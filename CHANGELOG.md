@@ -171,6 +171,10 @@
 
 - **Fixed: a DeepSeek V4 `<｜DSML｜tool_calls>` block that parses only partly is now a malformed-DSML error instead of merged, dropped or empty tool calls (HIPF-320).** `parse_tool_calls_body` skipped a broken invoke or parameter and kept going: an invoke whose close was misspelled absorbed the next invoke's parameters, a trailing broken invoke was dropped, a misspelled parameter close gave `{}` arguments, and a name attr without its closing `"` swallowed the next invoke. It is now strict: every invoke needs a clean `name="…">` attr and its own close before the next invoke open, and every parameter needs its own close; anything else fails the turn. The bare `</｜DSML｜>` invoke close and a parameter without `string="…"` are still accepted. DSpark verify still does not apply the DSML grammar mask, so DSpark greedy can still differ from AR on tool turns, but it can no longer release a wrong call.
 
+### Fixes: LLaMA RoPE inputs
+
+- **Fixed: LLaMA/Mistral/Qwen3 configs in the transformers 5 layout get their `rope_theta` again (HIPF-206).** transformers 5 nests `rope_theta` inside `rope_parameters`; the LLaMA carrier read only the top-level key and ran theta 10000. It now reads `rope_parameters.rope_theta` first (as transformers does), then the top-level key. On gfx1151, a Llama-3.2-1B q8 HFQ with the v5 layout gives logits bitwise identical to the v4 layout over 60 positions (beta: KL 0.042, top-1 38/60).
+
 ### Fixes: CI and platform builds
 
 - **Fixed: the Windows MSVC build links again.** The EP skew log's `clock_gettime` (hipfire-arch-qwen4) and the `HIPFIRE_DEBUG_FORCE_EVICT_MS` repro knob's `mmap`/`madvise`/`dlopen`/`dlsym` (rdna-compute PM4 replay) were declared as libc externs on every OS, so `link.exe` failed with LNK1120. Both are Linux-only now: off Linux the skew log timestamps from a process-local monotonic clock, and the force-evict knob is reported once and ignored. The hipfire-config hot-units sidecar test, hidden behind the link failure, now uses a path that is absolute on Windows too.

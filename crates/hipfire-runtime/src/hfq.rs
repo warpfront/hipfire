@@ -2446,8 +2446,8 @@ struct RawLlamaConfig {
     rms_norm_eps: f32,
     #[serde(default = "default_llama_max_pos")]
     max_position_embeddings: usize,
-    #[serde(default = "default_llama_rope")]
-    rope_theta: f32,
+    #[serde(default)]
+    rope_theta: Option<f32>,
     // Real safetensors configs ship `bos_token_id`/`eos_token_id` as either a
     // scalar (most LLaMA/Mistral) or an array (Llama-3.1: `[128001, 128009]`).
     // Keep them as raw Values and resolve to the FIRST element in finalize
@@ -2511,7 +2511,13 @@ fn llama_config_from_value(
         head_dim,
         norm_eps: raw.rms_norm_eps,
         max_seq_len: raw.max_position_embeddings,
-        rope_freq_base: raw.rope_theta,
+        // transformers >= 5 nests theta inside `rope_parameters` and prefers it
+        // over a top-level key (`convert_rope_params_to_dict`).
+        rope_freq_base: config["rope_parameters"]["rope_theta"]
+            .as_f64()
+            .map(|t| t as f32)
+            .or(raw.rope_theta)
+            .unwrap_or_else(default_llama_rope),
         rope_llama3: llama3_rope(config)?,
         bos_token: first_token_or(raw.bos_token_id.as_ref(), 1),
         eos_token: first_token_or(raw.eos_token_id.as_ref(), 2),
@@ -3438,6 +3444,29 @@ mod llama_config_tests {
         assert_eq!(c.bos_token, 128000);
         assert_eq!(c.eos_token, 128001);
         assert!(!c.has_qk_norm);
+    }
+
+    #[test]
+    fn transformers5_rope_parameters_theta() {
+        use rdna_compute::rope::RopeLlama3;
+        let mut config = config_value("llama")["config"].clone();
+        config.as_object_mut().unwrap().remove("rope_theta");
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(c.rope_freq_base, 10000.0);
+        config["rope_parameters"] = serde_json::json!({
+            "rope_type": "llama3", "rope_theta": 500000.0, "factor": 32.0,
+            "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192
+        });
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(c.rope_freq_base, 500000.0);
+        assert_eq!(c.rope_llama3, RopeLlama3::new(32.0, 1.0, 4.0, 8192));
+        config["rope_theta"] = serde_json::json!(10000.0);
+        let c = llama_config_from_value(&config, false).unwrap();
+        assert_eq!(
+            c.rope_freq_base, 500000.0,
+            "rope_parameters wins, as in HF 5.x"
+        );
     }
 
     #[test]
