@@ -453,7 +453,7 @@ fn main() {
         let sv_t = gpu.upload_f32(&tsv_val, &[v, R]).map_err(|e| format!("{e}"))?;
         let tg_t = gpu.upload_f32(&tg, &[v, R]).map_err(|e| format!("{e}"))?;
         let gb_t = gpu.upload_f32(&bias, &[R]).map_err(|e| format!("{e}"))?;
-        let out_t = gpu.alloc_tensor(&[n], DType::Raw).map_err(|e| format!("{e}"))?;
+        let out_t = gpu.alloc_tensor(&[n], DType::F32).map_err(|e| format!("{e}"))?;
 
         gpu.dspine_serial_chain(
             &base_t, &cand_t, &rms_t, &q_t, &sg_t, &sv_t, &tg_t, &gb_t,
@@ -481,7 +481,7 @@ fn main() {
         let v = 1024usize;
         let logits: Vec<f32> = prng(97, rows * v);
         let l_t = gpu.upload_f32(&logits, &[rows, v]).map_err(|e| format!("{e}"))?;
-        let cand_t = gpu.alloc_tensor(&[rows, 16], DType::Raw).map_err(|e| format!("{e}"))?;
+        let cand_t = gpu.alloc_tensor(&[rows, 16], DType::F32).map_err(|e| format!("{e}"))?;
         let base_t = gpu.alloc_tensor(&[rows, 16], DType::F32).map_err(|e| format!("{e}"))?;
 
         gpu.dspine_topk16(&l_t, &cand_t, &base_t, rows, v)
@@ -527,7 +527,7 @@ fn main() {
         let tsv_val = prng(127, v * R);
         let tg = prng(131, v * R);
         let bias = prng(137, R);
-        let anchor_sid: u32 = 4096;
+        let anchor_sid: u32 = 1024; // in-table sid (V = 4096; 4096 itself would read one row past the tables)
 
         let base_t = gpu.upload_f32(&base, &[n, k]).map_err(|e| format!("{e}"))?;
         let cand_t = gpu
@@ -539,7 +539,7 @@ fn main() {
         let sv_t = gpu.upload_f32(&tsv_val, &[v, R]).map_err(|e| format!("{e}"))?;
         let tg_t = gpu.upload_f32(&tg, &[v, R]).map_err(|e| format!("{e}"))?;
         let gb_t = gpu.upload_f32(&bias, &[R]).map_err(|e| format!("{e}"))?;
-        let out_t = gpu.alloc_tensor(&[n], DType::Raw).map_err(|e| format!("{e}"))?;
+        let out_t = gpu.alloc_tensor(&[n], DType::F32).map_err(|e| format!("{e}"))?;
 
         gpu.dspine_serial_chain(
             &base_t, &cand_t, &rms_t, &q_t, &sg_t, &sv_t, &tg_t, &gb_t,

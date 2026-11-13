@@ -192,6 +192,10 @@ pub struct DspineBridge {
     s_message: GpuTensor,    // [b, R] f32
     s_delta: GpuTensor,      // [b, H] f32
     s_rms: GpuTensor,        // [b] f32
+    // Pre-write hidden snapshot ([block, H] f32): the `base` term of the
+    // serial refinement reads the hidden the way the upstream sampler
+    // does, BEFORE this layer's bridge write lands (finish is in-place).
+    s_x_pre: GpuTensor,
     s_anchor: GpuTensor,     // [1] u32 — the block's first real token id
 }
 
@@ -350,6 +354,9 @@ impl DspineBridge {
             s_rms: gpu
                 .alloc_tensor(&[block], rdna_compute::DType::F32)
                 .map_err(|e| format!("dspine scratch rms: {e}"))?,
+            s_x_pre: gpu
+                .alloc_tensor(&[block, h], rdna_compute::DType::F32)
+                .map_err(|e| format!("dspine scratch x_pre: {e}"))?,
             s_anchor: gpu
                 .alloc_tensor(&[1], rdna_compute::DType::Raw)
                 .map_err(|e| format!("dspine scratch anchor: {e}"))?,
@@ -366,6 +373,16 @@ impl DspineBridge {
             gate_bias,
             serial,
         })
+    }
+
+    /// The pre-write hidden snapshot ([block, H] f32).
+    pub fn x_pre(&self) -> &GpuTensor {
+        &self.s_x_pre
+    }
+
+    /// The per-row RMS of the pre-write snapshot (prepare_read's stats).
+    pub fn rms_pre(&self) -> &GpuTensor {
+        &self.s_rms
     }
 
     /// Serial last-write refinement over the block's head logits:
@@ -393,18 +410,31 @@ impl DspineBridge {
             }
         };
         let vocab = self.cfg.trunk.vocab_size;
-        let cand = gpu.alloc_tensor(&[rows, 16], rdna_compute::DType::Raw)?;
+        // u32 payloads ride F32 tensors (4 B/elem): Raw is 1 B/elem and
+        // download_f32 reads numel*4, so a Raw alloc here is a bounded
+        // overread that only survives on pool granularity.
+        let cand = gpu.alloc_tensor(&[rows, 16], rdna_compute::DType::F32)?;
         let base = gpu.alloc_tensor(&[rows, 16], rdna_compute::DType::F32)?;
-        let out = gpu.alloc_tensor(&[rows], rdna_compute::DType::Raw)?;
+        let out = gpu.alloc_tensor(&[rows], rdna_compute::DType::F32)?;
+        eprintln!("[dspine-serial] rows={} base.buf={}B cand.buf={}B out.buf={}B",
+            rows, base.byte_size(), cand.byte_size(), out.byte_size());
         let pick = (|| -> hip_bridge::HipResult<Vec<u32>> {
             gpu.dspine_topk16(logits, &cand, &base, rows, vocab)?;
             let anchor_raw = gpu.download_f32(&self.s_anchor)?;
             let anchor_sid = anchor_raw[0].to_bits();
+            // logits row r is draft row r+1 (the seed row has no head
+            // logits), so the sender's rms/query must come from scratch
+            // rows 1..=rows, not 0..rows: one row off = every gate reads
+            // its neighbor's packed code and acceptance collapses.
+            let rms_rows = self.s_rms.sub_offset(1, rows);
+            let packed_rows = self
+                .s_packed
+                .sub_offset(3 * self.r, rows * 3 * self.r);
             gpu.dspine_serial_chain(
                 &base,
                 &cand,
-                &self.s_rms,
-                &self.s_packed,
+                &rms_rows,
+                &packed_rows,
                 &tables.tsv_gate,
                 &tables.tsv_val,
                 &tables.tg,
@@ -418,7 +448,19 @@ impl DspineBridge {
                 3 * self.r,
             )?;
             let raw = gpu.download_f32(&out)?;
-            Ok(raw.iter().map(|f| f.to_bits()).collect())
+            let picks: Vec<u32> = raw.iter().map(|f| f.to_bits()).collect();
+            if hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_DIAG").as_deref() == Ok("1") {
+                let base_raw = gpu.download_f32(&base)?;
+                let cand_raw = gpu.download_f32(&cand)?;
+                let top1: Vec<u32> = cand_raw.iter().map(|f| f.to_bits()).collect();
+                let agree = picks.iter().enumerate().filter(|(i, p)| **p == top1[i * 16]).count();
+                eprintln!("[dspine-serial] rows={} agree-with-top1={}/{} picks0..8={:?} top1-0..8={:?} base00={:.3}",
+                    rows, agree, rows,
+                    &picks[..rows.min(8)],
+                    &top1[..rows.min(8)],
+                    base_raw.first().copied().unwrap_or(0.0));
+            }
+            Ok(picks)
         })();
         let _ = gpu.free_tensor(cand);
         let _ = gpu.free_tensor(base);
@@ -449,6 +491,7 @@ impl DspineBridge {
             s_message,
             s_delta,
             s_rms,
+            s_x_pre,
             s_anchor,
             ..
         } = self;
@@ -467,7 +510,7 @@ impl DspineBridge {
             let _ = gpu.free_tensor(tables.tsv_gate);
             let _ = gpu.free_tensor(tables.tsv_val);
         }
-        for t in [s_normed, s_projected, s_codes, s_packed, s_message, s_delta, s_rms, s_anchor] {
+        for t in [s_normed, s_projected, s_codes, s_packed, s_message, s_delta, s_rms, s_anchor, s_x_pre] {
             let _ = gpu.free_tensor(t);
         }
     }
@@ -493,12 +536,22 @@ impl crate::dflash::DraftLayerBridge for DspineBridge {
         b: usize,
         _ctx_len: usize,
     ) -> hip_bridge::HipResult<()> {
-        assert_eq!(b, self.t, "bridge rows must be one full block");
+        // Scratch is sized to one full block; a shorter tail block (the
+        // last window when the emit budget runs out) is fine — every
+        // kernel is row-count driven and the anchor keeps its meaning.
+        assert!(b <= self.t, "bridge rows exceed the block-sized scratch");
         let h = self.h;
         let c = self.c;
         let r = self.r;
         let t = self.t;
         let eps = self.cfg.trunk.norm_eps;
+
+        // Snapshot the pre-write hidden rows first: finish rewrites x
+        // in place, and the serial refinement's base term reads the
+        // pre-write values exactly like the upstream stash.
+        gpu
+            .memcpy_dtod_at_ordered_async(&self.s_x_pre.buf, 0, &scratch.x.buf, 0, b * h * 4)
+            .map_err(|e| hip_bridge::HipError::new(e.code, &format!("dspine x_pre snapshot: {e}")))?;
 
         // 1. rms stats + normalized rows (kernel 1).
         gpu.dspine_prepare_read(&scratch.x, &self.s_rms, &self.s_normed, b, h, eps)?;

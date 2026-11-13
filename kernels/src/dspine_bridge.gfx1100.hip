@@ -303,7 +303,7 @@ __global__ void dspine_serial_chain_gfx1100(
 // scans a V/256 slice keeping a local 16-slot insertion list; phase 2:
 // thread 0 merges the 4096 survivors. First-seen (lowest) index wins ties,
 // matching argmax_f32_batched's first-max semantics.
-__global__ void dspine_topk16_gfx1100(
+extern "C" __global__ void dspine_topk16_gfx1100(
     const float* __restrict__ logits,
     unsigned int* __restrict__ cand,
     float* __restrict__ base_out,
@@ -368,5 +368,29 @@ __global__ void dspine_topk16_gfx1100(
             cand[(long long)row * 16 + i] = m_ids[i];
             base_out[(long long)row * 16 + i] = m_vals[i];
         }
+    }
+}
+
+// out[r*H+c] = x[(row_offset+r)*H+c] * nw[c]: the pre-write hidden rows
+// rescaled by the target final-norm weights, the sender-free `base` term of
+// the upstream serial_table score.
+extern "C" __global__ void dspine_scale_rows_gfx1100(
+    const float* __restrict__ x,
+    const float* __restrict__ nw,
+    float* __restrict__ out,
+    int row_offset,
+    int rows,
+    int H)
+{
+    const long long total = (long long)rows * H;
+    for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         idx < total;
+         idx += (long long)gridDim.x * blockDim.x)
+    {
+        // Upstream base: raw ⊙ draft-norm @ lm_head (serial_table takes the
+        // stash raw and the draft model's norm.weight verbatim — no RMS
+        // division; the draft norm's scale is what balances the term).
+        // idx is already relative to row_offset: one linear base shift.
+        out[idx] = x[(long long)row_offset * H + idx] * nw[(int)(idx % H)];
     }
 }

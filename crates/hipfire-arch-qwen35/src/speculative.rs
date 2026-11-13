@@ -8063,12 +8063,29 @@ pub fn draft_dflash_block_rank(
             .as_deref_mut()
             .filter(|b| b.serial().is_some())
         {
-            // Arch-24 serial refinement: the top-16 shortlist and the
-            // fused sender-table chain replace the plain argmax walk;
-            // the bridged forward already left query/rms in the
-            // bridge scratch and the anchor holds the seed token.
+            // Arch-24 serial refinement. The upstream score's base term
+            // reads the PRE-write hidden ((raw ⊙ norm_w) @ lm_head), so
+            // rebuild it from the bridge's x_pre snapshot instead of the
+            // trunk logits (which already contain this block's writes and
+            // would double-count the refinement term). The top-16 gather
+            // and the fused sender-chain then run on those pre-write
+            // logits; the trunk logits buffer is dead by this point and
+            // is reused for them.
+            // verify's final_hidden is written later (verify stage) and is
+            // dead during draft generation: reuse it as the scaled rows.
+            let h_pre = verify_scratch.final_hidden.sub_offset(0, batch * h);
+            gpu.dspine_scale_rows(
+                dspine.x_pre(),
+                &draft_weights.norm,
+                &h_pre,
+                1,
+                batch,
+                h,
+            )?;
+            let logits_pre = verify_scratch.logits.sub_offset(0, batch * vocab);
+            draft_lmhead_batched(gpu, w_out, verify_scratch, &h_pre, &logits_pre, batch, h)?;
             drafted = vec![seed_token];
-            drafted.extend(dspine.serial_refine(gpu, &logits_batch, batch)?);
+            drafted.extend(dspine.serial_refine(gpu, &logits_pre, batch)?);
         } else {
             // GPU argmax over (B-1) rows — one kernel, small D2H.
             let argmax_buf = verify_scratch.argmax.sub_offset(0, batch);

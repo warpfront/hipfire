@@ -388,4 +388,61 @@ impl Gpu {
     }
 
 
+
+    /// Pre-write hidden rows rescaled by the target final-norm weights
+    /// (`out[r] = x[row_offset + r] * nw`): the upstream serial_table's
+    /// `base` term input. See `dspine_scale_rows_gfx1100`.
+    pub fn dspine_scale_rows(
+        &mut self,
+        x: &GpuTensor,
+        nw: &GpuTensor,
+        out: &GpuTensor,
+        row_offset: usize,
+        rows: usize,
+        h: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dspine bridge kernels are gfx1100-only in v1",
+            ));
+        }
+        const SYM: &str = "dspine_scale_rows_gfx1100";
+        self.ensure_kernel(SYM, DSPINE_SRC, SYM)?;
+
+        let mut x_ptr = x.buf.as_ptr();
+        let mut nw_ptr = nw.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut ro = row_offset as i32;
+        let mut r_val = rows as i32;
+        let mut h_val = h as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut nw_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut ro as *mut _ as *mut c_void,
+            &mut r_val as *mut _ as *mut c_void,
+            &mut h_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            SYM,
+            [((rows * h + 255) / 256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(nw_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(ro);
+                b.push_i32(r_val);
+                b.push_i32(h_val);
+                b
+            },
+        )
+    }
+
 }

@@ -1374,10 +1374,7 @@ fn main() {
             vec![vocab_size as u32, hidden_size as u32],
             "lm_head shape must match the draft contract (V,H)"
         );
-        let nw_entry = find("model.language_model.norm.weight");
-        assert_eq!(nw_entry.quant_type, 1, "final norm must be F16");
         let lm_raw = read_hfq_tensor(tpath, &lm_entry);
-        let nw_raw = read_hfq_tensor(tpath, &nw_entry);
 
         let tensor_f32 = |name: &str, expect_shape: &[u32]| -> Vec<f32> {
             let idx = name_to_file
@@ -1412,7 +1409,10 @@ fn main() {
         );
         let prev_w = tensor_f32("selected_prefix_bridge.prev.weight", &[r as u32, c as u32]);
 
-        let norm_w = f16_bytes_to_f32(&nw_raw);
+        // The upstream build_serial_tables pairs the target lm_head with
+        // the DRAFT model's own norm.weight (dm.norm.weight), not the
+        // target's final norm.
+        let norm_w = tensor_f32("norm.weight", &[hidden_size as u32]);
         assert_eq!(norm_w.len(), hidden_size, "norm width");
         // The target lm_head rotation uses the same standard seed pair as
         // the engine (`ensure_mq_signs`), independent of this run's tier.
