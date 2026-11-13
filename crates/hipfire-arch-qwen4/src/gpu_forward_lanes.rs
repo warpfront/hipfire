@@ -1482,8 +1482,10 @@ fn segments_of_groups(groups: Vec<crate::mesh_lane_protocol::RowGroup>) -> Vec<S
         .collect()
 }
 
-/// Widest all-rows HC op: the wide-verify row bound every HC kernel arm admits
-/// ([`rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS`]).
+/// Widest all-rows HC op on every arch but single-device gfx942: the wide-verify row bound every
+/// HC kernel arm admits ([`rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS`]). Single-device
+/// gfx942 runs its all-rows segment up to [`g942_lanes::G942_ALLROWS_MAX_ROWS`] rows instead
+/// ([`LaneAllRowsRule::decide`]).
 const HC_ALL_ROWS_MAX: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
 
 /// Whether an AR / verify lane step of `group_rows` (the once-over-all-rows
@@ -1494,7 +1496,9 @@ const HC_ALL_ROWS_MAX: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_
 /// capture (the wide few-row limit the HC kernels' all-rows arms run under
 /// exists only eagerly), `cpu_splice` a layer with CPU routed experts (its
 /// groups are CPU-window sized). The HC read needs `HcRead` and `HcWrite`
-/// both [`StageShare::OnceAllRows`].
+/// both [`StageShare::OnceAllRows`]. `max_rows` is the widest step the arch's HC kernels run
+/// over all rows: [`HC_ALL_ROWS_MAX`], or [`g942_lanes::G942_ALLROWS_MAX_ROWS`] on a
+/// single-device gfx942 step.
 fn hc_all_rows_applies(
     flag: bool,
     ar_step: bool,
@@ -1502,6 +1506,7 @@ fn hc_all_rows_applies(
     cpu_splice: bool,
     group_rows: &[usize],
     policy: &LaneStagePolicy,
+    max_rows: usize,
 ) -> bool {
     let n: usize = group_rows.iter().sum();
     flag && ar_step
@@ -1511,7 +1516,7 @@ fn hc_all_rows_applies(
         && group_rows
             .iter()
             .all(|&rows| (1..=LANE_MAX_ROWS).contains(&rows))
-        && (LANE_MAX_ROWS + 1..=HC_ALL_ROWS_MAX).contains(&n)
+        && (LANE_MAX_ROWS + 1..=max_rows).contains(&n)
         && policy.share(StageName::HcRead) == StageShare::OnceAllRows
         && policy.share(StageName::HcWrite) == StageShare::OnceAllRows
 }
@@ -1519,7 +1524,8 @@ fn hc_all_rows_applies(
 /// Whether an AR / verify lane step also runs every non-MoE row-local stage once over all
 /// rows (`HIPFIRE_QWEN4_LANE_ALLROWS`), on top of the all-rows HC segment
 /// ([`hc_all_rows_applies`], which it refines: it is only asked for a step that segment
-/// admitted). Refused (`false`) for anything the wide 9..=64-row routes of the projections
+/// admitted). Refused (`false`) for anything the wide 9..=64-row routes (9..=128 on single-device
+/// gfx942, [`g942_lanes::G942_ALLROWS_MAX_ROWS`]) of the projections
 /// cannot serve exactly as their G x 8 groups' arms do:
 ///
 /// - `wide_scope_rows != 0`: a wide-verify scope is in force, so the projections would take
@@ -1552,7 +1558,7 @@ fn lane_step_trace_enabled() -> bool {
 
 /// Why a lane step that asked for `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` keeps its routed MoE on
 /// the <= 8-row groups (`Some(reason)`), or `None` when the one all-rows MoE call applies. The
-/// step the flag refines is a 9..=64-row AR / verify step the all-rows stage segment
+/// step the flag refines is a 9..=64-row (9..=128 on single-device gfx942) AR / verify step the all-rows stage segment
 /// admitted (`stages_apply`: flag, eager, no CPU splice, no wide scope, ...); the call is the
 /// wide-group MoE over every row, so it is refused wherever a wide-class group of `n` rows
 /// would be:
@@ -1793,6 +1799,11 @@ impl LaneAllRowsRule {
             self.cpu_splice,
             group_rows,
             &self.policy,
+            if self.g942_single {
+                g942_lanes::G942_ALLROWS_MAX_ROWS
+            } else {
+                HC_ALL_ROWS_MAX
+            },
         );
         let all_stages = all_rows_stages_apply(
             self.stages_flag,
@@ -3105,8 +3116,12 @@ fn forward_lanes_scoped(
         && lanes.len() >= 2
         && policy.share(StageName::PleProject) == StageShare::OnceAllRows
         && gpu.flags.qwen4_lane_ple_project_enabled()
-        && (2..=rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS).contains(&n)
-        && (gpu.arch_caps.is_gfx942() || gpu.bf16_rows_exact_one_launch(n)))
+        && if gpu.arch_caps.is_gfx942() {
+            (2..=g942_lanes::G942_ALLROWS_MAX_ROWS).contains(&n)
+        } else {
+            (2..=rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS).contains(&n)
+                && gpu.bf16_rows_exact_one_launch(n)
+        })
     .then(|| {
         all_segs.push(Segment {
             begin: 0,
@@ -7211,11 +7226,25 @@ mod tests {
         for groups in [&[8usize, 8][..], &[8, 8, 8, 8], &[5, 5]] {
             // The wave is a prefill step, never an AR step, whichever policy it runs.
             for wave in [&incumbent, &joint] {
-                assert!(!hc_all_rows_applies(true, false, true, false, groups, wave));
+                assert!(!hc_all_rows_applies(
+                    true,
+                    false,
+                    true,
+                    false,
+                    groups,
+                    wave,
+                    HC_ALL_ROWS_MAX
+                ));
             }
             // Incumbent: refused by the policy even for an AR step's shape.
             assert!(!hc_all_rows_applies(
-                true, true, true, false, groups, &incumbent
+                true,
+                true,
+                true,
+                false,
+                groups,
+                &incumbent,
+                HC_ALL_ROWS_MAX
             ));
         }
     }
@@ -7225,7 +7254,7 @@ mod tests {
         let production = LaneStagePolicy::production();
         let eight_by_two = [8usize, 8];
         let applies = |flag, ar, eager, cpu, groups: &[usize], policy: &LaneStagePolicy| {
-            hc_all_rows_applies(flag, ar, eager, cpu, groups, policy)
+            hc_all_rows_applies(flag, ar, eager, cpu, groups, policy, HC_ALL_ROWS_MAX)
         };
         assert!(applies(true, true, true, false, &eight_by_two, &production));
         // Flag off, a prefill wave / band edge (not an AR step), a recorded or
@@ -7473,7 +7502,7 @@ mod tests {
         assert!(!all_rows_stages_apply(true, true, 0, false, false));
         let production = LaneStagePolicy::production();
         let segment = |ar, eager, cpu, groups: &[usize]| {
-            hc_all_rows_applies(true, ar, eager, cpu, groups, &production)
+            hc_all_rows_applies(true, ar, eager, cpu, groups, &production, HC_ALL_ROWS_MAX)
         };
         let stages = |segment_applies| all_rows_stages_apply(true, segment_applies, 0, false, true);
         assert!(stages(segment(true, true, false, &[8, 8])));
@@ -7631,7 +7660,8 @@ mod tests {
             true,
             false,
             &group_rows,
-            &production
+            &production,
+            HC_ALL_ROWS_MAX
         ));
         // Row-exact lanes of the same rows (6 + 6 > 8 rows) are one group each: several groups.
         let exact = segments_of_groups(pack_classed_row_groups_with_cap(&rows, &[false; 8], 48));
@@ -7643,7 +7673,8 @@ mod tests {
             true,
             false,
             &exact_rows,
-            &production
+            &production,
+            HC_ALL_ROWS_MAX
         ));
     }
 
@@ -7672,8 +7703,15 @@ mod tests {
             compositions(n, &mut Vec::new(), &mut groups);
             assert!(!groups.is_empty());
             for group_rows in groups {
-                let segment =
-                    hc_all_rows_applies(true, true, true, false, &group_rows, &production);
+                let segment = hc_all_rows_applies(
+                    true,
+                    true,
+                    true,
+                    false,
+                    &group_rows,
+                    &production,
+                    HC_ALL_ROWS_MAX,
+                );
                 assert!(!segment, "{group_rows:?}");
                 let stages = all_rows_stages_apply(true, segment, 0, false, true);
                 assert!(!stages, "{group_rows:?}");
@@ -7739,6 +7777,11 @@ mod tests {
             rule.cpu_splice,
             group_rows,
             &rule.policy,
+            if rule.g942_single {
+                g942_lanes::G942_ALLROWS_MAX_ROWS
+            } else {
+                HC_ALL_ROWS_MAX
+            },
         );
         let all_stages = all_rows_stages_apply(
             rule.stages_flag,
@@ -7907,5 +7950,59 @@ mod tests {
         assert!(!rule.moe_all_rows(&[6; 8], true));
         // A prefill wave / band edge (not an AR step) never takes the segment.
         assert!(!rule.decide(false, &[6; 8], false, false).moe_all);
+    }
+
+    /// Single-device gfx942: the all-rows HC / stage / MoE segments take 16 groups of 8 rows
+    /// (32 MTP lanes x 4 rows = 128) and refuse 129 and above; every other rule keeps the 64-row
+    /// wide-verify bound (65 rows stay in their groups).
+    #[test]
+    fn gfx942_single_device_rule_takes_128_rows_and_others_keep_64() {
+        let g942 = LaneAllRowsRule {
+            gather_cap: None,
+            g942_single: true,
+            ..ep_rule()
+        };
+        let sixteen_by_eight = [8usize; 16];
+        let d = g942.decide(true, &sixteen_by_eight, false, false);
+        assert!(d.hc_all && d.all_stages && d.moe_all, "{d:?}");
+        assert!(!d.exact_scope && d.moe_refusal.is_none(), "{d:?}");
+        assert!(g942.moe_all_rows(&sixteen_by_eight, false));
+        // Every row count 9..=128 of eight-row groups (the last short) is one all-rows step.
+        for n in LANE_MAX_ROWS + 1..=g942_lanes::G942_ALLROWS_MAX_ROWS {
+            let mut groups = vec![LANE_MAX_ROWS; n / LANE_MAX_ROWS];
+            if n % LANE_MAX_ROWS != 0 {
+                groups.push(n % LANE_MAX_ROWS);
+            }
+            let d = g942.decide(true, &groups, false, false);
+            assert!(d.hc_all && d.all_stages && d.moe_all, "{n}: {d:?}");
+        }
+        // 129 rows and more keep the groups, with a reason from the HC segment's refusal.
+        for groups in [
+            [vec![8usize; 16], vec![1]].concat(),
+            vec![8usize; 17],
+            vec![8usize; 24],
+        ] {
+            let d = g942.decide(true, &groups, false, false);
+            assert!(!d.hc_all && !d.all_stages && !d.moe_all, "{groups:?}: {d:?}");
+            assert!(d.moe_refusal.is_some(), "{groups:?}");
+        }
+        // A wide-class lane keeps its classed group, a non-AR step takes no segment.
+        assert!(!g942.moe_all_rows(&sixteen_by_eight, true));
+        assert!(!g942.decide(false, &sixteen_by_eight, false, false).hc_all);
+        // A non-gfx942 rule still stops at the 64-row wide-verify bound.
+        let other = LaneAllRowsRule {
+            gather_cap: None,
+            g942_single: false,
+            ..ep_rule()
+        };
+        assert!(other.decide(true, &[8usize; 8], false, false).hc_all);
+        for groups in [
+            [vec![8usize; 8], vec![1]].concat(),
+            vec![8usize; 9],
+            sixteen_by_eight.to_vec(),
+        ] {
+            let d = other.decide(true, &groups, false, false);
+            assert!(!d.hc_all && !d.all_stages && !d.moe_all, "{groups:?}: {d:?}");
+        }
     }
 }

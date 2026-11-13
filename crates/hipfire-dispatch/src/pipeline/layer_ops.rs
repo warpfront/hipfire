@@ -2910,13 +2910,13 @@ pub fn execute_hyper_write_then_read(
     if write.ar.is_some() {
         return Ok(None);
     }
-    // G12 input: an exact-gfx942 lane step's all-rows HC segment (9..=WIDE_VERIFY_MAX_ROWS rows)
+    // G12 input: an exact-gfx942 lane step's all-rows HC segment (9..=LANE_ALLROWS_MAX_ROWS rows)
     // takes the same fused launch as the one-row singleton: `hyper_write_norm_f32` is one block
     // per (branch, row) and bitwise the separate launches, and the unfused wide route's k4 gates
     // are the quarters' arithmetic ([`g942_hc_quarters_gates`]), so each row is the singleton's.
     // The read then rotates nothing ahead (`rotate_into` is dropped below).
     let lane_wide = gpu.g942_lane_wide_rows(write.rows)
-        && write.rows <= rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+        && write.rows <= rdna_compute::cdna::gfx942::LANE_ALLROWS_MAX_ROWS
         && g942_hc_quarters_gates(gpu, write);
     let fusable = ((1..=gpu.few_row_limit()).contains(&gpu.route_rows(write.rows)) || lane_wide)
         && read.rows == write.rows

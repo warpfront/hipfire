@@ -701,6 +701,15 @@ pub(crate) fn g942_conv_fuse_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> 
     }
 }
 
+/// Widest all-rows lane step (rows of every lane in one launch) the exact-gfx942 single-device
+/// lane forward runs its shared stages over: 32 MTP lanes x (K = 3 + 1) verify rows = 128. The
+/// receipt that covers the bound is `GFX942_STOCK_FP8_ALLROWS_RECEIPT` in the qwen4 arch crate's
+/// `gpu_forward/g942_lanes.rs`. Every gfx942 kernel the lane step launches over all rows
+/// (`hyper_write_norm_bf16x`, the HC read / write, the trunk MFMA entries, the FP8 grouped MoE, the
+/// head) is per-row or row-count invariant, so this bound is a route bound, not an arithmetic
+/// one. Every non-gfx942 bound (`WIDE_VERIFY_MAX_ROWS`, 64) is unchanged.
+pub const LANE_ALLROWS_MAX_ROWS: usize = 128;
+
 impl Gfx942Device<'_> {
     /// [`crate::tensor_ops::hyper_norm`] that also stores each normalized value as BF16 bits into
     /// `normalized_bf16` (`[rows * branches * hidden]` BF16): the F32 `normalized` rows are
@@ -769,7 +778,8 @@ impl Gfx942Device<'_> {
     /// bitwise `hyper_write_norm_f32`'s, and the BF16 rows are the bytes `convert_f32_to_bf16`
     /// stages from `normalized` (the values are BF16-rounded). Entry
     /// `qwen4_g942_hyper_write_norm_bf16x` of module `qwen4_g942_conv_fuse`, grid `[4, rows]`,
-    /// block 256; the same operand contract and refusals as `hyper_write_norm`.
+    /// block 256; the same operand contract and refusals as `hyper_write_norm`, except the row
+    /// bound is [`LANE_ALLROWS_MAX_ROWS`] (each block is the whole computation of its (branch, row)).
     pub fn hyper_write_norm_bf16x(
         &mut self,
         p: &crate::tensor_ops::HyperWrite<'_>,
@@ -801,7 +811,7 @@ impl Gfx942Device<'_> {
             || p.branches != 4
             || p.hidden != 2560
             || rows == 0
-            || rows > crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+            || rows > LANE_ALLROWS_MAX_ROWS
             || norm_weight.dtype != DType::BF16
             || normalized_bf16.dtype != DType::BF16
             || normalized_bf16.numel() < rows * wide

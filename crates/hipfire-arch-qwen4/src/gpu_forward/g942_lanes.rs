@@ -6,7 +6,7 @@
 //!
 //! A child module of `gpu_forward`, so `gpu_forward_lanes` keeps only arch-gated call sites.
 //!
-//! A single-device stock-FP8 lane step of 9..=64 rows (more than one `LANE_MAX_ROWS` group) runs
+//! A single-device stock-FP8 lane step of 9..=128 rows (more than one `LANE_MAX_ROWS` group) runs
 //! its shared stages ONCE over every row instead of once per <= 8-row group:
 //!
 //! * the HC reads / writes, embedding, PLE rows, GDN / QSA in / out projections, final hyper
@@ -28,7 +28,8 @@
 
 use rdna_compute::Gpu;
 
-/// G0 receipt behind the gfx942 all-rows segment (9..=64 rows): `fn_lane_oracle --g0 --controls
+/// G0 receipt behind the gfx942 all-rows segment (9..=64 rows; 65..=128 rows are PENDING the MI300X
+/// c32 oracle, see the string's tail): `fn_lane_oracle --g0 --controls
 /// --ks 16,32,64 --contexts 64,512,2048 --steps 64` (plus the wide negative controls at k = 16
 /// and 64) on the stock-FP8 artifact, with the C0 HC write / read fix (`2028a9d12e`): every
 /// lane's logits rows, ids and state checkpoints byte-identical to the singleton under the
@@ -36,11 +37,12 @@ use rdna_compute::Gpu;
 /// `hc_allrows=true stages_allrows=true moe=allrows`). It proves the combined policy only, like
 /// [`GFX942_STOCK_FP8_RECEIPT`](crate::gpu_forward_lanes::GFX942_STOCK_FP8_RECEIPT), and binds
 /// the exact-gfx942 all-rows flags, which are always on there.
-pub const GFX942_STOCK_FP8_ALLROWS_RECEIPT: &str = "g0 mi300x/beat/L/l1-out/g0-final+ctl-final 2026-11-10 gfx942 stock-fp8 single, all-rows k=16/32/64 ctx 64/512/2048 steps 64, combined policy only, fn_lane_oracle sha256 3699aa99dddfc788 rc=0, with C0 2028a9d12e";
+pub const GFX942_STOCK_FP8_ALLROWS_RECEIPT: &str = "g0 mi300x/beat/L/l1-out/g0-final+ctl-final 2026-11-10 gfx942 stock-fp8 single, all-rows k=16/32/64 ctx 64/512/2048 steps 64, combined policy only, fn_lane_oracle sha256 3699aa99dddfc788 rc=0, with C0 2028a9d12e + 65..=128 rows: PENDING mi300x c32 oracle";
 
-/// Widest all-rows step the receipt covers: the wide-verify row bound the HC all-rows arms admit
-/// (`LANE_STORE_MAX_LANES` AR lanes of one row).
-pub const G942_ALLROWS_MAX_ROWS: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+/// Widest all-rows step the gfx942 single-device lane forward admits: 32 MTP lanes x (K = 3 + 1)
+/// verify rows ([`rdna_compute::cdna::gfx942::LANE_ALLROWS_MAX_ROWS`]). Non-gfx942 all-rows steps
+/// keep the wide-verify bound (`WIDE_VERIFY_MAX_ROWS`, 64).
+pub const G942_ALLROWS_MAX_ROWS: usize = rdna_compute::cdna::gfx942::LANE_ALLROWS_MAX_ROWS;
 
 /// The single-device gfx942 all-rows rule: a gfx942 lane step with no EP row gather. Its MoE
 /// segment is admitted by [`moe_refusal`] instead of the EP gather checks.
@@ -61,7 +63,7 @@ pub(crate) fn moe_refusal(
 ) -> Option<String> {
     if !stages_apply {
         return Some(
-            "the step takes no all-rows stage segment (LANE_ALLROWS / LANE_HC_ALLROWS off, not an eager 9..=64-row multi-group AR / verify step, or a CPU splice / wide scope / GDN qkv BF16 is in force)".into(),
+            "the step takes no all-rows stage segment (LANE_ALLROWS / LANE_HC_ALLROWS off, not an eager 9..=128-row multi-group AR / verify step, or a CPU splice / wide scope / GDN qkv BF16 is in force)".into(),
         );
     }
     if !moe_once {
@@ -84,10 +86,12 @@ mod tests {
 
     #[test]
     fn single_device_moe_takes_every_row_within_the_receipt_bound() {
+        assert_eq!(G942_ALLROWS_MAX_ROWS, 128);
         for n in 9..=G942_ALLROWS_MAX_ROWS {
             assert_eq!(moe_refusal(true, true, n, false), None, "{n}");
         }
         assert!(moe_refusal(true, true, G942_ALLROWS_MAX_ROWS + 1, false).is_some());
+        assert!(moe_refusal(true, true, 129, false).is_some());
     }
 
     #[test]
@@ -101,6 +105,6 @@ mod tests {
     #[test]
     fn gfx942_all_rows_on_needs_the_receipt() {
         assert!(!GFX942_STOCK_FP8_ALLROWS_RECEIPT.is_empty());
-        assert!(G942_ALLROWS_MAX_ROWS >= 64);
+        assert!(G942_ALLROWS_MAX_ROWS >= 128);
     }
 }

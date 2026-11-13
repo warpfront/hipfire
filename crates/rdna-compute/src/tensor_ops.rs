@@ -2602,7 +2602,9 @@ pub struct HyperNextGates<'a> {
 /// from a previous call's `next`) replaces `p.gates` as the gate source;
 /// `next` also computes the next hyper write's gate quarters (its norm and k4
 /// gate GEMV of these streams, bitwise); `clear` is zero-filled (a
-/// `zero_f32`).
+/// `zero_f32`). Exact gfx942 admits up to
+/// [`crate::cdna::gfx942::LANE_ALLROWS_MAX_ROWS`] rows (its single-device lane step's all-rows HC
+/// segment); every other arch keeps the `WIDE_VERIFY_MAX_ROWS` bound.
 pub fn hyper_write_norm(
     gpu: &mut Gpu,
     p: &HyperWrite<'_>,
@@ -2618,12 +2620,17 @@ pub fn hyper_write_norm(
     let wide = checked_product(p.branches, p.hidden, "HC write width")?;
     // Token rows: one block per (branch, row).
     let rows = p.input.numel() / wide.max(1);
+    let max_rows = if gpu.arch_caps.is_gfx942() {
+        crate::cdna::gfx942::LANE_ALLROWS_MAX_ROWS
+    } else {
+        crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+    };
     let quarters_ok = |q: &GpuTensor| q.dtype == DType::F32 && q.numel() == 16 * rows;
     if p.state_bf16
         || p.branches != 4
         || p.hidden != 2560
         || rows == 0
-        || rows > crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+        || rows > max_rows
         || norm_weight.dtype != DType::BF16
         || p.input.numel() != rows * wide
         || p.output.numel() != rows * wide
