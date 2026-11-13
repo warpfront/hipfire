@@ -52,6 +52,12 @@ required-features = ["lab"]
 name = "cdna_nor_hw_oracle"
 required-features = ["lab"]
 
+# MI300X (gfx942) VMEM load->load WAW hardware ordering oracle: global/buffer (+informational flat) pairs, no wait
+# between, cold-miss vs primed-hit races, typed ELF disassembly proof (fabric job; HIP runtime + hipcc).
+[[example]]
+name = "cdna_vmem_waw_hw_oracle"
+required-features = ["lab"]
+
 # Full gfx942 F16/F32 floating-compare family (+ v_cmp_ge_u64) MI300X/interpreter oracle: CMP/CMPX, E32/E64/SDWA,
 # non-VCC SGPR destinations, EXEC snapshots, FP_DENORM/FP_ROUND mode sweep (fabric job; HIP runtime + hipcc).
 [[example]]

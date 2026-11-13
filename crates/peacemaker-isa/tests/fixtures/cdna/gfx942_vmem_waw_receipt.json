@@ -1,0 +1,30 @@
+{
+  "status": "PASS",
+  "source_commit": "abd6508d499897f16eab911d4ef944a708d50d24",
+  "binary_sha256": "87a56ebd7c3669f931db993348500528472ff24bf0d970aeb36409205f7da744",
+  "raw_receipt_sha256": "669ed00bee7120286cb8b8b71cc1a796929f40d192beba2b4c889fdfc8131c02",
+  "raw_log_sha256": "f242a18b0c16c75dd055363132b448414d2ec5b313979295e9db95cfec7195ce",
+  "ledger": {
+    "owner": "PmLedgerWaw942.order",
+    "class": "oracle",
+    "start": "2026-11-13T01:45:00+00:00",
+    "end": "2026-11-13T01:45:11+00:00",
+    "wait_s": 0,
+    "run_s": 11,
+    "exit": 0,
+    "loadavg": "2.08 2.05 2.13",
+    "peak_runnable": 2,
+    "min_free_ram_pct": 97,
+    "cmd": "bash /scratch/quant/fn-fp8/beat/WC8/waw942/run-waw.sh"
+  },
+  "llvm_revision": "d6f6cb691863e9258034ab48c1dfce21689d5606",
+  "llvm_reference": "https://github.com/ROCm/llvm-project/blob/d6f6cb691863e9258034ab48c1dfce21689d5606/llvm/lib/Target/AMDGPU/SIInsertWaitcnts.cpp#L2493-L2503",
+  "vmem_type_reference": "https://github.com/ROCm/llvm-project/blob/d6f6cb691863e9258034ab48c1dfce21689d5606/llvm/lib/Target/AMDGPU/AMDGPUHWEvents.cpp#L59-L106",
+  "property_chain": [
+    "GCNProcessors.td:GFX942",
+    "AMDGPU.td:FeatureISAVersion9_4_2",
+    "AMDGPU.td:FeatureISAVersion9_4_Common",
+    "AMDGPU.td:FeatureGFX9",
+    "AMDGPU.td:FeatureVmemWriteVgprInOrder"
+  ]
+}

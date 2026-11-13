@@ -24,6 +24,12 @@
 //!   and its ISA basis in the `ledger` module docs): overwriting them needs no counter
 //!   wait, while the store still occupies its counter slot and blocks a barrier, and the
 //!   ISA's wait-state rule for wide VMEM store data is enforced by the hazard pass.
+//!   Same-class non-sampler VMEM VGPR-load WAWs use the gfx942 in-order VGPR-write
+//!   proof in `Ledger::required_replay`, separately from counter retirement. Both
+//!   loads stay pending; address/data RAW and other-class writes still require
+//!   waits. Widths, overlapping spans, cache policies and EXEC changes do not
+//!   split this writeback class. Unsupported image/FLAT/SCRATCH coverage is not
+//!   enabled by that rule.
 //!
 //! **Static branch proofs** (strict only): `ledger_program` also derives, per ledger
 //! instruction, an `EdgeChoice` from block-local typed scalar facts
@@ -875,9 +881,9 @@ mod tests {
         assert_eq!(evidence["checked"], true);
     }
 
-    /// The exact P1b wide64 anchor: pc 893 is the zero-mask exit gate and is `Taken`; the
-    /// all-`Both` reference walk (the unadapted verifier) still reports the baseline's pc 975
-    /// VMEM WAW, which is reachable only through the impossible fall-through of pc 893.
+    /// The exact P1b wide64 anchor: pc 893 is the zero-mask exit gate and is `Taken`.
+    /// Its original load/load WAW is now independently ordered. Replacing the younger
+    /// load with a VALU write keeps a real WAW on the all-Both impossible path.
     #[test]
     fn p1b_wide64_pc893_is_taken_and_the_all_both_reference_keeps_its_waw() {
         let (bundle, payloads) = peacemaker_ir::envelope::Bundle::read(P1B).expect("bundle");
@@ -915,11 +921,24 @@ mod tests {
             }
         }
 
-        // Reference: no proofs. `verify` and an all-Both table are the same walk.
+        // The byte-identical load/load anchor also passes without scalar pruning now.
+        ledger_cfg::verify(&program, &[]).unwrap();
+        // Keep this test sensitive to scalar pruning: a VALU overwrite is not ordered
+        // with VMEM, and only the original scalar proof can exclude that path.
+        let mut program = program;
+        program.instructions[975] = Instruction::new(
+            "v_mov_b32 v34, 0",
+            vec![RegRef {
+                kind: Kind::V,
+                base: 34,
+                len: 1,
+            }],
+            vec![],
+        );
         let reference = ledger_cfg::verify(&program, &[]).unwrap_err();
         for required in [
             "pc 975",
-            "global_load_dwordx4 v[34:37], v[4:5], off",
+            "v_mov_b32 v34, 0",
             "L872",
             "needs Vm wait 0",
             "Waw { reg: \"v[34:37]\" }",
