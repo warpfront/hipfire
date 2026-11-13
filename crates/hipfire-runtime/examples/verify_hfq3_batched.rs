@@ -95,7 +95,12 @@ fn compare_with_tol(name: &str, ref_out: &[f32], test_out: &[f32], tol: f32) -> 
     let mut bit_exact = 0usize;
     for i in 0..ref_out.len() {
         let err = (ref_out[i] - test_out[i]).abs();
-        max_err = max_err.max(err);
+        // f32::max drops NaN; an unwritten (NaN-poisoned) output must fail.
+        max_err = if err.is_nan() {
+            f32::INFINITY
+        } else {
+            max_err.max(err)
+        };
         if ref_out[i] == test_out[i] {
             bit_exact += 1;
         }
@@ -339,6 +344,30 @@ fn main() {
             gpu.free_tensor(d_y2).unwrap();
             gpu.free_tensor(d_y3).unwrap();
             gpu.free_tensor(d_y4).unwrap();
+
+            // Unaligned beta/alpha (Qwen3.5 n_v_heads = 32 rows): the MMQ body maps whole
+            // 128-row tiles to one segment, so the selector must route these off MMQ (HIPF-384).
+            let m_ba = 32usize;
+            let w_ba = synth_hfq3_bytes(m_ba, k, 43);
+            let d_w_ba = gpu.upload_raw(&w_ba, &[w_ba.len()]).unwrap();
+            let y_ref_ba = cpu_reference_via_gemv(&mut gpu, &w_ba, &x_mmq, m_ba, k, n);
+            let d_y1 = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
+            let d_y2 = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
+            let d_y3 = gpu.alloc_tensor(&[n * m_ba], DType::F32).unwrap();
+            let d_y4 = gpu
+                .upload_f32(&vec![f32::NAN; n * m_ba], &[n * m_ba])
+                .unwrap();
+            gpu.gemm_qkvza_hfq3g256_mmq(
+                &d_w_mmq, &d_w_mmq, &d_w_ba, &d_w_ba, &d_x_mmq, &d_y1, &d_y2, &d_y3, &d_y4, m_mmq,
+                m_mmq, m_ba, m_ba, k, n,
+            )
+            .unwrap();
+            let y4 = gpu.download_f32(&d_y4).unwrap();
+            any_fail |=
+                !compare_with_tol("mmq qkvza unaligned (alpha arm)", &y_ref_ba, &y4, mmq_tol);
+            for t in [d_y1, d_y2, d_y3, d_y4, d_w_ba] {
+                gpu.free_tensor(t).unwrap();
+            }
 
             gpu.free_tensor(d_x_mmq).unwrap();
         }
