@@ -8,10 +8,13 @@
 Drives a running `hipfire serve` (multi-slot, `--kv-mode q8`, VMM paged KV)
 over HTTP and checks the behaviours that page-table bugs break first:
 
-  1. edges:     greedy output of every prompt length in --edges (default the
-                128-token page edges 127/128/129, 255/256/257, 1151/1152/1153)
-                is stable solo, and identical when the same prompt runs
+  1. edges:     greedy output of every prompt length in --edges (default a
+                mixed set: the 128-token page edges 127/128/129, 255/256/257,
+                1151/1152/1153 plus the non-edge lengths 200/300/1000) is
+                stable solo, and identical when the same prompt runs
                 concurrently with others (--rounds rounds of --lanes lanes).
+                The non-edge lengths are load-bearing: with an edges-only set,
+                "every failure is at a page edge" holds by construction.
   2. saturate:  --bursts bursts of --lanes concurrent --saturate-len prompts,
                 sized so the page pool runs out. Every request must finish or
                 be refused with an HTTP error; the connection must not drop.
@@ -132,7 +135,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--port", type=int, default=11435)
     ap.add_argument("--model", required=True, help="model path as passed to serve")
-    ap.add_argument("--edges", default="127,128,129,255,256,257,1151,1152,1153")
+    ap.add_argument("--edges", default="127,128,129,200,255,256,257,300,1000,1151,1152,1153")
     ap.add_argument("--gen", type=int, default=32, help="greedy tokens per edge request")
     ap.add_argument("--lanes", type=int, default=4, help="concurrent requests (<= serve slots)")
     ap.add_argument("--rounds", type=int, default=9)

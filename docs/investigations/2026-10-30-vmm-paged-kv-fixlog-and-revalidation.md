@@ -594,3 +594,31 @@ without repeating the EQ matrix, the page-edge matrix above and the 4x12000 soak
 stays **experimental and not an admission route** (see `docs/VALIDATION.md`), and
 `check_vmm_paged_regressions.py` is the reproduction: it is expected to report the page-edge
 mismatches on gfx1100 until this is fixed.
+
+---
+
+## Correction (2026-11-13, review): this is not a paged-KV defect, and "page edges" was
+## unfalsifiable as written
+
+A gfx1151 (Strix Halo) re-run of the same harness on the **merge-base's default multi-slot
+slab route** (no paging at all) reproduced the class: 40 of 72 concurrent-vs-solo checks
+differed. The arena paged arm gave 40/72, the branch's slab arm 30/72, arena 20/72 and VMM
+17/72. The failure is therefore **pre-existing batch-shape numerics**, not something the VMM
+mapper introduced, and it is not even monotonic in "paged-ness".
+
+Two claims above do not survive that:
+
+- *"Every failure is at the page edges."* The harness's default length set was **only** page
+  edges (127/128/129, 255/256/257, 1151/1152/1153), so the conclusion held by construction.
+  `--edges` now defaults to a mixed set that includes non-edge lengths (200/300/1000), and the
+  edge claim must be re-derived from that.
+- *"A lane equals a different length's solo completion."* Solo digests also collide across
+  lengths on their own (127 and 128 both `f2ee3001`; 1151 and 1153 both `7f56ec11` on the
+  gfx1151 fixture), so digest equality across lengths is not evidence of a lane mix-up.
+
+The likely mechanism is row-count- and co-residency-dependent routing rather than a position
+mix-up [inference, not exercised]: `forward_slots::slots_few_mq4v2` (1..=8-row GEMV), tile
+attention serving every row when `n > active_slots`, and the page-quantum scheduler putting a
+1-row tail next to another lane's chunk. Treating "concurrent == solo" as an invariant is the
+open question; `docs/SERVE.md` now states that. The VMM arm passed every saturation, abort and
+teardown recheck on gfx1151, which is what this route actually claims.

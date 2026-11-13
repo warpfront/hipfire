@@ -1,5 +1,14 @@
 # VMM KV for the multi-slot serve engine — architecture and plan
 
+**Amendment (2026-11-13):** the VMM host-snapshot prefix cache described below
+(`serve_vmm_prefix.rs` and its `check_slots_vmm_prefix.py` harness) was
+**deleted**; `use_vmm` had been a literal `false` since `01ecc10fd`, so the path
+was unreachable and its constant tripped `check-selector-receipts.py`. Prefix
+reuse on this route is the shared paged pool's `PagePool` refcount/COW prefix
+sharing, verified by `scripts/check_vmm_paged_regressions.py`. The paragraphs
+that name the deleted module are the historical record of that work, not a
+current implementation pointer.
+
 **Lifecycle:** `planned` (design) / slices 0–3 `branch-implemented`, with the
 smoke evidence in §11. This record is design + execution plan. It makes no
 current-product claim and is **not** an acceptance pass: the

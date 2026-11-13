@@ -272,8 +272,9 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    `serve.multi_slot_paged_pages=0` the pool auto-sizes from post-weight free
    VRAM after the prefill scratch is resident, less the 512 MiB map reserve;
    an explicit count is the operator's physical ceiling. `prefix_cache`
-   requires and selects this route. `--multi-slot-paged` is mutually
-   exclusive with `--kv-backend vmm`; VMM wins if both are requested.
+   requires and selects this route. `--kv-backend vmm` does **not** select it
+   on its own (see below): the load is refused unless `--multi-slot-paged`
+   requests the pool too.
    `serve.multi_slot_paged_backend` selects the physical backing: `arena`
    (default, zeroed full-size K/V arenas) or experimental `vmm` (VA-only
    reservations; 2 MiB granule groups are mapped as pages become resident).
@@ -293,19 +294,26 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
     because `max_ctx_len`, conv state and per-slot logit rows are recorded.
     Multi-row MoE decode is admitted up to `FEW_ROW_ROUTE_ROWS` live rows.
     Still experimental, and not a production default. Mixed-length concurrent
-    prefill does not reliably reproduce the solo completion: on gfx1100 it
-    fails consistently at KV page-edge prompt lengths (127/128/129/255/256/257
-    tokens), where a lane can return another length's completion and four
-    identical prompts in one batch can disagree with each other and across
-    runs, and it was observed once on the A3B `.mq4r` route with a 360/25-token
-    pair. The mechanism is open; treat concurrent == solo as unproven on this
-    backend.
+    prefill does not reliably reproduce the solo completion, and this is **not**
+    a paged-KV defect: the merge-base's default multi-slot slab route reproduces
+    it (40 of 72 concurrent-vs-solo checks on gfx1151, against 17/72 for the VMM
+    arm), so it is pre-existing batch-shape numerics — projection and attention
+    arithmetic depend on the step's row count and co-residents, which arrival
+    timing changes. It was first seen at page-edge lengths because the harness
+    only tested those; `--edges` now includes non-edge lengths. The likely
+    mechanism is row-count-dependent routing rather than a position mix-up
+    [inference]. Treat concurrent == solo as unproven on every multi-slot
+    backend, not as an invariant this route owes.
     `scripts/check_vmm_paged_regressions.py` is the reproduction, and the log
     is [`investigations/2026-10-30-vmm-paged-kv-fixlog-and-revalidation.md`](investigations/2026-10-30-vmm-paged-kv-fixlog-and-revalidation.md).
 
-   `--kv-backend vmm` (q8, or fp8 on gfx1201) switches the slot engine's KV
-   storage from fixed per-slot slabs to one VMM reservation per slot, mapped
-   as requests are admitted up to their prompt + generation budget. The
+   `--kv-backend vmm` (q8, or fp8 on gfx1201) selects the shared paged pool
+   as this route's KV storage — it is not a per-slot reservation: since
+   `01ecc10fd` the slot engine has one pool for every slot, with per-slot
+   block tables and refcounted pages, and the per-slot VMM owner is gone.
+   Because that is a different, experimental cache, the load is refused
+   unless `--multi-slot-paged` (or `serve.multi_slot_paged`) asks for it as
+   well. The
    shared prefill scratch is one **total** row budget, not one per slot:
    `serve.max_batch_tokens` clamps to `max(serve.multi_slot_prefill_chunk,
    64 verify rows × slots)`. A lone prefilling slot may use the full chunk;
@@ -930,9 +938,19 @@ JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss. Vision+prefi
 supported on slots (the emitter withholds the stop bytes and ends the turn as
 `stop`; malformed shapes are 400s); `response_format: json_object` is
 enforced as a permissive object schema. `logprobs`/`top_logprobs` are supported
-(AR fallback; the sampled row is downloaded once per token); the images+tools
-combination stays refused, and tools alone are supported.
+(AR fallback; the sampled row is downloaded once per token), including with
+`stream: true`: every token chunk carries `choices[0].logprobs.content`. An
+entry covers one released text chunk, which is a decoder step — not
+necessarily one sampled token, and a per-sampled-token stream is not claimed.
+The images+tools combination stays refused, and tools alone are supported.
 This is not a registry admission.
+
+`memory.kv_backend=vmm` is **not** an opt-in to the shared paged pool on the
+multi-slot engine: the load is refused by name unless
+`serve.multi_slot_paged` also requests the pool (with
+`serve.multi_slot_paged_backend=vmm` for the VMM-backed variant). That keeps a
+`kv_backend=vmm` written for a per-slot route from landing on the experimental
+shared cache.
 
 ### Capability advertisement
 
