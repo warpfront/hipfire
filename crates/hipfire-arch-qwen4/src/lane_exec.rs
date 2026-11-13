@@ -2864,8 +2864,16 @@ mod wave_tests {
         assert_eq!(count(".share_prompt_end_continuing(gpu"), 1);
         assert_eq!(count(".prefill_wave("), 1);
         assert_eq!(count(".prefill_wave_wide("), 1);
-        assert_eq!(count("fill_head_after_wave("), 1, "the serial fill of every other wave");
-        assert_eq!(count("fill_heads_after_wave("), 1, "the batched fill, once per wave");
+        assert_eq!(
+            count("fill_head_after_wave("),
+            1,
+            "the serial fill of every other wave"
+        );
+        assert_eq!(
+            count("fill_heads_after_wave("),
+            1,
+            "the batched fill, once per wave"
+        );
         assert_eq!(count(".lane_prefill_tile("), 2, "completing + silent tiles");
         let begin = body.find("bundle.share_prompt_begin()").unwrap();
         let wave = body.find(".prefill_wave(").unwrap();

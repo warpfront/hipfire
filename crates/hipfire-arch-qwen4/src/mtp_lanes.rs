@@ -1925,7 +1925,11 @@ pub(crate) fn fill_heads_after_wave(
     // prefetch hint, bytes unchanged); the batched rows leave no lane's scope to do it.
     bundle.set_ple_lookahead(&[]);
     let call_rows = bundle.mtp_draft_call_rows();
-    let rows_max = fills.iter().map(|fill| fill.tokens.len()).max().unwrap_or(0);
+    let rows_max = fills
+        .iter()
+        .map(|fill| fill.tokens.len())
+        .max()
+        .unwrap_or(0);
     // The lane the rows run out on (every other lane's tile is shorter), finished serially.
     let mut serial_tail = None;
     for row in 0..rows_max {
@@ -2241,11 +2245,20 @@ mod tests {
         use super::batchable_wave_heads;
         assert!(batchable_wave_heads(true, true, 2, false));
         assert!(batchable_wave_heads(true, true, 32, false));
-        assert!(!batchable_wave_heads(false, true, 32, false), "not a gfx942 wave");
-        assert!(!batchable_wave_heads(true, false, 32, false), "no rows scratch");
+        assert!(
+            !batchable_wave_heads(false, true, 32, false),
+            "not a gfx942 wave"
+        );
+        assert!(
+            !batchable_wave_heads(true, false, 32, false),
+            "no rows scratch"
+        );
         assert!(!batchable_wave_heads(true, true, 1, false), "one lane");
         assert!(!batchable_wave_heads(true, true, 0, false));
-        assert!(!batchable_wave_heads(true, true, 32, true), "append scratch route");
+        assert!(
+            !batchable_wave_heads(true, true, 32, true),
+            "append scratch route"
+        );
     }
 
     #[test]
