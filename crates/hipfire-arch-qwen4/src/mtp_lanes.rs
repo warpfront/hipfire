@@ -1872,10 +1872,11 @@ fn batchable_wave_heads(
 /// took the hidden of the row before) under `with_lane`. The head Append reads nothing `with_lane`
 /// swaps in besides the head state and draft request (never the trunk state, the session cache
 /// or `lane_scope`), so the batched rows pass the lanes' states in place, as
-/// [`enqueue_batched_draft`] does; `poll_npu_trunk`, which every serial fill's scope runs first
-/// and which only advances the NPU executor's pending completions, runs once up front. I1 is
-/// checked for every lane before any head is touched; the head QSA mapping through the tile's end
-/// is provisioning's (`provision_lane_maps`), each call's own mapping check finds it in place.
+/// [`enqueue_batched_draft`] does; `poll_npu_trunk` and the empty PLE lookahead, which every serial
+/// fill's scope runs first (the first only advances the NPU executor's pending completions, the
+/// second clears a best-effort prefetch hint), run once up front. I1 is checked for every lane
+/// before any head is touched; the head QSA mapping through the tile's end is provisioning's
+/// (`provision_lane_maps`), each call's own mapping check finds it in place.
 pub(crate) fn fill_heads_after_wave(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
@@ -1920,6 +1921,9 @@ pub(crate) fn fill_heads_after_wave(
     bundle
         .poll_npu_trunk(gpu)
         .map_err(|e| format!("fill_heads_after_wave: {e}"))?;
+    // Every serial fill's `with_lane` scope names no lookahead tokens (a best-effort PLE
+    // prefetch hint, bytes unchanged); the batched rows leave no lane's scope to do it.
+    bundle.set_ple_lookahead(&[]);
     let call_rows = bundle.mtp_draft_call_rows();
     let rows_max = fills.iter().map(|fill| fill.tokens.len()).max().unwrap_or(0);
     // The lane the rows run out on (every other lane's tile is shorter), finished serially.
@@ -2192,6 +2196,7 @@ mod tests {
             "copy_spec_hidden_row_to(",
             "fill.hidden_row0 + fill.tokens.len() - 1",
             ".poll_npu_trunk(gpu)",
+            "bundle.set_ple_lookahead(&[]);",
         ] {
             assert!(body.contains(needed), "fill_heads_after_wave: {needed}");
         }
