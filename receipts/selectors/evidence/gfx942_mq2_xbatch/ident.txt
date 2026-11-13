@@ -1,0 +1,5 @@
+2026-11-13T00:25:09Z
+65498eece77cb98cc6e1301c9acdb62d4e083184
+5a683cbf76ca06d3e91f32f340ab9889462ed0d715110951a0e2b83d397d2b5f  /scratch/quant/fn-fp8/beat/WC8/bin/c3/qwen4_g942_mq2_xbatch_oracle
+qwen4_g942_mq2_xbatch_oracle: 864 cases, 0 failing; hipcc xbatch vs singleton (info) 37253538 bytes
+rc=0

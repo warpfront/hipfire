@@ -1,0 +1,156 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "arch": "gfx942",
+  "constant": "ROW_GRID_MAX_ROWS",
+  "value": 256,
+  "kind": "max",
+  "row_key": "rows",
+  "covers": true,
+  "candidate": "qwen4_g942_rows16_grid (row-grid HC down, 16-row slices on a 2-D grid)",
+  "incumbent": "gemm_bf16_mfma_gfx942_wide64 slices / gemm_bf16_mfma_gfx942_rows16 chain",
+  "card": "MI300X, TwinWide942f source arm of qwen4_g942_rows16_grid_oracle --bench (owner tip 1085f38918, oracle and kernel identical; bin sha256 452c02e2caec2c53f9746e1d7e1dd7ed9eb4ccb2ea024fb36e11f597e10c7da7), 25 reps warm+cold, 2026-11-13",
+  "summary": "Every measured row class 17..256 (the admitted range: batch > ROWS16_CHAIN_STEP and <= ROW_GRID_MAX_ROWS) is faster on the row grid than the best incumbent, warm and cold (ratio 0.29..0.66), and every arm is byte-equal to the reference. 256 is the largest measured class; at 257 the selector declines (row grid not taken, wide64 runs, output equal to reference) and the router-chain-only call leaves the output untouched. Larger batches are prefill routes this selector does not touch.",
+  "classes": [
+    {
+      "rows": 17,
+      "weights": "warm",
+      "cell": "hc_down_m320_k10240",
+      "row_grid_median_us": 19.97,
+      "wide_slices_median_us": 31.23,
+      "rows16_chain_median_us": 42.78,
+      "ratio_grid_over_best_incumbent": 0.6393,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 17,
+      "weights": "cold",
+      "cell": "hc_down_m320_k10240",
+      "row_grid_median_us": 22.53,
+      "wide_slices_median_us": 34.0,
+      "rows16_chain_median_us": 37.85,
+      "ratio_grid_over_best_incumbent": 0.6627,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 32,
+      "weights": "warm",
+      "cell": "hc_down_m320_k10240",
+      "row_grid_median_us": 20.09,
+      "wide_slices_median_us": 31.51,
+      "rows16_chain_median_us": 41.01,
+      "ratio_grid_over_best_incumbent": 0.6374,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 32,
+      "weights": "cold",
+      "cell": "hc_down_m320_k10240",
+      "row_grid_median_us": 21.33,
+      "wide_slices_median_us": 33.6,
+      "rows16_chain_median_us": 39.65,
+      "ratio_grid_over_best_incumbent": 0.6348,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 64,
+      "weights": "warm",
+      "cell": "hc_down_m320_k10240",
+      "row_grid_median_us": 20.17,
+      "wide_slices_median_us": 33.6,
+      "rows16_chain_median_us": 73.85,
+      "ratio_grid_over_best_incumbent": 0.6003,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 64,
+      "weights": "cold",
+      "cell": "hc_down_m320_k10240",
+      "row_grid_median_us": 22.05,
+      "wide_slices_median_us": 40.81,
+      "rows16_chain_median_us": 75.85,
+      "ratio_grid_over_best_incumbent": 0.5403,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 128,
+      "weights": "warm",
+      "cell": "hc_down_m320_k10240",
+      "row_grid_median_us": 20.53,
+      "wide_slices_median_us": 64.75,
+      "rows16_chain_median_us": 145.05,
+      "ratio_grid_over_best_incumbent": 0.317,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 128,
+      "weights": "cold",
+      "cell": "hc_down_m320_k10240",
+      "row_grid_median_us": 24.13,
+      "wide_slices_median_us": 76.74,
+      "rows16_chain_median_us": 148.9,
+      "ratio_grid_over_best_incumbent": 0.3145,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 256,
+      "weights": "warm",
+      "cell": "hc_down_m320_k10240",
+      "row_grid_median_us": 39.29,
+      "wide_slices_median_us": 127.57,
+      "rows16_chain_median_us": 286.41,
+      "ratio_grid_over_best_incumbent": 0.308,
+      "verdict": "faster",
+      "admitted": true
+    },
+    {
+      "rows": 256,
+      "weights": "cold",
+      "cell": "hc_down_m320_k10240",
+      "row_grid_median_us": 43.02,
+      "wide_slices_median_us": 149.7,
+      "rows16_chain_median_us": 294.87,
+      "ratio_grid_over_best_incumbent": 0.2874,
+      "verdict": "faster",
+      "admitted": true
+    }
+  ],
+  "declines": [
+    {
+      "cell": "decline_257_router_chain_wide",
+      "rows": 257,
+      "row_grid_taken": false,
+      "equal_to_reference": true,
+      "last_kernel": "gemm_bf16_mfma_gfx942_wide64"
+    },
+    {
+      "cell": "router_chain_only_m48_k10240",
+      "rows": 256,
+      "launched": true,
+      "output_untouched": false,
+      "last_kernel": "qwen4_g942_rows16_grid",
+      "pass": true
+    },
+    {
+      "cell": "router_chain_only_m48_k10240",
+      "rows": 257,
+      "launched": false,
+      "output_untouched": true,
+      "last_kernel": "qwen4_g942_rows16_grid",
+      "pass": true
+    }
+  ],
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/gfx942_row_grid/rows16_grid_bench.json",
+      "sha256": "6a478d24e173334650b9140aa85592eca4ad0c997dd04a5272becb2a04801a7d"
+    }
+  ]
+}
