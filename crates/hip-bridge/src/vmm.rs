@@ -589,6 +589,12 @@ pub struct VmmArena {
     releasing: bool,
     /// True once any mapping succeeded; a never-mapped VA may adopt a shared prefix.
     ever_mapped: bool,
+    /// Offsets that have been mapped and then unmapped. The driver keeps stale
+    /// translations for a VA remapped onto a new handle (a write through it
+    /// lands in the old, released physical page), so a retired offset is
+    /// refused rather than rebound. This is the same rule `VmmPageMapper`
+    /// enforces per granule (`bound_granules`), applied where the hazard lives.
+    retired_offsets: std::collections::HashSet<usize>,
     kind: VmmArenaKind,
 }
 
@@ -810,6 +816,7 @@ impl VmmArena {
             access_devices: vec![owner_device],
             releasing: false,
             ever_mapped: false,
+            retired_offsets: std::collections::HashSet::new(),
             kind,
         })
     }
@@ -883,6 +890,9 @@ impl VmmArena {
                 "VMM arena is releasing or already released",
             ));
         }
+        // The frontier is `mapped_bytes`, so an `unmap_at` earlier in this
+        // arena's life could have retired it.
+        self.ensure_fresh_offset(self.mapped_bytes)?;
         match self.kind {
             VmmArenaKind::Default => {}
             VmmArenaKind::ExportBuilding => {
@@ -1078,6 +1088,29 @@ impl VmmArena {
         Ok(())
     }
 
+    /// Refuse an offset that has been mapped and unmapped before.
+    ///
+    /// On gfx1100 (ROCm 7.x/10.x, amdgpu) `hipMemUnmap` + `hipMemRelease`,
+    /// then `hipMemCreate` + `hipMemMap` of a new allocation at the same VA,
+    /// leaves the old translation in place long enough that writes through
+    /// the VA reach the released physical page. Device synchronization,
+    /// re-setting access and dma-buf fences do not order it; only a fresh VA
+    /// (or keeping the VA on its original allocation) is safe. Recorded here
+    /// because `map_at`/`map_granule_at` can place a new handle at any offset,
+    /// including one a rollback just released.
+    fn ensure_fresh_offset(&self, offset: usize) -> HipResult<()> {
+        if self.retired_offsets.contains(&offset) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM offset {offset} was mapped and unmapped; remapping a used VA \
+                     is unsafe (stale translations) — reserve a fresh range"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Map one fresh physical allocation of `size` bytes at an arbitrary
     /// granularity-aligned `offset` in this reservation.
     ///
@@ -1093,6 +1126,7 @@ impl VmmArena {
         access_devices: &[i32],
     ) -> HipResult<()> {
         self.ensure_mappable()?;
+        self.ensure_fresh_offset(offset)?;
         if !offset.is_multiple_of(self.granularity) {
             return Err(HipError::new(
                 0,
@@ -1208,6 +1242,7 @@ impl VmmArena {
             let cleanup = match unsafe { hip.mem_unmap(address, size) } {
                 Ok(()) => {
                     segment.mapped = false;
+                    self.retired_offsets.insert(offset);
                     // SAFETY: unmapped; no range references the handle.
                     match unsafe { hip.mem_release(handle) } {
                         Ok(()) => {
@@ -1266,6 +1301,7 @@ impl VmmArena {
         access_devices: &[i32],
     ) -> HipResult<()> {
         self.ensure_mappable()?;
+        self.ensure_fresh_offset(offset)?;
         if !offset.is_multiple_of(self.granularity) {
             return Err(HipError::new(
                 0,
@@ -1369,6 +1405,7 @@ impl VmmArena {
             let cleanup = match unsafe { hip.mem_unmap(address, size) } {
                 Ok(()) => {
                     segment.mapped = false;
+                    self.retired_offsets.insert(offset);
                     let mut table = granule_table();
                     table
                         .drop_lease(id, &mut |handle| release_granule_handle(hip, handle))
@@ -1472,6 +1509,9 @@ impl VmmArena {
         );
         if one.is_empty() {
             self.mapped_bytes = self.mapped_bytes.saturating_sub(size);
+            // The unmap succeeded, so a later map at this offset would rebind
+            // a VA whose old translation may still be live.
+            self.retired_offsets.insert(offset);
         } else {
             self.segments.insert(index, one.remove(0));
             self.releasing = true;
@@ -1633,6 +1673,7 @@ impl VmmArena {
         access_devices: &[i32],
     ) -> HipResult<()> {
         self.ensure_mappable()?;
+        self.ensure_fresh_offset(self.mapped_bytes)?;
         if bytes == 0 || !bytes.is_multiple_of(self.granularity) {
             return Err(HipError::new(
                 0,
@@ -2270,6 +2311,7 @@ mod tests {
             access_devices: vec![0],
             releasing: false,
             ever_mapped: true,
+            retired_offsets: std::collections::HashSet::new(),
             kind: VmmArenaKind::Default,
         }
     }
@@ -3146,10 +3188,48 @@ mod tests {
         assert!(driver.take_ops().is_empty(), "a poisoned arena remapped");
     }
 
-    /// The only mid-life unmap is `release`: it synchronizes, unmaps every
+    /// A rollback (`unmap_at`) releases a never-scheduled segment, but the VA
+    /// must stay retired: a retried `map_at` at the same offset would rebind a
+    /// VA whose old translation the driver may still hold, which is the
+    /// stale-translation hazard, not a cache miss. Before this rule the pool's
+    /// rollback path could rebind a rolled-back granule on the next `sync`.
+    ///
+    /// `map_at`/`unmap_at` drive the real `HipRuntime`, so this exercises the
+    /// rule through the driver-generic `map_next` frontier (which is the same
+    /// `mapped_bytes` offset `unmap_at` would retire) plus the predicate
+    /// itself; the `unmap_at` insert is one line and is covered by the
+    /// gfx1100 `vmm_page_pool` rollback smokes on hardware.
+    #[test]
+    fn gfx1100_vmm_unmapped_offset_is_never_remapped() {
+        const MIB: usize = 1 << 20;
+        let driver = RecordingDriver::new(2 * MIB);
+        let mut arena = reserve_recorded(&driver, 64 * MIB);
+        arena.map_next(&driver, 2 * MIB, &[0]).unwrap();
+        assert!(arena.ensure_fresh_offset(0).is_ok(), "fresh prefix maps");
+        driver.take_ops();
+        // The frontier `unmap_at` retires after a rollback.
+        arena.retired_offsets.insert(2 * MIB);
+        let err = arena
+            .ensure_fresh_offset(2 * MIB)
+            .expect_err("a retired offset must be refused");
+        assert!(err.message.contains("remapping a used VA"), "{}", err.message);
+        assert!(
+            arena.map_next(&driver, 2 * MIB, &[0]).is_err(),
+            "a retired frontier must not be rebound"
+        );
+        assert!(
+            driver.take_ops().is_empty(),
+            "a refused remap must not reach the driver"
+        );
+        assert!(arena.ensure_fresh_offset(4 * MIB).is_ok(), "a fresh offset maps");
+    }
+
+    /// `release` synchronizes, unmaps every
     /// segment once (newest first) and releases its handles, retires the VA
     /// (never freed, so no later reserve can land on it) and refuses any
     /// further map on the released arena (the old range is never reused).
+    /// `unmap_at` is the other mid-life unmap: it retires its offset in
+    /// `retired_offsets`, so a rollback cannot rebind the VA on a retry.
     #[test]
     fn gfx1100_vmm_release_retires_the_va_and_never_reuses_it() {
         const MIB: usize = 1 << 20;

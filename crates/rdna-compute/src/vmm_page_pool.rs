@@ -14,7 +14,9 @@
 //   arena offset  =  granule * granule_bytes + within * page_bytes
 //
 // Granules are mapped in every K/V layer arena when the first page in the
-// granule becomes resident, and unmapped when the last resident page leaves.
+// granule becomes resident and then stay mapped for the pool's lifetime: a
+// granule whose pages all leave stays bound so the next allocation reuses it
+// in place (see `VmmPageMapper::sync` for why a used VA is never remapped).
 // Mapping is synchronized at page-pool transition boundaries (admission,
 // provisioning, COW, release), never inside a forward.
 
@@ -585,7 +587,14 @@ impl VmmPageMapper {
     }
 
     /// Unmap granules mapped by the current `sync` call before it commits.
-    /// They are not bound yet: no kernel has seen their VA.
+    /// They are not bound yet: no kernel has seen their VA, so no writes can be
+    /// lost — but the arena still **retires** each released offset
+    /// (`VmmArena::retired_offsets`), because remapping a VA onto a new handle
+    /// is the stale-translation hazard even when the first mapping was never
+    /// scheduled on a kernel. A retried `sync` therefore fails closed on that
+    /// granule instead of rebinding it, which is the intended direction: the
+    /// pool reports a permanent mapping failure rather than reusing a VA whose
+    /// old translation may still be live.
     fn rollback_mapped(&mut self, gpu: &mut Gpu, granules: &[usize]) -> Result<(), String> {
         let cost = self.layout.granule_bytes * (self.k_bases.len() + self.v_bases.len());
         for &granule in granules.iter().rev() {
