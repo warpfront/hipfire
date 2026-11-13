@@ -1231,7 +1231,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 2064
+**Count:** 2066
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1249,7 +1249,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_A4_FA_GATE_IL` | crates/hipfire-dispatch/src/pipeline/batched_attention.rs | developer |
 | `HIPFIRE_A4_HIN_TOKFAST` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_A4_RMS_FDIV` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_A4_SLAB` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/rdna-compute/examples/prefill_iu4_producer_oracle.rs | developer |
+| `HIPFIRE_A4_SLAB` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/rdna-compute/examples/gdn_canon_stream_oracle.rs | developer |
 | `HIPFIRE_A8_APF_K32` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_A8_FUSED_PROD` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_A8_PREFILL` | crates/rdna-compute/examples/gdn_canonical_producer_oracle.rs, crates/rdna-compute/src/feature_flags.rs | developer |
@@ -1846,9 +1846,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_G12_FP8_ISA` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_G12_FP8_ISA_COVERAGE` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_G12_FP8_ISA_FORCE_SMALL_N` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_G12_IU4_B1S_BUNDLE` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_G12_IU4_B1_BUNDLE` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_G12_IU4_B1_CONTROL` | crates/rdna-compute/examples/zba_fold_oracle.rs, crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_G12_IU4_B1S_BUNDLE` | crates/rdna-compute/examples/gdn_canon_stream_oracle.rs, crates/rdna-compute/examples/gdn_canonical_producer_oracle.rs | developer |
+| `HIPFIRE_G12_IU4_B1_BUNDLE` | crates/rdna-compute/examples/gdn_canon_stream_oracle.rs, crates/rdna-compute/examples/gdn_canonical_producer_oracle.rs | developer |
+| `HIPFIRE_G12_IU4_B1_CONTROL` | crates/rdna-compute/examples/gdn_canon_stream_oracle.rs, crates/rdna-compute/examples/gdn_canonical_producer_oracle.rs | developer |
 | `HIPFIRE_G12_IU4_GDN_COVERAGE` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_G12_IU4_ISA` | crates/rdna-compute/examples/shared_down_sigmoid_epi_oracle.rs, crates/rdna-compute/examples/zba_fold_oracle.rs | developer |
 | `HIPFIRE_G12_IU4_V3` | crates/rdna-compute/examples/shared_down_sigmoid_epi_oracle.rs, crates/rdna-compute/src/gemm.rs | developer |
@@ -1898,7 +1898,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GDN_MOE_PRE_FUSED` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/pipeline/batched_moe.rs | developer |
 | `HIPFIRE_GDN_PERSISTENT_STAGED` | crates/rdna-compute/src/compiler.rs | developer |
 | `HIPFIRE_GDN_PREFETCH` | crates/rdna-compute/src/dflash_gdn_replay.rs, crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_GDN_PREP_FUSED` | crates/rdna-compute/examples/zba_fold_oracle.rs, crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_GDN_PREP_FUSED` | crates/rdna-compute/examples/gdn_canon_stream_oracle.rs, crates/rdna-compute/examples/zba_fold_oracle.rs | developer |
 | `HIPFIRE_GDN_PREP_GFX11` | crates/rdna-compute/src/norm.rs | developer |
 | `HIPFIRE_GDN_PRE_FUSE_OFF` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_GDN_QK_HEAD_DIV` | crates/rdna-compute/src/kernels.rs | developer |
@@ -3127,6 +3127,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SERVE_MULTI_SLOT_SESSION_TTL_SECS` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_MULTI_SLOT_SLOTS` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_SERVE_OCR_FORMAT` | crates/hipfire-cli/src/serve/http.rs, crates/hipfire-cli/src/serve/mod.rs | stable |
 | `HIPFIRE_SERVE_PREFILL_MIN_TOKENS` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
 | `HIPFIRE_SERVE_PREFIX_CACHE` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
 | `HIPFIRE_SERVE_PREFIX_CACHE_MAX_BYTES` | crates/hipfire-config/src/lib.rs | experimental |

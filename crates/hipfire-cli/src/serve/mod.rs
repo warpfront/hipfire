@@ -48,6 +48,7 @@ pub mod complete;
 pub(crate) mod decide;
 pub(crate) mod embeddings;
 pub mod http;
+pub(crate) mod ocr;
 pub(crate) mod responses;
 pub(crate) mod ui;
 
@@ -182,6 +183,65 @@ pub(crate) struct RequestModelPolicy {
     pub(crate) allow_paths: bool,
     /// The operator's pre-warm model, which requests may always name.
     pub(crate) operator_model: Option<String>,
+}
+
+/// Model names whose assistant turn uses the Surya compact-block contract.
+///
+/// `serve.ocr_format` renders one model's output format, not a process-wide
+/// transform: it defaults only for a model the registry declares
+/// (`ModelEntry::compact_blocks`), checked per request against the name the
+/// request asked for. Canonical tags, aliases and installed file names all
+/// resolve to the declaring entry. Built once at startup from the same
+/// registry the load path uses; immutable.
+pub(crate) struct CompactBlockModels {
+    names: std::collections::HashSet<String>,
+    /// The declaring entries' artifact file names, which a path-form request
+    /// (`"model": "/models/surya-ocr-2.5.q8"`) is matched against by basename.
+    files: std::collections::HashSet<String>,
+}
+
+impl CompactBlockModels {
+    pub(crate) fn from_registry(registry: &hipfire_registry::RegistryV1) -> Self {
+        let mut names = std::collections::HashSet::new();
+        let mut files = std::collections::HashSet::new();
+        for (tag, entry) in &registry.models {
+            if entry.compact_blocks {
+                names.insert(tag.clone());
+                names.insert(entry.file.clone());
+                files.insert(entry.file.clone());
+            }
+        }
+        for alias in registry.aliases.keys() {
+            if registry
+                .models
+                .get(&registry.resolve_tag(alias))
+                .is_some_and(|entry| entry.compact_blocks)
+            {
+                names.insert(alias.clone());
+            }
+        }
+        Self { names, files }
+    }
+
+    /// True when `name` (a tag, alias, installed file name, or a path whose
+    /// file name is a declaring entry's artifact) is a model that declares
+    /// compact-block output. A path load (`serve /…/surya-ocr-2.5.q8`, or a
+    /// request naming that path) reports the path as its model name, so the
+    /// basename is what identifies it; only artifact file names are matched
+    /// that way, never a tag or alias that happens to equal a basename.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        if self.names.contains(name) {
+            return true;
+        }
+        std::path::Path::new(name)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|file| self.files.contains(file))
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.names.len()
+    }
 }
 
 pub(crate) fn finish_prewarm(meta: &mut ServeMeta, succeeded: bool) {
@@ -532,10 +592,42 @@ pub(crate) struct ServeShared {
     /// `serve.ui` / `--ui`: the /ui chat-frontend routes are live. Immutable
     /// for the process lifetime, like `capabilities`.
     pub(crate) ui_enabled: bool,
+    /// `serve.ocr_format` / `HIPFIRE_SERVE_OCR_FORMAT`: decode compact-block
+    /// (Surya-2.5) answers. `None` is the raw special-token form (the
+    /// default); a request's own `ocr_format` wins. The configured rendering
+    /// applies only to a model [`CompactBlockModels`] declares, never to the
+    /// whole process.
+    pub(crate) ocr_format: Option<ocr::OcrFormat>,
+    /// Models whose output the configured `ocr_format` may transform.
+    pub(crate) compact_block_models: CompactBlockModels,
     /// Bearer token every route except the minimal `/health` requires. `None`
     /// (no API key configured) leaves every route open, as before. Never
     /// logged or serialized: `BearerToken` redacts itself in `Debug`/`Display`.
     pub(crate) api_key: Option<BearerToken>,
+}
+
+impl ServeShared {
+    /// The serve-level rendering that applies to one request: the configured
+    /// default, only when the request's model declares compact-block output.
+    /// A request's own `ocr_format` still wins over this in
+    /// [`WireApi::lower`](http::WireApi).
+    fn ocr_default(&self, body: &serde_json::Value) -> Option<ocr::OcrFormat> {
+        let configured = self.ocr_format?;
+        let requested = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                self.meta
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .current_model
+                    .clone()
+            })?;
+        self.compact_block_models
+            .contains(&requested)
+            .then_some(configured)
+    }
 }
 
 /// Initial `/health` swap snapshot from the resolved process policy. The
@@ -1974,6 +2066,22 @@ pub(crate) fn serve_foreground(
     // `--open` implies `--ui`: the launcher promise is meaningless without
     // the route. Config/env (`serve.ui` / HIPFIRE_SERVE_UI) also enables it.
     let ui_enabled = args.ui || args.open || config_bool(&global, "serve.ui")?;
+    // Compact-block decoding default for models that declare the format.
+    // `raw` is the identity (the model's special tokens, which surya's own
+    // client parses); a request's own `ocr_format` wins over this, and the
+    // configured rendering never applies to a model that emits text.
+    let ocr_format_value = config_string(&global, "serve.ocr_format")?;
+    let ocr_format = ocr::OcrFormat::from_config(&ocr_format_value).ok_or_else(|| {
+        anyhow!("serve.ocr_format must be raw, html or blocks, got {ocr_format_value:?}")
+    })?;
+    let compact_block_models = CompactBlockModels::from_registry(&registry);
+    if let Some(format) = ocr_format {
+        eprintln!(
+            "[hipfire] serve.ocr_format={} applies to {} model name(s) declaring compact-block output",
+            format.config_value(),
+            compact_block_models.len()
+        );
+    }
     if ui_enabled {
         if api_key.is_some() {
             eprintln!("[hipfire] {UI_AUTH_NOTICE}");
@@ -2025,6 +2133,10 @@ pub(crate) fn serve_foreground(
         max_request_bytes,
         ui_enabled,
     );
+    let mut capabilities = capabilities;
+    capabilities["ocr_format"] = serde_json::json!(ocr_format
+        .map(ocr::OcrFormat::config_value)
+        .unwrap_or("raw"));
     let shared = Arc::new(ServeShared {
         capabilities,
         metrics: metrics::Metrics::default(),
@@ -2075,6 +2187,8 @@ pub(crate) fn serve_foreground(
         backoff_hook: Mutex::new(None),
         stream_stall_timeout,
         ui_enabled,
+        ocr_format,
+        compact_block_models,
         api_key,
     });
     let bind = format_bind(host, port);
@@ -3232,6 +3346,43 @@ mod tests {
             },
             root,
             config,
+        }
+    }
+
+    /// `serve.ocr_format` applies only to models whose registry row declares
+    /// the compact-block contract, under every name a request may use.
+    #[test]
+    fn compact_block_models_covers_tags_aliases_and_file_names() {
+        let registry = hipfire_registry::bundled().unwrap();
+        let models = CompactBlockModels::from_registry(&registry);
+        for name in [
+            "surya-ocr-2.5:q8",
+            "surya-ocr-2.5",
+            "surya",
+            "surya-ocr-2.5.q8",
+        ] {
+            assert!(models.contains(name), "{name} must declare compact blocks");
+        }
+        for name in ["qwen3.5:9b", "qwen3.5", "lightonocr3:0.8b"] {
+            assert!(!models.contains(name), "{name} must stay text");
+        }
+        // A path load names the artifact by path; its basename identifies it.
+        for name in [
+            "/models/hipfire/Datalab/surya-ocr-2.5-Q8/surya-ocr-2.5.q8",
+            "./surya-ocr-2.5.q8",
+            "models/surya-ocr-2.5.q8",
+        ] {
+            assert!(models.contains(name), "{name} must declare compact blocks");
+        }
+        // Only artifact file names match by basename, not tags or aliases,
+        // and a text model's path stays text.
+        for name in [
+            "/models/surya",
+            "/models/surya-ocr-2.5",
+            "/models/lightonocr3-0.8b.q8",
+            "/models/surya-ocr-2.5.q8.vl",
+        ] {
+            assert!(!models.contains(name), "{name} must stay text");
         }
     }
 
