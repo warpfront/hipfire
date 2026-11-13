@@ -2984,7 +2984,7 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // gfx94x split: opt-in via HIPFIRE_GFX942_RMSNORM_SPLIT=1.
+        // gfx94x split: default on gfx940/941/942 (HIPFIRE_GFX942_RMSNORM_SPLIT=0 opts out).
         // Two-kernel path (reduce + rotate) gives 5× more in-flight wave64s
         // on prefill scale; modest decode change. It is mathematically
         // equivalent, but its reduction order is not byte-identical.

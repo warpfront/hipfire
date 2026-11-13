@@ -23,8 +23,8 @@ extern "C" __global__ __launch_bounds__(64)
 void rotate_with_rms_gfx942(
     const float* __restrict__ x,          // [batch, K]
     const float* __restrict__ weight,     // [K]
-    const float* __restrict__ signs1,     // [K]
-    const float* __restrict__ signs2,     // [K]
+    const float* __restrict__ signs1,     // [256], shared by every group
+    const float* __restrict__ signs2,     // [256], shared by every group
     const float* __restrict__ rms_in,     // [batch]
     float* __restrict__ x_rot,            // [batch, K]
     int K
@@ -47,11 +47,14 @@ void rotate_with_rms_gfx942(
     // Apply Phase 1c (x * weight * rms) then Phase 2 (* signs1) in the SAME
     // left-associative order as the baseline kernel to preserve FP rounding:
     //   baseline: x_shared[i] = x_b[i] * weight[i] * rms;   // = ((x*w)*r)
-    //             v = x_shared[i] * signs1[i];              // = ((x*w)*r) * s
-    // We compute (((x*w)*r)*s) directly here per element.
+    //             v = x_shared[i] * signs1[i % 256];        // = ((x*w)*r) * s
+    // We compute (((x*w)*r)*s) directly here per element. The norm weight is
+    // per element of the row (index base + idx); only the signs repeat per
+    // 256-group (index d0 + idx). Indexing the weight with d0 applied group
+    // 0's weights to every group (#1136: garbage on K > 256 trunks).
     #define LOAD_V(idx, vname) \
         float vname; { \
-            float _xw = x_b[base + (idx)] * weight[d0 + (idx)]; \
+            float _xw = x_b[base + (idx)] * weight[base + (idx)]; \
             float _xwr = _xw * rms; \
             vname = _xwr * signs1[d0 + (idx)]; \
         }
