@@ -1146,7 +1146,18 @@ impl SemanticEventFold {
                         forward.push(serde_json::json!({ "type": "reasoning", "text": text }));
                     } else {
                         self.content.push_str(text);
-                        forward.push(serde_json::json!({ "type": "token", "text": text }));
+                        let mut logical = serde_json::json!({ "type": "token", "text": text });
+                        // Logprobs ride the daemon's token envelope and must
+                        // survive the fold: the non-stream path reads the RAW
+                        // event, so rebuilding the logical token without them
+                        // left `stream: true` + `logprobs` silently empty.
+                        if let Some(lp) = event.get("logprob") {
+                            logical["logprob"] = lp.clone();
+                        }
+                        if let Some(top) = event.get("top_logprobs") {
+                            logical["top_logprobs"] = top.clone();
+                        }
+                        forward.push(logical);
                     }
                 }
             }
@@ -7362,6 +7373,47 @@ mod tests {
             json2["choices"][0].get("logprobs").is_none(),
             "empty content must also be absent"
         );
+    }
+
+    /// The streamed delta is built from the fold's **logical** event, while
+    /// the non-stream response is built from the **raw** one. A logical token
+    /// event that dropped `logprob` therefore made `stream: true` + `logprobs`
+    /// silently empty (measured on gfx1100: non-stream 12 entries, stream
+    /// 0/14 chunks) while non-stream kept working. The fold must carry both.
+    #[test]
+    fn fold_preserves_logprobs_on_the_logical_token_event() {
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-lp", 3);
+        let logical = fold
+            .push(&serde_json::json!({
+                "type": "token",
+                "text": "Rivers",
+                "logprob": -0.25,
+                "top_logprobs": [
+                    { "token": "Rivers", "logprob": -0.25, "bytes": [82] },
+                    { "token": "R", "logprob": -1.5, "bytes": [82] }
+                ],
+                "id": "req-lp",
+                "attempt_id": 3
+            }))
+            .unwrap();
+        assert_eq!(logical.len(), 1);
+        assert_eq!(logical[0]["text"], "Rivers");
+        assert!((logical[0]["logprob"].as_f64().unwrap() + 0.25).abs() < 1e-6);
+        assert_eq!(logical[0]["top_logprobs"][1]["token"], "R");
+        // ...and it reaches the OpenAI chunk shape the SSE encoder emits.
+        assert_eq!(
+            openai_stream_logprobs_for_event(&logical[0]).unwrap()["content"][0]["token"],
+            "Rivers"
+        );
+        // A token event without logprobs stays byte-identical (no field).
+        let plain = fold
+            .push(&serde_json::json!({
+                "type": "token", "text": " flow", "id": "req-lp", "attempt_id": 3
+            }))
+            .unwrap();
+        assert!(plain[0].get("logprob").is_none());
+        assert!(openai_stream_logprobs_for_event(&plain[0]).is_none());
     }
 
     #[test]
