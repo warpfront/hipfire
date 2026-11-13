@@ -414,12 +414,9 @@ re-learned per session.
   engine.** A wrong-recipe model (e.g. dense-AWQ on an MoE) lobotomizes output
   and burns engine-debugging cycles. Coherence gates must include a bare factual
   prompt — strong/code prompts mask a lobotomy.
-- **Byte-parity validation requires deterministic recurrent state.** Production
-  Q8 DeltaNet state has default-on error feedback (`q8_ef`,
-  `HIPFIRE_DN_STATE_EF=1`) and is deterministic; leave the production default
-  enabled when validating the shipping route. If explicitly testing legacy
-  stochastic Q8 (`HIPFIRE_DN_STATE_EF=0`), byte parity is meaningless: re-enable
-  EF or pin FP32 plus `HIPFIRE_DETERMINISTIC=1`.
+- **Byte-parity validation requires deterministic recurrent state.** Q8
+  DeltaNet state always carries error feedback (`q8_ef`) and is deterministic;
+  validate the shipping route on it, or pin FP32 plus `HIPFIRE_DETERMINISTIC=1`.
 - **NaN defeats a `max`-based relative-error check.** `if rel > worst { worst = rel }`
   scores NaN↔NaN as 0, so an all-NaN comparison reads as "bit-exact agreement".
   Compare with an explicit `is_nan()` (or fail on any non-finite element).

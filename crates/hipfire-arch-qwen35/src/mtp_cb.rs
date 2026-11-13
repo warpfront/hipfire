@@ -115,7 +115,6 @@ fn draft_batchable(
         && head.weights.lm_head_draft.is_none()
         && st.sampling.is_greedy()
         && st.p_min <= 0.0
-        && mtp_device_token_chain_enabled_from_env()
         && mtp_device_token_chain_eligible_for(weights.embd_format, false, false)
         && weights.output.gpu_dtype == DType::MQ4G256V2
         && gpu.arch_caps.is_gfx1201()

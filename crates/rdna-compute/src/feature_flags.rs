@@ -942,9 +942,6 @@ pub struct FeatureFlags {
     /// qwen35 DFlash GPU softmax/nucleus fast path on the temp>0 sampled verify.
     /// **Default ON**; opt out with `HIPFIRE_DFLASH_FAST_SAMPLE=0`.
     pub dflash_fast_sample: bool,
-    /// qwen35 DFlash Q8 WMMA lm_head in verify. **Default ON**; opt out with
-    /// `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` ∈ {0,false,off,no}.
-    pub dflash_q8_lmhead_wmma: bool,
 
     /// Fold the 3 separate QKV `BiasAdd` launches (qwen2-family `attention_bias`)
     /// into the per-row fused-QKV decode kernel's lane-0 store. Eliminates 3 tiny
@@ -1733,13 +1730,6 @@ impl FeatureFlags {
                 .unwrap_or(false),
 
             dflash_fast_sample: value("HIPFIRE_DFLASH_FAST_SAMPLE").as_deref() != Ok("0"),
-            dflash_q8_lmhead_wmma: match value("HIPFIRE_DFLASH_Q8_LMHEAD_WMMA") {
-                Ok(v) => {
-                    let v = v.trim().to_ascii_lowercase();
-                    !(v == "0" || v == "false" || v == "off" || v == "no")
-                }
-                Err(_) => true,
-            },
 
             // QKV bias fold — default ON, opt out with HIPFIRE_FUSE_QKV_BIAS=0.
             fuse_qkv_bias: parse_bool("HIPFIRE_FUSE_QKV_BIAS").unwrap_or(true),
@@ -2672,7 +2662,6 @@ impl FeatureFlags {
             hipcc_extra_flags: String::new(),
             force_unfused: false,
             dflash_fast_sample: true,
-            dflash_q8_lmhead_wmma: true,
             fuse_qkv_bias: true,
             fuse_qkv_bias_debug: false,
             dn_snapshot_bulk_off: false,

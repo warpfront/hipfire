@@ -2189,10 +2189,9 @@ pub struct DflashSpeculator {
     sample_top_p: f32,
     sample_top_k: usize,
     sample_cactus: f32,
-    /// Divergent-render checkpoint ring. Populated by `prefill`'s seed when
-    /// `resume_enabled`; freed on `reset`/`free`.
+    /// Divergent-render checkpoint ring. Populated by `prefill`'s seed; freed on
+    /// `reset`/`free`.
     checkpoints: Vec<(usize, DeltaNetSnapshot)>,
-    resume_enabled: bool,
     ck_interval: usize,
     ck_cap: usize,
     /// This request's user-turn boundary (`Speculator::set_turn_boundary`), taken by
@@ -2235,19 +2234,13 @@ pub struct DflashWindowMark {
 }
 
 impl DflashSpeculator {
-    /// `resume_enabled`/`ck_interval`/`ck_cap` mirror the daemon's
-    /// `ckpt_resume_enabled()`/`ckpt_interval()`/`ckpt_max()` — passed in by
-    /// `build_dflash_speculator` so `new` itself is env-free (and unit-testable).
+    /// `ck_interval`/`ck_cap` mirror the daemon's `ckpt_interval()`/`ckpt_max()`
+    /// — passed in by `build_dflash_speculator` so `new` itself is env-free (and
+    /// unit-testable).
     /// `adaptive_b` is the already-resolved knob (load param AND env
     /// kill-switch AND the retained-PM4 gate folded by `build_dflash_speculator`)
     /// — likewise env-free and PM4-free here.
-    pub fn new(
-        df: DflashState,
-        resume_enabled: bool,
-        ck_interval: usize,
-        ck_cap: usize,
-        adaptive_b: bool,
-    ) -> Self {
+    pub fn new(df: DflashState, ck_interval: usize, ck_cap: usize, adaptive_b: bool) -> Self {
         let adaptive = DflashAdaptiveBlock::new(df.block_size, adaptive_b);
         Self {
             df: Some(df),
@@ -2266,7 +2259,6 @@ impl DflashSpeculator {
             checkpoints: Vec::new(),
             turn_boundary: None,
             pinned_boundary: None,
-            resume_enabled,
             ck_interval,
             ck_cap,
             last_window: None,
@@ -2294,7 +2286,7 @@ impl DflashSpeculator {
     /// Resolved DeltaNet checkpoint cadence of this speculator.
     pub fn checkpoint_policy(&self) -> DflashCheckpointPolicy {
         DflashCheckpointPolicy {
-            resume_enabled: self.resume_enabled,
+            resume_enabled: true,
             interval: self.ck_interval,
             cap: self.ck_cap,
         }
@@ -2400,14 +2392,10 @@ impl Speculator for DflashSpeculator {
         // following tool-result requests until the next user turn. One-shot per
         // request.
         let mut turn = TurnCheckpoint {
-            boundary: self.turn_boundary.take().filter(|_| self.resume_enabled),
+            boundary: self.turn_boundary.take(),
             pin: self.pinned_boundary,
         };
-        let ckpt_sink = if self.resume_enabled {
-            Some(&mut self.checkpoints)
-        } else {
-            None
-        };
+        let ckpt_sink = Some(&mut self.checkpoints);
         let aborted = if cache_hit {
             seed_target_hidden_suffix_abortable(
                 gpu,
@@ -3014,7 +3002,7 @@ impl Speculator for DflashSpeculator {
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
         let mut parts = DflashTargetParts::from_slot(slot);
         let policy = DflashCheckpointPolicy {
-            resume_enabled: self.resume_enabled,
+            resume_enabled: true,
             interval: self.ck_interval,
             cap: self.ck_cap,
         };
@@ -3190,7 +3178,7 @@ impl Speculator for DflashSpeculator {
 
 /// Construct the DFlash speculator from a freshly-loaded `DflashState`, resolving
 /// the env config the daemon's old `generate_dflash` read inline: checkpoint
-/// resume (`HIPFIRE_DFLASH_CKPT_RESUME`) and interval/cap
+/// interval/cap
 /// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
 /// `ckpt_interval()`/`ckpt_max()` defaults), plus the adaptive-B kill-switch
 /// (`HIPFIRE_DFLASH_ADAPTIVE_B=0` forces the fixed full block, mirroring
@@ -3198,10 +3186,6 @@ impl Speculator for DflashSpeculator {
 /// `adaptive_b` is the `SpecLoadCfg::dflash_adaptive_b` load param (None =
 /// default off).
 pub fn build_dflash_speculator(df: DflashState, adaptive_b: bool) -> Box<dyn Speculator> {
-    let resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
-        .ok()
-        .as_deref()
-        != Some("0");
     let ck_interval = hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -3235,7 +3219,7 @@ pub fn build_dflash_speculator(df: DflashState, adaptive_b: bool) -> Box<dyn Spe
         );
     }
     let adaptive_b = adaptive_b && !pm4_replay;
-    let mut speculator = DflashSpeculator::new(df, resume_enabled, ck_interval, ck_cap, adaptive_b);
+    let mut speculator = DflashSpeculator::new(df, ck_interval, ck_cap, adaptive_b);
     speculator.configure_lookup(
         hipfire_config::dflash_lookup_enabled(),
         hipfire_config::dflash_lookup_tail_enabled(),
@@ -3483,7 +3467,7 @@ impl DflashSpeculator {
             tape_max_rows: df.gdn_tape.max_n,
             block_size: df.block_size,
             checkpoint: DflashCheckpointPolicy {
-                resume_enabled: self.resume_enabled,
+                resume_enabled: true,
                 interval: self.ck_interval,
                 cap: self.ck_cap,
             },
@@ -3523,7 +3507,7 @@ impl DflashSpeculator {
             sample_cactus: self.sample_cactus,
             checkpoints: std::mem::take(&mut self.checkpoints),
             policy: DflashCheckpointPolicy {
-                resume_enabled: self.resume_enabled,
+                resume_enabled: true,
                 interval: self.ck_interval,
                 cap: self.ck_cap,
             },
