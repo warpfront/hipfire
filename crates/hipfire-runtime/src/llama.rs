@@ -1975,24 +1975,6 @@ pub fn llama_batched_prefill_eligible(
         && token_count >= 4
 }
 
-/// Kill-switch for the MQ-V2 (qt44 + neutral qt47-50) gfx11 WMMA prefill path:
-/// gfx12 (`gfx1200`/`gfx1201`) is always admitted, gfx11
-/// (`gfx1100`/`gfx1101`/`gfx1102`/`gfx1150`/`gfx1151`) is admitted unless
-/// `value` is `Some("0")`, anything else is rejected.
-pub fn mqv2_gfx11_wmma_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
-    let gfx11_enabled = value != Some("0");
-    if matches!(arch, "gfx1200" | "gfx1201") {
-        true
-    } else if matches!(
-        arch,
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
-    ) {
-        gfx11_enabled
-    } else {
-        false
-    }
-}
-
 /// Admit rule for the MQ-V2 family (`MQ4G256V2` + neutral `MQ6/5/3/2G256V2`)
 /// in batched WMMA prefill: dtype set × arch set (gfx11
 /// `gfx1100`/`gfx1101`/`gfx1102`/`gfx1150`/`gfx1151` and gfx12
