@@ -1581,7 +1581,51 @@ impl Tokenizer {
             return result;
         }
 
-        // Split text at special token boundaries (greedy longest match)
+        // The vision frame tokens are atomic: split the text on them before
+        // any other added token is matched. A vocab can carry short added
+        // tokens that end in `<` (Surya-ocr-2.5 has `.<`, `:<`, `><` for its
+        // compact HTML); matched leftmost-first, as HF `tokenizers` does,
+        // `HTML.<|vision_start|>` encodes as `.<` + `|vision_start|>` pieces
+        // and the image slot renders 0 `<|image_pad|>` positions. Wherever no
+        // added token overlaps a frame token this split falls on a boundary
+        // the matching below would produce anyway, so the ids are unchanged.
+        let mut remaining = text;
+        while let Some((at, len, id)) = self.next_vision_frame_token(remaining) {
+            self.encode_added_tokens_into(&remaining[..at], &mut result);
+            result.push(id);
+            remaining = &remaining[at + len..];
+        }
+        self.encode_added_tokens_into(remaining, &mut result);
+        result
+    }
+
+    /// The vision frame literals [`Self::encode`] keeps atomic.
+    const VISION_FRAME_TOKENS: [&'static str; 4] = [
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|image_pad|>",
+        "<|video_pad|>",
+    ];
+
+    /// Earliest vision frame token in `text` that this vocab registers:
+    /// `(byte offset, byte length, id)`.
+    fn next_vision_frame_token(&self, text: &str) -> Option<(usize, usize, u32)> {
+        if !text.contains("<|") {
+            return None;
+        }
+        Self::VISION_FRAME_TOKENS
+            .iter()
+            .filter_map(|literal| {
+                let at = text.find(literal)?;
+                let id = self.special_token_id(literal)?;
+                Some((at, literal.len(), id))
+            })
+            .min_by_key(|(at, _, _)| *at)
+    }
+
+    /// Split `text` at added-token boundaries (greedy longest match at each
+    /// position) and encode the segments between them.
+    fn encode_added_tokens_into(&self, text: &str, result: &mut Vec<u32>) {
         let mut remaining = text;
         while !remaining.is_empty() {
             // Try to match a special token at current position
@@ -1613,7 +1657,6 @@ impl Tokenizer {
             }
             remaining = &remaining[next_special..];
         }
-        result
     }
 
     /// Encode without special token handling.
@@ -4349,6 +4392,71 @@ mod prompt_norm_tests {
         let out = normalize_prompt_with(s, false);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), s);
+    }
+}
+
+#[cfg(test)]
+mod vision_frame_atomic_tests {
+    use super::*;
+
+    /// A Surya-ocr-2.5-shaped vocab: WordLevel-style single-char pieces plus
+    /// short non-special added tokens that end in `<` (`.<`, `:<`, `><`), and
+    /// the special vision frame. Matched leftmost-first (HF `tokenizers`
+    /// gives the same ids for the real checkpoint), text glued to the frame
+    /// would swallow its `<` and the image slot would vanish.
+    fn surya_like() -> Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        for (i, c) in [
+            "H", "T", "M", "L", ".", ":", "o", "k", "O", "K", "<", ">", "|", " ",
+        ]
+        .iter()
+        .enumerate()
+        {
+            vocab.insert((*c).to_owned(), serde_json::json!(100 + i));
+        }
+        let tok = serde_json::json!({
+            "model": { "type": "BPE", "vocab": vocab, "merges": [] },
+            "added_tokens": [
+                {"id": 1, "content": "<|im_start|>", "special": true},
+                {"id": 2, "content": "<|im_end|>", "special": true},
+                {"id": 9, "content": "<|vision_start|>", "special": true},
+                {"id": 10, "content": "<|vision_end|>", "special": true},
+                {"id": 11, "content": "<|image_pad|>", "special": true},
+                {"id": 50, "content": ".<", "special": false},
+                {"id": 51, "content": ":<", "special": false},
+                {"id": 52, "content": "><", "special": false}
+            ]
+        })
+        .to_string();
+        Tokenizer::from_hf_json(&tok).expect("tokenizer parses")
+    }
+
+    #[test]
+    fn text_glued_to_the_vision_frame_keeps_the_image_pad() {
+        let t = surya_like();
+        for text in [
+            "HTML.<|vision_start|><|image_pad|><|vision_end|>",
+            "Look:<|vision_start|><|image_pad|><|vision_end|>OK",
+            "<|im_start|>HTML.<|vision_start|><|image_pad|><|vision_end|><|im_end|>",
+        ] {
+            let ids = t.encode(text);
+            let frame = [9u32, 11, 10];
+            assert!(
+                ids.windows(3).any(|w| w == frame),
+                "{text:?} must keep the vision frame atomic: {ids:?}"
+            );
+        }
+    }
+
+    /// Outside the vision frame nothing changes: an added token that is not
+    /// adjacent to a frame token still matches leftmost-first (the
+    /// checkpoint's own `.<|im_end|>` pieces, as HF encodes them).
+    #[test]
+    fn added_tokens_away_from_the_frame_keep_their_encoding() {
+        let t = surya_like();
+        assert_eq!(t.encode("HTML.<|im_end|>")[4], 50, "`.<` still matches");
+        let glued = t.encode("HTML. <|vision_start|><|image_pad|><|vision_end|>");
+        assert_eq!(&glued[glued.len() - 3..], &[9, 11, 10]);
     }
 }
 
