@@ -366,7 +366,7 @@ impl Ledger {
     }
 
     pub fn required(&self, insn: &Instruction) -> Vec<(Counter, u8, Reason)> {
-        self.required_with(insn, true)
+        self.required_with(insn, true, false)
     }
 
     /// `required` for replaying emitted code (`ledger_cfg`; the Builder never calls it, its
@@ -374,18 +374,43 @@ impl Ledger {
     /// slot retires: a younger write to a register a pending VMEM store, returnless VMEM
     /// atomic or DS store reads needs no counter wait (no `Reason::War`). The operation
     /// still occupies its counter slot, still orders in-flight loads, and still makes a
-    /// barrier wait (`pending_stores`); loads' results (RAW, WAW) are unaffected. Every
-    /// other architecture is `required` exactly. Basis, see the module docs: the CDNA3 ISA
-    /// defines the counters by when the memory *effect* completes (§4.4 p.19-20) and bounds
-    /// the consumption of store data by wait states (§4.5 Table 11 p.20, enforced by
-    /// `cdna::hazard`), not by a counter.
+    /// barrier wait (`pending_stores`). A younger GLOBAL load may overwrite an older
+    /// GLOBAL load's VGPR result in their ordered VM stream (module docs); this does not
+    /// retire either operation or permit a read of either result. Other WAWs and every
+    /// RAW are unchanged. Every other architecture is `required` exactly. Store-source
+    /// lifetime follows the ISA's memory-effect counters and wait states (§4.4–4.5).
     pub(crate) fn required_replay(&self, insn: &Instruction) -> Vec<(Counter, u8, Reason)> {
-        self.required_with(insn, self.arch != Some(Arch::Gfx942))
+        let gfx942 = self.arch == Some(Arch::Gfx942);
+        self.required_with(insn, !gfx942, gfx942)
     }
 
-    fn required_with(&self, insn: &Instruction, hold_sources: bool) -> Vec<(Counter, u8, Reason)> {
+    fn required_with(
+        &self,
+        insn: &Instruction,
+        hold_sources: bool,
+        ordered_waw: bool,
+    ) -> Vec<(Counter, u8, Reason)> {
+        // Keep this proof narrower than counter retirement: GLOBAL VGPR loads only,
+        // with no unordered/mixed VM class in flight. FLAT, atomics, BUFFER, DS and
+        // AGPR results require their existing waits. Read operands are checked first.
+        let global_load = ordered_waw
+            && insn.memory == Some(MemoryClass::VmemLoad)
+            && insn.mnemonic().starts_with("global_load_")
+            && self.pending.iter().filter(|p| p.counter == Counter::Vm).all(|p| {
+                p.in_order
+                    && !p.maybe
+                    && p.order == OrderClass::Gfx9Vmem
+                    && p.family == MemoryFamily::Global
+            });
         let mut waits: Vec<(Counter, u8, Reason)> = Vec::new();
         for (index, pending) in self.pending.iter().enumerate() {
+            let ordered_pair = global_load
+                && pending.counter == Counter::Vm
+                && pending.in_order
+                && !pending.maybe
+                && pending.order == OrderClass::Gfx9Vmem
+                && pending.family == MemoryFamily::Global
+                && pending.src_locks.is_empty();
             let reason = pending
                 .defs
                 .iter()
@@ -397,6 +422,9 @@ impl Ledger {
                             reg: def.to_string(),
                         })
                         .or_else(|| {
+                            if ordered_pair && def.kind == crate::reg::Kind::V {
+                                return None;
+                            }
                             insn.defs
                                 .iter()
                                 .find(|write| def.overlaps(**write))
@@ -1081,6 +1109,82 @@ mod gfx942_tests {
             l.record(arch, i)
         }
         l
+    }
+
+    #[test]
+    fn ordered_global_waw_keeps_both_loads_and_all_raw_obligations() {
+        let a = load("global_load_dword v1, v8, s[4:5]", 1);
+        let b = load("global_load_dword v1, v8, s[6:7]", 1);
+        let mut l = ledger(Arch::Gfx942, &[a.clone()]);
+        assert!(matches!(l.required(&b)[0].2, Reason::Waw { .. }));
+        assert!(l.required_replay(&b).is_empty());
+        l.record(Arch::Gfx942, &b);
+        assert_eq!(l.shape().len(), 2);
+        assert!(l.is_pending(0) && l.is_pending(1));
+        assert_eq!(l.required_replay(&read(1))[0].1, 0);
+        l.wait_replay(Counter::Vm, 1);
+        assert!(!l.is_pending(0) && l.is_pending(1));
+        assert!(matches!(l.required_replay(&write(1))[0].2, Reason::Waw { .. }));
+        l.wait_replay(Counter::Vm, 0);
+        assert!(l.required_replay(&read(1)).is_empty());
+        // Destination aliases the younger load's address: RAW is not an ordered WAW.
+        let alias = Instruction::new(
+            "global_load_dword v1, v[1:2], off",
+            vec![v(1)],
+            vec![v(1), v(2)],
+        )
+        .memory(MemoryClass::VmemLoad);
+        let l = ledger(Arch::Gfx942, &[a]);
+        assert!(matches!(l.required_replay(&alias)[0].2, Reason::Use { .. }));
+    }
+
+    #[test]
+    fn global_waw_never_discharges_other_classes_or_mixed_vm_queues() {
+        let global = load("global_load_dword v1, v8, s[4:5]", 1);
+        let buffer = load("buffer_load_dword v1, v8, s[4:7], s9 offen", 1);
+        let flat = Instruction::new("flat_load_dword v1, v[8:9]", vec![v(1)], vec![v(8)])
+            .memory(MemoryClass::Flat { load: true });
+        let atomic = Instruction::new("global_atomic_add v1, v8, v4", vec![v(1)], vec![v(8)])
+            .memory(MemoryClass::VmemAtomic { returns: true });
+        for (older, younger) in [
+            (global.clone(), write(1)),
+            (global.clone(), ds_load(1)),
+            (ds_load(1), global.clone()),
+            (ds_load(1), ds_load(1)),
+            (global.clone(), flat.clone()),
+            (flat.clone(), global.clone()),
+            (global.clone(), buffer.clone()),
+            (buffer.clone(), global.clone()),
+            (global.clone(), atomic.clone()),
+            (atomic, global.clone()),
+        ] {
+            let l = ledger(Arch::Gfx942, &[older]);
+            assert!(!l.required_replay(&younger).is_empty(), "{}", younger.text);
+        }
+        for mixed in [flat, buffer] {
+            let l = ledger(Arch::Gfx942, &[global.clone(), mixed]);
+            assert!(!l.required_replay(&global).is_empty());
+        }
+        for arch in [Arch::Gfx1100, Arch::Gfx1201] {
+            let l = ledger(arch, &[global.clone()]);
+            assert!(!l.required_replay(&global).is_empty());
+        }
+        // Unknown/maybe queue entries cannot acquire a hardware-ordering proof.
+        let mut l = ledger(Arch::Gfx942, &[global.clone()]);
+        l.pending[0].maybe = true;
+        assert!(!l.required_replay(&global).is_empty());
+        l.pending[0].maybe = false;
+        l.pending[0].in_order = false;
+        assert!(!l.required_replay(&global).is_empty());
+        // AGPR writeback has not been covered by the VGPR hardware receipt.
+        let agpr = Instruction::new(
+            "global_load_dword a1, v8, s[4:5]",
+            vec![r(Kind::A, 1)],
+            vec![v(8)],
+        )
+        .memory(MemoryClass::VmemLoad);
+        let l = ledger(Arch::Gfx942, &[agpr.clone()]);
+        assert!(!l.required_replay(&agpr).is_empty());
     }
 
     /// Loads and stores of buffer and global share VM_CNT in issue order
