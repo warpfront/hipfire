@@ -2,7 +2,7 @@
   "oracle": "qwen4_g942_rows16_grid_oracle",
   "seed": 11400714819323198485,
   "quick": false,
-  "image": "/scratch/quant/fn-fp8/beat/WC8/twine/rows16-grid.elf",
+  "image": "/scratch/quant/fn-fp8/beat/WC8/abi-rcpt/rows16-grid.elf",
   "cases_pass": 770,
   "cases_fail": 0,
   "controls_detected": 17,

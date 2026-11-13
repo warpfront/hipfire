@@ -100,10 +100,10 @@ fn exact_image_hardware_receipt_is_hash_bound() {
     assert_eq!(r["raw_log_sha256"], sha(LOG.as_bytes()));
     assert_eq!(r["raw_receipt_sha256"], sha(ORACLE.as_bytes()));
     assert_eq!(r["ledger"]["exit"], 0);
-    assert_eq!(r["ledger"]["owner"], "TwinWide942f.twins");
+    assert_eq!(r["ledger"]["owner"], "Mi300xWideC8d.rcpt");
     assert_eq!(
         r["binary_sha256"],
-        "452c02e2caec2c53f9746e1d7e1dd7ed9eb4ccb2ea024fb36e11f597e10c7da7"
+        "01001d080759fe821fd5c7e0192428b7b01a88b9608257274a5a3d7d138d9f2c"
     );
     assert_eq!(
         r["oracle_source_sha256"],

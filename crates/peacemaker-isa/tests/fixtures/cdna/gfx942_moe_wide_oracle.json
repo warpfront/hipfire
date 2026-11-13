@@ -24,7 +24,7 @@
       "pass": 100
     }
   },
-  "image": "/scratch/quant/fn-fp8/beat/WC8/twine/moe-wide.elf",
+  "image": "/scratch/quant/fn-fp8/beat/WC8/abi-rcpt/moe-wide.elf",
   "image_env": "HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE",
   "oracle": "qwen4_g942_moe_wide_oracle",
   "quick": false,
