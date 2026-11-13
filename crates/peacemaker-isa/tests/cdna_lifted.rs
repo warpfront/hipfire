@@ -171,6 +171,67 @@ fn missing_vmem_wait_fails_and_the_wait_fixes_it() {
 }
 
 #[test]
+fn same_vmem_read_class_waw_keeps_pending_results_across_widths_and_policies() {
+    for (old_op, old_base, new_op, new_base, shared) in [
+        (FlatOp::LoadDword, 1, FlatOp::LoadDwordx2, 0, 1),
+        (FlatOp::LoadDwordx2, 0, FlatOp::LoadDword, 1, 1),
+        (FlatOp::LoadDwordx4, 0, FlatOp::LoadDwordx2, 2, 2),
+        (FlatOp::LoadUbyte, 1, FlatOp::LoadDword, 1, 1),
+        (FlatOp::LoadDword, 1, FlatOp::LoadUshort, 1, 1),
+    ] {
+        for old_policy in 0..8 {
+            for new_policy in 0..8 {
+                let load_with = |op, base, policy| {
+                    let mut i = ops::global_load(op, v(base), v(40), None, 0);
+                    let Inst::Flat(f) = &mut i else { unreachable!() };
+                    f.sc0 = policy & 1 != 0;
+                    f.sc1 = policy & 2 != 0;
+                    f.nt = policy & 4 != 0;
+                    i
+                };
+                let older = load_with(old_op, old_base, old_policy);
+                let younger = load_with(new_op, new_base, new_policy);
+                ok(&[older.clone(), younger.clone(), wait(0, 15), use_of(shared), end()]);
+                // A partial wait retires only the older result, not the younger one.
+                fails(
+                    &[older.clone(), younger.clone(), wait(1, 15), use_of(shared), end()],
+                    "Vm wait",
+                );
+                fails(&[older, younger, use_of(shared), end()], "Vm wait");
+            }
+        }
+    }
+}
+
+#[test]
+fn ordered_load_waw_is_not_an_exec_path_exemption() {
+    // The conv-fuse pattern issues optional per-lane loads, switches EXEC, then
+    // loads the same VGPR again. Ordering is proven without claiming disjoint
+    // EXEC masks, dropping operations, or pruning a feasible branch.
+    let pair = [
+        ops::s1(Sop1Op::MovB64, Src::ExecLo, Src::Int(1)),
+        load(1),
+        ops::s1(Sop1Op::MovB64, Src::ExecLo, Src::Int(-1)),
+        load(1),
+    ];
+    let mut p = pair.to_vec();
+    p.extend([wait(0, 15), use_of(1), end()]);
+    ok(&p);
+    let mut p = pair.to_vec();
+    p.extend([use_of(1), end()]);
+    fails(&p, "Vm wait");
+    // A genuine reachable WAW, including under a different EXEC, still refuses.
+    fails(&[
+        load(1),
+        ops::s1(Sop1Op::MovB64, Src::ExecLo, Src::Int(1)),
+        ops::v1(Vop1Op::MovB32, v(1), v(0)),
+        end(),
+    ], "Waw");
+    fails(&[load(1), ds_read(1), wait(0, 0), end()], "Waw");
+    fails(&[ds_read(1), load(1), wait(0, 0), end()], "Waw");
+}
+
+#[test]
 fn store_sources_are_not_counter_held_on_gfx942_but_counters_and_barriers_still_count() {
     let overwrite = |data: u8| ops::v1(Vop1Op::MovB32, v(data), v(0));
     // The CDNA3 ISA has no counter for "store data read" outside GWS (EXP_CNT): overwriting
