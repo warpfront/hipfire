@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- **gfx1150 (Strix Point) takes the measured qt44 (MQ4G256V2) prefill weight-reuse tiles: +74% prefill on Qwen3.8-27B.** `mqv2_prefill_batch_tile` had no gfx1150 bits=4 row, so every prefill chunk of an MQ4V2 dense model fell through to the one-tile base WMMA kernel. It now returns the same BT12 (gate_up) / BT4 (qkvza, qkv, residual) policy as gfx1151 from N = 96, and the four MQ4V2 prefill dispatchers accept `"gfx1150"` on the branch that launches `gemm_*_mq4g256v2_wmma_gfx1151_bt`. One dequantized weight tile feeds `16 * batch_tile` output rows with the base kernel's per-output WMMA chain, K order and epilogue, so outputs are byte-identical: greedy prefill-plus-decode on `qwen3.8:27b-mq4-xts` is unchanged, and the change is behind `HIPFIRE_MQ4V2_GFX1150_BT` (default on for exact gfx1150, `0` restores the base kernel). Measured on Ryzen AI 9 HX 370 (gfx1150, 16 CU, ROCm 10.1 / HIP 7.16, kv q8, fully resident) with `benchmarks/prompts/agentic_pi_system.txt` (1235 tokens, 12 interleaved fresh processes): prefill 67.3 -> 117.1 tok/s median, no overlap between arms. Decode (batch 1) never takes the row.
+
 ## v0.4.6 — 2026-11-11
 
 0.4.6 is the freeze baseline for the 0.5.0 consolidation (#666). Entries are grouped by area.

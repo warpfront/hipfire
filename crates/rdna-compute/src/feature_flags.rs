@@ -627,6 +627,15 @@ pub struct FeatureFlags {
     /// gfx1151, false elsewhere; outputs are byte-identical to the base kernels.
     /// `HIPFIRE_GFX1151_XLDS=0` restores the historical base kernels.
     pub gfx1151_xlds: bool,
+    /// `HIPFIRE_MQ4V2_GFX1150_BT` admits the exact-gfx1150 qt44
+    /// (MQ4G256V2) prefill weight-reuse batch tiles that gfx1151 runs
+    /// (`gemm_*_mq4g256v2_wmma_gfx1151_bt`, N >= 96, BT4/BT12): one
+    /// dequantized weight tile feeds `16 * batch_tile` output rows, with the
+    /// per-output WMMA chain, K order and epilogue of the base kernel, so the
+    /// output is byte-identical. gfx1150 otherwise falls through to the
+    /// one-tile base WMMA kernel for every prefill chunk. Default on for exact
+    /// gfx1150; `0` restores the base route.
+    pub mq4v2_gfx1150_bt: bool,
     /// Exact-K5120 MQ4V2 gate/up decode on gfx1100: default on (byte-identical
     /// to the generic kernel; `HIPFIRE_MQ4V2_GATEUP_K5120=0` opts out).
     pub mq4v2_gateup_k5120: bool,
@@ -1558,6 +1567,8 @@ impl FeatureFlags {
             gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gfx1100_q8x_verify: parse_bool("HIPFIRE_GFX1100_Q8X_VERIFY").unwrap_or(arch == "gfx1100"),
             gfx1151_xlds: parse_bool("HIPFIRE_GFX1151_XLDS").unwrap_or(arch == "gfx1151"),
+            mq4v2_gfx1150_bt: parse_bool("HIPFIRE_MQ4V2_GFX1150_BT")
+                .unwrap_or(arch == "gfx1150"),
             mq4v2_gateup_k5120: parse_bool("HIPFIRE_MQ4V2_GATEUP_K5120").unwrap_or(true),
             gfx12_mq4v2_gateup_k5120: parse_bool("HIPFIRE_GFX12_MQ4V2_GATEUP_K5120")
                 .unwrap_or(false),
@@ -2654,6 +2665,7 @@ impl FeatureFlags {
             gate_up_ldsstage: false,
             gfx1100_q8x_verify: false,
             gfx1151_xlds: false,
+            mq4v2_gfx1150_bt: false,
             mq4v2_gateup_k5120: false,
             gfx12_mq4v2_gateup_k5120: false,
             gfx12_mq4v2_fp8_gateup: false,
