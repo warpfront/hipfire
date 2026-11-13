@@ -156,6 +156,8 @@
     "kernels/src/qwen4_g942_glue_elem.hip",
     "kernels/src/qwen4_g942_glue_moe.hip",
     "kernels/src/qwen4_g942_gdn_lanes_verify.gfx942.hip",
+    "kernels/src/qwen4_g942_moe_wide.gfx942.hip",
+    "kernels/src/qwen4_g942_moe_gemm.gfx942.hip",
     "kernels/src/qwen4_g942_qsa_row_attention.gfx942.hip",
     "kernels/src/qwen4_g942_rows16_grid.gfx942.hip",
     "kernels/src/qwen4_g942_hc_gates.gfx942.hip",
@@ -202,6 +204,12 @@
     "kernels/ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1201.hxaco"
   ],
   "pm_twins": {
+    "kernels/qwen4_g942_qsa_row_attention_pm_gfx942.hxaco": {
+      "hip_source": "kernels/src/qwen4_g942_qsa_row_attention.gfx942.hip",
+      "anchor": "kernels/qwen4_g942_qsa_row_attention_hipcc_gfx942.co",
+      "symbols": ["qwen4_g942_qsa_row_f32", "qwen4_g942_qsa_row_fp8_fnuz"],
+      "reason": "Frozen two-entry gfx942 single-row QSA Route-A twin; both F32 and FP8-FNUZ entries retain the exact device ELF and HIP/HSA ABI. Live launchers remain independently checked, with no dispatch or obligation exemption."
+    },
     "kernels/qwen4_g942_gemv_mq2g256v2_xbatch_pm_gfx942.hxaco": {
       "hip_source": "kernels/src/qwen4_g942_gemv_mq2g256v2_xbatch.gfx942.hip",
       "anchor": "kernels/qwen4_g942_gemv_mq2g256v2_xbatch_gfx942_hipcc_gfx942.co",
