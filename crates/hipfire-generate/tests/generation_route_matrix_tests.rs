@@ -35,7 +35,6 @@ fn base() -> GenerationRouteInputs {
         min_p: None,
         nonneutral_penalties: false,
         force_ar_chat: false,
-        fast_sample_on: true,
         supports_temp_verify: false,
         supports_chain_nucleus_verify: false,
         kv_adaptive: false,
@@ -787,7 +786,6 @@ fn qwen35_mtp_route_honors_penalties_but_dflash_stays_ar() {
         supports_temp_verify: false,
         supports_chain_nucleus_verify: false,
         ngram_can_sample: true,
-        fast_sample_on: true,
         temp: 0.7,
         ..dflash
     };
@@ -811,14 +809,6 @@ fn qwen35_mtp_route_honors_penalties_but_dflash_stays_ar() {
         }),
         GenerationRoute::QwenAr,
         "sampled DFlash1 chain + penalties"
-    );
-    assert_eq!(
-        select_generation_route(&GenerationRouteInputs {
-            fast_sample_on: false,
-            ..sampled_chain
-        }),
-        GenerationRoute::QwenAr,
-        "sampled DFlash1 chain needs FAST_SAMPLE"
     );
 }
 
@@ -1524,7 +1514,6 @@ fn dflash2_selector_chain_nucleus_routes() {
         supports_temp_verify: true,
         supports_chain_nucleus_verify: true,
         ngram_can_sample: true,
-        fast_sample_on: true,
         temp: 1.0,
         user_explicit_sampling: true,
         min_p: Some(0.0),
@@ -1539,7 +1528,6 @@ fn dflash2_selector_chain_nucleus_routes() {
         supports_temp_verify: true,
         supports_chain_nucleus_verify: true,
         ngram_can_sample: true,
-        fast_sample_on: true,
         temp: 1.0,
         user_explicit_sampling: true,
         min_p: Some(0.05),
@@ -1555,7 +1543,6 @@ fn dflash2_selector_chain_nucleus_routes() {
         supports_temp_verify: true,
         supports_chain_nucleus_verify: true,
         ngram_can_sample: true,
-        fast_sample_on: true,
         temp: 1.0,
         user_explicit_sampling: true,
         nonneutral_penalties: true,
@@ -1585,7 +1572,6 @@ fn dflash2_selector_chain_nucleus_routes() {
         supports_temp_verify: false,
         supports_chain_nucleus_verify: false,
         ngram_can_sample: true,
-        fast_sample_on: true,
         temp: 0.7,
         user_explicit_sampling: true,
         min_p: None,

@@ -149,8 +149,8 @@ pub struct PrefillBatchScratch {
     pub moe_inactive_backup: Option<GpuTensor>,
 
     // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) scratch. All
-    // allocated when num_experts > 0; gated at runtime by
-    // HIPFIRE_MOE_GROUPED_GEMM=1. m_total_max is tile-aligned:
+    // allocated when num_experts > 0; used on WMMA archs. m_total_max is
+    // tile-aligned:
     // align_up(max_batch * k_top + num_experts * (BLOCK_M - 1), BLOCK_M)
     // with BLOCK_M=16.
     //
@@ -368,8 +368,8 @@ impl PrefillBatchScratch {
             DType::F32
         );
 
-        // Path 2 scatter + grouped-WMMA-GEMM scratch (gated at runtime by
-        // HIPFIRE_MOE_GROUPED_GEMM=1). m_total_max = N*K_TOP + E*(BLOCK_M-1).
+        // Path 2 scatter + grouped-WMMA-GEMM scratch (used on WMMA archs).
+        // m_total_max = N*K_TOP + E*(BLOCK_M-1).
         // i32 buffers stored as Raw (4 bytes/elem matches; no DType::I32 yet).
         let i_moe_expert_token_counts = alloc_opt!(
             config.num_experts > 0,

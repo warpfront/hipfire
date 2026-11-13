@@ -206,10 +206,7 @@ pub fn gdn_compact_qk_div(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> Optio
 /// A3B route remains isolated from the 48-head Qwen3.6-27B route (gfx1100 and
 /// exact gfx1201, each with its own k6144 entry symbol); on gfx1100 the latter
 /// measured +0.45% over a 512-token A/B/B/A and removes 48 dispatches/token.
-/// Set `HIPFIRE_GATED_NORM_MQ_ROTATE=0` to restore both explicit operations.
 pub fn gated_norm_mq_rotate(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>) -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| developer_var("HIPFIRE_GATED_NORM_MQ_ROTATE").as_deref() != Some("0"));
     let n_v_heads = dims.linear_value_heads;
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
         || gfx1151_radiowave(gpu)
@@ -222,8 +219,7 @@ pub fn gated_norm_mq_rotate(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>) ->
         || (gfx1101_campaign(gpu) && dims.dim == 2_560 && n_v_heads == 32)
         || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions(gpu))
             && dims.is_dense_27b_shape());
-    *ENABLED
-        && admitted_arch_shape
+    admitted_arch_shape
         && dims.linear_value_dim == 128
         && wo.k == n_v_heads * dims.linear_value_dim
         && is_mq4(wo.dtype)

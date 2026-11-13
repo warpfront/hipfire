@@ -50,8 +50,7 @@
 //
 // `fallbacks_exercised` counts sample_batch calls that issued the second D2H
 // (one or more lanes ran the exact-reducer sentinel fallback): the batch's D2H
-// count per call is 1, or 2 when a fallback ran. It reads 0 when
-// HIPFIRE_SAMPLE_PARALLEL=0 (the batch then runs the serial sampler).
+// count per call is 1, or 2 when a fallback ran.
 
 use hip_bridge::memory_effects;
 use hipfire_runtime::batch_sampler::{sample_batch, BatchSampleJob, BatchSamplerArena};
@@ -813,9 +812,7 @@ fn main() {
         std::process::exit(1);
     }
     if total_fallbacks == 0 {
-        eprintln!(
-            "FAIL: no sentinel fallback exercised (HIPFIRE_SAMPLE_PARALLEL=0 or HIPFIRE_SAMPLE_FAST=0 set, or too few trials)"
-        );
+        eprintln!("FAIL: no sentinel fallback exercised (too few trials)");
         std::process::exit(2);
     }
 }
