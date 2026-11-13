@@ -200,8 +200,8 @@ pub struct WaitProof {
     pub reason: Reason,
 }
 
-/// Per pending operation: counter, defs, source locks, in-order, family, order class, `maybe`
-/// (`Ledger::replay_state_key`).
+/// Per pending operation: counter, defs, source locks, in-order, family, counter-order
+/// class, `maybe`, and non-sampler VMEM read writeback class (`Ledger::replay_state_key`).
 pub(crate) type StateKey = Vec<(
     Counter,
     Vec<RegRef>,

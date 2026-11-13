@@ -11,14 +11,12 @@
 //! pre-change verifier (`seal/<variant>.err` / `.out`, status file `STATUS-Rip942.md`):
 //!
 //! * five variants sealed (`default d1 d4 xp2 pf2`) and must keep sealing, bit-identically;
-//! * six double-buffer variants (`pp pp_d4 pp_xp2 pp_gm1 xall xall_pp`) were refused with a
-//!   VMEM->VMEM `Waw` that needs a vmcnt wait on a syntactic path. The status report
-//!   attributes these to in-order writeback; that is a hypothesis about a *different* proof
-//!   rule, not evidence that the paths are infeasible. The block-local scalar proof of the
-//!   ledger-path plan may or may not move the first refusal. Until the integration owner's
-//!   combined run shows otherwise, the recorded refusal CLASS is the expectation; the old
-//!   pc/instruction/label stays in the data below as the frozen baseline, never as an
-//!   allowlist row;
+//! * six double-buffer variants (`pp pp_d4 pp_xp2 pp_gm1 xall xall_pp`) were refused with
+//!   VMEM->VMEM WAWs. The gfx942 in-order VGPR-write proof now discharges same
+//!   non-sampler VMEM_READ_ACCESS pairs, independently of scalar path feasibility.
+//!   Their immutable three-entry bundles must seal and reverify without rewriting
+//!   any device ELF bytes. The old first refusal remains below as historical evidence,
+//!   not an allowlist or a positive numerical/kernel qualification;
 //! * `d8 relay relay_xp1` exceeded the 512-states-per-label cap (unchanged cap);
 //! * `xp3_fs` was refused for an `s_barrier` with LGKM not drained.
 //!
@@ -504,7 +502,7 @@ fn assert_refused(case: &Case, class: &[&str]) -> String {
 }
 
 #[test]
-fn mandatory_six_double_buffer_variants_keep_their_recorded_waw_refusal_class() {
+fn mandatory_six_double_buffer_variants_seal_with_ordered_vmem_writeback() {
     for case in waw_refusals() {
         let Recorded::Waw {
             first_refusal,
@@ -513,13 +511,37 @@ fn mandatory_six_double_buffer_variants_keep_their_recorded_waw_refusal_class() 
         else {
             unreachable!()
         };
-        let now = assert_refused(&case, &["needs Vm wait", "Waw { reg: \""]);
-        if !now.contains(first_refusal) {
-            eprintln!(
-                "rip942 {}: first refusal moved (recorded {earlier_edges} earlier edges): \
-                 recorded `{first_refusal}`; now: {now}",
+        let sealed = seal_many(case.bytes, Arch::Gfx942, &specs()).unwrap_or_else(|e| {
+            panic!(
+                "{}: ordered VMEM proof did not discharge `{first_refusal}` \
+                ({earlier_edges} earlier edges): {e}",
                 case.name
-            );
+            )
+        });
+        assert_eq!(sealed.len(), SYMBOLS.len(), "{}", case.name);
+        let elf = device_elf(case.bytes);
+        assert_eq!(device_elf(&sealed[0].hxaco), elf, "{}", case.name);
+        for (s, symbol) in sealed.iter().zip(SYMBOLS) {
+            assert_eq!(s.elf_sha256, case.device_elf_sha256, "{}", case.name);
+            assert_eq!(s.report["kernel"], symbol);
+            let h = &s.report["hazards"];
+            assert_eq!(h["checked"], true);
+            for field in ["blocking", "findings", "bypasses"] {
+                assert_eq!(h[field], 0, "{} {symbol}: {h}", case.name);
+            }
+            assert_eq!(h["hazard"]["inserted_nops"], 0);
+            assert_eq!(h["hazard"]["rewritten_instructions"], 0);
+        }
+        assert_eq!(sealed[2].text_sha256, DESC_TEXT_SHA256);
+        let verified = verify_hxaco_many(&sealed[0].hxaco, Arch::Gfx942, &SYMBOLS)
+            .unwrap_or_else(|e| panic!("{}: three-entry re-verification: {e}", case.name));
+        for (a, b) in sealed.iter().zip(verified) {
+            assert_eq!(a.hxaco, b.hxaco, "{}", case.name);
+            assert_eq!(a.text_sha256, b.text_sha256, "{}", case.name);
+        }
+        for (s, each) in sealed.iter().zip(seal_each(&case)) {
+            let each = each.unwrap_or_else(|e| panic!("{}: independent seal: {e}", case.name));
+            assert_eq!(s.text_sha256, each.text_sha256);
         }
     }
 }
