@@ -1818,8 +1818,11 @@ pub(crate) fn serve_foreground(
     let multi_slot_paged_pages = args
         .multi_slot_paged_pages
         .unwrap_or(config_u64(&global, "serve.multi_slot_paged_pages")?);
+    // `--multi-slot-paged-pages 0` means auto-size, not "enable": the help
+    // says the flag implies the pool only when > 0, and a bare `0` used to
+    // turn the route on behind the operator's back.
     let mut multi_slot_paged = args.multi_slot_paged
-        || args.multi_slot_paged_pages.is_some()
+        || args.multi_slot_paged_pages.is_some_and(|pages| pages > 0)
         || config_bool(&global, "serve.multi_slot_paged")?
         || multi_slot_paged_pages > 0
         || env_paged_alias == Some(true)
@@ -1883,21 +1886,29 @@ pub(crate) fn serve_foreground(
     // rows must fit. This mirrors `serve_engine::multi_slot_prefill_rows`; 64
     // is the VMM reserve-slack upper bound per speculative slot. The built-in
     // `serve.max_batch_tokens` default (4096) exceeds that for the documented
-    // slot counts (1..3 slots x 1024) and would refuse every such start. When
-    // the key is still the built-in default, clamp it rather than failing; a
-    // user-set value keeps the strict refuse (an explicit oversized budget is
-    // a real misconfiguration).
+    // slot counts and would refuse every such start, so it is clamped. A
+    // *configured* value above the same capacity is clamped too, with the
+    // source named: the ts-validated capacity below is the engine's real
+    // allocation, and a config written against the older `slots x chunk`
+    // formula (2048/4096) must start with a smaller budget rather than fail
+    // the load. `validate_multi_slot_startup` still refuses an over-capacity
+    // value, so a caller that bypasses this clamp fails closed.
     const MAX_VERIFY_ROWS_PER_SLOT: u64 = 64;
     let max_batch_tokens = if multi_slot_enabled {
         let scratch_rows =
             multi_slot_prefill_chunk.max(MAX_VERIFY_ROWS_PER_SLOT.saturating_mul(multi_slot_slots));
-        let is_builtin = global
-            .get("serve.max_batch_tokens")
-            .map(|v| matches!(v.source, ConfigSource::BuiltIn))
-            .unwrap_or(true);
-        if is_builtin && max_batch_tokens > scratch_rows {
+        if max_batch_tokens > scratch_rows {
+            let source = if global
+                .get("serve.max_batch_tokens")
+                .map(|v| matches!(v.source, ConfigSource::BuiltIn))
+                .unwrap_or(true)
+            {
+                "built-in"
+            } else {
+                "configured"
+            };
             eprintln!(
-                "serve: built-in max_batch_tokens {max_batch_tokens} exceeds multi-slot scratch capacity {scratch_rows} (max(prefill_chunk {multi_slot_prefill_chunk}, 64 verify rows x {multi_slot_slots} slots)); clamping to {scratch_rows}"
+                "serve: {source} max_batch_tokens {max_batch_tokens} exceeds multi-slot scratch capacity {scratch_rows} (max(prefill_chunk {multi_slot_prefill_chunk}, 64 verify rows x {multi_slot_slots} slots)); clamping to {scratch_rows}"
             );
             scratch_rows
         } else {

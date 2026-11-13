@@ -199,7 +199,7 @@ impl Scheduler {
         // slot is eligible. The serve engine calls `next_batch_eligible`
         // directly with the FairQueue's grant mask (spec §5.3 S3).
         let all = vec![true; work.len()];
-        self.next_batch_eligible(work, remaining_rows, prefill_min_tokens, &all)
+        self.next_batch_eligible(work, remaining_rows, prefill_min_tokens, &all, false)
     }
 
     /// Same as [`next_batch`](Self::next_batch) but only slots `s` with
@@ -215,9 +215,10 @@ impl Scheduler {
         remaining_rows: usize,
         prefill_min_tokens: usize,
         eligible: &[bool],
+        paged_kv: bool,
     ) -> SlotBatch {
         let n = work.len();
-        let plan = self.allocate_rows(work, remaining_rows, prefill_min_tokens, eligible);
+        let plan = self.allocate_rows(work, remaining_rows, prefill_min_tokens, eligible, paged_kv);
         if let Some(c) = plan.next_prefill_cursor {
             self.prefill_cursor = c;
         }
@@ -294,6 +295,7 @@ impl Scheduler {
         remaining_rows: usize,
         prefill_min_tokens: usize,
         eligible: &[bool],
+        paged_kv: bool,
     ) -> RowAllocation {
         let n = work.len();
         // ---- Phase 1: decode (1 row per runnable decode slot, slot order) ----
@@ -347,6 +349,8 @@ impl Scheduler {
                     if left == 0 {
                         return 0;
                     }
+                    // The page-boundary trim is unconditional (it predates the
+                    // page quantum): only the quantum below is paged-only.
                     page_align_take(
                         self.chunk_size.min(left).max(prefill_min_tokens.min(left)),
                         w.next_pos,
@@ -354,10 +358,21 @@ impl Scheduler {
                         prefill_min_tokens,
                     )
                 };
-                let quantum = if avail >= PAGE_TOKENS && prefill_min_tokens <= PAGE_TOKENS {
+                // Only the page pool distributes a prefill step in whole
+                // PAGE_TOKENS quanta (its resumable-checkpoint granularity).
+                // Every other route keeps the distribution it has always had:
+                // the first prefilling slot in rotation order takes its whole
+                // quota, then leftovers go round-robin at full quota. With an
+                // unbounded quantum the `take` below is `min(cap, prompt_left,
+                // avail)`, which is exactly that — see the base
+                // `head_take` + full-quota loop this replaced.
+                let quantum = if paged_kv
+                    && avail >= PAGE_TOKENS
+                    && prefill_min_tokens <= PAGE_TOKENS
+                {
                     PAGE_TOKENS
                 } else {
-                    prefill_min_tokens.max(1)
+                    usize::MAX
                 };
                 let mut keep_going = true;
                 while avail > 0 && keep_going {
@@ -1161,7 +1176,7 @@ mod tests {
         ];
         // Only slot 0 is eligible (FairQueue granted it); slot 1 is not.
         let eligible = [true, false];
-        let b = s.next_batch_eligible(&mut work, 4096, 1, &eligible);
+        let b = s.next_batch_eligible(&mut work, 4096, 1, &eligible, false);
         assert_eq!(
             b.m_per_slot,
             vec![100, 0],

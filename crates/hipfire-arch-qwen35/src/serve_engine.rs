@@ -575,7 +575,9 @@ impl ModelRig {
         // Shared paged has no per-slot KvCache owner. Isolate MoE prompt
         // chunks so they never share a step (or a Redline tape) with decode:
         // the mixed `_vmm` batched prefill hung on 35B-A3B before sampling.
-        if self.config.num_experts > 0 {
+        // Paged only: the fixed-slab route shares one forward already and its
+        // rows must keep their established packing.
+        if pool.is_paged() && self.config.num_experts > 0 {
             let isolate: Vec<bool> = (0..batch.m_per_slot.len())
                 .map(|s| prefill_slots.get(s).copied().unwrap_or(false))
                 .collect();
@@ -614,9 +616,9 @@ impl ModelRig {
                     // row and the paged attention path is slot-addressed.
                     let combined = merge_isolated_prefills(&moe_prefills);
                     let n_pref = combined.m_per_slot.iter().filter(|&&m| m > 0).count();
-                    if n_pref > 1 {
+                    if n_pref > 1 && gpu.slot_trace() {
                         eprintln!(
-                            "[hipfire] batched MoE prefill: {n_pref} slots, {} rows",
+                            "[slot-trace] batched MoE prefill: {n_pref} slots, {} rows",
                             combined.total_rows()
                         );
                     }
@@ -3825,15 +3827,22 @@ fn configure_slots_redline(
 ) {
     let path = model_path.to_string_lossy();
     let arch = slots_model_arch(arch_id);
-    let redline_default = hipfire_runtime::config::retained_redline_default(
-        &gpu.arch,
-        arch,
-        &path,
-        1,
-        1,
-        1,
-        has_drafter,
-    ) && hipfire_config::devices::redline_platform_refusal().is_none();
+    // The multi-slot retained tape is validated on gfx1100 (the paged pool's
+    // supported arch) and on gfx1201 (the documented `.mq4r` policy). On any
+    // other arch the slots engine keeps the eager HIP route: gfx1151 never had
+    // a slots tape, and arming one there is unvalidated.
+    let slots_arch_supported = matches!(gpu.arch.as_str(), "gfx1100" | "gfx1201");
+    let redline_default = slots_arch_supported
+        && hipfire_runtime::config::retained_redline_default(
+            &gpu.arch,
+            arch,
+            &path,
+            1,
+            1,
+            1,
+            has_drafter,
+        )
+        && hipfire_config::devices::redline_platform_refusal().is_none();
     if gpu.replay.configure_model_default(redline_default) && redline_default {
         eprintln!(
             "[redline] slots: enabling fail-closed retained default on {} \
@@ -3996,10 +4005,14 @@ fn resolve_slot_kv_storage(
                 .to_string());
         }
         if kv_backend_vmm && !paged_backend_vmm {
-            eprintln!(
-                "[hipfire] kv_backend=vmm on the multi-slot engine is the shared VMM page pool \
-                 (the same cache as serve.multi_slot_paged_backend=vmm). \
-                 Per-slot VMM owners are not a separate mode."
+            // `memory.kv_backend=vmm` used to be silently promoted to the
+            // shared experimental pool here. Refuse instead (the daemon's
+            // admission does the same): the request did not ask for this cache.
+            return Err(
+                "kv_backend=vmm on the multi-slot engine is the shared VMM page pool; \
+                 request it with serve.multi_slot_paged + \
+                 serve.multi_slot_paged_backend=vmm (per-slot VMM owners are not a separate mode)"
+                    .to_string(),
             );
         }
         return Ok(SlotKvStorage {
@@ -5706,6 +5719,7 @@ fn run_loop(
                 remaining_for_sched,
                 prefill_min_tokens,
                 &eligible,
+                rig.pool.is_paged(),
             );
 
             // Count prefill + decode rows the scheduler emitted.

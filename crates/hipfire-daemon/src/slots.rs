@@ -1691,6 +1691,10 @@ impl SlotBackend {
             think_mode,
             decoded_vocab: None,
         });
+        // Logprob entries ride the released text events, so one entry covers
+        // one `ClientEvent::Token` (a decoder step's chunk), not necessarily
+        // one sampled token. A per-sampled-token stream needs a logprob on the
+        // engine's per-token event; until then this is the documented shape.
         let render_events =
             |events: Vec<ClientEvent>,
              stdout: &mut W,
@@ -2447,6 +2451,23 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
             // (`serve.multi_slot_paged_backend=vmm`), not a per-slot owner.
             // That pool has no fp8 kernels.
             Ok(KvBackend::Vmm) => {
+                // `memory.kv_backend=vmm` is not an opt-in to the shared
+                // experimental pool. Require the explicit request that
+                // selects it, so an operator who authored `kv_backend=vmm`
+                // for a per-slot route is refused by name instead of being
+                // moved onto a different, experimental cache.
+                if params
+                    .and_then(|p| p.get("multi_slot_paged"))
+                    .and_then(|v| v.as_bool())
+                    != Some(true)
+                {
+                    return Some(
+                        "experimental multi-slot: kv_backend=vmm is the shared paged pool; \
+                         request it with serve.multi_slot_paged (multi_slot_paged=true) \
+                         and serve.multi_slot_paged_backend=vmm"
+                            .to_string(),
+                    );
+                }
                 let raw = params
                     .and_then(|p| p.get("kv_mode"))
                     .and_then(|v| v.as_str())
@@ -4137,19 +4158,37 @@ mod tests {
                 "unsupported params passed: {params}"
             );
         }
-        // The VMM KV route is admitted for q8; a rotated tier is refused by
-        // the route's own descriptor-kernel gate.
+        // `kv_backend=vmm` names the shared experimental page pool. It is not
+        // an opt-in: without the explicit `multi_slot_paged` request the load
+        // is refused by name, so a `kv_backend=vmm` written for a per-slot
+        // route never lands on a different cache.
+        let bare = validate_load_caps(
+            &json!({"params": {"kv_backend": "vmm", "kv_mode": "q8"}}),
+            "gfx1100",
+        )
+        .expect("bare kv_backend=vmm must be refused");
+        assert!(bare.contains("multi_slot_paged"), "{bare}");
+        // With the opt-in, the pool is admitted for q8; a rotated tier is
+        // refused by the route's own descriptor-kernel gate.
         assert_eq!(
             validate_load_caps(
-                &json!({"params": {"kv_backend": "vmm", "kv_mode": "q8"}}),
+                &json!({"params": {
+                    "kv_backend": "vmm",
+                    "kv_mode": "q8",
+                    "multi_slot_paged": true
+                }}),
                 "gfx1100"
             ),
             None,
-            "vmm + q8 must be admitted"
+            "vmm + q8 + multi_slot_paged must be admitted"
         );
         assert!(
             validate_load_caps(
-                &json!({"params": {"kv_backend": "vmm", "kv_mode": "fwht3"}}),
+                &json!({"params": {
+                    "kv_backend": "vmm",
+                    "kv_mode": "fwht3",
+                    "multi_slot_paged": true
+                }}),
                 "gfx1100"
             )
             .is_some(),
@@ -4157,7 +4196,11 @@ mod tests {
         );
         assert!(
             validate_load_caps(
-                &json!({"params": {"kv_backend": "vmm", "kv_mode": "fp8"}}),
+                &json!({"params": {
+                    "kv_backend": "vmm",
+                    "kv_mode": "fp8",
+                    "multi_slot_paged": true
+                }}),
                 "gfx1201"
             )
             .is_some(),
