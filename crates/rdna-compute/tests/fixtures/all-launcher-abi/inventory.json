@@ -204,6 +204,18 @@
     "kernels/ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1201.hxaco"
   ],
   "pm_twins": {
+    "kernels/qwen4_g942_moe_gemm_pm_gfx942.hxaco": {
+      "hip_source": "kernels/src/qwen4_g942_moe_gemm.gfx942.hip",
+      "anchor": "kernels/qwen4_g942_moe_gemm_hipcc_gfx942.co",
+      "symbols": ["qwen4_g942_moe_gemm_f32", "qwen4_g942_moe_gemm_xbf16"],
+      "reason": "Frozen two-entry gfx942 grouped MoE GEMM Route-A twin; unchanged native ELF and HIP/HSA ABI. Both live production entry launchers remain checked, without dispatch or obligation exemptions."
+    },
+    "kernels/qwen4_g942_rows16_grid_pm_gfx942.hxaco": {
+      "hip_source": "kernels/src/qwen4_g942_rows16_grid.gfx942.hip",
+      "anchor": "kernels/qwen4_g942_rows16_grid_hipcc_gfx942.co",
+      "symbols": ["qwen4_g942_rows16_grid", "qwen4_g942_rows16_grid_x2"],
+      "reason": "Frozen two-entry gfx942 row-grid Route-A twin; unchanged native ELF and HIP/HSA ABI. The public launcher's real params/blob sites remain independently checked, without dispatch or obligation exemptions."
+    },
     "kernels/qwen4_g942_qsa_row_attention_pm_gfx942.hxaco": {
       "hip_source": "kernels/src/qwen4_g942_qsa_row_attention.gfx942.hip",
       "anchor": "kernels/qwen4_g942_qsa_row_attention_hipcc_gfx942.co",
