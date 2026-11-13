@@ -512,7 +512,7 @@ These findings shaped the design.
   The `done` event's `cached_tokens` is the reused length
   (`ar.rs:380-404`).
 - **Eligibility** (`ar.rs:3025-3029`): `messages` present, no eviction,
-  `HIPFIRE_QWEN_PROMPT_CACHE` not `0`, and a non-empty conversation. Under
+  and a non-empty conversation. Under
   eviction every Jinja chat turn cold-resets (`ar.rs:3465-3470`).
 - **Serve** sends `reset` before a chat request only when the model is
   neither `cache_capable` nor `continuous_batch_capable`
@@ -595,7 +595,6 @@ v1 does the state. That is O(questions × conversation) CPU.
    `asst_turn_cache`'s LRU order. It parses the request, checks the
    preconditions and limits, renders, computes E, and picks the start.
    Reuse is eligible only when all of these hold:
-   - `HIPFIRE_QWEN_PROMPT_CACHE` is not `0`;
    - `compact_offset == 0`;
    - `conversation_tokens` is non-empty and
      `seq_pos == conversation_tokens.len()`.
@@ -663,8 +662,8 @@ reset. It is the S2 reference and ends reset, like v1.
 
 **Preconditions.** The v1 409s and 400s apply unchanged: pp/EP,
 `kv_adaptive`, multi-slot, active lanes, unsupported arch. Session mode also
-returns 400 when no Jinja chat template is available (none in the model, or
-`HIPFIRE_JINJA_CHAT=0`). Session mode must render exactly like the chat
+returns 400 when no Jinja chat template is available (none in the model).
+Session mode must render exactly like the chat
 path, and that is Jinja.
 
 **Limits.**

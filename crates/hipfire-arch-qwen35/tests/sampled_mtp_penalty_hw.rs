@@ -47,9 +47,8 @@
 //!
 //! Each arm runs in its OWN FRESH PROCESS (the parent test re-executes this
 //! test binary on the ignored internal test `sampled_mtp_penalty_arm`), so two
-//! 35B sessions never share a process (allocator residue). The parent sets
-//! `HIPFIRE_MTP_SAMPLED=1` for the MTP child; every other `HIPFIRE_*` flag is
-//! inherited and recorded in `config.json`. The child reads the frozen config
+//! 35B sessions never share a process (allocator residue). Every `HIPFIRE_*` flag
+//! is inherited and recorded in `config.json`. The child reads the frozen config
 //! from the internal env `HIPFIRE_SAMPLED_MTP_CONFIG` (a path), never from the
 //! penalty/trial envs, and the arm is selected by `HIPFIRE_SAMPLED_MTP_ARM`
 //! (`ar` | `mtp`). Those two internal envs are not for manual use.
@@ -260,8 +259,6 @@ struct Config {
     padding: String,
     /// Every `HIPFIRE_*` env var of the parent, as inherited by the children.
     flags: BTreeMap<String, String>,
-    /// Env the parent additionally sets for the MTP child.
-    mtp_child_flags: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -502,8 +499,6 @@ fn build_config(greedy: bool) -> Result<Option<Config>, String> {
     let flags: BTreeMap<String, String> = std::env::vars()
         .filter(|(k, _)| k.starts_with("HIPFIRE_"))
         .collect();
-    let mut mtp_child_flags = BTreeMap::new();
-    mtp_child_flags.insert("HIPFIRE_MTP_SAMPLED".to_string(), "1".to_string());
     let (render, render_reason) = render_from_env(&model)?;
     Ok(Some(Config {
         mode: if greedy { "greedy" } else { "sampled" }.into(),
@@ -531,7 +526,6 @@ fn build_config(greedy: bool) -> Result<Option<Config>, String> {
         mtp_k: MTP_K,
         padding: PADDING.into(),
         flags,
-        mtp_child_flags,
     }))
 }
 
@@ -1032,9 +1026,7 @@ fn mtp_cases(
     pad: u32,
 ) -> Result<Vec<CaseOutput>, String> {
     if cfg.mode == "sampled" && !spec.supports_temp_verify() {
-        return Err(
-            "speculator does not advertise sampled verification (HIPFIRE_MTP_SAMPLED)".into(),
-        );
+        return Err("speculator does not advertise sampled verification".into());
     }
     let mut out = Vec::new();
     for (ci, (case, prompt)) in cfg.cases.iter().zip(prompts).enumerate() {
@@ -1201,7 +1193,7 @@ fn sampled_mtp_penalty_arm() {
 
 // ─── parent ─────────────────────────────────────────────────────────────────
 
-fn spawn_arm(cfg: &Config, dir: &Path, arm: &str) -> ArmOutput {
+fn spawn_arm(dir: &Path, arm: &str) -> ArmOutput {
     let exe = std::env::current_exe().expect("test binary path");
     let mut cmd = Command::new(exe);
     cmd.args([
@@ -1215,11 +1207,6 @@ fn spawn_arm(cfg: &Config, dir: &Path, arm: &str) -> ArmOutput {
     .env(CONFIG_ENV, dir.join("config.json"))
     .current_dir(dir)
     .stdin(Stdio::null());
-    if arm == "mtp" {
-        for (k, v) in &cfg.mtp_child_flags {
-            cmd.env(k, v);
-        }
-    }
     let output = cmd.output().unwrap_or_else(|e| panic!("spawn {arm}: {e}"));
     fs::write(dir.join(format!("{arm}.stdout.log")), &output.stdout).unwrap();
     fs::write(dir.join(format!("{arm}.stderr.log")), &output.stderr).unwrap();
@@ -1248,8 +1235,8 @@ fn run_oracle(test: &str, mut cfg: Config) -> (PathBuf, Config, ArmOutput, ArmOu
     )
     .expect("write config.json");
     eprintln!("[oracle] {test}: output {}", dir.display());
-    let ar = spawn_arm(&cfg, &dir, ARMS[0]);
-    let mtp = spawn_arm(&cfg, &dir, ARMS[1]);
+    let ar = spawn_arm(&dir, ARMS[0]);
+    let mtp = spawn_arm(&dir, ARMS[1]);
     assert_eq!(
         ar.effective_window, mtp.effective_window,
         "arms disagree on the penalty window"
