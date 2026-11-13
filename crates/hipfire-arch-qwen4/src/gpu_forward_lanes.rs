@@ -7983,7 +7983,10 @@ mod tests {
             vec![8usize; 24],
         ] {
             let d = g942.decide(true, &groups, false, false);
-            assert!(!d.hc_all && !d.all_stages && !d.moe_all, "{groups:?}: {d:?}");
+            assert!(
+                !d.hc_all && !d.all_stages && !d.moe_all,
+                "{groups:?}: {d:?}"
+            );
             assert!(d.moe_refusal.is_some(), "{groups:?}");
         }
         // A wide-class lane keeps its classed group, a non-AR step takes no segment.
@@ -8002,7 +8005,10 @@ mod tests {
             sixteen_by_eight.to_vec(),
         ] {
             let d = other.decide(true, &groups, false, false);
-            assert!(!d.hc_all && !d.all_stages && !d.moe_all, "{groups:?}: {d:?}");
+            assert!(
+                !d.hc_all && !d.all_stages && !d.moe_all,
+                "{groups:?}: {d:?}"
+            );
         }
     }
 }
