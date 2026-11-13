@@ -195,7 +195,6 @@ pub(crate) fn layer_steps<'a>(
                 route: KvRoute::WindowedQ8 {
                     tiled: io.tiled,
                     rows_flash: io.rows_flash,
-                    wmma_flash: true,
                 },
             },
             pos_buf: io.pos_buf,
