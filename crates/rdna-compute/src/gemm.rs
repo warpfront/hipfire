@@ -9089,7 +9089,11 @@ impl Gpu {
                 alpha_m, k, batch_size,
             );
         }
-        if batch_size <= 12 {
+        // The MMQ body routes whole 128-row tiles to one segment (CALLER INVARIANT in
+        // gemm_qkvza_hfq3g256_mmq_body.cuh); Qwen3.5 beta/alpha (n_v_heads rows) are not
+        // 128-aligned, so an unaligned call would leave alpha unwritten.
+        let aligned = qkv_m % 128 == 0 && z_m % 128 == 0 && beta_m % 128 == 0 && alpha_m % 128 == 0;
+        if batch_size <= 12 || !aligned {
             self.gemm_qkvza_hfq3g256_dot2(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
                 alpha_m, k, batch_size,
