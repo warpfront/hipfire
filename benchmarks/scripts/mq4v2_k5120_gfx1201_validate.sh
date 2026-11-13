@@ -28,7 +28,7 @@ export HIP_VISIBLE_DEVICES=${GPU_ID:-0}
 unset ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES HIPFIRE_HIPCC_EXTRA_FLAGS
 export HIPFIRE_GFX12_WEIGHT_LOAD_POLICY=rt
 export HIPFIRE_KERNEL_CACHE=${HIPFIRE_KERNEL_CACHE:-"$HOME/.hipfire_kernels"}
-export HIPFIRE_KV_MODE=q8 HIPFIRE_DN_STATE_EF=1
+export HIPFIRE_KV_MODE=q8
 export HIPFIRE_HOME="$OUT/probe-home"
 mkdir "$HIPFIRE_HOME"
 sha256sum "$MODEL" target/release/daemon target/release/hipfire > "$OUT/identity.sha256"

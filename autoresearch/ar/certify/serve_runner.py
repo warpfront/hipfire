@@ -171,7 +171,6 @@ class LiveServeRunner(_ServeRunner):
         os.environ["HIP_VISIBLE_DEVICES"] = str(self.dev)
         if det:
             os.environ["HIPFIRE_DETERMINISTIC"] = "1"
-            os.environ["HIPFIRE_DN_STATE_EF"] = "1"
         else:
             os.environ.pop("HIPFIRE_DETERMINISTIC", None)
         home = os.path.expanduser(f"~/.cache/serve_runner_{self.arch}")
@@ -191,7 +190,7 @@ class LiveServeRunner(_ServeRunner):
             req += '{"type":"generate","id":"%s","prompt":"%s","temperature":0.0,"max_tokens":48}\n' % (pid, pr)
         req += '{"type":"unload"}\n'
         env = dict(os.environ, HIP_VISIBLE_DEVICES=str(self.dev), HIPFIRE_EMIT_TOKEN_IDS="1",
-                   HIPFIRE_DETERMINISTIC="1", HIPFIRE_DN_STATE_EF="1")
+                   HIPFIRE_DETERMINISTIC="1")
         r = subprocess.run(daemon, input=req, shell=True, capture_output=True, text=True, env=env)
         ids = {pid: [] for pid, _ in self.PARITY_PROMPTS}
         for line in (r.stdout or "").splitlines():

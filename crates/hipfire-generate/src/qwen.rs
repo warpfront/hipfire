@@ -3655,16 +3655,6 @@ pub fn generate_dflash(
                 .as_deref()
                 == Some("0"),
     );
-    // DFlash divergent-render resume (default ON; opt out with
-    // HIPFIRE_DFLASH_CKPT_RESUME=0). When on, the recurrent state is checkpointed during
-    // the prompt seed and a divergent render resumes from the latest checkpoint
-    // ≤ lcp — byte-identical to a cold prefill of the same render (verified),
-    // so worst case equals the legacy cold-reset path. Off ⇒ no checkpoints
-    // (zero overhead) + legacy cold-reset-on-divergence.
-    let dflash_resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
-        .ok()
-        .as_deref()
-        != Some("0");
     // Qwen4 history stage of the shared canonical render, after the cold-length
     // fit checks above (same order as the former cache-plan stage).
     let prompt_tokens: Vec<u32> = if is_qwen4 {
@@ -3754,7 +3744,7 @@ pub fn generate_dflash(
                 rendered,
                 cache_eligible,
                 &dflash_ckpt_positions,
-                dflash_resume_enabled,
+                true,
                 if spec_name == "mtp" {
                     "mtp-jinja"
                 } else {
@@ -3778,7 +3768,7 @@ pub fn generate_dflash(
                 hist,
                 cache_disabled,
                 &dflash_ckpt_positions,
-                dflash_resume_enabled,
+                true,
             )
         })
     };
