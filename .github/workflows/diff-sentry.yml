@@ -13,10 +13,11 @@ name: diff-sentry
 #
 # Advisory, not a required check. Calibrated on the last 150 beta commits:
 # 8 would trip `high`, all false positives typical for an LLM engine
-# ("system prompt" in generate code, the `Env` column of docs/CONFIG.md).
+# (prompt wording in generate code, the `Env` column of docs/CONFIG.md).
 # Markdown under docs/ is therefore scanned but report-only (a git pathspec
 # `*` crosses `/`); scripts and configs under docs/ stay gated. Read a red
-# run's log before merging rather than overriding it blindly.
+# run's log before merging rather than overriding it blindly. A red
+# report-only group is printed but never fails the run; read it too.
 #
 # `pull_request` runs the PR's own copy of this file, so the scan does not
 # cover a PR that weakens or deletes this workflow. Never move it to
