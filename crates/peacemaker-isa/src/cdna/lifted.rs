@@ -814,7 +814,7 @@ mod tests {
         // Refined: either certifies, or reports a finding that is not the infeasible edge
         // into pc 975 (a distinct later error is fine; nothing is hidden).
         if let Err(refined) = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices) {
-            let impossible = format!("pc 893 `{}` not taken", text(893));
+            let impossible = format!("pc 893 `{}` not taken", program.instructions[893].text);
             assert!(!refined.contains(&impossible), "{refined}");
         }
     }
