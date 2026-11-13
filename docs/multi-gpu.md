@@ -435,11 +435,12 @@ them is bit-identical to one card.
   repeats byte for byte; (2) the per-element fold bound
   `|m - (p0 + p1)| <= (2^-8 + 2^-23)(|p0| + |p1|)`; (3) a KLD gate. For
   bit-identity checks set **`HIPFIRE_QWEN4_EP_TRUNK_SHARD=0`** on the EP arm
-  (developer variable, no typed key; it restores plain EP2). That covers
-  `fn_ep_oracle` / `scripts/fn_ep_compare.py`, `scripts/fn-ep-gate.sh` on two
-  gfx1201 cards (its arms inherit the variable) and the device-mesh cell
-  `g5-qwen4-ep2-vs-single-physical`, which sets it. On gfx1100 and at other
-  rank counts the shard does not apply and EP is the first bullet's route.
+  (developer variable, no typed key; it restores plain EP2). The device-mesh
+  cell `g5-qwen4-ep2-vs-single-physical` sets it, and every exactness arm of
+  `scripts/fn-ep-gate.sh` pins it (see the community gate below); for
+  `fn_ep_oracle` / `scripts/fn_ep_compare.py` run by hand, set it yourself. On
+  gfx1100 and at other rank counts the shard does not apply and EP is the first
+  bullet's route.
 
   Measured size (Flash-Next GPTQ3, code24 24x512 against the BF16 teacher,
   served decode, 6,120 scored rows, isolated `HIPFIRE_HOME`, one fresh process
@@ -935,7 +936,14 @@ checkout it builds the binaries, runs one card (`topology.ep = 1`) and N cards
 500 and about 4,400 tokens, 128 greedy tokens, state digests at steps 1, 64 and
 128), and `scripts/fn_ep_compare.py` compares the arms byte for byte: the
 tokens, the rank-0 logits sha256, every peer rank's logits mirror sha256 and
-every rank's state digests must equal the single card's. It then times
+every rank's state digests must equal the single card's. Every oracle arm of
+`--mode ep` and `--mode pp` pins `HIPFIRE_QWEN4_EP_TRUNK_SHARD=0` (the default
+two-gfx1201 EP2 is the TP2 trunk shard, which is not byte-equal to one card by
+design; see [Exactness](#flash-next-ep-enabling-and-status)), and `EXTRA_ENV`
+may not set it. The speed cells and the `--mode reserve` arms clear an inherited
+value and run the shipped default route, so on two gfx1201 cards the timed EP2
+is the shard route; the gate has no arm that compares the shard route with one
+card. It then times
 `hipfire bench --spec off` decode and prefill (3 fresh processes per arm by
 default, arms interleaved). Each arm runs in a private HOME holding only
 `topology.ep` unless `--no-isolate` is given.
