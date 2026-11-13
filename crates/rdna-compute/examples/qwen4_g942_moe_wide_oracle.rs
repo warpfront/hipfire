@@ -772,9 +772,13 @@ fn scatter_arm(
             let symbol = lab_ensure_moe_wide_entry(gpu, SCATTER).map_err(err)?;
             let mut args = KernargBlob::new();
             args.push_ptr(topk.buf.as_ptr());
-            for out in &outs {
-                args.push_ptr(out.body.buf.as_ptr());
-            }
+            // The six output words (`sc_words`' array length).
+            args.push_ptr(outs[0].body.buf.as_ptr());
+            args.push_ptr(outs[1].body.buf.as_ptr());
+            args.push_ptr(outs[2].body.buf.as_ptr());
+            args.push_ptr(outs[3].body.buf.as_ptr());
+            args.push_ptr(outs[4].body.buf.as_ptr());
+            args.push_ptr(outs[5].body.buf.as_ptr());
             for value in [launch.l, launch.e, launch.pmax] {
                 args.push_i32(value as i32);
             }
