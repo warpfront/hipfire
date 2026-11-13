@@ -23,7 +23,9 @@
 //! ([`Qwen4LaneStore::new`]; the lane byte census already charges all
 //! `max_lanes` payloads) and parks it as a pristine, not-live cell: the first
 //! admission takes a pristine cell as is (its bytes are exactly what the
-//! first-touch allocation would have produced), later ones reset it.
+//! first-touch allocation would have produced), later ones reset it. Each such
+//! slot also maps and zeroes its first KV chunk then ([`map_first_chunk`]), so the
+//! first provision of a short prompt maps nothing.
 //!
 //! A store staged `sampled` (`serve.batch_sampled`) also admits sampled
 //! requests: [`LaneSampling`] set on a lane after admission makes every token
@@ -1379,6 +1381,46 @@ fn new_payload(
     Ok((state, spec))
 }
 
+/// Release a payload [`new_payload`] built (every error path frees what it holds).
+fn free_payload(gpu: &mut Gpu, state: Qwen4State, spec: Option<LaneSpec>) {
+    let _ = state.free_gpu(gpu);
+    if let Some(spec) = spec {
+        let _ = spec.head.free_gpu(gpu);
+        let _ = gpu.free_tensor(spec.pending_hidden);
+        if let Some(lag) = spec.lag {
+            let _ = lag.free_gpu(gpu);
+        }
+    }
+}
+
+/// Map and zero the first KV chunk of a fresh payload's trunk context arenas and, for an
+/// MTP slot, its head arenas: the very growth the slot's first provision performs for any
+/// end in `1..=DEFAULT_KV_CHUNK_TOKENS`.
+///
+/// Exactness: `KvChunkPlan::mapped_bytes_for_tokens` rounds `row_bytes * rows` up to the
+/// plan's `growth_bytes`, itself at least `row_bytes * DEFAULT_KV_CHUNK_TOKENS`, so every
+/// arena rows count in `1..=64` (one token, or the 64 tokens of the first chunk) maps the
+/// same `growth_bytes` (clamped to the reserve) and zero-fills the same bytes; the
+/// resulting `qsa_mapped_tokens` / head `mapped_tokens` are functions of the mapped bytes
+/// alone. A later provision past the chunk grows from here exactly as it grows from a
+/// slot that already served a short request. Called only on a pristine, never-admitted
+/// payload.
+fn map_first_chunk(
+    gpu: &mut Gpu,
+    state: &mut Qwen4State,
+    spec: Option<&mut LaneSpec>,
+) -> Result<(), String> {
+    state
+        .ensure_mapped_capacity(gpu, 1)
+        .map_err(|e| format!("first trunk context chunk: {e}"))?;
+    if let Some(spec) = spec {
+        spec.head
+            .ensure_mapped_capacity(gpu, 1)
+            .map_err(|e| format!("first head context chunk: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Back an existing lane cell to a request's start: trunk state, then (when the store
 /// stages spec) the MTP head and pending hidden, every zero-fill enqueued into `batch`
 /// (the caller owns the one wait, also after an error).
@@ -2615,7 +2657,10 @@ impl Qwen4LaneStore {
     /// `spec_lanes`, [`new_payload`]) and park each as a pristine, not-live table cell
     /// ([`LaneTable::install_pristine`]). The lane byte census already charges `max_lanes`
     /// full payloads ([`Self::device_bytes`]), so this commits nothing the census did not
-    /// plan. On a failure the caller frees the cells built so far with the store.
+    /// plan (the first KV chunk each slot maps is inside the charged context pages). Each
+    /// slot also maps its first KV chunk ([`map_first_chunk`]), the growth a first provision
+    /// of a short prompt would perform. On a failure the caller frees the cells built so far
+    /// with the store.
     fn preallocate_payloads(&mut self, gpu: &mut Gpu, bundle: &Qwen4Bundle) -> Result<(), String> {
         let store_ring_rows = self.ring_rows;
         let (narrow_ring_rows, wide_lanes) = self.ring_split();
@@ -2637,7 +2682,14 @@ impl Qwen4LaneStore {
                 narrow_ring_rows,
                 store_spec_cfg,
             );
-            let payload = new_payload(gpu, bundle, slot, ring_rows, spec_cfg)?;
+            let (mut state, mut spec) = new_payload(gpu, bundle, slot, ring_rows, spec_cfg)?;
+            // The first provision of a short prompt then finds its context mapped and
+            // zeroed ([`map_first_chunk`]) instead of paying one blocking fill per arena.
+            if let Err(error) = map_first_chunk(gpu, &mut state, spec.as_mut()) {
+                free_payload(gpu, state, spec);
+                return Err(format!("admit: allocate lane {slot}: {error}"));
+            }
+            let payload = (state, spec);
             self.table
                 .install_pristine(slot, placeholder_host(slot), payload);
         }
