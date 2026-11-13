@@ -979,6 +979,11 @@ mod tests {
     fn reload() -> Inst {
         ops::global_load(FlatOp::LoadDword, v(1), v(2), None, 0)
     }
+    /// `v_mov_b32 v1, 0`: a VALU write of `v1`, which is not ordered with VMEM, so it is a real
+    /// WAW over a pending load of `v1` (the ordered load/load rewrite is certified by itself).
+    fn overwrite() -> Inst {
+        ops::v1(Vop1Op::MovB32, v(1), Int(0))
+    }
     /// `s_mov_b64 s[14:15], value`
     fn pair14(value: Src) -> Inst {
         ops::s1(Sop1Op::MovB64, s(14), value)
@@ -986,8 +991,17 @@ mod tests {
     /// hipcc's boolean-phi join with the constant of each side materialized in its own
     /// predecessor: `0: s_cbranch_scc1 B`; `jump_side`; `s_branch J`; `B:` `fall_side`; `J:`
     /// `s_and_b64 s[14:15], s[14:15], exec; s_cselect_b32 s14, 1, 0; s_cmp_lg_u32 s14, 1`; the
-    /// `gate` branch over a reload of `v1`; the reload; `E: s_endpgm`. `fall_side` is not empty.
+    /// `gate` branch over a VALU overwrite of `v1`; the overwrite; `E: s_endpgm`. `fall_side` is
+    /// not empty.
     fn phi_join(jump_side: &[Inst], fall_side: &[Inst], gate: SoppOp) -> Vec<Inst> {
+        phi_join_writing(jump_side, fall_side, gate, overwrite())
+    }
+    fn phi_join_writing(
+        jump_side: &[Inst],
+        fall_side: &[Inst],
+        gate: SoppOp,
+        write: Inst,
+    ) -> Vec<Inst> {
         let mut insts = vec![nop()];
         insts.extend_from_slice(jump_side);
         let jump = insts.len();
@@ -1001,7 +1015,7 @@ mod tests {
             ops::sc(SopcOp::CmpLgU32, s(14), Int(1)),
         ]);
         let gated = insts.len();
-        insts.extend([nop(), reload(), end()]);
+        insts.extend([nop(), write, end()]);
         let exit = insts.len() - 1;
         link(&mut insts, 0, SoppOp::CbranchScc1, fall);
         link(&mut insts, jump, SoppOp::Branch, join);
@@ -1037,8 +1051,18 @@ mod tests {
             }],
             "only the `s_branch` edge carries 0; the fall-through's -1 & EXEC is unknown"
         );
-        // The block-local verifier (the previous release) refuses: the pending load of v1
-        // reaches the reload over the impossible not-taken edge.
+        // Ordered VMEM load/load writeback is certified on its own: the same CFG with a
+        // reload instead of the overwrite needs no edge proof.
+        let ordered = phi_join_writing(
+            &[reload(), pair14(Int(0))],
+            &[pair14(Int(-1))],
+            SoppOp::CbranchScc1,
+            reload(),
+        );
+        let (oprog, ochoices, _) = convert_entries(&ordered);
+        ledger_cfg::verify_with_branch_proofs(&oprog, &[], &ochoices, &[]).unwrap();
+        // The block-local verifier refuses the VALU overwrite: the pending load of v1
+        // reaches it over the impossible not-taken edge.
         let e = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &[]).unwrap_err();
         assert!(e.contains("pc 11") && e.contains("Waw"), "{e}");
         ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &entries).unwrap();
@@ -1205,12 +1229,26 @@ mod tests {
         };
         assert!(entries.contains(&proof), "{entries:?}");
 
-        // Reference: block-local proofs only, as before the edge table existed.
+        // The ordered VMEM load/load writeback is certified without any entry proof.
+        ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &[]).unwrap();
+
+        // Keep the test sensitive to the edge proof: a VALU overwrite of v1 at pc 674 is not
+        // ordered with VMEM. Reference: block-local proofs only, as before the edge table.
+        let mut program = program;
+        program.instructions[674] = Instruction::new(
+            "v_mov_b32 v1, 0",
+            vec![RegRef {
+                kind: Kind::V,
+                base: 1,
+                len: 1,
+            }],
+            vec![],
+        );
         let before =
             ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &[]).unwrap_err();
         assert!(
             before.starts_with(
-                "pc 674 `global_load_dword v1, v[6:7], off` (after label `L648`): needs Vm wait 0 \
+                "pc 674 `v_mov_b32 v1, 0` (after label `L648`): needs Vm wait 0 \
                  (Waw { reg: \"v1\" }) but a path reaches it without one:"
             ),
             "{before}"
@@ -1218,10 +1256,7 @@ mod tests {
         // Refined: either certifies, or reports something that is not that infeasible edge.
         let after = ledger_cfg::verify_with_branch_proofs(&program, &[], &choices, &entries);
         if let Err(after) = after {
-            assert!(
-                !after.contains("pc 674 `global_load_dword v1, v[6:7], off`"),
-                "{after}"
-            );
+            assert!(!after.contains("pc 674 `v_mov_b32 v1, 0`"), "{after}");
         }
     }
 

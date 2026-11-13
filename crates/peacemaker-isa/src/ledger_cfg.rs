@@ -2569,11 +2569,22 @@ mod tests {
         )
     }
     /// A join `J` entered over two edges (the `s_branch` at pc 2, the fall-through of pc 4) and
-    /// ended by the conditional at pc 6; pc 7 reloads `v1` (a WAW if a load of `v1` is pending).
+    /// ended by the conditional at pc 6; pc 7 overwrites `v1` with a VALU write, which is not
+    /// ordered with VMEM (a WAW if a load of `v1` is pending; a VMEM reload would be ordered).
     /// pc 0 chooses the side; `branch_side` runs only before the `s_branch`, `fall_side` only
     /// before the fall-through. Ledger pcs: 0 branch, 1 branch side, 2 `s_branch J`, 3 `B:`,
     /// 4 fall side, 5 `J:`, 6 `s_cbranch_scc1 E`, 7 reload, 8 `E:`, 9 endpgm.
     fn join(branch_side: Instruction, fall_side: Instruction) -> Program {
+        join_writing(branch_side, fall_side, valu_v1())
+    }
+    fn valu_v1() -> Instruction {
+        Instruction::new("v_mov_b32 v1, 0", vec![v(1)], vec![])
+    }
+    fn join_writing(
+        branch_side: Instruction,
+        fall_side: Instruction,
+        write: Instruction,
+    ) -> Program {
         cdna(vec![
             ins("s_cbranch_scc1 B"),
             branch_side,
@@ -2582,7 +2593,7 @@ mod tests {
             fall_side,
             ins("J:"),
             ins("s_cbranch_scc1 E"),
-            load(1),
+            write,
             ins("E:"),
             ins("s_endpgm"),
         ])
@@ -2593,8 +2604,12 @@ mod tests {
         let nop = || ins("s_nop 0");
         let none: Vec<EdgeChoice> = vec![EdgeChoice::Both; 10];
 
+        // Ordered VMEM load/load writeback is certified on its own, with no proof at all.
+        let ordered = join_writing(load(1), nop(), load(1));
+        verify_with_branch_proofs(&ordered, &[], &none, &[]).unwrap();
+
         // The pending load reaches J only over the `s_branch` edge: without the proof the
-        // not-taken edge of pc 6 reloads `v1` under it.
+        // not-taken edge of pc 6 overwrites `v1` under it.
         let p = join(load(1), nop());
         let e = verify_with_branch_proofs(&p, &[], &none, &[]).unwrap_err();
         assert!(
@@ -2632,7 +2647,7 @@ mod tests {
     fn arrivals_with_equal_memory_but_different_proofs_are_never_merged() {
         // Both arrivals at J carry the same pending shape (one load of `v1`), so the ledger
         // half of the key is equal; the proven arrival (pc 2 -> J, Taken) must not hide the
-        // unproven one (fall-through), which reaches the reload at pc 7.
+        // unproven one (fall-through), which reaches the overwrite at pc 7.
         let p = join(load(1), load(1));
         let none: Vec<EdgeChoice> = vec![EdgeChoice::Both; 10];
         let proof = [entry(2, true, 5, 6, EdgeChoice::Taken)];
