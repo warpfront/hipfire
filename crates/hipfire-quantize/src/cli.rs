@@ -15,6 +15,24 @@ pub(crate) enum MoeExpertDown {
     Mq4g128v2Symmetric,
 }
 
+/// Candidate grid for the A4-aware AWQ alpha search (`--awq-a4-grid`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum AwqA4Grid {
+    /// The grid every A4-aware recipe has used: 0.35/0.45/0.55/0.65/0.75.
+    Shipped,
+    /// Adds the low band 0.05/0.15/0.25 and drops 0.45/0.65.
+    Wide,
+}
+
+impl AwqA4Grid {
+    pub(crate) fn alphas(self) -> &'static [f32] {
+        match self {
+            AwqA4Grid::Shipped => &crate::calibration::AWQ_A4_SHIPPED_ALPHAS,
+            AwqA4Grid::Wide => &crate::calibration::AWQ_A4_WIDE_ALPHAS,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "hipfire-quantize",
@@ -27,7 +45,10 @@ pub(crate) enum MoeExpertDown {
                   trunk-overlay  Build the <model>.trunk-overlay QT44 overlay sidecar for a base \
                   model (run `hipfire-quantize trunk-overlay --help`)\n  \
                   hc8  Build the <model>.hc8 8-bit hyper-connection mixer sidecar for a Flash-Next \
-                  base model (run `hipfire-quantize hc8 build --help`)"
+                  base model (run `hipfire-quantize hc8 build --help`)",
+    group = clap::ArgGroup::new("awq_a4_search")
+        .args(["awq_a4_aware", "awq_a4_route_c2"])
+        .multiple(false)
 )]
 pub(crate) struct QuantizeArgs {
     /// Hugging Face model directory or model ID. A GGUF weight file is
@@ -253,6 +274,16 @@ pub(crate) struct QuantizeArgs {
     /// asymmetric W surrogate, positive imatrix-RMS activation).
     #[arg(long, conflicts_with = "awq_alpha")]
     pub awq_a4_aware: bool,
+
+    /// Candidate grid for the `--awq-a4-aware` / `--awq-a4-route-c2` alpha
+    /// search. `shipped` (the default) is the grid every A4-aware recipe has
+    /// used, so an existing recipe reproduces byte for byte; `wide` adds the
+    /// low band 0.05/0.15/0.25 that a BF16-teacher MQ4G256 sweep measured
+    /// best on KLD, and drops 0.45/0.65. Widening the default is a recipe
+    /// bump, not a fix: the search minimizes W4A4 block-output error, not
+    /// KLD, so the wider grid has to be opted into and measured.
+    #[arg(long, value_enum, value_name = "GRID", requires = "awq_a4_search")]
+    pub awq_a4_grid: Option<AwqA4Grid>,
 
     /// Search shared AWQ alpha with the gfx1201 fused c2 A4 recipe and
     /// symmetric qt44 W writer for every eligible layer. Without captured
@@ -565,6 +596,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("awq", &[Main]),
     ("awq_fix_la_head_order", &[Main]),
     ("awq_a4_aware", &[Main]),
+    ("awq_a4_grid", &[Main]),
     ("awq_a4_route_c2", &[Main]),
     ("awq_a4_signed_capture", &[Main]),
     ("awq_a4_source_sha", &[Main]),
@@ -658,6 +690,49 @@ mod route_tests {
                 "FLAG_ROUTES names unknown argument {id}"
             );
         }
+    }
+
+    #[test]
+    fn awq_a4_grid_needs_a_search_flag_and_maps_to_the_two_grids() {
+        let parse = |argv: &[&str]| {
+            QuantizeArgs::command().try_get_matches_from(
+                std::iter::once("hipfire-quantize")
+                    .chain(["--input", "i", "--output", "o"])
+                    .chain(argv.iter().copied()),
+            )
+        };
+        let wide = parse(&["--awq-a4-aware", "--awq-a4-grid", "wide"]).unwrap();
+        assert_eq!(
+            wide.get_one::<AwqA4Grid>("awq_a4_grid"),
+            Some(&AwqA4Grid::Wide)
+        );
+        // No flag is the shipped grid, not "no search".
+        let unset = parse(&["--awq-a4-aware"]).unwrap();
+        assert_eq!(unset.get_one::<AwqA4Grid>("awq_a4_grid"), None);
+        // A grid may only be selected for a search that is running, and an
+        // unknown name never falls back silently to a default.
+        assert!(parse(&["--awq-a4-grid", "wide"]).is_err());
+        assert!(parse(&["--awq-a4-aware", "--awq-a4-grid", "Low"]).is_err());
+        let c2 = parse(&[
+            "--awq-a4-route-c2",
+            "--mq4v2-symmetric",
+            "--awq-a4-grid",
+            "wide",
+        ])
+        .unwrap();
+        assert_eq!(
+            c2.get_one::<AwqA4Grid>("awq_a4_grid"),
+            Some(&AwqA4Grid::Wide)
+        );
+        assert!(parse(&["--awq-a4-aware", "--awq-a4-grid", "shipped"]).is_ok());
+        assert_eq!(
+            AwqA4Grid::Shipped.alphas(),
+            &crate::calibration::AWQ_A4_SHIPPED_ALPHAS[..]
+        );
+        assert_eq!(
+            AwqA4Grid::Wide.alphas(),
+            &crate::calibration::AWQ_A4_WIDE_ALPHAS[..]
+        );
     }
 
     #[test]

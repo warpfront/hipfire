@@ -18,7 +18,37 @@ use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 pub(crate) static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 pub(crate) static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 pub(crate) static AWQ_A4_AWARE: OnceLock<bool> = OnceLock::new();
-pub(crate) const AWQ_A4_CANDIDATE_ALPHAS: [f32; 5] = [0.35, 0.45, 0.55, 0.65, 0.75];
+/// Shipped candidate smoothing exponents for the A4-aware search.
+///
+/// This is the grid every A4-aware recipe has used, and it is the default:
+/// `--awq-a4-aware` without `--awq-a4-grid` must keep producing the same
+/// bytes it always did. The search minimizes a W4A4 block-output error, not
+/// KLD, so a grid change is a recipe bump, not a bug fix — do not widen the
+/// default on the strength of a fixed-alpha KLD sweep.
+pub(crate) const AWQ_A4_SHIPPED_ALPHAS: [f32; 5] = [0.35, 0.45, 0.55, 0.65, 0.75];
+/// Opt-in wider grid (`--awq-a4-grid wide`): reaches the low band a
+/// BF16-teacher MQ4G256 alpha sweep measured best on KLD
+/// (`docs/perf-checkpoints/2026-08-16-qwen38-27b-mq4-awq-alpha-kld.md`),
+/// and drops `0.45`/`0.65`, which that sweep could not separate from their
+/// neighbors. The sweep varies the fixed exponent for the whole model; this
+/// grid only changes which candidates the per-tensor W4A4 search may pick,
+/// and its end-to-end KLD effect is not assumed to match the sweep's.
+pub(crate) const AWQ_A4_WIDE_ALPHAS: [f32; 6] = [0.05, 0.15, 0.25, 0.35, 0.55, 0.75];
+/// Grid selected for this run; unset means [`AWQ_A4_SHIPPED_ALPHAS`].
+static AWQ_A4_ALPHAS: OnceLock<&'static [f32]> = OnceLock::new();
+
+pub(crate) fn awq_a4_candidate_alphas() -> &'static [f32] {
+    AWQ_A4_ALPHAS
+        .get()
+        .copied()
+        .unwrap_or(&AWQ_A4_SHIPPED_ALPHAS)
+}
+
+pub(crate) fn select_awq_a4_grid(alphas: &'static [f32]) {
+    AWQ_A4_ALPHAS
+        .set(alphas)
+        .expect("AWQ A4 grid set twice — should not happen");
+}
 static AWQ_A4_ALPHA_BY_ACTIVATION: LazyLock<Mutex<HashMap<Vec<u32>, f32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Opt-in QAT producer rows; absent leaves the historical surrogate unchanged.
@@ -1494,10 +1524,12 @@ pub(crate) fn compute_a4_aware_awq_scales(
     k: usize,
     signs1: &[f32],
     signs2: &[f32],
+    alphas: &[f32],
 ) -> A4AwareAwqResult {
     debug_assert_eq!(in_sum2.len(), k);
     debug_assert_eq!(weights.len(), m * k);
     debug_assert_eq!(k % 256, 0);
+    debug_assert!(!alphas.is_empty(), "AWQ A4 alpha grid is non-empty");
 
     let captured = signed_awq_rows(name, k);
     let activations = captured.as_ref().map_or_else(
@@ -1554,7 +1586,7 @@ pub(crate) fn compute_a4_aware_awq_scales(
             / rows.len() as f64
     };
     let mut best: Option<A4AwareAwqResult> = None;
-    for alpha in AWQ_A4_CANDIDATE_ALPHAS {
+    for &alpha in alphas {
         let scales = compute_awq_scales(in_sum2, alpha);
         let relative_output_mse = score(&scales, &activations, &reference_outputs);
         if best.as_ref().map_or(true, |current| {
@@ -1623,7 +1655,16 @@ pub(crate) fn compute_awq_scales_for_weight(
                 relative_output_mse: f64::NAN,
             };
         }
-        let selected = compute_a4_aware_awq_scales(name, in_sum2, weights, m, k, signs1, signs2);
+        let selected = compute_a4_aware_awq_scales(
+            name,
+            in_sum2,
+            weights,
+            m,
+            k,
+            signs1,
+            signs2,
+            awq_a4_candidate_alphas(),
+        );
         AWQ_A4_ALPHA_BY_ACTIVATION
             .lock()
             .expect("A4 AWQ alpha cache poisoned")
@@ -2195,5 +2236,108 @@ mod imatrix_load_tests {
         let loaded = load_imatrix(&path, Some(order()), false).unwrap();
         assert!(loaded.table.contains_key("blk.0.attn_qkv.weight"));
         assert!(loaded.warnings.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod awq_a4_grid_tests {
+    use super::*;
+    use crate::quant_fwht::gen_fwht_signs;
+
+    const K: usize = 256;
+    const M: usize = 64;
+
+    /// Deterministic weights plus an activation profile with periodic
+    /// outliers — the regime AWQ's smoothing exponent exists for.
+    fn fixture(seed: u64, outlier: f32) -> (Vec<f32>, Vec<f32>) {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut uniform = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) / ((1u64 << 31) as f32)
+        };
+        let weights: Vec<f32> = (0..M * K).map(|_| uniform() * 2.0 - 1.0).collect();
+        let in_sum2: Vec<f32> = (0..K)
+            .map(|j| {
+                let base = 0.05 + uniform();
+                if j % 32 == 0 {
+                    base * outlier
+                } else {
+                    base
+                }
+            })
+            .collect();
+        (weights, in_sum2)
+    }
+
+    fn search(weights: &[f32], in_sum2: &[f32], alphas: &[f32]) -> A4AwareAwqResult {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        compute_a4_aware_awq_scales(
+            "blk.0.ffn_down.weight",
+            in_sum2,
+            weights,
+            M,
+            K,
+            &signs1,
+            &signs2,
+            alphas,
+        )
+    }
+
+    #[test]
+    fn the_default_grid_is_the_shipped_grid() {
+        assert_eq!(
+            awq_a4_candidate_alphas(),
+            &AWQ_A4_SHIPPED_ALPHAS[..],
+            "an A4-aware run with no --awq-a4-grid must keep the historical candidates"
+        );
+        // Pinned literals: these are a byte contract, not a tuning knob.
+        assert_eq!(AWQ_A4_SHIPPED_ALPHAS, [0.35, 0.45, 0.55, 0.65, 0.75]);
+        assert_eq!(AWQ_A4_WIDE_ALPHAS, [0.05, 0.15, 0.25, 0.35, 0.55, 0.75]);
+    }
+
+    #[test]
+    fn wide_grid_can_reach_the_low_band_and_stays_the_argmin_over_the_union() {
+        let union: Vec<f32> = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75].to_vec();
+        let mut low_band = 0usize;
+        let mut moved = 0usize;
+        for seed in 1..=16u64 {
+            let (weights, in_sum2) = fixture(seed, 8.0);
+            let shipped = search(&weights, &in_sum2, &AWQ_A4_SHIPPED_ALPHAS);
+            let wide = search(&weights, &in_sum2, &AWQ_A4_WIDE_ALPHAS);
+            let all = search(&weights, &in_sum2, &union);
+            // Each grid's pick is the argmin over its own candidates, and the
+            // union's argmin can only be at or below both objectives.
+            assert!(wide.relative_output_mse >= all.relative_output_mse);
+            assert!(shipped.relative_output_mse >= all.relative_output_mse);
+            assert!(union.contains(&wide.alpha) && union.contains(&shipped.alpha));
+            if wide.alpha != shipped.alpha {
+                moved += 1;
+            }
+            if wide.alpha < 0.35 {
+                low_band += 1;
+            }
+        }
+        assert!(
+            moved > 0,
+            "the two grids never disagree; fixture is vacuous"
+        );
+        assert!(
+            low_band > 0,
+            "no fixture put the winner in the band only the wide grid reaches"
+        );
+    }
+
+    #[test]
+    fn shipped_grid_cannot_leave_its_band() {
+        let (weights, in_sum2) = fixture(7, 8.0);
+        let shipped = search(&weights, &in_sum2, &AWQ_A4_SHIPPED_ALPHAS);
+        assert!(
+            AWQ_A4_SHIPPED_ALPHAS.contains(&shipped.alpha),
+            "shipped pick {} is outside the shipped grid",
+            shipped.alpha
+        );
     }
 }

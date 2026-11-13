@@ -2277,11 +2277,16 @@ pub(crate) fn run() {
             AWQ_A4_AWARE
                 .set(true)
                 .expect("AWQ_A4_AWARE set twice — should not happen");
+            // `--awq-a4-grid` only selects which candidates the search may
+            // pick; unset keeps the shipped grid, so an existing A4-aware
+            // recipe reproduces byte for byte.
+            let grid = args.awq_a4_grid.unwrap_or(AwqA4Grid::Shipped);
+            select_awq_a4_grid(grid.alphas());
         }
         if args.awq_a4_aware || args.awq_a4_route_c2 {
             eprintln!(
                 "AWQ pre-scaling: ENABLED (A4-aware shared-activation alpha search over {:?})",
-                AWQ_A4_CANDIDATE_ALPHAS
+                awq_a4_candidate_alphas()
             );
         } else {
             eprintln!(
@@ -2859,11 +2864,17 @@ pub(crate) fn run() {
     if args.awq_fix_la_head_order {
         metadata["awq_la_out_head_order"] = serde_json::json!("qwen3.8-hf-kmajor-vminor");
     }
+    // Only the wider grid changes bytes, so only it is recorded: an explicit
+    // `--awq-a4-grid shipped` (and no flag at all) must reproduce the
+    // historical artifact exactly, metadata included.
+    if matches!(args.awq_a4_grid, Some(AwqA4Grid::Wide)) {
+        metadata["awq_a4_grid"] = serde_json::json!("wide");
+    }
     if args.awq_a4_route_c2 {
         metadata["awq_a4_recipe"] = serde_json::json!({
             "producer": "gfx1201-fused-c2",
             "weight_grid": "mq4v2-symmetric-qt44",
-            "alpha_grid": AWQ_A4_CANDIDATE_ALPHAS,
+            "alpha_grid": awq_a4_candidate_alphas(),
             "fallback_activation": "imatrix-positive-rms",
         });
     }
