@@ -2021,11 +2021,7 @@ fn speed(
         // render error is fatal, never silently replaced by a raw completion.
         let text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&text);
         let template = hfq.chat_template();
-        let jinja = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0");
-        if let Some(template) = template.as_ref().filter(|_| jinja) {
+        if let Some(template) = template.as_ref() {
             let rendered = hipfire_runtime::prompt_frame::JinjaChatFrame {
                 tokenizer: &probe,
                 template,

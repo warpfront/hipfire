@@ -97,5 +97,5 @@ or FP32 + HIPFIRE_DETERMINISTIC=1, else stochastic quantized state masks corrupt
   (1) the cache-under-jinja wiring (item-4) doesn't exist, so flipping gains nothing
   for caching; (2) the `| tojson` tool-render skew should be fixed first.
 - Recommend: land item-4 wiring → run ① byte-identity → fix tojson/preserve_order →
-  then flip default behind the existing `HIPFIRE_JINJA_CHAT` flag with ChatScaffold
+  then flip the Jinja chat default on with ChatScaffold
   fallback retained.

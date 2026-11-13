@@ -43,7 +43,7 @@ Repro recipe (master at the time of this writeup):
 cargo build --release --example daemon --features deltanet
 
 # JSON over stdin to the daemon. Send a load message, wait, then generate
-# at temp=0.3 (or 0.0), jinja chat template on, thinking on.
+# at temp=0.3 (or 0.0), jinja chat template, thinking on.
 # See drive scripts referenced in the Reproducibility section.
 ```
 
@@ -282,7 +282,7 @@ PROMPT_JSON=$(python3 -c "import json; print(json.dumps(open('benchmarks/prompts
   sleep 300
   echo "{\"type\":\"unload\"}"
   sleep 2
-) | env HIPFIRE_JINJA_CHAT=1 "$DAEMON" 2>&1
+) | "$DAEMON" 2>&1
 
 # With repeat_penalty=1.3 default (pre-PR-#267 master): loop pathology
 # With "repeat_penalty": 1.0 in the generate request: clean output

@@ -15,7 +15,7 @@ mkdir -p $O
 export HSA_USERPTR_FOR_PAGED_MEM=0 GPU_PINNED_MIN_XFER_SIZE=100000
 export HIPFIRE_HOME=$H/.hipfire HOME=$H HIPFIRE_DAEMON_BIN=$B/daemon HIPFIRE_REGISTRY_URL=http://127.0.0.1:1/v1.json HIPFIRE_NO_REGISTRY_FETCH=1
 for v in $(compgen -e); do case $v in HIPFIRE_DEVICES|HIPFIRE_LOCK_DIR|HIPFIRE_FABRIC_ADMISSION|HIPFIRE_HOME|HIPFIRE_DAEMON_BIN|HIPFIRE_REGISTRY_URL|HIPFIRE_NO_REGISTRY_FETCH|FABRIC_JOB) ;; HIPFIRE_*|GPU_MAX_HW_QUEUES) unset $v;; esac; done
-export HIPFIRE_JINJA_CHAT=0 HIPFIRE_KV_MODE=q8 HIPFIRE_STATE_QUANT=q8
+export HIPFIRE_KV_MODE=q8 HIPFIRE_STATE_QUANT=q8
 T0=$(date +%s)
 { echo "date=$(date -u +%FT%TZ) FABRIC_JOB=${FABRIC_JOB:-} MODE=$MODE"; uptime; cat /proc/loadavg; echo "GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-unset (HIP default 4)}"; env | grep -E '^(HIPFIRE|GPU_MAX|ROCR|HSA)' | sort
   md5sum $B/* 2>/dev/null; echo "link: $(cat $D/current_link_width) x $(cat $D/current_link_speed)"; free -g | head -2; cat $B/SOURCE 2>/dev/null; } > $O/pre.txt 2>&1
