@@ -277,6 +277,78 @@ fn g942_moe_gemm_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
         None => gpu.ensure_kernel(QWEN4_G942_MOE_GEMM_MODULE, QWEN4_G942_MOE_GEMM_SRC, func),
     }
 }
+
+/// Load the entry `entry` (one of [`QWEN4_G942_MOE_WIDE_ENTRIES`]) of the wide glue module the way
+/// the launchers do (hipcc source, or the `HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE` code object) and
+/// return its symbol. The module under test of `qwen4_g942_moe_wide_oracle`, which launches it
+/// directly through [`Gpu::launch_kernel_blob`]. Exact gfx942 only.
+pub(crate) fn ensure_moe_wide_entry(gpu: &mut Gpu, entry: &str) -> HipResult<&'static str> {
+    let Some(symbol) = QWEN4_G942_MOE_WIDE_ENTRIES
+        .iter()
+        .copied()
+        .find(|name| *name == entry)
+    else {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{entry} is not an entry of {QWEN4_G942_MOE_WIDE_MODULE}"),
+        ));
+    };
+    if !gpu.arch_caps.is_gfx942() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{symbol}: needs an exact gfx942 device"),
+        ));
+    }
+    gpu.bind_thread()?;
+    g942_moe_wide_ensure(gpu, symbol)?;
+    Ok(symbol)
+}
+
+/// [`ensure_moe_wide_entry`] for the wide GEMM module ([`QWEN4_G942_MOE_GEMM_ENTRIES`], the
+/// `HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE` hook). The module under test of
+/// `qwen4_g942_moe_gemm_oracle`.
+pub(crate) fn ensure_moe_gemm_entry(gpu: &mut Gpu, entry: &str) -> HipResult<&'static str> {
+    let Some(symbol) = QWEN4_G942_MOE_GEMM_ENTRIES
+        .iter()
+        .copied()
+        .find(|name| *name == entry)
+    else {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{entry} is not an entry of {QWEN4_G942_MOE_GEMM_MODULE}"),
+        ));
+    };
+    if !gpu.arch_caps.is_gfx942() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{symbol}: needs an exact gfx942 device"),
+        ));
+    }
+    gpu.bind_thread()?;
+    g942_moe_gemm_ensure(gpu, symbol)?;
+    Ok(symbol)
+}
+
+/// Load the narrow production FP8 grouped GEMM entry (`gemm_fp8b128_moe_grouped_bf16mfma`, or its
+/// `_xbf16` variant) from its own hipcc module and return the symbol: the byte-compare REFERENCE
+/// of `qwen4_g942_moe_gemm_oracle` at tile counts where the public launcher already routes to the
+/// wide module. Exact gfx942 only.
+pub(crate) fn ensure_moe_gemm_narrow(gpu: &mut Gpu, x_bf16: bool) -> HipResult<&'static str> {
+    let symbol = if x_bf16 {
+        FP8B128_MOE_GROUPED_XBF16_KERNEL
+    } else {
+        FP8B128_MOE_GROUPED_KERNEL
+    };
+    if !gpu.arch_caps.is_gfx942() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{symbol}: needs an exact gfx942 device"),
+        ));
+    }
+    gpu.bind_thread()?;
+    gpu.ensure_kernel(FP8B128_MOE_GROUPED_MODULE, FP8B128_MOE_GROUPED_SRC, symbol)?;
+    Ok(symbol)
+}
 const QWEN4_GDN_LANES_F32_SRC: &str =
     include_str!("../../../../kernels/src/qwen4_gdn_lanes_f32.gfx942.hip");
 const QWEN4_GDN_LANES_F32_KERNEL: &str = "qwen4_gdn_lanes_step_f32_gfx942";
@@ -5277,6 +5349,70 @@ mod tests {
             include_bytes!("../../../../kernels/qwen4_g942_rows16_grid_hipcc_gfx942.co");
         assert_eq!(hex(anchor), ANCHOR_SHA256);
         for name in super::QWEN4_G942_ROWS16_GRID_ENTRIES {
+            assert!(
+                anchor.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{name} missing from the anchor"
+            );
+        }
+    }
+
+    /// The frozen hipcc anchor of the wide-lane MoE glue module: `hipcc --genco
+    /// --offload-arch=gfx942 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6`
+    /// of the pinned source (ROCm 7.16, AMD clang 24.0.0git d6f6cb6918). Re-seal both hashes
+    /// together when the source changes.
+    #[test]
+    fn g942_moe_wide_anchor_and_source_are_pinned() {
+        use sha2::{Digest, Sha256};
+        const SOURCE_SHA256: &str =
+            "7806d4fcdd2aef9d74ad99301d8ae1199c0a71b58ef4e1f8afdbe82746154e2c";
+        const ANCHOR_SHA256: &str =
+            "892b48a01c9a3f3a59a756609c9bde02e9a1de1eb8e4f4fb9e3f7dad8d2bc6a5";
+        let hex = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(
+            hex(super::QWEN4_G942_MOE_WIDE_SRC.as_bytes()),
+            SOURCE_SHA256
+        );
+        let anchor: &[u8] =
+            include_bytes!("../../../../kernels/qwen4_g942_moe_wide_hipcc_gfx942.co");
+        assert_eq!(hex(anchor), ANCHOR_SHA256);
+        for name in super::QWEN4_G942_MOE_WIDE_ENTRIES {
+            assert!(
+                anchor.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{name} missing from the anchor"
+            );
+        }
+    }
+
+    /// The frozen hipcc anchor of the wide-lane MoE GEMM module: `hipcc --genco
+    /// --offload-arch=gfx942 -O3 --no-offload-compress -fuse-cuid=none -mcode-object-version=6`
+    /// of the pinned source (ROCm 7.16, AMD clang 24.0.0git d6f6cb6918). Re-seal both hashes
+    /// together when the source changes.
+    #[test]
+    fn g942_moe_gemm_anchor_and_source_are_pinned() {
+        use sha2::{Digest, Sha256};
+        const SOURCE_SHA256: &str =
+            "ecad36922a715ce9bd5803831bd7b55ecdf3a40fa5aebc68c7b4893337f73b37";
+        const ANCHOR_SHA256: &str =
+            "740fddb9e0e03ff9c7dc6fa782b20d44e06f5fe9758f4fee741e0d9c0c8598e4";
+        let hex = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(
+            hex(super::QWEN4_G942_MOE_GEMM_SRC.as_bytes()),
+            SOURCE_SHA256
+        );
+        let anchor: &[u8] =
+            include_bytes!("../../../../kernels/qwen4_g942_moe_gemm_hipcc_gfx942.co");
+        assert_eq!(hex(anchor), ANCHOR_SHA256);
+        for name in super::QWEN4_G942_MOE_GEMM_ENTRIES {
             assert!(
                 anchor.windows(name.len()).any(|w| w == name.as_bytes()),
                 "{name} missing from the anchor"
