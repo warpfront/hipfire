@@ -23,27 +23,27 @@
     ]
   },
   "gpu_oracle": {
-    "status": "PASS",
-    "target": "gfx942",
-    "input_hxaco_sha256": "60113536989b8b8bfdebd417f312aceb878660580e61f388f683a90f4dd931ef",
-    "hipcc_image_sha256": "595e6d26f9d6d8a818b0649a6a11e8bcf1d2d51fa26b2deefb6f27a7a7f56c25",
-    "pm_device_elf_sha256": "620754d4895f3d59ff0587e03234c4e649cc60711d84a0f91db5af3028efcd40",
-    "hipcc_device_elf_sha256": "620754d4895f3d59ff0587e03234c4e649cc60711d84a0f91db5af3028efcd40",
     "case_count": 10,
-    "failed_cases": 0,
-    "coverage": "lanes 1/2/8/33/64 x rows 1/4 x two recurrence steps; state and output exact; spare slots untouched",
     "controls": "bitflip state/output detected for every case; swapped/dropped lanes detected for lanes > 1",
-    "oracle": "gdn_lanes_f32_gfx942_oracle --lanes 1,2,8,33,64 --rows 1,4 --steps 2",
+    "coverage": "lanes 1/2/8/33/64 x rows 1/4 x two recurrence steps; state and output exact; spare slots untouched",
+    "failed_cases": 0,
+    "hipcc_device_elf_sha256": "620754d4895f3d59ff0587e03234c4e649cc60711d84a0f91db5af3028efcd40",
+    "hipcc_image_sha256": "595e6d26f9d6d8a818b0649a6a11e8bcf1d2d51fa26b2deefb6f27a7a7f56c25",
     "image_env": "HIPFIRE_QWEN4_G942_GDN_LANES_IMAGE=/scratch/quant/fn-fp8/beat/gdn-lanes-twin.elf",
+    "input_hxaco_sha256": "60113536989b8b8bfdebd417f312aceb878660580e61f388f683a90f4dd931ef",
     "ledger": {
-      "owner": "Twin942c",
       "class": "oracle",
-      "path": "/scratch/quant/fn-fp8/beat/ledger.jsonl",
-      "line": 119,
-      "start": "2026-11-11T04:01:57+00:00",
       "end": "2026-11-11T04:02:00+00:00",
-      "exit": 0
-    }
+      "exit": 0,
+      "line": 119,
+      "owner": "Twin942c",
+      "path": "/scratch/quant/fn-fp8/beat/ledger.jsonl",
+      "start": "2026-11-11T04:01:57+00:00"
+    },
+    "oracle": "gdn_lanes_f32_gfx942_oracle --lanes 1,2,8,33,64 --rows 1,4 --steps 2",
+    "pm_device_elf_sha256": "620754d4895f3d59ff0587e03234c4e649cc60711d84a0f91db5af3028efcd40",
+    "status": "PASS",
+    "target": "gfx942"
   },
   "hxaco": {
     "bytes": 39352,
@@ -142,7 +142,7 @@
           "ledger": {
             "barriers": 3,
             "branches": 30,
-            "label_states": 70,
+            "label_states": 69,
             "labels": 23,
             "memory": {
               "ds_load": 198,
@@ -152,7 +152,7 @@
               "vmem_load": 161,
               "vmem_store": 130
             },
-            "steps": 16120,
+            "steps": 15555,
             "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
             "waitcnt": 211,
             "waitcnt_lgkmcnt_partial": 164,
