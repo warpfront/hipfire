@@ -10905,8 +10905,6 @@ pub const ZERO_INACTIVE_ROWS_F32_SRC: &str =
 
 pub const SQRT_SOFTPLUS_F32_SRC: &str = include_str!("../../../kernels/src/sqrt_softplus_f32.hip");
 
-pub const V4F_ATTN_POS0_SRC: &str = include_str!("../../../kernels/src/deepseek4_attn_pos0.hip");
-
 pub const V4F_ATTN_SWA_SRC: &str = include_str!("../../../kernels/src/deepseek4_attn_swa.hip");
 
 /// HIP-graphs-safe twin of `deepseek4_attn_swa`: reads `n_valid` from a

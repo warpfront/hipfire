@@ -771,9 +771,6 @@ pub enum SwaAttentionRoute<'a> {
         swa_v: &'a GpuTensor,
         attn_state: &'a GpuTensor,
     },
-    /// Developer diagnostic (`HIPFIRE_DEEPSEEK4_ATTN=pos0`): each head attends
-    /// only the current row's `kv`, on every layer.
-    Pos0 { kv: &'a GpuTensor },
     /// The window's rows over its staged SWA visibility
     /// ([`super::rows::SwaStageOp`]); `n_valid` holds each row's fill.
     Batched {
@@ -787,10 +784,7 @@ pub enum SwaAttentionRoute<'a> {
 
 impl SwaAttentionOp<'_> {
     pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
-        let decode = matches!(
-            self.route,
-            SwaAttentionRoute::Decode { .. } | SwaAttentionRoute::Pos0 { .. }
-        );
+        let decode = matches!(self.route, SwaAttentionRoute::Decode { .. });
         check_rows(self.rows, decode, || {
             format!("SWA attention l{}", self.layer)
         })
@@ -820,9 +814,6 @@ pub fn execute_swa_attention(gpu: &mut Gpu, op: &SwaAttentionOp<'_>) -> Result<(
             )
             .map_err(|e| hip_err("deepseek4_attn_swa_buf", e))
         }
-        SwaAttentionRoute::Pos0 { kv } => gpu
-            .deepseek4_attn_pos0(op.q, kv, op.sink, op.out, heads, hd, groups)
-            .map_err(|e| hip_err("deepseek4_attn_pos0", e)),
         SwaAttentionRoute::Batched {
             staged,
             n_valid,
