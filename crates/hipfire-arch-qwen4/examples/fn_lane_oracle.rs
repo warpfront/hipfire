@@ -57,8 +57,10 @@
 //! step (a many-row decode step is its own lane-oracle subject, not the prefill wave's).
 //! `--wave-prefill --spec mtp`: the same burst with MTP lanes. Every unfinished lane's prefill
 //! tile is planned in one step, so the MTP lanes' trunk rows run as one joint wave whose wide
-//! hidden capture feeds each lane's head fill (`fill_head_after_wave`); the lane's trunk, head,
-//! pending hidden and draft state after prefill, window 1 and the last window are compared with
+//! hidden capture feeds each lane's head fill (`fill_heads_after_wave`, one batched Append per
+//! row over the wave's MTP lanes; `fill_head_after_wave` per lane where it does not apply); the
+//! lane's trunk, head, pending hidden and draft state after prefill, window 1 and the last
+//! window are compared with
 //! the singleton `mtp_prefill` + `mtp_step` replay as in every MTP run. A run of two or more
 //! lanes in which no wave ran FAILS. `--controls` adds `wave_perturb_prompt` (lane 1's prompt
 //! carries one wrong token; the replay comparison must fail).

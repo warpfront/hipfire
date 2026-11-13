@@ -3641,15 +3641,7 @@ impl Qwen4Bundle {
         let mtp = self.mtp.as_mut().ok_or_else(|| {
             BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
         })?;
-        for lane in rows.iter_mut() {
-            let required = lane
-                .position
-                .checked_add(1)
-                .ok_or_else(|| BundleError::Forward("Qwen4 MTP position overflows".to_string()))?;
-            lane.state
-                .ensure_mapped_capacity(gpu, required)
-                .map_err(|error| BundleError::Forward(error.to_string()))?;
-        }
+        map_draft_rows(gpu, rows)?;
         mtp.forward_rows_deferred(
             gpu,
             &self.weights,
@@ -3661,6 +3653,25 @@ impl Qwen4Bundle {
                 .and_then(Qwen4GpuForward::mtp_ep_gather),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// One batched head Append over `rows.len()` lanes (2..=[`Self::mtp_draft_call_rows`]):
+    /// `n` [`Self::mtp_append_token`] steps in one call, each lane carrying its own head state
+    /// and draft request state (`rows[i].backbone_hidden` the lane's backbone hidden, `None` its
+    /// own `wide_hidden`; nothing is swapped in, no draft runs, no wide hidden is written).
+    /// Each lane's QSA context is mapped through its position first, as `mapped_mtp` does for
+    /// the one-token step.
+    pub(crate) fn mtp_forward_rows_append(
+        &mut self,
+        gpu: &mut Gpu,
+        rows: &mut [crate::mtp_gpu::DraftRow<'_>],
+    ) -> Result<(), BundleError> {
+        let mtp = self.mtp.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+        })?;
+        map_draft_rows(gpu, rows)?;
+        mtp.forward_rows_append(gpu, &self.weights, &self.config, rows)
+            .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
     /// [`Self::mtp_draft_finish`] for a lane's own draft request state: the
@@ -6978,6 +6989,24 @@ fn mapped_mtp<'a>(
     mtp.ensure_mapped_capacity(gpu, required)
         .map_err(|error| BundleError::Forward(error.to_string()))?;
     Ok(mtp)
+}
+
+/// Map each lane of a batched head call through its position (`mapped_mtp`'s coverage, one lane
+/// at a time: a lane's head arenas are its own).
+fn map_draft_rows(
+    gpu: &mut Gpu,
+    rows: &mut [crate::mtp_gpu::DraftRow<'_>],
+) -> Result<(), BundleError> {
+    for lane in rows.iter_mut() {
+        let required = lane
+            .position
+            .checked_add(1)
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP position overflows".to_string()))?;
+        lane.state
+            .ensure_mapped_capacity(gpu, required)
+            .map_err(|error| BundleError::Forward(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn cleanup_transaction(primary: BundleError, rollback: hip_bridge::HipResult<()>) -> BundleError {

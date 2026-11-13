@@ -124,7 +124,9 @@ use crate::lane_rank::{plan_and_draft, DecodeAdmission, LaneProto, LocalLaneRank
 use crate::mesh_lane_protocol::{
     ConfirmOutcome, ControllerInterval, GreedyRule, LaneMeshExecutor, ProposalSource,
 };
-use crate::mtp_lanes::{fill_head_after_wave, prefill_tile};
+use crate::mtp_lanes::{
+    fill_head_after_wave, fill_heads_after_wave, prefill_tile, wave_heads_batchable, WaveHeadFill,
+};
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, StepOutput,
 };
@@ -1540,21 +1542,39 @@ fn run_prefill_tiles(
                         g942_wave::note_wave(gpu.device_id, count, total_rows);
                     }
                     // Each MTP lane's head fill, in plan order, from its own rows of the capture
-                    // (the same head append, pairing and pending hidden as its serial tile).
-                    let mut capture_row = 0;
-                    for (ordinal, r) in range.clone().zip(&tiles[range.clone()]) {
-                        if lanes[ordinal].spec.is_some() {
-                            let scratch = append.as_deref_mut().and_then(Option::as_mut);
-                            fill_head_after_wave(
-                                bundle,
-                                gpu,
-                                &mut *lanes[ordinal],
-                                &plan.batch.tokens[r.rows.begin..r.rows.end()],
-                                capture_row,
-                                scratch,
-                            )?;
+                    // (the same head append, pairing and pending hidden as its serial tile). Two
+                    // or more MTP lanes on the exact gfx942 route fill their heads as ONE batched
+                    // Append per row ([`fill_heads_after_wave`]); every other wave runs each
+                    // lane's serial fill.
+                    {
+                        let mut fills: Vec<WaveHeadFill<'_>> = Vec::new();
+                        let mut capture_row = 0;
+                        for (lane, r) in lanes[range.clone()].iter_mut().zip(&tiles[range.clone()])
+                        {
+                            if lane.spec.is_some() {
+                                fills.push(WaveHeadFill {
+                                    lane: &mut **lane,
+                                    tokens: &plan.batch.tokens[r.rows.begin..r.rows.end()],
+                                    hidden_row0: capture_row,
+                                });
+                            }
+                            capture_row += r.rows.len;
                         }
-                        capture_row += r.rows.len;
+                        let mut scratch = append.as_deref_mut().and_then(Option::as_mut);
+                        if wave_heads_batchable(gpu, bundle, fills.len(), scratch.is_some()) {
+                            fill_heads_after_wave(bundle, gpu, &mut fills)?;
+                        } else {
+                            for fill in &mut fills {
+                                fill_head_after_wave(
+                                    bundle,
+                                    gpu,
+                                    &mut *fill.lane,
+                                    fill.tokens,
+                                    fill.hidden_row0,
+                                    scratch.as_deref_mut(),
+                                )?;
+                            }
+                        }
                     }
                     for (ordinal, r) in range.clone().zip(&tiles[range.clone()]) {
                         if wants_pick(&lanes[ordinal].host, r) {
@@ -2844,16 +2864,22 @@ mod wave_tests {
         assert_eq!(count(".share_prompt_end_continuing(gpu"), 1);
         assert_eq!(count(".prefill_wave("), 1);
         assert_eq!(count(".prefill_wave_wide("), 1);
-        assert_eq!(count("fill_head_after_wave("), 1);
+        assert_eq!(count("fill_head_after_wave("), 1, "the serial fill of every other wave");
+        assert_eq!(count("fill_heads_after_wave("), 1, "the batched fill, once per wave");
         assert_eq!(count(".lane_prefill_tile("), 2, "completing + silent tiles");
         let begin = body.find("bundle.share_prompt_begin()").unwrap();
         let wave = body.find(".prefill_wave(").unwrap();
         let wide = body.find(".prefill_wave_wide(").unwrap();
+        let gate = body
+            .find("wave_heads_batchable(gpu, bundle, fills.len(), scratch.is_some())")
+            .unwrap();
+        let batched = body.find("fill_heads_after_wave(").unwrap();
         let fill = body.find("fill_head_after_wave(").unwrap();
         let finals = body.find("final_tiles.push((ordinal").unwrap();
         let tile = body.find(".lane_prefill_tile(").unwrap();
         let end = body.find(".share_prompt_end_continuing(gpu").unwrap();
-        assert!(begin < wave && wave < wide && wide < fill && fill < finals);
+        assert!(begin < wave && wave < wide && wide < gate);
+        assert!(gate < batched && batched < fill && fill < finals);
         assert!(finals < tile && tile < end);
         // The wave arm feeds the shared tail (top-1 download, sampled draws).
         let wave_arm = &body[wave..tile];

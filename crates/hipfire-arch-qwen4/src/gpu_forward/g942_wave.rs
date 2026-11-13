@@ -12,7 +12,9 @@
 //! grouped MoE, the final hyper) run once over all the wave's rows, and the stateful cores
 //! (GDN, QSA, PLE conv) per lane on the lane's own rows and state. An MTP lane's wave rows are
 //! captured into the resident spec hidden buffer (`prefill_wave_wide`) and its head fill then
-//! runs from its own rows of that capture (`fill_head_after_wave`), the serial tile's head append.
+//! runs from its own rows of that capture, the serial tile's head append: one batched Append per
+//! row over the wave's MTP lanes (`fill_heads_after_wave`, two or more of them, byte-identical
+//! to the serial append lane by lane), else each lane's serial fill (`fill_head_after_wave`).
 //!
 //! Why each lane's bytes equal its serial tile (checked by the lane oracle, not assumed):
 //! the singleton chunk forward on gfx942 pins `Gpu::prefill_invariant_scope`

@@ -17,6 +17,12 @@
 //! `i`, so the per-lane bytes equal `n` serial `forward_token_deferred`
 //! calls (proved per round by the lab oracle).
 //!
+//! The same rows scratch carries the batched Append ([`Qwen4MtpGpu::forward_rows_append`]): one
+//! [`MtpStep::Append`] for 2..=[`Qwen4MtpGpu::draft_call_rows`] lanes, the Predict round's
+//! prologue and row stages followed by one whole `AppendOnly` attention per lane and no MoE,
+//! draft head or wide-hidden copy (the exact gfx942 prefill wave's head fill,
+//! `mtp_lanes::fill_heads_after_wave`).
+//!
 //! This module is a child of `mtp_gpu` and uses its private items directly.
 
 use super::*;
@@ -577,6 +583,85 @@ impl MtpGpuState {
     }
 }
 
+/// Stage 1 of a batched head call, a Predict round's and an Append call's alike: per lane, on
+/// the host, exactly `head_prologue`'s checks (the backbone hidden's shape, the position equal
+/// to the lane state's, within the QSA capacity and the mapped coverage); then the lanes'
+/// backbone hiddens into their rows of the rows scratch, the draft history (`observe_request`
+/// of each lane's own request state, in lane order) and ONE H2D of the `n` token ids. Returns
+/// the exact-extent row views of the `n`-lane call.
+fn stage_head_rows(
+    gpu: &mut Gpu,
+    rs: &mut MtpRowsScratch,
+    draft: &DraftHead,
+    max_seq: usize,
+    config: &Qwen4Config,
+    lanes: &mut [DraftRow<'_>],
+) -> Result<RowsView, MtpGpuError> {
+    let n = lanes.len();
+    let wide = config
+        .hc_count
+        .checked_mul(config.hidden_size)
+        .ok_or_else(|| invalid("MTP wide dimension overflow"))?;
+    let wide_bytes = wide * std::mem::size_of::<f32>();
+    for (row, lane) in lanes.iter().enumerate() {
+        if let Some(backbone) = lane.backbone_hidden {
+            if backbone.dtype != DType::F32 || backbone.numel() != wide {
+                return Err(invalid(format!(
+                    "MTP backbone hidden must be F32 with {wide} elements"
+                )));
+            }
+        }
+        let state = &*lane.state;
+        if lane.position != state.position {
+            return Err(invalid(format!(
+                "MTP lane {row} position mismatch: expected {}, got {}",
+                state.position, lane.position
+            )));
+        }
+        if lane.position >= max_seq {
+            return Err(invalid("MTP position exceeds QSA capacity"));
+        }
+        if lane.position >= state.mapped_tokens {
+            return Err(invalid(format!(
+                "MTP lane {row} position {} is past the mapped QSA coverage of {} tokens",
+                lane.position, state.mapped_tokens
+            )));
+        }
+    }
+    require_hc_up(&rs.hc_up, n, wide, config.hc_lowrank)?;
+    let view = rs.view(n, config)?;
+    {
+        let targets: SmallVec<[GpuTensor; MTP_DRAFT_LANES_MAX]> = (0..n)
+            .map(|row| rs.backbone_hidden.sub_offset(row * wide, wide))
+            .collect();
+        let pairs: SmallVec<[(&GpuTensor, &GpuTensor, usize); MTP_DRAFT_LANES_MAX]> = lanes
+            .iter()
+            .zip(&targets)
+            .map(|(lane, target)| {
+                (
+                    lane.backbone_hidden.unwrap_or(&lane.state.wide_hidden),
+                    target,
+                    wide_bytes,
+                )
+            })
+            .collect();
+        copy_tensors(gpu, &pairs)?;
+    }
+    // The widest call any load makes bounds the array; `n <= draft_call_rows()`.
+    let mut token_bytes = [0u8; MTP_DRAFT_LANES_MAX_GFX942 * std::mem::size_of::<i32>()];
+    for (row, lane) in lanes.iter_mut().enumerate() {
+        draft.observe_request(lane.request, lane.token);
+        token_bytes[row * 4..row * 4 + 4].copy_from_slice(&(lane.token as i32).to_ne_bytes());
+    }
+    upload_token_ids(
+        rs.token_ring.as_mut(),
+        gpu,
+        &rs.token_ids.buf,
+        &token_bytes[..n * 4],
+    )?;
+    Ok(view)
+}
+
 impl Qwen4MtpGpu {
     /// One Predict head step for `lanes.len()` (2..=[`Self::draft_call_rows`])
     /// drafting lanes at once, the draft's device work deferred into
@@ -701,65 +786,9 @@ impl Qwen4MtpGpu {
         // Never the plain-AR retained body (see `head_prologue`).
         gpu.replay.set_forward_eligible(false);
 
-        // Stage 1 (per lane, host): the position guards and the backbone
-        // hidden staging, exactly `head_prologue`'s; then the draft history
-        // and ONE H2D of the `n` tokens.
-        for (row, lane) in lanes.iter().enumerate() {
-            if let Some(backbone) = lane.backbone_hidden {
-                if backbone.dtype != DType::F32 || backbone.numel() != wide {
-                    return Err(invalid(format!(
-                        "MTP backbone hidden must be F32 with {wide} elements"
-                    )));
-                }
-            }
-            let state = &*lane.state;
-            if lane.position != state.position {
-                return Err(invalid(format!(
-                    "MTP lane {row} position mismatch: expected {}, got {}",
-                    state.position, lane.position
-                )));
-            }
-            if lane.position >= *max_seq {
-                return Err(invalid("MTP position exceeds QSA capacity"));
-            }
-            if lane.position >= state.mapped_tokens {
-                return Err(invalid(format!(
-                    "MTP lane {row} position {} is past the mapped QSA coverage of {} tokens",
-                    lane.position, state.mapped_tokens
-                )));
-            }
-        }
-        require_hc_up(&rs.hc_up, n, wide, config.hc_lowrank)?;
-        let view = rs.view(n, config)?;
-        {
-            let targets: SmallVec<[GpuTensor; MTP_DRAFT_LANES_MAX]> = (0..n)
-                .map(|row| rs.backbone_hidden.sub_offset(row * wide, wide))
-                .collect();
-            let pairs: SmallVec<[(&GpuTensor, &GpuTensor, usize); MTP_DRAFT_LANES_MAX]> = lanes
-                .iter()
-                .zip(&targets)
-                .map(|(lane, target)| {
-                    (
-                        lane.backbone_hidden.unwrap_or(&lane.state.wide_hidden),
-                        target,
-                        wide_bytes,
-                    )
-                })
-                .collect();
-            copy_tensors(gpu, &pairs)?;
-        }
-        // The widest call any load makes bounds the array; `n <= self.draft_call_rows()`.
-        let mut token_bytes = [0u8; MTP_DRAFT_LANES_MAX_GFX942 * std::mem::size_of::<i32>()];
-        for (row, lane) in lanes.iter_mut().enumerate() {
-            draft.observe_request(lane.request, lane.token);
-            token_bytes[row * 4..row * 4 + 4].copy_from_slice(&(lane.token as i32).to_ne_bytes());
-        }
-        upload_token_ids(
-            rs.token_ring.as_mut(),
-            gpu,
-            &rs.token_ids.buf,
-            &token_bytes[..n * 4],
-        )?;
+        // Stage 1 (per lane, host): the position guards, the backbone hidden staging, the
+        // draft history and ONE H2D of the `n` tokens ([`stage_head_rows`]).
+        let view = stage_head_rows(gpu, rs, &*draft, *max_seq, config, lanes)?;
         let rs: &MtpRowsScratch = rs;
 
         // Stages 2-4: the row stages once over all rows, the attention per
@@ -1031,6 +1060,153 @@ impl Qwen4MtpGpu {
     }
 }
 
+impl Qwen4MtpGpu {
+    /// One [`MtpStep::Append`] for `lanes.len()` (2..=[`Self::draft_call_rows`]) lanes at once:
+    /// each lane's K / V and index-key rows for `lane.token` at `lane.position` appended to its
+    /// own head arena, paired with `lane.backbone_hidden` (`None`: the lane's own `wide_hidden`).
+    /// No draft runs and no result is produced; `lane.fresh_qsa_selection` is ignored, as the
+    /// serial Append ignores it.
+    ///
+    /// Equivalent, lane by lane, to `n` calls of `forward_token(.., MtpStep::Append, ..)` with
+    /// each lane's state and request swapped in. The serial Append's program is `Embed,
+    /// HyperNorm, Project, HyperNorm, Project, BroadcastAdd, HyperRead,
+    /// IndexedAttention(AppendOnly)`: its `ffn` is `None`, so `push_head_rows_back` pushes
+    /// nothing (no HC write, MLP, MoE or final HC read; no EP gather, `moe_steps` untouched),
+    /// no draft runs, and `finish_head_step` skips the wide-hidden copy and only commits the
+    /// lengths. Here the prologue ([`stage_head_rows`]) and the row stages
+    /// ([`push_head_rows_front`]) are a Predict round's own, run once over the `n` rows (each
+    /// row bitwise the one-row step's: the batched-round oracle, the front does not depend on
+    /// the step), then each lane's whole one-row `AppendOnly` attention op runs on its row of
+    /// the HC read. `AppendOnly` admits only the whole mixer op
+    /// (`IndexedAttentionOp::check_phase`), so there is no projection split here: the op is the
+    /// serial one on the same bytes. The persistent bytes it writes, serial and batched alike,
+    /// are row `position` of the lane's full K and V caches and raw index keys, and the
+    /// pooled-key block that row completes (`complete > 0`); it returns before the selection,
+    /// attention and output projection, so the selection, its length scalar and `wide_hidden`
+    /// are untouched. The lane's lengths commit through [`MtpGpuState::commit_step`]
+    /// (`selected_len` 0), and its request state sees the token (`observe_request`), as the
+    /// serial prologue's `observe` does.
+    ///
+    /// A call of more than [`MTP_DRAFT_LANES_MAX`] lanes runs inside the lane-rows scope exactly
+    /// as [`Self::forward_rows_deferred`] does (the front's HC stages take the one-row step's
+    /// arithmetic for them). The caller maps each lane's QSA context through its position
+    /// (`MtpGpuState::ensure_mapped_capacity`), as `mapped_mtp` does for the one-token step.
+    pub(crate) fn forward_rows_append(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        lanes: &mut [DraftRow<'_>],
+    ) -> Result<(), MtpGpuError> {
+        let prior_rows_scope = gpu.lane_rows_scope;
+        gpu.lane_rows_scope |= lanes.len() > MTP_DRAFT_LANES_MAX;
+        let result = self.forward_rows_append_in_scope(gpu, weights, config, lanes);
+        gpu.lane_rows_scope = prior_rows_scope;
+        result
+    }
+
+    fn forward_rows_append_in_scope(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        lanes: &mut [DraftRow<'_>],
+    ) -> Result<(), MtpGpuError> {
+        if !draft_rounds_enabled(config) {
+            return Err(invalid(format!(
+                "batched MTP head appends need {MTP_DRAFT_ROUNDS_ENV}=1"
+            )));
+        }
+        let config = config.mtp_geometry();
+        let n = lanes.len();
+        let max_rows = self.draft_call_rows();
+        if !(2..=max_rows).contains(&n) {
+            return Err(invalid(format!(
+                "a batched MTP head append takes 2..={max_rows} lanes, got {n}"
+            )));
+        }
+        let Self {
+            scratch,
+            rows: rows_scratch,
+            max_seq,
+            draft,
+            ..
+        } = self;
+        let rs = rows_scratch.as_mut().ok_or_else(|| {
+            invalid(format!(
+                "MTP rows scratch is not allocated: set {MTP_DRAFT_ROUNDS_ENV}=1 (MoE head) before load"
+            ))
+        })?;
+        let mtp = bound_mtp(weights)?;
+        let hidden = config.hidden_size;
+        let glue_fold = gpu.flags.qwen4_draft_glue_fold_enabled();
+
+        // Never the plain-AR retained body (see `head_prologue`).
+        gpu.replay.set_forward_eligible(false);
+
+        // Stage 1 (per lane, host), as a Predict round's.
+        let view = stage_head_rows(gpu, rs, &*draft, *max_seq, config, lanes)?;
+        let rs: &MtpRowsScratch = rs;
+        let scratch: &MtpGpuScratch = scratch;
+
+        // The row stages once over all rows, then each lane's whole AppendOnly attention on its
+        // own row of the HC read. Everything the program borrows lives in this scope.
+        let lengths = {
+            let tensors = rs.tensors(&view);
+            let one_launch = fc_hidden_one_launch(
+                gpu,
+                weights.resident(&mtp.fc_hidden)?.dtype == DType::BF16,
+                n,
+                config.hc_count,
+            );
+            let views = HeadRowViews::new(&tensors, config, n, one_launch);
+            let ctx = DispatchCtx::new(gpu);
+            let attn = hyper_desc(weights, &mtp.attn_hyper)?;
+            let attention_inputs: SmallVec<[GpuTensor; MTP_DRAFT_LANES_MAX]> = (0..n)
+                .map(|row| rs.hc_mixed.sub_offset(row * hidden, hidden))
+                .collect();
+            let attention_outputs: SmallVec<[GpuTensor; MTP_DRAFT_LANES_MAX]> = (0..n)
+                .map(|row| rs.projected_embedding.sub_offset(row * hidden, hidden))
+                .collect();
+            let mut steps: SmallVec<[Step<'_>; 16]> = SmallVec::new();
+            push_head_rows_front(
+                &mut steps,
+                weights,
+                config,
+                mtp,
+                &tensors,
+                &views,
+                n,
+                glue_fold,
+                &view.backbone_hidden,
+                &attn.read,
+            )?;
+            let mut lengths: SmallVec<[(usize, usize, usize, usize, usize); MTP_DRAFT_LANES_MAX]> =
+                SmallVec::new();
+            for (row, lane) in lanes.iter().enumerate() {
+                let attention = head_attention_op(
+                    config,
+                    scratch,
+                    &*lane.state,
+                    qsa_desc(weights, &mtp.attention)?,
+                    IndexedAttentionMode::AppendOnly,
+                    &attention_inputs[row],
+                    &attention_outputs[row],
+                );
+                lengths.push(attention.next_lengths()?);
+                steps.push(Step::IndexedAttention(attention));
+            }
+            validate_steps(gpu, &steps)?;
+            execute_validated_steps(gpu, &ctx, &steps)?;
+            lengths
+        };
+        for (row, lane) in lanes.iter_mut().enumerate() {
+            lane.state.commit_step(lengths[row]);
+        }
+        Ok(())
+    }
+}
+
 /// Copy rows `(src_row, dst_row)` between two row-major tensors of `row_bytes`
 /// rows (distinct allocations): every maximal run of constant source and
 /// destination strides is one pitched device copy.
@@ -1208,5 +1384,76 @@ impl Qwen4MtpGpu {
             false,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    const SRC: &str = include_str!("rows.rs");
+
+    /// `SRC` from `head` through the end of that item (`end`: its closing line).
+    fn item<'a>(head: &str, end: &str) -> &'a str {
+        let rest = &SRC[SRC.find(head).unwrap_or_else(|| panic!("{head} missing"))..];
+        &rest[..rest.find(end).expect("item end")]
+    }
+
+    /// The batched Append is the serial Append lane by lane (a device is needed to run it, so
+    /// the contract is pinned on the source): a Predict round's prologue and row stages, ONE
+    /// whole `AppendOnly` attention per lane on its row of the HC read (`AppendOnly` admits no
+    /// projection split), the lengths committed per lane, and none of the Predict tail (no HC
+    /// write / MLP / MoE seal or EP gather, no draft head, no wide-hidden copy).
+    #[test]
+    fn batched_append_is_the_serial_append_without_the_predict_tail() {
+        let body = item("fn forward_rows_append_in_scope(", "\n    }\n");
+        for needed in [
+            "stage_head_rows(",
+            "push_head_rows_front(",
+            "IndexedAttentionMode::AppendOnly",
+            "attention.next_lengths()?",
+            "lane.state.commit_step(lengths[row])",
+            "(2..=max_rows).contains(&n)",
+        ] {
+            assert!(body.contains(needed), "batched append: {needed}");
+        }
+        for predict_only in [
+            "push_head_rows_back(",
+            "push_head_rows_pre_ffn(",
+            "push_head_rows_post_ffn(",
+            "seal_moe_rows(",
+            "moe_steps",
+            "draft_rows_enqueue(",
+            "lm_head",
+            "copy_tensors(",
+            "wide_hidden",
+            "MixerPhase::",
+            "projection_batch(",
+            "ReuseSelection",
+            "IndexedAttentionMode::Full",
+        ] {
+            assert!(
+                !body.contains(predict_only),
+                "batched append must not run the Predict tail: {predict_only}"
+            );
+        }
+        // Its scope handling is the Predict round's, and both rounds share one prologue.
+        let entry = item("pub(crate) fn forward_rows_append(", "\n    }\n");
+        let predict = item("pub(crate) fn forward_rows_deferred(", "\n    }\n");
+        for scope in [
+            "gpu.lane_rows_scope |= lanes.len() > MTP_DRAFT_LANES_MAX;",
+            "gpu.lane_rows_scope = prior_rows_scope;",
+        ] {
+            assert!(entry.contains(scope) && predict.contains(scope), "{scope}");
+        }
+        let predict_body = item("fn forward_rows_deferred_in_scope(", "\n    }\n");
+        assert!(predict_body.contains("stage_head_rows("));
+        let stage = item("fn stage_head_rows(", "\n}\n");
+        for needed in [
+            "draft.observe_request(lane.request, lane.token)",
+            "upload_token_ids(",
+            "lane.position != state.position",
+            "lane.position >= state.mapped_tokens",
+        ] {
+            assert!(stage.contains(needed), "stage_head_rows: {needed}");
+        }
     }
 }
