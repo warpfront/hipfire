@@ -295,26 +295,26 @@ fn lower_items(items: &[Value], out: &mut Vec<Value>) -> Result<(), String> {
     Ok(())
 }
 
-/// Message `content`: a string, or parts. Text parts concatenate exactly like
-/// chat-completions content parts; an `input_image` becomes an `image_url`
-/// part, which keeps the content an array as on chat.
+/// Message `content`: a string, or parts. Adjacent text parts concatenate
+/// exactly like chat-completions content parts; an `input_image` becomes an
+/// `image_url` part where the caller put it, which keeps the content an array
+/// as on chat and renders the image slot at the caller's position.
 fn message_content(content: Option<&Value>, path: &str) -> Result<Value, String> {
     let parts = match content {
         Some(Value::String(text)) => return Ok(Value::String(text.clone())),
         Some(Value::Array(parts)) => parts,
         _ => return Err(format!("{path}.content: field required (string or array)")),
     };
-    let mut text = String::new();
-    let mut images = Vec::new();
+    let mut lowered = super::anthropic::OrderedParts::default();
     for (k, part) in parts.iter().enumerate() {
         let part_path = format!("{path}.content.{k}");
         match part.get("type").and_then(Value::as_str) {
-            Some("input_text" | "output_text" | "text") => text.push_str(
+            Some("input_text" | "output_text" | "text") => lowered.text(
                 part.get("text")
                     .and_then(Value::as_str)
                     .ok_or_else(|| format!("{part_path}.text: field required"))?,
             ),
-            Some("refusal") => text.push_str(
+            Some("refusal") => lowered.text(
                 part.get("refusal")
                     .and_then(Value::as_str)
                     .ok_or_else(|| format!("{part_path}.refusal: field required"))?,
@@ -328,7 +328,7 @@ fn message_content(content: Option<&Value>, path: &str) -> Result<Value, String>
                             "{part_path}: input_image needs image_url (file_id is not supported)"
                         )
                     })?;
-                images.push(json!({ "type": "image_url", "image_url": { "url": url } }));
+                lowered.image(json!({ "type": "image_url", "image_url": { "url": url } }));
             }
             Some(other) => {
                 return Err(format!(
@@ -338,15 +338,7 @@ fn message_content(content: Option<&Value>, path: &str) -> Result<Value, String>
             None => return Err(format!("{part_path}.type: field required")),
         }
     }
-    if images.is_empty() {
-        return Ok(Value::String(text));
-    }
-    let mut out = Vec::with_capacity(images.len() + 1);
-    if !text.is_empty() {
-        out.push(json!({ "type": "text", "text": text }));
-    }
-    out.extend(images);
-    Ok(Value::Array(out))
+    Ok(lowered.finish())
 }
 
 /// Function tools (flat `name` / `description` / `parameters`) → chat
@@ -1014,6 +1006,39 @@ mod tests {
                 { "role": "user", "content": "next" },
             ])
         );
+    }
+
+    /// An `input_image` keeps the caller's position among the text parts:
+    /// the vision prompt renders each image slot where its part sits.
+    #[test]
+    fn input_parts_keep_the_callers_order() {
+        let image = json!({ "type": "input_image", "image_url": "data:image/png;base64,AAAA" });
+        let image_part =
+            json!({ "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } });
+        let input = |t: &str| json!({ "type": "input_text", "text": t });
+        let text = |t: &str| json!({ "type": "text", "text": t });
+        let cases = [
+            (
+                json!([image.clone(), input("a")]),
+                json!([image_part.clone(), text("a")]),
+            ),
+            (
+                json!([input("a"), image.clone()]),
+                json!([text("a"), image_part.clone()]),
+            ),
+            (
+                json!([input("a"), input("b"), image.clone(), input("c")]),
+                json!([text("ab"), image_part.clone(), text("c")]),
+            ),
+            (json!([input("a"), input("b")]), json!("ab")),
+        ];
+        for (content, want) in cases {
+            let lowered = lower_request(&json!({ "model": "m", "input": [
+                { "role": "user", "content": content },
+            ] }))
+            .unwrap();
+            assert_eq!(lowered.chat["messages"][0]["content"], want);
+        }
     }
 
     #[test]

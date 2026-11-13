@@ -173,8 +173,9 @@ fn lower_message(message: &Value, at: usize, out: &mut Vec<Value>) -> Result<(),
 }
 
 /// A user turn: `tool_result` blocks become chat `tool` messages (in order,
-/// ahead of the turn's own text); text concatenates like chat content
-/// parts; one base64 image becomes an `image_url` part.
+/// ahead of the turn's own text); adjacent text blocks concatenate like chat
+/// content parts; a base64 image becomes an `image_url` part where the caller
+/// put it, so the image slot renders at the caller's position.
 fn lower_user(content: &Value, at: usize, out: &mut Vec<Value>) -> Result<(), String> {
     let blocks = match content {
         Value::String(text) => {
@@ -188,14 +189,13 @@ fn lower_user(content: &Value, at: usize, out: &mut Vec<Value>) -> Result<(), St
             ))
         }
     };
-    let mut text = String::new();
-    let mut images = Vec::new();
+    let mut parts = OrderedParts::default();
     let mut tool_results = 0usize;
     for (j, block) in blocks.iter().enumerate() {
         let path = format!("messages.{at}.content.{j}");
         match block_type(block, &path)? {
-            "text" => text.push_str(block_text(block, &path)?),
-            "image" => images.push(image_part(block, &path)?),
+            "text" => parts.text(block_text(block, &path)?),
+            "image" => parts.image(image_part(block, &path)?),
             "tool_result" => {
                 out.push(tool_result_message(block, &path)?);
                 tool_results += 1;
@@ -207,19 +207,48 @@ fn lower_user(content: &Value, at: usize, out: &mut Vec<Value>) -> Result<(), St
             }
         }
     }
-    if images.is_empty() {
-        if !text.is_empty() || tool_results == 0 {
-            out.push(json!({ "role": "user", "content": text }));
-        }
-    } else {
-        let mut parts = Vec::with_capacity(images.len() + 1);
-        if !text.is_empty() {
-            parts.push(json!({ "type": "text", "text": text }));
-        }
-        parts.extend(images);
-        out.push(json!({ "role": "user", "content": parts }));
+    match parts.finish() {
+        Value::String(text) if text.is_empty() && tool_results > 0 => {}
+        content => out.push(json!({ "role": "user", "content": content })),
     }
     Ok(())
+}
+
+/// A user turn's content parts in the caller's order, lowered to chat
+/// content: adjacent text concatenates into one `text` part, each image keeps
+/// its position. With no image the content is the plain string, as before.
+#[derive(Default)]
+pub(super) struct OrderedParts {
+    parts: Vec<Value>,
+    pending: String,
+    images: usize,
+}
+
+impl OrderedParts {
+    pub(super) fn text(&mut self, text: &str) {
+        self.pending.push_str(text);
+    }
+
+    pub(super) fn image(&mut self, part: Value) {
+        self.flush_text();
+        self.parts.push(part);
+        self.images += 1;
+    }
+
+    fn flush_text(&mut self) {
+        if !self.pending.is_empty() {
+            let text = std::mem::take(&mut self.pending);
+            self.parts.push(json!({ "type": "text", "text": text }));
+        }
+    }
+
+    pub(super) fn finish(mut self) -> Value {
+        if self.images == 0 {
+            return Value::String(self.pending);
+        }
+        self.flush_text();
+        Value::Array(self.parts)
+    }
 }
 
 fn image_part(block: &Value, path: &str) -> Result<Value, String> {
@@ -960,14 +989,43 @@ mod tests {
         assert_eq!(
             lowered.chat["messages"][0]["content"],
             json!([
-                { "type": "text", "text": "what is this" },
                 { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                { "type": "text", "text": "what is this" },
             ])
         );
         assert_eq!(
             crate::serve::complete::request_images_base64(lowered.chat.get("messages")).unwrap(),
             vec!["AAAA".to_owned()]
         );
+    }
+
+    /// The image keeps the caller's position: the vision prompt renders each
+    /// image slot where its part sits, so a reorder here changes the prompt
+    /// the model sees (and its output) relative to the same turn on chat.
+    #[test]
+    fn user_turn_parts_keep_the_callers_order() {
+        let image = json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" } });
+        let image_part =
+            json!({ "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } });
+        let text = |t: &str| json!({ "type": "text", "text": t });
+        let cases = [
+            (
+                json!([text("a"), image.clone()]),
+                json!([text("a"), image_part.clone()]),
+            ),
+            (
+                json!([text("a"), text("b"), image.clone(), text("c")]),
+                json!([text("ab"), image_part.clone(), text("c")]),
+            ),
+            (json!([image.clone()]), json!([image_part.clone()])),
+            (json!([text("a"), text("b")]), json!("ab")),
+        ];
+        for (content, want) in cases {
+            let lowered = lower_request(&json!({ "model": "m", "max_tokens": 4,
+                "messages": [{ "role": "user", "content": content }] }))
+            .unwrap();
+            assert_eq!(lowered.chat["messages"][0]["content"], want);
+        }
     }
 
     #[test]
