@@ -136,6 +136,9 @@ pub struct VlPrefill {
     pub patches: Vec<f32>,
     pub grid_h: usize,
     pub grid_w: usize,
+    /// Multi-image payload, in request order. Non-empty supersedes the
+    /// single-image `patches`/`grid_*` fields.
+    pub images: Vec<crate::serve::VisualImage>,
     /// Post-merge visual token count.
     pub n_visual_tokens: usize,
     /// Filled by `vision_forward` (`n_visual_tokens * dim` floats).
@@ -196,7 +199,7 @@ impl Scheduler {
         // slot is eligible. The serve engine calls `next_batch_eligible`
         // directly with the FairQueue's grant mask (spec §5.3 S3).
         let all = vec![true; work.len()];
-        self.next_batch_eligible(work, remaining_rows, prefill_min_tokens, &all)
+        self.next_batch_eligible(work, remaining_rows, prefill_min_tokens, &all, false)
     }
 
     /// Same as [`next_batch`](Self::next_batch) but only slots `s` with
@@ -212,9 +215,10 @@ impl Scheduler {
         remaining_rows: usize,
         prefill_min_tokens: usize,
         eligible: &[bool],
+        paged_kv: bool,
     ) -> SlotBatch {
         let n = work.len();
-        let plan = self.allocate_rows(work, remaining_rows, prefill_min_tokens, eligible);
+        let plan = self.allocate_rows(work, remaining_rows, prefill_min_tokens, eligible, paged_kv);
         if let Some(c) = plan.next_prefill_cursor {
             self.prefill_cursor = c;
         }
@@ -291,6 +295,7 @@ impl Scheduler {
         remaining_rows: usize,
         prefill_min_tokens: usize,
         eligible: &[bool],
+        paged_kv: bool,
     ) -> RowAllocation {
         let n = work.len();
         // ---- Phase 1: decode (1 row per runnable decode slot, slot order) ----
@@ -315,11 +320,14 @@ impl Scheduler {
         }
 
         // ---- Phase 2: prefill (round-robin from the rotation cursor) ----
-        // The first prefilling slot in rotation order receives at least
-        // `prefill_min_tokens` rows (when its prompt and the remaining budget
-        // allow); leftover budget is distributed by rotation, capping each
-        // slot at `chunk_size`. The cursor advances each tick so a different
-        // prefilling slot gets the quantum next step.
+        // Every prefilling slot shares this step's leftover row budget.
+        // A quantum is one KV page when the budget can hold one (so a
+        // checkpoint boundary stays page-aligned), otherwise
+        // `prefill_min_tokens`. The cursor only chooses who receives the
+        // first quantum; it still advances each tick. Each slot is capped
+        // at `chunk_size`, so one lone prompt still takes the whole chunk
+        // and several prompts occupy one forward instead of serializing
+        // behind whoever the cursor points at.
         let mut avail = remaining_rows.saturating_sub(used);
         if avail > 0 {
             let prefill_slots: Vec<usize> = (0..n)
@@ -334,14 +342,15 @@ impl Scheduler {
                 // Per-slot round quota: chunk_size capped to the prompt,
                 // quantum-floored, then page-aligned when the take would
                 // complete a mid-page prompt (spec §4.5, see
-                // `page_align_take`). Both the rotated head allocation and
-                // the leftover distribution draw from this quota, so a
-                // trimmed head is not refilled within the same round.
+                // `page_align_take`). The shared distribution never exceeds
+                // this quota, so a trimmed completing round is not refilled.
                 let quota_of = |w: &PendingWork| -> usize {
                     let left = w.remaining_prompt.len();
                     if left == 0 {
                         return 0;
                     }
+                    // The page-boundary trim is unconditional (it predates the
+                    // page quantum): only the quantum below is paged-only.
                     page_align_take(
                         self.chunk_size.min(left).max(prefill_min_tokens.min(left)),
                         w.next_pos,
@@ -349,16 +358,20 @@ impl Scheduler {
                         prefill_min_tokens,
                     )
                 };
-                let head = prefill_slots[start];
-                let head_remaining = work[head].remaining_prompt.len();
-                let head_take = quota_of(&work[head]).min(avail);
-                if head_take > 0 && head_remaining > 0 {
-                    alloc[head] += head_take;
-                    avail -= head_take;
-                    used += head_take;
-                }
-                // Distribute any leftover budget by rotation, capping each
-                // slot at `chunk_size` total.
+                // Only the page pool distributes a prefill step in whole
+                // PAGE_TOKENS quanta (its resumable-checkpoint granularity).
+                // Every other route keeps the distribution it has always had:
+                // the first prefilling slot in rotation order takes its whole
+                // quota, then leftovers go round-robin at full quota. With an
+                // unbounded quantum the `take` below is `min(cap, prompt_left,
+                // avail)`, which is exactly that — see the base
+                // `head_take` + full-quota loop this replaced.
+                let quantum =
+                    if paged_kv && avail >= PAGE_TOKENS && prefill_min_tokens <= PAGE_TOKENS {
+                        PAGE_TOKENS
+                    } else {
+                        usize::MAX
+                    };
                 let mut keep_going = true;
                 while avail > 0 && keep_going {
                     keep_going = false;
@@ -370,7 +383,7 @@ impl Scheduler {
                         let already = alloc[i];
                         let prompt_left = work[i].remaining_prompt.len().saturating_sub(already);
                         let cap = quota_of(&work[i]).saturating_sub(already);
-                        let take = cap.min(prompt_left).min(avail);
+                        let take = quantum.min(cap).min(prompt_left).min(avail);
                         if take == 0 {
                             continue;
                         }
@@ -658,6 +671,7 @@ mod tests {
             patches: vec![],
             grid_h: 1,
             grid_w: 1,
+            images: Vec::new(),
             n_visual_tokens: n_visual,
             embeddings: vec![0.0; n_visual * 4],
             dim: 4,
@@ -1009,11 +1023,9 @@ mod tests {
     #[test]
     fn rotation_serves_two_prefills_across_ticks() {
         // Two prefill slots, budget 4, chunk 256, prefill_min 1.
-        // Tick 1: cursor 0 → slot 0 gets the quantum (at least 1 row), then
-        // leftover budget (3) is distributed round-robin: slot 0 gets more
-        // up to chunk, then slot 1. With chunk=256 and budget=4, slot 0
-        // gets 4 rows total (quantum 1 + 3 extra), slot 1 gets 0.
-        // Tick 2: cursor advances to 1 → slot 1 gets the quantum first.
+        // The budget is below one page, so the quantum is prefill_min and
+        // the two slots share the step. The cursor still rotates who is
+        // served first.
         let mut s = Scheduler {
             chunk_size: 256,
             vl_sequential: false,
@@ -1034,6 +1046,31 @@ mod tests {
         );
         // Both slots made progress across the two ticks.
         assert!(work[0].next_pos > 0 && work[1].next_pos > 0);
+    }
+
+    #[test]
+    fn concurrent_prefills_share_one_step_when_the_chunk_fills_the_budget() {
+        // The serve config clamps max_batch_tokens to prefill_chunk, so a
+        // head-takes-the-chunk allocator would run one slot per step. Page
+        // quanta split that budget across every prefilling slot instead.
+        let mut s = Scheduler {
+            chunk_size: 1024,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
+        let mut work = vec![
+            work_prefill(0, 5000, 0),
+            work_prefill(1, 5000, 0),
+            work_prefill(2, 5000, 0),
+            work_prefill(3, 5000, 0),
+        ];
+        let b = s.next_batch(&mut work, 1024, 1);
+        assert_eq!(b.total_rows(), 1024);
+        assert_eq!(b.m_per_slot, vec![256, 256, 256, 256]);
+        assert!(b
+            .m_per_slot
+            .iter()
+            .all(|&m| m % rdna_compute::page_pool::PAGE_TOKENS == 0));
     }
 
     #[test]
@@ -1137,7 +1174,7 @@ mod tests {
         ];
         // Only slot 0 is eligible (FairQueue granted it); slot 1 is not.
         let eligible = [true, false];
-        let b = s.next_batch_eligible(&mut work, 4096, 1, &eligible);
+        let b = s.next_batch_eligible(&mut work, 4096, 1, &eligible, false);
         assert_eq!(
             b.m_per_slot,
             vec![100, 0],

@@ -97,6 +97,7 @@ fn main() {
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
         min_p: 0.0,
+        logprobs_top_k: None,
         visual_data: None,
         json_schema: Some(schema),
         started_in_think: think,
@@ -120,7 +121,7 @@ fn main() {
             }) => {
                 println!("Accepted reused={reused} prefill={prefill}");
             }
-            Ok(Event::Token { id }) => text.push_str(&tok.decode(&[id])),
+            Ok(Event::Token { id, .. }) => text.push_str(&tok.decode(&[id])),
             Ok(Event::Done { reason, generated }) => {
                 println!("Done reason={reason:?} generated={generated}");
                 println!("OUTPUT: {:?}", text);

@@ -3252,6 +3252,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         None, // routed_out: non-EP single-GPU path
         fusion,
         None, // commit_stride: captured path keeps legacy cadence
+        None, // extract_hidden: captured path does not seed a draft context
     )
 }
 
@@ -3392,6 +3393,7 @@ fn forward_prefill_batch_intent(
         None,
         wrapper.max_batch_override,
         DflashFusionCtx::Off,
+        None,
         intent,
     );
     result
@@ -3455,6 +3457,73 @@ pub fn forward_prefill_batch_capture_hidden(
         None,
         wrapper.max_batch_override,
         DflashFusionCtx::Off,
+        None,
+        PrefillIntent::Inferred,
+    );
+    result
+}
+
+/// Ordinary prompt prefill that also writes the post-layer residual hidden
+/// rows of `extract_layers` into `staging` (one buffer per extract layer,
+/// rows `0..tokens.len()`). DFlash2's draft context is seeded from exactly
+/// those rows; unlike [`forward_prefill_batch_capture_hidden`] they are
+/// pre-norm (the draft consumes the target's layer output, not the final
+/// output-norm state).
+///
+/// Chunk planning, KV and DeltaNet state are those of
+/// [`forward_prefill_batch`]: each internal chunk writes its own rows at the
+/// correct staging offset, so a prompt split by the arch chunk ceiling still
+/// lands contiguously.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_capture_extract_hidden(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    extract: ExtractHiddenCapture<'_>,
+) -> HipResult<()> {
+    extract.ensure_rows(tokens.len())?;
+    // Same wrapper PBS plan as `forward_prefill_batch`.
+    let call = ordinary_call_facts(gpu, None, None, false, false, None, true, false, false);
+    let wrapper = ordinary_wrapper_pbs_prepare(
+        gpu,
+        weights,
+        config,
+        dn_state,
+        kv_cache,
+        scratch,
+        start_pos,
+        tokens.len(),
+        call,
+    )?;
+    let virtual_owner = scratch.reuse_virtual_pbs.borrow();
+    let pbs_for_call = wrapper.pbs(scratch.prefill_batch.as_ref(), virtual_owner.as_ref());
+    let result = forward_prefill_batch_with_pbs_opts_inner(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        None,
+        None,
+        HiddenCapture::Verify,
+        None,
+        None,
+        pbs_for_call,
+        None,
+        None,
+        true,
+        None,
+        wrapper.max_batch_override,
+        DflashFusionCtx::Off,
+        Some(extract),
         PrefillIntent::Inferred,
     );
     result
@@ -3506,6 +3575,7 @@ pub fn forward_prefill_batch_capped(
         Some(max_batch_cap),
         None,
         DflashFusionCtx::Off,
+        None,
         PrefillIntent::Inferred,
     )
 }
@@ -3545,6 +3615,7 @@ pub fn forward_prefill_batch_ordinary_capped(
         Some(max_batch_cap),
         None,
         DflashFusionCtx::Off,
+        None,
         PrefillIntent::Ordinary,
     )
 }
@@ -3649,6 +3720,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
         None,
         None,
         fusion,
+        None,
         PrefillIntent::Inferred,
     )
 }
@@ -3677,6 +3749,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // wrapper (`plan_wrapper_pbs`); replaces the arch/env default ceiling.
     max_batch_override: Option<usize>,
     fusion: DflashFusionCtx,
+    extract_hidden: Option<ExtractHiddenCapture<'_>>,
     intent: PrefillIntent,
 ) -> HipResult<()> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
@@ -3689,6 +3762,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         && gdn_tape.is_none()
         && per_token_hidden_out.is_none()
         && hidden_rb.is_none()
+        && extract_hidden.is_none()
         && tokens.len() == 1
         && intent != PrefillIntent::Ordinary;
     // Upper bound on the PrefillBatchScratch — large prompts get split
@@ -3886,6 +3960,14 @@ fn forward_prefill_batch_with_pbs_opts_inner(
              model fell through to the per-token fallback (likely non-MQ4 \
              weights, dn_state quant != Q8, or HIPFIRE_PREFILL_BATCHED=0).",
         );
+        if extract_hidden.is_some() {
+            return Err(HipError::new(
+                0,
+                "extract-hidden prefill requires the batched-FA-eligible path \
+                 (non-MQ4 weights, dn_state quant != Q8, or \
+                 HIPFIRE_PREFILL_BATCHED=0 fall back to per-token)",
+            ));
+        }
         // Fallback: per-token loop, byte-identical to decode. If hidden
         // extraction is requested, use the with_hidden variant so the ring
         // buffer still gets populated correctly (each call advances head by 1).
@@ -4357,6 +4439,10 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 None, // routed_out: non-EP single-GPU path
                 fusion,
                 commit_stride,
+                extract_hidden.map(|mut e| {
+                    e.row_base += chunk_start;
+                    e
+                }),
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Place the chunk's hidden rows at the ring's current head,
@@ -5707,6 +5793,69 @@ pub(crate) enum PrefillIntent {
 /// Per-token hidden destination: buffer, first destination row, capture kind.
 pub(crate) type HiddenRowsOut<'a> = (&'a GpuTensor, usize, HiddenCapture);
 
+/// Extract-layer hidden rows captured from a batched prefill.
+///
+/// `staging[i]` receives the chunk's `tokens.len() × dim` post-layer residual
+/// rows for `extract_layers[i]`, starting at row `row_base`. DFlash2's draft
+/// context consumes exactly those rows (one extract layer per staging buffer)
+/// and its own `SpecHiddenCapture` uses the same buffers for verify steps.
+#[derive(Clone, Copy)]
+pub struct ExtractHiddenCapture<'a> {
+    pub staging: &'a [GpuTensor],
+    pub extract_layers: &'a [usize],
+    pub dim: usize,
+    /// Destination row of this chunk's first token. Absolute within staging.
+    pub row_base: usize,
+}
+
+impl ExtractHiddenCapture<'_> {
+    /// Error unless every staging buffer can hold `row_base + rows` rows.
+    fn ensure_rows(&self, rows: usize) -> HipResult<()> {
+        if self.extract_layers.len() != self.staging.len() {
+            return Err(HipError::new(
+                0,
+                "extract-hidden capture: staging count does not match extract layers",
+            ));
+        }
+        for (i, t) in self.staging.iter().enumerate() {
+            let capacity = t.numel() / self.dim.max(1);
+            if self.row_base + rows > capacity {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "extract-hidden capture: rows {}..{} exceed staging[{i}] capacity {capacity}",
+                        self.row_base,
+                        self.row_base + rows
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy this layer's `n` residual rows into staging when `layer_idx` is an
+    /// extract layer. No-op otherwise.
+    fn capture_layer(
+        &self,
+        gpu: &mut Gpu,
+        pbs: &PrefillBatchScratch,
+        layer_idx: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let Some(i) = self.extract_layers.iter().position(|&l| l == layer_idx) else {
+            return Ok(());
+        };
+        let row_bytes = self.dim * 4;
+        gpu.memcpy_dtod_at_auto(
+            &self.staging[i].buf,
+            self.row_base * row_bytes,
+            &pbs.x_batch.buf,
+            0,
+            n * row_bytes,
+        )
+    }
+}
+
 #[inline]
 fn captures_verify_hidden(per_token_hidden_out: Option<HiddenRowsOut<'_>>) -> bool {
     per_token_hidden_out.is_some_and(|(_, _, capture)| capture == HiddenCapture::Verify)
@@ -5748,6 +5897,7 @@ pub(crate) fn forward_prefill_chunk(
     routed_out: Option<&GpuTensor>,
     fusion: DflashFusionCtx,
     commit_stride: Option<usize>,
+    extract_hidden: Option<ExtractHiddenCapture<'_>>,
 ) -> HipResult<()> {
     debug_assert!(
         commit_stride.is_none() || commit_stride == Some(WIDENED_COMMIT_ROWS),
@@ -5778,6 +5928,7 @@ pub(crate) fn forward_prefill_chunk(
         BatchSemantics::Sequential,
         fusion,
         commit_stride,
+        extract_hidden,
     )
 }
 
@@ -7744,6 +7895,7 @@ pub(crate) fn forward_batch_chunk_impl(
     batch_semantics: BatchSemantics<'_>,
     fusion: DflashFusionCtx,
     commit_stride: Option<usize>,
+    extract_hidden: Option<ExtractHiddenCapture<'_>>,
 ) -> HipResult<()> {
     let plain = ordinary_prefill_forward(
         gpu,
@@ -7785,6 +7937,7 @@ pub(crate) fn forward_batch_chunk_impl(
             fusion,
             commit_stride,
             route,
+            extract_hidden,
         )
     })
 }
@@ -7816,10 +7969,14 @@ fn forward_batch_chunk_body(
     fusion: DflashFusionCtx,
     commit_stride: Option<usize>,
     gdn_route: GdnPrefillRoute<'_>,
+    extract_hidden: Option<ExtractHiddenCapture<'_>>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
+    if let Some(cap) = extract_hidden {
+        cap.ensure_rows(n)?;
+    }
     debug_assert!(
         commit_stride.is_none() || commit_stride == Some(WIDENED_COMMIT_ROWS),
         "commit_stride admits only None and Some(512)"
@@ -8269,6 +8426,9 @@ fn forward_batch_chunk_body(
                 dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
             }
             _ => panic!("layer type mismatch at layer {layer_idx}"),
+        }
+        if let Some(cap) = extract_hidden.as_ref() {
+            cap.capture_layer(gpu, pbs, layer_idx, n)?;
         }
         if let (Some(inactive_mask), Some(backup)) = (inactive_mask, inactive_backup.as_ref()) {
             restore_inactive_residual_rows(gpu, pbs, backup, inactive_mask, n, dim)?;

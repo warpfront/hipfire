@@ -268,6 +268,10 @@ impl GranuleTable {
         self.entry(id).map(|entry| entry.handle)
     }
 
+    fn size(&self, id: VmmPhysicalId) -> Option<usize> {
+        self.entry(id).map(|entry| entry.size)
+    }
+
     fn live_bytes(&self) -> usize {
         self.entries.values().map(|entry| entry.size).sum()
     }
@@ -598,6 +602,12 @@ pub struct VmmArena {
     releasing: bool,
     /// True once any mapping succeeded; a never-mapped VA may adopt a shared prefix.
     ever_mapped: bool,
+    /// Offsets that have been mapped and then unmapped. The driver keeps stale
+    /// translations for a VA remapped onto a new handle (a write through it
+    /// lands in the old, released physical page), so a retired offset is
+    /// refused rather than rebound. This is the same rule `VmmPageMapper`
+    /// enforces per granule (`bound_granules`), applied where the hazard lives.
+    retired_offsets: std::collections::HashSet<usize>,
     kind: VmmArenaKind,
 }
 
@@ -819,6 +829,7 @@ impl VmmArena {
             access_devices: vec![owner_device],
             releasing: false,
             ever_mapped: false,
+            retired_offsets: std::collections::HashSet::new(),
             kind,
         })
     }
@@ -849,8 +860,20 @@ impl VmmArena {
             })
         })
     }
-    pub const fn mapped_bytes(&self) -> usize {
+    pub fn mapped_bytes(&self) -> usize {
         self.mapped_bytes
+    }
+
+    /// Highest mapped byte offset. For a contiguous prefix this equals
+    /// [`Self::mapped_bytes`]; with arbitrary holey mappings it is the safe
+    /// upper bound for an owner descriptor.
+    pub fn mapped_extent(&self) -> usize {
+        self.segments
+            .iter()
+            .filter(|segment| segment.mapped)
+            .map(|segment| segment.offset.saturating_add(segment.size))
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn base_address(&self) -> usize {
@@ -859,6 +882,13 @@ impl VmmArena {
 
     pub fn is_released(&self) -> bool {
         self.base.is_null()
+    }
+
+    /// True when this arena can never be mapped again: it is being released
+    /// (or already was), including the case where a failed `map_at` could not
+    /// clean up its own retained segment and set `releasing` itself.
+    pub fn unmappable(&self) -> bool {
+        self.releasing || self.is_released()
     }
 
     pub fn map_next(
@@ -873,6 +903,9 @@ impl VmmArena {
                 "VMM arena is releasing or already released",
             ));
         }
+        // The frontier is `mapped_bytes`, so an `unmap_at` earlier in this
+        // arena's life could have retired it.
+        self.ensure_fresh_offset(self.mapped_bytes)?;
         match self.kind {
             VmmArenaKind::Default => {}
             VmmArenaKind::ExportBuilding => {
@@ -1068,6 +1101,480 @@ impl VmmArena {
         Ok(())
     }
 
+    /// Refuse an offset that has been mapped and unmapped before.
+    ///
+    /// On gfx1100 (ROCm 7.x/10.x, amdgpu) `hipMemUnmap` + `hipMemRelease`,
+    /// then `hipMemCreate` + `hipMemMap` of a new allocation at the same VA,
+    /// leaves the old translation in place long enough that writes through
+    /// the VA reach the released physical page. Device synchronization,
+    /// re-setting access and dma-buf fences do not order it; only a fresh VA
+    /// (or keeping the VA on its original allocation) is safe. Recorded here
+    /// because `map_at`/`map_granule_at` can place a new handle at any offset,
+    /// including one a rollback just released.
+    fn ensure_fresh_offset(&self, offset: usize) -> HipResult<()> {
+        if self.retired_offsets.contains(&offset) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM offset {offset} was mapped and unmapped; remapping a used VA \
+                     is unsafe (stale translations) — reserve a fresh range"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Map one fresh physical allocation of `size` bytes at an arbitrary
+    /// granularity-aligned `offset` in this reservation.
+    ///
+    /// `map_next`/`map_next_granules` and `map_at` must not be mixed on one
+    /// arena: the former derive their address from the mapped-byte count,
+    /// while `map_at` may leave holes. The VMM page pool uses dedicated
+    /// arenas and only this method plus [`Self::unmap_at`].
+    pub fn map_at(
+        &mut self,
+        hip: &HipRuntime,
+        offset: usize,
+        size: usize,
+        access_devices: &[i32],
+    ) -> HipResult<()> {
+        self.ensure_mappable()?;
+        self.ensure_fresh_offset(offset)?;
+        if !offset.is_multiple_of(self.granularity) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM map offset {offset} must be a multiple of granularity {}",
+                    self.granularity
+                ),
+            ));
+        }
+        if size == 0 || !size.is_multiple_of(self.granularity) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM map size {size} must be a non-zero multiple of granularity {}",
+                    self.granularity
+                ),
+            ));
+        }
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| HipError::new(0, "VMM map offset overflowed"))?;
+        if end > self.reserved_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM map at {offset}..{end} exceeds reserve {}",
+                    self.reserved_bytes
+                ),
+            ));
+        }
+        if self.segments.iter().any(|segment| {
+            segment.offset < end && offset < segment.offset.saturating_add(segment.size)
+        }) {
+            return Err(HipError::new(
+                0,
+                &format!("VMM map at {offset}..{end} overlaps an existing segment"),
+            ));
+        }
+        let (next_access_devices, access) = self.resolve_access(hip, access_devices)?;
+        let added_device = next_access_devices.len() != self.access_devices.len();
+
+        hip.set_device(self.owner_device)?;
+        let prop = allocation_prop(self.kind, self.owner_device);
+        let handle = match take_fault(VmmFaultKind::Create) {
+            Some(fault) => return Err(fault),
+            None => hip.mem_create(size, &prop)?,
+        };
+        let address = offset_ptr(self.base, offset);
+        // SAFETY: `address` is base+offset inside the live reserve;
+        // `offset+size <= reserved_bytes`; `handle` is a fresh owned
+        // allocation covering exactly `size`, not mapped anywhere.
+        let mapped = take_fault(VmmFaultKind::Map)
+            .map_or_else(|| unsafe { hip.mem_map(address, size, handle) }, Err);
+        if let Err(err) = mapped {
+            // SAFETY: map failed, so no range references `handle`.
+            return match unsafe { hip.mem_release(handle) } {
+                Ok(()) => Err(err),
+                Err(cleanup) => {
+                    self.segments.push(VmmSegment {
+                        offset,
+                        size,
+                        handle: Some(handle),
+                        granule: None,
+                        mapped: false,
+                    });
+                    self.releasing = true;
+                    Err(combined_cleanup_error(err, cleanup))
+                }
+            };
+        }
+
+        // Newly-added peer access must cover every mapped segment, not just
+        // this one. With the owner device alone, the new range is sufficient
+        // (and avoids the gfx1100 4 KiB subrange rejection documented in
+        // `map_next`; real allocations are >= 2 MiB).
+        let mut access_error = None;
+        if added_device {
+            for segment in self.segments.iter().filter(|segment| segment.mapped) {
+                // SAFETY: `segment.offset..+segment.size` is mapped; `access`
+                // lists only owner/peer devices validated by `resolve_access`.
+                if let Err(err) = unsafe {
+                    hip.mem_set_access(offset_ptr(self.base, segment.offset), segment.size, &access)
+                } {
+                    access_error = Some(err);
+                    break;
+                }
+            }
+        }
+        if access_error.is_none() {
+            access_error = match take_fault(VmmFaultKind::AccessReset) {
+                Some(fault) => Some(fault),
+                // SAFETY: the new range is mapped; `access` was validated.
+                None => unsafe { hip.mem_set_access(address, size, &access) }.err(),
+            };
+        }
+        if let Some(err) = access_error {
+            let err = HipError {
+                code: err.code,
+                message: format!(
+                    "{}; VMM map_at access offset={offset} size={size} base=0x{:x} granularity={}",
+                    err.message, self.base as usize, self.granularity,
+                ),
+                context: err.context,
+            };
+            // SAFETY: just mapped, never used by a kernel. Unmap before release.
+            let mut segment = VmmSegment {
+                offset,
+                size,
+                handle: Some(handle),
+                granule: None,
+                mapped: true,
+            };
+            let cleanup = match unsafe { hip.mem_unmap(address, size) } {
+                Ok(()) => {
+                    segment.mapped = false;
+                    self.retired_offsets.insert(offset);
+                    // SAFETY: unmapped; no range references the handle.
+                    match unsafe { hip.mem_release(handle) } {
+                        Ok(()) => {
+                            segment.handle = None;
+                            None
+                        }
+                        Err(cleanup) => Some(cleanup),
+                    }
+                }
+                Err(cleanup) => Some(cleanup),
+            };
+            return match cleanup {
+                None => Err(err),
+                Some(cleanup) => {
+                    self.segments.push(segment);
+                    self.releasing = true;
+                    Err(combined_cleanup_error(err, cleanup))
+                }
+            };
+        }
+
+        self.access_devices = next_access_devices;
+        let insert_at = self
+            .segments
+            .iter()
+            .position(|segment| segment.offset > offset)
+            .unwrap_or(self.segments.len());
+        self.segments.insert(
+            insert_at,
+            VmmSegment {
+                offset,
+                size,
+                handle: Some(handle),
+                granule: None,
+                mapped: true,
+            },
+        );
+        self.mapped_bytes = self
+            .mapped_bytes
+            .checked_add(size)
+            .ok_or_else(|| HipError::new(0, "VMM mapped byte count overflowed"))?;
+        self.ever_mapped = true;
+        Ok(())
+    }
+
+    /// Map an existing tracked granule at an arbitrary offset, taking one
+    /// extra mapping lease on it. The granule's original mapping stays live;
+    /// both views alias the same physical memory. Used to prove the alias
+    /// primitive and available to a future COW page-sharing backend.
+    pub fn map_granule_at(
+        &mut self,
+        hip: &HipRuntime,
+        offset: usize,
+        size: usize,
+        id: VmmPhysicalId,
+        access_devices: &[i32],
+    ) -> HipResult<()> {
+        self.ensure_mappable()?;
+        self.ensure_fresh_offset(offset)?;
+        if !offset.is_multiple_of(self.granularity) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM map offset {offset} must be a multiple of granularity {}",
+                    self.granularity
+                ),
+            ));
+        }
+        if size == 0 || !size.is_multiple_of(self.granularity) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM map size {size} must be a non-zero multiple of granularity {}",
+                    self.granularity
+                ),
+            ));
+        }
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| HipError::new(0, "VMM map offset overflowed"))?;
+        if end > self.reserved_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM map at {offset}..{end} exceeds reserve {}",
+                    self.reserved_bytes
+                ),
+            ));
+        }
+        if self.segments.iter().any(|segment| {
+            segment.offset < end && offset < segment.offset.saturating_add(segment.size)
+        }) {
+            return Err(HipError::new(
+                0,
+                &format!("VMM map at {offset}..{end} overlaps an existing segment"),
+            ));
+        }
+        let tracked_size = granule_table()
+            .size(id)
+            .ok_or_else(|| HipError::new(0, "VMM granule is not in the granule table"))?;
+        if size != tracked_size {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM alias size {size} does not match tracked granule size {tracked_size}"
+                ),
+            ));
+        }
+        let (next_access_devices, access) = self.resolve_access(hip, access_devices)?;
+        let added_device = next_access_devices.len() != self.access_devices.len();
+
+        let handle = {
+            let mut table = granule_table();
+            table.add_lease(id)?;
+            table
+                .handle(id)
+                .ok_or_else(|| HipError::new(0, "VMM granule handle vanished"))?
+        };
+        let address = offset_ptr(self.base, offset);
+        // SAFETY: `address` is inside the live reserve; `handle` is a live
+        // tracked granule with a lease held by this call; mapping the same
+        // handle at a second VA is the documented alias use.
+        let mapped = take_fault(VmmFaultKind::Map).map_or_else(
+            || unsafe { hip.mem_map(address, size, handle as HipMemGenericAllocationHandle) },
+            Err,
+        );
+        if let Err(err) = mapped {
+            let _ =
+                granule_table().drop_lease(id, &mut |handle| release_granule_handle(hip, handle));
+            return Err(err);
+        }
+
+        let mut access_error = None;
+        if added_device {
+            for segment in self.segments.iter().filter(|segment| segment.mapped) {
+                // SAFETY: mapped range; access descriptors were validated.
+                if let Err(err) = unsafe {
+                    hip.mem_set_access(offset_ptr(self.base, segment.offset), segment.size, &access)
+                } {
+                    access_error = Some(err);
+                    break;
+                }
+            }
+        }
+        if access_error.is_none() {
+            access_error = match take_fault(VmmFaultKind::AccessReset) {
+                Some(fault) => Some(fault),
+                // SAFETY: the new alias range is mapped; access is validated.
+                None => unsafe { hip.mem_set_access(address, size, &access) }.err(),
+            };
+        }
+        if let Some(err) = access_error {
+            let mut segment = VmmSegment {
+                offset,
+                size,
+                handle: None,
+                granule: Some(id),
+                mapped: true,
+            };
+            let cleanup = match unsafe { hip.mem_unmap(address, size) } {
+                Ok(()) => {
+                    segment.mapped = false;
+                    self.retired_offsets.insert(offset);
+                    let mut table = granule_table();
+                    table
+                        .drop_lease(id, &mut |handle| release_granule_handle(hip, handle))
+                        .err()
+                }
+                Err(cleanup) => Some(cleanup),
+            };
+            return match cleanup {
+                None => Err(err),
+                Some(cleanup) => {
+                    self.segments.push(segment);
+                    self.releasing = true;
+                    Err(combined_cleanup_error(err, cleanup))
+                }
+            };
+        }
+
+        self.access_devices = next_access_devices;
+        let insert_at = self
+            .segments
+            .iter()
+            .position(|segment| segment.offset > offset)
+            .unwrap_or(self.segments.len());
+        self.segments.insert(
+            insert_at,
+            VmmSegment {
+                offset,
+                size,
+                handle: None,
+                granule: Some(id),
+                mapped: true,
+            },
+        );
+        self.mapped_bytes = self
+            .mapped_bytes
+            .checked_add(size)
+            .ok_or_else(|| HipError::new(0, "VMM mapped byte count overflowed"))?;
+        self.ever_mapped = true;
+        Ok(())
+    }
+
+    /// Unmap and release the exclusive segment at exactly `offset..offset+size`.
+    ///
+    /// Synchronizes every access device first: callers must have joined all
+    /// streams that could read this range. A failure leaves the segment
+    /// tracked and poisons the arena (its VA must not be remapped blindly).
+    pub fn unmap_at(&mut self, hip: &HipRuntime, offset: usize, size: usize) -> HipResult<()> {
+        if self.releasing || self.is_released() {
+            return Err(HipError::new(
+                0,
+                "VMM arena is releasing or already released",
+            ));
+        }
+        let index = self
+            .segments
+            .iter()
+            .position(|segment| segment.offset == offset && segment.size == size)
+            .ok_or_else(|| {
+                HipError::new(
+                    0,
+                    &format!(
+                        "VMM unmap_at {offset}..{} has no matching segment",
+                        offset + size
+                    ),
+                )
+            })?;
+        if !self.segments[index].mapped {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM unmap_at {offset}..{} segment is already unmapped",
+                    offset + size
+                ),
+            ));
+        }
+        for &device in &self.access_devices {
+            hip.set_device(device)?;
+            hip.device_synchronize()?;
+        }
+        hip.set_device(self.owner_device)?;
+
+        let mut one = vec![self.segments.remove(index)];
+        let base = self.base;
+        let result = cleanup_segments(
+            &mut one,
+            |segment_offset, segment_size| {
+                if let Some(err) = take_fault(VmmFaultKind::Unmap) {
+                    return Err(err);
+                }
+                // SAFETY: offset/size come from the removed tracked segment.
+                unsafe { hip.mem_unmap(offset_ptr(base, segment_offset), segment_size) }
+            },
+            |handle| {
+                if let Some(err) = take_fault(VmmFaultKind::Release) {
+                    return Err(err);
+                }
+                // SAFETY: called only after the segment's mapping was removed.
+                unsafe { hip.mem_release(handle) }
+            },
+            |id| granule_table().drop_lease(id, &mut |handle| release_granule_handle(hip, handle)),
+        );
+        if one.is_empty() {
+            self.mapped_bytes = self.mapped_bytes.saturating_sub(size);
+            // The unmap succeeded, so a later map at this offset would rebind
+            // a VA whose old translation may still be live.
+            self.retired_offsets.insert(offset);
+        } else {
+            self.segments.insert(index, one.remove(0));
+            self.releasing = true;
+        }
+        result
+    }
+
+    /// Non-owning view of a fully mapped `offset..offset+size` range.
+    ///
+    /// Unlike [`Self::buffer`] this validates coverage across segment holes,
+    /// so a caller cannot accidentally read an unmapped page.
+    pub fn buffer_at(&self, offset: usize, size: usize) -> HipResult<DeviceBuffer> {
+        if self.releasing || self.is_released() {
+            return Err(HipError::new(
+                0,
+                "cannot create a buffer view from a releasing or released VMM arena",
+            ));
+        }
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| HipError::new(0, "VMM buffer_at range overflowed"))?;
+        if end > self.reserved_bytes {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM buffer_at {offset}..{end} exceeds reserve {}",
+                    self.reserved_bytes
+                ),
+            ));
+        }
+        let mut covered = offset;
+        for segment in self.segments.iter().filter(|segment| segment.mapped) {
+            if segment.offset <= covered && covered < segment.offset.saturating_add(segment.size) {
+                covered = segment.offset.saturating_add(segment.size);
+                if covered >= end {
+                    break;
+                }
+            }
+        }
+        if covered < end {
+            return Err(HipError::new(
+                0,
+                &format!("VMM buffer_at {offset}..{end} covers an unmapped hole"),
+            ));
+        }
+        // SAFETY: the whole range is covered by mapped segments; the borrowed
+        // wrapper must not outlive the arena or be freed.
+        Ok(unsafe { DeviceBuffer::from_raw(offset_ptr(self.base, offset), size) })
+    }
+
     /// Bytes of one physical granule: `max(granularity, 2 MiB)` rounded up to
     /// the granularity. Only the last granule at the reserve end may be smaller.
     pub fn granule_bytes(&self) -> usize {
@@ -1179,6 +1686,7 @@ impl VmmArena {
         access_devices: &[i32],
     ) -> HipResult<()> {
         self.ensure_mappable()?;
+        self.ensure_fresh_offset(self.mapped_bytes)?;
         if bytes == 0 || !bytes.is_multiple_of(self.granularity) {
             return Err(HipError::new(
                 0,
@@ -1526,8 +2034,9 @@ impl VmmArena {
     ///
     /// # Safety
     ///
-    /// The returned buffer's safe byte length is capped at `mapped_bytes()`;
-    /// `logical_bytes` only validates the tensor's intended reserved extent.
+    /// The returned buffer's safe byte length is capped at `mapped_extent()`
+    /// (the highest mapped end, including any holes below it); `logical_bytes`
+    /// only validates the tensor's intended reserved extent.
     /// The caller must register exactly one returned owner for arena teardown.
     pub unsafe fn owner_buffer(&self, logical_bytes: usize) -> HipResult<DeviceBuffer> {
         if self.releasing || self.is_released() {
@@ -1547,7 +2056,7 @@ impl VmmArena {
         }
         Ok(DeviceBuffer::from_vmm_owner(
             self.base,
-            logical_bytes.min(self.mapped_bytes),
+            logical_bytes.min(self.mapped_extent()),
         ))
     }
 
@@ -1815,8 +2324,31 @@ mod tests {
             access_devices: vec![0],
             releasing: false,
             ever_mapped: true,
+            retired_offsets: std::collections::HashSet::new(),
             kind: VmmArenaKind::Default,
         }
+    }
+
+    #[test]
+    fn buffer_at_requires_full_mapped_coverage() {
+        let mapped = |offset: usize| VmmSegment {
+            offset,
+            size: 4096,
+            handle: None,
+            granule: None,
+            mapped: true,
+        };
+        let arena = host_arena(vec![mapped(0), mapped(8192)]);
+        assert!(arena.buffer_at(0, 4096).is_ok());
+        assert!(arena.buffer_at(8192, 4096).is_ok());
+        // The 4096..8192 hole is never viewable, even when the requested
+        // prefix/suffix individually are mapped.
+        assert!(arena.buffer_at(0, 8192).is_err());
+        assert!(arena.buffer_at(4096, 4096).is_err());
+        assert!(arena.buffer_at(8192, 8192).is_err());
+        assert!(arena.buffer_at(0, 0).is_ok());
+        // The reservation bound applies even without a segment past it.
+        assert!(arena.buffer_at(arena.reserved_bytes(), 1).is_err());
     }
 
     fn forget_prefix(mut prefix: VmmSharedPrefix) {
@@ -2713,10 +3245,55 @@ mod tests {
         assert!(driver.take_ops().is_empty(), "a poisoned arena remapped");
     }
 
-    /// The only mid-life unmap is `release`: it synchronizes, unmaps every
+    /// A rollback (`unmap_at`) releases a never-scheduled segment, but the VA
+    /// must stay retired: a retried `map_at` at the same offset would rebind a
+    /// VA whose old translation the driver may still hold, which is the
+    /// stale-translation hazard, not a cache miss. Before this rule the pool's
+    /// rollback path could rebind a rolled-back granule on the next `sync`.
+    ///
+    /// `map_at`/`unmap_at` drive the real `HipRuntime`, so this exercises the
+    /// rule through the driver-generic `map_next` frontier (which is the same
+    /// `mapped_bytes` offset `unmap_at` would retire) plus the predicate
+    /// itself; the `unmap_at` insert is one line and is covered by the
+    /// gfx1100 `vmm_page_pool` rollback smokes on hardware.
+    #[test]
+    fn gfx1100_vmm_unmapped_offset_is_never_remapped() {
+        const MIB: usize = 1 << 20;
+        let driver = RecordingDriver::new(2 * MIB);
+        let mut arena = reserve_recorded(&driver, 64 * MIB);
+        arena.map_next(&driver, 2 * MIB, &[0]).unwrap();
+        assert!(arena.ensure_fresh_offset(0).is_ok(), "fresh prefix maps");
+        driver.take_ops();
+        // The frontier `unmap_at` retires after a rollback.
+        arena.retired_offsets.insert(2 * MIB);
+        let err = arena
+            .ensure_fresh_offset(2 * MIB)
+            .expect_err("a retired offset must be refused");
+        assert!(
+            err.message.contains("remapping a used VA"),
+            "{}",
+            err.message
+        );
+        assert!(
+            arena.map_next(&driver, 2 * MIB, &[0]).is_err(),
+            "a retired frontier must not be rebound"
+        );
+        assert!(
+            driver.take_ops().is_empty(),
+            "a refused remap must not reach the driver"
+        );
+        assert!(
+            arena.ensure_fresh_offset(4 * MIB).is_ok(),
+            "a fresh offset maps"
+        );
+    }
+
+    /// `release` synchronizes, unmaps every
     /// segment once (newest first) and releases its handles, retires the VA
     /// (never freed, so no later reserve can land on it) and refuses any
     /// further map on the released arena (the old range is never reused).
+    /// `unmap_at` is the other mid-life unmap: it retires its offset in
+    /// `retired_offsets`, so a rollback cannot rebind the VA on a retry.
     #[test]
     fn gfx1100_vmm_release_retires_the_va_and_never_reuses_it() {
         const MIB: usize = 1 << 20;
@@ -2760,10 +3337,12 @@ mod tests {
         assert_eq!(arena.base_address(), 0);
     }
 
-    /// `hipMemUnmap` has exactly three call sites in the VMM module, each a
+    /// `hipMemUnmap` has exactly six call sites in the VMM module, each a
     /// teardown of a segment that is not live: import abort, the fresh segment
-    /// of a failed access call, and `release`'s teardown. A new call site must
-    /// extend this list on purpose.
+    /// of a failed access call (`map_at`) or a failed granule/handle map
+    /// (`map_granule_at`), the pre-use segment of `map_next`, `unmap_at`'s
+    /// tracked teardown, and `release`'s teardown. A new call site must extend
+    /// this list on purpose.
     #[test]
     fn mem_unmap_call_sites_in_the_vmm_module_are_the_audited_teardowns() {
         let source = include_str!("vmm.rs");
@@ -2790,7 +3369,14 @@ mod tests {
         sites.sort();
         assert_eq!(
             sites,
-            ["abort_import", "map_next", "teardown_segments"],
+            [
+                "abort_import",
+                "map_at",
+                "map_granule_at",
+                "map_next",
+                "teardown_segments",
+                "unmap_at"
+            ],
             "unreviewed hipMemUnmap call site in the VMM module"
         );
     }

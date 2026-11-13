@@ -263,6 +263,92 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    earlier testing; on 35B-A3B MoE checkpoints they diverged from serial on
    1–4 of 4 prompts.
 
+   `--multi-slot-paged` (`serve.multi_slot_paged`) selects the **shared
+   paged KV pool**: one `PagePool` of 128-token physical pages serves every
+   slot, each slot has a block table, and pages are allocated as a request
+   grows (not per slot at admission). Pages are refcounted and copy-on-write
+   shared for the prefix cache, and page exhaustion is a per-request overload
+   refusal with demand reclaim, not an engine failure. With
+   `serve.multi_slot_paged_pages=0` the pool auto-sizes from post-weight free
+   VRAM after the prefill scratch is resident, less the 512 MiB map reserve;
+   an explicit count is the operator's physical ceiling. `prefix_cache`
+   requires and selects this route. `--kv-backend vmm` does **not** select it
+   on its own (see below): the load is refused unless `--multi-slot-paged`
+   requests the pool too.
+   `serve.multi_slot_paged_backend` selects the physical backing: `arena`
+   (default, zeroed full-size K/V arenas) or experimental `vmm` (VA-only
+   reservations; 2 MiB granule groups are mapped as pages become resident).
+    The VMM backend currently admits q8 equal-stride pools; prefix cache,
+    multi-slot COW, and page-offset swap/restore are implemented. Batched vision, MTP (with a present head), and a DFlash2 draft are admitted.
+    MoE/A3B prompt chunks run as isolated single-slot `_vmm_paged` steps
+    (the mixed batched prefill hung on 35B-A3B); decode stays batched.
+    Single-token decode can record/replay retained PM4 when the slots `Gpu` is
+    armed (the automatic `.mq4r` / gfx1201-dense predicate as sequential, or
+    an explicit `HIPFIRE_REPLAY_BACKEND`). Live slots need not share a
+    position: every row's position rides the uploaded `positions[]` buffer and
+    the slots body synthesizes no position kernarg binding, so one prepared
+    tape covers any composition of single-token rows inside its context
+    bucket. A prefill row stays eager, including a one-token chunk. The tape
+    rearms when the context bucket changes (8192 tokens, capped by the slot
+    context) or the live-slot pattern changes,
+    because `max_ctx_len`, conv state and per-slot logit rows are recorded.
+    Multi-row MoE decode is admitted up to `FEW_ROW_ROUTE_ROWS` live rows.
+    Still experimental, and not a production default. Mixed-length concurrent
+    prefill does not reliably reproduce the solo completion, and this is **not**
+    a paged-KV defect: the merge-base's default multi-slot slab route reproduces
+    it (40 of 72 concurrent-vs-solo checks on gfx1151, against 17/72 for the VMM
+    arm), so it is pre-existing batch-shape numerics — projection and attention
+    arithmetic depend on the step's row count and co-residents, which arrival
+    timing changes. It was first seen at page-edge lengths because the harness
+    only tested those; `--edges` now includes non-edge lengths. The likely
+    mechanism is row-count-dependent routing rather than a position mix-up
+    [inference]. Treat concurrent == solo as unproven on every multi-slot
+    backend, not as an invariant this route owes.
+    `scripts/check_vmm_paged_regressions.py` is the reproduction, and the log
+    is [`investigations/2026-10-30-vmm-paged-kv-fixlog-and-revalidation.md`](investigations/2026-10-30-vmm-paged-kv-fixlog-and-revalidation.md).
+
+   `--kv-backend vmm` (q8, or fp8 on gfx1201) selects the shared paged pool
+   as this route's KV storage — it is not a per-slot reservation: since
+   `01ecc10fd` the slot engine has one pool for every slot, with per-slot
+   block tables and refcounted pages, and the per-slot VMM owner is gone.
+   Because that is a different, experimental cache, the load is refused
+   unless `--multi-slot-paged` (or `serve.multi_slot_paged`) asks for it as
+   well. The
+   shared prefill scratch is one **total** row budget, not one per slot:
+   `serve.max_batch_tokens` clamps to `max(serve.multi_slot_prefill_chunk,
+   64 verify rows × slots)`. A lone prefilling slot may use the full chunk;
+   concurrent prefills share those rows. This is the difference between a
+   4096-row (2.7 GiB on 27B) and a 1024-row scratch, and it is what leaves
+   KV headroom for concurrent long generations (4-slot 27B q8 VMM: 5766 MiB
+   mapped-byte budget at `multi_slot_prefill_chunk=1024`). Plain
+   prompt rows, decode and verify rows run batched through the
+   descriptor-addressed `_vmm` kernels; only MTP/DFlash prompt chunks stay on
+   the singleton body, because their private hidden capture is not ported to
+   the batched pass. Sampled (temperature>0) MTP/DFlash requests use the
+   same rejection-sampling acceptors as the singleton route; set
+   `speculation.mtp_sampled=0`/`HIPFIRE_MTP_SAMPLED=0` to restore the AR
+   fallback. Vision, MTP and DFlash2 run on this
+   route: image requests (up to 8, encoded per-image) use the sequential
+   per-token VL path against the slot's own cache (`--vision` with
+   `vision_mode=on`); a text turn that
+   continues an image conversation uses that same sequential M-RoPE path for
+   the turn (the `_vmm` kernels have no M-RoPE writer), while ordinary text
+   stays batched. MTP verify rows ride the batched decode step, and DFlash's
+   draft context is seeded from the singleton prefill's extract-layer hidden
+   capture (legacy DFlash drafts, which have no candidate selector, are still
+   refused). `serve.prefix_cache` runs on this route as the same
+   cross-session reuse of sealed 128-token pages plus Qwen hybrid checkpoints
+   as the arena route (this route's pool is the shared paged pool, so
+   `--kv-backend vmm` and `--multi-slot-paged` select the same cache).
+   Every unservable combination is refused before any GPU allocation. On this route decode always runs the
+   row-batched `_vmm` kernels, so a greedy comparison against the sequential
+   route (or against a different batch composition) is expected to differ at
+   some token, as on the arena route: output is deterministic for a fixed batch
+   composition and fully request-isolated, not byte-equal across routes. Design:
+   [`docs/plans/2026-10-22-vmm-kv-multislot-engine.md`](plans/2026-10-22-vmm-kv-multislot-engine.md).
+   A container recipe for this exact stack (4 slots, VMM, MTP + vision on a
+   qwen3.5-4b fixture, port 9001) is `docker/compose.vmm-9001.yaml`.
+
 Parked (swapped or cold) sessions are bounded even when clients abandon them:
 a session idle for `serve.multi_slot_session_ttl_secs` (default one hour; `0`
 disables the idle sweep) is closed by the next request or by the engine's idle
@@ -493,7 +579,8 @@ through to per-model / registry / daemon defaults when omitted):
 | `model` | Tag or path of an installed model; reloads if different from the resident model. A registry model that is not installed is 404 ("run `hipfire pull`") unless `serve.allow_request_pull = true`; a file outside the models directory, the catalog and the pre-warm model is 404 unless `serve.allow_request_paths = true`. |
 | `max_tokens` / `max_completion_tokens` | Omitted: the configured default (Qwen tags 81920, DeepSeek V4 Flash 393216, else `generation.max_tokens`) is fitted to the context left after the prompt, minus 64. Explicit and at or above the loaded context: 400. Never triggers a reload. |
 | `messages` | OpenAI chat messages (required for useful chat) |
-| `messages[].content[].image_url` | Base64 PNG/JPEG data URIs for VL models; remote URLs are rejected. Any number of images, in any message: each is rendered at its message position through the model's chat template, so an image conversation keeps its full history, and a client that resends earlier images every turn is not charged for them again (the resident conversation is continued in place; only images that are new to it are encoded). dots-OCR and LFM2-VL render one image per request. The experimental multi-slot route accepts one image and renders a single-turn prompt. |
+| `messages[].content[].image_url` | Base64 PNG/JPEG data URIs for VL models; remote URLs are rejected. On the standard route any number of images, in any message: each is rendered at its message position through the model's chat template, so an image conversation keeps its full history, and a client that resends earlier images every turn is not charged for them again (the resident conversation is continued in place; only images that are new to it are encoded). dots-OCR and LFM2-VL render one image per request. The experimental multi-slot engine (`serve.multi_slot=true`) accepts up to 8 per request, in request order, one M-RoPE span each, and renders a single-turn prompt |
+| `n` | 1..=8 on `/v1/chat/completions`; the gateway fans choices into separate daemon attempts (sequential, one admission at a time), sets `choice.index`, and returns all choices (non-stream) or sequential choice streams on one SSE body (one final `[DONE]`). `n>1` is a typed 400 on the Anthropic/Responses adapters. `echo`/`suffix` are legacy Completions fields and stay refused here |
 | `stream`, `stream_options.include_usage` | Streaming + optional usage on stream end |
 | `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty` | Sampling; explicit request values win, otherwise per-model TOML / registry-card values are applied. On the Qwen AR samplers (GPU kernel and the CPU sampler used by Flash-Next AR, grammar-constrained Qwen turns and the multi-slot VL first token) `top_k` keeps at most k candidates from a 64-wide gather (absent = 20; `0` or > 64 = 64) and `min_p` drops candidates below `min_p` × the top candidate's probability, both before `top_p`. At `temperature: 0` all three are no-ops. Other routes do not apply every field yet: Gemma4 eager, LFM2, Cohere2, MiniMax, DeepSeek V4 AR, LLaMA AR and single-slot Qwen3.5-VL image turns ignore the request `top_k`; those plus Muse Glimmer, DeepSeek V4 speculative and n-gram speculative decoding ignore `min_p`; Qwen2, Maple and dots.ocr text decode greedily. |
 | `seed` | OpenAI-compatible sampling seed: non-negative integer (≤ u64::MAX). Same seed is reproducible only when prompt, sampling parameters, and execution shape match. Cold vs prefix-resumed and solo vs co-batched shapes may differ until `serve.batch_invariant` is implemented; `null`/omitted = fresh entropy. Negative/fractional/non-integer values are rejected. |
@@ -502,7 +589,7 @@ through to per-model / registry / daemon defaults when omitted):
 | `stop` | A string or an array of up to 4 strings, each ≤ 64 characters; any other value is a 400. Matched on the answer only (never inside reasoning), across token boundaries; streaming holds back a possible partial match, the stop text and everything after it are not returned, and `finish_reason` is `stop` (or `tool_calls` when a call completed before the match). Honoured on the Qwen3.5-family routes (`qwen_ar`, `qwen_dflash`, which covers MTP), Flash-Next (`qwen4_ar`, `qwen4_spec` = native MTP) and Raon-1-mini (`raon_ar`, `raon_spec` = DFlash2); every other route answers 400 instead of ignoring it |
 | `min_tokens` | vLLM-compatible minimum completion length: an integer `>= 0` (default `0`) that must not exceed `max_tokens` (400 otherwise; never clamped; when `max_tokens` is omitted the check is against the configured default). Until that many completion tokens have been emitted, the end-of-sequence token, the decoded end-of-turn markers (`<|im_end|>`, `<|endoftext|>`) and `stop` sequences are ignored: a sampled EOS is an ordinary token (counted toward `min_tokens` and `max_tokens`, fed back, its marker text never shown) and generation continues; `max_tokens` still caps, so `finish_reason` is `length` if the cap arrives first. Applies to every token, thinking included. Honoured on the same routes as `stop` (`qwen_ar`, `qwen_dflash`/MTP, `qwen4_ar`, `qwen4_spec`, `raon_ar`, `raon_spec`), where a speculative window that accepts an EOS inside it simply continues past it; every other route, image requests and experimental multi-slot answer 400 instead of ignoring it. Flash-Next fn-lanes (single card and EP, AR and native-MTP lanes) honour it per lane: the lane is admitted with no EOS rule, so a window runs through an EOS draft, and the lane driver ends the request at the first EOS or stop at or after `min_tokens` (the tokens after it in that window are dropped). On a serve that batches (`continuous_batch_size > 1`) every other route answers 400 `min_tokens is not supported on the <route> route (continuous-batch/VMM lanes/promotion)` instead of silently decoding on a serialized singleton: Qwen3.5 continuous-batch, VMM and EP-batch lanes, dense LFM, and pipeline-parallel Qwen4 lanes; a singleton-only serve (`continuous_batch_size = 1`) honours it on the routes above. A Flash-Next `min_tokens` request on an idle fn-lanes serve starts as a lane (a cohort of one) on every topology, so a request that arrives mid-generation joins it concurrently |
 | `tools` | Tool definitions (with structured `messages` when Jinja chat is on). Flash-Next accepts them with native MTP attached: greedy tool turns run on MTP and match AR byte for byte |
-| `response_format` | **Not enforced on the standard route.** Any value (`json_object`, `json_schema`, `text`, even an unknown type) is accepted unvalidated with HTTP 200 and is not forwarded to the daemon; the model output is unconstrained (a model asked for JSON may still wrap it in a code fence). Only `serve.multi_slot = true` enforces `json_schema` (pre-sampling grammar mask) and refuses `json_object` / unknown types with 400 |
+| `response_format` | **Not enforced on the standard route.** Any value (`json_object`, `json_schema`, `text`, even an unknown type) is accepted unvalidated with HTTP 200 and is not forwarded to the daemon; the model output is unconstrained (a model asked for JSON may still wrap it in a code fence). Only `serve.multi_slot = true` enforces `json_schema` (strict subset, pre-sampling grammar mask) and `json_object` (permissive `{"type":"object"}` mask); unknown types are 400 |
 | `chat_template_kwargs.enable_thinking` | Mode axis. `false` forces a no-think turn (Qwen native empty closed think). Independent of effort and cap. |
 | `chat_template_kwargs.preserve_thinking` | Keep `<think>` in final non-stream content |
 | `thinking` / `thinking.type` | Mode axis (`on`/`off`, or DeepSeek-style `enabled`/`disabled`). Thinking disabled wins and drops effort/cap with a warning. |
@@ -843,14 +930,30 @@ start cost on that first switched request).
 ## Experimental prefix cache (multi-slot)
 
 `serve.prefix_cache` is **off by default**. On the multi-slot engine
-(`serve.multi_slot=true`) it enables cross-session radix reuse of sealed
-128-token KV pages plus Qwen hybrid checkpoints. `.mtp` sidecars are
-probed as both `foo.mq4v2.mtp` and `foo.mtp` on the slot engine and the
-single-slot loader (`hipfire run --spec mtp`). Verified on gfx1101 /
-ROCm 10 (`test_serve_prefix_cache --mtp-k 4`): greedy MTP, sampled AR,
-and JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss.
-Vision+prefix reuse stays off. Non-empty stop sequences, logprobs, and the images+tools combination stay refused on slots; tools alone are supported.
+(`serve.multi_slot=true`) the arena route (`kv_backend=legacy`) enables
+cross-session radix reuse of sealed 128-token KV pages plus Qwen hybrid
+checkpoints. Both routes skip
+vision requests. `.mtp` sidecars are probed as both `foo.mq4v2.mtp` and
+`foo.mtp` on the slot engine and the single-slot loader
+(`hipfire run --spec mtp`). Verified on gfx1101 / ROCm 10
+(`test_serve_prefix_cache --mtp-k 4`): greedy MTP, sampled AR, and
+JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss. Vision+prefix reuse stays off. Stop sequences are
+supported on slots (the emitter withholds the stop bytes and ends the turn as
+`stop`; malformed shapes are 400s); `response_format: json_object` is
+enforced as a permissive object schema. `logprobs`/`top_logprobs` are supported
+(AR fallback; the sampled row is downloaded once per token), including with
+`stream: true`: every token chunk carries `choices[0].logprobs.content`. An
+entry covers one released text chunk, which is a decoder step — not
+necessarily one sampled token, and a per-sampled-token stream is not claimed.
+The images+tools combination stays refused, and tools alone are supported.
 This is not a registry admission.
+
+`memory.kv_backend=vmm` is **not** an opt-in to the shared paged pool on the
+multi-slot engine: the load is refused by name unless
+`serve.multi_slot_paged` also requests the pool (with
+`serve.multi_slot_paged_backend=vmm` for the VMM-backed variant). That keeps a
+`kv_backend=vmm` written for a per-slot route from landing on the experimental
+shared cache.
 
 ### Capability advertisement
 
@@ -870,7 +973,7 @@ extra field; hipfire clients (and deployment tooling) use it for discovery:
     "prefix_cache": true,
     "structured_output": true,
     "structured_output_subset": "json-schema-strict-v1",
-    "refused_request_fields": ["stop", "logprobs", "response_format:json_object"]
+    "refused_request_fields": ["best_of", "logit_bias", "echo", "suffix", "tools+image"]
   }
 }
 ```

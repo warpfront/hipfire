@@ -66,3 +66,7 @@ required-features = ["lab"]
 [[example]]
 name = "shared_vmm_fd_probe"
 required-features = ["lab"]
+
+[[example]]
+name = "vmm_page_arena_smoke"
+required-features = ["lab"]
