@@ -2446,8 +2446,6 @@ fn forward_scratch_layers(
     };
     let mut delta_layer_idx = 0usize;
     let combine_next_rms = moe_combine_next_rms_enabled(gpu, weights, config);
-    let reuse_fused_rotation =
-        hipfire_config::developer_var("HIPFIRE_MOE_COMBINE_NEXT_RMS_RENORM").as_deref() != Ok("1");
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
@@ -2476,7 +2474,7 @@ fn forward_scratch_layers(
             layer,
             layer_idx,
             delta_layer_idx,
-            fused_transition && reuse_fused_rotation,
+            fused_transition,
             None,
             MixerOutput::Residual,
         );
@@ -5474,18 +5472,10 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
 /// that layer's normalized MQ activation. The whole-model admission check is
 /// intentionally strict so every deferred producer has exactly one compatible
 /// consumer and no fallback projection can observe an incomplete residual.
-/// Enabled by default for the admitted mq4r shape; set
-/// `HIPFIRE_MOE_COMBINE_NEXT_RMS=0` to restore the two-dispatch schedule.
+/// Enabled for the admitted mq4r shape; other shapes keep the two-dispatch
+/// schedule.
 fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
-    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let requested = *REQUESTED.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_MOE_COMBINE_NEXT_RMS")
-            .ok()
-            .as_deref()
-            != Some("0")
-    });
-    if !requested
-        || !(gpu.arch_caps.is_gfx1100() || hybrid::gfx1151_radiowave(gpu))
+    if !(gpu.arch_caps.is_gfx1100() || hybrid::gfx1151_radiowave(gpu))
         || config.dim != 2_048
         || config.num_experts_per_tok != 8
         || config.n_layers < 2

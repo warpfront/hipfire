@@ -277,7 +277,6 @@ fn plan_phases(
                 .into(),
         );
     }
-    let moe_env = hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD").ok();
     let head_dtype = target.weights.output.gpu_dtype;
     if !dflash_batched_lm_head_supported(head_dtype) {
         return Err(format!(
@@ -285,12 +284,7 @@ fn plan_phases(
              (per-row GEMV + D2H is not plannable)"
         ));
     }
-    if dflash_moe_verify_graph_lmhead_eligible(
-        target.config.num_experts,
-        false,
-        false,
-        moe_env.as_deref(),
-    ) {
+    if dflash_moe_verify_graph_lmhead_eligible(target.config.num_experts, false, false) {
         return Err(
             "plan_dflash_verify: the MoE extended verify graph (lm_head+argmax captured) is \
              not planned; dense chain verify only"

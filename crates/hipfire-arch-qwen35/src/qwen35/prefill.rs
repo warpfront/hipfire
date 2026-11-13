@@ -11282,11 +11282,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{name}: {tensor}: {e:?}"))
         };
         // `load_moe_ffn` arms the AWQ pointer table only when every expert has a
-        // down sidecar and `HIPFIRE_MOE_AWQ` is not "0".
-        let moe_awq_enabled = hipfire_config::developer_var("HIPFIRE_MOE_AWQ")
-            .ok()
-            .as_deref()
-            != Some("0");
+        // down sidecar.
         let mut layers = Vec::with_capacity(config.n_layers);
         let mut batch_pbs_eligible = true;
         let mut moe_has_mq6 = false;
@@ -11326,11 +11322,10 @@ mod tests {
                 .iter()
                 .map(|e| e.resources().down().dtype())
                 .collect();
-            let awq_all = moe_awq_enabled
-                && table
-                    .experts()
-                    .iter()
-                    .all(|e| !e.resources().down().sidecars().is_empty());
+            let awq_all = table
+                .experts()
+                .iter()
+                .all(|e| !e.resources().down().sidecars().is_empty());
             let gu_uniform = gate_up.iter().all(|d| *d == gate_up[0]);
             let down_uniform = down.iter().all(|d| *d == down[0]);
             let dtypes = hipfire_dispatch::families::moe::MoePrefillDtypes {

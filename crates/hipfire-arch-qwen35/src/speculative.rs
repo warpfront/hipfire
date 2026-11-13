@@ -134,27 +134,11 @@ fn dflash_gemm_q8_lmhead(
     y: &GpuTensor,
     n: usize,
 ) -> HipResult<()> {
-    if gpu.flags.dflash_q8_lmhead_wmma {
-        // #397 Ship 5.3: GemmQ8_0BatchedChunked routes to the identical
-        // gpu.gemm_q8_0_batched_chunked the prior direct call used.
-        return run_spec_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
-            &w_out.buf,
-            w_out.gpu_dtype,
-            x,
-            y,
-            w_out.m,
-            w_out.k,
-            n,
-        );
-    }
-
-    // The dispatch key is the scalar Q8 kernel chunked at its 64-row cap
-    // (`rdna_compute::gemm::q8_0_batched_chunks`); pass all `n` rows.
+    // #397 Ship 5.3: GemmQ8_0BatchedChunked routes to gpu.gemm_q8_0_batched_chunked,
+    // which takes WMMA where the arch has it and falls back to the scalar chunks.
     run_spec_gemm_key(
         gpu,
-        hipfire_dispatch::types::KernelKey::GemmQ8_0Batched,
+        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
         &w_out.buf,
         w_out.gpu_dtype,
         x,
@@ -223,28 +207,14 @@ fn gemm_mq_batched_lmhead_draft(
     gemm_mq_batched_lmhead(gpu, dtype, w_buf, rotated, logits, m, k, batch)
 }
 
-fn dflash_moe_verify_graph_lmhead_enabled_from_env_value(value: Option<&str>) -> bool {
-    match value {
-        Some(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        None => true,
-    }
-}
-
 pub(crate) fn dflash_moe_verify_graph_lmhead_eligible(
     num_experts: usize,
     want_full_logits: bool,
     tree_verify_present: bool,
-    env_value: Option<&str>,
 ) -> bool {
     // MoE-only: dense DFlash keeps the old forward-only verify graph. The
     // extended graph is also greedy-only because sampling needs full logits.
-    num_experts > 0
-        && !want_full_logits
-        && !tree_verify_present
-        && dflash_moe_verify_graph_lmhead_enabled_from_env_value(env_value)
+    num_experts > 0 && !want_full_logits && !tree_verify_present
 }
 
 fn dflash_moe_draft_ffn_graph_eligible(
@@ -252,16 +222,11 @@ fn dflash_moe_draft_ffn_graph_eligible(
     ctx_slice_present: bool,
     pld_present: bool,
     use_temp_sampling: bool,
-    env_value: Option<&str>,
 ) -> bool {
     // The draft FFN graph captures fixed-B per-layer work. Keep it off for
     // dense, PLD, ctx-slice diagnostics, and sampling until each path is
     // separately benched/coherence-gated.
-    num_experts > 0
-        && !ctx_slice_present
-        && !pld_present
-        && !use_temp_sampling
-        && dflash_moe_verify_graph_lmhead_enabled_from_env_value(env_value)
+    num_experts > 0 && !ctx_slice_present && !pld_present && !use_temp_sampling
 }
 
 /// Whether `HIPFIRE_VERIFY_GRAPH` admits the HipGraph verify route for this
@@ -6228,14 +6193,11 @@ fn verify_dflash_block_inner_body(
     // widening capture-time F16/LDS auxiliary kernels below the crossover or
     // on unsupported model shapes.
     let fusion = dflash_verify_fusion_ctx(gpu, target, tree_verify_present, b, required_tokens);
-    let moe_lmhead_graph_env =
-        hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD").ok();
     let moe_lmhead_graph_ok =
         dflash_moe_verify_graph_lmhead_eligible(
             target.config.num_experts,
             want_full_logits,
             tree_verify_present,
-            moe_lmhead_graph_env.as_deref(),
         ) && dflash_batched_lm_head_supported(target.weights.output.gpu_dtype);
 
     // Graph-capture path eligibility. The captured forward bakes in:
@@ -6692,10 +6654,8 @@ pub(crate) fn dflash_verify_head(
         argmax_per_pos = dflash_download_verify_argmax(gpu, verify_scratch, b)?;
     } else if try_batched {
         let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
-        // Q8_0 routes through the DFlash lm_head helper so the gfx12 WMMA
-        // arm can be coherence-gated independently of MTP. Set
-        // HIPFIRE_DFLASH_Q8_LMHEAD_WMMA=0 to force the legacy scalar chunks.
-        // MQ4/HFQ4/HFQ6/MQ6 kernels have no 64-row cap and take the
+        // Q8_0 routes through the DFlash lm_head helper (WMMA where the arch
+        // has it). MQ4/HFQ4/HFQ6/MQ6 kernels have no 64-row cap and take the
         // single-shot path.
         let math = verify_dense_math(gpu);
         dflash_enqueue_verify_lm_head(gpu, w_out, final_hidden, verify_scratch, b, vocab, math)?;
@@ -9231,14 +9191,11 @@ pub fn spec_step_dflash_with_railgun(
     // borderline `u*p_d <= p_t` accept) — validated coherent across genres
     // (no attractors), so default-on. Greedy path (temp==0) is never affected.
     let fast_sample_active = use_temp_sampling && gpu.flags.dflash_fast_sample;
-    let draft_ffn_graph_env =
-        hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
         target.config.num_experts,
         ctx_slice.is_some(),
         pld_spine.is_some(),
         use_temp_sampling,
-        draft_ffn_graph_env.as_deref(),
     );
 
     // C8: device tensors kept alive from draft-sample through verify-accept.
@@ -14899,49 +14856,26 @@ mod tests {
 
     #[test]
     fn dflash_extended_verify_graph_is_moe_greedy_only() {
-        assert!(dflash_moe_verify_graph_lmhead_eligible(
-            256, false, false, None
-        ));
-        assert!(!dflash_moe_verify_graph_lmhead_eligible(
-            0, false, false, None
-        ));
-        assert!(!dflash_moe_verify_graph_lmhead_eligible(
-            256, true, false, None
-        ));
-        assert!(!dflash_moe_verify_graph_lmhead_eligible(
-            256, false, true, None
-        ));
-        assert!(!dflash_moe_verify_graph_lmhead_eligible(
-            256,
-            false,
-            false,
-            Some("0")
-        ));
+        assert!(dflash_moe_verify_graph_lmhead_eligible(256, false, false));
+        assert!(!dflash_moe_verify_graph_lmhead_eligible(0, false, false));
+        assert!(!dflash_moe_verify_graph_lmhead_eligible(256, true, false));
+        assert!(!dflash_moe_verify_graph_lmhead_eligible(256, false, true));
     }
 
     #[test]
     fn dflash_draft_ffn_graph_is_moe_plain_dflash_only() {
         assert!(dflash_moe_draft_ffn_graph_eligible(
-            256, false, false, false, None
+            256, false, false, false
+        ));
+        assert!(!dflash_moe_draft_ffn_graph_eligible(0, false, false, false));
+        assert!(!dflash_moe_draft_ffn_graph_eligible(
+            256, true, false, false
         ));
         assert!(!dflash_moe_draft_ffn_graph_eligible(
-            0, false, false, false, None
+            256, false, true, false
         ));
         assert!(!dflash_moe_draft_ffn_graph_eligible(
-            256, true, false, false, None
-        ));
-        assert!(!dflash_moe_draft_ffn_graph_eligible(
-            256, false, true, false, None
-        ));
-        assert!(!dflash_moe_draft_ffn_graph_eligible(
-            256, false, false, true, None
-        ));
-        assert!(!dflash_moe_draft_ffn_graph_eligible(
-            256,
-            false,
-            false,
-            false,
-            Some("0")
+            256, false, false, true
         ));
     }
 

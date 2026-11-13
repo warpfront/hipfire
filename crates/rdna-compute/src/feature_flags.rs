@@ -967,9 +967,6 @@ pub struct FeatureFlags {
     /// candidate's cumulative logw < −X); `None`/0/unparseable → no cutoff.
     /// Use [`FeatureFlags::ddtree_logw_cutoff_value`] for the resolved threshold.
     pub ddtree_logw_cutoff: Option<f32>,
-    /// qwen35 DFlash Q8 WMMA lm_head in verify. **Default ON**; opt out with
-    /// `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` ∈ {0,false,off,no}.
-    pub dflash_q8_lmhead_wmma: bool,
 
     /// Fold the 3 separate QKV `BiasAdd` launches (qwen2-family `attention_bias`)
     /// into the per-row fused-QKV decode kernel's lane-0 store. Eliminates 3 tiny
@@ -1775,13 +1772,6 @@ impl FeatureFlags {
                 .ok()
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|&x| x > 0.0),
-            dflash_q8_lmhead_wmma: match value("HIPFIRE_DFLASH_Q8_LMHEAD_WMMA") {
-                Ok(v) => {
-                    let v = v.trim().to_ascii_lowercase();
-                    !(v == "0" || v == "false" || v == "off" || v == "no")
-                }
-                Err(_) => true,
-            },
 
             // QKV bias fold — default ON, opt out with HIPFIRE_FUSE_QKV_BIAS=0.
             fuse_qkv_bias: parse_bool("HIPFIRE_FUSE_QKV_BIAS").unwrap_or(true),
@@ -2732,7 +2722,6 @@ impl FeatureFlags {
             ddtree_tree_la: true,
             dflash_fast_sample: true,
             ddtree_logw_cutoff: None,
-            dflash_q8_lmhead_wmma: true,
             fuse_qkv_bias: true,
             fuse_qkv_bias_debug: false,
             dn_snapshot_bulk_off: false,

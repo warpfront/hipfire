@@ -656,7 +656,7 @@ impl Ctx {
     }
 }
 
-/// With GDN error feedback off (`HIPFIRE_DN_STATE_EF=0`), Q8 DeltaNet requant
+/// Without GDN error feedback (Q4 state), DeltaNet requant
 /// rounds stochastically off a process-global frame counter, so a request's
 /// bytes depend on the counter at its start. Every reference run and every
 /// executor request starts at frame 0 (the executor threads its frame per
@@ -6193,7 +6193,7 @@ fn lone_row_control(
 /// refuse wide admission; the `HIPFIRE_PREFILL_CHUNK_ROWS` and
 /// `HIPFIRE_VERIFY_GRAPH` pins).
 fn receipt_env() -> serde_json::Map<String, Value> {
-    const KEYS: [&str; 19] = [
+    const KEYS: [&str; 16] = [
         "HIPFIRE_CB_VERIFY_CHUNK128",
         "HIPFIRE_CB_VERIFY_PM",
         "HIPFIRE_WMMA_BATCH_TILES",
@@ -6206,10 +6206,7 @@ fn receipt_env() -> serde_json::Map<String, Value> {
         "HIPFIRE_CB_SEG_TWINS",
         "HIPFIRE_DFLASH_WINDOW",
         "HIPFIRE_DFLASH_ADAPTIVE_B",
-        "HIPFIRE_DFLASH_CKPT_RESUME",
-        "HIPFIRE_DFLASH_Q8_LMHEAD_WMMA",
         "HIPFIRE_SPEC_PHASES",
-        "HIPFIRE_DN_STATE_EF",
         "HIPFIRE_DN_SNAPSHOT_FLIP",
         "HIPFIRE_CB_DFLASH_DRAFT_BATCH",
         "HIPFIRE_DFLASH_ORDERED_DRAFT",

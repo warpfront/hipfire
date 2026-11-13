@@ -3094,12 +3094,9 @@ pub(crate) fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
 pub use hipfire_dispatch::ops::delta_net::StateQuant;
 
 /// Whether a `quant` DeltaNet state carries the per-element f16 error-feedback
-/// residual (Q8 only; `HIPFIRE_DN_STATE_EF=0` opts out).
+/// residual (Q8 only).
 pub(crate) fn delta_net_state_ef_enabled(quant: StateQuant) -> bool {
     quant == StateQuant::Q8
-        && hipfire_config::developer_var("HIPFIRE_DN_STATE_EF")
-            .map(|v| v != "0")
-            .unwrap_or(true)
 }
 
 /// Per-layer element counts of one [`DeltaNetState`] allocation, read from
@@ -3782,7 +3779,7 @@ pub struct DeltaNetState {
     /// Conv ring buffer: [n_deltanet_layers × conv_channels × (kernel_size-1)] FP32
     pub conv_states: Vec<GpuTensor>,
     /// Per-element f16 error-feedback residual for Q8 state requant (sigma-delta
-    /// noise-shaping). Empty unless Q8 + `HIPFIRE_DN_STATE_EF`. Same element count
+    /// noise-shaping). Empty unless Q8. Same element count
     /// as `s_matrices`; carries the previous step's quant error so the next
     /// requant cancels it — DeltaNet's contractive decay damps the shaped noise,
     /// yielding ~FP32-grade state at Q8's byte container.
@@ -3996,10 +3993,10 @@ impl DeltaNetState {
         // 2026-06-08. q8_ef ≈ FP32 coherence at −0.7% decode vs FP32's −4.5% (best
         // spec-decode τ too), and far better than stochastic Q8 — DFlash 27b-prose
         // unique_ratio 0.625 vs 0.555, max_freq 0.055 vs 0.078. Also makes the DN
-        // state DETERMINISTIC (no stochastic dither). Opt OUT with
-        // HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future
-        // work). The multi-GPU band split (`new_with_quant_multi` below) uses
-        // the same rule and geometry. Residual is f16 per-element.
+        // state DETERMINISTIC (no stochastic dither). Q8-only (FP32 has no
+        // requant; Q4 EF is future work). The multi-GPU band split
+        // (`new_with_quant_multi` below) uses the same rule and geometry.
+        // Residual is f16 per-element.
         let ef_enabled = delta_net_state_ef_enabled(quant);
         // One pure scalar plan (also read by the ordinary-prefill admission
         // tests) fixes the per-layer element counts the loop allocates.
@@ -4211,17 +4208,14 @@ impl DeltaNetState {
         let conv_state_size = conv_channels * (config.conv_kernel_dim - 1);
 
         // Same EF sigma-delta rule as the single path (`new_batched_with_quant`):
-        // Q8 + `HIPFIRE_DN_STATE_EF` default-ON. Each residual is f16 per state
+        // Q8 only. Each residual is f16 per state
         // element, allocated on the LA-layer's owning device so `ef_residual()`
         // returns `Some` and the DeltaNet kernel takes the deterministic
         // sigma-delta branch instead of stochastic dither. No further plumbing
         // is needed: `forward_scratch_layers_multi` already runs each layer on
         // `gpus.devices[device_for_layer]` and passes
         // `ef_residual(delta_layer_idx)` alongside the same-device S/scales.
-        let ef_enabled = quant == StateQuant::Q8
-            && hipfire_config::developer_var("HIPFIRE_DN_STATE_EF")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+        let ef_enabled = delta_net_state_ef_enabled(quant);
 
         let mut s_matrices = Vec::new();
         let mut s_scales = Vec::new();
@@ -4300,8 +4294,7 @@ impl DeltaNetState {
                     s_matrices,
                     s_scales,
                     conv_states,
-                    // Per-device EF residuals (Q8 + HIPFIRE_DN_STATE_EF default-ON);
-                    // empty only when EF is off (FP32/Q4/HIPFIRE_DN_STATE_EF=0) ⇒
+                    // Per-device EF residuals (Q8 only); empty for FP32/Q4 ⇒
                     // ef_residual() returns None ⇒ kernel uses stochastic requant.
                     s_ef_residual,
                     quant,

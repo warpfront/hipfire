@@ -163,7 +163,7 @@ across them keeps the chunked state ~FP32 across arbitrarily many chunks, at Q8'
   (`:8804` f32 / `:8816` q8 prefill; `:10628`/`:10640` the second path; tree variants at
   `:8752`/`:8772`).
 - The **Q8-EF state representation** — `DeltaNetState` (`qwen35.rs:902-960`): per-head int8 codes,
-  per-row absmax scales (`s_scales`), f16 `s_ef_residual`, `HIPFIRE_DN_STATE_EF` toggle. The
+  per-row absmax scales (`s_scales`), f16 `s_ef_residual` (always on for Q8). The
   chunked path requants into the *same* tensors; only the cadence changes (per-chunk vs per-token).
 - **GEMM primitives** for the chunk body (`Q@Kᵀ`, `K@Kᵀ`, `Mkq@delta`, the `Sᵀ@K` carry, the
   `S_in@q`/`S_in@k` reads): `crates/rdna-compute/src/gemm.rs`,

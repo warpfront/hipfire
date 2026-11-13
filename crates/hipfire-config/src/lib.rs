@@ -3440,15 +3440,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Allow DFlash GPU sampling on sampled verification."
     ),
     process_bool_field!(
-        "speculation.dflash_q8_lmhead_wmma",
-        "dflash_q8_lmhead_wmma",
-        Speculation,
-        true,
-        true,
-        "HIPFIRE_DFLASH_Q8_LMHEAD_WMMA",
-        "Allow Q8 WMMA LM-head dispatch during DFlash verification."
-    ),
-    process_bool_field!(
         "fusions.qkv_bias",
         "fuse_qkv_bias",
         Fusions,
@@ -4084,6 +4075,14 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "nothing ever read it",
         replacement: "none; per-kernel fusion selection is unchanged",
+    },
+    RetiredConfigKey {
+        key: "speculation.dflash_q8_lmhead_wmma",
+        legacy_key: "dflash_q8_lmhead_wmma",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DFlash Q8 LM-head opt-out of WMMA was removed (HIPF-396)",
+        replacement: "none; WMMA runs wherever the arch has it",
     },
 ];
 
@@ -5019,18 +5018,16 @@ pub fn mtp_host_spill_reason() -> &'static str {
 /// MTP divergent-render checkpoint + strict-prefix terminal-repair policy.
 ///
 /// Resolved once at drafter construction from the documented process-snapshot
-/// keys (see `docs/env-vars.md`): `HIPFIRE_DFLASH_CKPT_RESUME` (shared with the
-/// DFlash divergent-render path — there is no MTP-only twin),
+/// keys (see `docs/env-vars.md`):
 /// `HIPFIRE_CACHE_CKPT_INTERVAL` / `HIPFIRE_CACHE_CKPT_MAX`, and
 /// `HIPFIRE_SPEC_WINDOW_ROLLBACK`. Defaults match the MTP PRs that introduced
-/// the consumers: resume on, rollback on, interval 2048 (floor 256), cap 8
+/// the consumers: rollback on, interval 2048 (floor 256), cap 8
 /// (floor 1). Reads go through the versioned [`ProcessConfig`] snapshot so
 /// TOML `[developer]` overrides and the env-beats-config-beats-default
 /// precedence apply; arch crates receive these resolved values and perform
 /// no policy reads of their own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MtpCachePolicy {
-    pub checkpoint_resume: bool,
     pub checkpoint_interval: usize,
     pub checkpoint_cap: usize,
     pub window_rollback: bool,
@@ -5040,7 +5037,6 @@ pub struct MtpCachePolicy {
 /// per-repair or per-step.
 pub fn mtp_cache_policy() -> MtpCachePolicy {
     MtpCachePolicy {
-        checkpoint_resume: developer_bool("HIPFIRE_DFLASH_CKPT_RESUME", true),
         checkpoint_interval: developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
             .ok()
             .and_then(|v| v.parse().ok())

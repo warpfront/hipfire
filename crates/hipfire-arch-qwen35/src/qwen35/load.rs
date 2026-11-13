@@ -6042,16 +6042,12 @@ pub(crate) fn load_moe_ffn(
         );
     }
 
-    let moe_awq_enabled = hipfire_config::developer_var("HIPFIRE_MOE_AWQ")
-        .ok()
-        .as_deref()
-        != Some("0");
     let awq_present = pending
         .experts
         .iter()
         .filter(|expert| expert.down.awq_scale.is_some())
         .count();
-    if moe_awq_enabled && n_exp > 0 && awq_present == n_exp {
+    if n_exp > 0 && awq_present == n_exp {
         let aw_ptrs: Vec<u64> = pending
             .experts
             .iter()

@@ -45,7 +45,7 @@
 //!   random-walks the difference up: measured pos0 2.141e-3 — bit-identical
 //!   across PP/TP/EF-on/EF-off runs, i.e. a deterministic multi-standup
 //!   first-write effect — growing to worst 4.6e-1 over 27 positions EF-on
-//!   (3.0 with `HIPFIRE_DN_STATE_EF=0`). Bound 1.0 is 2x measured worst;
+//!   (3.0 with EF off, a removed opt-out). Bound 1.0 is 2x measured worst;
 //!   tokens exact throughout (3 runs). Precedent: `qwen_dense_tp2_parity.rs`
 //!   claims argmax-exact + relative error < 3e-3, never bit-exact.
 //! * EP2-vs-single (MoE) — ROUTE/STATE AGREEMENT + strict single parity.
@@ -678,7 +678,7 @@ fn qwen35_pp2_vs_single_oracle() {
 /// difference up over positions: measured pos0 2.141e-3 — bit-identical across
 /// PP/TP/EF-on/EF-off runs, i.e. a deterministic multi-standup first-write
 /// effect, NOT f32 order — growing to worst 4.6e-1 over 27 positions EF-on
-/// (3.0 with `HIPFIRE_DN_STATE_EF=0`, so EF sigma-delta damps ~6x). Bound 1.0
+/// (3.0 with EF off, a removed opt-out, so EF sigma-delta damps ~6x). Bound 1.0
 /// is 2x measured worst. Precedent: `qwen_dense_tp2_parity.rs` claims
 /// argmax-exact + relative error < 3e-3, never bit-exact. No new `pub` seam
 /// needed: every symbol below is already exported from

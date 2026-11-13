@@ -105,7 +105,6 @@ pub struct Qwen35MtpDrafter {
     last_window: Option<(usize, u32)>,
     /// Bounded recurrent-state snapshots used to resume a divergent re-render.
     checkpoints: Vec<(usize, DeltaNetSnapshot)>,
-    checkpoint_resume: bool,
     checkpoint_interval: usize,
     checkpoint_cap: usize,
     /// This request's user-turn boundary (`Speculator::set_turn_boundary`), taken by
@@ -153,7 +152,6 @@ impl Qwen35MtpDrafter {
             stats: MtpRequestStats::default(),
             last_window: None,
             checkpoints: Vec::new(),
-            checkpoint_resume: policy.checkpoint_resume,
             checkpoint_interval: policy.checkpoint_interval,
             checkpoint_cap: policy.checkpoint_cap,
             turn_boundary: None,
@@ -467,7 +465,6 @@ impl MtpDrafter for Qwen35MtpDrafter {
                 snapshot.free_gpu(gpu);
             }
         }
-        let checkpoint_resume = self.checkpoint_resume;
         let prompt_route = self.prompt_route;
         let checkpoint_interval = self.checkpoint_interval;
         let checkpoint_cap = self.checkpoint_cap;
@@ -476,7 +473,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         // following tool-result requests (`pinned_boundary`) until the next user
         // turn. One-shot: a realign re-prefill inside the request does not see it.
         let mut turn = TurnCheckpoint {
-            boundary: self.turn_boundary.take().filter(|_| checkpoint_resume),
+            boundary: self.turn_boundary.take(),
             pin: self.pinned_boundary,
         };
         let prefill = prefill_trunk_and_mtp_cache_with_boundary(
@@ -489,9 +486,6 @@ impl MtpDrafter for Qwen35MtpDrafter {
             prompt_route,
             turn.boundary,
             |gpu, dn_state, kv, position, at_turn| {
-                if !checkpoint_resume {
-                    return Ok(());
-                }
                 // The ring covers prompt rows only: `[0..position]` of the
                 // canonical prompt this request resumed or cold-seeded.
                 let prefix = (prompt_tokens.get(..position).unwrap_or(&[]), &[][..]);
@@ -819,25 +813,17 @@ impl MtpDrafter for Qwen35MtpDrafter {
     }
 
     fn mtp_checkpoint_positions(&self) -> Vec<usize> {
-        if self.checkpoint_resume {
-            self.checkpoints
-                .iter()
-                .map(|(position, _)| *position)
-                .collect()
-        } else {
-            Vec::new()
-        }
+        self.checkpoints
+            .iter()
+            .map(|(position, _)| *position)
+            .collect()
     }
 
     fn mtp_checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
-        if self.checkpoint_resume {
-            self.checkpoints
-                .iter()
-                .map(|(position, snapshot)| (*position, snapshot.prefix_hash))
-                .collect()
-        } else {
-            Vec::new()
-        }
+        self.checkpoints
+            .iter()
+            .map(|(position, snapshot)| (*position, snapshot.prefix_hash))
+            .collect()
     }
 
     fn mtp_rewind_to(

@@ -2294,18 +2294,16 @@ struct Qwen35LazyCharges {
 /// does not need (`Gpu::kv_fit_floor`). Two rings can be live together: the AR
 /// prefill ring (`LoadedModel.prefill_checkpoints`, gated by
 /// `HIPFIRE_CACHE_CKPT_RESUME` != 0, cap `ckpt_max()`) and, when a DFlash or
-/// native-MTP speculator is attached, that speculator's own ring (gated by
-/// `HIPFIRE_DFLASH_CKPT_RESUME`, i.e. `mtp_cache_policy().checkpoint_resume`,
-/// cap = the same `HIPFIRE_CACHE_CKPT_MAX` knob). `ckpt_max()`,
+/// native-MTP speculator is attached, that speculator's own ring (cap = the
+/// same `HIPFIRE_CACHE_CKPT_MAX` knob). `ckpt_max()`,
 /// `mtp_cache_policy().checkpoint_cap` and the DFlash builder all read that
 /// one knob with default 8 and floor 1, so a single `cap` serves every ring.
 fn qwen35_checkpoint_ring_bytes(snapshot_bytes: usize, speculator_ring: bool) -> usize {
-    let policy = hipfire_config::mtp_cache_policy();
     let ar_ring = hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_RESUME")
         .ok()
         .as_deref()
         != Some("0");
-    let rings = usize::from(ar_ring) + usize::from(speculator_ring && policy.checkpoint_resume);
+    let rings = usize::from(ar_ring) + usize::from(speculator_ring);
     snapshot_bytes.saturating_mul(rings)
 }
 
