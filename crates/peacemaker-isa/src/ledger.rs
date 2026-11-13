@@ -720,6 +720,25 @@ impl Ledger {
             .collect()
     }
 
+    /// Whether an incoming VM queue is invisible until a proven full drain.
+    /// Replay alone uses this: the actual queue, its waits and issue clipping stay intact.
+    /// Only certain gfx942 ordered loads qualify; stores and FLAT/atomic operations never do.
+    pub(crate) fn vmem_loads_unobserved(&self, observes: impl Fn(RegRef) -> bool) -> bool {
+        self.arch == Some(Arch::Gfx942)
+            && self
+                .pending
+                .iter()
+                .filter(|p| p.counter == Counter::Vm)
+                .all(|p| {
+                    p.in_order
+                        && !p.maybe
+                        && p.order == OrderClass::Gfx9Vmem
+                        && !p.defs.is_empty()
+                        && p.src_locks.is_empty()
+                        && !p.defs.iter().copied().any(&observes)
+                })
+    }
+
     /// The pre-canonicalization key (source locks kept on every architecture): the reference
     /// the `ledger_cfg` tests compare `replay_state_key` against.
     #[cfg(test)]
