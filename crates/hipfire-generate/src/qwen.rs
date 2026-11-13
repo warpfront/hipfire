@@ -2625,12 +2625,6 @@ pub fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_fra
     )
 }
 
-/// Native Qwen4 MTP plans reuse through the session cache, not the shared
-/// conversation/checkpoint planner. Environment disabling applies elsewhere.
-pub fn spec_cache_disabled_for(native_qwen4_mtp: bool, env_disabled: bool) -> bool {
-    env_disabled || native_qwen4_mtp
-}
-
 /// Where a Qwen4 session entry (plan, commit) runs, from whether the bundle's
 /// pipeline-parallel mesh is active and whether the model owns its `Gpus`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

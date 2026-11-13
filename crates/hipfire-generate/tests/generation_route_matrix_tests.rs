@@ -834,21 +834,6 @@ fn qwen_cache_planner_is_ineligible_cold() {
     assert_eq!(plan.new_tokens, vec![10, 11, 12]);
 }
 
-/// Native Qwen4 MTP never uses the shared conversation planner, including on a
-/// transition from an AR turn: its reusable prefixes are the bundle's session
-/// cache (`ArchModel::session_plan` with `SessionRoute::Mtp`), planned
-/// separately.
-#[test]
-fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
-    // Native Qwen4 MTP bypasses the shared planner.
-    assert!(hipfire_generate::qwen::spec_cache_disabled_for(true, false));
-    // Qwen3.5/3.6/3.8 MTP and DFlash keep the prompt cache: the rule is keyed
-    // on the loaded family, not on the speculator name "mtp".
-    assert!(!hipfire_generate::qwen::spec_cache_disabled_for(
-        false, false
-    ));
-}
-
 /// Asserts every `PromptCachePlan` field against the expected start and resume.
 /// `start == 0` means a cold miss.
 fn assert_plan(
