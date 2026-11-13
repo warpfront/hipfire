@@ -2,7 +2,6 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-use crate::config_cache;
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::{
     apply_tail_rope, attn_stub, ds4_superop, ffn_routed, ffn_stub, gemv_auto,
@@ -110,7 +109,7 @@ fn mtp_pre_ffn(
     let mtp = weights.mtp_layer.as_ref().ok_or_else(|| {
         "mtp_forward: weights.mtp_layer is None — \
             re-quantize DeepSeek V4 with --format deepseek4-q8-mtp to include the \
-            mtp.0.* tensors, then HIPFIRE_DEEPSEEK4_LOAD_MTP=1 at load time. \
+            mtp.0.* tensors and load with speculation.mtp enabled. \
             Files without an MTP layer cannot run spec-decode."
             .to_string()
     })?;
@@ -402,9 +401,9 @@ fn mtp_head_compute(
     let head = weights.head.as_ref().ok_or("mtp_head: head not uploaded")?;
     // ── 8. final_norm + lm_head → logits ──────────────────────────────
     // Two paths (mirrors the main-model `final_norm_and_head`):
-    //   - default (legacy): stream 0 → mtp_final_norm → lm_head.
-    //   - HIPFIRE_DEEPSEEK4_MTP_HEAD_HC=1: head-HC mix(streams, mtp.0.hc_head_*)
-    //     → mtp_final_norm → lm_head (reduces [hc_mult, hidden] → [hidden]).
+    //   - head-HC mix(streams, mtp.0.hc_head_*) → mtp_final_norm → lm_head
+    //     (reduces [hc_mult, hidden] → [hidden]);
+    //   - files without the hc_head tensors: stream 0 → mtp_final_norm → lm_head.
     if state.final_norm.is_none() {
         state.final_norm = Some(
             gpu.alloc_tensor(&[hidden], DType::F32)
@@ -417,11 +416,9 @@ fn mtp_head_compute(
                 .map_err(|e| format!("alloc final_norm_rot: {e:?}"))?,
         );
     }
-    // Run head-HC mix or legacy stream-0 path; result lands in
+    // Run head-HC mix or the stream-0 fallback; result lands in
     // `state.final_norm` via rmsnorm.
-    let use_head_hc = config_cache::mtp_head_hc_on()
-        && mtp.mtp_hc_head_fn.is_some()
-        && mtp.mtp_hc_head_base.is_some();
+    let use_head_hc = mtp.mtp_hc_head_fn.is_some() && mtp.mtp_hc_head_base.is_some();
     if use_head_hc {
         if state.head_hc_pre.is_none() {
             state.head_hc_pre = Some(

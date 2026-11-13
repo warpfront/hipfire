@@ -80,7 +80,6 @@ developer_callsite	*	HIPFIRE_CHAT_CURRENT_DATE#developer_var=-
 developer_callsite	*	HIPFIRE_CHUNK_DUMP_DIR#developer_var=ok.filter
 developer_callsite	*	HIPFIRE_CHUNK_DUMP_LAYERS#developer_var=-
 developer_callsite	*	HIPFIRE_CHUNK_DUMP_RAW#developer_var=as_deref.==Ok("1")
-developer_callsite	*	HIPFIRE_COHERE2MOE_Q8_SCALAR#developer_var=as_deref.!=Ok("1")
 developer_callsite	*	HIPFIRE_COHERE_DEBUG#developer_var_os=is_some
 developer_callsite	*	HIPFIRE_COMP_DUMP#developer_var=ok.and_then.filter.map
 developer_callsite	*	HIPFIRE_CONV_QKNORM#developer_var=-
@@ -96,7 +95,6 @@ developer_callsite	*	HIPFIRE_CPU_POOL_SPIN_US#developer_var=ok.and_then.unwrap_o
 developer_callsite	*	HIPFIRE_CPU_SPLIT_TRACE#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_DEBUG_BATCH#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DEBUG_POOL_INVARIANTS#developer_var=as_deref.==Ok("1")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN#developer_var=ok.as_deref.==Some("pos0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_ILP4#developer_bool=false
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_PER_POS#developer_var=as_deref.==Ok("1")
@@ -105,12 +103,7 @@ developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_SCOREGRID_XLANE#developer_bool=false
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT#developer_var=map.unwrap_or(gpu.arch == "gfx1151" && rows >= 64)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_TWIN#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ATTN_WARP#developer_bool=false
-developer_callsite	*	HIPFIRE_DEEPSEEK4_BATCH_HEAD#developer_var=map.unwrap_or(true)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_CACHE_TRACE#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_COMP_F16_WMMA#developer_var=map.unwrap_or(true)
-developer_callsite	*	HIPFIRE_DEEPSEEK4_COMP_ROPE_POS#developer_var=ok
-developer_callsite	*	HIPFIRE_DEEPSEEK4_COMP_ROPE_POS#developer_var=ok.unwrap_or_else
-developer_callsite	*	HIPFIRE_DEEPSEEK4_DSA_WMMA#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD#developer_var=ok.and_then.or.unwrap_or(0.3)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_AQL#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_GRAPH#developer_var=ok.as_deref.==Some("1")
@@ -123,27 +116,11 @@ developer_callsite	*	HIPFIRE_DEEPSEEK4_DUMP_PROMPT#developer_var=ok.as_deref.==S
 developer_callsite	*	HIPFIRE_DEEPSEEK4_DUMP_STATE#developer_var=-
 developer_callsite	*	HIPFIRE_DEEPSEEK4_DUMP_STATE#developer_var=is_ok
 developer_callsite	*	HIPFIRE_DEEPSEEK4_DUMP_TOPK#developer_var=-
-developer_callsite	*	HIPFIRE_DEEPSEEK4_E8_ATTN_PACK_B3#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_E8_BATCHED_GEMV#developer_var=ok.and_then.unwrap_or(8)
-developer_callsite	*	HIPFIRE_DEEPSEEK4_E8_PREFILL_B2#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_E8_PREFILL_B4#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_E8_U4#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_E8_WO_GROUPED#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_DEEPSEEK4_F32_TRACE#developer_var=is_ok
-developer_callsite	*	HIPFIRE_DEEPSEEK4_FFN_OVERLAP#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_FUSED_ROUTE_ACT#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU#developer_var=as_deref
-developer_callsite	*	HIPFIRE_DEEPSEEK4_GFX1100_INDEXER_TOPK_TWOSTAGE#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_GFX1151_INDEXER_TOPK_TWOSTAGE#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_GFX1201_HC_FUSED24#developer_var=as_deref.!=Ok("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_GFX1201_INDEXER_TOPK_TWOSTAGE#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_GFX1201_TOPK_GATHER_TILED#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_GFX942_E8_ROCBLAS#developer_bool=false
-developer_callsite	*	HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_TWOSTAGE#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_GRAPH#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BLOCK1024#developer_bool=false
 developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BOUNDED#developer_bool=false
@@ -152,8 +129,6 @@ developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_TOPK_TWOSTAGE_MIN#developer_var=o
 developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_TOPK_UNROLLED#developer_bool=false
 developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_WMMA#developer_var=map.unwrap_or(true)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_LAYER_NORM#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_LOAD_MTP#developer_var=map.unwrap_or(true)
-developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_8W#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_CND#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC#developer_var=as_deref.!=Ok("0")
@@ -167,7 +142,6 @@ developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_N32#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_NOSYNC#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MQ2_PERM#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MTP_ADDON#developer_var=ok
-developer_callsite	*	HIPFIRE_DEEPSEEK4_MTP_HEAD_HC#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_PARENT_POST_SCALE#developer_var=ok.and_then.unwrap_or(2.0)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_POST_SCALE#developer_var=ok.and_then.unwrap_or(1.5)
@@ -178,7 +152,6 @@ developer_callsite	*	HIPFIRE_DEEPSEEK4_SPEC_K#developer_var=ok.and_then.or.unwra
 developer_callsite	*	HIPFIRE_DEEPSEEK4_STAGE_LAYERS#developer_var=ok.map.filter.unwrap_or_else
 developer_callsite	*	HIPFIRE_DEEPSEEK4_STAGE_NORM#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_TOP_K#developer_var=ok.and_then.unwrap_or(0)
-developer_callsite	*	HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_WO_MULTIROW#developer_var=ok.and_then.filter.unwrap_or(0)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_WO_Q8_WMMA#developer_var=map.unwrap_or(default_wmma)
 developer_callsite	*	HIPFIRE_DENSE_TP_ROUTE#developer_var=ok
@@ -220,7 +193,6 @@ developer_callsite	*	HIPFIRE_DPM_WARMUP_SECS#developer_var=-
 developer_callsite	*	HIPFIRE_DRAFT_NOISE_EMBED_BATCH#developer_var=map_or(true, |v| v.trim() != "0")
 developer_callsite	*	HIPFIRE_DS4_DENSE_ACT_DIR#developer_var_os=-
 developer_callsite	*	HIPFIRE_DS4_EXPERT_OVERLAP#developer_var=as_deref.!=Ok("1")
-developer_callsite	*	HIPFIRE_DS4_GATHER_TILED#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_DS4_REPLAY_INVENTORY#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DS4_REPLAY_SEQUENCE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DS4_ROUTE_DUMP#developer_var=is_ok

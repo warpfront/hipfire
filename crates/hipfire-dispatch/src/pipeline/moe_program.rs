@@ -1304,7 +1304,7 @@ impl<'a> SealedMoeOp<'a> {
                 };
                 let result = match prelude.q8_router_policy {
                     _ if carry => self.router_projection_carrying_shared_iu4(gpu, params),
-                    MoeQ8RouterPolicy::FreshFp16Wmma { enabled, scratch }
+                    MoeQ8RouterPolicy::FreshFp16Wmma { scratch }
                         if prelude.router.dtype == rdna_compute::DType::Q8_0 =>
                     {
                         crate::families::gemm::run_q8_projection_fresh(
@@ -1316,7 +1316,6 @@ impl<'a> SealedMoeOp<'a> {
                             prelude.router.k,
                             params.batch_size,
                             scratch,
-                            enabled,
                         )
                         .map_err(|e| DispatchError::Hip(e.to_string()))
                     }

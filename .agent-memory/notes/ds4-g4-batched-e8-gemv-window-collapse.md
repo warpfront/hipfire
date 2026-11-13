@@ -12,8 +12,8 @@ so the `_b2`/`_b4` tile multipliers NEVER engage at spec-decode widths. Below
 B=16 the tile is mostly padding and launches only M/16 waves. Isolated, the
 grouped WMMA is FLAT at 345-357 us from B=1 to B=16 — the tile signature.
 
-Fixed in TWO places (commits b8efa47a7, 7f954ad98), both default-off behind
-`HIPFIRE_DEEPSEEK4_E8_BATCHED_GEMV=<max B>`:
+Fixed in TWO places (commits b8efa47a7, 7f954ad98); the batched GEMV now
+serves every batch up to 8 on gfx1151 (`e8_batched_gemv_max_batch`):
 
 - `gemv_mfp4g32_e8_soa_batched` — plain dense (`gemv_auto_batched_wmma`)
 - `gemv_mfp4g32_e8_soa_grouped_batched` — O-LoRA A (`wo_per_group_batched_e8_fallback`)

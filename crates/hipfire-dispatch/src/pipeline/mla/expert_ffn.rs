@@ -29,13 +29,13 @@ fn hip_err(what: impl std::fmt::Display, e: hip_bridge::HipError) -> DispatchErr
     DispatchError::Hip(format!("{what}: {e:?}"))
 }
 
-/// FFN input norm: `x_plain = rmsnorm(x_in)` and, when any consumer reads the
-/// rotated activation, `x_rot = FWHT(x_plain)` in the same launch.
+/// FFN input norm: `x_plain = rmsnorm(x_in)` and `x_rot = FWHT(x_plain)`
+/// in the same launch.
 pub fn execute_ffn_norm(gpu: &mut Gpu, op: &ExpertFfnOp<'_>) -> Result<(), DispatchError> {
     op.validate_for_gpu(gpu)?;
     let (layer, hidden) = (op.layer, op.hidden);
     match &op.route {
-        ExpertFfnRoute::Decode { rotate_nox, .. } if op.rotate => gpu
+        ExpertFfnRoute::Decode { rotate_nox, .. } => gpu
             .deepseek4_fused_rmsnorm_rotate_mq_plain(
                 op.x_in,
                 op.norm,
@@ -51,10 +51,7 @@ pub fn execute_ffn_norm(gpu: &mut Gpu, op: &ExpertFfnOp<'_>) -> Result<(), Dispa
                     e,
                 )
             }),
-        ExpertFfnRoute::Decode { .. } => gpu
-            .rmsnorm_f32(op.x_in, op.norm, op.x_plain, op.eps)
-            .map_err(|e| hip_err(format!("rmsnorm_f32 ffn-side plain l{layer}"), e)),
-        ExpertFfnRoute::Batched { .. } if op.rotate => gpu
+        ExpertFfnRoute::Batched { .. } => gpu
             .fused_rmsnorm_rotate_mq_plain_batched(
                 op.x_in, op.norm, op.x_rot, op.x_plain, hidden, op.eps, op.rows,
             )
@@ -64,9 +61,6 @@ pub fn execute_ffn_norm(gpu: &mut Gpu, op: &ExpertFfnOp<'_>) -> Result<(), Dispa
                     e,
                 )
             }),
-        ExpertFfnRoute::Batched { .. } => gpu
-            .rmsnorm_batched(op.x_in, op.norm, op.x_plain, op.rows, hidden, op.eps)
-            .map_err(|e| hip_err(format!("rmsnorm_batched ffn-side l{layer}"), e)),
     }
 }
 
@@ -129,7 +123,6 @@ pub fn execute_shared_expert(gpu: &mut Gpu, op: &ExpertFfnOp<'_>) -> Result<(), 
                 im,
                 hidden,
                 rows,
-                projection,
             )?;
             if !paired {
                 for (w, y) in [(op.shared_w1, op.shared_gate), (op.shared_w3, op.shared_up)] {
@@ -569,8 +562,6 @@ pub struct ExpertFfnOp<'a> {
     pub shared_im: usize,
     pub swiglu_limit: f32,
     pub eps: f32,
-    /// Also write `x_rot`: routed experts or FWHT shared gate/up read it.
-    pub rotate: bool,
     pub rows: usize,
     pub layer: usize,
     pub route: ExpertFfnRoute<'a>,
