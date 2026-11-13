@@ -115,11 +115,10 @@ fn host_topk_moe_decode_never_enters_ar_graph_capture() {
     config.num_experts_per_tok = HOST_TOPK_K;
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).expect("scratch");
     eprintln!(
-        "[1149] arch={} graph_forward={:?} graph_ar={} graph_moe={} replay={}",
+        "[1149] arch={} graph_forward={:?} graph_ar={} replay={}",
         gpu.arch,
         gpu.flags.graph_forward,
         gpu.flags.graph_ar,
-        gpu.flags.graph_moe,
         gpu.replay.is_enabled(),
     );
     let default_graph_ar = gpu.flags.graph_ar;

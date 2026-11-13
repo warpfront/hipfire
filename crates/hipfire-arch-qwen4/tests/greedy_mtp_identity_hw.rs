@@ -110,7 +110,7 @@
 //! runs as
 //! `HIPFIRE_GDN_TEST_STATE_QUANT=fp32 HIPFIRE_MTP_IDENTITY_MODEL=$M <test-bin> --ignored --test-threads=1 greedy_mtp_matches_ar_on_flash_next`.
 //!
-//! Qwen4 reads no `HIPFIRE_GRAPH` / `HIPFIRE_AR_GRAPH` / `HIPFIRE_GRAPH_MOE`
+//! Qwen4 reads no `HIPFIRE_GRAPH` / `HIPFIRE_AR_GRAPH`
 //! (only Qwen3.5 does; `gpu_forward.rs` documents that no Qwen4 production path
 //! opens a hipGraph capture). Its graph-like switch is the retained-replay
 //! backend `HIPFIRE_REPLAY_BACKEND` (`Gpu::init` ->
@@ -218,8 +218,8 @@ const DERIVED_K_ENV: &str = "HIPFIRE_QWEN4_MTP_DERIVED_K";
 const CONTROL_ENV: [&str; 4] = [MODEL_ENV, OUT_ENV, ARM_ENV, CASE_ENV];
 /// The launch-backend variable, the only graph-like switch Qwen4 honors in
 /// process: `ReplayController::from_config` (`rdna-compute/src/replay.rs`,
-/// called from `Gpu::init`) reads it. `HIPFIRE_GRAPH` / `HIPFIRE_AR_GRAPH` /
-/// `HIPFIRE_GRAPH_MOE` are read by Qwen3.5 only; no Qwen4 source reads them.
+/// called from `Gpu::init`) reads it. `HIPFIRE_GRAPH` / `HIPFIRE_AR_GRAPH`
+/// are read by Qwen3.5 only; no Qwen4 source reads them.
 const REPLAY_BACKEND_ENV: &str = "HIPFIRE_REPLAY_BACKEND";
 const GRAPH_POLICY_NOTE: &str = "graph policy is the retained-replay backend: hip = eager launches, auto = AR decode records then replays a retained body; verify forwards (2+ rows) always launch eager; HIPFIRE_GRAPH is not read by Qwen4";
 

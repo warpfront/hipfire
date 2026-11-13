@@ -1192,7 +1192,6 @@ fn main() {
     unsafe {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         std::env::set_var("HIPFIRE_GRAPH", "0");
-        std::env::set_var("HIPFIRE_GRAPH_MOE", "0");
     }
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -1481,7 +1480,7 @@ fn main() {
             "config n_layers={} dim={} hidden={} head_dim={} lpp={}",
             cfg.n_layers, cfg.dim, cfg.hidden_dim, cfg.head_dim, lpp
         );
-        eprintln!("HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_GRAPH_MOE=0");
+        eprintln!("HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0");
         eprintln!("batched: llama::prefill_forward:1508 → weight_gemm:1446 tap dispatch.rs:2848 MFMA; KV ONCE seq_len+16 F32 cleared per seq");
     } else if qwen35 {
         // qwen35 5/6 — WIRED (tap2). Uses forward_prefill_batch (qwen35.rs:11211) → run_plain_gemm_key (12848) / run_residual_gemm_key (12898) → GemmFamily::run_key:146 → tap families/gemm.rs:146
@@ -1613,7 +1612,7 @@ fn main() {
             "model: {model} arch={arch} n_layers={} dim={} hidden={} kv_max={} lpp={}",
             cfg.n_layers, cfg.dim, cfg.hidden_dim, kv_max, lpp
         );
-        eprintln!("HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_GRAPH_MOE=0");
+        eprintln!("HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0");
         eprintln!("batched: Qwen35Scratch [seq_len+16] kv_max={} DeltaNetState Q8 forward_prefill_batch MFMA n=batch_size; capture tap families/gemm.rs:146 (not weight_gemm)", kv_max);
     } else if gemma {
         // Gemma4 — WIRED. forward_prefill_batch runs the declarative layer program; the
@@ -1730,7 +1729,7 @@ fn main() {
             "model: {model} arch={arch} n_layers={} dim={} hidden={} kv_max={} lpp={}",
             cfg.n_layers, cfg.dim, cfg.hidden_dim, kv_max, lpp
         );
-        eprintln!("HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_GEMMA4_GRAPH=0");
+        eprintln!("HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0");
         eprintln!("batched: step-program prefill (64-row chunks); KV ONCE seq_len+16");
     } else if glimmer {
         let cfg = hipfire_arch_muse_glimmer::config::GlimmerConfig::from_hfq(&hfq)
@@ -1834,7 +1833,7 @@ fn main() {
             "model: {model} arch={arch} n_layers={} dim={} hidden={} kv_max={} lpp={}",
             cfg.n_layers, cfg.dim, cfg.hidden_dim, kv_max, lpp
         );
-        eprintln!("HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_GLIMMER_KV_VMM=1");
+        eprintln!("HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0");
         eprintln!(
             "batched: GlimmerState [seq_len+16] prefill_chunk_batched chunk {}",
             hipfire_arch_muse_glimmer::forward::glimmer_prefill_chunk_size(seq_len)
