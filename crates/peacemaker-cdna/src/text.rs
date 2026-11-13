@@ -1840,7 +1840,13 @@ fn vopc(op: VopcOp, p: &Line, suffix: Suffix) -> Result<Inst> {
     let ext = ext_kind(name, &m, suffix)?;
     o.count(3)?;
     let dw = op.src_dwords();
-    let ty = if dw == 2 { Ty::I64 } else { Ty::B32 };
+    let ty = if dw == 2 {
+        Ty::I64
+    } else if op.float_compare().is_some_and(|(w, _)| w == 16) {
+        Ty::F16
+    } else {
+        Ty::B32
+    };
     match ext {
         Ext::None => {
             o.vcc(0)?;

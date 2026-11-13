@@ -687,8 +687,9 @@ fn ds_integer_and_f32_atomics_distinct_addresses() {
     let f_init = |l: usize| ((l as f32 - 20.0) * 0.5).to_bits();
     let f_data = |l: usize| (l as f32 * 0.25 - 3.0).to_bits();
     type Model = fn(u32, u32) -> u32;
-    let cases: [(DsOp, Model, bool); 6] = [
+    let cases: [(DsOp, Model, bool); 7] = [
         (DsOp::AddU32, u32::wrapping_add, false),
+        (DsOp::OrB32, |a, b| a | b, false),
         (DsOp::MaxU32, u32::max, false),
         (DsOp::MaxI32, imax, false),
         (DsOp::AddF32, fadd, true),
@@ -731,6 +732,52 @@ fn ds_integer_and_f32_atomics_distinct_addresses() {
             )
         }
     }
+}
+
+#[test]
+fn ds_or_rtn_b32_returns_old_value() {
+    let mut r = Rig::new();
+    for l in 0..WAVE {
+        r.lds_put(0x200 + l * 4, val(l, 0))
+    }
+    r.set_v(1, |l| (l * 4) as u32);
+    r.set_v(4, |l| val(l, 1));
+    r.fill_v(10, 1, SENT);
+    r.ok(&ds_off(DsOp::OrRtnB32, Some(10), 1, Some(4), 0x200));
+    assert!(r.busy_v(10));
+    for l in 0..WAVE {
+        assert_eq!(
+            r.lds_word(0x200 + l * 4),
+            val(l, 0),
+            "not visible before retire"
+        )
+    }
+    r.drain().unwrap();
+    for l in 0..WAVE {
+        assert_eq!(r.w.v[10][l], val(l, 0), "old value, lane {l}");
+        assert_eq!(r.lds_word(0x200 + l * 4), val(l, 0) | val(l, 1), "lane {l}");
+    }
+    // One address, masked lanes: running OR; inactive lanes untouched.
+    let mask = 0xF0F0_3C3C_00FF_FF00u64;
+    let mut r = Rig::new();
+    r.lds_put(0x80, 0x8000_0001);
+    r.set_v(1, |_| 0x80);
+    r.set_v(4, |l| 1u32 << (l % 32));
+    r.fill_v(10, 1, SENT);
+    r.w.exec = mask;
+    r.ok(&ds_off(DsOp::OrRtnB32, Some(10), 1, Some(4), 0));
+    r.w.exec = u64::MAX;
+    r.drain().unwrap();
+    let mut acc = 0x8000_0001u32;
+    for l in 0..WAVE {
+        if mask >> l & 1 == 1 {
+            assert_eq!(r.w.v[10][l], acc, "lane {l}");
+            acc |= 1u32 << (l % 32);
+        } else {
+            assert_eq!(r.w.v[10][l], SENT, "inactive lane {l}");
+        }
+    }
+    assert_eq!(r.lds_word(0x80), acc);
 }
 
 #[test]
@@ -785,6 +832,194 @@ fn ds_add_rtn_u32_returns_old_value() {
         }
     }
     assert_eq!(r.lds_word(0x80), acc);
+}
+
+const OR_EDGES: [u32; 8] = [
+    0,
+    u32::MAX,
+    1,
+    0x8000_0000,
+    0x5555_5555,
+    0xAAAA_AAAA,
+    0x0F0F_00FF,
+    0xDEAD_BEEF,
+];
+
+#[test]
+fn ds_or_edge_patterns_and_random_bits() {
+    let mut x = 0x1234_5678_9ABC_DEF1u64;
+    let mut rnd = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x >> 16) as u32
+    };
+    let init: Vec<u32> = (0..WAVE)
+        .map(|l| if l < 8 { OR_EDGES[l] } else { rnd() })
+        .collect();
+    let data: Vec<u32> = (0..WAVE)
+        .map(|l| if l < 8 { OR_EDGES[7 - l] } else { rnd() })
+        .collect();
+    for rtn in [false, true] {
+        let mut r = Rig::new();
+        for l in 0..WAVE {
+            r.lds_put(0x200 + l * 4, init[l])
+        }
+        r.set_v(1, |l| (l * 4) as u32);
+        r.set_v(4, |l| data[l]);
+        r.fill_v(10, 1, SENT);
+        let (op, vdst) = if rtn {
+            (DsOp::OrRtnB32, Some(10))
+        } else {
+            (DsOp::OrB32, None)
+        };
+        r.run(&ds_off(op, vdst, 1, Some(4), 0x200));
+        for l in 0..WAVE {
+            assert_eq!(
+                r.lds_word(0x200 + l * 4),
+                init[l] | data[l],
+                "{op:?} lane {l}"
+            );
+            let want = if rtn { init[l] } else { SENT };
+            assert_eq!(r.w.v[10][l], want, "{op:?} vgpr lane {l}");
+        }
+    }
+}
+
+#[test]
+fn ds_or_empty_exec_and_alias_destinations() {
+    // EXEC = 0: no access, no fault, no destination write.
+    for (op, vdst) in [(DsOp::OrB32, None), (DsOp::OrRtnB32, Some(10u8))] {
+        let mut r = Rig::with_lds(64);
+        r.set_v(1, |_| 0xFFFF_FFF0);
+        r.fill_v(10, 1, SENT);
+        r.w.exec = 0;
+        r.try_run(&ds_off(op, vdst, 1, Some(4), 0)).unwrap();
+        assert!(
+            r.lds.iter().enumerate().all(|(i, &b)| b == pat(i)),
+            "{op:?}"
+        );
+        assert_eq!(r.w.v[10][0], SENT, "{op:?}");
+    }
+    // vdst aliases data0: the old value lands there, LDS gets old | original data.
+    let mut r = Rig::new();
+    for l in 0..WAVE {
+        r.lds_put(0x200 + l * 4, val(l, 0))
+    }
+    r.set_v(1, |l| (l * 4) as u32);
+    r.set_v(4, |l| val(l, 1));
+    r.ok(&ds_off(DsOp::OrRtnB32, Some(4), 1, Some(4), 0x200));
+    r.drain().unwrap();
+    for l in 0..WAVE {
+        assert_eq!(r.w.v[4][l], val(l, 0), "alias data0 lane {l}");
+        assert_eq!(r.lds_word(0x200 + l * 4), val(l, 0) | val(l, 1), "lane {l}");
+    }
+    // vdst aliases the address register: address captured at issue.
+    let mut r = Rig::new();
+    for l in 0..WAVE {
+        r.lds_put(0x200 + l * 4, val(l, 0))
+    }
+    r.set_v(1, |l| (l * 4) as u32);
+    r.set_v(4, |l| val(l, 1));
+    r.ok(&ds_off(DsOp::OrRtnB32, Some(1), 1, Some(4), 0x200));
+    r.drain().unwrap();
+    for l in 0..WAVE {
+        assert_eq!(r.w.v[1][l], val(l, 0), "alias addr lane {l}");
+        assert_eq!(r.lds_word(0x200 + l * 4), val(l, 0) | val(l, 1), "lane {l}");
+    }
+}
+
+#[test]
+fn ds_or_pending_counter_and_missing_wait() {
+    // Return form: LGKM unit, busy destination, deferred retirement.
+    let mut r = Rig::new();
+    r.lds_put(0x40, 0x0F);
+    r.set_v(1, |_| 0x40);
+    r.set_v(4, |_| 0xF0);
+    r.fill_v(10, 1, SENT);
+    r.ok(&ds_off(DsOp::OrRtnB32, Some(10), 1, Some(4), 0));
+    assert_eq!(r.w.pending.len(), 1);
+    let p = &r.w.pending[0];
+    assert_eq!(
+        (p.counter, p.weight, p.out_of_order),
+        (Counter::Lgkm, 1, false)
+    );
+    assert!(r.busy_v(10));
+    assert_eq!(r.units(Counter::Lgkm), 1);
+    r.fill_v(4, 1, 0); // data snapshotted at issue
+    r.wait(0, 15).unwrap(); // a VM wait never retires DS
+    assert!(r.busy_v(10), "missing lgkmcnt wait leaves the result busy");
+    assert_eq!(
+        r.lds_word(0x40),
+        0x0F,
+        "RMW not applied without an LGKM wait"
+    );
+    assert_eq!(r.w.v[10][0], SENT);
+    r.wait(63, 0).unwrap();
+    assert!(!r.busy_v(10));
+    assert_eq!(r.w.v[10][0], 0x0F, "old value, not the final OR");
+    assert_eq!(r.lds_word(0x40), 0xFF);
+    // No-return form: no destination, still one LGKM unit until retired.
+    let mut r = Rig::new();
+    r.lds_put(0x40, 1);
+    r.set_v(1, |_| 0x40);
+    r.set_v(4, |_| 2);
+    r.ok(&ds_off(DsOp::OrB32, None, 1, Some(4), 0));
+    assert!(r.w.pending[0].busy.is_empty());
+    assert_eq!(r.units(Counter::Lgkm), 1);
+    assert_eq!(r.lds_word(0x40), 1);
+    r.wait(63, 0).unwrap();
+    assert_eq!(r.lds_word(0x40), 3);
+    // The 16th outstanding LGKM operation forces the oldest out.
+    let mut r = Rig::new();
+    r.set_v(1, |_| 0x40);
+    r.set_v(4, |_| 1);
+    for _ in 0..15 {
+        r.ok(&ds_off(DsOp::OrB32, None, 1, Some(4), 0))
+    }
+    assert_eq!(r.units(Counter::Lgkm), 15);
+    r.ok(&ds_off(DsOp::OrB32, None, 1, Some(4), 0));
+    assert_eq!(r.units(Counter::Lgkm), 15);
+}
+
+#[test]
+fn ds_or_offset_and_bounds_guards() {
+    for op in [DsOp::OrB32, DsOp::OrRtnB32] {
+        let vdst = (op == DsOp::OrRtnB32).then_some(10u8);
+        // Offset adds to the address.
+        let mut r = Rig::with_lds(256);
+        r.lds_put(0x24, 0x10);
+        r.set_v(1, |_| 0x20);
+        r.set_v(4, |_| 0x01);
+        r.run(&ds_off(op, vdst, 1, Some(4), 4));
+        assert_eq!(r.lds_word(0x24), 0x11, "{op:?}");
+        // Faults: at end, straddling end, offset carry out of range.
+        for (addr, off) in [(256u32, 0u16), (253, 0), (200, 0x0100)] {
+            let mut r = Rig::with_lds(256);
+            r.set_v(1, |_| addr);
+            let res = r.try_run(&ds_off(op, vdst, 1, Some(4), off));
+            assert!(is_fault(&res), "{op:?} {addr:#x}+{off:#x}: {res:?}");
+        }
+        // Last in-range word is fine.
+        let mut r = Rig::with_lds(256);
+        r.set_v(1, |_| 252);
+        r.set_v(4, |_| 1);
+        r.try_run(&ds_off(op, vdst, 1, Some(4), 0)).unwrap();
+        // GDS is refused.
+        let mut r = Rig::new();
+        r.set_v(1, |l| (l * 4) as u32);
+        let res = r.try_run(&Inst::Ds(Ds {
+            op,
+            vdst: vdst.map(v),
+            addr: Some(v(1)),
+            data0: Some(v(4)),
+            data1: None,
+            offset0: 0,
+            offset1: 0,
+            gds: true,
+        }));
+        assert!(is_unsupported(&res), "{op:?}: {res:?}");
+    }
 }
 
 #[test]
