@@ -2001,6 +2001,11 @@ impl MeshRoot {
         })
     }
 
+    /// The name of the lane cost profile lanes are admitted under.
+    pub(crate) fn cost_profile_name(&self) -> &'static str {
+        self.profile.name()
+    }
+
     /// Bind the lane cost profile of `arch` (a `Gpu::arch` string) the first
     /// time it is called, before the first lane is admitted: lanes admitted
     /// from then on price their windows under it

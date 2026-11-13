@@ -143,10 +143,12 @@ pub(crate) struct DecodeAdmission<'a> {
 }
 
 impl LaneProto {
-    /// The protocol of a store. `copy`: the n-gram config of the opt-in copy
-    /// lane ([`MeshRoot::with_copy_lane`]); `None` leaves copy off on every
-    /// lane (the default store).
-    pub(crate) fn new(copy: Option<NgramModConfig>) -> Result<Self, String> {
+    /// The protocol of a store on a GPU of `arch` (a `Gpu::arch` string):
+    /// its lanes price windows under that arch's measured lane cost profile
+    /// ([`MeshRoot::bind_cost_arch`], as the EP mesh root does). `copy`: the
+    /// n-gram config of the opt-in copy lane ([`MeshRoot::with_copy_lane`]);
+    /// `None` leaves copy off on every lane (the default store).
+    pub(crate) fn new(copy: Option<NgramModConfig>, arch: &str) -> Result<Self, String> {
         let own = RankOwnership::single();
         let mut root = MeshRoot::new(
             own,
@@ -164,6 +166,7 @@ impl LaneProto {
         )
         .map_err(|e| format!("lane protocol root: {e}"))?;
         root.set_driver_terminates(true);
+        root.bind_cost_arch(arch);
         if let Some(ngram) = copy {
             root = root
                 .with_copy_lane(ngram)
@@ -1399,6 +1402,14 @@ mod tests {
     /// committed IDs, the pooled cost fit and every lane's retirement are the
     /// old route's, over lanes that skip steps, steps that ran a prefill tile
     /// and the three route modes.
+    #[test]
+    fn single_store_lanes_take_the_arch_cost_profile() {
+        let proto = |arch: &str| LaneProto::new(None, arch).unwrap();
+        assert_eq!(proto("gfx1201").root.cost_profile_name(), "gfx1201");
+        assert_eq!(proto("gfx1151").root.cost_profile_name(), "legacy");
+        assert_eq!(proto("gfx1100").root.cost_profile_name(), "legacy");
+    }
+
     #[test]
     fn single_rank_reducer_reproduces_the_old_lane_route() {
         let mut retired_seen = false;

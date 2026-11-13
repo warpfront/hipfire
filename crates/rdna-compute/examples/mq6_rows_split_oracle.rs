@@ -486,6 +486,9 @@ fn cases() -> Vec<Case> {
     };
     let mut v = vec![
         quad("gdn_in_x4", [10240, 6144, 48, 48], 2560, false),
+        // The qkv projection alone: GDN input groups whose a/b/z are not MQ6
+        // (MQ6 qkv + MQ4G256V2 a/b/z) launch it as a single-matrix projection.
+        single("gdn_qkv", 10240, 2560, true),
         single("gdn_out", 2560, 6144, true),
         quad("qsa_in_x4", [640, 12288, 512, 512], 2560, false),
         single("qsa_o", 2560, 6144, false),

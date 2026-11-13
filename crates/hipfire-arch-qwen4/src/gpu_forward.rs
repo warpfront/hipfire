@@ -11162,6 +11162,9 @@ pub struct Qwen4GpuForward {
     /// Pinned, fenced ring for the lane forward's token ids (the active-stream
     /// asynchronous upload; capture keeps the blocking `host_token_bytes` copy).
     pub(crate) lane_tokens: crate::lane_token_ring::LaneTokenRing,
+    /// Mixer phase outputs of lane steps that split a mixer under the compact
+    /// scratch plan (allocated on first use).
+    pub(crate) lane_carry: crate::gpu_forward_lanes::LaneCarry,
     /// Op ids of this band's trunk program (see [`mesh_trunk_op_range`]).
     mesh_trunk_ops: std::ops::Range<u32>,
     /// S1 slow-link layer-major prefill state: the admitted profile and, once
@@ -13556,6 +13559,7 @@ impl Qwen4GpuForward {
             lane_tokens: crate::lane_token_ring::LaneTokenRing::new(
                 max_chunk * std::mem::size_of::<i32>(),
             ),
+            lane_carry: Default::default(),
             mesh_trunk_ops,
             slowlink: Default::default(),
             share,
@@ -14974,6 +14978,7 @@ impl Qwen4GpuForward {
             host_ple,
             mesh_tokens,
             lane_tokens,
+            lane_carry,
             moe,
             moe_borrow,
             expert_stage,
@@ -15013,6 +15018,9 @@ impl Qwen4GpuForward {
             first.get_or_insert(error);
         }
         if let Some(error) = lane_tokens.free_gpu(gpu) {
+            first.get_or_insert(error);
+        }
+        if let Some(error) = lane_carry.free_gpu(gpu) {
             first.get_or_insert(error);
         }
         #[cfg(target_os = "linux")]
