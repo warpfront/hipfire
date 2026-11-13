@@ -1978,20 +1978,14 @@ fn dispatch_attend(
                     }
                 }
                 // Wide Q8/Q8 FA2 is independent of the default flash envelope,
-                // but cannot override explicit flash-off, CK, scalar/batched,
-                // tree/window, or speculative verify. The lower ingress
-                // rechecks exact arch, shape and batch before direct launch.
+                // but cannot override explicit flash-off, CK, tree/window, or
+                // speculative verify. The lower ingress rechecks exact arch,
+                // shape and batch before direct launch.
                 if gpu.flags.gfx11_q8_fa2_wide
                     && gpu.flags.gfx11_fa2_prefill
                     && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
                     && flash_optin
                     && !gpu.flash_attn_ck_loaded()
-                    && !matches!(
-                        hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
-                            .ok()
-                            .as_deref(),
-                        Some("scalar") | Some("batched")
-                    )
                     && ctx.workload == crate::context::DispatchWorkload::Standard
                     && io.tree_bias.is_none()
                     && plan.window <= 0
@@ -2059,32 +2053,19 @@ fn dispatch_attend(
                     && io.tree_bias.is_none()
                     && (io.batch_size > 1 || gpu.ordinary_prefill_active())
                 {
-                    // WMMA is the default variant: it beats the legacy LDS
-                    // kernel at EVERY context (1.21x @2048 .. 2.47x @12288) and
-                    // is ~1.9x the scalar flash kernel, so it needs no MIN_CTX
-                    // gate. The scalar variant keeps its measured break-even.
-                    // It computes in f16 (relative L2 ~1e-3 vs the f32
-                    // reference) — a real precision/speed trade, hence opt-in.
-                    let variant_override =
-                        hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL").ok();
-                    let variant = variant_override.clone().unwrap_or_else(|| {
-                        // Default batched speculative verify is measured on
-                        // exact gfx1100 only. Sibling gfx11 atoms keep WMMA
-                        // until measured; explicit HIPFIRE_FLASH_PREFILL_KERNEL
-                        // still selects batched on any arch.
-                        if gpu.arch.as_str() == "gfx1100"
-                            && ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify
-                        {
-                            "batched".to_owned()
-                        } else {
-                            "wmma".to_owned()
-                        }
-                    });
-                    // Explicit A/B route for speculative verify. Batched
-                    // flash keeps all query rows in one tiled launch and
-                    // avoids the slower query-tiled WMMA path on the measured
-                    // gfx1100 verify workload.
-                    if variant == "batched" {
+                    // WMMA beats the legacy LDS kernel at EVERY context (1.21x
+                    // @2048 .. 2.47x @12288) and is ~1.9x the scalar flash
+                    // kernel, so it needs no MIN_CTX gate. The scalar kernel
+                    // below is the fallback for archs/shapes without WMMA and
+                    // keeps its measured break-even.
+                    //
+                    // Batched speculative verify is measured on exact gfx1100
+                    // only: batched flash keeps all query rows in one tiled
+                    // launch and avoids the slower query-tiled WMMA path there.
+                    // Sibling gfx11 atoms keep WMMA until measured.
+                    if gpu.arch.as_str() == "gfx1100"
+                        && ctx.workload == crate::context::DispatchWorkload::SpeculativeVerify
+                    {
                         let fp = io.flash_partials.unwrap();
                         return hip!(gpu.attention_flash_q8_0_batched_masked(
                             io.q,
@@ -2106,8 +2087,8 @@ fn dispatch_attend(
                     }
                     // Kernel bounds: Q8_0 blocks are 32 dims wide, and O_frags
                     // is a fixed float8_t[MAX_D_CHUNKS=16] => head_dim <= 256.
-                    let wmma_ok = variant != "scalar"
-                        && (gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12())
+                    let wmma_ok = (gpu.arch_caps.has_wmma_w32()
+                        || gpu.arch_caps.has_wmma_w32_gfx12())
                         && (!gpu.arch_caps.has_wmma_w32_gfx12()
                             || gfx12_query16_workload_eligible(ctx))
                         && io.head_dim % 32 == 0
