@@ -173,11 +173,16 @@ fn parse_func_macro(after_name: &str) -> Result<Def, String> {
     })
 }
 
+/// Error text of a kernel-macro invocation whose balanced `)` is not in the text given.
+/// `preprocess` answers it by appending the next source line and expanding again.
+const OPEN_INVOCATION: &str = "the invocation is not closed before the end of the active text";
+
 /// Expands one invocation of a kernel-defining function-like macro starting at the
 /// identifier that ends at `c[after_name]`: returns the expansion and the index after
 /// the invocation's closing parenthesis. Fail closed on everything this reader does
-/// not model: variadics, `#`/`##`, string/char literals or unclosed (multi-line)
-/// invocation arguments, and an argument-count mismatch.
+/// not model: variadics, `#`/`##`, string/char literals in invocation arguments, an
+/// invocation that never closes (a multi-line one is joined by `preprocess` first),
+/// and an argument-count mismatch.
 fn expand_kernel_macro(
     name: &str,
     params: &[String],
@@ -196,7 +201,11 @@ fn expand_kernel_macro(
     while k < c.len() && c[k].is_whitespace() {
         k += 1;
     }
-    if k >= c.len() || c[k] != '(' {
+    if k >= c.len() {
+        // The argument list may start on a later line of the same invocation.
+        return Err(format!("kernel-defining macro {name}: {OPEN_INVOCATION}"));
+    }
+    if c[k] != '(' {
         return Err(format!(
             "kernel-defining function-like macro {name} is used without an argument list"
         ));
@@ -233,9 +242,7 @@ fn expand_kernel_macro(
         }
         q += 1;
     }
-    let end = end.ok_or_else(|| {
-        format!("kernel-defining macro {name}: the invocation is not closed on its line")
-    })?;
+    let end = end.ok_or_else(|| format!("kernel-defining macro {name}: {OPEN_INVOCATION}"))?;
     args.push(cur);
     if params.is_empty() && args.len() == 1 && args[0].trim().is_empty() {
         args.clear();
@@ -562,7 +569,10 @@ pub fn preprocess(text: &str, predef: &BTreeMap<String, String>) -> Result<Strin
     let mut out = String::with_capacity(joined.len());
     let mut stack: Vec<(bool, bool)> = Vec::new();
     let mut active = true;
-    for line in joined.split('\n') {
+    let lines: Vec<&str> = joined.split('\n').collect();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let line = lines[idx];
         let s = line.trim();
         if let Some(after) = s.strip_prefix('#') {
             let after = after.trim_start();
@@ -624,10 +634,42 @@ pub fn preprocess(text: &str, predef: &BTreeMap<String, String>) -> Result<Strin
             out.push('\n');
         } else {
             if active {
-                out.push_str(&expand_obj(line, &defs, 0)?);
+                // A kernel-defining macro invocation may span several source lines: extend
+                // the text with the following plain lines until its parentheses balance.
+                // A directive line, or the end of the file, inside the invocation fails closed.
+                let mut text = line.to_string();
+                let mut extra = 0usize;
+                loop {
+                    match expand_obj(&text, &defs, 0) {
+                        Ok(expanded) => {
+                            out.push_str(&expanded);
+                            break;
+                        }
+                        Err(e) if e.contains(OPEN_INVOCATION) => {
+                            let next = lines
+                                .get(idx + extra + 1)
+                                .filter(|l| !l.trim().starts_with('#'));
+                            match next {
+                                Some(l) => {
+                                    text.push(' ');
+                                    text.push_str(l);
+                                    extra += 1;
+                                }
+                                None => return Err(e),
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                // Keep one output line per source line.
+                for _ in 0..extra {
+                    out.push('\n');
+                }
+                idx += extra;
             }
             out.push('\n');
         }
+        idx += 1;
     }
     if !stack.is_empty() {
         return Err("unterminated #if".into());
@@ -834,4 +876,86 @@ pub fn decls_of(text: &str) -> Result<BTreeMap<String, Decl>, String> {
 /// same bytes as a HIP `int`/`float`. A pointer never matches a scalar.
 fn kinds_compatible(a: char, b: char) -> bool {
     a == b || (a == 'v' && b != 'p') || (b == 'v' && a != 'p')
+}
+
+#[cfg(test)]
+mod multiline_macro_tests {
+    use super::*;
+
+    const DEFS: &str = "#define KERNEL(NAME, BOUNDS, T)            \\
+    extern \"C\" __global__ BOUNDS void NAME(const T* x, int n) {}
+";
+
+    fn names(source: &str) -> Result<Vec<(String, u32)>, String> {
+        let d = decls_of(source)?;
+        Ok(d.into_iter().map(|(k, v)| (k, v.end)).collect())
+    }
+
+    #[test]
+    fn invocation_split_across_lines_expands_like_the_single_line_form() {
+        let one = format!("{DEFS}KERNEL(k_one, __launch_bounds__(256), float)\n");
+        let many = format!("{DEFS}KERNEL(k_one,\n        __launch_bounds__(256),\n   float\n)\n");
+        assert_eq!(names(&one).unwrap(), vec![("k_one".to_string(), 12)]);
+        assert_eq!(names(&many).unwrap(), names(&one).unwrap());
+        // The name alone on a line with the argument list on the next lines.
+        let split_name = format!("{DEFS}KERNEL\n(k_one, __launch_bounds__(256),\nfloat)\n");
+        assert_eq!(names(&split_name).unwrap(), names(&one).unwrap());
+    }
+
+    #[test]
+    fn several_multiline_invocations_and_following_code_are_kept() {
+        let source = format!(
+            "{DEFS}KERNEL(a, __launch_bounds__(64),\n       float)\nKERNEL(b, ,\n       double)\n__global__ void c(int z) {{}}\n"
+        );
+        let got = names(&source).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("a".to_string(), 12),
+                ("b".to_string(), 12),
+                ("c".to_string(), 4)
+            ]
+        );
+    }
+
+    #[test]
+    fn comments_inside_a_multiline_invocation_do_not_count() {
+        let source = format!(
+            "{DEFS}KERNEL(k, // closing ) in a line comment\n  /* ) and ( in a\n     block comment */ __launch_bounds__(128),\n  float)\n"
+        );
+        assert_eq!(names(&source).unwrap(), vec![("k".to_string(), 12)]);
+    }
+
+    #[test]
+    fn nested_brackets_across_lines_balance() {
+        let source = format!("{DEFS}KERNEL(k,\n  __launch_bounds__((128 +\n  (64))),\n  float)\n");
+        assert_eq!(names(&source).unwrap(), vec![("k".to_string(), 12)]);
+    }
+
+    #[test]
+    fn unbalanced_or_interrupted_invocations_fail_closed() {
+        // End of file before the closing parenthesis.
+        let eof = format!("{DEFS}KERNEL(k, __launch_bounds__(64),\n  float\n");
+        assert!(names(&eof).unwrap_err().contains("not closed"));
+        // A preprocessor directive inside the argument list is not modelled.
+        let directive =
+            format!("{DEFS}KERNEL(k,\n#if 1\n  __launch_bounds__(64),\n#endif\n float)\n");
+        assert!(names(&directive).unwrap_err().contains("not closed"));
+        // Name with no argument list at all.
+        let bare = format!("{DEFS}KERNEL\n");
+        assert!(names(&bare).is_err());
+        // Argument-count and literal checks still apply to the joined invocation.
+        let count = format!("{DEFS}KERNEL(k,\n  float)\n");
+        assert!(names(&count).unwrap_err().contains("takes 3 arguments"));
+        let literal = format!("{DEFS}KERNEL(k,\n  \"a)\",\n float)\n");
+        assert!(names(&literal).unwrap_err().contains("literal"));
+    }
+
+    #[test]
+    fn multiline_calls_of_non_kernel_macros_are_untouched() {
+        let source = format!(
+            "{DEFS}#define HELPER(A, B) A + B\nint v = HELPER(1,\n  2);\n__global__ void k(int z) {{}}\n"
+        );
+        assert_eq!(names(&source).unwrap(), vec![("k".to_string(), 4)]);
+    }
 }

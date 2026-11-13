@@ -373,6 +373,31 @@ impl World {
                         }
                     }
                 }
+                Tt::Id(name, _)
+                    if !is_skip_word(name)
+                        && !(k > 0 && (ts[k - 1].is_p('.') || ts[k - 1].is_p(':')))
+                        && ctx.idx.visible(name, sloc).is_none()
+                        && !ctx.params.contains(name)
+                        && self
+                            .const_array_element(name, ctx.file, ts.get(k + 1))
+                            .is_some() =>
+                {
+                    // `ARRAY[3]` of a constant array literal names that one element, not
+                    // every element the array holds.
+                    let (path, element) = self
+                        .const_array_element(name, ctx.file, ts.get(k + 1))
+                        .unwrap();
+                    let idx = BindIndex::default();
+                    let ectx = Ctx {
+                        file: &path,
+                        body: &[],
+                        params: HashSet::new(),
+                        idx: &idx,
+                    };
+                    let r = self.resolve(&element, &ectx, &[usize::MAX], depth + 1, callees);
+                    res.merge(&r);
+                    skip_to = k + 2;
+                }
                 Tt::Id(name, _) if !is_skip_word(name) => {
                     let prev = if k > 0 { ts.get(k - 1) } else { None };
                     let nxt = ts.get(k + 1);
@@ -545,6 +570,62 @@ impl World {
                 _ => {}
             }
         }
+    }
+
+    /// The element tokens of `NAME[<decimal literal>]` when `NAME` is one constant (this file's,
+    /// else the only one in the workspace) initialised by a plain array literal `[a, b, ..]`
+    /// (not the repeat form `[x; N]`) that has that index. The file defining the constant is
+    /// returned with it, because the element is resolved there.
+    fn const_array_element(
+        &self,
+        name: &str,
+        file: &str,
+        index: Option<&Tt>,
+    ) -> Option<(String, Vec<Tt>)> {
+        let Some(Tt::G('[', ix, _)) = index else {
+            return None;
+        };
+        let [Tt::N(n, _)] = ix.as_slice() else {
+            return None;
+        };
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let i: usize = n.parse().ok()?;
+        let src = match self.file(file).filter(|f| f.consts.contains_key(name)) {
+            Some(f) => f,
+            None => {
+                let files = self.const_files.get(name)?;
+                if files.len() != 1 {
+                    return None;
+                }
+                &self.files[files[0]]
+            }
+        };
+        let defs = src.consts.get(name)?;
+        if defs.len() != 1 {
+            return None;
+        }
+        let init = defs[0].init();
+        let [array] = init.as_slice() else {
+            return None;
+        };
+        if !array.is_g('[') {
+            return None;
+        }
+        let items = array.group()?;
+        if items.iter().any(|t| t.is_p(';')) {
+            return None;
+        }
+        let mut parts = split_top(items, ',');
+        if parts.last().is_some_and(|p| p.is_empty()) {
+            parts.pop();
+        }
+        let element = parts.get(i)?.clone();
+        if element.is_empty() {
+            return None;
+        }
+        Some((src.path.clone(), element))
     }
 
     fn resolve_const(&self, name: &str, file: &str, _depth: u32, callees: bool) -> Res {

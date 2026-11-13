@@ -4208,3 +4208,86 @@ fn actual_wide_selector_and_loader_feed_all_three_abi_checked_launches() {
         "classifications cannot stand in for a launch"
     );
 }
+
+#[test]
+fn constant_array_literal_index_names_one_element() {
+    // `ENTRIES[0]` is the first entry, not every entry of the array: the two kernels have
+    // different ABIs, so a launch of `FIRST` is checked against the first alone.
+    let source = |blob: &str| {
+        format!(
+            "const ENTRIES: [&str; 2] = [\"first_symbol\", \"second_symbol\"];
+            const FIRST: &str = ENTRIES[0];
+            fn launch_first(gpu: &Gpu) {{
+                {SMALL_LETS}
+                let mut b = KernargBlob::new();
+                {blob}
+                gpu.launch_kernel_blob(FIRST, g, bl, 0, b.as_mut_slice()).unwrap();
+            }}"
+        )
+    };
+    let symbols = [
+        ("first_symbol", small_decl()),
+        (
+            "second_symbol",
+            Decl::from_scalars(&[(8, 'p'), (8, 'p'), (4, 'i')]),
+        ),
+    ];
+    let good = source("b.push_ptr(wp); b.push_i32(nv); b.push_f32(sc); b.push_u64(big);");
+    let (abi, cov) = run_synth_at(PROBE_PATH, &good, &symbols, &no_policy());
+    assert!(abi.is_empty() && cov.is_empty(), "{abi:?} {cov:?}");
+    // The indexed entry is still checked: a missing word is a real mismatch.
+    let bad = source("b.push_ptr(wp); b.push_i32(nv); b.push_f32(sc);");
+    let (abi, cov) = run_synth_at(PROBE_PATH, &bad, &symbols, &no_policy());
+    assert!(
+        abi.iter().chain(&cov).any(|p| p.contains("first_symbol")),
+        "first entry escaped checking: {abi:?} {cov:?}"
+    );
+    // A non-literal index, or an index past the array, selects nothing in particular: every
+    // entry stays a candidate (and the second one's ABI then fails this blob).
+    for index in ["i", "7"] {
+        let wide = good.replace("ENTRIES[0]", &format!("ENTRIES[{index}]"));
+        let (abi, cov) = run_synth_at(PROBE_PATH, &wide, &symbols, &no_policy());
+        assert!(
+            abi.iter().chain(&cov).any(|p| p.contains("second_symbol")),
+            "index {index} must keep every entry a candidate: {abi:?} {cov:?}"
+        );
+    }
+}
+
+#[test]
+fn a_call_through_a_local_closure_does_not_reach_a_free_function_of_that_name() {
+    // `controls` mentions a changed kernel and calls its own closure `run`; the free
+    // function `run` launches a kernel named by its parameter and is only reached by `driver`.
+    // Rust resolves `controls`' call to the closure, so `run` stays outside the changed
+    // kernels' reach: its unresolvable parameter name is no coverage problem. Calling the
+    // free function (no closure) puts it back in reach.
+    let source = |controls_call: &str| {
+        format!(
+            "fn run(gpu: &Gpu, sym: &str, args: &mut KernargBlob) {{
+                gpu.launch_kernel_blob(sym, g, bl, 0, args.as_mut_slice()).unwrap();
+            }}
+            fn driver(gpu: &Gpu, f: &str) {{
+                let mut b = KernargBlob::new();
+                b.push_ptr(wp);
+                run(gpu, f, &mut b);
+            }}
+            fn controls(gpu: &Gpu) {{
+                {SMALL_LETS}
+                let mut b = KernargBlob::new();
+                b.push_ptr(wp); b.push_i32(nv); b.push_f32(sc); b.push_u64(big);
+                gpu.launch_kernel_blob(\"changed_symbol\", g, bl, 0, b.as_mut_slice()).unwrap();
+                {controls_call}
+            }}"
+        )
+    };
+    let symbols = [("changed_symbol", small_decl())];
+    let closure = source("let run = |x: i32| x + 1; let _ = run(3);");
+    let (abi, cov) = run_synth_at(PROBE_PATH, &closure, &symbols, &no_policy());
+    assert!(abi.is_empty() && cov.is_empty(), "{abi:?} {cov:?}");
+    let free = source("let mut c = KernargBlob::new(); run(gpu, \"other\", &mut c);");
+    let (_, cov) = run_synth_at(PROBE_PATH, &free, &symbols, &no_policy());
+    assert!(
+        cov.iter().any(|p| p.contains("run")),
+        "a real call of the free helper must keep it in reach: {cov:?}"
+    );
+}

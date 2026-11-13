@@ -876,7 +876,36 @@ pub fn analyze(world: &World, syms: &Symbols, policy: &Policy) -> Analysis {
             let me: Node = (fi, func.name.clone());
             let mut cs = BTreeSet::new();
             call_names(&func.body, &mut cs);
-            for c in cs {
+            // A call through a `let`-bound local (a closure or function alias) never reaches a
+            // free function that merely shares its name: Rust resolves the call to the local.
+            // The local's own initialiser still contributes what it can reach: the calls inside
+            // it (a closure body), or the function a bare path alias (`let f = module::name;`)
+            // names.
+            let calls = if cs.is_empty() {
+                cs
+            } else {
+                let local_idx = BindIndex::build(&func.body);
+                let mut resolved = BTreeSet::new();
+                for c in cs {
+                    match local_idx.map.get(&c) {
+                        Some(bindings) => {
+                            for b in bindings {
+                                call_names(&b.init, &mut resolved);
+                                if b.init.iter().all(|t| t.id().is_some() || t.is_p(':')) {
+                                    let mut ids = Vec::new();
+                                    idents_in(&b.init, &mut ids);
+                                    resolved.extend(ids);
+                                }
+                            }
+                        }
+                        None => {
+                            resolved.insert(c);
+                        }
+                    }
+                }
+                resolved
+            };
+            for c in calls {
                 let local = file.fns.iter().any(|f| f.name == c);
                 if local {
                     callers_of.entry((fi, c)).or_default().insert(me.clone());
