@@ -139,10 +139,10 @@ const BOOL_GRAMMARS: &[(&str, BoolReader)] = &[
             .prompt_token_heat
             .to_string()
     }),
-    // `value != Some("0")`: `RuntimeConfig::draft_f16`.
+    // `value != Some("0")`: `RuntimeConfig::prefill_batched`.
     ("ne_zero", |input, _default| {
-        runtime_config_for("HIPFIRE_DRAFT_F16", input)
-            .draft_f16
+        runtime_config_for("HIPFIRE_PREFILL_BATCHED", input)
+            .prefill_batched
             .to_string()
     }),
     // `.is_some()` / `.is_ok()` presence test (an empty value counts as present).

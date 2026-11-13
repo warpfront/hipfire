@@ -35,24 +35,6 @@ const FLUSH_BATCH: usize = 256;
 /// exact F32 diagonal followed by BF16 lower strict triangle.
 const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HessianStorage {
-    DenseF32,
-    Bf16TrilDiagF32,
-}
-
-fn hessian_storage_from_env() -> HessianStorage {
-    match hipfire_config::developer_var("HIPFIRE_CALIB_HESSIAN_STORAGE")
-        .ok()
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("f32" | "dense-f32" | "full-f32" | "legacy") => HessianStorage::DenseF32,
-        _ => HessianStorage::Bf16TrilDiagF32,
-    }
-}
-
 fn compact_hessian_bytes(k: usize) -> u64 {
     (k * 4 + k * (k - 1)) as u64
 }
@@ -274,7 +256,6 @@ impl CalibCollector {
         use std::cell::{Cell, RefCell};
 
         let mut accs = self.accs.lock().unwrap();
-        let hessian_storage = hessian_storage_from_env();
         // Fold any staged activation rows before reading the accumulators.
         for acc in accs.values_mut() {
             acc.flush(gpu);
@@ -294,13 +275,10 @@ impl CalibCollector {
         for name in &names {
             let acc = &accs[name];
             if acc.h.is_some() {
-                let (quant_type, data_len) = match hessian_storage {
-                    HessianStorage::DenseF32 => (2, (acc.k * acc.k * 4) as u64),
-                    HessianStorage::Bf16TrilDiagF32 => (
-                        QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32,
-                        compact_hessian_bytes(acc.k),
-                    ),
-                };
+                let (quant_type, data_len) = (
+                    QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32,
+                    compact_hessian_bytes(acc.k),
+                );
                 entries.push(HfqStreamEntry {
                     name: format!("{name}.hessian"),
                     quant_type,
@@ -361,12 +339,7 @@ impl CalibCollector {
                             *audit_worst.borrow_mut() = name.clone();
                         }
                     }
-                    match hessian_storage {
-                        HessianStorage::DenseF32 => write_f32_scaled(w, &h, inv),
-                        HessianStorage::Bf16TrilDiagF32 => {
-                            write_hessian_bf16_tril_diag_f32(w, &h, &diag, acc.k, inv)
-                        }
-                    }
+                    write_hessian_bf16_tril_diag_f32(w, &h, &diag, acc.k, inv)
                 }
                 Plan::Imatrix(name) => {
                     let acc = &accs[name];

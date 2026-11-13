@@ -25,7 +25,6 @@ cd /scratch/hipfire || exit 1
 
 export HIPFIRE_NORMALIZE_PROMPT=0
 export HIPFIRE_GRAPH=0
-export HIPFIRE_GRAPH_MOE=0
 export HIPFIRE_CALIB_BF16=1
 
 for m in lfm2.5-350m lfm2.5-1.2b gemma4-12b muse-glimmer; do

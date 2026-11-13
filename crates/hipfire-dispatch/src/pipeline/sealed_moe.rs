@@ -2281,7 +2281,7 @@ impl<'a> SealedMoeCall<'a> {
             {
                 return Err(DispatchError::UnsupportedVariant {
                     family: "moe",
-                    variant: "cpu-topk-fallback-not-capture-safe(set HIPFIRE_GRAPH_MOE=0)",
+                    variant: "cpu-topk-fallback-not-capture-safe(set HIPFIRE_GRAPH=0)",
                     arch: "",
                     quant: "",
                 });

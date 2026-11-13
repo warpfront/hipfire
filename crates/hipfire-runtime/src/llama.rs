@@ -1978,11 +1978,7 @@ pub fn llama_batched_prefill_eligible(
 /// Kill-switch for the MQ-V2 (qt44 + neutral qt47-50) gfx11 WMMA prefill path:
 /// gfx12 (`gfx1200`/`gfx1201`) is always admitted, gfx11
 /// (`gfx1100`/`gfx1101`/`gfx1102`/`gfx1150`/`gfx1151`) is admitted unless
-/// `HIPFIRE_MQV2_GFX11_WMMA=0`, anything else is rejected. Defined here as
-/// the shared home for the qwen35 caller (`qwen35::is_batchable_la`);
-/// `llama::is_batchable_la` does NOT delegate to it (see below).
-/// `value` is the raw env var (None = unset → default ON); only `Some("0")`
-/// disables the gfx11 path. Gfx12 is unaffected by the env var.
+/// `value` is `Some("0")`, anything else is rejected.
 pub fn mqv2_gfx11_wmma_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
     let gfx11_enabled = value != Some("0");
     if matches!(arch, "gfx1200" | "gfx1201") {
@@ -1998,14 +1994,15 @@ pub fn mqv2_gfx11_wmma_enabled_from_env(value: Option<&str>, arch: &str) -> bool
 }
 
 /// Admit rule for the MQ-V2 family (`MQ4G256V2` + neutral `MQ6/5/3/2G256V2`)
-/// in batched WMMA prefill: dtype set × arch set × the
-/// `HIPFIRE_MQV2_GFX11_WMMA` kill-switch in one function. Only
+/// in batched WMMA prefill: dtype set × arch set (gfx11
+/// `gfx1100`/`gfx1101`/`gfx1102`/`gfx1150`/`gfx1151` and gfx12
+/// `gfx1200`/`gfx1201`) in one function. Only
 /// `qwen35::is_batchable_la` delegates here — qwen35's
 /// `forward_prefill_chunk` has V2 dispatch arms, while the llama chunk path
 /// does not (see `llama::is_batchable_la`).
 /// `MQ4CG256` (qt45) stays gfx12-only in its caller and is intentionally
 /// NOT part of this rule.
-pub fn mqv2_wmma_batchable(dt: DType, mqv2_gfx11_wmma: Option<&str>, arch: &str) -> bool {
+pub fn mqv2_wmma_batchable(dt: DType, arch: &str) -> bool {
     // MQ4G256V2Lloyd (qt52) shares the V2 wire layout and dispatches through
     // the LUT variants of the same WMMA/FP8 prefill families (gfx12) — admit
     // it exactly like qt44; the dispatch layer fails closed on any family
@@ -2018,7 +2015,10 @@ pub fn mqv2_wmma_batchable(dt: DType, mqv2_gfx11_wmma: Option<&str>, arch: &str)
             | DType::MQ5G256V2
             | DType::MQ3G256V2
             | DType::MQ2G256V2
-    ) && mqv2_gfx11_wmma_enabled_from_env(mqv2_gfx11_wmma, arch)
+    ) && matches!(
+        arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
+    )
 }
 
 /// Is this dtype/arch combination eligible for the batched WMMA prefill

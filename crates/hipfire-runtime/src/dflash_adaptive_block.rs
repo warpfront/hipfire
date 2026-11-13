@@ -44,9 +44,8 @@
 //! target-lossless per-position sampling property.
 //!
 //! Env-free by construction: the `HIPFIRE_DFLASH_ADAPTIVE_B=0` kill-switch is
-//! resolved by `build_dflash_speculator` (mirroring DSpark's
-//! `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0` in `dspark_core`), so this controller is
-//! unit-testable without a device — see the tests below.
+//! resolved by `build_dflash_speculator`, so this controller is unit-testable
+//! without a device — see the tests below.
 
 /// Trailing verify cycles of acceptance history before the width may shrink.
 pub const ADAPTIVE_WINDOW: usize = 8;

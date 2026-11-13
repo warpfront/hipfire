@@ -227,7 +227,7 @@ fixed launch contracts.
 | Dense GEMV prerotated / residual / SwiGLU residual | **yes** (wave32 predicate; cross-RDNA scalar decode) |
 | Dense fused QKV / QKVZA / gate_up | **yes** (dense path; scalar fused decode cross-RDNA) |
 | Dense residual / plain / batched-lmhead GEMM keys | **yes, HasWmma** — gfx11 **base WMMA** + gfx12 WMMA (`gemm_table`: `GemmMq{2,3,5,6}G256V2*` use `ArchPredicate::HasWmma`) |
-| Batched prefill LA | **yes** on gfx1100/1101/1102/1150/1151 + gfx1200/1201 (`prefill.rs` `mqv2_with_wmma`); gfx11 half opt-out via `HIPFIRE_MQV2_GFX11_WMMA=0` (gfx12 unaffected) |
+| Batched prefill LA | **yes** on gfx1100/1101/1102/1150/1151 + gfx1200/1201 (`prefill.rs` `mqv2_with_wmma`) |
 | Weight-reuse / batch-tile defaults | see table below (`mqv2_prefill_batch_tile`) |
 | Batched lm_head / DFlash verify rotate+GEMM | **yes** on dense qwen35 HasWmma (scratch size asserts per V2 dtype) |
 | AWQ sidecar | **yes** — `DType::supports_awq_sidecar` lists MQ6/5/3/2G256V2 with the same pre-scale contract as qt=44 |

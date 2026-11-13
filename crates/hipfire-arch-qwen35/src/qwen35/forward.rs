@@ -1663,15 +1663,11 @@ pub(crate) fn moe_layers_use_host_topk<'a>(
 }
 
 /// MoE half of the AR decode hipGraph gate. Dense models always pass; MoE
-/// models need `experimental.graph.moe` and no host-top-K layer (#1149).
-/// `moe_host_topk` is evaluated only for MoE models with the knob on.
+/// models need every layer to resolve decode to GPU top-K (#1149).
+/// `moe_host_topk` is evaluated only for MoE models.
 #[inline]
-fn ar_graph_moe_admitted(
-    num_experts: usize,
-    allow_moe: bool,
-    moe_host_topk: impl FnOnce() -> bool,
-) -> bool {
-    num_experts == 0 || (allow_moe && !moe_host_topk())
+fn ar_graph_moe_admitted(num_experts: usize, moe_host_topk: impl FnOnce() -> bool) -> bool {
+    num_experts == 0 || !moe_host_topk()
 }
 
 #[inline]
@@ -1823,60 +1819,10 @@ pub fn forward_scratch(
     )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
-    // hipGraph capture for MoE was previously gated off-by-default behind
-    // HIPFIRE_GRAPH_MOE=1 because of a known drift bug (task #100): under
-    // capture, A3B accumulated a per-step ~1-ULP delta that compounded
-    // through the KV cache + GDN state and crossed the top-1 margin at
-    // step ~7 (q8 KV) or ~114 (asym3 KV), producing visible token-loop
-    // attractors by step 30-50 ("- **One**\n- **One**\n…").
-    //
-    // Root cause (fixed 2026-05-21): `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed`
-    // used K_TOP=8 concurrent `atomicAdd` writes per output row. FP32
-    // addition is non-associative, so the final bits depend on wavefront
-    // scheduling order. Under hipGraph replay that order differs from
-    // direct execution (graph scheduling pipelines kernels differently),
-    // introducing the systematic per-step delta. The kernel's own header
-    // (`kernels/src/gemv_hfq4g256_moe_down.hip:14-19`) had already flagged
-    // this non-determinism but rated it negligible based on the
-    // direct-only smoke test — capture amplifies the effect.
-    //
-    // Fix: the MoE FFN decode path now uses the atomic-free expand+combine
-    // pattern already used in prefill (`forward_prefill_batch_with_pbs`
-    // L5217-5232): `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`
-    // writes one row per (expert-rank, m), then `moe_down_combine_k8_batched`
-    // sums K_TOP slots into x_residual in a fixed iteration order. The
-    // resulting MoE FFN output is byte-deterministic under both direct
-    // execution and hipGraph replay.
-    //
-    // `experimental.graph.moe` remains the explicit policy control. The atomic
-    // fix is necessary but not sufficient — the CPU-topK fallback path
-    // (when not all gate-side MoE weights are MQ4G256, e.g. router=Q8 per
-    // the post-2026-04 router-attractor fix) calls `download_f32(router_logits)`,
-    // a sync D2H that fails under graph capture with hipError 906. Until
-    // that D2H is migrated to a capture-safe equivalent, opting in only
-    // works for models where the runtime takes the use_gpu_topk path.
-    //
-    // Reproducer used to characterize the fix:
-    //   hipfire config set experimental.graph.forward true
-    //   hipfire config set experimental.graph.moe true
-    //   HIPFIRE_SMOKE_KV=q8 \
-    //   HIPFIRE_SMOKE_MODE=chat HIPFIRE_SMOKE_STEPS=200 \
-    //   HIPFIRE_SMOKE_PROMPT="Count from one to twenty in English." \
-    //   ./target/release/examples/a3b_smoke_forward <uniform-mq4-a3b>
-    //
-    // Graph policy is resolved once from TOML before GPU initialization and is
-    // carried directly by the GPU feature snapshot.
-    // Default-ON (2026-06-16): cross-arch A/B validated — gfx12 +4.2% A3B mq4
-    // decode, coherence-gate clean (fluent at decode pos 1-4 on current ROCm).
-    // Opt out with `experimental.graph.moe = false`. Both root causes of the prior
-    // crash/drift are fixed:
-    //   1. atomicAdd drift (task #100, 2026-05-21): expand+combine pattern.
-    //   2. CPU-topK fallback D2H: `download_f32(router_logits)` replaced by
-    //      GPU `softmax_f32` + `moe_topk_renorm_k8` + small [k] D2H — fully
-    //      capture-safe. Mixed-kmap A3B (Q8 router, post-PR #199) no longer
-    //      crashes with hipError 906 under AR graph capture.
-    // Validated + flipped to default-on 2026-06-16.
-    let allow_moe = gpu.flags.graph_moe;
+    // MoE configs capture like dense ones. The two historical MoE capture
+    // blockers are fixed: the atomicAdd down-projection drift (task #100,
+    // 2026-05-21: expand + fixed-order combine) and the CPU-topK router
+    // `download_f32` D2H (now GPU softmax + top-k renorm + a small [k] D2H).
     // hipGraph per-forward-pass capture/replay default policy:
     //   - gfx12 (RDNA4): default-ON. +2.4-2.7% decode on 9B Qwen 3.5
     //     MFP4G32 (5-run mean, all positive, tight variance, 2026-05-11).
@@ -1887,14 +1833,8 @@ pub fn forward_scratch(
     //     and consistent across model sizes.
     //   - other archs (RDNA1/2, CDNA): default-OFF (opt-in via
     //     `experimental.graph.forward = true`) since not yet A/B'd on those.
-    //   - MoE configs follow `experimental.graph.moe`. The ~30-50-token
-    //     attractor drift in the use_gpu_topk MoE down step was fixed
-    //     2026-05-21 (task #100 — atomicAdd → expand+combine), but the
-    //     CPU-topK fallback's `download_f32(router_logits)` D2H sync
-    //     remains capture-incompatible, so mixed-kmap A3B (post-PR #199)
-    //     can crash under graph capture even with the fix. Once that
-    //     D2H is migrated to a capture-safe path, the MoE default can
-    //     be flipped to follow the arch defaults.
+    //   - MoE configs follow the same policy (both capture blockers fixed,
+    //     see above).
     // An explicit `experimental.graph.forward = false` always wins.
     let graph_override = gpu.flags.graph_forward;
     let graph_arch_default = gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
@@ -1947,9 +1887,9 @@ pub fn forward_scratch(
         gpu.graphs.ar_forward_replay_enabled = false;
         gpu.graphs.ar_forward_kernel_dirty = true;
     }
-    // MoE models require `experimental.graph.moe` in addition to the
-    // arch/kill-switch guards, and every MoE layer must resolve decode to GPU
-    // top-K: the host top-K fallback downloads router output mid-forward, which
+    // MoE models follow the same arch/kill-switch guards as dense, and every
+    // MoE layer must resolve decode to GPU top-K: the host top-K fallback
+    // downloads router output mid-forward, which
     // a capture cannot record (#1149, hipError 906). That resolution is decided
     // once per model (load-time, cached on the weights). Dense models
     // (num_experts==0) are unaffected.
@@ -1957,7 +1897,7 @@ pub fn forward_scratch(
         && graph_enabled
         && graph_eligible
         && !gpu.replay.is_enabled()
-        && ar_graph_moe_admitted(config.num_experts, allow_moe, || {
+        && ar_graph_moe_admitted(config.num_experts, || {
             weights.moe_decode_host_topk(config, gpu.arch_caps.has_wmma())
         });
     // A CPU-executed step (memory.offload_exec=cpu over a spilled prefix) is a
@@ -5667,22 +5607,16 @@ mod tests {
             assert!(!moe_layers_use_host_topk(std::iter::empty(), 8, wmma));
         }
 
-        let decide = |n_exp, allow, layers: &[_]| {
-            ar_graph_moe_admitted(n_exp, allow, || {
+        let decide = |n_exp, layers: &[_]| {
+            ar_graph_moe_admitted(n_exp, || {
                 moe_layers_use_host_topk(layers.iter().copied(), 8, false)
             })
         };
-        assert!(decide(256, true, &[gpu_topk, gpu_topk]));
-        assert!(!decide(256, true, &[gpu_topk, host_topk]));
-        assert!(!decide(256, false, &[gpu_topk]));
-        assert!(decide(0, false, &[]));
-        // Dense models and a disabled MoE knob never evaluate the layer scan.
-        assert!(ar_graph_moe_admitted(0, true, || panic!(
-            "dense must not scan"
-        )));
-        assert!(!ar_graph_moe_admitted(256, false, || panic!(
-            "knob off must not scan"
-        )));
+        assert!(decide(256, &[gpu_topk, gpu_topk]));
+        assert!(!decide(256, &[gpu_topk, host_topk]));
+        assert!(decide(0, &[]));
+        // Dense models never evaluate the layer scan.
+        assert!(ar_graph_moe_admitted(0, || panic!("dense must not scan")));
     }
 
     #[test]

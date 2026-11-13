@@ -1928,17 +1928,8 @@ impl GlimmerState {
         cfg: &GlimmerConfig,
         max_seq: usize,
     ) -> Result<Self, String> {
-        // `HIPFIRE_GLIMMER_KV_VMM=0` falls back to the legacy allocator.
-        // Default remains VMM so examples/tools keep working without a LoadCtx.
-        let use_vmm = hipfire_config::developer_var("HIPFIRE_GLIMMER_KV_VMM")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true);
-        let backend = if use_vmm {
-            KvBackend::Vmm
-        } else {
-            KvBackend::Legacy
-        };
-        Self::new_with_max_seq_backend(gpu, cfg, max_seq, backend)
+        // VMM by default so examples/tools keep working without a LoadCtx.
+        Self::new_with_max_seq_backend(gpu, cfg, max_seq, KvBackend::Vmm)
     }
 
     /// Allocate Glimmer state with an explicit KV storage backend.
@@ -1947,7 +1938,7 @@ impl GlimmerState {
     /// Does not read or mutate process environment — loader callers pass
     /// `ctx.kv_backend` so registry defaults and explicit overrides are
     /// deterministic. Non-loader callers should keep using
-    /// [`Self::new_with_max_seq`], which still honors `HIPFIRE_GLIMMER_KV_VMM`.
+    /// [`Self::new_with_max_seq`], which always picks VMM.
     pub fn new_with_max_seq_backend(
         gpu: &mut Gpu,
         cfg: &GlimmerConfig,
@@ -2091,8 +2082,8 @@ impl GlimmerState {
         // wraparound in every consumer; this does not.
         //
         // Precedent: DeepSeek4 (hipfire-arch-deepseek4/src/forward.rs:1813).
-        // Backend is chosen by the caller (typed ctor) or by
-        // `HIPFIRE_GLIMMER_KV_VMM` via `new_with_max_seq`.
+        // Backend is chosen by the caller (typed ctor; `new_with_max_seq`
+        // picks VMM).
         let use_vmm = backend == KvBackend::Vmm;
         if use_vmm {
             let sliding_layers = vec![true; cfg.n_sliding_layers()];

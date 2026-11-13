@@ -567,7 +567,7 @@ for idx in "${!MODEL_BASENAME[@]}"; do
     if [ "$STATUS" = "BLOCKED" ]; then
       echo "  NOTE: $TAG is BLOCKED (arch $ARCH_ID) — calib_sweep will exit 2 by design for diagnosis (see table notes)"
     fi
-    HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_GRAPH_MOE=0 \
+    HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 \
     "$CALIB_SWEEP_BIN" \
         --model "$TEACHER" \
         --corpus "$CORPUS" \
