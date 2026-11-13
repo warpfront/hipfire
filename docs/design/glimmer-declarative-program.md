@@ -46,15 +46,13 @@ Gemma are op fields, not separate operations:
   row count, picks the kernels) and `kernels = SandwichRoute::Steps(StepsRoute
   { shared_rotation, fused_silu_rotate })`: decode projections of one pre-norm
   run as generic `Gemv` steps, so the dispatch fusion table groups them as it
-  did before; batches take their route's ladder at any row count.
-  `HIPFIRE_GLIMMER_SHARED_ROT` and `HIPFIRE_GLIMMER_FUSED_SILU_ROTATE` are
-  read in the arch crate and passed as these fields.
+  did before; batches take their route's ladder at any row count. The
+  target trunk sets both fields; the drafter sets neither.
 - `SandwichStream::post_eps` (post-norm eps) and `out` (the attention
   sublayer writes `x'` into `residual`, the FFN sublayer writes `x"` back
   into `x`, so neither copies the residual stream).
-- `KvRoute::WindowedQ8 { tiled, rows_flash, wmma_flash }`: the
-  absolute-position Q8 cache and its decode/prefill/verify attention ladders
-  (`HIPFIRE_GLIMMER_WMMA_FULL` is read in the arch crate).
+- `KvRoute::WindowedQ8 { tiled, rows_flash }`: the
+  absolute-position Q8 cache and its decode/prefill/verify attention ladders.
 - `RopeKind::NoPe` for full layers, `AttnGate` for the attention gate.
 
 `forward.rs` keeps the lifecycle around the program: the embedding and its
@@ -119,8 +117,7 @@ FWHT-G256 projection formats read one shared rotated activation
 (`GemvInput::Prerotated`), as the pre-port shared-rotation path did; every
 other format (Q8 attention of the quality trunk, the Q8 LM head) reads the
 plain norm (`GemvInput::Raw`) and takes its plain GEMV, so no Q8 projection
-enters the fusion table. `HIPFIRE_GLIMMER_SHARED_ROT=0` and
-`HIPFIRE_GLIMMER_FUSED_SILU_ROTATE=0` keep their meaning.
+enters the fusion table.
 
 One launch-level change: prerotated MQ4 projections that share an input now
 match the dispatch fusion table on every arch, so the FFN gate/up pair runs
@@ -138,7 +135,7 @@ Batched rows keep the kernels each route ran before, per route:
 | Projections | Q8 chunked batched GEMM; MQ4/HFQ4 prerotated batched-LM-head GEMM; MQ6 batched GEMM; F32 batched GEMM; BF16 staged MFMA GEMM; other formats one GEMV per row | same |
 | gfx12, more than one row | Q/K/V/gate of one prerotated MQ4 input: one fused QKVZA WMMA GEMM; other MQ4/HFQ4 projections: the residual WMMA GEMM over a zeroed output (the Muse residual GEMM for M below 8192 at a multiple of 192 rows) | the batched-LM-head GEMMs |
 | QK norm, scale, RoPE | batched per-head norm, scale, batched RoPE | same |
-| Attention | per-row causal kernel until the chunk ends past the window (sliding) or past 2048 (full), then the query-tiled Q8 WMMA flash kernels; a one-row chunk, or `HIPFIRE_GLIMMER_WMMA_FULL=0`, takes the scalar key-tiled flash kernel on a tile-aligned rebased origin | the query-tiled WMMA flash kernels from two rows on, else the causal kernel |
+| Attention | per-row causal kernel until the chunk ends past the window (sliding) or past 2048 (full), then the query-tiled Q8 WMMA flash kernels; a one-row chunk takes the scalar key-tiled flash kernel on a tile-aligned rebased origin | the query-tiled WMMA flash kernels from two rows on, else the causal kernel |
 | Post-norm residual | batched norm in place, then `out = residual + norm` | same |
 | Head | batched final norm, GEMV of the last row only | batched final norm, then `glimmer_lm_head_picks` |
 
