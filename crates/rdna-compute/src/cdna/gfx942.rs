@@ -5069,6 +5069,7 @@ mod tests {
             ),
         ];
         let mut g12_lines = 0;
+        let mut g12_unroll_lines = 0;
         let mut outside = super::QWEN4_G942_CONV_FUSE_SRC.to_string();
         for (file, production, expected_blocks) in sources {
             let begin = format!("// BEGIN verbatim {file}\n");
@@ -5085,14 +5086,29 @@ mod tests {
                         "qwen4_g942_hyper_write_norm_bf16x(",
                         "hyper_write_norm_f32(",
                     );
+                let mut unroll_lines = 0;
                 let stripped: Vec<&str> = block
                     .lines()
-                    .filter(|line| {
+                    .filter_map(|line| {
                         let g12 = line.trim_end().ends_with("// G12");
                         g12_lines += usize::from(g12);
-                        !g12
+                        // The store loop's guard replaces tensor_ops.hip's early `break` (full
+                        // unroll, no `s_set_gpr_idx`); map it back and drop its closing brace.
+                        match line.trim_end() {
+                            "            if (j < hidden) {  // G12 unroll" => {
+                                unroll_lines += 1;
+                                Some("            if (j >= hidden) break;")
+                            }
+                            "            }  // G12 unroll" => {
+                                unroll_lines += 1;
+                                None
+                            }
+                            _ if g12 => None,
+                            _ => Some(line),
+                        }
                     })
                     .collect();
+                g12_unroll_lines += unroll_lines;
                 let stripped = stripped.join("\n");
                 assert!(
                     production.contains(&stripped),
@@ -5108,6 +5124,10 @@ mod tests {
         assert_eq!(
             g12_lines, 6,
             "the BF16 output parameter and two store lines of each of the two entries"
+        );
+        assert_eq!(
+            g12_unroll_lines, 2,
+            "the store-loop guard and its closing brace in hyper_norm_rows"
         );
         // Outside the markers: comments, includes and the one entry wrapper.
         let code: Vec<&str> = outside
@@ -5146,9 +5166,9 @@ mod tests {
     fn g942_conv_fuse_anchor_and_source_are_pinned() {
         use sha2::{Digest, Sha256};
         const SOURCE_SHA256: &str =
-            "f5b22c8d7f590a2e25511cc14d03f321a5072a13dbd617a6f68d1a17a275ca95";
+            "5816707818eef2e6bc65e6ed37c9fcf796bf82748f9d32c856e3e8facd88673d";
         const ANCHOR_SHA256: &str =
-            "acf9d67b83b041cbb291c6df8379cc5b0d1c6c208fa5b13c763f3979b84a7c3a";
+            "de47761cc0305b86b8234cb5cf12c192f10c41bd3cf91fcab7b1a3f97cb7e99a";
         let hex = |bytes: &[u8]| -> String {
             Sha256::digest(bytes)
                 .iter()
