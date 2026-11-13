@@ -1277,10 +1277,16 @@ impl Tokenizer {
                     t.add_bos = true;
                 }
             }
+            // The `generation_config` eos override above can displace the
+            // `<|im_end|>` terminator inferred from the vocab; restore it so
+            // `is_terminator` covers the ChatML turn boundary.
+            t.ensure_chatml_terminator();
             return Ok(t);
         }
         if let Some(gguf_meta) = meta.get("gguf_meta") {
-            return Self::from_gguf_meta_json(gguf_meta);
+            let mut t = Self::from_gguf_meta_json(gguf_meta)?;
+            t.ensure_chatml_terminator();
+            return Ok(t);
         }
         Err(TokenizerError::MetadataMissing {
             field: "tokenizer | gguf_meta",
@@ -1414,6 +1420,36 @@ impl Tokenizer {
     #[inline]
     pub fn is_terminator(&self, id: u32) -> bool {
         id == self.eos_id || self.eot_id == Some(id) || self.gen_eos_ids.contains(&id)
+    }
+
+    /// Keep `<|im_end|>` in the terminator set whenever this vocab carries it.
+    ///
+    /// Qwen ChatML templates close assistant turns with `<|im_end|>`. The
+    /// multi-slot `SlotEngine` (`serve_engine.rs`) stops only on
+    /// [`Self::is_terminator`]; the single-slot AR/DFlash routes and the
+    /// emitter also compare the `<|im_end|>` literal (`im_end_token ==
+    /// Some(next_token)` in `ar.rs`, `qwen_dflash_decoded_eot_from_tokens`,
+    /// `vision.rs`), so they stopped on it already. When the embedded
+    /// `generation_config` pins `eos_token_id` to `<|endoftext|>` (chandra-ocr-2
+    /// does exactly this), the override displaces the `<|im_end|>` eos inferred
+    /// from the vocab, and every turn then decodes on to `max_tokens` after the
+    /// model emitted `<|im_end|>`: the emitter suppresses the marker and reports
+    /// `stop`, while the engine keeps sampling (chandra-ocr-2 q8 served 2026-10-29:
+    /// a two-token "Hello!" cost 31.75 s at `max_tokens=2048`).
+    ///
+    /// Only a degenerate auxiliary slot (none, or a copy of `eos_id`) is
+    /// replaced, so a loader that already resolved a real second terminator is
+    /// left untouched.
+    fn ensure_chatml_terminator(&mut self) {
+        let Some(im_end) = self.token_to_id.get("<|im_end|>").copied() else {
+            return;
+        };
+        if im_end == self.eos_id || self.eot_id == Some(im_end) {
+            return;
+        }
+        if self.eot_id.map_or(true, |eot| eot == self.eos_id) {
+            self.eot_id = Some(im_end);
+        }
     }
 
     /// Look up a special token's ID by literal content. Returns `None`
@@ -4403,6 +4439,116 @@ mod sp_dummy_prefix_tests {
             t.encode("<|channel>thought\n<channel|>The capital of France is"),
             vec![100, 45518, 107, 101, 818, 5279, 529, 7001, 563],
         );
+    }
+
+    /// Qwen ChatML vocab: `<|endoftext|>` (2), `<|im_start|>` (3), `<|im_end|>` (4).
+    fn chatml_tok_json() -> String {
+        serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"<unk>": 0, "h": 5, "i": 6, "\u{2581}": 7},
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 2, "content": "<|endoftext|>", "special": true},
+                {"id": 3, "content": "<|im_start|>", "special": true},
+                {"id": 4, "content": "<|im_end|>", "special": true}
+            ]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn generation_config_eos_keeps_chatml_im_end_terminator() {
+        // chandra-ocr-2 ships exactly this: generation_config pins eos to
+        // `<|endoftext|>` while the model emits `<|im_end|>` at turn ends.
+        // The engine's only stop check is `is_terminator`, so losing
+        // `<|im_end|>` here decodes every turn to `max_tokens`.
+        let meta = serde_json::json!({
+            "architecture": "qwen3_5",
+            "tokenizer": chatml_tok_json(),
+            "generation_config": {"eos_token_id": 2}
+        })
+        .to_string();
+        let t = Tokenizer::from_hfq_metadata(&meta).expect("meta parses");
+        assert_eq!(t.eos_id, 2, "generation_config eos stays authoritative");
+        assert!(t.is_terminator(2));
+        assert!(t.is_terminator(4), "<|im_end|> must terminate generation");
+        assert!(!t.is_terminator(3), "<|im_start|> is not a terminator");
+    }
+
+    #[test]
+    fn without_generation_config_im_end_is_eos_and_endoftext_auxiliary() {
+        let meta = serde_json::json!({
+            "architecture": "qwen3_5",
+            "tokenizer": chatml_tok_json()
+        })
+        .to_string();
+        let t = Tokenizer::from_hfq_metadata(&meta).expect("meta parses");
+        assert_eq!(t.eos_id, 4);
+        assert!(t.is_terminator(4));
+        assert!(t.is_terminator(2));
+    }
+
+    /// The GGUF-side metadata branch (`gguf_meta.tokenizer.ggml.*`) takes the
+    /// same repair: ggml pins eos to `<|endoftext|>` and resolves no auxiliary
+    /// terminator when it equals eos, so `<|im_end|>` has to come back or every
+    /// ChatML turn on a GGUF-converted model decodes to `max_tokens`.
+    #[test]
+    fn gguf_meta_branch_keeps_chatml_im_end_terminator() {
+        let meta = serde_json::json!({
+            "gguf_meta": {
+                "tokenizer.ggml.model": "llama",
+                "tokenizer.ggml.tokens": [
+                    "<unk>", "<s>", "</s>", "<|endoftext|>", "<|im_start|>", "<|im_end|>"
+                ],
+                "tokenizer.ggml.eos_token_id": 3,
+                "tokenizer.ggml.bos_token_id": 1
+            }
+        })
+        .to_string();
+        let t = Tokenizer::from_hfq_metadata(&meta).expect("meta parses");
+        assert_eq!(t.eos_id, 3, "ggml eos stays authoritative");
+        assert!(t.is_terminator(3));
+        assert!(
+            t.is_terminator(5),
+            "<|im_end|> must terminate generation on the gguf branch too"
+        );
+        assert!(!t.is_terminator(4), "<|im_start|> is not a terminator");
+    }
+
+    /// A loader-resolved second terminator is never displaced. Here
+    /// `generation_config` pins eos to `<|eot_id|>` (5) while
+    /// `from_hf_json` resolved `<|endoftext|>` (2) as the auxiliary slot and
+    /// `<|im_end|>` (4) is present but distinct from both: the repair must
+    /// leave `eot_id` at 2 rather than overwrite it with 4.
+    #[test]
+    fn a_real_second_terminator_is_not_displaced_by_im_end() {
+        let tok = serde_json::json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {"<unk>": 0, "h": 6, "i": 7, "\u{2581}": 8},
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 2, "content": "<|endoftext|>", "special": true},
+                {"id": 3, "content": "<|im_start|>", "special": true},
+                {"id": 4, "content": "<|im_end|>", "special": true},
+                {"id": 5, "content": "<|eot_id|>", "special": true}
+            ]
+        })
+        .to_string();
+        let meta = serde_json::json!({
+            "architecture": "qwen3_5",
+            "tokenizer": tok,
+            "generation_config": {"eos_token_id": 5}
+        })
+        .to_string();
+        let t = Tokenizer::from_hfq_metadata(&meta).expect("meta parses");
+        assert_eq!(t.eos_id, 5);
+        assert_eq!(t.eot_id, Some(2), "the resolved second terminator is kept");
+        assert!(t.is_terminator(5));
+        assert!(t.is_terminator(2));
     }
 
     #[test]
