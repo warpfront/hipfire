@@ -408,11 +408,64 @@ fixture at 32K context the changelog-reported figures are EP2: 30 of 49 routed
 layers resident per rank (19 host-mapped), +0.34 GiB headroom; EP4: 49 of 49,
 +3.77 GiB headroom.
 
-**Exactness.** On the evidence below, EP output on exact gfx1201 is
-bit-identical to the same build on one card, not merely close. The evidence
-(`fn_ep_oracle` and the serve harnesses, 2×/4× R9700, pinned Flash-Next XTS
-sha256 prefix `8b15b6fe`; fixture-bound) covers **exact gfx1201 at EP2 and EP4
-only**; it is not evidence for gfx1100 or for other rank counts:
+**Exactness.** Flash-Next EP on exact gfx1201 has two routes, and only one of
+them is bit-identical to one card.
+
+- **Experts sharded, trunk replicated (EP4, and EP2 with
+  `HIPFIRE_QWEN4_EP_TRUNK_SHARD=0`): bit-identical to the same build on one
+  card**, not merely close. Re-measured on current beta (Flash-Next GPTQ3, two
+  R9700, shard off): every logits row over three prompts (163 of 163), every rank
+  mirror, every Hyper-Connection stream of a 31-row prefill chunk at the dumped
+  layers (0-3, 23, 47) and every state digest row equal one card.
+- **Default two-card EP2 (`topology.ep = 2` over exactly two gfx1201 cards): the
+  TP2 trunk shard, on since v0.4.5, which is NOT bit-identical to one card, by
+  design.** Each rank computes half of the K range of every trunk block output
+  (GDN `out_proj`, QSA `o_proj`, shared-expert down, and its owned routed
+  experts). The fused all-reduce + Hyper-Connection write
+  (`ar_hc_write_gfx1201`) rounds each rank's f32 partial to bf16 once and folds
+  `m = bf16(p0) + bf16(p1)`; one card rounds the full f32 sum once. The first
+  differing bits are at layer 0's GDN `out_proj` fold: `p0 + p1` in f32 equals
+  the single card's output to 3.6e-7, but the bf16 rounding of the partials
+  moves elements by up to 2.0e-3 and changes 34.6% of the bf16 values that
+  enter the stream. Routed top-k flips and 48 layers amplify that to a max abs
+  logit difference of 2 to 4.5 against one card, and a greedy decode can leave
+  the one-card token stream within the first tokens (the first token of a
+  near-tie prompt reorders). The route's contract is therefore not byte
+  equality but: (1) rank 0 and rank 1 hold equal logits and state, and a run
+  repeats byte for byte; (2) the per-element fold bound
+  `|m - (p0 + p1)| <= (2^-8 + 2^-23)(|p0| + |p1|)`; (3) a KLD gate. For
+  bit-identity checks set **`HIPFIRE_QWEN4_EP_TRUNK_SHARD=0`** on the EP arm
+  (developer variable, no typed key; it restores plain EP2). The device-mesh
+  cell `g5-qwen4-ep2-vs-single-physical` sets it, and every exactness arm of
+  `scripts/fn-ep-gate.sh` pins it (see the community gate below); for
+  `fn_ep_oracle` / `scripts/fn_ep_compare.py` run by hand, set it yourself. On
+  gfx1100 and at other rank counts the shard does not apply and EP is the first
+  bullet's route.
+
+  Measured size (Flash-Next GPTQ3, code24 24x512 against the BF16 teacher,
+  served decode, 6,120 scored rows, isolated `HIPFIRE_HOME`, one fresh process
+  per arm):
+
+  | arm | mean KLD | top-1 | PPL |
+  |---|---|---|---|
+  | one card | 0.087458 | 0.9243 | 4.7576 |
+  | EP2, shard off | 0.087458 (same logits hash as one card) | 0.9243 | 4.7576 |
+  | EP2, default (shard on) | 0.089191 | 0.9206 | 4.8663 |
+
+  Two cards default minus one card, paired per chunk: KLD d = +0.0017, 95% CI
+  [-0.0025, +0.0058] (2.0% of the one-card KLD, the CI includes 0, higher on 14
+  of 24 chunks); NLL of the reference text d = +0.0226, CI [+0.0026, +0.0439],
+  which excludes 0 (PPL +2.3%, top-1 against the teacher -0.37 points). The
+  design gate of the shard was d <= +0.0003 against EP2 on the point estimate;
+  on the mq4-xts fixture it measured the other sign (code24 KLD 0.082302 ->
+  0.077703), and one 24-chunk run on GPTQ3 cannot separate a small real cost
+  from the noise of a fixed rounding perturbation.
+
+The evidence below is for the replicated-trunk route (`fn_ep_oracle` and the
+serve harnesses, 2×/4× R9700, pinned Flash-Next XTS sha256 prefix `8b15b6fe`;
+fixture-bound). It covers **exact gfx1201 at EP2 and EP4 only**; it is not
+evidence for gfx1100 or for other rank counts, and it does not describe the
+default two-card EP2 route above:
 
 - EP2 and EP4 AR decode: logits and per-request state match one card at every
   step over 256 greedy tokens (ctx 512, 8192, 32768).
@@ -883,7 +936,14 @@ checkout it builds the binaries, runs one card (`topology.ep = 1`) and N cards
 500 and about 4,400 tokens, 128 greedy tokens, state digests at steps 1, 64 and
 128), and `scripts/fn_ep_compare.py` compares the arms byte for byte: the
 tokens, the rank-0 logits sha256, every peer rank's logits mirror sha256 and
-every rank's state digests must equal the single card's. It then times
+every rank's state digests must equal the single card's. Every oracle arm of
+`--mode ep` and `--mode pp` pins `HIPFIRE_QWEN4_EP_TRUNK_SHARD=0` (the default
+two-gfx1201 EP2 is the TP2 trunk shard, which is not byte-equal to one card by
+design; see [Exactness](#flash-next-ep-enabling-and-status)), and `EXTRA_ENV`
+may not set it. The speed cells and the `--mode reserve` arms clear an inherited
+value and run the shipped default route, so on two gfx1201 cards the timed EP2
+is the shard route; the gate has no arm that compares the shard route with one
+card. It then times
 `hipfire bench --spec off` decode and prefill (3 fresh processes per arm by
 default, arms interleaved). Each arm runs in a private HOME holding only
 `topology.ep` unless `--no-isolate` is given.

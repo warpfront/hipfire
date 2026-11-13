@@ -2214,15 +2214,15 @@
    "commands": {
     "negative": [],
     "positive": [
-     "HIPFIRE_TOPOLOGY_EP=1 cargo run --release --locked -p hipfire-loader --features lab --example fn_ep_oracle -- --model $MODELS_DIR/qwen3.8-flash-next-gptq3.mq4 --prompt-file benchmarks/prompts/bare_factual.txt --prompt-file benchmarks/prompts/glimmer_prefill_256.txt --max-seq 4096 --tokens 64 --state-steps 1,9,32,64 --skip-model-hash --out $OUT/g5-qwen4/single --arm single",
-     "HIPFIRE_TOPOLOGY_EP=2 cargo run --release --locked -p hipfire-loader --features lab --example fn_ep_oracle -- --model $MODELS_DIR/qwen3.8-flash-next-gptq3.mq4 --prompt-file benchmarks/prompts/bare_factual.txt --prompt-file benchmarks/prompts/glimmer_prefill_256.txt --max-seq 4096 --tokens 64 --state-steps 1,9,32,64 --skip-model-hash --out $OUT/g5-qwen4/ep2 --arm ep2",
+     "HIPFIRE_TOPOLOGY_EP=1 cargo run --release --locked -p hipfire-loader --features lab --example fn_ep_oracle -- --model $MODELS_DIR/qwen3.8-flash-next-gptq3.mq4 --prompt-file benchmarks/prompts/bare_factual.txt --prompt-file benchmarks/prompts/glimmer_prefill_256.txt --max-seq 4096 --tokens 64 --state-steps 1,9,32,64 --skip-model-hash --spec off --out $OUT/g5-qwen4/single --arm single",
+     "HIPFIRE_TOPOLOGY_EP=2 cargo run --release --locked -p hipfire-loader --features lab --example fn_ep_oracle -- --model $MODELS_DIR/qwen3.8-flash-next-gptq3.mq4 --prompt-file benchmarks/prompts/bare_factual.txt --prompt-file benchmarks/prompts/glimmer_prefill_256.txt --max-seq 4096 --tokens 64 --state-steps 1,9,32,64 --skip-model-hash --spec off --out $OUT/g5-qwen4/ep2 --arm ep2",
      "python3 scripts/fn_ep_compare.py $OUT/g5-qwen4/single $OUT/g5-qwen4/ep2 --expect-ranks 2"
     ]
    },
    "env": {
     "HIPFIRE_DETERMINISTIC": "1",
-    "HIPFIRE_MTP_MODE": "off",
-    "HIPFIRE_PREFILL_CHUNK_ROWS": "2048"
+    "HIPFIRE_PREFILL_CHUNK_ROWS": "2048",
+    "HIPFIRE_QWEN4_EP_TRUNK_SHARD": "0"
    },
    "fixture_files": [
     "$MODELS_DIR/qwen3.8-flash-next-gptq3.mq4"
@@ -2237,7 +2237,7 @@
     "kind": "none",
     "note": "the comparator fails on any differing logits/mirror/state byte"
    },
-   "note": "#666 G5 physical EP2 on the Flash-Next (Qwen4) expert-parallel route, default host barrier: every committed rank-0 logits row (sha256, token) byte-equal to the single card at steps 0..64, every rank mirror equal, per-rank state digests equal at steps 1,9,32,64; no tolerance. HIPFIRE_MTP_MODE=off keeps the single card from reserving the native-MTP capture ring (extra digest rows an EP load never has). Covers the Qwen4 EP route only; the Qwen3.5 MoE EP route stays g5-ep2-vs-single-physical.",
+   "note": "#666 G5 physical EP2 on the Flash-Next (Qwen4) expert-parallel route, default host barrier, trunk shard off: every committed rank-0 logits row (sha256, token) byte-equal to the single card at steps 0..64, every rank mirror equal, per-rank state digests equal at steps 1,9,32,64; no tolerance. HIPFIRE_QWEN4_EP_TRUNK_SHARD=0 is required for byte equality: the default EP2 over two gfx1201 cards is the TP2 trunk shard, which rounds each rank's f32 partial to bf16 before the fold and is not byte-equal to one card by design (docs/multi-gpu.md, Exactness). --spec off loads both arms without the native MTP head: fn_ep_oracle builds its own load config and never reads HIPFIRE_MTP_MODE, and an unset speculation.mtp (auto) attaches the head on the single card, whose capture-ring digest rows an EP load never has. Covers the Qwen4 EP route only; the Qwen3.5 MoE EP route stays g5-ep2-vs-single-physical.",
    "predicate": {
     "forbid": [
      "FAIL fn_ep_compare"
