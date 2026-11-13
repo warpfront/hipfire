@@ -180,7 +180,7 @@ fn hash_mismatch_degrades_resume_to_an_earlier_checkpoint_then_cold() {
     ];
     let positions = attested_checkpoint_positions(&ring, &prior);
     assert_eq!(positions, vec![128, 256, 360]);
-    let plan = plan_from_rendered(&prior, rendered.clone(), true, &positions, true, "test");
+    let plan = plan_from_rendered(&prior, rendered.clone(), true, &positions, "test");
     assert!(plan.cache_hit);
     assert_eq!(
         plan.resume_from,
@@ -194,7 +194,7 @@ fn hash_mismatch_degrades_resume_to_an_earlier_checkpoint_then_cold() {
     let only_bad = [(320, poisoned(320))];
     let positions = attested_checkpoint_positions(&only_bad, &prior);
     assert!(positions.is_empty());
-    let plan = plan_from_rendered(&prior, rendered.clone(), true, &positions, true, "test");
+    let plan = plan_from_rendered(&prior, rendered.clone(), true, &positions, "test");
     assert!(!plan.cache_hit);
     assert_eq!(plan.resume_from, None);
     assert_eq!(plan.start_pos, 0);
@@ -230,7 +230,7 @@ fn kept_cancel_prefix_resumes_where_the_old_wipe_cold_prefilled() {
     let mut rendered = prompt.clone();
     rendered.extend_from_slice(&[9001, 9002]);
     rendered.extend_from_slice(&[6000, 6001, 6002]);
-    let plan = plan_from_rendered(&kept, rendered.clone(), true, &positions, true, "test");
+    let plan = plan_from_rendered(&kept, rendered.clone(), true, &positions, "test");
     assert!(
         plan.cache_hit,
         "a kept conversation resumes instead of prefilling cold"
@@ -239,7 +239,7 @@ fn kept_cancel_prefix_resumes_where_the_old_wipe_cold_prefilled() {
     assert_eq!(plan.cached_tokens, 256);
 
     // The old full reset left an empty conversation: nothing to hit or resume.
-    let wiped = plan_from_rendered(&[], rendered.clone(), false, &[], true, "test");
+    let wiped = plan_from_rendered(&[], rendered.clone(), false, &[], "test");
     assert!(!wiped.cache_hit);
     assert_eq!(wiped.cached_tokens, 0);
     assert_eq!(wiped.new_tokens, rendered);
