@@ -223,3 +223,30 @@ fn unverified_rows_decode_but_never_encode() {
     }
     eprintln!("{seen} unverified CDNA3 rows decoded");
 }
+
+/// The F16/F32 compare family is typed (VOPC and VOP3), never the generated fallback.
+#[test]
+fn cdna3_float_compare_forms_decode_typed() {
+    let mut typed = 0;
+    for form in xml::forms(Isa::Cdna3) {
+        let n = &form.name;
+        let float_cmp = n.starts_with("V_CMP")
+            && !n.contains("_CLASS_")
+            && (n.ends_with("_F16") || n.ends_with("_F32"));
+        if !float_cmp || !form.verification.is_verified() || form.sample.is_empty() {
+            continue;
+        }
+        let (inst, _) = Inst::decode(Arch::Gfx942, form.sample)
+            .unwrap_or_else(|e| panic!("{n} {}: {e}", form.encoding));
+        assert!(
+            matches!(inst, Inst::Vopc(_) | Inst::Vop3(_)),
+            "{n} {}: {inst:?}",
+            form.encoding
+        );
+        typed += 1;
+    }
+    assert!(
+        typed >= 128,
+        "all 64 operations need both VOPC and VOP3 rows: {typed}"
+    );
+}

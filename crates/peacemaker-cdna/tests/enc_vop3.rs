@@ -302,7 +302,7 @@ fn opcode_table_is_complete_unique_and_round_trips() {
         count(|op| matches!(op, Vop3Op::Only(_))),
         Vop3OnlyOp::ALL.len()
     );
-    assert_eq!(ops.len(), 36 + 43 + 39 + 55);
+    assert_eq!(ops.len(), 88 + 43 + 39 + 55);
 
     let mut opcodes = HashSet::new();
     let mut names = HashSet::new();
@@ -1671,4 +1671,58 @@ fn llvm_has_no_64_bit_form_of_the_excluded_opcodes() {
             "opcode {opcode:#x}"
         );
     }
+}
+
+/// All 64 F16/F32 compares in VOP3: typed round trip, EXEC only for CMPX,
+/// neg/abs/clamp legal, no omod / op_sel, a VGPR destination is refused.
+#[test]
+fn float_compare_family_vop3_legality_and_effects() {
+    let exec = span(RegFile::Exec, 0, 2);
+    let mut n = 0;
+    for &k in VopcOp::ALL.iter().filter(|k| k.float_compare().is_some()) {
+        n += 1;
+        let op = Vop3Op::C(k);
+        assert_eq!(op.widths(), (2, 1, 1, 0), "{k:?}");
+        assert_eq!(op.opcode(ARCH), k.opcode(ARCH).map(u16::from), "{k:?}");
+        let base = bin(op, sg(10), v(1), v(2));
+        let m = op.mods();
+        assert_eq!(
+            (m.neg, m.abs, m.clamp, m.omod, m.op_sel),
+            (0b011, 0b011, true, false, 0)
+        );
+        let ok = Vop3 {
+            neg: 0b11,
+            abs: 0b11,
+            clamp: true,
+            ..base.clone()
+        };
+        let mut w = Vec::new();
+        ok.encode(ARCH, &mut w).unwrap();
+        let (back, len) = Inst::decode(ARCH, &w).unwrap();
+        assert_eq!((len, back), (w.len(), Inst::Vop3(ok)), "{k:?}");
+        for bad in [
+            Vop3 {
+                omod: 1,
+                ..base.clone()
+            },
+            Vop3 {
+                op_sel: 1,
+                ..base.clone()
+            },
+            Vop3 {
+                op_sel: 8,
+                ..base.clone()
+            },
+            bin(op, v(4), v(1), v(2)),
+        ] {
+            assert!(!encode_err(&bad).is_empty(), "{k:?}");
+        }
+        let fp = base.footprint();
+        assert!(fp.defs.contains(&span(RegFile::Sgpr, 10, 2)), "{k:?}");
+        assert!(fp.uses.contains(&exec), "{k:?}");
+        assert_eq!(fp.defs.contains(&exec), k.is_cmpx(), "{k:?}");
+        let fp = bin(op, Src::VccLo, v(1), v(2)).footprint();
+        assert!(fp.defs.contains(&span(RegFile::Vcc, 0, 2)), "{k:?}");
+    }
+    assert_eq!(n, 64);
 }

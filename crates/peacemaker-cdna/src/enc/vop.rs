@@ -169,10 +169,62 @@ op_table!(VopcOp {
     CmpxLtI32,
     CmpxGtF32,
     CmpxLtF32,
+    CmpFF16,
+    CmpLtF16,
+    CmpEqF16,
+    CmpLeF16,
+    CmpGtF16,
+    CmpLgF16,
+    CmpGeF16,
+    CmpOF16,
+    CmpUF16,
+    CmpNgeF16,
+    CmpNlgF16,
+    CmpNgtF16,
+    CmpNleF16,
+    CmpNeqF16,
+    CmpNltF16,
+    CmpTruF16,
+    CmpxFF16,
+    CmpxLtF16,
+    CmpxEqF16,
+    CmpxLeF16,
+    CmpxGtF16,
+    CmpxLgF16,
+    CmpxGeF16,
+    CmpxOF16,
+    CmpxUF16,
+    CmpxNgeF16,
+    CmpxNlgF16,
+    CmpxNgtF16,
+    CmpxNleF16,
+    CmpxNeqF16,
+    CmpxNltF16,
+    CmpxTruF16,
+    CmpFF32,
+    CmpNgeF32,
+    CmpNlgF32,
+    CmpNleF32,
+    CmpTruF32,
+    CmpxFF32,
+    CmpxEqF32,
+    CmpxLeF32,
+    CmpxLgF32,
+    CmpxGeF32,
+    CmpxOF32,
+    CmpxUF32,
+    CmpxNgeF32,
+    CmpxNlgF32,
+    CmpxNgtF32,
+    CmpxNleF32,
+    CmpxNeqF32,
+    CmpxNltF32,
+    CmpxTruF32,
     CmpEqU64,
     CmpNeU64,
     CmpGtI64,
     CmpGeI64,
+    CmpGeU64,
 });
 
 impl Vop1Op {
@@ -233,7 +285,7 @@ impl VopcOp {
     pub fn src_dwords(self) -> u8 {
         if matches!(
             self,
-            Self::CmpEqU64 | Self::CmpNeU64 | Self::CmpGtI64 | Self::CmpGeI64
+            Self::CmpEqU64 | Self::CmpNeU64 | Self::CmpGtI64 | Self::CmpGeI64 | Self::CmpGeU64
         ) {
             2
         } else {
@@ -245,17 +297,35 @@ impl VopcOp {
     /// their comparison ... to both an SGPR (or VCC) and the EXEC mask";
     /// Table 25 p.36 "Write VCC and exec").
     pub fn is_cmpx(self) -> bool {
-        matches!(
-            self,
-            Self::CmpxEqU32
-                | Self::CmpxNeU32
-                | Self::CmpxGtU32
-                | Self::CmpxLtU32
-                | Self::CmpxGtI32
-                | Self::CmpxLtI32
-                | Self::CmpxGtF32
-                | Self::CmpxLtF32
-        )
+        self.float_cmpx()
+            || matches!(
+                self,
+                Self::CmpxEqU32
+                    | Self::CmpxNeU32
+                    | Self::CmpxGtU32
+                    | Self::CmpxLtU32
+                    | Self::CmpxGtI32
+                    | Self::CmpxLtI32
+            )
+    }
+    /// The F16/F32 compare family (all sixteen predicates, CMP and CMPX):
+    /// `(operand width in bits, predicate)`, where the predicate is the low
+    /// nibble of the gfx942 opcode (0 F, 1 LT, 2 EQ, 3 LE, 4 GT, 5 LG, 6 GE,
+    /// 7 O, 8 U, 9 NGE, 10 NLG, 11 NGT, 12 NLE, 13 NEQ, 14 NLT, 15 TRU). The
+    /// opcode field is `v_cmp_*_f16` 32..=47, `v_cmpx_*_f16` 48..=63,
+    /// `v_cmp_*_f32` 64..=79, `v_cmpx_*_f32` 80..=95 (CDNA3 ISA §13.3.3).
+    /// `v_cmp_class_f32` and the integer compares are not in the family.
+    pub fn float_compare(self) -> Option<(u8, u8)> {
+        let opcode = self.opcode(Arch::Gfx942)?;
+        match opcode {
+            32..=63 => Some((16, opcode & 15)),
+            64..=95 => Some((32, opcode & 15)),
+            _ => None,
+        }
+    }
+    /// `v_cmpx_*_f16` / `v_cmpx_*_f32` (opcode bit 4 within the float family).
+    fn float_cmpx(self) -> bool {
+        self.float_compare().is_some() && self.opcode(Arch::Gfx942).is_some_and(|o| o & 16 != 0)
     }
 }
 
@@ -612,6 +682,8 @@ impl VopcOp {
     fn lit_ty(self) -> LitTy {
         if self.src_dwords() == 2 {
             LitTy::I64
+        } else if self.float_compare().is_some_and(|(w, _)| w == 16) {
+            LitTy::F16
         } else {
             LitTy::B32
         }
@@ -620,19 +692,7 @@ impl VopcOp {
     fn mods(self) -> (Mods, Mods) {
         match self {
             Self::CmpClassF32 => (Mods::Float, Mods::Int),
-            Self::CmpLtF32
-            | Self::CmpEqF32
-            | Self::CmpLeF32
-            | Self::CmpGtF32
-            | Self::CmpLgF32
-            | Self::CmpGeF32
-            | Self::CmpOF32
-            | Self::CmpUF32
-            | Self::CmpNeqF32
-            | Self::CmpNgtF32
-            | Self::CmpNltF32
-            | Self::CmpxGtF32
-            | Self::CmpxLtF32 => (Mods::Float, Mods::Float),
+            _ if self.float_compare().is_some() => (Mods::Float, Mods::Float),
             _ => (Mods::Int, Mods::Int),
         }
     }
@@ -1985,10 +2045,62 @@ impl VopcOp {
                 Self::CmpxLtI32 => 209,
                 Self::CmpxGtF32 => 84,
                 Self::CmpxLtF32 => 81,
+                Self::CmpFF16 => 32,
+                Self::CmpLtF16 => 33,
+                Self::CmpEqF16 => 34,
+                Self::CmpLeF16 => 35,
+                Self::CmpGtF16 => 36,
+                Self::CmpLgF16 => 37,
+                Self::CmpGeF16 => 38,
+                Self::CmpOF16 => 39,
+                Self::CmpUF16 => 40,
+                Self::CmpNgeF16 => 41,
+                Self::CmpNlgF16 => 42,
+                Self::CmpNgtF16 => 43,
+                Self::CmpNleF16 => 44,
+                Self::CmpNeqF16 => 45,
+                Self::CmpNltF16 => 46,
+                Self::CmpTruF16 => 47,
+                Self::CmpxFF16 => 48,
+                Self::CmpxLtF16 => 49,
+                Self::CmpxEqF16 => 50,
+                Self::CmpxLeF16 => 51,
+                Self::CmpxGtF16 => 52,
+                Self::CmpxLgF16 => 53,
+                Self::CmpxGeF16 => 54,
+                Self::CmpxOF16 => 55,
+                Self::CmpxUF16 => 56,
+                Self::CmpxNgeF16 => 57,
+                Self::CmpxNlgF16 => 58,
+                Self::CmpxNgtF16 => 59,
+                Self::CmpxNleF16 => 60,
+                Self::CmpxNeqF16 => 61,
+                Self::CmpxNltF16 => 62,
+                Self::CmpxTruF16 => 63,
+                Self::CmpFF32 => 64,
+                Self::CmpNgeF32 => 73,
+                Self::CmpNlgF32 => 74,
+                Self::CmpNleF32 => 76,
+                Self::CmpTruF32 => 79,
+                Self::CmpxFF32 => 80,
+                Self::CmpxEqF32 => 82,
+                Self::CmpxLeF32 => 83,
+                Self::CmpxLgF32 => 85,
+                Self::CmpxGeF32 => 86,
+                Self::CmpxOF32 => 87,
+                Self::CmpxUF32 => 88,
+                Self::CmpxNgeF32 => 89,
+                Self::CmpxNlgF32 => 90,
+                Self::CmpxNgtF32 => 91,
+                Self::CmpxNleF32 => 92,
+                Self::CmpxNeqF32 => 93,
+                Self::CmpxNltF32 => 94,
+                Self::CmpxTruF32 => 95,
                 Self::CmpEqU64 => 234,
                 Self::CmpNeU64 => 237,
                 Self::CmpGtI64 => 228,
                 Self::CmpGeI64 => 230,
+                Self::CmpGeU64 => 238,
             }),
             Arch::Gfx950 => None,
         }
@@ -2028,10 +2140,62 @@ impl VopcOp {
             Self::CmpxLtI32 => "v_cmpx_lt_i32",
             Self::CmpxGtF32 => "v_cmpx_gt_f32",
             Self::CmpxLtF32 => "v_cmpx_lt_f32",
+            Self::CmpFF16 => "v_cmp_f_f16",
+            Self::CmpLtF16 => "v_cmp_lt_f16",
+            Self::CmpEqF16 => "v_cmp_eq_f16",
+            Self::CmpLeF16 => "v_cmp_le_f16",
+            Self::CmpGtF16 => "v_cmp_gt_f16",
+            Self::CmpLgF16 => "v_cmp_lg_f16",
+            Self::CmpGeF16 => "v_cmp_ge_f16",
+            Self::CmpOF16 => "v_cmp_o_f16",
+            Self::CmpUF16 => "v_cmp_u_f16",
+            Self::CmpNgeF16 => "v_cmp_nge_f16",
+            Self::CmpNlgF16 => "v_cmp_nlg_f16",
+            Self::CmpNgtF16 => "v_cmp_ngt_f16",
+            Self::CmpNleF16 => "v_cmp_nle_f16",
+            Self::CmpNeqF16 => "v_cmp_neq_f16",
+            Self::CmpNltF16 => "v_cmp_nlt_f16",
+            Self::CmpTruF16 => "v_cmp_tru_f16",
+            Self::CmpxFF16 => "v_cmpx_f_f16",
+            Self::CmpxLtF16 => "v_cmpx_lt_f16",
+            Self::CmpxEqF16 => "v_cmpx_eq_f16",
+            Self::CmpxLeF16 => "v_cmpx_le_f16",
+            Self::CmpxGtF16 => "v_cmpx_gt_f16",
+            Self::CmpxLgF16 => "v_cmpx_lg_f16",
+            Self::CmpxGeF16 => "v_cmpx_ge_f16",
+            Self::CmpxOF16 => "v_cmpx_o_f16",
+            Self::CmpxUF16 => "v_cmpx_u_f16",
+            Self::CmpxNgeF16 => "v_cmpx_nge_f16",
+            Self::CmpxNlgF16 => "v_cmpx_nlg_f16",
+            Self::CmpxNgtF16 => "v_cmpx_ngt_f16",
+            Self::CmpxNleF16 => "v_cmpx_nle_f16",
+            Self::CmpxNeqF16 => "v_cmpx_neq_f16",
+            Self::CmpxNltF16 => "v_cmpx_nlt_f16",
+            Self::CmpxTruF16 => "v_cmpx_tru_f16",
+            Self::CmpFF32 => "v_cmp_f_f32",
+            Self::CmpNgeF32 => "v_cmp_nge_f32",
+            Self::CmpNlgF32 => "v_cmp_nlg_f32",
+            Self::CmpNleF32 => "v_cmp_nle_f32",
+            Self::CmpTruF32 => "v_cmp_tru_f32",
+            Self::CmpxFF32 => "v_cmpx_f_f32",
+            Self::CmpxEqF32 => "v_cmpx_eq_f32",
+            Self::CmpxLeF32 => "v_cmpx_le_f32",
+            Self::CmpxLgF32 => "v_cmpx_lg_f32",
+            Self::CmpxGeF32 => "v_cmpx_ge_f32",
+            Self::CmpxOF32 => "v_cmpx_o_f32",
+            Self::CmpxUF32 => "v_cmpx_u_f32",
+            Self::CmpxNgeF32 => "v_cmpx_nge_f32",
+            Self::CmpxNlgF32 => "v_cmpx_nlg_f32",
+            Self::CmpxNgtF32 => "v_cmpx_ngt_f32",
+            Self::CmpxNleF32 => "v_cmpx_nle_f32",
+            Self::CmpxNeqF32 => "v_cmpx_neq_f32",
+            Self::CmpxNltF32 => "v_cmpx_nlt_f32",
+            Self::CmpxTruF32 => "v_cmpx_tru_f32",
             Self::CmpEqU64 => "v_cmp_eq_u64",
             Self::CmpNeU64 => "v_cmp_ne_u64",
             Self::CmpGtI64 => "v_cmp_gt_i64",
             Self::CmpGeI64 => "v_cmp_ge_i64",
+            Self::CmpGeU64 => "v_cmp_ge_u64",
         }
     }
 }
