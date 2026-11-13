@@ -1008,11 +1008,14 @@ fn require_batchable_moe_ffn(gpu: &Gpu, ffn: &MoeFfnWeights) -> HipResult<()> {
 /// 16 rows and a PM4 recording is pinned to its base kernel, so a 1..4 row
 /// slot step was paying for an empty tile. The x-batch GEMV is the sequential
 /// accumulator with each weight row decoded once for up to four activations.
-
-fn slots_few_mq4v2(dt: DType, k: usize, n: usize) -> bool {
+///
+/// Exact gfx1100 only, shared with the `rdna-compute` few-row arms the bodies
+/// below call: gfx1151/gfx1201 keep the fused WMMA path and its bytes.
+fn slots_few_mq4v2(gpu: &Gpu, dt: DType, k: usize, n: usize) -> bool {
     dt == DType::MQ4G256V2
         && (1..=rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&n)
         && k.is_multiple_of(256)
+        && gpu.arch_caps.is_gfx1100()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1386,6 +1389,24 @@ impl CohortDecline {
     }
 }
 
+/// The checks that need nothing from the weights: live rows and arch.
+///
+/// They are separated out because [`CohortFacts`] costs three passes over the
+/// routed experts (per-expert down scales, uniform shape, gate_up scale) and a
+/// step that cannot be admitted must not pay that. `cohort_admit` runs them
+/// first for the unit-test contract; `slots_moe_cohort` runs them *before*
+/// building the facts, so a gfx1151/gfx1201 or single-row step — every step on
+/// those arches — pays four comparisons, not 768.
+pub(crate) fn cohort_precheck(n: usize, gfx1100: bool) -> Result<(), CohortDecline> {
+    if !matches!(n, 2..=4) {
+        return Err(CohortDecline::Rows);
+    }
+    if !gfx1100 {
+        return Err(CohortDecline::Arch);
+    }
+    Ok(())
+}
+
 /// Admit or refuse the merged multi-slot MoE for one layer.
 ///
 /// The merged program runs one rotate per row and one `_slots` GEMV pair for
@@ -1397,12 +1418,7 @@ impl CohortDecline {
 /// indexed silu+rotate *before* the FWHT, which is why it is the one scale this
 /// program can carry today.
 pub(crate) fn cohort_admit(f: &CohortFacts) -> Result<CohortPlan, CohortDecline> {
-    if !(2..=4).contains(&f.n) {
-        return Err(CohortDecline::Rows);
-    }
-    if !f.gfx1100 {
-        return Err(CohortDecline::Arch);
-    }
+    cohort_precheck(f.n, f.gfx1100)?;
     if f.dim != 2048 || f.mi != 512 || f.smi != 512 || f.k_top != 8 || f.n_exp != 256 {
         return Err(CohortDecline::Shape);
     }
@@ -1464,7 +1480,30 @@ pub(crate) fn cohort_admit(f: &CohortFacts) -> Result<CohortPlan, CohortDecline>
 
 /// `HIPFIRE_MOE_SLOTS_COHORT=0` forces the per-slot MoE. Read once per process;
 /// a deliberate opt-out is silent (no decline line).
+/// Oracle/test hook: `-1` unset, `0` off, `1` on. Process-global so one
+/// process can A/B the merged program against the per-lane one on the same
+/// composition (the env var is read once).
+static SLOTS_COHORT_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Force the merged multi-slot MoE program on (`Some(true)`), off
+/// (`Some(false)`) or back to `HIPFIRE_MOE_SLOTS_COHORT` (`None`). Same shape
+/// as `rdna_compute::prefill_invariant::set_qwen4_wide_verify_rows_override`:
+/// a lab/oracle hook, not a production route. `scripts/check_slots_moe_cohort.py`
+/// drives it through the engine A/B.
+pub fn set_slots_moe_cohort_override(on: Option<bool>) {
+    SLOTS_COHORT_OVERRIDE.store(match on {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    }, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn slots_cohort_enabled() -> bool {
+    match SLOTS_COHORT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         hipfire_config::developer_var("HIPFIRE_MOE_SLOTS_COHORT").as_deref() != Ok("0")
     });
@@ -1473,6 +1512,21 @@ fn slots_cohort_enabled() -> bool {
 
 /// One line per process for the first declined layer: a model that misses the
 /// merged program must be diagnosable from its own serve log.
+/// One line per process for the first admitted layer. The decline path is
+/// logged the same way; without this, "the merged program ran" has no
+/// observable signal except its launch names, and `scripts/check_slots_moe_cohort.py`
+/// needs exactly that to prove each arm did what it claims.
+fn log_cohort_admit_once(layer: u16, plan: CohortPlan) {
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if LOGGED.set(()).is_ok() {
+        eprintln!(
+            "[hipfire] slots MoE cohort: merged program admitted on layer {} \
+             (down_awq={})",
+            layer, plan.down_awq
+        );
+    }
+}
+
 fn log_cohort_decline_once(layer: u16, decline: CohortDecline) {
     static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if LOGGED.set(()).is_ok() {
@@ -1499,14 +1553,21 @@ fn slots_moe_cohort(
     pbs: &PrefillBatchScratch,
     n: usize,
 ) -> HipResult<bool> {
+    if !slots_cohort_enabled() {
+        return Ok(false);
+    }
+    // Rows and arch before the fact build: it walks every routed expert three
+    // times, and this program is gfx1100-only with 2..=4 live rows, so every
+    // other step must decline without that work. Silent, like the same
+    // declines below: "does not apply" is not a model/route refusal.
+    if cohort_precheck(n, gpu.arch_caps.is_gfx1100()).is_err() {
+        return Ok(false);
+    }
     let dim = config.dim;
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
     let n_exp = config.num_experts;
     let k_top = config.num_experts_per_tok;
-    if !slots_cohort_enabled() {
-        return Ok(false);
-    }
     let proj = |w: &WeightTensor| CohortProj {
         dtype: w.gpu_dtype,
         m: w.m,
@@ -1576,6 +1637,7 @@ fn slots_moe_cohort(
             return Ok(false);
         }
     };
+    log_cohort_admit_once(ffn.layer_idx, plan);
     // Resolve the per-expert down-AWQ table here, before the first launch.
     // Admission only reaches `down_awq` through `CohortDownScales::PerExpert`,
     // which already requires the table, so this cannot be `None` in practice —
@@ -1782,12 +1844,12 @@ fn mq4_residual_proj(
     n: usize,
 ) -> HipResult<()> {
     rotate_x_mq_batched_for(gpu, w, x, scratch, w.k, n)?;
-    if n == 1 && slots_few_mq4v2(w.gpu_dtype, w.k, 1) {
+    if n == 1 && slots_few_mq4v2(gpu, w.gpu_dtype, w.k, 1) {
         let x1 = scratch.sub_offset(0, w.k);
         let y1 = y.sub_offset(0, w.m);
         return gpu.gemv_hfq4g256_residual_mq4v2(&w.buf, &x1, &y1, w.m, w.k);
     }
-    if slots_few_mq4v2(w.gpu_dtype, w.k, n) {
+    if slots_few_mq4v2(gpu, w.gpu_dtype, w.k, n) {
         let y_n = y.sub_offset(0, n * w.m);
         return gpu.gemv_mq4g256v2_xbatch_residual(&w.buf, scratch, &y_n, w.m, w.k, n);
     }
@@ -2259,7 +2321,7 @@ where
             } else {
                 &pbs.x_norm_batch
             };
-            if slots_few_mq4v2(dt, layer.wqkv.k, n) {
+            if slots_few_mq4v2(gpu, dt, layer.wqkv.k, n) {
                 // Decode-width rows: sequential GEMV, weight decoded once per
                 // four rows. The fused WMMA tile is 16 wide and recording
                 // keeps only its base kernel.
@@ -2544,7 +2606,7 @@ where
             } else {
                 &pbs.x_norm_batch
             };
-            if slots_few_mq4v2(dt, layer.wqkv.k, n) {
+            if slots_few_mq4v2(gpu, dt, layer.wqkv.k, n) {
                 // Decode-width rows: sequential GEMV, weight decoded once per
                 // four rows. The fused WMMA tile is 16 wide and recording
                 // keeps only its base kernel.
@@ -3671,7 +3733,7 @@ fn run_fullattn_layer_slots(
             } else {
                 &pbs.x_norm_batch
             };
-            if slots_few_mq4v2(dt, layer.wq.k, n) {
+            if slots_few_mq4v2(gpu, dt, layer.wq.k, n) {
                 slots_qkv_few_mq4v2(
                     gpu,
                     &layer.wq.buf,
@@ -3932,7 +3994,7 @@ fn run_fullattn_moe_layer_slots(
             } else {
                 &pbs.x_norm_batch
             };
-            if slots_few_mq4v2(dt, layer.wq.k, n) {
+            if slots_few_mq4v2(gpu, dt, layer.wq.k, n) {
                 slots_qkv_few_mq4v2(
                     gpu,
                     &layer.wq.buf,
@@ -6126,6 +6188,47 @@ mod tests {
             routed_gate_up_awq: false,
             routed_down_scales: CohortDownScales::None,
         }
+    }
+
+    /// The rows/arch gates are the ones the caller can answer before it pays
+    /// for `CohortFacts` (three passes over 256 experts per MoE layer per
+    /// step). `cohort_admit` must still report them first and alone, even
+    /// when every other field would also be refused.
+    #[test]
+    fn cohort_cheap_gates_are_first_and_facts_independent() {
+        assert_eq!(cohort_precheck(1, true), Err(CohortDecline::Rows));
+        assert_eq!(cohort_precheck(0, true), Err(CohortDecline::Rows));
+        assert_eq!(cohort_precheck(5, true), Err(CohortDecline::Rows));
+        for n in 2..=4 {
+            assert_eq!(cohort_precheck(n, true), Ok(()));
+            assert_eq!(cohort_precheck(n, false), Err(CohortDecline::Arch));
+        }
+        // Everything else wrong, but rows decides first; then arch.
+        let broken = CohortFacts {
+            n: 1,
+            gfx1100: false,
+            dim: 1,
+            mi: 1,
+            smi: 1,
+            k_top: 1,
+            n_exp: 1,
+            cpu_deferred: true,
+            expert_tags: true,
+            ep_global_tiers: true,
+            routed_uniform: false,
+            routed_gate_up_awq: true,
+            routed_down_scales: CohortDownScales::Partial,
+            ..cohort_base()
+        };
+        assert_eq!(cohort_admit(&broken), Err(CohortDecline::Rows));
+        assert_eq!(
+            cohort_admit(&CohortFacts {
+                n: 2,
+                gfx1100: false,
+                ..broken
+            }),
+            Err(CohortDecline::Arch)
+        );
     }
 
     #[test]

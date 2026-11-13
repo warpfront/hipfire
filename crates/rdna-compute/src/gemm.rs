@@ -42103,20 +42103,24 @@ impl Gpu {
             // the retained tape's body.
             return self.gemm_mq4g256v2_q8x(&[(a_raw, y, m)], x, k, batch_size, true);
         }
-        if batch_size == 1 && k.is_multiple_of(256) {
-            // One row stays on the arch residual GEMV, including the gfx1100
-            // M=2048 K=4096 noscratch kernel. The 4-wide x-batch body keeps
-            // four accumulator sets at B=1 and misses that specialization.
-            let x1 = x.sub_offset(0, k);
-            let y1 = y.sub_offset(0, m);
-            return self.gemv_hfq4g256_residual_mq4v2(a_raw, &x1, &y1, m, k);
-        }
-        if (2..=crate::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&batch_size)
-            && k.is_multiple_of(256)
-        {
-            // Several decode rows: one weight pass per four activations.
-            // Both write Y in place, so a retained tape has no host memset.
-            return self.gemv_mq4g256v2_xbatch_residual(a_raw, x, y, m, k, batch_size);
+        match crate::prefill_invariant::few_row_mq4v2_route(&self.arch, batch_size, k) {
+            crate::prefill_invariant::FewRowMq4v2Route::ResidualGemv => {
+                // One row stays on the arch residual GEMV, including the
+                // gfx1100 M=2048 K=4096 noscratch kernel. The 4-wide x-batch
+                // body keeps four accumulator sets at B=1 and misses that
+                // specialization. Exact gfx1100: see `few_row_mq4v2_route`.
+                let x1 = x.sub_offset(0, k);
+                let y1 = y.sub_offset(0, m);
+                return self.gemv_hfq4g256_residual_mq4v2(a_raw, &x1, &y1, m, k);
+            }
+            crate::prefill_invariant::FewRowMq4v2Route::XBatchGemv => {
+                // Several decode rows: one weight pass per four activations.
+                // Both write Y in place, so a retained tape has no host
+                // memset. Exact gfx1100 only — gfx1151/gfx1201 keep the WMMA
+                // residual and its bytes.
+                return self.gemv_mq4g256v2_xbatch_residual(a_raw, x, y, m, k, batch_size);
+            }
+            crate::prefill_invariant::FewRowMq4v2Route::Incumbent => {}
         }
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(a_raw, x, y, m, k, batch_size);
@@ -42147,21 +42151,23 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if batch_size == 1 {
-            // One row is the AR singleton and the MQ4V2 GEMV writes Y
-            // outright, so it needs neither the residual pairing nor the Y
-            // zeroing. That zeroing is a host `hipMemset`, and host work
-            // inside a forward body is state a retained PM4 tape cannot
-            // replay (`effect-incomplete capture`) — the slots MoE body hit it
-            // three times per layer. `layer_ops::project_rotated` already
-            // keeps the GEMV for exactly this case; applying the same rule
-            // here is what makes it unbypassable for key-routed callers.
-            return self.gemv_mq4g256v2(a_raw, x, y, m, k);
-        }
-        if batch_size <= crate::prefill_invariant::FEW_ROW_ROUTE_ROWS {
-            // Few-row rows are per-row GEMV arithmetic too, and they write Y
-            // outright. Same reason as the one-row arm: the plain GEMM below
-            // zeroes Y with a host memset, which a retained tape cannot replay.
+        if crate::prefill_invariant::few_row_mq4v2_plain_route(&self.arch, batch_size, k) {
+            // Decode-width rows are per-row GEMV arithmetic too, and they
+            // write Y outright, so the retained tape has no host memset. Exact
+            // gfx1100: gfx1151/gfx1201 keep the zeroing + WMMA arm below and
+            // their byte identity (`few_row_mq4v2_plain_route`).
+            if batch_size == 1 {
+                // One row is the AR singleton and the MQ4V2 GEMV writes Y
+                // outright, so it needs neither the residual pairing nor the Y
+                // zeroing. That zeroing is a host `hipMemset`, and host work
+                // inside a forward body is state a retained PM4 tape cannot
+                // replay (`effect-incomplete capture`) — the slots MoE body hit
+                // it three times per layer. `layer_ops::project_rotated`
+                // already keeps the GEMV for exactly this case; applying the
+                // same rule here is what makes it unbypassable for key-routed
+                // callers.
+                return self.gemv_mq4g256v2(a_raw, x, y, m, k);
+            }
             // gfx1100 has no rows_x4 PM image, so that helper fell through to
             // one singleton GEMV per row (four weight passes). The x-batch
             // GEMV is the same accumulator with each weight row decoded once

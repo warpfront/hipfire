@@ -1107,9 +1107,12 @@ fn fmac(b: &mut Builder, dst: u8, w: u8, x: u8) -> R {
 /// `gemv_mq4g256v2_rdna3_mq4v2.37cf66a5274c0003`. Their scalar fold is 01+32.
 ///
 /// gfx11 VOPD dual-issues six of the eight terms across the two rows. Each
-/// row's own multiply/FMA sequence stays in this order, and the two `src1`
-/// registers of a packet sit in different VGPR banks, so the f32 bits match
-/// the scalar chain. The schedule (term index into `[1,0,2,3,4,5,6,7]`):
+/// row's own multiply/FMA sequence stays in this order, which is what keeps
+/// the f32 bits equal to the scalar chain: pairing two independent rows'
+/// terms changes nothing about either row's accumulation order. (The two
+/// `src1` registers of a packet sitting in different VGPR banks is a separate
+/// *encodability* rule — VOPD cannot encode a packet that violates it — not
+/// the reason the bits match.) The schedule (term index into `[1,0,2,3,4,5,6,7]`):
 /// row0:0, pair(row0:1, row1:0), row0:2, pair(row0:3, row1:1), row1:2,
 /// pair(row0:4, row1:3), pair(row0:5, row1:4), pair(row0:6, row1:5),
 /// pair(row0:7, row1:6), row1:7.

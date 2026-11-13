@@ -4153,12 +4153,11 @@ impl Gpu {
     /// Q/K/V/gate/beta/output point at that slot's packed-batch rows. The
     /// kernarg keeps the scalar `gated_delta_net_q8_fast` prefix so retained
     /// PM4 patches the requant frame at offset 76. Lane 0 is those prefix
-    /// pointers (HIP Resource wait sees them). Lane 1 is nine explicit
-    /// pointer args at offset 96, 168 B total, inside the gfx11 256 B
-    /// preload. A by-value table hid lane-1 from alias analysis.
-    ///
-    /// All rows share `n_tokens` (decode is 1). `lanes.len()` is grid.z,
-    /// 1..=2. Byte-identical to one `gated_delta_net_q8_batch_seq` per row
+    /// pointers (HIP Resource wait sees them). Lanes 1..=3 follow as nine
+    /// explicit pointer args each (`SLOTS_MAX = 4` lanes; a by-value table
+    /// hid them from alias analysis). All rows share `n_tokens` (decode is
+    /// 1), and `lanes.len()` is grid.z, 1..=`SLOTS_MAX`.
+    /// Byte-identical to one `gated_delta_net_q8_batch_seq` per row
     /// over that row's views, with frames reserved once as
     /// `n_tokens * n_lanes`.
     #[cfg(feature = "deltanet")]
