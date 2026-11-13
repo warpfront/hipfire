@@ -621,7 +621,7 @@ fn g942_conv_fuse_image() -> HipResult<Option<&'static std::sync::Arc<[u8]>>> {
 
 /// Bind `func` of [`QWEN4_G942_CONV_FUSE_MODULE`]: the hipcc source (the anchor object), or the
 /// `HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE` code object.
-fn g942_conv_fuse_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+pub(crate) fn g942_conv_fuse_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
     gpu.bind_thread()?;
     match g942_conv_fuse_image()? {
         Some(image) => gpu.ensure_embedded_kernel(QWEN4_G942_CONV_FUSE_MODULE, image.clone(), func),
@@ -2855,7 +2855,7 @@ pub const QWEN4_G942_ROWS16_GRID_ENTRIES: [&str; 2] =
 /// `HIPFIRE_QWEN4_G942_ROWS16_GRID_IMAGE=/absolute/device.elf` names one, that explicitly
 /// supplied code object (the Route-A twin proof: same module, same entry names, loaded through
 /// `ensure_embedded_kernel`). Unset: the source, unchanged.
-fn g942_rows16_grid_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
+pub(crate) fn g942_rows16_grid_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
     match hipfire_config::developer_var("HIPFIRE_QWEN4_G942_ROWS16_GRID_IMAGE") {
         Ok(path) if !path.is_empty() => {
             let bytes = std::fs::read(&path).map_err(|error| {

@@ -1125,6 +1125,49 @@ pub fn lab_ensure_qsa_row_entry(gpu: &mut Gpu, kernel: &'static str) -> HipResul
     crate::cdna::gfx942::ensure_qsa_row_kernel(gpu, kernel)
 }
 
+/// Bind `entry` (`qwen4_g942_hyper_norm_bf16x` or `qwen4_g942_hyper_write_norm_bf16x`) of the
+/// exact-gfx942 conv-fuse module the way the public launchers do (hipcc source, or the
+/// `HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE` code object) and return the symbol to launch. The module
+/// under test of `qwen4_g942_conv_fuse_oracle`, which launches it directly through
+/// [`Gpu::launch_kernel_blob`]. An entry that is not one of the module's two is an error.
+#[doc(hidden)]
+pub fn lab_ensure_conv_fuse_entry(gpu: &mut Gpu, entry: &str) -> HipResult<&'static str> {
+    let symbol = [
+        crate::cdna::gfx942::QWEN4_G942_HYPER_NORM_BF16X,
+        crate::cdna::gfx942::QWEN4_G942_HYPER_WRITE_NORM_BF16X,
+    ]
+    .into_iter()
+    .find(|name| *name == entry)
+    .ok_or_else(|| {
+        HipError::new(
+            0,
+            &format!("{entry} is not an entry of the conv-fuse module"),
+        )
+    })?;
+    crate::cdna::gfx942::g942_conv_fuse_ensure(gpu, symbol)?;
+    Ok(symbol)
+}
+
+/// Bind `entry` (`qwen4_g942_rows16_grid` or `qwen4_g942_rows16_grid_x2`) of the exact-gfx942
+/// row-grid module the way the public launcher does (hipcc source, or the
+/// `HIPFIRE_QWEN4_G942_ROWS16_GRID_IMAGE` code object) and return the symbol to launch. The module
+/// under test of `qwen4_g942_rows16_grid_oracle`, which launches it directly through
+/// [`Gpu::launch_kernel_blob`]. An entry that is not one of the module's two is an error.
+#[doc(hidden)]
+pub fn lab_ensure_rows16_grid_entry(gpu: &mut Gpu, entry: &str) -> HipResult<&'static str> {
+    let symbol = crate::cdna::gfx942::QWEN4_G942_ROWS16_GRID_ENTRIES
+        .into_iter()
+        .find(|name| *name == entry)
+        .ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("{entry} is not an entry of the row-grid module"),
+            )
+        })?;
+    crate::cdna::gfx942::g942_rows16_grid_ensure(gpu, symbol)?;
+    Ok(symbol)
+}
+
 /// Single-launch rollback kernel of a state's STORAGE format. Q8Ef has no
 /// single-launch kernel: its rollback must carry the residual and runs
 /// [`gated_delta_rollback_layers_ef`] instead.
