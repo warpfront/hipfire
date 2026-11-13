@@ -22,6 +22,11 @@
 //!
 //! Compare arms with `fn-ep/oracle/compare.py`.
 //!
+//! AR mode (`--spec off`, the default) loads with `speculation.mtp = off` on every arm: no native
+//! MTP head and no GDN row-capture ring, so a single-card arm and an EP arm carry the same state
+//! digest rows. This tool does not read `HIPFIRE_MTP_MODE` (the daemon / CLI translate it into the
+//! load's `SpecLoadCfg`); `--spec mtp` is the only way to attach the head here.
+//!
 //! Usage:
 //! ```text
 //! fn_ep_oracle --model M.mq4 --prompt-file a.txt [--prompt-file b.ids ...] \
@@ -907,10 +912,16 @@ fn run() -> R<()> {
     // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
     hipfire_loader::prepare_host_memory_for(Path::new(&args.model));
     let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
-    let mut spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg::default();
-    if args.mtp.is_some() {
-        spec_cfg.mtp = Some(args.dflash.is_none());
-    }
+    // The load's `speculation.mtp` is set here, never read from `HIPFIRE_MTP_MODE` (that variable
+    // reaches `SpecLoadCfg` only through the daemon / CLI). Left at `None` (auto) a single-card
+    // Qwen4 load attaches the native MTP head and its GDN row-capture ring, which an EP load
+    // admits only on an explicit request: the single arm's `state.jsonl` then carries
+    // `row_capture*` rows (and `row_capture_rows` > 0) that the EP arm never has. AR mode
+    // (`--spec off`, the default) therefore loads without the head; only `--spec mtp` arms it.
+    let mut spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg {
+        mtp: Some(args.mtp.is_some() && args.dflash.is_none()),
+        ..Default::default()
+    };
     if let Some((_, block)) = &args.dflash {
         spec_cfg.dflash = Some(true);
         spec_cfg.dflash_block = *block;
