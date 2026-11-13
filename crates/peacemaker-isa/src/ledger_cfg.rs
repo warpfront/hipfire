@@ -16,13 +16,16 @@
 //!
 //! * Path-sensitive: each path carries its own `Ledger`; nothing is joined, so
 //!   an operation is pending exactly on the paths that issue it (no `maybe`
-//!   ghost loads). Only states are deduplicated, by [`Ledger::replay_state_key`]
-//!   (pending shapes without operation ids; on gfx942 also without the source
-//!   registers of pending stores, which the gfx942 replay never reads: an exact
-//!   observational equivalence, no operation merged or dropped), at labels, the
-//!   only join points: a forward branch is explored as its own alternative; a
-//!   backward edge is explored until a label's state set reaches a fixed point,
-//!   and ids that merely advance per iteration do not grow it.
+//!   ghost loads). States are deduplicated at labels by id-free pending shapes,
+//!   omitting gfx942 store source locks that replay never reads. Strict gfx942
+//!   replay also identifies continuation-equivalent VM load queues: if EVERY
+//!   path reaches vmcnt(0), every intervening VM issue is an ordered load, and
+//!   no incoming load destination is read OR written before that drain, the
+//!   incoming VM queue is omitted from the key only. Stores/FLAT never qualify;
+//!   LGKM/EXP and control-proof directions remain in the key. Actual ledgers,
+//!   recording, waits and issue clipping are unchanged (`vm_drain_observers`).
+//!   Backedges run until the label state set reaches a fixed point; operation
+//!   ids that merely advance per iteration do not grow it.
 //! * Waits are decoded from the instruction text actually in the program, never
 //!   from the builder's `WaitProof` records: gfx12 `s_wait_loadcnt`/`storecnt`/
 //!   `dscnt`/`kmcnt` and the combined `loadcnt_dscnt`/`storecnt_dscnt`,
@@ -77,11 +80,11 @@
 //!   the label and those waits, so this is the walk it would do anyway; distinct incoming
 //!   states that a full drain collapses are one state. General rule, no label is special
 //!   and the state bound is unchanged.
-//! * No operation is ever dropped except by that bound: more than [`COUNTER_CAP`] pending
-//!   operations on one counter (reachable only for unclipped mixed or out-of-order queues),
-//!   more than [`MAX_STATES_PER_LABEL`] distinct states at one label, more than
-//!   [`MAX_STEPS`] instruction visits, or control flow the walk cannot follow (indirect
-//!   branches, calls) fail closed.
+//! * No operation is ever dropped from the ledger except by an explicit wait or
+//!   the architectural issue bound. More than [`COUNTER_CAP`] pending operations
+//!   on one counter (unclipped mixed/out-of-order queues), more than
+//!   [`MAX_STATES_PER_LABEL`] continuation classes at one label, more than
+//!   [`MAX_STEPS`] visits, or unknown control flow fail closed.
 //!
 //! A violation names the instruction, the counter wait it lacks, and the branch
 //! edges of the path that reaches it.
@@ -561,6 +564,7 @@ pub(crate) fn verify_with_branch_proofs(
         Mode::Strict,
         Ledger::replay_state_key,
         Some(choices),
+        true,
     )
 }
 
@@ -695,7 +699,7 @@ fn region_exit_is_drained(
 }
 
 fn walk(program: &Program, foreign: &[Range<usize>], mode: Mode) -> Result<Stats, String> {
-    walk_with(program, foreign, mode, Ledger::replay_state_key, None)
+    walk_with(program, foreign, mode, Ledger::replay_state_key, None, true)
 }
 
 /// Why `choices` cannot be the proof table of `program`: its length must be exactly the
@@ -726,6 +730,143 @@ fn check_branch_proofs(program: &Program, choices: &[EdgeChoice]) -> Result<(), 
     Ok(())
 }
 
+/// Registers observed (read OR written, irrespective of EXEC) before a full VM drain.
+/// RegRef's u8 base/length can describe up to 510 dwords; keep all of that domain,
+/// with disjoint scalar, vector and accumulator banks.
+#[derive(Clone, Copy, Default)]
+struct VmObservers([u64; 24]);
+
+impl VmObservers {
+    fn bank(reg: RegRef) -> usize {
+        match reg.kind {
+            Kind::V => 0,
+            Kind::S => 8,
+            Kind::A => 16,
+        }
+    }
+
+    fn insert(&mut self, reg: RegRef) {
+        let bank = Self::bank(reg);
+        for r in usize::from(reg.base)..usize::from(reg.base) + usize::from(reg.len) {
+            self.0[bank + r / 64] |= 1 << (r % 64);
+        }
+    }
+
+    fn observes(&self, reg: RegRef) -> bool {
+        let bank = Self::bank(reg);
+        (usize::from(reg.base)..usize::from(reg.base) + usize::from(reg.len))
+            .any(|r| self.0[bank + r / 64] & (1 << (r % 64)) != 0)
+    }
+
+    fn union(&mut self, other: Self) {
+        for (word, incoming) in self.0.iter_mut().zip(other.0) {
+            *word |= incoming;
+        }
+    }
+}
+
+/// Continuation equivalence for incoming gfx942 VM *loads*. A successful entry
+/// proves that EVERY syntactic path reaches vmcnt(0), before termination, unknown
+/// control flow, or a non-load VM issue; it lists every pre-drain register read/write.
+/// No branch predicate is assumed. Backward must-dataflow starts only at drains:
+/// a cycle that can avoid the drain never acquires a proof. Each node settles once.
+///
+/// If all incoming VM loads define unobserved registers, their queue cannot affect
+/// this continuation: new VM loads share Gfx9Vmem's order, and their younger counts
+/// and issue-bound retirement are independent of the older incoming prefix.
+/// Partial waits can only retire that prefix or the same suffix of new loads.
+/// The full drain then makes both executions identical. Other counters are never
+/// projected. This changes label keys only, not the ledger or any transition.
+fn vm_drain_observers(
+    program: &Program,
+    decoded: &HashMap<usize, Instruction>,
+    labels: &HashMap<&str, usize>,
+) -> Vec<Option<VmObservers>> {
+    let insns = &program.instructions;
+    let n = insns.len();
+    let mut successors = vec![[None; 2]; n];
+    let mut predecessors = vec![Vec::new(); n];
+    let mut local = vec![VmObservers::default(); n];
+    let mut result = vec![None; n];
+    let mut work = Vec::new();
+    for (pc, emitted) in insns.iter().enumerate() {
+        let insn = decoded.get(&pc).unwrap_or(emitted);
+        let text = emitted.text.trim();
+        let mnemonic = insn.mnemonic();
+        if text.starts_with("s_wait") {
+            let Ok(effects) = decode(text, program.arch) else {
+                continue;
+            };
+            if effects.iter().any(|e| *e == Effect::Wait(Counter::Vm, 0)) {
+                result[pc] = Some(VmObservers::default());
+                work.push(pc);
+                continue;
+            }
+        } else if mnemonic.starts_with("s_endpgm") || indirect(mnemonic) {
+            continue;
+        } else if is_label(text).is_none() && sync::branch_target(text).is_none() {
+            if decode(text, program.arch).is_err() {
+                continue;
+            }
+            if matches!(
+                insn.memory,
+                Some(
+                    MemoryClass::VmemStore
+                        | MemoryClass::VmemAtomic { .. }
+                        | MemoryClass::Flat { .. }
+                )
+            ) {
+                continue;
+            }
+            for reg in insn.defs.iter().chain(&insn.uses) {
+                local[pc].insert(*reg);
+            }
+        }
+        if let Some(target) = sync::branch_target(text) {
+            let Some(&target) = labels.get(target) else {
+                continue;
+            };
+            successors[pc][0] = Some(target);
+            if mnemonic != "s_branch" {
+                // A missing fallthrough must not become a one-successor proof.
+                if pc + 1 == n {
+                    successors[pc] = [None; 2];
+                    continue;
+                }
+                successors[pc][1] = Some(pc + 1);
+            }
+        } else if pc + 1 < n {
+            successors[pc][0] = Some(pc + 1);
+        }
+        for next in successors[pc].iter().flatten() {
+            predecessors[*next].push(pc);
+        }
+    }
+    while let Some(pc) = work.pop() {
+        for &pred in &predecessors[pc] {
+            if result[pred].is_some() {
+                continue;
+            }
+            let mut observed = local[pred];
+            let mut ready = true;
+            for next in successors[pred].iter().flatten() {
+                match result[*next] {
+                    Some(incoming) => observed.union(incoming),
+                    None => {
+                        ready = false;
+                        break;
+                    }
+                }
+            }
+            if ready {
+                result[pred] = Some(observed);
+                work.push(pred);
+            }
+        }
+    }
+    result
+}
+
 /// [`walk`] with the label-dedup key and the optional static branch proofs as parameters:
 /// production passes `Ledger::replay_state_key` (and proofs only through
 /// [`verify_with_branch_proofs`]); the tests pass the un-canonicalized `full_state_key` to
@@ -736,6 +877,7 @@ fn walk_with(
     mode: Mode,
     state_key: fn(&Ledger) -> StateKey,
     choices: Option<&[EdgeChoice]>,
+    abstract_vm: bool,
 ) -> Result<Stats, String> {
     if let Some(choices) = choices {
         if !matches!(mode, Mode::Strict) {
@@ -761,6 +903,11 @@ fn walk_with(
             }
         }
     }
+    let vm_observers = if abstract_vm && arch == Arch::Gfx942 && matches!(mode, Mode::Strict) {
+        vm_drain_observers(program, &decoded, &labels)
+    } else {
+        Vec::new()
+    };
     let mut seen: HashMap<usize, HashSet<StateKey>> = HashMap::new();
     let mut witness = Witness::default();
     let mut stats = Stats::default();
@@ -821,7 +968,17 @@ fn walk_with(
                     end += 1;
                 }
                 let states = seen.entry(pc).or_default();
-                if !states.insert(state_key(&ledger)) {
+                let mut key = state_key(&ledger);
+                if vm_observers
+                    .get(end)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|observed| {
+                        ledger.vmem_loads_unobserved(|reg| observed.observes(reg))
+                    })
+                {
+                    key.retain(|entry| entry.0 != Counter::Vm);
+                }
+                if !states.insert(key) {
                     break;
                 }
                 stats.label_states += 1;
@@ -1625,7 +1782,7 @@ mod tests {
     }
     /// The baseline walk: label dedup on the un-canonicalized key (`Ledger::full_state_key`).
     fn walk_full(p: &Program) -> Result<Stats, String> {
-        walk_with(p, &[], Mode::Strict, Ledger::full_state_key, None)
+        walk_with(p, &[], Mode::Strict, Ledger::full_state_key, None, false)
     }
 
     /// gfx942 `replay_state_key` drops only the registers a pending store read, which the gfx942
@@ -1942,9 +2099,196 @@ mod tests {
         }
         choices
     }
+    /// Optional loads in distinct registers, all drained after the EXEC restore.
+    /// No source or instruction rewriting is needed to collapse their 2^10 subsets.
+    fn optional_vm_loads(prefix: Vec<Instruction>, before_wait: Vec<Instruction>) -> Program {
+        let mut insns = prefix;
+        for i in 0..10 {
+            insns.push(ins(&format!("s_cbranch_scc1 J{i}")));
+            insns.push(load(10 + i));
+            insns.push(ins(&format!("J{i}:")));
+        }
+        insns.extend(before_wait);
+        insns.push(ins("s_or_b64 exec, exec, s[40:41]"));
+        insns.push(ins("s_waitcnt vmcnt(0)"));
+        for i in 0..10 {
+            insns.push(mov(30 + i, 10 + i));
+        }
+        insns.push(ins("s_endpgm"));
+        cdna(insns)
+    }
+
+    #[test]
+    fn unobserved_load_subsets_share_a_drain_continuation_class() {
+        let p = optional_vm_loads(vec![], vec![]);
+        let old = walk_full(&p).unwrap_err();
+        assert!(old.contains("state explosion"), "{old}");
+        let new = check(&p).unwrap();
+        assert_eq!(new.label_states, 10, "{new:?}");
+        // The scalar-control adapter uses the same abstraction with identical proof maps.
+        let choices = vec![EdgeChoice::Both; p.instructions.len()];
+        assert_eq!(verify_with_branch_proofs(&p, &[], &choices).unwrap(), new);
+    }
+
+    #[test]
+    fn predrain_read_write_and_exec_masked_overwrite_are_not_erased() {
+        for access in [mov(80, 1), mov(1, 80)] {
+            let p = optional_vm_loads(vec![load(1)], vec![ins("s_mov_b64 exec, 1"), access]);
+            let e = check(&p).unwrap_err();
+            // The optional dead loads can be collapsed only if the ENTIRE incoming
+            // queue is unobserved. Here a real hazard remains, not a waived use/WAW.
+            assert!(
+                e.contains("Use") || e.contains("Waw") || e.contains("state explosion"),
+                "{e}"
+            );
+            assert!(walk_full(&p).is_err());
+        }
+        // Minimal versions name the actual hazard rather than the fanout bound.
+        for access in [mov(80, 1), mov(1, 80)] {
+            let p = cdna(vec![
+                ins("s_cbranch_scc1 J"),
+                load(1),
+                ins("J:"),
+                ins("s_mov_b64 exec, 1"),
+                access,
+                ins("s_waitcnt vmcnt(0)"),
+                ins("s_endpgm"),
+            ]);
+            let e = check(&p).unwrap_err();
+            assert!(e.contains("Use") || e.contains("Waw"), "{e}");
+        }
+    }
+
+    #[test]
+    fn every_continuation_must_reach_a_full_drain() {
+        for suffix in [
+            vec![
+                ins("s_cbranch_scc1 USE"),
+                ins("s_waitcnt vmcnt(0)"),
+                ins("USE:"),
+                mov(3, 1),
+                ins("s_endpgm"),
+            ],
+            vec![ins("s_waitcnt vmcnt(1)"), mov(3, 1), ins("s_endpgm")],
+            vec![
+                ins("s_cbranch_scc1 LOOP"),
+                ins("s_waitcnt vmcnt(0)"),
+                ins("s_endpgm"),
+                ins("LOOP:"),
+                mov(3, 1),
+                ins("s_branch LOOP"),
+            ],
+        ] {
+            let mut insns = vec![ins("s_cbranch_scc1 J"), load(1), ins("J:")];
+            insns.extend(suffix);
+            let e = check(&cdna(insns)).unwrap_err();
+            assert!(e.contains("Use"), "{e}");
+        }
+        // Both alternatives drain: a branch before the drain is not itself a refusal.
+        let p = cdna(vec![
+            load(1),
+            ins("J:"),
+            ins("s_cbranch_scc1 A"),
+            ins("s_waitcnt vmcnt(0)"),
+            ins("s_branch USE"),
+            ins("A:"),
+            ins("s_waitcnt vmcnt(0)"),
+            ins("USE:"),
+            mov(3, 1),
+            ins("s_endpgm"),
+        ]);
+        check(&p).unwrap();
+    }
+
+    #[test]
+    fn pending_stores_and_flat_loads_never_enter_the_erased_class() {
+        let flat = Instruction::new("flat_load_dword v1, v[2:3]", vec![v(1)], vec![v(2)])
+            .memory(MemoryClass::Flat { load: true });
+        for pending in [store(1), flat] {
+            let p = optional_vm_loads(vec![pending], vec![]);
+            let e = check(&p).unwrap_err();
+            assert!(e.contains("state explosion"), "{e}");
+        }
+        // A future store/FLAT issue also prevents erasing an incoming load queue.
+        for future in [
+            store(80),
+            Instruction::new("flat_load_dword v80, v[2:3]", vec![v(80)], vec![v(2)])
+                .memory(MemoryClass::Flat { load: true }),
+        ] {
+            let p = optional_vm_loads(vec![], vec![future]);
+            let e = check(&p).unwrap_err();
+            assert!(e.contains("state explosion"), "{e}");
+        }
+    }
+
+    #[test]
+    fn other_counter_obligations_survive_vm_projection() {
+        for pending in [ds_load(1), smem_load(1)] {
+            let use_ = if matches!(pending.memory, Some(MemoryClass::SmemLoad)) {
+                Instruction::new("s_mov_b32 s3, s1", vec![s(3)], vec![s(1)])
+            } else {
+                mov(3, 1)
+            };
+            let p = cdna(vec![
+                ins("s_cbranch_scc1 J"),
+                pending,
+                ins("J:"),
+                ins("s_waitcnt vmcnt(0)"),
+                use_,
+                ins("s_endpgm"),
+            ]);
+            let e = check(&p).unwrap_err();
+            assert!(e.contains("Lgkm") && e.contains("Use"), "{e}");
+        }
+        let p = cdna(vec![
+            ins("s_cbranch_scc1 J"),
+            Instruction::new("exp", vec![], vec![v(1)]).memory(MemoryClass::Export),
+            ins("J:"),
+            ins("s_waitcnt vmcnt(0)"),
+            mov(1, 2),
+            ins("s_endpgm"),
+        ]);
+        let new = check(&p).unwrap();
+        assert_eq!(new.label_states, 2, "{new:?}");
+        assert_eq!(new, walk_full(&p).unwrap());
+    }
+
+    #[test]
+    fn drain_proof_does_not_assume_loop_exit_or_merge_register_banks() {
+        let p = cdna(vec![
+            ins("H:"),
+            ins("s_cbranch_scc1 H"),
+            ins("s_waitcnt vmcnt(0)"),
+            ins("s_endpgm"),
+        ]);
+        let labels = HashMap::from([("H", 0)]);
+        assert!(vm_drain_observers(&p, &HashMap::new(), &labels)[0].is_none());
+        let mut observed = VmObservers::default();
+        observed.insert(RegRef {
+            kind: Kind::V,
+            base: 10,
+            len: 4,
+        });
+        assert!(observed.observes(v(13)));
+        assert!(!observed.observes(v(14)));
+        assert!(!observed.observes(s(10)));
+        assert!(!observed.observes(RegRef {
+            kind: Kind::A,
+            base: 10,
+            len: 1
+        }));
+    }
+
     /// The baseline-keyed walk under the same proof map as `verify_with_branch_proofs`.
     fn walk_full_proved(p: &Program, choices: &[EdgeChoice]) -> Result<Stats, String> {
-        walk_with(p, &[], Mode::Strict, Ledger::full_state_key, Some(choices))
+        walk_with(
+            p,
+            &[],
+            Mode::Strict,
+            Ledger::full_state_key,
+            Some(choices),
+            false,
+        )
     }
 
     #[test]
@@ -1990,6 +2334,7 @@ mod tests {
             Mode::Dispatcher { body: &[] },
             Ledger::replay_state_key,
             Some(&choices),
+            true,
         )
         .unwrap_err();
         assert!(e.contains("strict"), "{e}");
