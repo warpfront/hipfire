@@ -7936,10 +7936,12 @@ pub fn generate_cohere2moe(
     } else {
         0.0
     };
+    // Every stop exit (EOS, <PAD>, repeat guard) breaks before the count
+    // increments, so `generated_count == max_tokens` only on the budget cap.
     let finish_reason = if !held_tool_calls.is_empty() {
         "tool_calls"
     } else {
-        "stop"
+        crate::common::length_or_stop(generated_count, max_tokens, false)
     };
     let mut pending_done = serde_json::json!({
         "type": "done",
