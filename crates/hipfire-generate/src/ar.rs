@@ -4399,7 +4399,7 @@ pub fn generate(
                     })
                     .map(|b| b.dn_state.stream.identity());
                 let found = m.prefill_checkpoints.iter().rposition(|(p, snap)| {
-                    if *p > lcp || *p >= rendered.len() {
+                    if speculative::plan_prefix_resume(&[*p], lcp, rendered.len()).is_none() {
                         return false;
                     }
                     let attested = speculative::checkpoint_prefix_attests(

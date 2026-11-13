@@ -948,7 +948,13 @@ DeltaNet checkpoint rings (one snapshot per ring, for the AR ring and, with a
 DFlash/MTP speculator, its own ring; further checkpoints up to
 `HIPFIRE_CACHE_CKPT_MAX`, default 8, are taken only while free VRAM still
 covers the admitted context's KV growth plus the reserve, else the ring recycles
-its oldest snapshot) and, with
+its oldest snapshot; on arch 5 these checkpoints also carry a prefix hash over
+the committed tokens they cover, so a decode-phase cancel can preserve the
+committed-prefix state and an edited prompt resumes from the common prefix
+instead of a cold re-prefill — restore validates the hash and cold-resets on
+mismatch; the reuse still needs `max_seq` headroom for the preserved prefix
+plus the full edited prompt, since the context-full guard counts both and
+cold-resets when they exceed it) and, with
 native MTP, the per-request `MtpSpecState` (head KV, scratch, verify buffers,
 trunk snapshot and PBS) and the prompt-fill transient. The loader logs one
 `max_seq fit: measured after full load: free=… transient=… (prefill … +

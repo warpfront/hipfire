@@ -13229,6 +13229,20 @@ pub fn attested_checkpoint_positions(ring: &[(usize, u64)], conversation: &[u32]
         .collect()
 }
 
+/// Resume-position choice over attested checkpoints (oldest first): the
+/// latest checkpoint at or before the divergence (`lcp`) that still leaves
+/// ≥1 token to re-prefill (`pos < rendered_len`). `None` = cold reset.
+/// The decode-cancel path implements this same rule inline (plus the live
+/// stream-identity check, which needs the GPU); the helper pins the
+/// host-side half under unit tests.
+pub fn plan_prefix_resume(attested: &[usize], lcp: usize, rendered_len: usize) -> Option<usize> {
+    attested
+        .iter()
+        .copied()
+        .filter(|&p| p <= lcp && p < rendered_len)
+        .next_back()
+}
+
 /// Snapshot the DeltaNet state at a user-turn boundary: unconditionally (no
 /// stride), and pinned against recycling by later stride snapshots.
 pub fn take_dn_boundary_checkpoint(
@@ -14440,6 +14454,59 @@ mod sparse_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_decision_lcp_choice() {
+        // Committed conversation of 40 tokens; checkpoints at 10/20/30.
+        let conv: Vec<u32> = (0..40).collect();
+        let ring: Vec<(usize, u64)> = [10, 20, 30]
+            .iter()
+            .map(|&p| (p, checkpoint_prefix_hash(p, (&conv[..p], &[]))))
+            .collect();
+        let attested = attested_checkpoint_positions(&ring, &conv);
+        assert_eq!(attested, vec![10, 20, 30]);
+        // Edited prompt diverges at 25: resume from 20, re-prefill [20..44).
+        assert_eq!(plan_prefix_resume(&attested, 25, 44), Some(20));
+    }
+
+    #[test]
+    fn resume_decision_prefix_hash_mismatch_resets() {
+        let conv: Vec<u32> = (0..40).collect();
+        // Checkpoint claims pos 20 but its hash covers different tokens;
+        // the other entry is a legacy unattested (0) snapshot.
+        let other: Vec<u32> = (100..120).collect();
+        let ring = vec![(20, checkpoint_prefix_hash(20, (&other, &[]))), (10, 0)];
+        assert!(attested_checkpoint_positions(&ring, &conv).is_empty());
+        assert_eq!(plan_prefix_resume(&[], 25, 44), None);
+    }
+
+    #[test]
+    fn resume_decision_no_checkpoint_in_range_resets() {
+        let conv: Vec<u32> = (0..40).collect();
+        let ring = vec![(30, checkpoint_prefix_hash(30, (&conv[..30], &[])))];
+        let attested = attested_checkpoint_positions(&ring, &conv);
+        assert_eq!(attested, vec![30]);
+        // The only checkpoint sits past the divergence: nothing to resume.
+        assert_eq!(plan_prefix_resume(&attested, 25, 44), None);
+        // Empty ring likewise cold-resets.
+        assert_eq!(plan_prefix_resume(&[], 25, 44), None);
+    }
+
+    #[test]
+    fn resume_decision_pure_extension_continues_live() {
+        // New prompt extends the conversation: lcp == committed length.
+        let conv: Vec<u32> = (0..40).collect();
+        let ring: Vec<(usize, u64)> = [10, 20, 30]
+            .iter()
+            .map(|&p| (p, checkpoint_prefix_hash(p, (&conv[..p], &[]))))
+            .collect();
+        let attested = attested_checkpoint_positions(&ring, &conv);
+        // Resume from the latest checkpoint; the render continues past it.
+        assert_eq!(plan_prefix_resume(&attested, 40, 48), Some(30));
+        // A checkpoint exactly at the render end leaves nothing to re-prefill,
+        // so the choice falls back to the previous one.
+        assert_eq!(plan_prefix_resume(&attested, 30, 30), Some(20));
+    }
 
     #[test]
     fn two_slot_alternating_keys_hit_after_two_misses() {

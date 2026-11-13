@@ -152,5 +152,26 @@ RESC=$(curl -fsS -m 120 "$EP" -H 'content-type: application/json' \
 CONTENTC=$(echo "$RESC" | python3 -c "import json,sys;print(json.load(sys.stdin)['choices'][0]['message']['content'])")
 echo "  Turn C content: $(printf '%s' "$CONTENTC" | head -c 160)"
 coherent "Turn C" "$CONTENTC" \
-  && echo "PASS: a mid-decode cancel kept the committed prefix and did not poison later turns" \
   || { echo "FAIL: Turn C degenerate/empty after a cancel"; exit 1; }
+
+echo "=== Turn D: resend Turn A's exact prompt unedited (must not resume off decode state) ==="
+LINES1=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+RESD=$(curl -fsS -m 120 "$EP" -H 'content-type: application/json' \
+  -d "$(python3 -c "import json,sys;print(json.dumps({'model':sys.argv[1],'messages':[{'role':'user','content':sys.argv[2]}],'max_tokens':48,'temperature':0,'stream':False,'chat_template_kwargs':{'enable_thinking':False}}))" "$MODEL" "$PROMPT")")
+CONTENTD=$(echo "$RESD" | python3 -c "import json,sys;print(json.load(sys.stdin)['choices'][0]['message']['content'])")
+echo "  Turn D content: $(printf '%s' "$CONTENTD" | head -c 160)"
+coherent "Turn D" "$CONTENTD" \
+  || { echo "FAIL: Turn D degenerate/empty after an unedited resend"; exit 1; }
+NEWD=$(tail -n +$((LINES1+1)) "$LOG" 2>/dev/null)
+echo "$NEWD" | grep -q 'prefix hash does not attest' \
+  && { echo "FAIL: prefix-hash attestation rejected a checkpoint on the unedited-resend path"; echo "$NEWD" | grep -E 'qwen-cache|abort|cancel'; exit 1; } \
+  || echo "  OK: every checkpoint attested its prefix on the resend path"
+REWOUND=$(echo "$NEWD" | grep -oE '\[qwen-cache resume\] rewound to checkpoint pos=[0-9]+' | tail -1 | grep -oE '[0-9]+$')
+if [ -n "$REWOUND" ]; then
+  [ "$REWOUND" -le "${KEPT:-0}" ] \
+    && echo "  OK: Turn D rewound to pos=$REWOUND, at or before the kept prefix (pos=${KEPT:-0})" \
+    || { echo "FAIL: Turn D resumed from pos=$REWOUND past the kept prefix ${KEPT:-0} (decode-state poison)"; exit 1; }
+else
+  echo "  OK: Turn D took no rewound resume (live continuation or cold render)"
+fi
+echo "PASS: a mid-decode cancel kept the committed prefix and did not poison later turns"
