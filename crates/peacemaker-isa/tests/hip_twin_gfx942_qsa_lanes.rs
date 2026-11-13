@@ -30,7 +30,7 @@ const SYMBOLS: [&str; 5] = [
 const OPEN_FP8: [(&str, &str); 1] = [
     (
         "qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942",
-        "CDNA certification of `qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942`: qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942: dword 1209: generated instruction v_cmp_eq_f16 (ENC_VOP3 opcode 34, gfx942) has no hand-written model",
+        "CDNA certification of `qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942`: qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942: dword 1254: generated instruction v_cvt_pk_fp8_f32 (ENC_VOP3 opcode 674, gfx942) has no hand-written model",
     ),
 ];
 /// Now certifiable after mixed-FMA qualification, but outside the frozen five-entry seal.

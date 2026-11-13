@@ -425,7 +425,7 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 30] = [
 const QSA_OPEN_FP8: [(&str, &str); 1] = [
     (
         "qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942",
-        "qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942: dword 1209: generated instruction v_cmp_eq_f16 (ENC_VOP3 opcode 34, gfx942) has no hand-written model",
+        "qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942: dword 1254: generated instruction v_cvt_pk_fp8_f32 (ENC_VOP3 opcode 674, gfx942) has no hand-written model",
     ),
 ];
 
