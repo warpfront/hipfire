@@ -118,6 +118,20 @@ required-features = ["lab"]
 name = "qwen4_g942_qsa_row_oracle"
 required-features = ["lab"]
 
+# gfx942 convert-elimination module (hyper_norm / hyper_write_norm with a BF16-bits output):
+# exact-image byte oracle (module vs unfused reference vs the public methods;
+# HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE honored).
+[[example]]
+name = "qwen4_g942_conv_fuse_oracle"
+required-features = ["lab"]
+
+# gfx942 row-grid module (one-launch rows16 GEMM over 16-row slices): exact-image byte oracle (module
+# vs the rows16 chain vs the public launchers; HIPFIRE_QWEN4_G942_ROWS16_GRID_IMAGE honored) and the
+# --bench cells behind ROW_GRID_MAX_ROWS.
+[[example]]
+name = "qwen4_g942_rows16_grid_oracle"
+required-features = ["lab"]
+
 # G3 head-logit oracle: stock-FP8 `<model>.mtp` sidecar head logits at N positions + the exact head inputs
 # (`beat/M/g3`). `reference-parity` supplies `wide_verify_oracle::dev_head_chain` (a head step on an explicit
 # backbone hidden); `lab` supplies `Qwen4MtpDrafter::lab_pending_hidden_bytes`.
