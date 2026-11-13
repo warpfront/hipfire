@@ -10,8 +10,9 @@
 //! mesh draft round of two or more lanes calls [`probe_round`] before its own
 //! work: the lanes' head states are copied into scratch twins
 //! ([`MtpGpuState::lab_twin`]), the serial arm runs `n` `mtp_forward_token_deferred`
-//! steps (one twin each), the batched arm runs one `mtp_forward_rows_deferred`
-//! call (`n` twins), and every lane's draft token, margin bits, 72 draft-top1
+//! steps (one twin each), the batched arm runs the round's batched head calls
+//! (`mtp_lanes::forward_draft_rows`: `n` twins in calls of at most 8 lanes), and
+//! every lane's draft token, margin bits, 72 draft-top1
 //! bytes, wide hidden, head KV state digest and draft request state are compared
 //! arm against arm. The lane's own state, request and every window structure are
 //! left untouched. One JSON line per lane per round goes to
@@ -253,8 +254,8 @@ fn serial_arm(
     })
 }
 
-/// The batched arm: one `mtp_forward_rows_deferred` over `n` twins, one
-/// download, each lane's parse.
+/// The batched arm: the round's batched head calls over `n` twins
+/// ([`crate::mtp_lanes::forward_draft_rows`]), one download, each lane's parse.
 fn batched_arm(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
@@ -291,8 +292,7 @@ fn batched_arm(
                 })
                 .collect();
             let mut run = |gpu: &mut Gpu| {
-                bundle
-                    .mtp_forward_rows_deferred(gpu, &mut rows, top1)
+                crate::mtp_lanes::forward_draft_rows(bundle, gpu, &mut rows, top1)
                     .map_err(|e| e.to_string())
             };
             match tally {
@@ -413,7 +413,7 @@ pub(crate) fn probe_round(
     }
     let slot = Gpu::TOPK8_OUT_BYTES;
     let top1 = gpu
-        .zeros(&[MTP_PROBE_SLOTS * slot], DType::Raw)
+        .zeros(&[n * slot], DType::Raw)
         .map_err(|e| format!("probe top1: {e}"))?;
     let serial_tally: SymbolTally = Arc::default();
     let batched_tally: SymbolTally = Arc::default();
@@ -513,9 +513,6 @@ pub(crate) fn probe_round(
     }
     Ok(())
 }
-
-/// Most lanes one probe round carries (the batched round's cap).
-const MTP_PROBE_SLOTS: usize = crate::mtp_gpu::MTP_DRAFT_LANES_MAX;
 
 fn arm_json(arm: &ArmResult) -> Value {
     json!({

@@ -3097,11 +3097,13 @@ impl MeshRoot {
                 .filter(|h| h.map_or(true, |o| o == r.rank))
                 .count();
             // One row gather per replicated op, or (a batched head round,
-            // HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS) one for a round of two or more
-            // replicated ops; every rank must have taken the same shape. An
-            // owned op crosses nothing.
-            let gathers_ok =
-                r.head_gathers == replicated_ops || (replicated_ops >= 2 && r.head_gathers == 1);
+            // HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS) one per call of a round of two or more
+            // replicated ops (`draft_round_slices`); every rank must have taken the same
+            // shape. An owned op crosses nothing.
+            let gathers_ok = r.head_gathers == replicated_ops
+                || (replicated_ops >= 2
+                    && r.head_gathers
+                        == crate::mtp_lanes::draft_round_slices(replicated_ops).count());
             let peer_gathers = by_rank
                 .values()
                 .map(|p| p.head_gathers)

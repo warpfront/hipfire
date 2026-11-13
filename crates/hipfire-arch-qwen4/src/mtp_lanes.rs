@@ -1097,16 +1097,16 @@ pub(crate) fn lane_call<R>(
         .map_err(|error| error.to_string())
 }
 
-/// Whether one draft round of `ops` ops runs as ONE batched head call
-/// (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`, rows scratch allocated): 2..=8 ops, and
-/// no op reads a distribution the batched ranking does not leave in the head's
-/// shared logit row (`any_distribution_read` with a head that does not
-/// re-score; a re-scoring head's read is its host-resident candidates).
+/// Whether one draft round of `ops` ops runs batched (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`, rows
+/// scratch allocated): 2 or more ops, as [`forward_draft_rows`]' calls of at most
+/// [`crate::mtp_gpu::MTP_DRAFT_LANES_MAX`] lanes each, and no op reads a distribution the
+/// batched ranking does not leave in the head's shared logit row (`any_distribution_read` with
+/// a head that does not re-score; a re-scoring head's read is its host-resident candidates).
 ///
 /// The decision must be the same on every EP rank (the head's gather parity
 /// advances once per batched call and once per op serially): it depends only
 /// on the root's plan, the process flag and the head's build, never on which
-/// rank owns the sampler.
+/// rank owns the sampler; the split into calls depends only on `ops`.
 pub(crate) fn draft_round_batchable(
     bundle: &Qwen4Bundle,
     ops: usize,
@@ -1127,13 +1127,46 @@ fn batchable_round(
     any_distribution_read: bool,
     rescored: bool,
 ) -> bool {
-    rows_ready
-        && (2..=crate::mtp_gpu::MTP_DRAFT_LANES_MAX).contains(&ops)
-        && (rescored || !any_distribution_read)
+    rows_ready && ops >= 2 && (rescored || !any_distribution_read)
 }
 
-/// The device work of one draft round as one batched head call: `ops[i]` is
-/// `(input token, position)` of `lanes[i]`; lane `i`'s result lands in slot
+/// The calls one batched round of `ops` (>= 2) lanes runs as: `ceil(ops / MAX)` contiguous
+/// slices of at most [`crate::mtp_gpu::MTP_DRAFT_LANES_MAX`] lanes, sizes differing by at most
+/// one (larger first), so every slice carries at least two lanes. A lane's batched head step is
+/// byte-identical to its serial step whatever the other rows of its call are (the batched-round
+/// oracle, `lab_draft_rounds`), so the split moves no byte.
+pub(crate) fn draft_round_slices(ops: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+    let max = crate::mtp_gpu::MTP_DRAFT_LANES_MAX;
+    let calls = ops.div_ceil(max).max(1);
+    let (base, extra) = (ops / calls, ops % calls);
+    (0..calls).scan(0usize, move |start, call| {
+        let len = base + usize::from(call < extra);
+        let range = *start..*start + len;
+        *start += len;
+        Some(range)
+    })
+}
+
+/// One batched draft round over `rows` (2 or more lanes): one
+/// `mtp_forward_rows_deferred` call per [`draft_round_slices`] slice, lane `i`'s result in
+/// slot `i` of `top1_out`. Every call is enqueued before any result is read: a lane's finish
+/// parses only its own slot (`draft_finish_request`).
+pub(crate) fn forward_draft_rows(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    rows: &mut [crate::mtp_gpu::DraftRow<'_>],
+    top1_out: &GpuTensor,
+) -> Result<(), BundleError> {
+    let slot = Gpu::TOPK8_OUT_BYTES;
+    for slice in draft_round_slices(rows.len()) {
+        let out = top1_out.sub_offset(slice.start * slot, slice.len() * slot);
+        bundle.mtp_forward_rows_deferred(gpu, &mut rows[slice], &out)?;
+    }
+    Ok(())
+}
+
+/// The device work of one draft round as batched head calls ([`forward_draft_rows`]): `ops[i]`
+/// is `(input token, position)` of `lanes[i]`; lane `i`'s result lands in slot
 /// `i` of `top1_out`. Each lane's own head state and draft request state are
 /// passed in place (nothing is swapped); the step is the lane's `j`-th draft
 /// (`j = position - window.position`), fresh selection exactly at `j == 0`.
@@ -1170,8 +1203,7 @@ pub(crate) fn enqueue_batched_draft(
             fresh_qsa_selection: j == 0,
         });
     }
-    bundle
-        .mtp_forward_rows_deferred(gpu, &mut rows, top1_out)
+    forward_draft_rows(bundle, gpu, &mut rows, top1_out)
         .map_err(|e| format!("batched draft step: {e}"))
 }
 
@@ -1196,20 +1228,50 @@ pub(crate) fn finish_batched_draft(
 
 #[cfg(test)]
 mod batched_draft_tests {
-    use super::batchable_round;
+    use super::{batchable_round, draft_round_slices};
 
     #[test]
-    fn batched_round_needs_two_to_eight_ops_and_the_rows_scratch() {
-        for ops in [0, 1, 9, 16] {
+    fn batched_round_needs_two_ops_and_the_rows_scratch() {
+        for ops in [0, 1] {
             assert!(!batchable_round(ops, true, false, true), "{ops} ops");
         }
-        for ops in 2..=8 {
+        for ops in 2..=64 {
             assert!(batchable_round(ops, true, false, true), "{ops} ops");
             assert!(
                 !batchable_round(ops, false, false, true),
                 "{ops} ops, no scratch"
             );
         }
+    }
+
+    #[test]
+    fn round_slices_cover_the_ops_in_calls_of_two_to_eight_lanes() {
+        let max = crate::mtp_gpu::MTP_DRAFT_LANES_MAX;
+        for ops in 2..=256 {
+            let slices: Vec<_> = draft_round_slices(ops).collect();
+            assert_eq!(slices.len(), ops.div_ceil(max), "{ops} ops");
+            let mut next = 0;
+            for slice in &slices {
+                assert_eq!(slice.start, next, "{ops} ops: contiguous");
+                assert!((2..=max).contains(&slice.len()), "{ops} ops: {slice:?}");
+                next = slice.end;
+            }
+            assert_eq!(next, ops, "{ops} ops: covered");
+            let lens: Vec<usize> = slices.iter().map(|s| s.len()).collect();
+            assert!(
+                lens.windows(2).all(|w| w[0] >= w[1] && w[0] - w[1] <= 1),
+                "{ops}: {lens:?}"
+            );
+        }
+        // At most eight lanes: one call over the whole round, as before.
+        for ops in 2..=max {
+            assert_eq!(draft_round_slices(ops).collect::<Vec<_>>(), vec![0..ops]);
+        }
+        assert_eq!(
+            draft_round_slices(32).collect::<Vec<_>>(),
+            vec![0..8, 8..16, 16..24, 24..32]
+        );
+        assert_eq!(draft_round_slices(9).collect::<Vec<_>>(), vec![0..5, 5..9]);
     }
 
     #[test]
