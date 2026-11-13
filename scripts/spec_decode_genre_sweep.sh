@@ -27,7 +27,7 @@
 # Env: HIPFIRE_MODELS_DIR (default ~/.hipfire/models)
 #
 # temp 0.0 (default) = greedy (the canonical lossless durability measure).
-# temp >0 = sampled spec-decode (HIPFIRE_DFLASH_FAST_SAMPLE / HIPFIRE_MTP_SAMPLED
+# temp >0 = sampled spec-decode (HIPFIRE_DFLASH_FAST_SAMPLE / native sampled MTP
 # engage the lossless rejection-sampling paths). Compare branches at the SAME temp.
 set -u
 cd "$(dirname "$0")/.."
@@ -73,10 +73,10 @@ GENRES=(
 ALL_CONFIGS=(
   "27b_ar|$M/qwen3.6-27b.mq4|none|"
   "27b_dflash|$M/qwen3.6-27b.mq4|$M/qwen36-27b-dflash-mq4.hf4|HIPFIRE_DFLASH_FAST_SAMPLE=1"
-  "27b_mtp|$M/qwen3.6-27b.mq4|none|HIPFIRE_QWEN_MTP=1 HIPFIRE_MTP_SAMPLED=1"
+  "27b_mtp|$M/qwen3.6-27b.mq4|none|HIPFIRE_QWEN_MTP=1"
   "a3b_ar|$M/qwen3.6-35b-a3b.mq4r|none|"
   "a3b_dflash|$M/qwen3.6-35b-a3b.mq4r|$M/qwen36-35b-a3b-dflash-mq4.hf4|HIPFIRE_DFLASH_FAST_SAMPLE=1"
-  "a3b_mtp|$M/qwen3.6-35b-a3b.mq4r-cvs-mtp|none|HIPFIRE_QWEN_MTP=1 HIPFIRE_MTP_SAMPLED=1"
+  "a3b_mtp|$M/qwen3.6-35b-a3b.mq4r-cvs-mtp|none|HIPFIRE_QWEN_MTP=1"
 )
 
 # Filter configs by --models selection.

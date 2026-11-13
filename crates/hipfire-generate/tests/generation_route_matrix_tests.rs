@@ -35,7 +35,6 @@ fn base() -> GenerationRouteInputs {
         min_p: None,
         nonneutral_penalties: false,
         force_ar_chat: false,
-        temp_spec_env_off: false,
         fast_sample_on: true,
         supports_temp_swor: false,
         supports_chain_nucleus_verify: false,
@@ -554,10 +553,6 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
             ..mtp
         },
         GenerationRouteInputs {
-            temp_spec_env_off: true,
-            ..mtp
-        },
-        GenerationRouteInputs {
             kv_adaptive: true,
             ..mtp
         },
@@ -626,11 +621,6 @@ fn qwen4_sampled_mtp_route_honors_penalties() {
                 ..sampled
             },
             GenerationRouteInputs {
-                temp_spec_env_off: true,
-                nonneutral_penalties: penalties,
-                ..sampled
-            },
-            GenerationRouteInputs {
                 kv_adaptive: true,
                 nonneutral_penalties: penalties,
                 ..sampled
@@ -646,10 +636,9 @@ fn qwen4_sampled_mtp_route_honors_penalties() {
 }
 
 /// Qwen4 pipeline parallelism: sampled, unpenalized requests take native MTP
-/// (Leviathan verify, distribution-exact) exactly as on one card. The kill
-/// switch (`speculation.mtp_sampled = 0` → `supports_temp_swor` false, and
-/// the naive sampled mode under PP, which the route input also reports as
-/// not sampled-capable) and any penalty keep the PP AR producer.
+/// (Leviathan verify, distribution-exact) exactly as on one card. A drafter
+/// without sampled verification (`supports_temp_swor` false, e.g. the naive
+/// sampled mode under PP) and any penalty keep the PP AR producer.
 #[test]
 fn qwen4_pp_sampled_mtp_route_admits_unpenalized_leviathan_only() {
     for pp in [2usize, 4, 8] {
@@ -681,7 +670,7 @@ fn qwen4_pp_sampled_mtp_route_admits_unpenalized_leviathan_only() {
             );
         }
         for refused in [
-            // HIPFIRE_MTP_SAMPLED=0 / PP naive mode.
+            // PP naive mode.
             GenerationRouteInputs {
                 supports_temp_swor: false,
                 ..sampled
@@ -697,10 +686,6 @@ fn qwen4_pp_sampled_mtp_route_admits_unpenalized_leviathan_only() {
             },
             GenerationRouteInputs {
                 force_ar_chat: true,
-                ..sampled
-            },
-            GenerationRouteInputs {
-                temp_spec_env_off: true,
                 ..sampled
             },
             GenerationRouteInputs {
@@ -862,8 +847,6 @@ fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
     assert!(!hipfire_generate::qwen::spec_cache_disabled_for(
         false, false
     ));
-    // HIPFIRE_QWEN_PROMPT_CACHE=0 still disables it for every family.
-    assert!(hipfire_generate::qwen::spec_cache_disabled_for(false, true));
 }
 
 /// Asserts every `PromptCachePlan` field against the expected start and resume.
@@ -1033,7 +1016,7 @@ fn local_candidate_never_covers_the_whole_prompt() {
     }
 }
 
-/// A disabled cache (`HIPFIRE_QWEN_PROMPT_CACHE=0` or eviction active) reaches
+/// A disabled cache (eviction active, native Qwen4 MTP) reaches
 /// the shared planner as `cache_eligible = false`: cold even where a live
 /// extension or checkpoint resume would hit.
 #[test]
@@ -1109,10 +1092,6 @@ fn qwen4_dflash2_takes_the_spec_route_single_card_without_penalties() {
             },
             GenerationRouteInputs {
                 force_ar_chat: true,
-                ..request
-            },
-            GenerationRouteInputs {
-                temp_spec_env_off: true,
                 ..request
             },
             GenerationRouteInputs {

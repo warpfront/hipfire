@@ -647,12 +647,11 @@ pub(crate) fn vl_plan_reuse(
     prior: &[u32],
     prompt: &[u32],
     seq_pos: usize,
-    reuse_allowed: bool,
     image_pad_id: u32,
     resident_images: &[[u8; 32]],
     images: &[[u8; 32]],
 ) -> usize {
-    if !reuse_allowed || prior.is_empty() || seq_pos != prior.len() {
+    if prior.is_empty() || seq_pos != prior.len() {
         return 0;
     }
     let lcp = prior.iter().zip(prompt).take_while(|(a, b)| a == b).count();
@@ -775,7 +774,6 @@ pub(crate) struct VlPrompt {
 pub(crate) struct VlRenderInputs<'a> {
     pub tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
     pub chat_template: Option<&'a str>,
-    pub jinja_enabled: bool,
     pub history: Option<&'a [hipfire_runtime::prompt_frame::Message]>,
     pub n_images: usize,
     pub system: Option<&'a str>,
@@ -788,7 +786,6 @@ pub(crate) struct VlRenderInputs<'a> {
     /// The resident conversation: assistant turns replay their emitted tokens
     /// (instead of a template re-render) only when there is one to continue.
     pub resident_tokens: &'a [u32],
-    pub turn_cache_enabled: bool,
 }
 
 /// Render the conversation a vision request carries.
@@ -854,13 +851,12 @@ pub(crate) fn vl_render_prompt(
             inputs.n_images
         ));
     }
-    let Some(template) = inputs.chat_template.filter(|_| inputs.jinja_enabled) else {
+    let Some(template) = inputs.chat_template else {
         let turns = history.iter().filter(|m| m.role != Role::System).count();
         let last_user = history.iter().rev().find(|m| m.role == Role::User);
         let (true, Some(last_user)) = (turns == 1, last_user) else {
             return Err(
-                "multi-turn image conversations need the model's chat template (it is missing or \
-                 HIPFIRE_JINJA_CHAT=0)"
+                "multi-turn image conversations need the model's chat template (it is missing)"
                     .to_owned(),
             );
         };
@@ -890,7 +886,7 @@ pub(crate) fn vl_render_prompt(
         .map_err(|e| format!("jinja render: {e}"))?;
     let started_in_think = hipfire_engine::emit::render_tail_opens_think(&rendered);
     let cold = tokenizer.encode(&rendered);
-    let tokens = if inputs.turn_cache_enabled && !inputs.resident_tokens.is_empty() {
+    let tokens = if !inputs.resident_tokens.is_empty() {
         match crate::qwen::qwen_jinja_cached_history_tokens(
             &frame,
             asst_turn_cache,
@@ -1152,16 +1148,6 @@ pub fn generate_vl(
     // Render the conversation (CPU only) BEFORE the stream opener: the opener's
     // `started_in_think` is read off the rendered prompt tail, like the text
     // path's. A render failure is reported right after the opener.
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-        .ok()
-        .as_deref()
-        != Some("0");
-    // The text path's prompt-cache kill switch also gates continuing a vision
-    // conversation in place.
-    let turn_cache_enabled = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
-        .ok()
-        .as_deref()
-        != Some("0");
     let rendered = match m.tokenizer.as_ref() {
         None => Err("tokenizer not loaded".to_owned()),
         Some(tokenizer) => {
@@ -1185,7 +1171,6 @@ pub fn generate_vl(
                 &VlRenderInputs {
                     tokenizer,
                     chat_template: m.chat_template.as_deref(),
-                    jinja_enabled,
                     history: messages_history,
                     n_images: image_sources.len(),
                     system: system_prompt,
@@ -1195,7 +1180,6 @@ pub fn generate_vl(
                     assistant_prefix,
                     image_ids,
                     resident_tokens: &m.conversation_tokens,
-                    turn_cache_enabled,
                 },
                 &mut m.asst_turn_cache,
             )
@@ -1295,7 +1279,6 @@ pub fn generate_vl(
             &m.conversation_tokens,
             &prompt_full,
             m.seq_pos,
-            turn_cache_enabled,
             image_pad_id,
             &m.vl_image_fingerprints,
             &image_fingerprints,
@@ -4290,7 +4273,6 @@ mod vl_history_tests {
             &VlRenderInputs {
                 tokenizer: tok,
                 chat_template: template,
-                jinja_enabled: true,
                 history: Some(history),
                 n_images,
                 system: None,
@@ -4300,7 +4282,6 @@ mod vl_history_tests {
                 assistant_prefix: AssistantPrefix::Plain,
                 image_ids: [VS, PAD, VE],
                 resident_tokens: resident,
-                turn_cache_enabled: true,
             },
             cache,
         )
@@ -4408,27 +4389,26 @@ mod vl_history_tests {
         let prior = vec![1, 2, PAD, PAD, 3, 4];
         let longer = vec![1, 2, PAD, PAD, 3, 4, 5, 6];
         let one = [[1u8; 32]];
-        let plan = |prior: &[u32], prompt: &[u32], seq_pos: usize, allowed: bool| {
-            vl_plan_reuse(prior, prompt, seq_pos, allowed, PAD, &one, &one)
+        let plan = |prior: &[u32], prompt: &[u32], seq_pos: usize| {
+            vl_plan_reuse(prior, prompt, seq_pos, PAD, &one, &one)
         };
-        assert_eq!(plan(&prior, &longer, 6, true), 6);
-        // Reuse disabled (kill switch), nothing resident, a cursor that
-        // is not at the end of the resident tokens: cold.
-        assert_eq!(plan(&prior, &longer, 6, false), 0);
-        assert_eq!(plan(&[], &longer, 0, true), 0);
-        assert_eq!(plan(&prior, &longer, 5, true), 0);
+        assert_eq!(plan(&prior, &longer, 6), 6);
+        // Nothing resident, or a cursor that is not at the end of the
+        // resident tokens: cold.
+        assert_eq!(plan(&[], &longer, 0), 0);
+        assert_eq!(plan(&prior, &longer, 5), 0);
         // Re-sent identical prompt: nothing to prefill, the last token's
         // recurrent update must not be applied twice.
-        assert_eq!(plan(&prior, &prior, 6, true), 0);
+        assert_eq!(plan(&prior, &prior, 6), 0);
         // A diverging or edited history is not an extension.
-        assert_eq!(plan(&prior, &[1, 9, PAD, PAD, 3, 4, 5], 6, true), 0);
-        assert_eq!(plan(&prior, &[1, 2, PAD, PAD, 3], 6, true), 0);
+        assert_eq!(plan(&prior, &[1, 9, PAD, PAD, 3, 4, 5], 6), 0);
+        assert_eq!(plan(&prior, &[1, 2, PAD, PAD, 3], 6), 0);
         // A boundary inside an image's pad run is never a reuse point.
         let cut = vec![1, 2, PAD, PAD];
-        assert_eq!(plan(&cut, &[1, 2, PAD, PAD, PAD, 3], 4, true), 0);
+        assert_eq!(plan(&cut, &[1, 2, PAD, PAD, PAD, 3], 4), 0);
         // Same tokens but a different image: cold.
         assert_eq!(
-            vl_plan_reuse(&prior, &longer, 6, true, PAD, &one, &[[2u8; 32]]),
+            vl_plan_reuse(&prior, &longer, 6, PAD, &one, &[[2u8; 32]]),
             0
         );
     }
@@ -4518,15 +4498,7 @@ mod vl_history_tests {
         let rendered = render(tok, Some(TEMPLATE), history, n_images, resident, cache).unwrap();
         let counts = vec![N_VISUAL; n_images];
         let prompt = expand_image_pads(&rendered.tokens, PAD, &counts).unwrap();
-        let reuse = vl_plan_reuse(
-            resident,
-            &prompt,
-            resident.len(),
-            true,
-            PAD,
-            resident_fps,
-            fps,
-        );
+        let reuse = vl_plan_reuse(resident, &prompt, resident.len(), PAD, resident_fps, fps);
         let encoded_images = image_pad_runs(&prompt, PAD)
             .iter()
             .enumerate()

@@ -257,7 +257,6 @@ pub fn glimmer_spec_admission(
     temp: f32,
     min_p: Option<f32>,
     fast_sample_on: bool,
-    temp_spec_env_off: bool,
     batched_logits_available: bool,
 ) -> GlimmerSpecMode {
     if !has_drafter || max_tokens <= 1 {
@@ -266,11 +265,7 @@ pub fn glimmer_spec_admission(
     if temp <= 0.01 {
         return GlimmerSpecMode::Greedy;
     }
-    if temp > 1e-6
-        && fast_sample_on
-        && !temp_spec_env_off
-        && min_p.map_or(true, |p| p <= 0.0)
-        && batched_logits_available
+    if temp > 1e-6 && fast_sample_on && min_p.map_or(true, |p| p <= 0.0) && batched_logits_available
     {
         return GlimmerSpecMode::ChainSampled;
     }
@@ -2265,15 +2260,9 @@ pub fn generate_gemma4(
         emit_error_with_id(stdout, id, "tokenizer not loaded");
         return;
     }
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-        .ok()
-        .as_deref()
-        != Some("0");
     let tools_nonempty = tools.is_some_and(|t| !t.is_empty());
     if tools_nonempty {
-        if let Some(reason) =
-            gemma4_tools_unsupported_reason(m.chat_template.as_deref(), jinja_enabled)
-        {
+        if let Some(reason) = gemma4_tools_unsupported_reason(m.chat_template.as_deref()) {
             emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -2311,7 +2300,7 @@ pub fn generate_gemma4(
     // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let try_jinja = m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -2586,14 +2575,8 @@ pub fn generate_gemma4(
 /// the embedded template (it declares them as `<|tool>` blocks the model was
 /// trained on) and that template's native `<|tool_call>` format, which
 /// [`GemmaToolSplitter`](gemma4::emit::GemmaToolSplitter) parses.
-pub fn gemma4_tools_unsupported_reason(
-    chat_template: Option<&str>,
-    jinja_enabled: bool,
-) -> Option<&'static str> {
+pub fn gemma4_tools_unsupported_reason(chat_template: Option<&str>) -> Option<&'static str> {
     match chat_template {
-        _ if !jinja_enabled => {
-            Some("HIPFIRE_JINJA_CHAT=0 disables the chat template that declares tools to the model")
-        }
         None => Some("this model embeds no chat template, so it cannot declare tools"),
         Some(template) if !template.contains("<|tool_call>") => {
             Some("this model's chat template has no tool-call format")
@@ -2974,8 +2957,8 @@ fn generate_gemma4_spec(
 /// Mirrors `generate_gemma4` shape (prefill loop / decode loop, JSONL
 /// `token` / `done` events) with Glimmer specifics:
 ///
-///   1. Prompt build goes through `JinjaChatFrame` when `HIPFIRE_JINJA_CHAT=1`
-///      and the model carries a chat_template, falling back to
+///   1. Prompt build goes through `JinjaChatFrame` when the model carries a
+///      chat_template, falling back to
 ///      `tokenizer.encode` (BOS-prepended) otherwise.
 ///   2. `glimmer::forward::decode_step` returns the full logits `Vec<f32>`
 ///      (the state does NOT stash a greedy next-token), so sampling runs
@@ -4192,80 +4175,41 @@ pub fn glimmer_ar_forward_pending(
     temp: f32,
     top_p: f32,
     top_k: Option<u32>,
-    gpu_sample: bool,
     gpu_rng: u32,
-    host_rng: &mut deepseek4::sampling::Xorshift,
 ) -> Result<(u32, u32), String> {
     let position = bundle.state.n_tokens as u32;
-    let top_k_host = top_k.map(|k| k as usize).unwrap_or(0);
     let has_drafter = bundle.drafter.is_some();
     let device_capture = has_drafter && bundle.device_hidden_capture_enabled();
-    if has_drafter {
-        if device_capture {
-            if gpu_sample {
-                glimmer::forward::decode_step_sampled_with_device_capture(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    token,
-                    position,
-                    temp,
-                    top_p,
-                    top_k,
-                    gpu_rng,
-                )
-            } else {
-                glimmer::forward::decode_step_with_device_capture(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    token,
-                    position,
-                )
-                .map(|logits| {
-                    let tok = deepseek4::sampling::sample_token(
-                        &logits, temp, top_k_host, top_p, host_rng,
-                    );
-                    (tok, gpu_rng)
-                })
-            }
-        } else if gpu_sample {
-            let tap = glimmer_tap_layers(bundle.config.n_layers);
-            glimmer::forward::decode_step_sampled_with_capture(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                token,
-                position,
-                &tap,
-                &mut bundle.target_hidden_host,
-                temp,
-                top_p,
-                top_k,
-                gpu_rng,
-            )
-        } else {
-            let tap = glimmer_tap_layers(bundle.config.n_layers);
-            glimmer::forward::decode_step_with_capture(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                token,
-                position,
-                &tap,
-                &mut bundle.target_hidden_host,
-            )
-            .map(|logits| {
-                let tok =
-                    deepseek4::sampling::sample_token(&logits, temp, top_k_host, top_p, host_rng);
-                (tok, gpu_rng)
-            })
-        }
-    } else if gpu_sample {
+    if device_capture {
+        glimmer::forward::decode_step_sampled_with_device_capture(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            token,
+            position,
+            temp,
+            top_p,
+            top_k,
+            gpu_rng,
+        )
+    } else if has_drafter {
+        let tap = glimmer_tap_layers(bundle.config.n_layers);
+        glimmer::forward::decode_step_sampled_with_capture(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            token,
+            position,
+            &tap,
+            &mut bundle.target_hidden_host,
+            temp,
+            top_p,
+            top_k,
+            gpu_rng,
+        )
+    } else {
         glimmer::forward::decode_step_sampled(
             &bundle.config,
             &bundle.weights,
@@ -4278,19 +4222,6 @@ pub fn glimmer_ar_forward_pending(
             top_k,
             gpu_rng,
         )
-    } else {
-        glimmer::forward::decode_step(
-            &bundle.config,
-            &bundle.weights,
-            &mut bundle.state,
-            gpu,
-            token,
-            position,
-        )
-        .map(|logits| {
-            let tok = deepseek4::sampling::sample_token(&logits, temp, top_k_host, top_p, host_rng);
-            (tok, gpu_rng)
-        })
     }
 }
 
@@ -4421,11 +4352,7 @@ pub fn generate_muse_glimmer(
     // ── Prompt build (same two-path branch as the gemma4 AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let try_jinja = m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -4655,49 +4582,32 @@ pub fn generate_muse_glimmer(
     // Candidate: `lcp == prior_len && 0 < lcp < prompt_ids.len()`.
     // Real hit also requires `bundle.can_rewind_session_to(lcp)`.
     // On hit: rewind_session_to(lcp) BEFORE mirror/seq truncation.
-    // On miss / cache-disabled / rewind error: reset_session_state + full prefill at 0.
+    // On miss / rewind error: reset_session_state + full prefill at 0.
     let (prefill_ids, prefill_start_pos): (Vec<u32>, u32) = {
-        let cache_disabled = hipfire_config::developer_var("HIPFIRE_GLIMMER_PROMPT_CACHE")
-            .ok()
-            .as_deref()
-            == Some("0");
         let trace = hipfire_config::developer_var("HIPFIRE_GLIMMER_CACHE_TRACE")
             .ok()
             .as_deref()
             == Some("1");
-        if cache_disabled {
-            // Opting out of the cache does NOT restore the CLI's per-request
-            // reset — arch 14 is in the cache_capable allowlist either way, so
-            // the CLI keeps the session warm. Cold-reset here or the opt-out
-            // path becomes the very double-write the cache was added to avoid.
-            if bundle.state.n_tokens > 0 || !m.conversation_tokens.is_empty() {
-                bundle.reset_session_state();
-                m.conversation_tokens.clear();
-                m.seq_pos = 0;
-                m.asst_turn_cache.clear();
-            }
-            (prompt_ids.clone(), 0u32)
-        } else {
-            let prior_len = m.conversation_tokens.len();
-            let max_match = prior_len.min(prompt_ids.len());
-            let mut lcp = 0usize;
-            while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
-                lcp += 1;
-            }
-            // STRICT FORWARD EXTENSION ONLY. Candidate iff the whole mirror is a
-            // prefix of the new render: `lcp == prior_len && 0 < lcp < prompt_ids.len()`.
-            let candidate = lcp == prior_len && lcp > 0 && lcp < prompt_ids.len();
-            let can_rewind = candidate && bundle.can_rewind_session_to(lcp);
-            let cache_hit = can_rewind;
-            if trace {
-                let reject_reason = if !candidate {
-                    "not_strict_forward_extension"
-                } else if !can_rewind {
-                    "capture_state_cannot_rewind"
-                } else {
-                    ""
-                };
-                eprintln!(
+        let prior_len = m.conversation_tokens.len();
+        let max_match = prior_len.min(prompt_ids.len());
+        let mut lcp = 0usize;
+        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+            lcp += 1;
+        }
+        // STRICT FORWARD EXTENSION ONLY. Candidate iff the whole mirror is a
+        // prefix of the new render: `lcp == prior_len && 0 < lcp < prompt_ids.len()`.
+        let candidate = lcp == prior_len && lcp > 0 && lcp < prompt_ids.len();
+        let can_rewind = candidate && bundle.can_rewind_session_to(lcp);
+        let cache_hit = can_rewind;
+        if trace {
+            let reject_reason = if !candidate {
+                "not_strict_forward_extension"
+            } else if !can_rewind {
+                "capture_state_cannot_rewind"
+            } else {
+                ""
+            };
+            eprintln!(
                     "[glimmer-cache] prior_len={} n_tokens={} prompt_len={} lcp={} candidate={} hit={} reason={} replay={}/{}",
                     prior_len,
                     bundle.state.n_tokens,
@@ -4709,37 +4619,36 @@ pub fn generate_muse_glimmer(
                     glimmer_replay_hits.get(),
                     glimmer_replay_lookups.get()
                 );
-            }
-            if cache_hit {
-                // Rewind session (KV + capture + drafter) BEFORE mirror/seq truncate.
-                if let Err(e) = bundle.rewind_session_to(lcp) {
-                    if trace {
-                        eprintln!(
-                            "[glimmer-cache] rewind_session_to({lcp}) failed: {e} — converting to MISS"
-                        );
-                    }
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.seq_pos = 0;
-                    m.asst_turn_cache.clear();
-                    (prompt_ids.clone(), 0u32)
-                } else {
-                    m.conversation_tokens.truncate(lcp);
-                    m.seq_pos = lcp;
-                    (prompt_ids[lcp..].to_vec(), lcp as u32)
+        }
+        if cache_hit {
+            // Rewind session (KV + capture + drafter) BEFORE mirror/seq truncate.
+            if let Err(e) = bundle.rewind_session_to(lcp) {
+                if trace {
+                    eprintln!(
+                        "[glimmer-cache] rewind_session_to({lcp}) failed: {e} — converting to MISS"
+                    );
                 }
-            } else {
-                // MISS with a hot cache MUST cold-reset. Covers both misses:
-                // lcp == 0 (fully divergent) and lcp == prompt_ids.len()
-                // (identical prompt re-sent), plus candidate rejected by capture.
-                if bundle.state.n_tokens > 0 || prior_len > 0 {
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.seq_pos = 0;
-                    m.asst_turn_cache.clear();
-                }
+                bundle.reset_session_state();
+                m.conversation_tokens.clear();
+                m.seq_pos = 0;
+                m.asst_turn_cache.clear();
                 (prompt_ids.clone(), 0u32)
+            } else {
+                m.conversation_tokens.truncate(lcp);
+                m.seq_pos = lcp;
+                (prompt_ids[lcp..].to_vec(), lcp as u32)
             }
+        } else {
+            // MISS with a hot cache MUST cold-reset. Covers both misses:
+            // lcp == 0 (fully divergent) and lcp == prompt_ids.len()
+            // (identical prompt re-sent), plus candidate rejected by capture.
+            if bundle.state.n_tokens > 0 || prior_len > 0 {
+                bundle.reset_session_state();
+                m.conversation_tokens.clear();
+                m.seq_pos = 0;
+                m.asst_turn_cache.clear();
+            }
+            (prompt_ids.clone(), 0u32)
         }
     };
 
@@ -4833,17 +4742,12 @@ pub fn generate_muse_glimmer(
             &bundle.weights,
         );
     let fast_sample_on = hipfire_runtime::config::get().dflash_fast_sample;
-    let temp_spec_env_off = hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
-        .ok()
-        .as_deref()
-        == Some("0");
     let spec_mode = glimmer_spec_admission(
         bundle.drafter.is_some(),
         max_tokens,
         temp,
         min_p,
         fast_sample_on,
-        temp_spec_env_off,
         batched_logits_available,
     );
     let use_spec = spec_mode != GlimmerSpecMode::Off;
@@ -4854,12 +4758,6 @@ pub fn generate_muse_glimmer(
     let mut logits_buf: Vec<f32> = Vec::new();
     // Shared by native AR, profit probes, and post-retirement AR tail.
     let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
-    let gpu_sample = !matches!(
-        hipfire_config::developer_var("HIPFIRE_GLIMMER_GPU_SAMPLE")
-            .ok()
-            .as_deref(),
-        Some("0")
-    );
     let mut gpu_rng: u32 = (rng.next_u64() as u32) | 1;
     // Common AR tail seed. Native AR initializes from prefill logits; retirement
     // hands the untouched greedy target prediction; completed spec leaves None.
@@ -5227,9 +5125,8 @@ pub fn generate_muse_glimmer(
                     }
                     let pending = last_pick;
                     // Force greedy recovery parameters — speculative path is greedy.
-                    let fb = glimmer_ar_forward_pending(
-                        bundle, gpu, pending, 0.0, 1.0, None, gpu_sample, gpu_rng, &mut rng,
-                    );
+                    let fb =
+                        glimmer_ar_forward_pending(bundle, gpu, pending, 0.0, 1.0, None, gpu_rng);
                     match fb {
                         Ok((next_tok, new_rng)) => {
                             gpu_rng = new_rng;
@@ -5741,9 +5638,8 @@ pub fn generate_muse_glimmer(
                     // Already-emitted bonus at commit_end: decode once without re-route/re-count.
                     let measured = matches!(probe_kind, GlimmerProfitProbeKind::Measured);
                     let probe_t0 = std::time::Instant::now();
-                    let probe = glimmer_ar_forward_pending(
-                        bundle, gpu, bonus, 0.0, 1.0, None, gpu_sample, gpu_rng, &mut rng,
-                    );
+                    let probe =
+                        glimmer_ar_forward_pending(bundle, gpu, bonus, 0.0, 1.0, None, gpu_rng);
                     match probe {
                         Ok((pred, new_rng)) => {
                             gpu_rng = new_rng;
@@ -5954,9 +5850,7 @@ pub fn generate_muse_glimmer(
                 ar_temp,
                 ar_top_p,
                 ar_top_k_opt,
-                gpu_sample,
                 gpu_rng,
-                &mut rng,
             ) {
                 Ok((sampled, new_rng)) => {
                     gpu_rng = new_rng;
@@ -6185,14 +6079,7 @@ pub fn generate_lfm2moe(
         // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
         // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
         // the .hfq carries no template, e.g. an older A1B convert).
-        // Jinja default-ON (flipped 2026-06-09): render through the model's chat
-        // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
-        // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let try_jinja = m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -6683,8 +6570,8 @@ pub fn generate_lfm2moe(
 /// Mirrors `generate_lfm2moe`'s shape (prefill loop / chunked batched prefill,
 /// per-token decode loop, JSONL `token` / `done` events) with two differences:
 ///
-///   1. Prompt build goes through `JinjaChatFrame` when `HIPFIRE_JINJA_CHAT=1`
-///      and the model carries a chat_template (so MiniMax-M2's own ChatML-ish
+///   1. Prompt build goes through `JinjaChatFrame` when the model carries a
+///      chat_template (so MiniMax-M2's own ChatML-ish
 ///      template + `tools` / `messages` reach the upstream Jinja branches),
 ///      falling back to the hand-rolled `ChatFrame::Plain` scaffold otherwise.
 ///   2. `minimax::forward::decode_step` returns the full logits `Vec<f32>`
@@ -6752,12 +6639,7 @@ pub fn generate_minimax(
         // (b) never matches across turns so the LCP prompt-cache is dead. Force
         // jinja on for both (falls back to Plain only when the .hfq carries no
         // template).
-        // Jinja default-ON (flipped 2026-06-09); opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let try_jinja = m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -7231,12 +7113,7 @@ pub fn generate_cohere2moe(
         // producing an off-distribution prompt that (a) decodes incoherently and
         // (b) never matches across turns so the LCP prompt-cache is dead. Force
         // jinja on (falls back to Plain only when the .hfq carries no template).
-        // Jinja default-ON; opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let try_jinja = m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -7318,14 +7195,9 @@ pub fn generate_cohere2moe(
             }
         } else {
             // cohere2moe REQUIRES its embedded jinja template (see above). When it
-            // is unavailable — HIPFIRE_JINJA_CHAT=0, or the .hfq carries no template
-            // — the only frame we could build is Plain ChatML, off-distribution for
+            // is unavailable (the .hfq carries no template) — the only frame we could build is Plain ChatML, off-distribution for
             // North. Refuse loudly instead of serving garbage.
-            let why = if !jinja_enabled {
-                "HIPFIRE_JINJA_CHAT=0 disables the required template"
-            } else {
-                "model .hfq carries no chat_template"
-            };
+            let why = "model .hfq carries no chat_template";
             eprintln!("[daemon] cohere2moe cannot build a valid prompt frame ({why}) — refusing ChatML fallback");
             emit_error_with_id(
                 stdout,
@@ -7595,11 +7467,7 @@ pub fn generate_cohere2moe(
     // without returning a result). Track whether anything visible (a text token
     // or a tool_call) was produced; if EOS arrives before that, mask it and
     // re-sample so the model is forced into <|START_TEXT|>/<|START_ACTION|> and
-    // actually returns content. Opt out with HIPFIRE_C2M_EMPTY_TURN_GUARD=0.
-    let empty_turn_guard = hipfire_config::developer_var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
-        .ok()
-        .as_deref()
-        != Some("0");
+    // actually returns content.
     let mut emitted_visible = false;
     let mut eos_suppressions = 0usize;
     const MAX_EOS_SUPPRESS: usize = 3;
@@ -7674,8 +7542,7 @@ pub fn generate_cohere2moe(
         if generated_count >= max_tokens {
             break;
         }
-        if empty_turn_guard
-            && forced_toks.is_empty()
+        if forced_toks.is_empty()
             && !think_force_closed
             && !emitted_visible
             && sec == Sec::Think
@@ -7694,7 +7561,7 @@ pub fn generate_cohere2moe(
             None => deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng),
         };
         if next_tok == eos_tok {
-            if empty_turn_guard && !emitted_visible && eos_suppressions < MAX_EOS_SUPPRESS {
+            if !emitted_visible && eos_suppressions < MAX_EOS_SUPPRESS {
                 // Reasoning-only turn in progress — the model is ending after
                 // <think> with nothing visible. FORCE a <|START_TEXT|> continuation
                 // rather than re-sampling the EOS-masked distribution: re-sampling

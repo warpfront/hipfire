@@ -355,7 +355,6 @@ mod tests {
             intent_of("memory.session_cache_bytes"),
             Intent::MemoryContext
         );
-        assert_eq!(intent_of("speculation.mtp_sampled"), Intent::Speculation);
         assert_eq!(intent_of("serve.port"), Intent::Advanced);
         assert_eq!(intent_of("developer.anything_else"), Intent::Advanced);
         assert_eq!(intent_of("not.a.key"), Intent::Advanced);

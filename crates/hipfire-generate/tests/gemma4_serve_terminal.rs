@@ -299,20 +299,14 @@ fn malformed_closed_tool_call_is_an_error_not_content() {
 #[test]
 fn tools_refusal_names_the_missing_template_capability() {
     let tool_template = "{{ '<|tool_call>call:' }}";
+    assert_eq!(gemma4_tools_unsupported_reason(Some(tool_template)), None);
     assert_eq!(
-        gemma4_tools_unsupported_reason(Some(tool_template), true),
-        None
-    );
-    assert_eq!(
-        gemma4_tools_unsupported_reason(Some("{{ bos_token }}"), true),
+        gemma4_tools_unsupported_reason(Some("{{ bos_token }}")),
         Some("this model's chat template has no tool-call format")
     );
-    assert!(gemma4_tools_unsupported_reason(None, true)
+    assert!(gemma4_tools_unsupported_reason(None)
         .unwrap()
         .contains("no chat template"));
-    assert!(gemma4_tools_unsupported_reason(Some(tool_template), false)
-        .unwrap()
-        .contains("HIPFIRE_JINJA_CHAT=0"));
 }
 
 fn message(role: Role, content: &str) -> Message {

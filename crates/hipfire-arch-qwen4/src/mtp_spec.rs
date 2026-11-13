@@ -6,7 +6,7 @@
 //!
 //! The runtime owns the speculative loop and its pending-seed contract.  This
 //! module records the native MTP count convention and lowers a verified
-//! window (greedy prefix match, or with `speculation.mtp_sampled` a sampled
+//! window (greedy prefix match, or for sampled requests a sampled
 //! verify from [`hipfire_runtime::spec_sampling`]: speculative rejection
 //! sampling, or SpecInfer naive sampling under
 //! `HIPFIRE_MTP_SAMPLED_MODE=naive`) onto the canonical runtime types.  In
@@ -350,14 +350,13 @@ pub fn target_commit_accept_len(accepted: &GreedyAccept) -> usize {
     accepted.accepted - usize::from(accepted_eos)
 }
 
-/// With `speculation.mtp_sampled` off (`HIPFIRE_MTP_SAMPLED=0`; on by
-/// default), native MTP verifies greedy target picks only, so a sampled
-/// request fails closed here (the router keeps such requests on AR).
+/// Native MTP verifies greedy target picks only, so a sampled request fails
+/// closed here (the router keeps such requests on AR). Sampled verification
+/// is off only for GDN state formats that `qwen4_mtp_sampled_allowed` rejects.
 pub fn require_native_greedy(temp: f32) -> Result<(), String> {
     if !temp.is_finite() || temp.abs() > 1.0e-6 {
         return Err(
-            "Qwen4 native MTP verifies greedy requests only while speculation.mtp_sampled is off (HIPFIRE_MTP_SAMPLED=0)"
-                .to_string(),
+            "Qwen4 native MTP verifies greedy requests only for this GDN state format".to_string(),
         );
     }
     Ok(())
@@ -2297,8 +2296,7 @@ impl SampledMode {
     }
 }
 
-/// Per-request sampled verification (`speculation.mtp_sampled`, temperature
-/// above zero).
+/// Per-request sampled verification (temperature above zero).
 ///
 /// Target policy: the Qwen4 AR producer is host `sampler::sample_cpu` over
 /// the FULL rendered prompt plus the generated tokens, with the request's
@@ -3756,7 +3754,7 @@ pub struct Qwen4MtpDrafter {
     /// counts (see `observe_agreement`); picks the verify route and draft
     /// depth when `HIPFIRE_MTP_INCREMENTAL` is unset.
     agreement: Vec<(f32, f32)>,
-    /// `speculation.mtp_sampled`, resolved at construction.
+    /// Sampled verification; `with_sampled_allowed` clears it for refused GDN formats.
     sampled_enabled: bool,
     /// `HIPFIRE_MTP_SAMPLED_MODE`, resolved at construction; an invalid
     /// value fails sampled requests with its message.
@@ -5478,7 +5476,7 @@ impl Qwen4MtpDrafter {
             row_hidden: None,
             prefill_rows: 0,
             agreement: vec![AGREEMENT_PRIOR; capacity],
-            sampled_enabled: hipfire_config::mtp_sampled_enabled(),
+            sampled_enabled: true,
             sampled_mode: SampledMode::from_env(),
             sampled: None,
             append_scratch: None,
@@ -5585,8 +5583,7 @@ impl Qwen4MtpDrafter {
     }
 
     /// Restrict sampled verification to loads that allow it: `false` turns
-    /// it off (sampled requests stay on AR), `true` keeps what
-    /// `speculation.mtp_sampled` resolved to; it never turns it on.
+    /// it off (sampled requests stay on AR); `true` leaves the flag unchanged.
     pub fn with_sampled_allowed(mut self, allowed: bool) -> Self {
         self.sampled_enabled &= allowed;
         self
@@ -9534,8 +9531,7 @@ impl Qwen4MtpDrafter {
             None if self.request.temp.abs() > 1.0e-6 => {
                 return Err(
                     "Qwen4 native MTP under qwen4 topology.pp verifies greedy requests only \
-                     while sampled verification is off (speculation.mtp_sampled / \
-                     HIPFIRE_MTP_SAMPLED=0)"
+                     while sampled verification is off"
                         .to_string(),
                 );
             }
@@ -10695,7 +10691,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         !self.sampled_enabled
     }
 
-    /// With `speculation.mtp_sampled`, a sampled request verifies by
+    /// A sampled request verifies by
     /// speculative rejection sampling, or naive sampling under
     /// `HIPFIRE_MTP_SAMPLED_MODE=naive`; greedy requests keep the argmax match.
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
@@ -10824,7 +10820,7 @@ pub fn build_qwen4_mtp_speculator(
 /// Whether a load with GDN state format `gdn` may verify sampled requests
 /// (temperature > 0) through native MTP. Under `q8_ef` they run AR instead
 /// until the sampled-MTP law (G5) is verified on a GPU; greedy native MTP is
-/// unchanged. Every other format keeps `speculation.mtp_sampled`. The match
+/// unchanged. Every other format keeps sampled verification. The match
 /// is exhaustive so a new format forces a decision here.
 pub fn qwen4_mtp_sampled_allowed(gdn: crate::GdnStateFormat) -> bool {
     match gdn {
@@ -12723,14 +12719,13 @@ mod tests {
     #[test]
     fn q8_and_fp32_sampled_mtp_unchanged() {
         use crate::GdnStateFormat;
-        let sampled = hipfire_config::mtp_sampled_enabled();
         let plain = Qwen4MtpDrafter::new(3, 4096, None);
-        assert_eq!(plain.sampled_enabled, sampled);
+        assert!(plain.sampled_enabled);
         for gdn in [GdnStateFormat::Q8, GdnStateFormat::F32] {
             let speculator =
                 build_qwen4_mtp_speculator(3, None, 4096, None, None, None, false, gdn, None);
-            assert_eq!(speculator.supports_temp_verify(), sampled, "{gdn:?}");
-            assert_eq!(speculator.requires_greedy(), !sampled, "{gdn:?}");
+            assert!(speculator.supports_temp_verify(), "{gdn:?}");
+            assert!(!speculator.requires_greedy(), "{gdn:?}");
             let gated = Qwen4MtpDrafter::new(3, 4096, None)
                 .with_sampled_allowed(qwen4_mtp_sampled_allowed(gdn));
             assert_eq!(gated.sampled_enabled, plain.sampled_enabled, "{gdn:?}");

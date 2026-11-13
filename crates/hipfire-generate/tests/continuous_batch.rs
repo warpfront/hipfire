@@ -253,7 +253,6 @@ fn lfm_dense_is_dense_and_route_is_lfm_ar() {
         min_p: None,
         nonneutral_penalties: false,
         force_ar_chat: false,
-        temp_spec_env_off: false,
         fast_sample_on: true,
         supports_temp_swor: false,
         supports_chain_nucleus_verify: false,

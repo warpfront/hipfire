@@ -2609,7 +2609,7 @@ pub fn ep_serve_minimax(
 }
 
 /// Format for re-rendering a historical assistant `tool_call` on a cache
-/// MISS in the non-jinja ChatScaffold path (`HIPFIRE_JINJA_CHAT=0`).
+/// MISS in the ChatScaffold path (model without a Jinja chat template).
 /// Mirrors the CLI's per-model grammar gating: grammar OFF (the default
 /// for native-XML Qwen3.5/3.6) => native XML; grammar ON (Hermes-format
 /// models like carnice, or a user override) => Hermes JSON. Both
@@ -3425,14 +3425,13 @@ pub fn generate_dflash(
     // `Qwen35SlotGuard` RAII target borrow — see the prefill/step/
     // reset/rewind_to calls below.
 
-    // Prompt build: same two-path branch as the AR-path generate() — when
-    // Jinja is enabled (default; opt out with HIPFIRE_JINJA_CHAT=0) AND the
+    // Prompt build: same two-path branch as the AR-path generate() — when the
     // model carries a chat_template, render via `JinjaChatFrame` so structured
     // `tools` / `messages` can reach the upstream template's `{% if tools %}` /
-    // multi-turn branches. Plain is allowed only for explicit opt-out or when
-    // no embedded template resolves. A configured-template render failure is
-    // fail-closed (non-retryable validation, handled=true) — never silently
-    // changes prompt semantics via Plain fallback.
+    // multi-turn branches. Plain applies only when no embedded template
+    // resolves. A configured-template render failure is fail-closed
+    // (non-retryable validation, handled=true) — never silently changes prompt
+    // semantics via Plain fallback.
     //
     // DFlash is single-turn by construction — `seq_pos` is reset to 0
     // below before seed_target_hidden_from_prompt runs — so we never
@@ -3440,17 +3439,10 @@ pub fn generate_dflash(
     let is_qwen4 = m.qwen4().is_some();
     // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
     // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
-    // produces garbage. Force jinja on for arch 11 (Plain only if the .hfq
-    // carries no template, e.g. an older A1B convert).
-    // Jinja default-ON (flipped 2026-06-09): render through the model's chat
-    // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
-    // ChatML/Plain). No template ⇒ Plain. Template present + render Err ⇒
-    // fail closed (see match below).
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-        .ok()
-        .as_deref()
-        != Some("0");
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    // produces garbage (Plain only if the .hfq carries no template, e.g. an
+    // older A1B convert). Template present + render Err ⇒ fail closed (see
+    // match below).
+    let try_jinja = m.chat_template.is_some();
     let mut started_in_think = matches!(
         assistant_prefix,
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
@@ -3642,14 +3634,9 @@ pub fn generate_dflash(
     } else {
         None
     };
-    let cache_disabled = spec_cache_disabled_for(
-        is_qwen4,
-        !is_qwen4
-            && hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
-                .ok()
-                .as_deref()
-                == Some("0"),
-    );
+    // Native Qwen4 MTP plans reuse through the session cache, not the shared
+    // conversation/checkpoint planner.
+    let cache_disabled = is_qwen4;
     // Qwen4 history stage of the shared canonical render, after the cold-length
     // fit checks above (same order as the former cache-plan stage).
     let prompt_tokens: Vec<u32> = if is_qwen4 {
@@ -6086,14 +6073,8 @@ pub fn generate_multi(
     let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
     // A full render (history through the chat template) cold-resets below anyway
     // and re-occupies the same positions, so a reset here could never create room.
-    let full_render = crate::ar::full_render_path(
-        messages_history.is_some(),
-        m.chat_template.is_some(),
-        hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0"),
-    );
+    let full_render =
+        crate::ar::full_render_path(messages_history.is_some(), m.chat_template.is_some());
     if crate::ar::context_full_resets(full_render, m.seq_pos, prompt_est, max_tokens, m.max_seq) {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
@@ -6138,35 +6119,19 @@ pub fn generate_multi(
     let nl = tokenizer.encode("\n");
     let q_tokens = tokenizer.encode(prompt);
 
-    // ChatML framing — two paths, same shape as the single-GPU AR
-    // generate() (line 3147+):
-    //
-    //   1) HIPFIRE_JINJA_CHAT=1 + model has chat_template + seq_pos==0
-    //      → render via JinjaChatFrame so structured tools/messages
-    //      reach the upstream template (q_tokens is unused; the rendered prompt
-    //      string is re-tokenized straight through).
-    //
-    //   2) Default: hand-rolled ChatFrame::Plain scaffold, byte-
-    //      identical to the pp=1 default path so multi-turn behavior
-    //      matches between pp=1 and pp>1 when both run the same prompt.
-    // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
-    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
-    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
-    // the .hfq carries no template, e.g. an older A1B convert).
-    // Jinja default-ON (flipped 2026-06-09): render through the model's chat
-    // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
-    // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-        .ok()
-        .as_deref()
-        != Some("0");
+    // ChatML framing, same shape as the single-GPU AR generate(): with a
+    // chat_template render via JinjaChatFrame so structured tools/messages
+    // reach the upstream template (q_tokens is unused; the rendered prompt
+    // string is re-tokenized straight through); otherwise the hand-rolled
+    // ChatFrame::Plain scaffold. LFM2.5 (arch_id 11) REQUIRES its embedded
+    // Jinja chat_template — Plain omits LFM2's `<|startoftext|>` BOS.
     // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
     // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
     // system prompt and the full history replay that render_messages provides.
     // Now Jinja renders the full conversation every turn; the cold-reset block
     // below (guarded on seq_pos > 0) re-zeros recurrent state so the full render
     // writes from position 0 instead of appending to the prior turn's KV/DeltaNet.
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let try_jinja = m.chat_template.is_some();
     // Request flag seeds Plain fallback only. Successful Jinja owns the
     // generation suffix — derive initial think from the rendered tail.
     let mut started_in_think = matches!(
@@ -10128,15 +10093,6 @@ pub(crate) enum Qwen4PromptRoute {
     Mtp,
 }
 
-/// `HIPFIRE_JINJA_CHAT` gate shared by the Qwen4 prompt stages: Jinja (default)
-/// when the model carries a chat template, else the Plain `ChatFrame`.
-fn qwen4_jinja_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-        .ok()
-        .as_deref()
-        != Some("0")
-}
-
 /// Stage 1 of the canonical Qwen4 singleton prompt: the cold render. Jinja
 /// (`render_messages` when tools/history are present, else `render`) encoded to
 /// ids, with `started_in_think` taken from the rendered tail; or the Plain
@@ -10160,7 +10116,7 @@ pub(crate) fn render_qwen4_prompt_cold(
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
     );
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let cold = if let Some(template) = m.chat_template.as_ref().filter(|_| qwen4_jinja_enabled()) {
+    let cold = if let Some(template) = m.chat_template.as_ref() {
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
@@ -10272,7 +10228,7 @@ pub(crate) fn render_qwen4_prompt_history(
         return Ok(cold);
     };
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    if let Some(template) = m.chat_template.as_ref().filter(|_| qwen4_jinja_enabled()) {
+    if let Some(template) = m.chat_template.as_ref() {
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
             template,

@@ -9,7 +9,6 @@ developer_callsite	*	?name#developer_var=-
 developer_callsite	*	?name#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	?name#developer_var=map.unwrap_or(true)
 developer_callsite	*	?name#developer_var=ok
-developer_callsite	*	?name#developer_var=ok.as_deref.==Some("0")
 developer_callsite	*	?name#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	?name#developer_var=ok.filter
 developer_callsite	*	?name#developer_var=ok.filter.map
@@ -48,7 +47,6 @@ developer_callsite	*	HIPFIRE_BF16W_TILED_ROWS#developer_bool=true
 developer_callsite	*	HIPFIRE_BF16_H_A4#developer_bool=false
 developer_callsite	*	HIPFIRE_BF16_H_FP8#developer_bool=true
 developer_callsite	*	HIPFIRE_C2M_DUMP_PROMPT#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_C2M_EMPTY_TURN_GUARD#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_C2M_NORMDUMP#developer_var=ok.map
 developer_callsite	*	HIPFIRE_CACHE_CKPT_INTERVAL#developer_var=ok.and_then.unwrap_or(2048)
 developer_callsite	*	HIPFIRE_CACHE_CKPT_INTERVAL#developer_var=ok.and_then.unwrap_or(2048usize)
@@ -181,7 +179,6 @@ developer_callsite	*	HIPFIRE_DFLASH_RAILGUN_WINDOW#developer_var=ok.as_deref.==S
 developer_callsite	*	HIPFIRE_DFLASH_SEED_ORACLE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DFLASH_SELECTOR_LANES#developer_var=map_or(true, |v| v.trim() != "0")
 developer_callsite	*	HIPFIRE_DFLASH_SPARSE_TARGET#developer_var=map_or(true, |v| v.trim() != "0")
-developer_callsite	*	HIPFIRE_DFLASH_TEMP_SPEC#developer_var=ok.as_deref.==Some("0")
 developer_callsite	*	HIPFIRE_DFLASH_VERIFY_PM4#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DFLASH_VERIFY_PM4#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DFLASH_WINDOW#developer_var=ok.and_then
@@ -287,7 +284,6 @@ developer_callsite	*	HIPFIRE_EP_UNIT_TAIL_STAGE_GAP#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_F1LITE#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_F1LITE#developer_var=as_deref.==Ok("0")
 developer_callsite	*	HIPFIRE_FA2_FILL#developer_bool=true
-developer_callsite	*	HIPFIRE_FAST_SAMPLE#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_FAULT_PREFIX_PUBLISH#developer_var=as_deref.!=Ok("1")
 developer_callsite	*	HIPFIRE_FA_KVWRITE_FOLD#developer_var=as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_FA_PERTOKEN_MIN_CTX#developer_var=ok.and_then
@@ -463,10 +459,8 @@ developer_callsite	*	HIPFIRE_GLIMMER_CTX_CAP#developer_var=ok.and_then.filter.un
 developer_callsite	*	HIPFIRE_GLIMMER_CTX_CAP#developer_var=ok.and_then.filter.unwrap_or(hipfire_arch_muse_glimmer::drafter::G...)
 developer_callsite	*	HIPFIRE_GLIMMER_DEVICE_CAPTURE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_GLIMMER_GPU_SAMPLE#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_GLIMMER_KV_VMM#developer_var=map.unwrap_or(true)
 developer_callsite	*	HIPFIRE_GLIMMER_PREFILL_CHUNK#developer_var=ok.and_then
-developer_callsite	*	HIPFIRE_GLIMMER_PROMPT_CACHE#developer_var=ok.as_deref.==Some("0")
 developer_callsite	*	HIPFIRE_GLIMMER_SPEC_DIAG#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_SPEC_FALLBACK#developer_var=ok.as_deref.!=Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_SPEC_PERTURB#developer_var=ok.as_deref.==Some("1")
@@ -489,8 +483,6 @@ developer_callsite	*	HIPFIRE_IU4_SYMFOLD#developer_var=as_deref.==Ok("0")
 developer_callsite	*	HIPFIRE_IU4_V2B#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_IU4_V2C#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_IU4_X5#developer_var=as_deref.!=Ok("0")
-developer_callsite	*	HIPFIRE_JINJA_CHAT#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_JINJA_CHAT#developer_var=ok.as_deref.==Some("0")
 developer_callsite	*	HIPFIRE_JIT_JOBS#developer_var=ok
 developer_callsite	*	HIPFIRE_JIT_JOBS#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_KV_V#developer_var=ok
@@ -596,7 +588,6 @@ developer_callsite	*	HIPFIRE_MTP_PHASE_TIMING#developer_var=map.unwrap_or(false)
 developer_callsite	*	HIPFIRE_MTP_PHASE_TIMING#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_MTP_PROPOSAL_GRAPH#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_MTP_P_MIN#developer_var=ok
-developer_callsite	*	HIPFIRE_MTP_SAMPLED#developer_bool=true
 developer_callsite	*	HIPFIRE_MTP_SAMPLED_MODE#developer_var=as_deref
 developer_callsite	*	HIPFIRE_MTP_SNAPSHOT_OVERLAP#developer_var=-
 developer_callsite	*	HIPFIRE_MTP_TRACE#developer_var=is_ok_and
@@ -850,8 +841,6 @@ developer_callsite	*	HIPFIRE_QWEN_CACHE_TRACE#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN_CACHE_TRACE#developer_var=ok.as_deref.!=Some("1")
 developer_callsite	*	HIPFIRE_QWEN_CACHE_TRACE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_QWEN_KV_DEFAULT_Q8#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_QWEN_PROMPT_CACHE#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_QWEN_PROMPT_CACHE#developer_var=ok.as_deref.==Some("0")
 developer_callsite	*	HIPFIRE_RAILGUN_CACHE_TABLE#developer_var=ok.filter
 developer_callsite	*	HIPFIRE_RAILGUN_NEGATIVE_CONTROL#developer_var=as_deref.==Ok("drop_boundaries")
 developer_callsite	*	HIPFIRE_RAON_A8_FUSE_ROUND#developer_bool=true

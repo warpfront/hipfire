@@ -200,21 +200,13 @@ fn store(m: &LoadedModel) -> Option<&Qwen35VmmStore> {
 }
 
 /// The pool serves this model: VMM store staged with AR lanes only, no
-/// singleton speculator, Jinja rendering, prompt cache on, plain KV.
+/// singleton speculator, a Jinja chat template, plain KV.
 pub fn pool_enabled(m: &LoadedModel) -> bool {
     m.speculator.is_none()
         && m.kv_adaptive.is_none()
         && m.pp <= 1
         && m.ep.is_none()
         && m.chat_template.is_some()
-        && hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0")
-        && hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
-            .ok()
-            .as_deref()
-            != Some("0")
         && store(m).is_some_and(|s| s.spec_engine().is_none())
 }
 

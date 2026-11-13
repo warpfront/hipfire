@@ -519,7 +519,7 @@ After `load_model`, request handling builds sampling defaults
    generate target.
 3. **Route match** on the selected route:
    - **Qwen4 (16)** → `Qwen4Spec` when native MTP is attached and the request
-     fits it (greedy, or sampled with `speculation.mtp_sampled`), else
+     fits it (greedy, or sampled), else
      `Qwen4Ar`. Qwen4 never takes the `m.ep` branch: its EP mesh sits inside
      the bundle.
    - **EP** (`m.ep.is_some()`) → `generate_ep` (ds4 / MiniMax ranks and
@@ -733,8 +733,7 @@ hipGraph route (Qwen4 replays prepared PM4, below).
   `HIPFIRE_SESSION_CACHE_BYTES=0` also turns it off.
 - **Removed.** The RC3 end-of-prompt checkpoint, the multi-entry radix store
   with typed PM4 relocation, shared-turn anchors and periodic captures no
-  longer exist for Qwen4; `HIPFIRE_QWEN_PROMPT_CACHE` and
-  `HIPFIRE_QWEN_RADIX_CACHE` do not affect it (Qwen3.5 and dense keep their
+  longer exist for Qwen4; `HIPFIRE_QWEN_RADIX_CACHE` does not affect it (Qwen3.5 and dense keep their
   own conversation cache).
 - **Concurrency.** Queued, not parallel: one request executes at a time per
   loaded model; HTTP concurrency queues and there is no GPU slot scheduler.

@@ -1944,18 +1944,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Native Qwen4 MTP n-gram copy lane (verbatim-copy matcher, adaptive take of up to the row-exact verify rows minus one, row-0 confirmation only until the copy source is established, kept on floor-retired requests). on/1 arms it wherever the native Qwen4 n-gram source is armed (triple 5/1/63); off/0 keeps the 5/3/3 pool with row-0 confirmation on every takeover (kill switch); auto (default) arms it for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 and leaves every other GPU off."
     ),
     field!(
-        "speculation.mtp_sampled",
-        "mtp_sampled",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Bool(true),
-        ValueRule::Bool,
-        false,
-        false,
-        Some("HIPFIRE_MTP_SAMPLED"),
-        "Qwen4 (Flash-Next) native MTP for sampled (temperature > 0) requests: lossless speculative rejection sampling against the AR sampler's distribution. On by default; off routes sampled requests to AR."
-    ),
-    field!(
         "speculation.mode",
         "speculation",
         Speculation,
@@ -2062,15 +2050,6 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_DEFAULT_CHATML"),
         "Allow the fallback ChatML frame when no template resolves."
-    ),
-    process_bool_field!(
-        "prompt.jinja_chat",
-        "jinja_chat",
-        Prompt,
-        true,
-        false,
-        "HIPFIRE_JINJA_CHAT",
-        "Render chat prompts through the model Jinja template; set HIPFIRE_JINJA_CHAT=0 for the hand-rolled ChatScaffold path."
     ),
     process_field!(
         "hardware.devices",
@@ -4084,6 +4063,22 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         reason: "the DFlash Q8 LM-head opt-out of WMMA was removed (HIPF-396)",
         replacement: "none; WMMA runs wherever the arch has it",
     },
+    RetiredConfigKey {
+        key: "speculation.mtp_sampled",
+        legacy_key: "mtp_sampled",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "the sampled native MTP opt-out was removed (HIPF-396)",
+        replacement: "none; sampled native MTP is on wherever the GDN state format admits it",
+    },
+    RetiredConfigKey {
+        key: "prompt.jinja_chat",
+        legacy_key: "jinja_chat",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the Jinja chat opt-out was removed (HIPF-396)",
+        replacement: "none; chat prompts render through the model template when one is present",
+    },
 ];
 
 pub fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKey> {
@@ -5147,13 +5142,6 @@ pub fn mtp_k_default(model_arch: u32, row_exact_verify_rows: usize) -> usize {
     } else {
         MTP_K_DEFAULT
     }
-}
-/// Sampled native-MTP enablement (`speculation.mtp_sampled`, env override
-/// `HIPFIRE_MTP_SAMPLED`, default on; `0` opts out). On, the Qwen4 MTP
-/// drafter verifies temperature > 0 requests by speculative rejection
-/// sampling; off leaves them to AR.
-pub fn mtp_sampled_enabled() -> bool {
-    developer_bool("HIPFIRE_MTP_SAMPLED", true)
 }
 /// MTP prompt-fill route opt-out (`HIPFIRE_MTP_OWN_PREFILL=1`). Strict
 /// snapshot boolean, default off: the MTP prompt fill prefills the trunk

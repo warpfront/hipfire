@@ -1,6 +1,6 @@
 {
   "sizing": "Heuristic UTF-8 bytes / 4, NOT tokenizer counts; includes rendered chat framing. All tool contexts preserve complete capture 00031.",
-  "format": "Qwen official reference Jinja, thinking disabled, add_generation_prompt true; tool argument JSON strings parsed as objects for template parameter rendering. Rendered txt requires HIPFIRE_JINJA_CHAT=0. Request JSON can instead use normal messages/tools rendering.",
+  "format": "Qwen official reference Jinja, thinking disabled, add_generation_prompt true; tool argument JSON strings parsed as objects for template parameter rendering. Rendered txt is wrapped again by a model chat template; use the request JSON (normal messages/tools rendering) against a templated model.",
   "generator": "generate.py",
   "jinja2_version": "3.1.6",
   "prompts": [

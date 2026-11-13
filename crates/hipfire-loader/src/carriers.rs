@@ -1334,9 +1334,7 @@ fn qwen4_native_mtp_speculator(
         hipfire_config::load_summary::Facet::SpecOn,
         format!("qwen4 native mtp K={max_k}"),
     );
-    if hipfire_config::mtp_sampled_enabled()
-        && !hipfire_arch_qwen4::mtp_spec::qwen4_mtp_sampled_allowed(gdn)
-    {
+    if !hipfire_arch_qwen4::mtp_spec::qwen4_mtp_sampled_allowed(gdn) {
         eprintln!(
             "  qwen4 native MTP sampled: off for GDN q8_ef (sampled requests use AR until the sampled-MTP law is verified)"
         );

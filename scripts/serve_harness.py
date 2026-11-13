@@ -2514,8 +2514,7 @@ def spawn_serve(cfg, home, log):
                    "HIPFIRE_DAEMON_BIN",
                    os.path.join(REPO, "target", "release", "daemon" + (".exe" if os.name == "nt" else ""))),
                HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_MODEL=cfg["model"])
-    # Sampled native MTP (`speculation.mtp_sampled`) is on by default; a parent
-    # HIPFIRE_MTP_SAMPLED=0 passes through as the opt-out.
+    # Sampled native MTP is always on.
     if cfg["mtp"] == "on":
         env.update(HIPFIRE_QWEN_MTP="1")
     # Experimental long-gated ngram-mod inside native MTP (TOML key `speculation.mtp_ngram`; the harness drives the env override).

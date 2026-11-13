@@ -20,7 +20,7 @@
 //!   if still open) so it answers instead of returning reasoning-only.
 //! - **think-budget force-close**: when thinking out-runs its token reserve,
 //!   force `<|END_THINKING|><|START_TEXT|>` so the answer fits before the cap.
-//! Both are gated by `HIPFIRE_C2M_EMPTY_TURN_GUARD` (default on) and bounded by
+//! Both are bounded by
 //! `MAX_EOS_SUPPRESS` / a one-shot `think_force_closed`, so forcing terminates.
 
 use hipfire_runtime::prompt_frame::ToolCall;
@@ -56,7 +56,6 @@ pub struct Cohere2MoeEmit<'a> {
     emitted_count: usize,
     emitted_visible: bool,
     eos_suppressions: usize,
-    empty_turn_guard: bool,
     think_count: usize,
     think_budget: usize,
     think_force_closed: bool,
@@ -97,10 +96,6 @@ impl<'a> Cohere2MoeEmit<'a> {
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
         let tk = ctx.tokenizer;
         let mark = |s: &str, fb: u32| -> u32 { tk.special_token_id(s).unwrap_or(fb) };
-        let empty_turn_guard = hipfire_config::developer_var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
-            .ok()
-            .as_deref()
-            != Some("0");
         // Think-budget: reserve room for an answer; honor an explicit max_think.
         // Byte-mirrors the AR loop's `think_reserve` / `think_budget`.
         let max_tokens = ctx.max_tokens;
@@ -126,7 +121,6 @@ impl<'a> Cohere2MoeEmit<'a> {
             emitted_count: 0,
             emitted_visible: false,
             eos_suppressions: 0,
-            empty_turn_guard,
             think_count: 0,
             think_budget,
             think_force_closed: false,
@@ -176,10 +170,7 @@ impl<'a> Cohere2MoeEmit<'a> {
     fn process(&mut self, token: u32) -> EmitOutcome {
         // ── EOS, with the empty-turn guard ──
         if token == self.eos {
-            if self.empty_turn_guard
-                && !self.emitted_visible
-                && self.eos_suppressions < MAX_EOS_SUPPRESS
-            {
+            if !self.emitted_visible && self.eos_suppressions < MAX_EOS_SUPPRESS {
                 // Reasoning-only turn ending with nothing visible: suppress the
                 // EOS and force a `<|START_TEXT|>` continuation (closing thinking
                 // first if still open). The masked EOS is NOT surfaced/counted.
@@ -248,8 +239,7 @@ impl<'a> Cohere2MoeEmit<'a> {
         }
 
         // ── Think-budget force-close (mechanism #2) ──
-        if self.empty_turn_guard
-            && !self.think_force_closed
+        if !self.think_force_closed
             && !self.emitted_visible
             && self.sec == Sec::Think
             && self.think_count >= self.think_budget
