@@ -1797,7 +1797,6 @@ pub struct GenerationRouteInputs {
     /// implement these controls and must use AR.
     pub nonneutral_penalties: bool,
     pub force_ar_chat: bool,
-    pub fast_sample_on: bool,
     pub supports_temp_swor: bool,
     /// Speculator applies faithful top_p/top_k on the sampled chain path
     /// (DFlash2 candidate-selector). When set, chain routing may engage even
@@ -2002,7 +2001,6 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         && i.temp > 1e-6
         && (!i.supports_temp_swor || i.supports_chain_nucleus_verify)
         && i.ngram_can_sample
-        && i.fast_sample_on
         && !dflash_min_p_present
         && !i.nonneutral_penalties;
     let mtp_sample_route = i.speculator_is_mtp && i.temp > 1e-6 && i.supports_temp_swor;
@@ -2713,7 +2711,6 @@ pub fn generate(
             .ok()
             .as_deref()
             == Some("0"),
-        fast_sample_on: hipfire_runtime::config::get().dflash_fast_sample,
         supports_temp_swor,
         supports_chain_nucleus_verify,
         kv_adaptive: m.kv_adaptive.is_some(),
@@ -3678,7 +3675,7 @@ pub fn generate(
                 } else if !ngram_can_sample {
                     "loaded drafter is greedy-only (MTP/n-gram); temp>0 runs AR"
                 } else if route_inputs.supports_chain_nucleus_verify {
-                    "sampled DFlash chain nucleus not engaged (check dflash_fast_sample)"
+                    "sampled DFlash chain nucleus not engaged"
                 } else {
                     "ddtree SWOR verify not active (needs ddtree_budget>0)"
                 };
@@ -6969,7 +6966,6 @@ mod qwen4_pp_route_tests {
             min_p: None,
             nonneutral_penalties: false,
             force_ar_chat: false,
-            fast_sample_on: false,
             supports_temp_swor: false,
             supports_chain_nucleus_verify: false,
             kv_adaptive: false,

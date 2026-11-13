@@ -570,7 +570,6 @@ def show_config(cfg):
     for env_key in (
         "HIPFIRE_DFLASH_DRAFT",
         "HIPFIRE_DFLASH_TREE",
-        "HIPFIRE_DFLASH_FAST_SAMPLE",
         "HIPFIRE_DDTREE_BUDGET",
         "HIPFIRE_DDTREE_TOPK",
     ):

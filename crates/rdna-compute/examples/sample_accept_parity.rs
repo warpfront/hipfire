@@ -4,14 +4,12 @@
 //!
 //! The kernel replicates the SINGLE-BLOCK `sample_top_p` draw per verify
 //! position, threading the xorshift32 RNG and lazily early-exiting on the first
-//! mismatch vs `draft[pos+1]`. This test forces the reference sampler onto its
-//! single-block path (`HIPFIRE_SAMPLE_PARALLEL=0`) — exactly what the fused
-//! kernel reimplements — and asserts the sampled token vector + advanced RNG are
-//! byte-identical across a matrix of (n, temp, top_p, top_k, seed) and three
-//! draft regimes (full-accept / immediate-mismatch / partial-accept). The
-//! parallel sampler is byte-identical to the single-block one for distinct
-//! logits (see `sample_top_p_parallel_impl`), so single-block parity transitively
-//! covers the production path.
+//! mismatch vs `draft[pos+1]`. This test asserts the sampled token vector +
+//! advanced RNG are byte-identical to the reference sampler across a matrix of
+//! (n, temp, top_p, top_k, seed) and three draft regimes (full-accept /
+//! immediate-mismatch / partial-accept). The parallel reference sampler is
+//! byte-identical to the single-block draw for distinct logits (see
+//! `sample_top_p_parallel_impl`).
 //!
 //! Run:
 //!   source ./scripts/gpu-lock.sh && gpu_acquire "sample-accept-parity"
@@ -179,10 +177,9 @@ fn cactus_distribution_check(gpu: &mut Gpu) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Reference uses the DEFAULT parallel sampler (production path on gfx1151);
-    // it is byte-identical to the single-block draw the fused kernel mirrors for
-    // distinct logits (see `sample_top_p_parallel_impl`). Force single-block with
-    // HIPFIRE_SAMPLE_PARALLEL=0 for an even tighter same-algorithm comparison.
+    // Reference uses the parallel sampler (the production path); it is
+    // byte-identical to the single-block draw the fused kernel mirrors for
+    // distinct logits (see `sample_top_p_parallel_impl`).
     let mut gpu = Gpu::init().expect("Gpu::init failed");
     println!("arch: {}  vocab: {VOCAB}", gpu.arch);
 

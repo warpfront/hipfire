@@ -6508,33 +6508,18 @@ impl Gpu {
             .as_deref()
             == Some("1");
         let gfx12 = self.arch_caps.has_wmma_w32_gfx12();
-        let fixed_head_dim = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_FIXED_HD")
-            .ok()
-            .as_deref()
-            != Some("0");
-        let fixed_hd = if fixed_head_dim { head_dim } else { 0 };
-        let prefetch_v = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_PREFETCH_V")
-            .ok()
-            .as_deref()
-            != Some("0");
         // gfx12 must see head_dim as a compile-time constant so the unrolled
         // float8_t output fragments stay in VGPRs. Leaving it dynamic spills
         // 544 B/thread to scratch (and reserves ~34 MiB of global scratch on
         // gfx1201), roughly halving this kernel's measured throughput.
-        let pv_suffix = if prefetch_v { "" } else { "_pv0" };
-        let tuning_suffix = pv_suffix;
-        let module = if !fixed_head_dim && split_q {
-            format!("attention_q8_0_flash_prefill_wmma_dynamic_splitq{tuning_suffix}")
-        } else if !fixed_head_dim {
-            format!("attention_q8_0_flash_prefill_wmma_dynamic{tuning_suffix}")
-        } else if gfx12 && split_q {
-            format!("attention_q8_0_flash_prefill_wmma_gfx12_hd{head_dim}_splitq{tuning_suffix}")
+        let module = if gfx12 && split_q {
+            format!("attention_q8_0_flash_prefill_wmma_gfx12_hd{head_dim}_splitq")
         } else if gfx12 {
-            format!("attention_q8_0_flash_prefill_wmma_gfx12_hd{head_dim}{tuning_suffix}")
+            format!("attention_q8_0_flash_prefill_wmma_gfx12_hd{head_dim}")
         } else if split_q {
-            format!("attention_q8_0_flash_prefill_wmma_gfx11_hd{head_dim}_splitq{tuning_suffix}")
+            format!("attention_q8_0_flash_prefill_wmma_gfx11_hd{head_dim}_splitq")
         } else {
-            format!("attention_q8_0_flash_prefill_wmma_gfx11_hd{head_dim}{tuning_suffix}")
+            format!("attention_q8_0_flash_prefill_wmma_gfx11_hd{head_dim}")
         };
         let kernel_src = if gfx12 {
             kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC
@@ -6555,10 +6540,9 @@ impl Gpu {
         };
         if !self.functions.contains_key(func) {
             let src = format!(
-                "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
+                "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V 1\n{}",
                 split_q as u32,
-                fixed_hd,
-                prefetch_v as u32,
+                head_dim,
                 if multi_slot {
                     kernels::kv_slot_desc_paged_source(
                         kernel_src,
@@ -10369,16 +10353,10 @@ impl Gpu {
     /// it the unrolled accumulators spill on gfx1201, roughly halving
     /// throughput); it is NOT stated to be a gfx11 requirement.
     ///
-    /// Tuning knobs (mirroring the parent `attention_q8_0_flash_prefill_wmma`):
-    /// - `HIPFIRE_FLASH_PREFILL_FIXED_HD` (`0` to disable compile-time
-    ///   `head_dim`; default enabled) — when disabled, `FIXED_HEAD_DIM` is `0`
-    ///   and the kernel uses a dynamic head_dim path.
-    /// - `HIPFIRE_FLASH_PREFILL_PREFETCH_V` (`0`/`1`, default `1`) — controls
-    ///   `PREFETCH_V` and the `_pv0` module suffix.
-    /// - `HIPFIRE_GLIMMER_SWA_PREFETCH_V` (`0`/`1`) — when set, wins over the
-    ///   shared `HIPFIRE_FLASH_PREFILL_PREFETCH_V` for **this kernel only**,
-    ///   so the SWA prefetch optimum can be swept per-arch without a rebuild.
-    ///   The per-arch optimum has not yet been measured.
+    /// Tuning knob: `HIPFIRE_GLIMMER_SWA_PREFETCH_V` (`0`/`1`, default `1`)
+    /// controls `PREFETCH_V` and the `_pv0` module suffix, so the SWA prefetch
+    /// optimum can be swept per-arch without a rebuild. The per-arch optimum
+    /// has not yet been measured. `head_dim` is always a compile-time constant.
     ///
     /// Module and **source** identity are per-arch class so each can be tuned
     /// independently without arch-bleed (see `autoresearch/ar/certify/cross_arch.py:66`
@@ -10429,30 +10407,16 @@ impl Gpu {
             head_dim <= 256,
             "head_dim {head_dim} exceeds MAX_D_CHUNKS*16"
         );
-        // Tunable knobs — mirrors the parent `attention_q8_0_flash_prefill_wmma`:
-        // - fixed_head_dim: env `HIPFIRE_FLASH_PREFILL_FIXED_HD` ( `0` => dynamic, 0)
-        //   The compile-time head_dim is documented as a gfx12 necessity (spill
-        //   without it halves throughput on gfx1201); NOT stated to be a gfx11
-        //   requirement, so the gfx11 arms honour the knob.
-        // - prefetch_v: env `HIPFIRE_FLASH_PREFILL_PREFETCH_V` ( `0`/`1`, default `1`)
-        //   plus per-kernel override `HIPFIRE_GLIMMER_SWA_PREFETCH_V` which wins
-        //   when set, so the SWA optimum can be swept per-arch without a rebuild.
+        // Tunable knobs:
+        // - prefetch_v: `HIPFIRE_GLIMMER_SWA_PREFETCH_V` (default on), so the SWA
+        //   optimum can be swept per-arch without a rebuild.
         // - SPLIT_Q: 0 for this kernel — the SWA kernel has no split-q variant
         //   (kept explicit rather than looking arbitrary).
-        let fixed_head_dim = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_FIXED_HD")
-            .ok()
-            .as_deref()
-            != Some("0");
-        let fixed_hd = if fixed_head_dim { head_dim } else { 0 };
-        let prefetch_v_base = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_PREFETCH_V")
-            .ok()
-            .as_deref()
-            != Some("0");
         let prefetch_v = hipfire_config::developer_var("HIPFIRE_GLIMMER_SWA_PREFETCH_V")
             .ok()
             .as_deref()
             .map(|v| v != "0")
-            .unwrap_or(prefetch_v_base);
+            .unwrap_or(true);
         let pv_suffix = if prefetch_v { "" } else { "_pv0" };
         let tuning_suffix = pv_suffix;
         let (module, src) = if self.arch_caps.has_wmma_w32_gfx12() {
@@ -10471,7 +10435,7 @@ impl Gpu {
                 ),
                 format!(
                     "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
-                    fixed_hd,
+                    head_dim,
                     prefetch_v as u32,
                     kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX1100_SRC
                 ),
@@ -10483,7 +10447,7 @@ impl Gpu {
                 ),
                 format!(
                     "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
-                    fixed_hd,
+                    head_dim,
                     prefetch_v as u32,
                     kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX1151_SRC
                 ),
@@ -10493,7 +10457,7 @@ impl Gpu {
                 format!("attention_q8_0_flash_prefill_wmma_swa_gfx11_hd{head_dim}{tuning_suffix}"),
                 format!(
                     "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
-                    fixed_hd,
+                    head_dim,
                     prefetch_v as u32,
                     kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_SRC
                 ),
@@ -10634,19 +10598,11 @@ impl Gpu {
             .ok()
             .as_deref()
             == Some("1");
-        let fixed_hd_off = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_FIXED_HD")
-            .ok()
-            .as_deref()
-            == Some("0");
-        let prefetch_v_off = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_PREFETCH_V")
-            .ok()
-            .as_deref()
-            == Some("0");
-        if split_q || fixed_hd_off || prefetch_v_off {
+        if split_q {
             return Err(hip_bridge::HipError::new(
                 0,
                 "attention_q8_0_flash_prefill_wmma_partial_gfx1201_bench requires incumbent \
-                 gfx1201 tuning SPLIT_Q=0 PREFETCH_V=1 FIXED_HD=128 (unset or default env)",
+                 gfx1201 tuning SPLIT_Q=0 (unset or default env)",
             ));
         }
         const SYMBOL: &str = "attention_q8_0_flash_prefill_wmma_partial_gfx1201";
@@ -11130,11 +11086,11 @@ impl Gpu {
             return Ok(false);
         };
         // The reference module must be the default gfx11 fixed-head_dim WMMA
-        // body: split-Q changes its arithmetic, and the dynamic-head_dim build
-        // is not the one this twin was proven against.
-        let dev = |name: &str| hipfire_config::developer_var(name).ok();
-        if dev("HIPFIRE_FLASH_PREFILL_SPLITQ").as_deref() == Some("1")
-            || dev("HIPFIRE_FLASH_PREFILL_FIXED_HD").as_deref() == Some("0")
+        // body: split-Q changes its arithmetic.
+        if hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_SPLITQ")
+            .ok()
+            .as_deref()
+            == Some("1")
         {
             return Ok(false);
         }

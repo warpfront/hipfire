@@ -1051,7 +1051,7 @@ fn sampled_head(
     let hidden = gpu.zeros(&[NMAX * case.k], DType::F32)?;
     let rotated = gpu.zeros(&[NMAX * case.k], DType::F32)?;
     // Backend policy only: the private CB owner predicate needs the state oracle.
-    for fixture in ["arch", "fp16", "head", "tiles", "lds"] {
+    for fixture in ["arch", "fp16", "tiles", "lds"] {
         let mut flags = (*gpu.flags).clone();
         let arch = if fixture == "arch" {
             "gfx1100"
@@ -1060,7 +1060,6 @@ fn sampled_head(
         };
         match fixture {
             "fp16" => flags.fp16_disabled = true,
-            "head" => flags.lm_head_wmma_disabled = true,
             "tiles" => flags.wmma_batch_tiles = false,
             "lds" => flags.hfq4g256_ldsstage_wmma = true,
             _ => {}

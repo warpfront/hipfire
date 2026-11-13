@@ -392,7 +392,6 @@ pub fn is_batch_request_eligible(
             || sampling.presence_penalty != 0.0
             || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
-        fast_sample_on: true,
         supports_temp_swor,
         supports_chain_nucleus_verify,
         kv_adaptive: has_adaptive,
@@ -1906,7 +1905,6 @@ fn vmm_singleton_route(
             .ok()
             .as_deref()
             == Some("0"),
-        fast_sample_on: true,
         supports_temp_swor: spec.is_some_and(|s| s.supports_temp_verify()),
         supports_chain_nucleus_verify: spec.is_some_and(|s| s.supports_chain_nucleus_verify()),
         kv_adaptive: m.kv_adaptive.is_some(),
@@ -7001,7 +6999,6 @@ pub fn is_qwen_ep_batch_request_eligible(
             || sampling.presence_penalty != 0.0
             || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
-        fast_sample_on: true,
         supports_temp_swor: m
             .speculator
             .as_ref()

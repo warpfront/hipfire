@@ -621,10 +621,6 @@ name = "sample_accept_parity"
 required-features = ["lab"]
 
 [[example]]
-name = "sample_parallel_stable_parity"
-required-features = ["lab"]
-
-[[example]]
 name = "sample_slot_rng_advance"
 required-features = ["lab"]
 

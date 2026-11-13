@@ -656,7 +656,7 @@ pub fn execute_deltanet_moe_layer_batched(
             n,
         )?;
     }
-    let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
+    let tree_parents = tree_verify.as_ref().map(|c| c.parent_indices);
     let pre_fused_ratio = gdn_moe_pre_fused_ratio(
         gdn_moe_pre_fused_on(&gpu.arch),
         gpu.flags.gfx12_gdn_pre_fused,

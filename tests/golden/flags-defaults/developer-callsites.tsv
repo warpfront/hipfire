@@ -289,11 +289,7 @@ developer_callsite	*	HIPFIRE_FIXED_TIER#developer_var=ok
 developer_callsite	*	HIPFIRE_FLASH_PREFILL#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_BC#developer_var=ok.and_then.unwrap_or(16)
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_BR#developer_var=ok.and_then.unwrap_or(8)
-developer_callsite	*	HIPFIRE_FLASH_PREFILL_FIXED_HD#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_FLASH_PREFILL_FIXED_HD#developer_var=ok.as_deref.==Some("0")
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_MIN_CTX#developer_var=ok.and_then.unwrap_or(10240)
-developer_callsite	*	HIPFIRE_FLASH_PREFILL_PREFETCH_V#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_FLASH_PREFILL_PREFETCH_V#developer_var=ok.as_deref.==Some("0")
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_SPLITQ#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_FLUX_ATTN#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_FLUX_ATTN#developer_var=ok
@@ -326,8 +322,6 @@ developer_callsite	*	HIPFIRE_G942_ROWS16_CHAIN#developer_bool=true
 developer_callsite	*	HIPFIRE_G942_TRUNK_GEMV#developer_bool=false
 developer_callsite	*	HIPFIRE_GATED_DELTA_VECTOR_CHUNKED#developer_bool=true
 developer_callsite	*	HIPFIRE_GATED_DELTA_VECTOR_PM#developer_bool=true
-developer_callsite	*	HIPFIRE_GATED_NORM_MQ_ROTATE#developer_var=as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_GATE_UP_BT#developer_var=map.unwrap_or(true)
 developer_callsite	*	HIPFIRE_GDN_BLK#developer_var=ok.and_then.map.unwrap_or(128)
 developer_callsite	*	HIPFIRE_GDN_CHUNKED#developer_var=map.unwrap_or(false)
 developer_callsite	*	HIPFIRE_GDN_CHUNK_PM#developer_bool=true
@@ -362,7 +356,6 @@ developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO#developer_bool=false
-developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32#developer_bool=true
 developer_callsite	*	HIPFIRE_GFX1100_DRAFT_VOCAB#developer_bool=gpu.arch_caps.is_gfx1100()
 developer_callsite	*	HIPFIRE_GFX1100_FA2_R3#developer_bool=true
 developer_callsite	*	HIPFIRE_GFX1100_FA_PREP#developer_bool=true
@@ -451,7 +444,7 @@ developer_callsite	*	HIPFIRE_GLIMMER_SPEC_DIAG#developer_var=ok.as_deref.==Some(
 developer_callsite	*	HIPFIRE_GLIMMER_SPEC_FALLBACK#developer_var=ok.as_deref.!=Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_SPEC_PERTURB#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD#developer_var=ok.as_deref.==Some("0")
-developer_callsite	*	HIPFIRE_GLIMMER_SWA_PREFETCH_V#developer_var=ok.as_deref.map.unwrap_or(prefetch_v_base)
+developer_callsite	*	HIPFIRE_GLIMMER_SWA_PREFETCH_V#developer_var=ok.as_deref.map.unwrap_or(true)
 developer_callsite	*	HIPFIRE_GLIMMER_TAP_LAYERS#developer_var=-
 developer_callsite	*	HIPFIRE_GLIMMER_TIMING#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GPTQ_BLOCK#developer_var=-
@@ -530,10 +523,8 @@ developer_callsite	*	HIPFIRE_MOE_GATE_UP_FUSED#developer_bool=false
 developer_callsite	*	HIPFIRE_MOE_GATE_UP_LOW_VGPR#developer_bool=false
 developer_callsite	*	HIPFIRE_MOE_GATE_UP_PAIR_VGPR#developer_bool=false
 developer_callsite	*	HIPFIRE_MOE_GATE_UP_RANK_INTERLEAVE#developer_bool=false
-developer_callsite	*	HIPFIRE_MOE_GATE_UP_TIGHT_GRID#developer_bool=true
 developer_callsite	*	HIPFIRE_MOE_GATE_UP_WG2#developer_bool=false
 developer_callsite	*	HIPFIRE_MOE_GRADED#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_MOE_GROUPED_GEMM#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_MOE_GROUPED_K2_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_MOE_HOT_FRAC#developer_var=ok.and_then.map.unwrap_or(0.2)
 developer_callsite	*	HIPFIRE_MOE_MQ6_ADMIT#developer_var=ok.as_deref
@@ -859,8 +850,6 @@ developer_callsite	*	HIPFIRE_ROCM_STRICT#developer_bool=false
 developer_callsite	*	HIPFIRE_ROUTED_GL#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_ROUTE_PLAN#developer_bool=true
 developer_callsite	*	HIPFIRE_ROUTE_PLAN_SEAL#developer_bool=false
-developer_callsite	*	HIPFIRE_SAMPLE_FAST#developer_bool=true
-developer_callsite	*	HIPFIRE_SAMPLE_PARALLEL#developer_bool=true
 developer_callsite	*	HIPFIRE_SCHED_PROFILE#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_SCHED_PROFILE#developer_var=ok.and_then.unwrap_or_else
 developer_callsite	*	HIPFIRE_SKIP_LLAMA_COMMIT_CHECK#developer_var=ok.as_deref.==Some("1")

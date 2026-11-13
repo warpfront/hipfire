@@ -1106,7 +1106,6 @@ HIPFIRE_REPLAY_PM4_WAIT_POLICY=resource \
 HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY=required-only \
 HIPFIRE_REPLAY_PM4_QUEUES=1 \
 HIPFIRE_REPLAY_PM4_STATEFUL=stateful \
-HIPFIRE_REPLAY_PM4_GCR_TRIM=1 \
 python3 scripts/redline_daemon_harness.py \
   --model "$MODEL" \
   --daemon target/release/daemon \
@@ -1132,7 +1131,6 @@ HIPFIRE_REPLAY_PM4_WAIT_POLICY=resource \
 HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY=required-only \
 HIPFIRE_REPLAY_PM4_QUEUES=1 \
 HIPFIRE_REPLAY_PM4_STATEFUL=stateful \
-HIPFIRE_REPLAY_PM4_GCR_TRIM=1 \
 python3 -m tools.redline bench \
   --model "$MODEL" \
   --daemon target/release/daemon \

@@ -153,8 +153,8 @@ pub struct PrefillBatchScratch {
     pub moe_inactive_backup: Option<GpuTensor>,
 
     // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) scratch. All
-    // allocated when num_experts > 0; gated at runtime by
-    // HIPFIRE_MOE_GROUPED_GEMM=1. m_total_max is tile-aligned:
+    // allocated when num_experts > 0; used on WMMA archs. m_total_max is
+    // tile-aligned:
     // align_up(max_batch * k_top + num_experts * (BLOCK_M - 1), BLOCK_M)
     // with BLOCK_M=16.
     //
@@ -173,10 +173,10 @@ pub struct PrefillBatchScratch {
 
     // ── Tree-aware LA scratch (Phase 3b of Task #101) ──
     // Per-token S-state tape consumed by gated_delta_net_q8_tree kernel
-    // when TreeVerifyCtx.parent_indices is Some. Reused across LA layers
+    // on a tree verify (TreeVerifyCtx). Reused across LA layers
     // since LA dispatch is serial per-cycle. Only allocated when the model
-    // has LA layers (linear_num_value_heads > 0). Call sites that pass
-    // parent_indices must ensure these tensors exist.
+    // has LA layers (linear_num_value_heads > 0). Tree-verify call sites
+    // must ensure these tensors exist.
     //
     // s_tape_q8:     [max_batch × n_v_heads × head_dim × head_dim] Raw/i8
     // s_tape_scales: [max_batch × n_v_heads × head_dim] f32
@@ -433,8 +433,8 @@ impl PrefillBatchScratch {
             DType::F32
         );
 
-        // Path 2 scatter + grouped-WMMA-GEMM scratch (gated at runtime by
-        // HIPFIRE_MOE_GROUPED_GEMM=1). m_total_max = N*K_TOP + E*(BLOCK_M-1).
+        // Path 2 scatter + grouped-WMMA-GEMM scratch (used on WMMA archs).
+        // m_total_max = N*K_TOP + E*(BLOCK_M-1).
         // i32 buffers stored as Raw (4 bytes/elem matches; no DType::I32 yet).
         let i_moe_expert_token_counts = alloc_opt!(
             config.num_experts > 0,

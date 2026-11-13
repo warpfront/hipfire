@@ -418,7 +418,7 @@ impl Pm4Commands {
         }
     }
 
-    fn acquire_entry(&mut self, gfx12_gcr_trim: bool, gfx11_policy: Gfx11EntryAcquirePolicy) {
+    fn acquire_entry(&mut self, gfx11_policy: Gfx11EntryAcquirePolicy) {
         match self {
             Self::Legacy { commands, .. } => match gfx11_policy {
                 Gfx11EntryAcquirePolicy::System => commands.acquire_system(),
@@ -426,8 +426,7 @@ impl Pm4Commands {
                 Gfx11EntryAcquirePolicy::Vmem => commands.acquire_inter_node_vmem(),
                 Gfx11EntryAcquirePolicy::None => {}
             },
-            Self::Gfx12(commands) if gfx12_gcr_trim => commands.acquire_system_gfx12(),
-            Self::Gfx12(commands) => commands.acquire_system(),
+            Self::Gfx12(commands) => commands.acquire_system_gfx12(),
         }
     }
 
@@ -456,7 +455,7 @@ impl Pm4Commands {
         }
     }
 
-    fn acquire_inter_node(&mut self, gfx12_gcr_trim: bool, vmem_only: bool) {
+    fn acquire_inter_node(&mut self, vmem_only: bool) {
         match self {
             Self::Legacy { commands, .. } if vmem_only => commands.acquire_inter_node_vmem(),
             Self::Legacy { commands, .. } => commands.acquire_inter_node_same_agent(),
@@ -467,8 +466,7 @@ impl Pm4Commands {
             Self::Gfx12(commands) if vmem_only => {
                 commands.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::HipLlvmVmemL1);
             }
-            Self::Gfx12(commands) if gfx12_gcr_trim => commands.acquire_inter_node_gfx12(),
-            Self::Gfx12(commands) => commands.acquire_system(),
+            Self::Gfx12(commands) => commands.acquire_inter_node_gfx12(),
         }
     }
 
@@ -6638,9 +6636,6 @@ impl ReplayController {
             .retained_kernarg_bindings(prefix)
             .map_err(|reason| format!("retained PM4 kernarg bindings: {reason}"))?;
 
-        let gfx12_gcr_trim = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GCR_TRIM")
-            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
-            .unwrap_or(true);
         let gfx11_vmem_acquire =
             match hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE") {
                 Some(value) if value != "auto" => matches!(value.as_str(), "1" | "true" | "on"),
@@ -6827,7 +6822,7 @@ impl ReplayController {
             // re-submits this prefix so a stale prior epoch cannot satisfy the
             // next run (ABA).
             commands.emit_entry_sentinel_reset()?;
-            commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
+            commands.acquire_entry(entry_acquire_policy);
             let mut resource_frontier = ResourceFrontier::default();
             let mut dependency_waits = 0usize;
             let mut dependency_acquires = 0usize;
@@ -6876,7 +6871,7 @@ impl ReplayController {
                             current_launch,
                         );
                         if boundary.acquire_vmem {
-                            commands.acquire_inter_node(gfx12_gcr_trim, true);
+                            commands.acquire_inter_node(true);
                         } else {
                             // Baseline default: the pre-dispatch hazard needs
                             // the system-scope acquire; the weaker inter-node
@@ -6895,7 +6890,7 @@ impl ReplayController {
                             &radiowave_certifications,
                             current_launch,
                         );
-                        commands.acquire_inter_node(gfx12_gcr_trim, boundary.acquire_vmem);
+                        commands.acquire_inter_node(boundary.acquire_vmem);
                     }
                     if shadow_on {
                         shadow_decisions.push(railgun::shadow::RedlineDecision {
@@ -7051,7 +7046,6 @@ impl ReplayController {
                             railgun_shadow::Transport {
                                 pool: &pool,
                                 new_commands: &new_commands,
-                                gcr_trim: gfx12_gcr_trim,
                                 entry_policy: entry_acquire_policy,
                             },
                         );
@@ -7170,7 +7164,7 @@ impl ReplayController {
                                 resource_limits_policy,
                             );
                             commands.set_scratch(scratch_rings.ring(lane_index)?);
-                            commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
+                            commands.acquire_entry(entry_acquire_policy);
                             Ok(commands)
                         })
                         .collect::<Result<Vec<_>, String>>()?;
@@ -7213,7 +7207,6 @@ impl ReplayController {
                                         .acquire_between(previous, current)
                                 {
                                     lane.acquire_inter_node(
-                                        gfx12_gcr_trim,
                                         ((pm4_architecture != Pm4Architecture::Gfx12
                                             && gfx11_vmem_acquire)
                                             || (pm4_architecture == Pm4Architecture::Gfx12
@@ -7255,7 +7248,7 @@ impl ReplayController {
                     resource_limits_policy,
                 );
                 commands.set_scratch(scratch_rings.ring(0)?);
-                commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
+                commands.acquire_entry(entry_acquire_policy);
                 let mut resource_frontier = ResourceFrontier::default();
                 for (position, index) in phase.indices.iter().copied().enumerate() {
                     if position != 0 && !phase.parallel {
@@ -7282,7 +7275,6 @@ impl ReplayController {
                                 .acquire_between(previous, current)
                         {
                             commands.acquire_inter_node(
-                                gfx12_gcr_trim,
                                 pm4_vmem_acquire_enabled(
                                     pm4_architecture,
                                     gfx11_vmem_acquire,

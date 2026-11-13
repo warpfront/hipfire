@@ -64,10 +64,10 @@ pub struct TreeVerifyCtx<'a> {
     pub attn_bias: &'a GpuTensor,
     /// `[N]` i32 — for each linearized slot, the slot index of its parent
     /// in the same linearization (or -1 for the root / seed). Produced by
-    /// `hipfire_runtime::ddtree::linearize_tree_with_parents`. When `Some`, LA layers
+    /// `hipfire_runtime::ddtree::linearize_tree_with_parents`. LA layers
     /// use tree-aware kernels that read parent state from the per-layer
     /// s_tape scratch of the batch scratch.
-    pub parent_indices: Option<&'a GpuTensor>,
+    pub parent_indices: &'a GpuTensor,
 }
 
 /// Row semantics of one batched forward chunk: a sequential prompt/verify

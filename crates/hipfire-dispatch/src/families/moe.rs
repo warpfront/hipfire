@@ -2232,25 +2232,13 @@ pub fn routed_codebook_pair_batched_supported(gate_up: DType, down: DType) -> bo
             || matches!(down, DType::MQ2G256Lloyd | DType::MQ3G256Lloyd))
 }
 
-pub fn codebook_batched_admit_enabled_from_env(
-    value: Option<&str>,
-    grouped_gemm_value: Option<&str>,
-    _arch: &str,
-) -> bool {
-    let grouped_gemm_on = !matches!(grouped_gemm_value, Some("0") | Some("off"));
-    match value {
-        Some("0") | Some("off") | Some("false") => false,
-        Some("1") | Some("on") | Some("true") => grouped_gemm_on,
-        _ => false,
-    }
+pub fn codebook_batched_admit_enabled_from_env(value: Option<&str>, _arch: &str) -> bool {
+    matches!(value, Some("1") | Some("on") | Some("true"))
 }
 
 pub fn codebook_batched_admit_enabled(arch: &str) -> bool {
     codebook_batched_admit_enabled_from_env(
         hipfire_config::developer_var("HIPFIRE_MOE_CODEBOOK_BATCHED")
-            .ok()
-            .as_deref(),
-        hipfire_config::developer_var("HIPFIRE_MOE_GROUPED_GEMM")
             .ok()
             .as_deref(),
         arch,
@@ -2736,7 +2724,7 @@ impl<'a> MoePrefillParams<'a> {
 
 pub struct MoePrefillResolution {
     /// Gate_up + down via grouped-GEMM scatter pipeline (Path 2).
-    /// Requires WMMA-capable arch (gfx11/gfx12) + `moe_grouped_gemm` flag.
+    /// Requires a WMMA-capable arch (gfx11/gfx12).
     pub use_path2: bool,
     /// Down uses atomic-accumulate GEMV (Path 0) instead of atomic-free
     /// expanded+combine (Path 1). gfx9* wave64 archs (gfx906/gfx908/gfx94x).
@@ -2818,9 +2806,7 @@ impl MoePrefillResolution {
             && !d.routed_has_mixed_experts
             && matches!(d.routed_gate_up, DType::MQ4G256 | DType::MQ4G256V2)
             && matches!(d.routed_down, DType::MQ4G256 | DType::MQ4G256V2);
-        let use_path2 = flags.moe_grouped_gemm
-            && arch.has_wmma()
-            && (!narrow_verify || offloaded_uniform_verify);
+        let use_path2 = arch.has_wmma() && (!narrow_verify || offloaded_uniform_verify);
         // MQ6 / MQ6V2 grouped-WMMA: gfx11 `_k2` kernel now exists (alongside the
         // gfx12 `_gfx12` / `mq6g256v2` sisters). Only suppress Path 2 on archs
         // that have NEITHER (gfx9*, gfx1010/1030, CDNA) — i.e. no wmma_w32 and
@@ -2853,8 +2839,7 @@ impl MoePrefillResolution {
         // either indexed kernel alone is fine, so this is an all-indexed
         // interaction, not a single-kernel defect. The narrow-verify gate must
         // NOT override this re-admit.
-        let use_path2 =
-            use_path2 || (d.routed_has_mixed_experts && flags.moe_grouped_gemm && arch.has_wmma());
+        let use_path2 = use_path2 || (d.routed_has_mixed_experts && arch.has_wmma());
         // mfp4-E8 routed experts: use Path 2 (grouped-WMMA) on gfx1151 and gfx12
         // (RDNA4). Both have a native E8 grouped-WMMA GEMM kernel:
         //   gfx1151 → gemm_mfp4g32_e8_moe_grouped_wmma (gfx1151.hip)
@@ -3249,12 +3234,10 @@ mod tests {
         for arch_name in [
             "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx1030", "gfx942",
         ] {
-            for flag_case in 0..3 {
+            for flag_case in 0..2 {
                 let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test(arch_name);
-                match flag_case {
-                    1 => flags.moe_grouped_gemm = false,
-                    2 => flags.moe_grouped_i8 = Some(true),
-                    _ => {}
+                if flag_case == 1 {
+                    flags.moe_grouped_i8 = Some(true);
                 }
                 let flags = std::sync::Arc::new(flags);
                 let arch = rdna_compute::arch_caps::ArchCaps::new(arch_name, flags.clone());
@@ -3336,18 +3319,6 @@ mod tests {
                 !decode.use_path2,
                 "one row must not take the Path 2 re-admit"
             );
-
-            let mut flags = rdna_compute::feature_flags::FeatureFlags::for_test("gfx1201");
-            flags.moe_grouped_gemm = false;
-            for batch in 2..=NARROW_VERIFY_MAX_ROWS {
-                let disabled = MoePrefillResolution::resolve_with_batch_ctx(
-                    &d, &ctx.arch, &flags, batch, true, true,
-                );
-                assert!(
-                    !disabled.use_path2,
-                    "re-admit must respect grouped-GEMM opt-out"
-                );
-            }
         }
     }
 

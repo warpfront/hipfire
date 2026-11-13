@@ -9676,10 +9676,7 @@ mod tests {
         ));
     }
 
-    /// The codebook admit is arch-gated (WMMA only) and hard-gated on Path 2
-    /// being enabled — Path 0/1 have no MQ2/MQ3-Lloyd indexed-GEMV arm, so
-    /// admitting with `HIPFIRE_MOE_GROUPED_GEMM=0` would turn a working slow
-    /// prefill into an `UnsupportedVariant` hard error.
+    /// The codebook admit is opt-in on every arch (default off).
     #[test]
     fn codebook_batched_admit_arch_and_flag_gates() {
         for arch in [
@@ -9689,45 +9686,26 @@ mod tests {
             // DEFAULT OFF until the grouped-WMMA codebook kernels have run on
             // hardware — they had never executed when this landed.
             assert!(
-                !codebook_batched_admit_enabled_from_env(None, None, arch),
+                !codebook_batched_admit_enabled_from_env(None, arch),
                 "{arch} must NOT default-admit: the grouped-WMMA codebook \
                  kernels are unvalidated (opt in with HIPFIRE_MOE_CODEBOOK_BATCHED=1)"
             );
             // Opt-in works on every WMMA arch.
             assert!(
-                codebook_batched_admit_enabled_from_env(Some("1"), None, arch),
+                codebook_batched_admit_enabled_from_env(Some("1"), arch),
                 "{arch} should admit under an explicit opt-in"
             );
-            // Path 2 disabled => never admit, whatever the codebook var says.
-            assert!(!codebook_batched_admit_enabled_from_env(
-                None,
-                Some("0"),
-                arch
-            ));
-            assert!(!codebook_batched_admit_enabled_from_env(
-                Some("1"),
-                Some("off"),
-                arch
-            ));
             // Explicit opt-out.
-            assert!(!codebook_batched_admit_enabled_from_env(
-                Some("0"),
-                None,
-                arch
-            ));
+            assert!(!codebook_batched_admit_enabled_from_env(Some("0"), arch));
         }
         // Non-WMMA archs have no grouped-WMMA sister kernel at all.
         for arch in ["gfx1010", "gfx1030", "gfx906", "gfx942"] {
             assert!(
-                !codebook_batched_admit_enabled_from_env(None, None, arch),
+                !codebook_batched_admit_enabled_from_env(None, arch),
                 "{arch} has no grouped-WMMA kernel — must not default-admit"
             );
             // ...but an explicit =1 is still honored for research / bring-up.
-            assert!(codebook_batched_admit_enabled_from_env(
-                Some("1"),
-                None,
-                arch
-            ));
+            assert!(codebook_batched_admit_enabled_from_env(Some("1"), arch));
         }
     }
 

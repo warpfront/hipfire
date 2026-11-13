@@ -5013,7 +5013,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     // sink, source constant and symbol are the ones named below, symbol ==
     // module unless noted). RDNA-core arches only.
     if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
-        // Sampled DFlash (`HIPFIRE_DFLASH_FAST_SAMPLE` default on): sampling.rs
+        // Sampled DFlash: sampling.rs
         // `batched_categorical_sample_f32` / `chain_accept_spec_f32`.
         add!(
             "batched_categorical_sample",
@@ -5759,7 +5759,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         // `Gpu::gemm_gate_up_hfq4g256_wmma_gfx12` batch-tile family
         // (`gfx12_bt_tile`: bt4 for N in [64,128), bt8 at multiples of 128,
         // bt12 at multiples of 192 / N >= 192): one source, symbol == module.
-        // `HIPFIRE_GATE_UP_BT=0` and the `_ldsstage` module are developer-only.
+        // The `_ldsstage` module is developer-only.
         add!(
             "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",
             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,

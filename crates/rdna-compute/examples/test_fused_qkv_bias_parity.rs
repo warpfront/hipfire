@@ -1,5 +1,5 @@
 //! GPU wiring validation for the `fused_qkv_<dtype>_with_bias` kernels
-//! (HIPFIRE_FUSE_QKV_BIAS). Format-agnostic: we upload ZEROED weight bytes for
+//! (QKV bias fold). Format-agnostic: we upload ZEROED weight bytes for
 //! each format, so every kernel's GEMV body produces exactly 0.0 (scale/codebook
 //! = 0 → 0 contribution, finite). The fused store is then `y[row] = 0 + bias[row]`,
 //! so the with-bias output MUST equal the per-projection bias bit-exactly, and

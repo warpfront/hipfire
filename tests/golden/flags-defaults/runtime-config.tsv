@@ -6,7 +6,6 @@ runtime_config	*	allow_mixed_arch=false
 runtime_config	*	attention_flash_mode="auto"
 runtime_config	*	chat_template_file=None
 runtime_config	*	devices=None
-runtime_config	*	dflash_fast_sample=true
 runtime_config	*	dflash_ngram_block=None
 runtime_config	*	draft_gemm_dump=false
 runtime_config	*	draft_subphase=false

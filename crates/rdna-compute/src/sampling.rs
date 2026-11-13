@@ -11,21 +11,6 @@ use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::{HipError, HipResult};
 
-/// Whether the multi-workgroup parallel sampler is enabled (default ON).
-/// `HIPFIRE_SAMPLE_PARALLEL=0` forces the legacy single-block kernel (for
-/// byte-exact A/B and as a fallback). Snapshot-backed, no per-flag cache.
-fn sample_parallel_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_SAMPLE_PARALLEL", true)
-}
-
-/// Whether the tie-safe fast reducer is enabled (default ON). This keeps the
-/// exact legacy parallel reducer available as a same-binary correctness and
-/// performance control without falling all the way back to the single-block
-/// sampler.
-fn sample_fast_stable_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_SAMPLE_FAST", true)
-}
-
 /// HIP source for the default parallel sampler module (`sample_top_p_parallel`,
 /// TOP_K 20). Shared by runtime ensure_kernel and the kernel registry so the
 /// cache hash is identical.
@@ -136,10 +121,7 @@ impl ParallelExactVariant {
 /// Whether the fast-stable reducer is used for a request (width 21 covers
 /// top_k<=20, width 65 covers 21..=64; vocab-guarded).
 fn sample_fast_stable_eligible(top_k_req: i32, vocab_size: usize) -> bool {
-    sample_fast_stable_enabled()
-        && top_k_req > 0
-        && top_k_req <= 64
-        && vocab_size <= SAMPLE_N_BLOCKS as usize * 256 * 16
+    top_k_req > 0 && top_k_req <= 64 && vocab_size <= SAMPLE_N_BLOCKS as usize * 256 * 16
 }
 
 /// What [`Gpu::sample_top_p_pf_enqueue`] enqueued, i.e. how the caller must
@@ -306,82 +288,25 @@ impl Gpu {
         // top_k → 20 (== kernel TOP_K, no cut), min_p → 0.0 (disabled).
         let top_k_req = top_k.map(|k| k as i32).unwrap_or(20);
         let min_p_val = min_p.unwrap_or(0.0);
-        // Multi-workgroup parallel sampler (default ON): splits the 150K-vocab
-        // top-K scan across N blocks instead of the single-block kernel that
-        // idles 95 of 96 CUs (~305 us/token on gfx1100 A3B decode). Byte-
-        // identical token for distinct logits. Opt out: HIPFIRE_SAMPLE_PARALLEL=0.
-        if sample_parallel_enabled() {
-            return self.sample_top_p_parallel_impl(
-                logits,
-                result_buf,
-                repeat_buf,
-                vocab_size,
-                temperature,
-                top_p,
-                rng_state,
-                repeat_window,
-                repeat_penalty,
-                presence_penalty,
-                frequency_penalty,
-                top_k_req,
-                min_p_val,
-            );
-        }
-        self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
-        let func = &self.functions["sample_top_p"];
-
-        let mut logits_ptr = logits.buf.as_ptr();
-        let mut result_ptr = result_buf.buf.as_ptr();
-        let mut repeat_ptr = repeat_buf.buf.as_ptr();
-        let mut vs = vocab_size as i32;
-        let mut temp = temperature;
-        let mut tp = top_p;
-        let mut rng = rng_state;
-        let mut rw = repeat_window as i32;
-        let mut rp = repeat_penalty;
-        let mut pp = presence_penalty;
-        let mut fp = frequency_penalty;
-        let mut tk = top_k_req;
-        let mut mp = min_p_val;
-
-        let mut params: Vec<*mut std::ffi::c_void> = vec![
-            &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
-            &mut result_ptr as *mut _ as *mut std::ffi::c_void,
-            &mut repeat_ptr as *mut _ as *mut std::ffi::c_void,
-            &mut vs as *mut _ as *mut std::ffi::c_void,
-            &mut temp as *mut _ as *mut std::ffi::c_void,
-            &mut tp as *mut _ as *mut std::ffi::c_void,
-            &mut rng as *mut _ as *mut std::ffi::c_void,
-            &mut rw as *mut _ as *mut std::ffi::c_void,
-            &mut rp as *mut _ as *mut std::ffi::c_void,
-            &mut pp as *mut _ as *mut std::ffi::c_void,
-            &mut fp as *mut _ as *mut std::ffi::c_void,
-            &mut tk as *mut _ as *mut std::ffi::c_void,
-            &mut mp as *mut _ as *mut std::ffi::c_void,
-        ];
-
-        // W7 P2b: gather TOP_K widened 20→64. LDS = nthreads*TOP_K*8; with
-        // TOP_K=64 the block must be 128 threads (128*64*8 = 64 KiB, the RDNA
-        // wave32 group-segment limit; 256 would request 128 KiB and fail).
-        let block_size = 128u32;
-        let shared_mem = block_size * 64 * 4 * 2;
-
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )?;
-        }
-
-        let mut out = [0u8; 8];
-        self.hip.memcpy_dtoh(&mut out, &result_buf.buf)?;
-        let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
-        let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
-        Ok((token_id, new_rng))
+        // Multi-workgroup parallel sampler: splits the 150K-vocab top-K scan
+        // across N blocks instead of the single-block kernel that idles 95 of
+        // 96 CUs (~305 us/token on gfx1100 A3B decode). Byte-identical token
+        // to the single-block kernel for distinct logits.
+        self.sample_top_p_parallel_impl(
+            logits,
+            result_buf,
+            repeat_buf,
+            vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            repeat_window,
+            repeat_penalty,
+            presence_penalty,
+            frequency_penalty,
+            top_k_req,
+            min_p_val,
+        )
     }
 
     /// Multi-workgroup parallel implementation of [`sample_top_p_pf`]. Up to
@@ -472,9 +397,7 @@ impl Gpu {
     /// `result_buf`, which may be a 2-element sub-view
     /// ([`GpuTensor::sub_offset`]); NO host readback or sync is performed.
     ///
-    /// Returns `Ok(None)` (nothing enqueued) when the parallel sampler is
-    /// disabled (`HIPFIRE_SAMPLE_PARALLEL=0`); the caller must then use the
-    /// singleton `sample_top_p_pf`. [`SampleEnqueued::Fast`] means a
+    /// Returns which reducer was enqueued. [`SampleEnqueued::Fast`] means a
     /// `token_id == u32::MAX` result must be re-run via
     /// [`Self::sample_top_p_pf_exact_enqueue`] with the ORIGINAL `rng_state`
     /// (the penalty prepass already ran in place and must not be repeated).
@@ -494,11 +417,8 @@ impl Gpu {
         frequency_penalty: f32,
         top_k: Option<u32>,
         min_p: Option<f32>,
-    ) -> HipResult<Option<SampleEnqueued>> {
+    ) -> HipResult<SampleEnqueued> {
         self.bind_thread()?;
-        if !sample_parallel_enabled() {
-            return Ok(None);
-        }
         let top_k_req = top_k.map(|k| k as i32).unwrap_or(20);
         let min_p_val = min_p.unwrap_or(0.0);
         let variant = self.sample_parallel_prepare(top_k_req)?;
@@ -523,7 +443,7 @@ impl Gpu {
                 top_k_req,
                 min_p_val,
             )?;
-            return Ok(Some(SampleEnqueued::Fast));
+            return Ok(SampleEnqueued::Fast);
         }
         self.enqueue_sample_exact(
             &variant,
@@ -536,7 +456,7 @@ impl Gpu {
             top_k_req,
             min_p_val,
         )?;
-        Ok(Some(SampleEnqueued::Exact))
+        Ok(SampleEnqueued::Exact)
     }
 
     /// Enqueue the exact parallel reducer (partial + finalize) WITHOUT the

@@ -10131,7 +10131,7 @@ pub const SOFTMAX_PROB_GATHER_BATCHED_SRC: &str =
 /// Batched temperature-scaled softmax, out-of-place. One block per row;
 /// writes `probs[r] = softmax(logits[r] / temp)` leaving `logits` untouched.
 /// Distribution-parity (tree reduction) to the host `softmax_temp_into`;
-/// used behind HIPFIRE_DFLASH_FAST_SAMPLE in the DFlash sampled path.
+/// used on the DFlash sampled path.
 ///
 /// This file holds TWO entry points: `softmax_temp_batched_f32` (above) and
 /// `softmax_temp_topp_batched_f32`, which additionally emits per-row nucleus

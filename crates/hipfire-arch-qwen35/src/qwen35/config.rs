@@ -56,15 +56,12 @@ pub(crate) fn f16_lm_head_mode_from_config() -> F16LmHeadMode {
 /// `forward_prefill_batch` returns an error if tree mode is requested but
 /// any FA layer would take the fallback path.
 ///
-/// GDN (LinearAttention) layers: if `parent_indices` is `Some`, the
-/// DeltaNet branch dispatches the tree-aware kernels
+/// GDN (LinearAttention) layers: the DeltaNet branch dispatches the
+/// tree-aware kernels
 /// (`conv1d_silu_split_tree_f32_n` + `gated_delta_net_q8_tree_batch_seq`)
 /// which walk per-token ancestor chains via `parent_indices` instead of
 /// the linear-sequence predecessor. This eliminates sibling-subtree
-/// cross-contamination of recurrent state at topk>1. If `parent_indices`
-/// is `None`, LA layers fall back to the linear path (byte-exact with
-/// DFlash at topk=1; approximation at topk>1 — used by pre-Phase-3
-/// callers that haven't been rewritten).
+/// cross-contamination of recurrent state at topk>1.
 
 /// Override the embedding for a single batch slot after the embedding-lookup
 /// kernel runs but before the layer loop. Used by the Qualcomm-style MTP

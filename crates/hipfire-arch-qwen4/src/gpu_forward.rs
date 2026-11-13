@@ -592,7 +592,6 @@ pub(crate) struct CompactScratchTerms {
     /// `None` unset, `Some(true)` `1`, `Some(false)` `0`.
     pub knob: Option<bool>,
     pub exact_gfx1201: bool,
-    pub grouped_gemm: bool,
     pub sym_iu4_requested: bool,
     pub source_symmetric: bool,
     /// Every routed trunk layer is a slab arena (manifest recipe
@@ -628,12 +627,7 @@ impl CompactScratchTerms {
         // Full).
         let route = (self.source_slab || (self.source_symmetric && self.sym_iu4_requested))
             && self.knob != Some(false);
-        if route
-            && self.exact_gfx1201
-            && self.grouped_gemm
-            && self.ple_key_value_bf16
-            && self.flash_next_profile
-        {
+        if route && self.exact_gfx1201 && self.ple_key_value_bf16 && self.flash_next_profile {
             Qwen4ForwardScratchMode::FnSymGfx1201
         } else {
             Qwen4ForwardScratchMode::Full
@@ -678,7 +672,6 @@ pub fn qwen4_forward_scratch_mode(
     CompactScratchTerms {
         knob: *KNOB,
         exact_gfx1201: CompactScratchTerms::is_exact_gfx1201(&gpu.arch),
-        grouped_gemm: gpu.flags.moe_grouped_gemm,
         sym_iu4_requested: gpu.qwen4_moe_sym_iu4_requested(),
         source_symmetric,
         source_slab,
@@ -4329,16 +4322,14 @@ impl Qwen4TileRoute {
         // gate/up with SwiGLU and BF16-out down), which needs no symmetric headers.
         let wmma = gpu.arch == "gfx1100";
         if wmma {
-            if !gpu.flags.moe_grouped_gemm
-                || !gpu.qwen4_moe_f16_wmma_grouped_applies(
-                    rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS,
-                    config.moe_intermediate_size,
-                    config.hidden_size,
-                )
-            {
+            if !gpu.qwen4_moe_f16_wmma_grouped_applies(
+                rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS,
+                config.moe_intermediate_size,
+                config.hidden_size,
+            ) {
                 return refuse("the F16 WMMA grouped MoE route is not available");
             }
-        } else if !gpu.flags.moe_grouped_gemm || !gpu.qwen4_moe_sym_iu4_requested() {
+        } else if !gpu.qwen4_moe_sym_iu4_requested() {
             return refuse("the symmetric IU4 route is not requested");
         }
         if mode != Qwen4ForwardScratchMode::Full
@@ -13202,15 +13193,12 @@ impl Qwen4GpuForward {
             if compact {
                 // The compact plan was admitted before any weight was
                 // loaded; it is valid only for the exact route it sized.
-                if gpu.arch != "gfx1201" || !gpu.flags.moe_grouped_gemm {
-                    return Err(invalid(
-                        "compact scratch requires gfx1201 with the grouped MoE GEMM",
-                    ));
+                if gpu.arch != "gfx1201" {
+                    return Err(invalid("compact scratch requires gfx1201"));
                 }
                 if !all_slab && !gpu.qwen4_moe_sym_iu4_requested() {
                     return Err(invalid(
-                        "compact scratch requires gfx1201 with the grouped MoE GEMM and the \
-                         symmetric IU4 route requested",
+                        "compact scratch requires gfx1201 with the symmetric IU4 route requested",
                     ));
                 }
                 for layer in &bundle.weights.layer_refs {
@@ -22273,7 +22261,6 @@ mod tests {
         let slab = CompactScratchTerms {
             knob: None,
             exact_gfx1201: true,
-            grouped_gemm: true,
             sym_iu4_requested: false,
             source_symmetric: false,
             source_slab: true,
@@ -22310,7 +22297,6 @@ mod tests {
         let sym = CompactScratchTerms {
             knob: Some(true),
             exact_gfx1201: true,
-            grouped_gemm: true,
             sym_iu4_requested: true,
             source_symmetric: true,
             source_slab: false,
@@ -22376,10 +22362,6 @@ mod tests {
             let off = [
                 CompactScratchTerms {
                     exact_gfx1201: false,
-                    ..base
-                },
-                CompactScratchTerms {
-                    grouped_gemm: false,
                     ..base
                 },
                 CompactScratchTerms {

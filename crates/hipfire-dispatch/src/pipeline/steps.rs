@@ -1295,13 +1295,12 @@ fn execute_window<'a>(
                     .any(|s| cpu_exec::plan_step(gpu, s).is_some())
         });
         if let Some((key, len)) = fused {
-            // ── QKV bias fold (HIPFIRE_FUSE_QKV_BIAS) ────────────────────────
-            // When the flag is on, the matched window is a per-row 3-way QKV
-            // decode key whose kernel supports the fold, and the 3 steps right
-            // after the window are `BiasAdd` on the q/k/v outputs in order,
-            // fold the bias into the kernel's lane-0 store and skip those 3
-            // steps.
-            if ctx.flags.fuse_qkv_bias && len == QKV3.len() && qkv_bias_fold_supported(key, ctx) {
+            // ── QKV bias fold ────────────────────────────────────────────────
+            // When the matched window is a per-row 3-way QKV decode key whose
+            // kernel supports the fold, and the 3 steps right after the window
+            // are `BiasAdd` on the q/k/v outputs in order, fold the bias into
+            // the kernel's lane-0 store and skip those 3 steps.
+            if len == QKV3.len() && qkv_bias_fold_supported(key, ctx) {
                 if let Some(biases) = match_trailing_qkv_bias(&steps[i..], len) {
                     launch_fused_qkv_with_bias(gpu, ctx, key, &steps[i..i + len], biases)?;
                     i += len + 3;

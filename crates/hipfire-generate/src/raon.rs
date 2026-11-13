@@ -769,7 +769,6 @@ mod tests {
             min_p: None,
             nonneutral_penalties: false,
             force_ar_chat: false,
-            fast_sample_on: true,
             supports_temp_swor: false,
             supports_chain_nucleus_verify: false,
             kv_adaptive: false,

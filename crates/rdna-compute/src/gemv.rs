@@ -2259,7 +2259,7 @@ impl Gpu {
     }
 
     /// `fused_qkv_mq4g256_lloyd` with an optional Q/K/V bias folded into the
-    /// kernel's lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`). All-null = byte-identical
+    /// kernel's lane-0 store (the QKV bias fold). All-null = byte-identical
     /// to the unfused path (fp32 store→add). Both arch siblings (base + gfx1100)
     /// carry the 3 trailing bias params, so the kernarg ABI matches whichever
     /// `_for_arch` selects.
@@ -2681,7 +2681,7 @@ impl Gpu {
     }
 
     /// `fused_qkv_mq3g256_lloyd` with an optional Q/K/V bias folded into the
-    /// kernel's lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`). All-null = byte-identical
+    /// kernel's lane-0 store (the QKV bias fold). All-null = byte-identical
     /// to the unfused path. Both arch siblings (base + gfx1100) carry the 3
     /// trailing bias params.
     #[allow(clippy::too_many_arguments)]
@@ -15870,12 +15870,10 @@ impl Gpu {
             let wg2 = self.arch_caps.is_gfx1100()
                 && hipfire_config::developer_bool("HIPFIRE_MOE_GATE_UP_WG2", false);
             // The unchanged base kernel maps blockIdx.x to one logical row in
-            // each M/2 gate and up output. The legacy M-sized grid therefore
-            // leaves its upper half to exit at the row >= M/2 guard. Default
-            // on for gfx1100 after exact shadow and stationary tg128 checks;
-            // HIPFIRE_MOE_GATE_UP_TIGHT_GRID=0 restores the legacy geometry.
+            // each M/2 gate and up output, so gfx1100 launches the tight M/2
+            // grid (exact shadow and stationary tg128 checks).
             let tight_grid = if self.arch_caps.is_gfx1100() {
-                hipfire_config::developer_bool("HIPFIRE_MOE_GATE_UP_TIGHT_GRID", true)
+                true
             } else if self.arch_caps.is_gfx1151() {
                 // gfx1151 keeps its own performance-admission gate. The
                 // kernel maps blockIdx.x to one row in each M/2 output, so

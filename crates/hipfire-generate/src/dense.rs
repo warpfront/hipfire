@@ -256,7 +256,6 @@ pub fn glimmer_spec_admission(
     max_tokens: usize,
     temp: f32,
     min_p: Option<f32>,
-    fast_sample_on: bool,
     batched_logits_available: bool,
 ) -> GlimmerSpecMode {
     if !has_drafter || max_tokens <= 1 {
@@ -265,8 +264,7 @@ pub fn glimmer_spec_admission(
     if temp <= 0.01 {
         return GlimmerSpecMode::Greedy;
     }
-    if temp > 1e-6 && fast_sample_on && min_p.map_or(true, |p| p <= 0.0) && batched_logits_available
-    {
+    if temp > 1e-6 && min_p.map_or(true, |p| p <= 0.0) && batched_logits_available {
         return GlimmerSpecMode::ChainSampled;
     }
     GlimmerSpecMode::Off
@@ -4733,7 +4731,7 @@ pub fn generate_muse_glimmer(
     let mut glimmer_visible_acc: String = String::new();
     let mut glimmer_tool_acc: String = String::new();
     // Speculative path: greedy is the validated 3.17x path; sampled chain-sample
-    // (temp>0) is gated on dflash_fast_sample + batched logits + !min_p.
+    // (temp>0) is gated on batched logits + !min_p.
     // The drafter presence is gated by HIPFIRE_DFLASH_DRAFT / dflash_mode=off
     // (daemon.rs:13118), so AR is untouched when absent.
     let batched_logits_available =
@@ -4741,13 +4739,11 @@ pub fn generate_muse_glimmer(
             &bundle.config,
             &bundle.weights,
         );
-    let fast_sample_on = hipfire_runtime::config::get().dflash_fast_sample;
     let spec_mode = glimmer_spec_admission(
         bundle.drafter.is_some(),
         max_tokens,
         temp,
         min_p,
-        fast_sample_on,
         batched_logits_available,
     );
     let use_spec = spec_mode != GlimmerSpecMode::Off;

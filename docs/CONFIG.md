@@ -204,7 +204,7 @@ list` remains accepted as a migration alias:
 ```bash
 hipfire config set kernel.mmq auto
 hipfire config set kernel.fp16 true
-hipfire config set fusions.qkv_bias true
+hipfire config set fusions.force_unfused false
 hipfire config set diagnostic.gemm_dump false
 ```
 
@@ -228,14 +228,7 @@ Stable/default-on and safety controls:
 | `hardware.tp_use_rccl` | `true` | RCCL tensor-parallel all-reduce. |
 | `kernel.prefill_batched` | `true` | Batched prefill kernels. |
 | `kernel.fp16` | `true` | Allow FP16 routes. |
-| `kernel.lm_head_wmma` | `true` | Allow WMMA LM-head dispatch. |
 | `kernel.hfq4g128_mmq` | `true` | Allow HFQ4G128 MMQ dispatch. |
-| `kernel.moe_grouped_gemm` | `true` | Grouped-GEMM MoE prefill. |
-| `kernel.deepseek4_q8_wmma` | `true` | DeepSeek4 Q8 WMMA prefill. |
-| `kernel.deepseek4_q8_4w` | `true` | DeepSeek4 four-wave Q8 tile. |
-| `speculation.ddtree_tree_la` | `true` | DDTree linearized-ancestor tape. |
-| `speculation.dflash_fast_sample` | `true` | GPU DFlash sampled verification. |
-| `fusions.qkv_bias` | `true` | Fold supported QKV bias launches. |
 | `kernel.rocblas_off` | `false` | Disable rocBLAS dispatch. |
 | `fusions.force_unfused` | `false` | Force supported projection paths unfused. |
 | `fusions.npu_trunk` | `"auto"` | Flash-Next (Qwen4) trunk projection engine: `off\|auto\|on\|emulate` (case-insensitive). `auto` (default) resolves silently to `off` on every arch except gfx1151, with no NPU I/O or allocation. On gfx1151 it arms only when the load is eligible (Flash-Next, K=2560, stock MQ6G256V2 trunk projections, a single device without EP, the full 8192-row prefill scratch rung and enough free memory for it), the NPU firmware is readable, and the calibration matches the device/build/model identity and selects a nonempty family set (the built-in calibration is the normal path and applies on any Halo kernel/firmware/GPU PCI address, keyed by arch/build/model/epilogue/route; under `auto` each request picks its NPU family subset and pair plan from GPU/NPU rate scales learned live in this process, see [live rate scales](npu/npu-trunk.md#live-rate-scales-auto)); any refusal logs one `npu-trunk: off (reason)` line (prefixed `WARN` when the load qualifies but the NPU fails to arm) and the load continues GPU-only. The armed trunk pins 1,053,843,456 B of userptr arenas against `RLIMIT_MEMLOCK`; grant a bounded limit of 1,318,060,032 B (`LimitMEMLOCK=1318060032`, `ulimit -l 1287168`), see [host memlock limit](npu/npu-trunk.md#host-memlock-limit). `off` is the kill switch. `on` requires the NPU and `emulate` runs the bit-identical GPU emulation of the NPU numerics: both refuse an ineligible load or arch instead of falling back, and both tolerate a missing or mismatched calibration (logged as `calibration=none (forced)`; every family is used). |
@@ -374,7 +367,7 @@ The EP owner-routed prefill and the expert-staging levers have no typed schema k
 | `developer.gdn_qk_indexed` | `HIPFIRE_GDN_QK_INDEXED` | on where qualified (exact gfx1201) | Sequential Q8-state MoE prefill indexes key-head Q/K by value-head ratio instead of repeating Q/K; `false` / `0` restores repeat/copy. |
 | `developer.gdn_moe_pre_fused` | `HIPFIRE_GDN_MOE_PRE_FUSED` | on where qualified (exact gfx1201) | Admitted MoE prefill uses the existing fused sigmoid/conv/norm/repeat preamble; `false` / `0` keeps separate launches. |
 | `developer.gdn_moe_chunk_scan` | `HIPFIRE_GDN_MOE_CHUNK_SCAN` | on where qualified (exact gfx1201) | Admitted MoE prefill uses the existing GDN chunk scan with Q8 state and EF residual; `false` / `0` restores sequential processing. |
-| `developer.ep_owner_routed_prefill` | `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | on under EP (2..=8 ranks) | Owner-routed chunk MoE: a prefill chunk of at least 512 rows computes only its own experts' tiles and pulls the other ranks' tiles over P2P; every other chunk keeps the full-table route. Admitted on gfx1201 (every layer verified symmetric on every rank, the symmetric IU4 MoE route requested, below) and on gfx1100 (the F16 WMMA grouped MoE route, QT44/QT53 experts on every layer), always with the Flash-Next profile, `kernel.moe_grouped_gemm` on and the full (non-compact) scratch plan; a refusal logs `qwen4 EP rank r/n: owner-routed prefill not admitted (reason)`. |
+| `developer.ep_owner_routed_prefill` | `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | on under EP (2..=8 ranks) | Owner-routed chunk MoE: a prefill chunk of at least 512 rows computes only its own experts' tiles and pulls the other ranks' tiles over P2P; every other chunk keeps the full-table route. Admitted on gfx1201 (every layer verified symmetric on every rank, the symmetric IU4 MoE route requested, below) and on gfx1100 (the F16 WMMA grouped MoE route, QT44/QT53 experts on every layer), always with the Flash-Next profile, the full (non-compact) scratch plan; a refusal logs `qwen4 EP rank r/n: owner-routed prefill not admitted (reason)`. |
 | `developer.qwen4_moe_sym_iu4` | `HIPFIRE_QWEN4_MOE_SYM_IU4` | unset = requested on gfx1100 / gfx1151 / gfx1201 | Grouped symmetric IU4 MoE prefill route for Qwen4. A typed boolean: `true` / `1` requests it, `false` / `0` keeps the whole incumbent route. `hipfire config set developer.qwen4_moe_sym_iu4 false`, a TOML boolean (or `"false"`, `0`) and `HIPFIRE_QWEN4_MOE_SYM_IU4=false` all disable it, exactly like `0`; any other spelling (`on`, `yes`, `2`, an empty value) is rejected with `invalid value for developer.qwen4_moe_sym_iu4: expected a boolean: true, false, 1 or 0`, never ignored. The request also needs the IU4 producers built with exactly the two-candidate activation search: on gfx1201 that is `kernel.g12_a4c2` (default `true`), on gfx1151 `kernel.gfx11_a4_candidates = "2"` (default), and any other `-DIU4_A4_CANDIDATES` value in `diagnostic.compiler.hipcc_extra_flags` withdraws it. Layers whose routed-expert headers fail the symmetry check (asymmetric artifacts) stay on the incumbent route. On gfx1100 the route is requested by default like the other two (the shipped NT1 gate/up and down module with the K3 down producer; **TODO-evidence: default-on decision record, see the CHANGELOG entry**): unset and `true` / `1` request it, `false` / `0` kills it everywhere, and the regular prefill and the S1 `AggregateSymIu4` window route (receipt `aggregate-sym-iu4`, resolved with a symmetric MQ4 artifact and exactly the two-candidate activation search `-DIU4_A4_CANDIDATES=2` in `diagnostic.compiler.hipcc_extra_flags`) read the same request, so they always agree; any other candidate value withdraws it, and a forced-but-unsupported `=1` prints one diagnostic and keeps the incumbent. On gfx1201, owner-routed prefill therefore has no single request key: it follows this developer lever plus those typed keys; on gfx1100 owner-routed prefill stays on the F16 WMMA grouped route (this lever gates only the single-device IU4 arm and the S1 aggregate window). |
 | `developer.moe_sym_iu4` | `HIPFIRE_MOE_SYM_IU4` | unset = on by capability | Symmetric IU4 grouped routed-expert prefill route for qwen35 MoE artifacts whose loader-verified routed experts are symmetric qt44 gate/up + symmetric qt53 down (gfx1201 PeaceMaker objects). A typed boolean like `developer.qwen4_moe_sym_iu4`; `false` / `0` is the kill switch and loads such an artifact with a WARNING onto its ~3.7x slower qt53 F32 prefill fallback. Without it, an arch lacking the objects (every arch but gfx1201 today) or headers that fail verification refuse the load. Independent of `developer.qwen4_moe_sym_iu4`; an explicit `HIPFIRE_IU4_PREFILL=0` also disables it. Numerics: BF16 slot boundaries, A4 activations (Qwen KLD +0.0205 vs the fallback). See `docs/env-vars.md`. |
 | `developer.qwen4_moe_x_lds` | `HIPFIRE_QWEN4_MOE_X_LDS` | `auto` | Exact gfx1151 F16 WMMA MoE route: the grouped gate/up SiLU and down GEMMs take X-through-LDS entries, bytewise the per-wave entries. `auto` arms exactly when a layer's MoE runs on the F16 WMMA route (its symmetric IU4 arm, above, is not selected); the default IU4 route is unchanged. `1` forces it wherever admissible, `0` keeps the per-wave entries. See `docs/env-vars.md`. |
@@ -1839,7 +1832,6 @@ keys. The remaining retained-replay controls are developer diagnostics:
 | `diagnostic.replay.pm4_kernarg_pool` | `"vram"` | `vram` \| `host` |
 | `diagnostic.replay.pm4_wait_policy` | `"resource"` | `allowlist` \| `resource-audit` \| `resource` |
 | `diagnostic.replay.pm4_acquire_policy` | `"required-only"` | `conservative`, `entry-only`, `required-only`, `without-repeat-interleave`, `without-fused-silu-rotate`, `without-mq-rotate`, `without-rope` |
-| `diagnostic.replay.pm4_gcr_trim` | `true` | bool |
 | `diagnostic.replay.pm4_dynamic_grid` | `false` | bool |
 | `diagnostic.replay.gfx1151_initiator` | `"legacy"` | `legacy` \| `order` \| `radv` |
 | `diagnostic.replay.gfx1151_interleave` | `"inherit"` | `inherit`, `off`, `64`, `128`, `256`, `512` |
@@ -2260,10 +2252,18 @@ branch) or a misspelled key is unknown and fails the load with
 | `prompt.jinja_chat` | `jinja_chat` | 0.3.1 | 0.5.0 | none; chat prompts render through the model template when one is present |
 | `speculation.draft_f16` | `draft_f16` | 0.3.1 | 0.5.0 | none; F16 draft weights always stay F16 |
 | `experimental.graph.moe` | `graph_moe` | 0.3.1 | 0.5.0 | `experimental.graph.forward = false` disables forward graph capture for every model |
+| `kernel.lm_head_wmma` | `lm_head_wmma` | 0.3.1 | 0.5.0 | none; WMMA runs wherever the arch has it (`kernel.fp16 = false` still forces the scalar head) |
+| `kernel.moe_grouped_gemm` | `moe_grouped_gemm` | 0.3.1 | 0.5.0 | none; grouped-GEMM MoE prefill runs wherever the arch has WMMA |
+| `kernel.deepseek4_q8_wmma` | `deepseek4_q8_wmma` | 0.3.1 | 0.5.0 | none; WMMA runs wherever the arch has it |
+| `kernel.deepseek4_q8_4w` | `deepseek4_q8_4w` | 0.3.1 | 0.5.0 | none; the tile is chosen by shape |
+| `speculation.ddtree_tree_la` | `ddtree_tree_la` | 0.3.1 | 0.5.0 | none; DDTree verify always uses the tree-aware kernels |
+| `speculation.dflash_fast_sample` | `dflash_fast_sample` | 0.3.1 | 0.5.0 | none; sampled DFlash verification always samples on the GPU |
+| `fusions.qkv_bias` | `fuse_qkv_bias` | 0.3.1 | 0.5.0 | none; supported QKV bias additions are always folded |
+| `diagnostic.replay.pm4_gcr_trim` | `replay_pm4_gcr_trim` | 0.3.1 | 0.5.0 | none; supported retained PM4 routes always trim redundant GCR operations |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 282 schema keys, plus the `developer.<name>` namespace.
+**Count:** 273 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -2309,7 +2309,6 @@ branch) or a misspelled key is unknown and fails the load with
 | `diagnostic.replay.manual_capture` | `replay_manual_capture` | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | experimental |
 | `diagnostic.replay.pm4_acquire_policy` | `replay_pm4_acquire_policy` | `HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY` | experimental |
 | `diagnostic.replay.pm4_dynamic_grid` | `replay_pm4_dynamic_grid` | `HIPFIRE_REPLAY_PM4_DYNAMIC_GRID` | experimental |
-| `diagnostic.replay.pm4_gcr_trim` | `replay_pm4_gcr_trim` | `HIPFIRE_REPLAY_PM4_GCR_TRIM` | experimental |
 | `diagnostic.replay.pm4_kernarg_pool` | `replay_pm4_kernarg_pool` | `HIPFIRE_PM4_KERNARG_POOL` | experimental |
 | `diagnostic.replay.pm4_max_parallel_phases` | `replay_pm4_max_parallel_phases` | `HIPFIRE_REPLAY_PM4_MAX_PARALLEL_PHASES` | experimental |
 | `diagnostic.replay.pm4_min_parallel_width` | `replay_pm4_min_parallel_width` | `HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WIDTH` | experimental |
@@ -2326,7 +2325,6 @@ branch) or a misspelled key is unknown and fails the load with
 | `fusions.force_unfused` | `force_unfused` | `HIPFIRE_FORCE_UNFUSED` | experimental |
 | `fusions.npu_trunk` | `npu_trunk` | `HIPFIRE_QWEN4_NPU_TRUNK` | experimental |
 | `fusions.npu_trunk_calibration` | `npu_trunk_calibration` | `HIPFIRE_QWEN4_NPU_TRUNK_CAL` | experimental |
-| `fusions.qkv_bias` | `fuse_qkv_bias` | `HIPFIRE_FUSE_QKV_BIAS` | stable |
 | `generation.loop_guard_threshold` | `ngram_loop_threshold` | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | stable |
 | `generation.loop_guard_window` | `ngram_window` | `HIPFIRE_NGRAM_WINDOW` | stable |
 | `generation.max_tokens` | `max_tokens` |  | stable |
@@ -2345,8 +2343,6 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.attn_qresident` | `attn_qresident` | `HIPFIRE_ATTN_QRESIDENT` | stable |
 | `kernel.attn_qresident_v2` | `attn_qresident_v2` | `HIPFIRE_ATTN_QRESIDENT_V2` | stable |
 | `kernel.calib_force_bf16` | `calib_force_bf16` | `HIPFIRE_CALIB_BF16` | experimental |
-| `kernel.deepseek4_q8_4w` | `deepseek4_q8_4w` | `HIPFIRE_DEEPSEEK4_Q8_4W` | stable |
-| `kernel.deepseek4_q8_wmma` | `deepseek4_q8_wmma` | `HIPFIRE_DEEPSEEK4_Q8_WMMA` | stable |
 | `kernel.deterministic` | `deterministic` | `HIPFIRE_DETERMINISTIC` | experimental |
 | `kernel.dot2_gemv` | `dot2_gemv` | `HIPFIRE_DOT2_GEMV` | experimental |
 | `kernel.draft_shared_ctx_kv_rotation` | `draft_shared_ctx_kv_rotation` | `HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION` | stable |
@@ -2406,11 +2402,9 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.lloyd_force_baseline` | `lloyd_force_baseline` | `HIPFIRE_LLOYD_FORCE_BASELINE` | experimental |
 | `kernel.lm_head_f16` | `lm_head_f16` | `HIPFIRE_LM_HEAD_F16` | stable |
 | `kernel.lm_head_overwrite` | `lm_head_overwrite` | `HIPFIRE_LM_HEAD_OVERWRITE` | experimental |
-| `kernel.lm_head_wmma` | `lm_head_wmma` | `HIPFIRE_LM_HEAD_WMMA` | stable |
 | `kernel.mmq` | `mmq` | `HIPFIRE_MMQ` | stable |
 | `kernel.moe_down_combine_vec4` | `moe_down_combine_vec4` | `HIPFIRE_MOE_DOWN_COMBINE_VEC4` | experimental |
 | `kernel.moe_grouped_4w` | `moe_grouped_4w` | `HIPFIRE_MOE_GROUPED_4W` | experimental |
-| `kernel.moe_grouped_gemm` | `moe_grouped_gemm` | `HIPFIRE_MOE_GROUPED_GEMM` | stable |
 | `kernel.moe_grouped_i8` | `moe_grouped_i8` | `HIPFIRE_MOE_GROUPED_I8` | experimental |
 | `kernel.moe_grouped_i8_k4` | `moe_grouped_i8_k4` | `HIPFIRE_MOE_GROUPED_I8_K4` | experimental |
 | `kernel.moe_grouped_i8_k4_gfx12` | `moe_grouped_i8_k4_gfx12` | `HIPFIRE_MOE_GROUPED_I8_K4_GFX12` | experimental |
@@ -2527,11 +2521,9 @@ branch) or a misspelled key is unknown and fails the load with
 | `serve.vmm_batch` | `serve_vmm_batch` | `HIPFIRE_SERVE_VMM_BATCH` | experimental |
 | `speculation.ddtree_budget` | `ddtree_budget` | `HIPFIRE_DDTREE_BUDGET` | experimental |
 | `speculation.ddtree_topk` | `ddtree_topk` | `HIPFIRE_DDTREE_TOPK` | experimental |
-| `speculation.ddtree_tree_la` | `ddtree_tree_la` | `HIPFIRE_DDTREE_TREE_LA` | experimental |
 | `speculation.dflash` | `dflash_mode` | `HIPFIRE_DFLASH_MODE` | stable |
 | `speculation.dflash_adaptive_b` | `dflash_adaptive_b` |  | stable |
 | `speculation.dflash_block` | `dflash_block` | `HIPFIRE_DFLASH_BLOCK` | stable |
-| `speculation.dflash_fast_sample` | `dflash_fast_sample` | `HIPFIRE_DFLASH_FAST_SAMPLE` | experimental |
 | `speculation.dflash_lookup` | `dflash_lookup` | `HIPFIRE_DFLASH_LOOKUP` | stable |
 | `speculation.dflash_ngram_block` | `dflash_ngram_block` | `HIPFIRE_DFLASH_NGRAM_BLOCK` | stable |
 | `speculation.dflash_tree` | `dflash_tree` | `HIPFIRE_DFLASH_TREE` | experimental |
