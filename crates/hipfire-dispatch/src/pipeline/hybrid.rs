@@ -180,13 +180,9 @@ fn gdn_compact2(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
 /// measured +0.45%, while profiling confirmed 853 -> 805 dispatches/token and
 /// a net 64.35 us/token reduction in GPU compute. Exact gfx1201 runs the same
 /// `gated_delta_net_q8_compact3_b2` object for the same shape (its state,
-/// output and EF bytes equal the materialized repeat-interleave route). Set
-/// `HIPFIRE_GDN_COMPACT3=0` to restore explicit Q/K materialization.
+/// output and EF bytes equal the materialized repeat-interleave route).
 fn gdn_compact3(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| developer_var("HIPFIRE_GDN_COMPACT3").as_deref() != Some("0"));
-    *ENABLED
-        && (gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions(gpu))
+    (gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions(gpu))
         && q8_state
         && dims.linear_key_heads * 3 == dims.linear_value_heads
         && dims.is_dense_27b_shape()
@@ -261,12 +257,9 @@ fn kv_write_fold_route_supported(plan: &KvTierPlan) -> bool {
 /// partial half-split RoPE into one head-local launch on the certified gfx1100
 /// shapes (and their exact-gfx1201 twins). The Qwen3.6-27B q24k4 route
 /// measured +0.64% over a 512-token A/B/B/A on gfx1100 and reduced 757 -> 709
-/// dispatches/token. Set `HIPFIRE_QWEN35_FA_PREP_FUSE=0` to retain the legacy
-/// path. The legacy interleaved-RoPE compatibility mode and diagnostic tap
-/// retain the established multi-dispatch path.
+/// dispatches/token. Other shapes, the legacy interleaved-RoPE compatibility
+/// mode and the diagnostic tap retain the established multi-dispatch path.
 pub fn fused_attention_prep(gpu: &Gpu, dims: &HybridDims) -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| developer_var("HIPFIRE_QWEN35_FA_PREP_FUSE").as_deref() != Some("0"));
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100() || gfx1151_radiowave(gpu))
         && dims.n_heads == 16
         && dims.n_kv_heads == 2)
@@ -277,8 +270,7 @@ pub fn fused_attention_prep(gpu: &Gpu, dims: &HybridDims) -> bool {
             && dims.is_dense_27b_shape()
             && dims.n_heads == 24
             && dims.n_kv_heads == 4);
-    *ENABLED
-        && admitted_arch_shape
+    admitted_arch_shape
         && !gpu.flags.rope_interleaved_legacy
         && dims.head_dim == 256
         && dims.n_rot == 64
@@ -288,10 +280,7 @@ pub fn fused_attention_prep(gpu: &Gpu, dims: &HybridDims) -> bool {
 /// epilogue on certified gfx1100/MQ4 shapes. Extending the existing Q8 reducer
 /// to Qwen3.6-27B's asym3 route measured +0.37% over a 512-token A/B/B/A and
 /// reduced 709 -> 677 dispatches/token; a 1025-token replay remained exact.
-/// Set `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE=0` to retain the legacy path.
 pub fn fused_attention_epilogue(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>) -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| developer_var("HIPFIRE_QWEN35_FA_EPILOGUE_FUSE").as_deref() != Some("0"));
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100() || gfx1151_radiowave(gpu))
         && dims.n_heads == 16
         && dims.n_kv_heads == 2)
@@ -302,7 +291,7 @@ pub fn fused_attention_epilogue(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>
             && dims.is_dense_27b_shape()
             && dims.n_heads == 24
             && dims.n_kv_heads == 4);
-    *ENABLED && admitted_arch_shape && dims.head_dim == 256 && is_mq4(wo.dtype)
+    admitted_arch_shape && dims.head_dim == 256 && is_mq4(wo.dtype)
 }
 
 /// fp8: admitted only for the flash-tile attend key whose [2+head_dim] f32

@@ -125,8 +125,7 @@ impl RowsRoute {
     }
 }
 
-// #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
-// only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
+// #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate.
 pub mod superop;
 
 /// Generic-pipeline refusal for the typed-only formats: MQ4G128V2 (qt=53) and
@@ -2189,16 +2188,6 @@ pub(crate) fn mixed_expert_dtype_tag(gate: DType, down: DType) -> Option<u8> {
     }
 }
 
-/// Which ninepath D3 family a uniform (gate, down) pair selects, if any.
-/// Only HFQ4/MQ4V1 (MQ4G256) may call `gemv_hfq4g256_moe_ninepath_d3`;
-/// V2 pairs (MQ4G256V2, MQ6G256V2) must use exact native indexed gate + V2 D4.
-/// Split V1/V2 pairings never share a family — wrong header is silent garbage.
-pub(crate) fn ninepath_d3_family(gate: DType, down: DType) -> Option<&'static str> {
-    match (gate, down) {
-        (DType::MQ4G256, DType::MQ4G256) => Some("hfq4"),
-        _ => None,
-    }
-}
 /// Bind the current G1 window seal (`#[cfg(lab)]` only) from the stage's
 /// existing immutable-identity proof. Fails closed when the routed set
 /// offers no immutability proof or no experts resolve: a merely
@@ -3143,8 +3132,7 @@ pub fn run_moe_prefill_bias_aware(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(128);
-    let use_grouped = batch_size >= gate_threshold
-        && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
+    let use_grouped = batch_size >= gate_threshold;
 
     // Shared research levers (read once; default 4w on gfx11+).
     let lloyd_4w_base =
@@ -3303,7 +3291,7 @@ pub fn run_moe_prefill_bias_aware(
             batch_size,
         ))?;
     } else {
-        // ── Scalar K4 path (batch_size < gate, or grouped opt-out) ──
+        // ── Scalar K4 path (batch_size < gate) ──
         let use_gate_up_k4096_lds = gpu.arch.eq_ignore_ascii_case("gfx1151")
             && 2 * im == 4096
             && hidden == 4096
@@ -3352,9 +3340,7 @@ pub fn run_moe_prefill_bias_aware(
 
         // Down: deterministic expanded+combine (default; bit-reproducible for
         // spec-decode) vs non-deterministic atomic-accumulate.
-        let deterministic = !p.uses_atomic_moe_down
-            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref()
-                != Ok("0");
+        let deterministic = !p.uses_atomic_moe_down;
         if deterministic {
             hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
                 p.expert_down_ptrs,
@@ -3377,13 +3363,8 @@ pub fn run_moe_prefill_bias_aware(
         } else {
             // DeepSeek4's routed down projection has fixed K=2048. The ordinary
             // AR route already uses the K8-all body; use its position-batched
-            // twin for gfx1151 verify as well. Keep an explicit rollback switch
-            // while this route is certified for retained replay.
-            let use_batched_k8all = gpu.arch.eq_ignore_ascii_case("gfx1151")
-                && im == 2048
-                && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DOWN_BATCHED_K8ALL")
-                    .as_deref()
-                    != Ok("0");
+            // twin for gfx1151 verify as well.
+            let use_batched_k8all = gpu.arch.eq_ignore_ascii_case("gfx1151") && im == 2048;
             if use_batched_k8all {
                 hip!(gpu
                     .deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k8all(
@@ -3714,9 +3695,9 @@ mod mixed_dispatch_tests {
     use super::{
         build_contiguous_permutation, decode_expanded_down_kind, decode_gate_uses_mixed,
         gate_down_skips_rotation, gate_up_varies, grouped_gemm_kind, mixed_expert_dtype_tag,
-        ninepath_d3_family, ninepath_d4_family, prefill_path1_down_kind,
-        prefill_path1_down_kind_tag_aware, prefill_path1_gate_up_kind,
-        prefill_path1_gate_up_kind_tag_aware, shared_dense_down_kind, use_gfx1151_i8_moe,
+        ninepath_d4_family, prefill_path1_down_kind, prefill_path1_down_kind_tag_aware,
+        prefill_path1_gate_up_kind, prefill_path1_gate_up_kind_tag_aware, shared_dense_down_kind,
+        use_gfx1151_i8_moe,
     };
     use crate::families::moe_buckets::bucket_topk_by_tier;
     use rdna_compute::DType::*;
@@ -3878,17 +3859,7 @@ mod mixed_dispatch_tests {
     }
 
     #[test]
-    fn ninepath_d3_is_hfq4_only_and_v2_uses_native_d4() {
-        // Only HFQ4/MQ4V1 (MQ4G256) may call the V1 ninepath D3 kernel.
-        assert_eq!(ninepath_d3_family(MQ4G256, MQ4G256), Some("hfq4"));
-        // V2 pairs must NOT use D3 — they use native indexed gate + V2 D4.
-        assert_eq!(ninepath_d3_family(MQ4G256V2, MQ4G256V2), None);
-        assert_eq!(ninepath_d3_family(MQ6G256V2, MQ6G256V2), None);
-        // Split V1/V2 pairs never share D3.
-        assert_eq!(ninepath_d3_family(MQ4G256V2, MQ4G256), None);
-        assert_eq!(ninepath_d3_family(MQ4G256, MQ4G256V2), None);
-        assert_eq!(ninepath_d3_family(MQ4G256V2, MQ6G256V2), None);
-        // D4 still separates V2 families correctly.
+    fn ninepath_d4_separates_v2_families() {
         assert_eq!(ninepath_d4_family(MQ4G256V2, MQ4G256V2), Some("mq4v2"));
         assert_eq!(ninepath_d4_family(MQ6G256V2, MQ6G256V2), Some("mq6v2"));
     }
@@ -5641,7 +5612,6 @@ fn decode_gate_up_stage(
     p: &crate::families::moe::MoeParams<'_>,
     res: crate::families::moe::MoeResolution,
     activation_input: &GpuTensor,
-    ninepath_d3: bool,
     route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
     reject_fp8_moe(&p.dtypes)?;
@@ -5712,24 +5682,7 @@ fn decode_gate_up_stage(
         // (`silu_mul_bf16_rt_f32`), their only reader.
         return Ok(());
     }
-    if ninepath_d3 {
-        // Only HFQ4/MQ4V1 may call the V1 ninepath D3 kernel. V2 uses
-        // exact native indexed gate (below) + V2 D4.
-        debug_assert_eq!(
-            ninepath_d3_family(p.dtypes.routed_gate_up, p.dtypes.routed_down),
-            Some("hfq4"),
-            "ninepath D3 is HFQ4-only"
-        );
-        hip!(gpu.gemv_hfq4g256_moe_ninepath_d3(
-            p.expert_gate_up_ptrs,
-            p.topk_indices,
-            xr,
-            p.gate_batch,
-            p.up_batch,
-            p.mi,
-            gate_up_k,
-        ))?;
-    } else if decode_gate_uses_mixed(p.expert_dtype_tags.is_some(), gate_up_varies) {
+    if decode_gate_uses_mixed(p.expert_dtype_tags.is_some(), gate_up_varies) {
         // Per-expert mixed gate_up (V1/V2 graded, N-tier etc). Must
         // precede the representative MQ4V2/MQ6V2/V1 arms — otherwise a
         // layer with mixed V1+V2 gate dtypes would silently mis-decode

@@ -1442,25 +1442,8 @@ pub fn plain_gemm_key_for(dt: DType) -> crate::types::KernelKey {
     }
 }
 
-fn q8_prefill_wmma_enabled_from_env(value: Option<&str>, _arch: &str, has_wmma: bool) -> bool {
-    if !has_wmma {
-        return false;
-    }
-    match value {
-        Some("0") | Some("off") | Some("false") => false,
-        Some("1") | Some("on") | Some("true") => true,
-        _ => true,
-    }
-}
-
 pub fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
-    q8_prefill_wmma_enabled_from_env(
-        hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_WMMA")
-            .ok()
-            .as_deref(),
-        gpu.arch.as_str(),
-        gpu.arch_caps.has_wmma(),
-    )
+    gpu.arch_caps.has_wmma()
 }
 
 /// #397 Ship 5.2 slice 1: route a single PLAIN-batched prefill GEMM through
@@ -2837,24 +2820,5 @@ mod tests {
                 17408
             ));
         }
-    }
-
-    #[test]
-    fn q8_prefill_wmma_defaults_on_for_wave32_wmma_arches() {
-        assert!(q8_prefill_wmma_enabled_from_env(None, "gfx1201", true));
-        assert!(q8_prefill_wmma_enabled_from_env(None, "gfx1100", true));
-        assert!(q8_prefill_wmma_enabled_from_env(None, "gfx1151", true));
-        assert!(!q8_prefill_wmma_enabled_from_env(None, "gfx1030", false));
-        assert!(q8_prefill_wmma_enabled_from_env(Some("1"), "gfx1151", true));
-        assert!(!q8_prefill_wmma_enabled_from_env(
-            Some("0"),
-            "gfx1201",
-            true
-        ));
-        assert!(!q8_prefill_wmma_enabled_from_env(
-            Some("1"),
-            "gfx1030",
-            false
-        ));
     }
 }

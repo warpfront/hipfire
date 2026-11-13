@@ -6352,8 +6352,8 @@ pub struct PrefillBatchScratch {
     pub moe_up_batch: GpuTensor,           // [B, k_top, IM]
     pub moe_rot_batch: GpuTensor,          // [B, k_top, IM]
     /// Per-(token, krank) expert outputs for the atomic-free down path.
-    /// Gated by HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=1 (or grouped path which
-    /// uses its own scratch). Sized [B, k_top, hidden] f32 — at DeepSeek V4
+    /// Used when the down is not atomic (the grouped path uses its own
+    /// scratch). Sized [B, k_top, hidden] f32 — at DeepSeek V4
     /// max_batch=512 hidden=4096 K_TOP=6 = 48 MB.
     pub moe_down_expert_outputs: GpuTensor,
     // ── Indexer chain scratch (Step-1 perf pass) ──

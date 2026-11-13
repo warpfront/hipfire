@@ -2126,13 +2126,12 @@ fn moe_decode_oplist_prefix_matches_gate_side() {
 // ── MQV2 resolver contracts (mixed gate precedence / MQ6V2 / D3) ─────────────
 //
 // Pure helpers exposed by `pipeline` + `MoeResolution` lattice. These pin the
-// three silent-corruption hazards from the MQV2 fix wave: mixed gate before
-// representative V1/V2 arms, uniform MQ6V2 indexability without V1 collapse,
-// and V2 never calling the HFQ4 ninepath D3 gate.
+// silent-corruption hazards from the MQV2 fix wave: mixed gate before
+// representative V1/V2 arms and uniform MQ6V2 indexability without V1 collapse.
 
 use crate::pipeline::{
-    decode_gate_uses_mixed, gate_up_varies, ninepath_d3_family, ninepath_d4_family,
-    prefill_path1_down_kind_tag_aware, prefill_path1_gate_up_kind_tag_aware,
+    decode_gate_uses_mixed, gate_up_varies, ninepath_d4_family, prefill_path1_down_kind_tag_aware,
+    prefill_path1_gate_up_kind_tag_aware,
 };
 
 #[test]
@@ -2266,20 +2265,10 @@ fn mixed_v1_v2_gate_precedence_requires_exact_variation() {
     );
 }
 
-/// V2 D3 restriction: only HFQ4/MQ4V1 may call `gemv_hfq4g256_moe_ninepath_d3`.
-/// V2 uniform pairs use exact native indexed gate + V2 D4 — never the HFQ4 D3
-/// gate (dual-half header is silent fluent corruption on the same stride).
+/// V2 uniform pairs have their own D4 families; split V1/V2 pairings share none
+/// (dual-half header is silent fluent corruption on the same stride).
 #[test]
-fn ninepath_d3_restricts_v2_to_native_gate_and_d4() {
-    // Sole admitted D3 pair.
-    assert_eq!(
-        ninepath_d3_family(DType::MQ4G256, DType::MQ4G256),
-        Some("hfq4")
-    );
-
-    // V2 uniforms have D4 families but NEVER a D3 family.
-    assert_eq!(ninepath_d3_family(DType::MQ4G256V2, DType::MQ4G256V2), None);
-    assert_eq!(ninepath_d3_family(DType::MQ6G256V2, DType::MQ6G256V2), None);
+fn ninepath_d4_separates_v2_families() {
     assert_eq!(
         ninepath_d4_family(DType::MQ4G256V2, DType::MQ4G256V2),
         Some("mq4v2"),
@@ -2290,21 +2279,13 @@ fn ninepath_d3_restricts_v2_to_native_gate_and_d4() {
         Some("mq6v2"),
         "V2 still has its own D4 path"
     );
-
-    // Lloyd D4 pair is not D3 either (D3 is HFQ4-only).
-    assert_eq!(
-        ninepath_d3_family(DType::MQ2G256Lloyd, DType::MQ3G256Lloyd),
-        None
-    );
-
-    // Split V1/V2 pairings share neither D3 nor D4.
+    // Split V1/V2 pairings share no D4 family.
     for (g, dn) in [
         (DType::MQ4G256V2, DType::MQ4G256),
         (DType::MQ4G256, DType::MQ4G256V2),
         (DType::MQ6G256V2, DType::MQ6G256),
         (DType::MQ4G256V2, DType::MQ6G256V2),
     ] {
-        assert_eq!(ninepath_d3_family(g, dn), None, "{g:?}/{dn:?}");
         assert_eq!(ninepath_d4_family(g, dn), None, "{g:?}/{dn:?}");
     }
 }

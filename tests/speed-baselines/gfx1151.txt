@@ -54,7 +54,7 @@
 # addon (deepseek-v4-flash-mtp.mq2lloyd) loaded for spec-decode rows.
 #
 # bench harness: deepseek4_chat (one-shot, B from HIPFIRE_DEEPSEEK4_PP_BATCH default 64).
-# Greedy temp=0 + HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=1 + canonical prompts. No
+# Greedy temp=0 + deterministic MoE down + canonical prompts. No
 # native DeepSeek V4 bench harness in this PR — the speed-gate.sh shell driver
 # remains qwen35-only for now (DeepSeek V4-aware speed-gate is a follow-up). These
 # rows are documented reference numbers a reviewer / future bench harness
@@ -70,13 +70,13 @@ deepseek4_mq2lloyd_plain_short_tg_tok_s=12.90
 deepseek4_mq2lloyd_plain_long_pp_tok_s=40.42
 deepseek4_mq2lloyd_plain_long_tg_tok_s=13.61
 
-# Path B grouped MoE (HIPFIRE_DEEPSEEK4_MOE_GROUPED default-on at chunk_size ≥
+# Path B grouped MoE (default-on at chunk_size ≥
 # 256). Same 461-token prose prompt, B=512 PBS so the WMMA-K2 grouped
 # kernel fires.
 deepseek4_mq2lloyd_path_b_pp_tok_s=51.79
 
 # K=2 MTP spec-decode (HIPFIRE_DEEPSEEK4_SPEC_DECODE=1 HIPFIRE_DEEPSEEK4_SPEC_K=2
-# HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=1), 4-prompt sweep, MTP addon loaded.
+# deterministic MoE down), 4-prompt sweep, MTP addon loaded.
 # Best of: prose | code | qa | math — code wins on accept (72.6%).
 deepseek4_mq2lloyd_mtp_k2_code_accept_pct=72.6
 deepseek4_mq2lloyd_mtp_k2_code_tg_tok_s=17.51

@@ -131,10 +131,7 @@ developer_callsite	*	HIPFIRE_DEEPSEEK4_INDEXER_WMMA#developer_var=map.unwrap_or(
 developer_callsite	*	HIPFIRE_DEEPSEEK4_LAYER_NORM#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_8W#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_CND#developer_var=as_deref.==Ok("1")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC#developer_var=as_deref.!=Ok("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_DOWN_BATCHED_K8ALL#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_GATE_UP_BATCHED_K4096_LDS#developer_var=ok.as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_GROUPED#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE#developer_var=ok.and_then.unwrap_or(128)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W#developer_var=as_deref
 developer_callsite	*	HIPFIRE_DEEPSEEK4_MOE_MMQLOAD#developer_var=as_deref.==Ok("1")
@@ -294,9 +291,6 @@ developer_callsite	*	HIPFIRE_FLASH_PREFILL_BC#developer_var=ok.and_then.unwrap_o
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_BR#developer_var=ok.and_then.unwrap_or(8)
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_FIXED_HD#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_FIXED_HD#developer_var=ok.as_deref.==Some("0")
-developer_callsite	*	HIPFIRE_FLASH_PREFILL_KERNEL#developer_var=ok
-developer_callsite	*	HIPFIRE_FLASH_PREFILL_KERNEL#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_FLASH_PREFILL_KERNEL#developer_var=unwrap_or_else
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_MIN_CTX#developer_var=ok.and_then.unwrap_or(10240)
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_PREFETCH_V#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_FLASH_PREFILL_PREFETCH_V#developer_var=ok.as_deref.==Some("0")
@@ -313,7 +307,6 @@ developer_callsite	*	HIPFIRE_FLUX_MOD_GEMV#developer_var=map_or(true, |v| v != "
 developer_callsite	*	HIPFIRE_FLUX_ROPE_FAST#developer_var=map_or(true, |v| v != "0")
 developer_callsite	*	HIPFIRE_FLUX_WPAD#developer_var=-
 developer_callsite	*	HIPFIRE_FN_LANE_POLICY#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_FORWARD_LOWERED#developer_var=ok.as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_FP8_DECODE_ATTN_GQA#developer_bool=true
 developer_callsite	*	HIPFIRE_FP8_PROD_INREG#developer_bool=true
 developer_callsite	*	HIPFIRE_FP8_ROW_SCALE_SHIFT#developer_var=unwrap_or_else
@@ -341,7 +334,6 @@ developer_callsite	*	HIPFIRE_GDN_CHUNK_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_GDN_CHUNK_SIZE#developer_var=ok.and_then.unwrap_or(16)
 developer_callsite	*	HIPFIRE_GDN_COMPACT2#developer_var=-
 developer_callsite	*	HIPFIRE_GDN_COMPACT2_SHAPE#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_GDN_COMPACT3#developer_var=as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_GDN_KKT_BATCHED#developer_bool=true
 developer_callsite	*	HIPFIRE_GDN_KKT_GFX1100#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_GDN_MOE_CHUNK_SCAN#developer_typed_bool=-
@@ -440,7 +432,6 @@ developer_callsite	*	HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1151_WEIGHT_BUFFER_RESIDUAL#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1151_WEIGHT_BUFFER_SIGMOID#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX11_LEAN_PBS#developer_var=map.unwrap_or(true)
-developer_callsite	*	HIPFIRE_GFX1201_ROUTER_W64#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_GFX12_FA2_SPLIT_COUNT#developer_var=ok.and_then.unwrap_or(8)
 developer_callsite	*	HIPFIRE_GFX12_FA2_SPLIT_VERIFY#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8#developer_var=ok.as_deref
@@ -546,7 +537,6 @@ developer_callsite	*	HIPFIRE_MOE_GROUPED_GEMM#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_MOE_GROUPED_K2_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_MOE_HOT_FRAC#developer_var=ok.and_then.map.unwrap_or(0.2)
 developer_callsite	*	HIPFIRE_MOE_MQ6_ADMIT#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_MOE_NINEPATH#developer_var=unwrap_or_default
 developer_callsite	*	HIPFIRE_MOE_ROUTER_FUSED_PREFILL#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_MOE_ROUTER_SHARED_FUSE#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_MOE_ROUTER_TOPK_MULTIROW#developer_typed_bool=-
@@ -630,14 +620,11 @@ developer_callsite	*	HIPFIRE_Q8_FLASH_TILE#developer_var=ok.and_then.filter.unwr
 developer_callsite	*	HIPFIRE_Q8_GEMV_FAST#developer_bool=true
 developer_callsite	*	HIPFIRE_Q8_MMQ_GFX11_TILES#developer_bool=true
 developer_callsite	*	HIPFIRE_Q8_PREFILL_GQA_WMMA#developer_bool=true
-developer_callsite	*	HIPFIRE_Q8_PREFILL_WMMA#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QKVZA_CPOL#developer_var=as_deref.==Ok("slc")
 developer_callsite	*	HIPFIRE_QKVZA_SCALAR_PREP#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_QKVZA_SCALAR_PREP#developer_var=as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_QWEN2_VERIFY_SEQ#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD#developer_var=ok.and_then.or.unwrap_or(0.1f32)
-developer_callsite	*	HIPFIRE_QWEN35_FA_EPILOGUE_FUSE#developer_var=as_deref.!=Some("0")
-developer_callsite	*	HIPFIRE_QWEN35_FA_PREP_FUSE#developer_var=as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_QWEN35_FINITE_TRACE#developer_var_os=is_none
 developer_callsite	*	HIPFIRE_QWEN35_GRAMMAR#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD#developer_var=ok.and_then.or.unwrap_or(0.1f32)
