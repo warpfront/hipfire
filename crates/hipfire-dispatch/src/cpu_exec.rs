@@ -63,8 +63,8 @@ use crate::families::gemv::WeightRef;
 use crate::pipeline::steps::{GemvInput, Step};
 use crate::types::{dtype_rotation_plan, DispatchError, RotationPlan};
 
-/// `memory.offload_exec` resolved once from the process snapshot, mirroring the
-/// `forward_lowered_enabled` precedent: read once, never per step.
+/// `memory.offload_exec` resolved once from the process snapshot: read once,
+/// never per step.
 ///
 /// One cached snapshot backs both predicates below, so the mode is resolved
 /// exactly once for the process rather than once per boolean derived from it.

@@ -1849,9 +1849,8 @@ pub struct MoeParams<'a> {
 pub struct MoeMq2Lloyd<'a> {
     /// SwiGLU clamp passed to `deepseek4_silu_mul_clamp_f32_batched`.
     pub swiglu_limit: f32,
-    /// Atomic self-combining down (the gfx1151 policy). When `false` and
-    /// `HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC!=0`, the expanded write plus
-    /// `moe_down_combine_k8_batched` is used.
+    /// Atomic self-combining down (the gfx1151 policy). When `false`, the
+    /// expanded write plus `moe_down_combine_k8_batched` is used.
     pub uses_atomic_down: bool,
     /// Exact-device native backend, when the loader admitted one.
     pub native: Option<&'a dyn MoeBiasAwareMq2Backend>,
@@ -1860,11 +1859,9 @@ pub struct MoeMq2Lloyd<'a> {
 }
 
 impl MoeMq2Lloyd<'_> {
-    /// Expanded-down + combine policy (the default), read per call.
+    /// Expanded-down + combine policy (the default).
     pub fn deterministic_down(&self) -> bool {
         !self.uses_atomic_down
-            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref()
-                != Ok("0")
     }
 }
 

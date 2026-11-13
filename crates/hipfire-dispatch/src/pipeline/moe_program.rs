@@ -191,7 +191,6 @@ pub(super) struct MoeDecodeSelection {
     pub(super) wave64_router: bool,
     pub(super) down_last_combine: bool,
     pub(super) route: Option<crate::families::moe::MoeRouteCapability>,
-    pub(super) ninepath_d3: bool,
     pub(super) ninepath_d4: bool,
     pub(super) ninepath_mq3l: bool,
     pub(super) ninepath_mq4v2: bool,
@@ -1823,7 +1822,6 @@ impl<'a> SealedMoeOp<'a> {
                     .needs_x_rot_local
                     .then_some(params.x_rot_local)
                     .unwrap_or(params.x_norm),
-                selection.ninepath_d3,
                 selection.route,
             );
         }
@@ -3243,7 +3241,6 @@ fn execute_prepare_decode<'a>(
         || selection.cpu_split
         || selection.cpu_deferred_experts
         || selection.down_last_combine
-        || selection.ninepath_d3
         || selection.ninepath_d4
         || params.ep_row_gather.is_some()
         || params.ep_mode != crate::families::moe::MoeEpMode::None
@@ -3799,8 +3796,7 @@ pub(super) fn select_decode(
         && ((ctx.arch.is_gfx1100()
             && !matches!(gfx1100_router_mode.as_deref(), Some("0" | "approx")))
             || ctx.arch.is_gfx1151());
-    let wave64_router = (ctx.arch.is_gfx1201()
-        && hipfire_config::developer_var("HIPFIRE_GFX1201_ROUTER_W64").as_deref() != Ok("0"))
+    let wave64_router = ctx.arch.is_gfx1201()
         || (ctx.arch.is_gfx1100()
             && params.n_exp == 256
             && gfx1100_router_mode.as_deref() == Some("approx"));
@@ -3846,10 +3842,6 @@ pub(super) fn select_decode(
         },
     );
 
-    static MOE_NINEPATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_MOE_NINEPATH").unwrap_or_default()
-    });
-    let ninepath_mode = MOE_NINEPATH.as_str();
     let ninepath_shape_ok = params.ep_mode == crate::families::moe::MoeEpMode::None
         && params.k == 8
         && params.batch_size == 1
@@ -3894,15 +3886,10 @@ pub(super) fn select_decode(
         route,
         // The split's routed down always writes the expanded F32 slot rows the
         // canonical combine folds: no fused or self-combining down arm exists.
-        ninepath_d3: !cpu_split && ninepath_hfq4 && matches!(ninepath_mode, "1" | "d3" | "on"),
-        ninepath_d4: !cpu_split
-            && ninepath_eligible
-            && !matches!(ninepath_mode, "0" | "off" | "d3"),
+        ninepath_d4: !cpu_split && ninepath_eligible,
         ninepath_mq3l: ninepath_mq3l && !cpu_split,
         ninepath_mq4v2: ninepath_mq4v2 && !cpu_split,
-        ninepath_mq4g128v2: ninepath_mq4g128v2
-            && !cpu_split
-            && !matches!(ninepath_mode, "0" | "off" | "d3"),
+        ninepath_mq4g128v2: ninepath_mq4g128v2 && !cpu_split,
         ninepath_mq6v2: ninepath_mq6v2 && !cpu_split,
         cpu_deferred_experts: params.cpu_deferred_experts,
         cpu_split,

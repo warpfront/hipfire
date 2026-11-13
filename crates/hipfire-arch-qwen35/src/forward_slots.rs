@@ -719,8 +719,7 @@ pub(crate) fn require_batchable_fullattn_moe_layer(
 }
 
 /// Post-process a fused-group plan for the Q8 WMMA fork: a uniform Q8_0
-/// group on a non-WMMA arch (or with `HIPFIRE_Q8_PREFILL_WMMA=0`, which
-/// `q8_prefill_wmma_enabled` folds into `q8_wmma_arch`) must NOT take the
+/// group on a non-WMMA arch must NOT take the
 /// WMMA-only `FusedQkvzaQ8_0`/`FusedQkvQ8_0` kernels. Degrade it to the
 /// Mixed machinery, which is the reference's plain fork for that case: one
 /// `GemmQ8_0BatchedChunked` per weight over the normed input
@@ -1991,10 +1990,7 @@ fn q8_flash_prefill_wmma_eligible(gpu: &Gpu, head_dim: usize, batch_size: usize)
     if !flash_optin {
         return false;
     }
-    let variant = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
-        .unwrap_or_else(|_| "wmma".to_owned());
-    variant != "scalar"
-        && gpu.arch_caps.has_wmma_w32()
+    gpu.arch_caps.has_wmma_w32()
         && !gpu.arch_caps.has_wmma_w32_gfx12()
         && head_dim % 32 == 0
         && head_dim <= 256
@@ -2004,9 +2000,9 @@ fn q8_flash_prefill_wmma_eligible(gpu: &Gpu, head_dim: usize, batch_size: usize)
 /// below the crossover) and the tiled no-LDS-cap flash kernel, mirroring the
 /// fallback ladder in `hipfire-dispatch/src/families/attention.rs`'s
 /// `AttnQ8_0KvBatchedMasked` arm. Deliberately narrower than that arm in one
-/// remaining respect: the scalar flash-prefill opt-in variant (gated by
-/// `HIPFIRE_FLASH_PREFILL_KERNEL=scalar` + a long-context minimum) has no
-/// `_slots` port, so that one case still falls through to this crossover —
+/// remaining respect: the scalar flash-prefill kernel (the non-WMMA arm with
+/// a long-context minimum) has no `_slots` port, so that one case still
+/// falls through to this crossover —
 /// SP1 built the two families used here, plus (below) the WMMA flash-prefill
 /// family, now ported for BOTH the single-active-slot reduction and the
 /// genuinely-multi-slot case (`attention_q8_0_flash_prefill_wmma_slots`).

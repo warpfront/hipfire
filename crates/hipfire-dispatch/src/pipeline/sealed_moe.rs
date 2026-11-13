@@ -8524,7 +8524,6 @@ mod tests {
             wave64_router: false,
             down_last_combine: false,
             route,
-            ninepath_d3: false,
             ninepath_d4: false,
             ninepath_mq3l: false,
             ninepath_mq4v2: false,
