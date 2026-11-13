@@ -569,7 +569,6 @@ def show_config(cfg):
     # Surface inherited DFlash env knobs the harness must not clobber.
     for env_key in (
         "HIPFIRE_DFLASH_DRAFT",
-        "HIPFIRE_DFLASH_FAST_SAMPLE",
     ):
         if env_key in os.environ:
             print(f"  env {env_key}={os.environ[env_key]!r} (pass-through)")

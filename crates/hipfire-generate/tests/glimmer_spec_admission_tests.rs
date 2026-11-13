@@ -21,26 +21,26 @@ use hipfire_generate::dense::{glimmer_spec_admission, GlimmerSpecMode};
 
 #[test]
 fn greedy_at_temp_zero() {
-    let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.0, None, true, true);
+    let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.0, None, true);
     assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Greedy);
-    let m2 = hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.01, None, true, true);
+    let m2 = hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.01, None, true);
     assert_eq!(m2, hipfire_generate::dense::GlimmerSpecMode::Greedy);
 }
 
 #[test]
 fn chain_sampled_at_temp_one_with_defaults() {
-    let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, true, true);
+    let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, true);
     assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::ChainSampled);
 }
 
 #[test]
 fn off_when_min_p_present() {
-    let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, Some(0.05), true, true);
+    let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, Some(0.05), true);
     assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Off);
     // zero and None are allowed
-    let ok0 = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, Some(0.0), true, true);
+    let ok0 = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, Some(0.0), true);
     assert_eq!(ok0, hipfire_generate::dense::GlimmerSpecMode::ChainSampled);
-    let ok_none = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, true, true);
+    let ok_none = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, true);
     assert_eq!(
         ok_none,
         hipfire_generate::dense::GlimmerSpecMode::ChainSampled
@@ -48,53 +48,47 @@ fn off_when_min_p_present() {
 }
 
 #[test]
-fn off_when_fast_sample_off() {
-    let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, false, true);
-    assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Off);
-}
-
-#[test]
 fn off_when_batched_logits_unavailable() {
-    let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, true, false);
+    let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, false);
     assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Off);
     // greedy does NOT require batched logits (still Greedy)
-    let g = hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.005, None, true, false);
+    let g = hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.005, None, false);
     assert_eq!(g, hipfire_generate::dense::GlimmerSpecMode::Greedy);
 }
 
 #[test]
 fn off_when_max_tokens_one() {
-    let m = hipfire_generate::dense::glimmer_spec_admission(true, 1, 0.0, None, true, true);
+    let m = hipfire_generate::dense::glimmer_spec_admission(true, 1, 0.0, None, true);
     assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Off);
-    let m2 = hipfire_generate::dense::glimmer_spec_admission(true, 1, 1.0, None, true, true);
+    let m2 = hipfire_generate::dense::glimmer_spec_admission(true, 1, 1.0, None, true);
     assert_eq!(m2, hipfire_generate::dense::GlimmerSpecMode::Off);
 }
 
 #[test]
 fn off_when_no_drafter() {
-    let m = hipfire_generate::dense::glimmer_spec_admission(false, 16, 0.0, None, true, true);
+    let m = hipfire_generate::dense::glimmer_spec_admission(false, 16, 0.0, None, true);
     assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Off);
-    let m2 = hipfire_generate::dense::glimmer_spec_admission(false, 16, 1.0, None, true, true);
+    let m2 = hipfire_generate::dense::glimmer_spec_admission(false, 16, 1.0, None, true);
     assert_eq!(m2, hipfire_generate::dense::GlimmerSpecMode::Off);
 }
 
 #[test]
 fn temp_boundary() {
     assert_eq!(
-        hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.01, None, true, true),
+        hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.01, None, true),
         hipfire_generate::dense::GlimmerSpecMode::Greedy
     );
     assert_eq!(
-        hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.02, None, true, true),
+        hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.02, None, true),
         hipfire_generate::dense::GlimmerSpecMode::ChainSampled
     );
     // just above greedy threshold but at/under 1e-6 should be Off, not sampled
     assert_eq!(
-        hipfire_generate::dense::glimmer_spec_admission(true, 16, 1e-6, None, true, true),
+        hipfire_generate::dense::glimmer_spec_admission(true, 16, 1e-6, None, true),
         hipfire_generate::dense::GlimmerSpecMode::Greedy
     );
     assert_eq!(
-        hipfire_generate::dense::glimmer_spec_admission(true, 16, 5e-7, None, true, true),
+        hipfire_generate::dense::glimmer_spec_admission(true, 16, 5e-7, None, true),
         hipfire_generate::dense::GlimmerSpecMode::Greedy
     );
 }

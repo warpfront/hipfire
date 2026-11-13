@@ -95,7 +95,7 @@ a new arm.
   path is supplied (`crates/hipfire-daemon/src/main.rs`).
 - **qwen35:** a loaded draft builds `DflashSpeculator` (chain only; DDTree tree verify was removed in 0.5.0). Chain-mode
   temp>0 verifies use selector-chain rejection sampling for DFlash2 selector drafts and the chain rejection
-  sampler (`HIPFIRE_DFLASH_FAST_SAMPLE` route) for DFlash1 drafts without a selector; DFlash verifiers implement no repeat/presence/frequency
+  sampler for DFlash1 drafts without a selector; DFlash verifiers implement no repeat/presence/frequency
   penalties, so a penalized request runs AR, and `min_p` is ignored (the daemon warns). Env
   opt-outs are documented (`HIPFIRE_DFLASH_CHAT=0`, etc.).
   Adaptive KV suppresses DFlash.

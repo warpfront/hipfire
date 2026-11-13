@@ -69,7 +69,6 @@ pub(super) fn emit_segment(
         segment,
         arch_lowering,
         transport.new_commands,
-        transport.gcr_trim,
         transport.entry_policy,
         dispatch,
     )
@@ -85,7 +84,6 @@ fn emit_segment_with(
     segment: &rp::Segment,
     arch_lowering: rp::ArchLowering,
     new_commands: &dyn Fn() -> Pm4Commands,
-    gcr_trim: bool,
     entry_policy: Gfx11EntryAcquirePolicy,
     mut dispatch: impl FnMut(&mut Pm4Commands, usize) -> Result<(), String>,
 ) -> Result<Pm4Commands, String> {
@@ -101,7 +99,7 @@ fn emit_segment_with(
         match op {
             Pm4Op::Entry => {
                 commands.emit_entry_sentinel_reset()?;
-                commands.acquire_entry(gcr_trim, entry_policy);
+                commands.acquire_entry(entry_policy);
             }
             Pm4Op::Boundary(v) => {
                 if v.wait_idle {
@@ -109,7 +107,7 @@ fn emit_segment_with(
                 }
                 match v.acquire {
                     Rung::None => {}
-                    Rung::InterNode => commands.acquire_inter_node(gcr_trim, false),
+                    Rung::InterNode => commands.acquire_inter_node(false),
                     Rung::System => commands.system_acquire(),
                 }
             }
@@ -471,7 +469,6 @@ pub(crate) struct LoweringContext {
     dispatch_interleave: Option<super::Gfx11DispatchInterleave>,
     resource_limits_policy: super::Gfx11ComputeResourceLimitsPolicy,
     entry_policy: super::Gfx11EntryAcquirePolicy,
-    gcr_trim: bool,
     _runtime: Runtime,
 }
 
@@ -508,8 +505,8 @@ impl LoweringContext {
     /// The context of the device `select` picks with the transport parameters
     /// Redline's PM4 prepare uses (`ReplayController::prepare_pm4_prefix_inner`):
     /// the dispatch-initiator, interleave, resource-limits and entry-acquire
-    /// policies, the retained kernarg pool, the `HIPFIRE_REPLAY_PM4_GCR_TRIM`
-    /// setting and `LegacyDependencyMode::CsPartialFlush`.
+    /// policies, the retained kernarg pool and
+    /// `LegacyDependencyMode::CsPartialFlush`.
     ///
     /// gfx12 is selected by the caller's ordinal or PCI address. Exact
     /// gfx1100 requires the PCI address (a single matching ROCr GPU agent
@@ -562,9 +559,6 @@ impl LoweringContext {
         let host_pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let kernarg_pool = retained_kernarg_pool(&device, &host_pool, entry_policy);
         let register_policy = Pm4RegisterPolicy::from_config();
-        let gcr_trim = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GCR_TRIM")
-            .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
-            .unwrap_or(true);
         Ok(Self {
             executables: BTreeMap::new(),
             resolved: BTreeMap::new(),
@@ -577,7 +571,6 @@ impl LoweringContext {
             dispatch_interleave,
             resource_limits_policy,
             entry_policy,
-            gcr_trim,
             _runtime: runtime,
         })
     }
@@ -654,7 +647,6 @@ impl LoweringContext {
         let transport = Transport {
             pool: &self.kernarg_pool,
             new_commands: &new_commands,
-            gcr_trim: self.gcr_trim,
             entry_policy: self.entry_policy,
         };
         let emit_started = std::time::Instant::now();
@@ -1028,7 +1020,6 @@ mod tests {
             &plan.segments[0],
             arch_lowering,
             &make,
-            true,
             Gfx11EntryAcquirePolicy::System,
             |commands, i| {
                 let Pm4Commands::Legacy { commands, .. } = commands else {
@@ -1149,7 +1140,6 @@ mod tests {
             &plan.segments[0],
             lowering,
             &make,
-            true,
             Gfx11EntryAcquirePolicy::System,
             |_, _| Ok(()),
         )

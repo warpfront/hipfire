@@ -3068,16 +3068,6 @@ fn moe_prefill_resolution_path0_gfx942() {
 }
 
 #[test]
-fn moe_prefill_resolution_grouped_gemm_opt_out() {
-    let mut flags = flags_default();
-    flags.moe_grouped_gemm = false;
-    let flags = std::sync::Arc::new(flags);
-    let caps = rdna_compute::arch_caps::ArchCaps::new("gfx1100", flags.clone());
-    let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &caps, &flags);
-    assert!(!r.use_path2, "moe_grouped_gemm=0 should disable Path 2");
-}
-
-#[test]
 fn moe_prefill_resolution_mq6_gfx11_uses_path2() {
     // Post-merge: the gfx11 MQ6 grouped-WMMA `_k2` kernel now exists, so the
     // 458 widen (8d555fc6) admits Path 2 on any wmma_w32 gfx11 arch (gfx1100

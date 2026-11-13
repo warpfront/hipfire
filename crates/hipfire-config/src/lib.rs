@@ -2927,15 +2927,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable weight-only MMQ dispatch."
     ),
     process_bool_field!(
-        "kernel.lm_head_wmma",
-        "lm_head_wmma",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_LM_HEAD_WMMA",
-        "Allow WMMA LM-head dispatch."
-    ),
-    process_bool_field!(
         "kernel.lm_head_overwrite",
         "lm_head_overwrite",
         Kernel,
@@ -3177,15 +3168,6 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_MOE_HFQ6_V2",
         "Enable HFQ6 grouped MoE v2 dispatch."
     ),
-    process_bool_field!(
-        "kernel.moe_grouped_gemm",
-        "moe_grouped_gemm",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_MOE_GROUPED_GEMM",
-        "Allow grouped-GEMM MoE prefill."
-    ),
     diagnostic_bool_field!(
         "diagnostic.blob_force",
         "blob_force",
@@ -3278,24 +3260,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Fuse the Gemma 4 E-series PLE activation and strided multiply; auto enables validated gfx1100/gfx1201."
     ),
     process_bool_field!(
-        "kernel.deepseek4_q8_wmma",
-        "deepseek4_q8_wmma",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_DEEPSEEK4_Q8_WMMA",
-        "Allow DeepSeek4 Q8 WMMA prefill."
-    ),
-    process_bool_field!(
-        "kernel.deepseek4_q8_4w",
-        "deepseek4_q8_4w",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_DEEPSEEK4_Q8_4W",
-        "Allow the DeepSeek4 four-wave Q8 WMMA tile."
-    ),
-    process_bool_field!(
         "kernel.rope_interleaved_legacy",
         "rope_interleaved_legacy",
         Kernel,
@@ -3339,24 +3303,6 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_FORCE_UNFUSED",
         "Force supported projection paths to remain unfused."
-    ),
-    process_bool_field!(
-        "speculation.dflash_fast_sample",
-        "dflash_fast_sample",
-        Speculation,
-        true,
-        true,
-        "HIPFIRE_DFLASH_FAST_SAMPLE",
-        "Allow DFlash GPU sampling on sampled verification."
-    ),
-    process_bool_field!(
-        "fusions.qkv_bias",
-        "fuse_qkv_bias",
-        Fusions,
-        true,
-        false,
-        "HIPFIRE_FUSE_QKV_BIAS",
-        "Fold supported QKV bias additions into fused QKV decode."
     ),
     diagnostic_bool_field!(
         "diagnostic.qkv_bias",
@@ -3526,13 +3472,6 @@ pub static FIELDS: &[ConfigField] = &[
         ]),
         "HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY",
         "Cache-acquire policy between retained PM4 launches."
-    ),
-    diagnostic_bool_field!(
-        "diagnostic.replay.pm4_gcr_trim",
-        "replay_pm4_gcr_trim",
-        true,
-        "HIPFIRE_REPLAY_PM4_GCR_TRIM",
-        "Trim redundant GCR operations on supported retained PM4 routes."
     ),
     process_auto_bool_field!(
         "replay.pm4_gfx11_vmem_acquire",
@@ -4065,6 +4004,62 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "the MoE graph-capture opt-out was removed (HIPF-396)",
         replacement: "experimental.graph.forward = false disables forward graph capture for every model",
+    },
+    RetiredConfigKey {
+        key: "kernel.lm_head_wmma",
+        legacy_key: "lm_head_wmma",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the LM-head WMMA opt-out was removed (HIPF-396)",
+        replacement: "none; WMMA runs wherever the arch has it (kernel.fp16 = false still forces the scalar head)",
+    },
+    RetiredConfigKey {
+        key: "kernel.moe_grouped_gemm",
+        legacy_key: "moe_grouped_gemm",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the grouped-GEMM MoE prefill opt-out was removed (HIPF-396)",
+        replacement: "none; grouped-GEMM MoE prefill runs wherever the arch has WMMA",
+    },
+    RetiredConfigKey {
+        key: "kernel.deepseek4_q8_wmma",
+        legacy_key: "deepseek4_q8_wmma",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DeepSeek4 Q8 WMMA prefill opt-out was removed (HIPF-396)",
+        replacement: "none; WMMA runs wherever the arch has it",
+    },
+    RetiredConfigKey {
+        key: "kernel.deepseek4_q8_4w",
+        legacy_key: "deepseek4_q8_4w",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DeepSeek4 four-wave Q8 WMMA tile opt-out was removed (HIPF-396)",
+        replacement: "none; the tile is chosen by shape",
+    },
+    RetiredConfigKey {
+        key: "speculation.dflash_fast_sample",
+        legacy_key: "dflash_fast_sample",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DFlash GPU sampling opt-out was removed (HIPF-396)",
+        replacement: "none; sampled DFlash verification always samples on the GPU",
+    },
+    RetiredConfigKey {
+        key: "fusions.qkv_bias",
+        legacy_key: "fuse_qkv_bias",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the QKV bias fold opt-out was removed (HIPF-396)",
+        replacement: "none; supported QKV bias additions are always folded",
+    },
+    RetiredConfigKey {
+        key: "diagnostic.replay.pm4_gcr_trim",
+        legacy_key: "replay_pm4_gcr_trim",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the retained PM4 GCR trim opt-out was removed (HIPF-396)",
+        replacement: "none; supported retained PM4 routes always trim redundant GCR operations",
     },
 ];
 
@@ -6807,7 +6802,6 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
                 "diagnostic.replay.pm4_acquire_policy",
                 ConfigValue::String("required-only".to_owned()),
             ),
-            ("diagnostic.replay.pm4_gcr_trim", ConfigValue::Bool(true)),
             (
                 "diagnostic.replay.pm4_dynamic_grid",
                 ConfigValue::Bool(false),

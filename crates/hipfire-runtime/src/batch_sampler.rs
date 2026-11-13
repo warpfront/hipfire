@@ -36,7 +36,7 @@
 //!   the old buffer, hence it is safe mid-batch and happens at most once per
 //!   reducer width.
 
-use crate::sampler::{self, SamplerConfig};
+use crate::sampler::SamplerConfig;
 use hip_bridge::{HipError, HipResult};
 use rdna_compute::sampling::SampleEnqueued;
 use rdna_compute::{Gpu, GpuTensor};
@@ -80,7 +80,7 @@ pub struct BatchSamplerArena {
     host: *mut c_void,
     slab_words: usize,
     scopes: Vec<ScopeSlot>,
-    kinds: Vec<Option<SampleEnqueued>>,
+    kinds: Vec<SampleEnqueued>,
     picks: Vec<BatchSamplePick>,
 }
 
@@ -279,21 +279,7 @@ pub fn sample_batch<'a>(
             cfg.top_k,
             cfg.min_p,
         )?;
-        match kind {
-            Some(k) => arena.kinds.push(Some(k)),
-            None => {
-                // The parallel sampler is disabled process-wide, so this can
-                // only be the first lane: run the whole batch through the
-                // serial sampler (exact by construction).
-                if i != 0 {
-                    return Err(HipError::new(
-                        0,
-                        "sample_batch: parallel sampler disabled mid-batch",
-                    ));
-                }
-                return sample_serial(gpu, arena, jobs);
-            }
-        }
+        arena.kinds.push(kind);
     }
 
     // (d) ONE D2H of every (token, rng) pair.
@@ -315,7 +301,7 @@ pub fn sample_batch<'a>(
     let mut lo = usize::MAX;
     let mut hi = 0usize;
     for (i, job) in jobs.iter().enumerate() {
-        if arena.kinds[i] == Some(SampleEnqueued::Fast) && res[2 * i] == u32::MAX {
+        if arena.kinds[i] == SampleEnqueued::Fast && res[2 * i] == u32::MAX {
             let slot = arena.results.sub_offset(2 * i, 2);
             gpu.sample_top_p_pf_exact_enqueue(
                 job.logits,
@@ -347,37 +333,6 @@ pub fn sample_batch<'a>(
         arena.picks.push(BatchSamplePick {
             token_id: res[2 * i],
             advanced_rng: res[2 * i + 1],
-        });
-    }
-    Ok(&arena.picks)
-}
-
-/// Serial reference path (`HIPFIRE_SAMPLE_PARALLEL=0`): the singleton's own
-/// [`sampler::sample`] per job, on the arena's slab/result slot standing in
-/// for the scratch `repeat_buf` / `sample_buf`.
-fn sample_serial<'a>(
-    gpu: &mut Gpu,
-    arena: &'a mut BatchSamplerArena,
-    jobs: &[BatchSampleJob<'_>],
-) -> HipResult<&'a [BatchSamplePick]> {
-    let sample_buf = arena.results.sub_offset(0, 2);
-    let repeat_buf = arena.slab.sub_offset(0, arena.repeat_cap);
-    arena.picks.clear();
-    for job in jobs {
-        let mut rng = job.rng_state;
-        let token_id = sampler::sample(
-            gpu,
-            job.logits,
-            &sample_buf,
-            &repeat_buf,
-            job.logits.numel(),
-            job.history,
-            job.cfg,
-            &mut rng,
-        );
-        arena.picks.push(BatchSamplePick {
-            token_id,
-            advanced_rng: rng,
         });
     }
     Ok(&arena.picks)
