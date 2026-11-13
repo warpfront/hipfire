@@ -54,9 +54,6 @@ const GROUPED_OLORA_E8_WAVE64X4_CANDIDATE_SRC: &str =
     include_str!("../../../../kernels/src/gemv_mfp4g32_e8_soa_grouped_wave64x4.gfx942.hip");
 const GROUPED_OLORA_E8_WAVE64X4_CANDIDATE_KERNEL: &str =
     "gemv_mfp4g32_e8_soa_grouped_wave64x4_gfx942_candidate";
-const INDEXER_TOP_K_BUF_PARALLEL_SRC: &str =
-    include_str!("../../../../kernels/src/indexer_top_k_buf_parallel.gfx942.hip");
-const INDEXER_TOP_K_BUF_PARALLEL_KERNEL: &str = "indexer_top_k_buf_parallel_gfx942";
 // Re-export of the frozen kernels.rs contract const (single include_str! site;
 // all other gfx942 sources in this file predate the kernels.rs re-export
 // convention and keep their local includes).
@@ -1423,15 +1420,11 @@ impl Gfx942Device<'_> {
         result
     }
 
-    /// Exact-gfx942 deterministic indexer top-K.
-    ///
-    /// `bounded == false` selects the O(N^2) rank-count reference
-    /// (`indexer_top_k_buf_parallel_gfx942`). `bounded == true` selects the
-    /// opt-in O(N log^2 K) tile-merge bitonic port
-    /// (`indexer_top_k_buf_parallel_gfx942_bounded`): a drop-in with
-    /// identical dispatch shape and byte-identical output. The selected
-    /// symbol keys both `ensure_kernel` and the launch, so the two modules
-    /// never share a cache entry.
+    /// Exact-gfx942 deterministic indexer top-K: the O(N log^2 K)
+    /// tile-merge bitonic kernel (`indexer_top_k_buf_parallel_gfx942_bounded`),
+    /// byte-identical to the O(N^2) rank-count reference kept in
+    /// `kernels/src/indexer_top_k_buf_parallel.gfx942.hip` for the
+    /// `test_indexer_top_k_buf` exactness harness.
     ///
     /// This is intentionally not exposed through the generic `Gpu` surface:
     /// DeepSeek4 must hold a verified model-owned gfx942 backend before it can
@@ -1444,20 +1437,12 @@ impl Gfx942Device<'_> {
         k_buf: &GpuTensor,
         n_idx_heads: i32,
         max_k: i32,
-        bounded: bool,
     ) -> HipResult<()> {
         self.gpu.bind_thread()?;
-        let (src, kernel) = if bounded {
-            (
-                INDEXER_TOP_K_BUF_BOUNDED_SRC,
-                INDEXER_TOP_K_BUF_BOUNDED_KERNEL,
-            )
-        } else {
-            (
-                INDEXER_TOP_K_BUF_PARALLEL_SRC,
-                INDEXER_TOP_K_BUF_PARALLEL_KERNEL,
-            )
-        };
+        let (src, kernel) = (
+            INDEXER_TOP_K_BUF_BOUNDED_SRC,
+            INDEXER_TOP_K_BUF_BOUNDED_KERNEL,
+        );
         self.gpu.ensure_kernel(kernel, src, kernel)?;
         let scores_ptr = scores.buf.as_ptr();
         let top_indices_ptr = top_indices.buf.as_ptr();

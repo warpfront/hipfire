@@ -333,7 +333,7 @@ pub struct DeepseekV4Config {
     /// `speculation.mtp = auto` on this producer (no measured AR floor) leaves
     /// the layer unloaded so ordinary AR keeps its memory; explicit `on` loads
     /// it. Defaults to `true` for directly-driven loaders (examples, oracles).
-    /// `HIPFIRE_DEEPSEEK4_LOAD_MTP=0` still skips it. Not (de)serialized.
+    /// Not (de)serialized.
     #[serde(skip)]
     pub load_mtp: bool,
 
@@ -717,8 +717,8 @@ pub struct DeepseekV4LayerWeights {
     pub compressor_ape: Option<rdna_compute::GpuTensor>, // [ratio, coff*head_dim]
     /// F16-native copies of the compressor projections for the WMMA
     /// GEMM path. Same data as `compressor_w{kv,gate}` but stored as
-    /// F16 bytes directly (no F32 decode). Populated when
-    /// `HIPFIRE_DEEPSEEK4_COMP_F16_WMMA` is enabled at load time.
+    /// F16 bytes directly (no F32 decode). Populated when the source tensor
+    /// is F16.
     pub compressor_wkv_f16: Option<rdna_compute::GpuTensor>,
     pub compressor_wgate_f16: Option<rdna_compute::GpuTensor>,
 
@@ -1355,7 +1355,7 @@ impl DeepseekV4Weights {
                 panic!(
                     "DeepseekV4Weights::resolve_layer({idx}) — \
                      idx points at the MTP slot but mtp_layer is None. \
-                     Either set HIPFIRE_DEEPSEEK4_LOAD_MTP=1 and use a model \
+                     Either load with speculation.mtp enabled and use a model \
                      quantized with MTP, or stop calling mtp_forward."
                 )
             })

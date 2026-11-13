@@ -132,54 +132,18 @@ run_current_baseline() {
     done
 }
 
-run_crosswall() {
-    md5sum "$BIN" | tee "$OUT/crosswall_binary.md5"
-    HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED=0 \
-        run_logged "crosswall_cap_2048_pos_12287" "$BIN" "$MODEL" \
-        --cap 2048 --position 12287 --decode-reps 1
-}
-
-run_model_ab() {
-    local caps=(2048 8192 32768)
-    local arms=(A B B A A B)
-    md5sum "$BIN" | tee "$OUT/model_ab_binary.md5"
-    : >"$OUT/model_ab_status.tsv"
-    printf 'cap\tposition\tsequence\tarm\tbounded\trc\n' >>"$OUT/model_ab_status.tsv"
-    for cap in "${caps[@]}"; do
-        position=$((cap * 4 - 1))
-        sequence=0
-        for arm in "${arms[@]}"; do
-            sequence=$((sequence + 1))
-            if [[ "$arm" == "B" ]]; then
-                bounded=1
-            else
-                bounded=0
-            fi
-            HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_BOUNDED="$bounded" \
-                run_logged "ab_cap_${cap}_seq_${sequence}_arm_${arm}" \
-                "$BIN" "$MODEL" --cap "$cap" --position "$position" --decode-reps 3
-            rc=$?
-            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "$cap" "$position" "$sequence" "$arm" "$bounded" "$rc" \
-                >>"$OUT/model_ab_status.tsv"
-        done
-    done
-}
-
 case "$cmd" in
     sweep) run_sweep ;;
     profile) run_profiles ;;
     topk) run_topk ;;
     baseline) run_current_baseline ;;
-    crosswall) run_crosswall ;;
-    ab) run_model_ab ;;
     all)
         run_sweep
         run_profiles
         run_topk
         ;;
     *)
-        echo "usage: $0 [all|sweep|profile|topk|baseline|crosswall|ab]" >&2
+        echo "usage: $0 [all|sweep|profile|topk|baseline]" >&2
         exit 2
         ;;
 esac

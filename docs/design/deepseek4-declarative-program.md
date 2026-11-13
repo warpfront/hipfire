@@ -59,7 +59,7 @@ as `apply_tail_rope` did.
 | `SparseIndex` (`attention::SparseIndexOp`) | ratio-4 indexer: query + RoPE, head weights, relu scores, top-k | two-stage, owner-parallel (gfx942) and portable top-k |
 | `SwaRingWrite` (`attention::SwaRingWriteOp`) | the row's KV into both SWA rings (decode attention reads the rings, so the write comes first) | ring slot from device state |
 | `IdentityGather` (`attention::IdentityGatherOp`) | ratio 128: the first active compressed rows, in order | F32 / F16 / block-cyclic sharded caches |
-| `SwaAttention` (`attention::SwaAttentionOp`) | ratio 0: softmax over the window and the sink | developer `Pos0` route (`HIPFIRE_DEEPSEEK4_ATTN=pos0`) on every layer |
+| `SwaAttention` (`attention::SwaAttentionOp`) | ratio 0: softmax over the window and the sink | — |
 | `SparseAttention` (`attention::SparseAttentionOp`) | ratio > 0: one joint softmax over the window, the gathered compressed rows and the sink; ratio 4 gathers the indexer's top-k first | F32 / F16 / block-cyclic sharded caches |
 | `ApplyTailRope` (`inverse`) | inverse tail RoPE of the attention output | same YaRN parameters as the forward rotation |
 | `OLora` (`attention::OLoraOp`) | grouped O-LoRA: (rotate) → per-group `wo_a` → (rotate) → `wo_b` | grouped wo_a per arch (MQ4, E8 gfx1151 / gfx1201 / gfx1100, gfx942 backend, per group) |
@@ -179,8 +179,7 @@ gfx1151 (halo), `deepseek-v4-flash-0731.mq2r` + its DSpark sidecar
 - Production `forward_prefill_batch_chunked` (1,024-row chunks), then 48
   greedy decode steps (logits, streams) and all caches.
 - 40 verify windows of 1-8 rows (unaligned compressor windows included):
-  every row's logits, streams, caches every 8 windows; also with
-  `HIPFIRE_DEEPSEEK4_BATCH_HEAD=0`.
+  every row's logits, streams, caches every 8 windows.
 - DSpark: target-hidden capture over a 600-token prefill, 8 drafted blocks
   (`dspark_forward`: tokens, confidences), the body-only route
   (`dspark_run_body_and_hc_gate`: `x_head`) and every stage ring.
