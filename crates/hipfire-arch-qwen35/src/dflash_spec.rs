@@ -22,6 +22,7 @@ use crate::speculative::{
     DeltaNetSnapshot, DenseTpTargetView, DflashLookup, DflashTargetParts, GdnTape,
     HiddenStateRingBuffer, ModelSlot, RailgunStep, SpecStepResult, VerifyScratch,
 };
+use hipfire_runtime::dspine::{DspineBridge, DspineConfig};
 use hipfire_runtime::dflash::{
     draft_seed_backfill_reads_host, DflashConfig, DflashScratch, DflashWeights, DraftCtxMode,
     TargetHiddenLogMark,
@@ -67,6 +68,10 @@ pub struct DflashState {
     pub ctx_capacity: usize,
     pub block_size: usize,
     pub ddtree: Option<DdtreeState>,
+    /// Arch-24 DSpine code-bridge runner. `Some` only on the singleton state
+    /// when the draft HFQ carries a `dspine` metadata block; VMM/CB lanes are
+    /// built with `None` (bridge writes are singleton-only in v1).
+    pub bridge: Option<DspineBridge>,
     /// Retained-PM4 route for the fixed B=16 chain target-verify forward.
     /// Always present; `Disabled` when admission fails (no controller held).
     pub verify_pm4: DflashVerifyPm4,
@@ -88,7 +93,11 @@ impl DflashState {
             block_size: _,
             ddtree,
             mut verify_pm4,
+            bridge,
         } = self;
+        if let Some(mut b) = bridge {
+            b.free_gpu(gpu);
+        }
         // Must prove no retained IB is in flight before any captured owner is
         // freed. Unknown quiescence → intentional leak; daemon restart is the
         // containment path.
@@ -391,6 +400,17 @@ pub fn load_dflash_state(
             draft_config.target_streams_per_layer
         ));
     }
+
+    // Arch-24 DSpine sidecar: when the HFQ carries a `dspine` metadata block,
+    // load the code-bridge runner here (before any heavy allocation, so a
+    // contract violation is a plain pointing error with nothing to roll back).
+    let bridge = match DspineConfig::from_hfq(&draft_hfq) {
+        Ok(Some(dspine_cfg)) => Some(DspineBridge::new(gpu, &draft_hfq, dspine_cfg)?),
+        Ok(None) => None,
+        Err(e) => {
+            return Err(format!("dspine contract re-check failed: {e}"));
+        }
+    };
 
     // Windowed draft context:
     //   - Legacy DFlash (n−1 sliding + last full): layers 0..n−2 attend over
@@ -719,6 +739,7 @@ pub fn load_dflash_state(
         }
     };
     Ok(DflashState {
+        bridge,
         draft_config,
         // Wrapped at successful state construction only: every error path
         // above frees the raw weights directly.
@@ -2977,6 +2998,7 @@ impl Speculator for DflashSpeculator {
                     owner,
                     probe: lk_probe,
                 }),
+                df.bridge.as_mut(),
             );
             if let Some(t) = call_t0 {
                 lk_wall_us = t.elapsed().as_secs_f64() * 1e6;
@@ -3549,6 +3571,7 @@ pub fn new_dflash_lane_state(
         gdn_tape,
     } = owners;
     Ok(DflashState {
+        bridge: None,
         draft_config: assets.draft_config.clone(),
         draft_weights: Arc::clone(&assets.weights),
         draft_scratch,
@@ -4273,6 +4296,7 @@ pub fn load_dflash_speculator_dense_tp2(
         );
         ranks.push(DenseTpDflashRankState {
             dflash: DflashState {
+                bridge: None,
                 draft_config: draft_config.clone(),
                 draft_weights: Arc::new(draft_weights),
                 draft_scratch,

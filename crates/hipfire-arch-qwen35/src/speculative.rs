@@ -30,6 +30,7 @@ use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weig
 use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_dispatch::pipeline::batched::{verify_dense_math, DenseBatchMath};
+use hipfire_runtime::dspine::DspineBridge;
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
@@ -7586,6 +7587,7 @@ fn dflash_sampled_selector_draft_parts_into(
         compact_offset,
         ctx_slice,
         draft_ffn_graph,
+        None,
     )?;
     let batch = b - 1;
     let h = draft_cfg.hidden;
@@ -7732,6 +7734,7 @@ fn draft_dflash_forward_rank(
     compact_offset: i32,
     ctx_slice: Option<usize>,
     draft_ffn_graph: bool,
+    bridge: Option<&mut DspineBridge>,
 ) -> HipResult<()> {
     let b = block.len();
     let h = draft_cfg.hidden;
@@ -7782,19 +7785,37 @@ fn draft_dflash_forward_rank(
     } else {
         (None, 0)
     };
-    dflash::draft_forward_opts(
-        gpu,
-        draft_weights,
-        draft_cfg,
-        None,
-        th_arg,
-        &positions_q,
-        &positions_k,
-        b,
-        effective_ctx_len,
-        draft_scratch,
-        draft_ffn_graph,
-    )?;
+    if let Some(bridge) = bridge {
+        // Arch-24: the anchor was set by the caller (block[0] = the seed);
+        // the trunk loop runs the bridge write after every layer, eager-only.
+        dflash::draft_forward_bridge(
+            gpu,
+            draft_weights,
+            draft_cfg,
+            None,
+            th_arg,
+            &positions_q,
+            &positions_k,
+            b,
+            effective_ctx_len,
+            draft_scratch,
+            bridge,
+        )?;
+    } else {
+        dflash::draft_forward_opts(
+            gpu,
+            draft_weights,
+            draft_cfg,
+            None,
+            th_arg,
+            &positions_q,
+            &positions_k,
+            b,
+            effective_ctx_len,
+            draft_scratch,
+            draft_ffn_graph,
+        )?;
+    }
     Ok(())
 }
 
@@ -7950,6 +7971,7 @@ pub fn draft_dflash_block_rank(
     draft_ffn_graph: bool,
     seed_token: u32,
     vocab: usize,
+    bridge: Option<&mut DspineBridge>,
 ) -> HipResult<Vec<u32>> {
     let b = block.len();
     let h = draft_cfg.hidden;
@@ -7966,6 +7988,7 @@ pub fn draft_dflash_block_rank(
         compact_offset,
         ctx_slice,
         draft_ffn_graph,
+        bridge,
     )?;
     let mut drafted: Vec<u32> = vec![seed_token];
     let w_out = &target_weights.output;
@@ -9001,6 +9024,7 @@ pub fn spec_step_dflash(
         verify_pm4,
         lookup,
         None,
+        None,
     )
 }
 
@@ -9052,7 +9076,18 @@ pub fn spec_step_dflash_with_railgun(
     verify_pm4: Option<&mut DflashVerifyPm4>,
     lookup: Option<DflashLookup<'_>>,
     mut railgun: Option<RailgunStep<'_>>,
+    // Arch-24 DSpine code-bridge runner (singleton only; `None` elsewhere).
+    mut bridge: Option<&mut DspineBridge>,
 ) -> HipResult<SpecStepResult> {
+    // Selector machinery and the bridge are mutually exclusive: the DSpine
+    // draft has no selector tensors, so a bridge carrying draft must never
+    // take the selector branch below.
+    if bridge.is_some() && draft_weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "dspine bridge draft must not run the DFlash2 selector path",
+        ));
+    }
     let selector_mode = draft_weights.has_candidate_selector();
     if selector_mode {
         if pld_spine.is_some() {
@@ -9415,6 +9450,12 @@ pub fn spec_step_dflash_with_railgun(
     } else if !use_temp_sampling && !host_path_active {
         // Greedy fast path shared verbatim with the dense-TP mesh ranks
         // (byte-identical draft production through draft_dflash_block_rank).
+        if let Some(bridge) = bridge.as_deref_mut() {
+            // Arch-24: the anchor is the block's first real token id (the seed).
+            bridge
+                .set_anchor(gpu, block[0])
+                .map_err(|e| hip_bridge::HipError::new(0, &format!("dspine anchor: {e}")))?;
+        }
         drafted = draft_dflash_block_rank(
             gpu,
             &target.weights,
@@ -9430,6 +9471,7 @@ pub fn spec_step_dflash_with_railgun(
             draft_ffn_graph,
             seed_token,
             vocab,
+            bridge.as_deref_mut(),
         )?;
     } else {
         // Sampled / host-shaped (RP, n-gram-block, logit-dump) path: shared
@@ -9447,6 +9489,7 @@ pub fn spec_step_dflash_with_railgun(
             co,
             ctx_slice,
             draft_ffn_graph,
+            bridge.as_deref_mut(),
         )?;
 
         // ── 5. Apply target.lm_head to draft hidden positions 1..B ──────────
@@ -11079,6 +11122,7 @@ pub fn spec_step_dflash_dense_tp2(
             false,
             seed_token,
             vocab,
+            None,
         )?;
         drafted_per_rank.push(drafted);
     }
