@@ -26,7 +26,7 @@
 //! route's: no speculator or MTP spec lanes (their routes keep their own
 //! caches), Jinja rendering, prompt cache on, no eviction/adaptive KV.
 
-use crate::ar::{ckpt_interval, ckpt_max, ckpt_resume_enabled, truncate_checkpoints};
+use crate::ar::{ckpt_interval, ckpt_max, truncate_checkpoints};
 use hipfire_arch_qwen35::forward_slots::vmm::{
     Qwen35RequestState, Qwen35VmmStore, VmmPrefixEntry, VmmRequestInit,
 };
@@ -87,12 +87,7 @@ pub fn plan_reuse(
     checkpoints: &[(usize, DeltaNetSnapshot)],
     rendered: &[u32],
 ) -> Reuse {
-    plan_reuse_at(
-        prior,
-        checkpoints.iter().map(|(p, _)| *p),
-        rendered,
-        ckpt_resume_enabled(),
-    )
+    plan_reuse_at(prior, checkpoints.iter().map(|(p, _)| *p), rendered)
 }
 
 /// [`plan_reuse`] over checkpoint positions (ascending, as the ring keeps
@@ -101,7 +96,7 @@ pub fn plan_reuse(
 /// so a re-sent final token must not be applied twice) resumes from the
 /// latest checkpoint at or before the LCP that leaves at least one token to
 /// prefill, else goes cold.
-fn plan_reuse_at<I>(prior: &[u32], positions: I, rendered: &[u32], resume_enabled: bool) -> Reuse
+fn plan_reuse_at<I>(prior: &[u32], positions: I, rendered: &[u32]) -> Reuse
 where
     I: DoubleEndedIterator<Item = usize> + ExactSizeIterator,
 {
@@ -111,9 +106,6 @@ where
         .take_while(|(a, b)| a == b)
         .count();
     if lcp < prior.len() || lcp == rendered.len() {
-        if !resume_enabled {
-            return Reuse::Cold;
-        }
         positions
             .enumerate()
             .rev()
@@ -149,19 +141,17 @@ pub fn checkpoint(
     stream: &[u32],
     turn: speculative::TurnCheckpoint,
 ) {
-    if ckpt_resume_enabled() {
-        speculative::take_turn_checkpoint(
-            checkpoints,
-            dn,
-            kv,
-            gpu,
-            pos,
-            ckpt_interval(),
-            ckpt_max(),
-            turn,
-            (stream.get(..pos).unwrap_or(&[]), &[]),
-        );
-    }
+    speculative::take_turn_checkpoint(
+        checkpoints,
+        dn,
+        kv,
+        gpu,
+        pos,
+        ckpt_interval(),
+        ckpt_max(),
+        turn,
+        (stream.get(..pos).unwrap_or(&[]), &[]),
+    );
 }
 
 /// Before the lane forwards its prefill chunk `[pos, pos + len)` (the
@@ -178,19 +168,17 @@ pub fn turn_checkpoint_before_chunk(
     stream: &[u32],
     turn: &mut speculative::TurnCheckpoint,
 ) {
-    if ckpt_resume_enabled() {
-        speculative::take_turn_checkpoint_before_chunk(
-            checkpoints,
-            dn,
-            kv,
-            gpu,
-            pos,
-            len,
-            ckpt_max(),
-            turn,
-            (stream.get(..pos).unwrap_or(&[]), &[]),
-        );
-    }
+    speculative::take_turn_checkpoint_before_chunk(
+        checkpoints,
+        dn,
+        kv,
+        gpu,
+        pos,
+        len,
+        ckpt_max(),
+        turn,
+        (stream.get(..pos).unwrap_or(&[]), &[]),
+    );
 }
 
 pub fn free_checkpoints(checkpoints: Checkpoints, gpu: &mut rdna_compute::Gpu) {

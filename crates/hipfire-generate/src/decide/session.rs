@@ -268,7 +268,7 @@ pub(crate) fn plan_session(m: &mut LoadedModel, req: &Value) -> Result<SessionPl
     let reuse = !dev_flag_off("HIPFIRE_QWEN_PROMPT_CACHE")
         && carrier.decide_kv_compact_offset(m) == Some(0);
     // With a speculator loaded the AR checkpoint ring is not the live one.
-    let resume = crate::ar::ckpt_resume_enabled() && m.speculator.is_none();
+    let resume = m.speculator.is_none();
     let ckpts: Vec<usize> = m.prefill_checkpoints.iter().map(|(p, _)| *p).collect();
     let start = if no_snapshot {
         d::SessionStart::Cold
