@@ -594,6 +594,89 @@ directory, so run it somewhere disposable or delete them afterwards. `--format
 q4k` is refused at load: Q4K (qt=4) is a GGUF/Maple-side container outside the
 dense HFQ decode set, which this encoder's host decoder does not implement.
 
+### LightOnOCR-3 0.8B (arch 5 — local-only row, no Hub artifact)
+
+`lightonai/LightOnOCR-3-0.8B` — Apache-2.0 document-OCR VLM on the
+Qwen3.5-VL architecture (24 hybrid DeltaNet/`full_attention` layers, tied
+248,320 vocab, `model.visual.*` patch-16 ViT tower). Registered local-only
+as `lightonocr3:0.8b` (aliases `lightonocr3`, `lightonocr3:0.8b-mq4`); the
+family `lightonocr3`/`lightonocr` maps to arch 5 in `scripts/registry_gen.py`.
+
+| Tag | File | Size GB | Min VRAM | Notes |
+|---|---|---:|---:|---|
+| `lightonocr3:0.8b` | `lightonocr3-0.8b.mq4` | 0.56 | 2 | MQ4G256V2 trunk (0.52 GiB); `--vision-only` sidecar `lightonocr3-0.8b.vl` (0.21 GiB, F16 tower) declared in the `vision` slot |
+| `lightonocr3:0.8b-q8` | `lightonocr3-0.8b.q8` | 0.82 | 2 | Q8 trunk (all weights Q8 interleaved, embed/norms F16; 0.77 GiB) — the high-fidelity tier; same shared `lightonocr3-0.8b.vl` tower pack (byte-identical F16 bytes) |
+
+Build from a flat copy of the whole HF snapshot, in one directory:
+`model.safetensors`, `config.json`, `generation_config.json`,
+`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`,
+`vocab.json`, `merges.txt`, `preprocessor_config.json` and
+`processor_config.json`. The trunk quantizer reads `config.json` from that
+directory (a `source/` subdirectory is not descended into), and it folds
+`chat_template.jinja` into the embedded `tokenizer_config` when the latter
+carries no inline template — so the template file is an input, not decoration.
+
+```bash
+hipfire quantize <snapshot-dir> --format mq4 --output <out>/lightonocr3-0.8b.mq4
+hipfire quantize <snapshot-dir> --format q8  --output <out>/lightonocr3-0.8b.q8
+# vision tower, once per quant dir — <stem>.vl (the quant suffix is stripped):
+hipfire-quantize --input <snapshot-dir> --vision-only \
+    --output <out>/lightonocr3-0.8b.vl          # one pack, both trunks
+```
+
+The registry pins are exactly what those three commands emit:
+
+| File | Size (B) | SHA-256 |
+|---|---:|---|
+| `lightonocr3-0.8b.mq4` | 557,869,696 | `578bc68062822f960823d5fe987ea1e5125d3e56b81f489ef27e2e877a1189c0` |
+| `lightonocr3-0.8b.q8` | 822,227,584 | `8fa2093744a69d67b553875bcc1695fd039665938bcddaa29072005639fc2a4e` |
+| `lightonocr3-0.8b.vl` | 227,722,240 | `708c7b798b075c3b6f1a2c50b0d4fca3ffd4eebb8ff220baadcb5762360e9079` |
+
+`sha256sum` the outputs against that table after building. The **embedded
+metadata is part of the identity**: `config.json`, `generation_config.json`,
+`tokenizer.json`, `tokenizer_config.json` (with `chat_template.jinja` folded
+in) are serialized into the container, and the data starts on a 4096-byte
+boundary after them. Dropping `chat_template.jinja` alone takes the MQ4 file
+to 557,865,600 B / `3db40068…` — one page smaller, no weight changed — which is
+exactly how a build from an incomplete snapshot ends up "not reproducing" the
+row. Keep the snapshot complete, and re-pin only if the table above stops
+matching.
+
+Put the artifacts wherever your local catalog points: register them in
+`~/.hipfire/models.toml` with absolute paths (one quant per directory, the
+store convention), or drop them in `~/.hipfire/models/`, which the registry
+lookup falls back to — either tag then resolves from there.
+
+The model card's trained default is thinking **off**; the registry row lowers
+it as `recommended_settings` (`reasoning_effort: none`, temperature 0.2,
+top_p 0.9), and a request that wants the card's sampling sends those fields
+itself. (Measured on gfx1100: a request that omits `reasoning_effort` returns
+the same page text in `content`, so this is the card's setting, not a
+requirement for getting text back.) The card's prompt modes work verbatim: an
+empty prompt transcribes the page, `grounding` returns
+`![label](x0,y0,x1,y1)` bounding boxes in 0–1000 coordinates. Image turns need
+the tower; `vision_mode` defaults to `auto`, so a `<stem>.vl` beside the trunk
+loads with no configuration:
+
+```bash
+hipfire config lightonocr3:0.8b set vision.mode auto        # auto is the default
+# One-shot: transcription is an empty prompt (add "grounding" for boxes).
+hipfire run lightonocr3:0.8b "" --image page.png
+hipfire run lightonocr3:0.8b grounding --image page.png
+# Served, with the card's sampling:
+hipfire serve lightonocr3:0.8b-q8 127.0.0.1:9425
+curl -s 127.0.0.1:9425/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"lightonocr3:0.8b-q8","reasoning_effort":"none","temperature":0.2,
+       "top_p":0.9,
+       "messages":[{"role":"user","content":[{"type":"image_url",
+       "image_url":{"url":"data:image/png;base64,<page bytes>"}}]}]}'
+```
+
+Measured on gfx1100 with a 7812-patch page: `run --image` on the MQ4 tier
+prefills 1908 vision rows in 121 ms and decodes 1107 tokens in 2.7 s; the q8
+serve request returns the same text with `finish_reason: length` at the token
+budget.
+
 ---
 
 ## Aliases
@@ -631,6 +714,8 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `vibethinker` | `vibethinker:3b` |
 | `qwen3.5:*-mq4` / `*-hf4` / several `*-hf6` | same-size primary or mq6 tag (see registry) |
 | `qwen3.5:9b:draft` etc. | matching `*-draft` tags |
+| `lightonocr3` / `lightonocr3:0.8b-mq4` | `lightonocr3:0.8b` |
+| `lightonocr3:q8` | `lightonocr3:0.8b-q8` |
 
 ---
 
@@ -641,7 +726,7 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 | Family | arch_id | Crate | Registry examples |
 |---|---:|---|---|
 | LLaMA / Mistral / plain Qwen3 path | 0 / 1 | `hipfire-arch-llama` | `qwen3:8b`, `qwen3:0.6b` (HF4 dense) |
-| Qwen3.5 dense hybrid | 5 | `hipfire-arch-qwen35` | `qwen3.5:*`, `qwen3.6:27b`, `qwen3.8:27b*`, carnice/qwopus dense |
+| Qwen3.5 dense hybrid | 5 | `hipfire-arch-qwen35` | `qwen3.5:*`, `qwen3.6:27b`, `qwen3.8:27b*`, carnice/qwopus dense, `lightonocr3:0.8b` (VL) |
 | Qwen3.5 / 3.6 MoE A3B | 6 | `hipfire-arch-qwen35` | `*:35b-a3b*`, `ornith-1.5:35b-a3b*`, `nex-n2:mini` |
 | Qwen2 | 7 | `hipfire-arch-qwen2` | `vibethinker:3b`, `vibethinker:3b-mq6` (support, not admission) |
 | DeepSeek V4 Flash | 9 | `hipfire-arch-deepseek4` | `deepseek-v4-flash`, `deepseek-v4-flash:mq2lloyd`, `deepseek-v4-flash-preview` |
