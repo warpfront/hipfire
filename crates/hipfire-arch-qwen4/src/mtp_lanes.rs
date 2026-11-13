@@ -1098,8 +1098,9 @@ pub(crate) fn lane_call<R>(
 }
 
 /// Whether one draft round of `ops` ops runs batched (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`, rows
-/// scratch allocated): 2 or more ops, as [`forward_draft_rows`]' calls of at most
-/// [`crate::mtp_gpu::MTP_DRAFT_LANES_MAX`] lanes each, and no op reads a distribution the
+/// scratch allocated): 2 or more ops, as [`forward_draft_rows`]' calls of at most the load's
+/// [`Qwen4Bundle::mtp_draft_call_rows`] lanes each (8; 32 on an exact single-device gfx942 load),
+/// and no op reads a distribution the
 /// batched ranking does not leave in the head's shared logit row (`any_distribution_read` with
 /// a head that does not re-score; a re-scoring head's read is its host-resident candidates).
 ///
@@ -1130,13 +1131,17 @@ fn batchable_round(
     rows_ready && ops >= 2 && (rescored || !any_distribution_read)
 }
 
-/// The calls one batched round of `ops` (>= 2) lanes runs as: `ceil(ops / MAX)` contiguous
-/// slices of at most [`crate::mtp_gpu::MTP_DRAFT_LANES_MAX`] lanes, sizes differing by at most
-/// one (larger first), so every slice carries at least two lanes. A lane's batched head step is
-/// byte-identical to its serial step whatever the other rows of its call are (the batched-round
-/// oracle, `lab_draft_rounds`), so the split moves no byte.
-pub(crate) fn draft_round_slices(ops: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
-    let max = crate::mtp_gpu::MTP_DRAFT_LANES_MAX;
+/// The calls one batched round of `ops` (>= 2) lanes runs as: `ceil(ops / max)` contiguous
+/// slices of at most `max` lanes (`max >= 2`: the load's [`Qwen4Bundle::mtp_draft_call_rows`], or
+/// [`crate::mtp_gpu::MTP_DRAFT_LANES_MAX`] where only expert-parallel ranks reach it), sizes
+/// differing by at most one (larger first), so every slice carries at least two lanes. A lane's
+/// batched head step is byte-identical to its serial step whatever the other rows of its call
+/// are (the batched-round oracle, `lab_draft_rounds`), so the split moves no byte.
+pub(crate) fn draft_round_slices(
+    ops: usize,
+    max: usize,
+) -> impl Iterator<Item = std::ops::Range<usize>> {
+    debug_assert!(max >= 2, "a batched call takes at least two lanes");
     let calls = ops.div_ceil(max).max(1);
     let (base, extra) = (ops / calls, ops % calls);
     (0..calls).scan(0usize, move |start, call| {
@@ -1158,7 +1163,7 @@ pub(crate) fn forward_draft_rows(
     top1_out: &GpuTensor,
 ) -> Result<(), BundleError> {
     let slot = Gpu::TOPK8_OUT_BYTES;
-    for slice in draft_round_slices(rows.len()) {
+    for slice in draft_round_slices(rows.len(), bundle.mtp_draft_call_rows()) {
         let out = top1_out.sub_offset(slice.start * slot, slice.len() * slot);
         bundle.mtp_forward_rows_deferred(gpu, &mut rows[slice], &out)?;
     }
@@ -1245,33 +1250,59 @@ mod batched_draft_tests {
     }
 
     #[test]
-    fn round_slices_cover_the_ops_in_calls_of_two_to_eight_lanes() {
-        let max = crate::mtp_gpu::MTP_DRAFT_LANES_MAX;
-        for ops in 2..=256 {
-            let slices: Vec<_> = draft_round_slices(ops).collect();
-            assert_eq!(slices.len(), ops.div_ceil(max), "{ops} ops");
-            let mut next = 0;
-            for slice in &slices {
-                assert_eq!(slice.start, next, "{ops} ops: contiguous");
-                assert!((2..=max).contains(&slice.len()), "{ops} ops: {slice:?}");
-                next = slice.end;
+    fn round_slices_cover_the_ops_in_calls_of_two_to_max_lanes() {
+        use crate::mtp_gpu::{MTP_DRAFT_LANES_MAX, MTP_DRAFT_LANES_MAX_GFX942};
+        for max in [MTP_DRAFT_LANES_MAX, MTP_DRAFT_LANES_MAX_GFX942] {
+            for ops in 2..=256 {
+                let slices: Vec<_> = draft_round_slices(ops, max).collect();
+                assert_eq!(slices.len(), ops.div_ceil(max), "max {max}, {ops} ops");
+                let mut next = 0;
+                for slice in &slices {
+                    assert_eq!(slice.start, next, "max {max}, {ops} ops: contiguous");
+                    assert!(
+                        (2..=max).contains(&slice.len()),
+                        "max {max}, {ops} ops: {slice:?}"
+                    );
+                    next = slice.end;
+                }
+                assert_eq!(next, ops, "max {max}, {ops} ops: covered");
+                let lens: Vec<usize> = slices.iter().map(|s| s.len()).collect();
+                assert!(
+                    lens.windows(2).all(|w| w[0] >= w[1] && w[0] - w[1] <= 1),
+                    "max {max}, {ops}: {lens:?}"
+                );
             }
-            assert_eq!(next, ops, "{ops} ops: covered");
-            let lens: Vec<usize> = slices.iter().map(|s| s.len()).collect();
-            assert!(
-                lens.windows(2).all(|w| w[0] >= w[1] && w[0] - w[1] <= 1),
-                "{ops}: {lens:?}"
-            );
+            // At most `max` lanes: one call over the whole round.
+            for ops in 2..=max {
+                assert_eq!(
+                    draft_round_slices(ops, max).collect::<Vec<_>>(),
+                    vec![0..ops],
+                    "max {max}, {ops} ops"
+                );
+            }
         }
-        // At most eight lanes: one call over the whole round, as before.
-        for ops in 2..=max {
-            assert_eq!(draft_round_slices(ops).collect::<Vec<_>>(), vec![0..ops]);
-        }
+        // Default width: a 32-lane round is four calls of eight.
         assert_eq!(
-            draft_round_slices(32).collect::<Vec<_>>(),
+            draft_round_slices(32, MTP_DRAFT_LANES_MAX).collect::<Vec<_>>(),
             vec![0..8, 8..16, 16..24, 24..32]
         );
-        assert_eq!(draft_round_slices(9).collect::<Vec<_>>(), vec![0..5, 5..9]);
+        assert_eq!(
+            draft_round_slices(9, MTP_DRAFT_LANES_MAX).collect::<Vec<_>>(),
+            vec![0..5, 5..9]
+        );
+        // Exact single-device gfx942: 32 lanes are ONE call; 33 split 17 + 16; 64 split 32 + 32.
+        assert_eq!(
+            draft_round_slices(32, MTP_DRAFT_LANES_MAX_GFX942).collect::<Vec<_>>(),
+            vec![0..32]
+        );
+        assert_eq!(
+            draft_round_slices(33, MTP_DRAFT_LANES_MAX_GFX942).collect::<Vec<_>>(),
+            vec![0..17, 17..33]
+        );
+        assert_eq!(
+            draft_round_slices(64, MTP_DRAFT_LANES_MAX_GFX942).collect::<Vec<_>>(),
+            vec![0..32, 32..64]
+        );
     }
 
     #[test]

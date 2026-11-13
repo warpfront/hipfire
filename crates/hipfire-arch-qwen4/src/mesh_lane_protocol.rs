@@ -3099,11 +3099,17 @@ impl MeshRoot {
             // One row gather per replicated op, or (a batched head round,
             // HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS) one per call of a round of two or more
             // replicated ops (`draft_round_slices`); every rank must have taken the same
-            // shape. An owned op crosses nothing.
+            // shape. An owned op crosses nothing. A mesh is expert-parallel, and an
+            // expert-parallel head's call carries at most `MTP_DRAFT_LANES_MAX` lanes (only an
+            // exact single-device gfx942 load takes wider calls), the width every rank sliced by.
             let gathers_ok = r.head_gathers == replicated_ops
                 || (replicated_ops >= 2
                     && r.head_gathers
-                        == crate::mtp_lanes::draft_round_slices(replicated_ops).count());
+                        == crate::mtp_lanes::draft_round_slices(
+                            replicated_ops,
+                            crate::mtp_gpu::MTP_DRAFT_LANES_MAX,
+                        )
+                        .count());
             let peer_gathers = by_rank
                 .values()
                 .map(|p| p.head_gathers)

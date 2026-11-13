@@ -715,25 +715,33 @@ impl DraftHead {
                         // launch's body and tie rule) lands the indices in the head's scratch;
                         // ONE `copy_regions_u32` moves word `i` to word 0 of member `i`'s slot.
                         // Every other word of a slot stays as the one-row launches leave it.
-                        let x = logits_rows.sub_offset(0, count * ranked);
-                        let indices = self.top1.sub_offset(0, count * std::mem::size_of::<i32>());
-                        execute_argmax(gpu, &x, &indices, count, ranked)?;
-                        let outs: SmallVec<[GpuTensor; 8]> = members
-                            .iter()
-                            .map(|&row| top1_out.sub_offset(row * slot, std::mem::size_of::<i32>()))
-                            .collect();
-                        let regions: SmallVec<[CopyRegion<'_>; 8]> = outs
-                            .iter()
-                            .enumerate()
-                            .map(|(i, out)| CopyRegion {
-                                dst: &out.buf,
-                                dst_offset: 0,
-                                src: &indices.buf,
-                                src_offset: i * std::mem::size_of::<i32>(),
-                                bytes: std::mem::size_of::<i32>(),
-                            })
-                            .collect();
-                        hip(copy_regions(gpu, &regions))?;
+                        // The indices land in `top1`, which holds `Gpu::TOPK8_OUT_BYTES / 4` (18)
+                        // of them: a class of more rows runs as launches of at most that many
+                        // (every row is its own block either way, so its index is the same).
+                        let word = std::mem::size_of::<i32>();
+                        let capacity = (self.top1.byte_size() / word).max(1);
+                        for first in (0..count).step_by(capacity) {
+                            let take = capacity.min(count - first);
+                            let x = logits_rows.sub_offset(first * ranked, take * ranked);
+                            let indices = self.top1.sub_offset(0, take * word);
+                            execute_argmax(gpu, &x, &indices, take, ranked)?;
+                            let outs: SmallVec<[GpuTensor; 8]> = members[first..first + take]
+                                .iter()
+                                .map(|&row| top1_out.sub_offset(row * slot, word))
+                                .collect();
+                            let regions: SmallVec<[CopyRegion<'_>; 8]> = outs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, out)| CopyRegion {
+                                    dst: &out.buf,
+                                    dst_offset: 0,
+                                    src: &indices.buf,
+                                    src_offset: i * word,
+                                    bytes: word,
+                                })
+                                .collect();
+                            hip(copy_regions(gpu, &regions))?;
+                        }
                         continue;
                     }
                     for (slot_in_batch, &row) in members.iter().enumerate() {

@@ -11,7 +11,8 @@
 //! work: the lanes' head states are copied into scratch twins
 //! ([`MtpGpuState::lab_twin`]), the serial arm runs `n` `mtp_forward_token_deferred`
 //! steps (one twin each), the batched arm runs the round's batched head calls
-//! (`mtp_lanes::forward_draft_rows`: `n` twins in calls of at most 8 lanes), and
+//! (`mtp_lanes::forward_draft_rows`: `n` twins in calls of at most the load's
+//! `Qwen4Bundle::mtp_draft_call_rows` lanes, 8, or 32 on exact single-device gfx942), and
 //! every lane's draft token, margin bits, 72 draft-top1
 //! bytes, wide hidden, head KV state digest and draft request state are compared
 //! arm against arm. The lane's own state, request and every window structure are

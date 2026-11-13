@@ -3624,7 +3624,7 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
-    /// One batched head round over `rows.len()` lanes (2..=8) with the draft
+    /// One batched head round over `rows.len()` lanes (2..=[`Self::mtp_draft_call_rows`]) with the draft
     /// read deferred into `top1_out` (`Raw`, one `Gpu::TOPK8_OUT_BYTES` slot
     /// per lane, in row order): `n` [`Self::mtp_forward_token_deferred`]
     /// steps in one call, each lane carrying its own head state and draft
@@ -3972,6 +3972,18 @@ impl Qwen4Bundle {
     /// (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1` at load, MoE head).
     pub(crate) fn mtp_rows_ready(&self) -> bool {
         self.mtp.as_ref().is_some_and(|mtp| mtp.rows.is_some())
+    }
+
+    /// Lanes one batched head call carries on this load: 32 on an exact single-device gfx942
+    /// load (the stock-FP8 profile), else [`crate::mtp_gpu::MTP_DRAFT_LANES_MAX`] (8; every
+    /// expert-parallel rank). Decided once, when the rows scratch is allocated
+    /// ([`crate::mtp_gpu::load_draft_call_rows`]); a draft round of more lanes runs as
+    /// `crate::mtp_lanes::draft_round_slices` calls of at most this many.
+    pub(crate) fn mtp_draft_call_rows(&self) -> usize {
+        self.mtp.as_ref().map_or(
+            crate::mtp_gpu::MTP_DRAFT_LANES_MAX,
+            crate::mtp_gpu::Qwen4MtpGpu::draft_call_rows,
+        )
     }
 
     /// The last MTP prediction's raw draft material, copied out of the head's

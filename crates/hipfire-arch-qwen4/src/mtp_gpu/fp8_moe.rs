@@ -218,7 +218,8 @@ impl MtpFp8MoeScratch {
 
     /// The scratch of a stock-FP8 MoE head (`None` for any other head).
     /// Also reserves the stable-scatter grouping scratch for the head's widest
-    /// batched round ([`MTP_DRAFT_LANES_MAX`] rows) before any forward or
+    /// batched round ([`draft_call_capacity`] rows: 32 for this stock-FP8 head, which exists on
+    /// exact single-device gfx942 only) before any forward or
     /// capture; the trunk's own reservation (its prefill chunk) normally
     /// covers it, the call only grows past it.
     pub(crate) fn new(gpu: &mut Gpu, config: &Qwen4Config) -> Result<Option<Self>, MtpGpuError> {
@@ -231,7 +232,7 @@ impl MtpFp8MoeScratch {
         gpu.try_gfx942()
             .ok_or_else(|| invalid("the qt=55 FP8 head route needs a gfx942 device"))?
             .reserve_fp8b128_moe_group(
-                MTP_DRAFT_LANES_MAX,
+                draft_call_capacity(config),
                 config.num_experts_per_tok,
                 config.num_experts,
             )?;
@@ -546,7 +547,7 @@ mod tests {
         // `MtpRowsScratch::shapes` order: gate_batch 24, rot_batch 26, sorted
         // slot index 32, grouped gate_up 35, grouped down 36.
         let rows = MtpRowsScratch::shapes(&stock).unwrap().unwrap();
-        Fp8GroupedBytes::for_rows(dims, MTP_DRAFT_LANES_MAX)
+        Fp8GroupedBytes::for_rows(dims, draft_call_capacity(&stock))
             .unwrap()
             .check_holds(
                 &rows,
