@@ -66,7 +66,7 @@ enum ReplayTransport {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Pm4Architecture {
+pub(crate) enum Pm4Architecture {
     Gfx10,
     Gfx11,
     Gfx12,
@@ -3481,7 +3481,7 @@ fn gfx1100_experiment_alias(architecture: Pm4Architecture, device_name: &str) ->
 /// Negative control (test-only, default off):
 /// `HIPFIRE_DEBUG_PM4_NO_CWSR_PRIV=1` leaves the bit clear on GFX11 so the
 /// fault can be reproduced against the same build.
-fn gfx11_cwsr_priv(architecture: Pm4Architecture) -> bool {
+pub(crate) fn gfx11_cwsr_priv(architecture: Pm4Architecture) -> bool {
     if architecture != Pm4Architecture::Gfx11 {
         return false;
     }
