@@ -28,16 +28,20 @@
 
 use rdna_compute::Gpu;
 
-/// G0 receipt behind the gfx942 all-rows segment (9..=64 rows; 65..=128 rows are PENDING the MI300X
-/// c32 oracle, see the string's tail): `fn_lane_oracle --g0 --controls
+/// G0 receipt behind the gfx942 all-rows segment. 9..=64 rows: `fn_lane_oracle --g0 --controls
 /// --ks 16,32,64 --contexts 64,512,2048 --steps 64` (plus the wide negative controls at k = 16
 /// and 64) on the stock-FP8 artifact, with the C0 HC write / read fix (`2028a9d12e`): every
 /// lane's logits rows, ids and state checkpoints byte-identical to the singleton under the
 /// combined production policy, the all-rows HC / stage / MoE segments engaged (step trace
 /// `hc_allrows=true stages_allrows=true moe=allrows`). It proves the combined policy only, like
 /// [`GFX942_STOCK_FP8_RECEIPT`](crate::gpu_forward_lanes::GFX942_STOCK_FP8_RECEIPT), and binds
-/// the exact-gfx942 all-rows flags, which are always on there.
-pub const GFX942_STOCK_FP8_ALLROWS_RECEIPT: &str = "g0 mi300x/beat/L/l1-out/g0-final+ctl-final 2026-11-10 gfx942 stock-fp8 single, all-rows k=16/32/64 ctx 64/512/2048 steps 64, combined policy only, fn_lane_oracle sha256 3699aa99dddfc788 rc=0, with C0 2028a9d12e + 65..=128 rows: PENDING mi300x c32 oracle";
+/// the exact-gfx942 all-rows flags, which are always on there. 65..=128 rows (the string's tail):
+/// the MTP lane oracle `fn_lane_oracle --spec mtp --k 3 --ks 1,2,8,16,32 --contexts 64,512,2048
+/// --steps 8 --controls` and `--k 7 --ks 8,16` (32 x 4 and 16 x 8 = 128-row verify steps) with
+/// `HIPFIRE_QWEN4_LANE_STEP_TRACE=1`: every lane's committed ids and trunk / head / draft
+/// checkpoints byte-identical to the singleton replay, the trace showing `rows=128
+/// hc_allrows=true moe=allrows`.
+pub const GFX942_STOCK_FP8_ALLROWS_RECEIPT: &str = "g0 mi300x/beat/L/l1-out/g0-final+ctl-final 2026-11-10 gfx942 stock-fp8 single, all-rows k=16/32/64 ctx 64/512/2048 steps 64, combined policy only, fn_lane_oracle sha256 3699aa99dddfc788 rc=0, with C0 2028a9d12e; 65..=128 rows: mi300x beat/WC8/out/c32/f1-k3+f1-k7 2026-11-13 MTP lanes K=3 ks 1/2/8/16/32 + K=7 ks 8/16 ctx 64/512/2048 steps 8, trace rows=128 hc_allrows moe=allrows, controls PASS, fn_lane_oracle sha256 1b38c0dda74d4318 rc=0, source 2f57c10ecf";
 
 /// Widest all-rows step the gfx942 single-device lane forward admits: 32 MTP lanes x (K = 3 + 1)
 /// verify rows ([`rdna_compute::cdna::gfx942::LANE_ALLROWS_MAX_ROWS`]). Non-gfx942 all-rows steps

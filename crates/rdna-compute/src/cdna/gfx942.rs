@@ -708,6 +708,7 @@ pub(crate) fn g942_conv_fuse_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> 
 /// (`hyper_write_norm_bf16x`, the HC read / write, the trunk MFMA entries, the FP8 grouped MoE, the
 /// head) is per-row or row-count invariant, so this bound is a route bound, not an arithmetic
 /// one. Every non-gfx942 bound (`WIDE_VERIFY_MAX_ROWS`, 64) is unchanged.
+// selector-receipt: receipts/selectors/gfx942_lane_allrows_max_rows.json
 pub const LANE_ALLROWS_MAX_ROWS: usize = 128;
 
 impl Gfx942Device<'_> {
