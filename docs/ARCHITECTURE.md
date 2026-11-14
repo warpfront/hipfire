@@ -263,6 +263,14 @@ the kill switch; forced `on`/`emulate` refuse other architectures. Details:
 `hipfire-xdna`, the AIE2P simulator, co-op prototypes) is experimental
 ([`npu/README.md`](npu/README.md)).
 
+The shared mode, stage-map type, containment, admission and pair geometry live in
+`hipfire_runtime::coproc`. The Flash-Next trunk consumes all of them; the qwen3.8-27b dense stage
+consumes the mode switch, the `StageMap` type and the pair schedule. Its switch is
+`fusions.qwen35_npu_trunk` / `HIPFIRE_QWEN35_NPU_TRUNK` (`off|auto|on|emulate`, default `off`;
+`auto` pairs where the built-in measured calibration prices a pair below GPU-only). `on` / `emulate` run the plain AR
+prefill and the DFlash prompt seed in bank pairs on `coproc::pair_schedule`
+(`qwen35::prefill::forward_prefill_npu_pair`, device half `npu_trunk::NpuTrunk`).
+
 ## Request lifecycle
 
 ```text

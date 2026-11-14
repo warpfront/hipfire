@@ -4762,8 +4762,15 @@ pub fn generate(
                 break;
             }
             let remaining = new_tokens.len() - start;
-            let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
+            // The armed 27B NPU trunk doubles a full-bank chunk into one bank pair; `first` is
+            // the chunk an unpaired prefill runs here, which places the user-turn snapshot.
+            let first = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
                 .unwrap_or(remaining.min(chunk_max).max(1));
+            let ceiling = hipfire_arch_qwen35::npu_trunk::outer_chunk_rows(
+                scratch, chunk_max, m.seq_pos, remaining,
+            );
+            let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, ceiling)
+                .unwrap_or(remaining.min(ceiling).max(1));
             if ckpt_resume_enabled() {
                 speculative::take_turn_checkpoint_before_chunk(
                     &mut m.prefill_checkpoints,
@@ -4771,7 +4778,7 @@ pub fn generate(
                     kv,
                     gpu,
                     m.seq_pos,
-                    outer,
+                    first,
                     ckpt_max(),
                     &mut turn,
                     // Committed conversation + the chunks forwarded so far.
@@ -4852,7 +4859,21 @@ pub fn generate(
             // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
             // fields, so this composes with the live kv/dn borrows.
             if ckpt_resume_enabled() {
-                // Stride snapshot that spares the pinned user-turn snapshot.
+                // The bank-boundary state of a pair first, then the stride snapshot that spares
+                // the pinned user-turn snapshot.
+                hipfire_arch_qwen35::npu_trunk::take_pair_checkpoint(
+                    scratch,
+                    &mut m.prefill_checkpoints,
+                    dn,
+                    kv,
+                    gpu,
+                    ckpt_interval(),
+                    ckpt_max(),
+                    &mut turn,
+                    m.seq_pos,
+                    (&m.conversation_tokens, &new_tokens[..end]),
+                );
+                m.user_turn_ckpt = turn.pin;
                 speculative::take_turn_checkpoint(
                     &mut m.prefill_checkpoints,
                     dn,

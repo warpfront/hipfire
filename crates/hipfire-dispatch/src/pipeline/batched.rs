@@ -118,6 +118,10 @@ pub const WIDENED_COMMIT_ROWS: usize = 512;
 pub struct BatchScratch<'a> {
     /// Small-arena scratch: the packed MQ4 routes need full-size planes.
     pub lean: bool,
+    /// A co-processor already wrote this chunk's mixer in-projections
+    /// (`dn_qkv/z/alpha/beta_batch`, `fa_q_full/k/v_batch`): the batched
+    /// mixers skip their native in-projection GEMMs.
+    pub in_projected: bool,
     pub x_batch: &'a GpuTensor,
     /// Un-rotated RMSNorm rows.
     pub x_norm_batch: &'a GpuTensor,

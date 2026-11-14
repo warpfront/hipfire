@@ -4,9 +4,10 @@ The Qwen4 `npu_trunk` module owns CPU-only model preparation for hipfire 0.4.2;
 `peacemaker-npu` owns the numerical reference, panel layout and deployment builder.
 Neither preparation path opens hardware or schedules prefill.
 
-`NpuTrunkMode::from_env()` borrows the central process snapshot for
-`HIPFIRE_QWEN4_NPU_TRUNK`: `off`, `auto` (default), `on`, or `emulate`.
+Qwen4 reads `fusions.npu_trunk` (env `HIPFIRE_QWEN4_NPU_TRUNK`) with
+`hipfire_runtime::coproc::Mode::from_config(SWITCH, Mode::Auto)`: `off`, `auto` (default), `on`, or `emulate`. Mode, containment, admission and pair geometry are shared in `hipfire_runtime::coproc`.
 At load, auto resolves silently to off on every arch except gfx1151.
+The qwen3.8-27b switch is `fusions.qwen35_npu_trunk` (env `HIPFIRE_QWEN35_NPU_TRUNK`, default `off`): `on` runs the AR prefill in bank pairs (8192 + 512..8192 rows) with every GDN/FA in-projection on the NPU (N512 K5120 programs, `bf16_direct`), `emulate` runs the same W8 x A8 GEMM on the GPU twin, and `auto` pairs only where the built-in measured Halo record (`crates/hipfire-arch-qwen35/src/npu_trunk/halo-xdna2-27b-v1.json`, schema 4, keyed on the `qwen3.8-27b.mq4` trunk index digest `feb45abd…`) prices the pair (`coproc::pair_time` at the pair's prefix) strictly below GPU-only. The record's GPU terms are rocprofv3 kernel attribution of one `off` p16k prefill; pack, consume and contention come from the matching `on` trace (an 8192 + 8192 pair: GPU waits only for the first chain, 59.5 ms, then 0); the co-run NPU rate is the silicon 15.1 TOPS of `npu-trunk-transport --corun`, which makes the short-bank-B stall conservative. A fault in the relay (the injected one is `HIPFIRE_QWEN35_NPU_TRUNK_FAULT_CHAIN`) latches the route off for the process, restores the pre-pair recurrent state and reruns the pair's rows GPU-only, in every mode. The DFlash prompt seed pairs the same way (a pair runs as one piece; each bank writes its extracted hidden rows into the draft ring after the rows before it, keeping the last ring rows of a windowed draft), unless the seed reads every piece back to host.
 
 ## Serving status (0.4.2)
 
@@ -1244,7 +1245,7 @@ they keep the natural 8192+B pairing.
 
 A pair may carry **one interior session snapshot row**, anywhere in the group
 (C1, 0.4.2). At the A/B split bank A runs whole and its fixed state is staged
-after it, as before. Inside a bank (`CutSite::Bank`), that bank's Core runs as
+after it, as before. Inside a bank (`coproc::pair::CutSite::Bank`), that bank's Core runs as
 two launches `[0,r)` and `[r,rows)` (`execute_*_core_rows`, `CoreWindow`):
 GDN: each launch ends with the ordinary chunk-end Q8 round trip (frame
 `position + lo + rows - 1`) and the conv ring cursor `(start + lo) % 3`; QSA:

@@ -2233,17 +2233,19 @@ pub fn batch_chunk_delta_net_attn(
     // keeps the four SETs + full plain prep.
     let q_scale = 1.0 / (hd as f32).sqrt();
     let fused_views = match &route {
+        // A co-processor projection (`in_projected`) has no fused GDN-prep epilogue.
         GdnPrefillRoute::Stream(call)
-            if gdn_stream_fused_prep_admitted(
-                gpu,
-                config,
-                dn_state,
-                delta_layer_idx,
-                call,
-                n,
-                config.linear_key_heads,
-                n_v_heads,
-            ) =>
+            if !pbs.in_projected
+                && gdn_stream_fused_prep_admitted(
+                    gpu,
+                    config,
+                    dn_state,
+                    delta_layer_idx,
+                    call,
+                    n,
+                    config.linear_key_heads,
+                    n_v_heads,
+                ) =>
         {
             // Resolve the completion module before the projection mutates anything.
             gpu.gdn_chunk_prep_fixup_prepare()?;
@@ -2267,18 +2269,20 @@ pub fn batch_chunk_delta_net_attn(
             q_scale,
             eps: config.norm_eps,
         });
-    let prep_fused = batch_chunk_delta_net_input_projection(
-        gpu,
-        layer,
-        config,
-        pbs,
-        n,
-        dim,
-        q8_wmma_arch,
-        fusion,
-        gdn_targets.as_ref(),
-        math,
-    )?;
+    // A co-processor projection already filled the raw rows: the stream preps them itself.
+    let prep_fused = !pbs.in_projected
+        && batch_chunk_delta_net_input_projection(
+            gpu,
+            layer,
+            config,
+            pbs,
+            n,
+            dim,
+            q8_wmma_arch,
+            fusion,
+            gdn_targets.as_ref(),
+            math,
+        )?;
     if let GdnPrefillRoute::Stream(call) = route {
         let (plan, _, _) = gdn_stream_layer(dn_state, delta_layer_idx, Some(&call))?;
         let x_fmt = match plan.algorithm {

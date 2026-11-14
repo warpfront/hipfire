@@ -1702,7 +1702,8 @@ impl SpecTarget for Qwen4Bundle {
         if reset {
             let mut hidden_out = hidden_out;
             let start = hidden_out.as_deref().map_or(0, Vec::len);
-            return crate::npu_trunk::containment::rerun_after_fault(
+            return hipfire_runtime::coproc::containment::rerun_after_fault(
+                crate::npu_trunk::SWITCH.tag,
                 self,
                 tokens.len(),
                 0,
@@ -10377,7 +10378,8 @@ impl MtpDrafter for Qwen4MtpDrafter {
             target,
             restart: 0,
         };
-        crate::npu_trunk::containment::rerun_after_fault(
+        hipfire_runtime::coproc::containment::rerun_after_fault(
+            crate::npu_trunk::SWITCH.tag,
             &mut run,
             prompt_len,
             start_pos,
@@ -11275,7 +11277,12 @@ pub(crate) fn native_mtp_request_allocation_sizes_ring(
     let verify_rows = crate::bundle::spec_hidden_capacity_rows(
         rows.max(max_seq.min(chunk_rows)),
         chunk_rows,
-        crate::npu_trunk::NpuTrunkMode::from_env().ok() == Some(crate::npu_trunk::NpuTrunkMode::On),
+        hipfire_runtime::coproc::Mode::from_config(
+            crate::npu_trunk::SWITCH,
+            hipfire_runtime::coproc::Mode::Auto,
+        )
+        .ok()
+            == Some(hipfire_runtime::coproc::Mode::On),
     )?;
     let mut sizes = vec![
         u64::try_from(verify_rows.checked_mul(hidden_row)?).ok()?,

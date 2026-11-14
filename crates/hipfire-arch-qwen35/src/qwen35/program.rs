@@ -304,6 +304,7 @@ impl PrefillBatchScratch {
     pub(crate) fn view(&self) -> BatchScratch<'_> {
         BatchScratch {
             lean: self.lean,
+            in_projected: false,
             x_batch: &self.x_batch,
             x_norm_batch: &self.x_norm_batch,
             x_rot_batch: &self.x_rot_batch,

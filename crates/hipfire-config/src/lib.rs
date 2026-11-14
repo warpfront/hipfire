@@ -3703,6 +3703,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Qwen4 trunk projection engine; auto admits calibrated gfx1151 NPU prefill, off is the GPU-only kill switch."
     ),
     field!(
+        "fusions.qwen35_npu_trunk",
+        "qwen35_npu_trunk",
+        Fusions,
+        ModelLoad,
+        DefaultValue::String("off"),
+        ValueRule::Enum(&["off", "auto", "on", "emulate"]),
+        false,
+        true,
+        Some("HIPFIRE_QWEN35_NPU_TRUNK"),
+        "Experimental qwen3.8-27b dense NPU stage: off, auto, on or emulate. on runs AR prefill in bank pairs (8192 + 512..8192 rows) with every GDN/FA in-projection on the gfx1151 NPU; emulate runs the same W8xA8 math on the GPU; auto stays GPU-only until a measured 27B calibration exists."
+    ),
+    field!(
         "fusions.npu_trunk_calibration",
         "npu_trunk_calibration",
         Fusions,

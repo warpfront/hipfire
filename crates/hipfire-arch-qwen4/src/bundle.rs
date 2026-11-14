@@ -2550,12 +2550,12 @@ impl Qwen4Bundle {
         position: usize,
         remaining: usize,
         chunk: usize,
-    ) -> Option<crate::gpu_forward::PairShape> {
+    ) -> Option<hipfire_runtime::coproc::pair::PairShape> {
         let banks = self
             .execution
             .as_ref()?
             .npu_trunk_pair(position, remaining, chunk)?;
-        Some(crate::gpu_forward::PairShape::new(
+        Some(hipfire_runtime::coproc::pair::PairShape::new(
             banks,
             position,
             self.session_next_boundary(),
@@ -5128,7 +5128,8 @@ impl Qwen4Bundle {
         }
         // An NPU fault latches the route off; the request then reruns from the re-planned session start with the
         // exact GPU-only schedule.
-        crate::npu_trunk::containment::rerun_after_fault(
+        hipfire_runtime::coproc::containment::rerun_after_fault(
+            crate::npu_trunk::SWITCH.tag,
             self,
             prompt.len(),
             reused,

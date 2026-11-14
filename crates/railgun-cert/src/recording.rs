@@ -1020,6 +1020,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen35-npu-pair",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "qwen3.8-27b NPU trunk bank pair (qwen35 prefill.rs forward_prefill_batch_with_pbs_opts_inner, the `pair_b` filter): an armed `NpuTrunk`, a full 8192-row bank A and an admitted bank B, `!capture_mode && !is_recording()`; `forward_prefill_npu_pair` passes the same two facts to `q8_multirow_attn_admitted` (see q8-multirow-verify-attention)",
+        effect: LaunchShape,
+        switches: "eager: one layer-major 8192 + bank-B pair with NPU (or emulate twin) in-projections; recorded or captured: the ordinary GPU-only chunks",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "W8 x A8 in-projections instead of the GPU route; no byte-exact oracle. Unreachable: prefill-only, default off (fusions.qwen35_npu_trunk)",
+        reaches: &[],
+    },
+    Decision {
         id: "q8-multirow-verify-attention",
         predicates: &[IsRecording, CaptureMode],
         condition: "q8_multirow_attn_admitted: gfx1100|gfx1151|gfx1201 && Q8 KV && head_dim ∈ {128, 256} && 4 <= n <= 32 && logical ctx > HIPFIRE_FA_PERTOKEN_MIN_CTX (default 4096) && !tree && !independent && ((!capture_mode && !replay_recording) || capture_safe_fixed_grid) (prefill.rs:9700-9722). The fixed-grid exception requires the admitted gfx1100 split verifier; after a split miss the launcher refuses recording, or admitted gfx1100 split capture (attention.rs:743-749, 9592-9598)",
@@ -1066,7 +1077,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "canonical-gdn-stream-eager-only",
         predicates: &[IsRecording, CaptureMode],
-        condition: "the canonical ordinary-prefill GDN stream and its plain-forward gate are eager-only: `ordinary_prefill_forward` (qwen35 prefill.rs; sequential, no tree/tape/fusion, band, max_layer, routed_out or mask override and !capture_mode && !is_recording() && !fp8_verify_scope && !iu4_verify_scope) feeds `with_gdn_forward` in forward_batch_chunk_impl and forward_prefill_chunk_pair_body; `gdn_dense_stream_route` and `gdn_wy_stream_route` (hipfire-dispatch pipeline/layer_ops.rs) each end in `&& !gpu.replay.is_recording() && !gpu.graphs.capture_mode` after the carry/stream, geometry and static-admission clauses; rdna-compute `fn_gdn_dense::applies_edge` ends in the same two clauses; `gdn_wy_stream_append` returns `wrong_shape()` when `replay.is_recording() || graphs.capture_mode`, as does `gdn_wy_stream_seal` for a not-yet-sealed stream; `Gpu::gdn_input_arith` (prefill_invariant.rs) computes `eager = !is_recording() && !capture_mode && k % 256 == 0` and reports the F16_WMMA arithmetic code instead of IU4/FP8/MMQ when not eager",
+        condition: "the canonical ordinary-prefill GDN stream and its plain-forward gate are eager-only: `ordinary_prefill_forward` (qwen35 prefill.rs; sequential, no tree/tape/fusion, band, max_layer, routed_out or mask override and !capture_mode && !is_recording() && !fp8_verify_scope && !iu4_verify_scope) feeds `with_gdn_forward` in forward_batch_chunk_impl, forward_prefill_chunk_pair_body and forward_prefill_npu_pair; `gdn_dense_stream_route` and `gdn_wy_stream_route` (hipfire-dispatch pipeline/layer_ops.rs) each end in `&& !gpu.replay.is_recording() && !gpu.graphs.capture_mode` after the carry/stream, geometry and static-admission clauses; rdna-compute `fn_gdn_dense::applies_edge` ends in the same two clauses; `gdn_wy_stream_append` returns `wrong_shape()` when `replay.is_recording() || graphs.capture_mode`, as does `gdn_wy_stream_seal` for a not-yet-sealed stream; `Gpu::gdn_input_arith` (prefill_invariant.rs) computes `eager = !is_recording() && !capture_mode && k % 256 == 0` and reports the F16_WMMA arithmetic code instead of IU4/FP8/MMQ when not eager",
         effect: KernelSelection,
         switches: "eager: the canonical stream routes (dense Scan64 append, WY append/seal, edge executor) and ordinary-prefill-only recipes; recorded or captured: the route predicates are false and the call keeps the incumbent route (the layer_ops.rs doc: recorder/capture runs keep the incumbent route), the direct append/seal entry points return an error before any launch, and `gdn_input_arith` reports F16_WMMA",
         kernels: &[],
@@ -2292,14 +2303,20 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
         function: "forward_prefill_batch_with_pbs_opts_inner",
-        occurrences: 2,
-        decisions: &["gfx1151-fa-pair-merge"],
+        occurrences: 4,
+        decisions: &["gfx1151-fa-pair-merge", "qwen35-npu-pair"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
         function: "forward_prefill_chunk_pair_body",
         occurrences: 2,
         decisions: &["q8-multirow-verify-attention"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "forward_prefill_npu_pair",
+        occurrences: 2,
+        decisions: &["q8-multirow-verify-attention", "qwen35-npu-pair"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
