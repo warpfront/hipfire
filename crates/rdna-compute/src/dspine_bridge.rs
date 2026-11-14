@@ -449,4 +449,56 @@ impl Gpu {
         )
     }
 
+
+    /// Gather the pre-write scores at the post-write top-k candidate ids
+    /// (see `dspine_gather16_gfx1100`).
+    pub fn dspine_gather16(
+        &mut self,
+        src: &GpuTensor,
+        cand: &GpuTensor,
+        out: &GpuTensor,
+        rows: usize,
+        v: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dspine bridge kernels are gfx1100-only in v1",
+            ));
+        }
+        const SYM: &str = "dspine_gather16_gfx1100";
+        self.ensure_kernel(SYM, DSPINE_SRC, SYM)?;
+
+        let mut s_ptr = src.buf.as_ptr();
+        let mut c_ptr = cand.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut v_val = v as i32;
+        let mut total = (rows * 16) as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut s_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut v_val as *mut _ as *mut c_void,
+            &mut total as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            SYM,
+            [((rows * 16 + 255) / 256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(s_ptr);
+                b.push_ptr(c_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(v_val);
+                b.push_i32(total);
+                b
+            },
+        )
+    }
+
 }

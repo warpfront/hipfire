@@ -8017,24 +8017,19 @@ pub fn draft_dflash_block_rank(
         );
         let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
-        // The serial-refinement arm rebuilds its own logits from the
-        // pre-write hidden (upstream base semantics), so the trunk lm_head
-        // GEMM here is dead weight for it — skip and keep the window at
-        // one head GEMM like the other arms.
-        let serial_active = bridge
-            .as_deref()
-            .map_or(false, |b| b.serial().is_some());
-        if !serial_active {
-            draft_lmhead_batched(
-                gpu,
-                w_out,
-                verify_scratch,
-                &hidden_rows,
-                &logits_batch,
-                batch,
-                h,
-            )?;
-        }
+        // The trunk lm_head runs unconditionally: its logits are the serial
+        // refinement's CANDIDATE source (upstream topk reads the forward's
+        // output hidden), while the score's base term is rebuilt from the
+        // pre-write hidden in the serial branch below.
+        draft_lmhead_batched(
+            gpu,
+            w_out,
+            verify_scratch,
+            &hidden_rows,
+            &logits_batch,
+            batch,
+            h,
+        )?;
         if selector_mode {
             let proposal = dflash::propose_candidates_device(
                 gpu,
@@ -8094,7 +8089,7 @@ pub fn draft_dflash_block_rank(
             let logits_pre = verify_scratch.logits.sub_offset(0, batch * vocab);
             draft_lmhead_batched(gpu, w_out, verify_scratch, &h_pre, &logits_pre, batch, h)?;
             drafted = vec![seed_token];
-            drafted.extend(dspine.serial_refine(gpu, &logits_pre, batch)?);
+            drafted.extend(dspine.serial_refine(gpu, &logits_pre, &logits_batch, batch)?);
         } else {
             // GPU argmax over (B-1) rows — one kernel, small D2H.
             let argmax_buf = verify_scratch.argmax.sub_offset(0, batch);

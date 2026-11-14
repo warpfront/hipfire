@@ -395,3 +395,20 @@ extern "C" __global__ void dspine_scale_rows_gfx1100(
         out[idx] = x[(long long)row_offset * H + idx] * nw[(int)(idx % H)];
     }
 }
+
+// base_pre[row][lane] = src[row * V + cand[row][lane]]: the serial_table
+// score's base term evaluated exactly at the post-write top-k candidate ids
+// (upstream rescoring: candidates from the forward's output logits, base
+// from the pre-write stash).
+extern "C" __global__ void dspine_gather16_gfx1100(
+    const float* __restrict__ src,
+    const unsigned int* __restrict__ cand,
+    float* __restrict__ out,
+    int V,
+    int total)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    const int row = idx / 16;
+    out[idx] = src[(long long)row * V + cand[idx]];
+}

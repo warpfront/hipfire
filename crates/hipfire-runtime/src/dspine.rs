@@ -425,7 +425,8 @@ impl DspineBridge {
     pub fn serial_refine(
         &self,
         gpu: &mut Gpu,
-        logits: &GpuTensor,
+        logits_pre: &GpuTensor,
+        logits_post: &GpuTensor,
         rows: usize,
     ) -> hip_bridge::HipResult<Vec<u32>> {
         let tables = match self.serial.as_ref() {
@@ -453,7 +454,12 @@ impl DspineBridge {
         let mode_argmax =
             hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_MODE").as_deref() == Ok("argmax");
         let pick = (|| -> hip_bridge::HipResult<Vec<u32>> {
-            gpu.dspine_topk16(logits, &cand, &base, rows, vocab)?;
+            // Upstream: candidates come from the forward's OUTPUT logits
+            // (post-write hidden @ lm_head), while the score's base term is
+            // evaluated at those ids on the PRE-write logits (serial_table
+            // rescoring). One topk on the post logits + one gather.
+            gpu.dspine_topk16(logits_post, &cand, &base, rows, vocab)?;
+            gpu.dspine_gather16(logits_pre, &cand, &base, rows, vocab)?;
             if mode_argmax {
                 let raw = gpu.download_f32(&cand)?;
                 return Ok((0..rows).map(|i| raw[i * 16].to_bits()).collect());
