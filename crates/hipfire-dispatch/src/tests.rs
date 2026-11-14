@@ -3397,8 +3397,8 @@ fn mq6_hfq6_gemv_resolves_on_rdna1_rdna2_and_keeps_prior_archs() {
         GemvVariant::WithSwiGLUResidual,
     ];
     for arch in [
-        "gfx1010", "gfx1030", "gfx1031", "gfx1032", "gfx906", "gfx1100", "gfx1151", "gfx1200",
-        "gfx1201",
+        "gfx1010", "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036",
+        "gfx906", "gfx1100", "gfx1151", "gfx1200", "gfx1201",
     ] {
         let ctx = DispatchCtx::for_test(arch);
         for dtype in [DType::MQ6G256, DType::HFQ6G256] {

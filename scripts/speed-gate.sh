@@ -61,6 +61,10 @@ else
                 90008)          BASELINE_ARCH="gfx908";  break ;;
                 100100)         BASELINE_ARCH="gfx1010"; break ;;
                 100300|100302)  BASELINE_ARCH="gfx1030"; break ;;
+                100303)         BASELINE_ARCH="gfx1033"; break ;;
+                100304)         BASELINE_ARCH="gfx1034"; break ;;
+                100305)         BASELINE_ARCH="gfx1035"; break ;;
+                100306)         BASELINE_ARCH="gfx1036"; break ;;
                 110000|110001)  BASELINE_ARCH="gfx1100"; break ;;
                 110501)         BASELINE_ARCH="gfx1151"; break ;;
                 120000)         BASELINE_ARCH="gfx1200"; break ;;

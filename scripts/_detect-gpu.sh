@@ -42,6 +42,10 @@ if [ -z "${HIPFIRE_DETECTED_ARCH:-}" ]; then
                 90008)          HIPFIRE_DETECTED_ARCH="gfx908";  break ;;
                 100100)         HIPFIRE_DETECTED_ARCH="gfx1010"; break ;;
                 100300|100302)  HIPFIRE_DETECTED_ARCH="gfx1030"; break ;;
+                100303)         HIPFIRE_DETECTED_ARCH="gfx1033"; break ;;
+                100304)         HIPFIRE_DETECTED_ARCH="gfx1034"; break ;;
+                100305)         HIPFIRE_DETECTED_ARCH="gfx1035"; break ;;
+                100306)         HIPFIRE_DETECTED_ARCH="gfx1036"; break ;;
                 110000|110001)  HIPFIRE_DETECTED_ARCH="gfx1100"; break ;;
                 110501)         HIPFIRE_DETECTED_ARCH="gfx1151"; break ;;
                 120000)         HIPFIRE_DETECTED_ARCH="gfx1200"; break ;;

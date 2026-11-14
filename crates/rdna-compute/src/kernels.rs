@@ -11738,8 +11738,8 @@ mod dispatch_tests {
 
     const ALL_ARCHS: &[&str] = &[
         "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
-        "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
-        "gfx1201", "gfx940", "gfx941", "gfx942",
+        "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx1100", "gfx1101", "gfx1102", "gfx1103",
+        "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201", "gfx940", "gfx941", "gfx942",
     ];
 
     /// WMMA-capable archs (RDNA3 + RDNA4).

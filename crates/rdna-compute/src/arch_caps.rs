@@ -128,7 +128,12 @@ impl ArchCaps {
         let is_cdna1 = is_gfx908;
         let is_rdna1 = is_gfx1010;
         let is_rdna1p1 = is_gfx1011 || is_gfx1012;
-        let is_rdna2 = is_gfx1030 || is_gfx1031 || is_gfx1032;
+        // gfx1033-1036 (RDNA2 APUs) share gfx1030's LLVM feature set
+        // (FeatureISAVersion10_3_0); only gfx1036 is hardware-tested (HIPF-354).
+        let is_rdna2 = is_gfx1030
+            || is_gfx1031
+            || is_gfx1032
+            || matches!(arch, "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
         let is_rdna3 = is_gfx1100
             || is_gfx1101
             || is_gfx1102
@@ -158,15 +163,25 @@ impl ArchCaps {
         let has_hfq3_dp4a = flags.hfq3_dp4a.unwrap_or(false) && has_hfq3_sdot4;
         // Issue #300: production HFQ3/HFQ4 MMQ prefill is default-on for
         // the supported sdot4 gfx10 allowlist; env flags remain escape hatches.
-        let has_hfq3_mmq = flags.hfq3_mmq.unwrap_or(true) && has_hfq3_sdot4;
-        let has_hfq4_mmq = flags.hfq4_mmq_rdna2.unwrap_or(true) && has_hfq3_sdot4;
+        // ponytail: MMQ stays off by default on the newly admitted gfx1033-1036.
+        // HFQ3 qkvza MMQ drops Y_alpha when beta_m+alpha_m <= 128 (HIPF-384);
+        // HFQ4 MMQ passed only on one gfx1036 with sclk pinned, and that unit
+        // corrupts LDS at auto DPM (HIPF-368). Re-admit once a second part passes at stock clocks.
+        let mmq_default = !matches!(arch, "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036");
+        let has_hfq3_mmq = flags.hfq3_mmq.unwrap_or(mmq_default) && has_hfq3_sdot4;
+        let has_hfq4_mmq = flags.hfq4_mmq_rdna2.unwrap_or(mmq_default) && has_hfq3_sdot4;
         let has_cdna3_lds_gemv = flags.gfx942_lds_gemv.unwrap_or(false);
 
         // Tuning parameters
         let gemv_dp4a = flags.gemv_dp4a.unwrap_or(is_gfx906);
         let gemv_prefetch = flags.gemv_prefetch.unwrap_or(is_gfx906);
+        // gfx1033-1036 keep R=2: R=1 was tuned for gfx1030/1031's RDNA2 GEMV variants,
+        // and gfx1036 runs the baseline narrow kernel 1.7-2.0x slower at R=1 (HIPF-370).
         let gemv_rows_default = flags.gemv_rows.unwrap_or_else(|| {
-            if is_wave64_native || is_rdna2 || is_rdna3_dgpu {
+            if is_wave64_native
+                || (is_rdna2 && !matches!(arch, "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036"))
+                || is_rdna3_dgpu
+            {
                 1
             } else {
                 2
@@ -747,7 +762,8 @@ mod tests {
     fn dot2_coverage() {
         for arch in &[
             "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
-            "gfx1030", "gfx1031", "gfx1032", "gfx1011", "gfx1012",
+            "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx1011",
+            "gfx1012",
         ] {
             assert!(
                 make_caps(arch).has_dot2_f32_f16(),
@@ -766,13 +782,33 @@ mod tests {
                 "hfq4 mmq missing for {arch}"
             );
         }
+        // gfx1033-1036 default off: validated only with sclk pinned on one unit (HIPF-368).
         for arch in &[
-            "gfx906", "gfx1010", "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151",
-            "gfx1152", "gfx1200", "gfx1201",
+            "gfx906", "gfx1010", "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx1100", "gfx1101",
+            "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
         ] {
             assert!(
                 !make_caps(arch).has_hfq4_mmq(),
                 "hfq4 mmq should not compile on {arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn hfq3_mmq_on_gfx103x_dgpu_off_on_new_rdna2() {
+        for arch in &["gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032"] {
+            assert!(
+                make_caps(arch).has_hfq3_mmq(),
+                "hfq3 mmq missing for {arch}"
+            );
+        }
+        // HIPF-384 on gfx1033-1036; gfx1010/gfx1151 lack sdot4.
+        for arch in &[
+            "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx1010", "gfx1151",
+        ] {
+            assert!(
+                !make_caps(arch).has_hfq3_mmq(),
+                "hfq3 mmq must stay off on {arch}"
             );
         }
     }
@@ -915,7 +951,7 @@ mod tests {
         }
         for arch in &[
             "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
-            "gfx940", "gfx941", "gfx942", "",
+            "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx940", "gfx941", "gfx942", "",
         ] {
             assert!(!make_caps(arch).has_iu4_wmma(), "{arch:?}");
         }

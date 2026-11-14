@@ -2061,7 +2061,17 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let mq3_gfx10_scalar = matches!(dt, DType::MQ3G256)
         && matches!(
             arch,
-            "gfx1010" | "gfx1011" | "gfx1012" | "gfx1013" | "gfx1030" | "gfx1031" | "gfx1032"
+            "gfx1010"
+                | "gfx1011"
+                | "gfx1012"
+                | "gfx1013"
+                | "gfx1030"
+                | "gfx1031"
+                | "gfx1032"
+                | "gfx1033"
+                | "gfx1034"
+                | "gfx1035"
+                | "gfx1036"
         );
     // MQ-V2 family (`MQ4G256V2` + neutral `MQ6/5/3/2G256V2`, qt44/qt47-50)
     // plus `MQ4CG256` (qt45): REFUSED on every arch. `forward_prefill_chunk`
@@ -8338,7 +8348,8 @@ mod tests {
             );
         }
         for arch in [
-            "gfx1010", "gfx1011", "gfx1012", "gfx1013", "gfx1030", "gfx1031", "gfx1032",
+            "gfx1010", "gfx1011", "gfx1012", "gfx1013", "gfx1030", "gfx1031", "gfx1032", "gfx1033",
+            "gfx1034", "gfx1035", "gfx1036",
         ] {
             assert!(
                 is_batchable_la(DType::MQ3G256, arch),
