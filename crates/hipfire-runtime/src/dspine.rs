@@ -499,43 +499,62 @@ impl DspineBridge {
                 .as_deref()
                 == Ok("1")
             {
-                // Route-2 pilot: capture the trunk's REAL packed projections
-                // (all block rows) plus the serial picks and the post-write
-                // argmax, so the offline analysis can measure the codebook
-                // approximation residual per predecessor word.
-                let packed_real = gpu.download_f32_stream_ordered(&self.s_packed)?;
-                let cand_raw = gpu.download_f32_stream_ordered(&cand)?;
-                let picks_u: Vec<u32> = raw.iter().map(|f| f.to_bits()).collect();
-                let argmax_u: Vec<u32> = cand_raw
-                    .chunks_exact(16)
-                    .map(|c| c[0].to_bits())
-                    .collect();
-                let packed_u: Vec<u32> = packed_real.iter().map(|f| f.to_bits()).collect();
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/dspine_capture/packed.bin")
-                {
-                    use std::io::Write as _;
-                    let _ = f.write_all(&{
-                        let mut b = Vec::with_capacity(packed_u.len() * 4);
-                        for v in &packed_u {
-                            b.extend_from_slice(&v.to_le_bytes());
+                // Full-input snapshot for offline oracle replay: every
+                // serial_chain input downloaded with checked results, one
+                // directory per window. The offline python oracle replays
+                // the chain and compares picks bit-for-bit.
+                static CAP_SEQ: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let seq = CAP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let dir = format!("/tmp/dspine_capture/win_{:05}", seq);
+                let _ = std::fs::create_dir_all(&dir);
+                let dl = |t: &GpuTensor, name: &str| -> Option<Vec<f32>> {
+                    match gpu.download_f32(t) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            eprintln!("[dspine-capture] {} download failed: {}", name, e);
+                            None
                         }
-                        b
+                    }
+                };
+                let cand_d = dl(&cand, "cand");
+                let base_d = dl(&base, "base");
+                let out_d = dl(&out, "out");
+                let rms_d = dl(&rms_rows, "rms_rows");
+                let packed_d = dl(&packed_rows, "packed_rows");
+                let gb_d = dl(&self.gate_bias, "gate_bias");
+                let anchor_d = dl(&self.s_anchor, "anchor");
+                let mut snap = |name: &str, v: &Option<Vec<f32>>| {
+                    if let Some(v) = v {
+                        if let Ok(mut f) = std::fs::File::create(format!("{}/{}.bin", dir, name)) {
+                            use std::io::Write as _;
+                            let _ = f.write_all(unsafe {
+                                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4)
+                            });
+                        }
+                    }
+                };
+                snap("cand", &cand_d);
+                snap("base", &base_d);
+                snap("out", &out_d);
+                snap("rms", &rms_d);
+                snap("packed", &packed_d);
+                snap("gate_bias", &gb_d);
+                snap("anchor", &anchor_d);
+                if let (Some(c), Some(o), Some(a)) = (&cand_d, &out_d, &anchor_d) {
+                    let meta = serde_json::json!({
+                        "rows": rows,
+                        "vocab": self.cfg.trunk.vocab_size,
+                        "r": self.r,
+                        "t": self.t,
+                        "anchor_sid": a[0].to_bits(),
+                        "picks": o.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+                        "argmax": c.chunks_exact(16).map(|c| c[0].to_bits()).collect::<Vec<u32>>(),
                     });
-                }
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/dspine_capture/meta.jsonl")
-                {
-                    use std::io::Write as _;
-                    let _ = writeln!(
-                        f,
-                        "{{\"rows\":{},\"picks\":{:?},\"argmax\":{:?}}}",
-                        rows, picks_u, argmax_u
-                    );
+                    if let Ok(mut f) = std::fs::File::create(format!("{}/meta.json", dir)) {
+                        use std::io::Write as _;
+                        let _ = f.write_all(meta.to_string().as_bytes());
+                    }
                 }
             }
             let picks: Vec<u32> = raw.iter().map(|f| f.to_bits()).collect();
