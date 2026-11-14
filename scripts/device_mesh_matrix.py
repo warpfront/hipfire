@@ -4,6 +4,7 @@ scripts/device-mesh/matrix.json. Existing harnesses/tests plus thin
 daemon-JSONL drivers for G1/G2 rows. Predicates parse structured output."""
 import argparse
 import collections
+import glob
 import hashlib
 import json
 import os
@@ -103,6 +104,41 @@ def isolated_env(env_extra):
     env.setdefault("HIPFIRE_HOME", os.path.join(env.get("MATRIX_ISOLATED_HOME", "/tmp/device-mesh-matrix-home"), ".hipfire"))
     os.makedirs(env["HIPFIRE_HOME"], exist_ok=True)
     return env
+
+def live_pid(pid):
+    try:
+        os.kill(pid, 0)
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+def reservation_holders(out):
+    """PIDs named by daemon-*.pid files (written by gpu_lock.rs) under the run's
+    --home dirs and the isolated home that are still alive."""
+    pats = [os.path.join(out, "**", ".hipfire", "daemon-*.pid"),
+            os.path.join(isolated_env(None)["HIPFIRE_HOME"], "daemon-*.pid")]
+    holders = {}
+    for pat in pats:
+        for path in glob.glob(pat, recursive=True):
+            try:
+                pid = int(open(path).read().split()[0])
+            except (OSError, ValueError, IndexError):
+                continue
+            if pid != os.getpid() and live_pid(pid):
+                holders[pid] = path
+    return holders
+
+def wait_reservations_released(out, limit=120):
+    """A row's serve daemon may outlive its harness for a moment and still holds
+    the GPU reservation. Block until it is gone so row order cannot matter
+    (HIPF-391). Returns the holders still alive after `limit` seconds."""
+    deadline = time.time() + limit
+    holders = reservation_holders(out)
+    while holders and time.time() < deadline:
+        time.sleep(0.25)
+        holders = reservation_holders(out)
+    return holders
 
 def run_cmd(argv, env_extra, timeout):
     env = isolated_env(env_extra)
@@ -816,6 +852,14 @@ def self_test():
     check("cargo-fail", not eval_cargo(SAMPLE_CARGO_FAIL, 1)[0])
     check("cargo-no-summary", not eval_cargo("nothing here", 1)[0])
     check("cargo-not-bare-ok", parse_cargo("all ok folks")["passed"] == 0)
+    with tempfile.TemporaryDirectory() as td:
+        hd = os.path.join(td, "home-x", ".hipfire")
+        os.makedirs(hd)
+        sleeper = subprocess.Popen(["sleep", "30"])
+        open(os.path.join(hd, "daemon-GPU-a.pid"), "w").write("%d\n" % sleeper.pid)
+        check("reservation-holder-seen", sleeper.pid in reservation_holders(td))
+        sleeper.kill(); sleeper.wait()
+        check("reservation-released-after-exit", not wait_reservations_released(td, 5))
     check("cmd-timeout-kills-tree", run_cmd(["sh", "-c", "sleep 30 & wait"], None, 1)["rc"] == 124)
     # A daemon that logs >64 KiB to stderr before answering must not stall.
     chatty = os.path.join(isolated_env(None)["HIPFIRE_HOME"], "chatty-daemon.sh")
@@ -1083,6 +1127,9 @@ def main(argv=None):
         except Exception as exc:  # never abort the matrix on one row
             disposition, note, detail = "failed", "runner exception: %s" % exc, {}
         elapsed = round(time.time() - start, 1)
+        stuck = wait_reservations_released(out)
+        if stuck:
+            print("warning: %s: daemon(s) %s still hold a GPU reservation after 120s" % (row["id"], sorted(stuck)))
         path = make_receipt(ctx, row, out, disposition, note, detail, elapsed)
         summary["rows"].append({"id": row["id"], "milestone": row["milestone"], "disposition": disposition,
                                 "note": note, "elapsed_s": elapsed, "receipt": path})
