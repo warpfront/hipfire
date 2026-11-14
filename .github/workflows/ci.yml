@@ -159,10 +159,13 @@ jobs:
           - name: rdna-compute-abi
             # dflash_accept_emu compares the builder device-accept kernel with
             # the rdna-compute host twin on the CPU interpreter;
-            # all_launcher_abi is the MoE launcher ABI gate.
+            # all_launcher_abi is the MoE launcher ABI gate;
+            # kernel_registry_coverage is the static kernel-pack completeness
+            # gate (every runtime HIP module registered or allowlisted).
             run: |
               cargo test --profile ci --locked -p rdna-compute --test dflash_accept_emu
               cargo test --profile ci --locked -p rdna-compute --test all_launcher_abi
+              cargo test --profile ci --locked -p rdna-compute --test kernel_registry_coverage
           - name: int-e
             run: cargo test --profile ci --locked $INTEG_PKGS --test '[e]*'
           - name: int-l

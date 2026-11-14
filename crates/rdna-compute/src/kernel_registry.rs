@@ -319,6 +319,25 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gated_delta_net_q8_independent_masked",
         ]
     );
+    // Q8 DeltaNet recurrence of the default (Q8 state) Qwen3.5/3.6 route: the
+    // fast kernel (`Gpu::gated_delta_net_q8`, no per-token requant) and its
+    // stream twin (`gdn_seq_check_plan`, the Sequential canonical-prefill
+    // plan every Q8 layer resolves to outside the Scan64 admission: 9B
+    // dense, A3B/MoE off gfx1201, gfx9). Neither launcher has an arch gate,
+    // and since #1136 the source compiles for wave64 targets too.
+    add!(
+        "gated_delta_net_q8_fast",
+        kernels::GATED_DELTA_NET_Q8_FAST_SRC,
+        [
+            "gated_delta_net_q8_fast",
+            "gated_delta_net_q8_fast_independent_masked",
+        ]
+    );
+    add!(
+        "gated_delta_net_q8_fast_stream",
+        kernels::GATED_DELTA_NET_Q8_FAST_STREAM_SRC,
+        ["gated_delta_net_q8_fast_stream"]
+    );
     // DFlash verify tape capture (`Gpu::tape_copy_batched`, tape_copy.rs): the
     // kernel source has no arch guard and the launcher no arch gate
     // (HIPFIRE_VERIFY_TAPE_COPY_BATCH defaults on), so every inventory carries
@@ -814,14 +833,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "fused_silu_mul_mq_rotate_awq",
             kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC,
             ["fused_silu_mul_mq_rotate_awq"]
-        );
-        add!(
-            "gated_delta_net_q8_fast",
-            kernels::GATED_DELTA_NET_Q8_FAST_SRC,
-            [
-                "gated_delta_net_q8_fast",
-                "gated_delta_net_q8_fast_independent_masked",
-            ]
         );
         add!(
             "gdn_pre_batched_gfx1201",
@@ -1357,14 +1368,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "fused_silu_mul_mq_rotate_awq_i4_hin",
             kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_SRC,
             ["fused_silu_mul_mq_rotate_awq_i4_hin"]
-        );
-        add!(
-            "gated_delta_net_q8_fast",
-            kernels::GATED_DELTA_NET_Q8_FAST_SRC,
-            [
-                "gated_delta_net_q8_fast",
-                "gated_delta_net_q8_fast_independent_masked"
-            ]
         );
         add!(
             "gdn_chunk_prep_gfx11",
@@ -3799,6 +3802,54 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             crate::tensor_ops::QSA_LANES_FUSE_SRC.into(),
             extra_flags,
         ));
+        // Flash-Next default route on exact gfx1201, loaded after ready on a cold
+        // kernel cache (one-shot `hipfire run`, R9700, 2026-11-14): the lane WMMA
+        // GEMMs (`lane_wmma.rs`, HIPFIRE_QWEN4_LANE_WMMA default on) and their
+        // tuned prefill tiles (`lane_wmma_tile.rs`, HIPFIRE_QWEN4_PREFILL_LWMMA_TILE
+        // default on) of 16..511-row prefill/verify, and the MQ6 symmetric-grid
+        // check the A8 trunk runs at load (`Gpu::qwen4_mq6_sym_check`).
+        entries.push(entry(
+            arch,
+            "qwen4_lane_wmma",
+            &QWEN4_LANE_WMMA_SYMBOLS,
+            crate::lane_wmma::LANE_WMMA_SRC.into(),
+            extra_flags,
+        ));
+        add!(
+            "qwen4_lwmma_tile",
+            crate::lane_wmma_tile::LANE_WMMA_TILE_SRC,
+            [
+                "lwmma_tile_bf16_t1_b32x32w2x1g4",
+                "lwmma_tile_bf16_t1_b32x64w2x2",
+                "lwmma_tile_bf16_t1_b64x64w4x1",
+                "lwmma_tile_bf16_t2_b16x32w1x1g4",
+                "lwmma_tile_bf16_t2_b32x64w2x2",
+                "lwmma_tile_bf16_t2_b64x64w4x1",
+                "lwmma_tile_bf16_t2_b64x64w4x2",
+                "lwmma_tile_bf16_t2_b32x128w2x2",
+                "lwmma_tile_bf16_t2_b64x128w4x2",
+                "lwmma_tile_bf16_t2_b64x128w2x4",
+            ]
+        );
+        add!(
+            "qwen4_mq6_sym_check_gfx1201",
+            crate::kernels::QWEN4_MQ6_SYM_CHECK_GFX1201_SRC,
+            ["qwen4_mq6_sym_check_gfx1201"]
+        );
+        // Flash-Next wide-pass gate/up (`moe32_gu_applies`, HIPFIRE_QWEN4_MOE32_GU
+        // default on, exact gfx1201, 9..=verify-window rows of the 1280 x 2560
+        // expert projection; gemm.rs:51078).
+        add!(
+            "gemm_mq4g256v2_moe_grouped_top10_g32",
+            kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+            [
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r8",
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r4",
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r4_pair",
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r8_nodz",
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r4_nodz",
+            ]
+        );
         // Default >= 512-row prefill: BF16 -> F16 WMMA projections (HC
         // input_mix_down 160 x 80 split-K tile + reducer, router/shared 128 x
         // 128, wider projections 128 x 256), the HC read-up tile, and the
@@ -6438,6 +6489,35 @@ static QSA_LANES_FUSE_SYMBOLS: std::sync::LazyLock<Vec<&'static str>> =
             ])
             .collect()
     });
+
+/// `qwen4_lane_wmma` exports (`kernels/src/qwen4_lane_wmma.gfx1201.hip` generator
+/// macros): `lwmma_gemm_<w>_t<T>_m<M>_n<N>`, `lwmma_gemm_bf16_t2_m<M>_n1_multi` and
+/// `lwmma_read_up_<w>_t<T>_g<G>`.
+static QWEN4_LANE_WMMA_NAMES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    let mut names = Vec::new();
+    for w in ["bf16", "w8"] {
+        for t in 1..=3 {
+            for m in 1..=4 {
+                for n in 1..=2 {
+                    names.push(format!("lwmma_gemm_{w}_t{t}_m{m}_n{n}"));
+                }
+            }
+        }
+    }
+    for m in 1..=4 {
+        names.push(format!("lwmma_gemm_bf16_t2_m{m}_n1_multi"));
+    }
+    for w in ["bf16", "w8"] {
+        for t in 1..=3 {
+            for g in [1, 2, 4] {
+                names.push(format!("lwmma_read_up_{w}_t{t}_g{g}"));
+            }
+        }
+    }
+    names
+});
+static QWEN4_LANE_WMMA_SYMBOLS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| QWEN4_LANE_WMMA_NAMES.iter().map(String::as_str).collect());
 
 /// JIT modules that the admitted default Redline programs load
 /// (`hipfire-runtime` `retained_redline_default`: the MQ4R SKU on gfx1100/gfx1151/
@@ -12110,6 +12190,29 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Default-route modules a cold empty-cache run JIT-compiled after the pack:
+        // the canonical-GDN Sequential stream executor (9B, A3B) and the gfx1201
+        // Flash-Next lane WMMA, prefill tile, MQ6 symmetric check and wide-pass
+        // gate/up modules.
+        const PACK_FIX_ADDED_MODULES: [&str; 5] = [
+            "gated_delta_net_q8_fast_stream",
+            "qwen4_lane_wmma",
+            "qwen4_lwmma_tile",
+            "qwen4_mq6_sym_check_gfx1201",
+            "gemm_mq4g256v2_moe_grouped_top10_g32",
+        ];
+        for module in PACK_FIX_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing pack-fix module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -12156,7 +12259,8 @@ mod tests {
                 + LANE_LEVIATHAN_ADDED_MODULES.len()
                 + ARGMAX_PAIR_MERGE_ADDED_MODULES.len()
                 + TRUNK_REDUCTION_PARTITION_ADDED_MODULES.len()
-                + TOPK8_ROWS_ADDED_MODULES.len(),
+                + TOPK8_ROWS_ADDED_MODULES.len()
+                + PACK_FIX_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
@@ -13776,6 +13880,17 @@ mod tests {
                 exp.push_str(&body[last..]);
                 let exp = exp.split("##").map(str::trim).collect::<Vec<_>>().join("");
                 scan_kernels(&exp, defs, fdefs, out, depth + 1);
+            } else if let Some(body) = defs.get(word) {
+                // An object-like macro that lists generator invocations
+                // (`#define ENTRIES_T1 ENTRY(1, ...) ENTRY_G4(1, ...)`) expands
+                // where it is used, like a generator macro.
+                let generates = body.contains("__global__")
+                    || c_idents(body)
+                        .iter()
+                        .any(|&(a, b)| fdefs.contains_key(&body[a..b]));
+                if depth <= 4 && generates {
+                    scan_kernels(body, defs, fdefs, out, depth + 1);
+                }
             }
         }
     }

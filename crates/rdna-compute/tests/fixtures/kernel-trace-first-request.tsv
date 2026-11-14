@@ -76,3 +76,15 @@ gfx1151	indexed_attention_gathered_wmma	indexed_attention_kv_f16vb_q8
 # Hold frj-t-r9700-mq2-fix-01, R9700 (gfx1201), qwen3.8-flash-next-base.mq2-xts
 # (daemon 7f3ce867cc0d): Qwen4 BF16 storage-boundary round trip.
 gfx1201	bf16_round_trip	bf16_round_trip_f32
+# Cold one-shot `hipfire run` (default config, empty HIPFIRE_KERNEL_CACHE, installed pack)
+# of beta 58dd700316 on R9700 (gfx1201: qwen3.5-9b.mq4, qwen3.6-35b-a3b.mq4r) and 7900 XTX
+# (gfx1100: qwen3.5-9b.mq4, ornith-1.5-35b-a3b.mq4r), ~150- and 5909-token prompts: the
+# Sequential canonical GDN prefill stream executor hipcc-compiled after ready (27B mq4-xts:
+# Scan64, none). release-0.5.0/regress/pack-fix/cold-beta-gfx{1201,1100}/summary.tsv.
+gfx1201	gated_delta_net_q8_fast_stream	gated_delta_net_q8_fast_stream
+gfx1100	gated_delta_net_q8_fast_stream	gated_delta_net_q8_fast_stream
+# Same cold one-shot cells, Flash-Next (qwen3.8-flash-next-gptq3.mq4 on R9700, default NativeMtp
+# route, packfix build 0dca175a89): the gfx1201 lane WMMA prefill tile (after ready) and the
+# A8-trunk MQ6 symmetric-grid check (during load) hipcc-compiled. gfx1100 Flash-Next: none.
+gfx1201	qwen4_lwmma_tile	lwmma_tile_bf16_t2_b32x64w2x2
+gfx1201	qwen4_mq6_sym_check_gfx1201	qwen4_mq6_sym_check_gfx1201
