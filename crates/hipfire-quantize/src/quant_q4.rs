@@ -350,46 +350,6 @@ pub(crate) fn quantize_q8f16(f32_data: &[f32]) -> Vec<u8> {
     output
 }
 
-// ─── Q8_HFQ Quantization (Split-Metadata Row Layout) ─────────────────────────
-
-/// Quantize F32 weights to Q8_HFQ format (split-metadata, 128B-aligned rows).
-/// Row layout: [f16 scales × n_groups | int8 values × K | padding to 128B].
-/// Returns (data, row_stride). Same 1.0625 B/w as Q8_0 for K=2048/4096 (zero padding waste).
-pub(crate) fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, usize) {
-    let group_size = 32;
-    let n_groups = k / group_size;
-    let scales_bytes = n_groups * 2;
-    let raw_row = scales_bytes + k;
-    let row_stride = (raw_row + 127) & !127; // pad to 128-byte boundary
-
-    let mut output = vec![0u8; m * row_stride];
-
-    for row in 0..m {
-        let row_data = &f32_data[row * k..(row + 1) * k];
-        let row_out = &mut output[row * row_stride..(row + 1) * row_stride];
-
-        for g in 0..n_groups {
-            let start = g * group_size;
-            let group = &row_data[start..start + group_size];
-
-            let max_abs = group.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-            let scale = max_abs / 127.0;
-            let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-
-            // Write f16 scale into scale array
-            row_out[g * 2..g * 2 + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
-
-            // Write int8 values into value array (after all scales)
-            for i in 0..group_size {
-                let q = (group[i] * inv_scale).round().max(-128.0).min(127.0) as i8;
-                row_out[scales_bytes + start + i] = q as u8;
-            }
-        }
-    }
-
-    (output, row_stride)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -274,9 +274,9 @@ fn documented_formats_are_accepted() {
     let tmp = tempfile::tempdir().unwrap();
     let input = llama(&tmp.path().join("ck"));
     for format in [
-        "mq4", "mq4v2", "mq4v1", "mq4g256", "magnum", "mq4c", "mq6", "mq6v2", "mq5v2", "mq3v2",
-        "mq2v2", "hf4", "hfq4", "hfq4g256", "hf6", "hfq6", "hfq6g256", "q8", "q8f16", "q4f16",
-        "mq3", "hfp4", "mfp4", "mfp4e8", "f16", "bf16", "oracle",
+        "mq4", "mq4v2", "mq4v1", "mq4g256", "magnum", "mq6", "mq6v2", "mq5v2", "mq3v2", "hf4",
+        "hfq4", "hfq4g256", "hf6", "hfq6", "hfq6g256", "q8", "q8f16", "mq3", "mfp4e8", "f16",
+        "bf16", "oracle",
     ] {
         let out_path = tmp.path().join(format!("{format}.hfq"));
         let out = quantize(
@@ -291,6 +291,40 @@ fn documented_formats_are_accepted() {
             &[],
         );
         assert!(out.status.success(), "--format {format}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn removed_formats_are_refused_before_reading_input() {
+    // The full table is unit-tested in `removed_formats.rs`; this pins the
+    // binary wiring: exit 2, no output, the message names format and qt.
+    let tmp = tempfile::tempdir().unwrap();
+    let input = llama(&tmp.path().join("ck"));
+    for (format, qt, nearest) in [
+        ("mq4c", "45", "mq4"),
+        ("q4f16", "0", "hfq4"),
+        ("mfp2e8-gptq", "37", "mfp4e8-gptq"),
+    ] {
+        let out_path = tmp.path().join("o.hfq");
+        let out = quantize(
+            &[
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                out_path.to_str().unwrap(),
+                "--format",
+                format,
+            ],
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(2), "{format}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(
+            err.contains(&format!("--format {format} (qt {qt}) was removed in 0.5.0"))
+                && err.contains(&format!("use --format {nearest}")),
+            "{format}: {err}"
+        );
+        assert!(!out_path.exists());
     }
 }
 
@@ -404,16 +438,7 @@ fn ragged_k_is_never_packed_across_rows() {
             })
             .collect();
         safetensors::serialize_to_file(&views, None, &dir.join("model.safetensors")).unwrap();
-        for format in [
-            "hfq6",
-            "hfq2g128",
-            "hfq3",
-            "hfq3g256",
-            "mq3",
-            "mq6",
-            "q4f16",
-            "q4k-q8embed",
-        ] {
+        for format in ["hfq6", "mq3", "mq6", "q4k-q8embed"] {
             let out_path = tmp.path().join(format!("{format}.hfq"));
             let out = quantize(
                 &[

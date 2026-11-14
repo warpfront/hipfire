@@ -38,6 +38,7 @@ mod quant_q4;
 mod qwen4;
 mod raon;
 mod reap_overlay;
+mod removed_formats;
 mod trunk_overlay;
 
 fn main() {

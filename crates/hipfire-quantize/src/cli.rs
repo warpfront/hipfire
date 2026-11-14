@@ -315,11 +315,6 @@ pub(crate) struct QuantizeArgs {
     #[arg(long)]
     pub mq3v2_symmetric: bool,
 
-    /// Encode MQ2V2 with a per-128 symmetric grid while retaining the existing
-    /// affine header layout. The stored zero is `-2*d`, so code 2 maps to zero.
-    #[arg(long)]
-    pub mq2v2_symmetric: bool,
-
     /// Routed-expert down_proj codec override. `mq4g128v2-symmetric` encodes
     /// every routed-expert down_proj (stacked `experts.down_proj` slices and
     /// un-stacked `mlp.experts.N.down_proj`) as symmetric MQ4G128V2 (qt53,
@@ -401,10 +396,6 @@ pub(crate) struct QuantizeArgs {
           value_parser = ["full", "alternating", "alt", "typed", "typed-gemma4", "0", "1", "2", "3"])]
     pub kmap_mode: String,
 
-    /// Permit research-only uniform MQ2 output.
-    #[arg(long)]
-    pub allow_mq2: bool,
-
     /// Permit research-only MQ2-Lloyd output.
     #[arg(long)]
     pub allow_mq2_lloyd: bool,
@@ -412,10 +403,6 @@ pub(crate) struct QuantizeArgs {
     /// Permit research-only MQ3-Lloyd output.
     #[arg(long)]
     pub allow_mq3_lloyd: bool,
-
-    /// Permit research-only MQ4-Lloyd output.
-    #[arg(long)]
-    pub allow_mq4_lloyd: bool,
 
     /// Include vision tensors that are skipped by default.
     #[arg(long)]
@@ -601,7 +588,6 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("awq_a4_signed_capture", &[Main]),
     ("awq_a4_source_sha", &[Main]),
     ("mq3v2_symmetric", &[Main]),
-    ("mq2v2_symmetric", &[Main]),
     ("moe_expert_down", &[Main]),
     ("mq4v2_final_codes", &[FinalCodes]),
     ("mq3v2_final_codes", &[FinalCodes]),
@@ -612,10 +598,8 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("raon_shared_ffn_scope", &[RaonSharedFfn]),
     ("kmap_dense", &[Main]),
     ("kmap_mode", &[Main]),
-    ("allow_mq2", &[Main]),
     ("allow_mq2_lloyd", &[Main]),
     ("allow_mq3_lloyd", &[Main]),
-    ("allow_mq4_lloyd", &[Main]),
     ("include_vision", &[Main]),
     ("vision_quant", &[Main]),
     ("include_prefix", &[Main]),

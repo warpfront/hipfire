@@ -180,10 +180,10 @@ codebook, so their per-weight cost depends on K.
 | Type | qt | Bytes/group | Stored bpw | Truth state (INDEX) |
 |---|---|---|---:|---|
 | `MQ3G256` | 17 | 104 | 3.25 | **shipped / ref-pinned** encoder + decode/prefill paths; quality degrades below ~9B (historical local battery — see below) |
-| `MQ2G256` | 18 | 72 | 2.25 | **shipped / ref-pinned** encoder; reserved product use — uniform 4-level codebook collapses; needs `--allow-mq2` / `HIPFIRE_ALLOW_MQ2=1` (research opt-in qualifier) |
+| `MQ2G256` | 18 | 72 | 2.25 | loads; quantizer no longer writes it (`--format mq2` removed in 0.5.0 — uniform 4-level codebook collapses) |
 | `MQ2G256Lloyd` | 19 | 72 | 2.25 | **shipped / ref-pinned** implementation; research opt-in (`--allow-mq2-lloyd`) — not a product default |
 | `MQ3G256Lloyd` | 20 | 112 | 3.5 | **shipped / ref-pinned** implementation; research opt-in (`--allow-mq3-lloyd`) — not a product default |
-| `MQ4G256Lloyd` | 30 | 160 | 5.0 | **shipped / ref-pinned** implementation; research opt-in (`--allow-mq4-lloyd`) — qt renumbered 21→30; pre-renumber artifacts must be re-quantized |
+| `MQ4G256Lloyd` | 30 | 160 | 5.0 | loads; quantizer no longer writes it (`--format mq4-lloyd` / `deepseek4-mq4lloyd` removed in 0.5.0) — qt renumbered 21→30 |
 | `MQ5G256` | 31 | 168 | 5.25 | **shipped / ref-pinned** encoder present (5-bit FWHT) |
 | `MQ2G256GL` / `MQ3G256GL` | 38 / 39 | 66 / 98 (GL SoA: indices + fp16 scale) | 2.0625 / 3.0625 | **shipped / ref-pinned** Magnum GL passthrough; one tensor-global codebook, not counted here |
 | `MQ2G256LloydU` | 51 | 72 | 2.25 | passthrough; Maple native-ternary: byte layout of qt 19 but **unrotated** (no FWHT at pack time, so the runtime must not rotate `x` for it) |

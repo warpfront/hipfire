@@ -63,51 +63,6 @@ pub(crate) fn quantize_mq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 
     output
 }
-
-/// MagnumQuant MQ2-G256: FWHT-rotated 2-bit quantization.
-/// Same binary format as HFQ2-G256 (72 bytes/group). Rotation is baked into
-/// the weights via cpu_fwht_256; the GEMV kernel rotates x instead.
-pub(crate) fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
-    let group_size = 256;
-    let block_bytes = 72;
-    let n = f32_data.len();
-    let n_blocks = (n + group_size - 1) / group_size;
-    let mut output = vec![0u8; n_blocks * block_bytes];
-
-    for b in 0..n_blocks {
-        let start = b * group_size;
-        let end = (start + group_size).min(n);
-
-        let mut group = [0.0f32; 256];
-        let actual_len = end - start;
-        group[..actual_len].copy_from_slice(&f32_data[start..end]);
-
-        cpu_fwht_256(&mut group, signs1, signs2);
-
-        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-        let range = max_val - min_val;
-        let scale = if range > 0.0 { range / 3.0 } else { 1.0 };
-        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
-
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
-        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
-
-        // Pack 256 weights into 64 bytes (4 per byte at 2-bit).
-        for i in 0..64 {
-            let mut byte_val = 0u8;
-            for j in 0..4 {
-                let q = ((group[4 * i + j] - min_val) * inv_scale + 0.5) as u8;
-                byte_val |= q.min(3) << (j * 2);
-            }
-            output[out_off + 8 + i] = byte_val;
-        }
-    }
-
-    output
-}
 pub(crate) const MQ3V2_GROUP_BYTES: usize = 104;
 pub(crate) const MQ2V2_GROUP_BYTES: usize = 72;
 /// MQ3G256V2 encoder — per-128 asymmetric fp16 header, neutral-size.
@@ -1889,72 +1844,6 @@ pub(crate) fn quantize_mq3g256gl(
     out
 }
 
-/// Quantize F32 weights to HFQ3-G256: 3-bit with 256-weight groups.
-/// Block: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights (0.406 B/w).
-/// Packing: 8 weights × 3 bits = 24 bits = 3 bytes per thread-group.
-/// Little-endian bitstream within each 3-byte chunk.
-pub(crate) fn quantize_hfq3g256(f32_data: &[f32]) -> Vec<u8> {
-    let group_size = 256;
-    let block_bytes = 104; // 8 metadata + 96 packed 3-bit
-    let n = f32_data.len();
-    let n_blocks = (n + group_size - 1) / group_size;
-    let mut output = vec![0u8; n_blocks * block_bytes];
-
-    for b in 0..n_blocks {
-        let start = b * group_size;
-        let end = (start + group_size).min(n);
-        let group = &f32_data[start..end];
-
-        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-        let range = max_val - min_val;
-        let scale = if range > 0.0 { range / 7.0 } else { 1.0 }; // 3-bit: 8 levels (0-7)
-        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
-
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
-        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
-
-        let actual_len = end - start;
-        // Pack 256 weights as 32 chunks of 8 weights × 3 bits = 3 bytes each = 96 bytes
-        // Matches the GEMV kernel's unpack: tid * 3 byte offset, 8 weights per thread.
-        for chunk in 0..32 {
-            let ci = chunk * 8; // index into group
-            let mut q = [0u8; 8];
-            for j in 0..8 {
-                let idx = ci + j;
-                let val = if idx < actual_len {
-                    group[idx]
-                } else {
-                    min_val
-                };
-                q[j] = ((val - min_val) * inv_scale + 0.5).clamp(0.0, 7.0) as u8;
-            }
-            // Pack 8 × 3-bit into 3 bytes (little-endian bitstream)
-            // Matches kernel unpack:
-            //   q0 = b0 & 7
-            //   q1 = (b0 >> 3) & 7
-            //   q2 = ((b0 >> 6) | (b1 << 2)) & 7
-            //   q3 = (b1 >> 1) & 7
-            //   q4 = (b1 >> 4) & 7
-            //   q5 = ((b1 >> 7) | (b2 << 1)) & 7
-            //   q6 = (b2 >> 2) & 7
-            //   q7 = (b2 >> 5) & 7
-            let b0 = (q[0] & 7) | ((q[1] & 7) << 3) | ((q[2] & 3) << 6);
-            let b1 = ((q[2] >> 2) & 1) | ((q[3] & 7) << 1) | ((q[4] & 7) << 4) | ((q[5] & 1) << 7);
-            let b2 = ((q[5] >> 1) & 3) | ((q[6] & 7) << 2) | ((q[7] & 7) << 5);
-
-            let bo = out_off + 8 + chunk * 3;
-            output[bo] = b0;
-            output[bo + 1] = b1;
-            output[bo + 2] = b2;
-        }
-    }
-
-    output
-}
-
 /// Quantize F32 weights to HFQ3-G128: 3-bit with 128-weight groups (finer granularity).
 /// Block: [f32 scale][f32 zero][48B packed 3-bit] = 56 bytes per 128 weights (0.4375 B/w).
 pub(crate) fn quantize_hfq3g128(f32_data: &[f32]) -> Vec<u8> {
@@ -2002,52 +1891,6 @@ pub(crate) fn quantize_hfq3g128(f32_data: &[f32]) -> Vec<u8> {
             output[bo] = b0;
             output[bo + 1] = b1;
             output[bo + 2] = b2;
-        }
-    }
-
-    output
-}
-
-/// Quantize F32 weights to HFQ2-G256: 2-bit with 256-weight groups.
-/// Block: [f32 scale][f32 zero][64B packed 2-bit] = 72 bytes per 256 weights (0.281 B/w).
-pub(crate) fn quantize_hfq2g256(f32_data: &[f32]) -> Vec<u8> {
-    let group_size = 256;
-    let block_bytes = 72; // 8 metadata + 64 packed
-    let n = f32_data.len();
-    let n_blocks = (n + group_size - 1) / group_size;
-    let mut output = vec![0u8; n_blocks * block_bytes];
-
-    for b in 0..n_blocks {
-        let start = b * group_size;
-        let end = (start + group_size).min(n);
-        let group = &f32_data[start..end];
-
-        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-        let range = max_val - min_val;
-        let scale = if range > 0.0 { range / 3.0 } else { 1.0 }; // 2-bit: 4 levels (0-3)
-        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
-
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
-        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
-
-        let actual_len = end - start;
-        // Pack 256 weights into 64 bytes (4 per byte at 2-bit)
-        for i in 0..64 {
-            let mut byte_val = 0u8;
-            for j in 0..4 {
-                let idx = 4 * i + j;
-                let val = if idx < actual_len {
-                    group[idx]
-                } else {
-                    min_val
-                };
-                let q = ((val - min_val) * inv_scale + 0.5) as u8;
-                byte_val |= q.min(3) << (j * 2);
-            }
-            output[out_off + 8 + i] = byte_val;
         }
     }
 

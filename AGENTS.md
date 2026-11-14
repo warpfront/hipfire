@@ -175,9 +175,9 @@ works, what to measure, what counts as pass/fail.
   `.mq4-xts` tier) is refused at load there (#1136); other model families
   are not gated at load for this. MoE/A3B + MQ3 is refused at load time
   (no MoE-branched WMMA path).
-- **MQ2 is refused by default.** The quantizer requires
-  `--format mq2 --allow-mq2` (or `HIPFIRE_ALLOW_MQ2=1`) to opt in. Severe quality
-  cliff confirmed; Lloyd-Max MQ2/MQ3 (qt=19/20) is the path forward.
+- **Uniform MQ2 was removed in 0.5.0.** The quantizer refuses `--format mq2`
+  (severe quality cliff, no published artifact); Lloyd-Max MQ2/MQ3 (qt=19/20)
+  is the path forward.
 - **`dflash_mode=off` is the schema default.** Any test exercising DFlash
   on a model without a registry DFlash policy still needs
   `hipfire config set dflash_mode auto` or

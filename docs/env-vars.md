@@ -1266,10 +1266,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ALLOW_BF16_QUANTIZED_TARGET` | crates/hipfire-arch-qwen4/src/artifact.rs | developer |
 | `HIPFIRE_ALLOW_FMT` | scripts/no-cargo-fmt-guard.py, scripts/test-no-cargo-fmt-guard.py | harness |
 | `HIPFIRE_ALLOW_MIXED_ARCH` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
-| `HIPFIRE_ALLOW_MQ2` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_ALLOW_MQ2_LLOYD` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_ALLOW_MQ3_LLOYD` | crates/hipfire-quantize/src/pipeline.rs | developer |
-| `HIPFIRE_ALLOW_MQ4_LLOYD` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_ALLOW_UNIT_IMATRIX` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_API_KEY` | scripts/lmx_continuous_batch.py | harness |
 | `HIPFIRE_ARCH` | scripts/kernel-tune-loop.sh | harness |

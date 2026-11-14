@@ -21,14 +21,13 @@ HFP4 family detail: [quant-formats/hfp4.md](quant-formats/hfp4.md).
 |---|---|---|---|---|
 | **`mq4`** *(alias)* / `mq4v2` | **qt 44 `MQ4G256V2`** | 4 | FWHT | Qwen 3.5+ default body. **`--format mq4` means V2, not qt 13.** |
 | `mq4v1` / `mq4g256` / `magnum` | qt 13 `MQ4G256` | 4 | FWHT | Legacy Magnum v1 only (explicit opt-in) |
-| `mq4c` | qt 45 `MQ4CG256` | 4 | FWHT | V1.5 pad geometry; `hipfire-quantize` direct |
 | `mq6` | qt 15 `MQ6G256` | 6 | FWHT | Qwen 3.5+ v1 when you can spare size for quality |
-| `mq{6,5,3,2}v2` | qt 47/48/49/50 | 6…2 | FWHT | Dense Magnum V2 ladder bodies — **`hipfire-quantize` direct** |
+| `mq{6,5,3}v2` | qt 47/48/49 | 6…3 | FWHT | Dense Magnum V2 ladder bodies — **`hipfire-quantize` direct** |
 | `hf4` (`hfq4`, `hfq4g256`) | qt 6 | 4 | none | Dense Llama / Mistral / Gemma / older Qwen. |
 | `hf6` (`hfq6`, `hfq6g256`) | qt 8 | 6 | none | Dense, higher quality |
 | `q8` / `q8f16` | qt 3 | 8 | none | Reference / debug (safetensors path) |
 | `mq3` | qt 17 | 3 | FWHT | Sub-4-bit v1 — **`hipfire-quantize` direct only** (thin CLI rejects it) |
-| `hfp4` / `mfp4` / E8 / Lloyd | varies | see docs | Advanced; usually via `hipfire-quantize` directly |
+| `hfp4` / `mfp4e8` / `mfp4e8soa` / Lloyd (`mq4l` = qt 52) | varies | see docs | Advanced; `hipfire-quantize` directly |
 
 FWHT (the “M” in MQ) applies the two-sign rotation
 `R = D2 · H · D1 / 16` (seeds 42 / 1042) before quantization. Qwen 3.5+ kernels
@@ -40,7 +39,7 @@ quality benefit — prefer HFQ.
 `q8f16`, and `hf4`/`hf6` aliases. **Unchanged surface** — the wrapper does not
 grow V2/`mq3`/Lloyd/HFP flags. Because the binary maps `mq4` → qt 44, a thin
 CLI `hipfire quantize … --format mq4` produces **MQ4G256V2**. Formats such as `mq3`,
-`mq{2,3,5,6}v2`, `mq4v1`, `mq4c`, HFP/MFP, Lloyd, and graded MoE need
+`mq{3,5,6}v2`, `mq4v1`, HFP4/MFP4-E8, Lloyd, and graded MoE need
 `hipfire-quantize` directly.
 
 **Not produced by the thin CLI path:** graded per-expert MoE recipes
@@ -49,19 +48,25 @@ ladders (`--tier` / `--fixed-tier`), and research formats. Those need extra
 flags on `hipfire-quantize` directly. See the binary’s `--help` and
 QUANTIZATION.md.
 
-**MQ2V2 product rejection:** `--format mq2v2` is wire-legal and runtime-loaded,
-but dense Qwen3.8 ladder KLD rejects it as a product body. Prefer `mq3v2` and
-above for any artifact you intend to serve; see
-[ladder.md](quant-formats/ladder.md).
+**Removed in 0.5.0:** the quantizer refuses every `--format` whose quant type
+no published artifact uses (registry and every `hipfire-models` Hugging Face
+file, checked by header), naming the format and the nearest supported one
+(e.g. `--format mq4c (qt 45) was removed in 0.5.0: no published artifact uses
+it; use --format mq4`). The refused spellings: `q4f16` (qt 0), `q8hfq` (5),
+`hfq3g256`/`hfq3g128`/`hfq3`/`hf3` (9/10), `hfq2g256`/`hfq2g128`/`hfq2`/`hf2`
+(11/12), `mq2`/`mq2g256` (18), `mfp4`/`mfp4g32`/`mf4p` (24),
+`mq4-lloyd`/`mq4g256-lloyd`/`mq4lloyd`/`deepseek4-mq4lloyd` (30),
+`mfp4l`/`mfp4-lloyd`/`mfp4g32-lloyd`/`mfp4lloyd` (32), `mfp4p`/`mfp4+p`/`mfp4-p`
+(33), `mfp3e8`/`mfp3-e8` and `-gptq` (36), `mfp2e8`/`mfp2-e8` and `-gptq` (37),
+`mq4c`/`mq4cg256`/`mq4g256c` (45), `mq2v2`/`mq2g256v2` (50). The loader and
+kernels are unchanged: every file loads exactly as before.
 
 Research / reserved formats require explicit opt-in on the binary:
 
 | Flag / env | Opens |
 |---|---|
-| `--allow-mq2` / `HIPFIRE_ALLOW_MQ2=1` | uniform `mq2` v1 (reserved — collapses) |
 | `--allow-mq2-lloyd` | `mq2-lloyd` |
 | `--allow-mq3-lloyd` | `mq3-lloyd` |
-| `--allow-mq4-lloyd` | `mq4-lloyd` |
 
 ### FLUX component packs (no quantization)
 
@@ -147,7 +152,7 @@ Full alias set and product-ladder controls. Common extras:
 | Flag | Role |
 |---|---|
 | `--input` / `--output` | Paths |
-| `--format` | Full set: `mq4`/`mq4v2` → qt44; `mq4v1`/`mq4g256`/`magnum` → qt13; `mq4c`; `mq{6,5,3,2}v2`; `mq3`; `hf4`/`hf6`; `hfp4`/`mfp4`/`mfp4e8`; Lloyd; `tq2`/`bq1`; … |
+| `--format` | Full set: `mq4`/`mq4v2` → qt44; `mq4v1`/`mq4g256`/`magnum` → qt13; `mq{6,5,3}v2`; `mq4l` (qt52); `mq3`/`mq5`/`mq6`; `hf4`/`hf6`; `hfp4`/`mfp4e8`/`mfp4e8soa`; `mq8`; Lloyd; … |
 | `--tier <xt\|base\|pro>` | Product rung (Qwen3.8 ladder): `xt` keeps lm_head at base codec; `base` lifts embed+lm_head; `pro` also lifts `ssm_out`. embed/conv1d stay Q8; structural tensors stay F16. See [ladder.md](quant-formats/ladder.md). |
 | `--fixed-tier <spec>` | Per-class codec overrides, e.g. `lm_head:mq6v2,ssm_out:mq6v2`. Classes: `lm_head,embed,router,attn,ssm_out` (plus `attn_full` where applicable). Dtypes: `q8,mq2v2,mq3v2,mq4v2,mq5v2,mq6v2` (+ limited legacy). Env: `HIPFIRE_FIXED_TIER`. |
 | `--imatrix <gguf>` | GGUF-format imatrix for activation-aware recipes |
@@ -161,13 +166,13 @@ Full alias set and product-ladder controls. Common extras:
 | `--arch-id` / `--force-arch-id` | Override written arch_id (qwen3* pillar guarded) |
 | `--threads` / `HIPFIRE_QUANT_THREADS` | CPU thread cap (default ~80% cores) |
 | `--include-vision` / `--vision-quant` | Vision tensors |
-| `--allow-mq2` / `--allow-mq*-lloyd` | Research gates (v1 mq2 / Lloyd) |
+| `--allow-mq*-lloyd` | Research gates (MQ2/MQ3 Lloyd) |
 | `--qwen4-flash-next` | Native Qwen4 / Qwen3.8-Flash-Next streaming producer; see [Qwen4 Flash-Next streaming producer](#qwen4-flash-next-streaming-producer). Reads no legacy recipe flag. |
 | `--qwen4-component-mode production\|compact-fixture` | Only with `--qwen4-flash-next`; default `production`. `compact-fixture` is a non-production bounded fixture mode. |
 | `ple-hot-rank` / `ple-hot-pack` / `trunk-overlay` | Standalone subcommands (first argument), not flags: PLE hot-row sidecars and the trunk overlay sidecar; see the sections below. |
 
-**Dense-only gate:** `mq{2,3,5,6}v2` refuse MoE `arch_id`s. Use legacy
-`mq{2,3,5,6}` or `mq4`/`mq4v2`/`mq4c` for MoE, or a dense checkpoint.
+**Dense-only gate:** `mq{3,5,6}v2` refuse MoE `arch_id`s. Use legacy
+`mq{3,5,6}` or `mq4`/`mq4v2` for MoE, or a dense checkpoint.
 
 **K-map Promote6 follows the MQ4 container family on audited loaders.** With
 `mq4`/`mq4v2` or V2 Lloyd MQ4 on the audited loader families (Llama
@@ -178,7 +183,7 @@ LFM2-MoE 11, Cohere2-MoE 12, Gemma4 13/22, Glimmer 14/23, and any other
 unaudited `arch_id`) keep their existing encoder routes: ordinary
 `mq4`/`mq4v2` and nonexpert V2 Lloyd Promote6 weights retain MQ6G256
 (qt15), but V2 Lloyd stacked experts remain unpromoted MQ4G256 (qt13).
-Legacy MQ4 and compact `mq4c` also keep MQ6G256 (qt15). Non-256-aligned weights still fall back to Q8. This does
+Legacy MQ4 also keeps MQ6G256 (qt15). Non-256-aligned weights still fall back to Q8. This does
 not rewrite existing artifacts or alter their loader routes.
 MQ6 V2 is not a layout-only conversion: its two fp16 affine grids per
 256-weight group differ from V1's single f32 grid. Both occupy 200 bytes;
@@ -189,8 +194,8 @@ Example — Qwen3.8 product ladder cell (base MQ4V2):
 ```bash
 hipfire-quantize --input ./qwen3.8-27b --output qwen3.8-27b.mq4v2.base.hfq \
   --format mq4v2 --tier base
-# mq2 pro style fixed-tier (illustrative; MQ2V2 is not a product body):
-#   --format mq2v2 --tier pro --fixed-tier lm_head:mq6v2,ssm_out:mq6v2
+# pro style fixed-tier:
+#   --format mq3v2 --tier pro --fixed-tier lm_head:mq6v2,ssm_out:mq6v2
 ```
 
 ### Multi-slot (`serve.multi_slot`) recipe admissibility
