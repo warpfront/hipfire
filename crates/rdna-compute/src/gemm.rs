@@ -22242,7 +22242,9 @@ impl Gpu {
         add: bool,
         shared_gate: Option<*mut c_void>,
     ) -> HipResult<()> {
-        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201") {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
+            && !(self.arch == "gfx1150" && self.flags.mq4v2_gfx1150_iu4)
+        {
             return Err(hip_bridge::HipError::new(
                 1,
                 &format!(
@@ -36004,7 +36006,7 @@ impl Gpu {
         }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && self.mq4v2_mmq_prefill_ok()
             && batch_size >= 64
         {
             if self.a8_prefill_active(batch_size, k) {
@@ -36019,7 +36021,7 @@ impl Gpu {
             }
             // The gfx11 IU4 base entry handles partial 128-row tiles, so odd
             // prefill batches stay on the W4A4 path without host padding.
-            if self.flags.iu4_prefill_enabled() {
+            if self.mq4v2_iu4_prefill_ok() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z, xq, y_z, z_m, k, batch_size)?;
@@ -37238,7 +37240,7 @@ impl Gpu {
         }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && self.mq4v2_mmq_prefill_ok()
             && batch_size >= 64
         {
             if self.a8_prefill_active(batch_size, k) {
@@ -37250,7 +37252,7 @@ impl Gpu {
             }
             // iu4-direct MMQ handles partial 128-row tiles; flag off keeps
             // the incumbent full-tile Q8_1 route and odd-batch fallback.
-            if self.flags.iu4_prefill_enabled() {
+            if self.mq4v2_iu4_prefill_ok() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_q, xq, y_q, q_m, k, batch_size)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_k, xq, y_k, k_m, k, batch_size)?;
@@ -38483,7 +38485,7 @@ impl Gpu {
         }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && self.mq4v2_mmq_prefill_ok()
             && batch_size >= 64
         {
             if self.a8_prefill_active(batch_size, k) {
@@ -38494,7 +38496,7 @@ impl Gpu {
             }
             // iu4-direct MMQ handles partial 128-row tiles; flag off keeps
             // the incumbent full-tile Q8_1 route and odd-batch fallback.
-            if self.flags.iu4_prefill_enabled() {
+            if self.mq4v2_iu4_prefill_ok() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(
                     a_gate, xq, y_gate, gate_m, k, batch_size,
@@ -40552,7 +40554,7 @@ impl Gpu {
         }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && self.mq4v2_mmq_prefill_ok()
             && batch_size >= 64
         {
             if self.a8_prefill_active(batch_size, k) {
@@ -40561,7 +40563,7 @@ impl Gpu {
             }
             // iu4-direct MMQ handles partial 128-row tiles; flag off keeps
             // the incumbent full-tile Q8_1 route and odd-batch fallback.
-            if self.flags.iu4_prefill_enabled() {
+            if self.mq4v2_iu4_prefill_ok() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)?;
                 return Ok(());
@@ -40723,6 +40725,21 @@ impl Gpu {
             projection,
             self.route_rows(batch_size),
         )
+    }
+
+    /// Whether this launch may enter the MQ4V2 (qt44) W4A4 MMQ prefill
+    /// block. gfx1100/gfx1151 are the certified incumbents; exact gfx1150
+    /// joins them behind `HIPFIRE_MQ4V2_GFX1150_IU4` (default on) and runs
+    /// the same generic gfx11 `*_mmq_iu4` kernels (the gfx1151-only
+    /// symfold/V2B/X5/LF16 variants stay closed by their own gates).
+    pub(crate) fn mq4v2_mmq_prefill_ok(&self) -> bool {
+        matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            || (self.arch == "gfx1150" && self.flags.mq4v2_gfx1150_iu4)
+    }
+
+    /// IU4 (W4A4) arm of the MQ4V2 MMQ prefill block.
+    pub(crate) fn mq4v2_iu4_prefill_ok(&self) -> bool {
+        self.flags.iu4_prefill_enabled() || (self.arch == "gfx1150" && self.flags.mq4v2_gfx1150_iu4)
     }
 
     /// Exact-gfx1151 small-batch 4-bit G256 WMMA route (`*_gfx1151_xlds`, MQ4V2 and
