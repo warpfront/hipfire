@@ -118,10 +118,9 @@ IGPU_ARCHS=(
     gfx902    # Raven Ridge / Picasso (Ryzen 2000G/3000G)
     gfx909    # Raven2 / Dali
     gfx90c    # Renoir / Lucienne / Cezanne / Barcelo (4xxx-5xxx APU)
-    gfx1013   # Van Gogh (Steam Deck) / BC-250
-    gfx1033   # Rembrandt (6xxx mobile)
-    gfx1034   # Rembrandt-R
-    gfx1035   # Rembrandt-R refresh
+    gfx1013   # Cyan Skillfish / BC-250
+    gfx1033   # Van Gogh (Steam Deck)
+    gfx1035   # Rembrandt (6xxx mobile)
     gfx1036   # Raphael desktop iGPU (AM5 7xxx)
     gfx1103   # Phoenix / Phoenix2 / Hawk Point
 )
@@ -138,11 +137,11 @@ arch_family() {
     case "$1" in
         gfx906|gfx908|gfx90a|gfx942)            echo "cdna" ;;
         gfx1010|gfx1011|gfx1012)                echo "rdna1" ;;
-        gfx1030|gfx1031|gfx1032)                echo "rdna2" ;;
+        gfx1030|gfx1031|gfx1032|gfx1034)        echo "rdna2" ;;
         gfx1100|gfx1101|gfx1102|gfx1150|gfx1151) echo "rdna3" ;;
         gfx1200|gfx1201)                        echo "rdna4" ;;
         gfx902|gfx909|gfx90c)                   echo "apu_gcn5" ;;
-        gfx1013|gfx1033|gfx1034|gfx1035|gfx1036|gfx1103) echo "apu_rdna" ;;
+        gfx1013|gfx1033|gfx1035|gfx1036|gfx1103) echo "apu_rdna" ;;
         *)                                       echo "unknown_$1" ;;
     esac
 }
