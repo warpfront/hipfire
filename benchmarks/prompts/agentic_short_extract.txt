@@ -1,0 +1,1 @@
+Read /tmp/quotes.txt and list the two shortest quotes. Reply as a JSON object with keys shortest and second_shortest, then give the character count of each.
