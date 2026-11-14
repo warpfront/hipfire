@@ -174,7 +174,6 @@ developer_callsite	*	HIPFIRE_DEEPSEEK4_POST_SCALE#developer_var=ok.and_then.unwr
 developer_callsite	*	HIPFIRE_DEEPSEEK4_PP_BATCH#developer_var=ok.and_then.unwrap_or(1024)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_REDLINE_HIP_BLOB#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DEEPSEEK4_ROUTE_SCALE#developer_var=ok.and_then
-developer_callsite	*	HIPFIRE_DEEPSEEK4_SEED#developer_var=ok.and_then.unwrap_or_else
 developer_callsite	*	HIPFIRE_DEEPSEEK4_SPEC_K#developer_var=ok.and_then.or.unwrap_or(2)
 developer_callsite	*	HIPFIRE_DEEPSEEK4_STAGE_LAYERS#developer_var=ok.map.filter.unwrap_or_else
 developer_callsite	*	HIPFIRE_DEEPSEEK4_STAGE_NORM#developer_var=ok.as_deref.==Some("1")

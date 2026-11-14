@@ -799,6 +799,7 @@ pub fn generate_deepseek4(
     temp: f32,
     top_p: f32,
     max_tokens: usize,
+    request_seed: u32,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
@@ -813,6 +814,7 @@ pub fn generate_deepseek4(
             temp,
             top_p,
             max_tokens,
+            request_seed,
             think_mode,
             tools,
             messages_history,
@@ -1195,16 +1197,8 @@ pub fn generate_deepseek4(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let seed: u64 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x9E3779B97F4A7C15)
-        });
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    // request_seed honours the wire `seed` (greedy stays deterministic).
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
 
     // Track whether the decode loop saw a complete
     // `<｜DSML｜tool_calls>` block close. Drives `finish_reason` in the
@@ -1688,6 +1682,7 @@ pub fn generate_deepseek4_heterogeneous(
     temp: f32,
     top_p: f32,
     max_tokens: usize,
+    request_seed: u32,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
@@ -1819,7 +1814,7 @@ pub fn generate_deepseek4_heterogeneous(
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
-    let mut rng = deepseek4::sampling::Xorshift::new(0x1357_9bdf);
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
     let mut parser = match think_mode {
         ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
             deepseek4::dsml::StreamParser::new_in_think()
