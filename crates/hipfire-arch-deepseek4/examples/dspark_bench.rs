@@ -14,9 +14,10 @@
 //!   - draft accept fraction = accepted / proposed
 //!   - the decoded text (for human coherence eyeball)
 //!
-//! Drafter: DSpark when the sidecar is present, else the MTP drafter (this
-//! harness builds the speculator directly, bypassing the loader's
-//! `speculation`-mode gate).
+//! Drafter: `--drafter dspark` (default) uses the DSpark sidecar when present,
+//! else the MTP drafter; `--drafter mtp` skips loading the sidecar and runs the
+//! MTP drafter (`HIPFIRE_DEEPSEEK4_SPEC_K` sets its K). This harness builds the
+//! speculator directly, bypassing the loader's `speculation`-mode gate.
 //!
 //! ENV:
 //!   HIPFIRE_DEEPSEEK4_MODEL   trunk HFQ path (default ~/.hipfire/models/deepseek-v4-flash.mq2lloyd)
@@ -168,6 +169,17 @@ fn main() -> Result<(), String> {
     eprintln!("Loading DeepSeek V4 trunk from {path}...");
     let mut hfq = HfqFile::open(Path::new(&path)).map_err(|e| format!("open: {e:?}"))?;
     let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    // Bench-local drafter arm (a CLI argument, not a product setting).
+    let args: Vec<String> = std::env::args().collect();
+    match args
+        .iter()
+        .position(|a| a == "--drafter")
+        .map(|i| args.get(i + 1).map(String::as_str))
+    {
+        None | Some(Some("dspark")) => {}
+        Some(Some("mtp")) => cfg.load_dspark = false,
+        Some(other) => return Err(format!("--drafter expects dspark|mtp, got {other:?}")),
+    }
     if let Some(experts_per_tok) = bench_experts_per_tok {
         if experts_per_tok == 0 || experts_per_tok > cfg.num_experts_per_tok {
             return Err(format!(
