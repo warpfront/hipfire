@@ -330,7 +330,7 @@ struct SetupArgs {
     strict_rocm: bool,
     #[arg(long, value_name = "ARCH")]
     gpu_arch: Option<String>,
-    /// auto (default) leaves replay.backend=auto so .mq4r models select Redline.
+    /// auto (default) leaves replay.backend=auto so MQ4R-SKU models select Redline.
     #[arg(long, value_parser = ["auto", "hip", "redline"])]
     profile: Option<String>,
     #[arg(long, short = 'y', visible_alias = "non-interactive")]

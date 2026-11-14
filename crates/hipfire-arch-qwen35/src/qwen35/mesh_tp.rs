@@ -861,7 +861,7 @@ fn ar_graph_trace_enabled() -> bool {
 }
 
 /// Whether a decode epoch of `rank` on `gpu` may use graphs: the hand
-/// route's `dense_tp_graph_enabled` for one rank (no KV eviction offset, AR
+/// route's `dense_tp_graph_enabled` for one rank (zero KV `compact_offset`, AR
 /// graphs and forward graphs on, gfx11/gfx12 by default) with a launch
 /// stream.
 fn graphs_enabled(rank: &Qwen35TpRank, gpu: &Gpu) -> bool {

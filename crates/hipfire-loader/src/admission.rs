@@ -303,7 +303,7 @@ fn qwen4_mtp_off_reason(
     if spec_mtp == Some(false) {
         "speculation.mtp=off"
     } else if retained {
-        ".mq4r retained replay path"
+        "MQ4R-SKU retained replay path"
     } else if !measured_ar_floor {
         "no measured AR floor (speculation.mtp=auto)"
     } else {
@@ -7203,7 +7203,7 @@ mod qwen4_pp_admission_tests {
         }
         assert_eq!(
             qwen4_mtp_off_reason(None, true, true),
-            ".mq4r retained replay path"
+            "MQ4R-SKU retained replay path"
         );
         assert_eq!(
             qwen4_mtp_off_reason(None, false, false),
