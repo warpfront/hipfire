@@ -405,9 +405,17 @@ static DISPATCH_GFX1100_DENSE_GATE_UP_LANE0_HEADERS: LazyLock<bool> = LazyLock::
     hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS", false)
 });
 
+// Kept (HIPF-396): `[developer] gate_up_bt = false` pins bt1 at B64 in the
+// certified gfx1201 batched Redline profile (docs/configs/batched-redline-pm4-product.toml).
+static GATE_UP_BT: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
+});
+
 #[inline]
 fn gfx12_bt_tile(batch_size: usize) -> usize {
-    if batch_size < 64 {
+    if !*GATE_UP_BT || batch_size < 64 {
         return 1;
     }
     // Exact divisors take precedence over masked tiles, including N >= 192.
@@ -435,7 +443,7 @@ impl Gpu {
     #[inline]
     fn ordinary_bt_tile(&self, batch_size: usize) -> usize {
         let tile = gfx12_bt_tile(batch_size);
-        if tile == 1 && batch_size > 0 && self.ordinary_prefill_active() {
+        if tile == 1 && batch_size > 0 && *GATE_UP_BT && self.ordinary_prefill_active() {
             12
         } else {
             tile
@@ -11044,7 +11052,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Adaptive-B batch-tile (shared with gate_up/residual).
+        // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/residual).
         let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
@@ -14399,7 +14407,7 @@ impl Gpu {
             }
             return result;
         }
-        // Adaptive-B batch-tile fast path: B independent
+        // Adaptive-B batch-tile fast path (env HIPFIRE_GATE_UP_BT): B independent
         // accumulator chains hide the WMMA latency that caps the 1-acc kernel at ~19%
         // of peak. B = clamp(N/16, 1, 12), capped at 12 (B=16 spills VGPR). Byte-exact
         // vs the 1-acc kernel; +85% at N=192 on gfx1201.
@@ -14564,7 +14572,7 @@ impl Gpu {
             }
             return result;
         }
-        // Adaptive-B batch-tile (shared with gate_up/qkvza).
+        // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/qkvza).
         let bt_b: usize = self.ordinary_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
@@ -46291,7 +46299,7 @@ impl Gpu {
         // 512 x 2560 0.31 -> 0.21 ms).  Below that wave count (M = 48) or
         // below 1024 tokens the exact-divisor order stays.
         let bt12_waves = m.div_ceil(16) * batch_size.div_ceil(192);
-        let bt_b = if batch_size >= 1024 && bt12_waves >= 256 {
+        let bt_b = if *GATE_UP_BT && batch_size >= 1024 && bt12_waves >= 256 {
             12
         } else {
             self.ordinary_bt_tile(batch_size)

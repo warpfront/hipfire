@@ -322,6 +322,7 @@ developer_callsite	*	HIPFIRE_G942_ROWS16_CHAIN#developer_bool=true
 developer_callsite	*	HIPFIRE_G942_TRUNK_GEMV#developer_bool=false
 developer_callsite	*	HIPFIRE_GATED_DELTA_VECTOR_CHUNKED#developer_bool=true
 developer_callsite	*	HIPFIRE_GATED_DELTA_VECTOR_PM#developer_bool=true
+developer_callsite	*	HIPFIRE_GATE_UP_BT#developer_var=map.unwrap_or(true)
 developer_callsite	*	HIPFIRE_GDN_BLK#developer_var=ok.and_then.map.unwrap_or(128)
 developer_callsite	*	HIPFIRE_GDN_CHUNKED#developer_var=map.unwrap_or(false)
 developer_callsite	*	HIPFIRE_GDN_CHUNK_PM#developer_bool=true

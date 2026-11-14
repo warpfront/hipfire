@@ -793,6 +793,7 @@ HIPFIRE_GATED_NORM_X_BF16	unclassified
 HIPFIRE_GATED_PRESCALE	unclassified
 HIPFIRE_GATEUP_LDSSTAGE	featureflags_parse_bool,raw_string
 HIPFIRE_GATE_MODEL	raw_string
+HIPFIRE_GATE_UP_BT	ne_zero
 HIPFIRE_GATE_UP_NOSYNC	eq_one
 HIPFIRE_GATE_UP_PAIR2	unclassified
 HIPFIRE_GATE_UP_VARIANT	eq_one,raw_string

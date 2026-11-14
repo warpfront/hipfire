@@ -206,8 +206,8 @@ that served three cases are deleted, and each case now runs the step program:
 
 `HIPFIRE_FORWARD_LOWERED` no longer affects Qwen3.5. The exact VMM slot route
 drops its refusal for it, and `scripts/forward-lowered-parity.sh` drops its
-Qwen3.5 rows. The variable keeps its `env-vars.md` row because llama, qwen2
-and deepseek4 still read it.
+Qwen3.5 rows. HIPF-396 later removed the variable for every family: decode
+always runs the lowered program.
 
 The MTP head (`mtp_head_forward_block_only_with_pos_buf`, every per-token
 draft and verify-tail caller) runs its decoder layer as the trunk's steps:

@@ -73,7 +73,7 @@ The default-on lowered path is:
 
 `generate_lfm2moe` → `decode_step` → `decode_step_inner` → `decode_step_layers_and_head_lowered` → LFM-local layer handlers.
 
-`HIPFIRE_FORWARD_LOWERED=0` retains the diagnostic hand loop. `HIPFIRE_LFM2_GRAPH` stays off; growing attention geometry is not safe to capture.
+The `HIPFIRE_FORWARD_LOWERED` control is gone (HIPF-396): decode always runs the lowered program. `HIPFIRE_LFM2_GRAPH` stays off; growing attention geometry is not safe to capture.
 
 Each MQ4 linear currently rotates its input independently. Q/K/V therefore perform three identical rotations. Dense gate/up perform two identical rotations. RMSNorm is also a separate launch before each layer half.
 

@@ -5758,7 +5758,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         // `Gpu::gemm_gate_up_hfq4g256_wmma_gfx12` batch-tile family
         // (`gfx12_bt_tile`: bt4 for N in [64,128), bt8 at multiples of 128,
         // bt12 at multiples of 192 / N >= 192): one source, symbol == module.
-        // The `_ldsstage` module is developer-only.
+        // `HIPFIRE_GATE_UP_BT=0` and the `_ldsstage` module are developer-only.
         add!(
             "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",
             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,

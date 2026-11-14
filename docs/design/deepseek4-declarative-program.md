@@ -82,7 +82,8 @@ step at a time and read their tensors after the step that produced them; each
 captured tensor is unchanged by the rest of its step.
 
 Removed: the hand layer loop and the #397 single-lane super-op path
-(`decode_step_body_lowered`, `HIPFIRE_FORWARD_LOWERED` for DeepSeek4).
+(`decode_step_body_lowered`). The `HIPFIRE_FORWARD_LOWERED` control is gone
+(HIPF-396): decode always runs the lowered program.
 
 ## Evidence
 
