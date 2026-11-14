@@ -3265,6 +3265,7 @@ pub fn generate(
                 temp,
                 top_p,
                 max_tokens,
+                request_seed,
                 think_mode,
                 tools,
                 messages_history,
