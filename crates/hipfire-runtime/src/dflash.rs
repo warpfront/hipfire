@@ -2684,7 +2684,25 @@ fn gemm_dispatch(
         None
     };
     let result = match w.gpu_dtype {
-        DType::F32 => gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m),
+        DType::F32 => {
+            let r = gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m);
+            if dump {
+                if let Err(e) = gpu.hip.device_synchronize() {
+                    eprintln!("[draft-gemm] F32 sync err {e}");
+                }
+                let n8 = (batch * w.m).min(8);
+                let mut host = vec![0f32; n8];
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(host.as_mut_ptr() as *mut u8, n8 * 4)
+                };
+                if gpu.hip.memcpy_dtoh(bytes, &y.buf).is_ok() {
+                    let nan = host.iter().filter(|v| v.is_nan()).count();
+                    let mx = host.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                    eprintln!("[draft-gemm] F32 y0..{n8} maxabs={mx:.4} nan={nan}");
+                }
+            }
+            r
+        }
         DType::F16 if w.row_stride != 0 => {
             gpu.gemm_f16_pitched_gfx1151(&w.buf, x, y, w.m, w.k, w.row_stride / 2, batch)
         }
