@@ -4468,7 +4468,17 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let mq3_uniform_with_gfx10_scalar = matches!(dt, DType::MQ3G256)
         && matches!(
             arch,
-            "gfx1010" | "gfx1011" | "gfx1012" | "gfx1013" | "gfx1030" | "gfx1031" | "gfx1032"
+            "gfx1010"
+                | "gfx1011"
+                | "gfx1012"
+                | "gfx1013"
+                | "gfx1030"
+                | "gfx1031"
+                | "gfx1032"
+                | "gfx1033"
+                | "gfx1034"
+                | "gfx1035"
+                | "gfx1036"
         );
 
     // HFP4G32 / MFP4G32 (v2 #2 batched WMMA prefill): same arch gate as
@@ -8631,8 +8641,9 @@ mod tests {
 
     const BATCHABLE_ARCHS: &[&str] = &[
         "gfx900", "gfx906", "gfx908", "gfx940", "gfx941", "gfx942", "gfx1010", "gfx1011",
-        "gfx1012", "gfx1013", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1101", "gfx1102",
-        "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
+        "gfx1012", "gfx1013", "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035",
+        "gfx1036", "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152",
+        "gfx1200", "gfx1201",
     ];
 
     const WMMA_ARCHS: &[&str] = &[
@@ -8641,7 +8652,8 @@ mod tests {
     ];
 
     const GFX10_SCALAR_ARCHS: &[&str] = &[
-        "gfx1010", "gfx1011", "gfx1012", "gfx1013", "gfx1030", "gfx1031", "gfx1032",
+        "gfx1010", "gfx1011", "gfx1012", "gfx1013", "gfx1030", "gfx1031", "gfx1032", "gfx1033",
+        "gfx1034", "gfx1035", "gfx1036",
     ];
 
     const NO_WMMA_ARCHS: &[&str] = &["gfx900", "gfx906", "gfx908", "gfx940", "gfx941", "gfx942"];

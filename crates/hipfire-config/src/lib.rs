@@ -4454,7 +4454,8 @@ pub fn oom_guard_mode() -> OomGuardMode {
 /// same physical memory as the desktop. An overshoot here is a global OOM,
 /// not a failed hipMalloc.
 pub const UNIFIED_MEMORY_ARCHS: &[&str] = &[
-    "gfx1035", "gfx1036", // RDNA2 APU (Van Gogh / Steam Deck class)
+    "gfx1033", "gfx1035",
+    "gfx1036", // RDNA2 APU (Van Gogh 1033, Rembrandt 1035, Raphael 1036)
     "gfx1103", // RDNA3 APU (Phoenix orphan)
     "gfx1150", "gfx1151", "gfx1152", // RDNA3.5 APU (Strix Point / Strix Halo)
 ];
@@ -4464,7 +4465,7 @@ pub const UNIFIED_MEMORY_ARCHS: &[&str] = &[
 pub const DISCRETE_MEMORY_ARCHS: &[&str] = &[
     "gfx906", "gfx908", "gfx940", "gfx941", "gfx942", // CDNA (HBM)
     "gfx1010", "gfx1011", "gfx1012", // RDNA1
-    "gfx1030", "gfx1031", "gfx1032", // RDNA2 dGPU
+    "gfx1030", "gfx1031", "gfx1032", "gfx1034", // RDNA2 dGPU
     "gfx1100", "gfx1101", "gfx1102", // RDNA3 dGPU
     "gfx1200", "gfx1201", // RDNA4
 ];
@@ -8826,6 +8827,8 @@ mod tests {
             assert!(is_discrete_memory_arch(arch));
         }
         assert!(is_unified_memory_arch("gfx1151"));
+        assert!(is_unified_memory_arch("gfx1033"));
+        assert!(is_discrete_memory_arch("gfx1034"));
         assert!(!is_unified_memory_arch("gfx1100"));
     }
 
