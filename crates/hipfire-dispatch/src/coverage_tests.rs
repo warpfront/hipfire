@@ -69,8 +69,9 @@ const WMMA_ARCHS: &[&str] = WAVE32; // same set today, but semantically distinct
 
 /// Everything incl. RDNA1/2 + CDNA, for dtypes whose arch gate is Always/dp4a.
 const ALL: &[&str] = &[
-    "gfx1010", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1101", "gfx1102", "gfx1150",
-    "gfx1151", "gfx1152", "gfx1200", "gfx1201", "gfx906", "gfx908", "gfx942",
+    "gfx1010", "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036",
+    "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
+    "gfx906", "gfx908", "gfx942",
 ];
 
 /// PRODUCTION MATRIX — (model, role, dtype) the wired forward pass hits today.
@@ -1174,13 +1175,15 @@ fn f16_full_attention_rejected_on_non_wmma_archs() {
 /// W4 dtypes whose GEMV gate is HasWave32 after the fix (the un-bricked set).
 const W4_WAVE32_DTYPES: &[DType] = &[MQ3G256, MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd];
 
-/// W4: MQ3/Lloyd GEMVs resolve Ok on RDNA1 (gfx1010) + RDNA2 (gfx1030/1031/1032)
+/// W4: MQ3/Lloyd GEMVs resolve Ok on RDNA1 (gfx1010) + RDNA2 (gfx1030-1036)
 /// AFTER the HasWmma→HasWave32 fix. (Was MissingImpl before.)
 #[test]
 fn w4_mq3_lloyd_resolve_on_rdna1_and_rdna2() {
     use crate::families::gemv::GemvFamily;
     let fam = GemvFamily::new();
-    let archs: &[&str] = &["gfx1010", "gfx1030", "gfx1031", "gfx1032"];
+    let archs: &[&str] = &[
+        "gfx1010", "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036",
+    ];
     let mut failures = Vec::new();
     for &d in W4_WAVE32_DTYPES {
         for &arch in archs {
@@ -1219,7 +1222,9 @@ fn w4_lloyd_fused_keys_un_bricked_on_rdna2_not_cdna() {
     let mut failures = Vec::new();
     for &key in lloyd_fused {
         // RDNA1/2 must now resolve.
-        for arch in ["gfx1010", "gfx1030", "gfx1031", "gfx1032"] {
+        for arch in [
+            "gfx1010", "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036",
+        ] {
             if family
                 .resolve(key, &DispatchCtx::for_test(arch), None)
                 .is_err()
