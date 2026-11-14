@@ -24,7 +24,7 @@ guidance only.
    does not invent gates.
 2. There is **no universal replacement gate** and **no C/A attestation**.
 3. `scripts/coherence-gate-*.sh` batteries are **retired as acceptance**
-   (historical reproduction only). Do not require them for merge,
+   (removed from the tree; git history only). Do not require them for merge,
    promotion, or arch-port certification language.
 4. Hardware-unwitnessed paths are **blocked**, not assumed green.
 5. A green automatic no-GPU CI run is never GPU-arch proof.

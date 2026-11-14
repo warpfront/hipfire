@@ -58,7 +58,7 @@ cache selection.
 - **hipfire-daemon** — the product binary. `[[bin]] name = "daemon"` in
   `crates/hipfire-daemon`; message dispatch and process lifetime only
   (`docs/ARCHITECTURE.md` § Serve / generate path).
-- **hipfire-quantize** — CPU-side encoder (safetensors/GGUF → `.hfq`/`.mq4`/…);
+- **hipfire-quantize** — CPU-side encoder (safetensors → `.hfq`/`.mq4`/…);
   builds without a GPU.
 - **hipfire-detect** — GPU-independent observability: attractor / special-token /
   n-gram / tool-call detectors (used by the gates and `coherence_probe`).

@@ -59,7 +59,7 @@ crates/
 ├── hipfire-engine/           # arch-free serve engine: scheduler, terminal, emit, prompt
 ├── hipfire-generate/         # generation bodies: ar, qwen, dense, vision, batch, img, redline fixtures
 ├── hipfire-daemon/           # the product binary — [[bin]] name = "daemon"
-├── hipfire-quantize/         # CPU encoder (safetensors/GGUF → .mq* / .hfq*)
+├── hipfire-quantize/         # CPU encoder (safetensors → .mq* / .hfq*)
 ├── hipfire-detect/           # observational JSONL behavior detectors
 ├── hipfire-atlas/            # Kernel Atlas schema + emit helpers
 ├── hipfire-config/           # typed TOML config + migration
@@ -140,10 +140,9 @@ router views, and whole-program preflight live there. Neutral stateful
 operation contracts and execution remain in
 `crates/hipfire-dispatch/src/pipeline/layer_ops.rs` and `steps.rs`; the sealed
 QT44/QT53 MoE route remains shared in `pipeline/sealed_moe.rs`,
-`moe_program.rs`, and `qt44_qt53_prefill.rs`. Fixed Qwen4 HIP helpers are
-registered by `hipfire-arch-qwen4/src/gpu_ops.rs`, while
-`rdna-compute/src/tensor_ops.rs` and `grouped_ops.rs` provide neutral wrapper
-contracts. This is an implementation ownership map, not replay/PM4 admission,
+`moe_program.rs`, and `qt44_qt53_prefill.rs`.
+`rdna-compute/src/tensor_ops.rs` and `grouped_ops.rs` provide the neutral HIP
+wrapper contracts. This is an implementation ownership map, not replay/PM4 admission,
 physical-EP proof, or a performance promotion.
 
 With `deltanet` enabled, the fixed-geometry QT44/QT53 route is admitted on

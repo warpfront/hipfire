@@ -187,7 +187,7 @@ any ship/promote claim.
 | `test_kernels` / channel | **Current** for kernel numeric claims |
 | Maintained serve / LFM / Redline harnesses | **Current** only for the semantics those harnesses own ([`VALIDATION.md`](../VALIDATION.md)) |
 | Astrea KLD/PPL/MSE rows | **planned / blocked** as a validation route — quality evidence only until INDEX/VALIDATION name Astrea as owner; compose manually via shared ids |
-| `scripts/coherence-gate-*.sh` | **Historical reproduction only** — not acceptance, not default `--correctness-command` |
+| `scripts/coherence-gate-*.sh` | **Removed** (git history only) — not acceptance, not default `--correctness-command` |
 
 Mark or treat rows as `perf_only` when correctness is absent. Fail
 closed rather than implying a green gate.

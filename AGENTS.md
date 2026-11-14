@@ -1015,8 +1015,9 @@ Caveats that are part of the fixture, not trivia:
 
 - **MTP `auto` (`speculation.mtp = auto`, the schema default) arms native MTP
   only for a producer that declares a measured AR floor. Today that is Qwen4
-  (Flash-Next, arch 16), except on `.mq4r` loads, which keep the retained
-  Redline AR route. Qwen3.5-class (arch 5/6, dense and MoE), DeepSeek V4 and
+  (Flash-Next, arch 16), except on MQ4R-SKU loads (HFQ `hipfire_route_sku`
+  metadata or the registry card, never the file extension), which keep the
+  retained Redline AR route. Qwen3.5-class (arch 5/6, dense and MoE), DeepSeek V4 and
   Gemma 4 declare no floor (the DS4 native-MTP audit found none), so `auto`
   resolves to AR there even when a head is present. An explicit
   `speculation.mtp = on` / `--spec mtp` still attaches any present head on

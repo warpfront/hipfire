@@ -1453,7 +1453,7 @@ measurement, is expected to land on `25,23` at chunk 256.
   instead of failing, as do penalized greedy requests. MTP sessions are not
   distributed: a native-MTP request on the mesh never reuses a session snapshot
   and publishes none. A speculative request that still reaches the mesh with
-  DFlash/DSpark/n-gram/DDTree, KV eviction or a checkpoint resume is refused
+  DFlash/DSpark/n-gram/DDTree or a checkpoint resume is refused
   before any state changes.
 
 #### Refusals
@@ -2156,7 +2156,7 @@ epoch bookkeeping. The decode partials alternate two slots
 (`BoundaryIo::partial_slot`: mixer 0, FFN 1), which selects the alternating
 direct-peer reduction the graph can capture; prefill reuses one partial
 buffer and takes the ordinary protocol. Any other decode (TP4, another pair,
-`HIPFIRE_TP_FULL_GRAPH=0`, `HIPFIRE_GRAPH=0`, a KV eviction offset) decodes
+`HIPFIRE_TP_FULL_GRAPH=0`, `HIPFIRE_GRAPH=0`) decodes
 eager through the executor. Per-segment hipGraphs (one per rank program
 segment between the collectives) measured slower than eager at TP4 on
 gfx1201 (45.99 vs 51.13 tok/s, Qwen3.8-27B) and were removed: TP2 uses the
@@ -2242,11 +2242,12 @@ Flash-Next PP uses a per-band budget instead (all-resident bands, each card
 checked against its own free VRAM before allocation); see
 [Per-band memory budget](#per-band-memory-budget).
 
-**Reproduce on your hardware** (2+ visible GPUs, deltanet feature):
+**Reproduce on your hardware** (2+ visible GPUs; the probe is a `saddle-lab`
+example, built with that crate's default features, and allocates Q8 KV):
 
 ```sh
-HIP_VISIBLE_DEVICES=0,1 cargo run --release --features deltanet \
-  -p hipfire-runtime --example pp2_vram_probe -- \
+HIP_VISIBLE_DEVICES=0,1 cargo run --release -p saddle-lab \
+  --example pp2_vram_probe -- \
   ~/.hipfire/models/qwen3.5-9b.mq4 4096
 ```
 
@@ -2420,6 +2421,10 @@ Retired `scripts/coherence-gate-*.sh` batteries are **not** acceptance for PP
 > **historical**, not evidence for any current route, and are superseded for
 > Flash-Next by the dated [Measured](#measured-flash-next-ep-on-2x-r9700-2026-10-13)
 > section, which is a different model, different cards and 8k to 16k prompts.
+> Their `asym3` KV mode was removed in 0.5.0, and the `pp2_vram_probe`
+> example they cite (then in `hipfire-runtime`) is now
+> `crates/saddle-lab/examples/pp2_vram_probe.rs` (Q8 KV); the current run
+> command is under [Memory budget](#memory-budget).
 
 # Multi-GPU Pipeline-Parallel
 

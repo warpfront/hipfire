@@ -156,15 +156,14 @@ python3 scripts/kernel_atlas.py collect-dflash \
 DFlash rows record prompt md5 plus metrics the demo prints
 (`decode_tok_s`, tau, TTFT, emitted/accepted tokens, cycles, …).
 `collect-dflash` **rejects** every `--kv-mode` except `q8`, `fwht2`,
-`fwht3`, or `fwht4` before launch (default `q8`). `asym*` is not accepted
-by this collector. `collect-ar`'s own `--kv-mode` default is still the legacy
-`asym3` (the `bench_qwen35_mq4` example builds the Givens constructor for it);
-pass `--kv-mode q8` (or `fwht3` for the headroom mode) explicitly.
+`fwht3`, or `fwht4` before launch (default `q8`). `collect-ar`'s own
+`--kv-mode` default is `fwht3`; the `bench_qwen35_mq4` example it runs accepts
+only `q8` and `fwht3`, so pass `--kv-mode q8` for the default-quality mode.
 
 Tok/s alone is **not** DFlash correctness. For correctness claims, use a
 path named in VALIDATION (path oracle and/or maintained harnesses) —
 **not** retired `scripts/coherence-gate-*.sh` as acceptance. Those
-scripts remain on disk for **historical reproduction only**.
+scripts were removed from the tree (git history only).
 
 ---
 

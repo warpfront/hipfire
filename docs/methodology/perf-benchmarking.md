@@ -211,8 +211,8 @@ Kernel Atlas collection and ISA views: [`kernel-atlas.md`](kernel-atlas.md).
 Perf without output checks can crown an attractor. For DFlash/spec
 claims, pair timing with decoded-output health (unique-token /
 repetition checks and eyeball) on the **same** fixture identity.
-Retired `scripts/coherence-gate-*.sh` batteries are **historical
-reproduction only** — not current acceptance
+Retired `scripts/coherence-gate-*.sh` batteries were **removed from the
+tree** (git history only) and are not current acceptance
 ([`VALIDATION.md`](../VALIDATION.md) § Retired coherence-gate scripts).
 
 Tight stddev on spec-decode is suspicious if acceptance noise should be

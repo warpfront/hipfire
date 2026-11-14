@@ -1095,7 +1095,7 @@ Reproduce the exact shadow and submission proof from a release daemon (set
 `MODEL` to the `lfm2.5-350m.mq4` fixture file whose MD5 is listed above):
 
 ```bash
-cargo build -p hipfire-runtime --release --example daemon --features deltanet
+cargo build --release -p hipfire-daemon
 
 # HISTORICAL/INERT: HIPFIRE_LFM2_GFX1201_DECODE_FUSION and HIPFIRE_REPLAY_LOWERED_FORWARD have no reader in current sources; the exports below are retained as recorded and have no effect on the route.
 HIPFIRE_LFM2_GFX1201_DECODE_FUSION=1 \

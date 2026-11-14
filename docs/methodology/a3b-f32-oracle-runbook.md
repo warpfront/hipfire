@@ -76,14 +76,15 @@ git clone <hipfire> && cd hipfire
 git checkout a3b-lowbit-work                 # or master; the oracle path is on both
 
 cargo build --release -p hipfire-quantize
-cargo build --release --example build_kld_ref_native -p hipfire-runtime \
-    --features arch-qwen35,deltanet
-cargo build --release --example eval_hipfire -p hipfire-runtime \
-    --features arch-qwen35,deltanet
+cargo build --release -p saddle-lab --example build_kld_ref_native
+cargo build --release -p hipfire-runtime --features deltanet --example eval_hipfire
 ```
 
-`build_kld_ref_native` declares `required-features = ["arch-qwen35", "deltanet"]`
-— omitting them silently skips the example.
+`build_kld_ref_native` is a `saddle-lab` example and declares
+`required-features = ["arch-qwen35", "deltanet"]`; both are in that crate's
+default features. `eval_hipfire` needs `deltanet`, which is a
+`hipfire-runtime` default. Disabling the default features silently skips
+the example.
 
 ## Steps 1–2 — get the oracle onto the box
 

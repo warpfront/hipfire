@@ -17,8 +17,9 @@
 >   `init_layers` passes `false`, and `HIPFIRE_ALLOW_MIXED_ARCH=1` downgrades
 >   the arch-mismatch error to a warning
 >   (`crates/hipfire-runtime/src/multi_gpu.rs`,
->   `crates/hipfire-runtime/src/config.rs`). The `docs/env-vars.md:230` and
->   `docs/plans/hetero-pflash-dflash.prd` line references are bring-up-era.
+>   `crates/hipfire-runtime/src/config.rs`). The `docs/env-vars.md:230` line
+>   reference is bring-up-era; `docs/plans/hetero-pflash-dflash.prd` was
+>   deleted with PFlash in 0.5.0 (git history only).
 > - §5: `Gpu::bind_thread()` is now at
 >   `crates/rdna-compute/src/dispatch.rs` and delegates to
 >   `crate::graph::bind_thread` (`crates/rdna-compute/src/graph.rs`, which
@@ -269,6 +270,6 @@ day one.**
 ## See also
 
 - `docs/multi-gpu.md` — operational guide (memory budgets, deployment recipes, throughput).
-- `docs/plans/hetero-pflash-dflash.prd` — the hetero PFlash+DFlash architectural plan.
+- `docs/plans/hetero-pflash-dflash.prd` — the hetero PFlash+DFlash architectural plan (deleted with PFlash in 0.5.0; git history only).
 - `docs/plans/path_d.md` — same-card spec-decode pipelining design (closed without merge after empirical dominated by chain-mode; preserved for future revival).
 - PR #204 (closed) — full hetero spec-decode prototype with the bind_thread pattern, long-context findings, and the pivot to native MTP as the actual perf lever.

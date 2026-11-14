@@ -46,12 +46,11 @@ Intended Astrea scope when implemented and owned:
 - MoE ingress: separate router, expert, and shared dense tensors before
   optimizing a MoE model family.
 - KV policy: compare the `q8` default (native `fp8` on gfx1201) against the
-  `fwht3` headroom mode, TriAttention/CASK,
-  TurboQuant-like, and RotorQuant-like candidates using an explicit policy
-  artifact.
+  `fwht3` headroom mode, TurboQuant-like, and RotorQuant-like candidates using
+  an explicit policy artifact (TriAttention/CASK KV eviction was removed in
+  0.5.0).
 - Package planning: describe a future single-file HFQ package containing
-  weights, transform metadata, KV policy, and embedded TriAttention/CASK
-  centers.
+  weights, transform metadata and KV policy.
 
 ## Deliberate boundary (still accurate as intent)
 
@@ -63,11 +62,8 @@ measurement — not admissions.
 Runtime/package work stays deferred until policy artifacts identify a candidate
 worth carrying:
 
-- HFQ package header and section table for `kv.policy`,
-  `triattn.centers`, and evidence metadata.
+- HFQ package header and section table for `kv.policy` and evidence metadata.
 - Loader-side validation and rejection of unsupported sections.
-- Daemon and CLI preference for embedded TriAttention/CASK data over external
-  sidecar paths.
 - Kernels or decode paths for any non-existing KV policy, especially
   TurboQuant-like and RotorQuant-like candidates.
 - Atlas joins for AR and DFlash perf, memory, and correctness rows under a

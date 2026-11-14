@@ -12,7 +12,7 @@ do not carry that full identity manifest, so this page is **historical** only
 (card, fixture, method, date and build per row) are in the README's
 [Measured performance (v0.4.4)](../README.md#measured-performance-v044) table
 and the [CHANGELOG](../CHANGELOG.md) entries it cites. The tables below were
-taken on older builds, most with the since-deprecated `asym3` KV mode; they
+taken on older builds, most with the `asym3` KV mode removed in 0.5.0; they
 are not the current speed of any listed card or model. The v0.4.5 Flash-Next
 EP2 serve measurement (2x R9700, 2026-11-11) is the **measured** (not admitted)
 record [`perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md`](perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md);

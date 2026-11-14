@@ -119,8 +119,9 @@ Three naming decisions, each deliberate:
   self-describe by qt, so no file is ever ambiguous; redefining qt=13 would make the scored
   baseline (`WT2 0.043776`) ambiguous by date, which is the same silent-reinterpretation hazard
   that produced the qt=43 / GLW mess. qt=13 stays reachable as `mq4v1`.
-- **Not `mq4r`.** `.mq4r` is a live file extension in `crates/hipfire-cli/src/main.rs:63` that
-  selects the Redline replay backend, and denotes "MQ4 gate + graded experts"
+- **Not `mq4r`.** `mq4r` is a live route SKU that selects the Redline replay backend (HFQ
+  `hipfire_route_sku` metadata or the registry card's `quant`, `crates/hipfire-runtime/src/route_sku.rs`;
+  `.mq4r` stays a model file extension), and denotes "MQ4 gate + graded experts"
   (`qwen35.rs:6011`). `mq4c` names the **padded-compat** v1.5 form (136 B), not the retired 132 B compact.
 - **`mq4_k` names its provenance.** Hierarchical sub-scale quantization is GGML's k-quant
   design; what is ours is the FWHT rotation beneath it and the per-16 granularity. Per
