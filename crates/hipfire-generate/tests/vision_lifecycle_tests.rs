@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! G4.8 vision/OCR request-lifecycle matrix: Qwen35-VL and dots.ocr
-//! cancellation + error epilogues.
+//! G4.8 vision/OCR request-lifecycle matrix: Qwen35-VL, dots.ocr and
+//! LFM2-VL cancellation + error epilogues.
 //!
 //! Covers every vision loop exit named in the G4.8 plan: cancel before
 //! prefill, cancel during decode, forward/argmax/spec faults — each paired
@@ -17,6 +17,8 @@
 //!   The comma-separated pair is required: trunk first, tower sidecar second.
 //! - `HIPFIRE_DOTS_OCR_FIXTURE`: path to the dots.ocr artifact, e.g.
 //!   `~/.hipfire/models/dots-ocr.q8.hfq`.
+//! - `HIPFIRE_LFM2_VL_FIXTURE`: an LFM2-VL artifact quantized with its
+//!   vision tower, e.g. `lfm2.5-vl-3b.mq4v2.hfq`.
 //! - Images (override with `HIPFIRE_VISION_IMAGE` / `HIPFIRE_DOTS_IMAGE`):
 //!   `benchmarks/vision/images/general_qa.jpg` (VL) and
 //!   `benchmarks/images/dots_ocr_smoke_001.jpg` (dots.ocr). Both are
@@ -299,6 +301,7 @@ fn vision_lifecycle_child() {
     match scenario.as_str() {
         "vl" => child_vl_matrix(),
         "dots" => child_dots_matrix(),
+        "lfm2" => child_lfm2_vl_matrix(),
         other => panic!("unknown matrix {other:?}"),
     }
 }
@@ -462,10 +465,21 @@ fn dots_ocr_lifecycle_matrix() {
                     *n += 1;
                     if *n == 1 && !aborted.get(&e.id).copied().unwrap_or(false) {
                         aborted.insert(e.id.clone(), true);
-                        let attempt = if e.id == "g48-dots-d9" { 109 } else { 203 };
+                        let attempt = if e.id == "g48-dots-d9" { 109 } else { 202 };
                         writeln!(stdin, "ABORT {} {attempt}", e.id).expect("abort decode");
                         stdin.flush().expect("flush abort");
                     }
+                }
+                // Client abort at the commit wait (turn decoded, never committed).
+                let commit_wait = match e.id.as_str() {
+                    "g48-dots-d11" => Some(115),
+                    "g48-dots-s4" => Some(116),
+                    "g48-dots-x4" => Some(204),
+                    _ => None,
+                };
+                if let (Some(attempt), "commit_ready") = (commit_wait, e.typ.as_str()) {
+                    writeln!(stdin, "ABORT {} {attempt}", e.id).expect("abort commit wait");
+                    stdin.flush().expect("flush abort");
                 }
                 transcript.events.push(e);
             }
@@ -486,14 +500,17 @@ fn dots_ocr_lifecycle_matrix() {
         "g48-dots-d8",
         "g48-dots-d9",
         "g48-dots-d10",
+        "g48-dots-d11",
         "unload-ok",
         "reload-spec-ok",
         "g48-dots-s1",
         "g48-dots-s2",
         "g48-dots-s3",
+        "g48-dots-s4",
         "g48-dots-x1",
         "g48-dots-x2",
         "g48-dots-x3",
+        "g48-dots-x4",
         "unload2-ok",
     ] {
         assert!(
@@ -521,6 +538,9 @@ fn dots_ocr_lifecycle_matrix() {
         assert_eq!(errs[0].rolled_back, Some(true), "{id} must attest rollback");
     }
     assert_outcome(&transcript, "g48-dots-d9", TerminalOutcome::Cancel);
+    for id in ["g48-dots-d11", "g48-dots-s4", "g48-dots-x4"] {
+        assert_outcome(&transcript, id, TerminalOutcome::Cancel);
+    }
     // Spec path: success, injected spec fault (error, never done), reuse.
     let s1 = token_text(&transcript, "g48-dots-s1");
     assert_outcome(&transcript, "g48-dots-s1", TerminalOutcome::Success);
@@ -534,6 +554,53 @@ fn dots_ocr_lifecycle_matrix() {
     assert_outcome(&transcript, "g48-dots-x2", TerminalOutcome::Cancel);
     assert_outcome(&transcript, "g48-dots-x3", TerminalOutcome::Success);
     assert_eq!(token_text(&transcript, "g48-dots-x3"), x1);
+}
+
+/// LFM2-VL lifecycle: baseline, client abort at the commit wait, reuse.
+/// Requires `HIPFIRE_LFM2_VL_FIXTURE`. Ignored: needs HIP GPU.
+#[test]
+#[ignore = "requires HIP GPU + HIPFIRE_LFM2_VL_FIXTURE (lfm2.5-vl-3b.mq4v2.hfq)"]
+fn lfm2_vl_lifecycle_matrix() {
+    let _matrix_guard = MATRIX_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut child, mut reader, mut stdin) = spawn_child("lfm2");
+    let mut line = String::new();
+    let mut transcript = Transcript::default();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let trimmed = line.trim().to_string();
+        if let Some(rest) = trimmed.strip_prefix("SECTION ") {
+            transcript.sections.push(rest.to_string());
+        } else if trimmed.starts_with('{') {
+            if let Some(e) = parse_event(&trimmed) {
+                if e.id == "g48-lfm2-l2" && e.typ == "commit_ready" {
+                    writeln!(stdin, "ABORT g48-lfm2-l2 302").expect("abort l2");
+                    stdin.flush().expect("flush abort");
+                }
+                transcript.events.push(e);
+            }
+        }
+    }
+    let status = child.wait().expect("child wait");
+    assert!(status.success(), "lfm2 matrix child failed: {status}");
+    for section in ["load-ok", "g48-lfm2-l1", "g48-lfm2-l2", "g48-lfm2-l3"] {
+        assert!(
+            transcript.sections.contains(&section.to_string()),
+            "missing SECTION {section} (got {:?})",
+            transcript.sections
+        );
+    }
+    let l1 = token_text(&transcript, "g48-lfm2-l1");
+    assert!(!l1.is_empty(), "baseline turn streamed no text");
+    assert_outcome(&transcript, "g48-lfm2-l1", TerminalOutcome::Success);
+    assert_outcome(&transcript, "g48-lfm2-l2", TerminalOutcome::Cancel);
+    assert_outcome(&transcript, "g48-lfm2-l3", TerminalOutcome::Success);
+    assert_eq!(token_text(&transcript, "g48-lfm2-l3"), l1);
 }
 
 // ── child-side GPU implementation ───────────────────────────────────────
@@ -842,6 +909,7 @@ fn dots_turn(
     let mut out = std::io::stdout();
     hipfire_generate::vision::generate_vl_dots_ocr(m, gpu, &mut out, &params);
     std::io::stdout().flush().expect("flush turn");
+    assert_dots_rolled_back(m, id, commit);
     clear_terminal_control();
     emit_marker(&format!("SECTION {id}"));
 }
@@ -871,8 +939,19 @@ fn dots_text_turn(
         m, gpu, &mut out, id, prompt, None, 0.0, 1.0, max_tokens,
     );
     std::io::stdout().flush().expect("flush turn");
+    assert_dots_rolled_back(m, id, commit);
     clear_terminal_control();
     emit_marker(&format!("SECTION {id}"));
+}
+
+/// Uncommitted dots turns (cancel, error, or abort at the commit wait) must
+/// leave no decoder rows resident.
+#[cfg(test)]
+fn assert_dots_rolled_back(m: &mut hipfire_loader::LoadedModel, id: &str, commit: bool) {
+    if !commit {
+        let pos = m.dots_ocr_mut().expect("dots bundle").state.next_pos;
+        assert_eq!(pos, 0, "{id}: uncommitted turn left decoder rows");
+    }
 }
 
 #[cfg(test)]
@@ -1025,6 +1104,17 @@ fn child_dots_matrix() {
         16,
         true,
     );
+    // Client abort at the commit wait (parent aborts on commit_ready).
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d11",
+        115,
+        &image,
+        prompt,
+        16,
+        false,
+    );
 
     // Unload/reload with the n-gram drafter armed: spec success must be
     // byte-identical to AR; spec fault fails closed; reuse recovers.
@@ -1095,12 +1185,23 @@ fn child_dots_matrix() {
         16,
         true,
     );
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-s4",
+        116,
+        &image,
+        prompt,
+        16,
+        false,
+    );
 
     // Text-only path on the same bundle: success, decode cancel, reuse.
     let text_prompt = "List three office supplies.";
     dots_text_turn(&mut m, &mut gpu, "g48-dots-x1", 201, text_prompt, 16, true);
     dots_text_turn(&mut m, &mut gpu, "g48-dots-x2", 202, text_prompt, 32, false);
     dots_text_turn(&mut m, &mut gpu, "g48-dots-x3", 203, text_prompt, 16, true);
+    dots_text_turn(&mut m, &mut gpu, "g48-dots-x4", 204, text_prompt, 16, false);
 
     hipfire_loader::unload_model(m, &mut gpu).expect("final dots unload");
     gpu.drain_pool();
@@ -1110,4 +1211,63 @@ fn child_dots_matrix() {
         "dots final unload leaked VRAM: base {vram_base} final {vram_final}"
     );
     emit_marker("SECTION unload2-ok");
+}
+
+/// One LFM2-VL turn; same harness contract as [`vl_turn`].
+#[cfg(test)]
+fn lfm2_vl_turn(
+    m: &mut hipfire_loader::LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    id: &str,
+    attempt: u64,
+    image: &str,
+    prompt: &str,
+    commit: bool,
+) {
+    use hipfire_engine::terminal::{
+        activate_terminal_control, clear_terminal_control, BatchAttemptScope,
+    };
+    activate_terminal_control(id, attempt);
+    let _scope = BatchAttemptScope::enter_singleton(attempt);
+    if commit {
+        spawn_committer(id, attempt);
+    }
+    emit_marker(&format!("READY {id}"));
+    let params = vl_params(id, prompt, image, 16);
+    let mut out = std::io::stdout();
+    hipfire_generate::vision::generate_lfm2_vl(m, gpu, &mut out, &params);
+    std::io::stdout().flush().expect("flush turn");
+    if !commit {
+        assert_eq!(m.seq_pos, 0, "{id}: uncommitted turn left seq_pos");
+        let rows = m.lfm2moe_mut().expect("lfm2 bundle").state.n_tokens;
+        assert_eq!(rows, 0, "{id}: uncommitted turn left KV rows");
+    }
+    clear_terminal_control();
+    emit_marker(&format!("SECTION {id}"));
+}
+
+#[cfg(test)]
+fn child_lfm2_vl_matrix() {
+    let path =
+        std::env::var("HIPFIRE_LFM2_VL_FIXTURE").expect("HIPFIRE_LFM2_VL_FIXTURE must be set");
+    let image = repo_image(
+        "benchmarks/vision/images/general_qa.jpg",
+        "HIPFIRE_VISION_IMAGE",
+    );
+    spawn_abort_injector();
+    let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
+    warm_first_alloc(&mut gpu);
+    let mut m = admit_and_load(
+        &mut gpu,
+        &path,
+        None,
+        4096,
+        hipfire_runtime::loader_api::SpecLoadCfg::default(),
+    );
+    emit_marker("SECTION load-ok");
+    let prompt = "Describe this image in one sentence.";
+    lfm2_vl_turn(&mut m, &mut gpu, "g48-lfm2-l1", 301, &image, prompt, true);
+    lfm2_vl_turn(&mut m, &mut gpu, "g48-lfm2-l2", 302, &image, prompt, false);
+    lfm2_vl_turn(&mut m, &mut gpu, "g48-lfm2-l3", 303, &image, prompt, true);
+    hipfire_loader::unload_model(m, &mut gpu).expect("lfm2 unload");
 }
