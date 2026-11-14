@@ -8,7 +8,7 @@
 //!
 //! gfx942 route facts these cases rest on (verified by reading the code, see census):
 //! * Today the sealed qt44/qt53 prefill route reaches path 1 on gfx942 because
-//!   `MoePrefillResolution::use_path2 = moe_grouped_gemm && arch.has_wmma()`
+//!   `MoePrefillResolution::use_path2 = arch.has_wmma()`
 //!   (`hipfire-dispatch/src/families/moe.rs:1685`) and `has_wmma()` is RDNA3|RDNA4
 //!   only (`rdna-compute/src/arch_caps.rs:144`). The scatter / unscatter / grouped
 //!   combine kernels below are therefore launched on gfx942 only by a future

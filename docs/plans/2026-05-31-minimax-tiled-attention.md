@@ -104,7 +104,7 @@ acceptable — measure first.)
 - Serve worktree: `~/hipfire-minimax-val` checked out on `lfm2moe/impl`. Update
   with `git fetch origin +refs/heads/lfm2moe/impl:refs/remotes/origin/lfm2moe/impl
   && git reset --hard origin/lfm2moe/impl && cargo build --release --example daemon`.
-- Start serve: `ROCR_VISIBLE_DEVICES=1 HIPFIRE_JINJA_CHAT=1 bun cli/index.ts serve
+- Start serve: `ROCR_VISIBLE_DEVICES=1 bun cli/index.ts serve
   127.0.0.1:11435 -d` (from the worktree). Stop: `bun cli/index.ts stop`.
 - minimax model: `~/minimax-tiny-val/MiniMax-M2.7.mq2-lloyd` (86 GB), symlinked as
   `~/.hipfire/models/minimax-m2.mq2lloyd` (the `.mq2-lloyd` dash ext is NOT

@@ -1309,10 +1309,7 @@ pub fn batch_chunk_delta_net_pre_gdn<'a>(
     // (`batched_moe::execute_deltanet_moe_layer_batched`) keeps the 3-launch
     // sequence. q_raw/k_raw stores are kept by the fused kernel (v1).
     {
-        let no_tree_parents = tree_verify
-            .as_ref()
-            .and_then(|c| c.parent_indices)
-            .is_none();
+        let no_tree_parents = tree_verify.is_none();
         let n_key_heads = config.linear_key_heads;
         if gpu.flags.gfx12_gdn_pre_fused
             && gpu.arch_caps.is_gfx1201()
@@ -1368,10 +1365,7 @@ pub fn batch_chunk_delta_net_pre_gdn<'a>(
             push_gdn_tape_copies(sink, tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
         } else if fusion.is_chain_verify()
             && matches!(batch_semantics, BatchSemantics::Sequential)
-            && tree_verify
-                .as_ref()
-                .and_then(|c| c.parent_indices)
-                .is_none()
+            && tree_verify.is_none()
             && verify_tape_copy_batch_enabled()
         {
             // Singleton chain verify: one batched launch for the same three
@@ -1410,14 +1404,13 @@ pub fn batch_chunk_delta_net_pre_gdn<'a>(
         }
     }
 
-    // Tree-aware dispatch gate: when the caller provides
-    // parent_indices (Phase 3b+ of Task #101), swap the linear
-    // conv1d + GDN for tree-walking variants that eliminate
-    // sibling-subtree state cross-contamination. The tree
+    // Tree-aware dispatch gate: a tree verify (Phase 3b+ of Task #101)
+    // swaps the linear conv1d + GDN for tree-walking variants that
+    // eliminate sibling-subtree state cross-contamination. The tree
     // kernels are READ-ONLY on dn_state (don't advance it) —
     // caller runs linear replay on the accepted spine
     // post-acceptance to commit the trajectory.
-    let tree_parents = tree_verify.and_then(|c| c.parent_indices);
+    let tree_parents = tree_verify.map(|c| c.parent_indices);
     if let Some(parents) = tree_parents {
         gpu.conv1d_silu_split_tree_f32_n(
             &pbs.dn_q_raw_batch,

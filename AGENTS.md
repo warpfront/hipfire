@@ -1022,8 +1022,7 @@ Caveats that are part of the fixture, not trivia:
   resolves to AR there even when a head is present. An explicit
   `speculation.mtp = on` / `--spec mtp` still attaches any present head on
   every producer, and DSpark / DFlash selection is unchanged. Qwen4 MTP serves greedy and sampled
-  requests: `speculation.mtp_sampled` (`HIPFIRE_MTP_SAMPLED`, default on since
-  0.4.1; `0` sends sampled requests to AR) verifies sampled requests by
+  requests: sampled requests are verified by
   speculative rejection sampling against the AR sampler's distribution
   (oracle: `crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs`).
   Sampled MTP output matches AR in distribution, not byte for byte.

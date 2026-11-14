@@ -666,10 +666,8 @@ def main():
         choices=("q8", "fp32", "q4"),
         help=(
             "DeltaNet state precision for the run. Omit to validate the production "
-            "default: Q8 with default-on deterministic error feedback (q8_ef). "
-            "Pass fp32 only when explicitly testing the FP32 state route. If "
-            "HIPFIRE_DN_STATE_EF=0 selects legacy stochastic Q8, byte parity is "
-            "meaningless; re-enable EF or use fp32 plus HIPFIRE_DETERMINISTIC=1."
+            "default: Q8 with deterministic error feedback (q8_ef). "
+            "Pass fp32 only when explicitly testing the FP32 state route."
         ),
     )
     parser.add_argument(

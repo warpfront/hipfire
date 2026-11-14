@@ -1975,37 +1975,16 @@ pub fn llama_batched_prefill_eligible(
         && token_count >= 4
 }
 
-/// Kill-switch for the MQ-V2 (qt44 + neutral qt47-50) gfx11 WMMA prefill path:
-/// gfx12 (`gfx1200`/`gfx1201`) is always admitted, gfx11
-/// (`gfx1100`/`gfx1101`/`gfx1102`/`gfx1150`/`gfx1151`) is admitted unless
-/// `HIPFIRE_MQV2_GFX11_WMMA=0`, anything else is rejected. Defined here as
-/// the shared home for the qwen35 caller (`qwen35::is_batchable_la`);
-/// `llama::is_batchable_la` does NOT delegate to it (see below).
-/// `value` is the raw env var (None = unset → default ON); only `Some("0")`
-/// disables the gfx11 path. Gfx12 is unaffected by the env var.
-pub fn mqv2_gfx11_wmma_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
-    let gfx11_enabled = value != Some("0");
-    if matches!(arch, "gfx1200" | "gfx1201") {
-        true
-    } else if matches!(
-        arch,
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
-    ) {
-        gfx11_enabled
-    } else {
-        false
-    }
-}
-
 /// Admit rule for the MQ-V2 family (`MQ4G256V2` + neutral `MQ6/5/3/2G256V2`)
-/// in batched WMMA prefill: dtype set × arch set × the
-/// `HIPFIRE_MQV2_GFX11_WMMA` kill-switch in one function. Only
+/// in batched WMMA prefill: dtype set × arch set (gfx11
+/// `gfx1100`/`gfx1101`/`gfx1102`/`gfx1150`/`gfx1151` and gfx12
+/// `gfx1200`/`gfx1201`) in one function. Only
 /// `qwen35::is_batchable_la` delegates here — qwen35's
 /// `forward_prefill_chunk` has V2 dispatch arms, while the llama chunk path
 /// does not (see `llama::is_batchable_la`).
 /// `MQ4CG256` (qt45) stays gfx12-only in its caller and is intentionally
 /// NOT part of this rule.
-pub fn mqv2_wmma_batchable(dt: DType, mqv2_gfx11_wmma: Option<&str>, arch: &str) -> bool {
+pub fn mqv2_wmma_batchable(dt: DType, arch: &str) -> bool {
     // MQ4G256V2Lloyd (qt52) shares the V2 wire layout and dispatches through
     // the LUT variants of the same WMMA/FP8 prefill families (gfx12) — admit
     // it exactly like qt44; the dispatch layer fails closed on any family
@@ -2018,7 +1997,10 @@ pub fn mqv2_wmma_batchable(dt: DType, mqv2_gfx11_wmma: Option<&str>, arch: &str)
             | DType::MQ5G256V2
             | DType::MQ3G256V2
             | DType::MQ2G256V2
-    ) && mqv2_gfx11_wmma_enabled_from_env(mqv2_gfx11_wmma, arch)
+    ) && matches!(
+        arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
+    )
 }
 
 /// Is this dtype/arch combination eligible for the batched WMMA prefill
@@ -3841,22 +3823,6 @@ pub fn forward_scratch_embed(
     Ok(())
 }
 
-/// Layer loop + final norm + logits + sampling. Graph-capturable.
-/// Cached `HIPFIRE_FORWARD_LOWERED` toggle for the llama-family decode path
-/// (N5 Phase A). Default ON; `HIPFIRE_FORWARD_LOWERED=0` forces the legacy
-/// hand-rolled [`forward_scratch_layers`] body as a byte-exact reference +
-/// escape hatch. Mirrors qwen2's `qwen2_forward_lowered_enabled`.
-fn llama_forward_lowered_enabled() -> bool {
-    use std::sync::OnceLock;
-    static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
-            .ok()
-            .as_deref()
-            != Some("0")
-    })
-}
-
 /// Numeric attention flash policy for `HIPFIRE_ATTN_FLASH` (`config.attention_flash_mode`):
 /// `0` never, `1` auto (flash at long context), `2` always. `auto` resolves to
 /// `2` on graph-capable archs (gfx11/gfx12) so direct and captured forwards run
@@ -3891,10 +3857,9 @@ fn llama_flash_partials_len(
     n_heads * max_seq.div_ceil(flash_tile) * (2 + head_dim)
 }
 
-/// KV-cache write + single-token attention for the lowered decode path.
+/// KV-cache write + single-token attention for the decode path.
 /// Asym and Q8 tiers use the paired `AttentionFamily` plan; legacy cache
-/// formats retain the hand ladder below. The hand body keeps its own inline
-/// copy as the byte-exact `HIPFIRE_FORWARD_LOWERED=0` reference.
+/// formats retain the hand ladder below.
 fn llama_kv_write_attend(
     gpu: &mut Gpu,
     kv_cache: &KvCache,
@@ -4121,22 +4086,14 @@ fn llama_kv_write_attend(
     Ok(())
 }
 
-/// Lowered llama-family decode loop (N5 Phase A3a). Behaviorally equivalent to
-/// the hand [`forward_scratch_layers`] loop: projections (QKV / o_proj / gate-up
-/// / down / lm_head) go through `hipfire_dispatch::execute_steps` (which selects
-/// FusedQkvQ4K / fused-MQ / per-op + handles FWHT rotation + residual fusion),
-/// while qk_norm, RoPE, the KV ladder (via [`llama_kv_write_attend`]), final
-/// norm and sampling stay the same bare `gpu.*` calls. Validated against the
-/// hand path via the `HIPFIRE_FORWARD_LOWERED=0`-vs-default committed-token md5
-/// A/B (`scripts/forward-lowered-parity.sh`).
-///
-/// Note: like the dead `arch-llama` port this came from, the lowered QKV/gate-up
-/// `RmsnormAutomatic` always normalizes — including the Q4K branch the hand path
-/// previously skipped (the "F1 rmsnorm bug" fix). So Q4K output is intentionally
-/// *more correct* and may legitimately differ from the hand bytes; gate Q4K via
-/// coherence-gate, not byte-parity. MQ paths are expected byte-identical.
+/// Llama-family decode loop + final norm + logits + sampling. Graph-capturable.
+/// Projections (QKV / o_proj / gate-up / down / lm_head) go through
+/// `hipfire_dispatch::execute_steps` (which selects FusedQkvQ4K / fused-MQ /
+/// per-op + handles FWHT rotation + residual fusion), while qk_norm, RoPE, the
+/// KV ladder (via [`llama_kv_write_attend`]), final norm and sampling stay bare
+/// `gpu.*` calls.
 #[allow(clippy::too_many_arguments)]
-fn forward_scratch_layers_lowered(
+pub fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &LlamaWeights,
     config: &LlamaConfig,
@@ -4149,7 +4106,7 @@ fn forward_scratch_layers_lowered(
     repeat_window: usize,
     repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
-    forward_scratch_compute_lowered(gpu, weights, config, pos, kv_cache, scratch, None)?;
+    forward_scratch_compute_capture(gpu, weights, config, pos, kv_cache, scratch, None)?;
     gpu.sample_top_p(
         &scratch.logits,
         &scratch.sample_buf,
@@ -4163,9 +4120,15 @@ fn forward_scratch_layers_lowered(
     )
 }
 
-/// Lowered layer loop + final norm + logits (no sampling) with the optional
-/// per-extract-layer hidden capture of [`forward_scratch_compute_capture`].
-fn forward_scratch_compute_lowered(
+/// `forward_scratch_compute` plus an optional per-extract-layer residual-hidden
+/// capture sink. Processes ONE token through the same decode body as AR's
+/// `forward_scratch`, and for each decoder layer whose index appears in
+/// `capture.extract_layers` downloads the post-FFN residual (`scratch.x[..dim]`)
+/// and appends, in `extract_layers` ascending order, `num_extract × dim` f32 to
+/// the sink. This is the per-token twin of `forward_prefill_batch_capture`'s
+/// capture; speculators use it wherever AR runs a per-token forward so the
+/// committed KV and hidden match AR's decode bit for bit.
+pub fn forward_scratch_compute_capture(
     gpu: &mut Gpu,
     weights: &LlamaWeights,
     config: &LlamaConfig,
@@ -4368,363 +4331,6 @@ impl crate::arch_spec::DenseArch for LlamaDense<'_> {
         };
         Ok(Some((plan, io)))
     }
-}
-
-pub fn forward_scratch_layers(
-    gpu: &mut Gpu,
-    weights: &LlamaWeights,
-    config: &LlamaConfig,
-    pos: usize,
-    kv_cache: &mut KvCache,
-    scratch: &ForwardScratch,
-    temperature: f32,
-    top_p: f32,
-    rng_state: u32,
-    repeat_window: usize,
-    repeat_penalty: f32,
-) -> HipResult<(u32, u32)> {
-    if llama_forward_lowered_enabled() {
-        return forward_scratch_layers_lowered(
-            gpu,
-            weights,
-            config,
-            pos,
-            kv_cache,
-            scratch,
-            temperature,
-            top_p,
-            rng_state,
-            repeat_window,
-            repeat_penalty,
-        );
-    }
-
-    let n_heads = config.n_heads;
-    let n_kv_heads = config.n_kv_heads;
-    let head_dim = config.head_dim;
-    let kv_dim = n_kv_heads * head_dim;
-
-    for layer_idx in 0..config.n_layers {
-        let layer = &weights.layers[layer_idx];
-
-        gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
-
-        if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
-            gpu.fused_qkv_q4k(
-                &layer.wq.buf,
-                &layer.wk.buf,
-                &layer.wv.buf,
-                &scratch.tmp,
-                &scratch.q,
-                &scratch.k,
-                &scratch.v,
-                layer.wq.m,
-                layer.wk.m,
-                layer.wv.m,
-                layer.wq.k,
-            )?;
-        } else {
-            // Batch FWHT for MQ weights: wq/wk/wv all consume scratch.tmp.
-            let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
-            weight_gemv_prerotated(gpu, &layer.wq, &scratch.tmp, x_rot, &scratch.q)?;
-            weight_gemv_prerotated(gpu, &layer.wk, &scratch.tmp, x_rot, &scratch.k)?;
-            weight_gemv_prerotated(gpu, &layer.wv, &scratch.tmp, x_rot, &scratch.v)?;
-        }
-
-        if config.has_qk_norm {
-            if let Some(ref qn) = layer.q_norm {
-                gpu.rmsnorm_batched(
-                    &scratch.q,
-                    qn,
-                    &scratch.q,
-                    n_heads,
-                    head_dim,
-                    config.norm_eps,
-                )?;
-            }
-            if let Some(ref kn) = layer.k_norm {
-                gpu.rmsnorm_batched(
-                    &scratch.k,
-                    kn,
-                    &scratch.k,
-                    n_kv_heads,
-                    head_dim,
-                    config.norm_eps,
-                )?;
-            }
-        }
-
-        gpu.rope_scaled_f32(
-            &scratch.q,
-            &scratch.k,
-            &scratch.pos_buf,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            config.rope_freq_base,
-            config.rope_llama3,
-        )?;
-
-        if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
-            // Rotated-K KV: the manual ladder below has no rotated-K kernels, so
-            // route KV-write + flash-attend through the dispatch attention
-            // family (the same path qwen35 uses). tier_inputs() classifies the
-            // tier from the cache's quant flags; run_attention does both the
-            // KV write and the single-token flash attend.
-            let ctx = DispatchCtx::new(gpu);
-            let plan = KvTierPlan::derive(KvTierInputs {
-                pos,
-                ..kv_cache.tier_inputs()
-            })
-            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-            let io = AttnParams {
-                q: &scratch.q,
-                k: &scratch.k,
-                v: &scratch.v,
-                k_cache: &kv_cache.k_gpu[layer_idx],
-                v_cache: &kv_cache.v_gpu[layer_idx],
-                k_scales: None,
-                v_scales: None,
-                pos_buf: &scratch.pos_buf,
-                pos,
-                positions: None,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                physical_cap: kv_cache.physical_cap,
-                batch_size: 1,
-                max_ctx_len: 0,
-                flash_partials: Some(&scratch.attn_partials),
-                givens_cos: kv_cache.givens_cos.as_ref(),
-                givens_sin: kv_cache.givens_sin.as_ref(),
-                tree_bias: None,
-                block_start: 0,
-                block_cols: 0,
-                output_gate: None,
-                output_awq_scale: None,
-                output: &scratch.attn_out,
-            };
-            attention_family()
-                .run_attention(&ctx, gpu, &plan, &io)
-                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-        } else if kv_cache.quant_hfq4 {
-            gpu.kv_cache_write_hfq4(
-                &kv_cache.k_gpu[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.kv_cache_write_hfq4(
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.attention_hfq4_kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        } else if kv_cache.quantized
-            && !kv_cache.k_scales.is_empty()
-            && !kv_cache.quant_int8
-            && !kv_cache.quant_q8
-        {
-            // HFQ8 flat layout
-            gpu.kv_cache_write_hfq8(
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.k_scales[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.kv_cache_write_hfq8(
-                &kv_cache.v_gpu[layer_idx],
-                &kv_cache.v_scales[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.attention_hfq8_kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.k_scales[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &kv_cache.v_scales[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        } else if kv_cache.quant_int8 {
-            gpu.kv_cache_write_int8c_f16(
-                &kv_cache.k_gpu[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.kv_cache_write_int8c_f16(
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.attention_int8c_f16_kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        } else if kv_cache.quantized && kv_cache.quant_q8 {
-            gpu.kv_cache_write_q8_0(
-                &kv_cache.k_gpu[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.kv_cache_write_q8_0(
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.attention_q8_0_kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        } else if kv_cache.quantized {
-            gpu.kv_cache_write_q4(
-                &kv_cache.k_gpu[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.kv_cache_write_q4(
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.attention_q4kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        } else {
-            gpu.kv_cache_write(
-                &kv_cache.k_gpu[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                kv_dim,
-            )?;
-            gpu.kv_cache_write(
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                kv_dim,
-            )?;
-            gpu.attention_f32(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        }
-
-        weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
-
-        gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
-        if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
-            gpu.fused_gate_up_q4k(
-                &layer.w_gate.buf,
-                &layer.w_up.buf,
-                &scratch.tmp,
-                &scratch.gate,
-                &scratch.up,
-                layer.w_gate.m,
-                layer.w_up.m,
-                layer.w_gate.k,
-            )?;
-        } else {
-            // Batch FWHT for MQ weights: w_gate/w_up share scratch.tmp.
-            let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &scratch.tmp, &scratch.x_rot)?;
-            weight_gemv_prerotated(gpu, &layer.w_gate, &scratch.tmp, x_rot, &scratch.gate)?;
-            weight_gemv_prerotated(gpu, &layer.w_up, &scratch.tmp, x_rot, &scratch.up)?;
-        }
-
-        gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
-        weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
-    }
-
-    gpu.rmsnorm_f32(
-        &scratch.x,
-        &weights.output_norm,
-        &scratch.tmp,
-        config.norm_eps,
-    )?;
-    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
-
-    // GPU-side sampling (includes sync readback — can't be in graph capture)
-    gpu.sample_top_p(
-        &scratch.logits,
-        &scratch.sample_buf,
-        &scratch.repeat_buf,
-        config.vocab_size,
-        temperature,
-        top_p,
-        rng_state,
-        repeat_window,
-        repeat_penalty,
-    )
 }
 
 /// Early-exit forward pass: check confidence at checkpoint layers, skip rest if confident.
@@ -4968,372 +4574,6 @@ pub fn forward_scratch_compute(
     scratch: &ForwardScratch,
 ) -> HipResult<()> {
     forward_scratch_compute_capture(gpu, weights, config, pos, kv_cache, scratch, None)
-}
-
-/// `forward_scratch_compute` plus an optional per-extract-layer residual-hidden
-/// capture sink. Processes ONE token through the same decode body as AR's
-/// `forward_scratch` (the lowered path unless `HIPFIRE_FORWARD_LOWERED=0`, then
-/// the hand ladder below), and for each decoder layer whose index appears in
-/// `capture.extract_layers` downloads the post-FFN residual (`scratch.x[..dim]`)
-/// and appends, in `extract_layers` ascending order, `num_extract × dim` f32 to
-/// the sink. This is the per-token twin of `forward_prefill_batch_capture`'s
-/// capture; speculators use it wherever AR runs a per-token forward so the
-/// committed KV and hidden match AR's decode bit for bit.
-#[allow(clippy::too_many_arguments)]
-pub fn forward_scratch_compute_capture(
-    gpu: &mut Gpu,
-    weights: &LlamaWeights,
-    config: &LlamaConfig,
-    pos: usize,
-    kv_cache: &mut KvCache,
-    scratch: &ForwardScratch,
-    mut capture: Option<&mut HiddenCaptureSink>,
-) -> HipResult<()> {
-    if llama_forward_lowered_enabled() {
-        return forward_scratch_compute_lowered(
-            gpu, weights, config, pos, kv_cache, scratch, capture,
-        );
-    }
-    let n_heads = config.n_heads;
-    let n_kv_heads = config.n_kv_heads;
-    let head_dim = config.head_dim;
-    let kv_dim = n_kv_heads * head_dim;
-    let dim = config.dim;
-    // Per-token capture appends rows in extract-layer ASCENDING order, matching
-    // forward_prefill_batch_capture's layout for n=1 (one position per call).
-    let mut cap_rows: Vec<Vec<f32>> = Vec::new();
-
-    for layer_idx in 0..config.n_layers {
-        let layer = &weights.layers[layer_idx];
-        gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
-
-        if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
-            gpu.fused_qkv_q4k(
-                &layer.wq.buf,
-                &layer.wk.buf,
-                &layer.wv.buf,
-                &scratch.tmp,
-                &scratch.q,
-                &scratch.k,
-                &scratch.v,
-                layer.wq.m,
-                layer.wk.m,
-                layer.wv.m,
-                layer.wq.k,
-            )?;
-        } else {
-            // Batch FWHT for MQ weights: wq/wk/wv all consume scratch.tmp.
-            let x_rot = rotate_x_for_mq(gpu, &layer.wq, &scratch.tmp, &scratch.x_rot)?;
-            weight_gemv_prerotated(gpu, &layer.wq, &scratch.tmp, x_rot, &scratch.q)?;
-            weight_gemv_prerotated(gpu, &layer.wk, &scratch.tmp, x_rot, &scratch.k)?;
-            weight_gemv_prerotated(gpu, &layer.wv, &scratch.tmp, x_rot, &scratch.v)?;
-        }
-
-        if config.has_qk_norm {
-            if let Some(ref qn) = layer.q_norm {
-                gpu.rmsnorm_batched(
-                    &scratch.q,
-                    qn,
-                    &scratch.q,
-                    n_heads,
-                    head_dim,
-                    config.norm_eps,
-                )?;
-            }
-            if let Some(ref kn) = layer.k_norm {
-                gpu.rmsnorm_batched(
-                    &scratch.k,
-                    kn,
-                    &scratch.k,
-                    n_kv_heads,
-                    head_dim,
-                    config.norm_eps,
-                )?;
-            }
-        }
-
-        gpu.rope_scaled_f32(
-            &scratch.q,
-            &scratch.k,
-            &scratch.pos_buf,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            config.rope_freq_base,
-            config.rope_llama3,
-        )?;
-
-        if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
-            // Rotated-K KV: the manual ladder below has no rotated-K kernels, so
-            // route KV-write + flash-attend through the dispatch attention
-            // family (the same path qwen35 uses). tier_inputs() classifies the
-            // tier from the cache's quant flags; run_attention does both the
-            // KV write and the single-token flash attend.
-            let ctx = DispatchCtx::new(gpu);
-            let plan = KvTierPlan::derive(KvTierInputs {
-                pos,
-                ..kv_cache.tier_inputs()
-            })
-            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-            let io = AttnParams {
-                q: &scratch.q,
-                k: &scratch.k,
-                v: &scratch.v,
-                k_cache: &kv_cache.k_gpu[layer_idx],
-                v_cache: &kv_cache.v_gpu[layer_idx],
-                k_scales: None,
-                v_scales: None,
-                pos_buf: &scratch.pos_buf,
-                pos,
-                positions: None,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                physical_cap: kv_cache.physical_cap,
-                batch_size: 1,
-                max_ctx_len: 0,
-                flash_partials: Some(&scratch.attn_partials),
-                givens_cos: kv_cache.givens_cos.as_ref(),
-                givens_sin: kv_cache.givens_sin.as_ref(),
-                tree_bias: None,
-                block_start: 0,
-                block_cols: 0,
-                output_gate: None,
-                output_awq_scale: None,
-                output: &scratch.attn_out,
-            };
-            attention_family()
-                .run_attention(&ctx, gpu, &plan, &io)
-                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-        } else if kv_cache.quant_hfq4 {
-            gpu.kv_cache_write_hfq4(
-                &kv_cache.k_gpu[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.kv_cache_write_hfq4(
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.attention_hfq4_kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        } else if kv_cache.quantized
-            && !kv_cache.k_scales.is_empty()
-            && !kv_cache.quant_int8
-            && !kv_cache.quant_q8
-        {
-            // HFQ8 flat layout
-            gpu.kv_cache_write_hfq8(
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.k_scales[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.kv_cache_write_hfq8(
-                &kv_cache.v_gpu[layer_idx],
-                &kv_cache.v_scales[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.attention_hfq8_kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.k_scales[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &kv_cache.v_scales[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        } else if kv_cache.quant_int8 {
-            gpu.kv_cache_write_int8c_f16(
-                &kv_cache.k_gpu[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.kv_cache_write_int8c_f16(
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.attention_int8c_f16_kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        } else if kv_cache.quantized && kv_cache.quant_q8 {
-            gpu.kv_cache_write_q8_0(
-                &kv_cache.k_gpu[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.kv_cache_write_q8_0(
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.attention_q8_0_kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        } else if kv_cache.quantized {
-            gpu.kv_cache_write_q4(
-                &kv_cache.k_gpu[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.kv_cache_write_q4(
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                n_kv_heads,
-                head_dim,
-            )?;
-            gpu.attention_q4kv(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        } else {
-            gpu.kv_cache_write(
-                &kv_cache.k_gpu[layer_idx],
-                &scratch.k,
-                &scratch.pos_buf,
-                kv_dim,
-            )?;
-            gpu.kv_cache_write(
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.v,
-                &scratch.pos_buf,
-                kv_dim,
-            )?;
-            gpu.attention_f32(
-                &scratch.q,
-                &kv_cache.k_gpu[layer_idx],
-                &kv_cache.v_gpu[layer_idx],
-                &scratch.attn_out,
-                &scratch.pos_buf,
-                pos + 1,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                kv_cache.physical_cap,
-            )?;
-        }
-
-        weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
-
-        gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
-        if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
-            gpu.fused_gate_up_q4k(
-                &layer.w_gate.buf,
-                &layer.w_up.buf,
-                &scratch.tmp,
-                &scratch.gate,
-                &scratch.up,
-                layer.w_gate.m,
-                layer.w_up.m,
-                layer.w_gate.k,
-            )?;
-        } else {
-            // Batch FWHT for MQ weights: w_gate/w_up share scratch.tmp.
-            let x_rot = rotate_x_for_mq(gpu, &layer.w_gate, &scratch.tmp, &scratch.x_rot)?;
-            weight_gemv_prerotated(gpu, &layer.w_gate, &scratch.tmp, x_rot, &scratch.gate)?;
-            weight_gemv_prerotated(gpu, &layer.w_up, &scratch.tmp, x_rot, &scratch.up)?;
-        }
-
-        gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
-        weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
-
-        // DFlash per-token capture: download this layer's post-FFN residual
-        // (`scratch.x[..dim]`) if it is an extract layer. Same point as the
-        // batched capture (post-FFN residual, before next attn_norm).
-        if let Some(cap) = capture.as_deref() {
-            if cap.extract_layers.contains(&layer_idx) {
-                let row = scratch.x.sub_offset(0, dim);
-                cap_rows.push(gpu.download_f32(&row)?);
-            }
-        }
-    }
-
-    if let Some(cap) = capture.as_deref_mut() {
-        debug_assert_eq!(
-            cap_rows.len(),
-            cap.extract_layers.len(),
-            "captured {} layers but extract_layers has {}",
-            cap_rows.len(),
-            cap.extract_layers.len()
-        );
-        for layer_rows in cap_rows.iter() {
-            cap.hidden.extend_from_slice(&layer_rows[..dim]);
-        }
-    }
-
-    gpu.rmsnorm_f32(
-        &scratch.x,
-        &weights.output_norm,
-        &scratch.tmp,
-        config.norm_eps,
-    )?;
-    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
-    Ok(())
 }
 
 /// Run a single forward pass for one token (decode step).

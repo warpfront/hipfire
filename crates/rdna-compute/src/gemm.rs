@@ -383,10 +383,6 @@ static DISPATCH_V2C_ADDEPI: LazyLock<bool> =
 static DISPATCH_V2B_ADDEPI: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_V2B_ADDEPI").as_deref() != Ok("0"));
 
-static DISPATCH_GFX1100_DENSE_GATE_UP_STAGE_X32: LazyLock<bool> = LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32", true)
-});
-
 static DISPATCH_GFX1100_DENSE_GATE_UP_PAIR: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR", false));
 
@@ -409,6 +405,8 @@ static DISPATCH_GFX1100_DENSE_GATE_UP_LANE0_HEADERS: LazyLock<bool> = LazyLock::
     hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS", false)
 });
 
+// Kept (HIPF-396): `[developer] gate_up_bt = false` pins bt1 at B64 in the
+// certified gfx1201 batched Redline profile (docs/configs/batched-redline-pm4-product.toml).
 static GATE_UP_BT: LazyLock<bool> = LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
         .map(|v| v != "0" && !v.is_empty())
@@ -5062,7 +5060,7 @@ impl Gpu {
     }
 
     /// `fused_qkv_hfq6g256` with an optional Q/K/V bias folded into the kernel's
-    /// lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`). All-null = byte-identical.
+    /// lane-0 store (the QKV bias fold). All-null = byte-identical.
     #[allow(clippy::too_many_arguments)]
     pub fn fused_qkv_hfq6g256_with_bias(
         &mut self,
@@ -25261,7 +25259,7 @@ impl Gpu {
     /// affect greedy acceptance. Do NOT use for AR greedy prefill — it will
     /// break byte-exact quality-gate reproducibility.
     ///
-    /// Fallbacks: non-gfx11 or HIPFIRE_FP16=0 or HIPFIRE_LM_HEAD_WMMA=0 →
+    /// Fallbacks: non-gfx11 or HIPFIRE_FP16=0 →
     /// routes to plain `gemm_hfq4g256`.
     ///
     /// Subtle: the residual-WMMA kernel goes through `ensure_fp16_x`, which
@@ -25289,8 +25287,7 @@ impl Gpu {
         let arch = self.arch.as_str();
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
-            && !self.flags.fp16_disabled
-            && !self.flags.lm_head_wmma_disabled;
+            && !self.flags.fp16_disabled;
         if wmma_eligible {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -25366,8 +25363,7 @@ impl Gpu {
         let arch_str = self.arch.as_str();
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
-            && !self.flags.fp16_disabled
-            && !self.flags.lm_head_wmma_disabled;
+            && !self.flags.fp16_disabled;
         if wmma_eligible {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -25474,8 +25470,7 @@ impl Gpu {
         // through to the per-row GEMV path.
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
-            && !self.flags.fp16_disabled
-            && !self.flags.lm_head_wmma_disabled;
+            && !self.flags.fp16_disabled;
         if wmma_eligible {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -27530,7 +27525,7 @@ impl Gpu {
     }
 
     /// `fused_qkv_q4k` with an optional Q/K/V bias folded into the kernel's
-    /// lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`). All-null = byte-identical to the
+    /// lane-0 store (the QKV bias fold). All-null = byte-identical to the
     /// unfused path.
     #[allow(clippy::too_many_arguments)]
     pub fn fused_qkv_q4k_with_bias(
@@ -27982,24 +27977,18 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
-        let wmma_on = !self.flags.deepseek4_q8_wmma_off;
-        if wmma_on && self.arch_caps.is_rdna4() {
+        if self.arch_caps.is_rdna4() {
             // RDNA4 (gfx12): upstream-tuned gating.
             if let Some(scratch) = x_f16_scratch {
                 let nn = (n * k) as i64;
                 self.deepseek4_convert_f32_to_f16(x, scratch, nn)?;
-                let use_4w = !self.flags.deepseek4_q8_4w_off
-                    && n >= 256
-                    && m >= 4096
-                    && m % 64 == 0
-                    && k % 32 == 0
-                    && n % 64 == 0;
+                let use_4w = n >= 256 && m >= 4096 && m % 64 == 0 && k % 32 == 0 && n % 64 == 0;
                 if use_4w {
                     return self.gemm_q8_0_wmma_4w(weight, scratch, y, m, k, n);
                 }
                 return self.gemm_q8_0_wmma(weight, scratch, y, m, k, n);
             }
-        } else if wmma_on && self.arch_caps.has_wmma() && m % 64 == 0 && k % 32 == 0 {
+        } else if self.arch_caps.has_wmma() && m % 64 == 0 && k % 32 == 0 {
             // i8-MMQ 64×64 dense path (gfx1151): int8 weights direct + Q8_1
             // activations + i8 WMMA at ~2x. ~1.4-1.56x over the f16 64×64 kernel
             // at the q-LoRA projection shapes (M=4096, batch≥256).
@@ -28009,12 +27998,11 @@ impl Gpu {
             // gfx11 / RDNA3.5 (gfx1151) Q8_0 WMMA prefill. The activation is
             // pre-converted to F16 in `scratch`; the kernels honor the F16 dtype
             // (no re-convert). 4-warp 64×64-tile kernel for batch%64==0 (~12%
-            // over single-warp 16×16; weight-bandwidth-bound); the 4w opt-out
-            // forces single-warp.
+            // over single-warp 16×16; weight-bandwidth-bound).
             if let Some(scratch) = x_f16_scratch {
                 let nn = (n * k) as i64;
                 self.deepseek4_convert_f32_to_f16(x, scratch, nn)?;
-                if !self.flags.deepseek4_q8_4w_off && n >= 64 && n % 64 == 0 {
+                if n >= 64 && n % 64 == 0 {
                     return self.gemm_q8_0_wmma_4w(weight, scratch, y, m, k, n);
                 }
                 return self.gemm_q8_0_wmma(weight, scratch, y, m, k, n);
@@ -29020,11 +29008,8 @@ impl Gpu {
         // Host-gated identity; reuses fused_gate_up_hfq4g256 arithmetic template.
         let glimmer_gate_up_k6656_gfx1100 =
             self.arch_caps.is_gfx1100() && gate_m == 19_968 && up_m == 19_968 && k == 6_656;
-        let dense_gate_up_stage_x32_gfx1100 = self.arch_caps.is_gfx1100()
-            && gate_m == 17_408
-            && up_m == 17_408
-            && k == 5_120
-            && *DISPATCH_GFX1100_DENSE_GATE_UP_STAGE_X32;
+        let dense_gate_up_stage_x32_gfx1100 =
+            self.arch_caps.is_gfx1100() && gate_m == 17_408 && up_m == 17_408 && k == 5_120;
         let dense_gate_up_pair_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
@@ -29478,7 +29463,7 @@ impl Gpu {
     }
 
     /// `fused_qkv_q8_0` with an optional Q/K/V bias folded into the kernel's
-    /// lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`). All-null = byte-identical to the
+    /// lane-0 store (the QKV bias fold). All-null = byte-identical to the
     /// unfused path.
     #[allow(clippy::too_many_arguments)]
     pub fn fused_qkv_q8_0_with_bias(
@@ -43092,8 +43077,7 @@ impl Gpu {
         }
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
-            && !self.flags.fp16_disabled
-            && !self.flags.lm_head_wmma_disabled;
+            && !self.flags.fp16_disabled;
         if wmma_eligible {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -45335,8 +45319,7 @@ impl Gpu {
         }
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
-            && !self.flags.fp16_disabled
-            && !self.flags.lm_head_wmma_disabled;
+            && !self.flags.fp16_disabled;
         if wmma_eligible {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -47287,8 +47270,7 @@ impl Gpu {
         }
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
-            && !self.flags.fp16_disabled
-            && !self.flags.lm_head_wmma_disabled;
+            && !self.flags.fp16_disabled;
         if wmma_eligible {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -48432,8 +48414,7 @@ impl Gpu {
         }
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
-            && !self.flags.fp16_disabled
-            && !self.flags.lm_head_wmma_disabled;
+            && !self.flags.fp16_disabled;
         if wmma_eligible {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -49627,8 +49608,7 @@ impl Gpu {
         }
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
-            && !self.flags.fp16_disabled
-            && !self.flags.lm_head_wmma_disabled;
+            && !self.flags.fp16_disabled;
         if wmma_eligible {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -50890,8 +50870,7 @@ impl Gpu {
         self.bind_thread()?;
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
-            && !self.flags.fp16_disabled
-            && !self.flags.lm_head_wmma_disabled;
+            && !self.flags.fp16_disabled;
         if wmma_eligible {
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {

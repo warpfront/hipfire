@@ -28,7 +28,7 @@ def classify(name: str) -> str:
         return "topk_selection"
     if "topk_kv_gather" in n or "indexer_kv_gather" in n:
         return "compressed_kv_read"
-    if "deepseek4_attn_swa" in n or "deepseek4_attn_pos0" in n:
+    if "deepseek4_attn_swa" in n:
         return "flash_attention"
     # Only call-site-specific routed-MoE symbols are safe to assign here.
     # Generic E8-SoA GEMVs are shared by attention, compressors, FFN and the

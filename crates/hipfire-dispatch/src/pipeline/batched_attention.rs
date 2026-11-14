@@ -2008,12 +2008,6 @@ pub fn batch_chunk_fa_attend(
                     .as_deref(),
                 Some("0") | Some("off") | Some("false")
             )
-            && !matches!(
-                hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
-                    .ok()
-                    .as_deref(),
-                Some("scalar") | Some("batched")
-            )
             && ctx.workload == DispatchWorkload::Standard
             && config.n_heads == 24
             && config.n_kv_heads == 4

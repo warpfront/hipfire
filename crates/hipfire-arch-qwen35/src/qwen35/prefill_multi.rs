@@ -120,7 +120,7 @@ pub fn multi_chunk_row_cap(gpu: &Gpu) -> usize {
 /// exact only when (a) the device's effective cap exceeds the product cap,
 /// (b) every singleton arm it must match runs the one-tile F16-WMMA chain the
 /// exact wide kernels reproduce ([`Gpu::mq4_verify_singleton_chain`]: refused
-/// under `HIPFIRE_FP16=0`, `HIPFIRE_LM_HEAD_WMMA=0`,
+/// under `HIPFIRE_FP16=0` or
 /// `HIPFIRE_HFQ4G256_LDSSTAGE=1`), and (c) the trunk and head are dense
 /// MQ4G256V2: every projection of every layer and the lm_head (no MoE,
 /// Lloyd, MQ3/MQ6, Q8 or other dtypes), with `w_down.k == hidden_dim` (the
@@ -2063,9 +2063,8 @@ mod pack_tests {
 
     /// Every switch that moves a singleton (`<= 63`-row) dense MQ4G256V2 arm
     /// off the one-tile F16-WMMA chain the wide kernels reproduce.
-    const SINGLETON_ARM_SWITCHES: [(&str, fn(&mut FeatureFlags)); 4] = [
+    const SINGLETON_ARM_SWITCHES: [(&str, fn(&mut FeatureFlags)); 3] = [
         ("HIPFIRE_FP16=0", |f| f.fp16_disabled = true),
-        ("HIPFIRE_LM_HEAD_WMMA=0", |f| f.lm_head_wmma_disabled = true),
         ("HIPFIRE_HFQ4G256_LDSSTAGE=1", |f| {
             f.hfq4g256_ldsstage_wmma = true
         }),

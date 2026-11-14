@@ -175,7 +175,6 @@ class Daemon:
             env["HIPFIRE_HOME"] = str(hipfire_home.resolve())
             env.pop("HIPFIRE_MODELS_DIR", None)
         env["HIP_VISIBLE_DEVICES"] = physical_gpu
-        env["HIPFIRE_GEMMA4_GRAPH"] = "0"
         env["HIPFIRE_GEMMA4_EAGLE"] = "0"
         env["HIPFIRE_Q8_BATCHED_LEGACY"] = "0"
         env["HIPFIRE_GEMMA4_PREFILL_BATCH"] = str(prefill_batch)

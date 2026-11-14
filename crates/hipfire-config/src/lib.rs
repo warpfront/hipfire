@@ -1944,18 +1944,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Native Qwen4 MTP n-gram copy lane (verbatim-copy matcher, adaptive take of up to the row-exact verify rows minus one, row-0 confirmation only until the copy source is established, kept on floor-retired requests). on/1 arms it wherever the native Qwen4 n-gram source is armed (triple 5/1/63); off/0 keeps the 5/3/3 pool with row-0 confirmation on every takeover (kill switch); auto (default) arms it for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 and leaves every other GPU off."
     ),
     field!(
-        "speculation.mtp_sampled",
-        "mtp_sampled",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Bool(true),
-        ValueRule::Bool,
-        false,
-        false,
-        Some("HIPFIRE_MTP_SAMPLED"),
-        "Qwen4 (Flash-Next) native MTP for sampled (temperature > 0) requests: lossless speculative rejection sampling against the AR sampler's distribution. On by default; off routes sampled requests to AR."
-    ),
-    field!(
         "speculation.mode",
         "speculation",
         Speculation,
@@ -2062,15 +2050,6 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_DEFAULT_CHATML"),
         "Allow the fallback ChatML frame when no template resolves."
-    ),
-    process_bool_field!(
-        "prompt.jinja_chat",
-        "jinja_chat",
-        Prompt,
-        true,
-        false,
-        "HIPFIRE_JINJA_CHAT",
-        "Render chat prompts through the model Jinja template; set HIPFIRE_JINJA_CHAT=0 for the hand-rolled ChatScaffold path."
     ),
     process_field!(
         "hardware.devices",
@@ -2381,15 +2360,6 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_PREFILL_CHUNK_ROWS",
         "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung). Resident Qwen3.5/3.6 MoE models (fully resident, single device, grouped MQ4 producers) take one widened rung instead: unset requests 4096 rows, admitted only when the projected prefill batch scratch plus grouped/projection workspace plus the 1 GiB margin fit the free VRAM, else the incumbent 512 (arch default) ceiling with no intermediate rung; an explicit value below 4096 or HIPFIRE_PREFILL_MAX_BATCH keeps the incumbent, one at or above 4096 requests the admitted rung (the actual admitted chunk is logged as `prefill_chunk: requested=… admitted=…`). Dense Qwen3.5/3.6 keeps the 8192 ladder above. Qwen4 (Flash-Next) rounds it down to 256 rows; its auto expert placement is sized from the same chunk: the explicit value, else 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere; exact gfx1100 on a measured narrow discrete host link (below 16 GB/s, probed before placement is sized) defaults to 8192, ceding resident expert layers for the wider chunk (an explicit value never probes and is authoritative for placement; 1536 opts out)."
-    ),
-    process_bool_field!(
-        "speculation.draft_f16",
-        "draft_f16",
-        Speculation,
-        true,
-        false,
-        "HIPFIRE_DRAFT_F16",
-        "Keep DFlash draft activations in FP16."
     ),
     diagnostic_bool_field!(
         "diagnostic.prompt_token_heat",
@@ -2990,15 +2960,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable weight-only MMQ dispatch."
     ),
     process_bool_field!(
-        "kernel.lm_head_wmma",
-        "lm_head_wmma",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_LM_HEAD_WMMA",
-        "Allow WMMA LM-head dispatch."
-    ),
-    process_bool_field!(
         "kernel.lm_head_overwrite",
         "lm_head_overwrite",
         Kernel,
@@ -3240,15 +3201,6 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_MOE_HFQ6_V2",
         "Enable HFQ6 grouped MoE v2 dispatch."
     ),
-    process_bool_field!(
-        "kernel.moe_grouped_gemm",
-        "moe_grouped_gemm",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_MOE_GROUPED_GEMM",
-        "Allow grouped-GEMM MoE prefill."
-    ),
     diagnostic_bool_field!(
         "diagnostic.blob_force",
         "blob_force",
@@ -3279,15 +3231,6 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_AR_GRAPH",
         "Allow autoregressive forward graph capture when otherwise eligible. Default on, except Windows gfx1100, where it defaults off (opt-in) because graph replay silently produced wrong output (#655); an explicit true/false or HIPFIRE_AR_GRAPH always wins."
-    ),
-    process_bool_field!(
-        "experimental.graph.moe",
-        "graph_moe",
-        Experimental,
-        true,
-        true,
-        "HIPFIRE_GRAPH_MOE",
-        "Allow graph capture for supported MoE forward paths."
     ),
     process_bool_field!(
         "kernel.deterministic",
@@ -3350,24 +3293,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Fuse the Gemma 4 E-series PLE activation and strided multiply; auto enables validated gfx1100/gfx1201."
     ),
     process_bool_field!(
-        "kernel.deepseek4_q8_wmma",
-        "deepseek4_q8_wmma",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_DEEPSEEK4_Q8_WMMA",
-        "Allow DeepSeek4 Q8 WMMA prefill."
-    ),
-    process_bool_field!(
-        "kernel.deepseek4_q8_4w",
-        "deepseek4_q8_4w",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_DEEPSEEK4_Q8_4W",
-        "Allow the DeepSeek4 four-wave Q8 WMMA tile."
-    ),
-    process_bool_field!(
         "kernel.rope_interleaved_legacy",
         "rope_interleaved_legacy",
         Kernel,
@@ -3420,42 +3345,6 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_DFLASH_TREE",
         "Enable DDTree tree-SWOR verification."
-    ),
-    process_bool_field!(
-        "speculation.ddtree_tree_la",
-        "ddtree_tree_la",
-        Speculation,
-        true,
-        true,
-        "HIPFIRE_DDTREE_TREE_LA",
-        "Allow DDTree linearized-ancestor tape replay."
-    ),
-    process_bool_field!(
-        "speculation.dflash_fast_sample",
-        "dflash_fast_sample",
-        Speculation,
-        true,
-        true,
-        "HIPFIRE_DFLASH_FAST_SAMPLE",
-        "Allow DFlash GPU sampling on sampled verification."
-    ),
-    process_bool_field!(
-        "speculation.dflash_q8_lmhead_wmma",
-        "dflash_q8_lmhead_wmma",
-        Speculation,
-        true,
-        true,
-        "HIPFIRE_DFLASH_Q8_LMHEAD_WMMA",
-        "Allow Q8 WMMA LM-head dispatch during DFlash verification."
-    ),
-    process_bool_field!(
-        "fusions.qkv_bias",
-        "fuse_qkv_bias",
-        Fusions,
-        true,
-        false,
-        "HIPFIRE_FUSE_QKV_BIAS",
-        "Fold supported QKV bias additions into fused QKV decode."
     ),
     diagnostic_bool_field!(
         "diagnostic.qkv_bias",
@@ -3625,13 +3514,6 @@ pub static FIELDS: &[ConfigField] = &[
         ]),
         "HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY",
         "Cache-acquire policy between retained PM4 launches."
-    ),
-    diagnostic_bool_field!(
-        "diagnostic.replay.pm4_gcr_trim",
-        "replay_pm4_gcr_trim",
-        true,
-        "HIPFIRE_REPLAY_PM4_GCR_TRIM",
-        "Trim redundant GCR operations on supported retained PM4 routes."
     ),
     process_auto_bool_field!(
         "replay.pm4_gfx11_vmem_acquire",
@@ -4084,6 +3966,110 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "nothing ever read it",
         replacement: "none; per-kernel fusion selection is unchanged",
+    },
+    RetiredConfigKey {
+        key: "speculation.dflash_q8_lmhead_wmma",
+        legacy_key: "dflash_q8_lmhead_wmma",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DFlash Q8 LM-head opt-out of WMMA was removed (HIPF-396)",
+        replacement: "none; WMMA runs wherever the arch has it",
+    },
+    RetiredConfigKey {
+        key: "speculation.mtp_sampled",
+        legacy_key: "mtp_sampled",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "the sampled native MTP opt-out was removed (HIPF-396)",
+        replacement: "none; sampled native MTP is on wherever the GDN state format admits it",
+    },
+    RetiredConfigKey {
+        key: "prompt.jinja_chat",
+        legacy_key: "jinja_chat",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the Jinja chat opt-out was removed (HIPF-396)",
+        replacement: "none; chat prompts render through the model template when one is present",
+    },
+    RetiredConfigKey {
+        key: "speculation.draft_f16",
+        legacy_key: "draft_f16",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DFlash draft F16→F32 lift opt-out was removed (HIPF-396)",
+        replacement: "none; F16 draft weights always stay F16",
+    },
+    RetiredConfigKey {
+        key: "experimental.graph.moe",
+        legacy_key: "graph_moe",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the MoE graph-capture opt-out was removed (HIPF-396)",
+        replacement: "experimental.graph.forward = false disables forward graph capture for every model",
+    },
+    RetiredConfigKey {
+        key: "kernel.lm_head_wmma",
+        legacy_key: "lm_head_wmma",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the LM-head WMMA opt-out was removed (HIPF-396)",
+        replacement: "none; WMMA runs wherever the arch has it (kernel.fp16 = false still forces the scalar head)",
+    },
+    RetiredConfigKey {
+        key: "kernel.moe_grouped_gemm",
+        legacy_key: "moe_grouped_gemm",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the grouped-GEMM MoE prefill opt-out was removed (HIPF-396)",
+        replacement: "none; grouped-GEMM MoE prefill runs wherever the arch has WMMA",
+    },
+    RetiredConfigKey {
+        key: "kernel.deepseek4_q8_wmma",
+        legacy_key: "deepseek4_q8_wmma",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DeepSeek4 Q8 WMMA prefill opt-out was removed (HIPF-396)",
+        replacement: "none; WMMA runs wherever the arch has it",
+    },
+    RetiredConfigKey {
+        key: "kernel.deepseek4_q8_4w",
+        legacy_key: "deepseek4_q8_4w",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DeepSeek4 four-wave Q8 WMMA tile opt-out was removed (HIPF-396)",
+        replacement: "none; the tile is chosen by shape",
+    },
+    RetiredConfigKey {
+        key: "speculation.ddtree_tree_la",
+        legacy_key: "ddtree_tree_la",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DDTree tree-aware linear-attention opt-out was removed (HIPF-396)",
+        replacement: "none; DDTree verify always uses the tree-aware kernels",
+    },
+    RetiredConfigKey {
+        key: "speculation.dflash_fast_sample",
+        legacy_key: "dflash_fast_sample",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DFlash GPU sampling opt-out was removed (HIPF-396)",
+        replacement: "none; sampled DFlash verification always samples on the GPU",
+    },
+    RetiredConfigKey {
+        key: "fusions.qkv_bias",
+        legacy_key: "fuse_qkv_bias",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the QKV bias fold opt-out was removed (HIPF-396)",
+        replacement: "none; supported QKV bias additions are always folded",
+    },
+    RetiredConfigKey {
+        key: "diagnostic.replay.pm4_gcr_trim",
+        legacy_key: "replay_pm4_gcr_trim",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the retained PM4 GCR trim opt-out was removed (HIPF-396)",
+        replacement: "none; supported retained PM4 routes always trim redundant GCR operations",
     },
 ];
 
@@ -5019,18 +5005,16 @@ pub fn mtp_host_spill_reason() -> &'static str {
 /// MTP divergent-render checkpoint + strict-prefix terminal-repair policy.
 ///
 /// Resolved once at drafter construction from the documented process-snapshot
-/// keys (see `docs/env-vars.md`): `HIPFIRE_DFLASH_CKPT_RESUME` (shared with the
-/// DFlash divergent-render path — there is no MTP-only twin),
+/// keys (see `docs/env-vars.md`):
 /// `HIPFIRE_CACHE_CKPT_INTERVAL` / `HIPFIRE_CACHE_CKPT_MAX`, and
 /// `HIPFIRE_SPEC_WINDOW_ROLLBACK`. Defaults match the MTP PRs that introduced
-/// the consumers: resume on, rollback on, interval 2048 (floor 256), cap 8
+/// the consumers: rollback on, interval 2048 (floor 256), cap 8
 /// (floor 1). Reads go through the versioned [`ProcessConfig`] snapshot so
 /// TOML `[developer]` overrides and the env-beats-config-beats-default
 /// precedence apply; arch crates receive these resolved values and perform
 /// no policy reads of their own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MtpCachePolicy {
-    pub checkpoint_resume: bool,
     pub checkpoint_interval: usize,
     pub checkpoint_cap: usize,
     pub window_rollback: bool,
@@ -5040,7 +5024,6 @@ pub struct MtpCachePolicy {
 /// per-repair or per-step.
 pub fn mtp_cache_policy() -> MtpCachePolicy {
     MtpCachePolicy {
-        checkpoint_resume: developer_bool("HIPFIRE_DFLASH_CKPT_RESUME", true),
         checkpoint_interval: developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -5151,13 +5134,6 @@ pub fn mtp_k_default(model_arch: u32, row_exact_verify_rows: usize) -> usize {
     } else {
         MTP_K_DEFAULT
     }
-}
-/// Sampled native-MTP enablement (`speculation.mtp_sampled`, env override
-/// `HIPFIRE_MTP_SAMPLED`, default on; `0` opts out). On, the Qwen4 MTP
-/// drafter verifies temperature > 0 requests by speculative rejection
-/// sampling; off leaves them to AR.
-pub fn mtp_sampled_enabled() -> bool {
-    developer_bool("HIPFIRE_MTP_SAMPLED", true)
 }
 /// MTP prompt-fill route opt-out (`HIPFIRE_MTP_OWN_PREFILL=1`). Strict
 /// snapshot boolean, default off: the MTP prompt fill prefills the trunk
@@ -6782,7 +6758,6 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
                 ConfigValue::String("auto".to_owned()),
             ),
             ("experimental.graph.ar", ConfigValue::Bool(true)),
-            ("experimental.graph.moe", ConfigValue::Bool(true)),
             ("diagnostic.prompt_token_heat", ConfigValue::Bool(false)),
             ("diagnostic.prompt_heat_json", ConfigValue::Bool(false)),
             ("diagnostic.prompt_heat_limit", ConfigValue::Integer(64)),
@@ -6837,7 +6812,6 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
                 "diagnostic.replay.pm4_acquire_policy",
                 ConfigValue::String("required-only".to_owned()),
             ),
-            ("diagnostic.replay.pm4_gcr_trim", ConfigValue::Bool(true)),
             (
                 "diagnostic.replay.pm4_dynamic_grid",
                 ConfigValue::Bool(false),
@@ -8361,7 +8335,7 @@ mod tests {
             }
         }
         values.values.insert(
-            "developer.dspark_q8_wmma".into(),
+            "developer.dspark_debug".into(),
             ConfigValue::String("1".into()),
         );
         values
@@ -8377,7 +8351,7 @@ mod tests {
             .filter_map(|schema| schema.env_compat)
             .collect();
         names.extend([
-            "HIPFIRE_DSPARK_Q8_WMMA",
+            "HIPFIRE_DSPARK_DEBUG",
             "HIPFIRE_NGRAM_WINDOW",
             "NOT_HIPFIRE",
         ]);

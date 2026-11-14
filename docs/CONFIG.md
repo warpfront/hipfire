@@ -204,7 +204,7 @@ list` remains accepted as a migration alias:
 ```bash
 hipfire config set kernel.mmq auto
 hipfire config set kernel.fp16 true
-hipfire config set fusions.qkv_bias true
+hipfire config set fusions.force_unfused false
 hipfire config set diagnostic.gemm_dump false
 ```
 
@@ -227,17 +227,8 @@ Stable/default-on and safety controls:
 | `topology.pp` | `1` | Pipeline-parallel degree: 1 (single device) or an integer 2–8; opt-in, experimental. Env `HIPFIRE_TOPOLOGY_PP`. An explicit load request with `pp` above 1 overrides it; otherwise this value applies. Only carriers that declare `pp` accept it above 1 (see [multi-gpu.md](multi-gpu.md#which-carriers-declare-which-axis)); any other model is refused with the uniform pipeline sentence. Details and the combination rules are in [Qwen4 expert-parallel and NPU controls](#qwen4-expert-parallel-and-npu-controls) and [multi-gpu.md](multi-gpu.md). |
 | `hardware.tp_use_rccl` | `true` | RCCL tensor-parallel all-reduce. |
 | `kernel.prefill_batched` | `true` | Batched prefill kernels. |
-| `speculation.draft_f16` | `true` | FP16 DFlash draft activations. |
 | `kernel.fp16` | `true` | Allow FP16 routes. |
-| `kernel.lm_head_wmma` | `true` | Allow WMMA LM-head dispatch. |
 | `kernel.hfq4g128_mmq` | `true` | Allow HFQ4G128 MMQ dispatch. |
-| `kernel.moe_grouped_gemm` | `true` | Grouped-GEMM MoE prefill. |
-| `kernel.deepseek4_q8_wmma` | `true` | DeepSeek4 Q8 WMMA prefill. |
-| `kernel.deepseek4_q8_4w` | `true` | DeepSeek4 four-wave Q8 tile. |
-| `speculation.ddtree_tree_la` | `true` | DDTree linearized-ancestor tape. |
-| `speculation.dflash_fast_sample` | `true` | GPU DFlash sampled verification. |
-| `speculation.dflash_q8_lmhead_wmma` | `true` | Q8 WMMA LM-head in DFlash verify. |
-| `fusions.qkv_bias` | `true` | Fold supported QKV bias launches. |
 | `kernel.rocblas_off` | `false` | Disable rocBLAS dispatch. |
 | `fusions.force_unfused` | `false` | Force supported projection paths unfused. |
 | `fusions.npu_trunk` | `"auto"` | Flash-Next (Qwen4) trunk projection engine: `off\|auto\|on\|emulate` (case-insensitive). `auto` (default) resolves silently to `off` on every arch except gfx1151, with no NPU I/O or allocation. On gfx1151 it arms only when the load is eligible (Flash-Next, K=2560, stock MQ6G256V2 trunk projections, a single device without EP, the full 8192-row prefill scratch rung and enough free memory for it), the NPU firmware is readable, and the calibration matches the device/build/model identity and selects a nonempty family set (the built-in calibration is the normal path and applies on any Halo kernel/firmware/GPU PCI address, keyed by arch/build/model/epilogue/route; under `auto` each request picks its NPU family subset and pair plan from GPU/NPU rate scales learned live in this process, see [live rate scales](npu/npu-trunk.md#live-rate-scales-auto)); any refusal logs one `npu-trunk: off (reason)` line (prefixed `WARN` when the load qualifies but the NPU fails to arm) and the load continues GPU-only. The armed trunk pins 1,053,843,456 B of userptr arenas against `RLIMIT_MEMLOCK`; grant a bounded limit of 1,318,060,032 B (`LimitMEMLOCK=1318060032`, `ulimit -l 1287168`), see [host memlock limit](npu/npu-trunk.md#host-memlock-limit). `off` is the kill switch. `on` requires the NPU and `emulate` runs the bit-identical GPU emulation of the NPU numerics: both refuse an ineligible load or arch instead of falling back, and both tolerate a missing or mismatched calibration (logged as `calibration=none (forced)`; every family is used). |
@@ -324,7 +315,7 @@ global-only TOML namespace instead of as hundreds of ambient process switches:
 ```toml
 [developer]
 gfx1151_gate_up_wave64 = true
-deepseek4_attn = "twin"
+moe_iu4_wide_tiles = false
 replay_pm4_queues = 4
 ```
 
@@ -376,7 +367,7 @@ The EP owner-routed prefill and the expert-staging levers have no typed schema k
 | `developer.gdn_qk_indexed` | `HIPFIRE_GDN_QK_INDEXED` | on where qualified (exact gfx1201) | Sequential Q8-state MoE prefill indexes key-head Q/K by value-head ratio instead of repeating Q/K; `false` / `0` restores repeat/copy. |
 | `developer.gdn_moe_pre_fused` | `HIPFIRE_GDN_MOE_PRE_FUSED` | on where qualified (exact gfx1201) | Admitted MoE prefill uses the existing fused sigmoid/conv/norm/repeat preamble; `false` / `0` keeps separate launches. |
 | `developer.gdn_moe_chunk_scan` | `HIPFIRE_GDN_MOE_CHUNK_SCAN` | on where qualified (exact gfx1201) | Admitted MoE prefill uses the existing GDN chunk scan with Q8 state and EF residual; `false` / `0` restores sequential processing. |
-| `developer.ep_owner_routed_prefill` | `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | on under EP (2..=8 ranks) | Owner-routed chunk MoE: a prefill chunk of at least 512 rows computes only its own experts' tiles and pulls the other ranks' tiles over P2P; every other chunk keeps the full-table route. Admitted on gfx1201 (every layer verified symmetric on every rank, the symmetric IU4 MoE route requested, below) and on gfx1100 (the F16 WMMA grouped MoE route, QT44/QT53 experts on every layer), always with the Flash-Next profile, `kernel.moe_grouped_gemm` on and the full (non-compact) scratch plan; a refusal logs `qwen4 EP rank r/n: owner-routed prefill not admitted (reason)`. |
+| `developer.ep_owner_routed_prefill` | `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | on under EP (2..=8 ranks) | Owner-routed chunk MoE: a prefill chunk of at least 512 rows computes only its own experts' tiles and pulls the other ranks' tiles over P2P; every other chunk keeps the full-table route. Admitted on gfx1201 (every layer verified symmetric on every rank, the symmetric IU4 MoE route requested, below) and on gfx1100 (the F16 WMMA grouped MoE route, QT44/QT53 experts on every layer), always with the Flash-Next profile, the full (non-compact) scratch plan; a refusal logs `qwen4 EP rank r/n: owner-routed prefill not admitted (reason)`. |
 | `developer.qwen4_moe_sym_iu4` | `HIPFIRE_QWEN4_MOE_SYM_IU4` | unset = requested on gfx1100 / gfx1151 / gfx1201 | Grouped symmetric IU4 MoE prefill route for Qwen4. A typed boolean: `true` / `1` requests it, `false` / `0` keeps the whole incumbent route. `hipfire config set developer.qwen4_moe_sym_iu4 false`, a TOML boolean (or `"false"`, `0`) and `HIPFIRE_QWEN4_MOE_SYM_IU4=false` all disable it, exactly like `0`; any other spelling (`on`, `yes`, `2`, an empty value) is rejected with `invalid value for developer.qwen4_moe_sym_iu4: expected a boolean: true, false, 1 or 0`, never ignored. The request also needs the IU4 producers built with exactly the two-candidate activation search: on gfx1201 that is `kernel.g12_a4c2` (default `true`), on gfx1151 `kernel.gfx11_a4_candidates = "2"` (default), and any other `-DIU4_A4_CANDIDATES` value in `diagnostic.compiler.hipcc_extra_flags` withdraws it. Layers whose routed-expert headers fail the symmetry check (asymmetric artifacts) stay on the incumbent route. On gfx1100 the route is requested by default like the other two (the shipped NT1 gate/up and down module with the K3 down producer; **TODO-evidence: default-on decision record, see the CHANGELOG entry**): unset and `true` / `1` request it, `false` / `0` kills it everywhere, and the regular prefill and the S1 `AggregateSymIu4` window route (receipt `aggregate-sym-iu4`, resolved with a symmetric MQ4 artifact and exactly the two-candidate activation search `-DIU4_A4_CANDIDATES=2` in `diagnostic.compiler.hipcc_extra_flags`) read the same request, so they always agree; any other candidate value withdraws it, and a forced-but-unsupported `=1` prints one diagnostic and keeps the incumbent. On gfx1201, owner-routed prefill therefore has no single request key: it follows this developer lever plus those typed keys; on gfx1100 owner-routed prefill stays on the F16 WMMA grouped route (this lever gates only the single-device IU4 arm and the S1 aggregate window). |
 | `developer.moe_sym_iu4` | `HIPFIRE_MOE_SYM_IU4` | unset = on by capability | Symmetric IU4 grouped routed-expert prefill route for qwen35 MoE artifacts whose loader-verified routed experts are symmetric qt44 gate/up + symmetric qt53 down (gfx1201 PeaceMaker objects). A typed boolean like `developer.qwen4_moe_sym_iu4`; `false` / `0` is the kill switch and loads such an artifact with a WARNING onto its ~3.7x slower qt53 F32 prefill fallback. Without it, an arch lacking the objects (every arch but gfx1201 today) or headers that fail verification refuse the load. Independent of `developer.qwen4_moe_sym_iu4`; an explicit `HIPFIRE_IU4_PREFILL=0` also disables it. Numerics: BF16 slot boundaries, A4 activations (Qwen KLD +0.0205 vs the fallback). See `docs/env-vars.md`. |
 | `developer.qwen4_moe_x_lds` | `HIPFIRE_QWEN4_MOE_X_LDS` | `auto` | Exact gfx1151 F16 WMMA MoE route: the grouped gate/up SiLU and down GEMMs take X-through-LDS entries, bytewise the per-wave entries. `auto` arms exactly when a layer's MoE runs on the F16 WMMA route (its symmetric IU4 arm, above, is not selected); the default IU4 route is unchanged. `1` forces it wherever admissible, `0` keeps the per-wave entries. See `docs/env-vars.md`. |
@@ -713,11 +704,10 @@ Admission charges the live plane once per owner.
 
 **q8_ef: sampled requests use AR until the sampled-MTP law is verified.**
 Under `q8_ef`, temperature > 0 requests run AR instead of native MTP (the
-native-MTP drafter of a `q8_ef` load has sampled verification off, the same
-route `speculation.mtp_sampled = false` takes), and the load logs `qwen4 native
+native-MTP drafter of a `q8_ef` load has sampled verification off), and the load logs `qwen4 native
 MTP sampled: off for GDN q8_ef (sampled requests use AR until the sampled-MTP
 law is verified)`. Greedy native MTP is unchanged, and `q8`, `fp32` and the
-default keep `speculation.mtp_sampled`. The rejection-sampling law under the EF
+default keep sampled native MTP. The rejection-sampling law under the EF
 reset history has not been verified on a GPU.
 
 **`q8_ef` measurements.** Decode KLD against the BF16 reference on code24
@@ -1071,7 +1061,6 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when a head is present: the DeepSeek V4 trunk's MTP layer, or for Qwen a bundled `.mq4-mtp` trailer or a `.mtp` sidecar (the registry `mtp` slot; Qwen3.8-27B ships one — [MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). **`auto` arms native MTP only for a producer that declares a measured AR floor** (a per-request AR-vs-draft pricing that retires drafting when it loses to AR). Today only Qwen4 (Flash-Next, arch 16) declares one. Qwen3.5-class (arch 5/6, dense and MoE), DeepSeek V4 (its native MTP was audited and has no measured floor) and Gemma 4 declare none, so `auto` stays AR there even with a head present, loads no head and logs `MTP: off by default (no measured AR floor); opt in with --spec mtp`. `on` / `--spec mtp` is the explicit opt-in and still arms any present head on every producer, failing the load without one; `off` never arms. DSpark and DFlash selection is separate and unchanged. A producer that does arm under `auto` still declines over a host-mapped routed-expert spill (Qwen4 attaches over a spill only on its admitted arch), on either `memory.offload_exec=pcie` or `cpu`, logging the count, seam and `opt in with --spec mtp`. `on` / `--spec mtp` opts in, except that uniform MQ6G256 V1 (qt15) Qwen35 MoE with FP16 WMMA enabled on gfx1200/gfx1201 is refused before serving/generation whenever a native MTP head would attach (now only an explicit `on`, since Qwen35 `auto` no longer attaches). The guard uses tensor metadata, not filenames. `--spec off` / `speculation.mtp=off` or an auto-declined spill stays AR; `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense models are outside this refusal. Other explicit attachment behavior is unchanged; this is admission protection, not a fix for the underlying WMMA defect. |
 | `mtp_k` | `"auto"` | `"auto"` \| int 1–63 | MTP draft cap (`speculation.mtp_k`, env `HIPFIRE_MTP_K`). **Default `auto`** for native Qwen4 MTP (Flash-Next, arch 16) = `min(GPU row-exact verify rows, window of the CPU routed-expert mode that owns layers) − 1` (capability rule: the cap is derived from the GPU's row-exact verify rows, not an architecture list), bounded by executor capacity 63; else 3 for every other model. With no CPU-owned experts that is 7 on every GPU today (8 rows); a load whose routed experts run on the CPU (D1 splice, or any D2 tier split including the measured per-load default; 4-row window) resolves 3 after placement. **On current beta a host-offloaded Flash-Next load whose CPU beats the host link arms the D2 measured default, so its effective `auto` cap is 3, not 7** (diagnostic j1408, R9700 gfx1201: CPU 153.9 GB/s versus link 26.2 GB/s, D2 on 48/48 tier layers, native MTP K=3, receipt `/home/kaden/qcal/release-0.4.3/mtp-kcap/run-r9700-selector/`); 7 applies where D2 does not own experts (`memory.offload_exec=pcie`, `HIPFIRE_QWEN4_D2_DEFAULT=0`, a link the CPU does not beat, or a fully resident load). `hipfire config` cannot see placement, so it shows 7 for arch 16 and the load-time `auto` value can be lower. The adaptive chooser picks each window's depth up to the cap, starting a request with no measured history at `min(3, cap)` and growing to the cap on evidence. Before the AR floor retires a request whose priced native options are all deeper than 3, it first re-probes shallow (K ≤ 3) native depths with bounded windows (3 priced windows, 6 in all) and retires only if those also lose to AR; otherwise the request keeps its best measured shallow depth and climbs again only on 3 consecutive better-priced windows (no setting for this). An explicit 1–63 is accepted by the shared schema; native Qwen4 carries it separately from `auto`, while qualified-row and CPU-window hard caps still apply and other producers retain their own existing limits. The incumbent floor's runtime depth limit remains 10. The developer-only `HIPFIRE_QWEN4_MTP_DERIVED_K=1` policy (default off) may select beyond the incumbent/default K, bounded only by an explicit user K if any, the dynamic qualified bundle row limit minus the seed (including CPU ownership), executor 63 and remaining budget; see [`env-vars.md`](env-vars.md). `4` restores the previous gfx1151 cap. Evidence and limits: one R9700 (gfx1201) hold on the PCIe / no-D2 route (base `0a3b67cb1`, before the D2 default existed) measured code +10.17% and prose +0.30% decode tok/s over the previous K3 with AR-identical output (receipts under `/home/kaden/qcal/release-0.4.3/mtp-kcap/`, see the changelog). That gain is conditional on that route and is not a claim about the current default, whose D2 route runs K3. That hold exercised neither a CPU-owned (K3) load nor the shallow re-probe/hold states on hardware; both are covered by CPU tests only, and gfx1151 and gfx1100 were not measured. |
-| `mtp_sampled` | `true` | bool | Default true. Native Qwen4 MTP uses distribution-preserving speculative rejection sampling for temperature >0, including supported repeat/presence/frequency penalties: target verification and draft probabilities use the same AR history, penalty window and sampling policy. False/`HIPFIRE_MTP_SAMPLED=0` leaves sampled requests on AR; greedy MTP is unchanged. Under `topology.pp` (Flash-Next pipeline mesh) the same Leviathan verify serves sampled requests with neutral penalties; penalized sampled requests, `HIPFIRE_MTP_SAMPLED_MODE=naive` and this key off decode AR on the mesh. Under `memory.state_quant = "q8_ef"` sampled requests use AR until the sampled-MTP law is verified, whatever this key says (see [`q8_ef`](#kv-cache)). This is distribution preservation, not identical seeded sampled token streams. DFlash/other drafters without this policy still fall back to AR for unsupported penalty requests. |
 | `mtp_ngram` | `"auto"` | `on` \| `off` \| `auto` (also `1` / `0`) | **Default `auto` (0.4.1).** N-gram takeover windows inside native MTP (ngram-mod). `auto` arms native Qwen4 MTP (arch 16, Flash-Next) on gfx1151 and gfx1201 and leaves every other producer off; `on`/`1` arms every MTP producer that supports it; `off`/`0` is the opt-out (kill switch). Env `HIPFIRE_MTP_NGRAM` beats TOML beats default. Eligible requests are greedy and sampled, thinking on or off (Qwen4 and Qwen3.5/3.x). A sampled takeover verifies each candidate with the point-mass draft distribution δ(candidate) through the shared rejection verify: lossless in distribution, not bit-identical to MTP-only output. The pool is request-local (cleared and reseeded from the full prompt every request), so candidates never depend on earlier requests. Triple (`HIPFIRE_NGRAM_MOD_N_MATCH` / `_N_MIN` / `_N_MAX`, overridable per component): 5/3/3 on admitted Qwen4 targets with the copy lane off (5/1/63 with it on), 24/48/64 elsewhere; on Qwen4 `n_max` is capped at 63 (the 64-row verify). On Qwen4 a pool hit takes the window only when the MTP head's own first draft equals the first candidate and the takeover's measured yield (decayed emitted tokens per takeover window over its verify cost) is at least the native window's best expected rate; otherwise the window is native. The Qwen4 takeover uses the same batched verify executor as native MTP windows (interleaved one-row route under `HIPFIRE_MTP_INCREMENTAL=1`) and appends the consumed rows to the MTP head teacher-forced (token p, target hidden p - 1), matching the draft steps' pairing. Load marker: `qwen4 native MTP n-gram: on\|off (n_match=.. n_min=.. n_max=..)`; `HIPFIRE_MTP_TRACE=1` window events carry `source` / `verify_route`. The 5/3/3 pool described here is the copy lane's `off` state; `speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY` (`on` arms the 5/1/63 copy lane; default `auto` arms it on gfx1151 / gfx1201) switches it. |
 | `mtp_ngram_copy` | `"auto"` | `on` \| `off` \| `auto` (also `1` / `0`) | Native Qwen4 MTP n-gram copy lane (verbatim-copy matcher, adaptive take of up to the row-exact verify rows minus one, row-0 confirmation only until the copy source is established, kept on floor-retired requests). on/1 arms it wherever the native Qwen4 n-gram source is armed (triple 5/1/63); off/0 keeps the 5/3/3 pool with row-0 confirmation on every takeover (kill switch); auto (default) arms it for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 and leaves every other GPU off. Env `HIPFIRE_MTP_NGRAM_COPY` beats TOML beats default. |
 | `dspark_conf_threshold` | `null` | `null` or number 0.0–1.0 | `null` ⇒ per-arch carrier default (qwen3 0.1 / deepseek4 0.3 in comments). |
@@ -1753,14 +1742,12 @@ ranges are the schema's; every key also appears in the generated
 | `serve.ui` | `false` | bool; serve the embedded chat UI at `/ui` on the serve listener. |
 | `serve.retry_enabled` | `false` | bool; server-owned single retry on typed transient daemon failures. |
 | `serve.retry_backoff_ms` | `50` | int 0–60000; backoff before that retry. |
-| `prompt.jinja_chat` | `true` | bool; render chat prompts through the model Jinja template (`HIPFIRE_JINJA_CHAT=0` selects the hand-rolled scaffold). |
 | `image.decode` | `"cpu"` | `cpu` \| `vcn` \| `auto` (VCN when probed, else CPU); VL image JPEG decode path. |
 | `prefill.chunk_rows` | `512` | int 2–1048576; widened ordinary-prefill chunk ceiling in rows. The registered `512` is a schema fallback only: it is not exported to the process config, so it is not a global runtime default, and an unset value resolves per model. Architecture default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere (the Qwen35 dense 27B widened route); per-device VRAM admission may pick a smaller rung. **Qwen3.5-class resident MoE (A3B/A10B/A17B):** the widened route used to admit only the dense 27B shape, so MoE kept the incumbent per-arch chunk (512 on exact gfx1100, 384 or 512 under the full FP8 path on exact gfx1201, 256 elsewhere). Those are the dense MQ4V2 gate-up sweet spots measured on those cards and 512 matches the dense 512-row commit seam; they are not a measured MoE optimum. Unset, a resident MoE now defaults to one 4096-row chunk (never an intermediate 1024/2048 rung) only when the model is fully resident on one device, every layer passes batched-prefill producer admission, the routed and shared experts are uniform MQ4G256 or MQ4G256V2, the DeltaNet state is Q8 with its EF owners, and the device has the WMMA grouped producer, and only when the projected full prefill scratch (grouped MoE scratch plus the DeltaNet `dn_z_fold_batch`/`dn_normed_batch` buffers the legacy projection omits, the projection prelude, and the existing 1 GiB transient/driver headroom over requested tensor payload) fits the actual free VRAM; otherwise the incumbent chunk applies. This is a default-admission change onto the existing explicit `HIPFIRE_PREFILL_MAX_BATCH=4096` path (the j1405 reference set both `HIPFIRE_PREFILL_MAX_BATCH=4096` and `HIPFIRE_PREFILL_CHUNK_ROWS=4096`; `prefill.chunk_rows` alone never raised the legacy MoE ceiling); no MoE kernel or commit code changed, and the receipt's generic `commit_stride=512` does not prove the MoE kernels commit per 512 rows (the dense 512-row commit is unchanged). Explicit values keep precedence: `HIPFIRE_PREFILL_MAX_BATCH` wins and leaves the incumbent; a `prefill.chunk_rows` below 4096 opts the MoE out; 4096 or more requests the single 4096 rung. The log line `prefill_chunk: requested=R admitted=A commit_stride=S` records the decision. 8192 was measured and rejected as the MoE default: it lost four same-hold comparisons to 4096 (-0.03% to -1.80%, 3 samples per shape) and raised peak VRAM by about 2.1 GiB. Offloaded, TP, EP, dense and Qwen4 loads are unaffected. Qwen4 rounds it down to 256 rows. Qwen4 sizes the auto expert placement reserve (and so how many expert layers stay in VRAM) from this same chunk: the explicit value, else 8192 on exact gfx1151, 4096 on exact gfx1201, and 1536 elsewhere. Exact gfx1100 on a measured narrow discrete host link (< 16 GB/s, probed once at load before placement is sized; see `developer.qwen4_expert_stage`) defaults to 8192 rows, so its placement is sized for the 8192-row reserve and cedes resident expert layers for the wider chunk; gfx1100 on a fast, unmeasured or unified-memory link keeps 1536, and no other arch probes. An explicit value is authoritative for placement and never probes: `HIPFIRE_PREFILL_CHUNK_ROWS=1536` opts out of the narrow-link default, and `=8192` charges the 8192-row reserve on any link (one gfx1100 XTX hold, single run, measured pp8192 931.7 vs 90.1 tok/s = 10.3x, but tg64 5.09 vs 5.71 tok/s = -11% and pp512 62.0 vs 72.2 tok/s = -14% against the 1536-row placement, with 5 instead of 10 resident layers). Env `HIPFIRE_PREFILL_CHUNK_ROWS`. |
 | `attention.ck_runtime_lib` | `null` | `null` or path; optional exact-architecture CK runtime sidecar (load or capability failure keeps native attention). |
 | `attention.ck_workspace_bytes` | `0` | int 0–17179869184; preallocated bytes for the optional CK staged attention path. |
 | `experimental.graph.forward` | `"auto"` | `auto` \| bool; hipGraph forward capture (`auto` follows architecture policy). Env `HIPFIRE_GRAPH`. |
 | `experimental.graph.ar` | `true` | bool; allow autoregressive forward graph capture when otherwise eligible. **Windows gfx1100 default is off (opt-in)**: AR graph replay silently produced wrong output there (token soup, #655), so an unset value resolves to `false` on Windows exact gfx1100 only; Linux gfx1100 and every other architecture keep `true`. An explicit `true`/`false` (config, `hipfire config set`, or env `HIPFIRE_AR_GRAPH`) always wins. Env `HIPFIRE_AR_GRAPH`. |
-| `experimental.graph.moe` | `true` | bool; allow graph capture for supported MoE forward paths. Env `HIPFIRE_GRAPH_MOE`. |
 | `kernel.calib_force_bf16` | `false` | bool; keep native-BF16 calibration teachers in BF16 (calibration only). |
 | `kernel.gemma4_q8_fused_prefill` | `false` | bool; fuse eligible Gemma 4 Q8 prefill projections on gfx1100. |
 | `kernel.gemma4_ple_batched_prefill` | `false` | bool; batch the Gemma 4 E-series PLE model projection on gfx1100. |
@@ -1845,7 +1832,6 @@ keys. The remaining retained-replay controls are developer diagnostics:
 | `diagnostic.replay.pm4_kernarg_pool` | `"vram"` | `vram` \| `host` |
 | `diagnostic.replay.pm4_wait_policy` | `"resource"` | `allowlist` \| `resource-audit` \| `resource` |
 | `diagnostic.replay.pm4_acquire_policy` | `"required-only"` | `conservative`, `entry-only`, `required-only`, `without-repeat-interleave`, `without-fused-silu-rotate`, `without-mq-rotate`, `without-rope` |
-| `diagnostic.replay.pm4_gcr_trim` | `true` | bool |
 | `diagnostic.replay.pm4_dynamic_grid` | `false` | bool |
 | `diagnostic.replay.gfx1151_initiator` | `"legacy"` | `legacy` \| `order` \| `radv` |
 | `diagnostic.replay.gfx1151_interleave` | `"inherit"` | `inherit`, `off`, `64`, `128`, `256`, `512` |
@@ -2053,7 +2039,6 @@ uses ambient variables in engine hot paths.
 | `prompt_heat_limit` | `diagnostic.prompt_heat_limit` | `HIPFIRE_PROMPT_HEAT_LIMIT` | 64 |
 | `dflash_mode` | `speculation.dflash` | `HIPFIRE_DFLASH_MODE` | `"off"` |
 | `vision_mode` | `vision.mode` | `HIPFIRE_VISION_MODE` | `"auto"` |
-| `draft_f16` | `speculation.draft_f16` | `HIPFIRE_DRAFT_F16` | true unless `0` |
 | `draft_gemm_dump` | `diagnostic.draft_gemm_dump` | `HIPFIRE_DRAFT_GEMM_DUMP` | off unless `1` |
 | `draft_subphase` | `diagnostic.draft_subphase` | `HIPFIRE_DRAFT_SUBPHASE` | off unless `1` |
 | `ddtree_budget` | `speculation.ddtree_budget` | `HIPFIRE_DDTREE_BUDGET` | 0 (chain DFlash; the flag reader treats `0` as unset) |
@@ -2081,7 +2066,6 @@ uses ambient variables in engine hot paths.
 | `uniform_vram_tolerance_gb` | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |
 | `mtp_mode` | `speculation.mtp` | `HIPFIRE_MTP_MODE` | `"auto"` (arms only a producer that declares a measured AR floor: Qwen4 today; Qwen35 / DeepSeek V4 / Gemma 4 stay AR; `on` / `--spec mtp` always arms; `off` never) |
 | `mtp_k` | `speculation.mtp_k` | `HIPFIRE_MTP_K` | `"auto"` (native Qwen4 MTP: `min(GPU row-exact verify rows, CPU-owned-expert window) − 1`, bounded by executor 63 = 7 with no CPU-owned experts, 3 on a CPU-placed load today, resolved at load after placement; `hipfire config` shows 7; other models 3; explicit 1–63 accepted, producer/qualified-row/CPU limits remain; `4` restores the previous gfx1151 cap) |
-| `mtp_sampled` | `speculation.mtp_sampled` | `HIPFIRE_MTP_SAMPLED` | true |
 | `mtp_ngram` | `speculation.mtp_ngram` | `HIPFIRE_MTP_NGRAM` | `"auto"` (on for Qwen4 native MTP on gfx1151 / gfx1201; `off`/`0` opts out) |
 | `mtp_ngram_copy` | `speculation.mtp_ngram_copy` | `HIPFIRE_MTP_NGRAM_COPY` | `"auto"` (on for native Qwen4 MTP on gfx1151 / gfx1201, off elsewhere; `off`/`0` is the kill switch) |
 | `dflash_lookup` | `speculation.dflash_lookup` | `HIPFIRE_DFLASH_LOOKUP` | `"auto"` (on; `off`/`0` disables the DFlash2 verbatim-copy lookup) |
@@ -2263,10 +2247,23 @@ branch) or a misspelled key is unknown and fails the load with
 | `memory.cask.auto_attach` | `cask_auto_attach` | 0.1.7 | 0.5.0 | none; full KV (use a larger `memory.max_seq` or KV quantization) |
 | `diagnostic.replay.gfx1151_cu_count` | `gfx1151_redline_cu_count` | 0.4.0 | 0.5.0 | none; the full CU set is always used (`HIPFIRE_GFX1151_REDLINE_CU_COUNT` is no longer read) |
 | `fusions.policy` | `fusion_policy` | 0.3.1 | 0.5.0 | none; nothing ever read it, and per-kernel fusion selection is unchanged |
+| `speculation.dflash_q8_lmhead_wmma` | `dflash_q8_lmhead_wmma` | 0.3.1 | 0.5.0 | none; WMMA runs wherever the arch has it |
+| `speculation.mtp_sampled` | `mtp_sampled` | 0.4.1 | 0.5.0 | none; sampled native MTP is on wherever the GDN state format admits it |
+| `prompt.jinja_chat` | `jinja_chat` | 0.3.1 | 0.5.0 | none; chat prompts render through the model template when one is present |
+| `speculation.draft_f16` | `draft_f16` | 0.3.1 | 0.5.0 | none; F16 draft weights always stay F16 |
+| `experimental.graph.moe` | `graph_moe` | 0.3.1 | 0.5.0 | `experimental.graph.forward = false` disables forward graph capture for every model |
+| `kernel.lm_head_wmma` | `lm_head_wmma` | 0.3.1 | 0.5.0 | none; WMMA runs wherever the arch has it (`kernel.fp16 = false` still forces the scalar head) |
+| `kernel.moe_grouped_gemm` | `moe_grouped_gemm` | 0.3.1 | 0.5.0 | none; grouped-GEMM MoE prefill runs wherever the arch has WMMA |
+| `kernel.deepseek4_q8_wmma` | `deepseek4_q8_wmma` | 0.3.1 | 0.5.0 | none; WMMA runs wherever the arch has it |
+| `kernel.deepseek4_q8_4w` | `deepseek4_q8_4w` | 0.3.1 | 0.5.0 | none; the tile is chosen by shape |
+| `speculation.ddtree_tree_la` | `ddtree_tree_la` | 0.3.1 | 0.5.0 | none; DDTree verify always uses the tree-aware kernels |
+| `speculation.dflash_fast_sample` | `dflash_fast_sample` | 0.3.1 | 0.5.0 | none; sampled DFlash verification always samples on the GPU |
+| `fusions.qkv_bias` | `fuse_qkv_bias` | 0.3.1 | 0.5.0 | none; supported QKV bias additions are always folded |
+| `diagnostic.replay.pm4_gcr_trim` | `replay_pm4_gcr_trim` | 0.3.1 | 0.5.0 | none; supported retained PM4 routes always trim redundant GCR operations |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 286 schema keys, plus the `developer.<name>` namespace.
+**Count:** 273 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -2312,7 +2309,6 @@ branch) or a misspelled key is unknown and fails the load with
 | `diagnostic.replay.manual_capture` | `replay_manual_capture` | `HIPFIRE_REPLAY_MANUAL_CAPTURE` | experimental |
 | `diagnostic.replay.pm4_acquire_policy` | `replay_pm4_acquire_policy` | `HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY` | experimental |
 | `diagnostic.replay.pm4_dynamic_grid` | `replay_pm4_dynamic_grid` | `HIPFIRE_REPLAY_PM4_DYNAMIC_GRID` | experimental |
-| `diagnostic.replay.pm4_gcr_trim` | `replay_pm4_gcr_trim` | `HIPFIRE_REPLAY_PM4_GCR_TRIM` | experimental |
 | `diagnostic.replay.pm4_kernarg_pool` | `replay_pm4_kernarg_pool` | `HIPFIRE_PM4_KERNARG_POOL` | experimental |
 | `diagnostic.replay.pm4_max_parallel_phases` | `replay_pm4_max_parallel_phases` | `HIPFIRE_REPLAY_PM4_MAX_PARALLEL_PHASES` | experimental |
 | `diagnostic.replay.pm4_min_parallel_width` | `replay_pm4_min_parallel_width` | `HIPFIRE_REPLAY_PM4_MIN_PARALLEL_WIDTH` | experimental |
@@ -2326,11 +2322,9 @@ branch) or a misspelled key is unknown and fails the load with
 | `experimental.budget_alert` | `experimental_budget_alert` | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | experimental |
 | `experimental.graph.ar` | `graph_ar` | `HIPFIRE_AR_GRAPH` | experimental |
 | `experimental.graph.forward` | `graph_forward` | `HIPFIRE_GRAPH` | experimental |
-| `experimental.graph.moe` | `graph_moe` | `HIPFIRE_GRAPH_MOE` | experimental |
 | `fusions.force_unfused` | `force_unfused` | `HIPFIRE_FORCE_UNFUSED` | experimental |
 | `fusions.npu_trunk` | `npu_trunk` | `HIPFIRE_QWEN4_NPU_TRUNK` | experimental |
 | `fusions.npu_trunk_calibration` | `npu_trunk_calibration` | `HIPFIRE_QWEN4_NPU_TRUNK_CAL` | experimental |
-| `fusions.qkv_bias` | `fuse_qkv_bias` | `HIPFIRE_FUSE_QKV_BIAS` | stable |
 | `generation.loop_guard_threshold` | `ngram_loop_threshold` | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | stable |
 | `generation.loop_guard_window` | `ngram_window` | `HIPFIRE_NGRAM_WINDOW` | stable |
 | `generation.max_tokens` | `max_tokens` |  | stable |
@@ -2349,8 +2343,6 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.attn_qresident` | `attn_qresident` | `HIPFIRE_ATTN_QRESIDENT` | stable |
 | `kernel.attn_qresident_v2` | `attn_qresident_v2` | `HIPFIRE_ATTN_QRESIDENT_V2` | stable |
 | `kernel.calib_force_bf16` | `calib_force_bf16` | `HIPFIRE_CALIB_BF16` | experimental |
-| `kernel.deepseek4_q8_4w` | `deepseek4_q8_4w` | `HIPFIRE_DEEPSEEK4_Q8_4W` | stable |
-| `kernel.deepseek4_q8_wmma` | `deepseek4_q8_wmma` | `HIPFIRE_DEEPSEEK4_Q8_WMMA` | stable |
 | `kernel.deterministic` | `deterministic` | `HIPFIRE_DETERMINISTIC` | experimental |
 | `kernel.dot2_gemv` | `dot2_gemv` | `HIPFIRE_DOT2_GEMV` | experimental |
 | `kernel.draft_shared_ctx_kv_rotation` | `draft_shared_ctx_kv_rotation` | `HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION` | stable |
@@ -2410,11 +2402,9 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.lloyd_force_baseline` | `lloyd_force_baseline` | `HIPFIRE_LLOYD_FORCE_BASELINE` | experimental |
 | `kernel.lm_head_f16` | `lm_head_f16` | `HIPFIRE_LM_HEAD_F16` | stable |
 | `kernel.lm_head_overwrite` | `lm_head_overwrite` | `HIPFIRE_LM_HEAD_OVERWRITE` | experimental |
-| `kernel.lm_head_wmma` | `lm_head_wmma` | `HIPFIRE_LM_HEAD_WMMA` | stable |
 | `kernel.mmq` | `mmq` | `HIPFIRE_MMQ` | stable |
 | `kernel.moe_down_combine_vec4` | `moe_down_combine_vec4` | `HIPFIRE_MOE_DOWN_COMBINE_VEC4` | experimental |
 | `kernel.moe_grouped_4w` | `moe_grouped_4w` | `HIPFIRE_MOE_GROUPED_4W` | experimental |
-| `kernel.moe_grouped_gemm` | `moe_grouped_gemm` | `HIPFIRE_MOE_GROUPED_GEMM` | stable |
 | `kernel.moe_grouped_i8` | `moe_grouped_i8` | `HIPFIRE_MOE_GROUPED_I8` | experimental |
 | `kernel.moe_grouped_i8_k4` | `moe_grouped_i8_k4` | `HIPFIRE_MOE_GROUPED_I8_K4` | experimental |
 | `kernel.moe_grouped_i8_k4_gfx12` | `moe_grouped_i8_k4_gfx12` | `HIPFIRE_MOE_GROUPED_I8_K4_GFX12` | experimental |
@@ -2481,7 +2471,6 @@ branch) or a misspelled key is unknown and fails the load with
 | `prefill.chunk_rows` | `prefill_chunk_rows` | `HIPFIRE_PREFILL_CHUNK_ROWS` | stable |
 | `prompt.chat_template` | `chat_template` | `HIPFIRE_CHAT_TEMPLATE_FILE` | stable |
 | `prompt.default_chatml` | `default_chatml` | `HIPFIRE_DEFAULT_CHATML` | stable |
-| `prompt.jinja_chat` | `jinja_chat` | `HIPFIRE_JINJA_CHAT` | stable |
 | `prompt.normalize` | `prompt_normalize` | `HIPFIRE_NORMALIZE_PROMPT` | stable |
 | `prompt.system` | `system_prompt` |  | stable |
 | `reasoning.budget` | `thinking_budget` |  | stable |
@@ -2532,23 +2521,18 @@ branch) or a misspelled key is unknown and fails the load with
 | `serve.vmm_batch` | `serve_vmm_batch` | `HIPFIRE_SERVE_VMM_BATCH` | experimental |
 | `speculation.ddtree_budget` | `ddtree_budget` | `HIPFIRE_DDTREE_BUDGET` | experimental |
 | `speculation.ddtree_topk` | `ddtree_topk` | `HIPFIRE_DDTREE_TOPK` | experimental |
-| `speculation.ddtree_tree_la` | `ddtree_tree_la` | `HIPFIRE_DDTREE_TREE_LA` | experimental |
 | `speculation.dflash` | `dflash_mode` | `HIPFIRE_DFLASH_MODE` | stable |
 | `speculation.dflash_adaptive_b` | `dflash_adaptive_b` |  | stable |
 | `speculation.dflash_block` | `dflash_block` | `HIPFIRE_DFLASH_BLOCK` | stable |
-| `speculation.dflash_fast_sample` | `dflash_fast_sample` | `HIPFIRE_DFLASH_FAST_SAMPLE` | experimental |
 | `speculation.dflash_lookup` | `dflash_lookup` | `HIPFIRE_DFLASH_LOOKUP` | stable |
 | `speculation.dflash_ngram_block` | `dflash_ngram_block` | `HIPFIRE_DFLASH_NGRAM_BLOCK` | stable |
-| `speculation.dflash_q8_lmhead_wmma` | `dflash_q8_lmhead_wmma` | `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` | experimental |
 | `speculation.dflash_tree` | `dflash_tree` | `HIPFIRE_DFLASH_TREE` | experimental |
-| `speculation.draft_f16` | `draft_f16` | `HIPFIRE_DRAFT_F16` | stable |
 | `speculation.dspark_confidence` | `dspark_conf_threshold` |  | experimental |
 | `speculation.mode` | `speculation` | `HIPFIRE_SPECULATION` | stable |
 | `speculation.mtp` | `mtp_mode` | `HIPFIRE_MTP_MODE` | stable |
 | `speculation.mtp_k` | `mtp_k` | `HIPFIRE_MTP_K` | stable |
 | `speculation.mtp_ngram` | `mtp_ngram` | `HIPFIRE_MTP_NGRAM` | stable |
 | `speculation.mtp_ngram_copy` | `mtp_ngram_copy` | `HIPFIRE_MTP_NGRAM_COPY` | stable |
-| `speculation.mtp_sampled` | `mtp_sampled` | `HIPFIRE_MTP_SAMPLED` | stable |
 | `speculation.ngram` | `ngram_mode` | `HIPFIRE_NGRAM_DRAFT` | stable |
 | `speculation.ngram_k` | `ngram_k` | `HIPFIRE_NGRAM_DRAFT_K` | stable |
 | `speculation.ngram_min_count` | `ngram_min_count` | `HIPFIRE_NGRAM_MIN_COUNT` | stable |

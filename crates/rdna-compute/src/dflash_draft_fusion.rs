@@ -173,7 +173,6 @@ impl Gpu {
             || k % 256 != 0
             || !self.arch_caps.has_wmma_w32_gfx12()
             || self.flags.fp16_disabled
-            || self.flags.lm_head_wmma_disabled
             || self.a8_prefill_active(batch_size, k)
             || (self.flags.hfq4g256_ldsstage_wmma
                 && k % 512 == 0

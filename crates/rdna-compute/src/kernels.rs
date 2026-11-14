@@ -3759,13 +3759,6 @@ pub const GEMV_MQ4G128V2P_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str = in
 pub const GEMV_MQ6G256V2_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq6g256v2_moe_gate_up_k8_indexed_batched.hip");
 
-/// Nine-path fused MoE gate_up (routed k=8, decode T=1): one CTA stages the
-/// activation into LDS once and all 8 routed-expert warps share it, replacing
-/// the per-(row,krank) x restaging of `gemv_hfq4g256_moe_gate_up_k8_indexed`.
-/// Byte-exact per-row math with the indexed kernel. See kernel header.
-pub const GEMV_HFQ4G256_MOE_NINEPATH_D3_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfq4g256_moe_ninepath_d3.hip");
-
 /// Nine-path fused MoE down + weighted combine (routed k=8, decode T=1):
 /// folds the expanded [8 × down_m] intermediate into LDS (never written to
 /// global) and applies the weighted k-ordered fold in the same kernel,
@@ -10090,14 +10083,6 @@ pub const KV_CACHE_WRITE_SRC: &str = include_str!("../../../kernels/src/kv_cache
 pub const KV_CACHE_WRITE_F32_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_f32_batched.hip");
 
-/// GPU-side top-K + top-P sampling. Eliminates 600KB logits download per token.
-/// Single block, 256 threads. Returns token ID + RNG state (8 bytes vs 600KB).
-///
-/// Phase 1: Parallel max reduction over vocab_size logits.
-/// Phase 2: Threshold filter — collect candidates within 30*temp of max (atomic shared counter).
-/// Phase 3: Thread 0 softmax + sort + top-p + sample on the small candidate set.
-pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top_p.hip");
-
 /// Multi-workgroup parallel rewrite of `sample_top_p`: vocab top-K scan split
 /// across N blocks (`sample_topk_partial`) + single-block merge/softmax/top-p
 /// (`sample_topk_finalize`) + an in-place penalty prepass
@@ -10138,7 +10123,7 @@ pub const SOFTMAX_PROB_GATHER_BATCHED_SRC: &str =
 /// Batched temperature-scaled softmax, out-of-place. One block per row;
 /// writes `probs[r] = softmax(logits[r] / temp)` leaving `logits` untouched.
 /// Distribution-parity (tree reduction) to the host `softmax_temp_into`;
-/// used behind HIPFIRE_DFLASH_FAST_SAMPLE in the DFlash sampled path.
+/// used on the DFlash sampled path.
 ///
 /// This file holds TWO entry points: `softmax_temp_batched_f32` (above) and
 /// `softmax_temp_topp_batched_f32`, which additionally emits per-row nucleus
@@ -10904,8 +10889,6 @@ pub const ZERO_INACTIVE_ROWS_F32_SRC: &str =
     include_str!("../../../kernels/src/zero_inactive_rows_f32.hip");
 
 pub const SQRT_SOFTPLUS_F32_SRC: &str = include_str!("../../../kernels/src/sqrt_softplus_f32.hip");
-
-pub const V4F_ATTN_POS0_SRC: &str = include_str!("../../../kernels/src/deepseek4_attn_pos0.hip");
 
 pub const V4F_ATTN_SWA_SRC: &str = include_str!("../../../kernels/src/deepseek4_attn_swa.hip");
 

@@ -35,8 +35,6 @@ fn base() -> GenerationRouteInputs {
         min_p: None,
         nonneutral_penalties: false,
         force_ar_chat: false,
-        temp_spec_env_off: false,
-        fast_sample_on: true,
         supports_temp_swor: false,
         supports_chain_nucleus_verify: false,
         kv_adaptive: false,
@@ -554,10 +552,6 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
             ..mtp
         },
         GenerationRouteInputs {
-            temp_spec_env_off: true,
-            ..mtp
-        },
-        GenerationRouteInputs {
             kv_adaptive: true,
             ..mtp
         },
@@ -626,11 +620,6 @@ fn qwen4_sampled_mtp_route_honors_penalties() {
                 ..sampled
             },
             GenerationRouteInputs {
-                temp_spec_env_off: true,
-                nonneutral_penalties: penalties,
-                ..sampled
-            },
-            GenerationRouteInputs {
                 kv_adaptive: true,
                 nonneutral_penalties: penalties,
                 ..sampled
@@ -646,10 +635,9 @@ fn qwen4_sampled_mtp_route_honors_penalties() {
 }
 
 /// Qwen4 pipeline parallelism: sampled, unpenalized requests take native MTP
-/// (Leviathan verify, distribution-exact) exactly as on one card. The kill
-/// switch (`speculation.mtp_sampled = 0` → `supports_temp_swor` false, and
-/// the naive sampled mode under PP, which the route input also reports as
-/// not sampled-capable) and any penalty keep the PP AR producer.
+/// (Leviathan verify, distribution-exact) exactly as on one card. A drafter
+/// without sampled verification (`supports_temp_swor` false, e.g. the naive
+/// sampled mode under PP) and any penalty keep the PP AR producer.
 #[test]
 fn qwen4_pp_sampled_mtp_route_admits_unpenalized_leviathan_only() {
     for pp in [2usize, 4, 8] {
@@ -681,7 +669,7 @@ fn qwen4_pp_sampled_mtp_route_admits_unpenalized_leviathan_only() {
             );
         }
         for refused in [
-            // HIPFIRE_MTP_SAMPLED=0 / PP naive mode.
+            // PP naive mode.
             GenerationRouteInputs {
                 supports_temp_swor: false,
                 ..sampled
@@ -697,10 +685,6 @@ fn qwen4_pp_sampled_mtp_route_admits_unpenalized_leviathan_only() {
             },
             GenerationRouteInputs {
                 force_ar_chat: true,
-                ..sampled
-            },
-            GenerationRouteInputs {
-                temp_spec_env_off: true,
                 ..sampled
             },
             GenerationRouteInputs {
@@ -840,36 +824,13 @@ fn llama_dflash_greedy_route_refuses_penalties() {
 
 #[test]
 fn qwen_cache_planner_is_ineligible_cold() {
-    let plan = hipfire_generate::qwen::plan_from_rendered(
-        &[10, 11],
-        vec![10, 11, 12],
-        false,
-        &[],
-        false,
-        "mtp",
-    );
+    let plan =
+        hipfire_generate::qwen::plan_from_rendered(&[10, 11], vec![10, 11, 12], false, &[], "mtp");
     assert!(!plan.cache_hit);
     assert_eq!(plan.start_pos, 0);
     assert_eq!(plan.cached_tokens, 0);
     assert_eq!(plan.resume_from, None);
     assert_eq!(plan.new_tokens, vec![10, 11, 12]);
-}
-
-/// Native Qwen4 MTP never uses the shared conversation planner, including on a
-/// transition from an AR turn: its reusable prefixes are the bundle's session
-/// cache (`ArchModel::session_plan` with `SessionRoute::Mtp`), planned
-/// separately.
-#[test]
-fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
-    // Native Qwen4 MTP bypasses the shared planner.
-    assert!(hipfire_generate::qwen::spec_cache_disabled_for(true, false));
-    // Qwen3.5/3.6/3.8 MTP and DFlash keep the prompt cache: the rule is keyed
-    // on the loaded family, not on the speculator name "mtp".
-    assert!(!hipfire_generate::qwen::spec_cache_disabled_for(
-        false, false
-    ));
-    // HIPFIRE_QWEN_PROMPT_CACHE=0 still disables it for every family.
-    assert!(hipfire_generate::qwen::spec_cache_disabled_for(false, true));
 }
 
 /// Asserts every `PromptCachePlan` field against the expected start and resume.
@@ -911,12 +872,12 @@ fn eop_checkpoint_plans_use_the_shared_planner() {
 
         // (a) live extension: the lineage is a strict prefix of the request.
         let rendered: Vec<u32> = (0..(l + 20) as u32).collect();
-        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, "t");
         assert_plan(&got, &rendered, l, None, "live extension");
 
         // (b) divergence with p <= lcp < l: rewind to the checkpoint.
         let rendered = fork(p + 8, 3);
-        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, "t");
         assert_plan(
             &got,
             &rendered,
@@ -927,47 +888,40 @@ fn eop_checkpoint_plans_use_the_shared_planner() {
 
         // (c) divergence exactly at the checkpoint.
         let rendered = fork(p, 2);
-        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, "t");
         assert_plan(&got, &rendered, p, Some(p), "divergence at the checkpoint");
 
         // (d) lcp below the checkpoint: cold.
         let rendered = fork(p - 17, 4);
-        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, "t");
         assert_plan(&got, &rendered, 0, None, "lcp below the checkpoint");
 
         // (e) exact match: resume from the checkpoint when it leaves a tail.
-        let got = plan(&lineage, lineage.clone(), true, &ckpts, true, "t");
+        let got = plan(&lineage, lineage.clone(), true, &ckpts, "t");
         assert_plan(&got, &lineage, p, Some(p), "exact match, p < n");
         // Exact match whose length equals the checkpoint leaves nothing to
         // replay: cold.
         let at_p: Vec<u32> = (0..p as u32).collect();
-        let got = plan(&at_p, at_p.clone(), true, &ckpts, true, "t");
+        let got = plan(&at_p, at_p.clone(), true, &ckpts, "t");
         assert_plan(&got, &at_p, 0, None, "exact match, p == n");
 
         // (f) shorter request that still covers the checkpoint.
         let rendered: Vec<u32> = (0..(p + 7) as u32).collect();
-        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, "t");
         assert_plan(&got, &rendered, p, Some(p), "shorter request, lcp >= p");
         // A shorter request ending exactly at the checkpoint has no tail: cold.
-        let got = plan(&lineage, at_p.clone(), true, &ckpts, true, "t");
+        let got = plan(&lineage, at_p.clone(), true, &ckpts, "t");
         assert_plan(&got, &at_p, 0, None, "shorter request ending at p");
 
         // (g) checkpoint-only lineage extended: strict-extension branch, no resume.
         let rendered: Vec<u32> = (0..(p + 23) as u32).collect();
-        let got = plan(&at_p, rendered.clone(), true, &ckpts, true, "t");
+        let got = plan(&at_p, rendered.clone(), true, &ckpts, "t");
         assert_plan(&got, &rendered, p, None, "checkpoint-only lineage extended");
 
         // (h) cache ineligible: cold even on a divergence that would resume.
         let rendered = fork(p + 8, 3);
-        let got = plan(&lineage, rendered.clone(), false, &ckpts, true, "t");
+        let got = plan(&lineage, rendered.clone(), false, &ckpts, "t");
         assert_plan(&got, &rendered, 0, None, "cache ineligible");
-
-        // (i) resume disabled: divergence is cold, a pure extension still hits.
-        let got = plan(&lineage, rendered.clone(), true, &ckpts, false, "t");
-        assert_plan(&got, &rendered, 0, None, "resume disabled, divergence");
-        let ext: Vec<u32> = (0..(l + 20) as u32).collect();
-        let got = plan(&lineage, ext.clone(), true, &ckpts, false, "t");
-        assert_plan(&got, &ext, l, None, "resume disabled, extension");
     }
 }
 
@@ -986,19 +940,17 @@ fn empty_lineage_is_a_local_miss() {
     use hipfire_generate::qwen::plan_from_rendered as plan;
     let rendered: Vec<u32> = (0..64).collect();
     for ckpts in [&[][..], &[16usize][..], &[16usize, 40][..]] {
-        for resume in [false, true] {
-            let got = plan(&[], rendered.clone(), true, ckpts, resume, "q35");
-            assert_plan(&got, &rendered, 0, None, "empty lineage");
-        }
+        let got = plan(&[], rendered.clone(), true, ckpts, "q35");
+        assert_plan(&got, &rendered, 0, None, "empty lineage");
     }
     // Live record plus an EOP checkpoint: the candidate stays the lineage's
     // own deepest hit.
     let live: Vec<u32> = (0..40).collect();
-    let got = plan(&live, rendered.clone(), true, &[16], true, "q35");
+    let got = plan(&live, rendered.clone(), true, &[16], "q35");
     assert_plan(&got, &rendered, 40, None, "live candidate");
     // EOP-only lineage (checkpoint-length record) yields the EOP candidate.
     let eop: Vec<u32> = (0..16).collect();
-    let got = plan(&eop, rendered.clone(), true, &[16], true, "q35");
+    let got = plan(&eop, rendered.clone(), true, &[16], "q35");
     assert_plan(&got, &rendered, 16, None, "EOP candidate");
 }
 
@@ -1030,12 +982,12 @@ fn local_candidate_never_covers_the_whole_prompt() {
                 vec![(n - 1).max(1)],
                 vec![1, (n / 2).max(1), n],
             ] {
-                for (eligible, resume) in [(true, true), (true, false), (false, true)] {
+                for eligible in [true, false] {
                     let ctx = format!(
-                        "n={n} lineage_len={} ckpts={ckpts:?} eligible={eligible} resume={resume}",
+                        "n={n} lineage_len={} ckpts={ckpts:?} eligible={eligible}",
                         lineage.len()
                     );
-                    let got = plan(lineage, rendered.clone(), eligible, &ckpts, resume, "q35");
+                    let got = plan(lineage, rendered.clone(), eligible, &ckpts, "q35");
                     assert!(got.start_pos < n, "{ctx}: start_pos {} >= n", got.start_pos);
                     assert!(!got.new_tokens.is_empty(), "{ctx}: empty suffix");
                     assert_eq!(got.new_tokens, rendered[got.start_pos..].to_vec(), "{ctx}");
@@ -1048,7 +1000,7 @@ fn local_candidate_never_covers_the_whole_prompt() {
     }
 }
 
-/// A disabled cache (`HIPFIRE_QWEN_PROMPT_CACHE=0` or eviction active) reaches
+/// A disabled cache (eviction active, native Qwen4 MTP) reaches
 /// the shared planner as `cache_eligible = false`: cold even where a live
 /// extension or checkpoint resume would hit.
 #[test]
@@ -1058,14 +1010,14 @@ fn cache_disabled_inputs_plan_cold_through_the_shared_planner() {
     let extension: Vec<u32> = (0..70).collect();
     let divergent: Vec<u32> = (0..45).chain(1_000_000..1_000_003).collect();
     for rendered in [&extension, &divergent] {
-        let got = plan(&lineage, rendered.clone(), false, &[37], true, "q35");
+        let got = plan(&lineage, rendered.clone(), false, &[37], "q35");
         assert_plan(&got, rendered, 0, None, "cache disabled");
     }
     // The same inputs with the cache enabled hit, so the cold plans above are
     // due to eligibility alone.
-    let got = plan(&lineage, extension.clone(), true, &[37], true, "q35");
+    let got = plan(&lineage, extension.clone(), true, &[37], "q35");
     assert_plan(&got, &extension, 50, None, "cache enabled extension");
-    let got = plan(&lineage, divergent.clone(), true, &[37], true, "q35");
+    let got = plan(&lineage, divergent.clone(), true, &[37], "q35");
     assert_plan(&got, &divergent, 37, Some(37), "cache enabled divergence");
 }
 
@@ -1124,10 +1076,6 @@ fn qwen4_dflash2_takes_the_spec_route_single_card_without_penalties() {
             },
             GenerationRouteInputs {
                 force_ar_chat: true,
-                ..request
-            },
-            GenerationRouteInputs {
-                temp_spec_env_off: true,
                 ..request
             },
             GenerationRouteInputs {
@@ -1552,7 +1500,6 @@ fn dflash2_selector_chain_nucleus_routes() {
         supports_temp_swor: true,
         supports_chain_nucleus_verify: true,
         ngram_can_sample: true,
-        fast_sample_on: true,
         temp: 1.0,
         user_explicit_sampling: true,
         min_p: Some(0.0),
@@ -1567,7 +1514,6 @@ fn dflash2_selector_chain_nucleus_routes() {
         supports_temp_swor: true,
         supports_chain_nucleus_verify: true,
         ngram_can_sample: true,
-        fast_sample_on: true,
         temp: 1.0,
         user_explicit_sampling: true,
         min_p: Some(0.05),
@@ -1583,7 +1529,6 @@ fn dflash2_selector_chain_nucleus_routes() {
         supports_temp_swor: true,
         supports_chain_nucleus_verify: true,
         ngram_can_sample: true,
-        fast_sample_on: true,
         temp: 1.0,
         user_explicit_sampling: true,
         nonneutral_penalties: true,
@@ -1627,7 +1572,6 @@ fn dflash2_selector_chain_nucleus_routes() {
         supports_temp_swor: false,
         supports_chain_nucleus_verify: false,
         ngram_can_sample: true,
-        fast_sample_on: true,
         temp: 0.7,
         user_explicit_sampling: true,
         min_p: None,

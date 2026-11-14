@@ -64,10 +64,10 @@ pub struct TreeVerifyCtx<'a> {
     pub attn_bias: &'a GpuTensor,
     /// `[N]` i32 — for each linearized slot, the slot index of its parent
     /// in the same linearization (or -1 for the root / seed). Produced by
-    /// `hipfire_runtime::ddtree::linearize_tree_with_parents`. When `Some`, LA layers
+    /// `hipfire_runtime::ddtree::linearize_tree_with_parents`. LA layers
     /// use tree-aware kernels that read parent state from the per-layer
     /// s_tape scratch of the batch scratch.
-    pub parent_indices: Option<&'a GpuTensor>,
+    pub parent_indices: &'a GpuTensor,
 }
 
 /// Row semantics of one batched forward chunk: a sequential prompt/verify
@@ -1442,25 +1442,8 @@ pub fn plain_gemm_key_for(dt: DType) -> crate::types::KernelKey {
     }
 }
 
-fn q8_prefill_wmma_enabled_from_env(value: Option<&str>, _arch: &str, has_wmma: bool) -> bool {
-    if !has_wmma {
-        return false;
-    }
-    match value {
-        Some("0") | Some("off") | Some("false") => false,
-        Some("1") | Some("on") | Some("true") => true,
-        _ => true,
-    }
-}
-
 pub fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
-    q8_prefill_wmma_enabled_from_env(
-        hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_WMMA")
-            .ok()
-            .as_deref(),
-        gpu.arch.as_str(),
-        gpu.arch_caps.has_wmma(),
-    )
+    gpu.arch_caps.has_wmma()
 }
 
 /// #397 Ship 5.2 slice 1: route a single PLAIN-batched prefill GEMM through
@@ -2837,24 +2820,5 @@ mod tests {
                 17408
             ));
         }
-    }
-
-    #[test]
-    fn q8_prefill_wmma_defaults_on_for_wave32_wmma_arches() {
-        assert!(q8_prefill_wmma_enabled_from_env(None, "gfx1201", true));
-        assert!(q8_prefill_wmma_enabled_from_env(None, "gfx1100", true));
-        assert!(q8_prefill_wmma_enabled_from_env(None, "gfx1151", true));
-        assert!(!q8_prefill_wmma_enabled_from_env(None, "gfx1030", false));
-        assert!(q8_prefill_wmma_enabled_from_env(Some("1"), "gfx1151", true));
-        assert!(!q8_prefill_wmma_enabled_from_env(
-            Some("0"),
-            "gfx1201",
-            true
-        ));
-        assert!(!q8_prefill_wmma_enabled_from_env(
-            Some("1"),
-            "gfx1030",
-            false
-        ));
     }
 }

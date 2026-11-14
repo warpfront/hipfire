@@ -258,9 +258,8 @@ host_cpu_weights={} cpu_offload_active={}",
             .expect("q8 kv");
     let dn_state =
         DeltaNetState::new_with_quant(gpu, &config, StateQuant::Q8).expect("q8 dn state");
-    // Default Q8 build runs with F16 error-feedback; the orchestrator enforces
-    // non-empty EF agreement across arms (both-active normally, both-empty
-    // only under an explicit HIPFIRE_DN_STATE_EF=0 opt-out).
+    // Q8 build runs with F16 error-feedback; the orchestrator enforces
+    // non-empty EF agreement across arms.
     let scratch = Qwen35Scratch::new(gpu, &config, REPEAT_WINDOW).expect("scratch");
     ModelSlot {
         name: name.to_string(),
@@ -952,10 +951,7 @@ fn run_orchestrator() {
     let first_tag = win_field(ew[0], "tag");
     let (eager_ef, graph_ef) = (ef_len(eager_dir, first_tag), ef_len(graph_dir, first_tag));
     assert_eq!(eager_ef, graph_ef, "dn_ef length diverged across arms");
-    assert!(
-        eager_ef > 0,
-        "dn_ef empty on both arms (HIPFIRE_DN_STATE_EF=0 set?)"
-    );
+    assert!(eager_ef > 0, "dn_ef empty on both arms");
 
     for (name, text, is_graph) in [
         ("eager", eager.as_str(), false),

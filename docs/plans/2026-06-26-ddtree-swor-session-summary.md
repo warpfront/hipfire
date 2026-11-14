@@ -67,7 +67,6 @@ safe (the spec speedup without distorting the sampled distribution).
 
 - `HIPFIRE_DDTREE_VERIFY=naive` — opt out of SWOR back to naive (default swor at temp>0).
 - `HIPFIRE_DDTREE_GREEDY_VERIFY=1` — force greedy argmax verify (diagnostic; ignores temp).
-- `HIPFIRE_DFLASH_TEMP_SPEC=0` — force temp>0 back to AR at serve (disable the routing).
 - `HIPFIRE_DDTREE_BUDGET` / `HIPFIRE_DDTREE_TOPK` — enable ddtree mode + tree shape.
 
 ## Validation status

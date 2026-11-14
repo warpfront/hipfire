@@ -766,17 +766,11 @@ pub fn ar_cancel_keeps_committed_prefix(m: &LoadedModel) -> bool {
         && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0)
 }
 
-pub fn ckpt_resume_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_RESUME")
-        .ok()
-        .as_deref()
-        != Some("0")
-}
 /// Whether the request renders the whole conversation through the chat template
 /// (messages history + a template), as opposed to appending `prompt` to the
 /// resident session.
-pub(crate) fn full_render_path(has_history: bool, has_template: bool, jinja_enabled: bool) -> bool {
-    has_history && has_template && jinja_enabled
+pub(crate) fn full_render_path(has_history: bool, has_template: bool) -> bool {
+    has_history && has_template
 }
 
 /// The context-full pre-check: reset the resident conversation to make room.
@@ -821,9 +815,9 @@ mod context_guard_tests {
         assert!(context_full_resets(false, 20_173, 800, 12_288, 32_768));
         // A request that fits never resets.
         assert!(!context_full_resets(false, 1_000, 800, 2_048, 32_768));
-        assert!(full_render_path(true, true, true));
-        assert!(!full_render_path(false, true, true));
-        assert!(!full_render_path(true, true, false));
+        assert!(full_render_path(true, true));
+        assert!(!full_render_path(false, true));
+        assert!(!full_render_path(true, false));
     }
 
     #[test]
@@ -1803,8 +1797,6 @@ pub struct GenerationRouteInputs {
     /// implement these controls and must use AR.
     pub nonneutral_penalties: bool,
     pub force_ar_chat: bool,
-    pub temp_spec_env_off: bool,
-    pub fast_sample_on: bool,
     pub supports_temp_swor: bool,
     /// Speculator applies faithful top_p/top_k on the sampled chain path
     /// (DFlash2 candidate-selector). When set, chain routing may engage even
@@ -1845,8 +1837,8 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     match i.arch_id {
         16 => {
             // Qwen4 native MTP verifies greedy picks, and sampled requests
-            // too when the drafter reports `supports_temp_verify`
-            // (`speculation.mtp_sampled`): speculative rejection sampling
+            // too when the drafter reports `supports_temp_verify`:
+            // speculative rejection sampling
             // against the AR sampler's own distribution
             // (`llama::sample_top_k_p`: temperature, the request's top_k and
             // min_p, top_p; the verifier's target applies the same cuts, so
@@ -1863,7 +1855,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             // request on the ordinary Qwen4 producer (penalize-then-argmax).
             // Qwen4 PP uses the same native driver for greedy requests and
             // for unpenalized sampled Leviathan requests (distribution-exact;
-            // `supports_temp_swor` is false for `speculation.mtp_sampled = 0`
+            // `supports_temp_swor` is false under the Q8-EF state gate
             // and, under PP, for `HIPFIRE_MTP_SAMPLED_MODE=naive`, whose draws
             // come from the process-wide sampler: those stay on the PP AR
             // producer). Penalized requests stay on the PP AR producer too:
@@ -1882,11 +1874,8 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
                 && i.pp <= 1
                 && !i.nonneutral_penalties
                 && (i.temp <= 1e-6 || i.supports_temp_swor);
-            let spec_ok = i.has_speculator
-                && (mtp_ok || dflash2_ok)
-                && !i.force_ar_chat
-                && !i.temp_spec_env_off
-                && !i.kv_adaptive;
+            let spec_ok =
+                i.has_speculator && (mtp_ok || dflash2_ok) && !i.force_ar_chat && !i.kv_adaptive;
             return if spec_ok {
                 GenerationRoute::Qwen4Spec
             } else {
@@ -1950,11 +1939,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
                 && i.pp <= 1
                 && (!i.nonneutral_penalties || i.speculator_supports_penalties)
                 && (i.temp <= 1e-6 || (i.supports_temp_swor && i.supports_chain_nucleus_verify));
-            let spec_ok = i.has_speculator
-                && dflash2_ok
-                && !i.force_ar_chat
-                && !i.temp_spec_env_off
-                && !i.kv_adaptive;
+            let spec_ok = i.has_speculator && dflash2_ok && !i.force_ar_chat && !i.kv_adaptive;
             return if spec_ok {
                 GenerationRoute::RaonSpec
             } else {
@@ -2011,16 +1996,13 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         && i.supports_temp_swor
         && !i.supports_chain_nucleus_verify
         && !i.user_explicit_sampling
-        && !i.nonneutral_penalties
-        && !i.temp_spec_env_off;
+        && !i.nonneutral_penalties;
     let chain_sample_route = !i.speculator_is_mtp
         && i.temp > 1e-6
         && (!i.supports_temp_swor || i.supports_chain_nucleus_verify)
         && i.ngram_can_sample
-        && i.fast_sample_on
         && !dflash_min_p_present
-        && !i.nonneutral_penalties
-        && !i.temp_spec_env_off;
+        && !i.nonneutral_penalties;
     let mtp_sample_route = i.speculator_is_mtp && i.temp > 1e-6 && i.supports_temp_swor;
     let qwen_greedy_route = i.temp <= 1e-6 && (!i.nonneutral_penalties || i.speculator_is_mtp);
     let qwen_dflash_route = caps.is_qwen_dflash()
@@ -2729,11 +2711,6 @@ pub fn generate(
             .ok()
             .as_deref()
             == Some("0"),
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
-            .ok()
-            .as_deref()
-            == Some("0"),
-        fast_sample_on: hipfire_runtime::config::get().dflash_fast_sample,
         supports_temp_swor,
         supports_chain_nucleus_verify,
         kv_adaptive: m.kv_adaptive.is_some(),
@@ -2750,7 +2727,7 @@ pub fn generate(
         if !QWEN4_PP_MTP_AR_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!(
                 "[hipfire] PP native MTP: penalized requests, sampled requests with \
-                 HIPFIRE_MTP_SAMPLED=0 and sampled requests with HIPFIRE_MTP_SAMPLED_MODE=naive \
+                 HIPFIRE_MTP_SAMPLED_MODE=naive \
                  decode AR (greedy and unpenalized sampled leviathan requests run MTP)"
             );
         }
@@ -3684,9 +3661,7 @@ pub fn generate(
                     .unwrap_or(false)
                 && !route_inputs.force_ar_chat
             {
-                let reason = if route_inputs.temp_spec_env_off {
-                    "HIPFIRE_DFLASH_TEMP_SPEC=0"
-                } else if min_p.map(|p| p > 0.0).unwrap_or(false) {
+                let reason = if min_p.map(|p| p > 0.0).unwrap_or(false) {
                     // Prefer min_p over SWOR-only: selector-chain honors top_p/top_k
                     // but still falls to AR when min_p>0 (DFlash ignores min_p).
                     "request set min_p (sampled DFlash honors top_p/top_k only); AR applies it"
@@ -3700,7 +3675,7 @@ pub fn generate(
                 } else if !ngram_can_sample {
                     "loaded drafter is greedy-only (MTP/n-gram); temp>0 runs AR"
                 } else if route_inputs.supports_chain_nucleus_verify {
-                    "sampled DFlash chain nucleus not engaged (check HIPFIRE_FAST_SAMPLE / temp-spec gates)"
+                    "sampled DFlash chain nucleus not engaged"
                 } else {
                     "ddtree SWOR verify not active (needs ddtree_budget>0)"
                 };
@@ -3740,14 +3715,7 @@ pub fn generate(
     // The rendered conversation (messages history through the chat template)
     // already holds the whole cached history, so a reset could never create room:
     // the full render lands on the same absolute positions after a cold prefill.
-    let full_render = full_render_path(
-        messages_history.is_some(),
-        m.chat_template.is_some(),
-        hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0"),
-    );
+    let full_render = full_render_path(messages_history.is_some(), m.chat_template.is_some());
     let prompt_est = if !full_render
         && m.seq_pos
             .saturating_add(prompt.len())
@@ -3843,22 +3811,10 @@ pub fn generate(
     let nl = tokenizer.encode("\n");
     let q_tokens = tokenizer.encode(prompt);
 
-    // ChatML framing — two paths:
-    //
-    //   1) `HIPFIRE_JINJA_CHAT=1` AND model carries an embedded chat_template
-    //      AND first turn (seq_pos == 0): render through `JinjaChatFrame`
-    //      against the upstream HF Jinja template, producing the byte
-    //      sequence the model was actually trained on (fixes the "hand-roll
-    //      drifted from upstream template" class — XML tool calls on
-    //      Qwen3.5/3.6 instead of JSON, `<|im_start|>user` for tool
-    //      responses instead of `<|im_start|>tool`, etc.).
-    //
-    //   2) Default: hand-rolled `prompt_frame::ChatFrame::Plain`
-    //      scaffold, byte-identical to today's behavior.
-    //
-    // Multi-turn (seq_pos > 0) currently always uses path 2 — Jinja
-    // single-turn parity is Stage 2; multi-turn message-history state on
-    // the daemon side is Stage 2 follow-up.
+    // ChatML framing: when the model carries an embedded chat_template, render
+    // through `JinjaChatFrame` against the upstream HF Jinja template (the byte
+    // sequence the model was trained on); otherwise use the hand-rolled
+    // `prompt_frame::ChatFrame::Plain` scaffold.
     //
     // Thinking-off interop with `assistant_prefix`: the CLI sets BOTH
     // `max_think_tokens = 1` AND `assistant_prefix = ClosedThink` when
@@ -3869,23 +3825,14 @@ pub fn generate(
     // picks up the signal it needs.
     // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
     // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
-    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
-    // the .hfq carries no template, e.g. an older A1B convert).
-    // Jinja default-ON (flipped 2026-06-09): render through the model's chat
-    // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
-    // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-        .ok()
-        .as_deref()
-        != Some("0");
+    // produces garbage (Plain only applies when the .hfq carries no template,
+    // e.g. an older A1B convert).
     // Jinja renders the FULL conversation every turn (stateless full-render,
     // like crate::qwen::generate_dflash) — fire on every turn, not just `seq_pos == 0`.
     // `render_messages` below replays `messages_history` (all prior turns) and
-    // includes the system prompt, so turn 2+ no longer falls through to the
-    // Plain branch (which dropped the system prompt and lost the Jinja
-    // template). The cold-reset further down (`jinja_active && seq_pos > 0`)
-    // re-prefills this full render from position 0.
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    // includes the system prompt. The cold-reset further down
+    // (`jinja_active && seq_pos > 0`) re-prefills this full render from position 0.
+    let try_jinja = m.chat_template.is_some();
     let mut started_in_think = matches!(
         assistant_prefix,
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
@@ -3907,8 +3854,7 @@ pub fn generate(
         // through `render_messages` so the upstream template's
         // `{% if tools %}` / multi-turn branches fire. With neither
         // supplied, fall through to the single-turn `render()` convenience,
-        // which is byte-identical to the synthesized [system?, user]
-        // path that shipped under HIPFIRE_JINJA_CHAT=1 before this change.
+        // which is byte-identical to the synthesized [system?, user] path.
         let render_result = if tools.is_some() || messages_history.is_some() {
             // Synthesize [system?, user] when no explicit history was
             // provided. Tools-with-legacy-prompt is the natural OpenAI
@@ -4002,7 +3948,6 @@ pub fn generate(
     // the cold-prefill boundaries where a snapshot is canonical.
     //
     // Mirrors V4F's prefix-cache (daemon.rs ~5390). Eligible when:
-    //   - HIPFIRE_QWEN_PROMPT_CACHE != "0"  (default on)
     //   - messages_history is provided (full-conversation context)
     //   - prior conversation_tokens non-empty (first turn = nothing to LCP)
     //
@@ -4013,48 +3958,25 @@ pub fn generate(
     // (seq_pos=0, conversation_tokens.clear(), zero DeltaNet, KV
     // compact_offset=0) and prefill the FULL rendered prompt — DeltaNet
     // is not reversible to position M<N so partial rollback is unsafe.
-    let cache_kill_switch = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
-        .ok()
-        .as_deref()
-        == Some("0");
-    // Jinja-on disqualification: when `HIPFIRE_JINJA_CHAT=1` the first
-    // turn renders through the upstream HF chat template (which the
-    // model was actually trained on — emits default system prompts,
-    // Hermes XML tool-call format on Qwen3.5/3.6, etc.). The cache
-    // path uses scaffold-style rendering (`ChatScaffold`) which
-    // produces a DIFFERENT byte sequence for the same logical content.
-    // Mixing the two within a session would degrade output quality
-    // (the model sees a different input distribution than it was
-    // trained for after turn 1). Skip the cache when Jinja is active
-    // so the operator gets consistent rendering across all turns.
-    // Cache-with-Jinja is a future project (would require Jinja-side
-    // assistant-turn replay).
-    let jinja_active = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-        .ok()
-        .as_deref()
-        != Some("0")
-        && m.chat_template.is_some();
-    // Cache-with-Jinja (item #37): `jinja_active` is NO LONGER a disqualifier.
-    // When jinja is active the prompt-build below routes through
-    // `build_cached_history_jinja` (verbatim assistant-turn splice through the
-    // model's trained template) instead of the ChatScaffold `build_cached_history`,
-    // so the LCP forward-extension cache now works under HIPFIRE_JINJA_CHAT too.
+    // Jinja renders through the model's trained template when one is present;
+    // the prompt-build below then splices cached assistant turns verbatim via
+    // `build_cached_history_jinja` instead of the ChatScaffold
+    // `build_cached_history`.
+    let jinja_active = m.chat_template.is_some();
     // VMM batch route: conversations finished on batch lanes (or parked
     // between singleton turns) are kept in the store's prefix pool; one of
     // them may be this request's resident conversation.
     let vmm_pool = jinja_active && tools.is_none() && crate::vmm_conv::pool_active(m);
-    let cache_eligible = !cache_kill_switch
-        && messages_history.is_some()
-        && (!m.conversation_tokens.is_empty() || vmm_pool);
+    let cache_eligible =
+        messages_history.is_some() && (!m.conversation_tokens.is_empty() || vmm_pool);
     if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
         .ok()
         .as_deref()
         == Some("1")
     {
         eprintln!(
-            "[qwen-cache eligible] eligible={} kill={} hist={} jinja={} conv_tok={}",
+            "[qwen-cache eligible] eligible={} hist={} jinja={} conv_tok={}",
             cache_eligible,
-            cache_kill_switch,
             messages_history.is_some(),
             jinja_active,
             m.conversation_tokens.len(),
@@ -4379,8 +4301,7 @@ pub fn generate(
             // Resume is only valid for qwen35 (the DeltaNet recurrent state in the
             // bundle). The gate used to read the always-None m.dn_state → resume
             // was silently disabled post-merge; gate on the bundle instead.
-            let resume_idx = if ckpt_resume_enabled()
-                && resume_safe
+            let resume_idx = if resume_safe
                 && m.state
                     .as_ref()
                     .map_or(false, |s| s.as_ref().arch_key() == "qwen35")
@@ -4521,8 +4442,7 @@ pub fn generate(
     // the LCP on a forward-extension HIT, or full-reset on a MISS — so we must
     // NOT blanket-reset here (that would discard a valid cache hit and force a
     // cold re-prefill every turn). Only cold-reset when the cache did NOT run
-    // (item #37): first turn (empty conversation), kill switch
-    // (HIPFIRE_QWEN_PROMPT_CACHE=0). On turn 2+ in those
+    // (item #37): first turn (empty conversation) or no messages history. On turn 2+ in those
     // cases, reset BEFORE the budget guard + prefill so the full render writes
     // from position 0 rather than appending to the prior turn's dirty
     // DeltaNet/KV/checkpoint state. Uses `crate::common::free_checkpoints` (NOT a bare
@@ -4727,7 +4647,7 @@ pub fn generate(
         // The snapshot sits on the newest existing chunk end at or before the
         // boundary: the chunk plan is untouched (numerics-neutral).
         let mut turn = speculative::TurnCheckpoint {
-            boundary: turn_boundary.filter(|_| ckpt_resume_enabled()),
+            boundary: turn_boundary,
             pin: m.user_turn_ckpt,
         };
         let mut prefill_aborted = false;
@@ -4764,21 +4684,19 @@ pub fn generate(
             let remaining = new_tokens.len() - start;
             let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
                 .unwrap_or(remaining.min(chunk_max).max(1));
-            if ckpt_resume_enabled() {
-                speculative::take_turn_checkpoint_before_chunk(
-                    &mut m.prefill_checkpoints,
-                    dn,
-                    kv,
-                    gpu,
-                    m.seq_pos,
-                    outer,
-                    ckpt_max(),
-                    &mut turn,
-                    // Committed conversation + the chunks forwarded so far.
-                    (&m.conversation_tokens, &new_tokens[..start]),
-                );
-                m.user_turn_ckpt = turn.pin;
-            }
+            speculative::take_turn_checkpoint_before_chunk(
+                &mut m.prefill_checkpoints,
+                dn,
+                kv,
+                gpu,
+                m.seq_pos,
+                outer,
+                ckpt_max(),
+                &mut turn,
+                // Committed conversation + the chunks forwarded so far.
+                (&m.conversation_tokens, &new_tokens[..start]),
+            );
+            m.user_turn_ckpt = turn.pin;
             let end = (start + outer).min(new_tokens.len());
             let chunk = &new_tokens[start..end];
             if let Err(e) = qwen35::forward_prefill_batch_ordinary(
@@ -4851,21 +4769,19 @@ pub fn generate(
             // later divergent render can resume here instead of cold. `dn`
             // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
             // fields, so this composes with the live kv/dn borrows.
-            if ckpt_resume_enabled() {
-                // Stride snapshot that spares the pinned user-turn snapshot.
-                speculative::take_turn_checkpoint(
-                    &mut m.prefill_checkpoints,
-                    dn,
-                    kv,
-                    gpu,
-                    m.seq_pos,
-                    ckpt_interval(),
-                    ckpt_max(),
-                    turn,
-                    // Committed conversation + the chunk forwarded so far.
-                    (&m.conversation_tokens, &new_tokens[..end]),
-                );
-            }
+            // Stride snapshot that spares the pinned user-turn snapshot.
+            speculative::take_turn_checkpoint(
+                &mut m.prefill_checkpoints,
+                dn,
+                kv,
+                gpu,
+                m.seq_pos,
+                ckpt_interval(),
+                ckpt_max(),
+                turn,
+                // Committed conversation + the chunk forwarded so far.
+                (&m.conversation_tokens, &new_tokens[..end]),
+            );
             start = end;
         }
         if prefill_aborted {
@@ -5401,21 +5317,19 @@ pub fn generate(
             // big code emission) can be resumed mid-region if the NEXT turn's
             // render diverges within it — without replaying the whole
             // generation.
-            if ckpt_resume_enabled() {
-                speculative::take_dn_checkpoint_pinned(
-                    &mut m.prefill_checkpoints,
-                    dn,
-                    kv,
-                    gpu,
-                    m.seq_pos,
-                    ckpt_interval(),
-                    ckpt_max(),
-                    m.user_turn_ckpt,
-                    // `conversation_tokens` IS the forwarded stream here (each
-                    // token is committed as it is forwarded).
-                    (&m.conversation_tokens, &[]),
-                );
-            }
+            speculative::take_dn_checkpoint_pinned(
+                &mut m.prefill_checkpoints,
+                dn,
+                kv,
+                gpu,
+                m.seq_pos,
+                ckpt_interval(),
+                ckpt_max(),
+                m.user_turn_ckpt,
+                // `conversation_tokens` IS the forwarded stream here (each
+                // token is committed as it is forwarded).
+                (&m.conversation_tokens, &[]),
+            );
             // Adaptive KV: downshift K/V precision as seq_pos crosses capacity
             // thresholds. `kv` (=m.kv_cache) and m.kv_adaptive are distinct
             // fields → NLL splits the borrow.
@@ -7052,8 +6966,6 @@ mod qwen4_pp_route_tests {
             min_p: None,
             nonneutral_penalties: false,
             force_ar_chat: false,
-            temp_spec_env_off: false,
-            fast_sample_on: false,
             supports_temp_swor: false,
             supports_chain_nucleus_verify: false,
             kv_adaptive: false,
@@ -7100,8 +7012,8 @@ mod qwen4_pp_route_tests {
                 GenerationRoute::Qwen4Spec,
                 "pp {pp}"
             );
-            // Sampled without `supports_temp_verify` (`HIPFIRE_MTP_SAMPLED=0`,
-            // or PP + `HIPFIRE_MTP_SAMPLED_MODE=naive`): the PP AR producer.
+            // Sampled without `supports_temp_verify` (PP +
+            // `HIPFIRE_MTP_SAMPLED_MODE=naive`): the PP AR producer.
             i.temp = 0.7;
             assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
             // Sampled, unpenalized, sampled verification available (leviathan):

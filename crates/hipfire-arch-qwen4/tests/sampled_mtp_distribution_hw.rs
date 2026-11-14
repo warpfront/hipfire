@@ -53,9 +53,9 @@
 //! `HIPFIRE_SAMPLED_MTP_OUT`; an arm whose `<arm>.ids.json` is already there
 //! is reused, so the arms can run first as separate time-boxed invocations of
 //! `sampled_mtp_distribution_arm` (set `HIPFIRE_SAMPLED_MTP_ARM`,
-//! `HIPFIRE_MTP_SAMPLED=1`, `HIPFIRE_MTP_SAMPLED_MODE=leviathan` and the arm's
+//! `HIPFIRE_MTP_SAMPLED_MODE=leviathan` and the arm's
 //! route knobs yourself: every arm checks it already runs under its
-//! environment and fails naming the variable otherwise). Every arm runs the
+//! environment and fails otherwise). Every arm runs the
 //! speculative-rejection-sampling (Leviathan) verifier explicitly; the naive
 //! verifier has its own test below.
 //!
@@ -176,7 +176,7 @@
 //! ```sh
 //! export HIPFIRE_MTP_IDENTITY_MODEL="$MODEL" HIPFIRE_SAMPLED_MTP_OUT="$OUT"
 //! export HIPFIRE_SAMPLED_MTP_TRIALS=2000 HIPFIRE_SAMPLED_MTP_PROMPT=prose
-//! export HIPFIRE_MTP_SAMPLED=1 HIPFIRE_MTP_SAMPLED_MODE=leviathan
+//! export HIPFIRE_MTP_SAMPLED_MODE=leviathan
 //! unset HIPFIRE_MTP_TRACE HIPFIRE_MTP_PHASE_TIMING
 //! # Repeat START..END ranges to cover 0..2000 for EACH arm.
 //! export HIPFIRE_SAMPLED_MTP_SHARD=0..10
@@ -307,7 +307,7 @@
 //! export HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2
 //! # export HIPFIRE_PP_LAYERS=24,24      # optional band split, logical band order
 //! export HIPFIRE_SAMPLED_MTP_TRIALS=2000 HIPFIRE_SAMPLED_MTP_PROMPT=prose
-//! export HIPFIRE_MTP_SAMPLED=1 HIPFIRE_MTP_SAMPLED_MODE=leviathan
+//! export HIPFIRE_MTP_SAMPLED_MODE=leviathan
 //! unset HIPFIRE_MTP_TRACE HIPFIRE_MTP_PHASE_TIMING HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS
 //! T="cargo test --release -p hipfire-arch-qwen4 --test sampled_mtp_distribution_hw"
 //! # Per arm, per shard (disjoint START..END ranges covering 0..2000; seeds are global):
@@ -1596,7 +1596,7 @@ fn new_drafter_with_max_seq(
         .with_ngram(ngram)
         .with_copy_lane(copy_lane);
     if !drafter.supports_temp_verify() {
-        return Err("HIPFIRE_MTP_SAMPLED did not enable sampled verification".into());
+        return Err("drafter does not advertise sampled verification".into());
     }
     Ok(drafter)
 }
@@ -1858,7 +1858,7 @@ impl PpLoaded {
         {
             let drafter = pp_drafter(speculator.as_mut())?;
             if !drafter.supports_temp_verify() {
-                return Err("HIPFIRE_MTP_SAMPLED did not enable sampled verification".into());
+                return Err("drafter does not advertise sampled verification".into());
             }
             if drafter.sampled_mode_is_naive() {
                 return Err(
@@ -2519,7 +2519,6 @@ fn arm_route(arm: &str) -> Option<&'static str> {
 /// unset (floor on, no forced route).
 fn arm_overrides(arm: &str, mode: &'static str) -> Vec<(&'static str, Option<&'static str>)> {
     let mut overrides: Vec<(&'static str, Option<&'static str>)> = vec![
-        ("HIPFIRE_MTP_SAMPLED", Some("1")),
         (SAMPLED_MODE_ENV, Some(mode)),
         ("HIPFIRE_MTP_TRACE", None),
         ("HIPFIRE_MTP_PHASE_TIMING", None),

@@ -568,17 +568,12 @@ fn run() -> Result<()> {
         return Err("usage: fa_a3b_screen [--plan|--self-check]".into());
     }
     // Reject alternate incumbent tuning rather than silently mislabel a screen.
-    for (name, allowed) in [
-        ("HIPFIRE_FLASH_PREFILL_SPLITQ", "0"),
-        ("HIPFIRE_FLASH_PREFILL_FIXED_HD", "1"),
-        ("HIPFIRE_FLASH_PREFILL_PREFETCH_V", "1"),
-    ] {
-        if let Ok(v) = std::env::var(name) {
-            if v != allowed {
-                return Err(
-                    format!("unset {name}; screen requires default incumbent tuning").into(),
-                );
-            }
+    if let Ok(v) = std::env::var("HIPFIRE_FLASH_PREFILL_SPLITQ") {
+        if v != "0" {
+            return Err(
+                "unset HIPFIRE_FLASH_PREFILL_SPLITQ; screen requires default incumbent tuning"
+                    .into(),
+            );
         }
     }
     let mut gpu = Gpu::init()?;

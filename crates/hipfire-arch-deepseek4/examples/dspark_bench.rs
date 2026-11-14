@@ -14,16 +14,16 @@
 //!   - draft accept fraction = accepted / proposed
 //!   - the decoded text (for human coherence eyeball)
 //!
-//! Drafter selection (bench-local A/B switch — this harness builds the
-//! speculator directly, bypassing the loader's `speculation`-mode gate):
-//!   HIPFIRE_DEEPSEEK4_DSPARK=0  → MTP drafter; otherwise DSpark (if sidecar).
+//! Drafter: `--drafter dspark` (default) uses the DSpark sidecar when present,
+//! else the MTP drafter; `--drafter mtp` skips loading the sidecar and runs the
+//! MTP drafter (`HIPFIRE_DEEPSEEK4_SPEC_K` sets its K). This harness builds the
+//! speculator directly, bypassing the loader's `speculation`-mode gate.
 //!
 //! ENV:
 //!   HIPFIRE_DEEPSEEK4_MODEL   trunk HFQ path (default ~/.hipfire/models/deepseek-v4-flash.mq2lloyd)
 //!   HIPFIRE_DEEPSEEK4_PROMPT  prompt text (default a fixed sentence)
 //!   HIPFIRE_DEEPSEEK4_MAX     max decode tokens (default 160)
 //!   HIPFIRE_DEEPSEEK4_WARMUP  throwaway warmup tokens before the timed run (default 24)
-//!   HIPFIRE_DEEPSEEK4_DSPARK  =0 forces MTP; else DSpark
 //!   HIPFIRE_DEEPSEEK4_BENCH_RAW=1  base completion (no chat framing)
 //!   HIPFIRE_DEEPSEEK4_BENCH_EXPERTS_PER_TOK=N
 //!                              benchmark-only routed-expert override
@@ -169,6 +169,17 @@ fn main() -> Result<(), String> {
     eprintln!("Loading DeepSeek V4 trunk from {path}...");
     let mut hfq = HfqFile::open(Path::new(&path)).map_err(|e| format!("open: {e:?}"))?;
     let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    // Bench-local drafter arm (a CLI argument, not a product setting).
+    let args: Vec<String> = std::env::args().collect();
+    match args
+        .iter()
+        .position(|a| a == "--drafter")
+        .map(|i| args.get(i + 1).map(String::as_str))
+    {
+        None | Some(Some("dspark")) => {}
+        Some(Some("mtp")) => cfg.load_dspark = false,
+        Some(other) => return Err(format!("--drafter expects dspark|mtp, got {other:?}")),
+    }
     if let Some(experts_per_tok) = bench_experts_per_tok {
         if experts_per_tok == 0 || experts_per_tok > cfg.num_experts_per_tok {
             return Err(format!(
@@ -202,8 +213,7 @@ fn main() -> Result<(), String> {
     let weights = DeepseekV4::load_weights(&mut hfq, &cfg, &mut gpu)?;
     let state = DeepseekV4State::new(&cfg)?;
 
-    let dspark_enabled = weights.dspark.is_some()
-        && std::env::var("HIPFIRE_DEEPSEEK4_DSPARK").ok().as_deref() != Some("0");
+    let dspark_enabled = weights.dspark.is_some();
     let block = if let Some(d) = weights.dspark.as_ref() {
         d.cfg.block_size
     } else {

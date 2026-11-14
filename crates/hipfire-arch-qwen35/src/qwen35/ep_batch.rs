@@ -870,15 +870,6 @@ pub fn validate_ep_batch_compatibility(
             }
         }
     }
-    let ef_enabled = hipfire_config::developer_var("HIPFIRE_DN_STATE_EF")
-        .map(|v| v != "0")
-        .unwrap_or(true);
-    if !ef_enabled {
-        return Err(HipError::new(
-            0,
-            "EP batch: requires default F16 EF (HIPFIRE_DN_STATE_EF !=0)",
-        ));
-    }
     for (i, dev) in gpus.devices.iter().enumerate() {
         dev.ensure_attention_q8_0_kv_independent_lds(load_cfg.lane_capacity, config.head_dim)
             .map_err(|e| HipError::new(0, &format!("EP batch: rank {i} LDS {e}")))?;

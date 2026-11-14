@@ -1334,9 +1334,7 @@ fn qwen4_native_mtp_speculator(
         hipfire_config::load_summary::Facet::SpecOn,
         format!("qwen4 native mtp K={max_k}"),
     );
-    if hipfire_config::mtp_sampled_enabled()
-        && !hipfire_arch_qwen4::mtp_spec::qwen4_mtp_sampled_allowed(gdn)
-    {
+    if !hipfire_arch_qwen4::mtp_spec::qwen4_mtp_sampled_allowed(gdn) {
         eprintln!(
             "  qwen4 native MTP sampled: off for GDN q8_ef (sampled requests use AR until the sampled-MTP law is verified)"
         );
@@ -12550,7 +12548,7 @@ impl Carrier for Deepseek4Carrier {
         } = deepseek4::load_deepseek4_bundle(src, ctx, compressor_cache)?;
         let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
         // deepseek4 MTP spec-decode capability: present iff the MTP addon weights loaded
-        // (HIPFIRE_DEEPSEEK4_MTP_ADDON / .mtp-addon.hfq / HIPFIRE_DEEPSEEK4_LOAD_MTP). The
+        // (HIPFIRE_DEEPSEEK4_MTP_ADDON / .mtp-addon.hfq / speculation.mtp). The
         // per-request spec gate (mtp_mode / HIPFIRE_DEEPSEEK4_SPEC_DECODE / temp<=eps) stays in
         // the generate path (T4 routing) — here we only build the capability. Undriven until T4:
         // the daemon's arch_id==9 branch still uses the bespoke generate_deepseek4 loop.

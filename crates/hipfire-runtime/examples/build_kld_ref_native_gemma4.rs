@@ -94,7 +94,6 @@ fn main() {
     unsafe {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         std::env::set_var("HIPFIRE_GRAPH", "0");
-        std::env::set_var("HIPFIRE_GEMMA4_GRAPH", "0");
     }
 
     // -------- load oracle model + tokenizer --------

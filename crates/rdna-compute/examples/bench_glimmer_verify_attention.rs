@@ -523,8 +523,6 @@ fn print_settings(gpu: &Gpu, ctx: usize, warmups: usize, groups: usize, iters: u
     );
     // Surface common attention tuning knobs that affect WMMA arithmetic.
     for k in [
-        "HIPFIRE_FLASH_PREFILL_FIXED_HD",
-        "HIPFIRE_FLASH_PREFILL_PREFETCH_V",
         "HIPFIRE_FLASH_PREFILL_SPLITQ",
         "HIPFIRE_GLIMMER_SWA_PREFETCH_V",
         "HIP_VISIBLE_DEVICES",

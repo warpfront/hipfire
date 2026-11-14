@@ -1072,7 +1072,7 @@ string or a blanket “always refuse at load.”
 | Flash-Next (Qwen4) `pp>1`, unsupported options | `qwen4: pipeline parallelism (topology.pp = N) does not support <subject>; drop the option or set topology.pp = 1`, subjects: DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, an experts-per-token override, a non-Single compute placement, the MTP n-gram modifier. Full list: [refusals](#flash-next-pipeline-parallelism-host-staged) |
 | Flash-Next (Qwen4) `pp>1`, environment and config requests | Same sentence with subjects host-mapped routed experts (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`), the expert hotset, expert staging, session snapshots, the session cache disk tier, the NPU trunk |
 | Flash-Next (Qwen4) `pp>1`, mesh, bands and budget | Refused before any allocation, naming `topology.pp`: pp outside `2..=8` or `tp`/`ep` ≠ 1, `HIPFIRE_EMULATE_GPUS`, too few visible devices, unknown PCI identity, an arch other than gfx1100/gfx1201, mixed arches, `HIPFIRE_MESH_TRANSPORT=peer`, a bad `HIPFIRE_PP_LAYERS`, a band that does not fit its card |
-| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`), for greedy requests and for sampled requests with the default Leviathan verify and neutral penalties; penalized requests, `HIPFIRE_MTP_SAMPLED=0` and `HIPFIRE_MTP_SAMPLED_MODE=naive` sampled requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree stay refused. fn-lanes under PP are AR lanes only: native-MTP lanes are not staged ([fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep)) |
+| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`), for greedy requests and for sampled requests with the default Leviathan verify and neutral penalties; penalized requests and `HIPFIRE_MTP_SAMPLED_MODE=naive` sampled requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree stay refused. fn-lanes under PP are AR lanes only: native-MTP lanes are not staged ([fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep)) |
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, `ep` above 8, an
@@ -1439,17 +1439,16 @@ measurement, is expected to land on `25,23` at chunk 256.
   contract is the single-card native-MTP result (tokens, window records, canonical
   state including the MTP head); qualify each hardware cell with `--mtp` in the gate below.
 - **Sampled native MTP (Leviathan) with neutral penalties** runs on the mesh with
-  the same route as greedy MTP: temperature > 0 requests (the default
-  `speculation.mtp_sampled`, `HIPFIRE_MTP_SAMPLED_MODE` unset or `leviathan`)
+  the same route as greedy MTP: temperature > 0 requests (with
+  `HIPFIRE_MTP_SAMPLED_MODE` unset or `leviathan`)
   draft from the head's re-scored candidates, verify through the same
   `[seed, drafts...]` block and accept by speculative rejection sampling, so the
   emitted stream equals PP AR in distribution (not bit-for-bit; the sampled-MTP
   chi-square oracle `sampled_mtp_distribution_hw` runs it with
   `HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2`). Every draft and target-row read goes
   through the output band's device. **Penalized sampled requests**
-  (repeat/presence/frequency), `HIPFIRE_MTP_SAMPLED_MODE=naive` (its draws come
-  from the process-wide AR sampler) and `HIPFIRE_MTP_SAMPLED=0`
-  (`speculation.mtp_sampled = false`, the kill switch) decode **AR** on the mesh
+  (repeat/presence/frequency) and `HIPFIRE_MTP_SAMPLED_MODE=naive` (its draws come
+  from the process-wide AR sampler) decode **AR** on the mesh
   instead of failing, as do penalized greedy requests. MTP sessions are not
   distributed: a native-MTP request on the mesh never reuses a session snapshot
   and publishes none. A speculative request that still reaches the mesh with

@@ -184,7 +184,6 @@ fn main() {
     unsafe {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         std::env::set_var("HIPFIRE_GRAPH", "0");
-        std::env::set_var("HIPFIRE_GRAPH_MOE", "0");
     }
 
     let args: Vec<String> = std::env::args().collect();
@@ -527,7 +526,7 @@ fn main() {
         config.n_layers, config.dim, config.hidden_dim, config.head_dim, layers_per_pass
     );
     eprintln!("flags: kldref={want_kldref} synthetic={synthetic} seed={seed}");
-    eprintln!("HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_GRAPH_MOE=0 (forced)");
+    eprintln!("HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 (forced)");
     if summary.max_consistency >= 1e-4 {
         std::process::exit(1);
     }

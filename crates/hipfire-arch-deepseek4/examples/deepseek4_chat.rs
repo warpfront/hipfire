@@ -13,7 +13,6 @@
 //!   echo "Hello" | deepseek4_chat
 //!
 //! ENV:
-//!   HIPFIRE_DEEPSEEK4_ATTN=pos0      fall back to pos-0 attention (default: SWA)
 //!   HIPFIRE_DEEPSEEK4_GEN_TOKENS=N   max tokens per turn (default 200)
 //!   HIPFIRE_DEEPSEEK4_MODEL=PATH     DeepSeek V4 HFQ path
 //!   HIPFIRE_DEEPSEEK4_CHAT_RAW=1     disable chat template (base-completion mode)
@@ -235,9 +234,8 @@ fn main() -> Result<(), String> {
         cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size, cfg.sliding_window
     );
     eprintln!(
-        "Generation: max_tokens={} attention={} mode={} temp={} top_k={} seed={}",
+        "Generation: max_tokens={} mode={} temp={} top_k={} seed={}",
         max_gen,
-        std::env::var("HIPFIRE_DEEPSEEK4_ATTN").unwrap_or_else(|_| "swa".to_string()),
         if raw_mode { "raw" } else { "chat" },
         temp,
         top_k,

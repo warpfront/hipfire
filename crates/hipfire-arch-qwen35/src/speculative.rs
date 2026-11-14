@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Behavior-preserving migration primitive for the draft/verify lm_head GEMM
 /// call sites in this module — the spec-decode analogue of qwen35.rs's
 /// `run_plain_gemm_key`. Passing the dispatcher-entry key
-/// (`GemmQ8_0BatchedChunked`, `GemmQ8_0Batched`, `GemmHfq4G256`,
+/// (`GemmQ8_0BatchedChunked`, `GemmHfq4G256`,
 /// `GemmHfq4G256BatchedLmhead`, `GemmHfq3G256BatchedLmhead`,
 /// `GemmHfq6G256BatchedLmhead`) makes `run_key` dispatch to the IDENTICAL
 /// `gpu.gemm_*` method the direct call used, so each method's own internal arch
@@ -134,27 +134,11 @@ fn dflash_gemm_q8_lmhead(
     y: &GpuTensor,
     n: usize,
 ) -> HipResult<()> {
-    if gpu.flags.dflash_q8_lmhead_wmma {
-        // #397 Ship 5.3: GemmQ8_0BatchedChunked routes to the identical
-        // gpu.gemm_q8_0_batched_chunked the prior direct call used.
-        return run_spec_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
-            &w_out.buf,
-            w_out.gpu_dtype,
-            x,
-            y,
-            w_out.m,
-            w_out.k,
-            n,
-        );
-    }
-
-    // The dispatch key is the scalar Q8 kernel chunked at its 64-row cap
-    // (`rdna_compute::gemm::q8_0_batched_chunks`); pass all `n` rows.
+    // #397 Ship 5.3: GemmQ8_0BatchedChunked routes to gpu.gemm_q8_0_batched_chunked,
+    // which takes WMMA where the arch has it and falls back to the scalar chunks.
     run_spec_gemm_key(
         gpu,
-        hipfire_dispatch::types::KernelKey::GemmQ8_0Batched,
+        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
         &w_out.buf,
         w_out.gpu_dtype,
         x,
@@ -223,28 +207,14 @@ fn gemm_mq_batched_lmhead_draft(
     gemm_mq_batched_lmhead(gpu, dtype, w_buf, rotated, logits, m, k, batch)
 }
 
-fn dflash_moe_verify_graph_lmhead_enabled_from_env_value(value: Option<&str>) -> bool {
-    match value {
-        Some(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        None => true,
-    }
-}
-
 pub(crate) fn dflash_moe_verify_graph_lmhead_eligible(
     num_experts: usize,
     want_full_logits: bool,
     tree_verify_present: bool,
-    env_value: Option<&str>,
 ) -> bool {
     // MoE-only: dense DFlash keeps the old forward-only verify graph. The
     // extended graph is also greedy-only because sampling needs full logits.
-    num_experts > 0
-        && !want_full_logits
-        && !tree_verify_present
-        && dflash_moe_verify_graph_lmhead_enabled_from_env_value(env_value)
+    num_experts > 0 && !want_full_logits && !tree_verify_present
 }
 
 fn dflash_moe_draft_ffn_graph_eligible(
@@ -252,16 +222,11 @@ fn dflash_moe_draft_ffn_graph_eligible(
     ctx_slice_present: bool,
     pld_present: bool,
     use_temp_sampling: bool,
-    env_value: Option<&str>,
 ) -> bool {
     // The draft FFN graph captures fixed-B per-layer work. Keep it off for
     // dense, PLD, ctx-slice diagnostics, and sampling until each path is
     // separately benched/coherence-gated.
-    num_experts > 0
-        && !ctx_slice_present
-        && !pld_present
-        && !use_temp_sampling
-        && dflash_moe_verify_graph_lmhead_enabled_from_env_value(env_value)
+    num_experts > 0 && !ctx_slice_present && !pld_present && !use_temp_sampling
 }
 
 /// Whether `HIPFIRE_VERIFY_GRAPH` admits the HipGraph verify route for this
@@ -3252,8 +3217,8 @@ pub fn dflash_extract_layer_ids(num_target_layers: usize, num_extract: usize) ->
 pub struct DdtreeScratch {
     pub max_n: usize,
     pub attn_bias: GpuTensor,
-    /// Per-slot parent index consumed by tree-aware LA kernels when
-    /// `HIPFIRE_DDTREE_TREE_LA=1`. `[max_n]` i32, uploaded fresh each
+    /// Per-slot parent index consumed by tree-aware LA kernels.
+    /// `[max_n]` i32, uploaded fresh each
     /// cycle via `memcpy_htod` before calling `verify_dflash_block_tree`.
     /// Allocated as Raw bytes (4 × max_n) since there's no i32 DType.
     pub parent_indices: GpuTensor,
@@ -3930,9 +3895,9 @@ pub(crate) fn apply_topp_trunc(row: &mut [f32], tau_cut: f32, z: f32) {
 /// Host-side nucleus (top_p) truncation of an ALREADY-normalized softmax row,
 /// IN PLACE, matching the AR rule in `mtp_spec.rs:307-325`: sort descending,
 /// accumulate, cut at the FIRST token whose cumulative prob >= top_p (inclusive
-/// crossing token), renormalize the kept set by its mass. Used on the non-fast
-/// DFlash temp arms (which compute the softmax on host, not GPU) so top_p is
-/// honored on the WHOLE temp path, not only under HIPFIRE_DFLASH_FAST_SAMPLE.
+/// crossing token), renormalize the kept set by its mass. Used on the DFlash
+/// temp arms that compute the softmax on host, so top_p is honored on the
+/// WHOLE temp path.
 ///
 /// `top_p >= 1.0` is a no-op (identity). Produces the same kept-set and the same
 /// renormalized values as `apply_topp_trunc` would given the GPU `tau_cut/Z`,
@@ -6228,14 +6193,11 @@ fn verify_dflash_block_inner_body(
     // widening capture-time F16/LDS auxiliary kernels below the crossover or
     // on unsupported model shapes.
     let fusion = dflash_verify_fusion_ctx(gpu, target, tree_verify_present, b, required_tokens);
-    let moe_lmhead_graph_env =
-        hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD").ok();
     let moe_lmhead_graph_ok =
         dflash_moe_verify_graph_lmhead_eligible(
             target.config.num_experts,
             want_full_logits,
             tree_verify_present,
-            moe_lmhead_graph_env.as_deref(),
         ) && dflash_batched_lm_head_supported(target.weights.output.gpu_dtype);
 
     // Graph-capture path eligibility. The captured forward bakes in:
@@ -6692,10 +6654,8 @@ pub(crate) fn dflash_verify_head(
         argmax_per_pos = dflash_download_verify_argmax(gpu, verify_scratch, b)?;
     } else if try_batched {
         let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
-        // Q8_0 routes through the DFlash lm_head helper so the gfx12 WMMA
-        // arm can be coherence-gated independently of MTP. Set
-        // HIPFIRE_DFLASH_Q8_LMHEAD_WMMA=0 to force the legacy scalar chunks.
-        // MQ4/HFQ4/HFQ6/MQ6 kernels have no 64-row cap and take the
+        // Q8_0 routes through the DFlash lm_head helper (WMMA where the arch
+        // has it). MQ4/HFQ4/HFQ6/MQ6 kernels have no 64-row cap and take the
         // single-shot path.
         let math = verify_dense_math(gpu);
         dflash_enqueue_verify_lm_head(gpu, w_out, final_hidden, verify_scratch, b, vocab, math)?;
@@ -8206,7 +8166,6 @@ pub fn dflash_draft_batch_max_rows(gpu: &Gpu) -> usize {
         && !gpu.flags.draft_collapse_off
         && gpu.flags.wmma_batch_tiles
         && !gpu.flags.fp16_disabled
-        && !gpu.flags.lm_head_wmma_disabled
         && !gpu.flags.hfq4g256_ldsstage_wmma
         && !gpu.a8_prefill_active(DFLASH_DRAFT_BATCH_ROWS64, 256)
     {
@@ -9219,30 +9178,22 @@ pub fn spec_step_dflash_with_railgun(
                 == Some("1")
         });
     let host_path_active = rp_active || ngram_block_active || logit_dump_active;
-    // HIPFIRE_DFLASH_FAST_SAMPLE (default ON, opt out with =0): in the temp>0
-    // sampled path, compute the per-row softmax (and the top_p nucleus cutoff) on
-    // the GPU instead of the host `exp` loop over the full vocab. The host RNG,
-    // accept test, residual sampler, and CACTUS math are UNCHANGED — they just
-    // read the GPU-produced probabilities instead of host-recomputed ones. The
-    // D2H transfer size is identical (full-vocab probs vs full-vocab logits);
-    // what moves to the GPU is the ~31×vocab `exp`/max/normalize work per
-    // cycle. PARITY: distribution-only, NOT byte-identical (GPU tree-reduction
-    // vs host sequential sum can differ at the last ULP and rarely flip a
-    // borderline `u*p_d <= p_t` accept) — validated coherent across genres
-    // (no attractors), so default-on. Greedy path (temp==0) is never affected.
-    let fast_sample_active = use_temp_sampling && gpu.flags.dflash_fast_sample;
-    let draft_ffn_graph_env =
-        hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH").ok();
+    // Temp>0 sampled path: the per-row softmax (and the top_p nucleus cutoff)
+    // runs on the GPU instead of the host `exp` loop over the full vocab. The
+    // host RNG, accept test, residual sampler, and CACTUS math read the
+    // GPU-produced probabilities. PARITY: distribution-only, NOT byte-identical
+    // (GPU tree-reduction vs host sequential sum can differ at the last ULP
+    // and rarely flip a borderline `u*p_d <= p_t` accept) — validated coherent
+    // across genres (no attractors). Greedy path (temp==0) is never affected.
     let draft_ffn_graph = dflash_moe_draft_ffn_graph_eligible(
         target.config.num_experts,
         ctx_slice.is_some(),
         pld_spine.is_some(),
         use_temp_sampling,
-        draft_ffn_graph_env.as_deref(),
     );
 
     // C8: device tensors kept alive from draft-sample through verify-accept.
-    // Only populated when fast_sample_active AND the batched GEMM path runs.
+    // Only populated on the sampled path when the batched GEMM path runs.
     // Otherwise stays None and the host accept loop falls back to draft_softmaxes.
     let mut c8_draft_probs_dev: Option<GpuTensor> = None;
     let mut c8_draft_tau_dev: Option<GpuTensor> = None;
@@ -9331,8 +9282,6 @@ pub fn spec_step_dflash_with_railgun(
                     diagnostics: phase_on || seed_oracle,
                     ctx_slice: ctx_slice.is_some(),
                     gdn_tape: gdn_tape.is_some(),
-                    gdn_frame_independent: target.dn_state.quant != qwen35::StateQuant::Q8
-                        || !target.dn_state.s_ef_residual.is_empty(),
                     lookup: lookup_facts,
                 };
                 match drg::admit_window(&facts) {
@@ -9668,7 +9617,7 @@ pub fn spec_step_dflash_with_railgun(
                     &mut draft_softmaxes,
                     &mut draft_probs_at_drafted,
                 )?;
-            } else if use_temp_sampling && fast_sample_active {
+            } else if use_temp_sampling {
                 // C8 GPU-sample path: softmax stays device-resident; only
                 // draft_tokens + draft_p_at_token (batch×8 bytes) come back.
                 // draft_probs_dev is kept alive in c8_draft_probs_dev until
@@ -9735,23 +9684,6 @@ pub fn spec_step_dflash_with_railgun(
                 c8_draft_p_at_token_dev = Some(pat_dev);
                 // draft_probs_at_drafted populated above; draft_softmaxes NOT
                 // populated (not needed when GPU accept kernel runs).
-            } else if use_temp_sampling {
-                // Full D2H of (B-1)×vocab logits, CPU softmax+sample.
-                let host_logits = gpu.download_f32(&logits_batch)?;
-                debug_assert_eq!(host_logits.len(), batch * vocab);
-                draft_softmaxes.reserve(batch);
-                for i in 0..batch {
-                    let row = &host_logits[i * vocab..(i + 1) * vocab];
-                    let mut probs = Vec::with_capacity(vocab);
-                    softmax_temp_into(row, temp, &mut probs);
-                    // Host truncation: the same AR law as the GPU tau/Z cut.
-                    apply_host_ar_trunc(&mut probs, top_k, top_p);
-                    let u = xorshift_next_unit(rng_state);
-                    let t = sample_categorical(&probs, u);
-                    draft_probs_at_drafted.push(probs[t as usize]);
-                    drafted.push(t);
-                    draft_softmaxes.push(probs);
-                }
             } else if host_path_active {
                 // RP / n-gram-block path: apply per-row penalties before argmax
                 // so draft and target pick from the same reshaped distribution.
@@ -9991,12 +9923,11 @@ pub fn spec_step_dflash_with_railgun(
         gpu.hip.device_synchronize()?;
     }
     let t_verify_start = std::time::Instant::now();
-    // Full target logits are D2H'd to the host for rejection sampling, RP, or
-    // n-gram block. Under FAST_SAMPLE the rejection sampler reads the
-    // GPU-softmaxed target probs directly from the resident
-    // `verify_scratch.logits` buffer, so the host full-logit download + host
-    // argmax are skipped — that's the target-side half of the cost cut.
-    let want_full_logits = (use_temp_sampling && !fast_sample_active) || host_path_active;
+    // Full target logits are D2H'd to the host for RP or n-gram block. The
+    // sampled rejection sampler reads the GPU-softmaxed target probs directly
+    // from the resident `verify_scratch.logits` buffer, so the host full-logit
+    // download + host argmax are skipped.
+    let want_full_logits = host_path_active;
     // Railgun D8: a kept full accept relies on the HIP/HipGraph verify body —
     // no route, or a route that planned this window as its ordinary HIP window
     // (`full_hip`/`partial_hip` advanced; prime/capture/PM4 windows do not).
@@ -10108,7 +10039,6 @@ pub fn spec_step_dflash_with_railgun(
         // clamp accept_len and re-draw the boundary sample from the target row.
         let budget_binds = matches!(max_accept, Some(m) if m < b - 1);
         let gpu_accept = !selector_mode
-            && fast_sample_active
             && !budget_binds
             && c8_draft_probs_dev.is_some()
             && c8_draft_tokens_dev.is_some()
@@ -10120,7 +10050,6 @@ pub fn spec_step_dflash_with_railgun(
         let device_decision: Option<SampledWindowDecision> = match q_receipt.as_ref() {
             Some(r)
                 if !gpu_accept
-                    && fast_sample_active
                     && dflash_device_accept_eligible(
                         dflash_device_accept_enabled() && gpu.dflash_device_accept_supported(),
                         &DflashSampleCfg {
@@ -10231,34 +10160,27 @@ pub fn spec_step_dflash_with_railgun(
         } else {
             // ── Host accept path (PLD / fallback per-row) ──────────────────
             debug_assert!(q_receipt.is_some() || draft_softmaxes.len() == b - 1);
-            // FAST_SAMPLE: compute the per-row target softmax on the GPU once for
-            // all B rows and download the probs. The accept loop below then reads
-            // `target_probs` from this buffer instead of calling the host
-            // `softmax_temp_into` — identical RNG/accept/residual/CACTUS math,
+            // Compute the per-row target softmax on the GPU once for all B rows
+            // and download the probs. The accept loop below reads `target_probs`
+            // from this buffer — identical RNG/accept/residual/CACTUS math,
             // distribution-parity probs. The verify logits are still resident in
             // `verify_scratch.logits[0..b*vocab]` (verify enqueued lm_head into it
             // and only ran GPU-argmax afterwards, which does not overwrite it).
-            let fast_tgt: Option<FastTargetRows> = if fast_sample_active {
-                let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
-                let mut rows = FastTargetRows::default();
-                dflash_target_rows_into(
-                    gpu,
-                    &logits_batch,
-                    b,
-                    vocab,
-                    DflashSampleCfg {
-                        temp,
-                        top_p,
-                        top_k,
-                        cactus_delta,
-                    },
-                    &mut rows,
-                )?;
-                Some(rows)
-            } else {
-                debug_assert_eq!(verify_out.logits_per_pos.len(), b * vocab);
-                None
-            };
+            let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
+            let mut fast_tgt = FastTargetRows::default();
+            dflash_target_rows_into(
+                gpu,
+                &logits_batch,
+                b,
+                vocab,
+                DflashSampleCfg {
+                    temp,
+                    top_p,
+                    top_k,
+                    cactus_delta,
+                },
+                &mut fast_tgt,
+            )?;
             let q = match q_receipt.take() {
                 Some(r) => r,
                 None => DflashSampledDraft {
@@ -10271,7 +10193,7 @@ pub fn spec_step_dflash_with_railgun(
             let decision = dflash_sampled_accept_rows(
                 &block,
                 &q,
-                fast_tgt.as_ref(),
+                Some(&fast_tgt),
                 &verify_out.logits_per_pos,
                 vocab,
                 DflashSampleCfg {
@@ -12672,9 +12594,8 @@ pub fn spec_step_ddtree_batched(
     // ddtree_build_attn_mask_f32 which walks the parent chain per-thread
     // and writes scratch.attn_bias directly on-device.
     //
-    // parent_indices is always uploaded (needed both by the mask kernel and,
-    // when ddtree_tree_la=true, by the tree-aware GDN kernels).
-    let use_tree_la = gpu.flags.ddtree_tree_la;
+    // parent_indices is always uploaded (needed both by the mask kernel and
+    // by the tree-aware GDN kernels).
     {
         let parent_bytes = unsafe {
             std::slice::from_raw_parts(parent_host.as_ptr() as *const u8, parent_host.len() * 4)
@@ -12757,16 +12678,12 @@ pub fn spec_step_ddtree_batched(
     // the assert semantics meaningful.
     let attn_bias_view = scratch.attn_bias.sub_offset(0, big_n * big_n);
     // Parent-indices sub-view sized to big_n (one i32 per slot; stored as
-    // 4 × big_n raw bytes). Only populated when HIPFIRE_DDTREE_TREE_LA=1.
+    // 4 × big_n raw bytes).
     let parent_view = scratch.parent_indices.sub_offset(0, big_n * 4);
     let ctx = qwen35::TreeVerifyCtx {
         positions: &verify_positions,
         attn_bias: &attn_bias_view,
-        parent_indices: if use_tree_la {
-            Some(&parent_view)
-        } else {
-            None
-        },
+        parent_indices: &parent_view,
     };
     let t_pre_verify = t_all.elapsed();
     // D8: `want_full_logits` was `temp > 0.0 && !use_swor` (the naive path,
@@ -12912,8 +12829,8 @@ pub fn spec_step_ddtree_batched(
         let fast = DDTREE_FAST_COUNT.with(|c| c.get());
         let slow = DDTREE_SLOW_COUNT.with(|c| c.get());
         eprintln!(
-            "[ddtree-tape] cycle: fast_tape_ok={} accept_len={} spine_accept={} tree_la={} (cumulative fast={}/slow={})",
-            fast_tape_ok, accept_len, spine_accept, use_tree_la, fast, slow,
+            "[ddtree-tape] cycle: fast_tape_ok={} accept_len={} spine_accept={} (cumulative fast={}/slow={})",
+            fast_tape_ok, accept_len, spine_accept, fast, slow,
         );
     }
     // True when the block's rows sit in committed order (either the accept
@@ -14899,49 +14816,26 @@ mod tests {
 
     #[test]
     fn dflash_extended_verify_graph_is_moe_greedy_only() {
-        assert!(dflash_moe_verify_graph_lmhead_eligible(
-            256, false, false, None
-        ));
-        assert!(!dflash_moe_verify_graph_lmhead_eligible(
-            0, false, false, None
-        ));
-        assert!(!dflash_moe_verify_graph_lmhead_eligible(
-            256, true, false, None
-        ));
-        assert!(!dflash_moe_verify_graph_lmhead_eligible(
-            256, false, true, None
-        ));
-        assert!(!dflash_moe_verify_graph_lmhead_eligible(
-            256,
-            false,
-            false,
-            Some("0")
-        ));
+        assert!(dflash_moe_verify_graph_lmhead_eligible(256, false, false));
+        assert!(!dflash_moe_verify_graph_lmhead_eligible(0, false, false));
+        assert!(!dflash_moe_verify_graph_lmhead_eligible(256, true, false));
+        assert!(!dflash_moe_verify_graph_lmhead_eligible(256, false, true));
     }
 
     #[test]
     fn dflash_draft_ffn_graph_is_moe_plain_dflash_only() {
         assert!(dflash_moe_draft_ffn_graph_eligible(
-            256, false, false, false, None
+            256, false, false, false
+        ));
+        assert!(!dflash_moe_draft_ffn_graph_eligible(0, false, false, false));
+        assert!(!dflash_moe_draft_ffn_graph_eligible(
+            256, true, false, false
         ));
         assert!(!dflash_moe_draft_ffn_graph_eligible(
-            0, false, false, false, None
+            256, false, true, false
         ));
         assert!(!dflash_moe_draft_ffn_graph_eligible(
-            256, true, false, false, None
-        ));
-        assert!(!dflash_moe_draft_ffn_graph_eligible(
-            256, false, true, false, None
-        ));
-        assert!(!dflash_moe_draft_ffn_graph_eligible(
-            256, false, false, true, None
-        ));
-        assert!(!dflash_moe_draft_ffn_graph_eligible(
-            256,
-            false,
-            false,
-            false,
-            Some("0")
+            256, false, false, true
         ));
     }
 

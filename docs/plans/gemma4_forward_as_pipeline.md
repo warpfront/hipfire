@@ -354,7 +354,7 @@ Add to `crates/hipfire-arch-gemma4/src/gemma4.rs`:
    gate on. The original implementation left graph capture hardwired off;
    v0.4.1 wires warm-up/capture/replay for graph-safe lowered decode bodies,
    on by default for exact gfx1201 and opt-in elsewhere
-   (`HIPFIRE_GEMMA4_GRAPH` / `HIPFIRE_GRAPH`; `=0` disables).
+   (`HIPFIRE_GRAPH`; `=0` disables).
 
 **Validation:** `cargo test` passes, existing behavior unchanged (gate off).
 

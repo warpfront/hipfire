@@ -23,7 +23,7 @@ kernel entirely on gpu."
   kernels.rs.
 - forward.rs `final_norm_and_sample_all_batched_lazy` rewritten: **batched head**
   (`compute_batched_head_logits`, one 565 MB lm-head read for all n) + fused kernel.
-  FWHT-head / `HIPFIRE_DEEPSEEK4_BATCH_HEAD=0` keep the old per-position fallback.
+  FWHT heads keep the old per-position fallback.
   Mirrors the greedy `final_norm_and_argmax_all_batched` architecture.
 
 ## Validation (all PASS)

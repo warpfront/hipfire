@@ -127,7 +127,6 @@ pub fn execute_compressor_project(
             for p in flavors {
                 let paired = project_pair_b3(
                     gpu, p.wkv, p.wgate, op.tmp, p.kv, p.score, p.proj_dim, hidden, rows,
-                    projection,
                 )?;
                 if !paired {
                     for (w, y) in [(p.wkv, p.kv), (p.wgate, p.score)] {

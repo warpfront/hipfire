@@ -1224,8 +1224,8 @@ impl Gpu {
     /// Mirrors the host `softmax_temp_into` (apply temp to each logit, max over
     /// scaled logits, exp(scaled - max), normalize). The GPU reduction order
     /// (tree) differs from the host sequential sum, so the result is
-    /// DISTRIBUTION-parity, NOT byte-identical — used only behind the
-    /// HIPFIRE_DFLASH_FAST_SAMPLE opt-in in the DFlash sampled path.
+    /// DISTRIBUTION-parity, NOT byte-identical — used only on the DFlash
+    /// sampled path.
     pub fn softmax_temp_batched_into_f32(
         &mut self,
         logits: &GpuTensor,
@@ -1286,8 +1286,8 @@ impl Gpu {
     ///
     /// `tau_cut` is found by bisection over the mass predicate (no sort); see the
     /// kernel doc in `softmax_temp_batched.hip`. Distribution-parity (tree
-    /// reduction), not byte-parity, to the host softmax — used behind
-    /// HIPFIRE_DFLASH_FAST_SAMPLE.
+    /// reduction), not byte-parity, to the host softmax — used on the DFlash
+    /// sampled path.
     #[allow(clippy::too_many_arguments)]
     pub fn softmax_temp_topp_batched_into_f32(
         &mut self,

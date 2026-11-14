@@ -266,8 +266,8 @@ pub struct SpecLoadCfg {
     /// `speculation` selector: `Some(true)` = `dspark` mode (load + force),
     /// `Some(false)` = another mechanism selected (skip load + build),
     /// `None` = `auto` (load if the sidecar exists, prefer over in-trunk MTP).
-    /// Replaces the old `HIPFIRE_DEEPSEEK4_DSPARK` / `HIPFIRE_DEEPSEEK4_LOAD_DSPARK`
-    /// env gates — both fold into this one mode.
+    /// Replaces the old per-mechanism DSpark env gates — both fold into this
+    /// one mode.
     pub dspark: Option<bool>,
     /// DSpark confidence-truncation threshold (`--dspark-conf-threshold`),
     /// forwarded ONLY when the user set it. `None` = use the per-arch carrier
@@ -295,8 +295,7 @@ pub struct SpecLoadCfg {
     pub dflash: Option<bool>,
     /// DFlash adaptive verify-block (`dflash_adaptive_b`, default false).
     /// `None` = loader default (off: fixed block). Env `HIPFIRE_DFLASH_ADAPTIVE_B=0`
-    /// forces the fixed full block at build, mirroring
-    /// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`. Mutually exclusive with the
+    /// forces the fixed full block at build. Mutually exclusive with the
     /// retained-PM4 verify route (which needs the fixed B=16 shape).
     pub dflash_adaptive_b: Option<bool>,
     /// DFlash2 proposal width of this load (`speculation.dflash_block`),

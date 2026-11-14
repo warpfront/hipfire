@@ -423,7 +423,6 @@ pub enum KernelKey {
     // so all are registered `ArchPredicate::Always`. Dispatched through
     // GemmFamily::run_key against the explicit key (NOT resolve()), so the
     // method selected is byte-identical to the prior direct spec-decode call.
-    GemmQ8_0Batched,
     GemmHfq4G256BatchedLmhead,
     GemmHfq3G256BatchedLmhead,
     GemmHfq6G256BatchedLmhead,

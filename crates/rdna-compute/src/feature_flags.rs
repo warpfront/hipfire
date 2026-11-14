@@ -463,7 +463,6 @@ pub struct FeatureFlags {
     pub fp16_layer_min: Option<usize>,
     pub fp16_layer_max: Option<usize>,
     pub wo_mmq: bool,
-    pub lm_head_wmma_disabled: bool,
     pub lm_head_overwrite: bool,
     /// Eager-only gfx1201 MQ6 X-LDS overwrite and fused F16 rotation (U2):
     /// `Some` = set (`1` on, any other value off); unset = on inside the
@@ -577,17 +576,12 @@ pub struct FeatureFlags {
     pub moe_down_combine_vec4: bool,
     pub moe_hfq6_i8: bool,
     pub moe_hfq6_v2: bool,
-    // ── MoE prefill (Ship 4.2) ────────────────────────────────────
-    /// Grouped-GEMM MoE prefill gate (HIPFIRE_MOE_GROUPED_GEMM). Default ON.
-    pub moe_grouped_gemm: bool,
-
     // ── Graph / capture / deterministic ─────────────────────────────
     pub graph_forward: Option<bool>,
     /// Autoregressive-forward hipGraph capture (`experimental.graph.ar`,
     /// `HIPFIRE_AR_GRAPH`). Default on, except on Windows exact gfx1100, where
     /// it defaults off (#655); see [`graph_ar_default`].
     pub graph_ar: bool,
-    pub graph_moe: bool,
     pub force_blob_path: bool,
     /// `HIPFIRE_RESIDUAL_KSPLIT_OFF=1` disables the exact-gfx1100 split-K LDS
     /// residual tier (N<=16 DFlash verify) and restores the historical base
@@ -891,14 +885,6 @@ pub struct FeatureFlags {
     /// Fuse the E-series PLE GELU and strided per-layer multiply on validated
     /// gfx1100 and gfx1201 paths.
     pub gemma4_ple_activation_fused_prefill: bool,
-    /// `HIPFIRE_DEEPSEEK4_Q8_WMMA=0` disables the Q8_0 dense WMMA prefill path
-    /// (forces the scalar chunked fallback). Consumed by
-    /// `gemm_q8_0_wmma_prefill_auto`.
-    pub deepseek4_q8_wmma_off: bool,
-    /// `HIPFIRE_DEEPSEEK4_Q8_4W=0` forces the single-warp 16×16 Q8_0 WMMA
-    /// kernel instead of the 4-warp 64×64 tile. Consumed by
-    /// `gemm_q8_0_wmma_prefill_auto`.
-    pub deepseek4_q8_4w_off: bool,
     pub rope_interleaved_legacy: bool,
     pub wo_wmma_variant: Option<String>,
 
@@ -956,28 +942,11 @@ pub struct FeatureFlags {
     // The naive fallback required a ~37 MB/cycle full-logits D2H and is
     // superseded by SWOR (distribution-exact, on-GPU). HIPFIRE_DDTREE_VERIFY
     // env var is no longer parsed; setting it has no effect.
-    /// qwen35 ddtree tree-LA (linearized-ancestor) fast-tape path. **Default ON**;
-    /// opt out with `HIPFIRE_DDTREE_TREE_LA=0`.
-    pub ddtree_tree_la: bool,
-    /// qwen35 DFlash GPU softmax/nucleus fast path on the temp>0 sampled verify.
-    /// **Default ON**; opt out with `HIPFIRE_DFLASH_FAST_SAMPLE=0`.
-    pub dflash_fast_sample: bool,
     /// qwen35 ddtree meta-verifier expansion cutoff (`HIPFIRE_DDTREE_LOGW_CUTOFF`).
     /// Stores the positive X the user set (stop tree expansion when the next
     /// candidate's cumulative logw < −X); `None`/0/unparseable → no cutoff.
     /// Use [`FeatureFlags::ddtree_logw_cutoff_value`] for the resolved threshold.
     pub ddtree_logw_cutoff: Option<f32>,
-    /// qwen35 DFlash Q8 WMMA lm_head in verify. **Default ON**; opt out with
-    /// `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` ∈ {0,false,off,no}.
-    pub dflash_q8_lmhead_wmma: bool,
-
-    /// Fold the 3 separate QKV `BiasAdd` launches (qwen2-family `attention_bias`)
-    /// into the per-row fused-QKV decode kernel's lane-0 store. Eliminates 3 tiny
-    /// overhead-dominated launches/layer. Env: HIPFIRE_FUSE_QKV_BIAS — default ON;
-    /// set `=0` to opt out (for bisection). NULL bias pointers are a kernel no-op,
-    /// so non-bias callers stay byte-identical regardless. Only fires for fused-QKV
-    /// keys whose dispatch arm reads the bias (see `qkv_bias_fold_supported`).
-    pub fuse_qkv_bias: bool,
 
     /// Diagnostic: log each QKV-bias fold to stderr. Env:
     /// HIPFIRE_FUSE_QKV_BIAS_DEBUG=1. Default off. Resolved once at init so the
@@ -1460,7 +1429,6 @@ impl FeatureFlags {
             fp16_layer_min: parse_usize("HIPFIRE_FP16_LAYER_MIN"),
             fp16_layer_max: parse_usize("HIPFIRE_FP16_LAYER_MAX"),
             wo_mmq: value("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1"),
-            lm_head_wmma_disabled: value("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0"),
             lm_head_overwrite: value("HIPFIRE_LM_HEAD_OVERWRITE").as_deref() == Ok("1"),
             qwen4_mq6_x4_gfx1201: match value("HIPFIRE_QWEN4_MQ6_X4_GFX1201").as_deref() {
                 Ok("1") => Some(true),
@@ -1554,16 +1522,9 @@ impl FeatureFlags {
             moe_down_combine_vec4: value("HIPFIRE_MOE_DOWN_COMBINE_VEC4").as_deref() == Ok("1"),
             moe_hfq6_i8: value("HIPFIRE_MOE_HFQ6_I8").as_deref() == Ok("1"),
             moe_hfq6_v2: value("HIPFIRE_MOE_HFQ6_V2").as_deref() == Ok("1"),
-            // MoE prefill (Ship 4.2)
-            moe_grouped_gemm: match value("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref() {
-                Some("0") | Some("off") => false,
-                _ => true,
-            },
-
             // Graph / capture / deterministic
             graph_forward: parse_bool("HIPFIRE_GRAPH"),
             graph_ar: resolve_graph_ar(value("HIPFIRE_AR_GRAPH").ok().as_deref(), arch, windows),
-            graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
             residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE").unwrap_or(arch == "gfx1100"),
@@ -1729,8 +1690,6 @@ impl FeatureFlags {
                 "HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL",
             )
             .unwrap_or(matches!(arch, "gfx1100" | "gfx1201")),
-            deepseek4_q8_wmma_off: value("HIPFIRE_DEEPSEEK4_Q8_WMMA").as_deref() == Ok("0"),
-            deepseek4_q8_4w_off: value("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0"),
             rope_interleaved_legacy: value("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref()
                 == Some("1"),
             wo_wmma_variant: value("HIPFIRE_WO_WMMA_VARIANT").ok(),
@@ -1769,22 +1728,11 @@ impl FeatureFlags {
             ddtree_budget: parse_usize("HIPFIRE_DDTREE_BUDGET").filter(|&b| b > 0),
             ddtree_topk: parse_usize("HIPFIRE_DDTREE_TOPK").filter(|&k| k >= 1),
             // D8: ddtree_verify_naive removed; HIPFIRE_DDTREE_VERIFY env is no-op.
-            ddtree_tree_la: value("HIPFIRE_DDTREE_TREE_LA").as_deref() != Ok("0"),
-            dflash_fast_sample: value("HIPFIRE_DFLASH_FAST_SAMPLE").as_deref() != Ok("0"),
             ddtree_logw_cutoff: value("HIPFIRE_DDTREE_LOGW_CUTOFF")
                 .ok()
                 .and_then(|s| s.parse::<f32>().ok())
                 .filter(|&x| x > 0.0),
-            dflash_q8_lmhead_wmma: match value("HIPFIRE_DFLASH_Q8_LMHEAD_WMMA") {
-                Ok(v) => {
-                    let v = v.trim().to_ascii_lowercase();
-                    !(v == "0" || v == "false" || v == "off" || v == "no")
-                }
-                Err(_) => true,
-            },
 
-            // QKV bias fold — default ON, opt out with HIPFIRE_FUSE_QKV_BIAS=0.
-            fuse_qkv_bias: parse_bool("HIPFIRE_FUSE_QKV_BIAS").unwrap_or(true),
             fuse_qkv_bias_debug: value("HIPFIRE_FUSE_QKV_BIAS_DEBUG").as_deref() == Ok("1"),
 
             // DFlash launch-fusion kill switches: `_OFF=1` disables, all no-ops.
@@ -2603,7 +2551,6 @@ impl FeatureFlags {
             fp16_layer_min: None,
             fp16_layer_max: None,
             wo_mmq: false,
-            lm_head_wmma_disabled: false,
             lm_head_overwrite: false,
             qwen4_mq6_x4_gfx1201: None,
             qwen4_mq6_x4_tile: None,
@@ -2648,10 +2595,8 @@ impl FeatureFlags {
             moe_down_combine_vec4: false,
             moe_hfq6_i8: false,
             moe_hfq6_v2: false,
-            moe_grouped_gemm: true,
             graph_forward: None,
             graph_ar: true,
-            graph_moe: true,
             force_blob_path: false,
             residual_ksplit_off: false,
             gfx12_gdn_pre_fused: false,
@@ -2710,8 +2655,6 @@ impl FeatureFlags {
             gemma4_ple_batched_prefill: false,
             gemma4_ple_branch_batched_prefill: false,
             gemma4_ple_activation_fused_prefill: false,
-            deepseek4_q8_wmma_off: false,
-            deepseek4_q8_4w_off: false,
             rope_interleaved_legacy: false,
             wo_wmma_variant: None,
             rocblas_all_archs: false,
@@ -2729,11 +2672,7 @@ impl FeatureFlags {
             ddtree_budget: None,
             ddtree_topk: None,
             // D8: ddtree_verify_naive removed.
-            ddtree_tree_la: true,
-            dflash_fast_sample: true,
             ddtree_logw_cutoff: None,
-            dflash_q8_lmhead_wmma: true,
-            fuse_qkv_bias: true,
             fuse_qkv_bias_debug: false,
             dn_snapshot_bulk_off: false,
             hidden_scatter_fuse_off: false,
@@ -2891,7 +2830,6 @@ mod tests {
                 assert!(!flags(Some("0")).graph_ar, "{arch} windows={windows}: 0");
                 assert!(flags(Some("1")).graph_ar, "{arch} windows={windows}: 1");
                 // The sibling graph switches are not touched by the platform.
-                assert!(flags(None).graph_moe, "{arch} windows={windows}: graph_moe");
                 assert_eq!(
                     flags(None).graph_forward,
                     None,
@@ -3433,12 +3371,6 @@ mod tests {
     fn force_unfused_defaults_false_in_test_ctor() {
         let f = FeatureFlags::for_test("gfx1151");
         assert!(!f.force_unfused);
-    }
-
-    #[test]
-    fn fuse_qkv_bias_defaults_on_in_test_ctor() {
-        let f = FeatureFlags::for_test("gfx1151");
-        assert!(f.fuse_qkv_bias);
     }
 
     /// H4/H3/H8a flags are exact gfx1151 / gfx1201: unset, H4 is level 3 on

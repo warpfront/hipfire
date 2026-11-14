@@ -390,8 +390,8 @@ impl Qwen35VmmStore {
             .dflash_engine
             .as_ref()
             .ok_or("dflash prefill: no DFlash engine staged")?;
-        if request.temp > 1e-6 && (!engine.supports_sampled() || !gpu.flags.dflash_fast_sample) {
-            return Err("dflash prefill: sampled lanes require FAST_SAMPLE selector chain".into());
+        if request.temp > 1e-6 && !engine.supports_sampled() {
+            return Err("dflash prefill: sampled lanes require the selector chain".into());
         }
         if prompt.is_empty() || prompt.len() >= engine.ctx_capacity() {
             return Err(format!(

@@ -25,8 +25,8 @@ staging, hipGraph capture (`HIPFIRE_LFM2_GRAPH`), Redline retained replay
 (dense only), and the oracle capture of per-layer hidden states.
 
 Removed: the hand decode loop, the #397 super-op path (`Lfm2MoeBindings`,
-`lfm2_lower_variant`, `HIPFIRE_FORWARD_LOWERED` for LFM) and the hand MoE
-block.
+`lfm2_lower_variant`) and the hand MoE block. The `HIPFIRE_FORWARD_LOWERED`
+control is gone (HIPF-396): decode always runs the lowered program.
 
 ## New shared pieces
 

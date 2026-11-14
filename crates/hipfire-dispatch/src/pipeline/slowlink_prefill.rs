@@ -868,7 +868,6 @@ impl<'a> PreparedChunkCall<'a> {
             if selection.cpu_split
                 || selection.cpu_deferred_experts
                 || selection.down_last_combine
-                || selection.ninepath_d3
                 || selection.ninepath_d4
                 || !selection.resolution.use_gpu_topk
                 || !selection
@@ -2484,7 +2483,7 @@ fn run_k1_cohort(
                 let tmp = aggregate
                     .then(|| routes.view(layout.k1_tmp, slots * d.hidden * F32_BYTES, DType::F32));
                 view.down_expanded = tmp.as_ref().unwrap_or(&y0);
-                super::decode_gate_up_stage(gpu, &view, dt.resolution, dt.input, false, dt.route)?;
+                super::decode_gate_up_stage(gpu, &view, dt.resolution, dt.input, dt.route)?;
                 super::decode_activation_stage(gpu, &view, dt.route, None)?;
                 super::decode_down_stage(
                     gpu,
@@ -4418,7 +4417,6 @@ pub mod selftest {
                 &p,
                 selection.resolution,
                 input,
-                false,
                 selection.route,
             )?;
             super::super::decode_activation_stage(gpu, &p, selection.route, Some((&gate, &up)))?;

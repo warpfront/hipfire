@@ -2259,7 +2259,7 @@ impl Gpu {
     }
 
     /// `fused_qkv_mq4g256_lloyd` with an optional Q/K/V bias folded into the
-    /// kernel's lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`). All-null = byte-identical
+    /// kernel's lane-0 store (the QKV bias fold). All-null = byte-identical
     /// to the unfused path (fp32 store→add). Both arch siblings (base + gfx1100)
     /// carry the 3 trailing bias params, so the kernarg ABI matches whichever
     /// `_for_arch` selects.
@@ -2681,7 +2681,7 @@ impl Gpu {
     }
 
     /// `fused_qkv_mq3g256_lloyd` with an optional Q/K/V bias folded into the
-    /// kernel's lane-0 store (`HIPFIRE_FUSE_QKV_BIAS`). All-null = byte-identical
+    /// kernel's lane-0 store (the QKV bias fold). All-null = byte-identical
     /// to the unfused path. Both arch siblings (base + gfx1100) carry the 3
     /// trailing bias params.
     #[allow(clippy::too_many_arguments)]
@@ -15870,12 +15870,10 @@ impl Gpu {
             let wg2 = self.arch_caps.is_gfx1100()
                 && hipfire_config::developer_bool("HIPFIRE_MOE_GATE_UP_WG2", false);
             // The unchanged base kernel maps blockIdx.x to one logical row in
-            // each M/2 gate and up output. The legacy M-sized grid therefore
-            // leaves its upper half to exit at the row >= M/2 guard. Default
-            // on for gfx1100 after exact shadow and stationary tg128 checks;
-            // HIPFIRE_MOE_GATE_UP_TIGHT_GRID=0 restores the legacy geometry.
+            // each M/2 gate and up output, so gfx1100 launches the tight M/2
+            // grid (exact shadow and stationary tg128 checks).
             let tight_grid = if self.arch_caps.is_gfx1100() {
-                hipfire_config::developer_bool("HIPFIRE_MOE_GATE_UP_TIGHT_GRID", true)
+                true
             } else if self.arch_caps.is_gfx1151() {
                 // gfx1151 keeps its own performance-admission gate. The
                 // kernel maps blockIdx.x to one row in each M/2 output, so
@@ -18272,80 +18270,6 @@ impl Gpu {
                 b.push_i32(m_val);
                 b.push_i32(k_val);
                 b.push_i32(kt_val);
-                b.push_i32(n_experts_val);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
-    /// Expert-wave-preserving down + deterministic combine experiment.
-    ///
-    /// The GEMV body and expanded stores are identical to the production
-    /// kernel. A reusable counter tail appended to `expert_outputs` elects the
-    /// last expert workgroup for each four-row tile; that wave folds the eight
-    /// expanded slots in fixed rank order into `x_residual`. The caller must
-    /// allocate and initially zero `batch_size * ceil(m/4)` f32-sized counter
-    /// slots after the `[batch_size * k_top * m]` payload.
-    /// Nine-path fused MoE gate_up (routed k=8, decode T=1): one CTA stages
-    /// x into LDS once; 8 routed-expert warps share it. Replaces
-    /// `gemv_hfq4g256_moe_gate_up_k8_indexed` — byte-exact per-row math.
-    /// Grid: (mi/8, 1, 1); block 256 (8 warps × 32).
-    pub fn gemv_hfq4g256_moe_ninepath_d3(
-        &mut self,
-        expert_ptrs: &GpuTensor,
-        topk_indices: &GpuTensor,
-        x: &GpuTensor,
-        y_gate: &GpuTensor,
-        y_up: &GpuTensor,
-        mi: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_hfq4g256_moe_ninepath_d3",
-            kernels::GEMV_HFQ4G256_MOE_NINEPATH_D3_SRC,
-            "gemv_hfq4g256_moe_ninepath_d3",
-        )?;
-        let pp = expert_ptrs.buf.as_ptr();
-        let ip = topk_indices.buf.as_ptr();
-        let xp = x.buf.as_ptr();
-        let ygp = y_gate.buf.as_ptr();
-        let yup = y_up.buf.as_ptr();
-        let mi_val = mi as i32;
-        let k_val = k as i32;
-        let n_experts_val = (expert_ptrs.buf.size() / 8) as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &pp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &ygp as *const _ as *mut c_void,
-            &yup as *const _ as *mut c_void,
-            &mi_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &n_experts_val as *const _ as *mut c_void,
-        ];
-        let bytes = 8 * crate::profile::gemv_hfq4g256_bytes(2 * mi, k) + k * 4;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_moe_ninepath_d3", bytes);
-        let result = self.launch_maybe_blob(
-            "gemv_hfq4g256_moe_ninepath_d3",
-            [(mi as u32) / 8, 1, 1],
-            [256, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pp);
-                b.push_ptr(ip);
-                b.push_ptr(xp);
-                b.push_ptr(ygp);
-                b.push_ptr(yup);
-                b.push_i32(mi_val);
-                b.push_i32(k_val);
                 b.push_i32(n_experts_val);
                 b
             },

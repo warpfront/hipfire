@@ -1032,8 +1032,6 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> Result<Vec<f32>
 /// plain `x * w` since they would flip the residual's sign. Under `1 + w` they
 /// become sensible scales of ~0.48–0.89. The final `norm` stores ±3.x, which is
 /// only sensible under the PLAIN convention — centering it was a real bug.
-///
-/// Opt out of centering with `HIPFIRE_GLIMMER_NO_CENTERED_NORM=1` for A/B.
 fn load_norm_with(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -1042,12 +1040,7 @@ fn load_norm_with(
     centered: bool,
 ) -> Result<GpuTensor, String> {
     let mut f32_data = load_f32_vec(hfq, name, dim)?;
-    if centered
-        && hipfire_config::developer_var("HIPFIRE_GLIMMER_NO_CENTERED_NORM")
-            .ok()
-            .as_deref()
-            != Some("1")
-    {
+    if centered {
         for v in f32_data.iter_mut() {
             *v += 1.0;
         }
@@ -1935,17 +1928,8 @@ impl GlimmerState {
         cfg: &GlimmerConfig,
         max_seq: usize,
     ) -> Result<Self, String> {
-        // `HIPFIRE_GLIMMER_KV_VMM=0` falls back to the legacy allocator.
-        // Default remains VMM so examples/tools keep working without a LoadCtx.
-        let use_vmm = hipfire_config::developer_var("HIPFIRE_GLIMMER_KV_VMM")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true);
-        let backend = if use_vmm {
-            KvBackend::Vmm
-        } else {
-            KvBackend::Legacy
-        };
-        Self::new_with_max_seq_backend(gpu, cfg, max_seq, backend)
+        // VMM by default so examples/tools keep working without a LoadCtx.
+        Self::new_with_max_seq_backend(gpu, cfg, max_seq, KvBackend::Vmm)
     }
 
     /// Allocate Glimmer state with an explicit KV storage backend.
@@ -1954,7 +1938,7 @@ impl GlimmerState {
     /// Does not read or mutate process environment — loader callers pass
     /// `ctx.kv_backend` so registry defaults and explicit overrides are
     /// deterministic. Non-loader callers should keep using
-    /// [`Self::new_with_max_seq`], which still honors `HIPFIRE_GLIMMER_KV_VMM`.
+    /// [`Self::new_with_max_seq`], which always picks VMM.
     pub fn new_with_max_seq_backend(
         gpu: &mut Gpu,
         cfg: &GlimmerConfig,
@@ -2098,8 +2082,8 @@ impl GlimmerState {
         // wraparound in every consumer; this does not.
         //
         // Precedent: DeepSeek4 (hipfire-arch-deepseek4/src/forward.rs:1813).
-        // Backend is chosen by the caller (typed ctor) or by
-        // `HIPFIRE_GLIMMER_KV_VMM` via `new_with_max_seq`.
+        // Backend is chosen by the caller (typed ctor; `new_with_max_seq`
+        // picks VMM).
         let use_vmm = backend == KvBackend::Vmm;
         if use_vmm {
             let sliding_layers = vec![true; cfg.n_sliding_layers()];

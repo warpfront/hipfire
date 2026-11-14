@@ -2133,11 +2133,10 @@ mod ora {
         let pass = cmp.failures == 0;
         let env_show = |k: &str| std::env::var(k).unwrap_or("(unset)".into());
         let summary = format!(
-            "tmp_gfx1201_chunk_exactness chunk={c} arch={} arms={:?} failures={} bytes_compared={} => {}\nmodel={:?}\nDN_STATE_EF={} DN_REQUANT_PER_TOKEN={} ROCR_VISIBLE_DEVICES={} HOME={}\n",
+            "tmp_gfx1201_chunk_exactness chunk={c} arch={} arms={:?} failures={} bytes_compared={} => {}\nmodel={:?}\nDN_REQUANT_PER_TOKEN={} ROCR_VISIBLE_DEVICES={} HOME={}\n",
             gpu.arch, args.arms, cmp.failures, cmp.bytes_compared,
             if pass { "PASS" } else { "FAIL" },
             args.model,
-            env_show("HIPFIRE_DN_STATE_EF"),
             env_show("HIPFIRE_DN_REQUANT_PER_TOKEN"), env_show("ROCR_VISIBLE_DEVICES"),
             env_show("HOME"),
         );

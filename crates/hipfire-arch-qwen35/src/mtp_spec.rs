@@ -165,18 +165,6 @@ impl MtpSamplingConfig {
 /// repeat buffer's 2048-token capacity.
 pub const PENALTY_REPEAT_CAP: usize = 2048;
 
-fn mtp_device_token_chain_enabled_from_env() -> bool {
-    // Default on: this path is token-identical in greedy mode and removes the
-    // proposal-loop host data dependency needed for later graph capture.
-    match hipfire_config::developer_var("HIPFIRE_MTP_DEVICE_TOKEN_CHAIN") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        Err(_) => true,
-    }
-}
-
 fn mtp_snapshot_overlap_enabled_from_env() -> bool {
     // Default off: current gfx1201 benches show this stream split regresses,
     // but the hook is useful as an opt-in cross-arch experiment.
@@ -187,40 +175,6 @@ fn mtp_snapshot_overlap_enabled_from_env() -> bool {
         }
         Err(_) => false,
     }
-}
-
-fn mtp_gpu_greedy_accept_enabled_from_env() -> bool {
-    // Default on for greedy device-token-chain MTP: candidates and verify
-    // argmaxes are already on-device, so the prefix accept + bonus selection
-    // can stay there until a compact two-int result is needed on host.
-    match hipfire_config::developer_var("HIPFIRE_MTP_GPU_ACCEPT") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        Err(_) => true,
-    }
-}
-
-fn mtp_q8_verify_wmma_enabled_from_env_value(value: Option<&str>) -> bool {
-    match value {
-        None => true,
-        Some(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-    }
-}
-
-fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
-    // Default on for MTP q8 verify: the chunked dispatch only routes to gfx12
-    // WMMA when the arch/shape supports it, otherwise it falls back to scalar.
-    // Prompt-sweep parity is clean; opt out with HIPFIRE_MTP_Q8_VERIFY_WMMA=0.
-    mtp_q8_verify_wmma_enabled_from_env_value(
-        hipfire_config::developer_var("HIPFIRE_MTP_Q8_VERIFY_WMMA")
-            .ok()
-            .as_deref(),
-    )
 }
 
 /// Default draft-confidence cutoff (adaptive-K) per arch.
@@ -1914,25 +1868,16 @@ pub(crate) fn mtp_trunk_verify_lm_head(
     }
     match w_out.gpu_dtype {
         DType::Q8_0 => {
-            if mtp_q8_verify_wmma_enabled_from_env() {
-                gpu.gemm_q8_0_batched_chunked(
-                    &w_out.buf,
-                    verify_hidden,
-                    logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            } else {
-                gpu.gemm_q8_0_batched_f32_chunked(
-                    &w_out.buf,
-                    verify_hidden,
-                    logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            }
+            // The chunked dispatch takes WMMA where the arch/shape supports it
+            // and falls back to the scalar chunks otherwise.
+            gpu.gemm_q8_0_batched_chunked(
+                &w_out.buf,
+                verify_hidden,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
         }
         DType::HFQ4G256 => {
             gpu.gemm_hfq4g256_batched_lmhead(
@@ -2388,8 +2333,9 @@ fn mtp_verify_accept_impl(
         let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
         gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
 
-        let use_gpu_accept =
-            !is_external && use_device_token_chain && mtp_gpu_greedy_accept_enabled_from_env();
+        // Greedy device-token-chain MTP: candidates and verify argmaxes are
+        // already on-device, so the prefix accept + bonus selection stays there.
+        let use_gpu_accept = !is_external && use_device_token_chain;
         let accepted = if use_gpu_accept {
             let candidate_device = state.mtp_token_chain.sub_offset(1, drafts_generated);
             let accept_result = state.verify_argmax.sub_offset(0, 2);
@@ -4407,13 +4353,7 @@ pub fn spec_step_mtp(
     // Instrument first cycle: print tape_captured so we can confirm the MoE
     // batched verify populates the tape (HIPFIRE_DEBUG_BATCH=1 already prints
     // eligibility; this one-shot print on cycle 0 is unconditional for W3e).
-    // HIPFIRE_MTP_TAPE_REPLAY=0 forces the original full-replay path (A/B gate).
-    let use_tape_replay = tape_captured
-        && advance >= 2
-        && hipfire_config::developer_var("HIPFIRE_MTP_TAPE_REPLAY")
-            .ok()
-            .as_deref()
-            != Some("0");
+    let use_tape_replay = tape_captured && advance >= 2;
     state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
     if use_tape_replay {
         // Batched verify populated the tape this cycle — cheap GDN-only replay.
@@ -4429,7 +4369,7 @@ pub fn spec_step_mtp(
             advance,
         )?;
     } else {
-        // Either tape not captured, HIPFIRE_MTP_TAPE_REPLAY=0 (A/B gate), or advance=1
+        // Either tape not captured or advance=1
         // (decode-mode-GEMV vs batch-WMMA ULP mismatch — use decode path for identity).
         if advance >= 2 {
             let replay = &verify_tokens[..advance];
@@ -5158,7 +5098,6 @@ pub fn mtp_draft_phase_inner(
     // k==0 one-token path: never run device-token chain / proposal graph
     // (both assume max_n ≥ 1 for candidate buffer views).
     let use_device_token_chain = max_n > 0
-        && mtp_device_token_chain_enabled_from_env()
         && mtp_device_token_chain_eligible_for(trunk_weights.embd_format, use_sampling, use_p_min);
     if use_device_token_chain && !use_full_vocab {
         assert!(
@@ -6110,12 +6049,6 @@ mod tests {
 
     #[test]
     fn proposal_graph_policy_is_opt_in_and_q8_device_chain_only() {
-        assert!(mtp_q8_verify_wmma_enabled_from_env_value(None));
-        assert!(!mtp_q8_verify_wmma_enabled_from_env_value(Some("0")));
-        assert!(!mtp_q8_verify_wmma_enabled_from_env_value(Some("off")));
-        assert!(mtp_q8_verify_wmma_enabled_from_env_value(Some("1")));
-        assert!(mtp_q8_verify_wmma_enabled_from_env_value(Some("ON")));
-
         assert_eq!(
             mtp_proposal_graph_policy_from_env_value(None),
             MtpProposalGraphPolicy::Off

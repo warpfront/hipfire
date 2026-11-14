@@ -2721,15 +2721,14 @@ mod tests {
 
         let mut cases = 0;
         for knob in [None, Some(false), Some(true)] {
-            for bits in 0..64 {
+            for bits in 0..32 {
                 let terms = CompactScratchTerms {
                     knob,
                     exact_gfx1201: bits & 1 != 0,
-                    grouped_gemm: bits & 2 != 0,
-                    sym_iu4_requested: bits & 4 != 0,
-                    source_slab: bits & 8 != 0,
-                    ple_key_value_bf16: bits & 16 != 0,
-                    flash_next_profile: bits & 32 != 0,
+                    sym_iu4_requested: bits & 2 != 0,
+                    source_slab: bits & 4 != 0,
+                    ple_key_value_bf16: bits & 8 != 0,
+                    flash_next_profile: bits & 16 != 0,
                     source_symmetric: true,
                 };
                 // The aggregate path selects with the artifact assumed
@@ -2748,7 +2747,7 @@ mod tests {
                 cases += 1;
             }
         }
-        assert_eq!(cases, 192);
+        assert_eq!(cases, 96);
     }
 
     fn slab_metadata() -> String {

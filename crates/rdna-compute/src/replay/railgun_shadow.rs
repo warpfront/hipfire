@@ -115,7 +115,6 @@ pub(super) struct RedlinePrepared<'a> {
 pub(super) struct Transport<'a> {
     pub pool: &'a KernargPool,
     pub new_commands: &'a dyn Fn() -> Pm4Commands,
-    pub gcr_trim: bool,
     pub entry_policy: Gfx11EntryAcquirePolicy,
 }
 
@@ -713,7 +712,7 @@ fn lower_executable(
         match op {
             Pm4Op::Entry => {
                 commands.emit_entry_sentinel_reset()?;
-                commands.acquire_entry(transport.gcr_trim, transport.entry_policy);
+                commands.acquire_entry(transport.entry_policy);
             }
             Pm4Op::Boundary(_) if drop_boundaries => {}
             Pm4Op::Boundary(v) => {
@@ -722,7 +721,7 @@ fn lower_executable(
                 }
                 match v.acquire {
                     Rung::None => {}
-                    Rung::InterNode => commands.acquire_inter_node(transport.gcr_trim, false),
+                    Rung::InterNode => commands.acquire_inter_node(false),
                     Rung::System => commands.gfx12_system_acquire()?,
                 }
             }

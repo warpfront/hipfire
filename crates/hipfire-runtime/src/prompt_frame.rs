@@ -463,7 +463,7 @@ impl<'a> ChatScaffold<'a> {
 
 /// How a historical assistant turn's `tool_calls` are re-rendered on a
 /// cache MISS in [`build_cached_history`] — the hand-rolled ChatScaffold
-/// path used only when `HIPFIRE_JINJA_CHAT=0`. (The default jinja path
+/// path used only when the model has no chat template. (The jinja path
 /// renders history through the model's trained chat_template instead, via
 /// `build_cached_history_jinja`, and is unaffected by this enum.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -533,7 +533,7 @@ pub fn qwen35_grammar_on(env: Option<&str>, model_path: &str) -> bool {
     }
 }
 
-/// Cache-miss history re-render format (non-jinja `HIPFIRE_JINJA_CHAT=0` path)
+/// Cache-miss history re-render format (non-jinja path, no chat template)
 /// for the same inputs as [`qwen35_grammar_on`]: grammar ON => Hermes JSON,
 /// grammar OFF => Qwen native XML.
 pub fn qwen35_history_render(env: Option<&str>, model_path: &str) -> ToolCallRender {

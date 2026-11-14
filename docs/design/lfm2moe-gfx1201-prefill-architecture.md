@@ -528,7 +528,7 @@ use_batched = gpu.arch_caps.is_gfx1201()
 
 `generate_lfm2moe` and the arch-11 `bench_prefill` arm make this selection before any prompt token is processed. The eager Phase0 path is the exact else branch. The environment flag is opt-in until Phase-4 certification; only the conductor may freeze a default-on-with-`=0` opt-out cutover.
 
-The batched function is not graph-captured in the vertical slice. `HIPFIRE_FORWARD_LOWERED` and `HIPFIRE_LFM2_GRAPH` remain eager diagnostic controls and do not alter the batched contract.
+The batched function is not graph-captured in the vertical slice. `HIPFIRE_LFM2_GRAPH` remains an eager diagnostic control and does not alter the batched contract. The `HIPFIRE_FORWARD_LOWERED` control is gone (HIPF-396): decode always runs the lowered program.
 
 ## 10. Vertical-slice implementation order
 

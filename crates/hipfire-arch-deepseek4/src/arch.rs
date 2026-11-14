@@ -1666,10 +1666,8 @@ impl DeepseekV4 {
 
         // Phase 1.5 host walk verifies every expected tensor is in the
         // HFQ index. We then upload all globals and per-layer
-        // non-expert tensors. The 256 routed experts per layer are
-        // default ON (most of the model's bytes — DeepSeek V4 is unusable
-        // without them). Opt out with `HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS=0`
-        // for shared-only-FFN diagnostic loads.
+        // non-expert tensors, then the 256 routed experts per layer (most of
+        // the model's bytes — DeepSeek V4 is unusable without them).
         //
         // For VRAM-constrained partial-MoE testing, set
         //   HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END=N
@@ -1677,10 +1675,6 @@ impl DeepseekV4 {
         // N). Layers >= N fall back to shared-only FFN. Each layer's
         // expert blob is ~1.84 GB on the FP4-fixed HFQ (post-unpack
         // logical shape), so 22 layers ≈ 40 GB.
-        let upload_experts = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
-            .ok()
-            .as_deref()
-            != Some("0");
         let expert_layer_end: Option<usize> =
             hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
                 .ok()
@@ -1976,13 +1970,10 @@ impl DeepseekV4 {
             // (gemv_f32 path) while default MQ4G256 quants land as Raw
             // (gemv_mq4g256_prerotated path). gemv_auto in forward.rs
             // branches on GpuTensor.dtype to pick the right kernel.
-            // Opt-in: keep F16-native parallel copies of the compressor
-            // projections for the WMMA GEMM path. Doubles compressor
-            // VRAM footprint but unlocks the 26× speedup measured in
-            // microbench (gemm_f16_x_f16_wmma vs gemm_f32_register_tiled).
-            let comp_f16_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
-                .map(|s| s != "0")
-                .unwrap_or(true);
+            // Keep F16-native parallel copies of the compressor projections
+            // for the WMMA GEMM path. Doubles compressor VRAM footprint but
+            // unlocks the 26× speedup measured in microbench
+            // (gemm_f16_x_f16_wmma vs gemm_f32_register_tiled).
             if layer.compress_ratio > 0 {
                 let compressor_wkv_name = format!("layers.{l}.attn.compressor.wkv.weight");
                 let compressor_wgate_name = format!("layers.{l}.attn.compressor.wgate.weight");
@@ -1994,10 +1985,9 @@ impl DeepseekV4 {
                 // a quantized format. Only retain the parallel F16 WMMA copy
                 // when the overlay-resolved tensor is actually F16; otherwise
                 // the regular dtype-aware GEMV/GEMM path below is authoritative.
-                if comp_f16_wmma
-                    && hfq
-                        .find_tensor_info(&compressor_wkv_name)
-                        .is_some_and(|info| info.quant_type == 1)
+                if hfq
+                    .find_tensor_info(&compressor_wkv_name)
+                    .is_some_and(|info| info.quant_type == 1)
                 {
                     layer.compressor_wkv_f16 = Some(Self::upload_quant_as_f16_native(
                         hfq,
@@ -2005,10 +1995,9 @@ impl DeepseekV4 {
                         &compressor_wkv_name,
                     )?);
                 }
-                if comp_f16_wmma
-                    && hfq
-                        .find_tensor_info(&compressor_wgate_name)
-                        .is_some_and(|info| info.quant_type == 1)
+                if hfq
+                    .find_tensor_info(&compressor_wgate_name)
+                    .is_some_and(|info| info.quant_type == 1)
                 {
                     layer.compressor_wgate_f16 = Some(Self::upload_quant_as_f16_native(
                         hfq,
@@ -2059,10 +2048,9 @@ impl DeepseekV4 {
                     gpu,
                     &indexer_compressor_wgate_name,
                 )?);
-                if comp_f16_wmma
-                    && hfq
-                        .find_tensor_info(&indexer_compressor_wkv_name)
-                        .is_some_and(|info| info.quant_type == 1)
+                if hfq
+                    .find_tensor_info(&indexer_compressor_wkv_name)
+                    .is_some_and(|info| info.quant_type == 1)
                 {
                     layer.indexer_compressor_wkv_f16 = Some(Self::upload_quant_as_f16_native(
                         hfq,
@@ -2070,10 +2058,9 @@ impl DeepseekV4 {
                         &indexer_compressor_wkv_name,
                     )?);
                 }
-                if comp_f16_wmma
-                    && hfq
-                        .find_tensor_info(&indexer_compressor_wgate_name)
-                        .is_some_and(|info| info.quant_type == 1)
+                if hfq
+                    .find_tensor_info(&indexer_compressor_wgate_name)
+                    .is_some_and(|info| info.quant_type == 1)
                 {
                     layer.indexer_compressor_wgate_f16 = Some(Self::upload_quant_as_f16_native(
                         hfq,
@@ -2279,31 +2266,23 @@ impl DeepseekV4 {
         let mtp_source: &HfqFile = mtp_addon.as_ref().unwrap_or(&*hfq);
         let mtp_present = mtp_source.find_tensor_info("mtp.0.norm.weight").is_some();
         if mtp_present {
-            let load_mtp = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_LOAD_MTP")
-                .map(|s| s != "0")
-                .unwrap_or(true)
-                && cfg.load_mtp
-                && cfg.reap_keep.is_none();
+            let load_mtp = cfg.load_mtp && cfg.reap_keep.is_none();
             if !load_mtp {
                 eprintln!(
                     "deepseek4: skipping MTP upload ({})",
                     if cfg.reap_keep.is_some() {
                         "REAP keep-map active — MTP unused for PPL/KLD and would \
                          need separate keep handling"
-                    } else if !cfg.load_mtp {
-                        "speculation.mtp = auto without a measured AR floor — plain AR"
                     } else {
-                        "HIPFIRE_DEEPSEEK4_LOAD_MTP=0"
+                        "speculation.mtp = auto without a measured AR floor — plain AR"
                     }
                 );
                 hipfire_config::load_summary::note(
                     hipfire_config::load_summary::Facet::SpecOff,
                     if cfg.reap_keep.is_some() {
                         "MTP off: REAP keep-map active"
-                    } else if !cfg.load_mtp {
-                        "MTP off: no measured AR floor (speculation.mtp=auto)"
                     } else {
-                        "MTP off: HIPFIRE_DEEPSEEK4_LOAD_MTP=0"
+                        "MTP off: no measured AR floor (speculation.mtp=auto)"
                     },
                 );
             } else {
@@ -2520,10 +2499,7 @@ impl DeepseekV4 {
         // Routed experts: 256 × 3 = 768 tensors per layer ×
         // 43 layers = 33,024 total. Per-expert hipMalloc takes ~10ms
         // (driver overhead) → 5+ min naive. Batch as ONE upload per
-        // (layer, projection): 129 uploads total. Opt out with
-        // HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS=0 (default ON; the experts
-        // are ~40 GB, but DeepSeek V4 is architecturally MoE so a
-        // shared-only run is diagnostic-only).
+        // (layer, projection): 129 uploads total.
         // Per-layer gate: skip uploads when partial-MoE budget excludes
         // this layer (forward gracefully falls back to shared-only).
         //
@@ -2533,82 +2509,77 @@ impl DeepseekV4 {
         // pages as soon as they're consumed. Host peak per layer ≈
         // stride_w1 × n_exp + stride_w2 × n_exp ≈ 1.2 GB — bounded,
         // well below the pressure threshold.
-        if upload_experts {
-            for l in 0..weights.layers.len() {
-                let upload_this_layer = expert_layer_end.is_none_or(|end| l < end);
-                if !upload_this_layer {
-                    continue;
-                }
-                let n_exp = cfg.n_routed_experts;
-                let keep = cfg.reap_keep.as_ref().and_then(|r| r.expert_plan(l).keep());
-                if let Some(expert_gpu) = routed_gpu.as_deref_mut() {
-                    let layer = weights
-                        .routed_layer_mut(l)
-                        .ok_or_else(|| format!("deepseek4: routed owner missing layer {l}"))?;
-                    Self::upload_layer_routed_experts(
-                        hfq,
-                        expert_gpu,
-                        &format!("layers.{l}"),
-                        n_exp,
-                        layer,
-                        shard,
-                        keep,
-                    )?;
-                } else {
-                    let layer = &mut weights.layers[l];
-                    Self::upload_layer_routed_experts(
-                        hfq,
-                        gpu,
-                        &format!("layers.{l}"),
-                        n_exp,
-                        layer,
-                        shard,
-                        keep,
-                    )?;
-                }
-                if heterogeneous_fault == Some(DeepseekV4HeterogeneousFault::AfterRoutedLayer(l)) {
-                    return Err(format!(
-                        "deepseek4: injected heterogeneous failure after routed layer {l}"
-                    ));
-                }
+        for l in 0..weights.layers.len() {
+            let upload_this_layer = expert_layer_end.is_none_or(|end| l < end);
+            if !upload_this_layer {
+                continue;
+            }
+            let n_exp = cfg.n_routed_experts;
+            let keep = cfg.reap_keep.as_ref().and_then(|r| r.expert_plan(l).keep());
+            if let Some(expert_gpu) = routed_gpu.as_deref_mut() {
+                let layer = weights
+                    .routed_layer_mut(l)
+                    .ok_or_else(|| format!("deepseek4: routed owner missing layer {l}"))?;
+                Self::upload_layer_routed_experts(
+                    hfq,
+                    expert_gpu,
+                    &format!("layers.{l}"),
+                    n_exp,
+                    layer,
+                    shard,
+                    keep,
+                )?;
+            } else {
+                let layer = &mut weights.layers[l];
+                Self::upload_layer_routed_experts(
+                    hfq,
+                    gpu,
+                    &format!("layers.{l}"),
+                    n_exp,
+                    layer,
+                    shard,
+                    keep,
+                )?;
+            }
+            if heterogeneous_fault == Some(DeepseekV4HeterogeneousFault::AfterRoutedLayer(l)) {
+                return Err(format!(
+                    "deepseek4: injected heterogeneous failure after routed layer {l}"
+                ));
             }
         }
 
-        // Routed experts for the MTP layer (same upload logic, gated on
-        // both `upload_experts` and the MTP layer existing). Reads from the
-        // addon HFQ if present, else from the base (in-band MTP).
-        if upload_experts {
-            if let Some(mtp) = weights.mtp_layer.as_mut() {
-                let mtp_expert_source: &HfqFile = mtp_addon.as_ref().unwrap_or(&*hfq);
-                eprintln!(
-                    "deepseek4: uploading MTP routed experts from {}.",
-                    if mtp_addon.is_some() {
-                        "addon HFQ"
-                    } else {
-                        "base HFQ"
-                    }
-                );
-                if let Some(expert_gpu) = routed_gpu.as_deref_mut() {
-                    Self::upload_layer_routed_experts(
-                        mtp_expert_source,
-                        expert_gpu,
-                        "mtp.0",
-                        cfg.n_routed_experts,
-                        mtp,
-                        shard,
-                        None, // MTP not loaded under REAP keep-map (see load_mtp guard)
-                    )?;
+        // Routed experts for the MTP layer (same upload logic). Reads from
+        // the addon HFQ if present, else from the base (in-band MTP).
+        if let Some(mtp) = weights.mtp_layer.as_mut() {
+            let mtp_expert_source: &HfqFile = mtp_addon.as_ref().unwrap_or(&*hfq);
+            eprintln!(
+                "deepseek4: uploading MTP routed experts from {}.",
+                if mtp_addon.is_some() {
+                    "addon HFQ"
                 } else {
-                    Self::upload_layer_routed_experts(
-                        mtp_expert_source,
-                        gpu,
-                        "mtp.0",
-                        cfg.n_routed_experts,
-                        mtp,
-                        shard,
-                        None, // MTP not loaded under REAP keep-map (see load_mtp guard)
-                    )?;
+                    "base HFQ"
                 }
+            );
+            if let Some(expert_gpu) = routed_gpu.as_deref_mut() {
+                Self::upload_layer_routed_experts(
+                    mtp_expert_source,
+                    expert_gpu,
+                    "mtp.0",
+                    cfg.n_routed_experts,
+                    mtp,
+                    shard,
+                    None, // MTP not loaded under REAP keep-map (see load_mtp guard)
+                )?;
+            } else {
+                Self::upload_layer_routed_experts(
+                    mtp_expert_source,
+                    gpu,
+                    "mtp.0",
+                    cfg.n_routed_experts,
+                    mtp,
+                    shard,
+                    None, // MTP not loaded under REAP keep-map (see load_mtp guard)
+                )?;
             }
         }
 
@@ -3342,17 +3313,10 @@ impl DeepseekV4 {
         cfg: &DeepseekV4Config,
         gpu: &mut Gpu,
     ) -> Result<DeepseekV4Weights, String> {
-        let upload_experts = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
-            .ok()
-            .as_deref()
-            != Some("0");
         let expert_layer_end: Option<usize> =
             hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
                 .ok()
                 .and_then(|s| s.parse().ok());
-        let comp_f16_wmma = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
-            .map(|s| s != "0")
-            .unwrap_or(true);
 
         // Build empty weight scaffold from config.
         let n_layers = cfg.num_hidden_layers;
@@ -3491,19 +3455,16 @@ impl DeepseekV4 {
                     gpu,
                     &format!("layers.{l}.attn.compressor.wgate.weight"),
                 )?);
-                if comp_f16_wmma {
-                    layer.compressor_wkv_f16 = Some(Self::upload_quant_as_f16_native_from_source(
-                        source,
-                        gpu,
-                        &format!("layers.{l}.attn.compressor.wkv.weight"),
-                    )?);
-                    layer.compressor_wgate_f16 =
-                        Some(Self::upload_quant_as_f16_native_from_source(
-                            source,
-                            gpu,
-                            &format!("layers.{l}.attn.compressor.wgate.weight"),
-                        )?);
-                }
+                layer.compressor_wkv_f16 = Some(Self::upload_quant_as_f16_native_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.compressor.wkv.weight"),
+                )?);
+                layer.compressor_wgate_f16 = Some(Self::upload_quant_as_f16_native_from_source(
+                    source,
+                    gpu,
+                    &format!("layers.{l}.attn.compressor.wgate.weight"),
+                )?);
                 layer.compressor_norm = Some(Self::upload_global_f16_as_f32_from_source(
                     source,
                     gpu,
@@ -3538,20 +3499,18 @@ impl DeepseekV4 {
                     gpu,
                     &format!("layers.{l}.attn.indexer.compressor.wgate.weight"),
                 )?);
-                if comp_f16_wmma {
-                    layer.indexer_compressor_wkv_f16 =
-                        Some(Self::upload_quant_as_f16_native_from_source(
-                            source,
-                            gpu,
-                            &format!("layers.{l}.attn.indexer.compressor.wkv.weight"),
-                        )?);
-                    layer.indexer_compressor_wgate_f16 =
-                        Some(Self::upload_quant_as_f16_native_from_source(
-                            source,
-                            gpu,
-                            &format!("layers.{l}.attn.indexer.compressor.wgate.weight"),
-                        )?);
-                }
+                layer.indexer_compressor_wkv_f16 =
+                    Some(Self::upload_quant_as_f16_native_from_source(
+                        source,
+                        gpu,
+                        &format!("layers.{l}.attn.indexer.compressor.wkv.weight"),
+                    )?);
+                layer.indexer_compressor_wgate_f16 =
+                    Some(Self::upload_quant_as_f16_native_from_source(
+                        source,
+                        gpu,
+                        &format!("layers.{l}.attn.indexer.compressor.wgate.weight"),
+                    )?);
                 layer.indexer_compressor_norm = Some(Self::upload_global_f16_as_f32_from_source(
                     source,
                     gpu,
@@ -3664,15 +3623,10 @@ impl DeepseekV4 {
         // `mtp.0.norm.weight` as the canary).
         let mtp_present = source.tensor_info("mtp.0.norm.weight").is_some();
         if mtp_present {
-            let load_mtp = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_LOAD_MTP")
-                .map(|s| s != "0")
-                .unwrap_or(true)
-                && cfg.load_mtp;
-            if !load_mtp {
+            if !cfg.load_mtp {
                 eprintln!(
                     "deepseek4: source contains MTP layer but the load skips it \
-                    (HIPFIRE_DEEPSEEK4_LOAD_MTP=0, or speculation.mtp = auto without a \
-                    measured AR floor) — skipping MTP upload"
+                    (speculation.mtp = auto without a measured AR floor) — skipping MTP upload"
                 );
             } else {
                 eprintln!("deepseek4: MTP layer present — uploading from safetensors source.");
@@ -3852,35 +3806,31 @@ impl DeepseekV4 {
         }
 
         // ── Routed experts ────────────────────────────────────────────
-        if upload_experts {
-            for (l, layer) in weights.layers.iter_mut().enumerate() {
-                let upload_this_layer = expert_layer_end.is_none_or(|end| l < end);
-                if !upload_this_layer {
-                    continue;
-                }
-                let n_exp = cfg.n_routed_experts;
-                Self::upload_layer_routed_experts_from_source(
-                    source,
-                    gpu,
-                    &format!("layers.{l}"),
-                    n_exp,
-                    layer,
-                    None, // No EP shard in safetensors path yet.
-                )?;
+        for (l, layer) in weights.layers.iter_mut().enumerate() {
+            let upload_this_layer = expert_layer_end.is_none_or(|end| l < end);
+            if !upload_this_layer {
+                continue;
             }
+            let n_exp = cfg.n_routed_experts;
+            Self::upload_layer_routed_experts_from_source(
+                source,
+                gpu,
+                &format!("layers.{l}"),
+                n_exp,
+                layer,
+                None, // No EP shard in safetensors path yet.
+            )?;
         }
-        if upload_experts {
-            if let Some(mtp) = weights.mtp_layer.as_mut() {
-                eprintln!("deepseek4: uploading MTP routed experts from safetensors source.");
-                Self::upload_layer_routed_experts_from_source(
-                    source,
-                    gpu,
-                    "mtp.0",
-                    cfg.n_routed_experts,
-                    mtp,
-                    None,
-                )?;
-            }
+        if let Some(mtp) = weights.mtp_layer.as_mut() {
+            eprintln!("deepseek4: uploading MTP routed experts from safetensors source.");
+            Self::upload_layer_routed_experts_from_source(
+                source,
+                gpu,
+                "mtp.0",
+                cfg.n_routed_experts,
+                mtp,
+                None,
+            )?;
         }
 
         Ok(weights)

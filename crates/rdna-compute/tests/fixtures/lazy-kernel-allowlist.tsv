@@ -134,7 +134,6 @@ module	cross_entropy_loss	no-caller	No production caller; only definitions, test
 module	ddtree_build_attn_mask	config-opt-in	Non-default configuration: speculation.ddtree_budget / speculation.dflash_tree; hipfire-arch-qwen35/src/dflash_spec.rs:524-534
 module	ddtree_gumbel_topk_batched	config-opt-in	Non-default configuration: speculation.ddtree_budget / speculation.dflash_tree; hipfire-arch-qwen35/src/dflash_spec.rs:524-534
 module	ddtree_swor_walk	config-opt-in	Non-default configuration: speculation.ddtree_budget / speculation.dflash_tree; hipfire-arch-qwen35/src/dflash_spec.rs:524-534
-module	deepseek4_attn_pos0	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22968
 module	deepseek4_attn_swa	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:23015
 module	deepseek4_attn_swa_batched	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:23069
 module	deepseek4_attn_swa_batched_debug	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:23138
@@ -757,7 +756,6 @@ module	gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc	non-core-family	Non-c
 module	gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc	non-core-family	Non-core family route: Gemma; rdna-compute/src/gemv.rs:15191
 module	gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151	developer-opt-in	Non-default developer override: HIPFIRE_GFX1151_GATE_UP_PAIRED_WAVES; rdna-compute/src/gemv.rs:14899-14902
 module	gemv_hfq4g256_moe_gate_up_k8_indexed_persistent_rank8_gfx1151	developer-opt-in	Non-default developer override: HIPFIRE_GFX1151_GATE_UP_PERSISTENT_RANK8; rdna-compute/src/gemv.rs:14895-14898
-module	gemv_hfq4g256_moe_ninepath_d3	developer-opt-in	Non-default developer override: HIPFIRE_MOE_NINEPATH; hipfire-dispatch/src/pipeline/moe_program.rs:2743
 module	gemv_hfq4g256_moe_up_k8_indexed_k2048_gfx1151	developer-opt-in	Non-default developer override: HIPFIRE_GFX1151_GATE_UP_SPLIT; rdna-compute/src/gemv.rs:14903-14917
 module	gemv_hfq4g256_multirow_default_mq2v2	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemv.rs:23236
 module	gemv_hfq4g256_multirow_default_mq5v2	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemv.rs:22694
@@ -1030,7 +1028,6 @@ module	indexer_top_k_buf	non-core-family	Non-core family route: DeepSeek4; rdna-
 module	indexer_top_k_buf_bounded	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21996
 module	indexer_top_k_buf_bounded_gfx1201	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21996
 module	indexer_top_k_buf_parallel	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21996
-module	indexer_top_k_buf_parallel_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/cdna/gfx942.rs:95-110
 module	indexer_top_k_buf_parallel_gfx942_bounded	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/cdna/gfx942.rs:95-110
 module	indexer_top_k_buf_unrolled	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21996
 module	indexer_topk_twostage	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22083
@@ -1149,7 +1146,6 @@ module	rotate_x_mq_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer ov
 module	rotate_x_mq_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	round_h_bf16_quality_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_EMU_BF16_H; rdna-compute/src/gemv.rs:4453-4460
 module	sample_rows_pf	config-opt-in	Non-default configuration: serve.continuous_batch_size; batch.rs:1029
-module	sample_top_p	developer-opt-in	Non-default developer override: HIPFIRE_SAMPLE_PARALLEL; rdna-compute/src/sampling.rs:329-331
 module	sigmoid_mul_rotate_x_mq_awq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:7171
 module	sigmoid_mul_rotate_x_mq_awq_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:7166
 module	sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640

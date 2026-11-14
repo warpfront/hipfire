@@ -472,7 +472,7 @@ fn spec_start_channel_matches_ar(rendered: &str) -> bool {
 
 /// Whether the shared speculative body renders this request to exactly the
 /// prompt [`generate_raon`] renders. It always uses the model's Jinja
-/// template when `HIPFIRE_JINJA_CHAT` allows it and the model has one, and
+/// template when the model has one, and
 /// falls back to plain ChatML on a render error: a request that would take
 /// either of those differences, or whose start channel is classified
 /// differently, must run on the AR route.
@@ -484,13 +484,6 @@ fn spec_prompt_matches_ar(
     tools: Option<&[serde_json::Value]>,
     enable_thinking: bool,
 ) -> bool {
-    if hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-        .ok()
-        .as_deref()
-        == Some("0")
-    {
-        return false;
-    }
     let (Some(tokenizer), Some(template)) = (m.tokenizer.as_ref(), m.chat_template.as_deref())
     else {
         return false;
@@ -776,8 +769,6 @@ mod tests {
             min_p: None,
             nonneutral_penalties: false,
             force_ar_chat: false,
-            temp_spec_env_off: false,
-            fast_sample_on: true,
             supports_temp_swor: false,
             supports_chain_nucleus_verify: false,
             kv_adaptive: false,
@@ -878,11 +869,6 @@ mod tests {
                 },
                 GenerationRouteInputs {
                     nonneutral_penalties: true,
-                    temp_spec_env_off: true,
-                    ..request
-                },
-                GenerationRouteInputs {
-                    nonneutral_penalties: true,
                     has_speculator: false,
                     speculator_is_dflash2: false,
                     ..request
@@ -904,10 +890,6 @@ mod tests {
                 },
                 GenerationRouteInputs {
                     force_ar_chat: true,
-                    ..request
-                },
-                GenerationRouteInputs {
-                    temp_spec_env_off: true,
                     ..request
                 },
                 GenerationRouteInputs {

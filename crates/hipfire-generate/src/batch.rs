@@ -392,14 +392,6 @@ pub fn is_batch_request_eligible(
             || sampling.presence_penalty != 0.0
             || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
-            .ok()
-            .as_deref()
-            == Some("0"),
-        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
-            .ok()
-            .as_deref()
-            != Some("0"),
         supports_temp_swor,
         supports_chain_nucleus_verify,
         kv_adaptive: has_adaptive,
@@ -1913,14 +1905,6 @@ fn vmm_singleton_route(
             .ok()
             .as_deref()
             == Some("0"),
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
-            .ok()
-            .as_deref()
-            == Some("0"),
-        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
-            .ok()
-            .as_deref()
-            != Some("0"),
         supports_temp_swor: spec.is_some_and(|s| s.supports_temp_verify()),
         supports_chain_nucleus_verify: spec.is_some_and(|s| s.supports_chain_nucleus_verify()),
         kv_adaptive: m.kv_adaptive.is_some(),
@@ -1975,16 +1959,12 @@ fn vmm_store_mtp_engine(store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35V
     store.spec_engine().is_some() && !hipfire_config::mtp_ngram_enabled()
 }
 
-/// Only the production FAST_SAMPLE selector chain has shared sampled seams.
+/// Only the production fast-sample selector chain has shared sampled seams.
 /// Other DFlash laws remain singleton, even when a greedy engine is staged.
 fn vmm_store_dflash_sampled(
     store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore,
 ) -> bool {
     store.dflash_engine().is_some_and(|e| e.supports_sampled())
-        && hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
-            .ok()
-            .as_deref()
-            != Some("0")
 }
 
 /// Whether the store serves sampled requests at all: staged with
@@ -2913,11 +2893,7 @@ pub fn is_vmm_batch_request_eligible(
         .get("tools")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty());
-    let jinja = m.chat_template.is_some()
-        && hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0");
+    let jinja = m.chat_template.is_some();
     let shape_ok = if jinja {
         batch_messages_are_text_chat(msg)
     } else {
@@ -7023,14 +6999,6 @@ pub fn is_qwen_ep_batch_request_eligible(
             || sampling.presence_penalty != 0.0
             || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
-            .ok()
-            .as_deref()
-            == Some("0"),
-        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
-            .ok()
-            .as_deref()
-            != Some("0"),
         supports_temp_swor: m
             .speculator
             .as_ref()

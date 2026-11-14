@@ -70,7 +70,6 @@ struct GraphEnv {
     replay_backend: Option<String>,
     graph: Option<String>,
     ar_graph: Option<String>,
-    graph_moe: Option<String>,
     ar_graph_trace: Option<String>,
 }
 
@@ -449,7 +448,6 @@ fn graph_env() -> GraphEnv {
         replay_backend: v("HIPFIRE_REPLAY_BACKEND"),
         graph: v("HIPFIRE_GRAPH"),
         ar_graph: v("HIPFIRE_AR_GRAPH"),
-        graph_moe: v("HIPFIRE_GRAPH_MOE"),
         ar_graph_trace: v("HIPFIRE_AR_GRAPH_TRACE"),
     }
 }
@@ -460,7 +458,6 @@ fn requested_mode(env: &GraphEnv) -> &'static str {
     if env.replay_backend.as_deref() == Some("hip")
         && env.graph.as_deref() == Some("1")
         && env.ar_graph.as_deref() == Some("1")
-        && env.graph_moe.as_deref() == Some("1")
         && env.ar_graph_trace.as_deref() == Some("1")
     {
         "graph"
@@ -1077,7 +1074,7 @@ fn plan() -> Result<()> {
     println!("  (head-major codes + f16 scales, finite-checked); corrupted scale/NaN code/wrong");
     println!("  length/nonfinite state or logits return Err");
     println!("graph arm requires: HIPFIRE_REPLAY_BACKEND=hip HIPFIRE_GRAPH=1 HIPFIRE_AR_GRAPH=1");
-    println!("  HIPFIRE_GRAPH_MOE=1 HIPFIRE_AR_GRAPH_TRACE=1; no CPU-executed weight placement;");
+    println!("  HIPFIRE_AR_GRAPH_TRACE=1; no CPU-executed weight placement;");
     println!("  Redline disabled (production guards own enforcement); witnesses record graph_exec");
     println!("  presence/binding/dirty/replay-enabled/blob count per continuation call WITHOUT a");
     println!("  replay counter; native proof additionally requires [qwen-ar-graph] capture/replay");
@@ -1127,7 +1124,6 @@ fn fake_manifest(codec: &str, mode: &str) -> Manifest {
             replay_backend: None,
             graph: None,
             ar_graph: None,
-            graph_moe: None,
             ar_graph_trace: None,
         },
         graph_witnesses: vec![],

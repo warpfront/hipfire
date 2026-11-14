@@ -28,10 +28,6 @@ const PROBE_USER_TEXT: &str = ".";
 /// ChatML turn opener: the conversation ends where the question turn opens.
 const TURN_OPEN: &str = "<|im_start|>";
 
-fn dev_flag_off(name: &str) -> bool {
-    hipfire_config::developer_var(name).ok().as_deref() == Some("0")
-}
-
 /// Tokens of `messages` + one user turn `user_text` + the closed-think
 /// assistant opener. The render matches the chat path's Jinja prompt-cache
 /// render (ar.rs:3055-3135): the model's template, each cached assistant turn
@@ -234,17 +230,12 @@ pub(crate) fn plan_session(m: &mut LoadedModel, req: &Value) -> Result<SessionPl
                 format!("decide not supported for arch_id {}", m.arch_id),
             )
         })?;
-    let template = m
-        .chat_template
-        .as_deref()
-        .filter(|_| !dev_flag_off("HIPFIRE_JINJA_CHAT"))
-        .ok_or_else(|| {
-            DecideError::new(
-                400,
-                "decide session mode needs the model's Jinja chat template \
-                 (none loaded, or HIPFIRE_JINJA_CHAT=0)",
-            )
-        })?;
+    let template = m.chat_template.as_deref().ok_or_else(|| {
+        DecideError::new(
+            400,
+            "decide session mode needs the model's Jinja chat template (none loaded)",
+        )
+    })?;
     let tok = m
         .tokenizer
         .as_ref()
@@ -262,13 +253,10 @@ pub(crate) fn plan_session(m: &mut LoadedModel, req: &Value) -> Result<SessionPl
     } = render_and_admit(tok, &parsed.questions, &limits, |text| {
         render_session_prompt(tok, template, cache, &parsed.messages, tools, text)
     })?;
-    // The chat path's prompt-cache eligibility (ar.rs:3025-3029): never with
-    // the cache kill switch. A positional rewind also needs an uncompacted KV
-    // cache.
-    let reuse = !dev_flag_off("HIPFIRE_QWEN_PROMPT_CACHE")
-        && carrier.decide_kv_compact_offset(m) == Some(0);
+    // A positional rewind needs an uncompacted KV cache.
+    let reuse = carrier.decide_kv_compact_offset(m) == Some(0);
     // With a speculator loaded the AR checkpoint ring is not the live one.
-    let resume = crate::ar::ckpt_resume_enabled() && m.speculator.is_none();
+    let resume = m.speculator.is_none();
     let ckpts: Vec<usize> = m.prefill_checkpoints.iter().map(|(p, _)| *p).collect();
     let start = if no_snapshot {
         d::SessionStart::Cold

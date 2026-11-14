@@ -4553,25 +4553,16 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // Dedicated WMMA sources exist for BOTH gfx11
     // (gfx1100/1101/1102/1150/1151, wave32 WMMA) and gfx12 (gfx1200/1201) —
     // parity-proven on gfx1100/gfx1151 at rel-RMS 2.5e-4–4.0e-4 across
-    // residual/qkv/qkvza/gate_up K=256/512 N=16/64. Admit on HasWmma
-    // (gfx1100/1101/1102/1150/1151 + gfx1200/1201) but gate the gfx11 half
-    // behind HIPFIRE_MQV2_GFX11_WMMA != "0" — setting
-    // HIPFIRE_MQV2_GFX11_WMMA=0 restores the per-token fallback ONLY on
-    // gfx11, leaving gfx12 untouched. Delegates to the shared
+    // residual/qkv/qkvza/gate_up K=256/512 N=16/64. Admitted on HasWmma
+    // (gfx1100/1101/1102/1150/1151 + gfx1200/1201) through the shared
     // `hipfire_runtime::llama::mqv2_wmma_batchable` rule (shared home for
-    // the dtype/arch/kill-switch set). NOTE: `llama::is_batchable_la` does
+    // the dtype/arch set). NOTE: `llama::is_batchable_la` does
     // NOT delegate to it — the llama chunk path has no V2 arms, so llama
     // refuses V2 everywhere; only this qwen35 caller admits V2. Lockstep with
     // the HasWmma predicate on GemmMq*G256V2* keys and with
     // gemm_mq*g256v2's has_wmma() guard.
     // MQ4CG256 (qt45) remains gfx12-only until its gfx11 sibling lands.
-    let mqv2_with_wmma = llama::mqv2_wmma_batchable(
-        dt,
-        hipfire_config::developer_var("HIPFIRE_MQV2_GFX11_WMMA")
-            .ok()
-            .as_deref(),
-        arch,
-    );
+    let mqv2_with_wmma = llama::mqv2_wmma_batchable(dt, arch);
     let mq_other_gfx12 = matches!(dt, DType::MQ4CG256) && matches!(arch, "gfx1200" | "gfx1201");
 
     // BF16 calibration teacher (qt=16) — native BF16 GEMM on gfx942 (CDNA3
@@ -8719,57 +8710,6 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_is_batchable_la_mq4_v2_env_escape() {
-        // HIPFIRE_MQV2_GFX11_WMMA=0 restores fallback ONLY on gfx11; gfx12
-        // remains admitted. Use the shared helper directly to avoid global env
-        // mutation flakiness in parallel tests — is_batchable_la delegates
-        // to `llama::mqv2_wmma_batchable`, which calls this helper verbatim.
-        for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"] {
-            assert!(
-                !llama::mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
-                "env=0 should disable {arch}"
-            );
-            assert!(
-                llama::mqv2_gfx11_wmma_enabled_from_env(None, arch),
-                "unset should enable {arch}"
-            );
-            assert!(
-                llama::mqv2_gfx11_wmma_enabled_from_env(Some("1"), arch),
-                "env=1 should enable {arch}"
-            );
-        }
-        for arch in ["gfx1200", "gfx1201"] {
-            assert!(
-                llama::mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
-                "gfx12 unaffected by env=0 on {arch}"
-            );
-            assert!(
-                llama::mqv2_gfx11_wmma_enabled_from_env(None, arch),
-                "gfx12 enabled without env on {arch}"
-            );
-        }
-        for arch in ["gfx1010", "gfx942", "gfx1030", "gfx1103", "gfx1152"] {
-            assert!(
-                !llama::mqv2_gfx11_wmma_enabled_from_env(None, arch),
-                "non-WMMA {arch} must never admit"
-            );
-            assert!(
-                !llama::mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
-                "non-WMMA {arch} with env=0"
-            );
-            assert!(
-                !llama::mqv2_gfx11_wmma_enabled_from_env(Some("1"), arch),
-                "non-WMMA {arch} with env=1"
-            );
-        }
-        // Prove gfx12 unchanged via is_batchable_la even with env=0 — the
-        // helper above shows helper-level, but also confirm the public gate:
-        // We cannot set env globally here without serializing tests, but
-        // helper's gfx12=true with env=0 proves the delegate will keep gfx12
-        // true when is_batchable_la reads HIPFIRE_MQV2_GFX11_WMMA=0.
-    }
-
-    #[test]
     fn qwen35_is_batchable_la_v2_family_gfx11_and_gfx12() {
         for arch in [
             "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
@@ -8840,10 +8780,8 @@ mod tests {
                 );
             }
         }
-        // V2 divergence: qwen35 admits on gfx11/gfx12 (kill-switch at its
-        // default ON here — both gates read `HIPFIRE_MQV2_GFX11_WMMA`
-        // identically, so with the var unset gfx11 admits), refuses
-        // pre-WMMA; llama refuses on all 5 arches.
+        // V2 divergence: qwen35 admits on gfx11/gfx12, refuses pre-WMMA;
+        // llama refuses on all 5 arches.
         let v2 = [
             DType::MQ4G256V2,
             DType::MQ6G256V2,
@@ -9738,10 +9676,7 @@ mod tests {
         ));
     }
 
-    /// The codebook admit is arch-gated (WMMA only) and hard-gated on Path 2
-    /// being enabled — Path 0/1 have no MQ2/MQ3-Lloyd indexed-GEMV arm, so
-    /// admitting with `HIPFIRE_MOE_GROUPED_GEMM=0` would turn a working slow
-    /// prefill into an `UnsupportedVariant` hard error.
+    /// The codebook admit is opt-in on every arch (default off).
     #[test]
     fn codebook_batched_admit_arch_and_flag_gates() {
         for arch in [
@@ -9751,45 +9686,26 @@ mod tests {
             // DEFAULT OFF until the grouped-WMMA codebook kernels have run on
             // hardware — they had never executed when this landed.
             assert!(
-                !codebook_batched_admit_enabled_from_env(None, None, arch),
+                !codebook_batched_admit_enabled_from_env(None, arch),
                 "{arch} must NOT default-admit: the grouped-WMMA codebook \
                  kernels are unvalidated (opt in with HIPFIRE_MOE_CODEBOOK_BATCHED=1)"
             );
             // Opt-in works on every WMMA arch.
             assert!(
-                codebook_batched_admit_enabled_from_env(Some("1"), None, arch),
+                codebook_batched_admit_enabled_from_env(Some("1"), arch),
                 "{arch} should admit under an explicit opt-in"
             );
-            // Path 2 disabled => never admit, whatever the codebook var says.
-            assert!(!codebook_batched_admit_enabled_from_env(
-                None,
-                Some("0"),
-                arch
-            ));
-            assert!(!codebook_batched_admit_enabled_from_env(
-                Some("1"),
-                Some("off"),
-                arch
-            ));
             // Explicit opt-out.
-            assert!(!codebook_batched_admit_enabled_from_env(
-                Some("0"),
-                None,
-                arch
-            ));
+            assert!(!codebook_batched_admit_enabled_from_env(Some("0"), arch));
         }
         // Non-WMMA archs have no grouped-WMMA sister kernel at all.
         for arch in ["gfx1010", "gfx1030", "gfx906", "gfx942"] {
             assert!(
-                !codebook_batched_admit_enabled_from_env(None, None, arch),
+                !codebook_batched_admit_enabled_from_env(None, arch),
                 "{arch} has no grouped-WMMA kernel — must not default-admit"
             );
             // ...but an explicit =1 is still honored for research / bring-up.
-            assert!(codebook_batched_admit_enabled_from_env(
-                Some("1"),
-                None,
-                arch
-            ));
+            assert!(codebook_batched_admit_enabled_from_env(Some("1"), arch));
         }
     }
 
@@ -11282,11 +11198,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{name}: {tensor}: {e:?}"))
         };
         // `load_moe_ffn` arms the AWQ pointer table only when every expert has a
-        // down sidecar and `HIPFIRE_MOE_AWQ` is not "0".
-        let moe_awq_enabled = hipfire_config::developer_var("HIPFIRE_MOE_AWQ")
-            .ok()
-            .as_deref()
-            != Some("0");
+        // down sidecar.
         let mut layers = Vec::with_capacity(config.n_layers);
         let mut batch_pbs_eligible = true;
         let mut moe_has_mq6 = false;
@@ -11326,11 +11238,10 @@ mod tests {
                 .iter()
                 .map(|e| e.resources().down().dtype())
                 .collect();
-            let awq_all = moe_awq_enabled
-                && table
-                    .experts()
-                    .iter()
-                    .all(|e| !e.resources().down().sidecars().is_empty());
+            let awq_all = table
+                .experts()
+                .iter()
+                .all(|e| !e.resources().down().sidecars().is_empty());
             let gu_uniform = gate_up.iter().all(|d| *d == gate_up[0]);
             let down_uniform = down.iter().all(|d| *d == down[0]);
             let dtypes = hipfire_dispatch::families::moe::MoePrefillDtypes {

@@ -7,8 +7,8 @@
 //! as the chain it replaces: `deinterleave_f32`, Q/K `rmsnorm_batched`, then
 //! `rope_partial_interleaved_f32` (the half-split partial RoPE). Qwen3.5
 //! decode runs the fusion where its gate admits the shape and the chain
-//! where it does not (the diagnostic tap, VL mrope,
-//! `HIPFIRE_QWEN35_FA_PREP_FUSE=0`), so any difference makes the same model's
+//! where it does not (the diagnostic tap, VL mrope), so any difference
+//! makes the same model's
 //! decode depend on that gate. On gfx1100 it did: left to the compiler, the
 //! fused RoPE second output was `fma(x1, cos, x0 * sin)` where the chain
 //! computes `fma(x0, sin, x1 * cos)`.
