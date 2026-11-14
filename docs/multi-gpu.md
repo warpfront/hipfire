@@ -2484,6 +2484,8 @@ which carries `output_norm + lm_head`). `total` is the sum across both cards.
 Notes:
 - `qwen3.5:27b mq4` rows use `qwen3.6:27b mq4` as a measurement proxy (same
   `n_layers=64`, `dim=5120`, `head_dim=256`, `n_kv_heads=4` — VRAM-equivalent).
+  `qwen3.6:27b` is retired in 0.5.0 (replacement `qwen3.8:27b`); an existing
+  verified install still loads, so the proxy rows stay valid.
   When `qwen3.5:27b mq4` lands as a downloadable artifact the rows can be
   re-measured directly.
 - `qwen3.6:35b-a3b mq4` is the current-generation A3B; `qwen3.5:35b-a3b mq4`

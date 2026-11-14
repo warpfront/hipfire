@@ -41,7 +41,7 @@ Optional. Name registry artifacts and the claim they should prove. When hw-gate 
 ```json
 {
   "routes": [
-    {"mode": "battery", "tag": "qwen3.6:27b"},
+    {"mode": "battery", "tag": "qwen3.8:27b"},
     {"mode": "chain",   "tag": "ornith-1.5:35b-a3b-mq4r"}
   ],
   "claim": "loads the Qwen3.5-family text artifacts; no regression on the load path"

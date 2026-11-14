@@ -33,9 +33,9 @@ Identity columns come straight from the registry (HF LFS sha256/size). Repo pref
 | 11 | draft | qwen3.5-27b/qwen35-27b-dflash-mq4.hfq | 919,401,472 | `3d428b97c1911a9ad815cc52fbee080306852c1dafad6b1b17bb70bd68010301` | `qwen3.5:27b-draft` |
 | 12 | core | qwen3.5-35b-a3b/qwen3.5-35b-a3b.mq4 | 19,663,624,448 | `953c570cb242857c4de4d6118d5d532a06c3d8fd218e5b4d4b0835161189081e` | `qwen3.5:35b-a3b` |
 | 13 | core | qwen3.6-27b/qwen3.6-27b.mq3 | 11,776,322,560 | `6b650a7d6cb4e2447dd67da7a87cb5e57956e98eff676a498a7586e3b3cc9298` | `qwen3.6:27b-mq3` |
-| 14 | core | qwen3.6-27b/qwen3.6-27b.mq4 | 14,984,158,208 | `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc` | `qwen3.6:27b` |
+| 14 | core | qwen3.6-27b/qwen3.6-27b.mq4 | 14,984,158,208 | `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc` | `qwen3.6:27b` (retired in 0.5.0, replacement `qwen3.8:27b`; existing verified installs still load) |
 | 15 | draft | qwen3.6-27b/qwen36-27b-dflash-mq3.hfq | 703,132,672 | `f5fc4bef4c15229f940f8ead6c04723b04308321c4a9584c3318d364cadf1728` | `qwen3.6:27b-draft-mq3` |
-| 16 | draft | qwen3.6-27b/qwen36-27b-dflash-mq4.hfq | 919,401,472 | `bd8c4f07ae80fe1385bf2606af9a7ba0daa18ca8daec50916f2a489054c44e70` | `qwen3.6:27b-draft` |
+| 16 | draft | qwen3.6-27b/qwen36-27b-dflash-mq4.hfq | 919,401,472 | `bd8c4f07ae80fe1385bf2606af9a7ba0daa18ca8daec50916f2a489054c44e70` | `qwen3.6:27b-draft` (retired in 0.5.0, replacement `qwen3.8:27b-draft-mq4`) |
 | 17 | core | qwen3.6-35b-a3b/qwen3.6-35b-a3b.mfp4 | 20,181,686,528 | `6bdade4e5602dccb012fce2dfddd7a27d169f08fd47c5c243d1cb06878fdc48a` | `qwen3.6:35b-a3b-mfp4` |
 | 18 | core | qwen3.6-35b-a3b/qwen3.6-35b-a3b.mq2 | 11,610,560,768 | `48b3f84614c46eb8b5ffb494f7a75c15216664afcbb47c3e78dd80c4ce7eb0a3` | `qwen3.6:35b-a3b-mq2` |
 | 19 | core | qwen3.6-35b-a3b/qwen3.6-35b-a3b.mq3p | 17,241,413,888 | `4ef8b5c5fcc37082e0b3c7496fcb980bb1dcabd21487bd7c8be16ac60e731953` | `qwen3.6:35b-a3b-mq3p` |

@@ -16,7 +16,7 @@ routes, not as a promise.
 | 2–4 GB | `qwen3.5:0.8b` | 0.55 GB | defaults (`speculation=auto`, `dflash_mode=off`) | 391 tok/s on 7900 XTX [A]; 250 RX 6800 XT, 190 RX 5700 XT, 231 MI50 [C] |
 | 4–6 GB | `qwen3.5:4b` | 2.59 GB | defaults | 180 tok/s on 7900 XTX [A]; 61 RX 5700 XT, 61 MI50 [C] |
 | 8–12 GB | `qwen3.5:9b` | 5.31 GB | defaults; for code, `dflash_mode auto` with `qwen3.5:9b-draft` | AR 132 tok/s on 7900 XTX [A]; 65 RX 6800 XT, 59 MI50 [C]. DFlash on code: 329–373 tok/s vs 122–124 AR; on prose it lost (98–99 vs 123–125) [B] |
-| 16–24 GB | `qwen3.5:27b` (or `qwen3.6:27b`) | 15.0 GB | defaults; for code, `dflash_mode auto` with `qwen3.5:27b-draft` / `qwen3.6:27b-draft` | AR 47 tok/s on 7900 XTX [A]; 22 RX 6800 XT, 21 MI50 [C]. DFlash on code: 196.0 (3.5) / 185.5 (3.6) tok/s vs ≈44 AR; prose/instruct ≈1.0–1.1× [B]. The current 27B flagship is `qwen3.8:27b-mq4-xts`; see [Measured on v0.4.4](#measured-on-v044) |
+| 16–24 GB | `qwen3.5:27b` | 15.0 GB | defaults; for code, `dflash_mode auto` with `qwen3.5:27b-draft` | AR 47 tok/s on 7900 XTX [A]; 22 RX 6800 XT, 21 MI50 [C]. DFlash on code: 196.0 (3.5) / 185.5 (the retired 3.6) tok/s vs ≈44 AR; prose/instruct ≈1.0–1.1× [B]. The current 27B flagship is `qwen3.8:27b-mq4-xts`; see [Measured on v0.4.4](#measured-on-v044) |
 
 `min_vram_gb` in the registry: 0.8B 2, 4B 4.1, 9B 6.8, 27B (Qwen 3.5 / 3.6 MQ4) 16.
 A 27B MQ4 trunk does not fit on 8 GB cards (OOM on RX 5700 XT and BC-250 in
@@ -92,7 +92,7 @@ separate surface: [IMAGEGEN.md](IMAGEGEN.md).
   ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)).
 - **DFlash** elsewhere is opt-in: `hipfire config <tag> set dflash_mode auto`.
   `hipfire pull <tag>` already fetches a draft the registry declares for that
-  tag (for example `qwen3.5:9b`, `qwen3.5:27b`, `qwen3.6:27b`), and the
+  tag (for example `qwen3.5:9b`, `qwen3.5:27b`, `qwen3.8:27b`), and the
   separate `-draft` tags are listed in [MODELS.md](MODELS.md). It helped code
   prompts and hurt prose in fixture [B]; measure your own workload before
   leaving it on.

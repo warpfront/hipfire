@@ -54,11 +54,11 @@ SCHEMA_VERSION = 1
 # (wrong file / re-quantized upload) — fail so a human reconciles it.
 SIZE_TOLERANCE = 0.25
 # Flash-Next MQ4 XTS is published as ONE split base (`<name>-base.mq4-xts`) on
-# the family's shared PLE pair, under four stock tags. The monolithic spellings
-# below are removed from HF: no entry may download them. A verified local
-# monolithic keeps serving the split tags through a pin compiled into the
-# client (hipfire-registry GRANDFATHERED_MONOLITHICS), so these names survive
-# here only to be banned.
+# the family's shared PLE pair, under one model tag; the other stock spellings
+# are aliases of it. The monolithic spellings below are removed from HF: no
+# entry may download them. A verified local monolithic keeps serving the split
+# tag through a pin compiled into the client (hipfire-registry
+# GRANDFATHERED_MONOLITHICS), so these names survive here only to be banned.
 FLASH_NEXT_XTS_REPO = "hipfire-models/qwen3.8-flash-next"
 FLASH_NEXT_XTS_LEGACY_FILE = "qwen3.8-flash-next-gptq3.mq4"
 FLASH_NEXT_XTS_CANONICAL_FILE = "qwen3.8-flash-next.mq4-xts"
@@ -71,8 +71,9 @@ FLASH_NEXT_XTS_SPLIT_BASE_SHA256 = (
     "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45"
 )
 FLASH_NEXT_XTS_SPLIT_BASE_SIZE = 70888270360
-FLASH_NEXT_XTS_TAGS = (
-    "qwen3.8:flash-next",
+FLASH_NEXT_XTS_TAG = "qwen3.8:flash-next"
+FLASH_NEXT_XTS_ALIAS_TAGS = (
+    "qwen3.8:flash",
     "qwen3.8:flash-next-mq4",
     "qwen3.8:flash-next-gptq3",
     "qwen3.8:flash-next-mq4-xts",
@@ -444,9 +445,9 @@ def is_strict_superset(old: object, new: object, path: str, errors: list[str]) -
         errors.append(f"superset violation at {path}: {old!r} != {new!r}")
 
 
-def validate_flash_next_xts(models: dict, errors: list[str]) -> None:
-    """The four stock MQ4 tags are one split base on the shared PLE pair."""
-    if not any(tag in models for tag in FLASH_NEXT_XTS_TAGS) and not any(
+def validate_flash_next_xts(models: dict, aliases: dict, errors: list[str]) -> None:
+    """One split-base tag on the shared PLE pair; the other stock tags alias it."""
+    if FLASH_NEXT_XTS_TAG not in models and not any(
         entry.get("repo") == FLASH_NEXT_XTS_REPO for entry in models.values()
     ):
         # build_registry also serves small, unrelated fixture/custom catalogs.
@@ -465,13 +466,11 @@ def validate_flash_next_xts(models: dict, errors: list[str]) -> None:
         "arch_id": 16,
         "quant": "mq4",
     }
-    present: list[tuple[str, dict]] = []
-    for tag in FLASH_NEXT_XTS_TAGS:
-        entry = models.get(tag)
-        if entry is None:
-            errors.append(f"{tag}: required Flash-Next MQ4 XTS tag is missing")
-            continue
-        present.append((tag, entry))
+    entry = models.get(FLASH_NEXT_XTS_TAG)
+    tag = FLASH_NEXT_XTS_TAG
+    if entry is None:
+        errors.append(f"{tag}: required Flash-Next MQ4 XTS tag is missing")
+    else:
         for key, value in expected.items():
             if entry.get(key) != value:
                 errors.append(f"{tag}: XTS invariant {key} must be {value!r}")
@@ -485,12 +484,12 @@ def validate_flash_next_xts(models: dict, errors: list[str]) -> None:
             if not isinstance(sidecar, dict) or sidecar.get("file") != file:
                 errors.append(f"{tag}: ple.{key} must be the shared {file!r}")
 
-    # One artifact under four names: identity, settings and sidecars never differ.
-    if present:
-        first_tag, first = present[0]
-        for tag, entry in present[1:]:
-            if entry != first:
-                errors.append(f"{tag}: XTS metadata differs from {first_tag}")
+    # One artifact under several names: the other spellings are aliases, never rows.
+    for alias in FLASH_NEXT_XTS_ALIAS_TAGS:
+        if alias in models:
+            errors.append(f"{alias}: duplicate of {tag}; make it an alias, not a model row")
+        elif aliases.get(alias) != tag:
+            errors.append(f"{alias} must alias {tag} (MQ4 XTS)")
 
 
 def split_base_stem(file: str) -> str | None:
@@ -586,8 +585,6 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
 
     # One tree fetch per unique repo.
     repos = sorted({e["repo"] for e in models.values() if e.get("repo")})
-    if FLASH_NEXT_XTS_REPO in repos and aliases.get("qwen3.8:flash") != "qwen3.8:flash-next":
-        errors.append("qwen3.8:flash must alias qwen3.8:flash-next (MQ4 XTS)")
     # Image-component (diffusion) repos publish AFTER their packs exist, so a
     # missing repo is expected until the first upload: sizes/digests stay TBD
     # on those entries. Fail-closed stays for text-model repos, where a probe
@@ -740,7 +737,7 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
     # Strict-superset guarantee — the whole point of v1 back-compat.
     is_strict_superset(curated.get("models", {}), registry["models"], "models", errors)
     is_strict_superset(curated.get("aliases", {}), registry["aliases"], "aliases", errors)
-    validate_flash_next_xts(out_models, errors)
+    validate_flash_next_xts(out_models, aliases, errors)
     validate_shared_ple_pins(out_models, errors)
 
     if errors:

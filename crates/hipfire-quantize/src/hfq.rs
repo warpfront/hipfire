@@ -929,8 +929,8 @@ mod maple_dtype_tests {
             assert_eq!(qt as u8, id);
             assert_eq!(QuantType::from_u8(id), Some(qt));
         }
-        // Neighbours are unassigned: 130 is the compact-Hessian record id
-        // (not a QuantType) and 135 is unallocated.
+        // Neighbours have no QuantType: 130 is the compact-Hessian record id and
+        // 135 is E8P-I4, whose (135,136) expert pair the qwen4 crate owns.
         assert_eq!(QuantType::from_u8(130), None);
         assert_eq!(QuantType::from_u8(135), None);
     }

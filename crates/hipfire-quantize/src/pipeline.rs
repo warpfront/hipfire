@@ -2335,10 +2335,12 @@ pub(crate) fn run() {
         );
         std::process::exit(1);
     }
-    // MQ2-Lloyd: rescues uniform MQ2 by 41–55× (per benchmarks/results/
-    // lloyd_max_findings_20260501.md) but still text-collapse — 9B ppl=2,163
-    // vs 9B MQ4 ppl=10. Research-only: same opt-in gate so users don't
-    // accidentally ship a 2-bpw model that won't produce coherent output.
+    // MQ3-Lloyd (qt=20) and MQ2-Lloyd (qt=19) both ship in the registry (dense
+    // qwen3.5 2b/4b/9b mq3; MQ2-Lloyd routed experts behind an MQ4 trunk in
+    // qwen3.6 mq2/mq3p/mq4p, MiniMax and DeepSeek V4 Flash). Both stay opt-in:
+    // whole-model dense MQ2-Lloyd still collapses (9B ppl=2,163 vs MQ4 ppl=10,
+    // benchmarks/results/lloyd_max_findings_20260501.md), and every artifact
+    // needs a PPL check against its own baseline before it is published.
     let allow_mq3_lloyd = args.allow_mq3_lloyd
         || hipfire_config::developer_var("HIPFIRE_ALLOW_MQ3_LLOYD")
             .ok()
@@ -2346,12 +2348,10 @@ pub(crate) fn run() {
             == Some("1");
     if use_mq3g256_lloyd && !allow_mq3_lloyd {
         eprintln!(
-            "note: --format mq3-lloyd is research — Lloyd-Max 8-entry codebook +\n\
-             3-bit indices (112 B/group, +7.7% over uniform MQ3). Hypothesis is\n\
-             non-uniform codebook lifts sub-9B MQ3 out of collapse (#114) and\n\
-             tightens 9B MQ3's 4× ppl gap vs MQ4. Ppl evidence pending — DO NOT\n\
-             ship MQ3-Lloyd artifacts to users until quality is validated against\n\
-             baseline MQ3/MQ4 ppl.\n\
+            "note: --format mq3-lloyd (qt=20: Lloyd-Max 8-entry codebook + 3-bit indices,\n\
+             112 B/group, +7.7% over uniform MQ3) is opt-in. It ships in the registry\n\
+             (qwen3.5 2b/4b/9b mq3, MQ3-Lloyd expert tiers), but validate PPL against the\n\
+             target model's MQ3/MQ4 baselines before publishing an artifact.\n\
              \n\
              To proceed, pass --allow-mq3-lloyd or set HIPFIRE_ALLOW_MQ3_LLOYD=1."
         );
@@ -2379,14 +2379,13 @@ pub(crate) fn run() {
         && !allow_mq2_lloyd
     {
         eprintln!(
-            "error: --format mq2-lloyd is research-only — Lloyd-Max codebook lifts\n\
-             uniform MQ2 by 41–55× ppl but absolute quality is still collapse\n\
-             (9B Qwen 3.5 wikitext2-test ppl=2,163 vs MQ4=10, MQ3=42; 0.8B ppl=19,651).\n\
-             2 bpw is fundamentally too aggressive for usable text; the format\n\
-             is plumbed for follow-on Lloyd-Max MQ3 (qt=20) experiments only.\n\
+            "error: MQ2-Lloyd (qt=19) formats are opt-in. Whole-model dense MQ2-Lloyd still\n\
+             collapses (9B Qwen 3.5 wikitext2-test ppl=2,163 vs MQ4=10, MQ3=42; 0.8B\n\
+             ppl=19,651), but MQ2-Lloyd routed experts behind an MQ4 trunk ship in the\n\
+             registry (qwen3.6:35b-a3b-mq2, MiniMax, DeepSeek V4 Flash). Use it for MoE\n\
+             expert tiers and validate PPL against the MQ4 baseline before publishing.\n\
              \n\
-             To opt in for research anyway, pass --allow-mq2-lloyd or set\n\
-             HIPFIRE_ALLOW_MQ2_LLOYD=1. Don't ship MQ2-Lloyd artifacts to users."
+             To opt in, pass --allow-mq2-lloyd or set HIPFIRE_ALLOW_MQ2_LLOYD=1."
         );
         std::process::exit(1);
     }

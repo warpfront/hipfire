@@ -13860,7 +13860,7 @@ effort = "high"
                 "qwen3.8:27boops":{{"repo":"x","file":"qwen3.8-27boops.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
                 "qwen3.8:flash-next":{{"repo":"x","file":"qwen3.8-flash-next.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":16,{dflash}}},
                 "qwen3.8:27b-draft-mq4":{{"repo":"x","file":"qwen38-27b-draft.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
-                "qwen3.6:27b":{{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3.6:27b-mq3":{{"repo":"x","file":"qwen3.6-27b.mq3","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
                 "qwen3.5:9b":{{"repo":"x","file":"qwen3.5-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
                 "raon-1-mini-preview":{{"repo":"x","file":"raon-1-mini-preview.mq4-xts","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":19,"dflash":{{"file":"raon-1-mini-preview-dflash2.mq4"}}}},
                 "raon-1-mini-preview:draft":{{"repo":"x","file":"raon-1-mini-preview-dflash2.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20}}
@@ -13890,7 +13890,7 @@ effort = "high"
             ("qwen3.8:27b-draft-mq4", "off"),
             ("raon-1-mini-preview", "auto"),
             ("raon-1-mini-preview:draft", "off"),
-            ("qwen3.6:27b", "off"),
+            ("qwen3.6:27b-mq3", "off"),
             ("qwen3.5:9b", "off"),
         ] {
             let (tag, entry) = registry.model(input).unwrap();
@@ -13962,7 +13962,7 @@ effort = "high"
             "qwen3.8:27boops",
             "qwen3.8:flash-next",
             "qwen3.8:27b-draft-mq4",
-            "qwen3.6:27b",
+            "qwen3.6:27b-mq3",
             "qwen3.5:9b",
         ] {
             let (tag, entry) = registry.model(input).unwrap();
@@ -24815,6 +24815,8 @@ effort = "high"
 
     #[test]
     fn retired_tags_refuse_pull_with_one_line_even_forced_before_any_work() {
+        // Other tests swap fixture pins in process-wide; hold the real table.
+        let _pins = RetiredOverride::set(RETIRED_MODELS);
         let paths = test_paths("retired-pull");
         DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
         for pin in RETIRED_MODELS {
@@ -24825,9 +24827,10 @@ effort = "high"
                     let error = pull_command(&paths, args).unwrap_err();
                     assert_eq!(error.to_string(), pin.refusal(), "{model} force={force}");
                     assert!(!error.to_string().contains('\n'));
-                    assert!(error.to_string().contains(
-                        "retired; the file still runs if you have it; replacement qwen3.8:flash-next"
-                    ));
+                    assert!(error.to_string().contains(&format!(
+                        "retired; the file still runs if you have it; replacement {}",
+                        pin.replacement
+                    )));
                 }
             }
         }
@@ -25005,6 +25008,78 @@ effort = "high"
             resolve_model_path(&paths, &registry, pin.tag).unwrap(),
             Some(lookalike)
         );
+        assert_eq!(download_count(), 0);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn retired_qwen36_27b_refuses_pull_naming_qwen38_27b_and_a_verified_install_still_loads() {
+        const BYTES: &[u8] = b"retired qwen3.6-27b fixture bytes";
+        static SHA: std::sync::LazyLock<String> =
+            std::sync::LazyLock::new(|| format!("{:x}", Sha256::digest(BYTES)));
+        let sha: &'static str = SHA.as_str();
+        let dense = RETIRED_MODELS
+            .iter()
+            .find(|pin| pin.tag == "qwen3.6:27b")
+            .copied()
+            .unwrap();
+        assert_eq!(dense.replacement, "qwen3.8:27b");
+        let draft = RETIRED_MODELS
+            .iter()
+            .find(|pin| pin.tag == "qwen3.6:27b-draft")
+            .unwrap();
+        assert_eq!(draft.file, "qwen36-27b-dflash-mq4.hfq");
+        let registry = hipfire_registry::bundled().unwrap();
+        for pin in [&dense, draft] {
+            assert!(registry.model(pin.tag).is_none(), "{}", pin.tag);
+            assert!(registry.entry_for_file(pin.file).is_none(), "{}", pin.file);
+        }
+        // The A3B MoE and the dense MQ3 rows are not retired.
+        assert!(registry.model("qwen3.6:35b-a3b").is_some());
+        assert!(registry.model("qwen3.6:27b-mq3").is_some());
+
+        // Hold the retired-table lock for the whole test: other tests swap in
+        // fixture pins process-wide. The fixture keeps the real tag, file and
+        // replacement; only the digest is shrunk to the fixture bytes.
+        let pin = RetiredModel {
+            sha256: sha,
+            size_bytes: BYTES.len() as u64,
+            ..dense
+        };
+        let _pins = RetiredOverride::set(&[pin]);
+        let paths = test_paths("retired-qwen36-27b");
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        for model in [dense.tag, dense.file] {
+            let error = pull_command(&paths, PullArgs::defaults(model)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "qwen3.6:27b is retired; the file still runs if you have it; replacement qwen3.8:27b"
+            );
+        }
+        assert_eq!(download_count(), 0);
+
+        fs::create_dir_all(&paths.models).unwrap();
+        let installed = paths.models.join(pin.file);
+        fs::write(&installed, BYTES).unwrap();
+        for input in [
+            pin.tag.to_owned(),
+            pin.file.to_owned(),
+            installed.display().to_string(),
+        ] {
+            assert_eq!(
+                resolve_model_path(&paths, &registry, &input).unwrap(),
+                Some(installed.clone()),
+                "{input}"
+            );
+            let card = model_card(&paths, &registry, &input);
+            assert_eq!(card.retired().map(|retired| retired.tag), Some(pin.tag));
+            let entry = card.entry().unwrap();
+            assert_eq!(entry.arch_id, Some(5));
+            assert_eq!(entry.default_kv_mode.as_deref(), Some("q8"));
+        }
+        // Wrong bytes are refused, never re-downloaded.
+        fs::write(&installed, b"not the pinned bytes").unwrap();
+        assert!(resolve_model_path(&paths, &registry, pin.tag).is_err());
         assert_eq!(download_count(), 0);
         fs::remove_dir_all(&paths.root).unwrap();
     }

@@ -95,9 +95,10 @@ def test_committed_v1_is_reproducible_from_models_json(monkeypatch):
 
 
 def test_flash_next_xts_wire_contract():
-    models = _load(REPO_ROOT / "registry" / "v1.json")["models"]
+    v1 = _load(REPO_ROOT / "registry" / "v1.json")
+    models = v1["models"]
     errors = []
-    rg.validate_flash_next_xts(models, errors)
+    rg.validate_flash_next_xts(models, v1["aliases"], errors)
     assert not errors, "\n".join(errors)
     for file in (
         rg.FLASH_NEXT_XTS_SPLIT_BASE_FILE,
@@ -112,18 +113,32 @@ def test_flash_next_xts_wire_contract():
     # The retired rungs are gone from the published registry too; the client
     # keeps compiled pins for a verified local copy (hipfire-registry RETIRED_MODELS).
     curated = _load(REPO_ROOT / "registry" / "models.json")["models"]
-    for tag in ("qwen3.8:flash-next-rtn-asym", "qwen3.8:flash-next-mq6q8-pleq8"):
+    for tag in (
+        "qwen3.8:flash-next-rtn-asym",
+        "qwen3.8:flash-next-mq6q8-pleq8",
+        "qwen3.6:27b",
+        "qwen3.6:27b-draft",
+    ):
         assert tag not in models and tag not in curated
-    for retired_file in ("qwen3.8-flash-next.mq4", "qwen3.8-flash-next.mq6q8-pleq8"):
+    for retired_file in (
+        "qwen3.8-flash-next.mq4",
+        "qwen3.8-flash-next.mq6q8-pleq8",
+        "qwen3.6-27b.mq4",
+        "qwen36-27b-dflash-mq4.hfq",
+    ):
         assert not any(entry.get("file") == retired_file for entry in models.values())
+        assert not any(
+            isinstance(entry.get("dflash"), dict) and entry["dflash"].get("file") == retired_file
+            for entry in models.values()
+        )
     # The obsolete local-only ZAB tier is removed outright (no retired pin either).
     assert "qwen3.8:flash-next-mq4-xts-zab" not in models
     assert "qwen3.8:flash-next-mq4-xts-zab" not in curated
     assert not any(
         entry.get("file") == "qwen3.8-flash-next.mq4-xts-zab" for entry in models.values()
     )
-    v1 = _load(REPO_ROOT / "registry" / "v1.json")
-    assert v1["aliases"]["qwen3.8:flash"] == "qwen3.8:flash-next"
+    for alias in rg.FLASH_NEXT_XTS_ALIAS_TAGS:
+        assert alias not in models and v1["aliases"][alias] == "qwen3.8:flash-next"
     assert models["qwen3.8:flash-next"]["desc"].startswith("Qwen3.8-Flash-Next MQ4 XTS")
     assert all("GPTQ3" not in entry["desc"] for entry in models.values())
 
@@ -139,7 +154,7 @@ def test_flash_next_mq2_xts_split_base_quant_and_arch():
     assert rg.quant_for("x.mq2-xts-abc") is None
 
 
-@pytest.mark.parametrize("target", [None, "qwen3.8:flash-next-mq4"])
+@pytest.mark.parametrize("target", [None, "qwen3.8:flash-next-mq4-xts-symtrunk"])
 def test_flash_next_short_alias_invariant_rejects_drift(monkeypatch, target):
     v1 = _load(REPO_ROOT / "registry" / "v1.json")
     curated = _load(REPO_ROOT / "registry" / "models.json")

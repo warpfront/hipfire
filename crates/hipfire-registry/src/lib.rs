@@ -717,6 +717,10 @@ pub struct RetiredModel {
     pub desc: &'static str,
     pub arch_id: u32,
     pub quant: &'static str,
+    /// The published card's `default_kv_mode`, if it had one.
+    pub default_kv_mode: Option<&'static str>,
+    /// The published card's `recommended_settings.min_p`, if it had one.
+    pub min_p: Option<f64>,
     /// Tag a user moves to.
     pub replacement: &'static str,
 }
@@ -737,8 +741,10 @@ impl RetiredModel {
                 temperature: Some(1.0),
                 top_p: Some(0.95),
                 top_k: Some(20),
+                min_p: self.min_p,
                 ..RecommendedSettings::default()
             }),
+            default_kv_mode: self.default_kv_mode.map(str::to_owned),
             sha256: Some(self.sha256.to_owned()),
             size_bytes: Some(self.size_bytes),
             arch_id: Some(self.arch_id),
@@ -785,6 +791,8 @@ pub const RETIRED_MODELS: &[RetiredModel] = &[
                experts, Q8F16 PLE rows embedded. Replaced by qwen3.8:flash-next.",
         arch_id: 16,
         quant: "mq4",
+        default_kv_mode: None,
+        min_p: None,
         replacement: "qwen3.8:flash-next",
     },
     // 2026-09-22 to 2026-09-28: the same rung with a Q8F16 language head.
@@ -801,7 +809,42 @@ pub const RETIRED_MODELS: &[RetiredModel] = &[
                rows embedded. Replaced by qwen3.8:flash-next.",
         arch_id: 16,
         quant: "mq6q8-pleq8",
+        default_kv_mode: None,
+        min_p: None,
         replacement: "qwen3.8:flash-next",
+    },
+    // Retired 2026-11 (0.5.0): the dense Qwen3.6-27B, superseded by Qwen3.8-27B.
+    RetiredModel {
+        tag: "qwen3.6:27b",
+        repo: "hipfire-models/qwen3.6-27b",
+        file: "qwen3.6-27b.mq4",
+        sha256: "86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc",
+        size_bytes: 14_984_158_208,
+        size_gb: 15.0,
+        min_vram_gb: 16.0,
+        desc: "Qwen3.6-27B dense MQ4 (arch 5), retired in 0.5.0. Replaced by qwen3.8:27b.",
+        arch_id: 5,
+        quant: "mq4",
+        default_kv_mode: Some("q8"),
+        min_p: Some(0.0),
+        replacement: "qwen3.8:27b",
+    },
+    // Its DFlash draft, retired with it.
+    RetiredModel {
+        tag: "qwen3.6:27b-draft",
+        repo: "hipfire-models/qwen3.6-27b",
+        file: "qwen36-27b-dflash-mq4.hfq",
+        sha256: "bd8c4f07ae80fe1385bf2606af9a7ba0daa18ca8daec50916f2a489054c44e70",
+        size_bytes: 919_401_472,
+        size_gb: 0.92,
+        min_vram_gb: 16.0,
+        desc: "DFlash draft for the retired qwen3.6:27b (arch 20), retired in 0.5.0. \
+               Replaced by qwen3.8:27b-draft-mq4.",
+        arch_id: 20,
+        quant: "mq4",
+        default_kv_mode: None,
+        min_p: Some(0.0),
+        replacement: "qwen3.8:27b-draft-mq4",
     },
 ];
 
@@ -2230,16 +2273,15 @@ mod tests {
             .map(|(tag, _)| tag.as_str())
             .collect();
         resolved.sort_unstable();
-        let mut expected = FLASH_NEXT_FIXTURE_TAGS.to_vec();
-        expected.sort_unstable();
-        assert_eq!(resolved, expected);
+        // One model row; the other stock spellings are aliases of it.
+        assert_eq!(resolved, ["qwen3.8:flash-next"]);
         for pin in RETIRED_MODELS {
             assert!(pin.entry().trunk_overlay().is_none(), "{}", pin.tag);
         }
         let first = parsed.models["qwen3.8:flash-next"].trunk_overlay().unwrap();
         for tag in FLASH_NEXT_FIXTURE_TAGS {
             assert_eq!(
-                parsed.models[tag].trunk_overlay().as_ref(),
+                parsed.model(tag).unwrap().1.trunk_overlay().as_ref(),
                 Some(&first),
                 "{tag}"
             );
@@ -2628,16 +2670,14 @@ mod tests {
             .map(|(tag, _)| tag.as_str())
             .collect();
         resolved.sort_unstable();
-        let mut expected = FLASH_NEXT_FIXTURE_TAGS.to_vec();
-        expected.sort_unstable();
-        assert_eq!(resolved, expected);
+        assert_eq!(resolved, ["qwen3.8:flash-next"]);
         for pin in RETIRED_MODELS {
             assert!(pin.entry().expert_hotset().is_none(), "{}", pin.tag);
         }
         let first = parsed.models["qwen3.8:flash-next"].expert_hotset().unwrap();
         for tag in FLASH_NEXT_FIXTURE_TAGS {
             assert_eq!(
-                parsed.models[tag].expert_hotset().as_ref(),
+                parsed.model(tag).unwrap().1.expert_hotset().as_ref(),
                 Some(&first),
                 "{tag}"
             );
@@ -3516,13 +3556,15 @@ mod tests {
     }
 
     #[test]
-    fn retired_pins_are_the_dropped_flash_next_artifacts_with_their_original_identity() {
+    fn retired_pins_are_the_dropped_artifacts_with_their_original_identity() {
         let tags: Vec<&str> = RETIRED_MODELS.iter().map(|pin| pin.tag).collect();
         assert_eq!(
             tags,
             [
                 "qwen3.8:flash-next-rtn-asym",
-                "qwen3.8:flash-next-mq6q8-pleq8"
+                "qwen3.8:flash-next-mq6q8-pleq8",
+                "qwen3.6:27b",
+                "qwen3.6:27b-draft"
             ]
         );
         let rtn = &RETIRED_MODELS[0];
@@ -3539,17 +3581,47 @@ mod tests {
             pleq8.sha256,
             "c0628b848077f02afed9ce5a4daa0598c379aa1d1e5ca0c0b24ddd04b49773a9"
         );
+        let dense = &RETIRED_MODELS[2];
+        assert_eq!(dense.file, "qwen3.6-27b.mq4");
+        assert_eq!(dense.size_bytes, 14_984_158_208);
+        assert_eq!(
+            dense.sha256,
+            "86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc"
+        );
+        assert_eq!(dense.entry().default_kv_mode.as_deref(), Some("q8"));
+        let draft = &RETIRED_MODELS[3];
+        assert_eq!(draft.file, "qwen36-27b-dflash-mq4.hfq");
+        assert_eq!(draft.size_bytes, 919_401_472);
+        assert_eq!(
+            draft.sha256,
+            "bd8c4f07ae80fe1385bf2606af9a7ba0daa18ca8daec50916f2a489054c44e70"
+        );
+        for (pin, repo, replacement, arch_id) in [
+            (rtn, FLASH_NEXT_XTS_REPO, "qwen3.8:flash-next", 16),
+            (pleq8, FLASH_NEXT_XTS_REPO, "qwen3.8:flash-next", 16),
+            (dense, "hipfire-models/qwen3.6-27b", "qwen3.8:27b", 5),
+            (
+                draft,
+                "hipfire-models/qwen3.6-27b",
+                "qwen3.8:27b-draft-mq4",
+                20,
+            ),
+        ] {
+            assert_eq!(pin.repo, repo, "{}", pin.tag);
+            assert_eq!(pin.replacement, replacement, "{}", pin.tag);
+            assert_eq!(pin.arch_id, arch_id, "{}", pin.tag);
+        }
         for pin in RETIRED_MODELS {
-            assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO, "{}", pin.tag);
-            assert_eq!(pin.replacement, "qwen3.8:flash-next", "{}", pin.tag);
             let entry = pin.entry();
             assert_eq!(entry.file, pin.file);
             assert_eq!(entry.sha256.as_deref(), Some(pin.sha256));
             assert_eq!(entry.size_bytes, Some(pin.size_bytes));
-            assert_eq!(entry.arch_id, Some(16));
+            assert_eq!(entry.arch_id, Some(pin.arch_id));
             assert!(!entry.has_ple_sidecars());
             assert!(!entry.is_flash_next_xts(), "{}", pin.tag);
             assert!(entry.grandfathered_monolithic().is_none());
+            // A retired card never declares a sidecar to fetch.
+            assert!(entry.dflash.is_none() && entry.mtp.is_none(), "{}", pin.tag);
             // The card lowers to the same sampling defaults it published.
             config_layer_for_tag(pin.tag, &entry).unwrap();
             let settings = entry.recommended_settings.as_ref().unwrap();
@@ -3579,9 +3651,8 @@ mod tests {
             assert_eq!(
                 message,
                 format!(
-                    "{} is retired; the file still runs if you have it; replacement \
-                     qwen3.8:flash-next",
-                    pin.tag
+                    "{} is retired; the file still runs if you have it; replacement {}",
+                    pin.tag, pin.replacement
                 )
             );
         }
@@ -4554,7 +4625,7 @@ mod tests {
         let raw = r#"{
             "schema_version":1,
             "generated_at":"2026-09-10T00:00:00Z",
-            "models":{"qwen3.6:27b":{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "models":{"qwen3.6:27b-mq3":{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
@@ -4565,7 +4636,7 @@ mod tests {
         assert!(registry.model("/elsewhere/qwen3.6-27b.mq4").is_none());
         // The bare file name still resolves: it carries no directory to confuse
         // with the installed artifact.
-        assert_eq!(registry.resolve_tag("qwen3.6-27b.mq4"), "qwen3.6:27b");
+        assert_eq!(registry.resolve_tag("qwen3.6-27b.mq4"), "qwen3.6:27b-mq3");
         assert!(registry.model("qwen3.6-27b.mq4").is_some());
     }
 
@@ -4574,16 +4645,16 @@ mod tests {
         let raw = r#"{
             "schema_version":1,
             "generated_at":"2026-09-10T00:00:00Z",
-            "models":{"qwen3.6:27b":{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
-            "aliases":{"qwen36":"qwen3.6:27b"}
+            "models":{"qwen3.6:27b-mq3":{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{"qwen36":"qwen3.6:27b-mq3"}
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
         let (tag, _) = registry.entry_for_file("qwen3.6-27b.mq4").unwrap();
-        assert_eq!(tag, "qwen3.6:27b");
+        assert_eq!(tag, "qwen3.6:27b-mq3");
         assert!(registry
             .entry_for_file("/elsewhere/qwen3.6-27b.mq4")
             .is_none());
-        assert!(registry.entry_for_file("qwen3.6:27b").is_none());
+        assert!(registry.entry_for_file("qwen3.6:27b-mq3").is_none());
         assert!(registry.entry_for_file("qwen36").is_none());
         assert!(registry.entry_for_file("other.mq4").is_none());
     }
@@ -4872,7 +4943,7 @@ mod tests {
                 "qwen3.8:flash-next":{{"repo":"x","file":"qwen3.8-flash-next.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":16,{dflash}}},
                 "qwen3.8:27b-draft-mq4":{{"repo":"x","file":"qwen38-27b-draft.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
                 "qwen3.8:27b-dflash-mq4":{{"repo":"x","file":"qwen38-27b-dflash.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
-                "qwen3.6:27b":{{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3.6:27b-mq3":{{"repo":"x","file":"qwen3.6-27b.mq3","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
                 "qwen3.5:27b":{{"repo":"x","file":"qwen3.5-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
                 "qwen3:8b":{{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
                 "qwen3.8:9b":{{"repo":"x","file":"qwen3.8-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}}
@@ -4924,7 +4995,7 @@ mod tests {
             "qwen3.8:flash-next",
             "qwen3.8:27b-draft-mq4",
             "qwen3.8:27b-dflash-mq4",
-            "qwen3.6:27b",
+            "qwen3.6:27b-mq3",
             "qwen3.5:27b",
             "qwen3:8b",
             "qwen3.8:9b",

@@ -732,9 +732,10 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
   "reasoning_effort": "low"
 }'
 
-# Qwen3.6 — no native effort: effort is dropped+warned; set an explicit cap if wanted
+# Qwen3.5 — no native effort: effort is dropped+warned; set an explicit cap if wanted
+# (the retired qwen3.6:27b behaved the same and still loads from a verified install)
 curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "qwen3.6:27b",
+  "model": "qwen3.5:27b",
   "messages": [{"role": "user", "content": "hi"}],
   "reasoning_effort": "low",
   "max_think_tokens": 2048

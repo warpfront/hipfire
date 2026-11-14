@@ -310,15 +310,12 @@ Registry-present smoke / historical artifacts (still in
 ```
 qwen35-9b-dflash-mq4.hfq    590f35403cd7f1d634945233234a12b7  557 MB
 qwen35-27b-dflash-mq4.hfq   7b6df2a4ee1c8d933f0a52e187d1860b  919 MB
-qwen36-27b-dflash-mq4.hfq   204c4c4ceab30cb9ebc118fa9d59a446  919 MB
-qwen3.6-27b.mq4             9a6acdc49bcaa6a7b52ac161444cb769   15 GB
 ```
 
-Any mismatch = re-pull or report. (The `qwen36-27b-dflash-mq4.hfq`
-checksum was refreshed 2026-05-30 from the stale `ecc64877…` — the HF
-file was re-uploaded since the original manifest; verify against the
-current `204c4c4c…`.)
-
+Any mismatch = re-pull or report. The dense `qwen3.6:27b` (`qwen3.6-27b.mq4`)
+and its draft `qwen3.6:27b-draft` (`qwen36-27b-dflash-mq4.hfq`) are retired in
+0.5.0: `hipfire pull` refuses them (replacement `qwen3.8:27b`), and a local copy
+verified against the compiled `RETIRED_MODELS` SHA-256 pin still loads.
 
 > **Sizes here are decimal (MB = 10⁶ bytes, GB = 10⁹ bytes), matching
 > Hugging Face's reported sizes and the `hipfire pull` progress bar.**
@@ -404,12 +401,12 @@ Still pullable (smaller smoke / historical):
 
 - `hipfire-models/qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
 - `hipfire-models/qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
-- `hipfire-models/qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
-  target `hipfire-models/qwen3.6-27b/qwen3.6-27b.mq4`)
+(The 3.6 27B draft and target, `qwen36-27b-dflash-mq4.hfq` /
+`qwen3.6-27b.mq4`, are retired: no longer pullable, see § "Verify hashes".)
 
 `hipfire pull <target>` fetches the target plus its draft sidecar;
 standalone drafts stay pullable via `hipfire pull qwen3.8:27b-draft`
-(and legacy `qwen3.{5,6}:{9b,27b}-draft`).
+(and legacy `qwen3.5:{9b,27b}-draft`).
 
 
 ---
