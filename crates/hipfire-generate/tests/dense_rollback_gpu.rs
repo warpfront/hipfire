@@ -50,10 +50,22 @@ extern "C" {
 
 static DENSE_GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Every test enters here first, so this runs before anything in the process
+/// snapshots the hipfire config (the snapshot is taken once and never re-read).
+/// The Glimmer DFlash tests need the wall-clock profit guard off so the spec
+/// route stays live; it only acts on spec requests, which no other test makes.
 fn lock() -> std::sync::MutexGuard<'static, ()> {
-    DENSE_GPU_TEST_LOCK
+    let guard = DENSE_GPU_TEST_LOCK
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(|e| e.into_inner());
+    static PROFIT_GUARD_OFF: std::sync::Once = std::sync::Once::new();
+    PROFIT_GUARD_OFF.call_once(|| std::env::set_var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD", "0"));
+    assert_eq!(
+        hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD").as_deref(),
+        Ok("0"),
+        "the hipfire config snapshot was taken before lock()"
+    );
+    guard
 }
 
 /// Slack for device-global free-byte assertions: far below one resident
@@ -539,16 +551,8 @@ fn dense_minimax_fault_rolls_back_and_retry_matches_fresh() {
 #[ignore = "requires real HIP GPU + HIPFIRE_DENSE_FIXTURE with muse-glimmer-30b.mq4 and muse-glimmer-30b-dflash.mq4"]
 fn glimmer_dflash_request_that_fits_max_seq_completes() {
     let _guard = lock();
-    // The wall-clock profit guard may retire DFlash to AR before the cap; keep
-    // the speculative route so the request reaches the window that would cross.
-    // The process config is snapshotted once, so this holds only before any
-    // other hipfire call in the process (run this test alone, or export it).
-    std::env::set_var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD", "0");
-    assert_eq!(
-        hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD").as_deref(),
-        Ok("0"),
-        "export HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD=0 or run this test alone"
-    );
+    // lock() turned the profit guard off: it may retire DFlash to AR before the
+    // cap, and the request must reach the window that would cross.
     let (Some(model), Some(draft)) = (
         dense_fixture("muse-glimmer-30b.mq4"),
         dense_fixture("muse-glimmer-30b-dflash.mq4"),
@@ -743,8 +747,7 @@ fn dense_reset_phase_error_visible_and_unattested() {
 #[ignore = "requires real HIP GPU + HIPFIRE_DENSE_FIXTURE with muse-glimmer-30b.mq4 and muse-glimmer-30b-dflash.mq4"]
 fn glimmer_client_abort_stops_decode() {
     let _guard = lock();
-    // Keep the DFlash window loop live (the profit guard may retire it to AR).
-    std::env::set_var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD", "0");
+    // lock() keeps the DFlash window loop live (profit guard off).
     let (Some(model), Some(draft)) = (
         dense_fixture("muse-glimmer-30b.mq4"),
         dense_fixture("muse-glimmer-30b-dflash.mq4"),
