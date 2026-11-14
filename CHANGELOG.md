@@ -52,6 +52,10 @@
 - PeaceMaker CDNA: generate complete gfx942 encoding/operand tables and gfx950 decode-only tables from AMD's ISA XML. Preserve hand-written simulator semantics; newly decoded instructions refuse unsupported simulation by name. Record every LLVM row cross-check; unverified XML/LLVM disagreements cannot be emitted or sealed.
 - CDNA XML decoding preserves verified forms outside the typed model without granting simulator or sealing support; FP8 MoE's exact SDWA WORD_1 conversion fields are verified by the bound 109-case MI300X oracle, while other unverified combinations remain blocked.
 
+### 0.5.0 consolidation
+
+- **Removed: kernels with no caller and the files only they used (−12.3k HIP LOC, 97 `kernels/src` files, plus their launchers, examples and allowlist rows).** Covers the uncompiled sources (`attention_dflash_wmma_m32_kstg_FAILED`, `gemm_hfq4g256_residual_{kt,mw}`, the unused `gemv_hfq4g256.gfx1201` / `gemv_hfq6g256.gfx1201` / `gated_delta_net_q8.gfx1200` chip variants, …), the DFlash attention WMMA v2–v7b generations, the int8/q8kv/timed attention paths, the hfq3/hfq4 MMQ x8/x32 tiles, the gfx1100 `muse_*` and `mw_lds` residual/gate-up experiments, q4lut/q4wave/q4as8, the mq{2,5,6}v2 multirow GEMVs and the DeepSeek V4 indexer stubs. Default routes are unchanged. The FWHT KV assembler is renamed (`ensure_givens4_kernel` → `ensure_fwht_kv_kernel`, `ensure_givens4_kv_slot_kernel` → `ensure_fwht_kv_slot_kernel`, `kv_slot_givens4_paged_source` → `kv_slot_fwht_paged_source`). The unused `givens_common.h` header is no longer prepended: the JIT source of the FWHT/asym/Q8/fp8 tile kernels changes, so they recompile once, but their code objects are byte-identical.
+
 ### 0.5.0 removals
 
 - **Removed config keys fail the load.** A `config.toml` or custom profile that still sets a key listed in `hipfire_config::RETIRED_CONFIG_KEYS` (including `kernel.mw16`, whose 0.4.x warn-and-ignore window ended) now fails with `configuration key '<key>' was removed in <version> (<reason>); replacement: <replacement>` instead of loading with a warning. See [`docs/CONFIG.md`](docs/CONFIG.md#lifecycle-status).

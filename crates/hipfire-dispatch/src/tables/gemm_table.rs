@@ -151,18 +151,8 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
-    // F16 WMMA MB4/MB8 fused-transpose, both wave32-WMMA. MB4 has NO gfx12
-    // source sibling (gemm_f16_wmma_mb4.hip only) → gfx11-family gate
-    // (HasWmmaW32 = RDNA3 + RDNA3.5); RDNA4 falls through to a non-WMMA entry.
-    // MB8 DOES have gemm_f16_wmma_mb8.gfx12.hip → HasWmma (admits RDNA4).
-    registry.register(KernelVariant {
-        key: KernelKey::GemmF16WmmaMb4,
-        arch_required: ArchPredicate::HasWmmaW32,
-        shape_gate: None,
-        steps: &[PipelineOp::Gemv],
-        has_awq: false,
-        tile: TileImpl::None,
-    });
+    // F16 WMMA MB8 fused-transpose, wave32-WMMA. MB8 has
+    // gemm_f16_wmma_mb8.gfx12.hip → HasWmma (admits RDNA4).
     registry.register(KernelVariant {
         key: KernelKey::GemmF16WmmaMb8,
         arch_required: ArchPredicate::HasWmma,
@@ -187,16 +177,6 @@ pub fn populate(registry: &mut KernelRegistry) {
     registry.register(KernelVariant {
         key: KernelKey::GemmBf16Mfma,
         arch_required: ArchPredicate::IsGfx942,
-        shape_gate: None,
-        steps: &[PipelineOp::Gemv],
-        has_awq: false,
-        tile: TileImpl::None,
-    });
-    // Q8_0 WMMA x64 (N%64 layout) — gfx11-family wave32 WMMA only
-    // (gemm_q8_0_wmma.hip, no gfx12 sibling) → HasWmmaW32, NOT HasWmma.
-    registry.register(KernelVariant {
-        key: KernelKey::GemmQ8_0WmmaX64,
-        arch_required: ArchPredicate::HasWmmaW32,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,

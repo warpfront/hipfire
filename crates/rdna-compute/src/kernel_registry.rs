@@ -117,7 +117,7 @@ pub enum RegistryError {
 }
 
 fn prepend_kv_slot_desc(body: &str) -> String {
-    // Same assembly as attention.rs `ensure_givens4_kernel`.
+    // Same assembly as attention.rs `ensure_kernel` callers of kv_slot_desc.h.
     format!(
         "{}\n{}",
         kernels::KV_SLOT_DESC_H,
@@ -156,27 +156,21 @@ fn q8_flash_prefill_wmma_gfx11_hd256_source() -> String {
 }
 
 fn assemble_asym(body: &str) -> String {
-    // The slot descriptor appears in asym3 but not all the other asym bodies.
+    // Same assembly as attention.rs `ensure_fwht_kv_kernel`. The slot
+    // descriptor appears in asym3 but not all the other asym bodies.
     let needs_slot = body.contains("#include \"kv_slot_desc.h\"");
     let stripped = body
         .replace("#include \"turbo_common.h\"", "")
-        .replace("#include \"givens_common.h\"", "")
         .replace("#include \"kv_slot_desc.h\"", "");
     if needs_slot {
         format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}",
             kernels::TURBO_COMMON_H,
-            kernels::GIVENS_COMMON_SRC,
             kernels::KV_SLOT_DESC_H,
             stripped
         )
     } else {
-        format!(
-            "{}\n{}\n{}",
-            kernels::TURBO_COMMON_H,
-            kernels::GIVENS_COMMON_SRC,
-            stripped
-        )
+        format!("{}\n{}", kernels::TURBO_COMMON_H, stripped)
     }
 }
 
@@ -680,7 +674,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     );
     // Multi-slot (slot-descriptor) launches of the q8 KV route run
     // separately named `*_paged` modules (attention.rs `ensure_kv_slot_kernel`,
-    // `ensure_givens4_kv_slot_kernel`, `attention_q8_0_flash_prefill_wmma_slots`).
+    // `ensure_fwht_kv_slot_kernel`, `attention_q8_0_flash_prefill_wmma_slots`).
     add!(
         "kv_cache_write_q8_0_batched_paged",
         kernels::kv_slot_desc_paged_source(
@@ -701,7 +695,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     );
     add!(
         "attention_flash_q8_0_tile_batched_paged",
-        kernels::kv_slot_givens4_paged_source(
+        kernels::kv_slot_fwht_paged_source(
             kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
             "attention_flash_q8_0_tile_batched",
             "attention_flash_q8_0_tile_batched_paged"
@@ -5692,7 +5686,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     }
     // Batched Q8_0 flash tile (`attention_flash_q8_0_tile_batched` /
     // `_masked` / windowed callers, attention.rs `launch_asym_flash_batched`);
-    // gfx1100 carries it above. Source goes through `ensure_givens4_kernel`'s
+    // gfx1100 carries it above. Source goes through `ensure_fwht_kv_kernel`'s
     // strip-and-prepend, i.e. `assemble_asym`.
     if matches!(arch, "gfx1151" | "gfx1201") {
         add!(

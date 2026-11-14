@@ -385,7 +385,6 @@ pub enum KernelKey {
     // own families (FusedQkv*, Moe*, etc.). See gemm_table.rs.
     GemmF16,
     GemmF16Tiled,
-    GemmF16WmmaMb4,
     GemmF16WmmaMb8,
     GemmF32Batched,
     // BF16 x BF16 -> F32 via CDNA3 `v_mfma_f32_16x16x16bf16_1k`
@@ -395,7 +394,6 @@ pub enum KernelKey {
     // model to F32 would land on `GemmF32Batched`, a warp-per-output-element
     // dot product with no data reuse, at a fraction of MFMA throughput.
     GemmBf16Mfma,
-    GemmQ8_0WmmaX64,
     GemmQ8_0ResidualWmma,
     GemmQ8_0ResidualWmmaGfx12,
     GemmHfq4G256Dp4a,
@@ -630,8 +628,8 @@ pub enum ArchPredicate {
     HasWave32,
     HasWmma,
     /// `has_wmma_w32()` — gfx11-family wave32 WMMA (RDNA3 + RDNA3.5), EXCLUDING
-    /// gfx12/RDNA4. For WMMA kernels with NO gfx12 source sibling (e.g.
-    /// gemm_f16_wmma_mb4, gemm_q8_0_wmma_x64); RDNA4 must fall through to a
+    /// gfx12/RDNA4. For WMMA kernels with NO gfx12 source sibling (e.g. the
+    /// HFQ4G256 MMQ set); RDNA4 must fall through to a
     /// non-WMMA entry. Restores the arch gate Phase 0.4 collapsed into HasWmma.
     HasWmmaW32,
     HasWmmaGfx12,

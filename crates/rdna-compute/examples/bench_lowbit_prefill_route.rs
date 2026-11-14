@@ -9,11 +9,11 @@
 //! the candidate replacement at the real Bonsai-27B shapes:
 //!
 //!   A) scalar   — N x gemv_{tq2,bq1}g128            (what prefill does now)
-//!   B) dequant  — one dequant_*_to_f16 + one gemm_f16 over all N tokens
+//!   B) tiled    — native tiled GEMM straight off the packed blocks
+//!   C) WMMA     — WMMA straight off the packed blocks (F16 activations)
 //!
-//! Arm B pays the dequant ONCE per weight per chunk, so its cost is amortised
-//! over N. The crossover N is the number that matters: below it, keep the
-//! scalar path; above it, the dequant route wins.
+//! The crossover N is the number that matters: below it, keep the scalar
+//! path; above it, the tiled/WMMA route wins.
 //!
 //! Usage: bench_lowbit_prefill_route [ternary|binary] [reps]
 
@@ -41,8 +41,6 @@ fn main() {
         let total = m * groups * blk;
         let packed: Vec<u8> = (0..total).map(|i| (i * 37 % 251) as u8).collect();
         let d_a = gpu.upload_raw(&packed, &[total]).expect("upload A");
-        // FP16 scratch for the dequantized weight: M*K*2 bytes.
-        let w_f16 = gpu.zeros(&[m * k], DType::F16).expect("zeros w_f16");
 
         for n in [8usize, 32, 128, 512] {
             let xs: Vec<f32> = (0..n * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
@@ -85,22 +83,9 @@ fn main() {
                         .expect("wmma");
                 }
             };
-            // Arm C: dequant -> generic F16-weight GEMM (measured, kept for contrast).
-            let dequant_route = |gpu: &mut Gpu| {
-                if ternary {
-                    gpu.dequantize_tq2g128_to_f16(&d_a.buf, &w_f16.buf, m, k)
-                        .expect("dequant");
-                } else {
-                    gpu.dequantize_bq1g128_to_f16(&d_a.buf, &w_f16.buf, m, k)
-                        .expect("dequant");
-                }
-                gpu.gemm_f16(&w_f16, &d_xf, &d_y, m, k, n)
-                    .expect("gemm_f16");
-            };
 
             scalar(&mut gpu);
             native(&mut gpu);
-            dequant_route(&mut gpu);
             gpu.hip.device_synchronize().expect("sync");
 
             let t0 = Instant::now();
@@ -109,13 +94,6 @@ fn main() {
             }
             gpu.hip.device_synchronize().expect("sync");
             let s_ms = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
-
-            let t1 = Instant::now();
-            for _ in 0..reps {
-                dequant_route(&mut gpu);
-            }
-            gpu.hip.device_synchronize().expect("sync");
-            let d_ms = t1.elapsed().as_secs_f64() * 1000.0 / reps as f64;
 
             wmma(&mut gpu);
             gpu.hip.device_synchronize().expect("sync");
@@ -133,25 +111,10 @@ fn main() {
             gpu.hip.device_synchronize().expect("sync");
             let n_ms = tn.elapsed().as_secs_f64() * 1000.0 / reps as f64;
 
-            // Decompose arm C: which half is the cost?
-            let t2 = Instant::now();
-            for _ in 0..reps {
-                if ternary {
-                    gpu.dequantize_tq2g128_to_f16(&d_a.buf, &w_f16.buf, m, k)
-                        .expect("dequant");
-                } else {
-                    gpu.dequantize_bq1g128_to_f16(&d_a.buf, &w_f16.buf, m, k)
-                        .expect("dequant");
-                }
-            }
-            gpu.hip.device_synchronize().expect("sync");
-            let dq_ms = t2.elapsed().as_secs_f64() * 1000.0 / reps as f64;
-
             println!(
-                "M={m:<6} K={k:<5} N={n:<4} scalar {s_ms:8.3} | tiled {n_ms:7.3} ({:4.1}x) | WMMA {w_ms:7.3} ({:5.1}x) | dq+f16 {d_ms:7.3} ({:.2}x) | dequant {dq_ms:7.3}",
+                "M={m:<6} K={k:<5} N={n:<4} scalar {s_ms:8.3} | tiled {n_ms:7.3} ({:4.1}x) | WMMA {w_ms:7.3} ({:5.1}x)",
                 s_ms / n_ms,
-                s_ms / w_ms,
-                s_ms / d_ms
+                s_ms / w_ms
             );
         }
     }

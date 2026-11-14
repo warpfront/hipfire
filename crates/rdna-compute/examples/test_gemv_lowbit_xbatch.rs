@@ -291,63 +291,6 @@ fn run_wmma(gpu: &mut Gpu, ternary: bool, m: usize, k: usize, n: usize, seed: u6
     true
 }
 
-/// Fused 4-way qkvza GEMM must equal four separate plain GEMMs on the same
-/// activations. The plain path is itself oracle-verified above, so this is a
-/// genuine equivalence check on the fusion/routing, which is where a fused
-/// kernel actually goes wrong (rows routed to the wrong matrix or stride).
-fn run_fused_qkvza(gpu: &mut Gpu, m: [usize; 4], k: usize, n: usize, seed: u64) -> bool {
-    let mut rng = Rng(seed);
-    let mut packed = Vec::new();
-    let mut dev = Vec::new();
-    for mi in m.iter() {
-        let (p, _) = pack(*mi, k, true, &mut rng);
-        let d = gpu.upload_raw(&p, &[p.len()]).expect("upload A");
-        packed.push(p);
-        dev.push(d);
-    }
-    let xs: Vec<f32> = (0..n * k).map(|_| rng.signed()).collect();
-    let d_x = gpu.upload_f32(&xs, &[n * k]).expect("upload x");
-
-    // Reference: four independent plain GEMMs.
-    let mut refs = Vec::new();
-    for (i, mi) in m.iter().enumerate() {
-        let y = gpu.zeros(&[n * mi], DType::F32).expect("zeros");
-        gpu.gemm_tq2g128_prefill(&dev[i], &d_x, &y, *mi, k, n)
-            .expect("plain");
-        refs.push(gpu.download_f32(&y).expect("dl"));
-    }
-
-    // Fused: one launch.
-    let ys: Vec<_> = m
-        .iter()
-        .map(|mi| gpu.zeros(&[n * mi], DType::F32).expect("zeros"))
-        .collect();
-    gpu.gemm_qkvza_tq2g128(
-        &dev[0], &dev[1], &dev[2], &dev[3], &d_x, &ys[0], &ys[1], &ys[2], &ys[3], m[0], m[1], m[2],
-        m[3], k, n,
-    )
-    .expect("fused");
-
-    for (i, mi) in m.iter().enumerate() {
-        let got = gpu.download_f32(&ys[i]).expect("dl");
-        let r = &refs[i];
-        let max_abs = r.iter().fold(0f32, |a, v| a.max(v.abs()));
-        let tol = 1e-3 * (1.0 + max_abs);
-        let mut worst = 0f32;
-        for j in 0..n * mi {
-            worst = worst.max((got[j] - r[j]).abs());
-        }
-        if worst >= tol {
-            eprintln!(
-                "FAIL: fused qkvza matrix {i} (m={mi}) K={k} N={n} max_err={worst:e} >= tol={tol:e}"
-            );
-            return false;
-        }
-    }
-    println!("PARITY OK fused qkvza  m={m:?} K={k:<4} N={n:<4} (== 4 separate GEMMs)");
-    true
-}
-
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     println!("arch: {}", gpu.arch);
@@ -382,13 +325,6 @@ fn main() {
                 ok &= run_wmma(&mut gpu, ternary, m, k, n, seed | 1);
             }
         }
-    }
-
-    // Fused qkvza. Uneven m values on purpose: beta/alpha are tiny in the
-    // real LA layer, and the routing arithmetic is where fusion breaks.
-    for &n in &[1usize, 8, 33, 70] {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-        ok &= run_fused_qkvza(&mut gpu, [64, 32, 8, 8], 512, n, seed | 1);
     }
 
     if !ok {

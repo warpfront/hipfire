@@ -2,8 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! GPU vs CPU correctness gate for mfp4+P (`gemv_mfp4g32_p` +
-//! `dequantize_mfp4g32_p_to_f16`).
+//! GPU vs CPU correctness gate for mfp4+P (`gemv_mfp4g32_p`).
 //!
 //! mfp4+P = mfp4 (E2M1 + FP16 row scale + offline FWHT) with the per-32-block
 //! UE8M0 scale promoted to E4M3 (FP8, non-power-of-2). Byte layout IDENTICAL to
@@ -14,9 +13,8 @@
 //!   1. Size invariant: packed.len() == m*(16+17*(k/32)).
 //!   2. E4M3 codec round-trip: e4m3_decode(encode_roundup(s)) >= s and is the
 //!      smallest such code (ceil) — verified over a value sweep.
-//!   3. dequantize_mfp4g32_p_to_f16 GPU vs CPU dequant: max diff < 1e-2.
-//!   4. gemv_mfp4g32_p GPU y vs CPU dot(cpu_dequant, x_rot): max rel err < 1e-2.
-//!   5. Quant-error sanity vs ORIGINAL weights (rotated): NRMSE < ~0.15 (E2M1
+//!   3. gemv_mfp4g32_p GPU y vs CPU dot(cpu_dequant, x_rot): max rel err < 1e-2.
+//!   4. Quant-error sanity vs ORIGINAL weights (rotated): NRMSE < ~0.15 (E2M1
 //!      4-bit grade), i.e. not garbage.
 
 use rdna_compute::{DType, Gpu};
@@ -304,36 +302,7 @@ fn run(gpu: &mut Gpu, m: usize, k: usize, s1: &[f32], s2: &[f32]) -> bool {
         return false;
     }
 
-    // GPU dequant-to-f16.
     let d_packed = gpu.upload_raw(&packed, &[packed.len()]).unwrap();
-    let f16_bytes = m * k * 2;
-    let d_f16 = gpu.upload_raw(&vec![0u8; f16_bytes], &[f16_bytes]).unwrap();
-    gpu.dequantize_mfp4g32_p_to_f16(&d_packed.buf, &d_f16.buf, m, k)
-        .unwrap();
-    gpu.hip.device_synchronize().unwrap();
-    let mut f16raw = vec![0u8; f16_bytes];
-    gpu.hip.memcpy_dtoh(&mut f16raw, &d_f16.buf).unwrap();
-    let mut gpu_dq = vec![0.0f32; m * k];
-    for i in 0..m * k {
-        gpu_dq[i] = f16_bits_to_f32(u16::from_le_bytes([f16raw[2 * i], f16raw[2 * i + 1]]));
-    }
-    let mut max_dq = 0.0f32;
-    for i in 0..m * k {
-        let d = (gpu_dq[i] - cpu_dq[i]).abs();
-        if d > max_dq {
-            max_dq = d;
-        }
-    }
-    let dq_ok = max_dq < 1e-2;
-    println!(
-        "[{}] dequant K={} max_gpu_vs_cpu={:.3e}",
-        if dq_ok { "PASS" } else { "FAIL" },
-        k,
-        max_dq
-    );
-    if !dq_ok {
-        return false;
-    }
 
     // GPU GEMV.
     let x: Vec<f32> = (0..k)

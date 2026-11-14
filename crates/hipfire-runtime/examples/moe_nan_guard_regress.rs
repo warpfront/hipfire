@@ -146,7 +146,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "down_indexed",
-        covers: "gemv_q8_0 / gemv_mq4g128v2 *_moe_down_top10_indexed_batched_expanded vs OLD, raw bad ids",
+        covers: "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded vs OLD, raw bad ids",
         run: down_indexed_case,
     },
     Case {
@@ -306,10 +306,6 @@ const OLD_COMBINE_GROUPED: OldFile = OldFile {
         "moe_down_combine_grouped_top10_bf16in",
         "moe_down_combine_grouped_top10_bf16in_zinit",
     ],
-};
-const OLD_Q8_DOWN: OldFile = OldFile {
-    file: "gemv_q8_0_moe_down_top10_indexed_batched_expanded.hip",
-    syms: &["gemv_q8_0_moe_down_top10_indexed_batched_expanded"],
 };
 const OLD_Q8_GROUPED: OldFile = OldFile {
     file: "gemm_q8_0_moe_grouped_top10.hip",
@@ -1649,14 +1645,13 @@ fn unscatter_case(cx: &mut Ctx) -> R<Outcome> {
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Indexed down gemv (Q8_0 / MQ4G128V2)
+// Indexed down gemv (MQ4G128V2)
 // ───────────────────────────────────────────────────────────────────────────────
 const DOWN_M: usize = HIDDEN;
 const DOWN_K: usize = MOE_INTERMEDIATE;
 
 fn run_down_indexed(
     cx: &mut Ctx,
-    fmt: Fmt,
     tab: &ExpertTable,
     ids: &[i32],
     x: &[f32],
@@ -1667,17 +1662,7 @@ fn run_down_indexed(
     let t_x = up_f32(&mut cx.gpu, x)?;
     let t_y = sentinel_f32(&mut cx.gpu, tokens * K * DOWN_M)?;
     if old {
-        let (file, sym) = match fmt {
-            Fmt::Q8 => (
-                &OLD_Q8_DOWN,
-                "gemv_q8_0_moe_down_top10_indexed_batched_expanded",
-            ),
-            Fmt::Mq4 => (
-                &OLD_MQ4_DOWN,
-                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
-            ),
-        };
-        cx.load_old(file)?;
+        cx.load_old(&OLD_MQ4_DOWN)?;
         let mut b = KernargBlob::new();
         b.push_ptr(ptr(&tab.table));
         b.push_ptr(ptr(&t_ids));
@@ -1688,24 +1673,18 @@ fn run_down_indexed(
         b.push_i32(tokens as i32);
         b.push_i32(E as i32);
         cx.launch_old(
-            sym,
+            "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
             [DOWN_M as u32, K as u32, tokens as u32],
             [32, 1, 1],
             0,
             b,
         )?;
     } else {
-        let launched = match fmt {
-            Fmt::Q8 => cx.gpu.gemv_q8_0_moe_down_top10_indexed_batched_expanded(
-                &tab.table, &t_ids, &t_x, &t_y, DOWN_M, DOWN_K, tokens, E,
-            ),
-            Fmt::Mq4 => cx
-                .gpu
-                .gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
-                    &tab.table, &t_ids, &t_x, &t_y, DOWN_M, DOWN_K, tokens, E, 10,
-                ),
-        };
-        launched.map_err(e)?;
+        cx.gpu
+            .gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
+                &tab.table, &t_ids, &t_x, &t_y, DOWN_M, DOWN_K, tokens, E, 10,
+            )
+            .map_err(e)?;
     }
     sync(&cx.gpu)?;
     let out = bits(&down_f32(&cx.gpu, &t_y)?);
@@ -1716,41 +1695,39 @@ fn run_down_indexed(
 fn down_indexed_case(cx: &mut Ctx) -> R<Outcome> {
     let mut rng = Rng::new(0x4E41_4E30);
     let mut results = Vec::new();
-    for fmt in [Fmt::Q8, Fmt::Mq4] {
-        let tab = build_experts(cx, &mut rng, fmt, DOWN_M, DOWN_K)?;
-        for &tokens in &[1usize, 5] {
-            let valid = make_topk(&mut rng, tokens, Spread::Uniform);
-            let x = extreme_vec(&mut rng, tokens * K * DOWN_K, -2.0, 2.0);
-            let tag = format!("{fmt:?} tokens={tokens}");
-            let new = run_down_indexed(cx, fmt, &tab, &valid, &x, tokens, false)?;
-            let old = run_down_indexed(cx, fmt, &tab, &valid, &x, tokens, true)?;
-            results.push(exact_bits(&format!("{tag} valid new-vs-old"), &new, &old));
-            for phase in 0..4 {
-                let (ids, bad) = poison_topk(&valid, phase);
-                let new_bad = run_down_indexed(cx, fmt, &tab, &ids, &x, tokens, false)?;
-                // These two kernels already bounds-checked on origin/beta (old is defined on bad ids).
-                let old_bad = run_down_indexed(cx, fmt, &tab, &ids, &x, tokens, true)?;
-                results.push(exact_bits(
-                    &format!("{tag} phase={phase} bad-ids new-vs-old"),
-                    &new_bad,
-                    &old_bad,
-                ));
-                let nonzero = bad.iter().enumerate().filter(|(_, b)| **b).any(|(s, _)| {
-                    new_bad[s * DOWN_M..(s + 1) * DOWN_M]
-                        .iter()
-                        .any(|&v| v != 0)
-                });
-                results.push(if nonzero {
-                    Err(format!(
-                        "{tag} phase={phase}: an unrouted rank's expanded row is not +0"
-                    ))
-                } else {
-                    Ok(format!("{tag} phase={phase}: unrouted rows are +0"))
-                });
-            }
+    let tab = build_experts(cx, &mut rng, Fmt::Mq4, DOWN_M, DOWN_K)?;
+    for &tokens in &[1usize, 5] {
+        let valid = make_topk(&mut rng, tokens, Spread::Uniform);
+        let x = extreme_vec(&mut rng, tokens * K * DOWN_K, -2.0, 2.0);
+        let tag = format!("{:?} tokens={tokens}", Fmt::Mq4);
+        let new = run_down_indexed(cx, &tab, &valid, &x, tokens, false)?;
+        let old = run_down_indexed(cx, &tab, &valid, &x, tokens, true)?;
+        results.push(exact_bits(&format!("{tag} valid new-vs-old"), &new, &old));
+        for phase in 0..4 {
+            let (ids, bad) = poison_topk(&valid, phase);
+            let new_bad = run_down_indexed(cx, &tab, &ids, &x, tokens, false)?;
+            // This kernel already bounds-checked on origin/beta (old is defined on bad ids).
+            let old_bad = run_down_indexed(cx, &tab, &ids, &x, tokens, true)?;
+            results.push(exact_bits(
+                &format!("{tag} phase={phase} bad-ids new-vs-old"),
+                &new_bad,
+                &old_bad,
+            ));
+            let nonzero = bad.iter().enumerate().filter(|(_, b)| **b).any(|(s, _)| {
+                new_bad[s * DOWN_M..(s + 1) * DOWN_M]
+                    .iter()
+                    .any(|&v| v != 0)
+            });
+            results.push(if nonzero {
+                Err(format!(
+                    "{tag} phase={phase}: an unrouted rank's expanded row is not +0"
+                ))
+            } else {
+                Ok(format!("{tag} phase={phase}: unrouted rows are +0"))
+            });
         }
-        tab.free(&mut cx.gpu)?;
     }
+    tab.free(&mut cx.gpu)?;
     pass(all(results))
 }
 
@@ -3785,7 +3762,6 @@ mod tests {
             &OLD_UNSCATTER,
             &OLD_COMBINE,
             &OLD_COMBINE_GROUPED,
-            &OLD_Q8_DOWN,
             &OLD_Q8_GROUPED,
             &OLD_MQ4_DOWN,
             &OLD_MQ4_MULTIROW,

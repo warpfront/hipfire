@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Benchmark the complete HFQ family: Q2, Q3, Q4, Q6, Q8 at G256.
+//! Benchmark the HFQ family: Q2, Q3, Q4, Q6 at G256.
 
 fn main() {
     let mut gpu = rdna_compute::Gpu::init().unwrap();
@@ -38,27 +38,9 @@ fn main() {
             group_size: 256,
         },
         Fmt {
-            name: "HFQ4-G512",
-            id: 45,
-            block_bytes: 264,
-            group_size: 512,
-        },
-        Fmt {
-            name: "HFQ4-G1024",
-            id: 46,
-            block_bytes: 520,
-            group_size: 1024,
-        },
-        Fmt {
             name: "HFQ6-G256",
             id: 6,
             block_bytes: 200,
-            group_size: 256,
-        },
-        Fmt {
-            name: "HFQ8-G256",
-            id: 8,
-            block_bytes: 264,
             group_size: 256,
         },
         Fmt {
@@ -101,10 +83,7 @@ fn main() {
                 2 => gpu.gemv_hfq2g256(&d_a, &d_x, &d_y, m, k).unwrap(),
                 3 => gpu.gemv_hfq3g256(&d_a, &d_x, &d_y, m, k).unwrap(),
                 4 => gpu.gemv_hfq4g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                45 => gpu.gemv_hfq4g512(&d_a, &d_x, &d_y, m, k).unwrap(),
-                46 => gpu.gemv_hfq4g1024(&d_a, &d_x, &d_y, m, k).unwrap(),
                 6 => gpu.gemv_hfq6g256(&d_a, &d_x, &d_y, m, k).unwrap(),
-                8 => gpu.gemv_hfq8g256(&d_a, &d_x, &d_y, m, k).unwrap(),
                 0 => gpu.gemv_q4k(&d_a, &d_x, &d_y, m, k).unwrap(),
                 _ => unreachable!(),
             };

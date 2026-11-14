@@ -31,11 +31,9 @@ impl Gpu {
     ) -> HipResult<()> {
         debug_assert_eq!(head_dim, 512, "attention_flash_fwht3_hd512 requires head_dim=512");
         self.bind_thread()?;
-        self.ensure_givens4_kernel(
-            "attention_flash_fwht3_tile_hd512",
-            kernels::ATTENTION_FLASH_FWHT3_TILE_HD512_SRC,
-            "attention_flash_fwht3_tile_hd512",
-        )?;
+        self.ensure_fwht_kv_kernel("attention_flash_fwht3_tile_hd512",
+        kernels::ATTENTION_FLASH_FWHT3_TILE_HD512_SRC,
+        "attention_flash_fwht3_tile_hd512",)?;
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
@@ -111,60 +109,6 @@ impl Gpu {
             }
         }
         Ok(())
-    }
-
-    /// Single-token hd512 KV cache write for fwht3 (Gemma4 full-attn layers).
-    /// K is written via FWHT-512 rotation + 3-bit quantize; V via standard Q8_0.
-    /// Signs1/signs2 are 512-element +-1 float arrays (same buffers used at read time).
-    pub fn kv_cache_write_fwht3_hd512(
-        &mut self,
-        k_dst: &GpuTensor, v_dst: &GpuTensor,
-        k_src: &GpuTensor, v_src: &GpuTensor,
-        pos_buf: &DeviceBuffer,
-        signs1: &GpuTensor, signs2: &GpuTensor,
-        n_kv_heads: usize, head_dim: usize,
-    ) -> HipResult<()> {
-        debug_assert_eq!(head_dim, 512, "kv_cache_write_fwht3_hd512 requires head_dim=512");
-        self.bind_thread()?;
-        // K: FWHT-512 rotated 3-bit.
-        self.ensure_givens4_kernel(
-            "kv_cache_write_fwht3_hd512",
-            kernels::KV_CACHE_WRITE_FWHT3_HD512_SRC,
-            "kv_cache_write_fwht3_hd512",
-        )?;
-        {
-            let mut kdp = k_dst.buf.as_ptr(); let mut ksp = k_src.buf.as_ptr();
-            let mut pp = pos_buf.as_ptr(); let mut s1p = signs1.buf.as_ptr();
-            let mut s2p = signs2.buf.as_ptr();
-            let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
-            let mut params: Vec<*mut std::ffi::c_void> = vec![
-                &mut kdp as *mut _ as *mut std::ffi::c_void, &mut ksp as *mut _ as *mut std::ffi::c_void,
-                &mut pp as *mut _ as *mut std::ffi::c_void, &mut s1p as *mut _ as *mut std::ffi::c_void,
-                &mut s2p as *mut _ as *mut std::ffi::c_void, &mut nkv as *mut _ as *mut std::ffi::c_void,
-                &mut hd as *mut _ as *mut std::ffi::c_void,
-            ];
-            let shared_mem = ((head_dim + 32) * 4) as u32;
-            self.launch_maybe_blob(
-                "kv_cache_write_fwht3_hd512",
-                [n_kv_heads as u32, 1, 1],
-                [32, 1, 1],
-                shared_mem,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(kdp);
-                    b.push_ptr(ksp);
-                    b.push_ptr(pp);
-                    b.push_ptr(s1p);
-                    b.push_ptr(s2p);
-                    b.push_i32(nkv);
-                    b.push_i32(hd);
-                    b
-                },
-            )?;
-        }
-        // V: standard Q8_0.
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
     }
 }
 

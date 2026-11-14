@@ -439,19 +439,11 @@ name = "bench_hfq_family"
 required-features = ["lab"]
 
 [[example]]
-name = "bench_q4lut"
-required-features = ["lab"]
-
-[[example]]
 name = "bench_q8"
 required-features = ["lab"]
 
 [[example]]
 name = "bench_tp_graph_host_overhead_gfx1201"
-required-features = ["lab"]
-
-[[example]]
-name = "bench_wide"
 required-features = ["lab"]
 
 [[example]]
@@ -500,10 +492,6 @@ required-features = ["lab"]
 
 [[example]]
 name = "diag_mq3_lloyd_multiacc"
-required-features = ["lab"]
-
-[[example]]
-name = "diag_mq4_lloyd_multiacc"
 required-features = ["lab"]
 
 [[example]]

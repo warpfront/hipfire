@@ -143,10 +143,6 @@ name = "probe_argmax_agreement"
 required-features = ["arch-qwen35"]
 
 [[example]]
-name = "profile_attention_phases"
-required-features = ["arch-qwen35"]
-
-[[example]]
 name = "profile_bandwidth_fwd"
 required-features = ["arch-qwen35"]
 

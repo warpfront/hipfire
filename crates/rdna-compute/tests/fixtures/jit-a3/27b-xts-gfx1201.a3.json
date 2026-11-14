@@ -41,7 +41,7 @@
     {
      "module": "attention_flash_fp8_e4m3_tile_batched",
      "kind": "hip",
-     "sha256": "48d0349d28b7a26fbe931eb04488ca677bd1d66469e9d9bc24f23cb71154dc4d",
+     "sha256": "1556a1cc1048d0e01a50a9925b9de7a0ca3a3ab684bba57cdf21613b1b6389c5",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -1430,7 +1430,7 @@
     {
      "module": "attention_flash_fp8_e4m3_tile_batched",
      "kind": "hip",
-     "sha256": "48d0349d28b7a26fbe931eb04488ca677bd1d66469e9d9bc24f23cb71154dc4d",
+     "sha256": "1556a1cc1048d0e01a50a9925b9de7a0ca3a3ab684bba57cdf21613b1b6389c5",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -3292,7 +3292,7 @@
     "module": "attention_flash_fp8_e4m3_tile_batched",
     "symbol": "attention_flash_fp8_e4m3_tile_batched",
     "kind": "hip",
-    "sha256": "48d0349d28b7a26fbe931eb04488ca677bd1d66469e9d9bc24f23cb71154dc4d",
+    "sha256": "1556a1cc1048d0e01a50a9925b9de7a0ca3a3ab684bba57cdf21613b1b6389c5",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",

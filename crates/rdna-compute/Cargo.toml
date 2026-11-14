@@ -333,10 +333,6 @@ name = "bench_e8_verify_tiles"
 required-features = ["lab"]
 
 [[example]]
-name = "bench_fused_qkvza_lowbit"
-required-features = ["lab"]
-
-[[example]]
 name = "bench_gate_up_hfq4_variants"
 required-features = ["lab"]
 
@@ -513,10 +509,6 @@ name = "bench_qkvza_q8_vs_mq4"
 required-features = ["lab"]
 
 [[example]]
-name = "bench_qkvza_ternary_vs_mq4"
-required-features = ["lab"]
-
-[[example]]
 name = "bench_rocblas_vs_wmma_f16"
 required-features = ["lab"]
 
@@ -538,10 +530,6 @@ required-features = ["lab"]
 
 [[example]]
 name = "burst_real_kernels"
-required-features = ["lab"]
-
-[[example]]
-name = "channel_q8_mmq_gfx1030"
 required-features = ["lab"]
 
 [[example]]
@@ -634,14 +622,6 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_conv1d_tree"
-required-features = ["lab"]
-
-[[example]]
-name = "test_dequant_bq1g128"
-required-features = ["lab"]
-
-[[example]]
-name = "test_dequant_tq2g128"
 required-features = ["lab"]
 
 [[example]]
@@ -926,14 +906,6 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_moe_grouped_wmma_e8"
-required-features = ["lab"]
-
-[[example]]
-name = "test_moe_grouped_wmma_hfp4"
-required-features = ["lab"]
-
-[[example]]
-name = "test_moe_grouped_wmma_hfq3"
 required-features = ["lab"]
 
 [[example]]

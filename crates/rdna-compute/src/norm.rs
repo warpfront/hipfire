@@ -342,9 +342,6 @@ impl Gpu {
         self.bind_thread()?;
         let batch = if x.shape.len() > 1 { x.shape[0] } else { 1 };
         let n = x.shape.last().copied().unwrap() as i32;
-        // Generic RMSNorm is route-neutral. DeepSeek-only experiments must not
-        // leak into Qwen/MiniMax through process-wide environment state.
-        let warp_reduce = false;
         let x_ptr = x.buf.as_ptr();
         let w_ptr = weight.buf.as_ptr();
         let out_ptr = out.buf.as_ptr();
@@ -362,8 +359,6 @@ impl Gpu {
             && disjoint;
         let symbol = if rowsplit {
             "rmsnorm_f32_rowsplit"
-        } else if warp_reduce {
-            "rmsnorm_f32_warp_reduce"
         } else {
             "rmsnorm_f32"
         };
@@ -384,7 +379,7 @@ impl Gpu {
         ];
 
         let block_size = 256u32.min(n as u32);
-        let shared_mem = if warp_reduce { 8 * 4 } else { block_size * 4 };
+        let shared_mem = block_size * 4;
         let grid = if rowsplit {
             [n as u32 / 256, 1, 1]
         } else {
@@ -2539,106 +2534,6 @@ impl Gpu {
         result
     }
 
-    /// 2-D spatial RoPE applied IN-PLACE to the Q and K slices of a
-    /// fused interleaved `[n_patches, 3 * hidden]` QKV buffer. V is
-    /// left untouched. Companion to [`Self::rope_2d_halfsplit_f32`].
-    ///
-    /// The fused-QKV variant matches the natural output layout of a
-    /// single QKV GEMM (one row per patch, `[Q-all-heads, K-all-heads,
-    /// V-all-heads]` along the second axis) — same layout
-    /// `vit_attention_opt` expects — so the encoder block becomes:
-    ///
-    /// ```text
-    /// single QKV GEMM  →  rope_2d_halfsplit_qkv_interleaved_f32  →  vit_attention_opt
-    /// ```
-    ///
-    /// without intermediate split/merge copies.
-    ///
-    /// `cos_table` and `sin_table` are the precomputed per-patch tables
-    /// of shape `[n_patches, head_dim]` produced by
-    /// `hipfire_arch_dots_ocr::rope::build_rope_2d_tables`.
-    pub fn rope_2d_halfsplit_qkv_interleaved_f32(
-        &mut self,
-        qkv: &GpuTensor,
-        cos_table: &GpuTensor,
-        sin_table: &GpuTensor,
-        n_patches: usize,
-        n_heads: usize,
-        head_dim: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        assert!(
-            head_dim % 4 == 0,
-            "rope_2d_halfsplit_qkv_interleaved_f32: head_dim={head_dim} must be a multiple of 4 \
-             (the dots.ocr quarter-repeat layout splits head_dim into [hc, wc, hc, wc])",
-        );
-        assert!(
-            n_patches > 0,
-            "rope_2d_halfsplit_qkv_interleaved_f32: n_patches must be > 0"
-        );
-        assert!(
-            n_heads > 0,
-            "rope_2d_halfsplit_qkv_interleaved_f32: n_heads must be > 0"
-        );
-        self.ensure_kernel(
-            "rope_2d_halfsplit_qkv_interleaved",
-            kernels::ROPE_2D_HALFSPLIT_QKV_INTERLEAVED_SRC,
-            "rope_2d_halfsplit_qkv_interleaved_f32",
-        )?;
-
-        let qkvp = qkv.buf.as_ptr();
-        let cp = cos_table.buf.as_ptr();
-        let sp = sin_table.buf.as_ptr();
-        let np = n_patches as i32;
-        let nh = n_heads as i32;
-        let hd = head_dim as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &qkvp as *const _ as *mut c_void,
-            &cp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &np as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-        ];
-
-        let half = (head_dim / 2) as u32;
-        let grid = [n_patches as u32, n_heads as u32, 1];
-        let block = [half, 1, 1];
-        // Bytes-touched estimate: per thread we RMW two Q entries + two
-        // K entries (= 4 × 2 × 4 = 32 bytes) plus 4 cos/sin reads (= 16
-        // bytes). Threads per kernel = n_patches * n_heads * head_dim/2.
-        let bytes = (n_patches * n_heads * head_dim * 4 * 4)             // Q+K RMW (read+write each)
-                  + (n_patches * head_dim * 4 * 2); // cos+sin reads
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "rope_2d",
-            "rope_2d_halfsplit_qkv_interleaved_f32",
-            bytes,
-        );
-        let result = self.launch_maybe_blob(
-            "rope_2d_halfsplit_qkv_interleaved_f32",
-            grid,
-            block,
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qkvp);
-                b.push_ptr(cp);
-                b.push_ptr(sp);
-                b.push_i32(np);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
     /// Split a fused interleaved `[n_patches, 3 * hidden]` QKV buffer
     /// into three separate `[n_patches, hidden]` Q, K, V buffers.
     /// Used by the dots.ocr vision encoder when feeding the
@@ -3268,32 +3163,6 @@ impl Gpu {
         result
     }
 
-    /// Softplus activation, in-place.
-    #[cfg(feature = "deltanet")]
-    pub fn softplus_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel("softplus", kernels::SOFTPLUS_SRC, "softplus_f32")?;
-        let func = &self.functions["softplus_f32"];
-        let mut xp = x.buf.as_ptr();
-        let mut n = x.numel() as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut n as *mut _ as *mut c_void,
-        ];
-        let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
-    }
-
     /// L2 normalization per head, in-place. One warp per head.
     #[cfg(feature = "deltanet")]
     pub fn l2_norm_f32(
@@ -3373,113 +3242,6 @@ impl Gpu {
         // (the Q8 residual WMMA consumer would otherwise reuse stale X).
         self.invalidate_x_caches_for(out.buf.as_ptr());
         result
-    }
-
-    /// Per-row temperature-scaled softmax probability gather. For each row
-    /// `r` in `[0, n_rows)`, returns `probs_out[r] = softmax(logits[r] / temp)[indices[r]]`
-    /// — i.e., the softmax probability of the specified token id in that
-    /// row's temperature-scaled distribution.
-    ///
-    /// Used by MTP residual-acceptance sampling spec-decode:
-    ///   - n_rows = 1: gather `p_draft(c_k)` after each draft sample
-    ///   - n_rows = K: batched gather of `p_target(c_k)` over K verify
-    ///     positions, avoiding the 6 MB D2H of full verify logits
-    ///
-    /// Launch: `n_rows` blocks × 256 threads. Numerically stable via
-    /// max-subtraction inside the kernel. `temp` must be > 0.
-    ///
-    /// Output D2H: `n_rows × 4` bytes (typically ≤ 24 B for K ≤ 6).
-    pub fn softmax_prob_gather_batched_f32(
-        &mut self,
-        logits: &GpuTensor,    // [n_rows × vocab] f32
-        indices: &GpuTensor,   // [n_rows] i32 (we use F32 storage; caller reinterprets)
-        probs_out: &GpuTensor, // [n_rows] f32
-        vocab: usize,
-        temperature: f32,
-        n_rows: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        assert!(
-            temperature > 0.0,
-            "softmax_prob_gather_batched: temperature must be > 0"
-        );
-        assert!(
-            n_rows >= 1,
-            "softmax_prob_gather_batched: n_rows must be >= 1"
-        );
-        self.ensure_kernel(
-            "softmax_prob_gather_batched",
-            kernels::SOFTMAX_PROB_GATHER_BATCHED_SRC,
-            "softmax_prob_gather_batched",
-        )?;
-        let func = &self.functions["softmax_prob_gather_batched"];
-        let mut lp = logits.buf.as_ptr();
-        let mut ip = indices.buf.as_ptr();
-        let mut pp = probs_out.buf.as_ptr();
-        let mut vs = vocab as i32;
-        let mut tp = temperature;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut lp as *mut _ as *mut c_void,
-            &mut ip as *mut _ as *mut c_void,
-            &mut pp as *mut _ as *mut c_void,
-            &mut vs as *mut _ as *mut c_void,
-            &mut tp as *mut _ as *mut c_void,
-        ];
-        let nth: u32 = 256;
-        let lds: u32 = nth * 4 + 4; // scratch[256] + s_target slot
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_rows as u32, 1, 1],
-                [nth, 1, 1],
-                lds,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
-    }
-
-    /// 1D causal conv (kernel_size=4) for decode. Updates ring buffer state.
-    #[cfg(feature = "deltanet")]
-    pub fn conv1d_decode_f32(
-        &mut self,
-        output: &GpuTensor,
-        input: &GpuTensor,
-        weight: &GpuTensor,
-        state: &GpuTensor,
-        n_channels: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "conv1d_decode",
-            kernels::CONV1D_DECODE_SRC,
-            "conv1d_decode_f32",
-        )?;
-        let func = &self.functions["conv1d_decode_f32"];
-        let mut op = output.buf.as_ptr();
-        let mut ip = input.buf.as_ptr();
-        let mut wp = weight.buf.as_ptr();
-        let mut sp = state.buf.as_ptr();
-        let mut nc = n_channels as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut op as *mut _ as *mut c_void,
-            &mut ip as *mut _ as *mut c_void,
-            &mut wp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void,
-        ];
-        let block = 256u32;
-        let grid = ((n_channels as u32) + block - 1) / block;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
     }
 
     /// LFM2 LIV double-gated short-conv, single-token decode. Reads the in_proj
@@ -8086,46 +7848,6 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
-    }
-
-    /// Compute cross-entropy loss for a single token on GPU.
-    /// Returns -log(softmax(logits)[target]). Downloads 4 bytes instead of 600KB.
-    pub fn cross_entropy_loss(
-        &mut self,
-        logits: &GpuTensor,
-        target_buf: &DeviceBuffer,
-        loss_buf: &GpuTensor,
-        vocab_size: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "cross_entropy_loss",
-            kernels::CROSS_ENTROPY_LOSS_SRC,
-            "cross_entropy_loss",
-        )?;
-        let func = &self.functions["cross_entropy_loss"];
-        let mut lp = logits.buf.as_ptr();
-        let mut tp = target_buf.as_ptr();
-        let mut op = loss_buf.buf.as_ptr();
-        let mut vs = vocab_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut lp as *mut _ as *mut c_void,
-            &mut tp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut vs as *mut _ as *mut c_void,
-        ];
-        let block_size = 256u32;
-        let shared_mem = (block_size * 4) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
     }
 
     // ═══ Vision encoder dispatch (GEMM, LayerNorm, GELU, bias-add) ═══

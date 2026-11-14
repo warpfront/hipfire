@@ -1170,9 +1170,6 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemv_mq4g256v2_multirow_r2"
             | "gemv_mq4g256v2_multirow_r4"
             | "gemv_mq4g256v2_multirow_r8"
-            | "gemv_mq6g256v2_multirow_r2"
-            | "gemv_mq6g256v2_multirow_r4"
-            | "gemv_mq6g256v2_multirow_r8"
     ) {
         return Some(vec![read(0), read(8), write(16)]);
     }
@@ -1198,8 +1195,6 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemm_mq6g256v2_residual_wmma_gfx11_bt4"
             | "gemm_mq6g256v2_residual_wmma_gfx11_bt6"
             | "gemm_mq6g256v2_residual_wmma_gfx11_bt8"
-            | "gemm_mq4g256v2_residual_wmma_gfx1100_mw4_lds"
-            | "gemm_mq4g256v2_residual_wmma_gfx1100_mw8_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds"
@@ -1629,9 +1624,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(48),
         ]),
         "deinterleave_f32" => Some(vec![read(0), write(8), write(16)]),
-        "rmsnorm_f32" | "rmsnorm_f32_warp_reduce" | "rmsnorm_f32_rowsplit" => {
-            Some(vec![read(0), read(8), write(16)])
-        }
+        "rmsnorm_f32" | "rmsnorm_f32_rowsplit" => Some(vec![read(0), read(8), write(16)]),
         "rope_partial_halfsplit_f32" | "rope_partial_halfsplit_f32_headgrid" => {
             Some(vec![write(0), write(8), read(16)])
         }
@@ -1982,9 +1975,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq4g256v2_multirow_r2"
             | "gemv_mq4g256v2_multirow_r4"
             | "gemv_mq4g256v2_multirow_r8"
-            | "gemv_mq6g256v2_multirow_r2"
-            | "gemv_mq6g256v2_multirow_r4"
-            | "gemv_mq6g256v2_multirow_r8"
     ) {
         return Some(32);
     }
@@ -2007,8 +1997,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemm_mq6g256v2_residual_wmma_gfx11_bt4"
             | "gemm_mq6g256v2_residual_wmma_gfx11_bt6"
             | "gemm_mq6g256v2_residual_wmma_gfx11_bt8"
-            | "gemm_mq4g256v2_residual_wmma_gfx1100_mw4_lds"
-            | "gemm_mq4g256v2_residual_wmma_gfx1100_mw8_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds"
@@ -2081,7 +2069,6 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "moe_down_combine_k8_batched_vec4"
         | "moe_topk_renorm_k8"
         | "rmsnorm_f32"
-        | "rmsnorm_f32_warp_reduce"
         | "rmsnorm_f32_rowsplit"
         | "rmsnorm_reduce_gfx1100"
         | "hc_input_map_4stream"
@@ -10633,9 +10620,6 @@ mod tests {
             "gemv_mq4g256v2_multirow_r2",
             "gemv_mq4g256v2_multirow_r4",
             "gemv_mq4g256v2_multirow_r8",
-            "gemv_mq6g256v2_multirow_r2",
-            "gemv_mq6g256v2_multirow_r4",
-            "gemv_mq6g256v2_multirow_r8",
         ] {
             let mut blob = hip_bridge::KernargBlob::new();
             for _ in 0..3 {
@@ -10672,8 +10656,6 @@ mod tests {
             "gemm_mq6g256v2_residual_wmma_gfx11_bt4",
             "gemm_mq6g256v2_residual_wmma_gfx11_bt6",
             "gemm_mq6g256v2_residual_wmma_gfx11_bt8",
-            "gemm_mq4g256v2_residual_wmma_gfx1100_mw4_lds",
-            "gemm_mq4g256v2_residual_wmma_gfx1100_mw8_lds",
             "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds",
             "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds",
             "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds",

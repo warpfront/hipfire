@@ -10,8 +10,7 @@
 //!
 //! Tests:
 //!   1. Size invariant: packed.len() == 32 + m*(16+17*(k/32)).
-//!   2. dequantize_mfp4g32_lloyd_to_f16 GPU output vs CPU dequant: max diff < 1e-2.
-//!   3. gemv_mfp4g32_lloyd GPU y vs CPU dot(cpu_dequant, x_rot): max rel err < 1e-2.
+//!   2. gemv_mfp4g32_lloyd GPU y vs CPU dot(cpu_dequant, x_rot): max rel err < 1e-2.
 //!
 //! Sweeps K in {256, 512, 1024, 1280, 1536, 1792, 2048} (all K%256==0).
 
@@ -318,46 +317,7 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, signs1: &[f32], signs2: &[f32]) ->
     // CPU dequant (rotated domain)
     let cpu_dq = dequant_mfp4g32_lloyd(&packed, m, k);
 
-    // ── GPU dequant-to-f16 ────────────────────────────────────────────────────
     let d_packed = gpu.upload_raw(&packed, &[packed.len()]).unwrap();
-    // Allocate f16 output as Raw bytes (m*k * 2 bytes)
-    let f16_bytes = m * k * 2;
-    let zero_f16 = vec![0u8; f16_bytes];
-    let d_f16_out = gpu.upload_raw(&zero_f16, &[f16_bytes]).unwrap();
-    gpu.dequantize_mfp4g32_lloyd_to_f16(&d_packed.buf, &d_f16_out.buf, m, k)
-        .unwrap();
-    gpu.hip.device_synchronize().unwrap();
-
-    // Download f16 bytes
-    let mut f16_raw = vec![0u8; f16_bytes];
-    gpu.hip.memcpy_dtoh(&mut f16_raw, &d_f16_out.buf).unwrap();
-    let mut gpu_dq = vec![0.0f32; m * k];
-    for i in 0..m * k {
-        gpu_dq[i] = f16_bits_to_f32(u16::from_le_bytes([f16_raw[2 * i], f16_raw[2 * i + 1]]));
-    }
-
-    // Check dequant consistency
-    let mut max_dq = 0.0f32;
-    for i in 0..m * k {
-        let d = (gpu_dq[i] - cpu_dq[i]).abs();
-        if d > max_dq {
-            max_dq = d;
-        }
-    }
-    let dq_ok = max_dq < 1e-2;
-    println!(
-        "[{}] dequant K={} max_gpu_vs_cpu={:.3e}",
-        if dq_ok { "PASS" } else { "FAIL" },
-        k,
-        max_dq
-    );
-    if !dq_ok {
-        eprintln!(
-            "FATAL: dequant GPU vs CPU divergence {:.3e} >= 1e-2",
-            max_dq
-        );
-        return false;
-    }
 
     // ── GPU GEMV ──────────────────────────────────────────────────────────────
     let x: Vec<f32> = (0..k)

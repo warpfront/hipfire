@@ -10,9 +10,9 @@
 //! grid) on gfx1101. The naive `vit_attention_f32` launches one block per
 //! (head, query) and each block re-reads all of K and V from DRAM —
 //! ~220 GB of traffic per layer at N=4624. This bench times it against
-//! `vit_attention_opt` (QPB=2) and checks parity against a CPU reference
-//! (small n) or cross-kernel (large n) so a replacement kernel can be
-//! judged on evidence.
+//! the Q-tiled `vit_attention_qtiled_f32` and checks parity against a CPU
+//! reference (small n) or cross-kernel (large n) so a replacement kernel can
+//! be judged on evidence.
 //!
 //! Usage:
 //!   cargo build --release -p rdna-compute --example bench_vit_attention_shapes
@@ -111,12 +111,6 @@ fn main() {
             2,
             trials,
         );
-        let t_opt = time_kernel(
-            &mut gpu,
-            |g| g.vit_attention_opt(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM),
-            2,
-            trials,
-        );
         let t_qtiled = time_kernel(
             &mut gpu,
             |g| g.vit_attention_qtiled_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM),
@@ -124,45 +118,34 @@ fn main() {
             trials,
         );
 
-        let (err_naive, err_opt, err_qtiled) = if n <= 676 {
+        let (err_naive, err_qtiled) = if n <= 676 {
             let host_ref = cpu_reference(&qkv_h, n);
             gpu.vit_attention_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
                 .expect("naive");
             let naive_out = gpu.download_f32(&out).expect("download");
-            gpu.vit_attention_opt(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
-                .expect("opt");
-            let opt_out = gpu.download_f32(&out).expect("download");
             gpu.vit_attention_qtiled_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
                 .expect("qtiled");
             let qtiled_out = gpu.download_f32(&out).expect("download");
             (
                 max_abs_err(&naive_out, &host_ref),
-                max_abs_err(&opt_out, &host_ref),
                 max_abs_err(&qtiled_out, &host_ref),
             )
         } else {
             gpu.vit_attention_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
                 .expect("naive");
             let naive_out = gpu.download_f32(&out).expect("download");
-            gpu.vit_attention_opt(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
-                .expect("opt");
-            let opt_out = gpu.download_f32(&out).expect("download");
             gpu.vit_attention_qtiled_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
                 .expect("qtiled");
             let qtiled_out = gpu.download_f32(&out).expect("download");
-            (
-                max_abs_err(&opt_out, &naive_out),
-                max_abs_err(&naive_out, &opt_out),
-                max_abs_err(&qtiled_out, &naive_out),
-            )
+            (0.0, max_abs_err(&qtiled_out, &naive_out))
         };
 
         let traffic_gb =
             (LAYERS as f64) * (HEADS as f64) * (n as f64) * (n as f64) * (HEAD_DIM as f64) * 8.0
                 / 1e9;
         println!(
-            "N={n:5}  naive {t_naive:8.1} ms   opt {t_opt:8.1} ms   qtiled {t_qtiled:8.1} ms   \
-             speedup {:6.2}x   |err| n/a-opt {err_naive:.2e}/{err_opt:.2e}/q {err_qtiled:.2e}   \
+            "N={n:5}  naive {t_naive:8.1} ms   qtiled {t_qtiled:8.1} ms   \
+             speedup {:6.2}x   |err| naive/qtiled {err_naive:.2e}/{err_qtiled:.2e}   \
              est naive traffic {traffic_gb:6.0} GB/tower",
             t_naive / t_qtiled
         );
