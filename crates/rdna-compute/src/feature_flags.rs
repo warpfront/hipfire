@@ -622,6 +622,14 @@ pub struct FeatureFlags {
     /// one-tile base WMMA kernel for every prefill chunk. Default on for exact
     /// gfx1150; `0` restores the base route.
     pub mq4v2_gfx1150_bt: bool,
+    /// `HIPFIRE_MQ4V2_GFX1150_IU4` admits exact gfx1150 to the MQ4V2
+    /// (qt44) W4A4 prefill block: N >= 64 prefill chunks run the same
+    /// gfx11 `*_mmq_iu4` MMQ kernels as gfx1100/gfx1151 instead of the
+    /// F16-activation WMMA batch tiles. Unlike the BT tiles this route
+    /// quantizes the activation to int4, so it is **not** byte-identical
+    /// to the incumbent; default on for exact gfx1150 during the
+    /// admission measurement, `0` restores the WMMA route.
+    pub mq4v2_gfx1150_iu4: bool,
     /// Exact-K5120 MQ4V2 gate/up decode on gfx1100: default on (byte-identical
     /// to the generic kernel; `HIPFIRE_MQ4V2_GATEUP_K5120=0` opts out).
     pub mq4v2_gateup_k5120: bool,
@@ -1634,6 +1642,8 @@ impl FeatureFlags {
             gfx1151_xlds: parse_bool("HIPFIRE_GFX1151_XLDS").unwrap_or(arch == "gfx1151"),
             mq4v2_gfx1150_bt: parse_bool("HIPFIRE_MQ4V2_GFX1150_BT")
                 .unwrap_or(arch == "gfx1150"),
+            mq4v2_gfx1150_iu4: parse_bool("HIPFIRE_MQ4V2_GFX1150_IU4")
+                .unwrap_or(arch == "gfx1150"),
             mq4v2_gateup_k5120: parse_bool("HIPFIRE_MQ4V2_GATEUP_K5120").unwrap_or(true),
             gfx12_mq4v2_gateup_k5120: parse_bool("HIPFIRE_GFX12_MQ4V2_GATEUP_K5120")
                 .unwrap_or(false),
@@ -1943,11 +1953,17 @@ impl FeatureFlags {
     }
 
     /// Resolved iu4-direct MMQ route: on unless explicitly disabled, and only
-    /// on exact gfx1100/gfx1151 (K16 kernel) or gfx1201 (K32 kernel).
-    /// `=0`/other arches keep the incumbent.
+    /// on exact gfx1100/gfx1151 (K16 kernel) or gfx1201 (K32 kernel). Exact
+    /// gfx1150 joins behind `HIPFIRE_MQ4V2_GFX1150_IU4` (default on) on the
+    /// same generic gfx11 K16 kernel; `=0` on either flag keeps the gfx1150
+    /// incumbent WMMA route.
     pub fn iu4_prefill_enabled(&self) -> bool {
         self.iu4_prefill.unwrap_or(true)
-            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
+            && match self.arch.as_str() {
+                "gfx1100" | "gfx1151" | "gfx1201" => true,
+                "gfx1150" => self.mq4v2_gfx1150_iu4,
+                _ => false,
+            }
     }
 
     /// Arches with a production MQ3V25 A4 consumer
@@ -2746,6 +2762,7 @@ impl FeatureFlags {
             gfx1100_q8x_verify: false,
             gfx1151_xlds: false,
             mq4v2_gfx1150_bt: false,
+            mq4v2_gfx1150_iu4: false,
             mq4v2_gateup_k5120: false,
             gfx12_mq4v2_gateup_k5120: false,
             gfx12_mq4v2_fp8_gateup: false,
@@ -5953,19 +5970,35 @@ mod tests {
     #[test]
     fn iu4_prefill_default_on_gfx11_and_gfx1201() {
         // Default process policy: the iu4-direct MMQ prefill route is on for
-        // exact gfx1100/gfx1151 (K16 kernel) and gfx1201 (K32 kernel) and
-        // nowhere else; `kernel.iu4_prefill=false` (or
-        // `HIPFIRE_IU4_PREFILL=0`) opts out.
+        // exact gfx1100/gfx1151 (K16 kernel), gfx1201 (K32 kernel) and exact
+        // gfx1150 behind `HIPFIRE_MQ4V2_GFX1150_IU4` (generic gfx11 K16
+        // kernel); `kernel.iu4_prefill=false` (or `HIPFIRE_IU4_PREFILL=0`)
+        // opts out everywhere.
         let resolved = resolve([]).unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
-        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1150"] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(flags.iu4_prefill_enabled(), "arch={arch}");
         }
-        for arch in ["gfx1101", "gfx1150", "gfx942"] {
+        for arch in ["gfx1101", "gfx942"] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(!flags.iu4_prefill_enabled(), "arch={arch}");
         }
+        // The per-arch gfx1150 flag closes the admission again. Legacy env
+        // developer vars reach the flags only through the env layer, as in
+        // production (`load_local_process_config`).
+        std::env::set_var("HIPFIRE_MQ4V2_GFX1150_IU4", "0");
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::LegacyEnv {
+                name: "HIPFIRE_MQ4V2_GFX1150_IU4".into(),
+            },
+            layer: hipfire_config::load_env_layer().unwrap(),
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let flags = FeatureFlags::from_process_config("gfx1150", &process);
+        assert!(!flags.iu4_prefill_enabled());
+        std::env::remove_var("HIPFIRE_MQ4V2_GFX1150_IU4");
 
         let mut layer = ConfigLayer::default();
         layer.set_cli("kernel.iu4_prefill", "false").unwrap();
@@ -5977,13 +6010,13 @@ mod tests {
         }])
         .unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
-        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1150", "gfx942"] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(!flags.iu4_prefill_enabled(), "arch={arch}");
         }
 
         // The unit-test constructor stays off (deterministic baseline).
-        for arch in ["gfx1100", "gfx1151"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1150"] {
             let test_flags = FeatureFlags::for_test(arch);
             assert!(!test_flags.iu4_prefill_enabled(), "arch={arch}");
         }
@@ -5999,7 +6032,9 @@ mod tests {
 
         let resolved = resolve([]).unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
-        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1030", "gfx1101"] {
+        for arch in [
+            "gfx1100", "gfx1151", "gfx1201", "gfx1150", "gfx1030", "gfx1101",
+        ] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             let ctx = ArchCtx {
                 gpu_arch: Some(arch.into()),
