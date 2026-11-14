@@ -315,7 +315,7 @@ global-only TOML namespace instead of as hundreds of ambient process switches:
 ```toml
 [developer]
 gfx1151_gate_up_wave64 = true
-deepseek4_attn = "twin"
+moe_iu4_wide_tiles = false
 replay_pm4_queues = 4
 ```
 
