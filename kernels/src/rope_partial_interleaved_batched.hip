@@ -25,9 +25,10 @@ extern "C" __global__ void rope_partial_interleaved_batched_f32(
     int n_rot,          // number of dims to rotate (64 for Qwen3.5)
     float freq_base,
     int batch_size,
-    int pos_offset      // added to positions[b] for the RoPE angle (NOT the KV slot);
+    int pos_offset,     // added to positions[b] for the RoPE angle (NOT the KV slot);
                         // carries kv_cache.compact_offset so post-eviction batched
                         // Q/K rotate at absolute phase matching cached keys. 0 = no-op.
+    RopeYarn yarn
 ) {
     int pair = blockIdx.x * blockDim.x + threadIdx.x;
     int b = blockIdx.y;
@@ -42,8 +43,8 @@ extern "C" __global__ void rope_partial_interleaved_batched_f32(
 
     float freq = 1.0f / powf(freq_base, (float)(2 * pair) / (float)n_rot);
     float angle = (float)pos * freq;
-    float cos_a = cosf(angle);
-    float sin_a = sinf(angle);
+    float cos_a, sin_a;
+    rope_yarn_sincos(angle, pair, yarn, &sin_a, &cos_a);
 
     int q_stride = n_heads_q * head_dim;
     int k_stride = n_heads_k * head_dim;

@@ -49,6 +49,8 @@ pub struct HybridDims {
     /// Rotated channels per head (partial rotary).
     pub n_rot: usize,
     pub rope_theta: f32,
+    /// Long-context RoPE scaling (YaRN); `None` for plain RoPE.
+    pub rope_scaling: rdna_compute::rope::RopeScaling,
     pub norm_eps: f32,
     pub linear_key_heads: usize,
     pub linear_value_heads: usize,
@@ -60,6 +62,16 @@ pub struct HybridDims {
 }
 
 impl HybridDims {
+    /// The `RopeYarn` kernel argument for this model's rotary width.
+    /// `RopeYarn::OFF` (identity) when no scaling is active.
+    pub fn rope_yarn(&self) -> rdna_compute::rope::RopeYarn {
+        rdna_compute::rope::Rope {
+            theta: self.rope_theta as f64,
+            scaling: self.rope_scaling,
+        }
+        .yarn(self.n_rot)
+    }
+
     fn key_width(&self) -> usize {
         self.linear_key_heads * self.linear_key_dim
     }
@@ -1233,6 +1245,7 @@ impl GatedAttentionOp<'_> {
             gpu.memcpy_htod_auto(row.pos_buf, &logical.to_ne_bytes())
                 .map_err(hip)?;
         }
+        let yarn = dims.rope_yarn();
         if let Some(mrope) = self.mrope {
             gpu.rope_mrope_halfsplit_f32(
                 row.q,
@@ -1261,6 +1274,7 @@ impl GatedAttentionOp<'_> {
                 dims.rope_theta,
                 dims.n_heads,
                 dims.n_kv_heads,
+                &yarn,
             )
         } else if fused_prep {
             gpu.qwen35_fa_prep_gfx1100(
@@ -1275,6 +1289,7 @@ impl GatedAttentionOp<'_> {
                 dims.rope_theta,
                 dims.n_heads,
                 dims.n_kv_heads,
+                &yarn,
             )
         } else {
             gpu.rope_partial_interleaved_f32(
@@ -1286,6 +1301,7 @@ impl GatedAttentionOp<'_> {
                 dims.head_dim,
                 dims.n_rot,
                 dims.rope_theta,
+                &yarn,
             )
         }
         .map_err(hip)?;
@@ -1374,6 +1390,7 @@ fn attention_shard(
     if let Some(tap) = op.tap {
         tap(gpu)?;
     }
+    let yarn = dims.rope_yarn();
     gpu.rope_partial_interleaved_f32(
         row.q,
         row.k,
@@ -1383,6 +1400,7 @@ fn attention_shard(
         dims.head_dim,
         dims.n_rot,
         dims.rope_theta,
+        &yarn,
     )
     .map_err(hip)?;
     let fused_epilogue = kv_attention(gpu, ctx, dims, &op.kv, row, &op.wo, false)?;

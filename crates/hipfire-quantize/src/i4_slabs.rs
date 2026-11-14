@@ -38,8 +38,23 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+
+/// Positional exact read. Unix keeps `pread` (no mutation of the shared
+/// handle); Windows has no `pread`, so a cloned handle seeks + reads
+/// (quantizer tooling only, one extra fd per call).
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+#[cfg(not(unix))]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read_exact(buf)
+}
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
@@ -795,8 +810,7 @@ struct E8pFile {
 impl E8pFile {
     fn read_at(&self, expert: usize, off: usize, len: usize) -> io::Result<Vec<u8>> {
         let mut v = vec![0u8; len];
-        self.file
-            .read_exact_at(&mut v, self.offsets[expert] + off as u64)?;
+        read_exact_at(&self.file, &mut v, self.offsets[expert] + off as u64)?;
         Ok(v)
     }
 }
@@ -1304,7 +1318,7 @@ fn copy_span(
         if buf.len() < n {
             buf.resize(n, 0);
         }
-        file.read_exact_at(&mut buf[..n], offset + done)?;
+        read_exact_at(&file, &mut buf[..n], offset + done)?;
         hasher.update(&buf[..n]);
         w.write_all(&buf[..n])?;
         done += n as u64;
@@ -1324,8 +1338,7 @@ fn sha256_file(path: &Path) -> Result<(String, u64), SlabError> {
     let mut off = 0u64;
     while off < len {
         let n = (len - off).min(buf.len() as u64) as usize;
-        file.read_exact_at(&mut buf[..n], off)
-            .map_err(|e| io_err(path.display(), e))?;
+        read_exact_at(&file, &mut buf[..n], off).map_err(|e| io_err(path.display(), e))?;
         hasher.update(&buf[..n]);
         off += n as u64;
     }
@@ -2216,7 +2229,7 @@ fn verify_output(
         s.spawn(move || {
             let read = |off: u64, n: usize| -> io::Result<Vec<u8>> {
                 let mut v = vec![0u8; n];
-                file.read_exact_at(&mut v, off)?;
+                read_exact_at(&file, &mut v, off)?;
                 Ok(v)
             };
             let run = || -> io::Result<()> {

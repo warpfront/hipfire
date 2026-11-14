@@ -144,6 +144,8 @@ impl Qwen35MtpHeadConfig {
             n_kv_heads: self.n_head_kv,
             head_dim: self.head_dim,
             rope_theta: self.rope_theta,
+            rope_scaling: rdna_compute::rope::RopeScaling::None,
+            max_position_embeddings: 262144,
             partial_rotary_factor: self.n_rot as f32 / self.head_dim as f32,
             is_vl_text: false,
             mrope_interleaved: false,
@@ -177,6 +179,7 @@ impl Qwen35MtpHeadConfig {
             head_dim: self.head_dim,
             n_rot: self.n_rot,
             rope_theta: self.rope_theta,
+            rope_scaling: rdna_compute::rope::RopeScaling::None,
             norm_eps: self.rms_norm_eps,
             linear_key_heads: 0,
             linear_value_heads: 0,
@@ -3518,6 +3521,7 @@ pub fn mtp_head_forward_block_batched(
         n,
         // pos_offset=0: MTP head has its own non-compacted KV. Unchanged behavior.
         0,
+        &rdna_compute::rope::RopeYarn::OFF,
     )?;
 
     // ── 6. v1 simplification: per-slot K/V writes + attention = V

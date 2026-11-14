@@ -873,6 +873,7 @@ pub fn dspark_qwen3_block_forward(
                 config.rope_freq_base,
                 block,
                 0,
+                &rdna_compute::rope::RopeYarn::OFF,
             )
         } else {
             gpu.rope_batched_f32(
@@ -901,6 +902,7 @@ pub fn dspark_qwen3_block_forward(
                 config.rope_freq_base,
                 kv_cap,
                 0,
+                &rdna_compute::rope::RopeYarn::OFF,
             )
         } else {
             gpu.rope_batched_f32(

@@ -34,7 +34,8 @@ extern "C" __global__ void rope_partial_halfsplit_batched_f32(
     int pos_offset,  // added to positions[b] for the RoPE angle (NOT the KV slot);
                      // carries kv_cache.compact_offset so post-eviction batched
                      // Q/K rotate at absolute phase matching the cached keys. 0 = no-op.
-    float* __restrict__ angle_out  // optional [batch_size * n_rot] angle table; nullptr = off
+    float* __restrict__ angle_out,  // optional [batch_size * n_rot] angle table; nullptr = off
+    RopeYarn yarn
 ) {
     int b = blockIdx.y;
     int half = n_rot / 2;
@@ -49,8 +50,7 @@ extern "C" __global__ void rope_partial_halfsplit_batched_f32(
     for (int i = threadIdx.x; i < half; i += blockDim.x) {
         float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)n_rot);
         float angle = (float)pos * freq;
-        cos_angles[i] = cosf(angle);
-        sin_angles[i] = sinf(angle);
+        rope_yarn_sincos(angle, i, yarn, &sin_angles[i], &cos_angles[i]);
         // Optional capture of the exact angle floats the rotations below consume
         // (A3B F5 PM Q prep rotates Q by this same table). Row layout [n_rot]:
         // cos[0..half], sin[half..n_rot]. Null for every other caller.

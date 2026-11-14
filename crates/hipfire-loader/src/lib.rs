@@ -2672,44 +2672,74 @@ fn finish_qwen35_load(
             None
         };
 
+    // ── YaRN + speculative decode refusal (v1 boundary) ───────────
+    // YaRN rescales low-frequency RoPE bands at ALL positions, so the
+    // draft's position arithmetic diverges from the target's. Refuse
+    // DFlash and MTP when YaRN is active (same boundary as
+    // `hipfire-arch-qwen35::serve_engine`).
+    let yarn_active = !matches!(config.rope_scaling, rdna_compute::rope::RopeScaling::None);
+    if yarn_active {
+        eprintln!(
+            "  YaRN RoPE scaling active: speculative decode (DFlash/MTP) is not supported in v1; serving AR only"
+        );
+    }
+
     // ── DFlash (skipped when a DSpark sidecar won) ─────────────────
     let dflash = if adaptive_blocks_generic_spec || dspark_speculator.is_some() {
         None
     } else if let Some(dp) = ctx.draft_path {
-        match hipfire_arch_qwen35::dflash_spec::load_dflash_state(
-            dp,
-            physical_cap,
-            config,
-            dn_state,
-            ctx.gpu,
-            ctx.spec.ddtree_budget,
-            ctx.spec.ddtree_topk,
-            &bundle.weights,
-            // Exact plain Q8 KV (not asym/fwht variants). Matches design:
-            // flags on the already-built cache — never re-resolve the string.
-            {
-                let kv = &bundle.kv_cache;
-                kv.quant_q8
-                    && !kv.quant_fwht
-                    && !kv.quant_asym2
-                    && !kv.quant_asym3
-                    && !kv.quant_asym4
-                    && matches!(kv.v_mode, llama::VMode::Q8)
-            },
-            bundle.kv_cache.uses_vmm_backend(),
-            bundle.scratch.flash_partials.numel(),
-            // finish_qwen35_load is the single-GPU carrier path.
-            true,
-            // Fail-closed: adaptive KV starts FWHT4 and tier-switches at runtime.
-            // Upstream also suppresses DFlash when adaptive is Some; this keeps
-            // admission honest if a future path reaches load_dflash_state.
-            bundle.kv_adaptive.is_some(),
-            ctx.spec
-                .dflash_block
-                .unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED),
-        ) {
-            Ok(s) => {
-                eprintln!(
+        if yarn_active {
+            if ctx.spec.dflash == Some(true) {
+                return Err(rollback_unfinished_qwen35(
+                    "YaRN RoPE scaling is active: DFlash is not supported in v1; \
+                     use dflash_mode=off or remove attention.yarn_factor"
+                        .to_string(),
+                    bundle,
+                    vision_weights,
+                    ctx.gpu,
+                ));
+            }
+            eprintln!("  DFlash draft {} refused: YaRN active (v1 boundary)", dp);
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::SpecOff,
+                "DFlash off: YaRN active (v1 boundary)",
+            );
+            None
+        } else {
+            match hipfire_arch_qwen35::dflash_spec::load_dflash_state(
+                dp,
+                physical_cap,
+                config,
+                dn_state,
+                ctx.gpu,
+                ctx.spec.ddtree_budget,
+                ctx.spec.ddtree_topk,
+                &bundle.weights,
+                // Exact plain Q8 KV (not asym/fwht variants). Matches design:
+                // flags on the already-built cache — never re-resolve the string.
+                {
+                    let kv = &bundle.kv_cache;
+                    kv.quant_q8
+                        && !kv.quant_fwht
+                        && !kv.quant_asym2
+                        && !kv.quant_asym3
+                        && !kv.quant_asym4
+                        && matches!(kv.v_mode, llama::VMode::Q8)
+                },
+                bundle.kv_cache.uses_vmm_backend(),
+                bundle.scratch.flash_partials.numel(),
+                // finish_qwen35_load is the single-GPU carrier path.
+                true,
+                // Fail-closed: adaptive KV starts FWHT4 and tier-switches at runtime.
+                // Upstream also suppresses DFlash when adaptive is Some; this keeps
+                // admission honest if a future path reaches load_dflash_state.
+                bundle.kv_adaptive.is_some(),
+                ctx.spec
+                    .dflash_block
+                    .unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED),
+            ) {
+                Ok(s) => {
+                    eprintln!(
                     "  DFlash draft loaded: {} (layers={}, hidden={}, block={}, runtime_block={})",
                     dp,
                     s.draft_config.n_layers,
@@ -2717,22 +2747,22 @@ fn finish_qwen35_load(
                     s.draft_config.block_size,
                     s.block_size
                 );
-                hipfire_config::load_summary::note(
-                    hipfire_config::load_summary::Facet::SpecOn,
-                    format!(
-                        "dflash (draft {}, block {})",
-                        Path::new(dp)
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| dp.to_string()),
-                        s.block_size
-                    ),
-                );
-                Some(s)
-            }
-            Err(e) => {
-                if ctx.spec.dflash == Some(true) {
-                    return Err(rollback_unfinished_qwen35(
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::SpecOn,
+                        format!(
+                            "dflash (draft {}, block {})",
+                            Path::new(dp)
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| dp.to_string()),
+                            s.block_size
+                        ),
+                    );
+                    Some(s)
+                }
+                Err(e) => {
+                    if ctx.spec.dflash == Some(true) {
+                        return Err(rollback_unfinished_qwen35(
                         format!(
                             "DFlash draft required (speculation.dflash = on) but failed to load ({dp}): {e}"
                         ),
@@ -2740,16 +2770,17 @@ fn finish_qwen35_load(
                         vision_weights,
                         ctx.gpu,
                     ));
+                    }
+                    eprintln!(
+                        "  DFlash draft load failed ({}): {} — falling back to AR only",
+                        dp, e
+                    );
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::SpecOff,
+                        format!("DFlash draft load failed: {e}"),
+                    );
+                    None
                 }
-                eprintln!(
-                    "  DFlash draft load failed ({}): {} — falling back to AR only",
-                    dp, e
-                );
-                hipfire_config::load_summary::note(
-                    hipfire_config::load_summary::Facet::SpecOff,
-                    format!("DFlash draft load failed: {e}"),
-                );
-                None
             }
         }
     } else {
@@ -2886,6 +2917,7 @@ fn finish_qwen35_load(
             || mtp_floor_declined
             || dflash.is_some()
             || dspark_speculator.is_some()
+            || yarn_active
         {
             None
         } else {

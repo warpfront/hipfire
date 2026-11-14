@@ -824,6 +824,7 @@ pub fn forward_batch(
             // the RoPE angle only. MiniMax prefill does no KV compaction, so 0
             // is the behavior-preserving no-op offset.
             0,
+            &rdna_compute::rope::RopeYarn::OFF,
         )
         .map_err(|e| format!("minimax L{l} batch rope: {e:?}"))?;
         gpu.kv_cache_write_q8_0_batched(

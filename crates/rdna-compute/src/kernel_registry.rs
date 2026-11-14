@@ -48,30 +48,42 @@ mod kernels {
     #[cfg(not(feature = "deltanet"))]
     pub const GATED_NORM_SRC: &str = include_str!("../../../kernels/src/gated_norm.hip");
     #[cfg(not(feature = "deltanet"))]
-    pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str =
-        include_str!("../../../kernels/src/rope_partial_interleaved.hip");
+    pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str = concat!(
+        include_str!("../../../kernels/src/rope_yarn.h"),
+        include_str!("../../../kernels/src/rope_partial_interleaved.hip")
+    );
     #[cfg(not(feature = "deltanet"))]
     pub const GATED_DELTA_NET_Q8_SRC: &str =
         include_str!("../../../kernels/src/gated_delta_net_q8.hip");
     #[cfg(not(feature = "deltanet"))]
-    pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str =
-        include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
+    pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str = concat!(
+        include_str!("../../../kernels/src/rope_yarn.h"),
+        include_str!("../../../kernels/src/rope_partial_halfsplit.hip")
+    );
     #[cfg(not(feature = "deltanet"))]
-    pub const ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC: &str =
-        include_str!("../../../kernels/src/rope_partial_halfsplit_headgrid.hip");
+    pub const ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC: &str = concat!(
+        include_str!("../../../kernels/src/rope_yarn.h"),
+        include_str!("../../../kernels/src/rope_partial_halfsplit_headgrid.hip")
+    );
     #[cfg(not(feature = "deltanet"))]
-    pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
-        include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip");
+    pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str = concat!(
+        include_str!("../../../kernels/src/rope_yarn.h"),
+        include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip")
+    );
     #[cfg(not(feature = "deltanet"))]
-    pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
-        include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip");
+    pub const QWEN35_FA_PREP_GFX1100_SRC: &str = concat!(
+        include_str!("../../../kernels/src/rope_yarn.h"),
+        include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
+    );
     #[cfg(not(feature = "deltanet"))]
     pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
+        include_str!("../../../kernels/src/rope_yarn.h"),
         "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151\n",
         include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
     );
     #[cfg(not(feature = "deltanet"))]
     pub const QWEN35_FA_PREP_GFX1201_SRC: &str = concat!(
+        include_str!("../../../kernels/src/rope_yarn.h"),
         "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1201\n",
         include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
     );
@@ -971,7 +983,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("mq_rotate_x", kernels::GEMV_MQ4G256_SRC, ["mq_rotate_x"]);
         add!(
             "qwen35_fa_prep_batched_gfx1201",
-            include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1201.hip"),
+            concat!(
+                include_str!("../../../kernels/src/rope_yarn.h"),
+                include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1201.hip")
+            ),
             ["qwen35_fa_prep_batched_gfx1201"]
         );
         add!("rmsnorm_f32", kernels::RMSNORM_SRC, ["rmsnorm_f32"]);

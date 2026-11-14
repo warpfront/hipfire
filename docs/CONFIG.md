@@ -1041,7 +1041,14 @@ outputs at short context, so set it only for long-context loads.
 Implemented by the engine (`rdna_compute::rope`, `kernels/src/rope_yarn.h`);
 the value reaches the engine through the versioned `ProcessConfig` into
 `RuntimeConfig::yarn_factor`. It is currently wired for Qwen4 (Flash-Next)
-and for the CLI's declared-context calculation. Other families ignore it.
+and Qwen3.5/3.8 (dense, arch 5/6) and for the CLI's declared-context
+calculation. Other families ignore it.
+
+**Qwen3.5/3.8 YaRN boundary (v1):** speculative decode (DFlash/MTP) is
+refused when YaRN is active — the draft's position arithmetic diverges from
+the target's under rescaled RoPE. The load logs the boundary and serves AR
+only; `dflash_mode=on` fails the load with a clear error. The default path
+(no YaRN) stays bit-exact: `RopeYarn::OFF` is the identity kernel argument.
 
 ---
 
