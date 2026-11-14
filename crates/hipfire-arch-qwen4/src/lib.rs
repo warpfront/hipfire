@@ -155,7 +155,6 @@ pub use config::{
 pub use gpu_forward::{
     ep_reserve_receipt_scope, qwen4_compact_scratch_possible, qwen4_forward_device_bytes,
     qwen4_forward_scratch_mode, Qwen4ForwardScratchMode, QWEN4_COMPACT_FALLBACK_ROWS,
-    QWEN4_COMPACT_SCRATCH_ENV,
 };
 pub use gpu_forward_lanes::{WaveHead, WaveLane};
 pub use hc8_sidecar::{hc8_sidecar_saved_bytes, resolve_hc8_sidecar, Qwen4Hc8Sidecar};

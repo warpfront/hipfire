@@ -2087,39 +2087,18 @@ pub(crate) fn vmm_context_arena_mapped_bytes(
         .ok()
 }
 
-/// `HIPFIRE_QWEN4_CAPTURE_RING_COMPACT` (developer, default ON, exact `0` is
-/// the kill switch back to the double ring): lay the GDN
-/// verify capture ring out as `rows + 1` state slots per layer instead of
-/// `2 * rows`. The ring is only ever written at ONE slot per half (the
-/// capture kernel and the rollback kernel both leave the last row's state in
-/// slot `rows - 1` of the view they are handed), so the other `rows - 1`
-/// slots of each half were never touched. The logical slot numbering
-/// (`gdn_live`, halves, digests) is unchanged; [`capture_ring_slot`] maps it
-/// onto the compact storage.
-pub(crate) const CAPTURE_RING_COMPACT_ENV: &str = "HIPFIRE_QWEN4_CAPTURE_RING_COMPACT";
-
-/// Whether new capture rings use the compact layout (unset or `1`; `0` off).
-pub(crate) fn compact_capture_ring() -> bool {
-    hipfire_config::developer_bool(CAPTURE_RING_COMPACT_ENV, true)
-}
-
-/// State slots one layer's capture ring of `rows` rows holds.
-pub(crate) fn capture_ring_slots(compact: bool, rows: usize) -> Option<usize> {
-    if compact {
-        rows.checked_add(1)
-    } else {
-        rows.checked_mul(2)
-    }
+/// State slots one layer's capture ring of `rows` rows holds: `rows + 1`,
+/// one written per half.
+pub(crate) fn capture_ring_slots(rows: usize) -> Option<usize> {
+    rows.checked_add(1)
 }
 
 /// Physical ring slot of logical slot `logical` (`0..2 * rows`). The lower
 /// logical half (`< rows`) lands in physical slot `rows - 1`, the upper half
 /// in `rows`: exactly the slots a capture or rollback of the half writes
 /// when its view starts at [`capture_view_start`].
-pub(crate) fn capture_ring_slot(compact: bool, rows: usize, logical: usize) -> usize {
-    if !compact {
-        logical
-    } else if logical < rows {
+pub(crate) fn capture_ring_slot(rows: usize, logical: usize) -> usize {
+    if logical < rows {
         rows - 1
     } else {
         rows
@@ -2129,16 +2108,12 @@ pub(crate) fn capture_ring_slot(compact: bool, rows: usize, logical: usize) -> u
 /// First physical slot of the `n`-row view a capture or rollback into the
 /// half starting at logical slot `base` hands the kernel: the kernel leaves
 /// the result in view slot `n - 1`, which must be the half's physical slot.
-pub(crate) fn capture_view_start(compact: bool, rows: usize, base: usize, n: usize) -> usize {
-    if !compact {
-        base
-    } else {
-        capture_ring_slot(true, rows, base) + 1 - n
-    }
+pub(crate) fn capture_view_start(rows: usize, base: usize, n: usize) -> usize {
+    capture_ring_slot(rows, base) + 1 - n
 }
 
 /// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` (developer, default ON, exact `0` is the
-/// kill switch back to one ring allocation per GDN layer): the compact
+/// kill switch back to one ring allocation per GDN layer): the
 /// capture ring of every GDN layer is a window of ONE shared pool allocation
 /// ([`capture_ring_pool_slots`]) instead of `rows + 1` slots per layer.
 ///
@@ -2159,8 +2134,7 @@ pub(crate) fn capture_view_start(compact: bool, rows: usize, base: usize, n: usi
 /// (`2 L' + rows - 1`, `2 L' + rows`), and the windows overlap only in slots
 /// nobody touches. The kernels, the pointer table, the logical slot numbering
 /// (`gdn_live`, halves) and every view are unchanged; only the allocation
-/// behind the window pointers is shared. Requires the compact layout (the
-/// double ring writes every slot of its half).
+/// behind the window pointers is shared.
 pub(crate) fn lane_reserve_trim() -> bool {
     hipfire_config::qwen4_lane_reserve_trim()
 }
@@ -2181,31 +2155,25 @@ pub(crate) fn capture_ring_pool_slots(rows: usize, gdn_layers: usize) -> Option<
 }
 
 /// Ring state slots a whole state allocates across its `gdn_layers` GDN
-/// layers for `rows`-row blocks: the shared pool when `compact` and `trim`,
-/// else `capture_ring_slots` per layer. `None` on overflow.
+/// layers for `rows`-row blocks: the shared pool when `trim`, else
+/// `capture_ring_slots` per layer. `None` on overflow.
 pub(crate) fn capture_ring_total_slots(
-    compact: bool,
     trim: bool,
     rows: usize,
     gdn_layers: usize,
 ) -> Option<usize> {
     if gdn_layers == 0 {
         Some(0)
-    } else if compact && trim {
+    } else if trim {
         capture_ring_pool_slots(rows, gdn_layers)
     } else {
-        gdn_layers.checked_mul(capture_ring_slots(compact, rows)?)
+        gdn_layers.checked_mul(capture_ring_slots(rows)?)
     }
 }
 
 /// [`capture_ring_total_slots`] under the process configuration.
 pub(crate) fn current_capture_ring_total_slots(rows: usize, gdn_layers: usize) -> Option<usize> {
-    capture_ring_total_slots(
-        compact_capture_ring(),
-        lane_reserve_trim(),
-        rows,
-        gdn_layers,
-    )
+    capture_ring_total_slots(lane_reserve_trim(), rows, gdn_layers)
 }
 
 /// The snapshot-arena mirror allocation (elements, dtype) of one state
@@ -2476,12 +2444,9 @@ pub struct Qwen4State {
     /// are views of ([`lane_reserve_trim`], [`capture_ring_pool_slots`]);
     /// `None`: every layer's ring in `row_capture` is its own allocation.
     row_capture_pool: Option<GpuTensor>,
-    /// Rows a verify may capture (0 = none allocated); the ring holds twice
-    /// as many slots.
+    /// Rows a verify may capture (0 = none allocated); the ring holds `2 * rows`
+    /// logical slots on `rows + 1` physical ones ([`capture_ring_slots`]).
     row_capture_rows: usize,
-    /// The ring was allocated in the compact `rows + 1`-slot layout
-    /// ([`capture_ring_slots`]); fixed per allocation.
-    row_capture_compact: bool,
     /// Live ring slot of every GDN layer's recurrent state.
     gdn_live: usize,
     /// Storage of every GDN layer's recurrent state (and its ring slots).
@@ -2924,7 +2889,6 @@ impl Qwen4State {
             row_capture_output: None,
             row_capture_pool: None,
             row_capture_rows: 0,
-            row_capture_compact: false,
             gdn_live: 0,
             gdn_format: format.gdn,
             gdn_value_heads: config.linear_num_value_heads,
@@ -4688,20 +4652,17 @@ impl Qwen4State {
             gdn,
             rows,
             gdn_layers,
-            compact_capture_ring(),
             lane_reserve_trim(),
         )
     }
 
-    /// [`Self::row_capture_allocation_sizes_scoped`] for an explicit ring
-    /// layout: `compact` ([`compact_capture_ring`]) and `trim`
-    /// ([`lane_reserve_trim`], effective only with `compact`).
+    /// [`Self::row_capture_allocation_sizes_scoped`] for an explicit `trim`
+    /// ([`lane_reserve_trim`]).
     pub(crate) fn row_capture_allocation_sizes_layout(
         config: &Qwen4Config,
         gdn: GdnStateFormat,
         rows: usize,
         gdn_layers: usize,
-        compact: bool,
         trim: bool,
     ) -> Option<Vec<u64>> {
         if rows > hipfire_config::QWEN4_VERIFY_MAX_ROWS {
@@ -4724,9 +4685,9 @@ impl Qwen4State {
             .checked_mul(config.linear_value_head_dim)?
             .checked_mul(key_units)?
             .checked_mul(gdn.storage().dtype().size())?;
-        let ring = slot_bytes.checked_mul(capture_ring_slots(compact, rows)?)?;
+        let ring = slot_bytes.checked_mul(capture_ring_slots(rows)?)?;
         // One shared pool for every layer's window (`lane_reserve_trim`).
-        let pool = if compact && trim {
+        let pool = if trim {
             Some(slot_bytes.checked_mul(capture_ring_pool_slots(rows, gdn_layers)?)?)
         } else {
             None
@@ -4858,14 +4819,12 @@ impl Qwen4State {
                 .checked_mul(DType::F32.size())
                 .ok_or_else(overflow)?;
         }
-        let compact = compact_capture_ring();
-        let ring_slots = capture_ring_slots(compact, rows).ok_or_else(overflow)?;
-        let initial_slot = capture_ring_slot(compact, rows, 0);
+        let ring_slots = capture_ring_slots(rows).ok_or_else(overflow)?;
+        let initial_slot = capture_ring_slot(rows, 0);
         // Every GDN layer's slot has one geometry (the rollback launch relies
         // on it too); a pool needs it to carve equal windows.
         let (pool_state, pool_dtype) = (self.gdn[0].recurrent.numel(), self.gdn[0].recurrent.dtype);
-        let pooled = compact
-            && lane_reserve_trim()
+        let pooled = lane_reserve_trim()
             && self.gdn.iter().all(|layer| {
                 layer.recurrent.numel() == pool_state && layer.recurrent.dtype == pool_dtype
             });
@@ -4991,7 +4950,6 @@ impl Qwen4State {
             }
         }
         self.row_capture_rows = rows;
-        self.row_capture_compact = compact;
         self.gdn_live = 0;
         // Publish a complete coherent ring before releasing previous storage.
         // A previous pool owns its windows; otherwise each layer's ring is owned.
@@ -5036,7 +4994,7 @@ impl Qwen4State {
     /// Point every GDN layer's `recurrent` at ring slot `slot`.
     fn set_gdn_live(&mut self, slot: usize) {
         self.gdn_live = slot;
-        let physical = capture_ring_slot(self.row_capture_compact, self.row_capture_rows, slot);
+        let physical = capture_ring_slot(self.row_capture_rows, slot);
         for (layer, (ring, _, _)) in self.gdn.iter_mut().zip(&self.row_capture) {
             let state = layer.recurrent.numel();
             layer.recurrent = ring.sub_offset(physical * state, state);
@@ -5056,8 +5014,7 @@ impl Qwen4State {
             .get(slot)
             .map(|(ring, inputs, recurrence)| GdnRowCapture {
                 states: ring.sub_offset(
-                    capture_view_start(self.row_capture_compact, self.row_capture_rows, base, rows)
-                        * state,
+                    capture_view_start(self.row_capture_rows, base, rows) * state,
                     rows * state,
                 ),
                 inputs,
@@ -5213,9 +5170,8 @@ impl Qwen4State {
             let qkv = conv / conv_history;
             let value_heads = self.gdn_value_heads;
             let key_heads = (qkv - value_heads * GDN_HEAD_DIM) / (2 * GDN_HEAD_DIM);
-            let from = capture_ring_slot(self.row_capture_compact, self.row_capture_rows, before);
-            let to =
-                capture_view_start(self.row_capture_compact, self.row_capture_rows, base, keep);
+            let from = capture_ring_slot(self.row_capture_rows, before);
+            let to = capture_view_start(self.row_capture_rows, base, keep);
             if self.gdn_format.has_residual() {
                 // The verify advanced every live residual in place; the entry
                 // residual exists only in the transaction mirror. Restore it, then
@@ -5590,24 +5546,21 @@ impl std::error::Error for StateError {}
 mod tests {
     use super::*;
 
-    /// The compact capture ring (`rows + 1` slots) is observationally the
-    /// `2 * rows`-slot ring: replaying random verify commits and rollbacks
-    /// on both layouts, with the kernels modeled as "write only view slot
-    /// n - 1", the live value always matches, no write touches the live or
-    /// the rollback-source slot, and every view stays inside the ring.
+    /// The capture ring (`rows + 1` physical slots) is observationally the logical
+    /// `2 * rows`-slot ring it models: replaying random verify commits and rollbacks
+    /// on both, with the kernels modeled as "write only view slot n - 1", the live
+    /// value always matches, no write touches the live or the rollback-source slot,
+    /// and every view stays inside the ring.
     #[test]
-    fn compact_capture_ring_matches_the_double_ring() {
+    fn capture_ring_matches_the_logical_ring() {
         for rows in 2..=hipfire_config::QWEN4_VERIFY_MAX_ROWS.min(16) {
-            assert_eq!(capture_ring_slots(false, rows), Some(2 * rows));
-            assert_eq!(capture_ring_slots(true, rows), Some(rows + 1));
-            let mut rings = [vec![0u64; 2 * rows], vec![0u64; rows + 1]];
-            let compact = [false, true];
-            // Initial live slot 0 holds value 1 in both layouts.
-            let mut live = [0usize; 2];
-            for k in 0..2 {
-                let slot = capture_ring_slot(compact[k], rows, 0);
-                rings[k][slot] = 1;
-            }
+            assert_eq!(capture_ring_slots(rows), Some(rows + 1));
+            let mut ring = vec![0u64; rows + 1];
+            let mut logical = vec![0u64; 2 * rows];
+            // Initial live slot 0 holds value 1.
+            ring[capture_ring_slot(rows, 0)] = 1;
+            logical[0] = 1;
+            let mut live = 0usize;
             let capture_base = |live: usize| if live < rows { rows } else { 0 };
             let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ rows as u64;
             let mut next = move || {
@@ -5621,47 +5574,34 @@ mod tests {
                 let verify_rows = 2 + (next() as usize) % (rows - 1);
                 let rollback = next() % 2 == 0 && verify_rows > 2;
                 let keep = 1 + (next() as usize) % (verify_rows - 1);
-                let before = live[0];
-                assert_eq!(live[0], live[1]);
+                let before = live;
                 let base = capture_base(before);
-                for k in 0..2 {
-                    let n = verify_rows;
-                    let start = capture_view_start(compact[k], rows, base, n);
-                    assert!(start + n <= rings[k].len(), "view out of ring");
-                    let written = start + n - 1;
-                    assert_ne!(written, capture_ring_slot(compact[k], rows, before));
-                    rings[k][written] = value;
-                }
-                let after_verify = base + verify_rows - 1;
-                for k in 0..2 {
-                    live[k] = after_verify;
-                }
+                let start = capture_view_start(rows, base, verify_rows);
+                assert!(start + verify_rows <= ring.len(), "view out of ring");
+                let written = start + verify_rows - 1;
+                assert_ne!(written, capture_ring_slot(rows, before));
+                ring[written] = value;
+                logical[base + verify_rows - 1] = value;
+                live = base + verify_rows - 1;
                 if rollback {
                     // Rollback re-runs `keep` rows from the pre-verify slot
                     // `before` into the half `base`.
-                    for k in 0..2 {
-                        let from = capture_ring_slot(compact[k], rows, before);
-                        let to = capture_view_start(compact[k], rows, base, keep);
-                        assert!(to + keep <= rings[k].len());
-                        let written = to + keep - 1;
-                        assert_ne!(written, from);
-                        rings[k][written] = rings[k][from] + 7;
-                        live[k] = base + keep - 1;
-                    }
+                    let from = capture_ring_slot(rows, before);
+                    let to = capture_view_start(rows, base, keep);
+                    assert!(to + keep <= ring.len());
+                    let written = to + keep - 1;
+                    assert_ne!(written, from);
+                    ring[written] = ring[from] + 7;
+                    logical[base + keep - 1] = logical[before] + 7;
+                    live = base + keep - 1;
                 }
-                for k in 0..2 {
-                    let slot = capture_ring_slot(compact[k], rows, live[k]);
-                    assert_eq!(
-                        rings[k][slot],
-                        rings[1 - k][capture_ring_slot(compact[1 - k], rows, live[1 - k])]
-                    );
-                }
+                assert_eq!(ring[capture_ring_slot(rows, live)], logical[live]);
             }
         }
     }
 
     /// The shared capture-ring pool (`HIPFIRE_QWEN4_LANE_RESERVE_TRIM`) is observationally the
-    /// per-layer compact ring: replaying random verify commits and rollbacks over every layer of
+    /// per-layer ring: replaying random verify commits and rollbacks over every layer of
     /// a state with the kernels modeled as "read the live / source slot, write only view slot
     /// n - 1", each layer's live value matches its own private ring, every layer's views stay
     /// inside the pool, and no pool slot is ever written by two layers (so no layer's live or
@@ -5670,21 +5610,16 @@ mod tests {
     fn shared_capture_pool_matches_per_layer_rings() {
         for layers in [1usize, 2, 7, 36] {
             for rows in 2..=hipfire_config::QWEN4_VERIFY_MAX_ROWS.min(16) {
-                let window = capture_ring_slots(true, rows).unwrap();
+                let window = capture_ring_slots(rows).unwrap();
                 let pool_slots = capture_ring_pool_slots(rows, layers).unwrap();
                 assert_eq!(pool_slots, CAPTURE_POOL_STRIDE * (layers - 1) + rows + 1);
                 assert_eq!(
-                    capture_ring_total_slots(true, true, rows, layers),
+                    capture_ring_total_slots(true, rows, layers),
                     Some(pool_slots)
                 );
                 assert_eq!(
-                    capture_ring_total_slots(true, false, rows, layers),
+                    capture_ring_total_slots(false, rows, layers),
                     Some(layers * window)
-                );
-                assert_eq!(
-                    capture_ring_total_slots(false, true, rows, layers),
-                    Some(layers * 2 * rows),
-                    "the double ring is never pooled"
                 );
                 assert!(pool_slots <= layers * window);
                 let mut pool = vec![0u64; pool_slots];
@@ -5697,7 +5632,7 @@ mod tests {
                 let tag = |layer: usize, value: u64| value * 100 + layer as u64;
                 let mut live = 0usize;
                 for layer in 0..layers {
-                    let slot = capture_ring_slot(true, rows, 0);
+                    let slot = capture_ring_slot(rows, 0);
                     private[layer][slot] = tag(layer, 1);
                     pool[at(layer, slot)] = tag(layer, 1);
                     writer[at(layer, slot)] = Some(layer);
@@ -5720,14 +5655,14 @@ mod tests {
                     for layer in 0..layers {
                         // The n-row view starts at `start`, ends inside the window, so inside the
                         // pool; the kernel writes only its last slot.
-                        let start = capture_view_start(true, rows, base, verify_rows);
+                        let start = capture_view_start(rows, base, verify_rows);
                         assert!(start + verify_rows <= window, "view out of window");
                         assert!(
                             CAPTURE_POOL_STRIDE * layer + start + verify_rows <= pool_slots,
                             "view out of pool"
                         );
                         let written = start + verify_rows - 1;
-                        let src = capture_ring_slot(true, rows, before);
+                        let src = capture_ring_slot(rows, before);
                         assert_ne!(written, src);
                         let abs = at(layer, written);
                         assert!(writer[abs].is_none_or(|owner| owner == layer));
@@ -5740,8 +5675,8 @@ mod tests {
                     live = base + verify_rows - 1;
                     if rollback {
                         for layer in 0..layers {
-                            let from = capture_ring_slot(true, rows, before);
-                            let to = capture_view_start(true, rows, base, keep);
+                            let from = capture_ring_slot(rows, before);
+                            let to = capture_view_start(rows, base, keep);
                             assert!(to + keep <= window);
                             assert!(CAPTURE_POOL_STRIDE * layer + to + keep <= pool_slots);
                             let written = to + keep - 1;
@@ -5757,7 +5692,7 @@ mod tests {
                         live = base + keep - 1;
                     }
                     for layer in 0..layers {
-                        let slot = capture_ring_slot(true, rows, live);
+                        let slot = capture_ring_slot(rows, live);
                         assert_eq!(pool[at(layer, slot)], private[layer][slot]);
                     }
                 }
@@ -6548,7 +6483,7 @@ mod tests {
                     (rows * qkv * 4) as u64,
                     (rows * (qkv + 2 * value_heads) * 4) as u64,
                 );
-                let pooled = compact_capture_ring() && lane_reserve_trim();
+                let pooled = lane_reserve_trim();
                 let per_layer = if pooled {
                     // One shared pool, then (inputs, recurrence) per layer.
                     assert_eq!(sizes.len(), 2 * layers + 3);
@@ -6562,8 +6497,7 @@ mod tests {
                     1 + 2 * layers
                 } else {
                     assert_eq!(sizes.len(), 3 * layers + 2);
-                    let ring = capture_ring_slots(compact_capture_ring(), rows).unwrap() as u64
-                        * slot_bytes;
+                    let ring = capture_ring_slots(rows).unwrap() as u64 * slot_bytes;
                     for layer in sizes[..3 * layers].chunks(3) {
                         assert_eq!(layer, [ring, inputs, recurrence], "{gdn:?} {rows}");
                     }
@@ -7190,7 +7124,6 @@ mod tests {
             row_capture_output: None,
             row_capture_pool: None,
             row_capture_rows: 0,
-            row_capture_compact: false,
             gdn_live: 0,
             gdn_format: GdnStateFormat::F32,
             gdn_value_heads: config.linear_num_value_heads,
@@ -7803,13 +7736,13 @@ mod tests {
         );
         let synced = code(src, "    fn reset_synced(", "\n    }\n");
         assert_eq!(synced.matches("memset_batch_sync(").count(), 1);
-        // The kill switch (`HIPFIRE_LANE_RESET_BATCH=0`) is today's per-buffer wait.
         let dispatch = include_str!("../../rdna-compute/src/dispatch.rs");
         let batched = code(dispatch, "    pub fn memset_batched(", "\n    }\n");
         assert!(
-            batched.contains("!self.flags.lane_reset_batch")
-                && batched.contains("return self.memset_stream_ordered("),
-            "memset_batched falls back to memset_stream_ordered under the kill switch"
+            batched.contains("self.hip.memset_async(buf, value, size, stream)")
+                && batched.contains("batch.pending = true")
+                && !batched.contains("memset_stream_ordered("),
+            "memset_batched enqueues every fill into the batch"
         );
         // The whole lane reset (trunk, head, pending hidden) shares one batch.
         let lane = include_str!("lane.rs");
@@ -8081,11 +8014,9 @@ mod tests {
         let config = crate::config::compact_test_config();
         // 36 GDN layers x (F32 inputs 4R x 10240 and recurrence 4R x 10336) + the ring slots
         // (the shared pool 2 * 35 + R + 1 = 75 slots by default; 36 x (R + 1) with
-        // HIPFIRE_QWEN4_LANE_RESERVE_TRIM=0, 36 x 2R with the compact kill switch)
+        // HIPFIRE_QWEN4_LANE_RESERVE_TRIM=0)
         // + 4R x 6144 F32 output + 36 x 16 table.
-        assert_eq!(capture_ring_slots(false, 4), Some(8));
-        assert_eq!(capture_ring_slots(true, 4), Some(5));
-        assert_eq!(capture_ring_slots(compact_capture_ring(), 4), Some(5));
+        assert_eq!(capture_ring_slots(4), Some(5));
         assert_eq!(capture_ring_pool_slots(4, 36), Some(75));
         let (f32_bytes, q8_bytes) = if lane_reserve_trim() {
             (247_880_256, 72_776_256)
@@ -8570,13 +8501,8 @@ mod tests {
                 advance_history(&mut gpu, &mut reference, row);
                 expected.push(capture_semantic_digest(&reference, &mut gpu));
             }
-            // The ring layout this allocation took (`HIPFIRE_QWEN4_CAPTURE_RING_COMPACT`, default
-            // on: `rows + 1` slots, logical slots mapped by `capture_ring_slot`; `=0` is the
-            // double ring where logical == physical). Run the test under both settings.
-            let compact = candidate.row_capture_compact;
-            let ring_slot = |state: &Qwen4State, logical: usize| {
-                capture_ring_slot(state.row_capture_compact, rows, logical)
-            };
+            // The ring holds `rows + 1` physical slots; logical slots map onto them
+            // through `capture_ring_slot`.
             for base in [0, rows] {
                 for keep in 0..=rows {
                     candidate.set_gdn_live(if base == 0 { 2 * rows - 1 } else { rows - 1 });
@@ -8586,27 +8512,18 @@ mod tests {
                     let old_bytes = gpu
                         .download_raw_bytes(&candidate.gdn[0].recurrent)
                         .expect("old live bytes");
-                    if compact {
-                        // Poison every physical slot but the old live one (the old state must
-                        // survive the capture), the compact ring's equivalent of the free half.
-                        for physical in 0..=rows {
-                            if physical == ring_slot(&candidate, old_live) {
-                                continue;
-                            }
-                            let slot = candidate.row_capture[0]
-                                .0
-                                .sub_offset(physical * state_units, state_units);
-                            gpu.hip
-                                .memset(&slot.buf, 0xa5, slot.byte_size())
-                                .expect("poison free slot");
+                    // Poison every physical slot but the old live one (the old state must
+                    // survive the capture).
+                    for physical in 0..=rows {
+                        if physical == capture_ring_slot(rows, old_live) {
+                            continue;
                         }
-                    } else {
-                        let destination = candidate.row_capture[0]
+                        let slot = candidate.row_capture[0]
                             .0
-                            .sub_offset(base * state_units, rows * state_units);
+                            .sub_offset(physical * state_units, state_units);
                         gpu.hip
-                            .memset(&destination.buf, 0xa5, destination.byte_size())
-                            .expect("poison free half");
+                            .memset(&slot.buf, 0xa5, slot.byte_size())
+                            .expect("poison free slot");
                     }
                     candidate.row_capture_armed = true;
                     let ticket = candidate.snapshot(&mut gpu).expect("armed snapshot");
@@ -8614,46 +8531,31 @@ mod tests {
                     assert_eq!(candidate.gdn_live, base + rows - 1);
                     let old_slot = candidate.row_capture[0]
                         .0
-                        .sub_offset(ring_slot(&candidate, old_live) * state_units, state_units);
+                        .sub_offset(capture_ring_slot(rows, old_live) * state_units, state_units);
                     assert_eq!(
                         gpu.download_raw_bytes(&old_slot).expect("old slot"),
                         old_bytes
                     );
-                    if compact {
-                        // Compact ring: only the captured slot and the old live slot hold
-                        // state; every other physical slot is still the poison byte.
-                        let written = [
-                            ring_slot(&candidate, candidate.gdn_live),
-                            ring_slot(&candidate, old_live),
-                        ];
-                        for physical in 0..=rows {
-                            if written.contains(&physical) {
-                                continue;
-                            }
-                            let slot = candidate.row_capture[0]
-                                .0
-                                .sub_offset(physical * state_units, state_units);
-                            assert!(
-                                gpu.download_raw_bytes(&slot)
-                                    .expect("uncaptured slot")
-                                    .iter()
-                                    .all(|byte| *byte == 0xa5),
-                                "intermediate state was materialized (physical slot {physical})"
-                            );
+                    // Only the captured slot and the old live slot hold state after the
+                    // capture; every other physical slot is still the poison byte.
+                    let written = [
+                        capture_ring_slot(rows, candidate.gdn_live),
+                        capture_ring_slot(rows, old_live),
+                    ];
+                    for physical in 0..=rows {
+                        if written.contains(&physical) {
+                            continue;
                         }
-                    } else {
-                        for slot in [base, base + rows - 2] {
-                            let intermediate = candidate.row_capture[0]
-                                .0
-                                .sub_offset(slot * state_units, state_units);
-                            assert!(
-                                gpu.download_raw_bytes(&intermediate)
-                                    .expect("uncaptured slot")
-                                    .iter()
-                                    .all(|byte| *byte == 0xa5),
-                                "intermediate state was materialized"
-                            );
-                        }
+                        let slot = candidate.row_capture[0]
+                            .0
+                            .sub_offset(physical * state_units, state_units);
+                        assert!(
+                            gpu.download_raw_bytes(&slot)
+                                .expect("uncaptured slot")
+                                .iter()
+                                .all(|byte| *byte == 0xa5),
+                            "intermediate state was materialized (physical slot {physical})"
+                        );
                     }
                     candidate.row_capture_armed = false;
                     if keep == 0 {

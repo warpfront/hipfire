@@ -16,8 +16,8 @@
 //! those weights once for all lanes' rows: ONE sealed MoE call per layer over the concatenated
 //! rows, on the same full-table runtime (`moe_full[layer]`) the singleton chunk binds. The
 //! row-local dense stages (embed, PLE rows, HC read / write, the GDN and QSA in / out
-//! projections) run once over all lanes' rows too (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT`, default
-//! on; `0` runs them per lane); the stateful cores always run per lane on the lane's own state.
+//! projections) run once over all lanes' rows too; the stateful cores always run per lane on
+//! the lane's own state.
 //!
 //! # Why the bytes are the lanes' own
 //!
@@ -68,59 +68,10 @@ pub const QWEN4_EP_WAVE_ROW_CAP: usize = 2048;
 pub const EXACT_WAVE_MIN_LANE_ROWS: usize =
     rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1;
 
-/// Sub-switch of the TILE-route wave (default ON after its card identity receipt, j7460; the master
-/// switch `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=0` kills every route): a burst whose lanes all take
-/// the owner-routed tile route runs as ONE tile-route wave. Exact `0` refuses it
-/// (`ep wave refused:`): the burst runs as serial tile-route tiles.
-pub const QWEN4_EP_WAVE_TILE_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_TILE";
-
-/// [`QWEN4_EP_WAVE_TILE_ENV`] parsed: on unless exact `0`.
-pub(crate) fn ep_wave_tile_enabled_from(value: Option<&str>) -> bool {
-    value.map(str::trim) != Some("0")
-}
-
-static EP_WAVE_TILE_KNOB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    ep_wave_tile_enabled_from(
-        hipfire_config::developer_var(QWEN4_EP_WAVE_TILE_ENV)
-            .ok()
-            .as_deref(),
-    )
-});
-
-/// Whether the tile-route wave is switched on in this process (every rank thread agrees).
-pub(crate) fn ep_wave_tile_enabled() -> bool {
-    *EP_WAVE_TILE_KNOB
-}
-
-/// Sub-switch of the trunk-shard PARTIAL-route wave (default ON after its card identity receipt,
-/// j7464; the master switch `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=0` kills every route): a burst of
-/// 65..=511-row lanes on a trunk-shard load runs as ONE wave on the shard's partial chunk route.
-/// Exact `0` refuses it (`ep wave refused:`): the burst runs as serial partial-chunk tiles.
-pub const QWEN4_EP_WAVE_SHARD_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_SHARD";
-
-/// [`QWEN4_EP_WAVE_SHARD_ENV`] parsed: on unless exact `0`.
-pub(crate) fn ep_wave_shard_enabled_from(value: Option<&str>) -> bool {
-    value.map(str::trim) != Some("0")
-}
-
-static EP_WAVE_SHARD_KNOB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    ep_wave_shard_enabled_from(
-        hipfire_config::developer_var(QWEN4_EP_WAVE_SHARD_ENV)
-            .ok()
-            .as_deref(),
-    )
-});
-
-/// Whether the trunk-shard partial-route wave is switched on in this process (every rank
-/// thread agrees).
-pub(crate) fn ep_wave_shard_enabled() -> bool {
-    *EP_WAVE_SHARD_KNOB
-}
-
-/// Knob (default unset: [`SMALL_LANE_MIN_ROWS`] with the small lanes on, else
-/// [`EXACT_WAVE_MIN_LANE_ROWS`]): the fewest rows of a lane the exact wave takes, 9 at the
-/// lowest (a lane of at most 8 rows runs the few-row routes and is never a wave lane). An
-/// explicit value overrides [`QWEN4_EP_WAVE_SMALL_LANES_ENV`] and `serve.batch_exact`.
+/// Knob (default unset: [`SMALL_LANE_MIN_ROWS`], or [`EXACT_WAVE_MIN_LANE_ROWS`] under
+/// `serve.batch_exact`): the fewest rows of a lane the exact wave takes, 9 at the lowest (a lane
+/// of at most 8 rows runs the few-row routes and is never a wave lane). An explicit value
+/// overrides the default and `serve.batch_exact`.
 pub const QWEN4_EP_WAVE_MIN_LANE_ROWS_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS";
 
 static EXACT_WAVE_MIN_LANE_ROWS_KNOB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
@@ -131,8 +82,7 @@ static EXACT_WAVE_MIN_LANE_ROWS_KNOB: std::sync::LazyLock<usize> = std::sync::La
         // `serve.batch_exact` on: 9..=64-row lanes keep their serial singleton tile. In the
         // small-lane wave they were measured NOT byte-equal to that tile (the D1 identity check:
         // exactly the 57/60/64-token prompts missed their C1 reply under `seeded`).
-        ep_wave_small_lanes_enabled()
-            && hipfire_config::qwen4_lane_row_exact() == hipfire_config::LaneRowExact::Off,
+        hipfire_config::qwen4_lane_row_exact() == hipfire_config::LaneRowExact::Off,
     )
 });
 
@@ -141,47 +91,25 @@ pub(crate) fn exact_wave_min_lane_rows() -> usize {
     *EXACT_WAVE_MIN_LANE_ROWS_KNOB
 }
 
-/// Kill switch of the SMALL LANES of the exact wave (default ON): lanes of 9..=64 rows
-/// ([`SMALL_LANE_MIN_ROWS`]..[`EXACT_WAVE_MIN_LANE_ROWS`]) join the wave. Their singleton tile
-/// takes the 16..=64-row lane WMMA arm of the BF16 projections (`Gpu::lane_wmma_applies`, keyed on
-/// the REAL rows, not bitwise the SIMT arm), which a joint call over the wave's rows would not;
-/// the wave therefore runs those projections once per lane (`Gpu::qwen4_wave_lane_rows`) and, when
-/// a small lane is in the wave, every other row-local stage per lane too
-/// ([`ep_wave_joint_for_lanes`]). That is NOT enough for byte identity: served C1-vs-C8 identity
-/// (R9700 EP2, D1 check) found a small lane's wave output differs from its solo prefill (exactly
-/// the 57/60/64-token prompts), so by default a small lane is distribution-equivalent, not
-/// byte-identical, to its serial tile. Under `serve.batch_exact` small lanes keep their serial
-/// tile (byte-identical by construction). Exact `0` restores the floor of
-/// [`EXACT_WAVE_MIN_LANE_ROWS`] (65): such lanes run serial singleton tiles. An explicit
-/// `HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS` overrides either.
-pub const QWEN4_EP_WAVE_SMALL_LANES_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES";
-
-/// [`QWEN4_EP_WAVE_SMALL_LANES_ENV`] parsed: on unless exact `0`.
-pub(crate) fn ep_wave_small_lanes_enabled_from(value: Option<&str>) -> bool {
-    value.map(str::trim) != Some("0")
-}
-
-static EP_WAVE_SMALL_LANES_KNOB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    ep_wave_small_lanes_enabled_from(
-        hipfire_config::developer_var(QWEN4_EP_WAVE_SMALL_LANES_ENV)
-            .ok()
-            .as_deref(),
-    )
-});
-
-/// Whether small lanes join the exact wave in this process (every rank thread agrees).
-pub(crate) fn ep_wave_small_lanes_enabled() -> bool {
-    *EP_WAVE_SMALL_LANES_KNOB
-}
-
 /// Fewest rows of a lane of the small-lane wave: lanes of at most 8 rows run the few-row routes.
+/// Lanes of 9..=64 rows ([`SMALL_LANE_MIN_ROWS`]..[`EXACT_WAVE_MIN_LANE_ROWS`]) join the wave by
+/// default. Their singleton tile takes the 16..=64-row lane WMMA arm of the BF16 projections
+/// (`Gpu::lane_wmma_applies`, keyed on the REAL rows, not bitwise the SIMT arm), which a joint call
+/// over the wave's rows would not; the wave therefore runs those projections once per lane
+/// (`Gpu::qwen4_wave_lane_rows`) and, when a small lane is in the wave, every other row-local stage
+/// per lane too ([`ep_wave_joint_for_lanes`]). That is NOT enough for byte identity: served C1-vs-C8
+/// identity (R9700 EP2, D1 check) found a small lane's wave output differs from its solo prefill
+/// (exactly the 57/60/64-token prompts), so by default a small lane is distribution-equivalent, not
+/// byte-identical, to its serial tile. Under `serve.batch_exact` small lanes keep their serial tile
+/// (byte-identical by construction). An explicit `HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS` overrides
+/// either.
 pub const SMALL_LANE_MIN_ROWS: usize = rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS + 1;
 
 /// The fewest rows of a wave lane: the explicit `HIPFIRE_EP_LANE_PREFILL_WAVE_MIN_ROWS` when it
-/// parses (an integer in `9..=EXACT_WAVE_MAX_LANE_ROWS`), else [`SMALL_LANE_MIN_ROWS`] with
-/// `small_lanes` on, else [`EXACT_WAVE_MIN_LANE_ROWS`].
-pub(crate) fn exact_wave_lane_floor_from(value: Option<&str>, small_lanes: bool) -> usize {
-    let default = if small_lanes {
+/// parses (an integer in `9..=EXACT_WAVE_MAX_LANE_ROWS`), else [`SMALL_LANE_MIN_ROWS`] when
+/// `batch_exact_off`, else [`EXACT_WAVE_MIN_LANE_ROWS`].
+pub(crate) fn exact_wave_lane_floor_from(value: Option<&str>, batch_exact_off: bool) -> usize {
+    let default = if batch_exact_off {
         SMALL_LANE_MIN_ROWS
     } else {
         EXACT_WAVE_MIN_LANE_ROWS
@@ -193,7 +121,7 @@ pub(crate) fn exact_wave_lane_floor_from(value: Option<&str>, small_lanes: bool)
 }
 
 /// Whether a wave of `lane_rows` runs its row-local dense stages jointly
-/// ([`ep_wave_joint_enabled`]): only when EVERY lane has at least `floor` rows, where `floor` is
+/// ([`ep_wave_policy_for`]): only when EVERY lane has at least `floor` rows, where `floor` is
 /// `WIDE_VERIFY_MAX_ROWS + 1` (65, every lane wider than the few-row window) unless the LAB
 /// prefill lane WMMA floor (`HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`,
 /// `FeatureFlags::qwen4_prefill_lwmma_floor_knob`) lowered it. The joint HC / GDN / QSA launches
@@ -201,46 +129,18 @@ pub(crate) fn exact_wave_lane_floor_from(value: Option<&str>, small_lanes: bool)
 /// route, the 9..=48-row MQ6 tile), so a lane below `floor` reproduces its singleton bytes only
 /// with its own per-lane launches; a lane at or above a lowered floor takes the same prefill
 /// entries at the same pinned split-K in its own tile and in the joint call.
-pub(crate) fn ep_wave_joint_for_lanes(
-    joint_enabled: bool,
-    lane_rows: &[usize],
-    floor: usize,
-) -> bool {
-    joint_enabled && lane_rows.iter().all(|&rows| rows >= floor)
+pub(crate) fn ep_wave_joint_for_lanes(lane_rows: &[usize], floor: usize) -> bool {
+    lane_rows.iter().all(|&rows| rows >= floor)
 }
 
 /// Most rows of a lane the exact wave takes: every lane stays below the 512-row floors (a
 /// larger tile takes the owner-routed tile route alone and keeps its serial tile).
 pub const EXACT_WAVE_MAX_LANE_ROWS: usize = QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP;
 
-/// Kill switch of the wave's JOINT dense stages (default ON): the row-local dense stages of the
-/// wave (embed, PLE rows, HC read / write, the GDN and QSA in / out projections) run once over
-/// every lane's rows beside the once-over-all-rows MoE; exact `0` restores the incumbent policy
-/// (every stage per lane, MoE once). Byte-identical on the burst oracle (G0a, 8 x 149 rows).
-pub const QWEN4_EP_WAVE_JOINT_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT";
-
-/// [`QWEN4_EP_WAVE_JOINT_ENV`] parsed: on unless exact `0`.
-pub(crate) fn ep_wave_joint_enabled_from(value: Option<&str>) -> bool {
-    value.map(str::trim) != Some("0")
-}
-
-static EP_WAVE_JOINT_KNOB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    ep_wave_joint_enabled_from(
-        hipfire_config::developer_var(QWEN4_EP_WAVE_JOINT_ENV)
-            .ok()
-            .as_deref(),
-    )
-});
-
-/// Whether the wave's dense stages run jointly in this process (every rank thread agrees).
-pub(crate) fn ep_wave_joint_enabled() -> bool {
-    *EP_WAVE_JOINT_KNOB
-}
-
-/// The wave's stage shares: `joint` (the default) runs every row-local stage once over all lanes'
-/// rows (embed, PLE rows, HC read / write, GDN and QSA in / out projections, the MoE); the
-/// stateful stages stay per lane. Not `joint` is the incumbent: every stage per lane (each
-/// lane's launches are its singleton tile's by construction), the MoE once over all rows.
+/// The wave's stage shares: `joint` runs every row-local stage once over all lanes' rows (embed,
+/// PLE rows, HC read / write, GDN and QSA in / out projections, the MoE); the stateful stages stay
+/// per lane. Not `joint` (a lane below the floor): every stage per lane (each lane's launches are
+/// its singleton tile's by construction), the MoE once over all rows.
 pub(crate) fn ep_wave_policy_for(joint: bool) -> LaneStagePolicy {
     let once = if joint {
         &[
@@ -340,11 +240,6 @@ pub(crate) struct EpWaveFacts {
     /// An EP reserve load refuses the wave's full-table call (`EpEpoch::plan_call` with the
     /// full-table route): its reason.
     pub reserve_refusal: Option<String>,
-    /// The tile-route wave is switched on ([`ep_wave_tile_enabled`]); the full-table wave needs
-    /// no sub-switch (the master switch decides).
-    pub tile_wave_enabled: bool,
-    /// The trunk-shard partial-route wave is switched on ([`ep_wave_shard_enabled`]).
-    pub shard_wave_enabled: bool,
     /// Per lane: the lane's own partial chunk runs the SYMMETRIC grouped chain
     /// (`Gpu::qwen4_moe_sym_iu4_applies` under the lane's tile scopes), else the F32 grouped
     /// chain. Only read on the Partial route.
@@ -418,11 +313,6 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
             None
         }
         Ok(EpWaveRoute::Tile) => {
-            if !facts.tile_wave_enabled {
-                return refuse(format!(
-                    "the tile-route wave is switched off ({QWEN4_EP_WAVE_TILE_ENV}=0)"
-                ));
-            }
             if let Some(lane) = facts.lane_a8.iter().position(|a8| !*a8) {
                 return refuse(format!(
                     "lane {lane} ({} rows) is on the tile route without the A8 chain; only the A8 tile chain is proven per-slot independent",
@@ -438,11 +328,6 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
             None
         }
         Ok(EpWaveRoute::Partial | EpWaveRoute::PartialMask) => {
-            if !facts.shard_wave_enabled {
-                return refuse(format!(
-                    "the trunk-shard partial-route wave is switched off ({QWEN4_EP_WAVE_SHARD_ENV}=0)"
-                ));
-            }
             // The singleton partial chunk runs the symmetric chain (floor / A8 scope) or the F32
             // grouped chain by the lane's rows against the floor in scope: one chain for all
             // lanes, else the wide call has no lane's route to reproduce.
@@ -494,7 +379,7 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
     }
 }
 
-/// The small-lane wave (`HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES`: lanes of 9..=64 rows) is
+/// The small-lane wave (lanes of 9..=64 rows) is
 /// exact only on the symmetric A8 chain (the Tile wave, a Partial wave whose lanes run the
 /// symmetric chain). On the F32 grouped chain (the FullTable wave, a Partial wave whose lanes are
 /// below the owner-routed floor: floor 512 or `HIPFIRE_QWEN4_MOE_EP_A8=0`) a lane of at most
@@ -724,8 +609,6 @@ impl Qwen4GpuForward {
                     )
                     .err()
             }),
-            tile_wave_enabled: ep_wave_tile_enabled(),
-            shard_wave_enabled: ep_wave_shard_enabled(),
             lane_sym,
             partial_mask: ep_wave_partial_mask_on(self.ep.as_ref()),
         }
@@ -796,7 +679,7 @@ impl Qwen4GpuForward {
             QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP,
         );
         // The wave's lane-row table for the BF16 projections of its wide calls (see
-        // [`QWEN4_EP_WAVE_SMALL_LANES_ENV`]): set only when a small lane is in the wave, cleared on
+        // [`SMALL_LANE_MIN_ROWS`]): set only when a small lane is in the wave, cleared on
         // every return path below (the forward runs in the closure, no `?` between here and the
         // restore after it).
         let prior_lane_rows = std::mem::replace(
@@ -870,8 +753,6 @@ mod tests {
             capacity_rows: 4096,
             tile_capacity_rows: 4096,
             reserve_refusal: None,
-            tile_wave_enabled: true,
-            shard_wave_enabled: true,
             lane_sym: vec![false; lane_rows.len()],
             partial_mask: false,
         }
@@ -981,28 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn the_small_lanes_switch_is_on_unless_exact_zero() {
-        for on in [
-            None,
-            Some(""),
-            Some("1"),
-            Some("on"),
-            Some("true"),
-            Some("2"),
-        ] {
-            assert!(ep_wave_small_lanes_enabled_from(on), "{on:?}");
-        }
-        for off in [Some("0"), Some(" 0\n")] {
-            assert!(!ep_wave_small_lanes_enabled_from(off), "{off:?}");
-        }
-        assert_eq!(
-            QWEN4_EP_WAVE_SMALL_LANES_ENV,
-            "HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES"
-        );
-    }
-
-    #[test]
-    fn the_lane_floor_is_9_with_small_lanes_65_without_and_an_explicit_value_wins() {
+    fn the_lane_floor_is_9_unless_batch_exact_65_and_an_explicit_value_wins() {
         assert_eq!(exact_wave_lane_floor_from(None, true), SMALL_LANE_MIN_ROWS);
         assert_eq!(SMALL_LANE_MIN_ROWS, 9);
         assert_eq!(
@@ -1020,7 +880,7 @@ mod tests {
             assert_eq!(exact_wave_lane_floor_from(bad, true), 9, "{bad:?}");
             assert_eq!(exact_wave_lane_floor_from(bad, false), 65, "{bad:?}");
         }
-        // An explicit MIN_ROWS overrides the switch either way.
+        // An explicit MIN_ROWS overrides the batch_exact coupling either way.
         assert_eq!(exact_wave_lane_floor_from(Some("65"), true), 65);
         assert_eq!(exact_wave_lane_floor_from(Some("100"), true), 100);
         assert_eq!(exact_wave_lane_floor_from(Some("20"), false), 20);
@@ -1029,21 +889,19 @@ mod tests {
     #[test]
     fn joint_dense_stages_need_every_lane_wider_than_the_few_row_window() {
         let floor = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1;
-        assert!(ep_wave_joint_for_lanes(true, &[65, 149, 511], floor));
-        assert!(!ep_wave_joint_for_lanes(true, &[60, 149], floor));
-        assert!(!ep_wave_joint_for_lanes(true, &[64, 64], floor));
-        assert!(!ep_wave_joint_for_lanes(false, &[149, 149], floor));
-        assert!(ep_wave_joint_for_lanes(true, &[], floor));
+        assert!(ep_wave_joint_for_lanes(&[65, 149, 511], floor));
+        assert!(!ep_wave_joint_for_lanes(&[60, 149], floor));
+        assert!(!ep_wave_joint_for_lanes(&[64, 64], floor));
+        assert!(ep_wave_joint_for_lanes(&[], floor));
     }
 
     /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` (49): lanes of 49..=64 rows join the joint stages;
     /// a lane below the floor still keeps every row-local stage per lane.
     #[test]
     fn a_lowered_prefill_floor_admits_49_to_64_row_lanes_to_the_joint_stages() {
-        assert!(ep_wave_joint_for_lanes(true, &[60; 8], 49));
-        assert!(ep_wave_joint_for_lanes(true, &[49, 64, 149], 49));
-        assert!(!ep_wave_joint_for_lanes(true, &[48, 60], 49));
-        assert!(!ep_wave_joint_for_lanes(false, &[60; 8], 49));
+        assert!(ep_wave_joint_for_lanes(&[60; 8], 49));
+        assert!(ep_wave_joint_for_lanes(&[49, 64, 149], 49));
+        assert!(!ep_wave_joint_for_lanes(&[48, 60], 49));
         assert!(ep_wave_lane_table(&[60; 8], 49).is_empty());
         assert_eq!(ep_wave_lane_table(&[40, 60, 149], 49), vec![40, 60, 149]);
     }
@@ -1068,10 +926,6 @@ mod tests {
         cases.push(facts(&[511, 511, 511, 511, 511]));
         let mut f = facts(&[200, 200]);
         f.moe_full_ready = false;
-        cases.push(f);
-        let mut f = facts(&[200, 200]);
-        f.ffn_partial = true;
-        f.shard_wave_enabled = false;
         cases.push(f);
         let mut f = facts(&[200, 200]);
         f.ffn_partial = true;
@@ -1103,10 +957,6 @@ mod tests {
         let mut f = facts(&[200, 200]);
         f.lane_tile = vec![true, true];
         f.tile_capacity_rows = 399;
-        cases.push(f);
-        let mut f = facts(&[200, 200]);
-        f.lane_tile = vec![true, true];
-        f.tile_wave_enabled = false;
         cases.push(f);
         let mut f = facts(&[200, 200]);
         f.capacity_rows = 399;
@@ -1192,52 +1042,20 @@ mod tests {
         );
     }
 
-    /// The tile-route wave is off until its card receipt: unset (and anything but exact `1`) it is
-    /// refused by name and the burst runs serial tile-route tiles; the full-table wave is not
-    /// gated by it.
     #[test]
-    fn the_tile_wave_has_its_own_kill_switch_and_the_full_table_wave_does_not() {
-        for on in [
-            None,
-            Some(""),
-            Some("1"),
-            Some(" 1 "),
-            Some("true"),
-            Some("2"),
-        ] {
-            assert!(ep_wave_tile_enabled_from(on), "{on:?}");
-        }
-        assert!(!ep_wave_tile_enabled_from(Some("0")));
-        assert!(!ep_wave_tile_enabled_from(Some(" 0\n")));
-        assert_eq!(QWEN4_EP_WAVE_TILE_ENV, "HIPFIRE_EP_LANE_PREFILL_WAVE_TILE");
+    fn the_tile_and_full_table_waves_are_both_admitted() {
         let mut tile = facts(&[149; 8]);
         tile.lane_tile = vec![true; 8];
         assert_eq!(ep_wave_refusal(&tile), None);
-        tile.tile_wave_enabled = false;
-        assert!(
-            refused(&tile).contains(QWEN4_EP_WAVE_TILE_ENV),
-            "{}",
-            refused(&tile)
-        );
-        let mut full = facts(&[149; 8]);
-        full.tile_wave_enabled = false;
-        assert_eq!(ep_wave_refusal(&full), None);
+        assert_eq!(ep_wave_refusal(&facts(&[149; 8])), None);
     }
 
     /// Under the trunk shard every 9+-row chunk is the partial route whatever the tile flags say
     /// (a reserve-sharing shard load installs the tile transport only as a rendezvous carrier):
     /// the wave is the Partial wave, its chain is the lanes' own (symmetric A8 or F32 grouped),
-    /// one chain for all lanes, with that chain's capacity, behind its own sub-switch.
+    /// one chain for all lanes, with that chain's capacity.
     #[test]
     fn the_shard_wave_is_the_partial_route_and_follows_the_lanes_own_chain() {
-        for on in [None, Some(""), Some("1"), Some("true"), Some("2")] {
-            assert!(ep_wave_shard_enabled_from(on), "{on:?}");
-        }
-        assert!(!ep_wave_shard_enabled_from(Some("0")));
-        assert_eq!(
-            QWEN4_EP_WAVE_SHARD_ENV,
-            "HIPFIRE_EP_LANE_PREFILL_WAVE_SHARD"
-        );
         let mut f = facts(&[149; 8]);
         f.ffn_partial = true;
         // The carrier tile hook may flag the lanes as tile lanes: the route is still Partial.
@@ -1256,7 +1074,7 @@ mod tests {
         assert_eq!(ep_wave_refusal(&f), None);
         f.lane_tile[4] = true;
         assert!(refused(&f).contains("tile mask"), "{}", refused(&f));
-        // Small lanes (60 rows, `HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES`) join the masked wave on
+        // Small lanes (60 rows) join the masked wave on
         // the symmetric A8 chain only; the unmasked Partial wave on the F32 grouped chain refuses
         // them (j8706: floor 512, u60x8 0/8 lane == singleton).
         let mut s = facts(&[60; 8]);
@@ -1294,12 +1112,9 @@ mod tests {
             "{}",
             refused(&f)
         );
-        // On by default (kill switch =0); the master switch / planner rules still hold.
+        // The planner rules still hold.
         f.lane_sym = vec![false; 8];
         f.capacity_rows = 4096;
-        f.shard_wave_enabled = false;
-        assert!(refused(&f).contains(QWEN4_EP_WAVE_SHARD_ENV));
-        f.shard_wave_enabled = true;
         f.lane_rows[2] = 512;
         assert!(refused(&f).contains("lane 2"), "{}", refused(&f));
     }
@@ -1324,17 +1139,11 @@ mod tests {
         assert_eq!(ep_wave_tile_rows(4096, None), 4096);
         assert_eq!(ep_wave_tile_rows(4096, Some(512)), 512);
         assert_eq!(ep_wave_tile_rows(256, Some(512)), 256);
-        // Trunk shard is the Partial route, not a refusal: it needs its own sub-switch.
+        // Trunk shard is the Partial route, not a refusal.
         let mut g = facts(&[300, 300]);
         g.ffn_partial = true;
         assert_eq!(ep_wave_route(&g), Ok(EpWaveRoute::Partial));
         assert_eq!(ep_wave_refusal(&g), None);
-        g.shard_wave_enabled = false;
-        assert!(
-            refused(&g).contains(QWEN4_EP_WAVE_SHARD_ENV),
-            "{}",
-            refused(&g)
-        );
     }
 
     /// The Tile wave runs under the scopes of its lanes' own tiles: `enter_tile_scopes` is entered
@@ -1416,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn the_wave_policy_is_joint_by_default_and_per_lane_with_the_moe_once_when_killed() {
+    fn the_wave_policy_is_joint_or_per_lane_with_the_moe_once() {
         let joint = [
             StageName::Embed,
             StageName::PleRows,
@@ -1429,7 +1238,7 @@ mod tests {
             StageName::Moe,
         ];
         for stage in StageName::ALL {
-            // Incumbent (`=0`): only the MoE once.
+            // Not joint: only the MoE once.
             let want = if stage == StageName::Moe {
                 StageShare::OnceAllRows
             } else {
@@ -1441,7 +1250,7 @@ mod tests {
                 "{}",
                 stage.key()
             );
-            // Joint (default): the dense row-local stages and the MoE once; the stateful cores,
+            // Joint: the dense row-local stages and the MoE once; the stateful cores,
             // PLE conv and the tail stages stay per lane.
             let want = if joint.contains(&stage) {
                 StageShare::OnceAllRows
@@ -1458,26 +1267,6 @@ mod tests {
         assert_eq!(ep_wave_policy_for(true).validate(), Ok(()));
         assert_eq!(ep_wave_policy_for(false).validate(), Ok(()));
         assert_eq!(ep_wave_expected_moe_calls(48), 48);
-    }
-
-    #[test]
-    fn the_joint_wave_has_its_own_kill_switch() {
-        for on in [
-            None,
-            Some(""),
-            Some("1"),
-            Some(" 1 "),
-            Some("true"),
-            Some("2"),
-        ] {
-            assert!(ep_wave_joint_enabled_from(on), "{on:?}");
-        }
-        assert!(!ep_wave_joint_enabled_from(Some("0")));
-        assert!(!ep_wave_joint_enabled_from(Some(" 0\n")));
-        assert_eq!(
-            QWEN4_EP_WAVE_JOINT_ENV,
-            "HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT"
-        );
     }
 
     /// Pins that bind each wave route to its singleton's emission: the FullTable wave binds no

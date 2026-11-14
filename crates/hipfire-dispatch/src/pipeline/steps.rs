@@ -118,7 +118,7 @@ pub enum Step<'a> {
     /// Launch-free clear of a preallocated scratch prefix.
     Clear(crate::pipeline::layer_ops::ClearOp<'a>),
     /// Sequence-parallel all-gather of the rows of one scratch tensor across the EP ranks
-    /// (`HIPFIRE_QWEN4_EP_SEQ_PARALLEL`). A fusion barrier like `Clear`.
+    /// (the sequence-parallel prefill route). A fusion barrier like `Clear`.
     RowGather(crate::pipeline::layer_ops::RowGatherOp<'a>),
     /// Embedding-table lookup of device-resident token ids.
     Embed(crate::pipeline::layer_ops::EmbeddingOp<'a>),

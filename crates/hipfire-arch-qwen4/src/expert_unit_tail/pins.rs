@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Dynamic pins of the D2 tail (`HIPFIRE_EP_UNIT_TAIL_PINS`): the pinned owner assignment of
+//! Dynamic pins of the D2 tail: the pinned owner assignment of
 //! D1.9 running TOGETHER with the tail.
 //!
 //! A pinned unit layer (`ep_unit_layer_balance == BalancedPinned`) runs, per MoE call, the pinned

@@ -15,12 +15,12 @@
 //! budget, and reproduces today's split exactly when no ranking is given.
 //!
 //! Pure CPU arithmetic: no file, environment, device or manifest access. Only
-//! the trunk layers are planned. The MTP head's experts are not units: by default
-//! (`HIPFIRE_EP_MTP_EXPERTS_RESIDENT`) every rank keeps its owned slice of them
-//! VRAM-resident and the loader charges those bytes to every rank's `non_expert`
-//! (hence to [`ep_unit_rank_budgets`]) BEFORE this planner walks the ranking
-//! ([`crate::expert_residency::ep_mtp_resident_decision`]); with the switch `=0` they
-//! stay host-mapped, pinned on every rank (today's placement).
+//! the trunk layers are planned. The MTP head's experts are not units: when the
+//! native MTP head stays attached on a multi-rank EP load, every rank keeps its
+//! owned slice of them VRAM-resident and the loader charges those bytes to every
+//! rank's `non_expert` (hence to [`ep_unit_rank_budgets`]) BEFORE this planner walks
+//! the ranking ([`crate::expert_residency::ep_mtp_resident_decision`]). Otherwise
+//! they stay host-mapped, pinned on every rank.
 //!
 //! # Walk
 //!
@@ -1111,21 +1111,6 @@ impl EpUnitPlan {
     }
 }
 
-/// The kill switch of pinned-owner balanced ownership on per-expert unit layers (D1.9):
-/// with a unit plan, a layer that is mixed on some rank, or host on some rank but not on
-/// every rank, runs the balanced per-call owner assignment with the resident experts pinned
-/// to their holder ([`ep_unit_pin_plane`]) instead of the static `e % ranks` owners. Only the
-/// exact value `0` is off (D1 behaviour: static owners on those layers); unset or any other
-/// value is on. It only matters where balanced ownership itself is admitted
-/// (`HIPFIRE_EP_BALANCED_OWNERS`, exact gfx1201 at 2..=4 ranks).
-pub const EP_UNIT_PINNED_OWNERS_ENV: &str = "HIPFIRE_EP_UNIT_PINNED_OWNERS";
-
-/// Whether [`EP_UNIT_PINNED_OWNERS_ENV`] allows pinned owners, from its raw value: on unless
-/// exactly `0`.
-pub fn ep_unit_pinned_owners_on(raw: Option<&str>) -> bool {
-    raw != Some("0")
-}
-
 /// How one trunk layer of a unit plan is owned across the mesh, decided from the plan alone
 /// so every rank agrees ([`ep_unit_layer_balance`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1143,7 +1128,7 @@ pub enum EpUnitLayerBalance {
 }
 
 /// The balanced-ownership decision of `layer`, from the plan only (see
-/// [`EpUnitLayerBalance`]); the kill switch ([`EP_UNIT_PINNED_OWNERS_ENV`]) is the caller's.
+/// [`EpUnitLayerBalance`]).
 pub fn ep_unit_layer_balance(plan: &EpUnitPlan, layer: usize) -> EpUnitLayerBalance {
     let ranks = plan.geometry().ranks;
     let (mut with_host, mut wholly_host) = (0usize, 0usize);
@@ -1464,10 +1449,6 @@ pub fn ep_units_refusal(facts: &EpUnitsFacts) -> Result<(), String> {
     Ok(())
 }
 
-/// `HIPFIRE_EP_EXPERT_STAGE`: the EP long-prefill expert stage lever (default
-/// on, exact `0` off).
-pub const EP_EXPERT_STAGE_ENV: &str = "HIPFIRE_EP_EXPERT_STAGE";
-
 /// Zeroed tail pad after the staged payload of each unit-stage buffer (the
 /// kernels' tail over-read, as the tier stage's).
 pub const EP_UNIT_STAGE_PAD_BYTES: u64 = ARENA_TAIL_PAD_BYTES as u64;
@@ -1589,21 +1570,16 @@ pub struct EpUnitStageSwitches<'a> {
     pub arch: &'a str,
     /// `HIPFIRE_QWEN4_EXPERT_STAGE`.
     pub expert_stage: Option<&'a str>,
-    /// [`EP_EXPERT_STAGE_ENV`].
-    pub ep_stage: Option<&'a str>,
-    /// `HIPFIRE_EP_OWNER_ROUTED_PREFILL`.
-    pub owner_routed: Option<&'a str>,
 }
 
 /// Whether the switches admit the EP expert stage on this arch: the arch
 /// admits it under EP (gfx1201, `stage_policy(arch).expert_parallel_stage`),
 /// the stage switch is on (`HIPFIRE_QWEN4_EXPERT_STAGE` explicit `1`, or the
 /// arch default; probe-free: gfx1201 never reads the host link, so this is the
-/// same value `expert_stage_enabled` settles on), and neither
-/// `HIPFIRE_EP_EXPERT_STAGE` nor `HIPFIRE_EP_OWNER_ROUTED_PREFILL` is `0`. The
-/// loader's VRAM charge and the forward's build decision both read this. The
-/// owner-routed route's own runtime admission (S1 symmetric headers) can still
-/// decline the stage after the load; the bytes are then charged and unused.
+/// same value `expert_stage_enabled` settles on). The loader's VRAM charge and
+/// the forward's build decision both read this. The owner-routed route's own
+/// runtime admission (S1 symmetric headers) can still decline the stage after
+/// the load; the bytes are then charged and unused.
 pub fn ep_unit_stage_switches_on(switches: &EpUnitStageSwitches<'_>) -> bool {
     rdna_compute::expert_capabilities::stage_policy(switches.arch).expert_parallel_stage
         && crate::expert_residency::expert_stage_switch(
@@ -1611,24 +1587,16 @@ pub fn ep_unit_stage_switches_on(switches: &EpUnitStageSwitches<'_>) -> bool {
             switches.expert_stage,
             || crate::host_link::HostLink::Unmeasured,
         )
-        && switches.ep_stage != Some("0")
-        && switches.owner_routed != Some("0")
 }
 
 /// [`ep_unit_stage_switches_on`] with the switches read from the process
 /// configuration, for `arch`.
 pub fn ep_unit_stage_on(arch: &str) -> bool {
     let var = |name: &str| hipfire_config::developer_var(name).ok();
-    let (expert_stage, ep_stage, owner_routed) = (
-        var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV),
-        var(EP_EXPERT_STAGE_ENV),
-        var(crate::gpu_forward::QWEN4_EP_OWNER_ROUTED_PREFILL_ENV),
-    );
+    let expert_stage = var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV);
     ep_unit_stage_switches_on(&EpUnitStageSwitches {
         arch,
         expert_stage: expert_stage.as_deref(),
-        ep_stage: ep_stage.as_deref(),
-        owner_routed: owner_routed.as_deref(),
     })
 }
 
@@ -3202,7 +3170,6 @@ mod loader_support_tests {
             },
             "HIPFIRE_EP_LAB_RESIDENT_LAYERS",
         );
-        // The EP expert stage is no incompatibility: no refusal names its lever.
         for facts in [
             EpUnitsFacts { ep: 1, ..ok },
             EpUnitsFacts { pp: 2, ..ok },
@@ -3219,8 +3186,7 @@ mod loader_support_tests {
                 ..ok
             },
         ] {
-            let error = ep_units_refusal(&facts).unwrap_err();
-            assert!(!error.contains(EP_EXPERT_STAGE_ENV), "{error}");
+            assert!(ep_units_refusal(&facts).is_err());
         }
     }
 
@@ -3377,14 +3343,6 @@ mod ep_unit_stage_tests {
         for off in [
             EpUnitStageSwitches {
                 expert_stage: Some("0"),
-                ..on
-            },
-            EpUnitStageSwitches {
-                ep_stage: Some("0"),
-                ..on
-            },
-            EpUnitStageSwitches {
-                owner_routed: Some("0"),
                 ..on
             },
             // Only gfx1201 builds the EP stage, whatever the explicit switch.
@@ -3796,16 +3754,6 @@ mod ep_unit_pin_tests {
             },
         )
         .unwrap()
-    }
-
-    #[test]
-    fn the_pinned_owner_switch_is_on_unless_exactly_zero() {
-        assert_eq!(EP_UNIT_PINNED_OWNERS_ENV, "HIPFIRE_EP_UNIT_PINNED_OWNERS");
-        assert!(ep_unit_pinned_owners_on(None));
-        for on in ["1", "", " 0", "0 ", "off", "true", "2"] {
-            assert!(ep_unit_pinned_owners_on(Some(on)), "{on:?}");
-        }
-        assert!(!ep_unit_pinned_owners_on(Some("0")));
     }
 
     #[test]

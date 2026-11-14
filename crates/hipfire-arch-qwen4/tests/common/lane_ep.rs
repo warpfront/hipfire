@@ -92,9 +92,8 @@ const EP_DEGREE: usize = 2;
 pub(super) enum ArmKind {
     /// Target-only AR lanes (the reference).
     Ar,
-    /// Native-MTP mesh lanes (no copy lane staged: the store the serve builds
-    /// with `HIPFIRE_EP_MTP_LANE_COPY=0`) with the fixed-count pin: native
-    /// windows at every lane count.
+    /// Native-MTP mesh lanes (no copy lane staged or reserved) with the
+    /// fixed-count pin: native windows at every lane count.
     Mtp,
     /// Native-MTP mesh lanes with the copy lane the serve stages by default
     /// (`ep::ep_default_copy_config`, steps of at most `COPY_WIDE_LANES`
@@ -943,7 +942,7 @@ impl EpLanes {
         // arm runs) is an error, never a silent copy-off arm.
         let copy = if kind == ArmKind::Copy {
             let copy = hipfire_arch_qwen4::ep::ep_default_copy_config(gpu.arch.as_str())
-                .ok_or("lane_copy: the default EP copy lane resolves to off (HIPFIRE_EP_MTP_LANE_COPY, HIPFIRE_MTP_NGRAM_COPY or HIPFIRE_QWEN4_LANE_COPY_LANES=0)")?;
+                .ok_or("lane_copy: the default EP copy lane resolves to off (HIPFIRE_MTP_NGRAM_COPY or HIPFIRE_QWEN4_LANE_COPY_LANES=0)")?;
             if copy.wide_lanes < lanes {
                 return Err(format!(
                     "lane_copy: {} lanes but only {} copy-wide lanes (HIPFIRE_QWEN4_LANE_COPY_LANES)",

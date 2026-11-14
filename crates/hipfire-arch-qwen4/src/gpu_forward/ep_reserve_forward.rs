@@ -48,10 +48,6 @@ use std::time::{Duration, Instant};
 /// diagnostic) and the loan's epoch log. Read once at load.
 pub(crate) const EP_RESERVE_RECEIPT_ENV: &str = "HIPFIRE_EP_RESERVE_RECEIPT";
 
-/// Developer knob (default `1`): `0` keeps the receipt records but skips the
-/// donor-hash read-back, so a timed request's wall clock carries no hash cost.
-pub(crate) const EP_RESERVE_RECEIPT_HASH_ENV: &str = "HIPFIRE_EP_RESERVE_RECEIPT_HASH";
-
 /// Prefix of every receipt log line (`scripts/fn_ep_compare.py reserve harvest`).
 const RECEIPT_PREFIX: &str = "EP_RESERVE_RECEIPT";
 
@@ -995,8 +991,6 @@ pub(crate) struct EpReserveForward {
     pub(super) poisoned: Option<String>,
     /// `HIPFIRE_EP_RESERVE_RECEIPT`: per-prompt records and donor hashes.
     pub(super) receipts: bool,
-    /// `HIPFIRE_EP_RESERVE_RECEIPT_HASH` (receipts only): read the donor hashes.
-    pub(super) hashes: bool,
     /// The weight shadows live in the donor segments (rebuilt at every epoch
     /// open, never ready outside one) and the resident bank serves only calls
     /// below the shadow-reading routes' 512 rows.
@@ -1188,8 +1182,6 @@ impl EpReserveForward {
                     epoch: EpEpoch::default(),
                     poisoned: None,
                     receipts,
-                    hashes: receipts
-                        && hipfire_config::developer_bool(EP_RESERVE_RECEIPT_HASH_ENV, true),
                     shadows: false,
                     prompt: None,
                     prompt_seq: 0,
@@ -1808,7 +1800,7 @@ impl Qwen4GpuForward {
         borrowed: bool,
     ) -> Result<(), Qwen4GpuForwardError> {
         let reserve = self.ep_reserve.as_mut().expect("an EP reserve forward");
-        let wanted = reserve.hashes
+        let wanted = reserve.receipts
             && borrowed
             && !reserve.epoch.dirty()
             && reserve

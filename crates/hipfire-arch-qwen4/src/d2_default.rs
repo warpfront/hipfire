@@ -34,12 +34,11 @@
 //!    the default does not apply. `cpu` keeps today's explicit behavior,
 //!    `pcie`/`passback` keep D2 off.
 //! 2. `developer.qwen4_d2_default = false` (`HIPFIRE_QWEN4_D2_DEFAULT=0`): off.
-//! 3. `HIPFIRE_MOE_CPU_EXPERTS=0` (the developer kill-switch): off.
-//! 4. No qualifying host split layer: off.
-//! 5. Unified memory (`Gpu::is_uma`): off, and never probed (there is no link).
-//! 6. `developer.qwen4_d2_default = true` (`HIPFIRE_QWEN4_D2_DEFAULT=1`): on,
+//! 3. No qualifying host split layer: off.
+//! 4. Unified memory (`Gpu::is_uma`): off, and never probed (there is no link).
+//! 5. `developer.qwen4_d2_default = true` (`HIPFIRE_QWEN4_D2_DEFAULT=1`): on,
 //!    skipping only the cost comparison (lab and receipt runs).
-//! 7. The decode-cost comparison below. A failed or invalid measurement, or
+//! 6. The decode-cost comparison below. A failed or invalid measurement, or
 //!    one whose robust comparison does not clear the margin, is off.
 //!
 //! # Decode-cost comparison
@@ -869,8 +868,6 @@ pub enum D2Default {
     Explicit(OffloadExec),
     /// `developer.qwen4_d2_default = false`.
     Disabled,
-    /// `HIPFIRE_MOE_CPU_EXPERTS=0`.
-    KillSwitch,
     /// No layer places experts in host memory where the split can serve them.
     NoHostSplitLayers,
     /// Unified-memory device: no link, never probed.
@@ -898,7 +895,6 @@ impl D2Default {
         match self {
             Self::Explicit(_) | Self::NoHostSplitLayers => None,
             Self::Disabled => Some("off (developer.qwen4_d2_default=false)".to_owned()),
-            Self::KillSwitch => Some("off (HIPFIRE_MOE_CPU_EXPERTS=0)".to_owned()),
             Self::Unified => Some("off (unified memory: no link to beat)".to_owned()),
             Self::Forced => Some("FORCED ON (developer.qwen4_d2_default=true)".to_owned()),
             Self::Unmeasured(why) => Some(why.describe()),
@@ -912,13 +908,12 @@ impl D2Default {
 }
 
 /// The selector truth table. `measure` is only evaluated when every earlier
-/// rule passed, so an explicit setting, the typed `false`, the kill-switch, a
-/// load without host split layers, a unified-memory device and a typed `true`
-/// never run the probe.
+/// rule passed, so an explicit setting, the typed `false`, a load without
+/// host split layers, a unified-memory device and a typed `true` never run
+/// the probe.
 pub fn decide(
     explicit: Option<OffloadExec>,
     forced: Option<bool>,
-    kill_switch: bool,
     host_split_layers: usize,
     unified: bool,
     measure: impl FnOnce() -> Result<DecodeMeasurement, Unusable>,
@@ -928,9 +923,6 @@ pub fn decide(
     }
     if forced == Some(false) {
         return D2Default::Disabled;
-    }
-    if kill_switch {
-        return D2Default::KillSwitch;
     }
     if host_split_layers == 0 {
         return D2Default::NoHostSplitLayers;
@@ -953,7 +945,7 @@ pub fn decide(
 /// undecided (`("load", text)`), a unified one is off (`("off", text)`); a
 /// stored record can never state `on`.
 pub fn calibration_verdict(unified: bool) -> (&'static str, String) {
-    let verdict = decide(None, None, false, 1, unified, || Err(Unusable::NoModelArm));
+    let verdict = decide(None, None, 1, unified, || Err(Unusable::NoModelArm));
     let status = match verdict {
         D2Default::Unmeasured(Unusable::NoModelArm) => "load",
         _ => "off",
@@ -1400,10 +1392,6 @@ pub(crate) fn resolve(
     let verdict = decide(
         hipfire_config::memory::offload_exec_explicit(),
         hipfire_config::memory::qwen4_d2_default(),
-        hipfire_config::developer_var("HIPFIRE_MOE_CPU_EXPERTS")
-            .ok()
-            .as_deref()
-            == Some("0"),
         layers.len(),
         unified,
         || measured_decode(gpu, weights, config, &layers),
@@ -1647,22 +1635,19 @@ mod tests {
 
     /// Whether `decide` (unset, nothing else gating) arms D2 on `measurement`.
     fn arms(measurement: DecodeMeasurement) -> bool {
-        run(None, None, false, 43, false, Ok(measurement))
-            .0
-            .selects_d2()
+        run(None, None, 43, false, Ok(measurement)).0.selects_d2()
     }
 
     /// Run [`decide`] and report whether the probe closure ran.
     fn run(
         explicit: Option<OffloadExec>,
         forced: Option<bool>,
-        kill_switch: bool,
         layers: usize,
         unified: bool,
         measured: Result<DecodeMeasurement, Unusable>,
     ) -> (D2Default, bool) {
         let probed = Cell::new(false);
-        let verdict = decide(explicit, forced, kill_switch, layers, unified, || {
+        let verdict = decide(explicit, forced, layers, unified, || {
             probed.set(true);
             measured
         });
@@ -1692,7 +1677,7 @@ mod tests {
         for mode in [OffloadExec::Pcie, OffloadExec::Cpu, OffloadExec::Passback] {
             for forced in [None, Some(true), Some(false)] {
                 for measured in [xtx(), r9700(), Err(Unusable::Arm)] {
-                    let (verdict, probed) = run(Some(mode), forced, false, 40, false, measured);
+                    let (verdict, probed) = run(Some(mode), forced, 40, false, measured);
                     assert_eq!(verdict, D2Default::Explicit(mode));
                     assert!(
                         !verdict.selects_d2(),
@@ -1706,24 +1691,23 @@ mod tests {
 
     #[test]
     fn unset_selects_d2_only_when_every_gate_passes_and_the_costs_favor_it() {
-        // (kill-switch, host split layers, unified, measured) -> (selects, probed)
+        // (host split layers, unified, measured) -> (selects, probed)
         let cases = [
             // The only ON row.
-            (false, 40, false, xtx(), true, true),
+            (40, false, xtx(), true, true),
             // Each gate alone turns it off, and the probe never runs.
-            (true, 40, false, xtx(), false, false),
-            (false, 0, false, xtx(), false, false),
-            (false, 40, true, xtx(), false, false),
+            (0, false, xtx(), false, false),
+            (40, true, xtx(), false, false),
             // A measured PCIe win and no measurement are off.
-            (false, 40, false, r9700(), false, true),
-            (false, 40, false, Err(Unusable::Arm), false, true),
+            (40, false, r9700(), false, true),
+            (40, false, Err(Unusable::Arm), false, true),
         ];
-        for (kill, layers, unified, measured, selects, probed) in cases {
-            let (verdict, did_probe) = run(None, None, kill, layers, unified, measured);
+        for (layers, unified, measured, selects, probed) in cases {
+            let (verdict, did_probe) = run(None, None, layers, unified, measured);
             assert_eq!(
                 verdict.selects_d2(),
                 selects,
-                "kill={kill} layers={layers} unified={unified} {measured:?}: {verdict:?}"
+                "layers={layers} unified={unified} {measured:?}: {verdict:?}"
             );
             assert_eq!(did_probe, probed, "{verdict:?}");
         }
@@ -1733,26 +1717,22 @@ mod tests {
     /// comparison (every other gate still applies) and never probes.
     #[test]
     fn typed_key_forces_or_vetoes_but_keeps_every_other_gate() {
-        let (verdict, probed) = run(None, Some(false), false, 40, false, xtx());
+        let (verdict, probed) = run(None, Some(false), 40, false, xtx());
         assert_eq!(verdict, D2Default::Disabled);
         assert!(!verdict.selects_d2() && !probed);
-        let (verdict, probed) = run(None, Some(true), false, 40, false, r9700());
+        let (verdict, probed) = run(None, Some(true), 40, false, r9700());
         assert_eq!(verdict, D2Default::Forced);
         assert!(verdict.selects_d2() && !probed);
         assert_eq!(
-            run(None, Some(true), true, 40, false, r9700()).0,
-            D2Default::KillSwitch
-        );
-        assert_eq!(
-            run(None, Some(true), false, 0, false, r9700()).0,
+            run(None, Some(true), 0, false, r9700()).0,
             D2Default::NoHostSplitLayers
         );
         assert_eq!(
-            run(None, Some(true), false, 40, true, r9700()).0,
+            run(None, Some(true), 40, true, r9700()).0,
             D2Default::Unified
         );
         assert_eq!(
-            run(None, Some(false), true, 40, false, r9700()).0,
+            run(None, Some(false), 40, false, r9700()).0,
             D2Default::Disabled
         );
     }
@@ -1760,26 +1740,22 @@ mod tests {
     #[test]
     fn verdict_variants_match_their_gate() {
         assert_eq!(
-            run(None, None, true, 5, false, xtx()).0,
-            D2Default::KillSwitch
-        );
-        assert_eq!(
-            run(None, None, false, 0, false, xtx()).0,
+            run(None, None, 0, false, xtx()).0,
             D2Default::NoHostSplitLayers
         );
-        assert_eq!(run(None, None, false, 5, true, xtx()).0, D2Default::Unified);
+        assert_eq!(run(None, None, 5, true, xtx()).0, D2Default::Unified);
         assert_eq!(
-            run(None, None, false, 5, false, Err(Unusable::Link)).0,
+            run(None, None, 5, false, Err(Unusable::Link)).0,
             D2Default::Unmeasured(Unusable::Link)
         );
         let win = from_rates(55.0, 7.1).costs().unwrap();
         assert_eq!(
-            run(None, None, false, 5, false, xtx()).0,
+            run(None, None, 5, false, xtx()).0,
             D2Default::CostsFavorD2(win)
         );
         let loss = from_rates(100.0, 40.0).costs().unwrap();
         assert_eq!(
-            run(None, None, false, 5, false, r9700()).0,
+            run(None, None, 5, false, r9700()).0,
             D2Default::CostsFavorPcie(loss)
         );
     }
@@ -1965,7 +1941,7 @@ mod tests {
             u128::from(costs.d2_worst_ns) * 100
                 > u128::from(costs.pcie_ns) * u128::from(D2_MAX_PCIE_PERCENT)
         );
-        let (verdict, probed) = run(None, None, false, 43, false, Ok(measurement));
+        let (verdict, probed) = run(None, None, 43, false, Ok(measurement));
         assert!(probed && verdict.selects_d2(), "{verdict:?}");
         let line = verdict.describe().unwrap();
         for needle in ["median CPU arm of 5 samples", "x17.", "max/median"] {
@@ -2186,7 +2162,7 @@ mod tests {
             },
         ] {
             assert_eq!(broken.costs(), Err(Unusable::InvalidSample));
-            let (verdict, _) = run(None, None, false, 43, false, Ok(broken));
+            let (verdict, _) = run(None, None, 43, false, Ok(broken));
             assert_eq!(verdict, D2Default::Unmeasured(Unusable::InvalidSample));
             assert!(!verdict.selects_d2());
         }
@@ -2252,7 +2228,6 @@ mod tests {
         let line = run(
             None,
             None,
-            false,
             43,
             false,
             Ok(sampled(
@@ -2424,19 +2399,17 @@ mod tests {
         let before = (
             hipfire_dispatch::cpu_exec_enabled(),
             hipfire_dispatch::passback_enabled(),
-            hipfire_dispatch::moe_cpu_experts_enabled(),
         );
-        let (verdict, _) = run(None, None, false, 40, false, xtx());
+        let (verdict, _) = run(None, None, 40, false, xtx());
         assert!(verdict.selects_d2());
-        let (forced, _) = run(None, Some(true), false, 40, false, Err(Unusable::Arm));
+        let (forced, _) = run(None, Some(true), 40, false, Err(Unusable::Arm));
         assert!(forced.selects_d2());
         let after = (
             hipfire_dispatch::cpu_exec_enabled(),
             hipfire_dispatch::passback_enabled(),
-            hipfire_dispatch::moe_cpu_experts_enabled(),
         );
         assert_eq!(before, after);
-        assert_eq!(before, (false, false, false), "unset mode is pcie");
+        assert_eq!(before, (false, false), "unset mode is pcie");
         assert_eq!(hipfire_config::memory::offload_exec(), OffloadExec::Pcie);
     }
 

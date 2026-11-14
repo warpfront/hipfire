@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Flash-Next expert-parallel (EP, 2 to 8 ranks) owner-routed chunk MoE
-//! exchange transport (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`).
+//! exchange transport.
 //!
 //! Every rank runs the same router, top-k and stable grouping of a prefill chunk
 //! layer, so the grouped row layout (`expert_tile_ids`, `sorted_slot_index`,

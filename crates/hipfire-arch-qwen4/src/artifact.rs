@@ -2720,34 +2720,31 @@ mod tests {
         use crate::gpu_forward::CompactScratchTerms;
 
         let mut cases = 0;
-        for knob in [None, Some(false), Some(true)] {
-            for bits in 0..32 {
-                let terms = CompactScratchTerms {
-                    knob,
-                    exact_gfx1201: bits & 1 != 0,
-                    sym_iu4_requested: bits & 2 != 0,
-                    source_slab: bits & 4 != 0,
-                    ple_key_value_bf16: bits & 8 != 0,
-                    flash_next_profile: bits & 16 != 0,
-                    source_symmetric: true,
-                };
-                // The aggregate path selects with the artifact assumed
-                // symmetric; the slab path ignores symmetry entirely.
-                let optimistic = terms.mode();
-                let pessimistic = CompactScratchTerms {
-                    source_symmetric: false,
-                    ..terms
-                }
-                .mode();
-                if terms.source_slab {
-                    assert_eq!(optimistic, pessimistic, "{terms:?}");
-                } else if optimistic != Qwen4ForwardScratchMode::Full {
-                    assert_eq!(pessimistic, Qwen4ForwardScratchMode::Full, "{terms:?}");
-                }
-                cases += 1;
+        for bits in 0..32 {
+            let terms = CompactScratchTerms {
+                exact_gfx1201: bits & 1 != 0,
+                sym_iu4_requested: bits & 2 != 0,
+                source_slab: bits & 4 != 0,
+                ple_key_value_bf16: bits & 8 != 0,
+                flash_next_profile: bits & 16 != 0,
+                source_symmetric: true,
+            };
+            // The aggregate path selects with the artifact assumed
+            // symmetric; the slab path ignores symmetry entirely.
+            let optimistic = terms.mode();
+            let pessimistic = CompactScratchTerms {
+                source_symmetric: false,
+                ..terms
             }
+            .mode();
+            if terms.source_slab {
+                assert_eq!(optimistic, pessimistic, "{terms:?}");
+            } else if optimistic != Qwen4ForwardScratchMode::Full {
+                assert_eq!(pessimistic, Qwen4ForwardScratchMode::Full, "{terms:?}");
+            }
+            cases += 1;
         }
-        assert_eq!(cases, 96);
+        assert_eq!(cases, 32);
     }
 
     fn slab_metadata() -> String {

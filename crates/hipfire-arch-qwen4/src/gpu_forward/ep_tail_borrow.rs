@@ -54,8 +54,8 @@ use std::time::{Duration, Instant};
 /// Developer knob: unset = [`EP_TAIL_BORROW_DEFAULT_ON`], `0` off, `1` on with
 /// [`EP_TAIL_BORROW_DEFAULT_ROWS`] borrowed rows, an integer N above the resident rows (a
 /// multiple of 256) = N borrowed rows. Ignored (with a note) when `HIPFIRE_PREFILL_CHUNK_ROWS`
-/// is set, without the D2 tail's prefill lever, without the EP tile hook, off gfx1201 or the
-/// compact plan.
+/// is set, without the D2 expert tail over a per-expert unit plan, without the EP tile hook,
+/// off gfx1201 or the compact plan.
 pub const EP_TAIL_BORROW_ENV: &str = "HIPFIRE_QWEN4_EP_TAIL_BORROW";
 
 /// Developer knob: `1` runs `UnitTailRank::borrow_verify` (a byte compare of every occupied
@@ -110,7 +110,7 @@ pub struct EpTailBorrowFacts {
     pub gfx1201: bool,
     /// The forward scratch plan of the load.
     pub mode: Qwen4ForwardScratchMode,
-    /// The D2 expert tail is configured WITH its prefill lever over a per-expert unit plan.
+    /// The D2 expert tail is configured over a per-expert unit plan.
     pub tail_prefill: bool,
     /// Rows of the resident bank: today's EP chunk.
     pub resident_rows: usize,
@@ -176,9 +176,7 @@ pub fn resolve_ep_tail_borrow(
         return refuse("needs the compact FnSymGfx1201 scratch plan".into());
     }
     if !facts.tail_prefill {
-        return refuse(
-            "needs the D2 expert tail with its prefill lever over a per-expert unit plan".into(),
-        );
+        return refuse("needs the D2 expert tail over a per-expert unit plan".into());
     }
     if facts.explicit_chunk {
         return refuse(format!("{QWEN4_PREFILL_CHUNK_ROWS_ENV} pins the chunk"));
@@ -965,7 +963,7 @@ impl Qwen4GpuForwardScratch {
 
 impl Qwen4GpuForward {
     /// The D2 tail the install handed over (called by the EP attach right after the tail is
-    /// installed with its prefill lever); a no-op on a load without a planned borrow.
+    /// installed); a no-op on a load without a planned borrow.
     pub(crate) fn ep_tail_borrow_take_tail(&mut self, tail: Arc<UnitTailRank>) {
         if let Some(borrow) = self.ep_tail_borrow.as_mut() {
             borrow.tail = Some(tail);
@@ -1008,10 +1006,7 @@ impl Qwen4GpuForward {
             Ok(false)
         };
         let Some(tail) = borrow.tail.clone() else {
-            return refuse(
-                borrow,
-                "no D2 tail with its prefill lever was installed on this rank".to_string(),
-            );
+            return refuse(borrow, "no D2 tail was installed on this rank".to_string());
         };
         if !has_hook {
             return refuse(
@@ -1683,7 +1678,7 @@ mod tests {
                     tail_prefill: false,
                     ..facts()
                 },
-                "prefill lever",
+                "per-expert unit plan",
             ),
             (
                 EpTailBorrowFacts {

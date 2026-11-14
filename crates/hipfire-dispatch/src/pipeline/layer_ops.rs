@@ -7087,7 +7087,7 @@ pub fn execute_clear(gpu: &mut Gpu, op: &ClearOp<'_>) -> Result<(), DispatchErro
 }
 
 /// Sequence-parallel all-gather of the rows of one scratch tensor (the Flash-Next EP2 prefill
-/// route, `HIPFIRE_QWEN4_EP_SEQ_PARALLEL`): the rows this rank produced are sent to the peer and
+/// route): the rows this rank produced are sent to the peer and
 /// the peer's rows received in place, so every rank holds all `rows` rows again. The row ranges
 /// belong to the architecture crate's transport ([`RowGather`]); the step is a fusion barrier like
 /// [`ClearOp`].
@@ -7132,8 +7132,8 @@ pub trait QsaSelectGather: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// Sequence-parallel QSA selection of one prefill tile (the Flash-Next EP2 route,
-/// `HIPFIRE_QWEN4_EP_SP_INDEXER`): this rank selects only the rows of `own`, the peer the rows of
+/// Sequence-parallel QSA selection of one prefill tile (the Flash-Next EP2 route):
+/// this rank selects only the rows of `own`, the peer the rows of
 /// `peer`; the two ranges are contiguous and cover the tile. The chosen block ids travel through
 /// `gather` and each rank rebuilds the peer rows' selection bytes locally.
 #[derive(Clone, Copy)]

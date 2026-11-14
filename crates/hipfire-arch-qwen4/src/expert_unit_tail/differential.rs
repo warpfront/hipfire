@@ -227,27 +227,11 @@ fn window_uses(rng: &mut Rng, j: u64, config: &EpUnitTailConfig) -> Vec<WindowUs
         .collect()
 }
 
-/// Run one (config, frozen, peer, seed) trace in lockstep with the RESERVE lever on.
+/// Run one (config, frozen, peer, seed) trace in lockstep; `Err` names the first divergence.
 fn run_case(
-    config: (usize, usize, u32),
-    frozen: bool,
-    peer: bool,
-    seed: u64,
-    retirements: u64,
-    perturb: Perturb,
-) -> Result<Totals, String> {
-    run_case_with(config, frozen, peer, true, seed, retirements, perturb)
-}
-
-/// Run one (config, frozen, peer, reserve, seed) trace in lockstep; `Err` names the first
-/// divergence. `reserve = false` sets the lever off on the migrated side
-/// ([`TailPolicy::set_peer_reserve`]) and drops the marked slice-5 blocks on the reference
-/// side (`disable_slice5_reserve`): beta's decisions exactly.
-fn run_case_with(
     (t, f, b): (usize, usize, u32),
     frozen: bool,
     peer: bool,
-    reserve: bool,
     seed: u64,
     retirements: u64,
     perturb: Perturb,
@@ -257,9 +241,7 @@ fn run_case_with(
         fill_per_step: f,
         boundary_every: b,
     };
-    let label = format!(
-        "config=({t},{f},{b}) frozen={frozen} peer={peer} reserve={reserve} seed={seed:#x}"
-    );
+    let label = format!("config=({t},{f},{b}) frozen={frozen} peer={peer} seed={seed:#x}");
     let mut rng = Rng(seed);
 
     // A random ranking priority over half of the unit universe.
@@ -277,10 +259,6 @@ fn run_case_with(
         beta.enable_peer_quarantine();
     }
     let mut rig = Rig::with_peer(config, frozen, priority, peer);
-    if !reserve {
-        beta.disable_slice5_reserve();
-        rig.policy.set_peer_reserve(false);
-    }
 
     // Warm start with a random number of units (with repeats, possibly more than T).
     let seeds: Vec<UnitKey> = (0..rng.below(t as u64 + 4))
@@ -381,31 +359,20 @@ fn run_case_with(
     })
 }
 
-/// Every seed of `configs` at one (frozen, peer), RESERVE lever on.
+/// Every seed of `configs` at one (frozen, peer); prints one summary line per config.
 fn sweep(
     configs: &[(usize, usize, u32)],
     frozen: bool,
     peer: bool,
 ) -> Result<Vec<((usize, usize, u32), Totals)>, String> {
-    sweep_with(configs, frozen, peer, true)
-}
-
-/// Every seed of `configs` at one (frozen, peer, reserve); prints one summary line per config.
-fn sweep_with(
-    configs: &[(usize, usize, u32)],
-    frozen: bool,
-    peer: bool,
-    reserve: bool,
-) -> Result<Vec<((usize, usize, u32), Totals)>, String> {
     let mut out = Vec::new();
     for &config in configs {
         let mut total = Totals::default();
         for seed in SEEDS {
-            total.add(&run_case_with(
+            total.add(&run_case(
                 config,
                 frozen,
                 peer,
-                reserve,
                 seed,
                 RETIREMENTS,
                 Perturb::None,
@@ -464,21 +431,6 @@ fn differential_peer_on() {
     assert!(
         sum(&rows, |t| t.stale_completions) > 0,
         "no stale completions"
-    );
-}
-
-/// The kill switch (`HIPFIRE_EP_UNIT_TAIL_PEER_RESERVE=0`): with the lever off the migrated
-/// policy decides exactly like beta's (the reference with no marked slice-5 block in effect), on
-/// every peer trace; and the lever is not vacuous (on, the same traces decide differently).
-#[test]
-fn differential_peer_on_reserve_off_is_beta() {
-    let off = sweep_with(&CONFIGS, false, true, false).unwrap();
-    let on = sweep(&CONFIGS, false, true).unwrap();
-    assert!(sum(&off, |t| t.quarantined) > 0, "nothing quarantined");
-    assert_ne!(
-        sum(&off, |t| t.fills_issued),
-        sum(&on, |t| t.fills_issued),
-        "the reserve never changed a decision on these traces"
     );
 }
 

@@ -16,7 +16,6 @@
 //! ordering changes. Pinned, disjoint first-row bounce slices carry the HC
 //! streams. Sender completion events gate receiver uploads, and stream order
 //! protects scratch reuse. The output band drains once before picks are read.
-//! `HIPFIRE_PP_LANE_OVERLAP=0` selects the sequential decode walk instead.
 //! The micro-batch count `G` per step comes from the output-band root's
 //! [`crate::lane::groups`] planner: maximal overlap `min(lanes, 2 * stages)`
 //! under a per-lane stage policy, measured per-`G` complete-step walls under a
@@ -786,135 +785,6 @@ fn sample_decode_lanes(
     Ok(())
 }
 
-/// The sequential kill-switch route; errors after the first launch are fatal.
-fn decode_run_sequential(
-    refs: &mut [&mut Qwen4Bundle],
-    stores: &mut [Qwen4LaneStore],
-    gpus: &mut Gpus,
-    bounce: &mut [u8],
-    call: &DecodeCall<'_>,
-    picks: &mut [u32],
-) -> Result<(), StepFailure> {
-    let DecodeCall {
-        plan,
-        decode,
-        epochs,
-        n_dec,
-        vocab,
-        bytes,
-    } = *call;
-    let stages = refs.len();
-    let int = std::mem::size_of::<i32>();
-    let mut launched = false;
-    for index in 0..stages {
-        let last = index + 1 == stages;
-        let gpu = &mut gpus.devices[index];
-        gpu.bind_thread()
-            .map_err(|e| StepFailure::new(format!("bind device {index}: {e}"), launched))?;
-        let band: &mut Qwen4Bundle = &mut *refs[index];
-        if index > 0 {
-            // Receiver: host -> device, then drain before the launch.
-            launched = true;
-            let streams = band
-                .lane_edge_streams()
-                .map_err(|e| StepFailure::new(e, true))?;
-            gpu.hip
-                .memcpy_htod(&streams.buf, &bounce[..bytes])
-                .map_err(|e| StepFailure::new(format!("band {index} edge upload: {e}"), true))?;
-            gpu.hip
-                .device_synchronize()
-                .map_err(|e| StepFailure::new(format!("band {index} edge drain: {e}"), true))?;
-        }
-        let policy = stores[index].stage_policy();
-        if last {
-            let parts = stores[index]
-                .step_parts(epochs)
-                .map_err(|e| StepFailure::new(e, launched))?;
-            let crate::lane::StepParts {
-                lanes,
-                logits,
-                top1,
-                top1_host,
-                ..
-            } = parts;
-            let mut rows: Vec<LaneRows<'_>> = lanes
-                .into_iter()
-                .zip(decode.iter())
-                .map(|(lane, r)| LaneRows {
-                    state: &mut lane.state,
-                    tokens: &plan.batch.tokens[r.rows.begin..r.rows.end()],
-                    kind: LaneRowKind::Ar,
-                    wide: false,
-                    // PP AR steps carry at most `LANE_MAX_ROWS` rows, so no all-rows segment.
-                    exact: false,
-                })
-                .collect();
-            let out = LaneOutputs {
-                logits: &logits.sub_offset(0, n_dec * vocab),
-                top1: &top1.sub_offset(0, n_dec * int),
-                wide_hidden: None,
-                vocab_shard: None,
-            };
-            launched = true;
-            let forwarded = forward_lanes(gpu, band, &mut rows, &out, &policy);
-            drop(rows);
-            forwarded.map_err(|e| StepFailure::new(format!("band {index}: {e}"), true))?;
-            if top1_host.len() < n_dec * int {
-                return Err(StepFailure::new("the host top-1 mirror is too small", true));
-            }
-            gpu.hip
-                .device_synchronize()
-                .map_err(|e| StepFailure::new(format!("band {index} drain: {e}"), true))?;
-            gpu.hip
-                .memcpy_dtoh(&mut top1_host[..n_dec * int], &top1.buf)
-                .map_err(|e| StepFailure::new(format!("top-1 download: {e}"), true))?;
-            gpu.take_device_wait_error()
-                .map_err(|e| StepFailure::new(format!("band {index}: {e}"), true))?;
-            let mut first = 0usize;
-            for r in decode {
-                for j in 0..r.rows.len {
-                    picks[r.rows.begin + j] = pick_at(top1_host, first + j);
-                }
-                first += r.rows.len;
-            }
-            sample_decode_lanes(&*gpu, &mut stores[index], call, picks)?;
-        } else {
-            let lanes = stores[index]
-                .band_lanes_mut(epochs)
-                .map_err(|e| StepFailure::new(e, launched))?;
-            let mut rows: Vec<LaneRows<'_>> = lanes
-                .into_iter()
-                .zip(decode.iter())
-                .map(|(lane, r)| LaneRows {
-                    state: &mut lane.state,
-                    tokens: &plan.batch.tokens[r.rows.begin..r.rows.end()],
-                    kind: LaneRowKind::Ar,
-                    wide: false,
-                    // PP AR steps carry at most `LANE_MAX_ROWS` rows, so no all-rows segment.
-                    exact: false,
-                })
-                .collect();
-            launched = true;
-            let forwarded = forward_lanes_edge(gpu, band, &mut rows, &policy);
-            drop(rows);
-            forwarded.map_err(|e| StepFailure::new(format!("band {index}: {e}"), true))?;
-            // Sender: drain, then device -> host.
-            gpu.hip
-                .device_synchronize()
-                .map_err(|e| StepFailure::new(format!("band {index} drain: {e}"), true))?;
-            gpu.take_device_wait_error()
-                .map_err(|e| StepFailure::new(format!("band {index}: {e}"), true))?;
-            let streams = band
-                .lane_edge_streams()
-                .map_err(|e| StepFailure::new(e, true))?;
-            gpu.hip
-                .memcpy_dtoh(&mut bounce[..bytes], &streams.buf)
-                .map_err(|e| StepFailure::new(format!("band {index} edge download: {e}"), true))?;
-        }
-    }
-    Ok(())
-}
-
 /// A contiguous set of whole lanes and its packed decode-row range.
 #[derive(Debug, PartialEq, Eq)]
 struct DecodeMicroBatch {
@@ -991,15 +861,9 @@ fn edge_host_wait_enabled(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-fn decode_overlap_enabled(value: Option<&str>) -> bool {
-    value != Some("0")
-}
-
-/// Exact decode wavefront, default on; `HIPFIRE_PP_LANE_OVERLAP=0` restores
-/// the sequential walk at this single dispatch site. No host bookkeeping
-/// observes another band's partial progress: agreement is checked only after
-/// all micro-batches finish. Fatal failures drain every band before returning
-/// to the caller, which poisons participants and quarantines the mesh.
+/// Exact decode wavefront. No host bookkeeping observes another band's partial progress:
+/// agreement is checked only after all micro-batches finish. Fatal failures drain every band
+/// before returning to the caller, which poisons participants and quarantines the mesh.
 #[allow(clippy::too_many_arguments)]
 fn decode_run(
     refs: &mut [&mut Qwen4Bundle],
@@ -1010,12 +874,7 @@ fn decode_run(
     call: &DecodeCall<'_>,
     picks: &mut [u32],
 ) -> Result<(), StepFailure> {
-    let overlap = hipfire_config::developer_var("HIPFIRE_PP_LANE_OVERLAP").ok();
-    let result = if decode_overlap_enabled(overlap.as_deref()) {
-        decode_run_overlap(refs, stores, gpus, bounce, events, call, picks)
-    } else {
-        decode_run_sequential(refs, stores, gpus, bounce, call, picks)
-    };
+    let result = decode_run_overlap(refs, stores, gpus, bounce, events, call, picks);
     if let Err(mut error) = result {
         if error.fatal {
             // Keep trying every band even if one bind or drain fails. The
@@ -1559,9 +1418,7 @@ impl Qwen4Bundle {
 
 #[cfg(test)]
 mod pp_lane_tests {
-    use super::{
-        decode_micro_batches, decode_overlap_enabled, decode_wavefront, edge_host_wait_enabled,
-    };
+    use super::{decode_micro_batches, decode_wavefront, edge_host_wait_enabled};
     use crate::lane::groups::max_groups;
 
     #[test]
@@ -1712,21 +1569,6 @@ mod pp_lane_tests {
                 }
                 assert_eq!(end, rows_cap * row_bytes);
             }
-        }
-    }
-
-    #[test]
-    fn pp_lane_overlap_kill_switch_parse() {
-        assert!(!decode_overlap_enabled(Some("0")));
-        for value in [
-            None,
-            Some("1"),
-            Some(""),
-            Some("false"),
-            Some(" 0"),
-            Some("0 "),
-        ] {
-            assert!(decode_overlap_enabled(value));
         }
     }
 

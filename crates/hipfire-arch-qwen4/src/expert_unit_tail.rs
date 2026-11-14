@@ -61,13 +61,14 @@
 //! * An unfinished or dropped lease quarantines its generation (it can never retire, its slots
 //!   never reclaim); an unknown-quiescence fence failure quarantines the slots it guarded.
 //!
-//! # Peer visibility (`HIPFIRE_EP_UNIT_TAIL_PEER`)
+//! # Peer visibility
 //!
 //! A sub-512-row prefill takes the FULL-table route: every rank computes every expert, so a unit
 //! the OWNER holds in a tail slot is read by the OTHER ranks from the owner's pinned host arena
-//! unless their full tables name the owner's slot. With the lever the ranks (threads of one
-//! process) share one [`PeerBoard`] and the protocol below. With it off there is no board and no
-//! quarantine, and every decision of [`TailPolicy::retire_windows`] is the pre-peer one.
+//! unless their full tables name the owner's slot. A configured tail on a mesh of two or more
+//! ranks shares one [`PeerBoard`] across the ranks (threads of one process) and runs the protocol
+//! below. A single-rank mesh has no board and no quarantine, and every decision of
+//! [`TailPolicy::retire_windows`] is the pre-peer one.
 //!
 //! * POST. At each of its retirements `k` (its retirement counter, from 1; the warm start posts
 //!   as `k = 0`) the owner posts the deltas of its OWN publications: `(unit, Some(slot
@@ -143,13 +144,12 @@
 //! refills a slot that rank may still name; a frozen tail leaves every table state valid
 //! (canonical, or a live slot with complete bytes).
 //!
-//! # Dynamic pins (`HIPFIRE_EP_UNIT_TAIL_PINS`)
+//! # Dynamic pins
 //!
-//! By default a configured tail runs on STATIC `e % ranks` owners (pinned owners off). With the
-//! pins lever the layers keep the D1.9 pinned owner assignment and the pin plane follows the
-//! tail's publications: a unit published in its holder's slot is pinned to its holder. The
-//! protocol, its plane-identity argument, its visibility argument and its failure path are in
-//! [`pins`].
+//! A configured tail keeps the D1.9 pinned owner assignment of the pinned unit layers, and the pin
+//! plane follows the tail's publications: a unit published in its holder's slot is pinned to its
+//! holder. The protocol, its plane-identity argument, its visibility argument and its failure path
+//! are in [`pins`].
 
 pub mod pins;
 pub use pins::{PinDelta, PinError, PinPlanes, PinPost, PinProtocol, PinStats, PIN_LAG};
@@ -186,52 +186,9 @@ pub const EP_UNIT_TAIL_ENV: &str = "HIPFIRE_EP_UNIT_TAIL";
 /// `1`: build the tail (pool, seed, usage log) but never admit or evict: the
 /// A/B arm that prices the tail's bookkeeping without any fill traffic.
 pub const EP_UNIT_TAIL_FREEZE_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_FREEZE";
-/// `1`: the pool is visible to prefill routes. The rank's FULL (chunk / prefill) pointer tables
-/// follow the tail's slot publications for the owned units whose canonical entries they share
-/// with the decode tables, so a full-table prefill forward reads a live slot from VRAM instead of
-/// the pinned host arena; and the long-prefill UNIT STAGE (the owner-routed tile route's staged
-/// forwards) names a slot-live owned unit's slot in its pointer table and skips that unit's bytes
-/// in the per-layer H2D copy (the decode tables alone see slots without it). Needs the tail;
-/// default on; `=0` is the kill switch.
-pub const EP_UNIT_TAIL_PREFILL_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PREFILL";
-/// `1`: with the tail AND [`EP_UNIT_TAIL_PREFILL_ENV`], every rank's FULL (chunk / prefill)
-/// pointer tables also follow the PEER ranks' slot publications for the peer-owned units whose
-/// full-table entries equal the owner's canonical ones, so a full-table prefill forward (every
-/// rank computes every expert) reads a unit the owner holds in a tail slot from the owner's VRAM
-/// over P2P instead of from the owner's pinned host arena. An owner quarantines an evicted slot
-/// until every peer's table dropped it (module docs). Default on (`=0` kills it); ignored (with a note) without
-/// the prefill lever.
-pub const EP_UNIT_TAIL_PEER_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PEER";
-/// `1`: with the tail AND [`EP_UNIT_TAIL_PREFILL_ENV`], the tail no longer turns pinned owners
-/// (D1.9) off: the pinned unit layers keep the balanced pinned owner assignment and its pin plane
-/// follows the tail, a unit published in its holder's slot is pinned to its holder (module docs
-/// of [`pins`]: the retirement-lagged, rank-identical plane, its safety argument and failure
-/// path). Effective only where pinned owners are admitted as without a tail
-/// (`HIPFIRE_EP_UNIT_PINNED_OWNERS` not `0`, balanced ownership admitted); otherwise (with a note)
-/// the tail runs exactly as it does without this lever. Default on (`=0` kills it).
-pub const EP_UNIT_TAIL_PINS_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PINS";
 /// `1`: print a `[unit-tail]` counter line every 64 windows and at release.
 pub const EP_UNIT_TAIL_LOG_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_LOG";
-/// Default on (`=0` is the kill switch): a retirement's fills are enqueued by the next forward's
-/// first row-gather call instead of at the retirement, so they run under that forward rather
-/// than inside the lane window's device-wide prepare sync, and the next retirement waits for
-/// them before it polls (the policy sees the same completions). `=0` issues them at the
-/// retirement and polls them.
-pub const EP_UNIT_TAIL_FILL_OVERLAP_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP";
-/// Default on (`=0` is the kill switch): under the D2 tail a few-row grouped prefill (verify)
-/// call's routed ids are written by the route kernels straight into the tail's usage log, the
-/// tail's whole per-call logging decision taken before the route launches, instead of the route
-/// writing the top-k scratch and the row gather copying it into the log (one device copy per MoE
-/// layer per step). The logged bytes, offsets and every routing result are identical. `=0`
-/// restores the per-layer copy.
-pub const EP_TAIL_LOG_DIRECT_ENV: &str = "HIPFIRE_EP_TAIL_LOG_DIRECT";
-/// Default on (`=0` is the kill switch): with peer quarantine ([`EP_UNIT_TAIL_PEER_ENV`]) in
-/// per-window mode, a retirement whose candidates saturate its fill budget keeps a reserve of
-/// free + quarantined slots ([`RESERVE_RETIREMENTS`]` x ` the budget, a constant) so `F` fills per
-/// window are sustained instead of alternating with the evictions (module docs, RESERVE). `=0`
-/// restores the candidate-waits rule for every retirement, decision for decision.
-pub const EP_UNIT_TAIL_PEER_RESERVE_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PEER_RESERVE";
-/// `G` (whole units, default [`EP_UNIT_TAIL_STAGE_GAP_DEFAULT`]): with the prefill lever, the
+/// `G` (whole units, default [`EP_UNIT_TAIL_STAGE_GAP_DEFAULT`]): with a configured tail, the
 /// slot-aware unit stage merges two H2D copy runs across a slot-live gap shorter than `G` units
 /// (the gap units are copied too and simply not referenced: their stage-table entries still name
 /// the slot). `0` = exactly the complement of the slot-live units.
@@ -331,22 +288,10 @@ pub fn ep_unit_tail_explicit() -> bool {
     raw.is_some() && parse_ep_unit_tail(raw.as_deref()).is_ok_and(|config| config.is_some())
 }
 
-/// A tail lever flag (`PREFILL` / `PEER` / `PINS`): default on, `=0` is the kill switch.
-pub fn tail_lever(env: &str) -> bool {
-    hipfire_config::developer_bool(env, true)
-}
-
-/// Whether the lever env var was set by the operator (notes about an ignored lever print only then).
-pub fn tail_lever_explicit(env: &str) -> bool {
-    hipfire_config::developer_var(env).is_ok()
-}
-
-/// Whether [`EP_UNIT_TAIL_ENV`] asks for a tail in this process. Without
-/// [`EP_UNIT_TAIL_PINS_ENV`] a configured tail runs on STATIC `e % ranks` owners: pinned owners
-/// (D1.9) deal the non-core experts of a call to either rank, so a rank's tail would have to follow
-/// a pin plane both ranks agree on every window (the dynamic pins of [`pins`] are exactly that),
-/// and the unit layers' owner kind ([`crate::gpu_forward::ep_unit_layer_owner_kind`]) keeps D1's
-/// static rule instead.
+/// Whether [`EP_UNIT_TAIL_ENV`] asks for a tail in this process. A configured tail's pool is
+/// visible to prefill routes (the full chunk tables follow the slot publications, and the unit
+/// stage's slot-aware tables skip the copies of slot-live units), and its pinned unit layers
+/// follow the tail's publications (the dynamic pins of [`pins`]).
 pub fn ep_unit_tail_configured() -> bool {
     resolve_ep_unit_tail(
         hipfire_config::developer_var(EP_UNIT_TAIL_ENV)
@@ -354,42 +299,6 @@ pub fn ep_unit_tail_configured() -> bool {
             .as_deref(),
     )
     .is_ok_and(|config| config.is_some())
-}
-
-/// Whether the D2 tail's pool is visible to prefill routes: the tail is configured AND
-/// [`EP_UNIT_TAIL_PREFILL_ENV`] is on. Gates both the full chunk tables following the slot
-/// publications and the unit stage's slot-aware tables / copy runs.
-pub fn ep_unit_tail_prefill_requested() -> bool {
-    ep_unit_tail_configured() && tail_lever(EP_UNIT_TAIL_PREFILL_ENV)
-}
-
-/// The pure decision of [`ep_unit_tail_pins_requested`]: the lever is on only with the tail
-/// AND its prefill lever (the decode owner assignment reads the full tables, which follow the
-/// slot publications only with the prefill lever).
-pub fn tail_pins_requested(prefill_requested: bool, pins_flag: bool) -> bool {
-    prefill_requested && pins_flag
-}
-
-/// Whether [`EP_UNIT_TAIL_PINS_ENV`] is in effect: the tail is configured, its prefill lever is
-/// on and the pins flag is on. Admission of pinned owners on the load is still decided as ever
-/// (`qwen4_ep_unit_pins_admitted`); without it the lever changes nothing.
-pub fn ep_unit_tail_pins_requested() -> bool {
-    tail_pins_requested(
-        ep_unit_tail_prefill_requested(),
-        tail_lever(EP_UNIT_TAIL_PINS_ENV),
-    )
-}
-
-/// The pure decision of [`ep_unit_tail_blocks_pins`].
-pub fn tail_blocks_pins(tail_configured: bool, pins_requested: bool) -> bool {
-    tail_configured && !pins_requested
-}
-
-/// Whether a configured tail turns pinned owners (D1.9) off on this load: any configured tail
-/// did, before the pins lever; with [`ep_unit_tail_pins_requested`] it does not. A load without
-/// a tail is never blocked.
-pub fn ep_unit_tail_blocks_pins() -> bool {
-    tail_blocks_pins(ep_unit_tail_configured(), ep_unit_tail_pins_requested())
 }
 
 /// Parse [`EP_UNIT_TAIL_STAGE_GAP_ENV`]: unset or empty = the default, else a non-negative integer.
@@ -699,9 +608,6 @@ pub struct TailPolicy {
     frozen: bool,
     /// PEER mode: evictions quarantine the slot instead of refilling it in the same retirement.
     peer: bool,
-    /// PEER per-window mode keeps the RESERVE under saturated demand (module docs);
-    /// [`EP_UNIT_TAIL_PEER_RESERVE_ENV`]`=0` turns it off ([`Self::set_peer_reserve`]).
-    peer_reserve: bool,
     /// `None` only after [`Self::close`] succeeded.
     bank: Option<SlotBank>,
     /// The membership of the NEXT generation: the `Resident` slots.
@@ -789,7 +695,6 @@ impl TailPolicy {
             config,
             frozen,
             peer,
-            peer_reserve: true,
             bank: Some(bank),
             staging,
             slots: cells
@@ -809,13 +714,6 @@ impl TailPolicy {
             refusals: 0,
             first_refusal: None,
         })
-    }
-
-    /// The RESERVE lever ([`EP_UNIT_TAIL_PEER_RESERVE_ENV`]): `false` keeps the candidate-waits
-    /// rule in every retirement (the pre-reserve decisions). Default `true`; only PEER per-window
-    /// mode ever keeps a reserve.
-    pub fn set_peer_reserve(&mut self, on: bool) {
-        self.peer_reserve = on;
     }
 
     pub fn config(&self) -> &EpUnitTailConfig {
@@ -1399,7 +1297,7 @@ impl TailPolicy {
         // while free + quarantined slots are below `RESERVE_RETIREMENTS x budget`, evicts one
         // victim into quarantine for a later retirement's fills. Below saturation the candidate
         // that has to evict waits (it is admitted if it misses again), as without the reserve.
-        let reserve = self.peer && self.peer_reserve && !boundary && candidates.len() >= budget;
+        let reserve = self.peer && !boundary && candidates.len() >= budget;
         let reserve_target = RESERVE_RETIREMENTS * budget;
         for cand in candidates.into_iter().take(budget) {
             if reserve {
@@ -1608,11 +1506,11 @@ struct BoardState {
     detached: Vec<bool>,
 }
 
-/// The cross-rank state of the PEER lever (module docs): what each owner posted, what each rank
-/// took, and the acknowledgements the owners release quarantined slots on; plus the pin section
-/// of the PINS lever ([`pins`]: the retirement-stamped pin deltas every rank applies under the
-/// retirement lag), independent of the PEER lever. One board per process and EP mesh, shared by
-/// every rank thread; every call is a short critical section.
+/// The cross-rank state of the peer board (module docs): what each owner posted, what each
+/// rank took, and the acknowledgements the owners release quarantined slots on; plus the pin
+/// section of the tail ([`pins`]: the retirement-stamped pin deltas every rank applies under
+/// the retirement lag). One board per process and EP mesh, shared by every rank thread; every
+/// call is a short critical section.
 #[derive(Debug)]
 pub struct PeerBoard {
     ranks: usize,
@@ -2299,8 +2197,8 @@ mod tests {
 
     /// Digest of every decision the policy makes over a deterministic random trace: each
     /// retirement's publish / unpublish / fill lists and the final counters. Pinned for the
-    /// flag-off policy (the PEER lever's quarantine is off) against the digests recorded on the
-    /// pre-peer policy (be067917f3). `peer` runs the same trace through the quarantine path with
+    /// no-peer policy (no quarantine path) against the digests recorded on the policy before the
+    /// peer board (be067917f3). `peer` runs the same trace through the quarantine path with
     /// every peer acknowledging at once.
     fn trace_digest(
         t: usize,
@@ -2413,7 +2311,7 @@ mod tests {
         h
     }
 
-    /// `(T, F, boundary, frozen, seed, digest)` of the pinned flag-off traces, recorded on the
+    /// `(T, F, boundary, frozen, seed, digest)` of the pinned no-peer traces, recorded on the
     /// pre-peer policy (be067917f3).
     const GOLDEN_CASES: [(usize, usize, u32, bool, u64, u64); 6] = [
         (5, 2, 1, false, 0x1234_5678_9abc_def1, 0x65a2_c5b0_4769_3f07),
@@ -2431,25 +2329,26 @@ mod tests {
         ),
     ];
 
-    /// Flag off (no quarantine) decides exactly like the pre-peer policy: the digests of
+    /// Without peers (no quarantine) decides exactly like the pre-peer policy: the digests of
     /// publish / unpublish / fill lists and counters over random traces (evictions, boundary
     /// mode, freeze, stale completions) are the ones recorded before the lever existed.
     #[test]
-    fn flag_off_policy_decisions_match_the_pre_peer_golden_traces() {
+    fn no_peer_policy_decisions_match_the_pre_peer_golden_traces() {
         for (t, f, b, frozen, seed, want) in GOLDEN_CASES {
             let got = trace_digest(t, f, b, frozen, false, seed, 400);
             assert_eq!(
                 got, want,
-                "T={t} F={f} b={b} frozen={frozen}: flag-off decisions moved ({got:#018x})"
+                "T={t} F={f} b={b} frozen={frozen}: no-peer decisions moved ({got:#018x})"
             );
         }
     }
 
-    /// The quarantine path only differs from flag off when a slot is evicted: a trace whose free
-    /// slots never drop below the reserve ([`QUARANTINE_WINDOWS`]` x ` the fill budget, so no
-    /// miss needs a victim and no reserve eviction happens) decides identically in both modes.
+    /// The quarantine path only differs from the no-peer path when a slot is evicted: a trace
+    /// whose free slots never drop below the reserve ([`QUARANTINE_WINDOWS`] x the fill
+    /// budget, so no miss needs a victim and no reserve eviction happens) decides identically
+    /// in both modes.
     #[test]
-    fn peer_mode_decides_like_flag_off_while_no_victim_is_needed() {
+    fn peer_mode_decides_like_no_peer_while_no_victim_is_needed() {
         for seed in [0x1234_5678_9abc_def1u64, 0x9e37_79b9_7f4a_7c15] {
             // 300 windows x 3 fills leave more than 3 x 3 of the 1000 slots free throughout.
             let off = trace_digest(1000, 3, 1, false, false, seed, 300);
@@ -2675,27 +2574,5 @@ mod tests {
         assert_eq!(board.released_through(0, 10), 5);
         // With no peer at all everything is released.
         assert_eq!(PeerBoard::new(1).released_through(0, 1), u64::MAX);
-    }
-
-    /// The pins lever is on by default (with the default tail and prefill lever); off (`=0`), a
-    /// configured tail turns pinned owners off exactly as before it existed
-    /// (`ep_unit_tail_configured()`); on, only with the tail's prefill lever, it does not.
-    #[test]
-    fn pins_flag_off_is_todays_static_owner_tail() {
-        // Requested only with the prefill lever AND the flag.
-        assert!(!tail_pins_requested(false, false));
-        assert!(!tail_pins_requested(true, false));
-        assert!(!tail_pins_requested(false, true));
-        assert!(tail_pins_requested(true, true));
-        // Flag off: the gate is exactly `tail configured` (the old `!ep_unit_tail_configured()`
-        // term of `qwen4_ep_unit_pins_admitted` / `pins_on`).
-        for configured in [false, true] {
-            assert_eq!(tail_blocks_pins(configured, false), configured);
-        }
-        // Flag on (which implies a configured tail): the tail no longer blocks pinned owners.
-        assert!(!tail_blocks_pins(true, true));
-        // The unit-test process has none of the levers set: the shipped defaults are all on.
-        assert!(ep_unit_tail_pins_requested());
-        assert!(!ep_unit_tail_blocks_pins());
     }
 }

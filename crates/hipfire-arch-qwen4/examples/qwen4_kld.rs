@@ -324,7 +324,6 @@ fn admit_untiered_arm(
     arm: UntieredArm,
     explicit: Option<OffloadExec>,
     force: Option<bool>,
-    kill_switch: bool,
     uma: bool,
 ) -> Result<(), String> {
     if uma {
@@ -341,9 +340,6 @@ fn admit_untiered_arm(
                 return Err(format!(
                     "--untiered d2 needs HIPFIRE_QWEN4_D2_DEFAULT=1 (developer.qwen4_d2_default is {force:?})"
                 ));
-            }
-            if kill_switch {
-                return Err("--untiered d2 conflicts with HIPFIRE_MOE_CPU_EXPERTS=0".into());
             }
         }
         UntieredArm::Pcie => {
@@ -651,10 +647,6 @@ impl Model {
                     arm,
                     hipfire_config::memory::offload_exec_explicit(),
                     hipfire_config::memory::qwen4_d2_default(),
-                    hipfire_config::developer_var("HIPFIRE_MOE_CPU_EXPERTS")
-                        .ok()
-                        .as_deref()
-                        == Some("0"),
                     gpu.is_uma(),
                 )?;
                 Some(arm)
@@ -668,7 +660,7 @@ impl Model {
             admit_pinned_control(
                 hipfire_config::memory::offload_exec(),
                 gpu.is_uma(),
-                hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled(),
+                hipfire_dispatch::cpu_exec::cpu_exec_enabled(),
                 hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()?.is_some(),
             )?;
             let policy = match pin.sidecar.as_deref() {
@@ -1017,7 +1009,6 @@ impl Model {
                         "HIPFIRE_QWEN4_D2_DEFAULT": env("HIPFIRE_QWEN4_D2_DEFAULT"),
                         "HIPFIRE_OFFLOAD_EXEC": env("HIPFIRE_OFFLOAD_EXEC"),
                         "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS": env("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS"),
-                        "HIPFIRE_MOE_CPU_EXPERTS": env("HIPFIRE_MOE_CPU_EXPERTS"),
                     },
                     "trunk_layers": trunk_layers,
                     "host_placed_trunk_layers": host_layers,
@@ -3287,42 +3278,18 @@ kl = [kld_from_block(r['ids'][i],r['logprobs'][i],r['residual'][i],candidate) fo
 
     #[test]
     fn untiered_arms_gate_on_exec_selection_not_on_placement() {
-        let ok =
-            |arm, explicit, force, kill, uma| admit_untiered_arm(arm, explicit, force, kill, uma);
-        assert!(ok(UntieredArm::D2, None, Some(true), false, false).is_ok());
-        assert!(ok(UntieredArm::D2, None, None, false, false).is_err());
-        assert!(ok(
-            UntieredArm::D2,
-            Some(OffloadExec::Pcie),
-            Some(true),
-            false,
-            false
-        )
-        .is_err());
-        assert!(ok(UntieredArm::D2, None, Some(true), true, false).is_err());
-        assert!(ok(UntieredArm::D2, None, Some(true), false, true).is_err());
-        assert!(ok(
-            UntieredArm::Pcie,
-            Some(OffloadExec::Pcie),
-            None,
-            false,
-            false
-        )
-        .is_ok());
-        assert!(ok(UntieredArm::Pcie, None, None, false, false).is_err());
-        assert!(ok(
-            UntieredArm::Pcie,
-            Some(OffloadExec::Cpu),
-            None,
-            false,
-            false
-        )
-        .is_err());
+        let ok = |arm, explicit, force, uma| admit_untiered_arm(arm, explicit, force, uma);
+        assert!(ok(UntieredArm::D2, None, Some(true), false).is_ok());
+        assert!(ok(UntieredArm::D2, None, None, false).is_err());
+        assert!(ok(UntieredArm::D2, Some(OffloadExec::Pcie), Some(true), false).is_err());
+        assert!(ok(UntieredArm::D2, None, Some(true), true).is_err());
+        assert!(ok(UntieredArm::Pcie, Some(OffloadExec::Pcie), None, false).is_ok());
+        assert!(ok(UntieredArm::Pcie, None, None, false).is_err());
+        assert!(ok(UntieredArm::Pcie, Some(OffloadExec::Cpu), None, false).is_err());
         assert!(ok(
             UntieredArm::Pcie,
             Some(OffloadExec::Pcie),
             Some(true),
-            false,
             false
         )
         .is_err());

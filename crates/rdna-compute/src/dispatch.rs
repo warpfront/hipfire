@@ -2014,7 +2014,7 @@ pub struct Gpu {
     /// ROUTING predicate sees `prefill_invariant::QWEN4_PREFILL_CANON_ROWS`
     /// via `Gpu::route_rows` while launches keep the real row count.
     /// Also set for one gfx1151 Flash-Next prefill tile of fewer than 512 rows
-    /// on the agent-turn append route (`HIPFIRE_QWEN4_APPEND_WMMA`).
+    /// on the agent-turn append route.
     pub prefill_invariant_scope: bool,
     /// True while an ordinary (non-verify, non-decode) prefill forward runs
     /// ([`Gpu::ordinary_prefill_enter`]): GDN/FFN/attention producers take the canonical
@@ -2042,8 +2042,7 @@ pub struct Gpu {
     /// installed budget id. `None` when emulation is off (the default).
     pub(crate) emu: Option<crate::emu::EmuGpuState>,
     /// True while a Qwen4 prefill tile runs on the agent-turn append route
-    /// (`HIPFIRE_QWEN4_APPEND_WMMA`, see
-    /// `prefill_invariant::qwen4_append_wmma_route`): the symmetric IU4 MoE arm
+    /// (see `prefill_invariant::qwen4_append_wmma_route`): the symmetric IU4 MoE arm
     /// is suppressed so the MoE takes the F16 WMMA grouped arm, exactly as
     /// `HIPFIRE_QWEN4_MOE_SYM_IU4=0` does, for that tile only.
     pub qwen4_append_f16_moe_scope: bool,
@@ -9366,9 +9365,8 @@ impl Gpu {
     }
 
     /// [`Self::memset_stream_ordered`] without the per-call wait: with a steady copy stream
-    /// and `flags.lane_reset_batch` the fill is only enqueued and recorded in `batch`, and
-    /// [`Self::memset_batch_sync`] waits for the whole run once. With no steady stream or with
-    /// the kill switch (`HIPFIRE_LANE_RESET_BATCH=0`) it is exactly the blocking
+    /// the fill is only enqueued and recorded in `batch`, and [`Self::memset_batch_sync`]
+    /// waits for the whole run once. With no steady stream it is exactly the blocking
     /// [`Self::memset_stream_ordered`]. The caller keeps `buf` alive until the batch is
     /// synced. A failed enqueue waits for the fills already in flight before returning, so
     /// no write outlives the error.
@@ -9380,9 +9378,6 @@ impl Gpu {
         value: i32,
         size: usize,
     ) -> HipResult<()> {
-        if !self.flags.lane_reset_batch {
-            return self.memset_stream_ordered(buf, value, size);
-        }
         self.bind_thread()?;
         match self.steady_copy_stream() {
             Some(stream) => {

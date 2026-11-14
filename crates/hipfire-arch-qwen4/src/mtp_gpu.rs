@@ -106,23 +106,14 @@ fn call_rows_for(capacity: usize, exact_gfx942: bool, ep_bound: bool) -> usize {
     }
 }
 
-/// `HIPFIRE_QWEN4_DRAFT_SHARDED_MOE` (developer; default on, exactly `0`
-/// disables and restores the X2 / replicated path byte for byte): with X2
-/// active, a batched draft pass (two to eight ops in the root's round, every
-/// op owned by a rank) keeps each rank's dense and attention work on its owned
-/// rows but runs the head's MoE once over ALL the round's rows on both ranks:
-/// each rank publishes its owner rows' MoE input, both all-gather it into the
-/// root's op order, and the existing replicated EP MoE call (compact tables,
+/// With X2 active, a batched draft pass (two to eight ops in the root's round,
+/// every op owned by a rank) keeps each rank's dense and attention work on its
+/// owned rows but runs the head's MoE once over ALL the round's rows on both
+/// ranks: each rank publishes its owner rows' MoE input, both all-gather it into
+/// the root's op order, and the existing replicated EP MoE call (compact tables,
 /// row-gather hook) runs over those rows; each rank keeps its own rows' FFN
-/// output. See [`S4Round`].
-pub(crate) const DRAFT_SHARDED_MOE_ENV: &str = "HIPFIRE_QWEN4_DRAFT_SHARDED_MOE";
-
-/// Whether the sharded draft MoE pass is on ([`DRAFT_SHARDED_MOE_ENV`], default
-/// on; exactly `0` disables).
-pub(crate) fn draft_sharded_moe_enabled() -> bool {
-    hipfire_config::developer_bool(DRAFT_SHARDED_MOE_ENV, true)
-}
-
+/// output.
+///
 /// One sharded-MoE draft pass (S4), the same on every rank: `g` global rows
 /// (the root's ops of the round, in order) of which row `s` is owned by rank
 /// `(owners >> s) & 1` (two ranks). A rank's own rows are its ops in that order.
@@ -2592,8 +2583,7 @@ pub struct Qwen4MtpGpu {
     /// Device table of the sharded-MoE activation all-gather's slot owners:
     /// 256 owner masks x 8 `i32` (slot `s` of mask `m` holds `(m >> s) & 1`),
     /// read as the gather's `slot_experts` (expert `e` is owned by rank
-    /// `e % 2`). `Some` only with [`DRAFT_SHARDED_MOE_ENV`] on, two ranks, at
-    /// [`Self::install_lane_local_moe`].
+    /// `e % 2`). `Some` only with two ranks, at [`Self::install_lane_local_moe`].
     pub(crate) s4_owners: Option<GpuTensor>,
     /// The grouped-route scratch of a stock-FP8 (qt=55) MoE head's one-row
     /// steps ([`MtpFp8MoeScratch`]); `None` for every other head.
@@ -3476,7 +3466,7 @@ impl Qwen4MtpGpu {
                 "the MTP head's lane-local MoE runtime must be untiered (its experts are the `mtp.` tensors)",
             ));
         }
-        if draft_sharded_moe_enabled() && placement.ranks == 2 && self.rows.is_some() {
+        if placement.ranks == 2 && self.rows.is_some() {
             let mut table = Vec::with_capacity(256 * 8 * std::mem::size_of::<i32>());
             for mask in 0u32..256 {
                 for slot in 0..8 {

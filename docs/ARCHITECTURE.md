@@ -165,7 +165,6 @@ default. The tile engages `Gpu::prefill_invariant_scope`, so every row-count
 routing predicate sees the canonical chunk while launches keep the real row
 count. `Gpu::qwen4_append_f16_moe_scope` keeps that tile's MoE on the F16 WMMA
 grouped arm, because the IU4 arm below 512 rows exceeds the KLD cap.
-`HIPFIRE_QWEN4_APPEND_WMMA=0` restores the F32 SIMT routes.
 
 ### Qwen4 expert-parallel mesh (Flash-Next, EP2 through EP8)
 
@@ -191,15 +190,14 @@ an experts-per-token override, a non-Single compute placement; lane
 steps never run under EP), and native MTP attaches under EP only on an explicit
 `--spec mtp` (`qwen4_ep_option_refusal`, `qwen4_native_mtp`).
 
-Three EP levers are **default-on under EP**, each with an exact-`0` kill switch
-(`gpu_forward.rs`):
+Three EP levers are **default-on under EP** (`gpu_forward.rs`):
 
-- `HIPFIRE_EP_BALANCED_OWNERS`: balanced per-call expert ownership on the
+- Balanced per-call expert ownership on the
   host-mapped trunk MoE layers. It ships for exact gfx1201 at 2..=4 ranks only;
   a gfx1100 rank logs `balanced ownership not admitted (needs gfx1201); static
   split`, a gfx1201 rank at 5..=8 ranks `... (needs at most 4 ranks); static
   split`, and both run the exact static split.
-- `HIPFIRE_EP_OWNER_ROUTED_PREFILL`: owner-routed chunk MoE, EP2 through EP8.
+- Owner-routed chunk MoE, EP2 through EP8.
   A prefill chunk of at least 512 rows computes only its owned expert tiles and
   pulls the other ranks' down rows over P2P, instead of computing every expert
   on every rank. It needs the Flash-Next profile and one of two routes: exact
@@ -208,7 +206,7 @@ Three EP levers are **default-on under EP**, each with an exact-`0` kill switch
   gate/up with the SwiGLU epilogue, BF16-out down; the per-layer verdict is
   the QT44/QT53 expert formats, and the grouping is the stable one so every
   rank shares the grouped layout).
-- `HIPFIRE_EP_EXPERT_STAGE`: Flash-Next long-prefill expert staging. It exists
+- Flash-Next long-prefill expert staging. It exists
   only when owner-routed prefill is admitted and only on gfx1201; a gfx1100
   rank logs `expert staging not admitted (needs gfx1201)` and builds nothing.
 

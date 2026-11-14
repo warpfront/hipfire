@@ -47,12 +47,11 @@
 //! - **Head ownership (X2 draft split).** A lane's head is replicated on every
 //!   EP head rank (`LanePlan::head_rank == None`: today's protocol) until the
 //!   root's `plan_window` sees two or more live head lanes in one window and
-//!   gives each an owner rank (`MeshRoot::set_draft_split`, kill switch
-//!   `HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0`). An owned lane's head work (draft
-//!   ops, catch-up, probe, head repair, tickets) belongs to its owner alone
-//!   ([`heads_lane`]); each draft op is answered by its owner (the sampler
-//!   owner for a replicated lane) and the root merges the answers in op
-//!   order. Ownership is one-way and ends with the lane.
+//!   gives each an owner rank (`MeshRoot::set_draft_split`). An owned lane's
+//!   head work (draft ops, catch-up, probe, head repair, tickets) belongs to
+//!   its owner alone ([`heads_lane`]); each draft op is answered by its owner
+//!   (the sampler owner for a replicated lane) and the root merges the answers
+//!   in op order. Ownership is one-way and ends with the lane.
 
 use crate::gpu_forward_lanes::{LaneAllRowsRule, StageName, LANE_MAX_ROWS};
 use crate::lane::LabRoutes;
@@ -4017,13 +4016,11 @@ impl MeshRoot {
 impl MeshRoot {
     /// Allow the X2 draft split: a window with two or more live head lanes
     /// then gives each an owner rank (see `plan_window`). The split exists
-    /// only on an EP mesh of two or more head ranks and only while the kill
-    /// switch (`HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0`) is not set; the caller sets
-    /// it only when every rank's head can run lane-local. Returns the
-    /// effective setting. Call before the first step.
+    /// only on an EP mesh of two or more head ranks; the caller sets it only
+    /// when every rank's head can run lane-local. Returns the effective
+    /// setting. Call before the first step.
     pub fn set_draft_split(&mut self, on: bool) -> bool {
         self.draft_split = on
-            && ep_draft_split_enabled()
             && self.world[0].kind == MeshKind::Ep
             && self.world.iter().filter(|w| w.head).count() >= 2;
         self.draft_split
@@ -4238,16 +4235,6 @@ impl RankSession {
 /// lane or non-spec lane allocates/uses none).
 fn lane_needs_head(l: &LanePlan) -> bool {
     l.head != HeadState::Free
-}
-
-/// `HIPFIRE_QWEN4_EP_DRAFT_SPLIT` (developer var; default on, exactly `0`
-/// kills it): whether an EP root may give a window's head lanes owner ranks
-/// ([`MeshRoot::set_draft_split`]). Off, every lane stays replicated and every
-/// rank and device path is today's.
-const EP_DRAFT_SPLIT_ENV: &str = "HIPFIRE_QWEN4_EP_DRAFT_SPLIT";
-
-pub(crate) fn ep_draft_split_enabled() -> bool {
-    hipfire_config::developer_var(EP_DRAFT_SPLIT_ENV).as_deref() != Ok("0")
 }
 
 /// Whether rank `own` runs the head work of lane `l`: it owns a head, the
@@ -8132,7 +8119,7 @@ mod tests {
     // ---- X2: the draft split ----------------------------------------------------
 
     /// An EP mesh with `lanes` spec lanes admitted and scripted; the root's draft-split flag
-    /// set directly (the env kill switch is read by `MeshRoot::set_draft_split`, not here).
+    /// set directly.
     fn split_mesh(lanes: u64, split: bool) -> Mesh {
         let mut m = Mesh::new(MeshKind::Ep, false);
         m.root.draft_split = split;

@@ -1464,7 +1464,7 @@ pub struct MoeFfnWeights {
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
     /// `memory.offload_exec=cpu` armed the host-side routed-expert splice on this
-    /// host-placed packed layer (`HIPFIRE_MOE_CPU_EXPERTS=0` is the kill-switch).
+    /// host-placed packed layer.
     /// Single-token decode and the narrow (`<= 4`-row) batched forwards that
     /// share its target arithmetic (the speculative verify and its accepted-
     /// prefix rollback replay) defer the routed FFN to

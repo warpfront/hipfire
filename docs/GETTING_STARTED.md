@@ -650,12 +650,12 @@ These behaviors shipped in 0.4.2 and are in every later release.
   embedded-q8 run), so treat the sidecar as a capacity lever for 128 GB-class
   hosts, not a free default.
 - **EP owner-routed prefill and expert staging.** With `topology.ep` 2..=8,
-  `HIPFIRE_EP_OWNER_ROUTED_PREFILL` defaults on when every admission condition
+  owner-routed prefill runs when every admission condition
   holds (exact gfx1201 on the symmetric IU4 route, exact gfx1100 on the F16
-  WMMA grouped route); `HIPFIRE_EP_EXPERT_STAGE` defaults on only on gfx1201.
-  The exact value `0` disables each. Single-card runs are unchanged. Setup and
-  gates: [multi-gpu.md](multi-gpu.md); variable semantics:
-  [env-vars.md](env-vars.md).
+  WMMA grouped route). Expert staging is on only on gfx1201.
+  Single-card runs are
+  unchanged. Setup and gates: [multi-gpu.md](multi-gpu.md); variable
+  semantics: [env-vars.md](env-vars.md).
 
 ## If something fails
 

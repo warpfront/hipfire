@@ -1665,7 +1665,7 @@ pub struct MoeDecodeOwnerMask<'a> {
 }
 
 /// Expert-parallel owner-routed chunk exchange of the grouped symmetric IU4
-/// prefill (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`).
+/// prefill.
 ///
 /// Every rank runs the same router, top-k and stable grouping, so the grouped
 /// row layout (`expert_tile_ids`, `sorted_slot_index`, `inverse_perm`) is
@@ -2144,7 +2144,7 @@ pub struct MoePrefillParams<'a> {
     /// read only when `ep_row_gather` is `Some`, `0` otherwise.
     pub ep_layer_idx: u16,
 
-    /// Owner-routed EP chunk exchange (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): when
+    /// Owner-routed EP chunk exchange: when
     /// `Some`, the lowering admits only the grouped symmetric IU4 prefill (the
     /// verified-symmetric QT44/QT53 route at >= 512 rows), inserts a
     /// `TileMask` stage after the scatter and a `TileExchange` stage between the

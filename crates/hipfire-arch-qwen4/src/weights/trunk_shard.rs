@@ -181,7 +181,7 @@ pub fn census_trunk_for(
 }
 
 /// The rank-local config the EP reserve census sizes the GDN state and the native MTP capture
-/// ring at (`HIPFIRE_EP_RESERVE_CENSUS`): the shard of rank 0 of a two-rank load with the shard
+/// ring at: the shard of rank 0 of a two-rank load with the shard
 /// on, `None` otherwise. Every rank of the shard shares the GDN / QSA head counts (balanced
 /// halves), so rank 0 stands for the busiest rank there; the shared-expert width, which does
 /// differ per rank, is [`max_shared_width`]. `None` also where the config cannot be cut (the

@@ -1724,7 +1724,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-ep-seq-parallel-recorded-guard",
         predicates: &[IsRecording, CaptureMode],
-        condition: "hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): the EP2 sequence-parallel prefill route (HIPFIRE_QWEN4_EP_SEQ_PARALLEL) is declined for the whole chunk when `gpu.replay.is_recording() || gpu.graphs.capture_mode`, which then runs the all-reduce route (ar_hc_write) exactly as before; likewise forward_lanes_scoped (gpu_forward_lanes.rs) admits the sub-512 sequence-parallel EP prefill wave (HIPFIRE_QWEN4_EP_SP_SUB512_WAVE) only with `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)`",
+        condition: "hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): the EP2 sequence-parallel prefill route is declined for the whole chunk when `gpu.replay.is_recording() || gpu.graphs.capture_mode`, which then runs the all-reduce route (ar_hc_write) exactly as before; likewise forward_lanes_scoped (gpu_forward_lanes.rs) admits the sub-512 sequence-parallel EP prefill wave only with `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)`",
         effect: KernelSelection,
         switches: "sp_hc_rs_d8_* reduce-scatter writes + sp_ag_rows_* all-gathers over own-row HC reads vs ar_hc_write_* all-reduce writes over all-row HC reads",
         kernels: &[],

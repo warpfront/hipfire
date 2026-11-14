@@ -3638,6 +3638,7 @@ const BOOTSTRAP_ENV: &[&str] = &[
 pub fn is_developer_key(key: &str) -> bool {
     key.strip_prefix(DEVELOPER_PREFIX)
         .is_some_and(valid_developer_suffix)
+        && retired_config_key(key).is_none()
 }
 
 /// `developer.*` keys with a typed boolean value: `true`, `false`, `1` or `0`
@@ -4070,6 +4071,190 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "the retained PM4 GCR trim opt-out was removed (HIPF-396)",
         replacement: "none; supported retained PM4 routes always trim redundant GCR operations",
+    },
+    RetiredConfigKey {
+        key: "developer.lane_reset_batch",
+        legacy_key: "lane_reset_batch",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the lane reset batching kill switch was removed (HIPF-396)",
+        replacement: "none; supported lane resets always batch their zero-fills on the steady copy stream",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_balanced_owners",
+        legacy_key: "ep_balanced_owners",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the balanced EP owner kill switch was removed (HIPF-396)",
+        replacement: "none; balanced EP owners are always used on gfx1201 at 2 to 4 ranks, other arches and larger N keep the static split",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_pinned_owners",
+        legacy_key: "ep_unit_pinned_owners",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the unit-pinned EP owner kill switch was removed (HIPF-396)",
+        replacement: "none; unit-pinned EP owners are always used where balanced ownership and a per-expert unit plan admit them",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_owner_routed_prefill",
+        legacy_key: "ep_owner_routed_prefill",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the owner-routed EP prefill kill switch was removed (HIPF-396)",
+        replacement: "none; owner-routed prefill is always used where its admission conditions hold",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_append_wmma",
+        legacy_key: "qwen4_append_wmma",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 append WMMA kill switch was removed (HIPF-396)",
+        replacement: "none; the WMMA append route runs on gfx1151 prefill tiles of HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS..511 rows",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_mtp_experts_resident",
+        legacy_key: "ep_mtp_experts_resident",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP MTP experts-resident kill switch was removed (HIPF-396)",
+        replacement: "none; an EP load of two or more ranks keeps the native MTP head's owned routed-expert slice VRAM-resident whenever the head is attached",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_mtp_lane_copy",
+        legacy_key: "ep_mtp_lane_copy",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP MTP lane-copy kill switch was removed (HIPF-396)",
+        replacement: "none; the copy lane follows the singleton policy, and speculation.mtp_ngram_copy = off still disables it",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_mtp_reserve_share",
+        legacy_key: "ep_mtp_reserve_share",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP MTP reserve-sharing kill switch was removed (HIPF-396)",
+        replacement: "none; native-MTP lanes always share the decoupled reserve on an EP load",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_draft_sharded_moe",
+        legacy_key: "qwen4_draft_sharded_moe",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 sharded draft MoE kill switch was removed (HIPF-396)",
+        replacement: "none; on a two-rank EP load, a batched draft pass of two to eight ops, each owned by one rank, runs the head MoE once over all the round's rows on both ranks",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ep_draft_split",
+        legacy_key: "qwen4_ep_draft_split",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP draft-split kill switch was removed (HIPF-396)",
+        replacement: "none; an EP root gives head lanes owner ranks whenever every rank's MTP head can run lane-local",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_tail_fill_overlap",
+        legacy_key: "ep_unit_tail_fill_overlap",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP unit-tail fill-overlap kill switch was removed (HIPF-396)",
+        replacement: "none; the tail's fill issue always overlaps the next forward",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_tail_peer",
+        legacy_key: "ep_unit_tail_peer",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP unit-tail peer-board kill switch was removed (HIPF-396)",
+        replacement: "none; the peer board is used whenever the D2 tail runs on a mesh of two or more ranks",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_tail_peer_reserve",
+        legacy_key: "ep_unit_tail_peer_reserve",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP unit-tail peer-reserve kill switch was removed (HIPF-396)",
+        replacement: "none; the peer quarantine reserve is always on",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_tail_pins",
+        legacy_key: "ep_unit_tail_pins",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP unit-tail pins kill switch was removed (HIPF-396)",
+        replacement: "none; the tail always keeps pinned owners where they are admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_tail_prefill",
+        legacy_key: "ep_unit_tail_prefill",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP unit-tail prefill kill switch was removed (HIPF-396)",
+        replacement: "none; the tail's full-table prefill always follows its publications",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_tail_log_direct",
+        legacy_key: "ep_tail_log_direct",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP tail direct-log kill switch was removed (HIPF-396)",
+        replacement: "none; the few-row MoE call always logs its slot under the tail",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_expert_stage",
+        legacy_key: "ep_expert_stage",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the EP expert-stage kill switch was removed (HIPF-396)",
+        replacement: "none; the EP expert stage is on wherever owner-routed prefill is admitted on gfx1201; HIPFIRE_QWEN4_EXPERT_STAGE=0 forces expert staging off",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_hc8_plan_charge",
+        legacy_key: "ep_hc8_plan_charge",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP hc8 plan-charge kill switch was removed (HIPF-396)",
+        replacement: "none; the plan always charges an applied hc8 sidecar at its E4M3 size",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_reserve_census",
+        legacy_key: "ep_reserve_census",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP reserve census kill switch was removed (HIPF-396)",
+        replacement: "none; the EP reserve census is always on for two or more EP ranks",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_compact_scratch",
+        legacy_key: "qwen4_compact_scratch",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 compact scratch kill switch was removed (HIPF-396)",
+        replacement: "none; the compact scratch plan is always used where its gate admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.moe_cpu_experts",
+        legacy_key: "moe_cpu_experts",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the MoE CPU experts kill switch was removed (HIPF-396)",
+        replacement: "set memory.offload_exec to pcie to turn host expert execution off",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_decode_share_shadows",
+        legacy_key: "qwen4_decode_share_shadows",
+        shipped_in: "0.4.4",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 decode-share shadows kill switch was removed (HIPF-396)",
+        replacement: "none; shadows always borrow the donor tail on admitted gfx1201 decode-share loads",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_capture_ring_compact",
+        legacy_key: "qwen4_capture_ring_compact",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 compact capture ring kill switch was removed (HIPF-396)",
+        replacement: "none; the capture ring always uses the compact rows + 1 slot layout",
     },
 ];
 
@@ -6208,6 +6393,10 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
         let Some(key) = developer_key_for_env(name) else {
             continue;
         };
+        // A removed env flag is ignored, not a load failure.
+        if retired_config_key(&key).is_some() {
+            continue;
+        }
         let Ok(raw) = raw.into_string() else {
             continue;
         };
@@ -7462,46 +7651,6 @@ mod tests {
         assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
         assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
         assert!(memory::ep_gather_direct());
-    }
-
-    #[test]
-    fn ep_mtp_experts_resident_is_on_unless_exactly_zero() {
-        use memory::parse_ep_mtp_experts_resident as parse;
-        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
-        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
-        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
-        // The process snapshot of a test binary carries no knob: the default is on.
-        assert!(memory::ep_mtp_experts_resident());
-        assert_eq!(
-            developer_key_for_env("HIPFIRE_EP_MTP_EXPERTS_RESIDENT").as_deref(),
-            Some("developer.ep_mtp_experts_resident")
-        );
-    }
-
-    #[test]
-    fn ep_hc8_plan_charge_is_on_unless_exactly_zero() {
-        use memory::parse_ep_hc8_plan_charge as parse;
-        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
-        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
-        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
-        assert!(memory::ep_hc8_plan_charge());
-        assert_eq!(
-            developer_key_for_env("HIPFIRE_EP_HC8_PLAN_CHARGE").as_deref(),
-            Some("developer.ep_hc8_plan_charge")
-        );
-    }
-
-    #[test]
-    fn ep_reserve_census_is_on_unless_exactly_zero() {
-        use memory::parse_ep_reserve_census as parse;
-        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
-        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
-        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
-        assert!(memory::ep_reserve_census());
-        assert_eq!(
-            developer_key_for_env("HIPFIRE_EP_RESERVE_CENSUS").as_deref(),
-            Some("developer.ep_reserve_census")
-        );
     }
 
     #[test]
@@ -11034,8 +11183,7 @@ pub mod memory {
     /// discovers `<base>.ep.expert-hotset` when the variable is unset, the drop-zero planar expert
     /// repack (F1, `HIPFIRE_QWEN4_EXPERT_DROP_ZERO`) follows it, and `hipfire pull` fetches the
     /// pinned sidecar. The decoupled unit reserve stays opt-in (`HIPFIRE_EP_UNIT_RESERVE=1`).
-    /// Kill switches: `HIPFIRE_QWEN4_EP_EXPERT_HOTSET=0`, `HIPFIRE_QWEN4_EXPERT_DROP_ZERO=0`,
-    /// `HIPFIRE_EP_UNIT_PINNED_OWNERS=0`.
+    /// Kill switches: `HIPFIRE_QWEN4_EP_EXPERT_HOTSET=0`, `HIPFIRE_QWEN4_EXPERT_DROP_ZERO=0`.
     pub const EP_EXPERT_HOTSET_DEFAULT_ON: bool = true;
 
     /// Optional override of the PLE hot-rank sidecar path
@@ -11525,52 +11673,6 @@ pub mod memory {
 
     /// Pure truth table behind [`ep_share_host`]: only a trimmed `0` is off.
     pub fn parse_ep_share_host(raw: Option<&str>) -> bool {
-        raw.map(str::trim) != Some("0")
-    }
-
-    /// Developer kill switch `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` for the expert-parallel
-    /// native-MTP head's routed experts: default on, each rank of an EP load (2 or more
-    /// ranks) with the head attached keeps ITS OWNED slice of them (experts `e % ranks ==
-    /// rank`, 256 of 512 on EP2) VRAM-resident, charged to the rank's expert budget before the
-    /// trunk unit ranking walk, instead of pinned host RAM read over PCIe on every decode
-    /// step. Exactly `0` restores the host-mapped head placement.
-    pub fn ep_mtp_experts_resident() -> bool {
-        parse_ep_mtp_experts_resident(process_value("HIPFIRE_EP_MTP_EXPERTS_RESIDENT").as_deref())
-    }
-
-    /// Pure truth table behind [`ep_mtp_experts_resident`]: only a trimmed `0` is off.
-    pub fn parse_ep_mtp_experts_resident(raw: Option<&str>) -> bool {
-        raw.map(str::trim) != Some("0")
-    }
-
-    /// Developer kill switch `HIPFIRE_EP_HC8_PLAN_CHARGE` for the expert-parallel plan's
-    /// charge of the `<model>.hc8` sidecar: default on, the plan and every rank's fit census
-    /// charge the replicated HC mixer tensors at their E4M3 size (the bytes the applied
-    /// sidecar leaves allocated) instead of the manifest's BF16 size. Exactly `0` restores the
-    /// BF16 charge.
-    pub fn ep_hc8_plan_charge() -> bool {
-        parse_ep_hc8_plan_charge(process_value("HIPFIRE_EP_HC8_PLAN_CHARGE").as_deref())
-    }
-
-    /// Pure truth table behind [`ep_hc8_plan_charge`]: only a trimmed `0` is off.
-    pub fn parse_ep_hc8_plan_charge(raw: Option<&str>) -> bool {
-        raw.map(str::trim) != Some("0")
-    }
-
-    /// Developer kill switch `HIPFIRE_EP_RESERVE_CENSUS` for the expert-parallel (2 or more
-    /// ranks) reserve census: default on, an EP load charges the measured HIP runtime
-    /// (`QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES` on an exact gfx1201 EP2 load) and so
-    /// retires the historical single-device floor, sizes the trunk-shard rank's GDN state,
-    /// MTP capture ring and shared-expert INT8 shadows at the rank-local width instead of the
-    /// global one, and returns the pre-shard shared-expert copies from the device pool to HIP
-    /// after the shard. Exactly `0` restores the earlier EP behaviour byte for byte (floor
-    /// kept, global census terms, no pool drain). Read once per load.
-    pub fn ep_reserve_census() -> bool {
-        parse_ep_reserve_census(process_value("HIPFIRE_EP_RESERVE_CENSUS").as_deref())
-    }
-
-    /// Pure truth table behind [`ep_reserve_census`]: only a trimmed `0` is off.
-    pub fn parse_ep_reserve_census(raw: Option<&str>) -> bool {
         raw.map(str::trim) != Some("0")
     }
 

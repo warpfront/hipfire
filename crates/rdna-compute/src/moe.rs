@@ -4793,7 +4793,7 @@ const EP_TILE_MASK_BLOCK: u32 = 256;
 const EP_TILE_PULL_TRIP_U4: usize = 1024;
 
 impl Gpu {
-    /// Owner-routed chunk MoE tile mask (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): write a COPY of
+    /// Owner-routed chunk MoE tile mask: write a COPY of
     /// the grouped-GEMM tile ids, `tile_ids_owned[t] = tile_ids[t]` when the tile's expert is
     /// owned by `rank` (`owner_table[tile_ids[t]] == rank`, an i32 per expert) and `-1`
     /// otherwise (the padding sentinel included). `tile_ids` is never written. One thread per

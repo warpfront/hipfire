@@ -1152,8 +1152,8 @@ Caveats that are part of the fixture, not trivia:
   since `c921903686` (`copy_lane_arch_admitted` in
   `crates/hipfire-config/src/lib.rs`). Flash-Next EP mesh lanes stage the same
   copy lane by default wherever `auto` arms it, in steps of at most
-  `HIPFIRE_QWEN4_LANE_COPY_LANES` (2) lanes (`047ed76122`; kill switch
-  `HIPFIRE_EP_MTP_LANE_COPY=0`). **Off is the 5/3/3 pool lane
+  `HIPFIRE_QWEN4_LANE_COPY_LANES` (2) lanes (`047ed76122`; `=0` turns it
+  off). **Off is the 5/3/3 pool lane
   exactly.** On Qwen4 a pool
   hit (`MtpNgramContext`, the 5/3/3 pool; request-local, cleared and reseeded
   from the full prompt every request, so earlier requests never influence
