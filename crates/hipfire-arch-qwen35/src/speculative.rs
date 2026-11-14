@@ -13929,6 +13929,9 @@ pub fn seed_target_hidden_suffix_abortable_parts(
                 );
             }
         }
+        // The suffix (cache-hit extension, forced advance, terminal repair) ends
+        // an ordinary-prefill phase too: seal before decode/verify (HIPF-409).
+        target.dn_state.seal_streams(gpu, pos)?;
         Ok(false)
     })();
     seed.free(gpu);
