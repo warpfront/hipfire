@@ -811,7 +811,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_KV_ADAPTIVE"),
-        "Runtime VRAM-fit KV precision policy."
+        "Runtime VRAM-fit KV precision policy. Requires an FWHT K mode (memory.kv_cache fwht*) to take effect; `advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>` sets explicit K/V floor tiers."
     ),
     field!(
         "memory.state_quant",
@@ -1186,7 +1186,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         None,
-        "Logical KV context capacity."
+        "Logical KV context capacity. Allocated at load, so a change takes effect on the next load."
     ),
     field!(
         "memory.kv_backend",
@@ -1234,7 +1234,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         None,
-        "Visible reasoning mode."
+        "Visible reasoning mode. Interacts with speculation.dflash: an active thinking budget (max_think_tokens > 0) makes DFlash fall back to plain decode, so turn thinking off to use spec-decode."
     ),
     field!(
         "reasoning.effort",
@@ -1246,7 +1246,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         None,
-        "Model-specific reasoning effort; auto preserves the carrier fallback."
+        "Model-specific reasoning effort; auto preserves the carrier fallback. The offered levels come from the model's chat template, so they differ per model (Qwen3.8 has low/medium/xhigh); a level the model lacks is projected up to its next real one, never down. A model with no native effort falls back to the reasoning.budget ladder."
     ),
     field!(
         "reasoning.budget",
@@ -1258,7 +1258,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         None,
-        "Named per-turn reasoning budget."
+        "Named per-turn reasoning budget. A cap, not a reasoning dial: it truncates <think>, it does not shape it. On a model with a native reasoning.effort (Qwen3.8, DeepSeek4) set the effort instead; a budget below what that effort spends force-closes <think> mid-thought. Only applies when thinking is on."
     ),
     field!(
         "reasoning.max_tokens",
@@ -1698,7 +1698,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_DFLASH_MODE"),
-        "DFlash eligibility policy."
+        "DFlash eligibility policy. DFlash needs its own paired draft and never falls back to the MTP head. A thinking budget routes a DFlash draft to plain decode: the dispatch gate bails when max_think_tokens > 0 and the think block is not closed (the default thinking-on path sets a budget), so turn thinking off, or set its budget to 0, and use greedy to get spec-decode."
     ),
     field!(
         "vision.mode",
@@ -1965,7 +1965,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_SPECULATION"),
-        "Canonical speculative-decoding selector."
+        "Canonical speculative-decoding selector. Forcing `dflash` needs a DFlash draft and never aliases to the MTP head; use `mtp` for the head. speculation.dflash and speculation.mtp still filter each mechanism under `auto`."
     ),
     field!(
         "speculation.dspark_confidence",
@@ -3714,18 +3714,6 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_QWEN4_NPU_TRUNK_CAL"),
         "NPU trunk calibration path; empty resolves to <hipfire home>/npu-trunk/calibration.json; absent file uses the keyed builtin; never read when effectively off."
     ),
-    field!(
-        "fusions.policy",
-        "fusion_policy",
-        Fusions,
-        ModelLoad,
-        DefaultValue::String("safe"),
-        ValueRule::Enum(&["safe", "off"]),
-        true,
-        false,
-        None,
-        "Certified fusion policy; individual kernel selection remains compiled."
-    ),
 ];
 
 pub fn fields() -> &'static [ConfigField] {
@@ -4088,6 +4076,14 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "CU masking on RDNA hung the R9700 MES (2026-10-14) and was refused; the knob (HIPFIRE_GFX1151_REDLINE_CU_COUNT) was removed",
         replacement: "none; the full CU set is always used",
+    },
+    RetiredConfigKey {
+        key: "fusions.policy",
+        legacy_key: "fusion_policy",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "nothing ever read it",
+        replacement: "none; per-kernel fusion selection is unchanged",
     },
 ];
 

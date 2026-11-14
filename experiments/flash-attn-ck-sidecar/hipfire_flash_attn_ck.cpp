@@ -42,10 +42,8 @@ constexpr bool kHasQ8D256 = false;
 #endif
 
 #if defined(HIPFIRE_CK_TARGET_GFX1100) || defined(HIPFIRE_CK_TARGET_GFX1201)
-constexpr bool kHasAsym3GivensD256 = true;
 constexpr bool kHasAsym3FwhtD256 = true;
 #else
-constexpr bool kHasAsym3GivensD256 = false;
 constexpr bool kHasAsym3FwhtD256 = false;
 #endif
 
@@ -164,33 +162,19 @@ bool is_q8_cell(const hipfire_flash_attn_ck_fwd_params* p)
 bool is_asym3_cell(const hipfire_flash_attn_ck_fwd_params* p)
 {
     return p->dtype == HIPFIRE_FLASH_ATTN_CK_F32 &&
-           (p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS ||
-            p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT) &&
+           p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT &&
            p->v_format == HIPFIRE_FLASH_ATTN_CK_Q8;
-}
-
-bool is_asym3_givens_cell(const hipfire_flash_attn_ck_fwd_params* p)
-{
-    return is_asym3_cell(p) && p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS &&
-           p->head_dim == 256;
 }
 
 bool is_asym3_fwht_cell(const hipfire_flash_attn_ck_fwd_params* p)
 {
-    return is_asym3_cell(p) && p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT &&
-           p->head_dim == 256;
-}
-
-bool is_asym3_execution_cell(const hipfire_flash_attn_ck_fwd_params* p)
-{
-    return is_asym3_givens_cell(p) || is_asym3_fwht_cell(p);
+    return is_asym3_cell(p) && p->head_dim == 256;
 }
 
 bool is_asym4_contract(const hipfire_flash_attn_ck_fwd_params* p)
 {
     return p->dtype == HIPFIRE_FLASH_ATTN_CK_F32 &&
-           (p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS ||
-            p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT) &&
+           p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT &&
            p->v_format == HIPFIRE_FLASH_ATTN_CK_Q8;
 }
 
@@ -247,43 +231,6 @@ __global__ void decode_q8_kv_d256(const uint8_t* packed_k,
     {
         dense_k[output + index] = __float2half_rn(k_scale * static_cast<float>(k_values[index]));
         dense_v[output + index] = __float2half_rn(v_scale * static_cast<float>(v_values[index]));
-    }
-}
-
-__device__ __forceinline__ void givens_rotate(float& a, float& b, float c, float s)
-{
-    const float a2 = a * c - b * s;
-    b = a * s + b * c;
-    a = a2;
-}
-
-__global__ void transform_q_givens_f32_to_f16(const float* input,
-                                               __half* output,
-                                               int rows,
-                                               int heads,
-                                               int head_dim,
-                                               const float* cos_theta,
-                                               const float* sin_theta)
-{
-    const int row = blockIdx.x;
-    const int head = blockIdx.y;
-    const int lane = threadIdx.x;
-    if(row >= rows || head >= heads || lane >= 32) return;
-    const int chunks = head_dim / 256;
-    for(int chunk = 0; chunk < chunks; ++chunk)
-    {
-        const int dim = chunk * 256 + lane * 8;
-        const int block = chunk * 128 + lane * 4;
-        const size_t base = (static_cast<size_t>(row) * heads + head) * head_dim + dim;
-        float values[8];
-#pragma unroll
-        for(int i = 0; i < 8; ++i) values[i] = input[base + i];
-#pragma unroll
-        for(int pair = 0; pair < 4; ++pair)
-            givens_rotate(values[pair * 2], values[pair * 2 + 1],
-                          cos_theta[block + pair], sin_theta[block + pair]);
-#pragma unroll
-        for(int i = 0; i < 8; ++i) output[base + i] = __float2half_rn(values[i]);
     }
 }
 
@@ -366,7 +313,7 @@ __global__ void decode_asym4_k(const uint8_t* packed,
     }
 }
 
-__global__ void decode_asym3_k_givens(const uint8_t* packed,
+__global__ void decode_asym3_k(const uint8_t* packed,
                                       __half* dense,
                                       int rows,
                                       int heads,
@@ -465,7 +412,6 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
         return 1;
     }
     if((q8 && !kHasQ8D256) ||
-       (p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS && !kHasAsym3GivensD256) ||
        (p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT && !kHasAsym3FwhtD256))
     {
         set_error(error, error_capacity, "selected quantized cell is not published by this artifact");
@@ -662,8 +608,7 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
                 set_error(error, error_capacity, "Asym3 packed strides have insufficient alignment");
                 return 1;
             }
-            const int64_t transform_elements =
-                p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS ? p->head_dim / 2 : 256;
+            const int64_t transform_elements = 256;
             if(p->k_transform0 == nullptr || p->k_transform1 == nullptr ||
                p->k_transform0_elements < transform_elements ||
                p->k_transform1_elements < transform_elements)
@@ -676,7 +621,7 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
                 set_error(error, error_capacity, "Asym3 transform base pointers must be 4-byte aligned");
                 return 1;
             }
-            if(!is_asym3_execution_cell(p))
+            if(!is_asym3_fwht_cell(p))
             {
                 set_error(error, error_capacity, "Asym3 packed layout is valid but has no CK execution cell");
                 return 2;
@@ -724,8 +669,7 @@ int validate(const hipfire_flash_attn_ck_fwd_params* p, char* error, size_t erro
                 set_error(error, error_capacity, "Asym4 packed strides have insufficient alignment");
                 return 1;
             }
-            const int64_t transform_elements =
-                p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS ? p->head_dim / 2 : 128;
+            const int64_t transform_elements = 128;
             if(p->k_transform0 == nullptr || p->k_transform1 == nullptr ||
                p->k_transform0_elements < transform_elements ||
                p->k_transform1_elements < transform_elements)
@@ -792,35 +736,7 @@ extern "C" size_t hipfire_flash_attn_ck_capabilities(
         HIPFIRE_FLASH_ATTN_CK_GFX1100,
 #endif
         HIPFIRE_FLASH_ATTN_CK_F32,
-        HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS,
-        HIPFIRE_FLASH_ATTN_CK_Q8,
-        256,
-        HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
-    },
-    {
-        HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
-        sizeof(hipfire_flash_attn_ck_capability),
-#if defined(HIPFIRE_CK_TARGET_GFX1201)
-        HIPFIRE_FLASH_ATTN_CK_GFX1201,
-#else
-        HIPFIRE_FLASH_ATTN_CK_GFX1100,
-#endif
-        HIPFIRE_FLASH_ATTN_CK_F32,
         HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT,
-        HIPFIRE_FLASH_ATTN_CK_Q8,
-        256,
-        HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
-    },
-    {
-        HIPFIRE_FLASH_ATTN_CK_ABI_VERSION,
-        sizeof(hipfire_flash_attn_ck_capability),
-#if defined(HIPFIRE_CK_TARGET_GFX1201)
-        HIPFIRE_FLASH_ATTN_CK_GFX1201,
-#else
-        HIPFIRE_FLASH_ATTN_CK_GFX1100,
-#endif
-        HIPFIRE_FLASH_ATTN_CK_F32,
-        HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS,
         HIPFIRE_FLASH_ATTN_CK_Q8,
         256,
         HIPFIRE_FLASH_ATTN_CK_CAP_CAUSAL | HIPFIRE_FLASH_ATTN_CK_CAP_GQA,
@@ -868,10 +784,9 @@ extern "C" size_t hipfire_flash_attn_ck_fwd_workspace_bytes(
 {
     if(params == nullptr) return 0;
     const bool q8 = kHasQ8D256 && is_q8_cell(params);
-    const bool asym3_givens = kHasAsym3GivensD256 && is_asym3_givens_cell(params);
     const bool asym3_fwht = kHasAsym3FwhtD256 && is_asym3_fwht_cell(params);
     const bool asym4 = is_asym4_execution_cell(params);
-    if(!(q8 || asym3_givens || asym3_fwht || asym4))
+    if(!(q8 || asym3_fwht || asym4))
         return 0;
     size_t out;
     if(!checked_staging_workspace_bytes(params, &out))
@@ -900,12 +815,8 @@ extern "C" int hipfire_flash_attn_ck_fwd(
     try
     {
         const bool q8 = is_q8_cell(p);
-        const bool asym3_givens = is_asym3_givens_cell(p);
         const bool asym3_fwht = is_asym3_fwht_cell(p);
-        const bool asym4_givens =
-            is_asym4_execution_cell(p) && p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS;
-        const bool asym4_fwht =
-            is_asym4_execution_cell(p) && p->k_format == HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT;
+        const bool asym4_fwht = is_asym4_execution_cell(p);
         const void* q_ptr = p->q;
         const void* k_ptr = p->k;
         const void* v_ptr = p->v;
@@ -942,7 +853,7 @@ extern "C" int hipfire_flash_attn_ck_fwd(
                 return 1;
             }
         }
-        if(q8 || asym3_givens || asym3_fwht || asym4_givens || asym4_fwht)
+        if(q8 || asym3_fwht || asym4_fwht)
         {
             size_t q_bytes, kv_bytes, aligned_q, aligned_kv;
             if(!checked_mul_size_t(q_count, sizeof(__half), &q_bytes) ||
@@ -972,23 +883,13 @@ extern "C" int hipfire_flash_attn_ck_fwd(
                     staged_k, staged_v, p->seqlen_k, p->nhead_k,
                     p->packed_k_row_stride_bytes, p->packed_v_row_stride_bytes);
             }
-            else if(asym3_givens || asym3_fwht)
+            else if(asym3_fwht)
             {
-                if(asym3_givens)
-                {
-                    transform_q_givens_f32_to_f16<<<dim3(p->seqlen_q, p->nhead_q), 32, 0, stream>>>(
-                        static_cast<const float*>(p->q), staged_q, p->seqlen_q, p->nhead_q,
-                        p->head_dim, static_cast<const float*>(p->k_transform0),
-                        static_cast<const float*>(p->k_transform1));
-                }
-                else
-                {
-                    transform_q_fwht_f32_to_f16<<<dim3(p->seqlen_q, p->nhead_q), 32, 0, stream>>>(
-                        static_cast<const float*>(p->q), staged_q, p->seqlen_q, p->nhead_q,
-                        p->head_dim, static_cast<const float*>(p->k_transform0),
-                        static_cast<const float*>(p->k_transform1));
-                }
-                decode_asym3_k_givens<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
+                transform_q_fwht_f32_to_f16<<<dim3(p->seqlen_q, p->nhead_q), 32, 0, stream>>>(
+                    static_cast<const float*>(p->q), staged_q, p->seqlen_q, p->nhead_q,
+                    p->head_dim, static_cast<const float*>(p->k_transform0),
+                    static_cast<const float*>(p->k_transform1));
+                decode_asym3_k<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
                     static_cast<const uint8_t*>(p->k), staged_k, p->seqlen_k, p->nhead_k,
                     p->packed_k_row_stride_bytes, p->packed_k_head_stride_bytes, p->head_dim);
                 decode_q8<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
@@ -997,20 +898,10 @@ extern "C" int hipfire_flash_attn_ck_fwd(
             }
             else
             {
-                if(asym4_givens)
-                {
-                    transform_q_givens_f32_to_f16<<<dim3(p->seqlen_q, p->nhead_q), 32, 0, stream>>>(
-                        static_cast<const float*>(p->q), staged_q, p->seqlen_q, p->nhead_q,
-                        p->head_dim, static_cast<const float*>(p->k_transform0),
-                        static_cast<const float*>(p->k_transform1));
-                }
-                else
-                {
-                    transform_q_fwht128x2_f32_to_f16<<<dim3(p->seqlen_q, p->nhead_q), 32, 0, stream>>>(
-                        static_cast<const float*>(p->q), staged_q, p->seqlen_q, p->nhead_q,
-                        p->head_dim, static_cast<const float*>(p->k_transform0),
-                        static_cast<const float*>(p->k_transform1));
-                }
+                transform_q_fwht128x2_f32_to_f16<<<dim3(p->seqlen_q, p->nhead_q), 32, 0, stream>>>(
+                    static_cast<const float*>(p->q), staged_q, p->seqlen_q, p->nhead_q,
+                    p->head_dim, static_cast<const float*>(p->k_transform0),
+                    static_cast<const float*>(p->k_transform1));
                 decode_asym4_k<<<dim3(p->seqlen_k, p->nhead_k), 32, 0, stream>>>(
                     static_cast<const uint8_t*>(p->k), staged_k, p->seqlen_k, p->nhead_k,
                     p->packed_k_row_stride_bytes, p->packed_k_head_stride_bytes, p->head_dim);
@@ -1100,7 +991,7 @@ extern "C" int hipfire_flash_attn_ck_fwd(
             set_error(error, error_capacity, "CK found no matching forward kernel");
             return 2;
         }
-        if(q8 || asym3_givens || asym3_fwht || asym4_givens || asym4_fwht)
+        if(q8 || asym3_fwht || asym4_fwht)
         {
             const int threads = 256;
             convert_f16_to_f32<<<(q_count + threads - 1) / threads, threads, 0, stream>>>(

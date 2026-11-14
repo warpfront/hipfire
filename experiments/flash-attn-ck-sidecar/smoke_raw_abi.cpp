@@ -20,23 +20,20 @@ namespace {
 
 #if defined(HIPFIRE_CK_TARGET_GFX1201)
 constexpr int32_t kExpectedArch = HIPFIRE_FLASH_ATTN_CK_GFX1201;
-constexpr size_t kExpectedCapabilities = 5;
+constexpr size_t kExpectedCapabilities = 3;
 constexpr bool kExpectedQ8D256 = false;
-constexpr bool kExpectedAsym3GivensD256 = true;
 constexpr bool kExpectedAsym3FwhtD256 = true;
 constexpr bool kExpectedAsym4D256 = true;
 #elif defined(HIPFIRE_CK_TARGET_GFX1151)
 constexpr int32_t kExpectedArch = HIPFIRE_FLASH_ATTN_CK_GFX1151;
 constexpr size_t kExpectedCapabilities = 1;
 constexpr bool kExpectedQ8D256 = false;
-constexpr bool kExpectedAsym3GivensD256 = false;
 constexpr bool kExpectedAsym3FwhtD256 = false;
 constexpr bool kExpectedAsym4D256 = false;
 #else
 constexpr int32_t kExpectedArch = HIPFIRE_FLASH_ATTN_CK_GFX1100;
-constexpr size_t kExpectedCapabilities = 6;
+constexpr size_t kExpectedCapabilities = 4;
 constexpr bool kExpectedQ8D256 = true;
-constexpr bool kExpectedAsym3GivensD256 = true;
 constexpr bool kExpectedAsym3FwhtD256 = true;
 constexpr bool kExpectedAsym4D256 = true;
 #endif
@@ -64,26 +61,17 @@ void verify_capabilities()
                                        HIPFIRE_FLASH_ATTN_CK_Q8,
                                        HIPFIRE_FLASH_ATTN_CK_Q8,
                                        256);
-    const bool has_asym3 = has_capability(HIPFIRE_FLASH_ATTN_CK_F32,
-                                          HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS,
-                                          HIPFIRE_FLASH_ATTN_CK_Q8,
-                                          256);
     const bool has_asym3_fwht = has_capability(HIPFIRE_FLASH_ATTN_CK_F32,
                                                HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT,
                                                HIPFIRE_FLASH_ATTN_CK_Q8,
                                                256);
-    const bool has_asym4_givens = has_capability(HIPFIRE_FLASH_ATTN_CK_F32,
-                                                 HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS,
-                                                 HIPFIRE_FLASH_ATTN_CK_Q8,
-                                                 256);
     const bool has_asym4_fwht = has_capability(HIPFIRE_FLASH_ATTN_CK_F32,
                                                HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT,
                                                HIPFIRE_FLASH_ATTN_CK_Q8,
                                                256);
     if(count != kExpectedCapabilities ||
-       has_q8 != kExpectedQ8D256 || has_asym3 != kExpectedAsym3GivensD256 ||
-       has_asym3_fwht != kExpectedAsym3FwhtD256 ||
-       has_asym4_givens != kExpectedAsym4D256 || has_asym4_fwht != kExpectedAsym4D256 ||
+       has_q8 != kExpectedQ8D256 || has_asym3_fwht != kExpectedAsym3FwhtD256 ||
+       has_asym4_fwht != kExpectedAsym4D256 ||
        !has_capability(HIPFIRE_FLASH_ATTN_CK_F16,
                        HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
                        HIPFIRE_FLASH_ATTN_CK_DENSE_F16,
@@ -91,18 +79,15 @@ void verify_capabilities()
     {
         std::fprintf(stderr,
                      "unexpected exact-architecture capability table: count=%zu expected=%zu "
-                     "q8=%d expected_q8=%d asym3=%d expected_asym3=%d "
+                     "q8=%d expected_q8=%d "
                      "asym3_fwht=%d expected_asym3_fwht=%d "
-                     "asym4_givens=%d asym4_fwht=%d expected_asym4=%d arch=%d\n",
+                     "asym4_fwht=%d expected_asym4=%d arch=%d\n",
                      count,
                      kExpectedCapabilities,
                      has_q8,
                      kExpectedQ8D256,
-                     has_asym3,
-                     kExpectedAsym3GivensD256,
                      has_asym3_fwht,
                      kExpectedAsym3FwhtD256,
-                     has_asym4_givens,
                      has_asym4_fwht,
                      kExpectedAsym4D256,
                      kExpectedArch);
@@ -490,8 +475,7 @@ void run_asym3_contract_case(int format, int hdim, bool artifact_has_cell)
     params.packed_k_row_stride_bytes = 2 * params.packed_k_head_stride_bytes;
     params.packed_v_row_stride_bytes = 2 * params.packed_v_head_stride_bytes;
     params.k_transform0 = params.k_transform1 = &dummy;
-    const int transform_elements =
-        format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS ? hdim / 2 : 256;
+    const int transform_elements = 256;
     params.k_transform0_elements = params.k_transform1_elements = transform_elements;
     params.workspace = &dummy;
     params.workspace_bytes = hipfire_flash_attn_ck_fwd_workspace_bytes(&params);
@@ -542,7 +526,7 @@ void run_asym3_contract_case(int format, int hdim, bool artifact_has_cell)
         std::exit(11);
     }
     std::printf("case=asym3-contract format=%s head_dim=%d status=%s\n",
-                format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS ? "givens" : "fwht", hdim,
+                "fwht", hdim,
                 has_cell ? "supported" : "recognized-no-cell");
 }
 
@@ -576,8 +560,7 @@ void run_asym4_contract_case(int format)
     params.packed_k_row_stride_bytes = 2 * params.packed_k_head_stride_bytes;
     params.packed_v_row_stride_bytes = 2 * params.packed_v_head_stride_bytes;
     params.k_transform0 = params.k_transform1 = &dummy;
-    const int transform_elements =
-        format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS ? hdim / 2 : 128;
+    const int transform_elements = 128;
     params.k_transform0_elements = params.k_transform1_elements = transform_elements;
 
     char error[1024]{};
@@ -616,7 +599,7 @@ void run_asym4_contract_case(int format)
         std::exit(18);
     }
     std::printf("case=asym4-contract format=%s head_dim=256 status=supported\n",
-                format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS ? "givens" : "fwht");
+                "fwht");
 }
 
 void run_asym3_case(int format, int hdim)
@@ -636,9 +619,8 @@ void run_asym3_case(int format, int hdim)
     const size_t kv_count = static_cast<size_t>(seqlen_k) * nhead_k * hdim;
     std::vector<float> q(q_count), transformed_q(q_count), v(kv_count), decoded_k(kv_count),
         decoded_v(kv_count), expected(q_count, 0.0f), output(q_count);
-    const bool givens = format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS;
-    std::vector<float> transform0(givens ? hdim / 2 : hdim);
-    std::vector<float> transform1(givens ? hdim / 2 : hdim);
+    std::vector<float> transform0(hdim);
+    std::vector<float> transform1(hdim);
     std::vector<uint8_t> packed_k(static_cast<size_t>(seqlen_k) * nhead_k * k_head_bytes);
     std::vector<uint8_t> packed_v(static_cast<size_t>(seqlen_k) * nhead_k * v_head_bytes);
     std::mt19937 rng(29 + hdim);
@@ -646,30 +628,6 @@ void run_asym3_case(int format, int hdim)
     for(float& value : q) value = distribution(rng);
     for(float& value : v) value = distribution(rng);
     transformed_q = q;
-    for(int pair = 0; pair < hdim / 2; ++pair)
-    {
-        const float angle = 0.001f * static_cast<float>((pair * 17 + 3) % 97);
-        if(givens)
-        {
-            transform0[pair] = std::cos(angle);
-            transform1[pair] = std::sin(angle);
-        }
-    }
-    if(givens)
-    {
-        for(int row = 0; row < seqlen_q; ++row)
-            for(int head = 0; head < nhead_q; ++head)
-                for(int pair = 0; pair < hdim / 2; ++pair)
-                {
-                    const size_t base =
-                        (static_cast<size_t>(row) * nhead_q + head) * hdim + pair * 2;
-                    const float a = transformed_q[base];
-                    const float b = transformed_q[base + 1];
-                    transformed_q[base] = a * transform0[pair] - b * transform1[pair];
-                    transformed_q[base + 1] = a * transform1[pair] + b * transform0[pair];
-                }
-    }
-    else
     {
         for(int dim = 0; dim < hdim; ++dim)
         {
@@ -779,7 +737,7 @@ void run_asym3_case(int format, int hdim)
     params.packed_k_row_stride_bytes = nhead_k * k_head_bytes;
     params.packed_v_row_stride_bytes = nhead_k * v_head_bytes;
     params.k_transform0 = dcos; params.k_transform1 = dsin;
-    params.k_transform0_elements = params.k_transform1_elements = givens ? hdim / 2 : hdim;
+    params.k_transform0_elements = params.k_transform1_elements = hdim;
     params.workspace_bytes = hipfire_flash_attn_ck_fwd_workspace_bytes(&params);
     check_hip(hipMalloc(&workspace, params.workspace_bytes), "hipMalloc(asym workspace)");
     params.workspace = workspace;
@@ -791,7 +749,7 @@ void run_asym3_case(int format, int hdim)
     for(size_t i = 0; i < q_count; ++i) { const float d = std::abs(output[i] - expected[i]); max_abs = std::max(max_abs, d); mean_abs += d; }
     mean_abs /= q_count;
     std::printf("case=asym3-%s-d%d-gqa-causal max_abs=%.7g mean_abs=%.7g workspace=%zu\n",
-                givens ? "givens" : "fwht", hdim, max_abs, mean_abs, params.workspace_bytes);
+                "fwht", hdim, max_abs, mean_abs, params.workspace_bytes);
     if(max_abs > 0.002f) std::exit(13);
     for(void* pointer : {dq, dk, dv, dout, dcos, dsin, workspace}) check_hip(hipFree(pointer), "hipFree(asym)");
 }
@@ -811,13 +769,12 @@ void run_asym4_case(int format)
     constexpr int nhead_k = 2;
     constexpr int k_head_bytes = 4 + hdim / 2;
     constexpr int v_head_bytes = (hdim / 32) * 34;
-    const bool givens = format == HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS;
     const float scale = 1.0f / std::sqrt(static_cast<float>(hdim));
     const size_t q_count = static_cast<size_t>(seqlen_q) * nhead_q * hdim;
     const size_t kv_count = static_cast<size_t>(seqlen_k) * nhead_k * hdim;
     std::vector<float> q(q_count), transformed_q(q_count), v(kv_count), decoded_k(kv_count),
         decoded_v(kv_count), expected(q_count, 0.0f), output(q_count);
-    std::vector<float> transform0(givens ? hdim / 2 : 128);
+    std::vector<float> transform0(128);
     std::vector<float> transform1(transform0.size());
     std::vector<uint8_t> packed_k(static_cast<size_t>(seqlen_k) * nhead_k * k_head_bytes);
     std::vector<uint8_t> packed_v(static_cast<size_t>(seqlen_k) * nhead_k * v_head_bytes);
@@ -826,27 +783,6 @@ void run_asym4_case(int format)
     for(float& value : q) value = distribution(rng);
     for(float& value : v) value = distribution(rng);
     transformed_q = q;
-    if(givens)
-    {
-        for(int pair = 0; pair < hdim / 2; ++pair)
-        {
-            const float angle = 0.001f * static_cast<float>((pair * 19 + 11) % 101);
-            transform0[pair] = std::cos(angle);
-            transform1[pair] = std::sin(angle);
-        }
-        for(int row = 0; row < seqlen_q; ++row)
-            for(int head = 0; head < nhead_q; ++head)
-                for(int pair = 0; pair < hdim / 2; ++pair)
-                {
-                    const size_t base =
-                        (static_cast<size_t>(row) * nhead_q + head) * hdim + pair * 2;
-                    const float a = transformed_q[base];
-                    const float b = transformed_q[base + 1];
-                    transformed_q[base] = a * transform0[pair] - b * transform1[pair];
-                    transformed_q[base + 1] = a * transform1[pair] + b * transform0[pair];
-                }
-    }
-    else
     {
         for(int dim = 0; dim < 128; ++dim)
         {
@@ -973,7 +909,7 @@ void run_asym4_case(int format)
     }
     mean_abs /= q_count;
     std::printf("case=asym4-%s-d256-gqa-causal max_abs=%.7g mean_abs=%.7g workspace=%zu\n",
-                givens ? "givens" : "fwht", max_abs, mean_abs, params.workspace_bytes);
+                "fwht", max_abs, mean_abs, params.workspace_bytes);
     if(max_abs > 0.002f) std::exit(19);
     for(void* pointer : {dq, dk, dv, dout, dt0, dt1, workspace})
         check_hip(hipFree(pointer), "hipFree(asym4)");
@@ -1009,7 +945,7 @@ void run_asym4_padded_stride_beyond_i32_case()
     params.v = dummy_v_align;
     params.out = dummy_out;
     params.dtype = HIPFIRE_FLASH_ATTN_CK_F32;
-    params.k_format = HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS;
+    params.k_format = HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT;
     params.v_format = HIPFIRE_FLASH_ATTN_CK_Q8;
     params.batch = 1;
     params.seqlen_q = 16;
@@ -1070,10 +1006,10 @@ void run_asym4_padded_stride_beyond_i32_case()
 void run_workspace_overflow_case()
 {
     // Use Asym4 if available, else Q8, else Asym3. Pick first available.
-    int format = HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS;
+    int format = HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT;
     if(!kExpectedAsym4D256)
     {
-        if(kExpectedAsym3GivensD256) format = HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS;
+        if(kExpectedAsym3FwhtD256) format = HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT;
         else if(kExpectedQ8D256) format = HIPFIRE_FLASH_ATTN_CK_Q8;
         else
         {
@@ -1119,7 +1055,7 @@ void run_workspace_overflow_case()
         params.packed_k_row_stride_bytes = static_cast<int64_t>(params.nhead_k) * 272;
         params.packed_v_row_stride_bytes = params.packed_k_row_stride_bytes;
     }
-    else if(format == HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS || format == HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT)
+    else if(format == HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT)
     {
         int k_head = 4 + (256*3)/8; //100
         int v_head = 272;
@@ -1180,7 +1116,7 @@ void run_dimension_overflow_case()
     params.struct_size = sizeof(params);
     params.q = qbuf; params.k = base; params.v = base; params.out = qbuf;
     params.dtype = HIPFIRE_FLASH_ATTN_CK_F32;
-    params.k_format = HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS;
+    params.k_format = HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT;
     params.v_format = HIPFIRE_FLASH_ATTN_CK_Q8;
     params.batch = 1;
     params.seqlen_q = 16;
@@ -1247,7 +1183,7 @@ void run_alignment_validation_case()
         p.struct_size = sizeof(p);
         p.q = qbuf; p.k = k_ptr; p.v = v_ptr; p.out = qbuf;
         p.dtype = HIPFIRE_FLASH_ATTN_CK_F32;
-        p.k_format = HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS;
+        p.k_format = HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT;
         p.v_format = HIPFIRE_FLASH_ATTN_CK_Q8;
         p.batch = 1; p.seqlen_q = 16; p.seqlen_k = 32;
         p.nhead_q = 4; p.nhead_k = 2; p.head_dim = hdim;
@@ -1350,26 +1286,16 @@ int main()
         run_q8_d256_case();
     }
     run_asym3_contract_case(
-        HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 256, kExpectedAsym3GivensD256);
-    run_asym3_contract_case(
-        HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 512, kExpectedAsym3GivensD256);
-    run_asym3_contract_case(
         HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 256, kExpectedAsym3FwhtD256);
     run_asym3_contract_case(
         HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 512, kExpectedAsym3FwhtD256);
-    if(kExpectedAsym3GivensD256)
-    {
-        run_asym3_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS, 256);
-    }
     if(kExpectedAsym3FwhtD256)
     {
         run_asym3_case(HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT, 256);
     }
     if(kExpectedAsym4D256)
     {
-        run_asym4_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS);
         run_asym4_contract_case(HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT);
-        run_asym4_case(HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS);
         run_asym4_case(HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT);
     }
     run_asym4_padded_stride_beyond_i32_case();

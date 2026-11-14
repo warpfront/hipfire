@@ -111,11 +111,6 @@ path = "examples/test_dflash_draft_collapse_gfx1100.rs"
 required-features = ["deltanet"]
 
 [[example]]
-name = "dflash_draft_graph_replay"
-path = "examples/dflash_draft_graph_replay.rs"
-required-features = ["deltanet"]
-
-[[example]]
 name = "test_dflash_hidden_scatter_gfx1100"
 path = "examples/test_dflash_hidden_scatter_gfx1100.rs"
 required-features = ["deltanet"]

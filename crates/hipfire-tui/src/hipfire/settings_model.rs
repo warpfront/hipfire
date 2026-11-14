@@ -706,14 +706,9 @@ fn lock_text(origin: &Origin) -> Option<String> {
     }
 }
 
-/// Plain title when the knob tables have one, else the canonical key.
+/// Plain title when the knob table has one, else the canonical key.
 pub(crate) fn row_title(key: &str) -> String {
-    if let Some(knob) = knobs::curated_knob(key) {
-        return knob.title.to_owned();
-    }
-    field(key)
-        .and_then(|schema| knobs::knob_info(schema.legacy_key))
-        .map_or_else(|| key.to_owned(), |info| info.title.to_owned())
+    knobs::knob(key).map_or_else(|| key.to_owned(), |knob| knob.title.to_owned())
 }
 
 /// A value in plain words. The offload and context labels are the easy view's

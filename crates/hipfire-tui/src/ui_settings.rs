@@ -23,7 +23,7 @@ use ratatui::{
 use crate::{
     app::{App, EditState, PendingEnum},
     hipfire::{
-        knobs::{self, Tradeoff, PREDICTION_NOTE},
+        knobs::{self, KnobKind, Tradeoff, PREDICTION_NOTE},
         settings_model::{value_string, RowId, SettingsRow, VirtualRow, MODEL_SCOPE_LOCK},
         writer::{self, FieldKind, SYM_IU4_KEY},
     },
@@ -927,7 +927,7 @@ fn evidence_row(
     row: &SettingsRow,
 ) -> Option<(&'static hipfire_config::evidence::EvidenceRow, &'static str)> {
     let knob = knobs::curated_knob(row.id.knob_id())?;
-    let Tradeoff::Evidence { line, side, .. } = knob.tradeoff else {
+    let KnobKind::Curated(Tradeoff::Evidence { line, side, .. }) = knob.kind else {
         return None;
     };
     let gpu = app.arch.gpu_arch.as_deref().unwrap_or("");
@@ -977,10 +977,11 @@ fn options_section(app: &App, row: &SettingsRow, width: usize) -> Vec<Line<'stat
             lines.push(heading("Options on this GPU"));
             let current = value_string(&row.resolved);
             const MAX: usize = 12;
-            let info = legacy_info(row);
+            let help = knobs::knob(key).map_or(&[][..], |knob| knob.option_help);
             for (value, label) in options.iter().take(MAX) {
-                let note = info
-                    .and_then(|info| info.options.iter().find(|(option, _)| option == value))
+                let note = help
+                    .iter()
+                    .find(|(option, _)| option == value)
                     .map_or("", |(_, desc)| *desc);
                 lines.extend(option_lines(*value == current, label, note, width));
             }
@@ -993,10 +994,13 @@ fn options_section(app: &App, row: &SettingsRow, width: usize) -> Vec<Line<'stat
     lines
 }
 
-/// The legacy explainer entry behind a key row (`knobs::KNOBS`), if any.
-fn legacy_info(row: &SettingsRow) -> Option<&'static knobs::KnobInfo> {
-    let schema = hipfire_config::field(row.id.key()?)?;
-    knobs::knob_info(schema.legacy_key)
+/// The "When" and "Note" help of an Advanced key row
+/// ([`KnobKind::Advanced`]), if it has any.
+fn advanced_help(row: &SettingsRow) -> Option<(&'static str, Option<&'static str>)> {
+    match knobs::knob(row.id.key()?)?.kind {
+        KnobKind::Advanced { when, note } => Some((when, note)),
+        KnobKind::Curated(_) => None,
+    }
 }
 
 fn bool_option_label(key: &str, value: &str) -> String {
@@ -1053,7 +1057,7 @@ fn measured_section(app: &App, row: &SettingsRow, width: usize) -> Vec<Line<'sta
     let Some(knob) = knobs::curated_knob(row.id.knob_id()) else {
         return Vec::new();
     };
-    let Tradeoff::Evidence { .. } = knob.tradeoff else {
+    let KnobKind::Curated(Tradeoff::Evidence { .. }) = knob.kind else {
         return Vec::new();
     };
     let gpu = app.arch.gpu_arch.as_deref().unwrap_or("this GPU");
@@ -1153,12 +1157,13 @@ fn why_lines(app: &App, row: &SettingsRow, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
         lines.extend(options);
     }
-    if let Some(info) = legacy_info(row).filter(|_| !curated) {
+    let advanced = advanced_help(row);
+    if let Some((when, note)) = advanced {
         lines.push(Line::from(""));
-        for text in wrap(&format!("When: {}", info.when), width) {
+        for text in wrap(&format!("When: {when}"), width) {
             lines.push(muted(text));
         }
-        if let Some(note) = info.note {
+        if let Some(note) = note {
             for text in wrap(&format!("Note: {note}"), width) {
                 lines.push(muted(text));
             }
@@ -1195,12 +1200,13 @@ fn why_lines(app: &App, row: &SettingsRow, width: usize) -> Vec<Line<'static>> {
         },
         width,
     ));
-    if let Some(info) = legacy_info(row).filter(|_| !curated) {
-        let default = if info.default.is_empty() {
-            "(unset)"
-        } else {
-            info.default
-        };
+    if advanced.is_some() {
+        let default = row
+            .id
+            .key()
+            .and_then(crate::hipfire::config::schema_default_text)
+            .filter(|text| !text.is_empty())
+            .unwrap_or("(unset)");
         lines.extend(detail("Default", default, width));
     }
     lines.push(Line::from(""));

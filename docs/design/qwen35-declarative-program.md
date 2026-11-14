@@ -248,8 +248,8 @@ across requests). Their handlers delegate to the hybrid stages.
 - The MTP NextN prologue (embedding, `enorm`/`hnorm`, concat, `eh_proj`) and
   the batched MTP forward (`mtp_head_forward_block_batched`, with beta's fill
   changes `2053debf5`..`289dfb64f`: pitched D2D concat, KV-only fill, shared
-  K/V rotation, the exact PM GEMM). Its callers are the prompt fill
-  (`kv_only=true`) and `mtp_compose.rs` (`kv_only=false`).
+  K/V rotation, the exact PM GEMM). Its callers include the prompt fill
+  (`kv_only=true`).
 - The PP decode loop (`ep_batch::forward_scratch_layers_multi`, multi-GPU pp
   migration #58). Dense TP decode mixer and FFN partials run through the
   dispatch `MixerOutput::Write` and `GatedMlp` `Write` arms.

@@ -41,12 +41,15 @@ pub enum FlashAttnCkKvFormat {
     DenseF16 = 1,
     DenseBf16 = 2,
     Q8 = 3,
-    Asym3Givens = 4,
     Asym3Fwht = 5,
-    Lloyd = 6,
-    Asym4Givens = 7,
     Asym4Fwht = 8,
 }
+
+/// Format ids 4 (Asym3-Givens), 6 (Lloyd) and 7 (Asym4-Givens) are retired.
+/// hipfire never requests them, but ABI v4 sidecars built before the removal
+/// still advertise those cells, so a capability cell carrying one stays
+/// well-formed instead of failing the whole load.
+const FLASH_ATTN_CK_RETIRED_KV_FORMATS: [i32; 3] = [4, 6, 7];
 
 pub const FLASH_ATTN_CK_CAP_CAUSAL: u32 = 1 << 0;
 pub const FLASH_ATTN_CK_CAP_GQA: u32 = 1 << 1;
@@ -145,22 +148,6 @@ fn select_q8_d256_prefill_capabilities(
     select_packed_prefill_capabilities(capabilities, input)
 }
 
-fn select_asym3_givens_prefill_capabilities(
-    capabilities: &[FlashAttnCkCapability],
-    input: FlashAttnCkPrefillInput,
-) -> Result<FlashAttnCkRequest, FlashAttnCkRejectReason> {
-    let request = input.request;
-    if request.k_format != FlashAttnCkKvFormat::Asym3Givens
-        || request.v_format != FlashAttnCkKvFormat::Q8
-    {
-        return Err(FlashAttnCkRejectReason::UnsupportedFormat);
-    }
-    if request.head_dim != 256 {
-        return Err(FlashAttnCkRejectReason::UnsupportedHeadDim);
-    }
-    select_packed_prefill_capabilities(capabilities, input)
-}
-
 fn select_asym3_fwht_prefill_capabilities(
     capabilities: &[FlashAttnCkCapability],
     input: FlashAttnCkPrefillInput,
@@ -182,10 +169,8 @@ fn select_asym4_prefill_capabilities(
     input: FlashAttnCkPrefillInput,
 ) -> Result<FlashAttnCkRequest, FlashAttnCkRejectReason> {
     let request = input.request;
-    if !matches!(
-        request.k_format,
-        FlashAttnCkKvFormat::Asym4Givens | FlashAttnCkKvFormat::Asym4Fwht
-    ) || request.v_format != FlashAttnCkKvFormat::Q8
+    if !matches!(request.k_format, FlashAttnCkKvFormat::Asym4Fwht)
+        || request.v_format != FlashAttnCkKvFormat::Q8
     {
         return Err(FlashAttnCkRejectReason::UnsupportedFormat);
     }
@@ -275,11 +260,9 @@ fn is_known_kv_format(value: i32) -> bool {
     value == FlashAttnCkKvFormat::DenseF16 as i32
         || value == FlashAttnCkKvFormat::DenseBf16 as i32
         || value == FlashAttnCkKvFormat::Q8 as i32
-        || value == FlashAttnCkKvFormat::Asym3Givens as i32
         || value == FlashAttnCkKvFormat::Asym3Fwht as i32
-        || value == FlashAttnCkKvFormat::Lloyd as i32
-        || value == FlashAttnCkKvFormat::Asym4Givens as i32
         || value == FlashAttnCkKvFormat::Asym4Fwht as i32
+        || FLASH_ATTN_CK_RETIRED_KV_FORMATS.contains(&value)
 }
 
 fn is_supported_abi(version: u32) -> bool {
@@ -895,10 +878,7 @@ impl crate::Gpu {
         }) else {
             return Ok(false);
         };
-        let asym4 = matches!(
-            k_format,
-            FlashAttnCkKvFormat::Asym4Givens | FlashAttnCkKvFormat::Asym4Fwht
-        );
+        let asym4 = k_format == FlashAttnCkKvFormat::Asym4Fwht;
         if q.dtype != crate::DType::F32 || output.dtype != crate::DType::F32 {
             self.report_flash_attn_ck_route(if asym4 {
                 "asym4_dtype_miss"
@@ -938,20 +918,14 @@ impl crate::Gpu {
             block_cols,
         };
         let selection = match k_format {
-            FlashAttnCkKvFormat::Asym3Givens => select_asym3_givens_prefill_capabilities(
-                self.flash_attn_ck.as_ref().unwrap().capabilities(),
-                input,
-            ),
             FlashAttnCkKvFormat::Asym3Fwht => select_asym3_fwht_prefill_capabilities(
                 self.flash_attn_ck.as_ref().unwrap().capabilities(),
                 input,
             ),
-            FlashAttnCkKvFormat::Asym4Givens | FlashAttnCkKvFormat::Asym4Fwht => {
-                select_asym4_prefill_capabilities(
-                    self.flash_attn_ck.as_ref().unwrap().capabilities(),
-                    input,
-                )
-            }
+            FlashAttnCkKvFormat::Asym4Fwht => select_asym4_prefill_capabilities(
+                self.flash_attn_ck.as_ref().unwrap().capabilities(),
+                input,
+            ),
             _ => Err(FlashAttnCkRejectReason::UnsupportedFormat),
         };
         if let Err(reason) = selection {
@@ -960,10 +934,8 @@ impl crate::Gpu {
         }
 
         let packed_k_head_bytes = match k_format {
-            FlashAttnCkKvFormat::Asym3Givens | FlashAttnCkKvFormat::Asym3Fwht => {
-                4 + head_dim * 3 / 8
-            }
-            FlashAttnCkKvFormat::Asym4Givens | FlashAttnCkKvFormat::Asym4Fwht => 4 + head_dim / 2,
+            FlashAttnCkKvFormat::Asym3Fwht => 4 + head_dim * 3 / 8,
+            FlashAttnCkKvFormat::Asym4Fwht => 4 + head_dim / 2,
             _ => return Ok(false),
         };
         let packed_v_head_bytes = head_dim / 32 * 34;
@@ -977,9 +949,8 @@ impl crate::Gpu {
             .checked_mul(nhead_k)
             .and_then(|value| value.checked_mul(packed_v_head_bytes));
         let transform_elements = match k_format {
-            FlashAttnCkKvFormat::Asym3Givens => head_dim / 2,
             FlashAttnCkKvFormat::Asym3Fwht => head_dim,
-            FlashAttnCkKvFormat::Asym4Givens | FlashAttnCkKvFormat::Asym4Fwht => 128,
+            FlashAttnCkKvFormat::Asym4Fwht => 128,
             _ => return Ok(false),
         };
         if q_elements.is_none_or(|required| q.numel() < required || output.numel() < required)
@@ -1077,9 +1048,7 @@ impl crate::Gpu {
             return Ok(false);
         }
         self.report_flash_attn_ck_route(match k_format {
-            FlashAttnCkKvFormat::Asym3Givens => "selected_asym3_givens_d256",
             FlashAttnCkKvFormat::Asym3Fwht => "selected_asym3_fwht_d256",
-            FlashAttnCkKvFormat::Asym4Givens => "selected_asym4_givens_d256",
             FlashAttnCkKvFormat::Asym4Fwht => "selected_asym4_fwht_d256",
             _ => unreachable!("selector admitted an unsupported transformed format"),
         });
@@ -1182,7 +1151,7 @@ mod tests {
         let mut cell = q8_d256_capability();
         cell.abi_version = 3;
         assert!(capability_is_compatible(3, &cell));
-        cell.k_format = FlashAttnCkKvFormat::Asym3Givens as i32;
+        cell.k_format = FlashAttnCkKvFormat::Asym3Fwht as i32;
         assert!(!capability_is_compatible(3, &cell));
     }
 
@@ -1206,20 +1175,6 @@ mod tests {
             v_format: FlashAttnCkKvFormat::Q8 as i32,
             head_dim: 256,
             ..dense_capability(FlashAttnCkArch::Gfx1100)
-        }
-    }
-
-    fn asym3_givens_d256_capability() -> FlashAttnCkCapability {
-        FlashAttnCkCapability {
-            k_format: FlashAttnCkKvFormat::Asym3Givens as i32,
-            ..q8_d256_capability()
-        }
-    }
-
-    fn asym3_givens_d256_capability_gfx1201() -> FlashAttnCkCapability {
-        FlashAttnCkCapability {
-            arch: FlashAttnCkArch::Gfx1201 as i32,
-            ..asym3_givens_d256_capability()
         }
     }
 
@@ -1271,18 +1226,18 @@ mod tests {
     }
 
     #[test]
-    fn asym3_givens_prefill_selector_is_exact_and_fail_closed() {
+    fn packed_prefill_selector_gates_are_exact_and_fail_closed() {
         let q8 = eligible_q8_prefill();
         let input = FlashAttnCkPrefillInput {
             request: FlashAttnCkRequest {
-                k_format: FlashAttnCkKvFormat::Asym3Givens,
+                k_format: FlashAttnCkKvFormat::Asym3Fwht,
                 ..q8.request
             },
             ..q8
         };
-        let cell = asym3_givens_d256_capability();
+        let cell = asym3_fwht_d256_capability();
         assert_eq!(
-            select_asym3_givens_prefill_capabilities(&[cell], input),
+            select_asym3_fwht_prefill_capabilities(&[cell], input),
             Ok(input.request)
         );
         let minimum_bulk_query = FlashAttnCkPrefillInput {
@@ -1290,7 +1245,7 @@ mod tests {
             ..input
         };
         assert_eq!(
-            select_asym3_givens_prefill_capabilities(&[cell], minimum_bulk_query),
+            select_asym3_fwht_prefill_capabilities(&[cell], minimum_bulk_query),
             Ok(input.request)
         );
         for (rejected, reason) in [
@@ -1324,7 +1279,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                select_asym3_givens_prefill_capabilities(&[cell], rejected),
+                select_asym3_fwht_prefill_capabilities(&[cell], rejected),
                 Err(reason)
             );
         }
@@ -1336,43 +1291,19 @@ mod tests {
             ..input
         };
         assert_eq!(
-            select_asym3_givens_prefill_capabilities(&[cell], d512),
+            select_asym3_fwht_prefill_capabilities(&[cell], d512),
             Err(FlashAttnCkRejectReason::UnsupportedHeadDim)
         );
-        let fwht = FlashAttnCkPrefillInput {
+        let asym4 = FlashAttnCkPrefillInput {
             request: FlashAttnCkRequest {
-                k_format: FlashAttnCkKvFormat::Asym3Fwht,
+                k_format: FlashAttnCkKvFormat::Asym4Fwht,
                 ..input.request
             },
             ..input
         };
         assert_eq!(
-            select_asym3_givens_prefill_capabilities(&[cell], fwht),
+            select_asym3_fwht_prefill_capabilities(&[cell], asym4),
             Err(FlashAttnCkRejectReason::UnsupportedFormat)
-        );
-    }
-
-    #[test]
-    fn asym3_givens_prefill_selector_accepts_exact_gfx1201_cell() {
-        let q8 = eligible_q8_prefill();
-        let input = FlashAttnCkPrefillInput {
-            request: FlashAttnCkRequest {
-                arch: FlashAttnCkArch::Gfx1201,
-                k_format: FlashAttnCkKvFormat::Asym3Givens,
-                ..q8.request
-            },
-            ..q8
-        };
-        assert_eq!(
-            select_asym3_givens_prefill_capabilities(
-                &[asym3_givens_d256_capability_gfx1201()],
-                input,
-            ),
-            Ok(input.request)
-        );
-        assert_eq!(
-            select_asym3_givens_prefill_capabilities(&[asym3_givens_d256_capability()], input),
-            Err(FlashAttnCkRejectReason::CapabilityMiss)
         );
     }
 
@@ -1432,10 +1363,7 @@ mod tests {
     #[test]
     fn asym4_prefill_selector_is_format_exact_and_fail_closed() {
         let q8 = eligible_q8_prefill();
-        for format in [
-            FlashAttnCkKvFormat::Asym4Givens,
-            FlashAttnCkKvFormat::Asym4Fwht,
-        ] {
+        for format in [FlashAttnCkKvFormat::Asym4Fwht] {
             let input = FlashAttnCkPrefillInput {
                 request: FlashAttnCkRequest {
                     k_format: format,
@@ -1646,16 +1574,6 @@ mod tests {
         assert!(sidecar.capabilities().iter().any(|cell| {
             cell.arch == FlashAttnCkArch::Gfx1100 as i32
                 && cell.dtype == FlashAttnCkDType::F32 as i32
-                && cell.k_format == FlashAttnCkKvFormat::Asym3Givens as i32
-                && cell.v_format == FlashAttnCkKvFormat::Q8 as i32
-                && cell.head_dim == 256
-        }));
-        assert!(!sidecar.capabilities().iter().any(|cell| {
-            cell.k_format == FlashAttnCkKvFormat::Asym3Givens as i32 && cell.head_dim == 512
-        }));
-        assert!(sidecar.capabilities().iter().any(|cell| {
-            cell.arch == FlashAttnCkArch::Gfx1100 as i32
-                && cell.dtype == FlashAttnCkDType::F32 as i32
                 && cell.k_format == FlashAttnCkKvFormat::Asym3Fwht as i32
                 && cell.v_format == FlashAttnCkKvFormat::Q8 as i32
                 && cell.head_dim == 256
@@ -1663,18 +1581,17 @@ mod tests {
         assert!(!sidecar.capabilities().iter().any(|cell| {
             cell.k_format == FlashAttnCkKvFormat::Asym3Fwht as i32 && cell.head_dim == 512
         }));
-        for format in [
-            FlashAttnCkKvFormat::Asym4Givens,
-            FlashAttnCkKvFormat::Asym4Fwht,
-        ] {
-            assert!(sidecar.capabilities().iter().any(|cell| {
-                cell.arch == FlashAttnCkArch::Gfx1100 as i32
-                    && cell.dtype == FlashAttnCkDType::F32 as i32
-                    && cell.k_format == format as i32
-                    && cell.v_format == FlashAttnCkKvFormat::Q8 as i32
-                    && cell.head_dim == 256
-            }));
-        }
+        assert!(sidecar.capabilities().iter().any(|cell| {
+            cell.arch == FlashAttnCkArch::Gfx1100 as i32
+                && cell.dtype == FlashAttnCkDType::F32 as i32
+                && cell.k_format == FlashAttnCkKvFormat::Asym4Fwht as i32
+                && cell.v_format == FlashAttnCkKvFormat::Q8 as i32
+                && cell.head_dim == 256
+        }));
+        assert!(!sidecar
+            .capabilities()
+            .iter()
+            .any(|cell| FLASH_ATTN_CK_RETIRED_KV_FORMATS.contains(&cell.k_format)));
         let error = sidecar
             .is_supported(&FlashAttnCkFwdParams::default())
             .expect_err("zero-shape parameters must be rejected");

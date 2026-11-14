@@ -18,414 +18,6 @@ use hipfire_config::{
 
 use crate::hipfire::writer::FieldKind;
 
-/// One key's help. Every field is a short, honest sentence (no marketing).
-#[derive(Clone, Copy, Debug)]
-pub struct KnobInfo {
-    pub key: &'static str,
-    /// Human-friendly title.
-    pub title: &'static str,
-    /// What it is (one line).
-    pub summary: &'static str,
-    /// What it does + the tradeoff (pros/cons).
-    pub effect: &'static str,
-    /// The default value, as a string (cross-checked against config defaults).
-    pub default: &'static str,
-    /// When to use / leave it.
-    pub when: &'static str,
-    /// A load-bearing interaction or caveat, if any.
-    pub note: Option<&'static str>,
-    /// For enum / bool keys: each selectable value and what it does. Empty for
-    /// numeric / free-string keys. Rendered in the explainer so users see what
-    /// every option means without leaving the Settings tab.
-    pub options: &'static [(&'static str, &'static str)],
-}
-
-/// Help for `key`, if a curated entry exists.
-pub fn knob_info(key: &str) -> Option<&'static KnobInfo> {
-    KNOBS.iter().find(|k| k.key == key)
-}
-
-/// Curated, honest help for the Settings keys. Order is not significant (lookup
-/// is by key). Defaults here mirror `config::defaults()` — see the cross-check
-/// test below so the two can't silently drift.
-pub const KNOBS: &[KnobInfo] = &[
-    KnobInfo {
-        key: "default_model",
-        title: "Default model",
-        summary: "The model serve pre-warms and chat uses when no model is named.",
-        effect: "Picks which weights load. No quality/speed tradeoff by itself — it just selects the model.",
-        default: "qwen3.5:9b",
-        when: "Set it to the model you use most. Change it from the Models tab.",
-        note: None,
-        options: &[],
-    },
-    KnobInfo {
-        key: "max_seq",
-        title: "Context (KV cache capacity)",
-        summary: "Maximum tokens the KV cache is allocated to hold at load.",
-        effect: "Larger = longer context, but more VRAM reserved up front. Smaller = less VRAM, shorter ceiling.",
-        default: "32768",
-        when: "Raise for long documents/agents; lower to fit a tight VRAM budget.",
-        note: Some("Allocated at load — changing it takes effect on the next serve/restart."),
-        options: &[],
-    },
-    KnobInfo {
-        key: "gpu_layer_budget",
-        title: "Layers kept on the GPU",
-        summary: "How many of the model's layers stay on the GPU. The rest spill to system RAM.",
-        effect: "Frees VRAM for a longer context, but decode slows sharply: a spilled layer's weights are read over PCIe every step instead of from VRAM. Load also takes much longer.",
-        default: "",
-        when: "Leave it unset for normal use — every model stays fully on the GPU, including MoE. Set a count or explicitly opt into 'auto' when the model or context will not otherwise fit.",
-        note: Some("The number counts layers ON THE GPU, not layers offloaded: 3 on a 64-layer model keeps 3 on the GPU and spills the other 61. Explicit 'auto' (-1) places by fit: the smallest spill that loads, routed experts first, and a model that already fits is left fully resident."),
-        options: &[],
-    },
-    KnobInfo {
-        key: "moe_expert_budget",
-        title: "Expert layers kept on the GPU",
-        summary: "For a Mixture-of-Experts model: how many layers keep their routed experts on the GPU. The rest spill to system RAM.",
-        effect: "Frees the VRAM a MoE model's experts dominate. A spilled expert is read over PCIe only when the router selects it, so a decode step pays for its few routed experts rather than the whole layer.",
-        default: "",
-        when: "Leave it unset for normal use — every routed expert stays on the GPU. Set a count or explicitly opt into 'auto' when a MoE model's experts do not fit, or when the row above still leaves too little VRAM.",
-        note: Some("Counts layers whose routed experts stay ON the GPU; llama.cpp's --n-cpu-moe K is this value written as n_layers - K. Only routed experts move — attention, router, shared expert and KV stay on the card. Needs the packed-expert layout (uniform, packable MQ4 experts). No effect on a dense model, and none on an architecture that cannot spill experts: a configured spill fails that model's load rather than being ignored."),
-        options: &[],
-    },
-    KnobInfo {
-        key: "offload_exec",
-        title: "Who multiplies a spilled layer",
-        summary: "Which engine executes the ops that read a spilled layer's weights: the GPU over PCIe, the CPU, or both at once.",
-        effect: "The CPU arm replaces a per-step read of every spilled weight over the link with a host-side GEMV, which is what makes a spill pay instead of costing. It is a per-step host sync (no hipGraph), and the GPU kernels are the faster engine once the bytes are resident. The pass-back ('both') splits each step's output rows between the two engines, so the GPU does useful work during the CPU arm's host time.",
-        default: "pcie",
-        when: "Leave on PCIe unless a spilled layer's per-step link read is the bottleneck; 'cpu' is the arm the CPU-exec offload path exists for, and 'passback' is the arm for a host whose link and CPU can stream the same weight bytes concurrently.",
-        note: Some("Decides who multiplies, never what is spilled: placement stays the 'GPU layers' row, and the KV cache stays in VRAM either way. Refused together with a retained-replay (Redline) backend, and unset/empty/unknown all fall back to pcie. Read once at load — changing it takes effect on the next serve/restart."),
-        options: &[
-            (
-                "pcie",
-                "'over PCIe' — `memory.offload_exec = pcie`: the GPU kernels read the host-mapped weights over the link and multiply.",
-            ),
-            (
-                "cpu",
-                "'on CPU' — `memory.offload_exec = cpu`: the CPU executes those GEMVs from system RAM; the GPU gets the result back.",
-            ),
-            (
-                "passback",
-                "'passback' — `memory.offload_exec = passback`: both do — the GPU takes a share of each step's output rows (see the 'Pass-back GPU share' row) while the CPU takes the rest, on the same weight bytes.",
-            ),
-        ],
-    },
-    KnobInfo {
-        key: "offload_passback_share",
-        title: "Pass-back GPU share",
-        summary: "How much of a spilled step the GPU takes back, as a share of its output rows.",
-        effect: "Higher hands more of each step to the faster-per-byte engine (usually the link, on a narrow PCIe link) and shortens the CPU arm; lower does the reverse. Only meaningful when 'Who multiplies a spilled layer' is 'passback'.",
-        default: "auto",
-        when: "Leave on auto: the engine schedules the share from this host's own measured engine rates and refines it as it decodes. Pin a number only when a measurement disagrees — `hipfire offload-bench` reports this host's numbers.",
-        note: Some("0 disables the pass-back, so 'passback' then behaves exactly as 'cpu' (the same bytes, the same order) — the A/B baseline. Ignored unless the mode is 'passback'; a share set in another mode prints one informational line at load. Up to 0.5, because beyond half the rows the choice is better expressed by switching the mode to 'pcie'. Read once at load."),
-        options: &[],
-    },
-    KnobInfo {
-        key: "kv_cache",
-        title: "KV cache precision",
-        summary: "Precision/memory tradeoff for the attention key/value cache.",
-        effect: "Lower precision saves VRAM and can speed decode, at some quality risk. Higher keeps fidelity.",
-        default: "auto",
-        when: "Leave on auto unless you need to fit a larger context or are A/B-testing precision.",
-        note: Some("auto is the inherit sentinel — it resolves to a non-q8 registry default_kv_mode when present, else the architecture default (fp8 on exact single-GPU gfx1201 Qwen), else q8. A model can ship a compressed default via the registry; a q8 default falls through to the architecture default, and nothing is guessed from the GPU arch alone."),
-        options: &[
-            ("auto", "Inherit: non-q8 registry default, else architecture default, else q8."),
-            ("q8", "Near-reference, ~2x vs fp16. The default. DFlash-safe."),
-            ("fwht4", "4-bit FWHT-rotated K + Q8 V. DFlash-safe."),
-            ("fwht3", "3-bit FWHT-rotated, ~5.5x. Best compressed-yet-DFlash-safe."),
-            ("fwht2", "2-bit FWHT. Smallest; for genuinely tight VRAM."),
-        ],
-    },
-    KnobInfo {
-        key: "kv_adaptive",
-        title: "Adaptive KV downshift",
-        summary: "Dynamically drops KV precision as context grows, instead of a fixed mode.",
-        effect: "Saves VRAM on long sessions by spending bits where they matter. Off = fixed precision. Requires an FWHT K mode (kv_cache fwht*).",
-        default: "off",
-        when: "Leave off unless you run long contexts on a tight VRAM budget and want graceful downshift.",
-        note: Some("Requires an FWHT K mode to take effect. The `advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>` combos set explicit K/V floor tiers — all 9 are cyclable here (and via the CLI)."),
-        options: &[
-            ("off", "No adaptive downshift — fixed KV precision."),
-            ("conservative", "Gentle floor: K=fwht4, V=lloyd4 — downshifts least."),
-            ("balanced", "Middle floor: K=fwht3, V=lloyd3."),
-            ("aggressive", "Deep floor: K=fwht2, V=lloyd2 — saves the most VRAM."),
-            ("advanced:k=…,v=…", "Pick the K (fwht4/3/2) and V (lloyd4/3/2) floor tiers explicitly — 9 combos."),
-        ],
-    },
-    KnobInfo {
-        key: "kv_backend",
-        title: "KV cache layout",
-        summary: "How the conversation memory (KV cache) is laid out in GPU memory.",
-        effect: "vmm reserves the whole context window and commits physical pages on demand; legacy allocates one contiguous block up front.",
-        default: "vmm",
-        when: "Leave on vmm; switch to legacy only to rule out a paging problem.",
-        note: None,
-        options: &[
-            ("legacy", "Physically contiguous allocation of the full context."),
-            ("vmm", "Reserve the logical window, commit pages as the chat grows."),
-        ],
-    },
-    KnobInfo {
-        key: "kv_k",
-        title: "KV key format",
-        summary: "Qwen-only override of the key (K) half of the KV cache format.",
-        effect: "Empty leaves the format the KV cache precision row selects; a value forces just the K axis.",
-        default: "",
-        when: "Only for experiments on Qwen models; normally follow the KV cache precision row.",
-        note: None,
-        options: &[],
-    },
-    KnobInfo {
-        key: "kv_v",
-        title: "KV value format",
-        summary: "Qwen-only override of the value (V) half of the KV cache format.",
-        effect: "Empty leaves the format the KV cache precision row selects; a value forces just the V axis.",
-        default: "",
-        when: "Only for experiments on Qwen models; normally follow the KV cache precision row.",
-        note: None,
-        options: &[],
-    },
-    KnobInfo {
-        key: "dflash_mode",
-        title: "DFlash eligibility",
-        summary: "Eligibility policy for DFlash speculative decoding: a paired DFlash draft the target verifies in batches. DFlash needs its own draft; it never falls back to the MTP head.",
-        effect: "Big decode speedup on predictable output (code, tool-calls, structured: ~4-5x). On free-form prose the acceptance rate is ~1, so it is a slight loss. Correctness is unchanged (the target verifies every token).",
-        default: "off",
-        when: "Turn on for code/agentic workloads when the model has a DFlash draft; `on` fails the load without one, even when an MTP head is present. Use the Speculation row (`speculation = mtp`) or mtp_mode to request the MTP head. Leave off for open-ended chat.",
-        note: Some("A thinking BUDGET routes a DFlash draft to plain decode: the dispatch gate bails when max_think_tokens > 0 and the think block isn't closed (the default thinking-on path sets a budget). Turn thinking off — or set its budget to 0 — and use greedy to actually get spec-decode."),
-        options: &[
-            ("off", "No DFlash speculative decoding (plain autoregressive)."),
-            ("on", "Use the DFlash draft whenever one is attached + the gate allows; fails the load without a draft."),
-            ("auto", "Engage DFlash when eligible (greedy, thinking-off, arch)."),
-        ],
-    },
-    KnobInfo {
-        key: "speculation",
-        title: "Speculation",
-        summary: "The general speculative-decoding selector (speculation.mode): which mechanism drafts tokens the target then verifies.",
-        effect: "auto picks by availability and eligibility (DFlash draft, native MTP head, n-gram, DSpark sidecar); the other values force one mechanism, which refuses the load when its own prerequisite is missing. Output is unchanged; only decode speed differs.",
-        default: "auto",
-        when: "Leave on auto. Force a mechanism to A/B-test it, or `off` for plain autoregressive decode.",
-        note: Some("Forcing `dflash` needs a DFlash draft and never aliases to the MTP head; use `mtp` for the head. The legacy dflash_mode / mtp_mode rows still filter each mechanism under auto."),
-        options: &[
-            ("off", "Plain autoregressive decode, no speculation."),
-            ("auto", "Cascade by availability and eligibility (the default)."),
-            ("ngram", "Prompt n-gram drafting; needs no draft model."),
-            ("dflash", "Force the model's DFlash draft; refuses the load without one."),
-            ("mtp", "Force the model's native MTP head."),
-            ("dspark", "Force the DSpark sidecar drafter."),
-        ],
-    },
-    KnobInfo {
-        key: "ple_format",
-        title: "PLE row format",
-        summary: "Which per-layer-embedding (PLE) row table a Flash-Next (Qwen4) load reads.",
-        effect: "q4 reads the 4-bit Lloyd-Max rows (much smaller on disk and in RAM, tiny quality cost); q8 reads the exact Q8 rows. Only affects PLE-split Qwen4 models; other models ignore it.",
-        default: "auto",
-        when: "Leave on auto (q4 on gfx1151 unified-memory Strix Halo, q8 elsewhere). Force q4 or q8 to pin the table.",
-        note: Some("A load never derives or downloads a missing table: q4 needs <model>.ple-q4 (hipfire pull, or `hipfire ple derive --format q4`). auto uses whichever format is on disk when only one exists."),
-        options: &[
-            ("auto", "q4 on gfx1151, q8 elsewhere; uses the other format when only it is on disk."),
-            ("q4", "4-bit Lloyd-Max rows (<model>.ple-q4); the load refuses when missing."),
-            ("q8", "Exact Q8 rows (embedded, or the <model>.ple-q8 sidecar)."),
-        ],
-    },
-    KnobInfo {
-        key: "thinking",
-        title: "Thinking (reasoning block)",
-        summary: "Whether reasoning models emit a hidden <think> block before the answer.",
-        effect: "On = better reasoning on hard prompts, but more tokens/latency and it suppresses spec-decode. Off = faster, leaner, spec-decode eligible.",
-        default: "on",
-        when: "On for hard reasoning/math; off for throughput, code, or to enable DFlash.",
-        note: Some("Interacts with dflash_mode: an active thinking budget (max_think_tokens > 0) makes DFlash fall back to plain decode. Turn thinking off to use spec-decode."),
-        options: &[
-            ("on", "Emit a hidden think block — stronger reasoning, more tokens, no spec-decode."),
-            ("off", "No think block — faster, leaner, spec-decode eligible."),
-        ],
-    },
-    KnobInfo {
-        key: "reasoning_effort",
-        title: "Reasoning effort",
-        summary: "How hard the model is told to think, in its own vocabulary.",
-        effect: "Shapes the reasoning up front by setting the model's native effort level, rather than truncating it after the fact. On Qwen3.8 this injects the card's effort instruction; medium is deliberately the unsteered baseline (no instruction at all).",
-        default: "auto",
-        when: "Prefer this over thinking_budget on any model that has it — lowering effort actually shortens the reasoning, where lowering the budget just cuts it off.",
-        note: Some("The offered levels come from the MODEL, probed from its chat template at load, so they differ per model: Qwen3.8 has low/medium/xhigh and rejects high/max outright. A level the model lacks is projected UP to its next real one (high -> xhigh), never down. When a model has no native effort, this falls back to the thinking_budget ladder."),
-        options: &[
-            ("auto", "Leave the template's own default in force (Qwen3.8: xhigh)."),
-            ("none", "No thinking — closed think block; see the thinking knob."),
-            ("low", "Brief, focused reasoning; straight to the conclusion."),
-            ("medium", "The model's unsteered baseline — no effort instruction."),
-            ("high", "Projected up to the model's next real rung if it has no 'high'."),
-            ("xhigh", "Thorough analysis: validate assumptions, weigh alternatives."),
-            ("max", "Saturates at the model's top rung."),
-        ],
-    },
-    KnobInfo {
-        key: "thinking_budget",
-        title: "Reasoning budget",
-        summary: "Named per-turn cap on tokens the model may spend inside <think>.",
-        effect: "Higher budgets allow deeper reasoning at the cost of latency; lower budgets force the model to commit to an answer sooner. Picks a preset instead of a raw token count.",
-        default: "med",
-        when: "med for everyday use; low for snappy chat; high/xhigh/max for hard reasoning; uncapped only if latency is no concern.",
-        note: Some("A CAP, not a reasoning dial — it truncates, it does not shape. On a model with a native reasoning.effort (Qwen3.8, DeepSeek4) set the effort instead: a budget below what the chosen effort spends force-closes <think> mid-thought, so you pay the deep reasoning and lose the conclusion. Effort-native models therefore leave this uncapped by default. Drives max_think_tokens unless a raw max_think_tokens override is set (the advanced knob wins). Only applies when thinking is on; thinking=off caps reasoning to a single token regardless."),
-        options: &[
-            ("low", "512 tokens — quick answers, minimal reasoning."),
-            ("med", "2048 tokens — the default; balanced reasoning vs latency."),
-            ("high", "8192 tokens — deeper reasoning for harder prompts."),
-            ("xhigh", "24576 tokens — very deep reasoning; watch latency."),
-            ("max", "32768 tokens — the ceiling; longest bounded reasoning."),
-            ("uncapped", "0 = no limit — model reasons until it stops (watch latency)."),
-        ],
-    },
-    KnobInfo {
-        key: "mtp_mode",
-        title: "Multi-token prediction (MTP)",
-        summary: "Uses a model's MTP head to predict several tokens per step where its producer has a measured autoregressive floor.",
-        effect: "Raises decode throughput on models whose MTP drafter declares a measured AR floor (native Flash-Next) when the head is usable at the loaded placement; Qwen3.5/3.6 and DeepSeek V4 keep plain AR under `auto` and load no head — use `on` (or --spec mtp) to opt in. A no-op on models without an MTP head.",
-        default: "auto",
-        when: "Leave on auto; force on/off only when A/B-testing throughput. `on` arms the head on a producer without a measured AR floor (Qwen3.5/3.6, DeepSeek V4) and overrides `auto`'s decline of a host-mapped routed-expert spill.",
-        note: Some("`auto` declines a host-mapped routed-expert spill (memory.moe_expert_budget, either offload_exec seam): the verify re-reads or recomputes the experts, and a head that is unverified there has produced garbled windows (`qwen3.6-35b-a3b.mq6` — mtp windows at tau 0.04-0.13 while its single-row AR decodes coherently). The load prints one line and decodes AR; set on (or --spec mtp) to opt back in."),
-        options: &[
-            ("off", "No multi-token prediction."),
-            ("on", "Force the MTP head where the model has one."),
-            ("auto", "Use MTP only where the producer has a measured AR floor and the model is not host-spilled; else single-token."),
-        ],
-    },
-    KnobInfo {
-        key: "mtp_k",
-        title: "MTP depth (K)",
-        summary: "How many tokens the MTP head proposes per step.",
-        effect: "Higher K can accept more per step (faster) but risks lower acceptance on hard text. Only used when MTP is active.",
-        default: "auto",
-        when: "Tune only when measuring MTP throughput; `auto` is 4 for Flash-Next on gfx1151 and 3 elsewhere.",
-        note: None,
-        options: &[],
-    },
-    KnobInfo {
-        key: "flash_mode",
-        title: "Flash attention mode",
-        summary: "Controls the flash-attention path for the Q8 KV cache.",
-        effect: "auto picks per arch; always/never force it. Mostly a performance knob; the FWHT KV modes are flash-only.",
-        default: "auto",
-        when: "Leave on auto unless debugging an attention path.",
-        note: None,
-        options: &[
-            ("auto", "Engine decides per arch — flash on where it helps (already on by default on gfx11/gfx12)."),
-            ("always", "Force flash attention on."),
-            ("never", "Disable flash attention (FWHT modes are flash-only)."),
-        ],
-    },
-    KnobInfo {
-        key: "mmq_screen",
-        title: "MMQ screening",
-        summary: "Mixed-precision matmul screening for quantized GEMMs.",
-        effect: "Detects Q8_1 outlier rows and falls back to WMMA. Arch-gated to gfx906 + RDNA3/3.5 (gfx1100-1103/1150-1152) and only fires when MMQ is active.",
-        default: "auto",
-        when: "Leave on auto unless profiling kernels.",
-        note: None,
-        options: &[
-            ("off", "No outlier sweep — max speed, risks tool-call corruption (#87)."),
-            ("on", "Force the per-weight outlier sweep."),
-            ("auto", "Screen on the supported arches (gfx906 + RDNA3/3.5) when MMQ is active."),
-        ],
-    },
-    KnobInfo {
-        key: "dflash_adaptive_b",
-        title: "DFlash adaptive batch",
-        summary: "Lets DFlash adapt its draft verify-block width to recent acceptance.",
-        effect: "Follows the trailing 8-cycle acceptance depth (τ̂+2 rows), shrunk only past 2k context where the fixed full block loses throughput. This is not output-identical: realized tokens can differ from fixed-B (observed even at temp 0) because a narrower verify window moves window boundaries; per-position sampling stays target-lossless.",
-        default: "false",
-        when: "Opt in for long-context DFlash sessions after measuring your workload; off keeps the fixed full block. Mutually exclusive with the retained PM4 verify route (PM4 loads keep the fixed B=16 shape).",
-        note: Some("HIPFIRE_DFLASH_ADAPTIVE_B=0 forces the fixed block even when enabled. Short contexts always get the full block."),
-        options: &[
-            ("true", "Size the draft batch to recent acceptance (context-gated, seeded at full)."),
-            ("false", "Fixed draft batch size (default)."),
-        ],
-    },
-    KnobInfo {
-        key: "prompt_normalize",
-        title: "Prompt normalization",
-        summary: "Collapses 3+ consecutive newlines to 2 before tokenizing.",
-        effect: "Stabilizes tokenization so whitespace differences don't swing performance; no meaning change for normal text.",
-        default: "true",
-        when: "Leave on. Turn off only when raw repeated newlines are semantically load-bearing.",
-        note: None,
-        options: &[
-            ("true", "Collapse 3+ newlines to 2 before tokenizing."),
-            ("false", "Leave whitespace as-is (when newlines are load-bearing)."),
-        ],
-    },
-    KnobInfo {
-        key: "default_chatml",
-        title: "Default ChatML",
-        summary: "Whether to apply a ChatML scaffold when a model has no embedded chat template.",
-        effect: "Improves chat formatting for templateless models; harmless when a model carries its own template.",
-        default: "true",
-        when: "Leave on; turn off only for raw/base models where a ChatML scaffold hurts.",
-        note: None,
-        options: &[
-            ("true", "Use a ChatML scaffold as the fallback when a model has no embedded template."),
-            ("false", "No fallback scaffold — a templateless model gets none (models with their own template are unaffected either way)."),
-        ],
-    },
-    KnobInfo {
-        key: "chat_template",
-        title: "Chat template",
-        summary: "Path to a custom Jinja chat template (.j2/.jinja). Empty = model default.",
-        effect: "Overrides how messages are rendered into the prompt. Wrong templates degrade output.",
-        default: "",
-        when: "Set only when you need a specific template; leave empty to use the model's own.",
-        note: Some("Must point to a file that exists; an invalid path is rejected on save."),
-        options: &[],
-    },
-    KnobInfo {
-        key: "temperature",
-        title: "Temperature",
-        summary: "Sampling randomness for generation.",
-        effect: "Lower = more deterministic/repeatable; higher = more varied/creative but less reliable.",
-        default: "0.3",
-        when: "Low (<=0.3) for code/factual; higher (0.7-1.0) for brainstorming.",
-        note: Some("Greedy (~0) is what spec-decode runs at; sampling adds cost."),
-        options: &[],
-    },
-    KnobInfo {
-        key: "top_p",
-        title: "Top-p (nucleus)",
-        summary: "Caps sampling to the smallest set of tokens whose probability sums to p.",
-        effect: "Lower = safer, more focused; higher = more diverse. Interacts with temperature.",
-        default: "0.8",
-        when: "Leave near default; lower it to tighten outputs.",
-        note: None,
-        options: &[],
-    },
-    KnobInfo {
-        key: "host",
-        title: "Serve endpoint",
-        summary: "The bind address (and port) of the OpenAI-compatible serve API.",
-        effect: "127.0.0.1 is local-only (the default); 0.0.0.0 listens on all interfaces. Chat and API clients connect here.",
-        // Must match `serve.host`'s config default — the serve surface is
-        // unauthenticated, so a LAN bind is an explicit operator choice.
-        // `defaults_match_config_defaults` pins this equality.
-        default: "127.0.0.1",
-        when: "Set 0.0.0.0 to expose serve on the network; the default keeps it private to this machine.",
-        note: Some("Paired with port (default 11435). Changes take effect on the next serve/restart."),
-        options: &[],
-    },
-    KnobInfo {
-        key: "max_tokens",
-        title: "Max tokens",
-        summary: "Upper bound on tokens generated per response.",
-        effect: "Caps response length and runaway generation. No quality effect within the cap.",
-        default: "4096",
-        when: "Raise for long outputs; lower to bound latency/cost.",
-        note: None,
-        options: &[],
-    },
-];
-
 // ---------------------------------------------------------------------------
 // Curated Settings rows (spec §3.1, §3.7)
 // ---------------------------------------------------------------------------
@@ -458,6 +50,21 @@ pub enum Tradeoff {
     Text(&'static str),
 }
 
+/// How an entry is explained.
+#[derive(Clone, Copy, Debug)]
+pub enum KnobKind {
+    /// A §3.1 curated row: the four-line explainer, line 2 the trade-off.
+    Curated(Tradeoff),
+    /// An Advanced row with plain-language help: `what` replaces the schema
+    /// help, and the why pane adds "When", "Note" and the schema default.
+    Advanced {
+        /// When to use / leave it.
+        when: &'static str,
+        /// A load-bearing interaction or caveat, if any.
+        note: Option<&'static str>,
+    },
+}
+
 /// Plain-language entry for one Settings row, keyed by canonical key (or
 /// [`PROMPT_PROCESSING_ID`]). Line 3 (why this value, when it applies) and
 /// line 4 (key, env, controls) are computed from the row at runtime.
@@ -470,10 +77,21 @@ pub struct SettingKnob {
     /// text). Bool rows use `"true"`/`"false"`. The Prompt processing row's
     /// real labels come from `quality_choices`; these are the generic ones.
     pub options: &'static [(&'static str, &'static str)],
+    /// What each value does, shown beside it under "Options on this GPU".
+    pub option_help: &'static [(&'static str, &'static str)],
     /// Explainer line 1: what it is.
     pub what: &'static str,
-    /// Explainer line 2: the trade-off.
-    pub tradeoff: Tradeoff,
+    pub kind: KnobKind,
+}
+
+impl SettingKnob {
+    const fn with_option_help(
+        mut self,
+        option_help: &'static [(&'static str, &'static str)],
+    ) -> Self {
+        self.option_help = option_help;
+        self
+    }
 }
 
 const fn text(
@@ -487,8 +105,26 @@ const fn text(
         id,
         title,
         options,
+        option_help: &[],
         what,
-        tradeoff: Tradeoff::Text(tradeoff),
+        kind: KnobKind::Curated(Tradeoff::Text(tradeoff)),
+    }
+}
+
+const fn advanced(
+    id: &'static str,
+    title: &'static str,
+    what: &'static str,
+    when: &'static str,
+    note: Option<&'static str>,
+) -> SettingKnob {
+    SettingKnob {
+        id,
+        title,
+        options: &[],
+        option_help: &[],
+        what,
+        kind: KnobKind::Advanced { when, note },
     }
 }
 
@@ -500,7 +136,8 @@ const VISION_MODE_OPTIONS: &[(&str, &str)] = &[
     ("on", "on"),
 ];
 
-/// Every §3.1 curated row, in group order.
+/// Every §3.1 curated row, in group order, then the Advanced rows that have
+/// plain-language help beyond the schema's ([`KnobKind::Advanced`]).
 pub const CURATED: &[SettingKnob] = &[
     // Quality
     SettingKnob {
@@ -508,33 +145,40 @@ pub const CURATED: &[SettingKnob] = &[
         title: "Prompt processing",
         options: &[("fast", "Fast"), ("accurate", "Accurate")],
         what: "How the model reads your prompt before it starts to answer.",
-        tradeoff: Tradeoff::Evidence {
+        option_help: &[],
+        kind: KnobKind::Curated(Tradeoff::Evidence {
             line: hipfire_config::evidence::PROMPT_PROCESSING,
             side: "Accurate",
             extra: None,
-        },
+        }),
     },
     SettingKnob {
         id: "developer.qwen4_moe_sym_iu4",
         title: "Flash-Next experts",
         options: &[("true", "Fast"), ("false", "Accurate")],
         what: "Math for the experts of Flash-Next models while reading prompts.",
-        tradeoff: Tradeoff::Evidence {
+        option_help: &[],
+        kind: KnobKind::Curated(Tradeoff::Evidence {
             line: hipfire_config::evidence::FLASH_NEXT_EXPERTS,
             side: "Accurate",
             extra: None,
-        },
+        }),
     },
     SettingKnob {
         id: "memory.ple_format",
         title: "Flash-Next word table",
         options: &[("auto", "auto"), ("q4", "q4 (small)"), ("q8", "q8 (exact)")],
         what: "Which word-table rows Flash-Next loads: small 4-bit or exact 8-bit.",
-        tradeoff: Tradeoff::Evidence {
+        option_help: &[
+            ("auto", "q4 on gfx1151, q8 elsewhere; uses the other format when only it is on disk."),
+            ("q4", "4-bit Lloyd-Max rows (<model>.ple-q4); the load refuses when missing."),
+            ("q8", "Exact Q8 rows (embedded, or the <model>.ple-q8 sidecar)."),
+        ],
+        kind: KnobKind::Curated(Tradeoff::Evidence {
             line: hipfire_config::evidence::FLASH_NEXT_PLE,
             side: "q8",
             extra: Some(hipfire_config::evidence::FLASH_NEXT_PLE_DISK),
-        },
+        }),
     },
     text(
         "reasoning.mode",
@@ -542,7 +186,11 @@ pub const CURATED: &[SettingKnob] = &[
         &[("on", "on"), ("off", "off")],
         "Whether the model thinks before it answers.",
         "Off answers sooner, but hard questions may get worse answers.",
-    ),
+    )
+    .with_option_help(&[
+        ("on", "Emit a hidden think block — stronger reasoning, more tokens, no spec-decode."),
+        ("off", "No think block — faster, leaner, spec-decode eligible."),
+    ]),
     text(
         "reasoning.effort",
         "Thinking effort",
@@ -557,7 +205,16 @@ pub const CURATED: &[SettingKnob] = &[
         ],
         "How hard the model is told to think, in its own vocabulary.",
         "Lower effort is shorter thinking; its quality cost is not measured.",
-    ),
+    )
+    .with_option_help(&[
+        ("auto", "Leave the template's own default in force (Qwen3.8: xhigh)."),
+        ("none", "No thinking — closed think block; see the thinking knob."),
+        ("low", "Brief, focused reasoning; straight to the conclusion."),
+        ("medium", "The model's unsteered baseline — no effort instruction."),
+        ("high", "Projected up to the model's next real rung if it has no 'high'."),
+        ("xhigh", "Thorough analysis: validate assumptions, weigh alternatives."),
+        ("max", "Saturates at the model's top rung."),
+    ]),
     text(
         "reasoning.budget",
         "Thinking cap",
@@ -572,7 +229,15 @@ pub const CURATED: &[SettingKnob] = &[
         ],
         "A hard limit on thinking length per turn. It cuts thinking short.",
         "A low cap can stop mid-thought; prefer effort where the model has one.",
-    ),
+    )
+    .with_option_help(&[
+        ("low", "512 tokens — quick answers, minimal reasoning."),
+        ("med", "2048 tokens — the default; balanced reasoning vs latency."),
+        ("high", "8192 tokens — deeper reasoning for harder prompts."),
+        ("xhigh", "24576 tokens — very deep reasoning; watch latency."),
+        ("max", "32768 tokens — the ceiling; longest bounded reasoning."),
+        ("uncapped", "0 = no limit — model reasons until it stops (watch latency)."),
+    ]),
     // Speed
     text(
         "experimental.graph.forward",
@@ -613,7 +278,15 @@ pub const CURATED: &[SettingKnob] = &[
         &[("auto", "auto"), ("always", "always"), ("never", "never")],
         "Which attention kernel reads the conversation memory.",
         "Leave on auto; forcing a kernel can fail where it is not supported.",
-    ),
+    )
+    .with_option_help(&[
+        (
+            "auto",
+            "Engine decides per arch — flash on where it helps (already on by default on gfx11/gfx12).",
+        ),
+        ("always", "Force flash attention on."),
+        ("never", "Disable flash attention (FWHT modes are flash-only)."),
+    ]),
     // Memory & context
     text(
         "memory.max_seq",
@@ -638,7 +311,14 @@ pub const CURATED: &[SettingKnob] = &[
         ],
         "Format of the conversation memory (KV cache). Smaller fits longer chats.",
         "Smaller formats save memory; exact formats keep more detail.",
-    ),
+    )
+    .with_option_help(&[
+        ("auto", "Inherit: non-q8 registry default, else architecture default, else q8."),
+        ("q8", "Near-reference, ~2x vs fp16. The default. DFlash-safe."),
+        ("fwht4", "4-bit FWHT-rotated K + Q8 V. DFlash-safe."),
+        ("fwht3", "3-bit FWHT-rotated, ~5.5x. Best compressed-yet-DFlash-safe."),
+        ("fwht2", "2-bit FWHT. Smallest; for genuinely tight VRAM."),
+    ]),
     text(
         "memory.kv_adaptive",
         "KV fit-to-memory",
@@ -650,7 +330,17 @@ pub const CURATED: &[SettingKnob] = &[
         ],
         "Lowers KV precision as the chat grows instead of a fixed format.",
         "Fits long chats in tight memory; needs an FWHT key format.",
-    ),
+    )
+    .with_option_help(&[
+        ("off", "No adaptive downshift — fixed KV precision."),
+        ("conservative", "Gentle floor: K=fwht4, V=lloyd4 — downshifts least."),
+        ("balanced", "Middle floor: K=fwht3, V=lloyd3."),
+        ("aggressive", "Deep floor: K=fwht2, V=lloyd2 — saves the most VRAM."),
+        (
+            "advanced:k=…,v=…",
+            "Pick the K (fwht4/3/2) and V (lloyd4/3/2) floor tiers explicitly — 9 combos.",
+        ),
+    ]),
     text(
         "memory.gpu_layer_budget",
         "Layers kept on GPU",
@@ -675,7 +365,21 @@ pub const CURATED: &[SettingKnob] = &[
         ],
         "Which engine multiplies the weights of layers spilled to memory.",
         "PCIe reads over the link, CPU computes in place, passback does both.",
-    ),
+    )
+    .with_option_help(&[
+        (
+            "pcie",
+            "'over PCIe' — `memory.offload_exec = pcie`: the GPU kernels read the host-mapped weights over the link and multiply.",
+        ),
+        (
+            "cpu",
+            "'on CPU' — `memory.offload_exec = cpu`: the CPU executes those GEMVs from system RAM; the GPU gets the result back.",
+        ),
+        (
+            "passback",
+            "'passback' — `memory.offload_exec = passback`: both do — the GPU takes a share of each step's output rows (see the 'Pass-back GPU share' row) while the CPU takes the rest, on the same weight bytes.",
+        ),
+    ]),
     text(
         "memory.offload_passback_share",
         "Pass-back GPU share",
@@ -718,14 +422,30 @@ pub const CURATED: &[SettingKnob] = &[
         ],
         "Which method guesses ahead so the model types faster.",
         "Meant to keep answers identical; a bad guess only wastes a little time.",
-    ),
+    )
+    .with_option_help(&[
+        ("off", "Plain autoregressive decode, no speculation."),
+        ("auto", "Cascade by availability and eligibility (the default)."),
+        ("ngram", "Prompt n-gram drafting; needs no draft model."),
+        ("dflash", "Force the model's DFlash draft; refuses the load without one."),
+        ("mtp", "Force the model's native MTP head."),
+        ("dspark", "Force the DSpark sidecar drafter."),
+    ]),
     text(
         "speculation.mtp",
         "MTP",
         AUTO_ON_OFF_OPTIONS,
         "Guesses ahead with the model's own multi-token head, when it has one.",
         "Faster typing when guesses land; answers are not changed.",
-    ),
+    )
+    .with_option_help(&[
+        ("off", "No multi-token prediction."),
+        ("on", "Force the MTP head where the model has one."),
+        (
+            "auto",
+            "Use MTP only where the producer has a measured AR floor and the model is not host-spilled; else single-token.",
+        ),
+    ]),
     text(
         "speculation.mtp_k",
         "MTP draft window",
@@ -739,7 +459,15 @@ pub const CURATED: &[SettingKnob] = &[
         AUTO_ON_OFF_OPTIONS,
         "Guesses ahead with a small paired draft model, when installed.",
         "Faster typing on supported pairs; needs the draft file installed.",
-    ),
+    )
+    .with_option_help(&[
+        ("off", "No DFlash speculative decoding (plain autoregressive)."),
+        (
+            "on",
+            "Use the DFlash draft whenever one is attached + the gate allows; fails the load without a draft.",
+        ),
+        ("auto", "Engage DFlash when eligible (greedy, thinking-off, arch)."),
+    ]),
     text(
         "speculation.ngram",
         "N-gram drafting",
@@ -769,11 +497,185 @@ pub const CURATED: &[SettingKnob] = &[
         "Uses RCCL to combine results across GPUs.",
         "RCCL is usually faster between GPUs; off uses the built-in path.",
     ),
+    // Advanced rows with plain-language help beyond the schema's.
+    advanced(
+        "serve.default_model",
+        "Default model",
+        concat!(
+            "The model serve pre-warms and chat uses when no model is named.",
+            " ",
+            "Picks which weights load. No quality/speed tradeoff by itself — it just selects the model."
+        ),
+        "Set it to the model you use most. Change it from the Models tab.",
+        None,
+    ),
+    advanced(
+        "memory.kv_backend",
+        "KV cache layout",
+        concat!(
+            "How the conversation memory (KV cache) is laid out in GPU memory.",
+            " ",
+            "vmm reserves the whole context window and commits physical pages on demand; legacy allocates one contiguous block up front."
+        ),
+        "Leave on vmm; switch to legacy only to rule out a paging problem.",
+        None,
+    )
+    .with_option_help(&[
+        ("legacy", "Physically contiguous allocation of the full context."),
+        ("vmm", "Reserve the logical window, commit pages as the chat grows."),
+    ]),
+    advanced(
+        "memory.kv_k",
+        "KV key format",
+        concat!(
+            "Qwen-only override of the key (K) half of the KV cache format.",
+            " ",
+            "Empty leaves the format the KV cache precision row selects; a value forces just the K axis."
+        ),
+        "Only for experiments on Qwen models; normally follow the KV cache precision row.",
+        None,
+    ),
+    advanced(
+        "memory.kv_v",
+        "KV value format",
+        concat!(
+            "Qwen-only override of the value (V) half of the KV cache format.",
+            " ",
+            "Empty leaves the format the KV cache precision row selects; a value forces just the V axis."
+        ),
+        "Only for experiments on Qwen models; normally follow the KV cache precision row.",
+        None,
+    ),
+    advanced(
+        "memory.mmq.screen",
+        "MMQ screening",
+        concat!(
+            "Mixed-precision matmul screening for quantized GEMMs.",
+            " ",
+            "Detects Q8_1 outlier rows and falls back to WMMA. Arch-gated to gfx906 + RDNA3/3.5 (gfx1100-1103/1150-1152) and only fires when MMQ is active."
+        ),
+        "Leave on auto unless profiling kernels.",
+        None,
+    )
+    .with_option_help(&[
+        ("off", "No outlier sweep — max speed, risks tool-call corruption (#87)."),
+        ("on", "Force the per-weight outlier sweep."),
+        ("auto", "Screen on the supported arches (gfx906 + RDNA3/3.5) when MMQ is active."),
+    ]),
+    advanced(
+        "speculation.dflash_adaptive_b",
+        "DFlash adaptive batch",
+        concat!(
+            "Lets DFlash adapt its draft verify-block width to recent acceptance.",
+            " ",
+            "Follows the trailing 8-cycle acceptance depth (τ̂+2 rows), shrunk only past 2k context where the fixed full block loses throughput. This is not output-identical: realized tokens can differ from fixed-B (observed even at temp 0) because a narrower verify window moves window boundaries; per-position sampling stays target-lossless."
+        ),
+        "Opt in for long-context DFlash sessions after measuring your workload; off keeps the fixed full block. Mutually exclusive with the retained PM4 verify route (PM4 loads keep the fixed B=16 shape).",
+        Some("HIPFIRE_DFLASH_ADAPTIVE_B=0 forces the fixed block even when enabled. Short contexts always get the full block."),
+    )
+    .with_option_help(&[
+        ("true", "Size the draft batch to recent acceptance (context-gated, seeded at full)."),
+        ("false", "Fixed draft batch size (default)."),
+    ]),
+    advanced(
+        "prompt.normalize",
+        "Prompt normalization",
+        concat!(
+            "Collapses 3+ consecutive newlines to 2 before tokenizing.",
+            " ",
+            "Stabilizes tokenization so whitespace differences don't swing performance; no meaning change for normal text."
+        ),
+        "Leave on. Turn off only when raw repeated newlines are semantically load-bearing.",
+        None,
+    )
+    .with_option_help(&[
+        ("true", "Collapse 3+ newlines to 2 before tokenizing."),
+        ("false", "Leave whitespace as-is (when newlines are load-bearing)."),
+    ]),
+    advanced(
+        "prompt.default_chatml",
+        "Default ChatML",
+        concat!(
+            "Whether to apply a ChatML scaffold when a model has no embedded chat template.",
+            " ",
+            "Improves chat formatting for templateless models; harmless when a model carries its own template."
+        ),
+        "Leave on; turn off only for raw/base models where a ChatML scaffold hurts.",
+        None,
+    )
+    .with_option_help(&[
+        ("true", "Use a ChatML scaffold as the fallback when a model has no embedded template."),
+        (
+            "false",
+            "No fallback scaffold — a templateless model gets none (models with their own template are unaffected either way).",
+        ),
+    ]),
+    advanced(
+        "prompt.chat_template",
+        "Chat template",
+        concat!(
+            "Path to a custom Jinja chat template (.j2/.jinja). Empty = model default.",
+            " ",
+            "Overrides how messages are rendered into the prompt. Wrong templates degrade output."
+        ),
+        "Set only when you need a specific template; leave empty to use the model's own.",
+        Some("Must point to a file that exists; an invalid path is rejected on save."),
+    ),
+    advanced(
+        "generation.temperature",
+        "Temperature",
+        concat!(
+            "Sampling randomness for generation.",
+            " ",
+            "Lower = more deterministic/repeatable; higher = more varied/creative but less reliable."
+        ),
+        "Low (<=0.3) for code/factual; higher (0.7-1.0) for brainstorming.",
+        Some("Greedy (~0) is what spec-decode runs at; sampling adds cost."),
+    ),
+    advanced(
+        "generation.top_p",
+        "Top-p (nucleus)",
+        concat!(
+            "Caps sampling to the smallest set of tokens whose probability sums to p.",
+            " ",
+            "Lower = safer, more focused; higher = more diverse. Interacts with temperature."
+        ),
+        "Leave near default; lower it to tighten outputs.",
+        None,
+    ),
+    advanced(
+        "serve.host",
+        "Serve endpoint",
+        concat!(
+            "The bind address (and port) of the OpenAI-compatible serve API.",
+            " ",
+            "127.0.0.1 is local-only (the default); 0.0.0.0 listens on all interfaces. Chat and API clients connect here."
+        ),
+        "Set 0.0.0.0 to expose serve on the network; the default keeps it private to this machine.",
+        Some("Paired with port (default 11435). Changes take effect on the next serve/restart."),
+    ),
+    advanced(
+        "generation.max_tokens",
+        "Max tokens",
+        concat!(
+            "Upper bound on tokens generated per response.",
+            " ",
+            "Caps response length and runaway generation. No quality effect within the cap."
+        ),
+        "Raise for long outputs; lower to bound latency/cost.",
+        None,
+    ),
 ];
 
-/// The curated entry for `id` (canonical key or [`PROMPT_PROCESSING_ID`]).
-pub fn curated_knob(id: &str) -> Option<&'static SettingKnob> {
+/// The entry for `id` (canonical key or [`PROMPT_PROCESSING_ID`]), curated
+/// row or Advanced help.
+pub fn knob(id: &str) -> Option<&'static SettingKnob> {
     CURATED.iter().find(|knob| knob.id == id)
+}
+
+/// The curated row entry for `id`; `None` for Advanced help entries.
+pub fn curated_knob(id: &str) -> Option<&'static SettingKnob> {
+    knob(id).filter(|knob| matches!(knob.kind, KnobKind::Curated(_)))
 }
 
 /// What an explainer is rendered for: the row's computed state.
@@ -822,10 +724,8 @@ fn why_line(ctx: &ExplainCtx<'_>) -> String {
 /// Dedicated line for a key with no curated entry (Advanced rows): the
 /// schema help over two lines, then why/when, then the key and its controls.
 pub fn schema_explainer(key: &str, ctx: &ExplainCtx<'_>) -> [String; 4] {
-    let schema = field(key);
-    let legacy = schema.and_then(|schema| knob_info(schema.legacy_key));
-    let text = match (legacy, schema) {
-        (Some(info), _) => format!("{} {}", info.summary, info.effect),
+    let text = match (knob(key), field(key)) {
+        (Some(knob), _) => knob.what.to_owned(),
         (None, Some(schema)) => schema.help.to_owned(),
         (None, None) => format!("{key} has no schema help."),
     };
@@ -887,9 +787,12 @@ pub fn explainer(id: &str, ctx: &ExplainCtx<'_>) -> Option<[String; 4]> {
     let tradeoff = if no_route {
         "This GPU has no choice here; the raw keys stay in Advanced.".to_owned()
     } else {
-        match knob.tradeoff {
-            Tradeoff::Text(text) => text.to_owned(),
-            Tradeoff::Evidence { line, side, extra } => evidence_text(line, side, extra, ctx.arch),
+        match knob.kind {
+            KnobKind::Curated(Tradeoff::Text(text)) => text.to_owned(),
+            KnobKind::Curated(Tradeoff::Evidence { line, side, extra }) => {
+                evidence_text(line, side, extra, ctx.arch)
+            }
+            KnobKind::Advanced { .. } => return None,
         }
     };
 
@@ -1038,41 +941,72 @@ mod tests {
     use super::*;
     use crate::hipfire::writer::EDITABLE_FIELDS;
 
-    #[test]
-    fn lookup_returns_curated_entry() {
-        let dflash = knob_info("dflash_mode").expect("dflash entry");
-        assert_eq!(dflash.title, "DFlash eligibility");
-        assert!(knob_info("does_not_exist").is_none());
+    /// Canonical key of an `EDITABLE_FIELDS` entry (keyed by legacy key).
+    fn canonical(key: &str) -> &'static str {
+        field(key)
+            .unwrap_or_else(|| panic!("{key} is not a schema key"))
+            .key
     }
 
     #[test]
-    fn dflash_explainer_does_not_promise_an_mtp_fallback() {
-        // docs/CONFIG.md: `dflash_mode=on` requires a DFlash draft and never
-        // enables MTP; the general selector is `speculation`.
-        let dflash = knob_info("dflash_mode").expect("dflash entry");
-        for field in [dflash.summary, dflash.when] {
+    fn lookup_separates_curated_rows_from_advanced_help() {
+        assert_eq!(
+            knob("speculation.dflash").expect("dflash entry").title,
+            "DFlash"
+        );
+        assert!(curated_knob("speculation.dflash").is_some());
+        let temperature = knob("generation.temperature").expect("temperature help");
+        assert!(matches!(temperature.kind, KnobKind::Advanced { .. }));
+        assert!(curated_knob("generation.temperature").is_none());
+        assert!(knob("does_not_exist").is_none());
+    }
+
+    #[test]
+    fn every_entry_is_a_schema_key_listed_once() {
+        for (index, knob) in CURATED.iter().enumerate() {
             assert!(
-                !field.contains("else its MTP head"),
-                "dflash copy must not promise an MTP fallback: {field}"
+                knob.id == PROMPT_PROCESSING_ID
+                    || hipfire_config::canonical_config_key(knob.id).as_deref() == Some(knob.id),
+                "{} is not a canonical schema key",
+                knob.id
+            );
+            assert!(
+                CURATED[..index].iter().all(|other| other.id != knob.id),
+                "{} is listed twice",
+                knob.id
             );
         }
-        assert!(dflash.summary.contains("never falls back"));
-        let spec = knob_info("speculation").expect("speculation entry");
-        assert_eq!(spec.default, "auto");
-        let values: Vec<&str> = spec.options.iter().map(|(v, _)| *v).collect();
+    }
+
+    #[test]
+    fn dflash_help_does_not_promise_an_mtp_fallback() {
+        // docs/CONFIG.md: `dflash_mode=on` requires a DFlash draft and never
+        // enables MTP; the general selector is `speculation`.
+        let help = field("speculation.dflash").unwrap().help;
+        assert!(
+            !help.contains("else its MTP head"),
+            "dflash help must not promise an MTP fallback: {help}"
+        );
+        assert!(help.contains("never falls back"));
+        let spec = knob("speculation.mode").expect("speculation entry");
+        let values: Vec<&str> = spec.option_help.iter().map(|(v, _)| *v).collect();
         assert_eq!(values, hipfire_config::SPECULATION_MODES);
     }
 
     #[test]
-    fn kv_adaptive_has_explainer_with_options() {
-        let k = knob_info("kv_adaptive").expect("kv_adaptive explainer");
+    fn kv_adaptive_has_per_option_help() {
+        let k = knob("memory.kv_adaptive").expect("kv_adaptive entry");
         // 4 presets + the advanced-family entry.
-        assert_eq!(k.options.len(), 5);
-        assert!(k.options.iter().any(|(v, _)| *v == "aggressive"));
-        assert!(k.options.iter().any(|(v, _)| v.starts_with("advanced")));
+        assert_eq!(k.option_help.len(), 5);
+        assert!(k.option_help.iter().any(|(v, _)| *v == "aggressive"));
+        assert!(k.option_help.iter().any(|(v, _)| v.starts_with("advanced")));
         assert!(
-            k.note.unwrap().to_lowercase().contains("fwht"),
-            "note explains the FWHT-K requirement"
+            field("memory.kv_adaptive")
+                .unwrap()
+                .help
+                .to_lowercase()
+                .contains("fwht"),
+            "help explains the FWHT-K requirement"
         );
     }
 
@@ -1083,11 +1017,11 @@ mod tests {
         use crate::hipfire::writer::FieldKind;
         for f in EDITABLE_FIELDS {
             if matches!(f.kind, FieldKind::Enum(_) | FieldKind::Bool) {
-                let info = knob_info(f.key).unwrap_or_else(|| panic!("no explainer for {}", f.key));
+                let key = canonical(f.key);
+                let info = knob(key).unwrap_or_else(|| panic!("no explainer for {key}"));
                 assert!(
-                    !info.options.is_empty(),
-                    "enum/bool key {} has no per-option help",
-                    f.key
+                    !info.option_help.is_empty(),
+                    "enum/bool key {key} has no per-option help"
                 );
             }
         }
@@ -1097,34 +1031,8 @@ mod tests {
     fn every_editable_field_has_help() {
         // 5e: selecting any editable key must show an explainer.
         for f in EDITABLE_FIELDS {
-            assert!(
-                knob_info(f.key).is_some(),
-                "no explainer for editable key {}",
-                f.key
-            );
-        }
-    }
-
-    #[test]
-    fn defaults_match_config_defaults() {
-        // STRICT: every knob's `default` must exist in config::defaults() AND
-        // match it — no silent skip. config::defaults() resolves the shared
-        // hipfire-config schema, so this also pins knob defaults to the real
-        // defaults. A knob without a config default fails loudly so it can't
-        // drift unnoticed (this is exactly the gap that hid default_chatml).
-        let cfg = crate::hipfire::config::ConfigState::defaults_for_test();
-        for k in KNOBS {
-            let expected = cfg.get(k.key).unwrap_or_else(|| {
-                panic!(
-                    "knob {} has no config default to cross-check — add it to config::defaults()",
-                    k.key
-                )
-            });
-            assert_eq!(
-                &k.default, expected,
-                "knob default for {} drifted from config defaults ({} vs {})",
-                k.key, k.default, expected
-            );
+            let key = canonical(f.key);
+            assert!(knob(key).is_some(), "no explainer for editable key {key}");
         }
     }
 
@@ -1132,34 +1040,22 @@ mod tests {
     fn load_bearing_interactions_are_documented() {
         // The two interactions this phase exists to surface.
         assert!(
-            knob_info("dflash_mode")
+            field("speculation.dflash")
                 .unwrap()
-                .note
-                .unwrap()
+                .help
                 .contains("thinking"),
-            "dflash note must mention the thinking interaction"
+            "dflash help must mention the thinking interaction"
         );
         assert!(
-            knob_info("thinking")
+            field("reasoning.mode")
                 .unwrap()
-                .note
-                .unwrap()
-                .to_lowercase()
-                .contains("dflash")
-                || knob_info("thinking")
-                    .unwrap()
-                    .note
-                    .unwrap()
-                    .contains("spec-decode"),
-            "thinking note must mention the dflash interaction"
+                .help
+                .contains("spec-decode"),
+            "thinking help must mention the dflash interaction"
         );
         assert!(
-            knob_info("kv_cache")
-                .unwrap()
-                .note
-                .unwrap()
-                .contains("inherit"),
-            "kv_cache note must explain auto = inherit"
+            field("memory.kv_cache").unwrap().help.contains("inherit"),
+            "kv_cache help must explain auto = inherit"
         );
     }
 
@@ -1229,7 +1125,10 @@ mod tests {
     #[test]
     fn explainers_are_four_lines_of_at_most_76_columns() {
         for arch in archs() {
-            for knob in CURATED {
+            for knob in CURATED
+                .iter()
+                .filter(|knob| curated_knob(knob.id).is_some())
+            {
                 let lines = explain(knob.id, &arch);
                 for line in &lines {
                     let width = line.chars().count();

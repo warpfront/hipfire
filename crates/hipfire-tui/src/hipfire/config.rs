@@ -107,13 +107,6 @@ impl ConfigState {
         }
     }
 
-    /// The hardcoded default map, for cross-checking the knob explainer defaults
-    /// (5e) against the real defaults so the two can't drift.
-    #[cfg(test)]
-    pub(crate) fn defaults_for_test() -> BTreeMap<String, String> {
-        defaults()
-    }
-
     pub fn probe_host(&self) -> String {
         match self.host.as_str() {
             "0.0.0.0" | "" => "127.0.0.1".into(),
@@ -194,6 +187,13 @@ fn default_map() -> &'static BTreeMap<String, String> {
             .map(|(key, value)| (key, value_to_string(&value)))
             .collect()
     })
+}
+
+/// The schema default of canonical `key` as the Settings tab shows it
+/// (empty for an unset default).
+pub(crate) fn schema_default_text(key: &str) -> Option<&'static str> {
+    let schema = hipfire_config::field(key)?;
+    default_map().get(schema.legacy_key).map(String::as_str)
 }
 
 fn value_to_string(value: &ConfigValue) -> String {

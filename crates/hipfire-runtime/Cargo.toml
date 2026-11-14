@@ -499,14 +499,6 @@ name = "debug_minimax_batch"
 required-features = ["lab"]
 
 [[example]]
-name = "dflash_mtp_demo"
-required-features = ["lab"]
-
-[[example]]
-name = "dflash_mtp_tree_demo"
-required-features = ["lab"]
-
-[[example]]
 name = "diag_mq3_lloyd_multiacc"
 required-features = ["lab"]
 

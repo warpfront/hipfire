@@ -104,8 +104,6 @@ pub mod gguf_source;
 #[cfg(feature = "deltanet")]
 pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]
-pub mod mtp_compose;
-#[cfg(feature = "deltanet")]
 pub mod mtp_dense_tp;
 #[cfg(feature = "deltanet")]
 pub mod mtp_head;
@@ -157,7 +155,5 @@ pub use arch::Qwen35;
 
 #[cfg(feature = "deltanet")]
 pub use carrier::{free_qwen35_bundle, load_bundle as load_qwen35_bundle, Qwen35Bundle};
-#[cfg(feature = "deltanet")]
-pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};
 #[cfg(feature = "deltanet")]
 pub use mtp_speculator::{build_qwen35_mtp_speculator, Qwen35MtpDrafter};
