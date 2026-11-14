@@ -339,6 +339,11 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
     # same dense-qwen3_5 id the quantizer derives from model_type `qwen3_5`.
     if family in ("lightonocr3", "lightonocr"):
         return 5
+    # Surya-ocr-2.5 = the same dense Qwen3.5-VL carrier (Qwen3_5ForConditionalGeneration,
+    # model_type `qwen3_5`), so the quantizer's arch stamp is 5. Local-only. Its
+    # compact block output is a serve rendering (`ocr_format`), not an arch.
+    if family in ("surya-ocr-2.5", "surya-ocr", "surya"):
+        return 5
     if family == "qwen3":
         return 1
     if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):

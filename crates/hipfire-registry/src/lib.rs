@@ -990,6 +990,14 @@ pub struct ModelEntry {
     pub default_tool_format: Option<String>,
     #[serde(default)]
     pub default_kv_mode: Option<String>,
+    /// The model's assistant turn uses the Surya compact-block contract: a
+    /// label token plus four 0–1000 coordinate tokens plus the block's HTML,
+    /// not ordinary text. `serve.ocr_format` (`HIPFIRE_SERVE_OCR_FORMAT`)
+    /// defaults a decoded rendering (`html` / `blocks`) only for a model that
+    /// declares this; a request's own `ocr_format` is unaffected. Absent for
+    /// every model that emits text.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub compact_blocks: bool,
     #[serde(default)]
     pub quant_recipe: Option<String>,
     #[serde(default)]
@@ -1006,6 +1014,10 @@ pub struct ModelEntry {
     pub arch_id: Option<u32>,
     #[serde(default)]
     pub quant: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ModelEntry {
