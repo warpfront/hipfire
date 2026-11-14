@@ -40,7 +40,7 @@ use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::dflash_sampled_accept::DflashAcceptScratch;
 use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
-use rdna_compute::gdn_stream::GdnStreamMeta;
+use rdna_compute::gdn_stream::{GdnStreamMeta, GdnStreamPhase};
 use rdna_compute::{DType, Fp8VerifyTarget, Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1391,6 +1391,10 @@ pub struct DeltaNetSnapshot {
     bulk_rev: Option<DeviceBuffer>,
     /// S1: descriptor count shared by both tables (fixed per snapshot).
     bulk_n_items: u32,
+    /// S1: descriptors of the four recurrent families (S, scales, conv, EF),
+    /// which come first in both tables; the carry's descriptors follow. A
+    /// Sealed save/restore launches only this prefix (see [`Self::carries`]).
+    bulk_n_state: u32,
     /// S1: live-state pointer/size fingerprint the tables were built
     /// against. Save/restore re-fingerprint the passed state and fall back
     /// to memcpy on any mismatch (never copy through stale descriptors).
@@ -1442,14 +1446,18 @@ impl DeltaNetSnapshot {
         gpu: &mut Gpu,
         state: &DeltaNetState,
         backs: [&[DeviceBuffer]; 8],
-    ) -> Option<(DeviceBuffer, DeviceBuffer, u32)> {
+    ) -> Option<(DeviceBuffer, DeviceBuffer, u32, u32)> {
         if gpu.ensure_dflash_state_bulk_copy_gfx1100().is_err() {
             return None;
         }
         let lives: [&[GpuTensor]; 8] = live_families(state);
         let mut fwd: Vec<DflashStateCopyDesc> = Vec::new();
         let mut rev: Vec<DflashStateCopyDesc> = Vec::new();
-        for (live_fam, back_fam) in lives.iter().zip(backs.iter()) {
+        let mut n_state = 0usize;
+        for (fam, (live_fam, back_fam)) in lives.iter().zip(backs.iter()).enumerate() {
+            if fam == 4 {
+                n_state = fwd.len();
+            }
             if live_fam.len() != back_fam.len() {
                 return None;
             }
@@ -1511,7 +1519,7 @@ impl DeltaNetSnapshot {
             let _ = gpu.hip.free(rev_buf);
             return None;
         }
-        Some((fwd_buf, rev_buf, n_items))
+        Some((fwd_buf, rev_buf, n_items, n_state as u32))
     }
 
     /// S1 arch gate. gfx1100 (S1), exact gfx1201 (railgun E0 port) and exact
@@ -1528,12 +1536,14 @@ impl DeltaNetSnapshot {
 
     /// S1: shared fast-path gate. Returns the table + count to launch, or
     /// `None` when the call must use the memcpy loops (kill switch, arch,
-    /// disarmed tables, or stale fingerprint).
+    /// disarmed tables, or stale fingerprint). `carry` selects every
+    /// descriptor; otherwise only the recurrent-family prefix.
     fn bulk_table(
         &self,
         state: &DeltaNetState,
         gpu: &Gpu,
         forward: bool,
+        carry: bool,
     ) -> Option<(&DeviceBuffer, u32)> {
         if !Self::bulk_arch(gpu) {
             return None;
@@ -1541,11 +1551,30 @@ impl DeltaNetSnapshot {
         if self.bulk_n_items == 0 || Self::bulk_fingerprint(state) != self.bulk_fingerprint {
             return None;
         }
+        let n = if carry {
+            self.bulk_n_items
+        } else {
+            self.bulk_n_state
+        };
+        if n == 0 {
+            return None;
+        }
         match (forward, &self.bulk_fwd, &self.bulk_rev) {
-            (true, Some(t), _) => Some((t, self.bulk_n_items)),
-            (false, _, Some(t)) => Some((t, self.bulk_n_items)),
+            (true, Some(t), _) => Some((t, n)),
+            (false, _, Some(t)) => Some((t, n)),
             _ => None,
         }
+    }
+
+    /// Whether a save/restore of a state whose stream cursors are `meta` must
+    /// move the GDN carry. Only an Open ordinary-prefill phase reads it: a
+    /// Sealed stream's next append re-enters from the live Q8(+EF) planes and
+    /// ring (`gdn_stream_append` writes the tile-entry conv and reconstructs
+    /// the entry state before any carry read, with no pending rows), so the
+    /// carry bytes of a Sealed state are unobservable and the per-cycle
+    /// decode/verify snapshot copies only the four recurrent families.
+    fn carries(meta: &[GdnStreamMeta]) -> bool {
+        meta.iter().any(|m| m.phase == GdnStreamPhase::Open)
     }
 
     /// S1: host-visible completion barrier. `memcpy_dtod` blocks the host;
@@ -1590,6 +1619,7 @@ impl DeltaNetSnapshot {
             bulk_fwd: None,
             bulk_rev: None,
             bulk_n_items: 0,
+            bulk_n_state: 0,
             bulk_fingerprint: Self::bulk_fingerprint(state),
             prefix_hash: 0,
         };
@@ -1598,10 +1628,11 @@ impl DeltaNetSnapshot {
         // snapshot on the legacy memcpy path.
         if Self::bulk_arch(gpu) {
             let backs = snap.back_families();
-            if let Some((f, r, n)) = Self::build_bulk_tables(gpu, state, backs) {
+            if let Some((f, r, n, n_state)) = Self::build_bulk_tables(gpu, state, backs) {
                 snap.bulk_fwd = Some(f);
                 snap.bulk_rev = Some(r);
                 snap.bulk_n_items = n;
+                snap.bulk_n_state = n_state;
             }
         }
         Ok(snap)
@@ -1913,8 +1944,10 @@ impl DeltaNetSnapshot {
         self.back_families().into_iter().flatten()
     }
 
-    /// Copy live state → backup (S/scale/conv + EF residual + GDN carry) and
-    /// record the stream recipe and cursors.
+    /// Copy live state → backup (S/scale/conv + EF residual, plus the GDN
+    /// carry while the stream is Open) and record the stream recipe and
+    /// cursors. A Sealed state's carry is unobservable ([`Self::carries`]), so
+    /// the decode/verify snapshot does not copy it.
     ///
     /// S1: on gfx1100/gfx1151/gfx1201 with armed tables and a matching fingerprint this is a
     /// single descriptor-driven `dflash_state_bulk_copy_gfx1100` launch over
@@ -1925,7 +1958,8 @@ impl DeltaNetSnapshot {
     /// `state` is refused before any byte moves.
     pub fn save_from(&mut self, state: &DeltaNetState, gpu: &mut Gpu) -> HipResult<()> {
         self.check_structure(state)?;
-        if let Some((table, n)) = self.bulk_table(state, gpu, true) {
+        let carry = Self::carries(&state.stream.meta);
+        if let Some((table, n)) = self.bulk_table(state, gpu, true, carry) {
             gpu.dflash_state_bulk_copy_gfx1100(table.as_ptr() as *const _, n)?;
             Self::bulk_sync(gpu)?;
             self.capture_stream(state);
@@ -1936,7 +1970,7 @@ impl DeltaNetSnapshot {
         // (VMM prefix reuse moves conversations between owners); shapes match
         // and pool rounding only pads, so the common extent covers every
         // element and never overruns either side.
-        for (backs, lives) in self.back_families().into_iter().zip(live_families(state)) {
+        for (backs, lives) in Self::moved(self.back_families(), live_families(state), carry) {
             for (dst, src) in backs.iter().zip(lives) {
                 gpu.hip
                     .memcpy_dtod(dst, &src.buf, src.buf.size().min(dst.size()))?;
@@ -1944,6 +1978,16 @@ impl DeltaNetSnapshot {
         }
         self.capture_stream(state);
         Ok(())
+    }
+
+    /// The (backup, live) family pairs a save/restore moves: all eight, or the
+    /// four recurrent families when the carry is not moved.
+    fn moved<'a, 'b>(
+        backs: [&'a [DeviceBuffer]; 8],
+        lives: [&'b [GpuTensor]; 8],
+        carry: bool,
+    ) -> impl Iterator<Item = (&'a [DeviceBuffer], &'b [GpuTensor])> {
+        backs.into_iter().zip(lives).take(if carry { 8 } else { 4 })
     }
 
     /// Async copy live state → backup on `stream`.
@@ -1962,7 +2006,8 @@ impl DeltaNetSnapshot {
         stream: &Stream,
     ) -> HipResult<()> {
         self.check_structure(state)?;
-        if let Some((table, n)) = self.bulk_table(state, gpu, true) {
+        let carry = Self::carries(&state.stream.meta);
+        if let Some((table, n)) = self.bulk_table(state, gpu, true, carry) {
             if gpu
                 .dflash_state_bulk_copy_gfx1100_on_stream(table.as_ptr() as *const _, n, stream)
                 .is_ok()
@@ -1971,7 +2016,7 @@ impl DeltaNetSnapshot {
                 return Ok(());
             }
         }
-        for (backs, lives) in self.back_families().into_iter().zip(live_families(state)) {
+        for (backs, lives) in Self::moved(self.back_families(), live_families(state), carry) {
             for (dst, src) in backs.iter().zip(lives) {
                 gpu.hip
                     .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
@@ -1981,8 +2026,10 @@ impl DeltaNetSnapshot {
         Ok(())
     }
 
-    /// Copy backup → live state (rewinds recurrent + EF residual + GDN carry
-    /// and the stream cursors to the snapshot).
+    /// Copy backup → live state (rewinds recurrent + EF residual, the GDN
+    /// carry when the snapshot was saved Open, and the stream cursors to the
+    /// snapshot). Restoring a Sealed image leaves the live carry bytes as they
+    /// are: no reader observes them before the next Open phase rewrites them.
     ///
     /// Refuses a schema, carry-geometry, lane/layer-shape or recipe mismatch
     /// before mutating anything. The state keeps its own owner generation.
@@ -1993,14 +2040,15 @@ impl DeltaNetSnapshot {
     /// contract); otherwise the legacy per-tensor memcpy loop below runs.
     pub fn restore_to(&self, state: &mut DeltaNetState, gpu: &mut Gpu) -> HipResult<()> {
         self.check_restore(state)?;
-        if let Some((table, n)) = self.bulk_table(state, gpu, false) {
+        let carry = Self::carries(&self.stream.meta);
+        if let Some((table, n)) = self.bulk_table(state, gpu, false, carry) {
             gpu.dflash_state_bulk_copy_gfx1100(table.as_ptr() as *const _, n)?;
             Self::bulk_sync(gpu)?;
             state.stream.apply_image(&self.stream)?;
             return Ok(());
         }
         // Common extent (see `save_from`).
-        for (backs, lives) in self.back_families().into_iter().zip(live_families(state)) {
+        for (backs, lives) in Self::moved(self.back_families(), live_families(state), carry) {
             for (src, dst) in backs.iter().zip(lives) {
                 gpu.hip
                     .memcpy_dtod(&dst.buf, src, src.size().min(dst.buf.size()))?;
@@ -15257,6 +15305,7 @@ mod dn_exchange_tests {
             bulk_fwd: Some(buf(FWD0, 8)),
             bulk_rev: Some(buf(REV0, 8)),
             bulk_n_items: 3,
+            bulk_n_state: 3,
             bulk_fingerprint: DeltaNetSnapshot::bulk_fingerprint(live),
             prefix_hash: 0,
         }
@@ -15616,6 +15665,7 @@ mod dn_stream_tests {
             bulk_fwd: None,
             bulk_rev: None,
             bulk_n_items: 0,
+            bulk_n_state: 0,
             bulk_fingerprint: DeltaNetSnapshot::bulk_fingerprint(live),
             prefix_hash: 0,
         }
@@ -16059,6 +16109,73 @@ mod dn_stream_tests {
                 (want.position, want.pending_rows)
             );
         }
+
+        snap.free_gpu(&mut gpu);
+        state.free_gpu(&mut gpu);
+    }
+
+    /// A Sealed (decode/verify) save/restore moves only the four recurrent
+    /// families: the per-cycle snapshot leaves the dead carry alone on both
+    /// sides, still rewinds S and the cursors.
+    #[test]
+    fn gpu_sealed_snapshot_moves_recurrent_state_but_not_the_dead_carry() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let g = GEOM;
+        let mk = |gpu: &mut Gpu, bytes: usize| gpu.zeros(&[bytes / 4], DType::F32).expect("zeros");
+        let carry = DeltaNetCarry {
+            geometry: g,
+            lanes: 1,
+            tile_state: vec![mk(&mut gpu, g.state_bytes())],
+            tile_conv: vec![mk(&mut gpu, g.conv_bytes())],
+            raw_qkv: vec![mk(&mut gpu, g.raw_qkv_bytes())],
+            raw_ab: vec![mk(&mut gpu, g.raw_ab_bytes())],
+        };
+        let mut state = DeltaNetState {
+            s_matrices: vec![gpu.zeros(&[8], DType::F32).expect("s")],
+            s_scales: vec![gpu.zeros(&[1], DType::F32).expect("scale")],
+            conv_states: vec![gpu.zeros(&[4], DType::F32).expect("conv")],
+            s_ef_residual: Vec::new(),
+            quant: qwen35::StateQuant::Q8,
+            stream: GdnStreamOwner::new(1, 1, Some(carry)),
+        };
+        state.stream.bind_recipe(0x5EED).unwrap();
+        let n_state = g.state_bytes() / 4;
+        let saved_s: Vec<f32> = (0..8).map(|i| i as f32 + 0.25).collect();
+        htod(&gpu, &state.s_matrices[0], &saved_s);
+        htod(
+            &gpu,
+            &state.stream.carry.as_ref().unwrap().tile_state[0],
+            &vec![1.0; n_state],
+        );
+        assert!(!state.stream.is_open());
+
+        let mut snap = DeltaNetSnapshot::new_for(&mut gpu, &state).expect("alloc");
+        snap.save_from(&state, &mut gpu).expect("save");
+        htod(&gpu, &state.s_matrices[0], &[9.0; 8]);
+        htod(
+            &gpu,
+            &state.stream.carry.as_ref().unwrap().tile_state[0],
+            &vec![7.0; n_state],
+        );
+        snap.restore_to(&mut state, &mut gpu).expect("restore");
+        assert_eq!(dtoh(&gpu, &state.s_matrices[0], 8), saved_s);
+        // Neither the save nor the restore touched a carry byte.
+        assert_eq!(
+            dtoh(
+                &gpu,
+                &state.stream.carry.as_ref().unwrap().tile_state[0],
+                n_state
+            ),
+            vec![7.0; n_state]
+        );
+        assert!(state
+            .stream
+            .meta
+            .iter()
+            .all(|m| m.phase == GdnStreamPhase::Sealed));
 
         snap.free_gpu(&mut gpu);
         state.free_gpu(&mut gpu);
