@@ -336,6 +336,7 @@ pub fn dflash_lane_draft(
         false,
         seed,
         config.vocab_size,
+        None,
     )
 }
 

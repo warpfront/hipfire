@@ -4888,6 +4888,9 @@ pub fn generate_spec(
     // sees): τ = accepted drafts / cycle.
     let mut spec_cycles = 0usize;
     let mut spec_accepted = 0usize;
+    // Per-cycle accepted-draft histogram (opt-in): the survival curve
+    // P(accept >= k) separates row-1 errors from deep-row errors.
+    let mut accept_hist: Vec<usize> = Vec::new();
     let mut generated = 0usize;
     // Set when the mid-loop `position + block_size >= ctx_capacity` break
     // fires: the draft's context-indexed structures cannot host another
@@ -5431,6 +5434,12 @@ pub fn generate_spec(
         } else {
             spec_cycles += 1;
             spec_accepted += step.accepted;
+            if hipfire_config::developer_var("HIPFIRE_SPEC_ACCEPT_HIST").as_deref() == Ok("1") {
+                if accept_hist.len() <= step.accepted {
+                    accept_hist.resize(step.accepted + 32, 0);
+                }
+                accept_hist[step.accepted] += 1;
+            }
         }
         // `emit` is already the committed tail with the seed re-echo stripped.
         let committed_tail = step.emit;
@@ -6137,6 +6146,11 @@ pub fn generate_spec(
         render_client_events(stdout, id, &finish.events, 0, true);
     }
 
+    if !accept_hist.is_empty() {
+        eprintln!(
+            "[spec-accept-hist] id={id} cycles={spec_cycles} accepted={spec_accepted} hist={accept_hist:?}"
+        );
+    }
     let t_end = Instant::now();
     Some(SpecRun {
         generated,

@@ -163,6 +163,11 @@ pub struct DflashConfig {
     /// (`dflash_config.target_streams_per_layer`, default 1). A multi-stream
     /// residual target (e.g. Raon's 4 mHC streams) contributes every stream.
     pub target_streams_per_layer: usize,
+    /// `dflash_config.draft_block_causal`: the draft attended causally inside
+    /// its block while training (DSpine arch-24; the SGLang/MLX references
+    /// refuse a checkpoint without it). DFlash2 checkpoints leave it unset
+    /// and stay bidirectional inside the block.
+    pub block_causal: bool,
 }
 
 impl DflashConfig {
@@ -321,6 +326,26 @@ impl DflashConfig {
         let target_streams_per_layer = dflash_u64("target_streams_per_layer")
             .filter(|&s| s >= 1)
             .unwrap_or(1);
+        // DSpine trains (and the references refuse to run without) a causal
+        // draft block. DFlash2 artifacts leave the key unset.
+        let block_causal = meta
+            .get("config")
+            .and_then(|c| c.get("dflash_config"))
+            .and_then(|d| d.get("draft_block_causal"))
+            .and_then(|v| v.as_bool())
+            .or_else(|| {
+                meta.get("dspine")
+                    .and_then(|d| d.get("versions"))
+                    .and_then(|v| v.get("draft_block_causal_version"))
+                    .and_then(|x| x.as_u64())
+                    .map(|v| v == 1)
+            })
+            .unwrap_or(false);
+        // A/B knob: HIPFIRE_DSPINE_BLOCK_CAUSAL=0 runs the same binary with
+        // the DFlash2 bidirectional block mask.
+        let block_causal = block_causal
+            && hipfire_config::developer_var("HIPFIRE_DSPINE_BLOCK_CAUSAL")
+                .map_or(true, |v| v.trim() != "0");
 
         Some(DflashConfig {
             n_layers,
@@ -343,6 +368,7 @@ impl DflashConfig {
             selector_rank,
             selector_top_k,
             target_streams_per_layer,
+            block_causal,
         })
     }
 }
@@ -4531,8 +4557,43 @@ fn draft_forward_based_inner(
         // All-sliding DFlash2: every layer sliding with same W.
         let is_swa_layer = windowed && (is_all_sliding_windowed || !is_full_layer);
         if is_swa_layer {
-            // Faithful non-causal SWA: window= swa_w, ctx_span= span
-            gpu.attention_dflash_sliding_f32(
+            // Windowed, ctx_span = span. DSpine drafts were trained causal
+            // inside the block (`draft_block_causal`); DFlash2 stays
+            // bidirectional there.
+            if cfg.block_causal {
+                gpu.attention_dflash_sliding_causal_f32(
+                    &scratch.q,
+                    k_cat_l,
+                    v_cat_l,
+                    &scratch.attn_out,
+                    b,
+                    span + b,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    hd,
+                    span,
+                    swa_w,
+                )?;
+            } else {
+                // Faithful non-causal SWA: window= swa_w, ctx_span= span
+                gpu.attention_dflash_sliding_f32(
+                    &scratch.q,
+                    k_cat_l,
+                    v_cat_l,
+                    &scratch.attn_out,
+                    b,
+                    span + b,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    hd,
+                    span,
+                    swa_w,
+                )?;
+            }
+        } else if cfg.block_causal {
+            // Non-windowed (Legacy) DSpine draft: causal everywhere is the
+            // same kernel with a window wider than the sequence.
+            gpu.attention_dflash_sliding_causal_f32(
                 &scratch.q,
                 k_cat_l,
                 v_cat_l,
@@ -4543,7 +4604,7 @@ fn draft_forward_based_inner(
                 cfg.n_kv_heads,
                 hd,
                 span,
-                swa_w,
+                span + b,
             )?;
         } else {
             use crate::llama::{attention_family, DispatchCtx, FullAttnParams, KernelKey};
@@ -5113,6 +5174,7 @@ mod block_policy_tests {
             selector_rank: Some(256),
             selector_top_k: Some(16),
             target_streams_per_layer: 1,
+            block_causal: false,
         };
         assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_UNBATCHED), 16);
         assert_eq!(cfg.runtime_block_size(8), 8);

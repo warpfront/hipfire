@@ -45,7 +45,9 @@
 
 #include <hip/hip_runtime.h>
 
-extern "C" __global__ void attention_dflash_sliding_f32(
+template <bool CAUSAL>
+__device__ __forceinline__ void dflash_sliding_body(
+    float* sdata,
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ v,
@@ -56,7 +58,6 @@ extern "C" __global__ void attention_dflash_sliding_f32(
     int ctx_span,
     int sliding_window
 ) {
-    extern __shared__ float sdata[];
     int head = blockIdx.x;
     int qi = blockIdx.y;
     int tid = threadIdx.x;
@@ -113,9 +114,11 @@ extern "C" __global__ void attention_dflash_sliding_f32(
         float local_max = -INFINITY;
         for (int j = tid; j < tile_len; j += nthreads) {
             int abs_j = tile_start + j;
-            int diff = ctx_span + qi - abs_j;
-            if (diff < 0) diff = -diff;
-            bool visible = diff < sliding_window;
+            // rel > 0: the key sits in the query's past.
+            int rel = ctx_span + qi - abs_j;
+            bool visible = CAUSAL
+                ? (rel >= 0 && rel < sliding_window)
+                : ((rel < 0 ? -rel : rel) < sliding_window);
             const float* k_ptr = k + abs_j * kv_stride + kv_head * head_dim;
             float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
             float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
@@ -294,4 +297,43 @@ extern "C" __global__ void attention_dflash_sliding_f32(
             out_ptr[d] = out_run[d] * inv_l;
         }
     }
+}
+
+// ── Entry points ─────────────────────────────────────────────────────────
+// `attention_dflash_sliding_f32` keeps the DFlash2 contract (bidirectional
+// inside the block). `attention_dflash_sliding_causal_f32` is the DSpine
+// draft contract (`dflash_config.draft_block_causal`): every context key in
+// the trailing window stays visible, block keys are past-only — the exact
+// `(kpos <= qpos) & (kpos > qpos - W)` mask of the reference implementation.
+
+extern "C" __global__ void attention_dflash_sliding_f32(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ out,
+    int B, int L, int n_heads, int n_kv_heads, int head_dim,
+    float scale,
+    int tile_size,
+    int ctx_span,
+    int sliding_window
+) {
+    extern __shared__ float sdata[];
+    dflash_sliding_body<false>(sdata, q, k, v, out, B, L, n_heads, n_kv_heads,
+                               head_dim, scale, tile_size, ctx_span, sliding_window);
+}
+
+extern "C" __global__ void attention_dflash_sliding_causal_f32(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ out,
+    int B, int L, int n_heads, int n_kv_heads, int head_dim,
+    float scale,
+    int tile_size,
+    int ctx_span,
+    int sliding_window
+) {
+    extern __shared__ float sdata[];
+    dflash_sliding_body<true>(sdata, q, k, v, out, B, L, n_heads, n_kv_heads,
+                              head_dim, scale, tile_size, ctx_span, sliding_window);
 }

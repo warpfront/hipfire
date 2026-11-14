@@ -180,6 +180,11 @@ pub struct DspineBridge {
     early_w: Vec<GpuTensor>, // 4 × [C, H] f32 (layers 0..3)
     write_w: Vec<GpuTensor>, // 5 × [H, R] f32
     packed_w: GpuTensor,    // [3R, C] f32 = gate ⊕ predecessor_gate ⊕ prev
+    // Standalone predecessor/value projections for the refinement lattice
+    // (the packed concat is consumed by the trunk bridge; the lattice reads
+    // them row-wise per predecessor candidate).
+    pred_gate: GpuTensor,   // [R, C] f32
+    prev_w: GpuTensor,      // [R, C] f32
     gate_bias: GpuTensor,   // [R] f32
     // Prebuilt serial sender tables ([V, R] f32 each), `Some` only
     // when the sidecar carried them (converter `--target-hfq`).
@@ -197,6 +202,24 @@ pub struct DspineBridge {
     // does, BEFORE this layer's bridge write lands (finish is in-place).
     s_x_pre: GpuTensor,
     s_anchor: GpuTensor,     // [1] u32 — the block's first real token id
+    /// Host-side copy of the anchor id (the table chain seeds its walk with it).
+    anchor_id: u32,
+    // Reused across draft windows: ~10 MB of device scratch and the FWHT sign
+    // tables are constant per row count, so the hot path allocates them once.
+    lattice_scratch: std::cell::RefCell<Option<LatticeScratch>>,
+}
+
+/// Big per-window lattice buffers plus the FWHT sign tables.
+struct LatticeScratch {
+    rows: usize,
+    lm: GpuTensor,
+    refined: GpuTensor,
+    scores: GpuTensor,
+    dbg: GpuTensor,
+    /// Message per (row, predecessor): the lattice GEMM's right operand.
+    msg: GpuTensor,
+    s1t: GpuTensor,
+    s2t: GpuTensor,
 }
 
 fn lift_bf16_tensor(
@@ -311,7 +334,19 @@ impl DspineBridge {
             hfq,
             "selected_prefix_bridge.gate.bias",
             vec![r],
+        )?;        let pred_gate = lift_bf16_tensor(
+            gpu,
+            hfq,
+            "selected_prefix_bridge.predecessor_gate.weight",
+            vec![r, c],
         )?;
+        let prev_w = lift_bf16_tensor(
+            gpu,
+            hfq,
+            "selected_prefix_bridge.prev.weight",
+            vec![r, c],
+        )?;
+
 
         // Prebuilt serial sender tables: fail-closed lift when the
         // metadata promises them (a missing tensor is a corrupt sidecar,
@@ -390,8 +425,12 @@ impl DspineBridge {
             early_w,
             write_w,
             packed_w,
+            pred_gate,
+            prev_w,
             gate_bias,
             serial,
+            anchor_id: 0,
+            lattice_scratch: std::cell::RefCell::new(None),
         })
     }
 
@@ -425,19 +464,12 @@ impl DspineBridge {
     pub fn serial_refine(
         &self,
         gpu: &mut Gpu,
-        logits_pre: &GpuTensor,
         logits_post: &GpuTensor,
         rows: usize,
+        lm_head_raw: &crate::llama::WeightTensor,
+        out_norm: &GpuTensor,
     ) -> hip_bridge::HipResult<Vec<u32>> {
-        let tables = match self.serial.as_ref() {
-            Some(t) => t,
-            None => {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    "serial_refine on a sidecar without TG/TSV tables",
-                ));
-            }
-        };
+        let tables = self.serial.as_ref();
         let vocab = self.cfg.trunk.vocab_size;
         // u32 payloads ride F32 tensors (4 B/elem): Raw is 1 B/elem and
         // download_f32 reads numel*4, so a Raw alloc here is a bounded
@@ -445,87 +477,262 @@ impl DspineBridge {
         let cand = gpu.alloc_tensor(&[rows, 16], rdna_compute::DType::F32)?;
         let base = gpu.alloc_tensor(&[rows, 16], rdna_compute::DType::F32)?;
         let out = gpu.alloc_tensor(&[rows], rdna_compute::DType::F32)?;
-        eprintln!("[dspine-serial] rows={} base.buf={}B cand.buf={}B out.buf={}B",
-            rows, base.byte_size(), cand.byte_size(), out.byte_size());
+        let diag =
+            hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_DIAG").as_deref() == Ok("1");
+        if diag {
+            eprintln!("[dspine-serial] rows={} base.buf={}B cand.buf={}B out.buf={}B",
+                rows, base.byte_size(), cand.byte_size(), out.byte_size());
+        }
         // Experiment switch: HIPFIRE_DSPINE_SERIAL_MODE=argmax returns the
         // pre-write argmax (topk16 lane 0) and skips the sender chain —
         // isolates how much of the acceptance gap is the refinement term
         // vs the base ordering itself.
-        let mode_argmax =
-            hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_MODE").as_deref() == Ok("argmax");
+        let serial_mode = hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_MODE")
+            .unwrap_or_default();
+        let mode_argmax = serial_mode == "argmax";
+        // Greedy refinement defaults to upstream's served `serial_table`
+        // scoring (shipped TG/TSV tables + the pre-write base term): the exact
+        // lattice's rmsnorm scale depends only on (row, predecessor), so it
+        // cancels in the per-row argmax and both paths pick the same tokens
+        // (verified pick-for-pick on every captured window) — the chain just
+        // skips the K*K full-H recomputation. `exact` re-runs the audited
+        // lattice, `argmax` skips refinement entirely.
+        let mode_table = serial_mode != "exact" && !mode_argmax;
+        let mode_table = mode_table && tables.is_some();
+        if serial_mode == "table" && tables.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "serial mode `table` needs the sidecar's TG/TSV tables",
+            ));
+        }
+        // Capture root is a run-scoped directory chosen by the caller
+        // (default keeps the legacy path for ad-hoc runs).
+        let cap_root = hipfire_config::developer_var("HIPFIRE_DSPINE_CAPTURE_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/tmp/dspine_capture_l".to_string());
+        let timing =
+            hipfire_config::developer_var("HIPFIRE_DSPINE_LATTICE_TIMING").as_deref() == Ok("1");
         let pick = (|| -> hip_bridge::HipResult<Vec<u32>> {
-            // Upstream: candidates come from the forward's OUTPUT logits
-            // (post-write hidden @ lm_head), while the score's base term is
-            // evaluated at those ids on the PRE-write logits (serial_table
-            // rescoring). One topk on the post logits + one gather.
+            let mut cap_dir: Option<String> = None;
+            let t0 = std::time::Instant::now();
+            // Upstream lattice (build_dspine_lattice): candidates from the
+            // post-write logits, then EXACT per-(candidate, predecessor)
+            // bridge-write recomputation — no sender-table approximation.
             gpu.dspine_topk16(logits_post, &cand, &base, rows, vocab)?;
-            gpu.dspine_gather16(logits_pre, &cand, &base, rows, vocab)?;
+            let t_topk = t0.elapsed();
             if mode_argmax {
-                let raw = gpu.download_f32(&cand)?;
+                // stream-ordered: the null-stream readback drains the whole
+                // queue and would dominate this control arm's window time.
+                let raw = gpu.download_f32_stream_ordered(&cand)?;
                 return Ok((0..rows).map(|i| raw[i * 16].to_bits()).collect());
             }
             // stream-ordered: the plain readback blocks on the legacy null
             // stream, syncing the whole decode queue (8x measured earlier).
-            let anchor_raw = gpu.download_f32_stream_ordered(&self.s_anchor)?;
-            let anchor_sid = anchor_raw[0].to_bits();
-            // logits row r is draft row r+1 (the seed row has no head
-            // logits), so the sender's rms/query must come from scratch
-            // rows 1..=rows, not 0..rows: one row off = every gate reads
-            // its neighbor's packed code and acceptance collapses.
+            // Lattice inputs: raw/rms/query all take rows 1..n (the seed row
+            // has no refinement); the anchor code is the bridge's row-0 code
+            // (already sqrt(C)-scaled by normalize_codes).
+            let raw_rows = self.s_x_pre.sub_offset(self.h, rows * self.h);
             let rms_rows = self.s_rms.sub_offset(1, rows);
-            let packed_rows = self
+            let query_rows = self
                 .s_packed
                 .sub_offset(3 * self.r, rows * 3 * self.r);
-            gpu.dspine_serial_chain(
-                &base,
+            let anchor_code = self.s_codes.sub_offset(0, self.c);
+            let mut held = self.lattice_scratch.replace(None);
+            if held.as_ref().map_or(true, |s| s.rows != rows) {
+                if let Some(old) = held.take() {
+                    let _ = gpu.free_tensor(old.lm);
+                    let _ = gpu.free_tensor(old.refined);
+                    let _ = gpu.free_tensor(old.scores);
+                    let _ = gpu.free_tensor(old.dbg);
+                    let _ = gpu.free_tensor(old.s1t);
+                    let _ = gpu.free_tensor(old.s2t);
+                }
+                // MQ4V2 head rows encode FWHT(W): the score dot product
+                // consumes the FWHT-rotated refined vector (engine sign
+                // convention, seeds 42/1042 — same tables as ensure_mq_signs).
+                let mut signs1 = vec![0f32; 256];
+                let mut signs2 = vec![0f32; 256];
+                {
+                    let mut st: u32 = 42;
+                    for i in 0..256 {
+                        st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+                        signs1[i] = if (st >> 16) & 1 == 1 { 1.0 } else { -1.0 };
+                    }
+                    st = 1042;
+                    for i in 0..256 {
+                        st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+                        signs2[i] = if (st >> 16) & 1 == 1 { 1.0 } else { -1.0 };
+                    }
+                }
+                held = Some(LatticeScratch {
+                    rows,
+                    lm: gpu.alloc_tensor(&[rows, 16, self.h], rdna_compute::DType::F32)?,
+                    refined: gpu.alloc_tensor(&[rows, 16, self.h], rdna_compute::DType::F32)?,
+                    scores: gpu.alloc_tensor(&[rows, 16, 16], rdna_compute::DType::F32)?,
+                    dbg: gpu.alloc_tensor(&[12800], rdna_compute::DType::F32)?,
+                    msg: gpu.alloc_tensor(&[rows * 16, self.r], rdna_compute::DType::F32)?,
+                    s1t: gpu.upload_f32(&signs1, &[256])?,
+                    s2t: gpu.upload_f32(&signs2, &[256])?,
+                });
+            }
+            let LatticeScratch {
+                rows: _sr, lm: lm_scratch, refined: refined_out, scores, dbg: dbg_seg, s1t, s2t,
+                msg,
+            } = held.take().unwrap();
+            let row_bytes = ((self.h + 255) / 256) * 136;
+            let last = self.write_w.len() - 1;
+            if mode_table {
+                let tables = tables.expect("table mode requires TG/TSV tables");
+                // Sender-table chain: candidates from the post-write top-16,
+                // base from the pre-write stash, one dot per (row, candidate)
+                // against TG — no per-predecessor full-H recomputation.
+                gpu.dspine_lattice_head_rows(
+                    &cand,
+                    &lm_head_raw.buf,
+                    &lm_scratch,
+                    rows,
+                    self.h,
+                    self.r,
+                    row_bytes,
+                )?;
+                gpu.dspine_lattice_base_pre(
+                    &raw_rows,
+                    out_norm,
+                    &lm_scratch,
+                    &s1t,
+                    &s2t,
+                    &base,
+                    rows,
+                    self.h,
+                )?;
+                gpu.dspine_serial_chain(
+                    &base,
+                    &cand,
+                    &rms_rows,
+                    &query_rows,
+                    &tables.tsv_gate,
+                    &tables.tsv_val,
+                    &tables.tg,
+                    &self.gate_bias,
+                    self.anchor_id,
+                    &out,
+                    rows,
+                    16,
+                    self.r,
+                    self.t,
+                    3 * self.r,
+                    self.rms_scale(),
+                )?;
+                let ids = gpu.download_f32_stream_ordered(&out)?;
+                let picks_v: Vec<u32> = (0..rows).map(|i| ids[i].to_bits()).collect();
+                if hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_CAPTURE")
+                    .as_deref()
+                    == Ok("1")
+                {
+                    static CAP_SEQ: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let seq = CAP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let dir = format!("{}/win_{:05}", cap_root, seq);
+                    let _ = std::fs::create_dir_all(&dir);
+                    if let Ok(mut f) = std::fs::File::create(format!("{}/picks.bin", dir)) {
+                        use std::io::Write as _;
+                        let mut bytes = Vec::with_capacity(picks_v.len() * 4);
+                        for id in &picks_v {
+                            bytes.extend_from_slice(&id.to_le_bytes());
+                        }
+                        let _ = f.write_all(&bytes);
+                    }
+                }
+                self.lattice_scratch.replace(Some(LatticeScratch {
+                    rows, lm: lm_scratch, refined: refined_out, scores, dbg: dbg_seg,
+                    s1t, s2t, msg,
+                }));
+                if timing {
+                    let t_walk = t0.elapsed();
+                    eprintln!("[dspine-table-timing] rows={} total={:.3}ms",
+                        rows, t_walk.as_secs_f64() * 1e3);
+                }
+                return Ok(picks_v);
+            }
+            gpu.dspine_lattice_head_rows(
                 &cand,
-                &rms_rows,
-                &packed_rows,
-                &tables.tsv_gate,
-                &tables.tsv_val,
-                &tables.tg,
-                &self.gate_bias,
-                anchor_sid,
-                &out,
+                &lm_head_raw.buf,
+                &lm_scratch,
                 rows,
-                16,
+                self.h,
                 self.r,
-                self.t,
-                3 * self.r,
-                self.rms_scale(),
+                row_bytes,
             )?;
-            let raw = gpu.download_f32_stream_ordered(&out)?;
+            gpu.dspine_lattice(
+                &raw_rows,
+                &rms_rows,
+                &query_rows,
+                &self.codebook,
+                &self.pred_gate,
+                &self.prev_w,
+                &self.gate_bias,
+                &self.write_w[last],
+                out_norm,
+                &s1t,
+                &s2t,
+                &cand,
+                &anchor_code,
+                &lm_scratch,
+                &refined_out,
+                &scores,
+                &dbg_seg,
+                &msg,
+                rows,
+                self.h,
+                self.r,
+                self.c,
+            )?;
+            let t_launch = t0.elapsed();
+            if timing {
+                // Null-stream readback forces the whole queue to drain, so
+                // this brackets the lattice kernel's true device time.
+                let _ = gpu.download_f32(&scores)?;
+            }
+            let t_sync = t0.elapsed();
+            // Host walk: row 0's predecessor is the anchor (single code, all
+            // lanes equivalent); deeper rows condition on the previous row's
+            // chosen lane.
+            if diag {
+                // Debug-only readback: ~4.9 MB per window, never needed for
+                // the pick itself (the capture path dumps refined separately).
+                let refined_h = gpu.download_f32_stream_ordered(&refined_out)?;
+                if let Some(_w0) = refined_h.first() {
+                    let mx = refined_h.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                    eprintln!("[dspine-lattice] refined0 maxabs={:.4} first4={:?}", mx, &refined_h[..4]);
+                }
+            }
+            let scores_h = gpu.download_f32_stream_ordered(&scores)?;
+            let cand_h = gpu.download_f32_stream_ordered(&cand)?;
+            let t_dl = t0.elapsed();
             if hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_CAPTURE")
                 .as_deref()
                 == Ok("1")
             {
-                // Full-input snapshot for offline oracle replay: every
-                // serial_chain input downloaded with checked results, one
-                // directory per window. The offline python oracle replays
-                // the chain and compares picks bit-for-bit.
                 static CAP_SEQ: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
                 let seq = CAP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let dir = format!("/tmp/dspine_capture/win_{:05}", seq);
+                let dir = format!("{}/win_{:05}", cap_root, seq);
                 let _ = std::fs::create_dir_all(&dir);
-                let dl = |t: &GpuTensor, name: &str| -> Option<Vec<f32>> {
-                    match gpu.download_f32(t) {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            eprintln!("[dspine-capture] {} download failed: {}", name, e);
-                            None
-                        }
-                    }
-                };
-                let cand_d = dl(&cand, "cand");
-                let base_d = dl(&base, "base");
-                let out_d = dl(&out, "out");
-                let rms_d = dl(&rms_rows, "rms_rows");
-                let packed_d = dl(&packed_rows, "packed_rows");
-                let gb_d = dl(&self.gate_bias, "gate_bias");
-                let anchor_d = dl(&self.s_anchor, "anchor");
-                let mut snap = |name: &str, v: &Option<Vec<f32>>| {
-                    if let Some(v) = v {
+                cap_dir = Some(dir.clone());
+                for (name, t) in [
+                    ("raw", &raw_rows),
+                    ("rms", &rms_rows),
+                    ("query", &query_rows),
+                    ("cand", &cand),
+                    ("refined", &refined_out),
+                    ("anchor", &self.s_anchor),
+                    ("codes", &self.s_codes),
+                    ("scores", &scores),
+                    ("dbg", &dbg_seg),
+                ] {
+                    let v = gpu.download_f32(t);
+                    if let Ok(v) = v {
                         if let Ok(mut f) = std::fs::File::create(format!("{}/{}.bin", dir, name)) {
                             use std::io::Write as _;
                             let _ = f.write_all(unsafe {
@@ -533,70 +740,77 @@ impl DspineBridge {
                             });
                         }
                     }
-                };
-                snap("cand", &cand_d);
-                snap("base", &base_d);
-                snap("out", &out_d);
-                snap("rms", &rms_d);
-                snap("packed", &packed_d);
-                snap("gate_bias", &gb_d);
-                snap("anchor", &anchor_d);
-                if let (Some(c), Some(o), Some(a)) = (&cand_d, &out_d, &anchor_d) {
-                    let meta = serde_json::json!({
-                        "rows": rows,
-                        "vocab": self.cfg.trunk.vocab_size,
-                        "r": self.r,
-                        "t": self.t,
-                        "anchor_sid": a[0].to_bits(),
-                        "picks": o.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
-                        "argmax": c.chunks_exact(16).map(|c| c[0].to_bits()).collect::<Vec<u32>>(),
-                    });
-                    if let Ok(mut f) = std::fs::File::create(format!("{}/meta.json", dir)) {
-                        use std::io::Write as _;
-                        let _ = f.write_all(meta.to_string().as_bytes());
-                    }
+                }
+                if let Ok(mut f) = std::fs::File::create(format!("{}/meta.json", dir)) {
+                    use std::io::Write as _;
+                    let _ = f.write_all(
+                        serde_json::json!({
+                            "rows": rows, "h": self.h, "r": self.r, "c": self.c,
+                            "vocab": self.cfg.trunk.vocab_size,
+                            "anchor_lane": 0,
+                        })
+                        .to_string()
+                        .as_bytes(),
+                    );
                 }
             }
-            let picks: Vec<u32> = raw.iter().map(|f| f.to_bits()).collect();
-            if hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_DIAG").as_deref() == Ok("1") {
-                let base_raw = gpu.download_f32(&base)?;
-                let cand_raw = gpu.download_f32(&cand)?;
-                let top1: Vec<u32> = cand_raw.iter().map(|f| f.to_bits()).collect();
-                let agree = picks.iter().enumerate().filter(|(i, p)| **p == top1[i * 16]).count();
-                // Coverage: is the post-write argmax id even inside this
-                // row's pre-write top-16 shortlist? Below 100% caps the
-                // refinement's acceptance no matter how good the score is.
-                let covered = (0..rows)
-                    .filter(|&i| (0..16).any(|k| top1[i * 16 + k] == picks[i]))
-                    .count();
-                let top1_in_short = (0..rows)
-                    .filter(|&i| {
-                        let want = top1[i * 16];
-                        (0..16).any(|k| {
-                            cand_raw[i * 16 + k].to_bits() == want
-                        })
-                    })
-                    .count();
-                // Per-row hit bitmap against the post-write argmax: shows
-                // where the chain drifts (row 0 has no accumulated sid
-                // error; deep rows inherit every earlier miss).
-                let hits: String = (0..rows)
-                    .map(|i| {
-                        if picks[i] == top1[i * 16] { '1' } else { '0' }
-                    })
-                    .collect();
-                eprintln!("[dspine-serial] rows={} agree={} covered={} top1_in_short={}/{} hits={} picks0..8={:?} top1-0..8={:?} base00={:.3}",
-                    rows, agree, covered, top1_in_short, rows, hits,
-                    &picks[..rows.min(8)],
-                    &top1[..rows.min(8)],
-                    base_raw.first().copied().unwrap_or(0.0));
+            if diag {
+                if let Some(_w0) = scores_h.first() {
+                    let mx = scores_h.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                    eprintln!(
+                        "[dspine-lattice] rows={} scores maxabs={:.3} first8={:?}",
+                        rows,
+                        mx,
+                        &scores_h[..8.min(scores_h.len())]
+                    );
+                }
             }
-            Ok(picks)
+            let mut picks_v: Vec<u32> = Vec::with_capacity(rows);
+            let mut lane_prev = 0usize;
+            for r in 0..rows {
+                let mut best_c = 0usize;
+                let mut best_s = f32::NEG_INFINITY;
+                for c in 0..16 {
+                    let sc = scores_h[(r * 16 + c) * 16 + lane_prev];
+                    if sc > best_s {
+                        best_s = sc;
+                        best_c = c;
+                    }
+                }
+                picks_v.push(cand_h[r * 16 + best_c].to_bits());
+                lane_prev = best_c;
+            }
+            self.lattice_scratch.replace(Some(LatticeScratch {
+                rows, lm: lm_scratch, refined: refined_out, scores, dbg: dbg_seg, s1t, s2t,
+                msg,
+            }));
+            if let Some(dir) = &cap_dir {
+                if let Ok(mut f) = std::fs::File::create(format!("{}/picks.bin", dir)) {
+                    use std::io::Write as _;
+                    let mut bytes = Vec::with_capacity(picks_v.len() * 4);
+                    for id in &picks_v {
+                        bytes.extend_from_slice(&id.to_le_bytes());
+                    }
+                    let _ = f.write_all(&bytes);
+                }
+            }
+            if timing {
+                let t_walk = t0.elapsed();
+                eprintln!(
+                    "[dspine-lattice-timing] rows={} topk={:.3}ms launch={:.3}ms sync={:.3}ms dl={:.3}ms walk={:.3}ms",
+                    rows,
+                    t_topk.as_secs_f64() * 1e3,
+                    (t_launch - t_topk).as_secs_f64() * 1e3,
+                    (t_sync - t_launch).as_secs_f64() * 1e3,
+                    (t_dl - t_sync).as_secs_f64() * 1e3,
+                    (t_walk - t_dl).as_secs_f64() * 1e3,
+                );
+            }
+            return Ok(picks_v);
         })();
         let _ = gpu.free_tensor(cand);
         let _ = gpu.free_tensor(base);
-        let _ = gpu.free_tensor(out);
-        pick
+        return pick;
     }
 
     /// The prebuilt sender tables, when the sidecar carried them.
@@ -613,6 +827,8 @@ impl DspineBridge {
             early_w,
             write_w,
             packed_w,
+            pred_gate,
+            prev_w,
             gate_bias,
             serial,
             s_normed,
@@ -624,6 +840,7 @@ impl DspineBridge {
             s_rms,
             s_x_pre,
             s_anchor,
+            lattice_scratch,
             ..
         } = self;
         let _ = gpu.free_tensor(codebook);
@@ -635,11 +852,22 @@ impl DspineBridge {
             let _ = gpu.free_tensor(t);
         }
         let _ = gpu.free_tensor(packed_w);
+        let _ = gpu.free_tensor(pred_gate);
+        let _ = gpu.free_tensor(prev_w);
         let _ = gpu.free_tensor(gate_bias);
         if let Some(tables) = serial {
             let _ = gpu.free_tensor(tables.tg);
             let _ = gpu.free_tensor(tables.tsv_gate);
             let _ = gpu.free_tensor(tables.tsv_val);
+        }
+        if let Some(sc) = lattice_scratch.into_inner() {
+            let _ = gpu.free_tensor(sc.lm);
+            let _ = gpu.free_tensor(sc.refined);
+            let _ = gpu.free_tensor(sc.scores);
+            let _ = gpu.free_tensor(sc.dbg);
+            let _ = gpu.free_tensor(sc.msg);
+            let _ = gpu.free_tensor(sc.s1t);
+            let _ = gpu.free_tensor(sc.s2t);
         }
         for t in [s_normed, s_projected, s_codes, s_packed, s_message, s_delta, s_rms, s_anchor, s_x_pre] {
             let _ = gpu.free_tensor(t);
@@ -649,6 +877,7 @@ impl DspineBridge {
     /// Feed the block's first real token id (the code anchor) before each
     /// bridged forward. The speculator driver owns the token.
     pub fn set_anchor(&mut self, gpu: &mut Gpu, anchor: u32) -> Result<(), String> {
+        self.anchor_id = anchor;
         let bytes = anchor.to_le_bytes();
         gpu.upload_raw(&bytes, &[1])
             .map(|t| {

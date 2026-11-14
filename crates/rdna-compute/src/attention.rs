@@ -19076,9 +19076,77 @@ impl Gpu {
     /// Grid: [n_heads, B, 1], block: next_pow2(max(L, head_dim)).min(256)
     /// LDS: (tile_size + block_size + head_dim) * 4 bytes, same 56 KB
     /// budget as `attention_dflash_f32`.
+    /// DFlash2 draft contract: bidirectional inside the block, windowed
+    /// against the context. See [`Self::attention_dflash_sliding_dispatch`].
     #[allow(clippy::too_many_arguments)]
     pub fn attention_dflash_sliding_f32(
         &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        b: usize,
+        l: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        ctx_span: usize,
+        sliding_window: usize,
+    ) -> HipResult<()> {
+        self.attention_dflash_sliding_dispatch(
+            "attention_dflash_sliding_f32",
+            q,
+            k,
+            v,
+            out,
+            b,
+            l,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ctx_span,
+            sliding_window,
+        )
+    }
+
+    /// DSpine draft contract (`draft_block_causal`): every context key in the
+    /// trailing window stays visible, block keys are past-only. Same layout,
+    /// grid and LDS budget as [`Self::attention_dflash_sliding_f32`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_dflash_sliding_causal_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        b: usize,
+        l: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        ctx_span: usize,
+        sliding_window: usize,
+    ) -> HipResult<()> {
+        self.attention_dflash_sliding_dispatch(
+            "attention_dflash_sliding_causal_f32",
+            q,
+            k,
+            v,
+            out,
+            b,
+            l,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ctx_span,
+            sliding_window,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_dflash_sliding_dispatch(
+        &mut self,
+        symbol: &str,
         q: &GpuTensor,
         k: &GpuTensor,
         v: &GpuTensor,
@@ -19142,7 +19210,7 @@ impl Gpu {
         self.ensure_kernel(
             "attention_dflash_sliding_f32",
             kernels::ATTENTION_DFLASH_SLIDING_SRC,
-            "attention_dflash_sliding_f32",
+            symbol,
         )?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         // Same LDS budget and tiling as attention_dflash_f32.
@@ -19182,7 +19250,7 @@ impl Gpu {
             &sw as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            "attention_dflash_sliding_f32",
+            symbol,
             [n_heads as u32, b as u32, 1],
             [block_size, 1, 1],
             shared_mem,

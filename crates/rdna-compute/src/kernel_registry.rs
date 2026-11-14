@@ -1284,7 +1284,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "attention_dflash_sliding_f32",
             kernels::ATTENTION_DFLASH_SLIDING_SRC,
-            ["attention_dflash_sliding_f32"]
+            [
+                "attention_dflash_sliding_f32",
+                "attention_dflash_sliding_causal_f32"
+            ]
         );
         add!(
             "deinterleave_batched",

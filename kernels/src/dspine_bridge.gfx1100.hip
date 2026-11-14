@@ -44,6 +44,34 @@ __device__ static inline float dspine_bf16_to_f32_bits(unsigned short bits) {
     return cvt.f;
 }
 
+// fp16 (IEEE half) bits -> f32, type-free: the gfx1100 HIP headers on target
+// hosts do not expose __ushort_as_half/__half2float reliably (7.x vs 10.x
+// header split), so the mq4v2 scale/zero decode goes through the bit layout.
+__device__ static inline float dspine_fp16_bits_to_f32(unsigned short h) {
+    union { unsigned int u; float f; } cvt;
+    const unsigned int sign = (unsigned int)(h & 0x8000u) << 16;
+    const unsigned int exp10 = (unsigned int)((h >> 10) & 0x1Fu);
+    const unsigned int man = (unsigned int)(h & 0x03FFu);
+    if (exp10 == 31u) {
+        cvt.u = sign | 0x7F800000u | (man << 13);
+        return cvt.f;
+    }
+    if (exp10 == 0u) {
+        if (man == 0u) {
+            cvt.u = sign;
+            return cvt.f;
+        }
+        // subnormal: man * 2^-24 (exact in f32)
+        cvt.u = 0x3B800000u; // 2^-24
+        float v = (float)man * cvt.f;
+        union { unsigned int u; float f; } sv;
+        sv.u = sign;
+        return copysignf(v, sv.f);
+    }
+    cvt.u = sign | ((exp10 - 15u + 127u) << 23) | (man << 13);
+    return cvt.f;
+}
+
 // ── prepare_read: rms stats + normalized rows ────────────────────────────
 // Grid: [m, 1, 1]. Block: [256]. x: [m, H] f32 (trunk block rows);
 // rms: [m] f32; normed: [m, H] f32 (x / rms).
@@ -411,4 +439,258 @@ extern "C" __global__ void dspine_gather16_gfx1100(
     if (idx >= total) return;
     const int row = idx / 16;
     out[idx] = src[(long long)row * V + cand[idx]];
+}
+
+// ── DSpine refinement lattice (upstream build_dspine_lattice semantics) ──
+// Three stages, all independent across (row, predecessor) pairs so the GPU
+// stays busy: message (this kernel), delta = write_last @ msg (one F32 GEMM
+// over every pair at once, launched from `rdna_compute::dspine_bridge`), and
+// the head score (the next kernel). Arithmetic per pair is unchanged from the
+// single-kernel per-row walk.
+extern "C" __global__ void dspine_lattice_msg_gfx1100(
+    const float* __restrict__ query,      // [rows, 3R] packed (q = [0..R])
+    const unsigned short* __restrict__ codebook, // [V, C] bf16 raw
+    const float* __restrict__ pred_gate,  // [R, C]
+    const float* __restrict__ prev_w,     // [R, C]
+    const float* __restrict__ gate_bias,  // [R]
+    const unsigned int* __restrict__ prev_cand, // [rows, 16] row r-1 candidates (row 0 unused)
+    const float* __restrict__ anchor_code, // [C] sqrt(C)-scaled anchor row
+    const float* __restrict__ write_last, // [H, R] (dbg slab only)
+    float* __restrict__ msg_out,          // [rows*16, R]
+    float* __restrict__ dbg_seg,          // [11776] row0 pred0: codes | msg | x | normed | write_last[0..R]
+    int R, int C, int rows)
+{
+    const int block = blockIdx.x;
+    const int row = block / 16;
+    const int pred = block % 16;
+    if (row >= rows) return;
+    const int tid = threadIdx.x;
+
+    __shared__ float s_codes[1024];   // C cap
+    if (C > 1024) return;
+
+    const float* q_row = query + (long long)row * 3 * R;
+    if (row == 0) {
+        for (int j = tid; j < C; j += blockDim.x) s_codes[j] = anchor_code[j];
+    } else {
+        const unsigned int pid = prev_cand[(long long)(row - 1) * 16 + pred];
+        const unsigned short* cb = codebook + (long long)pid * C;
+        for (int j = tid; j < C; j += blockDim.x) {
+            s_codes[j] = dspine_bf16_to_f32_bits(cb[j]) * sqrtf((float)C);
+        }
+    }
+    __syncthreads();
+
+    float* mrow = msg_out + (long long)block * R;
+    for (int t = tid; t < R; t += blockDim.x) {
+        const float* pg = pred_gate + (long long)t * C;
+        const float* pv_ = prev_w + (long long)t * C;
+        float pr = 0.0f, pvv = 0.0f;
+        for (int j = 0; j < C; ++j) {
+            pr += pg[j] * s_codes[j];
+            pvv += pv_[j] * s_codes[j];
+        }
+        const float qt = q_row[t] + gate_bias[t];
+        mrow[t] = (1.0f / (1.0f + expf(-(qt + pr)))) * pvv;
+    }
+    __syncthreads();
+
+    if (dbg_seg && block == 0) {
+        for (int j = tid; j < C; j += blockDim.x) dbg_seg[j] = s_codes[j];
+        for (int t = tid; t < R; t += blockDim.x) dbg_seg[C + t] = mrow[t];
+        for (int t = tid; t < R; t += blockDim.x) dbg_seg[1024 + 512 + 2 * 5120 + t] = write_last[t];
+    }
+}
+
+// Head score for one (draft row, predecessor): fold the GEMM's delta into the
+// write state, rmsnorm, apply the draft head norm, FWHT-rotate, then score
+// every candidate against its decoded mq4v2 head row. Grid: [rows * 16].
+extern "C" __global__ void dspine_lattice_score_gfx1100(
+    const float* __restrict__ raw,        // [rows, H] pre-write hidden rows
+    const float* __restrict__ rms,        // [rows]
+    const float* __restrict__ delta,      // [rows*16, H] = write_last @ msg (GEMM)
+    const float* __restrict__ out_norm,   // [H]
+    const float* __restrict__ mq_signs1,  // [256] FWHT sign table (seed 42)
+    const float* __restrict__ mq_signs2,  // [256] FWHT sign table (seed 1042)
+    const float* __restrict__ lm_row_scratch, // [rows, 16, H] decoded head rows
+    float* __restrict__ refined_out,      // [rows, 16, H] normed refined (debug)
+    float* __restrict__ scores,           // [rows, 16, 16] f32
+    float* __restrict__ dbg_seg,          // [11776] row0 pred0 slab (x at dbg_off, normed at dbg_off+H)
+    int H, int rows, int dbg_off)
+{
+    const int block = blockIdx.x;
+    const int row = block / 16;
+    const int pred = block % 16;
+    if (row >= rows) return;
+    const int tid = threadIdx.x;
+
+    __shared__ float s_refined[5120]; // H cap: 27B draft hidden
+    __shared__ float s_part[16][16];
+    __shared__ float s_red[256];
+    if (H > 5120) return;
+
+    const float* raw_row = raw + (long long)row * H;
+    const float* d_row = delta + (long long)block * H;
+    const float rms_r = rms[row];
+
+    // C. pre-norm write state for this predecessor.
+    for (int h = tid; h < H; h += blockDim.x) {
+        s_refined[h] = raw_row[h] + rms_r * d_row[h];
+    }
+    __syncthreads();
+
+    if (dbg_seg && block == 0) {
+        for (int h = tid; h < H; h += blockDim.x) dbg_seg[dbg_off + h] = s_refined[h];
+    }
+    __syncthreads();
+
+    // D. rmsnorm, head norm, FWHT rotation, score column `pred`.
+    float ss = 0.0f;
+    for (int h = tid; h < H; h += blockDim.x) ss += s_refined[h] * s_refined[h];
+    s_red[tid] = ss;
+    __syncthreads();
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (int i = 0; i < 256; ++i) tot += s_red[i];
+        s_red[0] = 1.0f / sqrtf(tot / (float)H + 1e-6f);
+    }
+    __syncthreads();
+    const float inv = s_red[0];
+    for (int h = tid; h < H; h += blockDim.x) {
+        const float nv = s_refined[h] * inv * out_norm[h];
+        s_refined[h] = nv;
+        refined_out[((long long)row * 16 + pred) * H + h] = nv;
+        if (dbg_seg && block == 0) dbg_seg[dbg_off + H + h] = nv;
+    }
+    __syncthreads();
+    // FWHT-forward rotate refined in place (H/256 groups x 256): the mq4v2
+    // head rows encode FWHT(W), so the score consumes rotate(refined) —
+    // signs1 -> butterfly -> 0.0625*signs2.
+    for (int g = 0; g < H / 256; ++g) {
+        float* grp = s_refined + g * 256;
+        for (int i = tid; i < 256; i += blockDim.x) grp[i] *= mq_signs1[i];
+        __syncthreads();
+        for (int stride = 1; stride < 256; stride <<= 1) {
+            const int i = tid;
+            if ((i & stride) == 0) {
+                const float a = grp[i];
+                const float b = grp[i | stride];
+                grp[i] = a + b;
+                grp[i | stride] = a - b;
+            }
+            __syncthreads();
+        }
+        for (int i = tid; i < 256; i += blockDim.x) grp[i] *= 0.0625f * mq_signs2[i];
+        __syncthreads();
+    }
+    {
+        const int c = tid / 16;
+        const int lane = tid % 16;
+        const float* hr = lm_row_scratch + ((long long)row * 16 + c) * H;
+        float acc = 0.0f;
+        for (int h = lane; h < H; h += 16) acc += hr[h] * s_refined[h];
+        s_part[c][lane] = acc;
+    }
+    __syncthreads();
+    if (tid < 16) {
+        float sc = 0.0f;
+        for (int l = 0; l < 16; ++l) sc += s_part[tid][l];
+        scores[((long long)row * 16 + tid) * 16 + pred] = sc;
+    }
+}
+
+// Decode one mq4v2 head row (256-element groups of 136 B: 8 B fp16
+// scale/zero pair + 128 B nibbles; lo nibble -> even index, hi -> odd) into
+// , cooperatively over  lanes.
+__device__ static inline void dspine_decode_mq4v2_row(
+    const unsigned char* row, int H, int R, float* out, int lane, int nlanes)
+{
+    const int groups = (H + 255) / 256;
+    for (int g = lane; g < groups; g += nlanes) {
+        const int off = g * 136;
+        const float s0 = dspine_fp16_bits_to_f32((unsigned short)(row[off] | (row[off+1] << 8)));
+        const float z0 = dspine_fp16_bits_to_f32((unsigned short)(row[off+2] | (row[off+3] << 8)));
+        const float s1 = dspine_fp16_bits_to_f32((unsigned short)(row[off+4] | (row[off+5] << 8)));
+        const float z1 = dspine_fp16_bits_to_f32((unsigned short)(row[off+6] | (row[off+7] << 8)));
+        const int base = g * 256;
+        for (int i = 0; i < 128; ++i) {
+            const unsigned char byte = row[off + 8 + i];
+            if (base + 2*i < H)     out[base + 2*i] = z0 + (byte & 0xF) * s0;
+            if (base + 2*i + 1 < H) out[base + 2*i + 1] = z1 + (byte >> 4) * s1;
+        }
+    }
+}
+
+// Head rows: decode each draft row's 16 candidate mq4v2 head rows once into
+// the per-row slab the score stage reads. Grid: [rows]. Block: [256].
+extern "C" __global__ void dspine_lattice_head_rows_gfx1100(
+    const unsigned int* __restrict__ cand,      // [rows, 16] post-write top-k ids
+    const unsigned char* __restrict__ lm_head,  // mq4v2 rows, row_bytes stride
+    float* __restrict__ lm_rows,                // [rows, 16, H] decoded head rows
+    int H, int R, int rows, int row_bytes)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int tid = threadIdx.x;
+    const int c = tid / 16;
+    const int lane = tid % 16;
+    const unsigned int cid = cand[(long long)row * 16 + c];
+    dspine_decode_mq4v2_row(lm_head + (long long)cid * row_bytes, H, R,
+                            lm_rows + ((long long)row * 16 + c) * H, lane, 16);
+}
+
+// base_pre[row][c] = (raw_row * out_norm) . lm_head[cand[row][c]] — the
+// serial_table score's sender-free term, evaluated against the decoded
+// (FWHT-rotated) candidate head rows already in `lm_rows`.
+extern "C" __global__ void dspine_lattice_base_pre_gfx1100(
+    const float* __restrict__ raw,        // [rows, H] pre-write hidden rows
+    const float* __restrict__ out_norm,   // [H]
+    const float* __restrict__ lm_rows,    // [rows, 16, H] decoded head rows
+    const float* __restrict__ mq_signs1,  // [256] FWHT sign table (seed 42)
+    const float* __restrict__ mq_signs2,  // [256] FWHT sign table (seed 1042)
+    float* __restrict__ base_pre,         // [rows, 16]
+    int H, int rows)
+{
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int tid = threadIdx.x;
+    __shared__ float s_x[5120]; // H cap: 27B draft hidden
+    __shared__ float s_part[16][16];
+    if (H > 5120) return;
+
+    const float* raw_row = raw + (long long)row * H;
+    for (int h = tid; h < H; h += blockDim.x) s_x[h] = raw_row[h] * out_norm[h];
+    __syncthreads();
+    // Same orthogonal FWHT rotation the score stage applies to the refined
+    // vector: the head rows encode rotate(W), so dotting them with rotate(x)
+    // reproduces W . x exactly (rotate is orthogonal).
+    for (int g = 0; g < H / 256; ++g) {
+        float* grp = s_x + g * 256;
+        for (int i = tid; i < 256; i += blockDim.x) grp[i] *= mq_signs1[i];
+        __syncthreads();
+        for (int stride = 1; stride < 256; stride <<= 1) {
+            const int i = tid;
+            if ((i & stride) == 0) {
+                const float a = grp[i];
+                const float b = grp[i | stride];
+                grp[i] = a + b;
+                grp[i | stride] = a - b;
+            }
+            __syncthreads();
+        }
+        for (int i = tid; i < 256; i += blockDim.x) grp[i] *= 0.0625f * mq_signs2[i];
+        __syncthreads();
+    }
+    const int c = tid / 16;
+    const int lane = tid % 16;
+    const float* hr = lm_rows + ((long long)row * 16 + c) * H;
+    float acc = 0.0f;
+    for (int h = lane; h < H; h += 16) acc += hr[h] * s_x[h];
+    s_part[c][lane] = acc;
+    __syncthreads();
+    if (tid < 16) {
+        float sc = 0.0f;
+        for (int l = 0; l < 16; ++l) sc += s_part[tid][l];
+        base_pre[(long long)row * 16 + tid] = sc;
+    }
 }
