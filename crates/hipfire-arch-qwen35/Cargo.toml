@@ -31,6 +31,10 @@ sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The qwen3.8-27b NPU trunk relay (`npu_trunk::NpuTrunk`).
+railgun = { path = "../railgun", features = ["npu"] }
+
 [build-dependencies]
 # build.rs: shared-weight loader ABI identity (hashes the loader closure).
 sha2.workspace = true

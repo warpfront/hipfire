@@ -2,10 +2,9 @@
 //! Weight preparation, program selection and thin GPU glue for the opt-in
 //! Flash-Next NPU trunk. References live in peacemaker-npu; no device opens here.
 
-pub(crate) use calibration::runtime_key_with_firmware;
 #[cfg(target_os = "linux")]
 pub use calibration::{bounded_memlock_bytes, trunk_pin_bytes};
-pub use calibration::{host_facts, npu_firmware, HostFacts};
+pub use calibration::{host_facts, HostFacts};
 #[cfg(target_os = "linux")]
 pub(crate) use calibration::{TRUNK_BANKS, TRUNK_ROWS_MAX};
 #[cfg(target_os = "linux")]
@@ -22,10 +21,7 @@ mod shapes;
 pub(crate) use packing::pack_matrix_direct;
 pub(crate) use programs::build_rowmajor_programs_for_families;
 
-pub use calibration::{
-    builtin_record, load_calibration, model_index_identity, model_trunk_index_sha256,
-    runtime_calibration_key,
-};
+pub use calibration::{builtin_record, load_calibration, model_index_identity};
 pub use config::{arch_admits_auto, NPU_TRUNK_DAEMON_KEY, NPU_TRUNK_ENV, SWITCH};
 pub use packing::{
     pack_matrix, pack_out, pack_out_layers, pack_shape, pack_shape_with_contract, pack_trunk,
