@@ -52,7 +52,7 @@ keys. Residual experiments use a flat global-only namespace:
 ```toml
 [developer]
 gfx1151_gate_up_wave64 = true
-deepseek4_attn = "twin"
+moe_iu4_wide_tiles = false
 ```
 
 The generic compatibility rule is `HIPFIRE_FOO=value` →
