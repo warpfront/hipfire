@@ -88,8 +88,7 @@ fn host_exec_mode() -> HostExecMode {
 /// `memory.offload_exec` executes some or all of a spilled step host-side
 /// (`cpu` or `passback`), so the CPU multiplies its weights
 /// ([`passback_enabled`] distinguishes the split form). Every host-exec
-/// mechanism in this module keys on this predicate, so both modes are covered
-/// without renaming a call site.
+/// mechanism in this module keys on this predicate, so both modes are covered.
 pub fn cpu_exec_enabled() -> bool {
     host_exec_mode() != HostExecMode::Pcie
 }
@@ -98,22 +97,6 @@ pub fn cpu_exec_enabled() -> bool {
 /// of its output rows back to the GPU ([`crate::offload_split`]).
 pub fn passback_enabled() -> bool {
     host_exec_mode() == HostExecMode::Passback
-}
-
-/// Whether the CPU expert splice is armed: `memory.offload_exec=cpu` (or
-/// `passback`, which splits only dense steps and runs routed experts on this
-/// splice) and the `HIPFIRE_MOE_CPU_EXPERTS=0` kill-switch unset. This is the *model-level*
-/// decision; the loader additionally requires a host-placed packed layer with no
-/// AWQ sidecar, and records the armed sink on the layer weights.
-pub fn moe_cpu_experts_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        cpu_exec_enabled()
-            && hipfire_config::developer_var("HIPFIRE_MOE_CPU_EXPERTS")
-                .ok()
-                .as_deref()
-                != Some("0")
-    });
-    *ENABLED
 }
 
 /// The splice pool configuration. Knobs (both developer vars, read once when

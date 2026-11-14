@@ -1457,7 +1457,7 @@ mod tests {
     /// plus `slots / (36 * rows)` Q8 state sets of 27.84 MiB, where `slots` is the
     /// state's ring slots across its 36 layers: `2 * 35 + rows + 1` in the shared
     /// pool (default), `36 * (rows + 1)` per-layer with
-    /// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM=0`, `72 * rows` with the compact kill switch.
+    /// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM=0`.
     #[test]
     fn capture_ring_scale_matches_the_design_check() {
         use crate::state::{capture_ring_slots, current_capture_ring_total_slots};
@@ -1466,7 +1466,7 @@ mod tests {
         assert_eq!(gdn_layers, 36);
         let set_mib = (gdn_layers * 811_008) as f64 / (1u64 << 20) as f64;
         for rows in [2usize, 4, 8] {
-            assert_eq!(capture_ring_slots(false, rows), Some(2 * rows));
+            assert_eq!(capture_ring_slots(rows), Some(rows + 1));
             let slots = current_capture_ring_total_slots(rows, gdn_layers).unwrap();
             let bytes =
                 Qwen4State::row_capture_bytes_scoped(&config, GdnStateFormat::Q8, rows, gdn_layers)
@@ -1497,13 +1497,13 @@ mod tests {
         let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
             + vh * config.linear_value_head_dim;
         for gdn in FORMATS {
-            let layout = |compact: bool, trim: bool| {
+            let layout = |trim: bool| {
                 Qwen4State::row_capture_allocation_sizes_layout(
-                    &config, gdn, rows, gdn_layers, compact, trim,
+                    &config, gdn, rows, gdn_layers, trim,
                 )
                 .unwrap()
             };
-            let (before, after) = (layout(true, false), layout(true, true));
+            let (before, after) = (layout(false), layout(true));
             let slot = gdn.storage().state_bytes(vh, 128, 128) as u64;
             let inputs = (rows * qkv * 4) as u64;
             let recurrence = (rows * (qkv + 2 * vh) * 4) as u64;
@@ -1542,9 +1542,7 @@ mod tests {
                 .flat_map(|layer| {
                     [0usize, rows].into_iter().flat_map(move |base| {
                         (1..=rows).map(move |n| {
-                            CAPTURE_POOL_STRIDE * layer
-                                + capture_view_start(true, rows, base, n)
-                                + n
+                            CAPTURE_POOL_STRIDE * layer + capture_view_start(rows, base, n) + n
                         })
                     })
                 })
@@ -1557,7 +1555,7 @@ mod tests {
             let mut touched = std::collections::HashSet::new();
             for layer in 0..gdn_layers {
                 for logical in [0usize, rows] {
-                    let slot = CAPTURE_POOL_STRIDE * layer + capture_ring_slot(true, rows, logical);
+                    let slot = CAPTURE_POOL_STRIDE * layer + capture_ring_slot(rows, logical);
                     assert!(
                         touched.insert(slot),
                         "layer {layer} target {slot} is shared"
@@ -1605,7 +1603,7 @@ mod tests {
             .unwrap();
         let total_with = |trim: bool| {
             let ring = sum(&Qwen4State::row_capture_allocation_sizes_layout(
-                &config, gdn, rows, gdn_layers, true, trim,
+                &config, gdn, rows, gdn_layers, trim,
             )
             .unwrap());
             census.total().unwrap() - ring_line.bytes().unwrap() + lanes as u64 * ring
@@ -1656,7 +1654,7 @@ mod tests {
             let wide = (config.hc_count * config.hidden_size * 4) as u64;
             let layout = |trim: bool| {
                 Qwen4State::row_capture_allocation_sizes_layout(
-                    &config, gdn, rows, gdn_layers, true, trim,
+                    &config, gdn, rows, gdn_layers, trim,
                 )
                 .unwrap()
             };

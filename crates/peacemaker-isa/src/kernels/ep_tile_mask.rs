@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Builder-emitted (PeaceMaker) gfx1100 / gfx1201 tile-ownership mask of the Flash-Next
-//! owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`):
+//! owner-routed chunk MoE:
 //! `ep_tile_mask_pm_<arch>`. One integer compare/select over the padded tile
 //! capacity, writing a COPY of the grouped-GEMM tile ids in which every tile of
 //! an expert this rank does not own is the sentinel `-1` (the symmetric IU4

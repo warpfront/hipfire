@@ -15,7 +15,8 @@
 use crate::gpu_forward::{Qwen4ForwardScratchMode, QWEN4_DECODE_SHARE_RESIDENT_ROWS};
 
 /// Developer knob selecting the decode-share mode (`off` | `bind` | later
-/// `bank` | `fixed` | `on`). Unset or any unrecognised value is `off`.
+/// `bank` | `fixed` | `on`). Unset or `auto` selects [`DECODE_SHARE_DEFAULT`];
+/// any unrecognised value is `off`.
 pub const DECODE_SHARE_ENV: &str = "HIPFIRE_QWEN4_DECODE_SHARE";
 
 /// Developer knob: `1` verifies the donor tail against its mirror right after
@@ -31,14 +32,6 @@ pub const DECODE_SHARE_SYNC_ENV: &str = "HIPFIRE_QWEN4_DECODE_SHARE_SYNC";
 /// Developer knob: `1` logs one line per borrow epoch (tiles, class span,
 /// zeroed and restored bytes, host wait).
 pub const DECODE_SHARE_LOG_ENV: &str = "HIPFIRE_QWEN4_DECODE_SHARE_LOG";
-
-/// Developer knob (default on; exactly `0` keeps the shadows resident):
-/// whether an admitted `on` / `fixed` gfx1201 load keeps the BF16 -> F16
-/// weight shadows and the shared-expert INT8 shadows in the donor tail
-/// (rebuilt at the first acquire of every borrow epoch) instead of resident
-/// VRAM. Both shadows are read only by prefill tiles of at least 512 rows,
-/// which on a decode-share load are always borrowed tiles.
-pub const DECODE_SHARE_SHADOWS_ENV: &str = "HIPFIRE_QWEN4_DECODE_SHARE_SHADOWS";
 
 /// The mode an unset (or `auto`) [`DECODE_SHARE_ENV`] selects. The product
 /// default: an admitted load (exact gfx1201, single device, ranked hot set,
@@ -127,12 +120,11 @@ impl DecodeShareMode {
     }
 
     /// Whether this load keeps the weight shadows in the donor tail: a mode
-    /// with a real donor loan (`fixed`, `on`: [`Self::uses_donor_backing`]),
-    /// exact gfx1201 (the only device whose F16 WMMA and INT8 shared-expert
-    /// routes read the shadows only in prefill tiles of at least 512 rows) and
-    /// [`DECODE_SHARE_SHADOWS_ENV`] not `0` (`knob`).
-    pub fn borrows_shadows(self, arch: &str, knob: bool) -> bool {
-        knob && arch == "gfx1201" && self.uses_donor_backing()
+    /// with a real donor loan (`fixed`, `on`: [`Self::uses_donor_backing`])
+    /// on exact gfx1201, the only device whose F16 WMMA and INT8 shared-expert
+    /// routes read the shadows only in prefill tiles of at least 512 rows.
+    pub fn borrows_shadows(self, arch: &str) -> bool {
+        arch == "gfx1201" && self.uses_donor_backing()
     }
 }
 
@@ -149,11 +141,6 @@ pub fn decode_share_sync_enabled() -> bool {
 /// [`DECODE_SHARE_LOG_ENV`] from the process snapshot: exactly `1`.
 pub fn decode_share_log_enabled() -> bool {
     hipfire_config::developer_bool(DECODE_SHARE_LOG_ENV, false)
-}
-
-/// [`DECODE_SHARE_SHADOWS_ENV`] from the process snapshot: on unless exactly `0`.
-pub fn decode_share_shadows_enabled() -> bool {
-    hipfire_config::developer_bool(DECODE_SHARE_SHADOWS_ENV, true)
 }
 
 /// What the loader knows about a load when it decides decode-share.

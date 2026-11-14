@@ -37,34 +37,6 @@ use std::fmt;
 /// load); unset or any other value is the default route.
 pub const EP_RESERVE_DECOUPLE_ENV: &str = "HIPFIRE_EP_RESERVE_DECOUPLE";
 
-/// Switch (default ON, exact `0` is the kill switch): a native-MTP EP lane
-/// store (`--spec mtp`, the mixed store) loads on the decoupled-reserve
-/// (route B) placement together with the AR lanes' placement. Off (`0`) the
-/// loader skips decoupling for a load that stages spec lanes (ordinary
-/// placement and reserve, the pre-share sizing) and the EP lane staging
-/// refuses a spec store on a reserve-sharing load (the daemon then stages AR
-/// lanes). Developer variable; read through the process configuration.
-pub const EP_MTP_RESERVE_SHARE_ENV: &str = "HIPFIRE_EP_MTP_RESERVE_SHARE";
-
-/// [`EP_MTP_RESERVE_SHARE_ENV`] (unset or `1` on; exact `0` off).
-pub fn ep_mtp_reserve_share_enabled() -> bool {
-    hipfire_config::developer_bool(EP_MTP_RESERVE_SHARE_ENV, true)
-}
-
-/// Whether a spec lane store keeps the decoupled reserve off a load (the
-/// load-time half): `Some(reason)` when MTP lanes will be staged
-/// (`spec_k` set and at least one MTP slot of `lanes`) and the kill switch
-/// (`HIPFIRE_EP_MTP_RESERVE_SHARE=0`) turned the sharing off.
-pub fn spec_store_blocks_reserve(
-    spec_k: Option<usize>,
-    spec_slots: usize,
-    share_enabled: bool,
-) -> Option<&'static str> {
-    (spec_k.is_some() && spec_slots > 0 && !share_enabled).then_some(
-        "native-MTP EP lanes are staged (`--spec mtp`) and HIPFIRE_EP_MTP_RESERVE_SHARE=0 keeps them off the decoupled reserve (it admits AR lanes only then); pass no `--spec mtp` (or HIPFIRE_EP_MTP_LANES=0) for 32-layer AR lanes, or unset HIPFIRE_EP_MTP_RESERVE_SHARE to run MTP lanes on it",
-    )
-}
-
 /// The stage-time half: whether a spec lane store (`row_budget` decode rows
 /// per step) may be staged on a reserve-sharing load whose resident bank holds
 /// `resident_rows`. Lane decode steps and every mesh verify window run on the
@@ -72,21 +44,11 @@ pub fn spec_store_blocks_reserve(
 /// instead of at the first step.
 pub fn spec_store_reserve_verdict(
     reserve_active: bool,
-    share_enabled: bool,
     row_budget: usize,
     resident_rows: Option<usize>,
 ) -> Result<(), String> {
     if !reserve_active {
         return Ok(());
-    }
-    if !share_enabled {
-        return Err(
-            "native-MTP lanes are refused on an EP reserve-sharing load while \
-             HIPFIRE_EP_MTP_RESERVE_SHARE=0 (AR lanes are admitted; load without \
-             `--spec mtp`, set HIPFIRE_EP_MTP_LANES=0, or unset \
-             HIPFIRE_EP_MTP_RESERVE_SHARE)"
-                .to_string(),
-        );
     }
     match resident_rows {
         Some(rows) if row_budget <= rows => Ok(()),
@@ -222,15 +184,11 @@ pub struct EpReserveFacts<'a> {
     pub explicit_chunk_override: bool,
     /// Whole-layer placement (no hot-set tier, slab or aggregate tier).
     pub whole_layer_placement: bool,
-    /// Owner-routed S1 prefill requested/admitted for the load.
-    pub owner_routed_s1: bool,
     /// Stage (S2) minimum rows; `None` when S2 is off. Must exceed the
     /// resident bank so every call that can stage uses the borrowed bank.
     pub s2_min_rows: Option<usize>,
     /// Retained-body / capture replay requested.
     pub capture: bool,
-    /// Invariant-prefill or routing overrides that can produce a wide Full-table call.
-    pub routing_override: bool,
     pub pipeline_parallel: bool,
     pub expert_tier: bool,
     pub expert_slab: bool,
@@ -241,7 +199,7 @@ pub struct EpReserveFacts<'a> {
 
 /// Pure phase-one admission. `Ok` only for discrete gfx1201 EP2, pinned
 /// Flash-Next QT44/QT53, `Full` scratch, a 4096-row prompt chunk, whole-layer
-/// placement and ordinary routing; AR and native MTP are both in scope.
+/// placement; AR and native MTP are both in scope.
 pub fn admit_ep_reserve(facts: &EpReserveFacts<'_>) -> Result<(), Refusal> {
     let no = |reason: &str| Err(Refusal::new(reason));
     if facts.arch != "gfx1201" {
@@ -288,9 +246,6 @@ pub fn admit_ep_reserve(facts: &EpReserveFacts<'_>) -> Result<(), Refusal> {
     }
     if facts.capture {
         return no("retained-body capture replay is requested");
-    }
-    if facts.routing_override {
-        return no("a routing/invariant-prefill override can take wide Full-table calls");
     }
     if let Some(min_rows) = facts.s2_min_rows {
         if min_rows <= EP_RESERVE_RESIDENT_ROWS {
@@ -1518,10 +1473,8 @@ mod tests {
             prompt_rows: 4096,
             explicit_chunk_override: false,
             whole_layer_placement: true,
-            owner_routed_s1: true,
             s2_min_rows: Some(2048),
             capture: false,
-            routing_override: false,
             pipeline_parallel: false,
             expert_tier: false,
             expert_slab: false,
@@ -1583,7 +1536,6 @@ mod tests {
             ("dflash", Box::new(|f| f.dflash = true)),
             ("slowlink", Box::new(|f| f.single_device_slowlink = true)),
             ("capture", Box::new(|f| f.capture = true)),
-            ("routing", Box::new(|f| f.routing_override = true)),
             ("s2 rows", Box::new(|f| f.s2_min_rows = Some(512))),
         ];
         for (name, mutate) in cases {
@@ -1591,10 +1543,9 @@ mod tests {
             mutate(&mut f);
             assert!(admit_ep_reserve(&f).is_err(), "{name} must refuse");
         }
-        // S2 off and S1 off are admitted scope choices, not refusals.
+        // S2 off is an admitted scope choice, not a refusal.
         let mut f = facts();
         f.s2_min_rows = None;
-        f.owner_routed_s1 = false;
         assert_eq!(admit_ep_reserve(&f), Ok(()));
     }
 
@@ -2154,35 +2105,16 @@ mod tests {
     }
 
     #[test]
-    fn a_spec_store_keeps_the_ordinary_reserve_only_under_the_kill_switch() {
-        // AR store (no spec_k) and an MTP-less slot count never block.
-        assert!(spec_store_blocks_reserve(None, 3, false).is_none());
-        assert!(spec_store_blocks_reserve(Some(2), 0, false).is_none());
-        // The kill switch (`HIPFIRE_EP_MTP_RESERVE_SHARE=0`) blocks the decoupled
-        // reserve for a spec store, naming the way out.
-        let why = spec_store_blocks_reserve(Some(2), 3, false).expect("blocked");
-        assert!(why.contains("--spec mtp") && why.contains("HIPFIRE_EP_MTP_RESERVE_SHARE=0"));
-        // The default (sharing on) lets the spec store take the reserve.
-        assert!(spec_store_blocks_reserve(Some(2), 3, true).is_none());
-    }
-
-    #[test]
-    fn the_stage_verdict_refuses_a_spec_store_on_a_reserve_load_only_under_the_kill_switch() {
+    fn the_stage_verdict_admits_a_spec_store_on_a_reserve_load_only_within_the_bank() {
         // An ordinary load never reaches the reserve rules.
-        assert_eq!(spec_store_reserve_verdict(false, false, 9999, None), Ok(()));
-        // A reserve load under the kill switch: labeled refusal.
-        let refused = spec_store_reserve_verdict(true, false, 8, Some(512)).unwrap_err();
-        assert!(refused.contains("refused on an EP reserve-sharing load"));
-        // By default a step that fits the resident bank is admitted...
-        assert_eq!(spec_store_reserve_verdict(true, true, 8, Some(512)), Ok(()));
-        assert_eq!(
-            spec_store_reserve_verdict(true, true, 512, Some(512)),
-            Ok(())
-        );
+        assert_eq!(spec_store_reserve_verdict(false, 9999, None), Ok(()));
+        // A step that fits the resident bank is admitted...
+        assert_eq!(spec_store_reserve_verdict(true, 8, Some(512)), Ok(()));
+        assert_eq!(spec_store_reserve_verdict(true, 512, Some(512)), Ok(()));
         // ...a wider one, or an unattached bank, is refused with the numbers.
-        let wide = spec_store_reserve_verdict(true, true, 513, Some(512)).unwrap_err();
+        let wide = spec_store_reserve_verdict(true, 513, Some(512)).unwrap_err();
         assert!(wide.contains("512-row") && wide.contains("513-row"));
-        assert!(spec_store_reserve_verdict(true, true, 8, None).is_err());
+        assert!(spec_store_reserve_verdict(true, 8, None).is_err());
     }
 
     #[test]

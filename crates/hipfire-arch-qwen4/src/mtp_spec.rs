@@ -11135,7 +11135,7 @@ pub fn native_mtp_device_bytes(
 
 /// [`native_mtp_device_bytes`] with the GDN capture ring sized under `ring_config` instead of
 /// the head's geometry: the EP reserve census passes the trunk shard's rank-local config
-/// (`HIPFIRE_EP_RESERVE_CENSUS`: 24 value heads, half of the global ring), since the rank
+/// (24 value heads, half of the global ring), since the rank
 /// allocates the ring on its own trunk's state.
 #[allow(clippy::too_many_arguments)]
 pub fn native_mtp_device_bytes_ring(

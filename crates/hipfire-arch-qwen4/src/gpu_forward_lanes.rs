@@ -82,8 +82,8 @@
 //! sub-512-row kernels, selected by capping the routing rows of the call at 511, with
 //! real launch extents), so the layer's expert weights are read once instead of once
 //! per lane tile; the row-local dense stages (embed, PLE rows, HC, the mixer in / out
-//! projections) run once over all rows too (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT`, default
-//! on; `0` runs them per lane, each launch the lane tile's by construction) and the
+//! projections) run once over all rows too when every lane has at least the floor's rows (else
+//! per lane, each launch the lane tile's by construction) and the
 //! stateful cores run per lane on the lane's own rows and state. The caller's policy is replaced
 //! by the EP wave policy ([`crate::gpu_forward::ep_wave::ep_wave_policy`]). A lane of 65+
 //! rows has committed state and head byte-equal to its serial tile because every kernel of
@@ -109,9 +109,9 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::LayerType;
 use crate::gpu_forward::ep_wave::{
-    ep_wave_expected_moe_calls, ep_wave_joint_enabled, ep_wave_joint_for_lanes, ep_wave_layer_moe,
-    ep_wave_partial_mask, ep_wave_policy_for, ep_wave_refusal, ep_wave_route, ep_wave_scope_rows,
-    ep_wave_tile_exchange, EpWaveRoute,
+    ep_wave_expected_moe_calls, ep_wave_joint_for_lanes, ep_wave_layer_moe, ep_wave_partial_mask,
+    ep_wave_policy_for, ep_wave_refusal, ep_wave_route, ep_wave_scope_rows, ep_wave_tile_exchange,
+    EpWaveRoute,
 };
 use crate::gpu_forward::g942_lanes;
 use crate::gpu_forward::{
@@ -2547,7 +2547,7 @@ fn forward_wave_with(
 /// The exact EP prefill wave ([`crate::gpu_forward::ep_wave`] has the design): the lane
 /// step over prefill lanes with the MoE ONCE per layer over every lane's rows on the
 /// singleton's FULL-TABLE route (sub-512 routing kernels), the dense row-local stages once over
-/// all rows too unless `HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0` (every other stage per lane;
+/// all rows too when every lane has at least the floor's rows (else every other stage per lane;
 /// the caller's `policy` is replaced by [`ep_wave_policy`]). Admission is decided from host
 /// facts before any launch, on every rank identically; a refusal is an `ep wave refused:`
 /// error and nothing ran.
@@ -2564,11 +2564,7 @@ fn forward_wave_ep(
     // `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`); lanes below it run their row-local stages per lane
     // (`ep_wave_joint_for_lanes`). A wave is a prefill forward by construction.
     let floor = gpu.flags.qwen4_prefill_lwmma_floor_knob();
-    let policy = ep_wave_policy_for(ep_wave_joint_for_lanes(
-        ep_wave_joint_enabled(),
-        &lane_rows,
-        floor,
-    ));
+    let policy = ep_wave_policy_for(ep_wave_joint_for_lanes(&lane_rows, floor));
     let total: usize = lane_rows.iter().sum();
     let facts = fwd.ep_wave_facts(gpu, &bundle.config, &lane_rows);
     if let Some(why) = ep_wave_refusal(&facts) {
@@ -3221,7 +3217,7 @@ fn forward_lanes_scoped(
         gpu.replay.set_forward_eligible(false);
     }
 
-    // `HIPFIRE_QWEN4_EP_SP_SUB512_WAVE`: a trunk-shard prefill wave of at
+    // A trunk-shard prefill wave of at
     // least the sub-512 SP floor runs its joint HC reads / writes sequence-parallel, like a wide
     // singleton chunk (`forward_chunk_scoped`'s `SpViews`): each rank reads / writes its half of the
     // wave's rows (reduce-scatter write), a row all-gather rejoins `hc_mixed` after every read and
@@ -3287,7 +3283,7 @@ fn forward_lanes_scoped(
             static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
-                    "  qwen4 EP sequence-parallel prefill wave (HIPFIRE_QWEN4_EP_SP_SUB512_WAVE): the wave's joint HC reads / writes split its rows across the two ranks (reduce-scatter HC write, row all-gather)"
+                    "  qwen4 EP sequence-parallel prefill wave: the wave's joint HC reads / writes split its rows across the two ranks (reduce-scatter HC write, row all-gather)"
                 );
             }
         }
@@ -6695,11 +6691,12 @@ mod tests {
         assert_eq!(production.len(), config.num_hidden_layers * 8 + 1);
     }
 
-    /// The EP prefill wave's program, both arms. Incumbent (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0`):
+    /// The EP prefill wave's program, both arms. Incumbent (a lane below the floor):
     /// every stage per lane (each mixer stays the singleton's whole op on the lane's own rows)
-    /// except the MoE, the only op placed once over all rows, one per layer. Joint (default): the
-    /// mixers split into in-proj / core / out-proj phases (the cores stay per lane), the HC
-    /// stages and projections are placed once over all rows, and still exactly one MoE per layer.
+    /// except the MoE, the only op placed once over all rows, one per layer. Joint (every lane at
+    /// the floor or wider): the mixers split into in-proj / core / out-proj phases (the cores stay
+    /// per lane), the HC stages and projections are placed once over all rows, and still exactly
+    /// one MoE per layer.
     #[test]
     fn ep_wave_program_places_only_the_moe_once() {
         use crate::gpu_forward::ep_wave::ep_wave_policy_for;
@@ -7208,12 +7205,12 @@ mod tests {
     }
 
     /// The exact EP prefill wave never takes the AR step's all-rows HC placement. Incumbent arm
-    /// (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0`): every HC stage is PER LANE (each lane's HC read /
+    /// (a lane below the floor): every HC stage is PER LANE (each lane's HC read /
     /// write are its singleton tile's launches at the lane's own rows and stream kind; under the
     /// trunk shard each write is its own all-reduce at the lane's row count), refused by the step
-    /// kind AND by the policy. Joint arm (default): the HC stages are one segment over every
-    /// lane's rows by the wave's own policy, and that segment is not the AR step's placement:
-    /// `hc_all_rows_applies` stays refused for the wave's step kind.
+    /// kind AND by the policy. Joint arm (every lane at the floor or wider): the HC stages are one
+    /// segment over every lane's rows by the wave's own policy, and that segment is not the AR
+    /// step's placement: `hc_all_rows_applies` stays refused for the wave's step kind.
     #[test]
     fn the_exact_wave_never_takes_the_all_rows_hc_placement() {
         use crate::gpu_forward::ep_wave::ep_wave_policy_for;

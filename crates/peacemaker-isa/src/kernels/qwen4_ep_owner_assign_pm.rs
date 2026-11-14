@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Builder-emitted (PeaceMaker) gfx1201 balanced-ownership assignment of the
-//! Flash-Next expert-parallel exchange (default on; `HIPFIRE_EP_BALANCED_OWNERS=0` disables):
+//! Flash-Next expert-parallel exchange:
 //! `qwen4_ep_owner_assign_pm_gfx1201`, the byte twin of the product kernel
 //! contract of `Gpu::qwen4_ep_owner_assign` and of the host reference
 //! `qwen4_ep_owner_map` (rdna-compute `moe.rs`). gfx1201 only: every other

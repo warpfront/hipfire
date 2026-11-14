@@ -393,13 +393,11 @@ capture).
 | | exact gfx1201 (R9700), N = 2..=8 | exact gfx1100 (7900 XTX), N = 2..=8 |
 |---|---|---|
 | Load / decode / verify / native MTP (`--spec mtp`) | Admitted (opt-in, experimental) | Admitted (opt-in, experimental) |
-| Balanced per-call expert ownership on host-mapped layers ("W1") | **On** by default under EP at N = 2..=4; kill switch `HIPFIRE_EP_BALANCED_OWNERS=0`. At N = 5..=8 **not admitted** (the certified owner-assign kernel covers 2..=4 ranks): each rank logs `balanced ownership not admitted (needs at most 4 ranks); static split` | **Not admitted**: each rank logs `balanced ownership not admitted (needs gfx1201); static split` and runs the static `e % N` split, which is exact |
-| Owner-routed prefill chunks ("S1") | **On** by default when every admission condition holds; kill switch `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0`. Symmetric IU4 route (every MoE layer verified symmetric on every rank) | Same default and kill switch. F16 WMMA grouped route (BF16-out gate/up with the SwiGLU epilogue, BF16-out down; QT44/QT53 experts on every layer); the stable grouping is used whenever the exchange is installed |
-| Long-prefill expert staging ("S2") | **On** by default when S1 is admitted; kill switch `HIPFIRE_EP_EXPERT_STAGE=0` (pipeline-wide kill switch `HIPFIRE_QWEN4_EXPERT_STAGE`) | Never created (`expert staging not admitted (needs gfx1201)`) |
+| Balanced per-call expert ownership on host-mapped layers ("W1") | **On** under EP at N = 2..=4. At N = 5..=8 **not admitted** (the certified owner-assign kernel covers 2..=4 ranks): each rank logs `balanced ownership not admitted (needs at most 4 ranks); static split` | **Not admitted**: each rank logs `balanced ownership not admitted (needs gfx1201); static split` and runs the static `e % N` split, which is exact |
+| Owner-routed prefill chunks ("S1") | **On** when every admission condition holds. Symmetric IU4 route (every MoE layer verified symmetric on every rank) | Same rule. F16 WMMA grouped route (BF16-out gate/up with the SwiGLU epilogue, BF16-out down; QT44/QT53 experts on every layer); the stable grouping is used whenever the exchange is installed |
+| Long-prefill expert staging ("S2") | **On** by default when S1 is admitted; pipeline-wide kill switch `HIPFIRE_QWEN4_EXPERT_STAGE` | Never created (`expert staging not admitted (needs gfx1201)`) |
 
-For the three levers, exactly `0` is off and unset or any other value is on
-(they follow one rule, `ep_lever_on`). Single-card (`ep = 1`) behavior is
-unchanged by all of them. The per-rank load log states what ran (`qwen4 EP
+Single-card (`ep = 1`) behavior is unchanged by these levers. The per-rank load log states what ran (`qwen4 EP
 rank r/n: balanced ownership on N host-mapped MoE layers`; `owner-routed
 prefill on …` or `owner-routed prefill not admitted (reason)`). How many routed
 layers stay in VRAM depends on the card and N: see
@@ -662,7 +660,7 @@ slowest link. EP has no host-staged fallback: if any directed card pair is
 not peer-accessible, the load refuses. The community gate below records each
 card's PCIe link speed and width and the P2P topology in its receipt.
 
-### Flash-Next EP: balanced expert ownership (default on under EP on gfx1201 at 2..=4 ranks; `HIPFIRE_EP_BALANCED_OWNERS=0` disables)
+### Flash-Next EP: balanced expert ownership (on under EP on gfx1201 at 2..=4 ranks)
 
 Under Flash-Next (Qwen4) expert parallelism rank `r` owns routed expert `e`
 when `e % ranks == r`. On the trunk layers whose experts live in pinned host
@@ -670,8 +668,7 @@ memory (the host-mapped layers, read zero-copy over PCIe) the number of routed
 experts a token draws from each rank differs call to call, so the rank with
 fewer host experts finishes early and waits for the other at every such layer.
 
-Balanced ownership (default on under EP; `HIPFIRE_EP_BALANCED_OWNERS=0` keeps
-the static split) balances that per call. After the router wrote the call's
+Balanced ownership (on under EP) balances that per call. After the router wrote the call's
 routed ids, one small device kernel deals the distinct routed experts to the
 ranks alternately in ascending expert id, identically on every rank, and
 rewrites the rank's live pointer tables for the layer: an expert the rank was
@@ -685,9 +682,8 @@ output is byte-identical to the static split and to one card.
 
 Scope: host-mapped trunk MoE layers on one-row decode and few-row forwards
 (verify, replay and takeover, 2 to 8 rows). VRAM-resident layers, chunk
-forwards (more than 8 rows) and the MTP head keep the static split. With
-`HIPFIRE_EP_BALANCED_OWNERS=0`, no table, buffer, stage or kernel module is
-added. Each rank logs `qwen4 EP rank r/n: balanced ownership on N host-mapped
+forwards (more than 8 rows) and the MTP head keep the static split.
+Each rank logs `qwen4 EP rank r/n: balanced ownership on N host-mapped
 MoE layers` at attach when it is on.
 
 Balanced ownership is admitted on exact gfx1201 at 2..=4 ranks only (the
@@ -697,11 +693,11 @@ ownership not admitted (needs gfx1201); static split`, and on gfx1201 at 5..=8
 ranks `... (needs at most 4 ranks); static split`; either way the rank builds
 nothing and runs the static `e % ranks` split, which is exact.
 
-### Flash-Next EP: owner-routed prefill chunks (default on under EP; `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0` disables)
+### Flash-Next EP: owner-routed prefill chunks (on under EP)
 
 Without the lever every EP rank runs the whole 512-expert grouped MoE of every
 prefill chunk, reading its peers' experts through P2P weight tables.
-`HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP2..EP8 on exact gfx1201 (symmetric IU4 route) and exact gfx1100 (F16 WMMA grouped route); `=0` is the kill switch, any other value or unset is on; single card unchanged)
+Owner-routed prefill (on under EP2..EP8 on exact gfx1201 (symmetric IU4 route) and exact gfx1100 (F16 WMMA grouped route); single card unchanged)
 splits that work. All ranks still run the router, top-k and stable grouping
 (a deterministic function of replicated bytes, so the grouped layout is
 identical everywhere). Each rank runs the grouped gate/up and down on its own
@@ -745,7 +741,7 @@ bitwise comparison with a single card (`fn-ep/coal/s1/compare_chunk.py`).
 
 ### Flash-Next EP: long-prefill expert staging
 
-`HIPFIRE_EP_EXPERT_STAGE` (default ON under EP when the owner-routed prefill is admitted on gfx1201; `=0` is the kill switch, any other value or unset is on) admits the existing
+Long-prefill expert staging, on under EP whenever owner-routed prefill is admitted on gfx1201, admits the existing
 `HIPFIRE_QWEN4_EXPERT_STAGE` pipeline under expert parallelism. It is gfx1201
 only: on gfx1100 a rank logs `qwen4 EP rank r/n: expert staging not admitted
 (needs gfx1201)` and builds nothing. Each rank
@@ -862,12 +858,10 @@ not once per tile. A load without lanes is unchanged.
 
 **Native-MTP lanes (`--spec mtp`, `serve.batch_spec`) take the decoupled reserve like the AR lanes.** The load charges the
 mixed store (`ep_lane_store_device_bytes_mixed`: the first 3 slots with MTP state, the rest AR-only) to the decoupled census
-and takes the plan when it holds more resident layers than the ordinary lane placement. `HIPFIRE_EP_MTP_RESERVE_SHARE=0` is
-the kill switch: the MTP store then keeps the ordinary reserve plus the mixed store (the load logs `qwen4 EP reserve
-decoupling: not applied (native-MTP EP lanes are staged ... HIPFIRE_EP_MTP_RESERVE_SHARE=0 ...)`; 25 resident layers at the
-defaults), and a spec store that still reaches a reserve-sharing load is refused at staging with a label (`native-MTP lanes
-are refused on an EP reserve-sharing load`) and the daemon stages AR lanes instead (`spec=off (...)`). Without `--spec mtp`,
-or with `HIPFIRE_EP_MTP_LANES=0`, the lanes are AR lanes.
+and takes the plan when it holds more resident layers than the ordinary lane placement. A native-MTP store on that load
+is admitted only when every mesh window fits the resident scratch bank. A store that does not fit is refused at staging
+with a label, and the daemon stages AR lanes instead (`spec=off (...)`). Without `--spec mtp`, or with
+`HIPFIRE_EP_MTP_LANES=0`, the lanes are AR lanes.
 
 Mesh window phases against the borrow window (a borrowed epoch is only ever opened by a prompt forward of more than 512
 rows, inside `forward_chunk`): the verify (`forward_lanes`) enters through `ep_reserve_lane_step_enter` (restores a dirty
@@ -1043,9 +1037,6 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 | `HIPFIRE_MESH_TRANSPORT` | Developer-only, Flash-Next PP: how band edges move HC streams: `auto` (default, host-staged), `host` or `peer` (refused) |
 | `HIPFIRE_QWEN4_EP` | `0` forces Flash-Next `topology.ep = 1` (developer kill switch) |
 | `HIPFIRE_EMULATE_GPUS` | Developer-only logical rank aliasing (integer `>=2`); also maps Flash-Next EP rank `r` to physical device `r % count` (see [emulation](#flash-next-qwen4-ep-under-emulation)) |
-| `HIPFIRE_EP_BALANCED_OWNERS` | Flash-Next EP: balanced per-call expert ownership on host-mapped layers (gfx1201 at 2..=4 ranks only; other arches and larger N keep the exact static split); on under EP, exact `0` disables |
-| `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | Flash-Next EP (N = 2..=8): owner-routed prefill chunks on gfx1201 and gfx1100; on under EP, exact `0` disables |
-| `HIPFIRE_EP_EXPERT_STAGE` | Flash-Next EP: long-prefill expert staging (gfx1201 only); on when owner-routed prefill is admitted, exact `0` disables |
 | `HIPFIRE_TP_USE_RCCL` | `0` opts out of RCCL (errors; no host AR yet) |
 | `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path tried before the ROCm root (nixpkgs / split RCCL installs) |
 | `HIPFIRE_PP_DFLASH=1` | **Experimental, generic Qwen3.5 / 3.6 PP only** — the daemon accepts a DFlash draft field with `pp>1` (cross-card spec generate is **not** fully implemented; see daemon refusal text). Flash-Next PP still refuses DFlash |
@@ -1536,7 +1527,7 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   thread enqueues every group's launches without blocking on a sender, so the
   receiver band's kernels are already queued when the edge event fires
   (`HIPFIRE_PP_LANE_EDGE_HOST_WAIT=1` restores the host `hipEventSynchronize`
-  per edge; `HIPFIRE_PP_LANE_OVERLAP=0` selects the sequential band walk). Prompt
+  per edge). Prompt
   tiles run as singleton PP tiles. Per-step token staging uses pinned host
   memory with event-fenced asynchronous uploads; it must stay byte-identical
   to a synchronous upload, and no speedup from it is measured or claimed here.

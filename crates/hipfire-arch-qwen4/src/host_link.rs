@@ -532,8 +532,8 @@ pub struct RouteChoice {
 /// `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS`). The chunk is reported before the
 /// model's `max_seq` cap, which is only known at load, and for the compact
 /// forward scratch plan the shipped Flash-Next artifacts take on gfx1201
-/// (`Qwen4ForwardScratchMode::FnSymGfx1201`, 16384 rows); a load that keeps
-/// the `Full` plan (`HIPFIRE_QWEN4_COMPACT_SCRATCH=0`) defaults to 4096 rows.
+/// (`Qwen4ForwardScratchMode::FnSymGfx1201`, 16384 rows); a load that takes the
+/// `Full` plan (an artifact that is not a compact-plan candidate) defaults to 4096 rows.
 pub fn link_route_choices(arch: &str, link: HostLink) -> Vec<RouteChoice> {
     let env = |name: &str| hipfire_config::developer_var(name).ok();
     link_route_choices_from(

@@ -1316,21 +1316,19 @@ impl Qwen4Bundle {
             applied.before_bytes >> 20,
             applied.after_bytes >> 20
         );
-        // `HIPFIRE_EP_RESERVE_CENSUS`: `replace_owned` freed each full pre-shard copy of the
+        // `replace_owned` freed each full pre-shard copy of the
         // shared-expert tensors into the device pool, which hands bytes back to HIP only on a
         // drain or an allocation that fails. The planner budgets the shard's saving, so return
         // them now. `drain_pool` frees only the pool's free lists (buffers no tensor owns) and
         // the slabs already fully retired, never a live buffer, and runs before the forward and
         // the first request allocate anything.
-        if hipfire_config::memory::ep_reserve_census() {
-            let parked = gpu.pool_parked_bytes();
-            gpu.drain_pool();
-            eprintln!(
-                "  qwen4 trunk shard: rank {}: returned {} MiB of pooled pre-shard copies to HIP",
-                placement.rank,
-                parked >> 20
-            );
-        }
+        let parked = gpu.pool_parked_bytes();
+        gpu.drain_pool();
+        eprintln!(
+            "  qwen4 trunk shard: rank {}: returned {} MiB of pooled pre-shard copies to HIP",
+            placement.rank,
+            parked >> 20
+        );
         Ok(())
     }
 
@@ -2143,18 +2141,15 @@ impl Qwen4Bundle {
     /// head source (`head_sources`, rank order, from [`Self::mtp_ep_expert_source`])
     /// is known: the EP mesh attach calls it on every rank after the forward's
     /// tables and row gather are installed. Installs nothing (the head stays
-    /// not-ready for lane-local calls, every call keeps today's path) when
-    /// `HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0`, when no EP-bound MoE head is attached, or
-    /// when any rank published no head source; that decision reads only the
-    /// gathered sources and the rank's own head, so every rank takes it alike.
+    /// not-ready for lane-local calls, every call keeps today's path) when no
+    /// EP-bound MoE head is attached, or when any rank published no head source;
+    /// that decision reads only the gathered sources and the rank's own head, so
+    /// every rank takes it alike.
     pub(crate) fn install_mtp_lane_local_moe(
         &mut self,
         gpu: &mut Gpu,
         head_sources: &[Option<Qwen4PeerLayerSource>],
     ) -> Result<(), String> {
-        if !crate::mesh_lane_protocol::ep_draft_split_enabled() {
-            return Ok(());
-        }
         let Some(placement) = self
             .execution
             .as_ref()
@@ -2210,8 +2205,8 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
-    /// Whether sharded-MoE draft passes can run ([`crate::mtp_gpu::draft_sharded_moe_enabled`]
-    /// at install, X2 active, rows scratch).
+    /// Whether sharded-MoE draft passes can run (decided at install: X2 active,
+    /// rows scratch).
     pub(crate) fn mtp_s4_ready(&self) -> bool {
         self.mtp.as_ref().is_some_and(Qwen4MtpGpu::s4_ready)
     }

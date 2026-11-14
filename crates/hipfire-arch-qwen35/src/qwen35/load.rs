@@ -2400,10 +2400,9 @@ pub fn report_cpu_exec_coverage(
     spilled.extend(expert_layers.iter().copied());
 
     // The expert splice is the same model-level decision the loader made
-    // (`memory.offload_exec=cpu|passback` + the `HIPFIRE_MOE_CPU_EXPERTS`
-    // kill-switch), so when it is armed a host-placed layer's routed FFN runs on
-    // the CPU too.
-    let expert_cpu = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled();
+    // (`memory.offload_exec=cpu|passback`), so when it is armed a host-placed layer's
+    // routed FFN runs on the CPU too.
+    let expert_cpu = hipfire_dispatch::cpu_exec::cpu_exec_enabled();
     let mut covered = 0usize;
     let mut splittable = 0usize;
     let mut uncovered: BTreeSet<String> = BTreeSet::new();
@@ -5988,9 +5987,8 @@ pub(crate) fn load_moe_ffn(
     }
     // CPU expert splice: only on the CPU arm (`memory.offload_exec=cpu`) and only
     // on a host-placed packed layer, so the PCIe arm is genuinely PCIe and
-    // resident loads are byte-identical. `HIPFIRE_MOE_CPU_EXPERTS=0` is the
-    // kill-switch. Splice arming is computed before the tag table exists (it is
-    // built below): the CPU arm over a host-placed packed layer with no AWQ
+    // resident loads are byte-identical. Splice arming is computed before the tag table
+    // exists (it is built below): the CPU arm over a host-placed packed layer with no AWQ
     // sidecar. The loader writes the **real** expert tables (every forward path
     // reads them); the splice records only that decode and the narrow (`<= 4`
     // row) batched forwards defer their routed FFN to the CPU, so the sealed
@@ -6010,7 +6008,7 @@ pub(crate) fn load_moe_ffn(
     // the GPU arms (ordinary wide prefill). AWQ layers stay refused: a bare
     // `gemv` would ignore the per-expert scale on either projection.
     let packed_host = residency.experts_host() && pending.packed_expert_owners.is_some();
-    let cpu_expert_splice = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+    let cpu_expert_splice = hipfire_dispatch::cpu_exec::cpu_exec_enabled()
         && packed_host
         // An unsupported CPU format keeps the existing GPU-over-host-RAM
         // route. Arming the splice would fail only after loading the model.

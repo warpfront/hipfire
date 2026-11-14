@@ -393,11 +393,10 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The un-tiered lab shape: the split is requested only by the lab force, never by an
 /// explicit `memory.offload_exec` (which always wins over the force and would change the
-/// route being measured) and never against the `HIPFIRE_MOE_CPU_EXPERTS=0` kill-switch.
+/// route being measured).
 fn admit_untiered(
     explicit: Option<hipfire_config::memory::OffloadExec>,
     force: Option<bool>,
-    kill_switch: bool,
 ) -> R<()> {
     if let Some(mode) = explicit {
         return Err(format!(
@@ -408,9 +407,6 @@ fn admit_untiered(
         return Err(format!(
             "--untiered needs HIPFIRE_QWEN4_D2_DEFAULT=1 (developer.qwen4_d2_default is {force:?})"
         ));
-    }
-    if kill_switch {
-        return Err("--untiered conflicts with HIPFIRE_MOE_CPU_EXPERTS=0".into());
     }
     Ok(())
 }
@@ -511,12 +507,8 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
         admit_untiered(
             hipfire_config::memory::offload_exec_explicit(),
             hipfire_config::memory::qwen4_d2_default(),
-            hipfire_config::developer_var("HIPFIRE_MOE_CPU_EXPERTS")
-                .ok()
-                .as_deref()
-                == Some("0"),
         )?;
-    } else if !hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+    } else if !hipfire_dispatch::cpu_exec::cpu_exec_enabled()
         || hipfire_dispatch::cpu_exec::passback_enabled()
     {
         return Err(format!(
@@ -1649,7 +1641,7 @@ fn real_main() -> R<bool> {
     let armed = m.bundle.split_layers();
     if armed.is_empty() {
         return Err(if args.untiered {
-            "the whole-layer D2 split armed on no layer: needs HIPFIRE_QWEN4_D2_DEFAULT=1 with HIPFIRE_OFFLOAD_EXEC unset, aggregate QT44/QT53 experts host-mapped (the product's automatic placement, or a diagnostic HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N), and HIPFIRE_MOE_CPU_EXPERTS != 0"
+            "the whole-layer D2 split armed on no layer: needs HIPFIRE_QWEN4_D2_DEFAULT=1 with HIPFIRE_OFFLOAD_EXEC unset, aggregate QT44/QT53 experts host-mapped (the product's automatic placement, or a diagnostic HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N)"
                 .into()
         } else {
             "the D2 split armed on no layer: needs HIPFIRE_OFFLOAD_EXEC=cpu, the hot set applied (explicit sidecar on gfx1100) and host-tier experts with CPU spans"
@@ -2230,15 +2222,11 @@ mod tests {
     #[test]
     fn untiered_admission_requires_force_and_no_explicit_exec() {
         use hipfire_config::memory::OffloadExec;
-        assert!(admit_untiered(None, Some(true), false).is_ok());
-        assert!(admit_untiered(None, None, false).is_err());
-        assert!(admit_untiered(None, Some(false), false).is_err());
-        assert!(admit_untiered(None, Some(true), true).is_err());
+        assert!(admit_untiered(None, Some(true)).is_ok());
+        assert!(admit_untiered(None, None).is_err());
+        assert!(admit_untiered(None, Some(false)).is_err());
         for mode in [OffloadExec::Pcie, OffloadExec::Cpu, OffloadExec::Passback] {
-            assert!(
-                admit_untiered(Some(mode), Some(true), false).is_err(),
-                "{mode}"
-            );
+            assert!(admit_untiered(Some(mode), Some(true)).is_err(), "{mode}");
         }
     }
 

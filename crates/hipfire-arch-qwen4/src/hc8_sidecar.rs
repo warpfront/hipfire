@@ -113,9 +113,8 @@ pub fn peek_hc8_sidecar(
 /// pipeline band or a disabled MTP leaves unloaded, so it is an upper bound
 /// and must never be subtracted from a budget.
 ///
-/// The one exception is an expert-parallel load (`HIPFIRE_EP_HC8_PLAN_CHARGE`,
-/// default on): there the plan and every rank's fit charge the tensors at the
-/// E4M3 size, from [`Qwen4Hc8Sidecar::plan_tensors`] filtered by
+/// The one exception is an expert-parallel load: there the plan and every rank's fit
+/// charge the tensors at the E4M3 size, from [`Qwen4Hc8Sidecar::plan_tensors`] filtered by
 /// `expert_residency::ep_hc8_plan_saving` to the tensors actually charged in
 /// the rank's non-expert census (never this upper bound).
 pub fn hc8_sidecar_saved_bytes(

@@ -3914,7 +3914,7 @@ mod tests {
         };
         let f16_shadows = residency::f16_shadow_charge(
             true,
-            residency::f16_shadow_route_rows_with("gfx1100", tile, true, 48, false),
+            residency::f16_shadow_route_rows_with("gfx1100", tile, 48, false),
             &residency::j1778_bf16_manifest(),
             config.num_hidden_layers,
         )

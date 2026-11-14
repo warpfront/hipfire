@@ -30,7 +30,7 @@
 //!    over the picks, ring rollback, head commit), runs the head append of
 //!    every `ArSynced` lane, then each prefill tile through the singleton
 //!    chunk program on the lane's own state (an MTP lane's tile also fills
-//!    its head; under `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward the
+//!    its head; on an EP forward the
 //!    65..=511-row lane tiles of a burst are forwarded together as exact prefill
 //!    waves, [`plan_prefill_parts`]). A pure-decode step's wall clock (draft start to the final
 //!    sync) feeds the store's cost model, then every MTP lane's window
@@ -145,32 +145,8 @@ pub(crate) static LANE_TILE_PHASES: std::sync::LazyLock<bool> = std::sync::LazyL
 #[path = "gpu_forward/g942_wave.rs"]
 pub mod g942_wave;
 
-/// The knob of the EXACT joint prefill wave of a step's sub-512-row lane prefill tiles (EP lane
-/// forwards only; see [`plan_prefill_parts`]). Default ON; `0` is the kill switch: every tile is
-/// its own serial singleton chunk forward, byte-identical to the wave's output anyway.
-pub const EP_LANE_PREFILL_WAVE_EXACT_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT";
-
 /// Most rows one prefill wave carries (the plan of record's 2048-row pass).
 pub(crate) const EP_WAVE_MAX_ROWS: usize = crate::gpu_forward::ep_wave::QWEN4_EP_WAVE_ROW_CAP;
-
-/// [`EP_LANE_PREFILL_WAVE_EXACT_ENV`] parsed: the wave is ON by default (it is byte-identical to
-/// the serial tiles it replaces); exactly `0` is the kill switch (today's serial tiles).
-pub(crate) fn ep_lane_prefill_wave_from(value: Option<&str>) -> bool {
-    value.is_none_or(|v| v.trim() != "0")
-}
-
-/// The wave knob, read once per process (every rank thread agrees).
-static EP_LANE_PREFILL_WAVE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    ep_lane_prefill_wave_from(
-        hipfire_config::developer_var(EP_LANE_PREFILL_WAVE_EXACT_ENV)
-            .ok()
-            .as_deref(),
-    )
-});
-
-pub(crate) fn ep_lane_prefill_wave_enabled() -> bool {
-    *EP_LANE_PREFILL_WAVE
-}
 
 /// Whether a lane's tile of `rows` rows joins an exact wave at all: only a tile in
 /// `EXACT_WAVE_MIN_LANE_ROWS..=EXACT_WAVE_MAX_LANE_ROWS` runs, alone, the sub-512 full-table
@@ -1369,7 +1345,6 @@ pub(crate) fn step_prefill_parts(
         .execution
         .as_ref()
         .is_some_and(|forward| forward.ep.is_some());
-    let wave_on = ep_lane_prefill_wave_enabled() && ep_forward;
     let wide_rows = bundle.spec_hidden_rows();
     let eligible: Vec<bool> = mtp.iter().map(|&mtp| !mtp || wide_rows > 0).collect();
     let wave_cap = if mtp.iter().any(|&mtp| mtp) {
@@ -1389,14 +1364,13 @@ pub(crate) fn step_prefill_parts(
             false
         }
     };
-    let parts = plan_prefill_parts(wave_on, tile_rows, &eligible, wave_cap, &host_admits);
+    let parts = plan_prefill_parts(ep_forward, tile_rows, &eligible, wave_cap, &host_admits);
     (parts, refused.take())
 }
 
 /// Each prefill tile of the plan through the singleton chunk program on the
-/// lane's own state (an MTP lane's tile also fills its head), or, under
-/// `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward, the step's 65..=511-row
-/// lane tiles as EXACT joint prefill waves ([`plan_prefill_parts`]: one
+/// lane's own state (an MTP lane's tile also fills its head), or, on an EP forward, the step's
+/// 65..=511-row lane tiles as EXACT joint prefill waves ([`plan_prefill_parts`]: one
 /// [`Qwen4Bundle::prefill_wave`] per wave, every lane's rows forwarded together
 /// with the MoE once over all rows); the prompt-completing tile's pick lands in
 /// `picks`.
@@ -2602,23 +2576,6 @@ mod wave_tests {
     }
 
     #[test]
-    fn the_wave_is_on_by_default_and_only_exact_zero_kills_it() {
-        for on in [
-            None,
-            Some(""),
-            Some("1"),
-            Some(" 1\n"),
-            Some("2"),
-            Some("true"),
-        ] {
-            assert!(ep_lane_prefill_wave_from(on), "{on:?}");
-        }
-        for off in [Some("0"), Some(" 0\n")] {
-            assert!(!ep_lane_prefill_wave_from(off), "{off:?}");
-        }
-    }
-
-    #[test]
     fn the_exact_window_is_the_sub_512_full_table_lanes() {
         assert_eq!(crate::gpu_forward::ep_wave::EXACT_WAVE_MIN_LANE_ROWS, 65);
         assert_eq!(
@@ -2897,10 +2854,9 @@ mod wave_tests {
         // The parts come from `step_prefill_parts`, the function provisioning reads too.
         assert!(body.contains("step_prefill_parts(bundle, gpu, &tile_rows, &mtp)"));
         let parts_fn = fn_src(src, "pub(crate) fn step_prefill_parts(");
-        // The host's admission gates every candidate wave; the knob and the EP forward gate the
-        // whole plan.
+        // The host's admission gates every candidate wave; the EP forward gates the whole plan.
         assert!(parts_fn.contains("bundle.ep_wave_admission(gpu, rows)"));
-        assert!(parts_fn.contains("ep_lane_prefill_wave_enabled() && ep_forward"));
+        assert!(parts_fn.contains("plan_prefill_parts(ep_forward, tile_rows"));
         // A wave carrying an MTP lane captures the wave's wide hidden into the resident spec
         // hidden buffer and caps its rows by that buffer.
         assert!(parts_fn.contains("EP_WAVE_MAX_ROWS.min(wide_rows)"));
