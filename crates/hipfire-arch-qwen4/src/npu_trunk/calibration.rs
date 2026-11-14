@@ -2,7 +2,8 @@
 //! Flash-Next calibration identity: the compiled-in measured Halo records, the model trunk index digest and the
 //! host facts a record is keyed on. The schema-4 record itself is `hipfire_runtime::coproc::calibration`.
 use super::{arch_admits_auto, shapes::FLASH_NEXT, SWITCH};
-use hipfire_runtime::coproc::{calibration_key, CalKey, Calibration, Mode};
+use hipfire_runtime::coproc::calibration::model_trunk_index_sha256;
+use hipfire_runtime::coproc::{Calibration, Mode};
 use std::{fs, path::Path};
 
 /// The compiled-in measured Halo record of a trunk route (`stock` or the overlay).
@@ -20,40 +21,6 @@ pub fn load_calibration(
     route: &str,
 ) -> Result<(Calibration, &'static str), String> {
     Calibration::load_with_builtin(path, &FLASH_NEXT, builtin_record(route))
-}
-
-/// Probe the exact accel node railgun opens, without opening the runtime.
-#[cfg(unix)]
-pub fn npu_firmware() -> Result<String, String> {
-    use std::os::unix::fs::FileTypeExt;
-    let node =
-        fs::metadata("/dev/accel/accel0").map_err(|e| format!("NPU accel0 unavailable: {e}"))?;
-    if !node.file_type().is_char_device() {
-        return Err("NPU accel0 is not an accel device".into());
-    }
-    let device = Path::new("/sys/class/accel/accel0/device");
-    let driver = fs::read_link(device.join("driver")).map_err(|e| format!("NPU driver: {e}"))?;
-    if driver.file_name().is_none_or(|name| name != "amdxdna") {
-        return Err("NPU accel0 is not amdxdna".into());
-    }
-    let pci = fs::canonicalize(device).map_err(|e| format!("NPU PCI device: {e}"))?;
-    if pci
-        .file_name()
-        .is_none_or(|name| !name.to_string_lossy().contains(':'))
-    {
-        return Err("NPU accel0 PCI identity unavailable".into());
-    }
-    let firmware = fs::read_to_string(device.join("fw_version"))
-        .map_err(|e| format!("NPU fw_version: {e}"))?;
-    if firmware.trim().is_empty() {
-        return Err("NPU fw_version is empty".into());
-    }
-    Ok(firmware)
-}
-
-#[cfg(not(unix))]
-pub fn npu_firmware() -> Result<String, String> {
-    Err("NPU accel0 unavailable on this platform".into())
 }
 
 /// Host facts the armed `npu-trunk:` line reports so stock-kernel reports are triageable:
@@ -158,45 +125,6 @@ pub fn trunk_pin_bytes() -> u64 {
 #[cfg(target_os = "linux")]
 pub use railgun::npu::bounded_memlock_bytes;
 
-/// Read only unprivileged metadata, never open a GPU/NPU or time work.
-pub fn runtime_calibration_key(
-    arch: &str,
-    pci_bdf: &str,
-    index: &str,
-    trunk_route: &str,
-) -> Result<CalKey, String> {
-    // railgun opens accel0; key that exact device, not the first PCI directory.
-    let firmware = npu_firmware()?;
-    runtime_key_with_firmware(arch, pci_bdf, &firmware, index, trunk_route)
-}
-
-pub(crate) fn runtime_key_with_firmware(
-    arch: &str,
-    pci_bdf: &str,
-    firmware: &str,
-    index: &str,
-    trunk_route: &str,
-) -> Result<CalKey, String> {
-    let release = std::process::Command::new("uname")
-        .arg("-r")
-        .output()
-        .map_err(|e| format!("uname -r: {e}"))?;
-    if !release.status.success() {
-        return Err("uname -r failed".into());
-    }
-    let release = std::str::from_utf8(&release.stdout).map_err(|e| e.to_string())?;
-    // PerfOpt's armed message is privileged dmesg, with no sysfs/proc ABI.
-    // Schema 3 deliberately keys kernel identity on uname_release alone.
-    Ok(calibration_key(
-        arch,
-        pci_bdf,
-        firmware,
-        release,
-        index,
-        trunk_route,
-    ))
-}
-
 /// Capture the base before it moves into the source owner. Off does nothing; on reads only the
 /// index the open file already parsed.
 pub fn model_index_identity(
@@ -210,111 +138,6 @@ pub fn model_index_identity(
         return None;
     }
     Some(model_trunk_index_sha256(hfq).map_err(|e| format!("model index identity: {e}")))
-}
-
-/// Domain tag of [`model_trunk_index_sha256`]'s preimage; bump it with any change to the encoding.
-const TRUNK_INDEX_DOMAIN: &[u8] = b"hipfire-npu-trunk-index-v1\0";
-
-/// Lowercase-hex SHA256 of the trunk-relevant HFQ index: the same for a monolithic MQ4 and its
-/// split MQ4 XTS base, different for any other trunk. Index-only: it reads the parsed arch id,
-/// effective metadata JSON and tensor index, never tensor payload or file offsets. The PLE
-/// sidecar split (128 embedded `...ngram_embedding.shard_N.weight` tensors vs. a `hipfire_ple_rows`
-/// marker) therefore does not change it.
-///
-/// Preimage (all integers little-endian):
-/// 1. `"hipfire-npu-trunk-index-v1\0"`
-/// 2. `u32` arch id
-/// 3. `u64` byte length + canonical metadata JSON: the effective metadata minus its top-level
-///    `hipfire_ple_rows` key, compact, every object's keys sorted by UTF-8 bytes at every depth,
-///    scalars as serde_json renders them
-/// 4. `u64` tensor count, then per tensor sorted by name (names are unique in an HFQ index; file
-///    order is deliberately ignored): `u32` name length + UTF-8 name, `u8` quant type,
-///    `u32` dim count + `u32` per dim, `u64` data size
-///
-/// Only a tensor named exactly `PLE_SHARD_PREFIX` + canonical decimal `N` (non-empty ASCII digits,
-/// no leading zero except `0`) + `PLE_SHARD_SUFFIX` is excluded; a similarly named tensor (e.g.
-/// zero-padded `N`) stays in the digest.
-///
-/// Evidence for the exclusion set: the tensor-walk proof `rcpt/mq4split.split.json` shows the
-/// monolithic MQ4 and its split MQ4 XTS base share 1197 common tensors with byte-identical
-/// payloads and equal order, differing only in the 128 PLE shards and the `hipfire_ple_rows` marker.
-pub fn model_trunk_index_sha256(hfq: &hipfire_runtime::hfq::HfqFile) -> Result<String, String> {
-    use hipfire_runtime::ple_sidecar::{PLE_BASE_MARKER_KEY, PLE_SHARD_PREFIX, PLE_SHARD_SUFFIX};
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write;
-    fn is_ple_shard(name: &str) -> bool {
-        name.strip_prefix(PLE_SHARD_PREFIX)
-            .and_then(|rest| rest.strip_suffix(PLE_SHARD_SUFFIX))
-            .is_some_and(|n| {
-                n.bytes().all(|b| b.is_ascii_digit())
-                    && matches!(n.as_bytes(), [_] | [b'1'..=b'9', ..])
-            })
-    }
-    fn canonical_json(value: &serde_json::Value, out: &mut String) {
-        use serde_json::Value;
-        match value {
-            Value::Array(items) => {
-                out.push('[');
-                for (i, item) in items.iter().enumerate() {
-                    if i != 0 {
-                        out.push(',');
-                    }
-                    canonical_json(item, out);
-                }
-                out.push(']');
-            }
-            Value::Object(map) => {
-                let mut entries: Vec<_> = map.iter().collect();
-                entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-                out.push('{');
-                for (i, (key, item)) in entries.into_iter().enumerate() {
-                    if i != 0 {
-                        out.push(',');
-                    }
-                    out.push_str(&serde_json::to_string(key).expect("string serializes"));
-                    out.push(':');
-                    canonical_json(item, out);
-                }
-                out.push('}');
-            }
-            scalar => out.push_str(&serde_json::to_string(scalar).expect("scalar serializes")),
-        }
-    }
-    let mut metadata: serde_json::Value =
-        serde_json::from_str(&hfq.metadata_json).map_err(|e| format!("metadata JSON: {e}"))?;
-    metadata
-        .as_object_mut()
-        .ok_or("metadata JSON is not an object")?
-        .remove(PLE_BASE_MARKER_KEY);
-    let mut canonical = String::new();
-    canonical_json(&metadata, &mut canonical);
-    let mut tensors: Vec<_> = hfq
-        .tensors()
-        .iter()
-        .filter(|t| !is_ple_shard(&t.name))
-        .collect();
-    tensors.sort_unstable_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
-    let mut hasher = Sha256::new();
-    hasher.update(TRUNK_INDEX_DOMAIN);
-    hasher.update(hfq.arch_id.to_le_bytes());
-    hasher.update((canonical.len() as u64).to_le_bytes());
-    hasher.update(canonical.as_bytes());
-    hasher.update((tensors.len() as u64).to_le_bytes());
-    for t in tensors {
-        hasher.update((t.name.len() as u32).to_le_bytes());
-        hasher.update(t.name.as_bytes());
-        hasher.update([t.quant_type]);
-        hasher.update((t.shape.len() as u32).to_le_bytes());
-        for dim in &t.shape {
-            hasher.update(dim.to_le_bytes());
-        }
-        hasher.update((t.data_size as u64).to_le_bytes());
-    }
-    let mut hex = String::with_capacity(64);
-    for byte in hasher.finalize() {
-        write!(&mut hex, "{byte:02x}").expect("write to String");
-    }
-    Ok(hex)
 }
 
 #[cfg(test)]
@@ -547,6 +370,7 @@ mod builtin_tests {
 #[cfg(test)]
 mod trunk_index_tests {
     use super::*;
+    use hipfire_runtime::coproc::calibration_key;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::ple_sidecar::ple_shard_name;
     use std::io::Write;
