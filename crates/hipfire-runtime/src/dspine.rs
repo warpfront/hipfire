@@ -464,7 +464,9 @@ impl DspineBridge {
                 let raw = gpu.download_f32(&cand)?;
                 return Ok((0..rows).map(|i| raw[i * 16].to_bits()).collect());
             }
-            let anchor_raw = gpu.download_f32(&self.s_anchor)?;
+            // stream-ordered: the plain readback blocks on the legacy null
+            // stream, syncing the whole decode queue (8x measured earlier).
+            let anchor_raw = gpu.download_f32_stream_ordered(&self.s_anchor)?;
             let anchor_sid = anchor_raw[0].to_bits();
             // logits row r is draft row r+1 (the seed row has no head
             // logits), so the sender's rms/query must come from scratch
@@ -492,7 +494,7 @@ impl DspineBridge {
                 3 * self.r,
                 self.rms_scale(),
             )?;
-            let raw = gpu.download_f32(&out)?;
+            let raw = gpu.download_f32_stream_ordered(&out)?;
             let picks: Vec<u32> = raw.iter().map(|f| f.to_bits()).collect();
             if hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_DIAG").as_deref() == Ok("1") {
                 let base_raw = gpu.download_f32(&base)?;
