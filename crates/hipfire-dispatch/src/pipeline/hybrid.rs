@@ -164,6 +164,12 @@ fn is_mq4(dtype: DType) -> bool {
     matches!(dtype, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256)
 }
 
+/// MQ rotation contract for decode fusions: Lloyd (qt=52) shares qt=44's
+/// FWHT input rotation; only the weight codebook differs (handled downstream).
+fn is_mq4_rot(dtype: DType) -> bool {
+    is_mq4(dtype) || dtype == DType::MQ4G256V2Lloyd
+}
+
 /// Decode path that keeps DeltaNet Q/K at their native head count and lets
 /// each pair of value/state heads reuse one Q/K head. The compact B2 schedule
 /// is the certified default on gfx1100 and gfx1201; `HIPFIRE_GDN_COMPACT2=0`
@@ -230,7 +236,7 @@ pub fn gated_norm_mq_rotate(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>) ->
         && admitted_arch_shape
         && dims.linear_value_dim == 128
         && wo.k == n_v_heads * dims.linear_value_dim
-        && is_mq4(wo.dtype)
+        && is_mq4_rot(wo.dtype)
 }
 
 /// Fold the single-token Q8_0 KV-cache write into the FA-prep epilogue on the
@@ -302,7 +308,7 @@ pub fn fused_attention_epilogue(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>
             && dims.is_dense_27b_shape()
             && dims.n_heads == 24
             && dims.n_kv_heads == 4);
-    *ENABLED && admitted_arch_shape && dims.head_dim == 256 && is_mq4(wo.dtype)
+    *ENABLED && admitted_arch_shape && dims.head_dim == 256 && is_mq4_rot(wo.dtype)
 }
 
 /// fp8: admitted only for the flash-tile attend key whose [2+head_dim] f32

@@ -273,6 +273,7 @@ module	fused_qkvza_mq4cg256	codec-outside-core-rungs	MQ4CG256/MQ4CG256 route abs
 module	fused_qkvza_mq4g256_lloyd	codec-outside-core-rungs	Dense MQ4G256Lloyd/MQ4 route absent from admitted core artifact rungs; rdna-compute/src/gemv.rs:1904
 module	fused_qkvza_mq4g256_lloyd_rdna3	codec-outside-core-rungs	Dense MQ4G256Lloyd/MQ4 route absent from admitted core artifact rungs; rdna-compute/src/gemv.rs:1904
 module	fused_qkvza_mq4g256v2_lloyd	codec-outside-core-rungs	MQ4G256V2Lloyd/MQ4 route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:39552
+module	fused_qkvza_mq4g256v2_lloyd_hoist_x32_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_LLOYD_MMQ_A4 (exact gfx1100 twin TU); rdna-compute/src/gemm.rs:43318-43324
 module	fused_qkvza_mq5g256v2	codec-outside-core-rungs	MQ5G256V2 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/fused_qkv.rs:696
 module	fused_rmsnorm_mq_rotate_awq_i4	developer-opt-in	Non-default developer override: HIPFIRE_RMSNORM_P1A_BATCHED; rdna-compute/src/gemv.rs:3801-3812
 module	fused_rmsnorm_mq_rotate_awq_i4_fold	developer-opt-in	Non-default developer override: HIPFIRE_RMSNORM_P1A_BATCHED; rdna-compute/src/gemv.rs:3949-3957
@@ -440,6 +441,7 @@ module	gemm_gate_up_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201_symfold	config-opt-in	
 module	gemm_gate_up_mq4g256v2_wmma_fp8_v2_gfx1201	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_gate_up_mq4g256v2_wmma_fp8_v2_gfx1201_symfold	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_gate_up_mq4g256v2_wmma_gfx1100_mw_lds	no-caller	Unreachable launcher branch: its N>=384 selection sits after the gfx1100 batch>=64 IU4/A8/Q8_1 MMQ return under the same non-capture, non-replay conditions, so no default or opt-in config reaches it; rdna-compute/src/gemm.rs:35841
+module	gemm_gate_up_mq4g256v2_wmma_gfx11_bt_lloyd	developer-opt-in	Non-default Lloyd (qt52) weights, N<64 BT route (HIPFIRE_LLOYD_F16_GFX11); rdna-compute/src/gemm.rs:39898
 module	gemm_gate_up_mq5g256v2_wmma	codec-outside-core-rungs	Non-slab MQ5G256V2 layout absent from core XTS artifact rungs; rdna-compute/src/gemm.rs:41418-42059
 module	gemm_hfp4g32_moe_grouped_wmma_gfx12	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/gemm.rs:30512-30530
 module	gemm_hfp4g32_residual_wmma	codec-outside-core-rungs	HFP4G32/MFP4G32 route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:12706
@@ -554,10 +556,12 @@ module	gemm_mq4g256v2_residual_iu4_v2c_gfx11	developer-opt-in	Non-default develo
 module	gemm_mq4g256v2_residual_mmq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemm.rs:1650-1680
 module	gemm_mq4g256v2_residual_mmq_i8_gfx11_t256	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemm.rs:1650-1680
 module	gemm_mq4g256v2_residual_mmq_i8_gfx12_apf0	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemm.rs:1650-1680
+module	gemm_mq4g256v2_residual_mmq_i8_lloyd_gfx11	developer-opt-in	Non-default developer override: HIPFIRE_LLOYD_MMQ_A4 (staged twin TU); rdna-compute/src/gemm.rs:23009
 module	gemm_mq4g256v2_residual_mmq_iu4_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_G12_RASTER / HIPFIRE_IU4_SYMFOLD; rdna-compute/src/gemm.rs:21648-21700
 module	gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold	developer-opt-in	Non-default developer override: HIPFIRE_G12_IU4_ISA / HIPFIRE_G12_RASTER; rdna-compute/src/gemm.rs:21636-21660
 module	gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r	developer-opt-in	Non-default developer override: HIPFIRE_G12_IU4_ISA / HIPFIRE_G12_IU4_V3; rdna-compute/src/gemm.rs:21625-21634
 module	gemm_mq4g256v2_residual_mmq_lloyd	codec-outside-core-rungs	MQ4G256V2Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:20952-21065
+module	gemm_mq4g256v2_residual_wmma_base	no-caller	Lab-only T0 reference arm (#[cfg(feature = "lab")]); only the lab example calls it; rdna-compute/src/gemm.rs:42083
 module	gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt12	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt12_lut	codec-outside-core-rungs	MQ4G256V2Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:35531-35560
 module	gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt4	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
@@ -576,6 +580,7 @@ module	gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201	config-opt-in	Non-default con
 module	gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201_symfold	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds	developer-opt-in	Non-default developer override: HIPFIRE_RESIDUAL_LDSSTAGE; rdna-compute/src/gemm.rs:38593-38607
 module	gemm_mq4g256v2_residual_wmma_gfx1100_mw_lds	no-caller	Unreachable launcher branch: its N>=416 selection sits after the gfx1100 batch>=64 IU4/A8/Q8_1 MMQ return under the same non-capture, non-replay conditions, so no default or opt-in config reaches it; rdna-compute/src/gemm.rs:37906-37916
+module	gemm_mq4g256v2_residual_wmma_gfx11_bt_lloyd	developer-opt-in	Non-default Lloyd (qt52) weights, N<64 BT route (HIPFIRE_LLOYD_F16_GFX11); rdna-compute/src/gemm.rs:42161
 module	gemm_mq4v2_packed_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_GFX1100_PACKED_MQ4_PREFILL; rdna-compute/src/packed_mq4.rs:4
 module	gemm_mq5g256v2_residual_wmma	codec-outside-core-rungs	Non-slab MQ5G256V2 layout absent from core XTS artifact rungs; rdna-compute/src/gemm.rs:41418-42059
 module	gemm_mq6g256v2_mmq_i8_gfx11	developer-opt-in	gfx1151 opt-in only, measured slower: HIPFIRE_MQ6_I8=1 (exact-INT8 MQ6 prefill, 128-token build); rdna-compute/src/gemm_mq6_i8.rs:64-94
@@ -641,6 +646,7 @@ module	gemm_qkv_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201	config-opt-in	Non-default 
 module	gemm_qkv_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201_symfold	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201_symfold	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
+module	gemm_qkv_mq4g256v2_wmma_gfx11_bt_lloyd	developer-opt-in	Non-default Lloyd (qt52) weights, N<64 BT route (HIPFIRE_LLOYD_F16_GFX11); rdna-compute/src/gemm.rs:38031
 module	gemm_qkv_mq5g256v2_wmma	codec-outside-core-rungs	Non-slab MQ5G256V2 layout absent from core XTS artifact rungs; rdna-compute/src/gemm.rs:41418-42059
 module	gemm_qkvza_hfp4g32_wmma	codec-outside-core-rungs	HFP4G32/MFP4G32 route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:9787
 module	gemm_qkvza_hfp4g32_wmma_gfx12	codec-outside-core-rungs	HFP4G32/MFP4G32 route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:9782
@@ -688,6 +694,7 @@ module	gemm_qkvza_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201	config-opt-in	Non-defaul
 module	gemm_qkvza_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201_symfold	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201_symfold	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
+module	gemm_qkvza_mq4g256v2_wmma_gfx11_bt_lloyd	developer-opt-in	Non-default Lloyd (qt52) weights, N<64 BT route (HIPFIRE_LLOYD_F16_GFX11); rdna-compute/src/gemm.rs:37270
 module	gemm_qkvza_mq5g256v2_wmma	codec-outside-core-rungs	Non-slab MQ5G256V2 layout absent from core XTS artifact rungs; rdna-compute/src/gemm.rs:41418-42059
 module	gemm_qkvza_tq2g128	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; test_gemv_lowbit_xbatch.rs:325
 module	gemm_tq2g128_prefill	codec-outside-core-rungs	TQ2G128 route absent from admitted core artifact rungs; rdna-compute/src/gemv.rs:9815
@@ -954,6 +961,7 @@ module	gemv_mq4g256v2_lloyd	codec-outside-core-rungs	MQ4G256V2Lloyd/MQ4Lloyd rou
 module	gemv_mq4g256v2_moe_gate_up_k8_indexed_batched	config-opt-in	Requires speculation.mtp=on / --spec mtp; qwen35 auto stays AR; hipfire-dispatch/src/pipeline/mod.rs:5499
 module	gemv_mq4g256v2_multirow_r2_lanes_mq4v2	config-opt-in	Non-default configuration: serve.vmm_batch; hipfire-arch-qwen35/src/forward_slots/vmm/dflash.rs:793
 module	gemv_mq4g256v2_residual_lloyd	codec-outside-core-rungs	MQ4G256V2Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemv.rs:12088
+module	gemv_mq4g256v2_residual_lloyd_dualrow	developer-opt-in	Non-default Lloyd (qt52) weights, exact-gfx1100 dual-row decode (other arches keep the single-row twin); rdna-compute/src/gemv.rs:13749
 module	gemv_mq4g256v2_xbatch	config-opt-in	Non-default configuration: serve.multi_slot=true; rdna-compute/src/gemm.rs:39872-39881
 module	gemv_mq4g256v2_xbatch_residual	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemm.rs:39825-39829
 module	gemv_mq6g256v2_moe_gate_up_k8_indexed_batched	config-opt-in	Requires speculation.mtp=on / --spec mtp; qwen35 auto stays AR; hipfire-dispatch/src/pipeline/mod.rs:5532

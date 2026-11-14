@@ -42,9 +42,9 @@ use hipfire_dispatch::families::moe::{
     codebook_batched_admit_enabled_from_env, mq6_batched_admit_enabled_from_env,
 };
 use hipfire_dispatch::pipeline::batched::{
-    mq_f16_projection_fast_route, q8_prefill_wmma_enabled, s4_residual_fast, valid_lane_mask,
-    verify_dense_math, BatchEpilogue, BatchSemantics, DenseBatchMath, DflashFusionCtx,
-    TreeVerifyCtx,
+    lloyd_mmq_a4_static_admitted, mq_f16_projection_fast_route, q8_prefill_wmma_enabled,
+    s4_residual_fast, valid_lane_mask, verify_dense_math, BatchEpilogue, BatchSemantics,
+    DenseBatchMath, DflashFusionCtx, TreeVerifyCtx,
 };
 use hipfire_dispatch::pipeline::batched_attention::{
     batch_chunk_fa_attend, batch_chunk_full_attn_attn, batch_chunk_full_attn_input_projection,
@@ -663,7 +663,15 @@ fn ordinary_prefill_static_ceiling(
     }
     let native_mq4 = native_mq4_widened_route(gpu, weights);
     let mq3 = mq3_wide_route(gpu, weights);
-    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 && !mq3 {
+    // Lloyd staged-i8 twin route (opt-in HIPFIRE_LLOYD_MMQ_A4=1, exact
+    // gfx1100): the twin SET consumes any N natively (descriptor bounds +
+    // tok<N masking, no padding) and the X128/BT arms cover every fallback
+    // shape, so the ceiling needs no N/K shape beyond the dense-27B gate
+    // above (all 27B K are K%256==0; per-launch gates fail closed). Shares
+    // the static half of dispatch's `lloyd_mmq_a4_route`.
+    let lloyd_twin_widened = lloyd_mmq_a4_static_admitted(gpu)
+        && dense_layers_have_projection_dtype(weights, DType::MQ4G256V2Lloyd);
+    if !dense_layers_are_all_mq4v2(weights) && !native_mq4 && !mq3 && !lloyd_twin_widened {
         return None;
     }
     // gfx1201 keeps all four FP8 projection routes for qt44; symmetric qt49
@@ -671,7 +679,8 @@ fn ordinary_prefill_static_ceiling(
     // gfx1100 A4 flag already implies the IU4 prefill gate. gfx11 substitutes
     // the existing IU4 K16 projection route; its full-attention layers remain
     // on Q8 FA2 because the packet kernel and FP8 KV format are gfx1201-only.
-    let projection_route_admitted = if native_mq4 || mq3 {
+    // The Lloyd twin is its own admitted projection route (same predicate).
+    let projection_route_admitted = if native_mq4 || mq3 || lloyd_twin_widened {
         true
     } else if gpu.arch == "gfx1201" {
         gpu.flags.gfx12_mq4v2_fp8_gateup

@@ -134,9 +134,14 @@ fn try_a8_sigmoid_prepared(
     n: usize,
     epilogue: &BatchEpilogue<'_>,
 ) -> HipResult<Option<rdna_compute::Int8MmqPrepared>> {
+    // AWQ-only (mirrors the uniform arm): base mq4l without AWQ sidecars
+    // keeps the sigmoid + standalone-quantize path, same as uniform non-AWQ.
+    // Lloyd rides the A4 predicate in place of the symmetric-file requirement.
+    let lloyd_wo = wo.dtype == DType::MQ4G256V2Lloyd && lloyd_mmq_a4_route(gpu, n, k);
+    let wo_is_a8 = wo.dtype == DType::MQ4G256V2 || lloyd_wo;
     if !gpu.flags.a8_fused_prod
-        || !gpu.a8_prefill_active(n, k)
-        || wo.dtype != DType::MQ4G256V2
+        || (!gpu.a8_prefill_active(n, k) && !lloyd_wo)
+        || !wo_is_a8
         || !matches!(epilogue, BatchEpilogue::Residual)
     {
         return Ok(None);
@@ -517,7 +522,10 @@ pub fn batch_chunk_full_attn_input_projection(
     let qkv_same_dtype = layer.wk.dtype == layer.wq.dtype && layer.wv.dtype == layer.wq.dtype;
 
     // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
-    let a8_prep = if qkv_same_dtype && layer.wq.dtype == DType::MQ4G256V2 {
+    let a8_prep = if qkv_same_dtype
+        && (layer.wq.dtype == DType::MQ4G256V2
+            || (qkv_is_mq4v2_lloyd && lloyd_mmq_a4_route(gpu, n, layer.wq.k)))
+    {
         try_a8_rmsnorm_prepared(
             gpu,
             &pbs.x_batch,
@@ -610,30 +618,61 @@ pub fn batch_chunk_full_attn_input_projection(
     // 2. Batched 3-way QKV projection (wq+wk+wv).
     if let Some(prep) = &a8_prep {
         let xq = gpu.int8_mmq_prepared_ptr(prep, layer.wq.k, n)?;
-        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
-            &layer.wq.buf,
-            xq,
-            &pbs.fa_q_full_batch,
-            layer.wq.m,
-            layer.wq.k,
-            n,
-        )?;
-        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
-            &layer.wk.buf,
-            xq,
-            &pbs.fa_k_batch,
-            layer.wk.m,
-            layer.wk.k,
-            n,
-        )?;
-        gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
-            &layer.wv.buf,
-            xq,
-            &pbs.fa_v_batch,
-            layer.wv.m,
-            layer.wv.k,
-            n,
-        )?;
+        if qkv_is_mq4v2_lloyd {
+            // Lloyd twin: same prepared int8 X, per-tensor codebooks.
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                &layer.wq.buf,
+                xq,
+                &pbs.fa_q_full_batch,
+                layer.wq.m,
+                layer.wq.k,
+                n,
+                lloyd_c16_or_fail(&layer.wq, "batch_chunk_full_attn_input_projection")?,
+            )?;
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                &layer.wk.buf,
+                xq,
+                &pbs.fa_k_batch,
+                layer.wk.m,
+                layer.wk.k,
+                n,
+                lloyd_c16_or_fail(&layer.wk, "batch_chunk_full_attn_input_projection")?,
+            )?;
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                &layer.wv.buf,
+                xq,
+                &pbs.fa_v_batch,
+                layer.wv.m,
+                layer.wv.k,
+                n,
+                lloyd_c16_or_fail(&layer.wv, "batch_chunk_full_attn_input_projection")?,
+            )?;
+        } else {
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
+                &layer.wq.buf,
+                xq,
+                &pbs.fa_q_full_batch,
+                layer.wq.m,
+                layer.wq.k,
+                n,
+            )?;
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
+                &layer.wk.buf,
+                xq,
+                &pbs.fa_k_batch,
+                layer.wk.m,
+                layer.wk.k,
+                n,
+            )?;
+            gpu.gemm_mq4g256v2_mmq_set_prequant_i8(
+                &layer.wv.buf,
+                xq,
+                &pbs.fa_v_batch,
+                layer.wv.m,
+                layer.wv.k,
+                n,
+            )?;
+        }
     } else if let Some(prep) = iu4_prep
         .as_ref()
         .filter(|_| mq3v25_a4_weight(gpu, layer.wq.dtype) && qkv_same_dtype)
@@ -805,9 +844,10 @@ pub fn batch_chunk_full_attn_input_projection(
             n,
         )?;
     } else if qkv_is_mq4v2_lloyd {
-        // qt=52: q/k/v all Lloyd. gfx11 → MMQ-LUT; gfx12 FP8-LUT.
-        if lloyd_mmq_lut_route(gpu) {
-            gpu.gemm_qkv_mq4g256v2_mmq_lloyd(
+        // qt=52: q/k/v all Lloyd. Small-N gfx1100 → F16-BT-LUT; N>=64 or
+        // other gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        if lloyd_f16_bt_route(gpu, n) {
+            gpu.gemm_qkv_mq4g256v2_wmma_gfx11_lloyd(
                 &layer.wq.buf,
                 &layer.wk.buf,
                 &layer.wv.buf,
@@ -820,10 +860,63 @@ pub fn batch_chunk_full_attn_input_projection(
                 layer.wv.m,
                 layer.wq.k,
                 n,
-                lloyd_c16_or_fail(&layer.wq, "batch_chunk_full_attn_input_projection")?,
-                lloyd_c16_or_fail(&layer.wk, "batch_chunk_full_attn_input_projection")?,
-                lloyd_c16_or_fail(&layer.wv, "batch_chunk_full_attn_input_projection")?,
+                [
+                    lloyd_f16_or_fail(&layer.wq, "batch_chunk_full_attn_input_projection")?,
+                    lloyd_f16_or_fail(&layer.wk, "batch_chunk_full_attn_input_projection")?,
+                    lloyd_f16_or_fail(&layer.wv, "batch_chunk_full_attn_input_projection")?,
+                ],
             )?;
+        } else if lloyd_mmq_lut_route(gpu) {
+            if lloyd_mmq_a4_route(gpu, n, layer.wq.k) {
+                // Staged i8 twin: one int8 quantize of X, then the existing
+                // single-matrix SET per projection — no pad-128 allocs.
+                let xq = gpu.ensure_int8_mmq_x(&pbs.x_rot_batch, n, layer.wq.k)?;
+                gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                    &layer.wq.buf,
+                    xq,
+                    &pbs.fa_q_full_batch,
+                    layer.wq.m,
+                    layer.wq.k,
+                    n,
+                    lloyd_c16_or_fail(&layer.wq, "batch_chunk_full_attn_input_projection")?,
+                )?;
+                gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                    &layer.wk.buf,
+                    xq,
+                    &pbs.fa_k_batch,
+                    layer.wk.m,
+                    layer.wk.k,
+                    n,
+                    lloyd_c16_or_fail(&layer.wk, "batch_chunk_full_attn_input_projection")?,
+                )?;
+                gpu.gemm_mq4g256v2_mmq_set_prequant_i8_lloyd(
+                    &layer.wv.buf,
+                    xq,
+                    &pbs.fa_v_batch,
+                    layer.wv.m,
+                    layer.wv.k,
+                    n,
+                    lloyd_c16_or_fail(&layer.wv, "batch_chunk_full_attn_input_projection")?,
+                )?;
+            } else {
+                gpu.gemm_qkv_mq4g256v2_mmq_lloyd(
+                    &layer.wq.buf,
+                    &layer.wk.buf,
+                    &layer.wv.buf,
+                    &pbs.x_rot_batch,
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.fa_v_batch,
+                    layer.wq.m,
+                    layer.wk.m,
+                    layer.wv.m,
+                    layer.wq.k,
+                    n,
+                    lloyd_c16_or_fail(&layer.wq, "batch_chunk_full_attn_input_projection")?,
+                    lloyd_c16_or_fail(&layer.wk, "batch_chunk_full_attn_input_projection")?,
+                    lloyd_c16_or_fail(&layer.wv, "batch_chunk_full_attn_input_projection")?,
+                )?;
+            }
         } else if let Some(prep) = &fp8_prep {
             // gfx1201 FP8-stream: the producer already emitted the fp8
             // pre-pass planes; consume them directly, no pack launch.
@@ -1471,7 +1564,19 @@ pub fn batch_chunk_full_attn_output_projection(
         &pbs.fa_attn_out_batch
     };
     if let Some(prep) = &a8_wo_prep {
-        out_proj_residual_i8_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
+        if layer.wo.dtype == DType::MQ4G256V2Lloyd {
+            out_proj_residual_i8_prepared_lloyd(
+                gpu,
+                pbs,
+                &layer.wo,
+                &layer.w_gate,
+                prep,
+                fusion,
+                n,
+            )?;
+        } else {
+            out_proj_residual_i8_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
+        }
     } else if let Some(prep) = &iu4_wo_prep {
         out_proj_residual_iu4_prepared(gpu, pbs, &layer.wo, &layer.w_gate, prep, fusion, n)?;
     } else if let Some(prep) = &fp8_wo_prep {
@@ -3137,14 +3242,26 @@ pub fn batched_gemm_single_weight(
         }
         DType::MQ4G256V2Lloyd => {
             // qt=52 mixed-format twin of the V2 arm: zero Y then residual
-            // (== plain GEMM). gfx11 → MMQ-LUT ADD; gfx12 keeps FP8-LUT.
+            // (== plain GEMM). Small-N gfx1100 → F16-BT-LUT; N>=64 or other
+            // gfx11 → MMQ-LUT ADD; gfx12 keeps FP8-LUT.
             let bytes = w.m * n * 4;
             if let Some(stream) = gpu.active_stream.as_ref() {
                 gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
             } else {
                 gpu.hip.memset(&y.buf, 0, bytes)?;
             }
-            if lloyd_mmq_lut_route(gpu) {
+            if lloyd_f16_bt_route(gpu, n) {
+                let lut = lloyd_f16_or_fail(w, "batched_gemm_single_weight")?;
+                gpu.gemm_mq4g256v2_residual_wmma_gfx11_lloyd(&w.buf, x, y, w.m, w.k, n, lut)
+            } else if lloyd_mmq_lut_route(gpu) {
+                if lloyd_mmq_a4_route(gpu, n, w.k) {
+                    // Staged i8 twin ADD into the zeroed Y (== plain GEMM).
+                    let c16 = lloyd_c16_or_fail(w, "batched_gemm_single_weight")?;
+                    let xq = gpu.ensure_int8_mmq_x(x, n, w.k)?;
+                    return gpu.gemm_mq4g256v2_mmq_add_prequant_i8_lloyd(
+                        &w.buf, xq, y, w.m, w.k, n, c16,
+                    );
+                }
                 let c16 = lloyd_c16_or_fail(w, "batched_gemm_single_weight")?;
                 gpu.gemm_hfq4g256_residual_mmq_lloyd(&w.buf, x, y, w.m, w.k, n, c16)
             } else {

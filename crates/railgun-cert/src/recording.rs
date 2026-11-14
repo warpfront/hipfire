@@ -2613,6 +2613,18 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-dispatch/src/pipeline/batched.rs",
+        function: "lloyd_f16_bt_route",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched.rs",
+        function: "lloyd_mmq_a4_route",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched.rs",
         function: "mq_f16_projection_fast_route",
         occurrences: 2,
         decisions: &["gfx1100-f16-projection-fast-route"],
@@ -3389,6 +3401,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_mq4g256v2_wmma_gfx11_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
         function: "gemm_hfq4g256",
         occurrences: 2,
         decisions: &["gfx906-cdna3-prefill-routes"],
@@ -3464,6 +3482,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq4g256v2_residual_wmma_gfx11_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
         function: "gemm_qkv_hfq4g256",
         occurrences: 2,
         decisions: &["gfx906-cdna3-prefill-routes"],
@@ -3524,6 +3548,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_mq4g256v2_wmma_gfx11_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
         function: "gemm_qkv_mq5g256v2_wmma_gfx12",
         occurrences: 2,
         decisions: &["gfx12-mqv2-prefill-projection-routes"],
@@ -3581,6 +3611,12 @@ pub const SITES: &[Site] = &[
         function: "gemm_qkvza_mq4g256v2_wmma",
         occurrences: 4,
         decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_mq4g256v2_wmma_gfx11_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
     },
     Site {
         file: "rdna-compute/src/gemm.rs",
