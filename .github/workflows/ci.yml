@@ -378,33 +378,26 @@ jobs:
     # branch that introduces them, so a red here is a real regression, not lint
     # debt. scripts/gates.sh is the separate GPU/model harness and needs
     # hardware -- it is deliberately not called from CI.
+    #
+    # The gate list lives in scripts/ci-gates.sh, which scripts/pre-commit-ci.sh
+    # runs too, so the two cannot drift apart.
     steps:
       - uses: actions/checkout@v4
         with:
-          # ratchet-diff resolves the merge base to read the base revision's
-          # thresholds; a shallow clone has no merge base to find.
+          # ratchet-diff and the MTP parity guard resolve the merge base to read
+          # the base revision; a shallow clone has no merge base to find.
           fetch-depth: 0
-      - name: Ratchets, layering, arch dispatch, qt register, bypass ledger
-        run: bash scripts/leanup-ratchets.sh
-      - name: Crate maps match the tree
-        run: python3 scripts/check-crate-maps.py --check
-      - name: Scratch growers invalidate captured graphs first
-        run: python3 scripts/check-scratch-growth.py
-      - name: Released CHANGELOG sections match their tags
-        run: python3 scripts/check-changelog.py
-      - name: Row-predicate selector constants carry a covering receipt
-        run: python3 scripts/check-selector-receipts.py
-      - name: MTP parity fixture bytes are pinned and the acceptance ratchet self-tests
-        run: |
-          python3 scripts/check-mtp-parity-ratchet.py --self-test
-          python3 scripts/check-mtp-parity-ratchet.py fixture
-      - name: No committed expectation was loosened
-        # PR-only: on a push there is no proposed base to compare against.
-        if: github.event_name == 'pull_request'
+      - name: Structural gates (scripts/ci-gates.sh)
+        # On a PR the base-relative gates run too (ratchet-diff: no committed
+        # expectation was loosened; the MTP parity ratchet guard). A push has
+        # no proposed base to compare against.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ "${{ github.event_name }}" != pull_request ]; then
+            exec bash scripts/ci-gates.sh
+          fi
           labels_json=$(gh pr view "${{ github.event.pull_request.number }}" --json labels)
           if echo "$labels_json" | jq -e '.labels[] | select(.name=="ratchet-raise")' >/dev/null; then
             export RATCHET_RAISE_LABEL_PRESENT=1
@@ -412,7 +405,7 @@ jobs:
             export RATCHET_RAISE_LABEL_PRESENT=0
           fi
           export RATCHET_RAISE_REQUIRE_LABEL=1
-          bash scripts/ratchet-diff.sh "origin/${{ github.base_ref }}"
+          bash scripts/ci-gates.sh "origin/${{ github.base_ref }}"
 
   supply-chain:
     name: cargo-deny (${{ matrix.checks }})

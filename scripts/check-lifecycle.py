@@ -53,7 +53,7 @@ ENV_VALUE_NOTES = {
 }
 # Developer-namespace spellings of deprecated env knobs (for TOML profiles).
 DEPRECATED_DEVELOPER_KEYS: set[str] = set()
-CI_ENTRY_GLOBS = ["scripts/no-gpu-ci.sh", ".github/workflows/*", ".githooks/*"]
+CI_ENTRY_GLOBS = ["scripts/no-gpu-ci.sh", "scripts/ci-gates.sh", ".github/workflows/*", ".githooks/*"]
 STATUSES = ("stable", "experimental", "developer", "harness", "deprecated")
 
 

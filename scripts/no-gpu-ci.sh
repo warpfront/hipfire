@@ -25,21 +25,15 @@ fi
 echo "== Rust check =="
 cargo check --workspace --examples
 
-echo "== Rust no-GPU unit tests =="
-cargo test -p rdna-compute --lib
-cargo test -p rdna-compute --test all_launcher_abi
-cargo test -p hipfire-cpu --lib
-cargo test -p hipfire-engine --lib decide
-cargo test -p hipfire-generate --lib decide
-cargo test -p hipfire-arch-qwen35 --lib moe_prefill
-cargo test -p hipfire-config -p hipfire-registry -p hipfire-client -p hipfire-cli -p hipfire-tui
-# peacemaker audit: lds_store_unwaited_at_barrier on committed code objects (no ROCm).
-cargo test -p peacemaker-isa --features toolchain --lib audit::
-# Advisory Peacemaker schedule lint: deterministic CPU-only calibration, no GPU.
-cargo test -j 8 -p peacemaker-isa --features toolchain --lib cost_lint::
+echo "== Rust no-GPU tests the ci.yml test shards do not run =="
+# ci.yml already runs every --lib unit test (lib-peacemaker-isa, with the
+# peacemaker-isa `toolchain` feature; lib-rest), all_launcher_abi
+# (rdna-compute-abi), hipfire-cli (serve) and hipfire-tui's bin tests (int-rest).
+# Left here: the hipfire-config bin and peacemaker-author's integration tests.
+cargo test -p hipfire-config --bins
 # PM typed core and its runtime driver, including the trybuild compile-fail
 # race tests: their pinned rustc diagnostics catch API changes that alter them.
-cargo test -p peacemaker-author
+cargo test -p peacemaker-author --test '*'
 
 echo "== Python CPU tests =="
 # Explicit paths only: scripts/*_test.py includes torch+CUDA scripts.
@@ -52,6 +46,12 @@ PYTEST_PATHS=(
     scripts/test_check_changelog.py scripts/test_check_conflict_markers.py scripts/test_kernel_idproof.py
     scripts/test_agentic_gate_driver.py
     scripts/test_post_land_smoke.py scripts/test_post_land_smoke_orchestrator.py
+    scripts/test_check_crate_maps.py scripts/test-pm-rdna-xml.py
+    scripts/test_registry_gen_flash_next.py scripts/test_registry_gen_ple.py
+    scripts/test_route_plan_build.py scripts/test_route_plan_walk.py
+    scripts/test_ep_hot_units.py scripts/test_k0rank.py scripts/test_fn_ep_gate_chunk.py
+    scripts/test_gfx1100_xts_scope.py scripts/test_q8_overlay_writer.py scripts/test_subq4_g2_carrier.py
+    scripts/slowlink-gap/quality_test_scorer.py scripts/slowlink-gap/quality_test_campaign.py
 )
 if python3 -c 'import pytest, numpy' 2>/dev/null; then
     python3 -m pytest "${PYTEST_PATHS[@]}"
@@ -68,16 +68,10 @@ python3 scripts/test_client_build_stamp.py
 python3 scripts/test_uninstall.py
 bash scripts/test-gpu-lock.sh
 bash scripts/test-fmt-sweep-rebase.sh
+python3 scripts/test-no-cargo-fmt-guard.py
 
-echo "== Env/docs drift check =="
-python3 scripts/check-env-docs.py
-
-echo "== Lifecycle check (deprecated surfaces opt-in; env/config lifecycle status) =="
-python3 scripts/check-lifecycle.py
-
-echo "== MTP parity fixture bytes + ratchet self-test =="
-python3 scripts/check-mtp-parity-ratchet.py --self-test
-python3 scripts/check-mtp-parity-ratchet.py fixture
+# The structural gates (env-docs, lifecycle, MTP parity, ...) are
+# scripts/ci-gates.sh, run by the ci.yml `gates` job.
 
 echo "== Leaked hipfire processes =="
 # A test that execs a workspace-built hipfire/daemon must not leave it running.
