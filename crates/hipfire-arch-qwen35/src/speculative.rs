@@ -5738,6 +5738,12 @@ fn dflash_commit_decision_borrowed(
                 )
             })
         })?;
+        // A plain (unscoped) replay is ordinary prefill and opens the GDN
+        // stream: seal before the next verify. A scoped replay never opens it,
+        // so this is the host stamp only.
+        target
+            .dn_state
+            .seal_streams(gpu, position + replay_tokens.len())?;
     }
     Ok((
         committed,
@@ -13929,6 +13935,10 @@ pub fn seed_target_hidden_suffix_abortable_parts(
                 );
             }
         }
+        // The suffix (prompt-cache HIT tail, forced think-close tokens, or a
+        // terminal-prefix replay) ends this ordinary-prefill phase: seal at its
+        // end before decode/verify reads the recurrent state.
+        target.dn_state.seal_streams(gpu, pos)?;
         Ok(false)
     })();
     seed.free(gpu);
