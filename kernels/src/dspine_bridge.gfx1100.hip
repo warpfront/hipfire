@@ -222,7 +222,8 @@ __global__ void dspine_serial_chain_gfx1100(
     int R,
     int T,
     int packed_stride,
-    int N
+    int N,
+    float rms_scale
 ) {
     const int block_idx = blockIdx.x;
     const int tid = threadIdx.x;
@@ -277,7 +278,7 @@ __global__ void dspine_serial_chain_gfx1100(
             for (int i = 0; i < 16; ++i) {
                 s += s_part[lane][i];
             }
-            s_score[lane] = base[(long long)row * K + lane] + rms[row] * s;
+            s_score[lane] = base[(long long)row * K + lane] + rms[row] * rms_scale * s;
         }
         __syncthreads();
         // 4. argmax over K candidates; advance the chain.

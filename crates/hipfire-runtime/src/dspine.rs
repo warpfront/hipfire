@@ -405,6 +405,14 @@ impl DspineBridge {
         &self.s_rms
     }
 
+    /// Refinement-term scale for weight sweeps (upstream weight=1.0).
+    pub fn rms_scale(&self) -> f32 {
+        let v = hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_WEIGHT")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok());
+        v.unwrap_or(1.0)
+    }
+
     /// Serial last-write refinement over the block's head logits:
     /// top-16 candidates per row (`dspine_topk16`), then the fused
     /// sender-table score chain (`dspine_serial_chain`) walked from
@@ -438,8 +446,18 @@ impl DspineBridge {
         let out = gpu.alloc_tensor(&[rows], rdna_compute::DType::F32)?;
         eprintln!("[dspine-serial] rows={} base.buf={}B cand.buf={}B out.buf={}B",
             rows, base.byte_size(), cand.byte_size(), out.byte_size());
+        // Experiment switch: HIPFIRE_DSPINE_SERIAL_MODE=argmax returns the
+        // pre-write argmax (topk16 lane 0) and skips the sender chain —
+        // isolates how much of the acceptance gap is the refinement term
+        // vs the base ordering itself.
+        let mode_argmax =
+            hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_MODE").as_deref() == Ok("argmax");
         let pick = (|| -> hip_bridge::HipResult<Vec<u32>> {
             gpu.dspine_topk16(logits, &cand, &base, rows, vocab)?;
+            if mode_argmax {
+                let raw = gpu.download_f32(&cand)?;
+                return Ok((0..rows).map(|i| raw[i * 16].to_bits()).collect());
+            }
             let anchor_raw = gpu.download_f32(&self.s_anchor)?;
             let anchor_sid = anchor_raw[0].to_bits();
             // logits row r is draft row r+1 (the seed row has no head
@@ -466,6 +484,7 @@ impl DspineBridge {
                 self.r,
                 self.t,
                 3 * self.r,
+                self.rms_scale(),
             )?;
             let raw = gpu.download_f32(&out)?;
             let picks: Vec<u32> = raw.iter().map(|f| f.to_bits()).collect();
@@ -474,8 +493,30 @@ impl DspineBridge {
                 let cand_raw = gpu.download_f32(&cand)?;
                 let top1: Vec<u32> = cand_raw.iter().map(|f| f.to_bits()).collect();
                 let agree = picks.iter().enumerate().filter(|(i, p)| **p == top1[i * 16]).count();
-                eprintln!("[dspine-serial] rows={} agree-with-top1={}/{} picks0..8={:?} top1-0..8={:?} base00={:.3}",
-                    rows, agree, rows,
+                // Coverage: is the post-write argmax id even inside this
+                // row's pre-write top-16 shortlist? Below 100% caps the
+                // refinement's acceptance no matter how good the score is.
+                let covered = (0..rows)
+                    .filter(|&i| (0..16).any(|k| top1[i * 16 + k] == picks[i]))
+                    .count();
+                let top1_in_short = (0..rows)
+                    .filter(|&i| {
+                        let want = top1[i * 16];
+                        (0..16).any(|k| {
+                            cand_raw[i * 16 + k].to_bits() == want
+                        })
+                    })
+                    .count();
+                // Per-row hit bitmap against the post-write argmax: shows
+                // where the chain drifts (row 0 has no accumulated sid
+                // error; deep rows inherit every earlier miss).
+                let hits: String = (0..rows)
+                    .map(|i| {
+                        if picks[i] == top1[i * 16] { '1' } else { '0' }
+                    })
+                    .collect();
+                eprintln!("[dspine-serial] rows={} agree={} covered={} top1_in_short={}/{} hits={} picks0..8={:?} top1-0..8={:?} base00={:.3}",
+                    rows, agree, covered, top1_in_short, rows, hits,
                     &picks[..rows.min(8)],
                     &top1[..rows.min(8)],
                     base_raw.first().copied().unwrap_or(0.0));

@@ -266,6 +266,7 @@ impl Gpu {
         r: usize,
         t: usize,
         packed_stride: usize,
+        rms_scale: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx1100() {
@@ -291,6 +292,7 @@ impl Gpu {
         let mut r_val = r as i32;
         let mut t_val = t as i32;
         let mut ps_val = packed_stride as i32;
+        let mut rs_val = rms_scale;
         let mut n_val = n as i32;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -309,6 +311,7 @@ impl Gpu {
             &mut t_val as *mut _ as *mut c_void,
             &mut ps_val as *mut _ as *mut c_void,
             &mut n_val as *mut _ as *mut c_void,
+            &mut rs_val as *mut _ as *mut c_void,
         ];
         self.launch_maybe_blob(
             SYM,
@@ -333,6 +336,7 @@ impl Gpu {
                 b.push_i32(t_val);
                 b.push_i32(ps_val);
                 b.push_i32(n_val);
+                b.push_f32(rs_val);
                 b
             },
         )
