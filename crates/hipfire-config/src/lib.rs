@@ -3712,7 +3712,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         Some("HIPFIRE_QWEN35_NPU_TRUNK"),
-        "Experimental qwen3.8-27b dense NPU stage: off, auto, on or emulate. No 27B prefill driver exists yet, so any value other than off is refused at load."
+        "Experimental qwen3.8-27b dense NPU stage: off, auto, on or emulate. on runs AR prefill in bank pairs (8192 + 512..8192 rows) with every GDN/FA in-projection on the gfx1151 NPU; emulate runs the same W8xA8 math on the GPU; auto stays GPU-only until a measured 27B calibration exists."
     ),
     field!(
         "fusions.npu_trunk_calibration",

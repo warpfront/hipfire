@@ -1164,6 +1164,10 @@ pub struct Qwen35Scratch {
     // `HIPFIRE_PREFILL_MAX_BATCH=4096` cache sizing would give, only when the
     // implicit cache differs from them. RefCell for the same reason as above.
     pub reuse_virtual_pbs: std::cell::RefCell<Option<PrefillBatchScratch>>,
+    /// The armed qwen3.8-27b NPU trunk (`HIPFIRE_QWEN35_NPU_TRUNK=on|emulate`); `None` is the
+    /// GPU-only route. Set once at load; RefCell for the same reason as above.
+    #[cfg(target_os = "linux")]
+    pub npu_trunk: std::cell::RefCell<Option<crate::npu_trunk::NpuTrunk>>,
 }
 
 fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
@@ -1422,6 +1426,8 @@ impl Qwen35Scratch {
             prefill_batch: None,
             widened_prefill_batch: std::cell::RefCell::new(None),
             reuse_virtual_pbs: std::cell::RefCell::new(None),
+            #[cfg(target_os = "linux")]
+            npu_trunk: std::cell::RefCell::new(None),
         })
         .and_then(|mut s| {
             // Allocate MoE scratch only for MoE configs. Done after the
@@ -1575,6 +1581,10 @@ impl Qwen35Scratch {
         }
         if let Some(pbs) = self.reuse_virtual_pbs.into_inner() {
             note(pbs.free_gpu(gpu));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(npu) = self.npu_trunk.into_inner() {
+            npu.free_gpu(gpu);
         }
         match first_err {
             Some(e) => Err(e),

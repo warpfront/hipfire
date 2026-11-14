@@ -702,6 +702,7 @@ developer_callsite	*	HIPFIRE_QWEN35_FA_EPILOGUE_FUSE#developer_var=as_deref.!=So
 developer_callsite	*	HIPFIRE_QWEN35_FA_PREP_FUSE#developer_var=as_deref.!=Some("0")
 developer_callsite	*	HIPFIRE_QWEN35_FINITE_TRACE#developer_var_os=is_none
 developer_callsite	*	HIPFIRE_QWEN35_GRAMMAR#developer_var=ok.as_deref
+developer_callsite	*	HIPFIRE_QWEN35_NPU_TRUNK_FAULT_CHAIN#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD#developer_var=ok.and_then.or.unwrap_or(0.1f32)
 developer_callsite	*	HIPFIRE_QWEN4_APPEND_WMMA#developer_bool=QWEN4_APPEND_WMMA_DEFAULT
 developer_callsite	*	HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS#developer_var=ok.and_then.filter.unwrap_or(QWEN4_APPEND_WMMA_MIN_ROWS_DEFAULT)

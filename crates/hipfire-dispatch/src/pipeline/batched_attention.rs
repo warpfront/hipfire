@@ -2958,17 +2958,19 @@ pub fn batch_chunk_full_attn_attn(
     } else {
         None
     };
-    batch_chunk_full_attn_input_projection(
-        gpu,
-        layer,
-        config,
-        pbs,
-        n,
-        dim,
-        q8_wmma_arch,
-        fusion,
-        math,
-    )?;
+    if !pbs.in_projected {
+        batch_chunk_full_attn_input_projection(
+            gpu,
+            layer,
+            config,
+            pbs,
+            n,
+            dim,
+            q8_wmma_arch,
+            fusion,
+            math,
+        )?;
+    }
     let fa_pm_qprep = fusion == DflashFusionCtx::Off
         && !vl_mrope
         && !gfx12_fa_prep

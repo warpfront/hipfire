@@ -160,7 +160,7 @@ impl HostProbe for SystemProbe<'_> {
     }
 
     fn npu_firmware(&self) -> Result<String, String> {
-        npu_trunk::npu_firmware()
+        hipfire_runtime::coproc::calibration::npu_firmware()
     }
 
     fn rocm(&self) -> RocmState {
@@ -277,7 +277,8 @@ impl HostProbe for SystemProbe<'_> {
     }
 
     fn model_trunk_index_sha256(&self, path: &Path) -> Option<String> {
-        npu_trunk::model_trunk_index_sha256(&HfqFile::open(path).ok()?).ok()
+        hipfire_runtime::coproc::calibration::model_trunk_index_sha256(&HfqFile::open(path).ok()?)
+            .ok()
     }
 
     fn calibration_records(&self) -> Result<Vec<(String, &'static str)>, String> {

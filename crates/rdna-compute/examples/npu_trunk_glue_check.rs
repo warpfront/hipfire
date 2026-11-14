@@ -14,7 +14,8 @@ use rdna_compute::{
     npu_trunk::{NpuBf16Layout, NpuTrunkOutput},
     DType, Gpu, GpuTensor,
 };
-const AP: usize = 32;
+// A full bank of distinct activation rows: a shorter period hides 128-row block permutations of the A stream.
+const AP: usize = 8192;
 const WP: usize = 64;
 // Same numeric DAG as lab quant_row(grid=1); repeated rows cache exact CPU dots,
 // not GPU results. Every output and every padding byte is still compared.

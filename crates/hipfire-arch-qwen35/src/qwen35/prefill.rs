@@ -4120,12 +4120,19 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         };
         // A ring seed chunks exactly as AR does; chunks wider than staging
         // land straight in the ring, so the ring (not its staging) bounds
-        // them. Every other ring caller stays capped at staging.
-        let ring_cap = hidden_rb.as_ref().map(|rb| {
+        // them. Every other ring caller stays capped at staging. With the 27B
+        // NPU trunk armed a ring seed is not capped at all: its caller hands
+        // over a whole pair, whose rows past the ring land as a row-by-row wrap
+        // would leave them (`write_rows_at`); unpaired seed pieces already fit.
+        #[cfg(target_os = "linux")]
+        let npu_armed = scratch.npu_trunk.borrow().is_some();
+        #[cfg(not(target_os = "linux"))]
+        let npu_armed = false;
+        let ring_cap = hidden_rb.as_ref().and_then(|rb| {
             if ring_seed {
-                rb.max_positions.max(rb.max_batch)
+                (!npu_armed).then(|| rb.max_positions.max(rb.max_batch))
             } else {
-                rb.max_batch
+                Some(rb.max_batch)
             }
         });
         let chunk_batch = prefill_effective_chunk_batch(limit, pbs.max_batch, ring_cap);
@@ -4141,13 +4148,14 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         );
         // F2 pair envelope, loop-invariant half: ordinary sequential prefill
         // with FA layers batch-admissible, no tree/tape/max_layer machinery,
-        // no hidden ring (its staging commit is chunk-sequential), plain
+        // the hidden ring only where a pair says so (F2: none, its staging commit is
+        // chunk-sequential; NPU: an eager ring seed), plain
         // DFlash fusion. Per-pair checks (exact 512+512, eager, shapes, KV
         // tier, max_ctx window) happen at each step below.
         let fa_pair_common_admitted = tree_verify.is_none()
             && gdn_tape.is_none()
             && max_layer.is_none()
-            && hidden_rb.is_none()
+            && (hidden_rb.is_none() || ring_seed)
             && matches!(fusion, DflashFusionCtx::Off)
             && (kv_cache.quant_q8
                 || kv_cache.quant_asym4
@@ -4164,6 +4172,10 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             && gpu.flags.packed_mq4_prefill
             && dense_layers_have_projection_dtype(weights, DType::MQ4G256);
         let mut chunk_start = 0usize;
+        // End row of bank A of a contained (NPU-faulted) pair: the GPU-only rerun offers the
+        // pair's bank-boundary cut when it reaches it, as the `off` schedule checkpoints there.
+        #[cfg(target_os = "linux")]
+        let mut rerun_cut: Option<usize> = None;
         while chunk_start < n {
             let remaining = n - chunk_start;
             // Widened grouping keeps an odd tail attached to the largest
@@ -4226,10 +4238,70 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     }
                 }
             }
+            // qwen3.8-27b co-processor pair: a full bank A plus a real bank B of an ordinary
+            // dense prefill, when the trunk admits it (`auto`: the calibrated cost test). Shorter
+            // tails stay GPU-only in every mode, so `on` and `emulate` split a prompt identically.
+            #[cfg(target_os = "linux")]
+            if let (true, Some(npu)) = (
+                wide && chunk_n == crate::npu_trunk::BANK_ROWS,
+                scratch.npu_trunk.borrow().as_ref(),
+            ) {
+                let pair_b = crate::npu_trunk::NpuTrunk::bank_b_rows(remaining).filter(|&b| {
+                    fa_pair_common_admitted
+                        && per_token_hidden_out.is_none()
+                        // A ring seed lands both banks straight in the ring in one piece.
+                        && hidden_rb.as_ref().is_none_or(|rb| rb.writes_direct(gpu, chunk_n + b))
+                        && mask_override.is_none()
+                        && pbs.max_batch >= chunk_n
+                        && fa_layers_batched_ok(kv_cache, weights, config, gpu.arch.as_str())
+                        && !gpu.graphs.capture_mode
+                        && !gpu.replay.is_recording()
+                        && !super::vl_prefill::overlaps(start_pos + chunk_start, chunk_n + b)
+                        && npu.admits_pair(start_pos + chunk_start, b)
+                });
+                if let Some(b) = pair_b {
+                    let a_end = chunk_start + chunk_n;
+                    eprintln!(
+                        "{}: pair rows={chunk_n}+{b} pos={} mode={}",
+                        crate::npu_trunk::SWITCH.tag,
+                        start_pos + chunk_start,
+                        npu.mode()
+                    );
+                    npu.save_pre(gpu, dn_state)?;
+                    if let Err(e) = forward_prefill_npu_pair(
+                        gpu,
+                        weights,
+                        config,
+                        [&tokens[chunk_start..a_end], &tokens[a_end..a_end + b]],
+                        start_pos + chunk_start,
+                        kv_cache,
+                        dn_state,
+                        scratch,
+                        [pbs, &npu.bank_b],
+                        npu,
+                        hidden_rb.as_deref(),
+                        needs_last_token_logits,
+                    ) {
+                        npu.abort(&format!("{e:?}"));
+                        if npu.contain(gpu, dn_state, &e)? {
+                            // NPU fault: the route is latched off; rerun these rows GPU-only.
+                            rerun_cut = Some(a_end);
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                    if let Some(rb) = hidden_rb.as_mut() {
+                        rb.finish_prefill_chunk(gpu, chunk_n + b)?;
+                    }
+                    chunk_start = a_end + b;
+                    continue;
+                }
+            }
             // F2 pair peek is only relevant to the legacy 512-row schedule;
             // widened chunks carry their tail directly.
             let pair_b = if chunk_n == FA_PAIR_ROWS
                 && fa_pair_common_admitted
+                && hidden_rb.is_none()
                 && remaining - chunk_n >= MIN_BATCH
             {
                 next_prefill_chunk_len(remaining - chunk_n, chunk_batch)
@@ -4369,6 +4441,13 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 rb.finish_prefill_chunk(gpu, chunk_n)?;
             }
             chunk_start = chunk_end;
+            #[cfg(target_os = "linux")]
+            if rerun_cut == Some(chunk_end) {
+                rerun_cut = None;
+                if let Some(npu) = scratch.npu_trunk.borrow().as_ref() {
+                    npu.cut_here(gpu, dn_state, start_pos + chunk_end)?;
+                }
+            }
         }
         Ok(())
     })();
@@ -7693,6 +7772,315 @@ fn forward_prefill_chunk_pair_body(
     )?;
 
     Ok(())
+}
+
+/// qwen3.8-27b co-processor pair: two consecutive chunks (banks A = 0, B = 1) of one request
+/// run layer-major on [`hipfire_runtime::coproc::pair_schedule`]. `Prepare(l, b)` lands any
+/// owed residual fold, runs the layer's RMSNorm + rotation (+ AWQ) to F16 and hands the bank to
+/// the trunk (pack + kick, or the `emulate` twin GEMM); `Run(l, b)` consumes the projections
+/// into the bank's `dn_*` / `fa_*` scratch and runs the mixer core, out-projection and FFN with
+/// the native in-projection skipped. Bank A precedes bank B on every layer, so recurrent state,
+/// KV and logits see the rows in sequential order. Callers hold the envelope: ordinary
+/// sequential prefill, dense batched GDN/FA layers, no tape / tree / side output; a hidden ring
+/// (an eager DFlash prompt seed) takes bank A's rows at `head` and bank B's right after, the
+/// caller then advances it by both banks.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_npu_pair(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: [&[u32]; 2],
+    start: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    pbs: [&PrefillBatchScratch; 2],
+    npu: &crate::npu_trunk::NpuTrunk,
+    ring: Option<&HiddenStateRingBuffer>,
+    needs_last_token_logits: bool,
+) -> HipResult<()> {
+    use hipfire_runtime::coproc::{pair_schedule, PairOp};
+    let rows = [tokens[0].len(), tokens[1].len()];
+    let starts = [start, start + rows[0]];
+    kv_cache.require_mapped_capacity(checked_kv_end(
+        start,
+        rows[0] + rows[1],
+        "forward_prefill_npu_pair",
+    )?)?;
+    let dim = config.dim;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    let dim_row_bytes = dim * 4;
+    let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
+    let math = verify_dense_math(gpu);
+    let dims = hybrid_dims(config);
+    let flash = flash_scratch(s);
+    let commit = rows.map(|n| widened_commit_stride(true, n));
+    let multirow = [0, 1].map(|b| {
+        q8_multirow_attn_admitted(
+            gpu.arch_caps.arch(),
+            kv_cache.quant_q8,
+            config.head_dim,
+            rows[b],
+            starts[b] + rows[b],
+            fa_pertoken_min_ctx(gpu.arch_caps.arch()),
+            false,
+            false,
+            gpu.graphs.capture_mode,
+            gpu.replay.is_recording(),
+            gfx1100_split_verify_admitted(
+                gpu,
+                config,
+                kv_cache.quant_q8 && matches!(kv_cache.v_mode, llama::VMode::Q8),
+                kv_cache.uses_vmm_backend(),
+                rows[b],
+                starts[b] + rows[b],
+                s.flash_partials.numel(),
+            ),
+        )
+    });
+    let ctx = rows.map(|n| {
+        DispatchCtx::new(gpu)
+            .with_workload(prefill_dispatch_workload(false, false, false))
+            .with_batch_size(n)
+    });
+    // Recurrent-state / KV slot of every layer (both banks share them).
+    let mut slot = Vec::with_capacity(config.n_layers);
+    let (mut delta, mut kv) = (0usize, 0usize);
+    for t in &config.layer_types {
+        match t {
+            LayerType::LinearAttention => {
+                slot.push(delta);
+                delta += 1;
+            }
+            LayerType::FullAttention => {
+                slot.push(kv);
+                kv += 1;
+            }
+        }
+    }
+    let init = |gpu: &mut Gpu, b: usize| -> HipResult<()> {
+        batch_chunk_embed_tokens(
+            gpu,
+            weights,
+            tokens[b],
+            s,
+            pbs[b],
+            rows[b],
+            dim,
+            dim_row_bytes,
+            true,
+            false,
+            false,
+            None,
+            None,
+        )?;
+        batch_chunk_upload_positions(
+            gpu,
+            pbs[b],
+            BatchSemantics::Sequential,
+            starts[b],
+            rows[b],
+            None,
+            false,
+        )
+    };
+    // One ordinary-prefill forward of absolute start `start` on the GDN stream: both banks append
+    // to each layer in order, and the cursors publish only after the whole pair succeeded.
+    let plain = ordinary_prefill_forward(
+        gpu,
+        ring,
+        None,
+        true,
+        false,
+        false,
+        DflashFusionCtx::Off,
+        false,
+        false,
+        false,
+        false,
+    );
+    with_gdn_forward(gpu, dn_state, plain, start, |gpu, dn_state, route| {
+        init(gpu, 0)?;
+        let mut seq = [None, None];
+        let mut last = None;
+        for op in pair_schedule(config.n_layers) {
+            match op {
+                PairOp::Init { bank } => init(gpu, bank)?,
+                PairOp::Prepare { layer, bank } => {
+                    let (norm, next) = match &weights.layers[layer] {
+                        LayerWeights::DeltaNet(l) => (&l.attn_norm, l.wqkv.dispatch_ref()),
+                        LayerWeights::FullAttn(l) => (&l.attn_norm, l.wq.dispatch_ref()),
+                        _ => return Err(HipError::new(0, "npu pair: layer is not dense GDN/FA")),
+                    };
+                    gpu.flush_residual_fold()?;
+                    // The F16 producer of this norm is not built on gfx1151 and lean scratch has no F16
+                    // plane: F32 norm + AWQ + FWHT here, the trunk casts into its own F16 input.
+                    hipfire_dispatch::pipeline::batched::fused_rmsnorm_rotate_mq_batched_for(
+                        gpu,
+                        &pbs[bank].x_batch,
+                        norm,
+                        &next,
+                        &pbs[bank].x_rot_batch,
+                        dim,
+                        config.norm_eps,
+                        rows[bank],
+                    )?;
+                    seq[bank] = npu.prepare(gpu, layer, bank, pbs[bank], rows[bank])?;
+                }
+                PairOp::Run { layer, bank } => {
+                    let n = rows[bank];
+                    npu.consume(gpu, layer, bank, seq[bank], pbs[bank], n)?;
+                    last = seq[bank].take().or(last);
+                    let view = pbs[bank].view();
+                    let projected = hipfire_dispatch::pipeline::batched::BatchScratch {
+                        in_projected: true,
+                        ..view
+                    };
+                    // Each bank appends at its own absolute start; both share the forward's
+                    // candidate cursors, so bank B continues from bank A's.
+                    let bank_route = match route {
+                        GdnPrefillRoute::Stream(call) => GdnPrefillRoute::Stream(GdnStreamCall {
+                            start_pos: starts[bank] as u64,
+                            ..call
+                        }),
+                        legacy => legacy,
+                    };
+                    match &weights.layers[layer] {
+                        LayerWeights::DeltaNet(l) => {
+                            batch_chunk_delta_net_attn(
+                                gpu,
+                                &l.mixer_view(),
+                                &dims,
+                                &projected,
+                                &deltanet_state_view(dn_state),
+                                n,
+                                dim,
+                                k_dim,
+                                v_dim,
+                                n_v_heads,
+                                hd,
+                                BatchSemantics::Sequential,
+                                None,
+                                None,
+                                0,
+                                slot[layer],
+                                q8_wmma_arch,
+                                q8_wmma_arch,
+                                BatchEpilogue::Residual,
+                                DflashFusionCtx::Off,
+                                bank_route,
+                            )?;
+                            l.ffn_rows(
+                                gpu,
+                                config.norm_eps,
+                                &view,
+                                n,
+                                dim,
+                                q8_wmma_arch,
+                                q8_wmma_arch,
+                                MlpOutput::Residual,
+                                DflashFusionCtx::Off,
+                                math,
+                            )?;
+                        }
+                        LayerWeights::FullAttn(l) => {
+                            batch_chunk_full_attn_attn(
+                                gpu,
+                                multirow[bank],
+                                &l.mixer_view(),
+                                &dims,
+                                &projected,
+                                &flash,
+                                &kv_view(kv_cache),
+                                n,
+                                dim,
+                                starts[bank],
+                                starts[bank] + n,
+                                &ctx[bank],
+                                BatchSemantics::Sequential,
+                                None,
+                                q8_wmma_arch,
+                                q8_wmma_arch,
+                                slot[layer],
+                                layer,
+                                BatchEpilogue::Residual,
+                                DflashFusionCtx::Off,
+                                commit[bank],
+                                None,
+                            )?;
+                            l.ffn_rows(
+                                gpu,
+                                config.norm_eps,
+                                &view,
+                                n,
+                                dim,
+                                q8_wmma_arch,
+                                q8_wmma_arch,
+                                MlpOutput::Residual,
+                                DflashFusionCtx::Off,
+                                math,
+                            )?;
+                        }
+                        _ => unreachable!("checked at Prepare"),
+                    }
+                    if let Some(rb) = ring {
+                        if let Some(slot) = rb.extract_slot(layer) {
+                            rb.write_rows_at(
+                                gpu,
+                                slot,
+                                starts[bank] - start,
+                                &pbs[bank].x_batch,
+                                n,
+                            )?;
+                        }
+                    }
+                    dump_hidden_localize(
+                        gpu,
+                        &pbs[bank].x_batch,
+                        n,
+                        starts[bank],
+                        dim,
+                        layer,
+                        "batched",
+                    );
+                    // Bank B has not touched this layer yet: its recurrent state and stream carry are
+                    // the bank-boundary state, the snapshot an unpaired prefill takes between its
+                    // chunks; its cursor is bank A's still-unpublished candidate.
+                    if bank == 0 && matches!(config.layer_types[layer], LayerType::LinearAttention)
+                    {
+                        let candidate = match &route {
+                            GdnPrefillRoute::Stream(call) => call.candidates.borrow()[slot[layer]],
+                            GdnPrefillRoute::Legacy => None,
+                        };
+                        let meta = candidate
+                            .or_else(|| dn_state.stream.lane_meta(slot[layer], 0).copied())
+                            .ok_or_else(|| HipError::new(0, "npu pair: no GDN stream cursor"))?;
+                        npu.stage_layer(gpu, dn_state, slot[layer], meta)?;
+                    }
+                }
+            }
+        }
+        npu.finish(last)?;
+        npu.set_cut(starts[1]);
+        batch_chunk_final_logits(
+            gpu,
+            weights,
+            config,
+            s,
+            pbs[1],
+            rows[1],
+            dim,
+            dim_row_bytes,
+            None,
+            needs_last_token_logits,
+            true,
+            &ctx[1],
+        )
+    })
 }
 
 /// Every full-attention layer takes the batched FA route (KV tier with

@@ -1946,6 +1946,47 @@ impl DeltaNetSnapshot {
         Ok(())
     }
 
+    /// Copy one DeltaNet layer's state (recurrent S, scales, conv, EF residual and its GDN stream
+    /// carry) into this snapshot with `meta` as that layer's stream cursor, ordered on the active
+    /// stream. A bank-pair prefill stages its bank boundary one layer at a time, between the two
+    /// banks' runs of that layer, while the forward's candidate cursors are still unpublished.
+    pub fn save_layer_from(
+        &mut self,
+        state: &DeltaNetState,
+        layer: usize,
+        meta: GdnStreamMeta,
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        self.check_structure(state)?;
+        if state.stream.lanes != 1 || layer >= self.stream.meta.len() {
+            return Err(HipError::new(
+                0,
+                "DeltaNet snapshot: per-layer staging needs a single-lane state",
+            ));
+        }
+        for (backs, lives) in self.back_families().into_iter().zip(live_families(state)) {
+            if let (Some(dst), Some(src)) = (backs.get(layer), lives.get(layer)) {
+                gpu.memcpy_dtod_at_auto(dst, 0, &src.buf, 0, src.buf.size().min(dst.size()))?;
+            }
+        }
+        self.stream.identity = state.stream.identity();
+        self.stream.meta[layer] = meta;
+        Ok(())
+    }
+
+    /// Copy every buffer and the stream image of `other` (a snapshot of the same state geometry)
+    /// into this one.
+    pub fn copy_from(&mut self, other: &DeltaNetSnapshot, gpu: &mut Gpu) -> HipResult<()> {
+        for (backs, srcs) in self.back_families().into_iter().zip(other.back_families()) {
+            for (d, s) in backs.iter().zip(srcs) {
+                // Active stream: ordered after the staged per-layer copies.
+                gpu.memcpy_dtod_at_auto(d, 0, s, 0, s.size().min(d.size()))?;
+            }
+        }
+        self.stream = other.stream.clone();
+        Ok(())
+    }
+
     /// Async copy live state → backup on `stream`.
     ///
     /// Caller owns cross-stream ordering. MTP trunk-spine uses this as an
@@ -3782,16 +3823,27 @@ impl HiddenStateRingBuffer {
         if !self.writes_direct(gpu, n) {
             return self.write_rows_to_staging(gpu, extract_idx, src, n);
         }
-        assert!(
-            n <= self.max_positions,
-            "write_chunk_rows: n {} > ring max_positions {}",
-            n,
-            self.max_positions
-        );
-        let first = n.min(self.max_positions - self.head);
-        self.copy_rows_into_ring(gpu, extract_idx, self.head, src, 0, first)?;
-        if first < n {
-            self.copy_rows_into_ring(gpu, extract_idx, 0, src, first, n - first)?;
+        self.write_rows_at(gpu, extract_idx, 0, src, n)
+    }
+
+    /// Direct ring write of `n` rows of `src` at slots `head + offset..`, wrapping; `head` does
+    /// not move. A forward that writes several consecutive row blocks (the 27B NPU pair's two
+    /// banks) places block `i` at the sum of the earlier blocks' rows, then calls
+    /// [`finish_prefill_chunk`](Self::finish_prefill_chunk) once with the total. Rows past the
+    /// ring's capacity land exactly where a row-by-row wrap leaves them: only the last
+    /// `max_positions` rows are copied (a windowed draft's ring keeps the last W positions).
+    pub fn write_rows_at(
+        &self,
+        gpu: &mut Gpu,
+        extract_idx: usize,
+        offset: usize,
+        src: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        for (dst, src_row, rows) in ring_write_spans(self.max_positions, self.head, offset, n) {
+            if rows > 0 {
+                self.copy_rows_into_ring(gpu, extract_idx, dst, src, src_row, rows)?;
+            }
         }
         Ok(())
     }
@@ -3849,6 +3901,58 @@ impl HiddenStateRingBuffer {
     pub fn reset(&mut self) {
         self.head = 0;
         self.written = 0;
+    }
+}
+
+/// Copies `(dst slot, src row, rows)` that place `n` rows written at ring slot `head + offset`
+/// into a ring of `max` slots exactly as a row-by-row wrap would: only the last `max` rows of the
+/// block land, the second span is the wrapped tail (0 rows when none).
+fn ring_write_spans(
+    max: usize,
+    head: usize,
+    offset: usize,
+    n: usize,
+) -> [(usize, usize, usize); 2] {
+    let skip = n.saturating_sub(max);
+    let rows = n - skip;
+    let start = (head + offset + skip) % max;
+    let first = rows.min(max - start);
+    [(start, skip, first), (0, skip + first, rows - first)]
+}
+
+#[cfg(test)]
+mod ring_write_tests {
+    use super::ring_write_spans;
+
+    /// The 27B NPU pair's two banks (`offset` = bank A rows) against a row-by-row wrap.
+    #[test]
+    fn bank_writes_equal_a_row_by_row_wrap() {
+        for max in [2048usize, 65536] {
+            for head in [0usize, 37, 2047] {
+                for (a, b) in [
+                    (8192usize, 8192usize),
+                    (8192, 1076),
+                    (8192, 512),
+                    (8192, 2955),
+                    (100, 7),
+                ] {
+                    let mut want = vec![None; max];
+                    for row in 0..a + b {
+                        want[(head + row) % max] = Some(row);
+                    }
+                    let mut got = vec![None; max];
+                    for (offset, n) in [(0, a), (a, b)] {
+                        for (dst, src, rows) in ring_write_spans(max, head % max, offset, n) {
+                            assert!(dst + rows <= max, "span past the ring");
+                            for i in 0..rows {
+                                got[dst + i] = Some(offset + src + i);
+                            }
+                        }
+                    }
+                    assert_eq!(got, want, "max {max} head {head} banks {a}+{b}");
+                }
+            }
+        }
     }
 }
 
@@ -13116,6 +13220,62 @@ pub fn take_dn_checkpoint_pinned(
     pin: Option<usize>,
     prefix: (&[u32], &[u32]),
 ) {
+    admit_dn_checkpoint(
+        cks,
+        dn,
+        kv,
+        gpu,
+        pos,
+        interval,
+        cap,
+        pin,
+        prefix,
+        |snap, gpu| snap.save_from(dn, gpu),
+    );
+}
+
+/// [`take_dn_checkpoint_pinned`] of a state staged earlier at `pos` (a bank-pair prefill's bank
+/// boundary) instead of the live state; same ring, interval, pin and memory rules.
+#[allow(clippy::too_many_arguments)]
+pub fn take_dn_checkpoint_staged(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    staged: &DeltaNetSnapshot,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    interval: usize,
+    cap: usize,
+    pin: Option<usize>,
+    prefix: (&[u32], &[u32]),
+) {
+    admit_dn_checkpoint(
+        cks,
+        dn,
+        kv,
+        gpu,
+        pos,
+        interval,
+        cap,
+        pin,
+        prefix,
+        |snap, gpu| snap.copy_from(staged, gpu),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_dn_checkpoint(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    kv: &KvCache,
+    gpu: &mut Gpu,
+    pos: usize,
+    interval: usize,
+    cap: usize,
+    pin: Option<usize>,
+    prefix: (&[u32], &[u32]),
+    fill: impl FnOnce(&mut DeltaNetSnapshot, &mut Gpu) -> HipResult<()>,
+) {
     if pos == 0 || cap == 0 {
         return;
     }
@@ -13163,7 +13323,7 @@ pub fn take_dn_checkpoint_pinned(
             },
         }
     };
-    if let Err(e) = snap.save_from(dn, gpu) {
+    if let Err(e) = fill(&mut snap, gpu) {
         // A recycled slot is partially overwritten, so it cannot rejoin the
         // ring either way: free it.
         eprintln!("take_dn_checkpoint: pos={pos} skipped: snapshot save failed: {e}");
@@ -13580,8 +13740,27 @@ impl SeedPrefill {
         Self { ceiling, pbs: None }
     }
 
-    fn next_len(&self, remaining: usize) -> usize {
-        dflash_seed_outer_chunk_len(remaining, self.ceiling)
+    /// Outer chunk at prompt position `pos`: `(rows, paired, first)`. `rows` is AR's plan, doubled
+    /// where [`crate::npu_trunk::outer_chunk_rows`] pairs, exactly as AR does; `paired` marks an
+    /// armed 27B NPU pair; `first` is the chunk an unpaired seed runs here (the pair's bank A),
+    /// which places the user-turn checkpoint as `off` does. A pair runs as one piece whatever
+    /// the ring size ([`HiddenStateRingBuffer::write_rows_at`] keeps the last ring rows), so it
+    /// is refused when the caller reads every piece back to host.
+    fn next_len(
+        &self,
+        target: &DflashTargetParts<'_>,
+        pos: usize,
+        remaining: usize,
+        host_capture: bool,
+    ) -> (usize, bool, usize) {
+        let first = dflash_seed_outer_chunk_len(remaining, self.ceiling);
+        let outer =
+            crate::npu_trunk::outer_chunk_rows(target.scratch, self.ceiling, pos, remaining);
+        if outer > self.ceiling && !host_capture {
+            (dflash_seed_outer_chunk_len(remaining, outer), true, first)
+        } else {
+            (first, false, first)
+        }
     }
 
     /// Rows of the next forward call inside an outer chunk with `remaining`
@@ -13756,7 +13935,12 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                 }
                 return Ok(true);
             }
-            let outer = seed.next_len(prompt_tokens.len() - seq_pos);
+            let (outer, paired, first) = seed.next_len(
+                target,
+                seq_pos,
+                prompt_tokens.len() - seq_pos,
+                target_hidden_host.is_some(),
+            );
             if let Some(cks) = checkpoints.as_deref_mut() {
                 take_turn_checkpoint_before_chunk(
                     cks,
@@ -13764,7 +13948,7 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
                     target.kv_cache,
                     gpu,
                     seq_pos,
-                    outer,
+                    first,
                     ckpt_cap,
                     turn,
                     (&prompt_tokens[..seq_pos], &[]),
@@ -13772,7 +13956,11 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
             }
             let end = seq_pos + outer;
             while seq_pos < end {
-                let piece = SeedPrefill::piece_len(hidden_rb, end - seq_pos);
+                let piece = if paired {
+                    end - seq_pos
+                } else {
+                    SeedPrefill::piece_len(hidden_rb, end - seq_pos)
+                };
                 let chunk = &prompt_tokens[seq_pos..seq_pos + piece];
                 seed.forward(gpu, target, hidden_rb, chunk, seq_pos, prompt_tokens.len())?;
                 append_prefill_hidden_host(
@@ -13786,6 +13974,18 @@ pub fn seed_target_hidden_from_prompt_abortable_parts(
             // Prompt-prefill progress (silent outside a `prompt_phase`).
             hipfire_runtime::prefill_progress::report(seq_pos, prompt_tokens.len());
             if let Some(cks) = checkpoints.as_deref_mut() {
+                crate::npu_trunk::take_pair_checkpoint(
+                    target.scratch,
+                    cks,
+                    target.dn_state,
+                    target.kv_cache,
+                    gpu,
+                    ckpt_interval,
+                    ckpt_cap,
+                    turn,
+                    seq_pos,
+                    (&prompt_tokens[..seq_pos], &[]),
+                );
                 take_turn_checkpoint(
                     cks,
                     target.dn_state,
@@ -13884,7 +14084,7 @@ pub fn seed_target_hidden_suffix_abortable_parts(
             if abort_check() {
                 return Ok(true);
             }
-            let outer = seed.next_len(suffix.len() - off);
+            let (outer, paired, first) = seed.next_len(target, pos, suffix.len() - off, false);
             if let Some(cks) = checkpoints.as_deref_mut() {
                 take_turn_checkpoint_before_chunk(
                     cks,
@@ -13892,7 +14092,7 @@ pub fn seed_target_hidden_suffix_abortable_parts(
                     target.kv_cache,
                     gpu,
                     pos,
-                    outer,
+                    first,
                     ckpt_cap,
                     turn,
                     (prefix_head, &suffix[..off]),
@@ -13900,7 +14100,11 @@ pub fn seed_target_hidden_suffix_abortable_parts(
             }
             let end = off + outer;
             while off < end {
-                let piece = SeedPrefill::piece_len(hidden_rb, end - off);
+                let piece = if paired {
+                    end - off
+                } else {
+                    SeedPrefill::piece_len(hidden_rb, end - off)
+                };
                 seed.forward(
                     gpu,
                     target,
@@ -13916,6 +14120,18 @@ pub fn seed_target_hidden_suffix_abortable_parts(
             // forced advances and terminal repair stay quiet).
             hipfire_runtime::prefill_progress::report(off, suffix.len());
             if let Some(cks) = checkpoints.as_deref_mut() {
+                crate::npu_trunk::take_pair_checkpoint(
+                    target.scratch,
+                    cks,
+                    target.dn_state,
+                    target.kv_cache,
+                    gpu,
+                    ckpt_interval,
+                    ckpt_cap,
+                    turn,
+                    pos,
+                    (prefix_head, &suffix[..off]),
+                );
                 take_turn_checkpoint(
                     cks,
                     target.dn_state,

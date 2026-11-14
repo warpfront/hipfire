@@ -363,9 +363,9 @@ fn match_calibration(
         .map_err(|e| e.to_string())?;
     let mut key = match firmware {
         Some(firmware) => {
-            trunk::runtime_key_with_firmware(&gpu.arch, &pci, firmware, index, route)?
+            coproc::calibration::runtime_key_with_firmware(&gpu.arch, &pci, firmware, index, route)?
         }
-        None => trunk::runtime_calibration_key(&gpu.arch, &pci, index, route)?,
+        None => coproc::calibration::runtime_calibration_key(&gpu.arch, &pci, index, route)?,
     };
     // A user calibration file stays fully strict; the built-in one binds on the hard key fields
     // (arch, build, model, epilogue, route) and takes this host's GPU PCI address, NPU firmware and
@@ -538,7 +538,7 @@ impl NpuForward {
             },
             || {
                 if mode == Mode::Auto {
-                    trunk::npu_firmware().map(Some).map_err(fail)
+                    coproc::calibration::npu_firmware().map(Some).map_err(fail)
                 } else {
                     Ok(None)
                 }
