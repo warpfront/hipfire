@@ -541,6 +541,36 @@ receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
 date = "2026-11-12"
 pinned_in = "947a59a8ac"
 
+[kld."gfx1150.qt44_w4a4.wt2"]
+status = "current"
+arch = "gfx1150"
+route = "A4 (default), cold kernel cache"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "WT2"
+kld = 0.068198
+kldseq_sha256 = "b6860355f701cb244335749d384ffa8af20c4b570aeb911dd5e9eb98533385eb"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+evaluator = "eval_hipfire-42b8b40e2-gfx1150"
+receipt = "/home/david/qcal/pr1150-gfx1150-kld/runs/"
+date = "2026-11-15"
+pinned_in = "PINNED_IN_W4A4_PLACEHOLDER"
+
+[kld."gfx1150.qt44_w4a4.code24"]
+status = "current"
+arch = "gfx1150"
+route = "A4 (default), cold kernel cache"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "code24"
+kld = 0.050419
+kldseq_sha256 = "4d1f0d99353c2bd3eb1f53456e9196377cbed6cf030b1e36ad51971846e078e4"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+evaluator = "eval_hipfire-42b8b40e2-gfx1150"
+receipt = "/home/david/qcal/pr1150-gfx1150-kld/runs/"
+date = "2026-11-15"
+pinned_in = "PINNED_IN_W4A4_PLACEHOLDER"
+
 [kld."gfx942.fn-fp8.wt2"]
 status = "current"
 arch = "gfx942"

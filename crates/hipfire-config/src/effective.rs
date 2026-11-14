@@ -204,7 +204,10 @@ pub fn effective(key: &str, resolved: &ResolvedConfig, ctx: &ArchCtx) -> Effecti
         STATE_QUANT_KEY if builtin && is_auto(&out.value) => state_quant_auto(&mut out, ctx),
         MTP_K_KEY if builtin && is_auto(&out.value) => mtp_k_auto(&mut out, ctx),
         IU4_KEY => {
-            if !matches!(ctx.arch(), "" | "gfx1100" | "gfx1151" | "gfx1201") {
+            if !matches!(
+                ctx.arch(),
+                "" | "gfx1100" | "gfx1151" | "gfx1150" | "gfx1201"
+            ) {
                 not_used_on_gpu(&mut out);
             }
         }
@@ -833,7 +836,7 @@ mod tests {
 
     #[test]
     fn iu4_prefill_is_used_only_on_gfx1100_gfx1151_gfx1201() {
-        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1150"] {
             let e = eff(IU4_KEY, &ctx(arch));
             assert!(e.used_on_gpu, "{arch}");
             assert_eq!(e.value, ConfigValue::Bool(true));

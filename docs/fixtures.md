@@ -70,6 +70,8 @@ reuse it for two scored runs with fresh HOME directories. Cold-JIT Halo runs
 can differ in chunk 0 only; warm-cache WT2/code24 repeats agree byte for byte
 (the cold-cache discriminator runs are recorded in
 [`docs/perf-checkpoints/2026-11-15-agents-md-measurements.md`](perf-checkpoints/2026-11-15-agents-md-measurements.md)).
+The gfx1150 qt44 W4A4 pins ran fully cold (fresh HOME per run, JIT compiled
+every time) and their repeats still agree byte for byte.
 
 Current pins (`status = "current"`), one per arch × route × corpus:
 
@@ -79,6 +81,7 @@ Current pins (`status = "current"`), one per arch × route × corpus:
 | gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | `pin:kld/gfx1201.fp8.wt2` | `pin:kld/gfx1201.fp8.code24` |
 | gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | `pin:kld/gfx1100.a4.wt2` | `pin:kld/gfx1100.a4.code24` |
 | gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | `pin:kld/gfx1151.a4.wt2` | `pin:kld/gfx1151.a4.code24` |
+| gfx1150 | A4 qt44 W4A4 (default), `--kv-mode q8 --kv-v q8`, cold kernel cache | `pin:kld/gfx1150.qt44_w4a4.wt2` | `pin:kld/gfx1150.qt44_w4a4.code24` |
 | gfx942 | Flash-Next stock FP8 AR (default route, `qwen4_kld eval --decode`), BF16 teacher | `pin:kld/gfx942.fn-fp8.wt2` | `pin:kld/gfx942.fn-fp8.code24` |
 
 The RDNA rows are re-pinned for the canonical GDN prefill (chunk- and
