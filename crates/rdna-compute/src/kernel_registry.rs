@@ -3042,7 +3042,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     if matches!(arch, "gfx1201" | "gfx1100") {
         add!(
             "gemv_bf16_xf32",
-            kernels::gemv_bf16_xf32_src(arch == "gfx1151"),
+            kernels::gemv_bf16_xf32_src(matches!(arch, "gfx1151" | "gfx1201")),
             ["gemv_bf16_xf32"]
         );
     }
@@ -4223,7 +4223,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
         add!(
             "gemv_bf16_xf32",
-            kernels::gemv_bf16_xf32_src(arch == "gfx1151"),
+            kernels::gemv_bf16_xf32_src(matches!(arch, "gfx1151" | "gfx1201")),
             [
                 "gemv_bf16_xf32",
                 "gemv_bf16_xf32_bf16_scaled_add",

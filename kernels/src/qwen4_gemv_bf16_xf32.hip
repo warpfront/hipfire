@@ -104,10 +104,11 @@ static __device__ __forceinline__ float gemv_bf16_xf32_row(
     return sum;
 }
 
-// gfx1151 runs the shared row body (eight dwordx4 loads in flight, measured
-// there). Every other arch keeps the original single-step kernel verbatim, so
-// its code is unchanged for the models that already ship on it.
-#if defined(__gfx1151__)
+// gfx1151 and gfx1201 run the shared row body (eight dwordx4 loads in
+// flight; same per-chain add order, so bitwise the single-step kernel).
+// Measured there; every other arch keeps the original single-step kernel
+// verbatim, so its code is unchanged for the models that already ship on it.
+#if defined(__gfx1151__) || defined(__gfx1201__)
 __launch_bounds__(32, 20)
 extern "C" __global__ void gemv_bf16_xf32(
     const unsigned short* __restrict__ W,  // [M, K] bf16 (raw u16)
