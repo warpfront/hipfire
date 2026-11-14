@@ -495,6 +495,49 @@ impl DspineBridge {
                 self.rms_scale(),
             )?;
             let raw = gpu.download_f32_stream_ordered(&out)?;
+            if hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_CAPTURE")
+                .as_deref()
+                == Ok("1")
+            {
+                // Route-2 pilot: capture the trunk's REAL packed projections
+                // (all block rows) plus the serial picks and the post-write
+                // argmax, so the offline analysis can measure the codebook
+                // approximation residual per predecessor word.
+                let packed_real = gpu.download_f32_stream_ordered(&self.s_packed)?;
+                let cand_raw = gpu.download_f32_stream_ordered(&cand)?;
+                let picks_u: Vec<u32> = raw.iter().map(|f| f.to_bits()).collect();
+                let argmax_u: Vec<u32> = cand_raw
+                    .chunks_exact(16)
+                    .map(|c| c[0].to_bits())
+                    .collect();
+                let packed_u: Vec<u32> = packed_real.iter().map(|f| f.to_bits()).collect();
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/dspine_capture/packed.bin")
+                {
+                    use std::io::Write as _;
+                    let _ = f.write_all(&{
+                        let mut b = Vec::with_capacity(packed_u.len() * 4);
+                        for v in &packed_u {
+                            b.extend_from_slice(&v.to_le_bytes());
+                        }
+                        b
+                    });
+                }
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/dspine_capture/meta.jsonl")
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        f,
+                        "{{\"rows\":{},\"picks\":{:?},\"argmax\":{:?}}}",
+                        rows, picks_u, argmax_u
+                    );
+                }
+            }
             let picks: Vec<u32> = raw.iter().map(|f| f.to_bits()).collect();
             if hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_DIAG").as_deref() == Ok("1") {
                 let base_raw = gpu.download_f32(&base)?;
