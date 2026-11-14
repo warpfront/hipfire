@@ -17,8 +17,7 @@ use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
 use hipfire_engine::terminal::{
-    active_attempt_id, await_client_terminal_commit, check_abort,
-    emit_aborted_terminal_after_abort, ClientTerminalDecision,
+    active_attempt_id, await_client_terminal_commit, check_abort, ClientTerminalDecision,
 };
 use hipfire_engine::turn_cache::{apply_turn_cache_action, TurnCacheAction};
 
@@ -2875,7 +2874,8 @@ pub fn generate_vl_dots_ocr(
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
         ClientTerminalDecision::Abort => {
-            crate::ar::emit_active_route_cancel(stdout, id, generated);
+            // Abort at the commit wait: roll back like the in-loop polls.
+            dots_ar_cancel(state, gpu, stdout, id, generated);
         }
     }
 }
@@ -3138,7 +3138,7 @@ pub fn run_dots_ocr_ngram_loop(
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
         ClientTerminalDecision::Abort => {
-            emit_aborted_terminal_after_abort(stdout, id, generated);
+            dots_spec_cancel(bundle, spec, gpu, stdout, id, generated);
         }
     }
 }
@@ -3380,7 +3380,7 @@ pub fn generate_dots_ocr_text(
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
         ClientTerminalDecision::Abort => {
-            emit_aborted_terminal_after_abort(stdout, id, generated);
+            dots_ar_cancel(state, gpu, stdout, id, generated);
         }
     }
 }
@@ -4171,10 +4171,10 @@ pub fn generate_lfm2_vl(
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
         ClientTerminalDecision::Abort => {
-            // Same release contract as the post-loop latch: the terminal pair
-            // must be the recognized wire dialect or serve holds its
-            // admission guard forever.
-            crate::ar::emit_active_route_cancel(stdout, id, generated_count);
+            // Abort at the commit wait: roll back (seq_pos was just advanced)
+            // so the uncommitted turn never stays resident.
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
         }
     }
 }
