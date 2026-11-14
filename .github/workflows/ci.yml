@@ -161,11 +161,16 @@ jobs:
             # the rdna-compute host twin on the CPU interpreter;
             # all_launcher_abi is the MoE launcher ABI gate;
             # kernel_registry_coverage is the static kernel-pack completeness
-            # gate (every runtime HIP module registered or allowlisted).
+            # gate (every runtime HIP module registered or allowlisted);
+            # flagship_pack_coverage and fn_route_plan pin the source SHA-256 of
+            # every measured flagship / walked Flash-Next module (GPU- and
+            # hipcc-free; a kernel source edit must re-pin them in the same change).
             run: |
               cargo test --profile ci --locked -p rdna-compute --test dflash_accept_emu
               cargo test --profile ci --locked -p rdna-compute --test all_launcher_abi
               cargo test --profile ci --locked -p rdna-compute --test kernel_registry_coverage
+              cargo test --profile ci --locked -p rdna-compute --test flagship_pack_coverage
+              cargo test --profile ci --locked -p rdna-compute --test fn_route_plan
           - name: int-e
             run: cargo test --profile ci --locked $INTEG_PKGS --test '[e]*'
           - name: int-l

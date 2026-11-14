@@ -197,7 +197,11 @@ fn assert_measured_hip_modules_registered(arch: &str, fixture: &str) {
     }
     assert!(
         failures.is_empty(),
-        "pack coverage regressions:\n{}",
+        "pack coverage regressions:\n{}\n\
+         A kernel source edit changes these pins: after confirming the edit is intended, replace the \
+         old sha256 with the printed source sha256 on every matching row of \
+         crates/rdna-compute/tests/fixtures/flagship-pack-gfx{{1201,1100,1151}}.tsv and add a header \
+         comment naming the commit, in the same change.",
         failures.join("\n")
     );
 }

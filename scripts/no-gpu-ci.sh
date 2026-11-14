@@ -27,8 +27,9 @@ cargo check --workspace --examples
 
 echo "== Rust no-GPU tests the ci.yml test shards do not run =="
 # ci.yml already runs every --lib unit test (lib-peacemaker-isa, with the
-# peacemaker-isa `toolchain` feature; lib-rest), all_launcher_abi and
-# kernel_registry_coverage (rdna-compute-abi), hipfire-cli (serve) and
+# peacemaker-isa `toolchain` feature; lib-rest), all_launcher_abi,
+# kernel_registry_coverage, flagship_pack_coverage and fn_route_plan
+# (rdna-compute-abi), hipfire-cli (serve) and
 # hipfire-tui's bin tests (int-rest).
 # Left here: the hipfire-config bin and peacemaker-author's integration tests.
 cargo test -p hipfire-config --bins
