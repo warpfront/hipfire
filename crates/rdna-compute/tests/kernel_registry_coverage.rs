@@ -4356,6 +4356,64 @@ impl Gpu {
     );
 }
 
+/// Promotion-lane rule (b), planted negative of the 2026-11-11 pack hole:
+/// 174e89a045 parked `gated_delta_net_q8_fast_stream` behind a `no-caller`
+/// row, 3f4ae83087 wired its caller 38 minutes later and left the row, so the
+/// module stayed out of the pack and the first 9B/A3B prompt hipcc-compiled
+/// it. A production-reachable module cannot hide behind `no-caller`.
+#[test]
+fn no_caller_row_fails_once_production_calls_its_loader() {
+    let parked = r#"
+impl Gpu {
+    fn gdn_stream(&mut self) {
+        self.ensure_kernel("gated_delta_net_q8_fast_stream", SRC, "f");
+    }
+}
+"#;
+    let wired = r#"
+impl Gpu {
+    fn gdn_stream(&mut self) {
+        self.ensure_kernel("gated_delta_net_q8_fast_stream", SRC, "f");
+    }
+    fn prefill_sequential(&mut self) {
+        self.gdn_stream();
+    }
+}
+"#;
+    let row = Allow {
+        kind: "module".to_string(),
+        name: "gated_delta_net_q8_fast_stream".to_string(),
+        category: "no-caller".to_string(),
+        line: 332,
+    };
+    let unpacked: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+    let mut packed = unpacked.clone();
+    packed.insert(
+        "gated_delta_net_q8_fast_stream".into(),
+        ["gfx1100", "gfx1201"].into_iter().collect(),
+    );
+
+    // Parked: no production caller, the claim holds.
+    let f = check(&scan1(parked), &unpacked, std::slice::from_ref(&row));
+    assert!(f.is_empty(), "{f:?}");
+    // Wired with the row left behind: the gate fails and names the caller.
+    let f = check(&scan1(wired), &unpacked, std::slice::from_ref(&row));
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert!(
+        f[0].contains("claims no-caller") && f[0].contains("prefill_sequential"),
+        "{f:?}"
+    );
+    // Wired with neither row nor registry entry: unregistered module.
+    let f = check(&scan1(wired), &unpacked, &[]);
+    assert!(
+        f.len() == 1 && f[0].contains("gated_delta_net_q8_fast_stream"),
+        "{f:?}"
+    );
+    // The fix: registered (packed), row deleted.
+    let f = check(&scan1(wired), &packed, &[]);
+    assert!(f.is_empty(), "{f:?}");
+}
+
 #[test]
 fn fixture_validation() {
     let text = "\

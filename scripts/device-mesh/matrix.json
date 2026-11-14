@@ -75,6 +75,11 @@
    "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
    "size_bytes": 125288544792,
    "source": "no download: the Flash-Next XTS monolithic GPTQ3 file. The registry tag qwen3.8:flash-next-gptq3 now names qwen3.8-flash-next-base.mq4-xts, so never hipfire pull it; verify a local copy against this lock."
+  },
+  "qwen3.5-9b.mq4": {
+   "sha256": "ba83acf5bfd5d4e334b0afc26d779734e31623bb7f74e807c3581dfecb3128ad",
+   "size_bytes": 5313750016,
+   "source": "registry tag qwen3.5:9b (hipfire-models/qwen3.5-9b, file qwen3.5-9b.mq4)"
   }
  },
  "notes": [
@@ -2521,6 +2526,898 @@
    },
    "probe": "none",
    "route": "pp+tp/vision-mesh"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "$DAEMON_BIN  # JSONL session with product defaults; see positive_session"
+    ]
+   },
+   "env": {},
+   "fixtures": [
+    "qwen3.8:27b-mq4-xts"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151",
+    "gfx942"
+   ],
+   "id": "dense-27b-ar",
+   "milestone": "lane",
+   "note": "Promotion lane: 27B mq4-xts autoregressive decode from the installed archive (no compiler), reasoning on and off, then forced advance (8-token think cap), an appended turn served from the held conversation, an aborted attempt rolled back, and clean warm/cold replays that must reproduce every answer.",
+   "positive_session": [
+    {
+     "send": {
+      "type": "load",
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 4096,
+       "dflash_mode": "off"
+      }
+     },
+     "expect": "loaded"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "on",
+      "attempt_id": 1,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 384,
+      "thinking_enabled": true,
+      "max_think_tokens": 0,
+      "prompt": "Write a Python function that returns the sum of a list of numbers."
+     },
+     "handshake": true
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "off",
+      "attempt_id": 2,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": false,
+      "prompt": "Write a Python function that returns the sum of a list of numbers."
+     },
+     "handshake": true
+    },
+    {
+     "send": {
+      "type": "reset",
+      "attempt_id": 3
+     },
+     "expect": "reset"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap1",
+      "attempt_id": 10,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       }
+      ],
+      "prompt": "Write a Python function that returns the sum of a list of numbers."
+     },
+     "handshake": true,
+     "capture_text": "cap1"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap2",
+      "attempt_id": 11,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       }
+      ],
+      "prompt": "Now make it ignore None values."
+     },
+     "handshake": true,
+     "capture_text": "cap2"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "ab3",
+      "attempt_id": 12,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap2"
+       },
+       {
+        "role": "user",
+        "content": "Add a docstring and one doctest."
+       }
+      ],
+      "prompt": "Add a docstring and one doctest."
+     },
+     "abort_at_commit_ready": true
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap3",
+      "attempt_id": 13,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap2"
+       },
+       {
+        "role": "user",
+        "content": "Add a docstring and one doctest."
+       }
+      ],
+      "prompt": "Add a docstring and one doctest."
+     },
+     "handshake": true
+    },
+    {
+     "send": {
+      "type": "reset",
+      "attempt_id": 14
+     },
+     "expect": "reset"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap1b",
+      "attempt_id": 20,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       }
+      ],
+      "prompt": "Write a Python function that returns the sum of a list of numbers."
+     },
+     "handshake": true,
+     "capture_text": "cap1b"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap2b",
+      "attempt_id": 21,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1b"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       }
+      ],
+      "prompt": "Now make it ignore None values."
+     },
+     "handshake": true,
+     "capture_text": "cap2b"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap3b",
+      "attempt_id": 22,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1b"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap2b"
+       },
+       {
+        "role": "user",
+        "content": "Add a docstring and one doctest."
+       }
+      ],
+      "prompt": "Add a docstring and one doctest."
+     },
+     "handshake": true
+    },
+    {
+     "send": {
+      "type": "reset",
+      "attempt_id": 23
+     },
+     "expect": "reset"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap3c",
+      "attempt_id": 30,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap2"
+       },
+       {
+        "role": "user",
+        "content": "Add a docstring and one doctest."
+       }
+      ],
+      "prompt": "Add a docstring and one doctest."
+     },
+     "handshake": true
+    },
+    {
+     "send": {
+      "type": "unload"
+     },
+     "expect": "unloaded"
+    }
+   ],
+   "predicate": {
+    "kind": "wire_transitions",
+    "aborted_ids": [
+     "ab3"
+    ],
+    "cached_ids": [
+     "cap2",
+     "cap2b"
+    ],
+    "rolled_back": true,
+    "identical_ids": [
+     [
+      "cap1",
+      "cap1b"
+     ],
+     [
+      "cap2",
+      "cap2b"
+     ]
+    ],
+    "rollback_checks": [
+     [
+      "cap3",
+      "cap3b",
+      "cap3c"
+     ]
+    ],
+    "require": [
+     "[think-cap]"
+    ],
+    "forbid": [
+     "hipcc compiled (",
+     "but hipcc is unavailable"
+    ]
+   },
+   "probe": "thin-driver",
+   "route": "single/ar-reasoning-transitions",
+   "transitions": [
+    "forced-advance",
+    "append",
+    "rollback"
+   ]
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "$DAEMON_BIN  # JSONL session with product defaults; see positive_session"
+    ]
+   },
+   "env": {},
+   "fixture_files": [
+    "$MODELS_DIR/qwen38-27b-dflash-mq4.hfq"
+   ],
+   "fixtures": [
+    "qwen3.8:27b-mq4-xts"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151",
+    "gfx942"
+   ],
+   "id": "dflash-think-close",
+   "milestone": "lane",
+   "note": "Promotion lane, escape of 2026-11-13 (58dd700316: 'forced-token advance ... the GDN stream is Open'): 27B mq4-xts with its pinned DFlash draft, reasoning on and off, the think-cap forced close inside the spec loop, an appended turn, an aborted attempt rolled back, and clean warm/cold replays. An absent or mismatched draft is hardware-blocked, which the lane counts as a failure.",
+   "positive_session": [
+    {
+     "send": {
+      "type": "load",
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 4096,
+       "dflash_mode": "on",
+       "draft": "$MODELS_DIR/qwen38-27b-dflash-mq4.hfq"
+      }
+     },
+     "expect": "loaded"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "on",
+      "attempt_id": 1,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 384,
+      "thinking_enabled": true,
+      "max_think_tokens": 0,
+      "prompt": "Write a Python function that returns the sum of a list of numbers."
+     },
+     "handshake": true
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "off",
+      "attempt_id": 2,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": false,
+      "prompt": "Write a Python function that returns the sum of a list of numbers."
+     },
+     "handshake": true
+    },
+    {
+     "send": {
+      "type": "reset",
+      "attempt_id": 3
+     },
+     "expect": "reset"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap1",
+      "attempt_id": 10,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       }
+      ],
+      "prompt": "Write a Python function that returns the sum of a list of numbers."
+     },
+     "handshake": true,
+     "capture_text": "cap1"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap2",
+      "attempt_id": 11,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       }
+      ],
+      "prompt": "Now make it ignore None values."
+     },
+     "handshake": true,
+     "capture_text": "cap2"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "ab3",
+      "attempt_id": 12,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap2"
+       },
+       {
+        "role": "user",
+        "content": "Add a docstring and one doctest."
+       }
+      ],
+      "prompt": "Add a docstring and one doctest."
+     },
+     "abort_at_commit_ready": true
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap3",
+      "attempt_id": 13,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap2"
+       },
+       {
+        "role": "user",
+        "content": "Add a docstring and one doctest."
+       }
+      ],
+      "prompt": "Add a docstring and one doctest."
+     },
+     "handshake": true
+    },
+    {
+     "send": {
+      "type": "reset",
+      "attempt_id": 14
+     },
+     "expect": "reset"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap1b",
+      "attempt_id": 20,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       }
+      ],
+      "prompt": "Write a Python function that returns the sum of a list of numbers."
+     },
+     "handshake": true,
+     "capture_text": "cap1b"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap2b",
+      "attempt_id": 21,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1b"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       }
+      ],
+      "prompt": "Now make it ignore None values."
+     },
+     "handshake": true,
+     "capture_text": "cap2b"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap3b",
+      "attempt_id": 22,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1b"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap2b"
+       },
+       {
+        "role": "user",
+        "content": "Add a docstring and one doctest."
+       }
+      ],
+      "prompt": "Add a docstring and one doctest."
+     },
+     "handshake": true
+    },
+    {
+     "send": {
+      "type": "reset",
+      "attempt_id": 23
+     },
+     "expect": "reset"
+    },
+    {
+     "send": {
+      "type": "generate",
+      "id": "cap3c",
+      "attempt_id": 30,
+      "temperature": 0.0,
+      "seed": 12345,
+      "max_tokens": 96,
+      "thinking_enabled": true,
+      "max_think_tokens": 8,
+      "messages": [
+       {
+        "role": "user",
+        "content": "Write a Python function that returns the sum of a list of numbers."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap1"
+       },
+       {
+        "role": "user",
+        "content": "Now make it ignore None values."
+       },
+       {
+        "role": "assistant",
+        "content": "$CAPTURE_cap2"
+       },
+       {
+        "role": "user",
+        "content": "Add a docstring and one doctest."
+       }
+      ],
+      "prompt": "Add a docstring and one doctest."
+     },
+     "handshake": true
+    },
+    {
+     "send": {
+      "type": "unload"
+     },
+     "expect": "unloaded"
+    }
+   ],
+   "predicate": {
+    "kind": "wire_transitions",
+    "aborted_ids": [
+     "ab3"
+    ],
+    "cached_ids": [
+     "cap2",
+     "cap2b"
+    ],
+    "rolled_back": true,
+    "identical_ids": [
+     [
+      "cap1",
+      "cap1b"
+     ],
+     [
+      "cap2",
+      "cap2b"
+     ]
+    ],
+    "rollback_checks": [
+     [
+      "cap3",
+      "cap3b",
+      "cap3c"
+     ]
+    ],
+    "require": [
+     "[think-cap]"
+    ],
+    "forbid": [
+     "hipcc compiled (",
+     "but hipcc is unavailable"
+    ]
+   },
+   "probe": "thin-driver",
+   "route": "single/dflash-reasoning-transitions",
+   "transitions": [
+    "forced-advance",
+    "append",
+    "rollback"
+   ]
+  },
+  {
+   "commands": {
+    "negative": [
+     "hipfire run --temp 0 --max-tokens 16 /nonexistent-cold-archive-9b.mq4 \"Write a haiku about rivers.\"  # expect nonzero fail-closed exit"
+    ],
+    "positive": [
+     "hipfire run --temp 0 --max-tokens 64 qwen3.5:9b \"Write a haiku about rivers.\"",
+     "hipfire run --temp 0 --max-tokens 64 qwen3.5:9b \"Read the following notes and then answer in three sentences. The river rises in the northern hills, where snowmelt feeds a chain of small lakes. Below the lakes it cuts a narrow gorge, turns two mills, and widens into a slow channel lined with willows. Farmers draw water from it in summer, and in spring it floods the low meadows, leaving silt that keeps the fields fertile. A dam built forty years ago now holds back part of the spring flood and supplies a town of twelve thousand people. Fish counts have fallen since the dam was built, and the town council is debating a fish ladder, a smaller reservoir, or removing the dam entirely. Question: what are the trade-offs the council has to weigh, and which option would you recommend?\""
+    ]
+   },
+   "env": {},
+   "fixtures": [
+    "qwen3.5:9b"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151",
+    "gfx942"
+   ],
+   "id": "cold-archive-9b",
+   "milestone": "lane",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "note": "Promotion lane, escape of 2026-11-13 (stale no-caller allowlist row left gated_delta_net_q8_fast_stream out of the pack; the first 9B prompt hipcc-compiled it): one-shot from the installed archive with an empty kernel cache and no device compiler; any runtime kernel compile fails the row.",
+   "predicate": {
+    "kind": "run",
+    "min_chars": 1,
+    "forbid": [
+     "hipcc compiled (",
+     "but hipcc is unavailable"
+    ]
+   },
+   "probe": "existing",
+   "route": "single/cold-archive-one-shot"
+  },
+  {
+   "commands": {
+    "negative": [
+     "hipfire run --temp 0 --max-tokens 16 /nonexistent-cold-archive-27b.mq4 \"Write a haiku about rivers.\"  # expect nonzero fail-closed exit"
+    ],
+    "positive": [
+     "hipfire run --temp 0 --max-tokens 64 qwen3.8:27b-mq4-xts \"Write a haiku about rivers.\"",
+     "hipfire run --temp 0 --max-tokens 64 qwen3.8:27b-mq4-xts \"Read the following notes and then answer in three sentences. The river rises in the northern hills, where snowmelt feeds a chain of small lakes. Below the lakes it cuts a narrow gorge, turns two mills, and widens into a slow channel lined with willows. Farmers draw water from it in summer, and in spring it floods the low meadows, leaving silt that keeps the fields fertile. A dam built forty years ago now holds back part of the spring flood and supplies a town of twelve thousand people. Fish counts have fallen since the dam was built, and the town council is debating a fish ladder, a smaller reservoir, or removing the dam entirely. Question: what are the trade-offs the council has to weigh, and which option would you recommend?\""
+    ]
+   },
+   "env": {},
+   "fixtures": [
+    "qwen3.8:27b-mq4-xts"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151",
+    "gfx942"
+   ],
+   "id": "cold-archive-27b",
+   "milestone": "lane",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "note": "Promotion lane: 27B mq4-xts one-shot from the installed archive with an empty kernel cache and no device compiler; any runtime kernel compile fails the row.",
+   "predicate": {
+    "kind": "run",
+    "min_chars": 1,
+    "forbid": [
+     "hipcc compiled (",
+     "but hipcc is unavailable"
+    ]
+   },
+   "probe": "existing",
+   "route": "single/cold-archive-one-shot"
+  },
+  {
+   "commands": {
+    "negative": [
+     "hipfire run --temp 0 --max-tokens 16 /nonexistent-cold-archive-a3b.mq4 \"Write a haiku about rivers.\"  # expect nonzero fail-closed exit"
+    ],
+    "positive": [
+     "hipfire run --temp 0 --max-tokens 64 ornith-1.5:35b-a3b-mq4r \"Write a haiku about rivers.\"",
+     "hipfire run --temp 0 --max-tokens 64 ornith-1.5:35b-a3b-mq4r \"Read the following notes and then answer in three sentences. The river rises in the northern hills, where snowmelt feeds a chain of small lakes. Below the lakes it cuts a narrow gorge, turns two mills, and widens into a slow channel lined with willows. Farmers draw water from it in summer, and in spring it floods the low meadows, leaving silt that keeps the fields fertile. A dam built forty years ago now holds back part of the spring flood and supplies a town of twelve thousand people. Fish counts have fallen since the dam was built, and the town council is debating a fish ladder, a smaller reservoir, or removing the dam entirely. Question: what are the trade-offs the council has to weigh, and which option would you recommend?\""
+    ]
+   },
+   "env": {},
+   "fixtures": [
+    "ornith-1.5:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151",
+    "gfx942"
+   ],
+   "id": "cold-archive-a3b",
+   "milestone": "lane",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "note": "Promotion lane: A3B .mq4r one-shot from the installed archive with an empty kernel cache and no device compiler (the pack hole that cut A3B one-shot speed 42% on gfx1201); any runtime kernel compile fails the row.",
+   "predicate": {
+    "kind": "run",
+    "min_chars": 1,
+    "forbid": [
+     "hipcc compiled (",
+     "but hipcc is unavailable"
+    ]
+   },
+   "probe": "existing",
+   "route": "single/cold-archive-one-shot"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "hipfire run --temp 0 --max-tokens 32 $MODELS_DIR/qwen3.8-flash-next-gptq3.mq4 \"Write a haiku about rivers.\""
+    ]
+   },
+   "env": {},
+   "fixtures": [],
+   "hosts": [
+    "gfx1201"
+   ],
+   "id": "cold-archive-flashnext",
+   "milestone": "lane",
+   "note": "Promotion lane: Flash-Next (Qwen4) single-card default route on gfx1201 from the installed archive, host-mapped experts, empty kernel cache and no device compiler (KernelPackFix 7cec18dd79 packed its gfx1201 default modules); any runtime kernel compile fails the row. The locked file is the GPTQ3 monolith the registry tag no longer names, so the row loads it by path.",
+   "predicate": {
+    "kind": "run",
+    "min_chars": 1,
+    "forbid": [
+     "hipcc compiled (",
+     "but hipcc is unavailable"
+    ]
+   },
+   "probe": "existing",
+   "route": "single/flashnext-cold-archive-one-shot",
+   "fixture_files": [
+    "$MODELS_DIR/qwen3.8-flash-next-gptq3.mq4"
+   ]
   }
  ],
  "version": 1

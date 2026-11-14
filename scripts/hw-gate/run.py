@@ -653,20 +653,15 @@ def _run_fixture_harness(repo, fixture, env_base, logs_dir, device, modes, harne
     for mode in modes:
         res = _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_cfg, models_dir)
         modes_result[mode] = res
-    # A mode can legitimately not run: the two lanes hold different drafts, so
-    # a `-dflash` mode has no artifact to speculate with on one of them.
-    # Failing that lane would be a false negative on evidence it never had, and
-    # counting it as a pass would claim coverage that did not happen. `skip`
-    # is therefore neither: it is recorded, reported, and excluded from the
-    # verdict. It must never be produced for a missing artifact the fixture
-    # DECLARED — that stays a hard fail.
-    graded = {m: r for m, r in modes_result.items() if r.get("status") != "skip"}
-    overall = "pass" if all(r.get("status") == "pass" for r in graded.values()) else ("pass" if not graded else "fail")
+    # Skip is not pass. The graded set is the declared set: a lane lacking a
+    # declared draft fails, and an absent artifact is a red, not a silent pass.
+    # The skip reason is kept so the evidence says why.
+    overall = "pass" if all(r.get("status") == "pass" for r in modes_result.values()) else "fail"
     reasons: list[str] = []
     for m, r in modes_result.items():
         status = r.get("status")
         if status == "skip":
-            reasons.append(f"{m}: skipped ({r.get('reason') or 'no reason given'})")
+            reasons.append(f"{m}: skipped ({r.get('reason') or 'no reason given'}) - skip is not pass")
         elif status != "pass":
             reasons.append(f"{m}: {r.get('reason') or 'fail'}")
     reason = "; ".join(reasons) if reasons else ""
@@ -1053,7 +1048,38 @@ def render_md(evidence: dict) -> str:
     return "\n".join(lines)
 
 
+def self_test() -> int:
+    """Stdlib-only check of the 'skip is not pass' rule; no GPU, cargo or network."""
+    global _run_harness_mode
+    real = _run_harness_mode
+    ok = {"exit": 0, "seconds": 0.0, "rows": [], "status": "pass", "reason": ""}
+    skip = {"exit": 0, "seconds": 0.0, "rows": [], "status": "skip", "reason": "none of ['d.hfq'] present for fixture X"}
+    cases = [
+        ({"battery": skip, "battery-dflash": skip}, "fail"),
+        ({"battery": ok, "battery-dflash": skip}, "fail"),
+        ({"battery": ok, "battery-dflash": ok}, "pass"),
+    ]
+    missed = 0
+    try:
+        for canned, want in cases:
+            _run_harness_mode = lambda *a, _c=canned: dict(_c[a[5]])
+            res = _run_fixture_harness(".", {"tag": "X"}, {}, ".", "0", list(canned), {}, ".")
+            skipped = [m for m, r in canned.items() if r["status"] == "skip"]
+            if res["status"] != want or any(f"{m}: skipped" not in res["reason"] for m in skipped):
+                print(f"hw-gate run.py: self-test MISS: want {want}, got {res['status']} ({res['reason']})", file=sys.stderr)
+                missed += 1
+    finally:
+        _run_harness_mode = real
+    if missed:
+        return 1
+    print("hw-gate run.py: self-test OK")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv_l = sys.argv[1:] if argv is None else argv
+    if "--self-test" in argv_l:
+        return self_test()
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--repo", required=True)
     ap.add_argument("--fixtures", required=True)

@@ -195,12 +195,13 @@ Any change to kernels, dispatch, fusion, rotation, rmsnorm, sampling,
 the spec-decode path, loader/daemon, or the forward pass MUST validate the
 actual path under test and attach claim-matched evidence for **direct
 maintainer review**. Use the harnesses below (and the routes in
-[docs/VALIDATION.md](docs/VALIDATION.md)). Optional automation
+[docs/VALIDATION.md](docs/VALIDATION.md)). Beta advances only through the
+promotion lane ([docs/VALIDATION.md#promotion-lane](docs/VALIDATION.md#promotion-lane)):
+every required hardware row must be `current` on the installed archive at the
+candidate SHA. The optional hw-gate
 ([`.github/workflows/hw-gate.yml`](.github/workflows/hw-gate.yml),
-[`scripts/hw-gate/`](scripts/hw-gate/)) may deliver the same class of
-evidence when it runs — a maintainer can apply `hw-run` to force a hardware
-pass — but hw-gate is **not** a required status check, not automatic
-acceptance, and not a substitute for the approving review. The fixed
+[`scripts/hw-gate/`](scripts/hw-gate/)) is not a substitute for that lane or
+for the approving review. The fixed
 `coherence-gate*.sh` batteries and the retired `tools/change_gate` /
 agentic-review route are historical only and must not be used as acceptance
 evidence. No local planning tool is merge evidence.
@@ -459,6 +460,21 @@ Open work is tracked on the GitHub issue tracker. One standing request:
 
 Beyond that, `hipfire list -r` + a benchmark issue on any arch without a
 committed baseline in `tests/speed-baselines/` is welcome.
+
+---
+
+## Commit attribution
+
+- Agent-authored commits end with `Agent: <model>/<seat>`, e.g.
+  `Agent: claude-opus-5.5/PromotionLane`.
+- Human-authored commits that go through the integration lane end with
+  `Human-Authored: <name>`.
+- The landing script refuses candidate commits with neither. CI rejects
+  malformed trailers and agent `Co-authored-by:` signatures without `Agent:`.
+- Waivers and gate-policy approvals (`Gate-Policy-Approved-By: Kaden|fivetide`)
+  are human-only, never an agent.
+
+Check locally: `python3 scripts/check-attribution.py --range origin/beta..HEAD --require`.
 
 ---
 

@@ -264,6 +264,11 @@ works, what to measure, what counts as pass/fail.
    host load checked by hand, a throwaway arm first, at least 4 interleaved
    fresh loads per arm, bootstrap CIs. An isolated kernel win is not a served
    win (§ 3).
+9. **Attribution trailers.** End every commit message with
+   `Agent: <model>/<seat>` (e.g. `Agent: claude-opus-5.5/PromotionLane`) as the
+   final paragraph; never add an agent `Co-authored-by:`. Never add or edit a
+   waiver or gate-policy file; never write `Gate-Policy-Approved-By` or
+   `Human-Authored` yourself. Check: `scripts/check-attribution.py --range BASE..HEAD --require`.
 
 ---
 

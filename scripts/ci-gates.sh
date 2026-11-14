@@ -36,9 +36,20 @@ run python3 scripts/check-lifecycle.py
 run python3 scripts/check-mtp-parity-ratchet.py --self-test
 run python3 scripts/check-mtp-parity-ratchet.py fixture
 run python3 scripts/check-pm-code-end.py --self-test
+# Promotion lane (docs/VALIDATION.md#promotion-lane). Each self-test plants
+# the defect its rule exists for and fails if the checker lets it through:
+# (a) skip is not pass (hw-gate fixtures, matrix rows, lane verdicts),
+# (c) a required row exercises forced advance, append and rollback; rule (b)
+# (no-caller vs production callers) is kernel_registry_coverage in ci.yml.
+run python3 scripts/hw-gate/run.py --self-test
+run python3 scripts/device_mesh_matrix.py --self-test
+run python3 scripts/promotion-lane/lane.py --self-test
+run python3 scripts/promotion-lane/lane.py check
+run python3 scripts/check-attribution.py --self-test
 if [[ -n "${1:-}" ]]; then
     run bash scripts/ratchet-diff.sh "$1"
     run python3 scripts/check-mtp-parity-ratchet.py guard --base "$1"
+    run python3 scripts/check-attribution.py --range "$1..HEAD"
 fi
 
 echo
