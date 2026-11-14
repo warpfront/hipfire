@@ -1521,7 +1521,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEEPSEEK4_REDLINE_HIP_BLOB` | crates/hipfire-arch-deepseek4/src/forward.rs | developer |
 | `HIPFIRE_DEEPSEEK4_RETAINED_EMBEDDING` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` | crates/hipfire-arch-deepseek4/examples/ds4_prod_vs_parent_trace.rs, crates/hipfire-arch-deepseek4/examples/ds4_quant_plog.rs | developer |
-| `HIPFIRE_DEEPSEEK4_SEED` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-generate/src/dense.rs | developer |
+| `HIPFIRE_DEEPSEEK4_SEED` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs | harness |
 | `HIPFIRE_DEEPSEEK4_SKIP_FFN` | crates/hipfire-arch-deepseek4/src/config_cache.rs | developer |
 | `HIPFIRE_DEEPSEEK4_SPEC_DECODE` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_DEEPSEEK4_SPEC_K` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/examples/dspark_bench.rs | developer |
