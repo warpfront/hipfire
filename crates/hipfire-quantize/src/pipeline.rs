@@ -6292,6 +6292,28 @@ fn handle_moe_expert_3d(
             // Per-expert AWQ override (Route A): when this expert has a
             // raw in_sum2 row, pre-scale W·s and remember s for the
             // sidecar. Falls through to the format branches otherwise.
+            //
+            // The exponent is always the caller's fixed `--awq-alpha`, never the
+            // `--awq-a4-aware` per-tensor search. That search scores candidates
+            // with `w4a4_relative_output_mse` — qt44 weights and `block_i4_128`
+            // A4 activations — while this arm writes MQ4G256 (qt13), or MQ5G256
+            // / MQ6G256 under HIPFIRE_MOE_{DOWN_,EXPERTS_}MQ5/6. No route runs
+            // those experts with quantized activations: the grouped symmetric
+            // cores admit qt44 only (`grouped_moe_site_tiers`,
+            // crates/hipfire-dispatch/src/pipeline/moe_program.rs) and the
+            // routed-IU4 route refuses AWQ'd down tensors
+            // (`ExpertIu4Reject::DownAwq`,
+            // crates/hipfire-dispatch/src/families/moe_expert_iu4.rs). So the
+            // qt44+A4 surrogate picks an exponent for a codec and an activation
+            // path the experts never take — measured on Qwen3.6-35B-A3B expert
+            // `down_proj` (real BF16 weights, real per-expert imatrix rows), its
+            // choice matched the stored codec's own argmin for 12 of 48 experts.
+            // Scoring them with the codec they do run does not rescue it either:
+            // on held-out rows the per-expert pick is noise around the fixed
+            // exponent (+0.27 % stored error at the 128-row fit the search uses,
+            // -0.68 % at 1536 rows), whose aggregate optimum is 0.55 itself.
+            // The dense MQ4G256 arm in `handle_main_quant` keeps the fixed alpha
+            // for the same reason. `expert_awq_active` requires supports_g256.
             let awq_scales: Option<Vec<f32>> = awq_in_sum2_per_expert
                 .as_ref()
                 .and_then(|t| t.get(x))
@@ -6444,6 +6466,14 @@ fn handle_moe_expert_3d(
                         QuantType::MQ5G256,
                         256u32,
                     )
+                } else if supports_g256 && use_mq4v2 {
+                    // `--format mq4v2` must mean qt44 for routed experts with
+                    // AWQ too. The plain V2 arm below is unreachable while
+                    // `awq_scales` is set, so without this arm an AWQ MoE body
+                    // silently falls to the qt13 encoder.
+                    let q =
+                        quantize_mq4g256v2_selected(&scaled, inner_m, inner_k_e, &signs1, &signs2);
+                    (q, QuantType::MQ4G256V2, 256u32)
                 } else {
                     (
                         quantize_mq4g256(&scaled, &signs1, &signs2),
@@ -9922,5 +9952,520 @@ mod route_sku_stamp_tests {
         assert_eq!(route_sku_for_recipe(false, true, true, true, true), None);
         assert_eq!(route_sku_for_recipe(true, false, true, true, true), None);
         assert_eq!(route_sku_for_recipe(true, true, false, true, true), None);
+    }
+}
+
+/// Routed-expert AWQ exponent contract.
+///
+/// `handle_moe_expert_3d` writes MQ4/MQ5/MQ6-G256 experts, which no route runs
+/// with quantized activations, so the `--awq-a4-aware` search (a qt44 + A4
+/// model) does not describe them and must not choose their exponent. The test
+/// pins the call site to the caller's fixed `--awq-alpha` through the real
+/// handler: the emitted weight bytes and the per-expert sidecars are recomputed
+/// from the fixed-alpha formula, which fails as soon as the search is wired
+/// back in for a fixture the two surrogates disagree on.
+#[cfg(test)]
+mod moe_expert_awq_alpha_tests {
+    use super::*;
+    use crate::calibration::{
+        awq_pre_scale_weights, awq_scales_to_f16_bytes, compute_a4_aware_awq_scales,
+        compute_awq_scales, AWQ_A4_AWARE, AWQ_A4_SHIPPED_ALPHAS, AWQ_ALPHA,
+    };
+    use crate::gguf_input::GgufFile;
+    use crate::quant_fwht::quantize_mq4g256;
+
+    const N_EXP: usize = 4;
+    const M: usize = 64;
+    const K: usize = 512;
+    /// Stacked-expert parent, as the quantizer names it; the emitted per-expert
+    /// tensors are `{EXPERTS_STEM}.{e}.down_proj.weight` plus its
+    /// `awq_scale.weight` sidecar.
+    const EXPERTS_STEM: &str = "model.language_model.layers.0.mlp.experts";
+    /// Set in the re-executed child (see [`in_child_process`]).
+    const CHILD_ENV: &str = "MOE_EXPERT_AWQ_ALPHA_TESTS_CHILD";
+
+    /// Runs `body` in a fresh copy of this test binary, filtered to `test`.
+    ///
+    /// `AWQ_ALPHA` and `AWQ_A4_AWARE` are process-global `OnceLock`s: the
+    /// handler reads them and a test cannot unset them. Arming them in the
+    /// shared test process would turn AWQ (and the A4 search) on for every
+    /// later test in this binary that reaches `handle_moe_expert_3d` or
+    /// `handle_main_quant` with an imatrix, so whether those tests pass would
+    /// depend on scheduling.
+    fn in_child_process(test: &str, body: impl FnOnce()) {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            body();
+            return;
+        }
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, rest)| rest);
+        let name = format!("{module}::{test}");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "child `{name}` failed:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "child did not run `{name}`:\n{stdout}"
+        );
+    }
+
+    /// Byte equality that reports where the encodings diverge instead of
+    /// printing both payloads.
+    fn assert_bytes_eq(got: &[u8], want: &[u8], what: &str) {
+        if got != want {
+            let first = got
+                .iter()
+                .zip(want)
+                .position(|(a, b)| a != b)
+                .unwrap_or(got.len().min(want.len()));
+            panic!(
+                "{what}: {} vs {} bytes, first difference at byte {first}",
+                got.len(),
+                want.len()
+            );
+        }
+    }
+
+    /// Deterministic expert weights: no libm, no RNG dependency.
+    fn weights(seed: u64, n: usize) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32 / 8388608.0 - 1.0) * 0.02
+            })
+            .collect()
+    }
+
+    /// Per-expert activation profiles spanning the dynamic ranges that move the
+    /// A4 surrogate: flat, one hot channel, long-tailed, and two-level.
+    fn profile(kind: usize) -> Vec<f32> {
+        (0..K)
+            .map(|j| {
+                let j = j as f32;
+                match kind {
+                    0 => 1.0 + (j % 7.0) * 0.01,
+                    1 => {
+                        if j < 8.0 {
+                            400.0
+                        } else {
+                            0.5 + (j % 11.0) * 0.02
+                        }
+                    }
+                    2 => 0.05 * (1.0 + j).ln_1p() + 0.02,
+                    _ => {
+                        if (j as usize) % 64 < 32 {
+                            30.0
+                        } else {
+                            0.2
+                        }
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Minimal GGUF v3 with no metadata (so the data section aligns to 32) and
+    /// one 2-D F32 tensor of shape `[k, n]` — the layout
+    /// `imatrix_in_sum2_for_parent` reads.
+    fn write_imatrix_2d(dir: &Path, name: &str, k: usize, n: usize, data: &[f32]) -> PathBuf {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&(k as u64).to_le_bytes());
+        out.extend_from_slice(&(n as u64).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // GGML_TYPE_F32
+        out.extend_from_slice(&0u64.to_le_bytes());
+        while out.len() % 32 != 0 {
+            out.push(0);
+        }
+        for value in data {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        let path = dir.join("imatrix.gguf");
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    /// Minimal single-tensor F32 safetensors file. `handle_moe_expert_3d`
+    /// only needs it for its post-batch `drop_tensor_pages` call; the weights
+    /// themselves arrive as `raw_data`.
+    fn write_safetensors(dir: &Path, name: &str, data: &[f32]) -> SafetensorsFile {
+        let mut header = format!(
+            r#"{{"{name}":{{"dtype":"F32","shape":[{N_EXP},{M},{K}],"data_offsets":[0,{}]}}}}"#,
+            data.len() * 4
+        );
+        while header.len() % 8 != 0 {
+            header.push(' ');
+        }
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        out.extend_from_slice(header.as_bytes());
+        for value in data {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        let path = dir.join("model.safetensors");
+        std::fs::write(&path, out).unwrap();
+        SafetensorsFile::open(&path).unwrap()
+    }
+
+    /// One expert's activation row. GGUF lists `ne0` first and `ne0` is the
+    /// fastest axis, so a `[K, N_EXP]` F32 tensor is expert-major:
+    /// `table[expert * K + j]`.
+    fn row(table: &[f32], expert: usize) -> Vec<f32> {
+        table[expert * K..(expert + 1) * K].to_vec()
+    }
+
+    /// The stacked `down_proj` fixture: per-expert in_sum2 rows (`table`), the
+    /// expert weights, and the imatrix GGUF + safetensors files on disk.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        parent: String,
+        table: Vec<f32>,
+        experts: Vec<Vec<f32>>,
+        raw: Vec<u8>,
+        imatrix: PathBuf,
+        st_files: [SafetensorsFile; 1],
+    }
+
+    fn fixture() -> Fixture {
+        let parent = format!("{EXPERTS_STEM}.down_proj");
+        let mut table = vec![0.0f32; K * N_EXP];
+        for e in 0..N_EXP {
+            table[e * K..(e + 1) * K].copy_from_slice(&profile(e));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let imatrix = write_imatrix_2d(
+            dir.path(),
+            "blk.0.ffn_down_exps.weight.in_sum2",
+            K,
+            N_EXP,
+            &table,
+        );
+        let experts: Vec<Vec<f32>> = (0..N_EXP)
+            .map(|e| weights(0x9e37_79b9_7f4a_7c15 + e as u64, M * K))
+            .collect();
+        let raw: Vec<u8> = experts
+            .iter()
+            .flatten()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let st_files = [write_safetensors(dir.path(), &parent, &experts.concat())];
+        Fixture {
+            _dir: dir,
+            parent,
+            table,
+            experts,
+            raw,
+            imatrix,
+            st_files,
+        }
+    }
+
+    /// The real handler on the fixture, with the imatrix loaded and every
+    /// format, GPTQ and route selector off.
+    fn run_handler(f: &Fixture) -> Vec<HfqTensor> {
+        run_handler_with(f, false)
+    }
+
+    /// [`run_handler`] with `use_mq4v2` (set by `--format mq4` / `mq4v2`) under
+    /// the caller's control.
+    fn run_handler_with(f: &Fixture, use_mq4v2: bool) -> Vec<HfqTensor> {
+        let gguf = GgufFile::open(&f.imatrix).unwrap();
+        let mut hfq_tensors = Vec::new();
+        let mut quantized_params = 0u64;
+        let mut spill: Option<TensorSpill> = None;
+        let meta = TensorMeta {
+            dtype: "F32".to_string(),
+            shape: vec![N_EXP, M, K],
+            data_offsets: [0, f.raw.len()],
+        };
+        let ctx = PerTensorCtx {
+            name: &f.parent,
+            file_idx: 0,
+            n_elements: N_EXP * M * K,
+            arch_id: 6,
+            is_vision: false,
+        };
+        let handled = handle_moe_expert_3d(
+            &ctx,
+            &meta,
+            &f.raw,
+            false,
+            false,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            &Some(gguf),
+            &None,
+            false,
+            0.0,
+            &None,
+            // `use_gptq_e8` .. `moe_expert_down_sym`, 42 selectors: every
+            // format, GPTQ and route flag off (bar `use_mq4v2`, the 6th), so this is the plain record
+            // whose only live arm is per-expert AWQ (which needs just an
+            // imatrix, the fixed alpha and `supports_g256`).
+            false,
+            false,
+            false,
+            false,
+            false,
+            use_mq4v2,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &None,
+            false,
+            &None,
+            reap_overlay::ReapArch::Qwen35,
+            &f.st_files,
+            &HashMap::new(),
+            &mut hfq_tensors,
+            &mut quantized_params,
+            &mut spill,
+        );
+        assert!(handled, "the stacked-expert handler must claim this tensor");
+        hfq_tensors
+    }
+
+    /// Without `--awq` (`AWQ_ALPHA` unset) an imatrix alone emits plain MQ4G256
+    /// experts and no sidecars. Runs in this (shared) test process, so it also
+    /// fails if a sibling test leaks the AWQ globals into it.
+    #[test]
+    fn routed_experts_without_the_awq_flag_get_no_awq() {
+        assert!(
+            AWQ_ALPHA.get().is_none() && AWQ_A4_AWARE.get().is_none(),
+            "the AWQ globals are armed in the shared test process"
+        );
+        let f = fixture();
+        let tensors = run_handler(&f);
+        assert_eq!(tensors.len(), N_EXP, "one weight each, no sidecars");
+        let signs1 = crate::quant_fwht::gen_fwht_signs(42, 256);
+        let signs2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
+        for e in 0..N_EXP {
+            let weight = tensors
+                .iter()
+                .find(|t| t.name == format!("{EXPERTS_STEM}.{e}.down_proj.weight"))
+                .unwrap_or_else(|| panic!("expert {e} weight missing"));
+            assert_eq!(weight.quant_type, QuantType::MQ4G256);
+            assert_bytes_eq(
+                &weight.data,
+                &quantize_mq4g256(&f.experts[e], &signs1, &signs2),
+                &format!("expert {e} weight bytes"),
+            );
+        }
+    }
+
+    #[test]
+    fn routed_experts_keep_the_fixed_alpha_when_the_a4_search_is_armed() {
+        in_child_process(
+            "routed_experts_keep_the_fixed_alpha_when_the_a4_search_is_armed",
+            routed_experts_keep_the_fixed_alpha_body,
+        );
+    }
+
+    fn routed_experts_keep_the_fixed_alpha_body() {
+        // Process-global and write-once; this runs in its own child process
+        // (`in_child_process`), so arming them reaches no other test.
+        let _ = AWQ_A4_AWARE.set(true);
+        assert_eq!(AWQ_A4_AWARE.get().copied(), Some(true));
+        // The handler reads the same global; whatever it resolves to is the
+        // alpha the frozen artifact must reproduce.
+        let fixed_alpha = *AWQ_ALPHA.get_or_init(|| 0.55);
+        let f = fixture();
+        let hfq_tensors = run_handler(&f);
+        // `HIPFIRE_AWQ_EXPERTS=none` (env or config) is a documented opt-out of
+        // `expert_awq_active`. Honor it rather than failing on a path the host
+        // disarmed, but still pin what that configuration must emit.
+        let expert_awq_disabled = hipfire_config::developer_var("HIPFIRE_AWQ_EXPERTS")
+            .ok()
+            .as_deref()
+            == Some("none");
+        if expert_awq_disabled {
+            assert_eq!(
+                hfq_tensors.len(),
+                N_EXP,
+                "HIPFIRE_AWQ_EXPERTS=none must emit weights without sidecars"
+            );
+            assert!(hfq_tensors
+                .iter()
+                .all(|t| t.quant_type == QuantType::MQ4G256));
+            return;
+        }
+        assert_eq!(
+            hfq_tensors.len(),
+            2 * N_EXP,
+            "one weight + one sidecar each"
+        );
+
+        let signs1 = crate::quant_fwht::gen_fwht_signs(42, 256);
+        let signs2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
+        let mut a4_differs = 0usize;
+        for e in 0..N_EXP {
+            let in_sum2 = row(&f.table, e);
+            let scales = compute_awq_scales(&in_sum2, fixed_alpha);
+
+            let mut scaled = f.experts[e].clone();
+            awq_pre_scale_weights(&mut scaled, M, K, &scales);
+            let expected_weight = quantize_mq4g256(&scaled, &signs1, &signs2);
+            let expected_sidecar = awq_scales_to_f16_bytes(&scales);
+
+            let weight = hfq_tensors
+                .iter()
+                .find(|t| t.name == format!("{EXPERTS_STEM}.{e}.down_proj.weight"))
+                .unwrap_or_else(|| panic!("expert {e} weight missing"));
+            assert_eq!(weight.quant_type, QuantType::MQ4G256);
+            assert_eq!(weight.group_size, 256);
+            assert_bytes_eq(
+                &weight.data,
+                &expected_weight,
+                &format!("expert {e} weight bytes"),
+            );
+
+            let sidecar = hfq_tensors
+                .iter()
+                .find(|t| t.name == format!("{EXPERTS_STEM}.{e}.down_proj.awq_scale.weight"))
+                .unwrap_or_else(|| panic!("expert {e} sidecar missing"));
+            assert_eq!(sidecar.quant_type, QuantType::F16);
+            assert_eq!(sidecar.shape, vec![K as u32]);
+            assert_bytes_eq(
+                &sidecar.data,
+                &expected_sidecar,
+                &format!("expert {e} sidecar bytes"),
+            );
+
+            // The fixture must discriminate: at least one expert's qt44+A4
+            // choice is not the fixed exponent, so re-wiring the search into
+            // this arm changes bytes and fails the equality above.
+            let a4 = compute_a4_aware_awq_scales(
+                &f.parent,
+                &in_sum2,
+                &f.experts[e],
+                M,
+                K,
+                &signs1,
+                &signs2,
+                &AWQ_A4_SHIPPED_ALPHAS,
+            );
+            if a4.alpha != fixed_alpha {
+                a4_differs += 1;
+                assert_ne!(
+                    awq_scales_to_f16_bytes(&a4.scales),
+                    expected_sidecar,
+                    "expert {e}: A4 pick must encode differently"
+                );
+            }
+        }
+        assert!(
+            a4_differs > 0,
+            "fixture does not discriminate: the A4 search picked the fixed alpha for every expert"
+        );
+    }
+
+    #[test]
+    fn awq_routed_experts_honor_mq4v2() {
+        in_child_process(
+            "awq_routed_experts_honor_mq4v2",
+            awq_routed_experts_honor_mq4v2_body,
+        );
+    }
+
+    /// `--format mq4` / `mq4v2` writes plain routed experts as qt44. The AWQ arm
+    /// must too; before the fix it fell through to the qt13 encoder whenever
+    /// `awq_scales` was set.
+    fn awq_routed_experts_honor_mq4v2_body() {
+        let fixed_alpha = *AWQ_ALPHA.get_or_init(|| 0.55);
+        let f = fixture();
+        let hfq_tensors = run_handler_with(&f, true);
+        if hipfire_config::developer_var("HIPFIRE_AWQ_EXPERTS")
+            .ok()
+            .as_deref()
+            == Some("none")
+        {
+            assert!(hfq_tensors
+                .iter()
+                .all(|t| t.quant_type == QuantType::MQ4G256V2));
+            return;
+        }
+        assert_eq!(
+            hfq_tensors.len(),
+            2 * N_EXP,
+            "one weight + one sidecar each"
+        );
+        let signs1 = crate::quant_fwht::gen_fwht_signs(42, 256);
+        let signs2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
+        for e in 0..N_EXP {
+            let scales = compute_awq_scales(&row(&f.table, e), fixed_alpha);
+            let mut scaled = f.experts[e].clone();
+            awq_pre_scale_weights(&mut scaled, M, K, &scales);
+            let weight = hfq_tensors
+                .iter()
+                .find(|t| t.name == format!("{EXPERTS_STEM}.{e}.down_proj.weight"))
+                .unwrap_or_else(|| panic!("expert {e} weight missing"));
+            assert_eq!(weight.quant_type, QuantType::MQ4G256V2, "expert {e} codec");
+            assert_eq!(weight.group_size, 256);
+            assert_bytes_eq(
+                &weight.data,
+                &quantize_mq4g256v2_selected(&scaled, M, K, &signs1, &signs2),
+                &format!("expert {e} weight bytes"),
+            );
+            let sidecar = hfq_tensors
+                .iter()
+                .find(|t| t.name == format!("{EXPERTS_STEM}.{e}.down_proj.awq_scale.weight"))
+                .unwrap_or_else(|| panic!("expert {e} sidecar missing"));
+            assert_bytes_eq(
+                &sidecar.data,
+                &awq_scales_to_f16_bytes(&scales),
+                &format!("expert {e} sidecar bytes"),
+            );
+        }
     }
 }
