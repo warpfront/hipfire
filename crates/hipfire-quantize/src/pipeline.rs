@@ -6466,6 +6466,14 @@ fn handle_moe_expert_3d(
                         QuantType::MQ5G256,
                         256u32,
                     )
+                } else if supports_g256 && use_mq4v2 {
+                    // `--format mq4v2` must mean qt44 for routed experts with
+                    // AWQ too. The plain V2 arm below is unreachable while
+                    // `awq_scales` is set, so without this arm an AWQ MoE body
+                    // silently falls to the qt13 encoder.
+                    let q =
+                        quantize_mq4g256v2_selected(&scaled, inner_m, inner_k_e, &signs1, &signs2);
+                    (q, QuantType::MQ4G256V2, 256u32)
                 } else {
                     (
                         quantize_mq4g256(&scaled, &signs1, &signs2),
@@ -10173,6 +10181,12 @@ mod moe_expert_awq_alpha_tests {
     /// The real handler on the fixture, with the imatrix loaded and every
     /// format, GPTQ and route selector off.
     fn run_handler(f: &Fixture) -> Vec<HfqTensor> {
+        run_handler_with(f, false)
+    }
+
+    /// [`run_handler`] with `use_mq4v2` (set by `--format mq4` / `mq4v2`) under
+    /// the caller's control.
+    fn run_handler_with(f: &Fixture, use_mq4v2: bool) -> Vec<HfqTensor> {
         let gguf = GgufFile::open(&f.imatrix).unwrap();
         let mut hfq_tensors = Vec::new();
         let mut quantized_params = 0u64;
@@ -10203,7 +10217,7 @@ mod moe_expert_awq_alpha_tests {
             0.0,
             &None,
             // `use_gptq_e8` .. `moe_expert_down_sym`, 42 selectors: every
-            // format, GPTQ and route flag off, so this is the plain record
+            // format, GPTQ and route flag off (bar `use_mq4v2`, the 6th), so this is the plain record
             // whose only live arm is per-expert AWQ (which needs just an
             // imatrix, the fixed alpha and `supports_g256`).
             false,
@@ -10211,7 +10225,7 @@ mod moe_expert_awq_alpha_tests {
             false,
             false,
             false,
-            false,
+            use_mq4v2,
             false,
             false,
             false,
@@ -10394,5 +10408,64 @@ mod moe_expert_awq_alpha_tests {
             a4_differs > 0,
             "fixture does not discriminate: the A4 search picked the fixed alpha for every expert"
         );
+    }
+
+    #[test]
+    fn awq_routed_experts_honor_mq4v2() {
+        in_child_process(
+            "awq_routed_experts_honor_mq4v2",
+            awq_routed_experts_honor_mq4v2_body,
+        );
+    }
+
+    /// `--format mq4` / `mq4v2` writes plain routed experts as qt44. The AWQ arm
+    /// must too; before the fix it fell through to the qt13 encoder whenever
+    /// `awq_scales` was set.
+    fn awq_routed_experts_honor_mq4v2_body() {
+        let fixed_alpha = *AWQ_ALPHA.get_or_init(|| 0.55);
+        let f = fixture();
+        let hfq_tensors = run_handler_with(&f, true);
+        if hipfire_config::developer_var("HIPFIRE_AWQ_EXPERTS")
+            .ok()
+            .as_deref()
+            == Some("none")
+        {
+            assert!(hfq_tensors
+                .iter()
+                .all(|t| t.quant_type == QuantType::MQ4G256V2));
+            return;
+        }
+        assert_eq!(
+            hfq_tensors.len(),
+            2 * N_EXP,
+            "one weight + one sidecar each"
+        );
+        let signs1 = crate::quant_fwht::gen_fwht_signs(42, 256);
+        let signs2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
+        for e in 0..N_EXP {
+            let scales = compute_awq_scales(&row(&f.table, e), fixed_alpha);
+            let mut scaled = f.experts[e].clone();
+            awq_pre_scale_weights(&mut scaled, M, K, &scales);
+            let weight = hfq_tensors
+                .iter()
+                .find(|t| t.name == format!("{EXPERTS_STEM}.{e}.down_proj.weight"))
+                .unwrap_or_else(|| panic!("expert {e} weight missing"));
+            assert_eq!(weight.quant_type, QuantType::MQ4G256V2, "expert {e} codec");
+            assert_eq!(weight.group_size, 256);
+            assert_bytes_eq(
+                &weight.data,
+                &quantize_mq4g256v2_selected(&scaled, M, K, &signs1, &signs2),
+                &format!("expert {e} weight bytes"),
+            );
+            let sidecar = hfq_tensors
+                .iter()
+                .find(|t| t.name == format!("{EXPERTS_STEM}.{e}.down_proj.awq_scale.weight"))
+                .unwrap_or_else(|| panic!("expert {e} sidecar missing"));
+            assert_bytes_eq(
+                &sidecar.data,
+                &awq_scales_to_f16_bytes(&scales),
+                &format!("expert {e} sidecar bytes"),
+            );
+        }
     }
 }
