@@ -2463,7 +2463,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward.rs",
-        function: "new_inner_with_reserve",
+        function: "build_with_reserve",
         occurrences: 2,
         decisions: &["qwen4-cpu-splice-eager-only"],
     },
