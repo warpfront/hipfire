@@ -419,29 +419,42 @@ function Get-GpuAdapters {
 }
 
 # READ-ONLY look at the display class registry key for the 64-bit memory size.
+# Failures are per key: an adapter key that cannot be enumerated or read is
+# recorded as a report error and the other adapters are still listed (#1143).
 function Get-DisplayClassMemory {
     $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11cd-be10-08002be10318}'
     $list = @()
-    foreach ($k in @(Get-ChildItem -LiteralPath $classKey -ErrorAction Stop)) {
+    $enumErrors = @()
+    $keys = @(Get-ChildItem -LiteralPath $classKey -ErrorAction SilentlyContinue -ErrorVariable enumErrors)
+    foreach ($e in @($enumErrors)) {
+        # Every class key has a 'Properties' subkey that Windows denies by
+        # design; it holds no adapter, so its access error is not reported.
+        if ([string]$e.TargetObject -match '\\Properties$') { continue }
+        Add-ReportError -Section 'gpu_memory_registry' -Message $e.Exception.Message
+    }
+    foreach ($k in $keys) {
         if ($k.PSChildName -notmatch '^\d{4}$') { continue }
-        $p = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
-        if ($null -eq $p) { continue }
-        $desc = $p.DriverDesc
-        if (-not $desc) { continue }
-        $raw = $p.'HardwareInformation.qwMemorySize'
-        $bytes = $null
-        if ($raw -is [byte[]]) {
-            if ($raw.Length -ge 8) { $bytes = [BitConverter]::ToUInt64($raw, 0) }
-        } elseif ($null -ne $raw) {
-            try { $bytes = [uint64]$raw } catch { $bytes = $null }
-        }
-        $list += [ordered]@{
-            key             = $k.PSChildName
-            driver_desc     = $desc
-            driver_version  = $p.DriverVersion
-            provider        = $p.ProviderName
-            memory_bytes    = $bytes
-            memory_mib      = $(if ($null -ne $bytes) { [math]::Round([double]$bytes / 1MB, 0) } else { $null })
+        try {
+            $p = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction Stop
+            $desc = $p.DriverDesc
+            if (-not $desc) { continue }
+            $raw = $p.'HardwareInformation.qwMemorySize'
+            $bytes = $null
+            if ($raw -is [byte[]]) {
+                if ($raw.Length -ge 8) { $bytes = [BitConverter]::ToUInt64($raw, 0) }
+            } elseif ($null -ne $raw) {
+                try { $bytes = [uint64]$raw } catch { $bytes = $null }
+            }
+            $list += [ordered]@{
+                key             = $k.PSChildName
+                driver_desc     = $desc
+                driver_version  = $p.DriverVersion
+                provider        = $p.ProviderName
+                memory_bytes    = $bytes
+                memory_mib      = $(if ($null -ne $bytes) { [math]::Round([double]$bytes / 1MB, 0) } else { $null })
+            }
+        } catch {
+            Add-ReportError -Section 'gpu_memory_registry' -Message ('{0}: {1}' -f $k.PSChildName, $_.Exception.Message)
         }
     }
     return ,$list
@@ -951,7 +964,7 @@ function Main {
         foreach ($f in @($report.hip_sdk.rocm_folders)) { if ($f) { [void]$L.Add(('  ROCm folder: {0}  (.info\version: {1})' -f $f.name, $f.version_file)) } }
     }
     if ($report.hipinfo -and $report.hipinfo.present) {
-        foreach ($l in @($report.hipinfo.summary_lines)) { [void]$L.Add('  hipInfo: ' + $l) }
+        foreach ($hl in @($report.hipinfo.summary_lines)) { [void]$L.Add('  hipInfo: ' + $hl) }
     } else {
         [void]$L.Add('  hipInfo.exe: not found')
     }

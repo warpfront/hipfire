@@ -3,8 +3,10 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Machine facts for `hipfire fit`, read from sysfs, `/proc` and the
-//! `hipfire calibrate` record. Nothing here initializes HIP or spawns the
-//! daemon.
+//! `hipfire calibrate` record. On Linux nothing here initializes HIP or spawns
+//! the daemon; native Windows has no KFD topology, sysfs or `/proc`, so there
+//! the GPUs come from HIP and host RAM from `GlobalMemoryStatusEx`
+//! ([`detect_hip`]).
 //!
 //! Every figure goes through the function the engine itself uses, fed from
 //! files under an injectable root so the tests run against a fake tree:
@@ -36,6 +38,8 @@ use super::types::{FitDevice, FitHost, LinkFacts};
 
 /// Process inputs the machine facts depend on, gathered by [`live_inputs`] and
 /// injected directly by tests.
+// The ROCr/userptr inputs feed the Linux sysfs path only.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HostInputs {
     /// `hardware.devices` (`HIPFIRE_DEVICES`) from the resolved config.
@@ -67,6 +71,7 @@ pub(crate) struct HostInputs {
 /// that variable, which the daemon sets to `0` only inside the Qwen4 load
 /// process, so while it is unset the GTT-backed answer is the root-injectable
 /// mirror in [`read_memory`] (the same formulas, evaluated as that load would).
+#[cfg(not(windows))]
 pub(crate) fn detect_with_notes(paths: &crate::Paths) -> (FitHost, Vec<String>) {
     let inputs = live_inputs(paths);
     let (mut host, notes) = detect_at(Path::new("/"), &inputs);
@@ -83,6 +88,177 @@ pub(crate) fn detect_with_notes(paths: &crate::Paths) -> (FitHost, Vec<String>) 
         host.gtt_used = budget.map(|budget| budget.used_bytes);
     }
     (host, notes)
+}
+
+/// Machine facts of this native Windows host plus report-only lines, with the
+/// same `load refused:` note contract as the Linux build (#1145).
+#[cfg(windows)]
+pub(crate) fn detect_with_notes(paths: &crate::Paths) -> (FitHost, Vec<String>) {
+    let inputs = live_inputs(paths);
+    detect_hip(
+        Path::new("/"),
+        &inputs,
+        query_hip_devices(),
+        hipfire_config::host_memory(),
+    )
+}
+
+/// One GPU as HIP enumerates it: the identity the daemon checks at start
+/// (`observe_hip_devices`, hipfire-daemon main.rs) plus `hipMemGetInfo`.
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug)]
+struct HipDevice {
+    /// `hipGetDeviceProperties` `gcnArchName`.
+    arch: String,
+    /// `hipDeviceGetPCIBusId`; `None` when HIP does not report it.
+    pci_bus_id: Option<String>,
+    /// `hipMemGetInfo` `(free, total)` with this device current; `None` when
+    /// the query fails.
+    mem_info: Option<(u64, u64)>,
+}
+
+/// Every device the HIP runtime exposes to this process, in HIP order. An
+/// inherited `HIP_VISIBLE_DEVICES` is applied by HIP itself, as in the daemon
+/// the CLI would spawn.
+#[cfg(windows)]
+fn query_hip_devices() -> Result<Vec<HipDevice>, String> {
+    let hip = hip_bridge::HipRuntime::load().map_err(|error| error.to_string())?;
+    let count = hip.device_count().map_err(|error| error.to_string())?;
+    (0..count)
+        .map(|id| {
+            Ok(HipDevice {
+                arch: hip.get_arch(id).map_err(|error| error.to_string())?,
+                pci_bus_id: hip.device_pci_bus_id(id).ok(),
+                mem_info: hip
+                    .set_device(id)
+                    .and_then(|()| hip.get_vram_info())
+                    .ok()
+                    .map(|(free, total)| (free as u64, total as u64)),
+            })
+        })
+        .collect()
+}
+
+/// Machine facts from the HIP device list (native Windows: no KFD topology,
+/// sysfs or `/proc`). Logical order is HIP's, as in the daemon; VRAM total is
+/// `hipMemGetInfo`'s and free goes through `uma_memory::device_free_from`, the
+/// clamp `Gpu::device_mem_info` applies. Host RAM is `GlobalMemoryStatusEx`
+/// (`hipfire_config::host_memory`); there is no GTT cap or TTM pool.
+/// `hardware.devices` resolves through KFD, so the daemon refuses it here.
+#[cfg(any(windows, test))]
+fn detect_hip(
+    root: &Path,
+    inputs: &HostInputs,
+    hip: Result<Vec<HipDevice>, String>,
+    memory: Option<hipfire_config::HostMemory>,
+) -> (FitHost, Vec<String>) {
+    let mut notes = Vec::new();
+    let refusal = inputs.config_refusal.clone().or_else(|| {
+        non_empty(inputs.devices_spec.as_deref()).map(|_| {
+            "load refused: hardware.devices resolves cards through the KFD topology, which native Windows does not have; fix: `hipfire config reset hardware.devices` and select the card with HIP_VISIBLE_DEVICES".to_owned()
+        })
+    });
+    let observed = match refusal {
+        Some(refusal) => {
+            notes.push(refusal);
+            Vec::new()
+        }
+        None => hip.unwrap_or_else(|error| {
+            notes.push(format!("HIP runtime: {}", first_line(&error)));
+            Vec::new()
+        }),
+    };
+    let live_host = inputs
+        .calibration
+        .as_ref()
+        .map(|_| calibration::detect_host_at(root));
+    let devices = observed
+        .iter()
+        .enumerate()
+        .map(|(index, gpu)| {
+            let unified_memory = hipfire_config::is_unified_memory_arch(&gpu.arch);
+            let vram_total = gpu.mem_info.map(|(_, total)| total);
+            let free = gpu.mem_info.and_then(|(free, total)| {
+                let carveout_total = gpu
+                    .pci_bus_id
+                    .as_deref()
+                    .and_then(uma_memory::carveout_total_bytes);
+                uma_memory::device_free_from(DeviceMemory {
+                    device_free: free,
+                    device_total: total,
+                    uma: unified_memory,
+                    carveout_total,
+                    host_available: (unified_memory
+                        && uma_memory::gtt_backed(total, carveout_total))
+                    .then(uma_memory::host_available_bytes)
+                    .flatten(),
+                })
+            });
+            match (gpu.mem_info, free) {
+                (None, _) => notes.push(format!(
+                    "GPU{index}: hipMemGetInfo failed, so free device memory is unknown"
+                )),
+                (Some(_), None) => notes.push(format!(
+                    "GPU{index}: a unified-memory GPU's free memory is capped by host RAM read from /proc/meminfo, which native Windows does not have (the load cannot size it either)"
+                )),
+                (Some(_), Some(_)) => {}
+            }
+            let bdf = gpu
+                .pci_bus_id
+                .as_deref()
+                .and_then(calibration::normalize_bdf);
+            let link = match (&bdf, unified_memory) {
+                (None, false) => LinkFacts {
+                    calibrated: false,
+                    gbps: None,
+                    narrow: None,
+                    detail: format!("not calibrated: HIP reports no PCI address; {NOT_CALIBRATED}"),
+                },
+                _ => link_facts(
+                    root,
+                    bdf.as_deref().unwrap_or_default(),
+                    &gpu.arch,
+                    unified_memory,
+                    inputs,
+                    live_host.as_ref(),
+                    vram_total,
+                ),
+            };
+            // HIP numbers the devices an inherited HIP_VISIBLE_DEVICES keeps
+            // from 0, so the selector for logical `index` is that list's entry.
+            let env_selector = inputs
+                .hip_visible
+                .as_deref()
+                .and_then(|filter| filter.split(',').map(str::trim).nth(index))
+                .filter(|token| !token.is_empty())
+                .map_or_else(|| index.to_string(), str::to_owned);
+            FitDevice {
+                index,
+                arch: gpu.arch.clone(),
+                unified_memory,
+                vram_total,
+                free,
+                link: Some(link),
+                capacity: None,
+                capacity_shown: None,
+                env_selector,
+                // hardware.devices is refused here; the report offers only
+                // HIP_VISIBLE_DEVICES (capacity::best_gpu_line).
+                config_selector: String::new(),
+            }
+        })
+        .collect();
+    (
+        FitHost {
+            ram_total: memory.map(|memory| memory.total_physical_bytes),
+            mem_available: memory.map(|memory| memory.available_physical_bytes),
+            ttm_pool: 0,
+            gtt_limit: None,
+            gtt_used: None,
+            devices,
+        },
+        notes,
+    )
 }
 
 fn env_var(name: &str) -> Option<String> {
@@ -141,6 +317,7 @@ fn devices_spec_from_config(paths: &crate::Paths) -> Result<Option<String>, Stri
 }
 
 /// [`detect`] against a sysfs/proc tree rooted at `root`.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn detect_at(root: &Path, inputs: &HostInputs) -> (FitHost, Vec<String>) {
     let mut notes = Vec::new();
     let memory = read_memory(root, inputs);
@@ -206,6 +383,7 @@ pub(crate) fn detect_at(root: &Path, inputs: &HostInputs) -> (FitHost, Vec<Strin
     )
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn rooted(root: &Path, absolute: &str) -> PathBuf {
     root.join(absolute.trim_start_matches('/'))
 }
@@ -236,6 +414,7 @@ fn first_line(text: &str) -> &str {
 /// devices. Falling back to another GPU set would report a FITS the load never
 /// reaches. A host with no GPU at all is not a refusal: there is nothing to
 /// select from and the caller's "no GPU" finding says so.
+#[cfg_attr(windows, allow(dead_code))]
 fn select_devices(gpus: Vec<GpuDevice>, inputs: &HostInputs) -> Result<Vec<GpuDevice>, String> {
     if gpus.is_empty() {
         return Ok(gpus);
@@ -269,6 +448,7 @@ fn select_devices(gpus: Vec<GpuDevice>, inputs: &HostInputs) -> Result<Vec<GpuDe
 /// The devices ROCr exposes under `filter` (ordinals and `GPU-<hex>` UUIDs, in
 /// list order); `None` when an entry matches no GPU. Mirrors
 /// `hipfire_config::devices::rocr_visible` (private, devices.rs:968-985).
+#[cfg_attr(windows, allow(dead_code))]
 fn rocr_filtered(devices: &[GpuDevice], filter: &str) -> Option<Vec<GpuDevice>> {
     filter
         .split(',')
@@ -288,6 +468,7 @@ fn rocr_filtered(devices: &[GpuDevice], filter: &str) -> Option<Vec<GpuDevice>> 
 }
 
 /// Host memory the admission gates read.
+#[cfg_attr(windows, allow(dead_code))]
 struct Memory {
     ram_total: Option<u64>,
     mem_available: Option<u64>,
@@ -302,6 +483,7 @@ struct Memory {
 /// `mem_info_gtt_used` summed over every `/sys/class/drm/card<N>` amdgpu
 /// device; mirrors `uma_memory::amdgpu_gtt_used_bytes` (uma_memory.rs:173) with
 /// an injectable root. `None` when `/sys/class/drm` cannot be listed.
+#[cfg_attr(windows, allow(dead_code))]
 fn amdgpu_gtt_used_at(root: &Path) -> Option<u64> {
     let mut used_bytes = 0u64;
     for card in std::fs::read_dir(root.join("sys/class/drm"))
@@ -332,6 +514,7 @@ fn amdgpu_gtt_used_at(root: &Path) -> Option<u64> {
 /// an unset variable counts as `0`; any other operator value means userptr
 /// memory and neither applies. The unified-memory free clamp counts the pool
 /// ungated, as `Gpu::device_mem_info` does.
+#[cfg_attr(windows, allow(dead_code))]
 fn read_memory(root: &Path, inputs: &HostInputs) -> Memory {
     let meminfo = std::fs::read_to_string(root.join("proc/meminfo")).ok();
     let zoneinfo = std::fs::read_to_string(root.join("proc/zoneinfo")).ok();
@@ -379,6 +562,7 @@ fn read_memory(root: &Path, inputs: &HostInputs) -> Memory {
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn fit_device(
     root: &Path,
     index: usize,
@@ -395,7 +579,7 @@ fn fit_device(
         unified_memory,
         apu_available,
     );
-    let link = link_facts(root, &bdf, &arch, unified_memory, inputs, live_host);
+    let link = link_facts(root, &bdf, &arch, unified_memory, inputs, live_host, None);
     FitDevice {
         index,
         arch,
@@ -421,6 +605,7 @@ fn fit_device(
 /// (dispatch.rs:1763-1777): a GTT-backed APU takes
 /// `min(that, MemAvailable - CMA + TTM pool)`. HIP's own figure is slightly
 /// lower once a process has opened the GPU (its context allocations).
+#[cfg_attr(windows, allow(dead_code))]
 fn device_free(
     sysfs: &Path,
     unified: bool,
@@ -462,9 +647,10 @@ const NOT_CALIBRATED: &str = "run `hipfire calibrate` (the engine probes the lin
 
 /// The host link of one GPU as the calibration record describes it. The lookup
 /// is `calibration::lookup_in` over the identity `hipfire calibrate` and the
-/// engine build (`DeviceIdentity::live_at`: sysfs VRAM total and PCIe path); the
-/// rate is `host_link::link_from_calibration`, as `calibrate.rs` `routes_for`
-/// uses it. Only a fresh record states a link.
+/// engine build (`DeviceIdentity::live_at`: sysfs VRAM total, else
+/// `hip_vram_bytes`, and PCIe path); the rate is
+/// `host_link::link_from_calibration`, as `calibrate.rs` `routes_for` uses it.
+/// Only a fresh record states a link.
 fn link_facts(
     root: &Path,
     bdf: &str,
@@ -472,6 +658,7 @@ fn link_facts(
     unified: bool,
     inputs: &HostInputs,
     live_host: Option<&HostFacts>,
+    hip_vram_bytes: Option<u64>,
 ) -> LinkFacts {
     let uncalibrated = |detail: String| LinkFacts {
         calibrated: false,
@@ -490,7 +677,7 @@ fn link_facts(
     let (Some(record), Some(live_host)) = (inputs.calibration.as_ref(), live_host) else {
         return uncalibrated(format!("not calibrated: {NOT_CALIBRATED}"));
     };
-    let identity = DeviceIdentity::live_at(root, bdf, arch, None);
+    let identity = DeviceIdentity::live_at(root, bdf, arch, hip_vram_bytes);
     let lookup = calibration::lookup_in(Some(record), live_host, &identity);
     match &lookup {
         Lookup::Missing(reason) => {
@@ -1031,5 +1218,148 @@ mod tests {
         let link = card_link(&root, None, true);
         assert!(!link.calibrated);
         assert!(link.detail.contains("unreadable [calibration] record"));
+    }
+
+    fn hip_gpu(arch: &str, bus: u32, mem_info: Option<(u64, u64)>) -> HipDevice {
+        HipDevice {
+            arch: arch.to_owned(),
+            pci_bus_id: Some(format!("0000:{bus:02x}:00.0")),
+            mem_info,
+        }
+    }
+
+    fn windows_memory() -> hipfire_config::HostMemory {
+        hipfire_config::HostMemory {
+            total_physical_bytes: 64 * GIB,
+            available_physical_bytes: 40 * GIB,
+            swap_total_bytes: None,
+            commit_limit_bytes: None,
+            commit_available_bytes: None,
+            source: "test",
+        }
+    }
+
+    /// #1145: native Windows has no KFD topology or /proc; the GPUs, their
+    /// VRAM and host RAM come from HIP and GlobalMemoryStatusEx.
+    #[test]
+    fn hip_identity_supplies_devices_vram_and_host_ram() {
+        let root = FakeRoot::new("hip-devices");
+        let (host, notes) = detect_hip(
+            &root.0,
+            &HostInputs::default(),
+            Ok(vec![
+                hip_gpu("gfx1100", 0x03, Some((22 * GIB, 24 * GIB))),
+                hip_gpu("gfx1201", 0x64, Some((30 * GIB, 32 * GIB))),
+            ]),
+            Some(windows_memory()),
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(host.ram_total, Some(64 * GIB));
+        assert_eq!(host.mem_available, Some(40 * GIB));
+        assert_eq!(
+            (host.ttm_pool, host.gtt_limit, host.gtt_used),
+            (0, None, None)
+        );
+        assert_eq!(host.devices.len(), 2);
+        let first = &host.devices[0];
+        assert_eq!((first.index, first.arch.as_str()), (0, "gfx1100"));
+        assert_eq!(
+            (first.vram_total, first.free),
+            (Some(24 * GIB), Some(22 * GIB))
+        );
+        assert!(!first.unified_memory);
+        assert_eq!(first.env_selector, "0");
+        assert!(first.config_selector.is_empty());
+        let second = &host.devices[1];
+        assert_eq!(
+            (second.vram_total, second.free),
+            (Some(32 * GIB), Some(30 * GIB))
+        );
+        assert_eq!(second.env_selector, "1");
+        assert!(second
+            .link
+            .as_ref()
+            .unwrap()
+            .detail
+            .contains("hipfire calibrate"));
+    }
+
+    #[test]
+    fn hip_identity_selectors_follow_an_inherited_hip_filter() {
+        let root = FakeRoot::new("hip-filter");
+        let inputs = HostInputs {
+            hip_visible: Some("3, 5".into()),
+            ..HostInputs::default()
+        };
+        let gpus = vec![
+            hip_gpu("gfx1100", 0x03, Some((GIB, 2 * GIB))),
+            hip_gpu("gfx1100", 0x04, Some((GIB, 2 * GIB))),
+        ];
+        let (host, _) = detect_hip(&root.0, &inputs, Ok(gpus), None);
+        let selectors: Vec<_> = host
+            .devices
+            .iter()
+            .map(|d| d.env_selector.as_str())
+            .collect();
+        assert_eq!(selectors, ["3", "5"]);
+        assert_eq!((host.ram_total, host.mem_available), (None, None));
+    }
+
+    #[test]
+    fn hip_identity_refuses_hardware_devices_and_reports_hip_failures() {
+        let root = FakeRoot::new("hip-refusal");
+        let inputs = HostInputs {
+            devices_spec: Some("0000:03:00.0".into()),
+            ..HostInputs::default()
+        };
+        let gpus = vec![hip_gpu("gfx1100", 0x03, Some((GIB, 2 * GIB)))];
+        let (host, notes) = detect_hip(&root.0, &inputs, Ok(gpus), Some(windows_memory()));
+        assert!(host.devices.is_empty());
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("load refused:"), "{notes:?}");
+        assert!(notes[0].contains("fix:") && notes[0].contains("HIP_VISIBLE_DEVICES"));
+        assert!(!notes[0].contains("doctor"));
+        assert_eq!(host.ram_total, Some(64 * GIB));
+
+        let (host, notes) = detect_hip(
+            &root.0,
+            &HostInputs::default(),
+            Err("failed to load amdhip64.dll: not found.\nmore".into()),
+            Some(windows_memory()),
+        );
+        assert!(host.devices.is_empty());
+        assert_eq!(
+            notes,
+            ["HIP runtime: failed to load amdhip64.dll: not found."]
+        );
+
+        let (host, notes) = detect_hip(
+            &root.0,
+            &HostInputs::default(),
+            Ok(vec![hip_gpu("gfx1100", 0x03, None)]),
+            None,
+        );
+        assert_eq!(
+            (host.devices[0].vram_total, host.devices[0].free),
+            (None, None)
+        );
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starts_with("GPU0: hipMemGetInfo failed"));
+    }
+
+    /// The calibration identity falls back to HIP's VRAM total where sysfs is
+    /// absent, as `hipfire calibrate` recorded it.
+    #[test]
+    fn hip_identity_matches_a_calibration_record_without_sysfs() {
+        let root = FakeRoot::new("hip-calibrated");
+        let inputs = HostInputs {
+            calibration: Some(record(&root.0, "2026-10-17T10:00:00Z", Some(37.1))),
+            ..HostInputs::default()
+        };
+        let gpus = vec![hip_gpu("gfx1201", 0x64, Some((30 * GIB, 32 * GIB)))];
+        let (host, _) = detect_hip(&root.0, &inputs, Ok(gpus), None);
+        let link = host.devices[0].link.clone().unwrap();
+        assert!(link.calibrated, "{}", link.detail);
+        assert_eq!(link.gbps, Some(37.1));
     }
 }

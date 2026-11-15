@@ -3,8 +3,9 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Data shared by the `hipfire fit` stages: the machine facts (read from
-//! sysfs, `/proc` and the calibration record, never from HIP), the per-fact
-//! findings behind the verdict, and the weight placement a load would take.
+//! sysfs, `/proc` and the calibration record on Linux, from HIP and
+//! `GlobalMemoryStatusEx` on native Windows), the per-fact findings behind
+//! the verdict, and the weight placement a load would take.
 
 use serde::Serialize;
 
@@ -124,7 +125,8 @@ pub(crate) struct LinkFacts {
     pub detail: String,
 }
 
-/// A GPU a load could use, from the KFD topology and amdgpu sysfs only.
+/// A GPU a load could use, from the KFD topology and amdgpu sysfs (native
+/// Windows: from HIP).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct FitDevice {
     /// Logical index in the set a load would use (0 = the device a
@@ -136,7 +138,7 @@ pub(crate) struct FitDevice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vram_total: Option<u64>,
     /// Free device bytes as `Gpu::device_mem_info` would report them before
-    /// the load, derived without HIP (see `fit/host.rs`).
+    /// the load, derived without HIP on Linux (see `fit/host.rs`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

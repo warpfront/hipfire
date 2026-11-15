@@ -329,10 +329,13 @@ pub(crate) fn capacity_lines(p: &Value, device: Option<&FitDevice>) -> Vec<Strin
 
 /// The `best GPU` plan line. `pinned`: `hardware.devices` is set, which wins
 /// over `HIP_VISIBLE_DEVICES` (hipfire_config::devices), so only the config
-/// form selects.
+/// form selects. Native Windows has no `hardware.devices` (no KFD topology),
+/// so there only `HIP_VISIBLE_DEVICES` selects.
 pub(crate) fn best_gpu_line(best: &GpuCapacity, pinned: bool) -> Option<String> {
     let p = best.projection?;
-    let how = if pinned {
+    let how = if cfg!(windows) {
+        format!("select it with HIP_VISIBLE_DEVICES={}", best.env_selector)
+    } else if pinned {
         format!(
             "select it with `hipfire config set hardware.devices {}` (hardware.devices is set, so HIP_VISIBLE_DEVICES is ignored)",
             best.config_selector
