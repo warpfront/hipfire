@@ -94,6 +94,13 @@ fn load_dev(attach_forward: bool) -> Result<Loaded, String> {
     hipfire_arch_qwen4::bundle::admit_executable_profile(&receipt.config)
         .map_err(|e| format!("executor admission: {e}"))?;
     let max_seq = MAX_SEQ_REQUEST.min(receipt.config.max_position_embeddings);
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )
+    .map_err(|e| format!("scratch mode: {e}"))?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -150,7 +157,7 @@ fn load_dev(attach_forward: bool) -> Result<Loaded, String> {
     .map_err(|e| format!("assemble: {e}"))?;
     if attach_forward {
         bundle
-            .attach_forward(&mut gpu, max_seq)
+            .attach_forward(&mut gpu, max_seq, scratch_mode)
             .map_err(|e| format!("attach_forward: {e}"))?;
     }
     Ok(Loaded {

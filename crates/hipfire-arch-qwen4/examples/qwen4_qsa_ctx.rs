@@ -1414,7 +1414,7 @@ fn main() -> Result<()> {
     eprintln!("text: {} tokens", tokens.len());
 
     let requested_chunk =
-        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu, n_ctx);
+        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu, n_ctx, scratch_mode);
     let probe = Arc::new(Mutex::new(Probe {
         phase: "prefill",
         ctx: 0,
