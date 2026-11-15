@@ -10,7 +10,8 @@
 // Receipt     : tools/cdna3-llvm.json (sha256 8078259f2fbbafb82838097ee6ce982f3c059e7ba67f87f797acc255bc1db6e3)
 // LLVM        : AMD LLVM version 24.0.0git
 // Receipt rows: {"unresolved": 26, "verified": 2435, "xml-only": 4}
-// Generator   : scripts/generate-cdna-tables.py sha256 881a8cc978f94473f5f0292b6fcaa1c9ba0a44135d85f47f365cc11d5f9f9ada
+// Generator   : scripts/generate-cdna-tables.py sha256 c732a0762132f628c12c10fb521716056c983600c0a6263144b2b4322085a3c0
+// Manifest    : xml-manifest-cdna3.json sha256 0ae4385d08800a8cfdb8efae59c5ce4b6b53ff3f5ebe2dd4c7b5b4591f4392fe (not committed; --manifest-dir DIR)
 // Tables      : 32 encodings, 1150 instructions, 2465 forms, 35 operand types, 83 data formats
 
 #![allow(clippy::all, clippy::pedantic, clippy::nursery, unused_imports)]
@@ -92892,7 +92893,7 @@ pub static TABLE: IsaTable = IsaTable {
         receipt_sha256: "8078259f2fbbafb82838097ee6ce982f3c059e7ba67f87f797acc255bc1db6e3",
         llvm_version: "AMD LLVM version 24.0.0git",
         generator: "scripts/generate-cdna-tables.py",
-        generator_sha256: "881a8cc978f94473f5f0292b6fcaa1c9ba0a44135d85f47f365cc11d5f9f9ada",
+        generator_sha256: "c732a0762132f628c12c10fb521716056c983600c0a6263144b2b4322085a3c0",
     },
     encodings: &ENCODINGS,
     instructions: &INSTRUCTIONS,

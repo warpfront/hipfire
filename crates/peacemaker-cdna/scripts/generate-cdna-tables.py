@@ -19,17 +19,22 @@ Outputs:
     field (with padding), condition, instruction, operand type, data format,
     form (instruction x encoding x condition) and operand of the XML, as Rust
     ``static`` tables consumed by ``src/xml.rs``.
-  * ``tools/xml-manifest-cdna3.json`` / ``tools/xml-manifest-cdna4.json``:
-    machine-readable row manifest (row id/name/encoding/condition/opcode/
-    bit_count/identifier/fields/operands/verification) with a structured seed
-    (named field values and little-endian bytes) that satisfies the row's XML
-    condition and decodes back to that row.
+  * ``xml-manifest-cdna3.json`` / ``xml-manifest-cdna4.json`` (NOT committed;
+    written only with ``--manifest-dir DIR``): machine-readable row manifest
+    (row id/name/encoding/condition/opcode/bit_count/identifier/fields/
+    operands/verification) with a structured seed (named field values and
+    little-endian bytes) that satisfies the row's XML condition and decodes
+    back to that row. Nothing in the tree reads it; each generated ``.rs``
+    header pins its sha256 (``// Manifest``), so a reproduced manifest can be
+    checked against the committed tables.
 
 Also usable as a module: ``load_model(xml_path)`` returns the parsed model and
 ``py_decode(model, words)`` the reference decoder the Rust runtime mirrors.
 
 Run from anywhere:  scripts/generate-cdna-tables.py --xml-dir <dir with the
-two XMLs>   (``--check`` regenerates in memory and fails if a file differs).
+two XMLs> [--manifest-dir DIR]   (``--check`` regenerates in memory and fails
+if a file differs, including the manifests in DIR when given).
+``scripts/check-pm-generated-pins.py`` checks the header pins without the XML.
 
 Structural cases the generator refuses (instead of faking support) are listed
 in ``Unsupported``; none occurs in the pinned XMLs except as reported in the
@@ -686,7 +691,7 @@ def check_operand_kinds(models):
         raise SystemExit(f"src/xml.rs OperandKind has kinds absent from both XMLs: {sorted(extra)}")
 
 
-def emit_rust(model, arch, receipt, generator_sha):
+def emit_rust(model, arch, receipt, generator_sha, manifest_sha):
     L = []
     w = L.append
     w("// SPDX-License-Identifier: Apache-2.0")
@@ -702,6 +707,7 @@ def emit_rust(model, arch, receipt, generator_sha):
     w(f"// LLVM        : {receipt['version']}")
     w(f"// Receipt rows: {json.dumps(receipt['counts'], sort_keys=True)}")
     w(f"// Generator   : {GENERATOR} sha256 {generator_sha}")
+    w(f"// Manifest    : xml-manifest-{arch['key']}.json sha256 {manifest_sha} (not committed; --manifest-dir DIR)")
     w(f"// Tables      : {len(model.encodings)} encodings, {len(model.instructions)} instructions, "
       f"{len(model.rows)} forms, {len(model.operand_types)} operand types, {len(model.data_formats)} data formats")
     w("")
@@ -966,7 +972,9 @@ def main():
                     help="directory holding amdgpu_isa_cdna3.xml and amdgpu_isa_cdna4.xml "
                          "(or $AMDGPU_ISA_XML_DIR)")
     ap.add_argument("--src-dir", type=pathlib.Path, default=CRATE / "src")
-    ap.add_argument("--tools-dir", type=pathlib.Path, default=CRATE / "tools")
+    ap.add_argument("--manifest-dir", type=pathlib.Path,
+                    help="also write (or with --check, compare) xml-manifest-<arch>.json here; "
+                         "the manifests are not committed")
     ap.add_argument("--check", action="store_true", help="fail if any generated file would change")
     args = ap.parse_args()
     if args.xml_dir is None:
@@ -981,11 +989,12 @@ def main():
         receipt = load_receipt(model, arch, CRATE / arch["receipt"])
         misses = receipt_selfcheck(model, receipt)
         manifest, problems = build_manifest(model, arch, receipt, generator_sha)
-        rust = emit_rust(model, arch, receipt, generator_sha)
-        outputs = {
-            args.src_dir / f"{arch['module']}.rs": rust,
-            args.tools_dir / f"xml-manifest-{arch['key']}.json": json.dumps(manifest, indent=1) + "\n",
-        }
+        manifest_body = json.dumps(manifest, indent=1) + "\n"
+        manifest_sha = hashlib.sha256(manifest_body.encode()).hexdigest()
+        rust = emit_rust(model, arch, receipt, generator_sha, manifest_sha)
+        outputs = {args.src_dir / f"{arch['module']}.rs": rust}
+        if args.manifest_dir is not None:
+            outputs[args.manifest_dir / f"xml-manifest-{arch['key']}.json"] = manifest_body
         for path, body in outputs.items():
             if args.check:
                 if not path.exists() or path.read_text() != body:

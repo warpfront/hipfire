@@ -1,0 +1,14 @@
+# Search exclusions for ripgrep and agent search tools. Git does not read this file, so it does not
+# change what is tracked. Generated PeaceMaker tables and LLVM oracle receipts: must equal the
+# linguist-generated list in .gitattributes (scripts/check-pm-generated-pins.py enforces it).
+# `rg -u` or `git grep` still searches them.
+/crates/peacemaker-cdna/src/generated_cdna3.rs
+/crates/peacemaker-cdna/src/generated_cdna4.rs
+/crates/peacemaker-cdna/tools/cdna3-llvm.json
+/crates/peacemaker-cdna/tools/cdna4-llvm.json
+/crates/peacemaker-ir/isa/gfx1100.xml.jsonl
+/crates/peacemaker-ir/isa/gfx1151.xml.jsonl
+/crates/peacemaker-ir/isa/gfx12.xml.jsonl
+/crates/peacemaker-ir/isa/sop1-overrides.json
+/crates/peacemaker-ir/isa/emu/trans_tables.rs
+/crates/peacemaker-npu/src/isa/gen.rs
