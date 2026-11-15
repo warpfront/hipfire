@@ -58,7 +58,7 @@ shards run under the `ci` Cargo profile (`cargo test --profile ci`: optimised
 where the exhaustive CPU oracle tests live, debug assertions and overflow
 checks on). Local equivalent of one shard: copy its command from the matrix in
 [`ci.yml`](../.github/workflows/ci.yml). These checks gate a merge into the
-`integration` branch; `beta` moves only on a green
+`beta-candidate` branch; `beta` moves only on a green
 [promotion record](#promotion-lane). `hw-gate` is not a substitute for
 either.
 
@@ -88,8 +88,8 @@ filed through the Windows test report issue form (native installs run
 ## Promotion lane
 
 Kaden's decision (2026-11-14, reversing the earlier "hw-gate is optional"
-rule): candidates land on `integration`; `beta` fast-forwards to an
-`integration` tip only when every required hardware row of every blocking
+rule): candidates land on `beta-candidate`; `beta` fast-forwards to a
+`beta-candidate` tip only when every required hardware row of every blocking
 card class is `current` on the **installed release archive** of that exact
 SHA. Two regressions reached beta through the GPU-free gate in one week (the
 DFlash forced-advance crash and the stale `no-caller` pack hole that cut A3B
@@ -375,7 +375,7 @@ not a separate required GitHub check beyond the [merge bar](#merge-bar-required)
 |---|---|---|
 | **Automatic (no GPU CI, required)** | PR / push via [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) | **Required** merge bar: `build (workspace, no GPU)`, `unit tests (lib, no GPU)`, `gates (ratchets, layering, registers)`. **Not** model coherence, serve semantics, or perf admission. |
 | **Automatic (Windows MSVC, advisory)** | PR / push via [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) on `windows-latest` | Native build, selected CPU library tests, no-HIP version/JSON smoke, unsigned ZIP packaging. Initially advisory; promote after the first green `beta` run. **Not** GPU/runtime certification. |
-| **Promotion lane (required for `beta`)** | Every `integration` tip `land-pick-lane.sh` promotes; inside fabric jobs on each blocking card class | **Required**: `beta` fast-forwards only on a green promotion record. See [§ Promotion lane](#promotion-lane). |
+| **Promotion lane (required for `beta`)** | Every `beta-candidate` tip `land-pick-lane.sh` promotes; inside fabric jobs on each blocking card class | **Required**: `beta` fast-forwards only on a green promotion record. See [§ Promotion lane](#promotion-lane). |
 | **Automatic (hw-gate, PR evidence)** | PR via [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) when that automation runs; hardware run after `hw-run` when buckets need it | Evidence for the reviewer. Not a required status check and not promotion. |
 | **Automatic (path-gated hooks)** | Local `pre-commit` on matching staged runtime paths | Runs the hotspot guards selected by the staged path set. Documentation-only staged sets do not trigger a separate docs hook. **Not** a full product matrix. |
 | **Manual local no-GPU equivalent** | Human/agent invokes `scripts/no-gpu-ci.sh` outside CI | Same checks as the workflow script body; still **manual invocation**, not automatic CI. |

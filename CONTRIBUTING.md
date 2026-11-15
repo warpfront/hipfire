@@ -467,7 +467,7 @@ committed baseline in `tests/speed-baselines/` is welcome.
 
 - Agent-authored commits end with `Agent: <model>/<seat>`, e.g.
   `Agent: claude-opus-5.5/PromotionLane`.
-- Human-authored commits that go through the integration lane end with
+- Human-authored commits that go through the beta-candidate lane end with
   `Human-Authored: <name>`.
 - The landing script refuses candidate commits with neither. CI rejects
   malformed trailers and agent `Co-authored-by:` signatures without `Agent:`.
