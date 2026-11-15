@@ -61,6 +61,12 @@ git show <sha>:<path> > <path>
 | `ds4_parent_moe_smoke` | `crates/hipfire-ds4-parent/examples/ds4_parent_moe_smoke.rs` | `bf6ec9ddf240` | 337 | Gate 4 parent-MoE smoke: load one real layer with experts and run parent_moe_forward over 16 rows of plausible activations. |
 | `ds4_parent_seq_plog` | `crates/hipfire-ds4-parent/examples/ds4_parent_seq_plog.rs` | `bf6ec9ddf240` | 108 | Sequential parent forward (token-by-token) for long-seq diagnostics. |
 
+## hipfire-generate
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `attn_wmma_row_probe` | `crates/hipfire-generate/examples/attn_wmma_row_probe.rs` | `c73864832f2c` | 147 | Row-invariance microtest for the batched Q8_0 prefill attention kernels (split-prefill investigation). |
+
 ## hipfire-loader
 
 | Example | Path | Last commit | LOC | Purpose |

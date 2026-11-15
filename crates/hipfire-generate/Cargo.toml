@@ -80,9 +80,6 @@ vcn-jpeg = ["hipfire-arch-qwen35-vl/vcn-jpeg"]
 # measure_floor there), so the lab gate costs it nothing on the path that
 # needs it while keeping it off the default `cargo build --all-targets`.
 # ---------------------------------------------------------------------------
-[[example]]
-name = "attn_wmma_row_probe"
-required-features = ["lab"]
 
 [[example]]
 name = "split_prefill_probe"
