@@ -694,3 +694,156 @@ extern "C" __global__ void dspine_lattice_base_pre_gfx1100(
         base_pre[(long long)row * 16 + tid] = sc;
     }
 }
+
+
+// ── fused prepare: rms stats + normalized rows + pre-write snapshot ─────
+// Bit-identical arithmetic to dspine_prepare_read_gfx1100 (the second loop
+// keeps x_row[i] * inv); additionally stores the untouched row into x_pre,
+// which removes the separate D2D snapshot before the bridge.
+extern "C" __launch_bounds__(256, 4)
+__global__ void dspine_prepare_read_snap_gfx1100(
+    const float* __restrict__ x,
+    float* __restrict__ rms,
+    float* __restrict__ normed,
+    float* __restrict__ x_pre,
+    int H,
+    float eps
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float* x_row = x + (long long)row * H;
+    float* n_row = normed + (long long)row * H;
+    float* xp_row = x_pre + (long long)row * H;
+
+    float acc = 0.0f;
+    for (int i = tid; i < H; i += 256) {
+        acc += x_row[i] * x_row[i];
+    }
+    __shared__ float red[256];
+    red[tid] = acc;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            red[tid] += red[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float denom = sqrtf(red[0] / (float)H + eps);
+    if (tid == 0) {
+        rms[row] = denom;
+    }
+    const float inv = 1.0f / denom;
+    for (int i = tid; i < H; i += 256) {
+        const float v = x_row[i];
+        n_row[i] = v * inv;
+        xp_row[i] = v;
+    }
+}
+
+// ── batched F32 GEMM, 4 outputs per sub-warp ────────────────────────────
+// Every output keeps gemm_f32_batched's exact per-lane order (k = lane,
+// lane+32, ...) and shuffle tree, so values are bit-identical to the
+// generic kernel. A sub-warp carries four outputs that share one B row:
+// four independent accumulation chains hide memory latency and the B load
+// is issued once per k. Block = 16 sub-warps over a 16x4 (m, n) tile.
+// M must be a multiple of 16.
+extern "C" __launch_bounds__(512, 2)
+__global__ void dspine_gemm_f32_batch_gfx1100(
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ Y,
+    long long M,
+    int K,
+    int N
+) {
+    const int sub = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.y * 4 + (sub & 3);
+    if (n >= N) {
+        return;
+    }
+    const long long m0 = (long long)blockIdx.x * 16 + (long long)(sub >> 2) * 4;
+    const float* b_row = B + (long long)n * K;
+    const float* a0 = A + m0 * (long long)K;
+    const float* a1 = a0 + K;
+    const float* a2 = a1 + K;
+    const float* a3 = a2 + K;
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    float s3 = 0.0f;
+    for (int k = lane; k < K; k += 32) {
+        const float bv = b_row[k];
+        s0 += a0[k] * bv;
+        s1 += a1[k] * bv;
+        s2 += a2[k] * bv;
+        s3 += a3[k] * bv;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        s0 += __shfl_down(s0, offset, 32);
+        s1 += __shfl_down(s1, offset, 32);
+        s2 += __shfl_down(s2, offset, 32);
+        s3 += __shfl_down(s3, offset, 32);
+    }
+    if (lane == 0) {
+        float* y_row = Y + (long long)n * M + m0;
+        y_row[0] = s0;
+        y_row[1] = s1;
+        y_row[2] = s2;
+        y_row[3] = s3;
+    }
+}
+
+// ── delta GEMM + finish, 4 outputs per sub-warp ─────────────────────────
+// Same reduction as gemm_f32_batched on (write_w [H, R], message [N, R]),
+// then x[n*H + m] += rms[n] * sum for non-block-first rows, in place.
+// H must be a multiple of 16.
+extern "C" __launch_bounds__(512, 2)
+__global__ void dspine_delta_finish_gfx1100(
+    const float* __restrict__ write_w,
+    const float* __restrict__ message,
+    float* __restrict__ x,
+    const float* __restrict__ rms,
+    long long H,
+    int R,
+    int N,
+    int T
+) {
+    const int sub = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.y * 4 + (sub & 3);
+    if (n >= N) {
+        return;
+    }
+    const long long m0 = (long long)blockIdx.x * 16 + (long long)(sub >> 2) * 4;
+    const float* msg_row = message + (long long)n * R;
+    const float* w0 = write_w + m0 * (long long)R;
+    const float* w1 = w0 + R;
+    const float* w2 = w1 + R;
+    const float* w3 = w2 + R;
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    float s3 = 0.0f;
+    for (int k = lane; k < R; k += 32) {
+        const float mv = msg_row[k];
+        s0 += w0[k] * mv;
+        s1 += w1[k] * mv;
+        s2 += w2[k] * mv;
+        s3 += w3[k] * mv;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        s0 += __shfl_down(s0, offset, 32);
+        s1 += __shfl_down(s1, offset, 32);
+        s2 += __shfl_down(s2, offset, 32);
+        s3 += __shfl_down(s3, offset, 32);
+    }
+    if (lane == 0 && (n % T) != 0) {
+        const float scale = rms[n];
+        float* x_row = x + (long long)n * H + m0;
+        x_row[0] += scale * s0;
+        x_row[1] += scale * s1;
+        x_row[2] += scale * s2;
+        x_row[3] += scale * s3;
+    }
+}

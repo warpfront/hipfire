@@ -457,7 +457,7 @@ fn main() {
 
         gpu.dspine_serial_chain(
             &base_t, &cand_t, &rms_t, &q_t, &sg_t, &sv_t, &tg_t, &gb_t,
-            anchor_sid, &out_t, n, k, R, T, R,
+            anchor_sid, &out_t, n, k, R, T, R, 1.0,
         )
         .map_err(|e| format!("{e}"))?;
         let raw = gpu.download_f32(&out_t).map_err(|e| format!("{e}"))?;
@@ -543,7 +543,7 @@ fn main() {
 
         gpu.dspine_serial_chain(
             &base_t, &cand_t, &rms_t, &q_t, &sg_t, &sv_t, &tg_t, &gb_t,
-            anchor_sid, &out_t, n, k, R, T, R,
+            anchor_sid, &out_t, n, k, R, T, R, 1.0,
         )
         .map_err(|e| format!("{e}"))?;
         let raw = gpu.download_f32(&out_t).map_err(|e| format!("{e}"))?;

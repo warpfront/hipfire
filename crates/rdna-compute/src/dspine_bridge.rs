@@ -242,6 +242,197 @@ impl Gpu {
         )
     }
 
+    /// Fused prepare: rms stats + normalized rows + pre-write snapshot
+    /// (`dspine_prepare_read_snap_gfx1100`). Bit-identical to
+    /// `dspine_prepare_read`; additionally stores the untouched rows into
+    /// `x_pre` (the refinement base term), removing the separate D2D copy.
+    pub fn dspine_prepare_read_snap(
+        &mut self,
+        x: &GpuTensor,
+        rms: &GpuTensor,
+        normed: &GpuTensor,
+        x_pre: &GpuTensor,
+        m: usize,
+        h: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dspine bridge kernels are gfx1100-only in v1",
+            ));
+        }
+        const SYM: &str = "dspine_prepare_read_snap_gfx1100";
+        self.ensure_kernel(SYM, DSPINE_SRC, SYM)?;
+
+        let mut x_ptr = x.buf.as_ptr();
+        let mut rms_ptr = rms.buf.as_ptr();
+        let mut normed_ptr = normed.buf.as_ptr();
+        let mut pre_ptr = x_pre.buf.as_ptr();
+        let mut h_val = h as i32;
+        let mut eps_val = eps;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut rms_ptr as *mut _ as *mut c_void,
+            &mut normed_ptr as *mut _ as *mut c_void,
+            &mut pre_ptr as *mut _ as *mut c_void,
+            &mut h_val as *mut _ as *mut c_void,
+            &mut eps_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            SYM,
+            [m as u32, 1, 1],
+            [256, 1, 1],
+            256 * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(rms_ptr);
+                b.push_ptr(normed_ptr);
+                b.push_ptr(pre_ptr);
+                b.push_i32(h_val);
+                b.push_f32(eps_val);
+                b
+            },
+        )
+    }
+
+    /// Batched F32 GEMM for the bridge (`dspine_gemm_f32_batch_gfx1100`):
+    /// Y[n*M + m] = A[m, K] · B[n, K], 8 outputs per block, bit-identical
+    /// reduction to `gemm_f32_batched`.
+    pub fn dspine_gemm_f32_batch(
+        &mut self,
+        a: &GpuTensor,
+        b_arg: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dspine bridge kernels are gfx1100-only in v1",
+            ));
+        }
+        const SYM: &str = "dspine_gemm_f32_batch_gfx1100";
+        self.ensure_kernel(SYM, DSPINE_SRC, SYM)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut b_ptr = b_arg.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as u64;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+
+        if m % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "dspine bridge GEMM needs M % 16 == 0",
+            ));
+        }
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            SYM,
+            [((m + 15) / 16) as u32, ((n + 3) / 4) as u32, 1],
+            [512, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(b_ptr);
+                b.push_ptr(y_ptr);
+                b.push_u64(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
+    /// Delta GEMM + in-place finish (`dspine_delta_finish_gfx1100`):
+    /// x[n*H + m] += rms[n] · Σ_k write_w[m, k] · message[n, k] for
+    /// non-block-first rows. Replaces the delta buffer and finish launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspine_delta_finish(
+        &mut self,
+        write_w: &GpuTensor,
+        message: &GpuTensor,
+        x: &GpuTensor,
+        rms: &GpuTensor,
+        h: usize,
+        r: usize,
+        n: usize,
+        t: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dspine bridge kernels are gfx1100-only in v1",
+            ));
+        }
+        const SYM: &str = "dspine_delta_finish_gfx1100";
+        self.ensure_kernel(SYM, DSPINE_SRC, SYM)?;
+
+        let mut w_ptr = write_w.buf.as_ptr();
+        let mut msg_ptr = message.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut rms_ptr = rms.buf.as_ptr();
+        let mut h_val = h as u64;
+        let mut r_val = r as i32;
+        let mut n_val = n as i32;
+        let mut t_val = t as i32;
+
+        if h % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "dspine delta+finish needs H % 16 == 0",
+            ));
+        }
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut msg_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut rms_ptr as *mut _ as *mut c_void,
+            &mut h_val as *mut _ as *mut c_void,
+            &mut r_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut t_val as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            SYM,
+            [((h + 15) / 16) as u32, ((n + 3) / 4) as u32, 1],
+            [512, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w_ptr);
+                b.push_ptr(msg_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(rms_ptr);
+                b.push_u64(h_val);
+                b.push_i32(r_val);
+                b.push_i32(n_val);
+                b.push_i32(t_val);
+                b
+            },
+        )
+    }
+
     /// Fused serial-refinement chain (): one
     /// workgroup per T-row block; rows walked serially from ,
     /// each row scoring its K head-logit candidates against the sender

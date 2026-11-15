@@ -2711,7 +2711,9 @@ fn gemm_dispatch(
     };
     let result = match w.gpu_dtype {
         DType::F32 => {
-            let r = gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m);
+            // Y[N,M] = B[N,K] @ A[M,K]^T: weight is A, so it comes first
+            // (the previous order wrote [out][batch] and only matched at batch 1).
+            let r = gpu.gemm_f32_batched(&w.buf, x, y, w.m, w.k, batch);
             if dump {
                 if let Err(e) = gpu.hip.device_synchronize() {
                     eprintln!("[draft-gemm] F32 sync err {e}");
@@ -3103,6 +3105,19 @@ fn gemm_dispatch(
             us,
             bytes / 1024,
             gbs
+        );
+    }
+    if dump && result.is_ok() {
+        if let Err(e) = gpu.hip.device_synchronize() {
+            eprintln!("[draft-gemm] sync err {e}");
+        }
+        eprintln!(
+            "[draft-gemm] dt={:?} M={} K={} B={} us={}",
+            w.gpu_dtype,
+            w.m,
+            w.k,
+            batch,
+            t0.unwrap().elapsed().as_micros()
         );
     }
     result

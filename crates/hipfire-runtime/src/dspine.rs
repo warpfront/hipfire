@@ -906,15 +906,13 @@ impl crate::dflash::DraftLayerBridge for DspineBridge {
         let t = self.t;
         let eps = self.cfg.trunk.norm_eps;
 
-        // Snapshot the pre-write hidden rows first: finish rewrites x
-        // in place, and the serial refinement's base term reads the
-        // pre-write values exactly like the upstream stash.
-        gpu
-            .memcpy_dtod_at_ordered_async(&self.s_x_pre.buf, 0, &scratch.x.buf, 0, b * h * 4)
-            .map_err(|e| hip_bridge::HipError::new(e.code, &format!("dspine x_pre snapshot: {e}")))?;
+        // Temporary bridge attribution (T4): HIPFIRE_DSPINE_BRIDGE_DIAG=1
+        // drains the queue at every boundary and prints one line per layer.
+        static BRIDGE_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let diag = *BRIDGE_DIAG
+            .get_or_init(|| std::env::var_os("HIPFIRE_DSPINE_BRIDGE_DIAG").map_or(false, |v| v != "0"));
+        let mut us = [0u128; 8];
 
-        // 1. rms stats + normalized rows (kernel 1).
-        gpu.dspine_prepare_read(&scratch.x, &self.s_rms, &self.s_normed, b, h, eps)?;
         // 2. projection GEMM: normed [b,H] × W_i[C,H]^T → projected [b,C].
         //    Layers 0..3 use early_read_weights[i]; the last layer read_weight.
         let w = if li < self.early_w.len() {
@@ -922,19 +920,188 @@ impl crate::dflash::DraftLayerBridge for DspineBridge {
         } else {
             &self.read_w
         };
+        static FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fused = *FUSED.get_or_init(|| {
+            std::env::var_os("HIPFIRE_DSPINE_FUSED_BRIDGE").map_or(true, |v| v != "0")
+        });
+        if fused {
+            // Fused path: the pre-write snapshot rides prepare_read (us[1]),
+            // the read-side GEMMs use the 8-outputs-per-block bridge kernel,
+            // and finish is folded into the delta GEMM (us[6]).
+            if diag {
+                gpu.hip.device_synchronize()?;
+            }
+            let tq = std::time::Instant::now();
+            gpu.dspine_prepare_read_snap(
+                &scratch.x,
+                &self.s_rms,
+                &self.s_normed,
+                &self.s_x_pre,
+                b,
+                h,
+                eps,
+            )?;
+            if diag {
+                gpu.hip.device_synchronize()?;
+                us[1] = tq.elapsed().as_micros();
+            }
+            if diag {
+                gpu.hip.device_synchronize()?;
+            }
+            let tq = std::time::Instant::now();
+            gpu.dspine_gemm_f32_batch(w, &self.s_normed, &self.s_projected, c, h, b)?;
+            if diag {
+                gpu.hip.device_synchronize()?;
+                us[2] = tq.elapsed().as_micros();
+            }
+            if diag {
+                gpu.hip.device_synchronize()?;
+            }
+            let tq = std::time::Instant::now();
+            gpu.dspine_normalize_codes(
+                &self.s_projected,
+                &self.codebook,
+                &self.s_anchor,
+                &self.s_codes,
+                b,
+                c,
+                t,
+            )?;
+            if diag {
+                gpu.hip.device_synchronize()?;
+                us[3] = tq.elapsed().as_micros();
+            }
+            if diag {
+                gpu.hip.device_synchronize()?;
+            }
+            let tq = std::time::Instant::now();
+            gpu.dspine_gemm_f32_batch(&self.packed_w, &self.s_codes, &self.s_packed, 3 * r, c, b)?;
+            if diag {
+                gpu.hip.device_synchronize()?;
+                us[4] = tq.elapsed().as_micros();
+            }
+            if diag {
+                gpu.hip.device_synchronize()?;
+            }
+            let tq = std::time::Instant::now();
+            gpu.dspine_feature_message(&self.s_packed, &self.gate_bias, &self.s_message, b, r, t)?;
+            if diag {
+                gpu.hip.device_synchronize()?;
+                us[5] = tq.elapsed().as_micros();
+            }
+            if diag {
+                gpu.hip.device_synchronize()?;
+            }
+            let tq = std::time::Instant::now();
+            gpu.dspine_delta_finish(
+                &self.write_w[li],
+                &self.s_message,
+                &scratch.x,
+                &self.s_rms,
+                h,
+                r,
+                b,
+                t,
+            )?;
+            if diag {
+                gpu.hip.device_synchronize()?;
+                us[6] = tq.elapsed().as_micros();
+            }
+        } else {
+        // Snapshot the pre-write hidden rows first: finish rewrites x
+        // in place, and the serial refinement's base term reads the
+        // pre-write values exactly like the upstream stash.
+        if diag {
+            gpu.hip.device_synchronize()?;
+        }
+        let tq = std::time::Instant::now();
+        gpu
+            .memcpy_dtod_at_ordered_async(&self.s_x_pre.buf, 0, &scratch.x.buf, 0, b * h * 4)
+            .map_err(|e| hip_bridge::HipError::new(e.code, &format!("dspine x_pre snapshot: {e}")))?;
+        if diag {
+            gpu.hip.device_synchronize()?;
+            us[0] = tq.elapsed().as_micros();
+        }
+
+        // 1. rms stats + normalized rows (kernel 1).
+        if diag {
+            gpu.hip.device_synchronize()?;
+        }
+        let tq = std::time::Instant::now();
+        gpu.dspine_prepare_read(&scratch.x, &self.s_rms, &self.s_normed, b, h, eps)?;
+        if diag {
+            gpu.hip.device_synchronize()?;
+            us[1] = tq.elapsed().as_micros();
+        }
+        // (weight selection moved above the fused/legacy branch)
         // gemm computes y = b_arg·a_arg^T ([n,m] row-major): pass the weight
         // first so y lands as projected [b, C] row-major.
+        if diag {
+            gpu.hip.device_synchronize()?;
+        }
+        let tq = std::time::Instant::now();
         gpu.gemm_f32_batched(w, &self.s_normed, &self.s_projected, c, h, b)?;
+        if diag {
+            gpu.hip.device_synchronize()?;
+            us[2] = tq.elapsed().as_micros();
+        }
         // 3. normalize_codes (kernel 2): anchor identity / L2 to sqrt(C).
+        if diag {
+            gpu.hip.device_synchronize()?;
+        }
+        let tq = std::time::Instant::now();
         gpu.dspine_normalize_codes(&self.s_projected, &self.codebook, &self.s_anchor, &self.s_codes, b, c, t)?;
+        if diag {
+            gpu.hip.device_synchronize()?;
+            us[3] = tq.elapsed().as_micros();
+        }
         // 4. packed GEMM: codes [b,C] × packed_w[3R,C]^T → packed [b,3R].
+        if diag {
+            gpu.hip.device_synchronize()?;
+        }
+        let tq = std::time::Instant::now();
         gpu.gemm_f32_batched(&self.packed_w, &self.s_codes, &self.s_packed, 3 * r, c, b)?;
+        if diag {
+            gpu.hip.device_synchronize()?;
+            us[4] = tq.elapsed().as_micros();
+        }
         // 5. feature_message (kernel 3): gate · predecessor value.
+        if diag {
+            gpu.hip.device_synchronize()?;
+        }
+        let tq = std::time::Instant::now();
         gpu.dspine_feature_message(&self.s_packed, &self.gate_bias, &self.s_message, b, r, t)?;
+        if diag {
+            gpu.hip.device_synchronize()?;
+            us[5] = tq.elapsed().as_micros();
+        }
         // 6. delta GEMM: message [b,R] × W_i[H,R]^T → delta [b,H].
+        if diag {
+            gpu.hip.device_synchronize()?;
+        }
+        let tq = std::time::Instant::now();
         gpu.gemm_f32_batched(&self.write_w[li], &self.s_message, &self.s_delta, h, r, b)?;
+        if diag {
+            gpu.hip.device_synchronize()?;
+            us[6] = tq.elapsed().as_micros();
+        }
         // 7. finish (kernel 4): x += rms * delta on non-first rows, in place.
+        if diag {
+            gpu.hip.device_synchronize()?;
+        }
+        let tq = std::time::Instant::now();
         gpu.dspine_finish(&scratch.x, &self.s_rms, &self.s_delta, b, h, t)?;
+        if diag {
+            gpu.hip.device_synchronize()?;
+            us[7] = tq.elapsed().as_micros();
+        }
+        }
+        if diag {
+            eprintln!(
+                "[dspine-bridge] li={} b={} snap={} prep={} read={} codes={} pack={} msg={} delta={} fin={} us",
+                li, b, us[0], us[1], us[2], us[3], us[4], us[5], us[6], us[7]
+            );
+        }
         Ok(())
     }
 }
