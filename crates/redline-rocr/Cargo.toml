@@ -33,9 +33,6 @@ proptest.workspace = true
 # Run on demand:  cargo build -p <crate> --examples --features lab
 # The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
 # ---------------------------------------------------------------------------
-[[example]]
-name = "pm4_ib_smoke"
-required-features = ["lab"]
 
 # Hardware proof for GFX10/GFX11 PM4 scratch dispatch (A5): AQL vs PM4
 # byte-identity incl. full occupancy. Needs the code objects from

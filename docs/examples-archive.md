@@ -145,6 +145,12 @@ git show <sha>:<path> > <path>
 | `tp_peer_push_probe` | `crates/rdna-compute/examples/tp_peer_push_probe.rs` | `127dbb74eac3` | 1284 | Lab microbench: in-kernel peer-VRAM push + system-scope flag collective against the incumbent TP2 tp_graph_signal_reduce_gfx1100 collective, on two exact gfx1201 cards. |
 | `wmma_zero_sign_probe` | `crates/rdna-compute/examples/wmma_zero_sign_probe.rs` | `b2e67a8ab9ca` | 134 | gfx11 WMMA zero-sign probe: output element 0 = A[0][0]*B[0][0] + masked partners A[0][k>=1] * (+0) + C. |
 
+## redline-rocr
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `pm4_ib_smoke` | `crates/redline-rocr/examples/pm4_ib_smoke.rs` | `dce28e65d31d` | 37 | Minimal redline PM4 indirect-buffer submit smoke. |
+
 ## saddle-lab
 
 | Example | Path | Last commit | LOC | Purpose |
