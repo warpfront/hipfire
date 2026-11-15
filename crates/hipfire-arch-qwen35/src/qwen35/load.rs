@@ -2974,7 +2974,7 @@ fn load_layer_into(
     Ok(layer)
 }
 
-/// gfx1201 A4 RMSNorm producer divide (`HIPFIRE_A4_RMS_FDIV`, see
+/// gfx1201 A4 RMSNorm producer divide (see
 /// `rdna_compute::gemv::awq_rcp_planes`): re-read the AWQ sidecar of each
 /// linear an RMSNorm producer feeds (DeltaNet `in_proj_qkv`, attention
 /// `q_proj`, `mlp.gate_proj`) from the checkpoint and replace its device

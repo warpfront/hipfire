@@ -16,9 +16,9 @@ use anyhow::Result;
 use capacity::{BestDevice, GpuCapacity};
 use clap::Args;
 use hipfire_loader::admission::{
-    admit_source_with_options, qwen4_kv_adaptive_requested, qwen_default_q8_enabled,
-    EffectiveTopology, KvBackendHints, KvBackendRequest, Qwen35CardProjection, SourceAdmission,
-    SourceAdmissionOptions, QWEN35_MIN_AUTO_CONTEXT,
+    admit_source_with_options, qwen4_kv_adaptive_requested, EffectiveTopology, KvBackendHints,
+    KvBackendRequest, Qwen35CardProjection, SourceAdmission, SourceAdmissionOptions,
+    QWEN35_MIN_AUTO_CONTEXT,
 };
 use hipfire_registry::{receipts, ModelEntry, RegistryV1};
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
@@ -1660,7 +1660,7 @@ impl AdmissionInputs<'_> {
             kv_v: self.kv_v,
             kv_adaptive: self.kv_adaptive,
             deepseek4_heterogeneous: self.options.non_single_compute,
-            qwen_default_q8: qwen_default_q8_enabled(),
+            qwen_default_q8: true,
             vmm_runtime_refusal: None,
             free_vram_bytes: device.free.and_then(|n| usize::try_from(n).ok()),
         }

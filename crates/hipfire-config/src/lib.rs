@@ -1686,7 +1686,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_DFLASH_LOOKUP"),
-        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. auto (default) and on/1 arm it on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no CACTUS); off/0 disables it. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
+        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. auto (default) and on/1 arm it on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no CACTUS); off/0 disables it."
     ),
     field!(
         "speculation.dflash",
@@ -2653,15 +2653,6 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_GFX11_PRODUCER_QUANT_FUSED",
         "Fuse the int4 activation quantiser into the gfx11 sigmoid/gated-norm producers (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx11 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
-    ),
-    process_bool_field!(
-        "kernel.gfx11_lean_pbs",
-        "gfx11_lean_pbs",
-        Kernel,
-        true,
-        true,
-        "HIPFIRE_GFX11_LEAN_PBS",
-        "Size fallback-only ordinary gfx11 MQ4V2 prefill scratch for at most 64 rows (default on for the admitted fused gfx1100/gfx1151 route); verify, non-fused, and other architectures retain full scratch. Set false or HIPFIRE_GFX11_LEAN_PBS=0 to opt out."
     ),
     process_field!(
         "kernel.gfx11_a4_candidates",
@@ -4511,6 +4502,14 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         reason: "the Qwen4 HC K4 all-rows kill switch was removed (HIPF-396)",
         replacement: "none; exact gfx1201 takes the all-rows HC K4 route where its shape gates admit it",
     },
+    RetiredConfigKey {
+        key: "kernel.gfx11_lean_pbs",
+        legacy_key: "gfx11_lean_pbs",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx11 lean prefill scratch kill switch was removed (HIPF-396)",
+        replacement: "none; the admitted fused gfx1100 and gfx1151 route takes the 64-row lean scratch",
+    },
 ];
 
 pub fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKey> {
@@ -5632,16 +5631,6 @@ pub fn dflash_lookup_enabled() -> bool {
 }
 fn dflash_lookup_enabled_value(value: Option<&str>) -> bool {
     !matches!(value, Some("0" | "off"))
-}
-/// Developer kill switch for the Tail windows of the DFlash lookup
-/// (`HIPFIRE_SPEC_LOOKUP_TAIL=0`, read through the `[developer]` namespace):
-/// an exact `0` disables only the Tail windows (Copy windows stay); anything
-/// else, including unset, leaves them on.
-pub fn dflash_lookup_tail_enabled() -> bool {
-    dflash_lookup_tail_enabled_value(process_value("HIPFIRE_SPEC_LOOKUP_TAIL").as_deref())
-}
-fn dflash_lookup_tail_enabled_value(value: Option<&str>) -> bool {
-    value != Some("0")
 }
 fn ngram_mod_triple_with_defaults(defaults: (usize, usize, usize)) -> (usize, usize, usize) {
     ngram_mod_triple_resolve(defaults, |name| developer_var(name).ok())
@@ -9076,18 +9065,6 @@ mod tests {
         }
         // The live (unset) snapshot resolves to the auto default: on.
         assert!(dflash_lookup_enabled());
-    }
-
-    #[test]
-    fn dflash_lookup_tail_kill_switch_is_strict_zero() {
-        // Default on (lookup itself is gated by `speculation.dflash_lookup`);
-        // only an exact `0` disables the Tail windows.
-        assert!(dflash_lookup_tail_enabled_value(None));
-        assert!(dflash_lookup_tail_enabled_value(Some("1")));
-        assert!(dflash_lookup_tail_enabled_value(Some("")));
-        assert!(dflash_lookup_tail_enabled_value(Some("off")));
-        assert!(!dflash_lookup_tail_enabled_value(Some("0")));
-        assert!(dflash_lookup_tail_enabled());
     }
 
     #[test]

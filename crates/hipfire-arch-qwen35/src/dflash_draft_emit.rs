@@ -50,7 +50,7 @@
 //! full-attention layer: its kernel route and `seq_len` layout are not
 //! declared here), cold seed / reset / eviction / rebuild (`delta` outside
 //! `1..=16`: family 4), online tuner, non-batched LM heads, F32 / unsupported
-//! embedding tables, the gfx1100 fused-collapse route, `HIPFIRE_DFLASH_ORDERED_DRAFT=0`.
+//! embedding tables, the gfx1100 fused-collapse route.
 //!
 //! ## Patches (node = ordinal among this emission's `Kernel` ops)
 //!
@@ -520,11 +520,6 @@ pub fn plan_dflash_draft(gpu: &mut Gpu, a: DraftEmitArgs<'_>) -> Result<DraftEmi
     // Mirrors build_dflash_noise_embeddings_weights: batched route when admitted.
     let batched_embed =
         crate::speculative::noise_embed_batch_admitted(gpu, target_weights, draft_scratch, b);
-    if !dflash::ordered_draft() {
-        return Err(
-            "refused: HIPFIRE_DFLASH_ORDERED_DRAFT=0 uses synchronous null-stream copies".into(),
-        );
-    }
     if draft_scratch.online.is_some() {
         return Err("refused: online draft tuner".into());
     }

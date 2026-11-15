@@ -182,7 +182,7 @@ pub struct LoadCtx<'a> {
     /// Authored Qwen-only K and V overrides. None preserves the selected whole-cache mode.
     pub kv_k_override: Option<&'a str>,
     pub kv_v_override: Option<&'a str>,
-    /// Sampled once per load from HIPFIRE_QWEN_KV_DEFAULT_Q8; never per token.
+    /// Implicit Qwen default-Q8 KV choice, set by the caller once per load; never per token.
     pub qwen_default_q8: bool,
     // NOTE: head overlays (`--head`) deliberately have NO LoadCtx field. They
     // validate and attach in `admit_source` before teardown, so the admitted

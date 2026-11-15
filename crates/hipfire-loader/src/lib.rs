@@ -3283,7 +3283,7 @@ pub fn load_model_with_gemma4_drafter(
             kv_mode: kv_mode_override,
             kv_k: kv_k_override,
             kv_v: kv_v_override,
-            qwen_default_q8: crate::admission::qwen_default_q8_enabled(),
+            qwen_default_q8: true,
             kv_adaptive: kv_adaptive_override,
             deepseek4_heterogeneous: !matches!(
                 deepseek4_compute_placement,
@@ -4834,7 +4834,7 @@ pub fn load_model_ep_with_kv_mode(
             kv_mode,
             kv_k: None,
             kv_v: None,
-            qwen_default_q8: crate::admission::qwen_default_q8_enabled(),
+            qwen_default_q8: true,
             kv_adaptive: None,
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: (!vmm_runtime_available)

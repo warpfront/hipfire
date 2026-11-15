@@ -42,11 +42,10 @@
 //! on native fp8 KV, see [`lane_fa_chunk_admitted`]): the per-request unfused
 //! prep + fp8 KV write + VerifyAttn tile/reduce of each FA layer collapse to
 //! the row-local prep once over all rows plus one launch per stage for all
-//! lanes (`rdna_compute::lane_fa`), byte-identical per request;
-//! `HIPFIRE_CB_LANE_FA_BATCH=0` keeps the per-request loop.
+//! lanes (`rdna_compute::lane_fa`), byte-identical per request.
 //!
 //! Save-free DeltaNet verify (`MultiChunkRequest::dn_state_src`, exact gfx1201,
-//! `HIPFIRE_CB_DN_SAVE_FREE`, DFlash CB verify only): the lane-batched GDN
+//! DFlash CB verify only): the lane-batched GDN
 //! route reads each lane's pre-window state from a source snapshot and writes
 //! only the request's `dn_state` (a conv-ring copy A -> B, the in-place conv
 //! kernel on B and
@@ -78,7 +77,7 @@ pub struct MultiChunkRequest<'a> {
     /// This request's hidden-state ring (DFlash extract layers); `None` = no
     /// capture. Its staging must hold the request's rows (`max_batch >= n`).
     pub hidden_rb: Option<&'a mut HiddenStateRingBuffer>,
-    /// Save-free DeltaNet verify (`HIPFIRE_CB_DN_SAVE_FREE`): `Some(snap)` =
+    /// Save-free DeltaNet verify: `Some(snap)` =
     /// `snap` holds this request's pre-window DeltaNet state (S, scales, conv
     /// ring, EF) as an IMMUTABLE source, and `dn_state` is the DESTINATION:
     /// the caller exchanged the owners of the two banks before the call
@@ -268,105 +267,10 @@ const MULTI_CHUNK_MAX_SEGS: usize = MULTI_CHUNK_MAX_ROWS / MIN_BATCH;
 
 use hipfire_dispatch::ops::verify_twins::{self as seg_twins, AttnFp8Seg};
 
-/// `HIPFIRE_CB_SEG_TWINS=0` keeps every request on its own singleton
-/// launches (A/B control for the segment twins).
-static SEG_TWINS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_SEG_TWINS").map_or(true, |v| v.trim() != "0")
-});
-
-/// `HIPFIRE_CB_TAPE_COPY_BATCH=0` (developer kill switch): every request
-/// snaps its GDN rollback tape with its own three `hipMemcpyDtoD` per layer
-/// (the singleton's copies) instead of one batched descriptor-copy launch per
-/// layer for all requests of the chunk ([`Gpu::tape_copy_batched`]). Default
-/// on; the tape bytes are identical either way.
-static TAPE_COPY_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_TAPE_COPY_BATCH").map_or(true, |v| v.trim() != "0")
-});
-
-/// `HIPFIRE_CB_LANE_GDN_BATCH=0` (developer kill switch): every request runs
-/// its own DeltaNet pre-GDN sequence + recurrence per layer (4 launches per
-/// lane) instead of one launch per stage per layer for all lanes of the chunk
-/// (see [`lane_gdn_chunk_admitted`]). Default on; every output and state byte
-/// is identical either way.
-static LANE_GDN_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_LANE_GDN_BATCH").map_or(true, |v| v.trim() != "0")
-});
-
-/// `HIPFIRE_CB_LANE_GDN_VARROWS=0` (developer kill switch): restores the
-/// equal-row-count-only admission of the lane-batched GDN route (both
-/// [`lane_gdn_chunk_admitted`] and the CB save-free admission,
-/// `dflash_cb::cb_dn_save_free_admitted`): a chunk whose requests do not all
-/// carry the same row count keeps the per-request recurrence and the SAVE +
-/// in-place verify. Default on: each lane may carry its own `1..=16` rows (the
-/// recurrence reads each lane's row count and its prefix frame offset from
-/// its table row); equal-count chunks are unaffected either way. Every output
-/// and state byte is identical either way. Equal-count batching / save-free
-/// stay on with this switch off (`HIPFIRE_CB_LANE_GDN_BATCH` /
-/// `HIPFIRE_CB_DN_SAVE_FREE` keep their own meanings).
-static LANE_GDN_VARROWS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_LANE_GDN_VARROWS").map_or(true, |v| v.trim() != "0")
-});
-
-/// Is the variable-row lane-batched GDN admission enabled for this process?
-pub(crate) fn lane_gdn_varrows_enabled() -> bool {
-    *LANE_GDN_VARROWS
-}
-
 /// Largest per-lane row count of an UNEQUAL (variable-row) lane-batched GDN
 /// chunk. Equal-count chunks keep their existing admission (up to the
 /// whole-forward row bound).
 const LANE_GDN_VARROWS_MAX_N: usize = 16;
-
-/// Default of `HIPFIRE_CB_DN_SAVE_FREE` when the variable is unset. The only
-/// place to flip the default after measurement.
-const CB_DN_SAVE_FREE_DEFAULT: bool = true;
-
-/// `HIPFIRE_CB_DN_SAVE_FREE` (developer var; `0` is the kill switch):
-/// whether the DFlash CB verify may swap the owners of each lane's live
-/// DeltaNet state and its pre-verify snapshot instead of copying the live
-/// state into the snapshot (see `dflash_cb::cb_dn_save_free_admitted`). Off
-/// restores today's SAVE + in-place verify, byte for byte.
-static CB_DN_SAVE_FREE: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(
-        || match hipfire_config::developer_var("HIPFIRE_CB_DN_SAVE_FREE") {
-            Ok(v) => v.trim() != "0",
-            Err(_) => CB_DN_SAVE_FREE_DEFAULT,
-        },
-    );
-
-/// Is the save-free CB verify enabled for this process? (The scratch arms its
-/// from-table at construction only when it is.)
-pub(crate) fn cb_dn_save_free_enabled() -> bool {
-    *CB_DN_SAVE_FREE
-}
-
-/// `HIPFIRE_CB_UPLOAD_COALESCE` (developer var; `0` is the kill switch):
-/// whether the continuous-batching step may skip or merge the tiny
-/// synchronous H2D uploads it issues every step. Two sites read it: the VMM
-/// executor's per-layer slot-descriptor tables (re-uploaded only when their
-/// bytes differ from what the device already holds) and the multi-lane CB
-/// verify's per-lane position uploads (one upload of every lane's positions).
-/// The device bytes before every reading kernel are identical either way; off
-/// restores one upload per layer / per lane. The draft-lane key positions land
-/// in separate per-lane scratch buffers and are never coalesced, so this
-/// switch does not touch `draft_forward_lanes`.
-static CB_UPLOAD_COALESCE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_UPLOAD_COALESCE").map_or(true, |v| v.trim() != "0")
-});
-
-/// Is the CB upload coalescing enabled for this process?
-pub(crate) fn cb_upload_coalesce_enabled() -> bool {
-    *CB_UPLOAD_COALESCE
-}
-
-/// `HIPFIRE_CB_LANE_FA_BATCH=0` (developer kill switch): every request runs
-/// its own FullAttention prep + fp8 KV write + VerifyAttn tile + reduce per
-/// layer (4+ launches per lane) instead of one launch per stage per layer
-/// for all lanes of the chunk (see [`lane_fa_chunk_admitted`]). Default on;
-/// every output and KV byte is identical either way.
-static LANE_FA_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_LANE_FA_BATCH").map_or(true, |v| v.trim() != "0")
-});
 
 /// Largest lane-batched FA partials buffer (f32 elements, 1 GiB): a chunk whose
 /// lanes would need more (very long contexts x many rows) keeps the per-lane
@@ -427,9 +331,8 @@ pub struct MultiChunkScratch {
     gdn_lane_table_host: std::sync::Mutex<Vec<rdna_compute::lane_gdn::GdnLaneTable>>,
     /// Snapshot-source twin of `gdn_lane_table` for the save-free DeltaNet
     /// verify (`GdnLaneTableFrom` rows read by `gated_delta_net_q8_fast_lanes_varrows_from`).
-    /// Armed at construction only when `HIPFIRE_CB_DN_SAVE_FREE` is on and the
-    /// device supports the lane-batched GDN route (the `_from` recurrence
-    /// JIT'd, the table allocated); `None` otherwise, which
+    /// Armed at construction when the device supports the lane-batched GDN route
+    /// (the `_from` recurrence JIT'd, the table allocated); `None` otherwise, which
     /// keeps `Self::gdn_from_ready` false so no chunk is admitted to it.
     gdn_lane_from: Option<GdnLaneFromTable>,
     /// Disjoint per-lane VerifyAttn partials of the lane-batched FullAttention
@@ -495,17 +398,16 @@ impl MultiChunkScratch {
 
     /// Arm the save-free route's from-table (see the `gdn_lane_from` field):
     /// JIT the `_from` recurrence and allocate both slot tables, once, here,
-    /// never in a decode step. `Ok(None)` when the route
-    /// is off or unsupported, or when the JIT / allocation is merely
-    /// unavailable (out of memory, compile failure): readiness stays false
-    /// and every chunk keeps today's SAVE route. A device-context fault is
-    /// propagated (the caller frees what it built).
+    /// never in a decode step. `Ok(None)` when the route is unsupported, or when
+    /// the JIT / allocation is merely unavailable (out of memory, compile
+    /// failure): readiness stays false and every chunk keeps today's SAVE route.
+    /// A device-context fault is propagated (the caller frees what it built).
     fn arm_gdn_lane_from(
         gpu: &mut Gpu,
         config: &Qwen35Config,
         n_delta: usize,
     ) -> HipResult<Option<GdnLaneFromTable>> {
-        if !cb_dn_save_free_enabled() || n_delta == 0 || !lane_gdn_batch_ready(gpu, config, 1) {
+        if n_delta == 0 || !lane_gdn_batch_ready(gpu, config, 1) {
             return Ok(None);
         }
         let ready = gpu.ensure_lane_gdn_varrows_from();
@@ -567,17 +469,13 @@ impl MultiChunkScratch {
     }
 }
 
-/// Process/device half of the lane-batched GDN admission: both kill switches
-/// (`HIPFIRE_CB_LANE_GDN_BATCH`, and `HIPFIRE_CB_TAPE_COPY_BATCH` whose batched
-/// descriptors the route queues), `1..=CONV_LANES_MAX` lanes and
-/// [`Gpu::lane_gdn_batch_admitted`] for this config's head geometry (exact
-/// gfx1201, fast GDN kernel, 128-wide heads, GQA layout, no graph capture /
-/// replay recording / G0 observation). Shared by [`lane_gdn_chunk_admitted`]
-/// and the CB save-free admission.
+/// Process/device half of the lane-batched GDN admission: `1..=CONV_LANES_MAX`
+/// lanes and [`Gpu::lane_gdn_batch_admitted`] for this config's head geometry
+/// (exact gfx1201, fast GDN kernel, 128-wide heads, GQA layout, no graph
+/// capture / replay recording / G0 observation). Shared by
+/// [`lane_gdn_chunk_admitted`] and the CB save-free admission.
 pub(crate) fn lane_gdn_batch_ready(gpu: &Gpu, config: &Qwen35Config, n_lanes: usize) -> bool {
-    *LANE_GDN_BATCH
-        && *TAPE_COPY_BATCH
-        && (1..=rdna_compute::lane_gdn::CONV_LANES_MAX).contains(&n_lanes)
+    (1..=rdna_compute::lane_gdn::CONV_LANES_MAX).contains(&n_lanes)
         && gpu.lane_gdn_batch_admitted(
             config.linear_num_value_heads,
             config.linear_num_key_heads,
@@ -595,8 +493,8 @@ pub(crate) fn lane_gdn_batch_ready(gpu: &Gpu, config: &Qwen35Config, n_lanes: us
 /// Slice-P fusion, which needs `gdn_tape.is_none()`, applies); sequential
 /// batch semantics; and the shape: all requests with the SAME row count (the
 /// existing equal-count admission, unbounded here up to the whole-forward row
-/// bound), or, unless `HIPFIRE_CB_LANE_GDN_VARROWS=0`, every request with its
-/// own `1..=LANE_GDN_VARROWS_MAX_N` rows. The recurrence's stochastic-rounding
+/// bound), or every request with its own `1..=LANE_GDN_VARROWS_MAX_N` rows. The
+/// recurrence's stochastic-rounding
 /// frame of lane `i` is `base + prefix_i` (`prefix_i` = rows of lanes `< i`,
 /// carried in lane `i`'s table row), the per-request order for any row counts.
 fn lane_gdn_chunk_admitted(
@@ -613,10 +511,9 @@ fn lane_gdn_chunk_admitted(
     matches!(sem, BatchSemantics::Sequential)
         && lane_gdn_batch_ready(gpu, config, reqs.len())
         && (equal
-            || (lane_gdn_varrows_enabled()
-                && reqs
-                    .iter()
-                    .all(|r| (1..=LANE_GDN_VARROWS_MAX_N).contains(&r.tokens.len()))))
+            || reqs
+                .iter()
+                .all(|r| (1..=LANE_GDN_VARROWS_MAX_N).contains(&r.tokens.len())))
         && reqs.iter().all(|r| {
             r.fusion.is_chain_verify() && r.gdn_tape.is_some_and(|t| r.tokens.len() <= t.max_n)
         })
@@ -681,8 +578,8 @@ fn lane_fa_plan_ok(
 /// per-request prep + write + attend)? The lane route reproduces exactly the
 /// route each request's singleton takes, so every one of these must hold:
 ///
-/// * process/device: `HIPFIRE_CB_LANE_FA_BATCH` not `0`, sequential batch
-///   semantics, [`Gpu::lane_fa_batch_admitted`] (exact gfx1201, VerifyAttn on,
+/// * process/device: sequential batch semantics,
+///   [`Gpu::lane_fa_batch_admitted`] (exact gfx1201, VerifyAttn on,
 ///   head_dim 256 GQA group 6 tile 128, no capture / recording / G0
 ///   observation, every request 1..=32 rows), at most `LANE_FA_MAX` requests,
 /// * no request on the segment-twin arm (`twin_attn`);
@@ -702,8 +599,7 @@ fn lane_fa_chunk_admitted(
     sem: BatchSemantics<'_>,
     twin_attn: &[bool],
 ) -> bool {
-    if !*LANE_FA_BATCH
-        || !matches!(sem, BatchSemantics::Sequential)
+    if !matches!(sem, BatchSemantics::Sequential)
         || reqs.is_empty()
         || reqs.len() > rdna_compute::lane_fa::LANE_FA_MAX
         || twin_attn.iter().any(|&t| t)
@@ -1338,28 +1234,17 @@ pub fn forward_prefill_batch_multi(
         None,
         None,
     )?;
-    if cb_upload_coalesce_enabled() {
-        // One upload of every lane's positions. Each per-lane call below (all
-        // Sequential, no tree ctx, no active mask, not pre-uploaded) is a
-        // single `memcpy_htod` of `start_pos..start_pos + n` into its row view
-        // of `pbs.positions`, and the views are contiguous in lane order
-        // (`offs` = cumulative rows), so the concatenation written at offset 0
-        // of `pbs.positions` is the same bytes at the same addresses.
-        // `rope_positions` is written only for a tree ctx (None here).
-        let positions: Vec<i32> = reqs
-            .iter()
-            .flat_map(|r| (0..r.tokens.len()).map(move |i| (r.start_pos + i) as i32))
-            .collect();
-        debug_assert_eq!(positions.len(), total);
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(positions.as_ptr() as *const u8, positions.len() * 4)
-        };
-        gpu.hip.memcpy_htod(&pbs.positions.buf, bytes)?;
-    } else {
-        for (r, view) in reqs.iter().zip(&views) {
-            batch_chunk_upload_positions(gpu, view, sem, r.start_pos, r.tokens.len(), None, false)?;
-        }
-    }
+    // One upload of every lane's positions into `pbs.positions`: the row views
+    // are contiguous in lane order (`offs` = cumulative rows). No tree ctx, so
+    // `rope_positions` is not written.
+    let positions: Vec<i32> = reqs
+        .iter()
+        .flat_map(|r| (0..r.tokens.len()).map(move |i| (r.start_pos + i) as i32))
+        .collect();
+    debug_assert_eq!(positions.len(), total);
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, positions.len() * 4) };
+    gpu.hip.memcpy_htod(&pbs.positions.buf, bytes)?;
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
     let arch_has_wmma = q8_wmma_arch;
     let tapes = reqs.iter().any(|r| r.gdn_tape.is_some());
@@ -1376,10 +1261,7 @@ pub fn forward_prefill_batch_multi(
     // twin segments share the singleton `max_seq` (`physical_cap`) word.
     let mut twin_attn: Vec<bool> = reqs
         .iter()
-        .map(|r| {
-            *SEG_TWINS
-                && attn_fp8_twin_eligible(gpu, s, r.kv_cache, r.start_pos, r.tokens.len(), r.fusion)
-        })
+        .map(|r| attn_fp8_twin_eligible(gpu, s, r.kv_cache, r.start_pos, r.tokens.len(), r.fusion))
         .collect();
     let twin_cap = reqs
         .iter()
@@ -1438,16 +1320,13 @@ pub fn forward_prefill_batch_multi(
     let mut kv_layer_idx = 0usize;
     // Deferred tape-capture copies of one DeltaNet layer (all requests),
     // issued as one batched launch after the layer's per-request recurrence.
-    let mut tape_copies: Vec<rdna_compute::tape_copy::TapeCopy> =
-        Vec::with_capacity(if *TAPE_COPY_BATCH && tapes {
-            (3 + usize::from(lane_from.is_some())) * reqs.len()
-        } else {
-            0
-        });
+    let mut tape_copies: Vec<rdna_compute::tape_copy::TapeCopy> = Vec::with_capacity(if tapes {
+        (3 + usize::from(lane_from.is_some())) * reqs.len()
+    } else {
+        0
+    });
     // Lane-batched GDN route (see `lane_gdn_chunk_admitted`, decided above
-    // with the source mode): the batched tape copy (`TAPE_COPY_BATCH`), whose
-    // descriptors it queues, is part of its admission, so each kill switch
-    // keeps its own A/B meaning.
+    // with the source mode) queues its tape copies in `tape_copies` too.
     // Each lane's own row count and prefix frame offset live in its table row
     // (`offs`, reset to zero per chunk); the recurrence launches reserve `total`.
     let mut lane_conv: Vec<(u64, usize, usize)> =
@@ -1644,7 +1523,7 @@ pub fn forward_prefill_batch_multi(
                 } else {
                     for (r, view) in reqs.iter_mut().zip(&views) {
                         let n = r.tokens.len();
-                        let sink = (*TAPE_COPY_BATCH).then_some(&mut tape_copies);
+                        let sink = Some(&mut tape_copies);
                         let parents = batch_chunk_delta_net_pre_gdn(
                             gpu,
                             &layer.mixer_view(),

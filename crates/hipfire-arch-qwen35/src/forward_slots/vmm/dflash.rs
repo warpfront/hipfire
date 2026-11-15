@@ -188,9 +188,9 @@ impl VmmDflashEngine {
             Err(e) => return refuse_engine(gpu, assets, format!("verify scratch: {e}")),
         };
         // The shared draft scratch is part of the engine's footprint (a step
-        // never allocates). It is ALWAYS reserved, also under the batched-draft
-        // kill switch: it owns the FWHT rotation buffers every lane (which
-        // allocates none) borrows for its own draft/backfill GEMMs.
+        // never allocates). It is ALWAYS reserved: it owns the FWHT rotation
+        // buffers every lane (which allocates none) borrows for its own
+        // draft/backfill GEMMs.
         if let Err(e) = cb.reserve_draft(gpu, &assets.draft_config) {
             let _ = cb.free_gpu(gpu);
             return refuse_engine(gpu, assets, format!("draft batch scratch: {e}"));
@@ -427,7 +427,7 @@ impl Qwen35VmmStore {
             let cfg = lane.sample_cfg();
             if cfg.temp > 1e-6 {
                 let b = lane.df.block_size;
-                lane.sampled_draft = Some(DflashSampledDraft::new(b, config.vocab_size));
+                lane.sampled_draft = Some(DflashSampledDraft::new(b));
                 lane.sampled_target.reserve_rows(b, config.vocab_size, &cfg);
                 lane.sample_scratch.reserve(config.vocab_size);
             }
@@ -800,9 +800,8 @@ impl Qwen35VmmStore {
     /// Provision: the singleton draft of every planned DFlash Verify lane on
     /// its own state (epoch-tagged: draft, q and thlog mark wait until commit).
     /// Greedy full-block lanes are drafted together through one
-    /// draft-model forward and one shared lm-head ([`dflash_cb_draft`]; kill
-    /// switch `HIPFIRE_CB_DFLASH_DRAFT_BATCH=0` drafts lane by lane with the
-    /// singleton call), byte-identical per lane. Sampled lanes use the singleton
+    /// draft-model forward and one shared lm-head ([`dflash_cb_draft`]),
+    /// byte-identical per lane. Sampled lanes use the singleton
     /// selector forward/scorer per lane. Touches only uncommitted
     /// drafter state (projection watermarks, draft K/V of the window), never
     /// target state.
@@ -893,15 +892,8 @@ impl Qwen35VmmStore {
         let engine = dflash_engine
             .as_mut()
             .ok_or("provision_step: DFlash lanes without a DFlash engine")?;
-        let tokens = dflash_cb_draft(
-            gpu,
-            weights,
-            config,
-            &mut engine.cb,
-            &mut lanes,
-            *DRAFT_BATCH_ON,
-        )
-        .map_err(|e| format!("provision_step: DFlash draft: {e}"))?;
+        let tokens = dflash_cb_draft(gpu, weights, config, &mut engine.cb, &mut lanes)
+            .map_err(|e| format!("provision_step: DFlash draft: {e}"))?;
         for (p, t) in pending.into_iter().zip(tokens) {
             *p.slot = Some(DflashCbDraft {
                 position: p.position,
@@ -1121,13 +1113,6 @@ impl Qwen35VmmStore {
         })
     }
 }
-
-/// `HIPFIRE_CB_DFLASH_DRAFT_BATCH=0` (developer kill switch): draft every DFlash
-/// lane with its own singleton call instead of batching full-block lanes
-/// through one draft-model forward. Default on (byte-identical per lane).
-static DRAFT_BATCH_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_DFLASH_DRAFT_BATCH").map_or(true, |v| v.trim() != "0")
-});
 
 /// `HIPFIRE_CB_PHASES=1`: synchronized wall time of the DFlash lane phases
 /// (draft / shared verify / per-lane accept), summed and printed to stderr

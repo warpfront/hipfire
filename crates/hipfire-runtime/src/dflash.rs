@@ -3079,7 +3079,6 @@ impl DraftGraphState {
 
     /// Whether this window runs through segment graphs. `ineligible`: a caller
     /// condition the graph route cannot serve (per-phase timing, a staged plan).
-    #[allow(clippy::too_many_arguments)]
     fn admit(
         &mut self,
         gpu: &mut Gpu,
@@ -3087,7 +3086,6 @@ impl DraftGraphState {
         cfg: &DflashConfig,
         scratch: &DflashScratch,
         b: usize,
-        ordered: bool,
         ineligible: bool,
     ) -> HipResult<bool> {
         if !self.enabled || ineligible || self.refused.is_some() {
@@ -3095,12 +3093,6 @@ impl DraftGraphState {
         }
         if gpu.replay.is_recording() || gpu.graphs.capture_mode {
             // Already inside someone else's recording: run the window plainly.
-            return Ok(false);
-        }
-        if !ordered {
-            self.refuse(
-                "HIPFIRE_DFLASH_ORDERED_DRAFT=0 (synchronous D2D copies are not capturable)".into(),
-            );
             return Ok(false);
         }
         if crate::config::get().draft_gemm_dump {
@@ -3378,45 +3370,20 @@ fn upload_slice_i32(gpu: &Gpu, dst: &GpuTensor, data: &[i32]) -> HipResult<()> {
     gpu.memcpy_htod_auto(&dst.buf, bytes)
 }
 
-/// `HIPFIRE_DFLASH_ORDERED_DRAFT=0` (developer kill switch): the draft
-/// body's D2D copies (residual saves, context/noise K/V concatenation) go
-/// back to the synchronous `hipMemcpy` on the null stream, and the batched
-/// lane draft uploads its key positions between the lane fc GEMMs again.
-/// Default on: the copies are enqueued on the execution stream
-/// (`Gpu::memcpy_dtod_at_ordered_async`) ahead of their consumer kernels and
-/// the host no longer drains the queue per copy. Same bytes, same ranges,
-/// same order on the stream as every producer and consumer kernel.
-static ORDERED_DRAFT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_DFLASH_ORDERED_DRAFT").map_or(true, |v| v.trim() != "0")
-});
-
-/// Whether the draft body runs its D2D copies stream-ordered
-/// ([`ORDERED_DRAFT`]); resolved once per process.
-pub fn ordered_draft() -> bool {
-    *ORDERED_DRAFT
-}
-
-/// One draft-body D2D copy. `ordered`: enqueued on the active stream (the
-/// null stream when none is set), where every producer of `src` and every
-/// consumer of `dst` in the draft body also runs, so no host wait is needed
-/// and the source cannot be rewritten before the copy executes. Otherwise
-/// the historical host-synchronous copy.
+/// One draft-body D2D copy, enqueued on the active stream (the null stream
+/// when none is set), where every producer of `src` and every consumer of
+/// `dst` in the draft body also runs, so no host wait is needed and the
+/// source cannot be rewritten before the copy executes.
 #[track_caller]
 fn draft_dtod_at(
     gpu: &Gpu,
-    ordered: bool,
     dst: &DeviceBuffer,
     dst_offset: usize,
     src: &DeviceBuffer,
     src_offset: usize,
     bytes: usize,
 ) -> HipResult<()> {
-    if ordered {
-        gpu.memcpy_dtod_at_ordered_async(dst, dst_offset, src, src_offset, bytes)
-    } else {
-        gpu.hip
-            .memcpy_dtod_at(dst, dst_offset, src, src_offset, bytes)
-    }
+    gpu.memcpy_dtod_at_ordered_async(dst, dst_offset, src, src_offset, bytes)
 }
 
 /// Rows per chunk for the windowed-mode post-seed backfill.
@@ -4104,22 +4071,13 @@ fn draft_forward_based_inner(
     // ── 2. Per-layer decoder ─────────────────────────────────────────────
     // DFlash2 all-sliding detection for windowed mode branching.
     let is_all_sliding_windowed = windowed && cfg.all_layers_sliding;
-    let ordered = ordered_draft();
-    let graph_seg = graphs.admit(
-        gpu,
-        weights,
-        cfg,
-        scratch,
-        b,
-        ordered,
-        dbg || staged.is_some(),
-    )?;
+    let graph_seg = graphs.admit(gpu, weights, cfg, scratch, b, dbg || staged.is_some())?;
     if graph_seg {
         // Segment 0: layer 0's fixed head. Segment `i + 1`: layer `i`'s fixed tail + layer
         // `i + 1`'s fixed head (the last one ends with the final norm). The variable
         // work (context K/V fill, noise-K rope, K/V concat, attention) runs between them.
         graphs.run_segment(gpu, b, 0, |gpu| {
-            draft_layer_pre(gpu, &weights.layers[0], scratch, cfg, b, h, eps, ordered)
+            draft_layer_pre(gpu, &weights.layers[0], scratch, cfg, b, h, eps)
         })?;
     }
     for li in 0..cfg.n_layers {
@@ -4132,7 +4090,7 @@ fn draft_forward_based_inner(
             None
         };
         if !graph_seg {
-            draft_layer_pre(gpu, layer, scratch, cfg, b, h, eps, ordered)?;
+            draft_layer_pre(gpu, layer, scratch, cfg, b, h, eps)?;
         }
 
         // K_ctx / V_ctx — same wk/wv weights but projected over the L
@@ -4298,7 +4256,6 @@ fn draft_forward_based_inner(
             let seg_bytes = len * kvd * 4;
             draft_dtod_at(
                 gpu,
-                ordered,
                 &k_cat_l.buf,
                 cat_off,
                 &k_cache_layer.buf,
@@ -4307,7 +4264,6 @@ fn draft_forward_based_inner(
             )?;
             draft_dtod_at(
                 gpu,
-                ordered,
                 &v_cat_l.buf,
                 cat_off,
                 &v_cache_layer.buf,
@@ -4318,7 +4274,6 @@ fn draft_forward_based_inner(
         }
         draft_dtod_at(
             gpu,
-            ordered,
             &k_cat_l.buf,
             cat_off,
             &scratch.k_noise.buf,
@@ -4327,7 +4282,6 @@ fn draft_forward_based_inner(
         )?;
         draft_dtod_at(
             gpu,
-            ordered,
             &v_cat_l.buf,
             cat_off,
             &scratch.v_noise.buf,
@@ -4402,27 +4356,16 @@ fn draft_forward_based_inner(
         if graph_seg {
             let last = li + 1 == cfg.n_layers;
             graphs.run_segment(gpu, b, li + 1, |gpu| {
-                draft_layer_post(
-                    gpu, layer, scratch, cfg, li, b, h, eps, ordered, false, false, true,
-                )?;
+                draft_layer_post(gpu, layer, scratch, cfg, li, b, h, eps, false, false, true)?;
                 if last {
                     gpu.rmsnorm_batched(&scratch.x, &weights.norm, &scratch.x, b, h, eps)
                 } else {
-                    draft_layer_pre(
-                        gpu,
-                        &weights.layers[li + 1],
-                        scratch,
-                        cfg,
-                        b,
-                        h,
-                        eps,
-                        ordered,
-                    )
+                    draft_layer_pre(gpu, &weights.layers[li + 1], scratch, cfg, b, h, eps)
                 }
             })?;
         } else {
             draft_layer_post(
-                gpu, layer, scratch, cfg, li, b, h, eps, ordered, graph_ffn, dbg, false,
+                gpu, layer, scratch, cfg, li, b, h, eps, graph_ffn, dbg, false,
             )?;
         }
         // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
@@ -4466,7 +4409,6 @@ fn draft_forward_based_inner(
 /// DFlash2 prepare convolution, and the Q / noise-K / noise-V projections of the
 /// B block rows. Reads only block-sized buffers and the layer weights, so a
 /// graph segment can record it.
-#[allow(clippy::too_many_arguments)]
 fn draft_layer_pre(
     gpu: &mut Gpu,
     layer: &DflashLayerWeights,
@@ -4475,7 +4417,6 @@ fn draft_layer_pre(
     b: usize,
     h: usize,
     eps: f32,
-    ordered: bool,
 ) -> HipResult<()> {
     // S7: dual-output RMSNorm replaces the residual memcpy + attn_norm
     // pair (bitwise residual capture, identical norm order).
@@ -4493,7 +4434,6 @@ fn draft_layer_pre(
         // Residual.
         draft_dtod_at(
             gpu,
-            ordered,
             &scratch.residual.buf,
             0,
             &scratch.x.buf,
@@ -4580,7 +4520,6 @@ fn draft_layer_post(
     b: usize,
     h: usize,
     eps: f32,
-    ordered: bool,
     graph_ffn: bool,
     dbg: bool,
     in_segment: bool,
@@ -4691,7 +4630,6 @@ fn draft_layer_post(
         } else {
             draft_dtod_at(
                 gpu,
-                ordered,
                 &scratch.residual.buf,
                 0,
                 &scratch.x.buf,

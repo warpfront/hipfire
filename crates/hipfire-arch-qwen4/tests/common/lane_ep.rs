@@ -790,9 +790,8 @@ fn load_ep(
     gpu: &mut Gpu,
 ) -> Result<hipfire_loader::LoadedModel, String> {
     use hipfire_loader::admission::{
-        admit_source_with_options, legacy_warning, qwen4_kv_adaptive_requested,
-        qwen_default_q8_enabled, BatchLoadRequest, KvBackendHints, KvBackendRequest,
-        SourceAdmissionOptions,
+        admit_source_with_options, legacy_warning, qwen4_kv_adaptive_requested, BatchLoadRequest,
+        KvBackendHints, KvBackendRequest, SourceAdmissionOptions,
     };
     let path = model
         .to_str()
@@ -818,7 +817,7 @@ fn load_ep(
             kv_mode: None,
             kv_k: None,
             kv_v: None,
-            qwen_default_q8: qwen_default_q8_enabled(),
+            qwen_default_q8: true,
             kv_adaptive: None,
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),

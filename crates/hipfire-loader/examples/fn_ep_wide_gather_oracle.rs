@@ -205,8 +205,8 @@ fn load_with_lane_reservation(
     gpu: &mut Gpu,
 ) -> R<hipfire_loader::LoadedModel> {
     use hipfire_loader::admission::{
-        admit_source_with_options, qwen4_kv_adaptive_requested, qwen_default_q8_enabled,
-        BatchLoadRequest, KvBackendHints, KvBackendRequest, SourceAdmissionOptions,
+        admit_source_with_options, qwen4_kv_adaptive_requested, BatchLoadRequest, KvBackendHints,
+        KvBackendRequest, SourceAdmissionOptions,
     };
     let mut admission = admit_source_with_options(
         model,
@@ -223,7 +223,7 @@ fn load_with_lane_reservation(
             kv_mode: None,
             kv_k: None,
             kv_v: None,
-            qwen_default_q8: qwen_default_q8_enabled(),
+            qwen_default_q8: true,
             kv_adaptive: None,
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),

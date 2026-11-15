@@ -1348,8 +1348,8 @@ pub struct DeltaNetSnapshot {
     stream: GdnStreamImage,
     /// S1: persistent forward (live -> backup) descriptor table, device
     /// resident, built once at `new_for`. `None` unless the bulk route armed
-    /// (arch outside `bulk_arch`, kill switch, JIT failure, or bad alignment
-    /// all leave this `None` and every op uses the memcpy loops).
+    /// (arch outside `bulk_arch`, JIT failure, or bad alignment all leave this
+    /// `None` and every op uses the memcpy loops).
     bulk_fwd: Option<DeviceBuffer>,
     /// S1: persistent reverse (backup -> live) descriptor table. Same
     /// arming rule as `bulk_fwd`; both are always armed together.
@@ -1482,18 +1482,14 @@ impl DeltaNetSnapshot {
     /// S1 arch gate. gfx1100 (S1), exact gfx1201 (railgun E0 port) and exact
     /// gfx1151. The kernel is a pure byte copy with no arch-specific code
     /// (plain `float4` loads/stores, no intrinsics); the `_gfx1100` suffix on
-    /// its symbol is historical. `HIPFIRE_DN_SNAPSHOT_BULK_OFF=1` opts out on
-    /// all three.
+    /// its symbol is historical.
     fn bulk_arch(gpu: &Gpu) -> bool {
-        !gpu.flags.dn_snapshot_bulk_off
-            && (gpu.arch_caps.is_gfx1100()
-                || gpu.arch_caps.is_gfx1151()
-                || gpu.arch_caps.is_gfx1201())
+        gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()
     }
 
     /// S1: shared fast-path gate. Returns the table + count to launch, or
-    /// `None` when the call must use the memcpy loops (kill switch, arch,
-    /// disarmed tables, or stale fingerprint).
+    /// `None` when the call must use the memcpy loops (arch, disarmed tables,
+    /// or stale fingerprint).
     fn bulk_table(
         &self,
         state: &DeltaNetState,
@@ -1674,7 +1670,7 @@ impl DeltaNetSnapshot {
 
     /// S1: armed descriptor count, or `None` when the snapshot rides the
     /// legacy memcpy loops. Diagnostics only (the launch-count gate proves
-    /// engagement); always `None` outside `bulk_arch` or under the kill switch.
+    /// engagement); always `None` outside `bulk_arch`.
     #[inline]
     pub fn bulk_n_items(&self) -> Option<u32> {
         self.bulk_fwd
@@ -2147,15 +2143,14 @@ impl GdnTape {
         bytes
     }
 
-    /// DFlash replay tape: [`Self::new_for_config`] plus, when
-    /// `HIPFIRE_DN_SNAPSHOT_FLIP` is on, the D8 snapshot-source tables that
-    /// [`Self::replay_gdn_from_snapshot`] needs.
+    /// DFlash replay tape: [`Self::new_for_config`] plus the D8 snapshot-source
+    /// tables that [`Self::replay_gdn_from_snapshot`] needs.
     pub fn new_for_dflash(
         gpu: &mut Gpu,
         config: &qwen35::Qwen35Config,
         max_n: usize,
     ) -> HipResult<Self> {
-        Self::new_armed(gpu, config, max_n, gpu.flags.dn_snapshot_flip)
+        Self::new_armed(gpu, config, max_n, true)
     }
 
     fn new_armed(
@@ -2478,10 +2473,10 @@ impl GdnTape {
         Ok(true)
     }
 
-    /// Railgun D8: whether [`Self::replay_gdn_from_snapshot`] can run —
-    /// `HIPFIRE_DN_SNAPSHOT_FLIP` not `0`, the two-launch replay admits this call,
-    /// and `snap` mirrors `dn_state` (one same-size backup per live tensor in
-    /// every family). Host-only; no allocation.
+    /// Railgun D8: whether [`Self::replay_gdn_from_snapshot`] can run — the
+    /// two-launch replay admits this call, and `snap` mirrors `dn_state` (one
+    /// same-size backup per live tensor in every family). Host-only; no
+    /// allocation.
     pub fn replay_from_snapshot_admits(
         &self,
         gpu: &Gpu,
@@ -2489,15 +2484,13 @@ impl GdnTape {
         snap: &DeltaNetSnapshot,
         n_steps: usize,
     ) -> bool {
-        gpu.flags.dn_snapshot_flip
-            && self.replay_ml_admits(gpu, dn_state, n_steps)
-            && snap.mirrors(dn_state)
+        self.replay_ml_admits(gpu, dn_state, n_steps) && snap.mirrors(dn_state)
     }
 
     /// Are this tape's D8 snapshot-source tables armed (`ml.from` exists)?
     /// [`Self::replay_from_snapshot_admits`] alone does not prove it: a
-    /// capture-only tape, or a DFlash tape built with
-    /// `HIPFIRE_DN_SNAPSHOT_FLIP=0`, has no `from` tables, and an admitted
+    /// capture-only tape, or a tape from [`Self::new_for_config`], has no
+    /// `from` tables, and an admitted
     /// snapshot-source replay on it is an error. The save-free CB verify
     /// (which commits through that replay) requires this before it exchanges
     /// any owner. Reads the existing `replay_ml` under its existing lock.
@@ -2931,7 +2924,7 @@ struct GdnReplayMl {
     gdn_table: DeviceBuffer,
     fingerprint: Option<u64>,
     /// Railgun D8 snapshot-source tables; armed by
-    /// [`GdnTape::new_for_dflash`] when `HIPFIRE_DN_SNAPSHOT_FLIP` is on.
+    /// [`GdnTape::new_for_dflash`].
     from: Option<GdnReplayMlFrom>,
 }
 
@@ -4122,19 +4115,14 @@ pub struct DflashSampledDraft {
 
 impl DflashSampledDraft {
     /// Reserve a request's maximum window without changing the selector law.
-    /// Sparse mode reserves only the top-K supports; dense rows (cactus or
-    /// `HIPFIRE_DFLASH_SPARSE_TARGET=0`) are allocated on first use.
-    pub fn new(b: usize, vocab: usize) -> Self {
+    /// Sparse mode reserves only the top-K supports; dense rows (cactus) are
+    /// allocated on first use.
+    pub fn new(b: usize) -> Self {
         let rows = b.saturating_sub(1);
-        let dense_q = if *DFLASH_SPARSE_TARGET_ON {
-            Vec::new()
-        } else {
-            (0..rows).map(|_| Vec::with_capacity(vocab)).collect()
-        };
         Self {
             block: Vec::with_capacity(b),
             selected_q: Vec::with_capacity(rows),
-            dense_q,
+            dense_q: Vec::new(),
             sparse_q: SparseQRows::with_capacity(rows, 64),
             sparse: false,
             proposal: None,
@@ -4159,20 +4147,13 @@ pub const DFLASH_SPARSE_CAP: usize = 256;
 /// `dense_slot` marker: the row is held sparse.
 const SPARSE_NONE: u32 = u32::MAX;
 
-/// `HIPFIRE_DFLASH_SPARSE_TARGET=0` (developer kill switch): download the
-/// full `[rows * vocab]` target probabilities and keep selector q dense.
-/// Default on. Read through [`dflash_sparse_target_enabled`].
-static DFLASH_SPARSE_TARGET_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_DFLASH_SPARSE_TARGET").map_or(true, |v| v.trim() != "0")
-});
-
 /// The one switch of the sparse sampled-DFlash representation, shared by the
 /// singleton route and the continuous-batching lanes (target rows AND selector
-/// q): the kill switch is on and CACTUS is off. CACTUS rewrites the whole dense
-/// target row (`scale * v` everywhere) and so stays on the dense arithmetic.
+/// q): on unless CACTUS is set. CACTUS rewrites the whole dense target row
+/// (`scale * v` everywhere) and so stays on the dense arithmetic.
 #[doc(hidden)]
 pub fn dflash_sparse_target_enabled(cfg: &DflashSampleCfg) -> bool {
-    *DFLASH_SPARSE_TARGET_ON && !(cfg.cactus_delta > 0.0)
+    !(cfg.cactus_delta > 0.0)
 }
 
 /// One verify row of [`FastTargetRows`].
@@ -4613,8 +4594,7 @@ pub fn dflash_device_accept_enabled() -> bool {
 
 /// Whether a sampled window is decided by [`dflash_sampled_accept_device`]:
 /// the switch is on, CACTUS is off (it rewrites the whole dense target row and
-/// keeps the host arithmetic), the selector q is the sparse representation
-/// (`HIPFIRE_DFLASH_SPARSE_TARGET=0` keeps dense q and the host loop) and the
+/// keeps the host arithmetic), the selector q is the sparse representation and the
 /// receipt covers the `block.len() - 1` proposed rows. Repeat / n-gram
 /// penalties never reach the sampled arm (they are greedy-only host paths).
 #[doc(hidden)]
@@ -7438,8 +7418,7 @@ pub fn download_hidden_block(
 /// caller runs the legacy per-token loop. Route: Q8_0 target embedding,
 /// `1 <= b <= max_block_size`, and either exact gfx1100 with
 /// `HIPFIRE_DRAFT_COLLAPSE_OFF` unset or the gfx1201 batched noise lookup
-/// ([`noise_embed_batch_admitted`], kill switch
-/// `HIPFIRE_DRAFT_NOISE_EMBED_BATCH=0`) that the lane-batched draft already
+/// ([`noise_embed_batch_admitted`]) that the lane-batched draft already
 /// uses. The batched kernel dequantizes each row with the same per-element
 /// math as the scalar loop, so the plane is bit-identical.
 ///
@@ -8094,43 +8073,19 @@ pub const DFLASH_DRAFT_BATCH_MAX_ROWS: usize = 48;
 /// One full 64-row draft chunk (C8 at 8-row lanes in a single forward).
 pub const DFLASH_DRAFT_BATCH_ROWS64: usize = 64;
 
-/// `HIPFIRE_CB_DRAFT_ROWS64=0` (developer kill switch): keep the batched
-/// draft at [`DFLASH_DRAFT_BATCH_MAX_ROWS`] rows per forward. Default on.
-static DRAFT_ROWS64_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_DRAFT_ROWS64").map_or(true, |v| v.trim() != "0")
-});
-
-/// `HIPFIRE_DFLASH_SELECTOR_LANES=0` (developer kill switch): score the
-/// batched draft's candidate selector per lane (one projection / top-K /
-/// three host syncs each) instead of once per chunk through
-/// [`dflash::propose_candidates_lanes_device`]. Default on.
-static SELECTOR_LANES_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_DFLASH_SELECTOR_LANES").map_or(true, |v| v.trim() != "0")
-});
-
-/// Whether the lane-batched selector applies: switch on, exact gfx1201 with
+/// Whether the lane-batched selector applies: exact gfx1201 with
 /// the draft-collapse overwrite route enabled (the only route whose
 /// projection is per-row identical across row counts), and the shared draft
 /// scratch owns the FWHT rotation buffer the projection rotates through.
 fn selector_lanes_batched(gpu: &Gpu, shared: &DflashScratch) -> bool {
-    *SELECTOR_LANES_ON
-        && gpu.arch == "gfx1201"
+    gpu.arch == "gfx1201"
         && !gpu.flags.draft_collapse_off
         && shared.mq_x_rot.is_some()
         && shared.mq_x_rot_f16.is_some()
 }
 
-/// `HIPFIRE_DRAFT_NOISE_EMBED_BATCH=0` (developer kill switch): keep the
-/// per-row `embedding_lookup_q8` loop for the batched draft's noise rows
-/// (64 launches at C8) instead of one `embedding_lookup_q8_batched` launch.
-/// Default on; every row byte is identical either way.
-static DRAFT_NOISE_EMBED_BATCH_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_DRAFT_NOISE_EMBED_BATCH")
-        .map_or(true, |v| v.trim() != "0")
-});
-
 /// Whether the batched draft's noise rows come from one batched Q8_0
-/// lookup: switch on, exact gfx1201, Q8_0 target embedding, and `rows` fit
+/// lookup: exact gfx1201, Q8_0 target embedding, and `rows` fit
 /// the shared `noise_tokens` plane (`max_block_size` ids). Independent of
 /// `draft_collapse_fused_enabled` (gfx1100 only). Exact: `embedding_q8` and
 /// `embedding_q8_batched` run the same per-element expression
@@ -8143,8 +8098,7 @@ pub(crate) fn noise_embed_batch_admitted(
     shared: &DflashScratch,
     rows: usize,
 ) -> bool {
-    *DRAFT_NOISE_EMBED_BATCH_ON
-        && gpu.arch == "gfx1201"
+    gpu.arch == "gfx1201"
         && matches!(target_weights.embd_format, llama::EmbeddingFormat::Q8_0)
         && rows >= 1
         && rows <= shared.max_block_size
@@ -8156,13 +8110,12 @@ pub(crate) fn noise_embed_batch_admitted(
 /// (`Gpu::gemm_mq4g256v2_overwrite_gfx12_dflash` inside
 /// `Gpu::draft_rows64_enter`), whose `_vt4` kernel is per-row identical to the
 /// one-tile kernel; the legacy `>= 64` arms (A8 / IU4 / bt-tile / fp8) are
-/// not. It therefore needs: kill switch unset, exact gfx1201, the draft
+/// not. It therefore needs: exact gfx1201, the draft
 /// collapse routes enabled, the batch-tile kernels, the F16 / WMMA lm_head
 /// chain with no LDS-staged arm (`mq4_verify_singleton_chain`) and no A8
 /// prefill route at 64 rows.
 pub fn dflash_draft_batch_max_rows(gpu: &Gpu) -> usize {
-    if *DRAFT_ROWS64_ON
-        && gpu.arch == "gfx1201"
+    if gpu.arch == "gfx1201"
         && !gpu.flags.draft_collapse_off
         && gpu.flags.wmma_batch_tiles
         && !gpu.flags.fp16_disabled
@@ -16008,7 +15961,7 @@ mod device_accept_tests {
             ..cfg
         };
         assert!(!dflash_device_accept_eligible(true, &cactus, &d, 5));
-        // Dense q (HIPFIRE_DFLASH_SPARSE_TARGET=0) keeps the host loop.
+        // Dense q (sparse off) keeps the host loop.
         let mut dense = sparse_draft(5);
         dense.sparse = false;
         assert!(!dflash_device_accept_eligible(true, &cfg, &dense, 5));

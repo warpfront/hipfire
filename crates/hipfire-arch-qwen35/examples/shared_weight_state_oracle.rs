@@ -553,12 +553,6 @@ fn main() -> Result<()> {
 /// Production carrier load at an explicit (non-automatic) `max_seq`, PP=1,
 /// no MTP/drafter/vision. The weight route follows the environment.
 fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundle> {
-    let qwen_default_q8 = !matches!(
-        hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8")
-            .ok()
-            .as_deref(),
-        Some("0")
-    );
     let mut lc = LoadCtx {
         path: model,
         max_seq,
@@ -572,7 +566,7 @@ fn load_bundle(model: &str, max_seq: usize, gpu: &mut Gpu) -> Result<Qwen35Bundl
         kv_mode_override: None,
         kv_k_override: None,
         kv_v_override: None,
-        qwen_default_q8,
+        qwen_default_q8: true,
         kv_backend: KvBackend::default(),
         kv_adaptive_override: None,
         state_quant_override: None,

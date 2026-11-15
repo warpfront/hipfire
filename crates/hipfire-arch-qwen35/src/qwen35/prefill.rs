@@ -2123,12 +2123,6 @@ fn lean_pbs_route(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, n: 
         })
 }
 
-fn lean_pbs_requested() -> bool {
-    hipfire_config::developer_var("HIPFIRE_GFX11_LEAN_PBS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true)
-}
-
 fn lean_dense_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
     let full = dense_prefill_allocation_bytes(config, rows)?;
     let v = config
@@ -2767,7 +2761,7 @@ fn ordinary_prefill_chunk_limit_with_facts(
     if perf <= WIDENED_COMMIT_ROWS {
         return Ok(perf.min(legacy));
     }
-    let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, perf);
+    let lean = lean_pbs_route(gpu, weights, config, perf);
     let mut admitted = memory_admitted_rung(
         gpu,
         config,
@@ -4062,7 +4056,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 // overwritten before it is read (same reuse contract as the
                 // legacy `prefill_batch` cache).
                 let mut cached = scratch.widened_prefill_batch.borrow_mut();
-                let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, owned_rows);
+                let lean = lean_pbs_route(gpu, weights, config, owned_rows);
                 if !cached
                     .as_ref()
                     .is_some_and(|p| p.max_batch >= owned_rows && p.lean == lean)

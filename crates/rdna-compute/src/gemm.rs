@@ -1254,12 +1254,6 @@ fn g12_iu4_b1s_image() -> HipResult<&'static [u8]> {
 /// under the 300 W cap. Parsed once so a producer and its consumers agree.
 static A4_SLAB: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A4_SLAB", true));
-/// gfx1201 GDN input projection merge on the non-fused IU4 verify path
-/// (`HIPFIRE_GDN_ZBA_FOLD`, default on; `=0` restores the four separate QKV,
-/// Z, beta and alpha SETs): one QKV + Z fold launch, or the Z fold SET +
-/// split. Byte-identical outputs.
-static GDN_ZBA_FOLD: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GDN_ZBA_FOLD", true));
 /// gfx1201 small-N verify schedules (`HIPFIRE_VERIFY_V64`, default on; `=0` kills): slab
 /// launches of at most [`VERIFY_V64_MAX_N`] rows load the `_v64` exports of the `_b1s`
 /// bundle (full_add/full_set/qkvzaset/gate_up_silu) instead of the shipped ones.
@@ -1279,19 +1273,6 @@ static A4_HIN_TOKFAST: LazyLock<bool> =
 #[inline]
 pub(crate) fn a4_hin_tokfast_enabled() -> bool {
     *A4_HIN_TOKFAST
-}
-/// Reciprocal-plane divide in the A4 RMSNorm slab producer
-/// (`HIPFIRE_A4_RMS_FDIV`, default on; `=0` opts out): the loader appends
-/// R = RN(1/a) and Rlo planes to each producer-fed AWQ scale
-/// ([`crate::gemv::awq_rcp_planes`]) and `fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv`
-/// replaces the per-element IEEE divide by a Markstein correction with an
-/// exact wave fallback. Byte-identical codes. Parsed once so the loader and
-/// the producer agree.
-static A4_RMS_FDIV: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A4_RMS_FDIV", true));
-#[inline]
-pub(crate) fn a4_rms_fdiv_enabled() -> bool {
-    *A4_RMS_FDIV
 }
 /// Quality receipts count the fused A4 GDN projection launches (print-only,
 /// one stderr line per launch). Kept off in production and all timing runs.
@@ -2251,11 +2232,16 @@ impl Gpu {
                 .any(|f| f == "-DIU4_A4_CANDIDATES=2")
     }
 
+    /// Reciprocal-plane divide in the A4 RMSNorm slab producer: the loader appends
+    /// R = RN(1/a) and Rlo planes to each producer-fed AWQ scale
+    /// ([`crate::gemv::awq_rcp_planes`]) and `fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv`
+    /// replaces the per-element IEEE divide by a Markstein correction with an
+    /// exact wave fallback. Byte-identical codes.
     /// Whether the loader should append reciprocal planes to the AWQ scales
-    /// of the linears fed by the RMSNorm producer (`HIPFIRE_A4_RMS_FDIV`):
+    /// of the linears fed by the RMSNorm producer:
     /// exact gfx1201 only, where the `_v2_slab_fdiv` producer can run.
     pub fn a4_rms_fdiv_planes_wanted(&self) -> bool {
-        a4_rms_fdiv_enabled() && self.arch == "gfx1201"
+        self.arch == "gfx1201"
     }
 }
 
@@ -36039,8 +36025,7 @@ impl Gpu {
     /// produce, so the outputs are byte-identical. Returns `Ok(false)` without
     /// launching when not admitted: exact gfx1201, the fold predicate holds,
     /// the weight buffer really is the fold, `0 < n <= 128`, the scratch and
-    /// outputs are large enough and 16-byte aligned, and
-    /// `HIPFIRE_GDN_ZBA_FOLD` != `0`.
+    /// outputs are large enough and 16-byte aligned.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_zba_fold_g12_iu4_prepared(
         &mut self,
@@ -36055,7 +36040,7 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<bool> {
-        if self.arch != "gfx1201" || !*GDN_ZBA_FOLD {
+        if self.arch != "gfx1201" {
             return Ok(false);
         }
         self.bind_thread()?;
@@ -36127,7 +36112,7 @@ impl Gpu {
     /// into `y_beta`/`y_alpha` (stride 48). `a_z_fold` is the loader's Z fold.
     /// Byte-identical to the separate SET launches. Returns `Ok(false)`
     /// without launching unless: exact gfx1201, slab activations,
-    /// `HIPFIRE_GDN_ZBA_FOLD` != `0`, [`Self::iu4_gdn_fold_active`],
+    /// [`Self::iu4_gdn_fold_active`],
     /// `0 < n <= 128`, and weights/outputs are large enough and 16-byte aligned.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qkvza_set_g12_iu4_prepared(
@@ -36143,7 +36128,7 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<bool> {
-        if self.arch != "gfx1201" || !*GDN_ZBA_FOLD {
+        if self.arch != "gfx1201" {
             return Ok(false);
         }
         self.bind_thread()?;

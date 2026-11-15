@@ -69,7 +69,7 @@ const BF16_K4_OTILE_ROWS_PER_BLOCK: usize = 2;
 /// `[K, AWQ_RCP_ROWS]`. Every other consumer reads only the first K floats.
 pub const AWQ_RCP_ROWS: usize = 3;
 
-/// `[a][R][Rlo]` for the `_v2_slab_fdiv` producer (`HIPFIRE_A4_RMS_FDIV`):
+/// `[a][R][Rlo]` for the `_v2_slab_fdiv` producer:
 /// R = RN(1/a) and Rlo = RN(fma(-a, R, 1) * R), so R + Rlo is 1/a to 2^-47
 /// relative; both are NaN unless 2^-20 <= |a| <= 2^20, which sends every
 /// lane that divides by that `a` to the IEEE divide. f32 `/`, `mul_add` and
@@ -4270,8 +4270,7 @@ impl Gpu {
     /// `HIPFIRE_G12_NORM` (default on) selects the bit-identical `_v2` twins
     /// (same geometry and arguments). The A4 slab AWQ twin divides with the
     /// loader's reciprocal planes (`_v2_slab_fdiv`, one extra `awq_rcp`
-    /// argument) when `awq` carries them ([`awq_has_rcp_planes`]) and
-    /// `HIPFIRE_A4_RMS_FDIV` is on.
+    /// argument) when `awq` carries them ([`awq_has_rcp_planes`]).
     /// The sidecar uses the compiled candidate policy (gfx1201 C2 {5,7}); it is
     /// NOT in general byte-identical to the standalone `quantize_int4_mmq_ds128`
     /// (8-candidate) chain. The `_exact_batched` twin selects that reference
@@ -4383,9 +4382,7 @@ impl Gpu {
         self.ensure_mq_signs()?;
         let v2 = !exact && self.flags.g12_norm_enabled();
         let slab = awq.is_some() && v2 && self.a4_slab_active();
-        let fdiv = slab
-            && crate::gemm::a4_rms_fdiv_enabled()
-            && awq.is_some_and(|t| awq_has_rcp_planes(t, k));
+        let fdiv = slab && awq.is_some_and(|t| awq_has_rcp_planes(t, k));
         let (module, source, kernel) = match (awq.is_some(), v2) {
             (true, false) => (
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
