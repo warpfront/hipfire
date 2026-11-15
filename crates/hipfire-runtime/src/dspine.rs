@@ -229,6 +229,11 @@ struct LatticeScratch {
     msg: GpuTensor,
     s1t: GpuTensor,
     s2t: GpuTensor,
+    // S4: refine I/O moved in from per-call allocs — candidate ids (u32 as
+    // f32), the pre-write base term, and the pick output.
+    cand: GpuTensor,
+    base: GpuTensor,
+    out: GpuTensor,
 }
 
 fn lift_bf16_tensor(
@@ -543,17 +548,10 @@ impl DspineBridge {
         let tables = self.serial.as_ref();
         let vocab = self.cfg.trunk.vocab_size;
         // u32 payloads ride F32 tensors (4 B/elem): Raw is 1 B/elem and
-        // download_f32 reads numel*4, so a Raw alloc here is a bounded
-        // overread that only survives on pool granularity.
-        let cand = gpu.alloc_tensor(&[rows, 16], rdna_compute::DType::F32)?;
-        let base = gpu.alloc_tensor(&[rows, 16], rdna_compute::DType::F32)?;
-        let out = gpu.alloc_tensor(&[rows], rdna_compute::DType::F32)?;
+        // download_f32 reads numel*4. The cand/base/out buffers live in
+        // LatticeScratch (S4) instead of per-call pool allocs.
         let diag =
             hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_DIAG").as_deref() == Ok("1");
-        if diag {
-            eprintln!("[dspine-serial] rows={} base.buf={}B cand.buf={}B out.buf={}B",
-                rows, base.byte_size(), cand.byte_size(), out.byte_size());
-        }
         // Experiment switch: HIPFIRE_DSPINE_SERIAL_MODE=argmax returns the
         // pre-write argmax (topk16 lane 0) and skips the sender chain —
         // isolates how much of the acceptance gap is the refinement term
@@ -584,6 +582,59 @@ impl DspineBridge {
             .unwrap_or_else(|| "/tmp/dspine_capture_l".to_string());
         let timing =
             hipfire_config::developer_var("HIPFIRE_DSPINE_LATTICE_TIMING").as_deref() == Ok("1");
+        // S4: take the lattice scratch once per call; cand/base/out ride in it.
+        let mut held = self.lattice_scratch.replace(None);
+        if held.as_ref().map_or(true, |s| s.rows != rows) {
+            if let Some(old) = held.take() {
+                let _ = gpu.free_tensor(old.lm);
+                let _ = gpu.free_tensor(old.refined);
+                let _ = gpu.free_tensor(old.scores);
+                let _ = gpu.free_tensor(old.dbg);
+                let _ = gpu.free_tensor(old.s1t);
+                let _ = gpu.free_tensor(old.s2t);
+                let _ = gpu.free_tensor(old.cand);
+                let _ = gpu.free_tensor(old.base);
+                let _ = gpu.free_tensor(old.out);
+            }
+            // MQ4V2 head rows encode FWHT(W): the score dot product
+            // consumes the FWHT-rotated refined vector (engine sign
+            // convention, seeds 42/1042 — same tables as ensure_mq_signs).
+            let mut signs1 = vec![0f32; 256];
+            let mut signs2 = vec![0f32; 256];
+            {
+                let mut st: u32 = 42;
+                for i in 0..256 {
+                    st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+                    signs1[i] = if (st >> 16) & 1 == 1 { 1.0 } else { -1.0 };
+                }
+                st = 1042;
+                for i in 0..256 {
+                    st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+                    signs2[i] = if (st >> 16) & 1 == 1 { 1.0 } else { -1.0 };
+                }
+            }
+            held = Some(LatticeScratch {
+                rows,
+                lm: gpu.alloc_tensor(&[rows, 16, self.h], rdna_compute::DType::F32)?,
+                refined: gpu.alloc_tensor(&[rows, 16, self.h], rdna_compute::DType::F32)?,
+                scores: gpu.alloc_tensor(&[rows, 16, 16], rdna_compute::DType::F32)?,
+                dbg: gpu.alloc_tensor(&[12800], rdna_compute::DType::F32)?,
+                msg: gpu.alloc_tensor(&[rows * 16, self.r], rdna_compute::DType::F32)?,
+                s1t: gpu.upload_f32(&signs1, &[256])?,
+                s2t: gpu.upload_f32(&signs2, &[256])?,
+                cand: gpu.alloc_tensor(&[rows, 16], rdna_compute::DType::F32)?,
+                base: gpu.alloc_tensor(&[rows, 16], rdna_compute::DType::F32)?,
+                out: gpu.alloc_tensor(&[rows], rdna_compute::DType::F32)?,
+            });
+        }
+        let LatticeScratch {
+            rows: _sr, lm: lm_scratch, refined: refined_out, scores, dbg: dbg_seg, s1t, s2t,
+            msg, cand, base, out,
+        } = held.take().unwrap();
+        if diag {
+            eprintln!("[dspine-serial] rows={} base.buf={}B cand.buf={}B out.buf={}B",
+                rows, base.byte_size(), cand.byte_size(), out.byte_size());
+        }
         let pick = (|| -> hip_bridge::HipResult<Vec<u32>> {
             let mut cap_dir: Option<String> = None;
             let t0 = std::time::Instant::now();
@@ -611,6 +662,10 @@ impl DspineBridge {
                 // queue and would dominate this control arm's window time.
                 let raw = gpu.download_f32_stream_ordered(&cand)?;
                 refine_ts_report(gpu, ev_start.take(), ev_end.take(), "argmax", rows, t0);
+                self.lattice_scratch.replace(Some(LatticeScratch {
+                    rows, lm: lm_scratch, refined: refined_out, scores, dbg: dbg_seg,
+                    s1t, s2t, msg, cand, base, out,
+                }));
                 return Ok((0..rows).map(|i| raw[i * 16].to_bits()).collect());
             }
             // stream-ordered: the plain readback blocks on the legacy null
@@ -624,48 +679,6 @@ impl DspineBridge {
                 .s_packed
                 .sub_offset(3 * self.r, rows * 3 * self.r);
             let anchor_code = self.s_codes.sub_offset(0, self.c);
-            let mut held = self.lattice_scratch.replace(None);
-            if held.as_ref().map_or(true, |s| s.rows != rows) {
-                if let Some(old) = held.take() {
-                    let _ = gpu.free_tensor(old.lm);
-                    let _ = gpu.free_tensor(old.refined);
-                    let _ = gpu.free_tensor(old.scores);
-                    let _ = gpu.free_tensor(old.dbg);
-                    let _ = gpu.free_tensor(old.s1t);
-                    let _ = gpu.free_tensor(old.s2t);
-                }
-                // MQ4V2 head rows encode FWHT(W): the score dot product
-                // consumes the FWHT-rotated refined vector (engine sign
-                // convention, seeds 42/1042 — same tables as ensure_mq_signs).
-                let mut signs1 = vec![0f32; 256];
-                let mut signs2 = vec![0f32; 256];
-                {
-                    let mut st: u32 = 42;
-                    for i in 0..256 {
-                        st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-                        signs1[i] = if (st >> 16) & 1 == 1 { 1.0 } else { -1.0 };
-                    }
-                    st = 1042;
-                    for i in 0..256 {
-                        st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-                        signs2[i] = if (st >> 16) & 1 == 1 { 1.0 } else { -1.0 };
-                    }
-                }
-                held = Some(LatticeScratch {
-                    rows,
-                    lm: gpu.alloc_tensor(&[rows, 16, self.h], rdna_compute::DType::F32)?,
-                    refined: gpu.alloc_tensor(&[rows, 16, self.h], rdna_compute::DType::F32)?,
-                    scores: gpu.alloc_tensor(&[rows, 16, 16], rdna_compute::DType::F32)?,
-                    dbg: gpu.alloc_tensor(&[12800], rdna_compute::DType::F32)?,
-                    msg: gpu.alloc_tensor(&[rows * 16, self.r], rdna_compute::DType::F32)?,
-                    s1t: gpu.upload_f32(&signs1, &[256])?,
-                    s2t: gpu.upload_f32(&signs2, &[256])?,
-                });
-            }
-            let LatticeScratch {
-                rows: _sr, lm: lm_scratch, refined: refined_out, scores, dbg: dbg_seg, s1t, s2t,
-                msg,
-            } = held.take().unwrap();
             let row_bytes = ((self.h + 255) / 256) * 136;
             let last = self.write_w.len() - 1;
             if mode_table {
@@ -736,7 +749,7 @@ impl DspineBridge {
                 }
                 self.lattice_scratch.replace(Some(LatticeScratch {
                     rows, lm: lm_scratch, refined: refined_out, scores, dbg: dbg_seg,
-                    s1t, s2t, msg,
+                    s1t, s2t, msg, cand, base, out,
                 }));
                 if timing {
                     let t_walk = t0.elapsed();
@@ -876,7 +889,7 @@ impl DspineBridge {
             }
             self.lattice_scratch.replace(Some(LatticeScratch {
                 rows, lm: lm_scratch, refined: refined_out, scores, dbg: dbg_seg, s1t, s2t,
-                msg,
+                msg, cand, base, out,
             }));
             if let Some(dir) = &cap_dir {
                 if let Ok(mut f) = std::fs::File::create(format!("{}/picks.bin", dir)) {
@@ -902,8 +915,6 @@ impl DspineBridge {
             }
             return Ok(picks_v);
         })();
-        let _ = gpu.free_tensor(cand);
-        let _ = gpu.free_tensor(base);
         return pick;
     }
 
@@ -972,6 +983,9 @@ impl DspineBridge {
             let _ = gpu.free_tensor(sc.scores);
             let _ = gpu.free_tensor(sc.dbg);
             let _ = gpu.free_tensor(sc.msg);
+            let _ = gpu.free_tensor(sc.cand);
+            let _ = gpu.free_tensor(sc.base);
+            let _ = gpu.free_tensor(sc.out);
             let _ = gpu.free_tensor(sc.s1t);
             let _ = gpu.free_tensor(sc.s2t);
         }
