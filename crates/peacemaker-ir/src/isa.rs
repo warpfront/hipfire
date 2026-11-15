@@ -297,16 +297,19 @@ pub fn table(arch: Arch) -> &'static [OpRow] {
     }
 }
 /// Complete variant-keyed XML rows, separate from the frozen census regression set.
+/// `build.rs` projects them from the committed `isa/*.xml.jsonl` catalogs.
 pub fn runtime_table(arch: Arch) -> &'static [OpRow] {
-    static GFX1100: LazyLock<Vec<OpRow>> = LazyLock::new(|| {
-        parse(include_str!("../isa/gfx1100.runtime.tbl")).expect("gfx1100 runtime table")
-    });
-    static GFX1151: LazyLock<Vec<OpRow>> = LazyLock::new(|| {
-        parse(include_str!("../isa/gfx1151.runtime.tbl")).expect("gfx1151 runtime table")
-    });
-    static GFX12: LazyLock<Vec<OpRow>> = LazyLock::new(|| {
-        parse(include_str!("../isa/gfx12.runtime.tbl")).expect("gfx12 runtime table")
-    });
+    macro_rules! generated {
+        ($target:literal) => {
+            include_str!(concat!(env!("OUT_DIR"), "/", $target, ".runtime.tbl"))
+        };
+    }
+    static GFX1100: LazyLock<Vec<OpRow>> =
+        LazyLock::new(|| parse(generated!("gfx1100")).expect("gfx1100 runtime table"));
+    static GFX1151: LazyLock<Vec<OpRow>> =
+        LazyLock::new(|| parse(generated!("gfx1151")).expect("gfx1151 runtime table"));
+    static GFX12: LazyLock<Vec<OpRow>> =
+        LazyLock::new(|| parse(generated!("gfx12")).expect("gfx12 runtime table"));
     match arch {
         Arch::Gfx1100 => &GFX1100,
         Arch::Gfx1151 => &GFX1151,

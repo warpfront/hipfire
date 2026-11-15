@@ -11,6 +11,10 @@ petgraph = "0.8"
 serde_json.workspace = true
 serde = { workspace = true, features = ["derive"] }
 
+[build-dependencies]
+# build.rs projects isa/*.xml.jsonl into the runtime rows (OUT_DIR/*.runtime.tbl).
+serde_json.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 insta = "1"
