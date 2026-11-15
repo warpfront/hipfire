@@ -190,10 +190,6 @@ required-features = ["lab", "rdna-compute/lab"]
 name = "f1_planar_byte_oracle"
 required-features = ["lab"]
 
-# C8 routed-expert kernel roofline (real expert tensors, VRAM-resident, EP2 C8 AR shape).
-[[example]]
-name = "moe_c8_roofline"
-required-features = ["lab"]
 
 # S3 wide-pass routed-expert byte oracle + A/B (production vs g32 gate/up on real expert tensors).
 [[example]]
@@ -462,29 +458,17 @@ required-features = ["lab"]
 name = "build_kld_ref_native_glimmer"
 required-features = ["lab"]
 
-[[example]]
-name = "check_think_tokens"
-required-features = ["lab"]
 
 [[example]]
 name = "ddtree_pq_sim"
 required-features = ["lab"]
 
-[[example]]
-name = "debug_dequant"
-required-features = ["lab"]
 
 [[example]]
 name = "debug_gemma4_attention"
 required-features = ["lab"]
 
-[[example]]
-name = "debug_hfq"
-required-features = ["lab"]
 
-[[example]]
-name = "debug_hfq2"
-required-features = ["lab"]
 
 [[example]]
 name = "debug_minimax_batch"
@@ -506,17 +490,11 @@ required-features = ["lab"]
 name = "ds4_prompt_fixture"
 required-features = ["lab"]
 
-[[example]]
-name = "ds4_tp_longctx_capacity"
-required-features = ["lab"]
 
 [[example]]
 name = "dump_embedded_template"
 required-features = ["lab"]
 
-[[example]]
-name = "dump_jinja_render"
-required-features = ["lab"]
 
 [[example]]
 name = "dump_meta"
@@ -554,17 +532,11 @@ required-features = ["lab"]
 name = "hfq_load_pipeline_bench"
 required-features = ["lab"]
 
-[[example]]
-name = "hfq_manifest"
-required-features = ["lab"]
 
 [[example]]
 name = "hfq_splice_attn"
 required-features = ["lab"]
 
-[[example]]
-name = "inspect_gemma4_hfq"
-required-features = ["lab"]
 
 [[example]]
 name = "jinja_render_dump"
@@ -582,13 +554,7 @@ required-features = ["lab"]
 name = "llama_lm_head_logits_parity"
 required-features = ["lab"]
 
-[[example]]
-name = "load_gguf"
-required-features = ["lab"]
 
-[[example]]
-name = "measure_launch"
-required-features = ["lab"]
 
 [[example]]
 name = "mq4v2_gemm_parity"
@@ -604,17 +570,8 @@ required-features = ["lab"]
 
 
 
-[[example]]
-name = "probe_wmma"
-required-features = ["lab"]
 
-[[example]]
-name = "profile_forward"
-required-features = ["lab"]
 
-[[example]]
-name = "profile_layers"
-required-features = ["lab"]
 
 [[example]]
 name = "profile_prefill_deepseek4"
@@ -628,13 +585,7 @@ required-features = ["lab"]
 name = "render_bench"
 required-features = ["lab"]
 
-[[example]]
-name = "render_chat_template"
-required-features = ["lab"]
 
-[[example]]
-name = "render_cohere2moe"
-required-features = ["lab"]
 
 [[example]]
 name = "smoke_llama_prefill_batch"
@@ -832,17 +783,8 @@ required-features = ["lab"]
 name = "fp8stream_producer_oracle"
 required-features = ["lab"]
 
-[[example]]
-name = "test_e4_engine_repro"
-required-features = ["lab"]
 
-[[example]]
-name = "a13_repro"
-required-features = ["lab"]
 
-[[example]]
-name = "ep_row_gather_probe"
-required-features = ["lab"]
 
 [[example]]
 name = "ep_transport_oracle"
