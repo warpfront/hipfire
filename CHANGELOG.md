@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.7 — (unreleased)
+## v0.4.7 — 2026-11-15
 
 0.4.7 is a bug-fix patch release on top of 0.4.6. It backports fixes from beta for bugs that 0.4.6 users can hit; it removes nothing and changes no default numerics. Every entry names its beta commit.
 
