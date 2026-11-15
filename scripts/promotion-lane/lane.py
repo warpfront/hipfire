@@ -40,7 +40,9 @@ POLICY_SCHEMA = "promotion-lane-policy-v1"
 WAIVERS_SCHEMA = "promotion-lane-waivers-v1"
 RECORD_SCHEMA = "promotion-record-v1"
 CANDIDATE_SCHEMA = "promotion-candidate-v1"
-GATES = ("candidate", "rented", "release")
+# candidate: blocks every candidate; rented: blocks while a host is rented (always per release);
+# release: per release only; secondary: never blocks a promotion or a release, records reported (red = warning)
+GATES = ("candidate", "rented", "release", "secondary")
 TRANSITIONS = ("forced-advance", "append", "rollback")
 COMPILE_MARKERS = ("hipcc compiled (", "but hipcc is unavailable")
 COMPILER_PREFIXES = ("hipcc", "hipconfig", "clang", "amdclang")
@@ -607,7 +609,7 @@ def cmd_merge(args, policy):
             problems.append("%s: second record for class %s" % (path, cls))
         else:
             records[cls] = (path, rec)
-    classes, owed, open_waivers = {}, [], []
+    classes, owed, open_waivers, warnings = {}, [], [], []
     for name, spec in sorted(policy["classes"].items()):
         required = spec["gate"] == "candidate" or (spec["gate"] == "rented" and name in args.rented)
         if name in records:
@@ -616,6 +618,8 @@ def cmd_merge(args, policy):
             problems += ["class %s: %s" % (name, w) for w in why] if required else []
             classes[name] = {"status": status, "record": path}
             open_waivers += [w for w in rec.get("waivers", []) if isinstance(w, dict) and w.get("closed_by") is None]
+            if spec["gate"] == "secondary" and status == "red":
+                warnings.append("secondary class %s: red (%s)" % (name, "; ".join(why)))
         elif name in args.allow_down:
             classes[name] = {"status": "down", "record": None}
             owed.append(name)
@@ -628,14 +632,20 @@ def cmd_merge(args, policy):
     green = not problems
     cand = {"schema": CANDIDATE_SCHEMA, "candidate": args.candidate, "classes": classes,
             "waivers_open": open_waivers, "verdict": "green" if green else "red", "owed": owed,
-            "problems": problems}
+            "problems": problems, "warnings": warnings}
     write_json(args.out, cand)
     print("CANDIDATE %s %s (%s)" % ("GREEN" if green else "RED", args.candidate[:12],
                                     ", ".join("%s=%s" % (k, v["status"]) for k, v in classes.items())))
+    for name, spec in sorted(policy["classes"].items()):
+        if spec["gate"] == "secondary":
+            status = classes[name]["status"]
+            print("  secondary: %s %s" % (name, "no record" if status == "not-run" else status))
     if owed:
         print("  owed: %s" % ",".join(owed))
     for problem in problems:
         print("  %s" % problem)
+    for warning in warnings:
+        print("  warning: %s" % warning)
     return 0 if green else 1
 
 
@@ -658,6 +668,7 @@ def cmd_check_release(args, policy):
             continue
         if isinstance(rec, dict) and rec.get("schema") == RECORD_SCHEMA and rec.get("candidate") == args.sha:
             by_class.setdefault(rec.get("class"), []).append((name, rec))
+    warnings, report = [], []
     for cls in sorted(policy["classes"]):
         verdicts = []
         for name, rec in by_class.get(cls, []):
@@ -665,8 +676,14 @@ def cmd_check_release(args, policy):
             if status == "green" and (rec.get("waivers") or any(r.get("verdict") == "waived" for r in rec.get("rows", []))):
                 status, why = "red", ["record is waived, release needs an unwaived record"]
             verdicts.append((status, name, why))
-        if not any(v[0] == "green" for v in verdicts):
-            detail = "; ".join("%s: %s" % (n, ", ".join(w)) for s, n, w in verdicts) or "no record"
+        detail = "; ".join("%s: %s" % (n, ", ".join(w)) for s, n, w in verdicts) or "no record"
+        green = any(v[0] == "green" for v in verdicts)
+        if policy["classes"][cls]["gate"] == "secondary":
+            report.append("secondary: %s %s" % (cls, "green" if green else ("red" if verdicts else "no record")))
+            if verdicts and not green:
+                warnings.append("secondary class %s: no green unwaived record at %s (%s)" % (cls, args.sha[:12], detail))
+            continue
+        if not green:
             problems.append("class %s: no green unwaived record at %s (%s)" % (cls, args.sha[:12], detail))
     shown = git(repo, "show", "%s:%s" % (args.sha, WAIVERS_REL))
     if shown.returncode == 0:
@@ -681,8 +698,12 @@ def cmd_check_release(args, policy):
                 problems.append("open waiver in release tree: %s rows=%s sha=%s" % (
                     waiver.get("class"), ",".join(waiver.get("rows", [])), str(waiver.get("sha"))[:12]))
     print("RELEASE %s %s" % ("GREEN" if not problems else "RED", args.sha[:12]))
+    for line in report:
+        print("  %s" % line)
     for problem in problems:
         print("  %s" % problem)
+    for warning in warnings:
+        print("  warning: %s" % warning)
     return 0 if not problems else 1
 
 
@@ -810,7 +831,8 @@ SELF_POLICY = {
     "classes": {
         "gfx1100": {"gate": "candidate", "budget_minutes": 60, "required": ["rowA", "rowB"]},
         "gfx1201": {"gate": "candidate", "budget_minutes": 60, "required": ["rowA", "rowB"]},
-        "gfx942": {"gate": "rented", "budget_minutes": 60, "required": ["rowA", "rowB"]},
+        "gfx942": {"gate": "secondary", "budget_minutes": 60, "required": ["rowA", "rowB"]},
+        "gfx-rented": {"gate": "rented", "budget_minutes": 60, "required": ["rowA", "rowB"]},
     },
     "transitions_required": ["forced-advance", "append", "rollback"],
     "waiver_grantors": ["Kaden", "fivetide"],
@@ -828,13 +850,14 @@ def _gen(rid, **extra):
 
 def _matrix(**overrides):
     """A synthetic matrix whose rows satisfy SELF_POLICY; overrides replace rows by id."""
-    forced = {"id": "rowA", "hosts": ["gfx1100", "gfx1201", "gfx942"], "transitions": ["forced-advance", "append"],
+    hosts = ["gfx1100", "gfx1201", "gfx942", "gfx-rented"]
+    forced = {"id": "rowA", "hosts": hosts, "transitions": ["forced-advance", "append"],
               "positive_session": [
                   _gen("t0", thinking_enabled=True, max_think_tokens=64),
                   {"send": {"type": "generate", "id": "t1", "attempt_id": 1, "max_tokens": 8, "messages": [
                       {"role": "user", "content": "hi"}, {"role": "assistant", "content": "$CAPTURE_t0"},
                       {"role": "user", "content": "more"}]}, "handshake": True}]}
-    rollback = {"id": "rowB", "hosts": ["gfx1100", "gfx1201", "gfx942"], "transitions": ["rollback"],
+    rollback = {"id": "rowB", "hosts": hosts, "transitions": ["rollback"],
                 "positive_session": [_gen("a"), {"send": {"type": "generate", "id": "b", "attempt_id": 1,
                                                           "max_tokens": 8, "prompt": "hi"},
                                                  "abort_at_commit_ready": True}, _gen("c")],
@@ -896,9 +919,12 @@ def _self_test_check(t):
     t(any("gfx1201" in p and "rollback" in p for p in check_tree(dropped, ok_matrix, None)),
       "dropping the rollback row from a class must fail check")
     override = json.loads(json.dumps(SELF_POLICY))
-    override["classes"]["gfx942"]["transitions_required"] = []
-    override["classes"]["gfx942"]["required"] = ["rowA"]
+    override["classes"]["gfx-rented"]["transitions_required"] = []
+    override["classes"]["gfx-rented"]["required"] = ["rowA"]
     t(check_tree(override, ok_matrix, None) == [], "a class-level empty transitions_required needs no transition rows")
+    secondary = json.loads(json.dumps(SELF_POLICY))
+    secondary["classes"]["gfx942"]["required"] = ["rowA"]
+    t(check_tree(secondary, ok_matrix, None) == [], "a secondary class is not held to transition coverage")
     override["classes"]["gfx1201"]["transitions_required"] = ["rollback"]
     t(check_tree(override, ok_matrix, None) == [], "another candidate class still requires all three")
     override["classes"]["gfx1100"]["transitions_required"] = ["append"]
@@ -1132,9 +1158,18 @@ def _self_test_merge(t, scratch, repo, release_sha):
         rc, text, _ = _call(cmd_merge, ns, SELF_POLICY)
         return rc, text, load_json(ns.out) if os.path.exists(ns.out) else None
 
-    rc, _, doc = merge([_fake_record("gfx1100", cand), _fake_record("gfx1201", cand)])
-    t(rc == 0 and doc["verdict"] == "green" and doc["classes"]["gfx942"]["status"] == "not-run",
-      "all candidate classes green -> green; rented class not required")
+    rc, text, doc = merge([_fake_record("gfx1100", cand), _fake_record("gfx1201", cand)])
+    t(rc == 0 and doc["verdict"] == "green" and doc["classes"]["gfx942"]["status"] == "not-run"
+      and doc["classes"]["gfx-rented"]["status"] == "not-run" and "secondary: gfx942 no record" in text,
+      "all candidate classes green -> green; rented and secondary classes not required")
+    rc, text, doc = merge([_fake_record("gfx1100", cand), _fake_record("gfx1201", cand),
+                           _fake_record("gfx942", cand, verdict="red")])
+    t(rc == 0 and doc["verdict"] == "green" and doc["classes"]["gfx942"]["status"] == "red"
+      and any("gfx942" in w for w in doc["warnings"]) and "secondary: gfx942 red" in text
+      and "warning: secondary class gfx942" in text, "a red secondary record warns, never blocks")
+    rc, text, doc = merge([_fake_record("gfx1100", cand), _fake_record("gfx1201", cand), _fake_record("gfx942", cand)])
+    t(rc == 0 and doc["classes"]["gfx942"]["status"] == "green" and doc["warnings"] == []
+      and "secondary: gfx942 green" in text, "a green secondary record is reported")
     rc, text, doc = merge([_fake_record("gfx1100", cand)])
     t(rc == 1 and doc["verdict"] == "red" and doc["classes"]["gfx1201"]["status"] == "not-run", "missing class -> red")
     rc, _, doc = merge([_fake_record("gfx1100", cand)], allow_down=["gfx1201"])
@@ -1150,11 +1185,17 @@ def _self_test_merge(t, scratch, repo, release_sha):
     thin = _fake_record("gfx1201", cand, rows=("rowA",))
     rc, _, _ = merge([_fake_record("gfx1100", cand), thin])
     t(rc == 1, "record missing a required row -> red")
-    rc, _, doc = merge([_fake_record("gfx1100", cand), _fake_record("gfx1201", cand)], rented=["gfx942"])
+    rc, _, doc = merge([_fake_record("gfx1100", cand), _fake_record("gfx1201", cand)], rented=["gfx-rented"])
     t(rc == 1, "--rented class without a record -> red")
-    rc, _, doc = merge([_fake_record("gfx1100", cand), _fake_record("gfx1201", cand), _fake_record("gfx942", cand)],
-                       rented=["gfx942"])
-    t(rc == 0 and doc["classes"]["gfx942"]["status"] == "green", "--rented class with green record -> green")
+    rc, _, doc = merge([_fake_record("gfx1100", cand), _fake_record("gfx1201", cand),
+                        _fake_record("gfx-rented", cand, verdict="red")], rented=["gfx-rented"])
+    t(rc == 1 and doc["classes"]["gfx-rented"]["status"] == "red", "--rented class with red record -> red")
+    rc, _, doc = merge([_fake_record("gfx1100", cand), _fake_record("gfx1201", cand),
+                        _fake_record("gfx-rented", cand)], rented=["gfx-rented"])
+    t(rc == 0 and doc["classes"]["gfx-rented"]["status"] == "green", "--rented class with green record -> green")
+    rc, _, doc = merge([_fake_record("gfx1100", cand), _fake_record("gfx1201", cand),
+                        _fake_record("gfx942", cand, verdict="red")], rented=["gfx942"])
+    t(rc == 0, "--rented never makes a secondary class blocking")
     rc, _, _ = merge([_fake_record("gfx1100", cand), _fake_record("gfx1100", cand), _fake_record("gfx1201", cand)])
     t(rc == 1, "two records for one class -> red")
     rc, _, _ = merge([_fake_record("gfx1100", cand)], allow_down=["gfx9999"])
@@ -1167,14 +1208,24 @@ def _self_test_merge(t, scratch, repo, release_sha):
         write_json(os.path.join(rel, cls + ".json"), _fake_record(cls, sha))
     ns = argparse.Namespace(sha=sha, records=rel, repo=repo)
     rc, text, _ = _call(cmd_check_release, ns, SELF_POLICY)
-    t(rc == 0 and text.startswith("RELEASE GREEN"), "check-release green with every class green and no waivers (%s)" % text)
+    t(rc == 0 and text.startswith("RELEASE GREEN") and "secondary: gfx942 green" in text,
+      "check-release green with every class green and no waivers (%s)" % text)
     os.remove(os.path.join(rel, "gfx942.json"))
     rc, text, _ = _call(cmd_check_release, ns, SELF_POLICY)
-    t(rc == 1 and "gfx942" in text, "check-release needs the rented class too")
-    write_json(os.path.join(rel, "gfx942.json"), _fake_record("gfx942", sha, waived=True))
+    t(rc == 0 and text.startswith("RELEASE GREEN") and "secondary: gfx942 no record" in text,
+      "check-release is green without a secondary record (%s)" % text)
+    write_json(os.path.join(rel, "gfx942.json"), _fake_record("gfx942", sha, verdict="red"))
+    rc, text, _ = _call(cmd_check_release, ns, SELF_POLICY)
+    t(rc == 0 and "secondary: gfx942 red" in text and "warning: secondary class gfx942" in text,
+      "a red secondary record warns but check-release stays green (%s)" % text)
+    os.remove(os.path.join(rel, "gfx942.json"))
+    os.remove(os.path.join(rel, "gfx-rented.json"))
+    rc, text, _ = _call(cmd_check_release, ns, SELF_POLICY)
+    t(rc == 1 and "gfx-rented" in text, "check-release needs the rented class too")
+    write_json(os.path.join(rel, "gfx-rented.json"), _fake_record("gfx-rented", sha, waived=True))
     rc, text, _ = _call(cmd_check_release, ns, SELF_POLICY)
     t(rc == 1 and "waived" in text, "check-release rejects a waived record")
-    write_json(os.path.join(rel, "gfx942.json"), _fake_record("gfx942", "e" * 40))
+    write_json(os.path.join(rel, "gfx-rented.json"), _fake_record("gfx-rented", "e" * 40))
     rc, _, _ = _call(cmd_check_release, ns, SELF_POLICY)
     t(rc == 1, "check-release ignores records for another sha")
 

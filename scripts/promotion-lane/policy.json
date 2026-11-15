@@ -12,7 +12,7 @@
       "required": ["dense-27b-ar", "dflash-think-close", "cold-archive-9b", "cold-archive-27b", "cold-archive-a3b", "cold-archive-flashnext"]
     },
     "gfx942": {
-      "gate": "rented",
+      "gate": "secondary",
       "budget_minutes": 60,
       "required": ["dense-27b-ar", "dflash-think-close", "cold-archive-9b", "cold-archive-27b", "cold-archive-a3b"]
     }
