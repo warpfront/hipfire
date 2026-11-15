@@ -11,6 +11,7 @@
 
 pub mod calibration;
 pub mod devices;
+pub mod dflash_floor;
 pub mod effective;
 pub mod emu;
 pub mod emu_budget;

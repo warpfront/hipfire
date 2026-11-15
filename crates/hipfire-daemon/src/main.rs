@@ -803,6 +803,27 @@ fn no_model_loaded_suffix(model_present: bool) -> &'static str {
     }
 }
 
+/// The registry DFlash VRAM floor (#1151) of a load request against the
+/// device's total VRAM (`Gpu::device_mem_info`; `None` when unreadable):
+/// `params.dflash_min_vram_gb` is what the CLI sends beside a registry draft.
+/// Callers apply it only to a `params.draft`, never to `HIPFIRE_DFLASH_DRAFT`.
+fn dflash_vram_floor_gate(
+    msg: &serde_json::Value,
+    dflash_mode: &str,
+    device_total_bytes: Option<u64>,
+) -> hipfire_config::dflash_floor::DflashVramGate {
+    let floor = msg
+        .get("params")
+        .and_then(|p| p.get(hipfire_config::dflash_floor::DFLASH_MIN_VRAM_PARAM))
+        .and_then(serde_json::Value::as_f64);
+    hipfire_config::dflash_floor::dflash_vram_gate(dflash_mode, floor, device_total_bytes)
+}
+
+/// Total VRAM of the load device, for [`dflash_vram_floor_gate`].
+fn device_total_bytes(gpu: &rdna_compute::Gpu) -> Option<u64> {
+    gpu.device_mem_info().ok().map(|(_, total)| total as u64)
+}
+
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
 /// the panic shape we used to emit (which dumped a Rust backtrace and the
 /// raw HipError debug-format) but turns it into a concrete next-step list.
@@ -1554,7 +1575,8 @@ fn main() {
                         .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
-                    let slot_params = slots::SlotLoadParams::from_load_msg(&msg);
+                    let slot_params =
+                        slots::SlotLoadParams::from_load_msg(&msg, device_total_bytes(&gpu));
                     // Vision tower: the SAME ladder the ordinary arm applies
                     // (`vision_mode=off` is a hard override). The slot engine
                     // discovers the `.vl` sibling itself, so it has to be told
@@ -1770,6 +1792,15 @@ fn main() {
                     .and_then(|p| p.get("tp"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1);
+                // Registry DFlash VRAM floor (#1151): the CLI sends the card's
+                // `dflash_min_vram_gb` beside the registry draft it wired; a
+                // developer-forced draft is never floored.
+                let floor_gate = match (&raw_draft, &env_draft) {
+                    (Some(_), None) => {
+                        dflash_vram_floor_gate(&msg, dflash_mode, device_total_bytes(&gpu))
+                    }
+                    _ => hipfire_config::dflash_floor::DflashVramGate::Pair,
+                };
                 let draft_path = if dflash_mode == "off" {
                     if let Some(d) = &raw_draft {
                         eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({d})");
@@ -1801,7 +1832,25 @@ fn main() {
                         );
                     }
                     None
+                } else if let hipfire_config::dflash_floor::DflashVramGate::Skip(reason) =
+                    &floor_gate
+                {
+                    if let Some(d) = &raw_draft {
+                        eprintln!(
+                            "[hipfire-daemon] dflash_mode=auto — DFlash draft not paired: {reason}; skipping draft load ({d})"
+                        );
+                    }
+                    hipfire_config::load_summary::note(
+                        hipfire_config::load_summary::Facet::SpecOff,
+                        format!("DFlash off: {reason}"),
+                    );
+                    None
                 } else {
+                    if let hipfire_config::dflash_floor::DflashVramGate::Forced(warning) =
+                        &floor_gate
+                    {
+                        eprintln!("[hipfire-daemon] warning: {warning}");
+                    }
                     if raw_draft.is_none() {
                         hipfire_config::load_summary::note(
                             hipfire_config::load_summary::Facet::SpecOff,

@@ -5402,9 +5402,7 @@ pub(crate) fn resolve_dflash_sidecar(
 ) -> Result<()> {
     match locate_dflash_sidecar(params, entry, models_dir, model_path)? {
         DflashSidecar::Unresolved => {}
-        DflashSidecar::Found(candidate) => {
-            params["draft"] = serde_json::json!(candidate.display().to_string());
-        }
+        DflashSidecar::Found(candidate) => wire_registry_draft(params, &candidate, entry),
         DflashSidecar::NotPulled(file) => {
             if params["dflash_mode"].as_str() == Some("on") {
                 bail!(dflash_draft_not_pulled(&file, tag));
@@ -5416,6 +5414,22 @@ pub(crate) fn resolve_dflash_sidecar(
         }
     }
     Ok(())
+}
+
+/// Wire a found registry DFlash draft into `params["draft"]`, beside the
+/// card's `dflash_min_vram_gb` (as `hipfire_config::dflash_floor::DFLASH_MIN_VRAM_PARAM`):
+/// the daemon checks that floor against the device it loads on, so `auto`
+/// skips the draft on a smaller card (#1151). An explicit draft never carries
+/// a floor.
+pub(crate) fn wire_registry_draft(
+    params: &mut serde_json::Value,
+    draft: &Path,
+    entry: Option<&ModelEntry>,
+) {
+    params["draft"] = serde_json::json!(draft.display().to_string());
+    if let Some(floor) = entry.and_then(|entry| entry.dflash_min_vram_gb) {
+        params[hipfire_config::dflash_floor::DFLASH_MIN_VRAM_PARAM] = serde_json::json!(floor);
+    }
 }
 
 /// What [`locate_dflash_sidecar`] found for the final DFlash mode.
@@ -13757,6 +13771,46 @@ effort = "high"
         .unwrap();
         assert_eq!(params["dflash_mode"], "auto");
         assert_eq!(params["draft"], draft_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn registry_dflash_draft_carries_its_vram_floor_and_an_explicit_one_does_not() {
+        // #1151: the card's dflash_min_vram_gb rides beside the registry
+        // draft for the daemon's device check; a developer draft is unfloored.
+        let paths = test_paths("dflash-sidecar-floor");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let draft_path = paths.models.join("qwen35-9b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let mut entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        entry.dflash_min_vram_gb = Some(28.0);
+        let params_for = |entry: &ModelEntry, explicit: Option<&str>| {
+            load_params(
+                &resolved_with_dflash_mode("auto", explicit),
+                Some(entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                Some("qwen3.5:9b"),
+                false,
+                None,
+            )
+            .unwrap()
+        };
+        let floor_key = hipfire_config::dflash_floor::DFLASH_MIN_VRAM_PARAM;
+        let paired = params_for(&entry, None);
+        assert_eq!(paired["draft"], draft_path.display().to_string());
+        assert_eq!(paired[floor_key], 28.0);
+        let explicit = params_for(&entry, Some("/models/custom-draft.hfq"));
+        assert_eq!(explicit["draft"], "/models/custom-draft.hfq");
+        assert!(explicit.get(floor_key).is_none());
+        // A card without a floor sends none.
+        entry.dflash_min_vram_gb = None;
+        assert!(params_for(&entry, None).get(floor_key).is_none());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 

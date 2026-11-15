@@ -170,6 +170,30 @@ def test_flash_next_short_alias_invariant_rejects_drift(monkeypatch, target):
     assert any("qwen3.8:flash must alias" in error for error in errors)
 
 
+@pytest.mark.parametrize(
+    "floor,keep_draft,needle",
+    [
+        (0, True, "invalid dflash_min_vram_gb"),
+        ("28", True, "invalid dflash_min_vram_gb"),
+        (28, False, "dflash_min_vram_gb without a dflash draft"),
+    ],
+)
+def test_dflash_min_vram_gb_is_validated(monkeypatch, floor, keep_draft, needle):
+    v1 = _load(REPO_ROOT / "registry" / "v1.json")
+    curated = _load(REPO_ROOT / "registry" / "models.json")
+    trees = _trees_from(v1)
+    monkeypatch.setattr(rg, "repo_tree", lambda repo, token: trees[repo])
+    monkeypatch.setattr(rg, "log", lambda msg: None)
+    entry = curated["models"]["qwen3.8:27b-mq5"]
+    assert entry["dflash_min_vram_gb"] > 0 and isinstance(entry["dflash"], dict)
+    entry["dflash_min_vram_gb"] = floor
+    if not keep_draft:
+        del entry["dflash"]
+    registry, errors = rg.build_registry(curated, None)
+    assert registry is None
+    assert any(needle in error for error in errors), errors
+
+
 def _rust_str_list(name: str) -> set[str]:
     src = (REPO_ROOT / "crates" / "hipfire-config" / "src" / "lib.rs").read_text()
     m = re.search(rf"const {name}: &\[&str\] = &\[(.*?)\];", src, re.S)

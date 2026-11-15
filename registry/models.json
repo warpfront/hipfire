@@ -1021,6 +1021,10 @@
           "reasoning_effort": "medium"
         }
       },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq5.hfq"
+      },
+      "dflash_min_vram_gb": 28,
       "mtp": {
         "file": "qwen3.8-27b.mtp",
         "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
@@ -1059,6 +1063,10 @@
           "reasoning_effort": "medium"
         }
       },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq5.hfq"
+      },
+      "dflash_min_vram_gb": 28,
       "mtp": {
         "file": "qwen3.8-27b.mtp",
         "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
@@ -1097,6 +1105,10 @@
           "reasoning_effort": "medium"
         }
       },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq5.hfq"
+      },
+      "dflash_min_vram_gb": 28,
       "mtp": {
         "file": "qwen3.8-27b.mtp",
         "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",

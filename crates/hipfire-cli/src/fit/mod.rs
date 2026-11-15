@@ -651,7 +651,7 @@ fn analyze_model(
         .map(|m| m.len())
         .or(result.model.size_bytes);
     let FitLoad {
-        params,
+        mut params,
         selector,
         draft_missing,
     } = match model_params(paths, input, Some(tag), entry, &path, args) {
@@ -670,6 +670,7 @@ fn analyze_model(
     let Some(device) = machine.devices.first() else {
         return Ok(result);
     };
+    apply_dflash_vram_floor(&mut params, device, &mut result.notes);
     let inputs = admission_inputs(&params);
     let admitted = match inputs.admit(&path, device) {
         Ok(admitted) => admitted,
@@ -922,7 +923,7 @@ fn model_params(
     {
         crate::DflashSidecar::Unresolved => None,
         crate::DflashSidecar::Found(draft) => {
-            params["draft"] = json!(draft.display().to_string());
+            crate::wire_registry_draft(&mut params, &draft, entry);
             None
         }
         crate::DflashSidecar::NotPulled(file) => Some(MissingDraft {
@@ -952,8 +953,12 @@ fn model_params(
         if let Ok(value) = hipfire_config::developer_var(variable) {
             params[key] = json!(value);
             if key == "draft" {
-                // The ladder names the draft (or opts out): none is missing.
+                // The ladder names the draft (or opts out): none is missing,
+                // and the daemon applies no registry floor to it.
                 draft_missing = None;
+                if let Some(params) = params.as_object_mut() {
+                    params.remove(hipfire_config::dflash_floor::DFLASH_MIN_VRAM_PARAM);
+                }
             }
         }
     }
@@ -1026,6 +1031,34 @@ fn report_missing_draft(result: &mut Analysis, params: &Value, tag: &str, missin
             "DFlash draft {} is not installed{size}; speculation.dflash = auto runs without it, `hipfire pull {tag}` fetches it",
             missing.file
         ));
+    }
+}
+
+/// The daemon's registry DFlash VRAM floor (#1151) for the planned device:
+/// below `dflash_min_vram_gb`, `auto` loads no draft and `on` loads it with a
+/// warning. Fit reads a discrete card's `mem_info_vram_total`; it does not
+/// model the HIP pool total of a unified-memory device, so that plans paired.
+fn apply_dflash_vram_floor(params: &mut Value, device: &FitDevice, notes: &mut Vec<String>) {
+    use hipfire_config::dflash_floor::{dflash_vram_gate, DflashVramGate, DFLASH_MIN_VRAM_PARAM};
+    if str_param(params, "draft").is_none() {
+        return;
+    }
+    let total = device.vram_total.filter(|_| !device.unified_memory);
+    match dflash_vram_gate(
+        params["dflash_mode"].as_str().unwrap_or("auto"),
+        params[DFLASH_MIN_VRAM_PARAM].as_f64(),
+        total,
+    ) {
+        DflashVramGate::Pair => {}
+        DflashVramGate::Skip(reason) => {
+            if let Some(params) = params.as_object_mut() {
+                params.remove("draft");
+            }
+            notes.push(format!(
+                "DFlash draft not paired: {reason}; speculation.dflash = on forces it"
+            ));
+        }
+        DflashVramGate::Forced(warning) => notes.push(warning),
     }
 }
 
@@ -1968,6 +2001,34 @@ mod tests {
             historical: false,
             note: None,
         }
+    }
+
+    #[test]
+    fn dflash_vram_floor_drops_the_auto_draft_on_a_smaller_card() {
+        // #1151, mirroring the daemon: a simulated 24 GB card is below a
+        // 28 GiB floor, the 32 GB test card clears it.
+        let params = |mode: &str| {
+            json!({"dflash_mode": mode, "draft": "/m/qwen38-27b-dflash-mq5.hfq",
+                "dflash_min_vram_gb": 28.0})
+        };
+        let xtx = FitDevice {
+            arch: "gfx1100".into(),
+            vram_total: Some(25_753_026_560),
+            ..device()
+        };
+        let mut notes = Vec::new();
+        let mut auto = params("auto");
+        apply_dflash_vram_floor(&mut auto, &xtx, &mut notes);
+        assert!(auto.get("draft").is_none());
+        assert!(notes[0].contains("DFlash draft not paired"), "{notes:?}");
+        let mut on = params("on");
+        apply_dflash_vram_floor(&mut on, &xtx, &mut notes);
+        assert!(on.get("draft").is_some());
+        assert!(notes[1].contains("speculation.dflash = on"), "{notes:?}");
+        let mut paired = params("auto");
+        apply_dflash_vram_floor(&mut paired, &device(), &mut notes);
+        assert!(paired.get("draft").is_some());
+        assert_eq!(notes.len(), 2);
     }
 
     fn report() -> Report {

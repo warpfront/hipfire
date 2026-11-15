@@ -996,6 +996,16 @@ pub struct ModelEntry {
     pub vae: Option<Sidecar>,
     #[serde(default)]
     pub dflash: Option<Sidecar>,
+    /// Smallest total device VRAM, in GiB (the unit of `min_vram_gb`), on
+    /// which `speculation.dflash = auto` pairs the `dflash` draft. Absent:
+    /// always pair. The CLI sends it beside the registry draft it wires and
+    /// the daemon checks it against the device it loads on: below it `auto`
+    /// skips the draft, an explicit `on` still loads it with a warning
+    /// (`hipfire_config::dflash_floor`). Set where the draft and KV growth
+    /// outgrow a smaller card (Qwen3.8-27B MQ5V2, #1151). Requires
+    /// `dflash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dflash_min_vram_gb: Option<f64>,
     /// Opt-in gfx1151 XDNA NPU spillover sidecar (`.xdna.zip` with manifest
     /// v1). Capability data only: `kernel.npu_spillover` must also be on, the
     /// archive must verify, and the host arch must be exactly `gfx1151`.
@@ -1190,7 +1200,8 @@ const RAON_DFLASH_AUTO_TAG: &str = "raon-1-mini-preview";
 /// Qwen3.8-27B trunk tiers (`qwen3.8:27b` and `qwen3.8:27b-*`, never a
 /// longer lookalike such as `27boops`) that declare a paired `dflash` sidecar
 /// also lower `speculation.dflash = "auto"`. The load resolver wires the draft
-/// only when that registry-declared file is present; without it MTP `auto`
+/// only when that registry-declared file is present, and the daemon drops it
+/// on a device below the entry's `dflash_min_vram_gb`; without it MTP `auto`
 /// stays in effect. The schema/BuiltIn default stays `off` for every other
 /// model; `arch_id=16`, draft/dflash sidecars, and tiers with no `dflash`
 /// declaration get no speculation policy.
@@ -1441,6 +1452,18 @@ impl RegistryV1 {
                     return Err(fail(format!("model '{tag}' has an empty sidecar file")));
                 }
                 validate_digest(sidecar.sha256.as_deref(), tag).map_err(fail)?;
+            }
+            if let Some(floor) = entry.dflash_min_vram_gb {
+                if !floor.is_finite() || floor <= 0.0 {
+                    return Err(fail(format!(
+                        "model '{tag}' has invalid dflash_min_vram_gb {floor}"
+                    )));
+                }
+                if entry.dflash.is_none() {
+                    return Err(fail(format!(
+                        "model '{tag}' sets dflash_min_vram_gb without a dflash draft"
+                    )));
+                }
             }
             for (key, sidecar) in &entry.ple {
                 let slot = format!("ple.{key}");
@@ -5032,9 +5055,10 @@ mod tests {
     #[test]
     fn bundled_dflash_auto_matches_only_declared_qwen38_27b_tiers() {
         // Source-grounded against checked-in registry/v1.json: DFlash-paired
-        // Qwen3.8-27B trunk tiers lower `auto`; mq5/mq6 tiers (no dflash
-        // declaration), Flash-Next, drafts, and other families do not; the
-        // explicit `raon-1-mini-preview` allow-list entry lowers it too.
+        // Qwen3.8-27B trunk tiers (mq5 included; the daemon applies its
+        // VRAM floor at load) lower `auto`; Flash-Next, drafts, and other
+        // families do not; the explicit `raon-1-mini-preview` allow-list
+        // entry lowers it too.
         let registry = bundled().unwrap();
         let mut auto_tiers = 0;
         for (tag, entry) in &registry.models {
@@ -5068,6 +5092,8 @@ mod tests {
             "qwen3.8:27b-mq4-xt",
             "qwen3.8:27b-mq4-xts",
             "qwen3.8:27b-mq4-pro",
+            "qwen3.8:27b-mq5",
+            "qwen3.8:27b-mq5-pro",
         ] {
             let (resolved, entry) = registry.model(tag).unwrap();
             assert!(entry.dflash.is_some(), "{tag} declares a DFlash draft");
@@ -5080,7 +5106,7 @@ mod tests {
             );
         }
         for tag in [
-            "qwen3.8:27b-mq5",
+            "qwen3.8:27b-mq6",
             "qwen3.8:27b-mq6-pro",
             "qwen3.8:flash-next",
             "qwen3.8:27b-draft-mq4",
@@ -5109,6 +5135,111 @@ mod tests {
                 "{alias}->{resolved}"
             );
         }
+    }
+
+    /// The DFlash VRAM floor the bundled Qwen3.8-27B MQ5V2 tiers declare
+    /// (#1151: measured peak VRAM with the draft on a 32 GB card, plus margin).
+    const QWEN38_27B_MQ5_DFLASH_FLOOR_GB: f64 = 28.0;
+
+    #[test]
+    fn bundled_qwen38_27b_mq5_pairs_its_draft_above_the_vram_floor() {
+        use hipfire_config::dflash_floor::{dflash_vram_gate, DflashVramGate};
+        // `mem_info_vram_total` of a 7900 XTX (24 GB) and an R9700 (32 GB).
+        const XTX_24GB: u64 = 25_753_026_560;
+        const R9700_32GB: u64 = 34_208_743_424;
+        let registry = bundled().unwrap();
+        let floored: Vec<&str> = registry
+            .models
+            .iter()
+            .filter(|(_, entry)| entry.dflash_min_vram_gb.is_some())
+            .map(|(tag, _)| tag.as_str())
+            .collect();
+        assert_eq!(
+            floored,
+            [
+                "qwen3.8:27b-mq5",
+                "qwen3.8:27b-mq5-pro",
+                "qwen3.8:27b-mq5-xt"
+            ],
+            "only the Qwen3.8-27B MQ5V2 tiers carry a DFlash floor"
+        );
+        for tag in floored {
+            let entry = &registry.models[tag];
+            let draft = entry.dflash.as_ref().expect("floored tiers pair a draft");
+            assert_eq!(draft.file, "qwen38-27b-dflash-mq5.hfq", "{tag}");
+            assert!(
+                draft.sha256.is_some() && draft.size_bytes.is_some(),
+                "{tag}"
+            );
+            let floor = entry.dflash_min_vram_gb;
+            assert_eq!(floor, Some(QWEN38_27B_MQ5_DFLASH_FLOOR_GB), "{tag}");
+            // 24 GB: `auto` skips the draft, `on` forces it with a warning.
+            assert!(
+                matches!(
+                    dflash_vram_gate("auto", floor, Some(XTX_24GB)),
+                    DflashVramGate::Skip(_)
+                ),
+                "{tag}"
+            );
+            assert!(
+                matches!(
+                    dflash_vram_gate("on", floor, Some(XTX_24GB)),
+                    DflashVramGate::Forced(_)
+                ),
+                "{tag}"
+            );
+            // 32 GB: paired.
+            assert_eq!(
+                dflash_vram_gate("auto", floor, Some(R9700_32GB)),
+                DflashVramGate::Pair,
+                "{tag}"
+            );
+        }
+        // MQ4-and-below tiers pair everywhere; MQ6V2 stays unpaired.
+        let (_, mq4) = registry.model("qwen3.8:27b").unwrap();
+        assert!(mq4.dflash.is_some() && mq4.dflash_min_vram_gb.is_none());
+        let (_, mq6) = registry.model("qwen3.8:27b-mq6").unwrap();
+        assert!(mq6.dflash.is_none());
+    }
+
+    #[test]
+    fn dflash_min_vram_gb_must_be_positive_and_needs_a_draft() {
+        let parse = |extra: &str| {
+            RegistryV1::parse(
+                &format!(
+                    r#"{{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{{
+                        "qwen3.8:27b-mq5":{{"repo":"x","file":"qwen3.8-27b.mq5","size_gb":1,"min_vram_gb":1,"desc":"x"{extra}}}}},"aliases":{{}}}}"#
+                ),
+                "test",
+            )
+        };
+        let draft = r#","dflash":{"file":"qwen38-27b-dflash-mq5.hfq"}"#;
+        let ok = parse(&format!(r#"{draft},"dflash_min_vram_gb":28"#)).unwrap();
+        assert_eq!(ok.models["qwen3.8:27b-mq5"].dflash_min_vram_gb, Some(28.0));
+        for (extra, needle) in [
+            (
+                r#","dflash_min_vram_gb":28"#.to_owned(),
+                "without a dflash draft",
+            ),
+            (
+                format!(r#"{draft},"dflash_min_vram_gb":0"#),
+                "invalid dflash_min_vram_gb",
+            ),
+            (
+                format!(r#"{draft},"dflash_min_vram_gb":-4"#),
+                "invalid dflash_min_vram_gb",
+            ),
+        ] {
+            let error = parse(&extra).unwrap_err().to_string();
+            assert!(error.contains(needle), "{extra}: {error}");
+        }
+        // Serializing an entry without a floor writes no key, so a cache an
+        // older client reads back parses under its strict schema.
+        let registry = bundled().unwrap();
+        let mq4 = &registry.models["qwen3.8:27b"];
+        assert!(!serde_json::to_string(mq4)
+            .unwrap()
+            .contains("dflash_min_vram_gb"));
     }
 
     #[test]

@@ -143,7 +143,9 @@ pub struct SlotLoadParams {
 }
 
 impl SlotLoadParams {
-    pub fn from_load_msg(msg: &serde_json::Value) -> Self {
+    /// `device_total_bytes` is the load device's total VRAM, for the registry
+    /// DFlash floor (`crate::dflash_vram_floor_gate`).
+    pub fn from_load_msg(msg: &serde_json::Value, device_total_bytes: Option<u64>) -> Self {
         let param = |k: &str| msg.get("params").and_then(|p| p.get(k));
         let param_str = |k: &str| param(k).and_then(|v| v.as_str());
         // `mtp_mode` on/auto only requests a depth here (`mtp_k` > 0); `off`
@@ -188,17 +190,20 @@ impl SlotLoadParams {
             )
         };
         // DFlash2 draft: HIPFIRE_DFLASH_DRAFT (non-empty wins, empty opts out)
-        // > params.draft; dflash_mode=off suppresses either way.
+        // > params.draft; dflash_mode=off suppresses either way, and `auto`
+        // skips a params.draft below its registry VRAM floor (#1151).
         let dflash_mode = param_str("dflash_mode").unwrap_or("auto");
-        let raw_draft: Option<String> = match hipfire_config::developer_var("HIPFIRE_DFLASH_DRAFT")
-            .ok()
-            .as_deref()
-        {
+        let env_draft = hipfire_config::developer_var("HIPFIRE_DFLASH_DRAFT").ok();
+        let raw_draft: Option<String> = match env_draft.as_deref() {
             Some("") => None,
             Some(p) => Some(p.to_string()),
             None => param_str("draft")
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
+        };
+        let floor_gate = match (&raw_draft, &env_draft) {
+            (Some(_), None) => crate::dflash_vram_floor_gate(msg, dflash_mode, device_total_bytes),
+            _ => hipfire_config::dflash_floor::DflashVramGate::Pair,
         };
         let dflash_draft = if dflash_mode == "off" {
             if let Some(d) = raw_draft {
@@ -206,7 +211,21 @@ impl SlotLoadParams {
             }
             None
         } else {
-            raw_draft.map(PathBuf::from)
+            match floor_gate {
+                hipfire_config::dflash_floor::DflashVramGate::Skip(reason) => {
+                    if let Some(d) = raw_draft {
+                        eprintln!(
+                            "[hipfire-daemon] dflash_mode=auto — DFlash draft not paired: {reason}; skipping draft load ({d})"
+                        );
+                    }
+                    None
+                }
+                hipfire_config::dflash_floor::DflashVramGate::Forced(warning) => {
+                    eprintln!("[hipfire-daemon] warning: {warning}");
+                    raw_draft.map(PathBuf::from)
+                }
+                hipfire_config::dflash_floor::DflashVramGate::Pair => raw_draft.map(PathBuf::from),
+            }
         };
         Self {
             mtp_k,
@@ -3263,7 +3282,7 @@ mod tests {
         // are indistinguishable downstream when only mtp_k travels, and a
         // check alone cannot restore the distinction.
         let parse = |params: serde_json::Value| {
-            SlotLoadParams::from_load_msg(&serde_json::json!({ "params": params }))
+            SlotLoadParams::from_load_msg(&serde_json::json!({ "params": params }), None)
         };
         // Absent and off: Off with k forced to 0 (verbatim rule).
         for params in [
@@ -3289,6 +3308,32 @@ mod tests {
         let on_k = parse(serde_json::json!({ "mtp_mode": "on", "mtp_k": 2 }));
         assert_eq!(on_k.mtp_mode, hipfire_config::MtpMode::On);
         assert_eq!(on_k.mtp_k, 2);
+    }
+
+    #[test]
+    fn slot_draft_honours_the_registry_vram_floor() {
+        // `mem_info_vram_total` of a 7900 XTX (24 GB) and an R9700 (32 GB).
+        const XTX_24GB: u64 = 25_753_026_560;
+        const R9700_32GB: u64 = 34_208_743_424;
+        let parse = |mode: &str, total: u64| {
+            SlotLoadParams::from_load_msg(
+                &serde_json::json!({ "params": {
+                    "dflash_mode": mode,
+                    "draft": "/models/qwen38-27b-dflash-mq5.hfq",
+                    "dflash_min_vram_gb": 28.0,
+                }}),
+                Some(total),
+            )
+        };
+        // Simulated 24 GB card: auto skips the draft; on still loads it.
+        assert_eq!(parse("auto", XTX_24GB).dflash_draft, None);
+        let forced = parse("on", XTX_24GB);
+        assert!(forced.dflash_draft.is_some() && forced.dflash_required);
+        // 32 GB card: auto pairs.
+        assert_eq!(
+            parse("auto", R9700_32GB).dflash_draft,
+            Some(PathBuf::from("/models/qwen38-27b-dflash-mq5.hfq"))
+        );
     }
 
     /// P10: a generate with no sampling fields resolves on the multi-slot

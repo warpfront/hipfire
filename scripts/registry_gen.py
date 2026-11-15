@@ -630,6 +630,15 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                 f"{tag}: invalid default_tool_format {tool_format!r} "
                 f"(allowed: {sorted(KNOWN_TOOL_FORMATS)})"
             )
+        # Optional DFlash VRAM floor (GiB, carried verbatim): the daemon skips
+        # the `dflash` draft under `auto` on a smaller device. Fail-closed,
+        # matching hipfire-registry.
+        floor = entry.get("dflash_min_vram_gb")
+        if floor is not None:
+            if isinstance(floor, bool) or not isinstance(floor, (int, float)) or not floor > 0:
+                errors.append(f"{tag}: invalid dflash_min_vram_gb {floor!r} (positive GiB)")
+            if not isinstance(entry.get("dflash"), dict):
+                errors.append(f"{tag}: dflash_min_vram_gb without a dflash draft")
         # Optional curated recommended_settings (carried verbatim by deepcopy).
         # Validate bounds — fail-closed, matching hipfire-registry.
         validate_recommended_settings(tag, entry.get("recommended_settings"), errors)
