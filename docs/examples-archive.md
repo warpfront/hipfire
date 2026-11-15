@@ -81,3 +81,13 @@ git show <sha>:<path> > <path>
 | `tmp_scratch_leak_probe` | `crates/rdna-compute/examples/tmp_scratch_leak_probe.rs` | `bf6ec9ddf240` | 133 | Scratch-leak probe (gate 1 of the grow_scratch_buffer leak fix). |
 | `tp_peer_push_probe` | `crates/rdna-compute/examples/tp_peer_push_probe.rs` | `127dbb74eac3` | 1284 | Lab microbench: in-kernel peer-VRAM push + system-scope flag collective against the incumbent TP2 tp_graph_signal_reduce_gfx1100 collective, on two exact gfx1201 cards. |
 | `wmma_zero_sign_probe` | `crates/rdna-compute/examples/wmma_zero_sign_probe.rs` | `b2e67a8ab9ca` | 134 | gfx11 WMMA zero-sign probe: output element 0 = A[0][0]*B[0][0] + masked partners A[0][k>=1] * (+0) + C. |
+
+## saddle-lab
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `a3b_load_check` | `crates/saddle-lab/examples/a3b_load_check.rs` | `77a471b33efa` | 92 | Phase 1 smoke test: load Qwen3.5-35B-A3B (or any qwen3_5_moe HFQ) end-to-end and report success/failure. |
+| `gpus_smoke` | `crates/saddle-lab/examples/gpus_smoke.rs` | `a0fca0d6db3f` | 111 | Smoke test for Gpus orchestrator: init_uniform layer split, peer enable, boundary_copy + wait_boundary round-trip. |
+| `infer_qwen3` | `crates/saddle-lab/examples/infer_qwen3.rs` | `d52ddaf3bae0` | 495 | Run inference on a .hfq (hipfire-quantized) model. |
+| `test_qwen35_load` | `crates/saddle-lab/examples/test_qwen35_load.rs` | `77a471b33efa` | 159 | Minimal test: load Qwen3.5 HFQ, parse config, print layer types. |
+| `test_qwen35_loadQA` | `crates/saddle-lab/examples/test_qwen35_loadQA.rs` | `77a471b33efa` | 185 | QA mirror for Qwen3.5 HFQ loading and config validation. |

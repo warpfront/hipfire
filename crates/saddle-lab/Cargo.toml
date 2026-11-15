@@ -50,17 +50,11 @@ libc = "0.2"
 name = "hfq_split"
 required-features = []
 
-[[example]]
-name = "gpus_smoke"
-required-features = []
 
 [[example]]
 name = "infer_qwen35"
 required-features = ["arch-qwen35"]
 
-[[example]]
-name = "infer_qwen3"
-required-features = ["arch-llama"]
 
 [[example]]
 name = "infer_vl"
@@ -78,9 +72,6 @@ required-features = ["arch-llama"]
 name = "run"
 required-features = ["arch-qwen35", "deltanet"]
 
-[[example]]
-name = "a3b_load_check"
-required-features = ["arch-qwen35"]
 
 [[example]]
 name = "a3b_multiturn_oneshot"
@@ -174,13 +165,7 @@ required-features = ["arch-qwen35"]
 name = "test_long_ctx"
 required-features = ["arch-qwen35"]
 
-[[example]]
-name = "test_qwen35_load"
-required-features = ["arch-qwen35"]
 
-[[example]]
-name = "test_qwen35_loadQA"
-required-features = ["arch-qwen35"]
 
 [[example]]
 name = "test_forward_slots_golden"
