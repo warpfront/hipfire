@@ -516,15 +516,30 @@ impl DspineBridge {
         let pick = (|| -> hip_bridge::HipResult<Vec<u32>> {
             let mut cap_dir: Option<String> = None;
             let t0 = std::time::Instant::now();
+            // HIPFIRE_DSPINE_REFINE_TS=1: event span over the refine cluster
+            // (topk + head_rows + base_pre + chain) reported next to the wall
+            // span. Dev-only; events are absent when the env is unset.
+            let ts = hipfire_config::developer_var("HIPFIRE_DSPINE_REFINE_TS")
+                .as_deref()
+                == Ok("1");
+            let mut ev_start = if ts { gpu.hip.event_create().ok() } else { None };
+            let mut ev_end = if ts { gpu.hip.event_create().ok() } else { None };
+            if let Some(e) = ev_start.as_ref() {
+                let _ = gpu.hip.event_record(e, None);
+            }
             // Upstream lattice (build_dspine_lattice): candidates from the
             // post-write logits, then EXACT per-(candidate, predecessor)
             // bridge-write recomputation — no sender-table approximation.
             gpu.topk_values_batched_f32(logits_post, &cand, &base, vocab, 16, rows)?;
             let t_topk = t0.elapsed();
             if mode_argmax {
+                if let Some(e) = ev_end.as_ref() {
+                    let _ = gpu.hip.event_record(e, None);
+                }
                 // stream-ordered: the null-stream readback drains the whole
                 // queue and would dominate this control arm's window time.
                 let raw = gpu.download_f32_stream_ordered(&cand)?;
+                refine_ts_report(gpu, ev_start.take(), ev_end.take(), "argmax", rows, t0);
                 return Ok((0..rows).map(|i| raw[i * 16].to_bits()).collect());
             }
             // stream-ordered: the plain readback blocks on the legacy null
@@ -624,7 +639,11 @@ impl DspineBridge {
                     3 * self.r,
                     self.rms_scale(),
                 )?;
+                if let Some(e) = ev_end.as_ref() {
+                    let _ = gpu.hip.event_record(e, None);
+                }
                 let ids = gpu.download_f32_stream_ordered(&out)?;
+                refine_ts_report(gpu, ev_start.take(), ev_end.take(), "table", rows, t0);
                 let picks_v: Vec<u32> = (0..rows).map(|i| ids[i].to_bits()).collect();
                 if hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_CAPTURE")
                     .as_deref()
@@ -688,6 +707,9 @@ impl DspineBridge {
                 self.r,
                 self.c,
             )?;
+            if let Some(e) = ev_end.as_ref() {
+                let _ = gpu.hip.event_record(e, None);
+            }
             let t_launch = t0.elapsed();
             if timing {
                 // Null-stream readback forces the whole queue to drain, so
@@ -710,6 +732,7 @@ impl DspineBridge {
             let scores_h = gpu.download_f32_stream_ordered(&scores)?;
             let cand_h = gpu.download_f32_stream_ordered(&cand)?;
             let t_dl = t0.elapsed();
+            refine_ts_report(gpu, ev_start.take(), ev_end.take(), "exact", rows, t0);
             if hipfire_config::developer_var("HIPFIRE_DSPINE_SERIAL_CAPTURE")
                 .as_deref()
                 == Ok("1")
@@ -1526,4 +1549,31 @@ mod tests {
         let cfg = DspineConfig::from_metadata(&with_tables).unwrap().unwrap();
         assert!(cfg.serial_tables, "converter --target-hfq pass must flag tables");
     }
+}
+
+
+/// `HIPFIRE_DSPINE_REFINE_TS=1`: report the refine cluster's device span next
+/// to the whole `serial_refine` wall span (queue wait + kernels + D2H).
+fn refine_ts_report(
+    gpu: &rdna_compute::Gpu,
+    start: Option<hip_bridge::Event>,
+    end: Option<hip_bridge::Event>,
+    mode: &str,
+    rows: usize,
+    t0: std::time::Instant,
+) {
+    let (Some(a), Some(b)) = (start, end) else {
+        return;
+    };
+    let _ = gpu.hip.event_synchronize(&b);
+    let dev_us = gpu.hip.event_elapsed_ms(&a, &b).unwrap_or(0.0) as f64 * 1e3;
+    eprintln!(
+        "[dspine-refine-ts] mode={} rows={} dev={:.1}us wall={:.1}us",
+        mode,
+        rows,
+        dev_us,
+        t0.elapsed().as_secs_f64() * 1e6
+    );
+    let _ = gpu.hip.event_destroy(a);
+    let _ = gpu.hip.event_destroy(b);
 }
