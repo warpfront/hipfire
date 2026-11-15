@@ -197,6 +197,7 @@ Supporting dated notes (still fixture-bound):
 | How to measure | [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) |
 | Bench-suite layout | [`methodology/bench-suite.md`](methodology/bench-suite.md) |
 | Immutable campaign checkpoints | [`perf-checkpoints/`](perf-checkpoints/) (new dated file; do not rewrite old bodies) |
+| Every measured or published perf number (history, provenance, guard rows) | [`PERF-LEDGER.md`](PERF-LEDGER.md) (`registry/receipts-v1.json` `ledger`) |
 | Claim → validation route | [`VALIDATION.md`](VALIDATION.md) |
 | Product admission | [`admissions.yml`](admissions.yml) only (schema v2; exactly one earned record) |
 | Redline-attributed claims | [`REDLINE.md`](REDLINE.md) |

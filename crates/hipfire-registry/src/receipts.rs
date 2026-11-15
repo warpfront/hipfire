@@ -28,6 +28,12 @@
 //! guessed). Rows from `docs/BENCHMARKS.md` are marked `historical`: that page
 //! states that none of its rows is a current baseline.
 //!
+//! # Perf ledger
+//!
+//! The same file also carries `ledger`: every measured or published perf
+//! number as history ([`LedgerRow`], [`ledger`]), with provenance ([`Prov`])
+//! and a `guard` flag. `hipfire fit` never reads it; see `docs/PERF-LEDGER.md`.
+//!
 //! # Speed classes (a product decision, not a measurement)
 //!
 //! | metric  | fast        | interactive     | usable         | slow        |
@@ -89,12 +95,66 @@ pub struct Receipt {
     pub note: Option<String>,
 }
 
+/// Who measured a ledger row and how it is evidenced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Prov {
+    /// Read from a raw log/json written by the run, or a run-record table the
+    /// run's reducer wrote next to per-run raw files.
+    Raw,
+    /// Only a release note, CHANGELOG or report states it; no raw file located.
+    Prose,
+    /// Measured by an external contributor on their own card.
+    Contributor,
+}
+
+/// One row of the perf ledger (history; see `docs/PERF-LEDGER.md`). Ledger rows
+/// are never read by `hipfire fit`; only `guard` rows may back a lane guard or
+/// a public claim, and a `guard` row is always `prov = raw`.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerRow {
+    /// Stable ledger id, for example `27B-R-01`.
+    pub id: String,
+    /// Ledger section the row came from, for example `1a`.
+    pub section: String,
+    /// Card and topology as the ledger states it, for example `2× R9700 EP2`.
+    pub card: String,
+    /// GPU arch when the row names exactly one, else `None`.
+    pub arch: Option<String>,
+    pub model: String,
+    /// sha256 prefix of the model file when known.
+    pub model_sha: Option<String>,
+    pub route: String,
+    /// Metric text, for example `pp4096 / pp16384`.
+    pub metric: String,
+    /// Value text as published (may hold several `/`-separated numbers).
+    pub value: String,
+    pub before_after: Option<String>,
+    /// `YYYY-MM[-DD]` as precise as the source (may end `-2x`).
+    pub date: String,
+    /// Release and/or commit the number was measured on.
+    pub commit: Option<String>,
+    /// Receipt path(s) or URL(s) the number was read from.
+    pub receipt: String,
+    pub method: Option<String>,
+    pub prov: Prov,
+    /// The ledger's own provenance cell, verbatim (caveats included).
+    pub prov_detail: String,
+    /// True only when the row may back a lane guard or a public claim.
+    pub guard: bool,
+    /// Route status on beta when the ledger was built.
+    pub beta_status: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiptFile {
     schema_version: u32,
     policy: String,
     receipts: Vec<Receipt>,
+    ledger_source: String,
+    ledger: Vec<LedgerRow>,
 }
 
 static BUNDLED: LazyLock<ReceiptFile> = LazyLock::new(|| {
@@ -111,6 +171,11 @@ pub fn bundled() -> &'static [Receipt] {
 /// The one-sentence policy the bundled file states.
 pub fn policy() -> &'static str {
     &BUNDLED.policy
+}
+
+/// Every perf-ledger row, in file order (history, including prose rows).
+pub fn ledger() -> &'static [LedgerRow] {
+    &BUNDLED.ledger
 }
 
 /// Receipts whose tag and arch both equal the arguments exactly: decode rows
@@ -560,5 +625,58 @@ mod tests {
             serde_json::to_string(&SpeedClass::Interactive).unwrap(),
             "\"interactive\""
         );
+    }
+
+    #[test]
+    fn ledger_rows_are_well_formed() {
+        assert!(!BUNDLED.ledger_source.trim().is_empty());
+        assert!(!ledger().is_empty());
+        let mut ids = HashSet::new();
+        for row in ledger() {
+            let at = &row.id;
+            assert!(ids.insert(at.as_str()), "duplicate ledger id {at}");
+            for (name, value) in [
+                ("section", &row.section),
+                ("card", &row.card),
+                ("model", &row.model),
+                ("route", &row.route),
+                ("metric", &row.metric),
+                ("value", &row.value),
+                ("date", &row.date),
+                ("prov_detail", &row.prov_detail),
+                ("beta_status", &row.beta_status),
+            ] {
+                assert!(!value.trim().is_empty(), "ledger {at}: empty {name}");
+            }
+            if let Some(arch) = &row.arch {
+                assert!(valid_arch(arch), "ledger {at}: bad arch {arch:?}");
+            }
+            if row.guard {
+                assert_eq!(row.prov, Prov::Raw, "ledger {at}: guard row must be raw");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_ledger_rows_record_a_receipt() {
+        for row in ledger().iter().filter(|row| row.prov == Prov::Raw) {
+            let at = &row.id;
+            let receipt = row.receipt.trim();
+            assert!(
+                receipt.contains('/') || receipt.contains('.'),
+                "ledger {at}: raw row needs a receipt path or URL, got {receipt:?}"
+            );
+            assert!(
+                receipt != "—" && !receipt.eq_ignore_ascii_case("same"),
+                "ledger {at}: raw row receipt is a placeholder"
+            );
+            let b = row.date.as_bytes();
+            assert!(
+                b.len() >= 7 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-',
+                "ledger {at}: raw row needs a YYYY-MM date, got {:?}",
+                row.date
+            );
+            assert!(row.method.is_some(), "ledger {at}: raw row needs a method");
+        }
     }
 }

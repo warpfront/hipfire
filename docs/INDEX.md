@@ -164,6 +164,7 @@ Every current top-level page, exactly once.
 | [`REDLINE.md`](REDLINE.md) | shipped / ref-pinned | Redline certification policy. |
 | [`GOLDEN-REDLINE.md`](GOLDEN-REDLINE.md) | branch-implemented | Sealed fixture reproduction and OpenAI-client setup. |
 | [`BENCHMARKS.md`](BENCHMARKS.md) | historical | Dated/historical bench tables; incomplete manifests stay historical-only. |
+| [`PERF-LEDGER.md`](PERF-LEDGER.md) | shipped / ref-pinned | Perf ledger (`registry/receipts-v1.json` `ledger`): provenance, guard rule, how a perf claim is admitted. |
 | [`speculation-support-inventory.md`](speculation-support-inventory.md) | shipped / ref-pinned | Current speculation capability inventory. |
 | [`load-refusal-wording.md`](load-refusal-wording.md) | shipped / ref-pinned | Model-load refusal wording inventory. |
 | [`spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | historical | Dated 2026-06-23 durability fixture/tables report. |
