@@ -5,13 +5,19 @@
 """Promotion lane: run the required hardware rows on the installed release
 archive, record the verdict, merge per-class records, and check the policy.
 
-The gate (this script, policy.json, device_mesh_matrix.py, matrix.json) comes
-from the previously promoted checkout (--gate-root); the candidate contributes
-only its release archive and its in-tree waivers.json. Stdlib only.
+The gate (this script, perf.py, policy.json, device_mesh_matrix.py,
+matrix.json) comes from the previously promoted checkout (--gate-root); the
+candidate contributes only its release archive and its in-tree waivers.json.
+Performance rows (policy.json `perf`, perf.py) compare the candidate with the
+gate's own beta on the same card. Stdlib only.
 
   lane.py run --archive A.tar.gz --class C --candidate SHA --out DIR
               [--gate-root R] [--repo R] [--models-dir D] [--timeout S]
               [--digest-cache FILE] [--host NAME]
+              [--perf-baseline RECORD.json] [--baseline-archive B.tar.gz]
+  lane.py perf --archive A.tar.gz --class C --out DIR [--gate-root R] [--models-dir D]
+              [--baseline-archive B.tar.gz] [--perf-baseline DOC.json] [--procs-per-arm N]
+              [--rows a,b] [--candidate SHA] [--digest-cache FILE] [--host NAME]
   lane.py merge --candidate SHA --out CAND.json [--allow-down C]... [--rented C]... RECORD.json...
   lane.py check-release --sha SHA --records DIR [--repo R]
   lane.py classify --repo R --range BASE..TIP
@@ -35,6 +41,9 @@ import sys
 import tarfile
 import tempfile
 from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import perf as perfmod  # noqa: E402  (gate-local module beside this script)
 
 POLICY_SCHEMA = "promotion-lane-policy-v1"
 WAIVERS_SCHEMA = "promotion-lane-waivers-v1"
@@ -141,6 +150,8 @@ def validate_policy(policy):
             problems.append("policy: %s must be a non-empty list of strings" % key)
     if not is_int(policy.get("waiver_max_days")) or policy["waiver_max_days"] <= 0:
         problems.append("policy: waiver_max_days must be a positive integer")
+    if "perf" in policy:
+        problems += perfmod.validate(policy["perf"], classes)
     return problems
 
 
@@ -430,6 +441,97 @@ def verified_arch(rows):
     return None
 
 
+def archive_identity(archive):
+    """(abs path, sha256, sidecar_ok) of a release archive; a sidecar mismatch is exit 2."""
+    archive = os.path.abspath(archive)
+    if not os.path.isfile(archive):
+        raise Usage("archive %s not found" % archive)
+    archive_sha = sha256_file(archive)
+    sidecar = archive + ".sha256"
+    sidecar_ok = None
+    if os.path.isfile(sidecar):
+        words = open(sidecar).read().split()
+        sidecar_ok = bool(words) and words[0].lower() == archive_sha
+        if not sidecar_ok:
+            raise Usage("archive sha256 %s does not match its sidecar %s" % (archive_sha, sidecar))
+    return archive, archive_sha, sidecar_ok
+
+
+def lane_env(out, install, models_dir):
+    """Child env of every lane process: no device compiler, installed binaries, isolated HOME."""
+    home, cache, tmp = (os.path.join(out, "home"), os.path.join(out, "kernel-cache"), os.path.join(out, "tmp"))
+    env = dict(os.environ)
+    env.pop("HIPFIRE_HOME", None)
+    env["PATH"] = clean_path(env.get("PATH", ""), os.path.join(out, "pathbin"))
+    env.update({"HIPFIRE_NO_DEVICE_COMPILER": "1",
+                "HIPFIRE_CLI_BIN": os.path.join(install, "bin", "hipfire"),
+                "HIPFIRE_DAEMON_BIN": os.path.join(install, "bin", "daemon"),
+                "HOME": home, "MATRIX_ISOLATED_HOME": home, "HIPFIRE_KERNEL_CACHE": cache, "TMPDIR": tmp})
+    if models_dir:
+        env["HIPFIRE_MODELS_DIR"] = os.path.abspath(models_dir)
+    return env
+
+
+def fresh_out(out, subs, stale):
+    for sub in subs:
+        shutil.rmtree(os.path.join(out, sub), ignore_errors=True)
+    for name in stale:
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(out, name))
+
+
+def perf_section(policy, cls, gate, out, env, install, args, expect_sha, digests, perf_policy=None,
+                 row_filter=None):
+    """Run the class's perf rows -> the record's perf section (None when the class has none).
+    Fixture/prompt problems and an unreadable baseline become skipped rows, i.e. red."""
+    perf = perf_policy or policy.get("perf")
+    rows = [r for r in perfmod.class_rows(perf, cls) if row_filter is None or r[0] in row_filter]
+    if not rows:
+        return None
+    baseline_install = None
+    if args.baseline_archive:
+        baseline_install = os.path.join(out, "baseline-install")
+        bpath, bsha, _ = archive_identity(args.baseline_archive)
+        extract_archive(bpath, baseline_install, cls)
+    baseline_doc = None
+    if args.perf_baseline:
+        try:
+            baseline_doc = load_json(args.perf_baseline)
+        except (OSError, ValueError) as exc:
+            print("  perf: baseline %s unreadable (%s); not reused" % (args.perf_baseline, exc))
+            baseline_doc = {}
+    models = env.get("HIPFIRE_MODELS_DIR") or os.path.expanduser("~/.hipfire/models")
+    try:
+        section = perfmod.run(perf, cls, install, models, gate, out, env, baseline_install=baseline_install,
+                              baseline_doc=baseline_doc, expect_sha=expect_sha, digests=digests,
+                              procs_per_arm=getattr(args, "procs_per_arm", None), row_filter=row_filter,
+                              candidate=args.candidate, host=args.host or socket.gethostname(),
+                              log=lambda msg: print(msg, flush=True))
+    except perfmod.PerfError as exc:
+        section = {"schema": perfmod.PERF_SCHEMA, "candidate": args.candidate, "class": cls, "mode": "none",
+                   "reuse_refused": None, "fingerprint": {}, "baseline": {}, "procs": {}, "wall_s": 0,
+                   "finished_utc": utc_now().isoformat(),
+                   "rows": [dict(perfmod.judge_row(perf, rid, row, cal, [], [], "none"), verdict="skipped",
+                                 note="perf infrastructure: %s" % exc) for rid, row, cal in rows]}
+    if baseline_install:
+        section["baseline"]["archive_sha256"] = bsha
+        shutil.rmtree(baseline_install, ignore_errors=True)
+    return section
+
+
+def apply_waivers(rows, ok_verdicts, repo, candidate, policy, cls, now, applied):
+    for row in rows:
+        if row["verdict"] in ok_verdicts:
+            continue
+        for waiver in candidate_waivers(repo, candidate):
+            ok, _ = waiver_applies(waiver, policy, cls, candidate, repo, now)
+            if ok and row["id"] in waiver.get("rows", []):
+                row["verdict"] = "waived"
+                if waiver not in applied:
+                    applied.append(waiver)
+                break
+
+
 def cmd_run(args):
     gate = os.path.abspath(args.gate_root)
     policy = load_policy(os.path.join(gate, POLICY_REL))
@@ -444,40 +546,17 @@ def cmd_run(args):
     if head.returncode != 0:
         raise Usage("gate root is not a git checkout: %s" % head.stderr.strip())
     repo = os.path.abspath(args.repo or gate)
-    archive = os.path.abspath(args.archive)
-    if not os.path.isfile(archive):
-        raise Usage("archive %s not found" % archive)
-
-    archive_sha = sha256_file(archive)
-    sidecar = archive + ".sha256"
-    sidecar_ok = None
-    if os.path.isfile(sidecar):
-        words = open(sidecar).read().split()
-        sidecar_ok = bool(words) and words[0].lower() == archive_sha
-        if not sidecar_ok:
-            raise Usage("archive sha256 %s does not match its sidecar %s" % (archive_sha, sidecar))
+    archive, archive_sha, sidecar_ok = archive_identity(args.archive)
 
     out = os.path.abspath(args.out)
-    for sub in ("install", "home", "kernel-cache", "tmp", "pathbin", "matrix"):
-        shutil.rmtree(os.path.join(out, sub), ignore_errors=True)
-    for stale in ("record.json", "matrix-runner.log"):
-        with contextlib.suppress(OSError):
-            os.remove(os.path.join(out, stale))
+    fresh_out(out, ("install", "home", "kernel-cache", "tmp", "pathbin", "matrix", "perf", "baseline-install"),
+              ("record.json", "matrix-runner.log"))
     install, matrix_out = (os.path.join(out, "install"), os.path.join(out, "matrix"))
-    home, cache, tmp = (os.path.join(out, "home"), os.path.join(out, "kernel-cache"), os.path.join(out, "tmp"))
-    for path in (install, matrix_out, home, cache, tmp):
+    for path in (install, matrix_out, os.path.join(out, "home"), os.path.join(out, "kernel-cache"),
+                 os.path.join(out, "tmp")):
         os.makedirs(path)
     extract_archive(archive, install, args.cls)
-
-    env = dict(os.environ)
-    env.pop("HIPFIRE_HOME", None)
-    env["PATH"] = clean_path(env.get("PATH", ""), os.path.join(out, "pathbin"))
-    env.update({"HIPFIRE_NO_DEVICE_COMPILER": "1",
-                "HIPFIRE_CLI_BIN": os.path.join(install, "bin", "hipfire"),
-                "HIPFIRE_DAEMON_BIN": os.path.join(install, "bin", "daemon"),
-                "HOME": home, "MATRIX_ISOLATED_HOME": home, "HIPFIRE_KERNEL_CACHE": cache, "TMPDIR": tmp})
-    if args.models_dir:
-        env["HIPFIRE_MODELS_DIR"] = os.path.abspath(args.models_dir)
+    env = lane_env(out, install, args.models_dir)
 
     cache_file = os.path.join(matrix_out, ".digest-cache.json")
     if args.digest_cache and os.path.isfile(args.digest_cache):
@@ -490,11 +569,6 @@ def cmd_run(args):
     started = utc_now()
     with open(os.path.join(out, "matrix-runner.log"), "w") as log:
         proc = subprocess.run(cmd, cwd=gate, env=env, stdout=log, stderr=subprocess.STDOUT)
-    finished = utc_now()
-    if args.digest_cache and os.path.isfile(cache_file):
-        staged = args.digest_cache + ".partial"
-        shutil.copyfile(cache_file, staged)
-        os.replace(staged, args.digest_cache)
     if proc.returncode not in (0, 1):
         raise Usage("matrix runner exited %d (see %s)" % (proc.returncode, os.path.join(out, "matrix-runner.log")))
 
@@ -504,21 +578,27 @@ def cmd_run(args):
         summary = None
     rows = row_records(required, summary, scan_markers(matrix_out, required))
 
+    try:
+        digests = load_json(cache_file) if os.path.isfile(cache_file) else {}
+    except ValueError:
+        digests = {}
+    perf = perf_section(policy, args.cls, gate, out, env, install, args, head.stdout.strip(), digests)
+    write_json(cache_file, digests)
+    finished = utc_now()
+    if args.digest_cache and os.path.isfile(cache_file):
+        staged = args.digest_cache + ".partial"
+        shutil.copyfile(cache_file, staged)
+        os.replace(staged, args.digest_cache)
+
     waivers = []
     now = utc_now()
-    for row in rows:
-        if row["verdict"] in ("current", "waived"):
-            continue
-        for waiver in candidate_waivers(repo, args.candidate):
-            ok, _ = waiver_applies(waiver, policy, args.cls, args.candidate, repo, now)
-            if ok and row["id"] in waiver.get("rows", []):
-                row["verdict"] = "waived"
-                if waiver not in waivers:
-                    waivers.append(waiver)
-                break
+    apply_waivers(rows, ("current", "waived"), repo, args.candidate, policy, args.cls, now, waivers)
+    perf_rows = perf["rows"] if perf else []
+    apply_waivers(perf_rows, perfmod.PASS, repo, args.candidate, policy, args.cls, now, waivers)
 
     wall = round((finished - started).total_seconds(), 1)
-    green = all(r["verdict"] in ("current", "waived") for r in rows)
+    green = all(r["verdict"] in ("current", "waived") for r in rows) and \
+        all(r["verdict"] in perfmod.PASS for r in perf_rows)
     record = {"schema": RECORD_SCHEMA, "candidate": args.candidate, "class": args.cls,
               "host": args.host or socket.gethostname(), "gpu_arch_verified": verified_arch(rows),
               "archive": {"file": archive, "sha256": archive_sha, "sidecar_ok": sidecar_ok},
@@ -531,13 +611,92 @@ def cmd_run(args):
               "started_utc": started.isoformat(), "finished_utc": finished.isoformat(), "wall_s": wall,
               "budget_minutes": cls["budget_minutes"], "over_budget": wall > cls["budget_minutes"] * 60,
               "verdict": "green" if green else "red"}
+    if perf:
+        record["perf"] = perf
     write_json(os.path.join(out, "record.json"), record)
     print("LANE %s %s %s (%d rows, %.1f min)" % (args.cls, "GREEN" if green else "RED",
-                                                args.candidate[:12], len(rows), wall / 60))
+                                                args.candidate[:12], len(rows) + len(perf_rows), wall / 60))
     for row in rows:
         if row["verdict"] != "current":
             print("  %s: %s (%s) %s" % (row["id"], row["verdict"], row["disposition"], row["note"]))
+    if perf:
+        print("  perf mode %s%s (%.1f min)" % (perf["mode"], "; baseline not reused: %s" % perf["reuse_refused"]
+                                               if perf.get("reuse_refused") else "", perf["wall_s"] / 60))
+        perfmod.print_rows(perf)
     return 0 if green else 1
+
+
+def cmd_perf(args):
+    """Perf rows only (calibration, A/A, kill experiments): DIR/perf.json; exit 0 pass, 1 red."""
+    gate = os.path.abspath(args.gate_root)
+    policy = load_policy(os.path.join(gate, POLICY_REL))
+    perf = policy.get("perf")
+    if not perf:
+        raise Usage("policy has no perf section")
+    if args.cls not in policy["classes"]:
+        raise Usage("class %s is not in policy" % args.cls)
+    row_filter = None
+    if args.rows:
+        row_filter = [r for r in args.rows.split(",") if r]
+        unknown = [r for r in row_filter if r not in perf["rows"]]
+        if unknown:
+            raise Usage("unknown perf rows: %s" % ",".join(unknown))
+        # rows outside the class run uncalibrated (A/A half-width 0) so calibration can measure them
+        perf = json.loads(json.dumps(perf))
+        crow = perf["classes"].setdefault(args.cls, {"rows": {}})["rows"]
+        for rid in row_filter:
+            crow.setdefault(rid, {"aa_half_width": 0.0, "uncalibrated": True})
+    if args.candidate:
+        need_sha(args.candidate, "--candidate")
+    archive, archive_sha, _ = archive_identity(args.archive)
+    out = os.path.abspath(args.out)
+    fresh_out(out, ("install", "home", "kernel-cache", "tmp", "pathbin", "perf", "baseline-install"), ("perf.json",))
+    install = os.path.join(out, "install")
+    os.makedirs(install)
+    extract_archive(archive, install, args.cls)
+    env = lane_env(out, install, args.models_dir)
+    try:
+        digests = load_json(args.digest_cache) if args.digest_cache and os.path.isfile(args.digest_cache) else {}
+    except ValueError:
+        digests = {}
+    head = git(gate, "rev-parse", "HEAD")
+    section = perf_section(policy, args.cls, gate, out, env, install, args,
+                           head.stdout.strip() if args.expect_gate_sha else None, digests, perf_policy=perf,
+                           row_filter=row_filter)
+    if section is None:
+        raise Usage("class %s has no perf rows (pass --rows)" % args.cls)
+    section["archive_sha256"] = archive_sha
+    if args.digest_cache:
+        write_json(args.digest_cache, digests)
+    write_json(os.path.join(out, "perf.json"), section)
+    shutil.rmtree(install, ignore_errors=True)
+    green = all(r["verdict"] in perfmod.PASS for r in section["rows"])
+    print("PERF %s %s (%d rows, mode %s, %.1f min)%s" % (args.cls, "GREEN" if green else "RED", len(section["rows"]),
+                                                       section["mode"], section["wall_s"] / 60,
+                                                       "; baseline not reused: %s" % section["reuse_refused"]
+                                                       if section.get("reuse_refused") else ""))
+    perfmod.print_rows(section)
+    return 0 if green else 1
+
+
+def cmd_calibrate(args):
+    """A/A analysis of `perf` runs of one archive against itself -> per-row half-widths (JSON on stdout)."""
+    policy = load_policy(os.path.join(os.path.abspath(args.gate_root), POLICY_REL))
+    if not policy.get("perf"):
+        raise Usage("policy has no perf section")
+    docs = []
+    for path in args.docs:
+        try:
+            doc = perfmod.baseline_section(load_json(path))
+        except (OSError, ValueError) as exc:
+            raise Usage("%s: unreadable (%s)" % (path, exc))
+        if doc is None:
+            raise Usage("%s: no %s section" % (path, perfmod.PERF_SCHEMA))
+        docs.append(dict(doc, label=os.path.basename(os.path.dirname(os.path.abspath(path))) or path))
+    result = perfmod.calibrate(policy["perf"], docs, args.cls)
+    json.dump(result, sys.stdout, indent=1)
+    print()
+    return 0
 
 
 # --------------------------------------------------------------------------- records
@@ -570,6 +729,20 @@ def record_problems(rec, policy):
     gate = rec.get("gate") if isinstance(rec.get("gate"), dict) else {}
     if not gate.get("sha"):
         problems.append("gate sha missing")
+    prows = perfmod.class_rows(policy.get("perf"), rec["class"])
+    if prows:
+        section = rec.get("perf") if isinstance(rec.get("perf"), dict) else {}
+        by_perf = {r.get("id"): r for r in section.get("rows", []) if isinstance(r, dict)}
+        for rid, _, cal in prows:
+            row = by_perf.get(rid)
+            if row is None:
+                problems.append("perf row %s absent" % rid)
+            elif row.get("verdict") not in perfmod.PASS:
+                problems.append("perf row %s verdict %s" % (rid, row.get("verdict")))
+            else:
+                why = perfmod.row_problem(policy["perf"], row, cal)
+                if why:
+                    problems.append("perf row %s: %s" % (rid, why))
     computed = "green" if not problems else "red"
     if rec.get("verdict") != computed:
         problems.append("record verdict %r but its rows say %s" % (rec.get("verdict"), computed))
@@ -759,6 +932,8 @@ def cmd_check(args):
         print("waivers.json: not JSON (%s)" % exc)
         return 1
     problems = check_tree(policy, matrix, waivers)
+    if "perf" in policy:
+        problems += perfmod.check_files(policy["perf"], repo)
     for problem in problems:
         print(problem)
     if not problems:
@@ -788,6 +963,14 @@ def cmd_plan(args, policy):
         missing += bool(host)
     print("transitions_required: %s" % ",".join(class_transitions(policy, cls)))
     print("rows: %s" % ",".join(cls["required"]))
+    prows = perfmod.class_rows(policy.get("perf"), args.cls)
+    for rid, row, cal in prows:
+        proc = policy["perf"]["procs"][row["proc"]]
+        print("  %s [perf] %s of %s (%s, spec %s, prompt %s) threshold %.4f (A/A half-width %.4f)"
+              % (rid, row["metric"], row["proc"], proc.get("model") or proc.get("model_file"), proc["spec"],
+                 proc["prompt"], perfmod.threshold(policy["perf"], cal), cal["aa_half_width"]))
+    if prows:
+        print("perf rows: %s" % ",".join(r[0] for r in prows))
     return 1 if missing else 0
 
 
@@ -1130,6 +1313,234 @@ def _self_test_run(t, scratch, repo, first):
         os.environ["PATH"] = saved
 
 
+# A planted stray knob the perf env scrub must remove. Built from two halves so the env-var inventory scan
+# (scripts/check-lifecycle.py, a literal-token scan) does not list a name no product reads.
+STRAY_KNOB = "HIPFIRE" + "_STRAY_KNOB"
+
+STUB_BENCH = r'''#!@PYTHON@
+import json, os, random, sys
+cfg = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "speed.json")))
+a = sys.argv[1:]
+runs = int(a[a.index("--runs") + 1])
+spec = a[a.index("--spec") + 1] if "--spec" in a else "default"
+with open(cfg["obs"], "a") as fh:
+    fh.write(json.dumps({"argv": a, "nodc": os.environ.get("HIPFIRE_NO_DEVICE_COMPILER"),
+                         "cache": os.listdir(os.environ["HIPFIRE_KERNEL_CACHE"]),
+                         "stray": os.environ.get("HIPFIRE" + "_STRAY_KNOB"), "home": os.environ["HIPFIRE_HOME"]}) + "\n")
+if cfg.get("fail"):
+    sys.exit(3)
+if cfg.get("pressure_n"):
+    # a stalled host: bump the fake PSI memory total by far more than this process's wall time
+    counter = os.path.join(cfg["psi"], "count")
+    done = int(open(counter).read()) if os.path.exists(counter) else 0
+    if done < cfg["pressure_n"]:
+        open(counter, "w").write(str(done + 1))
+        path = os.path.join(cfg["psi"], "memory")
+        total = int(open(path).read().split("total=")[1]) + 10 ** 9
+        open(path, "w").write("some avg10=0.00 avg60=0.00 avg300=0.00 total=%d\n" % total)
+s, rng = cfg["speed"], random.Random(os.environ["HIPFIRE_HOME"])
+j = lambda: 1 + rng.uniform(-0.002, 0.002)
+dec = [100.0 * s * j() for _ in range(runs)]
+print(json.dumps({"samples": {"decode": dec, "ttft_ms": [50.0 / s * j() for _ in range(runs)],
+                              "wall": [90.0 * s * j() for _ in range(runs)]},
+                  "spec_tau": [2.5] * runs if spec == "dflash" else [None] * runs, "prompt_tokens": 7,
+                  "gpu": {"arch": "gfx1100", "hip_version": cfg.get("hip", "7.1")},
+                  "power_device": {"pci": "0000:01:00.0"}}))
+'''
+
+SELF_PERF = {
+    "measure": {"bench_args": ["--backend", "noslots", "--json"], "proc_timeout_s": 60,
+                "max_pressure": {"cpu": 0.1, "memory": 0.02}, "pressure_retries": 1, "pressure_wait_s": 0},
+    "judge": {"procs_per_arm": 2, "bootstrap_draws": 500, "bootstrap_seed": 7, "ci": 0.95, "floor": 0.02,
+              "aa_multiplier": 3, "baseline_max_age_days": 7},
+    "fixtures": {"m.bin": {"size_bytes": 5, "sha256": hashlib.sha256(b"model").hexdigest()}},
+    "prompts": {"pr": {"file": "scripts/promotion-lane/perf-prompts/pr.txt",
+                       "sha256": hashlib.sha256(b"prompt\n").hexdigest()}},
+    "procs": {"p-ar": {"model": "m:tag", "files": ["m.bin"], "spec": "off", "prompt": "pr", "max_tokens": 8,
+                       "runs": 4, "discard": 1}},
+    "rows": {"perf-dec": {"proc": "p-ar", "metric": "decode_tok_s"},
+             "perf-ttft": {"proc": "p-ar", "metric": "ttft_ms"},
+             "perf-cold": {"proc": "p-ar", "metric": "cold_wall_tok_s"}},
+    "classes": {"gfx1100": {"rows": {"perf-dec": {"aa_half_width": 0.001}, "perf-ttft": {"aa_half_width": 0.001},
+                                     "perf-cold": {"aa_half_width": 0.01}}}},
+}
+
+
+def _self_test_perf_units(t):
+    perf = json.loads(json.dumps(SELF_PERF))
+    t(perfmod.validate(perf, SELF_POLICY["classes"]) == [], "self perf policy valid")
+    t(perfmod.threshold(perf, {"aa_half_width": 0.001}) == 0.98, "floor wins over a small A/A half-width")
+    t(perfmod.threshold(perf, {"aa_half_width": 0.01}) == 0.97, "3x a large A/A half-width wins over the floor")
+    bad = json.loads(json.dumps(perf))
+    del bad["classes"]["gfx1100"]["rows"]["perf-dec"]["aa_half_width"]
+    t(any("aa_half_width" in p for p in perfmod.validate(bad, SELF_POLICY["classes"])), "uncalibrated row rejected")
+    bad = json.loads(json.dumps(perf))
+    bad["procs"]["p-ar"]["discard"] = 3
+    t(any("discard" in p for p in perfmod.validate(bad, SELF_POLICY["classes"])), "discard leaving <2 warm runs rejected")
+    bad = json.loads(json.dumps(perf))
+    bad["classes"]["gfx9999"] = {"rows": {"perf-dec": {"aa_half_width": 0.0}}}
+    t(any("gfx9999" in p for p in perfmod.validate(bad, SELF_POLICY["classes"])), "perf class must be a policy class")
+    retuned = json.loads(json.dumps(perf))
+    retuned["judge"]["floor"], retuned["classes"]["gfx1100"]["rows"]["perf-dec"]["aa_half_width"] = 0.03, 0.002
+    t(perfmod.spec_sha256(retuned) == perfmod.spec_sha256(perf), "recalibration keeps baseline numbers reusable")
+    remeasured = json.loads(json.dumps(perf))
+    remeasured["procs"]["p-ar"]["max_tokens"] = 9
+    t(perfmod.spec_sha256(remeasured) != perfmod.spec_sha256(perf), "a measurement change invalidates reuse")
+    same = [[10.0, 10.1, 9.9], [10.0, 10.05, 9.95]]
+    point, lo, hi = perfmod.bootstrap(same, same, "higher", 500, "s", 0.95)
+    t(point == 1.0 and lo <= 1.0 <= hi, "identical arms: ratio 1 inside its CI")
+    point, lo, hi = perfmod.bootstrap(same, [[v * 1.05 for v in p] for p in same], "lower", 500, "s", 0.95)
+    t(point < 0.96 and hi < 0.98, "TTFT 5%% longer is a ratio below 1 (%s, %s)" % (point, hi))
+    row = {"id": "r", "verdict": "pass", "threshold": 0.98, "ci": [0.95, 0.97]}
+    t(perfmod.row_problem(perf, row, {"aa_half_width": 0.001}) is not None, "pass with CI below threshold is a lie")
+    row = {"id": "r", "verdict": "pass", "threshold": 0.95, "ci": [0.97, 0.99]}
+    t(perfmod.row_problem(perf, row, {"aa_half_width": 0.001}) is not None, "a softer threshold than policy is refused")
+    row = {"id": "r", "verdict": "pass", "threshold": 0.98, "ci": [0.97, 0.99]}
+    t(perfmod.row_problem(perf, row, {"aa_half_width": 0.001}) is None, "sound pass row accepted")
+
+
+def _self_test_perf_records(t):
+    policy = dict(json.loads(json.dumps(SELF_POLICY)), perf=json.loads(json.dumps(SELF_PERF)))
+    t(validate_policy(policy) == [], "policy with perf section valid")
+
+    def rec(**rows):
+        r = _fake_record("gfx1100", "c" * 40)
+        r["perf"] = {"schema": perfmod.PERF_SCHEMA, "rows": [dict({"id": rid, "threshold": 0.98 if rid != "perf-cold"
+                                                                   else 0.97, "ci": [0.99, 1.01], "verdict": "pass"},
+                                                                  **over) for rid, over in rows.items()]}
+        return r
+
+    ok = {"perf-dec": {}, "perf-ttft": {}, "perf-cold": {}}
+    t(record_status(rec(**ok), policy) == ("green", []), "record with passing perf rows is green")
+    t(record_status(_fake_record("gfx1100", "c" * 40), policy)[0] == "red", "record without perf rows is red")
+    t(record_status(rec(**dict(ok, **{"perf-dec": {"verdict": "regressed"}})), policy)[0] == "red",
+      "regressed perf row is red")
+    t(record_status(rec(**dict(ok, **{"perf-dec": {"ci": [0.95, 0.97]}})), policy)[0] == "red",
+      "perf row claiming pass under its threshold is red")
+    t(record_status(rec(**dict(ok, **{"perf-dec": {"verdict": "skipped"}})), policy)[0] == "red",
+      "skipped perf row is red (skip is not pass)")
+    t(record_status(rec(**dict(ok, **{"perf-dec": {"verdict": "waived"}})), policy)[0] == "green",
+      "waived perf row is green for the candidate gate")
+
+
+def _self_test_perf_run(t, scratch):
+    gate = os.path.join(scratch, "pgate")
+    os.makedirs(os.path.join(gate, "scripts", "promotion-lane", "perf-prompts"))
+    open(os.path.join(gate, SELF_PERF["prompts"]["pr"]["file"]), "w").write("prompt\n")
+    write_json(os.path.join(gate, POLICY_REL), dict(SELF_POLICY, perf=SELF_PERF))
+    git(gate, "init", "-q")
+    gate_sha = _git_commit(gate, "gate")
+    models = os.path.join(scratch, "pmodels")
+    os.makedirs(models)
+    open(os.path.join(models, "m.bin"), "wb").write(b"model")
+    obs = os.path.join(scratch, "perf-obs.jsonl")
+
+    def archive(name, **cfg):
+        stage = os.path.join(scratch, "pstage-" + name)
+        for rel in ("bin/daemon", "bin/kernels/compiled/gfx1100/k.hsaco"):
+            os.makedirs(os.path.dirname(os.path.join(stage, rel)), exist_ok=True)
+            open(os.path.join(stage, rel), "w").write("x")
+        open(os.path.join(stage, "bin", "hipfire"), "w").write(STUB_BENCH.replace("@PYTHON@", sys.executable))
+        os.chmod(os.path.join(stage, "bin", "hipfire"), 0o755)
+        write_json(os.path.join(stage, "bin", "speed.json"), dict({"speed": 1.0, "obs": obs}, **cfg))
+        path = os.path.join(scratch, "perf-%s.tar.gz" % name)
+        with tarfile.open(path, "w:gz") as tar:
+            tar.add(os.path.join(stage, "bin"), arcname="bin")
+        return path
+
+    psi = os.path.join(scratch, "psi")
+    os.makedirs(psi)
+    for res in perfmod.PSI_RESOURCES:
+        open(os.path.join(psi, res), "w").write("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+    fast, slow, broken, newhip = archive("fast"), archive("slow", speed=0.95), archive("broken", fail=True), \
+        archive("newhip", hip="7.2")
+    once, always = archive("once", pressure_n=1, psi=psi), archive("always", pressure_n=99, psi=psi)
+
+    def perf_case(name, cand, base=None, reuse=None, card="GPU-1", expect=False, cand_sha=None):
+        out = os.path.join(scratch, "pout-" + name)
+        argv = ["perf", "--archive", cand, "--class", "gfx1100", "--out", out, "--gate-root", gate,
+                "--models-dir", models, "--host", "selftest-host", "--candidate", cand_sha or "a" * 40]
+        argv += ["--baseline-archive", base] if base else []
+        argv += ["--perf-baseline", reuse] if reuse else []
+        argv += ["--expect-gate-sha"] if expect else []
+        with contextlib.suppress(OSError):
+            os.remove(obs)
+        os.environ["HIPFIRE_DEVICES"] = card
+        rc, text, err = _call(main, argv)
+        doc = load_json(os.path.join(out, "perf.json")) if os.path.exists(os.path.join(out, "perf.json")) else None
+        lines = [json.loads(l) for l in open(obs)] if os.path.exists(obs) else []
+        return rc, doc, lines, text + err, os.path.join(out, "perf.json")
+
+    saved = {k: os.environ.get(k) for k in ("HIPFIRE_DEVICES", STRAY_KNOB)}
+    saved_psi, perfmod.PSI_DIR = perfmod.PSI_DIR, psi
+    os.environ[STRAY_KNOB] = "1"
+    try:
+        verdicts = lambda d: {r["id"]: r["verdict"] for r in d["rows"]}
+        rc, aa, lines, text, aa_path = perf_case("aa", fast, base=fast, cand_sha=gate_sha)
+        t(rc == 0 and aa["mode"] == "pair" and set(verdicts(aa).values()) == {"pass"}, "A/A pair passes (%s)" % text)
+        t(len(lines) == 4 and all(l["nodc"] == "1" and l["cache"] == [] and l["stray"] is None for l in lines),
+          "4 fresh bench processes, no compiler, empty cache, stray HIPFIRE_* knob scrubbed")
+        t(len({l["home"] for l in lines}) == 4, "every bench process has its own HIPFIRE_HOME")
+        t(all("--warmups" in l["argv"] and l["argv"][l["argv"].index("--warmups") + 1] == "0"
+              and l["argv"][l["argv"].index("--min-tokens") + 1] == "8" for l in lines), "warmups 0, fixed length")
+        t([e["arm"] for e in sorted((e for p in aa["procs"].values() for a in ("old", "new") for e in p[a]),
+                                    key=lambda e: e["started_utc"])] == ["old", "new", "new", "old"],
+          "pair arms interleave and alternate per rep")
+        rc, doc, _, _, _ = perf_case("slow", slow, base=fast)
+        t(rc == 1 and verdicts(doc) == {"perf-dec": "regressed", "perf-ttft": "regressed", "perf-cold": "regressed"},
+          "5% slower candidate regresses decode, TTFT and cold rows")
+        rc, doc, lines, _, _ = perf_case("reuse", fast, reuse=aa_path)
+        t(rc == 0 and doc["mode"] == "reuse" and len(lines) == 2, "matching baseline numbers reused (candidate only)")
+        rc, doc, lines, text, _ = perf_case("reuse-confirm", slow, base=fast, reuse=aa_path)
+        t(rc == 1 and doc["mode"] == "reuse+confirm" and len(lines) == 2 + 4
+          and {r["mode"] for r in doc["rows"]} == {"pair-confirm"}, "regression vs reused numbers is confirmed in pair")
+        rc, doc, _, _, _ = perf_case("card", fast, base=fast, reuse=aa_path, card="GPU-2")
+        t(rc == 0 and doc["mode"] == "pair" and "card" in doc["reuse_refused"], "another card is not reused")
+        cal_path = os.path.join(scratch, "pout-card", "perf.json")
+        rc, text, _ = _call(main, ["calibrate", "--class", "gfx1100", "--gate-root", gate, aa_path, cal_path])
+        cal = json.loads(text) if rc == 0 else {}
+        dec = cal.get("perf-dec", {})
+        t(rc == 0 and [x["trial"].split()[0] for x in dec.get("trials", [])] == ["pair", "pair", "cross"]
+          and 0 < dec["aa_half_width"] < 0.01, "calibrate: two pair trials plus one cross-job trial (%s)" % text[:200])
+        rc, doc, _, _, _ = perf_case("hip", newhip, base=fast, reuse=aa_path)
+        t(doc["mode"] == "pair" and "hip_version" in doc["reuse_refused"], "another HIP runtime is not reused")
+        rc, doc, _, _, _ = perf_case("sha", fast, reuse=aa_path, expect=True)
+        t(rc == 0 and doc["mode"] == "reuse", "numbers measured for the gate's own sha are reused")
+        rc, doc, _, _, _ = perf_case("sha-wrong", fast, reuse=os.path.join(scratch, "pout-reuse", "perf.json"),
+                                     expect=True)
+        t(rc == 1 and doc["mode"] == "none" and set(verdicts(doc).values()) == {"skipped"}
+          and "the gate is" in doc["reuse_refused"], "numbers of another sha are not the gate's baseline")
+        rc, doc, _, _, _ = perf_case("none", fast)
+        t(rc == 1 and set(verdicts(doc).values()) == {"skipped"}, "no baseline at all: skipped is red")
+        rc, doc, _, _, _ = perf_case("broken", broken, base=fast)
+        t(rc == 1 and set(verdicts(doc).values()) == {"failed"}, "failing candidate bench is failed")
+        open(os.path.join(models, "m.bin"), "wb").write(b"mod3l")
+        rc, doc, _, _, _ = perf_case("fixture", fast, base=fast)
+        t(rc == 1 and all("perf infrastructure" in r["note"] for r in doc["rows"]), "fixture mismatch is a red row")
+        open(os.path.join(models, "m.bin"), "wb").write(b"model")
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(psi, "count"))
+        rc, doc, lines, _, _ = perf_case("pressure-once", once, base=fast)
+        rej = doc["procs"]["p-ar"].get("rejected", [])
+        t(rc == 0 and len(lines) == 5 and len(rej) == 1 and rej[0]["pressure"]["memory"] > 0.02
+          and "memory" in rej[0]["rejected"] and all(e.get("pressure") is not None and not e.get("rejected")
+                                                     for a in ("old", "new") for e in doc["procs"]["p-ar"][a]),
+          "a sample under host memory pressure is rejected, recorded and re-run")
+        os.remove(os.path.join(psi, "count"))
+        rc, doc, _, _, _ = perf_case("pressure-always", always, base=fast)
+        t(rc == 1 and set(verdicts(doc).values()) == {"skipped"} and all("host pressure" in r["note"]
+                                                                         for r in doc["rows"]),
+          "a host that stays under pressure gives skipped (red) rows, never a threshold")
+    finally:
+        perfmod.PSI_DIR = saved_psi
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+
 def _fake_record(cls, cand, verdict="green", rows=("rowA", "rowB"), waived=False):
     ok = verdict == "green"
     return {"schema": RECORD_SCHEMA, "candidate": cand, "class": cls, "host": "h", "gpu_arch_verified": cls,
@@ -1275,6 +1686,9 @@ def self_test():
         git(repo, "checkout", "-q", "--detach", cand)
         _self_test_merge(t, scratch, repo, cand)
         _self_test_classify(t, scratch)
+        _self_test_perf_units(t)
+        _self_test_perf_records(t)
+        _self_test_perf_run(t, scratch)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     for msg in t.failed:
@@ -1303,6 +1717,31 @@ def build_parser():
     run.add_argument("--timeout", type=int, default=None, help="per-command seconds for the matrix runner")
     run.add_argument("--digest-cache", default=None, help="fixture digest cache file, read before and updated after")
     run.add_argument("--host", default=None, help="host name to record (default: this host)")
+    run.add_argument("--perf-baseline", default=None,
+                     help="promotion record of the gate's beta on this class; its perf numbers are reused when "
+                          "host, card, runtime and measurement spec match")
+    run.add_argument("--baseline-archive", default=None,
+                     help="release archive of the gate's beta: runs interleaved with the candidate when the "
+                          "numbers cannot be reused, and confirms a regression seen against reused numbers")
+    prf = sub.add_parser("perf", help="perf rows only (calibration, A/A, kill experiments) -> DIR/perf.json")
+    prf.add_argument("--archive", required=True)
+    prf.add_argument("--class", dest="cls", required=True)
+    prf.add_argument("--out", required=True)
+    prf.add_argument("--gate-root", default=ROOT)
+    prf.add_argument("--models-dir", default=None)
+    prf.add_argument("--baseline-archive", default=None)
+    prf.add_argument("--perf-baseline", default=None, help="perf.json or promotion record whose numbers to reuse")
+    prf.add_argument("--expect-gate-sha", action="store_true",
+                     help="reuse only numbers measured for the gate root's HEAD (what `run` does)")
+    prf.add_argument("--procs-per-arm", type=int, default=None)
+    prf.add_argument("--rows", default=None, help="comma-separated perf rows (default: the class's rows)")
+    prf.add_argument("--candidate", default=None)
+    prf.add_argument("--digest-cache", default=None)
+    prf.add_argument("--host", default=None)
+    cal = sub.add_parser("calibrate", help="A/A half-widths per perf row from perf.json runs of one archive")
+    cal.add_argument("--class", dest="cls", required=True)
+    cal.add_argument("--gate-root", default=ROOT)
+    cal.add_argument("docs", nargs="+")
     merge = sub.add_parser("merge", help="merge per-class records into a candidate verdict")
     merge.add_argument("--candidate", required=True)
     merge.add_argument("--out", required=True)
@@ -1334,6 +1773,10 @@ def main(argv=None):
     try:
         if args.cmd == "run":
             return cmd_run(args)
+        if args.cmd == "calibrate":
+            return cmd_calibrate(args)
+        if args.cmd == "perf":
+            return cmd_perf(args)
         if args.cmd == "check":
             return cmd_check(args)
         policy = load_policy(os.path.join(ROOT, POLICY_REL))
