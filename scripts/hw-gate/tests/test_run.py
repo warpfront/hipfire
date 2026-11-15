@@ -992,7 +992,7 @@ def test_fixtures_manifest_declares_dflash_routes(tmp_path):
     assert "battery-dflash" in manifest["buckets"]["load"]["modes"]
     assert "chain-dflash" in manifest["buckets"]["serve"]["modes"]
     declared = {f["tag"]: f.get("dflash_draft") for f in manifest["fixtures"]}
-    assert declared["qwen3.8:27b-mq4-xt"], "the canonical xt trunk must declare a draft"
+    assert declared["qwen3.8:27b-mq4-xts"], "the canonical xts trunk must declare a draft"
     for tag, drafts in declared.items():
         if drafts is not None:
             assert isinstance(drafts, list) and drafts, f"{tag} dflash_draft must be a non-empty list"
@@ -1030,6 +1030,6 @@ def test_a_mismatched_draft_fails_rather_than_skewing_tau(tmp_path, monkeypatch)
 
 def test_manifest_pins_the_canonical_xt_draft():
     manifest = json.loads((Path(run_mod.__file__).parent / "fixtures.json").read_text())
-    xt = [f for f in manifest["fixtures"] if f["tag"] == "qwen3.8:27b-mq4-xt"][0]
+    xt = [f for f in manifest["fixtures"] if f["tag"] == "qwen3.8:27b-mq4-xts"][0]
     assert xt["dflash_draft"] == ["~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq"]
     assert xt["dflash_draft_sha256"] == "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc"

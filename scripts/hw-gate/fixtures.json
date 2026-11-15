@@ -9,12 +9,12 @@
   },
   "fixtures": [
     {
-      "tag": "qwen3.8:27b-mq4-xt",
-      "file": "qwen3.8-27b.mq4-xt",
-      "sha256": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
-      "size_bytes": 14980361216,
+      "tag": "qwen3.8:27b-mq4-xts",
+      "file": "qwen3.8-27b.mq4-xts",
+      "sha256": "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae",
+      "size_bytes": 14987185152,
       "arch_id": 5,
-      "why": "Canonical dense trunk (AGENTS.md pinned fixture); MQ4V2 xt tier (neutral-header v2 quant family 537a292df) that the device-mesh series refused. HF repo hipfire-models/qwen3.8-27b.",
+      "why": "Canonical dense trunk: pin:model/qwen3.8-27b.mq4-xts in fixtures/pins.toml (registry tag qwen3.8:27b-mq4-xts, H2 symmetric MQ4V2 XT qt44, HF repo hipfire-models/qwen3.8-27b). Replaces the qwen3.8:27b-mq4-xt entry, which pinned the discarded no-AWQ upload (9f91556f..., 14980361216 B) after the registry moved that tag to the AWQ'd file on 2026-09-23 (2afc4a2947): a runner with a current pull failed the size check, and one with the old file gated on a trunk that is not comparable.",
       "dflash_draft": [
         "~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq"
       ],
@@ -65,7 +65,7 @@
         "battery"
       ],
       "redline": {
-        "model_tag": "qwen3.8:27b-mq4-xt",
+        "model_tag": "qwen3.8:27b-mq4-xts",
         "harness_args": [
           "--pm4",
           "--capture-repeats",
