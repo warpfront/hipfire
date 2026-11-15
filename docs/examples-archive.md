@@ -58,6 +58,12 @@ git show <sha>:<path> > <path>
 | `test_qwen35_load_multi` | `crates/hipfire-arch-qwen35/examples/test_qwen35_load_multi.rs` | `bf6ec9ddf240` | 111 | Stage 4 smoke: load qwen3.5 weights distributed across 2 GPUs via qwen35::load_weights_multi. |
 | `test_qwen35_state_multi` | `crates/hipfire-arch-qwen35/examples/test_qwen35_state_multi.rs` | `d52ddaf3bae0` | 238 | Stage 4 smoke: build the full multi-GPU state stack on a real model: Qwen35ScratchSet (per-device), KvCache::new_gpu_fwht3_capped_multi (per-layer K/V on band-owning… |
 
+## hipfire-arch-qwen35-embed
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `inspect_source` | `crates/hipfire-arch-qwen35-embed/examples/inspect_source.rs` | `c53b6c1fd999` | 54 | Source diagnostics for arch 17: print how a tensor name resolves through each read path (tensor_data borrowed, tensor_data_pread / _vec owned) for a dir or an .hfq. |
+
 ## hipfire-arch-qwen4
 
 | Example | Path | Last commit | LOC | Purpose |
