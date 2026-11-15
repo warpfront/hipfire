@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! A3B path-parity PM combine twin (gfx1201 only): the ordered BF16 grouped expert combine
-//! `moe_down_combine_grouped_bf16in_pm_gfx1201` in module `moe_slot_ops_pm_gfx1201`.
+//! A3B path-parity PM combine twin (gfx1201, gfx1100, gfx1151): the ordered BF16 grouped expert combine
+//! `moe_down_combine_grouped_bf16in_pm_<arch>` in module `moe_slot_ops_pm_<arch>`. The structural tests run on
+//! every arch; the CPU-interpreter tests run the gfx1201 object.
 //!
 //! Law (per `t = workgroup_id_x`, `m = workgroup_id_y * 256 + tid`; return when `m >= dim` or
 //! `t >= n_tokens`): `acc = +0.0f32`; for `k` in `0..k_top` ascending, `slot = inverse_perm[t*k_top+k]`,
@@ -31,11 +32,11 @@ const KERNARG_BYTES: usize = 48;
 /// Kernarg byte offsets: y, inverse_perm, topk_weights, x_residual, dim, k_top, grouped_rows, n_tokens.
 const OFFSETS: [u32; 8] = [0, 8, 16, 24, 32, 36, 40, 44];
 
-fn bundle_path() -> String {
-    format!(
-        "{}/../../kernels/{MODULE}.hxaco",
-        env!("CARGO_MANIFEST_DIR")
-    )
+/// Every arch the combine is emitted for.
+const ARCHS: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
+
+fn bundle_path(module: &str) -> String {
+    format!("{}/../../kernels/{module}.hxaco", env!("CARGO_MANIFEST_DIR"))
 }
 
 fn count(text: &str, mnemonic: &str) -> usize {
@@ -45,21 +46,28 @@ fn count(text: &str, mnemonic: &str) -> usize {
 }
 
 #[test]
-fn emission_is_deterministic_and_targets_gfx1201_only() {
-    let (a, b) = (ops::emit(ARCH).unwrap(), ops::emit(ARCH).unwrap());
+fn emission_is_deterministic_and_targets_for_the_supported_archs() {
+    for arch in ARCHS {
+        emission_is_deterministic_and_targets_for_the_supported_archs_on(arch);
+    }
+}
+
+fn emission_is_deterministic_and_targets_for_the_supported_archs_on(arch: Arch) {
+    let (module, symbol) = (ops::module(arch), ops::symbol(arch));
+    let (a, b) = (ops::emit(arch).unwrap(), ops::emit(arch).unwrap());
     assert_eq!(a.s_text, b.s_text);
     assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256);
-    assert_eq!(ops::symbol(ARCH), SYMBOL);
-    assert_eq!(ops::module(ARCH), MODULE);
-    assert!(a.s_text.contains(&format!("{SYMBOL}:")));
+    assert_eq!(ops::symbol(arch), symbol);
+    assert_eq!(ops::module(arch), module);
+    assert!(a.s_text.contains(&format!("{symbol}:")));
     assert_eq!(a.shape.barriers, 0);
     assert!(
         a.shape.next_free_vgpr <= 32 && a.shape.next_free_sgpr <= 104,
         "{:?}",
         a.shape
     );
-    let (m1, t1, p1) = ops::emit_module(ARCH).unwrap();
-    let (m2, t2, p2) = ops::emit_module(ARCH).unwrap();
+    let (m1, t1, p1) = ops::emit_module(arch).unwrap();
+    let (m2, t2, p2) = ops::emit_module(arch).unwrap();
     assert_eq!(m1.len(), 1);
     assert_eq!(m2.len(), 1);
     assert_eq!(t1, t2);
@@ -69,9 +77,9 @@ fn emission_is_deterministic_and_targets_gfx1201_only() {
         serde_json::to_string(&p1).unwrap(),
         serde_json::to_string(&p2).unwrap()
     );
-    assert!(t1.contains(&format!("{SYMBOL}:")));
-    // Every other architecture is refused, not silently emitted.
-    for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx942] {
+    assert!(t1.contains(&format!("{symbol}:")));
+    // Every architecture but gfx1100, gfx1151 and gfx1201 is refused, not silently emitted.
+    for arch in [Arch::Gfx1200, Arch::Gfx942] {
         assert!(ops::emit(arch).is_err(), "{arch:?}");
         assert!(ops::emit_module(arch).is_err(), "{arch:?}");
     }
@@ -82,7 +90,14 @@ fn emission_is_deterministic_and_targets_gfx1201_only() {
 /// private / spills.
 #[test]
 fn kernarg_layout_and_resources_match_the_launcher() {
-    let text = ops::emit_module(ARCH).unwrap().1;
+    for arch in ARCHS {
+        kernarg_layout_and_resources_match_the_launcher_on(arch);
+    }
+}
+
+fn kernarg_layout_and_resources_match_the_launcher_on(arch: Arch) {
+    let symbol = ops::symbol(arch);
+    let text = ops::emit_module(arch).unwrap().1;
     let metadata = &text[text.find("amdhsa.kernels:").unwrap()..];
     let got: Vec<u32> = metadata
         .lines()
@@ -108,14 +123,20 @@ fn kernarg_layout_and_resources_match_the_launcher() {
     assert!(text.contains(".sgpr_spill_count: 0\n"), "sgpr spills");
     assert!(text.contains(&format!(".max_flat_workgroup_size: {BLOCK}")));
     assert!(text.contains(".wavefront_size: 32"));
-    assert!(text.contains(".symbol: ") && text.contains(&format!("{SYMBOL}.kd")));
+    assert!(text.contains(".symbol: ") && text.contains(&format!("{symbol}.kd")));
 }
 
 /// Instruction census: exactly one fused multiply-add (the loop body, never an unrolled or contracted
 /// pair), no atomics, no LDS (`ds_*`), no scratch, no barrier; the single `s_endpgm`.
 #[test]
 fn census_has_one_fma_body_and_no_atomics_or_lds() {
-    let e = ops::emit(ARCH).unwrap();
+    for arch in ARCHS {
+        census_has_one_fma_body_and_no_atomics_or_lds_on(arch);
+    }
+}
+
+fn census_has_one_fma_body_and_no_atomics_or_lds_on(arch: Arch) {
+    let e = ops::emit(arch).unwrap();
     let fma = count(&e.s_text, "v_fma_f32") + count(&e.s_text, "v_fmac_f32");
     assert_eq!(fma, 1, "one fma body expected");
     assert_eq!(count(&e.s_text, "v_mul_f32"), 0, "no separate multiply");
@@ -153,30 +174,44 @@ fn census_has_one_fma_body_and_no_atomics_or_lds() {
 /// `peacemaker-isa emit --kernel moe_slot_ops_pm --arch gfx1201 ... --bundle`).
 #[test]
 fn committed_bundle_equals_fresh_emission() {
-    let path = bundle_path();
+    for arch in ARCHS {
+        committed_bundle_equals_fresh_emission_on(arch);
+    }
+}
+
+fn committed_bundle_equals_fresh_emission_on(arch: Arch) {
+    let module = ops::module(arch);
+    let path = bundle_path(&module);
     let committed = std::fs::read(&path).unwrap_or_else(|e| {
         panic!("{path}: {e} (emit it: peacemaker-isa emit --kernel moe_slot_ops_pm --arch gfx1201 ... --bundle)")
     });
-    let (_, text, _) = ops::emit_module(ARCH).unwrap();
-    let elf = peacemaker_isa::native::assemble(&text, ARCH).unwrap();
+    let (_, text, _) = ops::emit_module(arch).unwrap();
+    let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();
     let fresh =
-        peacemaker_isa::native::bundle(&elf, ARCH, peacemaker_isa::native::DEFAULT_HOST_TARGET);
+        peacemaker_isa::native::bundle(&elf, arch, peacemaker_isa::native::DEFAULT_HOST_TARGET);
     assert!(
         committed == fresh,
-        "{MODULE}: fresh emission differs from the committed bundle {path}"
+        "{module}: fresh emission differs from the committed bundle {path}"
     );
 }
 
 /// The same `.text` through the ROCm oracle's `llvm-mc` + `ld.lld`.
 #[test]
 fn committed_bundle_text_equals_oracle_link() {
+    for arch in ARCHS {
+        committed_bundle_text_equals_oracle_link_on(arch);
+    }
+}
+
+fn committed_bundle_text_equals_oracle_link_on(arch: Arch) {
+    let module = ops::module(arch);
     let _ = require_rocm_tool!("llvm-mc");
     let _ = require_rocm_tool!("ld.lld");
-    let committed = std::fs::read(bundle_path()).unwrap();
-    let text = ops::emit_module(ARCH).unwrap().1;
+    let committed = std::fs::read(bundle_path(&module)).unwrap();
+    let text = ops::emit_module(arch).unwrap().1;
     assert!(
-        text_section(&link(&text, ARCH.name(), MODULE)) == text_section(&committed),
-        "{MODULE}: oracle-linked emission differs from the committed bundle"
+        text_section(&link(&text, arch.name(), &module)) == text_section(&committed),
+        "{module}: oracle-linked emission differs from the committed bundle"
     );
 }
 
@@ -184,18 +219,25 @@ fn committed_bundle_text_equals_oracle_link() {
 /// (`peacemaker-isa emit --kernel moe_slot_ops_pm ... --shape crates/peacemaker-isa/kernels/moe_slot_ops_pm.gfx1201.contract.json`).
 #[test]
 fn committed_contract_equals_fresh_contract() {
+    for arch in ARCHS {
+        committed_contract_equals_fresh_contract_on(arch);
+    }
+}
+
+fn committed_contract_equals_fresh_contract_on(arch: Arch) {
+    let symbol = ops::symbol(arch);
     let path = format!(
         "{}/kernels/moe_slot_ops_pm.{}.contract.json",
         env!("CARGO_MANIFEST_DIR"),
-        ARCH.name()
+        arch.name()
     );
     let committed: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}")))
             .unwrap();
-    let emitted = ops::emit(ARCH).unwrap();
-    let fresh = ops::contract(ARCH, &emitted);
+    let emitted = ops::emit(arch).unwrap();
+    let fresh = ops::contract(arch, &emitted);
     assert_eq!(committed, fresh, "{path} is stale");
-    assert_eq!(committed["symbol"], SYMBOL);
+    assert_eq!(committed["symbol"], symbol);
     assert_eq!(committed["group_segment_fixed_bytes"], 0);
     assert_eq!(committed["launch_dynamic_lds_bytes"], 0);
     assert_eq!(committed["require_wave32"], true);
@@ -847,51 +889,58 @@ mod toolchain {
     /// linked ELF, obligation-free.
     #[test]
     fn module_passes_certification() {
+        for arch in ARCHS {
+            module_passes_certification_on(arch);
+        }
+    }
+
+    fn module_passes_certification_on(arch: Arch) {
+        let symbol = ops::symbol(arch);
         let _ = require_rocm_tool!("llvm-mc");
         let _ = require_rocm_tool!("ld.lld");
         let _ = require_rocm_tool!("clang-offload-bundler");
         let _ = require_rocm_tool!("llvm-objdump");
         let _ = require_rocm_tool!("llvm-readobj");
-        let (emitted, text, _) = ops::emit_module(ARCH).unwrap();
+        let (emitted, text, _) = ops::emit_module(arch).unwrap();
         for e in &emitted {
-            ledger_replay::replay_waits(&e.s_text, ARCH).unwrap();
+            ledger_replay::replay_waits(&e.s_text, arch).unwrap();
         }
         let dir = std::env::temp_dir().join(format!(
             "peacemaker-isa-moe-slot-ops-cert-{}-{}",
-            ARCH.name(),
+            arch.name(),
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let s = dir.join("module.s");
         std::fs::write(&s, &text).unwrap();
         let toolchain = Toolchain::oracle();
-        let build = build(&toolchain, &s, &dir.join("module.hsaco"), ARCH.name()).unwrap();
-        let m7 = pm_check::m7(&build.elf, ARCH.name(), SYMBOL)
-            .unwrap_or_else(|e| panic!("{SYMBOL}: {e}"));
+        let build = build(&toolchain, &s, &dir.join("module.hsaco"), arch.name()).unwrap();
+        let m7 = pm_check::m7(&build.elf, arch.name(), &symbol)
+            .unwrap_or_else(|e| panic!("{symbol}: {e}"));
         assert_eq!(
             (m7["lift"].as_str(), &m7["obligations"]),
             (Some("byte-exact"), &serde_json::json!({})),
-            "{SYMBOL}: {m7}"
+            "{symbol}: {m7}"
         );
         let path = format!(
             "{}/kernels/moe_slot_ops_pm.{}.contract.json",
             env!("CARGO_MANIFEST_DIR"),
-            ARCH.name()
+            arch.name()
         );
         let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(json, ops::contract(ARCH, &emitted[0]), "{path} is stale");
+        assert_eq!(json, ops::contract(arch, &emitted[0]), "{path} is stale");
         let contract = serde_json::from_slice(&raw).unwrap();
         certify(
             &toolchain,
             &build,
             &s,
-            ARCH.name(),
+            arch.name(),
             &dir.join("manifest.json"),
             Some(&contract),
             "test",
             "test",
         )
-        .unwrap_or_else(|e| panic!("{SYMBOL}: {e}"));
+        .unwrap_or_else(|e| panic!("{symbol}: {e}"));
     }
 }

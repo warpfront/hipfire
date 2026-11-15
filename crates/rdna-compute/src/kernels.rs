@@ -10600,6 +10600,12 @@ pub const EP_TILE_PULL_N8_PM_GFX1100: &[u8] =
 /// Ascending top-k F32 FMA accumulation followed by an RN residual add; no LDS or atomics.
 pub const MOE_SLOT_OPS_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/moe_slot_ops_pm_gfx1201.hxaco");
+/// Builder (PeaceMaker) grouped BF16-input down combine for gfx1100 (`kernels/moe_slot_ops_pm_gfx1100.hxaco`).
+pub const MOE_SLOT_OPS_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/moe_slot_ops_pm_gfx1100.hxaco");
+/// Builder (PeaceMaker) grouped BF16-input down combine for gfx1151 (`kernels/moe_slot_ops_pm_gfx1151.hxaco`).
+pub const MOE_SLOT_OPS_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/moe_slot_ops_pm_gfx1151.hxaco");
 
 /// Certified PeaceMaker BF16 grouped expert combine v2 twin, gfx1201
 /// (`peacemaker-isa emit --kernel moe_slot_ops_v2_pm --arch gfx1201`, 48-byte kernarg), a

@@ -2,11 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Builder-emitted (PeaceMaker) gfx1201 BF16-input top-k combine of the symmetric
+//! Builder-emitted (PeaceMaker) gfx1201 / gfx1100 / gfx1151 BF16-input top-k combine of the symmetric
 //! IU4 grouped MoE (`HIPFIRE_MOE_SYM_IU4`, prefill Path2): the twin of
 //! `moe_down_combine_grouped_k8` for the BF16 grouped down rows the symmetric
 //! down GEMM writes, `moe_down_combine_grouped_bf16in_pm_gfx1201` in the module
-//! `moe_slot_ops_pm_gfx1201`. gfx1201 only (gfx1100 / gfx1151 are refused).
+//! `moe_slot_ops_pm_<arch>`. gfx1201, gfx1100 and gfx1151 (every other arch is refused).
 //!
 //! ABI (eight arguments, 48 bytes): `y_grouped_bf16` `*u16` @0 (BF16 bits,
 //! `[grouped_rows, dim]`), `inverse_perm` `*i32` @8 (`[n_tokens * k_top]`, flat
@@ -50,13 +50,14 @@
 //! per lane, grid `[n_tokens, dim / 2048, 1]`. v1 above, its contract and bundle are frozen; see
 //! the `v2` section at the end of the file.
 use super::common::{add64, add64_imm, mem, op, s, s_add_i32, smem, sop, sr, srd_tail, v, vr};
+use crate::arch::WgIdSource;
 use crate::{
     insn::{Instruction, MemoryClass},
     plan::Access,
     reg::{Kind, Live, RegRef},
     Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan,
 };
-use peacemaker_author::{Gfx1201, Scc, Target, WgUniform, Workgroup};
+use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, Scc, Target, WgUniform, Workgroup};
 
 type R = Result<(), String>;
 
@@ -85,6 +86,9 @@ const Y: u8 = 8;
 const INV: u8 = 10;
 const WGT: u8 = 12;
 const XR: u8 = 14;
+/// gfx1100 pads the declared user SGPRs so user + system >= 16 (`Arch::declared_user_sgprs`): the workgroup ids land
+/// on s14/s15, so `x_residual` is loaded to this spare pair instead.
+const XR_G1100: u8 = 48;
 const DIM: u8 = 16;
 const KTOP: u8 = 17;
 const GROWS: u8 = 18;
@@ -114,6 +118,29 @@ const YOFF: u8 = 42;
 /// The `m < dim` lane mask pair (the high word is never written in wave32 and held at zero).
 const LV: u8 = 44;
 const S_END: u8 = 48;
+const S_END_G1100: u8 = 56;
+/// Real user SGPRs (the kernarg pointer) and enabled system SGPRs (workgroup id x and y).
+const USER_SGPRS: u8 = 2;
+const SYSTEM_SGPRS: u8 = 2;
+
+/// gfx11 workgroup id SGPRs (x, y) right after the declared user SGPRs; gfx12 reads `ttmp9` / `ttmp7`.
+fn wg_in(arch: Arch) -> Result<(u8, u8), String> {
+    let ids = arch.workgroup_ids(arch.declared_user_sgprs(USER_SGPRS, SYSTEM_SGPRS))?;
+    match (ids.x, ids.y) {
+        (WgIdSource::Sgpr(x), WgIdSource::Sgpr(y)) => Ok((x, y)),
+        other => Err(format!(
+            "{KERNEL_ID}: no workgroup id SGPRs on {}: {other:?}",
+            arch.name()
+        )),
+    }
+}
+fn xr(arch: Arch) -> u8 {
+    if arch == Arch::Gfx1100 {
+        XR_G1100
+    } else {
+        XR
+    }
+}
 
 // ---- VGPRs ------------------------------------------------------------------
 const TID: u8 = 0;
@@ -137,11 +164,23 @@ fn kernargs() -> KernargLayout {
         .hidden("n_tokens", 44, 4, "by_value")
 }
 
-fn plan() -> Result<RegPlan, String> {
+fn plan(arch: Arch) -> Result<RegPlan, String> {
     let mut p = RegPlan::new(u16::from(V_END), 104)?;
     p.s::<2>("kernarg_ptr", KARG, Live::Whole)?;
-    for base in (8u8..S_END).step_by(8) {
-        p.add_range(&format!("s_blk{base}"), Kind::S, base, 8, Live::Whole)?;
+    if !arch.gfx12() {
+        p.s::<2>("wg_ids_in", wg_in(arch)?.0, Live::Whole)?;
+    }
+    if arch == Arch::Gfx1100 {
+        // s8..s13 kernarg words, s14/s15 the workgroup ids.
+        p.add_range("s_blk8", Kind::S, 8, 4, Live::Whole)?;
+        p.add_range("s_blk12", Kind::S, 12, 2, Live::Whole)?;
+        for base in (16u8..S_END_G1100).step_by(8) {
+            p.add_range(&format!("s_blk{base}"), Kind::S, base, 8, Live::Whole)?;
+        }
+    } else {
+        for base in (8u8..S_END).step_by(8) {
+            p.add_range(&format!("s_blk{base}"), Kind::S, base, 8, Live::Whole)?;
+        }
     }
     for base in (0u8..V_END).step_by(8) {
         p.add_range(&format!("v_blk{base}"), Kind::V, base, 8, Live::Whole)?;
@@ -149,11 +188,11 @@ fn plan() -> Result<RegPlan, String> {
     Ok(p)
 }
 
-/// The builder-emitted kernel (gfx1201 only; every other target is refused before any builder exists).
+/// The builder-emitted kernel (gfx1100, gfx1151 and gfx1201; every other target is refused before any builder exists).
 pub fn emit(arch: Arch) -> Result<Emitted, String> {
-    if arch != Arch::Gfx1201 {
+    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(format!(
-            "{KERNEL_ID}: built for gfx1201 only, not {}",
+            "{KERNEL_ID}: built for gfx1100, gfx1151 and gfx1201 only, not {}",
             arch.name()
         ));
     }
@@ -170,9 +209,13 @@ pub fn emit(arch: Arch) -> Result<Emitted, String> {
         wave32: true,
         cu_mode: false,
     };
-    let mut b = Builder::new(kspec, plan()?);
+    let mut b = Builder::new(kspec, plan(arch)?);
     b.enable_delay_alu();
-    kernel(&mut Workgroup::<Gfx1201, Builder>::new(&mut b)?)?;
+    match arch {
+        Arch::Gfx1100 => kernel(&mut Workgroup::<Gfx1100, Builder>::new(&mut b)?, arch)?,
+        Arch::Gfx1151 => kernel(&mut Workgroup::<Gfx1151, Builder>::new(&mut b)?, arch)?,
+        _ => kernel(&mut Workgroup::<Gfx1201, Builder>::new(&mut b)?, arch)?,
+    }
     b.finish()
 }
 
@@ -235,14 +278,27 @@ fn bstore_s(b: &mut Builder, data: u8, voff: u8, desc: u8, soff: u8) -> R {
 }
 
 // ---- kernel -----------------------------------------------------------------
-fn kernel<T: Target>(wg: &mut Workgroup<'_, T, Builder>) -> R {
+fn kernel<T: Target>(wg: &mut Workgroup<'_, T, Builder>, arch: Arch) -> R {
     let end = wg.exit(".Lcombine_end")?;
     let b = wg.isa();
-    smem(b, Y, 8, KARG, 0x00)?;
+    let xr = xr(arch);
+    if arch == Arch::Gfx1100 {
+        smem(b, Y, 4, KARG, 0x00)?;
+        smem(b, WGT, 2, KARG, 0x10)?;
+        smem(b, xr, 2, KARG, 0x18)?;
+    } else {
+        smem(b, Y, 8, KARG, 0x00)?;
+    }
     smem(b, DIM, 4, KARG, 0x20)?;
-    // Workgroup ids: gfx12 `ttmp9` (x) and `ttmp7[15:0]` (y).
-    sop(b, format!("s_mov_b32 s{WGX}, ttmp9"), &[WGX], &[])?;
-    sop(b, format!("s_and_b32 s{WGY}, ttmp7, 0xffff"), &[WGY], &[])?;
+    // Workgroup ids: gfx12 `ttmp9` (x) and `ttmp7[15:0]` (y); gfx11 the system SGPRs after the declared user SGPRs.
+    if arch.gfx12() {
+        sop(b, format!("s_mov_b32 s{WGX}, ttmp9"), &[WGX], &[])?;
+        sop(b, format!("s_and_b32 s{WGY}, ttmp7, 0xffff"), &[WGY], &[])?;
+    } else {
+        let (x, y) = wg_in(arch)?;
+        sop(b, format!("s_mov_b32 s{WGX}, s{x}"), &[WGX], &[x])?;
+        sop(b, format!("s_mov_b32 s{WGY}, s{y}"), &[WGY], &[y])?;
+    }
     // t >= n_tokens: the workgroup returns before any access.
     let outside = cmp_wg(
         wg,
@@ -254,7 +310,7 @@ fn kernel<T: Target>(wg: &mut Workgroup<'_, T, Builder>) -> R {
     let b = wg.isa();
     sop(
         b,
-        format!("{} s{T0}, s{KTOP}, -1", s_add_i32(Arch::Gfx1201)),
+        format!("{} s{T0}, s{KTOP}, -1", s_add_i32(arch)),
         &[T0],
         &[KTOP],
     )?;
@@ -314,7 +370,7 @@ fn kernel<T: Target>(wg: &mut Workgroup<'_, T, Builder>) -> R {
         &[BYTES],
         &[BYTES],
     )?;
-    srd(b, SRD_X, XR, BYTES)?;
+    srd(b, SRD_X, xr, BYTES)?;
     // The lane-mask pair's high word (wave32 never writes it; VOP3 reads the pair).
     sop(b, format!("s_mov_b32 s{}, 0", LV + 1), &[LV + 1], &[])?;
     // Lane column m = 256 wg_y + tid and its byte offsets; lanes with m >= dim leave exec.
@@ -391,7 +447,7 @@ fn kernel<T: Target>(wg: &mut Workgroup<'_, T, Builder>) -> R {
         add64_imm(b, WP, 4)?;
         sop(
             b,
-            format!("{} s{KLEFT}, s{KLEFT}, -1", s_add_i32(Arch::Gfx1201)),
+            format!("{} s{KLEFT}, s{KLEFT}, -1", s_add_i32(arch)),
             &[KLEFT],
             &[KLEFT],
         )?;
