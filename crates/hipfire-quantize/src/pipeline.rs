@@ -6090,6 +6090,12 @@ fn handle_moe_expert_3d(
                 .and_then(|t| t.get(x))
                 .filter(|v| v.len() == inner_k_e)
                 .map(|v| compute_awq_scales(v, awq_alpha_e));
+            // The `awq_scale` sidecar tells the runtime to divide x by `s`, so it
+            // may only ship for weights that were actually pre-scaled by `s`. The
+            // arms ahead of the AWQ arm (symmetric qt53, HIPFIRE_MOE_TIER_MAP,
+            // HIPFIRE_MOE_GRADED) encode UN-scaled weights even when
+            // `awq_scales` is Some; only the AWQ arm sets this.
+            let mut prescaled_by: Option<Vec<f32>> = None;
             let (quantized, qt, gs) = if moe_expert_down_sym && base_name == "down_proj" {
                 // Validated recipe (uniform symmetric MQ4, no promotion / AWQ /
                 // Lloyd / graded / tier-map) — the override is exclusive.
@@ -6222,9 +6228,10 @@ fn handle_moe_expert_3d(
                         256u32,
                     )
                 }
-            } else if let Some(scales) = awq_scales.as_ref() {
+            } else if let Some(scales) = awq_scales {
                 let mut scaled = f32_slice.clone();
-                awq_pre_scale_weights(&mut scaled, inner_m, inner_k_e, scales);
+                awq_pre_scale_weights(&mut scaled, inner_m, inner_k_e, &scales);
+                prescaled_by = Some(scales);
                 if down_mq6 {
                     (
                         quantize_mq6g256(&scaled, &signs1, &signs2),
@@ -6368,7 +6375,7 @@ fn handle_moe_expert_3d(
                 data: quantized,
                 spilled_len: 0,
             };
-            let sidecar = awq_scales.map(|s| HfqTensor {
+            let sidecar = prescaled_by.map(|s| HfqTensor {
                 name: format!("{parent_owned}{slot}.{base_owned}.awq_scale.weight"),
                 quant_type: QuantType::F16,
                 shape: vec![inner_k_e as u32],
@@ -9179,5 +9186,294 @@ mod route_sku_stamp_tests {
         assert_eq!(route_sku_for_recipe(false, true, true, true, true), None);
         assert_eq!(route_sku_for_recipe(true, false, true, true, true), None);
         assert_eq!(route_sku_for_recipe(true, true, false, true, true), None);
+    }
+}
+
+/// `HIPFIRE_MOE_TIER_MAP` / `HIPFIRE_MOE_GRADED` with `--awq --imatrix`: a
+/// routed expert's `awq_scale` sidecar tells the runtime to divide x by `s`, so
+/// it must ship if and only if that expert's weights were pre-scaled by `s`.
+/// Before the fix the tier-map and graded arms encoded un-scaled weights but
+/// still emitted the sidecar (`awq_scales` was computed for every expert).
+///
+/// The tests run the REAL `handle_moe_expert_3d`. `AWQ_ALPHA` is a write-once
+/// global, so each test re-executes itself in a child process that arms it,
+/// keeping AWQ off for every other test in this binary.
+#[cfg(test)]
+mod moe_expert_awq_sidecar_tests {
+    use super::*;
+    use safetensors::tensor::{serialize_to_file, TensorView};
+    use safetensors::Dtype;
+    use std::collections::HashMap;
+
+    const LAYER: usize = 3;
+    const NAME: &str = "model.language_model.layers.3.mlp.experts.down_proj";
+    const PARENT: &str = "model.language_model.layers.3.mlp.experts.";
+    const N_EXP: usize = 4;
+    const M: usize = 8;
+    const K: usize = 256;
+    const ALPHA: f32 = 0.5;
+    const CHILD_ENV: &str = "HIPFIRE_TEST_MOE_AWQ_SIDECAR_CHILD";
+
+    fn synth_bf16() -> Vec<u8> {
+        (0..N_EXP * M * K)
+            .flat_map(|i| {
+                let v = (((i * 37 + (i / 7) * 11) % 211) as f32 - 105.0) * 0.003;
+                ((v.to_bits() >> 16) as u16).to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// Expert-major `[e * K + j]`, strongly non-uniform so `s` is far from 1.
+    fn in_sum2() -> Vec<f32> {
+        (0..N_EXP * K)
+            .map(|i| 0.05 + ((i * 29 + (i / K) * 13) % 97) as f32 * 0.37)
+            .collect()
+    }
+
+    /// Minimal GGUF v3 imatrix: one 2-D F32 `in_sum2` tensor, dims `[K, N_EXP]`.
+    fn write_imatrix(dir: &Path) -> PathBuf {
+        let name = format!("blk.{LAYER}.ffn_down_exps.weight.in_sum2");
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&(K as u64).to_le_bytes());
+        out.extend_from_slice(&(N_EXP as u64).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // GGML_TYPE_F32
+        out.extend_from_slice(&0u64.to_le_bytes());
+        while out.len() % 32 != 0 {
+            out.push(0);
+        }
+        for v in in_sum2() {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        let path = dir.join("imatrix.gguf");
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    /// Re-run `test` in a child process with `AWQ_ALPHA` armed; in the child,
+    /// run `body`.
+    fn in_awq_child(test: &str, body: impl FnOnce()) {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let _ = AWQ_ALPHA.set(ALPHA);
+            assert_eq!(AWQ_ALPHA.get().copied(), Some(ALPHA));
+            body();
+            return;
+        }
+        let module = module_path!().split_once("::").map(|(_, m)| m).unwrap();
+        let full = format!("{module}::{test}");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([full.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child `{full}` failed\n--- stdout\n{stdout}\n--- stderr\n{stderr}"
+        );
+    }
+
+    fn run(tier_map: Option<HashMap<(usize, usize), QuantType>>, graded: bool) -> Vec<HfqTensor> {
+        for var in [
+            "HIPFIRE_AWQ_EXPERTS",
+            "HIPFIRE_MOE_EXPERTS_MQ6",
+            "HIPFIRE_MOE_DOWN_MQ6",
+            "HIPFIRE_MOE_EXPERTS_MQ5",
+            "HIPFIRE_MOE_DOWN_MQ5",
+        ] {
+            assert!(hipfire_config::developer_var(var).is_err(), "{var} is set");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let st_path = dir.path().join("experts.safetensors");
+        let bf16 = synth_bf16();
+        let view = TensorView::new(Dtype::BF16, vec![N_EXP, M, K], &bf16).unwrap();
+        serialize_to_file([(NAME, view)], None, &st_path).unwrap();
+        let st_files = vec![SafetensorsFile::open(&st_path).unwrap()];
+        let (meta, raw_data) = st_files[0].tensor_data(NAME).unwrap();
+        let imx_path = write_imatrix(dir.path());
+        let imatrix = Some(gguf_input::GgufFile::open(&imx_path).unwrap());
+        let ctx = PerTensorCtx {
+            name: NAME,
+            file_idx: 0,
+            n_elements: N_EXP * M * K,
+            arch_id: 5,
+            is_vision: false,
+        };
+        let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
+        let mut quantized_params = 0u64;
+        let mut spill: Option<TensorSpill> = None;
+        let handled = handle_moe_expert_3d(
+            &ctx,
+            meta,
+            raw_data,
+            true,
+            false,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            &imatrix,
+            &tier_map,
+            graded,
+            0.25,
+            &None,
+            false, // use_gptq_e8
+            false, // use_mq6g256
+            false, // use_mq4g256
+            true,  // use_mq4v2 (`--format mq4`)
+            false, // use_mq4v2_lloyd
+            false, // use_mq4_mq6exp
+            false, // use_mq4_mq2lloydexp
+            false, // use_mq4_mq2glexp
+            false, // use_mq4_mq2lloyd_native
+            false, // use_mq4_mq2lloyd_kmap
+            false, // use_mq4_mq2lloyd_imatrix
+            false, // use_mq4_mq3lloyd_kmap
+            false, // use_mq4_mqlloyd_tiered
+            false, // use_mq4_mqlloyd_antirez
+            false, // use_mq4_mqlloyd_antirez_gptq
+            false, // use_mq4_mq2lloyd_gptq_all
+            false, // use_mq5g256
+            false, // use_hfq6
+            false, // use_hfq4g256
+            false, // use_hfq_mixed
+            false, // use_mfp4e8
+            false, // use_mfp4e8soa
+            false, // use_mq3g256
+            false, // use_mq2g256_lloyd
+            false, // use_mq3g256_lloyd
+            false, // routed_gl
+            false, // moe_expert_down_sym
+            &Some(imx_path.clone()),
+            false,
+            &None,
+            reap_overlay::ReapArch::Qwen35,
+            &st_files,
+            &HashMap::new(),
+            &mut hfq_tensors,
+            &mut quantized_params,
+            &mut spill,
+        );
+        assert!(handled, "handler must claim the stacked expert tensor");
+        hfq_tensors
+    }
+
+    fn encode(qt: QuantType, w: &[f32]) -> Vec<u8> {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        match qt {
+            QuantType::MQ4G256 => quantize_mq4g256(w, &s1, &s2),
+            QuantType::MQ6G256 => quantize_mq6g256(w, &s1, &s2),
+            QuantType::MQ3G256Lloyd => quantize_mq3g256_lloyd(w, &s1, &s2),
+            QuantType::MQ2G256Lloyd => quantize_mq2g256_lloyd(w, &s1, &s2),
+            other => panic!("fixture does not expect {other:?}"),
+        }
+    }
+
+    /// Asserts, per expert: sidecar present => weights == encode(W·s) and the
+    /// sidecar holds s; sidecar absent => weights == encode(W). Returns the
+    /// emitted (qt, has_sidecar) per expert.
+    fn check_sidecar_iff_prescaled(tensors: &[HfqTensor]) -> Vec<(QuantType, bool)> {
+        let bf16 = synth_bf16();
+        let imx = in_sum2();
+        let by_name: HashMap<&str, &HfqTensor> =
+            tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+        assert_eq!(by_name.len(), tensors.len(), "duplicate tensor names");
+        let n_sidecars = tensors
+            .iter()
+            .filter(|t| t.name.ends_with(".awq_scale.weight"))
+            .count();
+        let mut seen = Vec::new();
+        for e in 0..N_EXP {
+            let w = by_name[format!("{PARENT}{e}.down_proj.weight").as_str()];
+            let side = by_name.get(format!("{PARENT}{e}.down_proj.awq_scale.weight").as_str());
+            let raw = &bf16[e * M * K * 2..(e + 1) * M * K * 2];
+            let unscaled: Vec<f32> = raw
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            let s = compute_awq_scales(&imx[e * K..(e + 1) * K], ALPHA);
+            let mut scaled = unscaled.clone();
+            awq_pre_scale_weights(&mut scaled, M, K, &s);
+            assert_ne!(
+                encode(w.quant_type, &scaled),
+                encode(w.quant_type, &unscaled)
+            );
+            match side {
+                Some(sc) => {
+                    assert_eq!(
+                        sc.data,
+                        awq_scales_to_f16_bytes(&s),
+                        "expert {e} sidecar bytes"
+                    );
+                    assert!(
+                        w.data == encode(w.quant_type, &scaled),
+                        "expert {e} ({:?}) ships an awq_scale sidecar but its weights are not pre-scaled by it (stray sidecar)",
+                        w.quant_type
+                    );
+                }
+                None => assert!(
+                    w.data == encode(w.quant_type, &unscaled),
+                    "expert {e} ({:?}) has no sidecar but its weights are not the plain encode",
+                    w.quant_type
+                ),
+            }
+            seen.push((w.quant_type, side.is_some()));
+        }
+        assert_eq!(
+            n_sidecars,
+            seen.iter().filter(|(_, s)| *s).count(),
+            "orphan sidecar"
+        );
+        assert_eq!(tensors.len(), N_EXP + n_sidecars);
+        seen
+    }
+
+    /// Positive control: without tier map / graded, the AWQ arm runs, so every
+    /// expert must carry a sidecar AND pre-scaled weights (proves the fixture
+    /// really arms expert AWQ, so the tests below cannot pass vacuously).
+    #[test]
+    fn awq_arm_ships_sidecars_with_prescaled_weights() {
+        in_awq_child("awq_arm_ships_sidecars_with_prescaled_weights", || {
+            let seen = check_sidecar_iff_prescaled(&run(None, false));
+            assert_eq!(seen, vec![(QuantType::MQ4G256, true); N_EXP]);
+        });
+    }
+
+    #[test]
+    fn tier_map_experts_ship_no_stray_awq_sidecar() {
+        in_awq_child("tier_map_experts_ship_no_stray_awq_sidecar", || {
+            let map = HashMap::from([
+                ((LAYER, 0), QuantType::MQ4G256),
+                ((LAYER, 1), QuantType::MQ3G256Lloyd),
+                ((LAYER, 2), QuantType::MQ6G256),
+                // expert 3 unmapped -> MQ4G256 fallback
+            ]);
+            let seen = check_sidecar_iff_prescaled(&run(Some(map), false));
+            assert_eq!(
+                seen,
+                vec![
+                    (QuantType::MQ4G256, false),
+                    (QuantType::MQ3G256Lloyd, false),
+                    (QuantType::MQ6G256, false),
+                    (QuantType::MQ4G256, false),
+                ]
+            );
+        });
+    }
+
+    /// No `.counts` in the fixture imatrix, so graded sends every expert to
+    /// MQ2-Lloyd.
+    #[test]
+    fn graded_experts_ship_no_stray_awq_sidecar() {
+        in_awq_child("graded_experts_ship_no_stray_awq_sidecar", || {
+            let seen = check_sidecar_iff_prescaled(&run(None, true));
+            assert_eq!(seen, vec![(QuantType::MQ2G256Lloyd, false); N_EXP]);
+        });
     }
 }
