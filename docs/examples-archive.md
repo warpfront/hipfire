@@ -14,6 +14,20 @@ commit (the last commit that touched it) and re-add its `[[example]]` block
 git show <sha>:<path> > <path>
 ```
 
+## hipfire-ds4-parent
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `ds4_parent_attn_mixed_smoke` | `crates/hipfire-ds4-parent/examples/ds4_parent_attn_mixed_smoke.rs` | `bf6ec9ddf240` | 671 | Gate 5 attention lift smoke: run parent attention on one layer of each compress_ratio class against the real checkpoint. |
+| `ds4_parent_attn_smoke` | `crates/hipfire-ds4-parent/examples/ds4_parent_attn_smoke.rs` | `113c668b9684` | 290 | Gate 4 parent-attention smoke: load layer 0 (compress_ratio == 0) without experts and run parent_attention_swa over 16 rows at start_pos = 0. |
+| `ds4_parent_compressor_smoke` | `crates/hipfire-ds4-parent/examples/ds4_parent_compressor_smoke.rs` | `bf6ec9ddf240` | 858 | Gate 5 parent-compressor smoke: load layers 2..4 (ratio-4 then ratio-128) without experts and run parent_compressor_forward over 16 rows at start_pos = 0 for both the… |
+| `ds4_parent_gpu_linear_smoke` | `crates/hipfire-ds4-parent/examples/ds4_parent_gpu_linear_smoke.rs` | `bf6ec9ddf240` | 562 | Gate 3 slice GpuLinear — first runtime validation of gemm_bf16_mfma_gfx942 plus parent/linear.rs residency path. |
+| `ds4_parent_head_smoke` | `crates/hipfire-ds4-parent/examples/ds4_parent_head_smoke.rs` | `bf6ec9ddf240` | 501 | Gate 5 head smoke: embed + hc_head + final RMSNorm + lm_head on real weights. |
+| `ds4_parent_indexer_smoke` | `crates/hipfire-ds4-parent/examples/ds4_parent_indexer_smoke.rs` | `bf6ec9ddf240` | 498 | Gate 5 parent-indexer smoke: load layer 2 (first compress_ratio == 4) without experts and run parent_indexer_forward over 16 rows. |
+| `ds4_parent_layer_smoke` | `crates/hipfire-ds4-parent/examples/ds4_parent_layer_smoke.rs` | `bf6ec9ddf240` | 340 | Gate 4 parent-layer canary: load layer 0 with experts and run parent_layer_forward_traced over 16 rows at start_pos = 0. |
+| `ds4_parent_moe_smoke` | `crates/hipfire-ds4-parent/examples/ds4_parent_moe_smoke.rs` | `bf6ec9ddf240` | 337 | Gate 4 parent-MoE smoke: load one real layer with experts and run parent_moe_forward over 16 rows of plausible activations. |
+| `ds4_parent_seq_plog` | `crates/hipfire-ds4-parent/examples/ds4_parent_seq_plog.rs` | `bf6ec9ddf240` | 108 | Sequential parent forward (token-by-token) for long-seq diagnostics. |
+
 ## hipfire-runtime
 
 | Example | Path | Last commit | LOC | Purpose |

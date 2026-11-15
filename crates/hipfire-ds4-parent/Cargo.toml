@@ -38,33 +38,21 @@ libloading.workspace = true
 # Run on demand:  cargo build -p <crate> --examples --features lab
 # The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
 # ---------------------------------------------------------------------------
-[[example]]
-name = "ds4_parent_attn_mixed_smoke"
-required-features = ["lab"]
 
 [[example]]
 name = "ds4_parent_attn_oracle"
 required-features = ["lab"]
 
-[[example]]
-name = "ds4_parent_attn_smoke"
-required-features = ["lab"]
 
 [[example]]
 name = "ds4_parent_codec_gate"
 required-features = ["lab"]
 
-[[example]]
-name = "ds4_parent_compressor_smoke"
-required-features = ["lab"]
 
 [[example]]
 name = "ds4_parent_forward_gate"
 required-features = ["lab"]
 
-[[example]]
-name = "ds4_parent_gpu_linear_smoke"
-required-features = ["lab"]
 
 [[example]]
 name = "ds4_parent_hc_smoke"
@@ -74,17 +62,11 @@ required-features = ["lab"]
 name = "ds4_parent_head_residual_compare"
 required-features = ["lab"]
 
-[[example]]
-name = "ds4_parent_head_smoke"
-required-features = ["lab"]
 
 [[example]]
 name = "ds4_parent_indexer_causality"
 required-features = ["lab"]
 
-[[example]]
-name = "ds4_parent_indexer_smoke"
-required-features = ["lab"]
 
 [[example]]
 name = "ds4_parent_inventory_gate"
@@ -102,9 +84,6 @@ required-features = ["lab"]
 name = "ds4_parent_layer_gate"
 required-features = ["lab"]
 
-[[example]]
-name = "ds4_parent_layer_smoke"
-required-features = ["lab"]
 
 [[example]]
 name = "ds4_parent_linear_gate"
@@ -118,9 +97,6 @@ required-features = ["lab"]
 name = "ds4_parent_moe_floor"
 required-features = ["lab"]
 
-[[example]]
-name = "ds4_parent_moe_smoke"
-required-features = ["lab"]
 
 [[example]]
 name = "ds4_parent_plumbing_probe"
@@ -138,9 +114,6 @@ required-features = ["lab"]
 name = "ds4_parent_residual_stage_content"
 required-features = ["lab"]
 
-[[example]]
-name = "ds4_parent_seq_plog"
-required-features = ["lab"]
 
 [[example]]
 name = "ds4_tokenize_corpus"
