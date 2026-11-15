@@ -918,6 +918,7 @@ fn batch_lane_done_metrics_guard_zero_and_one_token() {
     assert_eq!(z.prefill_tok_s, 0.0);
     assert_eq!(z.tok_s, 0.0);
     assert_eq!(z.decode_tok_s, 0.0);
+    assert_eq!(z.decode_ms, 0.0);
     assert!(z.latency_ms.is_finite() && z.tok_s.is_finite() && z.decode_tok_s.is_finite());
 
     // Single generated token: tok_s uses wall; decode_tok_s uses post-first span.
@@ -931,6 +932,7 @@ fn batch_lane_done_metrics_guard_zero_and_one_token() {
     assert!((one.prefill_tok_s - 160.0).abs() < 1e-6); // 16 / 0.1s
     assert!((one.tok_s - 5.0).abs() < 1e-6); // 1 / 0.2s
     assert!((one.decode_tok_s - 20.0).abs() < 1e-6); // 1 / 0.05s
+    assert!((one.decode_ms - 50.0).abs() < 1e-6); // first token -> finish
     assert!(one.tok_s.is_finite() && one.decode_tok_s.is_finite());
 
     // Zero generated keeps decode rate at 0 even with stamps.
@@ -960,6 +962,7 @@ fn batch_lane_done_metrics_multi_token_decode_rate() {
     assert!((m.prefill_tok_s - 640.0).abs() < 1e-6); // 32 / 0.05s
     assert!((m.tok_s - (5.0 / 0.28)).abs() < 1e-6);
     assert!((m.decode_tok_s - 25.0).abs() < 1e-6);
+    assert!((m.decode_ms - 200.0).abs() < 1e-6);
     assert!(m.tok_s.is_finite() && m.decode_tok_s.is_finite() && m.prefill_tok_s.is_finite());
 }
 
