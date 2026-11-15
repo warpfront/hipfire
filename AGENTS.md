@@ -152,6 +152,17 @@ or vendoring this repository.
 
 # Rules
 
+## What hipfire is best at (performance leads)
+
+Performance is the project's identity. These are the current leads, each cited by its raw row id in the `ledger` of
+[`registry/receipts-v1.json`](registry/receipts-v1.json) ([`docs/PERF-LEDGER.md`](docs/PERF-LEDGER.md)):
+- Qwen3.8-27B `.mq4-xts` IU4 prefill, one R9700: about 5,000–5,300 tok/s (`27B-R-03` pp8192 5,171.9; `27B-R-01` pp4096 5,265.9; Iu4Audit re-measured about 5,300 at pp8192 on beta on 2026-11-15).
+- Qwen3.6-35B-A3B `.mq4rs`, one R9700: pp8192 20,035 tok/s (`A3B-R-01`).
+- Qwen3.8-27B `.mq4-xts`, one 7900 XTX: pp8192 3,001 tok/s (`27B-X-01`).
+- Flash-Next EP2 on 2× R9700: code C8 930.9 tok/s, 1.058× the published dual-R9700 reference (`FN-M-01`). Only that cell leads; the other five trail at 0.72–0.94× (`FN-M-02`).
+
+Perf work lifts the common path, every model on every card. Do not add a special route that only one model or card takes.
+
 ## Where facts live
 
 | Fact | Home |
