@@ -17,6 +17,7 @@ Bare `hipfire` (no subcommand) is equivalent to `hipfire tui`: it launches the t
 | `hipfire pull <tag> --ple auto\|q4\|q8\|all\|none` | For a split Flash-Next entry, choose which PLE row sidecar is downloaded next to the base (default `auto`: `memory.ple_format`, else q4 on gfx1151 / q8 elsewhere, the union over every detected GPU arch on a mixed host such as gfx1100 + gfx1151). See [Flash-Next split PLE layout](#flash-next-split-ple-layout). |
 | `hipfire pull <flash-next tag>` (trunk overlay) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.trunk-overlay` sidecar (~305.5 MB) next to the base, from a pin compiled into the client, only on a host with a gfx1151 GPU (or no detected GPU); a gfx1100/gfx1201 host skips it. See [Flash-Next trunk overlay](#flash-next-trunk-overlay). |
 | `hipfire pull <flash-next tag>` (expert hotset) | The four stock Flash-Next MQ4 XTS tags also fetch the `qwen3.8-flash-next.mq4-xts.expert-hotset` sidecar (217676 B, ~213 KiB) next to the base, selected by default (the interactive pull prompt asks it as the default-on **Expert hot set (R9700 and 7900 XTX decode, 213 KB)** yes/no choice; `--yes` and the TUI's Models-tab pull keep it), from a pin compiled into the client. See [Flash-Next expert hotset](#flash-next-expert-hotset). |
+| `hipfire pull <tag>` (download count) | After a pull has downloaded the base artifact, one `GET` of the repo's `config.json` so Hugging Face counts the download. Nothing else is sent. See [Hugging Face download count](#hugging-face-download-count). |
 | `hipfire ple derive [--format q4] [--rank PATH] <model>` / `hipfire ple split [--out PATH] [--keep-original] <model>` | Derive `<model>.ple-q4` from the Q8 rows, or split a monolithic model into a PLE-less base + `<base>.ple-q8`. `<model>` is a path or registry tag. |
 | `hipfire ple rebind --old-base PATH --new-base PATH --source PATH` | Copy an existing q4 PLE sidecar to `<new-base>.ple-q4` with a new base binding, only after proving both monolithic bases have identical embedded PLE descriptors and Q8 bytes. The source sidecar is never modified. |
 | `hipfire list [-r\|--remote] [-j\|--json]` | Local models; `-r` also lists pullable registry tags; user aliases from `quantize --register` appear separately. |
@@ -224,6 +225,27 @@ published registry.
 - **`rm` and listings.** `rm <tag>` removes the hotset with the base
   (`<file>.expert-hotset`). `*.expert-hotset` files are sidecars: never listed
   or served as models.
+
+### Hugging Face download count
+
+Hugging Face counts a model download server-side when one of the repo's query
+files is requested; with no registered library these are `config.json`,
+`config.yaml`, `hyperparams.yaml`, `params.json` and `meta.yaml`, and `GET` and
+`HEAD` both count ([Hub docs](https://huggingface.co/docs/hub/models-download-stats)).
+hipfire's `.mq4`/`.hfq` artifacts are not query files, so a `hipfire-models`
+repo carries a small `config.json`.
+
+- **When.** Once per `hipfire pull` (including the automatic pull of `run` /
+  `serve`) that downloaded the base artifact, after the pull finished. A pull
+  that finds the base already present, or fetches only sidecars, sends nothing.
+- **What.** `GET <endpoint>/<repo>/resolve/main/config.json`: the same kind of
+  request, to the same endpoint (`HIPFIRE_HF_BASE`, else `HF_ENDPOINT`, else
+  `https://huggingface.co`) and with the same `HF_TOKEN`, as the download itself.
+  No identifier, hardware detail or usage data is added, and nothing is stored.
+- **Failure.** A missing file, an offline host or a timeout (5 s) is ignored and
+  never fails or delays the pull beyond that bound.
+- **Reading the number.** The Hub counter counts requests, including our own
+  test fleet's pulls: it is an upper bound on downloads, never a user count.
 
 ## Inference
 

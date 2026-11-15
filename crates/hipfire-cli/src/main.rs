@@ -64,6 +64,7 @@ mod npu_trunk;
 mod ple;
 mod prefill_progress;
 mod process_identity;
+mod pull_count;
 mod pull_select;
 mod serve;
 mod setup;
@@ -2255,6 +2256,10 @@ fn pull_with_all_pins(
             sidecar.size_bytes,
             true,
         )?;
+    }
+    if needs_base {
+        // One Hugging Face-counted request per completed base download.
+        pull_count::count_download(&entry.repo);
     }
     Ok(Some(model_path))
 }
@@ -21586,6 +21591,69 @@ effort = "high"
     }
 
     #[test]
+    fn pull_requests_the_hf_count_file_once_per_base_download_and_never_fails_on_it() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        pull_count::ENABLED_IN_TESTS.with(|enabled| enabled.set(true));
+        let paths = test_paths("pull-hf-count");
+        let content = b"count-model-content";
+        use sha2::{Digest, Sha256};
+        let raw = format!(
+            r#"{{"schema_version":1,"generated_at":"2099-01-01T00:00:00Z","models":{{
+                "count-model":{{"repo":"test/count","file":"count-model.mq4","size_gb":0.001,
+                "min_vram_gb":1,"desc":"x","default_kv_mode":"bf16","sha256":"{:x}","size_bytes":{}}}
+            }},"aliases":{{}}}}"#,
+            Sha256::digest(content),
+            content.len()
+        );
+        write_test_registry_cache(&paths, &raw);
+        let attempts = || pull_count::ATTEMPTS.with(|count| count.get());
+        // Fresh pull: the base, then exactly one count request, after it.
+        let files = std::collections::HashMap::from([
+            (
+                "/test/count/resolve/main/count-model.mq4".to_owned(),
+                content.to_vec(),
+            ),
+            (
+                "/test/count/resolve/main/config.json".to_owned(),
+                b"{}".to_vec(),
+            ),
+        ]);
+        let (base, server) = pull_count::tests::recording_server(files, 2);
+        let hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_command(&paths, PullArgs::defaults("count-model")).unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "GET /test/count/resolve/main/count-model.mq4 HTTP/1.1",
+                "GET /test/count/resolve/main/config.json HTTP/1.1",
+            ]
+        );
+        assert_eq!(attempts(), 1);
+        drop(hf);
+        // Already downloaded: no download, so no count request.
+        pull_command(&paths, PullArgs::defaults("count-model")).unwrap();
+        assert_eq!(attempts(), 1);
+        // A repo without config.json (404) still pulls successfully.
+        fs::remove_file(paths.models.join("count-model.mq4")).unwrap();
+        let files = std::collections::HashMap::from([(
+            "/test/count/resolve/main/count-model.mq4".to_owned(),
+            content.to_vec(),
+        )]);
+        let (base, server) = pull_count::tests::recording_server(files, 2);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_command(&paths, PullArgs::defaults("count-model")).unwrap();
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(attempts(), 2);
+        assert_eq!(
+            fs::read(paths.models.join("count-model.mq4")).unwrap(),
+            content
+        );
+        pull_count::ENABLED_IN_TESTS.with(|enabled| enabled.set(false));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
     fn pull_stale_same_name_artifact_refreshes_atomically() {
         let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
@@ -21747,14 +21815,14 @@ effort = "high"
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct EnvGuard {
+    pub(crate) struct EnvGuard {
         key: String,
         prev: Option<std::ffi::OsString>,
     }
     impl EnvGuard {
-        fn set(key: &str, val: &str) -> Self {
+        pub(crate) fn set(key: &str, val: &str) -> Self {
             let prev = env::var_os(key);
             env::set_var(key, val);
             Self {
