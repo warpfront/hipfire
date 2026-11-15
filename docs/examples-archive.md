@@ -14,6 +14,12 @@ commit (the last commit that touched it) and re-add its `[[example]]` block
 git show <sha>:<path> > <path>
 ```
 
+## hipfire-arch-deepseek4
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `ep_dspark_topology_probe` | `crates/hipfire-arch-deepseek4/examples/ep_dspark_topology_probe.rs` | `a0fca0d6db3f` | 496 | Admission probe for the asymmetric gfx1201 topology: target TP3 on devices 0..2, dedicated DSpark drafter on device 3. |
+
 ## hipfire-arch-qwen4
 
 | Example | Path | Last commit | LOC | Purpose |
