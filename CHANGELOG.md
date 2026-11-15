@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.4.7 — (unreleased)
+
+0.4.7 is a bug-fix patch release on top of 0.4.6. It backports fixes from beta for bugs that 0.4.6 users can hit; it removes nothing and changes no default numerics. Every entry names its beta commit.
+
+### Fixes: serving and tool calls
+
+- **Fixed: a DeepSeek V4 `<｜DSML｜tool_calls>` block that parses only partly, or has stray text between DSML tags, is a malformed-DSML error instead of merged, dropped or empty tool calls (HIPF-320, HIPF-378; beta d78fbc1056, 9cec232b40).**
+- **Fixed: Cohere2-MoE reports `finish_reason: "length"` when `max_tokens` ends the turn, instead of `"stop"` (HIPF-379, beta 3a29d28b3b).**
+- **Fixed: a Muse Glimmer singleton request that stops at the KV cache cap reports `finish_reason: "length"`, and `tokens` matches the streamed tokens (HIPF-277, beta e737039509).**
+- **Fixed: the request `seed` is honoured on the Glimmer, LFM2-MoE, MiniMax, Cohere2-MoE and DeepSeek4 singleton routes (HIPF-380, HIPF-412; beta caf510a4e4, c70e47cda7).** They seeded from the wall clock (the DeepSeek4 heterogeneous route from a fixed seed) and ignored the wire `seed`. The `HIPFIRE_DEEPSEEK4_SEED` developer override still wins on the DeepSeek4 singleton AR route.
+
+### Fixes: vision
+
+- **Fixed: an image no longer erases the conversation (#1079, beta c73fbf04ad).** Images stay at their message position and the Qwen3.5/3.8-VL generator renders the whole conversation; several images in history are accepted.
+- **Fixed: a Qwen3.5-VL, dots.ocr or LFM2-VL turn cancelled after it finished decoding no longer stays resident (HIPF-365, #1132; beta e8aa5600c7, fed83686dd, 5cd5b2714b).**
+
+### Fixes: loading and model inputs
+
+- **Fixed: a runtime that cannot reserve GPU address space no longer fails the load with `hipMemAddressReserve: out of memory` after the weights upload (#1058, beta 7e3e774ff7).** Automatic KV selection now proves a reservation works before choosing the VMM backend.
+- **Fixed: LLaMA/Mistral/Qwen3 configs in the transformers 5 layout get their `rope_theta` (`rope_parameters.rope_theta`) instead of running theta 10000 (HIPF-206, beta 63f75014f0).** Configs in the older layout are unchanged.
+- **Fixed: the per-row extent check of the non-codec loaders covers every row-packed raw dtype, so a stale ragged payload is refused at load instead of decoding to garbage (HIPF-317, beta 2999deecab).**
+- **Fixed: Qwen3.5-family MoE decode no longer fails AR hipGraph capture with hipError 906 when a layer falls back to host top-K; such a model decodes eager (#1149, beta 0667c592d7).**
+
+### Fixes: gfx94x / gfx906 (MI300X)
+
+- **Fixed: Qwen3.5/3.6 MQ4G256 trunks wider than 256 (e.g. Qwen3.8-27B `.mq4r`) no longer produce garbage on gfx94x (#1136, beta 2c7606f306).** The split RMSNorm + MQ rotation indexed the norm weight per group instead of per element.
+- **Fixed: the default Q8 DeltaNet recurrence compiles on gfx906 / gfx94x again (#1136, beta 58dd700316).** GCN/CDNA keep the `shfl_down` reduction; RDNA builds are unchanged.
+- **Fail closed: on wave64 GCN/CDNA a Qwen3.5/3.6 model whose weight format has no wave64 GEMV is refused at load instead of failing the first request (#1136, beta c212dd922c).**
+
+### Fixes: Flash-Next on gfx1201
+
+- **Fixed: Flash-Next expert parallelism (EP2 on two R9700) no longer aborts the load with `thread 'hipfire-qwen4-ep-rank1' has overflowed its stack`.** Peer ranks ran on 2 MiB worker threads while rank 0 runs on the 8 MiB main thread; the official 0.4.6 binaries (rustc 1.99.1) overflowed the peer rank in every EP2 load. Every rank worker now gets an 8 MiB stack, so the `RUST_MIN_STACK=8388608` workaround is no longer needed. (new fix; also proposed for beta)
+- **Fixed (kernel packs): a cold `hipfire run` of Flash-Next on gfx1201 no longer hipcc-compiles kernels the prebuilt pack lacked: the A8-trunk MQ6 symmetric-grid check during load (`qwen4_mq6_sym_check_gfx1201`), and after ready the lane WMMA GEMMs and prefill tiles (`qwen4_lane_wmma`, `qwen4_lwmma_tile`) and the wide-pass gate/up (`gemm_mq4g256v2_moe_grouped_top10_g32`) (the gfx1201 Flash-Next part of beta 7cec18dd79).**
+
+### Fixes: native Windows
+
+- **Fixed: `scripts/windows-check.ps1` writes `report.txt` again, and one unreadable display-adapter registry key no longer drops the GPU memory step (#1143).**
+- **Fixed: `hipfire fit` sees the GPUs (from HIP) and host RAM on Windows (#1145).** Linux output is unchanged.
+- **The daemon warns at start when it runs at Idle or BelowNormal priority, and `hipfire diag` shows the process priority class (#1144).** hipfire never changes the class.
+
 ## v0.4.6 — 2026-11-11
 
 0.4.6 is the freeze baseline for the 0.5.0 consolidation (#666). Entries are grouped by area.
