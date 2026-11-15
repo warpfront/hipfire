@@ -105,6 +105,11 @@ pub struct Qwen35Config {
     pub n_kv_heads: usize, // 2
     pub head_dim: usize,   // 256
     pub rope_theta: f32,
+    /// Long-context RoPE scaling, resolved by the engine
+    /// ([`hipfire_runtime::rope::rope_scaling`]).
+    pub rope_scaling: rdna_compute::rope::RopeScaling,
+    /// The checkpoint's native `max_position_embeddings`.
+    pub max_position_embeddings: usize,
     pub partial_rotary_factor: f32, // 0.25 — only 64/256 dims get RoPE
     /// True when a composite Qwen3.5-VL checkpoint is being used as a
     /// text-only model through its nested `text_config`.
@@ -884,6 +889,13 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
 
     let has_shared_expert = raw.shared_expert_intermediate_size > 0;
 
+    let rope_scaling = hipfire_runtime::rope::rope_scaling(tc)
+        .map_err(|e| format!("qwen35: rope_scaling: {e}"))?;
+    let max_position_embeddings = tc
+        .get("max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(262144) as usize;
+
     let mut config = Qwen35Config {
         dim,
         n_layers: raw.num_hidden_layers,
@@ -894,6 +906,8 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
         n_kv_heads,
         head_dim,
         rope_theta,
+        rope_scaling,
+        max_position_embeddings,
         partial_rotary_factor,
         is_vl_text,
         mrope_interleaved,
@@ -981,6 +995,28 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Result<Qwen35Config, String> {
 /// builds compatible metadata JSON from config.json.
 pub fn config_from_safetensors(source: &dyn ModelSource) -> Result<Qwen35Config, String> {
     config_from_metadata_json(source.metadata_json())
+}
+
+/// Positions the RoPE covers: `max_position_embeddings`, or the YaRN
+/// `factor x original` context.
+pub fn context_limit(config: &Qwen35Config) -> usize {
+    config
+        .rope_scaling
+        .context_limit(config.max_position_embeddings)
+}
+
+/// The full-attention rotary embedding.
+pub fn rope(config: &Qwen35Config) -> rdna_compute::rope::Rope {
+    rdna_compute::rope::Rope {
+        theta: config.rope_theta as f64,
+        scaling: config.rope_scaling,
+    }
+}
+
+/// The `RopeYarn` kernel argument for this config's rotary width.
+/// `RopeYarn::OFF` (identity) when no scaling is active.
+pub fn rope_yarn(config: &Qwen35Config) -> rdna_compute::rope::RopeYarn {
+    rope(config).yarn((config.head_dim as f32 * config.partial_rotary_factor) as usize)
 }
 
 #[cfg(test)]

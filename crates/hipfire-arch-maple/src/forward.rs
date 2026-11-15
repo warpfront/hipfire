@@ -162,6 +162,7 @@ fn decode_step_body(
                 head_dim,
                 n_rot,
                 cfg.rope_theta,
+                &rdna_compute::rope::RopeYarn::OFF,
             )
             .map_err(|e| format!("maple L{l}: rope: {e:?}"))?;
         }
@@ -1107,6 +1108,7 @@ pub fn forward_batch(
                 cfg.rope_theta,
                 b,
                 /*pos_offset=*/ 0,
+                &rdna_compute::rope::RopeYarn::OFF,
             )
             .map_err(|e| format!("maple L{l}: batch rope: {e:?}"))?;
         }

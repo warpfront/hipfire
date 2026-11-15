@@ -2717,6 +2717,7 @@ fn run_fullattn_layer_slots(
             config.mrope_section,
         )?;
     } else {
+        let yarn = crate::qwen35::config::rope_yarn(config);
         gpu.rope_partial_interleaved_f32_batched(
             &pbs.fa_q_batch,
             &pbs.fa_k_batch,
@@ -2728,6 +2729,7 @@ fn run_fullattn_layer_slots(
             config.rope_theta,
             n,
             0,
+            &yarn,
         )?;
     }
 
@@ -2956,6 +2958,7 @@ fn run_fullattn_moe_layer_slots(
             config.mrope_section,
         )?;
     } else {
+        let yarn = crate::qwen35::config::rope_yarn(config);
         gpu.rope_partial_interleaved_f32_batched(
             &pbs.fa_q_batch,
             &pbs.fa_k_batch,
@@ -2967,6 +2970,7 @@ fn run_fullattn_moe_layer_slots(
             config.rope_theta,
             n,
             0,
+            &yarn,
         )?;
     }
 

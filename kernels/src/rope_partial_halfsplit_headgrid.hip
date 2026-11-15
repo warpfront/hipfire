@@ -17,7 +17,8 @@ extern "C" __global__ void rope_partial_halfsplit_f32_headgrid(
     int n_heads_k,
     int head_dim,
     int n_rot,
-    float freq_base
+    float freq_base,
+    RopeYarn yarn
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int half = n_rot / 2;
@@ -26,8 +27,8 @@ extern "C" __global__ void rope_partial_halfsplit_f32_headgrid(
     int pos = *pos_buf;
     float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)n_rot);
     float angle = (float)pos * freq;
-    float cos_a = cosf(angle);
-    float sin_a = sinf(angle);
+    float cos_a, sin_a;
+    rope_yarn_sincos(angle, i, yarn, &sin_a, &cos_a);
 
     const int h = blockIdx.y;
     float* v = (h < n_heads_q) ? q + h * head_dim : k + (h - n_heads_q) * head_dim;

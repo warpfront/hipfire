@@ -21,18 +21,23 @@ use std::ffi::c_void;
 use crate::dispatch::{Gpu, GpuTensor};
 use hip_bridge::HipResult;
 
-pub(crate) const FA_PREP_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1100.hip");
+pub(crate) const FA_PREP_BATCHED_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
+    include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1100.hip")
+);
 /// gfx1151 twin: the same source under its own symbol, so either arch's
 /// kernel can change without touching the other's object.
 pub(crate) const FA_PREP_BATCHED_GFX1151_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
     "#define QWEN35_FA_PREP_BATCHED_KERNEL qwen35_fa_prep_batched_gfx1151\n",
     include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1100.hip")
 );
 pub(crate) const KV_PAIR_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0_pair_batched.gfx1100.hip");
-pub(crate) const FA_PREP_BATCHED_GFX1201_SRC: &str =
-    include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1201.hip");
+pub(crate) const FA_PREP_BATCHED_GFX1201_SRC: &str = concat!(
+    include_str!("../../../kernels/src/rope_yarn.h"),
+    include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1201.hip")
+);
 
 /// Output of the gfx1201 fused FA prep for the Q rows.
 pub enum FaPrepQOut<'a> {
@@ -75,6 +80,7 @@ impl Gpu {
         n_q_heads: usize,
         n_kv_heads: usize,
         batch_size: usize,
+        yarn: &crate::rope::RopeYarn,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.supports_dflash_fa_batch_fusions() {
@@ -99,6 +105,7 @@ impl Gpu {
             n_q_heads,
             n_kv_heads,
             batch_size,
+            yarn,
         )
     }
 
@@ -120,6 +127,7 @@ impl Gpu {
         n_q_heads: usize,
         n_kv_heads: usize,
         batch_size: usize,
+        yarn: &crate::rope::RopeYarn,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx1151() {
@@ -144,6 +152,7 @@ impl Gpu {
             n_q_heads,
             n_kv_heads,
             batch_size,
+            yarn,
         )
     }
 
@@ -165,6 +174,7 @@ impl Gpu {
         n_q_heads: usize,
         n_kv_heads: usize,
         batch_size: usize,
+        yarn: &crate::rope::RopeYarn,
     ) -> HipResult<()> {
         if !FA_PREP_BATCHED_GEOMETRIES.contains(&(n_q_heads, n_kv_heads)) {
             return Err(hip_bridge::HipError::new(
@@ -206,6 +216,7 @@ impl Gpu {
             &nq as *const _ as *mut c_void,
             &nkv as *const _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
+            yarn as *const _ as *mut c_void,
         ];
         // Per (head, token): interleaved read + norm read + q/gate/k writes.
         let bytes = batch_size * ((n_q_heads + n_kv_heads) * 256 * 4 * 2);
@@ -231,6 +242,7 @@ impl Gpu {
                 b.push_i32(nq);
                 b.push_i32(nkv);
                 b.push_i32(bs);
+                yarn.push(&mut b);
                 b
             },
         );
@@ -352,6 +364,7 @@ impl Gpu {
         n_q_heads: usize,
         n_kv_heads: usize,
         batch_size: usize,
+        yarn: &crate::rope::RopeYarn,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch != "gfx1201" {
@@ -439,6 +452,7 @@ impl Gpu {
             &nq as *const _ as *mut c_void,
             &nkv as *const _ as *mut c_void,
             &bs as *const _ as *mut c_void,
+            yarn as *const _ as *mut c_void,
         ]);
         let rows = (n_q_heads + n_kv_heads) * batch_size;
         let q_bytes = if sp.is_some() { 256 + 4 } else { 256 * 4 };
@@ -472,6 +486,7 @@ impl Gpu {
                 b.push_i32(nq);
                 b.push_i32(nkv);
                 b.push_i32(bs);
+                yarn.push(&mut b);
                 b
             },
         );

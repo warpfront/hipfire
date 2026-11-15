@@ -39,7 +39,8 @@ __global__ void qwen35_fa_prep_kvwrite_gfx1100(
     const float* __restrict__ k_weight,
     const int* __restrict__ pos_buf,
     float eps,
-    float freq_base)
+    float freq_base,
+    RopeYarn yarn)
 {
     constexpr int NQ = 16;
     constexpr int HD = 256;
@@ -114,8 +115,8 @@ __global__ void qwen35_fa_prep_kvwrite_gfx1100(
         const int pos = *pos_buf;
         const float freq = 1.0f / powf(freq_base, (float)(2 * tid) / (float)NROT);
         const float angle = (float)pos * freq;
-        const float cos_a = cosf(angle);
-        const float sin_a = sinf(angle);
+        float cos_a, sin_a;
+        rope_yarn_sincos(angle, tid, yarn, &sin_a, &cos_a);
         const float x0 = sdata[tid];
         const float x1 = sdata[tid + HALF];
         out[tid] = x0 * cos_a - x1 * sin_a;

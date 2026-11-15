@@ -10,6 +10,11 @@
 // and cos/sin are multiplied by `mscale` (HF `attention_scaling`).
 // `freq_scale == 1 && mscale == 1` is plain RoPE: the angle and the sin/cos
 // pass through untouched, so unscaled launches stay bit-identical.
+//
+// Self-contained: assembled sources place this header before the kernel's own
+// `#include <hip/hip_runtime.h>`, and `__forceinline__` is defined there.
+
+#include <hip/hip_runtime.h>
 
 struct RopeYarn {
     float freq_scale;  // 1 / factor

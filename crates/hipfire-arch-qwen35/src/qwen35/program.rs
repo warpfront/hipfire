@@ -56,6 +56,7 @@ pub(crate) fn hybrid_dims(config: &Qwen35Config) -> HybridDims {
         head_dim: config.head_dim,
         n_rot: (config.head_dim as f32 * config.partial_rotary_factor) as usize,
         rope_theta: config.rope_theta,
+        rope_scaling: config.rope_scaling,
         norm_eps: config.norm_eps,
         linear_key_heads: config.linear_num_key_heads,
         linear_value_heads: config.linear_num_value_heads,
