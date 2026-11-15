@@ -848,8 +848,8 @@ __global__ void dspine_delta_finish_legacy_gfx1100(
     }
 }
 
-// ── batched F32 GEMM, 16x16 tile ────────────────────────────────────────
-// Each wave computes a 4x4 tile. Every output keeps the same lane-strided
+// ── batched F32 GEMM, 16x8 tile ─────────────────────────────────────────
+// Each wave computes a 4x2 tile. Every output keeps the same lane-strided
 // accumulation and shuffle tree as the legacy kernel.
 extern "C" __launch_bounds__(512, 2)
 __global__ void dspine_gemm_f32_batch_gfx1100(
@@ -865,36 +865,36 @@ __global__ void dspine_gemm_f32_batch_gfx1100(
     const int m_group = wave & 3;
     const int n_group = wave >> 2;
     const long long m0 = (long long)blockIdx.x * 16 + (long long)m_group * 4;
-    const int n0 = blockIdx.y * 16 + n_group * 4;
+    const int n0 = blockIdx.y * 8 + n_group * 2;
     const float* a[4] = {
         A + m0 * K,
         A + (m0 + 1) * K,
         A + (m0 + 2) * K,
         A + (m0 + 3) * K,
     };
-    float acc[4][4] = {};
+    float acc[4][2] = {};
     for (int k = lane; k < K; k += 32) {
-        float b[4];
-        for (int j = 0; j < 4; ++j) {
+        float b[2];
+        for (int j = 0; j < 2; ++j) {
             b[j] = n0 + j < N ? B[(long long)(n0 + j) * K + k] : 0.0f;
         }
         for (int i = 0; i < 4; ++i) {
             const float av = a[i][k];
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < 2; ++j) {
                 acc[i][j] += av * b[j];
             }
         }
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
         for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < 2; ++j) {
                 acc[i][j] += __shfl_down(acc[i][j], offset, 32);
             }
         }
     }
     if (lane == 0) {
         for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < 2; ++j) {
                 const int n = n0 + j;
                 if (n < N) {
                     Y[(long long)n * M + m0 + i] = acc[i][j];
@@ -904,7 +904,7 @@ __global__ void dspine_gemm_f32_batch_gfx1100(
     }
 }
 
-// ── delta GEMM + finish, 16x16 tile ─────────────────────────────────────
+// ── delta GEMM + finish, 16x8 tile ──────────────────────────────────────
 extern "C" __launch_bounds__(512, 2)
 __global__ void dspine_delta_finish_gfx1100(
     const float* __restrict__ write_w,
@@ -921,37 +921,37 @@ __global__ void dspine_delta_finish_gfx1100(
     const int m_group = wave & 3;
     const int n_group = wave >> 2;
     const long long m0 = (long long)blockIdx.x * 16 + (long long)m_group * 4;
-    const int n0 = blockIdx.y * 16 + n_group * 4;
+    const int n0 = blockIdx.y * 8 + n_group * 2;
     const float* w[4] = {
         write_w + m0 * R,
         write_w + (m0 + 1) * R,
         write_w + (m0 + 2) * R,
         write_w + (m0 + 3) * R,
     };
-    float acc[4][4] = {};
+    float acc[4][2] = {};
     for (int k = lane; k < R; k += 32) {
-        float msg[4];
-        for (int j = 0; j < 4; ++j) {
+        float msg[2];
+        for (int j = 0; j < 2; ++j) {
             msg[j] = n0 + j < N
                          ? message[(long long)(n0 + j) * R + k]
                          : 0.0f;
         }
         for (int i = 0; i < 4; ++i) {
             const float weight = w[i][k];
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < 2; ++j) {
                 acc[i][j] += weight * msg[j];
             }
         }
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
         for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
+            for (int j = 0; j < 2; ++j) {
                 acc[i][j] += __shfl_down(acc[i][j], offset, 32);
             }
         }
     }
     if (lane == 0) {
-        for (int j = 0; j < 4; ++j) {
+        for (int j = 0; j < 2; ++j) {
             const int n = n0 + j;
             if (n < N && (n % T) != 0) {
                 const float scale = rms[n];
