@@ -40,9 +40,6 @@ serde_json.workspace = true
 # Run on demand:  cargo build -p <crate> --examples --features lab
 # The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
 # ---------------------------------------------------------------------------
-[[example]]
-name = "dump_gemma4_hidden_states"
-required-features = ["lab"]
 
 [[example]]
 name = "hfq4_gemm_parity"
@@ -56,6 +53,3 @@ required-features = ["lab"]
 name = "verify_drafter_gemma4"
 required-features = ["lab"]
 
-[[example]]
-name = "verify_overlap_gemma4"
-required-features = ["lab"]

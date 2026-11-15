@@ -20,6 +20,13 @@ git show <sha>:<path> > <path>
 |---|---|---|---|---|
 | `ep_dspark_topology_probe` | `crates/hipfire-arch-deepseek4/examples/ep_dspark_topology_probe.rs` | `a0fca0d6db3f` | 496 | Admission probe for the asymmetric gfx1201 topology: target TP3 on devices 0..2, dedicated DSpark drafter on device 3. |
 
+## hipfire-arch-gemma4
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `dump_gemma4_hidden_states` | `crates/hipfire-arch-gemma4/examples/dump_gemma4_hidden_states.rs` | `bf6ec9ddf240` | 144 | Dump per-layer hidden states from the Gemma 4 dense forward for offline comparison against the HF transformers oracle (arch bring-up validation). |
+| `verify_overlap_gemma4` | `crates/hipfire-arch-gemma4/examples/verify_overlap_gemma4.rs` | `6563dff7f0e0` | 239 | Reproduce the non-zero-position overlap used by Gemma 4 EAGLE verify. |
+
 ## hipfire-arch-qwen4
 
 | Example | Path | Last commit | LOC | Purpose |
