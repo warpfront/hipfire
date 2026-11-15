@@ -36,7 +36,10 @@ const OFFSETS: [u32; 8] = [0, 8, 16, 24, 32, 36, 40, 44];
 const ARCHS: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
 
 fn bundle_path(module: &str) -> String {
-    format!("{}/../../kernels/{module}.hxaco", env!("CARGO_MANIFEST_DIR"))
+    format!(
+        "{}/../../kernels/{module}.hxaco",
+        env!("CARGO_MANIFEST_DIR")
+    )
 }
 
 fn count(text: &str, mnemonic: &str) -> usize {
@@ -183,7 +186,7 @@ fn committed_bundle_equals_fresh_emission_on(arch: Arch) {
     let module = ops::module(arch);
     let path = bundle_path(&module);
     let committed = std::fs::read(&path).unwrap_or_else(|e| {
-        panic!("{path}: {e} (emit it: peacemaker-isa emit --kernel moe_slot_ops_pm --arch gfx1201 ... --bundle)")
+        panic!("{path}: {e} (emit it: peacemaker-isa emit --kernel moe_slot_ops_pm --arch {} ... --bundle)", arch.name())
     });
     let (_, text, _) = ops::emit_module(arch).unwrap();
     let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();

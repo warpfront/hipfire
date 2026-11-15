@@ -1,5 +1,5 @@
-//! Qwen4 symmetric IU4 MoE ORACLE (fn-moe-sym, gfx1151 + gfx1201; developer
-//! example).
+//! Qwen4 symmetric IU4 MoE ORACLE (fn-moe-sym, gfx1100 + gfx1151 + gfx1201;
+//! developer example; gfx1100 has the NT1 builder pair only, no anchors).
 //!
 //! Drives the production `Gpu` launchers of the opt-in route, the same calls
 //! the Qwen4 prefill makes under `HIPFIRE_QWEN4_MOE_SYM_IU4=1`:
@@ -42,7 +42,7 @@
 //! Needs `HIPFIRE_QWEN4_MOE_SYM_IU4=1` only for the route predicate report;
 //! the launchers themselves run regardless.
 //!
-//! a3b on gfx1201 (`--mode check|graph`) also runs the PM BF16-row combine
+//! a3b on an arch with a slot-ops object (`--mode check|graph`) also runs the PM BF16-row combine
 //! (`Gpu::moe_down_combine_grouped_bf16in_pm`) over the route's own grouped
 //! down rows and requires it bitwise equal to the HIP
 //! `moe_down_combine_grouped_k8` over the same rows widened BF16 -> F32
@@ -831,12 +831,20 @@ const MIXED_GFX1201: [Entry; 1] = [entry(
     true,
 )];
 const HIP_SYM_MODULE: &str = "qwen4_moe_iu4_sym_gfx1151";
+/// gfx1100 has one GEMM pair, the NT1 builder entries (`MOE_SYM_IU4_KERNELS[0]`).
+const ENTRIES_GFX1100: [Entry; 1] = [entry(
+    "pm_nt1",
+    "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100",
+    "qwen4_moe_down_iu4_sym_pm_gfx1100",
+    64,
+    true,
+)];
 
 fn entries(gpu: &Gpu) -> &'static [Entry] {
-    if gpu.arch == "gfx1201" {
-        &ENTRIES_GFX1201
-    } else {
-        &ENTRIES_GFX1151
+    match gpu.arch.as_str() {
+        "gfx1201" => &ENTRIES_GFX1201,
+        "gfx1100" => &ENTRIES_GFX1100,
+        _ => &ENTRIES_GFX1151,
     }
 }
 
@@ -2325,9 +2333,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     GEO.set(selected).map_err(|_| "geometry selected twice")?;
 
     let mut gpu = Gpu::init()?;
-    if !matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201") {
+    if !matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201") {
         return Err(format!(
-            "the symmetric IU4 MoE route is gfx1151/gfx1201-only, device is {}",
+            "the symmetric IU4 MoE route is gfx1100/gfx1151/gfx1201-only, device is {}",
             gpu.arch
         )
         .into());
@@ -2572,14 +2580,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if geo().name == "a3b" {
                 let key = "pm_combine_vs_hip_byte_mismatch_natural_unrouted";
-                if gpu.arch == "gfx1201" {
+                if gpu.moe_slot_ops_available() {
                     let mis = combine_mismatch(&mut gpu, &c, seed)?;
                     out.insert(key.into(), format!("[{},{}]", mis[0], mis[1]));
                     if mis[0] + mis[1] != 0 {
                         fails.push("PM combine differs from HIP combine".into());
                     }
                 } else {
-                    out.insert(key.into(), q("skipped_not_gfx1201"));
+                    out.insert(key.into(), q("skipped_no_slot_ops_object"));
                 }
             }
             let h_eager = md5_hex(&live_bytes(&g, &ygu, &ydn));

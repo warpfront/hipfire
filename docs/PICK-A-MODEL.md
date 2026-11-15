@@ -41,7 +41,7 @@ host. Decode is tok/s per request.
 | Strix Halo | `qwen3.8:27b-mq4-xts` + paired DFlash draft | DFlash | decode 135.3 (code) | 2026-10-13, v0.4.2 |
 | R9700 (32 GB) + host RAM | `qwen3.8:flash-next` (split base) | AR / native MTP (`--spec mtp`), hot set, same two prompts, 640 tokens | decode AR 49.7 (code), 45.6 (prose); MTP 82.9 (code), 48.5 (prose); prefill 6,647.8 (pp16384) | 2026-10-27, published v0.4.4 binary |
 | Strix Halo + XDNA2 | `qwen3.8-flash-next-gptq3.mq4` | NPU trunk prefill | 16,355-token prefill 2,472.7 tok/s | 2026-10-27, `943b5323da` |
-| R9700 (32 GB) | `qwen3.6:35b-a3b-mq4rs` (gfx1201 only) | AR, `bench --matrix` | decode 242.2 (tg128 at 128 context); prefill 11,788 (pp512), 19,867 (pp4096), 18,567 (pp16384) | 2026-10-27, published v0.4.4 binary |
+| R9700 (32 GB) | `qwen3.6:35b-a3b-mq4rs` (measured on gfx1201) | AR, `bench --matrix` | decode 242.2 (tg128 at 128 context); prefill 11,788 (pp512), 19,867 (pp4096), 18,567 (pp16384) | 2026-10-27, published v0.4.4 binary |
 
 ## Larger and newer families (registry floors)
 

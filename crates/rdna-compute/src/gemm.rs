@@ -759,11 +759,6 @@ pub(crate) fn hc_down_fused_selected(
         && !capturing
 }
 
-/// gfx1201's symmetric MoE uses the native image even when the gfx1151
-/// native-image kill switch is off.
-pub(crate) fn qwen4_moe_sym_native_selected(arch: &str, enabled: bool) -> bool {
-    arch == "gfx1201" || (arch == "gfx1151" && enabled)
-}
 /// HC-down (320 x 10240) tile, default on, `0` keeps the incumbent tile. gfx1151 (rows >= 2048):
 /// 160 x 64 pipelined instead of 64 x 64. gfx1201: [`LdsTileSplitK::HC_DOWN_GFX1201`] instead
 /// of the 64 x 128 / k64 split-K tile.
@@ -51850,29 +51845,25 @@ impl Gpu {
     /// Default ON by capability: requested unless the flag is explicitly false
     /// (`HIPFIRE_MOE_SYM_IU4=0`, the kill switch; unset and true both request) or
     /// the global IU4 prefill switch is explicitly off (`HIPFIRE_IU4_PREFILL=0`),
-    /// and only when the device selects the PeaceMaker native image (gfx1201; the
-    /// gfx1151 hipcc control is not part of this route), the frozen C2 A4 producer
-    /// candidate set is in force (`-DIU4_A4_CANDIDATES=2`, exactly as
+    /// and only when the device has a symmetric IU4 MoE descriptor
+    /// ([`Self::qwen4_moe_sym_kernel`]: `has_iu4_wmma` plus a descriptor row,
+    /// today gfx1100, gfx1151 and gfx1201) whose PeaceMaker native image is
+    /// selected (the gfx1151 hipcc control under `HIPFIRE_QWEN4_MOE_SYM_PM=0` is
+    /// not part of this route), the frozen C2 A4 producer candidate set is in
+    /// force (`-DIU4_A4_CANDIDATES=2`, exactly as
     /// [`Self::qwen4_moe_sym_iu4_requested`]), and the slot-ops builder object
     /// exists ([`Self::moe_slot_ops_available`]). Independent of
     /// `HIPFIRE_QWEN4_MOE_SYM_IU4`. Row count, shape plan and verified headers are
     /// checked separately; this route has no row floor of its own here.
     pub fn moe_sym_iu4_requested(&self) -> bool {
-        let mut candidates = self
-            .flags
-            .hipcc_extra_flags
-            .split_whitespace()
-            .filter(|flag| flag.starts_with("-DIU4_A4_CANDIDATES="))
-            .peekable();
-        let producer_ok =
-            candidates.peek().is_some() && candidates.all(|flag| flag == "-DIU4_A4_CANDIDATES=2");
-        let arch_ok = self.qwen4_moe_sym_arch_index().is_some()
-            && qwen4_moe_sym_native_selected(self.arch.as_str(), false);
+        let arch_ok = self
+            .qwen4_moe_sym_kernel()
+            .is_some_and(|kernel| moe_sym_iu4_native_selected(kernel, *QWEN4_MOE_SYM_PM));
         moe_sym_iu4_admits(
             *MOE_SYM_IU4,
             self.flags.iu4_prefill,
             arch_ok,
-            producer_ok,
+            iu4_a4_candidates_c2_only(&self.flags.hipcc_extra_flags),
             self.moe_slot_ops_available(),
         )
     }
@@ -52734,8 +52725,10 @@ impl Gpu {
     /// Runs the exact PeaceMaker twin ([`Gpu::qwen4_moe_rotate128_i4_pm`]) when
     /// [`Gpu::moe_rotate_i4_pm_selected`] holds (`HIPFIRE_MOE_ROTATE_I4_PM=1` on exact
     /// gfx1201, the symmetric IU4 route requested, C2, a supported shape; off by default),
-    /// otherwise the HIP incumbent ([`Gpu::qwen4_moe_rotate128_i4_incumbent`]). Both write the
-    /// same bytes, so every caller migrates through this one method.
+    /// otherwise the descriptor's embedded row-local producer at its own `k` (gfx1100 K3,
+    /// `k == 640`), otherwise the HIP incumbent ([`Gpu::qwen4_moe_rotate128_i4_incumbent`],
+    /// any `k % 128 == 0`: the A3B down `k == 512` on gfx1100). All write the same bytes, so
+    /// every caller migrates through this one method.
     pub fn qwen4_moe_rotate128_i4(
         &mut self,
         h: &GpuTensor,
@@ -52755,14 +52748,16 @@ impl Gpu {
             k: producer_k,
         } = kernel.down_producer
         {
-            return self.qwen4_moe_rotate128_i4_embedded(
-                (module, image, symbol, producer_k),
-                h,
-                sorted,
-                k,
-                grouped_rows,
-                total_slots,
-            );
+            if k == producer_k {
+                return self.qwen4_moe_rotate128_i4_embedded(
+                    (module, image, symbol, producer_k),
+                    h,
+                    sorted,
+                    k,
+                    grouped_rows,
+                    total_slots,
+                );
+            }
         }
         if k == 0 || k % 128 != 0 || grouped_rows == 0 || total_slots == 0 {
             return Err(hip_bridge::HipError::new(
@@ -56411,9 +56406,16 @@ mod route_selector_tests {
 
     #[test]
     fn symmetric_moe_native_kill_switch_is_gfx1151_only() {
-        for enabled in [false, true] {
-            assert_eq!(qwen4_moe_sym_native_selected("gfx1151", enabled), enabled);
-            assert!(qwen4_moe_sym_native_selected("gfx1201", enabled));
+        for kernel in &MOE_SYM_IU4_KERNELS {
+            for enabled in [false, true] {
+                let expected = enabled || kernel.arch != "gfx1151";
+                assert_eq!(
+                    moe_sym_iu4_native_selected(kernel, enabled),
+                    expected,
+                    "{}",
+                    kernel.arch
+                );
+            }
         }
     }
 

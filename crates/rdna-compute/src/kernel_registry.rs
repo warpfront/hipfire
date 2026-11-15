@@ -3923,6 +3923,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "qwen4_moe_group_scatter",
             ]
         );
+        // Down A4 producer of the A3B symmetric IU4 expert route (down k == 512; the
+        // embedded K3 producer serves only k == 640).
+        add!(
+            "qwen4_moe_rotate128_i4",
+            kernels::QWEN4_MOE_ROTATE128_I4_SRC,
+            ["qwen4_moe_rotate128_i4"]
+        );
         add!(
             "qwen4_moe_sym_check_gfx1100",
             kernels::qwen4_moe_sym_check_gfx1100_src(),

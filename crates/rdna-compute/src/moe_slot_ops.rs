@@ -80,6 +80,26 @@ fn moe_slot_ops_kernel(arch: &str) -> Option<(&'static [u8], &'static str)> {
     }
 }
 
+/// Bundle name and device symbol of the v1 slot-ops combine for `arch`
+/// (what the admission log names); `None` where no builder object exists.
+pub fn moe_slot_ops_pm_names(arch: &str) -> Option<(&'static str, &'static str)> {
+    match arch {
+        "gfx1100" => Some((
+            "moe_slot_ops_pm_gfx1100",
+            MOE_DOWN_COMBINE_BF16IN_PM_GFX1100_SYMBOL,
+        )),
+        "gfx1151" => Some((
+            "moe_slot_ops_pm_gfx1151",
+            MOE_DOWN_COMBINE_BF16IN_PM_GFX1151_SYMBOL,
+        )),
+        "gfx1201" => Some((
+            "moe_slot_ops_pm_gfx1201",
+            MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL,
+        )),
+        _ => None,
+    }
+}
+
 /// Embedded image and device symbol (also the module key) of the v2 combine
 /// bundle for `arch`; `None` where no builder object exists. The anchor of
 /// `PrefillRoute::MoeCombineV2`'s raw inventory.

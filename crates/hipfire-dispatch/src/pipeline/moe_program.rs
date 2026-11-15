@@ -5385,6 +5385,7 @@ fn expert_iu4_should_log(level: ExpertIu4LogLevel, occurrence: u64) -> bool {
 /// unbound default.
 pub(super) fn expert_iu4_log_line(
     arch: &str,
+    gemm_module: &str,
     f: &ExpertIu4Facts,
     decision: &ExpertIu4Decision,
     occurrence: u64,
@@ -5411,13 +5412,18 @@ pub(super) fn expert_iu4_log_line(
                 ),
                 plan,
             ) {
+                // v2 exists on gfx1201 only (its admission requires the raw inventory row).
                 "moe_slot_ops_v2_pm_gfx1201[moe_down_combine_grouped_bf16in_v2_pm_gfx1201]"
+                    .to_string()
             } else {
-                "moe_slot_ops_pm_gfx1201[moe_down_combine_grouped_bf16in_pm_gfx1201]"
+                match rdna_compute::moe_slot_ops::moe_slot_ops_pm_names(arch) {
+                    Some((bundle, symbol)) => format!("{bundle}[{symbol}]"),
+                    None => "unreported".to_string(),
+                }
             };
             Some(format!(
                 "{head} requested={} admitted host_mapped={} graph_capture={} {common} \
-                 modules=qwen4_moe_iu4_sym_pm_gfx1201\
+                 modules={gemm_module}\
                  [{gate_up},{down}]\
                  +{combine}",
                 f.requested, plan.host_mapped, f.capturing_graph
@@ -5461,9 +5467,15 @@ fn log_expert_iu4(gpu: &Gpu, f: &ExpertIu4Facts, decision: &ExpertIu4Decision) {
     };
     let occurrence = SEEN[class].fetch_add(1, Ordering::Relaxed);
     if expert_iu4_should_log(level, occurrence) {
-        if let Some(line) =
-            expert_iu4_log_line(gpu.arch.as_str(), f, decision, occurrence + 1, symbols)
-        {
+        if let Some(line) = expert_iu4_log_line(
+            gpu.arch.as_str(),
+            gpu.qwen4_moe_sym_kernel()
+                .map_or("unreported", |k| k.module),
+            f,
+            decision,
+            occurrence + 1,
+            symbols,
+        ) {
             eprintln!("{line}");
         }
     }
@@ -5775,6 +5787,42 @@ mod tests {
     }
 
     /// An admitted A3B prefill chunk on a device that requested the route.
+    #[test]
+    fn admitted_log_line_names_the_arch_modules_on_gfx1100_and_gfx1151() {
+        let facts = admitted_facts();
+        let admitted = decide_expert_iu4(&facts);
+        for (arch, gemm, gu, down, bundle, symbol) in [
+            (
+                "gfx1100",
+                "qwen4_moe_iu4_sym_pm_gfx1100",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100",
+                "qwen4_moe_down_iu4_sym_pm_gfx1100",
+                "moe_slot_ops_pm_gfx1100",
+                "moe_down_combine_grouped_bf16in_pm_gfx1100",
+            ),
+            (
+                "gfx1151",
+                "qwen4_moe_iu4_sym_pm_gfx1151",
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4",
+                "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4",
+                "moe_slot_ops_pm_gfx1151",
+                "moe_down_combine_grouped_bf16in_pm_gfx1151",
+            ),
+        ] {
+            let line =
+                expert_iu4_log_line(arch, gemm, &facts, &admitted, 1, Some([gu, down])).unwrap();
+            for needle in [
+                format!("arch={arch}"),
+                format!("modules={gemm}[{gu},{down}]"),
+                format!("+{bundle}[{symbol}]"),
+            ] {
+                assert!(line.contains(&needle), "{needle}: {line}");
+            }
+            // Neither the gfx1201 GEMM module nor either gfx1201 combine is named.
+            assert!(!line.contains("gfx1201"), "{line}");
+        }
+    }
+
     fn admitted_facts() -> ExpertIu4Facts {
         ExpertIu4Facts {
             capability: Some((a3b_spec(), true)),
@@ -5962,7 +6010,14 @@ mod tests {
             None
         );
         assert_eq!(
-            expert_iu4_log_line("gfx1201", &hostile, &ExpertIu4Decision::Unbound, 1, None),
+            expert_iu4_log_line(
+                "gfx1201",
+                "qwen4_moe_iu4_sym_pm_gfx1201",
+                &hostile,
+                &ExpertIu4Decision::Unbound,
+                1,
+                None
+            ),
             None
         );
         assert_eq!(expert_iu4_log_level(&ExpertIu4Decision::Unbound), None);
@@ -6464,7 +6519,15 @@ mod tests {
 
         let facts = admitted_facts();
         let admitted = decide_expert_iu4(&facts);
-        let line = expert_iu4_log_line("gfx1201", &facts, &admitted, 1, Some(PM_NT4)).unwrap();
+        let line = expert_iu4_log_line(
+            "gfx1201",
+            "qwen4_moe_iu4_sym_pm_gfx1201",
+            &facts,
+            &admitted,
+            1,
+            Some(PM_NT4),
+        )
+        .unwrap();
         for needle in [
             "requested=true",
             "admitted",
@@ -6500,7 +6563,15 @@ mod tests {
             ..facts
         };
         let admitted_host = decide_expert_iu4(&host);
-        let line = expert_iu4_log_line("gfx1201", &host, &admitted_host, 1, Some(PM_NT8)).unwrap();
+        let line = expert_iu4_log_line(
+            "gfx1201",
+            "qwen4_moe_iu4_sym_pm_gfx1201",
+            &host,
+            &admitted_host,
+            1,
+            Some(PM_NT8),
+        )
+        .unwrap();
         for needle in ["host_mapped=true", "graph_capture=true", "_nt8"] {
             assert!(line.contains(needle), "{needle}: {line}");
         }
@@ -6513,7 +6584,15 @@ mod tests {
         // A resident admission the launcher widens (flag + shape) names the entries it launches:
         // gate/up NT8 and down NT4. It logs in its own class, distinct from both the NT4 resident
         // and host-mapped ones.
-        let line = expert_iu4_log_line("gfx1201", &facts, &admitted, 1, Some(PM_MIXED)).unwrap();
+        let line = expert_iu4_log_line(
+            "gfx1201",
+            "qwen4_moe_iu4_sym_pm_gfx1201",
+            &facts,
+            &admitted,
+            1,
+            Some(PM_MIXED),
+        )
+        .unwrap();
         assert!(line.contains("host_mapped=false"), "{line}");
         assert!(
             line.contains("[qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8,qwen4_moe_down_iu4_sym_pm_gfx1201_nt4]"),
@@ -6538,8 +6617,15 @@ mod tests {
             requested: false,
             ..facts
         };
-        let line = expert_iu4_log_line("gfx1100", &refused, &decide_expert_iu4(&refused), 1, None)
-            .unwrap();
+        let line = expert_iu4_log_line(
+            "gfx1100",
+            "qwen4_moe_iu4_sym_pm_gfx1100",
+            &refused,
+            &decide_expert_iu4(&refused),
+            1,
+            None,
+        )
+        .unwrap();
         assert!(line.contains("requested=false"), "{line}");
         assert!(
             line.contains(ExpertIu4Reject::NotRequested.reason()),
@@ -6554,8 +6640,15 @@ mod tests {
             },
             ..facts
         };
-        let line =
-            expert_iu4_log_line("gfx1201", &tight, &decide_expert_iu4(&tight), 1, None).unwrap();
+        let line = expert_iu4_log_line(
+            "gfx1201",
+            "qwen4_moe_iu4_sym_pm_gfx1201",
+            &tight,
+            &decide_expert_iu4(&tight),
+            1,
+            None,
+        )
+        .unwrap();
         assert!(line.contains("int4_mmq_x_scratch"), "{line}");
     }
 
@@ -6648,7 +6741,15 @@ mod tests {
             ..admitted_facts()
         };
         let decision = decide_expert_iu4(&recording);
-        let line = expert_iu4_log_line("gfx1201", &recording, &decision, 1001, None).unwrap();
+        let line = expert_iu4_log_line(
+            "gfx1201",
+            "qwen4_moe_iu4_sym_pm_gfx1201",
+            &recording,
+            &decision,
+            1001,
+            None,
+        )
+        .unwrap();
         for needle in [
             "WARNING",
             ExpertIu4Exclusion::RedlineRecording.reason(),
@@ -6690,7 +6791,15 @@ mod tests {
             ),
         ] {
             let decision = decide_expert_iu4(&facts);
-            let line = expert_iu4_log_line("gfx1201", &facts, &decision, 1, None).unwrap();
+            let line = expert_iu4_log_line(
+                "gfx1201",
+                "qwen4_moe_iu4_sym_pm_gfx1201",
+                &facts,
+                &decision,
+                1,
+                None,
+            )
+            .unwrap();
             assert!(line.starts_with("WARNING"), "{label}: {line}");
             assert!(line.contains(name), "{label}: {line}");
         }
@@ -6700,8 +6809,15 @@ mod tests {
             use_path2: false,
             ..admitted_facts()
         };
-        let line =
-            expert_iu4_log_line("gfx1201", &path1, &decide_expert_iu4(&path1), 1, None).unwrap();
+        let line = expert_iu4_log_line(
+            "gfx1201",
+            "qwen4_moe_iu4_sym_pm_gfx1201",
+            &path1,
+            &decide_expert_iu4(&path1),
+            1,
+            None,
+        )
+        .unwrap();
         assert!(!line.starts_with("WARNING"), "{line}");
         assert!(line.contains(ExpertIu4Reject::NotPath2.reason()), "{line}");
     }

@@ -234,7 +234,7 @@ The code prompt is mostly prompt copy (about 60%), which favours speculative
 drafting. Full record, TTFT/decode split and caveats:
 [docs/perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md](docs/perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md).
 
-`qwen3.6:35b-a3b-mq4rs` loads on gfx1201 only; see
+`qwen3.6:35b-a3b-mq4rs` loads on gfx1100, gfx1151 and gfx1201; see
 [MODELS.md](docs/MODELS.md). Flash-Next on a 24 GB card (7900 XTX) runs with
 host-mapped experts, so its speed depends on the host link; no v0.4.4
 measurement of it is listed here. Earlier releases, including the 0.4.2
@@ -256,7 +256,7 @@ The bundled registry (`registry/v1.json`) contains 94 curated entries
 |---|---|
 | Qwen 3.8 dense | `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-xts` (flagship), `-mq4-xt`, `-mq4-pro`; MQ3, MQ5 and MQ6 `-xt` / base / `-pro` tiers; drafts `qwen3.8:27b-draft-mq3` … `-mq6` |
 | Qwen 3.8 Flash | `qwen3.8:flash-next` (alias `qwen3.8:flash`; MQ4 XTS split base), `-mq3-xts`, `-mq2-xts`, `-mq2-xts-4500` |
-| Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `-mq2`, `-mq3p`, `-mq4p`, `-mfp4`, `-mq4r`, `-mq4rs` (symmetric experts, gfx1201 fast prefill), `-mq5`, `-mq6` |
+| Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `-mq2`, `-mq3p`, `-mq4p`, `-mfp4`, `-mq4r`, `-mq4rs` (symmetric experts, gfx1100 / gfx1151 / gfx1201 fast prefill), `-mq5`, `-mq6` |
 | Qwen 3.6 dense | `qwen3.6:27b-mq3`, draft `qwen3.6:27b-draft-mq3` (`qwen3.6:27b` and `qwen3.6:27b-draft` are retired in 0.5.0; use `qwen3.8:27b`) |
 | Qwen 3.5 dense | `qwen3.5:0.8b`, `2b`, `4b`, `9b`, `27b`, with `-mq3` / `-mq6` variants and `9b` / `27b` drafts |
 | Qwen 3.5 MoE | `qwen3.5:35b-a3b` |

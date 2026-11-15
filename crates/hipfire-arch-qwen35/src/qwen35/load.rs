@@ -6334,7 +6334,8 @@ pub(crate) fn expert_iu4_model_verdict(
 /// IU4 route and the user did not explicitly kill it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExpertIu4Refusal {
-    /// A device hosting MoE layers has no gfx1201 PM objects / producers.
+    /// A device hosting MoE layers has no symmetric IU4 MoE descriptor, slot-ops
+    /// combine object or C2 producers (today: anything but gfx1100/gfx1151/gfx1201).
     ArchIncapable,
     /// A layer is ineligible, headers are not symmetric, or the header
     /// verifier failed.
@@ -6391,9 +6392,10 @@ pub(crate) fn expert_iu4_load_decision(
 
 const EXPERT_IU4_ARTIFACT_CLASS: &str =
     "symmetric qt44 gate_up + qt53 down routed experts (MQ4G256V2 + MQ4G128V2)";
-const EXPERT_IU4_REMEDY: &str = "run on a gfx1201 build with the IU4 route, use the qt44 \
-    (mq4r/mq4rs) artifact, or set HIPFIRE_MOE_SYM_IU4=0 to explicitly accept the \
-    ~3.7x slower qt53 F32 prefill fallback";
+const EXPERT_IU4_REMEDY: &str = "run on a GPU with the symmetric IU4 MoE route (gfx1100, \
+    gfx1151 or gfx1201; on gfx1151 unset HIPFIRE_QWEN4_MOE_SYM_PM=0, which deselects the native \
+    image the route needs), use the qt44 (mq4r/mq4rs) artifact, or set HIPFIRE_MOE_SYM_IU4=0 to \
+    explicitly accept the much slower qt53 F32 prefill fallback";
 
 /// `DispatchError::UnsupportedVariant::arch` is `&'static str`; map the arches
 /// that reach this route and leave anything else empty (the message carries the
@@ -6532,8 +6534,8 @@ fn expert_iu4_layer_capability(
         return Ok(None);
     }
     let layer = ffn.layer_idx;
-    // Not killed, so `requested()` false means the device lacks the gfx1201 PM
-    // objects / combine object / C2 producers.
+    // Not killed, so `requested()` false means the device lacks the symmetric IU4
+    // MoE descriptor / PM image / combine object / C2 producers.
     let arch_capable = gpu.moe_sym_iu4_requested();
     let mut capability = None;
     let mut detail = format!(
@@ -6682,8 +6684,8 @@ fn finalize_expert_iu4(
     let mut detail = String::new();
     let mut spec = None;
     if !kill {
-        // Not killed, so `requested()` false means the device lacks the gfx1201
-        // PM objects / combine object / C2 producers.
+        // Not killed, so `requested()` false means the device lacks the symmetric
+        // IU4 MoE descriptor / PM image / combine object / C2 producers.
         let incapable = hosting
             .iter()
             .copied()
@@ -9324,7 +9326,7 @@ mod expert_iu4_load_tests {
                 variant,
                 "layer 3: detail",
                 "symmetric qt44 gate_up + qt53 down",
-                "gfx1201 build with the IU4 route",
+                "symmetric IU4 MoE route (gfx1100",
                 "qt44 (mq4r/mq4rs)",
                 "HIPFIRE_MOE_SYM_IU4=0",
             ] {

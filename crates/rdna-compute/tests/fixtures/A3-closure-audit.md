@@ -48,7 +48,7 @@ The private launch wrappers continue to resolve the same process-frozen switches
 |---|---|---|
 | `mq6_x4_pm_gfx1151_selected` | `crates/rdna-compute/src/gemm.rs:221` | arch, native switch, M/N; gfx1151 native admission at M >= 2560 and N >= 2048 |
 | `hc_down_tile_selected` | `crates/rdna-compute/src/gemm.rs:229` | arch, switch, M/K/rows, recording/capture; gfx1151 160x64 HC tile and gfx1201 split-K HC tile |
-| `qwen4_moe_sym_native_selected` | `crates/rdna-compute/src/gemm.rs:243` | arch, native switch; gfx1201 remains native with gfx1151 kill switch disabled |
+| `moe_sym_iu4_native_selected` | `crates/rdna-compute/src/gemm.rs` | descriptor, native switch; a descriptor without a hipcc twin (gfx1100, gfx1201) is always native, gfx1151 follows `HIPFIRE_QWEN4_MOE_SYM_PM` |
 | `mq6_x4_tile_selected` | `crates/rdna-compute/src/gemm.rs:1012` | arch, resolved explicit/auto tile, Plain/BF16/Regions/HC-write kind, M/K/N; existing U3 measured table and BV12 divisibility rule |
 | `lds256_tile_source_selected` | `crates/rdna-compute/src/gemm.rs:1030` | gfx1151 identity and entry; selected common versus Qwen4 LDS source/module, including 64x64 tile special case |
 | `qsa_select_pm_shape_fits` | `crates/rdna-compute/src/tensor_ops.rs:3636` | arch admission, pooled dtype, rows, index heads/dim, blocks, query stride and output capacity; checked raw-offset bounds |
