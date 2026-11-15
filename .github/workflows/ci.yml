@@ -86,6 +86,12 @@ jobs:
             # shards; only the never-run examples/benches/GPU tests are
             # type-checked rather than linked.
             run: cargo check --locked --workspace --all-targets
+          - name: all-features
+            # `all-targets` above builds with default features, which skips every
+            # example/test behind `required-features` (lab, deltanet,
+            # reference-parity, ...) or a `#![cfg(feature)]`: ~820 targets that
+            # rotted unseen. --all-features type-checks all of them.
+            run: cargo check --locked --workspace --all-targets --all-features
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -188,6 +194,41 @@ jobs:
           - name: int-rest
             # Everything else, plus the unit tests of the lib and bin targets.
             run: cargo test --profile ci --locked $INTEG_PKGS --lib --bins --test '[!elmq]*'
+          - name: unrun-npu
+            # GPU-free targets no other shard runs (feature-gated or outside INTEG_PKGS);
+            # listed by name: a new target here must be added deliberately. Tests that need
+            # a GPU are #[ignore]d or left out.
+            run: |
+              cargo test --profile ci --locked -p peacemaker-npu --test array --test bw_probe --test config --test dma_array --test experts
+              cargo test --profile ci --locked -p railgun --features boundary-bench,cond-probe,g4-probe,mc-g2 --test kernel_abi_contract --test pinned_receipt
+              cargo test --profile ci --locked -p railgun-cert --test conditional_writer --test copy_kernel --test event_sync --test gfx1100_raon_decode --test gfx1100_raon_mq8 --test guard_kernel --test moe_sealed_standalone --test sealed_table --test task_graph --test wg_footprint --test whole16_fp8_abi
+              cargo test --profile ci --locked -p railgun-corpus --test conditional_receipt
+              cargo test --profile ci --locked -p railgun-jitcorpus --test corpus --test from_cache --test program_sequence
+              cargo test --profile ci --locked -p radiowave --test downstream_peacemaker_manifest --test union_identity
+          - name: unrun-pm
+            # Same rule as unrun-npu.
+            run: |
+              cargo test --profile ci --locked -p peacemaker-rip --features certify,hw-diff,l1 --test cdna --test check --test cli --test cookbook_a --test cookbook_b --test diag --test docs --test eval --test fa_prefill_twin --test features --test fmt --test fp8_gemm_twin --test gemv_mq2_xbatch_twin --test hc8_wmma_twin --test iu4_gemm_fine_emu --test iu4_gemm_fine_twin --test iu4_gemm_twin --test mq6_i8_gemm_twin --test producers_twin --test qsa --test qsa_select --test qsa_select_bf16 --test qwen4_moe_sym_twin --test ring_depth_script --test run --test runtime_join --test search --test validate --test vocabulary --test workgroup_id
+              cargo test --profile ci --locked -p peacemaker-cdna --test enc_ds --test enc_flat --test enc_mubuf --test enc_smem --test enc_sop --test enc_vop --test enc_vop3 --test enc_vop3p --test enc_vopk --test float --test sim_coverage --test sim_gemm --test sim_load --test sim_mem --test sim_mfma --test sim_salu --test sim_valu --test sim_xlane --test text_parse --test xml_inst --test xml_mix_alias_receipt --test xml_sdwa_receipt
+              cargo test --profile ci --locked -p peacemaker-ir --test emu_helpers --test handler_semantics_drift --test kernarg_indexed
+              cargo test --profile ci --locked -p peacemaker-isa --features lab,toolchain --test ds_bpermute --test native_identity --test pm_decode_load_fifo
+          - name: unrun-rdna
+            # Same rule as unrun-npu.
+            run: |
+              cargo test --profile ci --locked -p hipfire-dispatch --features lab,test-utils --test slab_moe_decode
+              cargo test --profile ci --locked -p rdna-compute --features deltanet,lab --test gemm_q8_0_mmq_gfx11_tiles --test jit_a3_route_plan --test jit_g0_route_data --test kernel_abi_drift --test lwmma_tile_hw --test mq6sym_i8_decode_hw --test q8_batched_chunk_plan --test qsa_filter_select --test qwen4_ep_owner_assign_pinned_pm --test qwen4_ep_owner_assign_pm --test qwen4_moe_down_a8_hw --test qwen4_moe_ep_a8_hw
+          - name: unrun-models
+            # Same rule as unrun-npu.
+            run: |
+              cargo test --profile ci --locked -p hipfire-arch-lfm2moe --features lab --test offload_parity
+              cargo test --profile ci --locked -p hipfire-arch-qwen35 --features deltanet,lab,moe-oracle --test dflash_lookup_state_oracle --test draft_vocab_rebuild --test sampled_mtp_penalty_hw
+              cargo test --profile ci --locked -p hipfire-arch-qwen4 --features lab,qwen4-dev-profiles,reference-parity --test dev_ple_rows_cpu --test expert_keep_route --test greedy_mtp_identity_hw --test mtp_reference_runtime_eq --test mtp_takeover_fill_hw --test npu_trunk_packing --test npu_trunk_plan --test npu_trunk_programs --test npu_trunk_simulation --test q8_ef_product_routes_hw --test sampled_mtp_distribution_hw --test session_cache_hw --test slowlink_prefill_hw
+          - name: unrun-runtime
+            # Same rule as unrun-npu; plus hipfire-quantize's bin unit tests.
+            run: |
+              cargo test --profile ci --locked -p hipfire-quantize --features lab --test cli_contract
+              cargo test --profile ci --locked -p hipfire-runtime --features deltanet,lab,rdna-compute/lab --test arch_id_unification --test cpu_quant_cross_check --test hf_tokenizer_corpus --test hf_tokenizer_differential --test kv_adaptive_reset --test mesh_split_refusal_alloc --test raon_template --test root_routed_ep_schedule --test tool_call_parser
+              cargo test --profile ci --locked -p hipfire-quantize --bins
     steps:
       - name: Private hipfire lock dir
         run: echo "HIPFIRE_LOCK_DIR=$RUNNER_TEMP/hipfire-locks" >> "$GITHUB_ENV" && mkdir -p "$RUNNER_TEMP/hipfire-locks"
