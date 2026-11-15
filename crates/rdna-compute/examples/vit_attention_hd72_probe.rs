@@ -10,9 +10,28 @@
 //! if qtiled rel-L2 > 1e-5 or wmma rel-L2 > 5e-3.
 //!
 //! Run inside a ROCm container: /dev/kfd + /opt/rocm/lib.
+//!
+//!   cargo run --release --example vit_attention_hd72_probe -p rdna-compute \
+//!       --features lab -- [--n 7564] [--hd 64] [--heads 16]
+//!
+//! `--n`, `--hd` and `--heads` take comma-separated lists and replace the
+//! defaults above, so the OCR serve's production shape (hidden 1024, 16 heads,
+//! head_dim 64, N=7564) runs from this one probe.
 
 use rdna_compute::{DType, Gpu, GpuTensor, HipResult};
 use std::time::Instant;
+
+/// Comma-separated integer list following `name`.
+fn arg_list(args: &[String], name: &str) -> Option<Vec<usize>> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(|v| {
+            v.split(',')
+                .map(|x| x.trim().parse().expect("flag takes an integer list"))
+                .collect()
+        })
+}
 
 fn time_median<F>(gpu: &mut Gpu, mut f: F) -> f64
 where
@@ -63,11 +82,17 @@ fn main() {
         ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos() * 1.5) as f32
     };
 
+    let args: Vec<String> = std::env::args().collect();
+    let heads = arg_list(&args, "--heads")
+        .and_then(|v| v.first().copied())
+        .unwrap_or(16);
+    let head_dims = arg_list(&args, "--hd").unwrap_or_else(|| vec![72, 64]);
+    let sizes = arg_list(&args, "--n").unwrap_or_else(|| vec![784, 4096, 5000]);
+
     let mut failed = false;
-    let heads = 16usize;
-    for &(hidden, head_dim) in &[(1152usize, 72usize), (1024, 64)] {
-        assert_eq!(heads * head_dim, hidden);
-        for &n in &[784usize, 4096, 5000] {
+    for head_dim in head_dims {
+        let hidden = heads * head_dim;
+        for &n in &sizes {
             println!("== hidden={hidden} head_dim={head_dim} N={n}");
             let qkv_h: Vec<f32> = (0..n * 3 * hidden).map(|_| normal()).collect();
             let qkv = gpu.upload_f32(&qkv_h, &[n * 3 * hidden]).expect("upload");
