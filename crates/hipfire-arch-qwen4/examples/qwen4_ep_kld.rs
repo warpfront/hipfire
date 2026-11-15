@@ -1507,9 +1507,8 @@ fn score_lanes(
 /// forward numerics unchanged).
 fn load_admitted_model(args: &Args, gpu: &mut Gpu) -> R<hipfire_loader::LoadedModel> {
     use hipfire_loader::admission::{
-        admit_source_with_options, legacy_warning, qwen4_kv_adaptive_requested,
-        qwen_default_q8_enabled, BatchLoadRequest, KvBackendHints, KvBackendRequest,
-        SourceAdmissionOptions,
+        admit_source_with_options, legacy_warning, qwen4_kv_adaptive_requested, BatchLoadRequest,
+        KvBackendHints, KvBackendRequest, SourceAdmissionOptions,
     };
     let (spec, kv_mode, state_quant) = match args.route {
         Route::Decode => (
@@ -1541,7 +1540,7 @@ fn load_admitted_model(args: &Args, gpu: &mut Gpu) -> R<hipfire_loader::LoadedMo
             kv_mode,
             kv_k: None,
             kv_v: None,
-            qwen_default_q8: qwen_default_q8_enabled(),
+            qwen_default_q8: true,
             kv_adaptive: None,
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),

@@ -6,9 +6,8 @@
 //! store's DFlash lanes). See [`draft_forward_lanes`].
 
 use super::{
-    draft_dtod_at, draft_ffn_layer, gemm_dispatch, ordered_draft, ring_segments, upload_slice_i32,
-    DflashConfig, DflashLayerWeights, DflashScratch, DflashWeights, DraftCtxMode,
-    DRAFT_LANE_WS_ROWS,
+    draft_dtod_at, draft_ffn_layer, gemm_dispatch, ring_segments, upload_slice_i32, DflashConfig,
+    DflashLayerWeights, DflashScratch, DflashWeights, DraftCtxMode, DRAFT_LANE_WS_ROWS,
 };
 use crate::llama::{rotate_x_mq_batched_for, WeightTensor};
 use hip_bridge::HipResult;
@@ -36,7 +35,7 @@ fn draft_lane_conv_enabled() -> bool {
 /// the batched lane draft run as packed, lane-batched stages (gather, grouped
 /// rotate + GEMM per singleton arithmetic class, one norm, one RoPE, one
 /// scatter) instead of one GEMM chain per lane segment. Exact gfx1201, MQ4G256V2
-/// weights, `ordered_draft()`, never during graph capture, replay recording or
+/// weights, never during graph capture, replay recording or
 /// G0 observation. Every output byte is identical either way; `0` restores the
 /// per-lane loops.
 static CB_DRAFT_LANE_CTX: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -440,12 +439,11 @@ fn wmma_chunk(rem: usize) -> usize {
 
 /// Process-level admission of the batched ctx/fc stages: switch on, exact
 /// gfx1201, no graph capture / replay recording / G0 observation, no
-/// calibration tap armed, `ordered_draft()`, and the shared workspace plus the
+/// calibration tap armed, and the shared workspace plus the
 /// FWHT rotation scratch present. Per-stage (per-weight, per-plan) checks are
 /// in [`pool_admitted`].
-fn lane_rows_admitted(gpu: &Gpu, shared: &DflashScratch, ordered: bool) -> bool {
+fn lane_rows_admitted(gpu: &Gpu, shared: &DflashScratch) -> bool {
     draft_lane_ctx_enabled()
-        && ordered
         && gpu.arch == "gfx1201"
         && !gpu.graphs.capture_mode
         && !gpu.replay.is_recording()
@@ -731,7 +729,6 @@ fn lane_attention(
     shared: &DflashScratch,
     li: usize,
     g: &LaneGeo,
-    ordered: bool,
 ) -> HipResult<()> {
     let kvd = cfg.kv_dim();
     let qd = cfg.q_dim();
@@ -765,7 +762,6 @@ fn lane_attention(
         let seg_bytes = len * kvd * 4;
         draft_dtod_at(
             gpu,
-            ordered,
             &k_cat_l.buf,
             cat_off,
             &k_cache_layer.buf,
@@ -774,7 +770,6 @@ fn lane_attention(
         )?;
         draft_dtod_at(
             gpu,
-            ordered,
             &v_cat_l.buf,
             cat_off,
             &v_cache_layer.buf,
@@ -785,7 +780,6 @@ fn lane_attention(
     }
     draft_dtod_at(
         gpu,
-        ordered,
         &k_cat_l.buf,
         cat_off,
         &shared.k_noise.buf,
@@ -794,7 +788,6 @@ fn lane_attention(
     )?;
     draft_dtod_at(
         gpu,
-        ordered,
         &v_cat_l.buf,
         cat_off,
         &shared.v_noise.buf,
@@ -931,36 +924,33 @@ pub fn draft_forward_lanes(
     );
 
     // ── Per-lane geometry, key positions, context projection ─────────────
-    let ordered = ordered_draft();
     // Owned staging (capacity `max_block_size >= total`, never grown).
     shared.lane_positions_q.clear();
     for lane in lanes.iter() {
         shared.lane_positions_q.extend_from_slice(lane.positions_q);
     }
-    if ordered {
-        // Every host position upload precedes the draft body, so no
-        // synchronous H2D drains the queue between the lane fc GEMMs. The fc
-        // GEMMs and hidden norms read no positions; every position reader
-        // (context RoPE, query/noise RoPE) still runs after its upload.
-        for lane in lanes.iter() {
-            assert_eq!(
-                lane.positions_k.len(),
-                lane.ctx_len + lane.b,
-                "positions_k size"
-            );
-            let ls = &*lane.scratch;
-            upload_slice_i32(
-                gpu,
-                &ls.positions_k,
-                lane_key_positions(ls, lane.positions_k, lane.ctx_len),
-            )?;
-        }
-        upload_slice_i32(gpu, &shared.positions_q, &shared.lane_positions_q)?;
+    // Every host position upload precedes the draft body, so no
+    // synchronous H2D drains the queue between the lane fc GEMMs. The fc
+    // GEMMs and hidden norms read no positions; every position reader
+    // (context RoPE, query/noise RoPE) still runs after its upload.
+    for lane in lanes.iter() {
+        assert_eq!(
+            lane.positions_k.len(),
+            lane.ctx_len + lane.b,
+            "positions_k size"
+        );
+        let ls = &*lane.scratch;
+        upload_slice_i32(
+            gpu,
+            &ls.positions_k,
+            lane_key_positions(ls, lane.positions_k, lane.ctx_len),
+        )?;
     }
+    upload_slice_i32(gpu, &shared.positions_q, &shared.lane_positions_q)?;
     // Lane-batched ctx/fc (`HIPFIRE_CB_DRAFT_LANE_CTX`): admission and the fc
     // row plan are decided here, before any lane state is written. `None`
     // keeps the per-lane loops below.
-    let lane_ctx_on = lane_rows_admitted(gpu, &*shared, ordered);
+    let lane_ctx_on = lane_rows_admitted(gpu, &*shared);
     let fc_plan = if lane_ctx_on {
         plan_fc(gpu, weights, cfg, &*shared, &*lanes)
     } else {
@@ -1002,13 +992,6 @@ pub fn draft_forward_lanes(
                 );
             }
         }
-        if !ordered {
-            upload_slice_i32(
-                gpu,
-                &ls.positions_k,
-                lane_key_positions(ls, lane.positions_k, l),
-            )?;
-        }
         let cached_rows = ls.thlog.proj_cached_rows();
         if fc_plan.is_none() {
             lane_fc_fill(gpu, weights, cfg, &*ls, &*shared, l, swa_w, cached_rows)?;
@@ -1028,7 +1011,7 @@ pub fn draft_forward_lanes(
     }
     // Lane-batched fc over every lane's original segments (planned and
     // admitted before the loop above; nothing was written for the lanes whose
-    // fc it covers). Positions were uploaded up front (`ordered`).
+    // fc it covers). Positions were uploaded up front.
     if let Some(plan) = &fc_plan {
         if plan.ns > 0 {
             // Same 64-row scope as the per-lane fc: outside it.
@@ -1037,9 +1020,6 @@ pub fn draft_forward_lanes(
             gpu.draft_rows64_exit(scoped);
             r?;
         }
-    }
-    if !ordered {
-        upload_slice_i32(gpu, &shared.positions_q, &shared.lane_positions_q)?;
     }
 
     // ── Per-layer decoder ────────────────────────────────────────────────
@@ -1068,7 +1048,6 @@ pub fn draft_forward_lanes(
         let layer = &weights.layers[li];
         draft_dtod_at(
             gpu,
-            ordered,
             &shared.residual.buf,
             0,
             &shared.x.buf,
@@ -1204,7 +1183,7 @@ pub fn draft_forward_lanes(
         )?;
 
         for (lane, g_) in lanes.iter().zip(&geos) {
-            lane_attention(gpu, cfg, lane.scratch, shared, li, g_, ordered)?;
+            lane_attention(gpu, cfg, lane.scratch, shared, li, g_)?;
         }
 
         // wo lands in x (the non-fused route), then the DFlash2 finish
@@ -1270,7 +1249,6 @@ pub fn draft_forward_lanes(
         ) {
             draft_dtod_at(
                 gpu,
-                ordered,
                 &shared.residual.buf,
                 0,
                 &shared.x.buf,

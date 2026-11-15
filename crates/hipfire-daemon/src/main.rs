@@ -2351,7 +2351,7 @@ fn main() {
                         vmm_runtime_refusal: vmm_runtime_refusal.as_deref(),
                         free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
                         unified_memory: gpu.is_uma(),
-                        qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
+                        qwen_default_q8: true,
                     },
                     qwen4_admission_options,
                 ) {
