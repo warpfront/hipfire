@@ -117,6 +117,14 @@ fn f32_to_bf16_bits(val: f32) -> u16 {
     (val.to_bits() >> 16) as u16
 }
 
+fn f32_slice_to_f16_bytes(f32_data: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(f32_data.len() * 2);
+    for &v in f32_data {
+        out.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+    }
+    out
+}
+
 fn f32_slice_to_bf16_bytes(f32_data: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(f32_data.len() * 2);
     for &v in f32_data {
@@ -991,6 +999,7 @@ fn main() {
     let mut output_path: Option<String> = None;
     let mut keep_f32 = false;
     let mut use_bf16 = false;
+    let mut use_f16 = false;
     let mut use_mq4 = false;
     let mut use_mq4v2 = false;
     let mut mq4v2_symmetric = false;
@@ -1027,6 +1036,10 @@ fn main() {
                 use_bf16 = true;
                 i += 1;
             }
+            "--f16" => {
+                use_f16 = true;
+                i += 1;
+            }
             "--keep-f32" => {
                 keep_f32 = true;
                 i += 1;
@@ -1034,7 +1047,7 @@ fn main() {
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: dspine_convert --input <dir_or_hf_id> --output <file.hfq> \
-                     [--bf16 (default) | --mq4 | --mq4v2 [--mq4v2-symmetric] | --keep-f32]"
+                     [--bf16 (default) | --f16 | --mq4 | --mq4v2 [--mq4v2-symmetric] | --keep-f32]"
                 );
                 std::process::exit(0);
             }
@@ -1044,10 +1057,13 @@ fn main() {
             }
         }
     }
-    let n_format_flags =
-        (keep_f32 as u8) + (use_bf16 as u8) + (use_mq4 as u8) + (use_mq4v2 as u8);
+    let n_format_flags = (keep_f32 as u8)
+        + (use_bf16 as u8)
+        + (use_f16 as u8)
+        + (use_mq4 as u8)
+        + (use_mq4v2 as u8);
     if n_format_flags > 1 {
-        eprintln!("--bf16, --keep-f32, --mq4, --mq4v2 are mutually exclusive");
+        eprintln!("--bf16, --f16, --keep-f32, --mq4, --mq4v2 are mutually exclusive");
         std::process::exit(1);
     }
     if mq4v2_symmetric && !use_mq4v2 {
@@ -1063,6 +1079,8 @@ fn main() {
 
     let dtype_desc = if keep_f32 {
         "F32"
+    } else if use_f16 {
+        "F16 (decoder GEMMs), BF16 (bridge), F32 (norms)"
     } else if use_mq4 {
         "MQ4-G256 (decoder GEMMs), BF16 (bridge), F32 (norms)"
     } else if use_mq4v2 {
@@ -1157,6 +1175,8 @@ fn main() {
 
     let draft_dtype = if keep_f32 {
         "f32"
+    } else if use_f16 {
+        "f16"
     } else if use_mq4 {
         "mq4"
     } else if use_mq4v2 {
@@ -1529,6 +1549,13 @@ fn main() {
                 mq4v2_symmetric,
             );
             (QuantType::MQ4G256V2, 256u32, q)
+        } else if use_f16 {
+            // F16 tier: bf16-trained weights are exactly representable in
+            // f16 (7-bit mantissa fits 10 bits, exponents in range), so this
+            // stores the bf16 draft without precision loss while routing the
+            // trunk through the validated F16 WMMA dispatch.
+            let f32_data = to_f32(raw, &meta.dtype);
+            (QuantType::F16, 0u32, f32_slice_to_f16_bytes(&f32_data))
         } else {
             (QuantType::BF16, 0u32, bf16_bytes)
         };

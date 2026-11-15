@@ -8063,10 +8063,10 @@ pub fn draft_dflash_block_rank(
                 // Always rejected: every cycle commits exactly one target token.
                 drafted[1..].fill(vocab as u32 - 1);
             }
-        } else if let Some(dspine) = bridge
-            .as_deref_mut()
-            .filter(|b| b.serial().is_some())
-        {
+        } else if let Some(dspine) = bridge.as_deref_mut() {
+            // Any arch-24 draft refines here: a sidecar without TG/TSV tables
+            // takes serial_refine's exact-lattice fallback instead of
+            // silently degrading to plain argmax.
             // Arch-24 serial refinement: the upstream lattice (exact
             // per-(candidate, predecessor) bridge-write recomputation and
             // head scoring) runs on the trunk logits' top-k candidates;
