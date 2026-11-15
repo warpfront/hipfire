@@ -160,3 +160,9 @@ git show <sha>:<path> > <path>
 | `infer_qwen3` | `crates/saddle-lab/examples/infer_qwen3.rs` | `d52ddaf3bae0` | 495 | Run inference on a .hfq (hipfire-quantized) model. |
 | `test_qwen35_load` | `crates/saddle-lab/examples/test_qwen35_load.rs` | `77a471b33efa` | 159 | Minimal test: load Qwen3.5 HFQ, parse config, print layer types. |
 | `test_qwen35_loadQA` | `crates/saddle-lab/examples/test_qwen35_loadQA.rs` | `77a471b33efa` | 185 | QA mirror for Qwen3.5 HFQ loading and config validation. |
+
+## va-bridge
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `parse_fixtures` | `crates/va-bridge/examples/parse_fixtures.rs` | `492a7e40f265` | 34 | Throwaway probe (experiment/vcn-jpeg): parse the 5 committed fixtures for VA submission without touching the GPU. |
