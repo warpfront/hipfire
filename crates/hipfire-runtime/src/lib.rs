@@ -10,7 +10,7 @@
 //! shared infrastructure: HFQ/GGUF file readers, the LLaMA-style
 //! scratch / KV / sampler primitives, tokenizer, prompt framing, eos
 //! filter, loop guard, spec-decode primitives
-//! (DFlash, DDTree), demand paging (cpu_router, weight_pager), and the
+//! (DFlash), demand paging (cpu_router, weight_pager), and the
 //! [`arch::Architecture`] trait.
 
 pub mod admission;
@@ -29,8 +29,6 @@ pub mod config;
 pub mod coproc;
 #[cfg(feature = "deltanet")]
 pub mod cpu_router;
-#[cfg(feature = "deltanet")]
-pub mod ddtree;
 pub mod device_mesh;
 #[cfg(feature = "deltanet")]
 pub mod dflash;

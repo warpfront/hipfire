@@ -200,7 +200,6 @@ fn main() {
             None,
             None,
             None,
-            None,
         )
         .expect("warmup prefill failed");
         // Reset DeltaNet state for the profiled run
@@ -296,7 +295,6 @@ fn main() {
                     None,
                     None,
                     None,
-                    None,
                 )
                 .expect("warmup prefill");
             } else {
@@ -319,7 +317,6 @@ fn main() {
                     &mut dn_state,
                     &scratch,
                     pbs,
-                    None,
                     None,
                     None,
                     None,
@@ -404,7 +401,6 @@ fn main() {
                 &mut kv_cache,
                 &mut dn_state,
                 &scratch,
-                None,
                 None,
                 None,
                 None,

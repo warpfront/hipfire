@@ -1477,17 +1477,14 @@ impl Qwen35Scratch {
                 .as_deref()
                 == Some("1")
             {
-                // Ordinary reuse cache: tape-free and capped at legacy ≤512
+                // Ordinary reuse cache: capped at legacy ≤512
                 // even under a larger requested ceiling — only a fully
                 // admitted request allocates the larger owned PBS, after
-                // Q8+EF/KV/free-VRAM checks in the inner entry. Tree/tape
-                // wrappers use separate owned tape-enabled scratch, never
-                // this cache. Other arches keep their existing sizing and
-                // tape behavior.
+                // Q8+EF/KV/free-VRAM checks in the inner entry.
                 // Sizing is the pure `implicit_reuse_pbs_plan` the CPU
                 // admission tests read for the same default/explicit cases.
-                let (max_batch, cap_tape) = super::prefill::implicit_reuse_pbs_plan_for_gpu(gpu);
-                s.prefill_batch = match PrefillBatchScratch::new_opt(gpu, config, max_batch, cap_tape) {
+                let max_batch = super::prefill::implicit_reuse_pbs_plan_for_gpu(gpu);
+                s.prefill_batch = match PrefillBatchScratch::new(gpu, config, max_batch) {
                     Ok(prefill) => Some(prefill),
                     Err(error) => {
                         cleanup_allocations!();
@@ -4394,7 +4391,6 @@ fn forward_prefill_dense_tp_batched(
                         BatchSemantics::Sequential,
                         chunk_start,
                         n,
-                        None,
                         false,
                     )?;
                     Ok(())
@@ -4445,7 +4441,6 @@ fn forward_prefill_dense_tp_batched(
                                 n_v_heads,
                                 hd,
                                 BatchSemantics::Sequential,
-                                None,
                                 captures
                                     .as_ref()
                                     .and_then(|caps| caps[rank].tape.as_deref())
@@ -4583,7 +4578,6 @@ fn forward_prefill_dense_tp_batched(
                                 max_ctx,
                                 &ctx,
                                 BatchSemantics::Sequential,
-                                None,
                                 q8_flags[rank],
                                 q8_flags[rank],
                                 kv_layer_idx,
@@ -4803,24 +4797,22 @@ pub fn forward_prefill_dense_tp_with_hidden(
     if cap == 0 {
         return Err(HipError::new(0, "prefill_max_batch is zero"));
     }
-    // ── Allocate per-rank PBS + N*dim partial (transactional, cap_gdn_tape=false) ──
+    // ── Allocate per-rank PBS + N*dim partial (transactional) ──
     let mut pbs_vec: Vec<PrefillBatchScratch> = Vec::with_capacity(tp);
     let mut partials: Vec<GpuTensor> = Vec::with_capacity(tp);
     for rank in 0..tp {
-        let pbs =
-            match PrefillBatchScratch::new_opt(&mut gpus.devices[rank], &configs[rank], cap, false)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    for (i, prev) in pbs_vec.drain(..).enumerate() {
-                        let _ = prev.free_gpu(&mut gpus.devices[i]);
-                    }
-                    for (i, prev) in partials.drain(..).enumerate() {
-                        let _ = gpus.devices[i].free_tensor(prev);
-                    }
-                    return Err(e);
+        let pbs = match PrefillBatchScratch::new(&mut gpus.devices[rank], &configs[rank], cap) {
+            Ok(p) => p,
+            Err(e) => {
+                for (i, prev) in pbs_vec.drain(..).enumerate() {
+                    let _ = prev.free_gpu(&mut gpus.devices[i]);
                 }
-            };
+                for (i, prev) in partials.drain(..).enumerate() {
+                    let _ = gpus.devices[i].free_tensor(prev);
+                }
+                return Err(e);
+            }
+        };
         pbs_vec.push(pbs);
         let partial = match gpus.devices[rank].alloc_tensor(&[cap * dim], DType::F32) {
             Ok(t) => t,

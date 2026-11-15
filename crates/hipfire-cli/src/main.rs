@@ -5186,8 +5186,6 @@ pub(crate) fn load_params(
         "ngram_draft": ngram_draft_param(&config_string(resolved, "speculation.ngram")?)?,
         "ngram_k": config_u64(resolved, "speculation.ngram_k")?,
         "ngram_min_count": config_u64(resolved, "speculation.ngram_min_count")?,
-        "ddtree_budget": config_u64(resolved, "speculation.ddtree_budget")?,
-        "ddtree_topk": config_u64(resolved, "speculation.ddtree_topk")?,
         "head": head_file,
         // Redline route SKU of the registry artifact (`mq4r` | `mq4rs` | `mq2r`,
         // the card's `quant`): the daemon's fallback when the file's HFQ

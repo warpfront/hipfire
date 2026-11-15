@@ -393,7 +393,6 @@ fn run(raw: &[String]) -> Result<()> {
         None,
         None,
         None,
-        None,
     )?;
     let (values, logits_raw) =
         download(&gpu, &bundle.scratch.logits, vocab, "final-position logits")?;

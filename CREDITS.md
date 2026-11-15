@@ -47,7 +47,7 @@ miscredit. Click through for the canonical author list.
 | Paper | Relevance |
 |-------|-----------|
 | [DFlash (arXiv:2602.06036)](https://arxiv.org/abs/2602.06036) | Speculative-decode method that ships in `crates/engine/src/dflash.rs`. Target layer fusion, non-causal bidirectional attention within block, post-FFN residual hidden extraction. Our 9B / 27B DFlash perf headlines come from this. |
-| [DDTree (arXiv:2604.12989)](https://arxiv.org/abs/2604.12989) | Block-diffusion draft tree, best-first heap, ancestor-only verify mask. Algorithm 1 ships in `crates/engine/src/speculative.rs`; informed the Path C PRD and the gfx1100 tree-mode FA tuning. |
+| [DDTree (arXiv:2604.12989)](https://arxiv.org/abs/2604.12989) | Block-diffusion draft tree, best-first heap, ancestor-only verify mask. The tree-verify implementation informed the Path C PRD and the gfx1100 tree-mode FA tuning; it was removed in 0.5.0 (history only). |
 | [CACTUS (arXiv:2604.04987)](https://arxiv.org/abs/2604.04987) | KL-bumped acceptance threshold replacing Leviathan `min(1, q/p)`. Shipped as the `temp>0` rejection-acceptance path so DFlash on creative content is no longer penalized for the draft being distilled on argmax. |
 | [Fail-Fast drafting (arXiv:2512.20573)](https://arxiv.org/abs/2512.20573) | Per-block confidence-gated speculation length. Informs the A3B DFlash default-off gate and the dynamic draft-length policy that collapses to AR when the draft is uncertain. |
 | [MoBiLE (arXiv:2510.12357)](https://arxiv.org/abs/2510.12357) | Per-token big/little MoE expert switching. Frames the A3B 24 GB consumer-card OOM mitigation; the eviction-aware sidecar work tracks this paper. |

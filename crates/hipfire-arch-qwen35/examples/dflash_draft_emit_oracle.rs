@@ -687,8 +687,6 @@ fn main() -> R<()> {
         &slot.config,
         &slot.dn_state,
         &mut gpu,
-        None,
-        None,
         &slot.weights,
         kv_q8,
         slot.kv_cache.uses_vmm_backend(),

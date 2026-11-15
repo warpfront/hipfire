@@ -33,16 +33,11 @@ def main():
     ap.add_argument("--n", type=int, default=33, help="sample size (0..164)")
     ap.add_argument("--kv-mode", default="q8", help="q8 | fwht4 | fwht3 | fwht2")
     ap.add_argument("--ar", action="store_true", help="AR baseline mode (passes --ar-baseline; no spec decode)")
-    ap.add_argument("--ddtree-batched", action="store_true", help="enable --ddtree-batched")
-    ap.add_argument("--ddtree-budget", type=int, default=None)
-    ap.add_argument("--ddtree-topk", type=int, default=None)
     ap.add_argument("--label", default="", help="label printed in the summary (e.g. 'linear-q8')")
     args = ap.parse_args()
     if args.kv_mode.lower() not in ("q8", "fwht4", "fwht3", "fwht2"):
         print("--kv-mode must be q8, fwht4, fwht3, or fwht2 for DFlash perf runs", file=sys.stderr)
         sys.exit(2)
-    if args.ar and (args.ddtree_batched or args.ddtree_budget is not None or args.ddtree_topk is not None):
-        print("--ar is incompatible with --ddtree-* flags", file=sys.stderr); sys.exit(2)
 
     with open(args.jsonl) as f:
         tasks = [json.loads(l) for l in f]
@@ -57,13 +52,7 @@ def main():
     extra_args = ["--kv-mode", args.kv_mode]
     if args.ar:
         extra_args.append("--ar-baseline")
-    if args.ddtree_batched:
-        extra_args.append("--ddtree-batched")
-    if args.ddtree_budget is not None:
-        extra_args += ["--ddtree-budget", str(args.ddtree_budget)]
-    if args.ddtree_topk is not None:
-        extra_args += ["--ddtree-topk", str(args.ddtree_topk)]
-    label = args.label or ("ar" if args.ar else "ddtree" if args.ddtree_batched else "linear")
+    label = args.label or ("ar" if args.ar else "linear")
     print(f"# label={label}  max={args.max} ctx={args.ctx} --no-chatml kv={args.kv_mode}  "
           f"extra={' '.join(extra_args)}")
     print()

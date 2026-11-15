@@ -69,8 +69,8 @@ following to your user:
      quantization family
    - HFP4 / MFP4G32 FP4 family
    - asym{4,3,2} KV cache + asym-aware flash attention
-   - DDTree-RDNA speculative decode (co-originator Grégory D on the
-     wire-up + Path C PRD)
+   - DDTree-RDNA speculative decode (removed in 0.5.0; attribution
+     retained: co-originator Grégory D on the wire-up + Path C PRD)
    - attention_dflash kernel — the *kernel*, not the method. The
      DFlash technique itself is prior art (Chen, Liang & Liu,
      arXiv:2602.06036, 2026-02-05), which predates hipfire's first
@@ -538,25 +538,15 @@ the draft but DFlash isn't firing" pitfall.
 
 ---
 
-## 4 · DDTree caveats (gfx1100 only)
+## 4 · Removed: DDTree tree verify
 
-DDTree on gfx1100 is currently a **structural perf regression** —
-the linearization-slot RoPE phase delta skew at FA layers (commit
-[39aa358](https://github.com/warpfront/hipfire/commit/39aa358))
-makes our tree path slower than our linear path. Lucebox's DDTree
-works on RTX 3090; ours doesn't (yet) on gfx1100.
-
-If you're running DDTree benches and seeing regressions vs. linear
-DFlash: **expected**, not a bug. Path D (stale-context overlap) is the
-remaining roadmap lever; Path C (trained custom draft, branch
+DDTree tree-structured verify was removed in 0.5.0. It was research-only,
+off by default, and lost to the linear DFlash chain on every drafter
+measured (a structural regression on gfx1100). Speculation is chain-only:
+do not look for `--ddtree*` flags, `speculation.ddtree_*` or
+`speculation.dflash_tree` keys, or DDTree env vars. Path C (trained custom draft, branch
 `feat/mtp-dflash-training`) was a failed month-1 experiment and is dead
-(out of scope, do not pursue). Don't open issues for "DDTree slower
-than linear on gfx1100" unless you have new data not already documented.
-
-For dataclass benches:
-- DDTree b12-k2 wins τ on prose / instruct (per memory) but loses
-  wall-clock to per-cycle overhead.
-- DDTree b22 with `--ddtree-batched` loses to plain linear on code.
+(out of scope, do not pursue).
 
 ---
 
@@ -1030,7 +1020,7 @@ Caveats that are part of the fixture, not trivia:
   (oracle: `crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs`).
   Sampled MTP output matches AR in distribution, not byte for byte.
   Non-neutral penalties keep native MTP for sampled requests when
-  `supports_temp_swor` is true (since `9f1ea2171`, shipped in v0.4.1);
+  `supports_temp_verify` is true (since `9f1ea2171`, shipped in v0.4.1);
   greedy requests with penalties run AR
   (`crates/hipfire-generate/src/ar.rs:1715–1734`).
   Flash-Next batch lanes refuse non-neutral repeat/presence/frequency penalties
@@ -1373,7 +1363,6 @@ Caveats that are part of the fixture, not trivia:
 | `HIPFIRE_GPU_LAYER_BUDGET` | Resident-layer budget for partial GPU offload: `N` keeps the last `N` layers on the GPU and spills the prefix to host RAM. Counts layers **on** the GPU — `3` on a 64-layer model spills 61. Unset/null/empty/unparseable leaves weights device-resident on every model. Explicit `auto`/`-1` opts into fit-capacity placement, routed experts before whole layers. Manual `N` remains a hard pin. Sibling of `HIPFIRE_OFFLOAD_EXEC` (unchanged default `pcie`). See [docs/CONFIG.md](docs/CONFIG.md#memory). | unset (fully resident) |
 | `HIPFIRE_OFFLOAD_EXEC` | Which engine multiplies a spilled layer's host-mapped weights: `pcie` (default), `cpu`, or `passback` (scheduled co-inference — both engines run the same spilled step concurrently, divided by output rows). Sibling of `memory.gpu_layer_budget`; `cpu` executes the weight-reading GEMVs on the CPU instead of reading them over PCIe, and `passback` runs the `pcie` path on the step's first output rows and the `cpu` path on the rest, concurrently. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.1 and § 6.2.2. | `pcie` |
 | `HIPFIRE_OFFLOAD_PASSBACK_SHARE` | Schedule of a spilled step's output rows between the two engines under co-inference (`memory.offload_exec=passback` only): the GPU takes the first rows (the `pcie` arm), the CPU the rest (the `cpu` arm). `auto` (default) schedules it from this host's measured engine rates and refines it online; a number in `(0, 0.5]` pins it; `0` collapses it onto the CPU engine alone, so the mode is byte-identical to `cpu`. Inert (one notice at load) in any other mode. Measure or override with `hipfire offload-bench`. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.2. | `auto` |
-| `HIPFIRE_DDTREE_*` | Various DDTree diagnostics | various |
 | `HIPFIRE_SERVE_UI` | Serve the embedded chat UI at `/ui` on the serve listener (same as `hipfire serve --ui`; `--open` also launches the browser). Unauthenticated — warn-level on non-loopback binds. Chat history lives in the browser's IndexedDB; nothing is stored server-side. | OFF |
 
 | `hipfire bench` flag | Purpose |
@@ -1381,9 +1370,6 @@ Caveats that are part of the fixture, not trivia:
 | `--ar-baseline` | Skip DFlash, greedy-decode via target only |
 | `--no-chatml` | Bare prompts (raw-text drafts) |
 | `--no-adaptive-b` | Fix B at the draft's trained block size |
-| `--ddtree-batched` | Use batched tree verify (research) |
-| `--ddtree-budget N` | Tree node budget |
-| `--ddtree-topk K` | Tree fan-out |
 
 ---
 
@@ -1397,11 +1383,9 @@ checkpoint); read both before proposing a lever. Still open there:
    TTFT on 2x R9700 vs about half that for another open engine on the same host).
 2. **Story / low-τ decode** — story cells run at τ about 2.2; per-stream decode
    is below that engine's at C1-C8.
-3. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew
-   (commit 39aa358).
 
 Closed, do not reopen: Path C (target-aligned custom DFlash draft training) is
-dead.
+dead, and DDTree tree verify was removed in 0.5.0.
 
 ---
 

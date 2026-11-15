@@ -186,7 +186,7 @@ gfx1151 has.
 that served three cases are deleted, and each case now runs the step program:
 
 - **DFlash hidden capture** (`forward_scratch_with_hidden`: the per-token
-  prefill fallback and the DDTree empty-tree step). A layer's hidden row is
+  prefill fallback). A layer's hidden row is
   written to the ring buffer once the layer is final, which on the deferred
   MoE combine (`moe_combine_next_rms_enabled`) is after the next layer's fused
   combine + norm.

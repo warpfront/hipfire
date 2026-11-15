@@ -708,7 +708,7 @@ const LFM2_TEMPLATE: &str =
 /// Built-in Gemma 4 IT chat template (arch_id=13).
 const GEMMA4_TEMPLATE: &str = include_str!("../../hipfire-runtime/templates/gemma-4-it.jinja");
 
-// `DdtreeState`, `DflashState`, `load_dflash_state`, and the `DflashSpeculator`
+// `DflashState`, `load_dflash_state`, and the `DflashSpeculator`
 // impl now live in `hipfire_arch_qwen35::dflash_spec` — all qwen35 + runtime
 // types, so the loader only constructs and routes them, never owns the DFlash
 // mechanics.
@@ -1233,7 +1233,7 @@ pub struct LoadedModel {
     pub model_path: String,
     /// The model's speculative-decode drafter+verifier, when a draft model is
     /// loaded (`Box<dyn Speculator>` so the daemon's decode loop is agnostic to
-    /// DFlash chain / DDTree tree / future MTP). Replaces the old
+    /// DFlash chain / MTP / n-gram). Replaces the old
     /// `dflash: Option<DflashState>` field — the `DflashState` now lives inside
     /// the `DflashSpeculator` impl behind this trait object.
     pub speculator: Option<Box<dyn Speculator>>,
@@ -2682,8 +2682,6 @@ fn finish_qwen35_load(
             config,
             dn_state,
             ctx.gpu,
-            ctx.spec.ddtree_budget,
-            ctx.spec.ddtree_topk,
             &bundle.weights,
             // Exact plain Q8 KV (not asym/fwht variants). Matches design:
             // flags on the already-built cache — never re-resolve the string.
@@ -5537,8 +5535,7 @@ fn load_model_ep_qwen35(
     hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
         .map_err(|e| format!("ensure_rank_streams: {e:?}"))?;
     // Sequential prefill scratch, one full chunk per rank on its owning
-    // device: a `PrefillBatchScratch` with the DeltaNet S-tape omitted (plain
-    // prefill never reads `dn_s_tape`; `cap_gdn_tape = false`) plus a zeroed
+    // device: a `PrefillBatchScratch` plus a zeroed
     // `[chunk*dim]` F32 routed partial. `chunk = min(max_seq, prefill_max_batch_ep())`
     // matches the shared EP batch `prefill_chunk` policy (`HIPFIRE_PREFILL_MAX_BATCH`); serve windows are `<= chunk`.
     // Staged in the guard so a mid-loop failure frees every published rank
@@ -5555,11 +5552,10 @@ fn load_model_ep_qwen35(
         staging.gpus_mut().devices[r]
             .bind_thread()
             .map_err(|e| format!("EP qwen35 prefill bind rank {r}: {e:?}"))?;
-        let pbs = qwen35::PrefillBatchScratch::new_opt(
+        let pbs = qwen35::PrefillBatchScratch::new(
             &mut staging.gpus_mut().devices[r],
             &config,
             prefill_chunk,
-            false,
         )
         .map_err(|e| format!("EP qwen35 prefill PBS rank {r}: {e:?}"))?;
         staging.prefill_pbs.push(pbs);

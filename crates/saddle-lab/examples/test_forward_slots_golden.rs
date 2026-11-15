@@ -352,7 +352,6 @@ fn main() {
             None,
             None,
             None,
-            None,
         )
         .expect("reference: prefill forward");
         gpu.hip.device_synchronize().expect("sync");

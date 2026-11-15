@@ -9532,26 +9532,6 @@ pub const GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 
-/// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
-/// to a caller-owned tape buffer, so sibling tokens read the parent's
-/// post-update state rather than the previous sibling's. Required for
-/// correctness when processing a DDTree-linearized token block.
-///
-/// s_q8_init / s_scales_init are the pre-block snapshot (READ-ONLY). The
-/// kernel never advances persistent dn_state.s_matrices — caller runs
-/// linear replay on the accepted spine post-acceptance to commit the
-/// trajectory (same pattern as conv1d_silu_split_tree).
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_Q8_TREE_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8_tree.hip");
-
-/// FP32 tree-aware GDN recurrence — full-precision counterpart of
-/// GATED_DELTA_NET_Q8_TREE_SRC (no per-token dequant/requant or scales).
-/// Used by the FP32 `StateQuant` spec-decode tree-verify path.
-#[cfg(feature = "deltanet")]
-pub const GATED_DELTA_NET_F32_TREE_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_f32_tree.hip");
-
 /// Batched-sequential FP32 GDN recurrence — full-precision counterpart of
 /// the Q8 batch kernel (GATED_DELTA_NET_Q8_SRC), with the same 32×32-tile
 /// parallelism. Replaces the slow 128-thread single-token `gated_delta_net`
@@ -9634,19 +9614,6 @@ pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
 #[cfg(feature = "deltanet")]
 pub const GDN_PRE_BATCHED_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/gdn_pre_batched.gfx1201.hip");
-
-/// Tree-aware variant of conv1d_silu_split. Each in-block token walks its
-/// ancestor chain via parent_indices[] for the 3-tap causal window, falling
-/// back to pre-block conv_state when the chain exits the block. Leaves
-/// conv_state unchanged — caller runs linear conv1d on the accepted spine
-/// post-acceptance to advance state.
-///
-/// Ported from SGLang's `causal_conv1d_update` HAS_EAGLE_TREE_CUSTOM_ATTN_MASK
-/// branch, simplified to take a precomputed parent_indices[] (our tree layout
-/// is materialized host-side by ddtree::linearize_tree).
-#[cfg(feature = "deltanet")]
-pub const CONV1D_SILU_SPLIT_TREE_SRC: &str =
-    include_str!("../../../kernels/src/conv1d_silu_split_tree.hip");
 
 /// GPU-side KV cache write using pos from a GPU buffer.
 /// Copies kv_dim floats from src to dst at offset pos_buf[0] * kv_dim.
@@ -9839,19 +9806,6 @@ pub const GREEDY_ACCEPT_SRC: &str = include_str!("../../../kernels/src/greedy_ac
 /// per-position single-block sampler.
 pub const DSPARK_SAMPLE_ACCEPT_LAZY_SRC: &str =
     include_str!("../../../kernels/src/dspark_sample_accept_lazy.hip");
-
-pub const DDTREE_SWOR_WALK_SRC: &str = include_str!("../../../kernels/src/ddtree_swor_walk.hip");
-
-pub const DDTREE_GUMBEL_TOPK_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/ddtree_gumbel_topk_batched.hip");
-
-/// Stage 3a: on-GPU ddtree attention-mask builder. Reads `parent_indices`
-/// (already device-resident from H2D) and writes the `attn_bias[big_n ×
-/// big_n]` f32 mask in-place, eliminating the ~15 KB H2D per cycle (D4).
-/// Grid: [big_n,1,1]. Block: [big_n,1,1]. Each thread i walks the parent
-/// chain upward, setting 0.0 for ancestor slots and -INF elsewhere.
-pub const DDTREE_BUILD_ATTN_MASK_SRC: &str =
-    include_str!("../../../kernels/src/ddtree_build_attn_mask.hip");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)

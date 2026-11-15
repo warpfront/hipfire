@@ -1147,7 +1147,7 @@ fn run_qwen35_batched(
         let use_batched = true;
         if use_batched {
             match hipfire_arch_qwen35::qwen35::forward_prefill_batch(
-                gpu, weights, cfg, chunk, 0, kv_cache, dn_state, scratch, None, None, None, None,
+                gpu, weights, cfg, chunk, 0, kv_cache, dn_state, scratch, None, None, None,
             ) {
                 Ok(()) => {}
                 Err(e) => {

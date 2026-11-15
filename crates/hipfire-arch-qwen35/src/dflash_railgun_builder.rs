@@ -350,7 +350,6 @@ fn named_allocations(gpu: &Gpu, request: &WindowRequest<'_>) -> Vec<(String, u64
             ffn_hidden_batch,
             dn_normed_rot_batch,
             positions,
-            rope_positions,
             pos3,
             tokens,
             fa_q_full_batch,

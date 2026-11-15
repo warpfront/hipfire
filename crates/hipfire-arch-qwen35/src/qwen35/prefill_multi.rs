@@ -1053,7 +1053,6 @@ fn rows_view(
             v(&pbs.dn_normed_rot_batch, v_dim),
         );
         set(&mut p.positions, v(&pbs.positions, 1));
-        set(&mut p.rope_positions, v(&pbs.rope_positions, 1));
         set(&mut p.pos3, v(&pbs.pos3, 3));
         set(&mut p.ext_emb_index, v(&pbs.ext_emb_index, 1));
         set(&mut p.tokens, v(&pbs.tokens, 1));
@@ -1340,12 +1339,11 @@ pub fn forward_prefill_batch_multi(
     )?;
     if cb_upload_coalesce_enabled() {
         // One upload of every lane's positions. Each per-lane call below (all
-        // Sequential, no tree ctx, no active mask, not pre-uploaded) is a
+        // Sequential, no active mask, not pre-uploaded) is a
         // single `memcpy_htod` of `start_pos..start_pos + n` into its row view
         // of `pbs.positions`, and the views are contiguous in lane order
         // (`offs` = cumulative rows), so the concatenation written at offset 0
         // of `pbs.positions` is the same bytes at the same addresses.
-        // `rope_positions` is written only for a tree ctx (None here).
         let positions: Vec<i32> = reqs
             .iter()
             .flat_map(|r| (0..r.tokens.len()).map(move |i| (r.start_pos + i) as i32))
@@ -1357,13 +1355,13 @@ pub fn forward_prefill_batch_multi(
         gpu.hip.memcpy_htod(&pbs.positions.buf, bytes)?;
     } else {
         for (r, view) in reqs.iter().zip(&views) {
-            batch_chunk_upload_positions(gpu, view, sem, r.start_pos, r.tokens.len(), None, false)?;
+            batch_chunk_upload_positions(gpu, view, sem, r.start_pos, r.tokens.len(), false)?;
         }
     }
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
     let arch_has_wmma = q8_wmma_arch;
     let tapes = reqs.iter().any(|r| r.gdn_tape.is_some());
-    let workload = prefill_dispatch_workload(hidden_out.is_some(), tapes, false);
+    let workload = prefill_dispatch_workload(hidden_out.is_some(), tapes);
     // MTP / plain requests keep the attend crossover; a ChainVerify request
     // attends through the tile + reduce (`verify_tile_attend`).
     let ctx = DispatchCtx::new(gpu).with_workload(workload);
@@ -1645,7 +1643,7 @@ pub fn forward_prefill_batch_multi(
                     for (r, view) in reqs.iter_mut().zip(&views) {
                         let n = r.tokens.len();
                         let sink = (*TAPE_COPY_BATCH).then_some(&mut tape_copies);
-                        let parents = batch_chunk_delta_net_pre_gdn(
+                        batch_chunk_delta_net_pre_gdn(
                             gpu,
                             &layer.mixer_view(),
                             &dims,
@@ -1657,16 +1655,12 @@ pub fn forward_prefill_batch_multi(
                             n_v_heads,
                             hd,
                             sem,
-                            None,
                             r.gdn_tape.map(gdn_tape_view).as_ref(),
                             0,
                             delta_layer_idx,
                             r.fusion,
                             sink,
                         )?;
-                        if parents.is_some() {
-                            return refuse("tree recurrence in a linear verify");
-                        }
                         let d = &*r.dn_state;
                         gpu.gated_delta_net_q8_batch_seq(
                             &view.dn_q_batch,
@@ -1889,7 +1883,6 @@ pub fn forward_prefill_batch_multi(
                             max_ctx_len,
                             rctx,
                             sem,
-                            None,
                             kv_layer_idx,
                             layer_idx,
                             r.fusion,
@@ -1930,7 +1923,6 @@ pub fn forward_prefill_batch_multi(
                                 max_ctx_len,
                                 rctx,
                                 sem,
-                                None,
                                 layer_idx,
                                 multirow,
                                 None,

@@ -485,11 +485,7 @@ fn unwalked_flash_next_policies_keep_lazy_loading() {
             }),
             "{name}"
         );
-        for spec in [
-            KernelSpecRoute::DFlash,
-            KernelSpecRoute::DDTree,
-            KernelSpecRoute::DSpark,
-        ] {
+        for spec in [KernelSpecRoute::DFlash, KernelSpecRoute::DSpark] {
             assert!(refused(&Load { spec, ..base }), "{name} {spec:?}");
         }
         // A policy axis outside the walks (the other QSA format than the walked one),

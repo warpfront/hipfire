@@ -1554,7 +1554,6 @@ pub(super) fn prefill(
             None,
             None,
             None,
-            None,
         );
         if let Some(g) = frame {
             req.gdn_frame = rdna_compute::norm::gdn_requant_frame_checkpoint();

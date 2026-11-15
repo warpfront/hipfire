@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Qwen3.5 config parsing (`Qwen35Config`), layer typing, EP batch attestation
-//! types, and the tree-verify / mrope context structs.
+//! types, and the mrope context structs.
 
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
@@ -38,34 +38,6 @@ pub(crate) fn f16_lm_head_mode_from_config() -> F16LmHeadMode {
     parse_f16_lm_head_mode(Some(hipfire_runtime::config::get().lm_head_f16.as_str()))
 }
 
-/// Optional tree-attention context for `forward_prefill_batch` — activates
-/// DDTree batched verify when `Some`.
-///
-/// Fields:
-/// - `positions`: length matches `tokens.len()`. Each slot's logical RoPE
-///   position (seed at `start_pos`, node i at `start_pos + depth_i`).
-///   Two nodes at the same tree depth share a logical position — they're
-///   alternative futures at the same time step, not successive tokens.
-/// - `attn_bias`: `[N × N]` f32 additive bias on qk scores (with N = tokens.len()),
-///   produced by `hipfire_runtime::ddtree::linearize_tree`. `0.0` on ancestor-or-self
-///   entries, `-inf` on non-ancestors. Applied to in-block keys only;
-///   prompt keys (positions `[0, start_pos)`) remain unmasked.
-///
-/// Tree mode requires the batched FA path (`fa_batched_ok`); the per-token
-/// FA fallback always uses causal attention and cannot honor a tree mask.
-/// `forward_prefill_batch` returns an error if tree mode is requested but
-/// any FA layer would take the fallback path.
-///
-/// GDN (LinearAttention) layers: if `parent_indices` is `Some`, the
-/// DeltaNet branch dispatches the tree-aware kernels
-/// (`conv1d_silu_split_tree_f32_n` + `gated_delta_net_q8_tree_batch_seq`)
-/// which walk per-token ancestor chains via `parent_indices` instead of
-/// the linear-sequence predecessor. This eliminates sibling-subtree
-/// cross-contamination of recurrent state at topk>1. If `parent_indices`
-/// is `None`, LA layers fall back to the linear path (byte-exact with
-/// DFlash at topk=1; approximation at topk>1 — used by pre-Phase-3
-/// callers that haven't been rewritten).
-
 /// Override the embedding for a single batch slot after the embedding-lookup
 /// kernel runs but before the layer loop. Used by the Qualcomm-style MTP
 /// probe (mtp_probe.rs) to inject mask-token embeddings whose values come
@@ -90,7 +62,7 @@ pub struct MaskEmbedOverride<'a> {
     pub embed: &'a [f32],
 }
 
-pub use hipfire_dispatch::pipeline::batched::{DflashFusionCtx, TreeVerifyCtx};
+pub use hipfire_dispatch::pipeline::batched::DflashFusionCtx;
 
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {

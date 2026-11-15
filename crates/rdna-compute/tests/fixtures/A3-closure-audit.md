@@ -8,7 +8,7 @@ Base: `f3fa11ec40`. Selector extraction commits: `0f5d5b9d6f`, `9007323697`, bra
 
 Main clarified that G0 manifests are lower bounds: every observed required symbol must appear in a closed plan, but a closed plan may contain additional reachable requests. FN-gfx1151 observations stop before failed native prefill and cannot exclude downstream branches.
 
-Explicit DFlash/DDTree/DSpark routes must refuse planning: the frozen input contains no separately admitted drafter header. Native MTP belongs to the primary model header and is in scope. The contract's `crate::flags::FeatureFlags` path is a typo; use `crate::feature_flags::FeatureFlags`, without an alias.
+Explicit DFlash/DSpark routes must refuse planning: the frozen input contains no separately admitted drafter header. Native MTP belongs to the primary model header and is in scope. The contract's `crate::flags::FeatureFlags` path is a typo; use `crate::feature_flags::FeatureFlags`, without an alias.
 
 ## Lower-bound inventories
 

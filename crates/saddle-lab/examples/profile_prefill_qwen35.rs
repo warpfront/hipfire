@@ -164,7 +164,6 @@ fn main() {
             None,
             None,
             None,
-            None,
         )
         .expect("warmup prefill failed");
         eprintln!(
@@ -188,7 +187,6 @@ fn main() {
         &mut kv_cache,
         &mut dn_state,
         &scratch,
-        None,
         None,
         None,
         None,

@@ -460,11 +460,6 @@ required-features = ["lab"]
 
 
 [[example]]
-name = "ddtree_pq_sim"
-required-features = ["lab"]
-
-
-[[example]]
 name = "debug_gemma4_attention"
 required-features = ["lab"]
 

@@ -778,7 +778,7 @@ mod tests {
             force_ar_chat: false,
             temp_spec_env_off: false,
             fast_sample_on: true,
-            supports_temp_swor: false,
+            supports_temp_verify: false,
             supports_chain_nucleus_verify: false,
             kv_adaptive: false,
         }
@@ -829,7 +829,7 @@ mod tests {
             has_speculator: true,
             speculator_is_dflash2: true,
             speculator_supports_penalties: true,
-            supports_temp_swor: true,
+            supports_temp_verify: true,
             supports_chain_nucleus_verify: true,
             temp,
             ..inputs(arch_id)
@@ -932,7 +932,7 @@ mod tests {
         // the selector-chain nucleus law.
         for incapable in [
             GenerationRouteInputs {
-                supports_temp_swor: false,
+                supports_temp_verify: false,
                 ..dflash2_inputs(19, 1.0)
             },
             GenerationRouteInputs {
@@ -948,7 +948,7 @@ mod tests {
         }
         // Greedy needs neither capability.
         let greedy = GenerationRouteInputs {
-            supports_temp_swor: false,
+            supports_temp_verify: false,
             supports_chain_nucleus_verify: false,
             ..dflash2_inputs(19, 0.0)
         };

@@ -205,7 +205,6 @@ fn main() {
         None,
         None,
         None,
-        None,
     )
     .expect("forward_prefill_batch prefix");
     eprintln!("prefill: {:.2}s", t0.elapsed().as_secs_f64());
@@ -234,7 +233,6 @@ fn main() {
             &scratch,
             None,
             Some(&h_buf),
-            None,
             None,
             None,
             None,

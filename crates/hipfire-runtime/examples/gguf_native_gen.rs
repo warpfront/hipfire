@@ -312,7 +312,6 @@ fn main() {
                 None,
                 None,
                 None,
-                None,
             )
             .expect("prefill forward failed");
             let la = gpu.download_f32(&scratch.logits).unwrap();
@@ -469,7 +468,6 @@ fn main() {
             &mut kv_cache,
             &mut dn_state,
             &scratch,
-            None,
             None,
             None,
             None,

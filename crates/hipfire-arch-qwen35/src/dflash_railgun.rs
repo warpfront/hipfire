@@ -73,7 +73,6 @@ pub enum RailgunRefusal {
     KvNotFp8,
     DraftNotFixed16,
     DraftNotAllSliding,
-    TreeVerify,
     RetainedPm4,
     OnlineTune,
     // per window
@@ -128,7 +127,6 @@ impl RailgunRefusal {
             Self::KvNotFp8 => "kv_not_fp8",
             Self::DraftNotFixed16 => "draft_not_fixed16",
             Self::DraftNotAllSliding => "draft_not_all_sliding",
-            Self::TreeVerify => "tree_verify",
             Self::RetainedPm4 => "retained_pm4",
             Self::OnlineTune => "online_tune",
             Self::Sampling => "sampling",
@@ -940,7 +938,6 @@ fn hip_label(why: RailgunRefusal) -> &'static str {
         RailgunRefusal::KvNotFp8 => "hip:kv_not_fp8",
         RailgunRefusal::DraftNotFixed16 => "hip:draft_not_fixed16",
         RailgunRefusal::DraftNotAllSliding => "hip:draft_not_all_sliding",
-        RailgunRefusal::TreeVerify => "hip:tree_verify",
         RailgunRefusal::RetainedPm4 => "hip:retained_pm4",
         RailgunRefusal::OnlineTune => "hip:online_tune",
         RailgunRefusal::Sampling => "hip:sampling",

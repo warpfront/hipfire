@@ -326,9 +326,6 @@ impl PrefillBatchScratch {
             dn_normed_batch: &self.dn_normed_batch,
             dn_normed_rot_batch: &self.dn_normed_rot_batch,
             dn_normed_rot_f16_batch: &self.dn_normed_rot_f16_batch,
-            dn_s_tape_q8: self.dn_s_tape_q8.as_ref(),
-            dn_s_tape_scales: self.dn_s_tape_scales.as_ref(),
-            dn_s_tape_f32: self.dn_s_tape_f32.as_ref(),
             fa_q_full_batch: &self.fa_q_full_batch,
             fa_q_batch: &self.fa_q_batch,
             fa_gate_batch: &self.fa_gate_batch,
@@ -338,7 +335,6 @@ impl PrefillBatchScratch {
             fa_attn_out_rot_batch: &self.fa_attn_out_rot_batch,
             fa_attn_out_rot_f16_batch: &self.fa_attn_out_rot_f16_batch,
             positions: &self.positions,
-            rope_positions: &self.rope_positions,
             mrope: None,
         }
     }

@@ -5,7 +5,7 @@
 
 //! Batched (prefill / multi-row verify) gated DeltaNet linear attention:
 //! qkv/z/beta/alpha projection, causal conv + gates, the gated delta
-//! recurrence (sequential, chunk-scan, tree and tape variants), gated norm and
+//! recurrence (sequential, chunk-scan and tape variants), gated norm and
 //! the output projection. Moved verbatim from the Qwen3.5 prefill path; the
 //! views carry the field names of the architecture-owned values they borrow.
 
@@ -1232,8 +1232,8 @@ pub fn gdn_qk_norm_interleave(
 /// Prescaffold (behavior-only) extraction for S5-gdn-pre-tape-fusion.
 ///
 /// Same statements, same order, same launches as the inlined block.
-/// Returns `tree_parents` so the caller's statement/launch order is unchanged.
-pub fn batch_chunk_delta_net_pre_gdn<'a>(
+/// Launch order is unchanged from the inlined block.
+pub fn batch_chunk_delta_net_pre_gdn(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerView<'_>,
     config: &HybridDims,
@@ -1245,17 +1245,16 @@ pub fn batch_chunk_delta_net_pre_gdn<'a>(
     n_v_heads: usize,
     hd: usize,
     batch_semantics: BatchSemantics<'_>,
-    tree_verify: Option<TreeVerifyCtx<'a>>,
     gdn_tape: Option<&GdnTapeView<'_>>,
     tape_offset: usize,
     delta_layer_idx: usize,
     fusion: DflashFusionCtx,
     tape_sink: Option<&mut Vec<rdna_compute::tape_copy::TapeCopy>>,
-) -> HipResult<Option<&'a GpuTensor>> {
+) -> HipResult<()> {
     let _ = fusion;
     // S5-gdn-pre-tape-fusion fast path: one launch for sigmoid(alpha/beta) +
     // tape writes + conv + QK norm/interleave. Chain verify is sequential
-    // with no tree parents, so success returns None. Every failed predicate
+    // so success returns early. Every failed predicate
     // (kill switch, non-sequential batch, non-GQA route, tape absence or
     // overflow, ineligible shapes/arch) runs the pre-change sequence below
     // launch-for-launch.
@@ -1295,7 +1294,7 @@ pub fn batch_chunk_delta_net_pre_gdn<'a>(
                     config.norm_eps,
                 )?;
                 if fused {
-                    return Ok(None);
+                    return Ok(());
                 }
             }
         }
@@ -1303,21 +1302,16 @@ pub fn batch_chunk_delta_net_pre_gdn<'a>(
     // Slice-P fused preamble (gfx1201): sigmoid(beta) + alpha gate + conv1d +
     // SiLU + split + Q/K norm + scale + interleave in ONE launch. Admission is
     // the kernel header's exact list: flag opt-in, exact gfx1201, sequential
-    // semantics, no tree parents, no DFlash tape (tape writes stay on the old
+    // semantics, no DFlash tape (tape writes stay on the old
     // path), the GQA interleave branch with exact head division, HD 128, and
     // n >= 1 (ragged tails run with a short last group). The MoE sibling
     // (`batched_moe::execute_deltanet_moe_layer_batched`) keeps the 3-launch
     // sequence. q_raw/k_raw stores are kept by the fused kernel (v1).
     {
-        let no_tree_parents = tree_verify
-            .as_ref()
-            .and_then(|c| c.parent_indices)
-            .is_none();
         let n_key_heads = config.linear_key_heads;
         if gpu.flags.gfx12_gdn_pre_fused
             && gpu.arch_caps.is_gfx1201()
             && matches!(batch_semantics, BatchSemantics::Sequential)
-            && no_tree_parents
             && gdn_tape.is_none()
             && n_key_heads < n_v_heads
             && n_v_heads % n_key_heads == 0
@@ -1347,7 +1341,7 @@ pub fn batch_chunk_delta_net_pre_gdn<'a>(
                 1.0 / (hd as f32).sqrt(),
                 config.norm_eps,
             )?;
-            return Ok(None);
+            return Ok(());
         }
     }
     // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
@@ -1368,10 +1362,6 @@ pub fn batch_chunk_delta_net_pre_gdn<'a>(
             push_gdn_tape_copies(sink, tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
         } else if fusion.is_chain_verify()
             && matches!(batch_semantics, BatchSemantics::Sequential)
-            && tree_verify
-                .as_ref()
-                .and_then(|c| c.parent_indices)
-                .is_none()
             && verify_tape_copy_batch_enabled()
         {
             // Singleton chain verify: one batched launch for the same three
@@ -1410,28 +1400,7 @@ pub fn batch_chunk_delta_net_pre_gdn<'a>(
         }
     }
 
-    // Tree-aware dispatch gate: when the caller provides
-    // parent_indices (Phase 3b+ of Task #101), swap the linear
-    // conv1d + GDN for tree-walking variants that eliminate
-    // sibling-subtree state cross-contamination. The tree
-    // kernels are READ-ONLY on dn_state (don't advance it) —
-    // caller runs linear replay on the accepted spine
-    // post-acceptance to commit the trajectory.
-    let tree_parents = tree_verify.and_then(|c| c.parent_indices);
-    if let Some(parents) = tree_parents {
-        gpu.conv1d_silu_split_tree_f32_n(
-            &pbs.dn_q_raw_batch,
-            &pbs.dn_k_raw_batch,
-            &pbs.dn_v_batch,
-            &pbs.dn_qkv_batch,
-            &layer.conv_weight,
-            &dn_state.conv_states[delta_layer_idx],
-            parents,
-            k_dim,
-            v_dim,
-            n,
-        )?;
-    } else if let BatchSemantics::Independent { active_mask, .. } = batch_semantics {
+    if let BatchSemantics::Independent { active_mask, .. } = batch_semantics {
         let full_mask = valid_lane_mask(n)?;
         if active_mask == full_mask {
             gpu.conv1d_silu_split_f32_independent(
@@ -1498,7 +1467,7 @@ pub fn batch_chunk_delta_net_pre_gdn<'a>(
         gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
         gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
     }
-    Ok(tree_parents)
+    Ok(())
 }
 
 /// Producer that [`batch_chunk_delta_net_output_projection`] selects for the
@@ -2191,7 +2160,6 @@ pub fn batch_chunk_delta_net_attn(
     n_v_heads: usize,
     hd: usize,
     batch_semantics: BatchSemantics<'_>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     gdn_tape: Option<&GdnTapeView<'_>>,
     tape_offset: usize,
     delta_layer_idx: usize,
@@ -2318,7 +2286,6 @@ pub fn batch_chunk_delta_net_attn(
                     hd,
                     batch_semantics,
                     None,
-                    None,
                     tape_offset,
                     delta_layer_idx,
                     fusion,
@@ -2358,7 +2325,7 @@ pub fn batch_chunk_delta_net_attn(
         );
     }
 
-    let tree_parents = batch_chunk_delta_net_pre_gdn(
+    batch_chunk_delta_net_pre_gdn(
         gpu,
         layer,
         config,
@@ -2370,7 +2337,6 @@ pub fn batch_chunk_delta_net_attn(
         n_v_heads,
         hd,
         batch_semantics,
-        tree_verify,
         gdn_tape,
         tape_offset,
         delta_layer_idx,
@@ -2378,68 +2344,7 @@ pub fn batch_chunk_delta_net_attn(
         None,
     )?;
 
-    // Gated Delta Net — tree variant reads per-token S from
-    // s_tape[parent] (or pre-block s_q8_init at root); linear
-    // variant advances dn_state.s_matrices in place.
-    if let Some(parents) = tree_parents {
-        // Tree-verify GDN, dispatched by DeltaNet state quant.
-        // FP32 uses the full-precision tree-tape kernel (no
-        // per-node Q8 round-trip); Q8 the original; Q4 tree has
-        // no kernel (was silently mis-routed to the Q8 tree
-        // kernel before — now a clean error).
-        match dn_state.quant {
-            StateQuant::FP32 => {
-                let tape_f32 = pbs.dn_s_tape_f32.as_ref().expect(
-                                "FP32 tree-aware LA requires dn_s_tape_f32 scratch (check PrefillBatchScratch::new)",
-                            );
-                gpu.gated_delta_net_f32_tree_batch_seq(
-                    &pbs.dn_q_batch,
-                    &pbs.dn_k_batch,
-                    &pbs.dn_v_batch,
-                    &pbs.dn_alpha_batch,
-                    &pbs.dn_beta_batch,
-                    &dn_state.s_matrices[delta_layer_idx],
-                    tape_f32,
-                    parents,
-                    &pbs.dn_attn_out_batch,
-                    n,
-                    n_v_heads,
-                    config.linear_value_dim,
-                )?;
-            }
-            StateQuant::Q8 => {
-                let tape_q8 = pbs.dn_s_tape_q8.as_ref().expect(
-                    "tree-aware LA requires dn_s_tape_q8 scratch (check PrefillBatchScratch::new)",
-                );
-                let tape_sc = pbs.dn_s_tape_scales.as_ref()
-                                .expect("tree-aware LA requires dn_s_tape_scales scratch (check PrefillBatchScratch::new)");
-                gpu.gated_delta_net_q8_tree_batch_seq(
-                    &pbs.dn_q_batch,
-                    &pbs.dn_k_batch,
-                    &pbs.dn_v_batch,
-                    &pbs.dn_alpha_batch,
-                    &pbs.dn_beta_batch,
-                    &dn_state.s_matrices[delta_layer_idx],
-                    &dn_state.s_scales[delta_layer_idx],
-                    tape_q8,
-                    tape_sc,
-                    parents,
-                    &pbs.dn_attn_out_batch,
-                    n,
-                    n_v_heads,
-                    config.linear_value_dim,
-                )?;
-            }
-            StateQuant::Q4 => {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    "Q4 DeltaNet state + tree-verify (DDTree) is unsupported: \
-                                 there is no Q4 tree-tape GDN kernel. Use Q8 or FP32 state \
-                                 for tree spec-decode.",
-                ));
-            }
-        }
-    } else {
+    {
         // EXPERIMENT (not #417): mirror the state-quant dispatch the
         // decode siblings already do (forward_scratch_layers:13194),
         // so the captured/eager batched prefill honours FP32/Q4 state

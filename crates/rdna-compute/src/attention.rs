@@ -3940,8 +3940,7 @@ impl Gpu {
     /// `Some`, the kernel ignores the causal cutoff and iterates over
     /// `[0, block_start + block_cols)`, applying an additive bias from
     /// `tree_bias[b × block_cols + (t - block_start)]` for in-block keys.
-    /// Caller passes `-inf` on non-ancestor slots and `0.0` on ancestors
-    /// (see `hipfire_runtime::ddtree::linearize_tree`).
+    /// Caller passes `-inf` on masked slots and `0.0` on visible slots.
     ///
     /// When `tree_bias` is `None`, `block_start` / `block_cols` are ignored
     /// and behavior is byte-identical to the legacy causal path.
@@ -13270,7 +13269,7 @@ impl Gpu {
 
     /// Shared helper: launch a batched asym flash tile + the shared asym reduce.
     ///
-    /// `tree_bias` / `block_start` / `block_cols` activate DDTree tree-attention
+    /// `tree_bias` / `block_start` / `block_cols` activate in-block masked-attention
     /// mode (bias added to in-block qk scores; seq_len extends to full cache
     /// including the tree block). When `tree_bias` is None and `block_cols` is
     /// 0, behavior is byte-identical to the legacy causal path.

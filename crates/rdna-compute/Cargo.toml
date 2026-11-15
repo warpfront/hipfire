@@ -537,14 +537,6 @@ name = "channel_test_hfq4g128_batched"
 required-features = ["lab"]
 
 [[example]]
-name = "ddtree_gumbel_check"
-required-features = ["lab"]
-
-[[example]]
-name = "ddtree_swor_kernel_check"
-required-features = ["lab"]
-
-[[example]]
 name = "dual_gpu_smoke"
 required-features = ["lab"]
 
@@ -621,10 +613,6 @@ name = "test_attention_dflash"
 required-features = ["lab"]
 
 [[example]]
-name = "test_conv1d_tree"
-required-features = ["lab"]
-
-[[example]]
 name = "test_dots_ocr_wmma_gfx12"
 required-features = ["lab"]
 
@@ -658,14 +646,6 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_fwht_128_gpu_vs_cpu"
-required-features = ["lab"]
-
-[[example]]
-name = "test_gated_delta_net_f32_tree"
-required-features = ["lab"]
-
-[[example]]
-name = "test_gated_delta_net_tree"
 required-features = ["lab"]
 
 [[example]]

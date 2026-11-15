@@ -1800,8 +1800,6 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         ngram_draft: params["ngram_draft"].as_bool(),
         ngram_k: usize_param(params, "ngram_k"),
         ngram_min_count: params["ngram_min_count"].as_u64().map(|v| v as u32),
-        ddtree_budget: usize_param(params, "ddtree_budget"),
-        ddtree_topk: usize_param(params, "ddtree_topk"),
         dspark: params["dspark_mode"]
             .as_str()
             .and_then(hipfire_config::parse_tri_state),
@@ -2063,7 +2061,7 @@ mod tests {
         let params = json!({"max_seq": 65536, "pp": 2, "kv_mode": "q8", "kv_backend": "vmm",
             "kv_k": "fwht3", "kv_v": "q8", "kv_adaptive": "off",
             "mtp_mode": "on", "mtp_k": 3, "ngram_draft": true, "ngram_k": 8,
-            "ngram_min_count": 2, "ddtree_budget": 16, "ddtree_topk": 4,
+            "ngram_min_count": 2,
             "dspark_mode": "off", "dflash_mode": "off", "dflash_block": 8,
             "dflash_adaptive_b": true, "head": "head.hfq"});
         let a = admission_inputs(&params);
@@ -2081,8 +2079,6 @@ mod tests {
         assert_eq!(a.options.spec.mtp, Some(true));
         assert_eq!(a.options.spec.mtp_k, Some(3));
         assert_eq!(a.options.spec.ngram_draft, Some(true));
-        assert_eq!(a.options.spec.ddtree_budget, Some(16));
-        assert_eq!(a.options.spec.ddtree_topk, Some(4));
         assert_eq!(a.options.spec.dspark, Some(false));
         assert_eq!(a.options.spec.dflash_block, Some(8));
         assert_eq!(a.options.spec.dflash_adaptive_b, Some(true));

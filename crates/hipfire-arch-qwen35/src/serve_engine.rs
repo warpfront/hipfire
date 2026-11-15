@@ -1549,9 +1549,8 @@ impl Rig {
         )
         .map_err(|e| format!("staging: {e}"))?;
         g.desc_staging = Some(desc_staging);
-        // Slots do plain prefill only — never tree-verify — so skip the GDN
-        // S-tape: at max_batch=cap_tokens it is tens of GB (16k → ~21 GB).
-        let pbs = PrefillBatchScratch::new_opt(g.gpu.as_mut().unwrap(), &config, max_batch, false)
+        // Slots do plain prefill only.
+        let pbs = PrefillBatchScratch::new(g.gpu.as_mut().unwrap(), &config, max_batch)
             .map_err(|e| format!("pbs: {e}"))?;
         g.pbs = Some(pbs);
         let scratch =

@@ -1562,7 +1562,6 @@ mod ora {
                 None,
                 Some(&hbuf),
                 None,
-                None,
             )
             .unwrap_or_else(|e| panic!("forward l={l} ceiling={ceiling}: {e:?}"));
         } else {
@@ -1581,7 +1580,6 @@ mod ora {
                 None,
                 Some(&hbuf_p),
                 None,
-                None,
             )
             .unwrap_or_else(|e| panic!("forward prefix p={resume_p}: {e:?}"));
             let hbuf2 = gpu
@@ -1598,7 +1596,6 @@ mod ora {
                 &scratch,
                 None,
                 Some(&hbuf2),
-                None,
                 None,
             )
             .unwrap_or_else(|e| panic!("forward extend l={l} p={resume_p}: {e:?}"));
@@ -1854,7 +1851,7 @@ mod ora {
                 let junk: Vec<u32> = vec![7; 256];
                 qwen35::forward_prefill_batch(
                     &mut *gpu, &m.weights, &m.config, &junk, 0, &mut kv, &mut dn, &scratch, None,
-                    None, None, None,
+                    None, None,
                 )
                 .unwrap();
                 dn.reset(&mut *gpu).unwrap();
@@ -1878,7 +1875,6 @@ mod ora {
                     &scratch,
                     None,
                     Some(&hbuf),
-                    None,
                     None,
                 )
                 .unwrap();
@@ -1927,7 +1923,6 @@ mod ora {
                         &scratch,
                         None,
                         Some(&hbuf),
-                        None,
                         None,
                         Some(&pbs),
                         None,
@@ -1988,7 +1983,6 @@ mod ora {
                         &scratch,
                         Some(&mut ring),
                         Some(&hbuf),
-                        None,
                         None,
                     )
                     .unwrap();

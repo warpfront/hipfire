@@ -5,7 +5,7 @@
 //
 // These operations are unique to DeltaNet's linear attention layers:
 // the gated linear recurrence with quantized/FP32 state, conv-state ring
-// buffer management, and tree-batched speculative-decode variants. They
+// buffer management. They
 // don't fit into the standard dispatch families because the state is
 // model-owned and the recurrence is an inherently sequential kernel.
 
@@ -63,27 +63,6 @@ pub struct DeltaNetBatchParams<'a> {
     pub quant: StateQuant,
 }
 
-/// Parameters for tree-batched DeltaNet (speculative-decode path).
-///
-/// Adds a tape buffer and parent-indices array so sibling tokens read
-/// the correct parent's post-update state.
-pub struct DeltaNetTreeParams<'a> {
-    pub q_batch: &'a GpuTensor,
-    pub k_batch: &'a GpuTensor,
-    pub v_batch: &'a GpuTensor,
-    pub gate_batch: &'a GpuTensor,
-    pub beta_batch: &'a GpuTensor,
-    pub s_q8_init: &'a GpuTensor,
-    pub s_scales_init: &'a GpuTensor,
-    pub s_tape_q8: &'a GpuTensor,
-    pub s_tape_scales: &'a GpuTensor,
-    pub parent_indices: &'a GpuTensor,
-    pub output_batch: &'a GpuTensor,
-    pub n_tokens: usize,
-    pub n_heads: usize,
-    pub head_dim: usize,
-}
-
 /// Parameters for DeltaNet conv-state ring-buffer management.
 pub struct ConvStateParams<'a> {
     pub state: &'a GpuTensor,
@@ -111,11 +90,6 @@ pub trait DeltaNetOps {
         gpu: &mut Gpu,
         params: &DeltaNetBatchParams,
     ) -> Result<(), String>;
-
-    /// Run tree-batched DeltaNet (speculative-decode path).
-    ///
-    /// Only supported with Q8 state (the tree tape mechanism is Q8-specific).
-    fn run_delta_net_tree(&self, gpu: &mut Gpu, params: &DeltaNetTreeParams) -> Result<(), String>;
 
     /// Zero the conv-state ring buffer.
     fn reset_conv_state(
@@ -243,26 +217,6 @@ impl DeltaNetOps for () {
             }
         }
         .map_err(|e| format!("delta_net_batch: {e:?}"))
-    }
-
-    fn run_delta_net_tree(&self, gpu: &mut Gpu, params: &DeltaNetTreeParams) -> Result<(), String> {
-        gpu.gated_delta_net_q8_tree_batch_seq(
-            params.q_batch,
-            params.k_batch,
-            params.v_batch,
-            params.gate_batch,
-            params.beta_batch,
-            params.s_q8_init,
-            params.s_scales_init,
-            params.s_tape_q8,
-            params.s_tape_scales,
-            params.parent_indices,
-            params.output_batch,
-            params.n_tokens,
-            params.n_heads,
-            params.head_dim,
-        )
-        .map_err(|e| format!("delta_net_tree: {e:?}"))
     }
 
     fn reset_conv_state(

@@ -37,7 +37,7 @@ fn base() -> GenerationRouteInputs {
         force_ar_chat: false,
         temp_spec_env_off: false,
         fast_sample_on: true,
-        supports_temp_swor: false,
+        supports_temp_verify: false,
         supports_chain_nucleus_verify: false,
         kv_adaptive: false,
     }
@@ -584,7 +584,7 @@ fn qwen4_sampled_mtp_route_honors_penalties() {
         arch_id: 16,
         has_speculator: true,
         speculator_is_mtp: true,
-        supports_temp_swor: true,
+        supports_temp_verify: true,
         temp: 0.7,
         user_explicit_sampling: true,
         ..base()
@@ -616,7 +616,7 @@ fn qwen4_sampled_mtp_route_honors_penalties() {
     for penalties in [false, true] {
         for refused in [
             GenerationRouteInputs {
-                supports_temp_swor: false,
+                supports_temp_verify: false,
                 nonneutral_penalties: penalties,
                 ..sampled
             },
@@ -647,7 +647,7 @@ fn qwen4_sampled_mtp_route_honors_penalties() {
 
 /// Qwen4 pipeline parallelism: sampled, unpenalized requests take native MTP
 /// (Leviathan verify, distribution-exact) exactly as on one card. The kill
-/// switch (`speculation.mtp_sampled = 0` → `supports_temp_swor` false, and
+/// switch (`speculation.mtp_sampled = 0` → `supports_temp_verify` false, and
 /// the naive sampled mode under PP, which the route input also reports as
 /// not sampled-capable) and any penalty keep the PP AR producer.
 #[test]
@@ -658,7 +658,7 @@ fn qwen4_pp_sampled_mtp_route_admits_unpenalized_leviathan_only() {
             pp,
             has_speculator: true,
             speculator_is_mtp: true,
-            supports_temp_swor: true,
+            supports_temp_verify: true,
             temp: 0.7,
             ..base()
         };
@@ -683,7 +683,7 @@ fn qwen4_pp_sampled_mtp_route_admits_unpenalized_leviathan_only() {
         for refused in [
             // HIPFIRE_MTP_SAMPLED=0 / PP naive mode.
             GenerationRouteInputs {
-                supports_temp_swor: false,
+                supports_temp_verify: false,
                 ..sampled
             },
             GenerationRouteInputs {
@@ -724,7 +724,7 @@ fn qwen35_mtp_route_honors_penalties_but_dflash_stays_ar() {
         arch_id: 5,
         has_speculator: true,
         speculator_is_mtp: true,
-        supports_temp_swor: true,
+        supports_temp_verify: true,
         nonneutral_penalties: true,
         ..base()
     };
@@ -795,27 +795,45 @@ fn qwen35_mtp_route_honors_penalties_but_dflash_stays_ar() {
         GenerationRoute::QwenAr,
         "greedy DFlash + penalties"
     );
-    // DDTree SWOR (temp>0, supports_temp_swor, no chain nucleus, no
-    // user-explicit sampling).
-    let ddtree = GenerationRouteInputs {
-        supports_temp_swor: true,
+    // Sampled DFlash on a draft without a candidate selector (DFlash1): the
+    // speculator reports no temperature verify, so temp>0 takes the chain
+    // rejection-sampling route (FAST_SAMPLE on) — no tree involved.
+    let sampled_chain = GenerationRouteInputs {
+        supports_temp_verify: false,
         supports_chain_nucleus_verify: false,
-        user_explicit_sampling: false,
+        ngram_can_sample: true,
+        fast_sample_on: true,
         temp: 0.7,
         ..dflash
     };
     assert_eq!(
-        select_generation_route(&ddtree),
+        select_generation_route(&sampled_chain),
         GenerationRoute::QwenDflash,
-        "DDTree SWOR without penalties"
+        "sampled DFlash1 chain without penalties"
+    );
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            user_explicit_sampling: true,
+            ..sampled_chain
+        }),
+        GenerationRoute::QwenDflash,
+        "sampled DFlash1 chain honors explicit top_p/top_k"
     );
     assert_eq!(
         select_generation_route(&GenerationRouteInputs {
             nonneutral_penalties: true,
-            ..ddtree
+            ..sampled_chain
         }),
         GenerationRoute::QwenAr,
-        "DDTree SWOR + penalties"
+        "sampled DFlash1 chain + penalties"
+    );
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            fast_sample_on: false,
+            ..sampled_chain
+        }),
+        GenerationRoute::QwenAr,
+        "sampled DFlash1 chain needs FAST_SAMPLE"
     );
 }
 
@@ -1101,7 +1119,7 @@ fn qwen4_dflash2_takes_the_spec_route_single_card_without_penalties() {
         arch_id: 16,
         has_speculator: true,
         speculator_is_dflash2: true,
-        supports_temp_swor: true,
+        supports_temp_verify: true,
         supports_chain_nucleus_verify: true,
         ..base()
     };
@@ -1145,7 +1163,7 @@ fn qwen4_dflash2_takes_the_spec_route_single_card_without_penalties() {
     // A sampled request needs a drafter that verifies at temperature.
     let greedy_only = GenerationRouteInputs {
         temp: 1.0,
-        supports_temp_swor: false,
+        supports_temp_verify: false,
         ..dflash2
     };
     assert_eq!(
@@ -1316,7 +1334,7 @@ fn dense_tp_qwen_with_mtp_takes_the_spec_route_only_when_it_can_serve() {
         dense_tp: true,
         has_speculator: true,
         speculator_is_mtp: true,
-        supports_temp_swor: true,
+        supports_temp_verify: true,
         temp: 0.0,
         ..base()
     };
@@ -1335,7 +1353,7 @@ fn dense_tp_qwen_with_mtp_takes_the_spec_route_only_when_it_can_serve() {
     // A drafter that cannot verify sampled output keeps temp>0 on the AR arm.
     let greedy_only = GenerationRouteInputs {
         temp: 0.7,
-        supports_temp_swor: false,
+        supports_temp_verify: false,
         ..tp_mtp
     };
     assert_eq!(
@@ -1508,32 +1526,37 @@ fn mtp_speculator_routes_through_qwen_dflash() {
         arch_id: 5,
         has_speculator: true,
         speculator_is_mtp: true,
-        supports_temp_swor: true,
+        supports_temp_verify: true,
         temp: 0.7,
         user_explicit_sampling: true,
         min_p: Some(0.05),
         ..base()
     };
     assert_eq!(select_generation_route(&i), GenerationRoute::QwenDflash);
-    // DDTree SWOR (supports_temp_swor, no chain nucleus) + user-explicit
-    // non-temperature controls still falls to AR.
+    // A temperature-only verify (supports_temp_verify, no chain nucleus: the
+    // target-generic llama DFlash chain) serves plain temp>0 but sends
+    // user-explicit non-temperature controls to AR.
     let i = GenerationRouteInputs {
-        arch_id: 5,
+        arch_id: 1,
         has_speculator: true,
         speculator_is_mtp: false,
-        supports_temp_swor: true,
+        supports_temp_verify: true,
         supports_chain_nucleus_verify: false,
         temp: 0.7,
-        user_explicit_sampling: true,
         ..base()
     };
-    assert_eq!(select_generation_route(&i), GenerationRoute::QwenAr);
+    assert_eq!(select_generation_route(&i), GenerationRoute::LlamaSpec);
+    let i = GenerationRouteInputs {
+        user_explicit_sampling: true,
+        ..i
+    };
+    assert_eq!(select_generation_route(&i), GenerationRoute::LlamaAr);
     // MTP without supports_temp_verify at temp>0 falls to AR.
     let i = GenerationRouteInputs {
         arch_id: 5,
         has_speculator: true,
         speculator_is_mtp: true,
-        supports_temp_swor: false,
+        supports_temp_verify: false,
         temp: 0.7,
         ..base()
     };
@@ -1544,12 +1567,12 @@ fn mtp_speculator_routes_through_qwen_dflash() {
 fn dflash2_selector_chain_nucleus_routes() {
     // Registry sampling profile: temp>0 + explicit top_p/top_k + min_p=0
     // with DFlash2 selector-chain nucleus → QwenDflash (not misclassified
-    // as DDTree SWOR).
+    // as a temperature-only verify).
     let i = GenerationRouteInputs {
         arch_id: 5,
         has_speculator: true,
         speculator_is_mtp: false,
-        supports_temp_swor: true,
+        supports_temp_verify: true,
         supports_chain_nucleus_verify: true,
         ngram_can_sample: true,
         fast_sample_on: true,
@@ -1564,7 +1587,7 @@ fn dflash2_selector_chain_nucleus_routes() {
     let i = GenerationRouteInputs {
         arch_id: 5,
         has_speculator: true,
-        supports_temp_swor: true,
+        supports_temp_verify: true,
         supports_chain_nucleus_verify: true,
         ngram_can_sample: true,
         fast_sample_on: true,
@@ -1580,7 +1603,7 @@ fn dflash2_selector_chain_nucleus_routes() {
     let i = GenerationRouteInputs {
         arch_id: 5,
         has_speculator: true,
-        supports_temp_swor: true,
+        supports_temp_verify: true,
         supports_chain_nucleus_verify: true,
         ngram_can_sample: true,
         fast_sample_on: true,
@@ -1591,26 +1614,12 @@ fn dflash2_selector_chain_nucleus_routes() {
     };
     assert_eq!(select_generation_route(&i), GenerationRoute::QwenAr);
 
-    // DDTree SWOR + explicit controls remains QwenAr (no chain nucleus).
-    let i = GenerationRouteInputs {
-        arch_id: 5,
-        has_speculator: true,
-        supports_temp_swor: true,
-        supports_chain_nucleus_verify: false,
-        ngram_can_sample: true,
-        temp: 0.7,
-        user_explicit_sampling: true,
-        min_p: None,
-        ..base()
-    };
-    assert_eq!(select_generation_route(&i), GenerationRoute::QwenAr);
-
     // Existing sampled MTP still selects QwenDflash with explicit controls.
     let i = GenerationRouteInputs {
         arch_id: 5,
         has_speculator: true,
         speculator_is_mtp: true,
-        supports_temp_swor: true,
+        supports_temp_verify: true,
         supports_chain_nucleus_verify: false,
         temp: 0.7,
         user_explicit_sampling: true,
@@ -1619,12 +1628,12 @@ fn dflash2_selector_chain_nucleus_routes() {
     };
     assert_eq!(select_generation_route(&i), GenerationRoute::QwenDflash);
 
-    // Legacy sampled chain (supports_temp_swor=false) unchanged: still
+    // Non-selector DFlash1 sampled chain (supports_temp_verify=false): still
     // engages with nucleus via ngram_can_sample + fast_sample.
     let i = GenerationRouteInputs {
         arch_id: 5,
         has_speculator: true,
-        supports_temp_swor: false,
+        supports_temp_verify: false,
         supports_chain_nucleus_verify: false,
         ngram_can_sample: true,
         fast_sample_on: true,

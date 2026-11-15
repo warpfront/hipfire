@@ -2037,19 +2037,6 @@ fn main() {
                         .and_then(|v| v.as_u64())
                         .map(|c| c as u32)
                         .or(Some(hipfire_runtime::config::get().ngram_min_count)),
-                    // DDTree draft tuning — same load-param mechanism as ngram_k:
-                    // CLI `--ddtree-budget` / `--ddtree-topk` → these load params,
-                    // env-wins-else-param in the loader.
-                    ddtree_budget: msg
-                        .get("params")
-                        .and_then(|p| p.get("ddtree_budget"))
-                        .and_then(|v| v.as_u64())
-                        .map(|b| b as usize),
-                    ddtree_topk: msg
-                        .get("params")
-                        .and_then(|p| p.get("ddtree_topk"))
-                        .and_then(|v| v.as_u64())
-                        .map(|k| k as usize),
                     // DSpark draft module: the CLI lowers `speculation` into a
                     // `dspark_mode` string. off→Some(false) (skip load+build),
                     // on→Some(true) (force), auto/absent→None (load-if-sidecar).

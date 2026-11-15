@@ -360,7 +360,7 @@ pub fn is_batch_request_eligible(
         .as_ref()
         .map(|s| !s.requires_greedy())
         .unwrap_or(false);
-    let supports_temp_swor = m
+    let supports_temp_verify = m
         .speculator
         .as_ref()
         .is_some_and(|s| s.supports_temp_verify());
@@ -400,7 +400,7 @@ pub fn is_batch_request_eligible(
             .ok()
             .as_deref()
             != Some("0"),
-        supports_temp_swor,
+        supports_temp_verify,
         supports_chain_nucleus_verify,
         kv_adaptive: has_adaptive,
     };
@@ -1921,7 +1921,7 @@ fn vmm_singleton_route(
             .ok()
             .as_deref()
             != Some("0"),
-        supports_temp_swor: spec.is_some_and(|s| s.supports_temp_verify()),
+        supports_temp_verify: spec.is_some_and(|s| s.supports_temp_verify()),
         supports_chain_nucleus_verify: spec.is_some_and(|s| s.supports_chain_nucleus_verify()),
         kv_adaptive: m.kv_adaptive.is_some(),
     };
@@ -7031,7 +7031,7 @@ pub fn is_qwen_ep_batch_request_eligible(
             .ok()
             .as_deref()
             != Some("0"),
-        supports_temp_swor: m
+        supports_temp_verify: m
             .speculator
             .as_ref()
             .is_some_and(|s| s.supports_temp_verify()),

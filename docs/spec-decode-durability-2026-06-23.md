@@ -14,7 +14,9 @@
 > "durability floors" below were campaign targets, not product admission criteria; `admissions.yml`
 > carries no speculation row. Retired `scripts/coherence-gate-*.sh` batteries are historical
 > reproduction only. DFlash itself is not deprecated; the legacy contiguous knobs
-> (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) were removed in 0.5.0.
+> (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) were removed in 0.5.0. DDTree tree verify
+> (including `HIPFIRE_VERIFY_GRAPH_TREE`) was also removed in 0.5.0; the DDTree rows below are
+> history only.
 
 Measured on gfx1100 (RX 7900-class), dense Qwen3.6-27B (`qwen3.6-27b.mq4`), q8 KV,
 greedy (temp=0), 3-run median. **AR decode baseline ≈ 43 tok/s** (genre-independent).

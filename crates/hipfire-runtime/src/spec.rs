@@ -5,7 +5,7 @@
 //! Transparent speculative-decode seam.
 //!
 //! The daemon's decode loop drives a `&mut dyn Speculator` and never learns
-//! which drafter/mode (DFlash chain, DDTree tree, DeepSeek4 MTP, future
+//! which drafter/mode (DFlash chain, DeepSeek4 MTP, future
 //! n-gram / EAGLE) is in use. Adding a drafter is a bounded-context change:
 //! implement [`Speculator`] and register one arm in the loader's
 //! `build_speculator` — no daemon edits.
@@ -571,37 +571,6 @@ pub trait SpecTarget {
         Err("target does not expose verify_block_sampled_capture_gpu".into())
     }
 
-    /// Single-pass TREE-masked verify: run the target over a linearized draft tree
-    /// in ONE batched forward and return the FULL per-node target logits
-    /// (`tokens.len() × vocab`, row-major).
-    ///
-    /// `tokens` is the slot-ordered token sequence (slot 0 = seed). `mask_block`
-    /// is the `[n × n]` additive `0.0`/`-inf` ancestor-visibility bias that encodes
-    /// the tree topology: a node's logits equal a causal verify of that node's
-    /// root-to-node chain. `depth_positions` are the per-slot RoPE positions
-    /// (`position + node.depth`); the target rotates Q/K at these positions so
-    /// parent→child distance is 1, while KV writes and the mask stay on contiguous
-    /// slots. The forward runs at contiguous positions `[position .. position + n)`.
-    ///
-    /// `hidden_out` captures per-extract-layer residual rows (same contract as
-    /// [`verify_block`](Self::verify_block) / [`dflash_extract_layers`](Self::dflash_extract_layers)).
-    ///
-    /// Leaves target state advanced by `n`; for stateless targets
-    /// [`commit_prefix`](Self::commit_prefix) is a no-op. Returns `Err` by default.
-    #[allow(clippy::too_many_arguments)]
-    fn verify_tree_logits(
-        &mut self,
-        _gpu: &mut Gpu,
-        _tokens: &[u32],
-        _mask_block: &[f32],
-        _depth_positions: &[i32],
-        _position: usize,
-        _scratch: &mut dyn SpecScratch,
-        _hidden_out: Option<&mut Vec<f32>>,
-    ) -> Result<Vec<f32>, String> {
-        Err("target does not expose verify_tree_logits".into())
-    }
-
     /// Look up the target's embedding row for `token_id`, dequantized to F32
     /// (length `dim`). Used by hidden-conditioned drafters to obtain the noise
     /// embedding broadcast across masked block positions. Returns `Err` by default.
@@ -829,9 +798,9 @@ pub struct SpecResetEvidence {
 
 /// A speculative-decode drafter+verifier, owned by the loaded model behind a
 /// `Box<dyn Speculator>`. The daemon's decode loop holds `&mut dyn Speculator`
-/// and is agnostic to whether the impl is a DFlash chain, a DDTree tree, an MTP
-/// head, or a future n-gram / EAGLE drafter — chain-vs-tree, K, budget, and
-/// topk are all resolved at build time and stored inside the impl.
+/// and is agnostic to whether the impl is a DFlash chain, an MTP head, or a
+/// future n-gram / EAGLE drafter — K, budget, and block width are all resolved
+/// at build time and stored inside the impl.
 pub trait Speculator {
     /// Prefill the prompt: seed the target's hidden state (advancing its KV +
     /// recurrent state) and prime the drafter's cached target-hidden buffer,
@@ -855,20 +824,21 @@ pub trait Speculator {
 
     /// Whether this speculator's verify is distribution-correct at temp>0 (so the
     /// daemon may route temp>0 requests through it for the spec speedup). Default
-    /// `false` — greedy-only drafters (n-gram, chain DFlash, MTP) keep temp>0 on
-    /// the AR sampler. The qwen35 DFlash ddtree path overrides this to `true`
-    /// (its SWOR verify samples the target distribution exactly). DFlash2
-    /// selector-chain also returns `true` here, but route selection must consult
-    /// [`Self::supports_chain_nucleus_verify`] to allow user-explicit top_p/top_k
-    /// (SWOR is temperature-only; selector-chain nucleus is not).
+    /// `false` — greedy-only drafters keep temp>0 on the AR sampler, and a
+    /// drafter that samples through the chain route signals that with
+    /// `requires_greedy() == false` instead. The target-generic DFlash chain
+    /// (SpecInfer naive sampling) returns `true` for a temperature-only verify;
+    /// DFlash2 selector-chain and sampled MTP also return `true`, and route
+    /// selection consults [`Self::supports_chain_nucleus_verify`] to allow
+    /// user-explicit top_p/top_k.
     fn supports_temp_verify(&self) -> bool {
         false
     }
 
     /// Whether chain-mode verify faithfully applies user-explicit top_p/top_k
     /// nucleus sampling (DFlash2 candidate-selector rejection sampling).
-    /// Distinct from [`Self::supports_temp_verify`]: that flag is also true for
-    /// DDTree SWOR, which honors temperature only and must refuse non-temperature
+    /// Distinct from [`Self::supports_temp_verify`]: a speculator that reports
+    /// that flag alone honors temperature only and must refuse non-temperature
     /// controls at the route gate. Default `false`.
     fn supports_chain_nucleus_verify(&self) -> bool {
         false
@@ -886,8 +856,8 @@ pub trait Speculator {
     /// `target` is the borrowed verifier; `emitted` is the prior committed
     /// tokens (repeat-penalty / n-gram context); `grammar` constrains both the
     /// draft and verify logits (`None` = unconstrained). `temp` is the request
-    /// sampling temperature — ignored by greedy-only drafters; the ddtree path
-    /// uses it to switch the verify into distribution-preserving SWOR at temp>0.
+    /// sampling temperature — ignored by greedy-only drafters; sampled verifiers
+    /// use it for their distribution-preserving accept at temp>0.
     ///
     /// `max_emit` is the remaining client-visible output budget (`max_tokens -
     /// generated`). Implementations MUST NOT verify/commit more tokens than this

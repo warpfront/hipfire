@@ -108,9 +108,6 @@ module	conv1d_silu_split_qknorm_b512	developer-opt-in	Non-default developer over
 module	conv1d_silu_split_qknorm_b64	developer-opt-in	Non-default developer override: HIPFIRE_CONV_QKNORM_SHAPE; rdna-compute/src/norm.rs:4976-5004
 module	convert_f32_to_bf16	non-core-family	Non-core family route: Muse Glimmer, Gemma, LFM2; hipfire-arch-lfm2moe/src/forward_batch.rs:102
 module	copy_f32_strided_slot_buffer	non-core-family	Non-core family route: DeepSeek4; hipfire-arch-deepseek4/src/forward.rs:12725
-module	ddtree_build_attn_mask	config-opt-in	Non-default configuration: speculation.ddtree_budget / speculation.dflash_tree; hipfire-arch-qwen35/src/dflash_spec.rs:524-534
-module	ddtree_gumbel_topk_batched	config-opt-in	Non-default configuration: speculation.ddtree_budget / speculation.dflash_tree; hipfire-arch-qwen35/src/dflash_spec.rs:524-534
-module	ddtree_swor_walk	config-opt-in	Non-default configuration: speculation.ddtree_budget / speculation.dflash_tree; hipfire-arch-qwen35/src/dflash_spec.rs:524-534
 module	deepseek4_attn_pos0	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22968
 module	deepseek4_attn_swa	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:23015
 module	deepseek4_attn_swa_batched	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:23069
@@ -296,7 +293,6 @@ module	gated_add_f32	non-core-family	Non-core family route: Flux/VAE; hipfire-ar
 module	gated_delta_net	config-opt-in	Non-default configuration: memory.state_quant; qwen35/forward.rs:2447
 module	gated_delta_net_f32_batch_seq	config-opt-in	Non-default configuration: memory.state_quant; qwen35/prefill.rs:9190
 module	gated_delta_net_f32_chunked	developer-opt-in	Non-default developer override: HIPFIRE_GDN_CHUNKED / HIPFIRE_STATE_QUANT; prefill.rs:9174-9176
-module	gated_delta_net_f32_tree	config-opt-in	Non-default configuration: speculation.ddtree_budget / speculation.dflash_tree; qwen35/prefill.rs:9114-9121
 module	gated_delta_net_q4	config-opt-in	Non-default configuration: memory.state_quant; qwen35/forward.rs:2473
 module	gated_delta_net_q8_compact2_b12	developer-opt-in	Non-default developer override: HIPFIRE_GDN_COMPACT2_SHAPE; rdna-compute/src/norm.rs:3472-3560
 module	gated_delta_net_q8_compact2_b16	developer-opt-in	Non-default developer override: HIPFIRE_GDN_COMPACT2_SHAPE; rdna-compute/src/norm.rs:3472-3560

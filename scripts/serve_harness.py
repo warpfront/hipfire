@@ -566,13 +566,10 @@ def show_config(cfg):
             print(f"      {k:18}= {cfg['sampling'][k]:<8} [{cfg['sampling_source'].get(k,'?')}]")
     notset = [k for k in SAMPLE_KEYS if k not in cfg["sampling"]]
     print(f"  sampling (NOT set, serve/daemon default applies): {', '.join(notset) or '(none)'}")
-    # Surface inherited DFlash/DDTree env knobs the harness must not clobber.
+    # Surface inherited DFlash env knobs the harness must not clobber.
     for env_key in (
         "HIPFIRE_DFLASH_DRAFT",
-        "HIPFIRE_DFLASH_TREE",
         "HIPFIRE_DFLASH_FAST_SAMPLE",
-        "HIPFIRE_DDTREE_BUDGET",
-        "HIPFIRE_DDTREE_TOPK",
     ):
         if env_key in os.environ:
             print(f"  env {env_key}={os.environ[env_key]!r} (pass-through)")
@@ -2536,7 +2533,7 @@ def spawn_serve(cfg, home, log):
     # caller-inherited value (do not pop/clear) so parent gates can pin the draft.
     if cfg.get("draft"):
         env["HIPFIRE_DFLASH_DRAFT"] = cfg["draft"]
-    # Plain DFlash / DDTree knobs (TREE/BUDGET/TOPK/FAST_SAMPLE) pass through
+    # Plain DFlash knobs (FAST_SAMPLE) pass through
     # from the parent environment unchanged — harness never rewrites them.
     # Harness-only parent IPC: must never reach hipfire serve / process config
     # (would otherwise lower as developer.serve_harness_pid_file).

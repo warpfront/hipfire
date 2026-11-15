@@ -1686,7 +1686,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_DFLASH_LOOKUP"),
-        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. auto (default) and on/1 arm it on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no CACTUS); off/0 disables it. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
+        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. auto (default) and on/1 arm it on a singleton DFlash2 selector chain (no retained-PM4 verify, no CACTUS); off/0 disables it. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
     ),
     field!(
         "speculation.dflash",
@@ -2016,30 +2016,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Minimum n-gram match count."
     ),
     field!(
-        "speculation.ddtree_budget",
-        "ddtree_budget",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(0),
-        ValueRule::Integer { min: 0, max: 64 },
-        true,
-        true,
-        Some("HIPFIRE_DDTREE_BUDGET"),
-        "DFlash verify-tree node budget; zero selects chain mode."
-    ),
-    field!(
-        "speculation.ddtree_topk",
-        "ddtree_topk",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(4),
-        ValueRule::Integer { min: 1, max: 8 },
-        true,
-        true,
-        Some("HIPFIRE_DDTREE_TOPK"),
-        "DFlash verify-tree fanout."
-    ),
-    field!(
         "prompt.chat_template",
         "chat_template",
         Prompt,
@@ -2261,17 +2237,6 @@ pub static FIELDS: &[ConfigField] = &[
         },
         "HIPFIRE_ROCBLAS_MIN_BATCH",
         "Minimum batch size for rocBLAS dispatch."
-    ),
-    diagnostic_field!(
-        "diagnostic.kernel.ddtree_logw_cutoff",
-        "ddtree_logw_cutoff",
-        DefaultValue::Null,
-        ValueRule::NullableFloat {
-            min: 0.0,
-            max: f64::MAX
-        },
-        "HIPFIRE_DDTREE_LOGW_CUTOFF",
-        "Positive DDTree cumulative-log-weight expansion cutoff."
     ),
     diagnostic_field!(
         "diagnostic.kernel.lloyd_mb4",
@@ -3413,24 +3378,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Force supported projection paths to remain unfused."
     ),
     process_bool_field!(
-        "speculation.dflash_tree",
-        "dflash_tree",
-        Speculation,
-        false,
-        true,
-        "HIPFIRE_DFLASH_TREE",
-        "Enable DDTree tree-SWOR verification."
-    ),
-    process_bool_field!(
-        "speculation.ddtree_tree_la",
-        "ddtree_tree_la",
-        Speculation,
-        true,
-        true,
-        "HIPFIRE_DDTREE_TREE_LA",
-        "Allow DDTree linearized-ancestor tape replay."
-    ),
-    process_bool_field!(
         "speculation.dflash_fast_sample",
         "dflash_fast_sample",
         Speculation,
@@ -4084,6 +4031,46 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "nothing ever read it",
         replacement: "none; per-kernel fusion selection is unchanged",
+    },
+    RetiredConfigKey {
+        key: "speculation.dflash_tree",
+        legacy_key: "dflash_tree",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "DDTree tree verify was removed (research-only; the linear chain won on every drafter measured)",
+        replacement: "none; DFlash always verifies the linear chain",
+    },
+    RetiredConfigKey {
+        key: "speculation.ddtree_budget",
+        legacy_key: "ddtree_budget",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "DDTree tree verify was removed (research-only; the linear chain won on every drafter measured)",
+        replacement: "none; DFlash always verifies the linear chain",
+    },
+    RetiredConfigKey {
+        key: "speculation.ddtree_topk",
+        legacy_key: "ddtree_topk",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "DDTree tree verify was removed (research-only; the linear chain won on every drafter measured)",
+        replacement: "none; DFlash always verifies the linear chain",
+    },
+    RetiredConfigKey {
+        key: "speculation.ddtree_tree_la",
+        legacy_key: "ddtree_tree_la",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "DDTree tree verify was removed (research-only; the linear chain won on every drafter measured)",
+        replacement: "none; DFlash always verifies the linear chain",
+    },
+    RetiredConfigKey {
+        key: "diagnostic.kernel.ddtree_logw_cutoff",
+        legacy_key: "ddtree_logw_cutoff",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "DDTree tree verify was removed (research-only; the linear chain won on every drafter measured)",
+        replacement: "none; DFlash always verifies the linear chain",
     },
 ];
 

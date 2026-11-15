@@ -869,8 +869,8 @@ impl Qwen35VmmStore {
             })();
         let (descs_dev, row_slot_dev, flash_partials, logits, hidden_out) =
             result.map_err(|e| format!("VMM executor scratch: {e}"))?;
-        // Plain trunk rows only: no GDN S-tape (that is a verify/tree cost).
-        let pbs = match PrefillBatchScratch::new_opt(gpu, config, trunk_rows, false) {
+        // Plain trunk rows only.
+        let pbs = match PrefillBatchScratch::new(gpu, config, trunk_rows) {
             Ok(p) => p,
             Err(e) => {
                 for t in descs_dev {

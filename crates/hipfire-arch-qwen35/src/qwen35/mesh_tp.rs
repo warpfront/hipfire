@@ -506,9 +506,7 @@ impl Qwen35TpRank {
         let mut kv = None;
         let built = (|| -> hip_bridge::HipResult<DeltaNetState> {
             scratch = Some(Qwen35Scratch::new_with_kv_max(gpu, &config, 64, max_seq)?);
-            pbs = Some(PrefillBatchScratch::new_opt(
-                gpu, &config, max_batch, false,
-            )?);
+            pbs = Some(PrefillBatchScratch::new(gpu, &config, max_batch)?);
             partial = Some(gpu.zeros(&[max_batch * config.dim], DType::F32)?);
             let mask = config
                 .layer_types
@@ -1031,16 +1029,8 @@ impl<'a> Qwen35TpBindings<'a> {
                     None,
                 )
                 .map_err(hip)?;
-                batch_chunk_upload_positions(
-                    gpu,
-                    pbs,
-                    BatchSemantics::Sequential,
-                    start,
-                    n,
-                    None,
-                    false,
-                )
-                .map_err(hip)
+                batch_chunk_upload_positions(gpu, pbs, BatchSemantics::Sequential, start, n, false)
+                    .map_err(hip)
             }
             (TpOp::Mixer { layer, index }, false) => {
                 let binding = program::DecodeBinding {
@@ -1077,7 +1067,6 @@ impl<'a> Qwen35TpBindings<'a> {
                         cfg.linear_key_head_dim,
                         BatchSemantics::Sequential,
                         None,
-                        None,
                         0,
                         index,
                         q8,
@@ -1102,7 +1091,6 @@ impl<'a> Qwen35TpBindings<'a> {
                     start + n,
                     &ctx,
                     BatchSemantics::Sequential,
-                    None,
                     q8,
                     q8,
                     index,
@@ -1654,7 +1642,6 @@ mod hw_tests {
             &mut plain_kv,
             &mut dn,
             &s,
-            None,
             None,
             None,
             None,

@@ -38,12 +38,6 @@ mod kernels {
     pub const CONV1D_SILU_SPLIT_SRC: &str =
         include_str!("../../../kernels/src/conv1d_silu_split.hip");
     #[cfg(not(feature = "deltanet"))]
-    pub const CONV1D_SILU_SPLIT_TREE_SRC: &str =
-        include_str!("../../../kernels/src/conv1d_silu_split_tree.hip");
-    #[cfg(not(feature = "deltanet"))]
-    pub const GATED_DELTA_NET_Q8_TREE_SRC: &str =
-        include_str!("../../../kernels/src/gated_delta_net_q8_tree.hip");
-    #[cfg(not(feature = "deltanet"))]
     pub const SCALE_F32_SRC: &str = include_str!("../../../kernels/src/scale_f32.hip");
     #[cfg(not(feature = "deltanet"))]
     pub const GATED_NORM_SRC: &str = include_str!("../../../kernels/src/gated_norm.hip");
@@ -245,16 +239,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         "conv1d_silu_split",
         kernels::CONV1D_SILU_SPLIT_SRC,
         ["conv1d_silu_split_f32", "conv1d_silu_split_f32_masked",]
-    );
-    add!(
-        "conv1d_silu_split_tree",
-        kernels::CONV1D_SILU_SPLIT_TREE_SRC,
-        ["conv1d_silu_split_tree_f32"]
-    );
-    add!(
-        "gated_delta_net_q8_tree",
-        kernels::GATED_DELTA_NET_Q8_TREE_SRC,
-        ["gated_delta_net_q8_tree"]
     );
     add!("sigmoid_mul", kernels::SIGMOID_MUL_SRC, ["sigmoid_mul_f32"]);
     add!("topk_logits", kernels::TOPK_LOGITS_SRC, ["topk_logits_f32"]);
@@ -7333,7 +7317,6 @@ pub enum KernelSpecRoute {
     Ar,
     NativeMtp,
     DFlash,
-    DDTree,
     DSpark,
 }
 
@@ -11496,7 +11479,7 @@ mod tests {
             assert!(by_name.contains_key(module), "missing P0 module {module}");
             count += 1;
         }
-        assert_eq!(count, 88);
+        assert_eq!(count, 86);
         // Modules added since the P0 capture: the scalar-prefill runtime's BR/BC
         // specialization, the `HIPFIRE_G12_DEC_NORM` decode twins, the five
         // multi-slot `*_paged` modules of the q8/asym3 routes, the H2 decode /

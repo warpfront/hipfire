@@ -750,7 +750,6 @@ fn dump(args: &[String]) -> Result<()> {
         None,
         None,
         None,
-        None,
     )?;
     snapshot(
         &gpu,

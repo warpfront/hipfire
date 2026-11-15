@@ -256,12 +256,6 @@ pub struct SpecLoadCfg {
     pub ngram_k: Option<usize>,
     /// n-gram min match count (`HIPFIRE_NGRAM_MIN_COUNT`). `None` = loader default.
     pub ngram_min_count: Option<u32>,
-    /// DDTree verify budget — max tree nodes (`HIPFIRE_DDTREE_BUDGET`). `None` =
-    /// loader default (0 = chain-mode DFlash, no ddtree). Mirrors `ngram_k`: a
-    /// CLI-forwarded draft tuning knob, env-wins-else-param in the loader.
-    pub ddtree_budget: Option<usize>,
-    /// DDTree per-position top-K width (`HIPFIRE_DDTREE_TOPK`). `None` = default.
-    pub ddtree_topk: Option<usize>,
     /// DSpark draft module (deepseek4 `-dspark` sidecar) enable, lowered from the
     /// `speculation` selector: `Some(true)` = `dspark` mode (load + force),
     /// `Some(false)` = another mechanism selected (skip load + build),

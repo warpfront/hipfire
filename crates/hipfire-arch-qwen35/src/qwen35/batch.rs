@@ -82,10 +82,6 @@ pub struct PrefillBatchScratch {
     // Uploaded once at the start of each chunk and reused by rope + kv_write
     // + attention kernels.
     pub positions: GpuTensor,
-    // Depth-based RoPE angles for DDTree verify (39aa358 fix). Uploaded in
-    // tree-verify mode; FA RoPE reads it instead of `positions` while KV
-    // writes and attention seq_len keep the flat physical slots.
-    pub rope_positions: GpuTensor,
     // VL M-RoPE phases: [max_batch × 3] i32-in-F32 per-row absolute (t,h,w).
     // Read by the FA RoPE branch only on steps whose SlotBatch carries pos3.
     pub pos3: GpuTensor,
@@ -170,71 +166,23 @@ pub struct PrefillBatchScratch {
     pub moe_expert_tile_ids: Option<GpuTensor>,
     pub moe_y_gate_up_grouped: Option<GpuTensor>, // [m_total × (2*mi)]
     pub moe_y_down_grouped: Option<GpuTensor>,    // [m_total × dim] for the down step
-
-    // ── Tree-aware LA scratch (Phase 3b of Task #101) ──
-    // Per-token S-state tape consumed by gated_delta_net_q8_tree kernel
-    // when TreeVerifyCtx.parent_indices is Some. Reused across LA layers
-    // since LA dispatch is serial per-cycle. Only allocated when the model
-    // has LA layers (linear_num_value_heads > 0). Call sites that pass
-    // parent_indices must ensure these tensors exist.
-    //
-    // s_tape_q8:     [max_batch × n_v_heads × head_dim × head_dim] Raw/i8
-    // s_tape_scales: [max_batch × n_v_heads × head_dim] f32
-    //
-    // At max_batch=22, n_v_heads=16, head_dim=128 → 5.77 MB + 180 KB total.
-    pub dn_s_tape_q8: Option<GpuTensor>,
-    pub dn_s_tape_scales: Option<GpuTensor>,
-    // FP32 per-node tape for the FP32 `StateQuant` tree-verify path. Same
-    // element layout as `dn_s_tape_q8` but f32 (4×), no scales side-table.
-    // TODO: gate allocation on state_quant (needs threading StateQuant into
-    // `new`); currently always allocated when LA layers exist, like the Q8
-    // tape. s_tape_f32: [max_batch × n_v_heads × head_dim × head_dim] f32.
-    pub dn_s_tape_f32: Option<GpuTensor>,
 }
 
 impl PrefillBatchScratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_batch: usize) -> HipResult<Self> {
-        // Default: allocate the spec-decode DeltaNet S-tape (tree-verify reads it).
-        Self::new_opt(gpu, config, max_batch, /*cap_gdn_tape=*/ true)
-    }
-
-    /// Like [`new`], but `cap_gdn_tape` controls allocation of the per-token
-    /// DeltaNet S-state tape (`dn_s_tape_*`, sized `[max_batch × n_v_heads ×
-    /// value_head_dim²]`). The tape is consumed ONLY by the tree-verify
-    /// (spec-decode) GDN kernels; plain prefill (`tree_parents == None`)
-    /// advances the recurrent state in place and never touches it. Pass `false`
-    /// for plain prefill to skip the tape — on A3B (16 value heads × 128²) it is
-    /// ~10 GB at an 8k batch (dn_s_tape_f32 8.2 GB + dn_s_tape_q8 2 GB), the
-    /// difference between an 8k prefill fitting and OOMing. Callers that may run
-    /// tree-verify MUST pass `true` (else the `.expect()` at the consumption site
-    /// panics).
-    pub fn new_opt(
-        gpu: &mut Gpu,
-        config: &Qwen35Config,
-        max_batch: usize,
-        cap_gdn_tape: bool,
-    ) -> HipResult<Self> {
-        Self::new_opt_with_alloc(
-            gpu,
-            config,
-            max_batch,
-            cap_gdn_tape,
-            false,
-            Gpu::alloc_tensor,
-        )
+        Self::new_opt_with_alloc(gpu, config, max_batch, false, Gpu::alloc_tensor)
     }
 
     /// Only for the model-wide admitted ordinary gfx11 route; callers must
     /// reject verify or non-fused dispatch before using its shortened fields.
     pub fn new_opt_lean(gpu: &mut Gpu, config: &Qwen35Config, max_batch: usize) -> HipResult<Self> {
-        Self::new_opt_with_alloc(gpu, config, max_batch, false, true, Gpu::alloc_tensor)
+        Self::new_opt_with_alloc(gpu, config, max_batch, true, Gpu::alloc_tensor)
     }
 
     fn new_opt_with_alloc(
         gpu: &mut Gpu,
         config: &Qwen35Config,
         max_batch: usize,
-        cap_gdn_tape: bool,
         lean: bool,
         mut allocate: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
     ) -> HipResult<Self> {
@@ -319,19 +267,6 @@ impl PrefillBatchScratch {
         // attention / kv_write kernels cast the pointer to `const int*`,
         // so dtype is cosmetic. Upload i32 bits via memcpy_htod.
         let i_positions = alloc!(&[max_batch], DType::F32);
-        // Depth-based RoPE angles for DDTree verify (39aa358 fix):
-        // `positions` stays the flat linear KV slot index; this buffer
-        // carries `base_pos + depth(node)` so FA-layer RoPE rotates Q/K
-        // at the logically-correct phase while KV writes stay on
-        // distinct linear slots. Uploaded per cycle in tree-verify mode
-        // from `TreeVerifyCtx.positions`; FA RoPE kernels read it ONLY
-        // when `tree_verify.is_some()`. Same i32-in-F32 cosmetic dtype
-        // pattern as `positions`.
-        let i_rope_positions = if lean {
-            None
-        } else {
-            Some(alloc!(&[max_batch], DType::F32))
-        };
         // VL M-RoPE phases: [max_batch × 3] i32-in-F32, per-row absolute
         // (t, h, w). Uploaded only on steps whose SlotBatch carries
         // `pos3`; the FA RoPE branch dispatches the batched M-RoPE
@@ -471,27 +406,6 @@ impl PrefillBatchScratch {
             &[grouped_m_total_max * config.dim],
             DType::F32
         );
-        let i_dn_s_tape_q8 = alloc_opt!(
-            cap_gdn_tape && config.linear_num_value_heads > 0,
-            &[max_batch
-                * config.linear_num_value_heads
-                * config.linear_value_head_dim
-                * config.linear_value_head_dim],
-            DType::Raw
-        );
-        let i_dn_s_tape_scales = alloc_opt!(
-            cap_gdn_tape && config.linear_num_value_heads > 0,
-            &[max_batch * config.linear_num_value_heads * config.linear_value_head_dim],
-            DType::F32
-        );
-        let i_dn_s_tape_f32 = alloc_opt!(
-            cap_gdn_tape && config.linear_num_value_heads > 0,
-            &[max_batch
-                * config.linear_num_value_heads
-                * config.linear_value_head_dim
-                * config.linear_value_head_dim],
-            DType::F32
-        );
 
         // No HIP allocations for ordinary-only verify sidecars. Borrow the
         // already-owned positions pointer solely as a zero-length sentinel;
@@ -503,7 +417,6 @@ impl PrefillBatchScratch {
         };
         let sentinels = lean.then(|| {
             (
-                borrowed_sentinel(DType::F32),
                 borrowed_sentinel(DType::F16),
                 borrowed_sentinel(DType::F16),
                 borrowed_sentinel(DType::F16),
@@ -511,7 +424,6 @@ impl PrefillBatchScratch {
             )
         });
         let (
-            rope_positions,
             x_rot_f16_batch,
             dn_normed_rot_f16_batch,
             ffn_hidden_f16_batch,
@@ -520,7 +432,6 @@ impl PrefillBatchScratch {
             sentinels
         } else {
             (
-                take!(i_rope_positions.unwrap()),
                 take!(i_x_rot_f16_batch.unwrap()),
                 take!(i_dn_normed_rot_f16_batch.unwrap()),
                 take!(i_ffn_hidden_f16_batch.unwrap()),
@@ -561,7 +472,6 @@ impl PrefillBatchScratch {
             ffn_hidden_batch: take!(i_ffn_hidden_batch),
             dn_normed_rot_batch: take!(i_dn_normed_rot_batch),
             positions: take!(i_positions),
-            rope_positions,
             pos3: take!(i_pos3),
             ext_emb_index: take!(i_ext_emb_index),
             ext_emb_row_ptr: take!(i_ext_emb_row_ptr),
@@ -599,9 +509,6 @@ impl PrefillBatchScratch {
             moe_expert_tile_ids: i_moe_expert_tile_ids.map(|i| take!(i)),
             moe_y_gate_up_grouped: i_moe_y_gate_up_grouped.map(|i| take!(i)),
             moe_y_down_grouped: i_moe_y_down_grouped.map(|i| take!(i)),
-            dn_s_tape_q8: i_dn_s_tape_q8.map(|i| take!(i)),
-            dn_s_tape_scales: i_dn_s_tape_scales.map(|i| take!(i)),
-            dn_s_tape_f32: i_dn_s_tape_f32.map(|i| take!(i)),
         })
     }
 
@@ -652,7 +559,6 @@ impl PrefillBatchScratch {
         }
         if !self.lean {
             for t in [
-                self.rope_positions,
                 self.x_rot_f16_batch,
                 self.dn_normed_rot_f16_batch,
                 self.ffn_hidden_f16_batch,
@@ -683,9 +589,6 @@ impl PrefillBatchScratch {
             self.moe_expert_tile_ids,
             self.moe_y_gate_up_grouped,
             self.moe_y_down_grouped,
-            self.dn_s_tape_q8,
-            self.dn_s_tape_scales,
-            self.dn_s_tape_f32,
         ] {
             if let Some(t) = t {
                 note(gpu.free_tensor(t));
@@ -790,7 +693,7 @@ impl Qwen35DecodeBatchState {
                     return Err(e);
                 }
             };
-        let pbs = match PrefillBatchScratch::new_opt(gpu, config, max_batch, false) {
+        let pbs = match PrefillBatchScratch::new(gpu, config, max_batch) {
             Ok(p) => p,
             Err(e) => {
                 dn_state.free_gpu(gpu);
@@ -981,7 +884,6 @@ impl Qwen35DecodeBatchState {
             &mut kv_lane,
             &mut dn_lane,
             scratch,
-            None,
             None,
             None,
             None,
@@ -1323,7 +1225,7 @@ impl Qwen35DecodeBatchState {
             .and_then(|v| v.checked_mul(l_dn))
             .and_then(|v| v.checked_mul(4))
             .ok_or_else(|| HipError::new(0, "DN conv bytes overflow"))?;
-        let pbs = PrefillBatchScratch::projected_allocation_bytes(config, max_batch, false)?;
+        let pbs = PrefillBatchScratch::projected_allocation_bytes(config, max_batch)?;
         let dim = config.dim as u64;
         let vocab = config.vocab_size as u64;
         let out = (max_batch as u64)
@@ -1355,14 +1257,10 @@ impl Qwen35DecodeBatchState {
 }
 
 impl PrefillBatchScratch {
-    /// Checked projection mirroring `new_opt`. Returns total bytes allocated
-    /// for `max_batch` with/without the GDN tape. Mirrors every `alloc!` in
-    /// `new_opt` exactly using only checked arithmetic.
-    pub fn projected_allocation_bytes(
-        config: &Qwen35Config,
-        max_batch: usize,
-        cap_gdn_tape: bool,
-    ) -> HipResult<u64> {
+    /// Checked projection mirroring `new`. Returns total bytes allocated
+    /// for `max_batch`. Mirrors every `alloc!` in `new` exactly using only
+    /// checked arithmetic.
+    pub fn projected_allocation_bytes(config: &Qwen35Config, max_batch: usize) -> HipResult<u64> {
         if max_batch == 0 {
             return Err(HipError::new(0, "PBS projected allocation: zero batch"));
         }
@@ -1426,10 +1324,9 @@ impl PrefillBatchScratch {
         add(cm(n, v_dim)?, 4)?;
         add(n, 4)?;
         add(n, 4)?;
-        add(n, 4)?;
         // VL side arrays: pos3 [n×3] and ext_emb_index [n] (i32-in-F32, 4
         // B/row each) plus ext_emb_row_ptr [n] raw u64 pointers (8 B/row) —
-        // must mirror the alloc!s in new_opt exactly.
+        // must mirror the alloc!s in new exactly.
         add(cm(n, 3)?, 4)?;
         add(n, 4)?;
         add(n, 8)?;
@@ -1445,7 +1342,7 @@ impl PrefillBatchScratch {
         add(cm(n, kv_dim)?, 4)?;
         add(cm(n, q_dim)?, 4)?;
         add(cm(n, q_dim)?, 4)?;
-        // Prescaffold F16 sidecars (same order as `new_opt`): half bytes.
+        // Prescaffold F16 sidecars (same order as `new`): half bytes.
         add(cm(n, dim)?, 2)?;
         add(cm(n, v_dim)?, 2)?;
         add(cm(n, hd)?, 2)?;
@@ -1496,35 +1393,6 @@ impl PrefillBatchScratch {
             add((m_max / 16) * 4, 1)?;
             add(cm(m_max, 2 * config.moe_intermediate_size as u64)?, 4)?;
             add(cm(m_max, config.dim as u64)?, 4)?;
-            if cap_gdn_tape && config.linear_num_value_heads > 0 {
-                let tape_elems = n
-                    .checked_mul(v_heads)
-                    .and_then(|v| v.checked_mul(v_hd))
-                    .and_then(|v| v.checked_mul(v_hd))
-                    .ok_or_else(|| HipError::new(0, "PBS tape elems overflow"))?;
-                add(tape_elems, 1)?;
-                add(
-                    cm(n, v_heads)?
-                        .checked_mul(v_hd)
-                        .ok_or_else(|| HipError::new(0, "PBS tape overflow"))?,
-                    4,
-                )?;
-                add(tape_elems, 4)?;
-            }
-        } else if cap_gdn_tape && config.linear_num_value_heads > 0 {
-            let tape_elems = n
-                .checked_mul(v_heads)
-                .and_then(|v| v.checked_mul(v_hd))
-                .and_then(|v| v.checked_mul(v_hd))
-                .ok_or_else(|| HipError::new(0, "PBS tape elems overflow"))?;
-            add(tape_elems, 1)?;
-            add(
-                cm(n, v_heads)?
-                    .checked_mul(v_hd)
-                    .ok_or_else(|| HipError::new(0, "PBS tape overflow"))?,
-                4,
-            )?;
-            add(tape_elems, 4)?;
         }
         Ok(total)
     }
@@ -1915,7 +1783,6 @@ pub fn forward_decode_batch_prepared(
         Some((&final_hidden, 0, HiddenCapture::Verify)),
         None,
         0,
-        None,
         true,
         true,
         None,
@@ -1971,7 +1838,6 @@ mod allocation_tests {
             &mut gpu,
             &config,
             2,
-            true,
             false,
             |gpu, shape, dtype| {
                 allocations += 1;
@@ -1986,7 +1852,6 @@ mod allocation_tests {
             &mut gpu,
             &config,
             2,
-            true,
             false,
             |gpu, shape, dtype| {
                 attempted += 1;
@@ -2009,7 +1874,7 @@ mod allocation_tests {
                 panic!("allocation fault did not trigger");
             }
         }
-        let retry = PrefillBatchScratch::new_opt(&mut gpu, &config, 2, true)
+        let retry = PrefillBatchScratch::new(&mut gpu, &config, 2)
             .expect("immediate retry after allocation failure");
         retry.free_gpu(&mut gpu).expect("release retried scratch");
         assert_eq!(

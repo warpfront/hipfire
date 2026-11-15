@@ -1078,7 +1078,7 @@ fn stage_qwen_vmm_spec(m: &mut LoadedModel, gpu: &mut Gpu, lanes: usize, row_bud
 /// Stage the VMM store's DFlash engine over the loaded singleton's resident
 /// draft weights (shared by reference count, never reloaded). Eligibility is
 /// derived from the resolved loaded speculator (`vmm_assets`: fixed-block
-/// chain, no DDTree, no admitted retained PM4, adaptive block off) and the
+/// chain, no admitted retained PM4, adaptive block off) and the
 /// store (Exact route, `max_rows >= block`), not from a second env parse.
 fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) {
     let assets = match m

@@ -2445,7 +2445,6 @@ pub(crate) fn qwen4_pp_option_refusal(
         (draft_path.is_some() || spec.dflash == Some(true), "DFlash"),
         (spec.dspark == Some(true), "DSpark"),
         (spec.ngram_draft == Some(true), "n-gram drafting"),
-        (crate::carriers::qwen4_ddtree_requested(spec), "DDTree"),
         (options.kv_adaptive, "adaptive KV"),
         (options.eagle_drafter, "an EAGLE drafter"),
         (
@@ -4428,7 +4427,7 @@ mod tests {
         );
     }
 
-    mod qwen4_ddtree_admission {
+    mod qwen4_source_option_admission {
         use super::super::*;
         use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 
@@ -4488,13 +4487,11 @@ mod tests {
 
         #[test]
         fn resolved_defaults_pass_source_gate_but_active_overrides_refuse() {
-            let path = write_probe("ddtree");
+            let path = write_probe("options");
             let defaults = SpecLoadCfg {
                 dflash: Some(false),
                 dspark: Some(false),
                 ngram_draft: Some(false),
-                ddtree_budget: Some(0),
-                ddtree_topk: Some(4),
                 mtp: Some(false),
                 ..SpecLoadCfg::default()
             };
@@ -4503,39 +4500,12 @@ mod tests {
                 .expect_err("minimal probe must fail later on invalid Qwen4 config");
             assert!(
                 !err.contains("qwen4: unsupported option(s)"),
-                "resolved schema defaults must pass the DDTree source gate: {err}"
+                "resolved schema defaults must pass the source option gate: {err}"
             );
             assert!(
                 err.contains("config admission failed"),
                 "defaults must reach Qwen4 config validation: {err}"
             );
-
-            let active = SpecLoadCfg {
-                ddtree_budget: Some(1),
-                ddtree_topk: Some(4),
-                ..defaults
-            };
-            let err = admit(&path, active, Some("off"))
-                .map(|_| ())
-                .expect_err("active DDTree must refuse");
-            assert!(
-                err.contains("qwen4: unsupported option(s): DDTree;"),
-                "active DDTree must be refused at source admission: {err}"
-            );
-
-            let nondefault_topk = SpecLoadCfg {
-                ddtree_budget: Some(0),
-                ddtree_topk: Some(5),
-                ..defaults
-            };
-            let err = admit(&path, nondefault_topk, Some("off"))
-                .map(|_| ())
-                .expect_err("non-default top-K must refuse");
-            assert!(
-                err.contains("qwen4: unsupported option(s): DDTree;"),
-                "non-default DDTree top-K must be refused at source admission: {err}"
-            );
-
             let err = admit(&path, defaults, Some("balanced"))
                 .map(|_| ())
                 .expect_err("active adaptive KV must refuse");
@@ -7091,11 +7061,6 @@ mod qwen4_pp_admission_tests {
                 None,
                 options_with(|o| o.spec.ngram_draft = Some(true)),
             ),
-            (
-                "DDTree",
-                None,
-                options_with(|o| o.spec.ddtree_budget = Some(1)),
-            ),
             ("adaptive KV", None, options_with(|o| o.kv_adaptive = true)),
             ("EAGLE", None, options_with(|o| o.eagle_drafter = true)),
             (
@@ -7379,14 +7344,6 @@ mod qwen4_pp_admission_tests {
                     o.spec.ngram_draft = Some(true);
                 }),
             ),
-            (
-                "DDTree",
-                None,
-                options_with(|o| {
-                    o.spec.mtp = Some(true);
-                    o.spec.ddtree_budget = Some(1);
-                }),
-            ),
         ];
         for (name, draft, options) in refused {
             let error = qwen4_pp_option_refusal(4, draft, &options).unwrap_err();
@@ -7545,8 +7502,6 @@ mod qwen4_pp_admission_tests {
                 dflash: Some(false),
                 dspark: Some(false),
                 ngram_draft: Some(false),
-                ddtree_budget: Some(0),
-                ddtree_topk: Some(4),
                 mtp: Some(false),
                 ..SpecLoadCfg::default()
             };

@@ -32,8 +32,8 @@ pub(crate) fn hip_err(e: DispatchError) -> HipError {
 ///
 /// `Off` is the behavior-preserving default: every hook takes the pre-change
 /// path. `ChainVerify` arms the exact-shape fast routes (linear chain verify
-/// only — tree verify stays `Off`). Computed once in
-/// `verify_dflash_block_inner` (`ChainVerify` iff `tree_verify` is `None`)
+/// only). Computed once in
+/// `verify_dflash_block_inner` (`ChainVerify` for chain verify)
 /// and threaded through the verify forwards; every other caller passes `Off`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DflashFusionCtx {
@@ -55,19 +55,6 @@ impl DflashFusionCtx {
     pub const fn split_verify_active(self) -> bool {
         matches!(self, Self::ChainVerifySplit)
     }
-}
-
-/// DDTree verify context: depth positions, ancestor bias and parent slots.
-#[derive(Clone, Copy)]
-pub struct TreeVerifyCtx<'a> {
-    pub positions: &'a [i32],
-    pub attn_bias: &'a GpuTensor,
-    /// `[N]` i32 — for each linearized slot, the slot index of its parent
-    /// in the same linearization (or -1 for the root / seed). Produced by
-    /// `hipfire_runtime::ddtree::linearize_tree_with_parents`. When `Some`, LA layers
-    /// use tree-aware kernels that read parent state from the per-layer
-    /// s_tape scratch of the batch scratch.
-    pub parent_indices: Option<&'a GpuTensor>,
 }
 
 /// Row semantics of one batched forward chunk: a sequential prompt/verify
@@ -141,9 +128,6 @@ pub struct BatchScratch<'a> {
     pub dn_normed_batch: &'a GpuTensor,
     pub dn_normed_rot_batch: &'a GpuTensor,
     pub dn_normed_rot_f16_batch: &'a GpuTensor,
-    pub dn_s_tape_q8: Option<&'a GpuTensor>,
-    pub dn_s_tape_scales: Option<&'a GpuTensor>,
-    pub dn_s_tape_f32: Option<&'a GpuTensor>,
     pub fa_q_full_batch: &'a GpuTensor,
     pub fa_q_batch: &'a GpuTensor,
     pub fa_gate_batch: &'a GpuTensor,
@@ -154,8 +138,6 @@ pub struct BatchScratch<'a> {
     pub fa_attn_out_rot_f16_batch: &'a GpuTensor,
     /// Physical KV slot per row.
     pub positions: &'a GpuTensor,
-    /// RoPE phase per row (DDTree depth positions; else unused).
-    pub rope_positions: &'a GpuTensor,
     /// Explicit per-row M-RoPE phases of a VL prompt chunk. `Some` makes the
     /// batched full-attention prep rotate with the batched M-RoPE kernel at
     /// these phases (and bypass every fused prep that bakes 1D rope); `None`
@@ -1044,7 +1026,7 @@ impl DenseBatchMath {
 
 /// Run `body` with the ordinary prefill intent open ([`Gpu::ordinary_prefill_enter`]) and restore
 /// the previous intent on every return, `Err` included. Every ordinary prefill forward
-/// (including a one-row tail) runs its layer stack inside this; decode, tree/chain verify, row
+/// (including a one-row tail) runs its layer stack inside this; decode, chain verify, row
 /// capture and rollback never do.
 pub fn with_ordinary_prefill<T>(gpu: &mut Gpu, body: impl FnOnce(&mut Gpu) -> T) -> T {
     let prev = gpu.ordinary_prefill_enter();
@@ -1798,7 +1780,7 @@ pub fn mq_f16_projection_fast_route(
 /// S4-f16-residual-inputs: shared fast-route predicate for the four
 /// post-attention/down hooks.
 ///
-/// True only for the frozen fixture route: chain (non-tree) verify on exact
+/// True only for the frozen fixture route: chain verify on exact
 /// gfx1100 or exact gfx1201, the slice kill switch clear, an MQ4G256V2 residual consumer, a
 /// `Residual` epilogue, and a verify-block batch `1 <= n <= 16`. Every false
 /// keeps the pre-change path byte-for-byte.

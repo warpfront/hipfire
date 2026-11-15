@@ -97,7 +97,6 @@ fn main() {
         None,
         None,
         None,
-        None,
     )
     .expect("prefill forward failed");
     gpu.hip.device_synchronize().expect("sync");

@@ -1016,7 +1016,6 @@ fn main() {
                             None,
                             Some(h_buf),
                             None,
-                            None,
                         )
                         .expect("forward_prefill_batch whole window");
                     }
@@ -1041,7 +1040,6 @@ fn main() {
                         None,
                         None,
                         None,
-                        None,
                     )
                     .expect("forward_prefill_batch prefix (scored-max-batch)");
                     let scored_rows = scoring_start..(n_ctx - 1 + usize::from(pad_scoring_tail));
@@ -1057,7 +1055,6 @@ fn main() {
                         None,
                         Some(h_buf),
                         None,
-                        None,
                         cap,
                     )
                     .expect("forward_prefill_batch_capped scored");
@@ -1072,7 +1069,6 @@ fn main() {
                         &mut kv_cache,
                         &mut dn_state,
                         &scratch,
-                        None,
                         None,
                         None,
                         None,

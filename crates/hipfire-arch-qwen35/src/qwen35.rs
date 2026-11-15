@@ -30,7 +30,7 @@ pub use config::{
     dense_tp_rank_layouts, local_dense_tp_config, validate_dense_tp, DenseTpRankLayout,
     DflashFusionCtx, LayerType, MaskEmbedOverride, MropeCtx, Qwen35BatchCompatibility,
     Qwen35BatchLoadConfig, Qwen35BatchParallelism, Qwen35Config, Qwen35EpBatchReceipt,
-    Qwen35EpReduce, Qwen35EpTopology, TreeVerifyCtx,
+    Qwen35EpReduce, Qwen35EpTopology,
 };
 pub use ep_batch::{
     forward_ep, forward_prefill_batch_ep, forward_prefill_batch_multi, forward_scratch_multi,

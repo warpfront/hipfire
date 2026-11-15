@@ -44,7 +44,6 @@ use hipfire_dispatch::families::moe::{
 use hipfire_dispatch::pipeline::batched::{
     mq_f16_projection_fast_route, q8_prefill_wmma_enabled, s4_residual_fast, valid_lane_mask,
     verify_dense_math, BatchEpilogue, BatchSemantics, DenseBatchMath, DflashFusionCtx,
-    TreeVerifyCtx,
 };
 use hipfire_dispatch::pipeline::batched_attention::{
     batch_chunk_fa_attend, batch_chunk_full_attn_attn, batch_chunk_full_attn_input_projection,
@@ -92,8 +91,7 @@ use rdna_compute::GpuTensor;
 /// Whether a target-verify forward over `weights` with KV tier `kv` can run
 /// inside the PM FP8 verify scope (`Gpu::fp8_verify_enter`): a dense
 /// MQ4G256V2 target whose batched attention takes the KV tier (FP8, Q8 or
-/// asym). A tree verify passes [`Fp8VerifyTarget::Ineligible`] itself.
-/// Singleton, batched and rollback forwards of one request share this
+/// asym). Singleton, batched and rollback forwards of one request share this
 /// answer, so they share the arithmetic.
 pub(crate) fn fp8_verify_target(
     weights: &Qwen35Weights,
@@ -457,30 +455,29 @@ pub(crate) fn prefill_max_batch_for_model(gpu: &Gpu, weights: &Qwen35Weights) ->
     )
 }
 
-/// Rows and tape flag of the implicit `HIPFIRE_PREFILL_REUSE_PBS=1` cache that
+/// Rows of the implicit `HIPFIRE_PREFILL_REUSE_PBS=1` cache that
 /// `Qwen35Scratch::new_with_kv_max` allocates (pure core of that sizing): an
 /// explicit `HIPFIRE_PREFILL_MAX_BATCH` raises the cache exactly as it raises
-/// every other ordinary ceiling, capped at 512 rows and tape-free on exact
-/// gfx1201, floored at 512 rows on gfx1151, the configured rows with a tape
-/// elsewhere.
+/// every other ordinary ceiling, capped at 512 rows on exact
+/// gfx1201, floored at 512 rows on gfx1151, the configured rows elsewhere.
 pub(crate) fn implicit_reuse_pbs_plan(
     arch: &str,
     explicit_max_batch: Option<usize>,
     fp8_chunk512: bool,
-) -> (usize, bool) {
+) -> usize {
     let configured =
         explicit_max_batch.unwrap_or_else(|| prefill_max_batch_for_arch(arch, fp8_chunk512));
     if arch == "gfx1201" {
-        (configured.min(512), false)
+        configured.min(512)
     } else if arch == "gfx1151" {
-        (configured.max(512), true)
+        configured.max(512)
     } else {
-        (configured, true)
+        configured
     }
 }
 
 /// [`implicit_reuse_pbs_plan`] for the live device and process configuration.
-pub(crate) fn implicit_reuse_pbs_plan_for_gpu(gpu: &Gpu) -> (usize, bool) {
+pub(crate) fn implicit_reuse_pbs_plan_for_gpu(gpu: &Gpu) -> usize {
     implicit_reuse_pbs_plan(
         gpu.arch.as_str(),
         explicit_prefill_max_batch(),
@@ -506,7 +503,7 @@ fn legacy_prefill_max_batch(
     })
 }
 
-/// Widened ordinary route: an ordinary (non-captured, no tree/tape/cap/caller
+/// Widened ordinary route: an ordinary (non-captured, no tape/cap/caller
 /// PBS) call whose admitted ceiling exceeds the 512-row commit seam.
 fn widened_route(wide_candidate: bool, limit: usize) -> bool {
     wide_candidate && limit > WIDENED_COMMIT_ROWS
@@ -1209,8 +1206,8 @@ enum WrapperOwner {
     /// The implicit `HIPFIRE_PREFILL_REUSE_PBS=1` cache as allocated.
     Physical,
     /// The lazily allocated explicit-equivalent owner (`Qwen35Scratch::
-    /// reuse_virtual_pbs`) with exactly these rows and tape flag.
-    Virtual { rows: usize, tape: bool },
+    /// reuse_virtual_pbs`) with exactly these rows.
+    Virtual { rows: usize },
 }
 ///
 /// The wrapper-side parameters of one ordinary call.
@@ -1247,17 +1244,17 @@ struct WrapperPbsInputs<'a> {
     fp8_chunk512: bool,
     /// The dense widened route is statically admitted.
     dense_widened: bool,
-    /// The implicit reuse cache `(rows, tape)`, `None` with reuse off.
-    physical: Option<(usize, bool)>,
-    /// An already allocated virtual owner `(rows, tape)` (e.g. kept from an
+    /// The implicit reuse cache rows, `None` with reuse off.
+    physical: Option<usize>,
+    /// An already allocated virtual owner rows (e.g. kept from an
     /// earlier request).
-    existing_virtual: Option<(usize, bool)>,
+    existing_virtual: Option<usize>,
     /// The DEFAULT resident-MoE request (no explicit knob) is statically
     /// eligible and its 8192 rung fits memory with no caller PBS present.
     default_moe_fits: bool,
     /// The call's own caller/capture facts ([`OrdinaryCallFacts`], the same
     /// record the inner entry builds, with no caller PBS) leave the call a
-    /// widen candidate: captured/recorded, tree, tape, staged ring,
+    /// widen candidate: captured/recorded, tape, staged ring,
     /// band/fusion and capped calls never get a promotion.
     call_eligible: bool,
 }
@@ -1308,10 +1305,7 @@ fn plan_wrapper_pbs(i: &WrapperPbsInputs) -> WrapperPbsPlan {
         }
     } else {
         WrapperPbsPlan {
-            owner: WrapperOwner::Virtual {
-                rows: target.0,
-                tape: target.1,
-            },
+            owner: WrapperOwner::Virtual { rows: target },
             max_batch_override,
             free_virtual: i.existing_virtual.is_some_and(|e| e != target),
             alloc_virtual: i.existing_virtual != Some(target),
@@ -1319,9 +1313,6 @@ fn plan_wrapper_pbs(i: &WrapperPbsInputs) -> WrapperPbsPlan {
     }
 }
 
-fn pbs_has_tape(p: &PrefillBatchScratch) -> bool {
-    p.dn_s_tape_q8.is_some() || p.dn_s_tape_f32.is_some()
-}
 ///
 /// The wrapper's call-level gate: the one decision of "may this call be
 /// promoted at all", shared by the production wrapper step and the CPU tests
@@ -1344,8 +1335,8 @@ fn pbs_has_tape(p: &PrefillBatchScratch) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OrdinaryWrapperGate {
     n: usize,
-    /// The implicit reuse cache `(rows, tape)`, `None` with reuse off.
-    physical: Option<(usize, bool)>,
+    /// The implicit reuse cache rows, `None` with reuse off.
+    physical: Option<usize>,
     call_eligible: bool,
 }
 
@@ -1353,7 +1344,7 @@ impl OrdinaryWrapperGate {
     fn new(
         n: usize,
         call: &OrdinaryCallFacts,
-        physical: Option<(usize, bool)>,
+        physical: Option<usize>,
         batched_eligible: impl Fn(usize) -> bool,
     ) -> Self {
         let call_eligible = n > 0
@@ -1381,7 +1372,7 @@ impl OrdinaryWrapperGate {
         arch: &str,
         fp8_chunk512: bool,
         dense_widened: bool,
-        existing_virtual: Option<(usize, bool)>,
+        existing_virtual: Option<usize>,
         default_moe_fits: bool,
     ) -> WrapperPbsPlan {
         // An empty call returns before the inner entry touches anything.
@@ -1417,13 +1408,13 @@ impl OrdinaryWrapperGate {
 /// credited.
 fn wrapper_virtual_credit_bytes(
     config: &Qwen35Config,
-    physical: Option<(usize, bool)>,
-    existing_virtual: Option<(usize, bool)>,
-    target: (usize, bool),
+    physical: Option<usize>,
+    existing_virtual: Option<usize>,
+    target: usize,
 ) -> usize {
     existing_virtual
         .filter(|&e| e == target && physical != Some(target))
-        .and_then(|(rows, tape)| resident_moe_owner_bytes(config, rows, tape))
+        .and_then(|rows| resident_moe_owner_bytes(config, rows))
         .unwrap_or(0)
 }
 ///
@@ -1448,15 +1439,12 @@ fn ordinary_wrapper_pbs_prepare(
     n: usize,
     call: OrdinaryCallFacts,
 ) -> HipResult<WrapperPbsPlan> {
-    let physical = scratch
-        .prefill_batch
-        .as_ref()
-        .map(|p| (p.max_batch, pbs_has_tape(p)));
+    let physical = scratch.prefill_batch.as_ref().map(|p| p.max_batch);
     let existing_virtual = scratch
         .reuse_virtual_pbs
         .borrow()
         .as_ref()
-        .map(|p| (p.max_batch, pbs_has_tape(p)));
+        .map(|p| p.max_batch);
     // Every denying fact (caller/capture record, the call's own batched
     // eligibility at its actual `n`, the 512-row seam) closes promotion before
     // any override, mapping or allocation.
@@ -1490,8 +1478,7 @@ fn ordinary_wrapper_pbs_prepare(
             KvTierFlags::from_cache(kv_cache),
             || resident_moe_memory_facts(gpu),
             ResidentMoeOwner {
-                rows: target.0,
-                tape: target.1,
+                rows: target,
                 credit_bytes,
             },
         )
@@ -1509,11 +1496,11 @@ fn ordinary_wrapper_pbs_prepare(
         }
     }
     if plan.alloc_virtual {
-        if let WrapperOwner::Virtual { rows, tape } = plan.owner {
+        if let WrapperOwner::Virtual { rows } = plan.owner {
             // The admission planned this owner from device capacity; the
             // allocation is the real check. Only a real failure keeps the
             // incumbent implicit cache and ceiling.
-            match PrefillBatchScratch::new_opt(gpu, config, rows, tape) {
+            match PrefillBatchScratch::new(gpu, config, rows) {
                 Ok(owner) => *scratch.reuse_virtual_pbs.borrow_mut() = Some(owner),
                 Err(e) => {
                     eprintln!(
@@ -1532,7 +1519,7 @@ fn ordinary_wrapper_pbs_prepare(
     Ok(plan)
 }
 ///
-/// A ring-only eager forward (no per-token hidden rows, tape or tree) is a
+/// A ring-only eager forward (no per-token hidden rows or tape) is a
 /// DFlash prompt seed that rides the ordinary route; verify and
 /// captured/recorded forwards keep the staged ring route. Shared by the inner
 /// entry and the wrappers.
@@ -1541,15 +1528,9 @@ fn hidden_ring_seed(
     hidden_ring: Option<&HiddenStateRingBuffer>,
     has_per_token_hidden_out: bool,
     has_gdn_tape: bool,
-    has_tree_verify: bool,
 ) -> bool {
     match hidden_ring {
-        Some(rb) => {
-            !has_per_token_hidden_out
-                && !has_gdn_tape
-                && !has_tree_verify
-                && rb.rides_ordinary_prefill(gpu)
-        }
+        Some(rb) => !has_per_token_hidden_out && !has_gdn_tape && rb.rides_ordinary_prefill(gpu),
         None => false,
     }
 }
@@ -1562,24 +1543,16 @@ fn ordinary_call_facts(
     gpu: &Gpu,
     caller_pbs_rows: Option<usize>,
     max_batch_cap: Option<usize>,
-    has_tree_verify: bool,
     has_gdn_tape: bool,
     hidden_ring: Option<&HiddenStateRingBuffer>,
     has_per_token_hidden_out: bool,
     has_max_layer: bool,
     fusion_on: bool,
 ) -> OrdinaryCallFacts {
-    let ring_seed = hidden_ring_seed(
-        gpu,
-        hidden_ring,
-        has_per_token_hidden_out,
-        has_gdn_tape,
-        has_tree_verify,
-    );
+    let ring_seed = hidden_ring_seed(gpu, hidden_ring, has_per_token_hidden_out, has_gdn_tape);
     OrdinaryCallFacts {
         caller_pbs_rows,
         max_batch_cap,
-        tree_verify: has_tree_verify,
         gdn_tape: has_gdn_tape,
         staged_hidden_ring: hidden_ring.is_some() && !ring_seed,
         max_layer: has_max_layer,
@@ -1626,7 +1599,7 @@ fn live_projection_scratch(gpu: &Gpu) -> LiveProjectionScratch {
     }
 }
 ///
-/// Bytes of the `PrefillBatchScratch::new_opt` allocations that
+/// Bytes of the `PrefillBatchScratch::new` allocations that
 /// [`PrefillBatchScratch::projected_allocation_bytes`] does not mirror:
 /// `dn_z_fold_batch` (`rows * (v_dim + 256)` F32) and `dn_normed_batch`
 /// (`rows * v_dim` F32 for a non-lean owner), i.e. `rows * (2 * v_dim + 256) *
@@ -1642,27 +1615,25 @@ fn resident_moe_pbs_unmirrored_bytes(config: &Qwen35Config, rows: usize) -> Opti
 }
 ///
 /// Requested payload bytes of one non-lean [`PrefillBatchScratch`] owner of
-/// `rows` rows with or without the verify-only S-tape: the constructor mirror
+/// `rows` rows: the constructor mirror
 /// plus [`resident_moe_pbs_unmirrored_bytes`], each term once. Payload only
 /// (no driver rounding or allocator overhead: the 1 GiB headroom covers such
 /// transients). `None` on overflow.
-fn resident_moe_owner_bytes(config: &Qwen35Config, rows: usize, tape: bool) -> Option<usize> {
-    let mirrored = PrefillBatchScratch::projected_allocation_bytes(config, rows, tape)
+fn resident_moe_owner_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
+    let mirrored = PrefillBatchScratch::projected_allocation_bytes(config, rows)
         .ok()
         .and_then(|bytes| usize::try_from(bytes).ok())?;
     mirrored.checked_add(resident_moe_pbs_unmirrored_bytes(config, rows)?)
 }
 ///
-/// Steady-state bytes of one ordinary (tape-free) MoE [`PrefillBatchScratch`]
-/// at `rows` rows ([`resident_moe_owner_bytes`] with no tape): the checked
+/// Steady-state bytes of one ordinary MoE [`PrefillBatchScratch`]
+/// at `rows` rows ([`resident_moe_owner_bytes`]): the checked
 /// constructor mirror, which charges the shared-expert, expanded-expert and
 /// grouped-GEMM scratch term for term (sorted maps, tile ids, grouped gate/up
 /// and down outputs) and the inactive residual backup, plus the two
-/// allocations it omits. Ordinary prefill allocates `cap_gdn_tape = false`, so
-/// the verify-only DeltaNet S-tape is NOT charged (unlike the placement
-/// reservation in [`dense_prefill_allocation_bytes`]). `None` on overflow.
+/// allocations it omits. `None` on overflow.
 fn resident_moe_pbs_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
-    resident_moe_owner_bytes(config, rows, false)
+    resident_moe_owner_bytes(config, rows)
 }
 ///
 /// Projection-prelude growth to `rows` rows. Producer-agnostic and
@@ -1835,20 +1806,18 @@ fn resident_moe_memory_facts(gpu: &Gpu) -> ResidentMoeMemoryFacts {
 }
 ///
 /// The PBS owner whose bytes the memory decision charges and credits.
-/// [`Self::WIDENED`] is the tape-free widened owner the inner entry
-/// allocates; the wrapper's virtual-explicit owner may be a different shape
-/// (tape flag, rows) and may already exist (`credit_bytes`).
+/// [`Self::WIDENED`] is the widened owner the inner entry allocates; the
+/// wrapper's virtual-explicit owner may be a different size and may already
+/// exist (`credit_bytes`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ResidentMoeOwner {
     rows: usize,
-    tape: bool,
     credit_bytes: usize,
 }
 
 impl ResidentMoeOwner {
     const WIDENED: Self = Self {
         rows: RESIDENT_MOE_CHUNK_ROWS,
-        tape: false,
         credit_bytes: 0,
     };
 }
@@ -1873,7 +1842,7 @@ fn resident_moe_memory_admits(
     let Some(free_bytes) = mem.free_bytes else {
         return false;
     };
-    let owner_bytes = resident_moe_owner_bytes(config, owner.rows, owner.tape);
+    let owner_bytes = resident_moe_owner_bytes(config, owner.rows);
     let pbs_bytes = match (
         resident_moe_pbs_bytes(config, RESIDENT_MOE_CHUNK_ROWS),
         owner_bytes,
@@ -1957,7 +1926,6 @@ struct OrdinaryCallFacts {
     /// hands the inner entry.
     caller_pbs_rows: Option<usize>,
     max_batch_cap: Option<usize>,
-    tree_verify: bool,
     gdn_tape: bool,
     /// A staged hidden ring (a ring-only eager seed rides the ordinary route).
     staged_hidden_ring: bool,
@@ -1969,13 +1937,12 @@ struct OrdinaryCallFacts {
 
 impl OrdinaryCallFacts {
     /// Only the whole-stack sequential ordinary entry with no caller PBS/cap
-    /// can widen: captured, TP/EP (separate callers), tree/tape, staged
+    /// can widen: captured, TP/EP (separate callers), tape, staged
     /// hidden-ring, band-limited, fused, or caller-capped requests resolve to
     /// the legacy path before any wider allocation or launch.
     fn wide_candidate(&self) -> bool {
         self.caller_pbs_rows.is_none()
             && self.max_batch_cap.is_none()
-            && !self.tree_verify
             && !self.gdn_tape
             && !self.staged_hidden_ring
             && !self.max_layer
@@ -2052,7 +2019,7 @@ fn plan_ordinary_prefill<E>(
     let pbs_rows = match req.call.caller_pbs_rows {
         Some(rows) => rows,
         None if wide => widened_owned_rows(limit, req.n),
-        None => owned_prefill_scratch_plan(req.n, req.max_batch.min(limit), req.call.tree_verify).0,
+        None => owned_prefill_scratch_plan(req.n, req.max_batch.min(limit)),
     };
     Ok(OrdinaryPrefillPlan {
         limit,
@@ -2085,7 +2052,7 @@ fn next_ordinary_chunk_len(
     }
 }
 /// Only the retained widened PBS owner can use this representation: ordinary
-/// sequential prefill runs eager, with no tree/chain verify or MoE/TP/EP.
+/// sequential prefill runs eager, with no chain verify or MoE/TP/EP.
 /// Check the exact same producer predicates used by the fallback decisions.
 fn lean_pbs_route(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, n: usize) -> bool {
     // An A8-owned site has a fused A8 producer only with A8_FUSED_PROD on;
@@ -2167,19 +2134,14 @@ fn lean_dense_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Op
 /// under-spilled by exactly that scratch — the difference between a load and an
 /// `hipMalloc: out of memory`.
 ///
-/// Term-by-term mirror of `PrefillBatchScratch::new_opt(..., false)` for dense
+/// Term-by-term mirror of `PrefillBatchScratch::new(..)` for dense
 /// configs: F32 `3D + 4K + 8V + 2H + 3I + 6Q + 2W + 3` elems/row, F16
 /// `D + V + I + Q` elems/row, plus 256 fixed bytes.
 fn dense_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
     if config.num_experts != 0 {
-        // `cap_gdn_tape = true` is the conservative arm: the tape is an
-        // `alloc_opt!` in the constructor, so charging it can only make the
-        // placement spill slightly more, never less.
-        return crate::qwen35::batch::PrefillBatchScratch::projected_allocation_bytes(
-            config, rows, true,
-        )
-        .ok()
-        .and_then(|bytes| usize::try_from(bytes).ok());
+        return crate::qwen35::batch::PrefillBatchScratch::projected_allocation_bytes(config, rows)
+            .ok()
+            .and_then(|bytes| usize::try_from(bytes).ok());
     }
     dense_layer_prefill_allocation_bytes(config, rows)
 }
@@ -3058,7 +3020,6 @@ pub fn forward_prefill_batch_single_chunk_captured(
     hidden_rb: Option<&HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
     forward_prefill_batch_single_chunk_captured_opts(
         gpu,
@@ -3073,7 +3034,6 @@ pub fn forward_prefill_batch_single_chunk_captured(
         hidden_rb,
         per_token_hidden_out,
         gdn_tape,
-        tree_verify,
         true,
         DflashFusionCtx::Off,
     )
@@ -3093,7 +3053,6 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     hidden_rb: Option<&HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     needs_last_token_logits: bool,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
@@ -3243,7 +3202,6 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         per_token_hidden_out.map(|t| (t, 0, HiddenCapture::Verify)),
         gdn_tape,
         0,
-        tree_verify,
         true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
         None, // band: full-stack single-GPU path
         None, // mask_override: captured-prefill caller does not use the MTP probe hook
@@ -3273,7 +3231,6 @@ pub fn forward_prefill_batch(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
     forward_prefill_batch_intent(
         gpu,
@@ -3287,7 +3244,6 @@ pub fn forward_prefill_batch(
         hidden_rb,
         per_token_hidden_out,
         gdn_tape,
-        tree_verify,
         PrefillIntent::Inferred,
     )
 }
@@ -3295,7 +3251,7 @@ pub fn forward_prefill_batch(
 /// Ordinary prompt prefill with an explicit intent (CHUNK-CANONICAL-DESIGN §1.1): every
 /// row count, a one-row outer tail included, runs the canonical prefill producers and the
 /// absolute-position GDN stream; a singleton is a prefill continuation, never plain AR
-/// decode through `forward_scratch`. Carries no verify, tape, tree, hidden-ring or
+/// decode through `forward_scratch`. Carries no verify, tape, hidden-ring or
 /// mask machinery. The caller seals the stream once at the actual prompt end
 /// (`DeltaNetState::seal_streams`) before decode/verify.
 pub fn forward_prefill_batch_ordinary(
@@ -3320,7 +3276,6 @@ pub fn forward_prefill_batch_ordinary(
         None,
         None,
         None,
-        None,
         PrefillIntent::Ordinary,
     )
 }
@@ -3338,20 +3293,18 @@ fn forward_prefill_batch_intent(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     intent: PrefillIntent,
 ) -> HipResult<()> {
     // Wrapper PBS plan (`plan_wrapper_pbs`): the dense widened route drops the
     // implicit ≤512 cache; an eligible, memory-admitted DEFAULT resident-MoE
     // request runs as a virtual explicit `HIPFIRE_PREFILL_MAX_BATCH=8192`
-    // (owner rows/tape from the explicit cache sizing, ceiling 8192); every
+    // (owner rows from the explicit cache sizing, ceiling 8192); every
     // other call keeps the implicit cache. Capped/explicit-PBS callers never
     // bypass (see `forward_prefill_batch_capped` and the inner entry).
     let call = ordinary_call_facts(
         gpu,
         None,
         None,
-        tree_verify.is_some(),
         gdn_tape.is_some(),
         hidden_rb.as_deref(),
         per_token_hidden_out.is_some(),
@@ -3384,7 +3337,6 @@ fn forward_prefill_batch_intent(
         per_token_hidden_out,
         HiddenCapture::Verify,
         gdn_tape,
-        tree_verify,
         pbs_for_call,
         None, // mask_override: MTP probe is the only consumer; default callers don't override
         None, // max_layer: default is the full stack
@@ -3420,7 +3372,7 @@ pub fn forward_prefill_batch_capture_hidden(
     hidden_out: &GpuTensor,
 ) -> HipResult<()> {
     // Same wrapper PBS plan as `forward_prefill_batch`.
-    let call = ordinary_call_facts(gpu, None, None, false, false, None, true, false, false);
+    let call = ordinary_call_facts(gpu, None, None, false, None, true, false, false);
     let wrapper = ordinary_wrapper_pbs_prepare(
         gpu,
         weights,
@@ -3446,7 +3398,6 @@ pub fn forward_prefill_batch_capture_hidden(
         None,
         Some(hidden_out),
         HiddenCapture::PromptFill,
-        None,
         None,
         pbs_for_call,
         None,
@@ -3482,7 +3433,6 @@ pub fn forward_prefill_batch_capped(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     max_batch_cap: usize,
 ) -> HipResult<()> {
     forward_prefill_batch_with_pbs_opts_inner(
@@ -3498,7 +3448,6 @@ pub fn forward_prefill_batch_capped(
         per_token_hidden_out,
         HiddenCapture::Verify,
         gdn_tape,
-        tree_verify,
         scratch.prefill_batch.as_ref(),
         None,
         None,
@@ -3537,7 +3486,6 @@ pub fn forward_prefill_batch_ordinary_capped(
         None,
         HiddenCapture::Verify,
         None,
-        None,
         scratch.prefill_batch.as_ref(),
         None,
         None,
@@ -3562,7 +3510,6 @@ pub fn forward_prefill_batch_with_pbs(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     pbs_in: Option<&PrefillBatchScratch>,
     mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
@@ -3579,7 +3526,6 @@ pub fn forward_prefill_batch_with_pbs(
         hidden_rb,
         per_token_hidden_out,
         gdn_tape,
-        tree_verify,
         pbs_in,
         mask_override,
         max_layer,
@@ -3596,7 +3542,7 @@ pub fn forward_prefill_batch_with_pbs(
 /// the configured/arch max ([`prefill_max_batch`]), `pbs.max_batch`, and the
 /// ring's staging `hidden_rb.max_batch` when a hidden ring is supplied — never
 /// larger than any staging owner. The exception is an eager ring-only prompt
-/// seed (no per-token hidden, tape or tree), whose chunks wider than staging
+/// seed (no per-token hidden or tape), whose chunks wider than staging
 /// write straight to the ring. Callers driving DFlash verify should size `pbs`
 /// (and hidden staging) to the maximum block they will request so everything
 /// fits in one chunk, or accept multi-chunk commits.
@@ -3621,7 +3567,6 @@ pub fn forward_prefill_batch_with_pbs_opts(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     pbs_in: Option<&PrefillBatchScratch>,
     mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
@@ -3641,7 +3586,6 @@ pub fn forward_prefill_batch_with_pbs_opts(
         per_token_hidden_out,
         HiddenCapture::Verify,
         gdn_tape,
-        tree_verify,
         pbs_in,
         mask_override,
         max_layer,
@@ -3667,7 +3611,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     per_token_hidden_out: Option<&GpuTensor>,
     hidden_capture: HiddenCapture,
     mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     pbs_in: Option<&PrefillBatchScratch>,
     mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
@@ -3681,12 +3624,11 @@ fn forward_prefill_batch_with_pbs_opts_inner(
 ) -> HipResult<()> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
     // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
-    // marker (tree_verify / gdn_tape / per-token-hidden extraction / hidden ring)
+    // marker (gdn_tape / per-token-hidden extraction / hidden ring)
     // or a multi-token batch means this is prefill or a spec/MTP verify forward,
     // which must NOT replay the plain-AR graph. See `forward_scratch`'s
     // `ar_graph_eligible` one-shot signal.
-    let plain_ar_graph_eligible = tree_verify.is_none()
-        && gdn_tape.is_none()
+    let plain_ar_graph_eligible = gdn_tape.is_none()
         && per_token_hidden_out.is_none()
         && hidden_rb.is_none()
         && tokens.len() == 1
@@ -3720,7 +3662,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     }
     // Explicit ordinary prefill: a one-row call is a prefill continuation, not decode.
     let ordinary_intent = intent == PrefillIntent::Ordinary
-        && tree_verify.is_none()
         && gdn_tape.is_none()
         && hidden_rb.is_none()
         && per_token_hidden_out.is_none()
@@ -3779,28 +3720,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // gdn_tape.is_some())` guard. Refusing here would pre-empt the per-token
     // fallback, which handles MQ3/Lloyd correctly.
 
-    // Tree-verify mode sanity checks — the downstream path can't silently
-    // fall back to per-token FA (that's always causal and would ignore the
-    // tree mask), and the positions/bias shapes must match the token count.
-    if let Some(ctx) = tree_verify.as_ref() {
-        assert_eq!(
-            ctx.positions.len(),
-            n,
-            "TreeVerifyCtx.positions length {} must equal tokens.len() {}",
-            ctx.positions.len(),
-            n,
-        );
-        assert_eq!(
-            ctx.attn_bias.numel(),
-            n * n,
-            "TreeVerifyCtx.attn_bias must be [{} × {}] f32 ({}), got numel {}",
-            n,
-            n,
-            n * n,
-            ctx.attn_bias.numel(),
-        );
-    }
-
     // Fast path requires (a) every LA layer's weights to be either MQ4G256
     // or HFQ4G256 (the batched GEMM kernels are dtype-agnostic but the LA
     // preamble's rmsnorm+rotate and SwiGLU+rotate kernels differ per dtype),
@@ -3823,12 +3742,10 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         moe_router_logits_present,
     );
     // F4 guard: reject batched prefill when KV tier has no batched keys.
-    // F32 KV has only BatchEq(1) → MissingImpl at resolve. asym2 + tree-verify
-    // has no _batched_masked variant → UnsupportedTreeTier. Force per-token
-    // fallback for these cases.
+    // F32 KV has only BatchEq(1) → MissingImpl at resolve. Force per-token
+    // fallback for this case.
     let kv_f32 = !kv_cache.quantized && !kv_cache.quant_q8 && !kv_cache.quant_hfq4;
-    let kv_asym2_tree = kv_cache.quant_asym2 && tree_verify.is_some();
-    let eligible = eligible && !kv_f32 && !kv_asym2_tree;
+    let eligible = eligible && !kv_f32;
 
     // MQ3-in-MoE refusal (predicate computed above). This protects the batched
     // MoE LA/FA bodies: their QKV matcher drops MQ3 and the wo path is
@@ -3869,11 +3786,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         // VL: the per-token loop below cannot splice image embeddings or rotate
         // at mrope phases. Surfaces before any KV / recurrent state is touched.
         super::vl_prefill::refuse_overlap(start_pos, n, "per-token prefill fallback")?;
-        assert!(
-            tree_verify.is_none(),
-            "tree-verify mode requires the batched-FA-eligible prefill path; \
-             kv quant + FA weight dtypes do not match on this model",
-        );
         // mask_override has nowhere to land on the per-token forward_scratch
         // fallback (it operates on `scratch.x`, not the batched `pbs.x_batch`,
         // and there's no shared "post-embed, pre-layer" hook). The MTP probe
@@ -3938,18 +3850,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // The next `forward_scratch` re-arms it.
     gpu.replay.enter_batched_forward();
 
-    // Tree-verify mode runs as a single chunk (tree is small, O(16) nodes);
-    // chunk splitting would require slicing the mask by chunk rows which
-    // is extra work for a case we don't need.
-    if tree_verify.is_some() {
-        assert!(
-            n <= max_batch,
-            "tree-verify tokens {} exceeds max_batch {}; tree budget must fit",
-            n,
-            max_batch,
-        );
-    }
-    // A ring-only forward (no per-token hidden rows, tape or tree) is a DFlash
+    // A ring-only forward (no per-token hidden rows or tape) is a DFlash
     // prompt seed. Eager, it rides the ordinary route below exactly as AR
     // prefills the same tokens; chunks wider than ring staging write their
     // hidden rows straight to the ring (`HiddenStateRingBuffer::writes_direct`).
@@ -3959,14 +3860,12 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         hidden_rb.as_deref(),
         per_token_hidden_out.is_some(),
         gdn_tape.is_some(),
-        tree_verify.is_some(),
     );
     // Canonical GDN stream (CHUNK-CANONICAL-DESIGN §1.1, §5): resolve the frozen per-layer
     // plans, bind the owner's recipe and reserve the persistent carry and the edge workspace
     // BEFORE the VRAM-dependent outer ceiling below is chosen. An allocation failure is a
     // typed error, never a precision change.
-    if tree_verify.is_none()
-        && gdn_tape.is_none()
+    if gdn_tape.is_none()
         && max_layer.is_none()
         && mask_override.is_none()
         && matches!(fusion, DflashFusionCtx::Off)
@@ -3978,7 +3877,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // Widened ordinary admission. Decided here, after required KV mapping, so
     // the per-device byte admission charges mapped KV. Only the whole-stack
     // sequential ordinary entry with no caller PBS/cap can widen: captured,
-    // TP/EP (separate callers), tree/tape, staged hidden-ring, band-limited,
+    // TP/EP (separate callers), tape, staged hidden-ring, band-limited,
     // fused, or caller-capped requests resolve to the legacy path before any
     // wider allocation or launch. The dense widened wrapper omits its
     // *implicit* ≤512 legacy cache above (`plan_wrapper_pbs`); an eligible,
@@ -3995,7 +3894,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 gpu,
                 pbs_in.map(|p| p.max_batch),
                 max_batch_cap,
-                tree_verify.is_some(),
                 gdn_tape.is_some(),
                 hidden_rb.as_deref(),
                 per_token_hidden_out.is_some(),
@@ -4032,9 +3930,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // When `pbs_in` is Some, we neither allocate nor free — the caller retains
     // ownership across DFlash cycles to avoid ~25 per-cycle tensor alloc/free
     // pairs on the hot verify path. When None, size the allocation to this
-    // call's largest possible chunk and allocate the DeltaNet S-state tape only
-    // for tree verify.
-    // Plain prefill never consumes that tape, and short prompts do not pay
+    // call's largest possible chunk; short prompts do not pay
     // the full configured footprint. Actual chunk length is
     // min(configured/capped max, pbs.max_batch, hidden_rb staging) so no
     // write exceeds a staging owner.
@@ -4083,7 +3979,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                         let attempt = if lean {
                             PrefillBatchScratch::new_opt_lean(gpu, config, rows)
                         } else {
-                            PrefillBatchScratch::new_opt(gpu, config, rows, false)
+                            PrefillBatchScratch::new(gpu, config, rows)
                         };
                         match attempt {
                             Ok(p) => break p,
@@ -4108,13 +4004,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 // `limit == max_batch` on every legacy path; on the admitted
                 // but memory-narrowed path it sizes the owned scratch to the
                 // executed 512 cadence instead of the unadmitted request.
-                let (owned_max_batch, cap_gdn_tape) = (plan.pbs_rows, tree_verify.is_some());
-                own_pbs = Some(PrefillBatchScratch::new_opt(
-                    gpu,
-                    config,
-                    owned_max_batch,
-                    cap_gdn_tape,
-                )?);
+                own_pbs = Some(PrefillBatchScratch::new(gpu, config, plan.pbs_rows)?);
                 own_pbs.as_ref().unwrap()
             }
         };
@@ -4140,12 +4030,11 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             downgrade.as_deref(),
         );
         // F2 pair envelope, loop-invariant half: ordinary sequential prefill
-        // with FA layers batch-admissible, no tree/tape/max_layer machinery,
+        // with FA layers batch-admissible, no tape/max_layer machinery,
         // no hidden ring (its staging commit is chunk-sequential), plain
         // DFlash fusion. Per-pair checks (exact 512+512, eager, shapes, KV
         // tier, max_ctx window) happen at each step below.
-        let fa_pair_common_admitted = tree_verify.is_none()
-            && gdn_tape.is_none()
+        let fa_pair_common_admitted = gdn_tape.is_none()
             && max_layer.is_none()
             && hidden_rb.is_none()
             && matches!(fusion, DflashFusionCtx::Off)
@@ -4183,7 +4072,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 )
             })?;
             if pbs.lean {
-                if !matches!(fusion, DflashFusionCtx::Off) || tree_verify.is_some() {
+                if !matches!(fusion, DflashFusionCtx::Off) {
                     return Err(hip_bridge::HipError::new(
                         0,
                         "lean PBS belongs to ordinary prefill; verify route requires full scratch",
@@ -4260,7 +4149,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 // is freed when the PBS allocation fails, so no leak.
                 if pair_scratch.is_none() {
                     let stage = FaPairStage::alloc(gpu, &hybrid_dims(config))?;
-                    match PrefillBatchScratch::new_opt(gpu, config, FA_PAIR_ROWS, false) {
+                    match PrefillBatchScratch::new(gpu, config, FA_PAIR_ROWS) {
                         Ok(pbs2) => pair_scratch = Some((pbs2, stage)),
                         Err(e) => {
                             let _ = stage.free_gpu(gpu);
@@ -4301,9 +4190,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             // after the chunk returns.
             let tape_for_chunk: Option<&mut crate::speculative::GdnTape> =
                 gdn_tape.as_mut().map(|t| &mut **t);
-            // Tree-verify was asserted to fit in one chunk above, so passing
-            // the whole ctx through unconditionally is safe.
-            let tv_for_chunk = tree_verify.as_ref().copied();
             // Apply mask_override only to the chunk that actually contains
             // its target slot, and rebase the slot index to chunk-local
             // coordinates. Out-of-range slots panic (caller error).
@@ -4348,7 +4234,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 pth_slot,
                 tape_for_chunk,
                 chunk_start,
-                tv_for_chunk,
                 false, // pre_uploaded: default path uploads inside
                 None,  // band: full-stack single-GPU path
                 mo_for_chunk,
@@ -4944,17 +4829,12 @@ fn next_prefill_chunk_len(remaining: usize, max_batch: usize) -> Option<usize> {
 /// Plan scratch owned by one prefill call.
 ///
 /// Large prompts retain the configured chunk size, while a short prompt gets
-/// exactly one right-sized chunk. The DeltaNet S-state tape is consumed only by
-/// tree verify; ordinary prefill advances recurrent state in place.
+/// exactly one right-sized chunk.
 #[inline]
-fn owned_prefill_scratch_plan(
-    n: usize,
-    configured_max_batch: usize,
-    tree_verify: bool,
-) -> (usize, bool) {
+fn owned_prefill_scratch_plan(n: usize, configured_max_batch: usize) -> usize {
     debug_assert!(n > 0);
     debug_assert!(configured_max_batch >= MIN_BATCH);
-    (configured_max_batch.min(n.max(MIN_BATCH)), tree_verify)
+    configured_max_batch.min(n.max(MIN_BATCH))
 }
 
 /// Whether `forward_prefill_batch_with_pbs` will take the tape-capturing
@@ -5716,9 +5596,8 @@ fn captures_verify_hidden(per_token_hidden_out: Option<HiddenRowsOut<'_>>) -> bo
 fn prefill_dispatch_workload(
     captures_verify_hidden: bool,
     captures_rollback_tape: bool,
-    is_tree_verify: bool,
 ) -> DispatchWorkload {
-    if captures_verify_hidden || captures_rollback_tape || is_tree_verify {
+    if captures_verify_hidden || captures_rollback_tape {
         DispatchWorkload::SpeculativeVerify
     } else {
         DispatchWorkload::Standard
@@ -5739,7 +5618,6 @@ pub(crate) fn forward_prefill_chunk(
     per_token_hidden_out: Option<HiddenRowsOut<'_>>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tape_offset: usize,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     pre_uploaded: bool,
     band: Option<&PrefillBandCtx<'_>>,
     mask_override: Option<MaskEmbedOverride<'_>>,
@@ -5767,7 +5645,6 @@ pub(crate) fn forward_prefill_chunk(
         per_token_hidden_out,
         gdn_tape,
         tape_offset,
-        tree_verify,
         pre_uploaded,
         false,
         band,
@@ -5788,7 +5665,6 @@ fn batch_chunk_validate_independent(
     batch_semantics: BatchSemantics<'_>,
     dn_state: &DeltaNetState,
     kv_cache: &llama::KvCache,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     gdn_tape: Option<&crate::speculative::GdnTape>,
 ) -> HipResult<()> {
     if let BatchSemantics::Independent {
@@ -5824,10 +5700,10 @@ fn batch_chunk_validate_independent(
                 "independent decode currently requires Q8 DeltaNet state and Q8 KV",
             ));
         }
-        if tree_verify.is_some() || gdn_tape.is_some() {
+        if gdn_tape.is_some() {
             return Err(HipError::new(
                 0,
-                "independent decode does not support tree or GDN tape modes",
+                "independent decode does not support GDN tape modes",
             ));
         }
     }
@@ -6031,37 +5907,13 @@ pub(crate) fn batch_chunk_upload_positions(
     batch_semantics: BatchSemantics<'_>,
     start_pos: usize,
     n: usize,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     pre_uploaded: bool,
 ) -> HipResult<()> {
     // ── 1b. Upload positions array ────────────────────────────────────────
     //
     // Positions is the per-row RoPE angle AND the physical KV cache slot (the
-    // batched kv_write kernels use the same index for both). We always use
-    // flat linear `start_pos .. start_pos + n`. Siblings in DDTree mode get
-    // DISTINCT slots this way — no write race — and the stored K carries a
-    // RoPE angle that matches the physical slot, which keeps subsequent
-    // cycles' attention reads consistent.
-    //
-    // Semantic trade vs. the original depth-based scheme (paper): tree
-    // siblings that represent "alternative futures at the same time step"
-    // now see a RoPE distance of 1 (or more) instead of 0. Empirically that
-    // slight distance shift costs little — the attn_bias mask still gates
-    // ancestor visibility exactly, and the Q·K dot products stay consistent
-    // across the whole cache (prompt + tree block). In exchange we get
-    // DDTree correctness for topk>1 without needing a tree-local KV scratch
-    // or a scatter-kernel for commit. `ctx.positions` is accepted for API
-    // compatibility but ignored — the DdNode depths it carries are only
-    // used by `linearize_tree` to build the attn_bias mask.
-    //
-    // 39aa358 DECOUPLING (2026-07-28): the "costs little" trade was wrong
-    // — it was the gfx1100 DDTree regression. Sibling logits computed with
-    // slot-based phases depress non-rank-0 acceptance, collapsing τ toward
-    // the chain and making tree strictly slower than linear. Fix: upload
-    // `ctx.positions` (depth-based, `base_pos + depth`) to
-    // `pbs.rope_positions`; FA RoPE reads THAT (correct sibling phases),
-    // while KV writes + attention seq_len keep the flat physical slots
-    // (no sibling write race, contiguous-cache invariants intact).
+    // batched kv_write kernels use the same index for both): flat linear
+    // `start_pos .. start_pos + n`.
     if !pre_uploaded {
         let (positions_host, active_mask) = match batch_semantics {
             BatchSemantics::Sequential => (
@@ -6090,30 +5942,12 @@ pub(crate) fn batch_chunk_upload_positions(
                 };
                 gpu.hip
                     .memcpy_htod_offset(&pbs.positions.buf, start * 4, positions_bytes)?;
-                if let Some(tv) = tree_verify.as_ref() {
-                    debug_assert_eq!(tv.positions.len(), n, "tree RoPE positions length");
-                    let rope_bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(
-                            tv.positions[start..start + len].as_ptr() as *const u8,
-                            len * 4,
-                        )
-                    };
-                    gpu.hip
-                        .memcpy_htod_offset(&pbs.rope_positions.buf, start * 4, rope_bytes)?;
-                }
                 Ok(())
             })?;
         } else {
             let positions_bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
             gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
-            if let Some(tv) = tree_verify.as_ref() {
-                debug_assert_eq!(tv.positions.len(), n, "tree RoPE positions length");
-                let rope_bytes: &[u8] = unsafe {
-                    std::slice::from_raw_parts(tv.positions.as_ptr() as *const u8, n * 4)
-                };
-                gpu.hip.memcpy_htod(&pbs.rope_positions.buf, rope_bytes)?;
-            }
         }
     }
 
@@ -6150,7 +5984,7 @@ fn gdn_moe_chunk_scan_on(arch: &str) -> bool {
 }
 
 /// Layer-independent, row-independent inputs of the MoE GDN chunk-scan admission. The outer
-/// call's rows, tape, tree and intent are never inputs (CHUNK-CANONICAL-DESIGN §1.1).
+/// call's rows, tape and intent are never inputs (CHUNK-CANONICAL-DESIGN §1.1).
 #[derive(Clone, Copy)]
 struct GdnMoeChunkScanInputs {
     /// Resolved `HIPFIRE_GDN_MOE_CHUNK_SCAN` ([`gdn_moe_chunk_scan_on`]).
@@ -6461,7 +6295,7 @@ struct GdnForwardStream {
 }
 
 /// Run `body` as one forward of absolute start `start_pos`. `plain` marks an ordinary
-/// prefill forward (sequential, no tree/tape/verify capture/band/layer cap/mask override,
+/// prefill forward (sequential, no tape/verify capture/band/layer cap/mask override,
 /// eager): it opens the ordinary-prefill numerical intent, and on a state with a bound
 /// stream it runs the layers through the absolute-position GDN stream, publishing the
 /// candidate cursors of every layer only after the whole body succeeded. A failure after
@@ -6751,7 +6585,7 @@ fn restore_inactive_residual_rows(
 //
 // Envelope (anything outside falls back to sequential 512 chunks): exact
 // gfx1151, eager, sequential single-request prefill, both chunks exactly
-// 512 rows, H24/KV4/D256, KV tier Q8 or fwht3, no tree/tape/band/
+// 512 rows, H24/KV4/D256, KV tier Q8 or fwht3, no tape/band/
 // max_layer, no hidden ring (its per-chunk staging commit is
 // chunk-sequential), DFlash fusion Off.
 // DeltaNet (dense LA + MoE-LA) sequential kernels stay 2x512 inside the
@@ -6880,7 +6714,7 @@ fn fa_pair_env_admitted(
     }
 }
 
-/// Whether a forward is an ordinary prefill phase: sequential, no tree/tape/verify-hidden
+/// Whether a forward is an ordinary prefill phase: sequential, no tape/verify-hidden
 /// capture, DFlash fusion, hidden ring other than the ordinary prompt seed, band, layer cap,
 /// routed output or mask override, eager, outside any verify scope.
 fn ordinary_prefill_forward(
@@ -6888,7 +6722,6 @@ fn ordinary_prefill_forward(
     hidden_rb: Option<&HiddenStateRingBuffer>,
     per_token_hidden_out: Option<HiddenRowsOut<'_>>,
     sequential: bool,
-    tree: bool,
     tape: bool,
     fusion: DflashFusionCtx,
     band: bool,
@@ -6897,7 +6730,6 @@ fn ordinary_prefill_forward(
     mask_override: bool,
 ) -> bool {
     sequential
-        && !tree
         && !tape
         && fusion == DflashFusionCtx::Off
         && !gpu.graphs.capture_mode
@@ -6927,7 +6759,7 @@ fn ordinary_prefill_forward(
 ///
 /// Callers guarantee the F2 envelope (see `fa_pair_env_admitted`); in
 /// particular `hidden_rb` is None (its per-chunk staging commit is
-/// chunk-sequential), `gdn_tape`/`tree_verify`/band are absent, and both
+/// chunk-sequential), `gdn_tape`/band are absent, and both
 /// halves are exactly `FA_PAIR_ROWS`.
 #[allow(clippy::too_many_arguments)]
 fn forward_prefill_chunk_pair(
@@ -6954,7 +6786,6 @@ fn forward_prefill_chunk_pair(
         None,
         per_token_hidden_out.map(|(t, capture)| (t, 0, capture)),
         true,
-        false,
         false,
         fusion,
         false,
@@ -7038,7 +6869,6 @@ fn forward_prefill_chunk_pair_body(
     let dispatch_workload = prefill_dispatch_workload(
         per_token_hidden_out.is_some_and(|(_, capture)| capture == HiddenCapture::Verify),
         false,
-        false,
     );
     let ctx = DispatchCtx::new(gpu)
         .with_workload(dispatch_workload)
@@ -7081,15 +6911,7 @@ fn forward_prefill_chunk_pair_body(
         None,
         mo_c,
     )?;
-    batch_chunk_upload_positions(
-        gpu,
-        pbs_c,
-        BatchSemantics::Sequential,
-        start_c,
-        n,
-        None,
-        false,
-    )?;
+    batch_chunk_upload_positions(gpu, pbs_c, BatchSemantics::Sequential, start_c, n, false)?;
     batch_chunk_embed_tokens(
         gpu,
         weights,
@@ -7105,15 +6927,7 @@ fn forward_prefill_chunk_pair_body(
         None,
         mo_n,
     )?;
-    batch_chunk_upload_positions(
-        gpu,
-        pbs_n,
-        BatchSemantics::Sequential,
-        start_n,
-        n,
-        None,
-        false,
-    )?;
+    batch_chunk_upload_positions(gpu, pbs_n, BatchSemantics::Sequential, start_n, n, false)?;
 
     #[cfg(feature = "moe-oracle")]
     crate::qwen35::oracle::set_prefill_start(start_c)
@@ -7122,22 +6936,8 @@ fn forward_prefill_chunk_pair_body(
     crate::qwen35::oracle::set_prefill_start(start_n)
         .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     // Once per half, exactly as two sequential chunks would validate.
-    batch_chunk_validate_independent(
-        n,
-        BatchSemantics::Sequential,
-        dn_state,
-        kv_cache,
-        None,
-        None,
-    )?;
-    batch_chunk_validate_independent(
-        n,
-        BatchSemantics::Sequential,
-        dn_state,
-        kv_cache,
-        None,
-        None,
-    )?;
+    batch_chunk_validate_independent(n, BatchSemantics::Sequential, dn_state, kv_cache, None)?;
+    batch_chunk_validate_independent(n, BatchSemantics::Sequential, dn_state, kv_cache, None)?;
 
     let fa_arch = gpu.arch.as_str();
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
@@ -7219,7 +7019,6 @@ fn forward_prefill_chunk_pair_body(
                         hd,
                         BatchSemantics::Sequential,
                         None,
-                        None,
                         half_tape,
                         delta_layer_idx,
                         q8_wmma_arch,
@@ -7278,7 +7077,6 @@ fn forward_prefill_chunk_pair_body(
                         max_ctx_c,
                         &ctx,
                         BatchSemantics::Sequential,
-                        None,
                         kv_layer_idx,
                         layer_idx,
                         fusion,
@@ -7311,7 +7109,6 @@ fn forward_prefill_chunk_pair_body(
                         max_ctx_n,
                         &ctx,
                         BatchSemantics::Sequential,
-                        None,
                         kv_layer_idx,
                         layer_idx,
                         fusion,
@@ -7396,7 +7193,6 @@ fn forward_prefill_chunk_pair_body(
                         max_ctx_c,
                         &ctx,
                         BatchSemantics::Sequential,
-                        None,
                         q8_wmma_arch,
                         arch_has_wmma,
                         kv_layer_idx,
@@ -7432,7 +7228,6 @@ fn forward_prefill_chunk_pair_body(
                         max_ctx_n,
                         &ctx,
                         BatchSemantics::Sequential,
-                        None,
                         q8_wmma_arch,
                         arch_has_wmma,
                         kv_layer_idx,
@@ -7506,7 +7301,6 @@ fn forward_prefill_chunk_pair_body(
                         hd,
                         BatchSemantics::Sequential,
                         None,
-                        None,
                         0,
                         delta_layer_idx,
                         half_start,
@@ -7552,7 +7346,6 @@ fn forward_prefill_chunk_pair_body(
                             n,
                             dim,
                             &kv_view(kv_cache),
-                            None,
                             layer_idx,
                             false,
                             false, // the F2 pair never admits the FP8 Q prep
@@ -7586,7 +7379,6 @@ fn forward_prefill_chunk_pair_body(
                             half_max_ctx,
                             &ctx,
                             BatchSemantics::Sequential,
-                            None,
                             q8_wmma_arch,
                             layer_idx,
                             false,
@@ -7627,7 +7419,6 @@ fn forward_prefill_chunk_pair_body(
                             half_max_ctx,
                             &ctx,
                             BatchSemantics::Sequential,
-                            None,
                             q8_wmma_arch,
                             layer_idx,
                             None,
@@ -7733,7 +7524,6 @@ pub(crate) fn forward_batch_chunk_impl(
     per_token_hidden_out: Option<HiddenRowsOut<'_>>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tape_offset: usize,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     pre_uploaded: bool,
     pre_embedded: bool,
     band: Option<&PrefillBandCtx<'_>>,
@@ -7750,7 +7540,6 @@ pub(crate) fn forward_batch_chunk_impl(
         hidden_rb,
         per_token_hidden_out,
         matches!(batch_semantics, BatchSemantics::Sequential),
-        tree_verify.is_some(),
         gdn_tape.is_some(),
         fusion,
         band.is_some(),
@@ -7773,7 +7562,6 @@ pub(crate) fn forward_batch_chunk_impl(
             per_token_hidden_out,
             gdn_tape,
             tape_offset,
-            tree_verify,
             pre_uploaded,
             pre_embedded,
             band,
@@ -7804,7 +7592,6 @@ fn forward_batch_chunk_body(
     per_token_hidden_out: Option<HiddenRowsOut<'_>>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tape_offset: usize,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     pre_uploaded: bool,
     pre_embedded: bool,
     band: Option<&PrefillBandCtx<'_>>,
@@ -7831,14 +7618,7 @@ fn forward_batch_chunk_body(
         Some(s) if n > s => Some(s),
         _ => None,
     };
-    batch_chunk_validate_independent(
-        n,
-        batch_semantics,
-        dn_state,
-        kv_cache,
-        tree_verify,
-        gdn_tape.as_deref(),
-    )?;
+    batch_chunk_validate_independent(n, batch_semantics, dn_state, kv_cache, gdn_tape.as_deref())?;
     // VL prompt chunk: refuse every route that cannot splice image rows and
     // rotate at mrope phases BEFORE any scratch / KV / recurrent write.
     if super::vl_prefill::overlaps(start_pos, n) {
@@ -7847,7 +7627,6 @@ fn forward_batch_chunk_body(
             n,
             &super::vl_prefill::ChunkRoute {
                 sequential: matches!(batch_semantics, BatchSemantics::Sequential),
-                tree_verify: tree_verify.is_some(),
                 pre_embedded,
                 pre_uploaded,
                 banded: band.is_some(),
@@ -7893,7 +7672,6 @@ fn forward_batch_chunk_body(
     let dispatch_workload = prefill_dispatch_workload(
         captures_verify_hidden(per_token_hidden_out),
         gdn_tape.is_some(),
-        tree_verify.is_some(),
     );
     let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_chunk")?;
     kv_cache.require_mapped_capacity(required_tokens)?;
@@ -7954,15 +7732,7 @@ fn forward_batch_chunk_body(
         batch_semantics.active_mask(),
         mask_override,
     )?;
-    batch_chunk_upload_positions(
-        gpu,
-        pbs,
-        batch_semantics,
-        start_pos,
-        n,
-        tree_verify,
-        pre_uploaded,
-    )?;
+    batch_chunk_upload_positions(gpu, pbs, batch_semantics, start_pos, n, pre_uploaded)?;
     // VL: splice the vision tower's embeddings over this chunk's image rows
     // (after the token embedding + mask override, before layer 0) and stage
     // the chunk's absolute mrope phases into `pbs.pos3`. No-ops without an
@@ -7996,7 +7766,7 @@ fn forward_batch_chunk_body(
             n,
             start_pos + n,
             fa_pertoken_min_ctx(gpu.arch_caps.arch()),
-            tree_verify.is_some(),
+            false,
             batch_semantics.is_independent(),
             gpu.graphs.capture_mode,
             gpu.replay.is_recording(),
@@ -8083,7 +7853,6 @@ fn forward_batch_chunk_body(
                     n_v_heads,
                     hd,
                     batch_semantics,
-                    tree_verify,
                     gdn_tape.as_deref().map(gdn_tape_view).as_ref(),
                     tape_offset,
                     delta_layer_idx,
@@ -8128,7 +7897,6 @@ fn forward_batch_chunk_body(
                     max_ctx_len,
                     &ctx,
                     batch_semantics,
-                    tree_verify,
                     q8_wmma_arch,
                     arch_has_wmma,
                     kv_layer_idx,
@@ -8194,7 +7962,6 @@ fn forward_batch_chunk_body(
                     n_v_heads,
                     hd,
                     batch_semantics,
-                    tree_verify,
                     gdn_tape.as_deref().map(gdn_tape_view).as_ref(),
                     tape_offset,
                     delta_layer_idx,
@@ -8240,7 +8007,6 @@ fn forward_batch_chunk_body(
                     max_ctx_len,
                     &ctx,
                     batch_semantics,
-                    tree_verify,
                     q8_wmma_arch,
                     layer_idx,
                     None,
@@ -8299,7 +8065,7 @@ mod tests {
     fn explicit_override_receipt_is_the_physical_chunk() {
         // gfx1201 + HIPFIRE_PREFILL_MAX_BATCH=8192 + HIPFIRE_PREFILL_REUSE_PBS=1: the implicit
         // cache is 512 rows, so the loop executes 512-row chunks. The receipt used to say 8192.
-        let (pbs_rows, _) = implicit_reuse_pbs_plan("gfx1201", Some(8192), true);
+        let pbs_rows = implicit_reuse_pbs_plan("gfx1201", Some(8192), true);
         assert_eq!(pbs_rows, 512);
         for n in [4096usize, 16384, 513, 100] {
             let planned = PrefillChunkReceipt {
@@ -8489,7 +8255,7 @@ mod tests {
 
     /// `HIPFIRE_GDN_MOE_CHUNK_SCAN` admission: the flag, the chunk-scan
     /// capability, head geometry and a complete Q8 state must all hold. The outer
-    /// call's rows, tape, tree and intent are not inputs.
+    /// call's rows, tape and intent are not inputs.
     #[test]
     fn gdn_moe_chunk_scan_admission_truth_table() {
         for mask in 0u16..16 {
@@ -9817,20 +9583,16 @@ mod tests {
     #[test]
     fn speculative_verify_has_an_explicit_dispatch_workload() {
         assert_eq!(
-            prefill_dispatch_workload(false, false, false),
+            prefill_dispatch_workload(false, false),
             DispatchWorkload::Standard
         );
         // DFlash and DSpark/MTP verify request per-token target hidden.
         assert_eq!(
-            prefill_dispatch_workload(true, false, false),
+            prefill_dispatch_workload(true, false),
             DispatchWorkload::SpeculativeVerify
         );
         assert_eq!(
-            prefill_dispatch_workload(false, true, false),
-            DispatchWorkload::SpeculativeVerify
-        );
-        assert_eq!(
-            prefill_dispatch_workload(false, false, true),
+            prefill_dispatch_workload(false, true),
             DispatchWorkload::SpeculativeVerify
         );
     }
@@ -9844,17 +9606,17 @@ mod tests {
     }
 
     #[test]
-    fn owned_prefill_scratch_is_right_sized_without_tree_tape() {
-        assert_eq!(owned_prefill_scratch_plan(1, 256, false), (2, false));
-        assert_eq!(owned_prefill_scratch_plan(2, 256, false), (2, false));
-        assert_eq!(owned_prefill_scratch_plan(32, 256, false), (32, false));
-        assert_eq!(owned_prefill_scratch_plan(256, 256, false), (256, false));
-        assert_eq!(owned_prefill_scratch_plan(1024, 256, false), (256, false));
+    fn owned_prefill_scratch_is_right_sized() {
+        assert_eq!(owned_prefill_scratch_plan(1, 256), 2);
+        assert_eq!(owned_prefill_scratch_plan(2, 256), 2);
+        assert_eq!(owned_prefill_scratch_plan(32, 256), 32);
+        assert_eq!(owned_prefill_scratch_plan(256, 256), 256);
+        assert_eq!(owned_prefill_scratch_plan(1024, 256), 256);
         // Capped-256 path: internal owned PBS splits at 256 even if arch default is 384.
-        assert_eq!(owned_prefill_scratch_plan(1024, 256, false), (256, false));
+        assert_eq!(owned_prefill_scratch_plan(1024, 256), 256);
         // Ordinary gfx1201 owned path may plan 384-row scratch.
-        assert_eq!(owned_prefill_scratch_plan(1024, 384, false), (384, false));
-        assert_eq!(owned_prefill_scratch_plan(200, 384, false), (200, false));
+        assert_eq!(owned_prefill_scratch_plan(1024, 384), 384);
+        assert_eq!(owned_prefill_scratch_plan(200, 384), 200);
     }
 
     #[test]
@@ -10178,7 +9940,7 @@ mod tests {
         assert_eq!(fp8_delta, 64_354_304);
         assert_eq!(dense_delta + fp8_delta, 2_664_144_896);
         // MoE configs charge the same dense terms plus the Path-2 grouped-GEMM
-        // scratch `PrefillBatchScratch::new_opt` allocates for them, through the
+        // scratch `PrefillBatchScratch::new` allocates for them, through the
         // checked mirror of that constructor. This used to be `None` (out of
         // scope), which left `minimum_prefill_reservation_bytes` undefined for
         // every MoE model and made the partial-offload placement under-spill by
@@ -10196,7 +9958,7 @@ mod tests {
             "the MoE charge must include the grouped scratch it allocates: {moe_bytes} vs {dense_only}"
         );
         let mirror =
-            crate::qwen35::batch::PrefillBatchScratch::projected_allocation_bytes(&moe, 512, true)
+            crate::qwen35::batch::PrefillBatchScratch::projected_allocation_bytes(&moe, 512)
                 .unwrap();
         assert_eq!(
             moe_bytes as u64, mirror,
@@ -10635,24 +10397,23 @@ mod tests {
     }
 
     /// Independent closed form of the REQUESTED payload bytes of one non-lean
-    /// MoE `PrefillBatchScratch` (u128), written from the `new_opt` allocation
+    /// MoE `PrefillBatchScratch` (u128), written from the `new` allocation
     /// list rather than from `projected_allocation_bytes`. Payload only (no
     /// driver rounding or allocator overhead; the 1 GiB headroom covers
     /// those transients). With `n` rows, `p = ceil(n/64)*64`, `k` key dim, `v`
     /// value dim, `H` value heads, `q`/`c` attention q/kv dims, experts `E`,
     /// top-k `t`, shared/routed intermediates `s`/`i`.
-    fn constructor_payload_bytes(c: &Qwen35Config, n: u128, tape: bool) -> u128 {
+    fn constructor_payload_bytes(c: &Qwen35Config, n: u128) -> u128 {
         let d = c.dim as u128;
         let h = c.hidden_dim as u128;
         let k = (c.linear_num_key_heads * c.linear_key_head_dim) as u128;
         let v = (c.linear_num_value_heads * c.linear_value_head_dim) as u128;
         let hh = c.linear_num_value_heads as u128;
-        let vhd = c.linear_value_head_dim as u128;
         let q = (c.n_heads * c.head_dim) as u128;
         let kvd = (c.n_kv_heads * c.head_dim) as u128;
         let p = n.div_ceil(64) * 64;
         let base = 4
-            * (n * (3 * d + 3 * h + 9 * v + 3 * k + 2 * hh + 6 * q + 2 * kvd + 263) + p * k)
+            * (n * (3 * d + 3 * h + 9 * v + 3 * k + 2 * hh + 6 * q + 2 * kvd + 262) + p * k)
             + 2 * n * (d + v + h + q)
             + 8 * n
             + 256;
@@ -10663,28 +10424,18 @@ mod tests {
         let m = (n * t + 15 * e).div_ceil(16) * 16;
         let moe = 4 * (n * (e + 1 + 3 * s + 2 * t + 3 * t * i + t * d + d) + m * (2 * i + d))
             + 4 * (2 * e + 1 + m + n * t + m / 16);
-        let tape_bytes = if tape && hh > 0 {
-            5 * n * hh * vhd * vhd + 4 * n * v
-        } else {
-            0
-        };
-        base + moe + tape_bytes
+        base + moe
     }
 
     #[test]
-    fn resident_moe_pbs_bytes_are_tape_free_and_include_grouped_scratch() {
+    fn resident_moe_pbs_bytes_include_grouped_scratch() {
         let moe = resident_moe_test_config();
         let rows = RESIDENT_MOE_CHUNK_ROWS;
         let bytes = resident_moe_pbs_bytes(&moe, rows).expect("chargeable");
         assert_eq!(
             bytes as u128,
-            constructor_payload_bytes(&moe, rows as u128, false),
-            "the census equals the independent constructor closed form (tape-free owner)"
-        );
-        let with_tape = resident_moe_owner_bytes(&moe, rows, true).expect("chargeable");
-        assert!(
-            bytes < with_tape,
-            "ordinary prefill never allocates the verify-only S-tape"
+            constructor_payload_bytes(&moe, rows as u128),
+            "the census equals the independent constructor closed form"
         );
         // The grouped gate/up and down outputs are inside the PBS term.
         let mut dense_shape = moe.clone();
@@ -10700,22 +10451,20 @@ mod tests {
         assert_eq!(resident_moe_pbs_bytes(&moe, usize::MAX), None);
     }
 
-    /// The two `new_opt` allocations `projected_allocation_bytes` does not
+    /// The two `new` allocations `projected_allocation_bytes` does not
     /// mirror (`dn_z_fold_batch`, `dn_normed_batch`) are charged exactly once,
-    /// and the census equals the independent constructor closed form for tape
-    /// off/on, credits and overflow.
+    /// and the census equals the independent constructor closed form for
+    /// credits and overflow.
     #[test]
     fn resident_moe_census_matches_constructor_closed_form() {
         let moe = resident_moe_test_config();
         let v = moe.linear_num_value_heads * moe.linear_value_head_dim;
         for rows in [100usize, 512, 1024, 4096] {
-            for tape in [false, true] {
-                assert_eq!(
-                    resident_moe_owner_bytes(&moe, rows, tape).map(|b| b as u128),
-                    Some(constructor_payload_bytes(&moe, rows as u128, tape)),
-                    "rows={rows} tape={tape}"
-                );
-            }
+            assert_eq!(
+                resident_moe_owner_bytes(&moe, rows).map(|b| b as u128),
+                Some(constructor_payload_bytes(&moe, rows as u128)),
+                "rows={rows}"
+            );
             let z_fold = rows * (v + 256) * 4;
             let normed = rows * v * 4;
             assert_eq!(
@@ -10723,7 +10472,7 @@ mod tests {
                 Some(z_fold + normed)
             );
             let mirrored = usize::try_from(
-                PrefillBatchScratch::projected_allocation_bytes(&moe, rows, false).unwrap(),
+                PrefillBatchScratch::projected_allocation_bytes(&moe, rows).unwrap(),
             )
             .unwrap();
             assert_eq!(
@@ -10731,12 +10480,12 @@ mod tests {
                 Some(mirrored + z_fold + normed)
             );
         }
-        assert_eq!(resident_moe_owner_bytes(&moe, usize::MAX, false), None);
+        assert_eq!(resident_moe_owner_bytes(&moe, usize::MAX), None);
         assert_eq!(resident_moe_pbs_unmirrored_bytes(&moe, usize::MAX), None);
         // Credits are the same census: a retained widened owner credits its own bytes.
         assert_eq!(
             resident_moe_cache_credit(&moe, Some((2048, false))) as u128,
-            constructor_payload_bytes(&moe, 2048, false)
+            constructor_payload_bytes(&moe, 2048)
         );
         // Memory decision charged from the closed form (not from the helpers).
         let kv = KvTierFlags {
@@ -10753,7 +10502,6 @@ mod tests {
         let need = usize::try_from(constructor_payload_bytes(
             &moe,
             RESIDENT_MOE_CHUNK_ROWS as u128,
-            false,
         ))
         .unwrap()
             + projection
@@ -10923,36 +10671,34 @@ mod tests {
             widened,
             4097
         ));
-        // A taped explicit-equivalent owner is charged its own (larger) bytes,
+        // A larger explicit-equivalent owner is charged its own (larger) bytes,
         // and an existing owner credits exactly its bytes.
-        let taped = ResidentMoeOwner {
-            rows: RESIDENT_MOE_CHUNK_ROWS,
-            tape: true,
+        let larger = ResidentMoeOwner {
+            rows: RESIDENT_MOE_CHUNK_ROWS * 2,
             credit_bytes: 0,
         };
-        let taped_bytes = resident_moe_owner_bytes(&moe, taped.rows, true).unwrap();
-        assert!(taped_bytes > pbs);
-        let taped_need = need - pbs + taped_bytes;
+        let larger_bytes = resident_moe_owner_bytes(&moe, larger.rows).unwrap();
+        assert!(larger_bytes > pbs);
+        let larger_need = need - pbs + larger_bytes;
         assert!(resident_moe_memory_admits(
             &moe,
             kv,
-            &mem(taped_need, 0),
+            &mem(larger_need, 0),
             None,
-            taped,
+            larger,
             0
         ));
         assert!(!resident_moe_memory_admits(
             &moe,
             kv,
-            &mem(taped_need - 1, 0),
+            &mem(larger_need - 1, 0),
             None,
-            taped,
+            larger,
             0
         ));
         // An owner smaller than the rung never lowers the 8192-row charge.
         let small = ResidentMoeOwner {
             rows: WIDENED_COMMIT_ROWS,
-            tape: false,
             credit_bytes: 0,
         };
         assert!(!resident_moe_memory_admits(
@@ -10972,8 +10718,8 @@ mod tests {
             0
         ));
         let credited = ResidentMoeOwner {
-            credit_bytes: taped_bytes,
-            ..taped
+            credit_bytes: larger_bytes,
+            ..larger
         };
         assert!(resident_moe_memory_admits(
             &moe,
@@ -11439,16 +11185,16 @@ mod tests {
             + WIDENED_VRAM_HEADROOM_BYTES
     }
 
-    fn owner_bytes_of(config: &Qwen35Config, owner: (usize, bool)) -> usize {
-        resident_moe_owner_bytes(config, owner.0, owner.1).unwrap()
+    fn owner_bytes_of(config: &Qwen35Config, owner: usize) -> usize {
+        resident_moe_owner_bytes(config, owner).unwrap()
     }
 
     /// `resident_moe_need_bytes` with the wrapper's explicit-equivalent owner as
-    /// the charged PBS (the larger of the tape-free rung and the owner).
+    /// the charged PBS (the larger of the rung and the owner).
     fn resident_moe_need_owner_bytes(
         config: &Qwen35Config,
         live_q16: usize,
-        owner: (usize, bool),
+        owner: usize,
     ) -> usize {
         let rung = resident_moe_pbs_bytes(config, RESIDENT_MOE_CHUNK_ROWS).unwrap();
         resident_moe_need_bytes(config, live_q16) - rung + rung.max(owner_bytes_of(config, owner))
@@ -11484,7 +11230,7 @@ mod tests {
         )>,
         cached: Option<(usize, bool)>,
         deduction: usize,
-        existing_virtual: Option<(usize, bool)>,
+        existing_virtual: Option<usize>,
     }
 
     type CallFlip = fn(&mut OrdinaryCallFacts);
@@ -11542,9 +11288,9 @@ mod tests {
         /// (`prefill_batch_pbs_eligible` false at the actual n): `plan` is an
         /// unexecuted placeholder and `chunks` is empty.
         ar_fallback: bool,
-        /// The executed PBS owner `(rows, tape)`, `None` when the inner entry
+        /// The executed PBS owner rows, `None` when the inner entry
         /// allocates its own.
-        owner: Option<(usize, bool)>,
+        owner: Option<usize>,
         plan: OrdinaryPrefillPlan,
         chunks: Vec<(usize, Option<usize>)>,
         /// The effective incumbent ceiling the inner entry ran with.
@@ -11674,8 +11420,7 @@ mod tests {
                     sc_memory_facts(sc)
                 },
                 ResidentMoeOwner {
-                    rows: target.0,
-                    tape: target.1,
+                    rows: target,
                     credit_bytes,
                 },
             );
@@ -11725,7 +11470,7 @@ mod tests {
         let owner = match wrapper.owner {
             WrapperOwner::None => None,
             WrapperOwner::Physical => physical,
-            WrapperOwner::Virtual { rows, tape } => Some((rows, tape)),
+            WrapperOwner::Virtual { rows } => Some(rows),
         };
         let incumbent = resolve_ordinary_max_batch(legacy_max_batch, None, sc.call.max_batch_cap);
         let max_batch = resolve_ordinary_max_batch(
@@ -11763,7 +11508,7 @@ mod tests {
             };
         }
         let mut call = sc.call;
-        call.caller_pbs_rows = call.caller_pbs_rows.or(owner.map(|o| o.0));
+        call.caller_pbs_rows = call.caller_pbs_rows.or(owner);
         let req = OrdinaryPlanRequest {
             call,
             n: sc.n,
@@ -11834,11 +11579,8 @@ mod tests {
         assert_eq!(r.plan.limit, r.incumbent, "{what}: incumbent ceiling");
         let rows = r
             .owner
-            .map(|o| o.0)
             .or(sc.call.caller_pbs_rows)
-            .unwrap_or_else(|| {
-                owned_prefill_scratch_plan(sc.n, r.incumbent, sc.call.tree_verify).0
-            });
+            .unwrap_or_else(|| owned_prefill_scratch_plan(sc.n, r.incumbent));
         assert_eq!(r.plan.pbs_rows, rows, "{what}: original owner rows");
         let batch = r.incumbent.min(rows);
         let (mut expected, mut left) = (Vec::new(), sc.n);
@@ -11901,18 +11643,13 @@ mod tests {
                 // Census of the actual HFQ shape against the independent
                 // constructor closed form (not the projected mirror).
                 for rows in [100usize, 512, 1024, 4096] {
-                    for tape in [false, true] {
-                        assert_eq!(
-                            resident_moe_owner_bytes(&moe.config, rows, tape).map(|b| b as u128),
-                            Some(constructor_payload_bytes(&moe.config, rows as u128, tape)),
-                            "{name}: census rows={rows} tape={tape}"
-                        );
-                    }
+                    assert_eq!(
+                        resident_moe_owner_bytes(&moe.config, rows).map(|b| b as u128),
+                        Some(constructor_payload_bytes(&moe.config, rows as u128)),
+                        "{name}: census rows={rows}"
+                    );
                 }
-                assert_eq!(
-                    resident_moe_owner_bytes(&moe.config, usize::MAX, false),
-                    None
-                );
+                assert_eq!(resident_moe_owner_bytes(&moe.config, usize::MAX), None);
 
                 // --- reuse PBS off: default vs beta explicit 8192 -------------
                 for n in [4096usize, 8192, 3855, 16384, 4097, 513, 100] {
@@ -12022,22 +11759,12 @@ mod tests {
                             assert_eq!(d.wrapper.owner, WrapperOwner::Physical);
                             assert!(!d.wrapper.alloc_virtual);
                         } else {
-                            assert_eq!(
-                                d.wrapper.owner,
-                                WrapperOwner::Virtual {
-                                    rows: target.0,
-                                    tape: target.1
-                                }
-                            );
+                            assert_eq!(d.wrapper.owner, WrapperOwner::Virtual { rows: target });
                             assert!(d.wrapper.alloc_virtual && !d.wrapper.free_virtual);
                         }
                         // Existing owner kept from an earlier admitted request: the
                         // same effective parameters, allocated only when it differs.
-                        for existing in [
-                            Some(target),
-                            Some((1024, false)),
-                            Some((target.0, !target.1)),
-                        ] {
+                        for existing in [Some(target), Some(1024), Some(target + 1)] {
                             let mut s2 = sd.clone();
                             s2.existing_virtual = existing;
                             let d2 = run(&moe, &s2);
@@ -12061,10 +11788,7 @@ mod tests {
                         assert!(!l.plan.wide);
                         assert_eq!(l.plan.limit, l.max_batch);
                         assert_ne!(l.max_batch, RESIDENT_MOE_CHUNK_ROWS);
-                        assert_eq!(
-                            l.plan.chunk_batch(None),
-                            l.max_batch.min(default_physical.0)
-                        );
+                        assert_eq!(l.plan.chunk_batch(None), l.max_batch.min(default_physical));
                         // A virtual owner kept from an earlier admitted request is
                         // released when a later request no longer fits even with
                         // the owner's own bytes credited; only a SAME-TARGET owner
@@ -12092,10 +11816,10 @@ mod tests {
                             assert_eq!(eff(&run(&moe, &credited)), eff(&e), "credited fit");
                             credited.free_bytes = Some(need_owner - owner_bytes - 1);
                             assert_eq!(run(&moe, &credited).wrapper.max_batch_override, None);
-                            // A mismatched owner (rows or tape) is replaced: the
+                            // A mismatched owner (rows) is replaced: the
                             // budget a speculative credit would admit is denied, and
                             // the stale owner is released.
-                            for stale in [(1024, false), (target.0, !target.1)] {
+                            for stale in [1024, target + 1] {
                                 let stale_bytes = owner_bytes_of(&moe.config, stale);
                                 assert!(stale_bytes < need_owner);
                                 let mut sc_stale = sd.clone();
@@ -12146,13 +11870,12 @@ mod tests {
                             "{name} {arch}: reuse baseline promotes"
                         );
                     }
-                    let call_flips: [(&str, CallFlip); 10] = [
+                    let call_flips: [(&str, CallFlip); 9] = [
                         ("caller PBS smaller", |c| c.caller_pbs_rows = Some(512)),
                         ("caller PBS covering the rung", |c| {
                             c.caller_pbs_rows = Some(8192)
                         }),
                         ("max_batch_cap", |c| c.max_batch_cap = Some(256)),
-                        ("tree verify", |c| c.tree_verify = true),
                         ("gdn tape", |c| c.gdn_tape = true),
                         ("staged hidden ring", |c| c.staged_hidden_ring = true),
                         ("max_layer", |c| c.max_layer = true),
@@ -12404,8 +12127,8 @@ mod tests {
         let inputs = |arch: &'static str,
                       fp8: bool,
                       dense: bool,
-                      physical: Option<(usize, bool)>,
-                      existing: Option<(usize, bool)>,
+                      physical: Option<usize>,
+                      existing: Option<usize>,
                       fits: bool| WrapperPbsInputs {
             arch,
             fp8_chunk512: fp8,
@@ -12424,7 +12147,7 @@ mod tests {
             "gfx1100",
             false,
             true,
-            Some((512, true)),
+            Some(512),
             None,
             true
         ))));
@@ -12432,23 +12155,15 @@ mod tests {
             "gfx1100", false, false, None, None, true
         ))));
         assert!(
-            plan_wrapper_pbs(&inputs(
-                "gfx1100",
-                false,
-                false,
-                None,
-                Some((4096, true)),
-                true
-            ))
-            .free_virtual
+            plan_wrapper_pbs(&inputs("gfx1100", false, false, None, Some(4096), true)).free_virtual
         );
         // Not fitting: the implicit cache, no override; an existing owner is released.
         let p = plan_wrapper_pbs(&inputs(
             "gfx1100",
             false,
             false,
-            Some((512, true)),
-            Some((4096, true)),
+            Some(512),
+            Some(4096),
             false,
         ));
         assert_eq!(
@@ -12460,18 +12175,11 @@ mod tests {
             ),
             (WrapperOwner::Physical, None, true, false)
         );
-        // Fitting default on gfx1100: the explicit-8192 owner (8192 rows, tape) from the
+        // Fitting default on gfx1100: the explicit-8192 owner (8192 rows) from the
         // existing explicit sizing function, ceiling 8192.
         let target = implicit_reuse_pbs_plan("gfx1100", Some(RESIDENT_MOE_CHUNK_ROWS), false);
-        assert_eq!(target, (8192, true));
-        let p = plan_wrapper_pbs(&inputs(
-            "gfx1100",
-            false,
-            false,
-            Some((512, true)),
-            None,
-            true,
-        ));
+        assert_eq!(target, 8192);
+        let p = plan_wrapper_pbs(&inputs("gfx1100", false, false, Some(512), None, true));
         assert_eq!(
             (
                 p.owner,
@@ -12480,10 +12188,7 @@ mod tests {
                 p.alloc_virtual
             ),
             (
-                WrapperOwner::Virtual {
-                    rows: 8192,
-                    tape: true
-                },
+                WrapperOwner::Virtual { rows: 8192 },
                 Some(8192),
                 false,
                 true
@@ -12494,7 +12199,7 @@ mod tests {
             "gfx1100",
             false,
             false,
-            Some((512, true)),
+            Some(512),
             Some(target),
             true,
         ));
@@ -12503,21 +12208,14 @@ mod tests {
             "gfx1100",
             false,
             false,
-            Some((512, true)),
-            Some((1024, false)),
+            Some(512),
+            Some(1024),
             true,
         ));
         assert_eq!((p.free_virtual, p.alloc_virtual), (true, true));
-        // A denying call (capture/tree/tape/ring/cap/state) never promotes, whatever
+        // A denying call (capture/tape/ring/cap/state) never promotes, whatever
         // fits, and leaves existing owners untouched.
-        let mut denied = inputs(
-            "gfx1100",
-            false,
-            false,
-            Some((512, true)),
-            Some((4096, true)),
-            true,
-        );
+        let mut denied = inputs("gfx1100", false, false, Some(512), Some(4096), true);
         denied.call_eligible = false;
         let p = plan_wrapper_pbs(&denied);
         assert_eq!(
@@ -12558,44 +12256,22 @@ mod tests {
         assert_eq!(resolve_ordinary_max_batch(512, Some(4096), None), 4096);
         assert_eq!(resolve_ordinary_max_batch(384, None, None), 384);
         // gfx1201 with the FP8 path: the implicit cache already is the explicit-8192 shape.
-        let p = plan_wrapper_pbs(&inputs(
-            "gfx1201",
-            true,
-            false,
-            Some((512, false)),
-            None,
-            true,
-        ));
+        let p = plan_wrapper_pbs(&inputs("gfx1201", true, false, Some(512), None, true));
         assert_eq!(
             (p.owner, p.max_batch_override, p.alloc_virtual),
             (WrapperOwner::Physical, Some(8192), false)
         );
-        // gfx1201 without it: 384-row cache -> the 512-row tape-free explicit owner.
-        let p = plan_wrapper_pbs(&inputs(
-            "gfx1201",
-            false,
-            false,
-            Some((384, false)),
-            None,
-            true,
-        ));
+        // gfx1201 without it: 384-row cache -> the 512-row explicit owner.
+        let p = plan_wrapper_pbs(&inputs("gfx1201", false, false, Some(384), None, true));
         assert_eq!(
             (p.owner, p.max_batch_override, p.alloc_virtual),
-            (
-                WrapperOwner::Virtual {
-                    rows: 512,
-                    tape: false
-                },
-                Some(8192),
-                true
-            )
+            (WrapperOwner::Virtual { rows: 512 }, Some(8192), true)
         );
         let open = OrdinaryCallFacts::default();
         assert!(open.wide_candidate());
-        let flips: [CallFlip; 9] = [
+        let flips: [CallFlip; 8] = [
             |c| c.caller_pbs_rows = Some(8192),
             |c| c.max_batch_cap = Some(256),
-            |c| c.tree_verify = true,
             |c| c.gdn_tape = true,
             |c| c.staged_hidden_ring = true,
             |c| c.max_layer = true,
@@ -12609,21 +12285,12 @@ mod tests {
             assert!(!c.wide_candidate());
         }
         // Implicit cache sizing per arch, default and explicit.
-        assert_eq!(implicit_reuse_pbs_plan("gfx1201", None, true), (512, false));
-        assert_eq!(
-            implicit_reuse_pbs_plan("gfx1201", None, false),
-            (384, false)
-        );
-        assert_eq!(
-            implicit_reuse_pbs_plan("gfx1201", Some(8192), false),
-            (512, false)
-        );
-        assert_eq!(implicit_reuse_pbs_plan("gfx1100", None, false), (512, true));
-        assert_eq!(
-            implicit_reuse_pbs_plan("gfx1100", Some(8192), false),
-            (8192, true)
-        );
-        assert_eq!(implicit_reuse_pbs_plan("gfx1151", None, false), (512, true));
+        assert_eq!(implicit_reuse_pbs_plan("gfx1201", None, true), 512);
+        assert_eq!(implicit_reuse_pbs_plan("gfx1201", None, false), 384);
+        assert_eq!(implicit_reuse_pbs_plan("gfx1201", Some(8192), false), 512);
+        assert_eq!(implicit_reuse_pbs_plan("gfx1100", None, false), 512);
+        assert_eq!(implicit_reuse_pbs_plan("gfx1100", Some(8192), false), 8192);
+        assert_eq!(implicit_reuse_pbs_plan("gfx1151", None, false), 512);
         // State gate over the allocator's own scalar plan.
         let moe = resident_moe_test_config();
         let q8 = DeltaNetStatePlan::new(&moe, StateQuant::Q8, 1, true);
@@ -12805,13 +12472,13 @@ mod tests {
     #[test]
     fn ordinary_wrapper_gate_uses_actual_n_and_seam() {
         let open = OrdinaryCallFacts::default();
-        let phys = Some((512usize, true));
+        let phys = Some(512usize);
         let gate = |arch: &str,
                     decouple: Option<&str>,
                     batched: bool,
                     n: usize,
                     call: &OrdinaryCallFacts,
-                    physical: Option<(usize, bool)>| {
+                    physical: Option<usize>| {
             OrdinaryWrapperGate::new(n, call, physical, |rows| {
                 prefill_batch_scalar_eligible(rows, arch, decouple, batched, true)
             })
@@ -12895,10 +12562,7 @@ mod tests {
             assert_eq!(
                 (p.owner, p.max_batch_override, p.alloc_virtual),
                 (
-                    WrapperOwner::Virtual {
-                        rows: target.0,
-                        tape: target.1
-                    },
+                    WrapperOwner::Virtual { rows: target },
                     Some(RESIDENT_MOE_CHUNK_ROWS),
                     true
                 ),
@@ -12915,10 +12579,9 @@ mod tests {
             assert!(p.free_virtual);
         }
         // Every caller/capture fact closes the gate at a valid n.
-        let flips: [CallFlip; 9] = [
+        let flips: [CallFlip; 8] = [
             |c| c.caller_pbs_rows = Some(8192),
             |c| c.max_batch_cap = Some(256),
-            |c| c.tree_verify = true,
             |c| c.gdn_tape = true,
             |c| c.staged_hidden_ring = true,
             |c| c.max_layer = true,
@@ -12952,9 +12615,9 @@ mod tests {
     #[test]
     fn wrapper_virtual_credit_is_same_target_only() {
         let moe = resident_moe_test_config();
-        let target = (8192usize, true);
-        let bytes = resident_moe_owner_bytes(&moe, target.0, target.1).unwrap();
-        let physical = Some((512usize, true));
+        let target = 8192usize;
+        let bytes = resident_moe_owner_bytes(&moe, target).unwrap();
+        let physical = Some(512usize);
         assert_eq!(
             wrapper_virtual_credit_bytes(&moe, physical, Some(target), target),
             bytes
@@ -12963,7 +12626,7 @@ mod tests {
             wrapper_virtual_credit_bytes(&moe, physical, None, target),
             0
         );
-        for stale in [(1024usize, true), (4096, false), (4096, true), (512, false)] {
+        for stale in [1024usize, 512, 4096] {
             assert_eq!(
                 wrapper_virtual_credit_bytes(&moe, physical, Some(stale), target),
                 0,
@@ -12986,7 +12649,7 @@ mod tests {
             call_eligible: true,
         });
         assert!(!p.free_virtual && !p.alloc_virtual);
-        for stale in [(1024usize, true), (4096, false)] {
+        for stale in [1024usize, 4096] {
             let p = plan_wrapper_pbs(&WrapperPbsInputs {
                 arch: "gfx1100",
                 fp8_chunk512: false,
@@ -13083,7 +12746,7 @@ mod tests {
         // n = 1, reuse on/off, fresh and existing virtual owner. The 512-row
         // static facts alone would still admit the model.
         for reuse in [false, true] {
-            for existing in [None, Some(target), Some((1024, false))] {
+            for existing in [None, Some(target), Some(1024)] {
                 let mut sc = base(false, reuse, 1);
                 sc.existing_virtual = existing;
                 let facts = sc_static_facts(moe, &sc);
@@ -13177,13 +12840,6 @@ mod tests {
         assert!(!fa_pair_merge_admitted(512, 512, "gfx1151", true, false));
         assert!(!fa_pair_merge_admitted(512, 512, "gfx1151", false, true));
         assert!(!fa_pair_merge_admitted(512, 512, "gfx1151", true, true));
-    }
-
-    #[test]
-    fn owned_prefill_scratch_preserves_tree_verify_tape() {
-        assert_eq!(owned_prefill_scratch_plan(22, 256, true), (22, true));
-        assert_eq!(owned_prefill_scratch_plan(64, 64, true), (64, true));
-        assert_eq!(owned_prefill_scratch_plan(22, 384, true), (22, true));
     }
 
     #[test]
@@ -13292,7 +12948,7 @@ mod tests {
         let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
         // Explicit PBS: the widened route would otherwise use an internal
         // owned scratch that is dropped after the call.
-        let pbs = PrefillBatchScratch::new_opt(&mut gpu, &config, N, false).expect("pbs");
+        let pbs = PrefillBatchScratch::new(&mut gpu, &config, N).expect("pbs");
         forward_prefill_batch_with_pbs(
             &mut gpu,
             &weights,
@@ -13302,7 +12958,6 @@ mod tests {
             &mut kv_cache,
             &mut dn_state,
             &scratch,
-            None,
             None,
             None,
             None,
@@ -13484,7 +13139,7 @@ mod tests {
         let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
         // Explicit PBS: the widened route would otherwise use an internal
         // owned scratch that is dropped after the call.
-        let pbs = PrefillBatchScratch::new_opt(&mut gpu, &config, N, false).expect("pbs");
+        let pbs = PrefillBatchScratch::new(&mut gpu, &config, N).expect("pbs");
         forward_prefill_batch_with_pbs(
             &mut gpu,
             &weights,
@@ -13494,7 +13149,6 @@ mod tests {
             &mut kv_cache,
             &mut dn_state,
             &scratch,
-            None,
             None,
             None,
             None,
@@ -13691,7 +13345,7 @@ mod tests {
         let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
         // Explicit PBS: the widened route would otherwise use an internal
         // owned scratch that is dropped after the call.
-        let pbs = PrefillBatchScratch::new_opt(&mut gpu, &config, N, false).expect("pbs");
+        let pbs = PrefillBatchScratch::new(&mut gpu, &config, N).expect("pbs");
         forward_prefill_batch_with_pbs(
             &mut gpu,
             &weights,
@@ -13701,7 +13355,6 @@ mod tests {
             &mut kv_cache,
             &mut dn_state,
             &scratch,
-            None,
             None,
             None,
             None,
@@ -13889,7 +13542,7 @@ mod tests {
         let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
         // Explicit PBS: the widened route would otherwise use an internal
         // owned scratch that is dropped after the call.
-        let pbs = PrefillBatchScratch::new_opt(&mut gpu, &config, N, false).expect("pbs");
+        let pbs = PrefillBatchScratch::new(&mut gpu, &config, N).expect("pbs");
         forward_prefill_batch_with_pbs(
             &mut gpu,
             &weights,
@@ -13899,7 +13552,6 @@ mod tests {
             &mut kv_cache,
             &mut dn_state,
             &scratch,
-            None,
             None,
             None,
             None,
@@ -14111,7 +13763,7 @@ mod tests {
         .expect("kv cache");
         let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn state");
         let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
-        let pbs = PrefillBatchScratch::new_opt(&mut gpu, &config, N, false).expect("pbs");
+        let pbs = PrefillBatchScratch::new(&mut gpu, &config, N).expect("pbs");
         forward_prefill_batch_with_pbs(
             &mut gpu,
             &weights,
@@ -14121,7 +13773,6 @@ mod tests {
             &mut kv_cache,
             &mut dn_state,
             &scratch,
-            None,
             None,
             None,
             None,
@@ -14337,7 +13988,7 @@ mod tests {
         .expect("kv cache");
         let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn state");
         let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
-        let pbs = PrefillBatchScratch::new_opt(&mut gpu, &config, N, false).expect("pbs");
+        let pbs = PrefillBatchScratch::new(&mut gpu, &config, N).expect("pbs");
         forward_prefill_batch_with_pbs(
             &mut gpu,
             &weights,
@@ -14347,7 +13998,6 @@ mod tests {
             &mut kv_cache,
             &mut dn_state,
             &scratch,
-            None,
             None,
             None,
             None,

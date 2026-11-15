@@ -59,14 +59,7 @@ impl SpecTarget for LlamaBundle {
         block_size: usize,
     ) -> Result<Box<dyn SpecScratch>, String> {
         let block_size = block_size.max(2);
-        // The tree-verify arm linearizes a DDTree of up to `dense_tree_verify_nodes`
-        // slots into ONE batched forward, so the verify scratch must hold the larger
-        // of the chain block and the (clamped) tree size — else a big
-        // `HIPFIRE_DDTREE_BUDGET` overflows `pbs.max_batch` and panics.
-        let max_batch = block_size.max(hipfire_runtime::dflash_generic::dense_tree_verify_nodes(
-            &gpu.flags,
-        ));
-        let pbs = PrefillBatchScratch::new(gpu, &self.config, max_batch, self.kv.physical_cap)
+        let pbs = PrefillBatchScratch::new(gpu, &self.config, block_size, self.kv.physical_cap)
             .map_err(|e| format!("LlamaSpecScratch PrefillBatchScratch: {e:?}"))?;
         Ok(Box::new(LlamaSpecScratch { pbs }))
     }
@@ -298,45 +291,6 @@ impl SpecTarget for LlamaBundle {
             &self.weights,
             &self.config,
             block,
-            position,
-            &mut self.kv,
-            &self.scratch,
-            &s.pbs,
-            sink.as_mut(),
-        )
-        .map_err(|e| format!("{e:?}"))
-    }
-
-    fn verify_tree_logits(
-        &mut self,
-        gpu: &mut Gpu,
-        tokens: &[u32],
-        mask_block: &[f32],
-        depth_positions: &[i32],
-        position: usize,
-        scratch: &mut dyn SpecScratch,
-        hidden_out: Option<&mut Vec<f32>>,
-    ) -> Result<Vec<f32>, String> {
-        let s = scratch
-            .as_any_mut()
-            .downcast_mut::<LlamaSpecScratch>()
-            .ok_or("verify_tree_logits: scratch is not LlamaSpecScratch")?;
-        let extract = &self.dflash_extract_layers;
-        let mut sink = match hidden_out {
-            Some(h) if !extract.is_empty() => Some(llama::HiddenCaptureSink {
-                extract_layers: extract,
-                hidden: h,
-                hidden_gpu: None,
-            }),
-            _ => None,
-        };
-        hipfire_runtime::llama_spec::verify_tree_logits(
-            gpu,
-            &self.weights,
-            &self.config,
-            tokens,
-            mask_block,
-            depth_positions,
             position,
             &mut self.kv,
             &self.scratch,

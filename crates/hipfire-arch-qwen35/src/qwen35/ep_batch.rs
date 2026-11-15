@@ -890,7 +890,7 @@ pub fn validate_ep_batch_compatibility(
         load_cfg.repeat_capacity,
     )?;
     let per_rank_seed_pbs =
-        PrefillBatchScratch::projected_allocation_bytes(config, load_cfg.prefill_chunk, false)?;
+        PrefillBatchScratch::projected_allocation_bytes(config, load_cfg.prefill_chunk)?;
     let dim = config.dim as u64;
     let decode_partial: u64 = (load_cfg.max_batch as u64)
         .checked_mul(dim)
@@ -1279,7 +1279,6 @@ impl QwenRootEpBinding<'_> {
             None,
             None,
             0,
-            None,
             self.pre_uploaded,
             self.pre_embedded,
             Some(band),
@@ -1582,11 +1581,10 @@ impl Qwen35DecodeBatchEpState {
                     Err(e) => return Err(guard.rollback(gpus, e)),
                 };
             guard.set_decode_partial(rank, partial);
-            let spbs = match PrefillBatchScratch::new_opt(
+            let spbs = match PrefillBatchScratch::new(
                 &mut gpus.devices[rank],
                 config,
                 load_cfg.prefill_chunk,
-                false,
             ) {
                 Ok(p) => p,
                 Err(e) => return Err(guard.rollback(gpus, e)),
@@ -2068,7 +2066,6 @@ impl Qwen35DecodeBatchEpState {
                                 None,
                                 None,
                                 0,
-                                None,
                                 true,
                                 false,
                                 Some(&band),
@@ -2434,7 +2431,6 @@ impl Qwen35DecodeBatchEpState {
                             None,
                             None,
                             0,
-                            None,
                             inputs_prepared,
                             inputs_prepared,
                             Some(&band),
@@ -3207,7 +3203,6 @@ pub fn forward_prefill_batch_ep(
                     None, // per_token_hidden_out
                     None, // gdn_tape
                     0,    // tape_offset
-                    None, // tree_verify
                     true, // pre_uploaded (hoisted above)
                     Some(&band),
                     None,  // mask_override
@@ -4757,7 +4752,7 @@ pub fn forward_scratch_multi(
 ///      `x_batch`) and `is_last_band=true` (does final norm + lm_head).
 ///   5. Repeat for any further bands.
 ///
-/// `tree_verify`, DFlash hidden-rb, GdnTape, and per_token_hidden_out
+/// DFlash hidden-rb, GdnTape, and per_token_hidden_out
 /// are pp=1 only in v1. They've been refused at the daemon load-time
 /// gate, so this function does not accept them as parameters.
 #[allow(clippy::too_many_arguments)]
@@ -4970,7 +4965,6 @@ pub fn forward_prefill_batch_multi(
                         None, // per_token_hidden_out: pp=1 only
                         None, // gdn_tape: pp=1 only
                         0,
-                        None,  // tree_verify: pp=1 only
                         false, // pre_uploaded
                         Some(&band_ctx),
                         None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook

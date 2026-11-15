@@ -1799,17 +1799,20 @@ pub struct GenerationRouteInputs {
     pub min_p: Option<f32>,
     /// At least one repeat/presence/frequency penalty is non-neutral. Native
     /// MTP verifiers apply them (Qwen4: sampled only; Qwen3.x: sampled and
-    /// greedy); DFlash verifiers (greedy, DDTree SWOR, selector chain) do not
+    /// greedy); DFlash verifiers (greedy, sampled chain, selector chain) do not
     /// implement these controls and must use AR.
     pub nonneutral_penalties: bool,
     pub force_ar_chat: bool,
     pub temp_spec_env_off: bool,
     pub fast_sample_on: bool,
-    pub supports_temp_swor: bool,
+    /// The speculator's `supports_temp_verify()`: its verify is
+    /// distribution-correct at temp>0. Alone (no chain nucleus) it marks a
+    /// temperature-only verify (target-generic DFlash naive chain sampling),
+    /// which refuses user-explicit non-temperature controls.
+    pub supports_temp_verify: bool,
     /// Speculator applies faithful top_p/top_k on the sampled chain path
     /// (DFlash2 candidate-selector). When set, chain routing may engage even
-    /// though [`Self::supports_temp_swor`] is also true; DDTree SWOR leaves
-    /// this false and still refuses user-explicit non-temperature controls.
+    /// though [`Self::supports_temp_verify`] is also true.
     pub supports_chain_nucleus_verify: bool,
     pub kv_adaptive: bool,
 }
@@ -1828,7 +1831,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             && i.speculator_is_mtp
             && !i.force_ar_chat
             && !i.kv_adaptive
-            && (i.temp <= 1e-6 || i.supports_temp_swor);
+            && (i.temp <= 1e-6 || i.supports_temp_verify);
         if dense_tp_mtp {
             return GenerationRoute::QwenDflash;
         }
@@ -1863,7 +1866,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             // request on the ordinary Qwen4 producer (penalize-then-argmax).
             // Qwen4 PP uses the same native driver for greedy requests and
             // for unpenalized sampled Leviathan requests (distribution-exact;
-            // `supports_temp_swor` is false for `speculation.mtp_sampled = 0`
+            // `supports_temp_verify` is false for `speculation.mtp_sampled = 0`
             // and, under PP, for `HIPFIRE_MTP_SAMPLED_MODE=naive`, whose draws
             // come from the process-wide sampler: those stay on the PP AR
             // producer). Penalized requests stay on the PP AR producer too:
@@ -1871,8 +1874,8 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             // Qwen3.5-only PP route.
             let mtp_ok = i.speculator_is_mtp
                 && (i.pp <= 1 || !i.nonneutral_penalties)
-                && (i.temp <= 1e-6 || i.supports_temp_swor)
-                && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_swor));
+                && (i.temp <= 1e-6 || i.supports_temp_verify)
+                && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_verify));
             // The other Qwen4 speculator is DFlash2 (`--spec dflash`, single
             // card): it verifies greedy picks, or sampled rows with the AR
             // sampler's law (temperature, top_k, top_p, min_p), and applies
@@ -1881,7 +1884,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             let dflash2_ok = i.speculator_is_dflash2
                 && i.pp <= 1
                 && !i.nonneutral_penalties
-                && (i.temp <= 1e-6 || i.supports_temp_swor);
+                && (i.temp <= 1e-6 || i.supports_temp_verify);
             let spec_ok = i.has_speculator
                 && (mtp_ok || dflash2_ok)
                 && !i.force_ar_chat
@@ -1949,7 +1952,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             let dflash2_ok = i.speculator_is_dflash2
                 && i.pp <= 1
                 && (!i.nonneutral_penalties || i.speculator_supports_penalties)
-                && (i.temp <= 1e-6 || (i.supports_temp_swor && i.supports_chain_nucleus_verify));
+                && (i.temp <= 1e-6 || (i.supports_temp_verify && i.supports_chain_nucleus_verify));
             let spec_ok = i.has_speculator
                 && dflash2_ok
                 && !i.force_ar_chat
@@ -1994,39 +1997,42 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // 4. Qwen / LLaMA DFlash/spec (same gates as production generate body).
     // MTP (speculator.name()=="mtp") shares the generic QwenDflash wrapper.
     // Sampled MTP honors temp>0 including user-explicit sampling and min_p
-    // when supports_temp_verify; DFlash keeps SWOR vs selector-chain gates.
-    // Selector-chain nucleus may share supports_temp_swor with DDTree SWOR but
-    // still takes the sampled chain route (user-explicit top_p/top_k allowed;
-    // min_p>0 still blocked — DFlash ignores min_p).
+    // when supports_temp_verify; DFlash keeps temperature-only vs chain gates.
+    // A temperature-only verify (supports_temp_verify without chain nucleus:
+    // target-generic DFlash naive sampling) refuses user-explicit controls.
+    // Selector-chain nucleus shares supports_temp_verify but still takes the
+    // sampled chain route (user-explicit top_p/top_k allowed; min_p>0 still
+    // blocked — DFlash ignores min_p). A non-selector qwen35 DFlash draft
+    // reports no temp verify and samples through the chain route too.
     // Token penalties: native MTP penalizes every verify row (sampled and
     // greedy) on the GPU against the emitted history, so it keeps the route;
-    // DFlash verifiers (greedy, DDTree SWOR, selector chain) implement none
+    // DFlash verifiers (greedy, sampled chain, selector chain) implement none
     // and send a penalized request to AR instead of dropping the penalties.
     let caps = hipfire_loader::carrier_for(i.arch_id)
         .map(|c| c.caps())
         .unwrap_or_default();
     let dflash_min_p_present = i.min_p.map(|p| p > 0.0).unwrap_or(false);
-    let ddtree_swor_route = !i.speculator_is_mtp
+    let temp_only_route = !i.speculator_is_mtp
         && i.temp > 1e-6
-        && i.supports_temp_swor
+        && i.supports_temp_verify
         && !i.supports_chain_nucleus_verify
         && !i.user_explicit_sampling
         && !i.nonneutral_penalties
         && !i.temp_spec_env_off;
     let chain_sample_route = !i.speculator_is_mtp
         && i.temp > 1e-6
-        && (!i.supports_temp_swor || i.supports_chain_nucleus_verify)
+        && (!i.supports_temp_verify || i.supports_chain_nucleus_verify)
         && i.ngram_can_sample
         && i.fast_sample_on
         && !dflash_min_p_present
         && !i.nonneutral_penalties
         && !i.temp_spec_env_off;
-    let mtp_sample_route = i.speculator_is_mtp && i.temp > 1e-6 && i.supports_temp_swor;
+    let mtp_sample_route = i.speculator_is_mtp && i.temp > 1e-6 && i.supports_temp_verify;
     let qwen_greedy_route = i.temp <= 1e-6 && (!i.nonneutral_penalties || i.speculator_is_mtp);
     let qwen_dflash_route = caps.is_qwen_dflash()
-        && (qwen_greedy_route || ddtree_swor_route || chain_sample_route || mtp_sample_route);
+        && (qwen_greedy_route || temp_only_route || chain_sample_route || mtp_sample_route);
     let llama_dflash_route = caps.is_llama_dflash()
-        && ((i.temp <= 1e-6 && !i.nonneutral_penalties) || ddtree_swor_route || chain_sample_route);
+        && ((i.temp <= 1e-6 && !i.nonneutral_penalties) || temp_only_route || chain_sample_route);
     if i.has_speculator
         && !i.force_ar_chat
         && (qwen_dflash_route || llama_dflash_route)
@@ -2617,7 +2623,7 @@ pub fn generate(
     system_prompt: Option<&str>,
     // Whether the request EXPLICITLY set a non-temperature sampling control
     // (top_p/top_k/min_p/penalties). Gates temp>0 spec routing: explicit controls
-    // force the AR sampler (the SWOR spec verify can only honor temperature).
+    // force the AR sampler (a temperature-only spec verify can only honor temperature).
     user_explicit_sampling: bool,
     temp: f32,
     top_p: f32,
@@ -2677,7 +2683,7 @@ pub fn generate(
             .and_then(|s| s.drafter_any_mut())
             .and_then(|any| any.downcast_ref::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
             .is_some_and(|drafter| drafter.sampled_mode_is_naive());
-    let supports_temp_swor = !pp_naive_sampled_mtp
+    let supports_temp_verify = !pp_naive_sampled_mtp
         && m.speculator
             .as_ref()
             .is_some_and(|s| s.supports_temp_verify());
@@ -2734,7 +2740,7 @@ pub fn generate(
             .as_deref()
             == Some("0"),
         fast_sample_on: hipfire_runtime::config::get().dflash_fast_sample,
-        supports_temp_swor,
+        supports_temp_verify,
         supports_chain_nucleus_verify,
         kv_adaptive: m.kv_adaptive.is_some(),
     };
@@ -3687,22 +3693,22 @@ pub fn generate(
                 let reason = if route_inputs.temp_spec_env_off {
                     "HIPFIRE_DFLASH_TEMP_SPEC=0"
                 } else if min_p.map(|p| p > 0.0).unwrap_or(false) {
-                    // Prefer min_p over SWOR-only: selector-chain honors top_p/top_k
+                    // Prefer min_p over temperature-only: selector-chain honors top_p/top_k
                     // but still falls to AR when min_p>0 (DFlash ignores min_p).
                     "request set min_p (sampled DFlash honors top_p/top_k only); AR applies it"
                 } else if route_inputs.nonneutral_penalties {
                     "request set a non-neutral repeat/presence/frequency penalty; AR applies it"
-                } else if route_inputs.supports_temp_swor
+                } else if route_inputs.supports_temp_verify
                     && !route_inputs.supports_chain_nucleus_verify
                     && user_explicit_sampling
                 {
-                    "request set an explicit top_p/top_k/min_p/penalty (ddtree SWOR verify honors temperature only); AR applies them"
+                    "request set an explicit top_p/top_k/min_p/penalty (the temperature-only sampled verify honors temperature only); AR applies them"
                 } else if !ngram_can_sample {
                     "loaded drafter is greedy-only (MTP/n-gram); temp>0 runs AR"
                 } else if route_inputs.supports_chain_nucleus_verify {
                     "sampled DFlash chain nucleus not engaged (check HIPFIRE_FAST_SAMPLE / temp-spec gates)"
                 } else {
-                    "ddtree SWOR verify not active (needs ddtree_budget>0)"
+                    "sampled DFlash chain verify not engaged (check HIPFIRE_DFLASH_FAST_SAMPLE / temp-spec gates)"
                 };
                 eprintln!(
                     "[hipfire] id={id}: temp>0 DFlash spec disabled -> AR ({reason}). Temperature honored; spec speedup off."
@@ -7054,7 +7060,7 @@ mod qwen4_pp_route_tests {
             force_ar_chat: false,
             temp_spec_env_off: false,
             fast_sample_on: false,
-            supports_temp_swor: false,
+            supports_temp_verify: false,
             supports_chain_nucleus_verify: false,
             kv_adaptive: false,
         }
@@ -7106,7 +7112,7 @@ mod qwen4_pp_route_tests {
             assert_eq!(select_generation_route(&i), GenerationRoute::Qwen4Ar);
             // Sampled, unpenalized, sampled verification available (leviathan):
             // native MTP, exactly as on one card.
-            i.supports_temp_swor = true;
+            i.supports_temp_verify = true;
             assert_eq!(
                 select_generation_route(&i),
                 GenerationRoute::Qwen4Spec,

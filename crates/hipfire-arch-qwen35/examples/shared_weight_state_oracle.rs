@@ -333,7 +333,6 @@ fn run(raw: &[String]) -> Result<()> {
         None,
         None,
         None,
-        None,
     )?;
     let (values, raw) = download_logits(&gpu, &bundle.scratch.logits, config.vocab_size)?;
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1e3;

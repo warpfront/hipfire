@@ -194,7 +194,6 @@ pub fn fingerprint_u64(values: &[u64]) -> u64 {
 #[derive(Clone, Debug)]
 pub struct DflashVerifyWindow<'a> {
     pub batch: usize,
-    pub tree: bool,
     pub want_full_logits: bool,
     /// `start_pos` of this window.
     pub position: usize,
@@ -203,7 +202,7 @@ pub struct DflashVerifyWindow<'a> {
 
 impl DflashVerifyWindow<'_> {
     fn eligible_shape(&self) -> bool {
-        self.batch == DFLASH_VERIFY_PM4_BLOCK && !self.tree && !self.want_full_logits
+        self.batch == DFLASH_VERIFY_PM4_BLOCK && !self.want_full_logits
     }
 }
 
@@ -607,7 +606,6 @@ mod tests {
     ) -> DflashVerifyWindow<'a> {
         DflashVerifyWindow {
             batch,
-            tree: false,
             want_full_logits: false,
             position,
             binding: bound,
@@ -640,16 +638,13 @@ mod tests {
     }
 
     #[test]
-    fn tree_and_full_logits_windows_stay_hip() {
+    fn full_logits_windows_stay_hip() {
         let bound = binding(1, 4096);
         let mut route = DflashVerifyPm4::armed();
-        let mut tree = window(&bound, 16, 0);
-        tree.tree = true;
-        assert_eq!(route.plan_route(&tree), DflashVerifyRoute::HipAuto);
         let mut logits = window(&bound, 16, 0);
         logits.want_full_logits = true;
         assert_eq!(route.plan_route(&logits), DflashVerifyRoute::HipAuto);
-        assert_eq!(route.counters().full_hip, 2);
+        assert_eq!(route.counters().full_hip, 1);
     }
 
     #[test]

@@ -64,7 +64,7 @@ pub mod dflash_railgun_builder;
 /// `dflash_spec` (the draft forward consumes `ModelSlot`-family types).
 #[cfg(feature = "deltanet")]
 pub mod dflash_slot;
-/// Qwen3.5 DFlash / DDTree speculative-decode state (`DflashState`,
+/// Qwen3.5 DFlash speculative-decode state (`DflashState`,
 /// `load_dflash_state`) and the `DflashSpeculator` impl of the arch-generic
 /// `hipfire_runtime::spec::Speculator`. Deltanet-gated — it owns `ModelSlot`-
 /// based draft verify.

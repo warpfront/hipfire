@@ -237,10 +237,7 @@ fn main() {
         if batched_prefill {
             // Plain prefill (no spec-decode tree) never reads the DeltaNet
             // S-tape — skip its ~10 GB alloc so long (8k+) prefills fit.
-            pbs_per_rank.push(
-                PrefillBatchScratch::new_opt(g, &config, max_batch, /*cap_gdn_tape=*/ false)
-                    .expect("pbs"),
-            );
+            pbs_per_rank.push(PrefillBatchScratch::new(g, &config, max_batch).expect("pbs"));
             prefill_partials.push(
                 g.zeros(&[max_batch * config.dim], DType::F32)
                     .expect("prefill partial"),

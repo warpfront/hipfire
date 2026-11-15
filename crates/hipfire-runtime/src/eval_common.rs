@@ -768,7 +768,6 @@ mod prefill_whole_tests {
                     None,
                     None,
                     None,
-                    None,
                 )
                 .expect("forward_prefill_batch prefix");"#,
             // The scored region continues the prefix call as the ordinary prompt-fill capture.

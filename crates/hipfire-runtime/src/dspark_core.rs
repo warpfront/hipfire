@@ -1722,10 +1722,10 @@ impl MtpDrafter for DsparkDrafter {
     }
 
     // `supports_temp_verify()` stays the trait default (false): in the daemon it
-    // flags a ddtree-SWOR *temperature-only* verify. DSpark is NOT that — its
-    // sampled verify honors temp+top_p+top_k (fused `sample_top_p_pf`), i.e. it's
-    // the "chain" kind. Sampling capability is signaled by `requires_greedy()`
-    // ==false; returning true here would mislabel DSpark as SWOR and drop the
+    // flags a *temperature-only* verify. DSpark is NOT that — its sampled verify
+    // honors temp+top_p+top_k (fused `sample_top_p_pf`), i.e. it's the "chain"
+    // kind. Sampling capability is signaled by `requires_greedy()` ==false;
+    // returning true here would route DSpark as temperature-only and drop the
     // nucleus controls.
 
     fn configure_request(&mut self, cfg: SpecRequestConfig) {

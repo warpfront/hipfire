@@ -249,7 +249,6 @@ impl VlPlan {
 pub struct ChunkRoute {
     /// `BatchSemantics::Sequential` (false for independent lanes).
     pub sequential: bool,
-    pub tree_verify: bool,
     /// x_batch was filled by the caller (pre-embedded or non-first band).
     pub pre_embedded: bool,
     /// Inputs were uploaded by a captured-prefill caller.
@@ -270,8 +269,6 @@ impl ChunkRoute {
     pub fn refusal(&self) -> Option<&'static str> {
         if !self.sequential {
             Some("independent-lane batch")
-        } else if self.tree_verify {
-            Some("tree verify")
         } else if self.pre_embedded {
             Some("pre-embedded / non-first-band batch")
         } else if self.pre_uploaded {
@@ -849,13 +846,6 @@ mod tests {
                     ..ok
                 },
                 "independent-lane batch",
-            ),
-            (
-                ChunkRoute {
-                    tree_verify: true,
-                    ..ok
-                },
-                "tree verify",
             ),
             (
                 ChunkRoute {

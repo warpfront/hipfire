@@ -10,7 +10,7 @@
 
 ## 1. Scope and invariants
 
-This design is only for prompt prefill for LFM2.5 (`arch_id == 11`) on **gfx1201**. It does not change decode, DFlash, DDTree, MTP, serving semantics, PM4, non-LFM models, or any non-gfx1201 GPU. It does not invoke the coherence gate.
+This design is only for prompt prefill for LFM2.5 (`arch_id == 11`) on **gfx1201**. It does not change decode, DFlash, MTP, serving semantics, PM4, non-LFM models, or any non-gfx1201 GPU. It does not invoke the coherence gate.
 
 The new path MUST:
 

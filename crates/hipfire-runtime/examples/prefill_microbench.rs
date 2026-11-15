@@ -226,7 +226,7 @@ fn main() {
         dn_state.reset(gpu);
         let t0 = Instant::now();
         qwen35::forward_prefill_batch(
-            gpu, &weights, &config, tokens, 0, kv_cache, dn_state, &scratch, None, None, None, None,
+            gpu, &weights, &config, tokens, 0, kv_cache, dn_state, &scratch, None, None, None,
         )
         .expect("forward_prefill_batch");
         gpu.hip.device_synchronize().expect("sync");

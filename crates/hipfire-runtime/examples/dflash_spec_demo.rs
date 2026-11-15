@@ -468,26 +468,15 @@ fn main() {
                                                     // diagnostics; usually a net loss on content where DFlash is strong).
     let mut pld_min_consensus: usize = 2;
     let mut pld_min_chain: usize = 5; // conservative: below paper's 8 but still filters noise
-                                      // DDTree (Ringel & Romano 2026): tree-structured verification built from
-                                      // DFlash per-position draft marginals. Per-path DFS verify (no batched
-                                      // tree attention) — slower per cycle but correct on hybrid arch. Spike
-                                      // measurement: does τ improve with the tree structure?
-    let mut ddtree_enabled: bool = false;
-    let mut ddtree_budget: usize = 16; // paper uses 60; cheaper spike default
-    let mut ddtree_topk: usize = 8; // paper uses B-1 * budget_fanout; small k keeps tree shallow
-                                    // --ddtree-batched: use spec_step_ddtree_batched (single tree-attention
-                                    // forward) instead of the per-path DFS. Requires FA batched path (Q8 /
-                                    // fwht KV). Tree-exact on FA side, linear-replay on GDN.
-    let mut ddtree_batched: bool = false;
-    // ChatML wrapping: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n —
-    // matches how the daemon / infer_qwen35 call the instruction-tuned Qwen3.5.
-    // Default ON (2026-04-17): bare prompts send the model off-distribution.
-    // Empirically the draft's acceptance rate on raw Qwen3.5 creative prompts
-    // drops to τ<1.5 (vs τ≈5 with ChatML) — measured on 27B rivers-essay:
-    // bare gives 20 tok/s, ChatML gives 40 tok/s with identical target, draft,
-    // and kv_mode. The gap is the draft predicting a structured distribution
-    // vs a garbled one. Opt out via --no-chatml for the diagnostic
-    // "pure continuation" case.
+                                      // ChatML wrapping: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n —
+                                      // matches how the daemon / infer_qwen35 call the instruction-tuned Qwen3.5.
+                                      // Default ON (2026-04-17): bare prompts send the model off-distribution.
+                                      // Empirically the draft's acceptance rate on raw Qwen3.5 creative prompts
+                                      // drops to τ<1.5 (vs τ≈5 with ChatML) — measured on 27B rivers-essay:
+                                      // bare gives 20 tok/s, ChatML gives 40 tok/s with identical target, draft,
+                                      // and kv_mode. The gap is the draft predicting a structured distribution
+                                      // vs a garbled one. Opt out via --no-chatml for the diagnostic
+                                      // "pure continuation" case.
     let mut chatml: bool = true;
     // --ar-baseline: skip DFlash entirely, greedy-decode via target only.
     // Diagnostic for comparing DFlash outputs against pure-AR on the
@@ -630,23 +619,6 @@ fn main() {
             "--pld-min-chain" => {
                 pld_min_chain = args[i + 1].parse().unwrap();
                 i += 2;
-            }
-            "--ddtree" => {
-                ddtree_enabled = true;
-                i += 1;
-            }
-            "--ddtree-budget" => {
-                ddtree_budget = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--ddtree-topk" => {
-                ddtree_topk = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--ddtree-batched" => {
-                ddtree_batched = true;
-                ddtree_enabled = true; // implies --ddtree
-                i += 1;
             }
             "--chatml" => {
                 chatml = true;
@@ -795,10 +767,6 @@ fn main() {
         }
         if pld_enabled {
             eprintln!("--pld is not supported for Glimmer");
-            std::process::exit(1);
-        }
-        if ddtree_enabled || ddtree_batched {
-            eprintln!("--ddtree is not supported for Glimmer");
             std::process::exit(1);
         }
         if cactus_delta != 0.0 {
@@ -1621,10 +1589,6 @@ fn main() {
             eprintln!("--tp 2 rejects --pld");
             std::process::exit(1);
         }
-        if ddtree_enabled || ddtree_batched {
-            eprintln!("--tp 2 rejects --ddtree*");
-            std::process::exit(1);
-        }
         if ctx_slice.is_some() {
             eprintln!("--tp 2 rejects --ctx-slice");
             std::process::exit(1);
@@ -1895,40 +1859,21 @@ fn main() {
     .expect("alloc hidden_rb");
 
     let mut target_snap = DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("snap");
-    // DDTree needs a SECOND snapshot for the post-seed branch point (shared
-    // across all DFS paths in a cycle). Allocate unconditionally — a single
-    // DeltaNetSnapshot is cheap (~100 MB on 9B) and unused if --ddtree is off.
-    let mut post_seed_snap =
-        DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("post-seed snap");
     // GdnTape: per-LA-layer (q, k, v, α, β) innovation tape — sized for B
     // positions, allocated once and reused every spec step. Enables the
     // rollback path to replay GDN recurrence without re-running the target.
-    //
-    // Tree verify extends the block size: `1 + tree_budget` rows per forward
-    // (seed + tree nodes). Size max_n = max(block_size, 1 + tree_budget) so
-    // the tape is large enough whether we run per-path DFS, batched tree,
-    // or plain DFlash.
-    let tape_max_n = draft_scratch_b.max(1 + ddtree_budget);
+    let tape_max_n = draft_scratch_b;
     let mut gdn_tape = hipfire_arch_qwen35::speculative::GdnTape::new_for_dflash(
         &mut gpu,
         &target.config,
         tape_max_n,
     )
     .expect("alloc gdn tape");
-    // DdtreeScratch: persistent attention-bias buffer for batched tree verify.
-    // One allocation at startup (sized for max_budget), reused every cycle —
-    // avoids the per-cycle malloc+htod+free churn that dominated early wall-
-    // clock numbers. Also allocated for non-ddtree runs (cheap, small) so
-    // callers can switch strategies at runtime without reinit.
-    let ddtree_scratch =
-        hipfire_arch_qwen35::speculative::DdtreeScratch::new(&mut gpu, ddtree_budget)
-            .expect("alloc ddtree scratch");
     // VerifyScratch: persistent per-cycle tensors (final_hidden, logits,
-    // rotation scratch, argmax buf). Sized to max_n = max(block_size,
-    // 1 + ddtree_budget) to cover plain DFlash and DDTree. Drops ~8
+    // rotation scratch, argmax buf). Sized to the block. Drops ~8
     // hipMalloc/hipFree pairs per cycle (biggest is 16 MB logits buffer),
     // saving 0.5-1.5 ms/cycle.
-    let verify_max_n = draft_scratch_b.max(1 + ddtree_budget);
+    let verify_max_n = draft_scratch_b;
     let verify_scratch = hipfire_arch_qwen35::speculative::VerifyScratch::with_prefill(
         &mut gpu,
         verify_max_n,
@@ -1986,10 +1931,8 @@ fn main() {
         draft_scratch.reset_upload_tracking();
         // Hidden ring-buffer head/written counters (GPU buffers stay).
         hidden_rb.reset();
-        // Spec / DDTree thread-local diagnostic counters that already
-        // had reset paths.
+        // Spec thread-local diagnostic counters that already had reset paths.
         hipfire_arch_qwen35::speculative::reset_seed_oracle_stats();
-        hipfire_arch_qwen35::speculative::reset_ddtree_meta_stats();
         // Host-timing counters (only relevant when HIPFIRE_HOST_TIMING=1,
         // but the call is cheap and keeps the cumulative-vs-per-row
         // semantics right when the flag flips on mid-battery).
@@ -2266,37 +2209,6 @@ fn main() {
         let mut pld_hits: usize = 0;
         let mut pld_accepted: usize = 0;
 
-        if ddtree_enabled {
-            if temp > 0.0 && !ddtree_batched {
-                eprintln!(
-                    "WARNING: --ddtree (non-batched) with temp>0 falls back to greedy on \
-                the verify side. Use --ddtree-batched for distribution-preserving naive tree sampling."
-                );
-            }
-            if temp > 0.0 && ddtree_batched {
-                eprintln!(
-                    "temp>0 + --ddtree-batched: distribution-preserving naive tree sampling \
-                (sample target, accept drafted child it lands on)."
-                );
-            }
-            if pld_enabled {
-                eprintln!("WARNING: --pld is ignored when --ddtree is enabled.");
-            }
-            if ddtree_batched {
-                eprintln!(
-                "ddtree: enabled (budget={}, topk={}; BATCHED tree verify via FA tree-attention mask + GDN linear replay)",
-                ddtree_budget, ddtree_topk,
-            );
-            } else {
-                eprintln!(
-                "ddtree: enabled (budget={}, topk={}; per-path DFS verify, ~{}× DFlash per-cycle cost)",
-                ddtree_budget,
-                ddtree_topk,
-                ddtree_budget / (draft_cfg.block_size.saturating_sub(1).max(1)),
-            );
-            }
-        }
-
         // HIPFIRE_PROFILE=1: enable per-kernel profiling for `--profile-cycles N`
         // worth of cycles (default 5) starting at cycle 1 (after a warm-up cycle
         // 0 to settle the JIT). Prints kernel breakdown after the limit.
@@ -2424,7 +2336,7 @@ fn main() {
             }
         }
 
-        // (Seed-oracle + ddtree-meta counter resets moved to the per-row reset
+        // (Seed-oracle counter resets moved to the per-row reset
         // block at the top of the multi-prompt loop — see issue #173.)
 
         // Adaptive-B state: tracks current B between cycles, plus a cooldown
@@ -2617,84 +2529,36 @@ fn main() {
             if used_pld {
                 pld_hits += 1;
             }
-            let step = if ddtree_enabled {
-                if ddtree_batched {
-                    speculative::spec_step_ddtree_batched(
-                        &mut gpu,
-                        &mut target,
-                        &draft_weights,
-                        &draft_cfg,
-                        &mut draft_scratch,
-                        &mut hidden_rb,
-                        &mut target_hidden_host,
-                        &mut target_snap,
-                        &mut post_seed_snap,
-                        &mut gdn_tape,
-                        &ddtree_scratch,
-                        &verify_scratch,
-                        position,
-                        seed_token,
-                        ctx_slice,
-                        ddtree_budget,
-                        ddtree_topk,
-                        runtime_temp,
-                        &mut rng_state,
-                        None, // max_accept: uncapped demo
-                    )
-                    .expect("ddtree-batched spec step")
-                } else {
-                    speculative::spec_step_ddtree(
-                        &mut gpu,
-                        &mut target,
-                        &draft_weights,
-                        &draft_cfg,
-                        &mut draft_scratch,
-                        &mut hidden_rb,
-                        &mut target_hidden_host,
-                        &mut target_snap,
-                        &mut post_seed_snap,
-                        &mut gdn_tape,
-                        &verify_scratch,
-                        position,
-                        seed_token,
-                        ctx_slice,
-                        ddtree_budget,
-                        ddtree_topk,
-                    )
-                    .expect("ddtree spec step")
-                }
-            } else {
-                speculative::spec_step_dflash(
-                    &mut gpu,
-                    &mut target,
-                    &draft_weights,
-                    &draft_cfg,
-                    &mut draft_scratch,
-                    &mut hidden_rb,
-                    &mut target_hidden_host,
-                    &mut target_snap,
-                    &verify_scratch,
-                    position,
-                    seed_token,
-                    ctx_slice,
-                    if no_tape { None } else { Some(&mut gdn_tape) },
-                    runtime_temp,
-                    1.0_f32, // top_p: demo has no nucleus CLI; 1.0 = disabled (byte-path unchanged)
-                    0,       // top_k: demo has no top-k CLI; 0 = disabled
-                    &mut rng_state,
-                    block_override,
-                    ngram_cache.as_ref(),
-                    &emitted,
-                    cactus_delta,
-                    pld_spine,
-                    runtime_repeat_penalty,
-                    repeat_window,
-                    None, // max_accept: uncapped demo
-                    Some(&mut verify_pm4),
-                    None, // lookup: demo never splices verbatim-copy candidates
-                )
-                .expect("spec step")
-            };
+            let step = speculative::spec_step_dflash(
+                &mut gpu,
+                &mut target,
+                &draft_weights,
+                &draft_cfg,
+                &mut draft_scratch,
+                &mut hidden_rb,
+                &mut target_hidden_host,
+                &mut target_snap,
+                &verify_scratch,
+                position,
+                seed_token,
+                ctx_slice,
+                if no_tape { None } else { Some(&mut gdn_tape) },
+                runtime_temp,
+                1.0_f32, // top_p: demo has no nucleus CLI; 1.0 = disabled (byte-path unchanged)
+                0,       // top_k: demo has no top-k CLI; 0 = disabled
+                &mut rng_state,
+                block_override,
+                ngram_cache.as_ref(),
+                &emitted,
+                cactus_delta,
+                pld_spine,
+                runtime_repeat_penalty,
+                repeat_window,
+                None, // max_accept: uncapped demo
+                Some(&mut verify_pm4),
+                None, // lookup: demo never splices verbatim-copy candidates
+            )
+            .expect("spec step");
             if used_pld {
                 pld_accepted += step.accepted;
             }
@@ -2976,22 +2840,6 @@ fn main() {
             "histogram: {:?}",
             stats.acceptance_hist.iter().enumerate().collect::<Vec<_>>()
         );
-        // DDTree meta-verifier pruner stats — only meaningful under --ddtree-*
-        // with HIPFIRE_DDTREE_LOGW_CUTOFF set. Cycles == 0 on pure-DFlash runs.
-        let meta = hipfire_arch_qwen35::speculative::read_ddtree_meta_stats();
-        if meta.cycles > 0 {
-            let mean_nodes = meta.total_nodes as f32 / meta.cycles as f32;
-            eprintln!(
-                "ddtree-meta: cycles={} mean_nodes={:.2} min={} max={} (cutoff={:?})",
-                meta.cycles,
-                mean_nodes,
-                meta.min_nodes,
-                meta.max_nodes,
-                hipfire_config::active_or_local_process_config()
-                    .legacy_value("HIPFIRE_DDTREE_LOGW_CUTOFF")
-                    .unwrap_or_else(|| "off".to_string()),
-            );
-        }
         // Adaptive-B usage report — only meaningful when --adaptive-b is on.
         if adaptive_b && !adaptive_b_histogram.is_empty() {
             let mut buckets: Vec<(usize, u32)> =

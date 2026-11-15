@@ -136,7 +136,7 @@
 //!
 //! This costs nothing today because every shipped consumer is scale-invariant:
 //! greedy DFlash takes the argmax, and the sampled path
-//! (`hipfire_runtime::ddtree::naive_sample_chain`) accepts on `p_t(draft)` drawn
+//! (`hipfire_runtime::spec_sampling::naive_sample_chain`) accepts on `p_t(draft)` drawn
 //! from the TARGET's distribution. It matters if you write something that
 //! treats the drafter's softmax as a distribution. Speculative REJECTION
 //! sampling does exactly that, and it fails hard: drafts sampled from the flat

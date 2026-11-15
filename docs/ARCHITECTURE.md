@@ -186,7 +186,7 @@ The mesh is owned by the rank-0 `Qwen4Bundle` (`attach_ep_mesh`,
 threads, each with its own `Gpu`. It is **not** `LoadedModel.ep`, so a Qwen4 EP
 model still takes the ordinary `Qwen4Ar` / `Qwen4Spec` generation route rather
 than `generate_ep`. EP refuses what the replicated program does not run
-(DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter,
+(DFlash, DSpark, n-gram drafting, adaptive KV, an EAGLE drafter,
 an experts-per-token override, a non-Single compute placement; lane
 steps never run under EP), and native MTP attaches under EP only on an explicit
 `--spec mtp` (`qwen4_ep_option_refusal`, `qwen4_native_mtp`).

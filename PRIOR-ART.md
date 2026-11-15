@@ -190,7 +190,12 @@ behind that default flip). The 372 B/head footprint at asym3 vs
 
 ---
 
-## 7. DDTree-RDNA speculative decode
+## 7. DDTree-RDNA speculative decode (removed in 0.5.0)
+
+> DDTree tree verify was removed from the tree in 0.5.0 (research-only, off
+> by default, slower than the linear DFlash chain on every drafter measured).
+> This section is kept as provenance for the contribution; the files named
+> below exist only in git history at and before the 0.4.x line.
 
 | | |
 |---|---|
@@ -202,7 +207,7 @@ behind that default flip). The 372 B/head footprint at asym3 vs
 | Wire-up + Path C PRD                         | `f94ed073` (2026-04-28) — **Grégory D** ([@flamme-demon](https://github.com/flamme-demon)) co-originator on the wire-up + PRD |
 | Originator                                   | Kaden Schutt (algorithm + kernel side) |
 | Co-originator                                | Grégory D (wire-up, Path C PRD, RDNA3 validation w/ Lucebox/buun) |
-| Canonical files                              | `crates/hipfire-runtime/src/ddtree.rs`, `crates/hipfire-runtime/src/speculative.rs`, kernels with tree-attention bias |
+| Canonical files (history only)               | `crates/hipfire-runtime/src/ddtree.rs`, `crates/hipfire-runtime/src/speculative.rs`, kernels with tree-attention bias |
 
 A speculative-decode tree algorithm adapted from the DDTree paper
 (arXiv:2604.12989) and integrated with hipfire's flash-attention +

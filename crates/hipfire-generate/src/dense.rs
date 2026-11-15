@@ -5520,7 +5520,7 @@ pub fn generate_muse_glimmer(
                 let t_after_verify = t_window.elapsed();
                 // Accept via shared variables — sampled reuses the same emit/keep_rows/rollback code.
                 let (accept, bonus) = if spec_mode == GlimmerSpecMode::ChainSampled {
-                    hipfire_runtime::ddtree::naive_sample_chain(
+                    hipfire_runtime::spec_sampling::naive_sample_chain(
                         &logits_buf,
                         &drafts,
                         bundle.config.vocab_size,

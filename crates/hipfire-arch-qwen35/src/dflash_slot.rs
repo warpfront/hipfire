@@ -27,7 +27,7 @@
 //!   captured into shared staging by [`crate::forward_slots::SpecVerifyCapture`]
 //!   during the forward and scattered into the slot's interleaved
 //!   `target_hidden` after accept;
-//! * no DDTree, no PLD spine, no CACTUS, no ngram-block, no repeat-penalty —
+//! * no PLD spine, no CACTUS, no ngram-block, no repeat-penalty —
 //!   the slot path is the DFlash2 selector chain only (the only draft shape
 //!   admitted by [`load_dflash_shared`]);
 //! * greedy verify only (temp==0 admission is enforced by the caller, the
@@ -174,7 +174,7 @@ impl DflashSlotDraft {
 
 /// Load the shared DFlash2 draft state for the slot engine. Mirrors
 /// `load_dflash_state` (dflash_spec.rs) minus the sequential-only pieces
-/// (hidden ring, DDTree, PM4 tape, verify prefill scratch).
+/// (hidden ring, PM4 tape, verify prefill scratch).
 ///
 /// `requested_ctx` is the engine's per-slot token capacity (`cap_tokens`).
 /// `max_batch` sizes the shared hidden staging (one step's rows).

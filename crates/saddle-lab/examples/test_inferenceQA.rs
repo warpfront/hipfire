@@ -753,7 +753,6 @@ fn prefill_batch_matches_sequential(ctx: &mut Context) -> CaseOutcome {
                     None,
                     None,
                     None,
-                    None,
                 )
                 .map_err(|e: hip_bridge::HipError| e.to_string())?;
                 let batch_logits = ctx

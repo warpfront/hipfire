@@ -450,7 +450,6 @@ fn main() {
             None, // hidden_rb (not needed — MTP demo doesn't use ring buffer)
             None, // per_token_hidden_out (not needed for MTP seed)
             None, // gdn_tape
-            None, // tree_verify
         )
         .expect("prefill forward_prefill_batch");
     }

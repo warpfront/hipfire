@@ -9,9 +9,8 @@
 //! through `impl SpecTarget for LlamaBundle` (in `hipfire-arch-llama`).
 
 use crate::llama::{
-    argmax, forward_prefill_batch_capture, forward_prefill_batch_tree, forward_scratch_embed,
-    is_batchable_la, weight_gemv, ForwardScratch, HiddenCaptureSink, KvCache, LlamaConfig,
-    LlamaWeights, PrefillBatchScratch,
+    argmax, forward_prefill_batch_capture, forward_scratch_embed, is_batchable_la, weight_gemv,
+    ForwardScratch, HiddenCaptureSink, KvCache, LlamaConfig, LlamaWeights, PrefillBatchScratch,
 };
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -223,87 +222,6 @@ pub fn verify_block_sampled_capture_gpu(
     let _ = gpu.free_tensor(result_buf);
     let _ = gpu.free_tensor(repeat_buf);
     Ok((out?.argmax, captured))
-}
-
-/// One single-pass TREE-masked verify, returning the FULL per-node target
-/// logits (`tokens.len() × vocab_size`, row-major).
-///
-/// `tokens` is the linearized DDTree (slot 0 = seed token, slots `1..` =
-/// `tree.nodes`), `mask_host` is the `[n × n]` row-major additive
-/// (`0.0`/`-inf`) tree-attention bias, and `depth_positions` the per-slot DEPTH
-/// RoPE positions (`position + node.depth`) — all from
-/// [`crate::ddtree::linearize_tree_with_parents`]. The whole tree is verified in
-/// ONE batched forward: Q/K RoPE rotates at the DEPTH positions (parent→child
-/// distance 1) while the KV write + mask stay on contiguous slots, so a node's
-/// logits equal a causal verify of that node's root-to-node chain (greedy-
-/// LOSSLESS). `capture` collects the per-extract-layer residual rows for DFlash
-/// hidden conditioning. The mask is uploaded into a scratch GPU tensor
-/// allocated + freed within the call.
-#[allow(clippy::too_many_arguments)]
-pub fn verify_tree_logits(
-    gpu: &mut Gpu,
-    weights: &LlamaWeights,
-    config: &LlamaConfig,
-    tokens: &[u32],
-    mask_host: &[f32],
-    depth_positions: &[i32],
-    position: usize,
-    kv_cache: &mut KvCache,
-    scratch: &ForwardScratch,
-    pbs: &PrefillBatchScratch,
-    capture: Option<&mut HiddenCaptureSink>,
-) -> HipResult<Vec<f32>> {
-    let n = tokens.len();
-    let dim = config.dim;
-    let vocab = config.vocab_size;
-    assert_eq!(
-        mask_host.len(),
-        n * n,
-        "verify_tree_logits: mask_host len {} != n*n ({}*{})",
-        mask_host.len(),
-        n,
-        n
-    );
-
-    // Upload the [n × n] additive mask into a scratch GPU tensor.
-    let bias = gpu.alloc_tensor(&[n * n], rdna_compute::DType::F32)?;
-    let mask_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(mask_host.as_ptr() as *const u8, mask_host.len() * 4) };
-    gpu.hip.memcpy_htod(&bias.buf, mask_bytes)?;
-
-    // ONE tree-masked batched forward → every node's hidden lands in pbs.x_batch.
-    let fwd = forward_prefill_batch_tree(
-        gpu,
-        weights,
-        config,
-        tokens,
-        position,
-        &bias,
-        depth_positions,
-        kv_cache,
-        scratch,
-        pbs,
-        capture,
-    );
-    let _ = gpu.free_tensor(bias);
-    fwd?;
-
-    // Per-node rmsnorm + lm_head over the n hidden rows in pbs.x_batch.
-    let mut logits_out: Vec<f32> = Vec::with_capacity(n * vocab);
-    for i in 0..n {
-        let off_bytes = i * dim * 4;
-        gpu.hip
-            .memcpy_dtod_at(&scratch.x.buf, 0, &pbs.x_batch.buf, off_bytes, dim * 4)?;
-        gpu.rmsnorm_f32(
-            &scratch.x,
-            &weights.output_norm,
-            &scratch.tmp,
-            config.norm_eps,
-        )?;
-        weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
-        logits_out.extend_from_slice(&gpu.download_f32(&scratch.logits)?);
-    }
-    Ok(logits_out)
 }
 
 /// Output of the shared verify forward: per-position pick (argmax, or a sampled

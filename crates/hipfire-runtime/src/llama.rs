@@ -2244,42 +2244,6 @@ pub struct HiddenCaptureSink<'a> {
     pub hidden_gpu: Option<&'a GpuTensor>,
 }
 
-/// Tree-attention mask reference for a single batched verify forward
-/// ([`forward_prefill_batch_tree`]).
-///
-/// When supplied, the batched flash-attention kernels run in tree mode: keys in
-/// the in-block region `[block_start, block_start + block_cols)` are biased by
-/// `bias[row × block_cols + (key_slot − block_start)]` (an additive
-/// `0.0`/`-inf` mask), while prompt keys before `block_start` stay fully
-/// visible. `block_start` is the absolute decode position the block begins at;
-/// `block_cols` equals the linearized tree length (`1 + tree.num_nodes()`).
-///
-/// The KV WRITE slot and the FA mask alignment stay CONTIGUOUS
-/// (`[block_start .. block_start + n)`), so siblings never collide on the same
-/// cache slot; but Q/K RoPE uses the tree-DEPTH positions
-/// (`block_start + node.depth`, see `rope_positions` below), so a parent→child
-/// RoPE distance is exactly 1 regardless of linearized slot. Decoupling the two
-/// is what kills the "linearization-slot RoPE phase skew" on bushy trees while
-/// avoiding the duplicate-KV-slot hazard of depth-based write slots.
-pub struct TreeMaskRef<'a> {
-    /// `[block_cols × block_cols]` row-major additive bias (0/-inf), on device.
-    pub bias: &'a GpuTensor,
-    /// Absolute decode position where the in-block keys begin (= `position`).
-    pub block_start: usize,
-    /// In-block key count (= linearized tree length `1 + tree.num_nodes()`).
-    pub block_cols: usize,
-    /// Per-slot DEPTH-based RoPE positions (`block_start + node.depth`), on
-    /// device as `[block_cols]` i32-in-F32. Used for the Q/K RoPE rotation ONLY —
-    /// the KV WRITE slot and the FA mask alignment stay CONTIGUOUS (`pbs.positions
-    /// = block_start + slot_index`), so siblings never collide on the same cache
-    /// slot. Decoupling RoPE-position from write-slot is what makes the bushy-tree
-    /// verify greedy-LOSSLESS: a node and its parent get RoPE distance == their
-    /// depth difference (1 for parent→child), matching the committed chain's
-    /// phases. With contiguous-slot RoPE (slot ≠ depth in heap-pop order) the
-    /// Q·K phase skews and a dense greedy target flips its argmax off AR.
-    pub rope_positions: &'a GpuTensor,
-}
-
 /// Process `tokens` through the model with one batched forward, advancing
 /// `kv_cache` by `tokens.len()` positions and writing the *last* token's
 /// logits into `scratch.logits`.
@@ -2392,7 +2356,6 @@ pub fn forward_prefill_batch_capture(
             pbs,
             capture.as_deref_mut(),
             false,
-            None,
         )?;
         offset += chunk_n;
     }
@@ -2415,105 +2378,6 @@ pub fn forward_prefill_batch_capture(
         p.free_gpu(gpu);
     }
     Ok(())
-}
-
-/// One tree-masked batched verify forward over a linearized DDTree.
-///
-/// `tokens` is the `1 + tree.num_nodes()` linearized node sequence (slot 0 =
-/// seed); `tree_bias` is the `[n × n]` row-major additive mask, and
-/// `depth_positions` the per-slot DEPTH RoPE positions (`position + node.depth`),
-/// both from [`crate::ddtree::linearize_tree_with_parents`]. A single batched
-/// forward runs with Q/K RoPE at the DEPTH positions (so parent→child distance is
-/// 1, making the bushy-tree verify greedy-lossless) while the KV WRITE and the
-/// `tree_bias` mask stay on CONTIGUOUS slots `[position .. position + n)` (no
-/// sibling write collision). The masked attention applies `tree_bias` over the
-/// in-block keys (prompt fully visible), and every node row's post-final-layer
-/// hidden lands in `pbs.x_batch`. `capture` (when `Some`) collects the
-/// per-extract-layer residual rows for DFlash conditioning.
-///
-/// Single chunk only: `n <= pbs.max_batch` (a tree never exceeds the speculation
-/// window). Requires Q8_0 KV (the canonical DFlash config): the rotated-K FA
-/// re-rotates K in-kernel by the WRITE slot, which conflicts with the decoupled
-/// depth-RoPE — so it is rejected here rather than silently skewed.
-#[allow(clippy::too_many_arguments)]
-pub fn forward_prefill_batch_tree(
-    gpu: &mut Gpu,
-    weights: &LlamaWeights,
-    config: &LlamaConfig,
-    tokens: &[u32],
-    position: usize,
-    tree_bias: &GpuTensor,
-    depth_positions: &[i32],
-    kv_cache: &mut KvCache,
-    scratch: &ForwardScratch,
-    pbs: &PrefillBatchScratch,
-    capture: Option<&mut HiddenCaptureSink>,
-) -> HipResult<()> {
-    let n = tokens.len();
-    if n == 0 {
-        return Ok(());
-    }
-    assert!(
-        n <= pbs.max_batch,
-        "forward_prefill_batch_tree: tree size {n} exceeds pbs.max_batch {}",
-        pbs.max_batch
-    );
-    assert_eq!(
-        depth_positions.len(),
-        n,
-        "forward_prefill_batch_tree: depth_positions len {} != tree size {n}",
-        depth_positions.len()
-    );
-
-    let arch = gpu.arch.as_str();
-    assert!(
-        kv_cache.quant_q8,
-        "forward_prefill_batch_tree requires Q8_0 KV (decoupled depth-RoPE is \
-         incompatible with the rotated-K in-kernel re-rotation)"
-    );
-    let weights_ok = weights.layers.iter().all(|l| {
-        is_batchable_la(l.wq.gpu_dtype, arch)
-            && is_batchable_la(l.wk.gpu_dtype, arch)
-            && is_batchable_la(l.wv.gpu_dtype, arch)
-            && is_batchable_la(l.wo.gpu_dtype, arch)
-            && is_batchable_la(l.w_gate.gpu_dtype, arch)
-            && is_batchable_la(l.w_up.gpu_dtype, arch)
-            && is_batchable_la(l.w_down.gpu_dtype, arch)
-    });
-    assert!(
-        crate::config::get().prefill_batched && weights_ok,
-        "forward_prefill_batch_tree requires the batched path (prefill_batched, \
-         batchable weights): weights_ok={weights_ok}"
-    );
-
-    // Upload the depth-based RoPE positions into a scratch device buffer (i32
-    // bits in an F32 tensor, matching pbs.positions' slot-cosmetic dtype).
-    let rope_pos = gpu.alloc_tensor(&[n], rdna_compute::DType::F32)?;
-    let rope_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(depth_positions.as_ptr() as *const u8, n * 4) };
-    gpu.hip.memcpy_htod(&rope_pos.buf, rope_bytes)?;
-
-    let tm = TreeMaskRef {
-        bias: tree_bias,
-        block_start: position,
-        block_cols: n,
-        rope_positions: &rope_pos,
-    };
-    let r = forward_prefill_chunk(
-        gpu,
-        weights,
-        config,
-        tokens,
-        position,
-        kv_cache,
-        scratch,
-        pbs,
-        capture,
-        false,
-        Some(&tm),
-    );
-    let _ = gpu.free_tensor(rope_pos);
-    r
 }
 
 /// Single-chunk capture-friendly entry. The caller must have already
@@ -2573,7 +2437,7 @@ pub fn forward_prefill_batch_chunk_captured(
     // per-position malloc/memcpy), so no cap-based gate is needed.
 
     forward_prefill_chunk(
-        gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, None, true, None,
+        gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, None, true,
     )
 }
 
@@ -2582,13 +2446,11 @@ fn q8_prefill_family_eligible(
     gpu_arch: &str,
     model_arch: ModelArch,
     quant_q8: bool,
-    is_tree: bool,
     batch_size: usize,
 ) -> bool {
     model_arch == ModelArch::Qwen3
         && (gpu_arch.starts_with("gfx11") || gpu_arch == "gfx1201")
         && quant_q8
-        && !is_tree
         && batch_size > 1
 }
 
@@ -2604,18 +2466,10 @@ fn forward_prefill_chunk(
     pbs: &PrefillBatchScratch,
     mut capture: Option<&mut HiddenCaptureSink>,
     pre_uploaded: bool,
-    tree_mask: Option<&TreeMaskRef>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
-    if let Some(tm) = tree_mask {
-        assert_eq!(
-            tm.block_cols, n,
-            "tree_mask.block_cols {} must equal chunk size {n}",
-            tm.block_cols
-        );
-    }
 
     // DFlash hidden capture: collect this chunk's per-extract-layer residual
     // rows (`[n × dim]` each, in `extract_layers` order) into host buffers as
@@ -2712,13 +2566,8 @@ fn forward_prefill_chunk(
     } else {
         start_pos + n
     };
-    let q8_family_eligible = q8_prefill_family_eligible(
-        &gpu.arch,
-        config.arch,
-        kv_cache.quant_q8,
-        tree_mask.is_some(),
-        n,
-    );
+    let q8_family_eligible =
+        q8_prefill_family_eligible(&gpu.arch, config.arch, kv_cache.quant_q8, n);
     let q8_attn_ctx = q8_family_eligible.then(|| DispatchCtx::new(gpu));
 
     // 2. Per-layer loop.
@@ -2920,17 +2769,11 @@ fn forward_prefill_chunk(
         }
 
         // Batched full RoPE (non-interleaved, half-split convention —
-        // matches forward_scratch's rope_f32). In tree mode the rotation uses
-        // DEPTH positions (parent→child distance 1) while the KV write below
-        // stays on the CONTIGUOUS `pbs.positions` slots — see TreeMaskRef docs.
-        let rope_pos = match tree_mask {
-            Some(tm) => tm.rope_positions,
-            None => &pbs.positions,
-        };
+        // matches forward_scratch's rope_f32).
         gpu.rope_batched_scaled_f32(
             &pbs.fa_q_batch,
             &pbs.fa_k_batch,
-            rope_pos,
+            &pbs.positions,
             config.n_heads,
             config.n_kv_heads,
             config.head_dim,
@@ -2965,19 +2808,13 @@ fn forward_prefill_chunk(
             // family treats batch_size=1 as decode and expects decode params.
         }
 
-        // Batched flash attention (causal, or tree-masked when `tree_mask` is
-        // Some). The masked kernels add `tree_mask.bias` over the in-block keys
-        // and leave the prompt fully visible; passing `None` is plain causal.
+        // Batched causal flash attention.
         const LDS_CTX_LIMIT: usize = 15000;
-        let (tree_bias, tree_block_start, tree_block_cols) = match tree_mask {
-            Some(tm) => (Some(tm.bias), tm.block_start, tm.block_cols),
-            None => (None, 0usize, 0usize),
-        };
         if q8_family_eligible {
             debug_assert!(kv_cache.quant_q8);
             // Ordinary causal Q8 prefill now shares the same paired dispatch
             // used by Qwen3.5, enabling the existing gfx11/gfx1201 M16 kernel.
-            // Tree verify and singleton tails remain on their legacy paths.
+            // Singleton tails remain on their legacy paths.
             let plan = KvTierPlan::derive(KvTierInputs {
                 pos: start_pos,
                 capture_mode: gpu.graphs.capture_mode,
@@ -3017,16 +2854,6 @@ fn forward_prefill_chunk(
                 .run_attention(q8_attn_ctx.as_ref().unwrap(), gpu, &plan, &io)
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         } else if max_ctx_len > LDS_CTX_LIMIT {
-            // Tree-masked verify is not yet validated in the long-context Q8
-            // regime (ctx > LDS_CTX_LIMIT). The batched-masked kernel below DOES
-            // accept a tree-bias arg, but the dense DFlash tree-verify path was
-            // only exercised at normal context, so we keep it guarded off here
-            // and pass `None`; wiring `tree_bias` in is a validated follow-up.
-            assert!(
-                tree_mask.is_none(),
-                "tree-masked verify is not yet validated on the long-context Q8 \
-                 path (ctx {max_ctx_len} > {LDS_CTX_LIMIT})."
-            );
             // Long-context Q8: tiled batched flash (O(1) LDS, capture-safe).
             // Replaces the former per-position malloc+memcpy loop now that
             // `attention_flash_q8_0_batched_masked` (the >8192 crossover kernel)
@@ -3061,9 +2888,9 @@ fn forward_prefill_chunk(
                 kv_cache.physical_cap,
                 max_ctx_len,
                 n,
-                tree_bias,
-                tree_block_start,
-                tree_block_cols,
+                None,
+                0,
+                0,
             )?;
         }
 
@@ -8469,16 +8296,14 @@ mod tests {
 
     #[test]
     fn q8_prefill_family_stays_inside_validated_qwen3_arch_envelope() {
-        let eligible =
-            |arch, model, q8, tree, batch| q8_prefill_family_eligible(arch, model, q8, tree, batch);
-        assert!(eligible("gfx1100", ModelArch::Qwen3, true, false, 256));
-        assert!(eligible("gfx1201", ModelArch::Qwen3, true, false, 2));
-        assert!(!eligible("gfx1030", ModelArch::Qwen3, true, false, 256));
-        assert!(!eligible("gfx1200", ModelArch::Qwen3, true, false, 256));
-        assert!(!eligible("gfx1100", ModelArch::Llama, true, false, 256));
-        assert!(!eligible("gfx1100", ModelArch::Qwen3, true, true, 256));
-        assert!(!eligible("gfx1100", ModelArch::Qwen3, true, false, 1));
-        assert!(!eligible("gfx1100", ModelArch::Qwen3, false, false, 256));
+        let eligible = |arch, model, q8, batch| q8_prefill_family_eligible(arch, model, q8, batch);
+        assert!(eligible("gfx1100", ModelArch::Qwen3, true, 256));
+        assert!(eligible("gfx1201", ModelArch::Qwen3, true, 2));
+        assert!(!eligible("gfx1030", ModelArch::Qwen3, true, 256));
+        assert!(!eligible("gfx1200", ModelArch::Qwen3, true, 256));
+        assert!(!eligible("gfx1100", ModelArch::Llama, true, 256));
+        assert!(!eligible("gfx1100", ModelArch::Qwen3, true, 1));
+        assert!(!eligible("gfx1100", ModelArch::Qwen3, false, 256));
     }
 
     #[test]

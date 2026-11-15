@@ -629,21 +629,6 @@ fn qwen4_use_range_payload(
     is_uma || residency.is_external()
 }
 
-const QWEN4_DDTREE_DEFAULT_BUDGET: usize = 0;
-const QWEN4_DDTREE_DEFAULT_TOPK: usize = 4;
-
-/// Return whether a Qwen4 load carries an active or non-default DDTree
-/// request. The CLI resolves schema defaults before serializing load params,
-/// so an ordinary AR load arrives as `Some(0)`/`Some(4)` rather than `None`.
-/// A non-default top-K remains unsupported even when the budget is zero.
-pub(crate) const fn qwen4_ddtree_requested(spec: SpecLoadCfg) -> bool {
-    match (spec.ddtree_budget, spec.ddtree_topk) {
-        (Some(budget), _) if budget != QWEN4_DDTREE_DEFAULT_BUDGET => true,
-        (_, Some(topk)) if topk != QWEN4_DDTREE_DEFAULT_TOPK => true,
-        _ => false,
-    }
-}
-
 pub struct Qwen4Carrier;
 
 impl Carrier for Qwen4Carrier {
@@ -745,7 +730,6 @@ impl Carrier for Qwen4Carrier {
                 spec.ngram_draft.is_some_and(|enabled| enabled),
                 "n-gram draft (speculation.ngram_draft)",
             ),
-            (qwen4_ddtree_requested(spec), "DDTree"),
             (options.non_single_compute, "non-single compute placement"),
             (options.expert_count_override, "expert-count override"),
         ]
@@ -1145,7 +1129,7 @@ impl Carrier for Qwen4Carrier {
 }
 
 /// Expert parallelism refuses what the replicated single-device program does
-/// not run: DFlash, DSpark, n-gram drafting, DDTree, drafters and the other
+/// not run: DFlash, DSpark, n-gram drafting, drafters and the other
 /// single-device-only load options. Native MTP (`--spec mtp`) is admitted: the
 /// drafter is replicated on every rank. Names EP and the escape hatches.
 /// `ep <= 1` never refuses (the single-device caps are unchanged).
@@ -1162,7 +1146,6 @@ pub(crate) fn qwen4_ep_option_refusal(
         (draft_path.is_some() || spec.dflash == Some(true), "DFlash"),
         (spec.dspark == Some(true), "DSpark"),
         (spec.ngram_draft == Some(true), "n-gram drafting"),
-        (qwen4_ddtree_requested(spec), "DDTree"),
         (options.kv_adaptive, "adaptive KV"),
         (options.eagle_drafter, "an EAGLE drafter"),
         (
@@ -11498,7 +11481,7 @@ impl Carrier for Qwen35Carrier {
         let kv = &mut b.kv_cache;
         let dn = &mut b.dn_state;
         match hipfire_arch_qwen35::qwen35::forward_prefill_batch(
-            gpu, weights, config, synthetic, 0, kv, dn, scratch, None, None, None, None,
+            gpu, weights, config, synthetic, 0, kv, dn, scratch, None, None, None,
         ) {
             Ok(()) => Some(true),
             Err(e) => {
@@ -11526,7 +11509,6 @@ impl Carrier for Qwen35Carrier {
                 &mut b.kv_cache,
                 &mut b.dn_state,
                 &b.scratch,
-                None,
                 None,
                 None,
                 None,
@@ -11865,7 +11847,6 @@ impl Carrier for Qwen35Carrier {
             &mut b.kv_cache,
             &mut b.dn_state,
             &b.scratch,
-            None,
             None,
             None,
             None,
@@ -14519,8 +14500,6 @@ mod qwen4_admission_tests {
             dflash: Some(false),
             dspark: Some(false),
             ngram_draft: Some(false),
-            ddtree_budget: Some(0),
-            ddtree_topk: Some(4),
             mtp: Some(false),
             ..SpecLoadCfg::default()
         }
@@ -14648,7 +14627,6 @@ mod qwen4_admission_tests {
             ("DFlash", Some("draft.hfq"), defaults),
             ("DSpark", None, with_spec(&|s| s.dspark = Some(true))),
             ("n-gram", None, with_spec(&|s| s.ngram_draft = Some(true))),
-            ("DDTree", None, with_spec(&|s| s.ddtree_budget = Some(8))),
             (
                 "adaptive KV",
                 None,

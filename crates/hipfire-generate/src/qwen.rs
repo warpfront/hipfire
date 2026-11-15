@@ -3325,12 +3325,12 @@ pub fn generate_dflash(
     temp: f32,
     // Nucleus (top_p) cutoff for the chain rejection-sampling path, applied
     // IDENTICALLY to both draft + target softmaxes (lossless == AR at this top_p).
-    // 1.0 (>= 0.999) disables it. Ignored by the ddtree SWOR arm.
+    // 1.0 (>= 0.999) disables it.
     top_p: f32,
     // Request top-k as sent (request/card recipe, e.g. qwen3.6 top_k=20).
     // Chain sampled verify cuts both draft + target softmax rows at it (absent
     // and 0 disable); sampled Qwen4 MTP resolves it as the AR sampler does
-    // (absent = 20, 0 = 64). Ignored by the ddtree SWOR arm.
+    // (absent = 20, 0 = 64).
     top_k: Option<u32>,
     // Min-p floor. 0.0 disables. Installed on SpecRequestConfig for MTP;
     // DFlash route selection still sends min_p requests to AR.
@@ -4367,10 +4367,12 @@ pub fn generate_spec(
     max_tokens: usize,
     emit_req: SpecEmitRequest,
     // Request sampling temperature. >0 only reaches here for speculators that
-    // report `supports_temp_verify()` (qwen35 DFlash ddtree → SWOR, sampled
-    // MTP) or that sample inside their own verify (Gemma4 EAGLE, configured
-    // through `configure_request`); greedy drafters ignore it. The daemon's
-    // routing gate enforces that invariant.
+    // report `supports_temp_verify()` (DFlash2 selector chain, target-generic
+    // DFlash chain, sampled MTP), that sample through the chain route
+    // (`requires_greedy() == false`: the qwen35 DFlash chain rejection
+    // sampler) or that sample inside their own verify (Gemma4 EAGLE,
+    // configured through `configure_request`); greedy drafters ignore it. The
+    // daemon's routing gate enforces that invariant.
     temp: f32,
 ) -> Option<SpecRun> {
     // Zero-budget reject: no first token, no prefill/GPU/state/client mutation.
@@ -4947,9 +4949,9 @@ pub fn generate_spec(
         }
     }
 
-    // (The DFlash RNG cell and the chain-vs-tree resolution that used to live
-    // here are now resolved once at build time and
-    // owned inside the speculator — see `build_dflash_speculator`.)
+    // (The DFlash RNG cell that used to live here is now resolved once at
+    // build time and owned inside the speculator — see
+    // `build_dflash_speculator`.)
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
@@ -5239,7 +5241,7 @@ pub fn generate_spec(
             break;
         }
 
-        // One acceptance window. The speculator owns chain-vs-tree dispatch
+        // One acceptance window. The speculator owns its verify dispatch
         // internally; the daemon just hands it the borrowed target and
         // the prior committed tokens (drafter repeat / n-gram context). The
         // in-step grammar mask comes from the emitter: qwen35 returns `None`

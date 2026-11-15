@@ -27,7 +27,7 @@
 //!      `[0..pos+1)`.
 //! ```
 //!
-//! Greedy-only (temp=0). No DDTree, no PLD, no rejection sampling — that's
+//! Greedy-only (temp=0). No PLD, no rejection sampling — that's
 //! Task 11 territory.
 
 use crate::mtp_head::{
@@ -1077,7 +1077,7 @@ impl MtpSpecState {
             + PENALTY_REPEAT_CAP + rows // mtp_sample_repeat_buf
             + 1 + 1 + 2 * max_n // gather idx/prob draft + verify
             + cvs.map_or(0, |c| max_n * c); // mtp_lm_logits_compressed
-        let pbs = PrefillBatchScratch::projected_allocation_bytes(config, rows, true)
+        let pbs = PrefillBatchScratch::projected_allocation_bytes(config, rows)
             .map_err(|e| format!("MTP trunk PBS sizing: {e}"))?;
         let pbs = usize::try_from(pbs).map_err(|_| "MTP trunk PBS sizing overflow".to_string())?;
         Ok(f32_elems * 4
@@ -2539,7 +2539,6 @@ fn mtp_accept_and_rollback(
                         None,
                         None,
                         None,
-                        None,
                     )
                 })?;
                 dn_state.seal_streams(gpu, cur_pos + advance)?;
@@ -2661,7 +2660,6 @@ fn mtp_verify_forward_graphed(
             None,
             Some(&state.verify_hidden),
             Some(&mut state.trunk_gdn_tape),
-            None,
             Some(&state.trunk_pbs),
             None,
             None,
@@ -2726,7 +2724,6 @@ fn mtp_verify_forward_graphed(
             None,
             Some(&state.verify_hidden),
             Some(&mut state.trunk_gdn_tape),
-            None,
             false,
             qwen35::DflashFusionCtx::Off,
         )?;
@@ -2884,7 +2881,6 @@ fn mtp_shared_verify_accept_rollback_inner(
             None,
             Some(&state.verify_hidden),
             verify_tape,
-            None,
             Some(&state.trunk_pbs),
             None,
             None,
@@ -3563,7 +3559,7 @@ mod lazy_state_bytes_tests {
             + 2 * max_n;
         let expect = small * 4
             + snap
-            + PrefillBatchScratch::projected_allocation_bytes(&c, rows, true).unwrap() as usize
+            + PrefillBatchScratch::projected_allocation_bytes(&c, rows).unwrap() as usize
             + GdnTape::requested_bytes(&c, rows, true)
             + Qwen35MtpHeadScratch::requested_bytes("gfx1100", &h, None)
             + Qwen35MtpHeadKvCache::q8_requested_bytes(&h);
@@ -3893,7 +3889,6 @@ where
                     &target.scratch,
                     None,
                     Some(&chunk_hidden),
-                    None,
                     None,
                 )?,
             }
@@ -4283,7 +4278,6 @@ pub fn spec_step_mtp(
         None, // hidden_rb: not used here (DFlash drafter not in the loop)
         Some(&state.verify_hidden),
         verify_tape,
-        None, // tree_verify
         Some(&state.trunk_pbs),
         None,  // mask_override
         None,  // max_layer
@@ -4445,7 +4439,6 @@ pub fn spec_step_mtp(
                     &mut target.kv_cache,
                     &mut target.dn_state,
                     &target.scratch,
-                    None,
                     None,
                     None,
                     None,
@@ -4674,7 +4667,6 @@ pub fn spec_step_mtp_compressed(
         None,
         Some(&state.verify_hidden),
         None,
-        None,
         Some(&state.trunk_pbs),
         None,  // mask_override
         None,  // max_layer
@@ -4757,7 +4749,6 @@ pub fn spec_step_mtp_compressed(
                 &mut target.kv_cache,
                 &mut target.dn_state,
                 &target.scratch,
-                None,
                 None,
                 None,
                 None,

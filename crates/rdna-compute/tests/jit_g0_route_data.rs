@@ -205,7 +205,7 @@ fn headers_are_quant_and_shape_specific_not_mixed_trace_defaults() {
         for e in m["default_entries"].as_array().unwrap() {
             let module = e["module"].as_str().unwrap();
             assert!(!module.starts_with("dflash_") || module == "dflash_state_bulk_copy_gfx1100");
-            assert!(!module.contains("ddtree") && !module.contains("dspark"));
+            assert!(!module.contains("dspark"));
             if family == "27b-xts" {
                 assert!(!module.contains("moe"));
             }

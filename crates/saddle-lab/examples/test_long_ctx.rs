@@ -230,7 +230,6 @@ it?"
             None,
             None,
             None,
-            None,
         )
         .expect("prefill");
         let prefill_ms = t_pf.elapsed().as_secs_f64() * 1000.0;

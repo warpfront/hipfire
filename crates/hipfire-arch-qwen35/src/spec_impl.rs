@@ -193,7 +193,6 @@ impl SpecTarget for ModelSlot {
                 None,
                 None,
                 None,
-                None,
             )
             .map_err(|e| e.to_string())?;
             pos += end - off;
@@ -370,7 +369,6 @@ impl SpecTarget for ModelSlot {
             &mut self.kv_cache,
             &mut self.dn_state,
             &self.scratch,
-            None,
             None,
             None,
             None,
@@ -621,7 +619,6 @@ impl SpecTarget for ModelSlot {
             &mut self.dn_state,
             &self.scratch,
             Some(&mut ring),
-            None,
             None,
             None,
         )

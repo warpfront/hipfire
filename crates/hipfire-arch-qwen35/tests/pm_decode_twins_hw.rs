@@ -278,7 +278,6 @@ fn capture_w1_decode_inputs() {
         } = &mut slot;
         qwen35::forward_prefill_batch(
             &mut gpu, weights, config, &prompt, 0, kv_cache, dn_state, scratch, None, None, None,
-            None,
         )
         .expect("prefill");
         qwen35::forward_scratch(
