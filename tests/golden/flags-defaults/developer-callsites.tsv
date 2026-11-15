@@ -731,6 +731,7 @@ developer_callsite	*	HIPFIRE_QWEN4_QSA_LANES_FUSE#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_NORM_EPI#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_POOLED_BF16#developer_bool=true
+developer_callsite	*	HIPFIRE_QWEN4_QSA_Q8_GATHER_GFX1201#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SCORE_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SCORE_ROWS32#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SELECT_EXACT#developer_bool=false
