@@ -4145,6 +4145,7 @@ pub fn generate_lfm2_vl(
         "tokens": generated_count,
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
+        "decode_ms": decode_ms as f64,
         "total_ms": t_turn.elapsed().as_millis().max(1),
         "attempt_id": active_attempt_id(),
         "finish_reason": finish_reason,

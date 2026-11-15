@@ -1677,6 +1677,8 @@ fn production_done_value_builder_matches_epilogue_shape() {
     assert_eq!(v["attempt_id"], 99);
     assert_eq!(v["dflash"], true);
     assert_eq!(v["tokens"], 3);
+    assert_eq!(v["decode_ms"], 2500.0);
+    assert_eq!(v["ttft_ms"], 2.0);
 }
 
 // --- Task 4 production-seam invariants (pending-seed / cancel /
