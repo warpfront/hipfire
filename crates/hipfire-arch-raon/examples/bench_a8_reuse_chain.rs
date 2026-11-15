@@ -170,7 +170,7 @@ fn run(gpu: &mut Gpu, groups: &[Group], rows: usize, arm: Arm) {
     for g in groups {
         let k = g.sites[0].0.k;
         let prep = if arm.reuse && g.sites.len() > 1 {
-            q8_0_prefill_prepare(gpu, PrefillActTier::A8, g.x, k, rows).unwrap()
+            q8_0_prefill_prepare(gpu, PrefillActTier::A8, g.x, g.sites[0].0.m, k, rows).unwrap()
         } else {
             None
         };
@@ -387,7 +387,7 @@ fn main() {
             t(&mut gpu, &mla_b[..1], REUSE),
             t(&mut gpu, &mla_c[..1], FULL),
         ];
-        let admitted = q8_0_prefill_prepare(&mut gpu, PrefillActTier::A8, &x, 2560, rows)
+        let admitted = q8_0_prefill_prepare(&mut gpu, PrefillActTier::A8, &x, 5120, 2560, rows)
             .unwrap()
             .is_some();
         let mut notes = if admitted {
