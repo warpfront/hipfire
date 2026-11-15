@@ -165,12 +165,18 @@ jobs:
             # flagship_pack_coverage and fn_route_plan pin the source SHA-256 of
             # every measured flagship / walked Flash-Next module (GPU- and
             # hipcc-free; a kernel source edit must re-pin them in the same change).
+            # flags_defaults_golden + flags-golden-extract.py are the flags defaults
+            # golden (tests/golden/flags-defaults): a default, ArchCaps accessor or
+            # config key change needs its golden row in the same commit
+            # (scripts/flags-golden.sh --regen).
             run: |
               cargo test --profile ci --locked -p rdna-compute --test dflash_accept_emu
               cargo test --profile ci --locked -p rdna-compute --test all_launcher_abi
               cargo test --profile ci --locked -p rdna-compute --test kernel_registry_coverage
               cargo test --profile ci --locked -p rdna-compute --test flagship_pack_coverage
               cargo test --profile ci --locked -p rdna-compute --test fn_route_plan
+              cargo test --profile ci --locked -p hipfire-runtime --test flags_defaults_golden
+              python3 scripts/flags-golden-extract.py
           - name: int-e
             run: cargo test --profile ci --locked $INTEG_PKGS --test '[e]*'
           - name: int-l
