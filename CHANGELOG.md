@@ -317,6 +317,46 @@
 - **LightOnOCR-3-0.8B (`lightonai/LightOnOCR-3-0.8B`) is a supported local model: `lightonocr3:0.8b` (MQ4) and `lightonocr3:0.8b-q8` are registered local-only (arch 5, dense Qwen3.5-VL family) with the card's settings lowered as `recommended_settings` (`reasoning_effort: none`, temperature 0.2, top_p 0.9) and the F16 vision tower on the shared `vision`-slot `<stem>.vl` pack (quant suffix stripped, the resolver's sibling convention).** The stock `Qwen3_5ForConditionalGeneration` safetensors quantizes unmodified: `hipfire quantize --format mq4` (557,869,696 B, sha256 `578bc680…`) or `--format q8` (822,227,584 B, `8fa20937…`), plus `hipfire-quantize --vision-only` for the `.vl` pack (227,722,240 B, `708c7b79…`, same F16 bytes under either trunk). The row pins are the bytes that recipe emits on beta `b90644a40e`; the embedded config/tokenizer JSON is part of the container identity, so the digest moves when the aux file set or the quantizer’s metadata changes (docs/MODELS.md states the file set and the `sha256sum` check). Text and image turns verified end to end on gfx1101: empty-prompt transcription and `grounding` mode both produce correct OCR output with normalized bounding boxes. The model is trained thinking-off, and the registry row carries that as `recommended_settings` (`reasoning_effort: none`, temperature 0.2, top_p 0.9); a request that wants the card's sampling sends those fields itself (omitting `reasoning_effort` still returns the page text; docs/MODELS.md). Image turns need the tower; `vision_mode` defaults to `auto`, so a `<stem>.vl` sibling loads with no configuration, and `vision.mode=off` is the text-only opt-out (an image turn then refuses with a message naming the skipped sidecar). `scripts/registry_gen.py` maps the `lightonocr3`/`lightonocr` families to arch 5.
 - **Multi-slot serve (`serve.multi_slot`) now stops a Qwen ChatML turn on `<|im_end|>` even when the embedded `generation_config` pins `eos_token_id` to `<|endoftext|>` (chandra-ocr-2 q8: a two-token "Hello!" decoded on to `max_tokens`, 31.75 s at 2048; a dense OCR page 219.3 → 129.5 s, 12384 → 7083 tokens, identical output).** `Tokenizer::from_hfq_metadata` overrides the vocab-inferred eos from `generation_config.eos_token_id`. chandra-ocr-2 ships `eos_token_id: 248044` (`<|endoftext|>`) while the model closes assistant turns with `248046` (`<|im_end|>`), so the override displaced the `<|im_end|>` eos the HF tokenizer blob had inferred and left `is_terminator` (`eos_id` | `eot_id`) matching only a token the model never emits. **Scope: the multi-slot `SlotEngine` (`serve_engine.rs`) is the only request route that stops on `is_terminator` alone.** The single-slot serve route and the AR/DFlash emitters also compare the `<|im_end|>` literal (`qwen_dflash_decoded_eot_from_tokens`, `vision.rs`), so they already stopped on it and are unchanged; default single-slot serve of the same model stopped at 3 tokens on the same tree. The emitter suppressed the marker from `content` and reported `finish_reason: stop`, which is why the burn was invisible from the client. `Tokenizer::ensure_chatml_terminator` now runs after the override (and on the `gguf_meta` branch), keeping `<|im_end|>` as the auxiliary `eot_id` and replacing only a degenerate auxiliary slot, so a loader-resolved second terminator is never dropped. Regression tests: `generation_config_eos_keeps_chatml_im_end_terminator`, `without_generation_config_im_end_is_eos_and_endoftext_auxiliary`, `gguf_meta_branch_keeps_chatml_im_end_terminator`, `a_real_second_terminator_is_not_displaced_by_im_end`. Measured on gfx1101 (RX 7700 XT, HIP 7.16) with chandra-ocr-2.q8 (md5 `9126a29950ef14a56299bda0b8067041`) on `serve.multi_slot`, the datalab contract (temperature 0, top_p 0.1, max_tokens 12384, `ocr_layout` prompt) and image md5 `a390f677c2ad947ca5894957808f6aed`: output md5 `59af232cd2f5ad5d5063742e56a06e17` before and after; `Say hello.` at max_tokens 2048 31.75 → 0.08 s (2 tokens); four concurrent short requests 0.55 s wall.
 
+## v0.4.7 — 2026-11-15
+
+0.4.7 is a bug-fix patch release on top of 0.4.6. It backports fixes from beta for bugs that 0.4.6 users can hit; it removes nothing and changes no default numerics. Every entry names its beta commit.
+
+### Fixes: serving and tool calls
+
+- **Fixed: a DeepSeek V4 `<｜DSML｜tool_calls>` block that parses only partly, or has stray text between DSML tags, is a malformed-DSML error instead of merged, dropped or empty tool calls (HIPF-320, HIPF-378; beta d78fbc1056, 9cec232b40).**
+- **Fixed: Cohere2-MoE reports `finish_reason: "length"` when `max_tokens` ends the turn, instead of `"stop"` (HIPF-379, beta 3a29d28b3b).**
+- **Fixed: a Muse Glimmer singleton request that stops at the KV cache cap reports `finish_reason: "length"`, and `tokens` matches the streamed tokens (HIPF-277, beta e737039509).**
+- **Fixed: the request `seed` is honoured on the Glimmer, LFM2-MoE, MiniMax, Cohere2-MoE and DeepSeek4 singleton routes (HIPF-380, HIPF-412; beta caf510a4e4, c70e47cda7).** They seeded from the wall clock (the DeepSeek4 heterogeneous route from a fixed seed) and ignored the wire `seed`. The `HIPFIRE_DEEPSEEK4_SEED` developer override still wins on the DeepSeek4 singleton AR route.
+
+### Fixes: vision
+
+- **Fixed: an image no longer erases the conversation (#1079, beta c73fbf04ad).** Images stay at their message position and the Qwen3.5/3.8-VL generator renders the whole conversation; several images in history are accepted.
+- **Fixed: a Qwen3.5-VL, dots.ocr or LFM2-VL turn cancelled after it finished decoding no longer stays resident (HIPF-365, #1132; beta e8aa5600c7, fed83686dd, 5cd5b2714b).**
+
+### Fixes: loading and model inputs
+
+- **Fixed: a runtime that cannot reserve GPU address space no longer fails the load with `hipMemAddressReserve: out of memory` after the weights upload (#1058, beta 7e3e774ff7).** Automatic KV selection now proves a reservation works before choosing the VMM backend.
+- **Fixed: LLaMA/Mistral/Qwen3 configs in the transformers 5 layout get their `rope_theta` (`rope_parameters.rope_theta`) instead of running theta 10000 (HIPF-206, beta 63f75014f0).** Configs in the older layout are unchanged.
+- **Fixed: the per-row extent check of the non-codec loaders covers every row-packed raw dtype, so a stale ragged payload is refused at load instead of decoding to garbage (HIPF-317, beta 2999deecab).**
+- **Fixed: Qwen3.5-family MoE decode no longer fails AR hipGraph capture with hipError 906 when a layer falls back to host top-K; such a model decodes eager (#1149, beta 0667c592d7).**
+
+### Fixes: gfx94x / gfx906 (MI300X)
+
+- **Fixed: Qwen3.5/3.6 MQ4G256 trunks wider than 256 (e.g. Qwen3.8-27B `.mq4r`) no longer produce garbage on gfx94x (#1136, beta 2c7606f306).** The split RMSNorm + MQ rotation indexed the norm weight per group instead of per element.
+- **Fixed: the default Q8 DeltaNet recurrence compiles on gfx906 / gfx94x again (#1136, beta 58dd700316).** GCN/CDNA keep the `shfl_down` reduction; RDNA builds are unchanged.
+- **Fail closed: on wave64 GCN/CDNA a Qwen3.5/3.6 model whose weight format has no wave64 GEMV is refused at load instead of failing the first request (#1136, beta c212dd922c).**
+
+### Fixes: Flash-Next on gfx1201
+
+- **Fixed: Flash-Next expert parallelism (EP2 on two R9700) no longer aborts the load with `thread 'hipfire-qwen4-ep-rank1' has overflowed its stack`.** Peer ranks ran on 2 MiB worker threads while rank 0 runs on the 8 MiB main thread; the official 0.4.6 binaries (rustc 1.99.1) overflowed the peer rank in every EP2 load. Every rank worker now gets an 8 MiB stack, so the `RUST_MIN_STACK=8388608` workaround is no longer needed. (new fix; also proposed for beta)
+- **Fixed (kernel packs): a cold `hipfire run` of Flash-Next on gfx1201 no longer hipcc-compiles kernels the prebuilt pack lacked: the A8-trunk MQ6 symmetric-grid check during load (`qwen4_mq6_sym_check_gfx1201`), and after ready the lane WMMA GEMMs and prefill tiles (`qwen4_lane_wmma`, `qwen4_lwmma_tile`) the wide-pass gate/up (`gemm_mq4g256v2_moe_grouped_top10_g32`) (the gfx1201 Flash-Next part of beta 7cec18dd79) and the dead-store-skipping routed MoE down (`gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151_nodz`, new: v0.4.6 and beta do not pack it).**
+
+### Fixes: native Windows
+
+- **Fixed: `scripts/windows-check.ps1` writes `report.txt` again, and one unreadable display-adapter registry key no longer drops the GPU memory step (#1143).**
+- **Fixed: `hipfire fit` sees the GPUs (from HIP) and host RAM on Windows (#1145).** Linux output is unchanged.
+- **The daemon warns at start when it runs at Idle or BelowNormal priority, and `hipfire diag` shows the process priority class (#1144).** hipfire never changes the class.
+
 ## v0.4.6 — 2026-11-11
 
 0.4.6 is the freeze baseline for the 0.5.0 consolidation (#666). Entries are grouped by area.
