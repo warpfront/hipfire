@@ -56,7 +56,7 @@ tier whose `min_vram_gb` fits with headroom for KV, and read
 | 5–8 GB | `bonsai:27b-bq1` (5) / `bonsai:27b-tq2` (8) | 3.8 / 7.16 GB | 27B at 1.14 / 2.125 bpw; heavy quantization, see the registry `desc` for its KLD |
 | 12 GB | `qwen3.5:27b-mq3` (12), `qwen3.6:27b-mq3` (12) | 10.7 GB | MQ3 alpha, gfx11 / gfx12 |
 | 13–15 GB | `qwen3.8:27b-mq3-xt` (13), `qwen3.8:27b-mq3` (14), `qwen3.8:27b-mq3-pro` (15) | 11.78–13.18 GB | MQ3V2 tiers |
-| 16–18 GB | `qwen3.8:27b-mq4-xt` (16, speed), `qwen3.8:27b` (17, registry default), `qwen3.8:27b-mq4-pro` (18) | 14.99–16.46 GB | MQ4V2 tiers; `qwen3.8:27b-mq4-xts` (16) is the canonical dense fixture |
+| 16–18 GB | `qwen3.8:27b-mq4-xt` (16, speed), `qwen3.8:27b-mq4` (17, asymmetric, the pre-0.5.0 default), `qwen3.8:27b-mq4-pro` (18) | 14.99–16.46 GB | MQ4V2 tiers; `qwen3.8:27b-mq4-xts` (16) is the registry default (`qwen3.8`, `qwen3.8:27b`) and the canonical dense fixture: paired KLD +0.0008 vs `qwen3.8:27b-mq4` (gfx1201 A4 route), decode 4.8% faster, 0.67 GB smaller |
 | 20–24 GB | `qwen3.8:27b-mq5*` (20–21), `qwen3.8:27b-mq6*` (23–24) | 18.18–22.17 GB | higher-quality V2 tiers |
 | 22 GB | `qwen3.6:35b-a3b` (22), `ornith-1.5:35b-a3b` (22), `nex-n2:mini` (22) | 19–19.8 GB | 35B / 3B-active MoE |
 | 24 GB | `muse-glimmer:fast` (24) / `muse-glimmer` (26) | 16.26 / 18.61 GB | 30B dense, thinking model |

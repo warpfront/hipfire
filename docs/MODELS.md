@@ -96,8 +96,8 @@ The `qwen3.6:35b-a3b*` entries and both `ornith-1.5:35b-a3b*` entries carry an `
 | `qwen3.8:27b-mq3` | `qwen3.8-27b.mq3` | 12.62 | 14 | q8 | MQ3V2 base |
 | `qwen3.8:27b-mq3-pro` | `qwen3.8-27b.mq3-pro` | 13.18 | 15 | q8 | MQ3V2 Pro |
 | `qwen3.8:27b-mq4-xt` | `qwen3.8-27b.mq4-xt` | 14.99 | 16 | q8 | MQ4V2 XT (speed; supersedes legacy `.mq4r`) |
-| `qwen3.8:27b-mq4-xts` | `qwen3.8-27b.mq4-xts` | 14.99 | 16 | q8 | MQ4V2 XT, symmetric (H2); int4-activation prefill on gfx1201/gfx1100/gfx1151; canonical dense fixture (`pin:model/qwen3.8-27b.mq4-xts`, [`fixtures.md`](fixtures.md)) |
-| `qwen3.8:27b` | `qwen3.8-27b.mq4` | 15.66 | 17 | q8 | MQ4V2 base; default; effort-native (`low`/`medium`/`xhigh`, default `xhigh`); uncapped think span unless explicit integer cap |
+| `qwen3.8:27b-mq4-xts` | `qwen3.8-27b.mq4-xts` | 14.99 | 16 | q8 | MQ4V2 XT, symmetric (H2); **default 27B** (`qwen3.8`, `qwen3.8:latest`, `qwen3.8:27b`; since 0.5.0, paired KLD +0.0008 vs the asymmetric file on the gfx1201 A4 route, decode 4.8% faster, pp8192 prefill 1.39-1.54x faster, 0.67 GB smaller); int4-activation prefill on gfx1201/gfx1100/gfx1151; canonical dense fixture (`pin:model/qwen3.8-27b.mq4-xts`, [`fixtures.md`](fixtures.md)) |
+| `qwen3.8:27b-mq4` | `qwen3.8-27b.mq4` | 15.66 | 17 | q8 | MQ4V2 base, asymmetric (the default before 0.5.0; explicit tag only); effort-native (`low`/`medium`/`xhigh`, default `xhigh`); uncapped think span unless explicit integer cap |
 | `qwen3.8:27b-mq4-pro` | `qwen3.8-27b.mq4-pro` | 16.46 | 18 | q8 | MQ4V2 Pro |
 | `qwen3.8:27b-mq5-xt` | `qwen3.8-27b.mq5-xt` | 18.18 | 20 | q8 | MQ5V2 XT |
 | `qwen3.8:27b-mq5` | `qwen3.8-27b.mq5` | 18.71 | 20 | q8 | MQ5V2 base |
@@ -698,9 +698,8 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `qwen3.6` / `qwen3.6:a3b` / `qwen3.6:35b-a3b-mq4p` | `qwen3.6:35b-a3b` |
 | `ornith` / `ornith-1.5` / `ornith1.5` / `ornith1.5:35b-a3b` | `ornith-1.5:35b-a3b` |
 | `ornith-1.5:fast` / `ornith-1.5:35b-a3b-fast` | `ornith-1.5:35b-a3b-mq4r` |
-| `qwen3.8` / `qwen3.8:latest` | `qwen3.8:27b` |
+| `qwen3.8` / `qwen3.8:latest` / `qwen3.8:27b` | `qwen3.8:27b-mq4-xts` |
 | `qwen3.8:fast` / `qwen3.8:27b-fast` | `qwen3.8:27b-mq4-xt` |
-| `qwen3.8:27b-mq4` | `qwen3.8:27b` |
 | `qwen3.8:draft` / `qwen3.8:27b-draft` | `qwen3.8:27b-draft-mq4` |
 | `muse-glimmer:latest` / `muse-glimmer:quality` / `muse-glimmer:30b` | `muse-glimmer` |
 | `qwen3` | `qwen3:8b` |

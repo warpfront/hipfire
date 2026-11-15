@@ -254,7 +254,7 @@ The bundled registry (`registry/v1.json`) contains 94 curated entries
 
 | Family | Pull tags |
 |---|---|
-| Qwen 3.8 dense | `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-xts` (flagship), `-mq4-xt`, `-mq4-pro`; MQ3, MQ5 and MQ6 `-xt` / base / `-pro` tiers; drafts `qwen3.8:27b-draft-mq3` … `-mq6` |
+| Qwen 3.8 dense | `qwen3.8:27b` = `qwen3.8:27b-mq4-xts` (MQ4V2 symmetric, the default and flagship), `qwen3.8:27b-mq4` (asymmetric, the pre-0.5.0 default), `-mq4-xt`, `-mq4-pro`; MQ3, MQ5 and MQ6 `-xt` / base / `-pro` tiers; drafts `qwen3.8:27b-draft-mq3` … `-mq6` |
 | Qwen 3.8 Flash | `qwen3.8:flash-next` (alias `qwen3.8:flash`; MQ4 XTS split base), `-mq3-xts`, `-mq2-xts`, `-mq2-xts-4500` |
 | Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `-mq2`, `-mq3p`, `-mq4p`, `-mfp4`, `-mq4r`, `-mq4rs` (symmetric experts, gfx1100 / gfx1151 / gfx1201 fast prefill), `-mq5`, `-mq6` |
 | Qwen 3.6 dense | `qwen3.6:27b-mq3`, draft `qwen3.6:27b-draft-mq3` (`qwen3.6:27b` and `qwen3.6:27b-draft` are retired in 0.5.0; use `qwen3.8:27b`) |

@@ -4081,8 +4081,10 @@ mod tests {
     #[test]
     fn bundled_qwen38_matches_the_release_contract() {
         let registry = bundled().unwrap();
-        let (tag, model) = registry.model("qwen3.8:27b").unwrap();
-        assert_eq!(tag, "qwen3.8:27b");
+        // 0.5.0: the default 27B is the symmetric `.mq4-xts`; the asymmetric
+        // `.mq4` stays reachable as the explicit `qwen3.8:27b-mq4`.
+        let (tag, model) = registry.model("qwen3.8:27b-mq4").unwrap();
+        assert_eq!(tag, "qwen3.8:27b-mq4");
         assert_eq!(model.file, "qwen3.8-27b.mq4");
         assert_eq!(model.arch_id, Some(5));
         assert_eq!(model.quant.as_deref(), Some("mq4"));
@@ -4095,13 +4097,19 @@ mod tests {
         );
         assert_eq!(model.size_bytes, Some(15662615552));
 
-        for alias in ["qwen3.8", "qwen3.8:latest", "qwen3.8:27b-mq4"] {
-            let (resolved, _) = registry
+        for alias in ["qwen3.8", "qwen3.8:latest", "qwen3.8:27b"] {
+            let (resolved, default) = registry
                 .model(alias)
                 .unwrap_or_else(|| panic!("{alias} must resolve"));
             assert_eq!(
-                resolved, "qwen3.8:27b",
-                "{alias} resolves to the canonical tag"
+                resolved, "qwen3.8:27b-mq4-xts",
+                "{alias} resolves to the symmetric default"
+            );
+            assert_eq!(default.file, "qwen3.8-27b.mq4-xts");
+            assert_eq!(
+                default.dflash.as_ref().map(|d| d.file.as_str()),
+                model.dflash.as_ref().map(|d| d.file.as_str()),
+                "{alias} keeps the paired MQ4 draft"
             );
         }
 
@@ -4558,7 +4566,7 @@ mod tests {
             registry.resolve_tag("qwen3.6-35b-a3b.mq4r"),
             "qwen3.6:35b-a3b-mq4r"
         );
-        assert_eq!(registry.resolve_tag("qwen3.8-27b.mq4"), "qwen3.8:27b");
+        assert_eq!(registry.resolve_tag("qwen3.8-27b.mq4"), "qwen3.8:27b-mq4");
         assert_eq!(
             registry.resolve_tag("qwen3.8-27b.mq4-xt"),
             "qwen3.8:27b-mq4-xt"
@@ -5196,7 +5204,7 @@ mod tests {
             );
         }
         // MQ4-and-below tiers pair everywhere; MQ6V2 stays unpaired.
-        let (_, mq4) = registry.model("qwen3.8:27b").unwrap();
+        let (_, mq4) = registry.model("qwen3.8:27b-mq4").unwrap();
         assert!(mq4.dflash.is_some() && mq4.dflash_min_vram_gb.is_none());
         let (_, mq6) = registry.model("qwen3.8:27b-mq6").unwrap();
         assert!(mq6.dflash.is_none());
@@ -5236,7 +5244,7 @@ mod tests {
         // Serializing an entry without a floor writes no key, so a cache an
         // older client reads back parses under its strict schema.
         let registry = bundled().unwrap();
-        let mq4 = &registry.models["qwen3.8:27b"];
+        let mq4 = &registry.models["qwen3.8:27b-mq4"];
         assert!(!serde_json::to_string(mq4)
             .unwrap()
             .contains("dflash_min_vram_gb"));
