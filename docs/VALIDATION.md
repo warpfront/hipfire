@@ -147,9 +147,68 @@ lane runs it and the candidate record and `check-release` report it
 (`secondary: gfx942 green|red|no record`); a red secondary record is a
 warning. The policy gate values are `candidate` (blocks every candidate),
 `rented` (blocks candidates while a host of the class is configured, and every
-release), `release` (every release only) and `secondary`. Budget: 60 minutes
-per card. A `.kldseq` row is not in the set: the evaluator (`eval_hipfire`) is not
+release), `release` (every release only) and `secondary`. Budget: 15 minutes
+per card for gfx1100 and gfx1201 including the performance rows (60 for
+gfx942). A `.kldseq` row is not in the set: the evaluator (`eval_hipfire`) is not
 in the release archive, and building it would put a compiler back in the lane.
+
+### Performance rows
+
+Correctness rows alone let a 4.4% DFlash per-cycle loss and a 42% cold-start
+loss through, so each blocking class also carries performance rows
+(`policy.json` `perf`, [`scripts/promotion-lane/perf.py`](../scripts/promotion-lane/perf.py)).
+They run after the correctness rows, in the same fabric job (class `timing`:
+exclusive card, build slots paused), on the same installed archive.
+
+| Row | Measures | Classes |
+|---|---|---|
+| `perf-27b-ar-decode` | 27B mq4-xts AR decode tok/s, committed 134-token code prompt, 128 tokens | gfx1100, gfx1201 |
+| `perf-27b-dflash-decode` | the same with the pinned DFlash draft, reasoning off | gfx1100, gfx1201 |
+| `perf-27b-ttft-134`, `perf-27b-ttft-5900` | 27B prefill TTFT at 134 and 5,909 tokens | gfx1100, gfx1201 |
+| `perf-27b-cold` | first request of a fresh process with an empty kernel cache (wall tok/s) | gfx1100, gfx1201 |
+| `perf-a3b-mq4rs-decode`, `perf-a3b-mq4rs-cold` | Qwen3.6-35B-A3B `.mq4rs` AR decode (the Redline default) and its cold first request | gfx1201 |
+| `perf-flashnext-decode` | Flash-Next GPTQ3 monolith, single-card default route (native MTP + n-gram), decode tok/s | gfx1201 |
+
+- **Measurement.** Every number comes from a fresh `hipfire bench` process
+  (own `HOME`/`HIPFIRE_HOME`, empty kernel cache, no device compiler,
+  `HIPFIRE_*`/`HIP_*`/`GPU_*` knobs scrubbed except the fabric's card
+  selectors) with `--warmups 0` and `--min-tokens` = `--max-tokens`: sample 0
+  is the cold row, the first `discard` samples are dropped for the warm rows.
+  Processes run grouped by model (arms interleaved inside the group), so one
+  model's load does not evict the next one's page cache mid-row.
+  Prompts are committed under `scripts/promotion-lane/perf-prompts/` and the
+  model files are pinned by size and sha256 in the policy.
+- **Host pressure.** Fabric's timing class locks the card, not the host CPU
+  or memory, and cold rows are CPU-bound. Each process records its load
+  average and the PSI `some` stall fraction over its lifetime
+  (`/proc/pressure` cpu, memory, io). A process above `max_pressure` (cpu
+  10%, memory 0.5%; Flash-Next memory 3%, its host-mapped experts reclaim
+  page cache by themselves) is rejected, kept in the record, and re-run up to twice
+  after the host's 10 s averages settle; a row still without clean samples
+  is `skipped` (red), never measured.
+- **Statistic.** Each process contributes the median of its measured runs;
+  an arm is the median of its 3 process medians; the row is the ratio of the
+  arms against the gate's own beta on the same card (new/old for tok/s,
+  old/new for TTFT, so below 1 is always a loss), with a 95% bootstrap CI over
+  processes. The process is the unit because runs inside one process are not
+  independent (on gfx1100 every process's third 5.9k-token prefill is ~19%
+  slower). A row **regresses** when the CI upper bound is below
+  `1 - max(2%, 3 x A/A half-width)`; the half-width per class and row comes
+  from an A/A calibration (`lane.py calibrate`) recorded in the policy.
+- **Baseline.** The previous promotion record of the gate's beta for the
+  same class supplies the baseline numbers when host, card (fabric GPU
+  UUID), HIP runtime, PCI slot and measurement spec match and the numbers are
+  at most 7 days old; only the candidate runs. Otherwise the beta's archive
+  runs interleaved with the candidate (`pair`). A regression seen against
+  reused numbers is confirmed by a `pair` run before it counts.
+- **Verdict.** A `regressed`, `failed` (candidate process failed) or
+  `skipped` (no usable baseline, fixture or prompt mismatch) perf row is red
+  and blocks promotion like a correctness row; waivers name perf rows the same
+  way. The record's `perf` section carries each row's ratio, CI, threshold,
+  mode and every process's raw samples.
+- **Cost.** A full `pair` run of every perf row takes about 10 minutes on
+  gfx1201 (Flash-Next is about 3.3 of them) and 5 on gfx1100; a `reuse` run
+  takes about half that.
 
 ### Three CPU rules in CI ([`scripts/ci-gates.sh`](../scripts/ci-gates.sh))
 
@@ -198,9 +257,13 @@ Each has a planted-negative self-test that fails CI if the rule stops firing.
 ```sh
 python3 scripts/promotion-lane/lane.py plan --class gfx1100
 python3 scripts/promotion-lane/lane.py run --archive hipfire-<tag>-linux-rocm-gfx1100-x64.tar.gz \
-    --class gfx1100 --candidate <sha> --out <dir> --models-dir <dir> --repo <checkout>
+    --class gfx1100 --candidate <sha> --out <dir> --models-dir <dir> --repo <checkout> \
+    [--perf-baseline <beta's record.json>] [--baseline-archive <beta's archive>]
 python3 scripts/promotion-lane/lane.py merge --candidate <sha> --out candidate.json <record.json>...
 python3 scripts/promotion-lane/lane.py check-release --sha <sha> --records <dir>
+# perf rows alone (A/A calibration, kill experiments), then the A/A half-widths
+python3 scripts/promotion-lane/lane.py perf --archive <A> --baseline-archive <A> --class gfx1100 --out <dir> --models-dir <dir>
+python3 scripts/promotion-lane/lane.py calibrate --class gfx1100 <dir1>/perf.json <dir2>/perf.json
 ```
 
 `lane.py run` must execute inside a fabric job on a card of its class. The
