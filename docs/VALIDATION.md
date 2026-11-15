@@ -139,10 +139,16 @@ the rows are in [`scripts/device-mesh/matrix.json`](../scripts/device-mesh/matri
 | `cold-archive-27b`, `cold-archive-a3b` | the same for 27B mq4-xts and A3B `.mq4r` | gfx1100, gfx1201, gfx942 |
 | `cold-archive-flashnext` | Flash-Next single-card default route (host-mapped experts) | gfx1201 |
 
-Card classes: gfx1100 and gfx1201 block every candidate. gfx942 (MI300X)
-blocks candidates only while it is rented (a host for it is configured in the
-landing inventory) and is always a per-release gate. Budget: 60 minutes per
-card. A `.kldseq` row is not in the set: the evaluator (`eval_hipfire`) is not
+Card classes: gfx1100 and gfx1201 block every candidate and every release.
+gfx942 (MI300X) is a **secondary** class (Kaden 2026-11-15: secondary until AMD
+interest; the MI300X rental is released): it never blocks a promotion or a
+release tag. When a host for it is configured in the landing inventory the
+lane runs it and the candidate record and `check-release` report it
+(`secondary: gfx942 green|red|no record`); a red secondary record is a
+warning. The policy gate values are `candidate` (blocks every candidate),
+`rented` (blocks candidates while a host of the class is configured, and every
+release), `release` (every release only) and `secondary`. Budget: 60 minutes
+per card. A `.kldseq` row is not in the set: the evaluator (`eval_hipfire`) is not
 in the release archive, and building it would put a compiler back in the lane.
 
 ### Three CPU rules in CI ([`scripts/ci-gates.sh`](../scripts/ci-gates.sh))
