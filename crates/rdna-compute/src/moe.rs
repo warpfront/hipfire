@@ -4107,7 +4107,7 @@ impl Gpu {
         // gfx1151, >= 512 tokens (x_row_div == 1: one X row per top-10 slot):
         // F16 WMMA grouped down, 8.6 -> 5.4 ms at 1131 tokens.  Not
         // bit-exact (F16 dequant/inputs); gated by KLD against the BF16
-        // source like the gate/up arm.  HIPFIRE_QWEN4_F16_WMMA=0 opts out.
+        // source like the gate/up arm.
         if x_row_div == 1 && self.qwen4_moe_down_wmma_applies(m, k, x_src_rows) {
             // Uncached: the activation buffer is reused with new contents per layer.
             let xp = self.convert_fp16_x_uncached(x_src, x_src_rows * k)?;
@@ -4162,7 +4162,6 @@ impl Gpu {
             && m == 2560
             && k == 640
             && self.route_rows(x_src_rows) >= 10 * crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
-            && *crate::gemm::QWEN4_F16_WMMA
     }
 
     /// Whether a `rows`-row grouped Flash-Next MoE prefill takes the F16 WMMA arm end to

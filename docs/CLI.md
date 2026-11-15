@@ -183,10 +183,8 @@ dequantized weight is exactly a BF16 value. The format is described in
   (the full file name plus `.hc8`), and is bound to that base by its length and
   index sha256; a mismatching sidecar is refused with one log line and the BF16
   base weights load.
-- **Default on, exact gfx1201.** When the sidecar is present the loader applies
-  it by default on exact gfx1201 only; other architectures load the BF16 base
-  untouched. `HIPFIRE_QWEN4_HC8=0` is the kill switch: the sidecar is ignored
-  and the BF16 weights load bit for bit as without it.
+- **Exact gfx1201 only.** When the sidecar is present the loader applies it on exact gfx1201;
+  other architectures load the BF16 base untouched.
 
 - **Pull.** The client carries one pin, not the registry (the trunk-overlay
   convention): `qwen3.8-flash-next-base.mq4-xts-symtrunk.hc8` (659649536 B,

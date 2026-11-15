@@ -404,7 +404,7 @@ impl LocalLaneRank<'_> {
 
         // A sampled lane's argmax picks are replaced by its sampler's draws; a
         // greedy lane takes the unchanged argmax path. On the device
-        // (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`) every sampled lane of the step is
+        // (exact gfx1201) every sampled lane of the step is
         // drawn by one `lane_sample_device` call; else each by `lane_sample_step`
         // (one D2H of the request's logits rows).
         let mut picks: Vec<Vec<u32>> = Vec::with_capacity(plan.lanes.len());

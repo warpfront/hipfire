@@ -312,9 +312,8 @@ pub fn trunk_overlay_in(entry: &ModelEntry, pins: &[TrunkOverlayPin]) -> Option<
 ///
 /// The HC8 sidecar (`<base file>.hc8`) is an HFQM container of the base's
 /// hyper-connection mixer weights requantized to per-row-scaled E4M3
-/// (`hipfire_runtime::hc8_sidecar`); the Qwen4 loader applies it by default on
-/// exact gfx1201 (`HIPFIRE_QWEN4_HC8=0` is the kill switch) and binds it to the
-/// base's file length and index sha256. Like [`TrunkOverlayPin`], the pin lives
+/// (`hipfire_runtime::hc8_sidecar`); the Qwen4 loader applies it on exact gfx1201 and
+/// binds it to the base's file length and index sha256. Like [`TrunkOverlayPin`], the pin lives
 /// in the client rather than in a registry field, keyed by the base identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hc8SidecarPin {

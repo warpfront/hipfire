@@ -6719,7 +6719,7 @@ pub struct GroupedDepthwiseOp<'a> {
     /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
     /// BF16 path never reads it.
     pub rotation: &'a GpuTensor,
-    /// Lane-batched form (`HIPFIRE_QWEN4_LANE_PLE_BATCH`): empty for the
+    /// Lane-batched form (exact gfx1201, `grouped_depthwise_lanes_admitted`): empty for the
     /// ordinary single-stream step. Otherwise lane `i` is row `i` of every
     /// row tensor (`rows == lane_states.len()`, one token per lane, contiguous
     /// lane rows) with its own convolution state `lane_states[i]` (`state` is
@@ -6977,8 +6977,8 @@ pub fn execute_grouped_depthwise(
 }
 
 /// Whether `lanes` one-row AR lanes' PLE chains may run as the batched form of
-/// [`GroupedDepthwiseOp::lane_states`]: exact gfx1201 with
-/// `HIPFIRE_QWEN4_LANE_PLE_BATCH`, BF16 key / value weights on the few-row
+/// [`GroupedDepthwiseOp::lane_states`]: exact gfx1201
+/// (`FeatureFlags::qwen4_lane_ple_batch_enabled`), BF16 key / value weights on the few-row
 /// SIMT rows route (`gemv_bf16_xf32_x4_rows`, each output row bitwise the
 /// one-row `gemv_bf16_xf32`), and `2..=PLE_LANES_MAX` lanes. Both launches go
 /// through the ordinary launch path (the tail's by-value lane table rides in

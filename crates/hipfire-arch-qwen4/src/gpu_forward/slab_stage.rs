@@ -1406,7 +1406,6 @@ impl Qwen4ExpertStage {
         let mut stage = Self {
             min_rows,
             min_rows_source,
-            capture: hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_CAPTURE_ENV, true),
             donors: lent.map_or([usize::MAX; 2], |(_, donors)| donors),
             donor_views: Vec::with_capacity(if borrowed { 2 } else { 0 }),
             mirrors: Vec::with_capacity(2),
@@ -1514,22 +1513,20 @@ impl Qwen4ExpertStage {
                 )
             };
             eprintln!(
-                "  qwen4 long-prefill expert staging: forwards of >= {} rows stage slab host layers {first_host}..{} through resident slab layers {} and {} (borrowed donor VRAM, no dedicated stage buffers; {} MiB pinned restore copies, host RAM on top of the placement's pinned experts{in_place}; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows})",
+                "  qwen4 long-prefill expert staging: forwards of >= {} rows stage slab host layers {first_host}..{} through resident slab layers {} and {} (borrowed donor VRAM, no dedicated stage buffers; {} MiB pinned restore copies, host RAM on top of the placement's pinned experts{in_place}; min_rows from {}, prefill chunk {chunk_rows})",
                 stage.min_rows,
                 moe.len(),
                 donors[0],
                 donors[1],
                 (window[0] + window[1]) >> 20,
-                if stage.capture { "stage" } else { "mapped" },
                 stage.min_rows_source.label()
             );
         } else {
             eprintln!(
-                "  qwen4 long-prefill expert staging: forwards of >= {} rows stage slab host layers {first_host}..{} through two {} MiB VRAM stage buffers (nothing borrowed, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows})",
+                "  qwen4 long-prefill expert staging: forwards of >= {} rows stage slab host layers {first_host}..{} through two {} MiB VRAM stage buffers (nothing borrowed, nothing to restore; min_rows from {}, prefill chunk {chunk_rows})",
                 stage.min_rows,
                 moe.len(),
                 stage_bytes >> 20,
-                if stage.capture { "stage" } else { "mapped" },
                 stage.min_rows_source.label()
             );
         }
@@ -1720,7 +1717,6 @@ impl Qwen4ExpertStage {
         let mut stage = Self {
             min_rows,
             min_rows_source,
-            capture: hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_CAPTURE_ENV, true),
             donors: [usize::MAX; 2],
             donor_views: Vec::new(),
             mirrors: buffers,
@@ -1813,12 +1809,11 @@ impl Qwen4ExpertStage {
             String::new()
         };
         eprintln!(
-            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host-tier experts of {} tier layers through two VRAM stage buffers of {} and {} MiB (device-tier experts keep their owner address; owners are never written, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows}){view_note}",
+            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host-tier experts of {} tier layers through two VRAM stage buffers of {} and {} MiB (device-tier experts keep their owner address; owners are never written, nothing to restore; min_rows from {}, prefill chunk {chunk_rows}){view_note}",
             stage.min_rows,
             layouts.len(),
             sizes[0] >> 20,
             sizes[1] >> 20,
-            if stage.capture { "stage" } else { "mapped" },
             stage.min_rows_source.label()
         );
         hipfire_config::load_summary::note(
@@ -2195,7 +2190,6 @@ impl Qwen4ExpertStage {
         let mut stage = Self {
             min_rows,
             min_rows_source,
-            capture: hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_CAPTURE_ENV, true),
             donors: borrow.unwrap_or([usize::MAX; 2]),
             donor_views: Vec::new(),
             mirrors: buffers,
@@ -2384,7 +2378,7 @@ impl Qwen4ExpertStage {
                 })
                 .collect::<Vec<_>>();
             eprintln!(
-                "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host experts of {} EP unit layers through the tensors of layers {} and {} lent as the two parity stage buffers (gate/up {} MiB + down {} MiB each; restored from {} MiB pinned copies after the last staged layer of each parity; lent allocation slack past the payload {slack:?} B; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows}){donor_note}",
+                "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host experts of {} EP unit layers through the tensors of layers {} and {} lent as the two parity stage buffers (gate/up {} MiB + down {} MiB each; restored from {} MiB pinned copies after the last staged layer of each parity; lent allocation slack past the payload {slack:?} B; min_rows from {}, prefill chunk {chunk_rows}){donor_note}",
                 stage.min_rows,
                 layouts.len(),
                 lent[0],
@@ -2392,17 +2386,15 @@ impl Qwen4ExpertStage {
                 lent_bytes[0] >> 20,
                 lent_bytes[1] >> 20,
                 (2 * (lent_bytes[0] + lent_bytes[1])) >> 20,
-                if stage.capture { "stage" } else { "mapped" },
                 stage.min_rows_source.label()
             );
         } else {
             eprintln!(
-                "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host experts of {} EP unit layers through two VRAM stage buffers of {} and {} MiB (resident experts keep their VRAM arena address; nothing overwritten, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows}){donor_note}",
+                "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host experts of {} EP unit layers through two VRAM stage buffers of {} and {} MiB (resident experts keep their VRAM arena address; nothing overwritten, nothing to restore; min_rows from {}, prefill chunk {chunk_rows}){donor_note}",
                 stage.min_rows,
                 layouts.len(),
                 sizes[0] >> 20,
                 sizes[1] >> 20,
-                if stage.capture { "stage" } else { "mapped" },
                 stage.min_rows_source.label()
             );
         }

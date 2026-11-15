@@ -54,8 +54,8 @@ pub fn load_stock_mtp_bundle(
     let bound = bind_stock_mtp_sidecar(&hfq, &sidecar_path)
         .map_err(|reason| stock_mtp_refusal_line(&sidecar_path, &reason))?;
     println!("{}", stock_mtp_attached_line(&bound));
-    let receipt = admit_hfqm_artifact_with(&hfq, Some(&gpu.arch), false, Some(&bound))
-        .map_err(|e| e.to_string())?;
+    let receipt =
+        admit_hfqm_artifact_with(&hfq, Some(&gpu.arch), Some(&bound)).map_err(|e| e.to_string())?;
     if receipt.config.mtp.is_none() || receipt.mtp_sidecar.is_none() {
         return Err("admission did not attach the MTP head sidecar".into());
     }

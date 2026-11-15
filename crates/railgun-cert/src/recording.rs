@@ -1559,7 +1559,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-shared-int8-prefill",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Gpu::qwen4_shared_i8_applies (HIPFIRE_QWEN4_SHARED_INT8, shared_i8.rs): exact gfx1201, BF16 shared-expert weights, hidden % 256 == 0, intermediate % 128 == 0, route rows >= QWEN4_F16_WMMA_MIN_TOKENS, and `!is_recording() && !capture_mode`",
+        condition: "Gpu::qwen4_shared_i8_applies (shared_i8.rs): exact gfx1201, BF16 shared-expert weights, hidden % 256 == 0, intermediate % 128 == 0, route rows >= QWEN4_F16_WMMA_MIN_TOKENS, and `!is_recording() && !capture_mode`",
         effect: KernelSelection,
         switches: "eager: the shared expert gate/up/down run the INT8 (iu8 WMMA) route on the model-lifetime INT8 weight shadows; recorded/captured: the F16 WMMA shadow route (qwen4-f16-wmma-prefill)",
         kernels: &[],
@@ -1636,7 +1636,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-ple-async-upload",
         predicates: &[CaptureMode, GraphSlotCapturing],
-        condition: "hipfire-arch-qwen4 ple_async_upload (ple_stage.rs), consulted by forward_chunk_scoped (gpu_forward.rs), the exact lane step forward_lanes_scoped (gpu_forward_lanes.rs), and the S1 layer-major tile step stage_tile (slowlink_prefill.rs) with `gpu.graphs.capture_mode`: the deferred PLE rows upload with a fenced asynchronous copy (HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD) only when no graph capture is open; under capture the blocking `memcpy_htod_auto` path (async on the active stream while capturing) runs. A pipeline-parallel mesh band forward (forward_chunk_scoped under a mesh epoch) takes the same fenced `upload_async` only when `!gpu.graphs.capture_mode`, so the mesh never blocks the host on the device queue outside capture. The S1 tile step passes the same `gpu.graphs.capture_mode` through the same helper into the same `stage_ple_rows` upload-mode branches, so the recorded and eager tiles stage identical bytes to the identical device buffer",
+        condition: "hipfire-arch-qwen4 ple_async_upload (ple_stage.rs), consulted by forward_chunk_scoped (gpu_forward.rs), the exact lane step forward_lanes_scoped (gpu_forward_lanes.rs), and the S1 layer-major tile step stage_tile (slowlink_prefill.rs) with `gpu.graphs.capture_mode`: the deferred PLE rows upload with a fenced asynchronous copy only when no graph capture is open; under capture the blocking `memcpy_htod_auto` path (async on the active stream while capturing) runs. A pipeline-parallel mesh band forward (forward_chunk_scoped under a mesh epoch) takes the same fenced `upload_async` only when `!gpu.graphs.capture_mode`, so the mesh never blocks the host on the device queue outside capture. The S1 tile step passes the same `gpu.graphs.capture_mode` through the same helper into the same `stage_ple_rows` upload-mode branches, so the recorded and eager tiles stage identical bytes to the identical device buffer",
         effect: LaunchMechanism,
         switches: "hipMemcpyAsync on the compute stream from pinned staging with a hip-event fence over the host staging buffer, vs the blocking or capture-aware upload; same bytes to the same device buffer",
         kernels: &[],
@@ -2562,12 +2562,6 @@ pub const SITES: &[Site] = &[
         function: "ensure_mapped_capacity",
         occurrences: 3,
         decisions: &["eager-only-refusals"],
-    },
-    Site {
-        file: "hipfire-arch-qwen4/src/state_parity.rs",
-        function: "run_mtp_head_d2_probe",
-        occurrences: 2,
-        decisions: &["qwen4-cpu-splice-eager-only"],
     },
     Site {
         file: "hipfire-daemon/src/bench.rs",

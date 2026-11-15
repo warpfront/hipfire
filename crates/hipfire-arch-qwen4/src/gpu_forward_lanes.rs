@@ -48,10 +48,11 @@
 //! the step interpreter's fusions apply exactly where the singleton's do.
 //!
 //! The PLE convolution splits the same way: its stateless key / value projections are the
-//! row-local stage [`StageName::PleProject`] (under `HIPFIRE_QWEN4_LANE_PLE_PROJECT`, exact
-//! gfx1201, BF16 weights and a total row count one row-exact launch covers: ONE
-//! `gemv_bf16_xf32_x4_rows_exact` launch each over every lane's rows, written in place into
-//! the lanes' own key / value slices), and only the gate / norm / convolution tail
+//! row-local stage [`StageName::PleProject`] (gated to exact gfx1201 and exact gfx942 by
+//! `FeatureFlags::qwen4_lane_ple_project_enabled`; BF16 weights and a total row count one
+//! row-exact launch covers: ONE launch each over every lane's rows, `gemv_bf16_xf32_x4_rows_exact`
+//! on gfx1201 and the BF16 MFMA trunk route on gfx942, written in place into the lanes' own
+//! key / value slices), and only the gate / norm / convolution tail
 //! ([`StageName::PleConv`], `GroupedDepthwiseOp::projected`) runs per lane on the lane's own
 //! convolution state.
 //!
@@ -181,7 +182,8 @@ pub enum StageName {
     /// (stateless: the grouped gate / norm / convolution tail that consumes
     /// them is [`StageName::PleConv`], per lane). Placed on its own all-rows
     /// segment when the BF16 projections run one row-exact launch over every row
-    /// (`HIPFIRE_QWEN4_LANE_PLE_PROJECT`).
+    /// (gated to exact gfx1201 and exact gfx942 by
+    /// `FeatureFlags::qwen4_lane_ple_project_enabled`).
     PleProject,
 }
 
@@ -2560,8 +2562,8 @@ fn forward_wave_ep(
 ) -> Result<(), Qwen4GpuForwardError> {
     let lane_rows: Vec<usize> = lanes.iter().map(|lane| lane.tokens.len()).collect();
     // Joint dense stages only when every lane has at least the prefill lane WMMA floor of rows
-    // (65 = every lane wider than the few-row window, or the LAB
-    // `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`); lanes below it run their row-local stages per lane
+    // (`QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS` with the dense entries on; otherwise 65 = every lane
+    // wider than the few-row window); lanes below it run their row-local stages per lane
     // (`ep_wave_joint_for_lanes`). A wave is a prefill forward by construction.
     let floor = gpu.flags.qwen4_prefill_lwmma_floor_knob();
     let policy = ep_wave_policy_for(ep_wave_joint_for_lanes(&lane_rows, floor));
@@ -3095,9 +3097,10 @@ fn forward_lanes_scoped(
         });
         seg_desc_rows.push(n);
     }
-    // `HIPFIRE_QWEN4_LANE_PLE_PROJECT` (default on, exact gfx1201): the PLE key / value
-    // projections of every lane run ONCE over all `n` rows, on their own all-rows segment (the
-    // lane-wide `PleProject` stage), instead of once per lane. The PLE rows and the key / value
+    // The PLE key / value projections of every lane run ONCE over all `n` rows, on their own
+    // all-rows segment (the lane-wide `PleProject` stage, gated by
+    // `FeatureFlags::qwen4_lane_ple_project_enabled`: exact gfx1201 and exact gfx942), instead
+    // of once per lane. The PLE rows and the key / value
     // scratch are laid out row after row in lane order (`SegViews`: dedicated fields address
     // row `begin` at `begin * width`, the compact PLE arena members at a pitch equal to their
     // width), so a projection over rows `[0, n)` writes every lane's own slice in place and each
@@ -3535,7 +3538,7 @@ fn forward_lanes_scoped(
         };
         let band_first = band_scope.band.start;
         let mut program = layer_program(bundle, policy, band_scope.input.then_some(ple_layer))?;
-        // `HIPFIRE_QWEN4_LANE_PLE_BATCH` (exact gfx1201, default off): AR lane
+        // Gated to exact gfx1201 by `FeatureFlags::qwen4_lane_ple_batch_enabled`: AR lane
         // steps of one row per lane run the PLE chain of up to
         // `PLE_LANES_MAX` consecutive lanes as ONE op (key / value projections
         // over the chunk's rows + one batched tail) instead of the whole chain
@@ -3867,9 +3870,9 @@ fn forward_lanes_scoped(
                                     (*first..*first + chunk.len()).contains(&i)
                                 })
                             {
-                                // `HIPFIRE_QWEN4_LANE_PLE_BATCH`: the chunk's lanes run
-                                // as one op at its first lane (lane rows are
-                                // independent; each keeps its own state).
+                                // The chunk's lanes run as one op at its
+                                // first lane (lane rows are independent; each
+                                // keeps its own state).
                                 if *first == i {
                                     let v = &ple_batch_views[chunk_index];
                                     steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
@@ -4403,7 +4406,7 @@ fn forward_lanes_scoped(
             lease
                 .stage_into(buffer)
                 .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-            if ple_async_upload(fwd.host_ple.enabled(), false, true, gpu.graphs.capture_mode) {
+            if ple_async_upload(false, true, gpu.graphs.capture_mode) {
                 fwd.host_ple.upload_async(gpu, &staged.buf, upload_len)?;
             } else {
                 fwd.host_ple.upload_blocking(gpu, &staged.buf, upload_len)?;
@@ -4536,7 +4539,7 @@ fn forward_lanes_scoped(
         }
         // Prefill wave head: per lane, the singleton's own LM-head / argmax
         // forms on the lane's rows (Final: `requested_rows == 1`).
-        // `HIPFIRE_QWEN4_WAVE_HEAD_ONE` (default on, `=0` kills; exact gfx1201): a Final wave of >= 2 lanes gathers
+        // Exact gfx1201 only: a Final wave of >= 2 lanes gathers
         // every lane's final row into the first rows of `scratch.hc_mixed` (ascending, so no
         // source row is overwritten before it is read) and runs ONE all-rows LM head and ONE
         // argmax over them under the wide few-row scope, instead of one one-row GEMV per lane.

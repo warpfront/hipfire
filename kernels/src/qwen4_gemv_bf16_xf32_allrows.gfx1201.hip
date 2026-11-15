@@ -170,7 +170,7 @@ BF16_ALLROWS_ENTRY(4, 4, 1, , 512)
 BF16_ALLROWS_ENTRY(4, 4, 5, u5, 512)
 
 // ---------------------------------------------------------------------------------------------
-// HC k4 all-rows (HIPFIRE_QWEN4_HC_K4_ALLROWS): `gemv_bf16_xf32_k4` of 9..=64 activation rows in ONE
+// HC k4 all-rows: `gemv_bf16_xf32_k4` of 9..=64 activation rows in ONE
 // launch. The k4 singleton splits each output row's K into quarters, four waves each running
 // `gemv_bf16_xf32_row` on their quarter (lane l: positions l * 8 + 256 * j of the quarter), folds
 // the quarter sums `(q0 + q1) + (q2 + q3)` and applies the optional `hc_act` epilogue (BF16 round

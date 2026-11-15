@@ -3371,7 +3371,6 @@ mod session_tests {
     fn policy() -> PpSessionPolicy {
         PpSessionPolicy {
             turn_snapshots: false,
-            tail_snapshot: true,
             tail_snapshot_min_gap: 1024,
             tail_snapshot_min_prompt: 16384,
             turn_end_token: Some(9),
@@ -3388,10 +3387,6 @@ mod session_tests {
         let skew = [0..20, 20..48];
         let devices = ["0@gfx1100", "1@gfx1100"];
         let base = meta(0, &even, &devices, 5, 1);
-        let tail_off = PpSessionPolicy {
-            tail_snapshot: false,
-            ..policy()
-        };
         let other_gap = PpSessionPolicy {
             tail_snapshot_min_gap: 1,
             ..policy()
@@ -3429,7 +3424,6 @@ mod session_tests {
             // another canonical chunk
             scope(&base, policy(), 4096),
             // the shared schedule settings
-            scope(&base, tail_off, 8192),
             scope(&base, other_gap, 8192),
             scope(&base, no_token, 8192),
         ];

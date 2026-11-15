@@ -127,8 +127,6 @@ fn live_position(
 /// Environment flag that adds message-end snapshot boundaries (P1b), read once
 /// when the bundle is assembled. Off by default.
 const TURN_SNAPSHOTS_ENV: &str = "HIPFIRE_QWEN4_TURN_SNAPSHOTS";
-/// Lineage-only split before the final message end, read once at assembly.
-const TAIL_SNAPSHOT_ENV: &str = "HIPFIRE_QWEN4_TAIL_SNAPSHOT";
 const TAIL_SNAPSHOT_MIN_GAP_ENV: &str = "HIPFIRE_QWEN4_TAIL_SNAPSHOT_MIN_GAP";
 const TAIL_SNAPSHOT_MIN_PROMPT_ENV: &str = "HIPFIRE_QWEN4_TAIL_SNAPSHOT_MIN_PROMPT";
 /// Below these the tail split's extra small tile costs more than the replay it
@@ -206,7 +204,6 @@ pub struct Qwen4Bundle {
     /// `HIPFIRE_QWEN4_TURN_SNAPSHOTS` (read once at assembly): also snapshot
     /// at message ends. Active only with `turn_end_token`.
     turn_snapshots: bool,
-    tail_snapshot: bool,
     tail_snapshot_min_gap: usize,
     tail_snapshot_min_prompt: usize,
     /// The tokenizer's `<|im_end|>` id (`set_turn_end_token`).
@@ -387,7 +384,6 @@ pub fn prompt_stage_bytes(config: &Qwen4Config, format: Qwen4StateFormat) -> Opt
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PpSessionPolicy {
     pub(crate) turn_snapshots: bool,
-    pub(crate) tail_snapshot: bool,
     pub(crate) tail_snapshot_min_gap: usize,
     pub(crate) tail_snapshot_min_prompt: usize,
     pub(crate) turn_end_token: Option<u32>,
@@ -400,11 +396,10 @@ impl PpSessionPolicy {
         let token = self
             .turn_end_token
             .map_or_else(|| "-".to_string(), |token| token.to_string());
+        // The "1" is the retired tail kill switch's on state, kept so band keys stay stable.
         format!(
-            "/tail{}:{}:{}/te{token}",
-            u8::from(self.tail_snapshot),
-            self.tail_snapshot_min_gap,
-            self.tail_snapshot_min_prompt
+            "/tail1:{}:{}/te{token}",
+            self.tail_snapshot_min_gap, self.tail_snapshot_min_prompt
         )
     }
 }
@@ -499,9 +494,6 @@ impl SessionState for Qwen4Bundle {
     }
 
     fn lineage_boundary(&self, prompt: &[u32], after: usize, up_to: usize) -> Option<usize> {
-        if !self.tail_snapshot {
-            return None;
-        }
         let chunk = self.session_cadence_rows()?;
         let token = self.turn_end_token?;
         let p = prompt[..up_to].iter().rposition(|&id| id == token)?;
@@ -909,10 +901,6 @@ impl Qwen4Bundle {
                     ple_config,
                     &inputs.metadata,
                     staging_rows,
-                    // `HIPFIRE_QWEN4_PLE_WIDE_READERS=0` keeps 16 concurrent
-                    // reads for every PLE request, including a whole prefill
-                    // chunk.
-                    hipfire_config::developer_bool("HIPFIRE_QWEN4_PLE_WIDE_READERS", true),
                 ) {
                     Ok(rows) => Some(Qwen4BundlePle {
                         rows,
@@ -996,7 +984,6 @@ impl Qwen4Bundle {
             pair_session_stage: None,
             slowlink: SlowlinkOwner::default(),
             turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
-            tail_snapshot: hipfire_config::developer_bool(TAIL_SNAPSHOT_ENV, true),
             tail_snapshot_min_gap: hipfire_config::developer_var(TAIL_SNAPSHOT_MIN_GAP_ENV)
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -2037,7 +2024,6 @@ impl Qwen4Bundle {
             .as_ref()
             .and_then(Qwen4GpuForward::ep_binding);
         let decision = crate::mtp_gpu::head_d2_decision(
-            hipfire_config::memory::qwen4_mtp_head_d2(),
             self.execution
                 .as_ref()
                 .is_some_and(|forward| !forward.split_layers().is_empty()),
@@ -4878,7 +4864,6 @@ impl Qwen4Bundle {
             state_format: self.state_format,
             turn_end_token: self.turn_end_token,
             turn_snapshots: self.turn_snapshots,
-            tail_snapshot: self.tail_snapshot,
             tail_snapshot_min_gap: self.tail_snapshot_min_gap,
             tail_snapshot_min_prompt: self.tail_snapshot_min_prompt,
             has_mtp: self.mtp.is_some(),
@@ -4981,7 +4966,6 @@ impl Qwen4Bundle {
     pub(crate) fn pp_session_policy(&self) -> PpSessionPolicy {
         PpSessionPolicy {
             turn_snapshots: self.turn_snapshots,
-            tail_snapshot: self.tail_snapshot,
             tail_snapshot_min_gap: self.tail_snapshot_min_gap,
             tail_snapshot_min_prompt: self.tail_snapshot_min_prompt,
             turn_end_token: self.turn_end_token,
@@ -4992,7 +4976,6 @@ impl Qwen4Bundle {
     /// match; called at every plan and prefill begin.
     pub(crate) fn pp_adopt_session_policy(&mut self, policy: PpSessionPolicy) {
         self.turn_snapshots = policy.turn_snapshots;
-        self.tail_snapshot = policy.tail_snapshot;
         self.tail_snapshot_min_gap = policy.tail_snapshot_min_gap;
         self.tail_snapshot_min_prompt = policy.tail_snapshot_min_prompt;
         self.turn_end_token = policy.turn_end_token;
@@ -6848,7 +6831,6 @@ fn build_ple_row_store(
     ple: &Qwen4PleConfig,
     metadata: &PleHashMetadata,
     staging_rows: usize,
-    wide_readers: bool,
 ) -> Result<RowStore, BundleError> {
     let descriptors = match source {
         Qwen4PleRows::Absent => return Err(no_ple_rows()),
@@ -6867,7 +6849,6 @@ fn build_ple_row_store(
                 store.clone(),
                 metadata.valid_rows(),
                 staging_rows,
-                wide_readers,
             )
             .map_err(BundleError::PleRows);
         }
@@ -6877,7 +6858,6 @@ fn build_ple_row_store(
         descriptors,
         metadata.valid_rows(),
         staging_rows,
-        wide_readers,
     )
     .map_err(BundleError::PleRows)
 }

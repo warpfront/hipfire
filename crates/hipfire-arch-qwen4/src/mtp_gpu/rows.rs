@@ -46,15 +46,6 @@ pub(crate) fn draft_rounds_enabled(config: &Qwen4Config) -> bool {
     )
 }
 
-/// `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS_XBATCH` (default on; `0` ranks every row
-/// with the one-row launches): whether a batched round's draft head shares
-/// one x-batched GEMV over the ranking copy between its rows.
-const MTP_DRAFT_ROUNDS_XBATCH_ENV: &str = "HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS_XBATCH";
-
-/// `HIPFIRE_QWEN4_MTP_DRAFT_PROJ_BATCH` (default on; `0` restores one whole
-/// indexed-attention op per lane): see [`projection_batch`].
-const MTP_DRAFT_PROJ_BATCH_ENV: &str = "HIPFIRE_QWEN4_MTP_DRAFT_PROJ_BATCH";
-
 /// Whether a batched round of `n` lanes splits the indexed attention into ONE
 /// input projection over the `n` rows, each lane's core (its own positions,
 /// K/V cache, pool and selection, one row) and ONE output projection over the
@@ -85,13 +76,13 @@ fn projection_batch(gpu: &Gpu, qsa: &Qwen4QsaWeights<'_>, n: usize) -> bool {
             && n <= MTP_DRAFT_LANES_MAX_GFX942
             && weights.iter().all(|w| w.dtype == DType::BF16)
     };
-    n >= 2 && route && hipfire_config::developer_bool(MTP_DRAFT_PROJ_BATCH_ENV, true)
+    n >= 2 && route
 }
 
 /// Whether the hidden FC's `n * hc_count` branch rows run ONE `ProjectLadder::TrunkRowExact`
 /// launch (`HeadRowViews::new`'s `one_launch`) instead of chunks of the few-row window, for a
 /// BF16 `fc_hidden` (`bf16`):
-/// - exact gfx1201: `HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH` and a row count its BF16 rows-exact route
+/// - exact gfx1201 with a row count its BF16 rows-exact route
 ///   takes in one launch (`Gpu::bf16_rows_exact_one_launch`);
 /// - exact gfx942, in a call wider than the default width (`n > MTP_DRAFT_LANES_MAX`) with at
 ///   most `LANE_ALLROWS_MAX_ROWS` branch rows: `TrunkRowExact` falls through to the BF16 MFMA
@@ -1036,10 +1027,8 @@ impl Qwen4MtpGpu {
         {
             let mut requests: SmallVec<[&mut DraftHeadRequestState; MTP_DRAFT_LANES_MAX]> =
                 lanes.iter_mut().map(|lane| &mut *lane.request).collect();
-            // `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS_XBATCH=0` ranks each row with the
-            // one-row launches (bisection switch; the bytes are the same).
-            let batch = hipfire_config::developer_bool(MTP_DRAFT_ROUNDS_XBATCH_ENV, true)
-                .then_some((&rs.draft_logits, &rs.draft_rotation));
+            // One x-batched GEMV over the ranking copy (same bytes as the one-row launches).
+            let batch = Some((&rs.draft_logits, &rs.draft_rotation));
             draft.draft_rows_enqueue(gpu, head, &rs.hc_mixed, &mut requests, top1_out, batch)?;
         }
         {

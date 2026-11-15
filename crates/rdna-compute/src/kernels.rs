@@ -1482,7 +1482,7 @@ pub const MQ_ROTATE_X_I4_F16OUT_SRC: &str = concat!(
 );
 /// [`MQ_ROTATE_X_I4_F16OUT_SRC`]'s kernel with the shared-expert INT8 route's third output, the
 /// A8 `block_i8_128` blocks of the same rotated row (`mq_rotate_x_i4_f16out_i8`, gfx1201): the
-/// front producer when `HIPFIRE_QWEN4_SHARED_INT8` runs the shared gate/up GEMM.
+/// front producer when the shared gate/up GEMM runs the INT8 route.
 pub const MQ_ROTATE_X_I4_F16OUT_I8_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),

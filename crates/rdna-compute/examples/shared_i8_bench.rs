@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! hipEvent microbench of the Qwen4 shared-expert INT8 route (`HIPFIRE_QWEN4_SHARED_INT8=1`,
-//! `crates/rdna-compute/src/shared_i8.rs`) against the F16 WMMA route it replaces, at the
+//! hipEvent microbench of the Qwen4 shared-expert INT8 route
+//! (`crates/rdna-compute/src/shared_i8.rs`) against the F16 WMMA route it replaces, at the
 //! Flash-Next shape (hidden 2560, intermediate 640, BF16 weights), per layer-pass of `ROWS`
 //! rows (default 16384, 4096).
 //!
@@ -18,7 +18,7 @@
 //! and median over the batches, for the whole chain and each stage. Analytic DRAM-ideal bytes
 //! per pass are printed with the times. One fresh process per measurement.
 //!
-//! Run: HIPFIRE_QWEN4_SHARED_INT8=1 cargo run --release --features lab --example shared_i8_bench -p rdna-compute
+//! Run: cargo run --release --features lab --example shared_i8_bench -p rdna-compute
 
 use rdna_compute::shared_i8::SharedI8Weights;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -87,10 +87,7 @@ fn time_us(gpu: &mut Gpu, mut f: impl FnMut(&mut Gpu)) -> (f64, f64) {
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let arch = gpu.arch.to_string();
-    let switch = std::env::var("HIPFIRE_QWEN4_SHARED_INT8").unwrap_or_default();
-    println!(
-        "arch {arch} HIPFIRE_QWEN4_SHARED_INT8={switch:?} calls/batch {CALLS} batches {BATCHES}"
-    );
+    println!("arch {arch} calls/batch {CALLS} batches {BATCHES}");
     let rows_list: Vec<usize> = std::env::var("ROWS")
         .ok()
         .map(|s| {
@@ -117,9 +114,7 @@ fn main() {
         down_rows: H,
     };
     if !gpu.qwen4_shared_i8_applies(&w, 4096) {
-        eprintln!(
-            "the INT8 route does not apply (HIPFIRE_QWEN4_SHARED_INT8={switch:?}, arch {arch})"
-        );
+        eprintln!("the INT8 route does not apply (arch {arch})");
         std::process::exit(2);
     }
     let mut x_rng = Rng(0x77);

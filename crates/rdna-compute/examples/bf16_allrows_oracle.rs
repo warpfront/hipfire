@@ -18,10 +18,10 @@
 //!
 //! Negative controls (each must be detected): row offset, poisoned pad row, wrong K.
 //!
-//! HC k4 section (`HIPFIRE_QWEN4_HC_K4_ALLROWS`, `gemv_bf16_xf32_k4_rows_allrows_m<TM>u<U>`): per layer
+//! HC k4 section (`gemv_bf16_xf32_k4_rows_allrows_m<TM>u<U>`): per layer
 //! block (attn / mlp) the real HC down 320 x 10240 (with and without `hc_act`), the M = 4 write gate
 //! (K 10240) and the up 10240 x 320, rows 1..=64, against the per-row `gemv_bf16_xf32_k4` singleton;
-//! arms group (flags off), `lane_t8` (direct), routed, and every tile x token tile direct; the same
+//! arms `lane_t8` (direct), routed, and every tile x token tile direct; the same
 //! three controls on the HC down; `--bench` adds the HC before (`lane_t8`) / after table.
 //!
 //!   cargo run --release -p rdna-compute --features lab --example bf16_allrows_oracle -- \
@@ -736,7 +736,7 @@ fn controls(gpu: &mut Gpu, rep: &mut Report, router: &[u8], rng: &mut Rng) -> us
     detected
 }
 
-// ---- HC k4 projection (HIPFIRE_QWEN4_HC_K4_ALLROWS) ----------------------------
+// ---- HC k4 projection ----------------------------------------------------------
 
 /// One HC tensor of a layer block (`input_mix_weight_down` `[320, 10240]` or `..._up` `[10240, 320]`).
 fn hc_tensor(
@@ -758,18 +758,12 @@ fn hc_tensor(
     (synth_bf16(rng, m * k), false)
 }
 
-fn set_hc(gpu: &mut Gpu, on: bool) {
-    Arc::make_mut(&mut gpu.flags).qwen4_hc_k4_allrows = on;
-}
-
 fn set_lane_hc(gpu: &mut Gpu, on: bool) {
     Arc::make_mut(&mut gpu.flags).qwen4_lane_hc_allrows = on;
 }
 
 #[derive(Clone, Copy)]
 enum HcArm {
-    /// `HIPFIRE_QWEN4_HC_K4_ALLROWS` and `HIPFIRE_QWEN4_LANE_HC_ALLROWS` off: today's k4 route.
-    Group,
     /// `gemv_bf16_xf32_k4_rows_lane_t8` (the H0 kernel) called directly.
     Lane,
     Routed,
@@ -779,7 +773,6 @@ enum HcArm {
 impl HcArm {
     fn name(self) -> String {
         match self {
-            HcArm::Group => "group".into(),
             HcArm::Lane => "lane_t8".into(),
             HcArm::Routed => "allrows_routed".into(),
             HcArm::Direct(t, tpb) => {
@@ -805,10 +798,9 @@ fn run_hc(
     act: Option<f32>,
     rows: usize,
 ) {
-    set_hc(gpu, !matches!(arm, HcArm::Group | HcArm::Lane));
     set_lane_hc(gpu, matches!(arm, HcArm::Lane));
     match arm {
-        HcArm::Group | HcArm::Routed => hip(
+        HcArm::Routed => hip(
             gpu.gemv_bf16_xf32_k4_rows(w, x, y, m, k, act, rows),
             "k4 routed",
         ),
@@ -821,7 +813,6 @@ fn run_hc(
             "k4 direct",
         ),
     }
-    set_hc(gpu, true);
     set_lane_hc(gpu, true);
 }
 
@@ -883,7 +874,6 @@ fn check_hc(
                 let xv = x.sub_offset(0, rows * k);
                 let mut arms = vec![HcArm::Routed];
                 if rows > 8 {
-                    arms.push(HcArm::Group);
                     arms.push(HcArm::Lane);
                 }
                 for t in HcK4AllRowsTile::ALL {
@@ -974,15 +964,15 @@ fn hc_controls(gpu: &mut Gpu, rep: &mut Report, down: &[u8], rng: &mut Rng) -> u
     detected
 }
 
-/// HC route proof: with the flag on the routed 9..=64-row call loads an `_allrows_` k4 entry and
-/// never `lane_t8` / `_tiled_r8`; flag off loads the incumbent; launch counts at 30 rows.
+/// HC route proof: the routed 9..=64-row call loads an `_allrows_` k4 entry and
+/// never `lane_t8` / `_tiled_r8`; launch counts at 30 rows.
 fn hc_route_proof(gpu: &mut Gpu) {
     let (m, k, rows) = (64usize, HcK4AllRowsTile::MIN_K, 30usize);
     let w = upload_bf16(gpu, &vec![0x3f; m * k * 2], m, k);
     let x = upload_f32(gpu, &vec![0.5f32; MAXR * k]);
     let y = alloc_out(gpu, MAXR * m);
     // Load every kernel first (a capture cannot compile).
-    for arm in [HcArm::Group, HcArm::Lane, HcArm::Routed] {
+    for arm in [HcArm::Lane, HcArm::Routed] {
         run_hc(gpu, arm, &w, &x, &y.live, m, k, Some(0.25), rows);
     }
     let loaded = gpu.loaded_kernel_names();
@@ -990,20 +980,17 @@ fn hc_route_proof(gpu: &mut Gpu) {
         loaded
             .iter()
             .any(|n| n.starts_with("gemv_bf16_xf32_k4_rows_allrows_")),
-        "flag on: no all-rows k4 entry loaded"
+        "no all-rows k4 entry loaded"
     );
     let n_on = launches(gpu, |g| {
         run_hc(g, HcArm::Routed, &w, &x, &y.live, m, k, Some(0.25), rows)
-    });
-    let n_group = launches(gpu, |g| {
-        run_hc(g, HcArm::Group, &w, &x, &y.live, m, k, Some(0.25), rows)
     });
     let n_lane = launches(gpu, |g| {
         run_hc(g, HcArm::Lane, &w, &x, &y.live, m, k, Some(0.25), rows)
     });
     assert_eq!(n_on, 1, "routed HC k4 at 30 rows is one launch");
     println!(
-        "bf16_allrows_oracle: HC route proof ok; launches at 30 rows: group (tiled r8 + tail) {n_group}, lane_t8 {n_lane}, all-rows {n_on}"
+        "bf16_allrows_oracle: HC route proof ok; launches at 30 rows: lane_t8 {n_lane}, all-rows {n_on}"
     );
     for t in [w, x, y.whole] {
         let _ = gpu.free_tensor(t);
@@ -1285,7 +1272,7 @@ fn hc_bench(gpu: &mut Gpu, down: &[u8], reps: usize, rng: &mut Rng) {
     let mut t: HashMap<(usize, usize, bool), f64> = HashMap::new();
     for (case, name) in names.iter().enumerate() {
         for rows in BENCH_ROWS {
-            let off = if rows > 8 { HcArm::Lane } else { HcArm::Group };
+            let off = if rows > 8 { HcArm::Lane } else { HcArm::Routed };
             let mut us = [0.0f64; 2];
             let mut n = [0usize; 2];
             for (i, arm) in [off, HcArm::Routed].into_iter().enumerate() {

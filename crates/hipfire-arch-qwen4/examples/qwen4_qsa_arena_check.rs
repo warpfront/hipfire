@@ -1542,8 +1542,7 @@ fn run() -> Result<i32> {
         "qsa_layers": n_qsa, "backend": backend.name(), "chunk_rows": chunk_rows,
         "scratch_mode": scratch_label,
         "wmma_gather": rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(&gpu, state_format.qsa),
-        "wmma_dense": gpu.arch_caps.has_wmma_w32()
-            && std::env::var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0"),
+        "wmma_dense": gpu.arch_caps.has_wmma_w32(),
         "env": std::env::vars().filter(|(k, _)| k.starts_with("HIPFIRE_") || k.starts_with("QSA_"))
             .collect::<std::collections::BTreeMap<_, _>>(),
     });

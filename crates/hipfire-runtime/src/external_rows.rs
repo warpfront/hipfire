@@ -1005,21 +1005,18 @@ impl RowStore {
         descriptors: Vec<SourceRangeDescriptor>,
         valid_rows: u64,
     ) -> Result<Self, RowStoreError> {
-        Self::with_staging_rows(name, descriptors, valid_rows, 0, true)
+        Self::with_staging_rows(name, descriptors, valid_rows, 0)
     }
 
     /// [`RowStore::new`] whose staging buffers (and coalesced reads) hold at
     /// least `rows` decoded rows, so a prefetch of `rows` row ids is
-    /// admissible.  Never smaller than the default budget.  `wide_readers`
-    /// lets a large request scale its concurrent reads up to
-    /// `MAX_PARALLEL_READERS`; without it every request keeps
-    /// `PARALLEL_READERS`.
+    /// admissible.  Never smaller than the default budget.  A large request
+    /// scales its concurrent reads up to `MAX_PARALLEL_READERS`.
     pub fn with_staging_rows(
         name: &str,
         descriptors: Vec<SourceRangeDescriptor>,
         valid_rows: u64,
         rows: usize,
-        wide_readers: bool,
     ) -> Result<Self, RowStoreError> {
         let descriptors: Arc<[SourceRangeDescriptor]> = descriptors.into();
         let mut layout = validate_descriptors(&descriptors, valid_rows)?;
@@ -1036,7 +1033,6 @@ impl RowStore {
             descriptors,
             layout,
             rows,
-            wide_readers,
             inline_fetch_enabled(),
         )
     }
@@ -1045,14 +1041,13 @@ impl RowStore {
     /// geometry and encoding come from the store, every fetch is served from
     /// its pack (the store is attached as the hot store, which also binds this
     /// store's [`FetchActivity`]), and the positional fallback source reads
-    /// single rows at their pack offsets.  `valid_rows`, `staging_rows` and
-    /// `wide_readers` are as for [`RowStore::with_staging_rows`].
+    /// single rows at their pack offsets.  `valid_rows` and `staging_rows`
+    /// are as for [`RowStore::with_staging_rows`].
     pub fn from_table_store(
         name: &str,
         store: Arc<HotRowStore>,
         valid_rows: u64,
         staging_rows: usize,
-        wide_readers: bool,
     ) -> Result<Self, RowStoreError> {
         let invalid = |reason: String| RowStoreError::Descriptor { index: 0, reason };
         let rows_per_shard = store.rows_per_shard();
@@ -1106,7 +1101,6 @@ impl RowStore {
             Vec::new().into(),
             layout,
             staging_rows,
-            wide_readers,
             inline_fetch_enabled(),
         )?;
         rows.attach_hot_store(store).map_err(invalid)?;
@@ -1119,7 +1113,6 @@ impl RowStore {
         descriptors: Arc<[SourceRangeDescriptor]>,
         layout: Layout,
         staging_rows: usize,
-        wide_readers: bool,
         inline_fetch: bool,
     ) -> Result<Self, RowStoreError> {
         let decoded_row_bytes = layout.row_width * 2;
@@ -1142,11 +1135,7 @@ impl RowStore {
             shard_scales: layout.shard_scales,
             decoded_row_bytes,
             staging_bytes,
-            max_readers: if wide_readers {
-                MAX_PARALLEL_READERS
-            } else {
-                PARALLEL_READERS
-            },
+            max_readers: MAX_PARALLEL_READERS,
             inline_fetch,
             rows_per_shard: layout.rows_per_shard,
             rows_per_page: layout.rows_per_page,
@@ -3983,7 +3972,6 @@ mod tests {
                     shard_scales: Vec::new().into(),
                 },
                 0,
-                true,
                 inline_fetch,
             )
         }
@@ -4111,7 +4099,7 @@ mod tests {
         assert!(default.unload().unwrap().is_clean());
 
         let rows = default_max * 2 + 3;
-        let store = RowStore::with_staging_rows("t", descriptors, valid_rows, rows, true).unwrap();
+        let store = RowStore::with_staging_rows("t", descriptors, valid_rows, rows).unwrap();
         assert_eq!(store.max_rows_per_prefetch(), rows);
         assert!(matches!(
             store.prefetch(0, vec![0; rows + 1]),
@@ -5113,8 +5101,7 @@ mod tests {
         assert_eq!(store.row_width(), ROW_WIDTH);
         assert_eq!(store.kept_buckets(), 256);
         let by_table =
-            RowStore::from_table_store("rank-order", store.clone(), HOT_PADDED_ROWS, 0, true)
-                .unwrap();
+            RowStore::from_table_store("rank-order", store.clone(), HOT_PADDED_ROWS, 0).unwrap();
 
         let ids = mixed_ids();
         let want = expected_q4_rows(&shards, &ids, HOT_ROWS_PER_SHARD);
@@ -5146,11 +5133,9 @@ mod tests {
         assert!(!by_table.activity().idle_for(Duration::from_secs(3600)));
 
         // Bad valid-row counts, and a store binds one row store only.
-        assert!(RowStore::from_table_store("x", store.clone(), 0, 0, true).is_err());
-        assert!(
-            RowStore::from_table_store("x", store.clone(), HOT_PADDED_ROWS + 1, 0, true).is_err()
-        );
-        match RowStore::from_table_store("x", store.clone(), HOT_PADDED_ROWS, 0, true).err() {
+        assert!(RowStore::from_table_store("x", store.clone(), 0, 0).is_err());
+        assert!(RowStore::from_table_store("x", store.clone(), HOT_PADDED_ROWS + 1, 0).is_err());
+        match RowStore::from_table_store("x", store.clone(), HOT_PADDED_ROWS, 0).err() {
             Some(RowStoreError::Descriptor { reason, .. }) => {
                 assert!(reason.contains("another row store"), "{reason}")
             }
@@ -6269,7 +6254,6 @@ mod tests {
                 descriptors,
                 layout,
                 0,
-                false,
                 true,
             )
             .unwrap();

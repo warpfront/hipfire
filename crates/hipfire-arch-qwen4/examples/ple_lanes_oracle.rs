@@ -3,10 +3,10 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte oracle + microbench of the lane-batched PLE chain
-//! (`HIPFIRE_QWEN4_LANE_PLE_BATCH`, `GroupedDepthwiseOp::lane_states`).
+//! (`GroupedDepthwiseOp::lane_states`, exact gfx1201).
 //!
 //! ```text
-//! HIPFIRE_QWEN4_LANE_PLE_BATCH=1 ple_lanes_oracle <BASE.mq4-xts> [--steps N] [--dilation D] [--bench N]
+//! ple_lanes_oracle <BASE.mq4-xts> [--steps N] [--dilation D] [--bench N]
 //! ```
 //!
 //! The real PLE key / value / norm / convolution weights are read from the
@@ -551,11 +551,7 @@ fn run() -> Result<bool, String> {
     let mut gpu = Gpu::init().map_err(err)?;
     println!("device arch: {}", gpu.arch);
     if gpu.arch != "gfx1201" || !gpu.flags.qwen4_lane_ple_batch_enabled() {
-        eprintln!(
-            "REFUSAL: needs exact gfx1201 with HIPFIRE_QWEN4_LANE_PLE_BATCH=1 (arch {}, flag {})",
-            gpu.arch,
-            gpu.flags.qwen4_lane_ple_batch_enabled()
-        );
+        eprintln!("REFUSAL: needs exact gfx1201 (arch {})", gpu.arch);
         std::process::exit(2);
     }
     println!(

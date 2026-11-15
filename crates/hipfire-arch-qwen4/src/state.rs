@@ -2112,14 +2112,12 @@ pub(crate) fn capture_view_start(rows: usize, base: usize, n: usize) -> usize {
     capture_ring_slot(rows, base) + 1 - n
 }
 
-/// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` (developer, default ON, exact `0` is the
-/// kill switch back to one ring allocation per GDN layer): the
-/// capture ring of every GDN layer is a window of ONE shared pool allocation
-/// ([`capture_ring_pool_slots`]) instead of `rows + 1` slots per layer.
+/// Slots between the windows of two consecutive GDN layers in the shared
+/// capture-ring pool: the layer's two write targets, nothing else.
 ///
-/// Why this is the same bytes, kernels and row math. A layer's ring is only
-/// ever touched at its two write targets, physical slots `rows - 1` and
-/// `rows` of its window ([`capture_ring_slot`]): the capture kernels
+/// Why sharing one allocation is sound. A layer's ring is only ever touched
+/// at its two write targets, physical slots `rows - 1` and `rows` of its
+/// window ([`capture_ring_slot`]): the capture kernels
 /// (`gated_delta_step_persistent256_body<kCapture>` and its `_lanes`
 /// variant) read only the live state slot and write only view slot `n - 1`
 /// (`(rows - 1) * slot`, `kernels/src/tensor_ops.hip`), the rollback kernels
@@ -2133,14 +2131,8 @@ pub(crate) fn capture_view_start(rows: usize, base: usize, n: usize) -> usize {
 /// (`2 L + rows - 1`, `2 L + rows`) are distinct from every other layer's
 /// (`2 L' + rows - 1`, `2 L' + rows`), and the windows overlap only in slots
 /// nobody touches. The kernels, the pointer table, the logical slot numbering
-/// (`gdn_live`, halves) and every view are unchanged; only the allocation
+/// (`gdn_live`, halves) and every view stay per layer; only the allocation
 /// behind the window pointers is shared.
-pub(crate) fn lane_reserve_trim() -> bool {
-    hipfire_config::qwen4_lane_reserve_trim()
-}
-
-/// Slots between the windows of two consecutive GDN layers in the shared
-/// capture-ring pool: the layer's two write targets, nothing else.
 pub(crate) const CAPTURE_POOL_STRIDE: usize = 2;
 
 /// State slots of the shared capture-ring pool of `gdn_layers` layers holding
@@ -2155,25 +2147,13 @@ pub(crate) fn capture_ring_pool_slots(rows: usize, gdn_layers: usize) -> Option<
 }
 
 /// Ring state slots a whole state allocates across its `gdn_layers` GDN
-/// layers for `rows`-row blocks: the shared pool when `trim`, else
-/// `capture_ring_slots` per layer. `None` on overflow.
-pub(crate) fn capture_ring_total_slots(
-    trim: bool,
-    rows: usize,
-    gdn_layers: usize,
-) -> Option<usize> {
+/// layers for `rows`-row blocks: the shared pool. `None` on overflow.
+pub(crate) fn current_capture_ring_total_slots(rows: usize, gdn_layers: usize) -> Option<usize> {
     if gdn_layers == 0 {
         Some(0)
-    } else if trim {
-        capture_ring_pool_slots(rows, gdn_layers)
     } else {
-        gdn_layers.checked_mul(capture_ring_slots(rows)?)
+        capture_ring_pool_slots(rows, gdn_layers)
     }
-}
-
-/// [`capture_ring_total_slots`] under the process configuration.
-pub(crate) fn current_capture_ring_total_slots(rows: usize, gdn_layers: usize) -> Option<usize> {
-    capture_ring_total_slots(lane_reserve_trim(), rows, gdn_layers)
 }
 
 /// The snapshot-arena mirror allocation (elements, dtype) of one state
@@ -2441,8 +2421,8 @@ pub struct Qwen4State {
     /// table the one-launch re-run reads.
     row_capture_output: Option<(GpuTensor, GpuTensor)>,
     /// The one allocation the per-layer capture-ring windows of `row_capture`
-    /// are views of ([`lane_reserve_trim`], [`capture_ring_pool_slots`]);
-    /// `None`: every layer's ring in `row_capture` is its own allocation.
+    /// are views of ([`capture_ring_pool_slots`]); `None`: every layer's ring
+    /// in `row_capture` is its own allocation.
     row_capture_pool: Option<GpuTensor>,
     /// Rows a verify may capture (0 = none allocated); the ring holds `2 * rows`
     /// logical slots on `rows + 1` physical ones ([`capture_ring_slots`]).
@@ -4634,11 +4614,9 @@ impl Qwen4State {
     }
 
     /// [`Self::row_capture_bytes`] per allocation of
-    /// [`Self::ensure_row_capture`], in its allocation order: with the shared
-    /// pool ([`lane_reserve_trim`], default) the pool first, then per GDN layer
-    /// the F32 input rows and the F32 recurrence inputs; with it off per GDN
-    /// layer the recurrent-state ring (storage format), the inputs and the
-    /// recurrence inputs; then the one F32 output block and the pointer table.
+    /// [`Self::ensure_row_capture`], in its allocation order: the shared pool
+    /// first, then per GDN layer the F32 input rows and the F32 recurrence
+    /// inputs; then the one F32 output block and the pointer table.
     /// Empty below two rows or for a band with no GDN layer (nothing is
     /// allocated); `None` on overflow.
     pub(crate) fn row_capture_allocation_sizes_scoped(
@@ -4646,24 +4624,6 @@ impl Qwen4State {
         gdn: GdnStateFormat,
         rows: usize,
         gdn_layers: usize,
-    ) -> Option<Vec<u64>> {
-        Self::row_capture_allocation_sizes_layout(
-            config,
-            gdn,
-            rows,
-            gdn_layers,
-            lane_reserve_trim(),
-        )
-    }
-
-    /// [`Self::row_capture_allocation_sizes_scoped`] for an explicit `trim`
-    /// ([`lane_reserve_trim`]).
-    pub(crate) fn row_capture_allocation_sizes_layout(
-        config: &Qwen4Config,
-        gdn: GdnStateFormat,
-        rows: usize,
-        gdn_layers: usize,
-        trim: bool,
     ) -> Option<Vec<u64>> {
         if rows > hipfire_config::QWEN4_VERIFY_MAX_ROWS {
             return None;
@@ -4685,13 +4645,8 @@ impl Qwen4State {
             .checked_mul(config.linear_value_head_dim)?
             .checked_mul(key_units)?
             .checked_mul(gdn.storage().dtype().size())?;
-        let ring = slot_bytes.checked_mul(capture_ring_slots(rows)?)?;
-        // One shared pool for every layer's window (`lane_reserve_trim`).
-        let pool = if trim {
-            Some(slot_bytes.checked_mul(capture_ring_pool_slots(rows, gdn_layers)?)?)
-        } else {
-            None
-        };
+        // One shared pool for every layer's window.
+        let pool = slot_bytes.checked_mul(capture_ring_pool_slots(rows, gdn_layers)?)?;
         let qkv = config
             .linear_num_key_heads
             .checked_mul(2)?
@@ -4711,24 +4666,16 @@ impl Qwen4State {
             .max(1);
         // Each layer's allocations are checked once; the layer count is not
         // multiplied out so an overflowing total still refuses.
-        let layer = ring.checked_add(inputs)?.checked_add(recurrence)?;
+        let layer = inputs.checked_add(recurrence)?;
         gdn_layers
             .checked_mul(layer)?
             .checked_add(output)?
-            .checked_add(table)?;
-        let mut sizes = Vec::with_capacity(3 * gdn_layers + 3);
-        match pool {
-            Some(pool) => {
-                sizes.push(pool);
-                for _ in 0..gdn_layers {
-                    sizes.extend([inputs, recurrence]);
-                }
-            }
-            None => {
-                for _ in 0..gdn_layers {
-                    sizes.extend([ring, inputs, recurrence]);
-                }
-            }
+            .checked_add(table)?
+            .checked_add(pool)?;
+        let mut sizes = Vec::with_capacity(2 * gdn_layers + 3);
+        sizes.push(pool);
+        for _ in 0..gdn_layers {
+            sizes.extend([inputs, recurrence]);
         }
         sizes.extend([output, table]);
         sizes
@@ -4824,10 +4771,9 @@ impl Qwen4State {
         // Every GDN layer's slot has one geometry (the rollback launch relies
         // on it too); a pool needs it to carve equal windows.
         let (pool_state, pool_dtype) = (self.gdn[0].recurrent.numel(), self.gdn[0].recurrent.dtype);
-        let pooled = lane_reserve_trim()
-            && self.gdn.iter().all(|layer| {
-                layer.recurrent.numel() == pool_state && layer.recurrent.dtype == pool_dtype
-            });
+        let pooled = self.gdn.iter().all(|layer| {
+            layer.recurrent.numel() == pool_state && layer.recurrent.dtype == pool_dtype
+        });
         let pool_elements = if pooled {
             let slots = capture_ring_pool_slots(rows, self.gdn.len()).ok_or_else(overflow)?;
             let elements = slots.checked_mul(pool_state).ok_or_else(overflow)?;
@@ -5600,8 +5546,8 @@ mod tests {
         }
     }
 
-    /// The shared capture-ring pool (`HIPFIRE_QWEN4_LANE_RESERVE_TRIM`) is observationally the
-    /// per-layer ring: replaying random verify commits and rollbacks over every layer of
+    /// The shared capture-ring pool is observationally the per-layer ring: replaying random
+    /// verify commits and rollbacks over every layer of
     /// a state with the kernels modeled as "read the live / source slot, write only view slot
     /// n - 1", each layer's live value matches its own private ring, every layer's views stay
     /// inside the pool, and no pool slot is ever written by two layers (so no layer's live or
@@ -5614,14 +5560,9 @@ mod tests {
                 let pool_slots = capture_ring_pool_slots(rows, layers).unwrap();
                 assert_eq!(pool_slots, CAPTURE_POOL_STRIDE * (layers - 1) + rows + 1);
                 assert_eq!(
-                    capture_ring_total_slots(true, rows, layers),
+                    current_capture_ring_total_slots(rows, layers),
                     Some(pool_slots)
                 );
-                assert_eq!(
-                    capture_ring_total_slots(false, rows, layers),
-                    Some(layers * window)
-                );
-                assert!(pool_slots <= layers * window);
                 let mut pool = vec![0u64; pool_slots];
                 let mut writer: Vec<Option<usize>> = vec![None; pool_slots];
                 let mut private: Vec<Vec<u64>> = (0..layers).map(|_| vec![0u64; window]).collect();
@@ -6483,28 +6424,17 @@ mod tests {
                     (rows * qkv * 4) as u64,
                     (rows * (qkv + 2 * value_heads) * 4) as u64,
                 );
-                let pooled = lane_reserve_trim();
-                let per_layer = if pooled {
-                    // One shared pool, then (inputs, recurrence) per layer.
-                    assert_eq!(sizes.len(), 2 * layers + 3);
-                    assert_eq!(
-                        sizes[0],
-                        capture_ring_pool_slots(rows, layers).unwrap() as u64 * slot_bytes
-                    );
-                    for layer in sizes[1..1 + 2 * layers].chunks(2) {
-                        assert_eq!(layer, [inputs, recurrence], "{gdn:?} {rows}");
-                    }
-                    1 + 2 * layers
-                } else {
-                    assert_eq!(sizes.len(), 3 * layers + 2);
-                    let ring = capture_ring_slots(rows).unwrap() as u64 * slot_bytes;
-                    for layer in sizes[..3 * layers].chunks(3) {
-                        assert_eq!(layer, [ring, inputs, recurrence], "{gdn:?} {rows}");
-                    }
-                    3 * layers
-                };
+                // One shared pool, then (inputs, recurrence) per layer.
+                assert_eq!(sizes.len(), 2 * layers + 3);
                 assert_eq!(
-                    sizes[per_layer..],
+                    sizes[0],
+                    capture_ring_pool_slots(rows, layers).unwrap() as u64 * slot_bytes
+                );
+                for layer in sizes[1..1 + 2 * layers].chunks(2) {
+                    assert_eq!(layer, [inputs, recurrence], "{gdn:?} {rows}");
+                }
+                assert_eq!(
+                    sizes[1 + 2 * layers..],
                     [
                         (rows * value_heads * GDN_HEAD_DIM * 4) as u64,
                         (layers * 16) as u64
@@ -8012,17 +7942,11 @@ mod tests {
     #[test]
     fn row_capture_bytes_charge_the_gdn_storage_dtype() {
         let config = crate::config::compact_test_config();
-        // 36 GDN layers x (F32 inputs 4R x 10240 and recurrence 4R x 10336) + the ring slots
-        // (the shared pool 2 * 35 + R + 1 = 75 slots by default; 36 x (R + 1) with
-        // HIPFIRE_QWEN4_LANE_RESERVE_TRIM=0)
-        // + 4R x 6144 F32 output + 36 x 16 table.
+        // 36 GDN layers x (F32 inputs 4R x 10240 and recurrence 4R x 10336) + the shared ring pool
+        // (2 * 35 + R + 1 = 75 slots) + 4R x 6144 F32 output + 36 x 16 table.
         assert_eq!(capture_ring_slots(4), Some(5));
         assert_eq!(capture_ring_pool_slots(4, 36), Some(75));
-        let (f32_bytes, q8_bytes) = if lane_reserve_trim() {
-            (247_880_256, 72_776_256)
-        } else {
-            (578_181_696, 157_932_096)
-        };
+        let (f32_bytes, q8_bytes) = (247_880_256, 72_776_256);
         assert_eq!(
             Qwen4State::row_capture_bytes(&config, GdnStateFormat::F32, 4),
             Some(f32_bytes)
@@ -8050,26 +7974,24 @@ mod tests {
             .expect("ar-only");
         let locals = [0, 1].map(|rank| global.trunk_shard_local(rank, 2).expect("local config"));
         // The global figures of `row_capture_bytes_charge_the_gdn_storage_dtype`.
-        let trim = lane_reserve_trim();
         assert_eq!(
             Qwen4State::row_capture_bytes(&global, GdnStateFormat::F32, 4),
-            Some(if trim { 247_880_256 } else { 578_181_696 })
+            Some(247_880_256)
         );
         assert_eq!(
             Qwen4State::row_capture_bytes(&global, GdnStateFormat::Q8, 4),
-            Some(if trim { 72_776_256 } else { 157_932_096 })
+            Some(72_776_256)
         );
         for local in &locals {
-            // 36 x (F32 inputs 4R x 5120 and recurrence 4R x 5168) + the ring slots (the shared
-            // 75-slot pool; 36 x (R+1) with HIPFIRE_QWEN4_LANE_RESERVE_TRIM=0) + 4R x 3072 F32
-            // output + 36 x 16 table; Q8 slots are 24 x 128 x 132 bytes.
+            // 36 x (F32 inputs 4R x 5120 and recurrence 4R x 5168) + the shared 75-slot ring pool
+            // + 4R x 3072 F32 output + 36 x 16 table; Q8 slots are 24 x 128 x 132 bytes.
             assert_eq!(
                 Qwen4State::row_capture_bytes(local, GdnStateFormat::F32, 4),
-                Some(if trim { 123_940_416 } else { 289_091_136 })
+                Some(123_940_416)
             );
             assert_eq!(
                 Qwen4State::row_capture_bytes(local, GdnStateFormat::Q8, 4),
-                Some(if trim { 36_388_416 } else { 78_966_336 })
+                Some(36_388_416)
             );
             assert_eq!(
                 Qwen4State::row_capture_bytes(local, GdnStateFormat::Q8, 1),

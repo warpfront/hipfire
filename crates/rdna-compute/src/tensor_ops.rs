@@ -1488,7 +1488,6 @@ pub fn gated_delta_chunk_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool
             && gpu.route_rows(p.rows) <= gpu.few_row_limit())
         && gpu.route_rows(p.rows) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
         && qwen4_gdn_prefill() == Qwen4GdnPrefill::Wy
-        && *crate::gemm::QWEN4_F16_WMMA
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.key_dim == 128
@@ -11965,7 +11964,6 @@ fn qsa_dense_wmma_applies(
 ) -> bool {
     gpu.arch_caps.has_wmma_w32()
         && gpu.route_rows(p.rows) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
-        && *crate::gemm::QWEN4_F16_WMMA
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.head_dim == 256
@@ -12143,7 +12141,6 @@ const QSA_GATHERED_STATIC_LDS_BYTES: usize = 16 * 256 * 2 + 2 * 8 * 256 * 2 + 2 
 /// q8, gfx1201: fp8).  Loaders use it to reserve and account the route's scratch.
 pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
     *QWEN4_QSA_WMMA_GATHER
-        && *crate::gemm::QWEN4_F16_WMMA
         && match format {
             QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
             QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
@@ -12175,7 +12172,7 @@ fn qsa_gathered_wmma_bytes(n_kv_heads: usize, tokens: usize) -> HipResult<usize>
 
 /// Reserve the gathered route's per-GPU workspace for a QSA cache of
 /// `tokens` rows when the route is enabled for `format`. Where the VMM
-/// workspace is admitted (gfx1151/gfx1201 on a VMM-certified platform) this is a
+/// workspace is admitted (gfx1151/gfx1201/gfx1100 on a VMM-certified platform) this is a
 /// stable-VA reservation that commits no pages, released by
 /// `Gpu::invalidate_weight_caches` (model unload); elsewhere the legacy
 /// slot is allocated whole, as before. Returns the reserved bytes, 0 when
@@ -15542,7 +15539,7 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        if !gpu.arch_caps.has_wmma_w32() || !*crate::gemm::QWEN4_F16_WMMA {
+        if !gpu.arch_caps.has_wmma_w32() {
             eprintln!("skip: needs gfx11 WMMA");
             return;
         }
@@ -16352,7 +16349,7 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        if !gpu.arch_caps.has_wmma_w32() || !*crate::gemm::QWEN4_F16_WMMA {
+        if !gpu.arch_caps.has_wmma_w32() {
             eprintln!("skip: needs gfx11 WMMA");
             return;
         }
@@ -16559,7 +16556,7 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        if !gpu.arch_caps.is_gfx1151() || !*crate::gemm::QWEN4_F16_WMMA {
+        if !gpu.arch_caps.is_gfx1151() {
             eprintln!("skip: needs gfx1151 and the F16 WMMA route");
             return;
         }
@@ -16859,7 +16856,7 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        if !gpu.arch_caps.is_gfx1151() || !*crate::gemm::QWEN4_F16_WMMA {
+        if !gpu.arch_caps.is_gfx1151() {
             eprintln!("skip: needs gfx1151 and the F16 WMMA route");
             return;
         }
@@ -18607,7 +18604,7 @@ mod tests {
             eprintln!("skip: no GPU");
             return;
         };
-        if !gpu.arch_caps.has_wmma_w32() || !*crate::gemm::QWEN4_F16_WMMA {
+        if !gpu.arch_caps.has_wmma_w32() {
             eprintln!("skip: needs gfx11 WMMA");
             return;
         }

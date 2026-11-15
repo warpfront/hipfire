@@ -6,7 +6,7 @@
 // `block_i4_128` IU4 sidecar + the RNE F16 cast of the raw row) with a THIRD output: the
 // A8 `block_i8_128` blocks of the same rotated row, the bytes `mq_rotate_x_i8_gfx12` emits
 // (`Gpu::mq6_i8_prepare_x`), for the shared-expert INT8 route
-// (`HIPFIRE_QWEN4_SHARED_INT8`, `shared_i8.rs`): the one read of the F32 activation row feeds
+// (`shared_i8.rs`): the one read of the F32 activation row feeds
 // the router / selector F16 X, the routed gate/up IU4 sidecar and the shared gate/up INT8 GEMM.
 //
 // The host concatenates `block_i4_128_quant.hip` (HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE),

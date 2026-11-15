@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Lane-batched PLE tail launcher (`HIPFIRE_QWEN4_LANE_PLE_BATCH`, exact
-//! gfx1201).
+//! Lane-batched PLE tail launcher (exact gfx1201, gated by
+//! `FeatureFlags::qwen4_lane_ple_batch_enabled`).
 //!
 //! One launch replaces the per-lane `copy_f32_buffer` / `grouped_gate_bf16` /
 //! `grouped_norm_bf16` / `grouped_depthwise_conv_silu_add_bf16` / `add_f32`

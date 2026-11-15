@@ -21,12 +21,12 @@
 //!
 //! # Draw route
 //!
-//! With `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` on (the default on gfx1201), every
+//! On exact gfx1201, every
 //! sampled draw (the AR rows, the prompt-completing first token, the native and
 //! the copy verify windows) is ONE lane-wide device launch
 //! (`hipfire_runtime::lane_draw::lane_draws`): Leviathan against each draft's q
 //! (a copy proposal is a point mass) under the shared device sampler's law, with
-//! the lane's xorshift32 stream as the RNG. With `=0` (or on a device the launch
+//! the lane's xorshift32 stream as the RNG. Elsewhere (or on a device the launch
 //! does not support) the host sampler draws, as before. The two routes draw the
 //! same distribution from different streams, so seeded ids differ between
 //! them. The arm resolves the route from the loaded `Gpu` (`lane_draw_route`)
@@ -1360,7 +1360,7 @@ fn apply_executor_advance(
 
 /// The sampled-draw route this process resolves, exactly as the product does
 /// (`lane::lane_device_sample`, which integration tests cannot see): `device`
-/// when the flag is on and the device supports the lane-wide draw launch,
+/// on exact gfx1201 when the device supports the lane-wide draw launch,
 /// `host` otherwise.
 fn lane_draw_route(gpu: &Gpu) -> &'static str {
     if gpu.flags.qwen4_lane_device_sample_enabled()

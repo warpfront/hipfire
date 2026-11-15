@@ -27,9 +27,7 @@ use crate::expert_ep_units::{
     ep_unit_layer_balance, ep_unit_pin_plane, EpLayerState, EpUnitLayerBalance, EpUnitLayerMap,
     EpUnitPlan, UnitTier,
 };
-use crate::ple_stage::{
-    ple_async_upload, ple_async_upload_enabled, PleHostStage, PLE_ASYNC_UPLOAD_ENV,
-};
+use crate::ple_stage::{ple_async_upload, PleHostStage};
 use crate::program::{
     execute_final_hyper, execute_lm_head, validate_final_hyper, validate_lm_head,
     Qwen4AttentionWeights, Qwen4DenseBinding, Qwen4FfnBinding, Qwen4FfnDims, Qwen4GdnWeights,
@@ -623,7 +621,7 @@ pub fn qwen4_compact_scratch_possible(gpu: &Gpu, config: &Qwen4Config) -> bool {
 /// were sized for.  `source_slab` is the manifest's `FlashNextSlab` recipe
 /// (every routed trunk layer is a slab arena);
 /// `source_symmetric` is the proof from the artifact's actual routed payload
-/// headers ([`crate::artifact::routed_headers_symmetric`]), not metadata, and
+/// headers ([`crate::artifact::routed_headers_symmetric_verdict`]), not metadata, and
 /// also needs the IU4 route requested;
 /// `ple_key_value_bf16` states that the PLE key/value projections are BF16.
 /// Cheap arch/flag checks come first so a caller may skip its header scan
@@ -880,14 +878,6 @@ pub const QWEN4_EP_LANE_PREFILL_STAGE_MIN_ROWS_ENV: &str = "HIPFIRE_EP_LANE_PREF
 /// HC-stream routes keep their own 512-row gates: the IU4 chain reads the F32 activation the
 /// sub-512 routes already produce.
 pub const QWEN4_EP_PREFILL_TILE_MIN_ROWS_ENV: &str = "HIPFIRE_EP_PREFILL_TILE_MIN_ROWS";
-
-/// Whether a long forward that captures wide hidden rows (the native-MTP
-/// prompt fill's trunk tiles) stages like any other long forward. `0` keeps
-/// those tiles on the mapped reads; unset or `1` stages them. The capture
-/// only copies the trunk's output streams after the program has run, on the
-/// compute stream, and never reads an expert, so it is byte-identical either
-/// way. Verify forwards capture too but stay below the row threshold.
-pub const QWEN4_EXPERT_STAGE_CAPTURE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE";
 
 /// One Flash-Next routed expert's QT44 gate/up and QT53 down bytes.
 const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 1_740_800;
@@ -4009,63 +3999,12 @@ pub(crate) fn qwen4_ep_unit_pins_admitted(arch: &str, ranks: usize) -> bool {
     qwen4_ep_balanced_owners_enabled() && qwen4_ep_balanced_owners_refusal(arch, ranks).is_none()
 }
 
-/// Whether an EP load admits the owner-routed tile route object (its buffers, the transport
-/// every rank registers with, the host rendezvous the EP reserve crosses): always, and with the
-/// trunk shard only where something uses it: a reserve-sharing
-/// load (the reserve's rendezvous carrier) or the partial tile mask (`pmask`, default on under
-/// the shard: [`trunk_shard_pmask_env_on`]). The shard's FFN of every forward is this rank's
-/// partial reduced by the fused all-reduce of its HC write, and the owner-routed tile exchange
-/// completes the routed FFN on every rank (it would double the routed half in the reduction), so
-/// under the shard the route's chunk exchange NEVER runs: the partial chunk route takes every wide
-/// call (`forward_chunk_tile`), and with the mask it drops the non-owned experts' tiles through
-/// the route's owner table.
-fn ep_owner_routed_prefill_on(trunk_shard: bool, reserve_sharing: bool, pmask: bool) -> bool {
-    !trunk_shard || reserve_sharing || pmask
-}
-
-/// Owner-routed chunk MoE (EP, N = 2..=8). A prefill chunk of at least 512 rows runs the grouped
-/// GEMMs on the compact (owned-experts-only) table with the tiles of the other ranks' experts
-/// masked out, then pulls each other-rank-owned tile's BF16 grouped down rows over P2P
-/// (`MoeTileExchange`) instead of computing every expert on every rank. Two routes carry it, both
-/// over the stable grouping every rank shares: exact gfx1201 on the symmetric IU4 GEMMs (a chunk
-/// whose layers verified symmetric on every rank), and exact gfx1100 on the F16 WMMA grouped GEMMs
-/// (gate/up with the SwiGLU epilogue and the down, both BF16-out; no symmetric headers needed, the
-/// verdict is that every layer's experts are QT44/QT53). Every other chunk keeps the full-table
-/// route. Admission: [`ep_owner_routed_prefill_on`].
-fn qwen4_ep_owner_routed_prefill_enabled(reserve_sharing: bool) -> bool {
-    ep_owner_routed_prefill_on(
-        crate::weights::trunk_shard::trunk_shard_requested(),
-        reserve_sharing,
-        trunk_shard_pmask_env_on(),
-    )
-}
-
 /// Whether an EP rank runs a COMPACT-table chunk route on every layer (and so may build the
 /// G2 expert stage, whose donor overwrites no peer reads): the admitted owner-routed tile
 /// route, or the trunk-shard partial chunk route (the rank's own compact table, non-owned
 /// experts the zero dummy, no peer expert read).
 fn ep_stage_chunk_route(tile_admitted: bool, trunk_shard: bool) -> bool {
     tile_admitted || trunk_shard
-}
-
-/// `HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK` (developer, default ON under the trunk shard, exact `0` is the
-/// kill switch): under the trunk shard,
-/// a wide chunk on the symmetric IU4 / F16 WMMA grouped route masks the NON-owned experts'
-/// tiles out of the grouped gate/up and down launches (the owner-routed route's tile mask, with
-/// no exchange) instead of running them on the zero dummy tables, so a rank's routed grouped
-/// GEMM work drops to its owned half. Needs the admitted owner-routed tile route object (its
-/// owner table and masked-id buffer; a reserve-sharing shard load); otherwise the compact
-/// zero-dummy route is bound unchanged.
-pub const QWEN4_EP_TRUNK_SHARD_PMASK_ENV: &str = "HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK";
-
-/// The partial tile mask switch (default on).
-pub(crate) fn trunk_shard_pmask_env_on() -> bool {
-    hipfire_config::developer_bool(QWEN4_EP_TRUNK_SHARD_PMASK_ENV, true)
-}
-
-/// Whether the partial-mask route is asked for: the shard's partial chunk route AND the switch.
-fn trunk_partial_mask_on(trunk_chunk_partial: bool, env_on: bool) -> bool {
-    trunk_chunk_partial && env_on
 }
 
 /// The tile route's transport seen as a MASK-ONLY exchange (the trunk shard's partial chunk
@@ -4490,7 +4429,18 @@ pub(crate) struct Qwen4ForwardEp {
     /// same call's gather reads it before the next layer's assignment).
     slot_owner: Option<GpuTensor>,
     /// Owner-routed chunk MoE state (admitted at construction); `None` when the route is not
-    /// admitted ([`qwen4_ep_owner_routed_prefill_enabled`]).
+    /// admitted. A prefill chunk of at least 512 rows runs the grouped GEMMs on the compact
+    /// (owned-experts-only) table with the tiles of the other ranks' experts masked out, then
+    /// pulls each other-rank-owned tile's BF16 grouped down rows over P2P (`MoeTileExchange`)
+    /// instead of computing every expert on every rank. Two routes carry it, both over the
+    /// stable grouping every rank shares: exact gfx1201 on the symmetric IU4 GEMMs (a chunk
+    /// whose layers verified symmetric on every rank), and exact gfx1100 on the F16 WMMA
+    /// grouped GEMMs (gate/up with the SwiGLU epilogue and the down, both BF16-out; no
+    /// symmetric headers needed, the verdict is that every layer's experts are QT44/QT53).
+    /// Every other chunk keeps the full-table route. Under the trunk shard the exchange never
+    /// runs (it would double the routed half of the shard's all-reduced partial): the partial
+    /// chunk route takes every wide call, and its partial mask drops the non-owned experts'
+    /// tiles through the owner table, with no exchange.
     tile: Option<Qwen4TileRoute>,
     /// The wide-verify int8 chain's owner mask (`HIPFIRE_QWEN4_MOE_GU_A8` default, trunk shard):
     /// built at [`Qwen4GpuForward::attach_ep`], `None` when the chain is off or unmasked
@@ -6885,9 +6835,6 @@ pub(crate) struct Qwen4ExpertStage {
     min_rows: usize,
     /// Where `min_rows` came from (`HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` or the default).
     min_rows_source: StageMinRowsSource,
-    /// Long forwards with a wide-hidden capture stage too
-    /// ([`QWEN4_EXPERT_STAGE_CAPTURE_ENV`]).
-    capture: bool,
     /// Donor trunk layer per parity.
     donors: [usize; 2],
     /// Borrowed device views of each donor's gate/up and down experts,
@@ -7169,7 +7116,6 @@ impl Qwen4ExpertStage {
         let mut stage = Self {
             min_rows,
             min_rows_source,
-            capture: hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_CAPTURE_ENV, true),
             donors,
             donor_views: Vec::with_capacity(4),
             mirrors: Vec::with_capacity(4),
@@ -7280,13 +7226,12 @@ impl Qwen4ExpertStage {
             return Err(error);
         }
         eprintln!(
-            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage host expert layers {first_host}..{} through resident layers {} and {} (borrowed donor VRAM, no dedicated stage buffers; {} MiB pinned restore copies, host RAM on top of the placement's pinned experts; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows})",
+            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage host expert layers {first_host}..{} through resident layers {} and {} (borrowed donor VRAM, no dedicated stage buffers; {} MiB pinned restore copies, host RAM on top of the placement's pinned experts; min_rows from {}, prefill chunk {chunk_rows})",
             stage.min_rows,
             moe.len(),
             donors[0],
             donors[1],
             2 * layer_bytes >> 20,
-            if stage.capture { "stage" } else { "mapped" },
             stage.min_rows_source.label()
         );
         hipfire_config::load_summary::note(
@@ -11107,8 +11052,7 @@ pub struct Qwen4GpuForward {
     /// commit fill's in-place embedding source ([`Self::lane_uploaded_token_ids`]).
     /// Emptied by every other forward's id upload.
     pub(crate) lane_uploaded_ids: (usize, Vec<u32>),
-    /// Host staging for the PLE rows and the fence over its asynchronous
-    /// upload (`HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD`).
+    /// Host staging for the PLE rows and the fence over its asynchronous upload.
     pub(crate) host_ple: PleHostStage,
     /// Tokens of the prefill chunk that follows the next forward. A
     /// successful forward enqueues their PLE rows (hashed from the history it
@@ -11121,10 +11065,6 @@ pub struct Qwen4GpuForward {
     pub(crate) ple_ahead: Option<RowTicket>,
     /// Device-argmax token readback (`forward_token_or_argmax`), once used.
     token_readback: Option<TokenReadback>,
-    /// `HIPFIRE_QWEN4_TOKEN_READBACK_EARLY` (default on), read once at
-    /// construction: whether `TokenReadback` queues the id copy at the
-    /// argmax instead of at the PLE read.
-    token_readback_early: bool,
     /// MoE runtime of each absolute trunk layer (`None`: a layer without a
     /// MoE FFN or one this band does not own); length `num_hidden_layers`.
     pub(crate) moe: Vec<Option<Qwen4MoeLayerRuntime>>,
@@ -11258,11 +11198,9 @@ pub struct Qwen4GpuForward {
 struct TokenReadback {
     stream: hip_bridge::Stream,
     event: hip_bridge::Event,
-    /// `HIPFIRE_QWEN4_TOKEN_READBACK_EARLY`: pinned 4-byte landing for the
-    /// id copy that `enqueue` queues on `stream` right behind the argmax
-    /// event. `None` keeps the legacy sequence (host event wait, then a D2H
-    /// into a stack array, then a stream wait) at `read_token`.
-    pinned: Option<hip_bridge::PinnedTransferBuffer>,
+    /// Pinned 4-byte landing for the id copy that `enqueue` queues on `stream`
+    /// right behind the argmax event.
+    pinned: hip_bridge::PinnedTransferBuffer,
 }
 
 // SAFETY: `TokenReadback` exclusively owns its stream, event and pinned id
@@ -11275,9 +11213,9 @@ struct TokenReadback {
 unsafe impl Send for TokenReadback {}
 
 impl TokenReadback {
-    /// Stream, event and (when `early`) the pinned id buffer. A failure
-    /// destroys whatever this call already created.
-    fn create(hip: &hip_bridge::HipRuntime, early: bool) -> Result<Self, hip_bridge::HipError> {
+    /// Stream, event and pinned id buffer. A failure destroys whatever this
+    /// call already created.
+    fn create(hip: &hip_bridge::HipRuntime) -> Result<Self, hip_bridge::HipError> {
         let stream = hip.stream_create_non_blocking()?;
         let event = match hip.event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING) {
             Ok(event) => event,
@@ -11286,17 +11224,13 @@ impl TokenReadback {
                 return Err(error);
             }
         };
-        let pinned = if early {
-            match hip.transfer_buffer(std::mem::size_of::<i32>()) {
-                Ok(buffer) => Some(buffer),
-                Err(error) => {
-                    let _ = hip.event_destroy(event);
-                    let _ = hip.stream_destroy(stream);
-                    return Err(error);
-                }
+        let pinned = match hip.transfer_buffer(std::mem::size_of::<i32>()) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                let _ = hip.event_destroy(event);
+                let _ = hip.stream_destroy(stream);
+                return Err(error);
             }
-        } else {
-            None
         };
         Ok(Self {
             stream,
@@ -11305,12 +11239,11 @@ impl TokenReadback {
         })
     }
 
-    /// Record the argmax-done event on the compute stream. Early mode then
-    /// makes the readback stream wait on that event and queues the 4-byte id
-    /// copy into the pinned buffer, so `read_token` only drains this stream.
-    /// The copy reads `token_ids` after the event, i.e. the argmax this call
-    /// follows; every later writer of `token_ids` first runs
-    /// [`Self::complete`].
+    /// Record the argmax-done event on the compute stream, then make the
+    /// readback stream wait on it and queue the 4-byte id copy into the pinned
+    /// buffer, so `read_token` only drains this stream. The copy reads
+    /// `token_ids` after the event, i.e. the argmax this call follows; every
+    /// later writer of `token_ids` first runs [`Self::complete`].
     fn enqueue(
         &mut self,
         hip: &hip_bridge::HipRuntime,
@@ -11318,45 +11251,29 @@ impl TokenReadback {
         active: Option<&hip_bridge::Stream>,
     ) -> Result<(), hip_bridge::HipError> {
         hip.event_record(&self.event, active)?;
-        if let Some(pinned) = self.pinned.as_mut() {
-            hip.stream_wait_event(&self.stream, &self.event)?;
-            pinned.download_async(
-                hip,
-                token_ids,
-                0,
-                std::mem::size_of::<i32>(),
-                Some(&self.stream),
-            )?;
-        }
+        hip.stream_wait_event(&self.stream, &self.event)?;
+        self.pinned.download_async(
+            hip,
+            token_ids,
+            0,
+            std::mem::size_of::<i32>(),
+            Some(&self.stream),
+        )?;
         Ok(())
     }
 
     /// Drain a queued id copy (no-op when none is pending), so `token_ids`
     /// may be rewritten and the pinned bytes read.
     fn complete(&mut self, hip: &hip_bridge::HipRuntime) -> Result<(), hip_bridge::HipError> {
-        match self.pinned.as_mut() {
-            Some(pinned) => pinned.complete(hip),
-            None => Ok(()),
-        }
+        self.pinned.complete(hip)
     }
 
-    /// The id of the argmax `enqueue` followed. Early mode drains the queued
-    /// copy and reads the pinned bytes; otherwise the legacy event wait, D2H
-    /// and stream wait.
-    fn read_token(
-        &mut self,
-        hip: &hip_bridge::HipRuntime,
-        token_ids: &hip_bridge::DeviceBuffer,
-    ) -> Result<u32, hip_bridge::HipError> {
+    /// The id of the argmax `enqueue` followed: drains the queued copy and
+    /// reads the pinned bytes.
+    fn read_token(&mut self, hip: &hip_bridge::HipRuntime) -> Result<u32, hip_bridge::HipError> {
         let mut bytes = [0u8; 4];
-        if let Some(pinned) = self.pinned.as_mut() {
-            pinned.complete(hip)?;
-            bytes.copy_from_slice(&pinned.as_bytes_mut()[..4]);
-        } else {
-            hip.event_synchronize(&self.event)?;
-            hip.memcpy_dtoh_async(&mut bytes, token_ids, Some(&self.stream))?;
-            hip.stream_synchronize(&self.stream)?;
-        }
+        self.pinned.complete(hip)?;
+        bytes.copy_from_slice(&self.pinned.as_bytes_mut()[..4]);
         Ok(i32::from_ne_bytes(bytes) as u32)
     }
 }
@@ -13173,19 +13090,17 @@ impl Qwen4GpuForward {
                         .map(ep_tail_borrow::EpTailBorrow::exchange_capacity)
                 });
             if let Some(state) = ep.as_mut() {
-                if qwen4_ep_owner_routed_prefill_enabled(reserve.is_some()) {
-                    state.tile = Qwen4TileRoute::admit(
-                        gpu,
-                        &bundle.config,
-                        state.placement,
-                        &state.seal.seal.owner_ranks(),
-                        &scratch,
-                        mode,
-                        max_chunk,
-                        flash_next,
-                        exchange.as_ref(),
-                    )?;
-                }
+                state.tile = Qwen4TileRoute::admit(
+                    gpu,
+                    &bundle.config,
+                    state.placement,
+                    &state.seal.seal.owner_ranks(),
+                    &scratch,
+                    mode,
+                    max_chunk,
+                    flash_next,
+                    exchange.as_ref(),
+                )?;
             }
             // Stock FP8: no QT44/QT53 headers to verify; the grouped route runs
             // in the Full plan's preallocated F32 buffers, proved here once.
@@ -13548,21 +13463,10 @@ impl Qwen4GpuForward {
             host_token_bytes,
             uploaded_id_rows: 0,
             lane_uploaded_ids: (0, Vec::new()),
-            host_ple: PleHostStage::new(
-                host_ple_bytes.len(),
-                ple_async_upload_enabled(
-                    hipfire_config::developer_var(PLE_ASYNC_UPLOAD_ENV)
-                        .ok()
-                        .as_deref(),
-                ),
-            ),
+            host_ple: PleHostStage::new(host_ple_bytes.len()),
             ple_lookahead: Vec::new(),
             ple_ahead: None,
             token_readback: None,
-            token_readback_early: hipfire_config::developer_bool(
-                "HIPFIRE_QWEN4_TOKEN_READBACK_EARLY",
-                true,
-            ),
             cpu_deferred_experts: moe.iter().flatten().any(|layer| layer.cpu_deferred_experts),
             cpu_split_layers: moe
                 .iter()
@@ -13594,7 +13498,7 @@ impl Qwen4GpuForward {
             mesh_route_rows: None,
             mesh_segment: None,
             mesh_next_op: None,
-            mesh_tokens: PleHostStage::new(max_chunk * std::mem::size_of::<i32>(), true),
+            mesh_tokens: PleHostStage::new(max_chunk * std::mem::size_of::<i32>()),
             lane_tokens: crate::lane_token_ring::LaneTokenRing::new(
                 max_chunk * std::mem::size_of::<i32>(),
             ),
@@ -15117,10 +15021,7 @@ impl Qwen4GpuForward {
         }
         if let Some(mut readback) = token_readback {
             // Drain the id copy first: the pinned buffer drops with `readback`.
-            let drained = match readback.pinned.as_mut() {
-                Some(pinned) => pinned.complete(&gpu.hip),
-                None => Ok(()),
-            };
+            let drained = readback.pinned.complete(&gpu.hip);
             for result in [
                 drained,
                 gpu.hip.stream_synchronize(&readback.stream),
@@ -16273,7 +16174,7 @@ impl Qwen4GpuForward {
             });
         }
         let sym_floor = std::mem::replace(&mut gpu.qwen4_moe_sym_iu4_floor, sym_floor_now);
-        // `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`: lowered only inside an EP prefill WAVE
+        // Lowered (`qwen4_prefill_lwmma_floor_knob`) only inside an EP prefill WAVE
         // (`ep_wave_run` sets `wave_route` before entering these scopes). Singleton prefill
         // chunks (`forward_chunk_scoped`), non-EP lane steps, decode, verify and the MTP head
         // always run at `WIDE_VERIFY_MAX_ROWS + 1`, where `Gpu::prefill_small_lane_rows` is never
@@ -16287,7 +16188,7 @@ impl Qwen4GpuForward {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 eprintln!(
-                    "  qwen4 prefill lane WMMA wave floor: {lwmma_floor_now} rows (HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR; EP prefill waves only, singletons, decode and verify are unchanged)"
+                    "  qwen4 prefill lane WMMA wave floor: {lwmma_floor_now} rows (EP prefill waves only, singletons, decode and verify are unchanged)"
                 );
             });
         }
@@ -16867,8 +16768,7 @@ impl Qwen4GpuForward {
         // reads) instead of the full table that would complete the routed FFN on both ranks,
         // and it never runs the owner-routed tile exchange (which completes it too). A
         // reserve-sharing shard load installs the tile route's transport only as the reserve's
-        // rendezvous carrier ([`ep_owner_routed_prefill_on`]): the partial route takes
-        // precedence over it below.
+        // rendezvous carrier: the partial route takes precedence over it below.
         let trunk_chunk_partial = ep_reserve_forward::ep_trunk_partial_chunk(
             ep.is_some(),
             n,
@@ -16905,13 +16805,13 @@ impl Qwen4GpuForward {
                     .map_err(|error| invalid(format!("EP tile exchange: {error}")))?;
             }
         }
-        // Partial mask (`HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK`): the shard's wide chunk on a
+        // Partial mask: the shard's wide chunk on a
         // layer the owner-routed route admits masks the non-owned tiles, no exchange. Admitted
         // at the call's real extent or under the ordinary-prefill intent
         // (`ep_reserve_forward::ep_partial_mask_active`): the intent's canonical route rows
         // make every chunk, a 25-row tail included, take the grouped arm the 8192-row chunk takes.
         let partial_mask_route = tile_route.filter(|_| {
-            trunk_partial_mask_on(trunk_chunk_partial, trunk_shard_pmask_env_on())
+            trunk_chunk_partial
                 && ep_reserve_forward::ep_partial_mask_active(ep, gpu, &config, n, route_n)
         });
         let partial_mask_exchange: Option<PartialMaskExchange<'_>> = partial_mask_route
@@ -17045,10 +16945,8 @@ impl Qwen4GpuForward {
         }
         // Decode, small chunks and MTP's few-row wide-hidden verify keep
         // mapped reads (below `min_rows`). A long forward that captures wide
-        // hidden rows (the MTP prompt fill) stages unless
-        // `HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE=0`: the capture is a copy of
-        // the output streams after the program, on the compute stream. The
-        // parity observer keeps its historical unsplit transport. A stream
+        // hidden rows (the MTP prompt fill) stages too: the capture is a copy of
+        // the output streams after the program, on the compute stream. A stream
         // capture keeps mapped reads too: a staged forward forks a copy
         // stream and its failure recovery synchronizes the device. The trunk-shard partial
         // chunk binds the compact table on EVERY layer (no full table, no peer donor read), the
@@ -17077,12 +16975,7 @@ impl Qwen4GpuForward {
             .filter(|stage| stage.begin_forward(tile_active || trunk_chunk_partial))
             .filter(|_| self.ep_reserve.is_none() || self.borrow_runtimes_active)
         {
-            Some(stage)
-                if n >= stage_threshold(stage.min_rows)
-                    && (stage.capture
-                        || (wide_hidden_capture.is_none() && self.layer_capture.is_none()))
-                    && self.qsa_tap.is_none() =>
-            {
+            Some(stage) if n >= stage_threshold(stage.min_rows) && self.qsa_tap.is_none() => {
                 let capturing = match gpu.active_stream.as_ref() {
                     Some(stream) => gpu.hip.stream_is_capturing(stream)?,
                     None => false,
@@ -17496,8 +17389,7 @@ impl Qwen4GpuForward {
                 },
             )?;
             if self.token_readback.is_none() {
-                self.token_readback =
-                    Some(TokenReadback::create(&gpu.hip, self.token_readback_early)?);
+                self.token_readback = Some(TokenReadback::create(&gpu.hip)?);
             }
             if let Some(readback) = self.token_readback.as_mut() {
                 if let Err(error) = readback.enqueue(
@@ -17636,7 +17528,6 @@ impl Qwen4GpuForward {
                 .filter(|_| n > 1 || device_token.is_some());
             let deferred = ple_split.is_some();
             let mut readback = self.token_readback.as_mut();
-            let token_ids = &self.scratch.token_ids;
             let history = &bundle.state.ple_history;
             let ple_metadata = bundle.ple.as_ref().map(|owner| &owner.metadata);
             let vocab = config.vocab_size;
@@ -17652,7 +17543,7 @@ impl Qwen4GpuForward {
                     let readback = readback
                         .as_deref_mut()
                         .ok_or_else(|| invalid("Qwen4 token readback missing"))?;
-                    let token = readback.read_token(&gpu.hip, &token_ids.buf)?;
+                    let token = readback.read_token(&gpu.hip)?;
                     gpu.take_device_wait_error()?;
                     if token as usize >= vocab {
                         return Err(invalid(
@@ -17678,12 +17569,7 @@ impl Qwen4GpuForward {
                     // Mesh: never block the host on the device queue; the fence
                     // keeps the staging bytes unwritable until the copy ran.
                     PleUploadMode::Async
-                } else if ple_async_upload(
-                    ple_host.enabled(),
-                    false,
-                    deferred,
-                    gpu.graphs.capture_mode,
-                ) {
+                } else if ple_async_upload(false, deferred, gpu.graphs.capture_mode) {
                     // Deferred past layer 0: do not make the host wait for the
                     // layers already enqueued. The fence keeps the staging
                     // bytes unwritable until the copy has run.
@@ -22680,35 +22566,6 @@ impl PairShape {
 #[cfg(test)]
 mod ep_rank_generic_tests {
     use super::*;
-
-    /// The owner-routed tile exchange completes the routed FFN on every rank, so the trunk
-    /// shard (whose FFN is each rank's partial) never runs it; the route object is admitted
-    /// under the shard only as the EP reserve's rendezvous carrier. Without the shard the
-    /// route is admitted whether or not a reserve shares.
-    #[test]
-    fn trunk_shard_admits_the_owner_routed_route_for_a_reserve_or_the_partial_mask() {
-        for reserve in [false, true] {
-            for pmask in [false, true] {
-                assert!(ep_owner_routed_prefill_on(false, reserve, pmask));
-            }
-        }
-        assert!(!ep_owner_routed_prefill_on(true, false, false));
-        assert!(ep_owner_routed_prefill_on(true, true, false));
-        assert!(ep_owner_routed_prefill_on(true, false, true));
-    }
-
-    /// The partial mask needs BOTH the shard's partial chunk route and the switch (default off).
-    #[test]
-    fn partial_mask_needs_the_partial_chunk_route_and_the_switch() {
-        assert_eq!(
-            QWEN4_EP_TRUNK_SHARD_PMASK_ENV,
-            "HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK"
-        );
-        assert!(!trunk_partial_mask_on(false, false));
-        assert!(!trunk_partial_mask_on(false, true));
-        assert!(!trunk_partial_mask_on(true, false));
-        assert!(trunk_partial_mask_on(true, true));
-    }
 
     /// The wide-verify chain's masked tile id scratch covers the padded tile capacity of its widest
     /// call (64 rows, top-10 of 512 experts: `ceil16(640 + 15 * 512) = 8320` grouped rows, 520 tiles) and

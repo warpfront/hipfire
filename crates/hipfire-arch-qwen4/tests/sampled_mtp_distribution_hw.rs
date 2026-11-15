@@ -392,12 +392,11 @@
 //! executor AR rows: the reference);
 //! `lane_batched` and `lane_adaptive` are native-MTP mesh lanes
 //! (`Qwen4Bundle::ep_mesh_decode_step`, Leviathan acceptance against each
-//! draft's q, every lane MTP, no copy lane). With
-//! `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` on (the default on gfx1201) every sampled
+//! draft's q, every lane MTP, no copy lane). On exact gfx1201 every sampled
 //! draw of every arm (AR rows, the prompt-completing first token, native and
 //! copy verify windows) is one lane-wide device launch
 //! (`hipfire_runtime::lane_draw::lane_draws`) under the shared device sampler's
-//! law (a copy proposal is a point-mass q); `=0` restores the host sampler. The
+//! law (a copy proposal is a point-mass q); elsewhere the host sampler draws. The
 //! arm resolves the route from its loaded `Gpu` and records it as
 //! `lane_suite.lane_draw_route` (`device` or `host`) in its config and merge key,
 //! so ids from one route are a config error under the other, shards of two

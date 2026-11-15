@@ -194,10 +194,6 @@ required-features = ["lab"]
 name = "mtp_takeover_fill_hw"
 required-features = ["reference-parity"]
 
-[[test]]
-name = "mtp_head_d2_hw"
-required-features = ["reference-parity"]
-
 # S1 slow-link layer-major prefill gate (frozen CLI; see docs/VALIDATION.md).
 [[example]]
 name = "qwen4_slowlink_gate"
