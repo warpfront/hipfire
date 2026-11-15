@@ -76,9 +76,6 @@ tempfile = "3"
 # Run on demand:  cargo build -p <crate> --examples --features lab
 # The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
 # ---------------------------------------------------------------------------
-[[example]]
-name = "dspark_qwen3_1window"
-required-features = ["lab"]
 
 [[example]]
 name = "fn_ep_oracle"
@@ -96,6 +93,3 @@ required-features = ["lab"]
 name = "fn_wide_kl_oracle"
 required-features = ["lab"]
 
-[[example]]
-name = "qwen4_slab_d2_capture"
-required-features = ["lab"]

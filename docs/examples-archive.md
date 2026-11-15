@@ -35,6 +35,13 @@ git show <sha>:<path> > <path>
 | `ds4_parent_moe_smoke` | `crates/hipfire-ds4-parent/examples/ds4_parent_moe_smoke.rs` | `bf6ec9ddf240` | 337 | Gate 4 parent-MoE smoke: load one real layer with experts and run parent_moe_forward over 16 rows of plausible activations. |
 | `ds4_parent_seq_plog` | `crates/hipfire-ds4-parent/examples/ds4_parent_seq_plog.rs` | `bf6ec9ddf240` | 108 | Sequential parent forward (token-by-token) for long-seq diagnostics. |
 
+## hipfire-loader
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `dspark_qwen3_1window` | `crates/hipfire-loader/examples/dspark_qwen3_1window.rs` | `0c208697b006` | 152 | Task-10 gate: load a Qwen3-8B target with its DSpark sidecar and drive one spec window through Speculator::prefill. |
+| `qwen4_slab_d2_capture` | `crates/hipfire-loader/examples/qwen4_slab_d2_capture.rs` | `a26defedb9ab` | 628 | Same-input D2/all-GPU slot measurements and artifact-backed CPU fixtures. |
+
 ## hipfire-quantize
 
 | Example | Path | Last commit | LOC | Purpose |
