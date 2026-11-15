@@ -70,7 +70,6 @@ size_bytes = 14980361216
 sha256 = "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7"
 date = "2026-09-07"
 pinned_in = "7babf58ff1"
-mirrored_in = ["scripts/hw-gate/fixtures.json"]
 
 [model."qwen3.6-27b.mq4"]
 status = "retired"
