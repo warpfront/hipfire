@@ -123,7 +123,6 @@ pub fn wy_stream_admitted_arch(
         arch,
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152"
     ) && qwen4_gdn_prefill() == Qwen4GdnPrefill::Wy
-        && *crate::gemm::QWEN4_F16_WMMA
         && key_dim == 128
         && value_dim == 128
         && key_heads > 0

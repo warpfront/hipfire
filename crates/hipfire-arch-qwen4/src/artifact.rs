@@ -1319,18 +1319,9 @@ pub struct Qwen4InventoryReceipt {
 /// non-string id is refused rather than guessed.  The declared recipe is
 /// explicit and exact: the manifest then admits only the formats and extents
 /// that recipe declares.
-///
-/// `drop_head` (the trunk shard's AR-only load,
-/// [`crate::weights::trunk_shard::trunk_shard_drops_mtp_head`]) admits a packed
-/// Flash-Next artifact headless: the config becomes
-/// [`crate::config::Qwen4Profile::FlashNextHeadless`] (no MTP head, the packed recipe
-/// kept) and the manifest declares no `mtp.*` tensor, so nothing downstream (weights,
-/// census, state, lanes, spec) references a head. The artifact's own `mtp.*` records stay
-/// in the file, unread ([`head_free_tensors`]).
 fn manifest_for_metadata(
     config: Qwen4Config,
     metadata_json: &str,
-    drop_head: bool,
     head_sidecar: bool,
 ) -> Result<(Qwen4Config, Qwen4Manifest), Qwen4ArtifactError> {
     let value: serde_json::Value = serde_json::from_str(metadata_json).map_err(|error| {
@@ -1357,15 +1348,6 @@ fn manifest_for_metadata(
                     crate::weights::STOCK_FP8_RECIPE_ID
                 )));
             }
-            let config = if drop_head {
-                config.into_headless().map_err(|error| {
-                    Qwen4ArtifactError::new(format!(
-                        "qwen4: headless config admission failed: {error}"
-                    ))
-                })?
-            } else {
-                config
-            };
             let manifest = Qwen4Manifest::build(&config).map_err(manifest_error)?;
             return Ok((config, manifest));
         };
@@ -1408,44 +1390,19 @@ fn manifest_for_metadata(
     Ok((config, manifest))
 }
 
-/// The HFQ index records the manifest of `config` is checked against: every record, unless
-/// the config is the head-dropped profile, whose `mtp.*` records (the native MTP head the
-/// artifact still carries) are ignored: nothing declares them and nothing reads them.
-fn head_free_tensors<'a>(
-    config: &Qwen4Config,
-    tensors: &'a [HfqTensorInfo],
-) -> std::borrow::Cow<'a, [HfqTensorInfo]> {
-    if matches!(
-        config.profile,
-        crate::config::Qwen4Profile::FlashNextHeadless
-    ) {
-        std::borrow::Cow::Owned(
-            tensors
-                .iter()
-                .filter(|info| !info.name.starts_with("mtp."))
-                .cloned()
-                .collect(),
-        )
-    } else {
-        std::borrow::Cow::Borrowed(tensors)
-    }
-}
-
 fn admit_inventory(
     arch_id: u32,
     config: Qwen4Config,
     metadata_json: &str,
     tensors: &[HfqTensorInfo],
-    drop_head: bool,
 ) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
     if arch_id != ARCH_ID {
         return Err(Qwen4ArtifactError::new(format!(
             "qwen4: source arch_id={arch_id} does not match reserved arch_id={ARCH_ID}"
         )));
     }
-    let (config, manifest) = manifest_for_metadata(config, metadata_json, drop_head, false)?;
-    let source_tensor_count =
-        validate_manifest_inventory(&head_free_tensors(&config, tensors), &manifest, 0, 0)?;
+    let (config, manifest) = manifest_for_metadata(config, metadata_json, false)?;
+    let source_tensor_count = validate_manifest_inventory(tensors, &manifest, 0, 0)?;
     let ple = admit_ple_metadata(metadata_json, &config)?;
     Ok(Qwen4InventoryReceipt {
         config,
@@ -1468,7 +1425,7 @@ pub fn admit_inventory_headers(
     let config = Qwen4Config::from_metadata_json(metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
     })?;
-    admit_inventory(arch_id, config, metadata_json, tensors, false)
+    admit_inventory(arch_id, config, metadata_json, tensors)
 }
 
 /// Explicit developer admission of a header-only dry inventory: Flash-Next
@@ -1485,7 +1442,7 @@ pub fn admit_developer_inventory_headers(
     let config = Qwen4Config::from_developer_metadata_json(metadata_json).map_err(|error| {
         Qwen4ArtifactError::new(format!("qwen4: config admission failed: {error}"))
     })?;
-    admit_inventory(arch_id, config, metadata_json, tensors, false)
+    admit_inventory(arch_id, config, metadata_json, tensors)
 }
 
 /// Validate one exact Qwen4 HFQM artifact before any GPU allocation.
@@ -1516,21 +1473,14 @@ pub fn admit_hfqm_artifact_on(
     hfq: &HfqFile,
     slab_device: Option<&str>,
 ) -> Result<Qwen4HfqmArtifact, Qwen4ArtifactError> {
-    admit_hfqm_artifact_with(
-        hfq,
-        slab_device,
-        crate::weights::trunk_shard::trunk_shard_drops_mtp_head(),
-        None,
-    )
+    admit_hfqm_artifact_with(hfq, slab_device, None)
 }
 
-/// [`admit_hfqm_artifact_on`] with the head policy passed in: `drop_head` admits a packed
-/// Flash-Next artifact headless ([`manifest_for_metadata`]). The one place the trunk shard's
-/// switch reaches admission; the CPU tests drive it with an explicit value.
+/// [`admit_hfqm_artifact_on`] with the stock-FP8 MTP sidecar passed in: `None` admits the
+/// artifact alone, `Some` admits it with its sidecar's records as one inventory.
 pub fn admit_hfqm_artifact_with(
     hfq: &HfqFile,
     slab_device: Option<&str>,
-    drop_head: bool,
     mtp: Option<&BoundStockMtpSidecar>,
 ) -> Result<Qwen4HfqmArtifact, Qwen4ArtifactError> {
     if hfq.arch_id != ARCH_ID {
@@ -1557,8 +1507,7 @@ pub fn admit_hfqm_artifact_with(
         ));
     }
     let config = parse_artifact_config(&hfq.metadata_json)?;
-    let (config, mut manifest) =
-        manifest_for_metadata(config, &hfq.metadata_json, drop_head, mtp.is_some())?;
+    let (config, mut manifest) = manifest_for_metadata(config, &hfq.metadata_json, mtp.is_some())?;
     if let Some(plan) = &slab {
         manifest = slab_manifest(&config, &manifest, plan)?;
     }
@@ -1577,7 +1526,6 @@ pub fn admit_hfqm_artifact_with(
         manifest = manifest.without_ple_shards();
     }
     let slab_inventory;
-    let head_free;
     let (inventory_tensors, inventory_manifest): (&[HfqTensorInfo], &Qwen4Manifest) =
         if slab.is_some() {
             // The 49,152 per-expert entries were validated end to end by the
@@ -1585,7 +1533,7 @@ pub fn admit_hfqm_artifact_with(
             // The remaining tensors face the ordinary exact-inventory check
             // against the manifest with the arenas taken out.
             slab_inventory = (
-                head_free_tensors(&config, hfq.tensors())
+                hfq.tensors()
                     .iter()
                     .filter(|info| parse_expert_entry_name(&info.name).is_none())
                     .cloned()
@@ -1600,8 +1548,7 @@ pub fn admit_hfqm_artifact_with(
             );
             (&slab_inventory.0, &slab_inventory.1)
         } else {
-            head_free = head_free_tensors(&config, hfq.tensors());
-            (&head_free[..], &manifest)
+            (hfq.tensors(), &manifest)
         };
     // With the head sidecar the inventory is the concatenation of both files' index
     // records: names, shapes and geometry only (no offsets), so one pass is exact, and a
@@ -1741,7 +1688,14 @@ fn payloads_symmetric(jobs: &[(&[u8], usize)]) -> bool {
     symmetric.load(Ordering::Relaxed)
 }
 
-/// [`routed_headers_symmetric`] over the named packed routed tensors.
+/// Whether every routed expert header of the named packed tensors is on the
+/// symmetric grid (`zp == -8 * sc`, both finite) the symmetric IU4 MoE route
+/// requires, read from the actual payload bytes, not metadata labels. Mirrors
+/// `kernels/src/qwen4_moe_sym_check.gfx1201.hip` exactly: QT44 gate/up and QT53
+/// down only, both QT44 subheaders of every group, every expert and row.
+///
+/// A short or malformed payload is an error; a finite asymmetric header, a
+/// non-QT44/QT53 tier, or an inventory without routed experts returns `false`.
 fn routed_tensors_symmetric(hfq: &HfqFile, names: &[&str]) -> Result<bool, Qwen4ArtifactError> {
     let mut gate_up = 0usize;
     let mut down = 0usize;
@@ -1805,23 +1759,8 @@ fn routed_tensors_symmetric(hfq: &HfqFile, names: &[&str]) -> Result<bool, Qwen4
     Ok(payloads_symmetric(&jobs))
 }
 
-/// Whether every trunk routed expert header of the artifact is on the
-/// symmetric grid (`zp == -8 * sc`, both finite) the symmetric IU4 MoE route
-/// requires, read from the actual payload bytes, not metadata labels.  Mirrors
-/// `kernels/src/qwen4_moe_sym_check.gfx1201.hip` exactly: QT44 gate/up and QT53
-/// down only, both QT44 subheaders of every group, every expert and row.
-///
-/// A short or malformed payload is an error; a finite asymmetric header, a
-/// non-QT44/QT53 tier, or an inventory without routed experts returns `false`.
-pub fn routed_headers_symmetric(
-    hfq: &HfqFile,
-    manifest: &Qwen4Manifest,
-) -> Result<bool, Qwen4ArtifactError> {
-    routed_tensors_symmetric(hfq, &routed_scan_names(manifest))
-}
-
-/// The routed trunk gate/up and down tensor names [`routed_headers_symmetric`]
-/// scans, in manifest order.
+/// The routed trunk gate/up and down tensor names the symmetric scan reads,
+/// in manifest order.
 fn routed_scan_names(manifest: &Qwen4Manifest) -> Vec<&str> {
     manifest
         .weights
@@ -1859,7 +1798,7 @@ fn routed_names_digest(hfq: &HfqFile, names: &[&str]) -> Option<String> {
     Some(format!("{:x}", digest.finalize()))
 }
 
-/// [`routed_headers_symmetric`] with its verdict cached per model file (see
+/// The symmetric-header verdict, cached per model file (see
 /// [`crate::sym_verdict_cache`]): an in-process memo, and, when `home` is the
 /// hipfire home, the verdict file under it. A hit needs the same canonical
 /// `path`, stat key, scan version and routed tensor layout. An artifact with an
@@ -1918,15 +1857,10 @@ pub fn routed_headers_symmetric_cached(
 /// [`routed_headers_symmetric_cached`] for the artifact's own path and the
 /// hipfire home ([`hipfire_config::hipfire_home`]: `HIPFIRE_HOME`, else
 /// `$HOME/.hipfire`). The one entry every scan site calls.
-/// `HIPFIRE_QWEN4_SYM_VERDICT_CACHE=0` disables the file and the memo: every
-/// call scans.
 pub fn routed_headers_symmetric_verdict(
     hfq: &HfqFile,
     manifest: &Qwen4Manifest,
 ) -> Result<bool, Qwen4ArtifactError> {
-    if !hipfire_config::developer_bool(crate::sym_verdict_cache::VERDICT_CACHE_ENV, true) {
-        return routed_headers_symmetric(hfq, manifest);
-    }
     let home = hipfire_config::hipfire_home().ok();
     routed_headers_symmetric_cached(hfq, manifest, hfq.path(), home.as_deref())
 }
@@ -3950,157 +3884,86 @@ mod tests {
         assert!(error.contains("config admission failed"), "{error}");
     }
 
-    fn admit_with_head_policy(
-        json: &str,
-        headers: &[HfqTensorInfo],
-        drop_head: bool,
-    ) -> Result<Qwen4InventoryReceipt, Qwen4ArtifactError> {
-        let config = Qwen4Config::from_metadata_json(json).expect("pinned config");
-        admit_inventory(ARCH_ID, config, json, headers, drop_head)
-    }
-
-    /// The shipped packed artifact (head records in the file) admits under the trunk
-    /// shard's head policy as the headless profile: packed recipe, no `mtp.*` in the
-    /// manifest, the head records ignored, every other record still held to the exact
-    /// inventory. Without the policy the same file admits unchanged, with the head.
+    /// The shipped packed artifact admits with its head: packed recipe, native MTP
+    /// config, every `mtp.*` tensor in the manifest, all head records counted. A file
+    /// without its head records, or with a missing, reshaped or undeclared record, is refused.
     #[test]
-    fn packed_artifact_admits_headless_when_the_shard_drops_the_head() {
+    fn packed_artifact_admits_with_its_head_and_refuses_any_deviation() {
         let headers = flash_next_headers();
-        let head_records = headers
-            .iter()
-            .filter(|header| header.name.starts_with("mtp."))
-            .count();
-        assert!(head_records > 0);
-        let kept = admit_with_head_policy(&flash_next_json(), &headers, false).unwrap();
+        let json = flash_next_json();
+        let kept = admit_inventory_headers(ARCH_ID, &json, &headers).unwrap();
         assert!(kept.config.profile == crate::config::Qwen4Profile::FlashNext);
-        assert!(kept.config.mtp.is_some());
-        assert_eq!(kept.source_tensor_count, headers.len());
-
-        let headless = admit_with_head_policy(&flash_next_json(), &headers, true)
-            .expect("the head-dropped inventory is admitted");
-        assert_eq!(
-            headless.config.profile,
-            crate::config::Qwen4Profile::FlashNextHeadless
-        );
-        assert!(headless.config.mtp.is_none());
-        assert_eq!(headless.config.mtp_num_hidden_layers, 0);
+        assert!(kept.config.mtp.is_some() && kept.config.mtp_num_hidden_layers == 1);
         assert!(matches!(
-            headless.manifest.identity.recipe,
+            kept.manifest.identity.recipe,
             Qwen4TierRecipe::FlashNextPacked { .. }
         ));
-        assert_eq!(
-            headless.manifest.identity.recipe,
-            kept.manifest.identity.recipe
-        );
-        assert_eq!(
-            headless.manifest.identity.profile_id,
-            "qwen3.8-flash-next-headless"
-        );
-        assert!(headless
+        assert!(kept
             .manifest
             .weights
             .iter()
-            .all(|entry| !entry.name.starts_with("mtp.")));
-        assert_eq!(headless.ple, kept.ple);
-        // the manifest declares none of the head's records; they stay in the file, ignored
-        assert_eq!(headless.source_tensor_count, headers.len() - head_records);
+            .any(|entry| entry.name.starts_with("mtp.")));
+        assert_eq!(kept.source_tensor_count, headers.len());
 
-        // a file that never carried the head admits the same headless manifest
+        // a file without its head records is refused by the head-bearing profile
         let no_head: Vec<_> = headers
             .iter()
             .filter(|header| !header.name.starts_with("mtp."))
             .cloned()
             .collect();
-        let bare = admit_with_head_policy(&flash_next_json(), &no_head, true).unwrap();
-        assert_eq!(bare.manifest, headless.manifest);
-        // ... but the head-bearing profile refuses it, and a missing / reshaped trunk record
-        // is still refused under the head policy
-        assert!(admit_with_head_policy(&flash_next_json(), &no_head, false).is_err());
-        let mut missing = headers.clone();
-        let at = missing
-            .iter()
-            .position(|header| header.name == "lm_head.weight")
-            .unwrap();
-        missing.remove(at);
-        assert!(admit_with_head_policy(&flash_next_json(), &missing, true).is_err());
-        let mut reshaped = headers.clone();
-        let at = reshaped
-            .iter()
-            .position(|header| header.name == "lm_head.weight")
-            .unwrap();
-        reshaped[at].shape[0] += 1;
-        assert!(admit_with_head_policy(&flash_next_json(), &reshaped, true).is_err());
-        // an undeclared extra record that is not the head is refused
-        let mut extra = headers.clone();
-        let mut stray = extra[0].clone();
-        stray.name = "model.language_model.stray.weight".into();
-        extra.push(stray);
-        assert!(admit_with_head_policy(&flash_next_json(), &extra, true).is_err());
-        // the stock-FP8 recipe id is its own (already head-free) profile: the policy is moot
-        let stock = stock_fp8_json("stock-fp8");
-        let stock_headers = stock_fp8_headers();
-        let under_policy = admit_with_head_policy(&stock, &stock_headers, true).unwrap();
-        assert_eq!(
-            under_policy.config.profile,
-            crate::config::Qwen4Profile::FlashNextArOnly
-        );
-        assert_eq!(
-            under_policy.manifest.identity.recipe,
-            Qwen4TierRecipe::StockFp8
-        );
-    }
-
-    /// Under the head-keeping shard policy (lab shard switch AND the MTP switch) the shipped
-    /// packed artifact admits UNCHANGED: checkpoint profile, native MTP config, the manifest
-    /// with every `mtp.*` tensor, all head records counted; any other policy outcome admits
-    /// it headless. The kept config then shards into rank-local configs that run the head on
-    /// the global geometry.
-    #[test]
-    fn head_keeping_shard_policy_admits_the_artifact_with_its_head() {
-        use crate::weights::trunk_shard::{drops_head_for, keeps_mtp_given};
-        let headers = flash_next_headers();
-        let json = flash_next_json();
-        let unsharded = admit_with_head_policy(&json, &headers, false).unwrap();
-        for (lab, mtp_env) in [(false, false), (true, false), (false, true)] {
-            let drop = drops_head_for(true, keeps_mtp_given(lab, mtp_env));
-            assert!(drop, "lab={lab} mtp={mtp_env} drops the head");
-            let admitted = admit_with_head_policy(&json, &headers, drop).unwrap();
-            assert_eq!(
-                admitted.config.profile,
-                crate::config::Qwen4Profile::FlashNextHeadless
-            );
-            assert!(admitted.config.mtp.is_none());
-        }
-        let drop = drops_head_for(true, keeps_mtp_given(true, true));
-        assert!(!drop);
-        let kept = admit_with_head_policy(&json, &headers, drop).unwrap();
-        assert_eq!(kept.config, unsharded.config);
-        assert_eq!(kept.config.profile, crate::config::Qwen4Profile::FlashNext);
-        assert!(kept.config.mtp.is_some() && kept.config.mtp_num_hidden_layers == 1);
-        assert_eq!(kept.manifest, unsharded.manifest);
-        assert_eq!(kept.source_tensor_count, headers.len());
-        assert!(
-            kept.manifest
-                .weights
-                .iter()
-                .filter(|entry| entry.name.starts_with("mtp."))
-                .count()
-                > 0
-        );
-        // every head record of the file is still held to the exact inventory
+        assert!(admit_inventory_headers(ARCH_ID, &json, &no_head).is_err());
+        // every head record is still held to the exact inventory
         let mut reshaped = headers.clone();
         let at = reshaped
             .iter()
             .position(|header| header.name.starts_with("mtp.") && header.shape.len() > 1)
             .unwrap();
         reshaped[at].shape[0] += 1;
-        assert!(admit_with_head_policy(&json, &reshaped, drop).is_err());
-        // the admitted global config shards; each rank's head geometry is the global config
+        assert!(admit_inventory_headers(ARCH_ID, &json, &reshaped).is_err());
+        // a missing or reshaped trunk record is refused
+        let mut missing = headers.clone();
+        let at = missing
+            .iter()
+            .position(|header| header.name == "lm_head.weight")
+            .unwrap();
+        missing.remove(at);
+        assert!(admit_inventory_headers(ARCH_ID, &json, &missing).is_err());
+        let mut reshaped = headers.clone();
+        let at = reshaped
+            .iter()
+            .position(|header| header.name == "lm_head.weight")
+            .unwrap();
+        reshaped[at].shape[0] += 1;
+        assert!(admit_inventory_headers(ARCH_ID, &json, &reshaped).is_err());
+        // an undeclared extra record that is not the head is refused
+        let mut extra = headers.clone();
+        let mut stray = extra[0].clone();
+        stray.name = "model.language_model.stray.weight".into();
+        extra.push(stray);
+        assert!(admit_inventory_headers(ARCH_ID, &json, &extra).is_err());
+        // the stock-FP8 recipe id is its own head-free profile
+        let stock = stock_fp8_json("stock-fp8");
+        let under_stock = admit_inventory_headers(ARCH_ID, &stock, &stock_fp8_headers()).unwrap();
+        assert_eq!(
+            under_stock.config.profile,
+            crate::config::Qwen4Profile::FlashNextArOnly
+        );
+        assert_eq!(
+            under_stock.manifest.identity.recipe,
+            Qwen4TierRecipe::StockFp8
+        );
+    }
+
+    /// The packed artifact's config shards into rank-local configs whose native MTP head
+    /// reads the global geometry: the head is replicated, never cut.
+    #[test]
+    fn packed_artifact_head_shards_on_the_global_geometry() {
+        let json = flash_next_json();
+        let kept = admit_inventory_headers(ARCH_ID, &json, &flash_next_headers()).unwrap();
         for rank in 0..2 {
             let local = kept.config.trunk_shard_local(rank, 2).unwrap();
             local.validate().unwrap();
             assert_eq!(local.mtp_geometry(), &kept.config);
-            assert_eq!(local.replica_geometry(), kept.config);
             assert!(local.num_attention_heads < kept.config.num_attention_heads);
         }
     }
@@ -4124,7 +3987,7 @@ mod tests {
         assert_eq!(sidecar.len(), 31);
         assert_eq!(rest.len(), base.len());
         let json = stock_fp8_json("stock-fp8");
-        let (config, manifest) = manifest_for_metadata(flash.clone(), &json, false, true).unwrap();
+        let (config, manifest) = manifest_for_metadata(flash.clone(), &json, true).unwrap();
         assert_eq!(
             config.profile,
             crate::config::Qwen4Profile::FlashNextStockMtp
@@ -4136,7 +3999,7 @@ mod tests {
             base.len() + 31
         );
         // The AR-only form of the same metadata is unchanged.
-        let (ar_config, _) = manifest_for_metadata(flash.clone(), &json, false, false).unwrap();
+        let (ar_config, _) = manifest_for_metadata(flash.clone(), &json, false).unwrap();
         assert!(ar_config.profile.is_ar_only() && ar_config.mtp.is_none());
         // A name present in both files is refused.
         let mut duplicate = merged.clone();
@@ -4148,7 +4011,7 @@ mod tests {
         assert!(validate_manifest_inventory(&missing, &manifest, 0, 0).is_err());
         assert!(validate_manifest_inventory(&base, &manifest, 0, 0).is_err());
         // A packed base (no recipe id) or another recipe cannot take the head sidecar.
-        let error = manifest_for_metadata(flash.clone(), &flash_next_json(), false, true)
+        let error = manifest_for_metadata(flash.clone(), &flash_next_json(), true)
             .unwrap_err()
             .to_string();
         assert!(

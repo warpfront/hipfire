@@ -272,7 +272,7 @@ fn run_case(
         position: 0,
     };
     if !gated_delta_chunk_route(gpu, &step) {
-        return Err(format!("{}: the chunked WY route is not taken (rows >= 512, gfx11 WMMA, HIPFIRE_QWEN4_GDN_PREFILL=wy, HIPFIRE_QWEN4_F16_WMMA != 0)", case.name));
+        return Err(format!("{}: the chunked WY route is not taken (rows >= 512, gfx11 WMMA, HIPFIRE_QWEN4_GDN_PREFILL=wy)", case.name));
     }
     let gate_args = GatedDeltaGateBatched {
         recurrent_output: &output,

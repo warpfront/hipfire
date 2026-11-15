@@ -434,7 +434,7 @@ pub(crate) enum LaneTileRoute {
     /// The trunk shard's partial chunk route (`ep_trunk_partial_chunk`): this rank's compact
     /// table, non-owned experts run on the zero dummy, the all-reduce completes the FFN.
     Partial,
-    /// [`Self::Partial`] with the partial tile mask (`HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK`): the
+    /// [`Self::Partial`] with the partial tile mask: the
     /// non-owned tiles are masked out of the grouped launches, so the rank computes only its
     /// owned experts.
     PartialMask,

@@ -40,10 +40,10 @@ use crate::mesh_rank_copy::{verify_capable, PreparedRankLane, ProbeOutcome};
 use crate::mtp_gpu::MtpAppendScratch;
 use crate::mtp_spec::{
     accept_native_greedy, floor_with_call_log, mtp_append_prefill_chunk, mtp_prefill_chunk,
-    mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
-    mtp_skip_intermediate_pick_enabled, prepare_native_window, publish_native_window,
-    singleton_floor_ar_probe_tokens, singleton_floor_min_windows, CommitFill, HeadTicket,
-    NativeFinish, PreparedNativeWindow, Qwen4Floor, Qwen4Ops, TargetTicket, MTP_WINDOW_COST,
+    mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled, prepare_native_window,
+    publish_native_window, singleton_floor_ar_probe_tokens, singleton_floor_min_windows,
+    CommitFill, HeadTicket, NativeFinish, PreparedNativeWindow, Qwen4Floor, Qwen4Ops, TargetTicket,
+    MTP_WINDOW_COST,
 };
 
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
@@ -358,7 +358,7 @@ pub(crate) fn floor_env_enabled() -> bool {
 /// `HIPFIRE_QWEN4_EP_LANE_AR_FLOOR` (developer; default off, `1` on): whether EP mesh
 /// native-MTP lanes run the AR floor (measured window pricing with sticky retirement to
 /// head-free AR). Off (the default), a mesh lane routes its draft depth from its own agreement
-/// (priced by the measured step cost, `HIPFIRE_QWEN4_LANE_MEASURED_DEPTH`, else
+/// (priced by the measured step cost on the gfx1201 profile, else
 /// [`Qwen4Floor::provisional_depth`]; depth 0 is a one-token `ArSynced` window, never sticky)
 /// and the n-gram copy lane is never stopped by the floor. On, the floor runs unless
 /// `HIPFIRE_MTP_AR_FLOOR=0`.
@@ -383,23 +383,6 @@ const LANE_MAX_DRAFTS: usize = crate::gpu_forward_lanes::LANE_MAX_ROWS - 1;
 /// the C8 program's K = 3 window (4 verify rows per lane).
 const GFX942_LANE_STATIC_DEPTH: usize = 3;
 
-/// `HIPFIRE_QWEN4_LANE_COST` (developer; `0` opts out): the measured lane
-/// cost profile of an arch ([`LaneCostProfile::for_arch`]). Off, every arch
-/// runs the gfx1151-prior, store-pooled, probe-budget-retire lane floor
-/// this module had before profiles.
-pub(crate) fn lane_cost_profile_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_COST", true)
-}
-
-/// `HIPFIRE_QWEN4_LANE_MEASURED_DEPTH` (developer; default on, `0` off): with the gfx1201
-/// lane cost profile, an EP mesh lane with the floor off ([`ep_mesh_lane_floor_enabled`])
-/// asks the store's measured step cost ([`LaneDepthCost`]) only whether a drafting window
-/// beats an AR window; every nonzero depth stays on the gfx1151 [`MTP_WINDOW_COST`] table.
-/// Off, and under the legacy profile, the static table decides AR too.
-pub(crate) fn lane_measured_depth_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_MEASURED_DEPTH", true)
-}
-
 /// `HIPFIRE_QWEN4_LANE_ROW_CAP` (developer; default off, `1` on): the gfx1201
 /// profile's even split of one 8-row group over the step's lanes
 /// ([`LaneCostProfile::step_row_cap`]). Off (the default since the all-rows
@@ -415,8 +398,7 @@ pub(crate) fn lane_row_cap_enabled() -> bool {
 /// The lane floor is the singleton's [`Qwen4Floor`]; the profile is what the
 /// lane feeds it and with which rules:
 ///
-/// - `legacy` (every arch without a measured profile, gfx1151 included, and
-///   every arch under `HIPFIRE_QWEN4_LANE_COST=0`): the gfx1151 prior
+/// - `legacy` (every arch without a measured profile, gfx1151 included): the gfx1151 prior
 ///   [`COST_PRIOR_US`], one fit pooled over the store's lanes and requests
 ///   (the root's [`LaneCostModel`]), retirement at the probe budget with no
 ///   AR probes: the floor this module shipped with, bit for bit.
@@ -500,22 +482,19 @@ impl LaneCostProfile {
 
     /// The profile of `arch` (a `Gpu::arch` string).
     pub(crate) fn for_arch(arch: &str) -> Self {
-        Self::for_arch_with(arch, lane_cost_profile_enabled())
-    }
-
-    /// Whether this profile lets the measured step cost
-    /// ([`LaneDepthCost`], `HIPFIRE_QWEN4_LANE_MEASURED_DEPTH`) remove AR
-    /// windows where a drafting window pays (depth stays static): the gfx1201 profile only.
-    pub(crate) fn measured_depth(&self) -> bool {
-        self.name == "gfx1201" && lane_measured_depth_enabled()
-    }
-
-    fn for_arch_with(arch: &str, enabled: bool) -> Self {
         match arch {
-            "gfx1201" if enabled => Self::gfx1201(),
-            "gfx942" if enabled => Self::gfx942(),
+            "gfx1201" => Self::gfx1201(),
+            "gfx942" => Self::gfx942(),
             _ => Self::LEGACY,
         }
+    }
+
+    /// Whether this profile lets the measured step cost ([`LaneDepthCost`]) remove AR
+    /// windows where a drafting window pays (depth stays static): the gfx1201 profile only.
+    /// Every nonzero depth stays on the gfx1151 [`MTP_WINDOW_COST`] table; the static table
+    /// decides AR everywhere else.
+    pub(crate) fn measured_depth(&self) -> bool {
+        self.name == "gfx1201"
     }
 
     pub(crate) fn name(&self) -> &'static str {
@@ -1686,8 +1665,7 @@ pub(crate) fn prefill_tile(
         ));
     }
     let end = start + tokens.len();
-    let needs_pick =
-        mtp_prefill_chunk_needs_pick(end, host.prompt.len(), mtp_skip_intermediate_pick_enabled());
+    let needs_pick = mtp_prefill_chunk_needs_pick(end, host.prompt.len());
     // `mtp_prefill_chunk` applies batched fill / the DET prompt fill to the scratch.
     let reuse = mtp_reuse_prefill_ids_enabled();
     let pick = lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
@@ -2959,17 +2937,12 @@ mod tests {
             "gfx1151", "gfx1100", "gfx1200", "", "gfx1201x", "gfx940", "gfx9420",
         ] {
             assert_eq!(
-                LaneCostProfile::for_arch_with(arch, true),
+                LaneCostProfile::for_arch(arch),
                 LaneCostProfile::LEGACY,
                 "{arch}"
             );
         }
-        // The kill switch: gfx1201 with HIPFIRE_QWEN4_LANE_COST=0.
-        assert_eq!(
-            LaneCostProfile::for_arch_with("gfx1201", false),
-            LaneCostProfile::LEGACY
-        );
-        let p = LaneCostProfile::for_arch_with("gfx1201", true);
+        let p = LaneCostProfile::for_arch("gfx1201");
         assert_eq!(p.name(), "gfx1201");
         assert_eq!(p.prior_us(), COST_PRIOR_GFX1201_US);
         assert_ne!(p.prior_us(), COST_PRIOR_US);
@@ -2983,14 +2956,9 @@ mod tests {
 
     #[test]
     fn gfx942_lanes_draft_a_static_depth_three_with_no_floor() {
-        let p = LaneCostProfile::for_arch_with("gfx942", true);
+        let p = LaneCostProfile::for_arch("gfx942");
         assert_eq!(p.name(), "gfx942");
         assert_eq!(p.static_depth, 3);
-        // The kill switch (HIPFIRE_QWEN4_LANE_COST=0) is the legacy floor.
-        assert_eq!(
-            LaneCostProfile::for_arch_with("gfx942", false),
-            LaneCostProfile::LEGACY
-        );
         // Even with the floor requested, no floor runs and every window drafts 3.
         let mut policy = LaneSpecPolicy::with_profile(7, true, &p);
         assert!(!policy.floor_enabled && !policy.retired());

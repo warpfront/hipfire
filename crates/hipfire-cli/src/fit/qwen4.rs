@@ -60,7 +60,6 @@ fn analyze_inventory(req: &Qwen4Request<'_>) -> Result<ArchFit, String> {
     let mut receipt = hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
         req.hfq,
         Some(&req.device.arch),
-        hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_drops_mtp_head(),
         stock_mtp.as_ref(),
     )
     .map_err(|error| error.to_string())?;

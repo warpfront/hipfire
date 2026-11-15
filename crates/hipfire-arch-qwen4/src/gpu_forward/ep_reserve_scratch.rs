@@ -1226,10 +1226,9 @@ mod tests {
         assert!(validate_placements(&roots, &segs, &huge, PlacementFit::Exact).is_err());
     }
 
-    /// The headless global config the trunk shard loads and the two rank-local configs cut
-    /// from it.
+    /// The global config the trunk shard loads and the two rank-local configs cut from it.
     fn shard_configs() -> (Qwen4Config, [Qwen4Config; 2]) {
-        let global = config().into_headless().expect("headless global config");
+        let global = config();
         let locals = [0, 1].map(|rank| global.trunk_shard_local(rank, 2).expect("local config"));
         (global, locals)
     }

@@ -71,7 +71,7 @@
 //!
 //! The draw route (`lane_suite.lane_draw_route`, `device` or `host`) is the
 //! sampled-token route the arm RESOLVED at run time
-//! (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` and the device's support): it is known
+//! (exact gfx1201 and the device's support): it is known
 //! only once the arm has a loaded GPU, so the arm process adds it to the
 //! config after the load ([`with_draw_route`]). It is a cross-arm field, so a
 //! merge or a verdict never mixes ids drawn on the device with ids drawn on
@@ -803,7 +803,7 @@ pub fn draw_route_coverage(routes: &[(&str, &str)]) -> (String, Vec<String>) {
     let distinct: BTreeSet<&str> = routes.iter().map(|(_, route)| *route).collect();
     let failures = if distinct.len() > 1 {
         vec![format!(
-            "the cohort's arms ran under different lane draw routes ({per_arm}): regenerate every arm under one HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE setting"
+            "the cohort's arms ran under different lane draw routes ({per_arm}): regenerate every arm on one draw route"
         )]
     } else {
         Vec::new()

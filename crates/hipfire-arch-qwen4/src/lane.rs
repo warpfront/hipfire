@@ -71,10 +71,7 @@ use crate::lane_rank::{DecodeAdmission, LaneProto};
 use crate::mesh_rank_copy::HeadLagStore;
 use crate::mtp_gpu::{MtpAppendScratch, MtpGpuState, MTP_FILL_ROWS};
 use crate::mtp_lanes::PendingWindow;
-use crate::mtp_spec::{
-    mtp_fill_scratch_requested, mtp_fill_scratch_wanted, native_mtp_row_capture,
-    Qwen4PromotionParts,
-};
+use crate::mtp_spec::{mtp_fill_scratch_wanted, native_mtp_row_capture, Qwen4PromotionParts};
 use crate::state::{Qwen4State, Qwen4StateFormat, StateMirror};
 use crate::weights::{
     HyperConnectionWeights, MoeWeights, Qwen4BandScope, Qwen4FfnWeights, Qwen4LayerWeights,
@@ -1774,12 +1771,12 @@ impl<C: LaneCell> LaneTable<C> {
     }
 }
 
-/// Host landing buffer for downloaded lane logits rows: pageable `Vec<f32>`, or
-/// (`HIPFIRE_QWEN4_LANE_PINNED_LOGITS`) a pinned `hipHostMalloc` buffer the
-/// one synchronous D2H of [`download_lane_rows`] DMAs into directly. Derefs to
-/// the backing's whole `[f32]` (the front `rows * vocab` floats of it are the
-/// last fetch); the sampler reads that slice, so the bytes it sees are the
-/// device bytes either way. The pinned buffer is freed when this is dropped.
+/// Host landing buffer for downloaded lane logits rows: a pinned
+/// `hipHostMalloc` buffer on exact gfx1201, which the one synchronous D2H of
+/// [`download_lane_rows`] DMAs into directly; pageable `Vec<f32>` elsewhere.
+/// Derefs to the backing's whole `[f32]` (the front `rows * vocab` floats of it
+/// are the last fetch); the sampler reads that slice, so the bytes it sees are
+/// the device bytes either way. The pinned buffer is freed when it is dropped.
 pub(crate) struct SampleScratch {
     backing: ScratchBacking,
     /// Floats a first allocation / growth reserves at least
@@ -1979,8 +1976,7 @@ fn copy_lane_rows(
 /// Download `rows` consecutive F32 logits rows of `logits` starting at row
 /// `first_row` into the front of `scratch` (grown only if shorter than
 /// `rows * vocab`, never shrunk): one synchronous D2H, straight into the
-/// scratch's pinned buffer when `HIPFIRE_QWEN4_LANE_PINNED_LOGITS` is on
-/// (exact gfx1201, default), else into its pageable `Vec`.
+/// scratch's pinned buffer on exact gfx1201, else into its pageable `Vec`.
 pub(crate) fn download_lane_rows(
     gpu: &Gpu,
     logits: &GpuTensor,
@@ -2120,9 +2116,8 @@ pub(crate) fn lane_sample_step(
     }
 }
 
-/// Whether sampled lanes draw on the device (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`,
-/// default on exact gfx1201): [`lane_sample_device`] instead of
-/// [`lane_sample_step`].
+/// Whether sampled lanes draw on the device (exact gfx1201, and the device's
+/// support): [`lane_sample_device`] instead of [`lane_sample_step`].
 pub(crate) fn lane_device_sample(gpu: &Gpu) -> bool {
     gpu.flags.qwen4_lane_device_sample_enabled()
         && hipfire_runtime::lane_draw::lane_draws_supported(gpu)
@@ -2348,7 +2343,7 @@ pub(crate) struct StepParts<'a> {
     /// only if a request needs more rows; never allocated per step).
     pub sample_host: &'a mut SampleScratch,
     /// The device lane sampler's arena, created at the first device draw
-    /// (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`) and freed with the store.
+    /// (exact gfx1201) and freed with the store.
     pub sample_arena: &'a mut Option<hipfire_runtime::lane_draw::LaneDrawArena>,
     pub spec: Option<&'a mut SpecStore>,
 }
@@ -2765,9 +2760,10 @@ impl Qwen4LaneStore {
         // The legacy wrapper has no rank: rank 0 owns the head iff its band
         // runs the LM head (the single scope and the output band do).
         let (rank, owner_mask) = if scope.output { (0, 1) } else { (0, 2) };
-        let append_scratch = (mtp_fill_scratch_requested()
-            && MtpAppendScratch::allocation_sizes(config, MTP_FILL_ROWS, MTP_FILL_ROWS).is_some())
-        .then_some((MTP_FILL_ROWS, MTP_FILL_ROWS));
+        let append_scratch =
+            MtpAppendScratch::allocation_sizes(config, MTP_FILL_ROWS, MTP_FILL_ROWS)
+                .is_some()
+                .then_some((MTP_FILL_ROWS, MTP_FILL_ROWS));
         let inputs = census::CensusInputs {
             config,
             format,
@@ -2801,9 +2797,10 @@ impl Qwen4LaneStore {
         copy: &LaneCopyConfig,
     ) -> Option<u64> {
         let scope = Qwen4BandScope::single(config);
-        let append_scratch = (mtp_fill_scratch_requested()
-            && MtpAppendScratch::allocation_sizes(config, MTP_FILL_ROWS, MTP_FILL_ROWS).is_some())
-        .then_some((MTP_FILL_ROWS, MTP_FILL_ROWS));
+        let append_scratch =
+            MtpAppendScratch::allocation_sizes(config, MTP_FILL_ROWS, MTP_FILL_ROWS)
+                .is_some()
+                .then_some((MTP_FILL_ROWS, MTP_FILL_ROWS));
         let inputs = census::CensusInputs {
             config,
             format,
@@ -2868,9 +2865,10 @@ impl Qwen4LaneStore {
         copy: Option<(usize, &LaneCopyConfig)>,
     ) -> Option<u64> {
         let scope = Qwen4BandScope::single(config);
-        let append_scratch = (mtp_fill_scratch_requested()
-            && MtpAppendScratch::allocation_sizes(config, MTP_FILL_ROWS, MTP_FILL_ROWS).is_some())
-        .then_some((MTP_FILL_ROWS, MTP_FILL_ROWS));
+        let append_scratch =
+            MtpAppendScratch::allocation_sizes(config, MTP_FILL_ROWS, MTP_FILL_ROWS)
+                .is_some()
+                .then_some((MTP_FILL_ROWS, MTP_FILL_ROWS));
         let inputs = census::CensusInputs {
             config,
             format,
@@ -3318,8 +3316,9 @@ impl Qwen4LaneStore {
     }
 
     /// A non-owning view of the staged MTP store's prompt-fill Append scratch
-    /// ([`MtpAppendScratch::shared_view`]), for the singleton drafter under
-    /// `HIPFIRE_QWEN4_LANE_APPEND_SHARE`; `None` for an AR store or a store without the scratch.
+    /// ([`MtpAppendScratch::shared_view`]), for the singleton drafter when the
+    /// EP load reserves MTP lanes on the exact VMM lane route; `None` for an
+    /// AR store or a store without the scratch.
     pub(crate) fn spec_append_scratch_view(&self) -> Option<MtpAppendScratch> {
         self.spec
             .as_ref()?
@@ -3716,7 +3715,7 @@ mod tests {
     use super::*;
     use crate::expert_arena::ArenaExpert;
 
-    /// Without a pinned runtime (flag off / allocation refused) the scratch is
+    /// Without a pinned runtime (off exact gfx1201, or allocation refused) the scratch is
     /// the pageable `Vec` of old: reserved at the first landing, grown only when
     /// shorter than the request, never shrunk, and the landing bytes are the
     /// slice the sampler reads.

@@ -1433,8 +1433,7 @@ fn main() -> Result<()> {
         artifact_id: std::env::var("QSA_ARTIFACT_ID").unwrap_or_else(|_| args[1].clone()),
         expected_state: Vec::new(),
         validation_cursor: None,
-        wmma_dense: gpu.arch_caps.has_wmma_w32()
-            && std::env::var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0"),
+        wmma_dense: gpu.arch_caps.has_wmma_w32(),
         wmma_gather: rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(&gpu, qsa_format),
     }));
     let mut out = std::fs::File::create(out_path).map_err(err)?;

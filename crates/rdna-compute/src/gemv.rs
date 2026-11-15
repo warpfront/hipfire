@@ -141,14 +141,6 @@ mod awq_rcp_planes_tests {
 }
 static GFX942_ROTATE_LIVE_VALIDATED: AtomicBool = AtomicBool::new(false);
 
-/// `HIPFIRE_QWEN4_MQ4_ROWS_PM` (on unless `0`) runs the few-row MQ4G256V2
-/// projections ([`Gpu::gemv_mq4g256v2_rows_x4`]) of exact gfx1151 / gfx1201 from the
-/// embedded PeaceMaker image (`kernels::MQ4_ROWS_X4_PM_GFX1151` /
-/// `MQ4_ROWS_X4_PM_GFX1201`); `0` runs the per-row `gemv_mq4g256v2` launches (same
-/// bytes, slower). Read once.
-static QWEN4_MQ4_ROWS_PM: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ4_ROWS_PM", true));
-
 /// Output-tile x token-wave shape of a `gemv_bf16_xf32_x4_rows_allrows_m<TM>t<TN>[u<U>]` entry
 /// (`kernels/src/qwen4_gemv_bf16_xf32_allrows.gfx1201.hip`): a block owns `TM` consecutive output
 /// rows and `ceil(rows / TN)` waves, each wave `TN` token rows; `u<U>` is the K-loop unroll.
@@ -20147,7 +20139,7 @@ impl Gpu {
     /// Whether a PREFILL call of `rows` rows takes the row-count-invariant prefill lane-WMMA
     /// entries instead of the 16..=64-row decode-shaped lane WMMA / HC8 arms: at or above the lane
     /// WMMA prefill floor ([`Gpu::qwen4_prefill_lwmma_floor`],
-    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`) within that window, or ANY `2..=64`-row call under
+    /// `QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS`) within that window, or ANY `2..=64`-row call under
     /// the ordinary prefill intent ([`Gpu::ordinary_prefill_active`]), so a row's arithmetic does
     /// not depend on the call's length. Pure. The floor is `WIDE_VERIFY_MAX_ROWS + 1` (so the
     /// floor arm is never true) outside a Qwen4 prefill forward's tile scopes: decode, verify,
@@ -20194,7 +20186,7 @@ impl Gpu {
     }
 
     /// Whether the HC k4 projection of `rows` activation rows takes the one-launch all-rows arm
-    /// (`HIPFIRE_QWEN4_HC_K4_ALLROWS`, exact gfx1201): the flag, `k % 32 == 0`, `k >=
+    /// (exact gfx1201): `k % 32 == 0`, `k >=
     /// [`HcK4AllRowsTile::MIN_K`]` and 9..=
     /// [`WIDE_VERIFY_MAX_ROWS`] rows. Pure; every output is bitwise the k4 singleton's, so no scope
     /// or recording state changes it.
@@ -20210,7 +20202,7 @@ impl Gpu {
     /// `gemv_bf16_xf32_k4_rows_allrows_m<TM>u<U>` launch ([`HcK4AllRowsTile::pick`]): each weight
     /// quarter is loaded once per block and applied to every token row of the block; every output
     /// is bitwise the single-row `gemv_bf16_xf32_k4` value (quarter chains, `(q0+q1)+(q2+q3)`
-    /// fold and `hc_act` epilogue verbatim). Needs the `HIPFIRE_QWEN4_HC_K4_ALLROWS` flag.
+    /// fold and `hc_act` epilogue verbatim). Exact gfx1201 only.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_bf16_xf32_k4_rows_allrows(
         &mut self,
@@ -20244,9 +20236,7 @@ impl Gpu {
     ) -> HipResult<()> {
         let bad = |msg: &str| Err(hip_bridge::HipError::new(1, msg));
         if !self.flags.qwen4_hc_k4_allrows_enabled() {
-            return bad(
-                "gemv_bf16_xf32_k4_rows_allrows needs HIPFIRE_QWEN4_HC_K4_ALLROWS on gfx1201",
-            );
+            return bad("gemv_bf16_xf32_k4_rows_allrows needs exact gfx1201");
         }
         if !k.is_multiple_of(32)
             || k == 0
@@ -22537,11 +22527,10 @@ impl Gpu {
     /// On exact gfx1151 / gfx1201 this runs the embedded PeaceMaker image
     /// `kernels/mq4_rows_x4_pm_gfx{1151,1201}.hxaco` (grid
     /// `[sum(ceil(m_i / 2)), 1, 1]`, block 32, one weight-row pair per
-    /// workgroup, each group dequantized once for all rows) unless
-    /// `HIPFIRE_QWEN4_MQ4_ROWS_PM=0`; otherwise (and on other arches) it is
-    /// the per-part per-row `gemv_mq4g256v2` loop. Admitted wide verify uses one
-    /// fixed8 PM tile launch, independently of the narrow PM selector; other
-    /// wide calls retain groups of eight.
+    /// workgroup, each group dequantized once for all rows); otherwise (and on
+    /// other arches) it is the per-part per-row `gemv_mq4g256v2` loop. Admitted
+    /// wide verify uses one fixed8 PM tile launch; other wide calls retain groups
+    /// of eight.
     pub fn gemv_mq4g256v2_rows_x4(
         &mut self,
         parts: [(&GpuTensor, &GpuTensor, usize); 4],
@@ -22598,22 +22587,18 @@ impl Gpu {
             }
             return Ok(());
         }
-        let pm = if !*QWEN4_MQ4_ROWS_PM {
-            None
-        } else {
-            match self.arch.as_str() {
-                "gfx1151" => Some((
-                    "mq4_rows_x4_pm_gfx1151",
-                    kernels::MQ4_ROWS_X4_PM_GFX1151,
-                    "gemv_mq4g256v2_rows_x4_pm_gfx1151",
-                )),
-                "gfx1201" => Some((
-                    "mq4_rows_x4_pm_gfx1201",
-                    kernels::MQ4_ROWS_X4_PM_GFX1201,
-                    "gemv_mq4g256v2_rows_x4_pm_gfx1201",
-                )),
-                _ => None,
-            }
+        let pm = match self.arch.as_str() {
+            "gfx1151" => Some((
+                "mq4_rows_x4_pm_gfx1151",
+                kernels::MQ4_ROWS_X4_PM_GFX1151,
+                "gemv_mq4g256v2_rows_x4_pm_gfx1151",
+            )),
+            "gfx1201" => Some((
+                "mq4_rows_x4_pm_gfx1201",
+                kernels::MQ4_ROWS_X4_PM_GFX1201,
+                "gemv_mq4g256v2_rows_x4_pm_gfx1201",
+            )),
+            _ => None,
         };
         let Some((module, image, symbol)) = pm else {
             for (w, y, m) in parts {

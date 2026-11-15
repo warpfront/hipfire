@@ -954,7 +954,7 @@ impl Model {
                 .attach_trunk_overlay(overlay)
                 .map_err(|e| format!("qwen4 trunk overlay: {e}"))?;
         }
-        // `<model>.hc8` (E4M3 HC mixer rows): controlled only by HIPFIRE_QWEN4_HC8.
+        // `<model>.hc8` (E4M3 HC mixer rows): applied on exact gfx1201 when present.
         if let Some(sidecar) = hc8_sidecar {
             bundle
                 .attach_hc8_sidecar(sidecar)

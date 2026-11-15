@@ -110,8 +110,7 @@ const WPATS: [&str; 6] = [
     "scale_edge",
 ];
 
-const ENV_REPORT: [&str; 6] = [
-    "HIPFIRE_QWEN4_MQ4_ROWS_PM",
+const ENV_REPORT: [&str; 5] = [
     "HIPFIRE_QWEN4_WIDE_TWIN_MQ4",
     "HIPFIRE_QWEN4_WIDE_TWIN_MQ6",
     "HIPFIRE_FN_LANE_PM_ROWS",

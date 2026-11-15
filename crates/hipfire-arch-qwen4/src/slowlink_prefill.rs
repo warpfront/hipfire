@@ -2195,7 +2195,7 @@ impl PleCursor {
         let ids = self.histories[ti].row_ids(&owner.metadata, w.tile_tokens(ti));
         let mut fetch = RowFetch::begin_or_adopt(&owner.rows, self.retained.take(), ids)
             .map_err(|error| Qwen4GpuForwardError::Ple(error.to_string()))?;
-        let mode = if ple_async_upload(host.enabled(), false, true, gpu.graphs.capture_mode) {
+        let mode = if ple_async_upload(false, true, gpu.graphs.capture_mode) {
             PleUploadMode::Async
         } else {
             PleUploadMode::Blocking

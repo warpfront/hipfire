@@ -3610,7 +3610,6 @@ fn load(
         Some(bound) => hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
             &hfq,
             Some(&gpu.arch),
-            false,
             Some(bound),
         ),
         None => admit_hfqm_artifact_on(&hfq, Some(&gpu.arch)),

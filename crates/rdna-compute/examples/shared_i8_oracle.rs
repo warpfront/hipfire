@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! GPU oracle of the Qwen4 shared-expert INT8 route (`HIPFIRE_QWEN4_SHARED_INT8=1`,
-//! `crates/rdna-compute/src/shared_i8.rs`) on exact gfx1201.
+//! GPU oracle of the Qwen4 shared-expert INT8 route (`crates/rdna-compute/src/shared_i8.rs`)
+//! on exact gfx1201.
 //!
 //! Byte checks (any mismatch exits 1):
 //!   1. Weight shadows: the rotated, A8-quantized gate/up (interleaved plane) and down planes
@@ -22,11 +22,11 @@
 //! WMMA route each against an f64 model of the exact BF16 recipe on sampled tokens: relative
 //! RMS and max-abs error of the final rows, and the INT8-vs-F16 route difference.
 //!
-//! Exit 0 pass, 1 mismatch, 2 the route does not apply (needs `HIPFIRE_QWEN4_SHARED_INT8=1` on
-//! gfx1201). `ROWS=a,b,..` overrides the row list; receipt `SHARED_I8_ORACLE_RECEIPT`
+//! Exit 0 pass, 1 mismatch, 2 the route does not apply (exact gfx1201 only).
+//! `ROWS=a,b,..` overrides the row list; receipt `SHARED_I8_ORACLE_RECEIPT`
 //! (default `./shared-i8-oracle.txt`).
 //!
-//! Run: HIPFIRE_QWEN4_SHARED_INT8=1 cargo run --release --features lab --example shared_i8_oracle -p rdna-compute
+//! Run: cargo run --release --features lab --example shared_i8_oracle -p rdna-compute
 
 use hip_bridge::DeviceBuffer;
 use rdna_compute::shared_i8::SharedI8Weights;
@@ -227,8 +227,7 @@ impl Report {
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let arch = gpu.arch.to_string();
-    let switch = std::env::var("HIPFIRE_QWEN4_SHARED_INT8").unwrap_or_default();
-    println!("arch {arch} HIPFIRE_QWEN4_SHARED_INT8={switch:?}");
+    println!("arch {arch}");
 
     let rows_list: Vec<usize> = std::env::var("ROWS")
         .ok()
@@ -262,8 +261,8 @@ fn main() {
     };
     if !gpu.qwen4_shared_i8_applies(&w, 4096) {
         eprintln!(
-            "the shared-expert INT8 route does not apply (HIPFIRE_QWEN4_SHARED_INT8={switch:?}, \
-             arch {arch}): the oracle needs the switch on exact gfx1201"
+            "the shared-expert INT8 route does not apply (arch {arch}): the oracle needs \
+             exact gfx1201"
         );
         std::process::exit(2);
     }
@@ -273,7 +272,7 @@ fn main() {
         failures: 0,
     };
     writeln!(report.text, "shared_i8_oracle receipt").unwrap();
-    writeln!(report.text, "arch {arch} I={I} H={H} switch={switch:?}").unwrap();
+    writeln!(report.text, "arch {arch} I={I} H={H}").unwrap();
 
     // ---- 1. weight shadows ----
     let (gu_plane, dn_plane) = gpu.qwen4_shared_i8_shadow_host(&w).unwrap();

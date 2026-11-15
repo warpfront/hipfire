@@ -8,9 +8,8 @@
 //! per-row power-of-two scales.
 //!
 //! [`resolve_hc8_sidecar`] decides whether the sidecar next to a model applies
-//! to this load.  An absent sidecar, a disabled kill switch
-//! (`HIPFIRE_QWEN4_HC8=0`, passed as `enabled == false`) and a non-Flash-Next
-//! profile are silent (the load logs exactly as before); a present sidecar
+//! to this load.  An absent sidecar, a load off exact gfx1201 (`enabled == false`),
+//! and a non-Flash-Next profile are silent (the load logs exactly as before); a present sidecar
 //! that fails to bind logs one `REFUSED` line and the BF16 weights run.  An
 //! accepted sidecar logs when applied
 //! ([`crate::bundle::Qwen4Bundle::attach_forward`]).
@@ -75,10 +74,9 @@ pub(crate) fn hc8_applied_line(applied: &Hc8Applied) -> String {
 
 /// Resolve the hc8 sidecar next to `model_path` for this load.
 ///
-/// `enabled` is `gpu.flags.qwen4_hc8_enabled()` (kill switch on and exact
-/// gfx1201).  `Ok(None)`: absent, disabled, not Flash-Next, or refused (the
-/// last logged).  `Err` is reserved for the signature's symmetry with the
-/// trunk overlay resolver; no current path returns it.
+/// `enabled` is `gpu.flags.qwen4_hc8_enabled()` (exact gfx1201).  `Ok(None)`: absent,
+/// off exact gfx1201, not Flash-Next, or refused (the last logged).  `Err` is reserved for the
+/// signature's symmetry with the trunk overlay resolver; no current path returns it.
 pub fn resolve_hc8_sidecar(
     hfq: &HfqFile,
     model_path: &Path,

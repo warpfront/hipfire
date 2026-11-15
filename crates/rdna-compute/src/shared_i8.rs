@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Qwen4 shared-expert INT8 prefill route on exact gfx1201 (`HIPFIRE_QWEN4_SHARED_INT8`, default on).
+//! Qwen4 shared-expert INT8 prefill route on exact gfx1201.
 //!
 //! The Flash-Next MoE shared expert (`hidden` = 2560 -> gate/up `intermediate` = 640 ->
 //! SwiGLU -> down 640 -> 2560, BF16 weights) runs on the F16 WMMA route
@@ -47,12 +47,6 @@ const GEMM_ENTRY_DOWN: &str = "qwen4_shared_i8_down_set_f32";
 const QUANT_MODULE: &str = "qwen4_shared_i8_quant_gfx12";
 const QUANT_ENTRY_ROT256: &str = "qwen4_shared_rot256_i8_w";
 const QUANT_ENTRY_ROT128: &str = "qwen4_shared_rot128_i8";
-
-/// `HIPFIRE_QWEN4_SHARED_INT8` (default on, `0` restores the F16 WMMA route): the shared
-/// expert's gate/up/down on the INT8 route (exact gfx1201, eager,
-/// `route_rows >= QWEN4_F16_WMMA_MIN_TOKENS`).
-static QWEN4_SHARED_INT8: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_INT8", true));
 
 /// The model-lifetime INT8 shadows of one layer's shared expert: A8 planes
 /// `[K/128][rows]` of 136-byte blocks (stored as F32 words: 34 per block).
@@ -106,10 +100,9 @@ pub fn shared_i8_shadow_plane_bytes(
     Some((gate_up, down))
 }
 
-/// The flag half of the route's admission, shared with the Qwen4 VRAM census: the INT8 route
-/// exists only on exact gfx1201 with `HIPFIRE_QWEN4_SHARED_INT8` not `0`.
-pub fn shared_i8_route_enabled(flag: bool, arch: &str) -> bool {
-    flag && arch == "gfx1201"
+/// The route's arch gate, shared with the Qwen4 VRAM census: exact gfx1201 only.
+pub fn shared_i8_route_enabled(arch: &str) -> bool {
+    arch == "gfx1201"
 }
 
 fn plane_words(k: usize, rows: usize) -> usize {
@@ -117,20 +110,19 @@ fn plane_words(k: usize, rows: usize) -> usize {
 }
 
 impl Gpu {
-    /// Whether this device and process can ever run the shared-expert INT8 route
-    /// ([`shared_i8_route_enabled`] on `HIPFIRE_QWEN4_SHARED_INT8`): the census charge's gate.
+    /// Whether this device can ever run the shared-expert INT8 route
+    /// ([`shared_i8_route_enabled`]): the census charge's gate.
     pub fn qwen4_shared_i8_enabled(&self) -> bool {
-        shared_i8_route_enabled(*QWEN4_SHARED_INT8, &self.arch)
+        shared_i8_route_enabled(&self.arch)
     }
 
     /// Whether the shared-expert INT8 route admits a call of `batch_size` rows on weights
-    /// `w`: the flag (`HIPFIRE_QWEN4_SHARED_INT8`), exact gfx1201, eager, BF16 weights with
-    /// 16-byte aligned bases, `hidden % 256 == 0`, `intermediate % 128 == 0` (the gate/up
-    /// plane's `2 * intermediate` rows tile by 128), and the F16 WMMA route's row floor.
+    /// `w`: exact gfx1201, eager, BF16 weights with 16-byte aligned bases, `hidden % 256 == 0`,
+    /// `intermediate % 128 == 0` (the gate/up plane's `2 * intermediate` rows tile by 128), and
+    /// the F16 WMMA route's row floor.
     pub fn qwen4_shared_i8_applies(&self, w: &SharedI8Weights<'_>, batch_size: usize) -> bool {
         let (intermediate, hidden) = (w.intermediate, w.hidden);
-        *QWEN4_SHARED_INT8
-            && self.arch == "gfx1201"
+        self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && batch_size > 0

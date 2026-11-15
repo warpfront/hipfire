@@ -484,23 +484,6 @@ mod bt_tile_tests {
 /// wave 0 reduces the partials through LDS. Must match the kernels.
 const MQ3_SPLITK_WAVES: u32 = 8;
 
-/// `HIPFIRE_QWEN4_F16_WMMA=0` keeps Qwen4 prefill on the bit-exact F32 arms
-/// (grouped MoE gate/up and down, BF16 dense projections).  The F16 WMMA arms
-/// are not bit-exact (F16 dequant/inputs); each was admitted by KLD against
-/// the BF16 source.  Read once.
-pub(crate) static QWEN4_F16_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0")
-});
-/// `HIPFIRE_QWEN4_F16_WMMA_GFX1201` runs gfx1201's F16 WMMA route on its
-/// gfx12 WMMA kernels (the BF16 projections and the HC read). Default on:
-/// not bit-exact, admitted by the Flash-Next KLD check against the BF16
-/// teacher; `0` keeps the multirow/SIMT arms.
-/// The M=1 shared selector remains on exact multirow; U1a owns its fusion.
-/// Capture/retained recording and other arches keep their existing routes.
-pub(crate) static QWEN4_F16_WMMA_GFX1201: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", true)
-    });
 /// `HIPFIRE_QWEN4_MOE_FRONT_FUSE` (default on, `0` restores the unfused chain): the
 /// sealed grouped MoE prefill on exact gfx1201's or exact gfx1151's symmetric IU4 route reads the HC `mixed`
 /// rows once in `mq_rotate_x_i4_f16out`, which emits both the router / shared-expert F16 X
@@ -803,35 +786,31 @@ pub const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
 /// The capability half of the Qwen4 F16 WMMA route, the ONE predicate behind
 /// both the runtime ([`Gpu::qwen4_f16_wmma_applies`]) and the placement census
 /// of the model-lifetime BF16 -> F16 weight shadows
-/// (`Gpu::ensure_bf16_f16_shadow`): gfx11 wave32 WMMA, or the gfx1201 opt-in
-/// (`gfx1201_optin`, the knob behind [`Gpu::qwen4_f16_wmma_gfx1201`]).
+/// (`Gpu::ensure_bf16_f16_shadow`): gfx11 wave32 WMMA, or exact gfx1201
+/// ([`Gpu::qwen4_f16_wmma_gfx1201`]).
 /// Capability, never an arch name: every part with `has_wmma_w32` runs the
 /// route.
-pub fn qwen4_f16_shadow_capable(caps: &crate::arch_caps::ArchCaps, gfx1201_optin: bool) -> bool {
-    caps.has_wmma_w32() || (caps.is_gfx1201() && gfx1201_optin)
+pub fn qwen4_f16_shadow_capable(caps: &crate::arch_caps::ArchCaps) -> bool {
+    caps.has_wmma_w32() || caps.is_gfx1201()
 }
 
 /// The whole route predicate of [`Gpu::qwen4_f16_wmma_applies`] over explicit
 /// facts, so a CPU proof can compare the runtime against the placement census
 /// without a device: capability ([`qwen4_f16_shadow_capable`]), a BF16
 /// weight, `route_rows >= QWEN4_F16_WMMA_MIN_TOKENS`, `K % 64 == 0`, no
-/// recorder or capture active (`route_open`) and not opted out
-/// (`f16_wmma_enabled`).
+/// recorder or capture active (`route_open`).
 pub fn qwen4_f16_wmma_applies_for(
     caps: &crate::arch_caps::ArchCaps,
-    gfx1201_optin: bool,
     weight_is_bf16: bool,
     route_rows: usize,
     k: usize,
     route_open: bool,
-    f16_wmma_enabled: bool,
 ) -> bool {
-    qwen4_f16_shadow_capable(caps, gfx1201_optin)
+    qwen4_f16_shadow_capable(caps)
         && weight_is_bf16
         && route_rows >= QWEN4_F16_WMMA_MIN_TOKENS
         && k % 64 == 0
         && route_open
-        && f16_wmma_enabled
 }
 
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
@@ -29677,40 +29656,37 @@ impl Gpu {
     /// Whether the Qwen4 F16 WMMA route applies to a `[M × K]` BF16 weight at
     /// `batch_size` rows: gfx11 WMMA or gfx1201 ([`qwen4_f16_shadow_capable`]),
     /// >= QWEN4_F16_WMMA_MIN_TOKENS rows, K % 64 == 0, no recorder/capture
-    /// active, not opted out. The placement census charges the lazy F16
+    /// active. The placement census charges the lazy F16
     /// shadows this route creates from the same capability predicate
     /// ([`Gpu::qwen4_f16_shadow_capable`]).
     pub fn qwen4_f16_wmma_applies(&self, weight: &GpuTensor, k: usize, batch_size: usize) -> bool {
         qwen4_f16_wmma_applies_for(
             &self.arch_caps,
-            *QWEN4_F16_WMMA_GFX1201,
             matches!(weight.dtype, DType::BF16 | DType::HC8E4M3Row),
             self.route_rows(batch_size),
             k,
             !self.replay.is_recording() && !self.graphs.capture_mode,
-            *QWEN4_F16_WMMA,
         )
     }
 
     /// The device's capability half of [`Self::qwen4_f16_wmma_applies`]
-    /// ([`qwen4_f16_shadow_capable`] with the gfx1201 opt-in knob): whether
+    /// ([`qwen4_f16_shadow_capable`]): whether
     /// this device can ever create the model-lifetime BF16 -> F16 weight
     /// shadows. The placement census reads exactly this.
     pub fn qwen4_f16_shadow_capable(&self) -> bool {
-        qwen4_f16_shadow_capable(&self.arch_caps, *QWEN4_F16_WMMA_GFX1201)
+        qwen4_f16_shadow_capable(&self.arch_caps)
     }
 
     /// gfx1201 runs the Qwen4 F16 WMMA route on its own gfx12 kernels
-    /// (`gemm_f16_x_f16_wmma_lds_splitk.hip`, `hyper_read_up_wmma.gfx1201.hip`)
-    /// unless `HIPFIRE_QWEN4_F16_WMMA_GFX1201=0` (default on).
+    /// (`gemm_f16_x_f16_wmma_lds_splitk.hip`, `hyper_read_up_wmma.gfx1201.hip`).
     /// Exact arch: gfx1200 and every other RDNA4 part stay on the multirow arms.
     pub fn qwen4_f16_wmma_gfx1201(&self) -> bool {
-        self.arch_caps.is_gfx1201() && *QWEN4_F16_WMMA_GFX1201
+        self.arch_caps.is_gfx1201()
     }
 
     /// Whether a Qwen4 forward of `rows` tokens keeps its HC residual streams as
     /// BF16 bits (the F16 prefill route: gfx11+ ISA, >= QWEN4_F16_WMMA_MIN_TOKENS
-    /// rows, no recorder or capture, not opted out).  Every HC reader rounds
+    /// rows, no recorder or capture).  Every HC reader rounds
     /// the stream to BF16 on load, so the stored value is the one it uses;
     /// the forward decides once and hands the flag to every stream op.
     pub fn qwen4_bf16_streams(&self, rows: usize) -> bool {
@@ -29718,7 +29694,6 @@ impl Gpu {
             && self.route_rows(rows) >= QWEN4_F16_WMMA_MIN_TOKENS
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && *QWEN4_F16_WMMA
     }
 
     /// The shared FP16 activation scratch as an `elems`-long F16 view, for a
@@ -30113,8 +30088,7 @@ impl Gpu {
     /// chain from +0 whatever `n` is, so a row's bytes do not depend on its batch. F16 has a
     /// narrower exponent range than BF16/F32: under/overflow is possible and this is explicitly
     /// DET, not byte-equal to [`Gpu::gemm_bf16_xf32_multirow`]. Called by the
-    /// `HIPFIRE_QWEN4_MTP_APPEND_DET` prompt-fill append route (default on, exact gfx1151;
-    /// fc_embedding, fc_hidden, HC up).
+    /// DET prompt-fill append route (exact gfx1151; fc_embedding, fc_hidden, HC up).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_bf16_xf32_mtp_dense_det_pm(
         &mut self,
@@ -50254,7 +50228,7 @@ impl Gpu {
         ))
     }
     /// Whether the Qwen4 grouped gate/up takes the F16 WMMA arm (gfx11 or gfx12
-    /// WMMA, 1280x2560, >= QWEN4_F16_WMMA_MIN_TOKENS tokens, not opted out).
+    /// WMMA, 1280x2560, >= QWEN4_F16_WMMA_MIN_TOKENS tokens).
     /// The BF16-output entries are gfx11-only; callers wanting them also need
     /// `has_wmma_w32`.
     pub fn qwen4_moe_gateup_wmma_applies(&self, m: usize, k: usize, x_src_rows: usize) -> bool {
@@ -50262,7 +50236,6 @@ impl Gpu {
             && m == 1280
             && k == 2560
             && self.route_rows(x_src_rows) >= QWEN4_F16_WMMA_MIN_TOKENS
-            && *QWEN4_F16_WMMA
     }
 
     /// The Qwen4 grouped gate/up WMMA arm writing `y_grouped` as BF16 bits
@@ -50398,7 +50371,6 @@ impl Gpu {
         // tokens; slower below ~450).  Not bit-exact — F16 dequant/inputs —
         // but KLD against the BF16 source is unchanged within noise (0.07525
         // vs 0.07475, paired CI [-0.0018, +0.0026], 8160 wikitext tokens).
-        // HIPFIRE_QWEN4_F16_WMMA=0 keeps the F32 arms.
         if self.qwen4_moe_gateup_wmma_applies(m, k, x_src_rows) {
             return self.gemm_mq4g256v2_moe_grouped_wmma_k2(
                 expert_weight_ptrs,
@@ -53776,7 +53748,7 @@ impl Gpu {
     }
 
     /// [`Gpu::qwen4_moe_front_producer`] plus the shared-expert INT8 route's A8 blocks of the
-    /// same rotated rows (`HIPFIRE_QWEN4_SHARED_INT8`, `shared_i8.rs`): one read of `x` yields the
+    /// same rotated rows (`shared_i8.rs`): one read of `x` yields the
     /// IU4 sidecar, the F16 X (shared F16 scratch) and the `block_i8_128` blocks
     /// ([`Gpu::mq6_i8_prepare_x`]'s bytes), the latter returned as a prepared handle valid until
     /// the next INT8 activation producer call. Callers gate with
@@ -55327,7 +55299,7 @@ mod tests {
                 return;
             }
         };
-        if !(gpu.arch_caps.has_wmma_w32() || gpu.qwen4_f16_wmma_gfx1201()) || !*QWEN4_F16_WMMA {
+        if !(gpu.arch_caps.has_wmma_w32() || gpu.qwen4_f16_wmma_gfx1201()) {
             eprintln!("skip: no Qwen4 F16 WMMA route on {}", gpu.arch);
             return;
         }

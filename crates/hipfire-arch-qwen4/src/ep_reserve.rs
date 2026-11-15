@@ -2134,16 +2134,10 @@ mod tests {
 
     // -- trunk shard: ONE shared plan (the root-wise maximum of the local plans) -------------
 
-    /// The headless global config the shard loads, and the two rank-local configs cut from it
+    /// The global config the shard loads, and the two rank-local configs cut from it
     /// (rank 0 shared width 384, rank 1 shared width 256; heads halved identically).
-    fn shard_global() -> Qwen4Config {
-        compact_test_config()
-            .into_headless()
-            .expect("headless global config")
-    }
-
     fn shard_locals() -> [Qwen4Config; 2] {
-        let global = shard_global();
+        let global = compact_test_config();
         [0, 1].map(|rank| global.trunk_shard_local(rank, 2).expect("local config"))
     }
 
@@ -2151,7 +2145,7 @@ mod tests {
     /// ranks' own plans.
     fn shard_forward() -> EpReserveForwardPlan {
         EpReserveForwardPlan::from_config_for_shard(
-            &shard_global(),
+            &compact_test_config(),
             Qwen4ForwardScratchMode::Full,
             0,
             true,
@@ -2179,7 +2173,7 @@ mod tests {
 
     #[test]
     fn the_shard_plan_is_the_union_of_the_local_plans_inside_the_global_one() {
-        let (global, locals) = (shard_global(), shard_locals());
+        let (global, locals) = (compact_test_config(), shard_locals());
         let mode = Qwen4ForwardScratchMode::Full;
         // The two ranks really have different local configs.
         assert_ne!(locals[0], locals[1]);
@@ -2272,7 +2266,7 @@ mod tests {
     #[test]
     fn receipts_agree_across_two_different_local_configs_and_refuse_a_per_rank_plan() {
         let mode = Qwen4ForwardScratchMode::Full;
-        let (global, locals) = (shard_global(), shard_locals());
+        let (global, locals) = (compact_test_config(), shard_locals());
         let plan = shard_plan();
         let generation = 0x5eed;
         // what `EpReserveForward::ep_reserve_plan_receipt` returns on each rank: the plan's
@@ -2338,7 +2332,7 @@ mod tests {
     /// without the shard keeps the census it had.
     #[test]
     fn shard_census_charges_are_conservative_per_rank() {
-        let (global, locals) = (shard_global(), shard_locals());
+        let (global, locals) = (compact_test_config(), shard_locals());
         let mode = Qwen4ForwardScratchMode::Full;
         let shared = shard_forward().charged_forward_bytes().unwrap();
         let context = crate::Qwen4ContextCommit::legacy(16384);
@@ -2410,7 +2404,7 @@ mod tests {
         use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry};
         use rdna_compute::DType;
 
-        let global = shard_global();
+        let global = compact_test_config();
         let (dims, qsa) = census_trunk_for(true, &global, 2).expect("the census view");
         // the census cuts from the GLOBAL geometry even when handed a rank-local config
         for local in shard_locals() {

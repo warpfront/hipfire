@@ -1298,7 +1298,6 @@ pub fn admit_qwen4_source(
     let receipt = hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
         hfq,
         Some(gpu_arch),
-        hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_drops_mtp_head(),
         mtp_sidecar.as_ref(),
     )
     .map_err(|error| error.to_string())?;

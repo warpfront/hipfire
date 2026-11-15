@@ -20,7 +20,7 @@
 //! * `gates`: the write's k4 gate route over that `normalized` -- `Gpu::gemv_bf16_xf32_k4_rows`
 //!   (the launcher the dispatch calls: `gemv_bf16_xf32_k4` at one row, `_k4_rows_r<R>` /
 //!   `_otile_r<R>` per the flag at 2..=8, `gemv_bf16_xf32_k4_rows_allrows_m<TM>u<U>` at 9..=64
-//!   under `HIPFIRE_QWEN4_HC_K4_ALLROWS`: exactly today's wide route, asserted per row count
+//!   exactly today's wide route, asserted per row count
 //!   via `Gpu::hc_k4_allrows_applies`), the otile entry directly at 2..=8 rows, and each
 //!   row alone through `gemv_bf16_xf32_k4`.
 //!
@@ -189,7 +189,7 @@ fn reference(gpu: &mut Gpu, c: &Case<'_>) -> Result<(Vec<f32>, Vec<f32>, Vec<f32
     .map_err(err)?;
     if c.rows > 8 && !gpu.hc_k4_allrows_applies(WIDE, c.rows) {
         return Err(format!(
-            "rows {}: the allrows k4 entry does not apply (HIPFIRE_QWEN4_HC_K4_ALLROWS off?)",
+            "rows {}: the allrows k4 entry does not apply (needs exact gfx1201)",
             c.rows
         ));
     }
@@ -405,7 +405,7 @@ fn run() -> Result<i32, String> {
     };
     let mut gpu = Gpu::init().map_err(err)?;
     println!("device arch: {}", gpu.arch);
-    println!("k4 entry at rows 9..=64: gemv_bf16_xf32_k4_rows -> gemv_bf16_xf32_k4_rows_allrows_m<TM>u<U> (HIPFIRE_QWEN4_HC_K4_ALLROWS)");
+    println!("k4 entry at rows 9..=64: gemv_bf16_xf32_k4_rows -> gemv_bf16_xf32_k4_rows_allrows_m<TM>u<U>");
     if !gpu.arch_caps.has_gfx11_plus_simt() {
         eprintln!(
             "refusing: the fused kernel is a gfx11+ route ({})",

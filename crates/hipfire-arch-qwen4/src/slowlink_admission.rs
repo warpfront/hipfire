@@ -580,8 +580,9 @@ pub struct SymIu4RouteFacts {
     /// The MoE recipe's BF16 round trip ([`QWEN4_MOE_RECIPE_BF16_ROUND_TRIP`]).
     pub recipe_bf16_round_trip: bool,
     /// Source-byte symmetry of EVERY routed trunk layer's QT44/QT53 headers
-    /// (`artifact::routed_headers_symmetric`); `None` until the scan ran, which it does only when
-    /// the three other terms and the layout hold ([`Self::scan_needed`]).
+    /// (`artifact::routed_headers_symmetric_verdict`); `None` until the scan ran,
+    /// which it does only when the three other terms and the layout hold
+    /// ([`Self::scan_needed`]).
     pub source_symmetric: Option<bool>,
 }
 
@@ -2833,7 +2834,7 @@ pub struct SingleDeviceLoad<'a> {
     /// admission, never beside it).
     pub purpose: AdmissionPurpose,
     /// The artifact's source-byte symmetry scan of EVERY routed trunk layer
-    /// (`artifact::routed_headers_symmetric`), run at most once and only when
+    /// (`artifact::routed_headers_symmetric_verdict`), run at most once and only when
     /// [`SymIu4RouteFacts::scan_needed`] holds. A caller with no artifact bytes passes a scan
     /// that answers `Ok(false)`: the route then stays on the layout.
     pub routed_source_symmetric: &'a dyn Fn() -> Result<bool, String>,
@@ -8516,7 +8517,6 @@ mod tests {
             hidden: 2560,
             pinned_budget_bytes: 1 << 30,
             prefix_cache: false,
-            slab_sp: false,
         }
     }
 
@@ -8540,21 +8540,9 @@ mod tests {
             let total = before.census.total().unwrap();
             let census = census_of(&inputs).unwrap().2;
 
-            let armed = admit_sp(&sp_facts_of(&before, true));
-            match route {
-                WindowRoute::Aggregate => {
-                    let sp = armed.unwrap_or_else(|d| panic!("{label}: {d}"));
-                    assert_eq!(sp.sp_max_rows, 5_376, "{label}");
-                }
-                _ => assert_eq!(
-                    armed.unwrap_err(),
-                    SpDecline::Route {
-                        route,
-                        mode: crate::slowlink_sp::SpMode::Hybrid
-                    },
-                    "{label}"
-                ),
-            }
+            let sp =
+                admit_sp(&sp_facts_of(&before, true)).unwrap_or_else(|d| panic!("{label}: {d}"));
+            assert_eq!(sp.sp_max_rows, 5_376, "{label}");
             let unarmed = admit_sp(&sp_facts_of(&before, false));
             assert_eq!(unarmed.unwrap_err(), SpDecline::KnobOff, "{label}");
 

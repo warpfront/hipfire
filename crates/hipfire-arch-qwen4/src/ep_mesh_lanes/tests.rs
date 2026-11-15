@@ -1553,7 +1553,7 @@ fn mesh_lane_ep_eight_sampled_lanes_each_emit_their_own_marker() {
     }
 }
 
-// ---- device-drawn sampled lanes (HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE) ------------
+// ---- device-drawn sampled lanes ----------------------------------------
 
 /// A rank fan whose sampler owner answers a verify like the device sampler does:
 /// every lane the root lent a spec is drawn by the shared device sampler's CPU
@@ -1763,11 +1763,11 @@ fn mesh_lane_ep_device_picks_decide_eight_sampled_lanes_without_row_reads() {
         let device = device.expect("a device-drawn eight-lane step on two scripted ranks");
         assert_eq!(lent, vec![8], "K={k}: every sampled lane was lent a spec");
         assert_eq!(draws.len(), 8, "K={k}: one reference draw per lane");
-        // The host Leviathan path over the same keyed rows and head reads: the
-        // flag off lends nothing, the rows are read and the naive RNG stays put.
+        // The host Leviathan path over the same keyed rows and head reads: nothing
+        // is lent, the rows are read and the naive RNG stays put.
         let (host, host_lent, _, host_draws) = device_step(false, true, false, k);
         let host = host.expect("the host Leviathan step");
-        assert_eq!(host_lent, vec![0], "K={k}: the flag off lends nothing");
+        assert_eq!(host_lent, vec![0], "K={k}: the host path lends nothing");
         assert!(host_draws.is_empty(), "K={k}: the host path draws nothing");
         for (i, (emitted, rng)) in device.iter().enumerate() {
             let tag = i as u32 + 1;

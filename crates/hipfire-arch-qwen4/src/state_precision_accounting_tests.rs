@@ -26,8 +26,7 @@ const SLOT_DELTA: usize = F32_SLOT - Q8_SLOT;
 /// Capture-ring rows R = 4, 8, 32.
 const RINGS: [usize; 3] = [4, 8, 32];
 /// Ring state slots a state's capture ring allocates across `layers` GDN layers for `r`-row
-/// blocks: the shared pool `2 * (layers - 1) + r + 1` by default
-/// (`HIPFIRE_QWEN4_LANE_RESERVE_TRIM`), `r + 1` per layer with the trim kill switch.
+/// blocks: the shared pool `2 * (layers - 1) + r + 1`.
 fn ring_slots(r: usize, layers: usize) -> usize {
     current_capture_ring_total_slots(r, layers).unwrap()
 }
