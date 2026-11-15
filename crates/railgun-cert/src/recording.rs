@@ -2781,7 +2781,7 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-dispatch/src/pipeline/sealed_moe.rs",
         function: "validate_for_gpu",
-        occurrences: 1,
+        occurrences: 2,
         decisions: &["eager-only-refusals"],
     },
     // Loader-independent qualification launcher refuses before submission under recording/capture.
