@@ -364,11 +364,17 @@ pub enum GdnStreamInput {
     /// Full raw rows; the executor preps every row it runs.
     Raw,
     /// The fused A4 `qkvzagdn` projection already ran the q/k/v part of
-    /// `gdn_chunk_prep` for these rows into the scratch planes and left only the
-    /// raw rows `gdn_chunk_prep_fixup` reads (tile edges, last three tokens) in
-    /// `qkv`. Valid ONLY for an append with no head replay and no incomplete
-    /// final tile (start and end on absolute tile boundaries):
-    /// `Gpu::gdn_stream_append` fails closed otherwise.
+    /// `gdn_chunk_prep` for the complete-tile prefix `[0, bulk_complete)` into
+    /// the scratch planes. Raw QKV rows are present only per the producer export
+    /// mask `export_raw(t) = valid(t) && (old_edge(t) || t + 3 >= (n & !63))`:
+    /// the tile-edge rows `gdn_chunk_prep_fixup` reads, the last three prefix
+    /// rows (conv ring), and every row of the materialized tail
+    /// `[bulk_complete, n)`, which the executor preps raw. Raw alpha/beta are
+    /// present for all rows. Valid ONLY when
+    /// [`GdnAppendSchedule::fused_prep_eligible`] holds (no head replay and at
+    /// least one complete tile; the append start is an absolute tile boundary,
+    /// the end may be anywhere): `Gpu::gdn_stream_append` fails closed
+    /// otherwise, before any mutation, and never converts it to `Raw`.
     FusedPrepped,
 }
 
@@ -472,6 +478,16 @@ pub struct GdnAppendSchedule {
 }
 
 impl GdnAppendSchedule {
+    /// Whether an append of this shape may use [`GdnStreamInput::FusedPrepped`]:
+    /// no head replay (start on an absolute tile boundary with nothing pending)
+    /// and a non-empty complete-tile prefix. A remainder (`bulk_tail > 0`) is
+    /// admitted only when `tail_export` holds, i.e. the loaded producer bundle
+    /// exports the final-tile raw rows (`Gpu::iu4_gdn_tail_export`; `false`
+    /// under a developer bundle override that differs from the embedded image).
+    pub fn fused_prep_eligible(&self, tail_export: bool) -> bool {
+        !self.head && self.bulk_complete > 0 && (self.bulk_tail == 0 || tail_export)
+    }
+
     /// Validate `meta` against `start_pos` and split `rows`. `micro` and
     /// `commit` are the plan's tile and seam spacings.
     pub fn new(
@@ -685,6 +701,62 @@ mod tests {
             (a.meta.tile_base, a.meta.frame_base, a.meta.pending_rows),
             (1536, 1536, 0)
         );
+    }
+
+    #[test]
+    fn fused_prep_admission_predicate() {
+        // Aligned Open-pending0 / Sealed start: every remainder 0..63.
+        for start in [0u64, 64, 512, 576, 45952] {
+            for rem in 0..64usize {
+                for tiles in 0..3usize {
+                    let n = tiles * 64 + rem;
+                    if n == 0 {
+                        continue;
+                    }
+                    for m in [
+                        open_at(start),
+                        GdnAppendSchedule::new(&open_at(start), start, 64, 64, 512)
+                            .map(|s| s.meta)
+                            .unwrap(),
+                    ] {
+                        let pos = m.position;
+                        let s = GdnAppendSchedule::new(&m, pos, n, 64, 512).unwrap();
+                        assert_eq!(s.fused_prep_eligible(true), tiles > 0, "pos {pos} n {n}");
+                        // A bundle without the final-tile raw export (developer
+                        // override) keeps only the tile-aligned admission.
+                        assert_eq!(
+                            s.fused_prep_eligible(false),
+                            tiles > 0 && rem == 0,
+                            "no-export pos {pos} n {n}"
+                        );
+                        assert_eq!(s.bulk_tail, rem);
+                    }
+                }
+            }
+        }
+        // rc == 0: sub-tile appends are never eligible.
+        let s = GdnAppendSchedule::new(&open_at(128), 128, 63, 64, 512).unwrap();
+        assert!(!s.fused_prep_eligible(true));
+        // Non-aligned starts replay a head tile.
+        for start in [1u64, 25, 63, 65, 511, 513] {
+            let s = GdnAppendSchedule::new(&open_at(start), start, 700, 64, 512).unwrap();
+            assert!(s.head && !s.fused_prep_eligible(true), "start {start}");
+        }
+        // Open with pending > 0 replays a head even with room for bulk.
+        let m = GdnAppendSchedule::new(&open_at(0), 0, 10, 64, 512)
+            .unwrap()
+            .meta;
+        assert_eq!(m.pending_rows, 10);
+        let s = GdnAppendSchedule::new(&m, 10, 500, 64, 512).unwrap();
+        assert!(s.head && s.bulk_complete > 0 && !s.fused_prep_eligible(true));
+        // Open pending0 at an aligned end of a previous whole-tile append.
+        let m = GdnAppendSchedule::new(&open_at(0), 0, 128, 64, 512)
+            .unwrap()
+            .meta;
+        assert_eq!(m.pending_rows, 0);
+        let s = GdnAppendSchedule::new(&m, 128, 130, 64, 512).unwrap();
+        assert!(s.fused_prep_eligible(true) && s.bulk_complete == 128 && s.bulk_tail == 2);
+        assert!(!s.fused_prep_eligible(false));
     }
 
     #[test]

@@ -5571,8 +5571,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC: &str = concat!(
 /// `iu4_gemm.sigmoid.region.s`; kernargs A, Xq, Y, M, K, N, add, shared_gate@40; appended after
 /// `qkvzagdn`, every earlier symbol's code unchanged, certified with
 /// `kernels/iu4_gemm.k128-128x128x8-cacc1.addsigmoid.contract.json`).
-/// SHA-256 49cc18eedd9507b868ecce6b05bd2993688354ed4180e1df456cafe45f34c297
-/// (previously 5cf347e7f66c82bcc0f836b6c6b1030946ee9e6a6a23c4df32a2ee33021521c8 without that symbol;
+/// SHA-256 037c7b0a46204c58ec730eb77113a9919643e0ff4715a73d0b3b116cc7c43c0b
+/// (was 49cc18eedd9507b868ecce6b05bd2993688354ed4180e1df456cafe45f34c297, which differs only in the
+/// fused GDN export `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1`, code sha256 a26cedbe… -> ad58008f…:
+/// its raw QKV rows also cover `t + 3 >= N & ~63` (the final incomplete C64 tile and its 3-row
+/// halo), one `s_and_b32` hoisted per epilogue, every other export byte-identical;
+/// that bundle was 5cf347e7f66c82bcc0f836b6c6b1030946ee9e6a6a23c4df32a2ee33021521c8 without the sigmoid symbol;
 /// 8edd7565 with the `.comment` stamp replaced by `hipfire peacemaker native-emit`;
 /// 875fb564 with VCC counted in gfx12 `.sgpr_count`; `.text` identical; f166cf72 with the
 /// emitter's code-end tail fill appended to `.text`):
@@ -5596,8 +5600,11 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL: &[u8] =
 /// the slab activation layout (`peacemaker-isa emit --alayout slab`), fed only
 /// by the slab producer twins (`Gpu::a4_slab_active`), including the fused
 /// GDN input projection `gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s`.
-/// SHA-256 b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa
-/// (was b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40, which differs only in the 27B
+/// SHA-256 4e3dc6e7d6efff1d1e0b496db1a3b89237f12c7ed7e5642d24684dbc99b57665
+/// (was b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa, which differs only in the
+/// fused GDN export `..._qkvzagdn_b1s`, code sha256 a26b3207… -> cb3eb24c…: the same raw-row
+/// `t + 3 >= N & ~63` export as `_b1`, every other export byte-identical; b351ce70 was
+/// b952699f05d513c3374c6ea22326deb64a92c481cf08d7d6d1398fbcd0659c40, which differs only in the 27B
 /// gate/up export `gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s`, code sha256 c9f1efc5… -> 9d12e51e…: the
 /// lead1 + rotation fold chain, then the prio2 WMMA / prio1 fold (F3-01-lead1rot-prio; bit-identical,
 /// GPU-timed ratios 0.9745 / 0.9758); the nine other exports are byte-identical; the module is 256 B

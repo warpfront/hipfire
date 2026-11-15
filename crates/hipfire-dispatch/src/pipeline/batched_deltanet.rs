@@ -1976,7 +1976,8 @@ fn gdn_stream_scratch_views(
 /// layer append: Scan64 plan with the BF16 scan plane and the IU4 gfx1201
 /// projection recipe, fused prep enabled, supported head geometry, and an
 /// append schedule (the exact one `gdn_stream_append` computes) with no head
-/// replay and no incomplete final tile. Any other state returns `false` and the
+/// replay and at least one complete C64 tile (any final remainder; see
+/// `GdnAppendSchedule::fused_prep_eligible`). Any other state returns `false` and the
 /// raw-row path runs unchanged; errors are left for that path to report.
 fn gdn_stream_fused_prep_admitted(
     gpu: &Gpu,
@@ -2008,7 +2009,7 @@ fn gdn_stream_fused_prep_admitted(
     }
     matches!(
         GdnAppendSchedule::new(&meta, call.start_pos, n, 64, 512),
-        Ok(s) if !s.head && s.bulk_tail == 0
+        Ok(s) if s.fused_prep_eligible(gpu.iu4_gdn_tail_export())
     )
 }
 
@@ -2018,7 +2019,8 @@ fn gdn_stream_fused_prep_admitted(
 /// in the plan's scan-output format (returned). The candidate cursor is recorded
 /// in the call; nothing is published here. With `input == FusedPrepped` the
 /// projection was the fused A4 producer (see
-/// `gdn_stream_fused_prep_admitted`) and the executor runs only the fixup.
+/// `gdn_stream_fused_prep_admitted`) and the executor runs the fixup on the
+/// complete prefix and the raw prep on any final incomplete tile.
 pub fn gdn_stream_scan_layer(
     gpu: &mut Gpu,
     call: &GdnStreamCall<'_>,
@@ -2223,14 +2225,14 @@ pub fn batch_chunk_delta_net_attn(
     // the same per-row arithmetic as four SETs plus the plain prep
     // (`gdn_arith::IU4_G12`: "one arithmetic"; the fixup carries the same causal
     // C64 gate prefix; `gdn_canonical_producer_oracle` `fused_vs_plain`). The
-    // only difference is that the fused GEMM stores just the raw QKV rows the
-    // fixup reads, while the stream needs full raw rows for a head replay and
-    // for the carried raw prefix of an incomplete final tile. So it is admitted
-    // only for an append whose schedule has NO head replay and NO incomplete
-    // final tile (start and end on absolute 64-row tile boundaries): the C64
-    // gate chunks and 128-row producer tiles then start on the absolute tile
-    // grid and no later append reads this call's raw rows. Every other append
-    // keeps the four SETs + full plain prep.
+    // fused GEMM stores only the raw QKV rows the stream needs: the edge rows
+    // the fixup reads plus the final incomplete C64 tile and the three rows
+    // before it. So it is admitted for an append whose schedule has NO head
+    // replay and at least one complete C64 tile (aligned start, arbitrary final
+    // remainder): the fixup runs on the complete prefix and the raw tail prep
+    // on the remainder, which is carried as pending raw rows for the next
+    // append's (raw) head replay. Head replays, short appends (no complete
+    // tile) and other arches keep the four SETs + full plain prep.
     let q_scale = 1.0 / (hd as f32).sqrt();
     let fused_views = match &route {
         GdnPrefillRoute::Stream(call)

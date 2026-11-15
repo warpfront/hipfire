@@ -282,13 +282,13 @@ fn builder_bundles_round_trip() {
         ),
         (
             "../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco",
-            "49cc18eedd9507b868ecce6b05bd2993688354ed4180e1df456cafe45f34c297",
+            "037c7b0a46204c58ec730eb77113a9919643e0ff4715a73d0b3b116cc7c43c0b",
             6,
             95_504,
         ),
         (
             "../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco",
-            "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
+            "4e3dc6e7d6efff1d1e0b496db1a3b89237f12c7ed7e5642d24684dbc99b57665",
             10,
             149_584,
         ),

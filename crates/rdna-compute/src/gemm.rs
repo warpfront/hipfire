@@ -1224,11 +1224,17 @@ fn g12_iu4_v3_enabled() -> bool {
 static G12_IU4_B1_CONTROL: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_B1_CONTROL", false));
 
-/// Developer A/B of iu4 builder bundles with one binary (for example the
-/// previous certified bundle as a same-binary opt-out):
+/// Developer A/B of iu4 builder bundles with one binary:
 /// `HIPFIRE_G12_IU4_B1_BUNDLE=<path>` / `HIPFIRE_G12_IU4_B1S_BUNDLE=<path>`
 /// load the token / slab bundle from a file instead of the embedded image.
 /// Read once; an unreadable file fails every launch that needs the bundle.
+/// The stream executor's fused prefix-plus-tail admission relies on the
+/// embedded qkvzagdn raw-export contract (final incomplete C64 tile and its
+/// halo); an override (or `HIPFIRE_G12_IU4_B1_CONTROL`) that is not
+/// byte-identical to the embedded image is assumed not to carry it, so
+/// [`Gpu::iu4_gdn_tail_export`] reports `false` and appends with a remainder
+/// take the raw producer. An older bundle is therefore not a drop-in
+/// replacement for every route.
 type BundleOverride = Option<Result<Vec<u8>, String>>;
 fn g12_iu4_bundle_override(var: &str) -> BundleOverride {
     let path = hipfire_config::developer_var(var).ok()?;
@@ -1268,6 +1274,56 @@ fn g12_iu4_b1s_image() -> HipResult<&'static [u8]> {
         &G12_IU4_B1S_BUNDLE,
         kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S,
     )
+}
+
+/// `true` when `image` is the embedded bundle (by content), i.e. carries the
+/// qkvzagdn final-tile raw-export contract this binary was certified with.
+fn g12_iu4_carries_tail_export(image: HipResult<&'static [u8]>, embedded: &[u8]) -> bool {
+    matches!(image, Ok(b) if b == embedded)
+}
+
+impl Gpu {
+    /// Whether the fused GDN projection bundle of the active activation
+    /// layout exports the raw rows of the final incomplete C64 tile and its
+    /// 3-row halo (`t + 3 >= n & !63`). `false` under a developer bundle
+    /// override or the control bundle that differs from the embedded image:
+    /// the stream executor then refuses fused admission for appends with a
+    /// tail (see `GdnAppendSchedule::fused_prep_eligible`).
+    pub fn iu4_gdn_tail_export(&self) -> bool {
+        if self.a4_slab_active() {
+            g12_iu4_carries_tail_export(
+                g12_iu4_b1s_image(),
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S,
+            )
+        } else {
+            g12_iu4_carries_tail_export(
+                g12_iu4_b1_image(),
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1,
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod iu4_tail_export_tests {
+    use super::*;
+
+    #[test]
+    fn override_bundle_without_tail_export_is_refused() {
+        let new = kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S;
+        assert!(g12_iu4_carries_tail_export(Ok(new), new));
+        // The control bundle predates the export: refused.
+        let old = kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL;
+        assert!(!g12_iu4_carries_tail_export(
+            Ok(old),
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1
+        ));
+        // An unreadable override is refused too.
+        assert!(!g12_iu4_carries_tail_export(
+            Err(hip_bridge::HipError::new(0, "unreadable")),
+            new
+        ));
+    }
 }
 /// B-1 slab activation layout (`HIPFIRE_A4_SLAB`, default on; `=0` opts
 /// out): the default gfx1201 A4 producers store each K128 block's
@@ -34771,7 +34827,9 @@ impl Gpu {
     /// loader's Z fold. Returns `Ok(false)` without launching anything when
     /// not admitted; after `Ok(true)` the caller must run
     /// [`Self::gdn_chunk_prep_fixup`], and `y_qkv` holds only the raw rows
-    /// that pass reads.
+    /// that pass reads: tile positions 0..2 and 125..127 of each 128-token
+    /// tile, plus every row `t` with `t + 3 >= (n & !63)` (the final partial
+    /// 64-token chunk and its 3-row halo; all rows when `n < 64`).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qkvza_mq4g256v2_iu4_gdn_prepared(
         &mut self,

@@ -7010,15 +7010,20 @@ impl Gpu {
     /// `raw.input == FusedPrepped` (gfx1201 A4 fused `qkvzagdn` projection): the
     /// whole-tile run's plain `gdn_chunk_prep` is replaced by
     /// `gdn_chunk_prep_fixup` over the same pointers and row count. Admitted
-    /// only when the schedule has no head replay and no incomplete final tile
-    /// (fails closed before any mutation otherwise), because the fused GEMM
-    /// stores just the raw rows the fixup reads, never the full rows a head
-    /// replay or the carried raw prefix would need. Byte-exactness: the fused
+    /// only when [`GdnAppendSchedule::fused_prep_eligible`] holds (no head
+    /// replay, at least one complete tile; fails closed before any mutation
+    /// otherwise, never converted to Raw). The fused GEMM stores the raw rows
+    /// the fixup reads for the complete prefix plus every raw tail row (the
+    /// producer export mask), so the raw tail `[rc, n)` is saved to the carry
+    /// pending buffers before any in-place gate rewrite, the fixup runs with
+    /// `T = rc` (never `n`), and a non-empty tail is then prepped raw from the
+    /// ring saved in `tile_entry_conv` and scanned with a Discard exit.
+    /// Byte-exactness: the fused
     /// epilogue and the fixup run the plain prep's per-element expressions
     /// (`gdn_arith::IU4_G12`: one arithmetic with the separate SETs), the C64
     /// gate chunks and 128-row producer tiles start at the call's first row,
     /// which is an absolute tile boundary, and the persistent ring is updated by
-    /// the fixup from the last three raw rows exactly as the plain prep does.
+    /// the fixup from the last three prefix raw rows exactly as the plain prep does.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_stream_append(
@@ -7044,9 +7049,11 @@ impl Gpu {
         let r = rc + rt;
         let fused = raw.input == GdnStreamInput::FusedPrepped;
         if fused {
-            if sched.head || rt != 0 {
+            if !sched.fused_prep_eligible(self.iu4_gdn_tail_export()) {
                 return Err(fail(format!(
-                    "fused-prepped input needs a tile-aligned append (head {}, tail rows {rt})",
+                    "fused-prepped input needs no head replay, a complete-tile prefix and, \
+                     for a tail, a producer bundle with the final-tile raw export \
+                     (head {}, complete rows {rc}, tail rows {rt})",
                     sched.head
                 )));
             }
@@ -7165,7 +7172,8 @@ impl Gpu {
                 if fused {
                     // The fused projection already wrote q/k/v for every row but
                     // the 3-row tile heads; the completion pass finishes those,
-                    // the C64 gates and the ring (no head, no tail: see above).
+                    // the C64 gates and the ring over the complete prefix only
+                    // (T = rc); a raw tail is prepped below.
                     self.gdn_stream_prep_fixup(&c, xb, live_conv, alb, beb, qs, ks, vs, rc)?;
                 } else {
                     self.gdn_stream_prep(&c, xb, live_conv, alb, beb, qs, ks, vs, rc)?;

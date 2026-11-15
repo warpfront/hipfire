@@ -55,11 +55,11 @@ const PINNED: &[(&str, &str)] = &[
     ),
     (
         "k128-128x128x8-cacc1-qkvzagdn",
-        "a26cedbe8c421d48fd31cb587a48fe863aae2b9afcc29397961ab4a15523367f",
+        "ad58008fd485b34e32550c4b5e2fa3e6cb09eb16ef4f9be95570838aafb84501",
     ),
     (
         "k128-128x128x8-cacc1-slab-qkvzagdn",
-        "a26b3207951c032b948024294970af5900bdff204900d83fa7a28a1eaa66acf0",
+        "cb3eb24ce840d420a6dd74e96fa6dc1ea3fad16f2105222aea849ac264ab2277",
     ),
     (
         "k128-256x128x16-cacc1-set",

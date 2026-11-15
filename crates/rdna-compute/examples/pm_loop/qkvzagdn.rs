@@ -43,6 +43,15 @@
 //! arms on sampled rows of Z/beta/alpha (NaN-aware) and on every raw-row element of `y_qkv` the kernel
 //! wrote; q/k/v have no CPU reference here (identity to the shipped object only) and are checked to be
 //! written; the conv inputs must be unchanged and the guards intact.
+//!
+//! # Raw-export coverage (PLAN-prefill-tail §3.1)
+//! The set of raw QKV rows the kernel must define is the frozen mask `export_raw(t) = t < N &&
+//! (t % 128 < 3 || t % 128 >= 125 || t + 3 >= (N & !63))` (`rc = N & !63` is the C64 prefix end: the
+//! three rows before it feed the conv ring, every row `>= rc` is the raw tail). It is computed from this
+//! formula, never from the poison pattern: the CPU reference token set always contains the whole
+//! `[rc - 3, N)` window, every required token of it is compared (a poisoned element is a mismatch), and
+//! every required row is scanned over all 10240 columns for the poison pattern. Both layouts (`token`
+//! `_b1`, `slab` `_b1s`) share this check; the launcher product oracle repeats it on its own output.
 
 use crate::common::{
     dev_err, emitted_object, i4_record, quantize_i4_block, rip_object, shipped_object, Elem, Xs64,
@@ -126,6 +135,34 @@ fn section_offsets(n: usize) -> ([usize; 9], usize) {
         at += b + GUARD;
     }
     (off, at)
+}
+
+/// PLAN-prefill-tail §3.1: must the producer define raw QKV row `t` of an `n`-token call? The old
+/// predicate (first/last three tokens of each 128-token producer tile, last three tokens of the call)
+/// with its `t + 3 >= n` threshold replaced by `t + 3 >= (n & !63)`.
+fn export_raw(t: usize, n: usize) -> bool {
+    let t128 = t % 128;
+    t < n && (t128 < 3 || t128 >= 125 || t + 3 >= (n & !63))
+}
+
+/// Rows `[rc - 3, n)` of the C64 prefix-end halo and the raw tail (`rc = n & !63`).
+fn tail_window(n: usize) -> std::ops::Range<usize> {
+    (n & !63).saturating_sub(3)..n
+}
+
+/// Required raw rows of `x` (`[n][QKV_M]` f32 bytes) that still hold the poison pattern in any
+/// column: `(rows_required, rows_unwritten, first (row, col) unwritten)`.
+fn unwritten_required(n: usize, x: &[u8]) -> (usize, usize, Option<(usize, usize)>) {
+    let (mut required, mut unwritten, mut first) = (0usize, 0usize, None);
+    for t in (0..n).filter(|&t| export_raw(t, n)) {
+        required += 1;
+        let row = &x[t * QKV_M * 4..(t + 1) * QKV_M * 4];
+        if let Some(c) = row.chunks_exact(4).position(|w| w == &[POISON; 4][..]) {
+            unwritten += 1;
+            first.get_or_insert((t, c));
+        }
+    }
+    (required, unwritten, first)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -513,7 +550,8 @@ pub fn build(
 }
 
 /// Tokens the CPU reference covers: all of them up to `REF_TOKENS`, else the first and last eight,
-/// every edge-class token that fits, and an even spread.
+/// the whole `[rc - 3, n)` export window of the frozen raw mask (prefix-end halo + tail), the first and
+/// last 128-row producer tile edges, every edge-class token that fits, and an even spread.
 fn ref_tokens(profile: Profile, n: usize) -> Vec<usize> {
     if n <= REF_TOKENS {
         return (0..n).collect();
@@ -521,15 +559,21 @@ fn ref_tokens(profile: Profile, n: usize) -> Vec<usize> {
     let mut s = std::collections::BTreeSet::new();
     s.extend(0..8);
     s.extend(n - 8..n);
+    s.extend(tail_window(n));
+    let last_edge = (n - 1) / 128 * 128;
+    for edge in [128, last_edge] {
+        s.extend(edge.saturating_sub(3)..(edge + 3).min(n));
+    }
+    let cap = s.len().max(REF_TOKENS - 16);
     for t in 0..n {
-        if s.len() >= REF_TOKENS - 16 {
+        if s.len() >= cap {
             break;
         }
         if token_class(profile, t) != TokenClass::Realistic {
             s.insert(t);
         }
     }
-    let spread = REF_TOKENS - s.len();
+    let spread = REF_TOKENS.saturating_sub(s.len());
     for i in 0..spread {
         s.insert(i * (n - 1) / spread.max(1));
     }
@@ -657,6 +701,12 @@ impl Workload for Qkvzagdn {
                     "edge_weight_rows": "r%128==9 all code -8, ==41 all code +7, ==73 zero scales",
                 },
                 "reference": {"tokens": ref_tokens(self.profile, self.n).len(), "sample_rows": SAMPLE_ROWS},
+                "export_mask": {
+                    "formula": "t < N && (t%128 < 3 || t%128 >= 125 || t + 3 >= (N & !63))",
+                    "required_rows": (0..self.n).filter(|&t| export_raw(t, self.n)).count(),
+                    "tail_window": [tail_window(self.n).start, tail_window(self.n).end],
+                    "layout": if self.cand.act == ALayout::Slab { "slab" } else { "token" },
+                },
             }),
         )]
     }
@@ -869,7 +919,10 @@ impl Workload for Qkvzagdn {
                 cmp(got, refs.z[ri * nt + j]);
             }
         }
-        // The raw QKV rows the kernel wrote.
+        // The raw QKV rows the kernel must define: `export_raw` decides which rows are required, the
+        // poison pattern only reports whether a required row was actually written. Every required
+        // reference token is compared (a poisoned element is a mismatch, never skipped); other rows
+        // are compared only when written.
         let x = self.section(out, 6).0;
         let poison_word = f32::from_bits(u32::from_le_bytes([POISON; 4]));
         let mut x_written = 0usize;
@@ -877,12 +930,16 @@ impl Workload for Qkvzagdn {
             for (j, &t) in refs.tokens.iter().enumerate() {
                 let got = f32_at(x, t * QKV_M + r);
                 if got.to_bits() == poison_word.to_bits() {
+                    if export_raw(t, self.n) {
+                        cmp(got, refs.qkv[ri * nt + j]);
+                    }
                     continue;
                 }
                 x_written += 1;
                 cmp(got, refs.qkv[ri * nt + j]);
             }
         }
+        let (required_rows, unwritten_rows, first_unwritten) = unwritten_required(self.n, x);
         // q/k/v: no CPU reference here; they must have been written.
         let written = |i: usize| {
             self.section(out, i)
@@ -892,12 +949,20 @@ impl Workload for Qkvzagdn {
                 .count()
         };
         let (wq, wk, wv) = (written(3), written(4), written(5));
-        let pass =
-            guards_ok && conv_ok && mismatches == 0 && x_written > 0 && wq > 0 && wk > 0 && wv > 0;
+        let pass = guards_ok
+            && conv_ok
+            && mismatches == 0
+            && x_written > 0
+            && required_rows > 0
+            && unwritten_rows == 0
+            && wq > 0
+            && wk > 0
+            && wv > 0;
         Ok(RefReport {
             reference: format!(
                 "cpu_iu4_symfold_rn(z rows=sample:192+all beta/alpha (qkvzaset::fold_ref_rows), y_qkv rows=sample:{SAMPLE_ROWS} written raw elements, \
                  tokens={nt}, fold=fma, NaN-aware, mismatching_elements={mismatches}, y_qkv_written={x_written}, \
+                 export_mask(required_rows={required_rows}, unwritten_required_rows={unwritten_rows}, first_unwritten_row_col={first_unwritten:?}), \
                  qkv_written_halfwords={wq}/{wk}/{wv}, guards_intact={guards_ok}, conv_inputs_unchanged={conv_ok}; \
                  q/k/v identity-to-shipped only)"
             ),
@@ -1038,10 +1103,18 @@ impl Qkvzagdn {
             let want = self.section(base_out, i).0;
             let same = v[..sb[i]] == *want;
             all &= same;
-            rows.push(json!({
+            let mut row = json!({
                 "buffer": SECTIONS[i], "bytes": sb[i], "identical_to_baseline_arm": same,
                 "first_differing_byte": v[..sb[i]].iter().zip(want).position(|(a, b)| a != b),
-            }));
+            });
+            if i == 6 {
+                // The launcher's own raw rows must cover the frozen export mask.
+                let (required, unwritten, first) = unwritten_required(n, &v[..sb[i]]);
+                all &= required > 0 && unwritten == 0;
+                row["export_mask"] = json!({"required_rows": required, "unwritten_required_rows": unwritten,
+                    "first_unwritten_row_col": first});
+            }
+            rows.push(row);
         }
         let want_symbol = abi_of(self.base).exports[0].symbol;
         Ok(json!({
@@ -1329,6 +1402,84 @@ mod tests {
         for class in [5, 13, 21, 29, 45] {
             assert!(t.contains(&class), "edge token {class}");
         }
+    }
+
+    #[test]
+    fn export_mask_is_the_frozen_formula() {
+        let required = |n: usize| -> Vec<usize> { (0..n).filter(|&t| export_raw(t, n)).collect() };
+        // The pre-change predicate: tile edges and the last three tokens.
+        let old = |t: usize, n: usize| t < n && (t % 128 < 3 || t % 128 >= 125 || t + 3 >= n);
+        for n in 1..=1300usize {
+            let rt = n % 64;
+            let rc = n - rt;
+            let set = required(n);
+            if rt == 0 {
+                // Aligned calls export exactly the old set.
+                assert!(
+                    set.iter().all(|&t| old(t, n))
+                        && (0..n).filter(|&t| old(t, n)).count() == set.len(),
+                    "n={n}"
+                );
+            } else {
+                // Every old row, the prefix-end halo and the whole tail.
+                assert!(
+                    (0..n).filter(|&t| old(t, n)).all(|t| set.contains(&t)),
+                    "n={n}"
+                );
+                assert!((rc.saturating_sub(3)..n).all(|t| set.contains(&t)), "n={n}");
+                assert!(!set.contains(&n), "n={n}");
+            }
+            if rc == 0 {
+                assert_eq!(
+                    set,
+                    (0..n).collect::<Vec<_>>(),
+                    "n={n}: rc == 0 exports every valid row"
+                );
+            }
+        }
+        // Rows the old mask missed: n=65 needs row 61, n=85 rows 61..82, n=149 rows 128..145.
+        assert!(required(65).contains(&61) && !old(61, 65));
+        assert!((61..82).all(|t| required(85).contains(&t) && !old(t, 85)));
+        // 128..130 are tile-head rows of the old mask too; 131..145 are the rows it missed.
+        assert!((131..146).all(|t| required(149).contains(&t) && !old(t, 149)));
+        // n=134: the tail 128..133 and its halo 125..127 are inside the old edge union already.
+        assert_eq!(
+            required(134),
+            vec![0, 1, 2, 125, 126, 127, 128, 129, 130, 131, 132, 133]
+        );
+        assert!((5885..5909).all(|t| required(5909).contains(&t)));
+    }
+
+    #[test]
+    fn unwritten_required_rows_are_reported_by_the_formula_not_the_sentinel() {
+        let n = 85usize;
+        let mut x = vec![POISON; n * QKV_M * 4];
+        let want = (0..n).filter(|&t| export_raw(t, n)).count();
+        let (req, unw, first) = unwritten_required(n, &x);
+        assert_eq!((req, unw, first), (want, want, Some((0, 0))));
+        for t in (0..n).filter(|&t| export_raw(t, n)) {
+            x[t * QKV_M * 4..(t + 1) * QKV_M * 4].fill(0);
+        }
+        assert_eq!(unwritten_required(n, &x), (want, 0, None));
+        // An unrequired row left poisoned is fine; one poisoned word of row 61 is not.
+        assert!(!export_raw(10, n));
+        x[61 * QKV_M * 4 + 4 * 7..61 * QKV_M * 4 + 4 * 8].fill(POISON);
+        assert_eq!(unwritten_required(n, &x), (want, 1, Some((61, 7))));
+    }
+
+    #[test]
+    fn reference_tokens_hold_the_whole_export_window() {
+        for n in [65usize, 85, 134, 149, 5909, 8191] {
+            let t = ref_tokens(Profile::Mixed, n);
+            assert!(t.windows(2).all(|w| w[0] < w[1]) && *t.last().unwrap() == n - 1);
+            if n > REF_TOKENS {
+                assert!(tail_window(n).all(|r| t.contains(&r)), "n={n}");
+            }
+        }
+        // Tile edges: 125..127 of the first tile and the last producer tile boundary.
+        let t = ref_tokens(Profile::Mixed, 5909);
+        assert!([125, 126, 127, 128, 129].iter().all(|r| t.contains(r)));
+        assert!([5885, 5886, 5887].iter().all(|r| t.contains(r)));
     }
 
     #[test]
