@@ -1993,7 +1993,6 @@ fn main() -> Result<()> {
     // One process is the OFF baseline. The existing gathered source is launched
     // directly above, never selected by a production environment override.
     std::env::set_var("HIPFIRE_QWEN4_QSA_WMMA_GATHER", "0");
-    std::env::set_var("HIPFIRE_QWEN4_F16_WMMA", "0");
     let mut gpu = Gpu::init().map_err(err)?;
     gpu.dpm_warmup(10.0).map_err(err)?;
     if mode == "compensated" {

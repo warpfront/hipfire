@@ -3397,15 +3397,14 @@ pub fn qwen4_ep_vram_layers(
     let copy = (spec_k.is_some() && batch.spec_copy)
         .then(|| hipfire_arch_qwen4::ep::ep_default_copy_config(gpu.arch.as_str()))
         .flatten();
-    // `HIPFIRE_QWEN4_LANE_APPEND_SHARE`: with MTP lanes reserved on the exact VMM lane route the
-    // singleton drafter's prompt-fill Append scratch is a view of the lane store's own, so the
-    // native-MTP census below charges it once (the lane store's). Every later census of this
-    // load (the decoupled reserve, each rank's placement) reads the same process-wide gate.
+    // With MTP lanes reserved on the exact VMM lane route the singleton drafter's prompt-fill
+    // Append scratch is a view of the lane store's own, so the native-MTP census below charges
+    // it once (the lane store's). Every later census of this load (the decoupled reserve, each
+    // rank's placement) reads the same process-wide gate.
     hipfire_arch_qwen4::mtp_spec::qwen4_set_lane_append_shared(
         spec_k.is_some()
             && batch.lanes().is_some()
-            && shared.backend == hipfire_arch_qwen4::Qwen4KvBackend::Vmm
-            && hipfire_config::qwen4_lane_append_share(),
+            && shared.backend == hipfire_arch_qwen4::Qwen4KvBackend::Vmm,
     );
     let ordinary_at = |chunk: usize| -> Result<Qwen4EpPlacementAt, String> {
         let (non_expert, layer_experts, reserve, ..) = qwen4_placement_inputs(
@@ -5460,7 +5459,6 @@ pub fn qwen4_preload_resource_plan(
     let receipt = hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
         hfq,
         Some(&gpu.arch),
-        hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_drops_mtp_head(),
         stock_mtp.as_ref(),
     )
     .map_err(|error| format!("qwen4 preload plan: artifact admission: {error}"))?;
@@ -7009,7 +7007,6 @@ fn load_qwen4_rank_unscoped(
     let receipt = hipfire_arch_qwen4::artifact::admit_hfqm_artifact_with(
         &hfq,
         Some(&ctx.gpu.arch),
-        hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_drops_mtp_head(),
         stock_mtp.as_ref(),
     )
     .map_err(|error| error.to_string())?;

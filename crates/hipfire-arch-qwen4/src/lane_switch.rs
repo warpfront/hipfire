@@ -50,8 +50,7 @@ pub const NATIVE_ALL_LANE_K: usize = 5;
 /// The shipped lane draft-depth cap (`HIPFIRE_EP_MTP_LANE_K` unset, flag off).
 /// 5 with the lane cost profile of `mtp_lanes` (gfx1201: per-request fit, even
 /// split of one 8-row group over the step's lanes, so deeper K never spills at
-/// C2..C4); `HIPFIRE_EP_MTP_LANE_K=2` restores the previous cap (use
-/// `HIPFIRE_QWEN4_LANE_COST=0` with it for the previous lane floor).
+/// C2..C4); `HIPFIRE_EP_MTP_LANE_K=2` restores the previous cap.
 pub const DEFAULT_LANE_K: usize = 5;
 
 /// [`NATIVE_ALL_ENV`] on.

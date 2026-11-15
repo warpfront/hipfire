@@ -394,11 +394,11 @@ pub struct ScratchState {
     /// whole context at load (`tensor_ops::reserve_qsa_gathered_wmma_scratch`),
     /// so no captured graph or recorded tape ever sees it move. Used where
     /// the VMM workspace is not admitted (`Gpu::qsa_gather_vmm_capable`:
-    /// everything but gfx1151/gfx1201 on a VMM-certified platform); kept for
+    /// everything but gfx1151/gfx1201/gfx1100 on a VMM-certified platform); kept for
     /// the process.
     pub qsa_gather_f16: Option<DeviceBuffer>,
     pub qsa_gather_f16_bytes: usize,
-    /// The same workspace as a registered VMM owner (gfx1151 or gfx1201 on a
+    /// The same workspace as a registered VMM owner (gfx1151, gfx1201 or gfx1100 on a
     /// certified platform): one stable virtual reservation for the whole context
     /// (`tensor_ops::reserve_qsa_gathered_wmma_workspace`), physical pages
     /// mapped in place over the prefix a forward ending at `end` touches

@@ -58,7 +58,7 @@
 //! likewise); a step with no sampled lane issues exactly the greedy device
 //! work and downloads.
 //!
-//! With `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` on (default on exact gfx1201) no
+//! On exact gfx1201 no
 //! logits row is downloaded: every sampled lane of a step (its AR row, its
 //! verify window, or its prompt-completing tile) is drawn by ONE
 //! `hipfire_runtime::lane_draw::lane_draws` launch (`lane::lane_sample_device`)
@@ -1676,8 +1676,8 @@ fn run_prefill_tiles(
         }
         // A sampled lane's prompt-completing pick is its first draw, from the
         // tile's final logits row; a greedy lane keeps the argmax. On the device
-        // (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`) every completing tile of the step
-        // is drawn by one `lane_sample_device` call; else each by one D2H.
+        // (exact gfx1201) every completing tile of the step is drawn by one
+        // `lane_sample_device` call; else each by one D2H.
         let device = crate::lane::lane_device_sample(gpu);
         if device {
             let mut ones: Vec<[u32; 1]> =

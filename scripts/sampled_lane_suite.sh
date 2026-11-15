@@ -56,14 +56,13 @@
 # windows (takeovers) in the lane counters. The single and pp2 topologies validate their
 # configuration and refuse ("ep2 only"); `selftest` is the host-only part.
 #
-# Draw route: with HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE on (the default on gfx1201)
-# every sampled draw of every ep2 arm (AR rows, the prompt-completing first
-# token, native and copy verify windows) is one lane-wide device launch;
-# `=0` restores the host sampler. Each arm records the route it RESOLVED
-# (`device` or `host`) as lane_suite.lane_draw_route in its config: ids of one
-# route are a config error under the other, shards of two routes never merge,
-# and `verdict` prints every arm's route and refuses a cohort that mixes them.
-# Run every arm of a cohort under the same setting.
+# Draw route: on exact gfx1201 every sampled draw of every ep2 arm (AR rows,
+# the prompt-completing first token, native and copy verify windows) is one
+# lane-wide device launch; elsewhere the host sampler draws. Each arm records
+# the route it RESOLVED (`device` or `host`) as lane_suite.lane_draw_route in
+# its config: ids of one route are a config error under the other, shards of
+# two routes never merge, and `verdict` prints every arm's route and refuses a
+# cohort that mixes them. Run every arm of a cohort on the same route.
 
 set -euo pipefail
 

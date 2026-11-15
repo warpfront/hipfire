@@ -724,8 +724,8 @@ fn resident_restore_matches_cold_on_flash_next() {
 /// split manually at the same index (chunk boundary, then the index, then the
 /// rest as a live continuation), never with the unsplit cold schedule. A
 /// restore after the tail adds nothing to the pool. Runs with the tail
-/// snapshot on (`HIPFIRE_QWEN4_TAIL_SNAPSHOT` unset) and the thresholds
-/// lowered to a 256-row gap and no minimum prompt (`set_tail_snapshot_limits`).
+/// snapshot (always on) and the thresholds lowered to a 256-row gap and no
+/// minimum prompt (`set_tail_snapshot_limits`).
 #[test]
 #[ignore = "needs a HIP GPU and HIPFIRE_SESSION_CACHE_MODEL"]
 fn tail_snapshot_restore_matches_split_cold_on_flash_next() {

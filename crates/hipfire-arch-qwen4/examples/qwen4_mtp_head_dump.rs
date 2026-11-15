@@ -234,8 +234,7 @@ fn run() -> R<()> {
     // ── load (qwen4_rows / fn_lane_oracle loader, two-file source) ───────
     hipfire_loader::prepare_host_memory_for(&args.model);
     let mut gpu = Gpu::init().map_err(es)?;
-    let receipt =
-        admit_hfqm_artifact_with(&hfq, Some(&gpu.arch), false, Some(&bound)).map_err(es)?;
+    let receipt = admit_hfqm_artifact_with(&hfq, Some(&gpu.arch), Some(&bound)).map_err(es)?;
     let profile_id = receipt.config.profile.id().to_string();
     let hidden_size = receipt.config.hidden_size;
     let hc_count = receipt.config.hc_count;

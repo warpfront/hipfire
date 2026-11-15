@@ -121,45 +121,6 @@ pub fn trunk_shard_requested() -> bool {
     }
 }
 
-/// `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP=0` (developer): drop the native MTP head under the shard
-/// (AR-only load: the head's weights and expert units go back to the trunk). Unset keeps the
-/// head, replicated on every rank.
-pub const TRUNK_SHARD_MTP_ENV: &str = "HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP";
-
-/// The raw `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP` switch (default on: keep the head).
-pub fn trunk_shard_mtp_env_on() -> bool {
-    hipfire_config::developer_bool(TRUNK_SHARD_MTP_ENV, true)
-}
-
-/// [`trunk_shard_keeps_mtp`] with both inputs passed in: whether the shard is requested and the
-/// MTP switch. Both are required: without the shard the head policy is not the shard's.
-pub const fn keeps_mtp_given(requested: bool, mtp_env: bool) -> bool {
-    requested && mtp_env
-}
-
-/// Whether the native MTP head stays loaded under the shard: replicated on every rank (its
-/// weights are not cut) and run on the GLOBAL geometry ([`Qwen4Config::mtp_geometry`]: 24 q
-/// heads, shared expert 640) while the 48-layer trunk runs sharded on the rank-local config.
-/// Default on whenever the shard is; `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP=0` drops it. THE one
-/// decision for it: artifact admission ([`crate::artifact`]) keeps the profile / `mtp` config /
-/// `mtp.*` manifest or drops them ([`Qwen4Config::into_headless`]) from it, and
-/// [`load_local_config`] refuses a config that disagrees; every spec/lane gate follows from
-/// the admitted config.
-pub fn trunk_shard_keeps_mtp() -> bool {
-    keeps_mtp_given(trunk_shard_requested(), trunk_shard_mtp_env_on())
-}
-
-/// Whether a load drops the native MTP head because the shard asks for it.
-pub fn trunk_shard_drops_mtp_head() -> bool {
-    drops_head_for(trunk_shard_requested(), trunk_shard_keeps_mtp())
-}
-
-/// [`trunk_shard_drops_mtp_head`] for an explicit `requested` and `keeps`
-/// ([`trunk_shard_keeps_mtp`]).
-pub const fn drops_head_for(requested: bool, keeps: bool) -> bool {
-    requested && !keeps
-}
-
 /// The census view of the shard for a `ranks`-way EP load: `Some` when the switch is on and
 /// the load is two-rank (the only shard width), else `None` (unchanged census). `config` is
 /// the GLOBAL config (the census sizes the whole tensors the shard cuts).
@@ -216,37 +177,25 @@ pub fn max_shared_width(d: &TrunkDims, mode: QsaMode, parts: usize) -> Result<us
 
 /// The rank-local config a two-rank EP load of rank `placement.rank` runs under when the
 /// shard is on (`Ok(None)` when it is off). Refused loudly when the switch is on but the
-/// load is not two-rank EP, or when the config carries the native MTP head the policy drops
-/// (artifact admission follows [`trunk_shard_drops_mtp_head`], so this is a defence). A kept
-/// head rides on the local config as its global [`Qwen4Config::mtp_geometry`].
+/// load is not two-rank EP. The native MTP head is always kept under the shard: replicated on
+/// every rank (its weights are not cut) and run on the GLOBAL geometry
+/// ([`Qwen4Config::mtp_geometry`]: 24 q heads, shared expert 640) while the 48-layer trunk
+/// runs sharded on the rank-local config.
 pub fn load_local_config(
     config: &Qwen4Config,
     placement: Option<Qwen4EpPlacement>,
 ) -> Result<Option<Qwen4Config>, String> {
-    load_local_config_for(
-        trunk_shard_requested(),
-        trunk_shard_keeps_mtp(),
-        config,
-        placement,
-    )
+    load_local_config_for(trunk_shard_requested(), config, placement)
 }
 
-/// [`load_local_config`] for an explicit `requested` and `keeps` ([`trunk_shard_keeps_mtp`]).
+/// [`load_local_config`] for an explicit `requested`.
 pub fn load_local_config_for(
     requested: bool,
-    keeps: bool,
     config: &Qwen4Config,
     placement: Option<Qwen4EpPlacement>,
 ) -> Result<Option<Qwen4Config>, String> {
     if !requested {
         return Ok(None);
-    }
-    if config.mtp.is_some() && !keeps {
-        return Err(format!(
-            "{TRUNK_SHARD_ENV}: the config carries the native MTP head but the shard drops it \
-             (unset {TRUNK_SHARD_MTP_ENV}, or set it to 1, to keep it replicated); \
-             artifact admission should have admitted the artifact headless"
-        ));
     }
     let placement = placement
         .filter(|p| p.ranks == 2)
@@ -1294,7 +1243,7 @@ mod tests {
 
     /// The MTP head stays replicated under the shard: no `mtp.*` tensor has a cut role, the
     /// census charges every one at its full bytes (whatever `parts`), the trunk entries next to
-    /// them are cut, and the manifest of a head-keeping load declares the head's tensors.
+    /// them are cut, and the manifest declares the head's tensors.
     #[test]
     fn the_mtp_head_is_never_cut_and_the_census_charges_it_in_full() {
         use crate::expert_residency::{resident_split_ranks, resident_split_ranks_trunk};
@@ -1307,7 +1256,7 @@ mod tests {
             .filter(|entry| entry.name.starts_with("mtp."))
             .cloned()
             .collect();
-        // the head-keeping manifest declares the head's attention, shared expert and router
+        // the manifest declares the head's attention, shared expert and router
         for needle in [
             "self_attn.q_proj.weight",
             "self_attn.o_proj.weight",
@@ -1319,12 +1268,6 @@ mod tests {
                 "mtp.* {needle} is in the manifest"
             );
         }
-        // the head-dropping one declares none
-        let headless = Qwen4Manifest::build(&flash.clone().into_headless().unwrap()).unwrap();
-        assert!(headless
-            .weights
-            .iter()
-            .all(|entry| !entry.name.starts_with("mtp.")));
 
         let dims = TrunkDims::from_config(&flash);
         let mode = QsaMode::GroupInterleaved;
@@ -1364,31 +1307,6 @@ mod tests {
             resident_split_ranks_trunk(&trunk_only, bytes, 2, Some((&dims, mode))).unwrap();
         assert_eq!(plain - sharded, trunk_plain - trunk_sharded);
         assert_eq!(sharded - trunk_sharded, head_plain);
-    }
-
-    /// THE head policy: kept when the shard is requested AND the MTP switch is on (its default),
-    /// dropped by `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP=0`; no shard, no head policy.
-    #[test]
-    fn the_head_is_kept_under_the_shard_unless_the_mtp_switch_drops_it() {
-        for requested in [false, true] {
-            for env in [false, true] {
-                assert_eq!(
-                    keeps_mtp_given(requested, env),
-                    requested && env,
-                    "requested={requested} env={env}"
-                );
-                // an off shard drops nothing; an on shard drops unless the head is kept
-                assert!(!drops_head_for(false, keeps_mtp_given(requested, env)));
-                assert_eq!(
-                    drops_head_for(true, keeps_mtp_given(requested, env)),
-                    !(requested && env)
-                );
-            }
-        }
-        // this process requests no shard (no EP2 topology, no switch): no head policy at all
-        assert!(!trunk_shard_keeps_mtp());
-        assert!(!trunk_shard_drops_mtp_head());
-        assert_eq!(TRUNK_SHARD_MTP_ENV, "HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP");
     }
 
     /// Census: the busiest rank keeps ceil(bytes * kept / total); replicated and unlisted

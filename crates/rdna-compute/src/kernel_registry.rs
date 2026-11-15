@@ -354,10 +354,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     // Lane-batched PLE tail of the AR lane step (`Gpu::ple_lanes_tail_f32`,
-    // ple_lanes.rs; HIPFIRE_QWEN4_LANE_PLE_BATCH, default off). The kernel has
-    // no arch guard; its only caller is admitted by
-    // `FeatureFlags::qwen4_lane_ple_batch_enabled`, which requires exact
-    // gfx1201, so only that inventory carries it.
+    // ple_lanes.rs). The kernel has no arch guard; its only caller is gated to
+    // exact gfx1201 by `FeatureFlags::qwen4_lane_ple_batch_enabled`, so only
+    // that inventory carries it.
     if arch == "gfx1201" {
         add!(
             "ple_lanes_tail_f32",
@@ -3465,7 +3464,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_mq6g256v2_mmq_i8_set_gfx12"
             ]
         );
-        // Qwen4 shared-expert INT8 route (`HIPFIRE_QWEN4_SHARED_INT8`, `shared_i8.rs`): the
+        // Qwen4 shared-expert INT8 route (`shared_i8.rs`): the
         // int8 x int8 GEMM and the BF16 -> FWHT -> A8 producers (weight shadows, hidden).
         add!(
             "mq_rotate_x_i4_f16out_i8",
@@ -7358,7 +7357,7 @@ pub struct RouteKernelInput<'a> {
     /// (`#! axis` lines of `route_plans/*.tsv`), e.g. `("qsa", "fp8")`.
     /// Empty for routes without a walked plan.
     pub route_axes: &'a [(&'a str, String)],
-    /// The load applies a `<model>.hc8` sidecar (`HIPFIRE_QWEN4_HC8` on, exact gfx1201, sidecar
+    /// The load applies a `<model>.hc8` sidecar (exact gfx1201, sidecar
     /// bound): the walked plan then also plans the `hc8_wmma_pm_gfx1201` image.
     pub hc8_sidecar: bool,
 }
@@ -9490,9 +9489,9 @@ fn add_wide_twin_entries(arch: &str, planned: &mut Vec<PlannedKernel>) {
     add_rowtile_entries(arch, planned, |family| family.enabled());
 }
 
-/// The `hc8_wmma_pm_gfx1201` image of an applied `.hc8` sidecar (`HIPFIRE_QWEN4_HC8`, exact gfx1201):
+/// The `hc8_wmma_pm_gfx1201` image of an applied `.hc8` sidecar (exact gfx1201):
 /// decode geometries, fused read-up and prefill dequant exports. Not planned without the sidecar
-/// or with the kill switch, so those loads never load the module.
+/// or off exact gfx1201, so those loads never load the module.
 fn add_hc8_entries(input: &RouteKernelInput<'_>, planned: &mut Vec<PlannedKernel>) {
     if input.hc8_sidecar && input.arch == "gfx1201" && input.flags.qwen4_hc8_enabled() {
         planned.push(PlannedKernel::Embedded {
@@ -11575,7 +11574,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // The Qwen4 shared-expert INT8 route (`HIPFIRE_QWEN4_SHARED_INT8`, `shared_i8.rs`).
+        // The Qwen4 shared-expert INT8 route (`shared_i8.rs`).
         const SHARED_I8_ADDED_MODULES: [&str; 3] = [
             "qwen4_shared_i8_gemm_gfx12",
             "qwen4_shared_i8_quant_gfx12",
@@ -12045,7 +12044,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` (default on, exact gfx1201): the lane-wide sampled verify.
+        // Lane-wide sampled verify modules (exact gfx1201 device draws).
         const LANE_LEVIATHAN_ADDED_MODULES: [&str; 1] = ["lane_leviathan"];
         for module in LANE_LEVIATHAN_ADDED_MODULES {
             assert!(
@@ -15319,27 +15318,20 @@ extern "C" __global__ void NAMED(int* p) {}
     #[test]
     fn hc8_image_is_planned_only_for_an_applied_sidecar() {
         let axes = synthetic_axes();
-        let plan = |arch: &str, sidecar: bool, kill: bool| {
-            let mut flags = default_feature_flags(arch).unwrap();
-            if kill {
-                flags.qwen4_hc8 = false;
-            }
+        let plan = |arch: &str, sidecar: bool| {
+            let flags = default_feature_flags(arch).unwrap();
             let mut input = synthetic_input(arch, &[], KernelSpecRoute::Ar, &flags, &axes);
             input.hc8_sidecar = sidecar;
             let mut planned = Vec::new();
             add_hc8_entries(&input, &mut planned);
             planned
         };
-        let planned = plan("gfx1201", true, false);
+        let planned = plan("gfx1201", true);
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].module(), crate::hc8::MODULE);
         assert_eq!(planned[0].symbols(), crate::hc8::ROUTE_SYMBOLS.as_slice());
-        assert!(plan("gfx1201", false, false).is_empty(), "no sidecar");
-        assert!(
-            plan("gfx1201", true, true).is_empty(),
-            "HIPFIRE_QWEN4_HC8=0"
-        );
-        assert!(plan("gfx1100", true, false).is_empty(), "other arch");
+        assert!(plan("gfx1201", false).is_empty(), "no sidecar");
+        assert!(plan("gfx1100", true).is_empty(), "other arch");
     }
 
     #[test]

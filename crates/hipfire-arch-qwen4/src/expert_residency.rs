@@ -1724,8 +1724,8 @@ pub fn shared_i8_shadow_bytes_at(
 }
 
 /// The INT8 shadow bytes a load of `weights` charges: [`shared_i8_shadow_bytes`] when the
-/// route can run (`enabled`: [`rdna_compute::Gpu::qwen4_shared_i8_enabled`], i.e. exact gfx1201
-/// and `HIPFIRE_QWEN4_SHARED_INT8` not `0`) and `route_rows` reaches the route's threshold
+/// route can run (`enabled`: [`rdna_compute::Gpu::qwen4_shared_i8_enabled`], exact gfx1201)
+/// and `route_rows` reaches the route's threshold
 /// ([`rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS`]); 0 otherwise.
 pub fn shared_i8_charge(
     enabled: bool,
@@ -5149,7 +5149,7 @@ mod tests {
             ep_mtp_resident_decision(&weights, ep_mtp_bytes, 1, true),
             Ok(None)
         );
-        // A manifest with no head experts (the trunk shard drops the head).
+        // A manifest with no head experts (no `mtp.` entries): an artifact without an MTP head.
         let headless: Vec<WeightEntry> = weights
             .iter()
             .filter(|entry| !entry.name.starts_with("mtp."))
@@ -5679,8 +5679,8 @@ mod tests {
 
     /// The shared-expert INT8 shadows are their own census term: present (48 layers x
     /// (20 x 1280 + 5 x 2560) blocks of 136 B) when the route is enabled at a route-rows
-    /// threshold chunk, absent with the route off (`HIPFIRE_QWEN4_SHARED_INT8=0`, or a non-gfx1201
-    /// device) or below the threshold, and part of the census total and its log line.
+    /// threshold chunk, absent on a non-gfx1201 device or below the threshold, and part of the
+    /// census total and its log line.
     #[test]
     fn shared_i8_shadows_are_a_census_term_only_when_the_route_is_on() {
         let weights = target_f16_manifest();
@@ -5690,15 +5690,8 @@ mod tests {
         assert_eq!(shared_i8_shadow_bytes(&weights, 48).unwrap(), on);
         assert_eq!(shared_i8_charge(false, 16384, &weights, 48).unwrap(), 0);
         assert_eq!(shared_i8_charge(true, 511, &weights, 48).unwrap(), 0);
-        assert!(rdna_compute::shared_i8::shared_i8_route_enabled(
-            true, "gfx1201"
-        ));
-        assert!(!rdna_compute::shared_i8::shared_i8_route_enabled(
-            false, "gfx1201"
-        ));
-        assert!(!rdna_compute::shared_i8::shared_i8_route_enabled(
-            true, "gfx1100"
-        ));
+        assert!(rdna_compute::shared_i8::shared_i8_route_enabled("gfx1201"));
+        assert!(!rdna_compute::shared_i8::shared_i8_route_enabled("gfx1100"));
         let mut census = census_with(1, 2, 3, 4, 5);
         let base = census.total().unwrap();
         census.shared_i8_shadows = on;
@@ -7267,50 +7260,37 @@ mod tests {
             "gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx1200", "gfx1030", "gfx942",
         ] {
             let caps = ArchCaps::new(arch, std::sync::Arc::new(FeatureFlags::for_test(arch)));
-            for optin in [true, false] {
-                for chunk in [47usize, 48, 256, 511, 512, 1536, 8192] {
-                    for pm_invariant in [false, true] {
-                        let route_rows = f16_shadow_route_rows_with(arch, chunk, 48, pm_invariant);
-                        let charge = f16_shadow_charge(
-                            qwen4_f16_shadow_capable(&caps, optin),
-                            route_rows,
-                            &weights,
-                            48,
-                        )
-                        .unwrap();
-                        // Independent spec: WMMA-w32 parts, or gfx1201 with its
-                        // opt-in, can build the shadows.
-                        let capable = matches!(arch, "gfx1100" | "gfx1101" | "gfx1151")
-                            || (arch == "gfx1201" && optin);
-                        let label = format!("{arch} optin {optin} chunk {chunk} pm {pm_invariant}");
-                        // Every non-gfx942 arch takes the ordinary-prefill intent and gfx942
-                        // pins the same canonical routing through the invariant scope, so
-                        // `Gpu::route_rows` of any prefill forward is the canonical row count,
-                        // whatever the chunk or the append/invariant knobs.
-                        let runtime_rows =
-                            rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS;
-                        assert!(
-                            rdna_compute::prefill_invariant::PrefillRouteIntent::OrdinaryPrefill
-                                .canonical_routing()
-                        );
-                        assert_eq!(route_rows, runtime_rows, "{label}");
-                        assert_eq!(charge, if capable { bound } else { 0 }, "{label}");
-                        // The runtime predicate over the shadowed owners' K
-                        // values agrees: it holds for some owner iff the census
-                        // charges.
-                        let runtime = [2560usize, 640, 10240].into_iter().any(|k| {
-                            qwen4_f16_wmma_applies_for(
-                                &caps,
-                                optin,
-                                true,
-                                runtime_rows,
-                                k,
-                                true,
-                                true,
-                            )
-                        });
-                        assert_eq!(runtime, charge > 0, "{label}");
-                    }
+            for chunk in [47usize, 48, 256, 511, 512, 1536, 8192] {
+                for pm_invariant in [false, true] {
+                    let route_rows = f16_shadow_route_rows_with(arch, chunk, 48, pm_invariant);
+                    let charge = f16_shadow_charge(
+                        qwen4_f16_shadow_capable(&caps),
+                        route_rows,
+                        &weights,
+                        48,
+                    )
+                    .unwrap();
+                    // Independent spec: WMMA-w32 parts and gfx1201 can build the shadows.
+                    let capable = matches!(arch, "gfx1100" | "gfx1101" | "gfx1151" | "gfx1201");
+                    let label = format!("{arch} chunk {chunk} pm {pm_invariant}");
+                    // Every non-gfx942 arch takes the ordinary-prefill intent and gfx942
+                    // pins the same canonical routing through the invariant scope, so
+                    // `Gpu::route_rows` of any prefill forward is the canonical row count,
+                    // whatever the chunk or the append/invariant knobs.
+                    let runtime_rows = rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS;
+                    assert!(
+                        rdna_compute::prefill_invariant::PrefillRouteIntent::OrdinaryPrefill
+                            .canonical_routing()
+                    );
+                    assert_eq!(route_rows, runtime_rows, "{label}");
+                    assert_eq!(charge, if capable { bound } else { 0 }, "{label}");
+                    // The runtime predicate over the shadowed owners' K
+                    // values agrees: it holds for some owner iff the census
+                    // charges.
+                    let runtime = [2560usize, 640, 10240]
+                        .into_iter()
+                        .any(|k| qwen4_f16_wmma_applies_for(&caps, true, runtime_rows, k, true));
+                    assert_eq!(runtime, charge > 0, "{label}");
                 }
             }
         }
@@ -7318,30 +7298,16 @@ mod tests {
         assert_eq!(f16_shadow_charge(true, 511, &weights, 48), Ok(0));
         assert_eq!(f16_shadow_charge(true, 512, &weights, 48), Ok(bound));
         // The guards the census inherits stay in the runtime predicate: a
-        // non-BF16 weight, K not a multiple of 64, a recorder/capture and the
-        // opt-out never apply.
+        // non-BF16 weight, K not a multiple of 64 and a recorder/capture never apply.
         let caps = ArchCaps::new(
             "gfx1100",
             std::sync::Arc::new(FeatureFlags::for_test("gfx1100")),
         );
-        assert!(qwen4_f16_wmma_applies_for(
-            &caps, true, true, 512, 640, true, true
-        ));
-        assert!(!qwen4_f16_wmma_applies_for(
-            &caps, true, false, 512, 640, true, true
-        ));
-        assert!(!qwen4_f16_wmma_applies_for(
-            &caps, true, true, 512, 8, true, true
-        ));
-        assert!(!qwen4_f16_wmma_applies_for(
-            &caps, true, true, 511, 640, true, true
-        ));
-        assert!(!qwen4_f16_wmma_applies_for(
-            &caps, true, true, 512, 640, false, true
-        ));
-        assert!(!qwen4_f16_wmma_applies_for(
-            &caps, true, true, 512, 640, true, false
-        ));
+        assert!(qwen4_f16_wmma_applies_for(&caps, true, 512, 640, true));
+        assert!(!qwen4_f16_wmma_applies_for(&caps, false, 512, 640, true));
+        assert!(!qwen4_f16_wmma_applies_for(&caps, true, 512, 8, true));
+        assert!(!qwen4_f16_wmma_applies_for(&caps, true, 511, 640, true));
+        assert!(!qwen4_f16_wmma_applies_for(&caps, true, 512, 640, false));
     }
 
     /// The shadows are physical owners DUPLICATING the original BF16 weights:
@@ -10865,7 +10831,7 @@ mod tests {
         }
     }
 
-    /// `HIPFIRE_QWEN4_LANE_APPEND_SHARE` at the shipped EP2 serve shape (8 lanes, K5, a 48-row
+    /// The shared Append scratch at the shipped EP2 serve shape (8 lanes, K5, a 48-row
     /// all-rows lane step, max_seq 16384, 4096-row chunk): the native-MTP census of the
     /// singleton drafter drops exactly the prompt-fill Append scratch allocations while the
     /// lane store keeps its own, so the scratch is charged once; and the one scratch still

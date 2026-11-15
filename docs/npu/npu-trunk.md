@@ -1502,7 +1502,7 @@ gap ledger.
 ### Halo consumer oracle (maintainer-run)
 
 ```sh
-HIPFIRE_QWEN4_GDN_PREFILL=wy HIPFIRE_QWEN4_F16_WMMA=1 \
+HIPFIRE_QWEN4_GDN_PREFILL=wy \
 nice -n 19 cargo run --release -p rdna-compute --features lab \
   --example npu_trunk_consumers_check -j 12
 ```

@@ -6,8 +6,8 @@
 #include <hip/hip_bfloat16.h>
 
 // Lane-batched PLE tail for the Qwen4 lane (C8) decode step
-// (`HIPFIRE_QWEN4_LANE_PLE_BATCH`, exact gfx1201, F32 HC streams, one row per
-// lane).
+// (exact gfx1201, host-gated by `FeatureFlags::qwen4_lane_ple_batch_enabled`; F32 HC
+// streams, one row per lane).
 //
 // The incumbent runs, once per lane (1 row, 1 token):
 //     copy_f32_buffer(query <- streams)

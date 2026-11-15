@@ -207,15 +207,6 @@ const MTP_SESSION_WORDS: usize = 7;
 /// launch sequence: the capacity of [`MtpAppendScratch`].
 pub(crate) const MTP_FILL_ROWS: usize = 1024;
 
-/// `HIPFIRE_QWEN4_MTP_APPEND_DET`: the DET route of the batched prompt-fill
-/// Append ([`MtpFillContext::PromptFill`] only), on by default on exact
-/// gfx1151; `0` is the kill switch.
-pub(crate) const MTP_APPEND_DET_ENV: &str = "HIPFIRE_QWEN4_MTP_APPEND_DET";
-/// Default of [`MTP_APPEND_DET_ENV`] when it is unset (or neither `0` nor
-/// `1`): requested, so exact gfx1151 takes DET and every other arch keeps the
-/// incumbent kernels ([`append_det_active`]).
-const MTP_APPEND_DET_DEFAULT: bool = true;
-
 /// Which caller a batched Append pass (`Qwen4MtpGpu::append_rows`) serves. It
 /// is stated by every caller and never inferred from the hidden row, the
 /// scratch or any option: only [`Self::PromptFill`] can take the DET route.
@@ -225,28 +216,16 @@ pub(crate) enum MtpFillContext {
     /// the trunk's chunked forward.
     PromptFill,
     /// The decode takeover step's head fill of the accepted window rows. Always
-    /// the incumbent kernels, whatever `HIPFIRE_QWEN4_MTP_APPEND_DET` says.
+    /// the incumbent kernels.
     DecodeFill,
 }
 
-/// `HIPFIRE_QWEN4_MTP_APPEND_DET` as requested: on unless `0`
-/// ([`MTP_APPEND_DET_DEFAULT`]); read at every prompt fill. See
-/// [`mtp_append_det_enabled`] for the effective gate.
-pub(crate) fn mtp_append_det_requested() -> bool {
-    hipfire_config::developer_bool(MTP_APPEND_DET_ENV, MTP_APPEND_DET_DEFAULT)
-}
-
-/// The DET gate from its two inputs: requested and exact gfx1151 (gfx1150,
-/// gfx1152, gfx1201 and every other arch never take it).
-fn append_det_active(requested: bool, exact_gfx1151: bool) -> bool {
-    requested && exact_gfx1151
-}
-
-/// Whether DET (`HIPFIRE_QWEN4_MTP_APPEND_DET`, default on) is in force on this GPU: exact
-/// gfx1151 only. This is the machine-level gate; whether one Append pass takes
-/// the DET route also depends on its [`MtpFillContext`] ([`append_rows_det`]).
+/// Whether DET is in force on this GPU: exact gfx1151 only (gfx1150, gfx1152,
+/// gfx1201 and every other arch never take it). This is the machine-level gate;
+/// whether one Append pass takes the DET route also depends on its
+/// [`MtpFillContext`] ([`append_rows_det`]).
 pub(crate) fn mtp_append_det_enabled(gpu: &Gpu) -> bool {
-    append_det_active(mtp_append_det_requested(), gpu.arch_caps.is_gfx1151())
+    gpu.arch_caps.is_gfx1151()
 }
 
 /// Whether an Append pass of `context` takes the DET route when the machine
@@ -969,7 +948,7 @@ impl MtpAppendScratch {
         })
     }
 
-    /// A second handle on this scratch's device buffers (`HIPFIRE_QWEN4_LANE_APPEND_SHARE`):
+    /// A second handle on this scratch's device buffers (the drafter's view of the lane store's):
     /// every tensor a non-owning alias of the owner's (`GpuTensor::shallow_clone`), with its
     /// own host staging vectors. The view is freed by dropping it (`free_gpu` is a no-op); the
     /// OWNER's `free_gpu` must outlive every use of the view. Safe to alternate with the owner
@@ -2621,10 +2600,10 @@ struct HeadRowViews {
     /// No chunk is wider than the few-row route (`FEW_ROW_ROUTE_ROWS`) unless
     /// one lane's own `hc_count` rows are, so every projected row stays on the
     /// route whose per-row bytes are the one-row step's. With `one_launch`
-    /// (`rows::fc_hidden_one_launch`: exact gfx1201 under
-    /// `HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH` with `Gpu::bf16_rows_exact_one_launch(rows *
-    /// hc_count)`, or a BF16 fc_hidden of a call wider than [`MTP_DRAFT_LANES_MAX`] on exact
-    /// gfx942) there is ONE chunk over all `rows * hc_count` rows: it runs
+    /// (`rows::fc_hidden_one_launch`: exact gfx1201 with
+    /// `Gpu::bf16_rows_exact_one_launch(rows * hc_count)`, or a BF16 fc_hidden of a call wider
+    /// than [`MTP_DRAFT_LANES_MAX`] on exact gfx942) there is ONE chunk over all
+    /// `rows * hc_count` rows: it runs
     /// `ProjectLadder::TrunkRowExact`, whose all-rows arm is bitwise the singleton (gfx942: the
     /// MFMA chain per output element), so every projected row is still bitwise the one-row
     /// step's.
@@ -3047,8 +3026,6 @@ fn head_d2_device_bytes(config: &Qwen4Config, head_d2: bool) -> Option<usize> {
 /// Why the native MTP head keeps its GPU expert route on this load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HeadD2Off {
-    /// `HIPFIRE_QWEN4_MTP_HEAD_D2=0` (the kill).
-    KnobOff,
     /// The trunk's D2 split has no armed layer on this load (a fast-link card
     /// keeps the PCIe-read head).
     TrunkD2Off,
@@ -3063,7 +3040,6 @@ pub(crate) enum HeadD2Off {
 impl HeadD2Off {
     pub(crate) fn reason(self) -> &'static str {
         match self {
-            Self::KnobOff => "HIPFIRE_QWEN4_MTP_HEAD_D2=0",
             Self::TrunkD2Off => "trunk D2 split is not armed on this load (the head follows it)",
             Self::Ep => "expert-parallel bundle",
             Self::Resident => {
@@ -3090,24 +3066,22 @@ pub(crate) fn head_experts_host_mapped(weights: &Qwen4Weights) -> Option<bool> {
     Some(down.buf.is_host_mapped())
 }
 
-/// Pure decision behind `attach_mtp`: `Some(false)` never arms (the kill);
-/// otherwise (`Some(true)` or unset) the head follows the trunk: armed when the
+/// Pure decision behind `attach_mtp`: the head follows the trunk: armed when the
 /// trunk's D2 split is armed on this load, the bundle is not EP and the head's
 /// experts are host-placed (`head_resident` = VRAM-resident, never split).
 pub(crate) fn head_d2_decision(
-    knob: Option<bool>,
     trunk_split_layers_nonempty: bool,
     ep: bool,
     head_resident: bool,
 ) -> HeadD2Decision {
-    match knob {
-        Some(false) => HeadD2Decision::Off(HeadD2Off::KnobOff),
-        Some(true) | None if ep => HeadD2Decision::Off(HeadD2Off::Ep),
-        Some(true) | None if !trunk_split_layers_nonempty => {
-            HeadD2Decision::Off(HeadD2Off::TrunkD2Off)
-        }
-        Some(true) | None if head_resident => HeadD2Decision::Off(HeadD2Off::Resident),
-        Some(true) | None => HeadD2Decision::Armed,
+    if ep {
+        HeadD2Decision::Off(HeadD2Off::Ep)
+    } else if !trunk_split_layers_nonempty {
+        HeadD2Decision::Off(HeadD2Off::TrunkD2Off)
+    } else if head_resident {
+        HeadD2Decision::Off(HeadD2Off::Resident)
+    } else {
+        HeadD2Decision::Armed
     }
 }
 
@@ -3331,11 +3305,6 @@ impl Qwen4MtpGpu {
         self.rows
             .as_ref()
             .map_or(MTP_DRAFT_LANES_MAX, MtpRowsScratch::call_rows)
-    }
-
-    /// Whether the head's experts run on a rows=1 D2 split executor.
-    pub(crate) fn head_d2_armed(&self) -> bool {
-        self.head_d2_executor().is_some()
     }
 
     fn head_d2_executor(&self) -> Option<&hipfire_dispatch::cpu_split::CpuSplitExecutor> {
@@ -4184,9 +4153,8 @@ impl Qwen4MtpGpu {
     ///
     /// `context` names the caller. [`MtpFillContext::PromptFill`] takes the
     /// DET route (all seven projections through the fixed-row native kernels)
-    /// on exact gfx1151 (`HIPFIRE_QWEN4_MTP_APPEND_DET`, default on), which also takes
-    /// a lone row; [`MtpFillContext::DecodeFill`] always runs the incumbent
-    /// kernels (at least two rows).
+    /// on exact gfx1151, which also takes a lone row; [`MtpFillContext::DecodeFill`]
+    /// always runs the incumbent kernels (at least two rows).
     ///
     /// `device_ids`, when given, holds `tokens` as `tokens.len()` device i32
     /// ids (at least that many bytes) that the embedding gather reads in place
@@ -4370,9 +4338,8 @@ impl Qwen4MtpGpu {
         // anything. Never route these through `project_weight` /
         // `gemm_bf16_xf32_f16_wmma_qwen4` (F16 WMMA from 512 rows).
         //
-        // DET (`PromptFill` on exact gfx1151, `HIPFIRE_QWEN4_MTP_APPEND_DET`
-        // on unless `0`, `det` below): all seven projections run the fixed-row
-        // native kernels instead (F16 WMMA, F32 accumulate, one ascending-K
+        // DET (`PromptFill` on exact gfx1151, `det` below): all seven projections run the
+        // fixed-row native kernels instead (F16 WMMA, F32 accumulate, one ascending-K
         // chain per output, no split-K, no epilogue). That arithmetic is
         // deterministic and row-invariant (a row's bytes do not depend on its
         // batch or sub-chunk) but it is NOT G1: the operands are F16-narrowed
@@ -4897,33 +4864,15 @@ mod tests {
     }
 
     #[test]
-    fn append_det_is_exact_gfx1151_only_and_zero_kills_it() {
-        // `0` (not requested): never on, on any arch.
-        assert!(!append_det_active(false, true));
-        assert!(!append_det_active(false, false));
-        // Requested: only exact gfx1151 (`is_gfx1151` is `arch == "gfx1151"`,
-        // so gfx1150 / gfx1152 / gfx1201 all arrive as `false`).
-        assert!(append_det_active(true, true));
-        assert!(!append_det_active(true, false));
-        assert_eq!(MTP_APPEND_DET_ENV, "HIPFIRE_QWEN4_MTP_APPEND_DET");
-    }
-
-    #[test]
-    fn append_det_default_resolves_on_for_gfx1151_only() {
-        // Unset resolves to the default: on for exact gfx1151, off on every
-        // other arch through the same `ArchCaps::is_gfx1151` predicate
-        // `mtp_append_det_enabled` reads.
+    fn append_det_is_exact_gfx1151_only() {
+        // The machine gate is `mtp_append_det_enabled`, i.e. `ArchCaps::is_gfx1151`.
         use rdna_compute::arch_caps::ArchCaps;
         use rdna_compute::feature_flags::FeatureFlags;
         for arch in [
             "gfx1151", "gfx1150", "gfx1152", "gfx1100", "gfx1201", "gfx942",
         ] {
             let caps = ArchCaps::new(arch, std::sync::Arc::new(FeatureFlags::for_test(arch)));
-            assert_eq!(
-                append_det_active(MTP_APPEND_DET_DEFAULT, caps.is_gfx1151()),
-                arch == "gfx1151",
-                "{arch}",
-            );
+            assert_eq!(caps.is_gfx1151(), arch == "gfx1151", "{arch}");
         }
     }
 
@@ -4956,51 +4905,26 @@ mod tests {
     #[test]
     fn head_d2_decision_table() {
         use HeadD2Decision::{Armed, Off};
-        // Unset and `1` both follow the trunk's D2 verdict (non-EP only) for a
-        // host-placed head.
-        for knob in [None, Some(true)] {
-            assert_eq!(head_d2_decision(knob, true, false, false), Armed);
-            assert_eq!(
-                head_d2_decision(knob, false, false, false),
-                Off(HeadD2Off::TrunkD2Off)
-            );
-            assert_eq!(
-                head_d2_decision(knob, true, true, false),
-                Off(HeadD2Off::Ep)
-            );
-            assert_eq!(
-                head_d2_decision(knob, false, true, false),
-                Off(HeadD2Off::Ep)
-            );
-            // A VRAM-resident head (HIPFIRE_QWEN4_MTP_HEAD_RESIDENT) never
-            // splits: there is no host copy for the CPU arm.
-            assert_eq!(
-                head_d2_decision(knob, true, false, true),
-                Off(HeadD2Off::Resident)
-            );
-            assert_eq!(
-                head_d2_decision(knob, false, false, true),
-                Off(HeadD2Off::TrunkD2Off)
-            );
-            assert_eq!(head_d2_decision(knob, true, true, true), Off(HeadD2Off::Ep));
-        }
-        // `0` is the kill for every trunk/EP/residency combination.
-        for trunk in [true, false] {
-            for ep in [true, false] {
-                for resident in [true, false] {
-                    assert_eq!(
-                        head_d2_decision(Some(false), trunk, ep, resident),
-                        Off(HeadD2Off::KnobOff)
-                    );
-                }
-            }
-        }
-        for off in [
-            HeadD2Off::KnobOff,
-            HeadD2Off::TrunkD2Off,
-            HeadD2Off::Ep,
-            HeadD2Off::Resident,
-        ] {
+        // The head follows the trunk's D2 verdict (non-EP only) for a host-placed head.
+        assert_eq!(head_d2_decision(true, false, false), Armed);
+        assert_eq!(
+            head_d2_decision(false, false, false),
+            Off(HeadD2Off::TrunkD2Off)
+        );
+        assert_eq!(head_d2_decision(true, true, false), Off(HeadD2Off::Ep));
+        assert_eq!(head_d2_decision(false, true, false), Off(HeadD2Off::Ep));
+        // A VRAM-resident head (HIPFIRE_QWEN4_MTP_HEAD_RESIDENT) never
+        // splits: there is no host copy for the CPU arm.
+        assert_eq!(
+            head_d2_decision(true, false, true),
+            Off(HeadD2Off::Resident)
+        );
+        assert_eq!(
+            head_d2_decision(false, false, true),
+            Off(HeadD2Off::TrunkD2Off)
+        );
+        assert_eq!(head_d2_decision(true, true, true), Off(HeadD2Off::Ep));
+        for off in [HeadD2Off::TrunkD2Off, HeadD2Off::Ep, HeadD2Off::Resident] {
             assert!(!off.reason().is_empty());
         }
     }
@@ -5395,14 +5319,14 @@ mod tests {
                 [384, 256][rank]
             );
         }
-        // a head-free shard has no head to size: the view is the plain config (identity)
-        let headless = global
+        // an AR-only shard has no head to size: the view is the plain config (identity)
+        let ar_only = global
             .clone()
-            .into_headless()
+            .into_ar_only()
             .unwrap()
             .trunk_shard_local(1, 2)
             .unwrap();
-        assert!(std::ptr::eq(headless.mtp_geometry(), &headless));
+        assert!(std::ptr::eq(ar_only.mtp_geometry(), &ar_only));
     }
 
     /// The hidden stream the head reads after the sharded trunk is the FULL replicated HC

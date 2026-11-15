@@ -320,10 +320,11 @@ impl Qwen4Bundle {
         let mut seeds: Vec<u32> = Vec::with_capacity(requests.len());
         let mut lane_requests: Vec<LaneRequest> = Vec::with_capacity(requests.len());
         let mut retired_before: Vec<bool> = Vec::with_capacity(requests.len());
-        // `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`: a sampled lane's verify rows are drawn on
-        // the sampler owner's device (one lane-wide Leviathan launch against the drafts'
-        // q, continuing the lane's xorshift32 stream from its prompt-completing draw);
-        // `=0` reads the rows to the root's host sampler.
+        // On exact gfx1201 a sampled lane's verify rows are drawn on the
+        // sampler owner's device (one lane-wide Leviathan launch against the
+        // drafts' q, continuing the lane's xorshift32 stream from its
+        // prompt-completing draw). Elsewhere, and under
+        // `serve.batch_exact = seeded`, the rows go to the root's host sampler.
         let device_sample = gpu.flags.qwen4_lane_device_sample_enabled()
             && hipfire_runtime::lane_draw::lane_draws_supported(gpu);
         for request in requests {

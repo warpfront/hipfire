@@ -64,8 +64,8 @@
 //!
 //! The IU4 route is forced through the public launchers (production gfx1100 default is OFF,
 //! `default_requested: false`; `HIPFIRE_QWEN4_MOE_SYM_IU4=1` turns it on): `setup` refuses unless
-//! the live selector picks the documented symbols and the F16 route applies on this device/env
-//! (`qwen4_moe_f16_wmma_grouped_applies`, `HIPFIRE_QWEN4_F16_WMMA` not 0).
+//! the live selector picks the documented symbols and the F16 route applies on this device
+//! (`qwen4_moe_f16_wmma_grouped_applies`).
 //!
 //! # Record
 //!
@@ -1033,8 +1033,8 @@ impl Bench {
         }
         if !gpu.qwen4_moe_f16_wmma_grouped_applies(t, I, H) {
             return Err(format!(
-                "the F16 WMMA grouped route does not apply at T={t} on this device/env \
-                 (qwen4_moe_f16_wmma_grouped_applies; HIPFIRE_QWEN4_F16_WMMA=0?): there is no baseline"
+                "the F16 WMMA grouped route does not apply at T={t} on this device \
+                 (qwen4_moe_f16_wmma_grouped_applies): there is no baseline"
             ));
         }
         if !self.aa {

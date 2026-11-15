@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Per-file verdict cache of the Qwen4 routed-expert symmetry scan
-//! ([`crate::artifact::routed_headers_symmetric`]). The scan reads every
+//! ([`crate::artifact::routed_headers_symmetric_verdict`]). The scan reads every
 //! routed trunk payload byte of the artifact (about 13 s on Flash-Next); its
 //! verdict is a pure function of those bytes, so it is paid once per file.
 //!
@@ -27,10 +27,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
-
-/// Developer knob: `0` disables the verdict cache (file and in-process memo),
-/// so every call scans.
-pub const VERDICT_CACHE_ENV: &str = "HIPFIRE_QWEN4_SYM_VERDICT_CACHE";
 
 /// Version of the scan's semantics. Bump it whenever the scan can return a
 /// different verdict for the same bytes; every stored verdict then misses.

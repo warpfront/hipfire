@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Lane-wide device draws (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`): every sampled
+//! Lane-wide device draws (exact gfx1201): every sampled
 //! lane of a step is drawn by ONE launch of the lane-wide verify kernel
 //! (`rdna_compute::lane_leviathan`), with one async H2D of the step's inputs
 //! and one D2H of `{tokens, accepted, rng}` per lane.

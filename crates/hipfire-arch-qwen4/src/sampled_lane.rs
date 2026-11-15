@@ -33,7 +33,7 @@
 //!   to "the root draws, ranks replay the committed decision".
 //! * [`SamplingMode::Greedy`]: the shared accept-prefix rule, no draw.
 //!
-//! # Device draws (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`)
+//! # Device draws (exact gfx1201)
 //!
 //! With [`LaneSampler::set_device_sample`] on, a [`SamplingMode::Leviathan`]
 //! lane's drafts are still drawn by the root from `q` ([`AcceptRule::draft_token`]),
@@ -279,7 +279,7 @@ impl DraftRead {
 
 /// The host row a [`TargetRowSource`] fills: exactly one full-vocabulary F32
 /// row, derefs to it. The backing is a [`SampleScratch`], pinned host memory
-/// under `HIPFIRE_QWEN4_LANE_PINNED_LOGITS` (the EP source's D2H lands in it
+/// on exact gfx1201 (the EP source's D2H lands in it
 /// directly), else a pageable `Vec`; the row's bytes are the same either way.
 #[derive(Default)]
 pub struct RowBuf {
@@ -2672,7 +2672,7 @@ mod tests {
         assert!(s.is_registered(&epoch(1)), "the driver releases it");
     }
 
-    // ---- Device draws (HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE) -----------------
+    // ---- Device draws (exact gfx1201) -------------------------------------
 
     fn penalty_cfg(seed: u64) -> SpecRequestConfig {
         SpecRequestConfig {
@@ -2705,7 +2705,7 @@ mod tests {
         accepted: usize,
     }
 
-    /// Run `arm` for `steps` steps with the device flag on. Unless `wrong_q`
+    /// Run `arm` for `steps` steps on the device route. Unless `wrong_q`
     /// (the negative control: the stand-in draws with a q that is not the one
     /// the root lent), every window is checked against the stand-in's own
     /// inputs: the lent spec's RNG chain, history, q shape and config, the
@@ -2927,13 +2927,15 @@ mod tests {
         assert!(rejected, "the law check must reject a wrong lent q");
     }
 
-    /// `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE=0` (the rule's flag off): no lane is
-    /// lent a spec, the sampler owner returns rows and the root reads them.
+    /// Off the device route (any arch but exact gfx1201, or under
+    /// `serve.batch_exact = seeded`): no lane is lent a spec, the sampler owner
+    /// returns rows and the root reads them.
     #[test]
-    fn sampled_lane_device_flag_off_keeps_the_host_row_path() {
+    fn sampled_lane_host_row_path_without_device_draws() {
         let arm = arms().remove(1);
         let mut m = Mesh::new(MeshKind::Ep, &[1]);
-        // A device-capable rank, but the rule's flag is off: nothing is lent.
+        // A device-capable rank, but the sampler's device route is off:
+        // nothing is lent.
         for r in &mut m.ranks {
             r.device = true;
         }
@@ -2947,7 +2949,7 @@ mod tests {
         );
     }
 
-    /// The rule's hook lends a spec only with the flag on, only to a
+    /// The rule's hook lends a spec only on the device route, only to a
     /// Leviathan lane that is registered, with the lane's own staged naive
     /// RNG, EOS and row-0 penalty history, and q exactly as the root drew
     /// the drafts: the SparseDist entries `draft_token` built for a native
@@ -2981,11 +2983,11 @@ mod tests {
         let rng_before = rng.naive_state();
         assert_eq!(rng_before, 123);
 
-        // Flag off: nothing is lent, whatever the lane.
+        // Device route off: nothing is lent, whatever the lane.
         assert_eq!(
             s.device_sample(&native, &drafts, &rng),
             Ok(None),
-            "flag off"
+            "device route off"
         );
         s.set_device_sample(true);
 
