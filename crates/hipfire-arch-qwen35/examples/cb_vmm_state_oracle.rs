@@ -885,12 +885,7 @@ fn load(model: &str) -> Result<(Ctx, Tokenizer, Value)> {
     drop(hfq);
     let mut gpu = Gpu::init()?;
     let src = ModelSource::from_path(model)?;
-    let qwen_default_q8 = !matches!(
-        hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8")
-            .ok()
-            .as_deref(),
-        Some("0")
-    );
+    let qwen_default_q8 = true;
     // Automatic sequence sizing exactly as admission's "pending" bound: the
     // carrier re-measures the card after weights. No max_seq/kv_backend override.
     let mut lc = LoadCtx {
@@ -4955,7 +4950,7 @@ struct WideExpect {
     /// no F16 wide verify symbol, at any row count.
     iu4: bool,
     /// The IU4 verify runs each DeltaNet layer's input projection (QKV, Z, beta, alpha) as ONE merged
-    /// SET launch plus a copy kernel (`HIPFIRE_GDN_ZBA_FOLD`, default on at n <= 128 rows on gfx1201):
+    /// SET launch plus a copy kernel (default at n <= 128 rows on gfx1201):
     /// 4 IU4 GEMMs per DeltaNet layer instead of 7.
     zba_fold: bool,
 }
@@ -4994,8 +4989,7 @@ impl WideExpect {
                 &slot.weights,
                 &slot.config,
             ),
-            zba_fold: gpu.arch == "gfx1201"
-                && hipfire_config::developer_bool("HIPFIRE_GDN_ZBA_FOLD", true),
+            zba_fold: gpu.arch == "gfx1201",
         }
     }
 
@@ -5367,9 +5361,8 @@ fn dflash_verify_lanes(
     // Direct prepares the pre-verify snapshot explicitly (the singleton's save
     // right after its draft; outside the launch probe, as before). The Product
     // route saves INSIDE `dflash_cb_verify` itself: either its own SAVE loop or
-    // the save-free owner exchange (`HIPFIRE_CB_DN_SAVE_FREE`), so no
-    // harness-side save may precede it, or the exchange would be hidden behind a
-    // copy this oracle issued outside the verify span.
+    // the save-free owner exchange, so no harness-side save may precede it, or the
+    // exchange would be hidden behind a copy this oracle issued outside the verify span.
     if route == Route::Direct {
         for l in lanes.iter_mut() {
             l.lane.df.target_snap.save_from(&l.rs.dn, gpu)?;
@@ -6176,7 +6169,7 @@ fn lone_row_control(
 /// refuse wide admission; the `HIPFIRE_PREFILL_CHUNK_ROWS` and
 /// `HIPFIRE_VERIFY_GRAPH` pins).
 fn receipt_env() -> serde_json::Map<String, Value> {
-    const KEYS: [&str; 15] = [
+    const KEYS: [&str; 11] = [
         "HIPFIRE_CB_VERIFY_CHUNK128",
         "HIPFIRE_CB_VERIFY_PM",
         "HIPFIRE_WMMA_BATCH_TILES",
@@ -6185,13 +6178,9 @@ fn receipt_env() -> serde_json::Map<String, Value> {
         "HIPFIRE_PREFILL_CHUNK_ROWS",
         "HIPFIRE_VERIFY_GRAPH",
         "HIPFIRE_GRAPH",
-        "HIPFIRE_CB_SEG_TWINS",
         "HIPFIRE_DFLASH_WINDOW",
         "HIPFIRE_DFLASH_ADAPTIVE_B",
         "HIPFIRE_SPEC_PHASES",
-        "HIPFIRE_DN_SNAPSHOT_FLIP",
-        "HIPFIRE_CB_DFLASH_DRAFT_BATCH",
-        "HIPFIRE_DFLASH_ORDERED_DRAFT",
     ];
     KEYS.iter()
         .map(|k| (k.to_string(), json!(std::env::var(k).ok())))
@@ -6247,9 +6236,9 @@ fn ensure_draft_ref(
 /// One batched-draft case: lanes `specs` (fixtures) are opened at their
 /// pre-window state (each compared with the frozen singleton pre-state), then
 /// drafted together by `dflash_cb_draft` (`min_lanes`: fewest lanes of a chunk
-/// that take the batched forward; `batched=false` is the per-lane singleton
-/// call). Every lane's tokens and post-draft draft state must equal the
-/// isolated singleton draft byte for byte. Returns `(receipt, ok, draft_ms)`.
+/// that take the batched forward). Every lane's tokens and post-draft draft
+/// state must equal the isolated singleton draft byte for byte. Returns
+/// `(receipt, ok, draft_ms)`.
 /// The cases share the probe's one `DflashCbScratch` `cb`, as the VMM DFlash
 /// engine reuses its single scratch every step; only `draft_min_lanes` is set
 /// per case and restored afterwards. (A fresh max-rows scratch per case ran the
@@ -6266,7 +6255,6 @@ fn draft_case(
     name: &str,
     specs: &[usize],
     min_lanes: usize,
-    batched: bool,
     expect_batched_lanes: usize,
 ) -> Result<(Value, bool, f64)> {
     let t_case = std::time::Instant::now();
@@ -6306,7 +6294,7 @@ fn draft_case(
                     compact_offset: l.rs.kv.compact_offset as i32,
                 })
                 .collect();
-            dflash_cb_draft(gpu, &slot.weights, &slot.config, &mut *cb, &mut dl, batched)?
+            dflash_cb_draft(gpu, &slot.weights, &slot.config, &mut *cb, &mut dl)?
         };
         gpu.hip.device_synchronize()?;
         Ok((toks, t0.elapsed().as_secs_f64() * 1e3))
@@ -6373,7 +6361,7 @@ fn draft_case(
         specs.len(), stats.0, stats.1, if ok { "OK" } else { "FAIL" }
     );
     let j = json!({
-        "case": name, "lanes": specs.len(), "min_lanes": min_lanes, "batched": batched,
+        "case": name, "lanes": specs.len(), "min_lanes": min_lanes,
         "batched_lanes": stats.0, "batched_chunks": stats.1, "expected_batched_lanes": expect_batched_lanes,
         "exact": exact, "ok": ok, "error": err_text, "draft_ms": ms, "case_wall_s": t_case.elapsed().as_secs_f64(),
         "per_lane": lane_json,
@@ -6384,8 +6372,8 @@ fn draft_case(
 /// Gate-0-style cases of the batched DFlash draft: 1..4 lanes (batched
 /// forward proven down to one lane with `min_lanes = 1`), the production
 /// chunking (`min_lanes = 2`: four lanes are a three-lane chunk plus a
-/// singleton lane), and the timing of eight lanes per step, serial vs
-/// batched (draft ms only; separate fresh lane sets, best of two).
+/// singleton lane), and the timing of eight lanes per step (draft ms only;
+/// separate fresh lane sets, best of two).
 fn draft_batch_cases(
     gpu: &mut Gpu,
     slot: &mut ModelSlot,
@@ -6431,7 +6419,6 @@ fn draft_batch_cases(
             name,
             &fxl(k),
             min_lanes,
-            true,
             expect,
         ) {
             Ok((j, ok, _)) => {
@@ -6445,50 +6432,29 @@ fn draft_batch_cases(
             }
         }
     }
-    let mut serial = Vec::new();
     let mut batched = Vec::new();
     for rep in 0..2 {
-        for (is_batched, sink) in [(false, &mut serial), (true, &mut batched)] {
-            let name = format!(
-                "draft_n8_{}_rep{rep}",
-                if is_batched { "batched" } else { "serial" }
-            );
-            match draft_case(
-                gpu,
-                slot,
-                d,
-                cfg,
-                fx,
-                refs,
-                cb,
-                &name,
-                &fxl(8),
-                2,
-                is_batched,
-                if is_batched { 8 } else { 0 },
-            ) {
-                Ok((j, ok, ms)) => {
-                    pass &= ok;
-                    sink.push(ms);
-                    rows.push(j);
-                }
-                Err(e) => {
-                    eprintln!("draftbatch case {name}: ERROR {e}");
-                    rows.push(json!({"case": name, "ok": false, "error": e.to_string()}));
-                    return Ok((rows, false));
-                }
+        let name = format!("draft_n8_batched_rep{rep}");
+        match draft_case(gpu, slot, d, cfg, fx, refs, cb, &name, &fxl(8), 2, 8) {
+            Ok((j, ok, ms)) => {
+                pass &= ok;
+                batched.push(ms);
+                rows.push(j);
+            }
+            Err(e) => {
+                eprintln!("draftbatch case {name}: ERROR {e}");
+                rows.push(json!({"case": name, "ok": false, "error": e.to_string()}));
+                return Ok((rows, false));
             }
         }
     }
     let best = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
     println!(
-        "draftbatch timing 8 lanes/step: serial {:.2} ms (runs {:?}) batched {:.2} ms (runs {:?})",
-        best(&serial),
-        serial,
+        "draftbatch timing 8 lanes/step: batched {:.2} ms (runs {:?})",
         best(&batched),
         batched
     );
-    rows.push(json!({"case": "draft_n8_timing", "serial_ms": serial, "batched_ms": batched, "serial_best_ms": best(&serial), "batched_best_ms": best(&batched)}));
+    rows.push(json!({"case": "draft_n8_timing", "batched_ms": batched, "batched_best_ms": best(&batched)}));
     Ok((rows, pass))
 }
 

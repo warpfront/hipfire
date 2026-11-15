@@ -688,8 +688,8 @@ pub struct Qwen35VmmStore {
     descs_host: Vec<VmmKvSlotDesc>,
     /// Bytes last uploaded into each `descs_dev[l]` (`None` = unknown: never
     /// uploaded, or an upload failed part-way). `forward_inner` skips a
-    /// layer's upload when its `descs_host` bytes equal this mirror
-    /// (`HIPFIRE_CB_UPLOAD_COALESCE`). `descs_dev` is written only by that
+    /// layer's upload when its `descs_host` bytes equal this mirror. `descs_dev`
+    /// is written only by that
     /// upload (kernels read it as `const`; it is allocated once in `new` and
     /// freed only with the store), so the mirror is exactly the device content.
     descs_uploaded: Vec<Option<Vec<u8>>>,
@@ -1668,24 +1668,21 @@ impl Qwen35VmmExecutor<'_> {
         let st = &mut *self.store;
         slots_embed_format_admitted(weights.embd_format)?;
         let ms = st.max_slots;
-        let coalesce = crate::qwen35::prefill::multi::cb_upload_coalesce_enabled();
         for (l, dev) in st.descs_dev.iter().enumerate() {
             let bytes = VmmKvSlotDesc::as_bytes(&st.descs_host[l * ms..(l + 1) * ms]);
             // A layer whose table bytes equal what the device already holds
             // would upload identical bytes: skipping it leaves the same device
             // content before every attention kernel. Unknown mirror → upload.
-            if coalesce && st.descs_uploaded[l].as_deref() == Some(bytes) {
+            if st.descs_uploaded[l].as_deref() == Some(bytes) {
                 continue;
             }
             // Unknown until the copy returns Ok (a failed copy may be partial).
             let mirror = st.descs_uploaded[l].take();
             gpu.hip.memcpy_htod(&dev.buf, bytes)?;
-            if coalesce {
-                let mut m = mirror.unwrap_or_default();
-                m.clear();
-                m.extend_from_slice(bytes);
-                st.descs_uploaded[l] = Some(m);
-            }
+            let mut m = mirror.unwrap_or_default();
+            m.clear();
+            m.extend_from_slice(bytes);
+            st.descs_uploaded[l] = Some(m);
         }
         let decode: Vec<usize> = (0..plan.requests.len())
             .filter(|&i| plan.requests[i].kind == RequestStepKind::Ar)

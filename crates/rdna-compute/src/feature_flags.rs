@@ -913,8 +913,6 @@ pub struct FeatureFlags {
     // Each `HIPFIRE_*_OFF=1` disables its slice's fast route and restores the
     // pre-change path. All default OFF (fast routes live once slices land);
     // nothing reads these fields yet — composers wire them in per slice.
-    /// S1: `HIPFIRE_DN_SNAPSHOT_BULK_OFF=1` restores the memcpy-loop snapshot.
-    pub dn_snapshot_bulk_off: bool,
     /// S2: `HIPFIRE_HIDDEN_SCATTER_FUSE_OFF=1` restores the row-copy loops.
     pub hidden_scatter_fuse_off: bool,
     /// S3: `HIPFIRE_MQ_F16_PROJECTION_OFF=1` restores F32 producers + convert.
@@ -956,12 +954,6 @@ pub struct FeatureFlags {
     /// twin `argmax_f32_batched_regrid_pm_gfx1201` (byte-identical, certified);
     /// `HIPFIRE_ARGMAX_REGRID_PM=0` restores the hipcc re-grid kernel.
     pub argmax_regrid_pm: bool,
-    /// Railgun D8: exact gfx1201 DFlash rollback without the restore copy: the
-    /// GDN tape replay reads the pre-verify state from the snapshot buffers and
-    /// writes the live ones (the snapshot stays the pre-window state).
-    /// Byte-identical; default on (the replay admission gates the arch);
-    /// `HIPFIRE_DN_SNAPSHOT_FLIP=0` restores the copy.
-    pub dn_snapshot_flip: bool,
     /// Default-on gfx1201 Flash-Next dense GDN prefill scan (architecture and
     /// admission are gated by the runtime); `HIPFIRE_FN_GDN_DENSE_SCAN=0` opts out.
     pub fn_gdn_dense_scan: bool,
@@ -1809,8 +1801,6 @@ impl FeatureFlags {
             fuse_qkv_bias_debug: value("HIPFIRE_FUSE_QKV_BIAS_DEBUG").as_deref() == Ok("1"),
 
             // DFlash launch-fusion kill switches: `_OFF=1` disables, all no-ops.
-            dn_snapshot_bulk_off: value("HIPFIRE_DN_SNAPSHOT_BULK_OFF").ok().as_deref()
-                == Some("1"),
             hidden_scatter_fuse_off: value("HIPFIRE_HIDDEN_SCATTER_FUSE_OFF").ok().as_deref()
                 == Some("1"),
             mq_f16_projection_off: value("HIPFIRE_MQ_F16_PROJECTION_OFF").ok().as_deref()
@@ -1830,7 +1820,6 @@ impl FeatureFlags {
             gdn_replay_ml_off: value("HIPFIRE_GDN_REPLAY_ML_OFF").ok().as_deref() == Some("1"),
             select_regrid_off: value("HIPFIRE_SELECT_REGRID_OFF").ok().as_deref() == Some("1"),
             argmax_regrid_pm: value("HIPFIRE_ARGMAX_REGRID_PM").ok().as_deref() != Some("0"),
-            dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
             mq6_rows_split: parse_bool("HIPFIRE_MQ6_ROWS_SPLIT")
@@ -2792,7 +2781,6 @@ impl FeatureFlags {
             hipcc_extra_flags: String::new(),
             force_unfused: false,
             fuse_qkv_bias_debug: false,
-            dn_snapshot_bulk_off: false,
             hidden_scatter_fuse_off: false,
             mq_f16_projection_off: false,
             mq_f16_residual_off: false,
@@ -2806,7 +2794,6 @@ impl FeatureFlags {
             gdn_replay_ml_off: false,
             select_regrid_off: false,
             argmax_regrid_pm: false,
-            dn_snapshot_flip: false,
             fn_gdn_dense_scan: false,
             fn_lane_pm_rows: false,
             mq6_rows_split: false,
@@ -3136,21 +3123,6 @@ mod tests {
     }
 
     #[test]
-    fn dn_snapshot_flip_defaults_on_and_zero_opts_out() {
-        assert!(FeatureFlags::from_lookup("gfx1201", |_| Err(())).dn_snapshot_flip);
-        for (value, expected) in [("0", false), ("1", true)] {
-            let flags = FeatureFlags::from_lookup("gfx1201", |name| {
-                if name == "HIPFIRE_DN_SNAPSHOT_FLIP" {
-                    Ok(value.into())
-                } else {
-                    Err(())
-                }
-            });
-            assert_eq!(flags.dn_snapshot_flip, expected);
-        }
-    }
-
-    #[test]
     fn fn_gdn_dense_scan_defaults_on_and_zero_opts_out() {
         assert!(FeatureFlags::from_lookup("gfx1201", |_| Err(())).fn_gdn_dense_scan);
         for (value, expected) in [("0", false), ("1", true)] {
@@ -3338,7 +3310,7 @@ mod tests {
                 );
             }
         }
-        // for_test zeroes every default-on flag (dn_snapshot_flip, fn_gdn_dense_scan, ...).
+        // for_test zeroes every default-on flag (fn_gdn_dense_scan, ...).
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitk_enabled());
         assert!(!FeatureFlags::for_test("gfx1151").qwen4_qsa_decode_splitkv_q8_enabled());
         assert!(!FeatureFlags::for_test("gfx1100").qwen4_qsa_decode_splitkv_q8_enabled());

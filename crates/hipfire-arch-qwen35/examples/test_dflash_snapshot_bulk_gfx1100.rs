@@ -223,8 +223,7 @@ fn run_case(gpu: &mut Gpu, bulk_arch: bool, ef_on: bool) {
 fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
     let bulk_arch =
-        (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201())
-            && !gpu.flags.dn_snapshot_bulk_off;
+        gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201();
     eprintln!("arch={} bulk_arch={bulk_arch}", gpu.arch);
     run_case(&mut gpu, bulk_arch, true);
     run_case(&mut gpu, bulk_arch, false);

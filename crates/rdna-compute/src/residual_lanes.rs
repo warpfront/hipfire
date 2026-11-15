@@ -16,8 +16,8 @@
 //! the singleton's per-lane FMA chains. See
 //! `kernels/src/gemv_mq4g256v2_residual_lanes.gfx1201.hip`. Replaces the PM
 //! x-batch residual (`pm_xbatch::residual`) for the A3B `wo` projection
-//! (m = 2048, K = 4096) behind `HIPFIRE_A3B_LANE_WO`; every other shape, and
-//! lane counts where the PM x-batch launch measures faster, stay on it.
+//! (m = 2048, K = 4096); every other shape, and lane counts where the PM
+//! x-batch launch measures faster, stay on it.
 //!
 //! Support is a pure function of the shapes: exact gfx1201, 1..=8 lanes,
 //! `K == 4096` and 32-bit weight byte offsets. The route admits it for

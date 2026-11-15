@@ -49,10 +49,9 @@ use crate::dflash_spec::{
 };
 use crate::qwen35::prefill::fp8_verify_open;
 use crate::qwen35::prefill::multi::{
-    cb_dn_save_free_enabled, dflash_iu4_verify_admitted, forward_prefill_batch_multi,
-    lane_gdn_batch_ready, lane_gdn_varrows_enabled, multi_chunk_pack_cap, multi_chunk_scratch_rows,
-    pack_whole_lanes, MultiChunkRequest, MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS,
-    MULTI_CHUNK_PRODUCT_MAX_ROWS,
+    dflash_iu4_verify_admitted, forward_prefill_batch_multi, lane_gdn_batch_ready,
+    multi_chunk_pack_cap, multi_chunk_scratch_rows, pack_whole_lanes, MultiChunkRequest,
+    MultiChunkScratch, MULTI_CHUNK_MAX_LANE_ROWS, MULTI_CHUNK_PRODUCT_MAX_ROWS,
 };
 use crate::qwen35::{self, DeltaNetState, DflashFusionCtx};
 use crate::qwen35::{Qwen35Config, Qwen35Weights};
@@ -73,29 +72,8 @@ use hipfire_runtime::spec::{request_rng_state, SpecRequestConfig};
 use rdna_compute::Gpu;
 use std::ops::Range;
 
-static CB_SAMPLED_TARGET_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_TARGET_BATCH")
-        .ok()
-        .as_deref()
-        != Some("0")
-});
-
 static CB_SAMPLED_PACKED_HEAD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_PACKED_HEAD")
-        .ok()
-        .as_deref()
-        != Some("0")
-});
-
-static CB_DFLASH_DRAFT_BATCH_MASTER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_DFLASH_DRAFT_BATCH")
-        .ok()
-        .as_deref()
-        != Some("0")
-});
-
-static CB_SAMPLED_DRAFT_BATCH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_DRAFT_BATCH")
         .ok()
         .as_deref()
         != Some("0")
@@ -735,19 +713,17 @@ fn cb_sampled_draft_run_admitted(
     ok
 }
 
-/// Draft phase over lanes. With `batched` (and the exact-gfx1201 MQ4 v2
-/// eligibility of [`dflash_draft_batch_eligible`]), greedy full-block lanes are
-/// packed in order into chunks of at most
+/// Draft phase over lanes. Greedy full-block lanes (when the exact-gfx1201 MQ4 v2
+/// eligibility of [`dflash_draft_batch_eligible`] holds) are packed in order into
+/// chunks of at most
 /// `min(dflash_draft_batch_max_rows(gpu), cb.draft_rows())` rows (48, or 64
 /// on exact gfx1201 where the scoped 64-row draft route is exact); each chunk of at
 /// least `cb.draft_min_lanes` lanes is ONE draft-model forward and ONE shared
 /// lm-head ([`draft_dflash_blocks_batched`]) with every lane keeping its own
 /// context rings, positions and hidden context. Every other lane (budget
-/// tails, lone lanes, ineligible machines/drafts, `batched == false`) runs
+/// tails, lone lanes, ineligible machines/drafts) runs
 /// the singleton call [`dflash_lane_draft`]. Sampled lanes always use the shared
-/// singleton selector draft unless the batched-draft master switch
-/// (`HIPFIRE_CB_DFLASH_DRAFT_BATCH`, default on) and `HIPFIRE_CB_SAMPLED_DRAFT_BATCH`
-/// (default on) both stay enabled: then each contiguous run of at least
+/// singleton selector draft unless each contiguous run of at least
 /// `max(cb.draft_min_lanes, 2)` eligible sampled lanes (positive temperature,
 /// `3 <= b <= block_size`, shared draft weights/config/layout, selector and
 /// receipt present, normal F16 gfx1201 overwrite admission for every MQ4
@@ -763,16 +739,13 @@ pub fn dflash_cb_draft(
     config: &Qwen35Config,
     cb: &mut DflashCbScratch,
     lanes: &mut [DflashCbDraftLane<'_>],
-    batched: bool,
 ) -> HipResult<Vec<Vec<u32>>> {
     let n = lanes.len();
     let mut out: Vec<Option<Vec<u32>>> = vec![None; n];
     // chunk id per lane (None = singleton draft).
     let mut chunk_of: Vec<Option<usize>> = vec![None; n];
     let mut n_chunks = 0usize;
-    if batched
-        && n > 0
-        && dflash_draft_batch_eligible(gpu, weights, config, &lanes[0].state.df.draft_weights)
+    if n > 0 && dflash_draft_batch_eligible(gpu, weights, config, &lanes[0].state.df.draft_weights)
     {
         let cap = dflash_draft_batch_max_rows(gpu).min(cb.draft_rows);
         let mut rows = 0usize;
@@ -839,10 +812,7 @@ pub fn dflash_cb_draft(
             out[i] = Some(t);
         }
     }
-    let sampled_batch = batched
-        && n > 0
-        && *CB_DFLASH_DRAFT_BATCH_MASTER
-        && *CB_SAMPLED_DRAFT_BATCH
+    let sampled_batch = n > 0
         && dflash_draft_batch_eligible(gpu, weights, config, &lanes[0].state.df.draft_weights);
     let sampled_cap = dflash_draft_batch_max_rows(gpu).min(cb.draft_rows);
     let sampled_min_lanes = cb.draft_min_lanes.max(2);
@@ -1075,7 +1045,7 @@ pub fn dflash_cb_verify(
         // One decision per packed chunk, never per lane (no half admission).
         let save_free = cb_dn_save_free_admitted(gpu, config, &cb.trunk, &lanes[range.clone()]);
         if save_free {
-            // Save-free DeltaNet verify (`HIPFIRE_CB_DN_SAVE_FREE`). Instead of
+            // Save-free DeltaNet verify. Instead of
             // copying every lane's live state A into its snapshot B, exchange
             // the owners of the four state families, so the canonical live
             // `dn_state` owns the old snapshot bank and the canonical
@@ -1197,7 +1167,7 @@ pub fn dflash_cb_verify(
             // batched run (always the lane the run started at or later).
             let mut batched_until = 0usize;
             for li in 0..chunk.len() {
-                if packed_sampled && li >= batched_until && *CB_SAMPLED_TARGET_BATCH {
+                if packed_sampled && li >= batched_until {
                     let n = cb_sampled_target_run_len(
                         &chunk[li..],
                         gpu.dflash_device_accept_supported(),
@@ -1391,8 +1361,8 @@ macro_rules! dn_sf_refuse {
 
 /// One diagnostic line: chunk lane count / rows / per-lane `b` and sample
 /// temperature, the offending lane's `b`, tape capacity and KV
-/// `compact_offset` when `lane` is given, the process VARROWS switch and the
-/// replay-graph / Redline flags, then the reason-specific `detail`.
+/// `compact_offset` when `lane` is given, the replay-graph / Redline flags,
+/// then the reason-specific `detail`.
 fn dn_sf_log(
     gpu: &Gpu,
     lanes: &[DflashCbVerifyLane<'_>],
@@ -1429,10 +1399,9 @@ fn dn_sf_log(
         );
     }
     eprintln!(
-        "[cb-dn-save-free-diag] {verdict} lanes={} rows={rows} b0={} varrows={} replay_enabled={} replay_graphs={}{per_lane} {detail}",
+        "[cb-dn-save-free-diag] {verdict} lanes={} rows={rows} b0={} replay_enabled={} replay_graphs={}{per_lane} {detail}",
         lanes.len(),
         lanes.first().map_or(0, |l| l.draft.verify_tokens.len()),
-        lane_gdn_varrows_enabled(),
         gpu.replay.is_enabled(),
         gpu.graphs.replay_graph_count(),
     );
@@ -1450,16 +1419,26 @@ fn dn_sf_replay_detail(
     use rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS;
     let n_la = tape.qkv_bufs.len();
     format!(
-        "dn_snapshot_flip={} q8={} n_la={n_la} steps_le_tape_max_n={} s_len_eq_n_la={} conv_len_eq_n_la={} \
+        "q8={} n_la={n_la} steps_le_tape_max_n={} s_len_eq_n_la={} conv_len_eq_n_la={} \
          backend_replay_eligible={} (supported={} recording={} steps_in_1..={}={}) mirrors={} \
          live_ef_len={} snap_ef_len={}",
-        gpu.flags.dn_snapshot_flip,
         state.quant == qwen35::StateQuant::Q8,
         b <= tape.max_n,
         state.s_matrices.len() == n_la,
         state.conv_states.len() == n_la,
-        gpu.gdn_replay_ml_eligible(tape.n_v_heads, tape.n_key_heads, tape.key_head_dim, tape.value_head_dim, b),
-        gpu.gdn_replay_ml_supported(tape.n_v_heads, tape.n_key_heads, tape.key_head_dim, tape.value_head_dim),
+        gpu.gdn_replay_ml_eligible(
+            tape.n_v_heads,
+            tape.n_key_heads,
+            tape.key_head_dim,
+            tape.value_head_dim,
+            b
+        ),
+        gpu.gdn_replay_ml_supported(
+            tape.n_v_heads,
+            tape.n_key_heads,
+            tape.key_head_dim,
+            tape.value_head_dim
+        ),
         gpu.replay.is_recording(),
         DFLASH_GDN_REPLAY_MAX_STEPS,
         (1..=DFLASH_GDN_REPLAY_MAX_STEPS).contains(&b),
@@ -1604,16 +1583,14 @@ fn dn_sf_alias_detail(lanes: &[DflashCbVerifyLane<'_>], sorted: &[u64]) -> Strin
 /// of the following must hold, otherwise the chunk takes today's SAVE route
 /// unchanged:
 ///
-/// * `HIPFIRE_CB_DN_SAVE_FREE` on (`cb_dn_save_free_enabled`), exact gfx1201;
+/// * exact gfx1201;
 /// * the shared scratch armed its snapshot-source lane table
 ///   ([`MultiChunkScratch::gdn_from_ready`]);
 /// * the lane-batched GDN admission's process half
-///   ([`lane_gdn_batch_ready`]: `HIPFIRE_CB_LANE_GDN_BATCH` /
-///   `HIPFIRE_CB_TAPE_COPY_BATCH`, `1..=CONV_LANES_MAX` lanes, exact gfx1201
+///   ([`lane_gdn_batch_ready`]: `1..=CONV_LANES_MAX` lanes, exact gfx1201
 ///   head geometry, no capture / recording / G0 observation) and its chunk
 ///   half (Sequential, ChainVerify, tape per lane — all structural here —
-///   and either EQUAL row counts or, unless `HIPFIRE_CB_LANE_GDN_VARROWS=0`,
-///   a per-lane count, each lane within its own tape);
+///   and a per-lane row count, each lane within its own tape);
 /// * per lane `2 <= b_i <= 16` (the D8 replay's step bound, checked against
 ///   the lane's own count, so every accept class can replay from the snapshot);
 /// * no enabled retained Redline controller and no existing replay graph
@@ -1641,15 +1618,10 @@ pub(crate) fn cb_dn_save_free_admitted(
 ) -> bool {
     use rdna_compute::dflash_gdn_replay::DFLASH_GDN_REPLAY_MAX_STEPS;
     let diag = *CB_DN_SAVE_FREE_DIAG;
-    let Some(first) = lanes.first() else {
+    if lanes.is_empty() {
         dn_sf_refuse!(diag, gpu, lanes, None, "empty", "")
-    };
-    let b0 = first.draft.verify_tokens.len();
-    let varrows = lane_gdn_varrows_enabled();
-    // Same order and short-circuit as the single `||` chain this replaces.
-    if !cb_dn_save_free_enabled() {
-        dn_sf_refuse!(diag, gpu, lanes, None, "disabled", "")
     }
+    // Same order and short-circuit as the single `||` chain this replaces.
     if !gpu.arch_caps.is_gfx1201() {
         dn_sf_refuse!(diag, gpu, lanes, None, "arch", "")
     }
@@ -1663,8 +1635,8 @@ pub(crate) fn cb_dn_save_free_admitted(
             lanes,
             None,
             "lane_gdn_unready",
-            "conv_lanes_max={} backend_lane_gdn_admitted={} recording={} capture={} g0_observing={} \
-             env_LANE_GDN_BATCH={:?} env_TAPE_COPY_BATCH={:?}",
+            "conv_lanes_max={} backend_lane_gdn_admitted={} recording={} capture={} \
+             g0_observing={}",
             rdna_compute::lane_gdn::CONV_LANES_MAX,
             gpu.lane_gdn_batch_admitted(
                 config.linear_num_value_heads,
@@ -1675,8 +1647,6 @@ pub(crate) fn cb_dn_save_free_admitted(
             gpu.replay.is_recording(),
             gpu.graphs.capture_mode,
             gpu.replay.is_g0_observing(),
-            hipfire_config::developer_var("HIPFIRE_CB_LANE_GDN_BATCH").ok(),
-            hipfire_config::developer_var("HIPFIRE_CB_TAPE_COPY_BATCH").ok(),
         )
     }
     if gpu.replay.is_enabled() {
@@ -1701,9 +1671,6 @@ pub(crate) fn cb_dn_save_free_admitted(
                 "allowed=2..={}",
                 DFLASH_GDN_REPLAY_MAX_STEPS
             )
-        }
-        if !(varrows || b_i == b0) {
-            dn_sf_refuse!(diag, gpu, lanes, Some(li), "b_mixed_no_varrows", "")
         }
         if b_i > df.gdn_tape.max_n {
             dn_sf_refuse!(diag, gpu, lanes, Some(li), "tape_capacity", "")

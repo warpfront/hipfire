@@ -1090,8 +1090,6 @@ mod lookup {
     pub(super) struct ArmInputs {
         /// Resolved `speculation.dflash_lookup` (`auto` = on).
         pub on: bool,
-        /// `HIPFIRE_SPEC_LOOKUP_TAIL` is not `0`.
-        pub tail_env: bool,
         pub selector: bool,
         /// Retained-PM4 verify replay admitted (shape-frozen at B=16).
         pub pm4: bool,
@@ -1099,11 +1097,11 @@ mod lookup {
         pub block_size: usize,
     }
 
-    /// `Ok(tail_enabled)` when lookup may arm, else the reason it stays off.
+    /// `Ok(())` when lookup may arm, else the reason it stays off.
     /// Only the singleton `DflashSpeculator` calls this: the VMM/CB lanes and
     /// the dense-TP mesh speculator are different types that never arm, and
     /// CACTUS (a per-request setting) is excluded per window in `step`.
-    pub(super) fn arming(i: &ArmInputs) -> Result<bool, &'static str> {
+    pub(super) fn arming(i: &ArmInputs) -> Result<(), &'static str> {
         if !i.on {
             return Err("speculation.dflash_lookup is off");
         }
@@ -1116,13 +1114,12 @@ mod lookup {
         if i.block_size < 3 {
             return Err("verify block < 3 rows");
         }
-        Ok(i.tail_env)
+        Ok(())
     }
 
-    pub(super) fn load_line(arm: &Result<bool, String>, max_rows: usize) -> String {
+    pub(super) fn load_line(arm: &Result<(), String>, max_rows: usize) -> String {
         match arm {
-            Ok(true) => format!("[dflash] lookup: armed (copy+tail, rows<={max_rows})"),
-            Ok(false) => format!("[dflash] lookup: armed (copy, rows<={max_rows})"),
+            Ok(()) => format!("[dflash] lookup: armed (copy+tail, rows<={max_rows})"),
             Err(why) => format!("[dflash] lookup: off ({why})"),
         }
     }
@@ -1134,16 +1131,16 @@ mod lookup {
         triple: (usize, usize, usize),
     ) -> (Option<LookupState>, String) {
         let max_rows = i.block_size.min(LOOKUP_MAX_ROWS);
-        let arm = arming(i).map_err(str::to_string).and_then(|tail| {
+        let arm = arming(i).map_err(str::to_string).and_then(|()| {
             let ctx = copy_config(triple)
                 .and_then(|c| MtpCopyContext::new(c).map_err(str::to_string))
                 .map_err(|e| format!("copy context: {e}"))?;
-            Ok((tail, ctx))
+            Ok(ctx)
         });
         match arm {
-            Ok((tail, ctx)) => {
-                let line = load_line(&Ok(tail), max_rows);
-                (Some(LookupState::new(ctx, tail, max_rows)), line)
+            Ok(ctx) => {
+                let line = load_line(&Ok(()), max_rows);
+                (Some(LookupState::new(ctx, max_rows)), line)
             }
             Err(why) => (None, load_line(&Err(why), max_rows)),
         }
@@ -1439,7 +1436,6 @@ mod lookup {
     pub(super) struct LookupState {
         pub ctx: MtpCopyContext,
         pub ctl: LookupController,
-        pub tail: bool,
         pub max_rows: usize,
         prompt_len: usize,
         dirty: bool,
@@ -1455,11 +1451,10 @@ mod lookup {
             LookupController::new(LookupPolicy::default(), true)
         }
 
-        fn new(ctx: MtpCopyContext, tail: bool, max_rows: usize) -> Self {
+        fn new(ctx: MtpCopyContext, max_rows: usize) -> Self {
             Self {
                 ctx,
                 ctl: Self::fresh_controller(),
-                tail,
                 max_rows,
                 prompt_len: 0,
                 dirty: false,
@@ -1566,9 +1561,7 @@ mod lookup {
                     return WindowPlan::Probe { rows: r };
                 }
             }
-            WindowPlan::Native {
-                tail: self.tail && rows >= 3,
-            }
+            WindowPlan::Native { tail: rows >= 3 }
         }
     }
 
@@ -1576,15 +1569,14 @@ mod lookup {
     mod tests {
         use super::*;
 
-        fn st(tail: bool) -> LookupState {
+        fn st() -> LookupState {
             let ctx = MtpCopyContext::new(copy_config((5, 1, 63)).unwrap()).unwrap();
-            LookupState::new(ctx, tail, 16)
+            LookupState::new(ctx, 16)
         }
 
         fn inputs() -> ArmInputs {
             ArmInputs {
                 on: true,
-                tail_env: true,
                 selector: true,
                 pm4: false,
                 block_size: 16,
@@ -1872,7 +1864,7 @@ mod lookup {
         #[test]
         fn lookup_rewind_rebuilds_history_from_prompt() {
             let (prompt, a) = mk_history();
-            let mut s = st(true);
+            let mut s = st();
             s.begin_request(&prompt);
             let emitted: Vec<u32> = a[..8].to_vec();
             assert!(s.sync_history(&emitted));
@@ -1915,7 +1907,7 @@ mod lookup {
         #[test]
         fn lookup_plan_window_incumbent_paths() {
             let (prompt, a) = mk_history();
-            let mut s = st(true);
+            let mut s = st();
             // Before begin_request: lookup off for the window (incumbent call).
             let emitted: Vec<u32> = a[..8].to_vec();
             assert_eq!(
@@ -1936,15 +1928,8 @@ mod lookup {
                 WindowPlan::Native { tail: true }
             );
             assert_eq!(s.proposal, a[8..23].to_vec());
-            // Tail kill switch: still native, no tail offer.
-            let mut s2 = st(false);
-            s2.begin_request(&prompt);
-            assert_eq!(
-                s2.plan_window(&emitted, a[7], 1000, 16, 4096, 16, 100_000),
-                WindowPlan::Native { tail: false }
-            );
             // No proposal: `emitted` of tokens never seen before.
-            let mut s3 = st(true);
+            let mut s3 = st();
             s3.begin_request(&prompt);
             let novel: Vec<u32> = vec![5000, 5001, 5002, 5003, 5004, 5005];
             assert_eq!(
@@ -1962,7 +1947,7 @@ mod lookup {
         #[test]
         fn lookup_plan_window_takes_copy_after_priced_evidence() {
             let (prompt, a) = mk_history();
-            let mut s = st(true);
+            let mut s = st();
             s.begin_request(&prompt);
             let emitted: Vec<u32> = a[..8].to_vec();
             // Priced native 16-row windows whose lookup shadow always matches
@@ -1993,7 +1978,7 @@ mod lookup {
         #[test]
         fn no_tail_action_matches_the_splice_decision_space() {
             let (prompt, a) = mk_history();
-            let mut s = st(true);
+            let mut s = st();
             s.begin_request(&prompt);
             let base = lookup_budget(16, 16, 64, 1000, 100_000);
             let decides = |ctl: &LookupController, k: usize, offered: usize| -> bool {
@@ -2039,14 +2024,7 @@ mod lookup {
 
         #[test]
         fn lookup_arming_reasons_and_load_lines() {
-            assert_eq!(arming(&inputs()), Ok(true));
-            assert_eq!(
-                arming(&ArmInputs {
-                    tail_env: false,
-                    ..inputs()
-                }),
-                Ok(false)
-            );
+            assert_eq!(arming(&inputs()), Ok(()));
             assert_eq!(
                 arming(&ArmInputs {
                     on: false,
@@ -2076,12 +2054,8 @@ mod lookup {
                 Err("verify block < 3 rows")
             );
             assert_eq!(
-                load_line(&Ok(true), 16),
+                load_line(&Ok(()), 16),
                 "[dflash] lookup: armed (copy+tail, rows<=16)"
-            );
-            assert_eq!(
-                load_line(&Ok(false), 8),
-                "[dflash] lookup: armed (copy, rows<=8)"
             );
             assert_eq!(
                 load_line(&Err("no DFlash2 candidate selector".into()), 16),
@@ -2111,23 +2085,20 @@ mod lookup {
             }
             let (state, line) = build_state(&inputs(), (5, 1, 63));
             let state = state.expect("armed");
-            assert!(state.tail);
             assert_eq!(state.max_rows, 16);
             assert_eq!(line, "[dflash] lookup: armed (copy+tail, rows<=16)");
             assert!(!state.ctx.is_begun());
             assert!(state.proposal.capacity() >= LOOKUP_MAX_CANDIDATES);
             let (state, line) = build_state(
                 &ArmInputs {
-                    tail_env: false,
                     block_size: 8,
                     ..inputs()
                 },
                 (5, 1, 63),
             );
-            let state = state.expect("armed copy-only");
-            assert!(!state.tail);
+            let state = state.expect("armed");
             assert_eq!(state.max_rows, 8);
-            assert_eq!(line, "[dflash] lookup: armed (copy, rows<=8)");
+            assert_eq!(line, "[dflash] lookup: armed (copy+tail, rows<=8)");
             // An unrunnable triple never arms and says why.
             let (state, line) = build_state(&inputs(), (5, 9, 3));
             assert!(state.is_none());
@@ -2364,19 +2335,17 @@ impl DflashSpeculator {
     }
 
     /// Arm (or leave off) the verbatim-copy lookup and print the one load
-    /// line. `on` = resolved `speculation.dflash_lookup`, `tail_env` = the
-    /// `HIPFIRE_SPEC_LOOKUP_TAIL` kill switch is not `0`. Armed only on this
+    /// line. `on` = resolved `speculation.dflash_lookup`. Armed only on this
     /// singleton DFlash2 selector chain (no retained-PM4 verify);
     /// the VMM/CB lanes and the dense-TP mesh speculator are other types and
     /// never arm; CACTUS is excluded per window in `step`.
-    pub fn configure_lookup(&mut self, on: bool, tail_env: bool) {
+    pub fn configure_lookup(&mut self, on: bool) {
         let Some(df) = self.df.as_ref() else {
             self.lookup = None;
             return;
         };
         let inputs = lookup::ArmInputs {
             on,
-            tail_env,
             selector: df.draft_weights.has_candidate_selector(),
             pm4: df.verify_pm4.admitted(),
             block_size: df.block_size,
@@ -3336,10 +3305,7 @@ pub fn build_dflash_speculator(df: DflashState, adaptive_b: bool) -> Box<dyn Spe
     let floor_call_log = hipfire_config::developer_var("HIPFIRE_DFLASH_FLOOR_CALL_LOG")
         .is_ok_and(|value| value == "1");
     let mut speculator = DflashSpeculator::new(df, ck_interval, ck_cap, adaptive_b, floor_call_log);
-    speculator.configure_lookup(
-        hipfire_config::dflash_lookup_enabled(),
-        hipfire_config::dflash_lookup_tail_enabled(),
-    );
+    speculator.configure_lookup(hipfire_config::dflash_lookup_enabled());
     if crate::dflash_railgun::window_var_enabled() {
         speculator.enable_railgun_window();
     }
