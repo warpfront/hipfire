@@ -63,3 +63,13 @@ git show <sha>:<path> > <path>
 | `test_e4_engine_repro` | `crates/hipfire-runtime/examples/test_e4_engine_repro.rs` | `9f71309bfc75` | 146 | Temporary audit probe: submit the E4 enum/const schema request directly to SlotEngine and watch events + per-token mask decisions. |
 | `tmp_fa2a_g2` | `crates/hipfire-runtime/examples/tmp_fa2a_g2.rs` | `bf6ec9ddf240` | 501 | THROWAWAY Slice-A G2 harness. |
 | `tmp_iu4_attrib` | `crates/hipfire-runtime/examples/tmp_iu4_attrib.rs` | `bf6ec9ddf240` | 125 | Throwaway iu4 attribution runner: JITs a TU copy from disk and times the N=512 gate_set case exactly like tmp_iu4_gfx12_oracle -- TIME. |
+
+## rdna-compute
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `host_kernel_access` | `crates/rdna-compute/examples/host_kernel_access.rs` | `e3066e7396ab` | 228 | Can a shader read host-mapped memory — and specifically the quantized path? |
+| `test_mfp4e8_grouped_wave64x4_gfx942` | `crates/rdna-compute/examples/test_mfp4e8_grouped_wave64x4_gfx942.rs` | `bf6ec9ddf240` | 212 | gfx942 native-wave64 qt35 projection candidate channel. |
+| `tmp_scratch_leak_probe` | `crates/rdna-compute/examples/tmp_scratch_leak_probe.rs` | `bf6ec9ddf240` | 133 | Scratch-leak probe (gate 1 of the grow_scratch_buffer leak fix). |
+| `tp_peer_push_probe` | `crates/rdna-compute/examples/tp_peer_push_probe.rs` | `127dbb74eac3` | 1284 | Lab microbench: in-kernel peer-VRAM push + system-scope flag collective against the incumbent TP2 tp_graph_signal_reduce_gfx1100 collective, on two exact gfx1201 cards. |
+| `wmma_zero_sign_probe` | `crates/rdna-compute/examples/wmma_zero_sign_probe.rs` | `b2e67a8ab9ca` | 134 | gfx11 WMMA zero-sign probe: output element 0 = A[0][0]*B[0][0] + masked partners A[0][k>=1] * (+0) + C. |

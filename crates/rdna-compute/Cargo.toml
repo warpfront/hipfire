@@ -848,9 +848,6 @@ required-features = ["lab"]
 name = "test_mfp4e8_grouped_gfx942"
 required-features = ["lab"]
 
-[[example]]
-name = "test_mfp4e8_grouped_wave64x4_gfx942"
-required-features = ["lab"]
 
 [[example]]
 name = "test_mfp4e8_lds8_family_gfx942"
@@ -976,9 +973,6 @@ required-features = ["lab"]
 name = "vmm_tensor_smoke"
 required-features = ["lab"]
 
-[[example]]
-name = "host_kernel_access"
-required-features = ["lab"]
 
 [[example]]
 name = "host_offload_headroom"
@@ -1040,9 +1034,6 @@ required-features = ["lab"]
 name = "bench_attention_flux_vt"
 required-features = ["lab"]
 
-[[example]]
-name = "tmp_scratch_leak_probe"
-required-features = ["lab"]
 
 [[example]]
 name = "test_kv_slot_desc_ports"
@@ -1324,11 +1315,6 @@ required-features = ["lab"]
 name = "railgun_persistent_cancel_smoke"
 required-features = ["lab"]
 
-# Peer-VRAM push + flag collective vs the incumbent TP2 graph collective
-# (two gfx1201 cards); `--features lab`.
-[[example]]
-name = "tp_peer_push_probe"
-required-features = ["lab"]
 
 # TP4 bf16 peer-push collective chain on four gfx1201 cards; `--features lab`.
 [[example]]
@@ -1415,9 +1401,6 @@ required-features = ["lab", "deltanet"]
 name = "attn_call_shape_oracle_gfx11"
 required-features = ["lab"]
 
-[[example]]
-name = "wmma_zero_sign_probe"
-required-features = ["lab"]
 
 # gfx942 wide-lane MoE modules: exact-image byte oracles (module vs the routes they replace vs the
 # public launchers; HIPFIRE_QWEN4_G942_MOE_{WIDE,GEMM}_IMAGE honored).
