@@ -2272,7 +2272,12 @@ impl<'a> SealedMoeCall<'a> {
             _ => {}
         }
         if let MoeKernelSelection::Decode(selection) = &self.selection {
-            if !selection.resolution.use_gpu_topk && gpu.graphs.replay.capturing.is_some() {
+            // The host top-K fallback downloads router output mid-call: neither
+            // the multi-step replay capture nor the plain AR hipGraph capture
+            // (`capture_mode`) can record it (#1149, hipError 906).
+            if !selection.resolution.use_gpu_topk
+                && (gpu.graphs.replay.capturing.is_some() || gpu.graphs.capture_mode)
+            {
                 return Err(DispatchError::UnsupportedVariant {
                     family: "moe",
                     variant: "cpu-topk-fallback-not-capture-safe(set HIPFIRE_GRAPH_MOE=0)",

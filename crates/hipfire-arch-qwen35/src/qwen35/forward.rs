@@ -550,30 +550,14 @@ impl hipfire_dispatch::families::moe::RoutedExpertWeights for MoeFfnWeights {
     }
 }
 
-/// Build the complete typed Qwen softmax/shared decode recipe from the
-/// caller-owned weights and scratch. `normalization` is either `Provided` for
-/// an already prepared activation or `RmsNorm` for the shared prologue.
-#[allow(clippy::too_many_arguments)]
-fn moe_params_for_decode<'a>(
-    ffn: &'a MoeFfnWeights,
-    x_norm: &'a GpuTensor,
-    x_residual: &'a GpuTensor,
-    config: &Qwen35Config,
-    s: &MoeScratchRef<'a>,
-    x_rot_prerotated: bool,
-    ep_routed_out: Option<&'a GpuTensor>,
-    ep_skip_shared: bool,
-    defer_routed_combine: bool,
-    ep_mode: MoeEpMode,
-    normalization: hipfire_dispatch::families::moe::MoeNormalization<'a>,
-) -> hipfire_dispatch::families::moe::MoeParams<'a> {
-    let hidden = config.dim;
-    let mi = config.moe_intermediate_size;
-    let smi = config.shared_expert_intermediate_size;
-    let k = config.num_experts_per_tok;
-    let n_exp = config.num_experts;
+/// The decode `MoeDtypes` of one MoE layer, from its loaded weights. Single
+/// source for the decode recipe and the load-time host-top-K graph decision
+/// (#1149).
+pub(crate) fn moe_decode_dtypes(
+    ffn: &MoeFfnWeights,
+) -> hipfire_dispatch::families::moe::MoeDtypes<'_> {
     let (per_expert_gate_up, per_expert_down) = ffn.per_expert_tier_tables();
-    let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
+    hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
         shared: Some(hipfire_dispatch::families::moe::MoeSharedDtypes {
             selector: ffn.shared_expert_gate.gpu_dtype,
@@ -610,7 +594,34 @@ fn moe_params_for_decode<'a>(
         has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
-    };
+    }
+}
+
+/// Build the complete typed Qwen softmax/shared decode recipe from the
+/// caller-owned weights and scratch. `normalization` is either `Provided` for
+/// an already prepared activation or `RmsNorm` for the shared prologue.
+#[allow(clippy::too_many_arguments)]
+fn moe_params_for_decode<'a>(
+    ffn: &'a MoeFfnWeights,
+    x_norm: &'a GpuTensor,
+    x_residual: &'a GpuTensor,
+    config: &Qwen35Config,
+    s: &MoeScratchRef<'a>,
+    x_rot_prerotated: bool,
+    ep_routed_out: Option<&'a GpuTensor>,
+    ep_skip_shared: bool,
+    defer_routed_combine: bool,
+    ep_mode: MoeEpMode,
+    normalization: hipfire_dispatch::families::moe::MoeNormalization<'a>,
+) -> hipfire_dispatch::families::moe::MoeParams<'a> {
+    let hidden = config.dim;
+    let mi = config.moe_intermediate_size;
+    let smi = config.shared_expert_intermediate_size;
+    let k = config.num_experts_per_tok;
+    let n_exp = config.num_experts;
+    let moe_dtypes = moe_decode_dtypes(ffn);
+    let per_expert_mixed =
+        moe_dtypes.per_expert_gate_up.is_some() || moe_dtypes.per_expert_down.is_some();
     crate::qwen35::weights::trace_moe_arm(
         "decode",
         moe_dtypes.routed_gate_up,
@@ -620,7 +631,7 @@ fn moe_params_for_decode<'a>(
             owners.gate_up.iter().all(|b| b.buf.is_host_mapped())
                 && owners.down.iter().all(|b| b.buf.is_host_mapped())
         }),
-        per_expert_gate_up.is_some() || per_expert_down.is_some(),
+        per_expert_mixed,
     );
     let shared = Some(hipfire_dispatch::families::moe::MoeSharedDecode {
         weights: hipfire_dispatch::families::moe::MoeSharedWeights {
@@ -1664,6 +1675,32 @@ fn ar_graph_trace_enabled() -> bool {
     })
 }
 
+/// True when any of the given MoE layers resolves decode to the host top-K
+/// fallback (`MoeResolution::use_gpu_topk == false`). Qwen decode never sets a
+/// route policy or selection bias, so the base resolution is the effective one.
+pub(crate) fn moe_layers_use_host_topk<'a>(
+    layers: impl IntoIterator<Item = hipfire_dispatch::families::moe::MoeDtypes<'a>>,
+    k: usize,
+    arch_has_wmma: bool,
+) -> bool {
+    layers.into_iter().any(|dtypes| {
+        !hipfire_dispatch::families::moe::MoeResolution::resolve_arch(&dtypes, k, arch_has_wmma)
+            .use_gpu_topk
+    })
+}
+
+/// MoE half of the AR decode hipGraph gate. Dense models always pass; MoE
+/// models need `experimental.graph.moe` and no host-top-K layer (#1149).
+/// `moe_host_topk` is evaluated only for MoE models with the knob on.
+#[inline]
+fn ar_graph_moe_admitted(
+    num_experts: usize,
+    allow_moe: bool,
+    moe_host_topk: impl FnOnce() -> bool,
+) -> bool {
+    num_experts == 0 || (allow_moe && !moe_host_topk())
+}
+
 #[inline]
 fn ar_graph_eligible_for_kv(
     requested: bool,
@@ -1922,12 +1959,18 @@ pub fn forward_scratch(
         gpu.graphs.ar_forward_kernel_dirty = true;
     }
     // MoE models require `experimental.graph.moe` in addition to the
-    // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
+    // arch/kill-switch guards, and every MoE layer must resolve decode to GPU
+    // top-K: the host top-K fallback downloads router output mid-forward, which
+    // a capture cannot record (#1149, hipError 906). That resolution is decided
+    // once per model (load-time, cached on the weights). Dense models
+    // (num_experts==0) are unaffected.
     let graph_would_be_used = ar_graph_test
         && graph_enabled
         && graph_eligible
         && !gpu.replay.is_enabled()
-        && (config.num_experts == 0 || allow_moe);
+        && ar_graph_moe_admitted(config.num_experts, allow_moe, || {
+            weights.moe_decode_host_topk(config, gpu.arch_caps.has_wmma())
+        });
     // A CPU-executed step (memory.offload_exec=cpu over a spilled prefix) is a
     // host sync point — a D2H and an H2D around the multiplication — so it can
     // neither be recorded into a hipGraph nor replayed out of one. Take the
@@ -5665,6 +5708,66 @@ pub fn forward_with_embedding(
 mod tests {
     use super::*;
     use hipfire_dispatch::pipeline::superop::SuperOpKind;
+
+    fn moe_dtypes(
+        gate_up: DType,
+        down: DType,
+    ) -> hipfire_dispatch::families::moe::MoeDtypes<'static> {
+        hipfire_dispatch::families::moe::MoeDtypes {
+            router: DType::MQ4G256,
+            shared: Some(hipfire_dispatch::families::moe::MoeSharedDtypes {
+                selector: DType::MQ4G256,
+                gate: DType::MQ4G256,
+                up: DType::MQ4G256,
+                down: DType::MQ4G256,
+            }),
+            experts_all_gate_up_mq4: matches!(gate_up, DType::MQ4G256 | DType::MQ4G256V2),
+            routed_gate_up: gate_up,
+            routed_down: down,
+            routed_has_mixed_experts: false,
+            per_expert_gate_up: None,
+            per_expert_down: None,
+            has_paro_shared: false,
+        }
+    }
+
+    /// #1149: one host-top-K MoE layer keeps the whole model's AR decode
+    /// graph eager; all-GPU-top-K MoE and dense models keep the old gate.
+    #[test]
+    fn ar_graph_gate_runs_eager_when_any_moe_layer_uses_host_topk() {
+        let gpu_topk = moe_dtypes(DType::MQ4G256, DType::MQ4G256);
+        // Split V2/V1 header pairing: not indexable, so decode falls back to
+        // host top-K (the qt13 mixed-header class).
+        let host_topk = moe_dtypes(DType::MQ6G256V2, DType::MQ4G256);
+        for wmma in [false, true] {
+            assert!(!moe_layers_use_host_topk([gpu_topk, gpu_topk], 8, wmma));
+            assert!(moe_layers_use_host_topk(
+                [gpu_topk, host_topk, gpu_topk],
+                8,
+                wmma
+            ));
+            // Router widths the GPU top-K kernel cannot select also fall back.
+            assert!(moe_layers_use_host_topk([gpu_topk], 6, wmma));
+            assert!(!moe_layers_use_host_topk(std::iter::empty(), 8, wmma));
+        }
+
+        let decide = |n_exp, allow, layers: &[_]| {
+            ar_graph_moe_admitted(n_exp, allow, || {
+                moe_layers_use_host_topk(layers.iter().copied(), 8, false)
+            })
+        };
+        assert!(decide(256, true, &[gpu_topk, gpu_topk]));
+        assert!(!decide(256, true, &[gpu_topk, host_topk]));
+        assert!(!decide(256, false, &[gpu_topk]));
+        assert!(decide(0, false, &[]));
+        // Dense models and a disabled MoE knob never evaluate the layer scan.
+        assert!(ar_graph_moe_admitted(0, true, || panic!(
+            "dense must not scan"
+        )));
+        assert!(!ar_graph_moe_admitted(256, false, || panic!(
+            "knob off must not scan"
+        )));
+    }
 
     #[test]
     fn x_rot_covers_deltanet_value_width_for_moe_configs() {

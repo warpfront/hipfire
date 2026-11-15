@@ -1102,6 +1102,8 @@ impl Rig {
             let layout = qwen35::Layout::single(config.n_layers).with_placement(placement.clone());
             let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
                 .map_err(|e| format!("load weights: {e}"))?;
+            // Decide the AR decode graph policy at load (#1149).
+            weights.resolve_moe_decode_host_topk(&config, &gpu);
             (weights, layer_bytes.host_bytes(&placement))
         };
 

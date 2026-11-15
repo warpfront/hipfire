@@ -111,8 +111,11 @@ impl Architecture for Qwen35 {
             None => Layout::single(cfg.n_layers),
             Some(placement) => Layout::single(cfg.n_layers).with_placement(placement.clone()),
         };
-        qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &layout)
-            .map_err(|e| format!("qwen35: load_weights failed: {e:?}"))
+        let weights = qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &layout)
+            .map_err(|e| format!("qwen35: load_weights failed: {e:?}"))?;
+        // Decide the AR decode graph policy at load (#1149).
+        weights.resolve_moe_decode_host_topk(cfg, gpu);
+        Ok(weights)
     }
 
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {

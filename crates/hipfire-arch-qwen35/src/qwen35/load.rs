@@ -3037,6 +3037,7 @@ fn load_weights_inner(
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,
+        moe_host_topk: Default::default(),
     };
     // Model-level symmetric IU4 resolution for the qt53 artifact class (default
     // on by capability; typed refusal or explicit-kill warning; no-op for every
@@ -5129,6 +5130,7 @@ pub fn load_weights_dense_tp_rank(
             pager: None,
             lm_head_aliases_embd,
             ep_shard: None,
+            moe_host_topk: Default::default(),
         })
     })();
     match res {
@@ -8210,6 +8212,7 @@ fn load_weights_ep_rank_inner(
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,
+        moe_host_topk: Default::default(),
     };
     let fingerprint = match &weights.layers[0] {
         LayerWeights::DeltaNetMoe(layer) => layer.ffn.expert_execution_plan.execution_fingerprint(),
