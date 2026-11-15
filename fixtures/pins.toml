@@ -366,6 +366,18 @@ pinned_in = "1f88748d9c"
 # Evaluator builds
 # ---------------------------------------------------------------------------
 
+[evaluator."eval_hipfire-42b8b40e2-gfx1150"]
+status = "current"
+tool = "eval_hipfire"
+commit = "42b8b40e2"
+branch = "feat/gfx1150-qt44-bt-beta"
+binary_md5 = "2438edea48b70e512b53fca4528414dd"
+build_arch = ["gfx1150"]
+toolchain = "ROCm 10.1 / HIP 7.16 / clang 24"
+receipt = "/home/david/qcal/pr1150-gfx1150-kld/runs/"
+date = "2026-11-15"
+pinned_in = "6f1ba538d"
+
 [evaluator."eval_hipfire-40c52c783a-gfx1201"]
 status = "current"
 tool = "eval_hipfire"
@@ -554,7 +566,7 @@ reference = "qwen3.8-27b.ref_wt2.bin"
 evaluator = "eval_hipfire-42b8b40e2-gfx1150"
 receipt = "/home/david/qcal/pr1150-gfx1150-kld/runs/"
 date = "2026-11-15"
-pinned_in = "PINNED_IN_W4A4_PLACEHOLDER"
+pinned_in = "6f1ba538d"
 
 [kld."gfx1150.qt44_w4a4.code24"]
 status = "current"
@@ -569,7 +581,7 @@ reference = "heldout-code24.gptqsym.kldref.bin"
 evaluator = "eval_hipfire-42b8b40e2-gfx1150"
 receipt = "/home/david/qcal/pr1150-gfx1150-kld/runs/"
 date = "2026-11-15"
-pinned_in = "PINNED_IN_W4A4_PLACEHOLDER"
+pinned_in = "6f1ba538d"
 
 [kld."gfx942.fn-fp8.wt2"]
 status = "current"
