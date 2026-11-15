@@ -430,8 +430,18 @@ developer_callsite	*	HIPFIRE_GPTQ_DAMPING#developer_var=ok.and_then.unwrap_or(0.
 developer_callsite	*	HIPFIRE_GQA_CHUNK#developer_var=ok.and_then.unwrap_or(128)
 developer_callsite	*	HIPFIRE_GQA_FUSED#developer_var=map.unwrap_or(false)
 developer_callsite	*	HIPFIRE_HC_CTRL_T1024#developer_bool=false
+developer_callsite	*	HIPFIRE_HETERO_DECODE_ROWS#developer_var=ok.and_then.filter.unwrap_or(HETERO_DECODE_ROWS)
+developer_callsite	*	HIPFIRE_HETERO_DECODE_TRACE#developer_var=is_ok_and.then
+developer_callsite	*	HIPFIRE_HETERO_HOST_TRACE#developer_var=is_ok_and
+developer_callsite	*	HIPFIRE_HETERO_LAYER_MAJOR#developer_var=is_ok_and
+developer_callsite	*	HIPFIRE_HETERO_PREFILL_ROWS#developer_var=ok.and_then.map.filter.unwrap_or(HETERO_PREFILL_CHUNK_ROWS)
+developer_callsite	*	HIPFIRE_HETERO_PREFILL_TRACE#developer_var=is_ok_and
+developer_callsite	*	HIPFIRE_HETERO_PREFILL_TRACE#developer_var=is_ok_and.then
+developer_callsite	*	HIPFIRE_HETERO_TILES#developer_var=ok.and_then.filter.unwrap_or(4)
+developer_callsite	*	HIPFIRE_HETERO_TILE_ROWS#developer_var=ok.and_then.map.filter.unwrap_or_else
 developer_callsite	*	HIPFIRE_HIPCC#developer_var_os=filter.map
 developer_callsite	*	HIPFIRE_HIP_WAIT#developer_var=-
+developer_callsite	*	HIPFIRE_IGPU_ARM_TRACE#developer_var=is_ok_and.then
 developer_callsite	*	HIPFIRE_IMG_COND_CACHE#developer_var=map_or(true, |v| v != "0")
 developer_callsite	*	HIPFIRE_IMG_PROFILE#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_IU4_BAFOLD#developer_var=as_deref.!=Ok("0")
@@ -509,6 +519,7 @@ developer_callsite	*	HIPFIRE_MOE_ROUTER_SHARED_FUSE#developer_var=as_deref.==Ok(
 developer_callsite	*	HIPFIRE_MOE_ROUTER_TOPK_MULTIROW#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_MOE_SHARED_PREPARED_IU4#developer_typed_bool=-
+developer_callsite	*	HIPFIRE_MOE_STAGE_HOST_TRACE#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_MOE_SYM_IU4#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_MOE_TIER_MAP#developer_var=-
 developer_callsite	*	HIPFIRE_MQ2_DOWN_ROWS#developer_var=as_deref
@@ -731,6 +742,7 @@ developer_callsite	*	HIPFIRE_QWEN4_QSA_LANES_FUSE#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_NORM_EPI#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_POOLED_BF16#developer_bool=true
+developer_callsite	*	HIPFIRE_QWEN4_QSA_Q8_GATHER_GFX1201#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SCORE_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SCORE_ROWS32#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SELECT_EXACT#developer_bool=false
@@ -767,7 +779,7 @@ developer_callsite	*	HIPFIRE_QWEN4_TRUNK_IU4#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QWEN4_TRUNK_IU4_RAGGED#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_QWEN4_TRUNK_OVERLAY#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QWEN4_TRUNK_TIER#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_QWEN4_TURN_SNAPSHOTS#developer_bool=false
+developer_callsite	*	HIPFIRE_QWEN4_TURN_SNAPSHOTS#developer_bool=crate::hetero::split_requested()
 developer_callsite	*	HIPFIRE_QWEN4_VMM_GFX1100#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_WIDE_GROUPED_DOWN#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_WIDE_GROUPED_MOE#developer_bool=false
@@ -870,5 +882,7 @@ developer_callsite	*	HIPFIRE_VL_MAX_PIXELS#developer_var=ok.and_then.filter.map.
 developer_callsite	*	HIPFIRE_VL_PREFILL#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_VL_SEQUENTIAL#developer_var=ok.is_some_and
 developer_callsite	*	HIPFIRE_VMM_PROMOTE_AT#developer_var=ok.and_then
+developer_callsite	*	HIPFIRE_VMM_TLB_POKE#developer_bool=in_tree
+developer_callsite	*	HIPFIRE_VMM_TLB_POKE#developer_var=ok
 developer_callsite	*	HIPFIRE_WEIGHT_SLAB#developer_var=-
 developer_callsite	*	HIPFIRE_WIDENED_PBS_GROW_ONLY#developer_var=ok.as_deref.!=Some("0")

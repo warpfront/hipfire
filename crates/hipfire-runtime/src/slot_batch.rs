@@ -191,7 +191,10 @@ pub struct BatchPlanner {
     /// Per-`work`-index forced prefill chunk length (empty = scheduler
     /// allocation). `Some(n)`: that request's prefill takes exactly `n` rows
     /// or none this step (an executor whose arithmetic depends on chunk
-    /// boundaries, e.g. the exact VMM route, sets this every step).
+    /// boundaries, e.g. the exact VMM route, sets this every step). Such a
+    /// chunk runs off the trunk (the singleton prefill on its own scratch),
+    /// so it is paced by the row budget, not held to the rows left after
+    /// decode: at least one runs per step, however long.
     pub forced_prefill_len: Vec<Option<usize>>,
     pending_cursor: Option<usize>,
 }
@@ -294,13 +297,15 @@ impl BatchPlanner {
         );
         if !self.forced_prefill_len.is_empty() {
             // Re-allocate prefill rows: decode rows stay, each forced
-            // request gets exactly its length if it fits, rotating from the
-            // cursor so two prefills alternate.
-            let mut avail = row_budget - verify_used;
+            // request gets exactly its length, rotating from the cursor so
+            // two prefills alternate. Forced chunks are off-trunk: they share
+            // a pacing budget of `row_budget` rows, and the first always runs
+            // (a chunk longer than the budget, or than what decode rows leave,
+            // would otherwise never be planned).
+            let mut avail = row_budget;
+            let mut admitted_one = false;
             for i in 0..n {
-                if alloc.alloc[i] > 0 && work[i].decoding {
-                    avail -= alloc.alloc[i];
-                } else {
+                if !(alloc.alloc[i] > 0 && work[i].decoding) {
                     alloc.alloc[i] = 0;
                 }
             }
@@ -318,9 +323,10 @@ impl BatchPlanner {
                     Some(w) => w.min(work[i].remaining_prompt.len()),
                     None => continue,
                 };
-                if want > 0 && want <= avail {
+                if want > 0 && (want <= avail || !admitted_one) {
                     alloc.alloc[i] = want;
-                    avail -= want;
+                    avail = avail.saturating_sub(want);
+                    admitted_one = true;
                 }
             }
             alloc.next_prefill_cursor =
@@ -668,6 +674,44 @@ mod tests {
             .unwrap();
         assert_eq!(plan.verify_rows, 0);
         assert_eq!(plan.prefill_rows, 20);
+    }
+
+    /// An exact-route chunk longer than the row budget (the singleton's own
+    /// 8192-row chunk under a 4096-row trunk budget) is planned, beside the
+    /// decode rows; it used to wait forever.
+    #[test]
+    fn forced_prefill_longer_than_the_budget_still_runs() {
+        let work = vec![
+            pw(0, vec![9], 50, true, SpecKind::None),
+            pw(1, (0..100).collect(), 0, false, SpecKind::None),
+        ];
+        let mut p = planner();
+        p.forced_prefill_len = vec![None, Some(100)];
+        let plan = p
+            .plan_step(&work, &[ep(1), ep(2)], &[true; 2], 32, 8)
+            .unwrap();
+        assert_eq!(plan.decode_rows, 1);
+        assert_eq!(plan.prefill_rows, 100);
+    }
+
+    /// Forced chunks are off-trunk: decode rows do not shrink the room for
+    /// one that fits the budget alone; a second forced chunk past the budget
+    /// waits its turn.
+    #[test]
+    fn forced_prefills_are_paced_by_the_budget_not_the_decode_rows() {
+        let work = vec![
+            pw(0, vec![9], 50, true, SpecKind::None),
+            pw(1, (0..32).collect(), 0, false, SpecKind::None),
+            pw(2, (0..8).collect(), 0, false, SpecKind::None),
+        ];
+        let mut p = planner();
+        p.forced_prefill_len = vec![None, Some(32), Some(8)];
+        let plan = p
+            .plan_step(&work, &[ep(1), ep(2), ep(3)], &[true; 3], 32, 8)
+            .unwrap();
+        assert_eq!(plan.decode_rows, 1);
+        assert_eq!(plan.prefill_rows, 32);
+        assert_eq!(plan.requests.len(), 2);
     }
 
     #[test]

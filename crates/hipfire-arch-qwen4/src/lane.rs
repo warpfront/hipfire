@@ -122,6 +122,12 @@ fn lane_expert_route(bundle: &Qwen4Bundle) -> LaneExpertRoute {
         LaneExpertRoute::Split
     } else if bundle.has_cpu_deferred_experts() {
         LaneExpertRoute::CpuDeferred
+    } else if bundle
+        .execution
+        .as_ref()
+        .is_some_and(|forward| forward.hetero_tiered_experts())
+    {
+        LaneExpertRoute::HeteroTiered
     } else if bundle.weights.expert_tiers().is_some() {
         LaneExpertRoute::Unclassified
     } else if bundle.weights.ep_placement().is_some() {
@@ -1994,7 +2000,10 @@ pub(crate) fn download_lane_rows(
         .flags
         .qwen4_lane_pinned_logits_enabled()
         .then_some(&gpu.hip);
-    copy_lane_rows(gpu, logits, begin, scratch.landing(pinned, n))
+    copy_lane_rows(gpu, logits, begin, scratch.landing(pinned, n))?;
+    // The rows are on the host, so the step's layers are done: a hetero wait
+    // that timed out in it skipped cold rows, and no lane may sample them.
+    crate::hetero::check_forward()
 }
 
 /// One draw of a sampled lane: the AR singleton's `sample_cpu` (neutral
@@ -2485,14 +2494,7 @@ impl Qwen4LaneStore {
         // A head owner (the single scope, every EP rank, the PP output band)
         // holds the MTP head; any other band that owns target layers holds
         // only its lanes' verify rings (target-only ownership).
-        let mut proto = LaneProto::new(copy.map(|c| c.ngram))?;
-        // G12 input: executor-local adapter, no scheduler interface changes. Exact gfx942 binds
-        // its lane cost profile (static drafting depth, `LaneCostProfile::gfx942`) through the
-        // existing `MeshRoot::bind_cost_arch` before the first lane is admitted; every other
-        // arch keeps the pooled legacy floor of this store.
-        if gpu.arch_caps.is_gfx942() {
-            proto.bind_cost_arch(&gpu.arch);
-        }
+        let proto = LaneProto::new(copy.map(|c| c.ngram), &gpu.arch)?;
         if let Some(spec) = spec {
             let verify_rows = if bundle.has_cpu_deferred_experts() {
                 crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
@@ -4685,6 +4687,7 @@ mod tests {
             LaneExpertRoute::HostMapped,
             LaneExpertRoute::CpuDeferred,
             LaneExpertRoute::Split,
+            LaneExpertRoute::HeteroTiered,
             LaneExpertRoute::Unclassified,
         ] {
             assert_eq!(
@@ -4709,6 +4712,22 @@ mod tests {
                     dense: [DType::BF16; 5],
                     decode_admitted: true,
                 }],
+                "{topology:?}"
+            );
+        }
+        // The hetero tier class keeps its own label off EP.
+        for topology in [LaneTopology::Single, LaneTopology::Pp] {
+            let mut facts = stage_facts();
+            facts.topology = topology;
+            facts.experts = LaneExpertRoute::HeteroTiered;
+            assert!(
+                matches!(
+                    moe_stage(&facts)[..],
+                    [StageRoute::Moe {
+                        experts: LaneExpertRoute::HeteroTiered,
+                        ..
+                    }]
+                ),
                 "{topology:?}"
             );
         }

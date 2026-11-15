@@ -456,6 +456,7 @@ pub fn qwen_ar_done_value(
     prefill_ms: f64,
     prefill_tok_s: f64,
     decode_tok_s: f64,
+    decode_ms: f64,
     ttft_ms: f64,
     cached_tokens: usize,
 ) -> serde_json::Value {
@@ -468,6 +469,7 @@ pub fn qwen_ar_done_value(
         "prefill_ms": (prefill_ms * 10.0).round() / 10.0,
         "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
         "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+        "decode_ms": (decode_ms * 10.0).round() / 10.0,
         "ttft_ms": (ttft_ms * 10.0).round() / 10.0,
         "cached_tokens": cached_tokens,
         "finish_reason": finish_reason,
@@ -1739,6 +1741,12 @@ pub fn emit_active_route_error(
 }
 
 pub fn emit_active_route_done(output: &mut dyn Write, id: &str, pending: &serde_json::Value) {
+    if hipfire_config::developer_bool("HIPFIRE_QWEN_CACHE_TRACE", false) {
+        eprintln!(
+            "  request {id}: done emitted at t={}",
+            hipfire_runtime::trace_clock_ms()
+        );
+    }
     if let Some(route) = active_generation_route() {
         emit_generation_done(route, output, id, pending);
     } else {
@@ -2545,6 +2553,7 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
         prefill_ms,
         prefill_tok_s,
         decode_tok_s,
+        decode_ms,
         prefill_ms,
         cached_tokens,
     );
@@ -5917,6 +5926,7 @@ pub fn generate(
             prefill_s * 1000.0,
             prefill_tok_s,
             decode_tok_s,
+            decode_s * 1000.0,
             prefill_s * 1000.0,
             cached_tokens_count,
         );
@@ -6323,6 +6333,7 @@ pub fn generate(
             "prefill_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
             "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
             "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+            "decode_ms": ((decode_s * 1000.0) * 10.0).round() / 10.0,
             "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
             "cached_tokens": cached_tokens_count,
             "finish_reason": if hit_stop { "stop" } else { "length" },
@@ -6420,6 +6431,7 @@ pub fn emit_qwen_ar_done(
     prefill_ms: f64,
     prefill_tok_s: f64,
     decode_tok_s: f64,
+    decode_ms: f64,
     ttft_ms: f64,
     cached_tokens: usize,
 ) {
@@ -6432,6 +6444,7 @@ pub fn emit_qwen_ar_done(
         prefill_ms,
         prefill_tok_s,
         decode_tok_s,
+        decode_ms,
         ttft_ms,
         cached_tokens,
     );

@@ -208,6 +208,71 @@ pub enum Step<'a> {
     SwaStage(crate::pipeline::mla::rows::SwaStageOp<'a>),
 }
 
+impl Step<'_> {
+    /// The variant's name (diagnostics: per-op stream-time traces).
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Step::Gemv { .. } => "Gemv",
+            Step::GemvResidual { .. } => "GemvResidual",
+            Step::RmsnormAutomatic { .. } => "RmsnormAutomatic",
+            Step::Attend { .. } => "Attend",
+            Step::Rope { .. } => "Rope",
+            Step::QkNorm { .. } => "QkNorm",
+            Step::BiasAdd { .. } => "BiasAdd",
+            Step::SiluMul { .. } => "SiluMul",
+            Step::HyperRead(..) => "HyperRead",
+            Step::GatedDeltaNet(..) => "GatedDeltaNet",
+            Step::IndexedAttention(..) => "IndexedAttention",
+            Step::HyperWrite(..) => "HyperWrite",
+            Step::GroupedDepthwise(..) => "GroupedDepthwise",
+            Step::GatedShortConv(..) => "GatedShortConv",
+            Step::LaneAttention(..) => "LaneAttention",
+            Step::Clear(..) => "Clear",
+            Step::Embed(..) => "Embed",
+            Step::HyperNorm(..) => "HyperNorm",
+            Step::Project(..) => "Project",
+            Step::BroadcastAdd(..) => "BroadcastAdd",
+            Step::GatedMlp(..) => "GatedMlp",
+            Step::SandwichMlp(..) => "SandwichMlp",
+            Step::SandwichAttention(..) => "SandwichAttention",
+            Step::ParallelMoeMlp(..) => "ParallelMoeMlp",
+            Step::PerLayerInput(..) => "PerLayerInput",
+            Step::Scale(..) => "Scale",
+            Step::Softcap(..) => "Softcap",
+            #[cfg(feature = "deltanet")]
+            Step::DeltaNetMixer(..) => "DeltaNetMixer",
+            #[cfg(feature = "deltanet")]
+            Step::GatedAttention(..) => "GatedAttention",
+            Step::Moe(..) => "Moe",
+            Step::MoeStage(..) => "MoeStage",
+            Step::HcPre(..) => "HcPre",
+            Step::HcPost(..) => "HcPost",
+            Step::HcHead(..) => "HcHead",
+            Step::QLoraPrepare(..) => "QLoraPrepare",
+            Step::PackedProjections(..) => "PackedProjections",
+            Step::QLoraProject(..) => "QLoraProject",
+            Step::KvJoint(..) => "KvJoint",
+            Step::ApplyTailRope(..) => "ApplyTailRope",
+            Step::ExpertFfn(..) => "ExpertFfn",
+            Step::SparseIndex(..) => "SparseIndex",
+            Step::KvCompress(..) => "KvCompress",
+            Step::PreparedProjection(..) => "PreparedProjection",
+            Step::SwaRingWrite(..) => "SwaRingWrite",
+            Step::IdentityGather(..) => "IdentityGather",
+            Step::SwaAttention(..) => "SwaAttention",
+            Step::SparseAttention(..) => "SparseAttention",
+            Step::OLora(..) => "OLora",
+            Step::CompressorProject(..) => "CompressorProject",
+            Step::EmbedStreams(..) => "EmbedStreams",
+            Step::StreamMeanCapture(..) => "StreamMeanCapture",
+            Step::RingKv(..) => "RingKv",
+            Step::BlockStage(..) => "BlockStage",
+            Step::SwaStage(..) => "SwaStage",
+            Step::RowGather(..) => "RowGather",
+        }
+    }
+}
+
 /// Op-kind for fusion matching. Composite and opaque MoE operations are
 /// barriers, represented by `None` rather than a fake numeric opcode.
 fn op_kind(step: &Step) -> Option<PipelineOp> {

@@ -3321,6 +3321,15 @@ impl Qwen4MtpGpu {
         })
     }
 
+    /// Whether the head's experts run on the hetero device split
+    /// (`topology.hetero_experts`).
+    pub(crate) fn head_hetero(&self) -> bool {
+        use hipfire_dispatch::families::moe::RoutedExpertWeights;
+        self.moe
+            .as_ref()
+            .is_some_and(|moe| moe.hetero_split().is_some())
+    }
+
     /// Lanes one batched head call carries on this load ([`load_draft_call_rows`], fixed when
     /// the rows scratch was allocated): [`MTP_DRAFT_LANES_MAX`] without the scratch.
     pub(crate) fn draft_call_rows(&self) -> usize {
