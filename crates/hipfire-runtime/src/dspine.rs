@@ -453,7 +453,7 @@ impl DspineBridge {
     }
 
     /// Serial last-write refinement over the block's head logits:
-    /// top-16 candidates per row (`dspine_topk16`), then the fused
+    /// top-16 candidates per row (`topk_values_batched_f32`, regrid), then the fused
     /// sender-table score chain (`dspine_serial_chain`) walked from
     /// the anchor. `logits` is the [rows, vocab] device block produced
     /// by the batched lm_head (rows = block_size - 1; the seed row is
@@ -519,7 +519,7 @@ impl DspineBridge {
             // Upstream lattice (build_dspine_lattice): candidates from the
             // post-write logits, then EXACT per-(candidate, predecessor)
             // bridge-write recomputation — no sender-table approximation.
-            gpu.dspine_topk16(logits_post, &cand, &base, rows, vocab)?;
+            gpu.topk_values_batched_f32(logits_post, &cand, &base, vocab, 16, rows)?;
             let t_topk = t0.elapsed();
             if mode_argmax {
                 // stream-ordered: the null-stream readback drains the whole
