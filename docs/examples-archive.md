@@ -45,6 +45,12 @@ git show <sha>:<path> > <path>
 |---|---|---|---|---|
 | `verify_batch_glimmer` | `crates/hipfire-arch-muse-glimmer/examples/verify_batch_glimmer.rs` | `bf6ec9ddf240` | 122 | Batched verify parity harness for Muse Glimmer. |
 
+## hipfire-arch-qwen2
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `profile_verify` | `crates/hipfire-arch-qwen2/examples/profile_verify.rs` | `ced1f71be757` | 121 | Per-kernel profile of qwen2 (arch_id=7) block-parallel spec-decode verify. |
+
 ## hipfire-arch-qwen35
 
 | Example | Path | Last commit | LOC | Purpose |

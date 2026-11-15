@@ -49,9 +49,6 @@ required-features = ["lab"]
 name = "inspect_hfq"
 required-features = ["lab"]
 
-[[example]]
-name = "profile_verify"
-required-features = ["lab"]
 
 [[example]]
 name = "verify_block_parity"
