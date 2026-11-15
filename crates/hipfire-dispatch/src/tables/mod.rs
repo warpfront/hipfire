@@ -86,6 +86,11 @@ impl KernelRegistry {
 
 impl ArchPredicate {
     pub fn eval_arch(&self, ctx: &DispatchCtx) -> bool {
+        self.eval_caps(&ctx.arch)
+    }
+
+    /// Arch predicate over bare [`ArchCaps`] (no GPU / dispatch context).
+    pub fn eval_caps(&self, caps: &rdna_compute::arch_caps::ArchCaps) -> bool {
         match self {
             Self::Always => true,
             // RDNA3 (gfx11) wave32 WMMA or RDNA4 (gfx12) WMMA.
@@ -100,22 +105,22 @@ impl ArchPredicate {
             // WMMA-free [32,1,1] scalar kernels (MQ3G256, MQ2/3/4-Lloyd) that
             // already run on RDNA1/2 via the qwen35 direct path. Strict superset
             // of has_wmma() (RDNA3/4 ⊂ wave32) → RDNA3/4 routing is unchanged.
-            Self::HasWave32 => ctx.arch.is_wave32(),
-            Self::HasWmma => ctx.arch.has_wmma(),
+            Self::HasWave32 => caps.is_wave32(),
+            Self::HasWmma => caps.has_wmma(),
             // gfx11-family wave32 WMMA only (RDNA3 + RDNA3.5), EXCLUDES gfx12/RDNA4 —
             // for WMMA kernels with no gfx12 source sibling (mb4, q8_0_wmma_x64).
-            Self::HasWmmaW32 => ctx.arch.has_wmma_w32(),
-            Self::HasWmmaGfx12 => ctx.arch.has_wmma_w32_gfx12(),
-            Self::HasDot2F32F16 => ctx.arch.has_dot2_f32_f16(),
+            Self::HasWmmaW32 => caps.has_wmma_w32(),
+            Self::HasWmmaGfx12 => caps.has_wmma_w32_gfx12(),
+            Self::HasDot2F32F16 => caps.has_dot2_f32_f16(),
             // MQ6/HFQ6 GEMV ships on RDNA4 (gemv_mq6g256_prerotated has a gfx12 build);
             // has_mmq is gfx906||rdna3 only, so admit RDNA4 explicitly.
-            Self::HasMmq => ctx.arch.has_mmq() || ctx.arch.is_rdna4(),
+            Self::HasMmq => caps.has_mmq() || caps.is_rdna4(),
             // MQ6/HFQ6 GEMV = HasMmq ∪ wave32 (adds RDNA1/2, #478).
-            Self::HasHfq6Gemv => ctx.arch.has_mmq() || ctx.arch.is_wave32(),
-            Self::HasCdna3LdsGemv => ctx.arch.has_cdna3_lds_gemv(),
-            Self::HasDp4a => ctx.arch.gemv_dp4a_enabled(),
-            Self::IsGfx942 => ctx.arch.is_gfx942(),
-            Self::IsGfx1201 => ctx.arch.is_gfx1201(),
+            Self::HasHfq6Gemv => caps.has_mmq() || caps.is_wave32(),
+            Self::HasCdna3LdsGemv => caps.has_cdna3_lds_gemv(),
+            Self::HasDp4a => caps.gemv_dp4a_enabled(),
+            Self::IsGfx942 => caps.is_gfx942(),
+            Self::IsGfx1201 => caps.is_gfx1201(),
         }
     }
 }

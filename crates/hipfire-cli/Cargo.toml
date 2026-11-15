@@ -39,3 +39,7 @@ base64.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 ureq = "3"
+
+# `hipfire fit` reads GPUs and VRAM from HIP on native Windows (no KFD topology or sysfs).
+[target.'cfg(windows)'.dependencies]
+hip-bridge = { path = "../hip-bridge" }

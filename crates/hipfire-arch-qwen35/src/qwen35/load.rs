@@ -251,6 +251,16 @@ fn load_weight_tensor_raw_with(
     k: usize,
     target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
+    let row_packed = match quant_type {
+        6 => Some(DType::HFQ4G256),
+        7 => Some(DType::HFQ4G128),
+        8 => Some(DType::HFQ6G256),
+        12 => Some(DType::HFQ3G128),
+        _ => None,
+    };
+    if let Some(dtype) = row_packed {
+        hipfire_runtime::weight_backend::validate_row_extent(dtype, data.len(), m, k, "raw")?;
+    }
     match quant_type {
         6 => {
             let buf = upload_codes(gpu, target, data, &[data.len()])?;
@@ -268,12 +278,6 @@ fn load_weight_tensor_raw_with(
             })
         }
         7 => {
-            hipfire_runtime::weight_backend::validate_hfq4g128_extent(
-                data.len(),
-                m,
-                k,
-                "HFQ4G128",
-            )?;
             let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -3033,6 +3037,7 @@ fn load_weights_inner(
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,
+        moe_host_topk: Default::default(),
     };
     // Model-level symmetric IU4 resolution for the qt53 artifact class (default
     // on by capability; typed refusal or explicit-kill warning; no-op for every
@@ -5125,6 +5130,7 @@ pub fn load_weights_dense_tp_rank(
             pager: None,
             lm_head_aliases_embd,
             ep_shard: None,
+            moe_host_topk: Default::default(),
         })
     })();
     match res {
@@ -8206,6 +8212,7 @@ fn load_weights_ep_rank_inner(
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,
+        moe_host_topk: Default::default(),
     };
     let fingerprint = match &weights.layers[0] {
         LayerWeights::DeltaNetMoe(layer) => layer.ffn.expert_execution_plan.execution_fingerprint(),

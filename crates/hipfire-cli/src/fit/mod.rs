@@ -33,7 +33,33 @@ use types::{gib, Finding, FitDevice, FitHost, PlacementPlan, Verdict};
 /// `plan.basis` in the JSON report.
 const PLAN_BASIS: &str = "pre-load";
 /// The text plan's `basis` line: what its numbers are, and what the load adds.
+#[cfg(not(windows))]
 const PLAN_BASIS_TEXT: &str = "pre-load estimate from file headers + sysfs; the load re-measures free VRAM after weights, drafts and scratch (max_seq fit) and may admit less";
+#[cfg(windows)]
+const PLAN_BASIS_TEXT: &str = "pre-load estimate from file headers + HIP free VRAM; the load re-measures free VRAM after weights, drafts and scratch (max_seq fit) and may admit less";
+
+/// Machine-fact fix lines. `hipfire doctor` exists only on Linux; native
+/// Windows reads the GPUs from HIP and `hipfire diag` shows what HIP reports
+/// (#1145).
+#[cfg(not(windows))]
+mod gpu_fix {
+    pub(super) const NO_GPU: &str = "no AMD GPU detected in the KFD topology";
+    pub(super) const RUN_DIAGNOSTIC: &str = "run `hipfire doctor`";
+    pub(super) const NO_FREE_COUNTER: &str =
+        "run `hipfire doctor` and check amdgpu sysfs memory counters";
+    pub(super) const REFUSED: &str =
+        "correct hardware.devices or the GPU visibility override, then run `hipfire doctor`";
+    pub(super) const VISIBILITY: &str = "set `hardware.devices` to a listed GPU, or unset incompatible ROCR_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES overrides";
+}
+#[cfg(windows)]
+mod gpu_fix {
+    pub(super) const NO_GPU: &str = "no AMD GPU visible to the HIP runtime";
+    pub(super) const RUN_DIAGNOSTIC: &str = "run `hipfire diag`";
+    pub(super) const NO_FREE_COUNTER: &str =
+        "run `hipfire diag` (it shows the free VRAM HIP reports to the daemon)";
+    pub(super) const REFUSED: &str = "correct HIP_VISIBLE_DEVICES, then run `hipfire diag`";
+    pub(super) const VISIBILITY: &str = "run `hipfire config reset hardware.devices` (native Windows has no KFD topology) and select the card with HIP_VISIBLE_DEVICES";
+}
 
 #[derive(Args, Debug)]
 pub(crate) struct FitArgs {
@@ -321,27 +347,35 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
     let (mut machine, host_notes) = host::detect_with_notes(paths);
     let mut findings = preflight_findings(paths);
     if let Some(error) = visibility_error {
-        findings.push(Finding::fails("admission", error.to_string(),
-            "set `hardware.devices` to a listed GPU, or unset incompatible ROCR_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES overrides"));
+        findings.push(Finding::fails(
+            "admission",
+            error.to_string(),
+            gpu_fix::VISIBILITY,
+        ));
     }
     for note in host_notes
         .iter()
         .filter(|note| note.starts_with("load refused:"))
     {
-        findings.push(Finding::fails("admission", note,
-            note.split_once("fix:").map(|(_, fix)| fix.trim()).unwrap_or("correct hardware.devices or the GPU visibility override, then run `hipfire doctor`")));
+        findings.push(Finding::fails(
+            "admission",
+            note,
+            note.split_once("fix:")
+                .map(|(_, fix)| fix.trim())
+                .unwrap_or(gpu_fix::REFUSED),
+        ));
     }
     if machine.devices.is_empty() {
         findings.push(Finding::undetermined(
             "vram",
-            "no AMD GPU detected in the KFD topology",
-            Some("run `hipfire doctor`".into()),
+            gpu_fix::NO_GPU,
+            Some(gpu_fix::RUN_DIAGNOSTIC.into()),
         ));
     } else if machine.devices[0].free.is_none() {
         findings.push(Finding::undetermined(
             "vram",
             "free device memory counter is unavailable; capacity cannot be determined",
-            Some("run `hipfire doctor` and check amdgpu sysfs memory counters".into()),
+            Some(gpu_fix::NO_FREE_COUNTER.into()),
         ));
     }
     supply_visible_device_count(process, &machine);
@@ -819,7 +853,7 @@ fn analyze_model(
                 _ => result.findings.push(Finding::undetermined(
                     "weights",
                     "weight size or free GPU memory is unavailable",
-                    Some("run `hipfire doctor`".into()),
+                    Some(gpu_fix::RUN_DIAGNOSTIC.into()),
                 )),
             }
             result.findings.push(Finding::undetermined(
@@ -1669,7 +1703,7 @@ impl AdmissionInputs<'_> {
             cask: Some(&self.cask),
             deepseek4_heterogeneous: self.options.non_single_compute,
             qwen_default_q8: qwen_default_q8_enabled(),
-            vmm_runtime_available: true,
+            vmm_runtime_refusal: None,
             free_vram_bytes: device.free.and_then(|n| usize::try_from(n).ok()),
         }
     }

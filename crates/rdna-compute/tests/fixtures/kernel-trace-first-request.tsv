@@ -76,3 +76,14 @@ gfx1151	indexed_attention_gathered_wmma	indexed_attention_kv_f16vb_q8
 # Hold frj-t-r9700-mq2-fix-01, R9700 (gfx1201), qwen3.8-flash-next-base.mq2-xts
 # (daemon 7f3ce867cc0d): Qwen4 BF16 storage-boundary round trip.
 gfx1201	bf16_round_trip	bf16_round_trip_f32
+# Cold one-shot `hipfire run` of qwen3.8-flash-next-gptq3.mq4 on R9700 (gfx1201, default
+# route, empty HIPFIRE_KERNEL_CACHE, installed pack): the A8-trunk MQ6 symmetric-grid check
+# hipcc-compiled during load (promotion lane cold-archive-flashnext, v0.4.6).
+gfx1201	qwen4_mq6_sym_check_gfx1201	qwen4_mq6_sym_check_gfx1201
+# Same cold cells after ready (~150-token prompt, promotion lane cold-archive-flashnext on the
+# 0.4.7 candidate): the gfx1201 lane WMMA GEMMs and prefill tile hipcc-compiled.
+gfx1201	qwen4_lane_wmma	lwmma_gemm_bf16_t2_m2_n1
+gfx1201	qwen4_lwmma_tile	lwmma_tile_bf16_t2_b32x64w2x2
+# 0.4.7 candidate lane cold-archive-flashnext (gfx1201, ~150-token prompt): the dead-store-skipping
+# routed MoE down module hipcc-compiled after ready.
+gfx1201	gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151_nodz	gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151_nodz

@@ -9879,6 +9879,8 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         "kho_scratch": kho_scratch_check(kho_scratch_probe()),
     });
     #[cfg(windows)]
+    let priority_class = hipfire_config::process_priority::current();
+    #[cfg(windows)]
     {
         report["gpu_memory_budget"] = gpu_memory_budget_json(
             std::process::id(),
@@ -9887,6 +9889,8 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
                 .map(Vec::as_slice)
                 .map_err(String::as_str),
         );
+        // This process's class; a daemon it starts inherits Idle/BelowNormal (#1144).
+        report["priority_class"] = serde_json::json!(priority_class.map(|class| class.to_string()));
     }
     if output.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -10017,6 +10021,18 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
                 .map_err(String::as_str),
         ) {
             println!("{line}");
+        }
+        #[cfg(windows)]
+        {
+            println!(
+                "priority:      {}",
+                priority_class.map_or_else(|| "unknown".to_owned(), |class| class.to_string())
+            );
+            if let Some(warning) =
+                priority_class.and_then(hipfire_config::process_priority::low_priority_warning)
+            {
+                println!("{warning}");
+            }
         }
     }
     Ok(())

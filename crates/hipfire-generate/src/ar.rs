@@ -2900,6 +2900,7 @@ pub fn generate(
                 reasoning_effort,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3264,6 +3265,7 @@ pub fn generate(
                 temp,
                 top_p,
                 max_tokens,
+                request_seed,
                 think_mode,
                 tools,
                 messages_history,
@@ -3415,6 +3417,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3441,6 +3444,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3498,6 +3502,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3524,6 +3529,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3581,6 +3587,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }
@@ -3607,6 +3614,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                request_seed,
             );
             return;
         }

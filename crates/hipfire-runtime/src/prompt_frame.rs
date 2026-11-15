@@ -926,6 +926,39 @@ pub struct Message {
     pub tool_plan: String,
 }
 
+/// Placeholder the HTTP gateway leaves in a message's `content` for each
+/// OpenAI `image_url` part, at that part's position (U+FFFC, the Unicode
+/// object-replacement character). The images themselves travel beside the
+/// messages (`images_base64`, in slot order); a vision-capable generator swaps
+/// every slot for the model's image marker before rendering the chat template,
+/// so an image keeps its place in the conversation instead of being flattened
+/// away with the rest of the non-text parts. The gateway strips this
+/// character from user text, so a slot is always an image.
+pub const IMAGE_SLOT: char = '\u{FFFC}';
+
+/// Image slots across `messages` — must equal the number of images sent.
+pub fn count_image_slots(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|message| message.content.matches(IMAGE_SLOT).count())
+        .sum()
+}
+
+/// `messages` with every image slot replaced by `replacement` (the
+/// architecture's per-image marker text).
+pub fn expand_image_slots(messages: &[Message], replacement: &str) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut expanded = message.clone();
+            if expanded.content.contains(IMAGE_SLOT) {
+                expanded.content = expanded.content.replace(IMAGE_SLOT, replacement);
+            }
+            expanded
+        })
+        .collect()
+}
+
 /// One assistant-emitted tool call, attached to an assistant `Message`.
 /// `arguments` is a free-form JSON value (typically an object). Templates
 /// that render in XML format (Qwen3.5/3.6's `<function=NAME><parameter=ARG>`
@@ -1487,8 +1520,12 @@ impl<'a> JinjaChatFrame<'a> {
 /// Returns `None` if fewer than `n` distinct sentinels exist; the caller then
 /// falls back to a plain render. Distinctness within a turn is what makes a
 /// channel shift detectable; recycling the same set across turns keeps the pool
-/// bounded (`k = 1 + max_tool_slots + 1`).
-fn pick_splice_sentinels(tok: &Tokenizer, n: usize) -> Option<Vec<(String, u32)>> {
+/// bounded (`k = 1 + max_tool_slots + 1`). A candidate whose id is in `avoid`
+/// (the plain render's own tokens) is skipped: a sentinel the prompt already
+/// contains cannot be told from the real one, and the `pad` tier would
+/// otherwise pick a VL tokenizer's `<|image_pad|>` for every conversation with
+/// an image in it.
+fn pick_splice_sentinels(tok: &Tokenizer, n: usize, avoid: &[u32]) -> Option<Vec<(String, u32)>> {
     if n == 0 {
         return Some(Vec::new());
     }
@@ -1557,11 +1594,20 @@ fn pick_splice_sentinels(tok: &Tokenizer, n: usize) -> Option<Vec<(String, u32)>
             deduped.push((s, id));
         }
     }
-    if deduped.len() < n {
+    let mut picked: Vec<(String, u32)> = Vec::with_capacity(n);
+    for (s, id) in deduped {
+        if picked.len() == n {
+            break;
+        }
+        if avoid.contains(&id) {
+            continue;
+        }
+        picked.push((s, id));
+    }
+    if picked.len() < n {
         return None;
     }
-    deduped.truncate(n);
-    Some(deduped)
+    Some(picked)
 }
 
 /// Does this template already emit `primer` at the head of a HISTORY
@@ -1817,7 +1863,7 @@ pub fn build_cached_history_jinja_with(
     }
     // 3. Pick k distinct sentinels, recycled across turns.
     let k = 1 + max_tool_slots + 1;
-    let sentinels = match pick_splice_sentinels(tok, k) {
+    let sentinels = match pick_splice_sentinels(tok, k, &plain_tokens) {
         Some(v) => v,
         None => return Ok(plain_tokens),
     };
@@ -2994,11 +3040,29 @@ mod tests {
         assert_ne!(spliced, plain);
     }
 
+    /// A sentinel the prompt already contains (a VL tokenizer's `<|image_pad|>`
+    /// is in the `pad` tier) is skipped, so a conversation with an image still
+    /// finds two distinct sentinels and its history splice is not abandoned.
+    #[test]
+    fn pick_splice_sentinels_skips_tokens_the_prompt_contains() {
+        let t = make_tokenizer();
+        let ids = |picked: Option<Vec<(String, u32)>>| -> Vec<u32> {
+            picked
+                .expect("enough sentinels")
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect()
+        };
+        assert_eq!(ids(pick_splice_sentinels(&t, 2, &[])), vec![9, 10]);
+        assert_eq!(ids(pick_splice_sentinels(&t, 2, &[9, 1, 2])), vec![10, 11]);
+        assert_eq!(ids(pick_splice_sentinels(&t, 2, &[10])), vec![9, 11]);
+        assert!(pick_splice_sentinels(&t, 2, &[9, 10, 11, 12, 13]).is_none());
+    }
     #[test]
     fn pick_splice_sentinels_none_reaches_plain_render() {
         let t = test_tokenizer_no_think();
         // This tokenizer has no reserved tokens, so n=1 should be None
-        assert!(pick_splice_sentinels(&t, 1).is_none());
+        assert!(pick_splice_sentinels(&t, 1, &[]).is_none());
         let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}";
         let frame = JinjaChatFrame {
             tokenizer: &t,

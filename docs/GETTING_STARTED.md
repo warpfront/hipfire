@@ -73,7 +73,7 @@ Both `master` and `beta` are mutable. For a reproducible install, pin and
 inspect the installer itself, then ask it to install the same tag or commit:
 
 ```bash
-PIN=v0.4.6
+PIN=v0.4.7
 curl -fsSL "https://raw.githubusercontent.com/warpfront/hipfire/${PIN}/scripts/install.sh" \
   -o /tmp/hipfire-install.sh
 sha256sum /tmp/hipfire-install.sh
@@ -81,7 +81,7 @@ less /tmp/hipfire-install.sh
 bash /tmp/hipfire-install.sh --ref "$PIN"
 ```
 
-Use `--tag v0.4.6` when the kind is known, or `--commit <full-sha>` for an
+Use `--tag v0.4.7` when the kind is known, or `--commit <full-sha>` for an
 immutable commit. Fetching a pinned script but omitting the selector installs
 `master`, so keep the two pins together.
 
@@ -140,7 +140,7 @@ directory or URL holding the assets (`https://…`, `file:///…`, or a plain
 path), for mirrors and offline installs:
 
 ```bash
-bash install.sh --tag v0.4.6 --kernel-pack-url file:///srv/hipfire-packs/v0.4.6
+bash install.sh --tag v0.4.7 --kernel-pack-url file:///srv/hipfire-packs/v0.4.7
 ```
 
 `hipfire kernel-pack install --tag <tag> --arch <arch> --source ~/.hipfire/src`
@@ -196,9 +196,9 @@ Repository variables choose another image
 publish from a local toolchain instead:
 
 ```bash
-scripts/build-kernel-pack.sh --tag v0.4.6 --out dist            # every admitted arch
-scripts/build-kernel-pack.sh --tag v0.4.6 --out dist gfx1201    # or a subset
-gh release upload v0.4.6 dist/hipfire-kernels-v0.4.6-*
+scripts/build-kernel-pack.sh --tag v0.4.7 --out dist            # every admitted arch
+scripts/build-kernel-pack.sh --tag v0.4.7 --out dist gfx1201    # or a subset
+gh release upload v0.4.7 dist/hipfire-kernels-v0.4.7-*
 ```
 
 The script compiles `git archive` of the tag's commit with a fresh `HOME` and
@@ -367,6 +367,19 @@ The limits below are properties of the code, not observations from a card:
   resolved DLL path and the HIP runtime/driver versions at start, and
   `hipfire diag --json` reports them under `live_gpu`
   (`hip_runtime_library`, `hip_runtime_version_raw`, `hip_driver_version_raw`).
+- **Process priority.** A Windows child process inherits its parent's
+  priority class only when that class is Idle or BelowNormal, and hipfire
+  never changes it. A Task Scheduler task runs at priority 7 by default, which
+  is BelowNormal, so a `hipfire serve` started by a default task (and the
+  daemon it spawns) runs behind every Normal-priority thread and generates
+  more slowly. Set the task's priority to 4–6 (Normal; export the task, change
+  `<Priority>7</Priority>`, re-import it) or start hipfire from a
+  Normal-priority process (`start "" /normal hipfire serve`). The daemon logs
+  a warning at start when its class is Idle or BelowNormal, and `hipfire diag`
+  shows the class (`priority_class` in `--json`) (#1144).
+- **`hipfire fit`** lists the GPUs and their VRAM from HIP and host RAM from
+  `GlobalMemoryStatusEx` (there is no KFD topology or `/proc`); see
+  [CLI](CLI.md#hipfire-fit) (#1145).
 - **Model file mapping.** On unified-memory GPUs (Strix Halo) the model file
   mapping is released after the headers are read, as on Linux; discrete GPUs
   keep it on both OSes.
@@ -517,7 +530,7 @@ one build, then prints one `fix:` line per problem
 hipfire update                  # advance the currently selected branch
 hipfire update @beta            # auto-detect branch/tag/commit
 hipfire update --branch master
-hipfire update --tag v0.4.6
+hipfire update --tag v0.4.7
 hipfire update --commit <sha>
 ```
 

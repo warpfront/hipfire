@@ -22,6 +22,13 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
+/// Stack of every rank worker thread: 8 MiB, the Linux main-thread default
+/// that rank 0 runs on. Peer ranks run the same load and forward code as rank
+/// 0, so they must not get less. std's 2 MiB spawn default (`RUST_MIN_STACK`)
+/// overflowed the Flash-Next EP2 peer rank at load in the official v0.4.6
+/// binaries, whose compiler laid out larger frames than a local build.
+const RANK_WORKER_STACK_BYTES: usize = 8 << 20;
+
 pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -262,7 +269,7 @@ impl<P: 'static> RankPool<P> {
     /// peer by calling `init(rank)` on its own thread, one rank at a time in
     /// ascending order. Returns once every peer exists, or the first
     /// construction error (after stopping the rest). Worker threads are named
-    /// `{thread_name}-rank{rank}`.
+    /// `{thread_name}-rank{rank}` and get an 8 MiB stack.
     /// `teardown` consumes a peer on its thread at close/drop.
     pub fn spawn(
         thread_name: &str,
@@ -292,6 +299,7 @@ impl<P: 'static> RankPool<P> {
             let baton = baton.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("{thread_name}-rank{rank}"))
+                .stack_size(RANK_WORKER_STACK_BYTES)
                 .spawn(move || worker_main(rank, init, rx, ready, shared, baton, teardown))
                 .map_err(|error| format!("spawn rank {rank} worker: {error}"))?;
             pool.workers.push(Worker {
