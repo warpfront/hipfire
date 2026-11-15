@@ -301,7 +301,7 @@ impl Gpu {
     }
 
     /// Batched F32 GEMM for the bridge (`dspine_gemm_f32_batch_gfx1100`):
-    /// Y[n*M + m] = A[m, K] · B[n, K], 16x16 outputs per block.
+    /// Y[n*M + m] = A[m, K] · B[n, K], 16x8 outputs per block.
     pub fn dspine_gemm_f32_batch(
         &mut self,
         a: &GpuTensor,
@@ -353,7 +353,7 @@ impl Gpu {
             sym,
             [
                 ((m + 15) / 16) as u32,
-                if use_legacy { ((n + 3) / 4) as u32 } else { 1 },
+                if use_legacy { ((n + 3) / 4) as u32 } else { ((n + 7) / 8) as u32 },
                 1,
             ],
             [512, 1, 1],
@@ -433,7 +433,7 @@ impl Gpu {
             sym,
             [
                 ((h + 15) / 16) as u32,
-                if use_legacy { ((n + 3) / 4) as u32 } else { 1 },
+                if use_legacy { ((n + 3) / 4) as u32 } else { ((n + 7) / 8) as u32 },
                 1,
             ],
             [512, 1, 1],
