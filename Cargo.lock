@@ -1572,6 +1572,7 @@ dependencies = [
  "ctrlc",
  "flate2",
  "getrandom 0.3.4",
+ "hip-bridge",
  "hipfire-arch-qwen4",
  "hipfire-client",
  "hipfire-config",

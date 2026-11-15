@@ -367,6 +367,19 @@ The limits below are properties of the code, not observations from a card:
   resolved DLL path and the HIP runtime/driver versions at start, and
   `hipfire diag --json` reports them under `live_gpu`
   (`hip_runtime_library`, `hip_runtime_version_raw`, `hip_driver_version_raw`).
+- **Process priority.** A Windows child process inherits its parent's
+  priority class only when that class is Idle or BelowNormal, and hipfire
+  never changes it. A Task Scheduler task runs at priority 7 by default, which
+  is BelowNormal, so a `hipfire serve` started by a default task (and the
+  daemon it spawns) runs behind every Normal-priority thread and generates
+  more slowly. Set the task's priority to 4–6 (Normal; export the task, change
+  `<Priority>7</Priority>`, re-import it) or start hipfire from a
+  Normal-priority process (`start "" /normal hipfire serve`). The daemon logs
+  a warning at start when its class is Idle or BelowNormal, and `hipfire diag`
+  shows the class (`priority_class` in `--json`) (#1144).
+- **`hipfire fit`** lists the GPUs and their VRAM from HIP and host RAM from
+  `GlobalMemoryStatusEx` (there is no KFD topology or `/proc`); see
+  [CLI](CLI.md#hipfire-fit) (#1145).
 - **Model file mapping.** On unified-memory GPUs (Strix Halo) the model file
   mapping is released after the headers are read, as on Linux; discrete GPUs
   keep it on both OSes.
