@@ -40,6 +40,10 @@ run python3 scripts/check-lifecycle.py
 run python3 scripts/check-mtp-parity-ratchet.py --self-test
 run python3 scripts/check-mtp-parity-ratchet.py fixture
 run python3 scripts/check-pm-code-end.py --self-test
+# Generated CDNA tables vs their committed generator/receipt/XML pins, and the
+# .ignore == linguist-generated list (no AMD XML or ROCm needed).
+run python3 scripts/check-pm-generated-pins.py --self-test
+run python3 scripts/check-pm-generated-pins.py
 # Promotion lane (docs/VALIDATION.md#promotion-lane). Each self-test plants
 # the defect its rule exists for and fails if the checker lets it through:
 # (a) skip is not pass (hw-gate fixtures, matrix rows, lane verdicts),
