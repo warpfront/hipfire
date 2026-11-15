@@ -50,9 +50,6 @@ required-features = ["lab"]
 name = "kld_logits"
 required-features = ["lab"]
 
-[[example]]
-name = "longctx_probe"
-required-features = ["lab"]
 
 [[example]]
 name = "parse_config"

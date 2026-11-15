@@ -14,6 +14,12 @@ commit (the last commit that touched it) and re-add its `[[example]]` block
 git show <sha>:<path> > <path>
 ```
 
+## hipfire-arch-cohere2moe
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `longctx_probe` | `crates/hipfire-arch-cohere2moe/examples/longctx_probe.rs` | `9a09e55236d2` | 159 | Cohere2MoE: pin where the long-context forward collapses into a degenerate <PAD> / single-token attractor (~30K tokens). |
+
 ## hipfire-arch-deepseek4
 
 | Example | Path | Last commit | LOC | Purpose |
