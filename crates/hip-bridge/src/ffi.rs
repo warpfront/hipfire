@@ -573,9 +573,9 @@ impl Default for HipPointerAttribute {
 /// `HIPFIRE_VMM_TLB_POKE` (developer): `1` forces and `0` disables the TLB
 /// flush after every VMM map ([`HipRuntime::mem_set_access`]). Unset: on when
 /// the loaded amdgpu is the in-tree module (no `/sys/module/amdgpu/version`;
-/// AMD's amdgpu-dkms declares one and flushes in the kernel), for the cards
-/// of [`VMM_TLB_POKE_ARCHS`] only (or every card when the process's cards
-/// cannot be told before the runtime loads). Forced on, it pokes every card.
+/// AMD's amdgpu-dkms declares one and flushes in the kernel), for the devices
+/// HIP reports as one of [`VMM_TLB_POKE_ARCHS`] only. Forced on, it pokes
+/// every device.
 pub const VMM_TLB_POKE_ENV: &str = "HIPFIRE_VMM_TLB_POKE";
 
 /// Archs the default poke covers: where the in-tree fault was reproduced and
@@ -587,42 +587,39 @@ pub const VMM_TLB_POKE_ARCHS: &[&str] = &["gfx1201"];
 /// it through KFD (a 64 KiB block is cached by HIP and issues no ioctl).
 const VMM_TLB_POKE_BYTES: usize = 4 << 20;
 
-/// Which HIP logical devices the poke covers: `None` = none, `Some(None)` =
-/// every device, `Some(Some(ids))` = those.
-fn vmm_tlb_poke_devices() -> Option<&'static Option<Vec<i32>>> {
-    static ON: std::sync::OnceLock<Option<Option<Vec<i32>>>> = std::sync::OnceLock::new();
-    ON.get_or_init(|| {
+/// Which devices the poke covers, decided once per process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VmmTlbPoke {
+    /// `HIPFIRE_VMM_TLB_POKE=1`: every device.
+    Forced,
+    /// The in-tree amdgpu default: devices whose HIP arch is in
+    /// [`VMM_TLB_POKE_ARCHS`].
+    Archs,
+}
+
+/// `None` = the poke is off.
+fn vmm_tlb_poke_mode() -> Option<VmmTlbPoke> {
+    static MODE: std::sync::OnceLock<Option<VmmTlbPoke>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
         let in_tree = !std::path::Path::new("/sys/module/amdgpu/version").exists();
         let forced = hipfire_config::developer_var(VMM_TLB_POKE_ENV).ok();
-        let on = hipfire_config::developer_bool(VMM_TLB_POKE_ENV, in_tree);
-        if !on {
+        if !hipfire_config::developer_bool(VMM_TLB_POKE_ENV, in_tree) {
             return None;
         }
-        // Logical HIP order is the startup card order (`hardware.devices`).
-        let cards = (forced.is_none())
-            .then(hipfire_config::devices::startup_devices)
-            .flatten();
-        let devices = cards.map(|cards| {
-            cards
-                .iter()
-                .enumerate()
-                .filter(|(_, card)| VMM_TLB_POKE_ARCHS.contains(&card.arch.as_str()))
-                .map(|(i, _)| i as i32)
-                .collect::<Vec<_>>()
-        });
-        if devices.as_ref().is_some_and(Vec::is_empty) {
-            return None;
-        }
+        let mode = if forced.is_some() {
+            VmmTlbPoke::Forced
+        } else {
+            VmmTlbPoke::Archs
+        };
         eprintln!(
-            "  hip-bridge: VMM TLB flush poke on ({}; devices {}; one 4 MiB hipMalloc+hipFree per VMM map, {VMM_TLB_POKE_ENV}=0 disables)",
-            if forced.is_some() { "forced" } else { "in-tree amdgpu" },
-            devices
-                .as_ref()
-                .map_or_else(|| "all".to_owned(), |d| format!("{d:?}"))
+            "  hip-bridge: VMM TLB flush poke on ({}; one 4 MiB hipMalloc+hipFree per VMM map, {VMM_TLB_POKE_ENV}=0 disables)",
+            match mode {
+                VmmTlbPoke::Forced => "forced, every device".to_owned(),
+                VmmTlbPoke::Archs => format!("in-tree amdgpu, {VMM_TLB_POKE_ARCHS:?} devices"),
+            }
         );
-        Some(devices)
+        Some(mode)
     })
-    .as_ref()
 }
 
 #[repr(C)]
@@ -2824,8 +2821,8 @@ impl HipRuntime {
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size, descs.as_ptr(), descs.len()) };
         self.check(code, "hipMemSetAccess")?;
-        if let Some(covered) = vmm_tlb_poke_devices() {
-            self.vmm_tlb_poke(descs, covered.as_deref())?;
+        if let Some(mode) = vmm_tlb_poke_mode() {
+            self.vmm_tlb_poke(descs, mode)?;
         }
         Ok(())
     }
@@ -2844,16 +2841,26 @@ impl HipRuntime {
     /// (kernel 7.0.1, ROCm 7.2.2): 0 faults in 76,800 grow-and-touch maps
     /// against a fault within ~50 without it; a 64 KiB poke (served from HIP's
     /// cache, no ioctl) and a 500 us sleep both still fault.
-    /// `covered`: the devices the poke runs on (`None` = every device).
-    fn vmm_tlb_poke(&self, descs: &[HipMemAccessDesc], covered: Option<&[i32]>) -> HipResult<()> {
+    /// `mode`: every device, or those whose HIP arch is in
+    /// [`VMM_TLB_POKE_ARCHS`] (asked of HIP by ordinal, not inferred from the
+    /// startup card list, whose PCI order need not be HIP's).
+    fn vmm_tlb_poke(&self, descs: &[HipMemAccessDesc], mode: VmmTlbPoke) -> HipResult<()> {
         let mut devices: Vec<i32> = descs
             .iter()
             .filter(|desc| desc.location.type_ == HIP_MEM_LOCATION_TYPE_DEVICE)
             .map(|desc| desc.location.id)
-            .filter(|id| covered.is_none_or(|c| c.contains(id)))
             .collect();
         devices.sort_unstable();
         devices.dedup();
+        if mode == VmmTlbPoke::Archs {
+            let mut kept = Vec::with_capacity(devices.len());
+            for device in devices {
+                if self.vmm_tlb_poke_covers(device)? {
+                    kept.push(device);
+                }
+            }
+            devices = kept;
+        }
         if devices.is_empty() {
             return Ok(());
         }
@@ -2877,6 +2884,27 @@ impl HipRuntime {
             ),
             ..err
         })
+    }
+
+    /// Whether HIP device `device` is one of [`VMM_TLB_POKE_ARCHS`]; cached
+    /// per ordinal (HIP ordinals are fixed for the process).
+    fn vmm_tlb_poke_covers(&self, device: i32) -> HipResult<bool> {
+        static COVERED: std::sync::Mutex<Vec<(i32, bool)>> = std::sync::Mutex::new(Vec::new());
+        let cached = COVERED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(d, _)| *d == device)
+            .map(|(_, c)| *c);
+        if let Some(covered) = cached {
+            return Ok(covered);
+        }
+        let covered = VMM_TLB_POKE_ARCHS.contains(&self.get_arch(device)?.as_str());
+        COVERED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((device, covered));
+        Ok(covered)
     }
 
     /// # Safety
