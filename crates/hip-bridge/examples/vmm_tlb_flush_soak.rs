@@ -10,8 +10,13 @@
 //! page-faults within ~10-50 maps without the poke; with it every round
 //! passes.
 //!
-//!   HIPFIRE_VMM_SMOKE_DEVICE=1 cargo run --release -p hip-bridge --features lab --example vmm_tlb_flush_soak -- [CHUNK_BYTES] [CHUNKS] [ROUNDS]
+//!   HIPFIRE_VMM_SMOKE_DEVICE=1 cargo run --release -p hip-bridge --features lab --example vmm_tlb_flush_soak -- [CHUNK_BYTES] [CHUNKS] [ROUNDS] [TOUCH]
 //!   HIPFIRE_VMM_TLB_POKE=0 ...   # the control: expected to fault on an affected driver
+//!
+//! Prints the mean wall time of a map (`map_next`, which includes the poke).
+//! `TOUCH=0` maps without the memsets (nothing reads the new pages, so the
+//! poke-off control cannot fault): the per-map cost of the poke is the
+//! difference between `HIPFIRE_VMM_TLB_POKE=1` and `=0` in that mode.
 
 use hip_bridge::{HipRuntime, VmmArena};
 
@@ -30,16 +35,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chunk = arg(1, 2 << 20);
     let chunks = arg(2, 128);
     let rounds = arg(3, 20);
+    let touch = arg(4, 1) != 0;
     let hip = HipRuntime::load()?;
     hip.set_device(device)?;
-    println!("vmm_tlb_flush_soak: device {device}, {chunks} x {chunk} B chunks, {rounds} rounds");
+    println!("vmm_tlb_flush_soak: device {device}, {chunks} x {chunk} B chunks, {rounds} rounds, touch {touch}");
+    let mut map_time = std::time::Duration::ZERO;
     for round in 0..rounds {
         let mut arena = VmmArena::reserve(&hip, device, chunk * chunks)?;
         let words = |bytes: usize| bytes / 4;
         for c in 0..chunks {
+            let t = std::time::Instant::now();
             arena
                 .map_next(&hip, chunk, &[device])
                 .map_err(|err| format!("round {round} chunk {c}: map: {err}"))?;
+            map_time += t.elapsed();
+            if !touch {
+                continue;
+            }
             let prefix = arena.buffer(chunk * (c + 1))?;
             // No host delay: the memset runs over the pages mapped just now.
             hip.memset_d32_async(
@@ -52,6 +64,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         hip.device_synchronize()
             .map_err(|err| format!("round {round}: sync: {err}"))?;
+        if !touch {
+            arena.release(&hip)?;
+            continue;
+        }
         let full = arena.buffer(chunk * chunks)?;
         let mut readback = vec![0u8; full.size()];
         hip.memcpy_dtoh(&mut readback, &full)?;
@@ -64,9 +80,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  {} rounds verified", round + 1);
         }
     }
+    let maps = rounds * chunks;
     println!(
-        "vmm_tlb_flush_soak: PASS ({} maps, each touched right away)",
-        rounds * chunks
+        "vmm_tlb_flush_soak: PASS ({maps} maps{}; mean map {:.1} us)",
+        if touch {
+            ", each touched right away"
+        } else {
+            ", not touched"
+        },
+        map_time.as_secs_f64() * 1e6 / maps as f64
     );
     Ok(())
 }
