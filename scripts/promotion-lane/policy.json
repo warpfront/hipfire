@@ -33,7 +33,6 @@
     "scripts/ratchet-diff.sh",
     "scripts/leanup-ratchets.sh",
     ".github/workflows/**",
-    "crates/rdna-compute/tests/fixtures/lazy-kernel-allowlist.tsv",
     "crates/rdna-compute/tests/kernel_registry_coverage.rs"
   ]
 }
