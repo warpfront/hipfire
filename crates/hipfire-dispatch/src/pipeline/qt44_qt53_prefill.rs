@@ -879,7 +879,7 @@ fn shared_i8_weights<'a>(shared: &MoeSharedPrefill<'a>) -> SharedI8Weights<'a> {
 }
 
 /// Whether this call's shared expert runs the INT8 route
-/// (`HIPFIRE_QWEN4_SHARED_INT8`, exact gfx1201, [`Gpu::qwen4_shared_i8_applies`]): the
+/// (exact gfx1201, [`Gpu::qwen4_shared_i8_applies`]): the
 /// router and selector on the F16 WMMA group ([`router_shares_f16`], off the one F16
 /// conversion), the BF16 recipe, all-BF16 shared gate/up/down with the router's K, and not
 /// path 2's fused unscatter activation (which reads the F32 gate/up outputs this route does

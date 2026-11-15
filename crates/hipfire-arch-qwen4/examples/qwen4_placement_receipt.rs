@@ -32,8 +32,8 @@
 //! `placement_inputs` itself takes a live `Gpu` and is not executed here: the reserve is
 //! the CPU composition of the same accounting primitives for the fixture below (QSA q8
 //! K/V, legacy backend, native MTP off, no pooled-BF16/F16 arenas, so the QSA selector
-//! and gather terms are 0; the gfx1201 F16 shadows assume `HIPFIRE_QWEN4_F16_WMMA_GFX1201`
-//! at its default). `--bind-identity` (a retired binary identity) is only a historical
+//! and gather terms are 0; the gfx1201 F16 shadows are always admitted.
+//! `--bind-identity` (a retired binary identity) is only a historical
 //! label: no baseline binary is executed.
 //!
 //! Usage:
@@ -379,12 +379,9 @@ fn fixture_reserve(
         } else {
             0
         };
-    // The shared-expert INT8 shadows (default on: the process flag, exact gfx1201).
+    // The shared-expert INT8 shadows (exact gfx1201).
     let shared_i8_shadows = residency::shared_i8_charge(
-        rdna_compute::shared_i8::shared_i8_route_enabled(
-            std::env::var("HIPFIRE_QWEN4_SHARED_INT8").map_or(true, |v| v != "0"),
-            fx.arch,
-        ),
+        rdna_compute::shared_i8::shared_i8_route_enabled(fx.arch),
         chunk_rows,
         fx.weights,
         config.num_hidden_layers,

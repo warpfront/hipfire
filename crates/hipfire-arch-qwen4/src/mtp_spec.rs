@@ -18,8 +18,8 @@
 use crate::bundle::{penalty_prepass_enabled, BundleError, Qwen4Bundle, Qwen4PpWindow};
 use crate::gpu_forward::{Qwen4OutputRows, QWEN4_SPEC_VERIFY_ROWS};
 use crate::mtp_gpu::{
-    mtp_append_det_enabled, mtp_append_det_requested, prompt_fill_uses_rows, MtpAppendScratch,
-    MtpFillContext, MtpGpuStateSnapshot, MTP_FILL_ROWS,
+    mtp_append_det_enabled, prompt_fill_uses_rows, MtpAppendScratch, MtpFillContext,
+    MtpGpuStateSnapshot, MTP_FILL_ROWS,
 };
 #[cfg(any(test, feature = "reference-parity"))]
 use crate::reference_mtp::{MtpError, Qwen4MtpState};
@@ -2213,9 +2213,8 @@ fn gdn_residual_trace_field(state: &crate::state::Qwen4State) -> String {
 /// against 40–46 when drafting continued).  `HIPFIRE_MTP_FLOOR_MIN_WINDOWS=<n>`
 /// (n ≥ 1) overrides it; `3` restores retirement at the probe budget.
 /// Continuous-batching lanes keep retirement at the probe budget, except the
-/// gfx1201 lane profile (`mtp_lanes::LaneCostProfile::gfx1201`, kill switch
-/// `HIPFIRE_QWEN4_LANE_COST=0`), whose floor reads this threshold and the AR
-/// probe count below.
+/// gfx1201 lane profile (`mtp_lanes::LaneCostProfile::gfx1201`), whose floor
+/// reads this threshold and the AR probe count below.
 const MTP_SINGLETON_FLOOR_MIN_WINDOWS: usize = 16;
 
 /// Ordinary AR tokens a singleton request's floor times, at the moment it
@@ -5769,17 +5768,15 @@ impl Qwen4MtpDrafter {
             let bundle = Self::bundle(target)?;
             if bundle.mtp_append_rows_supported(ops.gpu()?) {
                 let rows = MTP_FILL_ROWS.min(prefill_rows);
-                // `HIPFIRE_QWEN4_LANE_APPEND_SHARE`: with an MTP lane store staged, this scratch
-                // is a view of the store's own (same shape: `MTP_FILL_ROWS.min(chunk)` rows). The
-                // lane store and this drafter are never in use at the same time: both run on the
-                // one driver thread and the one stream of the bundle's single forward scratch,
-                // and no scratch tensor carries state between two passes (see
-                // `MtpAppendScratch::shared_view`). A longer prompt chunk than the lane
-                // store's id capacity takes the per-sub-chunk id upload
+                // With an MTP lane store staged, this scratch is a view of the store's own (same
+                // shape: `MTP_FILL_ROWS.min(chunk)` rows). The lane store and this drafter are
+                // never in use at the same time: both run on the one driver thread and the one
+                // stream of the bundle's single forward scratch, and no scratch tensor carries
+                // state between two passes (see `MtpAppendScratch::shared_view`). A longer prompt
+                // chunk than the lane store's id capacity takes the per-sub-chunk id upload
                 // (`prefill_uploads_chunk_ids`), which uploads the same bytes.
-                let shared = hipfire_config::qwen4_lane_append_share()
-                    .then(|| bundle.lane_append_scratch_view())
-                    .flatten()
+                let shared = bundle
+                    .lane_append_scratch_view()
                     .filter(|view| view.rows() >= rows);
                 let scratch = match shared {
                     Some(view) => view,
@@ -8006,7 +8003,7 @@ pub(crate) fn mtp_append_prefill_chunk(
 ) -> Result<ControlFlow<()>, String> {
     // The head's batched rows route: the incumbent batched fill
     // (`HIPFIRE_QWEN4_MTP_BATCHED_FILL`, on by default), or the DET prompt
-    // fill (exact gfx1151, `HIPFIRE_QWEN4_MTP_APPEND_DET` on unless `0`), which uses
+    // fill (exact gfx1151), which uses
     // the scratch even with batched fill off. Without a scratch (the head
     // does not support the rows route) the chunk is per-row either way.
     let det = mtp_append_det_enabled(ops.gpu()?);
@@ -9714,7 +9711,6 @@ impl Qwen4MtpDrafter {
         // chunked prefill rate plus one head step per token.
         // Each prompt token selects with its own query and the pooled keys
         // visible at that position, regardless of target prefill chunking.
-        let skip_intermediate_pick = mtp_skip_intermediate_pick_enabled();
         let chunk_rows = self.prefill_rows.max(1);
         let mut pos = start_pos;
         // The whole remaining prompt goes through the slow-link selector
@@ -9866,11 +9862,7 @@ impl Qwen4MtpDrafter {
             // Only the prompt's last chunk's pick is read (the seed): an
             // earlier chunk still captures its full wide hidden for the head
             // but skips the final hyper, LM head, argmax and readback.
-            let needs_pick = if chunk.len() > chunk_rows {
-                end == prompt_tokens.len()
-            } else {
-                mtp_prefill_chunk_needs_pick(end, prompt_tokens.len(), skip_intermediate_pick)
-            };
+            let needs_pick = mtp_prefill_chunk_needs_pick(end, prompt_tokens.len());
             let ControlFlow::Continue(pick) = mtp_prefill_chunk(
                 Self::bundle(target)?,
                 ops,
@@ -10959,17 +10951,11 @@ pub(crate) fn mtp_batched_fill_enabled() -> bool {
 }
 
 /// Whether this GPU's prompt fill wants the Append scratch: batched fill on,
-/// or the DET prompt fill in force (`HIPFIRE_QWEN4_MTP_APPEND_DET`, default on; exact
-/// gfx1151, which uses the scratch even with batched fill off). The head's
-/// own support ([`Qwen4Bundle::mtp_append_rows_supported`]) still applies.
+/// or the DET prompt fill in force (exact gfx1151, which uses the scratch even
+/// with batched fill off). The head's own support
+/// ([`Qwen4Bundle::mtp_append_rows_supported`]) still applies.
 pub(crate) fn mtp_fill_scratch_wanted(gpu: &Gpu) -> bool {
     mtp_batched_fill_enabled() || mtp_append_det_enabled(gpu)
-}
-
-/// [`mtp_fill_scratch_wanted`] from the environment alone, for admission
-/// arithmetic that has no GPU: an upper bound on every arch.
-pub(crate) fn mtp_fill_scratch_requested() -> bool {
-    mtp_batched_fill_enabled() || mtp_append_det_requested()
 }
 
 /// Rows of one prompt-fill Append pass: `capacity` (the scratch rows) with
@@ -11008,25 +10994,13 @@ fn prefill_uploads_chunk_ids(reuse: bool, chunk_rows: usize, capacity: usize) ->
     !reuse && (2..=capacity).contains(&chunk_rows)
 }
 
-/// `HIPFIRE_QWEN4_MTP_SKIP_INTERMEDIATE_PICK`: a non-final `mtp_prefill` chunk
-/// skips the LM head, argmax and readback unless set to `0`; read at every
-/// `mtp_prefill`.
-pub(crate) fn mtp_skip_intermediate_pick_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_SKIP_INTERMEDIATE_PICK", true)
-}
-
 /// Whether the `mtp_prefill` chunk ending at `end` (an exclusive prompt
 /// position, whether it ends at a capture boundary or at the natural chunk
 /// end) runs the LM head and reads its argmax back. Only the prompt's last
 /// chunk's pick is read (the seed, and the last row's logits for a sampled
-/// draw), so with the skip on every chunk ending before the prompt end is
-/// silent; the skip off keeps the pick on every chunk.
-pub(crate) fn mtp_prefill_chunk_needs_pick(
-    end: usize,
-    prompt_len: usize,
-    skip_intermediate: bool,
-) -> bool {
-    !skip_intermediate || end == prompt_len
+/// draw), so every chunk ending before the prompt end is silent.
+pub(crate) fn mtp_prefill_chunk_needs_pick(end: usize, prompt_len: usize) -> bool {
+    end == prompt_len
 }
 /// Whether this GPU's GDN route captures verify rows: row capture rides the
 /// few-row persistent GDN recurrence. gfx942 captures the F32 state only, so
@@ -11086,16 +11060,15 @@ pub fn qwen4_capture_bytes(
 
 /// Whether a native MTP request on this GPU allocates the prompt-fill Append
 /// scratch (`MtpAppendScratch`): exact gfx1151 or gfx1201 with
-/// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` on, or exact gfx1151 with
-/// `HIPFIRE_QWEN4_MTP_APPEND_DET` on (the default; the DET prompt fill needs the scratch
-/// even with batched fill off).
+/// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` on, or exact gfx1151 (the DET prompt
+/// fill needs the scratch even with batched fill off).
 pub fn native_mtp_fill_scratch(gpu: &Gpu) -> bool {
     (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) && mtp_fill_scratch_wanted(gpu)
 }
 
-/// Set by the EP loader (`qwen4_set_lane_append_shared`) when the load reserves MTP lanes under
-/// `HIPFIRE_QWEN4_LANE_APPEND_SHARE`: the singleton drafter's Append scratch is then a view of
-/// the lane store's, so the native-MTP census charges it once (in the lane store).
+/// Set by the EP loader (`qwen4_set_lane_append_shared`) when the load reserves MTP lanes on the
+/// exact VMM lane route: the singleton drafter's Append scratch is then a view of the lane
+/// store's, so the native-MTP census charges it once (in the lane store).
 static LANE_APPEND_SHARED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -11610,20 +11583,20 @@ mod tests {
         ends
     }
 
-    fn picking_chunks(ends: &[usize], prompt_len: usize, skip: bool) -> Vec<bool> {
+    fn picking_chunks(ends: &[usize], prompt_len: usize) -> Vec<bool> {
         ends.iter()
-            .map(|&end| mtp_prefill_chunk_needs_pick(end, prompt_len, skip))
+            .map(|&end| mtp_prefill_chunk_needs_pick(end, prompt_len))
             .collect()
     }
 
     #[test]
-    fn prefill_pick_only_on_the_final_chunk_when_skipping() {
+    fn prefill_pick_only_on_the_final_chunk() {
         // One chunk is always the final one and keeps its pick.
-        assert_eq!(picking_chunks(&[100], 100, true), vec![true]);
+        assert_eq!(picking_chunks(&[100], 100), vec![true]);
         // Natural split, no capture boundary: 100 rows in chunks of 40.
         let ends = prefill_chunk_ends(0, 100, 40, &[]);
         assert_eq!(ends, vec![40, 80, 100]);
-        assert_eq!(picking_chunks(&ends, 100, true), vec![false, false, true]);
+        assert_eq!(picking_chunks(&ends, 100), vec![false, false, true]);
     }
 
     #[test]
@@ -11632,16 +11605,16 @@ mod tests {
         // split chunks are non-final and skip the pick.
         let ends = prefill_chunk_ends(0, 100, 64, &[30, 90]);
         assert_eq!(ends, vec![30, 90, 100]);
-        assert_eq!(picking_chunks(&ends, 100, true), vec![false, false, true]);
+        assert_eq!(picking_chunks(&ends, 100), vec![false, false, true]);
         // The end-of-prompt capture boundary closes the final chunk: it keeps
         // the full logits/readback for the seed.
         let ends = prefill_chunk_ends(0, 100, 64, &[64, 100]);
         assert_eq!(ends, vec![64, 100]);
-        assert_eq!(picking_chunks(&ends, 100, true), vec![false, true]);
+        assert_eq!(picking_chunks(&ends, 100), vec![false, true]);
         // A split just before the end leaves a one-row final chunk that picks.
         let ends = prefill_chunk_ends(0, 100, 64, &[99]);
         assert_eq!(ends, vec![64, 99, 100]);
-        assert_eq!(picking_chunks(&ends, 100, true), vec![false, false, true]);
+        assert_eq!(picking_chunks(&ends, 100), vec![false, false, true]);
     }
 
     #[test]
@@ -11650,16 +11623,10 @@ mod tests {
         // on the absolute prompt end, so a one-chunk suffix still picks.
         let ends = prefill_chunk_ends(8192, 8300, 8192, &[]);
         assert_eq!(ends, vec![8300]);
-        assert_eq!(picking_chunks(&ends, 8300, true), vec![true]);
+        assert_eq!(picking_chunks(&ends, 8300), vec![true]);
         let ends = prefill_chunk_ends(8192, 8300, 64, &[8200]);
         assert_eq!(ends, vec![8200, 8264, 8300]);
-        assert_eq!(picking_chunks(&ends, 8300, true), vec![false, false, true]);
-    }
-
-    #[test]
-    fn prefill_opt_out_picks_every_chunk() {
-        let ends = prefill_chunk_ends(0, 100, 64, &[30, 90]);
-        assert_eq!(picking_chunks(&ends, 100, false), vec![true; ends.len()]);
+        assert_eq!(picking_chunks(&ends, 8300), vec![false, false, true]);
     }
 
     #[test]

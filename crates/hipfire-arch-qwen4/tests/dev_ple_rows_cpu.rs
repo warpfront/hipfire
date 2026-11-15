@@ -61,7 +61,6 @@ fn embedded_bf16_rows_of_a_synthetic_artifact_load_with_the_profile_geometry() {
         descriptors.clone(),
         metadata.valid_rows(),
         staging_rows,
-        true,
     )
     .expect("row store over the profile's shards");
     assert!(store.max_rows_per_prefetch() / ple.head_count >= tokens.len());

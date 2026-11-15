@@ -26,8 +26,7 @@
 //!
 //! Run: cargo run --release --features lab --example bench_qwen4_hc_wmma -p rdna-compute
 //! `SHAPES=MxKxB,...` (projections), `READS=HIDDENxROWS,...`, `REPS=n`.
-//! On gfx1201 the route is on by default; `HIPFIRE_QWEN4_F16_WMMA_GFX1201=0`
-//! turns it off (the gfx1201 legs of the `gemm`/`tensor_ops` route unit tests need it on).
+//! On gfx1201 the F16 WMMA route is always on.
 
 use rdna_compute::gemm::LdsTileSplitK;
 use rdna_compute::tensor_ops::{hyper_read_up_fused, hyper_read_up_wmma, HyperReadUpFused};

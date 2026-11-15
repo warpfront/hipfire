@@ -923,7 +923,7 @@ pub struct OpLedger {
 }
 
 /// What the root lends the sampler owner to draw one sampled lane's verify
-/// rows on its device (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`): the lane's sampler
+/// rows on its device (exact gfx1201): the lane's sampler
 /// policy, the staged RNG state, the penalty-window source (the committed
 /// tokens before row 0), each draft's distribution `q` as the root drew it and
 /// the EOS rule. Only the sampler owner reads it; followers ignore it.

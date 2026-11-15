@@ -122,13 +122,13 @@ pub(crate) fn exact_wave_lane_floor_from(value: Option<&str>, batch_exact_off: b
 
 /// Whether a wave of `lane_rows` runs its row-local dense stages jointly
 /// ([`ep_wave_policy_for`]): only when EVERY lane has at least `floor` rows, where `floor` is
-/// `WIDE_VERIFY_MAX_ROWS + 1` (65, every lane wider than the few-row window) unless the LAB
-/// prefill lane WMMA floor (`HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`,
-/// `FeatureFlags::qwen4_prefill_lwmma_floor_knob`) lowered it. The joint HC / GDN / QSA launches
-/// select their kernels on the real rows of the call (lane WMMA at 16..=64 rows, the HC8 decode
-/// route, the 9..=48-row MQ6 tile), so a lane below `floor` reproduces its singleton bytes only
-/// with its own per-lane launches; a lane at or above a lowered floor takes the same prefill
-/// entries at the same pinned split-K in its own tile and in the joint call.
+/// `FeatureFlags::qwen4_prefill_lwmma_floor_knob`: `QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS` while
+/// the dense and HC prefill entries are on, else `WIDE_VERIFY_MAX_ROWS + 1` (65, every lane wider
+/// than the few-row window). The joint HC / GDN / QSA launches select their kernels on the real
+/// rows of the call (lane WMMA at 16..=64 rows, the HC8 decode route, the 9..=48-row MQ6 tile), so
+/// a lane below `floor` reproduces its singleton bytes only with its own per-lane launches; a lane
+/// at or above a lowered floor takes the same prefill entries at the same pinned split-K in its own
+/// tile and in the joint call.
 pub(crate) fn ep_wave_joint_for_lanes(lane_rows: &[usize], floor: usize) -> bool {
     lane_rows.iter().all(|&rows| rows >= floor)
 }
@@ -193,7 +193,7 @@ pub(crate) enum EpWaveRoute {
     /// `HIPFIRE_EP_PREFILL_TILE_MIN_ROWS=512`, `HIPFIRE_QWEN4_MOE_EP_A8=0`, or the mask off), so
     /// no tile mask is bound.
     Partial,
-    /// [`Self::Partial`] with the shard's partial tile mask (`HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK`):
+    /// [`Self::Partial`] with the shard's partial tile mask:
     /// every lane's own partial chunk is admitted by the owner-routed tile route
     /// (`ep_tile_active`: the lowered floor on the A8 chain) and masks the non-owned tiles, so
     /// the wave's one MoE call binds the same mask-only exchange (owned experts only, no peer
@@ -244,8 +244,8 @@ pub(crate) struct EpWaveFacts {
     /// (`Gpu::qwen4_moe_sym_iu4_applies` under the lane's tile scopes), else the F32 grouped
     /// chain. Only read on the Partial route.
     pub lane_sym: Vec<bool>,
-    /// Trunk-shard partial tile mask in effect on this load (`HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK`
-    /// and the installed tile-route object): every lane's own partial chunk that the tile route
+    /// Trunk-shard partial tile mask in effect on this load (the installed tile-route object):
+    /// every lane's own partial chunk that the tile route
     /// admits masks the non-owned tiles, and the wave's one MoE call must mask them the same way.
     /// Only read on the Partial route.
     pub partial_mask: bool,
@@ -473,11 +473,10 @@ pub(crate) fn ep_wave_tile_exchange(
     })
 }
 
-/// Whether the trunk-shard partial tile mask is in effect: the switch and the installed tile
-/// route object (the same pair [`Qwen4GpuForward::forward_chunk_tile`] checks per chunk).
+/// Whether the trunk-shard partial tile mask is in effect: the partial route is active and
+/// the installed tile route object (the same pair [`Qwen4GpuForward::forward_chunk_tile`] checks per chunk).
 pub(crate) fn ep_wave_partial_mask_on(ep: Option<&Qwen4ForwardEp>) -> bool {
-    super::trunk_shard_pmask_env_on()
-        && crate::trunk_route::ffn_partial_active()
+    crate::trunk_route::ffn_partial_active()
         && ep.is_some_and(|ep| ep.tile.as_ref().is_some_and(|route| route.hook.is_some()))
 }
 
@@ -895,7 +894,7 @@ mod tests {
         assert!(ep_wave_joint_for_lanes(&[], floor));
     }
 
-    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` (49): lanes of 49..=64 rows join the joint stages;
+    /// `QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS` (49): lanes of 49..=64 rows join the joint stages;
     /// a lane below the floor still keeps every row-local stage per lane.
     #[test]
     fn a_lowered_prefill_floor_admits_49_to_64_row_lanes_to_the_joint_stages() {

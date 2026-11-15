@@ -342,11 +342,6 @@ pub(crate) fn sp_load_decision(
         hidden: profile.geometry.hidden,
         pinned_budget_bytes: 0,
         prefix_cache: false,
-        slab_sp: route == dsp::WindowRoute::SlabIu4
-            && hipfire_config::developer_bool(
-                crate::slowlink_sp::SP_SLAB_ENV,
-                crate::slowlink_sp::SP_SLAB_DEFAULT,
-            ),
     };
     let mut dtypes = None;
     if mode == Some(SpMode::Hybrid) {
@@ -2972,7 +2967,6 @@ mod tests {
             hidden: profile.geometry.hidden,
             pinned_budget_bytes: 1 << 30,
             prefix_cache: false,
-            slab_sp: false,
         };
         let at =
             |route, window| super::super::slowlink_prompt::product_profile_window(route, window);

@@ -4206,7 +4206,6 @@ pub(crate) struct ReplicaFingerprint {
     pub(crate) state_format: crate::state::Qwen4StateFormat,
     pub(crate) turn_end_token: Option<u32>,
     pub(crate) turn_snapshots: bool,
-    pub(crate) tail_snapshot: bool,
     pub(crate) tail_snapshot_min_gap: usize,
     pub(crate) tail_snapshot_min_prompt: usize,
     pub(crate) has_mtp: bool,
@@ -4577,13 +4576,12 @@ mod tests {
         };
         // The production census inputs (`device_bytes`): the prompt-fill append
         // scratch is charged when the store allocates it.
-        let append_scratch = (crate::mtp_spec::mtp_fill_scratch_requested()
-            && crate::mtp_gpu::MtpAppendScratch::allocation_sizes(
-                &config,
-                crate::mtp_gpu::MTP_FILL_ROWS,
-                crate::mtp_gpu::MTP_FILL_ROWS,
-            )
-            .is_some())
+        let append_scratch = crate::mtp_gpu::MtpAppendScratch::allocation_sizes(
+            &config,
+            crate::mtp_gpu::MTP_FILL_ROWS,
+            crate::mtp_gpu::MTP_FILL_ROWS,
+        )
+        .is_some()
         .then_some((crate::mtp_gpu::MTP_FILL_ROWS, crate::mtp_gpu::MTP_FILL_ROWS));
         let inputs = CensusInputs {
             config: &config,
@@ -4696,13 +4694,12 @@ mod tests {
             )
             .unwrap()
         };
-        let append_scratch = (crate::mtp_spec::mtp_fill_scratch_requested()
-            && crate::mtp_gpu::MtpAppendScratch::allocation_sizes(
-                &config,
-                crate::mtp_gpu::MTP_FILL_ROWS,
-                crate::mtp_gpu::MTP_FILL_ROWS,
-            )
-            .is_some())
+        let append_scratch = crate::mtp_gpu::MtpAppendScratch::allocation_sizes(
+            &config,
+            crate::mtp_gpu::MTP_FILL_ROWS,
+            crate::mtp_gpu::MTP_FILL_ROWS,
+        )
+        .is_some()
         .then_some((crate::mtp_gpu::MTP_FILL_ROWS, crate::mtp_gpu::MTP_FILL_ROWS));
         let inputs = CensusInputs {
             config: &config,

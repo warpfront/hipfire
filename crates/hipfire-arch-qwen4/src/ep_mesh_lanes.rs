@@ -70,7 +70,7 @@
 //! another lane's op can overwrite them; the root draws every proposal from its
 //! `q` on the lane's staged RNG.
 //!
-//! With `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` on (the default on exact gfx1201) the
+//! On exact gfx1201 the
 //! root lends the sampler owner each sampled lane's staged verify RNG, sampler
 //! policy, penalty-window source and draft distributions in
 //! [`VerifyPlan::samples`] ([`crate::mesh_lane_protocol::DeviceSampleSpec`]).
@@ -82,8 +82,8 @@
 //! (`mesh_lane_protocol::device_accept`). No logits row crosses to the host
 //! and no host scan runs.
 //!
-//! With the flag off (`=0`) rank 0 returns a [`RowHandle`] over its resident
-//! verify logits in [`SamplerOutput::rows`] and the root draws every
+//! Elsewhere, and under `serve.batch_exact = seeded`, rank 0 returns a [`RowHandle`] over its
+//! resident verify logits in [`SamplerOutput::rows`] and the root draws every
 //! accept/residual/bonus on the host. The handle is valid from the verify
 //! until the step's prepare (or abort). The ranks only replay the committed
 //! tokens, exactly as for greedy lanes.
@@ -1875,7 +1875,7 @@ impl LaneMeshExecutor for RankLane<'_> {
                     .collect(),
             );
             // The host rows are needed only by a sampled lane the root did not
-            // lend a device draw (`=0`, or a Leviathan lane).
+            // lend a device draw (off the device route, or a Leviathan lane).
             let host_rows = self.exec.step.as_ref().is_some_and(|s| {
                 s.lanes
                     .iter()

@@ -548,7 +548,8 @@ W2 `(133,134)`, E8P `(135,136)`), never a model or XTS label. `generation_label`
 v2 candidates qt 45/52, v3 qt 44/53 and the planar I4 tags) is display-only and never read by
 admission; the "V2" in `MQ4G256V2`/`MQ4G128V2` names a codec-layout revision, not the MQ
 generation. The qt 44/53 kernels need the symmetric grid, which the tag cannot show; the
-existing header check (`routed_headers_symmetric`, `qwen4_moe_sym_check`) stays the prerequisite.
+existing header check (`routed_headers_symmetric_verdict`,
+`qwen4_moe_sym_check`) stays the prerequisite.
 
 Routes: `PrefillK2`, `DecodeGemv`, `Stage` (slab-arena staging, needs K1 and K2), `TierStage`
 (`ExpertTierPlan`; MQ4 is arch-neutral), `D2CpuSplit` (CPU decoder inventory supplied by

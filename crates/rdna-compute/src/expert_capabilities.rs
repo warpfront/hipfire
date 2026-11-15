@@ -30,7 +30,7 @@
 //! Route prerequisite (not a table cell): qt `(44, 53)` kernels are symmetric-grid kernels
 //! (`zp == -8 * sc`). The quant tag cannot tell a symmetric XTS body from an asymmetric one (the
 //! retired `flash-next-rtn-asym` pin and the old `mq4-xt` dense pin carry the same qt 44 / 53);
-//! the existing payload check (`artifact::routed_headers_symmetric`,
+//! the existing payload check (`artifact::routed_headers_symmetric_verdict`,
 //! `Gpu::qwen4_moe_sym_check`) decides symmetry from the header bytes and stays the prerequisite.
 //!
 //! # Routes

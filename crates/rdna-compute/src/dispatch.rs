@@ -1008,7 +1008,7 @@ pub enum DType {
     /// 16-level codebook + 6-bit sub-scales). `K % 256 == 0`.
     GgmlIQ4XS,
     /// Qwen4 HC mixer weight as OCP E4M3 with a per-output-row power-of-two scale
-    /// (qt=57 `HC8E4M3Row`, exact gfx1201, `HIPFIRE_QWEN4_HC8`). Logical `[m, k]`; payload
+    /// (qt=57 `HC8E4M3Row`, exact gfx1201). Logical `[m, k]`; payload
     /// = `m*k` E4M3 bytes in the 512-B WMMA A-fragment tile order of
     /// `hc8::swizzle_hc8`, then `f32 s[m]`
     /// (`m*k + 4*m` bytes, see [`crate::hc8_weight::hc8_payload_bytes`]); the weight is
@@ -2073,7 +2073,7 @@ pub struct Gpu {
     /// forward's tile scopes; the route also never takes a call of at most `few_row_limit`
     /// rows, see [`Gpu::qwen4_moe_sym_iu4_applies`]).
     pub qwen4_moe_sym_iu4_floor: usize,
-    /// `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR` in scope: the fewest rows of a call that takes the
+    /// The floor in scope (`qwen4_prefill_lwmma_floor`): the fewest rows of a call that takes the
     /// prefill lane WMMA entries ([`Gpu::prefill_lwmma_dense_applies`] /
     /// [`Gpu::prefill_lwmma_hc_applies`]) instead of the 16..=64-row decode-shaped arms
     /// ([`Gpu::lane_wmma_applies`], the HC8 decode route). `WIDE_VERIFY_MAX_ROWS + 1` (65: no
@@ -5340,16 +5340,12 @@ impl Gpu {
     }
 
     /// Whether this Gpu backs the gathered QSA workspace with a stable-VA
-    /// VMM owner: gfx1151, gfx1201, or gfx1100 unless
-    /// `HIPFIRE_QWEN4_VMM_GFX1100=0` (the arches with evidence for it), a
-    /// platform the VMM KV backend is certified on (not native Windows, not
-    /// WSL without its unsafe override), and a runtime answering the VMM
+    /// VMM owner: gfx1151, gfx1201 or gfx1100 (the arches with evidence for
+    /// it), a platform the VMM KV backend is certified on (not native Windows,
+    /// not WSL without its unsafe override), and a runtime answering the VMM
     /// granularity query. Everything else keeps the legacy contiguous slot.
     pub(crate) fn qsa_gather_vmm_capable(&self) -> bool {
-        (self.arch_caps.is_gfx1151()
-            || self.arch_caps.is_gfx1201()
-            || (self.arch_caps.is_gfx1100()
-                && hipfire_config::devices::qwen4_vmm_gfx1100_enabled()))
+        (self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1201() || self.arch_caps.is_gfx1100())
             && hipfire_config::devices::vmm_kv_platform_refusal().is_none()
             && self.vmm_recommended_granularity().is_ok()
     }

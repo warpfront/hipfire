@@ -4007,7 +4007,6 @@ const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_moe_down_a8",
     "developer.qwen4_moe_down_a8_indexed",
     "developer.qwen4_d2_default",
-    "developer.qwen4_mtp_head_d2",
     "developer.qwen4_mtp_head_resident",
     "developer.qwen4_sp",
     "developer.qwen4_sp_touched",
@@ -4943,6 +4942,262 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         reason: "promoted to a typed key (HIPF-430); HIPFIRE_RAON_SHARED_FFN is unchanged",
         replacement: "kernel.raon_shared_ffn",
     },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_append_share",
+        legacy_key: "qwen4_lane_append_share",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 lane append scratch sharing kill switch was removed (HIPF-396)",
+        replacement: "none; the native-MTP drafter always views the lane store's Append scratch",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_cost",
+        legacy_key: "qwen4_lane_cost",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 lane cost profile kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always uses the gfx1201 lane cost profile",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_measured_depth",
+        legacy_key: "qwen4_lane_measured_depth",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 measured lane depth kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always prices drafting windows with the measured step cost",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_pinned_logits",
+        legacy_key: "qwen4_lane_pinned_logits",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 pinned sampled-logits kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always lands sampled lane logits in pinned host memory",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_device_sample",
+        legacy_key: "qwen4_lane_device_sample",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 lane-wide device draw kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 draws on the device unless serve.batch_exact = seeded",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_ple_batch",
+        legacy_key: "qwen4_lane_ple_batch",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 lane-batched PLE chain kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always runs the lane-batched PLE chain",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_ple_project",
+        legacy_key: "qwen4_lane_ple_project",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 lane-wide PLE projection kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 and gfx942 always run the lane-wide PLE projection",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_reserve_trim",
+        legacy_key: "qwen4_lane_reserve_trim",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 lane capture-ring pool kill switch was removed (HIPF-396)",
+        replacement: "none; the capture ring is always one shared pool allocation",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ep_trunk_shard_mtp",
+        legacy_key: "qwen4_ep_trunk_shard_mtp",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 trunk-shard MTP head drop switch was removed (HIPF-396)",
+        replacement: "none; the trunk shard always keeps the native MTP head, replicated on every rank",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_mq4_rows_pm",
+        legacy_key: "qwen4_mq4_rows_pm",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 MQ4 few-row PeaceMaker kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1151 and gfx1201 always take the PeaceMaker MQ4 rows kernels",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_mtp_append_det",
+        legacy_key: "qwen4_mtp_append_det",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 MTP prompt-fill DET Append kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1151 always runs the DET Append projections",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_mtp_draft_proj_batch",
+        legacy_key: "qwen4_mtp_draft_proj_batch",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 batched MTP draft-projection kill switch was removed (HIPF-396)",
+        replacement: "none; batched draft rounds always run one projection op over the lanes where the route admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_mtp_draft_rounds_xbatch",
+        legacy_key: "qwen4_mtp_draft_rounds_xbatch",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 x-batched MTP draft ranking kill switch was removed (HIPF-396)",
+        replacement: "none; draft rounds always rank rows with the x-batched GEMV",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_mtp_fc_one_launch",
+        legacy_key: "qwen4_mtp_fc_one_launch",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 MTP fc_hidden one-launch kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always runs MTP fc_hidden in one launch",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_mtp_skip_intermediate_pick",
+        legacy_key: "qwen4_mtp_skip_intermediate_pick",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 MTP intermediate prefill pick switch was removed (HIPF-396)",
+        replacement: "none; only the final prefill chunk runs the LM head pick",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ple_async_upload",
+        legacy_key: "qwen4_ple_async_upload",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 asynchronous PLE upload kill switch was removed (HIPF-396)",
+        replacement: "none; deferred PLE uploads are always asynchronous outside capture",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ple_wide_readers",
+        legacy_key: "qwen4_ple_wide_readers",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 wide PLE reader kill switch was removed (HIPF-396)",
+        replacement: "none; large PLE requests always scale to the maximum reader count",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_prefill_lwmma_wave_floor",
+        legacy_key: "qwen4_prefill_lwmma_wave_floor",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 lane WMMA prefill wave floor kill switch was removed (HIPF-396)",
+        replacement: "none; the 49-row floor applies whenever the dense and HC entries are enabled",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_shared_int8",
+        legacy_key: "qwen4_shared_int8",
+        shipped_in: "0.4.4",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 shared-expert INT8 kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always takes the INT8 shared-expert route; other arches keep F16",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_sp_slab",
+        legacy_key: "qwen4_sp_slab",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 slab-profile hybrid SP kill switch was removed (HIPF-396)",
+        replacement: "none; hybrid SP is admitted on the slab route like the aggregate route",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_sym_verdict_cache",
+        legacy_key: "qwen4_sym_verdict_cache",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 symmetry verdict cache kill switch was removed (HIPF-396)",
+        replacement: "none; the routed-header symmetry verdict is always memoized",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_tail_snapshot",
+        legacy_key: "qwen4_tail_snapshot",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 session tail snapshot kill switch was removed (HIPF-396)",
+        replacement: "none; the tail snapshot is always taken",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_token_readback_early",
+        legacy_key: "qwen4_token_readback_early",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 early token readback kill switch was removed (HIPF-396)",
+        replacement: "none; the sampled token is always read back early through the pinned buffer",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_vmm_gfx1100",
+        legacy_key: "qwen4_vmm_gfx1100",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 gfx1100 VMM admission kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1100 is always a certified Qwen4 VMM arch",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_wave_head_one",
+        legacy_key: "qwen4_wave_head_one",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 EP wave head-one kill switch was removed (HIPF-396)",
+        replacement: "none; the final rows of EP waves are always head-one-treated",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_mtp_head_d2",
+        legacy_key: "qwen4_mtp_head_d2",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the native MTP head D2 kill switch was removed (HIPF-396)",
+        replacement: "none; the head follows the trunk's D2 split on non-EP loads (a resident head is never split)",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_expert_stage_capture",
+        legacy_key: "qwen4_expert_stage_capture",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 expert-stage capture kill switch was removed (HIPF-396)",
+        replacement: "none; capture forwards always stage expert rows above the stage threshold",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ep_trunk_shard_pmask",
+        legacy_key: "qwen4_ep_trunk_shard_pmask",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 trunk-shard partial tile mask kill switch was removed (HIPF-396)",
+        replacement: "none; the shard partial tile mask applies wherever the partial route is admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_f16_wmma",
+        legacy_key: "qwen4_f16_wmma",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 F16 WMMA kill switch was removed (HIPF-396)",
+        replacement: "none; the F16 WMMA route is gated by device capability and the batch threshold",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_f16_wmma_gfx1201",
+        legacy_key: "qwen4_f16_wmma_gfx1201",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 gfx1201 F16 WMMA kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 takes the F16 WMMA route where its batch threshold and shape gates admit it",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_hc8",
+        legacy_key: "qwen4_hc8",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 HC8 gfx1201 kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 takes the HC8 sidecar route whenever the sidecar is present",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_hc_k4_allrows",
+        legacy_key: "qwen4_hc_k4_allrows",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 HC K4 all-rows kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 takes the all-rows HC K4 route where its shape gates admit it",
+    },
 ];
 
 pub fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKey> {
@@ -5468,35 +5723,6 @@ pub fn qwen4_lane_row_exact() -> LaneRowExact {
     static MODE: LazyLock<LaneRowExact> =
         LazyLock::new(|| parse_lane_row_exact(process_value(QWEN4_LANE_ROW_EXACT_ENV).as_deref()));
     *MODE
-}
-
-/// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` (developer, default ON, exact `0` is the kill
-/// switch): the Flash-Next GDN verify capture ring of every state (an MTP lane's, the
-/// singleton's) is laid out as ONE shared pool allocation whose per-layer windows overlap
-/// only in ring slots no kernel touches, instead of `rows + 1` slots per GDN layer. Same
-/// kernels, same views, same bytes written; it only removes dead allocation, which an EP2
-/// serve load turns into resident expert units (see `Qwen4State::ensure_row_capture`).
-/// `0` restores the per-layer allocation (and the old lane reservation) byte for byte.
-pub const QWEN4_LANE_RESERVE_TRIM_ENV: &str = "HIPFIRE_QWEN4_LANE_RESERVE_TRIM";
-
-/// [`QWEN4_LANE_RESERVE_TRIM_ENV`] read through the process snapshot.
-pub fn qwen4_lane_reserve_trim() -> bool {
-    developer_bool(QWEN4_LANE_RESERVE_TRIM_ENV, true)
-}
-
-/// `HIPFIRE_QWEN4_LANE_APPEND_SHARE` (developer, default ON, exact `0` is the kill switch):
-/// the native-MTP singleton drafter's prompt-fill Append scratch (`MtpAppendScratch`) is a
-/// non-owning view of the staged lane store's own scratch instead of a second allocation
-/// of the same shape, and an EP load with spec lanes does not reserve it twice. The two
-/// are never in use at the same time (one driver thread, one stream, and the lane store and
-/// the singleton already share the bundle's one forward scratch), and the scratch is
-/// rewritten by every pass before it is read (see `Qwen4MtpDrafter::ensure_resources`).
-/// `0` restores the per-drafter allocation and the old reservation byte for byte.
-pub const QWEN4_LANE_APPEND_SHARE_ENV: &str = "HIPFIRE_QWEN4_LANE_APPEND_SHARE";
-
-/// [`QWEN4_LANE_APPEND_SHARE_ENV`] read through the process snapshot.
-pub fn qwen4_lane_append_share() -> bool {
-    developer_bool(QWEN4_LANE_APPEND_SHARE_ENV, true)
 }
 
 /// `HIPFIRE_QWEN4_LANE_PAGE_BUDGET` (developer, default ON, exact `0` is the kill switch):
@@ -8369,22 +8595,6 @@ mod tests {
         for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
             assert_eq!(
                 typed_developer_bool_value(SYM_IU4_ENV, Some(raw)),
-                Some(want),
-                "{raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn qwen4_mtp_head_d2_is_a_typed_bool_developer_key_with_the_d2_default_spellings() {
-        const KEY: &str = "developer.qwen4_mtp_head_d2";
-        const ENV: &str = "HIPFIRE_QWEN4_MTP_HEAD_D2";
-        assert!(is_developer_key(KEY));
-        assert!(is_typed_bool_developer_key(KEY));
-        assert_eq!(typed_developer_bool_value(ENV, None), None);
-        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
-            assert_eq!(
-                typed_developer_bool_value(ENV, Some(raw)),
                 Some(want),
                 "{raw}"
             );
@@ -12502,15 +12712,6 @@ pub mod memory {
         super::developer_typed_bool("HIPFIRE_QWEN4_D2_DEFAULT")
     }
 
-    /// `developer.qwen4_mtp_head_d2` (env `HIPFIRE_QWEN4_MTP_HEAD_D2`), a typed
-    /// boolean read once per load by the native MTP head attach: `Some(false)`
-    /// never arms the head's rows=1 D2 CPU split executor (the kill); `Some(true)`
-    /// and `None` (unset) arm it whenever the trunk's D2 split is armed on the
-    /// same load (non-EP), otherwise the head keeps the GPU route.
-    pub fn qwen4_mtp_head_d2() -> Option<bool> {
-        super::developer_typed_bool("HIPFIRE_QWEN4_MTP_HEAD_D2")
-    }
-
     /// `developer.qwen4_mtp_head_resident` (env `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT`),
     /// a typed boolean read once per single-card load (default off, unset ==
     /// `0`): `Some(true)` asks the loader to keep the native MTP head's routed
@@ -12518,7 +12719,7 @@ pub mod memory {
     /// instead of pinned host RAM, charging their bytes against the expert hot
     /// set's budget; a load that cannot afford them refuses the request with
     /// one log line and keeps the host-mapped head. A resident head never runs
-    /// the head's rows=1 D2 CPU split (`qwen4_mtp_head_d2`): there is no host
+    /// the head's rows=1 D2 CPU split: there is no host
     /// copy to read.
     pub fn qwen4_mtp_head_resident() -> Option<bool> {
         super::developer_typed_bool("HIPFIRE_QWEN4_MTP_HEAD_RESIDENT")

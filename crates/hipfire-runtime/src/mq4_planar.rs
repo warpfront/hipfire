@@ -177,7 +177,7 @@ pub fn f16_bits_to_f32(bits: u16) -> f32 {
 
 /// The symmetric-grid predicate of `qwen4_moe_sym_check.gfx1201.hip`: both
 /// finite and `zp == -8 * sc` in f32. Identical to the loader's
-/// `routed_headers_symmetric` predicate.
+/// symmetry scan predicate.
 pub fn header_symmetric(scale_bits: u16, zero_bits: u16) -> bool {
     let scale = f16_bits_to_f32(scale_bits);
     let zero = f16_bits_to_f32(zero_bits);
