@@ -101,6 +101,7 @@ caps_accessors!(
     has_wmma_w32_gfx12,
     has_gfx11_plus_simt,
     has_qwen4_parallel_qsa_gdn,
+    has_qwen4_gdn_row_capture,
     has_dot2_f32_f16,
     has_mmq,
     is_gcn5_wave64,
@@ -302,7 +303,7 @@ fn defaults_match_golden() {
     }
     assert!(
         failures.is_empty(),
-        "defaults diverged from tests/golden/flags-defaults; if intended run {REGEN_HINT}\n{}",
+        "defaults diverged from tests/golden/flags-defaults. A default change MUST land with its golden row in the same commit: run `{REGEN_HINT}`, review the diff (only the rows you meant to change) and commit it with the change.\n{}",
         failures.join("\n")
     );
 }
@@ -346,7 +347,7 @@ fn caps_accessor_list_is_every_public_accessor() {
     listed.sort_unstable();
     assert_eq!(
         listed, declared,
-        "caps_accessors! must list every ArchCaps accessor"
+        "caps_accessors! must list every ArchCaps accessor: add the new accessor to caps_accessors! in this file, then run `scripts/flags-golden.sh --regen` and commit the golden rows with the accessor"
     );
 }
 
