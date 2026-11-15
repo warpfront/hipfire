@@ -832,3 +832,33 @@ fn footprints() {
             == Default::default()
     );
 }
+
+#[test]
+fn nor_b64_owns_the_verified_wide_sop2_row_and_refuses_bad_pairs() {
+    let inst = Inst::Sop2(Sop2 {
+        op: Sop2Op::NorB64,
+        sdst: Src::Sgpr(4),
+        ssrc0: Src::Sgpr(0),
+        ssrc1: Src::Sgpr(2),
+    });
+    assert_eq!(Sop2Op::NorB64.widths(), (2, 2, 2));
+    assert_eq!(inst.words(ARCH).unwrap(), [0x8c84_0200]);
+    assert_eq!(Inst::decode(ARCH, &[0x8c84_0200]).unwrap(), (inst, 1));
+    assert!(Inst::decode(ARCH, &[0x8c84_02ff]).is_err());
+    for (d, a, b) in [
+        (Src::Sgpr(5), Src::Sgpr(0), Src::Sgpr(2)),
+        (Src::Sgpr(4), Src::Sgpr(1), Src::Sgpr(2)),
+        (Src::Sgpr(4), Src::Sgpr(0), Src::Sgpr(3)),
+        (Src::Sgpr(4), Src::Vgpr(0), Src::Sgpr(2)),
+        (Src::Sgpr(4), Src::Lit(1), Src::Lit(2)),
+    ] {
+        assert!(Inst::Sop2(Sop2 {
+            op: Sop2Op::NorB64,
+            sdst: d,
+            ssrc0: a,
+            ssrc1: b
+        })
+        .words(ARCH)
+        .is_err());
+    }
+}

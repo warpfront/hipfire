@@ -105,10 +105,11 @@ mod tests {
             fields: FormFields,
         ) -> String {
             let row = isa::gfx12().iter().find(|r| r.name == name).unwrap();
-            Inst::from_parts(
+            Inst::from_encoding(
                 Arch::Gfx1201,
                 row.op,
                 row.form,
+                row.variant,
                 fields,
                 operands.into_iter().collect(),
                 mods,
@@ -318,10 +319,11 @@ mod tests {
             .iter()
             .find(|row| row.name == "s_endpgm")
             .unwrap();
-        let end = Inst::from_parts(
+        let end = Inst::from_encoding(
             Arch::Gfx1201,
             row.op,
             row.form,
+            row.variant,
             FormFields::None,
             Default::default(),
             Default::default(),
@@ -529,10 +531,11 @@ mod tests {
             .iter()
             .find(|row| row.name == "v_dual_fmac_f32")
             .unwrap();
-        let inst = Inst::from_parts(
+        let inst = Inst::from_encoding(
             Arch::Gfx1201,
             row.op,
             row.form,
+            row.variant,
             FormFields::Vopd {
                 y_op: row.op,
                 x_operands: 3,
@@ -926,6 +929,7 @@ mod tests {
         let mut inst = Inst {
             op: row.op,
             form: row.form,
+            variant: None,
             fields: FormFields::Vop3b { src2_unused: 0xff },
             operands: Default::default(),
             mods: Default::default(),

@@ -32,9 +32,6 @@ serde_json.workspace = true
 name = "vision_smoke"
 required-features = ["lab"]
 
-[[example]]
-name = "inspect_source"
-required-features = ["lab"]
 
 [[example]]
 name = "compare_tensor"

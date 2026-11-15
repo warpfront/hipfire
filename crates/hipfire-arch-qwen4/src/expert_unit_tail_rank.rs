@@ -21,14 +21,13 @@
 //! # Window protocol (rank thread; the only cross-rank state is the PEER board)
 //!
 //! * [`UnitTailRank::note_call`] (the row-gather hook, once per MoE layer
-//!   call): records the call's routed ids in the log. With `HIPFIRE_EP_TAIL_LOG_DIRECT` (default
-//!   on) a few-row grouped prefill call is reserved BEFORE its route launches
-//!   ([`UnitTailRank::reserve_topk`]: the whole window-count / deferred-fill / skip / overflow
-//!   decision is taken there, once) and its route kernels write the ids straight into the log
-//!   slice, so the gather only records `(layer, slots, offset)`: no device copy. Any call that
-//!   was not reserved (switch `=0`, a one-row decode, a borrow epoch, a chunk forward) takes its
-//!   decision at the gather and copies the ids there (a stream-ordered D2D); the log bytes and
-//!   the recorded offsets are the same either way.
+//!   call): records the call's routed ids in the log. A few-row grouped prefill call is reserved
+//!   BEFORE its route launches ([`UnitTailRank::reserve_topk`]: the whole window-count /
+//!   deferred-fill / skip / overflow decision is taken there, once) and its route kernels write
+//!   the ids straight into the log slice, so the gather only records `(layer, slots, offset)`: no
+//!   device copy. Any call that was not reserved (a one-row decode, a borrow epoch, a chunk
+//!   forward, a chunk dump or a route trace) takes its decision at the gather and copies the ids
+//!   there (a stream-ordered D2D); the log bytes and the recorded offsets are the same either way.
 //! * [`UnitTailRank::step_end`] (after the window's forward and its D2H sync): the retirement
 //!   cadence ([`crate::expert_unit_tail::RetireCadence`]) decides from the window's routed-id
 //!   count (rank-independent) whether this window ends a group; if not it returns at once (no
@@ -38,16 +37,15 @@
 //!   tables' upload on the compute stream, and only then the new fills on the
 //!   copy stream (it waits for the upload, so no copy can overwrite a slot a
 //!   table still names). Completed fills are published at the next retirement.
-//! * Fill overlap (`HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP`, default on): the retirement makes the
+//! * Fill overlap: the retirement makes the
 //!   copy stream wait for the table upload but does NOT enqueue the fills yet; the first
 //!   row-gather call of the next forward does, so the copies run under that forward instead of
 //!   inside the lane window's `prepare_commit` device-wide sync that follows the retirement. The
 //!   next retirement waits for the last batch's event before it polls, so every fill issued so
 //!   far is complete when the policy steps: the policy sees exactly the completions the
 //!   device-wide sync gave it. A deferred fill targets a `Filling` slot no table and no staged
-//!   forward names (published slots only), so issuing it later changes no read. `=0` issues
-//!   the fills at the retirement and polls them (the previous behaviour).
-//! * With `HIPFIRE_EP_UNIT_TAIL_PEER` (the protocol and its safety argument are the module docs
+//!   forward names (published slots only), so issuing it later changes no read.
+//! * On a mesh of two or more ranks (the protocol and its safety argument are the module docs
 //!   of [`crate::expert_unit_tail`]) the retirement also posts this rank's publications to the
 //!   shared [`PeerBoard`], takes every delta the peers posted so far, applies it to the
 //!   full-table image of the peer-owned entries [`peer_shared`] admits, uploads the touched full
@@ -91,10 +89,10 @@
 //! it never fails a decode (every table state is valid: canonical, or a live
 //! slot with complete bytes). The one exception is the pins lever's own fault (below).
 //!
-//! # Dynamic pins (`HIPFIRE_EP_UNIT_TAIL_PINS`)
+//! # Dynamic pins
 //!
-//! With the pins lever the tail runs on PINNED unit layers (D1.9) instead of static owners, and
-//! every retirement also steps the rank's [`PinProtocol`] (the protocol, its identity and
+//! Where pinned owners are in effect the tail runs on PINNED unit layers (D1.9) instead of static
+//! owners, and every retirement also steps the rank's [`PinProtocol`] (the protocol, its identity
 //! visibility arguments and its failure path are the module docs of
 //! [`crate::expert_unit_tail::pins`]): the rank posts the publications / evictions its
 //! retirement made (an empty marker when it made none), applies every rank's posts with stamp
@@ -204,25 +202,23 @@ pub(crate) struct TailLayerInit {
     /// The entries the tables were uploaded from (canonical pointers).
     pub gate_up_entries: Vec<usize>,
     pub down_entries: Vec<usize>,
-    /// The layer's full (chunk / prefill) table, when `HIPFIRE_EP_UNIT_TAIL_PREFILL` is on.
+    /// The layer's full (chunk / prefill) table.
     pub full: Option<TailFullInit>,
-    /// A pinned unit layer's pin plane (`HIPFIRE_EP_UNIT_TAIL_PINS`): a non-owning alias of the
-    /// device `u8[512]` the balanced layer owns; the tail rewrites it at retirements. `None`
-    /// without the lever and for a layer without a pin plane.
+    /// A pinned unit layer's pin plane: a non-owning alias of the device `u8[512]` the balanced
+    /// layer owns; the tail rewrites it at retirements. `None` for a layer without a pin plane.
     pub pins: Option<GpuTensor>,
 }
 
 /// Whether the forward hands layer `ordinal`'s tables to the tail (`HIPFIRE_EP_UNIT_TAIL`): a
-/// static-owner layer over host experts as ever, and with the pins lever also every layer that
-/// has a pin plane (pinned unit layers keep the balanced owner kind, their full tables are what
-/// the per-call owner assignment reads). Without the lever this is exactly the static-owner rule.
+/// static-owner layer over host experts as ever, and also every layer that has a pin plane
+/// (pinned unit layers keep the balanced owner kind; their full tables are what the per-call
+/// owner assignment reads).
 pub(crate) fn tail_layer_selected(
     static_owners: bool,
     host_mapped: bool,
-    with_pins: bool,
     has_pin_plane: bool,
 ) -> bool {
-    (static_owners && host_mapped) || (with_pins && has_pin_plane)
+    (static_owners && host_mapped) || has_pin_plane
 }
 
 /// The layer's FULL (chunk / prefill) pointer tables: non-owning aliases and the host entries
@@ -863,9 +859,9 @@ struct Inner {
     log: Option<GpuTensor>,
     log_host: Vec<u8>,
     log_used: usize,
-    /// `HIPFIRE_EP_TAIL_LOG_DIRECT` (default on): a row-gather call's routed ids are routed
-    /// straight into the usage log ([`Inner::reserve_topk`]) instead of copied there after the
-    /// route.
+    /// A row-gather call's routed ids are routed straight into the usage log
+    /// ([`Inner::reserve_topk`]) instead of copied there after the route (off under a chunk dump
+    /// or a route trace, which read the top-k scratch after the layer).
     log_direct: bool,
     /// The call the route stage reserved a log destination for and whose gather has not run yet.
     reserved: Option<Reserved>,
@@ -893,10 +889,8 @@ struct Inner {
     fill_ns: u64,
     /// Host time the retirements spent waiting for the previous fills' event (fill overlap).
     fill_wait_ns: u64,
-    /// Fill overlap (`HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP`): the fills of the last retirement wait
-    /// here (the copy stream already waits for its table upload) until the next forward's first
-    /// row-gather call issues them.
-    fill_overlap: bool,
+    /// Fill overlap: the fills of the last retirement wait here (the copy stream already waits for
+    /// its table upload) until the next forward's first row-gather call issues them.
     deferred: Vec<FillTicket>,
     uploads: u64,
     /// H2D calls and bytes of the retirements' table uploads (changed entry ranges only).
@@ -982,6 +976,7 @@ impl SkewLog {
 }
 
 /// CLOCK_MONOTONIC in ns (the clock rocprofv3 timestamps use).
+#[cfg(target_os = "linux")]
 fn monotonic_ns() -> u64 {
     #[repr(C)]
     struct Timespec {
@@ -997,6 +992,15 @@ fn monotonic_ns() -> u64 {
         return 0;
     }
     ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
+}
+
+/// No CLOCK_MONOTONIC (and no rocprofv3) off Linux; the libc constant differs per OS, so a
+/// process-local monotonic clock keeps the log lines ordered instead.
+#[cfg(not(target_os = "linux"))]
+fn monotonic_ns() -> u64 {
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_nanos() as u64
 }
 
 /// The rank's tail (installed in the row-gather hook).
@@ -1040,9 +1044,7 @@ impl UnitTailRank {
         config: EpUnitTailConfig,
         freeze: bool,
         log_enabled: bool,
-        fill_overlap: bool,
         log_direct: bool,
-        peer_reserve: bool,
         layers: Vec<TailLayerInit>,
         peer: Option<Arc<PeerBoard>>,
         pin_board: Option<Arc<PeerBoard>>,
@@ -1328,7 +1330,6 @@ impl UnitTailRank {
                 ));
             }
         };
-        policy.set_peer_reserve(peer_reserve);
         let seeds = match policy.seed(&order) {
             Ok(seeds) => seeds,
             Err(error) => {
@@ -1378,7 +1379,6 @@ impl UnitTailRank {
             upload_ns: 0,
             fill_ns: 0,
             fill_wait_ns: 0,
-            fill_overlap,
             log_direct,
             reserved: None,
             deferred: Vec::new(),
@@ -1435,12 +1435,12 @@ impl UnitTailRank {
                 state.pins.as_ref().map_or(0, |pins| pins.device.len())
             )
         } else {
-            "on static owners (pinned owners are off while the tail is on)".to_string()
+            "on static owners (no pinned unit layers on this load)".to_string()
         };
         eprintln!(
             "qwen4 EP rank {rank}: D2 tail on: {slots} evictable slots ({} MiB pool) over {} mixed layers \
              {owners_note}, \
-             {} warm units published, F={} fills/window{}{}{}; retires every {} routed ids or {} windows",
+             {} warm units published, F={} fills/window{}{}; retires every {} routed ids or {} windows",
             ((slots * (gub + dnb)) >> 20),
             state.layers.len(),
             seed_keys.len(),
@@ -1451,11 +1451,6 @@ impl UnitTailRank {
                 String::new()
             },
             if freeze { ", FROZEN (no admission)" } else { "" },
-            if fill_overlap {
-                ", fills overlap the next forward"
-            } else {
-                ""
-            },
             retire_ids,
             crate::expert_unit_tail::RETIRE_MAX_WINDOWS
         );
@@ -1669,7 +1664,7 @@ impl Inner {
     }
 
     /// The device allocations every generation of this tail is published through: the decode
-    /// tables and, with the prefill lever, the full tables, `experts` u64 entries each.
+    /// tables and, where a layer has them, the full tables, `experts` u64 entries each.
     fn table_extents(&self) -> Vec<Binding> {
         let bytes = (self.experts * ENTRY_BYTES) as u64;
         let mut out = Vec::new();
@@ -1917,11 +1912,11 @@ impl Inner {
         LogAdmit::Log { at: self.log_used }
     }
 
-    /// `HIPFIRE_EP_TAIL_LOG_DIRECT`: decide the call's logging before its route launches
-    /// ([`Self::admit_call`]) and, for a call that logs, return the `slots * 4`-byte log view at
-    /// its offset for the route to write. The decision is parked until the call's gather
-    /// ([`Self::note_with`]) records it, so it is never taken twice. A borrow epoch, or the
-    /// switch off, takes no decision here: the gather decides, exactly as before.
+    /// Decide the call's logging before its route launches ([`Self::admit_call`]) and, for a call
+    /// that logs, return the `slots * 4`-byte log view at its offset for the route to write. The
+    /// decision is parked until the call's gather ([`Self::note_with`]) records it, so it is never
+    /// taken twice. A borrow epoch, or `log_direct` off, takes no decision here: the gather
+    /// decides, exactly as before.
     fn reserve_with(
         &mut self,
         layer_idx: u16,
@@ -2290,14 +2285,12 @@ impl Inner {
         // forward that just ended) completes before the poll, as the lane window's device-wide
         // prepare sync made them complete before. The wait is the part of the copies the forward
         // did not hide.
-        if self.fill_overlap {
-            self.issue_deferred(gpu)?;
-            if !self.batches.is_empty() {
-                let t_wait = Instant::now();
-                let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
-                RankCopy::new(&gpu.hip, stream, &mut self.events).wait_newest()?;
-                self.fill_wait_ns += t_wait.elapsed().as_nanos() as u64;
-            }
+        self.issue_deferred(gpu)?;
+        if !self.batches.is_empty() {
+            let t_wait = Instant::now();
+            let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
+            RankCopy::new(&gpu.hip, stream, &mut self.events).wait_newest()?;
+            self.fill_wait_ns += t_wait.elapsed().as_nanos() as u64;
         }
         // Completed fills (issued in order on one stream: stop at the first pending).
         let completed = self.poll_batches(gpu)?;
@@ -2404,12 +2397,8 @@ impl Inner {
                 self.policy.abandon_fills(tickets);
                 return Err(error);
             }
-            if self.fill_overlap {
-                // Issued by the next forward's first row-gather call (`issue_deferred`).
-                self.deferred = tickets;
-            } else {
-                self.issue_batch(gpu, tickets)?;
-            }
+            // Issued by the next forward's first row-gather call (`issue_deferred`).
+            self.deferred = tickets;
         }
         let t_end = Instant::now();
         self.log_ns += (t_log - t0).as_nanos() as u64;
@@ -2639,7 +2628,7 @@ impl Inner {
              fills {} published {} evictions {}{} skipped {} stale {} live {}/{} late-in-flight {} \
              host-only reads {} log overflow {} | us/window: log {:.0} retire {:.0} upload {:.0} fill {:.0} (us/retirement: {:.0} {:.0} {:.0} {:.0}) ({} layer uploads: {} H2D calls, {} B){} \
              | raw unix_ms={unix_ms} retirements={} unit_bytes={} core_reads={} tail_reads={} host_reads={} core_distinct={} tail_distinct={} host_distinct={} fills_issued={} \
-             fill_overlap={} fill_wait_us={:.0}",
+            fill_wait_us={:.0}",
             self.rank,
             s.windows,
             s.retirements,
@@ -2688,7 +2677,6 @@ impl Inner {
             s.tail_distinct,
             s.host_distinct,
             s.fills_issued,
-            self.fill_overlap,
             self.fill_wait_ns as f64 / 1e3,
         );
     }
@@ -5256,29 +5244,28 @@ mod tests {
         );
     }
 
-    /// Without the pins lever the forward hands the tail exactly the static-owner host layers it
-    /// always did (whatever pin planes exist); with it, every layer that has a pin plane too.
+    /// The forward hands the tail the static-owner host layers and every layer with a pin plane.
     #[test]
-    fn the_layer_selector_without_the_pins_lever_is_the_static_owner_rule() {
+    fn the_layer_selector_hands_over_static_owner_host_layers_and_pin_planes() {
         for static_owners in [false, true] {
             for host_mapped in [false, true] {
                 for has_pin_plane in [false, true] {
                     assert_eq!(
-                        tail_layer_selected(static_owners, host_mapped, false, has_pin_plane),
-                        static_owners && host_mapped,
+                        tail_layer_selected(static_owners, host_mapped, has_pin_plane),
+                        (static_owners && host_mapped) || has_pin_plane,
                         "so={static_owners} host={host_mapped} plane={has_pin_plane}"
                     );
                 }
             }
         }
-        // With the lever a pinned unit layer is handed over whatever it holds on this rank (a
-        // rank whose layer is wholly resident still applies the pin deltas to its plane) ...
-        assert!(tail_layer_selected(false, false, true, true));
-        assert!(tail_layer_selected(false, true, true, true));
+        // A pinned unit layer is handed over whatever it holds on this rank (a rank whose layer is
+        // wholly resident still applies the pin deltas to its plane) ...
+        assert!(tail_layer_selected(false, false, true));
+        assert!(tail_layer_selected(false, true, true));
         // ... a layer without a plane is not, and a static-owner layer is handed over as ever.
-        assert!(!tail_layer_selected(false, true, true, false));
-        assert!(tail_layer_selected(true, true, true, false));
-        assert!(!tail_layer_selected(true, false, true, false));
+        assert!(!tail_layer_selected(false, true, false));
+        assert!(tail_layer_selected(true, true, false));
+        assert!(!tail_layer_selected(true, false, false));
     }
 
     #[test]
@@ -5445,7 +5432,6 @@ mod tests {
             upload_ns: 0,
             fill_ns: 0,
             fill_wait_ns: 0,
-            fill_overlap: false,
             log_direct: false,
             reserved: None,
             deferred: Vec::new(),
@@ -5576,9 +5562,9 @@ mod tests {
         }
     }
 
-    /// `HIPFIRE_EP_TAIL_LOG_DIRECT`: a call reserved before its route launches takes the very
-    /// verdict (window count, deferred-fill issue point, skip / overflow rule) the gather takes
-    /// for an unreserved call, records the same `(layer, slots, offset)` and moves no bytes.
+    /// Direct logging: a call reserved before its route launches takes the very verdict (window
+    /// count, deferred-fill issue point, skip / overflow rule) the gather takes for an unreserved
+    /// call, records the same `(layer, slots, offset)` and moves no bytes.
     mod direct_log {
         use super::{bare, bare_policy};
         use crate::expert_unit_tail_rank::{Inner, LogAdmit, LOG_IDS};
@@ -5688,9 +5674,9 @@ mod tests {
             )
         }
 
-        /// Run `calls` through the per-layer copy (`=0`), the direct log, and the direct log whose
-        /// route ignored the view; every state is the same, only the copies differ. Returns the
-        /// recorded calls.
+        /// Run `calls` through the per-layer copy (`log_direct` off), the direct log, and the direct
+        /// log whose route ignored the view; every state is the same, only the copies differ.
+        /// Returns the recorded calls.
         fn parity(setup: fn(&mut Inner), calls: &[Call]) -> State {
             let (mut old, mut direct, mut ignored) = (tail(false), tail(true), tail(true));
             for inner in [&mut old, &mut direct, &mut ignored] {

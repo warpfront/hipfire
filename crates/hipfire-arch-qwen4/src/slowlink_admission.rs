@@ -3863,6 +3863,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         }
     }
 
@@ -3913,7 +3914,7 @@ mod tests {
         };
         let f16_shadows = residency::f16_shadow_charge(
             true,
-            residency::f16_shadow_route_rows_with("gfx1100", tile, true, 48, false),
+            residency::f16_shadow_route_rows_with("gfx1100", tile, 48, false),
             &residency::j1778_bf16_manifest(),
             config.num_hidden_layers,
         )
@@ -4931,6 +4932,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let (max_seq, tile) = (16_640usize, purpose_tile_rows(AdmissionPurpose::Product));
 

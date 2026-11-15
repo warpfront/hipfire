@@ -1,0 +1,7 @@
+2026-11-13T06:03:25Z
+2f57c10ecf09c42ea2c877551469696676c3bb06
+1b38c0dda74d4318ee20ddab9f9ada889b0a2d7ef3169baa40777161ffb8d481  /scratch/quant/fn-fp8/beat/WC8/bin/f1/fn_lane_oracle
+args: --spec mtp --k 7 --routes batched --ks 8,16 --contexts 64,512,2048 --steps 8 --max-seq 4096
+HIPFIRE_KERNEL_CACHE=/scratch/quant/fn-fp8/beat/WC8/kcache
+HIPFIRE_MTP_INCREMENTAL=0
+HIPFIRE_QWEN4_LANE_STEP_TRACE=1

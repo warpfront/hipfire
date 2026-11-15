@@ -29,7 +29,7 @@
 //   Equivalent integer test: abs(ctx_span + qi - kj) < sliding_window.
 //   This is bidirectional within-block and window-limited cross to context,
 //   matching upstream DFlash2's non-causal mask. Context positions are
-//   contiguous (callers refuse CASK with windowed draft mode).
+//   contiguous (KV is never evicted under windowed draft mode).
 //
 // Numerical structure: GQA mapping, dot-product unroll, cooperative
 // V-accumulation, and tiled online-softmax are preserved verbatim from

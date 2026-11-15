@@ -1,0 +1,6 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.16)
+[rocblas] loaded for gfx942
+  gemv_mq2g256v2: hipcc compiled (gfx942, key 999ab73fcccf9e9d)
+  gemv_mq2g256v2_xbatch: hipcc compiled (gfx942, key 2f25e2dbc57e8a1d)
+qwen4_g942_mq2_xbatch_oracle: 864 cases, 0 failing; hipcc xbatch vs singleton (info) 37253538 bytes

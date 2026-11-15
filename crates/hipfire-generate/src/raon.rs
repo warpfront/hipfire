@@ -472,7 +472,7 @@ fn spec_start_channel_matches_ar(rendered: &str) -> bool {
 
 /// Whether the shared speculative body renders this request to exactly the
 /// prompt [`generate_raon`] renders. It always uses the model's Jinja
-/// template when `HIPFIRE_JINJA_CHAT` allows it and the model has one, and
+/// template when the model has one, and
 /// falls back to plain ChatML on a render error: a request that would take
 /// either of those differences, or whose start channel is classified
 /// differently, must run on the AR route.
@@ -484,13 +484,6 @@ fn spec_prompt_matches_ar(
     tools: Option<&[serde_json::Value]>,
     enable_thinking: bool,
 ) -> bool {
-    if hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-        .ok()
-        .as_deref()
-        == Some("0")
-    {
-        return false;
-    }
     let (Some(tokenizer), Some(template)) = (m.tokenizer.as_ref(), m.chat_template.as_deref())
     else {
         return false;
@@ -606,8 +599,6 @@ pub fn generate_raon_spec(
         // The Jinja render owns the generation suffix once it succeeds, and
         // `spec_prompt_matches_ar` proved that it does.
         AssistantPrefix::Plain,
-        None,
-        None,
         tools.filter(|t| !t.is_empty()),
         messages_history.filter(|h| !h.is_empty()),
         stop,
@@ -778,9 +769,7 @@ mod tests {
             min_p: None,
             nonneutral_penalties: false,
             force_ar_chat: false,
-            temp_spec_env_off: false,
-            fast_sample_on: true,
-            supports_temp_swor: false,
+            supports_temp_verify: false,
             supports_chain_nucleus_verify: false,
             kv_adaptive: false,
         }
@@ -831,7 +820,7 @@ mod tests {
             has_speculator: true,
             speculator_is_dflash2: true,
             speculator_supports_penalties: true,
-            supports_temp_swor: true,
+            supports_temp_verify: true,
             supports_chain_nucleus_verify: true,
             temp,
             ..inputs(arch_id)
@@ -880,11 +869,6 @@ mod tests {
                 },
                 GenerationRouteInputs {
                     nonneutral_penalties: true,
-                    temp_spec_env_off: true,
-                    ..request
-                },
-                GenerationRouteInputs {
-                    nonneutral_penalties: true,
                     has_speculator: false,
                     speculator_is_dflash2: false,
                     ..request
@@ -909,10 +893,6 @@ mod tests {
                     ..request
                 },
                 GenerationRouteInputs {
-                    temp_spec_env_off: true,
-                    ..request
-                },
-                GenerationRouteInputs {
                     has_speculator: false,
                     speculator_is_dflash2: false,
                     ..request
@@ -934,7 +914,7 @@ mod tests {
         // the selector-chain nucleus law.
         for incapable in [
             GenerationRouteInputs {
-                supports_temp_swor: false,
+                supports_temp_verify: false,
                 ..dflash2_inputs(19, 1.0)
             },
             GenerationRouteInputs {
@@ -950,7 +930,7 @@ mod tests {
         }
         // Greedy needs neither capability.
         let greedy = GenerationRouteInputs {
-            supports_temp_swor: false,
+            supports_temp_verify: false,
             supports_chain_nucleus_verify: false,
             ..dflash2_inputs(19, 0.0)
         };

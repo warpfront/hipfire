@@ -342,7 +342,7 @@ fn t3_decoder_agrees_with_pinned_objdump() {
         let mut branches = 0usize;
         let mut targets = std::collections::BTreeSet::new();
         for (i, inst) in kt.insts.iter().enumerate() {
-            let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).unwrap();
+            let row = isa::lookup_inst(Arch::Gfx1201, &inst).ok().unwrap();
             if !BRANCH_SET.contains(&row.name) {
                 continue;
             }
@@ -409,10 +409,11 @@ fn t9_assembler_parity_where_syntax_is_lossless() {
         .expect("KT48 holds VOP3b instructions");
     let mut synth = insts[vop3b_index].clone();
     synth.fields = FormFields::Vop3b { src2_unused: 0x00 };
-    let synth = Inst::from_parts(
+    let synth = Inst::from_encoding(
         Arch::Gfx1201,
         synth.op,
         synth.form,
+        synth.variant,
         synth.fields.clone(),
         SmallVec::from_vec(synth.operands.to_vec()),
         synth.mods.clone(),

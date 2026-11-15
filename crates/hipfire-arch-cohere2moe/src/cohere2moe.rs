@@ -78,7 +78,7 @@ fn hfq_source_metadata(
         ));
     }
     let (dtype, row_stride) = validate_raw_layout(info.quant_type, data.len(), m, k)?;
-    let mut metadata = ExpertSourceMetadata::new(
+    let metadata = ExpertSourceMetadata::new(
         info.name.clone(),
         fingerprint.to_string(),
         shape,
@@ -89,7 +89,6 @@ fn hfq_source_metadata(
         format!("hfq:qt{}:g{}", info.quant_type, info.group_size),
         format!("{:?}", hipfire_dispatch::types::dtype_rotation_plan(dtype)),
     );
-    metadata.sidecar_source_names = Vec::new();
     Ok(metadata)
 }
 
@@ -165,9 +164,7 @@ fn dtype_for_quant_type(qt: u8) -> Result<DType, String> {
 /// `DType`/quantizer contracts and check every multiplication.
 fn encoded_row_bytes(dtype: DType, k: usize) -> Result<usize, String> {
     // The byte layout is `DType::row_bytes`; this arch only accepts whole
-    // groups. Paro's repacked projection layout is HFQ4-G128 (72 bytes per
-    // 128 columns): `wt_from_raw` is HFQ-only today, but listing it keeps a
-    // future raw Paro entry off one-byte-per-column reasoning.
+    // groups.
     let group_k = match dtype {
         DType::F32 | DType::F16 | DType::BF16 => 1,
         DType::Q8_0 => 32,
@@ -180,7 +177,6 @@ fn encoded_row_bytes(dtype: DType, k: usize) -> Result<usize, String> {
         | DType::MQ2G256Lloyd
         | DType::MQ3G256Lloyd
         | DType::MQ4G256Lloyd => 256,
-        DType::ParoQ4G128 => 128,
         other => return Err(format!("no encoded row byte formula for dtype {other:?}")),
     };
     if k % group_k != 0 {
@@ -242,7 +238,6 @@ fn wt_from_raw(
         m,
         k,
         row_stride,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -292,7 +287,6 @@ mod tests {
     fn grouped_formats_reject_ragged_k() {
         assert!(validate_raw_layout(13, 136, 1, 257).is_err());
         assert!(validate_raw_layout(15, 200, 1, 257).is_err());
-        assert_eq!(encoded_row_bytes(DType::ParoQ4G128, 128).unwrap(), 72);
     }
 }
 
@@ -326,60 +320,7 @@ pub(crate) fn source_fingerprint(source: &dyn ModelSource, names: &[String]) -> 
     format!("{:016x}", hasher.finish())
 }
 
-pub(crate) fn source_row_stride(bytes: usize, rows: usize) -> Result<usize, String> {
-    if rows == 0 {
-        return Err("encoded source row count is zero".to_string());
-    }
-    bytes
-        .checked_div(rows)
-        .filter(|&stride| stride > 0 && stride * rows == bytes)
-        .ok_or_else(|| format!("encoded source bytes {bytes} do not form {rows} rows"))
-}
-pub(crate) fn model_source_metadata(
-    source: &dyn ModelSource,
-    name: &str,
-    logical_shape: Vec<usize>,
-    encoded_bytes: usize,
-    row_stride: usize,
-    dtype: DType,
-    fingerprint: &str,
-    quant_tag: String,
-    basis: String,
-    sidecars: Vec<String>,
-) -> Result<ExpertSourceMetadata, String> {
-    let info = source
-        .tensor_info(name)
-        .ok_or_else(|| format!("cohere2moe: source tensor not found: {name}"))?;
-    if logical_shape.is_empty() || encoded_bytes == 0 || row_stride == 0 {
-        return Err(format!(
-            "cohere2moe: invalid source layout for {name}: shape={logical_shape:?} bytes={encoded_bytes} stride={row_stride}"
-        ));
-    }
-    let rows = logical_shape[0];
-    let expected = row_stride
-        .checked_mul(rows)
-        .ok_or_else(|| format!("cohere2moe: source row capacity overflows for {name}"))?;
-    if expected != encoded_bytes {
-        return Err(format!(
-            "cohere2moe: source {name} bytes {encoded_bytes} != rows {rows} × stride {row_stride} ({expected})"
-        ));
-    }
-    let mut metadata = ExpertSourceMetadata::new(
-        info.name.clone(),
-        fingerprint.to_string(),
-        logical_shape,
-        dtype,
-        encoded_bytes,
-        row_stride,
-        1,
-        quant_tag,
-        basis,
-    );
-    metadata.sidecar_source_names = sidecars;
-    Ok(metadata)
-}
-
-/// Build the one runtime plan used by both Cohere carriers.  The source
+/// Build the one runtime plan used by the Cohere carrier.  The source
 /// metadata vectors are assembled before the corresponding expert upload;
 /// this function never reads GPU state or constructs dispatch metadata itself.
 pub(crate) fn build_moe_static_binding(
@@ -387,7 +328,6 @@ pub(crate) fn build_moe_static_binding(
     gates: Vec<ExpertSourceMetadata>,
     ups: Vec<ExpertSourceMetadata>,
     downs: Vec<ExpertSourceMetadata>,
-    sidecars: Vec<ExpertSourceMetadata>,
     layer_idx: usize,
     n_layers: usize,
     physical_device: i32,
@@ -416,9 +356,6 @@ pub(crate) fn build_moe_static_binding(
         Ok(())
     };
     add_source(router.clone())?;
-    for source in sidecars {
-        add_source(source)?;
-    }
     for source in gates.iter().chain(ups.iter()).chain(downs.iter()) {
         add_source(source.clone())?;
     }
@@ -488,24 +425,6 @@ pub(crate) fn build_moe_static_binding(
             ShardPolicy::Replicate,
         ));
     }
-    let sidecar_names = gates
-        .iter()
-        .chain(ups.iter())
-        .chain(downs.iter())
-        .flat_map(|source| source.sidecar_source_names.iter().cloned())
-        .collect::<std::collections::BTreeSet<_>>();
-    for name in &sidecar_names {
-        let source = source_by_name
-            .get(name)
-            .ok_or_else(|| format!("expert sidecar metadata '{name}' is absent"))?;
-        manifest.push(WeightEntry::layer(
-            name.clone(),
-            layer_idx,
-            source.logical_shape.clone(),
-            source.dtype,
-            ShardPolicy::Replicate,
-        ));
-    }
     let resources = gates
         .iter()
         .zip(&ups)
@@ -532,7 +451,7 @@ pub(crate) fn build_moe_static_binding(
             gate: gate_names,
             up: up_names,
             down: down_names,
-            sidecars: sidecar_names.into_iter().collect(),
+            sidecars: Vec::new(),
         },
         resources: ExpertResourceRequirements::new(resources),
         router: router.name,
@@ -559,7 +478,6 @@ enum PendingOwner {
     Tensor(GpuTensor),
     Weight(WeightTensor),
     Expert(ExpertWeights),
-    Sidecars(Cohere2MoeParoSidecars),
     Moe(MoeFfn),
     Layer(Cohere2MoeLayerWeights),
 }
@@ -597,10 +515,6 @@ impl LoadTransaction {
 
     pub(crate) fn hold_expert(&mut self, expert: ExpertWeights) -> usize {
         self.hold(PendingOwner::Expert(expert))
-    }
-
-    pub(crate) fn hold_sidecars(&mut self, sidecars: Cohere2MoeParoSidecars) -> usize {
-        self.hold(PendingOwner::Sidecars(sidecars))
     }
 
     pub(crate) fn hold_moe(&mut self, moe: MoeFfn) -> usize {
@@ -645,15 +559,6 @@ impl LoadTransaction {
         }
     }
 
-    pub(crate) fn take_sidecars(&mut self, slot: usize) -> Result<Cohere2MoeParoSidecars, String> {
-        match self.take_owner(slot)? {
-            PendingOwner::Sidecars(sidecars) => Ok(sidecars),
-            _ => Err(format!(
-                "load transaction owner slot {slot} is not sidecars"
-            )),
-        }
-    }
-
     pub(crate) fn take_moe(&mut self, slot: usize) -> Result<MoeFfn, String> {
         match self.take_owner(slot)? {
             PendingOwner::Moe(moe) => Ok(moe),
@@ -677,13 +582,6 @@ impl LoadTransaction {
     pub(crate) fn expert_ref(&self, slot: usize) -> Option<&ExpertWeights> {
         match self.owners.get(slot).and_then(Option::as_ref) {
             Some(PendingOwner::Expert(expert)) => Some(expert),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn sidecars_ref(&self, slot: usize) -> Option<&Cohere2MoeParoSidecars> {
-        match self.owners.get(slot).and_then(Option::as_ref) {
-            Some(PendingOwner::Sidecars(sidecars)) => Some(sidecars),
             _ => None,
         }
     }
@@ -720,7 +618,6 @@ impl Drop for LoadTransaction {
                 }
                 PendingOwner::Weight(weight) => weight.free_all(gpu),
                 PendingOwner::Expert(expert) => expert.free_gpu(gpu),
-                PendingOwner::Sidecars(sidecars) => sidecars.free_gpu(gpu),
                 PendingOwner::Moe(moe) => moe.free_gpu(gpu),
                 PendingOwner::Layer(layer) => layer.free_gpu(gpu),
             }
@@ -741,18 +638,6 @@ pub struct ExpertWeights {
     pub down: WeightTensor,    // [hidden, moe_inter]
 }
 
-/// Per-layer shared ParoQuant rotation sidecars (Dir/safetensors path only).
-/// All experts in a MoE layer reference these via non-owning `ParoRotation`
-/// aliases, so the owner must outlive the experts — `MoeFfn` holds it.
-pub struct Cohere2MoeParoSidecars {
-    pub gate_up_pairs: GpuTensor,
-    pub gate_up_theta: GpuTensor,
-    pub gate_up_channel_scales: GpuTensor,
-    pub down_pairs: GpuTensor,
-    pub down_theta: GpuTensor,
-    pub down_channel_scales: GpuTensor,
-}
-
 /// 128-expert MoE FFN (sigmoid selection, no bias, no shared expert).
 pub struct MoeFfn {
     pub router: WeightTensor,           // mlp.gate.weight [n_exp, hidden]
@@ -762,9 +647,6 @@ pub struct MoeFfn {
     /// Load-time source/layout/dtype proof. This field is mandatory for every
     /// published MoE owner; forward code has no raw-execution fallback.
     pub(crate) sealed: MoeStaticBinding,
-    /// Owned per-layer PARO sidecars (Dir/safetensors path only). The experts'
-    /// `ParoRotation` aliases reference these — keep them alive.
-    pub paro_shared: Option<Cohere2MoeParoSidecars>,
 }
 
 struct ResidentMoeExperts<'a>(&'a [ExpertWeights]);
@@ -995,7 +877,6 @@ impl Cohere2MoeWeights {
                     gate_sources,
                     up_sources,
                     down_sources,
-                    Vec::new(),
                     l,
                     cfg.num_hidden_layers,
                     gpu.device_id,
@@ -1096,7 +977,6 @@ impl Cohere2MoeWeights {
                     expert_gate_up_ptrs,
                     expert_down_ptrs,
                     sealed,
-                    paro_shared: None,
                 });
                 tx.moe_mut(moe_slot)
                     .ok_or_else(|| format!("cohere2moe L{l}: missing staged MoE owner"))?
@@ -1156,25 +1036,6 @@ impl ExpertWeights {
     }
 }
 
-impl Cohere2MoeParoSidecars {
-    pub(crate) fn free_gpu(self, gpu: &mut Gpu) {
-        let Cohere2MoeParoSidecars {
-            gate_up_pairs,
-            gate_up_theta,
-            gate_up_channel_scales,
-            down_pairs,
-            down_theta,
-            down_channel_scales,
-        } = self;
-        let _ = gpu.free_tensor(gate_up_pairs);
-        let _ = gpu.free_tensor(gate_up_theta);
-        let _ = gpu.free_tensor(gate_up_channel_scales);
-        let _ = gpu.free_tensor(down_pairs);
-        let _ = gpu.free_tensor(down_theta);
-        let _ = gpu.free_tensor(down_channel_scales);
-    }
-}
-
 impl MoeFfn {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let MoeFfn {
@@ -1183,7 +1044,6 @@ impl MoeFfn {
             expert_gate_up_ptrs,
             expert_down_ptrs,
             sealed: _,
-            paro_shared,
         } = self;
         router.free_all(gpu);
         for expert in experts {
@@ -1191,9 +1051,6 @@ impl MoeFfn {
         }
         let _ = gpu.free_tensor(expert_gate_up_ptrs);
         let _ = gpu.free_tensor(expert_down_ptrs);
-        if let Some(sidecars) = paro_shared {
-            sidecars.free_gpu(gpu);
-        }
     }
 }
 

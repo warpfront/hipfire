@@ -13,7 +13,7 @@
 //! `conversation_tokens` handling, `redline_*` bench helpers, prompt-frame
 //! helpers) were trapped inside `crates/hipfire-daemon/src/main.rs`.
 //! Moving them down into `hipfire-loader` would create a cycle because
-//! `hipfire-pflash` (and each arch crate) already depend on `hipfire-runtime`
+//! each arch crate already depends on `hipfire-runtime`
 //! and `hipfire-loader` depends on the arch crates. The fix is a layer above
 //! the loader that the binary and the arch crates can both depend on:
 //!
@@ -25,7 +25,7 @@
 //!
 //! `hipfire-engine` may depend on `hipfire-runtime`, `hipfire-loader`,
 //! `saddle-core`, `hipfire-config`, `hipfire-dispatch`, `rdna-compute`,
-//! `hip-bridge`. It **must not** depend on `hipfire-pflash` or any
+//! `hip-bridge`. It **must not** depend on any
 //! `hipfire-arch-*` crate — those must be able to depend on it.
 //!
 //! Weight manifests and device placement stay out (PR #527).

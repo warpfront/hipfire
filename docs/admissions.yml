@@ -4,12 +4,12 @@
 #
 # This registry records sealed product-route evidence/admission only.
 # It does NOT select runtime defaults. Current automatic runtime selection
-# is only retained_redline_default: mq4r_redline_default (single-GPU .mq4r on
+# is only retained_redline_default: mq4r_redline_default (single-GPU MQ4R SKU on
 # exact gfx1100/gfx1151/gfx1201 with pp=tp=1; model-family agnostic),
 # Qwen3.5 dense and Qwen4 (MTP-off) plain-AR decode on exact gfx1201,
 # Qwen3.5 dense .mq3-xt plain-AR decode on exact gfx1100, and
-# DeepSeek4 .mq2r AR on gfx1151. Existing LFM .mq4 evidence is not
-# auto-selected because it is not .mq4r; any usable LFM retained route
+# DeepSeek4 MQ2R SKU AR on gfx1151. Existing LFM .mq4 evidence is not
+# auto-selected because it is not an MQ4R SKU; any usable LFM retained route
 # remains explicit opt-in and must still prove route support.
 schema_version: 2
 policy:
@@ -76,9 +76,9 @@ records:
       note: >
         Registry evidence/admission only. Does not select runtime defaults.
         Current automatic runtime selection is retained_redline_default only
-        (.mq4r path/extension with no arch_id/model-family gate, plus the
-        gfx1201 Qwen3.5 dense / Qwen4 MTP-off and gfx1151 DeepSeek4 .mq2r
-        predicates). This sealed LFM .mq4 row is not auto-selected; LFM
+        (the MQ4R SKU with no arch_id/model-family gate, plus the
+        gfx1201 Qwen3.5 dense / Qwen4 MTP-off and gfx1151 DeepSeek4 MQ2R
+        SKU predicates). This sealed LFM .mq4 row is not auto-selected; LFM
         retained replay requires explicit opt-in and route proof.
       forbidden_selection:
         - path_inference

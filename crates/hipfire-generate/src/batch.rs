@@ -328,9 +328,8 @@ pub fn is_batch_request_eligible(
     m: &LoadedModel,
     continuous_batch_size: usize,
     serve_continuous_batch: bool,
-    pflash_active: bool,
 ) -> bool {
-    let has_image = msg.get("image").is_some() || msg.get("image_base64").is_some();
+    let has_image = hipfire_engine::prompt::wire_has_image(msg);
     let has_tools = msg
         .get("tools")
         .and_then(|v| v.as_array())
@@ -361,7 +360,7 @@ pub fn is_batch_request_eligible(
         .as_ref()
         .map(|s| !s.requires_greedy())
         .unwrap_or(false);
-    let supports_temp_swor = m
+    let supports_temp_verify = m
         .speculator
         .as_ref()
         .is_some_and(|s| s.supports_temp_verify());
@@ -393,15 +392,7 @@ pub fn is_batch_request_eligible(
             || sampling.presence_penalty != 0.0
             || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
-            .ok()
-            .as_deref()
-            == Some("0"),
-        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
-            .ok()
-            .as_deref()
-            != Some("0"),
-        supports_temp_swor,
+        supports_temp_verify,
         supports_chain_nucleus_verify,
         kv_adaptive: has_adaptive,
     };
@@ -449,7 +440,7 @@ pub fn is_batch_request_eligible(
     if !batch_messages_are_single_user(msg) || has_tools || has_image || has_stop {
         return false;
     }
-    if has_spec || has_adaptive || m.eviction.is_some() || pflash_active {
+    if has_spec || has_adaptive {
         return false;
     }
     if m.pp != 1 || m.ep.is_some() {
@@ -479,8 +470,7 @@ pub fn is_batch_request_eligible(
 
 /// Batch eligibility predicate shape shared by the Qwen continuous-batch
 /// drivers (fixed-lane and VMM).
-pub(crate) type QwenBatchEligibility =
-    fn(&serde_json::Value, &LoadedModel, usize, bool, bool) -> bool;
+pub(crate) type QwenBatchEligibility = fn(&serde_json::Value, &LoadedModel, usize, bool) -> bool;
 
 /// Drain already-delivered daemon messages into a Qwen batch scheduler at a
 /// step boundary: admit eligible generates (render once, enqueue, announce),
@@ -590,7 +580,6 @@ pub(crate) fn drain_qwen_batch_inbox(
                         model,
                         batch_size,
                         parse_serve_continuous_batch(&json),
-                        false,
                     ) {
                         barrier = Some(daemon_regular_with_admission(json, carried_admission));
                         break;
@@ -1390,7 +1379,6 @@ pub fn drive_qwen_continuous_batch(
                     metrics.decode_ms,
                     metrics.ttft_ms,
                     0,
-                    "",
                 );
                 pending_done["latency_ms"] =
                     serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
@@ -1918,15 +1906,7 @@ fn vmm_singleton_route(
             .ok()
             .as_deref()
             == Some("0"),
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
-            .ok()
-            .as_deref()
-            == Some("0"),
-        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
-            .ok()
-            .as_deref()
-            != Some("0"),
-        supports_temp_swor: spec.is_some_and(|s| s.supports_temp_verify()),
+        supports_temp_verify: spec.is_some_and(|s| s.supports_temp_verify()),
         supports_chain_nucleus_verify: spec.is_some_and(|s| s.supports_chain_nucleus_verify()),
         kv_adaptive: m.kv_adaptive.is_some(),
     };
@@ -1980,16 +1960,12 @@ fn vmm_store_mtp_engine(store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35V
     store.spec_engine().is_some() && !hipfire_config::mtp_ngram_enabled()
 }
 
-/// Only the production FAST_SAMPLE selector chain has shared sampled seams.
+/// Only the production fast-sample selector chain has shared sampled seams.
 /// Other DFlash laws remain singleton, even when a greedy engine is staged.
 fn vmm_store_dflash_sampled(
     store: &hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore,
 ) -> bool {
     store.dflash_engine().is_some_and(|e| e.supports_sampled())
-        && hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
-            .ok()
-            .as_deref()
-            != Some("0")
 }
 
 /// Whether the store serves sampled requests at all: staged with
@@ -2599,6 +2575,10 @@ struct VmmLaneCtl {
     decode_start: usize,
     /// Finished and feeding its last rows; `commit_ready` follows.
     drain: Option<VmmDrain>,
+    /// The request's user-turn boundary (the singleton's `turn_boundary`): its
+    /// prompt prefill snapshots at its newest chunk end at or before it, so a
+    /// follow-up user turn resumes from there.
+    turn: hipfire_arch_qwen35::speculative::TurnCheckpoint,
     /// Verbatim assistant turn stored when the client commits.
     turn_store: Option<(TurnCacheAction, Vec<u32>)>,
 }
@@ -2887,7 +2867,7 @@ fn vmm_retire_free(
 /// not run it per row: tools/tool turns (grammar-constrained CPU sampling
 /// and the tool-call parser), images (vision path), invalid stops (the
 /// singleton reports them), logprobs (the singleton sampler's envelopes),
-/// budget alerts (mid-stream text injection), adaptive KV/eviction/PFlash
+/// budget alerts (mid-stream text injection), adaptive KV
 /// (per-request KV rewriting), and PP/EP outside the Qwen4 fn-lanes route. A loaded
 /// speculator does not exclude a greedy request — batched rows are AR, and a
 /// lonely request keeps its singleton spec route. Qwen4 fn-lanes also admit
@@ -2899,7 +2879,6 @@ pub fn is_vmm_batch_request_eligible(
     m: &LoadedModel,
     continuous_batch_size: usize,
     serve_continuous_batch: bool,
-    pflash_active: bool,
 ) -> bool {
     let staged = qwen4_lanes_staged(m)
         || m.state.as_ref().is_some_and(|s| {
@@ -2910,16 +2889,12 @@ pub fn is_vmm_batch_request_eligible(
     if !staged || !serve_continuous_batch || continuous_batch_size <= 1 {
         return false;
     }
-    let has_image = msg.get("image").is_some() || msg.get("image_base64").is_some();
+    let has_image = hipfire_engine::prompt::wire_has_image(msg);
     let has_tools = msg
         .get("tools")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty());
-    let jinja = m.chat_template.is_some()
-        && hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0");
+    let jinja = m.chat_template.is_some();
     let shape_ok = if jinja {
         batch_messages_are_text_chat(msg)
     } else {
@@ -2941,7 +2916,7 @@ pub fn is_vmm_batch_request_eligible(
     if m.qwen4().is_none() && request_sets_min_tokens(msg) {
         return false;
     }
-    if m.kv_adaptive.is_some() || m.eviction.is_some() || pflash_active {
+    if m.kv_adaptive.is_some() {
         return false;
     }
     if !lane_batch_topology_supported(qwen4_lanes_staged(m), m.pp, m.ep.is_some()) {
@@ -3070,7 +3045,7 @@ fn qwen4_lane_request_supported(
         Some(Value::Array(a)) => a.is_empty(),
         Some(_) => false,
     };
-    let images_ok = msg.get("image").is_none() && msg.get("image_base64").is_none();
+    let images_ok = !hipfire_engine::prompt::wire_has_image(msg);
     let logprobs_ok = matches!(msg.get("logprobs"), None | Some(Value::Bool(false)))
         && matches!(msg.get("top_logprobs"), None | Some(Value::Null))
         && sampling.repeat_penalty == 1.0
@@ -3323,26 +3298,38 @@ pub fn batch_request_eligible_for_route(
     m: &LoadedModel,
     continuous_batch_size: usize,
     serve_continuous_batch: bool,
-    pflash_active: bool,
     inbox: &mut DaemonInbox,
 ) -> bool {
     if vmm_route {
-        is_vmm_batch_request_eligible(
-            msg,
-            m,
-            continuous_batch_size,
-            serve_continuous_batch,
-            pflash_active,
-        ) && (qwen4_lone_request_takes_lane_for(msg, m) || inbox.has_pending_batch_generate())
+        is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch)
+            && (qwen4_lone_request_takes_lane_for(msg, m)
+                || inbox.has_pending_batch_generate()
+                || g942_burst_peer(m, inbox))
     } else {
-        is_batch_request_eligible(
-            msg,
-            m,
-            continuous_batch_size,
-            serve_continuous_batch,
-            pflash_active,
-        )
+        is_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch)
     }
+}
+
+/// gfx942 single-device fn-lanes (P2): an eligible request that finds no peer queued waits up to
+/// `g942_wave::BURST_GAP` (4 ms; G12's single admission-coalescing rule replaces it) for one, so
+/// a burst enters the lane driver together (one prefill wave) instead of its first request
+/// starting as an AR singleton.
+fn g942_burst_peer(m: &LoadedModel, inbox: &mut DaemonInbox) -> bool {
+    use hipfire_arch_qwen4::lane_exec::g942_wave;
+    let gap = m
+        .qwen4()
+        .is_some_and(g942_wave::serve_armed)
+        .then_some(g942_wave::BURST_GAP);
+    let start = Instant::now();
+    while gap.is_some_and(|gap| start.elapsed() < gap) {
+        if inbox.has_pending_batch_generate() {
+            let ms = start.elapsed().as_secs_f64() * 1e3;
+            eprintln!("[g942-wave] burst: peer queued {ms:.2} ms after the first arrival");
+            return true;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    false
 }
 
 /// Daemon: drive the staged batch scheduler — the Qwen4 lane driver on a
@@ -3384,7 +3371,6 @@ pub fn arm_promotion(
     m: &LoadedModel,
     continuous_batch_size: usize,
     serve_continuous_batch: bool,
-    pflash_active: bool,
     max_tokens: usize,
     max_think_tokens: usize,
     client_seed: Option<u64>,
@@ -3405,13 +3391,7 @@ pub fn arm_promotion(
         && m.qwen4().is_none_or(|b| {
             b.lanes().is_some() && qwen4_lane_promotion_supported(b.lane_topology())
         })
-        && is_vmm_batch_request_eligible(
-            msg,
-            m,
-            continuous_batch_size,
-            serve_continuous_batch,
-            pflash_active,
-        )
+        && is_vmm_batch_request_eligible(msg, m, continuous_batch_size, serve_continuous_batch)
         && (sampling.temp <= 0.0
             || (m.qwen4().is_none()
                 && vmm_sampled_lane(msg, m, &sampling) == Some(VmmLaneDecode::Ar))))
@@ -4533,6 +4513,9 @@ pub fn drive_qwen_vmm_continuous_batch(
                 lane.prompt_len = rendered.len();
                 lane.conversation_tokens = rendered.clone();
             }
+            let turn_boundary = model.tokenizer.as_ref().and_then(|tok| {
+                hipfire_runtime::prompt_frame::user_turn_resume_boundary(tok, None, &rendered)
+            });
             ctl[lane_idx] = VmmLaneCtl {
                 started_in_think,
                 think,
@@ -4541,6 +4524,10 @@ pub fn drive_qwen_vmm_continuous_batch(
                 cached: start,
                 prefill_tokens: rendered.len() - start,
                 decode_start: rendered.len(),
+                turn: hipfire_arch_qwen35::speculative::TurnCheckpoint {
+                    boundary: turn_boundary,
+                    pin: None,
+                },
                 ..VmmLaneCtl::default()
             };
             loop_guards[lane_idx] =
@@ -4693,7 +4680,6 @@ pub fn drive_qwen_vmm_continuous_batch(
                 metrics.decode_ms,
                 metrics.ttft_ms,
                 c.cached,
-                "",
             );
             pending_done["latency_ms"] =
                 serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
@@ -4923,6 +4909,34 @@ pub fn drive_qwen_vmm_continuous_batch(
                 )
             }
         };
+        // User-turn snapshot before a lane's prefill chunk that holds its
+        // boundary, on the singleton's own chunk plan (exact route), as the
+        // singleton takes it.
+        if let Some(store) = vmm_bundle(&mut model.state).and_then(|b| b.vmm_store.as_ref()) {
+            for (i, len) in planner.forced_prefill_len.iter().enumerate() {
+                let (Some(len), true) = (*len, ctl[i].keep) else {
+                    continue;
+                };
+                let Some(st) = store.request_state(&epochs[i]) else {
+                    continue;
+                };
+                let stream: &[u32] = match &sched.lanes[i] {
+                    BatchLane::Running(lane) => &lane.conversation_tokens,
+                    _ => &[],
+                };
+                let lane = &mut ctl[i];
+                crate::vmm_conv::turn_checkpoint_before_chunk(
+                    &mut lane.checkpoints,
+                    &st.dn,
+                    &st.kv,
+                    gpu,
+                    st.position,
+                    len,
+                    stream,
+                    &mut lane.turn,
+                );
+            }
+        }
         // Device-memory grants: a lane whose KV growth this step would leave
         // the admitted lanes unable to complete (`Qwen35VmmStore::
         // step_grants`) waits a step with its state untouched, as a lane
@@ -5275,13 +5289,20 @@ pub fn drive_qwen_vmm_continuous_batch(
                         hipfire_runtime::slot_batch::RequestStepKind::Ar => ctl[idx].main_row,
                         _ => false,
                     };
+                let turn = ctl[idx].turn;
                 if let (true, Some(st)) = (take, store.request_state(&r.epoch)) {
+                    let stream: &[u32] = match &sched.lanes[idx] {
+                        BatchLane::Running(lane) => &lane.conversation_tokens,
+                        _ => &[],
+                    };
                     crate::vmm_conv::checkpoint(
                         &mut ctl[idx].checkpoints,
                         &st.dn,
                         &st.kv,
                         gpu,
                         st.position,
+                        stream,
+                        turn,
                     );
                 }
                 // `prefill_progress` for this lane's prompt chunk (silent on
@@ -5792,7 +5813,6 @@ pub fn drive_lfm_continuous_batch(
                             model,
                             batch_size,
                             parse_serve_continuous_batch(&json),
-                            false,
                         ) {
                             barrier = Some(daemon_regular_with_admission(json, carried_admission));
                             break;
@@ -6895,7 +6915,6 @@ pub fn is_qwen_ep_batch_request_eligible(
     m: &LoadedModel,
     continuous_batch_size: usize,
     serve_continuous_batch: bool,
-    pflash_active: bool,
 ) -> bool {
     let caps = hipfire_loader::carrier_for(m.arch_id)
         .map(|c| c.caps())
@@ -6927,7 +6946,7 @@ pub fn is_qwen_ep_batch_request_eligible(
     }
     // Staged `batch` above is the admission: staging already passed the full
     // `validate_ep_batch_compatibility` (embd/lm_head/all-global-experts).
-    let has_image = msg.get("image").is_some() || msg.get("image_base64").is_some();
+    let has_image = hipfire_engine::prompt::wire_has_image(msg);
     let has_tools = msg
         .get("tools")
         .and_then(|v| v.as_array())
@@ -6939,7 +6958,7 @@ pub fn is_qwen_ep_batch_request_eligible(
     if !batch_messages_are_single_user(msg) {
         return false;
     }
-    if m.speculator.is_some() || m.kv_adaptive.is_some() || m.eviction.is_some() || pflash_active {
+    if m.speculator.is_some() || m.kv_adaptive.is_some() {
         return false;
     }
     if batch.is_none() {
@@ -6986,15 +7005,7 @@ pub fn is_qwen_ep_batch_request_eligible(
             || sampling.presence_penalty != 0.0
             || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
-            .ok()
-            .as_deref()
-            == Some("0"),
-        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
-            .ok()
-            .as_deref()
-            != Some("0"),
-        supports_temp_swor: m
+        supports_temp_verify: m
             .speculator
             .as_ref()
             .is_some_and(|s| s.supports_temp_verify()),
@@ -7356,7 +7367,6 @@ pub fn drive_qwen35_ep_continuous_batch(
                             model,
                             batch_size,
                             parse_serve_continuous_batch(&json),
-                            false,
                         ) {
                             barrier = Some(daemon_regular_with_admission(json, Some(admission)));
                             break;
@@ -7858,7 +7868,6 @@ pub fn drive_qwen35_ep_continuous_batch(
                     metrics.decode_ms,
                     metrics.ttft_ms,
                     0,
-                    "",
                 );
                 pending_done["latency_ms"] =
                     serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
@@ -8363,6 +8372,7 @@ mod tests {
             json!({"tools": null}),
             json!({"image": "x"}),
             json!({"image_base64": "x"}),
+            json!({"images_base64": ["x"]}),
             json!({"logprobs": true}),
             json!({"top_logprobs": 2}),
         ] {

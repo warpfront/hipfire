@@ -11,10 +11,10 @@ accept.
 
 Each JSONL row is a DPO pair with `prompt` and `chosen` fields. We emit
 one concatenated prompt+chosen "doc" per row, separated by blank lines
-so the corpus chunker in triattn_validate splits them correctly.
+so the corpus chunker splits them correctly.
 
-Filters out `rejected` and the DPO negatives — for both sidecar cal and
-draft training we only want the high-quality responses (the draft is
+Filters out `rejected` and the DPO negatives — for draft
+training we only want the high-quality responses (the draft is
 meant to mimic the target's preferred behavior, not its failure modes).
 
 Usage:

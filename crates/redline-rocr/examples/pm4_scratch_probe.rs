@@ -14,18 +14,24 @@
 //! occupancy: every wave slot busy at once, each lane re-reading its private
 //! tag so any two waves sharing a scratch slice corrupt each other), `mq4`
 //! (the product `gemv_mq4g256v2_residual` code object over clean, wild and
-//! NaN/Inf/denormal/-0 inputs).
+//! NaN/Inf/denormal/-0 inputs). `evict` (only when named with `--only`):
+//! the same (plain, scratch) IB resubmitted while KFD evicts and restores the
+//! queue every `--evict-ms`; the queue owns the ring through
+//! `QueueSet::bind_scratch` unless `--unbound 1` (negative control: stalls,
+//! HIPF-347).
 //!
 //! Build the code objects with `examples/pm4_scratch/build.sh <arch> <dir>`.
 //!
 //! ```text
 //! pm4_scratch_probe --probe probe_gfx1100.co --mq4 mq4_residual_gfx1100.co
+//! pm4_scratch_probe --probe probe_gfx1100.co --only evict [--unbound 1]
 //! ```
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use redline_rocr::abi;
 use redline_rocr::packet::{KernelDispatchPacket, PacketImage};
 use redline_rocr::{
     CompletionSignal, Executable, Gfx10KernelImage, Gfx10Pm4CommandBuffer, Gfx10Scratch,
@@ -163,11 +169,15 @@ impl Rig {
     }
 
     fn submit(&mut self, packet: PacketImage) -> R<()> {
+        self.submit_within(packet, Duration::from_secs(60))
+    }
+
+    fn submit_within(&mut self, packet: PacketImage, timeout: Duration) -> R<()> {
         self.completion.reset();
         self.queues.prepare_batches(&[vec![packet]]).map_err(err)?;
         self.queues.ring_prepared().map_err(err)?;
         self.queues
-            .wait_signal(&self.completion, Duration::from_secs(60))
+            .wait_signal(&self.completion, timeout)
             .map_err(err)
     }
 
@@ -851,11 +861,186 @@ fn case_residual(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct Evict {
+    period_ms: u64,
+    iters: usize,
+    unbound: bool,
+}
+
+/// Drop and re-fault one page of an `hsa_amd_memory_lock`ed host buffer (a
+/// KFD userptr BO) every `period_ms`: each drop fires the MMU notifier, so
+/// KFD evicts and later restores every queue of the process.
+fn start_eviction(period_ms: u64) -> R<()> {
+    type MemoryLock = unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        usize,
+        *mut abi::Agent,
+        i32,
+        *mut *mut std::ffi::c_void,
+    ) -> abi::Status;
+    unsafe extern "C" {
+        fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
+        fn dlsym(h: *mut std::ffi::c_void, name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+    }
+    const RTLD_LAZY_NOLOAD: i32 = 0x1 | 0x4;
+    const MADV_DONTNEED: i32 = 4;
+    const PAGE: usize = 4096;
+    const PAGES: usize = 512;
+    // Owned by the eviction thread below, which runs until process exit.
+    let mut buffer = vec![1_u8; (PAGES + 1) * PAGE];
+    let base = (buffer.as_mut_ptr() as usize).next_multiple_of(PAGE);
+    // SAFETY: plain libdl calls; the HSA runtime is already loaded by `Rig`.
+    let lock = unsafe {
+        let handle = [c"libhsa-runtime64.so.1", c"libhsa-runtime64.so"]
+            .iter()
+            .map(|name| dlopen(name.as_ptr(), RTLD_LAZY_NOLOAD))
+            .find(|handle| !handle.is_null())
+            .ok_or("libhsa-runtime64 is not loaded")?;
+        let lock = dlsym(handle, c"hsa_amd_memory_lock".as_ptr());
+        if lock.is_null() {
+            return Err("hsa_amd_memory_lock missing".into());
+        }
+        std::mem::transmute::<*mut std::ffi::c_void, MemoryLock>(lock)
+    };
+    let mut agent_address = std::ptr::null_mut();
+    // SAFETY: `base..base + PAGES * PAGE` lies inside `buffer`.
+    let status = unsafe {
+        lock(
+            base as *mut std::ffi::c_void,
+            PAGES * PAGE,
+            std::ptr::null_mut(),
+            0,
+            &mut agent_address,
+        )
+    };
+    if status != abi::STATUS_SUCCESS {
+        return Err(format!("hsa_amd_memory_lock failed: {status:#x}"));
+    }
+    std::thread::spawn(move || {
+        let _owner = buffer;
+        for drop in 0.. {
+            std::thread::sleep(Duration::from_millis(period_ms));
+            let page = base + (drop % PAGES) * PAGE;
+            // SAFETY: the page is inside the locked buffer this thread owns.
+            unsafe {
+                madvise(page as *mut std::ffi::c_void, PAGE, MADV_DONTNEED);
+                std::ptr::write_volatile(page as *mut u8, 1);
+            }
+        }
+    });
+    Ok(())
+}
+
+/// HIPF-347: a retained-style IB, 16 x (plain, scratch) dispatches, resubmitted
+/// under forced KFD eviction. The command processor reloads the scratch
+/// registers from `amd_queue_t` when it maps the queue again, so the queue
+/// must own the ring (`QueueSet::bind_scratch`); unbound it stalls (5 s wait).
+fn case_evict(
+    rig: &mut Rig,
+    tally: &mut Tally,
+    dyn_kernel: &Kernel,
+    plain: &Kernel,
+    evict: Evict,
+) -> R<()> {
+    let ring = rig.ring(&[dyn_kernel, plain])?.ok_or("no scratch kernel")?;
+    if !evict.unbound {
+        rig.queues
+            .bind_scratch(0, &ring.scratch)
+            .ok_or("no queue")?;
+    }
+    let threads = 32_768_usize;
+    let geometry = LaunchGeometry::new([threads as u32, 1, 1], [64, 1, 1]).map_err(err)?;
+    let input = random_words(&mut Rng(0x0347_0347_0347_0347), threads);
+    let mut reference = input.clone();
+    let mut buffers = vec![rig.words(&input)?];
+    let mut args = Vec::new();
+    let mut commands = Rig::new_stream(Some(&ring));
+    for step in 0..32 {
+        buffers.push(rig.zeros(threads * 4)?);
+        let (from, to) = (&buffers[step], &buffers[step + 1]);
+        let (kernel, explicit) = if step % 2 == 1 {
+            reference = scratch_dyn_ref(&reference, threads, 24);
+            let explicit = ptr_bytes(&[
+                Part::Ptr(from),
+                Part::Ptr(to),
+                Part::I32(threads as i32),
+                Part::I32(24),
+            ]);
+            (dyn_kernel, explicit)
+        } else {
+            reference = plain_mix_ref(&reference);
+            (plain, ptr_bytes(&[Part::Ptr(from), Part::Ptr(to)]))
+        };
+        let kernarg = kernarg_for(rig, kernel, geometry, &explicit)?;
+        commands
+            .dispatch(kernel, geometry, 0, kernarg.address())
+            .map_err(err)?;
+        commands.dependency_rmw_same_agent();
+        args.push(kernarg);
+    }
+    commands.wait_compute_idle();
+    commands.acquire_system();
+    let bytes = commands.as_bytes();
+    let mut indirect = rig
+        .host
+        .allocate_executable_bytes(bytes.len())
+        .map_err(err)?;
+    indirect.write_exact(&bytes).map_err(err)?;
+    start_eviction(evict.period_ms)?;
+    let started = std::time::Instant::now();
+    let (mut wrong, mut stalled) = (0, None);
+    for iter in 0..evict.iters {
+        buffers.last_mut().unwrap().as_mut_bytes().fill(0);
+        let packet = PacketImage::pm4_indirect_buffer(
+            indirect.address(),
+            commands.len_dwords(),
+            rig.completion.raw(),
+        )
+        .map_err(err)?;
+        if rig.submit_within(packet, Duration::from_secs(5)).is_err() {
+            stalled = Some(iter);
+            break;
+        }
+        wrong += usize::from(read_words(buffers.last_mut().unwrap(), threads) != reference);
+    }
+    tally.check(
+        &format!(
+            "evict ring={} period_ms={}",
+            if evict.unbound { "unbound" } else { "bound" },
+            evict.period_ms
+        ),
+        wrong == 0 && stalled.is_none(),
+        format!(
+            "iters={} stalled_at={stalled:?} wrong_iters={wrong} secs={:.1}",
+            evict.iters,
+            started.elapsed().as_secs_f64()
+        ),
+    );
+    if stalled.is_some() {
+        // The wedged queue cannot be torn down cleanly.
+        println!(
+            "RESULT arch={} cases={} failures={}",
+            rig.device.name(),
+            tally.cases,
+            tally.failures
+        );
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn main() -> R<()> {
     let mut probe = PathBuf::new();
     let mut mq4 = PathBuf::new();
     let mut mq3 = PathBuf::new();
     let mut only = String::new();
+    let mut evict = Evict {
+        period_ms: 10,
+        iters: 3000,
+        unbound: false,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let value = args.next().ok_or(format!("{flag} needs a value"))?;
@@ -864,6 +1049,9 @@ fn main() -> R<()> {
             "--mq4" => mq4 = value.into(),
             "--mq3" => mq3 = value.into(),
             "--only" => only = value,
+            "--evict-ms" => evict.period_ms = value.parse().map_err(err)?,
+            "--iters" => evict.iters = value.parse().map_err(err)?,
+            "--unbound" => evict.unbound = value == "1",
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -907,6 +1095,9 @@ fn main() -> R<()> {
         }
         if wanted("alias-control") {
             case_alias_control(&mut rig, &mut tally, &alias)?;
+        }
+        if only == "evict" {
+            case_evict(&mut rig, &mut tally, &dyn_kernel, &plain, evict)?;
         }
     }
     if !mq4.as_os_str().is_empty() && wanted("mq4") {

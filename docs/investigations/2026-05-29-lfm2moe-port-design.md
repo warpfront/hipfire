@@ -147,7 +147,7 @@ for a *completion* prompt fed to an *instruct/thinking* model, NOT an arch bug
 (cosine ≥0.999 already proves the forward). The daemon's ChatFrame wraps the turn
 correctly. Use chat framing for this model.
 
-### Chat template — upstream jinja (embedded; `HIPFIRE_JINJA_CHAT=1`)
+### Chat template — upstream jinja (embedded)
 
 LiquidAI ships a real `chat_template.jinja` (4621 B; ChatML turns with a leading
 `{{ bos_token }}` = `<|startoftext|>`, `<think>…</think>` reasoning, and a
@@ -173,8 +173,8 @@ format. Fixed end-to-end (mirrors how MiniMax-M2 serves jinja):
    `{{ bos_token }}` renders the correct token (the Gemma 4 precedent).
 
 Verified: `[chat_template] using HFQ-embedded` fires at load, no render-fallback,
-coherent (Paris / 80 km/h, 244 tok/s) under `HIPFIRE_JINJA_CHAT=1`. The flag is
-opt-in (global default off, same as MiniMax); without it serve uses the Plain
+coherent (Paris / 80 km/h, 244 tok/s) on the jinja template path. That path was
+then opt-in (global default off, same as MiniMax); without it serve uses the Plain
 ChatFrame as before. Upstream template kept verbatim at
 `crates/hipfire-arch-lfm2moe/assets/chat_template.jinja`.
 

@@ -262,7 +262,6 @@ pub fn mtp_probe_step(
         None,                     // hidden_rb: MTP probe doesn't drive a draft model
         Some(&final_hidden_view), // post-output-norm hidden for all N rows
         None,                     // gdn_tape
-        None,                     // tree_verify
         Some(&state.pbs),
         Some(MaskEmbedOverride {
             slot: mask_slot,

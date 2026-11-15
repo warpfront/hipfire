@@ -147,7 +147,7 @@ pub fn is_expert_hotset_name(name: &str) -> bool {
 }
 
 /// Every file the registry names as a *sidecar* of some entry — `dflash`,
-/// `vision`, `triattn`, `mtp`, `dspark`, the FLUX components, and the
+/// `vision`, `mtp`, `dspark`, the FLUX components, and the
 /// alternative `heads` carriers.
 ///
 /// These share the model suffixes (`.hfq`), so a suffix test alone cannot
@@ -161,7 +161,6 @@ pub fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
         .values()
         .flat_map(|entry| {
             [
-                entry.triattn.as_ref(),
                 entry.mtp.as_ref(),
                 entry.dspark.as_ref(),
                 entry.t5.as_ref(),
@@ -312,7 +311,6 @@ mod tests {
         assert!(is_model_file("deepseek-v4-flash-0731.mq2r"));
         assert!(is_model_file("deepseek-v4-flash-0731.mq2rxt"));
         assert!(is_model_file("draft.hfq"));
-        assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
     }
 

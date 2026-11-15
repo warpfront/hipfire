@@ -3344,6 +3344,363 @@ fn fma_mix_neg_is_negate_and_neg_hi_is_abs() {
     assert_eq!(f32::from_bits(w.v[4][0]), 0.0, "clamp(-5.0) = 0");
 }
 
+/// One `v_fma_mix_f32` (NEG_HI = 0) on a gfx942 wave in `mode`, every lane the same sources.
+fn mix_f32_hw(
+    mode: Mode,
+    srcs: [u32; 3],
+    op_sel: u8,
+    op_sel_hi: u8,
+    neg_lo: u8,
+    clamp: bool,
+) -> u32 {
+    let mut w = new_wave();
+    w.mode = mode;
+    for (i, s) in srcs.iter().enumerate() {
+        w.v[1 + i] = [*s; 64];
+    }
+    let regs = [Src::Vgpr(1), Src::Vgpr(2), Src::Vgpr(3)];
+    vexec(
+        &mut w,
+        vop3p(
+            Vop3pOp::FmaMixF32,
+            Src::Vgpr(4),
+            &regs,
+            op_sel,
+            op_sel_hi,
+            neg_lo,
+            0,
+            clamp,
+        ),
+    )
+    .unwrap();
+    assert!(w.v[4].iter().all(|&x| x == w.v[4][0]));
+    w.v[4][0]
+}
+
+/// NaN results of `v_fma_mix_f32`, gfx942. The vectors marked (r1) are first mismatch samples of the MI300X receipt
+/// `cdna_mix_hw_oracle/1` r1 (hardware value); the others follow the rule set that reproduced r1's NaN-result
+/// histograms, signalling-NaN counts and NaN totals exactly in all 32 MODE settings.
+#[test]
+fn fma_mix_f32_gfx942_nan_results_follow_mi300x_receipt() {
+    let ieee1 = Mode::default();
+    let ieee0 = Mode {
+        ieee: false,
+        ..Mode::default()
+    };
+    // (r1) 0 * -inf is invalid: the default NaN 0xffc00000, even with a NaN source (all sources f16 hi, `-0`, `-inf`, NaN).
+    assert_eq!(
+        mix_f32_hw(
+            ieee1,
+            [0x8000_0000, 0xfc00_0400, 0x7f80_0000],
+            7,
+            7,
+            0,
+            false
+        ),
+        0xffc0_0000
+    );
+    // (r1) invalid product beats an f32 sNaN addend.
+    assert_eq!(
+        mix_f32_hw(
+            ieee1,
+            [0x0000_0001, 0xfc00_0400, 0xffa5_a5a5],
+            3,
+            3,
+            0,
+            false
+        ),
+        0xffc0_0000
+    );
+    assert_eq!(
+        mix_f32_hw(ieee0, [0, 0x7f80_0000, 0xffa5_a5a5], 0, 0, 0, false),
+        0xffc0_0000
+    );
+    // (r1) several NaNs: the first of src0, src1, src2 wins (f16 lo NaN 0xffff -> 0xffffe000 over src1's quiet NaN).
+    assert_eq!(
+        mix_f32_hw(
+            ieee1,
+            [0x007f_ffff, 0x83ff_7e00, 0x0400_83ff],
+            4,
+            7,
+            0,
+            false
+        ),
+        0xffff_e000
+    );
+    assert_eq!(
+        mix_f32_hw(
+            ieee1,
+            [0x7fc0_0000, 0x7f7f_ffff, 0xffc0_0000],
+            2,
+            2,
+            0,
+            false
+        ),
+        0x7fc0_0000
+    );
+    assert_eq!(
+        mix_f32_hw(
+            ieee1,
+            [0x3f80_0000, 0x7fc0_0001, 0xffc0_0002],
+            0,
+            0,
+            0,
+            false
+        ),
+        0x7fc0_0001
+    );
+    assert_eq!(
+        mix_f32_hw(
+            ieee1,
+            [0x3f80_0000, 0x3f80_0000, 0xffc0_0002],
+            0,
+            0,
+            0,
+            false
+        ),
+        0xffc0_0002
+    );
+    // (r1) MODE.IEEE = 0 passes a signalling NaN unquieted (f32 source, and an f16 source widened without quieting);
+    // MODE.IEEE = 1 sets the quiet bit (payload and sign kept).
+    assert_eq!(
+        mix_f32_hw(ieee0, [0, 0x0000_0001, 0xffa5_a5a5], 0, 0, 0, false),
+        0xffa5_a5a5
+    );
+    assert_eq!(
+        mix_f32_hw(ieee1, [0, 0x0000_0001, 0xffa5_a5a5], 0, 0, 0, false),
+        0xffe5_a5a5
+    );
+    assert_eq!(
+        mix_f32_hw(ieee0, [0, 0x7f80_0001, 0x8000_7bff], 0, 4, 0, false),
+        0x7f80_0001
+    );
+    assert_eq!(
+        mix_f32_hw(ieee1, [0, 0x7f80_0001, 0x8000_7bff], 0, 4, 0, false),
+        0x7fc0_0001
+    );
+    assert_eq!(
+        mix_f32_hw(ieee0, [0, 0x7c01_0001, 0xfc00_7c01], 0, 7, 0, false),
+        0x7f80_2000
+    );
+    assert_eq!(
+        mix_f32_hw(ieee1, [0, 0x7c01_0001, 0xfc00_7c01], 0, 7, 0, false),
+        0x7fc0_2000
+    );
+    // NEG_LO flips the sign of a NaN source; inf - inf is the default NaN.
+    assert_eq!(
+        mix_f32_hw(
+            ieee1,
+            [0x7fc0_0000, 0x3f80_0000, 0x3f80_0000],
+            0,
+            0,
+            1,
+            false
+        ),
+        0xffc0_0000
+    );
+    assert_eq!(
+        mix_f32_hw(
+            ieee1,
+            [0x7f80_0000, 0x3f80_0000, 0xff80_0000],
+            0,
+            0,
+            0,
+            false
+        ),
+        0xffc0_0000
+    );
+    // CLAMP: NaN -> +0.0 with DX10_CLAMP, otherwise the NaN passes (quieted per IEEE).
+    let nan = [0x7fc0_0000, 0x3f80_0000, 0x3f80_0000];
+    assert_eq!(mix_f32_hw(ieee1, nan, 0, 0, 0, true), 0);
+    let no_dx10 = Mode {
+        dx10_clamp: false,
+        ..Mode::default()
+    };
+    assert_eq!(mix_f32_hw(no_dx10, nan, 0, 0, 0, true), 0x7fc0_0000);
+    let snan = [0x7f80_0001, 0x3f80_0000, 0x3f80_0000];
+    let no_dx10_ieee0 = Mode {
+        dx10_clamp: false,
+        ieee: false,
+        ..Mode::default()
+    };
+    assert_eq!(mix_f32_hw(no_dx10_ieee0, snan, 0, 0, 0, true), 0x7f80_0001);
+}
+
+/// Output-denormal flush of `v_fma_mix_f32`, gfx942 (MODE.FP_DENORM_32 bit 1 clear): flush when the result is tiny
+/// after rounding with an unbounded exponent range, not when the fixed-grid result is subnormal. Vectors are
+/// MI300X receipt `cdna_mix_hw_oracle/1` r1 mismatch samples (hardware values) or r1 rows on which hardware and the
+/// pre-fix interpreter agreed.
+#[test]
+fn fma_mix_f32_gfx942_output_flush_is_tiny_after_unbounded_rounding() {
+    let out_flush = Mode {
+        denorm32: 1,
+        denorm16_64: 2,
+        ..Mode::default()
+    };
+    let all_flush = Mode {
+        denorm32: 0,
+        denorm16_64: 0,
+        ..Mode::default()
+    };
+    // (r1) 2^-150 + (2^23 - 1) * 2^-149 = (2^23 - 0.5) * 2^-149: representable with 24 bits, tiny -> +0
+    // (the fixed grid ties up to 2^-126).
+    let tiny = [0x0000_0001, 0x3f00_0000, 0x007f_ffff];
+    assert_eq!(mix_f32_hw(out_flush, tiny, 0, 0, 0, false), 0);
+    assert_eq!(
+        mix_f32_hw(out_flush, tiny, 0, 0, 0, true),
+        0,
+        "clamp keeps the tiny positive, then flushed"
+    );
+    // Output denormals preserved: the fixed-grid result 2^-126 stays.
+    assert_eq!(
+        mix_f32_hw(Mode::default(), tiny, 0, 0, 0, false),
+        0x0080_0000
+    );
+    // (r1) the flushed zero keeps the sign: -(-2^-149) * (-0.5) + -(2^23 - 1) * 2^-149 = -(2^23 - 0.5) * 2^-149.
+    assert_eq!(
+        mix_f32_hw(
+            out_flush,
+            [0x8000_0001, 0xb800_bc00, 0x807f_ffff],
+            2,
+            2,
+            1,
+            false
+        ),
+        0x8000_0000
+    );
+    // (r1) (1 - 2^-24) * 2^-126 + f16 zero, input and output flush.
+    assert_eq!(
+        mix_f32_hw(
+            all_flush,
+            [0x3f7f_ffff, 0x0080_0000, 0x7fc0_0000],
+            0,
+            4,
+            0,
+            false
+        ),
+        0
+    );
+    // (r1, hardware == interpreter) exact 2^-126 - 0.0078 * 2^-149 is above 2^-126 - 2^-151: unbounded rounding gives
+    // 2^-126, not tiny, so it is NOT flushed.
+    assert_eq!(
+        mix_f32_hw(
+            out_flush,
+            [0x0000_0001, 0xbc00_7c00, 0x0080_0000],
+            0,
+            0,
+            0,
+            false
+        ),
+        0x0080_0000
+    );
+}
+
+#[test]
+fn fma_mix_f32_gfx942_inline_float_uses_selected_precision_rom() {
+    // MI300X r2: half inline 1.0 is 0x00003c00. Low selection is 1;
+    // high selection is zero, not the high half of f32 0x3f800000.
+    for pos in 0..3 {
+        for high in [false, true] {
+            for negate in [false, true] {
+                let mut w = new_wave();
+                for (reg, value) in [2.0f32, 3.0, 4.0].into_iter().enumerate() {
+                    w.v[reg + 1] = [value.to_bits(); 64];
+                }
+                let mut src = [Src::Vgpr(1), Src::Vgpr(2), Src::Vgpr(3)];
+                src[pos] = Src::Float(InlineFloat::One);
+                vexec(
+                    &mut w,
+                    vop3p(
+                        Vop3pOp::FmaMixF32,
+                        Src::Vgpr(4),
+                        &src,
+                        if high { 1 << pos } else { 0 },
+                        1 << pos,
+                        if negate { 1 << pos } else { 0 },
+                        0,
+                        false,
+                    ),
+                )
+                .unwrap();
+                let expected: [f32; 3] = if high {
+                    [4.0, 4.0, 6.0]
+                } else if negate {
+                    [1.0, 2.0, 5.0]
+                } else {
+                    [7.0, 6.0, 7.0]
+                };
+                assert_eq!(
+                    w.v[4],
+                    [expected[pos].to_bits(); 64],
+                    "pos={pos}, high={high}, negate={negate}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fma_mix_f32_gfx942_integer_inline_stays_sign_extended() {
+    // MI300X r2: unlike float constants, integer -1 remains a B32 word;
+    // either selected half is 0xffff, including the high half.
+    for pos in 0..3 {
+        for high in [false, true] {
+            let mut w = new_wave();
+            for (reg, value) in [2.0f32, 3.0, 4.0].into_iter().enumerate() {
+                w.v[reg + 1] = [value.to_bits(); 64];
+            }
+            let mut src = [Src::Vgpr(1), Src::Vgpr(2), Src::Vgpr(3)];
+            src[pos] = Src::Int(-1);
+            vexec(
+                &mut w,
+                vop3p(
+                    Vop3pOp::FmaMixF32,
+                    Src::Vgpr(4),
+                    &src,
+                    if high { 1 << pos } else { 0 },
+                    1 << pos,
+                    0,
+                    0,
+                    false,
+                ),
+            )
+            .unwrap();
+            assert_eq!(w.v[4], [0xffff_e000; 64]);
+        }
+    }
+}
+
+#[test]
+fn fma_mix_f32_gfx942_exact_underflow_ties_and_clamped_negative_zero() {
+    let mode = Mode {
+        denorm32: 0,
+        ..Mode::default()
+    };
+    // The middle product is exactly 2^-126 - 2^-151. MI300X r2
+    // preserves that RNE tie; the adjacent products bracket it.
+    for (b, expected) in [
+        (0x1d84_2107, 0),
+        (0x1d84_2108, 0x0080_0000),
+        (0x1d84_2109, 0x0080_0001),
+    ] {
+        assert_eq!(
+            mix_f32_hw(mode, [0x2278_0000, b, 0], 0, 0, 0, false),
+            expected
+        );
+        assert_eq!(
+            mix_f32_hw(mode, [0xa278_0000, b, 0], 0, 0, 0, false),
+            expected | 0x8000_0000
+        );
+    }
+    for src in [
+        [0x8000_0000, 0x3f80_0000, 0x8000_0000],
+        [0, 0xbf80_0000, 0x8000_0000],
+    ] {
+        assert_eq!(mix_f32_hw(mode, src, 0, 0, 0, false), 0x8000_0000);
+        assert_eq!(mix_f32_hw(mode, src, 0, 0, 0, true), 0);
+    }
+}
+
 // ---- packed F32
 
 fn pk32_case(

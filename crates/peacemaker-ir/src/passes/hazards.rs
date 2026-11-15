@@ -102,7 +102,7 @@ fn pipe_of(inst: &Inst, arch: Arch) -> Pipeline {
 }
 
 fn pipe_by_name(inst: &Inst, arch: Arch) -> Pipeline {
-    match inst.op.name(arch).unwrap_or("") {
+    match inst.name(arch).unwrap_or("") {
         name if name.starts_with('s') => Pipeline::Salu,
         name if name.starts_with('v') => Pipeline::Valu,
         _ => Pipeline::Ds,
@@ -113,7 +113,7 @@ fn pipe_by_name(inst: &Inst, arch: Arch) -> Pipeline {
 /// `isVMEM && !isFLAT` and `isSMRD` clear the state, FLAT-encoded accesses
 /// (`global_*`, `scratch_*`, `flat_*`) are ignored, `s_sendmsg_rtn_*` is SOP1.
 fn llvm_pipe(inst: &Inst, arch: Arch) -> Pipeline {
-    let name = inst.op.name(arch).unwrap_or("");
+    let name = inst.name(arch).unwrap_or("");
     // Every SMEM-encoded instruction is `isSMRD` in LLVM, including the effect-less hints (`s_prefetch_data`): it
     // clears the pending state instead of consuming an SGPR (it is not a SALU/VALU in the pass's classification).
     if inst.form == crate::inst::Form::Smem && !name.starts_with("s_sendmsg_rtn") {
@@ -498,7 +498,7 @@ fn gfx11_block(
             *state = Gfx11State::default();
             continue;
         }
-        let name = inst.op.name(arch).unwrap_or("");
+        let name = inst.name(arch).unwrap_or("");
         // ROCm LLVM GCNHazardRecognizer.cpp fixVcmpxPermlaneHazards and
         // AMDGPU.td FeatureISAVersion11_Common enable this on both targets.
         // fixVcmpxPermlaneHazards: V_NOP does NOT break the chain; a real
@@ -606,7 +606,7 @@ fn sgpr_block(
             *machine = Gfx12Sgpr::default();
             continue;
         }
-        if inst.op.name(arch) == Some("s_wait_alu") {
+        if inst.name(arch) == Some("s_wait_alu") {
             for operand in &inst.operands {
                 if let Operand::Imm(ImmField::Sopp(bits) | ImmField::Sopk(bits)) = operand {
                     machine.wait(*bits as u16);
@@ -617,7 +617,7 @@ fn sgpr_block(
         // Encoding rows use 64-bit slots for lane masks in both wave sizes;
         // `wave_effects` narrows them to the kernel's wave width and leaves
         // genuine 64-bit scalar data operands as two registers.
-        let name = inst.op.name(arch).unwrap_or("");
+        let name = inst.name(arch).unwrap_or("");
         let effects = crate::effects::wave_effects(arch, wave, inst);
         let use_refs = effects.uses.as_slice();
         let def_refs = effects.defs.as_slice();
@@ -750,7 +750,7 @@ fn wmma_block(
         let Some(inst) = body.insts.get(id) else {
             continue;
         };
-        let name = inst.op.name(arch).unwrap_or("");
+        let name = inst.name(arch).unwrap_or("");
         if name.starts_with("v_wmma_") || name.starts_with("v_swmmac_") {
             let chained = previous.iter().any(|old| {
                 inst.effects
@@ -859,10 +859,11 @@ mod tests {
                 .iter()
                 .find(|row| row.name == *name)
                 .expect(name);
-            let inst = Inst::from_parts(
+            let inst = Inst::from_encoding(
                 arch,
                 row.op,
                 row.form,
+                row.variant,
                 FormFields::None,
                 smallvec::SmallVec::from_vec(operands.clone()),
                 Modifiers::default(),
@@ -1364,10 +1365,11 @@ mod tests {
                 .iter()
                 .find(|row| row.name == name)
                 .expect(name);
-            Inst::from_parts(
+            Inst::from_encoding(
                 arch,
                 row.op,
                 row.form,
+                row.variant,
                 FormFields::None,
                 SmallVec::from_vec(operands),
                 Modifiers::default(),

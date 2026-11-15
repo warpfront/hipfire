@@ -31,7 +31,7 @@
 //   per thread with block = min(256, head_dim)).
 // - q_out must not alias `interleaved` (it never does: fa_q vs fa_q_full
 //   are distinct scratch planes); gate_out must alias neither input.
-// - The K norm, RoPE, and triattn tap stay exactly as before (K comes from
+// - The K norm and RoPE stay exactly as before (K comes from
 //   the K projection, not the deinterleaver, so it cannot fold here).
 //
 // Grid: [n_heads, N, 1]. Block: [min(256, head_dim)]. Shared: block floats.

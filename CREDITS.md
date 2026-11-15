@@ -47,7 +47,7 @@ miscredit. Click through for the canonical author list.
 | Paper | Relevance |
 |-------|-----------|
 | [DFlash (arXiv:2602.06036)](https://arxiv.org/abs/2602.06036) | Speculative-decode method that ships in `crates/engine/src/dflash.rs`. Target layer fusion, non-causal bidirectional attention within block, post-FFN residual hidden extraction. Our 9B / 27B DFlash perf headlines come from this. |
-| [DDTree (arXiv:2604.12989)](https://arxiv.org/abs/2604.12989) | Block-diffusion draft tree, best-first heap, ancestor-only verify mask. Algorithm 1 ships in `crates/engine/src/speculative.rs`; informed the Path C PRD and the gfx1100 tree-mode FA tuning. |
+| [DDTree (arXiv:2604.12989)](https://arxiv.org/abs/2604.12989) | Block-diffusion draft tree, best-first heap, ancestor-only verify mask. The tree-verify implementation informed the Path C PRD and the gfx1100 tree-mode FA tuning; it was removed in 0.5.0 (history only). |
 | [CACTUS (arXiv:2604.04987)](https://arxiv.org/abs/2604.04987) | KL-bumped acceptance threshold replacing Leviathan `min(1, q/p)`. Shipped as the `temp>0` rejection-acceptance path so DFlash on creative content is no longer penalized for the draft being distilled on argmax. |
 | [Fail-Fast drafting (arXiv:2512.20573)](https://arxiv.org/abs/2512.20573) | Per-block confidence-gated speculation length. Informs the A3B DFlash default-off gate and the dynamic draft-length policy that collapses to AR when the draft is uncertain. |
 | [MoBiLE (arXiv:2510.12357)](https://arxiv.org/abs/2510.12357) | Per-token big/little MoE expert switching. Frames the A3B 24 GB consumer-card OOM mitigation; the eviction-aware sidecar work tracks this paper. |
@@ -118,16 +118,12 @@ new PRs merge). Hand-edits inside the auto block will be overwritten.
 - #451: fix(gpu-lock): flock-based stale-proof GPU mutex
 - #453: fix(rccl): mark all_reduce_sum_f32 unsafe (clippy not_unsafe_ptr_arg_deref)
 - #359: perf: barrier-free gate_up + MoE grouped WMMA kernels (+43-53%)
-- #378: refactor(paro): remove default-off and unwired HIPFIRE_PARO_* env vars
 - #342: refactor(rdna-compute): decompose Gpu God Object — 12 domain files, 5 state structs
 - #349: feat: wire mtp_mode/mtp_k into global and per-model config
 - #348: fix(cli): add .mq2lloyd extension to listLocal and findModel
 - #337: Arch routing centralization -- ArchCaps atom/molecule/capability hierarchy (#328, task 2)
 - #334: feat: consolidate HIPFIRE_ env vars into FeatureFlags + RuntimeConfig structs (#328, task 1)
 - #330: perf(gfx1151): MQ4-Lloyd K4 prefill kernels (non-mb4 + mb4)
-- #319: ParoQuant batched prefill (Phases 0-4) + MQ4G128 LA gates + g256-perfmax + rebase repair
-- #318: feat(paroquant-moe): full hipGraph capture support for Qwen3.6-A3B-PARO (follow-up to #316 + #317)
-- #316: feat(paroquant): Qwen3.6-A3B-MoE working — KLD 0.93 → 0.09 (10×)
 - #317: fix(qwen35-moe): atomic-free MoE down for hipGraph determinism (task #100)
 - #240: Fix/nix deps
 - #214: feat(quantize): K-map alternating mode — same PPL, 17% smaller MoE (#196)

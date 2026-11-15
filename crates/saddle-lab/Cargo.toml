@@ -50,17 +50,11 @@ libc = "0.2"
 name = "hfq_split"
 required-features = []
 
-[[example]]
-name = "gpus_smoke"
-required-features = []
 
 [[example]]
 name = "infer_qwen35"
 required-features = ["arch-qwen35"]
 
-[[example]]
-name = "infer_qwen3"
-required-features = ["arch-llama"]
 
 [[example]]
 name = "infer_vl"
@@ -78,9 +72,6 @@ required-features = ["arch-llama"]
 name = "run"
 required-features = ["arch-qwen35", "deltanet"]
 
-[[example]]
-name = "a3b_load_check"
-required-features = ["arch-qwen35"]
 
 [[example]]
 name = "a3b_multiturn_oneshot"
@@ -143,10 +134,6 @@ name = "probe_argmax_agreement"
 required-features = ["arch-qwen35"]
 
 [[example]]
-name = "profile_attention_phases"
-required-features = ["arch-qwen35"]
-
-[[example]]
 name = "profile_bandwidth_fwd"
 required-features = ["arch-qwen35"]
 
@@ -178,13 +165,7 @@ required-features = ["arch-qwen35"]
 name = "test_long_ctx"
 required-features = ["arch-qwen35"]
 
-[[example]]
-name = "test_qwen35_load"
-required-features = ["arch-qwen35"]
 
-[[example]]
-name = "test_qwen35_loadQA"
-required-features = ["arch-qwen35"]
 
 [[example]]
 name = "test_forward_slots_golden"
@@ -197,26 +178,6 @@ required-features = ["arch-qwen35", "deltanet"]
 [[example]]
 name = "demo_concurrent_serve"
 required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "triattn_accuracy_sweep"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_decode_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_infer"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_longctx_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_periodic_demo"
-required-features = ["arch-qwen35"]
 
 [[example]]
 name = "pp_parity"

@@ -42,36 +42,6 @@ use hipfire_dispatch::pipeline::{GemvInput, RowsRoute};
 use hipfire_runtime::llama::EmbeddingFormat;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-// Opt-out for fusing the FFN activation and MagnumQuant G256 rotation.
-pub(crate) fn fused_silu_rotate_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_GLIMMER_FUSED_SILU_ROTATE").as_deref() != Ok("0")
-}
-
-/// `HIPFIRE_GLIMMER_WMMA_FULL=0` keeps batched attention on the F32 scalar
-/// kernels instead of the query-tiled F16 WMMA flash kernels (relative L2
-/// ~1e-3; greedy text measured identical on Muse Glimmer).
-pub(crate) fn wmma_flash_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_GLIMMER_WMMA_FULL")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(true)
-}
-
-// ───────────────────── Shared rotation gate ─────────────────────
-// HIPFIRE_GLIMMER_SHARED_ROT default ON (=1 or unset), =0 selects old path.
-// Mirrors Gemma4's attn_input_qkv and Qwen35's run_fa_layer_body precedent.
-pub(crate) fn shared_rot_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_GLIMMER_SHARED_ROT").as_deref() != Ok("0")
-}
-
-fn batched_lm_head_enabled() -> bool {
-    !matches!(
-        hipfire_config::developer_var("HIPFIRE_GLIMMER_BATCHED_LM_HEAD")
-            .ok()
-            .as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
 /// Chunk size for batched prefill: 192 for prompts >= 512 tokens, else 256.
 /// Overridable via `HIPFIRE_GLIMMER_PREFILL_CHUNK` (clamped to 1-512); the
 /// rationale for the split is on the function body below.
@@ -398,9 +368,8 @@ pub fn verify_block(
 ) -> Result<Vec<u32>, String> {
     if logits_out.is_some() && !glimmer_batched_logits_available(cfg, weights) {
         return Err(format!(
-            "glimmer verify_block: logits_out requires Q8 lm_head with batched path enabled (lm_head dtype {:?}, batched_lm_head_enabled={})",
-            weights.lm_head.gpu_dtype,
-            batched_lm_head_enabled()
+            "glimmer verify_block: logits_out requires a Q8/F32/BF16 lm_head (lm_head dtype {:?})",
+            weights.lm_head.gpu_dtype
         ));
     }
     let mut logits_sink = logits_out;
@@ -793,22 +762,20 @@ fn decode_step_capture_impl(
     body
 }
 
-/// True iff a `Some(logits_out)` request can be served (Q8/F32 lm_head + batched
-/// path enabled). Mirrors the exact condition used inside the function below.
+/// True iff a `Some(logits_out)` request can be served (Q8/F32/BF16 lm_head).
+/// Mirrors the exact condition used inside the function below.
 pub fn glimmer_batched_logits_available(cfg: &GlimmerConfig, weights: &GlimmerWeights) -> bool {
     let _ = cfg;
-    (weights.lm_head.gpu_dtype == DType::Q8_0
+    weights.lm_head.gpu_dtype == DType::Q8_0
         || weights.lm_head.gpu_dtype == DType::F32
-        || weights.lm_head.gpu_dtype == DType::BF16)
-        && batched_lm_head_enabled()
+        || weights.lm_head.gpu_dtype == DType::BF16
 }
 
 /// Shared lm_head routine for draft and verify. `hidden_batch` is [B*hidden]
 /// already RMSNormed (the lm_head input). Returns argmax picks for rows
-/// [0..batch) in order. Q8/F32/BF16 heads (batched path enabled) run one
-/// batched GEMM over all rows with one scale/softcap and a GPU batched argmax;
-/// every other head, or `HIPFIRE_GLIMMER_BATCHED_LM_HEAD=0`, runs the decode
-/// head per row. This is the single source of truth for draft and verify so
+/// [0..batch) in order. Q8/F32/BF16 heads run one batched GEMM over all rows
+/// with one scale/softcap and a GPU batched argmax; every other head runs the
+/// decode head per row. This is the single source of truth for draft and verify so
 /// they cannot diverge on near-ties due to different accumulation order (the
 /// Q8 vs per-row flip that halved tau on the Q8-head artifact).
 ///
@@ -842,9 +809,8 @@ pub fn glimmer_lm_head_picks(
     let batched = glimmer_batched_logits_available(cfg, weights);
     if logits_out.is_some() && !batched {
         return Err(format!(
-            "glimmer lm_head_picks: logits_out requires Q8/F32/BF16 lm_head with batched path enabled (lm_head dtype {:?}, batched_lm_head_enabled={})",
-            weights.lm_head.gpu_dtype,
-            batched_lm_head_enabled()
+            "glimmer lm_head_picks: logits_out requires a Q8/F32/BF16 lm_head (lm_head dtype {:?})",
+            weights.lm_head.gpu_dtype
         ));
     }
     let ctx = DispatchCtx::new(gpu);

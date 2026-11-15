@@ -1724,31 +1724,13 @@ mod tests {
 
     #[test]
     fn mq4_flags_map_to_quant_types() {
-        // codec mapping reachability: labels map via QuantType and GgufFormat
+        // codec mapping reachability: wire ids map via QuantType
         use crate::hfq::QuantType;
-        use crate::pipeline_gguf::GgufFormat;
-        assert_eq!(GgufFormat::from_flag("mq4"), Some(GgufFormat::Mq4V2));
-        assert_eq!(GgufFormat::from_flag("mq4v2"), Some(GgufFormat::Mq4V2));
-        assert_eq!(
-            GgufFormat::from_flag("mq4v2-lloyd"),
-            Some(GgufFormat::Mq4V2Lloyd)
-        );
-        assert_eq!(GgufFormat::from_flag("mq4l"), Some(GgufFormat::Mq4V2Lloyd));
-        assert_eq!(GgufFormat::from_flag("mq4c"), Some(GgufFormat::Mq4C));
-        assert_eq!(GgufFormat::from_flag("mq4v1"), Some(GgufFormat::Mq4));
-        assert_eq!(GgufFormat::from_flag("mq4g256v2"), Some(GgufFormat::Mq4V2));
-        assert_eq!(GgufFormat::from_flag("mq4cg256"), Some(GgufFormat::Mq4C));
         assert_eq!(QuantType::from_u8(44), Some(QuantType::MQ4G256V2));
         assert_eq!(QuantType::from_u8(45), Some(QuantType::MQ4CG256));
         assert_eq!(QuantType::MQ4G256V2 as u8, 44);
         assert_eq!(QuantType::MQ4CG256 as u8, 45);
         // new V2 family
-        assert_eq!(GgufFormat::from_flag("mq6v2"), Some(GgufFormat::Mq6V2));
-        assert_eq!(GgufFormat::from_flag("mq5v2"), Some(GgufFormat::Mq5V2));
-        assert_eq!(GgufFormat::from_flag("mq3v2"), Some(GgufFormat::Mq3V2));
-        assert_eq!(GgufFormat::from_flag("mq2v2"), Some(GgufFormat::Mq2V2));
-        assert_eq!(GgufFormat::from_flag("mq6g256v2"), Some(GgufFormat::Mq6V2));
-        assert_eq!(GgufFormat::from_flag("mq2g256v2"), Some(GgufFormat::Mq2V2));
         assert_eq!(QuantType::from_u8(47), Some(QuantType::MQ6G256V2));
         assert_eq!(QuantType::from_u8(48), Some(QuantType::MQ5G256V2));
         assert_eq!(QuantType::from_u8(49), Some(QuantType::MQ3G256V2));

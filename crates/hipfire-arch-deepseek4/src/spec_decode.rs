@@ -185,7 +185,7 @@ fn speculative_decode_impl(
     // Callers (MtpSpeculator) clamp k from remaining max_emit; max_emit==1 → k=0.
     if cfg.num_nextn_predict_layers == 0 || weights.mtp_layer.is_none() {
         return Err("speculative_decode_step: MTP layer not loaded — \
-            quantize with deepseek4-q8-mtp + addon, or set HIPFIRE_DEEPSEEK4_LOAD_MTP=1"
+            quantize with deepseek4-q8-mtp + addon and load with speculation.mtp enabled"
             .to_string());
     }
 

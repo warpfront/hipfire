@@ -36,7 +36,7 @@ is the shared `GatedMlp` op on its `Product` ladder
 |---|---|---|
 | `DeltaNetMixer` | `project` → `prepare` → `recur` → `gated_norm` → `output` | QKVZA scalar prep, conv + QK norm, conv scalar prep, compact QK (2:1, 3:1), FP32/Q8/Q8-compact/Q4 state, fused gated norm + MQ rotate |
 | `GatedAttention` | `project` → `attend` → `output` | fused FA prep, Q8 KV-write fold, TriAttention tap, compaction offset, (t, h, w) mrope, fused gate + MQ-rotate epilogue |
-| `GatedMlp` (`Product`) | `project` → `down` | `Residual`: MQ SiLU·rotate + SwiGLU-residual GEMV, HFQ residual GEMV, plain GEMV + add for the rotated formats (MFP4, MQ8, MQ4G128, ParoQ4G128, …), `memory.offload_exec=cpu` split. `Write` (dense-TP partial): SiLU·mul + plain GEMV |
+| `GatedMlp` (`Product`) | `project` → `down` | `Residual`: MQ SiLU·rotate + SwiGLU-residual GEMV, HFQ residual GEMV, plain GEMV + add for the rotated formats (MFP4, MQ8, MQ4G128, …), `memory.offload_exec=cpu` split. `Write` (dense-TP partial): SiLU·mul + plain GEMV |
 
 MoE layers call `moe_ffn_dispatch` (the sealed MoE program with its CPU
 expert splice).
@@ -130,13 +130,12 @@ The batched mixers of the MoE layers moved from `qwen35/prefill.rs` into
 
 | Executor | Body |
 |---|---|
-| `execute_deltanet_moe_layer_batched` | DeltaNet-MoE linear attention: norm (exact gfx1201 IU4 producer or FWHT), PARO / IU4-prepared / 6-bit / Q8 / low-bit / fused QKVZA projection, MoE chunk scan, fused GDN preamble or indexed Q/K or the legacy conv / QK-norm / repeat sequence, tree / sequential / chunked / lane-batched recurrence, gated norm and its gfx11/gfx12 quant producers, always-residual output projection; then the MoE FFN |
-| `attention_moe_prep_batched` | FA-MoE norm, PARO / IU4-prepared / fused / plain / mixed-format QKV projection, then the A3B native FP8 FA2 Q prep (gfx1201), or Q/K norm, TriAttention tap and the A3B F5 PM Q-prep or RoPE |
+| `execute_deltanet_moe_layer_batched` | DeltaNet-MoE linear attention: norm (exact gfx1201 IU4 producer or FWHT), IU4-prepared / 6-bit / Q8 / low-bit / fused QKVZA projection, MoE chunk scan, fused GDN preamble or indexed Q/K or the legacy conv / QK-norm / repeat sequence, tree / sequential / chunked / lane-batched recurrence, gated norm and its gfx11/gfx12 quant producers, always-residual output projection; then the MoE FFN |
+| `attention_moe_prep_batched` | FA-MoE norm, IU4-prepared / fused / plain / mixed-format QKV projection, then the A3B native FP8 FA2 Q prep (gfx1201), or Q/K norm, TriAttention tap and the A3B F5 PM Q-prep or RoPE |
 | `attention_moe_finish_batched` | KV write + attend (or the F5 PM direct attend), sigmoid gate, always-residual output projection (incl. the exact gfx1201 rotate producer); then the MoE FFN |
 | `execute_attention_moe_layer_batched` | FP8 Q-prep and F5 admission (FP8 wins), prep, finish, per-layer MoE trace span |
 
-Current-beta integration carries #913's explicit 128-channel Paro rotation
-arguments into the moved MoE executors. It also preserves #935's post-gate
+Current-beta integration preserves #935's post-gate
 QKV/alpha/beta tape copies: the DeltaNet-MoE binding forwards `tape_offset`
 to dispatch so DFlash/MTP rollback reads the same rows.
 
@@ -148,9 +147,7 @@ admission stays in the chunk loop, beside the dense one, and reaches the
 executor as a bool, as in slice 2.
 
 They stay separate executors from the dense ones: the output projection
-always accumulates into the residual, the PARO Givens arms rotate the
-un-rotated norm in `x_norm_batch` (now a `BatchScratch` field) by each
-projection's own tables, and the conv / QK-norm launch sequence differs, so
+always accumulates into the residual, and the conv / QK-norm launch sequence differs, so
 merging them would change numerics. MQ3G256 / MQ3-Lloyd projections are
 refused inside the executors as well as by the arch's MoE MQ3 guard.
 
@@ -189,7 +186,7 @@ gfx1151 has.
 that served three cases are deleted, and each case now runs the step program:
 
 - **DFlash hidden capture** (`forward_scratch_with_hidden`: the per-token
-  prefill fallback and the DDTree empty-tree step). A layer's hidden row is
+  prefill fallback). A layer's hidden row is
   written to the ring buffer once the layer is final, which on the deferred
   MoE combine (`moe_combine_next_rms_enabled`) is after the next layer's fused
   combine + norm.
@@ -209,8 +206,8 @@ that served three cases are deleted, and each case now runs the step program:
 
 `HIPFIRE_FORWARD_LOWERED` no longer affects Qwen3.5. The exact VMM slot route
 drops its refusal for it, and `scripts/forward-lowered-parity.sh` drops its
-Qwen3.5 rows. The variable keeps its `env-vars.md` row because llama, qwen2
-and deepseek4 still read it.
+Qwen3.5 rows. HIPF-396 later removed the variable for every family: decode
+always runs the lowered program.
 
 The MTP head (`mtp_head_forward_block_only_with_pos_buf`, every per-token
 draft and verify-tail caller) runs its decoder layer as the trunk's steps:
@@ -251,8 +248,8 @@ across requests). Their handlers delegate to the hybrid stages.
 - The MTP NextN prologue (embedding, `enorm`/`hnorm`, concat, `eh_proj`) and
   the batched MTP forward (`mtp_head_forward_block_batched`, with beta's fill
   changes `2053debf5`..`289dfb64f`: pitched D2D concat, KV-only fill, shared
-  K/V rotation, the exact PM GEMM). Its callers are the prompt fill
-  (`kv_only=true`) and `mtp_compose.rs` (`kv_only=false`).
+  K/V rotation, the exact PM GEMM). Its callers include the prompt fill
+  (`kv_only=true`).
 - The PP decode loop (`ep_batch::forward_scratch_layers_multi`, multi-GPU pp
   migration #58). Dense TP decode mixer and FFN partials run through the
   dispatch `MixerOutput::Write` and `GatedMlp` `Write` arms.
@@ -300,8 +297,7 @@ outstanding: a hiptrx runbook (`cb_vmm_state_oracle` k=1,2,3, a 27B DFlash
 serve A/B, and an A3B native FP8 prefill A/B beta vs stack) and a hipx row
 (27B DFlash with split verify). HIPF-119 (slice 3) adds the A3B/Ornith
 oracle rows, the sealed MoE oracle, the emulated EP route oracles, A3B MTP
-serve and PARO (Qwen3.5-35B-A3B-PARO stays per-token: its shared expert is
-F32; shisa-Qwen3.6-35B-A3B-PARO reaches the moved PARO arms). Its gfx1201-only
+serve. Its gfx1201-only
 routes (exact IU4 producers, fused GDN preamble, indexed Q/K, MoE chunk scan,
 A3B F5, the A3B native FP8 FA2 Q prep of the MoE attention) and the Q8 / 6-bit /
 low-bit / mixed-format attention arms have no gfx1151 fixture: the move is

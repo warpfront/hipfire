@@ -87,17 +87,13 @@ fn main() {
 
     // Force determinism knobs (mirror build_kld_ref_native_glimmer).
     // SAFETY: single-threaded init phase.
-    // No HIPFIRE_GLIMMER*GRAPH variable exists in crates/hipfire-arch-muse-glimmer/
-    // or crates/hipfire-runtime/ (grep HIPFIRE_GLIMMER*GRAPH returns nothing;
-    // unlike HIPFIRE_GEMMA4_GRAPH for gemma4). Only the two generic knobs are set.
-    // The Q8 KV allocator can be flipped via HIPFIRE_GLIMMER_KV_VMM; to keep the
-    // KLD invariant (identical KV quantization) we pin it to the same value the
-    // builder uses (VMM enabled = 1, the default when unset). See
-    // glimmer.rs:1864 `use_vmm = env != "0" unwrap_or(true)`.
+    // No HIPFIRE_GLIMMER*GRAPH variable exists; only the two generic knobs are
+    // set. The Q8 KV allocator is always VMM (`GlimmerState::new_with_max_seq`),
+    // the same as the builder, so the KLD invariant (identical KV quantization)
+    // holds.
     unsafe {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         std::env::set_var("HIPFIRE_GRAPH", "0");
-        std::env::set_var("HIPFIRE_GLIMMER_KV_VMM", "1");
     }
 
     // -------- validate the reference header BEFORE touching the GPU --------
@@ -178,8 +174,7 @@ fn main() {
     // allocates KvCache::new_gpu_q8 / new_gpu_q8_vmm_capped_filtered for both
     // caches (glimmer.rs:1870,1898,1909). kv_max = n_ctx + 16 mirrors the
     // builder so the two sides use IDENTICAL Q8 quantization — Q8 noise cancels
-    // and KLD isolates weight precision. The VMM allocator is pinned to 1 above
-    // so the two arms cannot silently differ via HIPFIRE_GLIMMER_KV_VMM.
+    // and KLD isolates weight precision.
     let kv_max = n_ctx + 16;
     let mut state =
         GlimmerState::new_with_max_seq(&mut gpu, &config, kv_max).expect("GlimmerState");

@@ -66,3 +66,18 @@ def test_untagged_version_section_is_editable(repo):
     text = RELEASED.replace("## v1.1.0", "## v1.2.0 — next\n- d\n\n## v1.1.0")
     _run(repo, text)
     assert _run(repo, text.replace("- d\n", "- d edited\n")) == 0
+
+
+def test_second_unreleased_heading_fails(repo):
+    top = "# Changelog\n\n## Unreleased\n- c\n\n## Unreleased\n- d\n\n"
+    assert _run(repo, RELEASED.replace("# Changelog\n\n", top)) == 1
+
+
+def test_duplicated_unreleased_entry_fails(repo):
+    top = "# Changelog\n\n## Unreleased\n\n### Fixes\n- c\n\n### Docs\n- c\n\n"
+    assert _run(repo, RELEASED.replace("# Changelog\n\n", top)) == 1
+
+
+def test_one_unreleased_section_with_distinct_entries_passes(repo):
+    top = "# Changelog\n\n## Unreleased\n- c\n\n### Fixes\n- d\n  - c\n\n"
+    assert _run(repo, RELEASED.replace("# Changelog\n\n", top)) == 0

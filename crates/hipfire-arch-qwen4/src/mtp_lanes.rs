@@ -379,6 +379,10 @@ pub(crate) fn ep_mesh_lane_floor_enabled() -> bool {
 
 const LANE_MAX_DRAFTS: usize = crate::gpu_forward_lanes::LANE_MAX_ROWS - 1;
 
+/// The gfx942 lane profile's static drafting depth ([`LaneCostProfile::gfx942`]):
+/// the C8 program's K = 3 window (4 verify rows per lane).
+const GFX942_LANE_STATIC_DEPTH: usize = 3;
+
 /// `HIPFIRE_QWEN4_LANE_COST` (developer; `0` opts out): the measured lane
 /// cost profile of an arch ([`LaneCostProfile::for_arch`]). Off, every arch
 /// runs the gfx1151-prior, store-pooled, probe-budget-retire lane floor
@@ -441,6 +445,9 @@ pub(crate) struct LaneCostProfile {
     /// Most verify rows one step may carry before its rows spill into a second
     /// once-over-all-rows group (0: the step's rows are not capped).
     step_rows: usize,
+    /// A static drafting depth every window of a lane takes (0: the floor and
+    /// the cost tables choose it). No floor, calibration or retirement runs.
+    static_depth: usize,
 }
 
 impl LaneCostProfile {
@@ -452,6 +459,7 @@ impl LaneCostProfile {
         retire_after: FLOOR_PROBE_WINDOWS,
         probe_tokens: 0,
         step_rows: 0,
+        static_depth: 0,
     };
 
     /// The gfx1201 (EP2 R9700) profile under the singleton's retire rules.
@@ -467,6 +475,26 @@ impl LaneCostProfile {
             } else {
                 0
             },
+            static_depth: 0,
+        }
+    }
+
+    /// The exact-gfx942 (MI300X) profile: a **static drafting depth of
+    /// [`GFX942_LANE_STATIC_DEPTH`] at every lane window**, no floor, no
+    /// calibration, no retirement. This is the C8 wide-verify program's
+    /// measured-cost row **placeholder**: it is replaced by the measured lane
+    /// cycle cost (the per-depth window price of the C8 lane step) once that
+    /// is published. The remaining fields are the legacy ones; they are inert
+    /// with the floor off.
+    pub(crate) fn gfx942() -> Self {
+        Self {
+            name: "gfx942",
+            prior_us: COST_PRIOR_US,
+            per_request: false,
+            retire_after: FLOOR_PROBE_WINDOWS,
+            probe_tokens: 0,
+            step_rows: 0,
+            static_depth: GFX942_LANE_STATIC_DEPTH,
         }
     }
 
@@ -485,6 +513,7 @@ impl LaneCostProfile {
     fn for_arch_with(arch: &str, enabled: bool) -> Self {
         match arch {
             "gfx1201" if enabled => Self::gfx1201(),
+            "gfx942" if enabled => Self::gfx942(),
             _ => Self::LEGACY,
         }
     }
@@ -566,6 +595,8 @@ impl LaneSpecPolicy {
     ) -> Self {
         let mut floor = profile.floor();
         floor.set_capacity(max_k);
+        // A static-depth profile runs no floor at all: nothing observes, prices or retires.
+        let floor_enabled = floor_enabled && profile.static_depth == 0;
         let floor = floor_with_call_log(floor, "lane", floor_enabled);
         Self {
             agreement,
@@ -699,6 +730,11 @@ impl LaneSpecPolicy {
             0 => LaneRoute::ArSynced,
             k_max => LaneRoute::Batched { k_max },
         };
+        // A static-depth profile (gfx942): every window drafts its depth, the
+        // floor and the tables never consulted.
+        if self.profile.static_depth > 0 {
+            return batched(self.profile.static_depth);
+        }
         if !self.floor_enabled {
             let static_depth = self.floor.provisional_depth(&self.agreement, k);
             let depth = match depth_costs {
@@ -1061,16 +1097,17 @@ pub(crate) fn lane_call<R>(
         .map_err(|error| error.to_string())
 }
 
-/// Whether one draft round of `ops` ops runs as ONE batched head call
-/// (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`, rows scratch allocated): 2..=8 ops, and
-/// no op reads a distribution the batched ranking does not leave in the head's
-/// shared logit row (`any_distribution_read` with a head that does not
-/// re-score; a re-scoring head's read is its host-resident candidates).
+/// Whether one draft round of `ops` ops runs batched (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`, rows
+/// scratch allocated): 2 or more ops, as [`forward_draft_rows`]' calls of at most the load's
+/// [`Qwen4Bundle::mtp_draft_call_rows`] lanes each (8; 32 on an exact single-device gfx942 load),
+/// and no op reads a distribution the
+/// batched ranking does not leave in the head's shared logit row (`any_distribution_read` with
+/// a head that does not re-score; a re-scoring head's read is its host-resident candidates).
 ///
 /// The decision must be the same on every EP rank (the head's gather parity
 /// advances once per batched call and once per op serially): it depends only
 /// on the root's plan, the process flag and the head's build, never on which
-/// rank owns the sampler.
+/// rank owns the sampler; the split into calls depends only on `ops`.
 pub(crate) fn draft_round_batchable(
     bundle: &Qwen4Bundle,
     ops: usize,
@@ -1091,13 +1128,50 @@ fn batchable_round(
     any_distribution_read: bool,
     rescored: bool,
 ) -> bool {
-    rows_ready
-        && (2..=crate::mtp_gpu::MTP_DRAFT_LANES_MAX).contains(&ops)
-        && (rescored || !any_distribution_read)
+    rows_ready && ops >= 2 && (rescored || !any_distribution_read)
 }
 
-/// The device work of one draft round as one batched head call: `ops[i]` is
-/// `(input token, position)` of `lanes[i]`; lane `i`'s result lands in slot
+/// The calls one batched round of `ops` (>= 2) lanes runs as: `ceil(ops / max)` contiguous
+/// slices of at most `max` lanes (`max >= 2`: the load's [`Qwen4Bundle::mtp_draft_call_rows`], or
+/// [`crate::mtp_gpu::MTP_DRAFT_LANES_MAX`] where only expert-parallel ranks reach it), sizes
+/// differing by at most one (larger first), so every slice carries at least two lanes. A lane's
+/// batched head step is byte-identical to its serial step whatever the other rows of its call
+/// are (the batched-round oracle, `lab_draft_rounds`), so the split moves no byte.
+pub(crate) fn draft_round_slices(
+    ops: usize,
+    max: usize,
+) -> impl Iterator<Item = std::ops::Range<usize>> {
+    debug_assert!(max >= 2, "a batched call takes at least two lanes");
+    let calls = ops.div_ceil(max).max(1);
+    let (base, extra) = (ops / calls, ops % calls);
+    (0..calls).scan(0usize, move |start, call| {
+        let len = base + usize::from(call < extra);
+        let range = *start..*start + len;
+        *start += len;
+        Some(range)
+    })
+}
+
+/// One batched draft round over `rows` (2 or more lanes): one
+/// `mtp_forward_rows_deferred` call per [`draft_round_slices`] slice, lane `i`'s result in
+/// slot `i` of `top1_out`. Every call is enqueued before any result is read: a lane's finish
+/// parses only its own slot (`draft_finish_request`).
+pub(crate) fn forward_draft_rows(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    rows: &mut [crate::mtp_gpu::DraftRow<'_>],
+    top1_out: &GpuTensor,
+) -> Result<(), BundleError> {
+    let slot = Gpu::TOPK8_OUT_BYTES;
+    for slice in draft_round_slices(rows.len(), bundle.mtp_draft_call_rows()) {
+        let out = top1_out.sub_offset(slice.start * slot, slice.len() * slot);
+        bundle.mtp_forward_rows_deferred(gpu, &mut rows[slice], &out)?;
+    }
+    Ok(())
+}
+
+/// The device work of one draft round as batched head calls ([`forward_draft_rows`]): `ops[i]`
+/// is `(input token, position)` of `lanes[i]`; lane `i`'s result lands in slot
 /// `i` of `top1_out`. Each lane's own head state and draft request state are
 /// passed in place (nothing is swapped); the step is the lane's `j`-th draft
 /// (`j = position - window.position`), fresh selection exactly at `j == 0`.
@@ -1134,8 +1208,7 @@ pub(crate) fn enqueue_batched_draft(
             fresh_qsa_selection: j == 0,
         });
     }
-    bundle
-        .mtp_forward_rows_deferred(gpu, &mut rows, top1_out)
+    forward_draft_rows(bundle, gpu, &mut rows, top1_out)
         .map_err(|e| format!("batched draft step: {e}"))
 }
 
@@ -1160,20 +1233,76 @@ pub(crate) fn finish_batched_draft(
 
 #[cfg(test)]
 mod batched_draft_tests {
-    use super::batchable_round;
+    use super::{batchable_round, draft_round_slices};
 
     #[test]
-    fn batched_round_needs_two_to_eight_ops_and_the_rows_scratch() {
-        for ops in [0, 1, 9, 16] {
+    fn batched_round_needs_two_ops_and_the_rows_scratch() {
+        for ops in [0, 1] {
             assert!(!batchable_round(ops, true, false, true), "{ops} ops");
         }
-        for ops in 2..=8 {
+        for ops in 2..=64 {
             assert!(batchable_round(ops, true, false, true), "{ops} ops");
             assert!(
                 !batchable_round(ops, false, false, true),
                 "{ops} ops, no scratch"
             );
         }
+    }
+
+    #[test]
+    fn round_slices_cover_the_ops_in_calls_of_two_to_max_lanes() {
+        use crate::mtp_gpu::{MTP_DRAFT_LANES_MAX, MTP_DRAFT_LANES_MAX_GFX942};
+        for max in [MTP_DRAFT_LANES_MAX, MTP_DRAFT_LANES_MAX_GFX942] {
+            for ops in 2..=256 {
+                let slices: Vec<_> = draft_round_slices(ops, max).collect();
+                assert_eq!(slices.len(), ops.div_ceil(max), "max {max}, {ops} ops");
+                let mut next = 0;
+                for slice in &slices {
+                    assert_eq!(slice.start, next, "max {max}, {ops} ops: contiguous");
+                    assert!(
+                        (2..=max).contains(&slice.len()),
+                        "max {max}, {ops} ops: {slice:?}"
+                    );
+                    next = slice.end;
+                }
+                assert_eq!(next, ops, "max {max}, {ops} ops: covered");
+                let lens: Vec<usize> = slices.iter().map(|s| s.len()).collect();
+                assert!(
+                    lens.windows(2).all(|w| w[0] >= w[1] && w[0] - w[1] <= 1),
+                    "max {max}, {ops}: {lens:?}"
+                );
+            }
+            // At most `max` lanes: one call over the whole round.
+            for ops in 2..=max {
+                assert_eq!(
+                    draft_round_slices(ops, max).collect::<Vec<_>>(),
+                    vec![0..ops],
+                    "max {max}, {ops} ops"
+                );
+            }
+        }
+        // Default width: a 32-lane round is four calls of eight.
+        assert_eq!(
+            draft_round_slices(32, MTP_DRAFT_LANES_MAX).collect::<Vec<_>>(),
+            vec![0..8, 8..16, 16..24, 24..32]
+        );
+        assert_eq!(
+            draft_round_slices(9, MTP_DRAFT_LANES_MAX).collect::<Vec<_>>(),
+            vec![0..5, 5..9]
+        );
+        // Exact single-device gfx942: 32 lanes are ONE call; 33 split 17 + 16; 64 split 32 + 32.
+        assert_eq!(
+            draft_round_slices(32, MTP_DRAFT_LANES_MAX_GFX942).collect::<Vec<_>>(),
+            vec![0..32]
+        );
+        assert_eq!(
+            draft_round_slices(33, MTP_DRAFT_LANES_MAX_GFX942).collect::<Vec<_>>(),
+            vec![0..17, 17..33]
+        );
+        assert_eq!(
+            draft_round_slices(64, MTP_DRAFT_LANES_MAX_GFX942).collect::<Vec<_>>(),
+            vec![0..32, 32..64]
+        );
     }
 
     #[test]
@@ -1628,6 +1757,11 @@ pub(crate) fn prefill_tile(
 /// (as the serial tile's forward has by the time its head fill runs); the head must still be at
 /// the tile's start. The trunk ids are not reused (`reuse_trunk_ids = false`: the wave's token
 /// ids are the whole burst's, the head uploads the chunk's own, the same bytes).
+///
+/// A wave of two or more MTP lanes on the exact gfx942 single-device route fills every lane's
+/// head with one [`fill_heads_after_wave`] instead (see [`wave_heads_batchable`]); this
+/// per-lane fill stays the route of every other wave, and the serial chunk the batched one is
+/// byte-identical to.
 pub(crate) fn fill_head_after_wave(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
@@ -1675,6 +1809,248 @@ pub(crate) fn fill_head_after_wave(
         }
     }))
     .map_err(|e| format!("fill_head_after_wave: {e}"))
+}
+
+/// One MTP lane of a prefill wave whose head fill [`fill_heads_after_wave`] runs: the lane, its
+/// tile's `tokens` and the first row of its tile in the wave's wide-hidden capture (the per-lane
+/// arguments of [`fill_head_after_wave`]).
+pub(crate) struct WaveHeadFill<'a> {
+    pub(crate) lane: &'a mut Qwen4LaneState,
+    pub(crate) tokens: &'a [u32],
+    pub(crate) hidden_row0: usize,
+}
+
+/// Whether a wave's head fills run as one [`fill_heads_after_wave`] instead of one
+/// [`fill_head_after_wave`] per lane: the wave is the exact gfx942 single-device one
+/// (`g942_wave::wave_applies`), the head has the batched rows scratch
+/// ([`Qwen4Bundle::mtp_rows_ready`]), at least two MTP lanes filled, and no append scratch (the
+/// route on which the serial fill's chunk is the per-row Append, which is what the batched fill
+/// reproduces; the scratch exists on exact gfx1151 / gfx1201 only, never under a gfx942 wave).
+pub(crate) fn wave_heads_batchable(
+    gpu: &Gpu,
+    bundle: &Qwen4Bundle,
+    mtp_lanes: usize,
+    append_scratch: bool,
+) -> bool {
+    batchable_wave_heads(
+        crate::lane_exec::g942_wave::wave_applies(gpu, bundle),
+        bundle.mtp_rows_ready(),
+        mtp_lanes,
+        append_scratch,
+    )
+}
+
+/// [`wave_heads_batchable`]'s pure rule.
+fn batchable_wave_heads(
+    wave: bool,
+    rows_ready: bool,
+    mtp_lanes: usize,
+    append_scratch: bool,
+) -> bool {
+    wave && rows_ready && mtp_lanes >= 2 && !append_scratch
+}
+
+/// [`fill_head_after_wave`] for every MTP lane of one prefill wave at once. Each lane's head,
+/// pending hidden and draft request state end byte-identical to the serial fill's.
+///
+/// The serial fill (no append scratch route, [`wave_heads_batchable`]) is
+/// `mtp_append_prefill_chunk`'s per-row loop: one `mtp_append_token` per row (`MtpStep::Append`:
+/// no MoE, no draft head, no wide-hidden copy) with the lane's `pending` as the backbone hidden,
+/// `pending` moved onto the row's own capture row after each. Here row `j` of every lane that
+/// has one is one batched Append (`Qwen4Bundle::mtp_forward_rows_append`, each lane on its own
+/// head state and draft request state, [`draft_round_slices`] of at most the load's
+/// [`Qwen4Bundle::mtp_draft_call_rows`] lanes), at the lane's head position `start + j` with the
+/// lane's token `j`, and the pairing is the serial loop's (token `p` with the target hidden of
+/// `p - 1`): row 0 takes the lane's `pending_hidden`, except at prompt position 0, which takes
+/// its own capture row (the serial loop copies it into `pending` first), and row `j > 0` takes
+/// capture row `hidden_row0 + j - 1`. Those are the bytes `pending` holds at that row in the
+/// serial loop, and nothing else reads `pending` in between, so the only write owed is the
+/// serial loop's last one: each lane's `pending_hidden` ends on its last capture row.
+///
+/// A call needs two lanes at least: once a single lane has rows left, those rows run as
+/// `mtp_append_prefill_chunk` over the rest of its tile (the serial fill itself, after `pending`
+/// took the hidden of the row before) under `with_lane`. The head Append reads nothing `with_lane`
+/// swaps in besides the head state and draft request (never the trunk state, the session cache
+/// or `lane_scope`), so the batched rows pass the lanes' states in place, as
+/// [`enqueue_batched_draft`] does; `poll_npu_trunk` and the empty PLE lookahead, which every serial
+/// fill's scope runs first (the first only advances the NPU executor's pending completions, the
+/// second clears a best-effort prefetch hint), run once up front. I1 is checked for every lane
+/// before any head is touched; the head QSA mapping through the tile's end is provisioning's
+/// (`provision_lane_maps`), each call's own mapping check finds it in place.
+pub(crate) fn fill_heads_after_wave(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    fills: &mut [WaveHeadFill<'_>],
+) -> Result<(), String> {
+    let wide = bundle
+        .config
+        .hc_count
+        .checked_mul(bundle.config.hidden_size)
+        .ok_or_else(|| "fill_heads_after_wave: hidden width overflow".to_string())?;
+    for fill in fills.iter() {
+        let Qwen4LaneState { host, state, spec } = &*fill.lane;
+        let spec = spec
+            .as_ref()
+            .ok_or_else(|| "fill_heads_after_wave: lane has no MTP state".to_string())?;
+        let start = host.prefilled;
+        let end = start + fill.tokens.len();
+        if state.position != end || spec.head.position() != start {
+            return Err(format!(
+                "fill_heads_after_wave: I1: trunk position {} (want {end}), head position {} (want {start})",
+                state.position,
+                spec.head.position()
+            ));
+        }
+    }
+    // The wave's capture, as a view: the bundle is borrowed mutably by every call below.
+    let capture = bundle
+        .spec_hidden
+        .as_ref()
+        .map(|hidden| hidden.sub_offset(0, hidden.numel()))
+        .ok_or_else(|| "fill_heads_after_wave: no wide-hidden capture".to_string())?;
+    for fill in fills.iter() {
+        let outside = fill
+            .hidden_row0
+            .checked_add(fill.tokens.len())
+            .and_then(|rows| rows.checked_mul(wide))
+            .is_none_or(|end| end > capture.numel());
+        if outside {
+            return Err("fill_heads_after_wave: a tile's rows are outside the capture".to_string());
+        }
+    }
+    bundle
+        .poll_npu_trunk(gpu)
+        .map_err(|e| format!("fill_heads_after_wave: {e}"))?;
+    // Every serial fill's `with_lane` scope names no lookahead tokens (a best-effort PLE
+    // prefetch hint, bytes unchanged); the batched rows leave no lane's scope to do it.
+    bundle.set_ple_lookahead(&[]);
+    let call_rows = bundle.mtp_draft_call_rows();
+    let rows_max = fills
+        .iter()
+        .map(|fill| fill.tokens.len())
+        .max()
+        .unwrap_or(0);
+    // The lane the rows run out on (every other lane's tile is shorter), finished serially.
+    let mut serial_tail = None;
+    for row in 0..rows_max {
+        let Some(first) = fills.iter().position(|fill| fill.tokens.len() > row) else {
+            break;
+        };
+        if fills.iter().filter(|fill| fill.tokens.len() > row).count() < 2 {
+            fill_rows_serially(bundle, gpu, &mut fills[first], row)?;
+            serial_tail = Some(first);
+            break;
+        }
+        let backbones: Vec<Option<GpuTensor>> = fills
+            .iter()
+            .filter(|fill| fill.tokens.len() > row)
+            .map(|fill| match (row, fill.lane.host.prefilled) {
+                // Prompt position 0 has no predecessor: it takes its own hidden.
+                (0, 0) => Some(capture.sub_offset(fill.hidden_row0 * wide, wide)),
+                // The tile's first row pairs with `pending` (the previous tile's last row).
+                (0, _) => None,
+                // Row `j` pairs with the target hidden of row `j - 1`.
+                _ => Some(capture.sub_offset((fill.hidden_row0 + row - 1) * wide, wide)),
+            })
+            .collect();
+        let mut rows: Vec<crate::mtp_gpu::DraftRow<'_>> = Vec::with_capacity(backbones.len());
+        for (fill, backbone) in fills
+            .iter_mut()
+            .filter(|fill| fill.tokens.len() > row)
+            .zip(&backbones)
+        {
+            let Qwen4LaneState { host, spec, .. } = &mut *fill.lane;
+            let LaneSpec {
+                head,
+                draft,
+                pending_hidden,
+                ..
+            } = spec
+                .as_mut()
+                .ok_or_else(|| "fill_heads_after_wave: lane has no MTP state".to_string())?;
+            rows.push(crate::mtp_gpu::DraftRow {
+                state: head,
+                request: draft,
+                token: fill.tokens[row],
+                backbone_hidden: Some(backbone.as_ref().unwrap_or(&*pending_hidden)),
+                position: host.prefilled + row,
+                fresh_qsa_selection: true,
+            });
+        }
+        for slice in draft_round_slices(rows.len(), call_rows) {
+            bundle
+                .mtp_forward_rows_append(gpu, &mut rows[slice])
+                .map_err(|e| format!("fill_heads_after_wave: row {row}: {e}"))?;
+        }
+    }
+    // The serial loop's last write: `pending` on the tile's last row (the serial tail's own
+    // loop already ended there).
+    for (index, fill) in fills.iter().enumerate() {
+        if serial_tail == Some(index) || fill.tokens.is_empty() {
+            continue;
+        }
+        let spec = fill
+            .lane
+            .spec
+            .as_ref()
+            .ok_or_else(|| "fill_heads_after_wave: lane has no MTP state".to_string())?;
+        bundle
+            .copy_spec_hidden_row_to(
+                gpu,
+                fill.hidden_row0 + fill.tokens.len() - 1,
+                &spec.pending_hidden,
+            )
+            .map_err(|e| format!("fill_heads_after_wave: pending hidden copy: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The rows `row..` of a wave lane's tile as the serial fill runs them: `pending` takes the
+/// target hidden of row `row - 1` (what the serial loop leaves it as after that row), then
+/// `mtp_append_prefill_chunk` over the rest of the tile in the lane's `with_lane` scope, which
+/// also ends with `pending` on the tile's last row.
+fn fill_rows_serially(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    fill: &mut WaveHeadFill<'_>,
+    row: usize,
+) -> Result<(), String> {
+    let (tokens, hidden_row0) = (fill.tokens, fill.hidden_row0);
+    let Qwen4LaneState { host, state, spec } = &mut *fill.lane;
+    let LaneSpec {
+        head,
+        draft,
+        pending_hidden,
+        ..
+    } = spec
+        .as_mut()
+        .ok_or_else(|| "fill_heads_after_wave: lane has no MTP state".to_string())?;
+    let start = host.prefilled;
+    if row > 0 {
+        bundle
+            .copy_spec_hidden_row_to(gpu, hidden_row0 + row - 1, pending_hidden)
+            .map_err(|e| format!("fill_heads_after_wave: pending hidden copy: {e}"))?;
+    }
+    lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+        b.poll_npu_trunk(gpu)?;
+        match mtp_append_prefill_chunk(
+            b,
+            &mut Qwen4Ops::Single(&mut *gpu),
+            &tokens[row..],
+            start + row,
+            hidden_row0 + row,
+            pending_hidden,
+            None,
+            false,
+            &|| false,
+        )
+        .map_err(BundleError::Forward)?
+        {
+            std::ops::ControlFlow::Continue(()) => Ok(()),
+            std::ops::ControlFlow::Break(()) => unreachable!("a never-abort fill cannot break"),
+        }
+    }))
+    .map_err(|e| format!("fill_heads_after_wave: {e}"))
 }
 
 /// The depth in `1..=k` with the most expected tokens per [`MTP_WINDOW_COST`]
@@ -1792,6 +2168,97 @@ mod tests {
         // The serial tile pairs with the same append (through `mtp_prefill_chunk`).
         assert!(fn_body(LANES_SRC, "prefill_tile").contains("mtp_prefill_chunk("));
         assert!(SPEC_SRC.contains("pub(crate) fn mtp_append_prefill_chunk("));
+    }
+
+    /// `src` from `head` through the end of that item (`\n}\n`).
+    fn item<'a>(src: &'a str, head: &str) -> &'a str {
+        let rest = &src[src.find(head).unwrap_or_else(|| panic!("{head} missing"))..];
+        &rest[..rest.find("\n}\n").expect("item end")]
+    }
+
+    /// The batched wave head fill is the serial fill's per-row Append, row by row across the
+    /// lanes: one batched Append (`MtpStep::Append`, never a Predict round: no draft head, no
+    /// MoE, no wide-hidden copy) per row over the lanes that have it, sliced to the load's call
+    /// width, with the serial loop's pairing (row 0 `pending`, position 0 its own capture row,
+    /// row `j` capture row `j - 1`) and its last `pending` write; I1 for every lane first; the
+    /// lane left alone finishes through the serial chunk itself.
+    #[test]
+    fn wave_heads_fill_is_the_serial_fill_row_by_row_in_append_mode() {
+        let body = fn_body(LANES_SRC, "fill_heads_after_wave");
+        for needed in [
+            "state.position != end || spec.head.position() != start",
+            "bundle.mtp_draft_call_rows()",
+            "draft_round_slices(rows.len(), call_rows)",
+            "mtp_forward_rows_append(gpu, &mut rows[slice])",
+            "fill_rows_serially(bundle, gpu, &mut fills[first], row)",
+            "(0, 0) => Some(capture.sub_offset(fill.hidden_row0 * wide, wide))",
+            "(0, _) => None",
+            "Some(capture.sub_offset((fill.hidden_row0 + row - 1) * wide, wide))",
+            "backbone_hidden: Some(backbone.as_ref().unwrap_or(&*pending_hidden))",
+            "position: host.prefilled + row,",
+            "token: fill.tokens[row],",
+            "copy_spec_hidden_row_to(",
+            "fill.hidden_row0 + fill.tokens.len() - 1",
+            ".poll_npu_trunk(gpu)",
+            "bundle.set_ple_lookahead(&[]);",
+        ] {
+            assert!(body.contains(needed), "fill_heads_after_wave: {needed}");
+        }
+        // I1 is checked for every lane before the first call touches a head.
+        assert!(body.find("I1:").unwrap() < body.find("mtp_forward_rows_append(").unwrap());
+        for not_append in [
+            "forward_rows_deferred",
+            "enqueue_batched_draft(",
+            "forward_draft_rows(",
+            "draft_finish",
+            "mtp_prefill_chunk(",
+            "ops_prefill_rows",
+            "spec_prefill_rows",
+            "forward_chunk",
+            "with_lane(",
+        ] {
+            assert!(
+                !body.contains(not_append),
+                "the batched head fill is Append only, on the lanes' own states: {not_append}"
+            );
+        }
+        let tail = item(LANES_SRC, "fn fill_rows_serially(");
+        for needed in [
+            "copy_spec_hidden_row_to(gpu, hidden_row0 + row - 1, pending_hidden)",
+            "bundle.with_lane(state, Some((head, draft))",
+            "mtp_append_prefill_chunk(",
+            "&tokens[row..],",
+            "start + row,",
+            "hidden_row0 + row,",
+            "None,\n            false,\n            &|| false,",
+        ] {
+            assert!(tail.contains(needed), "fill_rows_serially: {needed}");
+        }
+        // The per-lane fill stays the route of every wave the batched one does not take.
+        assert!(fn_body(LANES_SRC, "fill_head_after_wave").contains("mtp_append_prefill_chunk("));
+    }
+
+    /// The batched fill needs the exact gfx942 wave, the rows scratch, two MTP lanes and the
+    /// serial fill's per-row route (no append scratch).
+    #[test]
+    fn wave_heads_batch_only_on_the_gfx942_wave_with_two_lanes_and_no_append_scratch() {
+        use super::batchable_wave_heads;
+        assert!(batchable_wave_heads(true, true, 2, false));
+        assert!(batchable_wave_heads(true, true, 32, false));
+        assert!(
+            !batchable_wave_heads(false, true, 32, false),
+            "not a gfx942 wave"
+        );
+        assert!(
+            !batchable_wave_heads(true, false, 32, false),
+            "no rows scratch"
+        );
+        assert!(!batchable_wave_heads(true, true, 1, false), "one lane");
+        assert!(!batchable_wave_heads(true, true, 0, false));
+        assert!(
+            !batchable_wave_heads(true, true, 32, true),
+            "append scratch route"
+        );
     }
 
     #[test]
@@ -2488,7 +2955,9 @@ mod tests {
 
     #[test]
     fn profiles_follow_the_arch_and_gfx1151_stays_legacy() {
-        for arch in ["gfx1151", "gfx1100", "gfx1200", "gfx942", "", "gfx1201x"] {
+        for arch in [
+            "gfx1151", "gfx1100", "gfx1200", "", "gfx1201x", "gfx940", "gfx9420",
+        ] {
             assert_eq!(
                 LaneCostProfile::for_arch_with(arch, true),
                 LaneCostProfile::LEGACY,
@@ -2510,6 +2979,39 @@ mod tests {
         let own = lane.cost.as_ref().expect("per-request fit");
         assert_eq!(fit_array(own), COST_PRIOR_GFX1201_US);
         assert_eq!(own.observed(), 0);
+    }
+
+    #[test]
+    fn gfx942_lanes_draft_a_static_depth_three_with_no_floor() {
+        let p = LaneCostProfile::for_arch_with("gfx942", true);
+        assert_eq!(p.name(), "gfx942");
+        assert_eq!(p.static_depth, 3);
+        // The kill switch (HIPFIRE_QWEN4_LANE_COST=0) is the legacy floor.
+        assert_eq!(
+            LaneCostProfile::for_arch_with("gfx942", false),
+            LaneCostProfile::LEGACY
+        );
+        // Even with the floor requested, no floor runs and every window drafts 3.
+        let mut policy = LaneSpecPolicy::with_profile(7, true, &p);
+        assert!(!policy.floor_enabled && !policy.retired());
+        for _ in 0..40 {
+            assert_eq!(
+                policy.route(7, LabRoutes::Floor, None),
+                LaneRoute::Batched { k_max: 3 }
+            );
+        }
+        // The window budget still caps it; a zero budget is an AR window.
+        assert_eq!(
+            policy.route(2, LabRoutes::Floor, None),
+            LaneRoute::Batched { k_max: 2 }
+        );
+        assert_eq!(policy.route(0, LabRoutes::Floor, None), LaneRoute::ArSynced);
+        // A lane capped at two drafts (k = 2) never exceeds its own capacity.
+        let mut small = LaneSpecPolicy::with_profile(2, true, &p);
+        assert_eq!(
+            small.route(7, LabRoutes::Floor, None),
+            LaneRoute::Batched { k_max: 2 }
+        );
     }
 
     #[test]

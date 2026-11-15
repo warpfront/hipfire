@@ -332,12 +332,9 @@ fn main() {
     }
     .expect("load weights");
 
-    // KV cache sized for prompt + max_gen + headroom. Use asym3 (KV
-    // 5.5x compressed) for the bigger models to keep each smoke under
-    // a single 32 GB R9700 budget. asym3 is the daemon default for 27B
-    // and A3B per the existing config.
+    // KV cache sized for prompt + max_gen + headroom. Use Q8 KV.
     let kv_seq = (prompt_tokens.len() + max_gen + 64).max(2048);
-    let mut kv_cache = KvCache::new_gpu_asym3(
+    let mut kv_cache = KvCache::new_gpu_q8(
         &mut gpu,
         config.n_layers,
         config.n_kv_heads,

@@ -21,6 +21,7 @@ peacemaker-isa = { path = "../peacemaker-isa" }
 peacemaker-author = { path = "../peacemaker-author" }
 peacemaker-lift = { path = "../peacemaker-lift" }
 peacemaker-ir = { path = "../peacemaker-ir" }
+peacemaker-cdna = { path = "../peacemaker-cdna" }
 syn = { version = "2", features = ["full", "visit-mut"] }
 quote = "1"
 proc-macro2 = { version = "1", features = ["span-locations"] }

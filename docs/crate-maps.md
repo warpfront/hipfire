@@ -16,7 +16,7 @@ restate what existing docs already own:
   never re-draws the DAG or re-lists the workspace.
 - [`GLOSSARY.md`](GLOSSARY.md) owns named subsystems and the status
   vocabulary `production` / `research` / `legacy`. Maps reuse exactly that
-  vocabulary for crate status; they do not redefine DFlash, PFlash, etc.
+  vocabulary for crate status; they do not redefine DFlash, etc.
 - [`INDEX.md`](INDEX.md) owns doc lifecycle truth states
   (shipped / branch-implemented / measured / planned). Those are doc states,
   not crate maturity — keep the two vocabularies separate.

@@ -14,13 +14,17 @@
 //
 // One launch per block output (mixer out/o-proj K-partial, or the FFN partial = shared-down +
 // routed combine):
-//   (a) round this rank's f32 partial [rows, 2560] to bf16 and push it into the PEER's
-//       fine-grained VRAM mailbox bank `tag & 1` as 16-byte tagged granules {d0d1, tag, d2d3,
-//       tag} (system-scope write-through b128 stores, one shot);
+//   (a) push this rank's f32 partial [rows, 2560] into the PEER's fine-grained VRAM mailbox bank
+//       `tag & 1`, system-scope write-through stores, one shot. Two partial formats (P32):
+//       bf16 (`ar_hc_write_*`): each value rounded to bf16, for the FFN partial, which is already
+//       bf16-exact (`bf16_scaled_add` stores the bf16-rounded shared + routed sum), so the
+//       rounding is the identity and the wire carries half the bytes;
+//       f32 (`ar_hc_write_p32_*`): the value unrounded, for the mixer out-projection partial (a
+//       raw f32 GEMV output; one card rounds its full f32 K sum to bf16 once, in the HC write);
 //   (b) load this lane's stream words and the row gates while the push is in flight;
 //   (c) bounded poll of this rank's own mailbox for the peer's granules (same granule range);
-//   (d) fold in fixed rank order, `m = 0.0f + (first + second)` of the two bf16-rounded partials
-//       (identical bits on both ranks);
+//   (d) fold in fixed rank order, `m = 0.0f + (first + second)` of the two partials as they
+//       travel (identical bits on both ranks);
 //   (e) apply the production `hyper_write_bf16x2` arithmetic to the four BF16 streams in place:
 //       `stream' = bf16(bf16(gate * bf16(m)) + stream)`, gate from the row's four gate logits.
 //
@@ -45,29 +49,37 @@
 // (oracle only; null in every product launch).
 //
 // ---------------------------------------------------------------------------------------
-// Wire formats. Both are ABI-identical entries (`ar_hc_write_*` tagged, `ar_hc_write_d8_*`
-// dense). The host picks one PER LAUNCH from the row count (HIPFIRE_EP_AR_WIRE_DENSE, default
-// on: dense from 16 rows, tagged below; 0 = tagged always) and gives each wire its own
-// mailbox region, so a slot is only ever written and read under one format. The partial values,
-// their bf16 rounding, the fold order and the HC write are the same code in both; only what
-// travels through the mailbox differs.
+// Wire formats. ABI-identical entries per partial format: tagged (`ar_hc_write_*`,
+// `ar_hc_write_p32_*`) and dense (`ar_hc_write_d8_*`, `ar_hc_write_p32_d16_*`). The host picks one
+// PER LAUNCH from the row count (HIPFIRE_EP_AR_WIRE_DENSE, default on: dense from 16 rows,
+// tagged below; 0 = tagged always) and gives each wire its own mailbox region, so a slot is
+// only ever written and read under one format. The partial values, the fold order and the HC
+// write are the same code in both; only what travels through the mailbox differs.
 //
-// Dense wire. A granule is 8 bytes {d0d1, d2d3} (the four bf16 payload values, NO tag): half the
-// wire bytes of the tagged 16-byte granule. The measured bottleneck of a 256-row launch is the
-// posted-store bandwidth of the PCIe peer link (~40 GB/s per direction, independent of the
-// store width), so halving the bytes halves that term.
+// Tagged wire. A record pairs payload with the generation tag; it is accepted only when both
+// of its tags equal the launch's generation (each 8-byte {payload, tag} pair arrives as a unit).
+// bf16 partials: one 16-byte record {d0d1, tag, d2d3, tag} per granule of four values; f32
+// partials: two, {p0, tag, p1, tag} at record slot j and {p2, tag, p3, tag} at slot G + j (G =
+// granules of the launch: two planes, so the lanes of a wave store and poll contiguous 16-byte
+// slots; interleaved slots 2j / 2j + 1 cost a 13-row launch 23 us against 10 us on the bf16 wire,
+// half-coalesced posted stores).
+//
+// Dense wire. A granule is its payload alone, NO tag: 8 bytes {d0d1, d2d3} (bf16) or 16 bytes
+// {p0, p1, p2, p3} (f32), half the wire bytes of the tagged granule. The measured bottleneck of
+// a 256-row launch is the posted-store bandwidth of the PCIe peer link (~40 GB/s per direction,
+// independent of the store width), so halving the bytes halves that term.
 //   EMPTY = 0xFFFFFFFF. A mailbox dword is "valid" iff it is not EMPTY. The mailbox is EMPTY
 //   everywhere at load/reset (memset 0xFF), a producer stores payload dwords, the CONSUMER
-//   stores EMPTY back over every slot it consumed (one b64 store per granule, after its poll
+//   stores EMPTY back over every slot it consumed (one store per granule, after its poll
 //   succeeded and its payload sits in registers).
 // Why a reader never folds a torn or stale granule:
-//   1. Torn. A granule is accepted only when BOTH of its dwords are non-EMPTY, and each dword
+//   1. Torn. A granule is accepted only when ALL of its dwords are non-EMPTY, and each dword
 //      is validated on its own, so the argument needs only that a naturally aligned dword
 //      store (and the dword load of it) is single-copy atomic. That holds for the gfx12
 //      memory pipeline and for PCIe (a Memory Write TLP is dword-granular: every dword of a
 //      write lands whole or not at all; the ORDER in which the dwords of one TLP, or of two
 //      TLPs, become visible is unspecified and is not used). A b64/b128 store may be split
-//      or merged on the wire in any way; a half-visible granule has an EMPTY dword and is
+//      or merged on the wire in any way; a partly visible granule has an EMPTY dword and is
 //      not accepted. (The tagged wire instead relies on the 8-byte {payload, tag} pair
 //      arriving as a unit.) Tested with a hostile peer that stores dwords one at a time in
 //      both orders with a gap (ar_hc_write_tear_oracle).
@@ -82,16 +94,19 @@
 //      it in the same launch: the consumer re-arms only slots whose payload it has read. Two
 //      banks are still required: without them the peer's launch g+1 could store into a slot
 //      this rank's launch g has read but not yet re-armed, and the re-arm would erase it.
-//   3. Payload == EMPTY. A finite partial never rounds to bf16 0xFFFF (that is a NaN), so a
-//      payload dword is 0xFFFFFFFF only for a pair of NaNs; the producer remaps that dword
-//      to 0xFFFFFFFE (still a NaN pair): finite results are byte-identical, a NaN pair stays
-//      NaN (only its payload bits can differ from the tagged wire).
+//      Launches of the two partial formats share the dense region and the generation: the
+//      argument is per slot and per launch, whatever the slot size.
+//   3. Payload == EMPTY. 0xFFFFFFFF is an f32 NaN, or two bf16 NaNs (a finite partial never
+//      rounds to bf16 0xFFFF); the producer remaps a payload dword 0xFFFFFFFF to 0xFFFFFFFE
+//      (still NaN): finite results are byte-identical, a NaN stays NaN (only its payload bits
+//      can differ from the tagged wire).
 //   4. Abort. A timed-out wait leaves granules behind; the host resets both ranks (memset
 //      0xFF of the mailbox, zero generation) before the next launch, as for the tagged wire.
 // Contract kept from the tagged wire, one weaker consequence: both ranks must issue the same
-// launches with the same row counts. A peer that pushed MORE granules than this rank polled
-// leaves unread payload that a later launch of the same bank would accept (the tagged wire's
-// tag would reject it); a peer that pushed fewer makes this rank time out on both wires.
+// launches with the same row counts and partial format. A peer that pushed MORE granules than
+// this rank polled leaves unread payload that a later launch of the same bank would accept (the
+// tagged wire's tag would reject it); a peer that pushed fewer makes this rank time out on both
+// wires.
 
 #define AR_HC_KMAX 6
 #define AR_HC_HIDDEN 2560
@@ -99,12 +114,6 @@
 #define AR_HC_TICKET_WORD 16
 
 typedef unsigned int arhc_u4 __attribute__((ext_vector_type(4)));
-
-__device__ __forceinline__ unsigned arhc_bf16bits(float f) {
-    unsigned u = __float_as_uint(f);
-    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
-}
-__device__ __forceinline__ float arhc_bf16r(float f) { return __uint_as_float(arhc_bf16bits(f) << 16); }
 
 // float -> bf16 bits, bit-identical to `hip_bfloat16(v).data` for every one of the 2^32 inputs
 // (round to nearest even; Inf passes; a NaN keeps its upper bits and gets the low mantissa bit
@@ -211,23 +220,75 @@ __device__ __forceinline__ void arhc_load_batch<6>(arhc_u4 (&r)[6], const arhc_u
         : "v"(p[0]), "v"(p[1]), "v"(p[2]), "v"(p[3]), "v"(p[4]), "v"(p[5])
         : "memory");
 }
+// 8 / 10 / 12 records: the tagged wire's two records per granule at 4 / 5 / 6 granules per lane.
+template <>
+__device__ __forceinline__ void arhc_load_batch<8>(arhc_u4 (&r)[8], const arhc_u4 *const (&p)[8]) {
+    asm volatile(
+        "global_load_b128 %0, %8, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %1, %9, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %2, %10, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %3, %11, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %4, %12, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %5, %13, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %6, %14, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %7, %15, off scope:SCOPE_SYS\n\t"
+        "s_wait_loadcnt 0"
+        : "=&v"(r[0]), "=&v"(r[1]), "=&v"(r[2]), "=&v"(r[3]), "=&v"(r[4]), "=&v"(r[5]), "=&v"(r[6]),
+          "=&v"(r[7])
+        : "v"(p[0]), "v"(p[1]), "v"(p[2]), "v"(p[3]), "v"(p[4]), "v"(p[5]), "v"(p[6]), "v"(p[7])
+        : "memory");
+}
+template <>
+__device__ __forceinline__ void arhc_load_batch<10>(arhc_u4 (&r)[10], const arhc_u4 *const (&p)[10]) {
+    asm volatile(
+        "global_load_b128 %0, %10, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %1, %11, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %2, %12, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %3, %13, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %4, %14, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %5, %15, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %6, %16, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %7, %17, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %8, %18, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %9, %19, off scope:SCOPE_SYS\n\t"
+        "s_wait_loadcnt 0"
+        : "=&v"(r[0]), "=&v"(r[1]), "=&v"(r[2]), "=&v"(r[3]), "=&v"(r[4]), "=&v"(r[5]), "=&v"(r[6]),
+          "=&v"(r[7]), "=&v"(r[8]), "=&v"(r[9])
+        : "v"(p[0]), "v"(p[1]), "v"(p[2]), "v"(p[3]), "v"(p[4]), "v"(p[5]), "v"(p[6]), "v"(p[7]),
+          "v"(p[8]), "v"(p[9])
+        : "memory");
+}
+template <>
+__device__ __forceinline__ void arhc_load_batch<12>(arhc_u4 (&r)[12], const arhc_u4 *const (&p)[12]) {
+    asm volatile(
+        "global_load_b128 %0, %12, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %1, %13, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %2, %14, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %3, %15, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %4, %16, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %5, %17, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %6, %18, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %7, %19, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %8, %20, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %9, %21, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %10, %22, off scope:SCOPE_SYS\n\t"
+        "global_load_b128 %11, %23, off scope:SCOPE_SYS\n\t"
+        "s_wait_loadcnt 0"
+        : "=&v"(r[0]), "=&v"(r[1]), "=&v"(r[2]), "=&v"(r[3]), "=&v"(r[4]), "=&v"(r[5]), "=&v"(r[6]),
+          "=&v"(r[7]), "=&v"(r[8]), "=&v"(r[9]), "=&v"(r[10]), "=&v"(r[11])
+        : "v"(p[0]), "v"(p[1]), "v"(p[2]), "v"(p[3]), "v"(p[4]), "v"(p[5]), "v"(p[6]), "v"(p[7]),
+          "v"(p[8]), "v"(p[9]), "v"(p[10]), "v"(p[11])
+        : "memory");
+}
 
-// Dense wire: 8-byte granules {d0d1, d2d3} (4 bf16 values), NO tag. A slot is valid when neither
-// of its two dwords equals ARHC_EMPTY (all ones); the consumer re-arms what it read.
+// Dense wire: a slot is valid when none of its dwords equals ARHC_EMPTY (all ones); the consumer
+// re-arms what it read.
 #define ARHC_EMPTY 0xFFFFFFFFu
 typedef unsigned int arhc_u2 __attribute__((ext_vector_type(2)));
-template <bool DENSE>
-struct ArhcRec {
-    using type = arhc_u4;
-};
-template <>
-struct ArhcRec<true> {
-    using type = arhc_u2;
-};
 
-// A payload dword is never the EMPTY marker. Two bf16 payload halves of 0xFFFF are both NaNs
-// (a finite partial never rounds to bf16 0xFFFF), so the remap below changes only the payload
-// bits of a NaN pair and no finite value.
+// A payload dword is never the EMPTY marker. 0xFFFFFFFF is a NaN as an f32 and a pair of NaNs as
+// two bf16 halves (a finite partial never rounds to bf16 0xFFFF), so the remap below changes only
+// the payload bits of a NaN and no finite value.
 __device__ __forceinline__ unsigned arhc_nonempty(unsigned w) { return w == ARHC_EMPTY ? ARHC_EMPTY - 1u : w; }
 
 __device__ __forceinline__ void arhc_st64_sys(arhc_u2 *p, arhc_u2 v) {
@@ -308,6 +369,110 @@ __device__ __forceinline__ void arhc_load_batch64<6>(arhc_u2 (&r)[6], const arhc
         : "memory");
 }
 
+__device__ __forceinline__ unsigned arhc_bf16bits(float f) {
+    unsigned u = __float_as_uint(f);
+    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+}
+__device__ __forceinline__ float arhc_bf16r(float f) { return __uint_as_float(arhc_bf16bits(f) << 16); }
+
+// Mailbox records of one granule (four partial values) per wire and partial format (P32):
+//   bf16 partials, tagged: one 16-byte {d0d1, tag, d2d3, tag}  (d = bf16 bits, d0 in the low half)
+//   bf16 partials, dense:  one 8-byte {d0d1, d2d3}
+//   f32 partials, tagged:  two 16-byte {p0, tag, p1, tag}, {p2, tag, p3, tag} at record slots j, G + j
+//   f32 partials, dense:   one 16-byte {p0, p1, p2, p3}
+template <bool DENSE, bool P32>
+struct ArhcRec {
+    using type = arhc_u4;
+    static constexpr int recs = 1;
+};
+template <>
+struct ArhcRec<true, false> {
+    using type = arhc_u2;
+    static constexpr int recs = 1;
+};
+template <>
+struct ArhcRec<false, true> {
+    using type = arhc_u4;
+    static constexpr int recs = 2;
+};
+
+template <int N>
+__device__ __forceinline__ void arhc_load_recs(arhc_u4 (&r)[N], const arhc_u4 *const (&p)[N]) { arhc_load_batch<N>(r, p); }
+template <int N>
+__device__ __forceinline__ void arhc_load_recs(arhc_u2 (&r)[N], const arhc_u2 *const (&p)[N]) { arhc_load_batch64<N>(r, p); }
+
+// Push granule `j` (four f32 partial values) into the record array `pb`: bf16-rounded or f32.
+// `G`: granules of the launch (the second plane of the tagged f32 records starts at slot G).
+template <bool DENSE, bool P32>
+__device__ __forceinline__ void arhc_push(typename ArhcRec<DENSE, P32>::type *pb, int j, int G, const float (&v)[4], unsigned tag) {
+    if constexpr (P32 && DENSE) {
+        arhc_st128_sys(pb + j, arhc_u4{arhc_nonempty(__float_as_uint(v[0])), arhc_nonempty(__float_as_uint(v[1])),
+                                       arhc_nonempty(__float_as_uint(v[2])), arhc_nonempty(__float_as_uint(v[3]))});
+    } else if constexpr (P32) {
+        arhc_st128_sys(pb + j, arhc_u4{__float_as_uint(v[0]), tag, __float_as_uint(v[1]), tag});
+        arhc_st128_sys(pb + G + j, arhc_u4{__float_as_uint(v[2]), tag, __float_as_uint(v[3]), tag});
+    } else {
+        const unsigned w0 = arhc_bf16bits(v[0]) | (arhc_bf16bits(v[1]) << 16);
+        const unsigned w1 = arhc_bf16bits(v[2]) | (arhc_bf16bits(v[3]) << 16);
+        if constexpr (DENSE) {
+            arhc_st64_sys(pb + j, arhc_u2{arhc_nonempty(w0), arhc_nonempty(w1)});
+        } else {
+            arhc_st128_sys(pb + j, arhc_u4{w0, tag, w1, tag});
+        }
+    }
+}
+// Whether the records of one granule (`rec[0 .. recs)`) are all present.
+template <bool DENSE, bool P32>
+__device__ __forceinline__ bool arhc_valid(const typename ArhcRec<DENSE, P32>::type *rec, unsigned tag) {
+    if constexpr (P32 && DENSE) {
+        return (rec[0].x != ARHC_EMPTY) & (rec[0].y != ARHC_EMPTY) & (rec[0].z != ARHC_EMPTY) & (rec[0].w != ARHC_EMPTY);
+    } else if constexpr (P32) {
+        return (rec[0].y == tag) & (rec[0].w == tag) & (rec[1].y == tag) & (rec[1].w == tag);
+    } else if constexpr (DENSE) {
+        return (rec[0].x != ARHC_EMPTY) & (rec[0].y != ARHC_EMPTY);
+    } else {
+        return (rec[0].y == tag) & (rec[0].w == tag);
+    }
+}
+// The four peer partial values of one granule's records.
+template <bool DENSE, bool P32>
+__device__ __forceinline__ void arhc_unpack(const typename ArhcRec<DENSE, P32>::type *rec, float (&in)[4]) {
+    if constexpr (P32 && DENSE) {
+        in[0] = __uint_as_float(rec[0].x); in[1] = __uint_as_float(rec[0].y);
+        in[2] = __uint_as_float(rec[0].z); in[3] = __uint_as_float(rec[0].w);
+    } else if constexpr (P32) {
+        in[0] = __uint_as_float(rec[0].x); in[1] = __uint_as_float(rec[0].z);
+        in[2] = __uint_as_float(rec[1].x); in[3] = __uint_as_float(rec[1].z);
+    } else {
+        unsigned rw1;
+        if constexpr (DENSE) rw1 = rec[0].y; else rw1 = rec[0].z;
+        const unsigned rw0 = rec[0].x;
+        in[0] = __uint_as_float(rw0 << 16); in[1] = __uint_as_float(rw0 & 0xFFFF0000u);
+        in[2] = __uint_as_float(rw1 << 16); in[3] = __uint_as_float(rw1 & 0xFFFF0000u);
+    }
+}
+// Dense re-arm of granule `j` (its payload is already in registers).
+template <bool P32>
+__device__ __forceinline__ void arhc_rearm(typename ArhcRec<true, P32>::type *lb, int j) {
+    if constexpr (P32) {
+        arhc_st128_sys(lb + j, arhc_u4{ARHC_EMPTY, ARHC_EMPTY, ARHC_EMPTY, ARHC_EMPTY});
+    } else {
+        arhc_st64_sys(lb + j, arhc_u2{ARHC_EMPTY, ARHC_EMPTY});
+    }
+}
+// The fold of one element in fixed rank order, identical bits on both ranks:
+// `0.0f + (first + second)` of the two partials as they travel (the local one rounded to bf16 on
+// the bf16 wire, as the peer's arrived).
+template <bool P32>
+__device__ __forceinline__ float arhc_fold(float local, float in, int local_is_first) {
+    const float loc = P32 ? local : arhc_bf16r(local);
+    const float fi = local_is_first ? loc : in;
+    const float si = local_is_first ? in : loc;
+    float xi = 0.0f;
+    xi = xi + (fi + si);
+    return xi;
+}
+
 // Prefetched operands of one granule's HC write: the four branches' stream words at
 // [row, col, col + 4) and the row's four gates. They depend only on local data written by
 // earlier launches, so they load while the push is in flight; the apply step after the fold
@@ -385,11 +550,13 @@ __device__ __forceinline__ void arhc_apply(void *__restrict__ streams, int row, 
     for (int br = 0; br < 4; ++br) arhc_apply_br<F32S>(streams, row, col, br, p.w[br], p.g[br], m);
 }
 
-template <int K, bool F32S, bool DENSE>
+template <int K, bool F32S, bool DENSE, bool P32>
 __device__ __forceinline__ bool arhc_body(
     const float *__restrict__ part, void *__restrict__ streams, const float *__restrict__ gates,
     char *peer_mbox, const char *local_mbox, unsigned bank_stride, unsigned tag,
-    hf_device_wait_block *__restrict__ wb, int local_is_first, int g0, int g1, float *__restrict__ mixed_dbg) {
+    hf_device_wait_block *__restrict__ wb, int local_is_first, int g0, int g1, int G, float *__restrict__ mixed_dbg) {
+    using Rec = typename ArhcRec<DENSE, P32>::type;
+    constexpr int R = ArhcRec<DENSE, P32>::recs;
     const int tid = threadIdx.x, T = blockDim.x;
     float pv[K][4];
 #pragma unroll
@@ -401,28 +568,20 @@ __device__ __forceinline__ bool arhc_body(
         }
     }
     const unsigned bank = tag & 1u;
-    typename ArhcRec<DENSE>::type *pb = reinterpret_cast<typename ArhcRec<DENSE>::type *>(peer_mbox + bank * bank_stride);
-    const typename ArhcRec<DENSE>::type *lb =
-        reinterpret_cast<const typename ArhcRec<DENSE>::type *>(local_mbox + bank * bank_stride);
+    Rec *pb = reinterpret_cast<Rec *>(peer_mbox + bank * bank_stride);
+    const Rec *lb = reinterpret_cast<const Rec *>(local_mbox + bank * bank_stride);
 #pragma unroll
     for (int k = 0; k < K; ++k) {
         const int j = g0 + tid + k * T;
-        if (j < g1) {
-            const unsigned w0 = arhc_bf16bits(pv[k][0]) | (arhc_bf16bits(pv[k][1]) << 16);
-            const unsigned w1 = arhc_bf16bits(pv[k][2]) | (arhc_bf16bits(pv[k][3]) << 16);
-            if constexpr (DENSE) {
-                arhc_st64_sys(pb + j, arhc_u2{arhc_nonempty(w0), arhc_nonempty(w1)});
-            } else {
-                arhc_st128_sys(pb + j, arhc_u4{w0, tag, w1, tag});
-            }
-        }
+        if (j < g1) arhc_push<DENSE, P32>(pb, j, G, pv[k], tag);
     }
-    typename ArhcRec<DENSE>::type r[K];
-    const typename ArhcRec<DENSE>::type *lp[K];
+    Rec r[K * R];
+    const Rec *lp[K * R];
 #pragma unroll
     for (int k = 0; k < K; ++k) {
         const int j = g0 + tid + k * T;
-        lp[k] = lb + (j < g1 ? j : g1 - 1);
+#pragma unroll
+        for (int q = 0; q < R; ++q) lp[k * R + q] = lb + q * G + (j < g1 ? j : g1 - 1);
     }
     ArhcPre<F32S> pre[K];
 #pragma unroll
@@ -440,18 +599,12 @@ __device__ __forceinline__ bool arhc_body(
     }
     if (!hf_bounded_wait(
             [&] {
-                if constexpr (DENSE) arhc_load_batch64<K>(r, lp); else arhc_load_batch<K>(r, lp);
+                arhc_load_recs<K * R>(r, lp);
                 bool ok = true;
 #pragma unroll
                 for (int k = 0; k < K; ++k) {
                     const int j = g0 + tid + k * T;
-                    if (j < g1) {
-                        if constexpr (DENSE) {
-                            ok &= (r[k].x != ARHC_EMPTY) & (r[k].y != ARHC_EMPTY);
-                        } else {
-                            ok &= (r[k].y == tag) & (r[k].w == tag);
-                        }
-                    }
+                    if (j < g1) ok &= arhc_valid<DENSE, P32>(r + k * R, tag);
                 }
                 return ok;
             },
@@ -464,33 +617,18 @@ __device__ __forceinline__ bool arhc_body(
 #pragma unroll
         for (int k = 0; k < K; ++k) {
             const int j = g0 + tid + k * T;
-            if (j < g1) arhc_st64_sys(const_cast<arhc_u2 *>(lb) + j, arhc_u2{ARHC_EMPTY, ARHC_EMPTY});
+            if (j < g1) arhc_rearm<P32>(const_cast<Rec *>(lb), j);
         }
     }
 #pragma unroll
     for (int k = 0; k < K; ++k) {
         const int j = g0 + tid + k * T;
         if (j < g1) {
-            unsigned rw0, rw1;
-            if constexpr (DENSE) {
-                rw0 = r[k].x;
-                rw1 = r[k].y;
-            } else {
-                rw0 = r[k].x;
-                rw1 = r[k].z;
-            }
-            const float in[4] = {__uint_as_float(rw0 << 16), __uint_as_float(rw0 & 0xFFFF0000u),
-                                 __uint_as_float(rw1 << 16), __uint_as_float(rw1 & 0xFFFF0000u)};
+            float in[4];
+            arhc_unpack<DENSE, P32>(r + k * R, in);
             float m[4];
 #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const float loc = arhc_bf16r(pv[k][e]);
-                const float fi = local_is_first ? loc : in[e];
-                const float si = local_is_first ? in[e] : loc;
-                float xi = 0.0f;
-                xi = xi + (fi + si);
-                m[e] = xi;
-            }
+            for (int e = 0; e < 4; ++e) m[e] = arhc_fold<P32>(pv[k][e], in[e], local_is_first);
             const long long e0 = (long long)j * 4;
             if (mixed_dbg) {
 #pragma unroll
@@ -502,7 +640,7 @@ __device__ __forceinline__ bool arhc_body(
     return true;
 }
 
-template <bool F32S, bool DENSE>
+template <bool F32S, bool DENSE, bool P32>
 __device__ __forceinline__ void arhc_entry(
     const float *__restrict__ part, void *__restrict__ streams, const float *__restrict__ gates,
     char *peer_mbox, const char *local_mbox, unsigned bank_stride,
@@ -518,12 +656,12 @@ __device__ __forceinline__ void arhc_entry(
     if (g0 < g1) {
         const int K = (g1 - g0 + (int)blockDim.x - 1) / (int)blockDim.x;
         switch (K) {
-        case 1: ok = arhc_body<1, F32S, DENSE>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, mixed_dbg); break;
-        case 2: ok = arhc_body<2, F32S, DENSE>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, mixed_dbg); break;
-        case 3: ok = arhc_body<3, F32S, DENSE>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, mixed_dbg); break;
-        case 4: ok = arhc_body<4, F32S, DENSE>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, mixed_dbg); break;
-        case 5: ok = arhc_body<5, F32S, DENSE>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, mixed_dbg); break;
-        case 6: ok = arhc_body<6, F32S, DENSE>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, mixed_dbg); break;
+        case 1: ok = arhc_body<1, F32S, DENSE, P32>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, G, mixed_dbg); break;
+        case 2: ok = arhc_body<2, F32S, DENSE, P32>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, G, mixed_dbg); break;
+        case 3: ok = arhc_body<3, F32S, DENSE, P32>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, G, mixed_dbg); break;
+        case 4: ok = arhc_body<4, F32S, DENSE, P32>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, G, mixed_dbg); break;
+        case 5: ok = arhc_body<5, F32S, DENSE, P32>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, G, mixed_dbg); break;
+        case 6: ok = arhc_body<6, F32S, DENSE, P32>(part, streams, gates, peer_mbox, local_mbox, bank_stride, tag, wb, local_is_first, g0, g1, G, mixed_dbg); break;
         default: ok = false; break;
         }
     }
@@ -548,18 +686,21 @@ __device__ __forceinline__ void arhc_entry(
 
 // Branch-split launch (tagged wire, small row counts; host: ar_hc_split_geometry). One lane
 // per (granule, branch) ITEM instead of one lane per granule: item i covers granule j = i >> 2,
-// branch br = i & 3. The br == 0 lane pushes the granule (same slot, same tagged format, same
-// bank as arhc_body), all four lanes of the item group poll it (the same 16 bytes), fold it
-// with the same expression and apply ONLY their branch with ONLY their branch's gate. The
-// per-element arithmetic and the wire are those of arhc_body<K, F32S, false>; the apply's ALU
-// chain per lane is a quarter as long (the decode apply is ALU-latency-bound). Block b owns
-// items [b * per, min(4G, (b + 1) * per)), per % 4 == 0, per <= blockDim (one item per lane).
-template <bool F32S>
+// branch br = i & 3. The granule's records are pushed by its first lanes (bf16 partials: the
+// br == 0 lane pushes the one record; f32 partials: br == 0 and br == 1 push one record each;
+// same slots, same tagged format, same bank as arhc_body), all four lanes of the item group
+// poll every record of the granule, fold them with the same expression and apply ONLY their
+// branch with ONLY their branch's gate. The per-element arithmetic and the wire are those of
+// arhc_body<K, F32S, false, P32>; the apply's ALU chain per lane is a quarter as long (the
+// decode apply is ALU-latency-bound). Block b owns items [b * per, min(4G, (b + 1) * per)),
+// per % 4 == 0, per <= blockDim (one item per lane).
+template <bool F32S, bool P32>
 __device__ __forceinline__ void arhc_split_entry(
     const float *__restrict__ part, void *__restrict__ streams, const float *__restrict__ gates,
     char *peer_mbox, const char *local_mbox, unsigned bank_stride,
     unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
     int local_is_first, int count, float *__restrict__ mixed_dbg) {
+    constexpr int R = ArhcRec<false, P32>::recs;
     const int I = count;  // 4 items per granule, 4 values per granule
     const int per = (((I + (int)gridDim.x - 1) / (int)gridDim.x) + 3) & ~3;
     const int i0 = (int)blockIdx.x * per;
@@ -573,10 +714,15 @@ __device__ __forceinline__ void arhc_split_entry(
         const float4 a = *reinterpret_cast<const float4 *>(part + (long long)j * 4);
         const float pv[4] = {a.x, a.y, a.z, a.w};
         const unsigned bank = tag & 1u;
-        if (br == 0) {
-            const unsigned w0 = arhc_bf16bits(pv[0]) | (arhc_bf16bits(pv[1]) << 16);
-            const unsigned w1 = arhc_bf16bits(pv[2]) | (arhc_bf16bits(pv[3]) << 16);
-            arhc_st128_sys(reinterpret_cast<arhc_u4 *>(peer_mbox + bank * bank_stride) + j, arhc_u4{w0, tag, w1, tag});
+        arhc_u4 *pb = reinterpret_cast<arhc_u4 *>(peer_mbox + bank * bank_stride);
+        if constexpr (P32) {
+            if (br < 2) {
+                const arhc_u4 rec = br == 0 ? arhc_u4{__float_as_uint(pv[0]), tag, __float_as_uint(pv[1]), tag}
+                                            : arhc_u4{__float_as_uint(pv[2]), tag, __float_as_uint(pv[3]), tag};
+                arhc_st128_sys(pb + br * (I / 4) + j, rec);
+            }
+        } else {
+            if (br == 0) arhc_push<false, false>(pb, j, I / 4, pv, tag);
         }
         const long long e0 = (long long)j * 4;
         const int row = (int)(e0 / AR_HC_HIDDEN), col = (int)(e0 % AR_HC_HIDDEN);
@@ -584,28 +730,23 @@ __device__ __forceinline__ void arhc_split_entry(
         const typename ArhcWord<F32S>::type wv = arhc_load_br<F32S>(streams, row, col, br);
         asm volatile("" ::"v"(wv.x), "v"(wv.y));
         if constexpr (F32S) asm volatile("" ::"v"(wv.z), "v"(wv.w));
-        arhc_u4 r[1];
-        const arhc_u4 *const lp[1] = {reinterpret_cast<const arhc_u4 *>(local_mbox + bank * bank_stride) + j};
+        arhc_u4 r[R];
+        const arhc_u4 *lb = reinterpret_cast<const arhc_u4 *>(local_mbox + bank * bank_stride);
+        const arhc_u4 *lp[R];
+#pragma unroll
+        for (int q = 0; q < R; ++q) lp[q] = lb + q * (I / 4) + j;
         ok = hf_bounded_wait(
             [&] {
-                arhc_load_batch<1>(r, lp);
-                return (r[0].y == tag) & (r[0].w == tag);
+                arhc_load_recs<R>(r, lp);
+                return arhc_valid<false, P32>(r, tag);
             },
             wb, HF_WAIT_SITE_AR_HC_WRITE_GFX1201, tag);
         if (ok) {
-            const unsigned rw0 = r[0].x, rw1 = r[0].z;
-            const float in[4] = {__uint_as_float(rw0 << 16), __uint_as_float(rw0 & 0xFFFF0000u),
-                                 __uint_as_float(rw1 << 16), __uint_as_float(rw1 & 0xFFFF0000u)};
+            float in[4];
+            arhc_unpack<false, P32>(r, in);
             float m[4];
 #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const float loc = arhc_bf16r(pv[e]);
-                const float fi = local_is_first ? loc : in[e];
-                const float si = local_is_first ? in[e] : loc;
-                float xi = 0.0f;
-                xi = xi + (fi + si);
-                m[e] = xi;
-            }
+            for (int e = 0; e < 4; ++e) m[e] = arhc_fold<P32>(pv[e], in[e], local_is_first);
             if (mixed_dbg && br == 0) {
 #pragma unroll
                 for (int e = 0; e < 4; ++e) mixed_dbg[e0 + e] = m[e];
@@ -630,18 +771,21 @@ __device__ __forceinline__ void arhc_split_entry(
     }
 }
 
-// Entries. Four ABI-identical kernels: {BF16, F32} streams x {tagged, dense} wire.
-//   tagged (`ar_hc_write_*`): the 16-byte tagged granule (kill switch, HIPFIRE_EP_AR_WIRE_DENSE=0).
-//   dense  (`ar_hc_write_d8_*`): the 8-byte untagged granule with receiver re-arm (see header).
+// Entries. Twelve ABI-identical kernels: {bf16, f32} partials x {BF16, F32} streams x
+// {tagged, dense, branch-split tagged} wire.
+//   bf16 partials (`ar_hc_write_*`): tagged 16-byte granule (kill switch HIPFIRE_EP_AR_WIRE_DENSE=0),
+//     dense `_d8_` 8-byte granule with receiver re-arm, branch-split `_s_`.
+//   f32 partials (`ar_hc_write_p32_*`): tagged two 16-byte records per granule, dense `_d16_` one
+//     16-byte record with receiver re-arm, branch-split `_s_`.
 
-// BF16-bit streams (`[rows][4][2560]` u16).
+// bf16 partials (the FFN writes): tagged wire, BF16-bit streams (`[rows][4][2560]` u16).
 extern "C" __global__ __launch_bounds__(512) void ar_hc_write_gfx1201(
     const float *__restrict__ part, unsigned short *__restrict__ streams, const float *__restrict__ gates,
     char *peer_mbox, const char *local_mbox, unsigned bank_stride,
     unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
     int local_is_first, int count, float *__restrict__ mixed_dbg) {
-    arhc_entry<false, false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
-                             count, mixed_dbg);
+    arhc_entry<false, false, false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
 }
 
 // F32 streams (`[rows][4][2560]` f32 holding BF16-exact values), same ABI.
@@ -650,38 +794,37 @@ extern "C" __global__ __launch_bounds__(512) void ar_hc_write_f32s_gfx1201(
     char *peer_mbox, const char *local_mbox, unsigned bank_stride,
     unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
     int local_is_first, int count, float *__restrict__ mixed_dbg) {
-    arhc_entry<true, false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
-                            count, mixed_dbg);
+    arhc_entry<true, false, false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
 }
 
-// Dense wire, BF16-bit streams.
+// Dense wire.
 extern "C" __global__ __launch_bounds__(512) void ar_hc_write_d8_gfx1201(
     const float *__restrict__ part, unsigned short *__restrict__ streams, const float *__restrict__ gates,
     char *peer_mbox, const char *local_mbox, unsigned bank_stride,
     unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
     int local_is_first, int count, float *__restrict__ mixed_dbg) {
-    arhc_entry<false, true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
-                            count, mixed_dbg);
+    arhc_entry<false, true, false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
 }
 
-// Dense wire, F32 streams.
 extern "C" __global__ __launch_bounds__(512) void ar_hc_write_d8_f32s_gfx1201(
     const float *__restrict__ part, float *__restrict__ streams, const float *__restrict__ gates,
     char *peer_mbox, const char *local_mbox, unsigned bank_stride,
     unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
     int local_is_first, int count, float *__restrict__ mixed_dbg) {
-    arhc_entry<true, true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
-                           count, mixed_dbg);
+    arhc_entry<true, true, false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
 }
 
-// Branch-split tagged entries (arhc_split_entry), same ABI: decode-size launches.
+// Branch-split tagged entries (arhc_split_entry): decode-size launches.
 extern "C" __global__ __launch_bounds__(512) void ar_hc_write_s_gfx1201(
     const float *__restrict__ part, unsigned short *__restrict__ streams, const float *__restrict__ gates,
     char *peer_mbox, const char *local_mbox, unsigned bank_stride,
     unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
     int local_is_first, int count, float *__restrict__ mixed_dbg) {
-    arhc_split_entry<false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
-                            count, mixed_dbg);
+    arhc_split_entry<false, false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
 }
 
 extern "C" __global__ __launch_bounds__(512) void ar_hc_write_s_f32s_gfx1201(
@@ -689,6 +832,61 @@ extern "C" __global__ __launch_bounds__(512) void ar_hc_write_s_f32s_gfx1201(
     char *peer_mbox, const char *local_mbox, unsigned bank_stride,
     unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
     int local_is_first, int count, float *__restrict__ mixed_dbg) {
-    arhc_split_entry<true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
-                           count, mixed_dbg);
+    arhc_split_entry<true, false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
+}
+
+// f32 partials (the mixer out-projection writes): the same six shapes.
+extern "C" __global__ __launch_bounds__(512) void ar_hc_write_p32_gfx1201(
+    const float *__restrict__ part, unsigned short *__restrict__ streams, const float *__restrict__ gates,
+    char *peer_mbox, const char *local_mbox, unsigned bank_stride,
+    unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
+    int local_is_first, int count, float *__restrict__ mixed_dbg) {
+    arhc_entry<false, false, true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
+}
+
+extern "C" __global__ __launch_bounds__(512) void ar_hc_write_p32_f32s_gfx1201(
+    const float *__restrict__ part, float *__restrict__ streams, const float *__restrict__ gates,
+    char *peer_mbox, const char *local_mbox, unsigned bank_stride,
+    unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
+    int local_is_first, int count, float *__restrict__ mixed_dbg) {
+    arhc_entry<true, false, true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
+}
+
+extern "C" __global__ __launch_bounds__(512) void ar_hc_write_p32_d16_gfx1201(
+    const float *__restrict__ part, unsigned short *__restrict__ streams, const float *__restrict__ gates,
+    char *peer_mbox, const char *local_mbox, unsigned bank_stride,
+    unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
+    int local_is_first, int count, float *__restrict__ mixed_dbg) {
+    arhc_entry<false, true, true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
+}
+
+extern "C" __global__ __launch_bounds__(512) void ar_hc_write_p32_d16_f32s_gfx1201(
+    const float *__restrict__ part, float *__restrict__ streams, const float *__restrict__ gates,
+    char *peer_mbox, const char *local_mbox, unsigned bank_stride,
+    unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
+    int local_is_first, int count, float *__restrict__ mixed_dbg) {
+    arhc_entry<true, true, true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
+}
+
+extern "C" __global__ __launch_bounds__(512) void ar_hc_write_p32_s_gfx1201(
+    const float *__restrict__ part, unsigned short *__restrict__ streams, const float *__restrict__ gates,
+    char *peer_mbox, const char *local_mbox, unsigned bank_stride,
+    unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
+    int local_is_first, int count, float *__restrict__ mixed_dbg) {
+    arhc_split_entry<false, true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
+}
+
+extern "C" __global__ __launch_bounds__(512) void ar_hc_write_p32_s_f32s_gfx1201(
+    const float *__restrict__ part, float *__restrict__ streams, const float *__restrict__ gates,
+    char *peer_mbox, const char *local_mbox, unsigned bank_stride,
+    unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
+    int local_is_first, int count, float *__restrict__ mixed_dbg) {
+    arhc_split_entry<true, true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb,
+        local_is_first, count, mixed_dbg);
 }

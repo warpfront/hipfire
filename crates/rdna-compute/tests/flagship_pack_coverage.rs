@@ -197,7 +197,11 @@ fn assert_measured_hip_modules_registered(arch: &str, fixture: &str) {
     }
     assert!(
         failures.is_empty(),
-        "pack coverage regressions:\n{}",
+        "pack coverage regressions:\n{}\n\
+         A kernel source edit changes these pins: after confirming the edit is intended, replace the \
+         old sha256 with the printed source sha256 on every matching row of \
+         crates/rdna-compute/tests/fixtures/flagship-pack-gfx{{1201,1100,1151}}.tsv and add a header \
+         comment naming the commit, in the same change.",
         failures.join("\n")
     );
 }
@@ -295,27 +299,29 @@ fn every_measured_flagship_hip_module_is_registered_exactly_on_gfx1100() {
 
 #[test]
 fn halo_and_rdna3_fixtures_pin_measured_route_counts() {
-    let cases: [(&str, &str, &[(&str, usize)]); 2] = [
+    let cases: [(&str, &str, &[(&str, usize, usize)]); 2] = [
         (
             "gfx1151",
             FLAGSHIP_1151,
             &[
-                ("27b-ar", 41),
-                ("27b-dflash-default", 59),
-                ("27b-mtp", 58),
-                ("a3b-ar-iu4off", 55),
+                ("27b-ar", 41, 0),
+                ("27b-dflash-default", 59, 0),
+                ("27b-mtp", 58, 0),
+                ("a3b-ar", 51, 3),
+                ("a3b-ar-iu4off", 55, 0),
             ],
         ),
         (
             "gfx1100",
             FLAGSHIP_1100,
             &[
-                ("27b-ar", 34),
-                ("27b-dflash-default", 55),
-                ("27b-mtp", 65),
-                ("fn-ar", 30),
-                ("fn-mtp", 36),
-                ("a3b-ar-iu4off", 53),
+                ("27b-ar", 34, 0),
+                ("27b-dflash-default", 55, 0),
+                ("27b-mtp", 65, 0),
+                ("fn-ar", 30, 0),
+                ("fn-mtp", 36, 0),
+                ("a3b-ar", 47, 3),
+                ("a3b-ar-iu4off", 53, 0),
             ],
         ),
     ];
@@ -323,11 +329,17 @@ fn halo_and_rdna3_fixtures_pin_measured_route_counts() {
         let rows = rows_of(fixture);
         let counts = header_counts_of(fixture);
         assert_eq!(counts.len(), expected.len(), "{arch}: route set");
-        for (route, hip) in expected {
-            assert_eq!(counts[*route], (*hip, 0), "{arch} {route}: header counts");
+        for (route, hip, emb) in expected {
+            assert_eq!(
+                counts[*route],
+                (*hip, *emb),
+                "{arch} {route}: header counts"
+            );
             let mine: Vec<&Row> = rows.iter().filter(|r| r.route == *route).collect();
-            assert_eq!(mine.len(), *hip, "{arch} {route}: row count");
-            assert!(mine.iter().all(|r| r.arch == arch && r.kind == "hip"));
+            assert_eq!(mine.len(), hip + emb, "{arch} {route}: row count");
+            assert!(mine.iter().all(|r| r.arch == arch));
+            assert_eq!(mine.iter().filter(|r| r.kind == "hip").count(), *hip);
+            assert_eq!(mine.iter().filter(|r| r.kind == "embedded").count(), *emb);
             let unique: BTreeSet<&str> = mine.iter().map(|r| r.module.as_str()).collect();
             assert_eq!(
                 unique.len(),

@@ -231,14 +231,13 @@ fn fused_qkv_hfq6_resolves_cross_arch() {
 #[test]
 fn fused_qkv_variant_for_key_classifies_by_family() {
     use KernelKey::*;
-    // 3-way QKV family (incl. Q4K + Paro QKV synthesis).
+    // 3-way QKV family (incl. Q4K).
     for k in [
         FusedQkvHfq4G256,
         FusedQkvMq3G256Lloyd,
         FusedQkvMq4G256Lloyd,
         FusedQkvHfq6G256,
         FusedQkvQ4K,
-        FusedQkvParo4G128T,
     ] {
         assert_eq!(
             fused_qkv_variant_for_key(k),
@@ -246,13 +245,12 @@ fn fused_qkv_variant_for_key_classifies_by_family() {
             "{k:?}"
         );
     }
-    // 4-way QKVZA family (incl. Paro).
+    // 4-way QKVZA family.
     for k in [
         FusedQkvzaHfq4G256,
         FusedQkvzaMq3G256Lloyd,
         FusedQkvzaMq4G256Lloyd,
         FusedQkvzaHfq6G256,
-        FusedQkvzaParo4G128T,
     ] {
         assert_eq!(
             fused_qkv_variant_for_key(k),
@@ -260,7 +258,7 @@ fn fused_qkv_variant_for_key_classifies_by_family() {
             "{k:?}"
         );
     }
-    // 2-way Gate+Up family (incl. Q8_0 + Q4K + Paro).
+    // 2-way Gate+Up family (incl. Q8_0 + Q4K).
     for k in [
         FusedGateUpHfq4G256,
         FusedGateUpMq3G256Lloyd,
@@ -268,7 +266,6 @@ fn fused_qkv_variant_for_key_classifies_by_family() {
         FusedGateUpHfq6G256,
         FusedGateUpQ4K,
         FusedGateUpQ8_0,
-        FusedGateUpParo4G128T,
     ] {
         assert_eq!(
             fused_qkv_variant_for_key(k),
@@ -797,8 +794,6 @@ const ALL_DTYPES: &[DType] = &[
     DType::TQ2G128,
     DType::BQ1G128,
     DType::HFQ6G256,
-    DType::ParoQ4G128,
-    DType::ParoQ4G64,
     DType::FP8E4M3B128,
     DType::FP8E4M3PT,
     DType::HC8E4M3Row,
@@ -1129,7 +1124,7 @@ fn every_admitted_dtype_or_key_has_a_dispatch_arm() {
         steps_src,
         "fn launch_fused<'a>(",
         "key",
-        8,
+        7,
     );
     let run_key = ArmSet::parse(
         "families/gemm.rs::GemmFamily::run_key",
@@ -1434,31 +1429,16 @@ fn dtype_needs_rotation_false_for_hfq_and_scalar() {
 
 #[test]
 fn gemv_steps_rotation_matches_plan() {
-    for dtype in [
-        DType::MQ4G256,
-        DType::MFP4G32,
-        DType::ParoQ4G128,
-        DType::HFQ4G256,
-    ] {
+    for dtype in [DType::MQ4G256, DType::MFP4G32, DType::HFQ4G256] {
         let steps = KernelKey::gemv_steps(dtype, GemvVariant::Plain);
         let plan = dtype_rotation_plan(dtype);
         let has_fwht = steps.contains(&PipelineOp::RotateFwht);
-        let has_givens = steps.contains(&PipelineOp::GivensRotate);
         match plan {
-            RotationPlan::Givens => {
-                assert!(
-                    has_givens && !has_fwht,
-                    "{dtype:?}: Givens plan must emit GivensRotate, not FWHT"
-                );
-            }
             RotationPlan::FwhtG256 | RotationPlan::FwhtG128 => {
-                assert!(
-                    has_fwht && !has_givens,
-                    "{dtype:?}: FWHT plan must emit RotateFwht"
-                );
+                assert!(has_fwht, "{dtype:?}: FWHT plan must emit RotateFwht");
             }
             RotationPlan::None => {
-                assert!(!has_fwht && !has_givens, "{dtype:?}: no rotation");
+                assert!(!has_fwht, "{dtype:?}: no rotation");
             }
             RotationPlan::Mq8Internal => {}
         }
@@ -1688,7 +1668,6 @@ fn dtypes_all_mq4() -> MoeDtypes<'static> {
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
         routed_has_mixed_experts: false,
-        has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
     }
@@ -2144,29 +2123,15 @@ fn moe_decode_oplist_prefix_matches_gate_side() {
     assert!(!too_long.can_satisfy(&oplist)); // second op mismatches Softmax
 }
 
-#[test]
-fn moe_res_paro_needs_sidecar() {
-    let mut d = dtypes_all_mq4();
-    d.routed_gate_up = DType::ParoQ4G128;
-    d.routed_down = DType::ParoQ4G128;
-    d.has_paro_shared = false;
-    assert!(!MoeResolution::resolve(&d, 8).routed_indexable_paro);
-    d.has_paro_shared = true;
-    let r = MoeResolution::resolve(&d, 8);
-    assert!(r.routed_indexable_paro);
-    assert!(r.use_gpu_topk);
-}
-
 // ── MQV2 resolver contracts (mixed gate precedence / MQ6V2 / D3) ─────────────
 //
 // Pure helpers exposed by `pipeline` + `MoeResolution` lattice. These pin the
-// three silent-corruption hazards from the MQV2 fix wave: mixed gate before
-// representative V1/V2 arms, uniform MQ6V2 indexability without V1 collapse,
-// and V2 never calling the HFQ4 ninepath D3 gate.
+// silent-corruption hazards from the MQV2 fix wave: mixed gate before
+// representative V1/V2 arms and uniform MQ6V2 indexability without V1 collapse.
 
 use crate::pipeline::{
-    decode_gate_uses_mixed, gate_up_varies, ninepath_d3_family, ninepath_d4_family,
-    prefill_path1_down_kind_tag_aware, prefill_path1_gate_up_kind_tag_aware,
+    decode_gate_uses_mixed, gate_up_varies, ninepath_d4_family, prefill_path1_down_kind_tag_aware,
+    prefill_path1_gate_up_kind_tag_aware,
 };
 
 #[test]
@@ -2300,20 +2265,10 @@ fn mixed_v1_v2_gate_precedence_requires_exact_variation() {
     );
 }
 
-/// V2 D3 restriction: only HFQ4/MQ4V1 may call `gemv_hfq4g256_moe_ninepath_d3`.
-/// V2 uniform pairs use exact native indexed gate + V2 D4 — never the HFQ4 D3
-/// gate (dual-half header is silent fluent corruption on the same stride).
+/// V2 uniform pairs have their own D4 families; split V1/V2 pairings share none
+/// (dual-half header is silent fluent corruption on the same stride).
 #[test]
-fn ninepath_d3_restricts_v2_to_native_gate_and_d4() {
-    // Sole admitted D3 pair.
-    assert_eq!(
-        ninepath_d3_family(DType::MQ4G256, DType::MQ4G256),
-        Some("hfq4")
-    );
-
-    // V2 uniforms have D4 families but NEVER a D3 family.
-    assert_eq!(ninepath_d3_family(DType::MQ4G256V2, DType::MQ4G256V2), None);
-    assert_eq!(ninepath_d3_family(DType::MQ6G256V2, DType::MQ6G256V2), None);
+fn ninepath_d4_separates_v2_families() {
     assert_eq!(
         ninepath_d4_family(DType::MQ4G256V2, DType::MQ4G256V2),
         Some("mq4v2"),
@@ -2324,21 +2279,13 @@ fn ninepath_d3_restricts_v2_to_native_gate_and_d4() {
         Some("mq6v2"),
         "V2 still has its own D4 path"
     );
-
-    // Lloyd D4 pair is not D3 either (D3 is HFQ4-only).
-    assert_eq!(
-        ninepath_d3_family(DType::MQ2G256Lloyd, DType::MQ3G256Lloyd),
-        None
-    );
-
-    // Split V1/V2 pairings share neither D3 nor D4.
+    // Split V1/V2 pairings share no D4 family.
     for (g, dn) in [
         (DType::MQ4G256V2, DType::MQ4G256),
         (DType::MQ4G256, DType::MQ4G256V2),
         (DType::MQ6G256V2, DType::MQ6G256),
         (DType::MQ4G256V2, DType::MQ6G256V2),
     ] {
-        assert_eq!(ninepath_d3_family(g, dn), None, "{g:?}/{dn:?}");
         assert_eq!(ninepath_d4_family(g, dn), None, "{g:?}/{dn:?}");
     }
 }
@@ -2356,7 +2303,6 @@ fn dummy_wr<'a>(t: &'a rdna_compute::GpuTensor) -> WeightRef<'a> {
         m: 1,
         k: 1,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2562,7 +2508,6 @@ fn guard_qkv_mq4g256lloyd_fires() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2581,7 +2526,6 @@ fn guard_qkv_mq4g256lloyd_rejects_wrong_dtype() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2600,7 +2544,6 @@ fn guard_qkv_mq4g256lloyd_rejects_awq_scale() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: Some(&dummy),
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2619,7 +2562,6 @@ fn guard_qkv_mq4g256lloyd_rejects_force_unfused() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2640,7 +2582,6 @@ fn guard_qkv_hfq4g256_covers_mq4g256() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2659,7 +2600,6 @@ fn guard_qkv_hfq4g256_covers_hfq4g256() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2684,7 +2624,6 @@ fn guard_qkv_hfq6g256_dp4a_decoupled() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2696,7 +2635,6 @@ fn guard_qkv_hfq6g256_dp4a_decoupled() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2725,7 +2663,6 @@ fn guard_qkv_rejects_mixed_gemv_input() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2771,7 +2708,6 @@ fn guard_gate_up_mq4g256lloyd_fires() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2790,7 +2726,6 @@ fn match_fused_prefix_admits_exact_mq4g256v2_qkv() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2813,7 +2748,6 @@ fn match_fused_prefix_admits_exact_mq4g256v2_qkvza() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2842,7 +2776,6 @@ fn match_fused_prefix_admits_exact_mq4g256v2_gate_up() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2866,7 +2799,6 @@ fn match_fused_prefix_rejects_mixed_v1_v2_mq4_window() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2878,7 +2810,6 @@ fn match_fused_prefix_rejects_mixed_v1_v2_mq4_window() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2939,7 +2870,6 @@ fn match_fused_prefix_rejects_mq4g256v2_on_unsupported_arch() {
         m: 4096,
         k: 4096,
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -2998,7 +2928,6 @@ fn moe_dtypes_mq4() -> MoeDtypes<'static> {
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
         routed_has_mixed_experts: false,
-        has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
     }
@@ -3009,15 +2938,6 @@ fn moe_dtypes_mq6() -> MoeDtypes<'static> {
     d.routed_gate_up = DType::MQ6G256;
     d.routed_down = DType::MQ6G256;
     d.experts_all_gate_up_mq4 = false;
-    d
-}
-
-fn moe_dtypes_paro() -> MoeDtypes<'static> {
-    let mut d = moe_dtypes_mq4();
-    d.routed_gate_up = DType::ParoQ4G128;
-    d.routed_down = DType::ParoQ4G128;
-    d.experts_all_gate_up_mq4 = false;
-    d.has_paro_shared = true;
     d
 }
 
@@ -3077,19 +2997,12 @@ fn mq3v25_a8_route_requires_flag_symmetric_multirow_and_exact_arch() {
     }
 }
 
-fn flags_default() -> rdna_compute::feature_flags::FeatureFlags {
-    rdna_compute::feature_flags::FeatureFlags::for_test("gfx1100")
-}
-
 #[test]
 fn moe_prefill_resolution_path2_gfx11_mq4() {
     let arch = crate::context::DispatchCtx::for_test("gfx1100");
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
     assert!(r.use_path2, "gfx11 should have Path 2 (WMMA)");
     assert!(!r.down_path0, "gfx11 should not be Path 0");
-    assert!(!r.paro_mode);
-    assert!(!r.use_paro_i8);
-    assert!(!r.use_paro_i8_k8);
 }
 
 #[test]
@@ -3105,7 +3018,6 @@ fn moe_prefill_resolution_path2_gfx12_mq6() {
     let arch = crate::context::DispatchCtx::for_test("gfx1200");
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
     assert!(r.use_path2, "gfx12 should have Path 2 for MQ6");
-    assert!(!r.paro_mode);
 }
 
 #[test]
@@ -3125,25 +3037,6 @@ fn moe_prefill_resolution_gfx1151_mixed_mq6_fences_mq4_i8() {
         mixed_mq6.force_mq4_grouped_fp16,
         "MQ6-promoted/mixed A3B layers must not run remaining MQ4 projections through grouped-i8 by default"
     );
-}
-
-#[test]
-fn moe_prefill_resolution_path2_gfx11_paro() {
-    let arch = crate::context::DispatchCtx::for_test("gfx1100");
-    let r = MoePrefillResolution::resolve(&moe_dtypes_paro(), &arch.arch, &arch.flags);
-    assert!(r.use_path2, "gfx11 should have Path 2 for Paro");
-    assert!(r.paro_mode);
-    assert!(!r.use_paro_i8, "gfx1100 is not gfx1151 — no i8");
-}
-
-#[test]
-fn moe_prefill_resolution_path2_gfx1151_paro_i8() {
-    let arch = crate::context::DispatchCtx::for_test("gfx1151");
-    let r = MoePrefillResolution::resolve(&moe_dtypes_paro(), &arch.arch, &arch.flags);
-    assert!(r.use_path2);
-    assert!(r.paro_mode);
-    assert!(r.use_paro_i8, "gfx1151 should default to i8 for Paro");
-    assert!(r.use_paro_i8_k8, "gfx1151 should default to i8 k8 for Paro");
 }
 
 #[test]
@@ -3168,29 +3061,6 @@ fn moe_prefill_resolution_path0_gfx942() {
     let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
     assert!(!r.use_path2, "gfx942 has no WMMA — no Path 2");
     assert!(r.down_path0, "gfx942 (CDNA3) should be Path 0");
-}
-
-#[test]
-fn moe_prefill_resolution_grouped_gemm_opt_out() {
-    let mut flags = flags_default();
-    flags.moe_grouped_gemm = false;
-    let flags = std::sync::Arc::new(flags);
-    let caps = rdna_compute::arch_caps::ArchCaps::new("gfx1100", flags.clone());
-    let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &caps, &flags);
-    assert!(!r.use_path2, "moe_grouped_gemm=0 should disable Path 2");
-}
-
-#[test]
-fn moe_prefill_resolution_paro_i8_opt_out() {
-    let mut flags = flags_default();
-    flags.moe_paro_i8 = Some(false);
-    let flags = std::sync::Arc::new(flags);
-    let caps = rdna_compute::arch_caps::ArchCaps::new("gfx1151", flags.clone());
-    let r = MoePrefillResolution::resolve(&moe_dtypes_paro(), &caps, &flags);
-    assert!(r.use_path2);
-    assert!(r.paro_mode);
-    assert!(!r.use_paro_i8, "moe_paro_i8=0 should disable i8");
-    assert!(!r.use_paro_i8_k8);
 }
 
 #[test]
@@ -3267,7 +3137,6 @@ fn moe_prefill_resolution_codebook_pair_uses_path2_on_wmma() {
              Path 0/1 have no Lloyd indexed-GEMV arm"
         );
         assert!(!r.down_path0, "{arch_name} is not a Path 0 arch");
-        assert!(!r.paro_mode);
     }
 }
 
@@ -3444,9 +3313,8 @@ fn cpu_quant_refuses_unimplemented_formats() {
         DType::MFP4G32Lloyd,
         DType::MFP4G32P,
         DType::MFP4G32E8SOA,
-        DType::ParoQ4G128, // Givens rotation on the activation
-        DType::Q4K,        // no dense HFQ artifact uses it
-        DType::Q8HFQ,      // padded rows (row_stride), not expressible in the group model
+        DType::Q4K,   // no dense HFQ artifact uses it
+        DType::Q8HFQ, // padded rows (row_stride), not expressible in the group model
         DType::Raw,
     ] {
         assert!(
@@ -3521,6 +3389,35 @@ fn mq6_hfq6_gemv_resolves_on_rdna1_rdna2_and_keeps_prior_archs() {
         .is_err());
 }
 
+/// HIPF-222: `GemvHfq3G128` was gated on sdot4, so gfx1151/RDNA3 resolved
+/// MissingImpl and LLaMA hfq3 files failed at the first generate. The kernel is
+/// wave32 scalar: every wave32 arch resolves, CDNA wave64 stays excluded.
+#[test]
+fn hfq3g128_gemv_resolves_on_wave32_only() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    for arch in ["gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1201"] {
+        let r = fam.resolve(
+            DType::HFQ3G128,
+            GemvVariant::Plain,
+            false,
+            &DispatchCtx::for_test(arch),
+            None,
+        );
+        assert!(r.is_ok(), "HFQ3G128 must resolve on {arch}: {r:?}");
+    }
+    for arch in ["gfx906", "gfx942"] {
+        let r = fam.resolve(
+            DType::HFQ3G128,
+            GemvVariant::Plain,
+            false,
+            &DispatchCtx::for_test(arch),
+            None,
+        );
+        assert!(r.is_err(), "HFQ3G128 must stay rejected on {arch}");
+    }
+}
+
 #[test]
 fn arch_has_hfq6_gemv_is_mmq_union_wave32() {
     assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_rdna1()));
@@ -3529,4 +3426,32 @@ fn arch_has_hfq6_gemv_is_mmq_union_wave32() {
     assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_rdna4()));
     assert!(ArchPredicate::HasHfq6Gemv.eval_arch(&ctx_gfx906()));
     assert!(!ArchPredicate::HasHfq6Gemv.eval_arch(&DispatchCtx::for_test("gfx942")));
+}
+
+/// HIPF-241: `GemvHfq3G256` was gated on sdot4 + gfx110x, so gfx1151/gfx12
+/// resolved MissingImpl and LLaMA hfq3g256 files failed at the first prefill.
+/// The generic kernel is wave32 scalar: every wave32 arch resolves, CDNA wave64
+/// stays excluded.
+#[test]
+fn hfq3g256_gemv_resolves_on_wave32_only() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    for (arch, ok) in [
+        ("gfx1010", true),
+        ("gfx1030", true),
+        ("gfx1100", true),
+        ("gfx1151", true),
+        ("gfx1201", true),
+        ("gfx906", false),
+        ("gfx942", false),
+    ] {
+        let r = fam.resolve(
+            DType::HFQ3G256,
+            GemvVariant::Plain,
+            false,
+            &DispatchCtx::for_test(arch),
+            None,
+        );
+        assert_eq!(r.is_ok(), ok, "HFQ3G256 on {arch}: {r:?}");
+    }
 }

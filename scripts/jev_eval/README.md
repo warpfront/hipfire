@@ -13,11 +13,9 @@ git clone https://github.com/scienthoon/jev-ood-calibration ~/repos/jev-evals/je
    cargo build --release -p hipfire-daemon -p hipfire-cli
    cargo build --release -p hipfire-generate --features lab --example split_prefill_probe
    python3 scripts/jev_eval/gates.py --model ~/.hipfire/models/qwen3.5-4b.mq4
-   python3 scripts/jev_eval/gates.py --model ~/.hipfire/models/qwen3.5-4b.mq4 --cask
    ```
    The same runs include the session-mode gates S1–S5 (spec §12.8). They
-   need no extra flags; under `--cask` every session start is `cold` and S1
-   is INCONCLUSIVE by design (the chat prompt cache is off under eviction).
+   need no extra flags.
    Gate S6 (session decide with a DFlash speculator loaded: read-only,
    keeps the assistant-turn cache, no leak) runs alone on a model with a
    drafter:

@@ -648,6 +648,7 @@ fn mesh_lane_ep_multi_group_all_rows_step_plans_one_exchange_per_layer() {
         gather_cap: Some(48),
         trunk_ar_write: trunk,
         band_moe_calls: 48,
+        g942_single: false,
         policy: crate::gpu_forward_lanes::LaneStagePolicy::production(),
         hetero_rows: 0,
     };
@@ -1025,10 +1026,10 @@ fn mesh_lane_ep_draft_split_runs_only_owned_ops_with_no_head_crossings() {
 }
 
 /// A window of one head lane gains nothing from a split: it stays replicated (today's
-/// calls, one crossing per op) with the split on, and the kill switch (`false`) keeps
-/// every lane replicated.
+/// calls, one crossing per op) with the split on, and `split = false` keeps every lane
+/// replicated.
 #[test]
-fn mesh_lane_ep_a_lone_lane_and_the_kill_switch_keep_todays_replicated_calls() {
+fn mesh_lane_ep_a_lone_lane_keeps_todays_replicated_calls() {
     let (driven, merged, crossings, sims) = split_run(1, true);
     assert_eq!(merged.counts.head_draft_calls, 1);
     assert_eq!(crossings, 1 + merged.counts.target_exchanges as u64);

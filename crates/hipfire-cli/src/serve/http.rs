@@ -3308,7 +3308,7 @@ mod tests {
         let mut meta = crate::serve::ServeMeta::new("test".to_owned());
         meta.current_model = Some("qwen3.5:4b".to_owned());
         meta.loaded = LoadedInfo {
-            kv_mode: Some("asym3".to_owned()),
+            kv_mode: Some("fwht3".to_owned()),
             kv_backend: Some("paged".to_owned()),
             max_seq: Some(32768),
             ..LoadedInfo::default()
@@ -3317,7 +3317,7 @@ mod tests {
             loaded_config_json(&meta),
             serde_json::json!({
                 "model": "qwen3.5:4b",
-                "kv_mode": "asym3",
+                "kv_mode": "fwht3",
                 "kv_backend": "paged",
                 "max_seq": 32768u64,
             })

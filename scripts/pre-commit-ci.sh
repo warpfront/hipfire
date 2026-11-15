@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # Run the fast GPU-free CI checks locally before committing.
 #
-# Same commands as .github/workflows/ci.yml (gates, supply-chain, fmt, clippy)
-# and the static checks of scripts/no-gpu-ci.sh. Skipped as slow or not
-# runnable locally: the release `build` job, every test step, cargo-deny
-# `advisories` (network fetch; continue-on-error in CI), and hw-gate (GPU +
-# reviewer seats). no-gpu-ci's `cargo check --workspace --examples` is covered
-# by clippy --all-targets.
+# The structural gates are scripts/ci-gates.sh, the same runner the ci.yml
+# `gates` job calls; this adds ci.yml's supply-chain, fmt and clippy jobs.
+# Skipped as slow or not runnable locally: the release `build` job, every test
+# step (scripts/no-gpu-ci.sh), cargo-deny `advisories` (network fetch;
+# continue-on-error in CI), and hw-gate (GPU + reviewer seats).
 #
 # Usage: scripts/pre-commit-ci.sh [BASE_REF]
-#   BASE_REF  the branch the PR targets, e.g. origin/beta; forwarded to
-#             ratchet-diff.sh (its default is origin/master).
+#   BASE_REF  the branch the PR targets (default origin/beta); forwarded to
+#             ci-gates.sh for its base-relative gates.
 #
 # rustfmt: the whole workspace must be clean (`cargo-fmt --all -- --check`;
 # beta is rustfmt-clean since the 0.4.3 sweep, and the generated AIE2P tables
@@ -30,12 +29,7 @@ run() {
     "$@" || failed+=("$*")
 }
 
-run bash scripts/leanup-ratchets.sh
-run python3 scripts/check-crate-maps.py --check
-run python3 scripts/check-scratch-growth.py
-run python3 scripts/check-changelog.py
-run python3 scripts/check-conflict-markers.py
-run bash scripts/ratchet-diff.sh ${1:+"$1"}
+run bash scripts/ci-gates.sh "${1:-origin/beta}"
 if cargo deny --version >/dev/null 2>&1; then
     run cargo deny check bans licenses sources
 else
@@ -46,12 +40,6 @@ fi
 run cargo-fmt --all -- --check
 run bash scripts/ci-rustfmt-changed.sh
 run cargo clippy --workspace --all-targets --locked
-run python3 scripts/check-env-docs.py
-run python3 scripts/check-lifecycle.py
-run python3 scripts/check-selector-receipts.py
-run python3 scripts/check-mtp-parity-ratchet.py --self-test
-run python3 scripts/check-mtp-parity-ratchet.py fixture
-run python3 scripts/check-mtp-parity-ratchet.py guard --base "${1:-origin/beta}"
 
 echo
 if [[ ${#failed[@]} -gt 0 ]]; then

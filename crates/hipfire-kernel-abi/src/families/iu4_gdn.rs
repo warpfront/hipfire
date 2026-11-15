@@ -425,13 +425,13 @@ const OBJ_B1: ObjectRefV1 = ObjectRefV1::Embedded {
     // `gemm.rs` g12_iu4_b1_image: kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1
     module: "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1",
     artifact: "kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco",
-    sha256: "49cc18eedd9507b868ecce6b05bd2993688354ed4180e1df456cafe45f34c297",
+    sha256: "037c7b0a46204c58ec730eb77113a9919643e0ff4715a73d0b3b116cc7c43c0b",
 };
 const OBJ_B1S: ObjectRefV1 = ObjectRefV1::Embedded {
     // `gemm.rs` g12_iu4_b1s_image: kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S
     module: "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
     artifact: "kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco",
-    sha256: "b351ce70156444a657f31165c704b02faf58c4e81acc3de2d1ff35ffa428eefa",
+    sha256: "4e3dc6e7d6efff1d1e0b496db1a3b89237f12c7ed7e5642d24684dbc99b57665",
 };
 
 const fn export(symbol: &'static str, object: ObjectRefV1) -> ExportV1 {

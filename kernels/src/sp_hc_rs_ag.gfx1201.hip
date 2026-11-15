@@ -7,8 +7,9 @@
 // activations the next sharded op needs (`sp_ag_rows_*`).
 //
 // This file is APPENDED to the helpers of `ar_hc_write.gfx1201.hip` (module source =
-// device_wait_deadline.h + ar_hc_write.gfx1201.hip + this file): it reuses arhc_bf16bits,
-// arhc_bf16r, arhc_nonempty, arhc_st64_sys, arhc_load_batch64<K>, ArhcPre/arhc_load/arhc_apply,
+// device_wait_deadline.h + ar_hc_write.gfx1201.hip + this file): it reuses ArhcRec,
+// arhc_push / arhc_valid / arhc_unpack / arhc_rearm / arhc_fold of the dense wire (both partial
+// formats), arhc_nonempty, arhc_st64_sys, arhc_load_recs<K>, ArhcPre/arhc_load/arhc_apply,
 // hf_bounded_wait, the dense (EMPTY = 0xFFFFFFFF, consumer re-arm) wire and the generation /
 // ticket protocol unchanged. The wire argument (torn / stale / payload-EMPTY / abort) in the
 // header of ar_hc_write.gfx1201.hip applies verbatim: only WHICH granules travel and WHO
@@ -20,28 +21,31 @@
 // r*4*2560 stream elements / r*4 gates):
 //   own  = [own_row0,  own_row0  + own_rows)   rows THIS rank folds and writes,
 //   peer = [peer_row0, peer_row0 + peer_rows)  rows the PEER folds and writes.
-//   (a) push bf16(partial) of the PEER range as dense granules into the peer mailbox bank
-//       `tag & 1`; slot index = granule index relative to peer_row0 (slot 0 = first granule
-//       of peer_row0);
+//   (a) push the partial of the PEER range as dense granules (bf16 partials `sp_hc_rs_d8_*`:
+//       8 bytes; f32 partials `sp_hc_rs_p32_d16_*`: 16 bytes) into the peer mailbox bank
+//       `tag & 1`; slot index = granule index relative to peer_row0 (slot 0 = first granule of
+//       peer_row0);
 //   (b) bounded poll (site SP_HC_RS_GFX1201) of this rank's own mailbox slots
 //       0 .. own_rows * 640: the peer pushed its PEER range = this rank's own range, in the
-//       same relative order. The poll side uses the K-templated b64 batch (K <= AR_HC_KMAX);
+//       same relative order. The poll side uses the K-templated batch (K <= AR_HC_KMAX);
 //   (c) re-arm every consumed slot to EMPTY;
-//   (d) fold the own rows exactly like arhc_body: `xi = 0.0f; xi = xi + (fi + si)` with
-//       fi/si by local_is_first, loc = arhc_bf16r(local partial), in = the peer's granule;
+//   (d) fold the own rows exactly like arhc_body: arhc_fold<P32>(local partial, peer partial)
+//       in rank order;
 //   (e) arhc_apply on the own rows only. Rows outside the own range of `streams` are never
 //       written. `mixed_dbg` (nullable) receives m of the own rows at the full-tile offset.
-// The folded value of an element is bit-identical to the all-reduce's, so the own rows of a
-// reduce-scatter launch equal the same rows of an `ar_hc_write_d8_*` launch.
+// The folded value of an element is bit-identical to the all-reduce's of the same partial
+// format, so the own rows of a reduce-scatter launch equal the same rows of an
+// `ar_hc_write_d8_*` / `ar_hc_write_p32_d16_*` launch.
 // A rank with own_rows == 0 still pushes and still advances the generation; the push side
 // and the poll side may have different granule counts (uneven splits), so every block takes a
 // slice of BOTH.
 //
 // All-gather (AG). `sp_ag_rows_bf16_d8_gfx1201` exchanges rows of a `[rows][row_elems]` buffer
-// (row_elems % 4 == 0): this rank pushes its own rows (dense granules, slot index relative to
-// own_row0), polls the peer's rows (peer_rows * row_elems / 4 granules), writes them into the
-// buffer rows of the peer range and re-arms. Payload dwords go through arhc_nonempty (a
-// NaN-pair dword 0xFFFFFFFF arrives as 0xFFFFFFFE; every finite value is byte-exact).
+// (row_elems % 4 == 0): this rank pushes its own rows (dense 8-byte granules of four bf16
+// values, slot index relative to own_row0), polls the peer's rows (peer_rows * row_elems / 4
+// granules), writes them into the buffer rows of the peer range and re-arms. Payload dwords go
+// through arhc_nonempty (a NaN-pair dword 0xFFFFFFFF arrives as 0xFFFFFFFE; every finite value
+// is byte-exact).
 // Element formats of the AG buffer:
 //   bf16    (`sp_ag_rows_bf16_d8_gfx1201`):    buffer u16 bits, two per dword;
 //   f32bf16 (`sp_ag_rows_f32bf16_d8_gfx1201`): buffer f32 words that hold BF16-EXACT values
@@ -54,7 +58,7 @@
 // generation. A timed-out wait never reaches the ticket (the host resets both ranks).
 //
 // Mailbox banks are `bank_stride` bytes apart; a launch pushes and polls at most
-// bank_stride / 8 granules (host checks it).
+// bank_stride / (granule bytes) granules: 8 (bf16 RS, AG) or 16 (f32 RS) bytes each (host checks it).
 //
 // Geometry (host: sp_rs_geometry / sp_ag_geometry): grid <= 64 blocks, <= 512 lanes, the poll
 // side at most AR_HC_KMAX granules per lane.
@@ -64,9 +68,11 @@
 
 #define SP_GRANULES_PER_ROW (AR_HC_HIDDEN / 4)
 
-// Plain-load bf16 push of `p0..p1` (granule indices relative to the start of `src`): four
-// granules in flight per lane.
-__device__ __forceinline__ void sp_push_f32(const float *__restrict__ src, arhc_u2 *pb, int p0, int p1) {
+// Plain-load push of `p0..p1` (granule indices relative to the start of `src`): four granules
+// in flight per lane.
+template <bool P32>
+__device__ __forceinline__ void sp_push(const float *__restrict__ src, typename ArhcRec<true, P32>::type *pb, int p0,
+                                        int p1) {
     const int tid = threadIdx.x, T = blockDim.x;
     for (int j0 = p0 + tid; j0 < p1; j0 += 4 * T) {
         float4 a[4];
@@ -80,9 +86,8 @@ __device__ __forceinline__ void sp_push_f32(const float *__restrict__ src, arhc_
         for (int u = 0; u < 4; ++u) {
             const int j = j0 + u * T;
             if (j < p1) {
-                const unsigned w0 = arhc_bf16bits(a[u].x) | (arhc_bf16bits(a[u].y) << 16);
-                const unsigned w1 = arhc_bf16bits(a[u].z) | (arhc_bf16bits(a[u].w) << 16);
-                arhc_st64_sys(pb + j, arhc_u2{arhc_nonempty(w0), arhc_nonempty(w1)});
+                const float v[4] = {a[u].x, a[u].y, a[u].z, a[u].w};
+                arhc_push<true, P32>(pb, j, 0, v, 0u);  // dense: one record per granule, no plane
             }
         }
     }
@@ -113,11 +118,12 @@ __device__ __forceinline__ void sp_arrive(bool ok, unsigned *__restrict__ gen_pt
 // ---------------------------------------------------------------------------------------
 
 // Poll / fold / apply of the own granules g0..g1 (relative to own_row0) of this block.
-template <int K, bool F32S>
+template <int K, bool F32S, bool P32>
 __device__ __forceinline__ bool sp_rs_body(
     const float *__restrict__ part, void *__restrict__ streams, const float *__restrict__ gates,
     const char *local_mbox, unsigned bank_stride, unsigned tag, hf_device_wait_block *__restrict__ wb,
     int local_is_first, int own_row0, int g0, int g1, float *__restrict__ mixed_dbg) {
+    using Rec = typename ArhcRec<true, P32>::type;
     const int tid = threadIdx.x, T = blockDim.x;
     const long long base = (long long)own_row0 * AR_HC_HIDDEN;
     float pv[K][4];
@@ -129,9 +135,9 @@ __device__ __forceinline__ bool sp_rs_body(
             pv[k][0] = a.x; pv[k][1] = a.y; pv[k][2] = a.z; pv[k][3] = a.w;
         }
     }
-    const arhc_u2 *lb = reinterpret_cast<const arhc_u2 *>(local_mbox + (tag & 1u) * bank_stride);
-    arhc_u2 r[K];
-    const arhc_u2 *lp[K];
+    const Rec *lb = reinterpret_cast<const Rec *>(local_mbox + (tag & 1u) * bank_stride);
+    Rec r[K];
+    const Rec *lp[K];
 #pragma unroll
     for (int k = 0; k < K; ++k) {
         const int j = g0 + tid + k * T;
@@ -153,12 +159,12 @@ __device__ __forceinline__ bool sp_rs_body(
     }
     if (!hf_bounded_wait(
             [&] {
-                arhc_load_batch64<K>(r, lp);
+                arhc_load_recs<K>(r, lp);
                 bool ok = true;
 #pragma unroll
                 for (int k = 0; k < K; ++k) {
                     const int j = g0 + tid + k * T;
-                    if (j < g1) ok &= (r[k].x != ARHC_EMPTY) & (r[k].y != ARHC_EMPTY);
+                    if (j < g1) ok &= arhc_valid<true, P32>(r + k, tag);
                 }
                 return ok;
             },
@@ -168,25 +174,17 @@ __device__ __forceinline__ bool sp_rs_body(
 #pragma unroll
     for (int k = 0; k < K; ++k) {
         const int j = g0 + tid + k * T;
-        if (j < g1) arhc_st64_sys(const_cast<arhc_u2 *>(lb) + j, arhc_u2{ARHC_EMPTY, ARHC_EMPTY});
+        if (j < g1) arhc_rearm<P32>(const_cast<Rec *>(lb), j);
     }
 #pragma unroll
     for (int k = 0; k < K; ++k) {
         const int j = g0 + tid + k * T;
         if (j < g1) {
-            const unsigned rw0 = r[k].x, rw1 = r[k].y;
-            const float in[4] = {__uint_as_float(rw0 << 16), __uint_as_float(rw0 & 0xFFFF0000u),
-                                 __uint_as_float(rw1 << 16), __uint_as_float(rw1 & 0xFFFF0000u)};
+            float in[4];
+            arhc_unpack<true, P32>(r + k, in);
             float m[4];
 #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const float loc = arhc_bf16r(pv[k][e]);
-                const float fi = local_is_first ? loc : in[e];
-                const float si = local_is_first ? in[e] : loc;
-                float xi = 0.0f;
-                xi = xi + (fi + si);
-                m[e] = xi;
-            }
+            for (int e = 0; e < 4; ++e) m[e] = arhc_fold<P32>(pv[k][e], in[e], local_is_first);
             const long long e0 = base + (long long)j * 4;
             if (mixed_dbg) {
 #pragma unroll
@@ -198,7 +196,7 @@ __device__ __forceinline__ bool sp_rs_body(
     return true;
 }
 
-template <bool F32S>
+template <bool F32S, bool P32>
 __device__ __forceinline__ void sp_rs_entry(
     const float *__restrict__ part, void *__restrict__ streams, const float *__restrict__ gates,
     char *peer_mbox, const char *local_mbox, unsigned bank_stride,
@@ -218,36 +216,36 @@ __device__ __forceinline__ void sp_rs_entry(
     const int o1 = min(Go, o0 + perO);
     // (a) push the peer range
     if (p0 < p1) {
-        arhc_u2 *pb = reinterpret_cast<arhc_u2 *>(peer_mbox + (tag & 1u) * bank_stride);
-        sp_push_f32(part + (long long)peer_row0 * AR_HC_HIDDEN, pb, p0, p1);
+        auto *pb = reinterpret_cast<typename ArhcRec<true, P32>::type *>(peer_mbox + (tag & 1u) * bank_stride);
+        sp_push<P32>(part + (long long)peer_row0 * AR_HC_HIDDEN, pb, p0, p1);
     }
     // (b)-(e) own range
     bool ok = true;
     if (o0 < o1) {
         const int K = (o1 - o0 + (int)blockDim.x - 1) / (int)blockDim.x;
         switch (K) {
-        case 1: ok = sp_rs_body<1, F32S>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
-        case 2: ok = sp_rs_body<2, F32S>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
-        case 3: ok = sp_rs_body<3, F32S>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
-        case 4: ok = sp_rs_body<4, F32S>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
-        case 5: ok = sp_rs_body<5, F32S>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
-        case 6: ok = sp_rs_body<6, F32S>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
+        case 1: ok = sp_rs_body<1, F32S, P32>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
+        case 2: ok = sp_rs_body<2, F32S, P32>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
+        case 3: ok = sp_rs_body<3, F32S, P32>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
+        case 4: ok = sp_rs_body<4, F32S, P32>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
+        case 5: ok = sp_rs_body<5, F32S, P32>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
+        case 6: ok = sp_rs_body<6, F32S, P32>(part, streams, gates, local_mbox, bank_stride, tag, wb, local_is_first, own_row0, o0, o1, mixed_dbg); break;
         default: ok = false; break;
         }
     }
     sp_arrive(ok, gen_ptr, tag);
 }
 
-// BF16-bit streams (`[rows][4][2560]` u16). Arguments: those of ar_hc_write_d8_gfx1201 with
-// `count` replaced by the four row-range ints.
+// bf16 partials (FFN), BF16-bit streams (`[rows][4][2560]` u16). Arguments: those of
+// ar_hc_write_d8_gfx1201 with `count` replaced by the four row-range ints.
 extern "C" __global__ __launch_bounds__(512) void sp_hc_rs_d8_gfx1201(
     const float *__restrict__ part, unsigned short *__restrict__ streams, const float *__restrict__ gates,
     char *peer_mbox, const char *local_mbox, unsigned bank_stride,
     unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
     int local_is_first, int own_row0, int own_rows, int peer_row0, int peer_rows,
     float *__restrict__ mixed_dbg) {
-    sp_rs_entry<false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
-                       own_row0, own_rows, peer_row0, peer_rows, mixed_dbg);
+    sp_rs_entry<false, false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
+        own_row0, own_rows, peer_row0, peer_rows, mixed_dbg);
 }
 
 // F32 streams (`[rows][4][2560]` f32 holding BF16-exact values), same ABI.
@@ -257,8 +255,29 @@ extern "C" __global__ __launch_bounds__(512) void sp_hc_rs_d8_f32s_gfx1201(
     unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
     int local_is_first, int own_row0, int own_rows, int peer_row0, int peer_rows,
     float *__restrict__ mixed_dbg) {
-    sp_rs_entry<true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
-                      own_row0, own_rows, peer_row0, peer_rows, mixed_dbg);
+    sp_rs_entry<true, false>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
+        own_row0, own_rows, peer_row0, peer_rows, mixed_dbg);
+}
+
+// f32 partials (mixer out-projection), same ABI.
+extern "C" __global__ __launch_bounds__(512) void sp_hc_rs_p32_d16_gfx1201(
+    const float *__restrict__ part, unsigned short *__restrict__ streams, const float *__restrict__ gates,
+    char *peer_mbox, const char *local_mbox, unsigned bank_stride,
+    unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
+    int local_is_first, int own_row0, int own_rows, int peer_row0, int peer_rows,
+    float *__restrict__ mixed_dbg) {
+    sp_rs_entry<false, true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
+        own_row0, own_rows, peer_row0, peer_rows, mixed_dbg);
+}
+
+extern "C" __global__ __launch_bounds__(512) void sp_hc_rs_p32_d16_f32s_gfx1201(
+    const float *__restrict__ part, float *__restrict__ streams, const float *__restrict__ gates,
+    char *peer_mbox, const char *local_mbox, unsigned bank_stride,
+    unsigned *__restrict__ gen_ptr, hf_device_wait_block *__restrict__ wb,
+    int local_is_first, int own_row0, int own_rows, int peer_row0, int peer_rows,
+    float *__restrict__ mixed_dbg) {
+    sp_rs_entry<true, true>(part, streams, gates, peer_mbox, local_mbox, bank_stride, gen_ptr, wb, local_is_first,
+        own_row0, own_rows, peer_row0, peer_rows, mixed_dbg);
 }
 
 // ---------------------------------------------------------------------------------------

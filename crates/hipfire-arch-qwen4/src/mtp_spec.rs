@@ -6,7 +6,7 @@
 //!
 //! The runtime owns the speculative loop and its pending-seed contract.  This
 //! module records the native MTP count convention and lowers a verified
-//! window (greedy prefix match, or with `speculation.mtp_sampled` a sampled
+//! window (greedy prefix match, or for sampled requests a sampled
 //! verify from [`hipfire_runtime::spec_sampling`]: speculative rejection
 //! sampling, or SpecInfer naive sampling under
 //! `HIPFIRE_MTP_SAMPLED_MODE=naive`) onto the canonical runtime types.  In
@@ -36,6 +36,10 @@ use hipfire_runtime::spec::{
     SpecScratch, SpecStep, SpecTarget, Speculator,
 };
 use hipfire_runtime::spec_economics::{
+    batched_depth as economics_batched_depth, observe_agreement, observe_agreement_counts,
+    valid_us, Action, NativeWindow, WindowStats, AGREEMENT_PRIOR, DEFAULT_DECAY,
+};
+use hipfire_runtime::spec_economics::{
     derived_offer_bin, fn_measured_ar_price, fn_measured_depth_counts, fn_measured_load_identity,
     fn_measured_reference_supported, fn_measured_window_price, fn_phase1_ar_price,
     fn_phase1_window_price, native_margin_bin, CalibrationCounts, ContextBucket, DerivedAction,
@@ -44,10 +48,6 @@ use hipfire_runtime::spec_economics::{
 };
 #[cfg(test)]
 use hipfire_runtime::spec_economics::{fresh_agreement, Agreement, MAX_DEPTH};
-use hipfire_runtime::spec_economics::{
-    observe_agreement, observe_agreement_counts, valid_us, Action, NativeWindow, WindowStats,
-    AGREEMENT_PRIOR, DEFAULT_DECAY,
-};
 use hipfire_runtime::spec_sampling::{
     accept_naive_prefix, accept_sampled_prefix, naive_target_sampler, verify_sampled_draft,
     DraftVerdict, PenaltyHistory, SampleSpec, SparseDist, SpecRng,
@@ -350,14 +350,13 @@ pub fn target_commit_accept_len(accepted: &GreedyAccept) -> usize {
     accepted.accepted - usize::from(accepted_eos)
 }
 
-/// With `speculation.mtp_sampled` off (`HIPFIRE_MTP_SAMPLED=0`; on by
-/// default), native MTP verifies greedy target picks only, so a sampled
-/// request fails closed here (the router keeps such requests on AR).
+/// Native MTP verifies greedy target picks only, so a sampled request fails
+/// closed here (the router keeps such requests on AR). Sampled verification
+/// is off only for GDN state formats that `qwen4_mtp_sampled_allowed` rejects.
 pub fn require_native_greedy(temp: f32) -> Result<(), String> {
     if !temp.is_finite() || temp.abs() > 1.0e-6 {
         return Err(
-            "Qwen4 native MTP verifies greedy requests only while speculation.mtp_sampled is off (HIPFIRE_MTP_SAMPLED=0)"
-                .to_string(),
+            "Qwen4 native MTP verifies greedy requests only for this GDN state format".to_string(),
         );
     }
     Ok(())
@@ -2015,6 +2014,100 @@ fn takeover_probe(gpu: &Gpu, start: Instant) -> TakeoverProbe {
 /// the others from the few-row forward's growth (2 rows ~50 ms, 5 ~69,
 /// 8 ~98) plus ~2.7 ms per draft step.
 pub(crate) const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.7, 1.87, 2.25, 2.55, 2.75, 3.0, 3.6];
+
+/// `HIPFIRE_QWEN4_MTP_G942_DEPTH=<k>` (gfx942 only, developer knob): every
+/// native window drafts exactly `min(k, budget)` tokens on the batched route
+/// (`0` = the interleaved route), with no AR floor, no calibration and no
+/// cost table. It exists for the identity / distribution oracles and the
+/// window-cost measurement, which must run a fixed depth before any gfx942
+/// price exists. `HIPFIRE_MTP_INCREMENTAL=1` still wins over it. A malformed
+/// value fails the window (never a silent default).
+pub const MTP_G942_DEPTH_ENV: &str = "HIPFIRE_QWEN4_MTP_G942_DEPTH";
+
+/// The gfx942 opt-out of the MFMA one-row trunk GEMM (dispatch
+/// `g942_trunk_gemv`, read once). Under it the single-row decode runs a GEMV
+/// whose bytes differ from the multi-row MFMA verify chunk (M-K round 1:
+/// `forward_chunk(N)` != N `forward_token` for N >= 2), so native MTP is
+/// refused while it is set.
+const G942_TRUNK_GEMV_ENV: &str = "HIPFIRE_G942_TRUNK_GEMV";
+
+/// Measured gfx942 window cost in milliseconds, same index as
+/// [`MTP_WINDOW_COST`]: `[0]` is one interleaved token (a single-row forward
+/// plus one head step), `[d]` a batched window drafting `d` tokens (`d` head
+/// steps, the `d + 1` row verify and the repair). Values are mean window ms
+/// from `examples/qwen4_mtp_g942_cost.rs` on the MI300X (gfx942) with the
+/// stock-FP8 Flash-Next artifact (context 1743..2170, 24 windows per depth,
+/// AR token 18.22 ms). A width carries a cost only once greedy identity
+/// (MTP == AR) has proven it exact on gfx942; an unpublished width (`None`)
+/// is refused at route time, dropping to the deepest published width below
+/// it, else AR, and is never priced from the gfx1151 table. Depths >= 2 cost
+/// 4-20x a token (each window past depth 1 adds ~55-60 ms), so the economics
+/// never choose them today.
+pub(crate) const MTP_WINDOW_COST_MS_GFX942: [Option<f32>; MTP_WINDOW_COST.len()] = [
+    Some(18.26),
+    Some(21.50),
+    Some(87.16),
+    Some(146.07),
+    Some(200.79),
+    Some(253.09),
+    Some(309.41),
+    Some(365.34),
+];
+
+type G942CostMs = [Option<f32>; MTP_WINDOW_COST.len()];
+
+/// `cost_ms` as [`MTP_WINDOW_COST`] units (interleaved token = 1.0); an
+/// unmeasured depth, or every depth when `[0]` is unmeasured, is infinite.
+fn g942_cost_ratios(cost_ms: &G942CostMs) -> [f32; MTP_WINDOW_COST.len()] {
+    let mut ratios = [f32::INFINITY; MTP_WINDOW_COST.len()];
+    let Some(base) = cost_ms[0].filter(|&cost| valid_us(cost)) else {
+        return ratios;
+    };
+    for (ratio, cost) in ratios.iter_mut().zip(cost_ms) {
+        if let Some(cost) = cost.filter(|&cost| valid_us(cost)) {
+            *ratio = cost / base;
+        }
+    }
+    ratios
+}
+
+/// The deepest measured depth at or below `depth` (`0` is the interleaved
+/// baseline), else `None`.
+fn g942_priced_depth_at_or_below(cost_ms: &G942CostMs, depth: usize) -> Option<usize> {
+    let ratios = g942_cost_ratios(cost_ms);
+    (0..=depth.min(ratios.len() - 1))
+        .rev()
+        .find(|&d| ratios[d].is_finite())
+}
+
+/// Whether any batched depth `1..=k` has a measured gfx942 cost.
+fn g942_any_batched_priced(cost_ms: &G942CostMs, k: usize) -> bool {
+    let ratios = g942_cost_ratios(cost_ms);
+    (1..=k.min(ratios.len() - 1)).any(|d| ratios[d].is_finite())
+}
+
+/// Parse [`MTP_G942_DEPTH_ENV`]: unset or blank is `None`.
+fn parse_g942_depth(raw: Option<&str>) -> Result<Option<usize>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(None);
+    };
+    let depth = raw
+        .parse::<usize>()
+        .map_err(|_| format!("{MTP_G942_DEPTH_ENV}={raw:?} is not a draft depth"))?;
+    if depth >= MTP_WINDOW_COST.len() {
+        return Err(format!(
+            "{MTP_G942_DEPTH_ENV}={depth} exceeds the native depth limit {}",
+            MTP_WINDOW_COST.len() - 1
+        ));
+    }
+    Ok(Some(depth))
+}
+
+/// Whether `HIPFIRE_G942_TRUNK_GEMV` is set (same snapshot as dispatch).
+fn g942_trunk_gemv_requested() -> bool {
+    hipfire_config::developer_bool(G942_TRUNK_GEMV_ENV, false)
+}
+
 /// The singleton drafter's decay on gfx1151 (~30-window memory). The floor
 /// retires a request to AR, stickily, once no native route's measured cost
 /// per expected token beats AR. With the ~8-window memory an early run of
@@ -2203,8 +2296,7 @@ impl SampledMode {
     }
 }
 
-/// Per-request sampled verification (`speculation.mtp_sampled`, temperature
-/// above zero).
+/// Per-request sampled verification (temperature above zero).
 ///
 /// Target policy: the Qwen4 AR producer is host `sampler::sample_cpu` over
 /// the FULL rendered prompt plus the generated tokens, with the request's
@@ -3662,7 +3754,7 @@ pub struct Qwen4MtpDrafter {
     /// counts (see `observe_agreement`); picks the verify route and draft
     /// depth when `HIPFIRE_MTP_INCREMENTAL` is unset.
     agreement: Vec<(f32, f32)>,
-    /// `speculation.mtp_sampled`, resolved at construction.
+    /// Sampled verification; `with_sampled_allowed` clears it for refused GDN formats.
     sampled_enabled: bool,
     /// `HIPFIRE_MTP_SAMPLED_MODE`, resolved at construction; an invalid
     /// value fails sampled requests with its message.
@@ -3747,6 +3839,18 @@ pub struct Qwen4MtpDrafter {
     /// Per-window decay of `agreement`, `ngram_agreement` and the floor's
     /// measured costs on the loaded arch ([`singleton_agreement_decay`]).
     agreement_decay: f32,
+    /// The loaded GPU is gfx942 ([`Self::bind_arch`]): the verify block must be
+    /// bitwise the single-row decode and only measured gfx942 costs price a
+    /// native depth.
+    g942: bool,
+    /// gfx942 window costs in ms ([`MTP_WINDOW_COST_MS_GFX942`]).
+    g942_cost_ms: G942CostMs,
+    /// [`MTP_G942_DEPTH_ENV`] as bound on gfx942 (`Err`: malformed).
+    g942_depth: Result<Option<usize>, String>,
+    /// `HIPFIRE_G942_TRUNK_GEMV` is set on gfx942 ([`G942_TRUNK_GEMV_ENV`]).
+    g942_gemv: bool,
+    /// This request was refused native MTP on gfx942 and runs AR to its end.
+    g942_refused: bool,
     /// `[seed, candidates..]` of the current takeover window (reused).
     takeover_block: Vec<u32>,
     /// Same-request AR floor; reset by request configuration or a newly
@@ -5372,7 +5476,7 @@ impl Qwen4MtpDrafter {
             row_hidden: None,
             prefill_rows: 0,
             agreement: vec![AGREEMENT_PRIOR; capacity],
-            sampled_enabled: hipfire_config::mtp_sampled_enabled(),
+            sampled_enabled: true,
             sampled_mode: SampledMode::from_env(),
             sampled: None,
             append_scratch: None,
@@ -5397,6 +5501,11 @@ impl Qwen4MtpDrafter {
             ngram_warm_depths: 0,
             ngram_row_cost: None,
             agreement_decay: DEFAULT_DECAY,
+            g942: false,
+            g942_cost_ms: MTP_WINDOW_COST_MS_GFX942,
+            g942_depth: Ok(None),
+            g942_gemv: false,
+            g942_refused: false,
             takeover_block: Vec::new(),
             floor,
             floor_enabled: true,
@@ -5474,8 +5583,7 @@ impl Qwen4MtpDrafter {
     }
 
     /// Restrict sampled verification to loads that allow it: `false` turns
-    /// it off (sampled requests stay on AR), `true` keeps what
-    /// `speculation.mtp_sampled` resolved to; it never turns it on.
+    /// it off (sampled requests stay on AR); `true` leaves the flag unchanged.
     pub fn with_sampled_allowed(mut self, allowed: bool) -> Self {
         self.sampled_enabled &= allowed;
         self
@@ -5945,19 +6053,68 @@ impl Qwen4MtpDrafter {
 
     /// With no agreement evidence, start at K=3 (or the smaller budget);
     /// evidence may still grow the chooser to the unchanged configured cap.
+    /// gfx942 prices every depth from its measured table from the first
+    /// window (the prior agreement included): its depth >= 2 windows cost
+    /// several tokens, so the K=3 start would run the request's probe
+    /// windows at a measured loss.
     fn batched_depth(&self, k: usize) -> usize {
-        if self.agreement.iter().all(|&entry| entry == AGREEMENT_PRIOR) {
+        if self.g942 {
+            economics_batched_depth(&self.agreement, k, &g942_cost_ratios(&self.g942_cost_ms))
+        } else if self.agreement.iter().all(|&entry| entry == AGREEMENT_PRIOR) {
             k.min(3)
         } else {
             self.floor.provisional_depth(&self.agreement, k)
         }
     }
 
+    /// The window-cost prior of `depth` in [`MTP_WINDOW_COST`] units: the
+    /// gfx1151 table everywhere except gfx942, which has its own measured
+    /// table and is infinite where that has no measurement (never the
+    /// gfx1151 value).
+    fn window_cost_prior(&self, depth: usize) -> f32 {
+        if self.g942 {
+            g942_cost_ratios(&self.g942_cost_ms)
+                .get(depth)
+                .copied()
+                .unwrap_or(f32::INFINITY)
+        } else {
+            MTP_WINDOW_COST.get(depth).copied().unwrap_or(f32::INFINITY)
+        }
+    }
+
+    /// Why gfx942 serves this window on AR instead of native MTP, if it must:
+    /// the GEMV trunk route (its single-row decode is not bitwise the MFMA
+    /// verify chunk) always; no measured gfx942 window cost for any depth up
+    /// to `k` unless the window is `pinned` (a forced route or depth, which
+    /// bypasses the cost chooser by design).
+    fn g942_refusal(&self, k: usize, pinned: bool) -> Option<&'static str> {
+        if self.g942_gemv {
+            return Some(
+                "HIPFIRE_G942_TRUNK_GEMV=1 makes AR decode a GEMV that is not bitwise equal to the multi-row verify",
+            );
+        }
+        if !pinned && !g942_any_batched_priced(&self.g942_cost_ms, k) {
+            return Some("no measured gfx942 window cost for any draft depth");
+        }
+        None
+    }
+
+    /// Latch the gfx942 refusal for the rest of the request (the first window
+    /// takes the resource pass, later ones skip it) and log it once.
+    fn g942_refuse(&mut self, reason: &str, plan: WindowPlan) -> WindowPlan {
+        self.g942_refused = true;
+        self.stats.mtp_retired = true;
+        if !self.follower {
+            eprintln!("QWEN4_MTP gfx942: native MTP refused ({reason}); this request runs AR");
+        }
+        plan
+    }
+
     /// Price both sources on the same clock; unsupported arches retain the
     /// original chooser. Depth drafts require depth + 1 verify rows.
     fn ngram_window_cost(&self, depth: usize) -> f32 {
         let Some((single, extra)) = self.ngram_row_cost else {
-            return MTP_WINDOW_COST.get(depth).copied().unwrap_or(f32::INFINITY);
+            return self.window_cost_prior(depth);
         };
         if self.floor_enabled {
             if let Some(cost) = self.floor.batched_cost(depth) {
@@ -8352,6 +8509,18 @@ impl Qwen4MtpDrafter {
         self.ngram_row_cost = Self::ngram_row_cost_for(gpu);
         self.agreement_decay = singleton_agreement_decay(&gpu.arch);
         self.floor.set_decay(self.agreement_decay);
+        self.g942 = gpu.arch_caps.is_gfx942();
+        if self.g942 {
+            self.g942_gemv = g942_trunk_gemv_requested();
+            self.g942_depth = parse_g942_depth(
+                hipfire_config::developer_var(MTP_G942_DEPTH_ENV)
+                    .ok()
+                    .as_deref(),
+            );
+        } else {
+            self.g942_gemv = false;
+            self.g942_depth = Ok(None);
+        }
     }
 
     /// Every timing- or host-state-dependent decision of the next window,
@@ -8415,11 +8584,23 @@ impl Qwen4MtpDrafter {
                 self.proposal_capacity()
             ));
         }
+        // gfx942's fixed-depth knob ([`MTP_G942_DEPTH_ENV`]) pins the window
+        // like a forced route; `HIPFIRE_MTP_INCREMENTAL=1` still wins.
+        if self.g942 {
+            if let Err(error) = &self.g942_depth {
+                return Err(error.clone());
+            }
+        }
+        let g942_depth = if self.g942 && incremental != Some("1") {
+            self.g942_depth.clone().ok().flatten()
+        } else {
+            None
+        };
         // A developer-forced route is a diagnostic override: the floor
         // neither calibrates nor retires, so the pinned route runs as before.
         // `HIPFIRE_MTP_AR_FLOOR=0` (`floor_enabled == false`) bypasses the
         // floor the same way and restores the pre-floor chooser.
-        let forced = matches!(incremental, Some("0" | "1"));
+        let forced = matches!(incremental, Some("0" | "1")) || g942_depth.is_some();
         let floor_active = self.floor_enabled && !forced;
         self.observe_think_close(emitted, floor_active);
         #[cfg(feature = "reference-parity")]
@@ -8456,6 +8637,18 @@ impl Qwen4MtpDrafter {
                 ngram_candidates: Vec::new(),
             });
         }
+        // gfx942: the verify block must be bitwise the single-row decode, and
+        // no gfx1151 price may stand in for a depth nobody measured here. A
+        // refused request runs AR: the first window takes the resource pass
+        // (like a floor retirement), later ones are head-free.
+        if self.g942 {
+            if self.g942_refused {
+                return Ok(ar(WindowRoute::ArRetired));
+            }
+            if let Some(reason) = self.g942_refusal(native_k, forced) {
+                return Ok(self.g942_refuse(reason, ar(WindowRoute::ArRouted)));
+            }
+        }
         if floor_active && self.floor.needs_ar_sample() {
             return Ok(ar(WindowRoute::ArCalibrate));
         }
@@ -8478,6 +8671,7 @@ impl Qwen4MtpDrafter {
         // interleaved verify costs one forward per emitted token and wastes no
         // draft. `HIPFIRE_MTP_INCREMENTAL=0|1` forces a route.
         let depth = match incremental {
+            _ if g942_depth.is_some() => g942_depth.map_or(k, |depth| depth.min(k)),
             Some("0") => k,
             Some("1") => 0,
             _ if !self.floor_enabled => self.floor_off_depth(k),
@@ -8492,6 +8686,22 @@ impl Qwen4MtpDrafter {
                 Action::Interleaved => 0,
                 Action::Native(depth) => depth,
             },
+        };
+        // gfx942 prices only measured depths: a chosen depth without a
+        // measurement drops to the deepest measured one below it (the
+        // interleaved baseline included), else the request runs AR.
+        let depth = if self.g942 && !forced {
+            match g942_priced_depth_at_or_below(&self.g942_cost_ms, depth) {
+                Some(priced) => priced,
+                None => {
+                    return Ok(self.g942_refuse(
+                        "no measured gfx942 window cost at or below the chosen depth",
+                        ar(WindowRoute::ArRouted),
+                    ));
+                }
+            }
+        } else {
+            depth
         };
         let mut plan = WindowPlan {
             route: WindowRoute::Native { depth },
@@ -9321,8 +9531,7 @@ impl Qwen4MtpDrafter {
             None if self.request.temp.abs() > 1.0e-6 => {
                 return Err(
                     "Qwen4 native MTP under qwen4 topology.pp verifies greedy requests only \
-                     while sampled verification is off (speculation.mtp_sampled / \
-                     HIPFIRE_MTP_SAMPLED=0)"
+                     while sampled verification is off"
                         .to_string(),
                 );
             }
@@ -10482,13 +10691,14 @@ impl MtpDrafter for Qwen4MtpDrafter {
         !self.sampled_enabled
     }
 
-    /// With `speculation.mtp_sampled`, a sampled request verifies by
+    /// A sampled request verifies by
     /// speculative rejection sampling, or naive sampling under
     /// `HIPFIRE_MTP_SAMPLED_MODE=naive`; greedy requests keep the argmax match.
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         self.request = cfg;
         self.emitted_seen = None;
         self.head_lag.clear();
+        self.g942_refused = false;
         self.retained = None;
         self.floor_pending = None;
         self.floor_enabled =
@@ -10610,7 +10820,7 @@ pub fn build_qwen4_mtp_speculator(
 /// Whether a load with GDN state format `gdn` may verify sampled requests
 /// (temperature > 0) through native MTP. Under `q8_ef` they run AR instead
 /// until the sampled-MTP law (G5) is verified on a GPU; greedy native MTP is
-/// unchanged. Every other format keeps `speculation.mtp_sampled`. The match
+/// unchanged. Every other format keeps sampled verification. The match
 /// is exhaustive so a new format forces a decision here.
 pub fn qwen4_mtp_sampled_allowed(gdn: crate::GdnStateFormat) -> bool {
     match gdn {
@@ -10805,9 +11015,12 @@ pub(crate) fn mtp_prefill_chunk_needs_pick(
     !skip_intermediate || end == prompt_len
 }
 /// Whether this GPU's GDN route captures verify rows: row capture rides the
-/// few-row persistent GDN recurrence.
+/// few-row persistent GDN recurrence. gfx942 captures the F32 state only, so
+/// there the stock-FP8 profile (which pins it, [`crate::state::resolve_gdn_format`])
+/// is required.
 pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
-    gpu.arch_caps.has_gfx11_plus_simt()
+    gpu.arch_caps.has_qwen4_gdn_row_capture()
+        && (!gpu.arch_caps.is_gfx942() || config.profile.is_stock_fp8())
         && config.linear_key_head_dim == 128
         && config.linear_value_head_dim == 128
         && config.linear_conv_kernel_dim == 4
@@ -10922,7 +11135,7 @@ pub fn native_mtp_device_bytes(
 
 /// [`native_mtp_device_bytes`] with the GDN capture ring sized under `ring_config` instead of
 /// the head's geometry: the EP reserve census passes the trunk shard's rank-local config
-/// (`HIPFIRE_EP_RESERVE_CENSUS`: 24 value heads, half of the global ring), since the rank
+/// (24 value heads, half of the global ring), since the rank
 /// allocates the ring on its own trunk's state.
 #[allow(clippy::too_many_arguments)]
 pub fn native_mtp_device_bytes_ring(
@@ -12226,6 +12439,159 @@ mod tests {
         assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRetired);
     }
 
+    fn g942_drafter() -> Qwen4MtpDrafter {
+        let mut drafter = Qwen4MtpDrafter::new(3, 4096, None);
+        drafter.g942 = true;
+        drafter
+    }
+
+    #[test]
+    fn g942_without_a_measured_cost_refuses_native_depths_and_never_borrows_the_gfx1151_table() {
+        let mut drafter = g942_drafter();
+        drafter.g942_cost_ms = [None; MTP_WINDOW_COST.len()];
+        for depth in 0..MTP_WINDOW_COST.len() {
+            assert!(drafter.window_cost_prior(depth).is_infinite(), "{depth}");
+        }
+        assert!(drafter.ngram_window_cost(3).is_infinite());
+        // gfx1151's table still prices every other arch.
+        let other = Qwen4MtpDrafter::new(3, 4096, None);
+        assert_eq!(other.window_cost_prior(3), MTP_WINDOW_COST[3]);
+        // Even with a calibrated floor (which would route Native on gfx1151)
+        // the request runs AR: the first window takes the resource pass, the
+        // rest are head-free, and the latch is the request's.
+        drafter.floor.seed_calibrated(30_000.0);
+        let plan = plan_of(&mut drafter, 3, None);
+        assert_eq!(plan.route, WindowRoute::ArRouted);
+        assert!(drafter.g942_refused && drafter.stats.mtp_retired);
+        assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRetired);
+        drafter.configure_request(SpecRequestConfig::default());
+        assert!(!drafter.g942_refused);
+    }
+
+    #[test]
+    fn g942_forced_depth_pins_a_floorless_native_window() {
+        let mut drafter = g942_drafter();
+        drafter.g942_depth = Ok(Some(2));
+        let plan = plan_of(&mut drafter, 3, None);
+        assert_eq!(plan.route, WindowRoute::Native { depth: 2 });
+        assert!(!plan.floor_active && !drafter.g942_refused);
+        assert_eq!(
+            plan_of(&mut drafter, 1, None).route,
+            WindowRoute::Native { depth: 1 }
+        );
+        // The interleaved pin still wins; INCREMENTAL=0 takes the forced depth.
+        assert_eq!(
+            plan_of(&mut drafter, 3, Some("1")).route,
+            WindowRoute::Native { depth: 0 }
+        );
+        assert_eq!(
+            plan_of(&mut drafter, 3, Some("0")).route,
+            WindowRoute::Native { depth: 2 }
+        );
+        // The knob is gfx942's: elsewhere it is ignored.
+        let mut other = Qwen4MtpDrafter::new(3, 4096, None);
+        other.g942_depth = Ok(Some(2));
+        assert_eq!(plan_of(&mut other, 3, None).route, WindowRoute::ArCalibrate);
+    }
+
+    #[test]
+    fn g942_depth_env_parses_strictly() {
+        assert_eq!(parse_g942_depth(None), Ok(None));
+        assert_eq!(parse_g942_depth(Some("  ")), Ok(None));
+        assert_eq!(parse_g942_depth(Some(" 3 ")), Ok(Some(3)));
+        assert_eq!(parse_g942_depth(Some("0")), Ok(Some(0)));
+        assert_eq!(parse_g942_depth(Some("7")), Ok(Some(7)));
+        for bad in ["8", "-1", "x", "2.5"] {
+            assert!(parse_g942_depth(Some(bad)).is_err(), "{bad}");
+        }
+        let mut drafter = g942_drafter();
+        drafter.g942_depth = parse_g942_depth(Some("9"));
+        let error = drafter
+            .plan_window_with(&[0, 1], 3, None, false)
+            .expect_err("a malformed depth fails the window");
+        assert!(error.contains(MTP_G942_DEPTH_ENV), "{error}");
+    }
+
+    #[test]
+    fn g942_gemv_trunk_refuses_native_even_with_a_forced_depth() {
+        let mut drafter = g942_drafter();
+        drafter.g942_depth = Ok(Some(2));
+        drafter.g942_gemv = true;
+        assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRouted);
+        assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRetired);
+        let mut pinned = g942_drafter();
+        pinned.g942_gemv = true;
+        assert_eq!(
+            plan_of(&mut pinned, 3, Some("0")).route,
+            WindowRoute::ArRouted
+        );
+    }
+
+    #[test]
+    fn g942_measured_costs_price_only_their_own_depths() {
+        let unmeasured = || {
+            let mut drafter = g942_drafter();
+            drafter.g942_cost_ms = [None; MTP_WINDOW_COST.len()];
+            drafter
+        };
+        let mut drafter = unmeasured();
+        // Only the interleaved baseline: no batched depth is priced.
+        drafter.g942_cost_ms[0] = Some(30.0);
+        assert_eq!(plan_of(&mut drafter, 3, None).route, WindowRoute::ArRouted);
+        // Batched depths without the baseline cannot be priced either.
+        let mut no_base = unmeasured();
+        no_base.g942_cost_ms[2] = Some(50.0);
+        assert_eq!(plan_of(&mut no_base, 3, None).route, WindowRoute::ArRouted);
+        // Baseline and depth 2 measured: depth 2 is the only priced batched
+        // depth and it beats the baseline at the prior agreement.
+        let mut priced = unmeasured();
+        priced.g942_cost_ms[0] = Some(30.0);
+        priced.g942_cost_ms[2] = Some(60.0);
+        assert_eq!(priced.window_cost_prior(0), 1.0);
+        assert_eq!(priced.window_cost_prior(2), 2.0);
+        assert!(priced.window_cost_prior(1).is_infinite());
+        priced.floor.seed_calibrated(30_000.0);
+        let plan = plan_of(&mut priced, 3, None);
+        assert_eq!(plan.route, WindowRoute::Native { depth: 2 });
+        assert!(plan.floor_active && !priced.g942_refused);
+    }
+
+    #[test]
+    fn g942_shipped_table_prices_published_depths_and_keeps_a_batched_plan_at_depth_one() {
+        let mut drafter = g942_drafter();
+        let base = MTP_WINDOW_COST_MS_GFX942[0].expect("the baseline is published");
+        assert!(base > 0.0);
+        for (depth, cost) in MTP_WINDOW_COST_MS_GFX942.iter().enumerate() {
+            if let Some(cost) = cost {
+                let prior = drafter.window_cost_prior(depth);
+                assert!(prior.is_finite(), "{depth}");
+                assert_eq!(prior, cost / base, "{depth}");
+            }
+        }
+        // An unpublished depth 2 maps to the deepest published one below it.
+        let mut table = MTP_WINDOW_COST_MS_GFX942;
+        table[2] = None;
+        assert_eq!(g942_priced_depth_at_or_below(&table, 2), Some(1));
+        assert_eq!(g942_priced_depth_at_or_below(&table, 0), Some(0));
+        // At the prior agreement (a fresh request) gfx942 already prices from
+        // its table: depth 1, never the K=3 start of the other arches.
+        assert!(drafter
+            .agreement
+            .iter()
+            .all(|&entry| entry == AGREEMENT_PRIOR));
+        assert_eq!(drafter.batched_depth(3), 1);
+        // With high agreement the measured prices (depth >= 2 costs several
+        // tokens) keep the chosen batched depth at or below 1.
+        for entry in drafter.agreement.iter_mut() {
+            *entry = (19.0, 20.0);
+        }
+        assert!(
+            drafter.batched_depth(3) <= 1,
+            "{}",
+            drafter.batched_depth(3)
+        );
+    }
+
     fn plan_window_budget_error(drafter: &mut Qwen4MtpDrafter, k: usize) -> String {
         drafter
             .plan_window_with(&[0, 1], k, None, false)
@@ -12353,14 +12719,13 @@ mod tests {
     #[test]
     fn q8_and_fp32_sampled_mtp_unchanged() {
         use crate::GdnStateFormat;
-        let sampled = hipfire_config::mtp_sampled_enabled();
         let plain = Qwen4MtpDrafter::new(3, 4096, None);
-        assert_eq!(plain.sampled_enabled, sampled);
+        assert!(plain.sampled_enabled);
         for gdn in [GdnStateFormat::Q8, GdnStateFormat::F32] {
             let speculator =
                 build_qwen4_mtp_speculator(3, None, 4096, None, None, None, false, gdn, None);
-            assert_eq!(speculator.supports_temp_verify(), sampled, "{gdn:?}");
-            assert_eq!(speculator.requires_greedy(), !sampled, "{gdn:?}");
+            assert!(speculator.supports_temp_verify(), "{gdn:?}");
+            assert!(!speculator.requires_greedy(), "{gdn:?}");
             let gated = Qwen4MtpDrafter::new(3, 4096, None)
                 .with_sampled_allowed(qwen4_mtp_sampled_allowed(gdn));
             assert_eq!(gated.sampled_enabled, plain.sampled_enabled, "{gdn:?}");

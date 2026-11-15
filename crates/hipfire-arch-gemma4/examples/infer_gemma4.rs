@@ -166,8 +166,7 @@ fn main() {
         }
         gen.push(next);
         history.push(next);
-        // Decode loop uses the hipGraph path when HIPFIRE_GEMMA4_GRAPH=1
-        // (default off → falls through to eager decode_step internally).
+        // Decode loop uses the hipGraph path (eager when capture is inexact).
         logits = decode_step_with_graph(&cfg, &weights, &mut state, &mut gpu, next, pos as u32)
             .expect("decode");
         pos += 1;

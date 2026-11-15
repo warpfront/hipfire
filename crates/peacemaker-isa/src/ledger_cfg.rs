@@ -16,13 +16,16 @@
 //!
 //! * Path-sensitive: each path carries its own `Ledger`; nothing is joined, so
 //!   an operation is pending exactly on the paths that issue it (no `maybe`
-//!   ghost loads). Only states are deduplicated, by [`Ledger::replay_state_key`]
-//!   (pending shapes without operation ids; on gfx942 also without the source
-//!   registers of pending stores, which the gfx942 replay never reads: an exact
-//!   observational equivalence, no operation merged or dropped), at labels, the
-//!   only join points: a forward branch is explored as its own alternative; a
-//!   backward edge is explored until a label's state set reaches a fixed point,
-//!   and ids that merely advance per iteration do not grow it.
+//!   ghost loads). States are deduplicated at labels by id-free pending shapes,
+//!   omitting gfx942 store source locks that replay never reads. Strict gfx942
+//!   replay also identifies continuation-equivalent VM load queues: if EVERY
+//!   path reaches vmcnt(0), every intervening VM issue is an ordered load, and
+//!   no incoming load destination is read OR written before that drain, the
+//!   incoming VM queue is omitted from the key only. Stores/FLAT never qualify;
+//!   LGKM/EXP and control-proof directions remain in the key. Actual ledgers,
+//!   recording, waits and issue clipping are unchanged (`vm_drain_observers`).
+//!   Backedges run until the label state set reaches a fixed point; operation
+//!   ids that merely advance per iteration do not grow it.
 //! * Waits are decoded from the instruction text actually in the program, never
 //!   from the builder's `WaitProof` records: gfx12 `s_wait_loadcnt`/`storecnt`/
 //!   `dscnt`/`kmcnt` and the combined `loadcnt_dscnt`/`storecnt_dscnt`,
@@ -77,11 +80,11 @@
 //!   the label and those waits, so this is the walk it would do anyway; distinct incoming
 //!   states that a full drain collapses are one state. General rule, no label is special
 //!   and the state bound is unchanged.
-//! * No operation is ever dropped except by that bound: more than [`COUNTER_CAP`] pending
-//!   operations on one counter (reachable only for unclipped mixed or out-of-order queues),
-//!   more than [`MAX_STATES_PER_LABEL`] distinct states at one label, more than
-//!   [`MAX_STEPS`] instruction visits, or control flow the walk cannot follow (indirect
-//!   branches, calls) fail closed.
+//! * No operation is ever dropped from the ledger except by an explicit wait or
+//!   the architectural issue bound. More than [`COUNTER_CAP`] pending operations
+//!   on one counter (unclipped mixed/out-of-order queues), more than
+//!   [`MAX_STATES_PER_LABEL`] continuation classes at one label, more than
+//!   [`MAX_STEPS`] visits, or unknown control flow fail closed.
 //!
 //! A violation names the instruction, the counter wait it lacks, and the branch
 //! edges of the path that reaches it.
@@ -91,6 +94,27 @@
 //! (so the dispatcher after a body sees the state the body leaves) but does not report a
 //! hazard whose pc lies inside a body span; every hazard outside the exact spans is
 //! fatal and all are reported. It proves the dispatcher only, never a body.
+//!
+//! Static branch proofs (strict only, crate-private [`verify_with_branch_proofs`]): the
+//! typed gfx942 certification passes one `ledger_control::EdgeChoice` per instruction. A
+//! conditional `s_cbranch_scc0/scc1` proven (block-local scalar facts valid for every state
+//! entering its basic block) to go one way follows only that edge, with the current ledger and
+//! the same path-witness edge; its other edge is not walked. A second table of
+//! `ledger_control::EntryProof`s refines the same decision for executions that entered the
+//! branch's block over one specific edge (a join whose predecessor leaves a constant in an
+//! SGPR, e.g. hipcc's `s_mov_b64 s[14:15], 0; s_branch J` / `J: s_and_b64 s[14:15], s[14:15],
+//! exec; s_cselect_b32; s_cmp_lg_u32; s_cbranch_scc1`): the walk remembers the edge it
+//! crossed into a label, applies the matching proof to the block's terminal branch only, and
+//! keys the label's dedup state on the applied direction as well, so two arrivals with equal
+//! pending memory but different feasible directions are never merged. This is a
+//! control-feasibility filter, not a hazard rule: memory recording, waits, the issue clip, the
+//! caps and the ledger half of the dedup key (`Ledger::replay_state_key` / `full_state_key`)
+//! are untouched. Equal extended keys have identical successors. Edge-conditioned choices
+//! can split an old label state, so no monotone state-count reduction is assumed; the same
+//! unchanged state/step caps still fail closed. With no `EntryProof` the label key is the old
+//! one. Target labels of an
+//! impossible edge are still validated. [`verify`], [`verify_emitted`], [`verify_dispatcher`]
+//! and [`verify_dispatcher_emitted`] pass no proofs (all `Both`).
 //!
 //! Region summary (dispatcher mode only): a body whose every exiting path provably leaves
 //! every memory counter drained is not walked; the walk goes from its entry label to its
@@ -106,6 +130,7 @@
 //! [`verify`] checks. It is general (all counters, no label names) and finite, so it
 //! bounds the walk without raising [`MAX_STATES_PER_LABEL`].
 
+use crate::ledger_control::{EdgeChoice, EntryProof};
 use crate::{
     arch::Arch,
     insn::{Instruction, MemoryClass, Program},
@@ -526,6 +551,39 @@ pub fn verify_dispatcher(program: &Program, body: &[Range<usize>]) -> Result<Sta
     walk(program, body, Mode::Dispatcher { body })
 }
 
+/// [`verify`] under the static edge decisions of a typed control analysis
+/// (`ledger_control::EdgeChoice`, one per instruction of `program`, labels included, and the
+/// edge-conditioned `ledger_control::EntryProof`s).
+/// Crate-private and strict only: a `Taken`/`Fallthrough` entry on a conditional
+/// `s_cbranch_scc0/scc1` follows that edge alone (target with the current ledger, or the next
+/// instruction with the current ledger) and is sound only if the producer proved it for every
+/// state entering the branch's basic block (`cdna::lifted::ledger_program`). An `EntryProof`
+/// does the same for the terminal branch of a labelled block, only for walks that reached the
+/// label over its named edge, and is sound only if the producer proved it for every execution
+/// crossing that edge. Everything else is the same walk: the same memory, wait, key and cap
+/// rules, the same ledger half of the label dedup key (`Ledger::replay_state_key`, which
+/// depends on the instruction, its edge choice and the pending state only), the same target
+/// validation of an impossible edge. `choices` of the wrong length, a proof on a label or any
+/// non-eligible instruction, or an `EntryProof` whose edge, label or branch is not exactly
+/// what it names (`check_branch_proofs`) is an error. All `Both` and no entries is exactly
+/// [`verify`].
+pub(crate) fn verify_with_branch_proofs(
+    program: &Program,
+    foreign: &[Range<usize>],
+    choices: &[EdgeChoice],
+    entries: &[EntryProof],
+) -> Result<Stats, String> {
+    walk_with(
+        program,
+        foreign,
+        Mode::Strict,
+        Ledger::replay_state_key,
+        Some(choices),
+        entries,
+        true,
+    )
+}
+
 /// The bit of `counter` in a may-pending set.
 fn counter_bit(counter: Counter) -> u8 {
     match counter {
@@ -657,18 +715,273 @@ fn region_exit_is_drained(
 }
 
 fn walk(program: &Program, foreign: &[Range<usize>], mode: Mode) -> Result<Stats, String> {
-    walk_with(program, foreign, mode, Ledger::replay_state_key)
+    walk_with(
+        program,
+        foreign,
+        mode,
+        Ledger::replay_state_key,
+        None,
+        &[],
+        true,
+    )
 }
 
-/// [`walk`] with the label-dedup key as a parameter: production always passes
-/// `Ledger::replay_state_key`; the tests pass the un-canonicalized `full_state_key` to compare
-/// outcomes against the baseline keying.
+/// Why `choices` and `entries` cannot be the proof tables of `program`: `choices` must have
+/// exactly one entry per instruction and only an eligible conditional branch
+/// (`s_cbranch_scc0/scc1` naming a label) may carry a proof, so labels and every other
+/// instruction are `Both`. Each [`EntryProof`] must name exactly what the walk will find:
+/// a label at `label`; a conditional `s_cbranch_scc0/scc1` at `branch` that is `Both` in
+/// `choices`, with no label, branch or `s_endpgm` strictly between them (one basic block);
+/// an edge `from` -> `label` that really exists (the taken edge of the branch at `from`
+/// naming that label, or a fall-through from the instruction before the label, which must
+/// not end control flow); a `Taken`/`Fallthrough` direction; and each edge at most once.
+fn check_branch_proofs(
+    program: &Program,
+    choices: &[EdgeChoice],
+    entries: &[EntryProof],
+) -> Result<(), String> {
+    let insns = &program.instructions;
+    if choices.len() != insns.len() {
+        return Err(format!(
+            "branch proof map has {} entries for {} instructions (one per instruction, labels \
+             included)",
+            choices.len(),
+            insns.len()
+        ));
+    }
+    let eligible = |pc: usize| {
+        let text = insns[pc].text.trim();
+        is_label(text).is_none()
+            && matches!(insns[pc].mnemonic(), "s_cbranch_scc0" | "s_cbranch_scc1")
+            && sync::branch_target(text).is_some()
+    };
+    for (pc, (choice, insn)) in choices.iter().zip(insns).enumerate() {
+        if *choice != EdgeChoice::Both && !eligible(pc) {
+            return Err(format!(
+                "branch proof map: pc {pc} `{}` carries {choice:?} but is not a conditional \
+                 s_cbranch_scc0/scc1 branch",
+                insn.text.trim()
+            ));
+        }
+    }
+    let mut edges: HashSet<(usize, bool)> = HashSet::new();
+    for entry in entries {
+        let EntryProof {
+            from,
+            taken,
+            label,
+            branch,
+            choice,
+        } = *entry;
+        let bad = |why: &str| Err(format!("branch entry proof {entry:?}: {why}"));
+        if choice == EdgeChoice::Both {
+            return bad("a proof must select an edge");
+        }
+        if from >= insns.len() || label >= insns.len() || branch >= insns.len() {
+            return bad("a pc is outside the program");
+        }
+        let Some(name) = is_label(insns[label].text.trim()) else {
+            return bad("`label` is not a label");
+        };
+        if !eligible(branch) || label >= branch {
+            return bad("`branch` is not a conditional s_cbranch_scc0/scc1 after the label");
+        }
+        if choices[branch] != EdgeChoice::Both {
+            return bad("the branch already carries a block-local proof");
+        }
+        for (pc, insn) in insns.iter().enumerate().take(branch).skip(label + 1) {
+            let text = insn.text.trim();
+            if is_label(text).is_some()
+                || sync::branch_target(text).is_some()
+                || insn.mnemonic().starts_with("s_endpgm")
+                || indirect(insn.mnemonic())
+            {
+                return bad(&format!("pc {pc} `{text}` ends or splits the block"));
+            }
+        }
+        let real_edge = if taken {
+            sync::branch_target(insns[from].text.trim()) == Some(name)
+        } else {
+            let mnemonic = insns[from].mnemonic();
+            from + 1 == label
+                && mnemonic != "s_branch"
+                && !mnemonic.starts_with("s_endpgm")
+                && !indirect(mnemonic)
+        };
+        if !real_edge {
+            return bad("`from` -> `label` is not a control-flow edge of the program");
+        }
+        if !edges.insert((from, taken)) {
+            return bad("the edge already has a proof");
+        }
+    }
+    Ok(())
+}
+
+/// Registers observed (read OR written, irrespective of EXEC) before a full VM drain.
+/// RegRef's u8 base/length can describe up to 510 dwords; keep all of that domain,
+/// with disjoint scalar, vector and accumulator banks.
+#[derive(Clone, Copy, Default)]
+struct VmObservers([u64; 24]);
+
+impl VmObservers {
+    fn bank(reg: RegRef) -> usize {
+        match reg.kind {
+            Kind::V => 0,
+            Kind::S => 8,
+            Kind::A => 16,
+        }
+    }
+
+    fn insert(&mut self, reg: RegRef) {
+        let bank = Self::bank(reg);
+        for r in usize::from(reg.base)..usize::from(reg.base) + usize::from(reg.len) {
+            self.0[bank + r / 64] |= 1 << (r % 64);
+        }
+    }
+
+    fn observes(&self, reg: RegRef) -> bool {
+        let bank = Self::bank(reg);
+        (usize::from(reg.base)..usize::from(reg.base) + usize::from(reg.len))
+            .any(|r| self.0[bank + r / 64] & (1 << (r % 64)) != 0)
+    }
+
+    fn union(&mut self, other: Self) {
+        for (word, incoming) in self.0.iter_mut().zip(other.0) {
+            *word |= incoming;
+        }
+    }
+}
+
+/// Continuation equivalence for incoming gfx942 VM *loads*. A successful entry
+/// proves that EVERY syntactic path reaches vmcnt(0), before termination, unknown
+/// control flow, or a non-load VM issue; it lists every pre-drain register read/write.
+/// No branch predicate is assumed. Backward must-dataflow starts only at drains:
+/// a cycle that can avoid the drain never acquires a proof. Each node settles once.
+///
+/// If all incoming VM loads define unobserved registers, their queue cannot affect
+/// this continuation: new VM loads share Gfx9Vmem's order, and their younger counts
+/// and issue-bound retirement are independent of the older incoming prefix.
+/// Partial waits can only retire that prefix or the same suffix of new loads.
+/// The full drain then makes both executions identical. Other counters are never
+/// projected. This changes label keys only, not the ledger or any transition.
+fn vm_drain_observers(
+    program: &Program,
+    decoded: &HashMap<usize, Instruction>,
+    labels: &HashMap<&str, usize>,
+) -> Vec<Option<VmObservers>> {
+    let insns = &program.instructions;
+    let n = insns.len();
+    let mut successors = vec![[None; 2]; n];
+    let mut predecessors = vec![Vec::new(); n];
+    let mut local = vec![VmObservers::default(); n];
+    let mut result = vec![None; n];
+    let mut work = Vec::new();
+    for (pc, emitted) in insns.iter().enumerate() {
+        let insn = decoded.get(&pc).unwrap_or(emitted);
+        let text = emitted.text.trim();
+        let mnemonic = insn.mnemonic();
+        if text.starts_with("s_wait") {
+            let Ok(effects) = decode(text, program.arch) else {
+                continue;
+            };
+            if effects.iter().any(|e| *e == Effect::Wait(Counter::Vm, 0)) {
+                result[pc] = Some(VmObservers::default());
+                work.push(pc);
+                continue;
+            }
+        } else if mnemonic.starts_with("s_endpgm") || indirect(mnemonic) {
+            continue;
+        } else if is_label(text).is_none() && sync::branch_target(text).is_none() {
+            if decode(text, program.arch).is_err() {
+                continue;
+            }
+            if matches!(
+                insn.memory,
+                Some(
+                    MemoryClass::VmemStore
+                        | MemoryClass::VmemAtomic { .. }
+                        | MemoryClass::Flat { .. }
+                )
+            ) {
+                continue;
+            }
+            for reg in insn.defs.iter().chain(&insn.uses) {
+                local[pc].insert(*reg);
+            }
+        }
+        if let Some(target) = sync::branch_target(text) {
+            let Some(&target) = labels.get(target) else {
+                continue;
+            };
+            successors[pc][0] = Some(target);
+            if mnemonic != "s_branch" {
+                // A missing fallthrough must not become a one-successor proof.
+                if pc + 1 == n {
+                    successors[pc] = [None; 2];
+                    continue;
+                }
+                successors[pc][1] = Some(pc + 1);
+            }
+        } else if pc + 1 < n {
+            successors[pc][0] = Some(pc + 1);
+        }
+        for next in successors[pc].iter().flatten() {
+            predecessors[*next].push(pc);
+        }
+    }
+    while let Some(pc) = work.pop() {
+        for &pred in &predecessors[pc] {
+            if result[pred].is_some() {
+                continue;
+            }
+            let mut observed = local[pred];
+            let mut ready = true;
+            for next in successors[pred].iter().flatten() {
+                match result[*next] {
+                    Some(incoming) => observed.union(incoming),
+                    None => {
+                        ready = false;
+                        break;
+                    }
+                }
+            }
+            if ready {
+                result[pred] = Some(observed);
+                work.push(pred);
+            }
+        }
+    }
+    result
+}
+
+/// [`walk`] with the label-dedup key and the optional static branch proofs as parameters:
+/// production passes `Ledger::replay_state_key` (and proofs only through
+/// [`verify_with_branch_proofs`]); the tests pass the un-canonicalized `full_state_key` to
+/// compare outcomes against the baseline keying, with the same proofs in both walks.
+/// `entries` are meaningful only with `choices` (validated together, strict only).
 fn walk_with(
     program: &Program,
     foreign: &[Range<usize>],
     mode: Mode,
     state_key: fn(&Ledger) -> StateKey,
+    choices: Option<&[EdgeChoice]>,
+    entries: &[EntryProof],
+    abstract_vm: bool,
 ) -> Result<Stats, String> {
+    if choices.is_some() || !entries.is_empty() {
+        if !matches!(mode, Mode::Strict) {
+            return Err("branch proofs are strict-only: the dispatcher walk takes none".into());
+        }
+        check_branch_proofs(
+            program,
+            choices.ok_or("branch entry proofs need the block-local proof map")?,
+            entries,
+        )?;
+    }
+    // (from pc, taken) -> the proof of the label the edge enters.
+    let entry_proofs: HashMap<(usize, bool), EntryProof> =
+        entries.iter().map(|e| ((e.from, e.taken), *e)).collect();
     let insns = &program.instructions;
     let arch = program.arch;
     let labels: HashMap<&str, usize> = insns
@@ -687,7 +1000,13 @@ fn walk_with(
             }
         }
     }
-    let mut seen: HashMap<usize, HashSet<StateKey>> = HashMap::new();
+    let vm_observers = if abstract_vm && arch == Arch::Gfx942 && matches!(mode, Mode::Strict) {
+        vm_drain_observers(program, &decoded, &labels)
+    } else {
+        Vec::new()
+    };
+    // Entry-proof directions remain distinct even when incoming VM queues are equivalent.
+    let mut seen: HashMap<usize, HashSet<(StateKey, Option<EdgeChoice>)>> = HashMap::new();
     let mut witness = Witness::default();
     let mut stats = Stats::default();
     // Dispatcher mode: the hazards reported (deduplicated per pc and need), their messages,
@@ -707,10 +1026,15 @@ fn walk_with(
         }
     }
     stats.summarized = summaries.len();
-    let mut stack: Vec<(usize, Ledger, Option<usize>)> = vec![(0, Ledger::default(), None)];
-    while let Some((mut pc, mut ledger, mut path)) = stack.pop() {
+    // (pc, ledger, witness edge, the branch pc whose taken edge this state follows).
+    type Pending = (usize, Ledger, Option<usize>, Option<usize>);
+    let mut stack: Vec<Pending> = vec![(0, Ledger::default(), None, None)];
+    while let Some((mut pc, mut ledger, mut path, mut via)) = stack.pop() {
         // The label this walk last passed: the block a violation sits in.
         let mut block: &str = "entry";
+        // The `EntryProof` of the edge this walk crossed into the current block, as
+        // (its branch pc, direction); consumed by that branch.
+        let mut refined: Option<(usize, EdgeChoice)> = None;
         while let Some(emitted) = insns.get(pc) {
             let insn = decoded.get(&pc).unwrap_or(emitted);
             stats.steps += 1;
@@ -746,8 +1070,25 @@ fn walk_with(
                     stats.steps += 1;
                     end += 1;
                 }
+                // The edge just crossed: the taken edge of the branch at `via`, else the
+                // fall-through from the previous instruction (the program entry has none).
+                let edge = match via.take() {
+                    Some(from) => Some((from, true)),
+                    None => pc.checked_sub(1).map(|from| (from, false)),
+                };
+                let entry = edge.and_then(|e| entry_proofs.get(&e));
                 let states = seen.entry(pc).or_default();
-                if !states.insert(state_key(&ledger)) {
+                let mut key = state_key(&ledger);
+                if vm_observers
+                    .get(end)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|observed| {
+                        ledger.vmem_loads_unobserved(|reg| observed.observes(reg))
+                    })
+                {
+                    key.retain(|entry| entry.0 != Counter::Vm);
+                }
+                if !states.insert((key, entry.map(|e| e.choice))) {
                     break;
                 }
                 stats.label_states += 1;
@@ -758,6 +1099,7 @@ fn walk_with(
                          wait the counters before the branches that reach it"
                     ));
                 }
+                refined = entry.map(|e| (e.branch, e.choice));
                 block = label;
                 pc = match summaries.get(&pc) {
                     Some(&exit) => {
@@ -778,12 +1120,34 @@ fn walk_with(
                 })?;
                 if mnemonic == "s_branch" {
                     path = witness.push(path, pc, true);
+                    via = Some(pc);
                     pc = target_pc;
                 } else {
-                    let taken = witness.push(path, pc, true);
-                    stack.push((target_pc, ledger.clone(), taken));
-                    path = witness.push(path, pc, false);
-                    pc += 1;
+                    // The static proof (`verify_with_branch_proofs`) selects one edge only
+                    // when it holds for every state entering the branch's block; the ledger
+                    // is never edited, so every retained edge is the old transition.
+                    let local = choices.map_or(EdgeChoice::Both, |c| c[pc]);
+                    // The proof of the edge this block was entered over, if any, belongs to
+                    // exactly this branch (`check_branch_proofs`); the block-local choice
+                    // applies to every other arrival.
+                    let entered = refined.take().filter(|(b, _)| *b == pc).map(|(_, c)| c);
+                    match entered.unwrap_or(local) {
+                        EdgeChoice::Both => {
+                            let taken = witness.push(path, pc, true);
+                            stack.push((target_pc, ledger.clone(), taken, Some(pc)));
+                            path = witness.push(path, pc, false);
+                            pc += 1;
+                        }
+                        EdgeChoice::Taken => {
+                            path = witness.push(path, pc, true);
+                            via = Some(pc);
+                            pc = target_pc;
+                        }
+                        EdgeChoice::Fallthrough => {
+                            path = witness.push(path, pc, false);
+                            pc += 1;
+                        }
+                    }
                 }
                 continue;
             }
@@ -1536,7 +1900,15 @@ mod tests {
     }
     /// The baseline walk: label dedup on the un-canonicalized key (`Ledger::full_state_key`).
     fn walk_full(p: &Program) -> Result<Stats, String> {
-        walk_with(p, &[], Mode::Strict, Ledger::full_state_key)
+        walk_with(
+            p,
+            &[],
+            Mode::Strict,
+            Ledger::full_state_key,
+            None,
+            &[],
+            false,
+        )
     }
 
     /// gfx942 `replay_state_key` drops only the registers a pending store read, which the gfx942
@@ -1842,6 +2214,684 @@ mod tests {
         assert!(
             proven > 0 && refused > 0 && fewer > 0,
             "{proven} {refused} {fewer}"
+        );
+    }
+
+    /// An all-[`EdgeChoice::Both`] map but for the listed `(pc, choice)` overrides.
+    fn proofs(p: &Program, at: &[(usize, EdgeChoice)]) -> Vec<EdgeChoice> {
+        let mut choices = vec![EdgeChoice::Both; p.instructions.len()];
+        for &(pc, choice) in at {
+            choices[pc] = choice;
+        }
+        choices
+    }
+    /// Optional loads in distinct registers, all drained after the EXEC restore.
+    /// No source or instruction rewriting is needed to collapse their 2^10 subsets.
+    fn optional_vm_loads(prefix: Vec<Instruction>, before_wait: Vec<Instruction>) -> Program {
+        let mut insns = prefix;
+        for i in 0..10 {
+            insns.push(ins(&format!("s_cbranch_scc1 J{i}")));
+            insns.push(load(10 + i));
+            insns.push(ins(&format!("J{i}:")));
+        }
+        insns.extend(before_wait);
+        insns.push(ins("s_or_b64 exec, exec, s[40:41]"));
+        insns.push(ins("s_waitcnt vmcnt(0)"));
+        for i in 0..10 {
+            insns.push(mov(30 + i, 10 + i));
+        }
+        insns.push(ins("s_endpgm"));
+        cdna(insns)
+    }
+
+    #[test]
+    fn unobserved_load_subsets_share_a_drain_continuation_class() {
+        let p = optional_vm_loads(vec![], vec![]);
+        let old = walk_full(&p).unwrap_err();
+        assert!(old.contains("state explosion"), "{old}");
+        let new = check(&p).unwrap();
+        assert_eq!(new.label_states, 10, "{new:?}");
+        // The scalar-control adapter uses the same abstraction with identical proof maps.
+        let choices = vec![EdgeChoice::Both; p.instructions.len()];
+        assert_eq!(
+            verify_with_branch_proofs(&p, &[], &choices, &[]).unwrap(),
+            new
+        );
+    }
+
+    #[test]
+    fn predrain_read_write_and_exec_masked_overwrite_are_not_erased() {
+        for access in [mov(80, 1), mov(1, 80)] {
+            let p = optional_vm_loads(vec![load(1)], vec![ins("s_mov_b64 exec, 1"), access]);
+            let e = check(&p).unwrap_err();
+            // The optional dead loads can be collapsed only if the ENTIRE incoming
+            // queue is unobserved. Here a real hazard remains, not a waived use/WAW.
+            assert!(
+                e.contains("Use") || e.contains("Waw") || e.contains("state explosion"),
+                "{e}"
+            );
+            assert!(walk_full(&p).is_err());
+        }
+        // Minimal versions name the actual hazard rather than the fanout bound.
+        for access in [mov(80, 1), mov(1, 80)] {
+            let p = cdna(vec![
+                ins("s_cbranch_scc1 J"),
+                load(1),
+                ins("J:"),
+                ins("s_mov_b64 exec, 1"),
+                access,
+                ins("s_waitcnt vmcnt(0)"),
+                ins("s_endpgm"),
+            ]);
+            let e = check(&p).unwrap_err();
+            assert!(e.contains("Use") || e.contains("Waw"), "{e}");
+        }
+    }
+
+    #[test]
+    fn every_continuation_must_reach_a_full_drain() {
+        for suffix in [
+            vec![
+                ins("s_cbranch_scc1 USE"),
+                ins("s_waitcnt vmcnt(0)"),
+                ins("USE:"),
+                mov(3, 1),
+                ins("s_endpgm"),
+            ],
+            vec![ins("s_waitcnt vmcnt(1)"), mov(3, 1), ins("s_endpgm")],
+            vec![
+                ins("s_cbranch_scc1 LOOP"),
+                ins("s_waitcnt vmcnt(0)"),
+                ins("s_endpgm"),
+                ins("LOOP:"),
+                mov(3, 1),
+                ins("s_branch LOOP"),
+            ],
+        ] {
+            let mut insns = vec![ins("s_cbranch_scc1 J"), load(1), ins("J:")];
+            insns.extend(suffix);
+            let e = check(&cdna(insns)).unwrap_err();
+            assert!(e.contains("Use"), "{e}");
+        }
+        // Both alternatives drain: a branch before the drain is not itself a refusal.
+        let p = cdna(vec![
+            load(1),
+            ins("J:"),
+            ins("s_cbranch_scc1 A"),
+            ins("s_waitcnt vmcnt(0)"),
+            ins("s_branch USE"),
+            ins("A:"),
+            ins("s_waitcnt vmcnt(0)"),
+            ins("USE:"),
+            mov(3, 1),
+            ins("s_endpgm"),
+        ]);
+        check(&p).unwrap();
+    }
+
+    #[test]
+    fn pending_stores_and_flat_loads_never_enter_the_erased_class() {
+        let flat = Instruction::new("flat_load_dword v1, v[2:3]", vec![v(1)], vec![v(2)])
+            .memory(MemoryClass::Flat { load: true });
+        for pending in [store(1), flat] {
+            let p = optional_vm_loads(vec![pending], vec![]);
+            let e = check(&p).unwrap_err();
+            assert!(e.contains("state explosion"), "{e}");
+        }
+        // A future store/FLAT issue also prevents erasing an incoming load queue.
+        for future in [
+            store(80),
+            Instruction::new("flat_load_dword v80, v[2:3]", vec![v(80)], vec![v(2)])
+                .memory(MemoryClass::Flat { load: true }),
+        ] {
+            let p = optional_vm_loads(vec![], vec![future]);
+            let e = check(&p).unwrap_err();
+            assert!(e.contains("state explosion"), "{e}");
+        }
+    }
+
+    #[test]
+    fn other_counter_obligations_survive_vm_projection() {
+        for pending in [ds_load(1), smem_load(1)] {
+            let use_ = if matches!(pending.memory, Some(MemoryClass::SmemLoad)) {
+                Instruction::new("s_mov_b32 s3, s1", vec![s(3)], vec![s(1)])
+            } else {
+                mov(3, 1)
+            };
+            let p = cdna(vec![
+                ins("s_cbranch_scc1 J"),
+                pending,
+                ins("J:"),
+                ins("s_waitcnt vmcnt(0)"),
+                use_,
+                ins("s_endpgm"),
+            ]);
+            let e = check(&p).unwrap_err();
+            assert!(e.contains("Lgkm") && e.contains("Use"), "{e}");
+        }
+        let p = cdna(vec![
+            ins("s_cbranch_scc1 J"),
+            Instruction::new("exp", vec![], vec![v(1)]).memory(MemoryClass::Export),
+            ins("J:"),
+            ins("s_waitcnt vmcnt(0)"),
+            mov(1, 2),
+            ins("s_endpgm"),
+        ]);
+        let new = check(&p).unwrap();
+        assert_eq!(new.label_states, 2, "{new:?}");
+        assert_eq!(new, walk_full(&p).unwrap());
+    }
+
+    #[test]
+    fn drain_proof_does_not_assume_loop_exit_or_merge_register_banks() {
+        let p = cdna(vec![
+            ins("H:"),
+            ins("s_cbranch_scc1 H"),
+            ins("s_waitcnt vmcnt(0)"),
+            ins("s_endpgm"),
+        ]);
+        let labels = HashMap::from([("H", 0)]);
+        assert!(vm_drain_observers(&p, &HashMap::new(), &labels)[0].is_none());
+        let mut observed = VmObservers::default();
+        observed.insert(RegRef {
+            kind: Kind::V,
+            base: 10,
+            len: 4,
+        });
+        assert!(observed.observes(v(13)));
+        assert!(!observed.observes(v(14)));
+        assert!(!observed.observes(s(10)));
+        assert!(!observed.observes(RegRef {
+            kind: Kind::A,
+            base: 10,
+            len: 1
+        }));
+    }
+
+    /// The baseline-keyed walk under the same proof map as `verify_with_branch_proofs`.
+    fn walk_full_proved(p: &Program, choices: &[EdgeChoice]) -> Result<Stats, String> {
+        walk_with(
+            p,
+            &[],
+            Mode::Strict,
+            Ledger::full_state_key,
+            Some(choices),
+            &[],
+            false,
+        )
+    }
+
+    #[test]
+    fn malformed_proof_maps_are_rejected_before_the_walk() {
+        let p = cdna(vec![
+            load(1),
+            ins("s_cbranch_scc1 T"),
+            ins("s_branch T"),
+            ins("s_cbranch_vccz T"),
+            ins("T:"),
+            ins("s_endpgm"),
+        ]);
+        let n = p.instructions.len();
+        for len in [0, n - 1, n + 1] {
+            let e =
+                verify_with_branch_proofs(&p, &[], &vec![EdgeChoice::Both; len], &[]).unwrap_err();
+            assert!(e.contains("branch proof map"), "{len}: {e}");
+        }
+        // pc 0 load, pc 2 unconditional, pc 3 ineligible conditional, pc 4 label, pc 5 endpgm.
+        for pc in [0, 2, 3, 4, 5] {
+            for choice in [EdgeChoice::Taken, EdgeChoice::Fallthrough] {
+                let e = verify_with_branch_proofs(&p, &[], &proofs(&p, &[(pc, choice)]), &[])
+                    .unwrap_err();
+                assert!(e.contains("branch proof map"), "pc {pc} {choice:?}: {e}");
+                assert!(e.contains(&format!("pc {pc}")), "pc {pc}: {e}");
+            }
+        }
+        // An eligible conditional may carry a proof, and Both is accepted anywhere.
+        verify_with_branch_proofs(&p, &[], &proofs(&p, &[(1, EdgeChoice::Taken)]), &[]).unwrap();
+        verify_with_branch_proofs(&p, &[], &proofs(&p, &[(1, EdgeChoice::Fallthrough)]), &[])
+            .unwrap();
+        verify_with_branch_proofs(&p, &[], &proofs(&p, &[]), &[]).unwrap();
+        // The test seam validates identically.
+        let e = walk_full_proved(&p, &proofs(&p, &[(2, EdgeChoice::Taken)])).unwrap_err();
+        assert!(e.contains("branch proof map"), "{e}");
+    }
+
+    #[test]
+    fn proofs_are_strict_only() {
+        let p = cdna(vec![ins("s_cbranch_scc1 T"), ins("T:"), ins("s_endpgm")]);
+        let choices = proofs(&p, &[(0, EdgeChoice::Taken)]);
+        let e = walk_with(
+            &p,
+            &[],
+            Mode::Dispatcher { body: &[] },
+            Ledger::replay_state_key,
+            Some(&choices),
+            &[],
+            true,
+        )
+        .unwrap_err();
+        assert!(e.contains("strict"), "{e}");
+        // The dispatcher entry points take no proofs: all-Both, as before.
+        assert_eq!(
+            verify_dispatcher(&p, &[]).unwrap(),
+            verify(&p, &[]).unwrap()
+        );
+    }
+
+    #[test]
+    fn taken_follows_only_the_target_and_fallthrough_only_the_next_instruction() {
+        // The load is pending on both edges; only the fall-through path waits before the use.
+        let wait_on_fallthrough = cdna(vec![
+            load(1),
+            ins("s_cbranch_scc1 T"),
+            ins("s_waitcnt vmcnt(0)"),
+            ins("T:"),
+            mov(3, 1),
+            ins("s_endpgm"),
+        ]);
+        let p = &wait_on_fallthrough;
+        let both = verify(p, &[]).unwrap_err();
+        assert!(
+            both.contains("pc 4") && both.contains("pc 1 `s_cbranch_scc1 T` taken"),
+            "{both}"
+        );
+        let taken = verify_with_branch_proofs(p, &[], &proofs(p, &[(1, EdgeChoice::Taken)]), &[])
+            .unwrap_err();
+        assert!(
+            taken.contains("pc 4") && taken.contains("pc 1 `s_cbranch_scc1 T` taken"),
+            "{taken}"
+        );
+        verify_with_branch_proofs(p, &[], &proofs(p, &[(1, EdgeChoice::Fallthrough)]), &[])
+            .unwrap();
+
+        // The mirror image: only the taken path waits.
+        let wait_on_taken = cdna(vec![
+            load(1),
+            ins("s_cbranch_scc1 T"),
+            mov(3, 1),
+            ins("s_endpgm"),
+            ins("T:"),
+            ins("s_waitcnt vmcnt(0)"),
+            mov(3, 1),
+            ins("s_endpgm"),
+        ]);
+        let p = &wait_on_taken;
+        assert!(verify(p, &[]).is_err());
+        verify_with_branch_proofs(p, &[], &proofs(p, &[(1, EdgeChoice::Taken)]), &[]).unwrap();
+        let fall =
+            verify_with_branch_proofs(p, &[], &proofs(p, &[(1, EdgeChoice::Fallthrough)]), &[])
+                .unwrap_err();
+        assert!(
+            fall.contains("pc 2") && fall.contains("pc 1 `s_cbranch_scc1 T` not taken"),
+            "{fall}"
+        );
+    }
+
+    #[test]
+    fn an_impossible_edge_is_still_target_validated() {
+        let p = cdna(vec![ins("s_cbranch_scc1 NOWHERE"), ins("s_endpgm")]);
+        for choice in [EdgeChoice::Both, EdgeChoice::Taken, EdgeChoice::Fallthrough] {
+            let e =
+                verify_with_branch_proofs(&p, &[], &proofs(&p, &[(0, choice)]), &[]).unwrap_err();
+            assert!(e.contains("never placed"), "{choice:?}: {e}");
+        }
+    }
+
+    fn entry(
+        from: usize,
+        taken: bool,
+        label: usize,
+        branch: usize,
+        choice: EdgeChoice,
+    ) -> EntryProof {
+        EntryProof {
+            from,
+            taken,
+            label,
+            branch,
+            choice,
+        }
+    }
+    /// The baseline-keyed walk under the same block-local and edge proofs.
+    fn walk_full_entries(
+        p: &Program,
+        choices: &[EdgeChoice],
+        entries: &[EntryProof],
+    ) -> Result<Stats, String> {
+        walk_with(
+            p,
+            &[],
+            Mode::Strict,
+            Ledger::full_state_key,
+            Some(choices),
+            entries,
+            false,
+        )
+    }
+    /// A join `J` entered over two edges (the `s_branch` at pc 2, the fall-through of pc 4) and
+    /// ended by the conditional at pc 6; pc 7 overwrites `v1` with a VALU write, which is not
+    /// ordered with VMEM (a WAW if a load of `v1` is pending; a VMEM reload would be ordered).
+    /// pc 0 chooses the side; `branch_side` runs only before the `s_branch`, `fall_side` only
+    /// before the fall-through. Ledger pcs: 0 branch, 1 branch side, 2 `s_branch J`, 3 `B:`,
+    /// 4 fall side, 5 `J:`, 6 `s_cbranch_scc1 E`, 7 reload, 8 `E:`, 9 endpgm.
+    fn join(branch_side: Instruction, fall_side: Instruction) -> Program {
+        join_writing(branch_side, fall_side, valu_v1())
+    }
+    fn valu_v1() -> Instruction {
+        Instruction::new("v_mov_b32 v1, 0", vec![v(1)], vec![])
+    }
+    fn join_writing(
+        branch_side: Instruction,
+        fall_side: Instruction,
+        write: Instruction,
+    ) -> Program {
+        cdna(vec![
+            ins("s_cbranch_scc1 B"),
+            branch_side,
+            ins("s_branch J"),
+            ins("B:"),
+            fall_side,
+            ins("J:"),
+            ins("s_cbranch_scc1 E"),
+            write,
+            ins("E:"),
+            ins("s_endpgm"),
+        ])
+    }
+
+    #[test]
+    fn an_entry_proof_prunes_only_the_walk_that_entered_over_its_edge() {
+        let nop = || ins("s_nop 0");
+        let none: Vec<EdgeChoice> = vec![EdgeChoice::Both; 10];
+
+        // Ordered VMEM load/load writeback is certified on its own, with no proof at all.
+        let ordered = join_writing(load(1), nop(), load(1));
+        verify_with_branch_proofs(&ordered, &[], &none, &[]).unwrap();
+
+        // The pending load reaches J only over the `s_branch` edge: without the proof the
+        // not-taken edge of pc 6 overwrites `v1` under it.
+        let p = join(load(1), nop());
+        let e = verify_with_branch_proofs(&p, &[], &none, &[]).unwrap_err();
+        assert!(
+            e.contains("pc 7") && e.contains("Waw") && e.contains("pc 2 `s_branch J` taken"),
+            "{e}"
+        );
+        let over_branch = [entry(2, true, 5, 6, EdgeChoice::Taken)];
+        verify_with_branch_proofs(&p, &[], &none, &over_branch).unwrap();
+        assert!(walk_full_entries(&p, &none, &over_branch).is_ok());
+        // The baseline key agrees: without the proof it refuses the same program.
+        let reference = walk_full_entries(&p, &none, &[]).unwrap_err();
+        assert!(reference.contains("pc 7"), "{reference}");
+
+        // A proof for the other edge does not rescue the walk over this one.
+        let wrong_edge = [entry(4, false, 5, 6, EdgeChoice::Taken)];
+        let e = verify_with_branch_proofs(&p, &[], &none, &wrong_edge).unwrap_err();
+        assert!(e.contains("pc 7"), "{e}");
+
+        // The mirror image: the pending load reaches J only by falling through.
+        let p = join(nop(), load(1));
+        assert!(verify_with_branch_proofs(&p, &[], &none, &[]).is_err());
+        let over_fallthrough = [entry(4, false, 5, 6, EdgeChoice::Taken)];
+        verify_with_branch_proofs(&p, &[], &none, &over_fallthrough).unwrap();
+        assert!(walk_full_entries(&p, &none, &over_fallthrough).is_ok());
+        let e = verify_with_branch_proofs(&p, &[], &none, &over_branch).unwrap_err();
+        assert!(e.contains("pc 7"), "{e}");
+
+        // `Fallthrough` selects the not-taken edge for the proven arrival only.
+        let p = join(nop(), nop());
+        let to_end = [entry(2, true, 5, 6, EdgeChoice::Fallthrough)];
+        verify_with_branch_proofs(&p, &[], &none, &to_end).unwrap();
+    }
+
+    #[test]
+    fn arrivals_with_equal_memory_but_different_proofs_are_never_merged() {
+        // Both arrivals at J carry the same pending shape (one load of `v1`), so the ledger
+        // half of the key is equal; the proven arrival (pc 2 -> J, Taken) must not hide the
+        // unproven one (fall-through), which reaches the overwrite at pc 7.
+        let p = join(load(1), load(1));
+        let none: Vec<EdgeChoice> = vec![EdgeChoice::Both; 10];
+        let proof = [entry(2, true, 5, 6, EdgeChoice::Taken)];
+        let e = verify_with_branch_proofs(&p, &[], &none, &proof).unwrap_err();
+        assert!(
+            e.contains("pc 7") && e.contains("pc 0 `s_cbranch_scc1 B` taken"),
+            "{e}"
+        );
+        assert!(walk_full_entries(&p, &none, &proof).is_err());
+        // With a proof on each edge both arrivals are decided and the program passes.
+        let both = [
+            entry(2, true, 5, 6, EdgeChoice::Taken),
+            entry(4, false, 5, 6, EdgeChoice::Taken),
+        ];
+        let stats = verify_with_branch_proofs(&p, &[], &none, &both).unwrap();
+        assert_eq!(stats, walk_full_entries(&p, &none, &both).unwrap());
+        // No proofs: the label key is the old one (one state, both arrivals merged).
+        let p = join(ins("s_nop 0"), ins("s_nop 0"));
+        let plain = verify_with_branch_proofs(&p, &[], &none, &[]).unwrap();
+        assert_eq!(plain, verify(&p, &[]).unwrap());
+    }
+
+    #[test]
+    fn malformed_entry_proofs_are_rejected_before_the_walk() {
+        let p = join(ins("s_nop 0"), ins("s_nop 0"));
+        let none: Vec<EdgeChoice> = vec![EdgeChoice::Both; 10];
+        let good = entry(2, true, 5, 6, EdgeChoice::Taken);
+        verify_with_branch_proofs(&p, &[], &none, &[good]).unwrap();
+        verify_with_branch_proofs(&p, &[], &none, &[entry(4, false, 5, 6, EdgeChoice::Taken)])
+            .unwrap();
+
+        let bad = |list: &[EntryProof], why: &str| {
+            let e = verify_with_branch_proofs(&p, &[], &none, list).unwrap_err();
+            assert!(
+                e.contains("branch entry proof") && e.contains(why),
+                "{why}: {e}"
+            );
+        };
+        bad(
+            &[entry(2, true, 5, 6, EdgeChoice::Both)],
+            "must select an edge",
+        );
+        bad(
+            &[entry(2, true, 99, 6, EdgeChoice::Taken)],
+            "outside the program",
+        );
+        bad(
+            &[entry(99, true, 5, 6, EdgeChoice::Taken)],
+            "outside the program",
+        );
+        bad(&[entry(2, true, 4, 6, EdgeChoice::Taken)], "is not a label");
+        bad(
+            &[entry(2, true, 5, 7, EdgeChoice::Taken)],
+            "is not a conditional",
+        );
+        bad(
+            &[entry(2, true, 5, 2, EdgeChoice::Taken)],
+            "is not a conditional",
+        );
+        bad(
+            &[entry(0, true, 3, 6, EdgeChoice::Taken)],
+            "ends or splits the block",
+        );
+        bad(
+            &[entry(2, true, 5, 0, EdgeChoice::Taken)],
+            "after the label",
+        );
+        // The named edge must exist: not a branch, a wrong target, an unconditional
+        // fall-through, or a fall-through into a different pc.
+        bad(
+            &[entry(1, true, 5, 6, EdgeChoice::Taken)],
+            "not a control-flow edge",
+        );
+        bad(
+            &[entry(0, true, 5, 6, EdgeChoice::Taken)],
+            "not a control-flow edge",
+        );
+        bad(
+            &[entry(2, false, 5, 6, EdgeChoice::Taken)],
+            "not a control-flow edge",
+        );
+        bad(
+            &[entry(3, false, 5, 6, EdgeChoice::Taken)],
+            "not a control-flow edge",
+        );
+        bad(&[good, good], "already has a proof");
+        bad(
+            &[good, entry(2, true, 5, 6, EdgeChoice::Fallthrough)],
+            "already has a proof",
+        );
+
+        // A block-local proof on the same branch leaves nothing to refine.
+        let local = proofs(&p, &[(6, EdgeChoice::Taken)]);
+        let e = verify_with_branch_proofs(&p, &[], &local, &[good]).unwrap_err();
+        assert!(e.contains("already carries a block-local proof"), "{e}");
+        // Strict only, and only together with the block-local map.
+        let e = walk_with(
+            &p,
+            &[],
+            Mode::Dispatcher { body: &[] },
+            Ledger::replay_state_key,
+            Some(&none),
+            &[good],
+            true,
+        )
+        .unwrap_err();
+        assert!(e.contains("strict"), "{e}");
+        let e = walk_with(
+            &p,
+            &[],
+            Mode::Strict,
+            Ledger::replay_state_key,
+            None,
+            &[good],
+            true,
+        )
+        .unwrap_err();
+        assert!(e.contains("block-local proof map"), "{e}");
+    }
+
+    #[test]
+    fn proofs_prune_loop_edges_without_changing_the_fixed_point() {
+        // The previous iteration's load is still pending at the head's use: the back edge
+        // is the hazard.
+        let carried = cdna(vec![
+            ins("H:"),
+            mov(3, 1),
+            load(1),
+            ins("s_cbranch_scc1 H"),
+            ins("s_endpgm"),
+        ]);
+        let p = &carried;
+        assert!(verify(p, &[]).unwrap_err().contains("pc 1"));
+        let taken = verify_with_branch_proofs(p, &[], &proofs(p, &[(3, EdgeChoice::Taken)]), &[])
+            .unwrap_err();
+        assert!(taken.contains("pc 1"), "{taken}");
+        verify_with_branch_proofs(p, &[], &proofs(p, &[(3, EdgeChoice::Fallthrough)]), &[])
+            .unwrap();
+
+        // A back edge that is always taken never reaches the code after it.
+        let spin = cdna(vec![
+            ins("H:"),
+            load(1),
+            ins("s_waitcnt vmcnt(0)"),
+            ins("s_cbranch_scc1 H"),
+            load(2),
+            mov(3, 2),
+            ins("s_endpgm"),
+        ]);
+        let p = &spin;
+        assert!(verify(p, &[]).is_err());
+        let stats =
+            verify_with_branch_proofs(p, &[], &proofs(p, &[(3, EdgeChoice::Taken)]), &[]).unwrap();
+        assert_eq!(stats.label_states, 1, "{stats:?}");
+    }
+
+    #[test]
+    fn wait_prefix_dedup_is_unchanged_under_proofs() {
+        // Two states reach A (load pending, nothing pending); the label's wait prefix
+        // drains both into one.
+        let p = cdna(vec![
+            ins("s_cbranch_scc1 A"),
+            load(1),
+            ins("A:"),
+            ins("s_waitcnt vmcnt(0)"),
+            mov(3, 1),
+            ins("s_endpgm"),
+        ]);
+        for choice in [EdgeChoice::Both, EdgeChoice::Taken, EdgeChoice::Fallthrough] {
+            let choices = proofs(&p, &[(0, choice)]);
+            let canonical = verify_with_branch_proofs(&p, &[], &choices, &[]).unwrap();
+            let full = walk_full_proved(&p, &choices).unwrap();
+            assert_eq!(canonical.label_states, 1, "{choice:?}: {canonical:?}");
+            assert_eq!(canonical, full, "{choice:?}");
+        }
+    }
+
+    #[test]
+    fn all_both_proofs_are_the_unadapted_walk_on_the_corpus() {
+        let mut rng = Lcg(0x2545_f491_4f6c_dd1d);
+        for i in 0..1500u32 {
+            let arch = if i % 2 == 0 {
+                Arch::Gfx942
+            } else {
+                Arch::Gfx1201
+            };
+            let p = corpus_program(&mut rng, arch);
+            let plain = verify(&p, &[]);
+            let both = verify_with_branch_proofs(&p, &[], &proofs(&p, &[]), &[]);
+            assert_eq!(plain, both, "{arch:?}");
+        }
+    }
+
+    /// The canonical key against the baseline key under one **identical** random proof map
+    /// (refined semantics are compared with themselves, never with the unrefined walk: pruned
+    /// edges legitimately change verdicts). The edge choices here are arbitrary, not sound
+    /// facts; they only exercise the seam.
+    #[test]
+    fn canonical_and_full_keys_agree_under_identical_proof_maps() {
+        let mut rng = Lcg(0xd1b5_4a32_d192_ed03);
+        let (mut proven, mut refused, mut pruned) = (0u32, 0u32, 0u32);
+        for i in 0..3000u32 {
+            let arch = if i % 2 == 0 {
+                Arch::Gfx942
+            } else {
+                Arch::Gfx1201
+            };
+            let p = corpus_program(&mut rng, arch);
+            let mut choices = proofs(&p, &[]);
+            for (pc, insn) in p.instructions.iter().enumerate() {
+                if insn.mnemonic() == "s_cbranch_scc1" {
+                    choices[pc] = match rng.below(3) {
+                        0 => EdgeChoice::Both,
+                        1 => EdgeChoice::Taken,
+                        _ => EdgeChoice::Fallthrough,
+                    };
+                    pruned += u32::from(choices[pc] != EdgeChoice::Both);
+                }
+            }
+            let new = verify_with_branch_proofs(&p, &[], &choices, &[]);
+            let old = walk_full_proved(&p, &choices);
+            if matches!(&old, Err(e) if e.contains("state explosion")) {
+                continue;
+            }
+            let text: Vec<&str> = p.instructions.iter().map(|i| i.text.as_str()).collect();
+            assert_eq!(
+                new.is_ok(),
+                old.is_ok(),
+                "{arch:?}: {new:?} vs {old:?}\n{text:#?}"
+            );
+            match (&new, &old) {
+                (Ok(n), Ok(o)) => {
+                    proven += 1;
+                    assert!(n.label_states <= o.label_states, "{text:#?}");
+                    if arch != Arch::Gfx942 {
+                        assert_eq!(n.label_states, o.label_states, "{text:#?}");
+                    }
+                }
+                _ => refused += 1,
+            }
+        }
+        assert!(
+            proven > 0 && refused > 0 && pruned > 0,
+            "{proven} {refused} {pruned}"
         );
     }
 

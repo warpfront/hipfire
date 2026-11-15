@@ -423,3 +423,25 @@ pub(crate) fn dequantize_e4m3_f32scale_to_f32(
     }
     out
 }
+
+pub(crate) fn dequantize_hfq_q8f16(data: &[u8], n_elements: usize) -> Result<Vec<f32>, String> {
+    let n_blocks = n_elements.div_ceil(32);
+    let expected = n_blocks * 34;
+    if data.len() != expected {
+        return Err(format!(
+            "Q8F16 byte size {} != {expected} for {n_elements} elements",
+            data.len()
+        ));
+    }
+    let mut out = vec![0.0f32; n_elements];
+    for b in 0..n_blocks {
+        let off = b * 34;
+        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let start = b * 32;
+        let end = (start + 32).min(n_elements);
+        for i in start..end {
+            out[i] = (data[off + 2 + i - start] as i8) as f32 * scale;
+        }
+    }
+    Ok(out)
+}

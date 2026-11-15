@@ -296,9 +296,10 @@ pub fn session_snapshot_bytes(
     p: usize,
 ) -> Option<u64> {
     let part = |bytes: usize| bytes.checked_next_multiple_of(256);
-    // A Q8Ef snapshot carries the plain Q8 payload only: the live F16
-    // residual plane is never snapshotted (it is zeroed on every restore), so
-    // the size is the `storage()` format's, equal to Q8's.
+    // A Q8Ef snapshot carries the plain Q8 slot and, with it, the real live F16
+    // residual plane (restored verbatim; it is no longer zeroed on restore).
+    // A carrying stream (`format.gdn_stream`: C16 WY on gfx11, dense C64 on gfx1201) adds its
+    // carry tensors to every snapshot (the Open phase's authoritative state).
     let gdn_storage = format.gdn.storage();
     let gdn_recurrent = gdn_storage.state_units(
         config.linear_num_value_heads,
@@ -312,11 +313,34 @@ pub fn session_snapshot_bytes(
                 .linear_num_value_heads
                 .checked_mul(config.linear_value_head_dim)?,
         )?;
-    let gdn = part(gdn_recurrent.checked_mul(gdn_storage.dtype().size())?)?.checked_add(part(
-        conv_channels
-            .checked_mul(config.linear_conv_kernel_dim.saturating_sub(1))?
-            .checked_mul(4)?,
-    )?)?;
+    let residual = if format.gdn.has_residual() {
+        format
+            .gdn
+            .residual_units(
+                config.linear_num_value_heads,
+                config.linear_key_head_dim,
+                config.linear_value_head_dim,
+            )
+            .checked_mul(2)?
+    } else {
+        0
+    };
+    let mut carry = 0usize;
+    if format.gdn_stream != crate::GdnStreamKind::None {
+        for &(_, elements, dtype) in
+            &crate::state::gdn_carry::carry_layer_specs(config, format.gdn_stream)
+        {
+            carry = carry.checked_add(part(elements.checked_mul(dtype.size())?)?)?;
+        }
+    }
+    let gdn = part(gdn_recurrent.checked_mul(gdn_storage.dtype().size())?)?
+        .checked_add(part(carry)?)?
+        .checked_add(part(residual)?)?
+        .checked_add(part(
+            conv_channels
+                .checked_mul(config.linear_conv_kernel_dim.saturating_sub(1))?
+                .checked_mul(4)?,
+        )?)?;
     let compress = config.indexer_compress_ratio;
     let raw_width = config
         .indexer_kv_heads
@@ -396,11 +420,12 @@ impl PpSessionPolicy {
 
 /// The session-cache scope of one bundle. Single (`band == None`) is exactly the
 /// historical string for the F32 and Q8 GDN formats; Q8Ef appends the distinct
-/// `/q8_ef-reset` spelling after the format (its snapshots carry Q8 payload
-/// only and restore zeroes the live residual, so they never alias a plain Q8
-/// or F32 scope). A PP band appends its band identity (index/count, layers,
-/// complete placement, devices, mesh and load epoch) and the shared schedule
-/// policy, so no two bands, placements, devices, meshes or loads alias.
+/// `/q8_ef-v2` spelling after the format (its snapshots carry the plain Q8
+/// payload plus the real residual, so they never alias a plain Q8 or F32 scope
+/// nor an older residual-less Q8Ef snapshot). A PP band appends its band
+/// identity (index/count, layers, complete placement, devices, mesh and load
+/// epoch) and the shared schedule policy, so no two bands, placements, devices,
+/// meshes or loads alias.
 pub(crate) fn session_scope(
     route: SessionRoute,
     chunk: usize,
@@ -413,7 +438,7 @@ pub(crate) fn session_scope(
     let turns = if turns { "/turns" } else { "" };
     let gdn_abi = match format.gdn {
         crate::GdnStateFormat::F32 | crate::GdnStateFormat::Q8 => "",
-        crate::GdnStateFormat::Q8Ef => "/q8_ef-reset",
+        crate::GdnStateFormat::Q8Ef => "/q8_ef-v2",
     };
     let mut scope = format!("qwen4/{route:?}/chunk{chunk}/{format:?}{gdn_abi}{turns}");
     if let Some((band, policy)) = band {
@@ -464,6 +489,16 @@ impl SessionState for Qwen4Bundle {
                 .as_ref()
                 .map(|band| (band, self.pp_session_policy())),
         );
+        // A WY-stream state's payload carries each layer's stream cursor and
+        // carry tensors under the plan's recipe: another recipe or schema is
+        // another domain.
+        if let Some(plan) = self.state.gdn_stream_plan() {
+            scope.push_str(&format!(
+                "/gdnstream-wy16-s{}-{:016x}",
+                rdna_compute::gdn_stream::GDN_STREAM_SCHEMA_VERSION,
+                plan.recipe_id
+            ));
+        }
         // A slow-link load mixes in `tile_rows` tiles but checkpoints on its
         // own cadence (`checkpoint_stride_rows`): the pair is a distinct
         // numeric/cache identity, never aliasing an explicit chunk-1536
@@ -1338,21 +1373,19 @@ impl Qwen4Bundle {
             applied.before_bytes >> 20,
             applied.after_bytes >> 20
         );
-        // `HIPFIRE_EP_RESERVE_CENSUS`: `replace_owned` freed each full pre-shard copy of the
+        // `replace_owned` freed each full pre-shard copy of the
         // shared-expert tensors into the device pool, which hands bytes back to HIP only on a
         // drain or an allocation that fails. The planner budgets the shard's saving, so return
         // them now. `drain_pool` frees only the pool's free lists (buffers no tensor owns) and
         // the slabs already fully retired, never a live buffer, and runs before the forward and
         // the first request allocate anything.
-        if hipfire_config::memory::ep_reserve_census() {
-            let parked = gpu.pool_parked_bytes();
-            gpu.drain_pool();
-            eprintln!(
-                "  qwen4 trunk shard: rank {}: returned {} MiB of pooled pre-shard copies to HIP",
-                placement.rank,
-                parked >> 20
-            );
-        }
+        let parked = gpu.pool_parked_bytes();
+        gpu.drain_pool();
+        eprintln!(
+            "  qwen4 trunk shard: rank {}: returned {} MiB of pooled pre-shard copies to HIP",
+            placement.rank,
+            parked >> 20
+        );
         Ok(())
     }
 
@@ -2171,18 +2204,15 @@ impl Qwen4Bundle {
     /// head source (`head_sources`, rank order, from [`Self::mtp_ep_expert_source`])
     /// is known: the EP mesh attach calls it on every rank after the forward's
     /// tables and row gather are installed. Installs nothing (the head stays
-    /// not-ready for lane-local calls, every call keeps today's path) when
-    /// `HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0`, when no EP-bound MoE head is attached, or
-    /// when any rank published no head source; that decision reads only the
-    /// gathered sources and the rank's own head, so every rank takes it alike.
+    /// not-ready for lane-local calls, every call keeps today's path) when no
+    /// EP-bound MoE head is attached, or when any rank published no head source;
+    /// that decision reads only the gathered sources and the rank's own head, so
+    /// every rank takes it alike.
     pub(crate) fn install_mtp_lane_local_moe(
         &mut self,
         gpu: &mut Gpu,
         head_sources: &[Option<Qwen4PeerLayerSource>],
     ) -> Result<(), String> {
-        if !crate::mesh_lane_protocol::ep_draft_split_enabled() {
-            return Ok(());
-        }
         let Some(placement) = self
             .execution
             .as_ref()
@@ -2238,8 +2268,8 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
-    /// Whether sharded-MoE draft passes can run ([`crate::mtp_gpu::draft_sharded_moe_enabled`]
-    /// at install, X2 active, rows scratch).
+    /// Whether sharded-MoE draft passes can run (decided at install: X2 active,
+    /// rows scratch).
     pub(crate) fn mtp_s4_ready(&self) -> bool {
         self.mtp.as_ref().is_some_and(Qwen4MtpGpu::s4_ready)
     }
@@ -2395,6 +2425,15 @@ impl Qwen4Bundle {
             .as_ref()
             .map(|forward| forward.prompt_chunk_rows())
             .or_else(|| self.pp_band.as_ref().map(|band| band.chunk()))
+    }
+
+    /// Rows the resident spec hidden buffer holds (the wide-hidden capture of a prompt chunk or
+    /// a prefill wave that holds an MTP lane); 0 before the buffer exists.
+    pub(crate) fn spec_hidden_rows(&self) -> usize {
+        let width = self.config.hc_count * self.config.hidden_size;
+        self.spec_hidden
+            .as_ref()
+            .map_or(0, |hidden| hidden.numel() / width.max(1))
     }
 
     /// A whole-prompt entry begins (see [`Qwen4GpuForward::share_prompt_begin`]):
@@ -3649,7 +3688,7 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
-    /// One batched head round over `rows.len()` lanes (2..=8) with the draft
+    /// One batched head round over `rows.len()` lanes (2..=[`Self::mtp_draft_call_rows`]) with the draft
     /// read deferred into `top1_out` (`Raw`, one `Gpu::TOPK8_OUT_BYTES` slot
     /// per lane, in row order): `n` [`Self::mtp_forward_token_deferred`]
     /// steps in one call, each lane carrying its own head state and draft
@@ -3666,15 +3705,7 @@ impl Qwen4Bundle {
         let mtp = self.mtp.as_mut().ok_or_else(|| {
             BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
         })?;
-        for lane in rows.iter_mut() {
-            let required = lane
-                .position
-                .checked_add(1)
-                .ok_or_else(|| BundleError::Forward("Qwen4 MTP position overflows".to_string()))?;
-            lane.state
-                .ensure_mapped_capacity(gpu, required)
-                .map_err(|error| BundleError::Forward(error.to_string()))?;
-        }
+        map_draft_rows(gpu, rows)?;
         mtp.forward_rows_deferred(
             gpu,
             &self.weights,
@@ -3686,6 +3717,25 @@ impl Qwen4Bundle {
                 .and_then(Qwen4GpuForward::mtp_ep_gather),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// One batched head Append over `rows.len()` lanes (2..=[`Self::mtp_draft_call_rows`]):
+    /// `n` [`Self::mtp_append_token`] steps in one call, each lane carrying its own head state
+    /// and draft request state (`rows[i].backbone_hidden` the lane's backbone hidden, `None` its
+    /// own `wide_hidden`; nothing is swapped in, no draft runs, no wide hidden is written).
+    /// Each lane's QSA context is mapped through its position first, as `mapped_mtp` does for
+    /// the one-token step.
+    pub(crate) fn mtp_forward_rows_append(
+        &mut self,
+        gpu: &mut Gpu,
+        rows: &mut [crate::mtp_gpu::DraftRow<'_>],
+    ) -> Result<(), BundleError> {
+        let mtp = self.mtp.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+        })?;
+        map_draft_rows(gpu, rows)?;
+        mtp.forward_rows_append(gpu, &self.weights, &self.config, rows)
+            .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
     /// [`Self::mtp_draft_finish`] for a lane's own draft request state: the
@@ -3999,6 +4049,18 @@ impl Qwen4Bundle {
         self.mtp.as_ref().is_some_and(|mtp| mtp.rows.is_some())
     }
 
+    /// Lanes one batched head call carries on this load: 32 on an exact single-device gfx942
+    /// load (the stock-FP8 profile), else [`crate::mtp_gpu::MTP_DRAFT_LANES_MAX`] (8; every
+    /// expert-parallel rank). Decided once, when the rows scratch is allocated
+    /// ([`crate::mtp_gpu::load_draft_call_rows`]); a draft round of more lanes runs as
+    /// `crate::mtp_lanes::draft_round_slices` calls of at most this many.
+    pub(crate) fn mtp_draft_call_rows(&self) -> usize {
+        self.mtp.as_ref().map_or(
+            crate::mtp_gpu::MTP_DRAFT_LANES_MAX,
+            crate::mtp_gpu::Qwen4MtpGpu::draft_call_rows,
+        )
+    }
+
     /// The last MTP prediction's raw draft material, copied out of the head's
     /// shared buffers: the 8 re-scored candidates' exact logits (host-resident,
     /// no device traffic), or the whole draft logit row when the head does not
@@ -4024,6 +4086,25 @@ impl Qwen4Bundle {
                 Ok(crate::sampled_lane::DraftRead::FullRow(row))
             }
         }
+    }
+
+    /// Lab-only: the MTP head's last one-row stock-FP8 MoE routing (raw F32
+    /// router logits `[num_experts]`, top-k ids and renormalised weights;
+    /// exact semantics on [`crate::mtp_gpu::LabHeadRouting`]). Call it right
+    /// after the head Predict step it should describe. `Ok(None)` when the
+    /// head is not a stock-FP8 MoE head (no grouped MoE scratch).
+    #[cfg(feature = "lab")]
+    pub fn mtp_lab_fp8_head_routing(
+        &self,
+        gpu: &Gpu,
+    ) -> Result<Option<crate::mtp_gpu::LabHeadRouting>, BundleError> {
+        self.mtp
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .lab_fp8_head_routing(gpu, &self.config)
+            .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
     /// The last MTP step of a chain: append only its K/V and index-key cache
@@ -5138,7 +5219,30 @@ impl Qwen4Bundle {
         self.share_prompt_begin();
         let result = self.prefill_final_tiles(gpu, prompt, reused, logits);
         let finish = self.share_prompt_end(gpu, result.is_ok());
-        result.and(finish)
+        // The terminal fence of the ordinary-prefill phase: the real prompt end, once (never a
+        // tile, session boundary or checkpoint), before decode/verify reads the live slot.
+        let sealed = if result.is_ok() {
+            self.seal_gdn_streams(gpu)
+        } else {
+            Ok(())
+        };
+        result.and(finish).and(sealed)
+    }
+
+    /// Seal every open GDN stream of the resident state ([`Qwen4State::seal_gdn_streams`] with
+    /// this bundle's resident GDN weights). A no-op on a sealed or carry-less state.
+    fn seal_gdn_streams(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        let weights = &self.weights;
+        self.state
+            .seal_gdn_streams(gpu, &|abs| {
+                let gdn = weights.layer(abs)?.gdn.as_ref()?;
+                Some(crate::state::gdn_carry::GdnSealWeights {
+                    conv: weights.resident(&gdn.conv).ok()?,
+                    a_log: weights.resident(&gdn.a_log).ok()?,
+                    dt_bias: weights.resident(&gdn.dt_bias).ok()?,
+                })
+            })
+            .map_err(BundleError::State)
     }
 
     /// The chunk loop of [`Self::prefill_final_from`].
@@ -5751,6 +5855,11 @@ impl Qwen4Bundle {
                     ));
                 }
             }
+            // The request moves sealed: its stream carry stays with the resident slot when the
+            // lane carries none ([`Qwen4State::swap_requests`]).
+            bundle
+                .seal_gdn_streams(gpu)
+                .map_err(|error| error.to_string())?;
             bundle.state.clamp_f16_valid();
             lane.state.clamp_f16_valid();
             bundle.state.swap_requests(&mut lane.state);
@@ -5783,7 +5892,7 @@ impl Qwen4Bundle {
             gpu,
             &self.config,
             self.state.max_seq_len,
-            self.state_format,
+            self.state_format.lane(),
             self.state.qsa_backend(),
             self.weights.band_scope(),
             mirror,
@@ -5976,7 +6085,8 @@ impl Qwen4Bundle {
     /// is the EXACT joint prefill ([`crate::gpu_forward::ep_wave`]): the MoE once
     /// per layer over every lane's rows on the singleton's full-table route, every
     /// other stage per lane, and `policy` is replaced by the EP wave policy; each
-    /// lane is byte-equal to its serial tile. A wave the route cannot take is
+    /// lane of 65+ rows is byte-equal to its serial tile; a 9..=64-row lane is only
+    /// distribution-equivalent (it skips the wave under `serve.batch_exact`). A wave the route cannot take is
     /// refused before any launch with an `ep wave refused:` error
     /// ([`Self::ep_wave_admission`] is the same decision, host only), and the
     /// caller runs serial lane tiles instead.
@@ -6950,6 +7060,24 @@ fn mapped_mtp<'a>(
     mtp.ensure_mapped_capacity(gpu, required)
         .map_err(|error| BundleError::Forward(error.to_string()))?;
     Ok(mtp)
+}
+
+/// Map each lane of a batched head call through its position (`mapped_mtp`'s coverage, one lane
+/// at a time: a lane's head arenas are its own).
+fn map_draft_rows(
+    gpu: &mut Gpu,
+    rows: &mut [crate::mtp_gpu::DraftRow<'_>],
+) -> Result<(), BundleError> {
+    for lane in rows.iter_mut() {
+        let required = lane
+            .position
+            .checked_add(1)
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP position overflows".to_string()))?;
+        lane.state
+            .ensure_mapped_capacity(gpu, required)
+            .map_err(|error| BundleError::Forward(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn cleanup_transaction(primary: BundleError, rollback: hip_bridge::HipResult<()>) -> BundleError {

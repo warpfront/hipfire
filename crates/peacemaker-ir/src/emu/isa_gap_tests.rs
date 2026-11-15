@@ -37,7 +37,8 @@ fn dec(words: &[u32]) -> (Inst, &'static str) {
     let (inst, n) =
         gfx11::decode(Arch::Gfx1100, words).unwrap_or_else(|e| panic!("decode {words:08x?}: {e}"));
     assert_eq!(n, words.len(), "{words:08x?} decoded to {n} words");
-    let name = crate::isa::lookup(Arch::Gfx1100, inst.op, inst.form)
+    let name = crate::isa::lookup_inst(Arch::Gfx1100, &inst)
+        .ok()
         .unwrap_or_else(|| panic!("{words:08x?} has no gfx1100 row"))
         .name;
     (inst, name)
@@ -854,7 +855,8 @@ fn dec12(words: &[u32]) -> (Inst, &'static str) {
     let (inst, n) = crate::codec::gfx12::decode_for(Arch::Gfx1201, words)
         .unwrap_or_else(|e| panic!("decode {words:08x?}: {e}"));
     assert_eq!(n, words.len(), "{words:08x?} decoded to {n} words");
-    let name = crate::isa::lookup(Arch::Gfx1201, inst.op, inst.form)
+    let name = crate::isa::lookup_inst(Arch::Gfx1201, &inst)
+        .ok()
         .unwrap_or_else(|| panic!("{words:08x?} has no gfx1201 row"))
         .name;
     (inst, name)

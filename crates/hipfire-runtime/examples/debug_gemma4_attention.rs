@@ -15,10 +15,9 @@ fn main() {
 
     let config = Gemma4Config::from_hfq(&hfq).expect("failed config");
     let weights = Gemma4Weights::load(&hfq, &config, &mut gpu).expect("failed weights");
-    // Sliding tier is always Q8; the full tier keeps the asym3 cache this probe used.
-    let mut state =
-        Gemma4State::new_with_full_tier(&mut gpu, &config, 2048, FullKvTier::LegacyAsym3)
-            .expect("failed state");
+    // Sliding tier is always Q8; the full tier keeps the rotated (Fwht3) cache this probe used.
+    let mut state = Gemma4State::new_with_full_tier(&mut gpu, &config, 2048, FullKvTier::Fwht3)
+        .expect("failed state");
 
     println!("Running Layer 0 forward with BOS (2)...");
     forward::decode_step(&config, &weights, &mut state, &mut gpu, 2, 0)

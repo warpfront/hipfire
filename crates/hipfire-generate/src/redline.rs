@@ -243,14 +243,7 @@ pub fn redline_qwen_snapshot(
         redline_append_mapped(gpu, &mut kv, tensor)?;
     }
     let mut recurrent = Vec::new();
-    for tensor in bundle
-        .dn_state
-        .s_matrices
-        .iter()
-        .chain(bundle.dn_state.s_scales.iter())
-        .chain(bundle.dn_state.conv_states.iter())
-        .chain(bundle.dn_state.s_ef_residual.iter())
-    {
+    for tensor in bundle.dn_state.families().into_iter().flatten() {
         redline_append_buffer(gpu, &mut recurrent, &tensor.buf)?;
     }
     Ok(RedlineQwenSnapshot {
@@ -763,18 +756,10 @@ pub fn redline_reset_qwen(
         .clear_gpu(gpu)
         .map_err(|error| error.to_string())?;
     bundle.kv_cache.compact_offset = 0;
-    for tensor in bundle
+    bundle
         .dn_state
-        .s_matrices
-        .iter()
-        .chain(bundle.dn_state.s_scales.iter())
-        .chain(bundle.dn_state.conv_states.iter())
-        .chain(bundle.dn_state.s_ef_residual.iter())
-    {
-        gpu.hip
-            .memset(&tensor.buf, 0, tensor.buf.size())
-            .map_err(|error| error.to_string())?;
-    }
+        .reset(gpu)
+        .map_err(|error| error.to_string())?;
     redline_fill_qwen_scratch(gpu, bundle, 0)?;
     gpu.hip
         .device_synchronize()
@@ -856,7 +841,7 @@ fn redline_prime_qwen_tokens(
     bundle: &mut Qwen35Bundle,
     tokens: &[u32],
 ) -> Result<(), String> {
-    qwen35::forward_prefill_batch(
+    qwen35::forward_prefill_batch_ordinary(
         gpu,
         &bundle.weights,
         &bundle.config,
@@ -865,12 +850,12 @@ fn redline_prime_qwen_tokens(
         &mut bundle.kv_cache,
         &mut bundle.dn_state,
         &bundle.scratch,
-        None,
-        None,
-        None,
-        None,
     )
     .map_err(|error| error.to_string())?;
+    bundle
+        .dn_state
+        .seal_streams(gpu, tokens.len())
+        .map_err(|error| error.to_string())?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
@@ -2494,18 +2479,9 @@ fn redline_reset_qwen_slot(
         .clear_gpu(gpu)
         .map_err(|error| error.to_string())?;
     slot.kv_cache.compact_offset = 0;
-    for tensor in slot
-        .dn_state
-        .s_matrices
-        .iter()
-        .chain(slot.dn_state.s_scales.iter())
-        .chain(slot.dn_state.conv_states.iter())
-        .chain(slot.dn_state.s_ef_residual.iter())
-    {
-        gpu.hip
-            .memset(&tensor.buf, 0, tensor.buf.size())
-            .map_err(|error| error.to_string())?;
-    }
+    slot.dn_state
+        .reset(gpu)
+        .map_err(|error| error.to_string())?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
@@ -2520,7 +2496,7 @@ fn redline_prime_qwen_slot(
         return Ok(());
     }
     let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-    qwen35::forward_prefill_batch(
+    qwen35::forward_prefill_batch_ordinary(
         gpu,
         &slot.weights,
         &slot.config,
@@ -2529,12 +2505,11 @@ fn redline_prime_qwen_slot(
         &mut slot.kv_cache,
         &mut slot.dn_state,
         &slot.scratch,
-        None,
-        None,
-        None,
-        None,
     )
     .map_err(|error| error.to_string())?;
+    slot.dn_state
+        .seal_streams(gpu, synthetic.len())
+        .map_err(|error| error.to_string())?;
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
@@ -3853,14 +3828,14 @@ fn redline_qwen4_replay_failure(
     // growth produces. The plan must refuse before the body, not after it.
     gpu.replay
         .set_prepared_max_position(context.saturating_sub(1));
-    let launches = gpu.replay.recorded_launches().len();
+    let launches = gpu.replay.retained_body_launches();
     let reprepared = if pm4 {
         gpu.replay
             .prepare_pm4_prefix(gpu.device_id as usize, launches)
             .map(|_| ())
     } else {
         gpu.replay
-            .prepare_linear_aql(gpu.device_id as usize)
+            .prepare_linear_aql_prefix(gpu.device_id as usize, launches)
             .map(|_| ())
     };
     if let Err(reason) = reprepared {
@@ -3911,7 +3886,7 @@ fn redline_shadow_qwen4(
 ) -> Result<serde_json::Value, String> {
     // The replayed decode steps fetch PLE rows: hold the whole-request guard.
     let _ple_serving = loaded.ple_serving_guard();
-    let launches = gpu.replay.recorded_launches().len();
+    let launches = gpu.replay.retained_body_launches();
     if launches == 0 {
         return Err("Qwen4 Redline shadow requires a captured decode tape".to_string());
     }
@@ -3924,7 +3899,7 @@ fn redline_shadow_qwen4(
             .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
     } else {
         gpu.replay
-            .prepare_linear_aql(gpu.device_id as usize)
+            .prepare_linear_aql_prefix(gpu.device_id as usize, launches)
             .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
     }?;
     // Read while the plan is still installed: a replay consumes it.
@@ -3995,7 +3970,7 @@ fn redline_shadow_qwen4(
                 "command_dwords": identity.command_dwords,
                 "queues": identity.queue_count,
                 "phases": identity.phase_count,
-                "dispatch_equals_launches": identity.dispatch_count == capture.launch_count,
+                "dispatch_equals_launches": identity.dispatch_count == launches,
                 "queue_count": identity.queue_count,
                 "phase_count": identity.phase_count,
             })
@@ -4045,6 +4020,7 @@ fn redline_shadow_qwen4(
         },
         "capture": {
             "launches": capture.launch_count,
+            "body_launches": launches,
             "unique_kernels": capture.unique_kernel_count,
             "sequence_hash": format!("{:016x}", capture.sequence_hash),
             "aql_contracts": capture.unique_kernel_count,
@@ -5554,14 +5530,7 @@ fn redline_trace_hash(bytes: &[u8]) -> u64 {
 }
 
 fn redline_trace_dn_planes(bundle: &Qwen35Bundle) -> Vec<&rdna_compute::GpuTensor> {
-    bundle
-        .dn_state
-        .s_matrices
-        .iter()
-        .chain(bundle.dn_state.s_scales.iter())
-        .chain(bundle.dn_state.conv_states.iter())
-        .chain(bundle.dn_state.s_ef_residual.iter())
-        .collect()
+    bundle.dn_state.families().into_iter().flatten().collect()
 }
 
 fn redline_trace_kv_planes(bundle: &Qwen35Bundle) -> Vec<&rdna_compute::GpuTensor> {

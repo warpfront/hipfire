@@ -429,7 +429,6 @@ fn bring_up() -> Option<Rig> {
         } = &mut slot;
         qwen35::forward_prefill_batch(
             &mut gpu, weights, config, &prompt, 0, kv_cache, dn_state, scratch, None, None, None,
-            None,
         )
         .expect("prefill");
     }

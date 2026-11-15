@@ -12,7 +12,7 @@ old CLIs that read {models, aliases} keep working unchanged; new fields are
 purely additive:
   top-level : schema_version, generated_at
   per-entry : sha256 (HF LFS oid), size_bytes, arch_id, quant
-  sidecars  : triattn/mtp/dflash gain sha256/size_bytes next to their `file`
+  sidecars  : mtp/dflash gain sha256/size_bytes next to their `file`
 
 Fail-closed: ANY problem — repo unreachable, file missing from the repo
 tree, file not LFS (no sha256), size_bytes disagreeing with curated
@@ -41,6 +41,7 @@ import json
 import re
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -54,11 +55,11 @@ SCHEMA_VERSION = 1
 # (wrong file / re-quantized upload) — fail so a human reconciles it.
 SIZE_TOLERANCE = 0.25
 # Flash-Next MQ4 XTS is published as ONE split base (`<name>-base.mq4-xts`) on
-# the family's shared PLE pair, under four stock tags. The monolithic spellings
-# below are removed from HF: no entry may download them. A verified local
-# monolithic keeps serving the split tags through a pin compiled into the
-# client (hipfire-registry GRANDFATHERED_MONOLITHICS), so these names survive
-# here only to be banned.
+# the family's shared PLE pair, under one model tag; the other stock spellings
+# are aliases of it. The monolithic spellings below are removed from HF: no
+# entry may download them. A verified local monolithic keeps serving the split
+# tag through a pin compiled into the client (hipfire-registry
+# GRANDFATHERED_MONOLITHICS), so these names survive here only to be banned.
 FLASH_NEXT_XTS_REPO = "hipfire-models/qwen3.8-flash-next"
 FLASH_NEXT_XTS_LEGACY_FILE = "qwen3.8-flash-next-gptq3.mq4"
 FLASH_NEXT_XTS_CANONICAL_FILE = "qwen3.8-flash-next.mq4-xts"
@@ -66,13 +67,15 @@ FLASH_NEXT_XTS_MONOLITHIC_FILES = (
     FLASH_NEXT_XTS_CANONICAL_FILE,
     FLASH_NEXT_XTS_LEGACY_FILE,
 )
-FLASH_NEXT_XTS_SPLIT_BASE_FILE = "qwen3.8-flash-next-base.mq4-xts"
-FLASH_NEXT_XTS_SPLIT_BASE_SHA256 = (
-    "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45"
-)
-FLASH_NEXT_XTS_SPLIT_BASE_SIZE = 70888270360
-FLASH_NEXT_XTS_TAGS = (
-    "qwen3.8:flash-next",
+# The split base identity is the fixture pin (fixtures/pins.toml).
+with open(Path(__file__).resolve().parents[1] / "fixtures" / "pins.toml", "rb") as _f:
+    _SPLIT_BASE_PIN = tomllib.load(_f)["model"]["qwen3.8-flash-next-base.mq4-xts"]
+FLASH_NEXT_XTS_SPLIT_BASE_FILE = _SPLIT_BASE_PIN["file"]
+FLASH_NEXT_XTS_SPLIT_BASE_SHA256 = _SPLIT_BASE_PIN["sha256"]
+FLASH_NEXT_XTS_SPLIT_BASE_SIZE = _SPLIT_BASE_PIN["size_bytes"]
+FLASH_NEXT_XTS_TAG = "qwen3.8:flash-next"
+FLASH_NEXT_XTS_ALIAS_TAGS = (
+    "qwen3.8:flash",
     "qwen3.8:flash-next-mq4",
     "qwen3.8:flash-next-gptq3",
     "qwen3.8:flash-next-mq4-xts",
@@ -334,6 +337,11 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
     # daily run, every other model's entry included.
     if family in ("ornith-1.5", "ornith1.5", "ornith"):
         return 6 if "a3b" in tag else 5
+    # LightOnOCR-3 0.8B/4B = dense Qwen3.5-VL (Qwen3_5ForConditionalGeneration,
+    # DeltaNet + full-attention hybrid). Local-only today: arch stamp is the
+    # same dense-qwen3_5 id the quantizer derives from model_type `qwen3_5`.
+    if family in ("lightonocr3", "lightonocr"):
+        return 5
     if family == "qwen3":
         return 1
     if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
@@ -439,9 +447,9 @@ def is_strict_superset(old: object, new: object, path: str, errors: list[str]) -
         errors.append(f"superset violation at {path}: {old!r} != {new!r}")
 
 
-def validate_flash_next_xts(models: dict, errors: list[str]) -> None:
-    """The four stock MQ4 tags are one split base on the shared PLE pair."""
-    if not any(tag in models for tag in FLASH_NEXT_XTS_TAGS) and not any(
+def validate_flash_next_xts(models: dict, aliases: dict, errors: list[str]) -> None:
+    """One split-base tag on the shared PLE pair; the other stock tags alias it."""
+    if FLASH_NEXT_XTS_TAG not in models and not any(
         entry.get("repo") == FLASH_NEXT_XTS_REPO for entry in models.values()
     ):
         # build_registry also serves small, unrelated fixture/custom catalogs.
@@ -460,13 +468,11 @@ def validate_flash_next_xts(models: dict, errors: list[str]) -> None:
         "arch_id": 16,
         "quant": "mq4",
     }
-    present: list[tuple[str, dict]] = []
-    for tag in FLASH_NEXT_XTS_TAGS:
-        entry = models.get(tag)
-        if entry is None:
-            errors.append(f"{tag}: required Flash-Next MQ4 XTS tag is missing")
-            continue
-        present.append((tag, entry))
+    entry = models.get(FLASH_NEXT_XTS_TAG)
+    tag = FLASH_NEXT_XTS_TAG
+    if entry is None:
+        errors.append(f"{tag}: required Flash-Next MQ4 XTS tag is missing")
+    else:
         for key, value in expected.items():
             if entry.get(key) != value:
                 errors.append(f"{tag}: XTS invariant {key} must be {value!r}")
@@ -480,12 +486,12 @@ def validate_flash_next_xts(models: dict, errors: list[str]) -> None:
             if not isinstance(sidecar, dict) or sidecar.get("file") != file:
                 errors.append(f"{tag}: ple.{key} must be the shared {file!r}")
 
-    # One artifact under four names: identity, settings and sidecars never differ.
-    if present:
-        first_tag, first = present[0]
-        for tag, entry in present[1:]:
-            if entry != first:
-                errors.append(f"{tag}: XTS metadata differs from {first_tag}")
+    # One artifact under several names: the other spellings are aliases, never rows.
+    for alias in FLASH_NEXT_XTS_ALIAS_TAGS:
+        if alias in models:
+            errors.append(f"{alias}: duplicate of {tag}; make it an alias, not a model row")
+        elif aliases.get(alias) != tag:
+            errors.append(f"{alias} must alias {tag} (MQ4 XTS)")
 
 
 def split_base_stem(file: str) -> str | None:
@@ -548,7 +554,7 @@ def validate_shared_ple_pins(models: dict, errors: list[str]) -> None:
 def annotate_sidecar(
     sidecar: dict, tree: dict[str, dict], tag: str, kind: str, errors: list[str]
 ) -> dict:
-    """triattn/mtp/dflash/vision sub-object: require existence, add sha256/size_bytes if LFS."""
+    """mtp/dflash/vision sub-object: require existence, add sha256/size_bytes if LFS."""
     out = dict(sidecar)
     fname = sidecar.get("file", "")
     item = tree.get(fname)
@@ -581,8 +587,6 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
 
     # One tree fetch per unique repo.
     repos = sorted({e["repo"] for e in models.values() if e.get("repo")})
-    if FLASH_NEXT_XTS_REPO in repos and aliases.get("qwen3.8:flash") != "qwen3.8:flash-next":
-        errors.append("qwen3.8:flash must alias qwen3.8:flash-next (MQ4 XTS)")
     # Image-component (diffusion) repos publish AFTER their packs exist, so a
     # missing repo is expected until the first upload: sizes/digests stay TBD
     # on those entries. Fail-closed stays for text-model repos, where a probe
@@ -628,6 +632,15 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                 f"{tag}: invalid default_tool_format {tool_format!r} "
                 f"(allowed: {sorted(KNOWN_TOOL_FORMATS)})"
             )
+        # Optional DFlash VRAM floor (GiB, carried verbatim): the daemon skips
+        # the `dflash` draft under `auto` on a smaller device. Fail-closed,
+        # matching hipfire-registry.
+        floor = entry.get("dflash_min_vram_gb")
+        if floor is not None:
+            if isinstance(floor, bool) or not isinstance(floor, (int, float)) or not floor > 0:
+                errors.append(f"{tag}: invalid dflash_min_vram_gb {floor!r} (positive GiB)")
+            if not isinstance(entry.get("dflash"), dict):
+                errors.append(f"{tag}: dflash_min_vram_gb without a dflash draft")
         # Optional curated recommended_settings (carried verbatim by deepcopy).
         # Validate bounds — fail-closed, matching hipfire-registry.
         validate_recommended_settings(tag, entry.get("recommended_settings"), errors)
@@ -683,7 +696,7 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                                 f"HF {size_bytes / 1e9:.2f} GB ({drift:.0%} drift); "
                                 f"update registry/models.json"
                             )
-            for kind in ("triattn", "mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae"):
+            for kind in ("mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae"):
                 if isinstance(entry.get(kind), dict):
                     new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
             ple = entry.get("ple")
@@ -735,7 +748,7 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
     # Strict-superset guarantee — the whole point of v1 back-compat.
     is_strict_superset(curated.get("models", {}), registry["models"], "models", errors)
     is_strict_superset(curated.get("aliases", {}), registry["aliases"], "aliases", errors)
-    validate_flash_next_xts(out_models, errors)
+    validate_flash_next_xts(out_models, aliases, errors)
     validate_shared_ple_pins(out_models, errors)
 
     if errors:

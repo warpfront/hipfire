@@ -3,12 +3,12 @@
 # hipfire — see LICENSE and NOTICE in the project root.
 """Flash-Next MQ4 XTS is ONE split base on the shared PLE pair.
 
-The four stock tags (`qwen3.8:flash-next`, `-mq4`, `-gptq3`, `-mq4-xts`) must
-all be the split base `qwen3.8-flash-next-base.mq4-xts` with the family's
-shared `ple` map (`q4` / `q8`), byte-for-byte identical metadata, and no entry may
-download the removed monolithic (`qwen3.8-flash-next.mq4-xts`,
-`qwen3.8-flash-next-gptq3.mq4`); the client keeps a compiled-in pin for a
-verified local copy.
+`qwen3.8:flash-next` must be the split base `qwen3.8-flash-next-base.mq4-xts`
+with the family's shared `ple` map (`q4` / `q8`); the other stock spellings
+(`qwen3.8:flash`, `-mq4`, `-gptq3`, `-mq4-xts`) must be aliases of it, never
+duplicate rows; and no entry may download the removed monolithic
+(`qwen3.8-flash-next.mq4-xts`, `qwen3.8-flash-next-gptq3.mq4`); the client keeps
+a compiled-in pin for a verified local copy.
 
 No network: `repo_tree` is stubbed, the catalog is built in memory.
 """
@@ -59,12 +59,18 @@ def _stock_entry() -> dict:
 
 
 def _stock_models() -> dict:
-    return {tag: copy.deepcopy(_stock_entry()) for tag in rg.FLASH_NEXT_XTS_TAGS}
+    return {rg.FLASH_NEXT_XTS_TAG: _stock_entry()}
 
 
-def _errors(models: dict) -> list[str]:
+def _stock_aliases() -> dict:
+    return {alias: rg.FLASH_NEXT_XTS_TAG for alias in rg.FLASH_NEXT_XTS_ALIAS_TAGS}
+
+
+def _errors(models: dict, aliases: dict | None = None) -> list[str]:
     errors: list[str] = []
-    rg.validate_flash_next_xts(models, errors)
+    rg.validate_flash_next_xts(
+        models, _stock_aliases() if aliases is None else aliases, errors
+    )
     return errors
 
 
@@ -95,11 +101,18 @@ def test_split_base_invariants_reject_drift(key, value):
     assert _errors(models)
 
 
-@pytest.mark.parametrize("tag", rg.FLASH_NEXT_XTS_TAGS)
-def test_every_stock_tag_is_required(tag):
-    models = _stock_models()
-    del models[tag]
-    assert any("missing" in error for error in _errors(models))
+def test_the_stock_tag_is_required():
+    other = {"other": {"repo": rg.FLASH_NEXT_XTS_REPO, "file": BASE, "desc": "x"}}
+    assert any("missing" in error for error in _errors(other))
+
+
+@pytest.mark.parametrize("alias", rg.FLASH_NEXT_XTS_ALIAS_TAGS)
+def test_every_stock_spelling_must_alias_the_split_tag(alias):
+    aliases = _stock_aliases()
+    del aliases[alias]
+    assert any(f"{alias} must alias" in error for error in _errors(_stock_models(), aliases))
+    aliases[alias] = "qwen3.8:flash-next-mq4-xts-symtrunk"
+    assert any(f"{alias} must alias" in error for error in _errors(_stock_models(), aliases))
 
 
 @pytest.mark.parametrize("key", ["q4", "q8"])
@@ -114,18 +127,15 @@ def test_every_stock_tag_is_required(tag):
 )
 def test_ple_sidecars_must_be_the_shared_files(key, mutate):
     models = _stock_models()
-    mutate(models["qwen3.8:flash-next-gptq3"]["ple"], key)
+    mutate(models["qwen3.8:flash-next"]["ple"], key)
     assert any(f"ple.{key}" in error for error in _errors(models))
 
 
-def test_the_four_tags_must_carry_identical_metadata():
+@pytest.mark.parametrize("alias", rg.FLASH_NEXT_XTS_ALIAS_TAGS)
+def test_a_stock_spelling_may_not_be_a_duplicate_row(alias):
     models = _stock_models()
-    models["qwen3.8:flash-next-mq4"]["recommended_settings"] = {"temperature": 0.5}
-    errors = _errors(models)
-    assert any("qwen3.8:flash-next-mq4" in error and "differs" in error for error in errors)
-    models = _stock_models()
-    models["qwen3.8:flash-next-mq4-xts"]["min_vram_gb"] = 8
-    assert any("differs" in error for error in _errors(models))
+    models[alias] = _stock_entry()
+    assert any(alias in error and "duplicate" in error for error in _errors(models))
 
 
 @pytest.mark.parametrize("file", rg.FLASH_NEXT_XTS_MONOLITHIC_FILES)
@@ -149,10 +159,11 @@ def test_no_entry_may_name_the_removed_monolithic(file):
 def test_old_wire_registry_shape_is_rejected():
     """The pre-split wire defaults (legacy filename on three tags) are gone."""
     models = _stock_models()
-    for tag in rg.FLASH_NEXT_XTS_TAGS[:3]:
+    for tag in rg.FLASH_NEXT_XTS_ALIAS_TAGS[1:]:
+        models[tag] = _stock_entry()
         models[tag]["file"] = rg.FLASH_NEXT_XTS_LEGACY_FILE
-    models["qwen3.8:flash-next-mq4-xts"]["file"] = rg.FLASH_NEXT_XTS_CANONICAL_FILE
-    errors = _errors(models)
+    models["qwen3.8:flash-next"]["file"] = rg.FLASH_NEXT_XTS_CANONICAL_FILE
+    errors = _errors(models, {})
     assert sum("removed monolithic" in error for error in errors) == 4
 
 
@@ -177,7 +188,7 @@ def _curated(models: dict) -> dict:
             entry.pop(key, None)
         entry["ple"] = {key: {"file": sidecar["file"]} for key, sidecar in entry["ple"].items()}
         curated_models[tag] = entry
-    return {"models": curated_models, "aliases": {"qwen3.8:flash": "qwen3.8:flash-next"}}
+    return {"models": curated_models, "aliases": _stock_aliases()}
 
 
 def test_build_registry_accepts_the_split_only_catalog(monkeypatch):
@@ -185,13 +196,14 @@ def test_build_registry_accepts_the_split_only_catalog(monkeypatch):
     monkeypatch.setattr(rg, "log", lambda msg: None)
     registry, errors = rg.build_registry(_curated(_stock_models()), None)
     assert errors == [], errors
-    for tag in rg.FLASH_NEXT_XTS_TAGS:
-        built = registry["models"][tag]
-        assert built["file"] == BASE
-        assert built["sha256"] == rg.FLASH_NEXT_XTS_SPLIT_BASE_SHA256
-        assert built["size_bytes"] == rg.FLASH_NEXT_XTS_SPLIT_BASE_SIZE
-        assert built["ple"]["q4"]["file"] == Q4 and built["ple"]["q8"]["file"] == Q8
-    assert registry["aliases"]["qwen3.8:flash"] == "qwen3.8:flash-next"
+    built = registry["models"][rg.FLASH_NEXT_XTS_TAG]
+    assert built["file"] == BASE
+    assert built["sha256"] == rg.FLASH_NEXT_XTS_SPLIT_BASE_SHA256
+    assert built["size_bytes"] == rg.FLASH_NEXT_XTS_SPLIT_BASE_SIZE
+    assert built["ple"]["q4"]["file"] == Q4 and built["ple"]["q8"]["file"] == Q8
+    for alias in rg.FLASH_NEXT_XTS_ALIAS_TAGS:
+        assert alias not in registry["models"]
+        assert registry["aliases"][alias] == rg.FLASH_NEXT_XTS_TAG
 
 
 def test_build_registry_fails_when_a_tag_still_names_the_monolithic(monkeypatch):
@@ -206,7 +218,7 @@ def test_build_registry_fails_when_a_tag_still_names_the_monolithic(monkeypatch)
     monkeypatch.setattr(rg, "repo_tree", lambda repo, token: tree)
     monkeypatch.setattr(rg, "log", lambda msg: None)
     curated = _curated(_stock_models())
-    curated["models"]["qwen3.8:flash-next-mq4-xts"]["file"] = rg.FLASH_NEXT_XTS_CANONICAL_FILE
+    curated["models"]["qwen3.8:flash-next"]["file"] = rg.FLASH_NEXT_XTS_CANONICAL_FILE
     registry, errors = rg.build_registry(curated, None)
     assert registry is None
     assert any("monolithic" in error for error in errors), errors

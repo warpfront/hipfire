@@ -85,6 +85,7 @@ fn make_state(gpu: &mut Gpu, ef_on: bool, seed: u64) -> DeltaNetState {
             Vec::new()
         },
         quant: StateQuant::Q8,
+        stream: hipfire_arch_qwen35::qwen35::weights::GdnStreamOwner::new(N_LAYERS, 1, None),
     }
 }
 

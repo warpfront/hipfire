@@ -535,8 +535,8 @@ pub(crate) struct Qwen4EpRowGatherHook {
     /// Buffer index of this rank's previous invocation. The transport's hazard
     /// rule forbids the same buffer on two consecutive invocations.
     last_buffer: AtomicUsize,
-    /// Balanced-ownership layers (default on under EP; `HIPFIRE_EP_BALANCED_OWNERS=0`
-    /// disables), installed once after the forward attached its live tables.
+    /// Balanced-ownership layers (on under EP when the gate admits them),
+    /// installed once after the forward attached its live tables.
     /// Never set when disabled.
     balanced: OnceLock<BalancedOwners>,
     /// The mesh's per-expert unit plan (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`), installed once for
@@ -786,10 +786,10 @@ fn shared_tail_board(
 }
 
 /// Install the rank's D2 tail when `HIPFIRE_EP_UNIT_TAIL` asks for it. The tail needs the
-/// per-expert unit plan (a plan-less load is a load error, never a silent no-op). With
-/// `HIPFIRE_EP_UNIT_TAIL_PEER=1` (and the prefill lever), and/or with `HIPFIRE_EP_UNIT_TAIL_PINS=1`
-/// where pinned owners are in effect, every rank gets the mesh's one shared
-/// [`crate::expert_unit_tail::PeerBoard`], created by the first rank to install (`peer_board`).
+/// per-expert unit plan (a plan-less load is a load error, never a silent no-op). On a mesh of two
+/// or more ranks every rank gets the mesh's one shared [`crate::expert_unit_tail::PeerBoard`]
+/// (which also carries the pin planes of pinned owners), created by the first rank to install
+/// (`peer_board`).
 fn install_unit_tail(
     hook: &Qwen4EpRowGatherHook,
     gpu: &mut Gpu,
@@ -817,85 +817,27 @@ fn install_unit_tail(
         return Ok(());
     };
     let log = hipfire_config::developer_bool(tail::EP_UNIT_TAIL_LOG_ENV, false);
-    let prefill = tail::tail_lever(tail::EP_UNIT_TAIL_PREFILL_ENV);
     let ranks = plan.geometry().ranks;
-    // Notes about an ignored lever print only when the operator set that lever.
-    let peer_set = tail::tail_lever_explicit(tail::EP_UNIT_TAIL_PEER_ENV);
-    let pins_set = tail::tail_lever_explicit(tail::EP_UNIT_TAIL_PINS_ENV);
-    let peer = if !tail::tail_lever(tail::EP_UNIT_TAIL_PEER_ENV) {
-        None
-    } else if !prefill {
-        if peer_set {
-            eprintln!(
-                "qwen4 EP rank {rank}: {}=1 is ignored: it needs {}=1",
-                tail::EP_UNIT_TAIL_PEER_ENV,
-                tail::EP_UNIT_TAIL_PREFILL_ENV
-            );
-        }
-        None
-    } else if ranks < 2 {
-        if peer_set {
-            eprintln!(
-                "qwen4 EP rank {rank}: {}=1 is ignored: the mesh has no peer rank",
-                tail::EP_UNIT_TAIL_PEER_ENV
-            );
-        }
+    let peer = if ranks < 2 {
         None
     } else if rank >= ranks {
         return Err(format!(
             "{}: rank {rank} is outside the plan's {ranks} ranks",
-            tail::EP_UNIT_TAIL_PEER_ENV
+            tail::EP_UNIT_TAIL_ENV
         ));
     } else {
         Some(shared_tail_board(
             peer_board,
             ranks,
-            tail::EP_UNIT_TAIL_PEER_ENV,
+            tail::EP_UNIT_TAIL_ENV,
         )?)
     };
-    // The pins lever: the tail keeps the pinned unit layers (D1.9) and their pin plane follows
-    // its publications. Effective only where those layers exist on this load (pinned owners
-    // admitted as without a tail); otherwise the tail runs exactly as it does without the lever.
-    let pins_flag = tail::tail_lever(tail::EP_UNIT_TAIL_PINS_ENV);
-    let pins_requested = tail::ep_unit_tail_pins_requested();
-    if pins_set && pins_flag && !pins_requested {
-        eprintln!(
-            "qwen4 EP rank {rank}: {}=1 is ignored: it needs {}=1",
-            tail::EP_UNIT_TAIL_PINS_ENV,
-            tail::EP_UNIT_TAIL_PREFILL_ENV
-        );
-    }
-    let layers = forward.tail_layers(prefill, pins_requested);
-    let pin_board = if !pins_requested {
-        None
-    } else if !layers.iter().any(|layer| layer.pins.is_some()) {
-        if pins_set {
-            eprintln!(
-                "qwen4 EP rank {rank}: {}=1 is ignored: pinned owners are not in effect on this load \
-                 (the tail runs on static owners, as without the lever)",
-                tail::EP_UNIT_TAIL_PINS_ENV
-            );
-        }
-        None
-    } else if ranks < 2 {
-        if pins_set {
-            eprintln!(
-                "qwen4 EP rank {rank}: {}=1 is ignored: the mesh has no peer rank",
-                tail::EP_UNIT_TAIL_PINS_ENV
-            );
-        }
-        None
-    } else if rank >= ranks {
-        return Err(format!(
-            "{}: rank {rank} is outside the plan's {ranks} ranks",
-            tail::EP_UNIT_TAIL_PINS_ENV
-        ));
+    // The pinned unit layers' pin planes ride the mesh's one shared board (`peer`).
+    let layers = forward.tail_layers();
+    let pin_board = if layers.iter().any(|layer| layer.pins.is_some()) {
+        peer.clone()
     } else {
-        Some(shared_tail_board(
-            peer_board,
-            ranks,
-            tail::EP_UNIT_TAIL_PINS_ENV,
-        )?)
+        None
     };
     let installed = Arc::new(crate::expert_unit_tail_rank::UnitTailRank::install(
         gpu,
@@ -905,27 +847,21 @@ fn install_unit_tail(
         config,
         hipfire_config::developer_bool(tail::EP_UNIT_TAIL_FREEZE_ENV, false),
         log,
-        tail::tail_lever(tail::EP_UNIT_TAIL_FILL_OVERLAP_ENV),
         // Direct usage log: routed ids are written into the log by the route, not copied there.
         // The chunk dump and the routing trace read the top-k scratch after the layer, so either
         // one keeps the per-layer copy.
-        tail::tail_lever(tail::EP_TAIL_LOG_DIRECT_ENV)
-            && crate::chunk_dump::config().is_none()
-            && !forward.route_trace_active(),
-        tail::tail_lever(tail::EP_UNIT_TAIL_PEER_RESERVE_ENV),
+        crate::chunk_dump::config().is_none() && !forward.route_trace_active(),
         layers,
         peer,
         pin_board,
     )?);
     hook.install_tail(installed.clone())?;
-    if prefill {
-        // The pool is visible to prefill routes: the unit stage (when this rank built one) names
-        // live slots in its tables and skips their bytes in the H2D copy.
-        forward.link_unit_tail_stage(installed.clone(), log)?;
-        // A planned EP tail borrow (`HIPFIRE_QWEN4_EP_TAIL_BORROW`) lends this same pool to
-        // prefill as its extra scratch bank; the mesh attaches it once the tile hook exists.
-        forward.ep_tail_borrow_take_tail(installed);
-    }
+    // The pool is visible to prefill routes: the unit stage (when this rank built one) names
+    // live slots in its tables and skips their bytes in the H2D copy.
+    forward.link_unit_tail_stage(installed.clone(), log)?;
+    // A planned EP tail borrow (`HIPFIRE_QWEN4_EP_TAIL_BORROW`) lends this same pool to
+    // prefill as its extra scratch bank; the mesh attaches it once the tile hook exists.
+    forward.ep_tail_borrow_take_tail(installed);
     Ok(())
 }
 
@@ -1095,7 +1031,7 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
             .and_then(Option::as_ref)
         {
             Some(pins) => {
-                // The pin planes of the tail (`HIPFIRE_EP_UNIT_TAIL_PINS`) are identical on every
+                // The pin planes of the tail are identical on every
                 // rank by construction; after a recorded fault they may not be, and a call over
                 // planes that differ is not exact: refuse before any launch of the pinned kernel.
                 if let Some(why) = self.tail.get().and_then(|tail| tail.pins_fault()) {
@@ -1449,8 +1385,8 @@ impl MoeTileExchange for Qwen4EpTileExchangeHook {
 pub struct Qwen4EpMesh {
     pool: RankPool<Qwen4EpPeer>,
     gather: Arc<EpRowGather>,
-    /// Owner-routed chunk MoE transport (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`); `None`
-    /// when the lever is off or was not admitted on every rank.
+    /// Owner-routed chunk MoE transport; `None` when the route was not admitted
+    /// on every rank.
     tile: Option<Arc<EpTileExchange>>,
     /// Rank 0's trunk output split (`HIPFIRE_EP_TRUNK_SPLIT`); `None` when off.
     split: Option<TrunkSplitRank>,
@@ -1666,7 +1602,9 @@ impl Qwen4Bundle {
     /// `self` is rank 0 on `gpu`: loaded with its forward attached and bound
     /// to its load's seal ([`Qwen4Bundle::bind_ep_seal`]), from which the
     /// rank count and every rank's physical device come. `loader` builds one
-    /// peer on its worker thread (hipfire-loader supplies it). Sequence:
+    /// peer on its worker thread (hipfire-loader supplies it). `ep_ar_wire` (typed
+    /// `topology.ep_ar_wire`) picks the mixer partials' wire format under the two-card trunk
+    /// shard (ignored without it). Sequence:
     ///
     /// 1. every peer loads on its own thread; it must be bound to rank 0's
     ///    seal at its own rank on the seal's device, and its config and EP
@@ -1678,7 +1616,7 @@ impl Qwen4Bundle {
     /// 4. every rank reports its compact expert sources;
     /// 5. every rank builds its full (P2P) tables from all sources and installs
     ///    the row-gather hook (`Qwen4GpuForward::attach_ep`);
-    /// 5b. with `HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`, every rank's tile-exchange
+    /// 5b. every rank's tile-exchange
     ///    registration and symmetric verdicts are collected (`run_all`, every rank, any
     ///    admitted rank count); the exchange is installed only if all ranks admitted and agree;
     /// 6. per-rank memory is recorded and the mesh is stored in `self`.
@@ -1689,6 +1627,7 @@ impl Qwen4Bundle {
         &mut self,
         gpu: &mut Gpu,
         loader: Arc<PeerLoadFn>,
+        ep_ar_wire: hipfire_config::topology::EpArWire,
     ) -> Result<(), BundleError> {
         if self.ep.is_some() {
             return Err(ep_err("the mesh is already attached"));
@@ -1796,7 +1735,7 @@ impl Qwen4Bundle {
         let pool =
             RankPool::spawn("hipfire-qwen4-ep", inits, Qwen4EpPeer::teardown).map_err(ep_err)?;
 
-        match self.ep_attach_steps(gpu, pool, spec, trunk_layers, device_ids) {
+        match self.ep_attach_steps(gpu, pool, spec, trunk_layers, device_ids, ep_ar_wire) {
             Ok(mesh) => {
                 self.ep = Some(Box::new(mesh));
                 Ok(())
@@ -1814,14 +1753,14 @@ impl Qwen4Bundle {
         spec: EpRowGatherSpec,
         trunk_layers: usize,
         device_ids: Vec<i32>,
+        ep_ar_wire: hipfire_config::topology::EpArWire,
     ) -> Result<Qwen4EpMesh, String> {
         let ranks = spec.ranks;
         // 2. Register every rank's gather buffers, build the transport. On exact gfx1201 a
         // rank's gather waits its peers' producer events on its stream instead of the host
-        // (`HIPFIRE_QWEN4_EP_GATHER_DEVICE_WAIT`, default on, `=0` restores the host waits):
-        // same copies in the same stream order, no host round trip per MoE layer.
-        let device_waits = gpu.arch_caps.is_gfx1201()
-            && hipfire_config::developer_bool("HIPFIRE_QWEN4_EP_GATHER_DEVICE_WAIT", true);
+        // (other arches keep the host waits): same copies in the same stream order, no host
+        // round trip per MoE layer.
+        let device_waits = gpu.arch_caps.is_gfx1201();
         let builder = Mutex::new(Some(EpRowGather::builder(spec).device_waits(device_waits)));
         let register = |rank: usize, bundle: &Qwen4Bundle, gpu: &mut Gpu| -> Result<(), String> {
             let buffers = bundle
@@ -1882,7 +1821,7 @@ impl Qwen4Bundle {
             error
         };
 
-        // 2b. Owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): every rank that
+        // 2b. Owner-routed chunk MoE: every rank that
         // admitted it at construction registers its grouped-row buffer (allocated before
         // P2P is enabled below) with one transport.
         let capacities = {
@@ -2080,8 +2019,8 @@ impl Qwen4Bundle {
                             exchange
                                 .register(0, gpu0)
                                 .map_err(|e| format!("register trunk-shard mailbox: {e}"))?;
-                            // `HIPFIRE_QWEN4_EP_SEQ_PARALLEL`: resolve the SP kernels now (JIT is
-                            // not capture-safe); a no-op with the switch off.
+                            // Resolve the SP kernels now (JIT is not capture-safe); a no-op
+                            // when SP is unavailable.
                             crate::trunk_route::sp_prepare(&exchange, gpu0)
                         },
                         &|rank, peer: &mut Qwen4EpPeer| {
@@ -2100,6 +2039,20 @@ impl Qwen4Bundle {
             } else {
                 None
             };
+        // The mixer write's partial format (`topology.ep_ar_wire`); the FFN write always sends
+        // bf16 (its partial is already bf16-exact).
+        let mixer_wire = match ep_ar_wire {
+            hipfire_config::topology::EpArWire::Bf16 => {
+                rdna_compute::ar_hc_write::ArHcPartial::Bf16
+            }
+            hipfire_config::topology::EpArWire::F32 => rdna_compute::ar_hc_write::ArHcPartial::F32,
+        };
+        if ar_hc.is_some() {
+            eprintln!(
+                "qwen4 trunk shard: mixer all-reduce wire {} (topology.ep_ar_wire), FFN bf16",
+                ep_ar_wire.name()
+            );
+        }
 
         // 2e. Vocabulary-sharded target LM head (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`, X1): every rank
         // allocates its exchange buffers (the packed shard logits and top-1 ids rank 0 reads
@@ -2333,7 +2286,7 @@ impl Qwen4Bundle {
                 .attach_ep(gpu, bundle, &sources, installed)
                 .map_err(|error| format!("attach EP tables: {error}"))
                 .and_then(|()| match forward.balanced_plan() {
-                    // Default on (`HIPFIRE_EP_BALANCED_OWNERS=0` disables) with a
+                    // Admitted with a
                     // host-mapped layer on gfx1201 at 2..=4 ranks; other arches and
                     // more ranks run the exact static split (`attach_ep` builds no
                     // balanced layers).
@@ -2370,13 +2323,19 @@ impl Qwen4Bundle {
                     .map_err(|error| format!("settle the MoE down A8 head verdict: {error}"))
             });
             // The head's lane-local (full-table) MoE runtime, once the forward, its
-            // row gather and the head's pending verdict are in place (a no-op under
-            // `HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0` or without an EP-bound MoE head).
+            // row gather and the head's pending verdict are in place (a no-op
+            // without an EP-bound MoE head).
             let result =
                 result.and_then(|()| bundle.install_mtp_lane_local_moe(gpu, &head_sources));
             if result.is_ok() {
                 crate::trunk_route::install(ar_hc.as_ref().map(|exchange| {
-                    crate::trunk_route::TrunkShardRoute::new(exchange.clone(), rank, true, true)
+                    crate::trunk_route::TrunkShardRoute::new(
+                        exchange.clone(),
+                        rank,
+                        true,
+                        true,
+                        mixer_wire,
+                    )
                 }));
             }
             result
@@ -3066,16 +3025,13 @@ pub fn ep_lane_spec_k(resolved_k: usize) -> usize {
 /// reservation, the daemon's request and the batch staging share, so the
 /// reserved and the staged store cannot differ.
 pub fn ep_default_copy_config(gpu_arch: &str) -> Option<crate::lane::LaneCopyConfig> {
-    // Copy lane: on by default where the singleton policy arms it
-    // (`HIPFIRE_EP_MTP_LANE_COPY=0` kills it). Only the first
+    // Copy lane: on where the singleton policy arms it. Only the first
     // `HIPFIRE_QWEN4_LANE_COPY_LANES` lane slots (default 2) hold the widened
     // 8-row capture ring and may take copy windows, and a step with more
     // lanes offers none: at higher occupancy a copy window costs more than
     // it saves and each wide ring costs resident experts. `0` lanes = off.
     let wide_lanes = copy_wide_lanes();
-    if wide_lanes == 0
-        || !hipfire_config::developer_bool("HIPFIRE_EP_MTP_LANE_COPY", true)
-        || !hipfire_config::mtp_ngram_copy_enabled_for_arch(crate::ARCH_ID, gpu_arch)
+    if wide_lanes == 0 || !hipfire_config::mtp_ngram_copy_enabled_for_arch(crate::ARCH_ID, gpu_arch)
     {
         return None;
     }
@@ -3296,7 +3252,25 @@ fn stage_rank_lanes(
         .device_mem_info()
         .map(|(free, _)| free as u64)
         .map_err(|error| format!("rank {rank}: device memory query failed: {error}"))?;
-    ep_lane_fit(rank, need, free, reserve)?;
+    ep_lane_fit(rank, need, free, reserve).map_err(|error| {
+        // Only `serve.batch_exact` lanes carry the canonical GDN stream (`Qwen4StateFormat::lane`):
+        // name it, it is what such a store adds per lane.
+        let carry = crate::state::Qwen4State::gdn_stream_device_bytes(
+            &bundle.config,
+            bundle.state_format().lane().gdn_stream,
+            &crate::weights::Qwen4BandScope::single(&bundle.config),
+            crate::state::StateMirror::Snapshot,
+        )
+        .unwrap_or(0);
+        if carry == 0 {
+            error
+        } else {
+            format!(
+                "{error}; serve.batch_exact lanes keep the canonical GDN stream carry ({} MiB per MTP lane): lower serve.continuous_batch_size or turn serve.batch_exact off",
+                carry >> 20
+            )
+        }
+    })?;
     bundle
         .stage_lanes_with_copy(gpu, max_lanes, row_budget, spec, copy)
         .map_err(|error| format!("rank {rank}: {}", bundle_text(error)))
@@ -3418,15 +3392,11 @@ impl Qwen4Bundle {
         if spec.is_some() && self.ep_reserve_active() {
             // AR lanes are admitted on a reserve-sharing load (lane decode
             // steps run on the resident bank, lane prefill tiles borrow like
-            // a singleton prompt tile). A native-MTP store is admitted by
-            // default too (every window must fit the resident bank, see
-            // `spec_store_reserve_verdict` and the mesh window epoch guard)
-            // and refused with a label only under the kill switch
-            // `HIPFIRE_EP_MTP_RESERVE_SHARE=0`; the staging caller falls back
-            // to AR lanes on the refusal. The loader does not reserve a spec
-            // store under the decoupled reserve under the kill switch
-            // (`qwen4_ep_vram_layers`), so the refusal fires only for a load
-            // that was not planned with MTP lanes.
+            // a singleton prompt tile). A native-MTP store is admitted too when
+            // every window fits the resident bank (see
+            // `spec_store_reserve_verdict` and the mesh window epoch guard);
+            // otherwise it is refused with a label and the staging caller falls
+            // back to AR lanes.
             let resident_rows = self
                 .execution
                 .as_ref()
@@ -3435,17 +3405,9 @@ impl Qwen4Bundle {
             // verify block (the step row budget only caps decode lanes and
             // is `serve.max_batch_tokens` wide, never a window's rows).
             let window_rows = max_lanes * crate::gpu_forward_lanes::LANE_MAX_ROWS;
-            crate::ep_reserve::spec_store_reserve_verdict(
-                true,
-                crate::ep_reserve::ep_mtp_reserve_share_enabled(),
-                window_rows,
-                resident_rows,
-            )
-            .map_err(ep_err)?;
-            eprintln!(
-                "  qwen4 EP: native-MTP lanes staged on a reserve-sharing load \
-                 (HIPFIRE_EP_MTP_RESERVE_SHARE on, default)"
-            );
+            crate::ep_reserve::spec_store_reserve_verdict(true, window_rows, resident_rows)
+                .map_err(ep_err)?;
+            eprintln!("  qwen4 EP: native-MTP lanes staged on a reserve-sharing load");
         }
         if let Some(spec) = spec {
             // Spec lanes decode only through the mesh lane protocol
@@ -4455,6 +4417,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let bytes = |rows: usize| {
             ep_lane_store_device_bytes(
@@ -4559,6 +4522,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         // The production census inputs (`device_bytes`): the prompt-fill append
         // scratch is charged when the store allocates it.
@@ -4652,6 +4616,7 @@ mod tests {
             gdn: crate::GdnStateFormat::Q8,
             qsa_f16_arena: false,
             qsa_pooled_bf16: false,
+            gdn_stream: crate::GdnStreamKind::None,
         };
         let copy = |wide_lanes: usize| crate::lane::LaneCopyConfig {
             ngram: hipfire_runtime::ngram_mod::NgramModConfig {
@@ -4791,6 +4756,7 @@ mod tests {
                 gdn,
                 qsa_f16_arena: false,
                 qsa_pooled_bf16: false,
+                gdn_stream: crate::GdnStreamKind::None,
             };
             let with = Qwen4State::device_bytes_with_mirror(
                 &config,

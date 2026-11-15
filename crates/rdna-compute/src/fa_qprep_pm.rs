@@ -143,7 +143,7 @@ impl Gpu {
     /// native fp8-E4M3; the fold itself never reads the cache), H16/KV2/D256 with a 64-wide
     /// rotary, non-legacy half-split RoPE, production rows `64..=8192` and host context
     /// `1..=262144`. Callers must additionally exclude tree/window/independent/paired/multi
-    /// layouts and any consumer of pre-RoPE Q (triattn tap).
+    /// layouts and any consumer of pre-RoPE Q (diagnostic tap).
     #[allow(clippy::too_many_arguments)]
     pub fn fa_prefill_pm_qprep_admission(
         qprep_flag: bool,

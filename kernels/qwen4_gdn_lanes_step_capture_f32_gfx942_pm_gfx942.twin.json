@@ -1,0 +1,191 @@
+{
+  "anchor": {
+    "bytes": 35400,
+    "device_elf_sha256": "a3c20760f46746da7188305a55665114c229d0255bf53e15a99e54de740752fa",
+    "file": "qwen4_gdn_lanes_step_capture_f32_gfx942_hipcc_gfx942.co",
+    "sha256": "73292e24607c978ce53bff2a013d9ae60cb095a4987478104df098f157e71bd2"
+  },
+  "arch": "gfx942",
+  "compiler": {
+    "flags": [
+      "--genco",
+      "--offload-arch=gfx942",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6"
+    ],
+    "invocation": "hipcc <flags> -o <anchor.co> <source_dir>/qwen4_gdn_lanes_capture_f32.gfx942.hip",
+    "provenance": "Owner's immutable final anchor (7fefe36da01090185ab6c97fe9fd178411d7508a); this recipe does not recompile it",
+    "runtime_source_basename": "qwen4_gdn_lanes_capture_f32.gfx942.hip"
+  },
+  "gpu_oracle": {
+    "status": "PASS",
+    "target": "gfx942",
+    "input_hxaco_sha256": "78f58780c3b88d9ed6a9956084566444ced7069197cb0aa2a51d1e02d1430659",
+    "hipcc_image_sha256": "73292e24607c978ce53bff2a013d9ae60cb095a4987478104df098f157e71bd2",
+    "pm_device_elf_sha256": "a3c20760f46746da7188305a55665114c229d0255bf53e15a99e54de740752fa",
+    "hipcc_device_elf_sha256": "a3c20760f46746da7188305a55665114c229d0255bf53e15a99e54de740752fa",
+    "reference_verify_device_elf_sha256": "60ebb9c7b0bb236a37d2a216df426fee61edc88556e4cfc4e81290a64909c0b4",
+    "failed_cases": 0,
+    "exit_code": 0,
+    "case_count": 184,
+    "batched_capture_comparisons": 48,
+    "raw_log_fixture": "crates/peacemaker-isa/tests/fixtures/cdna/gfx942_gdn_capture_oracle.txt",
+    "raw_log_sha256": "ceaa8fd0332994a44f6ccaa3c8bd3af1eecd53b7da75cb30d32c07ff0d230e93",
+    "oracle_binary_sha256": "1b9274725720f189e05757323297531d02b9cbb0a365a483f8445f8eb72af00a",
+    "scope": "Qualifies only the single capture-lanes twin. The four-entry verify module is the immutable owner reference, not a certified PM twin; conv/gate are not exercised by this oracle.",
+    "ledger": {
+      "row": 227,
+      "owner": "TwinWide942",
+      "class": "oracle",
+      "start": "2026-11-12T19:28:16+00:00",
+      "end": "2026-11-12T19:28:37+00:00",
+      "run_s": 21,
+      "wait_s": 0,
+      "exit": 0
+    }
+  },
+  "hxaco": {
+    "bytes": 35400,
+    "file": "qwen4_gdn_lanes_step_capture_f32_gfx942_pm_gfx942.hxaco",
+    "sha256": "78f58780c3b88d9ed6a9956084566444ced7069197cb0aa2a51d1e02d1430659"
+  },
+  "module": "qwen4_gdn_lanes_step_capture_f32_gfx942_pm_gfx942",
+  "seal": {
+    "reports": [
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 12,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 20,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 36
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 31304,
+        "elf_sha256": "a3c20760f46746da7188305a55665114c229d0255bf53e15a99e54de740752fa",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 6598,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 0,
+            "rewritten_instructions": 0,
+            "s_nop": 323,
+            "s_nop_wait_states": 485,
+            "violations": 0
+          },
+          "instructions": 4864,
+          "kernel": "qwen4_gdn_lanes_step_capture_f32_gfx942",
+          "ledger": {
+            "barriers": 3,
+            "branches": 30,
+            "label_states": 56,
+            "labels": 23,
+            "memory": {
+              "ds_load": 198,
+              "ds_store": 16,
+              "smem": 4,
+              "vmem_atomic": 0,
+              "vmem_load": 161,
+              "vmem_store": 130
+            },
+            "steps": 11903,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 210,
+            "waitcnt_lgkmcnt_partial": 164,
+            "waitcnt_vmcnt_partial": 21
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 35400,
+        "hxaco_sha256": "78f58780c3b88d9ed6a9956084566444ced7069197cb0aa2a51d1e02d1430659",
+        "kernel": "qwen4_gdn_lanes_step_capture_f32_gfx942",
+        "lds": 9216,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 1,
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 48,
+        "text_bytes": 26392,
+        "text_sha256": "a98acae069503f91b3d17869a8e102af64feaf00728cd277ac067d7fcc1b9467",
+        "user_sgprs": 2,
+        "vgprs": 140,
+        "wavefront_size": 64
+      }
+    ],
+    "tool": "peacemaker-isa example hip_twin (gfx942 Route A: typed lift, full device-ELF identity, bundle)"
+  },
+  "source": {
+    "bytes": 28151,
+    "owner_commit": "7fefe36da01090185ab6c97fe9fd178411d7508a",
+    "path": "kernels/src/qwen4_gdn_lanes_capture_f32.gfx942.hip",
+    "sha256": "08507d4e225d6a9f2e14a7b5e75a224476bd08fd941ed01549a195c538f0c1b3"
+  },
+  "symbols": [
+    "qwen4_gdn_lanes_step_capture_f32_gfx942"
+  ]
+}

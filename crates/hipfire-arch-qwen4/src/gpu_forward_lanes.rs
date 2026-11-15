@@ -82,13 +82,15 @@
 //! sub-512-row kernels, selected by capping the routing rows of the call at 511, with
 //! real launch extents), so the layer's expert weights are read once instead of once
 //! per lane tile; the row-local dense stages (embed, PLE rows, HC, the mixer in / out
-//! projections) run once over all rows too (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT`, default
-//! on; `0` runs them per lane, each launch the lane tile's by construction) and the
+//! projections) run once over all rows too when every lane has at least the floor's rows (else
+//! per lane, each launch the lane tile's by construction) and the
 //! stateful cores run per lane on the lane's own rows and state. The caller's policy is replaced
-//! by the EP wave policy ([`crate::gpu_forward::ep_wave::ep_wave_policy`]). A lane's
-//! committed state and head are byte-equal to its serial tile because every kernel of
+//! by the EP wave policy ([`crate::gpu_forward::ep_wave::ep_wave_policy`]). A lane of 65+
+//! rows has committed state and head byte-equal to its serial tile because every kernel of
 //! the wave's MoE call (router, shared expert, grouped expert GEMMs, combine) computes
-//! each row independently of the other rows of its launch; the card oracle proves it.
+//! each row independently of the other rows of its launch; the card oracle proves it. A
+//! small lane (9..=64 rows) is NOT: by default it is distribution-equivalent to its serial
+//! tile (served C1-vs-C8 identity differs), and under `serve.batch_exact` it skips the wave.
 //!
 //! # Pipeline-parallel bands
 //!
@@ -107,10 +109,11 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::LayerType;
 use crate::gpu_forward::ep_wave::{
-    ep_wave_expected_moe_calls, ep_wave_joint_enabled, ep_wave_joint_for_lanes, ep_wave_layer_moe,
-    ep_wave_partial_mask, ep_wave_policy_for, ep_wave_refusal, ep_wave_route, ep_wave_scope_rows,
-    ep_wave_tile_exchange, EpWaveRoute,
+    ep_wave_expected_moe_calls, ep_wave_joint_for_lanes, ep_wave_layer_moe, ep_wave_partial_mask,
+    ep_wave_policy_for, ep_wave_refusal, ep_wave_route, ep_wave_scope_rows, ep_wave_tile_exchange,
+    EpWaveRoute,
 };
+use crate::gpu_forward::g942_lanes;
 use crate::gpu_forward::{
     bind_ep_lane_gather, ep_lane, ep_lane_buffer, ep_lane_check_invocations, ep_lane_moe_rows,
     lane_layer_moe,
@@ -1460,9 +1463,9 @@ fn lm_head_row_slice(
             full.m
         )));
     }
-    if full.rotation.is_some() || full.awq_scale.is_some() {
+    if full.awq_scale.is_some() {
         return Err(invalid(
-            "vocabulary shard: the LM head carries a rotation / scale sidecar",
+            "vocabulary shard: the LM head carries a scale sidecar",
         ));
     }
     let row_bytes = full.row_stride;
@@ -1603,8 +1606,10 @@ fn segments_of_groups(groups: Vec<crate::mesh_lane_protocol::RowGroup>) -> Vec<S
         .collect()
 }
 
-/// Widest all-rows HC op: the wide-verify row bound every HC kernel arm admits
-/// ([`rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS`]).
+/// Widest all-rows HC op on every arch but single-device gfx942: the wide-verify row bound every
+/// HC kernel arm admits ([`rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS`]). Single-device
+/// gfx942 runs its all-rows segment up to [`g942_lanes::G942_ALLROWS_MAX_ROWS`] rows instead
+/// ([`LaneAllRowsRule::decide`]).
 const HC_ALL_ROWS_MAX: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
 
 /// Whether an AR / verify lane step of `group_rows` (the once-over-all-rows
@@ -1615,7 +1620,9 @@ const HC_ALL_ROWS_MAX: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_
 /// capture (the wide few-row limit the HC kernels' all-rows arms run under
 /// exists only eagerly), `cpu_splice` a layer with CPU routed experts (its
 /// groups are CPU-window sized). The HC read needs `HcRead` and `HcWrite`
-/// both [`StageShare::OnceAllRows`].
+/// both [`StageShare::OnceAllRows`]. `max_rows` is the widest step the arch's HC kernels run
+/// over all rows: [`HC_ALL_ROWS_MAX`], or [`g942_lanes::G942_ALLROWS_MAX_ROWS`] on a
+/// single-device gfx942 step.
 fn hc_all_rows_applies(
     flag: bool,
     ar_step: bool,
@@ -1623,6 +1630,7 @@ fn hc_all_rows_applies(
     cpu_splice: bool,
     group_rows: &[usize],
     policy: &LaneStagePolicy,
+    max_rows: usize,
 ) -> bool {
     let n: usize = group_rows.iter().sum();
     flag && ar_step
@@ -1632,7 +1640,7 @@ fn hc_all_rows_applies(
         && group_rows
             .iter()
             .all(|&rows| (1..=LANE_MAX_ROWS).contains(&rows))
-        && (LANE_MAX_ROWS + 1..=HC_ALL_ROWS_MAX).contains(&n)
+        && (LANE_MAX_ROWS + 1..=max_rows).contains(&n)
         && policy.share(StageName::HcRead) == StageShare::OnceAllRows
         && policy.share(StageName::HcWrite) == StageShare::OnceAllRows
 }
@@ -1677,7 +1685,8 @@ fn hetero_moe_all_rows_applies(
 /// Whether an AR / verify lane step also runs every non-MoE row-local stage once over all
 /// rows (`HIPFIRE_QWEN4_LANE_ALLROWS`), on top of the all-rows HC segment
 /// ([`hc_all_rows_applies`], which it refines: it is only asked for a step that segment
-/// admitted). Refused (`false`) for anything the wide 9..=64-row routes of the projections
+/// admitted). Refused (`false`) for anything the wide 9..=64-row routes (9..=128 on single-device
+/// gfx942, [`g942_lanes::G942_ALLROWS_MAX_ROWS`]) of the projections
 /// cannot serve exactly as their G x 8 groups' arms do:
 ///
 /// - `wide_scope_rows != 0`: a wide-verify scope is in force, so the projections would take
@@ -1710,7 +1719,7 @@ pub(crate) fn lane_step_trace_enabled() -> bool {
 
 /// Why a lane step that asked for `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` keeps its routed MoE on
 /// the <= 8-row groups (`Some(reason)`), or `None` when the one all-rows MoE call applies. The
-/// step the flag refines is a 9..=64-row AR / verify step the all-rows stage segment
+/// step the flag refines is a 9..=64-row (9..=128 on single-device gfx942) AR / verify step the all-rows stage segment
 /// admitted (`stages_apply`: flag, eager, no CPU splice, no wide scope, ...); the call is the
 /// wide-group MoE over every row, so it is refused wherever a wide-class group of `n` rows
 /// would be:
@@ -1833,6 +1842,8 @@ pub struct LaneAllRowsRule {
     pub trunk_ar_write: bool,
     /// MoE calls per step the gather buffer parity is checked on (the band's layers).
     pub band_moe_calls: usize,
+    /// Single-device gfx942: the MoE all-rows segment needs no EP gather ([`g942_lanes::moe_refusal`]).
+    pub g942_single: bool,
     /// The stage shares (HC read / write, MoE) the rule reads.
     pub policy: LaneStagePolicy,
     /// The hetero tier split's decode slot width ([`crate::hetero::hetero_decode_rows`]) on a
@@ -1875,6 +1886,7 @@ impl LaneAllRowsRule {
             gather_cap: None,
             trunk_ar_write: false,
             band_moe_calls: 0,
+            g942_single: false,
             policy: LaneStagePolicy::production(),
             hetero_rows: 0,
         }
@@ -1916,6 +1928,7 @@ impl LaneAllRowsRule {
             trunk_ar_write: crate::trunk_route::attn_writer().is_some()
                 || crate::trunk_route::ffn_writer().is_some(),
             band_moe_calls,
+            g942_single: g942_lanes::single_device_rule(gpu, gather_cap),
             policy: *policy,
             hetero_rows: 0,
         }
@@ -1960,6 +1973,11 @@ impl LaneAllRowsRule {
             self.cpu_splice,
             group_rows,
             &self.policy,
+            if self.g942_single {
+                g942_lanes::G942_ALLROWS_MAX_ROWS
+            } else {
+                HC_ALL_ROWS_MAX
+            },
         );
         let all_stages = all_rows_stages_apply(
             self.stages_flag,
@@ -1974,7 +1992,14 @@ impl LaneAllRowsRule {
             (n >= self.bf16_min_rows) == (1 >= self.bf16_min_rows),
         );
         let exact_scope = (self.exact_flag || any_exact_lane) && all_stages;
-        let moe_refusal = if self.moe_flag {
+        let moe_refusal = if self.moe_flag && self.g942_single {
+            g942_lanes::moe_refusal(
+                all_stages,
+                self.policy.share(StageName::Moe) == StageShare::OnceAllRows,
+                n,
+                any_wide_lane,
+            )
+        } else if self.moe_flag {
             all_rows_moe_refusal(
                 all_stages,
                 self.policy.share(StageName::Moe) == StageShare::OnceAllRows,
@@ -2319,7 +2344,7 @@ const LANE_CARRY_FIELDS: [ScratchField; 10] = [
 
 /// Rows a lane step's carry buffers cover at most (`WIDE_VERIFY_MAX_ROWS`); a
 /// wider step (a prefill wave) keeps its mixers whole instead.
-const LANE_CARRY_MAX_ROWS: usize = 64;
+const LANE_CARRY_MAX_ROWS: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
 
 /// Logical row width of a [`LANE_CARRY_FIELDS`] member, as [`SegViews::new`]
 /// views it.
@@ -2915,6 +2940,13 @@ fn forward_wave_with(
         .execution
         .take()
         .ok_or_else(|| invalid("Qwen4 forward resources are not attached"))?;
+    // gfx942 single device (P2): the lane tile's canonical prefill routing and F16 clamp.
+    let g942 = crate::lane_exec::g942_wave::wave_applies(gpu, bundle);
+    if g942 {
+        lanes
+            .iter_mut()
+            .for_each(|lane| lane.state.clamp_f16_valid());
+    }
     let mut rows: Vec<LaneRows<'_>> = lanes
         .iter_mut()
         .map(|lane| LaneRows {
@@ -2927,8 +2959,9 @@ fn forward_wave_with(
         })
         .collect();
     let scope = std::mem::replace(&mut gpu.qwen4_scope, true);
-    let invariant =
-        rdna_compute::prefill_invariant::prefill_pm_invariant_enabled() && gpu.arch == "gfx1151";
+    let invariant = (rdna_compute::prefill_invariant::prefill_pm_invariant_enabled()
+        && gpu.arch == "gfx1151")
+        || g942;
     let invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, invariant);
     let result = if forward.ep.is_some() {
         forward_wave_ep(gpu, &mut forward, bundle, &mut rows, out)
@@ -2944,7 +2977,7 @@ fn forward_wave_with(
 /// The exact EP prefill wave ([`crate::gpu_forward::ep_wave`] has the design): the lane
 /// step over prefill lanes with the MoE ONCE per layer over every lane's rows on the
 /// singleton's FULL-TABLE route (sub-512 routing kernels), the dense row-local stages once over
-/// all rows too unless `HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0` (every other stage per lane;
+/// all rows too when every lane has at least the floor's rows (else every other stage per lane;
 /// the caller's `policy` is replaced by [`ep_wave_policy`]). Admission is decided from host
 /// facts before any launch, on every rank identically; a refusal is an `ep wave refused:`
 /// error and nothing ran.
@@ -2961,11 +2994,7 @@ fn forward_wave_ep(
     // `HIPFIRE_QWEN4_PREFILL_LWMMA_WAVE_FLOOR`); lanes below it run their row-local stages per lane
     // (`ep_wave_joint_for_lanes`). A wave is a prefill forward by construction.
     let floor = gpu.flags.qwen4_prefill_lwmma_floor_knob();
-    let policy = ep_wave_policy_for(ep_wave_joint_for_lanes(
-        ep_wave_joint_enabled(),
-        &lane_rows,
-        floor,
-    ));
+    let policy = ep_wave_policy_for(ep_wave_joint_for_lanes(&lane_rows, floor));
     let total: usize = lane_rows.iter().sum();
     let facts = fwd.ep_wave_facts(gpu, &bundle.config, &lane_rows);
     if let Some(why) = ep_wave_refusal(&facts) {
@@ -3525,14 +3554,20 @@ fn forward_lanes_scoped(
     // lane's tail reads it through its own views. Taken for 2+ lanes of a decode step whose `n`
     // rows run ONE row-exact BF16 launch (`Gpu::bf16_rows_exact_one_launch`) under a policy that
     // shares the stage; the weights' dtype and the 1-row-lane PLE batch are checked where the
-    // weights are known (`ple_project`).
+    // weights are known (`ple_project`). G12 input: exact gfx942 runs the pair on the BF16 MFMA
+    // trunk route (`ProjectLadder::TrunkRowExact` falls through to `project_weight`, one chain per
+    // output element whatever the row count), so every row count of the step is one launch there.
     let ple_seg: Option<usize> = (band_scope.input
         && !prefill
         && lanes.len() >= 2
         && policy.share(StageName::PleProject) == StageShare::OnceAllRows
         && gpu.flags.qwen4_lane_ple_project_enabled()
-        && (2..=rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS).contains(&n)
-        && gpu.bf16_rows_exact_one_launch(n))
+        && if gpu.arch_caps.is_gfx942() {
+            (2..=g942_lanes::G942_ALLROWS_MAX_ROWS).contains(&n)
+        } else {
+            (2..=rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS).contains(&n)
+                && gpu.bf16_rows_exact_one_launch(n)
+        })
     .then(|| {
         all_segs.push(Segment {
             begin: 0,
@@ -3632,7 +3667,7 @@ fn forward_lanes_scoped(
         gpu.replay.set_forward_eligible(false);
     }
 
-    // `HIPFIRE_QWEN4_EP_SP_SUB512_WAVE`: a trunk-shard prefill wave of at
+    // A trunk-shard prefill wave of at
     // least the sub-512 SP floor runs its joint HC reads / writes sequence-parallel, like a wide
     // singleton chunk (`forward_chunk_scoped`'s `SpViews`): each rank reads / writes its half of the
     // wave's rows (reduce-scatter write), a row all-gather rejoins `hc_mixed` after every read and
@@ -3675,9 +3710,11 @@ fn forward_lanes_scoped(
                 ar_out,
                 *seg,
                 ple_head_count * ple_row_width,
-                // PP edges require packed BF16 rows; preserve the original
-                // single-scope scratch addressing without changing its ops.
-                bf16_state && !(band_scope.input && band_scope.output),
+                // BF16 streams are packed rows whatever the band: every stream op (a joint HC
+                // write over the wave's rows, a lane's own PLE conv and final HC read, the wide
+                // hidden capture) addresses row `i` at `2 * i * wide` bytes, so a lane view starts
+                // at its packed row (`bf16_stream_rows`), never at the F32 pitch.
+                bf16_state,
                 // Every segment of the step addresses the one field its
                 // total row count selects.
                 scratch.ple_normed_field(n),
@@ -3698,7 +3735,7 @@ fn forward_lanes_scoped(
             static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
-                    "  qwen4 EP sequence-parallel prefill wave (HIPFIRE_QWEN4_EP_SP_SUB512_WAVE): the wave's joint HC reads / writes split its rows across the two ranks (reduce-scatter HC write, row all-gather)"
+                    "  qwen4 EP sequence-parallel prefill wave: the wave's joint HC reads / writes split its rows across the two ranks (reduce-scatter HC write, row all-gather)"
                 );
             }
         }
@@ -4036,7 +4073,7 @@ fn forward_lanes_scoped(
                         first_lane: lane_segs[*first].first_lane,
                     },
                     ple_head_count * ple_row_width,
-                    bf16_state && !(band_scope.input && band_scope.output),
+                    bf16_state,
                     scratch.ple_normed_field(n),
                     carry,
                 )
@@ -4437,6 +4474,10 @@ fn forward_lanes_scoped(
                                 zba_fold: fwd.trunk_zba.get(layer).and_then(Option::as_ref),
                                 trunk_a4: fwd.trunk_a4.get(layer).copied().unwrap_or(0),
                                 phase,
+                                // A consumer view: an open stream (a promoted
+                                // request prefilled by the WY scan) is sealed
+                                // before the lane reads its live slot.
+                                carry: state.gdn_carry_view(slot, false),
                             }));
                         }
                         LaneOp::Qsa { layer, slot, phase } => {
@@ -5532,7 +5573,14 @@ mod tests {
         // exact-gfx1201-only, so gfx1151 carries one row per shared stage but that one.
         assert_eq!(
             LANE_ROW_TWIN_PROOFS.len(),
-            (shared.len() - 1) + 2 * shared.len() + 1 + 2 + 3 + 2 + shared.len() + (shared.len() - 1)
+            (shared.len() - 1)
+                + 2 * shared.len()
+                + 1
+                + 2
+                + 3
+                + 2
+                + shared.len()
+                + (shared.len() - 1)
         );
         for arch in ["gfx1151", "gfx1201", "gfx942"] {
             for stage in StageName::ALL {
@@ -6055,10 +6103,7 @@ mod tests {
             LaneTopology::Single,
             &LaneStageRoutes::default(),
         );
-        assert_eq!(
-            empty.policy,
-            production_without(&[StageName::PleProject])
-        );
+        assert_eq!(empty.policy, production_without(&[StageName::PleProject]));
         assert!(empty.receipts.is_empty());
         // An unclassified instance never matches a single-card row.
         let mut unclassified = LaneStageRoutes::default();
@@ -7295,11 +7340,12 @@ mod tests {
         assert_eq!(production.len(), config.num_hidden_layers * 8 + 1);
     }
 
-    /// The EP prefill wave's program, both arms. Incumbent (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0`):
+    /// The EP prefill wave's program, both arms. Incumbent (a lane below the floor):
     /// every stage per lane (each mixer stays the singleton's whole op on the lane's own rows)
-    /// except the MoE, the only op placed once over all rows, one per layer. Joint (default): the
-    /// mixers split into in-proj / core / out-proj phases (the cores stay per lane), the HC
-    /// stages and projections are placed once over all rows, and still exactly one MoE per layer.
+    /// except the MoE, the only op placed once over all rows, one per layer. Joint (every lane at
+    /// the floor or wider): the mixers split into in-proj / core / out-proj phases (the cores stay
+    /// per lane), the HC stages and projections are placed once over all rows, and still exactly
+    /// one MoE per layer.
     #[test]
     fn ep_wave_program_places_only_the_moe_once() {
         use crate::gpu_forward::ep_wave::ep_wave_policy_for;
@@ -7864,12 +7910,12 @@ mod tests {
     }
 
     /// The exact EP prefill wave never takes the AR step's all-rows HC placement. Incumbent arm
-    /// (`HIPFIRE_EP_LANE_PREFILL_WAVE_JOINT=0`): every HC stage is PER LANE (each lane's HC read /
+    /// (a lane below the floor): every HC stage is PER LANE (each lane's HC read /
     /// write are its singleton tile's launches at the lane's own rows and stream kind; under the
     /// trunk shard each write is its own all-reduce at the lane's row count), refused by the step
-    /// kind AND by the policy. Joint arm (default): the HC stages are one segment over every
-    /// lane's rows by the wave's own policy, and that segment is not the AR step's placement:
-    /// `hc_all_rows_applies` stays refused for the wave's step kind.
+    /// kind AND by the policy. Joint arm (every lane at the floor or wider): the HC stages are one
+    /// segment over every lane's rows by the wave's own policy, and that segment is not the AR
+    /// step's placement: `hc_all_rows_applies` stays refused for the wave's step kind.
     #[test]
     fn the_exact_wave_never_takes_the_all_rows_hc_placement() {
         use crate::gpu_forward::ep_wave::ep_wave_policy_for;
@@ -7882,11 +7928,25 @@ mod tests {
         for groups in [&[8usize, 8][..], &[8, 8, 8, 8], &[5, 5]] {
             // The wave is a prefill step, never an AR step, whichever policy it runs.
             for wave in [&incumbent, &joint] {
-                assert!(!hc_all_rows_applies(true, false, true, false, groups, wave));
+                assert!(!hc_all_rows_applies(
+                    true,
+                    false,
+                    true,
+                    false,
+                    groups,
+                    wave,
+                    HC_ALL_ROWS_MAX
+                ));
             }
             // Incumbent: refused by the policy even for an AR step's shape.
             assert!(!hc_all_rows_applies(
-                true, true, true, false, groups, &incumbent
+                true,
+                true,
+                true,
+                false,
+                groups,
+                &incumbent,
+                HC_ALL_ROWS_MAX
             ));
         }
     }
@@ -7896,7 +7956,7 @@ mod tests {
         let production = LaneStagePolicy::production();
         let eight_by_two = [8usize, 8];
         let applies = |flag, ar, eager, cpu, groups: &[usize], policy: &LaneStagePolicy| {
-            hc_all_rows_applies(flag, ar, eager, cpu, groups, policy)
+            hc_all_rows_applies(flag, ar, eager, cpu, groups, policy, HC_ALL_ROWS_MAX)
         };
         assert!(applies(true, true, true, false, &eight_by_two, &production));
         // Flag off, a prefill wave / band edge (not an AR step), a recorded or
@@ -8237,7 +8297,7 @@ mod tests {
         assert!(!all_rows_stages_apply(true, true, 0, false, false));
         let production = LaneStagePolicy::production();
         let segment = |ar, eager, cpu, groups: &[usize]| {
-            hc_all_rows_applies(true, ar, eager, cpu, groups, &production)
+            hc_all_rows_applies(true, ar, eager, cpu, groups, &production, HC_ALL_ROWS_MAX)
         };
         let stages = |segment_applies| all_rows_stages_apply(true, segment_applies, 0, false, true);
         assert!(stages(segment(true, true, false, &[8, 8])));
@@ -8395,7 +8455,8 @@ mod tests {
             true,
             false,
             &group_rows,
-            &production
+            &production,
+            HC_ALL_ROWS_MAX
         ));
         // Row-exact lanes of the same rows (6 + 6 > 8 rows) are one group each: several groups.
         let exact = segments_of_groups(pack_classed_row_groups_with_cap(&rows, &[false; 8], 48));
@@ -8407,7 +8468,8 @@ mod tests {
             true,
             false,
             &exact_rows,
-            &production
+            &production,
+            HC_ALL_ROWS_MAX
         ));
     }
 
@@ -8436,8 +8498,15 @@ mod tests {
             compositions(n, &mut Vec::new(), &mut groups);
             assert!(!groups.is_empty());
             for group_rows in groups {
-                let segment =
-                    hc_all_rows_applies(true, true, true, false, &group_rows, &production);
+                let segment = hc_all_rows_applies(
+                    true,
+                    true,
+                    true,
+                    false,
+                    &group_rows,
+                    &production,
+                    HC_ALL_ROWS_MAX,
+                );
                 assert!(!segment, "{group_rows:?}");
                 let stages = all_rows_stages_apply(true, segment, 0, false, true);
                 assert!(!stages, "{group_rows:?}");
@@ -8481,6 +8550,7 @@ mod tests {
             gather_cap: Some(48),
             trunk_ar_write: false,
             band_moe_calls: 48,
+            g942_single: false,
             policy: LaneStagePolicy::production(),
             hetero_rows: 0,
         }
@@ -8503,6 +8573,11 @@ mod tests {
             rule.cpu_splice,
             group_rows,
             &rule.policy,
+            if rule.g942_single {
+                g942_lanes::G942_ALLROWS_MAX_ROWS
+            } else {
+                HC_ALL_ROWS_MAX
+            },
         );
         let all_stages = all_rows_stages_apply(
             rule.stages_flag,
@@ -8671,5 +8746,65 @@ mod tests {
         assert!(!rule.moe_all_rows(&[6; 8], true));
         // A prefill wave / band edge (not an AR step) never takes the segment.
         assert!(!rule.decide(false, &[6; 8], false, false).moe_all);
+    }
+
+    /// Single-device gfx942: the all-rows HC / stage / MoE segments take 16 groups of 8 rows
+    /// (32 MTP lanes x 4 rows = 128) and refuse 129 and above; every other rule keeps the 64-row
+    /// wide-verify bound (65 rows stay in their groups).
+    #[test]
+    fn gfx942_single_device_rule_takes_128_rows_and_others_keep_64() {
+        let g942 = LaneAllRowsRule {
+            gather_cap: None,
+            g942_single: true,
+            ..ep_rule()
+        };
+        let sixteen_by_eight = [8usize; 16];
+        let d = g942.decide(true, &sixteen_by_eight, false, false);
+        assert!(d.hc_all && d.all_stages && d.moe_all, "{d:?}");
+        assert!(!d.exact_scope && d.moe_refusal.is_none(), "{d:?}");
+        assert!(g942.moe_all_rows(&sixteen_by_eight, false));
+        // Every row count 9..=128 of eight-row groups (the last short) is one all-rows step.
+        for n in LANE_MAX_ROWS + 1..=g942_lanes::G942_ALLROWS_MAX_ROWS {
+            let mut groups = vec![LANE_MAX_ROWS; n / LANE_MAX_ROWS];
+            if n % LANE_MAX_ROWS != 0 {
+                groups.push(n % LANE_MAX_ROWS);
+            }
+            let d = g942.decide(true, &groups, false, false);
+            assert!(d.hc_all && d.all_stages && d.moe_all, "{n}: {d:?}");
+        }
+        // 129 rows and more keep the groups, with a reason from the HC segment's refusal.
+        for groups in [
+            [vec![8usize; 16], vec![1]].concat(),
+            vec![8usize; 17],
+            vec![8usize; 24],
+        ] {
+            let d = g942.decide(true, &groups, false, false);
+            assert!(
+                !d.hc_all && !d.all_stages && !d.moe_all,
+                "{groups:?}: {d:?}"
+            );
+            assert!(d.moe_refusal.is_some(), "{groups:?}");
+        }
+        // A wide-class lane keeps its classed group, a non-AR step takes no segment.
+        assert!(!g942.moe_all_rows(&sixteen_by_eight, true));
+        assert!(!g942.decide(false, &sixteen_by_eight, false, false).hc_all);
+        // A non-gfx942 rule still stops at the 64-row wide-verify bound.
+        let other = LaneAllRowsRule {
+            gather_cap: None,
+            g942_single: false,
+            ..ep_rule()
+        };
+        assert!(other.decide(true, &[8usize; 8], false, false).hc_all);
+        for groups in [
+            [vec![8usize; 8], vec![1]].concat(),
+            vec![8usize; 9],
+            sixteen_by_eight.to_vec(),
+        ] {
+            let d = other.decide(true, &groups, false, false);
+            assert!(
+                !d.hc_all && !d.all_stages && !d.moe_all,
+                "{groups:?}: {d:?}"
+            );
+        }
     }
 }

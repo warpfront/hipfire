@@ -272,7 +272,6 @@ pub struct RuntimeConfig {
     pub pp_dflash: bool,                   // HIPFIRE_PP_DFLASH
     pub pp_pflash: bool,                  // HIPFIRE_PP_PFLASH
     pub chat_template_file: Option<String>, // HIPFIRE_CHAT_TEMPLATE_FILE
-    pub jinja_chat: bool,                 // HIPFIRE_JINJA_CHAT
     pub experimental_budget_alert: bool,  // HIPFIRE_EXPERIMENTAL_BUDGET_ALERT
     pub emit_token_ids: bool,             // HIPFIRE_EMIT_TOKEN_IDS
 

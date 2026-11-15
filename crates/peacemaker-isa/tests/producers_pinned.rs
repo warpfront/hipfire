@@ -134,13 +134,13 @@ const PINNED: &[(&str, &str, &str)] = &[
     ),
     (
         "gdn/chunk_prep",
-        "24b70b48c5db7ae8c2175ff49dfc98d1d407544b708891d5bed4bd51454d5cda",
-        "c574a1bb3c6bb46119d239a72e1474e2039cde8a416de603eeb3b043fbc8aca5",
+        "877ee5af6b9fab53e0c9a9a15c621902b1fe1ff971e3ee2083f54c2d7b830886",
+        "3e967d5f2ccb4027dade9b76b9c24a354bbe48a4221c6c2da7d9dff28562d1db",
     ),
     (
         "gdn/module",
-        "24b70b48c5db7ae8c2175ff49dfc98d1d407544b708891d5bed4bd51454d5cda",
-        "122b731e47fde0395c24a836cf26fa85d1ba73ab50cc1285fa1a36a672d71708",
+        "877ee5af6b9fab53e0c9a9a15c621902b1fe1ff971e3ee2083f54c2d7b830886",
+        "94867994b04d0beec8f67b7f776d847d24c395723cbc8eb78acefd5b3551edb8",
     ),
 ];
 

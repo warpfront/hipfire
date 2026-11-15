@@ -12,7 +12,10 @@ extern "C" __global__ void rope_batched_f32(
     int n_heads_k,
     int head_dim,
     float freq_base,
-    int batch_size
+    int batch_size,
+    float l3_inv_factor,
+    float l3_smooth_mul,
+    float l3_smooth_add
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;  // freq index
     int b = blockIdx.y;  // batch index
@@ -21,6 +24,11 @@ extern "C" __global__ void rope_batched_f32(
 
     int pos = positions[b];
     float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
+    // Llama-3 remap (rdna_compute::rope::RopeLlama3); inv_factor 1 = plain RoPE.
+    if (l3_inv_factor != 1.0f) {
+        float s = fminf(fmaxf(freq * l3_smooth_mul + l3_smooth_add, 0.0f), 1.0f);
+        freq *= s + (1.0f - s) * l3_inv_factor;
+    }
     float val = (float)pos * freq;
     float cos_val = cosf(val);
     float sin_val = sinf(val);

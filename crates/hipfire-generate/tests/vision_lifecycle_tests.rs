@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! G4.8 vision/OCR request-lifecycle matrix: Qwen35-VL and dots.ocr
-//! cancellation + error epilogues.
+//! G4.8 vision/OCR request-lifecycle matrix: Qwen35-VL, dots.ocr and
+//! LFM2-VL cancellation + error epilogues.
 //!
 //! Covers every vision loop exit named in the G4.8 plan: cancel before
 //! prefill, cancel during decode, forward/argmax/spec faults — each paired
@@ -17,6 +17,8 @@
 //!   The comma-separated pair is required: trunk first, tower sidecar second.
 //! - `HIPFIRE_DOTS_OCR_FIXTURE`: path to the dots.ocr artifact, e.g.
 //!   `~/.hipfire/models/dots-ocr.q8.hfq`.
+//! - `HIPFIRE_LFM2_VL_FIXTURE`: an LFM2-VL artifact quantized with its
+//!   vision tower, e.g. `lfm2.5-vl-3b.mq4v2.hfq`.
 //! - Images (override with `HIPFIRE_VISION_IMAGE` / `HIPFIRE_DOTS_IMAGE`):
 //!   `benchmarks/vision/images/general_qa.jpg` (VL) and
 //!   `benchmarks/images/dots_ocr_smoke_001.jpg` (dots.ocr). Both are
@@ -299,6 +301,7 @@ fn vision_lifecycle_child() {
     match scenario.as_str() {
         "vl" => child_vl_matrix(),
         "dots" => child_dots_matrix(),
+        "lfm2" => child_lfm2_vl_matrix(),
         other => panic!("unknown matrix {other:?}"),
     }
 }
@@ -320,12 +323,13 @@ fn vl_lifecycle_matrix() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (mut child, mut reader, mut stdin) = spawn_child("vl");
-    // Drive abort injection: prefill cancels fire on READY, decode cancels
-    // on the first streamed token.
+    // Drive abort injection: prefill cancels fire on gen_start, decode cancels
+    // on the first streamed text (token or reasoning: VL thinks by default),
+    // commit-wait cancels on commit_ready.
     let mut line = String::new();
     let mut transcript = Transcript::default();
-    let mut t6_tokens = 0;
     let mut aborted_t6 = false;
+    let mut aborted_t6c = false;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
@@ -342,13 +346,15 @@ fn vl_lifecycle_matrix() {
                     writeln!(stdin, "ABORT g48-vl-t2 2").expect("abort t2");
                     stdin.flush().expect("flush abort");
                 }
-                if e.id == "g48-vl-t6" && e.typ == "token" {
-                    t6_tokens += 1;
-                    if t6_tokens == 1 && !aborted_t6 {
-                        aborted_t6 = true;
-                        writeln!(stdin, "ABORT g48-vl-t6 6").expect("abort t6");
-                        stdin.flush().expect("flush abort");
-                    }
+                if e.id == "g48-vl-t6" && e.text.is_some() && !aborted_t6 {
+                    aborted_t6 = true;
+                    writeln!(stdin, "ABORT g48-vl-t6 6").expect("abort t6");
+                    stdin.flush().expect("flush abort");
+                }
+                if e.id == "g48-vl-t6c" && e.typ == "commit_ready" && !aborted_t6c {
+                    aborted_t6c = true;
+                    writeln!(stdin, "ABORT g48-vl-t6c 10").expect("abort t6c");
+                    stdin.flush().expect("flush abort");
                 }
                 transcript.events.push(e);
             }
@@ -369,6 +375,7 @@ fn vl_lifecycle_matrix() {
         "reload-ok",
         "g48-vl-t5",
         "g48-vl-t6",
+        "g48-vl-t6c",
         "g48-vl-t7",
         "g48-vl-t8",
         "g48-vl-t9",
@@ -415,8 +422,9 @@ fn vl_lifecycle_matrix() {
     assert!(!fresh.is_empty(), "fresh-load turn streamed no text");
     // Reuse after cancel + injected prefill fault.
     assert_eq!(token_text(&transcript, "g48-vl-t4"), fresh);
-    // Cancel during decode, then reuse.
+    // Cancel during decode, then cancel at the commit wait, then reuse.
     assert_outcome(&transcript, "g48-vl-t6", TerminalOutcome::Cancel);
+    assert_outcome(&transcript, "g48-vl-t6c", TerminalOutcome::Cancel);
     assert_eq!(token_text(&transcript, "g48-vl-t7"), fresh);
     // Injected decode fault, then reuse.
     assert_outcome(&transcript, "g48-vl-t8", TerminalOutcome::Error);
@@ -457,10 +465,21 @@ fn dots_ocr_lifecycle_matrix() {
                     *n += 1;
                     if *n == 1 && !aborted.get(&e.id).copied().unwrap_or(false) {
                         aborted.insert(e.id.clone(), true);
-                        let attempt = if e.id == "g48-dots-d9" { 109 } else { 203 };
+                        let attempt = if e.id == "g48-dots-d9" { 109 } else { 202 };
                         writeln!(stdin, "ABORT {} {attempt}", e.id).expect("abort decode");
                         stdin.flush().expect("flush abort");
                     }
+                }
+                // Client abort at the commit wait (turn decoded, never committed).
+                let commit_wait = match e.id.as_str() {
+                    "g48-dots-d11" => Some(115),
+                    "g48-dots-s4" => Some(116),
+                    "g48-dots-x4" => Some(204),
+                    _ => None,
+                };
+                if let (Some(attempt), "commit_ready") = (commit_wait, e.typ.as_str()) {
+                    writeln!(stdin, "ABORT {} {attempt}", e.id).expect("abort commit wait");
+                    stdin.flush().expect("flush abort");
                 }
                 transcript.events.push(e);
             }
@@ -481,14 +500,17 @@ fn dots_ocr_lifecycle_matrix() {
         "g48-dots-d8",
         "g48-dots-d9",
         "g48-dots-d10",
+        "g48-dots-d11",
         "unload-ok",
         "reload-spec-ok",
         "g48-dots-s1",
         "g48-dots-s2",
         "g48-dots-s3",
+        "g48-dots-s4",
         "g48-dots-x1",
         "g48-dots-x2",
         "g48-dots-x3",
+        "g48-dots-x4",
         "unload2-ok",
     ] {
         assert!(
@@ -516,6 +538,9 @@ fn dots_ocr_lifecycle_matrix() {
         assert_eq!(errs[0].rolled_back, Some(true), "{id} must attest rollback");
     }
     assert_outcome(&transcript, "g48-dots-d9", TerminalOutcome::Cancel);
+    for id in ["g48-dots-d11", "g48-dots-s4", "g48-dots-x4"] {
+        assert_outcome(&transcript, id, TerminalOutcome::Cancel);
+    }
     // Spec path: success, injected spec fault (error, never done), reuse.
     let s1 = token_text(&transcript, "g48-dots-s1");
     assert_outcome(&transcript, "g48-dots-s1", TerminalOutcome::Success);
@@ -529,6 +554,53 @@ fn dots_ocr_lifecycle_matrix() {
     assert_outcome(&transcript, "g48-dots-x2", TerminalOutcome::Cancel);
     assert_outcome(&transcript, "g48-dots-x3", TerminalOutcome::Success);
     assert_eq!(token_text(&transcript, "g48-dots-x3"), x1);
+}
+
+/// LFM2-VL lifecycle: baseline, client abort at the commit wait, reuse.
+/// Requires `HIPFIRE_LFM2_VL_FIXTURE`. Ignored: needs HIP GPU.
+#[test]
+#[ignore = "requires HIP GPU + HIPFIRE_LFM2_VL_FIXTURE (lfm2.5-vl-3b.mq4v2.hfq)"]
+fn lfm2_vl_lifecycle_matrix() {
+    let _matrix_guard = MATRIX_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut child, mut reader, mut stdin) = spawn_child("lfm2");
+    let mut line = String::new();
+    let mut transcript = Transcript::default();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let trimmed = line.trim().to_string();
+        if let Some(rest) = trimmed.strip_prefix("SECTION ") {
+            transcript.sections.push(rest.to_string());
+        } else if trimmed.starts_with('{') {
+            if let Some(e) = parse_event(&trimmed) {
+                if e.id == "g48-lfm2-l2" && e.typ == "commit_ready" {
+                    writeln!(stdin, "ABORT g48-lfm2-l2 302").expect("abort l2");
+                    stdin.flush().expect("flush abort");
+                }
+                transcript.events.push(e);
+            }
+        }
+    }
+    let status = child.wait().expect("child wait");
+    assert!(status.success(), "lfm2 matrix child failed: {status}");
+    for section in ["load-ok", "g48-lfm2-l1", "g48-lfm2-l2", "g48-lfm2-l3"] {
+        assert!(
+            transcript.sections.contains(&section.to_string()),
+            "missing SECTION {section} (got {:?})",
+            transcript.sections
+        );
+    }
+    let l1 = token_text(&transcript, "g48-lfm2-l1");
+    assert!(!l1.is_empty(), "baseline turn streamed no text");
+    assert_outcome(&transcript, "g48-lfm2-l1", TerminalOutcome::Success);
+    assert_outcome(&transcript, "g48-lfm2-l2", TerminalOutcome::Cancel);
+    assert_outcome(&transcript, "g48-lfm2-l3", TerminalOutcome::Success);
+    assert_eq!(token_text(&transcript, "g48-lfm2-l3"), l1);
 }
 
 // ── child-side GPU implementation ───────────────────────────────────────
@@ -634,9 +706,8 @@ fn admit_and_load(
             kv_v: None,
             qwen_default_q8: true,
             kv_adaptive: None,
-            cask: None,
             deepseek4_heterogeneous: false,
-            vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+            vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),
             free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
         },
     )
@@ -655,7 +726,6 @@ fn admit_and_load(
         None,
         None,
         None,
-        &hipfire_runtime::loader_api::CaskConfig::default(),
         1,
         spec,
         gpu,
@@ -685,7 +755,10 @@ fn vl_params<'a>(
         id,
         prompt,
         system_prompt: None,
-        image_source: ImageSource::Path(image),
+        image_sources: vec![ImageSource::Path(image)],
+        messages_history: None,
+        enable_thinking: true,
+        reasoning_effort: None,
         temp: 0.0,
         top_p: 1.0,
         max_tokens,
@@ -724,6 +797,15 @@ fn vl_turn(
     let mut out = std::io::stdout();
     hipfire_generate::vision::generate_vl(m, gpu, &mut out, &params);
     std::io::stdout().flush().expect("flush turn");
+    // Uncommitted turns end in cancel or error: whenever the abort lands
+    // (prefill, decode, or the commit wait), nothing of the turn may stay resident.
+    if !commit {
+        assert_eq!(m.seq_pos, 0, "{id}: uncommitted turn left seq_pos");
+        assert!(
+            m.conversation_tokens.is_empty(),
+            "{id}: uncommitted turn left tokens"
+        );
+    }
     clear_terminal_control();
     emit_marker(&format!("SECTION {id}"));
 }
@@ -788,9 +870,11 @@ fn child_vl_matrix() {
     );
     emit_marker("SECTION reload-ok");
     vl_turn(&mut m, &mut gpu, "g48-vl-t5", 5, &image, prompt, 8, true);
-    // T6 cancel-during-decode (parent aborts on first token; wider budget
-    // so decode is still in flight); T7 reuse.
+    // T6 cancel-during-decode (parent aborts on the first streamed text; wider
+    // budget so decode is still in flight); T6c client abort at the commit
+    // wait (parent aborts on commit_ready); T7 reuse.
     vl_turn(&mut m, &mut gpu, "g48-vl-t6", 6, &image, prompt, 32, false);
+    vl_turn(&mut m, &mut gpu, "g48-vl-t6c", 10, &image, prompt, 8, false);
     vl_turn(&mut m, &mut gpu, "g48-vl-t7", 7, &image, prompt, 8, true);
     // T8 injected decode fault; T9 reuse.
     hipfire_generate::common::arm_vision_fault(Some("decode"));
@@ -825,6 +909,7 @@ fn dots_turn(
     let mut out = std::io::stdout();
     hipfire_generate::vision::generate_vl_dots_ocr(m, gpu, &mut out, &params);
     std::io::stdout().flush().expect("flush turn");
+    assert_dots_rolled_back(m, id, commit);
     clear_terminal_control();
     emit_marker(&format!("SECTION {id}"));
 }
@@ -854,8 +939,19 @@ fn dots_text_turn(
         m, gpu, &mut out, id, prompt, None, 0.0, 1.0, max_tokens,
     );
     std::io::stdout().flush().expect("flush turn");
+    assert_dots_rolled_back(m, id, commit);
     clear_terminal_control();
     emit_marker(&format!("SECTION {id}"));
+}
+
+/// Uncommitted dots turns (cancel, error, or abort at the commit wait) must
+/// leave no decoder rows resident.
+#[cfg(test)]
+fn assert_dots_rolled_back(m: &mut hipfire_loader::LoadedModel, id: &str, commit: bool) {
+    if !commit {
+        let pos = m.dots_ocr_mut().expect("dots bundle").state.next_pos;
+        assert_eq!(pos, 0, "{id}: uncommitted turn left decoder rows");
+    }
 }
 
 #[cfg(test)]
@@ -1008,6 +1104,17 @@ fn child_dots_matrix() {
         16,
         true,
     );
+    // Client abort at the commit wait (parent aborts on commit_ready).
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d11",
+        115,
+        &image,
+        prompt,
+        16,
+        false,
+    );
 
     // Unload/reload with the n-gram drafter armed: spec success must be
     // byte-identical to AR; spec fault fails closed; reuse recovers.
@@ -1078,12 +1185,23 @@ fn child_dots_matrix() {
         16,
         true,
     );
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-s4",
+        116,
+        &image,
+        prompt,
+        16,
+        false,
+    );
 
     // Text-only path on the same bundle: success, decode cancel, reuse.
     let text_prompt = "List three office supplies.";
     dots_text_turn(&mut m, &mut gpu, "g48-dots-x1", 201, text_prompt, 16, true);
     dots_text_turn(&mut m, &mut gpu, "g48-dots-x2", 202, text_prompt, 32, false);
     dots_text_turn(&mut m, &mut gpu, "g48-dots-x3", 203, text_prompt, 16, true);
+    dots_text_turn(&mut m, &mut gpu, "g48-dots-x4", 204, text_prompt, 16, false);
 
     hipfire_loader::unload_model(m, &mut gpu).expect("final dots unload");
     gpu.drain_pool();
@@ -1093,4 +1211,63 @@ fn child_dots_matrix() {
         "dots final unload leaked VRAM: base {vram_base} final {vram_final}"
     );
     emit_marker("SECTION unload2-ok");
+}
+
+/// One LFM2-VL turn; same harness contract as [`vl_turn`].
+#[cfg(test)]
+fn lfm2_vl_turn(
+    m: &mut hipfire_loader::LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    id: &str,
+    attempt: u64,
+    image: &str,
+    prompt: &str,
+    commit: bool,
+) {
+    use hipfire_engine::terminal::{
+        activate_terminal_control, clear_terminal_control, BatchAttemptScope,
+    };
+    activate_terminal_control(id, attempt);
+    let _scope = BatchAttemptScope::enter_singleton(attempt);
+    if commit {
+        spawn_committer(id, attempt);
+    }
+    emit_marker(&format!("READY {id}"));
+    let params = vl_params(id, prompt, image, 16);
+    let mut out = std::io::stdout();
+    hipfire_generate::vision::generate_lfm2_vl(m, gpu, &mut out, &params);
+    std::io::stdout().flush().expect("flush turn");
+    if !commit {
+        assert_eq!(m.seq_pos, 0, "{id}: uncommitted turn left seq_pos");
+        let rows = m.lfm2moe_mut().expect("lfm2 bundle").state.n_tokens;
+        assert_eq!(rows, 0, "{id}: uncommitted turn left KV rows");
+    }
+    clear_terminal_control();
+    emit_marker(&format!("SECTION {id}"));
+}
+
+#[cfg(test)]
+fn child_lfm2_vl_matrix() {
+    let path =
+        std::env::var("HIPFIRE_LFM2_VL_FIXTURE").expect("HIPFIRE_LFM2_VL_FIXTURE must be set");
+    let image = repo_image(
+        "benchmarks/vision/images/general_qa.jpg",
+        "HIPFIRE_VISION_IMAGE",
+    );
+    spawn_abort_injector();
+    let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
+    warm_first_alloc(&mut gpu);
+    let mut m = admit_and_load(
+        &mut gpu,
+        &path,
+        None,
+        4096,
+        hipfire_runtime::loader_api::SpecLoadCfg::default(),
+    );
+    emit_marker("SECTION load-ok");
+    let prompt = "Describe this image in one sentence.";
+    lfm2_vl_turn(&mut m, &mut gpu, "g48-lfm2-l1", 301, &image, prompt, true);
+    lfm2_vl_turn(&mut m, &mut gpu, "g48-lfm2-l2", 302, &image, prompt, false);
+    lfm2_vl_turn(&mut m, &mut gpu, "g48-lfm2-l3", 303, &image, prompt, true);
+    hipfire_loader::unload_model(m, &mut gpu).expect("lfm2 unload");
 }

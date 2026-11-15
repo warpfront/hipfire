@@ -12,7 +12,7 @@ of the K3 kernel alone (launch + sync included, synchronized per loop). It is no
 
 | file | role |
 |---|---|
-| `crates/hipfire-runtime/examples/mq_i4_a4_gfx1100_g1_oracle.rs` | raw HIP runner (same 48-byte kernarg ABI, load and identity check as `mq_i4_a4_byte_oracle`, symbol `mq_i4_a4_r128_k640_gfx1100`) |
+| `crates/hipfire-runtime/examples/mq_i4_a4_gfx1100_g1_oracle.rs` | raw HIP runner (same 48-byte kernarg ABI, load and identity check as the since-removed gfx1201 `mq_i4_a4_byte_oracle`, symbol `mq_i4_a4_r128_k640_gfx1100`) |
 | `crates/peacemaker-isa/tools/mq_i4_a4_gfx1100_oracle.py` | CPU driver: case generation, expected bytes, comparison, receipt |
 | `crates/peacemaker-isa/tools/mq_i4_a4_oracle.py` | certified base harness, imported (not copied) |
 | `/home/kaden/qcal/release-0.4.2/subq4/calib2/pilot_solve.py` | CPU oracle `a4_emulate`; SHA256 pinned to `53965f2328e32d86c7b87460a02573a065424e220383891da210441dc9f6c0df` (any other file is refused). The runtime `mq_i4_reference` has no A4 producer. |

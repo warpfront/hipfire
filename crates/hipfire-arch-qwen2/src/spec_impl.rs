@@ -11,7 +11,7 @@
 //! prefix KV the verify wrote is already correct; the rejected tail is overwritten
 //! by the next verify). Unlike llama/qwen35, Qwen2 keeps its KV in its own
 //! `Qwen2State` (not the shared `llama::KvCache`), so [`SpecTarget::kv_cache_mut`]
-//! stays at its `None` default — arch_id=7 has no FlashCASK eviction.
+//! stays at its `None` default.
 //!
 //! VERIFY IS BLOCK-PARALLEL: [`SpecTarget::verify_block`] runs the whole
 //! candidate block through one batched layer loop

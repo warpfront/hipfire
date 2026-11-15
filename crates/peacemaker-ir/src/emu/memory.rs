@@ -868,10 +868,11 @@ mod tests {
     }
     fn insn(name: &str, operands: Vec<Operand>) -> Inst {
         let row = crate::isa::gfx12().iter().find(|r| r.name == name).unwrap();
-        Inst::from_parts(
+        Inst::from_encoding(
             Arch::Gfx1201,
             row.op,
             row.form,
+            row.variant,
             Default::default(),
             operands.into_iter().collect(),
             Default::default(),
@@ -916,7 +917,8 @@ mod tests {
     fn prefetch_data_is_a_noop_in_range_and_refused_out_of_range() {
         let (inst, n) = crate::codec::gfx12::decode(&[0xF404_C00B, 0xF800_0000]).unwrap();
         assert_eq!(n, 2);
-        let name = crate::isa::lookup(Arch::Gfx1201, inst.op, inst.form)
+        let name = crate::isa::lookup_inst(Arch::Gfx1201, &inst)
+            .ok()
             .unwrap()
             .name;
         assert_eq!(name, "s_prefetch_data");
@@ -1114,10 +1116,11 @@ mod tests {
             .iter()
             .find(|r| r.name == name)
             .unwrap_or_else(|| panic!("{name} missing from {arch:?}"));
-        Inst::from_parts(
+        Inst::from_encoding(
             arch,
             row.op,
             row.form,
+            row.variant,
             Default::default(),
             operands.into_iter().collect(),
             Default::default(),

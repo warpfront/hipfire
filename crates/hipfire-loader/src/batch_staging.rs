@@ -23,7 +23,6 @@
 //! fields.
 
 use crate::LoadedModel;
-use hipfire_arch_qwen35::qwen35::StateQuant;
 use rdna_compute::Gpu;
 
 /// What the load handler needs to know after staging.
@@ -562,6 +561,16 @@ pub fn d2_single_card_lane_refusal(
     })
 }
 
+/// Why a Qwen4 lane request cannot be staged at all: the lane store holds at
+/// most [`hipfire_arch_qwen4::lane::MAX_LANES`] lanes, while the configuration
+/// ceiling (`serve.continuous_batch_size`) is higher. Refused before any
+/// device-byte accounting so the load logs the real cause and stays sequential.
+pub fn qwen4_lane_capacity_refusal(requested: usize) -> Option<String> {
+    let max = hipfire_arch_qwen4::lane::MAX_LANES;
+    (requested == 0 || requested > max)
+        .then(|| format!("lanes={requested} outside the lane store capacity 1..={max}"))
+}
+
 /// Kill switch of EP native-MTP lanes: exact `0` keeps the AR lane store (as
 /// before the mesh lane protocol); unset (the default) or any other value
 /// stages native-MTP lanes.
@@ -656,6 +665,9 @@ fn stage_qwen4_lanes(
     };
     if req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Nonexact {
         return refuse("qwen4 has only the exact lane route");
+    }
+    if let Some(why) = qwen4_lane_capacity_refusal(requested) {
+        return refuse(&why);
     }
     let max_seq = m.max_seq;
     let natural_spec_off = if !req.spec {
@@ -879,10 +891,6 @@ fn stage_qwen4_lanes(
     }
 }
 
-fn stochastic_q8_state_without_ef(quant: StateQuant, has_state: bool, has_ef: bool) -> bool {
-    quant == StateQuant::Q8 && has_state && !has_ef
-}
-
 /// Stage the VMM continuous-batching store beside the resident Qwen35
 /// bundle. No fixed-lane KV is allocated: request owners are created lazily
 /// at admission, shaped like the resident (VMM) singleton KV. Any failure
@@ -901,19 +909,6 @@ fn stage_qwen_vmm_batch(
         );
         return out;
     };
-    if gpu.arch_caps.is_gfx1100()
-        && req.route == hipfire_arch_qwen35::forward_slots::vmm::VmmRoute::Exact
-        && stochastic_q8_state_without_ef(
-            b.dn_state.quant,
-            !b.dn_state.s_scales.is_empty(),
-            !b.dn_state.s_ef_residual.is_empty(),
-        )
-    {
-        // Legacy stochastic Q8 state is not singleton-exact under hipGraph:
-        // replay freezes the captured requant frame, unlike eager AR lanes.
-        eprintln!("[daemon] gfx1100 Exact VMM requires Q8 error feedback (HIPFIRE_DN_STATE_EF=1); stochastic EF-off singleton graph parity is unproven — existing route");
-        return out;
-    }
     // The executor's own coverage predicate (embedding/lm_head dtypes,
     // slots-body layer coverage, VMM KV route and flash plan) — not the
     // fixed-lane `qwen_batch_weight_formats_supported` gate.
@@ -1065,7 +1060,7 @@ fn stage_qwen_vmm_spec(m: &mut LoadedModel, gpu: &mut Gpu, lanes: usize, row_bud
 /// Stage the VMM store's DFlash engine over the loaded singleton's resident
 /// draft weights (shared by reference count, never reloaded). Eligibility is
 /// derived from the resolved loaded speculator (`vmm_assets`: fixed-block
-/// chain, no DDTree, no admitted retained PM4, adaptive block off) and the
+/// chain, no admitted retained PM4, adaptive block off) and the
 /// store (Exact route, `max_rows >= block`), not from a second env parse.
 fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) {
     let assets = match m
@@ -1151,9 +1146,25 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
 mod tests {
     use super::{
         d2_single_card_lane_refusal, ep_spec_lane_reservation, ep_spec_lane_reservation_with,
-        ep_spec_off_reason, stochastic_q8_state_without_ef, StateQuant,
+        ep_spec_off_reason, qwen4_lane_capacity_refusal,
     };
     use hipfire_runtime::loader_api::SpecLoadCfg;
+
+    /// Lane counts past the store capacity (64) are refused up front with the cause named;
+    /// 32 and 64 (the gfx942 stock-FP8 serve widths) pass.
+    #[test]
+    fn lane_capacity_refusal_bounds_are_one_to_sixty_four() {
+        for ok in [1usize, 8, 32, 64] {
+            assert_eq!(qwen4_lane_capacity_refusal(ok), None, "{ok}");
+        }
+        for bad in [0usize, 65, 128, 256] {
+            let why = qwen4_lane_capacity_refusal(bad).expect("refused");
+            assert!(
+                why.contains(&format!("lanes={bad}")) && why.contains("1..=64"),
+                "{why}"
+            );
+        }
+    }
 
     /// The D2 lane refusal: single-card topology with CPU-split layers only, killed by the env.
     #[test]
@@ -1234,23 +1245,5 @@ mod tests {
             ep_spec_lane_reservation_with(true, true, SpecLoadCfg::default(), "gfx1201"),
             (None, false)
         );
-    }
-
-    #[test]
-    fn exact_ef_guard_only_rejects_live_stochastic_q8_state() {
-        assert!(stochastic_q8_state_without_ef(StateQuant::Q8, true, false));
-        assert!(!stochastic_q8_state_without_ef(StateQuant::Q8, true, true));
-        assert!(!stochastic_q8_state_without_ef(
-            StateQuant::Q8,
-            false,
-            false
-        ));
-        for quant in [StateQuant::FP32, StateQuant::Q4] {
-            for has_state in [false, true] {
-                for has_ef in [false, true] {
-                    assert!(!stochastic_q8_state_without_ef(quant, has_state, has_ef));
-                }
-            }
-        }
     }
 }

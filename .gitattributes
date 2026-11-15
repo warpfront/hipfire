@@ -1,2 +1,17 @@
 # Preserve byte-identical benchmark prompts whose whitespace is part of the fixture.
 benchmarks/prompts/qwen38_issue693_longcode_20676.txt whitespace=-trailing-space
+
+# Generated PeaceMaker tables and LLVM oracle receipts: collapsed in GitHub diffs and language
+# stats, and excluded from ripgrep/agent search by .ignore (scripts/check-pm-generated-pins.py
+# requires the two lists to be equal). They stay committed because regenerating them needs AMD's
+# ISA XML (not in the repo) or ROCm llvm-mc; the same script checks the CDNA table pins without either.
+crates/peacemaker-cdna/src/generated_cdna3.rs linguist-generated=true
+crates/peacemaker-cdna/src/generated_cdna4.rs linguist-generated=true
+crates/peacemaker-cdna/tools/cdna3-llvm.json linguist-generated=true
+crates/peacemaker-cdna/tools/cdna4-llvm.json linguist-generated=true
+crates/peacemaker-ir/isa/gfx1100.xml.jsonl linguist-generated=true
+crates/peacemaker-ir/isa/gfx1151.xml.jsonl linguist-generated=true
+crates/peacemaker-ir/isa/gfx12.xml.jsonl linguist-generated=true
+crates/peacemaker-ir/isa/sop1-overrides.json linguist-generated=true
+crates/peacemaker-ir/isa/emu/trans_tables.rs linguist-generated=true
+crates/peacemaker-npu/src/isa/gen.rs linguist-generated=true

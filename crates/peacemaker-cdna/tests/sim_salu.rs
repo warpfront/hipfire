@@ -155,7 +155,16 @@ fn is64_sop2(op: Sop2Op) -> bool {
     use Sop2Op::*;
     matches!(
         op,
-        CselectB64 | AndB64 | OrB64 | XorB64 | Andn2B64 | Orn2B64 | LshlB64 | LshrB64 | AshrI64
+        CselectB64
+            | AndB64
+            | OrB64
+            | XorB64
+            | Andn2B64
+            | Orn2B64
+            | NorB64
+            | LshlB64
+            | LshrB64
+            | AshrI64
     )
 }
 
@@ -274,6 +283,11 @@ fn ref_sop2(op: Sop2Op, a: u64, b: u64, scc: bool) -> (u64, Option<bool>) {
             let r = a | !b;
             (r, nz(r))
         }
+        NorB64 => {
+            // De Morgan reference, deliberately distinct from the emulator expression.
+            let r = (!a) & (!b);
+            (r, nz(r))
+        }
         LshlB32 => {
             let r = (u64::from(a32) << (b32 & 31)) & M32;
             (r, nz(r))
@@ -371,6 +385,7 @@ sop2_tests! {
     s_cselect_b32 => CselectB32, s_cselect_b64 => CselectB64, s_and_b32 => AndB32, s_and_b64 => AndB64,
     s_or_b32 => OrB32, s_or_b64 => OrB64, s_xor_b32 => XorB32, s_xor_b64 => XorB64,
     s_andn2_b32 => Andn2B32, s_andn2_b64 => Andn2B64, s_orn2_b32 => Orn2B32, s_orn2_b64 => Orn2B64,
+    s_nor_b64 => NorB64,
     s_lshl_b32 => LshlB32, s_lshl_b64 => LshlB64, s_lshr_b32 => LshrB32, s_lshr_b64 => LshrB64,
     s_ashr_i32 => AshrI32, s_ashr_i64 => AshrI64, s_bfm_b32 => BfmB32, s_mul_i32 => MulI32,
     s_bfe_u32 => BfeU32, s_bfe_i32 => BfeI32, s_mul_hi_u32 => MulHiU32, s_mul_hi_i32 => MulHiI32,
@@ -1735,6 +1750,36 @@ fn sop2_dst_ops_run_to_exact_register_file() {
                 w.s[21], 0xbbbb_bbbb,
                 "{op:?} wrote the high dword of a 32-bit destination"
             )
+        }
+    }
+}
+
+#[test]
+fn nor_b64_uses_both_dwords_before_alias_writes_and_runs_with_empty_exec() {
+    for (a, b, want) in [
+        (0u64, 0u64, u64::MAX),
+        (u64::MAX, 0, 0),
+        (0xffff_ffff, 0, 0xffff_ffff_0000_0000),
+        (0, 0xffff_ffff_0000_0000, 0xffff_ffff),
+        (0xaaaa_aaaa_5555_5555, 0x5555_5555_aaaa_aaaa, 0),
+        (1 << 63, 0, 0x7fff_ffff_ffff_ffff),
+    ] {
+        for dst in [SA, SB, SD] {
+            for exec in [0, u64::MAX] {
+                for incoming_scc in [false, true] {
+                    let mut w = fresh(a, b, 0x1369_2468_fedc_9876, incoming_scc);
+                    w.exec = exec;
+                    step(&mut w, &sop2(Sop2Op::NorB64, sg(dst), sg(SA), sg(SB))).unwrap();
+                    let d = usize::from(dst);
+                    let got = u64::from(w.s[d]) | u64::from(w.s[d + 1]) << 32;
+                    assert_eq!(
+                        got, want,
+                        "dst={dst}, EXEC={exec:#x}, incoming SCC={incoming_scc}"
+                    );
+                    assert_eq!(w.scc, want != 0);
+                    assert_eq!(w.exec, exec);
+                }
+            }
         }
     }
 }

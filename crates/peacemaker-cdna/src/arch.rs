@@ -6,10 +6,11 @@
 //!
 //! Every encoder, decoder and emulator path that differs between CDNA
 //! generations takes an [`Arch`] and reads its [`Caps`] row. Only gfx942 is
-//! populated. A later variant (gfx950 / CDNA4: OCP FP8, FP4/FP6 MFMA, larger
-//! LDS) adds an enum variant, a `Caps` row, and per-variant opcode arms in the
-//! `enc` tables (`*Op::opcode(arch)` returns `None` where a variant lacks an
-//! instruction); nothing else is forked.
+//! populated for encoding and emulation. gfx950 (CDNA4: OCP FP8, FP4/FP6
+//! MFMA, larger LDS) is decode-only: it has a `Caps` row and per-variant
+//! opcode arms in the `enc` tables that are all `None`
+//! (`*Op::opcode(arch)` returns `None` where a variant lacks an
+//! instruction); its instructions decode through the generated tables.
 use crate::enc::vop3p::MaiOp;
 use crate::Result;
 
@@ -17,6 +18,8 @@ use crate::Result;
 pub enum Arch {
     /// CDNA3, AMD Instinct MI300X/MI300A/MI325X.
     Gfx942,
+    /// CDNA4, AMD Instinct MI350X/MI355X. Decode-only.
+    Gfx950,
 }
 
 /// How FP8/BF8 bytes are interpreted by the variant's conversion and MFMA
@@ -73,6 +76,8 @@ pub struct Caps {
     pub mai: &'static [MaiOp],
     /// FP4/FP6 MFMA operand types (gfx950).
     pub fp4_fp6_mfma: bool,
+    /// No encoder or emulator for this variant: decode only (gfx950).
+    pub decode_only: bool,
 }
 
 const GFX942_MAI: &[MaiOp] = MaiOp::ALL;
@@ -99,13 +104,44 @@ const GFX942: Caps = Caps {
     permlane_swap: false,
     mai: GFX942_MAI,
     fp4_fp6_mfma: false,
+    decode_only: false,
+};
+
+/// gfx950 (CDNA4, MI355X): decode-only. The typed instruction tables are
+/// gfx942's and every `*Op::opcode(Arch::Gfx950)` is `None`, so an opcode
+/// number of gfx942 is never read as gfx950 (CDNA4 renumbers and extends the
+/// set); the machine-readable CDNA4 ISA decodes every instruction instead.
+const GFX950: Caps = Caps {
+    arch: Arch::Gfx950,
+    name: "gfx950",
+    generation: "CDNA4",
+    elf_mach: 0x04f,
+    fp8: Fp8Encoding::Ocp,
+    lds_bytes: 160 * 1024,
+    sgprs: 102,
+    vgprs: 256,
+    agprs: 256,
+    unified_vgprs: 512,
+    vgpr_granule: 8,
+    packed_tid: true,
+    vmcnt_max: 63,
+    lgkmcnt_max: 15,
+    expcnt_max: 7,
+    back_off_barrier: true,
+    dpp_wave_ops: true,
+    permlane16: false,
+    permlane_swap: true,
+    mai: &[],
+    fp4_fp6_mfma: true,
+    decode_only: true,
 };
 
 impl Arch {
-    pub const ALL: &'static [Arch] = &[Arch::Gfx942];
+    pub const ALL: &'static [Arch] = &[Arch::Gfx942, Arch::Gfx950];
     pub fn caps(self) -> &'static Caps {
         match self {
             Arch::Gfx942 => &GFX942,
+            Arch::Gfx950 => &GFX950,
         }
     }
     pub fn name(self) -> &'static str {
@@ -113,6 +149,13 @@ impl Arch {
     }
     pub fn has_mai(self, op: MaiOp) -> bool {
         self.caps().mai.contains(&op)
+    }
+    /// Whether the crate can encode instructions for this variant. gfx950
+    /// (CDNA4) is decode-only: its instructions decode into
+    /// [`crate::Inst::Xml`] from the machine-readable ISA, but no typed
+    /// instruction exists for it and nothing is encoded or emulated.
+    pub fn encodes(self) -> bool {
+        !self.caps().decode_only
     }
 }
 

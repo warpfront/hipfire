@@ -36,7 +36,7 @@ These are independent axes. Do not conflate them in CLI, logs, or claims.
 
 | Axis | What it selects | Examples |
 |---|---|---|
-| **Weight quantization** | How model weights are stored/decoded | MQ4R, Q8 weights, Paro, HFQ families, Lloyd **weight** dtypes |
+| **Weight quantization** | How model weights are stored/decoded | MQ4R, Q8 weights, HFQ families, Lloyd **weight** dtypes |
 | **KV encoding** | How the attention K/V cache is packed | static `q8`, `asym2/3/4`, `fwht2/3/4`; Lloyd-V overrides; adaptive tier ladder |
 
 VMM is a **KV storage backend**. It does not change weight codecs. MQ4R in the

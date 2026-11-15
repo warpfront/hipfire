@@ -470,7 +470,7 @@ const MESSAGES: &[(&str, &str)] = &[
     ("R0399", "the paths disagree on LDS ownership: t is Free on one path and Writing on the other"),
     ("R0401", "v40 at entry has no unique live owner"),
     ("R0402", "extra overlaps vectors with a shared lifetime"),
-    ("R0402", "register width must be 1, 2, 4 or 8"),
+    ("R0402", "register width must be 1, 2, 4 or 8 (16 for AGPRs)"),
     ("R0402", "register budget exceeds architectural limit"),
     ("R0403", "s_barrier is a barrier: barriers go through the typed core"),
     ("R0403", "typed kernel: LDS, barriers, branches and loops go through peacemaker-author"),

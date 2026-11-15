@@ -765,8 +765,9 @@ fn pm_emulator_construction_reports_exact_missing_semantics() {
         let mut missing = BTreeSet::new();
         for id in &kernel.body.layout {
             let inst = kernel.body.insts.get(*id).unwrap();
-            let row =
-                peacemaker_ir::isa::lookup(IR_ARCH, inst.op, inst.form).expect("decoded opcode");
+            let row = peacemaker_ir::isa::lookup_inst(IR_ARCH, &inst)
+                .ok()
+                .expect("decoded opcode");
             if peacemaker_ir::emu::semantic_class(row.name).is_none() {
                 missing.insert(row.name.to_string());
             }
@@ -969,8 +970,9 @@ fn pinned_actual_singleton_objects_construct_with_complete_semantics() {
         let mut absent = BTreeSet::new();
         for id in &kernel.body.layout {
             let inst = kernel.body.insts.get(*id).unwrap();
-            let row =
-                peacemaker_ir::isa::lookup(IR_ARCH, inst.op, inst.form).expect("decoded opcode");
+            let row = peacemaker_ir::isa::lookup_inst(IR_ARCH, &inst)
+                .ok()
+                .expect("decoded opcode");
             if peacemaker_ir::emu::semantic_class(row.name).is_none() {
                 absent.insert(row.name.to_string());
             }

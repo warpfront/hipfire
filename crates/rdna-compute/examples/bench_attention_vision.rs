@@ -107,43 +107,11 @@ fn main() {
         .unwrap();
     gpu.attention_dflash_wmma_n64_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd)
         .unwrap();
-    gpu.attention_dflash_wmma_n64_f16kv_f32(
-        &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-    )
-    .unwrap();
     gpu.attention_dflash_wmma_n128_f16kv_f32(
         &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
     )
     .unwrap();
-    gpu.attention_dflash_wmma_m64_n128_f16kv_f32(
-        &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-    )
-    .unwrap();
-    gpu.attention_dflash_wmma_m64_n128_f16kv_v2_f32(
-        &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-    )
-    .unwrap();
-    gpu.attention_dflash_wmma_m64_n128_f16kv_v3_f32(
-        &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-    )
-    .unwrap();
-    gpu.attention_dflash_wmma_m64_n128_f16kv_v4_f32(
-        &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-    )
-    .unwrap();
     gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
-        &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-    )
-    .unwrap();
-    gpu.attention_dflash_wmma_m64_n32_f16kv_v6_f32(
-        &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-    )
-    .unwrap();
-    gpu.attention_dflash_wmma_m128_n32_f16kv_v7_f32(
-        &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-    )
-    .unwrap();
-    gpu.attention_dflash_wmma_m128_n32_f16kv_v7b_f32(
         &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
     )
     .unwrap();
@@ -184,19 +152,6 @@ fn main() {
 
     let t = std::time::Instant::now();
     for _ in 0..iters {
-        gpu.attention_dflash_wmma_n64_f16kv_f32(
-            &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-        )
-        .unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!(
-        "M=32 N=64  f16-K/V wmma: {:.1} ms / iter ({iters} iters)",
-        t.elapsed().as_secs_f32() * 1000.0 / iters as f32
-    );
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
         gpu.attention_dflash_wmma_n128_f16kv_f32(
             &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
         )
@@ -210,58 +165,6 @@ fn main() {
 
     let t = std::time::Instant::now();
     for _ in 0..iters {
-        gpu.attention_dflash_wmma_m64_n128_f16kv_f32(
-            &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-        )
-        .unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!(
-        "M=64 N=128 f16-K/V O-reg wmma:    {:.1} ms / iter ({iters} iters)",
-        t.elapsed().as_secs_f32() * 1000.0 / iters as f32
-    );
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
-        gpu.attention_dflash_wmma_m64_n128_f16kv_v2_f32(
-            &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-        )
-        .unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!(
-        "M=64 N=128 v2 (pad+coop softmax): {:.1} ms / iter ({iters} iters)",
-        t.elapsed().as_secs_f32() * 1000.0 / iters as f32
-    );
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
-        gpu.attention_dflash_wmma_m64_n128_f16kv_v3_f32(
-            &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-        )
-        .unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!(
-        "M=64 N=128 v3 (hoisted S_lds):    {:.1} ms / iter ({iters} iters)",
-        t.elapsed().as_secs_f32() * 1000.0 / iters as f32
-    );
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
-        gpu.attention_dflash_wmma_m64_n128_f16kv_v4_f32(
-            &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-        )
-        .unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!(
-        "M=64 N=128 v4 (V_lds_T):          {:.1} ms / iter ({iters} iters)",
-        t.elapsed().as_secs_f32() * 1000.0 / iters as f32
-    );
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
         gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
             &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
         )
@@ -270,45 +173,6 @@ fn main() {
     gpu.hip.device_synchronize().unwrap();
     eprintln!(
         "M=64 N=32  v5 (V_tile=32):        {:.1} ms / iter ({iters} iters)",
-        t.elapsed().as_secs_f32() * 1000.0 / iters as f32
-    );
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
-        gpu.attention_dflash_wmma_m64_n32_f16kv_v6_f32(
-            &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-        )
-        .unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!(
-        "M=64 N=32  v6 (V_lds_T):          {:.1} ms / iter ({iters} iters)",
-        t.elapsed().as_secs_f32() * 1000.0 / iters as f32
-    );
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
-        gpu.attention_dflash_wmma_m128_n32_f16kv_v7_f32(
-            &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-        )
-        .unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!(
-        "M=128 N=32 v7 (sub-tile):         {:.1} ms / iter ({iters} iters)",
-        t.elapsed().as_secs_f32() * 1000.0 / iters as f32
-    );
-
-    let t = std::time::Instant::now();
-    for _ in 0..iters {
-        gpu.attention_dflash_wmma_m128_n32_f16kv_v7b_f32(
-            &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
-        )
-        .unwrap();
-    }
-    gpu.hip.device_synchronize().unwrap();
-    eprintln!(
-        "M=128 N=32 v7b (seq, no-share):   {:.1} ms / iter ({iters} iters)",
         t.elapsed().as_secs_f32() * 1000.0 / iters as f32
     );
 

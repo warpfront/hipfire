@@ -481,50 +481,6 @@
       "min_vram_gb": 20,
       "desc": "MQ3+P graded — MQ4 quality at MQ3 size."
     },
-    "qwen3.6:35b-a3b-mq4p": {
-      "recommended_settings": {
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": 20,
-        "min_p": 0.0,
-        "presence_penalty": 0.0,
-        "repeat_penalty": 1.0
-      },
-      "sampling_profiles": {
-        "general": {
-          "temperature": 1.0,
-          "top_p": 0.95,
-          "top_k": 20,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
-        },
-        "coding": {
-          "temperature": 0.6,
-          "top_p": 0.95,
-          "top_k": 20,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
-        },
-        "instruct": {
-          "temperature": 0.7,
-          "top_p": 0.8,
-          "top_k": 20,
-          "min_p": 0.0,
-          "presence_penalty": 0.0,
-          "repeat_penalty": 1.0
-        }
-      },
-      "repo": "hipfire-models/qwen3.6-35b-a3b",
-      "mtp": {
-        "file": "qwen3.6-35b-a3b.mtp"
-      },
-      "file": "qwen3.6-35b-a3b.mq4p",
-      "size_gb": 19.8,
-      "min_vram_gb": 22,
-      "desc": "MQ4+P graded — robust 4-bit default, beats uniform MQ4."
-    },
     "qwen3.6:35b-a3b-mfp4": {
       "recommended_settings": {
         "temperature": 1.0,
@@ -747,27 +703,7 @@
       "min_vram_gb": 22,
       "quant_recipe": "mq4v2-symmetric-no-q8-router-down-mq4g128v2-symmetric@7da11034",
       "default_kv_mode": "q8",
-      "desc": "MQ4 symmetric-expert prefill SKU for the R9700 (exact gfx1201), quantized from Qwen/Qwen3.6-35B-A3B@7da11034 with --format mq4 --uniform --mq4v2-symmetric --no-q8-router --moe-expert-down mq4g128v2-symmetric. Routed gate/up are symmetric MQ4G256V2 (qt44) and routed down is symmetric MQ4G128V2 (qt53); shared experts, attention, router and lm_head are MQ4G256V2, the embedding is Q8F16. Census: 10,631 MQ4G256V2, 10,240 MQ4G128V2, 31 Q8F16, 191 F16. Loads on gfx1201 only by default: it takes the int4-activation expert prefill (pp16000 18,587.9 tok/s on one R9700 at the 0.4.3 RC, registry text, not a live baseline; pp4096 543 ms vs 1,249 ms for .mq4r). That route's WT2 KLD vs the native-F32 parent is 0.129 (32 x 512 windows, q8 KV, prefill-whole) against 0.206 for .mq4r under the same harness. Other GPUs refuse the load; HIPFIRE_MOE_SYM_IU4=0 accepts the qt53 F32 prefill fallback, ~5x slower than the IU4 route on gfx1201 (2,735 vs 543 ms at pp4096). No MTP sidecar is registered for this file."
-    },
-    "qwen3.6:27b": {
-      "recommended_settings": {
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": 20,
-        "min_p": 0.0
-      },
-      "repo": "hipfire-models/qwen3.6-27b",
-      "file": "qwen3.6-27b.mq4",
-      "size_gb": 15.0,
-      "min_vram_gb": 16,
-      "default_kv_mode": "q8",
-      "desc": "44 tok/s AR / 185 tok/s w/ draft on code",
-      "triattn": {
-        "file": "qwen3.6-27b.mq4.triattn.blended_v3.bin"
-      },
-      "dflash": {
-        "file": "qwen36-27b-dflash-mq4.hfq"
-      }
+      "desc": "MQ4 symmetric-expert prefill SKU for gfx1100, gfx1151 and the R9700 (exact gfx1201), quantized from Qwen/Qwen3.6-35B-A3B@7da11034 with --format mq4 --uniform --mq4v2-symmetric --no-q8-router --moe-expert-down mq4g128v2-symmetric. Routed gate/up are symmetric MQ4G256V2 (qt44) and routed down is symmetric MQ4G128V2 (qt53); shared experts, attention, router and lm_head are MQ4G256V2, the embedding is Q8F16. Census: 10,631 MQ4G256V2, 10,240 MQ4G128V2, 31 Q8F16, 191 F16. Loads on gfx1100, gfx1151 and gfx1201 by default: it takes the int4-activation expert prefill (pp16000 18,587.9 tok/s on one R9700 at the 0.4.3 RC, registry text, not a live baseline; pp4096 543 ms vs 1,249 ms for .mq4r). That route's WT2 KLD vs the native-F32 parent is 0.129 on gfx1201, 0.126 on gfx1100 and 0.127 on gfx1151 (32 x 512 windows, q8 KV, prefill-whole) against 0.206 for .mq4r under the same harness. Prefill vs the fallback on gfx1100 / gfx1151: 3.25x / 3.37x at pp512 and 2.03x / 2.80x at pp16384. Other GPUs refuse the load; HIPFIRE_MOE_SYM_IU4=0 accepts the qt53 F32 prefill fallback, ~5x slower than the IU4 route on gfx1201 (2,735 vs 543 ms at pp4096). No MTP sidecar is registered for this file."
     },
     "qwen3.8:27b-mq3-xt": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1085,6 +1021,10 @@
           "reasoning_effort": "medium"
         }
       },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq5.hfq"
+      },
+      "dflash_min_vram_gb": 28,
       "mtp": {
         "file": "qwen3.8-27b.mtp",
         "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
@@ -1123,6 +1063,10 @@
           "reasoning_effort": "medium"
         }
       },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq5.hfq"
+      },
+      "dflash_min_vram_gb": 28,
       "mtp": {
         "file": "qwen3.8-27b.mtp",
         "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
@@ -1161,6 +1105,10 @@
           "reasoning_effort": "medium"
         }
       },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq5.hfq"
+      },
+      "dflash_min_vram_gb": 28,
       "mtp": {
         "file": "qwen3.8-27b.mtp",
         "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
@@ -1287,69 +1235,6 @@
       }
     },
     "qwen3.8:flash-next": {
-      "repo": "hipfire-models/qwen3.8-flash-next",
-      "file": "qwen3.8-flash-next-base.mq4-xts",
-      "size_gb": 70.9,
-      "min_vram_gb": 72,
-      "desc": "Qwen3.8-Flash-Next MQ4 XTS: the canonical Flash-Next rung since 2026-10-02, with 4-bit symmetric Hessian-GPTQ routed experts (Qwen4 HFQM, arch 16). Tiers (recipe r2): MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head; MQ4G256V2/MQ4G128V2 routed experts, solved on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Every non-expert tensor is byte-identical to the retired RTN-asymmetric rung (qwen3.8-flash-next.mq4). KLD vs the BF16 source (32 x 512 WikiText-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481 (RTN-asym: 0.0743 / 1.263 / 0.8936 / 5.537). Split base (70.9 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB, the default on gfx1151) or exact .ple-q8 (54.4 GB, the default elsewhere), so the download is about 100.0 GB with the q4 rows or 125.3 GB with the q8 rows. Every base tensor and the q8 rows are byte-identical to the earlier monolithic file (qwen3.8-flash-next.mq4-xts / qwen3.8-flash-next-gptq3.mq4, sha256 8b15b6fe), and a verified local copy of that file keeps loading under these tags without a download. Needs hipfire at or after a6f241ce2 (split-base PLE loader).",
-      "recommended_settings": {
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": 20
-      },
-      "ple": {
-        "q4": {
-          "file": "qwen3.8-flash-next.ple-q4"
-        },
-        "q8": {
-          "file": "qwen3.8-flash-next.ple-q8"
-        }
-      }
-    },
-
-    "qwen3.8:flash-next-mq4": {
-      "repo": "hipfire-models/qwen3.8-flash-next",
-      "file": "qwen3.8-flash-next-base.mq4-xts",
-      "size_gb": 70.9,
-      "min_vram_gb": 72,
-      "desc": "Qwen3.8-Flash-Next MQ4 XTS: the canonical Flash-Next rung since 2026-10-02, with 4-bit symmetric Hessian-GPTQ routed experts (Qwen4 HFQM, arch 16). Tiers (recipe r2): MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head; MQ4G256V2/MQ4G128V2 routed experts, solved on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Every non-expert tensor is byte-identical to the retired RTN-asymmetric rung (qwen3.8-flash-next.mq4). KLD vs the BF16 source (32 x 512 WikiText-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481 (RTN-asym: 0.0743 / 1.263 / 0.8936 / 5.537). Split base (70.9 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB, the default on gfx1151) or exact .ple-q8 (54.4 GB, the default elsewhere), so the download is about 100.0 GB with the q4 rows or 125.3 GB with the q8 rows. Every base tensor and the q8 rows are byte-identical to the earlier monolithic file (qwen3.8-flash-next.mq4-xts / qwen3.8-flash-next-gptq3.mq4, sha256 8b15b6fe), and a verified local copy of that file keeps loading under these tags without a download. Needs hipfire at or after a6f241ce2 (split-base PLE loader).",
-      "recommended_settings": {
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": 20
-      },
-      "ple": {
-        "q4": {
-          "file": "qwen3.8-flash-next.ple-q4"
-        },
-        "q8": {
-          "file": "qwen3.8-flash-next.ple-q8"
-        }
-      }
-    },
-
-    "qwen3.8:flash-next-gptq3": {
-      "repo": "hipfire-models/qwen3.8-flash-next",
-      "file": "qwen3.8-flash-next-base.mq4-xts",
-      "size_gb": 70.9,
-      "min_vram_gb": 72,
-      "desc": "Qwen3.8-Flash-Next MQ4 XTS: the canonical Flash-Next rung since 2026-10-02, with 4-bit symmetric Hessian-GPTQ routed experts (Qwen4 HFQM, arch 16). Tiers (recipe r2): MQ6G256V2 (qt47) on the 240 trunk attention/GDN projections and the language head; MQ4G256V2/MQ4G128V2 routed experts, solved on a 262,144-token calibration corpus disjoint from WikiText-2 (no AWQ fold; 553 of 25,088 experts keep RTN); Q8F16 (qt3) embedding, the MTP layer's five attention projections and the PLE n-gram rows; hyper-connection matrices, MoE router, shared expert, PLE projections and norms stay BF16. Every non-expert tensor is byte-identical to the retired RTN-asymmetric rung (qwen3.8-flash-next.mq4). KLD vs the BF16 source (32 x 512 WikiText-2, prefill route) 0.0661, p99 1.095, top-1 0.8995, PPL 5.481 (RTN-asym: 0.0743 / 1.263 / 0.8936 / 5.537). Split base (70.9 GB) with no PLE rows of its own: it loads them from the shared qwen3.8-flash-next.ple-q4 (29.1 GB, the default on gfx1151) or exact .ple-q8 (54.4 GB, the default elsewhere), so the download is about 100.0 GB with the q4 rows or 125.3 GB with the q8 rows. Every base tensor and the q8 rows are byte-identical to the earlier monolithic file (qwen3.8-flash-next.mq4-xts / qwen3.8-flash-next-gptq3.mq4, sha256 8b15b6fe), and a verified local copy of that file keeps loading under these tags without a download. Needs hipfire at or after a6f241ce2 (split-base PLE loader).",
-      "recommended_settings": {
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": 20
-      },
-      "ple": {
-        "q4": {
-          "file": "qwen3.8-flash-next.ple-q4"
-        },
-        "q8": {
-          "file": "qwen3.8-flash-next.ple-q8"
-        }
-      }
-    },
-
-    "qwen3.8:flash-next-mq4-xts": {
       "repo": "hipfire-models/qwen3.8-flash-next",
       "file": "qwen3.8-flash-next-base.mq4-xts",
       "size_gb": 70.9,
@@ -1568,7 +1453,7 @@
       "file": "qwen3.5-2b.mq4",
       "size_gb": 1.29,
       "min_vram_gb": 2.8,
-      "desc": "2B, HF4 (legacy 4-bit format)",
+      "desc": "2B, MQ4 (MQ4G256 v1)",
       "quant_recipe": "v3-awq-f1"
     },
     "qwen3.5:2b-hf6": {
@@ -1619,19 +1504,6 @@
       "size_gb": 0.92,
       "min_vram_gb": 16,
       "desc": "DFlash draft for qwen3.5:27b — pairs with target for 4× decode on code (212 tok/s peak)"
-    },
-    "qwen3.6:27b-draft": {
-      "recommended_settings": {
-        "temperature": 1.0,
-        "top_p": 0.95,
-        "top_k": 20,
-        "min_p": 0.0
-      },
-      "repo": "hipfire-models/qwen3.6-27b",
-      "file": "qwen36-27b-dflash-mq4.hfq",
-      "size_gb": 0.92,
-      "min_vram_gb": 16,
-      "desc": "DFlash draft for qwen3.6:27b — pairs with target for ~4× decode on code (refreshed 2026-04-27 from z-lab@0919688)"
     },
     "decider:4b": {
       "repo": "hipfire-models/decider-4b",
@@ -1721,7 +1593,7 @@
       "file": "lfm2.5-350m.q8",
       "size_gb": 0.38,
       "min_vram_gb": 1.9,
-      "desc": "LFM2.5 350M dense (MQ4, embedded chat template)",
+      "desc": "LFM2.5 350M dense (Q8F16, embedded chat template)",
       "quant_recipe": "q8"
     },
     "lfm2.5:8b-a1b": {
@@ -1737,7 +1609,7 @@
       "file": "lfm2.5-1.2b.mq4",
       "size_gb": 0.7,
       "min_vram_gb": 2.2,
-      "desc": "LFM2.5 1.2B Instruct dense (Q8, embedded chat template)",
+      "desc": "LFM2.5 1.2B Instruct dense (MQ4, embedded chat template)",
       "quant_recipe": "v3-awq-f1"
     },
     "lfm2.5:1.2b-thinking": {
@@ -1745,7 +1617,7 @@
       "file": "lfm2.5-1.2b-thinking.mq4",
       "size_gb": 0.7,
       "min_vram_gb": 2.2,
-      "desc": "LFM2.5 1.2B Thinking dense (Q8, reasoning)",
+      "desc": "LFM2.5 1.2B Thinking dense (MQ4, reasoning)",
       "quant_recipe": "v3-awq-f1"
     },
     "raon-1-mini-preview": {
@@ -2062,7 +1934,7 @@
       "size_gb": 23.8,
       "min_vram_gb": 24,
       "arch_id": 40,
-      "desc": "FLUX.1-dev MMDiT trunk as per-component HFQ packs (arch 40; sidecars arch 41 T5-XXL / 42 CLIP-L / 43 VAE). Guidance-distilled: 28 default steps (guidance_embed_dim 128). LOCAL-ONLY PLACEHOLDER: FLUX.1-dev is NCL and cannot be redistributed; dev packs are never uploaded to the Hub, so digest fields stay TBD."
+      "desc": "FLUX.1-dev MMDiT trunk as per-component HFQ packs (arch 40; sidecars arch 41 T5-XXL / 42 CLIP-L / 43 VAE). Guidance-distilled: 28 default steps (guidance_embed_dim 128). NOT CURRENTLY DOWNLOADABLE: the hipfire-models/flux repo was never published (HTTP 404 even for org members), so this row has no sha256 or size and pull fails. FLUX.1-dev is NCL and cannot be redistributed; place locally built dev packs in the models directory by hand."
     },
     "embeddinggemma-2:q8f16": {
       "repo": "",
@@ -2091,6 +1963,44 @@
       "desc": "EmbeddingGemma 2 (`google/embeddinggemma-2`) single-vector embedding encoder (arch 18): 24 bidirectional Gemma-4-family layers (sliding/full 5:1, per-layer head_dim/KV overrides, half-split RoPE, projection-only PLE, sandwich norms, `layer_scalar`), mean pool + L2 into the 768-d `embedding_projection`, Matryoshka 768/512/256/128 via the request's `dims`. **Not a chat model** — no LM head, served only through the non-chat `embed` verb (`hipfire embed`, `POST /v1/embeddings`). Text, image, audio and video: the checkpoint's vision and audio towers ride the `<trunk-stem>.vl` pack declared in `vision`, and the video leg drives that same vision tower per frame (no extra weights). Tower VRAM follows `vision_mode`, which defaults to `auto` (the pack is loaded and media served; `vision_mode=off` keeps the load text-only, media refused per modality). LOCAL-ONLY staged artifact, NOT uploaded/pullable: produced with `hipfire-quantize --input <google/embeddinggemma-2 snapshot> --output <this file> --format mq4v2`, which writes the tower pack beside it; place both in the models directory. The digests are of the bytes that command reproduced, so a re-quantized artifact carries different ones. Parity against a float32 CPU transformers 5.19.0 reference (2e-2 rel-L2 band, `scripts/check_embeddinggemma2_parity.py`): text 2.2e-4-1.0e-3, images 2.7e-4-3.1e-3, audio 2.4e-4-2.6e-3, video 3.1e-4-4.9e-3 on the raw checkpoint; on this mq4v2 trunk the worst fixture is 2.75e-1 against its 5e-1 band, and `scripts/check_embeddinggemma2_multislot.py` is bit-identical to the sequential route with mixed media in one batched forward.",
       "sha256": "793e692303905fe54d3f65db7f0fe7d79bc07390f399a76a6aa6ef416819cc07",
       "size_bytes": 253110320
+    },
+    "lightonocr3:0.8b": {
+      "repo": "",
+      "file": "lightonocr3-0.8b.mq4",
+      "vision": {
+        "file": "lightonocr3-0.8b.vl",
+        "sha256": "708c7b798b075c3b6f1a2c50b0d4fca3ffd4eebb8ff220baadcb5762360e9079",
+        "size_bytes": 227722240
+      },
+      "size_gb": 0.56,
+      "min_vram_gb": 2,
+      "desc": "LightOnOCR-3-0.8B (`lightonai/LightOnOCR-3-0.8B`) — Apache-2.0 document-OCR VLM on the Qwen3.5-VL architecture (arch 5): 24 hybrid layers (18 DeltaNet `linear_attention` + 6 `full_attention` every 4th), 1024d, tied 248320 vocab, plus the `model.visual.*` patch-16 ViT tower on the `<trunk>.vl` sidecar (F16). Prompt modes per the model card: empty prompt = transcription, `grounding` = labelled bounding boxes. Trained/evaluated with thinking disabled — the card's `enable_thinking=false`, temp 0.2, top_p 0.9 are the lowered recommended_settings. The tower loads automatically: `vision_mode` defaults to `auto`, so the `<stem>.vl` sibling beside the trunk serves image turns; `hipfire config lightonocr3:0.8b set vision.mode off` is the text-only opt-out. LOCAL-ONLY until an HF pack ships — `hipfire pull` refuses by design (place the trunk + `.vl` in the models dir, or catalog them via models.toml).",
+      "recommended_settings": {
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "reasoning_effort": "none"
+      },
+      "sha256": "578bc68062822f960823d5fe987ea1e5125d3e56b81f489ef27e2e877a1189c0",
+      "size_bytes": 557869696
+    },
+    "lightonocr3:0.8b-q8": {
+      "repo": "",
+      "file": "lightonocr3-0.8b.q8",
+      "vision": {
+        "file": "lightonocr3-0.8b.vl",
+        "sha256": "708c7b798b075c3b6f1a2c50b0d4fca3ffd4eebb8ff220baadcb5762360e9079",
+        "size_bytes": 227722240
+      },
+      "size_gb": 0.82,
+      "min_vram_gb": 2,
+      "desc": "LightOnOCR-3-0.8B (`lightonai/LightOnOCR-3-0.8B`) — the Q8 trunk tier (all weights Q8 interleaved, embed/norms F16; 0.77 GiB) of the same document-OCR VLM as `lightonocr3:0.8b`, paired with the same F16 vision-tower pack `lightonocr3-0.8b.vl`. Highest-fidelity tier: use when OCR accuracy over latency is the priority. Same card modes and recommended_settings as the MQ4 tier; the same `vision.mode auto` default serves image turns. LOCAL-ONLY — `hipfire pull` refuses by design.",
+      "recommended_settings": {
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "reasoning_effort": "none"
+      },
+      "sha256": "8fa2093744a69d67b553875bcc1695fd039665938bcddaa29072005639fc2a4e",
+      "size_bytes": 822227584
     }
   },
   "aliases": {
@@ -2107,9 +2017,13 @@
     "qwen3.5:large": "qwen3.5:27b",
     "qwen3.6": "qwen3.6:35b-a3b",
     "qwen3.6:a3b": "qwen3.6:35b-a3b",
+    "qwen3.6:35b-a3b-mq4p": "qwen3.6:35b-a3b",
     "qwen3.8": "qwen3.8:27b",
     "qwen3.8:latest": "qwen3.8:27b",
     "qwen3.8:flash": "qwen3.8:flash-next",
+    "qwen3.8:flash-next-mq4": "qwen3.8:flash-next",
+    "qwen3.8:flash-next-gptq3": "qwen3.8:flash-next",
+    "qwen3.8:flash-next-mq4-xts": "qwen3.8:flash-next",
     "qwen3.8:fast": "qwen3.8:27b-mq4-xt",
     "qwen3.8:27b-fast": "qwen3.8:27b-mq4-xt",
     "qwen3.8:27b-mq4": "qwen3.8:27b",
@@ -2165,10 +2079,8 @@
     "qwopus:27b-mq4": "qwopus:27b",
     "qwen3.5-9b:draft": "qwen3.5:9b-draft",
     "qwen3.5-27b:draft": "qwen3.5:27b-draft",
-    "qwen3.6-27b:draft": "qwen3.6:27b-draft",
     "qwen3.5:9b:draft": "qwen3.5:9b-draft",
     "qwen3.5:27b:draft": "qwen3.5:27b-draft",
-    "qwen3.6:27b:draft": "qwen3.6:27b-draft",
     "qwen3.5:2b-mq4": "qwen3.5:2b",
     "vibethinker": "vibethinker:3b",
     "muse-glimmer:latest": "muse-glimmer",
@@ -2178,6 +2090,9 @@
     "muse-glimmer:30b:draft": "muse-glimmer:draft",
     "muse-glimmer-30b:draft": "muse-glimmer:draft",
     "embeddinggemma-2": "embeddinggemma-2:q8f16",
-    "embeddinggemma": "embeddinggemma-2:q8f16"
+    "embeddinggemma": "embeddinggemma-2:q8f16",
+    "lightonocr3": "lightonocr3:0.8b",
+    "lightonocr3:0.8b-mq4": "lightonocr3:0.8b",
+    "lightonocr3:q8": "lightonocr3:0.8b-q8"
   }
 }

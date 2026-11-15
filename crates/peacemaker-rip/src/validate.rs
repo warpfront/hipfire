@@ -22,17 +22,17 @@ thread_local! {
     static TEXTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
-const CDNA_UNSUPPORTED: &str =
-    "the .rip front end lowers onto the RDNA builder; gfx942 kernels use peacemaker_isa::cdna";
+#[path = "validate_cdna.rs"]
+mod cdna;
 
-/// The RDNA IR architecture for `arch`; CDNA has no `.rip` lowering, so it is refused.
+/// The RDNA IR architecture. CDNA uses its typed codec and footprints instead.
 fn ir_arch(arch: Arch) -> Result<IrArch, String> {
     match arch {
         Arch::Gfx1100 => Ok(IrArch::Gfx1100),
         Arch::Gfx1151 => Ok(IrArch::Gfx1151),
         Arch::Gfx1201 => Ok(IrArch::Gfx1201),
         Arch::Gfx1200 => Err("the .rip front end has no gfx1200 builder target".into()),
-        Arch::Gfx942 => Err(CDNA_UNSUPPORTED.into()),
+        Arch::Gfx942 => Err("CDNA instructions use the CDNA codec".into()),
     }
 }
 
@@ -155,6 +155,9 @@ fn builder_reg(reg: &peacemaker_ir::reg::RegRef) -> Option<RegRef> {
 /// Register effects from the target opcode table, excluding special registers
 /// and TTMPs. Returns (definitions, uses), retaining operand order and widths.
 pub fn effects(arch: Arch, text: &str) -> Result<(Vec<RegRef>, Vec<RegRef>), String> {
+    if arch == Arch::Gfx942 {
+        return cdna::effects(text);
+    }
     let ir = ir_arch(arch)?;
     let inst = parse(arch, ir, text)?;
     let effects = table_effects(ir, &inst).map_err(|e| malformed(arch, text, e))?;
@@ -181,7 +184,11 @@ fn source_list(declared: &[RegRef], actual: &[RegRef]) -> String {
     let entries = corrected
         .iter()
         .map(|reg| {
-            let prefix = if reg.kind == Kind::V { "v" } else { "s" };
+            let prefix = match reg.kind {
+                Kind::V => "v",
+                Kind::S => "s",
+                Kind::A => "a",
+            };
             if reg.len == 1 {
                 format!("{prefix}({})", reg.base)
             } else {
@@ -197,27 +204,42 @@ fn source_list(declared: &[RegRef], actual: &[RegRef]) -> String {
 /// effects that omit any table effect under the overlap rule above.
 /// Labels and typed branches belong to the driver, not this entry point.
 pub fn instruction(arch: Arch, text: &str, defs: &[RegRef], uses: &[RegRef]) -> Result<(), String> {
-    let ir = ir_arch(arch)?;
-    let inst = parse(arch, ir, text)?;
-    let encoded = if arch.gfx12() {
-        peacemaker_ir::codec::gfx12::encode(&inst)
+    if arch == Arch::Gfx942 {
+        cdna::instruction(text, defs, uses)?;
     } else {
-        peacemaker_ir::codec::gfx11::encode(ir, &inst)
-    };
-    encoded.map_err(|e| malformed(arch, text, e))?;
-    // parse_line already constructs Effects::from_table (including both VOPD
-    // halves). Reuse that result instead of recomputing effects on every op.
-    let effects = &inst.effects;
-    let missing_defs: Vec<_> = effects
-        .defs
-        .iter()
-        .filter_map(builder_reg)
+        let ir = ir_arch(arch)?;
+        let inst = parse(arch, ir, text)?;
+        let encoded = if arch.gfx12() {
+            peacemaker_ir::codec::gfx12::encode(&inst)
+        } else {
+            peacemaker_ir::codec::gfx11::encode(ir, &inst)
+        };
+        encoded.map_err(|e| malformed(arch, text, e))?;
+        declared_effects(
+            text,
+            defs,
+            uses,
+            inst.effects.defs.iter().filter_map(builder_reg),
+            inst.effects.uses.iter().filter_map(builder_reg),
+        )?;
+    }
+    TEXTS.with(|texts| texts.borrow_mut().push(text.to_owned()));
+    Ok(())
+}
+
+fn declared_effects(
+    text: &str,
+    defs: &[RegRef],
+    uses: &[RegRef],
+    actual_defs: impl IntoIterator<Item = RegRef>,
+    actual_uses: impl IntoIterator<Item = RegRef>,
+) -> Result<(), String> {
+    let missing_defs: Vec<_> = actual_defs
+        .into_iter()
         .filter(|&reg| !defs.iter().any(|&declared| declared.overlaps(reg)))
         .collect();
-    let missing_uses: Vec<_> = effects
-        .uses
-        .iter()
-        .filter_map(builder_reg)
+    let missing_uses: Vec<_> = actual_uses
+        .into_iter()
         .filter(|&reg| !uses.iter().any(|&declared| declared.overlaps(reg)))
         .collect();
     if !missing_defs.is_empty() || !missing_uses.is_empty() {
@@ -238,7 +260,6 @@ pub fn instruction(arch: Arch, text: &str, defs: &[RegRef], uses: &[RegRef]) -> 
         );
         return Err(message);
     }
-    TEXTS.with(|texts| texts.borrow_mut().push(text.to_owned()));
     Ok(())
 }
 
@@ -385,7 +406,6 @@ pub(crate) fn emitted(
     text: &str,
     sites: Vec<(String, String)>,
 ) -> Result<(), Vec<String>> {
-    let arch_ir = ir_arch(arch).map_err(|reason| vec![reason])?;
     let bytes = peacemaker_isa::native::assemble(text, arch).map_err(|reason| {
         let at = sites
             .iter()
@@ -394,6 +414,10 @@ pub(crate) fn emitted(
             .unwrap_or_default();
         vec![format!("{at}assemble: {reason}")]
     })?;
+    if arch == Arch::Gfx942 {
+        return cdna::emitted(&bytes, sites);
+    }
+    let arch_ir = ir_arch(arch).map_err(|reason| vec![reason])?;
     let lifted = peacemaker_lift::lift_object(
         &bytes,
         peacemaker_lift::Options {

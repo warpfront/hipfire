@@ -333,13 +333,15 @@ pub struct DeepseekV4Config {
     /// `speculation.mtp = auto` on this producer (no measured AR floor) leaves
     /// the layer unloaded so ordinary AR keeps its memory; explicit `on` loads
     /// it. Defaults to `true` for directly-driven loaders (examples, oracles).
-    /// `HIPFIRE_DEEPSEEK4_LOAD_MTP=0` still skips it. Not (de)serialized.
+    /// Not (de)serialized.
     #[serde(skip)]
     pub load_mtp: bool,
 
-    /// DeepSeek V4 routed-MQ2 product-family selector. This is derived from an
-    /// exact `.mq2r`/`.mq2rxt` artifact identity and is never inferred from a
-    /// tensor dtype, so MQ2-Lloyd keeps its established runtime defaults. The
+    /// DeepSeek V4 routed-MQ2 product-family selector. This is derived from the
+    /// artifact's identity (the HFQ route metadata or recipe key, or the exact
+    /// MQ2R P3 tensor map, `hipfire_runtime::route_sku`; MQ2RXT by its recipe
+    /// key), never from the file name, so MQ2-Lloyd keeps its established
+    /// runtime defaults. The
     /// family shares routed-expert, route-scale, HC, and indexer policy; dense
     /// dtype validation remains SKU-specific. Not serialized upstream.
     #[serde(skip)]
@@ -427,26 +429,19 @@ impl DeepseekV4Config {
             .ok_or_else(|| "deepseek4: metadata_json missing `config` wrapper".to_string())?;
         let raw: RawDeepseekV4Config = serde_json::from_value(inner.clone())
             .map_err(|e| format!("deepseek4: parsing inner config failed: {e}"))?;
-        let mq2rxt = hfq
-            .path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2rxt"))
-            || wrapper
-                .get("hipfire_quant_recipe")
-                .and_then(|value| value.as_str())
-                .is_some_and(|recipe| recipe == "deepseek4-mq2rxt-mq4-p3-v1");
-        // lifecycle: deprecated since 0.4.0, removal 0.5.0 — DS4 MQ2R selection by file extension; 0.5.0 selects by HFQ metadata (no runtime warning: only way to reach the route today)
+        let mq2rxt = wrapper
+            .get("hipfire_quant_recipe")
+            .and_then(|value| value.as_str())
+            .is_some_and(|recipe| recipe == "deepseek4-mq2rxt-mq4-p3-v1");
+        // MQ2R is selected by the file's identity, never by its name: the
+        // HFQ route metadata / recipe identity, or the exact MQ2R P3 tensor
+        // map in the tensor index (hipfire_runtime::route_sku). A file that
+        // carries E8 tensors without the exact recipe fails here.
         let mq2r = mq2rxt
-            || hfq
-                .path()
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
-            || wrapper
-                .get("hipfire_quant_recipe")
-                .and_then(|value| value.as_str())
-                .is_some_and(|recipe| recipe == "deepseek4-mq2r-e8-p3-v1");
+            || hipfire_runtime::route_sku::header_route(&hfq.metadata_json)?
+                == Some(hipfire_runtime::route_sku::RouteSku::Mq2r)
+            || hipfire_runtime::route_sku::structural_route(hfq)?
+                == Some(hipfire_runtime::route_sku::RouteSku::Mq2r);
         let mut config = DeepseekV4Config {
             vocab_size: raw.vocab_size,
             hidden_size: raw.hidden_size,
@@ -722,8 +717,8 @@ pub struct DeepseekV4LayerWeights {
     pub compressor_ape: Option<rdna_compute::GpuTensor>, // [ratio, coff*head_dim]
     /// F16-native copies of the compressor projections for the WMMA
     /// GEMM path. Same data as `compressor_w{kv,gate}` but stored as
-    /// F16 bytes directly (no F32 decode). Populated when
-    /// `HIPFIRE_DEEPSEEK4_COMP_F16_WMMA` is enabled at load time.
+    /// F16 bytes directly (no F32 decode). Populated when the source tensor
+    /// is F16.
     pub compressor_wkv_f16: Option<rdna_compute::GpuTensor>,
     pub compressor_wgate_f16: Option<rdna_compute::GpuTensor>,
 
@@ -1360,7 +1355,7 @@ impl DeepseekV4Weights {
                 panic!(
                     "DeepseekV4Weights::resolve_layer({idx}) — \
                      idx points at the MTP slot but mtp_layer is None. \
-                     Either set HIPFIRE_DEEPSEEK4_LOAD_MTP=1 and use a model \
+                     Either load with speculation.mtp enabled and use a model \
                      quantized with MTP, or stop calling mtp_forward."
                 )
             })

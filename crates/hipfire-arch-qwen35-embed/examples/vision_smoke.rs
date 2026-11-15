@@ -57,7 +57,7 @@ fn main() -> Result<(), String> {
     let mut gpu = Gpu::init().map_err(|e| format!("gpu: {e:?}"))?;
     println!("gpu: {}", gpu.arch);
 
-    let weights = load_vision_weights(&mut gpu, st, &cfg)?;
+    let weights = load_vision_weights(&mut gpu, &src, &cfg)?;
     let (f, t) = gpu.hip.get_vram_info().unwrap_or((0, 0));
     println!(
         "tower weights loaded; VRAM {} MB free / {} MB",

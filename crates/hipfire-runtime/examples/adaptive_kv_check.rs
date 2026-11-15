@@ -168,7 +168,7 @@ fn max_cnorm(gpu: &Gpu, kv: &KvCache, bits: usize) -> f32 {
 /// Make a fresh fwht3 cache (3 layers, all real KV layers).
 fn make_cache(gpu: &mut Gpu) -> KvCache {
     let is_kv = vec![true; N_LAYERS];
-    KvCache::new_gpu_fwht3_filtered(gpu, &is_kv, N_KV_HEADS, HEAD_DIM, MAX_SEQ).unwrap()
+    KvCache::new_gpu_fwht3_filtered(gpu, &is_kv, N_KV_HEADS, HEAD_DIM, MAX_SEQ, VMode::Q8).unwrap()
 }
 
 /// Write the deterministic source into every layer's V buffer via the q8 path.
@@ -254,7 +254,7 @@ fn write_lloyd(gpu: &mut Gpu, kv: &KvCache, bits: usize) {
 /// at the fwht4 footprint (132 B/head @256); 128-wide FWHT signs (seeds 42/1042).
 fn make_k_cache(gpu: &mut Gpu) -> KvCache {
     let is_kv = vec![true; N_LAYERS];
-    KvCache::new_gpu_fwht4_filtered(gpu, &is_kv, N_KV_HEADS, HEAD_DIM, MAX_SEQ).unwrap()
+    KvCache::new_gpu_fwht4_filtered(gpu, &is_kv, N_KV_HEADS, HEAD_DIM, MAX_SEQ, VMode::Q8).unwrap()
 }
 
 /// Write the deterministic source into every layer's K buffer via the fused
@@ -754,8 +754,15 @@ fn main() {
         // Reference cache: a fwht3 (256-wide) cache written DIRECTLY at fwht3
         // over the same source.
         let is_kv = vec![true; N_LAYERS];
-        let refc = KvCache::new_gpu_fwht3_filtered(&mut gpu, &is_kv, N_KV_HEADS, HEAD_DIM, MAX_SEQ)
-            .unwrap();
+        let refc = KvCache::new_gpu_fwht3_filtered(
+            &mut gpu,
+            &is_kv,
+            N_KV_HEADS,
+            HEAD_DIM,
+            MAX_SEQ,
+            VMode::Q8,
+        )
+        .unwrap();
         write_k_fwht3(&mut gpu, &refc, N_LAYERS);
         gpu.hip.device_synchronize().unwrap();
 

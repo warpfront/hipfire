@@ -820,9 +820,13 @@ impl<'a> Emulator<'a> {
         }
         let arch = program.target.arch;
         let step = |inst: &'a Inst, va: Option<u64>, extent: usize| -> Result<Step<'a>> {
-            let name = crate::isa::lookup(arch, inst.op, inst.form)
-                .ok_or("unknown decoded opcode")?
-                .name;
+            let name = crate::isa::lookup_inst(arch, inst)?.name;
+            if let Some(variant) = inst.variant {
+                return Err(format!(
+                    "no qualified numeric semantics for {name} encoding {} condition {}",
+                    variant.encoding, variant.condition
+                ));
+            }
             let class =
                 match semantic_class(name).ok_or_else(|| format!("no semantics for {name}"))? {
                     "wait" => Class::Wait,
@@ -1319,10 +1323,11 @@ mod tests {
     }
     fn insn(name: &str, operands: Vec<Operand>) -> Inst {
         let row = crate::isa::gfx12().iter().find(|r| r.name == name).unwrap();
-        Inst::from_parts(
+        Inst::from_encoding(
             Arch::Gfx1201,
             row.op,
             row.form,
+            row.variant,
             Default::default(),
             operands.into_iter().collect(),
             Default::default(),
@@ -2136,10 +2141,11 @@ mod tests {
         for (c, n) in waits {
             w.per_counter[*c as usize] = Some(*n);
         }
-        Inst::from_parts(
+        Inst::from_encoding(
             Arch::Gfx1201,
             row.op,
             row.form,
+            row.variant,
             Default::default(),
             [Operand::Imm(ImmField::Sopp(0))].into_iter().collect(),
             crate::operand::Modifiers {

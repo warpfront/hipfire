@@ -14,6 +14,14 @@
 //! workspace. Product code and sampled coverage, identity and law assertions
 //! are unchanged.
 //!
+//! A model with a `<model>.mtp` sidecar (the stock-FP8 artifact, whose native
+//! head lives there) loads through the oracle recipe
+//! (`common/stock_mtp_load.rs`: the sidecar bound at admission, `attach_mtp`;
+//! a standalone load, the product loader admits the head on gfx942 too). On gfx942 (no GDN row capture, no cost table yet) run the
+//! MTP arms under `HIPFIRE_QWEN4_MTP_G942_DEPTH=<1..7>` (a forced fixed depth;
+//! `interleaved` still takes the interleaved route) with
+//! `HIPFIRE_G942_TRUNK_GEMV` unset.
+//!
 //! The serve battery's prose prompt (thinking off, rendered as `hipfire
 //! serve` renders one user message) is decoded from a cold state
 //! `HIPFIRE_SAMPLED_MTP_TRIALS` times (default 2000) per arm, each trial with
@@ -45,9 +53,9 @@
 //! `HIPFIRE_SAMPLED_MTP_OUT`; an arm whose `<arm>.ids.json` is already there
 //! is reused, so the arms can run first as separate time-boxed invocations of
 //! `sampled_mtp_distribution_arm` (set `HIPFIRE_SAMPLED_MTP_ARM`,
-//! `HIPFIRE_MTP_SAMPLED=1`, `HIPFIRE_MTP_SAMPLED_MODE=leviathan` and the arm's
+//! `HIPFIRE_MTP_SAMPLED_MODE=leviathan` and the arm's
 //! route knobs yourself: every arm checks it already runs under its
-//! environment and fails naming the variable otherwise). Every arm runs the
+//! environment and fails otherwise). Every arm runs the
 //! speculative-rejection-sampling (Leviathan) verifier explicitly; the naive
 //! verifier has its own test below.
 //!
@@ -168,7 +176,7 @@
 //! ```sh
 //! export HIPFIRE_MTP_IDENTITY_MODEL="$MODEL" HIPFIRE_SAMPLED_MTP_OUT="$OUT"
 //! export HIPFIRE_SAMPLED_MTP_TRIALS=2000 HIPFIRE_SAMPLED_MTP_PROMPT=prose
-//! export HIPFIRE_MTP_SAMPLED=1 HIPFIRE_MTP_SAMPLED_MODE=leviathan
+//! export HIPFIRE_MTP_SAMPLED_MODE=leviathan
 //! unset HIPFIRE_MTP_TRACE HIPFIRE_MTP_PHASE_TIMING
 //! # Repeat START..END ranges to cover 0..2000 for EACH arm.
 //! export HIPFIRE_SAMPLED_MTP_SHARD=0..10
@@ -299,7 +307,7 @@
 //! export HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2
 //! # export HIPFIRE_PP_LAYERS=24,24      # optional band split, logical band order
 //! export HIPFIRE_SAMPLED_MTP_TRIALS=2000 HIPFIRE_SAMPLED_MTP_PROMPT=prose
-//! export HIPFIRE_MTP_SAMPLED=1 HIPFIRE_MTP_SAMPLED_MODE=leviathan
+//! export HIPFIRE_MTP_SAMPLED_MODE=leviathan
 //! unset HIPFIRE_MTP_TRACE HIPFIRE_MTP_PHASE_TIMING HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS
 //! T="cargo test --release -p hipfire-arch-qwen4 --test sampled_mtp_distribution_hw"
 //! # Per arm, per shard (disjoint START..END ranges covering 0..2000; seeds are global):
@@ -461,6 +469,8 @@ use std::process::{Command, Stdio};
 
 #[path = "common/hw_identity.rs"]
 mod hw_identity;
+#[path = "common/stock_mtp_load.rs"]
+mod stock_mtp_load;
 use hw_identity::Counters;
 #[path = "common/lane_ep.rs"]
 mod lane_ep;
@@ -1068,15 +1078,56 @@ struct Loaded {
     tokenizer: Tokenizer,
     template: String,
     state: String,
+    /// The native MTP head is already attached (the product loader does it).
+    mtp_attached: bool,
 }
 
 fn load(model: &Path) -> Result<Loaded, String> {
     load_with_max_seq(model, MAX_SEQ)
 }
 
+/// A stock-FP8 `model` with its `<model>.mtp` head sidecar, loaded through the
+/// oracle recipe ([`stock_mtp_load`]): forward resources and the native MTP
+/// head attached, sized for `max_seq`.
+fn load_stock_mtp(model: &Path, max_seq: usize) -> Result<Loaded, String> {
+    let (tokenizer, template) = {
+        let hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
+        (
+            Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?,
+            hfq.chat_template().ok_or("artifact has no chat template")?,
+        )
+    };
+    hipfire_loader::prepare_host_memory_for(model);
+    let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    let (state_request, want_gdn) = hw_identity::gdn_test_state_quant()?;
+    let bundle = stock_mtp_load::load_stock_mtp_bundle(&mut gpu, model, max_seq, state_request)?;
+    let state_format = bundle.state_format();
+    if state_format.gdn != want_gdn {
+        return Err(format!(
+            "{}={state_request} resolved to GDN state {:?}, expected {want_gdn:?}",
+            hw_identity::GDN_TEST_STATE_QUANT_ENV,
+            state_format.gdn
+        ));
+    }
+    Ok(Loaded {
+        gpu,
+        bundle,
+        tokenizer,
+        template,
+        state: format!(
+            "state_quant={state_request} gdn_format={} {state_format:?}",
+            state_format.gdn.name()
+        ),
+        mtp_attached: true,
+    })
+}
+
 /// [`load`] with the context (`max_seq`) the forward, the native-MTP reserve
 /// and the assembled bundle are sized for.
 fn load_with_max_seq(model: &Path, max_seq: usize) -> Result<Loaded, String> {
+    if stock_mtp_load::has_stock_mtp_sidecar(model) {
+        return load_stock_mtp(model, max_seq);
+    }
     let mut hfq = HfqFile::open(model).map_err(|e| e.to_string())?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?;
     let template = hfq.chat_template().ok_or("artifact has no chat template")?;
@@ -1296,6 +1347,7 @@ fn load_with_max_seq(model: &Path, max_seq: usize) -> Result<Loaded, String> {
         bundle,
         tokenizer,
         template,
+        mtp_attached: false,
         state: format!(
             "state_quant={state_request} gdn_format={} {state_format:?}",
             state_format.gdn.name()
@@ -1534,15 +1586,17 @@ fn new_drafter_with_max_seq(
     copy_lane: bool,
     max_seq: usize,
 ) -> Result<Qwen4MtpDrafter, String> {
-    loaded
-        .bundle
-        .attach_mtp(&mut loaded.gpu, max_seq)
-        .map_err(|e| e.to_string())?;
+    if !loaded.mtp_attached {
+        loaded
+            .bundle
+            .attach_mtp(&mut loaded.gpu, max_seq)
+            .map_err(|e| e.to_string())?;
+    }
     let drafter = Qwen4MtpDrafter::new(MTP_K, max_seq, None)
         .with_ngram(ngram)
         .with_copy_lane(copy_lane);
     if !drafter.supports_temp_verify() {
-        return Err("HIPFIRE_MTP_SAMPLED did not enable sampled verification".into());
+        return Err("drafter does not advertise sampled verification".into());
     }
     Ok(drafter)
 }
@@ -1771,7 +1825,6 @@ impl PpLoaded {
             .ok_or_else(|| format!("{} is not valid UTF-8", model.display()))?;
         let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
         let (state_request, _) = hw_identity::gdn_test_state_quant()?;
-        let cask = hipfire_runtime::loader_api::CaskConfig::default();
         let mut spec = hipfire_runtime::loader_api::SpecLoadCfg::default();
         // The native head is attached on every arm so placement and reserves
         // are identical across the arms of one comparison.
@@ -1783,7 +1836,6 @@ impl PpLoaded {
             None,
             None,
             Some(state_request),
-            &cask,
             PP_DEGREE,
             spec,
             &mut gpu,
@@ -1806,7 +1858,7 @@ impl PpLoaded {
         {
             let drafter = pp_drafter(speculator.as_mut())?;
             if !drafter.supports_temp_verify() {
-                return Err("HIPFIRE_MTP_SAMPLED did not enable sampled verification".into());
+                return Err("drafter does not advertise sampled verification".into());
             }
             if drafter.sampled_mode_is_naive() {
                 return Err(
@@ -2467,7 +2519,6 @@ fn arm_route(arm: &str) -> Option<&'static str> {
 /// unset (floor on, no forced route).
 fn arm_overrides(arm: &str, mode: &'static str) -> Vec<(&'static str, Option<&'static str>)> {
     let mut overrides: Vec<(&'static str, Option<&'static str>)> = vec![
-        ("HIPFIRE_MTP_SAMPLED", Some("1")),
         (SAMPLED_MODE_ENV, Some(mode)),
         ("HIPFIRE_MTP_TRACE", None),
         ("HIPFIRE_MTP_PHASE_TIMING", None),

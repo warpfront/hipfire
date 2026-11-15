@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Interactive REPL for hipfire — like `ollama run`.
-//! Usage: hipfire-run <model.hfq> [--system "prompt"] [--kv givens4|givens2]
+//! Usage: hipfire-run <model.hfq> [--system "prompt"] [--kv q8]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -49,7 +49,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: run <model.hfq> [--draft-model <path>] [--system \"prompt\"] [--kv givens4|givens2] [--temp F] [--max-seq N] [--fp32-state|--q8-state|--q4-state]");
+        eprintln!("Usage: run <model.hfq> [--draft-model <path>] [--system \"prompt\"] [--kv q8] [--temp F] [--max-seq N] [--fp32-state|--q8-state|--q4-state]");
         std::process::exit(1);
     }
     let model_path = &args[1];

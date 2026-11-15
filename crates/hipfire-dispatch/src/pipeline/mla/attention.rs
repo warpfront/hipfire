@@ -51,7 +51,6 @@ pub trait LatentAttentionBackend {
         k_buf: &GpuTensor,
         n_idx_heads: i32,
         max_k: i32,
-        bounded: bool,
     ) -> Result<bool, String>;
 }
 
@@ -76,8 +75,8 @@ pub enum IndexTopK<'a> {
         ws_scores: &'a GpuTensor,
         ws_indices: &'a GpuTensor,
     },
-    /// The owner's parallel kernel, else the portable one.
-    BackendParallel { bounded: bool, wide: bool },
+    /// The owner's parallel (bounded) kernel, else the portable one.
+    BackendParallel { wide: bool },
     /// The portable one-launch kernel (`wide` = gfx1151/gfx1201 variant).
     Portable { wide: bool },
 }
@@ -300,7 +299,7 @@ fn execute_decode_indexer(gpu: &mut Gpu, op: &SparseIndexOp<'_>) -> Result<(), D
                 )
                 .map_err(|e| hip_err(format!("idx top_k two-stage l{layer}"), e));
         }
-        IndexTopK::BackendParallel { bounded, wide } => {
+        IndexTopK::BackendParallel { wide } => {
             if backend
                 .try_indexer_top_k_buf_parallel(
                     gpu,
@@ -310,7 +309,6 @@ fn execute_decode_indexer(gpu: &mut Gpu, op: &SparseIndexOp<'_>) -> Result<(), D
                     &k_buf,
                     /*n_idx_heads=*/ 1,
                     k as i32,
-                    bounded,
                 )
                 .map_err(DispatchError::Hip)?
             {
@@ -773,9 +771,6 @@ pub enum SwaAttentionRoute<'a> {
         swa_v: &'a GpuTensor,
         attn_state: &'a GpuTensor,
     },
-    /// Developer diagnostic (`HIPFIRE_DEEPSEEK4_ATTN=pos0`): each head attends
-    /// only the current row's `kv`, on every layer.
-    Pos0 { kv: &'a GpuTensor },
     /// The window's rows over its staged SWA visibility
     /// ([`super::rows::SwaStageOp`]); `n_valid` holds each row's fill.
     Batched {
@@ -789,10 +784,7 @@ pub enum SwaAttentionRoute<'a> {
 
 impl SwaAttentionOp<'_> {
     pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
-        let decode = matches!(
-            self.route,
-            SwaAttentionRoute::Decode { .. } | SwaAttentionRoute::Pos0 { .. }
-        );
+        let decode = matches!(self.route, SwaAttentionRoute::Decode { .. });
         check_rows(self.rows, decode, || {
             format!("SWA attention l{}", self.layer)
         })
@@ -822,9 +814,6 @@ pub fn execute_swa_attention(gpu: &mut Gpu, op: &SwaAttentionOp<'_>) -> Result<(
             )
             .map_err(|e| hip_err("deepseek4_attn_swa_buf", e))
         }
-        SwaAttentionRoute::Pos0 { kv } => gpu
-            .deepseek4_attn_pos0(op.q, kv, op.sink, op.out, heads, hd, groups)
-            .map_err(|e| hip_err("deepseek4_attn_pos0", e)),
         SwaAttentionRoute::Batched {
             staged,
             n_valid,
@@ -1522,7 +1511,7 @@ fn wo_a_rows_e8(
             )
             .map_err(e("grouped batched E8 O-LoRA A"));
     }
-    if wo_a.dtype == DType::MFP4G32E8SOA && rows > 16 && route.e8_b2 {
+    if wo_a.dtype == DType::MFP4G32E8SOA && rows > 16 && route.e8_multi_tile {
         return gpu
             .gemm_mfp4g32_e8_soa_grouped_wmma_b2(
                 wo_a,

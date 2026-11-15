@@ -151,7 +151,7 @@ static ROWS: &[EvidenceRow] = &[
         speed_metric: Some("pp8192 tok/s (≈)"),
         typing: Some("unchanged"),
         caveat: Some("cross-card: A4 on card C vs fp8 on card A, 300 W"),
-        source: Some("AGENTS.md:639-642; CHANGELOG.md:1770"),
+        source: Some("fixtures/pins.toml; CHANGELOG.md:1770"),
         ..NONE
     },
     // Prompt processing, iu4 off, gfx1100.
@@ -166,7 +166,7 @@ static ROWS: &[EvidenceRow] = &[
         speed_metric: Some("XTX pp8192 tok/s"),
         typing: Some("unchanged (48.92 vs 48.82 tok/s)"),
         caveat: Some(
-            "old checkpoint qwen3.8-27b.mq4-xt; current mq4-xts: unknown (AGENTS.md:643-644 pins A4 only)",
+            "old checkpoint qwen3.8-27b.mq4-xt; current mq4-xts: unknown (fixtures/pins.toml pins A4 only)",
         ),
         source: Some("CHANGELOG.md:1887"),
         ..NONE

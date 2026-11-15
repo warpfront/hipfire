@@ -47,7 +47,8 @@ fn state() -> State {
 fn dec(words: &[u32]) -> (Inst, &'static str) {
     let (inst, n) = gfx12::decode(words).unwrap_or_else(|e| panic!("decode {words:08x?}: {e}"));
     assert_eq!(n, words.len(), "{words:08x?} decoded to {n} words");
-    let name = crate::isa::lookup(Arch::Gfx1201, inst.op, inst.form)
+    let name = crate::isa::lookup_inst(Arch::Gfx1201, &inst)
+        .ok()
         .unwrap_or_else(|| panic!("{words:08x?} has no gfx1201 row"))
         .name;
     (inst, name)
@@ -62,10 +63,11 @@ fn roundtrip(words: &[u32], want_name: &str) -> Inst {
         words,
         "{want_name}: re-encode differs"
     );
-    let rebuilt = Inst::from_parts(
+    let rebuilt = Inst::from_encoding(
         Arch::Gfx1201,
         inst.op,
         inst.form,
+        inst.variant,
         inst.fields.clone(),
         inst.operands.clone(),
         inst.mods.clone(),
@@ -663,7 +665,8 @@ fn v_cmp_i64_u64_e64_family_per_lane_masks() {
     }
 }
 
-/// The five new compare rows exist only in the gfx1201 table (and agree with the llvm-mc text pinned there).
+/// The compare rows (and `s_min_num_f32`) agree with the llvm-mc text pinned in the gfx1201 table; gfx1100/gfx1151
+/// resolve them only where their XML catalogs carry a verified row (evidence cited below).
 #[test]
 fn new_i64_compare_rows_pin_their_llvm_text() {
     let rows: [(&str, &str, &[u32]); 8] = [
@@ -702,26 +705,49 @@ fn new_i64_compare_rows_pin_their_llvm_text() {
     ];
     for (name, text, words) in rows {
         let inst = roundtrip(words, name);
-        let row = crate::isa::lookup(Arch::Gfx1201, inst.op, inst.form).unwrap();
+        let row = crate::isa::lookup_inst(Arch::Gfx1201, &inst).ok().unwrap();
         let table: Vec<u32> = row
             .encoding
             .split_whitespace()
             .map(|w| u32::from_str_radix(w, 16).unwrap())
             .collect();
         assert_eq!((row.sample, table.as_slice()), (text, words), "{name}");
-        // v_add_f32_e64 predates this work (gfx1100 has it at the same encoding); the others are gfx1201-table only,
-        // except v_ashrrev_i64, which gfx1100 (and gfx1151, whose table is the gfx1100 table plus deltas) gained later
-        // (`gfx11_decode_gap_tests`: the Raon gather word, llvm-mc verified for both).
+        // v_add_f32_e64 predates this work (gfx1100 has it at the same encoding). The other gfx11 cross-checks are
+        // XML-catalog evidence (`isa/gfx1100.xml.jsonl`, `isa/gfx1151.xml.jsonl`; ROCm llvm-mc oracle `verified`):
+        // - the five `v_cmp_{eq,le,ne}_i64` / `v_cmp_{le,ge}_u64` rows exist in both catalogs as ENC_VOP3 rows
+        //   (opcodes 82, 83, 85, 91, 94; candidates `000052d4…`, `000053d4…`, `000055d4…`, `00005bd4…`, `00005ed4…`);
+        // - `v_ashrrev_i64` is ENC_VOP3 opcode 830 in both (candidate `00003ed700010202`; also the Raon gather word in
+        //   `gfx11_decode_gap_tests`);
+        // - `s_min_num_f32` (SOP2 opcode 66) is a gfx12 name only: gfx1151 has the same encoding as `s_min_f32`
+        //   (ENC_SOP2 opcode 66, candidate `000000a1`), and gfx1100 has no SOP2 opcode 66 row at all.
+        // Gfx1030 has neither a census table nor an XML catalog.
         if name == "v_add_f32_e64" {
             continue;
         }
-        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1030] {
-            if name == "v_ashrrev_i64" && arch != Arch::Gfx1030 {
-                continue;
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            let xml_name = match name {
+                "s_min_num_f32" => (arch == Arch::Gfx1151).then_some("s_min_f32"),
+                _ => Some(name.strip_suffix("_e64").unwrap_or(name)),
+            };
+            match (xml_name, gfx12::decode_for(arch, words)) {
+                (Some(want), Ok((inst, used))) => {
+                    assert_eq!(used, words.len(), "{arch:?} {name}");
+                    assert_eq!(inst.name(arch), Some(want), "{arch:?} {name}");
+                }
+                (Some(want), Err(e)) => panic!("{arch:?} {name}: verified XML row {want}: {e}"),
+                (None, Ok((inst, _))) => {
+                    panic!("{arch:?} {name}: no XML row, decoded {:?}", inst.name(arch))
+                }
+                (None, Err(e)) => {
+                    let e = e.to_string();
+                    assert!(e.contains("undefined"), "{arch:?} {name}: {e}");
+                }
             }
-            let e = gfx12::decode_for(arch, words).unwrap_err().to_string();
-            assert!(e.contains("undefined"), "{arch:?} {name}: {e}");
         }
+        let e = gfx12::decode_for(Arch::Gfx1030, words)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("undefined"), "Gfx1030 {name}: {e}");
     }
 }
 

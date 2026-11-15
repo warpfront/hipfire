@@ -87,6 +87,12 @@ fn tighter_memory(host: Option<u64>, cgroup: Option<u64>) -> Option<u64> {
 /// Host availability clamped to known cgroup-v2 limits, including ancestors.
 /// Each limit is reduced by that cgroup's current usage, not just ours.
 pub fn host_available_memory() -> Option<u64> {
+    // Windows has no `/proc/meminfo`: without this branch the memory term is
+    // unknown, `compile_job_budget` admits one worker, and even an explicit
+    // `HIPFIRE_JIT_JOBS` is clamped to 1 (the whole JIT runs serially).
+    #[cfg(windows)]
+    let host = hipfire_config::host_memory().map(|memory| memory.available_physical_bytes);
+    #[cfg(not(windows))]
     let host = crate::uma_memory::mem_available_bytes();
     let groups = std::fs::read_to_string("/proc/self/cgroup").ok();
     let relative = groups

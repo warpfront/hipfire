@@ -17,7 +17,7 @@
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::llama::{KvCache, VMode};
 use std::path::Path;
 use std::time::Instant;
 
@@ -110,37 +110,6 @@ fn main() {
             kv_max,
         )
         .unwrap(),
-        "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym2" => {
-            let is_kv_layer: Vec<bool> = config
-                .layer_types
-                .iter()
-                .map(|t| *t == qwen35::LayerType::FullAttention)
-                .collect();
-            KvCache::new_gpu_asym2_filtered(
-                &mut gpu,
-                &is_kv_layer,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_max,
-            )
-            .unwrap()
-        }
         "fwht4" => {
             let is_kv_layer: Vec<bool> = config
                 .layer_types
@@ -153,6 +122,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                VMode::Q8,
             )
             .unwrap()
         }
@@ -168,6 +138,7 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                VMode::Q8,
             )
             .unwrap()
         }
@@ -183,11 +154,12 @@ fn main() {
                 config.n_kv_heads,
                 config.head_dim,
                 kv_max,
+                VMode::Q8,
             )
             .unwrap()
         }
         other => {
-            panic!("unknown --kv-mode: {other} (q8, asym4, asym3, asym2, fwht4, fwht3, fwht2)")
+            panic!("unknown --kv-mode: {other} (q8, fwht4, fwht3, fwht2)")
         }
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();

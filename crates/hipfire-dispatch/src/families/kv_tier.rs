@@ -25,8 +25,7 @@ pub enum F32AttnPolicy {
 }
 
 /// Sealed decode of the KV-cache storage tier. Produced ONLY by `classify`.
-/// Carries every distinction any consumer branches on, including the
-/// Givens-vs-FWHT rotation distinction (the `fwht` field on asym variants).
+/// Carries every distinction any consumer branches on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KTier {
     F32,
@@ -38,18 +37,15 @@ pub enum KTier {
     Q4,    // llama legacy
     Int8c, // llama INT8-per-column
     Hfq8,  // llama HFQ8 flat-layout
-    Asym4 {
-        fwht: bool,
-    },
-    Asym3 {
-        fwht: bool,
-    },
-    Asym2 {
-        fwht: bool,
-    },
+    /// Signed-FWHT-rotated 4-bit K + Q8 V.
+    Fwht4,
+    /// Signed-FWHT-rotated 3-bit K + Q8 V.
+    Fwht3,
+    /// Signed-FWHT-rotated 2-bit K + Q8 V.
+    Fwht2,
     /// Native E4M3FN K/V, one f16 scale per (token, KV head) inline in the
     /// token row. gfx1201-only, Qwen dense single-GPU only. Never q8, never
-    /// compactable, never a PFlash drafter tier.
+    /// compactable.
     Fp8,
 }
 
@@ -64,7 +60,7 @@ pub fn classify(
     quant_q4: bool,
     quant_int8: bool,
     quant_hfq8: bool,
-    quant_fwht: bool,
+    _quant_fwht: bool,
     quant_bf16: bool,
     quant_fp8: bool,
 ) -> KTier {
@@ -102,11 +98,11 @@ pub fn classify(
     } else if quant_bf16 {
         KTier::Bf16
     } else if quant_asym4 {
-        KTier::Asym4 { fwht: quant_fwht }
+        KTier::Fwht4
     } else if quant_asym3 {
-        KTier::Asym3 { fwht: quant_fwht }
+        KTier::Fwht3
     } else if quant_asym2 {
-        KTier::Asym2 { fwht: quant_fwht }
+        KTier::Fwht2
     } else if quant_q8 {
         KTier::Q8
     } else if quant_int8 {
@@ -123,50 +119,6 @@ pub fn classify(
 }
 
 impl KTier {
-    /// K bytes per position for the compaction gather kernels (cask/triattn).
-    /// Callers MUST gate with `is_compactable()` first.
-    pub fn k_bytes_per_pos(self, n_kv_heads: usize, head_dim: usize) -> usize {
-        match self {
-            KTier::Q8 => n_kv_heads * (head_dim / 32) * 34,
-            KTier::Asym4 { .. } => n_kv_heads * (4 + head_dim / 2),
-            KTier::Asym3 { .. } => n_kv_heads * (4 + (head_dim * 3) / 8),
-            KTier::Asym2 { .. } => n_kv_heads * (4 + head_dim / 4),
-            // Bf16 has a well-defined 2 bytes/element, but it is deliberately
-            // NOT compactable (see `is_compactable`), and this fn's contract
-            // is that callers gate on that first. Panicking keeps a
-            // compaction path that forgot the gate loud instead of silently
-            // compacting a layout no gather kernel can read.
-            KTier::F32
-            | KTier::Bf16
-            | KTier::Fp8
-            | KTier::Hfq4
-            | KTier::Q4
-            | KTier::Int8c
-            | KTier::Hfq8 => {
-                panic!("k_bytes_per_pos undefined for {self:?}")
-            }
-        }
-    }
-
-    /// Tiers the TriAttn/CASK compaction kernels support. Collapses `fwht`.
-    pub fn is_compactable(self) -> bool {
-        matches!(
-            self,
-            KTier::Q8 | KTier::Asym4 { .. } | KTier::Asym3 { .. } | KTier::Asym2 { .. }
-        )
-    }
-
-    /// Drafter-scoring storage must be Q8 or FWHT-asym (Givens-asym banned).
-    pub fn storage_ok_for_pflash(self) -> bool {
-        matches!(
-            self,
-            KTier::Q8
-                | KTier::Asym4 { fwht: true }
-                | KTier::Asym3 { fwht: true }
-                | KTier::Asym2 { fwht: true }
-        )
-    }
-
     pub fn is_q8(self) -> bool {
         matches!(self, KTier::Q8)
     }
@@ -364,30 +316,21 @@ impl KvTierPlan {
                     fp8_attend_key(pos, flash_mode, capture_mode),
                     false,
                 ),
-                KTier::Asym4 { fwht: true } => (
+                KTier::Fwht4 => (
                     KernelKey::KvWriteAsym4Fwht,
                     KernelKey::AttnFlashAsym4Fwht,
                     true,
                 ),
-                KTier::Asym4 { fwht: false } => {
-                    (KernelKey::KvWriteAsym4, KernelKey::AttnFlashAsym4, true)
-                }
-                KTier::Asym3 { fwht: true } => (
+                KTier::Fwht3 => (
                     KernelKey::KvWriteAsym3Fwht,
                     KernelKey::AttnFlashAsym3Fwht,
                     true,
                 ),
-                KTier::Asym3 { fwht: false } => {
-                    (KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym3, true)
-                }
-                KTier::Asym2 { fwht: true } => (
+                KTier::Fwht2 => (
                     KernelKey::KvWriteAsym2Fwht,
                     KernelKey::AttnFlashAsym2Fwht,
                     true,
                 ),
-                KTier::Asym2 { fwht: false } => {
-                    (KernelKey::KvWriteAsym2, KernelKey::AttnFlashAsym2, true)
-                }
                 KTier::Q8 if q8_windowed => {
                     // cohere2moe: windowed flash unconditionally (window=0 on
                     // full layers == plain flash; >0 applies the sliding mask).
@@ -509,29 +452,15 @@ fn batched_keys(
 ) -> Result<(KernelKey, KernelKey), UnsupportedTreeTier> {
     use KernelKey::*;
     match (write_single, attend_single) {
-        // asym4 → batched-masked (serves both causal and tree-verify)
-        (KvWriteAsym4, AttnFlashAsym4) => Ok((KvWriteAsym4Batched, AttnFlashAsym4BatchedMasked)),
+        // fwht4 → batched-masked (serves both causal and tree-verify)
         (KvWriteAsym4Fwht, AttnFlashAsym4Fwht) => {
             Ok((KvWriteAsym4FwhtBatched, AttnFlashAsym4FwhtBatchedMasked))
         }
-        // asym3 → batched-masked
-        (KvWriteAsym3, AttnFlashAsym3) => Ok((KvWriteAsym3Batched, AttnFlashAsym3BatchedMasked)),
+        // fwht3 → batched-masked
         (KvWriteAsym3Fwht, AttnFlashAsym3Fwht) => {
             Ok((KvWriteAsym3FwhtBatched, AttnFlashAsym3FwhtBatchedMasked))
         }
-        // asym2 → batched ONLY (no _masked — 2-bit tree-verify gap)
-        (KvWriteAsym2, AttnFlashAsym2) => {
-            if is_tree {
-                Err(UnsupportedTreeTier {
-                    write_key: write_single,
-                    attend_key: attend_single,
-                    batch_size,
-                    reason: "tree-verify not supported for this 2-bit tier (no _masked kernel)",
-                })
-            } else {
-                Ok((KvWriteAsym2Batched, AttnFlashAsym2Batched))
-            }
-        }
+        // fwht2 → batched ONLY (no _masked — 2-bit tree-verify gap)
         (KvWriteAsym2Fwht, AttnFlashAsym2Fwht) => {
             if is_tree {
                 Err(UnsupportedTreeTier {
@@ -584,13 +513,10 @@ fn tiers_match(write: KernelKey, attend: KernelKey) -> bool {
     matches!(
         (write, attend),
         // asym4 single-token
-        (KvWriteAsym4, AttnFlashAsym4)
-        | (KvWriteAsym4Fwht, AttnFlashAsym4Fwht)
+        (KvWriteAsym4Fwht, AttnFlashAsym4Fwht)
         // asym3 single-token
-        | (KvWriteAsym3, AttnFlashAsym3)
         | (KvWriteAsym3Fwht, AttnFlashAsym3Fwht)
         // asym2 single-token
-        | (KvWriteAsym2, AttnFlashAsym2)
         | (KvWriteAsym2Fwht, AttnFlashAsym2Fwht)
         // q8 single-token
         | (KvWriteQ8_0, AttnFlashQ8_0)
@@ -618,13 +544,10 @@ fn tiers_match(write: KernelKey, attend: KernelKey) -> bool {
         | (KvWriteF32, AttnFlashGqa)
         | (KvWriteF32, AttnFlash)
         // asym4 batched
-        | (KvWriteAsym4Batched, AttnFlashAsym4BatchedMasked)
         | (KvWriteAsym4FwhtBatched, AttnFlashAsym4FwhtBatchedMasked)
         // asym3 batched
-        | (KvWriteAsym3Batched, AttnFlashAsym3BatchedMasked)
         | (KvWriteAsym3FwhtBatched, AttnFlashAsym3FwhtBatchedMasked)
         // asym2 batched (no _masked)
-        | (KvWriteAsym2Batched, AttnFlashAsym2Batched)
         | (KvWriteAsym2FwhtBatched, AttnFlashAsym2FwhtBatched)
         // q8 batched
         | (KvWriteQ8_0Batched, AttnQ8_0KvBatchedMasked)
@@ -1017,18 +940,13 @@ mod tests {
             classify(false, false, false, false, false, false, false, false, false, false, false),
             KTier::F32
         );
-        // fp8 decodes to Fp8, is not q8/compactable/pflash, and has no
-        // defined compaction stride.
+        // fp8 decodes to Fp8 and is not q8.
         assert_eq!(
             classify(false, false, false, false, false, false, false, false, false, false, true),
             KTier::Fp8
         );
         assert!(!KTier::Fp8.is_q8());
-        assert!(!KTier::Fp8.is_compactable());
-        assert!(!KTier::Fp8.storage_ok_for_pflash());
         assert!(!KTier::Bf16.is_q8());
-        assert!(!KTier::Bf16.is_compactable());
-        assert!(!KTier::Bf16.storage_ok_for_pflash());
     }
 
     #[test]
@@ -1149,19 +1067,6 @@ mod tests {
     }
 
     #[test]
-    fn asym4_givens() {
-        let inputs = KvTierInputs {
-            quant_asym4: true,
-            quant_fwht: false,
-            ..default_inputs()
-        };
-        let plan = KvTierPlan::derive(inputs).unwrap();
-        assert_eq!(plan.write_key, KernelKey::KvWriteAsym4);
-        assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym4);
-        assert!(plan.uses_givens);
-    }
-
-    #[test]
     fn asym4_fwht() {
         let inputs = KvTierInputs {
             quant_asym4: true,
@@ -1175,19 +1080,6 @@ mod tests {
     }
 
     #[test]
-    fn asym3_givens() {
-        let inputs = KvTierInputs {
-            quant_asym3: true,
-            quant_fwht: false,
-            ..default_inputs()
-        };
-        let plan = KvTierPlan::derive(inputs).unwrap();
-        assert_eq!(plan.write_key, KernelKey::KvWriteAsym3);
-        assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym3);
-        assert!(plan.uses_givens);
-    }
-
-    #[test]
     fn asym3_fwht() {
         let inputs = KvTierInputs {
             quant_asym3: true,
@@ -1197,19 +1089,6 @@ mod tests {
         let plan = KvTierPlan::derive(inputs).unwrap();
         assert_eq!(plan.write_key, KernelKey::KvWriteAsym3Fwht);
         assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym3Fwht);
-        assert!(plan.uses_givens);
-    }
-
-    #[test]
-    fn asym2_givens() {
-        let inputs = KvTierInputs {
-            quant_asym2: true,
-            quant_fwht: false,
-            ..default_inputs()
-        };
-        let plan = KvTierPlan::derive(inputs).unwrap();
-        assert_eq!(plan.write_key, KernelKey::KvWriteAsym2);
-        assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym2);
         assert!(plan.uses_givens);
     }
 
@@ -1241,18 +1120,6 @@ mod tests {
     // ── Batched key selection tests ──
 
     #[test]
-    fn batched_asym4() {
-        let inputs = KvTierInputs {
-            quant_asym4: true,
-            ..batched_inputs()
-        };
-        let plan = KvTierPlan::derive(inputs).unwrap();
-        assert_eq!(plan.write_key, KernelKey::KvWriteAsym4Batched);
-        assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym4BatchedMasked);
-        assert_eq!(plan.batch_size, 128);
-    }
-
-    #[test]
     fn batched_asym4_fwht() {
         let inputs = KvTierInputs {
             quant_asym4: true,
@@ -1265,17 +1132,6 @@ mod tests {
     }
 
     #[test]
-    fn batched_asym3() {
-        let inputs = KvTierInputs {
-            quant_asym3: true,
-            ..batched_inputs()
-        };
-        let plan = KvTierPlan::derive(inputs).unwrap();
-        assert_eq!(plan.write_key, KernelKey::KvWriteAsym3Batched);
-        assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym3BatchedMasked);
-    }
-
-    #[test]
     fn batched_asym3_fwht() {
         let inputs = KvTierInputs {
             quant_asym3: true,
@@ -1285,30 +1141,6 @@ mod tests {
         let plan = KvTierPlan::derive(inputs).unwrap();
         assert_eq!(plan.write_key, KernelKey::KvWriteAsym3FwhtBatched);
         assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym3FwhtBatchedMasked);
-    }
-
-    #[test]
-    fn batched_asym2_causal() {
-        let inputs = KvTierInputs {
-            quant_asym2: true,
-            is_tree: false,
-            ..batched_inputs()
-        };
-        let plan = KvTierPlan::derive(inputs).unwrap();
-        assert_eq!(plan.write_key, KernelKey::KvWriteAsym2Batched);
-        assert_eq!(plan.attend_key, KernelKey::AttnFlashAsym2Batched);
-    }
-
-    #[test]
-    fn batched_asym2_tree_rejected() {
-        let inputs = KvTierInputs {
-            quant_asym2: true,
-            is_tree: true,
-            ..batched_inputs()
-        };
-        let err = KvTierPlan::derive(inputs).unwrap_err();
-        assert_eq!(err.write_key, KernelKey::KvWriteAsym2);
-        assert_eq!(err.attend_key, KernelKey::AttnFlashAsym2);
     }
 
     #[test]
@@ -1394,42 +1226,18 @@ mod tests {
         ));
         assert!(tiers_match(KernelKey::KvWriteQ8_0, KernelKey::AttnQ8_0Kv));
         assert!(tiers_match(
-            KernelKey::KvWriteAsym4,
-            KernelKey::AttnFlashAsym4
-        ));
-        assert!(tiers_match(
             KernelKey::KvWriteAsym4Fwht,
             KernelKey::AttnFlashAsym4Fwht
-        ));
-        assert!(tiers_match(
-            KernelKey::KvWriteAsym3,
-            KernelKey::AttnFlashAsym3
         ));
         assert!(tiers_match(
             KernelKey::KvWriteAsym3Fwht,
             KernelKey::AttnFlashAsym3Fwht
         ));
         assert!(tiers_match(
-            KernelKey::KvWriteAsym2,
-            KernelKey::AttnFlashAsym2
-        ));
-        assert!(tiers_match(
             KernelKey::KvWriteAsym2Fwht,
             KernelKey::AttnFlashAsym2Fwht
         ));
         // batched
-        assert!(tiers_match(
-            KernelKey::KvWriteAsym4Batched,
-            KernelKey::AttnFlashAsym4BatchedMasked
-        ));
-        assert!(tiers_match(
-            KernelKey::KvWriteAsym3Batched,
-            KernelKey::AttnFlashAsym3BatchedMasked
-        ));
-        assert!(tiers_match(
-            KernelKey::KvWriteAsym2Batched,
-            KernelKey::AttnFlashAsym2Batched
-        ));
         assert!(tiers_match(
             KernelKey::KvWriteQ8_0Batched,
             KernelKey::AttnQ8_0KvBatchedMasked
@@ -1460,8 +1268,8 @@ mod tests {
     #[test]
     fn tiers_match_rejects_cross_tier() {
         assert!(!tiers_match(
-            KernelKey::KvWriteAsym3,
-            KernelKey::AttnFlashAsym4
+            KernelKey::KvWriteAsym3Fwht,
+            KernelKey::AttnFlashAsym4Fwht
         ));
         assert!(!tiers_match(KernelKey::KvWriteQ8_0, KernelKey::AttnF32));
         assert!(!tiers_match(
@@ -1486,14 +1294,10 @@ mod tests {
     // ── KTier enum and classify tests ──
 
     #[test]
-    fn classify_carries_fwht_bit() {
+    fn classify_rotated_tiers() {
         assert_eq!(
             classify(false, false, true, false, false, false, false, false, true, false, false),
-            KTier::Asym3 { fwht: true }
-        );
-        assert_eq!(
-            classify(false, false, true, false, false, false, false, false, false, false, false),
-            KTier::Asym3 { fwht: false }
+            KTier::Fwht3
         );
         assert_eq!(
             classify(true, false, false, false, false, false, false, false, false, false, false),
@@ -1515,11 +1319,7 @@ mod tests {
 
     #[test]
     fn ktier_queries() {
-        assert!(
-            KTier::Q8.is_compactable() && KTier::Q8.is_q8() && KTier::Q8.storage_ok_for_pflash()
-        );
-        assert!(KTier::Asym3 { fwht: true }.storage_ok_for_pflash());
-        assert!(!KTier::Asym3 { fwht: false }.storage_ok_for_pflash());
-        assert!(!KTier::F32.is_compactable());
+        assert!(KTier::Q8.is_q8());
+        assert!(!KTier::F32.is_q8());
     }
 }

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 
-//! Qwen3.5 DFlash / DDTree speculative-decode state and `Speculator` impl.
+//! Qwen3.5 DFlash speculative-decode state and `Speculator` impl.
 //!
 //! Contents: [`DflashState`] (the loaded draft weights/scratch + target
-//! snapshot/tape + optional [`DdtreeState`]), [`load_dflash_state`] (its
+//! snapshot/tape), [`load_dflash_state`] (its
 //! load-time constructor), the [`DflashSpeculator`] impl (which owns
 //! `DflashState` + the divergent-render checkpoint ring) behind the arch-generic
 //! [`Speculator`] trait, and [`build_dflash_speculator`] (its env-resolving
@@ -13,14 +13,14 @@
 use crate::dflash_verify_pm4::{DflashVerifyPm4, DFLASH_VERIFY_PM4_BLOCK};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant};
 use crate::speculative::{
-    apply_eviction_retain_to_draft, apply_host_ar_trunc, sample_categorical,
-    scatter_hidden_block_to_interleaved, scatter_hidden_prefill_to_interleaved,
-    seed_target_hidden_dense_tp2_abortable, seed_target_hidden_from_prompt_abortable,
-    seed_target_hidden_from_prompt_abortable_parts, seed_target_hidden_suffix_abortable,
-    seed_target_hidden_suffix_abortable_parts, softmax_temp_into, spec_step_ddtree_batched,
-    spec_step_dflash_dense_tp2, spec_step_dflash_with_railgun, xorshift_next_unit, DdtreeScratch,
-    DeltaNetSnapshot, DenseTpTargetView, DflashLookup, DflashTargetParts, GdnTape,
-    HiddenStateRingBuffer, ModelSlot, RailgunStep, SpecStepResult, VerifyScratch,
+    apply_host_ar_trunc, sample_categorical, scatter_hidden_block_to_interleaved,
+    scatter_hidden_prefill_to_interleaved, seed_target_hidden_dense_tp2_abortable,
+    seed_target_hidden_from_prompt_abortable, seed_target_hidden_from_prompt_abortable_parts,
+    seed_target_hidden_suffix_abortable, seed_target_hidden_suffix_abortable_parts,
+    softmax_temp_into, spec_step_dflash_dense_tp2, spec_step_dflash_with_railgun,
+    xorshift_next_unit, DeltaNetSnapshot, DenseTpTargetView, DflashLookup, DflashTargetParts,
+    GdnTape, HiddenStateRingBuffer, ModelSlot, RailgunStep, SpecStepResult, TurnCheckpoint,
+    VerifyScratch,
 };
 use hipfire_runtime::dflash::{
     draft_seed_backfill_reads_host, DflashConfig, DflashScratch, DflashWeights, DraftCtxMode,
@@ -30,8 +30,8 @@ use hipfire_runtime::dflash_adaptive_block::DflashAdaptiveBlock;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{
-    request_rng_state, terminal_prefix_replay, EvictRetain, PrefillOutcome, SpecGrammar,
-    SpecRequestConfig, SpecStep, SpecTarget, Speculator,
+    request_rng_state, terminal_prefix_replay, PrefillOutcome, SpecGrammar, SpecRequestConfig,
+    SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
@@ -39,16 +39,6 @@ use std::sync::Arc;
 
 /// Extract layers the retained B=16 DFlash2 verify route admits.
 const DFLASH_VERIFY_PM4_EXTRACT_LAYERS: [usize; 5] = [5, 19, 33, 47, 61];
-
-// ─── DDTree side state ────────────────────────────────────────────────
-
-/// Side state for DDTree-mode speculative decoding.
-pub struct DdtreeState {
-    pub post_seed_snap: DeltaNetSnapshot,
-    pub scratch: DdtreeScratch,
-    pub budget: usize,
-    pub topk: usize,
-}
 
 // ─── DFlash state ─────────────────────────────────────────────────────
 
@@ -66,7 +56,6 @@ pub struct DflashState {
     pub gdn_tape: GdnTape,
     pub ctx_capacity: usize,
     pub block_size: usize,
-    pub ddtree: Option<DdtreeState>,
     /// Retained-PM4 route for the fixed B=16 chain target-verify forward.
     /// Always present; `Disabled` when admission fails (no controller held).
     pub verify_pm4: DflashVerifyPm4,
@@ -86,7 +75,6 @@ impl DflashState {
             gdn_tape,
             ctx_capacity: _,
             block_size: _,
-            ddtree,
             mut verify_pm4,
         } = self;
         // Must prove no retained IB is in flight before any captured owner is
@@ -102,7 +90,6 @@ impl DflashState {
                 verify_scratch,
                 target_snap,
                 gdn_tape,
-                ddtree,
             ));
             let _ = gpu;
             return;
@@ -114,10 +101,6 @@ impl DflashState {
         verify_scratch.free_gpu(gpu);
         target_snap.free_gpu(gpu);
         gdn_tape.free_gpu(gpu);
-        if let Some(dd) = ddtree {
-            dd.post_seed_snap.free_gpu(gpu);
-            dd.scratch.free_gpu(gpu);
-        }
     }
 
     /// Free the scratch a VMM lane never needs and that a promoted singleton
@@ -315,32 +298,33 @@ fn alloc_dflash_owners(
 // ─── DFlash state load ────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-/// Default ceiling for the DFlash draft's context-indexed structures
-/// (`target_hidden` [L × extract×hidden], the per-layer K/V caches, the
-/// hidden ring, `mq_x_rot`, and the host hidden log). Serve loads default
-/// `max_seq` to 32768+, which sized ALL of these to 32K rows — on a 27B
-/// target with a 5-layer-extract MQ4 draft that is ~11 GB of draft-side
-/// VRAM, vs ~1.4 GB at the ≤4K contexts DFlash benches actually run. The
-/// draft only affects acceptance rate (verify is target-gated), so a
+/// Ceiling for the DFlash draft's context-indexed structures when the draft
+/// declares no sliding window (`target_hidden` [L × extract×hidden], the
+/// per-layer K/V caches, the hidden ring, `mq_x_rot`, and the host hidden
+/// log). Serve loads default `max_seq` to 32768+, which sized ALL of these to
+/// 32K rows — on a 27B target with a 5-layer-extract MQ4 draft that is ~11 GB
+/// of draft-side VRAM, vs ~1.4 GB at the ≤4K contexts DFlash benches actually
+/// run. The draft only affects acceptance rate (verify is target-gated), so a
 /// request that outgrows the cap simply falls back to AR in the daemon —
-/// emitted tokens are never at risk. `HIPFIRE_DFLASH_CTX_CAP=0` opts out
-/// (legacy uncapped behaviour); any other value overrides the ceiling.
+/// emitted tokens are never at risk. The cap is fixed: the 0.4.x
+/// `HIPFIRE_DFLASH_CTX_CAP` override was removed in 0.5.0.
 pub const DEFAULT_DFLASH_CTX_CAP: usize = 8192;
 
-// lifecycle: deprecated since 0.4.0, removal 0.5.0 — legacy contiguous DFlash opt-in knobs; the draft-declared window supersedes them
-/// One warning line when an operator opts into legacy contiguous DFlash
-/// (`HIPFIRE_DFLASH_WINDOW=0`) or overrides its draft cap
-/// (`HIPFIRE_DFLASH_CTX_CAP`). Silent when neither knob is set.
-fn warn_deprecated_legacy_dflash_knobs() {
-    let window_zero = hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
+/// `HIPFIRE_DFLASH_WINDOW` as a window-row override: `Ok(Some(rows))` for a
+/// positive value, `Ok(None)` when unset or unparsable. `0` (the removed
+/// legacy contiguous mode) is refused so a stale environment fails loudly
+/// instead of silently running the windowed default.
+pub(crate) fn dflash_window_override() -> Result<Option<usize>, String> {
+    match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        == Some(0);
-    let ctx_cap = hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP").is_ok();
-    if window_zero || ctx_cap {
-        eprintln!(
-            "  warning: HIPFIRE_DFLASH_WINDOW=0 / HIPFIRE_DFLASH_CTX_CAP (legacy contiguous DFlash) are deprecated and will be removed in 0.5.0; use the draft-declared window"
-        );
+    {
+        Some(0) => Err(
+            "HIPFIRE_DFLASH_WINDOW=0 (legacy contiguous DFlash) was removed in 0.5.0; \
+             unset it to use the draft-declared window, or set it to a positive row count"
+                .to_string(),
+        ),
+        other => Ok(other),
     }
 }
 
@@ -350,15 +334,6 @@ pub fn load_dflash_state(
     target_config: &Qwen35Config,
     target_dn: &DeltaNetState,
     gpu: &mut Gpu,
-    // DDTree draft tuning forwarded by the loader from the unified spec config
-    // (CLI `--ddtree-budget` / `--ddtree-topk`). Env wins, else these, else default.
-    ddtree_budget_param: Option<usize>,
-    ddtree_topk_param: Option<usize>,
-    // CASK eviction active for this load. Windowed draft mode refuses the
-    // combination (the eviction rebuild re-projects rows the window has
-    // already dropped) and falls back to Legacy — gather-compact over the
-    // rings is a follow-up.
-    eviction_active: bool,
     // Retained-PM4 admission facts owned by the loader/target, not the draft.
     target_weights: &Qwen35Weights,
     kv_is_q8: bool,
@@ -407,14 +382,9 @@ pub fn load_dflash_state(
     // `DflashConfig::declared_window` / `all_layers_sliding`). That is the
     // only width correct by construction.
     //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
-    //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy (cap + AR fallback)
-    //   unset                         draft-declared window, else Legacy
-    warn_deprecated_legacy_dflash_knobs();
-    let window = match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(0) => None,
+    //   unset                         draft-declared window, else the capped
+    //                                 contiguous fallback (`DEFAULT_DFLASH_CTX_CAP`)
+    let window = match dflash_window_override()? {
         Some(w) => {
             if let Some(declared) = draft_config.declared_window {
                 if declared != w {
@@ -429,26 +399,9 @@ pub fn load_dflash_state(
         }
         None => draft_config.declared_window,
     };
-    let window = match (window, eviction_active) {
-        (Some(w), true) => {
-            eprintln!(
-                "  DFlash windowed mode ({w}) disabled: CASK eviction rebuild is not \
-                 ring-aware — falling back to Legacy capped mode"
-            );
-            None
-        }
-        (w, _) => w,
-    };
     let ctx_capacity = match window {
         Some(w) => w,
-        None => match hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            Some(0) => ctx_capacity, // explicit opt-out: legacy uncapped
-            Some(cap) => ctx_capacity.min(cap),
-            None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
-        },
+        None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
     };
     if let Some(w) = window {
         let from_meta = if draft_config.declared_window == Some(w) {
@@ -459,21 +412,20 @@ pub fn load_dflash_state(
         if draft_config.all_layers_sliding {
             eprintln!(
                 "  DFlash2 draft windowed: all {} layers sliding at W={w} \
-                 (no full-attention layer; draft VRAM pinned at W; \
-                 HIPFIRE_DFLASH_WINDOW=0 for Legacy){from_meta}",
+                 (no full-attention layer; draft VRAM pinned at W){from_meta}",
                 draft_config.n_layers
             );
         } else {
             eprintln!(
                 "  DFlash draft windowed: SWA W={w} rows on layers 0..n-2, full-attention \
-                 last layer over all {} rows (draft VRAM pinned at W; HIPFIRE_DFLASH_WINDOW=0 for Legacy){from_meta}",
+                 last layer over all {} rows (draft VRAM pinned at W){from_meta}",
                 requested_ctx
             );
         }
     } else if ctx_capacity < requested_ctx {
         eprintln!(
             "  DFlash draft ctx capped: {} -> {} rows (draft-side VRAM scales with this; \
-             HIPFIRE_DFLASH_CTX_CAP=0 for uncapped, or set a larger cap)",
+             the cap is fixed — use a draft that declares a sliding window)",
             requested_ctx, ctx_capacity
         );
     }
@@ -519,27 +471,7 @@ pub fn load_dflash_state(
             Some(false) => "0",
         }
     );
-    // DDTree verify batches up to `budget + 1` slots (seed + budget nodes), which
-    // can exceed the chain block_size+1. Size verify_scratch / GdnTape / hidden
-    // staging for the larger of the two so ddtree-mode serve doesn't overflow
-    // ("verify_scratch max_n < b" panic). budget=0 ⇒ chain-only, unchanged.
-    // Resolved through FeatureFlags (env override) so the ddtree budget has a
-    // single parser shared with the dense path — env wins, else the CLI param,
-    // else 0 (chain-only). An explicit `HIPFIRE_DDTREE_BUDGET=0` reads as None
-    // (unset) here and falls through to the param, matching the dense semantics.
-    let mut ddtree_budget: usize = gpu.flags.ddtree_budget.or(ddtree_budget_param).unwrap_or(0);
-    // DFlash2 is chain-only: never construct DDTree (independent-marginal
-    // tree would bypass the candidate selector).
-    if draft_weights.has_candidate_selector() {
-        if ddtree_budget > 0 {
-            eprintln!(
-                "  DFlash2 candidate selector: DDTree disabled (chain-only; \
-                 independent-marginal tree would bypass the selector)"
-            );
-        }
-        ddtree_budget = 0;
-    }
-    let max_n = (block_size + 1).max(ddtree_budget + 1);
+    let max_n = block_size + 1;
     // The hidden-ring STAGING buffers must hold one staged chunk. Verify
     // cycles stage only `max_n` (= block_size+1) rows. The prompt seed
     // (`seed_target_hidden_from_prompt_abortable`) follows AR's chunk plan and
@@ -590,31 +522,6 @@ pub fn load_dflash_state(
         }
     };
     let _ = draft_hfq;
-    // DDTree (budget read once above, used for scratch sizing).
-    let ddtree = if ddtree_budget > 0 {
-        let topk: usize = gpu.flags.ddtree_topk.or(ddtree_topk_param).unwrap_or(4);
-        let post_seed_snap = or_free!(
-            DeltaNetSnapshot::new_for(gpu, target_dn),
-            "",
-            owners,
-            draft_weights,
-        );
-        let scratch = or_free!(
-            DdtreeScratch::new(gpu, ddtree_budget),
-            "DdtreeScratch::new",
-            post_seed_snap,
-            owners,
-            draft_weights,
-        );
-        Some(DdtreeState {
-            post_seed_snap,
-            scratch,
-            budget: ddtree_budget,
-            topk,
-        })
-    } else {
-        None
-    };
     let DflashOwners {
         draft_scratch,
         hidden_rb,
@@ -677,7 +584,6 @@ pub fn load_dflash_state(
         &hidden_rb.extract_layers,
         block_size,
         &draft_config.target_layer_ids,
-        ddtree.is_some(),
         verify_scratch.prefill_batch.is_some(),
         pbs_eligible_b16,
         verify_scratch.max_n,
@@ -738,7 +644,6 @@ pub fn load_dflash_state(
             ctx_capacity
         },
         block_size,
-        ddtree,
         verify_pm4,
     })
 }
@@ -827,15 +732,13 @@ fn dflash_prefill_finish(
 ///
 /// `cfg.temp <= 1e-6`: historical host argmax fold (first maximal index wins
 /// via strict `>`), no RNG draw. Otherwise: host softmax at `cfg.temp`, then
-/// `apply_host_ar_trunc(top_k, top_p)` ONLY when `chain` (DDTree SWOR honors
-/// temperature only; origin lines 905-910), then exactly one
+/// `apply_host_ar_trunc(top_k, top_p)`, then exactly one
 /// `xorshift_next_unit(rng)` draw and `sample_categorical` (origin lines
 /// 911-912). `cactus_delta` is not consulted. `scratch` holds the probability
 /// row (cleared/reserved by `softmax_temp_into`; identical to the singleton's
 /// former fresh `Vec`).
 pub(crate) fn dflash_first_token(
     logits: &[f32],
-    chain: bool,
     cfg: crate::speculative::DflashSampleCfg,
     rng: &mut u64,
     scratch: &mut Vec<f32>,
@@ -854,9 +757,7 @@ pub(crate) fn dflash_first_token(
             .0
     } else {
         softmax_temp_into(logits, cfg.temp, scratch);
-        if chain {
-            apply_host_ar_trunc(scratch, cfg.top_k, cfg.top_p);
-        }
+        apply_host_ar_trunc(scratch, cfg.top_k, cfg.top_p);
         let u = xorshift_next_unit(rng);
         sample_categorical(scratch, u)
     }
@@ -989,8 +890,6 @@ mod cycle_trace {
         pub accepted: usize,
         pub committed: &'a [u32],
         pub step_us: u64,
-        /// Tree-mode result: appended as a trailing `"ddtree":true`.
-        pub ddtree: bool,
         /// Armed-lookup window kind: appended as trailing
         /// `"kind":..,"k":..,"lookup":..`.
         pub lookup: Option<LookupTag>,
@@ -1020,9 +919,6 @@ mod cycle_trace {
             let _ = write!(s, r#","accepted":{},"committed":"#, self.accepted);
             push_u32s(&mut s, self.committed);
             let _ = write!(s, r#","step_us":{}"#, self.step_us);
-            if self.ddtree {
-                s.push_str(r#","ddtree":true"#);
-            }
             if let Some(l) = &self.lookup {
                 let _ = write!(
                     s,
@@ -1057,7 +953,6 @@ mod cycle_trace {
                 accepted: 2,
                 committed: &[9, 8, 6],
                 step_us: 1234,
-                ddtree: false,
                 lookup: None,
                 railgun: None,
             };
@@ -1068,7 +963,7 @@ mod cycle_trace {
         }
 
         #[test]
-        fn cycle_trace_cycle_line_empty_drafted_and_ddtree() {
+        fn cycle_trace_cycle_line_empty_drafted() {
             let c = Cycle {
                 pid: 1,
                 seq: 1,
@@ -1082,13 +977,12 @@ mod cycle_trace {
                 accepted: 0,
                 committed: &[4],
                 step_us: 0,
-                ddtree: true,
                 lookup: None,
                 railgun: None,
             };
             assert_eq!(
                 c.line(),
-                r#"{"ev":"cycle","pid":1,"seq":1,"cyc":0,"pos":0,"seed":3,"b":1,"max_emit":1,"temp":0,"drafted":[],"accepted":0,"committed":[4],"step_us":0,"ddtree":true}"#
+                r#"{"ev":"cycle","pid":1,"seq":1,"cyc":0,"pos":0,"seed":3,"b":1,"max_emit":1,"temp":0,"drafted":[],"accepted":0,"committed":[4],"step_us":0}"#
             );
         }
 
@@ -1120,7 +1014,6 @@ mod cycle_trace {
                 accepted: 1,
                 committed: &[9, 6],
                 step_us: 10,
-                ddtree: false,
                 lookup,
                 railgun: None,
             };
@@ -1200,7 +1093,6 @@ mod lookup {
         pub on: bool,
         /// `HIPFIRE_SPEC_LOOKUP_TAIL` is not `0`.
         pub tail_env: bool,
-        pub ddtree: bool,
         pub selector: bool,
         /// Retained-PM4 verify replay admitted (shape-frozen at B=16).
         pub pm4: bool,
@@ -1215,9 +1107,6 @@ mod lookup {
     pub(super) fn arming(i: &ArmInputs) -> Result<bool, &'static str> {
         if !i.on {
             return Err("speculation.dflash_lookup is off");
-        }
-        if i.ddtree {
-            return Err("DDTree chain");
         }
         if !i.selector {
             return Err("no DFlash2 candidate selector");
@@ -1685,7 +1574,6 @@ mod lookup {
             ArmInputs {
                 on: true,
                 tail_env: true,
-                ddtree: false,
                 selector: true,
                 pm4: false,
                 block_size: 16,
@@ -2157,13 +2045,6 @@ mod lookup {
             );
             assert_eq!(
                 arming(&ArmInputs {
-                    ddtree: true,
-                    ..inputs()
-                }),
-                Err("DDTree chain")
-            );
-            assert_eq!(
-                arming(&ArmInputs {
                     selector: false,
                     ..inputs()
                 }),
@@ -2192,8 +2073,8 @@ mod lookup {
                 "[dflash] lookup: armed (copy, rows<=8)"
             );
             assert_eq!(
-                load_line(&Err("DDTree chain".into()), 16),
-                "[dflash] lookup: off (DDTree chain)"
+                load_line(&Err("no DFlash2 candidate selector".into()), 16),
+                "[dflash] lookup: off (no DFlash2 candidate selector)"
             );
         }
 
@@ -2202,10 +2083,6 @@ mod lookup {
             for i in [
                 ArmInputs {
                     on: false,
-                    ..inputs()
-                },
-                ArmInputs {
-                    ddtree: true,
                     ..inputs()
                 },
                 ArmInputs {
@@ -2282,10 +2159,8 @@ fn lower_qwen35(r: &SpecStepResult) -> SpecStep {
 /// promotion has moved it out (see [`DflashSpeculator::take_vmm_lane`]).
 const SINGLETON_VACANT: &str = "DFlash singleton lane state is vacant; prefill first";
 
-/// DFlash / DDTree speculator: wraps the qwen35 `spec_step_*` chain/tree
-/// kernels behind the arch-generic [`Speculator`] trait. Chain-vs-tree is an
-/// internal detail resolved at build (`ddtree` presence comes from the loaded
-/// `DflashState`).
+/// DFlash speculator: wraps the qwen35 `spec_step_*` chain
+/// kernels behind the arch-generic [`Speculator`] trait.
 ///
 /// Owns the `DflashState` moved out of `LoadedModel.dflash`, plus the divergent-
 /// render DeltaNet checkpoint ring folded in from `LoadedModel.dflash_checkpoints`.
@@ -2306,20 +2181,25 @@ pub struct DflashSpeculator {
     /// Per-request sampling, set via `set_sampling` before each step loop and
     /// applied in the chain-mode `spec_step_dflash` branch of `step`. Default
     /// greedy (temp 0 / top_p 1 / top_k 0 / cactus 0) → argmax-accept, the
-    /// historical DFlash posture, so an unconfigured speculator (or the
-    /// greedy-only DDTree branches) decode greedily. Mirrors spec-graph's old
+    /// historical DFlash posture, so an unconfigured speculator decodes
+    /// greedily. Mirrors spec-graph's old
     /// inline `generate_dflash` call, which threaded the request temp/top_p/top_k
     /// into the same four `spec_step_dflash` args.
     sample_temp: f32,
     sample_top_p: f32,
     sample_top_k: usize,
     sample_cactus: f32,
-    /// Divergent-render checkpoint ring. Populated by `prefill`'s seed when
-    /// `resume_enabled`; freed on `reset`/`free`.
+    /// Divergent-render checkpoint ring. Populated by `prefill`'s seed; freed on
+    /// `reset`/`free`.
     checkpoints: Vec<(usize, DeltaNetSnapshot)>,
-    resume_enabled: bool,
     ck_interval: usize,
     ck_cap: usize,
+    /// This request's user-turn boundary (`Speculator::set_turn_boundary`), taken by
+    /// the prompt seed.
+    turn_boundary: Option<usize>,
+    /// Position of the newest user-turn snapshot in `checkpoints`, protected from
+    /// recycling until the next user turn replaces it.
+    pinned_boundary: Option<usize>,
     last_window: Option<DflashWindowMark>,
     /// Adaptive verify-block controller (trailing-τ proposal shrink),
     /// owned by `hipfire_runtime::dflash_adaptive_block` so the policy is
@@ -2354,19 +2234,13 @@ pub struct DflashWindowMark {
 }
 
 impl DflashSpeculator {
-    /// `resume_enabled`/`ck_interval`/`ck_cap` mirror the daemon's
-    /// `ckpt_resume_enabled()`/`ckpt_interval()`/`ckpt_max()` — passed in by
-    /// `build_dflash_speculator` so `new` itself is env-free (and unit-testable).
+    /// `ck_interval`/`ck_cap` mirror the daemon's `ckpt_interval()`/`ckpt_max()`
+    /// — passed in by `build_dflash_speculator` so `new` itself is env-free (and
+    /// unit-testable).
     /// `adaptive_b` is the already-resolved knob (load param AND env
     /// kill-switch AND the retained-PM4 gate folded by `build_dflash_speculator`)
     /// — likewise env-free and PM4-free here.
-    pub fn new(
-        df: DflashState,
-        resume_enabled: bool,
-        ck_interval: usize,
-        ck_cap: usize,
-        adaptive_b: bool,
-    ) -> Self {
+    pub fn new(df: DflashState, ck_interval: usize, ck_cap: usize, adaptive_b: bool) -> Self {
         let adaptive = DflashAdaptiveBlock::new(df.block_size, adaptive_b);
         Self {
             df: Some(df),
@@ -2383,7 +2257,8 @@ impl DflashSpeculator {
             sample_top_k: hipfire_runtime::llama::ar_candidate_cap(None),
             sample_cactus: 0.0,
             checkpoints: Vec::new(),
-            resume_enabled,
+            turn_boundary: None,
+            pinned_boundary: None,
             ck_interval,
             ck_cap,
             last_window: None,
@@ -2411,7 +2286,7 @@ impl DflashSpeculator {
     /// Resolved DeltaNet checkpoint cadence of this speculator.
     pub fn checkpoint_policy(&self) -> DflashCheckpointPolicy {
         DflashCheckpointPolicy {
-            resume_enabled: self.resume_enabled,
+            resume_enabled: true,
             interval: self.ck_interval,
             cap: self.ck_cap,
         }
@@ -2426,7 +2301,7 @@ impl DflashSpeculator {
     /// Arm (or leave off) the verbatim-copy lookup and print the one load
     /// line. `on` = resolved `speculation.dflash_lookup`, `tail_env` = the
     /// `HIPFIRE_SPEC_LOOKUP_TAIL` kill switch is not `0`. Armed only on this
-    /// singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify);
+    /// singleton DFlash2 selector chain (no retained-PM4 verify);
     /// the VMM/CB lanes and the dense-TP mesh speculator are other types and
     /// never arm; CACTUS is excluded per window in `step`.
     pub fn configure_lookup(&mut self, on: bool, tail_env: bool) {
@@ -2437,7 +2312,6 @@ impl DflashSpeculator {
         let inputs = lookup::ArmInputs {
             on,
             tail_env,
-            ddtree: df.ddtree.is_some(),
             selector: df.draft_weights.has_candidate_selector(),
             pm4: df.verify_pm4.admitted(),
             block_size: df.block_size,
@@ -2513,11 +2387,15 @@ impl Speculator for DflashSpeculator {
         // `prefill_start`, reusing the prior turn's KV + recurrent state; miss →
         // seed the full prompt (the seed fn resets target state itself).
         let (ck_interval, ck_cap) = (self.ck_interval, self.ck_cap);
-        let ckpt_sink = if self.resume_enabled {
-            Some(&mut self.checkpoints)
-        } else {
-            None
+        // This request's user-turn boundary: the seed snapshots at its newest
+        // chunk end at or before it; that snapshot stays pinned through the
+        // following tool-result requests until the next user turn. One-shot per
+        // request.
+        let mut turn = TurnCheckpoint {
+            boundary: self.turn_boundary.take(),
+            pin: self.pinned_boundary,
         };
+        let ckpt_sink = Some(&mut self.checkpoints);
         let aborted = if cache_hit {
             seed_target_hidden_suffix_abortable(
                 gpu,
@@ -2525,10 +2403,12 @@ impl Speculator for DflashSpeculator {
                 &mut df.hidden_rb,
                 prefill_tokens,
                 prefill_start,
+                prompt_tokens.get(..prefill_start).unwrap_or(&[]),
                 abort,
                 ckpt_sink,
                 ck_interval,
                 ck_cap,
+                &mut turn,
             )
         } else {
             seed_target_hidden_from_prompt_abortable(
@@ -2541,12 +2421,14 @@ impl Speculator for DflashSpeculator {
                 ckpt_sink,
                 ck_interval,
                 ck_cap,
+                &mut turn,
             )
         }
         .map_err(|e| {
             hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::seed");
             e.to_string()
         })?;
+        self.pinned_boundary = turn.pin;
         if aborted {
             // Caller resets conversation state + emits aborted/done; the slot
             // guard restores the target bundle on the way out.
@@ -2576,7 +2458,6 @@ impl Speculator for DflashSpeculator {
         )?;
         let first_token = dflash_first_token(
             &first_logits,
-            df.ddtree.is_none(),
             crate::speculative::DflashSampleCfg {
                 temp: self.sample_temp,
                 top_p: self.sample_top_p,
@@ -2639,10 +2520,12 @@ impl Speculator for DflashSpeculator {
             &mut df.hidden_rb,
             tokens,
             start_pos,
+            &[],
             abort,
             None,
             self.ck_interval,
             self.ck_cap,
+            &mut TurnCheckpoint::default(),
         )
         .map_err(|e| e.to_string())?;
         if aborted {
@@ -2733,21 +2616,19 @@ impl Speculator for DflashSpeculator {
             .map_err(|e| e.to_string())
     }
 
-    /// Temp>0 verify is distribution-correct on the ddtree-batched arm (SWOR)
-    /// and on DFlash2 selector-chain rejection sampling. Legacy chain without
-    /// a selector stays greedy-only at this gate.
+    /// Temp>0 verify is distribution-correct on DFlash2 selector-chain
+    /// rejection sampling; a chain without a selector stays greedy-only at
+    /// this gate (sampled DFlash on such drafts runs the chain rejection
+    /// sampler in `spec_step_dflash`, not this speculator step).
     fn supports_temp_verify(&self) -> bool {
         match (&self.df, &self.vacant) {
-            (Some(df), _) => df.ddtree.is_some() || df.draft_weights.has_candidate_selector(),
-            // A vacancy only exists for fixed-chain assets: no DDTree.
+            (Some(df), _) => df.draft_weights.has_candidate_selector(),
             (None, Some(assets)) => assets.weights.has_candidate_selector(),
             (None, None) => false,
         }
     }
 
     /// Faithful top_p/top_k nucleus only on the DFlash2 candidate-selector chain.
-    /// DDTree SWOR returns false so route selection still blocks user-explicit
-    /// non-temperature controls for the tree path.
     fn supports_chain_nucleus_verify(&self) -> bool {
         match (&self.df, &self.vacant) {
             (Some(df), _) => df.draft_weights.has_candidate_selector(),
@@ -2816,16 +2697,14 @@ impl Speculator for DflashSpeculator {
             target_hidden: df.draft_scratch.thlog.mark(),
         };
 
-        // Two-way dispatch: DDTree-batched (SWOR) when a tree is configured
-        // (never for DFlash2 selector — load refused construction), else
-        // chain-mode DFlash. Selector chain uses sparse-q rejection at temp>0.
+        // Chain-mode DFlash. Selector chain uses sparse-q rejection at temp>0.
         // The grammar arg is ignored — qwen35 enforces tool-call grammar post-hoc
         // in the daemon.
-        // The production chain/tree calls below use ctx_slice=None, so no
+        // The production chain call below uses ctx_slice=None, so no
         // persistent host shadow exists or is read after prompt backfill.
         let mut host_hidden = Vec::new();
         // Armed-lookup bookkeeping of this window. `lk_ran` is `None` when
-        // lookup is inactive for it (unarmed, DDTree, CACTUS, or the pending
+        // lookup is inactive for it (unarmed, CACTUS, or the pending
         // seed is not `emitted.last()`): the incumbent call, nothing observed.
         let mut lk_ran: Option<lookup::Ran> = None;
         let mut lk_probe = false;
@@ -2833,38 +2712,7 @@ impl Speculator for DflashSpeculator {
             owner.clear_route();
         }
         let mut lk_wall_us = 0.0f64;
-        let result = if let Some(dd) = df.ddtree.as_mut() {
-            // Tree node budget is structural; max_accept is the commit bound.
-            // Keep at least 1 node so the tree builder stays well-formed; the
-            // accept clamp drops to 0 drafts when max_emit == 1.
-            let tree_budget = dd.budget.min(max_emit.saturating_sub(1).max(1));
-            spec_step_ddtree_batched(
-                gpu,
-                slot,
-                &df.draft_weights,
-                &df.draft_config,
-                &mut df.draft_scratch,
-                &mut df.hidden_rb,
-                &mut host_hidden,
-                &mut df.target_snap,
-                &mut dd.post_seed_snap,
-                &mut df.gdn_tape,
-                &dd.scratch,
-                &df.verify_scratch,
-                position,
-                seed,
-                None, // ctx_slice = full history
-                tree_budget,
-                dd.topk,
-                // Request temperature → distribution-preserving SWOR verify at
-                // temp>0 (greedy/argmax at temp 0). The ddtree-batched arm is the
-                // only DFlash mode with sampled verify; the chain below stays
-                // greedy, so `supports_temp_verify` gates serve routing to ddtree.
-                temp,
-                &mut self.rng_state,
-                max_accept,
-            )
-        } else {
+        let result = {
             // Selector chain must error on invalid rewrites rather than silently
             // substituting 0/None — keep the CACTUS guard here (the other
             // rewrites are hard-wired to off/None in this path, but the direct
@@ -2956,9 +2804,7 @@ impl Speculator for DflashSpeculator {
                 // merge re-wire). These four positions reproduce spec-graph's old
                 // inline `generate_dflash` call verbatim: temp 0 ⇒ greedy/argmax;
                 // temp>0 ⇒ lossless rejection sampling with the IDENTICAL
-                // (top_k,top_p) nucleus truncation on draft + target. The DDTree
-                // branches above stay greedy (tree-verify is greedy by
-                // construction) and ignore these.
+                // (top_k,top_p) nucleus truncation on draft + target.
                 self.sample_temp,
                 self.sample_top_p, // top_p (1.0 = no truncation)
                 self.sample_top_k, // top_k (0 = top_p-only)
@@ -2996,10 +2842,8 @@ impl Speculator for DflashSpeculator {
         // and skipping a window would leave its pending cycle unlabelled
         // forever (the tuner finalizes strictly in order), so it is fed
         // every chain window exactly as before.
-        if df.ddtree.is_none() {
-            if let (Ok(r), Some(t)) = (&result, df.draft_scratch.online.as_mut()) {
-                t.observe(position, &r.committed[1..], r.accepted);
-            }
+        if let (Ok(r), Some(t)) = (&result, df.draft_scratch.online.as_mut()) {
+            t.observe(position, &r.committed[1..], r.accepted);
         }
         // Armed lookup: the controller learns from the window it actually ran
         // (`LookupController::observe` owns the censoring / source-separated
@@ -3036,8 +2880,7 @@ impl Speculator for DflashSpeculator {
         // Feed the committed accept count into the trailing-τ controller for
         // the NEXT cycle's proposal width (cap_emit already reconciled
         // `accepted` with the truncated emit, so this is what really
-        // committed). DDTree has its own structural budget — only the chain
-        // proposal width shrinks; the tree budget is never fed here.
+        // committed).
         if let (Ok(s), true) = (&lowered, feed_adaptive) {
             let prev = self.adaptive.effective();
             let next = self.adaptive.observe(s.accepted);
@@ -3081,16 +2924,11 @@ impl Speculator for DflashSpeculator {
                         // follow the seed.
                         b: r.drafted.len(),
                         max_emit,
-                        temp: if df.ddtree.is_some() {
-                            temp
-                        } else {
-                            self.sample_temp
-                        },
+                        temp: self.sample_temp,
                         drafted: r.drafted.get(1..).unwrap_or(&[]),
                         accepted: r.accepted,
                         committed: &s.emit,
                         step_us,
-                        ddtree: df.ddtree.is_some(),
                         lookup: lk_trace.map(|(kind, k, lookup)| cycle_trace::LookupTag {
                             kind,
                             k,
@@ -3104,30 +2942,6 @@ impl Speculator for DflashSpeculator {
         }
         self.last_window = lowered.as_ref().ok().map(|_| window_mark);
         lowered
-    }
-
-    fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
-        self.last_window = None;
-        if let Some(owner) = self.railgun.as_mut() {
-            owner.invalidate();
-        }
-        // Compact the drafter's cached target-hidden rows to match the target KV
-        // after the FlashCASK eviction the daemon already applied to the target.
-        let df = self
-            .df
-            .as_mut()
-            .ok_or_else(|| SINGLETON_VACANT.to_string())?;
-        let ne = df.draft_config.num_extract();
-        let h = df.draft_config.hidden;
-        apply_eviction_retain_to_draft(
-            gpu,
-            &mut df.draft_scratch,
-            &retain.retain_mask,
-            ne,
-            h,
-            retain.pre_phys,
-        )
-        .map_err(|e| e.to_string())
     }
 
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
@@ -3188,7 +3002,7 @@ impl Speculator for DflashSpeculator {
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
         let mut parts = DflashTargetParts::from_slot(slot);
         let policy = DflashCheckpointPolicy {
-            resume_enabled: self.resume_enabled,
+            resume_enabled: true,
             interval: self.ck_interval,
             cap: self.ck_cap,
         };
@@ -3238,8 +3052,19 @@ impl Speculator for DflashSpeculator {
         }
     }
 
+    fn set_turn_boundary(&mut self, boundary: Option<usize>) {
+        self.turn_boundary = boundary;
+    }
+
     fn checkpoint_positions(&self) -> Vec<usize> {
         self.checkpoints.iter().map(|(p, _)| *p).collect()
+    }
+
+    fn checkpoint_prefix_hashes(&self) -> Vec<(usize, u64)> {
+        self.checkpoints
+            .iter()
+            .map(|(p, snap)| (*p, snap.prefix_hash))
+            .collect()
     }
 
     fn rewind_to(
@@ -3353,23 +3178,14 @@ impl Speculator for DflashSpeculator {
 
 /// Construct the DFlash speculator from a freshly-loaded `DflashState`, resolving
 /// the env config the daemon's old `generate_dflash` read inline: checkpoint
-/// resume (`HIPFIRE_DFLASH_CKPT_RESUME` + no-eviction) and interval/cap
+/// interval/cap
 /// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
 /// `ckpt_interval()`/`ckpt_max()` defaults), plus the adaptive-B kill-switch
-/// (`HIPFIRE_DFLASH_ADAPTIVE_B=0` forces the fixed full block, mirroring
-/// DSpark's `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`). Called once at load.
+/// (`HIPFIRE_DFLASH_ADAPTIVE_B=0` forces the fixed full block). Called once
+/// at load.
 /// `adaptive_b` is the `SpecLoadCfg::dflash_adaptive_b` load param (None =
 /// default off).
-pub fn build_dflash_speculator(
-    df: DflashState,
-    eviction_is_none: bool,
-    adaptive_b: bool,
-) -> Box<dyn Speculator> {
-    let resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
-        .ok()
-        .as_deref()
-        != Some("0")
-        && eviction_is_none;
+pub fn build_dflash_speculator(df: DflashState, adaptive_b: bool) -> Box<dyn Speculator> {
     let ck_interval = hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -3403,7 +3219,7 @@ pub fn build_dflash_speculator(
         );
     }
     let adaptive_b = adaptive_b && !pm4_replay;
-    let mut speculator = DflashSpeculator::new(df, resume_enabled, ck_interval, ck_cap, adaptive_b);
+    let mut speculator = DflashSpeculator::new(df, ck_interval, ck_cap, adaptive_b);
     speculator.configure_lookup(
         hipfire_config::dflash_lookup_enabled(),
         hipfire_config::dflash_lookup_tail_enabled(),
@@ -3488,7 +3304,7 @@ pub struct DflashVmmAssets {
     pub tape_max_rows: usize,
     pub block_size: usize,
     pub checkpoint: DflashCheckpointPolicy,
-    /// Proof of fixed-block chain eligibility: no DDTree, no admitted
+    /// Proof of fixed-block chain eligibility: no admitted
     /// retained-PM4 route, adaptive block controller disabled.
     pub fixed_chain: bool,
 }
@@ -3512,7 +3328,7 @@ impl DflashVmmAssets {
 
 /// Allocate a clean DFlash `DflashState` against the shared weights and
 /// resolved policy of `assets` (no weight load). Fixed-chain lanes have
-/// `ddtree = None` and an explicitly disabled retained verify route. `kind`
+/// an explicitly disabled retained verify route. `kind`
 /// selects the scratch footprint ([`DflashOwnerKind`]): `VmmLane` omits the
 /// draft FWHT rotation buffers and the verify `prefill_batch`; `Singleton` is
 /// the full owner set (the speculator's lazily rebuilt state).
@@ -3558,7 +3374,6 @@ pub fn new_dflash_lane_state(
         gdn_tape,
         ctx_capacity: assets.ctx_capacity,
         block_size: assets.block_size,
-        ddtree: None,
         verify_pm4: DflashVerifyPm4::disabled("VMM continuous-batching lane is eager-only"),
     })
 }
@@ -3622,7 +3437,7 @@ fn quiesce_for_lane_move(gpu: &mut Gpu) -> Result<(), String> {
 
 impl DflashSpeculator {
     /// Shared-asset descriptor for a VMM engine. `Err(reason)` when the loaded
-    /// speculator is not a fixed-block chain DFlash (DDTree, admitted retained
+    /// speculator is not a fixed-block chain DFlash (admitted retained
     /// PM4, or adaptive block controller enabled). While the lane state is
     /// vacant the descriptor it was taken with is returned (a clone of the
     /// same weights `Arc`).
@@ -3633,9 +3448,6 @@ impl DflashSpeculator {
                 .clone()
                 .ok_or_else(|| SINGLETON_VACANT.to_string());
         };
-        if df.ddtree.is_some() {
-            return Err("DFlash VMM lanes require chain mode (DDTree is loaded)".into());
-        }
         if df.verify_pm4.admitted() {
             return Err("DFlash VMM lanes refuse an admitted retained-PM4 verify route".into());
         }
@@ -3655,7 +3467,7 @@ impl DflashSpeculator {
             tape_max_rows: df.gdn_tape.max_n,
             block_size: df.block_size,
             checkpoint: DflashCheckpointPolicy {
-                resume_enabled: self.resume_enabled,
+                resume_enabled: true,
                 interval: self.ck_interval,
                 cap: self.ck_cap,
             },
@@ -3669,7 +3481,7 @@ impl DflashSpeculator {
     /// no replacement state is allocated (a promoted lane lives for the whole
     /// batch; the singleton rebuilds a fresh state on its next `prefill`,
     /// [`Self::ensure_live`], or takes the lane back via
-    /// [`Self::restore_vmm_lane`]). A refused request (DDTree / PM4 /
+    /// [`Self::restore_vmm_lane`]). A refused request (PM4 /
     /// adaptive, or already vacant) and a failed quiesce leave the speculator
     /// untouched. No re-prefill, no projection-watermark reset.
     /// Pointer-bound singleton verify graphs are destroyed.
@@ -3695,7 +3507,7 @@ impl DflashSpeculator {
             sample_cactus: self.sample_cactus,
             checkpoints: std::mem::take(&mut self.checkpoints),
             policy: DflashCheckpointPolicy {
-                resume_enabled: self.resume_enabled,
+                resume_enabled: true,
                 interval: self.ck_interval,
                 cap: self.ck_cap,
             },
@@ -3838,6 +3650,7 @@ pub fn dflash_prefill_lane_parts(
         ckpt_sink,
         policy.interval,
         policy.cap,
+        &mut TurnCheckpoint::default(),
     )
     .map_err(|e| {
         hipfire_runtime::reset_core::note_hip_error(&e, "qwen35::dflash_prefill::seed");
@@ -3857,9 +3670,9 @@ pub fn dflash_prefill_lane_parts(
         0,
         None,
     )?;
-    // Shared with the singleton prefill (lines 890-913 originally):
-    // `chain = true`, the lane runs the selector chain route.
-    let first_token = dflash_first_token(&first_logits, true, cfg, rng, scratch);
+    // Shared with the singleton prefill (lines 890-913 originally): the lane
+    // runs the selector chain route.
+    let first_token = dflash_first_token(&first_logits, cfg, rng, scratch);
     Ok(PrefillOutcome::Ready { first_token })
 }
 
@@ -3900,10 +3713,12 @@ pub fn dflash_repair_terminal_prefix_parts(
         &mut df.hidden_rb,
         &replay,
         position,
+        &[],
         &|| false,
         policy.resume_enabled.then_some(checkpoints),
         policy.interval,
         policy.cap,
+        &mut TurnCheckpoint::default(),
     )
     .map_err(|e| e.to_string())?;
     debug_assert!(!aborted, "terminal repair uses a non-aborting callback");
@@ -3948,7 +3763,6 @@ pub fn admit_dflash_verify_pm4(
     runtime_extract_layers: &[usize],
     runtime_block_size: usize,
     target_layer_ids: &[usize],
-    ddtree_present: bool,
     prefill_batch_present: bool,
     pbs_eligible_b16: bool,
     verify_max_n: usize,
@@ -3997,9 +3811,6 @@ pub fn admit_dflash_verify_pm4(
             "runtime block size is {runtime_block_size}, not {DFLASH_VERIFY_PM4_BLOCK}"
         ));
     }
-    if ddtree_present {
-        return Err("DDTree is present".into());
-    }
     if !prefill_batch_present {
         return Err("verify_scratch.prefill_batch is absent".into());
     }
@@ -4039,8 +3850,8 @@ pub fn admit_dflash_verify_pm4(
 // greedy-only; retained PM4 and HipGraph verify stay disarmed on this path.
 
 /// One rank's draft replica + mesh bookkeeping. `dflash` mirrors the
-/// single-GPU `DflashState` layout (chain-only: `ddtree` is always `None`,
-/// `verify_pm4` always disabled); `tp_partial` is the persistent `[B,H]`
+/// single-GPU `DflashState` layout (chain-only: `verify_pm4` always
+/// disabled); `tp_partial` is the persistent `[B,H]`
 /// reduction staging for that rank's device.
 pub struct DenseTpDflashRankState {
     pub dflash: DflashState,
@@ -4057,7 +3868,7 @@ pub struct DenseTpDflashSpeculator {
 
 /// Transactionally build both draft replicas. Every rank binds its own device
 /// and runs the single-rank load logic under a `DenseTp2EagerGreedy` posture:
-/// fixed B=16, DFlash2 all-sliding selector draft, no DDTree/PFlash/CASK/
+/// fixed B=16, DFlash2 all-sliding selector draft, no
 /// adaptive-KV state, PM4/graph never armed. A later rank's failure frees all
 /// earlier ranks' draft + partial state; borrowed target state is untouched.
 /// Returns the mesh owner; target rank configs must already exist.
@@ -4108,14 +3919,8 @@ pub fn load_dflash_speculator_dense_tp2(
         ));
     }
     // Window posture mirrors `load_dflash_state` (declared window by default,
-    // explicit override or Legacy opt-out via HIPFIRE_DFLASH_WINDOW). Mesh
-    // loads never enable eviction, so no ring-aware refusal applies here.
-    warn_deprecated_legacy_dflash_knobs();
-    let window = match hipfire_config::developer_var("HIPFIRE_DFLASH_WINDOW")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(0) => None,
+    // explicit override via HIPFIRE_DFLASH_WINDOW).
+    let window = match dflash_window_override()? {
         Some(w) => {
             if let Some(declared) = draft_config.declared_window {
                 if declared != w {
@@ -4132,14 +3937,7 @@ pub fn load_dflash_speculator_dense_tp2(
     let requested_ctx = ctx_capacity;
     let ctx_capacity = match window {
         Some(_) => requested_ctx,
-        None => match hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            Some(0) => ctx_capacity,
-            Some(cap) => ctx_capacity.min(cap),
-            None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
-        },
+        None => ctx_capacity.min(DEFAULT_DFLASH_CTX_CAP),
     };
     let mut ranks: Vec<DenseTpDflashRankState> = Vec::with_capacity(2);
     // Free helper for the transactional unwind: every rank state fully built
@@ -4286,7 +4084,6 @@ pub fn load_dflash_speculator_dense_tp2(
                     ctx_capacity
                 },
                 block_size,
-                ddtree: None,
                 verify_pm4: DflashVerifyPm4::disabled("dense TP mesh is eager-only"),
             },
             tp_partial,
@@ -4426,7 +4223,6 @@ mod admit_dflash_verify_pm4_tests {
         runtime_extract_layers: &'static [usize],
         runtime_block_size: usize,
         target_layer_ids: &'static [usize],
-        ddtree_present: bool,
         prefill_batch_present: bool,
         pbs_eligible_b16: bool,
         verify_max_n: usize,
@@ -4449,7 +4245,6 @@ mod admit_dflash_verify_pm4_tests {
                 runtime_extract_layers: &DFLASH_VERIFY_PM4_EXTRACT_LAYERS,
                 runtime_block_size: DFLASH_VERIFY_PM4_BLOCK,
                 target_layer_ids: &DFLASH_VERIFY_PM4_EXTRACT_LAYERS,
-                ddtree_present: false,
                 prefill_batch_present: true,
                 pbs_eligible_b16: true,
                 verify_max_n: DFLASH_VERIFY_PM4_BLOCK,
@@ -4473,7 +4268,6 @@ mod admit_dflash_verify_pm4_tests {
             a.runtime_extract_layers,
             a.runtime_block_size,
             a.target_layer_ids,
-            a.ddtree_present,
             a.prefill_batch_present,
             a.pbs_eligible_b16,
             a.verify_max_n,
@@ -4615,16 +4409,6 @@ mod admit_dflash_verify_pm4_tests {
             err,
             "hidden-ring extract layers [5, 19, 33, 47, 61] != draft target_layer_ids [5, 19, 33, 47, 60]"
         );
-    }
-
-    #[test]
-    fn rejects_ddtree() {
-        let err = admit(Args {
-            ddtree_present: true,
-            ..Args::default()
-        })
-        .unwrap_err();
-        assert_eq!(err, "DDTree is present");
     }
 
     #[test]

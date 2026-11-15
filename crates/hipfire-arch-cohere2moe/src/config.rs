@@ -29,7 +29,6 @@
 //! No QK-norm, no attention bias, `logit_scale=1.0` (no-op), tied embeddings.
 
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::model_source::ModelSource;
 use serde::Deserialize;
 
 /// Per-layer attention kind, decoded from `layer_types`.
@@ -174,9 +173,8 @@ impl Cohere2MoeConfig {
         Self::from_metadata_json(&hfq.metadata_json)
     }
 
-    /// Parse from a `metadata_json` string (HFQ metadata OR a SafetensorsSource's
-    /// config.json, both of which embed the HF config under the `config` key).
-    /// Shared by `from_hfq` and `from_safetensors`.
+    /// Parse from a `metadata_json` string (HFQ metadata, which embeds the HF
+    /// config under the `config` key). Used by `from_hfq`.
     pub fn from_metadata_json(metadata_json: &str) -> Result<Self, String> {
         let wrapper: serde_json::Value = serde_json::from_str(metadata_json)
             .map_err(|e| format!("cohere2moe: metadata_json not valid JSON: {e}"))?;
@@ -184,14 +182,6 @@ impl Cohere2MoeConfig {
             .get("config")
             .ok_or_else(|| "cohere2moe: metadata_json missing `config` wrapper".to_string())?;
         Self::from_config_value(inner)
-    }
-
-    /// Parse the config from a safetensors directory source (the transparent
-    /// Dir loading path). Mirrors `qwen35::config_from_safetensors`. The
-    /// `SafetensorsSource` embeds config.json under the same `config` wrapper
-    /// key as HFQ metadata, so this reuses `from_metadata_json`.
-    pub fn from_safetensors(source: &dyn ModelSource) -> Result<Self, String> {
-        Self::from_metadata_json(source.metadata_json())
     }
 
     /// Parse from a raw `config.json` Value (the inner `config` blob).
@@ -283,11 +273,10 @@ impl Cohere2MoeConfig {
 mod config_tests {
     use super::*;
 
-    /// The transparent Dir path: SafetensorsSource::metadata_json embeds
-    /// config.json under the `config` key (same as HFQ metadata), so
-    /// from_metadata_json (which from_safetensors delegates to) must parse it.
+    /// HFQ metadata embeds the HF config under the `config` key; this test
+    /// checks that `from_metadata_json` parses that wrapper.
     #[test]
-    fn from_metadata_json_parses_dir_shape() {
+    fn from_metadata_json_parses_config_wrapper() {
         let json = r#"{"config":{
             "vocab_size": 256000, "hidden_size": 2048, "num_hidden_layers": 4,
             "num_attention_heads": 16, "num_key_value_heads": 4,
@@ -295,7 +284,7 @@ mod config_tests {
             "sliding_window": 4096,
             "layer_types": ["sliding_attention","sliding_attention","sliding_attention","full_attention"]
         }}"#;
-        let cfg = Cohere2MoeConfig::from_metadata_json(json).expect("parse Dir config");
+        let cfg = Cohere2MoeConfig::from_metadata_json(json).expect("parse config wrapper");
         assert_eq!(cfg.num_hidden_layers, 4);
         assert_eq!(cfg.num_experts, 8);
         assert_eq!(cfg.sliding_window, 4096);

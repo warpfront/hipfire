@@ -90,7 +90,7 @@
       "DFlash": "docs/speculation-support-inventory.md (DFlash is per model arch, GPU-generic); tuned: CHANGELOG 0.4.2 gfx1100 shared rotations, gfx1151 XLDS verify GEMMs, gfx1201 continuous-batching / device accept; CHANGELOG 0.4.4 gfx1201 native-fp8 split-KV verifier (#921, #922)",
       "MTP": "docs/speculation-support-inventory.md (MTP per model arch); tuned: CHANGELOG 0.4.2 gfx1151 MTP cap 4 + DET prompt fill, gfx1201 batched MTP fill; CHANGELOG 0.4.4 exact gfx1100 int8-activation verify GEMV (#987), WMMA split-K verify attention (#989), 65,536-token draft vocabulary (#998), all default on",
       "NPU prefill": "CHANGELOG 0.4.2 Flash-Next NPU trunk route: exact gfx1151 with XDNA2 only",
-      "Redline": "README / docs/ARCHITECTURE.md Redline roles: RDNA1-RDNA4 dispatch; mq4r_redline_default on exact gfx1100/gfx1151/gfx1201"
+      "Redline": "README / docs/ARCHITECTURE.md Redline roles: RDNA1-RDNA4 dispatch; mq4r_redline_default (MQ4R SKU by HFQ metadata or registry card) on exact gfx1100/gfx1151/gfx1201"
     }
   }
 }

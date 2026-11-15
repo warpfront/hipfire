@@ -40,8 +40,7 @@
 //! ## T = 2..8 (prefill-family Path 2, sealed grouped program; stage order
 //! `moe_program.rs:2063-2076`: scatter, gate_up, unscatter, activation, down, combine)
 //!
-//! * `use_path2 = moe_grouped_gemm && arch.has_wmma() && (!narrow_verify || ..)`
-//!   (`families/moe.rs:2611-2613`): `moe_grouped_gemm` defaults on (`feature_flags.rs:1159-1162`),
+//! * `use_path2 = arch.has_wmma() && (!narrow_verify || ..)` (`families/moe.rs`),
 //!   `has_wmma` = RDNA3|RDNA4 (`arch_caps.rs:145,457`; gfx1100 HAS wmma). `narrow_verify` needs
 //!   `is_verify && has_host_projection` (`moe.rs:2596-2597`) and `is_verify` is
 //!   `ctx.workload == SpeculativeVerify` (`moe_program.rs:4115-4122`), which the qwen4 FN forward
@@ -92,7 +91,7 @@
 //!
 //! ## T = 1 (AR decode family, `select_decode` `moe_program.rs:3048-3105`)
 //!
-//! Grouped route requires `SoftmaxGatedShared`, `batch_size == 1`, no EP / Paro / deferred combine
+//! Grouped route requires `SoftmaxGatedShared`, `batch_size == 1`, no EP / deferred combine
 //! and `select_grouped_route` (`mod.rs:322-423`: capability admitted, geometry, formats, no
 //! tags / sidecars); decode params `program.rs:1107-1128` (`batch_size: 1`, `x_rot_prerotated:
 //! false`, `normalization: Provided`). Same four Gpu launchers on every arch, residency-blind:
@@ -121,7 +120,7 @@
 //!
 //! Live check: `setup` re-evaluates the public selector predicates on the actual `Gpu`
 //! (`route_rows`, `few_row_limit`, `qwen4_moe_sym_iu4_applies`, `qwen4_moe_gateup_wmma_applies`,
-//! `qwen4_moe_down_wmma_applies`, `has_wmma`, `moe_grouped_gemm`) and refuses when any differs from
+//! `qwen4_moe_down_wmma_applies`, `has_wmma`) and refuses when any differs from
 //! the table (e.g. a lab env switch moved the shipped route).
 //!
 //! ## Not modelled (stated, not guessed)
@@ -1469,11 +1468,10 @@ impl ChainBase {
                 gpu.arch, self.ctx.arch
             ));
         }
-        if !gpu.arch_caps.has_wmma() || !gpu.flags.moe_grouped_gemm {
+        if !gpu.arch_caps.has_wmma() {
             return Err(
-                "qwen4_moe_verify: use_path2 is false on this device/env (has_wmma / \
-                 HIPFIRE_MOE_GROUPED_GEMM); the shipped route differs from the traced one \
-                 (families/moe.rs:2611-2613)"
+                "qwen4_moe_verify: use_path2 is false on this device (has_wmma); the shipped \
+                 route differs from the traced one (families/moe.rs)"
                     .into(),
             );
         }
@@ -1582,9 +1580,9 @@ impl ChainBase {
         if t >= 2 {
             v.extend([
                 p(
-                    "use_path2 = moe_grouped_gemm && arch.has_wmma() && (!narrow_verify || offloaded_uniform_verify)",
+                    "use_path2 = arch.has_wmma() && (!narrow_verify || offloaded_uniform_verify)",
                     json!(true),
-                    "crates/hipfire-dispatch/src/families/moe.rs:2611-2613; feature_flags.rs:1159-1162; arch_caps.rs:145,457",
+                    "crates/hipfire-dispatch/src/families/moe.rs; arch_caps.rs:145,457",
                 ),
                 p(
                     "narrow_verify = is_verify && has_host_projection && batch<=4 (is_verify = ctx.workload==SpeculativeVerify; qwen4 FN seals Standard)",
@@ -1650,7 +1648,7 @@ impl ChainBase {
         } else {
             v.extend([
                 p(
-                    "select_decode: SoftmaxGatedShared && batch_size==1 && ep None && no Paro && !defer_routed_combine -> select_grouped_route",
+                    "select_decode: SoftmaxGatedShared && batch_size==1 && ep None && !defer_routed_combine -> select_grouped_route",
                     json!(true),
                     "crates/hipfire-dispatch/src/pipeline/moe_program.rs:3048-3105; mod.rs:322-423; program.rs:1107-1128",
                 ),

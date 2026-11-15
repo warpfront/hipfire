@@ -38,6 +38,21 @@ peacemaker-lift = { path = "../peacemaker-lift" }
 peacemaker-rip = { path = "../peacemaker-rip" }
 railgun-cert = { path = "../railgun-cert" }
 [[example]]
+name = "gdn_capture_f32_gfx942_oracle"
+required-features = ["lab"]
+[[example]]
+name = "gdn_lanes_f32_gfx942_oracle"
+required-features = ["lab"]
+[[example]]
+name = "gdn_lanes_verify_f32_gfx942_oracle"
+required-features = ["lab"]
+[[example]]
+name = "qsa_lanes_gfx942_oracle"
+required-features = ["lab"]
+[[example]]
+name = "qwen4_g942_mq2_xbatch_oracle"
+required-features = ["lab"]
+[[example]]
 name = "bench_stream_mix_chain_gfx1201"
 required-features = ["lab"]
 [[example]]
@@ -324,10 +339,6 @@ name = "bench_e8_verify_tiles"
 required-features = ["lab"]
 
 [[example]]
-name = "bench_fused_qkvza_lowbit"
-required-features = ["lab"]
-
-[[example]]
 name = "bench_gate_up_hfq4_variants"
 required-features = ["lab"]
 
@@ -504,10 +515,6 @@ name = "bench_qkvza_q8_vs_mq4"
 required-features = ["lab"]
 
 [[example]]
-name = "bench_qkvza_ternary_vs_mq4"
-required-features = ["lab"]
-
-[[example]]
 name = "bench_rocblas_vs_wmma_f16"
 required-features = ["lab"]
 
@@ -532,19 +539,7 @@ name = "burst_real_kernels"
 required-features = ["lab"]
 
 [[example]]
-name = "channel_q8_mmq_gfx1030"
-required-features = ["lab"]
-
-[[example]]
 name = "channel_test_hfq4g128_batched"
-required-features = ["lab"]
-
-[[example]]
-name = "ddtree_gumbel_check"
-required-features = ["lab"]
-
-[[example]]
-name = "ddtree_swor_kernel_check"
 required-features = ["lab"]
 
 [[example]]
@@ -557,6 +552,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "gdn_chunk_generalized_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_chunk_tail_kill"
 required-features = ["lab", "deltanet"]
 
 [[example]]
@@ -608,27 +607,11 @@ name = "sample_accept_parity"
 required-features = ["lab"]
 
 [[example]]
-name = "sample_parallel_stable_parity"
-required-features = ["lab"]
-
-[[example]]
 name = "sample_slot_rng_advance"
 required-features = ["lab"]
 
 [[example]]
 name = "test_attention_dflash"
-required-features = ["lab"]
-
-[[example]]
-name = "test_conv1d_tree"
-required-features = ["lab"]
-
-[[example]]
-name = "test_dequant_bq1g128"
-required-features = ["lab"]
-
-[[example]]
-name = "test_dequant_tq2g128"
 required-features = ["lab"]
 
 [[example]]
@@ -665,14 +648,6 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_fwht_128_gpu_vs_cpu"
-required-features = ["lab"]
-
-[[example]]
-name = "test_gated_delta_net_f32_tree"
-required-features = ["lab"]
-
-[[example]]
-name = "test_gated_delta_net_tree"
 required-features = ["lab"]
 
 [[example]]
@@ -855,9 +830,6 @@ required-features = ["lab"]
 name = "test_mfp4e8_grouped_gfx942"
 required-features = ["lab"]
 
-[[example]]
-name = "test_mfp4e8_grouped_wave64x4_gfx942"
-required-features = ["lab"]
 
 [[example]]
 name = "test_mfp4e8_lds8_family_gfx942"
@@ -913,14 +885,6 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_moe_grouped_wmma_e8"
-required-features = ["lab"]
-
-[[example]]
-name = "test_moe_grouped_wmma_hfp4"
-required-features = ["lab"]
-
-[[example]]
-name = "test_moe_grouped_wmma_hfq3"
 required-features = ["lab"]
 
 [[example]]
@@ -991,9 +955,6 @@ required-features = ["lab"]
 name = "vmm_tensor_smoke"
 required-features = ["lab"]
 
-[[example]]
-name = "host_kernel_access"
-required-features = ["lab"]
 
 [[example]]
 name = "host_offload_headroom"
@@ -1055,9 +1016,6 @@ required-features = ["lab"]
 name = "bench_attention_flux_vt"
 required-features = ["lab"]
 
-[[example]]
-name = "tmp_scratch_leak_probe"
-required-features = ["lab"]
 
 [[example]]
 name = "test_kv_slot_desc_ports"
@@ -1199,6 +1157,16 @@ required-features = ["lab"]
 name = "lane_gdn_oracle"
 required-features = ["lab", "deltanet"]
 
+# Qwen3.5-family prefill GDN chunk/EF oracle (slice A of reliability/CHUNK-KL.md):
+# production gated_delta_net_q8_batch_seq(_indexed) vs F64 recurrence, whole-call
+# vs split-call, eager + hipGraph. Needs the deltanet-gated GDN launchers, so
+# build with `--features lab,deltanet`. `test = true` runs its CPU-only regressions
+# (`cargo test -p rdna-compute --features lab,deltanet --example qwen35_prefill_chunk_oracle`).
+[[example]]
+name = "qwen35_prefill_chunk_oracle"
+required-features = ["lab", "deltanet"]
+test = true
+
 [[example]]
 name = "lane_fa_oracle"
 required-features = ["lab", "deltanet"]
@@ -1293,6 +1261,10 @@ name = "bench_q8_lmhead_rows"
 required-features = ["lab"]
 
 [[example]]
+name = "test_gate_up_f16_xlds_gfx1151"
+required-features = ["lab"]
+
+[[example]]
 name = "lane_rows_pm_gfx1201_h0"
 required-features = ["lab"]
 
@@ -1325,11 +1297,6 @@ required-features = ["lab"]
 name = "railgun_persistent_cancel_smoke"
 required-features = ["lab"]
 
-# Peer-VRAM push + flag collective vs the incumbent TP2 graph collective
-# (two gfx1201 cards); `--features lab`.
-[[example]]
-name = "tp_peer_push_probe"
-required-features = ["lab"]
 
 # TP4 bf16 peer-push collective chain on four gfx1201 cards; `--features lab`.
 [[example]]
@@ -1368,4 +1335,61 @@ required-features = ["lab"]
 
 [[example]]
 name = "gdn_chunk_pm_oracle"
+required-features = ["lab"]
+
+# S0 kill oracles of reliability/CHUNK-CANONICAL-DESIGN.md §6 (canonical GDN
+# prefill producers + absolute-position carry). Shared support:
+# examples/gdn_canon_common/ (included via #[path]).
+[[example]]
+name = "gdn_canon_producer_kill"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canon_scan_prefix_kill"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canon_reference_kill"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canon_snapshot_kill"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canon_wy_prefix_kill"
+required-features = ["lab", "deltanet"]
+
+# Canonical GDN prefill oracles / probes (reliability/CHUNK-CANONICAL-DESIGN.md G1/G3):
+# build with `--features lab,deltanet` (gdn_*) or `--features lab` (attn_call_shape_oracle_gfx11,
+# wmma_zero_sign_probe).
+[[example]]
+name = "gdn_canon_stream_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canon_bulk_digest"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_canonical_producer_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_wy_stream_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "attn_call_shape_oracle_gfx11"
+required-features = ["lab"]
+
+
+# gfx942 wide-lane MoE modules: exact-image byte oracles (module vs the routes they replace vs the
+# public launchers; HIPFIRE_QWEN4_G942_MOE_{WIDE,GEMM}_IMAGE honored).
+[[example]]
+name = "qwen4_g942_moe_wide_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_g942_moe_gemm_oracle"
 required-features = ["lab"]

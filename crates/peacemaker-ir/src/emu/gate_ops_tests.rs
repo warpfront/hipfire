@@ -58,10 +58,11 @@ fn insn_with(name: &str, ops: Vec<Operand>, mods: Modifiers, fields: FormFields)
         .iter()
         .find(|r| r.name == name)
         .unwrap_or_else(|| panic!("{name} missing from the gfx1100 table"));
-    Inst::from_parts(
+    Inst::from_encoding(
         Arch::Gfx1100,
         row.op,
         row.form,
+        row.variant,
         fields,
         ops.into_iter().collect(),
         mods,

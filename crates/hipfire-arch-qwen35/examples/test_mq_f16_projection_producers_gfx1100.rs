@@ -289,7 +289,6 @@ fn main() {
                     m: 8,
                     k,
                     row_stride: 0,
-                    paro: None,
                     awq_scale: if awq { Some(d_awq) } else { None },
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,

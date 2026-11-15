@@ -518,6 +518,11 @@ struct Rig {
     sessions: SessionTable,
     adm: AdmissionController,
     swap: SwapManager,
+    /// Host stream cursors (schema/recipe/phase/absolute position per LA layer)
+    /// of parked sessions. The swap store holds only tensor bytes; the cursors
+    /// must travel with them or a restored Open prefill would resume with the
+    /// wrong position. Keyed like `swap`; pruned when the session is gone.
+    parked_streams: std::collections::HashMap<u64, crate::qwen35::weights::GdnStreamImage>,
     stamp: SnapshotStamp,
     n_slots: usize,
     cap_tokens: usize,
@@ -636,13 +641,10 @@ fn cached_compile_schema(
     Ok(compiled)
 }
 
+/// Every device buffer a DeltaNet state owns (recurrence, scales, conv, EF and
+/// the persistent GDN carry), for byte accounting and ownership lists.
 fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
-    let mut v: Vec<&GpuTensor> = Vec::new();
-    v.extend(dn.s_matrices.iter());
-    v.extend(dn.s_scales.iter());
-    v.extend(dn.conv_states.iter());
-    v.extend(dn.s_ef_residual.iter());
-    v
+    dn.families().into_iter().flatten().collect()
 }
 
 /// Layer ordinal in an HFQ tensor name (`layers.<n>.…`, optionally behind a
@@ -664,15 +666,13 @@ pub(crate) fn tensor_layer_index(name: &str) -> Option<usize> {
 }
 
 /// Per-tier discriminant: K/V spans are stride-shaped, so a snapshot must
-/// never restore into a different KV tier. Preserve the historical tags.
+/// never restore into a different KV tier. Preserve the historical tags
+/// (21/31/41, the removed Givens asym tiers, stay retired).
 fn slot_snapshot_kv_tag(kv_mode: hipfire_runtime::kv_mode::KvMode) -> u32 {
     use hipfire_runtime::kv_mode::KvMode;
 
     match kv_mode {
         KvMode::Q8 => 1,
-        KvMode::Asym2 => 21,
-        KvMode::Asym3 => 31,
-        KvMode::Asym4 => 41,
         KvMode::Fwht2 => 22,
         KvMode::Fwht3 => 32,
         KvMode::Fwht4 => 42,
@@ -1102,6 +1102,8 @@ impl Rig {
             let layout = qwen35::Layout::single(config.n_layers).with_placement(placement.clone());
             let weights = qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
                 .map_err(|e| format!("load weights: {e}"))?;
+            // Decide the AR decode graph policy at load (#1149).
+            weights.resolve_moe_decode_host_topk(&config, &gpu);
             (weights, layer_bytes.host_bytes(&placement))
         };
 
@@ -1516,30 +1518,15 @@ impl Rig {
                     .map_err(|e| format!("kv rotation table upload: {e}"))?;
                 Ok(t)
             };
-            let (cos, sin, s1, s2) = match kv_plan.givens_len {
-                Some(len) => {
-                    let (c, si) = KvCache::gen_givens_angles(42, len);
-                    (
-                        Some(upload_f32(gpu, &c)?),
-                        Some(upload_f32(gpu, &si)?),
-                        None,
-                        None,
-                    )
-                }
-                None => match kv_plan.fwht_len {
-                    Some(len) => (
-                        None,
-                        None,
-                        Some(upload_f32(gpu, &KvCache::gen_fwht_signs(42, len))?),
-                        Some(upload_f32(gpu, &KvCache::gen_fwht_signs(1042, len))?),
-                    ),
-                    None => (None, None, None, None),
-                },
+            let (s1, s2) = match kv_plan.fwht_len {
+                Some(len) => (
+                    Some(upload_f32(gpu, &KvCache::gen_fwht_signs(42, len))?),
+                    Some(upload_f32(gpu, &KvCache::gen_fwht_signs(1042, len))?),
+                ),
+                None => (None, None),
             };
             g.kv_tier = Some(crate::forward_slots::SlotKvTier {
                 mode: kv_mode,
-                givens_cos: cos,
-                givens_sin: sin,
                 fwht_signs1: s1,
                 fwht_signs2: s2,
             });
@@ -1564,9 +1551,8 @@ impl Rig {
         )
         .map_err(|e| format!("staging: {e}"))?;
         g.desc_staging = Some(desc_staging);
-        // Slots do plain prefill only — never tree-verify — so skip the GDN
-        // S-tape: at max_batch=cap_tokens it is tens of GB (16k → ~21 GB).
-        let pbs = PrefillBatchScratch::new_opt(g.gpu.as_mut().unwrap(), &config, max_batch, false)
+        // Slots do plain prefill only.
+        let pbs = PrefillBatchScratch::new(g.gpu.as_mut().unwrap(), &config, max_batch)
             .map_err(|e| format!("pbs: {e}"))?;
         g.pbs = Some(pbs);
         let scratch =
@@ -1820,7 +1806,7 @@ impl Rig {
                 },
                 arch_policy: ArchPolicy {
                     arch_tag: "qwen35-deltanet".to_string(),
-                    state_abi_tag: "dn-q8".to_string(),
+                    state_abi_tag: g.dn_states[0].stream.identity().state_abi_tag("dn-q8"),
                     position_attention_tag: "causal-mrope".to_string(),
                 },
                 kv_layout: KvLayout {
@@ -1924,6 +1910,7 @@ impl Rig {
             sessions: SessionTable::default(),
             adm,
             swap,
+            parked_streams: std::collections::HashMap::new(),
             stamp,
             n_slots: cfg.n_slots,
             cap_tokens: cfg.cap_tokens,
@@ -4169,7 +4156,7 @@ fn run_loop(
                         })
                     {
                         // Legacy DFlash owns context-indexed draft buffers capped by
-                        // HIPFIRE_DFLASH_CTX_CAP. Past the cap the documented policy
+                        // DEFAULT_DFLASH_CTX_CAP. Past the cap the documented policy
                         // is plain AR fallback, not an out-of-bounds scatter/assert.
                         work[s].spec = SpecKind::None;
                         if let Some(last) = work[s].remaining_prompt.last().copied() {
@@ -7238,6 +7225,7 @@ fn evict(rig: &mut Rig, victim: SessionId, stats: &Arc<Mutex<EngineStats>>) -> b
     let Some(slot) = sess.slot else { return false };
     let tokens = sess.tokens.clone();
 
+    let stream_image = rig.model.dn_states[slot.0].stream.image();
     let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
     let snap = capture_slot(
         &mut rig.gpu,
@@ -7254,6 +7242,10 @@ fn evict(rig: &mut Rig, victim: SessionId, stats: &Arc<Mutex<EngineStats>>) -> b
     let evicted = match snap {
         Ok(snap) => match rig.swap.park(victim.0, snap) {
             Ok(()) => {
+                rig.parked_streams.insert(victim.0, stream_image);
+                let sessions = &rig.sessions;
+                rig.parked_streams
+                    .retain(|key, _| sessions.get(SessionId(*key)).is_some());
                 rig.sessions
                     .mark_swapped(&mut rig.pool, &mut rig.adm, victim);
                 true
@@ -7301,6 +7293,7 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
             ),
         );
         rig.swap.forget(id.0);
+        rig.parked_streams.remove(&id.0);
         rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
         lock_stats(stats).note_swap(&rig.swap);
         return false;
@@ -7319,6 +7312,16 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
                 rig.stamp,
             );
             drop(dn_refs);
+            // The cursors parked with the tensors; a missing or mismatching
+            // image fails closed to Cold below (never a guessed position).
+            let stream_applied: Result<(), String> = match rig.parked_streams.remove(&id.0) {
+                Some(image) if r.is_ok() => rig.model.dn_states[slot.0]
+                    .stream
+                    .apply_image(&image)
+                    .map_err(|e| e.to_string()),
+                Some(_) => Ok(()),
+                None => Err("no parked GDN stream cursors for session".to_string()),
+            };
             // MTP head KV is per-generation, not per-session. Reset it so
             // the restored session starts a fresh MTP prefill.
             if let Some(state) = rig.model.mtp_states[slot.0].as_mut() {
@@ -7329,6 +7332,7 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
             if let Some(st) = rig.model.dflash_states[slot.0].take() {
                 st.free_gpu(&mut rig.gpu);
             }
+            let r = r.map_err(|e| e.to_string()).and_then(|()| stream_applied);
             match r {
                 Ok(()) => {
                     rig.sessions.mark_resident(id, slot, snap.seq_len);
@@ -7357,6 +7361,7 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
                     id.0
                 ),
             );
+            rig.parked_streams.remove(&id.0);
             rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
             lock_stats(stats).note_swap(&rig.swap);
             false
@@ -7374,9 +7379,6 @@ mod tests {
 
         let tags = [
             (KvMode::Q8, 1),
-            (KvMode::Asym2, 21),
-            (KvMode::Asym3, 31),
-            (KvMode::Asym4, 41),
             (KvMode::Fwht2, 22),
             (KvMode::Fwht3, 32),
             (KvMode::Fwht4, 42),

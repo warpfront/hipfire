@@ -55,12 +55,11 @@ crates/
 ├── hipfire-arch-diffusion/   # FLUX.1 / FLUX.2 image-generation components (ids 40/45)
 ├── hipfire-arch-toy/         # template only (0xFF); never dispatched
 ├── hipfire-ds4-parent/       # DeepSeek V4 parent-checkpoint calibration oracle
-├── hipfire-pflash/           # PFlash prefill compression — deprecated since 0.4.0, removal in 0.5.0
 ├── hipfire-loader/           # Carrier registry, load_model, LoadedModel, batch staging
 ├── hipfire-engine/           # arch-free serve engine: scheduler, terminal, emit, prompt
 ├── hipfire-generate/         # generation bodies: ar, qwen, dense, vision, batch, img, redline fixtures
 ├── hipfire-daemon/           # the product binary — [[bin]] name = "daemon"
-├── hipfire-quantize/         # CPU encoder (safetensors/GGUF → .mq* / .hfq*)
+├── hipfire-quantize/         # CPU encoder (safetensors → .mq* / .hfq*)
 ├── hipfire-detect/           # observational JSONL behavior detectors
 ├── hipfire-atlas/            # Kernel Atlas schema + emit helpers
 ├── hipfire-config/           # typed TOML config + migration
@@ -100,7 +99,6 @@ operator runtime.
 | Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline **transport**: record, retain, replay PM4/AQL (see below) |
 | Typed authoring and validation | `peacemaker-ir`, `peacemaker-lift`, `peacemaker-cdna`, `peacemaker-author`, `peacemaker-isa`, `peacemaker-rip`, `railgun`, `railgun-cert`, `railgun-corpus`, `railgun-jitcorpus` | Machine-code types, lifter, checked builder, certified facts and dispatch-program model. `peacemaker-cdna` (CDNA3/gfx942 instruction model and CPU emulator) is reached only through `peacemaker-isa`'s opt-in `cdna` arm. It is a transitive compile-time dependency of `rdna-compute` (which depends on `peacemaker-isa`), but no runtime dispatch, callsite selection or default behavior uses it. Authoring and validation, **not** the retained transport (see railgun below) |
 | Direct-KMD research | `redline`, `saddle-lab` | Not the serving transport |
-| Deprecated | `hipfire-pflash` | PFlash prefill compression: deprecated since 0.4.0, removal in 0.5.0 |
 | NPU (XDNA2/AIE2P) | `peacemaker-npu`, `railgun` feature `npu`, `hipfire-arch-qwen4` `npu_trunk`, `npu-tools`, `hipfire-xdna` | `hipfire-arch-qwen4` links `peacemaker-npu` and `railgun`'s `npu` feature on Linux; the Flash-Next trunk route defaults to `auto` and arms only on gfx1151 with an openable NPU and matching calibration (see [Qwen4 NPU trunk](#qwen4-npu-trunk-xdna2)). `npu-tools` and `hipfire-xdna` are diagnostic/experimental ([`npu/README.md`](npu/README.md)) |
 
 The dependency edge runs one way and is checked by `cargo tree`:
@@ -142,10 +140,9 @@ router views, and whole-program preflight live there. Neutral stateful
 operation contracts and execution remain in
 `crates/hipfire-dispatch/src/pipeline/layer_ops.rs` and `steps.rs`; the sealed
 QT44/QT53 MoE route remains shared in `pipeline/sealed_moe.rs`,
-`moe_program.rs`, and `qt44_qt53_prefill.rs`. Fixed Qwen4 HIP helpers are
-registered by `hipfire-arch-qwen4/src/gpu_ops.rs`, while
-`rdna-compute/src/tensor_ops.rs` and `grouped_ops.rs` provide neutral wrapper
-contracts. This is an implementation ownership map, not replay/PM4 admission,
+`moe_program.rs`, and `qt44_qt53_prefill.rs`.
+`rdna-compute/src/tensor_ops.rs` and `grouped_ops.rs` provide the neutral HIP
+wrapper contracts. This is an implementation ownership map, not replay/PM4 admission,
 physical-EP proof, or a performance promotion.
 
 With `deltanet` enabled, the fixed-geometry QT44/QT53 route is admitted on
@@ -168,7 +165,6 @@ default. The tile engages `Gpu::prefill_invariant_scope`, so every row-count
 routing predicate sees the canonical chunk while launches keep the real row
 count. `Gpu::qwen4_append_f16_moe_scope` keeps that tile's MoE on the F16 WMMA
 grouped arm, because the IU4 arm below 512 rows exceeds the KLD cap.
-`HIPFIRE_QWEN4_APPEND_WMMA=0` restores the F32 SIMT routes.
 
 ### Qwen4 expert-parallel mesh (Flash-Next, EP2 through EP8)
 
@@ -189,20 +185,19 @@ The mesh is owned by the rank-0 `Qwen4Bundle` (`attach_ep_mesh`,
 threads, each with its own `Gpu`. It is **not** `LoadedModel.ep`, so a Qwen4 EP
 model still takes the ordinary `Qwen4Ar` / `Qwen4Spec` generation route rather
 than `generate_ep`. EP refuses what the replicated program does not run
-(DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK,
-PFlash, an experts-per-token override, a non-Single compute placement; lane
+(DFlash, DSpark, n-gram drafting, adaptive KV, an EAGLE drafter,
+an experts-per-token override, a non-Single compute placement; lane
 steps never run under EP), and native MTP attaches under EP only on an explicit
 `--spec mtp` (`qwen4_ep_option_refusal`, `qwen4_native_mtp`).
 
-Three EP levers are **default-on under EP**, each with an exact-`0` kill switch
-(`gpu_forward.rs`):
+Three EP levers are **default-on under EP** (`gpu_forward.rs`):
 
-- `HIPFIRE_EP_BALANCED_OWNERS`: balanced per-call expert ownership on the
+- Balanced per-call expert ownership on the
   host-mapped trunk MoE layers. It ships for exact gfx1201 at 2..=4 ranks only;
   a gfx1100 rank logs `balanced ownership not admitted (needs gfx1201); static
   split`, a gfx1201 rank at 5..=8 ranks `... (needs at most 4 ranks); static
   split`, and both run the exact static split.
-- `HIPFIRE_EP_OWNER_ROUTED_PREFILL`: owner-routed chunk MoE, EP2 through EP8.
+- Owner-routed chunk MoE, EP2 through EP8.
   A prefill chunk of at least 512 rows computes only its owned expert tiles and
   pulls the other ranks' down rows over P2P, instead of computing every expert
   on every rank. It needs the Flash-Next profile and one of two routes: exact
@@ -211,7 +206,7 @@ Three EP levers are **default-on under EP**, each with an exact-`0` kill switch
   gate/up with the SwiGLU epilogue, BF16-out down; the per-layer verdict is
   the QT44/QT53 expert formats, and the grouping is the stable one so every
   rank shares the grouped layout).
-- `HIPFIRE_EP_EXPERT_STAGE`: Flash-Next long-prefill expert staging. It exists
+- Flash-Next long-prefill expert staging. It exists
   only when owner-routed prefill is admitted and only on gfx1201; a gfx1100
   rank logs `expert staging not admitted (needs gfx1201)` and builds nothing.
 
@@ -339,7 +334,7 @@ Load is **source × carrier**, not a two-file hard split.
 | Source | Type | Arch id origin |
 |---|---|---|
 | HFQ / MQ* artifact | `ModelSource::Hfq(HfqFile)` | Header `HfqFile::arch_id` |
-| Safetensors / Paro directory | `ModelSource::Dir(SafetensorsSource)` | `derive_arch_id` from `config.json` (`architectures` / `model_type`) |
+| Safetensors directory | `ModelSource::Dir(SafetensorsSource)` | `derive_arch_id` from `config.json` (`architectures` / `model_type`) |
 
 Defined in `crates/hipfire-runtime/src/loader_api.rs` and
 `safetensors_source.rs`. Unrecognized dir `model_type` yields sentinel
@@ -347,9 +342,7 @@ Defined in `crates/hipfire-runtime/src/loader_api.rs` and
 to Qwen3.5.
 
 Tensor names follow family-dependent HuggingFace conventions (e.g. dense LLaMA
-`model.layers.{i}.…`; Qwen3.5 nested `model.language_model.layers.…`). GGUF
-inputs map only **recognized** llama.cpp names via `gguf_to_safetensors_name`
-at quantize time; unknown GGUF names are retained unchanged.
+`model.layers.{i}.…`; Qwen3.5 nested `model.language_model.layers.…`).
 
 ### Carriers
 
@@ -524,7 +517,7 @@ After `load_model`, request handling builds sampling defaults
    generate target.
 3. **Route match** on the selected route:
    - **Qwen4 (16)** → `Qwen4Spec` when native MTP is attached and the request
-     fits it (greedy, or sampled with `speculation.mtp_sampled`), else
+     fits it (greedy, or sampled), else
      `Qwen4Ar`. Qwen4 never takes the `m.ep` branch: its EP mesh sits inside
      the bundle.
    - **EP** (`m.ep.is_some()`) → `generate_ep` (ds4 / MiniMax ranks and
@@ -589,8 +582,9 @@ recorder-aware launch site
 **Runtime routing/default ≠ admission or certification.** Example runtime
 automatic default (source capability/default fact only, `REDLINE.md`; not an
 admission or certification record): `mq4r_redline_default` — exact GPU arch
-`gfx1100`/`gfx1151`/`gfx1201` + PP=1 + TP=1 + case-insensitive `.mq4r`
-extension configures model default replay backend (model-family agnostic; no
+`gfx1100`/`gfx1151`/`gfx1201` + PP=1 + TP=1 + the MQ4R SKU (HFQ
+metadata or registry card, never the file extension) configures model default
+replay backend (model-family agnostic; no
 `arch_id` gate); `gfx1200` and all other arches remain opt-in. Built-in `hip`
 config profile, explicit `HIPFIRE_REPLAY_BACKEND`, or manual capture disables
 the automatic default / opts into broader capability.
@@ -642,12 +636,10 @@ accepted sets differ by carrier). Concrete modes include:
 | `q8` | Q8_0 K and V |
 | `fp8` / `bf16` | Native K+V layout (`fp8`: Qwen single-GPU; `bf16`: Qwen quality-control arm, Maple default) |
 | `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers + Q8 V; optional headroom modes |
-| `asym2` / `asym3` / `asym4` | **Deprecated since 0.4.0, removal in 0.5.0**: legacy Givens-rotated Lloyd K + Q8 V (fwht3 supersedes Givens asym KV). On Qwen the bare names alias `fwhtN`; the Givens constructors need `legacy-asymN` |
 
 **Qwen-family `auto` / unset** (arch-aware, Qwen only): native **fp8/fp8** on
 exact `gfx1201` single GPU when the load is native-eligible (H24/Hkv4/D256
-dense or H16/Hkv2/D256 A3B, D256, no adaptive, no CASK
-(deprecated since 0.4.0, removal in 0.5.0), no slots/TP/PP split);
+dense or H16/Hkv2/D256 A3B, D256, no adaptive, no slots/TP/PP split);
 **q8/q8** everywhere else, gfx1100 and gfx1151 included. Native `bf16`
 stays H24 dense-only. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
 compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /
@@ -739,8 +731,7 @@ hipGraph route (Qwen4 replays prepared PM4, below).
   `HIPFIRE_SESSION_CACHE_BYTES=0` also turns it off.
 - **Removed.** The RC3 end-of-prompt checkpoint, the multi-entry radix store
   with typed PM4 relocation, shared-turn anchors and periodic captures no
-  longer exist for Qwen4; `HIPFIRE_QWEN_PROMPT_CACHE` and
-  `HIPFIRE_QWEN_RADIX_CACHE` do not affect it (Qwen3.5 and dense keep their
+  longer exist for Qwen4; `HIPFIRE_QWEN_RADIX_CACHE` does not affect it (Qwen3.5 and dense keep their
   own conversation cache).
 - **Concurrency.** Queued, not parallel: one request executes at a time per
   loaded model; HTTP concurrency queues and there is no GPU slot scheduler.

@@ -68,7 +68,7 @@ jobs:
           sudo systemctl stop docker.socket docker.service
           sudo mkdir -p /mnt/docker
           { sudo cat "$conf" 2>/dev/null || echo '{}'; } \
-            | jq '. + {"data-root": "/mnt/docker"}' | sudo tee "$conf.new" >/dev/null
+            | jq '. + {"data-root": "/mnt/docker", "dns": ["1.1.1.1", "8.8.8.8"]}' | sudo tee "$conf.new" >/dev/null
           sudo mv "$conf.new" "$conf"
           sudo systemctl start docker.service
           df -h / /mnt

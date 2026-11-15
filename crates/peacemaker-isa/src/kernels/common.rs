@@ -118,7 +118,7 @@ pub fn s_add_i32(a: Arch) -> &'static str {
 pub fn smem_off(a: Arch, off: u32) -> String {
     if off != 0 {
         format!("{off:#x}")
-    } else if a.gfx12() {
+    } else if a.gfx12() || a.wave64() {
         "0x0".into()
     } else {
         "null".into()
@@ -160,11 +160,16 @@ pub fn add64_imm(b: &mut Builder, reg: u8, imm: u32) -> Result<(), String> {
 
 /// `s_load_b{32,64,128,256}` of `len` dwords at `s[base:base+1] + off`.
 pub fn smem(b: &mut Builder, dst: u8, len: u8, base: u8, off: u32) -> Result<(), String> {
-    let name = match len {
-        1 => "s_load_b32",
-        2 => "s_load_b64",
-        4 => "s_load_b128",
-        8 => "s_load_b256",
+    let cdna = b.spec.arch.wave64();
+    let name = match (len, cdna) {
+        (1, false) => "s_load_b32",
+        (2, false) => "s_load_b64",
+        (4, false) => "s_load_b128",
+        (8, false) => "s_load_b256",
+        (1, true) => "s_load_dword",
+        (2, true) => "s_load_dwordx2",
+        (4, true) => "s_load_dwordx4",
+        (8, true) => "s_load_dwordx8",
         _ => return Err("SMEM width".into()),
     };
     let d = if len == 1 { s(dst) } else { sr(dst, len) };
@@ -187,6 +192,15 @@ pub fn smem(b: &mut Builder, dst: u8, len: u8, base: u8, off: u32) -> Result<(),
 pub const SRD_WORD3: u32 = 0x3100_4000;
 /// Words 2 and 3 of a raw buffer descriptor whose base is already in words
 /// 0/1: `num_records` from an SGPR, or unbounded (`-1`).
+/// Raw buffer resource word 3 for `a`: gfx9 CDNA's DATA_FORMAT-32 descriptor
+/// (`0x20000`, as hipcc builds for gfx942) or [`SRD_WORD3`] on RDNA.
+pub fn srd_word3(a: Arch) -> u32 {
+    if a.wave64() {
+        0x0002_0000
+    } else {
+        SRD_WORD3
+    }
+}
 pub fn srd_tail(b: &mut Builder, srd: u8, records: Option<u8>) -> Result<(), String> {
     match records {
         Some(r) => sop(b, format!("s_mov_b32 s{}, s{r}", srd + 2), &[srd + 2], &[r])?,
@@ -194,7 +208,7 @@ pub fn srd_tail(b: &mut Builder, srd: u8, records: Option<u8>) -> Result<(), Str
     }
     sop(
         b,
-        format!("s_mov_b32 s{}, {}", srd + 3, lit(SRD_WORD3)),
+        format!("s_mov_b32 s{}, {}", srd + 3, lit(srd_word3(b.spec.arch))),
         &[srd + 3],
         &[],
     )
@@ -208,10 +222,14 @@ pub fn bload(
     srd: u8,
     offset: u32,
 ) -> Result<(), String> {
-    let name = match width {
-        1 => "buffer_load_b32",
-        2 => "buffer_load_b64",
-        4 => "buffer_load_b128",
+    let cdna = b.spec.arch.wave64();
+    let name = match (width, cdna) {
+        (1, false) => "buffer_load_b32",
+        (2, false) => "buffer_load_b64",
+        (4, false) => "buffer_load_b128",
+        (1, true) => "buffer_load_dword",
+        (2, true) => "buffer_load_dwordx2",
+        (4, true) => "buffer_load_dwordx4",
         _ => return Err("buffer load width".into()),
     };
     if offset > b.spec.arch.buffer_offset_max() {
@@ -239,7 +257,12 @@ pub fn bload_u16(b: &mut Builder, dst: u8, voff: u8, srd: u8, offset: u32) -> Re
     mem(
         b,
         format!(
-            "buffer_load_u16 v{dst}, v{voff}, s[{srd}:{}], {} offen{}",
+            "{} v{dst}, v{voff}, s[{srd}:{}], {} offen{}",
+            if b.spec.arch.wave64() {
+                "buffer_load_ushort"
+            } else {
+                "buffer_load_u16"
+            },
             srd + 3,
             zero_soffset(b.spec.arch),
             imm_offset(offset)
@@ -264,7 +287,12 @@ pub fn bstore_b128(
     mem(
         b,
         format!(
-            "buffer_store_b128 {d}, v{voff}, s[{srd}:{}], {} offen{}",
+            "{} {d}, v{voff}, s[{srd}:{}], {} offen{}",
+            if b.spec.arch.wave64() {
+                "buffer_store_dwordx4"
+            } else {
+                "buffer_store_b128"
+            },
             srd + 3,
             zero_soffset(b.spec.arch),
             imm_offset(offset)

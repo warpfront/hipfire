@@ -485,11 +485,7 @@ fn unwalked_flash_next_policies_keep_lazy_loading() {
             }),
             "{name}"
         );
-        for spec in [
-            KernelSpecRoute::DFlash,
-            KernelSpecRoute::DDTree,
-            KernelSpecRoute::DSpark,
-        ] {
+        for spec in [KernelSpecRoute::DFlash, KernelSpecRoute::DSpark] {
             assert!(refused(&Load { spec, ..base }), "{name} {spec:?}");
         }
         // A policy axis outside the walks (the other QSA format than the walked one),
@@ -792,6 +788,7 @@ fn gfx1100_hip_rows_hash_the_effective_source_the_loader_binds() {
     let (ar, mtp) = route_plans(&split);
     let inventory = entries("gfx1100", &builtin_flags("gfx1100").hipcc_extra_flags).unwrap();
     let mut checked = 0;
+    let mut stale = Vec::new();
     for (route, plan, native_mtp) in [("ar", &ar, false), ("native_mtp", &mtp, true)] {
         for row in walked
             .rows
@@ -805,12 +802,14 @@ fn gfx1100_hip_rows_hash_the_effective_source_the_loader_binds() {
             else {
                 panic!("{route}: {} is not a planned HIP entry", row.module);
             };
-            assert_eq!(
-                sha_hex(planned.source()),
-                row.sha256,
-                "{route} {}: row sha256 is not the planned effective source",
-                row.module
-            );
+            let effective = sha_hex(planned.source());
+            if effective != row.sha256 {
+                stale.push(format!(
+                    "{route} {}: row sha256 {} != planned effective source {effective}",
+                    row.module, row.sha256
+                ));
+                continue;
+            }
             let live = inventory
                 .iter()
                 .find(|e| e.module == row.module)
@@ -824,6 +823,15 @@ fn gfx1100_hip_rows_hash_the_effective_source_the_loader_binds() {
             checked += 1;
         }
     }
+    assert!(
+        stale.is_empty(),
+        "stale gfx1100 route-plan row digests:\n{}\n\
+         A kernel source edit changes them: after confirming the edit is intended, replace the old \
+         sha256 with the effective one on every matching row of crates/rdna-compute/src/route_plans/*.tsv \
+         and add a header comment naming the commit (or re-walk with scripts/route_plan_walk.py + \
+         scripts/route_plan_build.py), in the same change.",
+        stale.join("\n")
+    );
     assert!(checked > 80, "only {checked} gfx1100 hip rows checked");
     // Lazy launcher inputs of the split route: the constants themselves.
     for (module, source) in [

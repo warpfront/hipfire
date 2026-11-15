@@ -2957,10 +2957,6 @@ mod render_tests {
             assert!(text.contains("1/2 local"), "{w}x{h}: expanded group count");
             assert!(!text.contains(".ple-q4"), "{w}x{h}: no .ple-q4 rows");
             assert!(
-                !text.contains("triattn"),
-                "{w}x{h}: no triattn sidecar display"
-            );
-            assert!(
                 !text.contains("local-only"),
                 "{w}x{h}: Have is local/remote only"
             );

@@ -1,0 +1,550 @@
+{
+  "cases_fail": 0,
+  "cases_pass": 582,
+  "controls_detected": 28,
+  "controls_missed": 0,
+  "extra": {
+    "host_mirror_mismatches": 0
+  },
+  "families": {
+    "combine": {
+      "fail": 0,
+      "pass": 49
+    },
+    "router": {
+      "fail": 0,
+      "pass": 264
+    },
+    "scatter": {
+      "fail": 0,
+      "pass": 169
+    },
+    "unscatter": {
+      "fail": 0,
+      "pass": 100
+    }
+  },
+  "image": null,
+  "image_env": "HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE",
+  "oracle": "qwen4_g942_moe_wide_oracle",
+  "quick": false,
+  "rows": [
+    {
+      "case": "T=8 norm=0 logits=0",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=0",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=0 logits=1",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=1",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=0 logits=2",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=2",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=0 logits=3",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=3",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=0 logits=4",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=4",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=0 logits=5",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "module_single_fault_row1": 0,
+      "module_single_fault_row6": 0,
+      "ok": true,
+      "product": 0,
+      "product_single_fault_row1": 0,
+      "product_single_fault_row6": 0,
+      "reference_repeat": 0,
+      "reference_single_fault_row1": 0,
+      "reference_single_fault_row6": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=5",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "module_single_fault_row1": 0,
+      "module_single_fault_row7": 0,
+      "ok": true,
+      "product": 0,
+      "product_single_fault_row1": 0,
+      "product_single_fault_row7": 0,
+      "reference_repeat": 0,
+      "reference_single_fault_row1": 0,
+      "reference_single_fault_row7": 0
+    },
+    {
+      "case": "T=8 norm=0 logits=6",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=6",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=0 logits=7",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=7",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=0 logits=8",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=8",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=0 logits=9",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=9",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=0 logits=10",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=10",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=0 logits=11",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "case": "T=8 norm=1 logits=11",
+      "failed_rows": 0,
+      "family": "router",
+      "fault_module": 0,
+      "fault_product": 0,
+      "fault_reference": 0,
+      "fault_reference_repeat": 0,
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "control": "router flip_logit_byte",
+      "detected": true,
+      "differing_bytes": 30,
+      "guards_ok": true
+    },
+    {
+      "control": "router tokens_minus_1",
+      "detected": true,
+      "differing_bytes": 80,
+      "guards_ok": true
+    },
+    {
+      "control": "router normalize_flipped",
+      "detected": true,
+      "differing_bytes": 397,
+      "guards_ok": true
+    },
+    {
+      "control": "router swapped_output_bindings",
+      "detected": true,
+      "differing_bytes": 2206,
+      "guards_ok": true
+    },
+    {
+      "control": "scatter slots_minus_1",
+      "detected": true,
+      "differing_bytes": 8,
+      "guards_ok": true
+    },
+    {
+      "control": "scatter experts_minus_1",
+      "detected": true,
+      "differing_bytes": 30,
+      "guards_ok": true
+    },
+    {
+      "control": "scatter grouped_rows_plus_16",
+      "detected": true,
+      "differing_bytes": 0,
+      "guards_ok": false
+    },
+    {
+      "control": "scatter flip_topk_byte",
+      "detected": true,
+      "differing_bytes": 16,
+      "guards_ok": true
+    },
+    {
+      "control": "scatter inject_unrouted_marker",
+      "detected": true,
+      "differing_bytes": 335,
+      "guards_ok": true
+    },
+    {
+      "control": "unscatter slots_minus_1",
+      "detected": true,
+      "differing_bytes": 2557,
+      "guards_ok": true
+    },
+    {
+      "control": "unscatter rows_minus_1",
+      "detected": true,
+      "differing_bytes": 2560,
+      "guards_ok": true
+    },
+    {
+      "control": "unscatter swapped_shared_bindings",
+      "detected": true,
+      "differing_bytes": 32468,
+      "guards_ok": true
+    },
+    {
+      "control": "unscatter flip_gate_up_gate_byte",
+      "detected": true,
+      "differing_bytes": 2,
+      "guards_ok": true
+    },
+    {
+      "control": "unscatter flip_gate_up_up_byte",
+      "detected": true,
+      "differing_bytes": 2,
+      "guards_ok": true
+    },
+    {
+      "control": "unscatter flip_shared_gate_byte",
+      "detected": true,
+      "differing_bytes": 2,
+      "guards_ok": true
+    },
+    {
+      "control": "unscatter flip_shared_up_byte",
+      "detected": true,
+      "differing_bytes": 2,
+      "guards_ok": true
+    },
+    {
+      "control": "unscatter flip_selector_byte",
+      "detected": true,
+      "differing_bytes": 2,
+      "guards_ok": true
+    },
+    {
+      "control": "unscatter flip_inverse_row",
+      "detected": true,
+      "differing_bytes": 1204,
+      "guards_ok": true
+    },
+    {
+      "control": "combine tokens_minus_1",
+      "detected": true,
+      "differing_bytes": 9553,
+      "guards_ok": true
+    },
+    {
+      "control": "combine n_experts_1",
+      "detected": true,
+      "differing_bytes": 138816,
+      "guards_ok": true
+    },
+    {
+      "control": "combine swapped_target_shared_bindings",
+      "detected": true,
+      "differing_bytes": 306049,
+      "guards_ok": true
+    },
+    {
+      "control": "combine flip_grouped_down_byte",
+      "detected": true,
+      "differing_bytes": 2,
+      "guards_ok": true
+    },
+    {
+      "control": "combine flip_inverse_row",
+      "detected": true,
+      "differing_bytes": 3205,
+      "guards_ok": true
+    },
+    {
+      "control": "combine flip_topk_index",
+      "detected": true,
+      "differing_bytes": 3205,
+      "guards_ok": true
+    },
+    {
+      "control": "combine flip_topk_weight_byte",
+      "detected": true,
+      "differing_bytes": 5104,
+      "guards_ok": true
+    },
+    {
+      "control": "combine flip_residual_byte",
+      "detected": true,
+      "differing_bytes": 2,
+      "guards_ok": true
+    },
+    {
+      "control": "combine flip_shared_out_byte",
+      "detected": true,
+      "differing_bytes": 2,
+      "guards_ok": true
+    },
+    {
+      "control": "combine flip_selector_byte",
+      "detected": true,
+      "differing_bytes": 5098,
+      "guards_ok": true
+    }
+  ],
+  "seed": 5573003621461721089
+}

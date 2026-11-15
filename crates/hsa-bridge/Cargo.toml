@@ -34,13 +34,5 @@ hip-bridge = { path = "../hip-bridge" }
 # The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
 # ---------------------------------------------------------------------------
 [[example]]
-name = "hip_graph_extra_poc"
-required-features = ["lab"]
-
-[[example]]
-name = "hip_graph_gemv_poc"
-required-features = ["lab"]
-
-[[example]]
 name = "hsa_vs_hip_launch"
 required-features = ["lab"]

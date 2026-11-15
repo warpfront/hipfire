@@ -26,14 +26,8 @@
 //! pair, with full state reset between rows. Each row's stderr output
 //! is bracketed by `@@@ ROW <i>: <label> @@@` / `@@@ ROW <i> END @@@`
 //! markers so downstream parsers can split a multi-row stream.
-//! `--prompts-file` rejects `--cask-sidecar` and `--pflash` (those
-//! paths have single-prompt state that would otherwise leak across
-//! rows). Single `--prompt` mode emits no row separators — output
+//! Single `--prompt` mode emits no row separators — output
 //! stays byte-identical to the legacy path.
-//!
-//! `--cask-sidecar` / `--cask` / `--cask-budget` / `--cask-beta` /
-//! `--cask-core-frac` / `--cask-fold-m` (FlashCASK) are deprecated since
-//! 0.4.0 and will be removed in 0.5.0; using them prints a one-line warning.
 //!
 //! Per-process diagnostics that gate on env vars (`HIPFIRE_PROFILE`,
 //! `HIPFIRE_HOST_TIMING`, `HIPFIRE_DPM_WARMUP_SECS`,
@@ -50,8 +44,7 @@
 //! to assemble the JSON-lines manifest at runtime from committed
 //! `.txt` fixtures via `jq -nR --arg p "$(cat path/to/prompt.txt)"
 //! '{label:"...",prompt:$p,max:N}'` (or commit the JSONL fixture
-//! directly, see `benchmarks/prompts/longcode_pflash.jsonl` for an
-//! example of the latter shape). Smoke / correctness tests that
+//! directly). Smoke / correctness tests that
 //! don't compare numbers across sessions can inline prompts safely.
 
 #[cfg(not(feature = "deltanet"))]
@@ -400,37 +393,11 @@ fn main() {
     use hipfire_arch_qwen35::speculative::{
         self, DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, ModelSlotConfig, SpecStats,
     };
-    use hipfire_runtime::cask::CaskCtx;
     use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::tokenizer::Tokenizer;
-    use hipfire_runtime::triattn::{EvictionCtx, EvictionResult, TriAttnCenters};
     use std::path::Path;
     use std::time::Instant;
-
-    enum CaskPolicy {
-        Plain(EvictionCtx),
-        Cask(CaskCtx),
-    }
-    impl CaskPolicy {
-        fn maybe_evict(
-            &self,
-            gpu: &mut rdna_compute::Gpu,
-            kv: &mut hipfire_runtime::llama::KvCache,
-            physical: usize,
-        ) -> hip_bridge::HipResult<Option<EvictionResult>> {
-            match self {
-                CaskPolicy::Plain(c) => c.maybe_evict(gpu, kv, physical),
-                CaskPolicy::Cask(c) => c.maybe_evict(gpu, kv, physical),
-            }
-        }
-        fn eviction_count(&self) -> usize {
-            match self {
-                CaskPolicy::Plain(c) => c.eviction_count.get(),
-                CaskPolicy::Cask(c) => c.eviction_count(),
-            }
-        }
-    }
 
     // ── Parse args ─────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
@@ -446,11 +413,6 @@ fn main() {
     let mut prompts_file: Option<String> = None;
     let mut prompt_file: Option<String> = None;
     let mut tp: usize = 1;
-    let mut pflash_path: Option<String> = None;
-    let mut pflash_keep_ratio: f32 = 0.30;
-    let mut pflash_block_size: usize = 64;
-    let mut pflash_sink_tokens: usize = 16;
-    let mut pflash_recent_tokens: usize = 32;
     let mut max_tokens: usize = 64;
     let mut ctx_capacity: usize = 512;
     let mut ctx_slice: Option<usize> = None;
@@ -506,26 +468,15 @@ fn main() {
                                                     // diagnostics; usually a net loss on content where DFlash is strong).
     let mut pld_min_consensus: usize = 2;
     let mut pld_min_chain: usize = 5; // conservative: below paper's 8 but still filters noise
-                                      // DDTree (Ringel & Romano 2026): tree-structured verification built from
-                                      // DFlash per-position draft marginals. Per-path DFS verify (no batched
-                                      // tree attention) — slower per cycle but correct on hybrid arch. Spike
-                                      // measurement: does τ improve with the tree structure?
-    let mut ddtree_enabled: bool = false;
-    let mut ddtree_budget: usize = 16; // paper uses 60; cheaper spike default
-    let mut ddtree_topk: usize = 8; // paper uses B-1 * budget_fanout; small k keeps tree shallow
-                                    // --ddtree-batched: use spec_step_ddtree_batched (single tree-attention
-                                    // forward) instead of the per-path DFS. Requires FA batched path (Q8 /
-                                    // asym3 / asym4 KV). Tree-exact on FA side, linear-replay on GDN.
-    let mut ddtree_batched: bool = false;
-    // ChatML wrapping: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n —
-    // matches how the daemon / infer_qwen35 call the instruction-tuned Qwen3.5.
-    // Default ON (2026-04-17): bare prompts send the model off-distribution.
-    // Empirically the draft's acceptance rate on raw Qwen3.5 creative prompts
-    // drops to τ<1.5 (vs τ≈5 with ChatML) — measured on 27B rivers-essay:
-    // bare gives 20 tok/s, ChatML gives 40 tok/s with identical target, draft,
-    // and kv_mode. The gap is the draft predicting a structured distribution
-    // vs a garbled one. Opt out via --no-chatml for the diagnostic
-    // "pure continuation" case.
+                                      // ChatML wrapping: <|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n —
+                                      // matches how the daemon / infer_qwen35 call the instruction-tuned Qwen3.5.
+                                      // Default ON (2026-04-17): bare prompts send the model off-distribution.
+                                      // Empirically the draft's acceptance rate on raw Qwen3.5 creative prompts
+                                      // drops to τ<1.5 (vs τ≈5 with ChatML) — measured on 27B rivers-essay:
+                                      // bare gives 20 tok/s, ChatML gives 40 tok/s with identical target, draft,
+                                      // and kv_mode. The gap is the draft predicting a structured distribution
+                                      // vs a garbled one. Opt out via --no-chatml for the diagnostic
+                                      // "pure continuation" case.
     let mut chatml: bool = true;
     // --ar-baseline: skip DFlash entirely, greedy-decode via target only.
     // Diagnostic for comparing DFlash outputs against pure-AR on the
@@ -538,18 +489,6 @@ fn main() {
     // forward_prefill_batch on committed tokens (byte-exact vs AR when
     // combined with HIPFIRE_PREFILL_BATCHED=0).
     let mut no_tape: bool = false;
-
-    // FlashCASK: TriAttention scoring + CASK core-aware m-folding merge
-    // applied to target.kv_cache between spec_step cycles. Passes the
-    // compact_offset math through target's forward pass automatically
-    // (qwen35::forward_scratch already reads kv_cache.compact_offset for
-    // RoPE phase). Only opt-in — keep spec demo unchanged by default.
-    let mut cask_sidecar: Option<String> = None;
-    let mut cask_budget: usize = 512;
-    let mut cask_beta: usize = 128;
-    let mut use_cask: bool = false;
-    let mut cask_core_frac: f32 = 0.5;
-    let mut cask_fold_m: usize = 2;
 
     let mut i = 1;
     while i < args.len() {
@@ -572,28 +511,6 @@ fn main() {
             }
             "--prompt-file" => {
                 prompt_file = Some(args[i + 1].clone());
-                i += 2;
-            }
-            // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-            "--pflash" => {
-                eprintln!("warning: PFlash is deprecated and will be removed in 0.5.0; not supported (--pflash)");
-                pflash_path = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--keep-ratio" => {
-                pflash_keep_ratio = args[i + 1].parse().expect("--keep-ratio f32");
-                i += 2;
-            }
-            "--pflash-block-size" => {
-                pflash_block_size = args[i + 1].parse().expect("--pflash-block-size usize");
-                i += 2;
-            }
-            "--sink-tokens" => {
-                pflash_sink_tokens = args[i + 1].parse().expect("--sink-tokens usize");
-                i += 2;
-            }
-            "--recent-tokens" => {
-                pflash_recent_tokens = args[i + 1].parse().expect("--recent-tokens usize");
                 i += 2;
             }
             "--max" => {
@@ -703,23 +620,6 @@ fn main() {
                 pld_min_chain = args[i + 1].parse().unwrap();
                 i += 2;
             }
-            "--ddtree" => {
-                ddtree_enabled = true;
-                i += 1;
-            }
-            "--ddtree-budget" => {
-                ddtree_budget = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--ddtree-topk" => {
-                ddtree_topk = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--ddtree-batched" => {
-                ddtree_batched = true;
-                ddtree_enabled = true; // implies --ddtree
-                i += 1;
-            }
             "--chatml" => {
                 chatml = true;
                 i += 1;
@@ -748,31 +648,6 @@ fn main() {
                 }
                 i += 2;
             }
-            // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-            "--cask-sidecar" => {
-                cask_sidecar = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--cask" => {
-                use_cask = true;
-                i += 1;
-            }
-            "--cask-budget" => {
-                cask_budget = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--cask-beta" => {
-                cask_beta = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--cask-core-frac" => {
-                cask_core_frac = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--cask-fold-m" => {
-                cask_fold_m = args[i + 1].parse().unwrap();
-                i += 2;
-            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(1);
@@ -781,18 +656,6 @@ fn main() {
     }
     let target_path = target_path.expect("--target required");
     let draft_path = draft_path.expect("--draft required");
-    if cask_sidecar.is_some() || use_cask {
-        eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (--cask* flags)");
-    }
-    if let Err(e) = hipfire_arch_qwen35::carrier::validate_ddtree_cask(
-        ddtree_enabled || ddtree_batched,
-        true,
-        cask_sidecar.is_some() || use_cask,
-    ) {
-        eprintln!("{e}");
-        std::process::exit(1);
-    }
-
     // Build the prompt manifest. Exactly one of --prompt, --prompt-file,
     // or --prompts-file is accepted. Single-prompt modes emit no row
     // separator, keeping legacy parsers on the old path.
@@ -803,17 +666,6 @@ fn main() {
         + usize::from(prompts_file.is_some());
     if prompt_inputs != 1 {
         eprintln!("exactly one of --prompt, --prompt-file, or --prompts-file is required");
-        std::process::exit(1);
-    }
-    if prompts_file.is_some() && cask_sidecar.is_some() {
-        // EvictionCtx.eviction_count has no reset path; cumulative counts
-        // across rows would be silently wrong-looking in the FlashCASK
-        // report. Fail fast rather than ship misleading numbers.
-        eprintln!("--prompts-file + --cask-sidecar is not supported (eviction state would leak across rows)");
-        std::process::exit(1);
-    }
-    if prompts_file.is_some() && pflash_path.is_some() {
-        eprintln!("--prompts-file + --pflash is not supported yet (PFlash drafter state is single-prompt only)");
         std::process::exit(1);
     }
     // Each row is (label, raw_prompt, row_max_tokens). row_max_tokens
@@ -915,18 +767,6 @@ fn main() {
         }
         if pld_enabled {
             eprintln!("--pld is not supported for Glimmer");
-            std::process::exit(1);
-        }
-        if ddtree_enabled || ddtree_batched {
-            eprintln!("--ddtree is not supported for Glimmer");
-            std::process::exit(1);
-        }
-        if pflash_path.is_some() {
-            eprintln!("--pflash is not supported for Glimmer");
-            std::process::exit(1);
-        }
-        if cask_sidecar.is_some() || use_cask {
-            eprintln!("--cask is not supported for Glimmer");
             std::process::exit(1);
         }
         if cactus_delta != 0.0 {
@@ -1749,18 +1589,6 @@ fn main() {
             eprintln!("--tp 2 rejects --pld");
             std::process::exit(1);
         }
-        if ddtree_enabled || ddtree_batched {
-            eprintln!("--tp 2 rejects --ddtree*");
-            std::process::exit(1);
-        }
-        if pflash_path.is_some() {
-            eprintln!("--tp 2 rejects --pflash");
-            std::process::exit(1);
-        }
-        if cask_sidecar.is_some() || use_cask {
-            eprintln!("--tp 2 rejects --cask*");
-            std::process::exit(1);
-        }
         if ctx_slice.is_some() {
             eprintln!("--tp 2 rejects --ctx-slice");
             std::process::exit(1);
@@ -1869,16 +1697,15 @@ fn main() {
     slot_cfg.max_seq = ctx_capacity + cfg_block_size_for_slot + 16;
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
         "q8" => hipfire_arch_qwen35::speculative::KvMode::Q8,
-        "asym4" | "turbo4" => hipfire_arch_qwen35::speculative::KvMode::Asym4,
-        "asym3" | "turbo3" | "turbo" => hipfire_arch_qwen35::speculative::KvMode::Asym3,
-        "asym2" | "turbo2" => hipfire_arch_qwen35::speculative::KvMode::Asym2,
         "fwht4" => hipfire_arch_qwen35::speculative::KvMode::Fwht4,
         "fwht3" => hipfire_arch_qwen35::speculative::KvMode::Fwht3,
         "fwht2" => hipfire_arch_qwen35::speculative::KvMode::Fwht2,
         other => {
-            eprintln!(
-                "unknown --kv-mode: {other}. Valid: q8, asym4, asym3, asym2, fwht4, fwht3, fwht2"
-            );
+            if let Some(msg) = hipfire_config::removed_kv_name_error(other) {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+            eprintln!("unknown --kv-mode: {other}. Valid: q8, fwht4, fwht3, fwht2");
             std::process::exit(1);
         }
     };
@@ -1938,14 +1765,17 @@ fn main() {
     // `use_sliding_window` and matching `layer_types`). Mirrors
     // `dflash_spec.rs::load_dflash_state`; keep serve and bench in sync.
     //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
-    //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy
     //   unset                         draft-declared window, else Legacy
-    // Refused with CASK eviction (the eviction rebuild is not ring-aware).
     let dflash_window = match std::env::var("HIPFIRE_DFLASH_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
     {
-        Some(0) => None,
+        Some(0) => {
+            panic!(
+                "HIPFIRE_DFLASH_WINDOW=0 (legacy contiguous DFlash) was removed in 0.5.0; \
+                 unset it or set a positive row count"
+            );
+        }
         Some(w) => {
             if let Some(declared) = draft_cfg.declared_window {
                 if declared != w {
@@ -1959,16 +1789,6 @@ fn main() {
             Some(w)
         }
         None => draft_cfg.declared_window,
-    };
-    let dflash_window = match (dflash_window, cask_sidecar.is_some()) {
-        (Some(w), true) => {
-            eprintln!(
-                "draft: windowed mode ({w}) disabled — CASK eviction rebuild is not \
-                 ring-aware; using Legacy"
-            );
-            None
-        }
-        (w, _) => w,
     };
     let mut draft_scratch = match dflash_window {
         Some(w) => {
@@ -2021,7 +1841,7 @@ fn main() {
     );
 
     let tokenizer: Tokenizer = target.load_tokenizer().expect("target tokenizer");
-    // Per-row tokenize, ChatML wrap, and optional PFlash compression are
+    // Per-row tokenize, and ChatML wrap are
     // done inside the loop below.
 
     // ── Hidden ring buffer + snapshot + target_hidden_host ────────────
@@ -2039,40 +1859,21 @@ fn main() {
     .expect("alloc hidden_rb");
 
     let mut target_snap = DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("snap");
-    // DDTree needs a SECOND snapshot for the post-seed branch point (shared
-    // across all DFS paths in a cycle). Allocate unconditionally — a single
-    // DeltaNetSnapshot is cheap (~100 MB on 9B) and unused if --ddtree is off.
-    let mut post_seed_snap =
-        DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("post-seed snap");
     // GdnTape: per-LA-layer (q, k, v, α, β) innovation tape — sized for B
     // positions, allocated once and reused every spec step. Enables the
     // rollback path to replay GDN recurrence without re-running the target.
-    //
-    // Tree verify extends the block size: `1 + tree_budget` rows per forward
-    // (seed + tree nodes). Size max_n = max(block_size, 1 + tree_budget) so
-    // the tape is large enough whether we run per-path DFS, batched tree,
-    // or plain DFlash.
-    let tape_max_n = draft_scratch_b.max(1 + ddtree_budget);
+    let tape_max_n = draft_scratch_b;
     let mut gdn_tape = hipfire_arch_qwen35::speculative::GdnTape::new_for_dflash(
         &mut gpu,
         &target.config,
         tape_max_n,
     )
     .expect("alloc gdn tape");
-    // DdtreeScratch: persistent attention-bias buffer for batched tree verify.
-    // One allocation at startup (sized for max_budget), reused every cycle —
-    // avoids the per-cycle malloc+htod+free churn that dominated early wall-
-    // clock numbers. Also allocated for non-ddtree runs (cheap, small) so
-    // callers can switch strategies at runtime without reinit.
-    let ddtree_scratch =
-        hipfire_arch_qwen35::speculative::DdtreeScratch::new(&mut gpu, ddtree_budget)
-            .expect("alloc ddtree scratch");
     // VerifyScratch: persistent per-cycle tensors (final_hidden, logits,
-    // rotation scratch, argmax buf). Sized to max_n = max(block_size,
-    // 1 + ddtree_budget) to cover plain DFlash and DDTree. Drops ~8
+    // rotation scratch, argmax buf). Sized to the block. Drops ~8
     // hipMalloc/hipFree pairs per cycle (biggest is 16 MB logits buffer),
     // saving 0.5-1.5 ms/cycle.
-    let verify_max_n = draft_scratch_b.max(1 + ddtree_budget);
+    let verify_max_n = draft_scratch_b;
     let verify_scratch = hipfire_arch_qwen35::speculative::VerifyScratch::with_prefill(
         &mut gpu,
         verify_max_n,
@@ -2102,75 +1903,6 @@ fn main() {
         )
     };
 
-    // ── Build FlashCASK policy (opt-in via --cask-sidecar) ──────────
-    // The policy evicts target.kv_cache between spec_step cycles.
-    // compact_offset is maintained on kv_cache itself, so qwen35's
-    // forward_scratch sees the right RoPE phase without extra plumbing.
-    //
-    // Built ONCE outside the per-row loop. The
-    // `--prompts-file + --cask-sidecar` rejection above ensures
-    // cask_policy is only ever Some(...) in single-prompt mode (1
-    // iteration), so eviction_count carrying across rows isn't a
-    // concern in practice — but locating the build here documents
-    // the invariant "this object's lifetime is the process, not the
-    // row." If a future change lifts the rejection, eviction_count
-    // would need an explicit reset hook; today it doesn't have one.
-    let cask_policy: Option<CaskPolicy> = if let Some(path) = cask_sidecar.as_ref() {
-        let centers = TriAttnCenters::load(Path::new(path)).expect("load cask sidecar");
-        let fa_layer_ids: Vec<usize> = target
-            .config
-            .layer_types
-            .iter()
-            .enumerate()
-            .filter_map(|(i, t)| {
-                if *t == LayerType::FullAttention {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let n_rot = (target.config.head_dim as f32 * target.config.partial_rotary_factor) as usize;
-        // Ensure target KV has enough headroom for budget+beta+B+margin. The
-        // existing slot_cfg sized it to ctx_capacity + block_size + 16 — we
-        // don't resize here; just assert.
-        assert!(
-            target.kv_cache.max_seq >= cask_budget + cask_beta + draft_scratch_b + 4,
-            "target.kv_cache.max_seq ({}) < cask_budget+beta+B+4 ({}) — raise --ctx or lower --cask-budget/beta",
-            target.kv_cache.max_seq,
-            cask_budget + cask_beta + draft_scratch_b + 4,
-        );
-        let base = EvictionCtx::new(
-            &mut gpu,
-            &centers,
-            fa_layer_ids,
-            cask_budget,
-            cask_beta,
-            target.config.n_heads,
-            target.config.n_kv_heads,
-            target.config.head_dim,
-            n_rot,
-            target.config.rope_theta,
-            target.kv_cache.max_seq,
-        )
-        .expect("build EvictionCtx for FlashCASK");
-        Some(if use_cask {
-            eprintln!(
-                "FlashCASK: CASK α={:.2} m={} budget={} β={}",
-                cask_core_frac, cask_fold_m, cask_budget, cask_beta
-            );
-            CaskPolicy::Cask(CaskCtx::new(base, cask_core_frac, cask_fold_m))
-        } else {
-            eprintln!(
-                "FlashCASK: TriAttention (plain) budget={} β={}",
-                cask_budget, cask_beta
-            );
-            CaskPolicy::Plain(base)
-        })
-    } else {
-        None
-    };
-
     // ── Per-row loop ──────────────────────────────────────────────────
     // Issue #173: when --prompts-file is used, run multiple prompts
     // against the resident (target, draft) pair to amortize the ~17 GB
@@ -2191,19 +1923,16 @@ fn main() {
         // ── Per-row state reset ────────────────────────────────────
         // Required for correctness on row 2+. See plan §"Per-row reset".
         target_hidden_host.clear();
-        // KV write head + RoPE compaction. seed_target_hidden_from_prompt
-        // calls target.reset_state but that only zeros DN buffers;
-        // compact_offset (set by CASK eviction) persists otherwise.
+        // KV write head + RoPE offset. seed_target_hidden_from_prompt
+        // calls target.reset_state but that only zeros DN buffers.
         target.kv_cache.compact_offset = 0;
         // Draft scratch upload-tracking. The per-row scatter +
         // abs_positions seed below is what re-primes these.
         draft_scratch.reset_upload_tracking();
         // Hidden ring-buffer head/written counters (GPU buffers stay).
         hidden_rb.reset();
-        // Spec / DDTree thread-local diagnostic counters that already
-        // had reset paths.
+        // Spec thread-local diagnostic counters that already had reset paths.
         hipfire_arch_qwen35::speculative::reset_seed_oracle_stats();
-        hipfire_arch_qwen35::speculative::reset_ddtree_meta_stats();
         // Host-timing counters (only relevant when HIPFIRE_HOST_TIMING=1,
         // but the call is cheap and keeps the cumulative-vs-per-row
         // semantics right when the flag flips on mid-battery).
@@ -2255,104 +1984,6 @@ fn main() {
             }
         );
 
-        // ── Optional PFlash compression ───────────────────────────────
-        // Single-prompt only for now. --prompts-file + --pflash is rejected
-        // during arg validation so the drafter state cannot leak across rows.
-        let mut pflash_compress_ms: u128 = 0;
-        let mut pflash_kept_tokens: usize = prompt_tokens.len();
-        let pflash_source_tokens = prompt_tokens.len();
-        if let Some(pflash_drafter_path) = pflash_path.as_ref() {
-            use hipfire_pflash::pflash::{
-                self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState,
-                RequestKind,
-            };
-            let cfg = PflashConfig {
-                mode: PflashMode::Always,
-                keep_ratio: pflash_keep_ratio,
-                block_size: pflash_block_size,
-                sink_tokens: pflash_sink_tokens,
-                recent_tokens: pflash_recent_tokens,
-                min_keep_tokens: 0,
-                drafter_path: Some(pflash_drafter_path.clone()),
-                ..Default::default()
-            };
-            let mut state = PflashState::new(&cfg);
-            let drafter_max_kv = prompt_tokens.len() + 64;
-            let t_load = Instant::now();
-            pflash::load_drafter(
-                &mut state,
-                &mut gpu,
-                Path::new(pflash_drafter_path),
-                &tokenizer,
-                drafter_max_kv,
-            )
-            .expect("pflash: load drafter");
-            eprintln!(
-                "pflash drafter loaded: {:.2}s | tokenizer_compat={}",
-                t_load.elapsed().as_secs_f64(),
-                state.tokenizer_compat
-            );
-            if !state.tokenizer_compat {
-                eprintln!("FAIL: pflash drafter tokenizer incompatible with target");
-                state.unload_drafter(&mut gpu);
-                std::process::exit(2);
-            }
-
-            let t_compress = Instant::now();
-            let decision = pflash::maybe_compress_prompt(
-                &mut gpu,
-                &mut state,
-                &cfg,
-                &prompt_tokens,
-                RequestKind::Text,
-                &[],
-            )
-            .expect("pflash: maybe_compress_prompt");
-            pflash_compress_ms = t_compress.elapsed().as_millis();
-
-            prompt_tokens = match decision {
-                PflashDecision::Compressed(cp) => {
-                    eprintln!(
-                        "pflash compress: {} ms (score={}ms select={}ms gather={}ms)",
-                        pflash_compress_ms,
-                        cp.timings.score_ms,
-                        cp.timings.select_ms,
-                        cp.timings.gather_ms
-                    );
-                    eprintln!(
-                        "pflash kept:    {} -> {} tokens (ratio {:.3})",
-                        cp.source_tokens,
-                        cp.kept_tokens,
-                        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32
-                    );
-                    eprintln!("pflash spans:   {} ranges", cp.kept_spans.len());
-                    pflash_kept_tokens = cp.kept_tokens;
-                    cp.token_ids
-                }
-                PflashDecision::Bypass {
-                    reason:
-                        BypassReason::BelowThreshold {
-                            source_tokens: st,
-                            threshold,
-                        },
-                } => {
-                    eprintln!(
-                        "pflash bypass (BelowThreshold {st} < {threshold}); running full prefill"
-                    );
-                    prompt_tokens
-                }
-                PflashDecision::Bypass { reason } => {
-                    eprintln!("FAIL: unexpected pflash bypass: {reason:?}");
-                    state.unload_drafter(&mut gpu);
-                    std::process::exit(2);
-                }
-            };
-            // Free PFlash drafter VRAM before DFlash machinery starts touching
-            // the target / DFlash-head scratches. The DFlash drafter remains loaded.
-            state.unload_drafter(&mut gpu);
-            vram_report(&gpu.hip, "after pflash unload");
-        }
-
         // Shadow `max_tokens` (CLI default) with this row's value so the
         // existing decode-loop body keeps working unchanged.
         let max_tokens = row_max_tokens;
@@ -2398,8 +2029,7 @@ fn main() {
         )
         .expect("seed backfill");
         // Seed the upload watermark + per-row absolute positions for the
-        // draft's cross-attention RoPE. Pre-eviction these match [0..prompt_len)
-        // exactly, so FlashCASK-free runs stay byte-identical.
+        // draft's cross-attention RoPE. These match [0..prompt_len) exactly.
         draft_scratch.thlog.seed_prompt(prompt_tokens.len());
         let prefill_secs = t2.elapsed().as_secs_f64();
         let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
@@ -2409,38 +2039,7 @@ fn main() {
         );
         vram_report(&gpu.hip, "after_prefill");
 
-        // Post-prefill eviction: if the prompt already filled past the
-        // threshold, compact once before decoding so the spec loop starts at
-        // budget-sized physical state. cask_policy is built once before the
-        // for-loop; the rejection of --prompts-file + --cask-sidecar
-        // guarantees this only runs in single-prompt mode.
         let mut position: usize = prompt_tokens.len();
-        if let Some(ref p) = cask_policy {
-            if let Some(ev) = p
-                .maybe_evict(&mut gpu, &mut target.kv_cache, position)
-                .expect("post-prefill cask evict")
-            {
-                let pre_phys = position;
-                eprintln!(
-                    "FlashCASK: post-prefill compact {} -> {} (compact_offset={})",
-                    pre_phys, ev.new_physical, target.kv_cache.compact_offset,
-                );
-                position = ev.new_physical;
-                // Mirror the KV eviction into the draft's target_hidden so
-                // draft/target see the same windowed context.
-                if !ev.retain_mask.is_empty() {
-                    speculative::apply_eviction_retain_to_draft(
-                        &mut gpu,
-                        &mut draft_scratch,
-                        &ev.retain_mask,
-                        draft_cfg.num_extract(),
-                        draft_cfg.hidden,
-                        pre_phys,
-                    )
-                    .expect("mirror eviction to draft (post-prefill)");
-                }
-            }
-        }
 
         // ── Initial seed_token: target's greedy pick after prefill ───────
         // Target state is at position `prompt_len` after seed_target_hidden_from_prompt.
@@ -2463,8 +2062,6 @@ fn main() {
 
         // ── Decode loop ───────────────────────────────────────────────────
         let mut emitted: Vec<u32> = vec![first_token];
-        // `position` was already declared above (it may have been advanced by a
-        // post-prefill CASK eviction). Keep it as-is.
         let mut seed_token: u32 = first_token;
 
         // Loop-break cycle detector (HIPFIRE_DFLASH_LOOP_BREAK=stop|escalate|temp).
@@ -2612,37 +2209,6 @@ fn main() {
         let mut pld_hits: usize = 0;
         let mut pld_accepted: usize = 0;
 
-        if ddtree_enabled {
-            if temp > 0.0 && !ddtree_batched {
-                eprintln!(
-                    "WARNING: --ddtree (non-batched) with temp>0 falls back to greedy on \
-                the verify side. Use --ddtree-batched for distribution-preserving naive tree sampling."
-                );
-            }
-            if temp > 0.0 && ddtree_batched {
-                eprintln!(
-                    "temp>0 + --ddtree-batched: distribution-preserving naive tree sampling \
-                (sample target, accept drafted child it lands on)."
-                );
-            }
-            if pld_enabled {
-                eprintln!("WARNING: --pld is ignored when --ddtree is enabled.");
-            }
-            if ddtree_batched {
-                eprintln!(
-                "ddtree: enabled (budget={}, topk={}; BATCHED tree verify via FA tree-attention mask + GDN linear replay)",
-                ddtree_budget, ddtree_topk,
-            );
-            } else {
-                eprintln!(
-                "ddtree: enabled (budget={}, topk={}; per-path DFS verify, ~{}× DFlash per-cycle cost)",
-                ddtree_budget,
-                ddtree_topk,
-                ddtree_budget / (draft_cfg.block_size.saturating_sub(1).max(1)),
-            );
-            }
-        }
-
         // HIPFIRE_PROFILE=1: enable per-kernel profiling for `--profile-cycles N`
         // worth of cycles (default 5) starting at cycle 1 (after a warm-up cycle
         // 0 to settle the JIT). Prints kernel breakdown after the limit.
@@ -2697,15 +2263,6 @@ fn main() {
                     ar_first_tok_secs = Some(t_ar.elapsed().as_secs_f64());
                 }
                 position += 1;
-                if let Some(ref p) = cask_policy {
-                    if let Some(ev) = p
-                        .maybe_evict(&mut gpu, &mut target.kv_cache, position)
-                        .expect("ar cask evict")
-                    {
-                        // AR baseline doesn't touch draft state — no mirror needed.
-                        position = ev.new_physical;
-                    }
-                }
                 if tokenizer.is_terminator(next) {
                     eprintln!("eos (id={next})");
                     break;
@@ -2779,7 +2336,7 @@ fn main() {
             }
         }
 
-        // (Seed-oracle + ddtree-meta counter resets moved to the per-row reset
+        // (Seed-oracle counter resets moved to the per-row reset
         // block at the top of the multi-prompt loop — see issue #173.)
 
         // Adaptive-B state: tracks current B between cycles, plus a cooldown
@@ -2972,84 +2529,36 @@ fn main() {
             if used_pld {
                 pld_hits += 1;
             }
-            let step = if ddtree_enabled {
-                if ddtree_batched {
-                    speculative::spec_step_ddtree_batched(
-                        &mut gpu,
-                        &mut target,
-                        &draft_weights,
-                        &draft_cfg,
-                        &mut draft_scratch,
-                        &mut hidden_rb,
-                        &mut target_hidden_host,
-                        &mut target_snap,
-                        &mut post_seed_snap,
-                        &mut gdn_tape,
-                        &ddtree_scratch,
-                        &verify_scratch,
-                        position,
-                        seed_token,
-                        ctx_slice,
-                        ddtree_budget,
-                        ddtree_topk,
-                        runtime_temp,
-                        &mut rng_state,
-                        None, // max_accept: uncapped demo
-                    )
-                    .expect("ddtree-batched spec step")
-                } else {
-                    speculative::spec_step_ddtree(
-                        &mut gpu,
-                        &mut target,
-                        &draft_weights,
-                        &draft_cfg,
-                        &mut draft_scratch,
-                        &mut hidden_rb,
-                        &mut target_hidden_host,
-                        &mut target_snap,
-                        &mut post_seed_snap,
-                        &mut gdn_tape,
-                        &verify_scratch,
-                        position,
-                        seed_token,
-                        ctx_slice,
-                        ddtree_budget,
-                        ddtree_topk,
-                    )
-                    .expect("ddtree spec step")
-                }
-            } else {
-                speculative::spec_step_dflash(
-                    &mut gpu,
-                    &mut target,
-                    &draft_weights,
-                    &draft_cfg,
-                    &mut draft_scratch,
-                    &mut hidden_rb,
-                    &mut target_hidden_host,
-                    &mut target_snap,
-                    &verify_scratch,
-                    position,
-                    seed_token,
-                    ctx_slice,
-                    if no_tape { None } else { Some(&mut gdn_tape) },
-                    runtime_temp,
-                    1.0_f32, // top_p: demo has no nucleus CLI; 1.0 = disabled (byte-path unchanged)
-                    0,       // top_k: demo has no top-k CLI; 0 = disabled
-                    &mut rng_state,
-                    block_override,
-                    ngram_cache.as_ref(),
-                    &emitted,
-                    cactus_delta,
-                    pld_spine,
-                    runtime_repeat_penalty,
-                    repeat_window,
-                    None, // max_accept: uncapped demo
-                    Some(&mut verify_pm4),
-                    None, // lookup: demo never splices verbatim-copy candidates
-                )
-                .expect("spec step")
-            };
+            let step = speculative::spec_step_dflash(
+                &mut gpu,
+                &mut target,
+                &draft_weights,
+                &draft_cfg,
+                &mut draft_scratch,
+                &mut hidden_rb,
+                &mut target_hidden_host,
+                &mut target_snap,
+                &verify_scratch,
+                position,
+                seed_token,
+                ctx_slice,
+                if no_tape { None } else { Some(&mut gdn_tape) },
+                runtime_temp,
+                1.0_f32, // top_p: demo has no nucleus CLI; 1.0 = disabled (byte-path unchanged)
+                0,       // top_k: demo has no top-k CLI; 0 = disabled
+                &mut rng_state,
+                block_override,
+                ngram_cache.as_ref(),
+                &emitted,
+                cactus_delta,
+                pld_spine,
+                runtime_repeat_penalty,
+                repeat_window,
+                None, // max_accept: uncapped demo
+                Some(&mut verify_pm4),
+                None, // lookup: demo never splices verbatim-copy candidates
+            )
+            .expect("spec step");
             if used_pld {
                 pld_accepted += step.accepted;
             }
@@ -3257,34 +2766,6 @@ fn main() {
             position += step.accepted + 1;
             seed_token = step.bonus_token;
 
-            // FlashCASK eviction. Fires when target.kv_cache physical hits
-            // budget+β. compact_offset is maintained on the cache so the next
-            // cycle's target.forward_scratch uses the right RoPE phase.
-            if let Some(ref p) = cask_policy {
-                if let Some(ev) = p
-                    .maybe_evict(&mut gpu, &mut target.kv_cache, position)
-                    .expect("spec cask evict")
-                {
-                    let pre_phys = position;
-                    position = ev.new_physical;
-                    // Mirror the KV eviction into the draft's target_hidden view.
-                    // Empty retain_mask (CASK m-fold path) → skip; draft keeps the
-                    // pre-eviction buffer, the old τ-collapse behaviour still
-                    // applies there until m-fold gets a compatible draft mirror.
-                    if !ev.retain_mask.is_empty() {
-                        speculative::apply_eviction_retain_to_draft(
-                            &mut gpu,
-                            &mut draft_scratch,
-                            &ev.retain_mask,
-                            draft_cfg.num_extract(),
-                            draft_cfg.hidden,
-                            pre_phys,
-                        )
-                        .expect("mirror eviction to draft");
-                    }
-                }
-            }
-
             // Stop on any terminator (eos_id OR eot_id). Checking only eos_id
             // misses `<|endoftext|>` when running --no-chatml on a raw-text draft
             // — see findings/dflash-benchmark-2026-04-24.md §3.5 (post-EOT
@@ -3321,13 +2802,6 @@ fn main() {
             stats.tau(),
             stats.mean_committed(),
         );
-        if let Some(ref p) = cask_policy {
-            eprintln!(
-                "FlashCASK: {} evictions  final compact_offset={}",
-                p.eviction_count(),
-                target.kv_cache.compact_offset,
-            );
-        }
         let accept_rate = if stats.cycles > 0 {
             stats.accepted_tokens as f32 / (stats.cycles * (draft_cfg.block_size - 1)) as f32
         } else {
@@ -3345,17 +2819,6 @@ fn main() {
         let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
         eprintln!("=== BENCH METRICS ===");
         eprintln!("prompt_tokens: {}", prompt_tokens.len());
-        if pflash_path.is_some() {
-            eprintln!("pflash_source_tokens: {pflash_source_tokens}");
-            eprintln!("pflash_kept_tokens: {pflash_kept_tokens}");
-            eprintln!("pflash_compress_ms: {pflash_compress_ms}");
-            if pflash_source_tokens > 0 {
-                eprintln!(
-                    "pflash_ratio: {:.3}",
-                    pflash_kept_tokens as f32 / pflash_source_tokens as f32
-                );
-            }
-        }
         eprintln!("prefill_secs: {:.4}", prefill_secs);
         eprintln!("prefill_tok_s: {:.2}", prefill_tok_s);
         eprintln!("ttft_ms: {:.2}", ttft_ms.unwrap_or(0.0));
@@ -3377,22 +2840,6 @@ fn main() {
             "histogram: {:?}",
             stats.acceptance_hist.iter().enumerate().collect::<Vec<_>>()
         );
-        // DDTree meta-verifier pruner stats — only meaningful under --ddtree-*
-        // with HIPFIRE_DDTREE_LOGW_CUTOFF set. Cycles == 0 on pure-DFlash runs.
-        let meta = hipfire_arch_qwen35::speculative::read_ddtree_meta_stats();
-        if meta.cycles > 0 {
-            let mean_nodes = meta.total_nodes as f32 / meta.cycles as f32;
-            eprintln!(
-                "ddtree-meta: cycles={} mean_nodes={:.2} min={} max={} (cutoff={:?})",
-                meta.cycles,
-                mean_nodes,
-                meta.min_nodes,
-                meta.max_nodes,
-                hipfire_config::active_or_local_process_config()
-                    .legacy_value("HIPFIRE_DDTREE_LOGW_CUTOFF")
-                    .unwrap_or_else(|| "off".to_string()),
-            );
-        }
         // Adaptive-B usage report — only meaningful when --adaptive-b is on.
         if adaptive_b && !adaptive_b_histogram.is_empty() {
             let mut buckets: Vec<(usize, u32)> =

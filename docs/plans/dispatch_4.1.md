@@ -222,7 +222,7 @@ land together if the workspace must stay green between commits).
 
 | Item | Where |
 |---|---|
-| **Step 8** — grouped-GEMM MoE prefill: register HFQ4G256/MQ6/Paro/MQ2-Lloyd grouped keys; **plumb `p.batch_size` through the `run_moe_decode` hardcoded `1` literals** (the `FIXME(Step 8)`s) `[D-F4]` | Step 8 |
+| **Step 8** — grouped-GEMM MoE prefill: register HFQ4G256/MQ6/MQ2-Lloyd grouped keys; **plumb `p.batch_size` through the `run_moe_decode` hardcoded `1` literals** (the `FIXME(Step 8)`s) `[D-F4]` | Step 8 |
 | `Step::Moe` in `execute_steps` (no fusion value) `[D-F10]` | deferred / Ship 6 vocab |
 | ds4 MoE decode/prefill | done (PR #428) |
 | `HIPFIRE_DISPATCH_OLD/_NEW` same-binary selector `[G-F5]` | program-level (Phase 0.6), not 4.1 |

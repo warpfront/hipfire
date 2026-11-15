@@ -2,14 +2,13 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Minimal GGUF reader + dequant copied from `crates/engine/src/{gguf.rs,llama.rs}`.
-//! Self-contained so hipfire-quantize doesn't pull engine's GPU dependency tree.
-//! TODO: factor into a shared `gguf-codec` crate.
+//! Minimal GGUF container reader for `--imatrix <file.gguf>` (llama.cpp
+//! imatrix files: F32 `.in_sum2` / `.counts` tensors). Metadata values are
+//! skipped except `general.alignment`. GGUF *weight* input was removed in
+//! 0.5.0, so no tensor dequantizers live here.
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32};
 use memmap2::Mmap;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Cursor, Read};
 use std::path::Path;
@@ -100,40 +99,6 @@ impl GgmlType {
 }
 
 #[derive(Debug, Clone)]
-pub enum MetaValue {
-    U8(u8),
-    I8(i8),
-    U16(u16),
-    I16(i16),
-    U32(u32),
-    I32(i32),
-    F32(f32),
-    Bool(bool),
-    String(String),
-    U64(u64),
-    I64(i64),
-    F64(f64),
-    Array(Vec<MetaValue>),
-}
-
-impl MetaValue {
-    pub fn as_u32(&self) -> Option<u32> {
-        match self {
-            MetaValue::U32(v) => Some(*v),
-            MetaValue::I32(v) => Some(*v as u32),
-            MetaValue::U64(v) => Some(*v as u32),
-            _ => None,
-        }
-    }
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            MetaValue::String(s) => Some(s),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct TensorInfo {
     pub name: String,
     pub shape: Vec<usize>,
@@ -151,34 +116,12 @@ impl TensorInfo {
 }
 
 pub struct GgufFile {
-    pub version: u32,
-    pub metadata: HashMap<String, MetaValue>,
     pub tensors: Vec<TensorInfo>,
     pub tensor_data_offset: usize,
     mmap: Mmap,
 }
 
 impl GgufFile {
-    /// Test-only: metadata + tensor-table view with no backing file. The
-    /// mmap is a zero-length map of an empty temp file (memmap2 handles
-    /// zero-length files); config translation reads only `metadata` and
-    /// `tensors`.
-    #[cfg(test)]
-    pub fn for_tests(
-        metadata: HashMap<String, MetaValue>,
-        tensors: Vec<TensorInfo>,
-    ) -> io::Result<Self> {
-        let file = tempfile::tempfile()?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        Ok(Self {
-            version: 3,
-            metadata,
-            tensors,
-            tensor_data_offset: 0,
-            mmap,
-        })
-    }
-
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -193,7 +136,7 @@ impl GgufFile {
         }
 
         let version = cursor.read_u32::<LittleEndian>()?;
-        if version < 2 || version > 3 {
+        if !(2..=3).contains(&version) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported GGUF version: {version}"),
@@ -203,11 +146,23 @@ impl GgufFile {
         let tensor_count = cursor.read_u64::<LittleEndian>()? as usize;
         let metadata_kv_count = cursor.read_u64::<LittleEndian>()? as usize;
 
-        let mut metadata = HashMap::new();
+        let mut alignment = 32usize;
         for _ in 0..metadata_kv_count {
             let key = read_string(&mut cursor)?;
-            let value = read_meta_value(&mut cursor)?;
-            metadata.insert(key, value);
+            let vtype = cursor.read_u32::<LittleEndian>()?;
+            if key == "general.alignment" {
+                alignment = match vtype {
+                    4 => cursor.read_u32::<LittleEndian>()? as usize,
+                    5 => cursor.read_i32::<LittleEndian>()? as u32 as usize,
+                    10 => cursor.read_u64::<LittleEndian>()? as u32 as usize,
+                    _ => {
+                        skip_typed_value(&mut cursor, vtype)?;
+                        alignment
+                    }
+                };
+            } else {
+                skip_typed_value(&mut cursor, vtype)?;
+            }
         }
 
         let mut tensors = Vec::with_capacity(tensor_count);
@@ -234,17 +189,10 @@ impl GgufFile {
             });
         }
 
-        let alignment = metadata
-            .get("general.alignment")
-            .and_then(|v| v.as_u32())
-            .unwrap_or(32) as usize;
-
         let pos = cursor.position() as usize;
-        let tensor_data_offset = (pos + alignment - 1) / alignment * alignment;
+        let tensor_data_offset = pos.div_ceil(alignment) * alignment;
 
         Ok(GgufFile {
-            version,
-            metadata,
             tensors,
             tensor_data_offset,
             mmap,
@@ -256,13 +204,6 @@ impl GgufFile {
         let end = start + info.byte_size();
         &self.mmap[start..end]
     }
-
-    pub fn meta(&self, key: &str) -> Option<&MetaValue> {
-        self.metadata.get(key)
-    }
-    pub fn meta_str(&self, key: &str) -> Option<&str> {
-        self.meta(key).and_then(|v| v.as_str())
-    }
 }
 
 fn read_string(cursor: &mut Cursor<&[u8]>) -> io::Result<String> {
@@ -273,376 +214,36 @@ fn read_string(cursor: &mut Cursor<&[u8]>) -> io::Result<String> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid UTF-8: {e}")))
 }
 
-fn read_meta_value(cursor: &mut Cursor<&[u8]>) -> io::Result<MetaValue> {
-    let vtype = cursor.read_u32::<LittleEndian>()?;
-    read_typed_value(cursor, vtype)
-}
-
-fn read_typed_value(cursor: &mut Cursor<&[u8]>, vtype: u32) -> io::Result<MetaValue> {
+/// Advance past one metadata value of GGUF type `vtype` without keeping it.
+fn skip_typed_value(cursor: &mut Cursor<&[u8]>, vtype: u32) -> io::Result<()> {
+    let fixed = match vtype {
+        0 | 1 | 7 => Some(1),
+        2 | 3 => Some(2),
+        4..=6 => Some(4),
+        10..=12 => Some(8),
+        _ => None,
+    };
+    if let Some(n) = fixed {
+        cursor.set_position(cursor.position() + n);
+        return Ok(());
+    }
     match vtype {
-        0 => Ok(MetaValue::U8(cursor.read_u8()?)),
-        1 => Ok(MetaValue::I8(cursor.read_i8()?)),
-        2 => Ok(MetaValue::U16(cursor.read_u16::<LittleEndian>()?)),
-        3 => Ok(MetaValue::I16(cursor.read_i16::<LittleEndian>()?)),
-        4 => Ok(MetaValue::U32(cursor.read_u32::<LittleEndian>()?)),
-        5 => Ok(MetaValue::I32(cursor.read_i32::<LittleEndian>()?)),
-        6 => Ok(MetaValue::F32(cursor.read_f32::<LittleEndian>()?)),
-        7 => Ok(MetaValue::Bool(cursor.read_u8()? != 0)),
-        8 => Ok(MetaValue::String(read_string(cursor)?)),
+        8 => {
+            let len = cursor.read_u64::<LittleEndian>()?;
+            cursor.set_position(cursor.position() + len);
+            Ok(())
+        }
         9 => {
             let elem_type = cursor.read_u32::<LittleEndian>()?;
-            let count = cursor.read_u64::<LittleEndian>()? as usize;
-            let mut arr = Vec::with_capacity(count);
+            let count = cursor.read_u64::<LittleEndian>()?;
             for _ in 0..count {
-                arr.push(read_typed_value(cursor, elem_type)?);
+                skip_typed_value(cursor, elem_type)?;
             }
-            Ok(MetaValue::Array(arr))
+            Ok(())
         }
-        10 => Ok(MetaValue::U64(cursor.read_u64::<LittleEndian>()?)),
-        11 => Ok(MetaValue::I64(cursor.read_i64::<LittleEndian>()?)),
-        12 => Ok(MetaValue::F64(cursor.read_f64::<LittleEndian>()?)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown metadata value type: {vtype}"),
         )),
-    }
-}
-
-// ─── Dequant (copied from engine/src/llama.rs) ────────────────────────────
-
-fn dequant_q4_0(data: &[u8], n: usize) -> Vec<f32> {
-    let block_size = 32;
-    let nblocks = (n + block_size - 1) / block_size;
-    let mut out = vec![0.0f32; n];
-    for b in 0..nblocks {
-        let off = b * 18;
-        if off + 18 > data.len() {
-            break;
-        }
-        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
-        for j in 0..16 {
-            let byte = data[off + 2 + j];
-            let lo = (byte & 0x0F) as i32 - 8;
-            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-            let idx = b * block_size + j * 2;
-            if idx < n {
-                out[idx] = lo as f32 * scale;
-            }
-            if idx + 1 < n {
-                out[idx + 1] = hi as f32 * scale;
-            }
-        }
-    }
-    out
-}
-
-fn dequant_q8_0(data: &[u8], n: usize) -> Vec<f32> {
-    let block_size = 32;
-    let nblocks = (n + block_size - 1) / block_size;
-    let mut out = vec![0.0f32; n];
-    for b in 0..nblocks {
-        let off = b * 34;
-        if off + 34 > data.len() {
-            break;
-        }
-        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
-        for j in 0..32 {
-            let q = data[off + 2 + j] as i8 as f32;
-            let idx = b * block_size + j;
-            if idx < n {
-                out[idx] = q * scale;
-            }
-        }
-    }
-    out
-}
-
-fn dequant_q2_0(data: &[u8], n: usize) -> Vec<f32> {
-    const QK: usize = 128;
-    const BLK: usize = 34;
-    let mut out = Vec::with_capacity(n);
-    let nblocks = n / QK;
-    for b in 0..nblocks {
-        let base = b * BLK;
-        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
-        let qs = &data[base + 2..base + BLK];
-        for j in 0..QK {
-            let code = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
-            out.push((code as i32 - 1) as f32 * d);
-        }
-    }
-    out
-}
-
-fn dequant_q1_0(data: &[u8], n: usize) -> Vec<f32> {
-    const BLK: usize = 18;
-    const QK: usize = 128;
-    let nblocks = (n + QK - 1) / QK;
-    let mut out = Vec::with_capacity(n);
-    for b in 0..nblocks {
-        let base = b * BLK;
-        let d = f16_to_f32(u16::from_le_bytes([data[base], data[base + 1]]));
-        let neg_d = -d;
-        for j in 0..QK {
-            if out.len() == n {
-                break;
-            }
-            let byte = data[base + 2 + (j >> 3)];
-            let bit = (byte >> (j & 7)) & 1;
-            out.push(if bit == 1 { d } else { neg_d });
-        }
-    }
-    out
-}
-
-fn dequant_q4_k(data: &[u8], n: usize) -> Vec<f32> {
-    let block_size = 256;
-    let block_bytes = 144;
-    let nblocks = (n + block_size - 1) / block_size;
-    let mut out = vec![0.0f32; n];
-    for b in 0..nblocks {
-        let off = b * block_bytes;
-        if off + block_bytes > data.len() {
-            break;
-        }
-        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
-        let dmin = f16_to_f32(u16::from_le_bytes([data[off + 2], data[off + 3]]));
-
-        let sc_data = &data[off + 4..off + 16];
-        let mut scales = [0u8; 8];
-        let mut mins = [0u8; 8];
-        for i in 0..4 {
-            scales[i] = sc_data[i] & 63;
-            mins[i] = sc_data[4 + i] & 63;
-        }
-        for i in 0..4 {
-            scales[4 + i] = (sc_data[8 + i] & 0xF) | ((sc_data[i] >> 6) << 4);
-            mins[4 + i] = (sc_data[8 + i] >> 4) | ((sc_data[4 + i] >> 6) << 4);
-        }
-
-        let qdata = &data[off + 16..off + 16 + 128];
-        for group in 0..4 {
-            let sb_even = group * 2;
-            let sb_odd = group * 2 + 1;
-            let sc_even = d * scales[sb_even] as f32;
-            let m_even = dmin * mins[sb_even] as f32;
-            let sc_odd = d * scales[sb_odd] as f32;
-            let m_odd = dmin * mins[sb_odd] as f32;
-            for l in 0..32 {
-                let byte = qdata[group * 32 + l];
-                let idx_even = b * block_size + group * 64 + l;
-                let idx_odd = idx_even + 32;
-                if idx_even < n {
-                    out[idx_even] = (byte & 0x0F) as f32 * sc_even - m_even;
-                }
-                if idx_odd < n {
-                    out[idx_odd] = ((byte >> 4) & 0x0F) as f32 * sc_odd - m_odd;
-                }
-            }
-        }
-    }
-    out
-}
-
-fn dequant_q5_k(data: &[u8], n: usize) -> Vec<f32> {
-    let block_size = 256;
-    let block_bytes = 176;
-    let nblocks = (n + block_size - 1) / block_size;
-    let mut out = vec![0.0f32; n];
-    for b in 0..nblocks {
-        let off = b * block_bytes;
-        if off + block_bytes > data.len() {
-            break;
-        }
-        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
-        let dmin = f16_to_f32(u16::from_le_bytes([data[off + 2], data[off + 3]]));
-
-        // 12-byte packed scales/mins — same layout as Q4_K
-        let sc_data = &data[off + 4..off + 16];
-        let mut scales = [0u8; 8];
-        let mut mins = [0u8; 8];
-        for i in 0..4 {
-            scales[i] = sc_data[i] & 63;
-            mins[i] = sc_data[4 + i] & 63;
-        }
-        for i in 0..4 {
-            scales[4 + i] = (sc_data[8 + i] & 0xF) | ((sc_data[i] >> 6) << 4);
-            mins[4 + i] = (sc_data[8 + i] >> 4) | ((sc_data[4 + i] >> 6) << 4);
-        }
-
-        // 32 bytes of high bits (1 bit per element), then 128 bytes of low nibbles
-        let qh = &data[off + 16..off + 48];
-        let ql = &data[off + 48..off + 176];
-
-        for group in 0..4 {
-            let sb_even = group * 2;
-            let sb_odd = group * 2 + 1;
-            let sc_even = d * scales[sb_even] as f32;
-            let m_even = dmin * mins[sb_even] as f32;
-            let sc_odd = d * scales[sb_odd] as f32;
-            let m_odd = dmin * mins[sb_odd] as f32;
-            for l in 0..32 {
-                let byte = ql[group * 32 + l];
-                let hbit = ((qh[l] >> group) & 1) as u8;
-                let hbit2 = ((qh[l] >> (group + 4)) & 1) as u8;
-                let idx_even = b * block_size + group * 64 + l;
-                let idx_odd = idx_even + 32;
-                if idx_even < n {
-                    let q = ((byte & 0x0F) | (hbit << 4)) as f32;
-                    out[idx_even] = q * sc_even - m_even;
-                }
-                if idx_odd < n {
-                    let q = (((byte >> 4) & 0x0F) | (hbit2 << 4)) as f32;
-                    out[idx_odd] = q * sc_odd - m_odd;
-                }
-            }
-        }
-    }
-    out
-}
-
-fn dequant_q6_k(data: &[u8], n: usize) -> Vec<f32> {
-    let block_size = 256;
-    let block_bytes = 210;
-    let nblocks = (n + block_size - 1) / block_size;
-    let mut out = vec![0.0f32; n];
-    for b in 0..nblocks {
-        let off = b * block_bytes;
-        if off + block_bytes > data.len() {
-            break;
-        }
-        let mut ql = &data[off..off + 128];
-        let mut qh = &data[off + 128..off + 192];
-        let mut sc = &data[off + 192..off + 208];
-        let d = f16_to_f32(u16::from_le_bytes([data[off + 208], data[off + 209]]));
-        let base = b * block_size;
-        for group in 0..2 {
-            let y_off = base + group * 128;
-            for l in 0..32 {
-                let is = l / 16;
-                let q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) as i32 - 32;
-                let q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
-                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
-                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
-                let idx0 = y_off + l;
-                let idx1 = y_off + l + 32;
-                let idx2 = y_off + l + 64;
-                let idx3 = y_off + l + 96;
-                if idx0 < n {
-                    out[idx0] = d * sc[is] as i8 as f32 * q1 as f32;
-                }
-                if idx1 < n {
-                    out[idx1] = d * sc[is + 2] as i8 as f32 * q2 as f32;
-                }
-                if idx2 < n {
-                    out[idx2] = d * sc[is + 4] as i8 as f32 * q3 as f32;
-                }
-                if idx3 < n {
-                    out[idx3] = d * sc[is + 6] as i8 as f32 * q4 as f32;
-                }
-            }
-            ql = &ql[64..];
-            qh = &qh[32..];
-            sc = &sc[8..];
-        }
-    }
-    out
-}
-
-/// Dispatcher: dequantize any supported tensor to f32. Panics on unsupported types.
-pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
-    let n = info.numel();
-    match info.dtype {
-        GgmlType::F32 => {
-            let mut out = vec![0.0f32; n];
-            for (i, chunk) in data.chunks_exact(4).enumerate().take(n) {
-                out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            }
-            out
-        }
-        GgmlType::F16 => {
-            let mut out = vec![0.0f32; n];
-            for (i, chunk) in data.chunks_exact(2).enumerate().take(n) {
-                out[i] = f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
-            }
-            out
-        }
-        GgmlType::BF16 => {
-            let mut out = vec![0.0f32; n];
-            for (i, chunk) in data.chunks_exact(2).enumerate().take(n) {
-                out[i] = bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
-            }
-            out
-        }
-        GgmlType::Q4_0 => dequant_q4_0(data, n),
-        GgmlType::Q8_0 => dequant_q8_0(data, n),
-        GgmlType::Q2_0 => dequant_q2_0(data, n),
-        GgmlType::Q1_0 => dequant_q1_0(data, n),
-        GgmlType::Q4K => dequant_q4_k(data, n),
-        GgmlType::Q5K => dequant_q5_k(data, n),
-        GgmlType::Q6K => dequant_q6_k(data, n),
-        other => panic!(
-            "GGUF tensor type {:?} not implemented (tensor: {})",
-            other, info.name
-        ),
-    }
-}
-
-#[cfg(test)]
-mod q2_0_tests {
-    use super::*;
-    #[test]
-    fn q2_0_type_params() {
-        let t = GgmlType::from_u32(42).expect("ggml_type 42 = Q2_0");
-        assert_eq!(t, GgmlType::Q2_0);
-        assert_eq!(t.block_size(), 128);
-        assert_eq!(t.block_bytes(), 34); // 2 (FP16 d) + 32 (2-bit x 128)
-    }
-
-    #[test]
-    fn q2_0_dequant_matches_formula() {
-        let mut block = vec![0u8; 34];
-        block[0] = 0x00;
-        block[1] = 0x40; // FP16 2.0 little-endian
-        block[2] = 0xE4; // codes 0,1,2,3 (LSB-first)
-        let out = dequant_q2_0(&block, 128);
-        assert_eq!(&out[0..4], &[-2.0, 0.0, 2.0, 4.0]); // (code-1)*d
-        assert!(out[4..128].iter().all(|&x| x == -2.0)); // code 0 -> -d
-        assert_eq!(out.len(), 128);
-    }
-}
-
-#[cfg(test)]
-mod q1_0_tests {
-    use super::*;
-
-    #[test]
-    fn q1_0_ggml_type_reads() {
-        let t = GgmlType::from_u32(41).expect("ggml_type 41 = Q1_0");
-        assert_eq!(t, GgmlType::Q1_0);
-        assert_eq!(t.block_size(), 128);
-        assert_eq!(t.block_bytes(), 18);
-    }
-
-    #[test]
-    fn dequant_q1_0_sign_only() {
-        // One block: d=0.5, all-ones bits -> all +0.5; first bit cleared -> element 0 = -0.5.
-        // FP16 0.5 = 0x3800 little-endian ([0x00, 0x38]); no `half` crate dep in this
-        // workspace, so the bit pattern is constructed directly (same style as the
-        // q2_0_dequant_matches_formula test above).
-        let mut blk = vec![0u8; 18];
-        blk[0] = 0x00;
-        blk[1] = 0x38; // FP16 0.5, little-endian
-        for b in blk[2..18].iter_mut() {
-            *b = 0xFF; // all bits set -> all +d
-        }
-        let all_pos = dequant_q1_0(&blk, 128);
-        assert_eq!(all_pos.len(), 128);
-        assert!(all_pos.iter().all(|&v| (v - 0.5).abs() < 1e-3));
-
-        blk[2] &= !1u8; // clear bit 0 of first qs byte -> element 0 = -d
-        let mixed = dequant_q1_0(&blk, 128);
-        assert!((mixed[0] + 0.5).abs() < 1e-3);
-        assert!((mixed[1] - 0.5).abs() < 1e-3);
     }
 }

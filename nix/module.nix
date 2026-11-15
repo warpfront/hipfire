@@ -240,8 +240,8 @@ in
     kvCache = lib.mkOption {
       type = lib.types.str;
       default = "auto";
-      example = "asym3";
-      description = "KV cache quantization mode: auto / q8 / asym4 / asym3 / asym2 / turbo / turbo4 / turbo3 / turbo2.";
+      example = "fwht3";
+      description = "KV cache quantization mode: auto / q8 / fp8 / bf16 / fwht4 / fwht3 / fwht2.";
     };
 
     dflashMode = lib.mkOption {
@@ -308,7 +308,7 @@ in
       type = lib.types.attrsOf lib.types.str;
       default = { };
       example = lib.literalExpression ''
-        { HIPFIRE_KV_MODE = "asym3"; }
+        { HIPFIRE_KV_MODE = "fwht3"; }
       '';
       description = "Extra environment variables (HIPFIRE_*) for the daemon.";
     };

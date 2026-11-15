@@ -94,7 +94,7 @@
       "gpu": 1,
       "model_path": "/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x",
       "model_sha256": "86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc",
-      "mode": { "kv": "q8", "dflash": "on", "dflash_ctx_cap": 0, "mtp": "off" },
+      "mode": { "kv": "q8", "dflash": "on", "mtp": "off" },
       "proxy_scope": "hermes-only",
       "endpoints": {
         "serve_port": 12181,

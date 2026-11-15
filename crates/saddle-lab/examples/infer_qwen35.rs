@@ -156,42 +156,14 @@ fn main() {
     .expect("failed to load weights");
 
     let kv_seq = 2048usize;
-    let kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {
-        "auto" => "q8".to_string(),
-        mode => mode.to_string(),
-    };
-    let mut kv_cache = match kv_mode.as_str() {
-        "givens4" => {
-            eprintln!("KV cache: givens4");
-            llama::KvCache::new_gpu_asym3(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_seq,
-            )
-            .unwrap()
-        }
-        "givens2" => {
-            eprintln!("KV cache: givens2");
-            llama::KvCache::new_gpu_asym2(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_seq,
-            )
-            .unwrap()
-        }
-        _ => llama::KvCache::new_gpu_q8(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-    };
+    let mut kv_cache = llama::KvCache::new_gpu_q8(
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        kv_seq,
+    )
+    .unwrap();
     let mut dn_state = if std::env::var("FP32_STATE").is_ok() {
         DeltaNetState::new_with_quant(
             &mut gpu,

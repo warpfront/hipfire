@@ -448,7 +448,9 @@ mod tests {
             decode(arch, words).unwrap_or_else(|e| panic!("{arch:?} {name} {words:08x?}: {e}"));
         assert_eq!(used, words.len(), "{arch:?} {name}: width");
         assert_eq!(inst.op.id, opcode, "{arch:?} {name}: opcode id");
-        let row = isa::lookup(arch, inst.op, inst.form).expect("decoded opcode has a table row");
+        let row = isa::lookup_inst(arch, &inst)
+            .ok()
+            .expect("decoded opcode has a table row");
         assert_eq!(row.name, name, "{arch:?} {words:08x?}");
         let table_words: Vec<u32> = row
             .encoding
@@ -464,10 +466,11 @@ mod tests {
             words,
             "{arch:?} {name}: re-encode"
         );
-        let rebuilt = Inst::from_parts(
+        let rebuilt = Inst::from_encoding(
             arch,
             inst.op,
             inst.form,
+            inst.variant,
             inst.fields.clone(),
             inst.operands.clone(),
             inst.mods.clone(),
@@ -555,7 +558,7 @@ mod tests {
                     "{name}"
                 );
                 let (inst, _) = decode(arch, &signed).unwrap();
-                assert_eq!(isa::lookup(arch, inst.op, inst.form).unwrap().name, name);
+                assert_eq!(isa::lookup_inst(arch, &inst).unwrap().name, name);
                 assert_eq!(encode(arch, &inst).unwrap().as_slice(), &signed);
             }
         }

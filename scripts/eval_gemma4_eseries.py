@@ -175,7 +175,6 @@ class Daemon:
             env["HIPFIRE_HOME"] = str(hipfire_home.resolve())
             env.pop("HIPFIRE_MODELS_DIR", None)
         env["HIP_VISIBLE_DEVICES"] = physical_gpu
-        env["HIPFIRE_GEMMA4_GRAPH"] = "0"
         env["HIPFIRE_GEMMA4_EAGLE"] = "0"
         env["HIPFIRE_Q8_BATCHED_LEGACY"] = "0"
         env["HIPFIRE_GEMMA4_PREFILL_BATCH"] = str(prefill_batch)
@@ -396,7 +395,7 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--prefill-batch", type=int, default=8)
     parser.add_argument(
-        "--kv-mode", choices=("q8", "asym4", "asym3", "asym2"), default="q8"
+        "--kv-mode", choices=("q8", "fwht4", "fwht3", "fwht2"), default="q8"
     )
     parser.add_argument("--flash-attn-ck-lib", type=Path)
     parser.add_argument("--flash-attn-ck-workspace-bytes", type=int, default=536870912)

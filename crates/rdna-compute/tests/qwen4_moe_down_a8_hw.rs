@@ -54,11 +54,12 @@ const INC_GRP_SHIPPED: &str =
 const INC_GRP_PLANAR: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2p_moe_grouped_top10_o8_r16.gfx1201.hip");
 
-// Lab-only best-exact per-pick reference (MoeDn32 dni, moekern-out/hb_dn): NOT in the shipped tree, loaded by
-// absolute path so the timing arm can state "A8 vs the best exact decode" next to the production incumbent.
-const LAB_DNI: &str =
-    include_str!("/home/kaden/qcal/release-0.4.5/mgmtp/moekern-out/hb_dn/dni_prod.hip");
-const MOD_DNI: &str = "e1dn_lab_dni";
+// Best-exact per-pick reference (the MoeDn32 `dni` kernel): first a lab-only source loaded by absolute
+// path, now shipped as the default gfx1201 <= 8-row down (`HIPFIRE_QWEN4_MOE_DOWN_DNI`, 7a1f00cb4), so the
+// timing arm reads the in-tree source and states "A8 vs the best exact decode" next to the incumbent.
+const DNI_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g128v2_moe_down_top10_dni.gfx1201.hip");
+const MOD_DNI: &str = "e1dn_dni";
 const F_DNI_S: &str = "gemv_mq4g128v2_moe_down_top10_dni_k640";
 const F_DNI_P: &str = "gemv_mq4g128v2p_moe_down_top10_dni_k640";
 const MOD_A8: &str = "e1dn_a8";
@@ -231,10 +232,10 @@ fn load_all(gpu: &mut Gpu) {
         .expect("flush kernel");
     gpu.ensure_kernel_public(MOD_FLUSH, FLUSH_SRC, F_STREAM)
         .expect("stream kernel");
-    gpu.ensure_kernel_public(MOD_DNI, LAB_DNI, F_DNI_S)
-        .expect("lab dni shipped");
-    gpu.ensure_kernel_public(MOD_DNI, LAB_DNI, F_DNI_P)
-        .expect("lab dni planar");
+    gpu.ensure_kernel_public(MOD_DNI, DNI_SRC, F_DNI_S)
+        .expect("dni shipped");
+    gpu.ensure_kernel_public(MOD_DNI, DNI_SRC, F_DNI_P)
+        .expect("dni planar");
 }
 
 fn gpu_gate() -> Option<Gpu> {

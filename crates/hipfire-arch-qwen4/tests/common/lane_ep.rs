@@ -92,9 +92,8 @@ const EP_DEGREE: usize = 2;
 pub(super) enum ArmKind {
     /// Target-only AR lanes (the reference).
     Ar,
-    /// Native-MTP mesh lanes (no copy lane staged: the store the serve builds
-    /// with `HIPFIRE_EP_MTP_LANE_COPY=0`) with the fixed-count pin: native
-    /// windows at every lane count.
+    /// Native-MTP mesh lanes (no copy lane staged or reserved) with the
+    /// fixed-count pin: native windows at every lane count.
     Mtp,
     /// Native-MTP mesh lanes with the copy lane the serve stages by default
     /// (`ep::ep_default_copy_config`, steps of at most `COPY_WIDE_LANES`
@@ -799,7 +798,6 @@ fn load_ep(
         .to_str()
         .ok_or_else(|| format!("{} is not valid UTF-8", model.display()))?;
     let (state_request, _) = hw_identity::gdn_test_state_quant()?;
-    let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let spec = hipfire_runtime::loader_api::SpecLoadCfg {
         // The native head is attached only for the arms that decode with it.
         mtp: kind.mesh().then_some(true),
@@ -822,15 +820,13 @@ fn load_ep(
             kv_v: None,
             qwen_default_q8: qwen_default_q8_enabled(),
             kv_adaptive: None,
-            cask: Some(&cask),
             deepseek4_heterogeneous: false,
-            vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+            vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
         },
         SourceAdmissionOptions {
             spec,
             kv_adaptive: qwen4_kv_adaptive_requested(None),
-            cask: cask.sidecar.is_some(),
             ..Default::default()
         },
     )?;
@@ -858,7 +854,6 @@ fn load_ep(
         None,
         None,
         Some(state_request),
-        &cask,
         1,
         spec,
         gpu,
@@ -947,7 +942,7 @@ impl EpLanes {
         // arm runs) is an error, never a silent copy-off arm.
         let copy = if kind == ArmKind::Copy {
             let copy = hipfire_arch_qwen4::ep::ep_default_copy_config(gpu.arch.as_str())
-                .ok_or("lane_copy: the default EP copy lane resolves to off (HIPFIRE_EP_MTP_LANE_COPY, HIPFIRE_MTP_NGRAM_COPY or HIPFIRE_QWEN4_LANE_COPY_LANES=0)")?;
+                .ok_or("lane_copy: the default EP copy lane resolves to off (HIPFIRE_MTP_NGRAM_COPY or HIPFIRE_QWEN4_LANE_COPY_LANES=0)")?;
             if copy.wide_lanes < lanes {
                 return Err(format!(
                     "lane_copy: {} lanes but only {} copy-wide lanes (HIPFIRE_QWEN4_LANE_COPY_LANES)",

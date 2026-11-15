@@ -348,6 +348,7 @@ fn fixture_reserve(
         gdn,
         qsa_f16_arena: false,
         qsa_pooled_bf16: false,
+        gdn_stream: hipfire_arch_qwen4::GdnStreamKind::None,
     };
     let context =
         Qwen4ContextCommit::for_expert_reserve(backend, false, fx.max_seq, chunk_rows, GRANULARITY);

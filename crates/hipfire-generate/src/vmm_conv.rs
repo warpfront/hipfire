@@ -26,7 +26,7 @@
 //! route's: no speculator or MTP spec lanes (their routes keep their own
 //! caches), Jinja rendering, prompt cache on, no eviction/adaptive KV.
 
-use crate::ar::{ckpt_interval, ckpt_max, ckpt_resume_enabled, truncate_checkpoints};
+use crate::ar::{ckpt_interval, ckpt_max, truncate_checkpoints};
 use hipfire_arch_qwen35::forward_slots::vmm::{
     Qwen35RequestState, Qwen35VmmStore, VmmPrefixEntry, VmmRequestInit,
 };
@@ -87,12 +87,7 @@ pub fn plan_reuse(
     checkpoints: &[(usize, DeltaNetSnapshot)],
     rendered: &[u32],
 ) -> Reuse {
-    plan_reuse_at(
-        prior,
-        checkpoints.iter().map(|(p, _)| *p),
-        rendered,
-        ckpt_resume_enabled(),
-    )
+    plan_reuse_at(prior, checkpoints.iter().map(|(p, _)| *p), rendered)
 }
 
 /// [`plan_reuse`] over checkpoint positions (ascending, as the ring keeps
@@ -101,7 +96,7 @@ pub fn plan_reuse(
 /// so a re-sent final token must not be applied twice) resumes from the
 /// latest checkpoint at or before the LCP that leaves at least one token to
 /// prefill, else goes cold.
-fn plan_reuse_at<I>(prior: &[u32], positions: I, rendered: &[u32], resume_enabled: bool) -> Reuse
+fn plan_reuse_at<I>(prior: &[u32], positions: I, rendered: &[u32]) -> Reuse
 where
     I: DoubleEndedIterator<Item = usize> + ExactSizeIterator,
 {
@@ -111,9 +106,6 @@ where
         .take_while(|(a, b)| a == b)
         .count();
     if lcp < prior.len() || lcp == rendered.len() {
-        if !resume_enabled {
-            return Reuse::Cold;
-        }
         positions
             .enumerate()
             .rev()
@@ -136,17 +128,57 @@ fn best_entry(pool: &[VmmPrefixEntry], rendered: &[u32]) -> Option<(usize, Reuse
         .map(|(i, r, _)| (i, r))
 }
 
-/// Snapshot `dn` into `checkpoints` at the singleton's cadence.
+/// Snapshot `dn` into `checkpoints` at the singleton's cadence, sparing the
+/// lane's pinned user-turn snapshot (`turn.pin`). `stream` is the
+/// lane's committed token stream; the snapshot is attested against
+/// `stream[..pos]` (unattested when the lane's record is shorter than `pos`).
 pub fn checkpoint(
     checkpoints: &mut Checkpoints,
     dn: &DeltaNetState,
     kv: &hipfire_runtime::llama::KvCache,
     gpu: &mut rdna_compute::Gpu,
     pos: usize,
+    stream: &[u32],
+    turn: speculative::TurnCheckpoint,
 ) {
-    if ckpt_resume_enabled() {
-        speculative::take_dn_checkpoint(checkpoints, dn, kv, gpu, pos, ckpt_interval(), ckpt_max());
-    }
+    speculative::take_turn_checkpoint(
+        checkpoints,
+        dn,
+        kv,
+        gpu,
+        pos,
+        ckpt_interval(),
+        ckpt_max(),
+        turn,
+        (stream.get(..pos).unwrap_or(&[]), &[]),
+    );
+}
+
+/// Before the lane forwards its prefill chunk `[pos, pos + len)` (the
+/// singleton's chunk plan): the user-turn snapshot exactly as the singleton
+/// takes it (`speculative::take_turn_checkpoint_before_chunk`).
+#[allow(clippy::too_many_arguments)]
+pub fn turn_checkpoint_before_chunk(
+    checkpoints: &mut Checkpoints,
+    dn: &DeltaNetState,
+    kv: &hipfire_runtime::llama::KvCache,
+    gpu: &mut rdna_compute::Gpu,
+    pos: usize,
+    len: usize,
+    stream: &[u32],
+    turn: &mut speculative::TurnCheckpoint,
+) {
+    speculative::take_turn_checkpoint_before_chunk(
+        checkpoints,
+        dn,
+        kv,
+        gpu,
+        pos,
+        len,
+        ckpt_max(),
+        turn,
+        (stream.get(..pos).unwrap_or(&[]), &[]),
+    );
 }
 
 pub fn free_checkpoints(checkpoints: Checkpoints, gpu: &mut rdna_compute::Gpu) {
@@ -168,22 +200,13 @@ fn store(m: &LoadedModel) -> Option<&Qwen35VmmStore> {
 }
 
 /// The pool serves this model: VMM store staged with AR lanes only, no
-/// singleton speculator, Jinja rendering, prompt cache on, plain KV.
+/// singleton speculator, a Jinja chat template, plain KV.
 pub fn pool_enabled(m: &LoadedModel) -> bool {
     m.speculator.is_none()
-        && m.eviction.is_none()
         && m.kv_adaptive.is_none()
         && m.pp <= 1
         && m.ep.is_none()
         && m.chat_template.is_some()
-        && hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0")
-        && hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
-            .ok()
-            .as_deref()
-            != Some("0")
         && store(m).is_some_and(|s| s.spec_engine().is_none())
 }
 
@@ -290,35 +313,16 @@ pub fn clear(state: &mut Option<Box<dyn ArchModel>>, gpu: &mut rdna_compute::Gpu
     }
 }
 
-/// Copy `src`'s DeltaNet state into `dst` (common buffer extent: same
-/// shapes, allocations may be pool-rounded differently). Synchronizes.
+/// Copy `src`'s complete DeltaNet state (recurrence, EF, GDN carry, cursors)
+/// into `dst` through the owner API, which validates stream identity and
+/// shapes before any byte moves. Synchronizes.
 fn copy_dn(
     gpu: &mut rdna_compute::Gpu,
-    dst: &DeltaNetState,
+    dst: &mut DeltaNetState,
     src: &DeltaNetState,
 ) -> Result<(), String> {
-    if dst.s_matrices.len() != src.s_matrices.len()
-        || dst.s_scales.len() != src.s_scales.len()
-        || dst.conv_states.len() != src.conv_states.len()
-        || dst.s_ef_residual.len() != src.s_ef_residual.len()
-    {
-        return Err("copy_dn: DeltaNet layouts differ".into());
-    }
-    let pairs = dst
-        .s_matrices
-        .iter()
-        .zip(&src.s_matrices)
-        .chain(dst.s_scales.iter().zip(&src.s_scales))
-        .chain(dst.conv_states.iter().zip(&src.conv_states))
-        .chain(dst.s_ef_residual.iter().zip(&src.s_ef_residual));
-    for (d, s) in pairs {
-        if d.shape != s.shape {
-            return Err("copy_dn: DeltaNet tensor shapes differ".into());
-        }
-        let n = d.buf.size().min(s.buf.size());
-        gpu.memcpy_dtod_at_auto(&d.buf, 0, &s.buf, 0, n)
-            .map_err(|e| format!("copy_dn: {e}"))?;
-    }
+    dst.copy_from(gpu, src)
+        .map_err(|e| format!("copy_dn: {e}"))?;
     gpu.hip
         .device_synchronize()
         .map_err(|e| format!("copy_dn: sync: {e}"))
@@ -502,7 +506,7 @@ pub fn singleton_adopt(
         checkpoints: cks,
         ..
     } = entry;
-    if let Err(e) = copy_dn(gpu, &b.dn_state, &st.dn) {
+    if let Err(e) = copy_dn(gpu, &mut b.dn_state, &st.dn) {
         // Bundle DeltaNet is undefined: zero it and serve cold.
         eprintln!("[vmm-prefix] singleton adopt: {e}; cold");
         let _ = b.dn_state.reset(gpu);
@@ -652,7 +656,14 @@ impl ThinkCtl {
         let bytes = stream();
         let raw_str = std::str::from_utf8(&bytes).unwrap_or("");
         let in_think = hipfire_runtime::emit_text::currently_in_think(raw_str, started_in_think);
-        self.account(Some(id), in_think, force_answer_now, generated, max_tokens, close_len)
+        self.account(
+            Some(id),
+            in_think,
+            force_answer_now,
+            generated,
+            max_tokens,
+            close_len,
+        )
     }
 
     /// The think state the singleton AR loop holds after committing
@@ -855,7 +866,14 @@ mod tests {
     fn in_think_scan_matches_whole_stream_scan() {
         let streams: [&[&[u8]]; 4] = [
             &[b"ok <th", b"ink>a", b"b</thi", b"nk>", b"\n<think>", b"x"],
-            &[b"</think>", b"ans", b"<", b"/", b"think>", b"<think><think>"],
+            &[
+                b"</think>",
+                b"ans",
+                b"<",
+                b"/",
+                b"think>",
+                b"<think><think>",
+            ],
             &[b"<think>\xE2", b"\x82", b"\xAC</think>", b"y"],
             &[b"<think>", b"\xFF", b"</think>", b"z"],
         ];

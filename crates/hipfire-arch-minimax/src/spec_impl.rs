@@ -174,7 +174,5 @@ impl SpecTarget for MiniMaxBundle {
     }
 
     // kv_cache_mut: defaulted to `None` — MiniMaxState uses its own KvCache
-    // (not the shared llama::KvCache borrow the eviction sites expect), and
-    // arch_id=10 has no FlashCASK eviction wired. The daemon's eviction sites are
-    // `if let Some(ev)`-gated, so this is never reached for a non-evicting target.
+    // (not the shared llama::KvCache).
 }

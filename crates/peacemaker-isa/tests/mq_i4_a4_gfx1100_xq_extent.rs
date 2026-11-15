@@ -105,7 +105,8 @@ fn program(swap_xq_site: bool) -> peacemaker_ir::Program {
             .expect("K3 kernel");
         let name = |kernel: &peacemaker_ir::inst::Kernel, i: usize| -> &'static str {
             let inst = kernel.body.insts.get(kernel.body.layout[i]).expect("inst");
-            peacemaker_ir::isa::lookup(arch, inst.op, inst.form)
+            peacemaker_ir::isa::lookup_inst(arch, &inst)
+                .ok()
                 .expect("opcode row")
                 .name
         };

@@ -27,8 +27,7 @@ const SLOT_DELTA: usize = F32_SLOT - Q8_SLOT;
 const RINGS: [usize; 3] = [4, 8, 32];
 /// Ring state slots a state's capture ring allocates across `layers` GDN layers for `r`-row
 /// blocks: the shared pool `2 * (layers - 1) + r + 1` by default
-/// (`HIPFIRE_QWEN4_LANE_RESERVE_TRIM`), `r + 1` per layer with the trim kill switch, `2r` per
-/// layer with the compact-ring kill switch too.
+/// (`HIPFIRE_QWEN4_LANE_RESERVE_TRIM`), `r + 1` per layer with the trim kill switch.
 fn ring_slots(r: usize, layers: usize) -> usize {
     current_capture_ring_total_slots(r, layers).unwrap()
 }
@@ -48,6 +47,7 @@ fn format_of(qsa: QsaKvFormat, gdn: GdnStateFormat) -> Qwen4StateFormat {
         gdn,
         qsa_f16_arena: false,
         qsa_pooled_bf16: false,
+        gdn_stream: crate::GdnStreamKind::None,
     }
 }
 
@@ -200,7 +200,7 @@ fn gdn_precision_owner_accounting() {
     assert_eq!(2 * Q8_ALL, 55 * MIB + 11 * MIB / 16);
     assert_eq!(2 * F32_ALL, 216 * MIB);
 
-    // Capture ring R+1 slots (2R with the kill switch); the non-ring terms are format independent.
+    // Capture ring R+1 slots; the non-ring terms are format independent.
     for (index, &r) in RINGS.iter().enumerate() {
         let q8 = Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, r).unwrap();
         let f32 = Qwen4State::row_capture_bytes(&config, GdnStateFormat::F32, r).unwrap();
@@ -228,9 +228,7 @@ fn gdn_precision_owner_accounting() {
             ring_slots(r, GDN_LAYERS) * SLOT_DELTA + SET_DELTA,
             "R={r}"
         );
-        // The kill-switch layout stays 2R slots.
-        assert_eq!(capture_ring_slots(false, r), Some(2 * r));
-        assert_eq!(capture_ring_slots(true, r), Some(r + 1));
+        assert_eq!(capture_ring_slots(r), Some(r + 1));
     }
     assert_eq!(
         ring_q8(0) + Q8_ALL,

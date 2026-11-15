@@ -152,16 +152,11 @@ impl<'a> RowsProgram<'a> {
 
 /// Route knobs of the batched projections for this model on `gpu`.
 pub(crate) fn rows_projection(gpu: &Gpu, backend: Mq2rBackend) -> RowsProjection {
-    let flag = |name: &str| hipfire_config::developer_var(name).as_deref() != Ok("0");
     RowsProjection {
         e8_soa: e8_soa_kernel(&gpu.arch, backend),
-        e8_b2: config_cache::e8_prefill_b2_on(&gpu.arch, backend.is_gfx1151()),
-        e8_b4: config_cache::e8_prefill_b4_on(&gpu.arch, backend.is_gfx1151()),
+        e8_multi_tile: config_cache::e8_prefill_b4_on(&gpu.arch),
         e8_batched_gemv_max: config_cache::e8_batched_gemv_max_batch(),
         gfx1201_e8: backend.is_gfx1201(),
-        gfx1201_wide: flag("HIPFIRE_DEEPSEEK4_GFX1201_E8_WIDE"),
-        e8_pair_b3: flag("HIPFIRE_DEEPSEEK4_E8_BATCHED_PAIR_B3"),
-        hfq4_wmma: flag("HIPFIRE_DEEPSEEK4_HFQ4_WMMA"),
         f32_trace: hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_F32_TRACE").is_ok(),
     }
 }
@@ -192,13 +187,10 @@ fn tail_rope(cfg: &DeepseekV4Config, layer: &DeepseekV4LayerWeights) -> Compress
 /// Whether the compressor projections run as F16 WMMA on the F16 weight
 /// copies (all of the layer's flavors have them).
 fn compressor_f16_wmma(layer: &DeepseekV4LayerWeights) -> bool {
-    let on = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_F16_WMMA")
-        .map(|s| s != "0")
-        .unwrap_or(true);
     let have_idx_f16 = layer.compress_ratio != 4
         || (layer.indexer_compressor_wkv_f16.is_some()
             && layer.indexer_compressor_wgate_f16.is_some());
-    on && layer.compressor_wkv_f16.is_some() && layer.compressor_wgate_f16.is_some() && have_idx_f16
+    layer.compressor_wkv_f16.is_some() && layer.compressor_wgate_f16.is_some() && have_idx_f16
 }
 
 /// The windowed compressor commit can run batched: a chunk starting on a
@@ -457,10 +449,7 @@ fn hc_pre<'a>(
             comb: &pbs.hc_comb_batch,
             // gfx1201 1,024-row chunk only; every other shape keeps the
             // 24-workgroup route.
-            fused24: gpu.arch_caps.is_gfx1201()
-                && rows == 1024
-                && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_GFX1201_HC_FUSED24").as_deref()
-                    != Ok("0"),
+            fused24: gpu.arch_caps.is_gfx1201() && rows == 1024,
         },
     }))
 }
@@ -499,12 +488,7 @@ fn attention_input_pack<'a>(
     layer_idx: usize,
     rows: usize,
 ) -> Option<AttentionInputPackB3<'a>> {
-    let enabled = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_ATTN_PACK_B3")
-        .ok()
-        .as_deref()
-        != Some("0");
-    if !enabled
-        || gpu.arch != "gfx1151"
+    if gpu.arch != "gfx1151"
         || layer_idx >= cfg.num_hidden_layers
         || rows != 3
         || !cfg.hidden_size.is_multiple_of(256)
@@ -1070,15 +1054,8 @@ fn compressed_attention_rows<'a>(
                 // The LDS-transpose (coalesced-store) gather: gfx1201, and gfx1151
                 // where it measured 9.9-11.9x the scattered-store kernel,
                 // byte-identical.
-                tiled_gather: (gpu.arch.eq_ignore_ascii_case("gfx1201")
-                    && hipfire_config::developer_var(
-                        "HIPFIRE_DEEPSEEK4_GFX1201_TOPK_GATHER_TILED",
-                    )
-                    .as_deref()
-                        != Ok("0"))
-                    || (gpu.arch.eq_ignore_ascii_case("gfx1151")
-                        && hipfire_config::developer_var("HIPFIRE_DS4_GATHER_TILED").as_deref()
-                            != Ok("0")),
+                tiled_gather: gpu.arch.eq_ignore_ascii_case("gfx1201")
+                    || gpu.arch.eq_ignore_ascii_case("gfx1151"),
                 staged: &pbs.topk_staged_batch,
                 gather_head_dim: head_dim,
             },
@@ -1117,9 +1094,7 @@ fn compressed_attention_rows<'a>(
     }
     program.push(Stage::Other, index_step);
 
-    let wmma_flag = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref()
-        != Ok("0")
-        && gpu.arch_caps.has_wmma();
+    let wmma_flag = gpu.arch_caps.has_wmma();
     let wmma = if direct {
         // The portable WMMA symbol is not a viable gfx1201 lowering (351 ms
         // against 0.8 ms on the TP3 rank-2 shape).
@@ -1250,25 +1225,9 @@ fn kv_compress_rows<'a>(
             }
         }
     }
-    // "start" (the default, as the reference) rotates each committed row at
-    // the start of its window; "mid" / "end" stay for diagnostic A/B.
-    let mode = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS")
-        .ok()
-        .unwrap_or_else(|| "start".to_string());
+    // Each committed row rotates at the start of its window, as the reference.
     let event_positions = (0..events)
-        .map(|k| {
-            let pos = first_event + k * ratio + start_pos as usize;
-            let window_start = pos / ratio * ratio;
-            if is_indexer {
-                window_start as i32
-            } else {
-                match mode.as_str() {
-                    "end" => pos as i32,
-                    "mid" => (window_start + ratio / 2) as i32,
-                    _ => window_start as i32,
-                }
-            }
-        })
+        .map(|k| ((first_event + k * ratio + start_pos as usize) / ratio * ratio) as i32)
         .collect();
     let rope = if is_indexer {
         CompressorRope {
@@ -1336,14 +1295,7 @@ fn expert_ffn_rows<'a>(
             layer.shared_tp_size
         ));
     }
-    let fwht = crate::forward::weight_needs_fwht;
-    // The routed experts read the rotated input, so it stays live with MoE on.
-    let rotate_in = config_cache::moe_on() || fwht(shared_w1) || fwht(shared_w3);
-    let do_routed = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_MOE")
-        .ok()
-        .as_deref()
-        != Some("0")
-        && layer.expert_gate_up_blob.is_some()
+    let do_routed = layer.expert_gate_up_blob.is_some()
         && layer.expert_w2_blob.is_some()
         // Hash layers without the static tid2eid table fall back to the
         // shared expert alone.
@@ -1428,7 +1380,6 @@ fn expert_ffn_rows<'a>(
         shared_im,
         swiglu_limit: cfg.swiglu_limit,
         eps: cfg.rms_norm_eps,
-        rotate: rotate_in,
         rows,
         layer: layer_idx,
         route: expert_ffn::ExpertFfnRoute::Batched {

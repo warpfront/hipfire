@@ -1,0 +1,70 @@
+{
+  "arch": "gfx942",
+  "cases": 24576,
+  "code_object_sha256": "a9b44e401751015cf5bda1fd0d072def3a0e8085d88a5ef18c2f9db4714d8df9",
+  "controls_detected": 12,
+  "hip_source_sha256": "30c96774d9bda2d6744df32de0dc53e6628ab0687c71017980ab1318c6ed36c1",
+  "inputs_a_sha256": "060125c05d12e43b28037ff8d72864231088f1efc0ec621cfa894dd15f378826",
+  "inputs_b_sha256": "6f06f437402715eb3f21e4dbdef4a08be19173f512994b5dda8c099fcd90f8da",
+  "interpreter_source_sha256": "3d0f636b31e9f9f6098b61c0a00ba2af431a82e731039342c8b9f0d552ad43b2",
+  "oracle": "cdna_nor_hw_oracle",
+  "oracle_source_sha256": "53e2704e228dafd3754abe60e61a39f29ac2e89474b39f04e18b8f6157fb4435",
+  "rows": [
+    {
+      "bad_bytes": 0,
+      "cases": 4096,
+      "guards_ok": true,
+      "hardware_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "interpreter_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "kernel": "nor_separate",
+      "poison": 90
+    },
+    {
+      "bad_bytes": 0,
+      "cases": 4096,
+      "guards_ok": true,
+      "hardware_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "interpreter_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "kernel": "nor_separate",
+      "poison": 165
+    },
+    {
+      "bad_bytes": 0,
+      "cases": 4096,
+      "guards_ok": true,
+      "hardware_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "interpreter_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "kernel": "nor_alias0",
+      "poison": 90
+    },
+    {
+      "bad_bytes": 0,
+      "cases": 4096,
+      "guards_ok": true,
+      "hardware_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "interpreter_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "kernel": "nor_alias0",
+      "poison": 165
+    },
+    {
+      "bad_bytes": 0,
+      "cases": 4096,
+      "guards_ok": true,
+      "hardware_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "interpreter_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "kernel": "nor_alias1",
+      "poison": 90
+    },
+    {
+      "bad_bytes": 0,
+      "cases": 4096,
+      "guards_ok": true,
+      "hardware_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "interpreter_sha256": "8dec15b5cec5b4919f83cf7475cf615e404e1c6d67880d5ae9f679cb991c8fd0",
+      "kernel": "nor_alias1",
+      "poison": 165
+    }
+  ],
+  "seed": 1718470036395454757,
+  "status": "PASS"
+}

@@ -11,8 +11,8 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
-    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode, MtpEpGather,
-    Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
+    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode, seal_moe_rows,
+    MtpEpGather, Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
     Qwen4PeerLayerSource,
 };
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
@@ -30,10 +30,10 @@ use hipfire_dispatch::pipeline::gated_mlp::{
     Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput, MlpStorage,
 };
 use hipfire_dispatch::pipeline::{
-    execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
-    DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp,
-    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectLadder,
-    ProjectOp, Step,
+    execute_validated_steps, g942_bf16_few_rows_invariant, validate_steps, BroadcastAddOp, ClearOp,
+    DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp,
+    HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
+    MixerPhase, ProjectLadder, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::kv_backend::{
@@ -56,28 +56,64 @@ use std::fmt;
 const MTP_APPEND_BRANCHES: usize = 4;
 /// Rows of every MTP HC read and write: one token.
 const MTP_HC_ROWS: usize = 1;
-/// Most lanes one batched head round (`Qwen4MtpGpu::forward_rows_deferred`)
-/// carries: the EP row gather's capacity and the few-row route's limit
-/// (`LANE_MAX_DRAFTS` is 7).
+/// Most lanes one batched head round (`Qwen4MtpGpu::forward_rows_deferred`) carries in one
+/// call by default: the EP row gather's capacity and the few-row route's limit
+/// (`LANE_MAX_DRAFTS` is 7). Every load but exact single-device gfx942 keeps it
+/// ([`load_draft_call_rows`]).
 pub(crate) const MTP_DRAFT_LANES_MAX: usize = 8;
 
-/// `HIPFIRE_QWEN4_DRAFT_SHARDED_MOE` (developer; default on, exactly `0`
-/// disables and restores the X2 / replicated path byte for byte): with X2
-/// active, a batched draft pass (two to eight ops in the root's round, every
-/// op owned by a rank) keeps each rank's dense and attention work on its owned
-/// rows but runs the head's MoE once over ALL the round's rows on both ranks:
-/// each rank publishes its owner rows' MoE input, both all-gather it into the
-/// root's op order, and the existing replicated EP MoE call (compact tables,
-/// row-gather hook) runs over those rows; each rank keeps its own rows' FFN
-/// output. See [`S4Round`].
-pub(crate) const DRAFT_SHARDED_MOE_ENV: &str = "HIPFIRE_QWEN4_DRAFT_SHARDED_MOE";
+/// Most lanes one batched head call carries on an exact gfx942 single-device load
+/// ([`load_draft_call_rows`]): the head's row stages (HC, dense projections, the grouped FP8
+/// MoE call, glue) run once over up to 32 rows, so a 32-lane draft round is one call instead
+/// of four. Each lane's bytes stay its serial one-row step's: the gfx942 routes the stages take
+/// past 8 rows are row-invariant (ascending-K MFMA chains, the grouped FP8 MoE, the
+/// x-batched lm-head launcher chunked at its 8-row kernel width).
+pub(crate) const MTP_DRAFT_LANES_MAX_GFX942: usize = 32;
 
-/// Whether the sharded draft MoE pass is on ([`DRAFT_SHARDED_MOE_ENV`], default
-/// on; exactly `0` disables).
-pub(crate) fn draft_sharded_moe_enabled() -> bool {
-    hipfire_config::developer_bool(DRAFT_SHARDED_MOE_ENV, true)
+/// Rows the head's per-call buffers are sized for ([`MtpRowsScratch`], the head MoE grouping
+/// reservation) and the widest call [`load_draft_call_rows`] can pick. The device byte census
+/// (`MtpRowsScratch::device_bytes`, `Qwen4MtpGpu::device_bytes`) has no GPU, so it keys on the
+/// profile: the stock-FP8 profile is admitted on exact single-device gfx942 only
+/// (`Qwen4Admission`: `Fp8ExpertsUnsupported`, `Fp8SingleDeviceOnly`), every other profile is
+/// sized for [`MTP_DRAFT_LANES_MAX`] rows. The allocation and the census use this one function,
+/// so the load ledger is exact for every load.
+pub(crate) fn draft_call_capacity(config: &Qwen4Config) -> usize {
+    if config.profile.is_stock_fp8() {
+        MTP_DRAFT_LANES_MAX_GFX942
+    } else {
+        MTP_DRAFT_LANES_MAX
+    }
 }
 
+/// The widest batched head call of this load, decided once when the rows scratch is allocated:
+/// the scratch's [`draft_call_capacity`] on exact gfx942 with the head not expert-parallel
+/// (`ep_bound`; the sharded-MoE pass and the lane-local head exist under EP only), else
+/// [`MTP_DRAFT_LANES_MAX`]. Never above the capacity the scratch was sized for.
+pub(crate) fn load_draft_call_rows(gpu: &Gpu, config: &Qwen4Config, ep_bound: bool) -> usize {
+    call_rows_for(
+        draft_call_capacity(config),
+        gpu.arch_caps.is_gfx942(),
+        ep_bound,
+    )
+}
+
+/// [`load_draft_call_rows`]' pure rule.
+fn call_rows_for(capacity: usize, exact_gfx942: bool, ep_bound: bool) -> usize {
+    if exact_gfx942 && !ep_bound {
+        capacity
+    } else {
+        MTP_DRAFT_LANES_MAX
+    }
+}
+
+/// With X2 active, a batched draft pass (two to eight ops in the root's round,
+/// every op owned by a rank) keeps each rank's dense and attention work on its
+/// owned rows but runs the head's MoE once over ALL the round's rows on both
+/// ranks: each rank publishes its owner rows' MoE input, both all-gather it into
+/// the root's op order, and the existing replicated EP MoE call (compact tables,
+/// row-gather hook) runs over those rows; each rank keeps its own rows' FFN
+/// output.
+///
 /// One sharded-MoE draft pass (S4), the same on every rank: `g` global rows
 /// (the root's ops of the round, in order) of which row `s` is owned by rank
 /// `(owners >> s) & 1` (two ranks). A rank's own rows are its ops in that order.
@@ -104,7 +140,11 @@ impl S4Round {
 pub(crate) const MTP_DRAFT_ROUNDS_ENV: &str = "HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS";
 
 mod rows;
-pub(crate) use rows::{draft_rounds_enabled, DraftRow, MtpRowsScratch};
+pub(crate) use rows::{DraftRow, MtpRowsScratch};
+mod fp8_moe;
+#[cfg(feature = "lab")]
+pub use fp8_moe::LabHeadRouting;
+pub(crate) use fp8_moe::MtpFp8MoeScratch;
 #[cfg(feature = "lab")]
 mod lab;
 #[cfg(feature = "lab")]
@@ -326,8 +366,8 @@ fn invalid(message: impl Into<String>) -> MtpGpuError {
 }
 
 /// The tensors the head's row stages read and write. [`MtpGpuScratch`] (one
-/// row, [`MTP_HC_ROWS`]) and [`rows::MtpRowsScratch`] (up to
-/// [`MTP_DRAFT_LANES_MAX`] lanes) each lend one, so the stage sequences are
+/// row, [`MTP_HC_ROWS`]) and [`rows::MtpRowsScratch`] (up to the load's
+/// [`load_draft_call_rows`] lanes) each lend one, so the stage sequences are
 /// written once and take the row count as a parameter.
 #[derive(Clone, Copy)]
 struct HeadRowTensors<'a> {
@@ -2543,9 +2583,11 @@ pub struct Qwen4MtpGpu {
     /// Device table of the sharded-MoE activation all-gather's slot owners:
     /// 256 owner masks x 8 `i32` (slot `s` of mask `m` holds `(m >> s) & 1`),
     /// read as the gather's `slot_experts` (expert `e` is owned by rank
-    /// `e % 2`). `Some` only with [`DRAFT_SHARDED_MOE_ENV`] on, two ranks, at
-    /// [`Self::install_lane_local_moe`].
+    /// `e % 2`). `Some` only with two ranks, at [`Self::install_lane_local_moe`].
     pub(crate) s4_owners: Option<GpuTensor>,
+    /// The grouped-route scratch of a stock-FP8 (qt=55) MoE head's one-row
+    /// steps ([`MtpFp8MoeScratch`]); `None` for every other head.
+    pub(crate) fp8_moe: Option<MtpFp8MoeScratch>,
 }
 
 /// Draft-head front: tokens below this id, plus EOS and the control ids
@@ -2579,10 +2621,13 @@ struct HeadRowViews {
     /// No chunk is wider than the few-row route (`FEW_ROW_ROUTE_ROWS`) unless
     /// one lane's own `hc_count` rows are, so every projected row stays on the
     /// route whose per-row bytes are the one-row step's. With `one_launch`
-    /// (`HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH`, BF16 fc_hidden, and
-    /// `Gpu::bf16_rows_exact_one_launch(rows * hc_count)`) there is ONE chunk over all
-    /// `rows * hc_count` rows: it runs `ProjectLadder::TrunkRowExact`, whose all-rows arm is
-    /// bitwise the singleton, so every projected row is still bitwise the one-row step's.
+    /// (`rows::fc_hidden_one_launch`: exact gfx1201 under
+    /// `HIPFIRE_QWEN4_MTP_FC_ONE_LAUNCH` with `Gpu::bf16_rows_exact_one_launch(rows *
+    /// hc_count)`, or a BF16 fc_hidden of a call wider than [`MTP_DRAFT_LANES_MAX`] on exact
+    /// gfx942) there is ONE chunk over all `rows * hc_count` rows: it runs
+    /// `ProjectLadder::TrunkRowExact`, whose all-rows arm is bitwise the singleton (gfx942: the
+    /// MFMA chain per output element), so every projected row is still bitwise the one-row
+    /// step's.
     fc_hidden: SmallVec<[(GpuTensor, GpuTensor, usize); 4]>,
 }
 
@@ -2629,8 +2674,8 @@ impl HeadRowViews {
 /// Head step stage 2a (row stage, rows-shaped): the token embedding, the two
 /// pre-FC norms, both FC projections, their broadcast add and the attention
 /// HC read, over `rows` lanes' rows at once. Every op here is row-local: a
-/// batched round runs it once over all drafting lanes (`rows` up to
-/// [`MTP_DRAFT_LANES_MAX`]); `rows == 1` is the one-token step. `views` is
+/// batched round runs it once over all drafting lanes (`rows` up to the load's
+/// [`load_draft_call_rows`]); `rows == 1` is the one-token step. `views` is
 /// [`HeadRowViews::new`] for the same `t` and `rows`.
 #[allow(clippy::too_many_arguments)]
 fn push_head_rows_front<'a>(
@@ -3083,7 +3128,8 @@ impl Qwen4MtpGpu {
             .checked_add(Qwen4MoeLayerRuntime::device_bytes(config)?)?
             .checked_add(head_d2_device_bytes(config, head_d2)?)?
             .checked_add(draft)?
-            .checked_add(MtpRowsScratch::device_bytes(config)?)?;
+            .checked_add(MtpRowsScratch::device_bytes(config)?)?
+            .checked_add(MtpFp8MoeScratch::device_bytes(config)?)?;
         Some((resident, scratch))
     }
 
@@ -3116,6 +3162,7 @@ impl Qwen4MtpGpu {
         }
         resident.extend(widen(draft)?);
         resident.extend(MtpRowsScratch::allocation_sizes(config)?);
+        resident.extend(MtpFp8MoeScratch::allocation_sizes(config)?);
         Some((resident, widen(draft_scratch)?))
     }
 
@@ -3227,10 +3274,29 @@ impl Qwen4MtpGpu {
             }
         };
         // The batched head rounds' rows scratch: allocated last, only under
-        // `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1` (otherwise nothing changes).
-        let rows = match MtpRowsScratch::new(gpu, config) {
+        // `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1` (otherwise nothing changes); it decides the
+        // widest batched call of this load ([`load_draft_call_rows`]) once, here.
+        let rows = match MtpRowsScratch::new(gpu, config, ep_bound) {
             Ok(rows) => rows,
             Err(error) => {
+                let _ = draft.free_gpu(gpu);
+                let _ = moe.map(|moe| moe.free_gpu(gpu));
+                let _ = state.free_gpu(gpu);
+                let _ = scratch.free_gpu(gpu);
+                return Err(error);
+            }
+        };
+        // A stock-FP8 (qt=55) MoE head has no indexed decode route: its one-row
+        // steps run the grouped route, whose scratch is allocated here, after
+        // the rows scratch (nothing for any other head).
+        let fp8_moe = match moe.as_ref().filter(|moe| moe.is_fp8()) {
+            Some(_) => MtpFp8MoeScratch::new(gpu, config),
+            None => Ok(None),
+        };
+        let fp8_moe = match fp8_moe {
+            Ok(fp8_moe) => fp8_moe,
+            Err(error) => {
+                let _ = rows.and_then(|rows| rows.free_gpu(gpu));
                 let _ = draft.free_gpu(gpu);
                 let _ = moe.map(|moe| moe.free_gpu(gpu));
                 let _ = state.free_gpu(gpu);
@@ -3251,6 +3317,7 @@ impl Qwen4MtpGpu {
             s4_round: None,
             s4_owners: None,
             rows,
+            fp8_moe,
         })
     }
 
@@ -3261,6 +3328,14 @@ impl Qwen4MtpGpu {
         self.moe
             .as_ref()
             .is_some_and(|moe| moe.hetero_split().is_some())
+    }
+
+    /// Lanes one batched head call carries on this load ([`load_draft_call_rows`], fixed when
+    /// the rows scratch was allocated): [`MTP_DRAFT_LANES_MAX`] without the scratch.
+    pub(crate) fn draft_call_rows(&self) -> usize {
+        self.rows
+            .as_ref()
+            .map_or(MTP_DRAFT_LANES_MAX, MtpRowsScratch::call_rows)
     }
 
     /// Whether the head's experts run on a rows=1 D2 split executor.
@@ -3400,7 +3475,7 @@ impl Qwen4MtpGpu {
                 "the MTP head's lane-local MoE runtime must be untiered (its experts are the `mtp.` tensors)",
             ));
         }
-        if draft_sharded_moe_enabled() && placement.ranks == 2 && self.rows.is_some() {
+        if placement.ranks == 2 && self.rows.is_some() {
             let mut table = Vec::with_capacity(256 * 8 * std::mem::size_of::<i32>());
             for mask in 0u32..256 {
                 for slot in 0..8 {
@@ -3421,6 +3496,7 @@ impl Qwen4MtpGpu {
             moe_full,
             draft,
             rows,
+            fp8_moe,
             s4_owners,
             ..
         } = self;
@@ -3430,6 +3506,7 @@ impl Qwen4MtpGpu {
         let moe_error = moe.and_then(|moe| moe.free_gpu(gpu));
         let moe_full_error = moe_full.and_then(|moe| moe.free_gpu(gpu));
         let rows_error = rows.and_then(|rows| rows.free_gpu(gpu));
+        let fp8_moe_error = fp8_moe.and_then(|fp8_moe| fp8_moe.free_gpu(gpu));
         let s4_error = s4_owners.and_then(|table| gpu.free_tensor(table).err());
         draft_error
             .or(scratch_error)
@@ -3437,6 +3514,7 @@ impl Qwen4MtpGpu {
             .or(moe_error)
             .or(moe_full_error)
             .or(rows_error)
+            .or(fp8_moe_error)
             .or(s4_error)
             .map_or(Ok(()), |error| Err(MtpGpuError::Hip(error)))
     }
@@ -3794,6 +3872,11 @@ impl Qwen4MtpGpu {
         backbone_hidden: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), MtpGpuError> {
+        // The MTP head is never the plain-AR retained body. Eligibility is
+        // stated per forward and otherwise left as the last trunk forward set
+        // it, so a head step after an eligible spec AR token would run as if it
+        // were being recorded or replayed (HIPF-294).
+        gpu.replay.set_forward_eligible(false);
         let wide = config
             .hc_count
             .checked_mul(config.hidden_size)
@@ -3933,12 +4016,39 @@ impl Qwen4MtpGpu {
             } else {
                 self.moe.as_ref()
             };
+            // A stock-FP8 (qt=55) head has no indexed decode route: its one-row
+            // step seals the grouped call (`seal_moe_rows` at one routing row),
+            // over the grouped scratch allocated at attach and the one-row
+            // scratch's HC rows and FFN output.
+            let fp8_router = match (head_moe, self.fp8_moe.as_ref()) {
+                (Some(runtime), Some(fp8)) if runtime.is_fp8() && step != MtpStep::Append => {
+                    Some(fp8.router_view(config)?)
+                }
+                _ => None,
+            };
+            let fp8_layer = match (self.fp8_moe.as_ref(), fp8_router.as_ref()) {
+                (Some(fp8), Some(router)) => Some(fp8.layer_scratch(scratch, router)),
+                _ => None,
+            };
             // The MTP layer's FFN is the trunk's kind (`attach` refuses a
             // head whose FFN weights disagree with the profile).
             let ffn = if step == MtpStep::Append {
                 None
             } else {
                 Some(match (&mtp.ffn, head_moe) {
+                    (Qwen4FfnWeights::Moe(_), Some(runtime)) if runtime.is_fp8() => {
+                        if moe_ep.is_some() {
+                            return Err(invalid(
+                                "stock-FP8 head experts run on one device; they take no EP row gather",
+                            ));
+                        }
+                        let layer = fp8_layer.as_ref().ok_or_else(|| {
+                            invalid(
+                                "a stock-FP8 MTP head step needs the head's grouped MoE scratch",
+                            )
+                        })?;
+                        MtpFfnCall::Moe(seal_moe_rows(&ctx, config, 0, runtime, 1, layer, None)?)
+                    }
                     (Qwen4FfnWeights::Moe(_), Some(runtime)) => {
                         MtpFfnCall::Moe(seal_moe_decode(
                             &ctx,
@@ -4104,6 +4214,8 @@ impl Qwen4MtpGpu {
         device_ids: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), MtpGpuError> {
+        // Never the plain-AR retained body (see `head_prologue`).
+        gpu.replay.set_forward_eligible(false);
         let config = config.mtp_geometry();
         let rows = tokens.len();
         let w = AppendWidths::new(config).ok_or_else(|| invalid("MTP append width overflow"))?;
@@ -4588,6 +4700,50 @@ mod tests {
 
     fn sum(sizes: &[u64]) -> u64 {
         sizes.iter().sum()
+    }
+
+    /// The batched head call is 32 rows on exact single-device gfx942 only, and the rows scratch
+    /// (so the census, which shares [`MtpRowsScratch::shapes`]) holds 32 rows exactly where the
+    /// stock-FP8 profile loads (admitted on single-device gfx942 only); every other profile
+    /// keeps 8 rows.
+    #[test]
+    fn draft_call_width_is_32_on_single_device_gfx942_only() {
+        assert_eq!(MTP_DRAFT_LANES_MAX, 8);
+        assert_eq!(MTP_DRAFT_LANES_MAX_GFX942, 32);
+        for (capacity, gfx942, ep, want) in [
+            (32, true, false, 32),
+            (32, true, true, 8),
+            (32, false, false, 8),
+            (32, false, true, 8),
+            (8, true, false, 8),
+            (8, true, true, 8),
+            (8, false, false, 8),
+        ] {
+            assert_eq!(
+                call_rows_for(capacity, gfx942, ep),
+                want,
+                "capacity {capacity}, gfx942 {gfx942}, ep {ep}"
+            );
+        }
+        let packed = compact_test_config();
+        let stock = packed.clone().into_stock_mtp().unwrap();
+        assert_eq!(draft_call_capacity(&packed), MTP_DRAFT_LANES_MAX);
+        assert_eq!(draft_call_capacity(&stock), MTP_DRAFT_LANES_MAX_GFX942);
+        for (config, rows) in [(&packed, 8usize), (&stock, 32)] {
+            let geometry = config.mtp_geometry();
+            let shapes = MtpRowsScratch::shapes(config).unwrap().unwrap();
+            // token ids (i32 per row), the draft ranking's logits and rotated rows, and the
+            // attention output rows scale with the call width; the per-expert counters do not.
+            assert_eq!(shapes[0], (rows * 4, DType::Raw));
+            assert_eq!(shapes[1].0, rows * geometry.hidden_size);
+            assert_eq!(shapes[37].0, rows * geometry.vocab_size);
+            assert_eq!(shapes[38].0, rows * geometry.hidden_size);
+            assert_eq!(
+                shapes[43].0,
+                rows * geometry.num_attention_heads * geometry.head_dim
+            );
+            assert_eq!(shapes[30].0, geometry.num_experts * 4);
+        }
     }
 
     /// Operator and fill scratch inventories are their owners' own shape

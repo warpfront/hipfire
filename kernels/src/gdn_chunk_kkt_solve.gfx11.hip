@@ -39,6 +39,28 @@ __device__ __forceinline__ gk_f8 gk_mma(gk_bfrag a, gk_bfrag b, gk_f8 c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b,c);
 #endif
 }
+// gfx11 WMMA rounds a sum differently for +0 and -0 zero products (see gdn_chunk_scan.gfx1201.hip,
+// gs_split). In the block merges `-D1*X` and `-Q*Y` the A operand is a triangular inverse whose upper
+// triangle is structural +0, multiplied by rows of X / Y that are zero in a partial tile and real in the
+// completed one: the zero sign differed, and a last valid row's inverse could round differently in F16.
+// `gk_mma_bsplit` takes the later-row-dependent B operand split by sign (negative half first).
+#if !GDN_CHUNK_GFX12
+__device__ __forceinline__ gk_f8 gk_mma_bsplit(gk_bfrag a, gk_bfrag b, gk_f8 c) {
+    union { unsigned short h[16]; gk_bfrag v; } u, p, n;
+    u.v = b;
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+        const unsigned w = u.h[e];
+        const bool neg = (w >> 15) != 0;
+        p.h[e] = neg ? (unsigned short)0 : (unsigned short)w;
+        n.h[e] = neg ? (unsigned short)w : (unsigned short)0x8000u;
+    }
+    c = gk_mma(a, n.v, c);
+    return gk_mma(a, p.v, c);
+}
+#else
+#define gk_mma_bsplit gk_mma
+#endif
 __device__ __forceinline__ int gk_acc_row(int lane, int elem) {
 #if GDN_CHUNK_GFX12
     return 8 * (lane >> 4) + elem;
@@ -213,7 +235,7 @@ __global__ void gdn_chunk_kkt_solve_gfx1100(
             __builtin_amdgcn_wave_barrier();
             __builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"wavefront");
             gk_f8 y=gk_zero();
-            y=gk_mma(gk_frag_shared(&s.a[0][0],GK_PITCH,origin+16,origin+16,lane),
+            y=gk_mma_bsplit(gk_frag_shared(&s.a[0][0],GK_PITCH,origin+16,origin+16,lane),
                      gk_frag_shared(&s.tmp[0][0],36,wave*16,0,lane),y);
             const int yc=origin+(lane&15);
 #pragma unroll
@@ -242,7 +264,7 @@ __global__ void gdn_chunk_kkt_solve_gfx1100(
             gk_f8 z=gk_zero();
 #pragma unroll
             for(int kk=0;kk<2;++kk)
-                z=gk_mma(gk_frag_shared(&s.a[0][0],GK_PITCH,32+rb*16,32+kk*16,lane),
+                z=gk_mma_bsplit(gk_frag_shared(&s.a[0][0],GK_PITCH,32+rb*16,32+kk*16,lane),
                          gk_frag_shared(&s.tmp[0][0],36,cb*16,kk*16,lane),z);
             const int zc=cb*16+(lane&15);
 #pragma unroll

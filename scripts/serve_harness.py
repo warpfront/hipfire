@@ -566,13 +566,9 @@ def show_config(cfg):
             print(f"      {k:18}= {cfg['sampling'][k]:<8} [{cfg['sampling_source'].get(k,'?')}]")
     notset = [k for k in SAMPLE_KEYS if k not in cfg["sampling"]]
     print(f"  sampling (NOT set, serve/daemon default applies): {', '.join(notset) or '(none)'}")
-    # Surface inherited DFlash/DDTree env knobs the harness must not clobber.
+    # Surface inherited DFlash env knobs the harness must not clobber.
     for env_key in (
         "HIPFIRE_DFLASH_DRAFT",
-        "HIPFIRE_DFLASH_TREE",
-        "HIPFIRE_DFLASH_FAST_SAMPLE",
-        "HIPFIRE_DDTREE_BUDGET",
-        "HIPFIRE_DDTREE_TOPK",
     ):
         if env_key in os.environ:
             print(f"  env {env_key}={os.environ[env_key]!r} (pass-through)")
@@ -2513,9 +2509,8 @@ def spawn_serve(cfg, home, log):
                HIPFIRE_DAEMON_BIN=os.environ.get(
                    "HIPFIRE_DAEMON_BIN",
                    os.path.join(REPO, "target", "release", "daemon" + (".exe" if os.name == "nt" else ""))),
-               HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
-    # Sampled native MTP (`speculation.mtp_sampled`) is on by default; a parent
-    # HIPFIRE_MTP_SAMPLED=0 passes through as the opt-out.
+               HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_MODEL=cfg["model"])
+    # Sampled native MTP is always on.
     if cfg["mtp"] == "on":
         env.update(HIPFIRE_QWEN_MTP="1")
     # Experimental long-gated ngram-mod inside native MTP (TOML key `speculation.mtp_ngram`; the harness drives the env override).
@@ -2536,7 +2531,7 @@ def spawn_serve(cfg, home, log):
     # caller-inherited value (do not pop/clear) so parent gates can pin the draft.
     if cfg.get("draft"):
         env["HIPFIRE_DFLASH_DRAFT"] = cfg["draft"]
-    # Plain DFlash / DDTree knobs (TREE/BUDGET/TOPK/FAST_SAMPLE) pass through
+    # Plain DFlash knobs (FAST_SAMPLE) pass through
     # from the parent environment unchanged — harness never rewrites them.
     # Harness-only parent IPC: must never reach hipfire serve / process config
     # (would otherwise lower as developer.serve_harness_pid_file).

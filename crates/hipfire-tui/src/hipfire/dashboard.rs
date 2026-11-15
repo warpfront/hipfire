@@ -1733,13 +1733,13 @@ mod tests {
 
     #[test]
     fn stats_loaded_config_present() {
-        let b = r#"{"model":"q","uptime_s":1,"queue_depth":0,"requests_served":0,"recent_tok_s":null,"loaded_config":{"model":"qwen3.5:4b","kv_mode":"asym3","kv_backend":"paged","max_seq":32768}}"#;
+        let b = r#"{"model":"q","uptime_s":1,"queue_depth":0,"requests_served":0,"recent_tok_s":null,"loaded_config":{"model":"qwen3.5:4b","kv_mode":"fwht3","kv_backend":"paged","max_seq":32768}}"#;
         let s = parse_stats(b).expect("parse");
         assert_eq!(
             s.loaded_config,
             Some(LoadedConfig {
                 model: "qwen3.5:4b".into(),
-                kv_mode: Some("asym3".into()),
+                kv_mode: Some("fwht3".into()),
                 kv_backend: Some("paged".into()),
                 max_seq: Some(32768),
             })

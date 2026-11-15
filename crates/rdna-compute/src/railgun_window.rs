@@ -605,8 +605,7 @@ impl Gpu {
             mq_x_rot,
             argmax_host,
             gemv_residual_tmp,
-            mq6_fp8_x_rot,
-            paro_x_scratch
+            mq6_fp8_x_rot
         );
         buf!(
             mq_x_rot_fp8,

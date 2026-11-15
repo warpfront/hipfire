@@ -11,7 +11,7 @@ KLD references and produce the result tables.
 | Where published | HF **dataset** repo `hipfire-models/qwen-kldref` (the `hf_repo` field in `manifest.json`); fetched by `scripts/fetch-eval-refs.sh` | `kld/` in the **model** repo `hipfire-models/qwen3.8-27b` (not in `manifest.json`, not fetched by `fetch-eval-refs.sh`) |
 | Corpus / size | `slice/wikitext2-1024s-2048ctx.txt`, 1175 chunks of 2048 tokens (~2.5 GB each) | WT2 `qwen3.8-27b.ref_wt2.bin` and code24 `heldout-code24.gptqsym.kldref.bin`, 24 chunks of 2048 tokens (50.7 MB / 12.6 MB) |
 | Producer | `build_kld_ref` from a BF16 GGUF via llama.cpp (see `manifest.json` `producer_cmd`) | Published ready-made; self-contained (tokens embedded, no corpus or tokenizer download) |
-| Use | Quant-ladder / Pareto comparisons across variants and GGUF anchors | Exact, bit-reproducible per-arch pins used by `AGENTS.md` |
+| Use | Quant-ladder / Pareto comparisons across variants and GGUF anchors | Exact, bit-reproducible per-arch pins (`kld` pins in `fixtures/pins.toml`) |
 
 `hipfire-models/eval-refs` is not a published repo; legacy refs live in
 `hipfire-models/qwen-kldref`, and `scripts/fetch-eval-refs.sh` is named for
@@ -21,17 +21,18 @@ The current pins, their expected KLD and `.kldseq` SHA-256 per arch/route,
 and the exact reproduction recipe are authoritative in two places; read
 those instead of copying numbers from here:
 
-- [`AGENTS.md` §5 → "Pinned Hugging Face bench fixture" → "Quality pins"](../../../AGENTS.md#pinned-hugging-face-bench-fixture)
+- [`fixtures/pins.toml`](../../../fixtures/pins.toml) (the `kld` and `reference` pins) and
+  [`docs/fixtures.md` → "Quality pins"](../../../docs/fixtures.md#quality-pins) (method)
 - [`kld/VERIFY.md` in `hipfire-models/qwen3.8-27b`](https://huggingface.co/hipfire-models/qwen3.8-27b/blob/77ff3bea2/kld/VERIFY.md)
   (one `hf download`, one pinned `cargo build`, one copy-paste block; pinned
   at HF commit `77ff3bea2`)
 
-Reference SHA-256s for the current pins (same in both places):
+Reference SHA-256 pins for the current pins (same in both places):
 
-| Reference | SHA-256 |
+| Reference | Pin |
 |---|---|
-| WT2 `kld/qwen3.8-27b.ref_wt2.bin` | `8c545178fb43647499c4c7bdd33178c24fd402615c641add9ed51a0c9a43234a` |
-| code24 `kld/heldout-code24.gptqsym.kldref.bin` | `43ab7591f2acf6b5b4058b77253109230d96591be02469ddef55235102ec7582` |
+| WT2 `kld/qwen3.8-27b.ref_wt2.bin` | `pin:reference/qwen3.8-27b.ref_wt2.bin` |
+| code24 `kld/heldout-code24.gptqsym.kldref.bin` | `pin:reference/heldout-code24.gptqsym.kldref.bin` |
 
 ## Files
 
@@ -96,7 +97,7 @@ SHA-256s above (the `VERIFY.md` block does both).
 ## Quality-pin protocol (current)
 
 For anything compared against the Qwen3.8-27B pins, follow `VERIFY.md` /
-`AGENTS.md` exactly:
+[`docs/fixtures.md`](../../../docs/fixtures.md#quality-pins) exactly:
 
 - `eval_hipfire --scoring-mode prefill --max-chunks 24` — teacher-forced
   prefill over the 24 reference chunks; always pass `--kv-mode`, `--kv-v`
@@ -121,7 +122,7 @@ For anything compared against the Qwen3.8-27B pins, follow `VERIFY.md` /
    entry to `manifest.json` with `sha256`, `hf_repo`, `hf_repo_type`,
    `producer_cmd`, `llamacpp_commit`, `slice_md5`, and shape metadata.
    (A new current-generation pin set is instead published under the
-   model repo's `kld/` with a `VERIFY.md`, and recorded in `AGENTS.md`.)
+   model repo's `kld/` with a `VERIFY.md`, and recorded in `fixtures/pins.toml`.)
 
 2. Run the candidate against the cached reference. Paths are relative to
    the repo root; adjust `--kv-mode` per arch (see protocol above). Full
@@ -140,10 +141,8 @@ For anything compared against the Qwen3.8-27B pins, follow `VERIFY.md` /
 
      For a compressed-KV measurement spell the supported FWHT mode
      (`--kv-mode fwht3`, or `fwht2` / `fwht4`). The `asym2` / `asym3` /
-     `asym4` (and `turbo*`) spellings are **deprecated since 0.4.0 and
-     scheduled for removal in 0.5.0**; `eval_hipfire` builds the legacy
-     Givens-rotation asym KV cache directly for them, and `asym3` is still the
-     evaluator's built-in default `--kv-mode`, so never omit the flag. See
+     `asym4` (and `turbo*`) spellings were **removed in 0.5.0** and are
+     rejected; the evaluator's built-in default `--kv-mode` is `q8`. See
      [`docs/QUANTIZATION.md`](../../../docs/QUANTIZATION.md) for the KV-mode
      table. Older result tables under `results/` that mention `asym3`
      predate this and are historical context, not a current recipe.
@@ -179,7 +178,7 @@ For anything compared against the Qwen3.8-27B pins, follow `VERIFY.md` /
 harness — binary format, eval matrix, scoring modes, validation
 methodology, and pivot decisions. The parent
 [`../README.md`](../README.md) has the legacy-ref download quick-start. For
-the current Qwen3.8-27B pins, `AGENTS.md` and `kld/VERIFY.md` take
+the current Qwen3.8-27B pins, `fixtures/pins.toml` and `kld/VERIFY.md` take
 precedence over the plan.
 
 ## Pinned llama.cpp commit

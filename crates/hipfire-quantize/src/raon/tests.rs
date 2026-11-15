@@ -11,6 +11,57 @@ use safetensors::Dtype;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+// ─── private rayon pool ─────────────────────────────────────────────────────
+//
+// A conversion nests rayon joins (the per-tensor job fan-out, then each job's
+// own `par_iter`). A worker blocked in an inner join steals pending jobs, so on
+// the shared global pool a worker also steals the jobs of every other test
+// running at the same time and its stack grows with the whole bin's load until
+// it overflows (2 MiB worker stacks under the parallel test runner). Each
+// conversion below runs on its own pool, so its workers only ever nest that
+// conversion's own jobs: the depth of a solo run.
+
+fn isolated<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .expect("private rayon pool")
+        .install(f)
+}
+
+fn run_cli(input: &Path, output: &Path) -> Result<RaonSummary, String> {
+    isolated(|| super::run_cli(input, output))
+}
+
+fn run_cli_with(input: &Path, output: &Path, attn_mq8: bool) -> Result<RaonSummary, String> {
+    isolated(|| super::run_cli_with(input, output, attn_mq8))
+}
+
+fn run_recipe(
+    input: &Path,
+    output: &Path,
+    format: &str,
+    symmetric: bool,
+    tier: Option<&str>,
+    attn_mq8: bool,
+) -> Result<RaonSummary, String> {
+    isolated(|| super::run_recipe(input, output, format, symmetric, tier, attn_mq8))
+}
+
+fn swap_shared_ffn(
+    input: &Path,
+    source: &Path,
+    output: &Path,
+    target: SharedFfn,
+    scope: Scope,
+) -> Result<SwapSummary, String> {
+    isolated(|| super::swap_shared_ffn(input, source, output, target, scope))
+}
+
+fn verify_artifact(path: &Path, unit_sidecars: bool) -> Result<RaonSummary, String> {
+    isolated(|| super::verify_artifact(path, unit_sidecars))
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 fn vals(seed: u32, n: usize, scale: f32) -> Vec<f32> {

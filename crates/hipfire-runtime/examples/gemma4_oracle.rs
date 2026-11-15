@@ -8,7 +8,7 @@
 //! HF reference (`scripts/oracle_gemma4.py`) and hipfire compare BYTE-IDENTICAL
 //! inputs (no tokenizer differences enter).
 //!
-//! The state mirrors the production bundle: Q8 sliding tier and an asym3 full
+//! The state mirrors the production bundle: Q8 sliding tier and a Fwht3 full
 //! tier (Q8 with `HIPFIRE_ORACLE_KV_Q8=1`), both position-indexed over
 //! `max_seq`. This example bypasses the production admission/control plane.
 //!
@@ -43,7 +43,7 @@ fn main() {
     let tier = if std::env::var("HIPFIRE_ORACLE_KV_Q8").ok().as_deref() == Some("1") {
         FullKvTier::Q8
     } else {
-        FullKvTier::LegacyAsym3
+        FullKvTier::Fwht3
     };
     eprintln!("oracle: max_seq={max_seq} sliding=q8 full={tier:?}");
     let mut state =

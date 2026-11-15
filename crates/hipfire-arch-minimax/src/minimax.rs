@@ -383,7 +383,6 @@ fn wt_from_raw(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -915,7 +914,7 @@ impl MiniMaxWeights {
 // ──────────────────────────── Teardown ────────────────────────────
 // Exhaustive-destructure frees so a future added GPU-bearing field is a
 // compile error, not a silent VRAM leak. WeightTensors use `free_all`
-// (buf + non-aliased ParoQuant rotation + AWQ sidecar).
+// (buf + AWQ sidecar).
 //
 // SHARD=None (single-GPU) LAYOUT ONLY. The only caller that reaches this via
 // unload_model is `load_minimax` (shard=None, MiniMaxWeights::load → arch.rs
@@ -1338,7 +1337,6 @@ fn load_wt_from_source(
         m,
         k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
@@ -1496,7 +1494,6 @@ pub fn load_weights_from_safetensors(
                 m: 2 * inter,
                 k: hidden,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -1513,7 +1510,6 @@ pub fn load_weights_from_safetensors(
                 m: hidden,
                 k: inter,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,

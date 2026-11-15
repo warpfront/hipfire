@@ -176,10 +176,11 @@ mod tests {
             op_sel_hi: 7,
             ..Default::default()
         };
-        let i = Inst::from_parts(
+        let i = Inst::from_encoding(
             arch,
             row.op,
             row.form,
+            row.variant,
             Default::default(),
             vec![v(0), v(1), v(2), v(3)].into_iter().collect(),
             mods,
@@ -352,10 +353,11 @@ mod tests {
             clamp,
             ..Default::default()
         };
-        let i = Inst::from_parts(
+        let i = Inst::from_encoding(
             arch,
             row.op,
             row.form,
+            row.variant,
             Default::default(),
             vec![v(0), v(1), v(2), v(3)].into_iter().collect(),
             mods,

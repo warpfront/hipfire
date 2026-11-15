@@ -274,7 +274,7 @@ fn forward_prefill(
         return Ok(());
     }
     qwen35::forward_prefill_batch_capped(
-        gpu, weights, config, tokens, start, kv, dn, scratch, None, None, None, None, chunk,
+        gpu, weights, config, tokens, start, kv, dn, scratch, None, None, None, chunk,
     )
     .map_err(|e| format!("prefill at position {start}: {e:?}"))
 }

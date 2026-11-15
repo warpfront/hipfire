@@ -1,0 +1,35 @@
+{
+  "codec": {
+    "cases": 7168,
+    "llvm_version": "AMD LLVM version 24.0.0git",
+    "test": "peacemaker-cdna::enc_vop3p::oracle_fma_mix_f32_full_selection_space"
+  },
+  "ledger": {
+    "class": "oracle",
+    "cmd": "bash /scratch/quant/fn-fp8/beat/WC8/twinc/run-mix-r3.sh",
+    "end": "2026-11-12T22:19:42+00:00",
+    "exit": 0,
+    "loadavg": "3.78 3.79 3.87",
+    "min_free_ram_pct": 95,
+    "owner": "TwinWide942d",
+    "peak_runnable": 18,
+    "run_s": 166,
+    "start": "2026-11-12T22:16:56+00:00",
+    "wait_s": 46
+  },
+  "oracle_build_commit": "e88c8a3602bc90f41f5f3b625cc04434d6b032ca",
+  "raw_log": "crates/peacemaker-isa/tests/fixtures/cdna/gfx942_fma_mix_f32_oracle.txt",
+  "raw_log_sha256": "763178aa2a57ea7bfccfa9131e5cb242089aaced7e29f9d5f3fc88ca512c5ffc",
+  "raw_oracle": "crates/peacemaker-isa/tests/fixtures/cdna/gfx942_fma_mix_f32_oracle.json",
+  "raw_oracle_sha256": "5bdfda7debf52a614239104b948fe3d2e8d453c9a20e8469129f65361c381157",
+  "schema": "gfx942_fma_mix_f32_receipt/1",
+  "status": "PASS",
+  "summary": {
+    "controls": 8,
+    "controls_detected": 8,
+    "modes_run": 32,
+    "rows_compared": 7088373760,
+    "strict_mismatches": 0
+  },
+  "target": "gfx942"
+}

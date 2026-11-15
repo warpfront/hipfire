@@ -1,0 +1,51 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.16)
+[rocblas] loaded for gfx942
+device gfx942 | GDN shapes: key heads 16, value heads 48, 128x128, qkv width 10240 | steps 3 | candidate route: HIPFIRE_QWEN4_G942_GDN_LANES_VERIFY_IMAGE=/scratch/quant/fn-fp8/beat/WC8/twinc/gdn-lanes-verify-device.elf (31464 bytes)
+  qwen4_g942_gdn_verify: hipcc compiled (gfx942, key c2fc17ca5d130b37)
+[verify lanes case=uniform4 rows=[4, 4, 4, 4, 4, 4, 4, 4]] window 0 lanes route vs per-lane chains: differing words 0 (first None), ring words written 6291456 (want 6291456) => ok
+[verify lanes case=uniform4 rows=[4, 4, 4, 4, 4, 4, 4, 4]] control: flipped gated-output bit: diff words 1 => ok
+[verify lanes case=uniform4 rows=[4, 4, 4, 4, 4, 4, 4, 4]] control: lanes' outputs swapped: diff words 49116 => ok
+[verify lanes case=uniform4 rows=[4, 4, 4, 4, 4, 4, 4, 4]] control: last lane not launched: diff words 24576 => ok
+[verify lanes case=uniform4 rows=[4, 4, 4, 4, 4, 4, 4, 4]] control: conv cursor off by one: diff words 30697 => ok
+[verify lanes case=uniform4 rows=[4, 4, 4, 4, 4, 4, 4, 4]] window 1 lanes route vs per-lane chains: differing words 0 (first None), ring words written 6291456 (want 6291456) => ok
+[verify lanes case=uniform4 rows=[4, 4, 4, 4, 4, 4, 4, 4]] window 2 lanes route vs per-lane chains: differing words 0 (first None), ring words written 6291456 (want 6291456) => ok
+[verify lanes case=ragged rows=[4, 2, 3, 8, 4, 5, 2, 6]] window 0 lanes route vs per-lane chains: differing words 0 (first None), ring words written 6291456 (want 6291456) => ok
+[verify lanes case=ragged rows=[4, 2, 3, 8, 4, 5, 2, 6]] control: flipped gated-output bit: diff words 1 => ok
+[verify lanes case=ragged rows=[4, 2, 3, 8, 4, 5, 2, 6]] control: last lane not launched: diff words 36864 => ok
+[verify lanes case=ragged rows=[4, 2, 3, 8, 4, 5, 2, 6]] control: conv cursor off by one: diff words 30682 => ok
+[verify lanes case=ragged rows=[4, 2, 3, 8, 4, 5, 2, 6]] window 1 lanes route vs per-lane chains: differing words 0 (first None), ring words written 6291456 (want 6291456) => ok
+[verify lanes case=ragged rows=[4, 2, 3, 8, 4, 5, 2, 6]] window 2 lanes route vs per-lane chains: differing words 0 (first None), ring words written 6291456 (want 6291456) => ok
+  tensor_ops: hipcc compiled (gfx942, key a54af22a341a12b5)
+[verify lanes case=mixed rows=[4, 1, 4, 1, 3, 1, 2, 4]] window 0 lanes route vs per-lane chains: differing words 0 (first None), ring words written 3932160 (want 3932160) => ok
+[verify lanes case=mixed rows=[4, 1, 4, 1, 3, 1, 2, 4]] control: flipped gated-output bit: diff words 1 => ok
+[verify lanes case=mixed rows=[4, 1, 4, 1, 3, 1, 2, 4]] control: last lane not launched: diff words 24576 => ok
+[verify lanes case=mixed rows=[4, 1, 4, 1, 3, 1, 2, 4]] control: conv cursor off by one: diff words 30687 => ok
+[verify lanes case=mixed rows=[4, 1, 4, 1, 3, 1, 2, 4]] window 1 lanes route vs per-lane chains: differing words 0 (first None), ring words written 3932160 (want 3932160) => ok
+[verify lanes case=mixed rows=[4, 1, 4, 1, 3, 1, 2, 4]] window 2 lanes route vs per-lane chains: differing words 0 (first None), ring words written 3932160 (want 3932160) => ok
+[verify lanes case=all_ar rows=[1, 1, 1, 1, 1, 1, 1, 1]] window 0 lanes route vs per-lane chains: differing words 0 (first None), ring words written 0 (want 0) => ok
+[verify lanes case=all_ar rows=[1, 1, 1, 1, 1, 1, 1, 1]] control: flipped gated-output bit: diff words 1 => ok
+[verify lanes case=all_ar rows=[1, 1, 1, 1, 1, 1, 1, 1]] control: lanes' outputs swapped: diff words 12278 => ok
+[verify lanes case=all_ar rows=[1, 1, 1, 1, 1, 1, 1, 1]] control: last lane not launched: diff words 6144 => ok
+[verify lanes case=all_ar rows=[1, 1, 1, 1, 1, 1, 1, 1]] control: conv cursor off by one: diff words 20455 => ok
+[verify lanes case=all_ar rows=[1, 1, 1, 1, 1, 1, 1, 1]] window 1 lanes route vs per-lane chains: differing words 0 (first None), ring words written 0 (want 0) => ok
+[verify lanes case=all_ar rows=[1, 1, 1, 1, 1, 1, 1, 1]] window 2 lanes route vs per-lane chains: differing words 0 (first None), ring words written 0 (want 0) => ok
+[verify lanes case=single rows=[3]] window 0 lanes route vs per-lane chains: differing words 0 (first None), ring words written 786432 (want 786432) => ok
+[verify lanes case=single rows=[3]] control: flipped gated-output bit: diff words 1 => ok
+[verify lanes case=single rows=[3]] control: conv cursor off by one: diff words 30679 => ok
+[verify lanes case=single rows=[3]] window 1 lanes route vs per-lane chains: differing words 0 (first None), ring words written 786432 (want 786432) => ok
+[verify lanes case=single rows=[3]] window 2 lanes route vs per-lane chains: differing words 0 (first None), ring words written 786432 (want 786432) => ok
+[verify lanes case=pair rows=[2, 1]] window 0 lanes route vs per-lane chains: differing words 0 (first None), ring words written 786432 (want 786432) => ok
+[verify lanes case=pair rows=[2, 1]] control: flipped gated-output bit: diff words 1 => ok
+[verify lanes case=pair rows=[2, 1]] control: last lane not launched: diff words 6144 => ok
+[verify lanes case=pair rows=[2, 1]] control: conv cursor off by one: diff words 30674 => ok
+[verify lanes case=pair rows=[2, 1]] window 1 lanes route vs per-lane chains: differing words 0 (first None), ring words written 786432 (want 786432) => ok
+[verify lanes case=pair rows=[2, 1]] window 2 lanes route vs per-lane chains: differing words 0 (first None), ring words written 786432 (want 786432) => ok
+[verify lanes case=wide rows=[8, 8, 8, 8, 8, 8, 8, 8]] window 0 lanes route vs per-lane chains: differing words 0 (first None), ring words written 6291456 (want 6291456) => ok
+[verify lanes case=wide rows=[8, 8, 8, 8, 8, 8, 8, 8]] control: flipped gated-output bit: diff words 1 => ok
+[verify lanes case=wide rows=[8, 8, 8, 8, 8, 8, 8, 8]] control: lanes' outputs swapped: diff words 98250 => ok
+[verify lanes case=wide rows=[8, 8, 8, 8, 8, 8, 8, 8]] control: last lane not launched: diff words 49152 => ok
+[verify lanes case=wide rows=[8, 8, 8, 8, 8, 8, 8, 8]] control: conv cursor off by one: diff words 30679 => ok
+[verify lanes case=wide rows=[8, 8, 8, 8, 8, 8, 8, 8]] window 1 lanes route vs per-lane chains: differing words 0 (first None), ring words written 6291456 (want 6291456) => ok
+[verify lanes case=wide rows=[8, 8, 8, 8, 8, 8, 8, 8]] window 2 lanes route vs per-lane chains: differing words 0 (first None), ring words written 6291456 (want 6291456) => ok
+gdn_lanes_verify_f32_gfx942_oracle: PASS [route: HIPFIRE_QWEN4_G942_GDN_LANES_VERIFY_IMAGE=/scratch/quant/fn-fp8/beat/WC8/twinc/gdn-lanes-verify-device.elf (31464 bytes)]

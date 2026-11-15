@@ -2,17 +2,18 @@
 
 Maps claim class → validation route. **Merge authority is direct maintainer
 review backed by evidence selected for the changed behavior**, plus the
-required no-GPU CI checks named below. Executable behavior lives in the
-scripts and workflows named in each route. Methodology numbers and Redline
-certification prose live in their owners
+required no-GPU CI checks named below. **`beta` advances only through the
+[promotion lane](#promotion-lane)**: every required hardware row is `current`
+on the installed release archive of the exact candidate SHA. Executable
+behavior lives in the scripts and workflows named in each route. Methodology
+numbers and Redline certification prose live in their owners
 ([`INDEX.md`](INDEX.md)).
 
-Automation — including [`hw-gate`](../.github/workflows/hw-gate.yml) when it
-runs — is **optional evidence delivery**. It is not a merge prerequisite, not
-a required status check, and not a substitute for the proof the claim needs
-or for an approving human review. Authors may request hardware routes with
-the PR template's `<!-- hw-gate-request -->` block when that automation is
-used; no local planning tool is merge evidence.
+[`hw-gate`](../.github/workflows/hw-gate.yml) is PR-time evidence automation:
+useful for a reviewer, not how `beta` moves, and not a substitute for the
+lane, the proof the claim needs, or an approving human review. Authors may
+request hardware routes with the PR template's `<!-- hw-gate-request -->`
+block; no local planning tool is merge evidence.
 
 | Field | Value |
 |---|---|
@@ -56,11 +57,10 @@ so the check names above are stable while the shards are rebalanced. Test
 shards run under the `ci` Cargo profile (`cargo test --profile ci`: optimised
 where the exhaustive CPU oracle tests live, debug assertions and overflow
 checks on). Local equivalent of one shard: copy its command from the matrix in
-[`ci.yml`](../.github/workflows/ci.yml). `hw-gate` is **not**
-among the required checks: a missing, skipped, or unsuccessful hw-gate run
-is not a merge blocker by itself, and a successful hw-gate run is not
-automatic acceptance, auto-promotion, or a substitute for the approving
-review.
+[`ci.yml`](../.github/workflows/ci.yml). These checks gate a merge into the
+`beta-candidate` branch; `beta` moves only on a green
+[promotion record](#promotion-lane). `hw-gate` is not a substitute for
+either.
 
 Every change still owes the evidence named by the [claim → route map](#claim--route-map)
 for the surfaces it touches. The author or reviewer may gather that evidence
@@ -85,16 +85,200 @@ filed through the Windows test report issue form (native installs run
 [`scripts/windows-check.ps1`](../scripts/windows-check.ps1)); see
 [Help test Windows](GETTING_STARTED.md#help-test-windows).
 
-## hw-gate (optional evidence automation)
+## Promotion lane
 
-[`hw-gate`](../.github/workflows/hw-gate.yml) is optional automation that can
-collect load/serve/kernel evidence and post seat commentary on a PR. It does
-not approve PRs, does not replace the [merge bar](#merge-bar-required), and
-does not own `master`. When it runs, two automated reviewer seats (seat 1:
-diff review and route selection; seat 2: investigation) may assist under
-their own automation identities; a human
-still owns the approving review. Diffs that touch no hardware-relevant
-surface need no hardware route.
+Kaden's decision (2026-11-14, reversing the earlier "hw-gate is optional"
+rule): candidates land on `beta-candidate`; `beta` fast-forwards to a
+`beta-candidate` tip only when every required hardware row of every blocking
+card class is `current` on the **installed release archive** of that exact
+SHA. Two regressions reached beta through the GPU-free gate in one week (the
+DFlash forced-advance crash and the stale `no-caller` pack hole that cut A3B
+one-shot speed 42%); the lane exists to stop that class of escape.
+
+### What runs
+
+1. The candidate builds its own archive with
+   [`scripts/build-binary-archive.sh`](../scripts/build-binary-archive.sh) at its SHA.
+2. [`scripts/promotion-lane/lane.py`](../scripts/promotion-lane/lane.py) `run`
+   installs it into a fresh directory and runs
+   [`scripts/device_mesh_matrix.py`](../scripts/device_mesh_matrix.py)
+   `--rows <required> --host-class <class>` against it with an isolated
+   `HOME`, an empty kernel cache and **no device compiler**: compiler
+   directories are filtered out of `PATH` and `HIPFIRE_NO_DEVICE_COMPILER=1`
+   is set (resolved-root discovery finds `hipcc` regardless of `PATH`). A
+   kernel the pack lacks therefore fails the request instead of compiling
+   quietly, and any `hipcc compiled (` / `but hipcc is unavailable` line in a
+   row's log fails that row.
+3. The wrapper, not the runner's exit code, is the verdict: a required row
+   that is missing, `hardware-blocked` (absent or mismatched fixture or
+   draft), `rerun-required` or `failed` is red. **Skip is not pass.** The
+   runner's own exit status is also a verdict now (0 only when every selected
+   row is `current`).
+4. One `promotion-record-v1` JSON per class (candidate SHA, archive file and
+   sha256, gate SHA and policy/matrix hashes, verified GPU arch, every row
+   with `current|failed|skipped|waived`, waivers applied, wall time against
+   the class budget); `lane.py merge` folds the classes into a
+   `promotion-candidate-v1` record whose verdict decides the fast-forward.
+
+Rows run product defaults (no `HIPFIRE_DETERMINISTIC`): developer modes route
+to kernels the pack legitimately omits (deterministic mode forces
+`gemm_hfq4g256_residual_wmma_k2`, packed for gfx1151 only), so a lane row
+under them would fail on a hole no user hits.
+
+### Required rows
+
+Selection lives in [`scripts/promotion-lane/policy.json`](../scripts/promotion-lane/policy.json);
+the rows are in [`scripts/device-mesh/matrix.json`](../scripts/device-mesh/matrix.json)
+(milestone `lane`).
+
+| Row | What it proves | Classes |
+|---|---|---|
+| `dense-27b-ar` | 27B mq4-xts AR, reasoning on and off, 8-token think cap (forced advance), an appended turn served from the held conversation (`cached_tokens > 0`), an attempt aborted at `commit_ready` (rollback), clean warm/cold replays reproducing every answer | gfx1100, gfx1201, gfx942 |
+| `dflash-think-close` | the same session with the pinned DFlash draft (`dflash_mode on`); pins the 2026-11-13 forced-advance escape | gfx1100, gfx1201, gfx942 |
+| `cold-archive-9b` | 9B one-shot from a cold install: pins the 2026-11-13 pack hole | gfx1100, gfx1201, gfx942 |
+| `cold-archive-27b`, `cold-archive-a3b` | the same for 27B mq4-xts and A3B `.mq4r` | gfx1100, gfx1201, gfx942 |
+| `cold-archive-flashnext` | Flash-Next single-card default route (host-mapped experts) | gfx1201 |
+
+Card classes: gfx1100 and gfx1201 block every candidate and every release.
+gfx942 (MI300X) is a **secondary** class (Kaden 2026-11-15: secondary until AMD
+interest; the MI300X rental is released): it never blocks a promotion or a
+release tag. When a host for it is configured in the landing inventory the
+lane runs it and the candidate record and `check-release` report it
+(`secondary: gfx942 green|red|no record`); a red secondary record is a
+warning. The policy gate values are `candidate` (blocks every candidate),
+`rented` (blocks candidates while a host of the class is configured, and every
+release), `release` (every release only) and `secondary`. Budget: 15 minutes
+per card for gfx1100 and gfx1201 including the performance rows (60 for
+gfx942). A `.kldseq` row is not in the set: the evaluator (`eval_hipfire`) is not
+in the release archive, and building it would put a compiler back in the lane.
+
+### Performance rows
+
+Correctness rows alone let a 4.4% DFlash per-cycle loss and a 42% cold-start
+loss through, so each blocking class also carries performance rows
+(`policy.json` `perf`, [`scripts/promotion-lane/perf.py`](../scripts/promotion-lane/perf.py)).
+They run after the correctness rows, in the same fabric job (class `timing`:
+exclusive card, build slots paused), on the same installed archive.
+
+| Row | Measures | Classes |
+|---|---|---|
+| `perf-27b-ar-decode` | 27B mq4-xts AR decode tok/s, committed 134-token code prompt, 128 tokens | gfx1100, gfx1201 |
+| `perf-27b-dflash-decode` | the same with the pinned DFlash draft, reasoning off | gfx1100, gfx1201 |
+| `perf-27b-ttft-134`, `perf-27b-ttft-5900` | 27B prefill TTFT at 134 and 5,909 tokens | gfx1100, gfx1201 |
+| `perf-27b-cold` | first request of a fresh process with an empty kernel cache (wall tok/s) | gfx1100, gfx1201 |
+| `perf-a3b-mq4rs-decode`, `perf-a3b-mq4rs-cold` | Qwen3.6-35B-A3B `.mq4rs` AR decode (the Redline default) and its cold first request | gfx1201 |
+| `perf-flashnext-decode` | Flash-Next GPTQ3 monolith, single-card default route (native MTP + n-gram), decode tok/s | gfx1201 |
+
+- **Measurement.** Every number comes from a fresh `hipfire bench` process
+  (own `HOME`/`HIPFIRE_HOME`, empty kernel cache, no device compiler,
+  `HIPFIRE_*`/`HIP_*`/`GPU_*` knobs scrubbed except the fabric's card
+  selectors) with `--warmups 0` and `--min-tokens` = `--max-tokens`: sample 0
+  is the cold row, the first `discard` samples are dropped for the warm rows.
+  Processes run grouped by model (arms interleaved inside the group), so one
+  model's load does not evict the next one's page cache mid-row.
+  Prompts are committed under `scripts/promotion-lane/perf-prompts/` and the
+  model files are pinned by size and sha256 in the policy.
+- **Host pressure.** Fabric's timing class locks the card, not the host CPU
+  or memory, and cold rows are CPU-bound. Each process records its load
+  average and the PSI `some` stall fraction over its lifetime
+  (`/proc/pressure` cpu, memory, io). A process above `max_pressure` (cpu
+  10%, memory 0.5%; Flash-Next memory 3%, its host-mapped experts reclaim
+  page cache by themselves) is rejected, kept in the record, and re-run up to twice
+  after the host's 10 s averages settle; a row still without clean samples
+  is `skipped` (red), never measured.
+- **Statistic.** Each process contributes the median of its measured runs;
+  an arm is the median of its 3 process medians; the row is the ratio of the
+  arms against the gate's own beta on the same card (new/old for tok/s,
+  old/new for TTFT, so below 1 is always a loss), with a 95% bootstrap CI over
+  processes. The process is the unit because runs inside one process are not
+  independent (on gfx1100 every process's third 5.9k-token prefill is ~19%
+  slower). A row **regresses** when the CI upper bound is below
+  `1 - max(2%, 3 x A/A half-width)`; the half-width per class and row comes
+  from an A/A calibration (`lane.py calibrate`) recorded in the policy.
+- **Baseline.** The previous promotion record of the gate's beta for the
+  same class supplies the baseline numbers when host, card (fabric GPU
+  UUID), HIP runtime, PCI slot and measurement spec match and the numbers are
+  at most 7 days old; only the candidate runs. Otherwise the beta's archive
+  runs interleaved with the candidate (`pair`). A regression seen against
+  reused numbers is confirmed by a `pair` run before it counts.
+- **Verdict.** A `regressed`, `failed` (candidate process failed) or
+  `skipped` (no usable baseline, fixture or prompt mismatch) perf row is red
+  and blocks promotion like a correctness row; waivers name perf rows the same
+  way. The record's `perf` section carries each row's ratio, CI, threshold,
+  mode and every process's raw samples.
+- **Cost.** A full `pair` run of every perf row takes about 10 minutes on
+  gfx1201 (Flash-Next is about 3.3 of them) and 5 on gfx1100; a `reuse` run
+  takes about half that.
+
+### Three CPU rules in CI ([`scripts/ci-gates.sh`](../scripts/ci-gates.sh))
+
+Each has a planted-negative self-test that fails CI if the rule stops firing.
+
+- **(a) Skip is not pass.** hw-gate grades the declared mode set: a skipped
+  mode fails its fixture (`scripts/hw-gate/run.py --self-test`); the matrix
+  and the lane wrapper count a non-executed required row as red
+  (`device_mesh_matrix.py --self-test`, `lane.py --self-test`).
+- **(b) A production-reachable module cannot be allowlisted `no-caller`.**
+  `kernel_registry_coverage` fails a `no-caller` row once production code
+  calls the function that loads the module; the planted negative replays the
+  `gated_delta_net_q8_fast_stream` sequence (`ci.yml`, rdna-compute-abi).
+- **(c) A required row exercises forced advance, append and rollback.**
+  `lane.py check` requires every transition in `transitions_required` to be
+  structurally present in a required row of a blocking class (a capped
+  `max_think_tokens`, an assistant turn quoting a captured answer, an
+  `abort_at_commit_ready` or reset, judged by `wire_transitions`).
+
+### Gate policy, waivers, attribution
+
+- **Who judges whom.** The lane scripts, matrix and policy come from the
+  previously promoted `beta`; the candidate contributes only its archive and
+  its waiver file, so a candidate cannot soften the gate that judges it.
+- **Gate-policy changes** (paths listed in `policy.json` `gate_policy_paths`:
+  the lane, matrix, runner, hw-gate, the kernel allowlist and coverage test,
+  layering, ratchets, CI workflows) land only in a candidate that contains
+  nothing else and whose commits carry `Gate-Policy-Approved-By: Kaden` or
+  `Gate-Policy-Approved-By: fivetide`. The landing script refuses mixed or
+  unapproved policy candidates.
+- **Waivers** live in [`scripts/promotion-lane/waivers.json`](../scripts/promotion-lane/waivers.json):
+  SHA, class, rows, reason, `granted_by` (Kaden or fivetide, never an agent),
+  expiry at most 7 days after the grant, rollback plan, `closed_by`. No release
+  is tagged with an open waiver (`lane.py check-release`).
+- **Attribution.** Agent-authored commits end with `Agent: <model>/<seat>`,
+  human ones landing through the lane with `Human-Authored: <name>`
+  ([CONTRIBUTING.md](../CONTRIBUTING.md#commit-attribution));
+  [`scripts/check-attribution.py`](../scripts/check-attribution.py) runs in CI
+  (well-formedness) and in the landing script (`--require`).
+- **Escape hatch.** Reverts always proceed. A card class whose host is down is
+  recorded `down` and owed a rerun; promoting past it needs an explicit
+  `--allow-down <class>` and at least one class that ran green.
+
+### Commands
+
+```sh
+python3 scripts/promotion-lane/lane.py plan --class gfx1100
+python3 scripts/promotion-lane/lane.py run --archive hipfire-<tag>-linux-rocm-gfx1100-x64.tar.gz \
+    --class gfx1100 --candidate <sha> --out <dir> --models-dir <dir> --repo <checkout> \
+    [--perf-baseline <beta's record.json>] [--baseline-archive <beta's archive>]
+python3 scripts/promotion-lane/lane.py merge --candidate <sha> --out candidate.json <record.json>...
+python3 scripts/promotion-lane/lane.py check-release --sha <sha> --records <dir>
+# perf rows alone (A/A calibration, kill experiments), then the A/A half-widths
+python3 scripts/promotion-lane/lane.py perf --archive <A> --baseline-archive <A> --class gfx1100 --out <dir> --models-dir <dir>
+python3 scripts/promotion-lane/lane.py calibrate --class gfx1100 <dir1>/perf.json <dir2>/perf.json
+```
+
+`lane.py run` must execute inside a fabric job on a card of its class. The
+landing flow (build, per-class runs over fabric, merge, fast-forward) is the
+maintainers' `land-pick-lane.sh`, outside the tree.
+
+## hw-gate (PR evidence automation)
+
+[`hw-gate`](../.github/workflows/hw-gate.yml) collects load/serve/kernel
+evidence and posts seat commentary on a PR. It does not approve PRs, does not
+move `beta` (the [promotion lane](#promotion-lane) does) and does not own
+`master`. When it runs, two automated reviewer seats (seat 1: diff review and
+route selection; seat 2: investigation) may assist under their own automation
+identities; a human still owns the approving review. Diffs that touch no
+hardware-relevant surface need no hardware route.
 
 ### Bucket selection (`scripts/hw-gate/select.py`)
 
@@ -104,7 +288,7 @@ Changed paths → buckets `load` / `serve` / `kernel` (first match wins per path
 | Bucket | Path rules (summary) |
 |---|---|
 | **kernel** | `kernels/**`, `crates/rdna-compute/**`, `crates/hipfire-dispatch/**`, `crates/hip-bridge/**`, `crates/saddle-core/**` |
-| **serve** | `crates/hipfire-engine/**`, `crates/hipfire-generate/**`, the HTTP gateway `crates/hipfire-cli/src/serve/**` and `crates/hipfire-client/**`, daemon `slots.rs` / `serve*.rs`, runtime emit/eos/dflash/spec/reset/triattn surfaces, arch `serve`/`generate`/`spec` sources |
+| **serve** | `crates/hipfire-engine/**`, `crates/hipfire-generate/**`, the HTTP gateway `crates/hipfire-cli/src/serve/**` and `crates/hipfire-client/**`, daemon `slots.rs` / `serve*.rs`, runtime emit/eos/dflash/spec/reset surfaces, arch `serve`/`generate`/`spec` sources |
 | **load** | loader/daemon/runtime load+config surfaces, arch `load*`/`weights*`/`carrier.rs`, `crates/hipfire-config/**`, `crates/hipfire-registry/**`, `registry/**`, workspace/`crates/*/Cargo.toml` and lockfile |
 | **none** | everything else (docs, benchmarks, most scripts, tests, markdown, …) |
 
@@ -161,8 +345,9 @@ reported as unavailable.
 drives only `battery` and `chain`, plus `--dflash on` variants of both
 (`battery-dflash`, `chain-dflash`, from `HARNESS_MODES` in
 `scripts/hw-gate/run.py`). A `-dflash` mode needs a fixture-declared draft whose
-sha256 matches the manifest; a lane without that draft reports the mode as not
-run rather than falling back to plain decode.
+sha256 matches the manifest. A lane without that draft records the mode as
+`skip` and the fixture **fails** (skip is not pass); it never falls back to
+plain decode.
 
 - **`load` bucket** — `battery` and `battery-dflash` on every fixture (varied
   prompts, expect substrings, attractor / runaway / empty detection).
@@ -202,7 +387,7 @@ Manual load/serve evidence for those changes (in addition to the
    harness `--out` / bench `--json` fields and stderr markers agree).
 2. **Default axes.** On exact **gfx1201**, unpinned eligible Qwen must
    keep native **fp8/fp8** (`KV cache: Fp8 vmm (` or equivalent admission
-   marker). On a **non-gfx1201** arch, unpinned Qwen HFQ/PaRo must
+   marker). On a **non-gfx1201** arch, unpinned Qwen HFQ must
    default **q8/q8** (not the former FWHT3/Q8).
 3. **Card-B baseline guard.** Run
    [`scripts/guard_gfx1201_baseline.py`](../scripts/guard_gfx1201_baseline.py)
@@ -259,15 +444,17 @@ not a separate required GitHub check beyond the [merge bar](#merge-bar-required)
 |---|---|---|
 | **Automatic (no GPU CI, required)** | PR / push via [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) | **Required** merge bar: `build (workspace, no GPU)`, `unit tests (lib, no GPU)`, `gates (ratchets, layering, registers)`. **Not** model coherence, serve semantics, or perf admission. |
 | **Automatic (Windows MSVC, advisory)** | PR / push via [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) on `windows-latest` | Native build, selected CPU library tests, no-HIP version/JSON smoke, unsigned ZIP packaging. Initially advisory; promote after the first green `beta` run. **Not** GPU/runtime certification. |
-| **Automatic (hw-gate, optional)** | PR via [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) when that automation runs; hardware run after `hw-run` when buckets need it | **Optional** evidence delivery. Not a required status check; not automatic acceptance or promotion. |
+| **Promotion lane (required for `beta`)** | Every `beta-candidate` tip `land-pick-lane.sh` promotes; inside fabric jobs on each blocking card class | **Required**: `beta` fast-forwards only on a green promotion record. See [§ Promotion lane](#promotion-lane). |
+| **Automatic (hw-gate, PR evidence)** | PR via [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) when that automation runs; hardware run after `hw-run` when buckets need it | Evidence for the reviewer. Not a required status check and not promotion. |
 | **Automatic (path-gated hooks)** | Local `pre-commit` on matching staged runtime paths | Runs the hotspot guards selected by the staged path set. Documentation-only staged sets do not trigger a separate docs hook. **Not** a full product matrix. |
 | **Manual local no-GPU equivalent** | Human/agent invokes `scripts/no-gpu-ci.sh` outside CI | Same checks as the workflow script body; still **manual invocation**, not automatic CI. |
 | **Manual (GPU / model)** | Human or agent on hardware with an explicit model path | Required for claim classes that name GPU/model routes (parity oracles, serve semantics, perf protocol, Redline promotion ladder, admissions) when those surfaces change — whether or not hw-gate ran. |
 | **Direct maintainer review** | Human approval on the PR | **Required** (one approving review). Judges claim-matched evidence; automation comments are inputs, not substitutes. |
 
 No-GPU CI green never substitutes for GPU/model evidence the claim map
-requires. hw-gate green (when present) does not create an admission, skip
-claim-specific oracles named below, or replace the approving review.
+requires. A green promotion record or hw-gate run does not create an
+admission, skip claim-specific oracles named below, or replace the approving
+review.
 
 ### Automatic entrypoints
 
@@ -275,7 +462,8 @@ claim-specific oracles named below, or replace the approving review.
 |---|---|---|
 | No-GPU CI (required jobs) | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (+ [`scripts/no-gpu-ci.sh`](../scripts/no-gpu-ci.sh) body) | **Required** automatic CI: workspace build, lib unit tests, ratchets/layering/registers gates. |
 | Windows MSVC (required) | [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) + [`scripts/package-windows.ps1`](../scripts/package-windows.ps1) | Native Windows CPU build/tests/smoke and unsigned developer artifact; no GPU certification. |
-| **hw-gate (optional)** | [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) + [`scripts/hw-gate/`](../scripts/hw-gate/) | **Optional** evidence automation: path → buckets, pinned fixtures, hardware run, seat commentary. See [§ hw-gate](#hw-gate-optional-evidence-automation). |
+| **Promotion lane** | [`scripts/promotion-lane/`](../scripts/promotion-lane/) + [`scripts/device_mesh_matrix.py`](../scripts/device_mesh_matrix.py) | **Required** for `beta`: required rows on the installed archive, no compiler, one promotion record per candidate. See [§ Promotion lane](#promotion-lane). |
+| **hw-gate (PR evidence)** | [`.github/workflows/hw-gate.yml`](../.github/workflows/hw-gate.yml) + [`scripts/hw-gate/`](../scripts/hw-gate/) | Evidence automation: path → buckets, pinned fixtures, hardware run, seat commentary. See [§ hw-gate](#hw-gate-pr-evidence-automation). |
 | Pre-commit hooks | [`.githooks/pre-commit`](../.githooks/pre-commit) | **Automatic** when hooks are installed (`scripts/install-hooks.sh`). Selects HOTSPOT / SERVE_HOTSPOT / PP_HOTSPOT runtime guards from staged paths; documentation-only staged sets exit without a separate docs gate. |
 | Dispatch `bind_thread` invariant | [`scripts/verify-bind-thread.sh`](../scripts/verify-bind-thread.sh) (via pre-commit on matching paths) | **Automatic** when hooked: every public `dispatch.rs` entry must bind the HIP thread. Not a kernel numeric test. |
 | Env/docs drift check | [`scripts/check-env-docs.py`](../scripts/check-env-docs.py) | **Automatic** through `scripts/no-gpu-ci.sh`; checks that referenced `HIPFIRE_*` names are documented and production reads are config-owned. |
@@ -321,13 +509,18 @@ cargo test -p rdna-compute --lib -- --test-threads=1
 
 ### Documentation checks
 
-The shipped automated documentation-specific check is
-[`scripts/check-env-docs.py`](../scripts/check-env-docs.py). It validates
-environment-variable reference coverage and config ownership; it is not a
-general Markdown link, lifecycle-label, or semantic-drift checker. Beta does
+The shipped automated documentation-specific checks are
+[`scripts/check-env-docs.py`](../scripts/check-env-docs.py), which validates
+environment-variable reference coverage and config ownership, and
+[`scripts/check-pins.py`](../scripts/check-pins.py), which validates
+[`fixtures/pins.toml`](../fixtures/pins.toml) (schema, provenance of current
+KLD pins, prompt md5s against the committed files, mirrored digests) and that
+every `pin:<kind>/<id>` cited in the root rule files, `docs/`, `.agents/` and
+`scripts/` exists. Neither is a general Markdown link, lifecycle-label, or
+semantic-drift checker. Beta does
 not currently ship a standalone `check-docs-reliability.py` command or a
 documentation-only pre-commit gate. For documentation-only changes, run the
-env/docs check plus `git diff --check`, and inspect changed links and commands
+env/docs and pins checks plus `git diff --check`, and inspect changed links and commands
 against the current tree.
 
 ### Maintained manual harness roles
@@ -633,10 +826,10 @@ is a *historical* band, not a matched product-default baseline):
 | VL image-bearing serve semantics (`generate_vl` over `/v1/chat/completions`) | Manual OpenAI-compatible battery through `hipfire serve` with the exact VL artifact: committed fixtures under [`../benchmarks/vision/images/`](../benchmarks/vision/images/) + the fixed desc/ocr prompts of [`comparison-2026-05-23.md`](../benchmarks/vision/comparison-2026-05-23.md), greedy temp 0; stream **and** non-stream typed-emission check (reasoning vs `content` deltas; no literal `<think>`/`<|im_end|>` chunks in content); client-disconnect probe mid-stream followed by an immediate follow-up turn (no slot wedge); eyeball every decoded output; record artifact sha256, fixture hashes, binary md5s. No scripted harness exists (**blocked** until one lands); `scripts/serve_harness.py` is text-only today and does not exercise this surface | Manual serve (semantics only) |
 | Retained replay / PM4 / AQL graft | `scripts/redline_daemon_harness.py` **and** the certification steps in `docs/REDLINE.md` | Manual Redline; promotion still policy-gated |
 | Perf improvement claim | Protocol in `methodology/perf-benchmarking.md` + stationary matched runs; `speed-gate.sh` or `gates.sh` perf arm when applicable. Flash-Next claims also carry a [startup-config / product-default receipt](#flash-next-product-default-receipts-perf-claims) (`scripts/perf_config_receipt.py`) | Measured; not admission |
-| Existing sealed MQ4R Redline fixture reproduction | `python3 -m tools.redline golden` for its exact gfx1100/gfx1151/gfx1201 fixture only | Measured reproduction; exact identity + route proof + stationary floor; not admission. Does **not** imply that every default-eligible `.mq4r` model file is one of the sealed fixtures. |
+| Existing sealed MQ4R Redline fixture reproduction | `python3 -m tools.redline golden` for its exact gfx1100/gfx1151/gfx1201 fixture only | Measured reproduction; exact identity + route proof + stationary floor; not admission. Does **not** imply that every default-eligible MQ4R-SKU model file is one of the sealed fixtures. |
 | Arch port | `methodology/arch-port-validation.md` (channel + speed; no retired coherence battery as acceptance) | Manual |
 | Model/route **admission** (registry evidence) | Row in [`admissions.yml`](admissions.yml) | Schema v2; exactly one evidence-bound record (LFM2.5-350M MQ4 gfx1201 retained-PM4). No inferred/wildcard rows. Registry admission/evidence is distinct from runtime wiring: the sealed LFM row does **not** select a runtime default and current automatic selection does not use it. |
-| MQ4R **runtime** automatic Redline default | Source predicate `mq4r_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) | Cross-model automatic runtime predicate (the gfx1201 Qwen3.5 dense and Qwen4 rows below are the other product defaults). Runtime-only: exact GPU arch `gfx1100`, `gfx1151`, or `gfx1201`; PP=1; TP=1; case-insensitive `.mq4r` → retained PM4/Auto unless disabled with the config wizard's built-in `hip` profile, another explicit backend selection, or `HIPFIRE_REPLAY_BACKEND=hip`. Model-family agnostic apart from the exclusions applied by `retained_redline_default` in the same file: Muse Glimmer (arch 14) is withheld until its PM4 lowering lands, Gemma 4 (arch 13) is never admitted (unvalidated retained tape), expert-parallel loads (`ep` > 1) are never admitted, and a Qwen3.5 process using CPU-executed partial offload gets no retained default. Selection by file extension is marked deprecated since 0.4.0, removal in 0.5.0 (0.5.0 selects by HFQ metadata). `gfx1200` and all other arches remain opt-in. Existing LFM `.mq4` registry evidence is not auto-selected because it is not `.mq4r`, not because LFM is categorically exempt; any usable non-default retained route must still prove route support and fail closed when unsupported. **Not** registry admission, **not** Section 7 certification, and **not** a sealed-fixture claim for every default-eligible `.mq4r` model. |
+| MQ4R **runtime** automatic Redline default | Source predicate `mq4r_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) | Cross-model automatic runtime predicate (the gfx1201 Qwen3.5 dense and Qwen4 rows below are the other product defaults). Runtime-only: exact GPU arch `gfx1100`, `gfx1151`, or `gfx1201`; PP=1; TP=1; the MQ4R SKU (HFQ `hipfire_route_sku`, else the registry card `quant`; never the extension) → retained PM4/Auto unless disabled with the config wizard's built-in `hip` profile, another explicit backend selection, or `HIPFIRE_REPLAY_BACKEND=hip`. Model-family agnostic apart from the exclusions applied by `retained_redline_default` in the same file: Muse Glimmer (arch 14) is withheld until its PM4 lowering lands, Gemma 4 (arch 13) is never admitted (unvalidated retained tape), expert-parallel loads (`ep` > 1) are never admitted, and a Qwen3.5 process using CPU-executed partial offload gets no retained default. Selection by file extension was removed in 0.5.0 (the SKU comes from HFQ metadata or the registry card). `gfx1200` and all other arches remain opt-in. Existing LFM `.mq4` registry evidence is not auto-selected because it is not `.mq4r`, not because LFM is categorically exempt; any usable non-default retained route must still prove route support and fail closed when unsupported. **Not** registry admission, **not** Section 7 certification, and **not** a sealed-fixture claim for every default-eligible `.mq4r` model. |
 | gfx1201 Qwen3.5 dense **runtime** automatic Redline default | Source predicate `retained_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) §3 | Runtime-only: exact GPU arch `gfx1201`; `model_arch` `qwen3_5` (dense, any weight format); PP=1; TP=1; no drafter → retained PM4/Auto for plain-AR decode unless disabled with `replay.backend = "hip"`, the built-in `hip` profile, another explicit backend selection, or `HIPFIRE_REPLAY_BACKEND=hip`. Every new gfx1201 decode kernel must pass the graph-vs-PM4 parity gate (logits, hidden, DeltaNet state, KV at ctx 512/8,192/32,768, 256 greedy tokens). **Not** registry admission and **not** Section 7 certification. |
 | gfx1201 Qwen4 (Flash-Next) **runtime** automatic Redline default | Source predicate `retained_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) §3 | Runtime-only: exact GPU arch `gfx1201`; `model_arch` `qwen4` (any weight format); PP=1; TP=1; no drafter (a native MTP head is a drafter, so only MTP-off loads replay) → retained PM4/Auto for plain-AR decode, same opt-outs as the Qwen3.5 row. A change to the Qwen4 decode tape must pass `scripts/redline_daemon_harness.py --qwen4 --pm4` (HIP/PM4/blob bit-exact over the shadow positions) and greedy text equality against `HIPFIRE_REPLAY_BACKEND=hip`. **Not** registry admission and **not** Section 7 certification. |
 | gfx1100 Qwen3.5 dense `.mq3-xt` **runtime** automatic Redline default | Source predicate `retained_redline_default` in `crates/hipfire-runtime/src/config.rs`; policy in [`REDLINE.md`](REDLINE.md) §3 | Runtime-only: exact GPU arch `gfx1100`; `model_arch` `qwen3_5`; case-insensitive `.mq3-xt`; PP=1; TP=1; no drafter → retained PM4/Auto (with the GFX10/GFX11 scratch rings) for plain-AR decode, same opt-outs as the gfx1201 Qwen3.5 row. A change to the tape must keep served `generate` greedy identity vs `HIPFIRE_REPLAY_BACKEND=hip` with a per-request `HIPFIRE_REPLAY_ROUTE_PROOF replays>0` marker: `python3 tools/redline/serve_identity_ab.py ident --daemon <daemon> --model <qwen3.8-27b.mq3-xt> --arms dflt,hip,kill --out <dir>` (acks `commit_ready`; an un-acked driver prints no marker) and `... ab --arms dflt,hip` for decode tok/s. **Not** registry admission and **not** Section 7 certification. |
@@ -662,7 +855,7 @@ be required for merge, promotion, or benchmark claims.
 
 | Pattern | Status |
 |---|---|
-| `scripts/coherence-gate-*.sh` (e.g. `coherence-gate-qwen35-dspark.sh`, `coherence-gate-qwen3-dspark.sh`, `coherence-gate-minimax.sh`, `coherence-gate-cohere2moe.sh`, `coherence-gate-deepseek4-*.sh`, …) | **Historical reproduction only.** Never promotion or acceptance. Deprecated since 0.4.0, removal in 0.5.0 (with `_coherence_runner.py`, `awq_coherence_check.sh`, `pflash-gate.sh`); each prints a deprecation warning. There is **no universal successor**: use the claim-specific route in the [claim → route map](#claim--route-map), or treat the surface as blocked. |
+| `scripts/coherence-gate-*.sh` (formerly e.g. `coherence-gate-qwen35-dspark.sh`, `coherence-gate-qwen3-dspark.sh`, `coherence-gate-minimax.sh`, `coherence-gate-cohere2moe.sh`, `coherence-gate-deepseek4-*.sh`, …), `_coherence_runner.py`, `awq_coherence_check.sh` | **Removed in 0.5.0** (git history only). Never promotion or acceptance. There is **no universal successor**: use the claim-specific route in the [claim → route map](#claim--route-map) (`scripts/serve_harness.py` battery/chain for serve-level coherence), or treat the surface as blocked. |
 | `tools/change_gate/`, `.github/agentic-review/`, and the pre-hw-gate agentic static-review route | **Retired.** Superseded as a review path; historical references only. Not merge evidence. |
 | Other gate scripts **not named anywhere in this selector** | Do not treat as canonical acceptance unless a future INDEX/VALIDATION revision names them. Supporting tools already listed above stay in force. |
 
@@ -682,8 +875,8 @@ blocked on purpose.
 | railgun G0/G7/check result as Redline route proof or as a replacement for the Redline ladder | **Rejected** — railgun validates typed programs; it does not certify a retained route |
 | Coherence-gate pass as current acceptance | **Rejected** |
 | `change_gate` / agentic-review route as current acceptance | **Rejected** — retired; historical only |
-| hw-gate success as required merge gate, auto-approval, or auto-promotion | **Rejected** — optional evidence only; direct review + required no-GPU checks remain |
-| Missing/skipped hw-gate as a merge blocker by itself | **Rejected** — hw-gate is not a required status check |
+| hw-gate success as auto-approval or auto-promotion | **Rejected** — PR evidence only; `beta` moves on the promotion lane, merges on direct review + required no-GPU checks |
+| A skipped, missing or `hardware-blocked` required lane row as a pass | **Rejected** — skip is not pass; only a recorded waiver (Kaden or fivetide, at most 7 days) lets a red row through, and no release is tagged with one open |
 | Bench number without protocol + identity hashes | **Rejected** as promotion evidence |
 | Inferred or “signed” `admissions.yml` row without earned fixture evidence | **Rejected** — schema v2 forbids inferred/wildcard rows; only the exact admitted record applies |
 
@@ -693,4 +886,6 @@ blocked on purpose.
 - Admission registry: [`admissions.yml`](admissions.yml)
 - Redline policy: [`REDLINE.md`](REDLINE.md)
 - Perf protocol: [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md)
+- Testing playbook (setup, smoke tests, reporting bars): [`testing.md`](testing.md)
+- Fixture and quality pins: [`fixtures.md`](fixtures.md), values in [`../fixtures/pins.toml`](../fixtures/pins.toml) (`scripts/check-pins.py`)
 - Engineering lessons (bitwise-gate discipline, gate gaps, measurement rules): [`methodology/lessons-0.4.5.md`](methodology/lessons-0.4.5.md)

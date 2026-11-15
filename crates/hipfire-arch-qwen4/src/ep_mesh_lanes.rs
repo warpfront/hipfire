@@ -98,8 +98,8 @@ use crate::gpu_forward_lanes::{
 use crate::lane::download_lane_rows;
 use crate::lane::{LabRoutes, LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
 use crate::lane_exec::pick_at;
+use crate::mesh_lane_protocol::heads_lane;
 use crate::mesh_lane_protocol::SamplingMode;
-use crate::mesh_lane_protocol::{ep_draft_split_enabled, heads_lane};
 use crate::mesh_lane_protocol::{
     AbortRecord, AcceptRule, CommitDecision, ControllerInterval, DevicePick, DraftOp,
     DraftProposal, DraftRound, EvidenceError, HeadAppend, HeadEnd, HeadState, LaneAdmission,
@@ -397,11 +397,11 @@ fn window_needs_growth(bundle: &Qwen4Bundle, start: &WindowStart) -> bool {
     })
 }
 
-/// The sharded-MoE pass (S4, `HIPFIRE_QWEN4_DRAFT_SHARDED_MOE`) of a draft
+/// The sharded-MoE pass (S4) of a draft
 /// round, decided from the root's whole round and the plan alone so every rank
-/// decides alike (`rank` only names this rank's share): the switch and the S4
-/// head tables are on, the round holds two to eight ops, every op is a lane one
-/// of two ranks owns (X2), and the round is one batched head call
+/// decides alike (`rank` only names this rank's share): the S4 head tables are
+/// on, the round holds two to eight ops, every op is a lane one of two ranks
+/// owns (X2), and the round is one batched head call
 /// ([`crate::mtp_lanes::draft_round_batchable`] over the whole round). Any other
 /// round (a lone op, replicated lanes) keeps its X2 / replicated path unchanged.
 fn s4_round_for<'a>(
@@ -410,10 +410,7 @@ fn s4_round_for<'a>(
     plan_of: impl Fn(&LaneWindowKey) -> Option<&'a LanePlan>,
     rank: usize,
 ) -> R<Option<S4Round>> {
-    if !crate::mtp_gpu::draft_sharded_moe_enabled()
-        || !bundle.mtp_s4_ready()
-        || !(2..=crate::mtp_gpu::MTP_DRAFT_LANES_MAX).contains(&ops.len())
-    {
+    if !bundle.mtp_s4_ready() || !(2..=crate::mtp_gpu::MTP_DRAFT_LANES_MAX).contains(&ops.len()) {
         return Ok(None);
     }
     let mut lanes: SmallVec<[(Option<usize>, bool); crate::mtp_gpu::MTP_DRAFT_LANES_MAX]> =
@@ -1006,7 +1003,7 @@ impl RankLane<'_> {
                 // serial and batched head steps on scratch twins of their states
                 // (no effect on the lanes; armed by env only, `lab` builds only).
                 #[cfg(feature = "lab")]
-                if crate::lab_draft_rounds::probe_enabled()
+                if crate::lab_draft_rounds::probe_enabled(bundle)
                     && s4.is_none()
                     && round.ops.len() >= 2
                     && !round.ops.iter().try_fold(false, |any, op| {
@@ -2694,10 +2691,9 @@ impl EpMeshLanes {
     }
 
     /// Decide the X2 draft split once, at the first step: the root may give a
-    /// window's head lanes owners only while `HIPFIRE_QWEN4_EP_DRAFT_SPLIT` is not
-    /// `0` and every rank's MTP head can run lane-local
-    /// ([`Qwen4Bundle::mtp_lane_local_ready`]: rank 0 and every peer, asked
-    /// through the pool). Logs the decision once.
+    /// window's head lanes owners only while every rank's MTP head can run
+    /// lane-local ([`Qwen4Bundle::mtp_lane_local_ready`]: rank 0 and every peer,
+    /// asked through the pool). Logs the decision once.
     fn decide_draft_split(
         &mut self,
         bundle: &mut Qwen4Bundle,
@@ -2713,9 +2709,7 @@ impl EpMeshLanes {
                 e.rank, e.reason
             )))
         })?;
-        let (want, reason) = if !ep_draft_split_enabled() {
-            (false, "HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0".to_string())
-        } else if let Some(rank) = ready.iter().position(|ready| !ready) {
+        let (want, reason) = if let Some(rank) = ready.iter().position(|ready| !ready) {
             (
                 false,
                 format!("rank {rank}'s MTP head has no lane-local MoE"),
@@ -3080,8 +3074,7 @@ fn device_draws(
 
 /// Lab draft trace (`HIPFIRE_LAB_MTP_DRAFT_TRACE=<dir>`): one JSON line per
 /// answered draft op per rank, appended to `<dir>/rank<r>.jsonl`, so the ops of
-/// a split run merge into the incumbent's (`HIPFIRE_QWEN4_EP_DRAFT_SPLIT=0`) rank 0
-/// trace op for op.
+/// a split run merge into the unsplit run's rank 0 trace op for op.
 #[cfg(feature = "lab")]
 mod lab_trace {
     use std::io::Write;

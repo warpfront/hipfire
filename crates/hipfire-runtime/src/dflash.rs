@@ -525,70 +525,43 @@ fn hfq_weight(
         .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
     let wt = match info.quant_type {
         1 => {
-            // F16 on disk. Default: upload as F16 (no lift) and dispatch through
-            // the mw16 WMMA kernel — 3-5× faster draft at B=16 on gfx1100 than
-            // the F32 lift path (which bypassed WMMA entirely via the naive
-            // gemm_f32_batched kernel at ~100 GB/s / 10 % peak).
-            //
-            // HIPFIRE_DRAFT_F16=0 falls back to the legacy F16→F32 lift for
-            // A/B comparison.
-            let use_f16 = crate::config::get().draft_f16;
-            if use_f16 {
-                assert_eq!(
-                    data.len(),
-                    m * k * 2,
-                    "dflash {name} F16 byte-size mismatch"
-                );
-                // gfx1151: a power-of-two row pitch (K % 2048 == 0) camps every
-                // wave on the same DRAM channels (~50 GB/s); 128 pad halfs per
-                // row restore ~200 GB/s. Only gemm_dispatch reads these
-                // weights, and it routes padded ones to gemm_f16_pitched_gfx1151.
-                let ld = if gpu.arch_caps.is_gfx1151() && k % 2048 == 0 {
-                    k + 128
-                } else {
-                    k
-                };
-                let buf = if ld == k {
-                    upload_raw_weight(gpu, data, &[m * k])?
-                } else {
-                    let mut padded = vec![0u8; m * ld * 2];
-                    for (dst, src) in padded.chunks_exact_mut(ld * 2).zip(data.chunks_exact(k * 2)) {
-                        dst[..k * 2].copy_from_slice(src);
-                    }
-                    upload_raw_weight(gpu, &padded, &[m * ld])?
-                };
-                Ok::<WeightTensor, hip_bridge::HipError>(WeightTensor {
-                    buf,
-                    gpu_dtype: DType::F16,
-                    m,
-                    k,
-                    row_stride: if ld == k { 0 } else { ld * 2 },
-                    paro: None,
-                    awq_scale: None,
-                    lloyd_lut_e4m3: None,
-                    lloyd_lut_f16: None,
-                    lloyd_lut_c16: None,
-                })
+            // F16 on disk: upload as F16 (no lift) and dispatch through the
+            // mw16 WMMA kernel — 3-5× faster draft at B=16 on gfx1100 than an
+            // F32 lift through the naive gemm_f32_batched kernel.
+            assert_eq!(
+                data.len(),
+                m * k * 2,
+                "dflash {name} F16 byte-size mismatch"
+            );
+            // gfx1151: a power-of-two row pitch (K % 2048 == 0) camps every
+            // wave on the same DRAM channels (~50 GB/s); 128 pad halfs per
+            // row restore ~200 GB/s. Only gemm_dispatch reads these
+            // weights, and it routes padded ones to gemm_f16_pitched_gfx1151.
+            let ld = if gpu.arch_caps.is_gfx1151() && k % 2048 == 0 {
+                k + 128
             } else {
-                let f32_data: Vec<f32> = data
-                    .chunks_exact(2)
-                    .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                    .collect();
-                assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
-                let buf = upload_f32_weight(gpu, &f32_data, &[m * k])?;
-                Ok(WeightTensor {
-                    buf,
-                    gpu_dtype: DType::F32,
-                    m,
-                    k,
-                    row_stride: 0,
-                    paro: None,
-                    awq_scale: None,
-                    lloyd_lut_e4m3: None,
-                    lloyd_lut_f16: None,
-                    lloyd_lut_c16: None,
-                })
-            }
+                k
+            };
+            let buf = if ld == k {
+                upload_raw_weight(gpu, data, &[m * k])?
+            } else {
+                let mut padded = vec![0u8; m * ld * 2];
+                for (dst, src) in padded.chunks_exact_mut(ld * 2).zip(data.chunks_exact(k * 2)) {
+                    dst[..k * 2].copy_from_slice(src);
+                }
+                upload_raw_weight(gpu, &padded, &[m * ld])?
+            };
+            Ok::<WeightTensor, hip_bridge::HipError>(WeightTensor {
+                buf,
+                gpu_dtype: DType::F16,
+                m,
+                k,
+                row_stride: if ld == k { 0 } else { ld * 2 },
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            })
         }
         2 => {
             let f32_data: Vec<f32> = data
@@ -603,7 +576,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -620,7 +592,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -637,7 +608,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -655,7 +625,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -684,7 +653,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -711,7 +679,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -738,7 +705,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -765,7 +731,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -792,7 +757,6 @@ fn hfq_weight(
                 m,
                 k,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
@@ -855,7 +819,7 @@ fn attach_awq_scale_with_copy(
 
 impl DflashLayerWeights {
     /// Consume one layer's weights, releasing every GPU tensor including the
-    /// AWQ/paro sidecars (`free_all`, not `.buf` — an AWQ-trunk drafter
+    /// AWQ sidecars (`free_all`, not `.buf` — an AWQ-trunk drafter
     /// carries one scale tensor per weight per layer). Shared by the
     /// success-path `DflashWeights::free_gpu` and the `load` error path so a
     /// failed load frees completed layers without duplicating this list.
@@ -1346,7 +1310,7 @@ impl DflashWeights {
         })
     }
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        // free_all (not .buf) so the awq_scale / paro sidecars are released too —
+        // free_all (not .buf) so the awq_scale sidecar is released too —
         // on an AWQ-trunk drafter every weight carries an awq_scale GpuTensor, so
         // .buf-only freeing leaks one tensor per weight per layer on each unload.
         self.fc.free_all(gpu);
@@ -1376,7 +1340,7 @@ impl DflashWeights {
 ///
 /// The fields are PRIVATE (this is a submodule), so the only ways to mutate
 /// them are the invariant-preserving operations below — `seed_prompt`,
-/// `append_committed`, `rebuild_after_eviction`, `reset`, plus the two
+/// `append_committed`, `reset`, plus the two
 /// `draft_forward`-owned watermarks `mark_uploaded` / `mark_proj_cached`.
 /// A caller can no longer set `uploaded_rows` without `abs_positions` staying
 /// consistent (the desync that bit the generic DFlash path in 89856eab and
@@ -1524,23 +1488,6 @@ mod target_hidden_log {
                 self.abs_positions
                     .push(base_pos as i32 + p as i32 + compact_offset);
             }
-        }
-
-        /// Post-eviction rebuild: `new_abs` is the compacted absolute-position
-        /// list (one entry per retained row). Replaces the row layout and
-        /// invalidates the projection cache (row indices shifted).
-        pub fn rebuild_after_eviction(&mut self, new_abs: Vec<i32>) {
-            self.uploaded_rows = new_abs.len();
-            self.abs_positions = new_abs;
-            self.proj_cached_rows = 0;
-            self.full_cached_rows = 0;
-        }
-
-        /// Invalidate only the per-layer projection cache (eviction mirror that
-        /// keeps the uploaded rows but shifts their indices).
-        pub fn invalidate_proj_cache(&mut self) {
-            self.proj_cached_rows = 0;
-            self.full_cached_rows = 0;
         }
 
         /// `draft_forward`-owned: record that `l` rows are now uploaded H2D.
@@ -1750,7 +1697,7 @@ pub struct DflashScratch {
     // tracker drops per-cycle H2D from ~90 MB (full ctx at 1100 tokens × 5
     // layers × 4096 × 4 B) to ~700 KB. See `TargetHiddenLog` for the
     // invariant-preserving API (seed_prompt / append_committed /
-    // rebuild_after_eviction / reset); raw poking is no longer possible.
+    // reset); raw poking is no longer possible.
     pub thlog: TargetHiddenLog,
 
     /// Per-layer cache of `k_ctx` and `v_ctx` (post-GEMM-of-target_hidden_proj;
@@ -2281,18 +2228,6 @@ impl DflashScratch {
             DraftCtxMode::Legacy => usize::MAX,
             DraftCtxMode::Windowed { w, .. } => w,
         }
-    }
-
-    /// Invalidate the per-layer k_ctx/v_ctx projection cache. Called from
-    /// `apply_eviction_retain_to_draft` (in speculative.rs) when CASK
-    /// evicts positions — the cached rows no longer correspond to the
-    /// right absolute positions, so the simplest correct thing is to
-    /// rebuild on the next cycle. A finer mirror (applying retain_mask
-    /// to the cache) could preserve the cache across eviction but adds
-    /// complexity; the rebuild cost is bounded by one slow cycle per
-    /// eviction which is rare relative to total cycles.
-    pub fn invalidate_draft_ctx_cache(&mut self) {
-        self.thlog.invalidate_proj_cache();
     }
 
     /// Turn the graph-captured draft window on or off for this scratch (the
@@ -4071,8 +4006,7 @@ fn draft_forward_based_inner(
     // `draft_ctx_cached_rows` is the scratch-owned invariant: how many
     // prefix rows have been computed end-to-end (fc + hidden_norm +
     // per-layer wk + k_norm + per-layer wv). It resets to 0 at new
-    // prompts (reset_upload_tracking) and on eviction
-    // (invalidate_draft_ctx_cache).
+    // prompts (reset_upload_tracking).
     //
     // Full-rebuild cases: delta == L (first cycle after reset), or
     // delta > L somehow (shouldn't happen — this would be a bug). Those
@@ -5421,7 +5355,6 @@ mod construction_tests {
                 m: 2,
                 k: 8,
                 row_stride: 0,
-                paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,

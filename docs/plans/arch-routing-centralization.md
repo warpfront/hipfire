@@ -39,7 +39,7 @@ Check if `mod arch_caps;` exists in `crates/rdna-compute/src/lib.rs`. If not, ad
 
 - [ ] **Step 2: Write the `ArchCaps` struct definition**
 
-Replace the entire `arch_caps.rs` file. Keep the existing `paro_la_gates_mq4g128_default` function and test module. Add the struct:
+Replace the entire `arch_caps.rs` file. Add the struct:
 
 ```rust
 use crate::feature_flags::FeatureFlags;

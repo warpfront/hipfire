@@ -382,7 +382,7 @@ when the ranks are not one arch (a mixed gfx1100/gfx1201 set is refused:
 `requires the same architecture on every rank`), when fewer than `ep` devices
 are visible, or when a directed card pair is not peer-accessible. EP has no
 host-staged fallback for a missing peer pair; the load refuses. EP also refuses
-DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, drafters, CASK, PFlash,
+DFlash, DSpark, n-gram drafting, adaptive KV, drafters,
 the retained Redline default and `HIPFIRE_MTP_SAMPLED_MODE=naive`. Exact AR
 lane batching (`serve.vmm_batch`) is **not** refused under EP; see
 [fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep).
@@ -393,13 +393,11 @@ capture).
 | | exact gfx1201 (R9700), N = 2..=8 | exact gfx1100 (7900 XTX), N = 2..=8 |
 |---|---|---|
 | Load / decode / verify / native MTP (`--spec mtp`) | Admitted (opt-in, experimental) | Admitted (opt-in, experimental) |
-| Balanced per-call expert ownership on host-mapped layers ("W1") | **On** by default under EP at N = 2..=4; kill switch `HIPFIRE_EP_BALANCED_OWNERS=0`. At N = 5..=8 **not admitted** (the certified owner-assign kernel covers 2..=4 ranks): each rank logs `balanced ownership not admitted (needs at most 4 ranks); static split` | **Not admitted**: each rank logs `balanced ownership not admitted (needs gfx1201); static split` and runs the static `e % N` split, which is exact |
-| Owner-routed prefill chunks ("S1") | **On** by default when every admission condition holds; kill switch `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0`. Symmetric IU4 route (every MoE layer verified symmetric on every rank) | Same default and kill switch. F16 WMMA grouped route (BF16-out gate/up with the SwiGLU epilogue, BF16-out down; QT44/QT53 experts on every layer); the stable grouping is used whenever the exchange is installed |
-| Long-prefill expert staging ("S2") | **On** by default when S1 is admitted; kill switch `HIPFIRE_EP_EXPERT_STAGE=0` (pipeline-wide kill switch `HIPFIRE_QWEN4_EXPERT_STAGE`) | Never created (`expert staging not admitted (needs gfx1201)`) |
+| Balanced per-call expert ownership on host-mapped layers ("W1") | **On** under EP at N = 2..=4. At N = 5..=8 **not admitted** (the certified owner-assign kernel covers 2..=4 ranks): each rank logs `balanced ownership not admitted (needs at most 4 ranks); static split` | **Not admitted**: each rank logs `balanced ownership not admitted (needs gfx1201); static split` and runs the static `e % N` split, which is exact |
+| Owner-routed prefill chunks ("S1") | **On** when every admission condition holds. Symmetric IU4 route (every MoE layer verified symmetric on every rank) | Same rule. F16 WMMA grouped route (BF16-out gate/up with the SwiGLU epilogue, BF16-out down; QT44/QT53 experts on every layer); the stable grouping is used whenever the exchange is installed |
+| Long-prefill expert staging ("S2") | **On** by default when S1 is admitted; pipeline-wide kill switch `HIPFIRE_QWEN4_EXPERT_STAGE` | Never created (`expert staging not admitted (needs gfx1201)`) |
 
-For the three levers, exactly `0` is off and unset or any other value is on
-(they follow one rule, `ep_lever_on`). Single-card (`ep = 1`) behavior is
-unchanged by all of them. The per-rank load log states what ran (`qwen4 EP
+Single-card (`ep = 1`) behavior is unchanged by these levers. The per-rank load log states what ran (`qwen4 EP
 rank r/n: balanced ownership on N host-mapped MoE layers`; `owner-routed
 prefill on …` or `owner-routed prefill not admitted (reason)`). How many routed
 layers stay in VRAM depends on the card and N: see
@@ -408,11 +406,90 @@ fixture at 32K context the changelog-reported figures are EP2: 30 of 49 routed
 layers resident per rank (19 host-mapped), +0.34 GiB headroom; EP4: 49 of 49,
 +3.77 GiB headroom.
 
-**Exactness.** On the evidence below, EP output on exact gfx1201 is
-bit-identical to the same build on one card, not merely close. The evidence
-(`fn_ep_oracle` and the serve harnesses, 2×/4× R9700, pinned Flash-Next XTS
-sha256 prefix `8b15b6fe`; fixture-bound) covers **exact gfx1201 at EP2 and EP4
-only**; it is not evidence for gfx1100 or for other rank counts:
+**Exactness.** Flash-Next EP on exact gfx1201 has two routes, and only one of
+them is bit-identical to one card.
+
+- **Experts sharded, trunk replicated (EP4, and EP2 with
+  `HIPFIRE_QWEN4_EP_TRUNK_SHARD=0`): bit-identical to the same build on one
+  card**, not merely close. Re-measured on current beta (Flash-Next GPTQ3, two
+  R9700, shard off): every logits row over three prompts (163 of 163), every rank
+  mirror, every Hyper-Connection stream of a 31-row prefill chunk at the dumped
+  layers (0-3, 23, 47) and every state digest row equal one card.
+- **Default two-card EP2 (`topology.ep = 2` over exactly two gfx1201 cards): the
+  TP2 trunk shard, on since v0.4.5, which is NOT bit-identical to one card, by
+  design.** Each rank computes half of the K range of every trunk block output
+  (GDN `out_proj`, QSA `o_proj`, shared-expert down, and its owned routed
+  experts). The fused all-reduce + Hyper-Connection write
+  (`ar_hc_write_gfx1201`) rounds each rank's f32 partial to bf16 once and folds
+  `m = bf16(p0) + bf16(p1)`; one card rounds the full f32 sum once. The first
+  differing bits are at layer 0's GDN `out_proj` fold: `p0 + p1` in f32 equals
+  the single card's output to 3.6e-7, but the bf16 rounding of the partials
+  moves elements by up to 2.0e-3 and changes 34.6% of the bf16 values that
+  enter the stream. Routed top-k flips and 48 layers amplify that to a max abs
+  logit difference of 2 to 4.5 against one card, and a greedy decode can leave
+  the one-card token stream within the first tokens (the first token of a
+  near-tie prompt reorders). The route's contract is therefore not byte
+  equality but: (1) rank 0 and rank 1 hold equal logits and state, and a run
+  repeats byte for byte; (2) the per-element fold bound
+  `|m - (p0 + p1)| <= (2^-8 + 2^-23)(|p0| + |p1|)`; (3) a KLD gate. For
+  bit-identity checks set **`HIPFIRE_QWEN4_EP_TRUNK_SHARD=0`** on the EP arm
+  (developer variable, no typed key; it restores plain EP2). The device-mesh
+  cell `g5-qwen4-ep2-vs-single-physical` sets it, and every exactness arm of
+  `scripts/fn-ep-gate.sh` pins it (see the community gate below); for
+  `fn_ep_oracle` / `scripts/fn_ep_compare.py` run by hand, set it yourself. On
+  gfx1100 and at other rank counts the shard does not apply and EP is the first
+  bullet's route.
+- **Opt-in f32 mixer wire (`topology.ep_ar_wire = "f32"`, typed key, default
+  `"bf16"`; `hipfire config set topology.ep_ar_wire f32`, global or per model).**
+  On the trunk shard only, the mixer out-projection (GDN `out_proj`, QSA
+  `o_proj`) partials travel unrounded and the fold is `m = p0 + p1`, rounded to
+  bf16 once in the HC write (bound `2^-24 (|p0| + |p1|)`); the FFN partials
+  still travel as bf16, which costs nothing (the shared + routed FFN partial is
+  already stored bf16-rounded, so the rounding is the identity). It is still not
+  byte-identical to one card: the two K halves sum in a different order than one
+  card's K loop, so `bf16(m)` can land on the other side of a rounding boundary
+  (step-0 max abs logit difference 3.3 on the `short-500` gate prompt, but all
+  33 greedy tokens equal one card's, where the bf16 wire leaves at the first
+  token). Rank equality and run-to-run repeatability hold as above.
+
+  Measured size (Flash-Next GPTQ3 against the BF16 teacher, served decode,
+  isolated `HIPFIRE_HOME`, one fresh process per arm; code24 24x512 = 6,120
+  scored rows, WT2 32x512 = 8,160):
+
+  | arm | code24 KLD | code24 top-1 / PPL | WT2 KLD | WT2 top-1 / PPL |
+  |---|---|---|---|---|
+  | one card | 0.087458 | 0.9243 / 4.7576 | 0.083130 | 0.8897 / 5.4786 |
+  | EP2, shard off | 0.087458 (same logits hash as one card) | 0.9243 / 4.7576 | - | - |
+  | EP2, shard on, `ep_ar_wire = "bf16"` (default) | 0.089191 | 0.9206 / 4.8663 | 0.085023 | 0.8837 / 5.4991 |
+  | EP2, shard on, `ep_ar_wire = "f32"` | 0.085721 | 0.9190 / 4.8206 | 0.080915 | 0.8844 / 5.4759 |
+
+  Paired per chunk (20,000-draw bootstrap), minus one card: default code24 KLD
+  d = +0.0017, 95% CI [-0.0025, +0.0058], WT2 d = +0.0019, CI [-0.0017,
+  +0.0058] (NLL of the code24 reference text +0.0226, CI [+0.0026, +0.0439]);
+  f32 code24 d = -0.0017, CI [-0.0074, +0.0037], WT2 d = -0.0022, CI [-0.0056,
+  +0.0012]. f32 minus default: code24 d = -0.0035, CI [-0.0078, +0.0009]; WT2
+  d = -0.0041, CI [-0.0074, -0.0009]. Rank 0 and rank 1 disagreed on 0 of the
+  6,120 / 8,160 rows on both wires.
+  The shard's design gate was d <= +0.0003 against EP2 on the point estimate;
+  on the mq4-xts fixture the default measured the other sign (code24 KLD
+  0.082302 -> 0.077703).
+
+  Cost of `"f32"` (2x R9700, symtrunk `serve --spec mtp`, one throwaway load
+  plus four fresh loads per arm, B/A of per-stream decode tok/s with a
+  two-level bootstrap 95% CI): code C1 / C4 / C8 0.981 [0.946, 1.019] /
+  1.016 [0.992, 1.040] / 1.000 [0.983, 1.019]; story C1 / C4 / C8 0.995
+  [0.956, 1.035] / 0.992 [0.975, 1.010] / **0.984 [0.969, 0.999]** (story C8
+  -1.6%, the one cell whose CI excludes 0; story ms per step +2.6% at C4 and
+  +2.2% at C8). Prefill about -2% (pp4k 6,331 vs 6,457 tok/s, pp16k 6,564 vs
+  6,676, with one slow default load left out). The cost is the doubled wire
+  bytes of the mixer launches: a 48-row launch takes 21.9 us instead of 14.5,
+  a 256-row launch 124 us instead of 69 (`ar_hc_write_bench`, f32 streams).
+
+The evidence below is for the replicated-trunk route (`fn_ep_oracle` and the
+serve harnesses, 2×/4× R9700, pinned Flash-Next XTS sha256 prefix `8b15b6fe`;
+fixture-bound). It covers **exact gfx1201 at EP2 and EP4 only**; it is not
+evidence for gfx1100 or for other rank counts, and it does not describe the
+default two-card EP2 route above:
 
 - EP2 and EP4 AR decode: logits and per-request state match one card at every
   step over 256 greedy tokens (ctx 512, 8192, 32768).
@@ -583,7 +660,7 @@ slowest link. EP has no host-staged fallback: if any directed card pair is
 not peer-accessible, the load refuses. The community gate below records each
 card's PCIe link speed and width and the P2P topology in its receipt.
 
-### Flash-Next EP: balanced expert ownership (default on under EP on gfx1201 at 2..=4 ranks; `HIPFIRE_EP_BALANCED_OWNERS=0` disables)
+### Flash-Next EP: balanced expert ownership (on under EP on gfx1201 at 2..=4 ranks)
 
 Under Flash-Next (Qwen4) expert parallelism rank `r` owns routed expert `e`
 when `e % ranks == r`. On the trunk layers whose experts live in pinned host
@@ -591,8 +668,7 @@ memory (the host-mapped layers, read zero-copy over PCIe) the number of routed
 experts a token draws from each rank differs call to call, so the rank with
 fewer host experts finishes early and waits for the other at every such layer.
 
-Balanced ownership (default on under EP; `HIPFIRE_EP_BALANCED_OWNERS=0` keeps
-the static split) balances that per call. After the router wrote the call's
+Balanced ownership (on under EP) balances that per call. After the router wrote the call's
 routed ids, one small device kernel deals the distinct routed experts to the
 ranks alternately in ascending expert id, identically on every rank, and
 rewrites the rank's live pointer tables for the layer: an expert the rank was
@@ -606,9 +682,8 @@ output is byte-identical to the static split and to one card.
 
 Scope: host-mapped trunk MoE layers on one-row decode and few-row forwards
 (verify, replay and takeover, 2 to 8 rows). VRAM-resident layers, chunk
-forwards (more than 8 rows) and the MTP head keep the static split. With
-`HIPFIRE_EP_BALANCED_OWNERS=0`, no table, buffer, stage or kernel module is
-added. Each rank logs `qwen4 EP rank r/n: balanced ownership on N host-mapped
+forwards (more than 8 rows) and the MTP head keep the static split.
+Each rank logs `qwen4 EP rank r/n: balanced ownership on N host-mapped
 MoE layers` at attach when it is on.
 
 Balanced ownership is admitted on exact gfx1201 at 2..=4 ranks only (the
@@ -618,11 +693,11 @@ ownership not admitted (needs gfx1201); static split`, and on gfx1201 at 5..=8
 ranks `... (needs at most 4 ranks); static split`; either way the rank builds
 nothing and runs the static `e % ranks` split, which is exact.
 
-### Flash-Next EP: owner-routed prefill chunks (default on under EP; `HIPFIRE_EP_OWNER_ROUTED_PREFILL=0` disables)
+### Flash-Next EP: owner-routed prefill chunks (on under EP)
 
 Without the lever every EP rank runs the whole 512-expert grouped MoE of every
 prefill chunk, reading its peers' experts through P2P weight tables.
-`HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP2..EP8 on exact gfx1201 (symmetric IU4 route) and exact gfx1100 (F16 WMMA grouped route); `=0` is the kill switch, any other value or unset is on; single card unchanged)
+Owner-routed prefill (on under EP2..EP8 on exact gfx1201 (symmetric IU4 route) and exact gfx1100 (F16 WMMA grouped route); single card unchanged)
 splits that work. All ranks still run the router, top-k and stable grouping
 (a deterministic function of replicated bytes, so the grouped layout is
 identical everywhere). Each rank runs the grouped gate/up and down on its own
@@ -666,7 +741,7 @@ bitwise comparison with a single card (`fn-ep/coal/s1/compare_chunk.py`).
 
 ### Flash-Next EP: long-prefill expert staging
 
-`HIPFIRE_EP_EXPERT_STAGE` (default ON under EP when the owner-routed prefill is admitted on gfx1201; `=0` is the kill switch, any other value or unset is on) admits the existing
+Long-prefill expert staging, on under EP whenever owner-routed prefill is admitted on gfx1201, admits the existing
 `HIPFIRE_QWEN4_EXPERT_STAGE` pipeline under expert parallelism. It is gfx1201
 only: on gfx1100 a rank logs `qwen4 EP rank r/n: expert staging not admitted
 (needs gfx1201)` and builds nothing. Each rank
@@ -783,12 +858,10 @@ not once per tile. A load without lanes is unchanged.
 
 **Native-MTP lanes (`--spec mtp`, `serve.batch_spec`) take the decoupled reserve like the AR lanes.** The load charges the
 mixed store (`ep_lane_store_device_bytes_mixed`: the first 3 slots with MTP state, the rest AR-only) to the decoupled census
-and takes the plan when it holds more resident layers than the ordinary lane placement. `HIPFIRE_EP_MTP_RESERVE_SHARE=0` is
-the kill switch: the MTP store then keeps the ordinary reserve plus the mixed store (the load logs `qwen4 EP reserve
-decoupling: not applied (native-MTP EP lanes are staged ... HIPFIRE_EP_MTP_RESERVE_SHARE=0 ...)`; 25 resident layers at the
-defaults), and a spec store that still reaches a reserve-sharing load is refused at staging with a label (`native-MTP lanes
-are refused on an EP reserve-sharing load`) and the daemon stages AR lanes instead (`spec=off (...)`). Without `--spec mtp`,
-or with `HIPFIRE_EP_MTP_LANES=0`, the lanes are AR lanes.
+and takes the plan when it holds more resident layers than the ordinary lane placement. A native-MTP store on that load
+is admitted only when every mesh window fits the resident scratch bank. A store that does not fit is refused at staging
+with a label, and the daemon stages AR lanes instead (`spec=off (...)`). Without `--spec mtp`, or with
+`HIPFIRE_EP_MTP_LANES=0`, the lanes are AR lanes.
 
 Mesh window phases against the borrow window (a borrowed epoch is only ever opened by a prompt forward of more than 512
 rows, inside `forward_chunk`): the verify (`forward_lanes`) enters through `ep_reserve_lane_step_enter` (restores a dirty
@@ -883,7 +956,14 @@ checkout it builds the binaries, runs one card (`topology.ep = 1`) and N cards
 500 and about 4,400 tokens, 128 greedy tokens, state digests at steps 1, 64 and
 128), and `scripts/fn_ep_compare.py` compares the arms byte for byte: the
 tokens, the rank-0 logits sha256, every peer rank's logits mirror sha256 and
-every rank's state digests must equal the single card's. It then times
+every rank's state digests must equal the single card's. Every oracle arm of
+`--mode ep` and `--mode pp` pins `HIPFIRE_QWEN4_EP_TRUNK_SHARD=0` (the default
+two-gfx1201 EP2 is the TP2 trunk shard, which is not byte-equal to one card by
+design; see [Exactness](#flash-next-ep-enabling-and-status)), and `EXTRA_ENV`
+may not set it. The speed cells and the `--mode reserve` arms clear an inherited
+value and run the shipped default route, so on two gfx1201 cards the timed EP2
+is the shard route; the gate has no arm that compares the shard route with one
+card. It then times
 `hipfire bench --spec off` decode and prefill (3 fresh processes per arm by
 default, arms interleaved). Each arm runs in a private HOME holding only
 `topology.ep` unless `--no-isolate` is given.
@@ -957,12 +1037,8 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 | `HIPFIRE_MESH_TRANSPORT` | Developer-only, Flash-Next PP: how band edges move HC streams: `auto` (default, host-staged), `host` or `peer` (refused) |
 | `HIPFIRE_QWEN4_EP` | `0` forces Flash-Next `topology.ep = 1` (developer kill switch) |
 | `HIPFIRE_EMULATE_GPUS` | Developer-only logical rank aliasing (integer `>=2`); also maps Flash-Next EP rank `r` to physical device `r % count` (see [emulation](#flash-next-qwen4-ep-under-emulation)) |
-| `HIPFIRE_EP_BALANCED_OWNERS` | Flash-Next EP: balanced per-call expert ownership on host-mapped layers (gfx1201 at 2..=4 ranks only; other arches and larger N keep the exact static split); on under EP, exact `0` disables |
-| `HIPFIRE_EP_OWNER_ROUTED_PREFILL` | Flash-Next EP (N = 2..=8): owner-routed prefill chunks on gfx1201 and gfx1100; on under EP, exact `0` disables |
-| `HIPFIRE_EP_EXPERT_STAGE` | Flash-Next EP: long-prefill expert staging (gfx1201 only); on when owner-routed prefill is admitted, exact `0` disables |
 | `HIPFIRE_TP_USE_RCCL` | `0` opts out of RCCL (errors; no host AR yet) |
 | `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path tried before the ROCm root (nixpkgs / split RCCL installs) |
-| `HIPFIRE_PP_PFLASH=1` | **Experimental, generic Qwen3.5 / 3.6 PP only** — the daemon accepts PFlash compose with `pp>1` (not a product default; not route-certified). Flash-Next PP still refuses PFlash |
 | `HIPFIRE_PP_DFLASH=1` | **Experimental, generic Qwen3.5 / 3.6 PP only** — the daemon accepts a DFlash draft field with `pp>1` (cross-card spec generate is **not** fully implemented; see daemon refusal text). Flash-Next PP still refuses DFlash |
 
 Test-only: `HIPFIRE_HAVE_2_GPU`, `HIPFIRE_PP_PARITY_MODEL` (pp_parity harness).
@@ -978,24 +1054,21 @@ string or a blanket “always refuse at load.”
 |---|---|
 | `tp > 1` and `pp > 1` | Error: mutually exclusive |
 | DFlash `draft` set and `HIPFIRE_PP_DFLASH` unset | Error: DFlash requires `pp=1` (daemon, any arch) |
-| DFlash `draft` set and `HIPFIRE_PP_DFLASH=1` | **Experimental exception, generic Qwen3.5 / 3.6 route only:** load may accept; cross-card speculative generate is **not** fully implemented (daemon message states PR2–4 of the hetero PFlash/DFlash plan are incomplete). Not an admission. Flash-Next PP still refuses a draft: `does not support DFlash` |
-| CASK / TriAttention sidecar set | Error: requires `pp=1` (daemon); Flash-Next PP also names it: `does not support CASK` |
-| PFlash drafter / mode on and `HIPFIRE_PP_PFLASH` unset | Error: PFlash requires `pp=1` (daemon, any arch) |
-| PFlash on and `HIPFIRE_PP_PFLASH=1` | **Experimental exception, generic Qwen3.5 / 3.6 route only:** opt-in only; not a product default and not route-certified performance. Flash-Next PP still refuses PFlash: `does not support PFlash` |
+| DFlash `draft` set and `HIPFIRE_PP_DFLASH=1` | **Experimental exception, generic Qwen3.5 / 3.6 route only:** load may accept; cross-card speculative generate is **not** fully implemented (daemon message states cross-card spec-decode is not implemented). Not an admission. Flash-Next PP still refuses a draft: `does not support DFlash` |
 | Non-PP carriers at `pp>1` | Carrier-specific error strings (not one universal quote). Examples at the audited ref: `qwen2: pipeline-parallel (pp>1) unsupported`; `llama:` / `dots_ocr:` / `deepseek4:` / `minimax:` / `lfm2moe:` `pipeline-parallel (pp>1) unsupported` on HFQ (and distinct `safetensors + pp>1 unsupported` on dirs); **`cohere2moe: pp>1 unsupported via registry`** (different wording). |
 | Qwen3.5 **safetensors directory** + `pp>1` | Error: `qwen35: safetensors + pp>1 unsupported` |
 | Qwen3.5 / 3.6 **VL HFQ** + `pp>1` | **Not a hard refuse.** `load_qwen35_pp` is the text HFQ loader only — vision weights are **not** loaded on that path, so VL artifacts **silently become text-only** under PP. Serve real VL at `pp=1`. |
 | `hipfire bench --matrix` on a multi-GPU load (PP, TP or EP) | **Not a refusal.** The synthetic `bench_prefill` / `bench_decode` rows run on every topology `serve` admits (the earlier `bench_prefill requires a single-GPU model (pp=1, non-EP)` refusal is gone) and the JSON reports the loaded `topology` as `{pp, tp, ep, cards}` from the daemon's own answers. Rows are synthetic token ids (no prompt, speculation or HTTP path); time a real prompt with `hipfire bench --prompt-file`. See [CLI.md](CLI.md#bench-matrix-topology) |
 | Raon-1-mini `pp>1` | HFQ only. A DFlash draft or speculation request is refused at admission (`raon1_mini: topology.pp = N does not run speculation ...`); the session cache is not attached; `tp > 1` and `topology.ep > 1` get the uniform sentences. Full list in [Raon-1-mini pipeline parallelism](#raon-1-mini-pipeline-parallelism) |
-| Flash-Next (Qwen4) `pp>1`, unsupported options | `qwen4: pipeline parallelism (topology.pp = N) does not support <subject>; drop the option or set topology.pp = 1`, subjects: DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, PFlash, an experts-per-token override, a non-Single compute placement, the MTP n-gram modifier. Full list: [refusals](#flash-next-pipeline-parallelism-host-staged) |
+| Flash-Next (Qwen4) `pp>1`, unsupported options | `qwen4: pipeline parallelism (topology.pp = N) does not support <subject>; drop the option or set topology.pp = 1`, subjects: DFlash, DSpark, n-gram drafting, adaptive KV, an EAGLE drafter, an experts-per-token override, a non-Single compute placement, the MTP n-gram modifier. Full list: [refusals](#flash-next-pipeline-parallelism-host-staged) |
 | Flash-Next (Qwen4) `pp>1`, environment and config requests | Same sentence with subjects host-mapped routed experts (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`), the expert hotset, expert staging, session snapshots, the session cache disk tier, the NPU trunk |
 | Flash-Next (Qwen4) `pp>1`, mesh, bands and budget | Refused before any allocation, naming `topology.pp`: pp outside `2..=8` or `tp`/`ep` ≠ 1, `HIPFIRE_EMULATE_GPUS`, too few visible devices, unknown PCI identity, an arch other than gfx1100/gfx1201, mixed arches, `HIPFIRE_MESH_TRANSPORT=peer`, a bad `HIPFIRE_PP_LAYERS`, a band that does not fit its card |
-| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`), for greedy requests and for sampled requests with the default Leviathan verify and neutral penalties; penalized requests, `HIPFIRE_MTP_SAMPLED=0` and `HIPFIRE_MTP_SAMPLED_MODE=naive` sampled requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree stay refused. fn-lanes under PP are AR lanes only: native-MTP lanes are not staged ([fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep)) |
+| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`), for greedy requests and for sampled requests with the default Leviathan verify and neutral penalties; penalized requests and `HIPFIRE_MTP_SAMPLED_MODE=naive` sampled requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram stay refused. fn-lanes under PP are AR lanes only: native-MTP lanes are not staged ([fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep)) |
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, `ep` above 8, an
 arch other than gfx1100/gfx1201, mixed arches, too few devices, missing peer
-access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/CASK/PFlash/Redline,
+access, DFlash/DSpark/n-gram/adaptive KV/drafters/Redline,
 `HIPFIRE_MTP_SAMPLED_MODE=naive`): see
 [Flash-Next EP: enabling and status](#flash-next-ep-enabling-and-status).
 
@@ -1357,21 +1430,20 @@ measurement, is expected to land on `25,23` at chunk 256.
   contract is the single-card native-MTP result (tokens, window records, canonical
   state including the MTP head); qualify each hardware cell with `--mtp` in the gate below.
 - **Sampled native MTP (Leviathan) with neutral penalties** runs on the mesh with
-  the same route as greedy MTP: temperature > 0 requests (the default
-  `speculation.mtp_sampled`, `HIPFIRE_MTP_SAMPLED_MODE` unset or `leviathan`)
+  the same route as greedy MTP: temperature > 0 requests (with
+  `HIPFIRE_MTP_SAMPLED_MODE` unset or `leviathan`)
   draft from the head's re-scored candidates, verify through the same
   `[seed, drafts...]` block and accept by speculative rejection sampling, so the
   emitted stream equals PP AR in distribution (not bit-for-bit; the sampled-MTP
   chi-square oracle `sampled_mtp_distribution_hw` runs it with
   `HIPFIRE_SAMPLED_MTP_TOPOLOGY=pp2`). Every draft and target-row read goes
   through the output band's device. **Penalized sampled requests**
-  (repeat/presence/frequency), `HIPFIRE_MTP_SAMPLED_MODE=naive` (its draws come
-  from the process-wide AR sampler) and `HIPFIRE_MTP_SAMPLED=0`
-  (`speculation.mtp_sampled = false`, the kill switch) decode **AR** on the mesh
+  (repeat/presence/frequency) and `HIPFIRE_MTP_SAMPLED_MODE=naive` (its draws come
+  from the process-wide AR sampler) decode **AR** on the mesh
   instead of failing, as do penalized greedy requests. MTP sessions are not
   distributed: a native-MTP request on the mesh never reuses a session snapshot
   and publishes none. A speculative request that still reaches the mesh with
-  DFlash/DSpark/n-gram/DDTree, KV eviction or a checkpoint resume is refused
+  DFlash/DSpark/n-gram or a checkpoint resume is refused
   before any state changes.
 
 #### Refusals
@@ -1386,11 +1458,8 @@ within the environment rows, the first match wins.
 | DFlash | a draft path or DFlash speculation is requested |
 | DSpark | DSpark speculation is requested |
 | n-gram drafting | n-gram drafting is requested |
-| DDTree | DDTree is requested |
 | adaptive KV | `kv_adaptive` is on |
 | an EAGLE drafter | a drafter model (`params.drafter`) is given |
-| CASK | a CASK / TriAttention sidecar is given |
-| PFlash | PFlash is requested |
 | an experts-per-token override | an experts-per-token override is given |
 | a non-Single compute placement | a compute placement other than `single` is given |
 | the MTP n-gram modifier (speculation.mtp_ngram = on; leave it auto or off) | native MTP is on and `speculation.mtp_ngram = on`; `auto` and `off` are accepted and build no n-gram pool |
@@ -1458,7 +1527,7 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   thread enqueues every group's launches without blocking on a sender, so the
   receiver band's kernels are already queued when the edge event fires
   (`HIPFIRE_PP_LANE_EDGE_HOST_WAIT=1` restores the host `hipEventSynchronize`
-  per edge; `HIPFIRE_PP_LANE_OVERLAP=0` selects the sequential band walk). Prompt
+  per edge). Prompt
   tiles run as singleton PP tiles. Per-step token staging uses pinned host
   memory with event-fenced asynchronous uploads; it must stay byte-identical
   to a synchronous upload, and no speedup from it is measured or claimed here.
@@ -2076,7 +2145,7 @@ epoch bookkeeping. The decode partials alternate two slots
 (`BoundaryIo::partial_slot`: mixer 0, FFN 1), which selects the alternating
 direct-peer reduction the graph can capture; prefill reuses one partial
 buffer and takes the ordinary protocol. Any other decode (TP4, another pair,
-`HIPFIRE_TP_FULL_GRAPH=0`, `HIPFIRE_GRAPH=0`, a KV eviction offset) decodes
+`HIPFIRE_TP_FULL_GRAPH=0`, `HIPFIRE_GRAPH=0`) decodes
 eager through the executor. Per-segment hipGraphs (one per rank program
 segment between the collectives) measured slower than eager at TP4 on
 gfx1201 (45.99 vs 51.13 tok/s, Qwen3.8-27B) and were removed: TP2 uses the
@@ -2148,9 +2217,9 @@ same-box reference.
 - Generic PP decode is sequential across bands (no async multi-band pipeline /
   per-band graph capture as a documented product path); Flash-Next PP pipelines
   prefill chunks across its bands.
-- `HIPFIRE_PP_PFLASH` / `HIPFIRE_PP_DFLASH` are experimental flags of the generic
-  Qwen3.5 / 3.6 route. They are **not** admissions, are not route-certified
-  performance features, and do not change what Flash-Next PP refuses.
+- `HIPFIRE_PP_DFLASH` is an experimental flag of the generic
+  Qwen3.5 / 3.6 route. It is **not** an admission, is not a route-certified
+  performance feature, and does not change what Flash-Next PP refuses.
 
 ## Memory budget
 
@@ -2162,11 +2231,12 @@ Flash-Next PP uses a per-band budget instead (all-resident bands, each card
 checked against its own free VRAM before allocation); see
 [Per-band memory budget](#per-band-memory-budget).
 
-**Reproduce on your hardware** (2+ visible GPUs, deltanet feature):
+**Reproduce on your hardware** (2+ visible GPUs; the probe is a `saddle-lab`
+example, built with that crate's default features, and allocates Q8 KV):
 
 ```sh
-HIP_VISIBLE_DEVICES=0,1 cargo run --release --features deltanet \
-  -p hipfire-runtime --example pp2_vram_probe -- \
+HIP_VISIBLE_DEVICES=0,1 cargo run --release -p saddle-lab \
+  --example pp2_vram_probe -- \
   ~/.hipfire/models/qwen3.5-9b.mq4 4096
 ```
 
@@ -2181,8 +2251,8 @@ fit or speed on other SKUs.
 PP KV policy for Qwen3.5 multi-GPU defaults through `QWEN35_PP_POLICY` (see
 `kv_mode.rs`) — do not assume single-GPU `auto` KV defaults apply unchanged:
 PP and dense TP / MoE EP have no native constructor, so `auto` is `q8/q8` on
-every arch there (gfx1201 included), and PP accepts only `q8`, `fwht2`,
-`fwht3` and legacy `legacy-asym3` K.
+every arch there (gfx1201 included), and PP accepts only `q8`, `fwht2`
+and `fwht3` K.
 
 ## Measured: Flash-Next EP on 2× R9700 (2026-10-13)
 
@@ -2340,12 +2410,16 @@ Retired `scripts/coherence-gate-*.sh` batteries are **not** acceptance for PP
 > **historical**, not evidence for any current route, and are superseded for
 > Flash-Next by the dated [Measured](#measured-flash-next-ep-on-2x-r9700-2026-10-13)
 > section, which is a different model, different cards and 8k to 16k prompts.
+> Their `asym3` KV mode was removed in 0.5.0, and the `pp2_vram_probe`
+> example they cite (then in `hipfire-runtime`) is now
+> `crates/saddle-lab/examples/pp2_vram_probe.rs` (Q8 KV); the current run
+> command is under [Memory budget](#memory-budget).
 
 # Multi-GPU Pipeline-Parallel
 
 **Status:** v1 feature-complete on `feat/multi-gpu-pp` branch — tracking
 issue [#58](https://github.com/warpfront/hipfire/issues/58). Stages
-0–9 of the v2 plan are merged; refusal contracts (DFlash / VL / CASK +
+0–9 of the v2 plan are merged; refusal contracts (DFlash / VL +
 pp>1) are wired and validated. This doc is the source of truth for
 memory budget, deployment recipes, throughput, and known limitations.
 
@@ -2399,6 +2473,8 @@ which carries `output_norm + lm_head`). `total` is the sum across both cards.
 Notes:
 - `qwen3.5:27b mq4` rows use `qwen3.6:27b mq4` as a measurement proxy (same
   `n_layers=64`, `dim=5120`, `head_dim=256`, `n_kv_heads=4` — VRAM-equivalent).
+  `qwen3.6:27b` is retired in 0.5.0 (replacement `qwen3.8:27b`); an existing
+  verified install still loads, so the proxy rows stay valid.
   When `qwen3.5:27b mq4` lands as a downloadable artifact the rows can be
   re-measured directly.
 - `qwen3.6:35b-a3b mq4` is the current-generation A3B; `qwen3.5:35b-a3b mq4`
@@ -2469,8 +2545,7 @@ Direct daemon JSON (driving without the CLI):
 | arch_id ∈ {5, 6} (Qwen3.5 dense + MoE/A3B) | Accepted | Validated end-to-end |
 | arch_id = others (LLaMA / Qwen3) | Refused | Single-GPU only in v1 |
 | VL models (vision_config + vision tensors) | Refused | v1.1 |
-| DFlash draft (`draft` field set) | Refused | v1.1 — see `feedback_cask_mfold_dflash_broken.md` for the v1 ship-blocker |
-| CASK / TriAttention sidecar | Refused | Eviction context is single-device — v1.1 |
+| DFlash draft (`draft` field set) | Refused | v1.1 |
 
 ## Throughput baseline (gfx1100 × 2)
 
@@ -2493,7 +2568,6 @@ v1.1.
 
 Refused at load time:
 - `pp > 1` + DFlash speculative decode
-- `pp > 1` + CASK/TriAttention sidecar (eviction is single-device)
 - `pp > 1` + VL models (vision encoder is single-device)
 - `pp > 1` + arch_id ∉ {5, 6} (LLaMA / Qwen3 dense are pp=1 only)
 
@@ -2522,7 +2596,6 @@ The `pp-gate.sh` battery checks:
 1. Per-token `forward_scratch_multi` ≡ `forward_scratch` bit-exact (pp_parity_chatml)
 2. Daemon `pp=1` ≡ `pp=2` byte-identical with `HIPFIRE_DETERMINISTIC=1` (greedy ChatML)
 3. DFlash + pp=2 refusal at load
-4. CASK + pp=2 refusal at load
 
 A pre-commit hook calls `pp-gate.sh` automatically when staged files
 match the `multi_gpu|pp_|peer_access|pipeline|stages` hotspot regex.

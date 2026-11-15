@@ -106,16 +106,6 @@ fn qwen35_prefill_q4k_q6k_unsupported() {
 
 // ─── Qwen3.5 dispatch constants ───────────────────────────────
 
-#[test]
-fn qwen35_default_kv_mode_is_asym3() {
-    // The daemon defaults to asym3/turbo3 for KV cache.
-    // This is a policy decision in daemon.rs load_model.
-    // The KvCache::new_gpu_asym3_capped sets:
-    //   quantized=true, quant_asym3=true, quant_fwht=false (Givens rotation)
-    let caps = vec![false, false, false, false, true, false, false]; // matches asym3 pattern
-    assert_eq!(caps[4], true); // quant_asym3
-}
-
 // ─── Qwen3.5 MoE dispatch ─────────────────────────────────────
 
 #[test]
@@ -143,7 +133,6 @@ fn mq4_dtypes() -> MoeDtypes<'static> {
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
         routed_has_mixed_experts: false,
-        has_paro_shared: false,
         per_expert_gate_up: None,
         per_expert_down: None,
     }
@@ -170,7 +159,7 @@ fn moe_resolve_k_ne_8_falls_back_to_cpu() {
 
 #[test]
 fn moe_resolve_non_indexable_routed_falls_back() {
-    // Routed gate_up is Q8 (not MQ4/MQ6/Paro) → not indexable.
+    // Routed gate_up is Q8 (not MQ4/MQ6) → not indexable.
     let d = MoeDtypes {
         routed_gate_up: DType::Q8_0,
         routed_down: DType::Q8_0,
@@ -196,32 +185,6 @@ fn moe_resolve_mq6_indexable() {
     assert!(res.use_gpu_topk);
     assert!(res.routed_indexable_mq6);
     assert!(res.routed_indexable());
-}
-
-#[test]
-fn moe_resolve_paro_indexable() {
-    let d = MoeDtypes {
-        routed_gate_up: DType::ParoQ4G128,
-        routed_down: DType::ParoQ4G128,
-        has_paro_shared: true,
-        ..mq4_dtypes()
-    };
-    let res = MoeResolution::resolve(&d, 8);
-    assert!(res.use_gpu_topk);
-    assert!(res.routed_indexable_paro);
-    assert!(res.routed_indexable());
-}
-
-#[test]
-fn moe_resolve_paro_without_sidecar_falls_back() {
-    let d = MoeDtypes {
-        routed_gate_up: DType::ParoQ4G128,
-        routed_down: DType::ParoQ4G128,
-        has_paro_shared: false,
-        ..mq4_dtypes()
-    };
-    let res = MoeResolution::resolve(&d, 8);
-    assert!(!res.use_gpu_topk, "Paro without sidecar must fall back");
 }
 
 #[test]

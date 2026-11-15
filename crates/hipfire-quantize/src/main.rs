@@ -26,7 +26,6 @@ mod model_filter;
 mod pipeline;
 mod pipeline_deepseek;
 mod pipeline_flux;
-mod pipeline_gguf;
 mod pipeline_maple;
 mod ple_hot_pack;
 mod ple_hot_rank;
@@ -39,6 +38,7 @@ mod quant_q4;
 mod qwen4;
 mod raon;
 mod reap_overlay;
+mod removed_formats;
 mod trunk_overlay;
 
 fn main() {

@@ -111,6 +111,3 @@ required-features = ["lab"]
 name = "ep_deepseek4"
 required-features = ["lab"]
 
-[[example]]
-name = "ep_dspark_topology_probe"
-required-features = ["lab"]

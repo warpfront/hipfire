@@ -33,7 +33,6 @@ class Daemon:
             HIPFIRE_REPLAY_BACKEND="shadow",
             HIPFIRE_REPLAY_MANUAL_CAPTURE="1",
             HIPFIRE_KV_MODE=kv_mode,
-            HIPFIRE_CASK_OFF="1",
             HIPFIRE_AR_GRAPH="0",
             HIPFIRE_GRAPH="0",
             HIPFIRE_REDLINE_DISPATCH_PROFILE="0",

@@ -73,7 +73,6 @@ pub enum RailgunRefusal {
     KvNotFp8,
     DraftNotFixed16,
     DraftNotAllSliding,
-    TreeVerify,
     RetainedPm4,
     OnlineTune,
     // per window
@@ -91,13 +90,6 @@ pub enum RailgunRefusal {
     LookupProbe,
     ColdSeedOrRebuild,
     ShapeNotWarm,
-    /// `Whole16` only: the verify's GDN requant reads the stochastic-rounding
-    /// frame (Q8 state, EF off), and the incumbent HIP-graph verify bakes the
-    /// frame at capture (a replay reserves none), so a railgun window cannot
-    /// reproduce its bytes. With EF on the requant is deterministic round-to-
-    /// nearest and ignores the frame (`kernels/src/gated_delta_net_q8.hip:158-163`,
-    /// `gated_delta_net_q8_fast.hip:533-535`); FP32 and Q4 state take no frame.
-    GdnFrameDependent,
     /// The window manifest does not admit this window's node sequence (or its
     /// bind witnesses). Decided on the host right after bind, before anything is
     /// staged, sealed or enqueued, so nothing needs undoing.
@@ -128,7 +120,6 @@ impl RailgunRefusal {
             Self::KvNotFp8 => "kv_not_fp8",
             Self::DraftNotFixed16 => "draft_not_fixed16",
             Self::DraftNotAllSliding => "draft_not_all_sliding",
-            Self::TreeVerify => "tree_verify",
             Self::RetainedPm4 => "retained_pm4",
             Self::OnlineTune => "online_tune",
             Self::Sampling => "sampling",
@@ -145,7 +136,6 @@ impl RailgunRefusal {
             Self::LookupProbe => "lookup_probe",
             Self::ColdSeedOrRebuild => "cold_seed_or_rebuild",
             Self::ShapeNotWarm => "shape_not_warm",
-            Self::GdnFrameDependent => "gdn_frame_dependent",
             Self::ManifestRefused => "manifest_refused",
             Self::LoweringSelfCheck => "lowering_self_check",
             Self::SkeletonBuilding => "skeleton_building",
@@ -242,11 +232,6 @@ pub struct WindowFacts {
     pub diagnostics: bool,
     pub ctx_slice: bool,
     pub gdn_tape: bool,
-    /// The target's GDN state requant ignores the stochastic-rounding frame:
-    /// FP32/Q4 state, or Q8 with error feedback on (deterministic rounding).
-    /// False for Q8 with EF off, where the verify's bytes depend on a frame the
-    /// graph bakes and railgun cannot reproduce.
-    pub gdn_frame_independent: bool,
     pub lookup: LookupFacts,
 }
 
@@ -290,7 +275,6 @@ pub fn admit_window(f: &WindowFacts) -> Result<WindowExecution, RailgunRefusal> 
     match f.lookup {
         // The host splice runs the draft segment only: no GDN verify node.
         LookupFacts::TailMayAct => Ok(WindowExecution::HostSplice),
-        _ if !f.gdn_frame_independent => Err(RailgunRefusal::GdnFrameDependent),
         _ => Ok(WindowExecution::Whole16),
     }
 }
@@ -940,7 +924,6 @@ fn hip_label(why: RailgunRefusal) -> &'static str {
         RailgunRefusal::KvNotFp8 => "hip:kv_not_fp8",
         RailgunRefusal::DraftNotFixed16 => "hip:draft_not_fixed16",
         RailgunRefusal::DraftNotAllSliding => "hip:draft_not_all_sliding",
-        RailgunRefusal::TreeVerify => "hip:tree_verify",
         RailgunRefusal::RetainedPm4 => "hip:retained_pm4",
         RailgunRefusal::OnlineTune => "hip:online_tune",
         RailgunRefusal::Sampling => "hip:sampling",
@@ -957,7 +940,6 @@ fn hip_label(why: RailgunRefusal) -> &'static str {
         RailgunRefusal::LookupProbe => "hip:lookup_probe",
         RailgunRefusal::ColdSeedOrRebuild => "hip:cold_seed_or_rebuild",
         RailgunRefusal::ShapeNotWarm => "hip:shape_not_warm",
-        RailgunRefusal::GdnFrameDependent => "hip:gdn_frame_dependent",
         RailgunRefusal::ManifestRefused => "hip:manifest_refused",
         RailgunRefusal::LoweringSelfCheck => "hip:lowering_self_check",
         RailgunRefusal::SkeletonBuilding => "hip:skeleton_building",
@@ -1071,7 +1053,6 @@ mod tests {
             diagnostics: false,
             ctx_slice: false,
             gdn_tape: true,
-            gdn_frame_independent: true,
             lookup: LookupFacts::None,
         }
     }
@@ -1164,10 +1145,6 @@ mod tests {
             (Box::new(|f| f.ctx_slice = true), RailgunRefusal::CtxSlice),
             (Box::new(|f| f.gdn_tape = false), RailgunRefusal::NoGdnTape),
             (Box::new(|f| f.b = 9), RailgunRefusal::BlockNot16),
-            (
-                Box::new(|f| f.gdn_frame_independent = false),
-                RailgunRefusal::GdnFrameDependent,
-            ),
         ];
         for (mutate, want) in cases {
             let mut f = window();

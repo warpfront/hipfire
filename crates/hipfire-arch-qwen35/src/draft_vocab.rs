@@ -393,7 +393,7 @@ fn try_attach(
             output.m, vocab.rows
         ));
     }
-    if output.paro.is_some() || output.row_stride != 0 {
+    if output.row_stride != 0 {
         return Err(format!(
             "{:?} lm_head has no plain row layout",
             output.gpu_dtype
@@ -454,7 +454,6 @@ fn try_attach(
         m: k,
         k: output.k,
         row_stride: 0,
-        paro: None,
         awq_scale: None,
         lloyd_lut_e4m3: output.lloyd_lut_e4m3,
         lloyd_lut_f16: output.lloyd_lut_f16,

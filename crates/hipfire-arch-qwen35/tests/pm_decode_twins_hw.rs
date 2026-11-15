@@ -24,7 +24,7 @@
 //!
 //! ```bash
 //! HIPFIRE_REPLAY_BACKEND=shadow HIPFIRE_REPLAY_MANUAL_CAPTURE=1 HIPFIRE_GRAPH=0 \
-//! HIPFIRE_AR_GRAPH=0 HIPFIRE_CASK_OFF=1 \
+//! HIPFIRE_AR_GRAPH=0 \
 //! PMDT_MODEL=/abs/model.mq4-xts PMDT_OUT=/abs/oracle-inputs \
 //! cargo test --release -p hipfire-arch-qwen35 --test pm_decode_twins_hw -- --ignored --nocapture
 //! ```
@@ -278,7 +278,6 @@ fn capture_w1_decode_inputs() {
         } = &mut slot;
         qwen35::forward_prefill_batch(
             &mut gpu, weights, config, &prompt, 0, kv_cache, dn_state, scratch, None, None, None,
-            None,
         )
         .expect("prefill");
         qwen35::forward_scratch(

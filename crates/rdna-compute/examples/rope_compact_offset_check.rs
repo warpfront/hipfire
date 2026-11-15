@@ -4,7 +4,7 @@
 
 // H4 verification: the batched RoPE `pos_offset` param (carries
 // kv_cache.compact_offset) must rotate at ABSOLUTE phase = positions[b] + offset.
-// Proves, without needing a CASK-eviction setup:
+// Proves, without needing an eviction setup:
 //   T1 (offset applied / equivalence): batched(positions=[K..K+B], offset=0)
 //        == batched(positions=[0..B], offset=K)   — both rotate at K..K+B.
 //   T2 (matches the absolute-phase reference): batched(B=1, positions=[0], offset=K)

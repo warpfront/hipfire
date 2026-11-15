@@ -206,7 +206,6 @@ def test_serve_patterns_positive():
         "crates/hipfire-runtime/src/dspark_core.rs",
         "crates/hipfire-runtime/src/spec.rs",
         "crates/hipfire-runtime/src/reset_core.rs",
-        "crates/hipfire-runtime/src/triattn.rs",
         "crates/hipfire-arch-qwen35/src/qwen35/serve.rs",
         "crates/hipfire-arch-qwen35/src/foo/serve_engine.rs",
         "crates/hipfire-arch-llama/src/bar/generate_utils.rs",

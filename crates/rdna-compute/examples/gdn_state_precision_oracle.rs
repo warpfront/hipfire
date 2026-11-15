@@ -88,23 +88,27 @@
 //!
 //! * `keep == rows`: all-accept commit, candidate alone, the residual is
 //!   kept (no reset);
-//! * `keep == 0`: candidate, then the live-residual reset
-//!   `gdn_q8ef_residual_zero` (the source slot is the restore target);
-//! * `0 < keep < rows`: candidate, `gated_delta_rollback_layers` with format
-//!   `q8_ef` (the plain-Q8 replay of the ring), then the residual reset.
+//! * `keep == 0`: candidate, then the restore of the ENTRY residual into the
+//!   candidate owner (the source slot is the restore target; a restore never
+//!   zeroes the residual);
+//! * `0 < keep < rows`: candidate, the entry-residual restore, then
+//!   `gated_delta_rollback_layers_ef` (the residual-preserving replay of the
+//!   kept rows with the capture kernel). Nothing is reset afterwards.
 //!
 //! HARD checks for `q8_ef` (any failure exits 1): (a) the candidate run twice
 //! from the identical source slot and residual is byte-identical in outputs,
 //! final ring slot, rollback target and live residual (same-route
 //! determinism); (b) the live source slot is byte-unchanged; (c) no ring slot
 //! of the candidate view other than the final slot (and the rollback target)
-//! is written (poison check of the whole view); (d) after keep `< rows` the
-//! live residual is exactly zero and the rollback target equals the second
-//! identical run; (e) after keep `== rows` the live residual equals the
+//! is written (poison check of the whole view); (d) after keep `== 0` the
+//! live residual equals the entry residual byte for byte, and after
+//! `0 < keep < rows` the rollback target, residual and discarded outputs equal
+//! a candidate capture of only the `keep` rows (the replay's definition) and
+//! the second identical run; (e) after keep `== rows` the live residual equals the
 //! capture's final residual (kept, not zeroed); (f) no non-finite output,
 //! state (decoded) or residual; (g) with `--graph 1` the captured and
-//! replayed graph (candidate; candidate + reset; candidate + rollback +
-//! reset, the reset dispatch inside the capture) reproduces the eager bytes.
+//! replayed graph (candidate; candidate + restore; candidate + restore +
+//! rollback, the restore copy inside the capture) reproduces the eager bytes.
 //! Every case also requires the candidate outputs and final slot to equal the
 //! window's candidate-alone capture (same route, same history) and the
 //! capture to have written the residual.
@@ -145,9 +149,9 @@
 use hip_bridge::KernargBlob;
 use rdna_compute::prefill_invariant::{FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
 use rdna_compute::tensor_ops::{
-    gated_delta_rollback_layers, gated_delta_step, gated_delta_step_batched,
-    gdn_q8ef_residual_zero, GatedDeltaRollbackLayers, GatedDeltaStep, GatedDeltaStepBatched,
-    GdnStateFormat,
+    copy_regions, gated_delta_rollback_layers, gated_delta_rollback_layers_ef, gated_delta_step,
+    gated_delta_step_batched, CopyRegion, GatedDeltaRollbackEf, GatedDeltaRollbackEfLayer,
+    GatedDeltaRollbackLayers, GatedDeltaStep, GatedDeltaStepBatched, GdnStateFormat,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::json;
@@ -941,6 +945,8 @@ struct Rig {
     /// q8_ef: the candidate owner's live F16 residual (a capture leaves its
     /// final residual here; the reset kernel zeroes it).
     ef_cand: Option<GpuTensor>,
+    /// q8_ef: the window's ENTRY residual (the restore source).
+    ef_entry: Option<GpuTensor>,
 }
 
 impl Rig {
@@ -965,6 +971,7 @@ impl Rig {
         ];
         if format.has_residual() {
             let residual_units = format.residual_units(VH, HD, HD);
+            specs.push((residual_units, DType::F16));
             specs.push((residual_units, DType::F16));
             specs.push((residual_units, DType::F16));
         }
@@ -1004,6 +1011,7 @@ impl Rig {
         let dec = next();
         let ef_ar = format.has_residual().then(&mut next);
         let ef_cand = format.has_residual().then(&mut next);
+        let ef_entry = format.has_residual().then(&mut next);
         let table = next();
         Ok(Self {
             format,
@@ -1023,6 +1031,7 @@ impl Rig {
             dec,
             ef_ar,
             ef_cand,
+            ef_entry,
         })
     }
 
@@ -1044,9 +1053,18 @@ impl Rig {
             .ok_or_else(|| format!("format {} has no candidate residual", label(self.format)))
     }
 
+    /// The window's entry residual (q8_ef only).
+    fn ef_entry_tensor(&self) -> Res<&GpuTensor> {
+        self.ef_entry
+            .as_ref()
+            .ok_or_else(|| format!("format {} has no entry residual", label(self.format)))
+    }
+
     fn free(self, gpu: &mut Gpu) -> Res<()> {
         let mut first = None;
-        let residuals = [self.ef_ar, self.ef_cand].into_iter().flatten();
+        let residuals = [self.ef_ar, self.ef_cand, self.ef_entry]
+            .into_iter()
+            .flatten();
         for tensor in [
             self.ring,
             self.ar_state,
@@ -1160,6 +1178,39 @@ fn launch_rollback(
     start: usize,
     kernels: &mut BTreeSet<String>,
 ) -> Res<()> {
+    if rig.format == GdnStateFormat::Q8Ef {
+        // A Q8Ef rollback replays the kept rows from the entry residual with the
+        // capture kernel's residual-fed boundary and preserves the residual; the
+        // plain-Q8 single-launch replay refuses Q8Ef. The caller owns restoring the
+        // entry residual into the candidate plane before this launch.
+        gpu.set_wide_verify_rows(rig.ring_rows);
+        let residual = rig.ef_cand_tensor()?;
+        let layers = [GatedDeltaRollbackEfLayer {
+            recurrence: &rig.recurrence,
+            ring: &rig.ring,
+            residual,
+        }];
+        ctx(
+            gated_delta_rollback_layers_ef(
+                gpu,
+                &GatedDeltaRollbackEf {
+                    layers: &layers,
+                    discard: &rig.discard.sub_offset(0, keep * VW),
+                    rows,
+                    keep,
+                    from: source,
+                    to: base,
+                    qkv_width: QKV,
+                    key_heads: KH,
+                    value_heads: VH,
+                    position: start + keep - 1,
+                },
+            ),
+            "gated_delta_rollback_layers_ef",
+        )?;
+        observe(gpu, kernels);
+        return Ok(());
+    }
     gpu.set_wide_verify_rows(rig.ring_rows);
     ctx(
         gated_delta_rollback_layers(
@@ -1516,10 +1567,11 @@ enum EfMode {
     /// Candidate alone: the window's capture and `keep == rows` (all-accept
     /// commit: the live residual is kept).
     Capture,
-    /// `keep == 0`: candidate, then the live-residual reset (the source slot
-    /// is the restore target and stays untouched).
+    /// `keep == 0`: candidate, then the entry-residual restore (the source
+    /// slot is the restore target and stays untouched).
     Restore,
-    /// `0 < keep < rows`: candidate, the plain-Q8 rollback, the reset.
+    /// `0 < keep < rows`: candidate, the entry-residual restore, the
+    /// residual-preserving replay of the kept rows.
     Rollback(usize),
 }
 
@@ -1583,12 +1635,23 @@ fn upload_bytes(gpu: &Gpu, tensor: &GpuTensor, data: &[u8]) -> Res<()> {
     ctx(gpu.hip.memcpy_htod(&tensor.buf, data), "upload bytes")
 }
 
-/// The production residual reset (`gdn_q8ef_residual_zero`) of the candidate
-/// owner's live residual.
-fn ef_zero(gpu: &mut Gpu, rig: &Rig, kernels: &mut BTreeSet<String>) -> Res<()> {
+/// The restore of the ENTRY residual into the candidate owner's live
+/// residual (what a state restore / partial rollback does: the residual is
+/// part of the state and is never reset to zero).
+fn ef_restore(gpu: &mut Gpu, rig: &Rig, kernels: &mut BTreeSet<String>) -> Res<()> {
+    let (dst, src) = (rig.ef_cand_tensor()?, rig.ef_entry_tensor()?);
     ctx(
-        gdn_q8ef_residual_zero(gpu, rig.ef_cand_tensor()?),
-        "gdn_q8ef_residual_zero",
+        copy_regions(
+            gpu,
+            &[CopyRegion {
+                dst: &dst.buf,
+                dst_offset: 0,
+                src: &src.buf,
+                src_offset: 0,
+                bytes: RESIDUAL_BYTES,
+            }],
+        ),
+        "copy_regions (entry residual restore)",
     )?;
     observe(gpu, kernels);
     Ok(())
@@ -1604,10 +1667,10 @@ fn ef_launch(
     launch_candidate(gpu, rig, w.source, w.base, w.rows, w.start, kernels)?;
     match mode {
         EfMode::Capture => Ok(()),
-        EfMode::Restore => ef_zero(gpu, rig, kernels),
+        EfMode::Restore => ef_restore(gpu, rig, kernels),
         EfMode::Rollback(keep) => {
-            launch_rollback(gpu, rig, w.source, w.base, w.rows, keep, w.start, kernels)?;
-            ef_zero(gpu, rig, kernels)
+            ef_restore(gpu, rig, kernels)?;
+            launch_rollback(gpu, rig, w.source, w.base, w.rows, keep, w.start, kernels)
         }
     }
 }
@@ -1675,6 +1738,7 @@ fn ef_run_once(
         POISON_STATE,
     )?;
     upload_bytes(gpu, rig.ef_cand_tensor()?, w.residual)?;
+    upload_bytes(gpu, rig.ef_entry_tensor()?, w.residual)?;
     if replayed {
         replay(gpu)?;
     } else {
@@ -1829,15 +1893,13 @@ fn check_ef_snap(
             ));
         }
     }
-    if matches!(mode, EfMode::Restore | EfMode::Rollback(_)) {
-        if let Some(offset) = first_nonzero(&snap.residual) {
-            failures.push(failure(
-                "residual_not_zero",
-                Some(offset / (HD * 2)),
-                offset,
-                "live residual not exactly zero after the reset event",
-            ));
-        }
+    if mode == EfMode::Restore {
+        failures.extend(compare(
+            "residual_not_restored",
+            &snap.residual,
+            residual_in,
+            Some(HD * 2),
+        ));
     }
     if mode == EfMode::Capture
         && first_nonzero(residual_in).is_some()
@@ -1875,6 +1937,35 @@ fn check_ef_snap(
     failures
 }
 
+/// The rollback's replay is the capture kernel over the kept rows from the
+/// entry state: its target slot, residual and discarded outputs equal a
+/// candidate capture of only the `keep` rows (`keepcap`).
+fn check_ef_rollback(snap: &EfSnap, keepcap: &EfSnap, keep: usize) -> Vec<Failure> {
+    [
+        compare(
+            "rollback_vs_keep_capture_slot",
+            &snap.kept,
+            &keepcap.final_slot,
+            None,
+        ),
+        compare(
+            "rollback_vs_keep_capture_residual",
+            &snap.residual,
+            &keepcap.residual,
+            Some(HD * 2),
+        ),
+        compare(
+            "rollback_vs_keep_capture_output",
+            &snap.discard,
+            &keepcap.out[..keep * VW * 4],
+            Some(VW * 4),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// AR-with-EF against the candidate capture (never failing).
 fn ef_capture_diags(cap: &EfSnap, reference: &Reference, rows: usize) -> Vec<Diag> {
     let last = rows - 1;
@@ -1903,16 +1994,21 @@ fn ef_capture_diags(cap: &EfSnap, reference: &Reference, rows: usize) -> Vec<Dia
     ]
 }
 
-/// AR-with-EF after row `keep - 1` against the rollback-plus-reset state
-/// (never failing; expected to differ).
+/// AR-with-EF after row `keep - 1` against the rollback state: slot, residual
+/// and their effective state (never failing).
 fn ef_rollback_diags(snap: &EfSnap, reference: &Reference, keep: usize) -> Vec<Diag> {
     let row = keep - 1;
     vec![
         diag_q8("ar_vs_rollback_slot", &snap.kept, &reference.states[row]),
         diag_effective(
             "ar_vs_rollback_effective_state",
-            &effective_state(&snap.kept, None),
+            &effective_state(&snap.kept, Some(&snap.residual)),
             &effective_state(&reference.states[row], Some(&reference.residuals[row])),
+        ),
+        diag_f16(
+            "ar_vs_rollback_residual",
+            &snap.residual,
+            &reference.residuals[row],
         ),
         diag_f32(
             "ar_vs_rollback_discard",
@@ -2088,6 +2184,13 @@ fn run_cases_ef(
                     mode,
                     Some(&cap),
                 ));
+                if let EfMode::Rollback(keep) = mode {
+                    let wk = EfWindow { rows: keep, ..w };
+                    let (keepcap, keep_failures) =
+                        ef_exec(gpu, rig, &wk, EfMode::Capture, &mut kernels, capture_limit)?;
+                    failures.extend(keep_failures);
+                    failures.extend(check_ef_rollback(&snap, &keepcap, keep));
+                }
                 let diagnostics = match mode {
                     EfMode::Capture => capture_diags.clone(),
                     EfMode::Rollback(keep) => ef_rollback_diags(&snap, &reference, keep),
@@ -2125,7 +2228,7 @@ fn prewarm(gpu: &mut Gpu, rig: &Rig, kernels: &mut BTreeSet<String>) -> Res<()> 
     launch_candidate(gpu, rig, 0, rig.ring_rows, 1, START_POSITION, kernels)?;
     launch_rollback(gpu, rig, 0, rig.ring_rows, 1, 1, START_POSITION, kernels)?;
     if rig.format.has_residual() {
-        ef_zero(gpu, rig, kernels)?;
+        ef_restore(gpu, rig, kernels)?;
     }
     if rig.format.storage() == GdnStateFormat::Q8 {
         gdn_state_convert(
@@ -2539,7 +2642,7 @@ mod tests {
         let cli = parse_args(&[]).unwrap();
         assert_eq!(cli.formats, vec![GdnStateFormat::Q8, GdnStateFormat::F32]);
         assert!(!cli.graph && !cli.all_keeps);
-        assert_eq!(cli.max_rows, 32);
+        assert_eq!(cli.max_rows, WIDE_VERIFY_MAX_ROWS);
         assert_eq!(cli.windows, 3);
         assert_eq!(cli.seed, DEFAULT_SEED);
         assert_eq!(cli.json, None);
@@ -2582,7 +2685,7 @@ mod tests {
             "--windows 1",
             "--windows 0",
             "--max-rows 0",
-            "--max-rows 33",
+            "--max-rows 65",
             "--graph 2",
             "--formats q8,q8",
             "--formats bf16",
@@ -2791,10 +2894,10 @@ mod tests {
                 Vec::new()
             },
             source: q8_slot(3, 0.25),
-            residual: if mode == EfMode::Capture {
-                f16_plane(0x3800)
+            residual: if mode == EfMode::Restore {
+                f16_plane(RESIDUAL_IN)
             } else {
-                vec![0; RESIDUAL_BYTES]
+                f16_plane(0x3800)
             },
             stray: None,
         }
@@ -2862,17 +2965,30 @@ mod tests {
             ["residual_not_kept"]
         );
 
-        // Reset events leave exactly zero.
+        // A restore returns the entry residual, never zero.
         let mut restore = clean_snap(EfMode::Restore);
         restore.residual[RESIDUAL_BYTES - 1] = 1;
         let failures = check(&restore, EfMode::Restore, Some(&cap));
-        assert_eq!(kinds(&failures), ["residual_not_zero"]);
-        assert_eq!(failures[0].byte_offset, RESIDUAL_BYTES - 1);
-        let mut rollback = clean_snap(EfMode::Rollback(2));
-        rollback.residual = f16_plane(0x3800);
+        assert_eq!(kinds(&failures), ["residual_not_restored"]);
+        let mut restore = clean_snap(EfMode::Restore);
+        restore.residual = vec![0; RESIDUAL_BYTES];
         assert_eq!(
-            kinds(&check(&rollback, EfMode::Rollback(2), Some(&cap))),
-            ["residual_not_zero"]
+            kinds(&check(&restore, EfMode::Restore, Some(&cap))),
+            ["residual_not_restored"]
+        );
+        // The rollback equals a capture of the kept rows.
+        let rollback = clean_snap(EfMode::Rollback(2));
+        let mut keepcap = clean_snap(EfMode::Capture);
+        keepcap.final_slot = rollback.kept.clone();
+        keepcap.residual = rollback.residual.clone();
+        keepcap.out = f32_bytes(&vec![0.25; 2 * VW]);
+        let mut rb = clean_snap(EfMode::Rollback(2));
+        rb.discard = f32_bytes(&vec![0.25; 2 * VW]);
+        assert!(check_ef_rollback(&rb, &keepcap, 2).is_empty());
+        keepcap.residual = vec![0; RESIDUAL_BYTES];
+        assert_eq!(
+            kinds(&check_ef_rollback(&rb, &keepcap, 2)),
+            ["rollback_vs_keep_capture_residual"]
         );
         let mut rollback = clean_snap(EfMode::Rollback(2));
         rollback.kept = vec![POISON_STATE; SLOT_BYTES];

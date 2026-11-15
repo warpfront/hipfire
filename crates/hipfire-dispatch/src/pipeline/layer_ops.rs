@@ -19,7 +19,12 @@ use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use crate::types::KernelKey;
+use rdna_compute::gdn_stream::GdnStreamPhase;
 use rdna_compute::qsa_sp_select::QsaSpBlocks;
+use rdna_compute::tensor_ops::gdn_wy_stream::{
+    gdn_wy_stream_append, gdn_wy_stream_seal, wy_stream_admitted, GdnWyAppend, GdnWyCarry,
+    GdnWyEdge, GdnWySeal,
+};
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_params,
     gated_delta_conv_params_batched, gated_delta_conv_params_qknorm_batched,
@@ -50,7 +55,7 @@ use rdna_compute::tensor_ops::{
     gated_delta_step_gate_wmma_qknormed_arena, indexed_attention_cache_append_batch_arena,
     indexed_attention_index_key_append_batch_arena, indexed_attention_norm_rope_batch_arena,
     indexed_attention_rope_table, qsa_core_lanes, qsa_lanes_fuse_enabled, Bf16Arena, GdnCoreLane,
-    GdnCoreRowsLane, QsaCoreLane, QsaOutRotate, QSA_CORE_LANES_MAX, QSA_CORE_LANE_ROWS,
+    GdnCoreRowsLane, QsaCoreLane, QsaOutRotate, QSA_CORE_LANE_ROWS,
 };
 use rdna_compute::{
     DType, Gpu, GpuTensor, TrunkFamily, QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM,
@@ -967,6 +972,41 @@ fn project_trunk_masked_inner(
                     }
                 }
             }
+            // Ordinary prefill: EVERY IU4 trunk projection of a ragged tile (not only the
+            // Z|beta|alpha fold) takes the canonical padded tile, so a row's bytes never depend
+            // on whether it lands in a whole or a partial 128-row tile. A projection that cannot
+            // be padded (output capacity) is an error, never a silent fall to another recipe.
+            if gpu.ordinary_prefill_active() && !gpu.qwen4_trunk_iu4_applies(rows) {
+                if let Some(n_pad) = gpu.qwen4_trunk_iu4_ragged(rows) {
+                    let rest: SmallVec<[usize; 4]> =
+                        mq4.iter().copied().filter(|&j| a4[j] && !done[j]).collect();
+                    if !rest.is_empty() {
+                        // The Z|beta|alpha members project into the fold's full-capacity padded
+                        // planes (their row views hold only `rows`); the rest into their own.
+                        let padded_out = |j: usize| -> &GpuTensor {
+                            match zba.as_ref().and_then(|f| f.padded_outputs.map(|p| (f, p))) {
+                                Some((f, [y_z, y_beta, y_alpha])) if j == f.z => y_z,
+                                Some((f, [y_z, y_beta, y_alpha])) if j == f.beta => y_beta,
+                                Some((f, [y_z, y_beta, y_alpha])) if j == f.alpha => y_alpha,
+                                _ => projections[j].1,
+                            }
+                        };
+                        let padded: SmallVec<[(&GpuTensor, usize, &GpuTensor); 4]> = rest
+                            .iter()
+                            .map(|&j| (projections[j].0.buf, projections[j].0.m, padded_out(j)))
+                            .collect();
+                        if !hip(gpu.qwen4_trunk_set_ragged(input, rows, n_pad, k, &padded))? {
+                            return Err(DispatchError::Hip(format!(
+                                "ordinary prefill: ragged IU4 projection of {rows} rows (padded {n_pad}) \
+                                 has no dedicated padded output extent"
+                            )));
+                        }
+                        for j in rest {
+                            done[j] = true;
+                        }
+                    }
+                }
+            }
             if !dense.is_empty() {
                 let reservation = hip(gpu.reserve_int4_mmq(k, rows))?;
                 let prepared =
@@ -1152,11 +1192,13 @@ fn project_rotated(
         return Ok(());
     }
     // Few-row Q8F16 (2..=`few_row_limit` route rows) where the multi-row hipcc kernels exist
-    // (gfx1100 / gfx1201): `gemv_q8_0_rows_exact`, each output row bitwise the rows == 1
+    // (gfx1100 / gfx1201, and gfx1151 at K > 1536 with its `gemv_q8_0_rows` tile):
+    // `gemv_q8_0_rows_exact`, each output row bitwise the rows == 1
     // `gemv_q8_0` decode singleton, weights read once per group of rows. This is the Q8 twin of
     // the MQ6 / MQ4 few-row arms below and what the lane (once-over-all-rows) QSA in / out
-    // stages bind for a Q8F16 trunk-overlay projection. gfx1151 keeps its staged-rows decode
-    // kernels in `gemm_q8_0_batched_f32_chunked`; larger row counts keep the batched GEMM.
+    // stages bind for a Q8F16 trunk-overlay projection. gfx1151 at K <= 1536 keeps its
+    // staged-rows decode kernels in `gemm_q8_0_batched_f32_chunked`; larger row counts keep the
+    // batched GEMM.
     if weight.dtype == DType::Q8_0
         && (2..=gpu.few_row_limit()).contains(&route)
         && rdna_compute::gemv::q8_0_rows_exact_route(&gpu.arch, weight.k)
@@ -1256,6 +1298,18 @@ fn project_rotated(
     hip(result)
 }
 
+/// `HIPFIRE_QWEN4_G942_FOLD_ELEM` (read once; default on, the Route-A twin of
+/// `kernels/src/qwen4_g942_glue_elem.hip` is sealed; `=0` off): the gfx942 C1
+/// elementwise folds. Today: the HC read's few-row down GEMM carries its activation
+/// chain (`bf16_roundtrip_f32`, `scale_f32`, `bf16_roundtrip_f32`, `silu_f32`,
+/// `bf16_roundtrip_f32`) as its output epilogue, six launches to one, bitwise.
+fn g942_fold_elem() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_QWEN4_G942_FOLD_ELEM", true)
+    });
+    *ON
+}
+
 /// `HIPFIRE_G942_TRUNK_GEMV=1` (read once): on gfx942, one-row BF16 trunk
 /// projections keep the legacy GEMV arm instead of the MFMA GEMM.
 fn g942_trunk_gemv() -> bool {
@@ -1263,6 +1317,39 @@ fn g942_trunk_gemv() -> bool {
         hipfire_config::developer_bool("HIPFIRE_G942_TRUNK_GEMV", false)
     });
     *OPT_OUT
+}
+
+/// Whether a BF16-weight projection on this device is bitwise independent of its batch rows
+/// between one row and a few rows (up to 16): exact gfx942 on the MFMA trunk route
+/// ([`g942_trunk_mfma_route`]), i.e. unless `HIPFIRE_G942_TRUNK_GEMV=1` keeps the legacy GEMV
+/// arm at one row. Callers that run one op over `n` lanes' rows in place of `n` one-row ops
+/// (batched MTP head rounds) ask this before relying on that.
+pub fn g942_bf16_few_rows_invariant(gpu: &Gpu) -> bool {
+    gpu.arch_caps.is_gfx942() && !g942_trunk_gemv()
+}
+
+/// `HIPFIRE_G942_ROWS16_CHAIN` (read once, default on; `=0` kills): on gfx942,
+/// a BF16 projection of more than 16 rows takes ⌈rows/16⌉ chained few-row
+/// launches instead of the 32-row-tile entry while the shape's
+/// `rdna_compute::cdna::gfx942::rows16_chain_max_rows` admits it. Same bytes
+/// either way (row-invariant MFMA chain).
+fn g942_rows16_chain() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_G942_ROWS16_CHAIN", true)
+    });
+    *ON
+}
+
+/// `HIPFIRE_G942_BF16_WIDE` (read once, default on; `=0` kills): on gfx942, a BF16
+/// projection group of 17.. rows takes the wide entry (`Gpu::gemm_bf16_mfma_gfx942_wide`, one
+/// weight pass per 64 rows) while `rdna_compute::cdna::gfx942::wide_max_rows` admits any of its
+/// members, ahead of the rows16 chain. Same bytes either way (row-invariant MFMA chain; Tier C
+/// `qwen4_gemm_bf16_mfma_gfx942_wide`, rows 1..=64 / 65 / 257 / 1025 on every trunk shape; model
+/// prefill logits and states byte-equal with the switch on and off).
+fn g942_bf16_wide() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G942_BF16_WIDE", true));
+    *ON
 }
 
 /// Whether a BF16-weight projection takes the gfx942 MFMA GEMM
@@ -1335,8 +1422,24 @@ fn project_g942_mfma(
         require_tensor(out, elements, out.dtype, "gfx942 trunk output")?;
         outputs.push(view(out, 0, elements));
     }
-    // Few rows: the whole group, four members per launch, on the fused entry.
-    let x = view(input, 0, n);
+    // Few rows (and, past 16, the wide entry or the per-shape rows16 chain):
+    // the whole group, four members per launch, on the fused entry. A wide
+    // or chain launch stages an F32 activation to BF16 once (the bytes the
+    // in-kernel staging produces): otherwise every 16-row chain launch
+    // re-reads its F32 rows per workgroup and the wide entry converts them
+    // in each workgroup.
+    let chain = g942_rows16_chain();
+    let wide = g942_bf16_wide();
+    let mut staged: Option<GpuTensor> = None;
+    if (chain || wide) && rows > 16 && input.dtype == DType::F32 {
+        let mut scratch = hip(gpu.qwen4_f16_x_scratch(n))?;
+        scratch.dtype = DType::BF16;
+        hip(gpu.convert_f32_to_bf16(input, &scratch, n))?;
+        staged = Some(scratch);
+    }
+    let x = staged
+        .as_ref()
+        .map_or_else(|| view(input, 0, n), |s| view(s, 0, n));
     let mut fused: SmallVec<[bool; 4]> = SmallVec::from_elem(false, group.len());
     for (chunk, members) in group
         .chunks(rdna_compute::gemm::GEMM_BF16_MFMA_ROWS16_MAX_MEMBERS)
@@ -1354,11 +1457,10 @@ fn project_g942_mfma(
                 )
             })
             .collect();
-        if hip(gpu.gemm_bf16_mfma_gfx942_rows16(&x, &launch, k, rows))? {
+        if hip(gpu.gemm_bf16_mfma_gfx942_rows16_chain(&x, &launch, k, rows, chain, wide))? {
             fused[base..base + members.len()].fill(true);
         }
     }
-    let mut staged: Option<GpuTensor> = None;
     // The registered `KernelKey::GemmBf16Mfma` entry (arch-gated to gfx942 by
     // the registry; refuses a non-BF16 activation), not a direct launch.
     let ctx = DispatchCtx::new(gpu);
@@ -1864,6 +1966,25 @@ fn execute_hyper_read_hc8_decode(
     ))
 }
 
+/// G12 input: whether the gfx942 wide-verify HC read stages its down projection's BF16 activation
+/// from the norm launch itself (rows > 16, BF16 down weight on the MFMA route, no calibration tap
+/// and no banded weight: the tap needs the F32 rows and a banded weight reads F32).
+fn g942_hc_down_stages_bf16(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
+    gpu.arch_caps.is_gfx942()
+        && op.rows > 16
+        && gpu.active_capture.is_none()
+        && op.input_mix_down.dtype == DType::BF16
+        && g942_trunk_mfma_route(
+            true,
+            g942_trunk_gemv(),
+            op.rows,
+            DType::BF16,
+            DType::BF16,
+            DType::F32,
+        )
+        && !super::projection_split::is_split(gpu, &op.input_mix_down, op.rows)
+}
+
 /// `normalized_ready`: a preceding fused launch already wrote this read's
 /// single-row `normalized` (see [`execute_hyper_write_then_read`]).
 fn execute_hyper_read_inner(
@@ -1874,6 +1995,32 @@ fn execute_hyper_read_inner(
     paired: Option<&HyperWriteOp<'_>>,
     gates_written: &mut bool,
     prenormed: bool,
+) -> Result<(), DispatchError> {
+    execute_hyper_read_core(
+        gpu,
+        op,
+        normalized_ready,
+        rotate_into,
+        paired,
+        gates_written,
+        prenormed,
+        None,
+    )
+}
+
+/// [`execute_hyper_read_inner`] with `staged_norm`: the BF16 bits of the read's `normalized` rows
+/// a preceding fused launch (`qwen4_g942_hyper_write_norm_bf16x`, only when
+/// [`g942_hc_down_stages_bf16`] held) already stored in the shared activation scratch.
+#[allow(clippy::too_many_arguments)]
+fn execute_hyper_read_core(
+    gpu: &mut Gpu,
+    op: &HyperReadOp<'_>,
+    normalized_ready: bool,
+    rotate_into: Option<&GpuTensor>,
+    paired: Option<&HyperWriteOp<'_>>,
+    gates_written: &mut bool,
+    prenormed: bool,
+    staged_norm: Option<GpuTensor>,
 ) -> Result<(), DispatchError> {
     // The HC8 sidecar (`DType::HC8E4M3Row`, exact gfx1201): decode / verify rows read the E4M3
     // weights through the PeaceMaker `hc8_gemm`; prefill-class rows get exact BF16 operands.
@@ -1938,6 +2085,11 @@ fn execute_hyper_read_inner(
     let wmma_read = f16 && op.low_rank % 16 == 0 && op.low_rank <= 504 && op.hidden % 16 == 0;
     let mut normalized_f16 = None;
     let mut activated = false;
+    // gfx942 C1 fold: the down GEMM already applied the activation chain to `low`.
+    let mut g942_act_folded = false;
+    // gfx942 wide verify (rows > 16, BF16 up weight): the BF16 copy of the activated `low`, which
+    // the up projection reads in place of its own F32 -> BF16 staging.
+    let mut g942_low_staged: Option<GpuTensor> = None;
     // The WMMA read takes `low` as packed BF16, staged in `up` (which that
     // route does not otherwise use).
     let low_bf16 = wmma_read.then(|| {
@@ -2127,20 +2279,72 @@ fn execute_hyper_read_inner(
         ))?;
         activated = true;
     } else {
+        // G12 input: gfx942 wide verify (rows > 16, BF16 down weight). The wide / rows16 down
+        // GEMM reads the activation as BF16, which `project_g942_mfma` stages from the F32
+        // `normalized` with one `convert_f32_to_bf16` launch; `qwen4_g942_hyper_norm_bf16x`
+        // stores those bytes (the values are already BF16-rounded) next to the F32 rows, so the
+        // staging launch drops out. The calibration tap needs the F32 rows and a banded down
+        // weight reads F32.
+        let mut g942_norm_staged: Option<GpuTensor> = staged_norm;
         if !normalized_ready {
-            hip(hyper_norm(gpu, &norm))?;
+            if g942_hc_down_stages_bf16(gpu, op) {
+                let mut scratch = hip(gpu.qwen4_f16_x_scratch(op.rows * wide))?;
+                scratch.dtype = DType::BF16;
+                match gpu.try_gfx942() {
+                    Some(mut device) => hip(device.hyper_norm_bf16x(&norm, &scratch))?,
+                    None => hip(hyper_norm(gpu, &norm))?,
+                }
+                g942_norm_staged = Some(scratch);
+            } else {
+                hip(hyper_norm(gpu, &norm))?;
+            }
         }
-        let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
-        let projected = project_weight(
-            gpu,
-            &op.input_mix_down,
-            &normalized,
-            &low,
-            op.rows,
-            Some(op.rotation),
-        );
-        gpu.prefill_lwmma_dense_hold = held;
-        projected?;
+        // gfx942 C1 fold (`HIPFIRE_QWEN4_G942_FOLD_ELEM`): the few-row down GEMM with the
+        // activation chain below as its epilogue, one launch for the six; bitwise their output.
+        // Past 16 rows (lane steps included) the wide / rows16 GEMM plus the unfused chain runs:
+        // measured at N = 32 on MI300X, 96 HC reads are 6.3 ms that way and 10.1 ms as two 16-row
+        // slices of the fused entry (20 workgroups per slice, launched serially).
+        if g942_fold_elem()
+            && gpu.arch_caps.is_gfx942()
+            && op.rows <= 16
+            && op.input_mix_down.dtype == DType::BF16
+            && normalized.dtype == DType::F32
+            && low.dtype == DType::F32
+            && op.input_mix_down.m == op.low_rank
+            && !(g942_trunk_gemv() && op.rows == 1)
+            && !super::projection_split::is_split(gpu, &op.input_mix_down, op.rows)
+        {
+            gpu.maybe_capture_activation(
+                op.input_mix_down.buf,
+                &normalized,
+                op.rows,
+                op.input_mix_down.k,
+            );
+            if let Some(mut device) = gpu.try_gfx942() {
+                g942_act_folded = hip(device.qwen4_hc_down_act_rows16(
+                    &op.input_mix_down.buf.buf,
+                    &normalized,
+                    &low,
+                    op.input_mix_down.m,
+                    op.input_mix_down.k,
+                    op.rows,
+                    1.0 / op.branches as f32,
+                ))?;
+            }
+        }
+        if !g942_act_folded {
+            let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
+            let projected = project_weight(
+                gpu,
+                &op.input_mix_down,
+                g942_norm_staged.as_ref().unwrap_or(&normalized),
+                &low,
+                op.rows,
+                Some(op.rotation),
+            );
+            gpu.prefill_lwmma_dense_hold = held;
+            projected?;
+        }
     }
     // `activated` implies the gfx11+ route: the down GEMV already applied it.
     if gpu.arch_caps.has_gfx11_plus_simt() {
@@ -2154,31 +2358,63 @@ fn execute_hyper_read_inner(
                 },
             ))?;
         }
-    } else {
-        // The three source BF16 boundaries, each one launch over all rows of
-        // `low`: the round trip is elementwise, so this is bitwise the
-        // per-row launches it replaces. Its BF16 copy is staged in `up`,
-        // which the up projection below overwrites before anything reads it.
+    } else if !g942_act_folded {
         let elements = op.rows * op.low_rank;
-        let mut staging = view(op.up, 0, elements);
-        staging.dtype = DType::BF16;
-        let roundtrip = Bf16Roundtrip {
-            input: &low,
-            scratch: &staging,
-            output: &low,
-            elements,
-        };
-        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
-        hip(scale_f32(
-            gpu,
-            &ScaleF32 {
-                values: &low,
-                scale: 1.0 / op.branches as f32,
-            },
-        ))?;
-        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
-        hip(gpu.silu_f32(&low, &low))?;
-        hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+        // G12 input: gfx942 wide verify. The chain below (three BF16 round trips around the
+        // scale and SiLU) is `hc_activation_fused_f32`'s expression on every element, one launch
+        // over all rows of `low`; with `bf16_out` it writes the BF16 bits the up projection's MFMA
+        // reads (the bytes `convert_f32_to_bf16` stages from the chain's F32 result), so the
+        // up projection skips its own staging launch as well. Six launches become one.
+        // The calibration tap needs the F32 `low` and a banded up weight reads F32.
+        let staged_bf16 = gpu.arch_caps.is_gfx942()
+            && gpu.active_capture.is_none()
+            && op.input_mix_up.dtype == DType::BF16
+            && g942_trunk_mfma_route(
+                true,
+                g942_trunk_gemv(),
+                op.rows,
+                DType::BF16,
+                DType::BF16,
+                DType::F32,
+            )
+            && !super::projection_split::is_split(gpu, &op.input_mix_up, op.rows);
+        if staged_bf16 {
+            let mut scratch = hip(gpu.qwen4_f16_x_scratch(elements))?;
+            scratch.dtype = DType::BF16;
+            hip(hc_activation_fused_f32(
+                gpu,
+                &HcActivationFused {
+                    values: &low,
+                    scale: 1.0 / op.branches as f32,
+                    bf16_out: Some(&scratch),
+                },
+            ))?;
+            g942_low_staged = Some(scratch);
+        } else {
+            // The three source BF16 boundaries, each one launch over all rows of
+            // `low`: the round trip is elementwise, so this is bitwise the
+            // per-row launches it replaces. Its BF16 copy is staged in `up`,
+            // which the up projection below overwrites before anything reads it.
+            let mut staging = view(op.up, 0, elements);
+            staging.dtype = DType::BF16;
+            let roundtrip = Bf16Roundtrip {
+                input: &low,
+                scratch: &staging,
+                output: &low,
+                elements,
+            };
+            hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+            hip(scale_f32(
+                gpu,
+                &ScaleF32 {
+                    values: &low,
+                    scale: 1.0 / op.branches as f32,
+                },
+            ))?;
+            hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+            hip(gpu.silu_f32(&low, &low))?;
+            hip(bf16_roundtrip_f32(gpu, &roundtrip))?;
+        }
     }
     if up_fused {
         // The F16 WMMA route's BF16 WMMA read (not bit-exact, see
@@ -2263,7 +2499,15 @@ fn execute_hyper_read_inner(
         return hip(hyper_read_up_fused(gpu, &read));
     }
     let held = std::mem::replace(&mut gpu.prefill_lwmma_dense_hold, true);
-    let projected = project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation));
+    let up_input = g942_low_staged.as_ref().unwrap_or(&low);
+    let projected = project_weight(
+        gpu,
+        &op.input_mix_up,
+        up_input,
+        &up,
+        op.rows,
+        Some(op.rotation),
+    );
     gpu.prefill_lwmma_dense_hold = held;
     projected?;
     if let Some(rotated) = rotate_into.filter(|r| {
@@ -2666,7 +2910,15 @@ pub fn execute_hyper_write_then_read(
     if write.ar.is_some() {
         return Ok(None);
     }
-    let fusable = (1..=gpu.few_row_limit()).contains(&gpu.route_rows(write.rows))
+    // G12 input: an exact-gfx942 lane step's all-rows HC segment (9..=LANE_ALLROWS_MAX_ROWS rows)
+    // takes the same fused launch as the one-row singleton: `hyper_write_norm_f32` is one block
+    // per (branch, row) and bitwise the separate launches, and the unfused wide route's k4 gates
+    // are the quarters' arithmetic ([`g942_hc_quarters_gates`]), so each row is the singleton's.
+    // The read then rotates nothing ahead (`rotate_into` is dropped below).
+    let lane_wide = gpu.g942_lane_wide_rows(write.rows)
+        && write.rows <= rdna_compute::cdna::gfx942::LANE_ALLROWS_MAX_ROWS
+        && g942_hc_quarters_gates(gpu, write);
+    let fusable = ((1..=gpu.few_row_limit()).contains(&gpu.route_rows(write.rows)) || lane_wide)
         && read.rows == write.rows
         && !write.state_bf16
         && !read.state_bf16
@@ -2682,10 +2934,13 @@ pub fn execute_hyper_write_then_read(
     let rows = write.rows;
     let next_gates = next
         .filter(|(op, _)| {
-            op.block_inject.dtype == DType::BF16
-                && op.block_inject.m == 4
-                && op.block_inject.k == wide
-                && op.block_inject.awq_scale.is_none()
+            hc_quarters_inject_ok(
+                op.block_inject.dtype,
+                op.block_inject.m,
+                op.block_inject.k,
+                op.block_inject.awq_scale.is_some(),
+                wide,
+            )
         })
         .map(|(op, quarters)| HyperNextGates {
             norm_weight: op.norm_weight,
@@ -2708,25 +2963,67 @@ pub fn execute_hyper_write_then_read(
     if quarters_in.is_none() {
         hyper_write_gates(gpu, write, &input, &write_normalized, &gates)?;
     }
-    hip(hyper_write_norm(
+    let fused_write = HyperWrite {
+        input: &input,
+        normalized: &write_normalized,
+        mixed: &mixed,
+        gates: &gates,
+        output: &output,
+        branches: write.branches,
+        hidden: write.hidden,
+        state_bf16: false,
+    };
+    // Lane-wide pairs: the launch also stores the read's `normalized` rows as the BF16 bits its
+    // down projection reads (`qwen4_g942_hyper_write_norm_bf16x`), as the read's own norm does.
+    let mut staged_norm = None;
+    let stage = lane_wide && g942_hc_down_stages_bf16(gpu, read);
+    if stage {
+        let mut scratch = hip(gpu.qwen4_f16_x_scratch(rows * wide))?;
+        scratch.dtype = DType::BF16;
+        match gpu.try_gfx942() {
+            Some(mut device) => hip(device.hyper_write_norm_bf16x(
+                &fused_write,
+                read.norm_weight,
+                &normalized,
+                &scratch,
+                quarters_in,
+                next_gates.as_ref(),
+                clear.as_ref(),
+            ))?,
+            None => hip(hyper_write_norm(
+                gpu,
+                &fused_write,
+                read.norm_weight,
+                &normalized,
+                quarters_in,
+                next_gates.as_ref(),
+                clear.as_ref(),
+            ))?,
+        }
+        staged_norm = Some(scratch);
+    } else {
+        hip(hyper_write_norm(
+            gpu,
+            &fused_write,
+            read.norm_weight,
+            &normalized,
+            quarters_in,
+            next_gates.as_ref(),
+            clear.as_ref(),
+        ))?;
+    }
+    // A lane-wide read rotates nothing ahead: the BF16 trunk weights read `mixed` as it is.
+    let rotate_into = rotate_into.filter(|_| !lane_wide);
+    execute_hyper_read_core(
         gpu,
-        &HyperWrite {
-            input: &input,
-            normalized: &write_normalized,
-            mixed: &mixed,
-            gates: &gates,
-            output: &output,
-            branches: write.branches,
-            hidden: write.hidden,
-            state_bf16: false,
-        },
-        read.norm_weight,
-        &normalized,
-        quarters_in,
-        next_gates.as_ref(),
-        clear.as_ref(),
-    ))?;
-    execute_hyper_read_inner(gpu, read, true, rotate_into, None, &mut false, false)?;
+        read,
+        true,
+        rotate_into,
+        None,
+        &mut false,
+        false,
+        staged_norm,
+    )?;
     Ok(Some(next_gates.is_some()))
 }
 
@@ -2741,6 +3038,114 @@ fn hyper_write_gates_k4(gpu: &Gpu, op: &HyperWriteOp<'_>) -> bool {
             gpu.route_rows(op.rows),
             gpu.few_row_limit(),
         ) == Some(4)
+}
+
+/// The next write's gate weight geometry the fused quarters (and the gfx942 unfused route that
+/// must match them) cover: BF16 `[4, wide]` without an AWQ scale.
+fn hc_quarters_inject_ok(
+    dtype: DType,
+    m: usize,
+    k: usize,
+    has_awq_scale: bool,
+    wide: usize,
+) -> bool {
+    dtype == DType::BF16 && m == 4 && k == wide && !has_awq_scale
+}
+
+/// `HIPFIRE_QWEN4_G942_HC_QUARTERS_GATES` (developer, read once, default on; `=0` restores the
+/// pre-C0 unfused route, whose gates are the BF16 MFMA GEMV's): see [`g942_hc_quarters_gates`].
+fn g942_hc_quarters_gates_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_QWEN4_G942_HC_QUARTERS_GATES", true)
+    });
+    *ON
+}
+
+/// Which row window an exact-gfx942 hyper write's gate projection runs in; the one typed input
+/// of [`g942_hc_quarters_gates_route`] besides the geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum G942HcGateRows {
+    /// `1..=few_row_limit` route rows: decode, few-row verify, and every <= 8-row lane group.
+    FewRow,
+    /// More rows than the few-row window inside an exact-gfx942 lane step
+    /// ([`Gpu::g942_lane_wide_rows`]): the all-rows HC segment. Every row must be bitwise the row
+    /// the one-row singleton (and each <= 8-row group) computes, so it takes the quarters
+    /// arithmetic too.
+    LaneWide,
+    /// Everything else: the ordinary prefill chunk, the invariant profile and the P2 prefill
+    /// wave. Its pinned route is the BF16 MFMA GEMV and must not change.
+    Chunk,
+}
+
+/// Classify a write of `rows` rows. `route_rows` is [`Gpu::route_rows`] of them.
+fn g942_hc_gate_rows(route_rows: usize, few_row_limit: usize, lane_wide: bool) -> G942HcGateRows {
+    if (1..=few_row_limit).contains(&route_rows) {
+        G942HcGateRows::FewRow
+    } else if lane_wide {
+        G942HcGateRows::LaneWide
+    } else {
+        G942HcGateRows::Chunk
+    }
+}
+
+/// Whether the unfused hyper write's gates take the quarters-equivalent route on gfx942.
+///
+/// [`execute_hyper_write_then_read`] fuses the NEXT write's gate quarters into `hyper_write_norm`
+/// whenever the geometry allows (BF16 inject `[4, 4 * 2560]` without AWQ scale, four branches,
+/// hidden 2560, F32 streams, `1..=few_row_limit` route rows); a write that does not get them
+/// (chain broken, a lane segment whose base pointer differs) computes its own gates. The BF16
+/// MFMA GEMV the unfused route takes on gfx942 is not bitwise those quarters, so which gates a
+/// write saw depended on the schedule. On exactly those
+/// geometries the unfused route therefore runs `hyper_norm` and the four-wave k4 gate GEMV
+/// (`gemv_bf16_xf32_k4*`: per branch `gemv_bf16_xf32_row` over K = 2560, folded
+/// `(q0 + q1) + (q2 + q3)`), which is the `hyper_write_norm` quarter code's arithmetic on the same
+/// normalized values. A lane step's all-rows HC segment ([`G942HcGateRows::LaneWide`]) takes it
+/// at any width; the chunk keeps the MFMA route. Any other geometry keeps the MFMA route.
+#[allow(clippy::too_many_arguments)]
+fn g942_hc_quarters_gates_route(
+    caps: &rdna_compute::arch_caps::ArchCaps,
+    enabled: bool,
+    has_ar: bool,
+    inject: (DType, usize, usize, bool),
+    branches: usize,
+    hidden: usize,
+    state_bf16: bool,
+    gates_f32: bool,
+    rows: G942HcGateRows,
+) -> bool {
+    let (dtype, m, k, has_awq_scale) = inject;
+    caps.is_gfx942()
+        && enabled
+        && !has_ar
+        && !state_bf16
+        && branches == 4
+        && hidden == 2560
+        && hc_quarters_inject_ok(dtype, m, k, has_awq_scale, 4 * 2560)
+        && gates_f32
+        && rows != G942HcGateRows::Chunk
+}
+
+fn g942_hc_quarters_gates(gpu: &Gpu, op: &HyperWriteOp<'_>) -> bool {
+    g942_hc_quarters_gates_route(
+        &gpu.arch_caps,
+        g942_hc_quarters_gates_enabled(),
+        op.ar.is_some(),
+        (
+            op.block_inject.dtype,
+            op.block_inject.m,
+            op.block_inject.k,
+            op.block_inject.awq_scale.is_some(),
+        ),
+        op.branches,
+        op.hidden,
+        op.state_bf16,
+        op.gates.dtype == DType::F32,
+        g942_hc_gate_rows(
+            gpu.route_rows(op.rows),
+            gpu.few_row_limit(),
+            gpu.g942_lane_wide_rows(op.rows),
+        ),
+    )
 }
 
 /// Whether the read's row count takes the fused `hyper_norm_gate_k4_outputs_f32` launch: 1..=8
@@ -2811,7 +3216,11 @@ fn hyper_write_gates(
     // Decode and few-row verify (route rows within `few_row_limit`): the gate GEMV splits each row's
     // K across four waves, and a verify row is bitwise the decode row it
     // replaces (greedy MTP == AR depends on it).
-    let k4 = hyper_write_gates_k4(gpu, op);
+    let k4 = hyper_write_gates_k4(gpu, op) || g942_hc_quarters_gates(gpu, op);
+    // Every row of an exact-gfx942 lane step's all-rows segment: the batched tiled k4 launch
+    // (eight-row tiles plus the remainder, each row bitwise the one-row kernel's), whatever
+    // the width. Named here, not left to `gemv_bf16_xf32_k4_rows`' width-keyed pick.
+    let lane_wide_k4 = k4 && gpu.g942_lane_wide_rows(op.rows);
     // Multi-row: one launch normalizes each row into LDS and projects the
     // BF16 gate from there; `normalized` (read by nothing below) is not
     // written.  Bitwise identical to hyper_norm + project_weight.
@@ -2848,7 +3257,17 @@ fn hyper_write_gates(
                 state_bf16: op.state_bf16,
             },
         ))?;
-        if k4 {
+        if lane_wide_k4 {
+            hip(gpu.gemv_bf16_xf32_k4_rows_tiled(
+                op.block_inject.buf,
+                normalized,
+                gates,
+                op.block_inject.m,
+                op.block_inject.k,
+                None,
+                op.rows,
+            ))?;
+        } else if k4 {
             // Four gate rows of K = branches * hidden; four waves per row
             // instead of one.
             hip(gpu.gemv_bf16_xf32_k4_rows(
@@ -2967,6 +3386,141 @@ pub struct GatedDeltaNetOp<'a> {
     pub trunk_a4: u16,
     /// Which part of the mixer this call runs (see [`MixerPhase`]).
     pub phase: MixerPhase,
+    /// The layer's persistent stream carry (`None`: the state carries none).
+    pub carry: Option<GdnCarryView<'a>>,
+}
+
+/// The persistent stream carry of one GDN layer as the dispatch layer consumes
+/// it (CHUNK-CANONICAL-DESIGN §3.3, §3.5): the F32 tile-entry state, the
+/// incomplete tile's pending scan inputs and the host cursor, owned by the
+/// request state, plus the shared replay staging. `stream` is the explicit
+/// ordinary-prefill intent: the op appends to the stream (the C16 WY scan at
+/// absolute tile/seam positions, whatever the call's row count). Every other
+/// op (decode, verify, a state read) is a consumer of the live slot, and an
+/// open stream is sealed before it runs.
+#[derive(Clone, Copy)]
+pub struct GdnCarryView<'a> {
+    pub carry: GdnWyCarry<'a>,
+    pub edge: GdnEdgeView<'a>,
+    pub stream: bool,
+}
+
+/// The shared per-state staging of the layer's stream, by scan algorithm.
+#[derive(Clone, Copy)]
+pub enum GdnEdgeView<'a> {
+    /// gfx11 C16 WY stream: replay staging and the gated-norm stand-in for the seal's
+    /// discarded rows (BF16 `[128]`).
+    Wy {
+        edge: GdnWyEdge<'a>,
+        norm: &'a GpuTensor,
+    },
+    /// gfx1201 dense C64 stream: the F32 widened-constants staging and the edge workspace.
+    /// `carry.tile_entry` is the F32 tile-entry state, `carry.pending_conv` the F32
+    /// `[live ring | tile ring | pending qkv]` plane and `carry.pending_params` the pending
+    /// raw alpha/beta rows ([`rdna_compute::fn_gdn_dense::DenseStreamCarry`]).
+    Scan64 {
+        consts: &'a GpuTensor,
+        ws: &'a rdna_compute::gdn_stream::GdnStreamWorkspace,
+        plan: &'a rdna_compute::gdn_stream::GdnPrefillPlan,
+    },
+}
+
+/// Whether `op` appends to its WY stream: ordinary-prefill intent with a
+/// carry, no row capture, and the static WY admission of the device (never
+/// the call's row count). Recorder/capture runs keep the incumbent route.
+fn gdn_wy_stream_route(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
+    op.carry
+        .as_ref()
+        .is_some_and(|view| view.stream && matches!(view.edge, GdnEdgeView::Wy { .. }))
+        && op.row_capture.is_none()
+        && op.conv_kernel == 4
+        && gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
+        && wy_stream_admitted(gpu, op.key_heads, op.value_heads, op.key_dim, op.value_dim)
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+}
+
+/// Whether `op` appends to its dense C64 (Scan64) stream: ordinary-prefill intent with a
+/// Scan64 carry, no row capture, eager, and the dense scan's static admission (never the
+/// call's row count: a 1-row call appends too). The input projection is F32.
+#[cfg(feature = "deltanet")]
+fn gdn_dense_stream_route(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
+    op.carry
+        .as_ref()
+        .is_some_and(|view| view.stream && matches!(view.edge, GdnEdgeView::Scan64 { .. }))
+        && op.row_capture.is_none()
+        && op.conv_kernel == 4
+        && rdna_compute::fn_gdn_dense::stream_admitted(
+            gpu,
+            op.format,
+            op.key_heads,
+            op.value_heads,
+            op.key_dim,
+            op.value_dim,
+        )
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+}
+
+#[cfg(not(feature = "deltanet"))]
+fn gdn_dense_stream_route(_: &Gpu, _: &GatedDeltaNetOp<'_>) -> bool {
+    false
+}
+
+/// Seal `op`'s open stream (finish the incomplete tile, quantize once at the absolute end)
+/// before a consumer of the live slot runs: the WY or the Scan64 executor by the layer's edge.
+fn seal_open_stream(
+    gpu: &mut Gpu,
+    op: &GatedDeltaNetOp<'_>,
+    view: &GdnCarryView<'_>,
+) -> Result<(), DispatchError> {
+    match view.edge {
+        GdnEdgeView::Wy { edge, norm } => hip(gdn_wy_stream_seal(
+            gpu,
+            &GdnWySeal {
+                state: op.recurrent,
+                format: op.format,
+                residual: op.residual,
+                carry: view.carry,
+                edge: &edge,
+                key_heads: op.key_heads,
+                value_heads: op.value_heads,
+                norm,
+            },
+        )
+        .map(drop)),
+        #[cfg(feature = "deltanet")]
+        GdnEdgeView::Scan64 { consts, ws, plan } => {
+            let sealed = hip(rdna_compute::fn_gdn_dense::stream_seal(
+                gpu,
+                plan,
+                &view.carry.meta.get(),
+                op.key_heads,
+                op.value_heads,
+                op.recurrent,
+                op.residual,
+                op.conv_state,
+                &rdna_compute::fn_gdn_dense::DenseStreamCarry {
+                    tile_entry: view.carry.tile_entry,
+                    conv: view.carry.pending_conv,
+                    params: view.carry.pending_params,
+                },
+                &rdna_compute::fn_gdn_dense::DenseStreamModel {
+                    conv_weight: op.conv,
+                    a_log: op.a_log,
+                    dt_bias: op.dt_bias,
+                    consts,
+                },
+                ws,
+            ))?;
+            view.carry.meta.set(sealed);
+            Ok(())
+        }
+        #[cfg(not(feature = "deltanet"))]
+        GdnEdgeView::Scan64 { .. } => Err(DispatchError::Hip(
+            "Scan64 stream needs the deltanet feature".into(),
+        )),
+    }
 }
 
 /// Where a few-row GDN forward leaves what a later rollback to any accepted
@@ -2995,7 +3549,7 @@ impl GatedDeltaNetOp<'_> {
     /// phase wrote the capture in place). The projection-only phases cannot
     /// honor one (their op carries the capture's `inputs` as `projection`,
     /// never as a `row_capture`).
-    fn check_phase(&self) -> Result<(), DispatchError> {
+    pub(super) fn check_phase(&self) -> Result<(), DispatchError> {
         if matches!(self.phase, MixerPhase::InProj | MixerPhase::OutProj)
             && self.row_capture.is_some()
         {
@@ -3183,7 +3737,7 @@ impl GatedDeltaNetOp<'_> {
 /// gate parameters and gate compute each row as the per-row kernels do, so a
 /// decode row is bitwise the per-row route's, and the step runs as one
 /// launch over all value heads instead of the sequential kernel.
-fn gdn_persistent_batch(gpu: &Gpu, op: &GatedDeltaNetOp<'_>, rows: usize) -> bool {
+pub(super) fn gdn_persistent_batch(gpu: &Gpu, op: &GatedDeltaNetOp<'_>, rows: usize) -> bool {
     gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && (gpu.route_rows(rows) > 1 || gpu.arch_caps.is_gfx942())
         && op.key_dim == 128
@@ -3253,6 +3807,8 @@ fn gdn_dense_qkv_bf16(
         && gdn_persistent_batch(gpu, op, op.rows)
         && !gated_delta_chunk_route(gpu, step)
         && rdna_compute::fn_gdn_dense::applies(gpu, step)
+        // The canonical stream's prep reads the F32 projection.
+        && !gdn_dense_stream_route(gpu, op)
         && mq6_i8_route(gpu, &op.qkv, op.rows)
 }
 
@@ -3634,7 +4190,11 @@ pub fn execute_gated_delta_net_uncovered(
 /// its armed capture ring (the persistent-batch capture route), the latter only
 /// under `HIPFIRE_QWEN4_GDN_LANES_ROWS` ([`rdna_compute::feature_flags::FeatureFlags::qwen4_gdn_lanes_rows_enabled`]).
 pub fn gdn_core_lane_groupable(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
-    op.phase == MixerPhase::Core
+    // An op whose stream is open must run the per-op route, which seals it.
+    !op.carry
+        .as_ref()
+        .is_some_and(|view| view.carry.meta.get().phase == GdnStreamPhase::Open)
+        && op.phase == MixerPhase::Core
         && if op.rows == 1 {
             op.row_capture.is_none() && !gdn_persistent_batch(gpu, op, 1)
         } else {
@@ -3688,6 +4248,13 @@ pub fn execute_gated_delta_net_core_lanes(
     ops: &[&GatedDeltaNetOp<'_>],
     before_launch: impl FnOnce(&mut Gpu) -> Result<(), DispatchError>,
 ) -> Result<bool, DispatchError> {
+    // Exact gfx942: the uncaptured F32 lanes (one-row AR lanes and multi-row prefill lanes) and
+    // the armed verify lanes as batched launches over every lane (`pipeline/gdn.rs`); a group it
+    // declines falls through to the gfx11+ multi-lane kernels below, which refuse it too.
+    let before_launch = match super::gdn::execute_core_lanes_f32_gfx942(gpu, ops, before_launch)? {
+        super::gdn::Gfx942GdnLanes::Done => return Ok(true),
+        super::gdn::Gfx942GdnLanes::Declined(before_launch) => before_launch,
+    };
     let Some(first) = ops.first() else {
         return Ok(false);
     };
@@ -3947,6 +4514,18 @@ fn execute_gated_delta_net_hc_impl(
         op.phase
     };
     let arenas = core_arena(phase, arenas);
+    // Ordinary prefill appends to the layer's stream (C16 WY on gfx11, dense C64 on gfx1201)
+    // at absolute tile and seam positions; any other consumer of the live slot first seals an
+    // open stream (finishes the incomplete tile, quantizes once at the absolute end).
+    let wy_stream = gdn_wy_stream_route(gpu, op) && arenas.is_none();
+    let dense_stream = gdn_dense_stream_route(gpu, op) && arenas.is_none();
+    if !wy_stream && !dense_stream && matches!(phase, MixerPhase::Whole | MixerPhase::Core) {
+        if let Some(view) = op.carry.as_ref() {
+            if view.carry.meta.get().phase == GdnStreamPhase::Open {
+                seal_open_stream(gpu, op, view)?;
+            }
+        }
+    }
     // A row window is a Core launch over rows `[lo, lo + rows)` of a bank whose
     // input projections ran bank-wide: row-shaped inputs are offset by `lo`,
     // scratch only this launch touches starts at row 0, and the stored-layout
@@ -3974,7 +4553,7 @@ fn execute_gated_delta_net_hc_impl(
     let mut beta = view(op.beta, 0, rows * op.value_heads);
     let z = view(op.z_output, lo * value, rows * value);
     let history_rows = op.conv_kernel.saturating_sub(1);
-    let persistent_batch = gdn_persistent_batch(gpu, op, rows);
+    let persistent_batch = gdn_persistent_batch(gpu, op, rows) || wy_stream || dense_stream;
     if arenas.is_some() && (!persistent_batch || op.row_capture.is_some()) {
         return Err(DispatchError::Hip(
             "GDN trunk arena needs batched k4 without row capture".into(),
@@ -4023,7 +4602,7 @@ fn execute_gated_delta_net_hc_impl(
         value_dim: op.value_dim,
         position: core_window_position(op.start_position, window.map(|w| w.lo)),
     };
-    let chunked = persistent_batch && gated_delta_chunk_route(gpu, &dims);
+    let chunked = wy_stream || (persistent_batch && gated_delta_chunk_route(gpu, &dims));
     if chunked && capture.is_some() {
         return Err(DispatchError::Hip(
             "GDN row capture is a few-row verify contract, not the chunked prefill route".into(),
@@ -4166,16 +4745,21 @@ fn execute_gated_delta_net_hc_impl(
         // persistent gfx1201 route) the convolution also stores the normalized
         // Q/K the recurrence reads, so its Q/K columns of `conv_output` are not
         // written and the separate Q/K-norm launch is skipped.
-        let fused_qk =
-            chunked && capture.is_none() && gated_delta_conv_qknorm_route(gpu, &step, &conv);
+        let fused_qk = !wy_stream
+            && chunked
+            && capture.is_none()
+            && gated_delta_conv_qknorm_route(gpu, &step, &conv);
         // gfx1201 FN dense route: its producer replaces the convolution, the
         // gate-parameter pass and the step (the gate below finishes it).
         #[cfg(feature = "deltanet")]
-        let dense = arenas.is_none() && !chunked && rdna_compute::fn_gdn_dense::applies(gpu, &step);
+        let dense = dense_stream
+            || (arenas.is_none() && !chunked && rdna_compute::fn_gdn_dense::applies(gpu, &step));
         #[cfg(not(feature = "deltanet"))]
         let dense = false;
         // Convolution and gate parameters in one launch.
-        if dense {
+        if dense_stream {
+            // The stream's prep owns the convolution, gate parameters, Q/K norm and packing.
+        } else if dense {
             #[cfg(feature = "deltanet")]
             hip(rdna_compute::fn_gdn_dense::run(
                 gpu,
@@ -4235,9 +4819,71 @@ fn execute_gated_delta_net_hc_impl(
             value_heads: op.value_heads,
             value_dim: op.value_dim,
         };
+        // The dense C64 stream appends the rows at absolute tile/seam positions and publishes
+        // exactly them (BF16 scan output in `recurrent_output`, gated below like the
+        // incumbent dense route); the live slot is quantized only at an absolute 512 seam or
+        // the explicit seal. A Sealed cursor is wherever the last prefill left it (decode
+        // does not advance it): the call's start restamps it, like the WY executor opening a
+        // Sealed stream at `start`; an Open cursor must already be at the start.
+        #[cfg(feature = "deltanet")]
+        if let (true, Some(view)) = (dense_stream, op.carry.as_ref()) {
+            if let GdnEdgeView::Scan64 { consts, ws, plan } = view.edge {
+                let next = hip(rdna_compute::fn_gdn_dense::stream_append(
+                    gpu,
+                    plan,
+                    &view.carry.meta.get().begin_append_at(dims.position as u64),
+                    dims.position as u64,
+                    rows,
+                    op.key_heads,
+                    op.value_heads,
+                    op.recurrent,
+                    op.residual,
+                    op.conv_state,
+                    &rdna_compute::fn_gdn_dense::DenseStreamCarry {
+                        tile_entry: view.carry.tile_entry,
+                        conv: view.carry.pending_conv,
+                        params: view.carry.pending_params,
+                    },
+                    &rdna_compute::fn_gdn_dense::DenseStreamModel {
+                        conv_weight: op.conv,
+                        a_log: op.a_log,
+                        dt_bias: op.dt_bias,
+                        consts,
+                    },
+                    ws,
+                    &projection,
+                    &a,
+                    &b,
+                    &conv_output,
+                    &recurrent_output,
+                ))?;
+                view.carry.meta.set(next);
+            }
+        }
         // The F16 prefill route fuses the gate into the chunked WMMA
         // recurrence (KLD-gated); otherwise the exact kernels run.
-        if chunked {
+        if let (
+            true,
+            Some(GdnCarryView {
+                carry,
+                edge: GdnEdgeView::Wy { edge, .. },
+                ..
+            }),
+        ) = (wy_stream, op.carry.as_ref())
+        {
+            // The stream appends the rows at absolute tile/seam positions and
+            // publishes exactly them; the live slot is quantized only at an
+            // absolute 512 seam (or the explicit seal).
+            hip(gdn_wy_stream_append(
+                gpu,
+                &GdnWyAppend {
+                    step: &step,
+                    gate: &gated,
+                    carry: *carry,
+                    edge,
+                },
+            ))?;
+        } else if chunked {
             if let Some(src) = arenas.and_then(|a| a.z) {
                 if fused_qk {
                     hip(gated_delta_step_gate_wmma_qknormed_arena(
@@ -5117,7 +5763,10 @@ pub fn execute_indexed_attention_core_lanes(
     out_proj: Option<&IndexedAttentionOp<'_>>,
     before_launch: impl FnOnce(&mut Gpu) -> Result<(), DispatchError>,
 ) -> Result<bool, DispatchError> {
-    if ops.len() < 2 || ops.len() > QSA_CORE_LANES_MAX || !gpu.flags.qwen4_qsa_lanes_enabled() {
+    if ops.len() < 2
+        || ops.len() > super::qsa::core_lanes_group_max(gpu)
+        || !gpu.flags.qwen4_qsa_lanes_enabled()
+    {
         return Ok(false);
     }
     let i32_bytes = std::mem::size_of::<i32>();
@@ -5276,6 +5925,11 @@ pub fn execute_indexed_attention_core_lanes(
             }
         })
         .collect();
+    // Exact gfx942: five launches over every lane
+    // (`pipeline/qsa.rs`); the gfx1201 kernels below are not admitted there.
+    if gpu.arch_caps.is_gfx942() {
+        return super::qsa::execute_core_lanes_gfx942(gpu, &lanes, before_launch);
+    }
     let Some(plan) = hip(qsa_core_lanes(gpu, &lanes))? else {
         return Ok(false);
     };
@@ -6433,7 +7087,7 @@ pub fn execute_clear(gpu: &mut Gpu, op: &ClearOp<'_>) -> Result<(), DispatchErro
 }
 
 /// Sequence-parallel all-gather of the rows of one scratch tensor (the Flash-Next EP2 prefill
-/// route, `HIPFIRE_QWEN4_EP_SEQ_PARALLEL`): the rows this rank produced are sent to the peer and
+/// route): the rows this rank produced are sent to the peer and
 /// the peer's rows received in place, so every rank holds all `rows` rows again. The row ranges
 /// belong to the architecture crate's transport ([`RowGather`]); the step is a fusion barrier like
 /// [`ClearOp`].
@@ -6478,8 +7132,8 @@ pub trait QsaSelectGather: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// Sequence-parallel QSA selection of one prefill tile (the Flash-Next EP2 route,
-/// `HIPFIRE_QWEN4_EP_SP_INDEXER`): this rank selects only the rows of `own`, the peer the rows of
+/// Sequence-parallel QSA selection of one prefill tile (the Flash-Next EP2 route):
+/// this rank selects only the rows of `own`, the peer the rows of
 /// `peer`; the two ranges are contiguous and cover the tile. The chosen block ids travel through
 /// `gather` and each rank rebuilds the peer rows' selection bytes locally.
 #[derive(Clone, Copy)]
@@ -7163,6 +7817,147 @@ mod tests {
         assert_eq!(hc_decode_partitions(DType::BF16, 10240, 5, 4), None);
     }
 
+    /// gfx942 unfused HC gates take the quarters-equivalent k4 route exactly where
+    /// `execute_hyper_write_then_read` would have fused the next-gate quarters (BF16 inject
+    /// `[4, 4 * 2560]` without AWQ scale, four branches, hidden 2560, F32 streams and gates,
+    /// 1..=few_row_limit route rows), only on gfx942, and only while the kill switch is on.
+    #[test]
+    fn g942_unfused_hc_gates_follow_the_quarters_predicate() {
+        use crate::context::DispatchCtx;
+        let wide = 4 * 2560;
+        let bf16 = (DType::BF16, 4, wide, false);
+        let route = |caps: &rdna_compute::arch_caps::ArchCaps,
+                     enabled: bool,
+                     has_ar: bool,
+                     inject: (DType, usize, usize, bool),
+                     branches: usize,
+                     hidden: usize,
+                     state_bf16: bool,
+                     gates_f32: bool,
+                     rows: usize| {
+            g942_hc_quarters_gates_route(
+                caps,
+                enabled,
+                has_ar,
+                inject,
+                branches,
+                hidden,
+                state_bf16,
+                gates_f32,
+                g942_hc_gate_rows(rows, 8, false),
+            )
+        };
+        let gfx942 = DispatchCtx::for_test("gfx942");
+        let c = &gfx942.arch;
+        for rows in 1..=8 {
+            assert!(
+                route(c, true, false, bf16, 4, 2560, false, true, rows),
+                "{rows}"
+            );
+            // the quarters' own inject predicate agrees with the route's
+            assert!(hc_quarters_inject_ok(bf16.0, bf16.1, bf16.2, bf16.3, wide));
+        }
+        // Past the few-row limit outside a lane step (verify beyond 8 rows, prefill's invariant
+        // scope, the ordinary prefill chunk): the pinned MFMA route, unchanged.
+        for rows in [9, 16, 17, 32, 33, 64, 8192] {
+            assert!(
+                !route(c, true, false, bf16, 4, 2560, false, true, rows),
+                "{rows}"
+            );
+        }
+        // ... but a row of a lane step's all-rows HC segment takes the quarters at every width,
+        // under the same geometry / kill-switch refusals.
+        for rows in [9usize, 16, 17, 32, 33, 64, 128, 256] {
+            assert_eq!(g942_hc_gate_rows(rows, 8, true), G942HcGateRows::LaneWide);
+            assert_eq!(g942_hc_gate_rows(rows, 8, false), G942HcGateRows::Chunk);
+            let lane = g942_hc_gate_rows(rows, 8, true);
+            let wide_route = |enabled: bool, branches: usize, ar: bool, awq: bool| {
+                g942_hc_quarters_gates_route(
+                    c,
+                    enabled,
+                    ar,
+                    (DType::BF16, 4, wide, awq),
+                    branches,
+                    2560,
+                    false,
+                    true,
+                    lane,
+                )
+            };
+            assert!(wide_route(true, 4, false, false), "{rows}");
+            assert!(!wide_route(false, 4, false, false), "{rows} kill switch");
+            assert!(!wide_route(true, 8, false, false), "{rows} branches");
+            assert!(!wide_route(true, 4, true, false), "{rows} all-reduce write");
+            assert!(!wide_route(true, 4, false, true), "{rows} awq");
+        }
+        // The few-row window wins over the lane flag, and a lane step never makes <= 8 rows chunk.
+        for rows in 1..=8usize {
+            assert_eq!(g942_hc_gate_rows(rows, 8, true), G942HcGateRows::FewRow);
+        }
+        assert_eq!(g942_hc_gate_rows(0, 8, false), G942HcGateRows::Chunk);
+        assert!(!route(c, true, false, bf16, 4, 2560, false, true, 0));
+        // Kill switch, all-reduce write, BF16 state, geometry, dtype and AWQ refusals.
+        assert!(!route(c, false, false, bf16, 4, 2560, false, true, 1));
+        assert!(!route(c, true, true, bf16, 4, 2560, false, true, 1));
+        assert!(!route(c, true, false, bf16, 4, 2560, true, true, 1));
+        assert!(!route(c, true, false, bf16, 8, 2560, false, true, 1));
+        assert!(!route(c, true, false, bf16, 4, 2048, false, true, 1));
+        assert!(!route(c, true, false, bf16, 4, 2560, false, false, 1));
+        assert!(!route(
+            c,
+            true,
+            false,
+            (DType::F32, 4, wide, false),
+            4,
+            2560,
+            false,
+            true,
+            1
+        ));
+        assert!(!route(
+            c,
+            true,
+            false,
+            (DType::BF16, 8, wide, false),
+            4,
+            2560,
+            false,
+            true,
+            1
+        ));
+        assert!(!route(
+            c,
+            true,
+            false,
+            (DType::BF16, 4, wide + 32, false),
+            4,
+            2560,
+            false,
+            true,
+            1
+        ));
+        assert!(!route(
+            c,
+            true,
+            false,
+            (DType::BF16, 4, wide, true),
+            4,
+            2560,
+            false,
+            true,
+            1
+        ));
+        // Every other arch keeps its own route (the gfx11+ k4 route is already the quarters').
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let ctx = DispatchCtx::for_test(arch);
+            for rows in 1..=8 {
+                assert!(!route(
+                    &ctx.arch, true, false, bf16, 4, 2560, false, true, rows
+                ));
+            }
+        }
+    }
+
     #[test]
     fn requant_experiments_do_not_leak_wmma_into_admitted_wide_verify() {
         for dtype in [DType::MQ2G256V2, DType::MQ3G256V2, DType::MQ5G256V2] {
@@ -7248,7 +8043,6 @@ mod tests {
                     m,
                     k,
                     row_stride: k,
-                    rotation: None,
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
@@ -7295,6 +8089,7 @@ mod tests {
                 zba_fold: None,
                 trunk_a4: 0,
                 phase: MixerPhase::Whole,
+                carry: None,
             }
         }
     }
@@ -7347,7 +8142,6 @@ mod tests {
             m: 1,
             k: 1,
             row_stride: 1,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -7770,7 +8564,6 @@ mod tests {
             m,
             k,
             row_stride: k,
-            rotation: None,
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
@@ -8050,6 +8843,7 @@ mod tests {
                         zba_fold: None,
                         trunk_a4: 0,
                         phase: $phase,
+                        carry: None,
                     }
                 };
             }

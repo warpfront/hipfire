@@ -26,10 +26,7 @@
 //!                      [--kv-mode <mode>=q8] \
 //!                      [--max-chunks N]
 //!
-//! `--kv-mode` accepts `q8 | asym2 | asym3 | asym4`. Default is `q8` for
-//! cross-arch portability — `asym3` is hard-coded to head_dim=256 in
-//! `crates/hipfire-runtime/src/llama.rs` (Qwen3.5-specific), so plain-
-//! Qwen3 / Llama / Mistral models with head_dim != 256 must use `q8`.
+//! `--kv-mode` accepts `q8`. Default is `q8` for cross-arch portability.
 //!
 //! Output format: HFKSEQ (see eval_hipfire.rs and kldref_format.py).
 
@@ -74,8 +71,8 @@ fn main() {
             }
             "--kv-mode" => {
                 let v = argv[i + 1].clone();
-                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4") {
-                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 (got {v})");
+                if !matches!(v.as_str(), "q8") {
+                    eprintln!("--kv-mode must be one of: q8 (got {v})");
                     std::process::exit(1);
                 }
                 kv_mode = v;
@@ -204,30 +201,6 @@ fn main() {
     let kv_max = n_ctx + 16;
     let mut kv_cache = match args.kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym2" => KvCache::new_gpu_asym2(
             &mut gpu,
             config.n_layers,
             config.n_kv_heads,

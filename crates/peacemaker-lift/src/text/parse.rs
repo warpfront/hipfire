@@ -1962,10 +1962,11 @@ fn finish(row: &'static OpRow, mut parsed: ParsedOperands) -> Result<Inst, Parse
         }
     }
     let fields = derive_fields(row, &parsed)?;
-    Inst::from_parts(
+    Inst::from_encoding(
         parsed.arch,
         row.op,
         row.form,
+        row.variant,
         fields,
         SmallVec::from_vec(parsed.operands),
         parsed.mods,

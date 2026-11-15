@@ -17,9 +17,8 @@ use hipfire_config::{
     effective::{active_choice, quality_choices, ArchCtx, Choice, Effective, Origin},
     field, fields,
     intent::{intent_of, Intent},
-    is_deprecated_key, is_developer_key, load_config_profile, load_global, model_override_allowed,
-    ConfigCategory, ConfigField, ConfigLayer, ConfigPaths, ConfigSource, ConfigValue,
-    ResolvedConfig,
+    is_developer_key, load_config_profile, load_global, model_override_allowed, ConfigCategory,
+    ConfigField, ConfigLayer, ConfigPaths, ConfigSource, ConfigValue, ResolvedConfig,
 };
 use hipfire_registry::RegistryV1;
 
@@ -104,7 +103,6 @@ pub struct SettingsRow {
     pub display: String,
     /// Why the row cannot be edited right now (an environment variable owns it).
     pub locked: Option<String>,
-    pub deprecated: bool,
     /// Canonical keys behind the row (virtual: every key its choices write).
     pub keys: Vec<String>,
     /// Virtual rows only: the options for this GPU. Empty = no route here.
@@ -392,9 +390,7 @@ fn group_keys(group: Intent, resolved: &ResolvedConfig) -> Vec<String> {
         let mut live: Vec<&ConfigField> = fields()
             .iter()
             .filter(|schema| {
-                !is_deprecated_key(schema.key)
-                    && (intent_of(schema.key) == Intent::Advanced
-                        || RAW_PREFILL_KEYS.contains(&schema.key))
+                intent_of(schema.key) == Intent::Advanced || RAW_PREFILL_KEYS.contains(&schema.key)
             })
             .collect();
         live.sort_by_key(|schema| (category_rank(schema.category), schema.key));
@@ -408,14 +404,6 @@ fn group_keys(group: Intent, resolved: &ResolvedConfig) -> Vec<String> {
                 .filter(|key| is_developer_key(key) && key.as_str() != SYM_IU4_KEY)
                 .cloned(),
         );
-        let mut deprecated: Vec<&ConfigField> = fields()
-            .iter()
-            .filter(|schema| {
-                is_deprecated_key(schema.key) && intent_of(schema.key) == Intent::Advanced
-            })
-            .collect();
-        deprecated.sort_by_key(|schema| (category_rank(schema.category), schema.key));
-        keys.extend(deprecated.into_iter().map(|schema| schema.key.to_owned()));
         return keys;
     }
 
@@ -433,8 +421,7 @@ fn group_keys(group: Intent, resolved: &ResolvedConfig) -> Vec<String> {
                 && !RAW_PREFILL_KEYS.contains(&schema.key)
         })
         .collect();
-    // Category-default keys, deprecated ones last (the existing Advanced rule).
-    rest.sort_by_key(|schema| (is_deprecated_key(schema.key), schema.key));
+    rest.sort_by_key(|schema| schema.key);
     keys.extend(rest.into_iter().map(|schema| schema.key.to_owned()));
     keys
 }
@@ -475,7 +462,6 @@ impl Builder<'_> {
             chain,
             display,
             locked,
-            deprecated: is_deprecated_key(&canonical),
             keys: vec![canonical],
             choices: Vec::new(),
             current_choice: None,
@@ -572,7 +558,6 @@ impl Builder<'_> {
             chain,
             display,
             locked,
-            deprecated: false,
             keys,
             choices,
             current_choice,
@@ -721,14 +706,9 @@ fn lock_text(origin: &Origin) -> Option<String> {
     }
 }
 
-/// Plain title when the knob tables have one, else the canonical key.
+/// Plain title when the knob table has one, else the canonical key.
 pub(crate) fn row_title(key: &str) -> String {
-    if let Some(knob) = knobs::curated_knob(key) {
-        return knob.title.to_owned();
-    }
-    field(key)
-        .and_then(|schema| knobs::knob_info(schema.legacy_key))
-        .map_or_else(|| key.to_owned(), |info| info.title.to_owned())
+    knobs::knob(key).map_or_else(|| key.to_owned(), |knob| knob.title.to_owned())
 }
 
 /// A value in plain words. The offload and context labels are the easy view's
@@ -1155,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_partition_the_rows_and_advanced_orders_deprecated_last() {
+    fn groups_partition_the_rows() {
         let (paths, root) = fixture_home("groups");
         write_config(&paths, "[developer]\nsome_flag = \"1\"\n");
         let model = build(
@@ -1171,16 +1151,6 @@ mod tests {
         keys.dedup();
         assert_eq!(keys.len(), total, "a key appears in two groups");
         let advanced: Vec<&SettingsRow> = model.rows_in(Intent::Advanced).collect();
-        let first_deprecated = advanced
-            .iter()
-            .position(|row| row.deprecated)
-            .expect("deprecated keys are in Advanced");
-        assert!(advanced[first_deprecated..]
-            .iter()
-            .all(|row| row.deprecated));
-        assert!(advanced[..first_deprecated]
-            .iter()
-            .all(|row| !row.deprecated));
         assert!(advanced
             .iter()
             .any(|row| row.id == RowId::Key("developer.some_flag".into())));

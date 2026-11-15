@@ -40,6 +40,12 @@ use hip_bridge::HipResult;
 /// (`peacemaker-isa emit --kernel moe_down_combine_grouped_bf16in_pm --arch gfx1201`).
 pub const MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL: &str =
     "moe_down_combine_grouped_bf16in_pm_gfx1201";
+/// The gfx1100 twin of [`MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL`].
+pub const MOE_DOWN_COMBINE_BF16IN_PM_GFX1100_SYMBOL: &str =
+    "moe_down_combine_grouped_bf16in_pm_gfx1100";
+/// The gfx1151 twin of [`MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL`].
+pub const MOE_DOWN_COMBINE_BF16IN_PM_GFX1151_SYMBOL: &str =
+    "moe_down_combine_grouped_bf16in_pm_gfx1151";
 /// Threads per workgroup (v1: one output column per thread; v2: eight
 /// contiguous columns per thread).
 pub const MOE_DOWN_COMBINE_BF16IN_BLOCK: u32 = 256;
@@ -58,8 +64,36 @@ const GRID_Y_MAX: usize = 65_535;
 /// module for `arch`; `None` where no builder object exists.
 fn moe_slot_ops_kernel(arch: &str) -> Option<(&'static [u8], &'static str)> {
     match arch {
+        "gfx1100" => Some((
+            kernels::MOE_SLOT_OPS_PM_GFX1100,
+            MOE_DOWN_COMBINE_BF16IN_PM_GFX1100_SYMBOL,
+        )),
+        "gfx1151" => Some((
+            kernels::MOE_SLOT_OPS_PM_GFX1151,
+            MOE_DOWN_COMBINE_BF16IN_PM_GFX1151_SYMBOL,
+        )),
         "gfx1201" => Some((
             kernels::MOE_SLOT_OPS_PM_GFX1201,
+            MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL,
+        )),
+        _ => None,
+    }
+}
+
+/// Bundle name and device symbol of the v1 slot-ops combine for `arch`
+/// (what the admission log names); `None` where no builder object exists.
+pub fn moe_slot_ops_pm_names(arch: &str) -> Option<(&'static str, &'static str)> {
+    match arch {
+        "gfx1100" => Some((
+            "moe_slot_ops_pm_gfx1100",
+            MOE_DOWN_COMBINE_BF16IN_PM_GFX1100_SYMBOL,
+        )),
+        "gfx1151" => Some((
+            "moe_slot_ops_pm_gfx1151",
+            MOE_DOWN_COMBINE_BF16IN_PM_GFX1151_SYMBOL,
+        )),
+        "gfx1201" => Some((
+            "moe_slot_ops_pm_gfx1201",
             MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL,
         )),
         _ => None,
@@ -193,7 +227,7 @@ pub fn moe_combine_v2_shape_supported(
 
 impl Gpu {
     /// This device has the embedded builder object of the slot ops
-    /// (`kernels::MOE_SLOT_OPS_PM_GFX1201` on gfx1201; every other arch: no).
+    /// (`kernels::MOE_SLOT_OPS_PM_GFX1100` / `_GFX1151` / `_GFX1201` on that arch; every other arch: no).
     pub fn moe_slot_ops_available(&self) -> bool {
         moe_slot_ops_kernel(&self.arch).is_some()
     }
@@ -357,28 +391,34 @@ mod tests {
     const A3B_DIM: usize = 2048;
 
     #[test]
-    fn kernel_selection_is_gfx1201_only() {
-        let (_, symbol) = moe_slot_ops_kernel("gfx1201").unwrap();
-        assert_eq!(symbol, MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL);
-        assert!(symbol.ends_with("gfx1201"));
-        for arch in [
-            "gfx1200", "gfx1100", "gfx1101", "gfx1151", "gfx942", "gfx1030", "gfx11", "",
+    fn kernel_selection_covers_gfx1100_gfx1151_and_gfx1201_only() {
+        for (arch, want) in [
+            ("gfx1100", MOE_DOWN_COMBINE_BF16IN_PM_GFX1100_SYMBOL),
+            ("gfx1151", MOE_DOWN_COMBINE_BF16IN_PM_GFX1151_SYMBOL),
+            ("gfx1201", MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL),
         ] {
+            let (_, symbol) = moe_slot_ops_kernel(arch).unwrap();
+            assert_eq!(symbol, want);
+            assert!(symbol.ends_with(arch));
+        }
+        for arch in ["gfx1200", "gfx1101", "gfx942", "gfx1030", "gfx11", ""] {
             assert!(moe_slot_ops_kernel(arch).is_none(), "{arch:?}");
         }
     }
 
     #[test]
     fn embedded_image_exports_the_launcher_symbol() {
-        let (image, symbol) = moe_slot_ops_kernel("gfx1201").unwrap();
-        assert!(
-            image.windows(4).any(|w| w == b"\x7fELF"),
-            "no device ELF in the {symbol} bundle"
-        );
-        assert!(
-            image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
-            "{symbol} missing from its image"
-        );
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let (image, symbol) = moe_slot_ops_kernel(arch).unwrap();
+            assert!(
+                image.windows(4).any(|w| w == b"\x7fELF"),
+                "no device ELF in the {symbol} bundle"
+            );
+            assert!(
+                image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
+                "{symbol} missing from its image"
+            );
+        }
     }
 
     #[test]

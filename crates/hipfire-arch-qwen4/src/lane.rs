@@ -18,7 +18,14 @@
 //!
 //! Lane device states are allocated on a slot's first admission and kept
 //! across releases: a later admission into that slot resets the state in
-//! place instead of allocating again.
+//! place instead of allocating again. On the exact gfx942 single device the
+//! store instead allocates every slot's state when it is built
+//! ([`Qwen4LaneStore::new`]; the lane byte census already charges all
+//! `max_lanes` payloads) and parks it as a pristine, not-live cell: the first
+//! admission takes a pristine cell as is (its bytes are exactly what the
+//! first-touch allocation would have produced), later ones reset it. Each such
+//! slot also maps and zeroes its first KV chunk then ([`map_first_chunk`]), so the
+//! first provision of a short prompt maps nothing.
 //!
 //! A store staged `sampled` (`serve.batch_sampled`) also admits sampled
 //! requests: [`LaneSampling`] set on a lane after admission makes every token
@@ -87,8 +94,8 @@ pub(crate) mod groups;
 pub mod pages;
 use groups::GroupPlanner;
 
-/// Most lanes one store holds.
-pub(crate) const MAX_LANES: usize = 64;
+/// Most lanes one store holds (gfx942 stock-FP8 serves 64: 259 MiB/lane [MEAS], ~16.6 GB).
+pub const MAX_LANES: usize = 64;
 
 /// Topology of THIS rank's bundle. Expert parallelism is read from the
 /// rank's own weights (peers hold no root `bundle.ep`); a band that is not the
@@ -1380,6 +1387,46 @@ fn new_payload(
     Ok((state, spec))
 }
 
+/// Release a payload [`new_payload`] built (every error path frees what it holds).
+fn free_payload(gpu: &mut Gpu, state: Qwen4State, spec: Option<LaneSpec>) {
+    let _ = state.free_gpu(gpu);
+    if let Some(spec) = spec {
+        let _ = spec.head.free_gpu(gpu);
+        let _ = gpu.free_tensor(spec.pending_hidden);
+        if let Some(lag) = spec.lag {
+            let _ = lag.free_gpu(gpu);
+        }
+    }
+}
+
+/// Map and zero the first KV chunk of a fresh payload's trunk context arenas and, for an
+/// MTP slot, its head arenas: the very growth the slot's first provision performs for any
+/// end in `1..=DEFAULT_KV_CHUNK_TOKENS`.
+///
+/// Exactness: `KvChunkPlan::mapped_bytes_for_tokens` rounds `row_bytes * rows` up to the
+/// plan's `growth_bytes`, itself at least `row_bytes * DEFAULT_KV_CHUNK_TOKENS`, so every
+/// arena rows count in `1..=64` (one token, or the 64 tokens of the first chunk) maps the
+/// same `growth_bytes` (clamped to the reserve) and zero-fills the same bytes; the
+/// resulting `qsa_mapped_tokens` / head `mapped_tokens` are functions of the mapped bytes
+/// alone. A later provision past the chunk grows from here exactly as it grows from a
+/// slot that already served a short request. Called only on a pristine, never-admitted
+/// payload.
+fn map_first_chunk(
+    gpu: &mut Gpu,
+    state: &mut Qwen4State,
+    spec: Option<&mut LaneSpec>,
+) -> Result<(), String> {
+    state
+        .ensure_mapped_capacity(gpu, 1)
+        .map_err(|e| format!("first trunk context chunk: {e}"))?;
+    if let Some(spec) = spec {
+        spec.head
+            .ensure_mapped_capacity(gpu, 1)
+            .map_err(|e| format!("first head context chunk: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Back an existing lane cell to a request's start: trunk state, then (when the store
 /// stages spec) the MTP head and pending hidden, every zero-fill enqueued into `batch`
 /// (the caller owns the one wait, also after an error).
@@ -1402,6 +1449,53 @@ fn reset_cell_into(
         _ => Err(format!(
             "admit: lane {slot} spec state does not match the store"
         )),
+    }
+}
+
+/// `(ring rows, spec payload)` a slot's payload is built from: the one rule of a
+/// first-touch admission ([`Qwen4LaneStore::admit_in`]) and of the pre-allocation
+/// ([`Qwen4LaneStore::preallocate_payloads`]). A slot past the mixed store's `spec_lanes`
+/// is an AR-only lane (no capture ring, no head); a slot at or past `wide_lanes` holds the
+/// narrow ring.
+fn slot_payload_shape(
+    slot: usize,
+    spec_lanes: usize,
+    wide_lanes: usize,
+    wide_ring_rows: usize,
+    narrow_ring_rows: usize,
+    spec_cfg: Option<SpecAlloc>,
+) -> (usize, Option<SpecAlloc>) {
+    if slot < spec_lanes {
+        let ring = if slot < wide_lanes {
+            wide_ring_rows
+        } else {
+            narrow_ring_rows
+        };
+        (ring, spec_cfg)
+    } else {
+        (0, None)
+    }
+}
+
+/// Host entry of a pre-allocated, never-admitted cell: the state a released cell
+/// has (empty prompt, no sampler, not Decoding; generation 0 matches no epoch). The first
+/// admission overwrites it whole.
+fn placeholder_host(slot: usize) -> LaneHost {
+    LaneHost {
+        epoch: RequestEpoch {
+            request_tag: 0,
+            owner_generation: 0,
+        },
+        slot,
+        prompt: Vec::new(),
+        prefilled: 0,
+        generated: Vec::new(),
+        pending_seed: None,
+        status: LaneStatus::Prefilling,
+        stamp: 0,
+        sampling: None,
+        rng: 0,
+        ignore_eos: false,
     }
 }
 
@@ -1441,9 +1535,16 @@ impl LaneCell for Qwen4LaneState {
 /// Slot table of the lanes: which slots hold a live request and the cells
 /// (host + payload) allocated so far. Epoch lookups match both the request
 /// tag and the owner generation, so a stale generation never matches.
+///
+/// A cell is PRISTINE while it holds exactly the bytes its payload constructor
+/// produced and nothing has touched it since: only a pre-allocated cell
+/// ([`Self::install_pristine`]) that no admission has used yet. The first admission into
+/// a pristine cell needs no reset (its state IS the fresh state the first-touch
+/// allocation would have produced); the flag drops the moment a slot is admitted.
 struct LaneTable<C: LaneCell> {
     cells: Vec<Option<C>>,
     live: Vec<bool>,
+    pristine: Vec<bool>,
     next_stamp: u64,
 }
 
@@ -1452,8 +1553,22 @@ impl<C: LaneCell> LaneTable<C> {
         Self {
             cells: (0..max_lanes).map(|_| None).collect(),
             live: vec![false; max_lanes],
+            pristine: vec![false; max_lanes],
             next_stamp: 0,
         }
+    }
+
+    /// Park a freshly built payload in the empty, not-live `slot` ahead of any
+    /// admission. `host` is a placeholder (the state of a released cell: empty
+    /// prompt, no sampling, not Decoding) that the first admission overwrites;
+    /// the cell is pristine until then.
+    fn install_pristine(&mut self, slot: usize, host: LaneHost, payload: C::Payload) {
+        assert!(
+            self.cells[slot].is_none() && !self.live[slot],
+            "install_pristine: slot {slot} already holds a cell"
+        );
+        self.cells[slot] = Some(C::assemble(host, payload));
+        self.pristine[slot] = true;
     }
 
     fn max_lanes(&self) -> usize {
@@ -1492,16 +1607,18 @@ impl<C: LaneCell> LaneTable<C> {
     }
 
     /// Admit `epoch` into the lowest free slot as a request about to prefill.
-    /// `prepare(slot, existing)` is called exactly once: with the slot's kept
-    /// payload cell (it must reset it in place and return `Ok(None)`), or
-    /// with `None` when the slot has never held one (it must return the new
-    /// payload). The new host entry is published only after `prepare`
-    /// succeeded.
+    /// `prepare(slot, existing, pristine)` is called exactly once: with the
+    /// slot's kept payload cell (it must put it back to a request's start and
+    /// return `Ok(None)`; `pristine` says the cell is still exactly what its
+    /// constructor produced, so it needs no reset), or with `None` when the
+    /// slot holds no cell (it must return the new payload). The new host entry
+    /// is published only after `prepare` succeeded. The cell is not pristine
+    /// from the moment `prepare` is called, also when it fails.
     fn admit(
         &mut self,
         epoch: RequestEpoch,
         prompt: Vec<u32>,
-        prepare: impl FnOnce(usize, Option<&mut C>) -> Result<Option<C::Payload>, String>,
+        prepare: impl FnOnce(usize, Option<&mut C>, bool) -> Result<Option<C::Payload>, String>,
     ) -> Result<usize, String> {
         self.admit_in(epoch, prompt, None, prepare)
     }
@@ -1513,7 +1630,7 @@ impl<C: LaneCell> LaneTable<C> {
         epoch: RequestEpoch,
         prompt: Vec<u32>,
         preferred: Option<usize>,
-        prepare: impl FnOnce(usize, Option<&mut C>) -> Result<Option<C::Payload>, String>,
+        prepare: impl FnOnce(usize, Option<&mut C>, bool) -> Result<Option<C::Payload>, String>,
     ) -> Result<usize, String> {
         self.admit_host(epoch, prompt, None, preferred, prepare)
     }
@@ -1528,7 +1645,7 @@ impl<C: LaneCell> LaneTable<C> {
         prompt: Vec<u32>,
         generated: Vec<u32>,
         pending_seed: u32,
-        prepare: impl FnOnce(usize, Option<&mut C>) -> Result<Option<C::Payload>, String>,
+        prepare: impl FnOnce(usize, Option<&mut C>, bool) -> Result<Option<C::Payload>, String>,
     ) -> Result<usize, String> {
         self.admit_host(
             epoch,
@@ -1545,7 +1662,7 @@ impl<C: LaneCell> LaneTable<C> {
         prompt: Vec<u32>,
         decoding: Option<(Vec<u32>, u32)>,
         preferred: Option<usize>,
-        prepare: impl FnOnce(usize, Option<&mut C>) -> Result<Option<C::Payload>, String>,
+        prepare: impl FnOnce(usize, Option<&mut C>, bool) -> Result<Option<C::Payload>, String>,
     ) -> Result<usize, String> {
         if !epoch.is_admitted() {
             return Err(format!("admit: generation 0 is never admitted ({epoch:?})"));
@@ -1579,13 +1696,14 @@ impl<C: LaneCell> LaneTable<C> {
         };
         match self.cells[slot].as_mut() {
             Some(cell) => {
-                if prepare(slot, Some(&mut *cell))?.is_some() {
+                let pristine = std::mem::take(&mut self.pristine[slot]);
+                if prepare(slot, Some(&mut *cell), pristine)?.is_some() {
                     return Err("admit: prepare returned a payload for a kept cell".to_string());
                 }
                 *cell.host_mut() = host;
             }
             None => {
-                let payload = prepare(slot, None)?.ok_or_else(|| {
+                let payload = prepare(slot, None, false)?.ok_or_else(|| {
                     "admit: prepare returned no payload for a new cell".to_string()
                 })?;
                 self.cells[slot] = Some(C::assemble(host, payload));
@@ -2309,8 +2427,9 @@ pub struct Qwen4LaneStore {
 }
 
 impl Qwen4LaneStore {
-    /// An empty store for `max_lanes` lanes (states are allocated on first
-    /// admission into a slot) and its step output buffers. With `spec`
+    /// A store for `max_lanes` lanes and its step output buffers. On the exact gfx942
+    /// single device every slot's state is allocated here ([`Self::preallocate_payloads`]);
+    /// elsewhere states are allocated on first admission into a slot. With `spec`
     /// every lane is an MTP lane.
     pub(crate) fn new(
         gpu: &mut Gpu,
@@ -2397,6 +2516,23 @@ impl Qwen4LaneStore {
                     "lane store: MTP lanes need the GDN row capture this GPU lacks".to_string(),
                 );
             }
+            // gfx942 captures the F32 recurrent state only and runs the single-card
+            // topology (the capture recurrence and its rollback are the gfx942-pinned
+            // F32 persistent body; PP/EP rings were never proven there).
+            if gpu.arch_caps.is_gfx942() {
+                if bundle.state_format().gdn != crate::GdnStateFormat::F32 {
+                    return Err(format!(
+                        "lane store: gfx942 MTP lanes capture the F32 GDN state only, not {}",
+                        bundle.state_format().gdn.name()
+                    ));
+                }
+                if lane_topology(bundle) != LaneTopology::Single {
+                    return Err(
+                        "lane store: gfx942 MTP lanes run the single-card topology only"
+                            .to_string(),
+                    );
+                }
+            }
         }
         // The copy lane widens the store's verify rows and the first
         // `wide_lanes` slots' ring to `1 + max(k, take cap)` and adds the
@@ -2475,7 +2611,7 @@ impl Qwen4LaneStore {
             }
             _ => None,
         };
-        Ok(Self {
+        let mut store = Self {
             table: LaneTable::new(max_lanes),
             row_budget: row_budget.min(max_lanes),
             ring_rows,
@@ -2505,7 +2641,61 @@ impl Qwen4LaneStore {
             copy: copy_arming,
             page_reserved: vec![0; max_lanes],
             long_prefill_seen: std::sync::atomic::AtomicBool::new(false),
-        })
+        };
+        // Exact gfx942 single device: every slot's payload exists before the first
+        // admission, so the opening burst's TTFT path pays no per-lane allocation
+        // fills. Anywhere else a fresh slot still allocates at its first admission.
+        if gpu.arch_caps.is_gfx942() && lane_topology(bundle) == LaneTopology::Single {
+            if let Err(error) = store.preallocate_payloads(gpu, bundle) {
+                let _ = store.free_gpu(gpu);
+                return Err(error);
+            }
+        }
+        Ok(store)
+    }
+
+    /// Build every slot's payload up front with the choices [`Self::admit_in`] makes for a
+    /// first-touch slot (wide vs narrow ring by [`Self::ring_split`], MTP vs AR-only past
+    /// `spec_lanes`, [`new_payload`]) and park each as a pristine, not-live table cell
+    /// ([`LaneTable::install_pristine`]). The lane byte census already charges `max_lanes`
+    /// full payloads ([`Self::device_bytes`]), so this commits nothing the census did not
+    /// plan (the first KV chunk each slot maps is inside the charged context pages). Each
+    /// slot also maps its first KV chunk ([`map_first_chunk`]), the growth a first provision
+    /// of a short prompt would perform. On a failure the caller frees the cells built so far
+    /// with the store.
+    fn preallocate_payloads(&mut self, gpu: &mut Gpu, bundle: &Qwen4Bundle) -> Result<(), String> {
+        let store_ring_rows = self.ring_rows;
+        let (narrow_ring_rows, wide_lanes) = self.ring_split();
+        let store_spec_cfg = self
+            .spec
+            .as_ref()
+            .map(|s| (s.config, s.head_max_seq, s.backend, s.lag_rows));
+        let spec_lanes = self
+            .spec
+            .as_ref()
+            .and_then(|s| s.config.spec_lanes)
+            .unwrap_or(usize::MAX);
+        for slot in 0..self.table.max_lanes() {
+            let (ring_rows, spec_cfg) = slot_payload_shape(
+                slot,
+                spec_lanes,
+                wide_lanes,
+                store_ring_rows,
+                narrow_ring_rows,
+                store_spec_cfg,
+            );
+            let (mut state, mut spec) = new_payload(gpu, bundle, slot, ring_rows, spec_cfg)?;
+            // The first provision of a short prompt then finds its context mapped and
+            // zeroed ([`map_first_chunk`]) instead of paying one blocking fill per arena.
+            if let Err(error) = map_first_chunk(gpu, &mut state, spec.as_mut()) {
+                free_payload(gpu, state, spec);
+                return Err(format!("admit: allocate lane {slot}: {error}"));
+            }
+            let payload = (state, spec);
+            self.table
+                .install_pristine(slot, placeholder_host(slot), payload);
+        }
+        Ok(())
     }
 
     /// The snapshot mirror every lane state of a store staged with `spec`
@@ -2709,7 +2899,7 @@ impl Qwen4LaneStore {
             spec_lanes,
             Qwen4State::device_bytes_with_mirror(
                 config,
-                format,
+                format.lane(),
                 context,
                 &scope,
                 Self::state_mirror(None),
@@ -2727,7 +2917,11 @@ impl Qwen4LaneStore {
     /// Admit `epoch` with its canonical `prompt` into the lowest free lane
     /// and return its slot. A slot that held a request before resets its
     /// state in place (an MTP lane also its head, draft policy, pending
-    /// hidden, window policy and counters); a fresh slot allocates one.
+    /// hidden, window policy and counters). A slot's payload otherwise exists
+    /// already when the store pre-allocated it ([`Self::preallocate_payloads`],
+    /// exact gfx942 single-device): its first admission is taken as is, with no reset
+    /// (a pristine cell is byte-for-byte what a first-touch allocation builds).
+    /// Anywhere else a fresh slot allocates one here.
     pub fn admit(
         &mut self,
         gpu: &mut Gpu,
@@ -2760,20 +2954,20 @@ impl Qwen4LaneStore {
             .and_then(|s| s.config.spec_lanes)
             .unwrap_or(usize::MAX);
         self.table
-            .admit_in(epoch, prompt, preferred, |slot, existing| {
-                // A slot past the mixed store's MTP lanes is an AR-only lane:
-                // no capture ring, no head.
-                let (ring_rows, spec_cfg) = if slot < spec_lanes {
-                    let ring = if slot < wide_lanes {
-                        store_ring_rows
-                    } else {
-                        narrow_ring_rows
-                    };
-                    (ring, store_spec_cfg)
-                } else {
-                    (0, None)
-                };
+            .admit_in(epoch, prompt, preferred, |slot, existing, pristine| {
+                let (ring_rows, spec_cfg) = slot_payload_shape(
+                    slot,
+                    spec_lanes,
+                    wide_lanes,
+                    store_ring_rows,
+                    narrow_ring_rows,
+                    store_spec_cfg,
+                );
                 match existing {
+                    // Pre-allocated and never admitted: already the state a first-touch
+                    // allocation would produce (zero fills, empty head, default
+                    // draft/window/stats, ring unarmed), nothing to reset.
+                    Some(_) if pristine => Ok(None),
                     Some(cell) => {
                         // Trunk state, MTP head and pending hidden zero under ONE
                         // stream wait (paid also when a reset fails part-way).
@@ -2837,7 +3031,9 @@ impl Qwen4LaneStore {
             prompt,
             generated,
             pending_seed,
-            |slot, existing| match existing {
+            // A pristine cell (a pre-allocated slot, never admitted) is the fresh payload
+            // the first-touch branch below builds: the same promote on it is exact.
+            |slot, existing, _pristine| match existing {
                 Some(cell) => {
                     match (spec_cfg, cell.spec.as_mut(), parts.as_ref()) {
                         (Some(_), Some(spec), Some(parts)) => spec
@@ -3636,7 +3832,7 @@ mod tests {
         prompt: &[u32],
         made: &mut usize,
     ) -> Result<usize, String> {
-        table.admit(epoch, prompt.to_vec(), |slot, existing| match existing {
+        table.admit(epoch, prompt.to_vec(), |slot, existing, _| match existing {
             Some(cell) => {
                 cell.payload += 100;
                 Ok(None)
@@ -3703,7 +3899,7 @@ mod tests {
             prompt.to_vec(),
             vec![4, 5],
             6,
-            |slot, existing| match existing {
+            |slot, existing, _| match existing {
                 Some(cell) => {
                     cell.payload += 100;
                     Ok(None)
@@ -3781,7 +3977,7 @@ mod tests {
         // A failed prepare leaves no half-published lane.
         table.release(&epoch(2, 1)).unwrap();
         let error = table
-            .admit_decoding(epoch(4, 1), vec![7], vec![1], 2, |_, _| {
+            .admit_decoding(epoch(4, 1), vec![7], vec![1], 2, |_, _, _| {
                 Err("no memory".to_string())
             })
             .unwrap_err();
@@ -3794,7 +3990,7 @@ mod tests {
     fn a_failed_prepare_leaves_the_table_untouched() {
         let mut table = LaneTable::<TestCell>::new(1);
         let error = table
-            .admit(epoch(1, 1), vec![7], |_, _| Err("no memory".to_string()))
+            .admit(epoch(1, 1), vec![7], |_, _, _| Err("no memory".to_string()))
             .unwrap_err();
         assert_eq!(error, "no memory");
         assert_eq!(table.active(), 0);
@@ -3817,6 +4013,88 @@ mod tests {
         assert_eq!(cell.payload, 100);
         assert_eq!(cell.host.prompt, vec![9]);
         assert_eq!(cell.host.stamp, 1);
+    }
+
+    /// Admission into a pre-installed cell: pristine exactly until the first admission,
+    /// then every later admission into the slot is a reset.
+    #[test]
+    fn a_pre_installed_cell_is_pristine_until_its_first_admission() {
+        let mut table = LaneTable::<TestCell>::new(2);
+        table.install_pristine(0, placeholder_host(0), 7);
+        table.install_pristine(1, placeholder_host(1), 8);
+        // Pre-installed cells are not live and match no epoch.
+        assert_eq!(table.active(), 0);
+        assert!(table.epochs().is_empty());
+        assert!(table.get(&epoch(1, 1)).is_none());
+        let seen = std::cell::RefCell::new(Vec::new());
+        let prepare = |slot: usize, existing: Option<&mut TestCell>, pristine: bool| {
+            seen.borrow_mut().push((slot, existing.is_some(), pristine));
+            match existing {
+                Some(cell) if !pristine => {
+                    cell.payload += 100;
+                    Ok(None)
+                }
+                Some(_) => Ok(None),
+                None => Ok(Some(0)),
+            }
+        };
+        assert_eq!(table.admit(epoch(1, 1), vec![7], prepare), Ok(0));
+        let cell = table.get(&epoch(1, 1)).unwrap();
+        // The pristine cell was used as is and carries the admission's host entry.
+        assert_eq!(cell.payload, 7);
+        assert_eq!(cell.host.slot, 0);
+        assert_eq!(cell.host.status, LaneStatus::Prefilling);
+        assert_eq!(cell.host.prompt, vec![7]);
+        assert_eq!(cell.host.stamp, 0);
+        table.release(&epoch(1, 1)).unwrap();
+        // The second admission into slot 0 is a reuse of a touched cell.
+        assert_eq!(table.admit(epoch(2, 1), vec![9], prepare), Ok(0));
+        assert_eq!(table.get(&epoch(2, 1)).unwrap().payload, 107);
+        // Slot 1 is still pristine, also for a promoted admission, which clears the flag.
+        assert_eq!(
+            table.admit_decoding(epoch(3, 1), vec![9], vec![4], 5, prepare),
+            Ok(1)
+        );
+        assert_eq!(table.get(&epoch(3, 1)).unwrap().payload, 8);
+        assert_eq!(
+            table.get(&epoch(3, 1)).unwrap().host.status,
+            LaneStatus::Decoding
+        );
+        table.release(&epoch(3, 1)).unwrap();
+        assert_eq!(table.admit(epoch(4, 1), vec![9], prepare), Ok(1));
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                (0, true, true),
+                (0, true, false),
+                (1, true, true),
+                (1, true, false)
+            ]
+        );
+    }
+
+    /// A failed `prepare` on a pristine cell leaves it non-pristine: the next admission
+    /// resets it (the conservative, always-exact outcome).
+    #[test]
+    fn a_failed_prepare_drops_the_pristine_flag() {
+        let mut table = LaneTable::<TestCell>::new(1);
+        table.install_pristine(0, placeholder_host(0), 7);
+        let error = table
+            .admit(epoch(1, 1), vec![7], |_, _, pristine| {
+                assert!(pristine);
+                Err("no memory".to_string())
+            })
+            .unwrap_err();
+        assert_eq!(error, "no memory");
+        assert_eq!(table.active(), 0);
+        table
+            .admit(epoch(2, 1), vec![7], |_, existing, pristine| {
+                assert!(!pristine);
+                existing.unwrap().payload += 100;
+                Ok(None)
+            })
+            .unwrap();
+        assert_eq!(table.get(&epoch(2, 1)).unwrap().payload, 107);
     }
 
     #[test]
@@ -5220,7 +5498,7 @@ mod lane_sampling_tests {
             owner_generation: 1,
         };
         let mut table = LaneTable::<Cell>::new(1);
-        let prepare = |_: usize, existing: Option<&mut Cell>| match existing {
+        let prepare = |_: usize, existing: Option<&mut Cell>, _: bool| match existing {
             Some(_) => Ok(None),
             None => Ok(Some(())),
         };

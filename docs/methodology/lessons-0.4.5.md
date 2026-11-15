@@ -319,7 +319,12 @@ that appears in both arms is this known divergence, not the candidate (the
 lane-trace exit 1 seen while gating `3639de7b26` was exactly that). The gates do catch real defects: the
 default-on exact EP prefill wave was found not byte-identical for ≤ 64-row
 lanes (first-token KL max 0.114, one top-1 flip in 17 lanes, j8439) and was
-fixed by raising its row floor (`2919b59bbc`).
+fixed by raising its row floor (`2919b59bbc`). The later small-lane wave
+(`HIPFIRE_EP_LANE_PREFILL_WAVE_SMALL_LANES`, default on) re-admitted those
+lanes on a burst-oracle pass, but served C1-vs-C8 identity (0.5.0 D1 check)
+showed they are still not byte-identical to a solo prefill: by default they are
+distribution-equivalent, and only `serve.batch_exact` (which keeps them out of
+the wave) is byte-identical.
 
 ## 8. Gate gaps found this cycle
 

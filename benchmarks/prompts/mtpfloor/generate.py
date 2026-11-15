@@ -88,7 +88,7 @@ for kind in ('code', 'prose', 'tool'):
                         'immutable_capture_floor_exceeds_target': kind == 'tool' and len(baseline.encode('utf-8')) > target_bytes,
                         'request_filename': f'{stem}.request.json'})
 manifest = {'sizing': 'Heuristic UTF-8 bytes / 4, NOT tokenizer counts; includes rendered chat framing. All tool contexts preserve complete capture 00031.',
-            'format': 'Qwen official reference Jinja, thinking disabled, add_generation_prompt true; tool argument JSON strings parsed as objects for template parameter rendering. Rendered txt requires HIPFIRE_JINJA_CHAT=0. Request JSON can instead use normal messages/tools rendering.',
+            'format': 'Qwen official reference Jinja, thinking disabled, add_generation_prompt true; tool argument JSON strings parsed as objects for template parameter rendering. Rendered txt is wrapped again by a model chat template; use the request JSON (normal messages/tools rendering) against a templated model.',
             'generator': 'generate.py', 'jinja2_version': jinja2.__version__, 'prompts': entries}
 (ROOT / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 files = sorted(p for p in ROOT.iterdir() if p.is_file() and p.name != 'MD5SUMS')

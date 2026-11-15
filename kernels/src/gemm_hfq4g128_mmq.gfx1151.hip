@@ -8,15 +8,15 @@
 
 // Non-grouped i8 WMMA MMQ port of `gemm_hfq4g128.hip` for gfx1151 (Strix Halo).
 //
-// Why this exists (rocprof 2026-05-22 attribution on A3B-PARO pp256 HEAD):
-// `gemm_hfq4g128` = **66.31%** of prefill wall time, the single largest
-// kernel slice. It's the catch-all batched GEMM for ParoQ4G128 weights NOT
-// covered by the routed-MoE grouped MMQ k8 path — shared-expert gate/up/
+// Why this exists:
+// `gemm_hfq4g128` was the single largest slice of prefill wall time. It is
+// the catch-all batched GEMM for HFQ4G128 weights NOT covered by the
+// routed-MoE grouped MMQ k8 path — shared-expert gate/up/
 // down, LA wqkv/wz, FullAttn QKV/wo. The G256 sister has a full arch zoo
 // (RDNA2/CDNA1/RDNA3 MMQ + RDNA3/RDNA4 WMMA in dispatch.rs:13756-13830);
 // G128 has nothing but the baseline non-WMMA wave32 tiled kernel. This
-// closes that gap by reusing the i8 WMMA pattern from
-// `gemm_paro_q4g128_moe_grouped_mmq_k8.gfx1151.hip` minus the expert
+// closes that gap by reusing the i8 WMMA pattern of the routed grouped
+// MMQ k8 kernel minus the expert
 // scatter/gather, so it can replace the baseline directly.
 //
 // Activation contract: X must be pre-quantized to Q8_1 mmq DS4 layout via

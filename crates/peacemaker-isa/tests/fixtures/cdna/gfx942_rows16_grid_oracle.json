@@ -1,0 +1,185 @@
+{
+  "oracle": "qwen4_g942_rows16_grid_oracle",
+  "seed": 11400714819323198485,
+  "quick": false,
+  "image": "/scratch/quant/fn-fp8/beat/WC8/abi-rcpt/rows16-grid.elf",
+  "cases_pass": 770,
+  "cases_fail": 0,
+  "controls_detected": 17,
+  "controls_missed": 0,
+  "rows": [
+    {
+      "case": "rows16_grid ms=[320] k=10240 rows=1 x=f32 d_mask=0b0000",
+      "ok": true,
+      "guards_ok": true,
+      "differing_bytes_vs_reference": {
+        "reference_repeat": 0,
+        "module": 0,
+        "product_grid": 0,
+        "module_x2": 0
+      }
+    },
+    {
+      "case": "rows16_grid ms=[320] k=10240 rows=1 x=f32 d_mask=0b0001",
+      "ok": true,
+      "guards_ok": true,
+      "differing_bytes_vs_reference": {
+        "reference_repeat": 0,
+        "module": 0,
+        "product_grid": 0,
+        "module_x2": 0
+      }
+    },
+    {
+      "case": "rows16_grid ms=[320] k=10240 rows=2 x=f32 d_mask=0b0000",
+      "ok": true,
+      "guards_ok": true,
+      "differing_bytes_vs_reference": {
+        "reference_repeat": 0,
+        "module": 0,
+        "product_grid": 0,
+        "module_x2": 0
+      }
+    },
+    {
+      "case": "rows16_grid ms=[320] k=10240 rows=2 x=f32 d_mask=0b0001",
+      "ok": true,
+      "guards_ok": true,
+      "differing_bytes_vs_reference": {
+        "reference_repeat": 0,
+        "module": 0,
+        "product_grid": 0,
+        "module_x2": 0
+      }
+    },
+    {
+      "case": "rows16_grid ms=[320] k=10240 rows=7 x=f32 d_mask=0b0000",
+      "ok": true,
+      "guards_ok": true,
+      "differing_bytes_vs_reference": {
+        "reference_repeat": 0,
+        "module": 0,
+        "product_grid": 0,
+        "module_x2": 0
+      }
+    },
+    {
+      "case": "rows16_grid ms=[320] k=10240 rows=7 x=f32 d_mask=0b0001",
+      "ok": true,
+      "guards_ok": true,
+      "differing_bytes_vs_reference": {
+        "reference_repeat": 0,
+        "module": 0,
+        "product_grid": 0,
+        "module_x2": 0
+      }
+    },
+    {
+      "case": "rows16_grid ms=[320] k=10240 rows=8 x=f32 d_mask=0b0000",
+      "ok": true,
+      "guards_ok": true,
+      "differing_bytes_vs_reference": {
+        "reference_repeat": 0,
+        "module": 0,
+        "product_grid": 0,
+        "module_x2": 0
+      }
+    },
+    {
+      "case": "rows16_grid ms=[320] k=10240 rows=8 x=f32 d_mask=0b0001",
+      "ok": true,
+      "guards_ok": true,
+      "differing_bytes_vs_reference": {
+        "reference_repeat": 0,
+        "module": 0,
+        "product_grid": 0,
+        "module_x2": 0
+      }
+    },
+    {
+      "control": "rows16_grid x_bf16 flip_x_byte",
+      "differing_bytes": 1339,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_bf16 flip_a0_byte",
+      "differing_bytes": 93,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_bf16 flip_a1_byte",
+      "differing_bytes": 96,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_bf16 rows_minus_1",
+      "differing_bytes": 2555,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_bf16 swap_a0_a1",
+      "differing_bytes": 96800,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_bf16 swap_d0_d1",
+      "differing_bytes": 96800,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_bf16 wrong_k",
+      "differing_bytes": 96821,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_bf16 wrong_d_mask",
+      "differing_bytes": 99480,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_f32 flip_x_byte",
+      "differing_bytes": 1313,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_f32 flip_a0_byte",
+      "differing_bytes": 96,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_f32 flip_a1_byte",
+      "differing_bytes": 94,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_f32 rows_minus_1",
+      "differing_bytes": 2557,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_f32 swap_a0_a1",
+      "differing_bytes": 96888,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_f32 swap_d0_d1",
+      "differing_bytes": 96888,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_f32 wrong_k",
+      "differing_bytes": 96647,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_f32 wrong_d_mask",
+      "differing_bytes": 99437,
+      "detected": true
+    },
+    {
+      "control": "rows16_grid x_f32 wrong_entry(qwen4_g942_rows16_grid)",
+      "differing_bytes": 38782,
+      "detected": true
+    }
+  ]
+}

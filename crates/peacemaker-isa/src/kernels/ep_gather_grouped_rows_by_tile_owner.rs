@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Builder-emitted (PeaceMaker) gfx1100 / gfx1201 tile pull of the Flash-Next
-//! owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`). For every live
+//! owner-routed chunk MoE. For every live
 //! tile whose expert another rank owns, copy the tile's sixteen grouped rows of
 //! the OWNER's `y_down_grouped` (peer-mapped device memory) onto the same rows
 //! of this rank's buffer. All ranks run the same stable grouping, so a tile has

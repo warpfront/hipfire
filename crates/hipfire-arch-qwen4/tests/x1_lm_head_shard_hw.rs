@@ -104,7 +104,6 @@ fn weight<'a>(buf: &'a GpuTensor, m: usize) -> WeightRef<'a> {
         m,
         k: K,
         row_stride: ROW_STRIDE,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,

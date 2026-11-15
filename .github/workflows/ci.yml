@@ -4,8 +4,10 @@ name: CI
 #
 # hipfire loads the HIP/ROCm runtime via dlopen at *runtime* (see
 # crates/hip-bridge — libloading, no build.rs, no link-time -lamdhip64),
-# so the entire workspace compiles and unit-tests on a stock runner with
-# no GPU and no ROCm installed. The GPU-bound gates need real RDNA
+# so the entire workspace compiles on a stock runner with no GPU and no
+# ROCm installed. The test shards install the ROCm compiler toolchain (no
+# GPU, no driver) because the ISA/PeaceMaker CPU-oracle tests assemble,
+# link and compile with it. The GPU-bound gates need real RDNA
 # hardware and are run MANUALLY from a checkout — see docs/VALIDATION.md
 # and scripts/gates.sh. The agentic CI gate workflows (claude-review.yml,
 # gpu-gates.yml, gate-merge.yml, gate-sweep.yml) were removed; they were
@@ -31,6 +33,9 @@ on:
     # via the GPU-free `cargo test --lib --workspace` dispatch coverage gate,
     # not just on PRs. beta = pre-release line, also pushed to directly.
     branches: [master, beta, 'integration/**']
+  # Manual runs on any branch (`gh workflow run ci.yml --ref <branch>`), e.g.
+  # to prove a CI change green before it lands.
+  workflow_dispatch:
 
 # Supersede in-flight runs when a PR gets new pushes.
 concurrency:
@@ -81,6 +86,12 @@ jobs:
             # shards; only the never-run examples/benches/GPU tests are
             # type-checked rather than linked.
             run: cargo check --locked --workspace --all-targets
+          - name: all-features
+            # `all-targets` above builds with default features, which skips every
+            # example/test behind `required-features` (lab, deltanet,
+            # reference-parity, ...) or a `#![cfg(feature)]`: ~820 targets that
+            # rotted unseen. --all-features type-checks all of them.
+            run: cargo check --locked --workspace --all-targets --all-features
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -108,7 +119,10 @@ jobs:
       # Belt and braces on a GPU-less runner: no test may see a device.
       ROCR_VISIBLE_DEVICES: "-1"
       HIP_VISIBLE_DEVICES: "-1"
-      HIPFIRE_TEST_REQUIRE_ROCM: "0"
+      # No HIPFIRE_TEST_REQUIRE_ROCM=0: the step below installs the ROCm
+      # compiler toolchain, so every ISA/PeaceMaker CPU-oracle test (llvm-mc,
+      # ld.lld, hipcc, ...) runs here instead of skipping, and a missing tool
+      # fails the shard. Only the Windows job is a no-ROCm host.
       # GPU-free integration/bin tests: `--lib` skips crates/*/tests/*.rs and
       # bin-only unit tests. These crates' integration tests are GPU-free (GPU
       # ones are #[ignore]). The `int-*` shards split them by the first letter
@@ -151,10 +165,24 @@ jobs:
           - name: rdna-compute-abi
             # dflash_accept_emu compares the builder device-accept kernel with
             # the rdna-compute host twin on the CPU interpreter;
-            # all_launcher_abi is the MoE launcher ABI gate.
+            # all_launcher_abi is the MoE launcher ABI gate;
+            # kernel_registry_coverage is the static kernel-pack completeness
+            # gate (every runtime HIP module registered or allowlisted);
+            # flagship_pack_coverage and fn_route_plan pin the source SHA-256 of
+            # every measured flagship / walked Flash-Next module (GPU- and
+            # hipcc-free; a kernel source edit must re-pin them in the same change).
+            # flags_defaults_golden + flags-golden-extract.py are the flags defaults
+            # golden (tests/golden/flags-defaults): a default, ArchCaps accessor or
+            # config key change needs its golden row in the same commit
+            # (scripts/flags-golden.sh --regen).
             run: |
               cargo test --profile ci --locked -p rdna-compute --test dflash_accept_emu
               cargo test --profile ci --locked -p rdna-compute --test all_launcher_abi
+              cargo test --profile ci --locked -p rdna-compute --test kernel_registry_coverage
+              cargo test --profile ci --locked -p rdna-compute --test flagship_pack_coverage
+              cargo test --profile ci --locked -p rdna-compute --test fn_route_plan
+              cargo test --profile ci --locked -p hipfire-runtime --test flags_defaults_golden
+              python3 scripts/flags-golden-extract.py
           - name: int-e
             run: cargo test --profile ci --locked $INTEG_PKGS --test '[e]*'
           - name: int-l
@@ -166,9 +194,70 @@ jobs:
           - name: int-rest
             # Everything else, plus the unit tests of the lib and bin targets.
             run: cargo test --profile ci --locked $INTEG_PKGS --lib --bins --test '[!elmq]*'
+          - name: unrun-npu
+            # GPU-free targets no other shard runs (feature-gated or outside INTEG_PKGS);
+            # listed by name: a new target here must be added deliberately. Tests that need
+            # a GPU are #[ignore]d or left out.
+            run: |
+              cargo test --profile ci --locked -p peacemaker-npu --test array --test bw_probe --test config --test dma_array --test experts
+              cargo test --profile ci --locked -p railgun --features boundary-bench,cond-probe,g4-probe,mc-g2 --test kernel_abi_contract --test pinned_receipt
+              cargo test --profile ci --locked -p railgun-cert --test conditional_writer --test copy_kernel --test event_sync --test gfx1100_raon_decode --test gfx1100_raon_mq8 --test guard_kernel --test moe_sealed_standalone --test sealed_table --test task_graph --test wg_footprint --test whole16_fp8_abi
+              cargo test --profile ci --locked -p railgun-corpus --test conditional_receipt
+              cargo test --profile ci --locked -p railgun-jitcorpus --test corpus --test from_cache --test program_sequence
+              cargo test --profile ci --locked -p radiowave --test downstream_peacemaker_manifest --test union_identity
+          - name: unrun-pm
+            # Same rule as unrun-npu.
+            run: |
+              cargo test --profile ci --locked -p peacemaker-rip --features certify,hw-diff,l1 --test cdna --test check --test cli --test cookbook_a --test cookbook_b --test diag --test docs --test eval --test fa_prefill_twin --test features --test fmt --test fp8_gemm_twin --test gemv_mq2_xbatch_twin --test hc8_wmma_twin --test iu4_gemm_fine_emu --test iu4_gemm_fine_twin --test iu4_gemm_twin --test mq6_i8_gemm_twin --test producers_twin --test qsa --test qsa_select --test qsa_select_bf16 --test qwen4_moe_sym_twin --test ring_depth_script --test run --test runtime_join --test search --test validate --test vocabulary --test workgroup_id
+              cargo test --profile ci --locked -p peacemaker-cdna --test enc_ds --test enc_flat --test enc_mubuf --test enc_smem --test enc_sop --test enc_vop --test enc_vop3 --test enc_vop3p --test enc_vopk --test float --test sim_coverage --test sim_gemm --test sim_load --test sim_mem --test sim_mfma --test sim_salu --test sim_valu --test sim_xlane --test text_parse --test xml_inst --test xml_mix_alias_receipt --test xml_sdwa_receipt
+              cargo test --profile ci --locked -p peacemaker-ir --test emu_helpers --test handler_semantics_drift --test kernarg_indexed
+              cargo test --profile ci --locked -p peacemaker-isa --features lab,toolchain --test ds_bpermute --test native_identity --test pm_decode_load_fifo
+          - name: unrun-rdna
+            # Same rule as unrun-npu.
+            run: |
+              cargo test --profile ci --locked -p hipfire-dispatch --features lab,test-utils --test slab_moe_decode
+              cargo test --profile ci --locked -p rdna-compute --features deltanet,lab --test gemm_q8_0_mmq_gfx11_tiles --test jit_a3_route_plan --test jit_g0_route_data --test kernel_abi_drift --test lwmma_tile_hw --test mq6sym_i8_decode_hw --test q8_batched_chunk_plan --test qsa_filter_select --test qwen4_ep_owner_assign_pinned_pm --test qwen4_ep_owner_assign_pm --test qwen4_moe_down_a8_hw --test qwen4_moe_ep_a8_hw
+          - name: unrun-models
+            # Same rule as unrun-npu.
+            run: |
+              cargo test --profile ci --locked -p hipfire-arch-lfm2moe --features lab --test offload_parity
+              cargo test --profile ci --locked -p hipfire-arch-qwen35 --features deltanet,lab,moe-oracle --test dflash_lookup_state_oracle --test draft_vocab_rebuild --test sampled_mtp_penalty_hw
+              cargo test --profile ci --locked -p hipfire-arch-qwen4 --features lab,qwen4-dev-profiles,reference-parity --test dev_ple_rows_cpu --test expert_keep_route --test greedy_mtp_identity_hw --test mtp_reference_runtime_eq --test mtp_takeover_fill_hw --test npu_trunk_packing --test npu_trunk_plan --test npu_trunk_programs --test npu_trunk_simulation --test q8_ef_product_routes_hw --test sampled_mtp_distribution_hw --test session_cache_hw --test slowlink_prefill_hw
+          - name: unrun-runtime
+            # Same rule as unrun-npu; plus hipfire-quantize's bin unit tests.
+            run: |
+              cargo test --profile ci --locked -p hipfire-quantize --features lab --test cli_contract
+              cargo test --profile ci --locked -p hipfire-runtime --features deltanet,lab,rdna-compute/lab --test arch_id_unification --test cpu_quant_cross_check --test hf_tokenizer_corpus --test hf_tokenizer_differential --test kv_adaptive_reset --test mesh_split_refusal_alloc --test raon_template --test root_routed_ep_schedule --test tool_call_parser
+              cargo test --profile ci --locked -p hipfire-quantize --bins
     steps:
       - name: Private hipfire lock dir
         run: echo "HIPFIRE_LOCK_DIR=$RUNNER_TEMP/hipfire-locks" >> "$GITHUB_ENV" && mkdir -p "$RUNNER_TEMP/hipfire-locks"
+      - name: ROCm 10.1 compiler toolchain (CPU oracles; no GPU)
+        # The Containerfile's rocm-sdk packages and pins (ROCm 10.1.0-3, the
+        # release kernel-pack toolchain), from AMD's repo for this runner's
+        # Ubuntu, laid out as on a dev host (/opt/rocm/{bin,lib,llvm,core,...}
+        # -> core-10.1) so the oracle tests resolve the tools they use there.
+        run: |
+          set -euo pipefail
+          ROCM_PKG_VERSION=10.1.0-3
+          . /etc/os-release
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://stable.repo.amd.com/rocm/gpg/packages.gpg | sudo tee /etc/apt/keyrings/amdrocm.asc >/dev/null
+          fingerprint="$(gpg --batch --with-colons --show-keys /etc/apt/keyrings/amdrocm.asc | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test "$fingerprint" = D0F004A0025A1145C7807FCD0701EAC4D5E02107
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.asc] https://stable.repo.amd.com/rocm/core/packages/ubuntu${VERSION_ID//./} stable main" \
+            | sudo tee /etc/apt/sources.list.d/amdrocm.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            amdrocm-runtime10.1="$ROCM_PKG_VERSION" amdrocm-runtime-dev10.1="$ROCM_PKG_VERSION"
+          for name in bin lib include libexec share; do sudo ln -sfn "core-10.1/$name" "/opt/rocm/$name"; done
+          sudo ln -sfn core-10.1/lib/llvm /opt/rocm/llvm
+          sudo ln -sfn core-10.1/lib/llvm/amdgcn /opt/rocm/amdgcn
+          sudo ln -sfn core-10.1 /opt/rocm/core
+          sudo ln -sfn core-10.1 /opt/rocm/core-10
+          /opt/rocm/lib/llvm/bin/clang --version
+          /opt/rocm/bin/hipcc --version
+          df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -344,33 +433,26 @@ jobs:
     # branch that introduces them, so a red here is a real regression, not lint
     # debt. scripts/gates.sh is the separate GPU/model harness and needs
     # hardware -- it is deliberately not called from CI.
+    #
+    # The gate list lives in scripts/ci-gates.sh, which scripts/pre-commit-ci.sh
+    # runs too, so the two cannot drift apart.
     steps:
       - uses: actions/checkout@v4
         with:
-          # ratchet-diff resolves the merge base to read the base revision's
-          # thresholds; a shallow clone has no merge base to find.
+          # ratchet-diff and the MTP parity guard resolve the merge base to read
+          # the base revision; a shallow clone has no merge base to find.
           fetch-depth: 0
-      - name: Ratchets, layering, arch dispatch, qt register, bypass ledger
-        run: bash scripts/leanup-ratchets.sh
-      - name: Crate maps match the tree
-        run: python3 scripts/check-crate-maps.py --check
-      - name: Scratch growers invalidate captured graphs first
-        run: python3 scripts/check-scratch-growth.py
-      - name: Released CHANGELOG sections match their tags
-        run: python3 scripts/check-changelog.py
-      - name: Row-predicate selector constants carry a covering receipt
-        run: python3 scripts/check-selector-receipts.py
-      - name: MTP parity fixture bytes are pinned and the acceptance ratchet self-tests
-        run: |
-          python3 scripts/check-mtp-parity-ratchet.py --self-test
-          python3 scripts/check-mtp-parity-ratchet.py fixture
-      - name: No committed expectation was loosened
-        # PR-only: on a push there is no proposed base to compare against.
-        if: github.event_name == 'pull_request'
+      - name: Structural gates (scripts/ci-gates.sh)
+        # On a PR the base-relative gates run too (ratchet-diff: no committed
+        # expectation was loosened; the MTP parity ratchet guard). A push has
+        # no proposed base to compare against.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ "${{ github.event_name }}" != pull_request ]; then
+            exec bash scripts/ci-gates.sh
+          fi
           labels_json=$(gh pr view "${{ github.event.pull_request.number }}" --json labels)
           if echo "$labels_json" | jq -e '.labels[] | select(.name=="ratchet-raise")' >/dev/null; then
             export RATCHET_RAISE_LABEL_PRESENT=1
@@ -378,7 +460,7 @@ jobs:
             export RATCHET_RAISE_LABEL_PRESENT=0
           fi
           export RATCHET_RAISE_REQUIRE_LABEL=1
-          bash scripts/ratchet-diff.sh "origin/${{ github.base_ref }}"
+          bash scripts/ci-gates.sh "origin/${{ github.base_ref }}"
 
   supply-chain:
     name: cargo-deny (${{ matrix.checks }})

@@ -130,7 +130,7 @@ impl Gpu {
     /// Whether [`Self::gemv_mq4g256v2_lane_proj`] is admitted: exact gfx1201,
     /// `lanes` in `1..=8`, `k == 2048`, 1..=4 segments of at most `i32::MAX`
     /// rows (a pure function of shapes; the caller guarantees the weights are
-    /// MQ4G256V2 without AWQ / ParoQuant, as for the x-batch GEMV it replaces).
+    /// MQ4G256V2 without AWQ, as for the x-batch GEMV it replaces).
     pub fn lane_proj_admitted(&self, rows: &[usize], k: usize, lanes: usize) -> bool {
         let total: usize = rows.iter().sum();
         self.arch_caps.is_gfx1201()

@@ -36,7 +36,8 @@ fn emit(spec: Spec) -> Result<Emitted, String> {{
     let kspec = KernelSpec {{
         kernel_id: "t".into(), variant: "v".into(), arch: spec.arch, symbol: "t_kernel".into(),
         kernargs: KernargLayout::new(0), user_sgpr_count: 2, system_sgpr_workgroup_id_y: false,
-        workgroup_size: 32, group_segment_fixed_size: 1024, wave32: true, cu_mode: false,
+        workgroup_size: if spec.arch == Arch::Gfx942 {{ 64 }} else {{ 32 }},
+        group_segment_fixed_size: 1024, wave32: spec.arch != Arch::Gfx942, cu_mode: false,
     }};
     let mut p = RegPlan::new(256, 104)?;
     for i in 0..4u8 {{ p.v::<8>("vec", 8 * i, Live::Whole)?; }}
@@ -160,6 +161,11 @@ fn check_on_a_valid_kernel_exits_zero_with_a_summary_line_per_target() {
     assert_eq!(all.status.code(), Some(0));
     assert!(
         text(&all.stderr).contains("ok gfx1100/v: "),
+        "{}",
+        text(&all.stderr)
+    );
+    assert!(
+        text(&all.stderr).contains("ok gfx942/v: "),
         "{}",
         text(&all.stderr)
     );
@@ -387,4 +393,28 @@ fn help_and_no_arguments() {
     }
     assert_eq!(rip(&["--help"]).status.code(), Some(0));
     assert_eq!(rip(&[]).status.code(), Some(2));
+}
+
+#[test]
+fn check_accepts_gfx942_wave64_and_reports_resources() {
+    let dir = scratch("gfx942");
+    let body = good()
+        .replace("wave32: true", "wave32: false")
+        .replace("workgroup_size: 32", "workgroup_size: 64");
+    let src = write(&dir, "cdna.rip", &body);
+    let r = rip(&[
+        "check",
+        &src,
+        "--arch",
+        "gfx942",
+        "--variant",
+        "v",
+        "--json",
+    ]);
+    assert!(r.status.success(), "{}", text(&r.stderr));
+    let doc: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(doc["ok"], true, "{doc}");
+    assert_eq!(doc["results"][0]["arch"], "gfx942", "{doc}");
+    assert!(doc["results"][0]["resources"].is_object(), "{doc}");
+    std::fs::remove_dir_all(dir).unwrap();
 }

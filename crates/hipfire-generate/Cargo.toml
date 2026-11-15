@@ -32,7 +32,6 @@ hipfire-dispatch = { path = "../hipfire-dispatch" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-engine = { path = "../hipfire-engine" }
-hipfire-pflash = { path = "../hipfire-pflash" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
@@ -81,9 +80,6 @@ vcn-jpeg = ["hipfire-arch-qwen35-vl/vcn-jpeg"]
 # measure_floor there), so the lab gate costs it nothing on the path that
 # needs it while keeping it off the default `cargo build --all-targets`.
 # ---------------------------------------------------------------------------
-[[example]]
-name = "attn_wmma_row_probe"
-required-features = ["lab"]
 
 [[example]]
 name = "split_prefill_probe"

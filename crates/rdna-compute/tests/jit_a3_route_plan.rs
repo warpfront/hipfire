@@ -313,7 +313,6 @@ fn ar_plan_carries_no_native_mtp_head_or_unrelated_model_recipe() {
             "glimmer",
             "minimax",
             "qsa_",
-            "ddtree",
             "dspark",
             "_gfx1151",
             "eagle",
@@ -592,11 +591,7 @@ fn explicit_drafter_and_unclosed_routes_refuse() {
         flags: &flags,
     };
     let refused = |load: &Load<'_>| matches!(plan(load), Err(RegistryError::UnsupportedRoute(_)));
-    for spec in [
-        KernelSpecRoute::DFlash,
-        KernelSpecRoute::DDTree,
-        KernelSpecRoute::DSpark,
-    ] {
+    for spec in [KernelSpecRoute::DFlash, KernelSpecRoute::DSpark] {
         assert!(refused(&Load { spec, ..base }), "{spec:?} must refuse");
     }
     assert!(refused(&Load {

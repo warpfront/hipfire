@@ -126,6 +126,8 @@ pub mod slowlink_sp;
 pub mod state;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod state_parity;
+/// The stock-FP8 MTP head sidecar (`<model>.mtp`): bind, routing and log lines.
+pub mod stock_mtp_sidecar;
 pub mod sym_verdict_cache;
 pub(crate) mod trunk_a8;
 pub mod trunk_overlay;
@@ -155,7 +157,6 @@ pub use config::{
 pub use gpu_forward::{
     ep_reserve_receipt_scope, qwen4_compact_scratch_possible, qwen4_forward_device_bytes,
     qwen4_forward_scratch_mode, Qwen4ForwardScratchMode, QWEN4_COMPACT_FALLBACK_ROWS,
-    QWEN4_COMPACT_SCRATCH_ENV,
 };
 pub use gpu_forward_lanes::{WaveHead, WaveLane};
 pub use hc8_sidecar::{hc8_sidecar_saved_bytes, resolve_hc8_sidecar, Qwen4Hc8Sidecar};
@@ -166,7 +167,9 @@ pub use ple::{
     PLE_PADDED_ROWS, PLE_PADDING_MULTIPLE, PLE_ROW_WIDTH, PLE_VALID_ROWS,
 };
 pub use rdna_compute::tensor_ops::{GdnStateFormat, QsaKvFormat};
-pub use state::{resolve_gdn_format, resolve_qsa_format, resolve_state_format, Qwen4StateFormat};
+pub use state::{
+    resolve_gdn_format, resolve_qsa_format, resolve_state_format, GdnStreamKind, Qwen4StateFormat,
+};
 pub use trunk_overlay::{
     resolve_trunk_overlay, trunk_overlay_extra_bytes, Qwen4TrunkOverlay, TrunkOverlayPolicy,
 };

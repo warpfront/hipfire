@@ -73,7 +73,7 @@ Both `master` and `beta` are mutable. For a reproducible install, pin and
 inspect the installer itself, then ask it to install the same tag or commit:
 
 ```bash
-PIN=v0.4.5
+PIN=v0.4.6
 curl -fsSL "https://raw.githubusercontent.com/warpfront/hipfire/${PIN}/scripts/install.sh" \
   -o /tmp/hipfire-install.sh
 sha256sum /tmp/hipfire-install.sh
@@ -81,7 +81,7 @@ less /tmp/hipfire-install.sh
 bash /tmp/hipfire-install.sh --ref "$PIN"
 ```
 
-Use `--tag v0.4.5` when the kind is known, or `--commit <full-sha>` for an
+Use `--tag v0.4.6` when the kind is known, or `--commit <full-sha>` for an
 immutable commit. Fetching a pinned script but omitting the selector installs
 `master`, so keep the two pins together.
 
@@ -140,7 +140,7 @@ directory or URL holding the assets (`https://…`, `file:///…`, or a plain
 path), for mirrors and offline installs:
 
 ```bash
-bash install.sh --tag v0.4.5 --kernel-pack-url file:///srv/hipfire-packs/v0.4.5
+bash install.sh --tag v0.4.6 --kernel-pack-url file:///srv/hipfire-packs/v0.4.6
 ```
 
 `hipfire kernel-pack install --tag <tag> --arch <arch> --source ~/.hipfire/src`
@@ -196,9 +196,9 @@ Repository variables choose another image
 publish from a local toolchain instead:
 
 ```bash
-scripts/build-kernel-pack.sh --tag v0.4.5 --out dist            # every admitted arch
-scripts/build-kernel-pack.sh --tag v0.4.5 --out dist gfx1201    # or a subset
-gh release upload v0.4.5 dist/hipfire-kernels-v0.4.5-*
+scripts/build-kernel-pack.sh --tag v0.4.6 --out dist            # every admitted arch
+scripts/build-kernel-pack.sh --tag v0.4.6 --out dist gfx1201    # or a subset
+gh release upload v0.4.6 dist/hipfire-kernels-v0.4.6-*
 ```
 
 The script compiles `git archive` of the tag's commit with a fresh `HOME` and
@@ -367,6 +367,19 @@ The limits below are properties of the code, not observations from a card:
   resolved DLL path and the HIP runtime/driver versions at start, and
   `hipfire diag --json` reports them under `live_gpu`
   (`hip_runtime_library`, `hip_runtime_version_raw`, `hip_driver_version_raw`).
+- **Process priority.** A Windows child process inherits its parent's
+  priority class only when that class is Idle or BelowNormal, and hipfire
+  never changes it. A Task Scheduler task runs at priority 7 by default, which
+  is BelowNormal, so a `hipfire serve` started by a default task (and the
+  daemon it spawns) runs behind every Normal-priority thread and generates
+  more slowly. Set the task's priority to 4–6 (Normal; export the task, change
+  `<Priority>7</Priority>`, re-import it) or start hipfire from a
+  Normal-priority process (`start "" /normal hipfire serve`). The daemon logs
+  a warning at start when its class is Idle or BelowNormal, and `hipfire diag`
+  shows the class (`priority_class` in `--json`) (#1144).
+- **`hipfire fit`** lists the GPUs and their VRAM from HIP and host RAM from
+  `GlobalMemoryStatusEx` (there is no KFD topology or `/proc`); see
+  [CLI](CLI.md#hipfire-fit) (#1145).
 - **Model file mapping.** On unified-memory GPUs (Strix Halo) the model file
   mapping is released after the headers are read, as on Linux; discrete GPUs
   keep it on both OSes.
@@ -517,7 +530,7 @@ one build, then prints one `fix:` line per problem
 hipfire update                  # advance the currently selected branch
 hipfire update @beta            # auto-detect branch/tag/commit
 hipfire update --branch master
-hipfire update --tag v0.4.5
+hipfire update --tag v0.4.6
 hipfire update --commit <sha>
 ```
 
@@ -583,7 +596,7 @@ Defaults that matter on day one (from the native schema; full table in [CONFIG.m
 | `temperature` | `0.3` | Stored global default only for run/serve send (see above); Chat session seed |
 | `max_tokens` | `4096` | Per-request generation cap for `run` / API fallback |
 | `kv_cache` | `auto` | Resolves via a registry non-q8 `default_kv_mode`, else the architecture default: Qwen native `fp8` on eligible exact gfx1201, `q8` on gfx1100 / gfx1151 and elsewhere. `fwht3` is an optional headroom mode |
-| `dflash_mode` | **`off`** (schema) | DFlash is opt-in; pulling a draft does not enable it. Exception: Qwen3.8-27B tiers with a registry-declared draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) resolve `auto` through the registry layer, so the pulled draft is used there; if the draft file is absent the load keeps MTP `auto` (AR for this Qwen35 producer: it declares no measured AR floor, so only `--spec mtp` arms its head). `hipfire config set dflash_mode off` is the kill switch ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)). |
+| `dflash_mode` | **`off`** (schema) | DFlash is opt-in; pulling a draft does not enable it. Exception: Qwen3.8-27B tiers with a registry-declared draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`, and `-mq5*` on a card with at least 28 GiB of VRAM) resolve `auto` through the registry layer, so the pulled draft is used there; if the draft file is absent the load keeps MTP `auto` (AR for this Qwen35 producer: it declares no measured AR floor, so only `--spec mtp` arms its head). `hipfire config set dflash_mode off` is the kill switch ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)). |
 | `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`. Native **MTP** under `auto` arms only a producer that declares a measured AR floor (today only Flash-Next / Qwen4); Qwen3.5-class and DeepSeek V4 heads stay AR until `--spec mtp` opts in. An eligible **DSpark** sidecar may still activate under `auto`. Use `speculation=off` to force plain AR. |
 | `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
 | `host` / `port` | `127.0.0.1` / `11435` | Serve bind (no TLS; key optional, recommended off loopback) |
@@ -604,9 +617,7 @@ another installed target still declares it (see [CLI.md](CLI.md)).
 ## Long context (optional)
 
 Long context needs no extra setup beyond `max_seq` and VRAM; for KV headroom
-pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)). CASK/TriAttention
-eviction is deprecated and will be removed in 0.5.0 — off by default, not
-supported, and not a recommended route to long context.
+pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)).
 
 **YaRN context extension (since 0.4.2, Qwen3.8-Flash-Next only).** The engine can
 apply YaRN RoPE scaling at load through `attention.yarn_factor` (env
@@ -652,12 +663,12 @@ These behaviors shipped in 0.4.2 and are in every later release.
   embedded-q8 run), so treat the sidecar as a capacity lever for 128 GB-class
   hosts, not a free default.
 - **EP owner-routed prefill and expert staging.** With `topology.ep` 2..=8,
-  `HIPFIRE_EP_OWNER_ROUTED_PREFILL` defaults on when every admission condition
+  owner-routed prefill runs when every admission condition
   holds (exact gfx1201 on the symmetric IU4 route, exact gfx1100 on the F16
-  WMMA grouped route); `HIPFIRE_EP_EXPERT_STAGE` defaults on only on gfx1201.
-  The exact value `0` disables each. Single-card runs are unchanged. Setup and
-  gates: [multi-gpu.md](multi-gpu.md); variable semantics:
-  [env-vars.md](env-vars.md).
+  WMMA grouped route). Expert staging is on only on gfx1201.
+  Single-card runs are
+  unchanged. Setup and gates: [multi-gpu.md](multi-gpu.md); variable
+  semantics: [env-vars.md](env-vars.md).
 
 ## If something fails
 

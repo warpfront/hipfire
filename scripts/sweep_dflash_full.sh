@@ -4,8 +4,8 @@
 # Copyright (c) 2026 Kaden Schutt
 # hipfire — see LICENSE and NOTICE in the project root.
 
-# DFlash + DDTree sweep across 9B/27B-3.5/27B-3.6 post-EOT-fix (commit 6cff40e).
-# Matrix: 3 models × 2 modes (DFlash linear, DDTree b12-k2) × 3 genres
+# DFlash sweep across 9B/27B-3.5/27B-3.6 post-EOT-fix (commit 6cff40e).
+# Matrix: 3 models × 1 mode (DFlash linear) × 3 genres
 #         (code/prose/instruct) × 3 runs each, median reported.
 set -u
 cd "$(dirname "$0")/.."
@@ -95,7 +95,6 @@ MODELS=(
 
 MODES=(
   "dflash|"
-  "ddtree-b12-k2|--ddtree-batched --ddtree-budget 12 --ddtree-topk 2"
 )
 
 GENRES=(

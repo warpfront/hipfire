@@ -27,10 +27,8 @@ enum hipfire_flash_attn_ck_kv_format {
     HIPFIRE_FLASH_ATTN_CK_DENSE_F16 = 1,
     HIPFIRE_FLASH_ATTN_CK_DENSE_BF16 = 2,
     HIPFIRE_FLASH_ATTN_CK_Q8 = 3,
-    HIPFIRE_FLASH_ATTN_CK_ASYM3_GIVENS = 4,
+    /* 4 (Asym3-Givens), 6 (Lloyd) and 7 (Asym4-Givens) are retired. */
     HIPFIRE_FLASH_ATTN_CK_ASYM3_FWHT = 5,
-    HIPFIRE_FLASH_ATTN_CK_LLOYD = 6,
-    HIPFIRE_FLASH_ATTN_CK_ASYM4_GIVENS = 7,
     HIPFIRE_FLASH_ATTN_CK_ASYM4_FWHT = 8,
 };
 
@@ -92,7 +90,7 @@ struct hipfire_flash_attn_ck_fwd_params {
     int64_t packed_k_head_stride_bytes;
     int64_t packed_v_head_stride_bytes;
 
-    /* Asym transform metadata: cos/sin for Givens, signs1/signs2 for FWHT. */
+    /* Asym transform metadata: FWHT signs1/signs2. */
     const void* k_transform0;
     const void* k_transform1;
     int64_t k_transform0_elements;

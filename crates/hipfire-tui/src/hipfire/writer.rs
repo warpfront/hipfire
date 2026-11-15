@@ -9,9 +9,8 @@
 //! mutate the same sparse `~/.hipfire/config.toml` document.
 
 use hipfire_config::{
-    effective::Choice, field, is_deprecated_key, is_developer_key, is_typed_bool_developer_key,
-    load_global, parse_typed_bool, write_global_toml, ConfigLayer, ConfigPaths, ConfigValue,
-    ValueRule,
+    effective::Choice, field, is_developer_key, is_typed_bool_developer_key, load_global,
+    parse_typed_bool, write_global_toml, ConfigLayer, ConfigPaths, ConfigValue, ValueRule,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -36,9 +35,8 @@ pub struct FieldSpec {
 }
 
 /// KV cache modes in cycling order. Every entry is in the schema's own list
-/// (`memory.kv_cache`); the deprecated asymN/turboN aliases and the
-/// `legacy-*` Givens opt-outs are left out. A test pins this list to the schema
-/// minus those, so a mode the schema gains cannot silently go unselectable.
+/// (`memory.kv_cache`). A test pins this list to the schema, so a mode the
+/// schema gains cannot silently go unselectable.
 const KV_CACHE: &[&str] = &[
     "auto", "q8", "fwht4", "fwht3", "fwht2", "fp8", "bf16", "f16", "f32",
 ];
@@ -68,10 +66,8 @@ const FLASH_MODE: &[&str] = &["auto", "always", "never"];
 pub const SYM_IU4_KEY: &str = "developer.qwen4_moe_sym_iu4";
 
 /// Overrides of the schema-derived kind, only where the curated list has a
-/// better option order than the schema's own. Every other non-deprecated
-/// schema field gets its kind from its `ValueRule` ([`field_spec`]).
-/// `hipfire-config` is the sole validator; deprecated CASK/PFlash keys are
-/// deliberately absent (read-only in the TUI).
+/// better option order than the schema's own. Every other schema field gets its kind from its `ValueRule` ([`field_spec`]).
+/// `hipfire-config` is the sole validator.
 pub const EDITABLE_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         key: "kv_cache",
@@ -146,7 +142,6 @@ fn spec_table() -> &'static [(&'static str, FieldSpec)] {
 fn build_spec_table() -> Vec<(&'static str, FieldSpec)> {
     let mut table: Vec<(&'static str, FieldSpec)> = hipfire_config::fields()
         .iter()
-        .filter(|schema| !is_deprecated_key(schema.key))
         .map(|schema| {
             let curated = EDITABLE_FIELDS
                 .iter()
@@ -171,8 +166,8 @@ fn build_spec_table() -> Vec<(&'static str, FieldSpec)> {
     table
 }
 
-/// The edit spec of `key` (canonical or legacy spelling); `None` for a
-/// deprecated key, an unknown key, and any `developer.*` key but the typed
+/// The edit spec of `key` (canonical or legacy spelling); `None` for an
+/// unknown key, and any `developer.*` key but the typed
 /// boolean one (see [`field_kind`]).
 pub fn field_spec(key: &str) -> Option<&'static FieldSpec> {
     let canonical = match field(key) {
@@ -453,7 +448,7 @@ mod tests {
 
         // A free string keeps the empty string as a value.
         assert_eq!(
-            write_value(&path, "prefill_drafter", "").unwrap(),
+            write_value(&path, "session_cache_dir", "").unwrap(),
             Value::String(String::new())
         );
         // And a genuinely bad value is still rejected.
@@ -524,26 +519,6 @@ mod tests {
         );
     }
 
-    /// Deprecated CASK/PFlash keys are not editable rows.
-    #[test]
-    fn deprecated_keys_have_no_field_spec() {
-        for spec in EDITABLE_FIELDS {
-            assert!(
-                !hipfire_config::is_deprecated_key(spec.key),
-                "{} is deprecated but editable",
-                spec.key
-            );
-        }
-        for key in [
-            "cask",
-            "prefill_compression",
-            "prefill_drafter",
-            "prefill_threshold",
-        ] {
-            assert!(field_spec(key).is_none(), "{key}");
-        }
-    }
-
     /// Numeric ranges come from the schema, not a local copy: the old table said
     /// 131072/524288 where the schema allows 393216/1048576.
     #[test]
@@ -604,15 +579,7 @@ mod tests {
         let ValueRule::Enum(schema_list) = field("memory.kv_cache").unwrap().rule else {
             panic!("memory.kv_cache is not an enum rule");
         };
-        let live: std::collections::BTreeSet<&str> = schema_list
-            .iter()
-            .copied()
-            .filter(|mode| {
-                !(mode.starts_with("asym")
-                    || mode.starts_with("turbo")
-                    || mode.starts_with("legacy-"))
-            })
-            .collect();
+        let live: std::collections::BTreeSet<&str> = schema_list.iter().copied().collect();
         let offered: std::collections::BTreeSet<&str> = options.iter().copied().collect();
         assert_eq!(offered, live);
         for mode in ["fp8", "bf16", "f16", "f32"] {
@@ -631,10 +598,6 @@ mod tests {
     fn every_live_schema_field_has_a_kind_from_its_rule() {
         for schema in hipfire_config::fields() {
             let spec = field_spec(schema.key);
-            if is_deprecated_key(schema.key) {
-                assert!(spec.is_none(), "{} is deprecated", schema.key);
-                continue;
-            }
             let spec = spec.unwrap_or_else(|| panic!("{} has no spec", schema.key));
             assert!(
                 spec.key == schema.key || EDITABLE_FIELDS.iter().any(|s| s.key == spec.key),

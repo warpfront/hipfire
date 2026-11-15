@@ -107,7 +107,7 @@ fn eligible_groups(body: &Body, arch: Arch) -> Vec<EligibleGroup> {
     let mut groups: Vec<EligibleGroup> = Vec::new();
     for p in 1..body.layout.len() {
         let branch = body.insts.get(body.layout[p]).unwrap();
-        let Some(name) = branch.op.name(arch) else {
+        let Some(name) = branch.name(arch) else {
             continue;
         };
         if !matches!(name, "s_cbranch_scc0" | "s_cbranch_scc1") {
@@ -125,7 +125,7 @@ fn eligible_groups(body: &Body, arch: Arch) -> Vec<EligibleGroup> {
             continue;
         }
         let cmp = body.insts.get(body.layout[p - 1]).unwrap();
-        if !cmp.op.name(arch).is_some_and(|n| n.starts_with("s_cmp_")) {
+        if !cmp.name(arch).is_some_and(|n| n.starts_with("s_cmp_")) {
             continue;
         }
         let mut has_register = false;
@@ -635,10 +635,11 @@ mod tests {
 
     fn mkm(name: &str, operands: Vec<Operand>, mods: Modifiers) -> Inst {
         let r = row(name);
-        let inst = Inst::from_parts(
+        let inst = Inst::from_encoding(
             ARCH,
             r.op,
             r.form,
+            r.variant,
             canonical_fields(r),
             SmallVec::from_vec(operands),
             mods,

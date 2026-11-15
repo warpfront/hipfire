@@ -3,7 +3,7 @@
 scripts/device-mesh/matrix.json. Existing harnesses/tests plus thin
 daemon-JSONL drivers for G1/G2 rows. Predicates parse structured output."""
 import argparse
-import collections
+import glob
 import hashlib
 import json
 import os
@@ -56,10 +56,14 @@ def models_dir():
     return os.path.expanduser(os.environ.get("HIPFIRE_MODELS_DIR", "~/.hipfire/models"))
 
 def resolve_fixture(root, tag):
+    """Registry tag -> model file under the models dir; an alias tag resolves
+    through `aliases` like the CLI does (c0179aad7d made several tags aliases)."""
     try:
         reg = json.load(open(os.path.join(root, "registry", "v1.json")))
-        name = reg.get("models", reg).get(tag, {}).get("file")
-    except (OSError, ValueError):
+        models = reg.get("models", reg)
+        entry = models.get(tag) or models.get(reg.get("aliases", {}).get(tag, ""), {})
+        name = entry.get("file")
+    except (OSError, ValueError, AttributeError):
         name = None
     return os.path.join(models_dir(), os.path.basename(name) if name else tag)
 
@@ -103,6 +107,41 @@ def isolated_env(env_extra):
     env.setdefault("HIPFIRE_HOME", os.path.join(env.get("MATRIX_ISOLATED_HOME", "/tmp/device-mesh-matrix-home"), ".hipfire"))
     os.makedirs(env["HIPFIRE_HOME"], exist_ok=True)
     return env
+
+def live_pid(pid):
+    try:
+        os.kill(pid, 0)
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+def reservation_holders(out):
+    """PIDs named by daemon-*.pid files (written by gpu_lock.rs) under the run's
+    --home dirs and the isolated home that are still alive."""
+    pats = [os.path.join(out, "**", ".hipfire", "daemon-*.pid"),
+            os.path.join(isolated_env(None)["HIPFIRE_HOME"], "daemon-*.pid")]
+    holders = {}
+    for pat in pats:
+        for path in glob.glob(pat, recursive=True):
+            try:
+                pid = int(open(path).read().split()[0])
+            except (OSError, ValueError, IndexError):
+                continue
+            if pid != os.getpid() and live_pid(pid):
+                holders[pid] = path
+    return holders
+
+def wait_reservations_released(out, limit=120):
+    """A row's serve daemon may outlive its harness for a moment and still holds
+    the GPU reservation. Block until it is gone so row order cannot matter
+    (HIPF-391). Returns the holders still alive after `limit` seconds."""
+    deadline = time.time() + limit
+    holders = reservation_holders(out)
+    while holders and time.time() < deadline:
+        time.sleep(0.25)
+        holders = reservation_holders(out)
+    return holders
 
 def run_cmd(argv, env_extra, timeout):
     env = isolated_env(env_extra)
@@ -369,6 +408,49 @@ def eval_wire(runs, kind, pred):
                         and e.get("id") is not None and e.get("id") not in known):
                     bad.append("unknown-id terminal: %r" % (e.get("id"),))
         return not bad, "wire: %d id(s) exactly-one-terminal, bad=%s" % (len(ids), bad)
+    if kind == "wire_transitions":
+        # Promotion-lane transition row (forced advance, append, rollback).
+        # Every request ends `done` (aborted ones with finish_reason
+        # `aborted`) and every committed one shows a non-empty answer;
+        # `cached_ids` were served from the conversation the daemon held (an
+        # append, not a cold re-prefill); `rolled_back` needs an attested reset
+        # ack; `identical_ids` pairs replay the same route after a reset.
+        # `rollback_checks` [post, warm, cold]: the request after an aborted
+        # attempt must equal the clean replay of whichever route it took —
+        # `warm` when the daemon restored the held conversation (cached_tokens
+        # > 0), `cold` when the rollback dropped it (a full re-prefill).
+        run = runs[0]
+        aborted = set(pred.get("aborted_ids", []))
+        bad = []
+        def done_of(rid):
+            term = terminal_of(run, rid) or {}
+            return term if term.get("type") == "done" else None
+        def cached(rid):
+            n = (done_of(rid) or {}).get("cached_tokens")
+            return n if isinstance(n, int) else -1
+        for rid in run.get("generates", []):
+            term = terminal_of(run, rid) or {}
+            if term.get("type") != "done":
+                why = (" (%s)" % term.get("message", "")[:160]) if term.get("type") == "error" else ""
+                bad.append("%s: terminal %s%s" % (rid, term.get("type"), why))
+            elif rid in aborted and term.get("finish_reason") != "aborted":
+                bad.append("%s: finish_reason %r, the abort did not land" % (rid, term.get("finish_reason")))
+            elif rid not in aborted and not visible_text(id_events(run, rid)).strip():
+                bad.append("%s: empty answer" % rid)
+        for rid in pred.get("cached_ids", []):
+            if cached(rid) <= 0:
+                bad.append("%s: cached_tokens=%d, append not served from the held conversation" % (rid, cached(rid)))
+        if pred.get("rolled_back") and not any(
+                e.get("type") == "reset" and e.get("rolled_back") is True for e in run.get("events", [])):
+            bad.append("no attested reset (rolled_back=true) ack")
+        pairs = [tuple(p) for p in pred.get("identical_ids", [])]
+        for post, warm, cold in pred.get("rollback_checks", []):
+            pairs.append((post, warm if cached(post) > 0 else cold))
+        for a, b in pairs:
+            ta, tb = visible_text(id_events(run, a)), visible_text(id_events(run, b))
+            if not ta.strip() or ta != tb:
+                bad.append("%s vs %s: answers differ or empty (%d/%d chars)" % (a, b, len(ta), len(tb)))
+        return not bad, "wire: %d request(s), transitions bad=%s" % (len(run.get("generates", [])), bad)
     return False, "wire: unknown predicate %s" % kind
 
 def subst(node, mapping):
@@ -383,8 +465,14 @@ def subst(node, mapping):
         return re.sub(pattern, lambda m: mapping[m.group(0)], node)
     return node
 
+def visible_text(events):
+    """The answer a client shows: `token` events only, no reasoning stream."""
+    return "".join(e["text"] for e in events
+                   if isinstance(e, dict) and e.get("type") == "token" and isinstance(e.get("text"), str))
+
 def drive_session(daemon_bin, script, mapping, env, timeout):
     run = {"events": [], "generates": [], "loaded": [], "broken": ""}
+    mapping = dict(mapping)  # captures are per session
     try:
         proc = subprocess.Popen([daemon_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, bufsize=1,
@@ -400,9 +488,12 @@ def drive_session(daemon_bin, script, mapping, env, timeout):
             lines.put(None)
     threading.Thread(target=pump, daemon=True).start()
     # An undrained stderr pipe blocks the daemon once ~64 KiB of load/kernel
-    # logging accumulates, which surfaces as an opaque `load: timed out`.
-    err_tail = collections.deque(maxlen=200)
-    threading.Thread(target=lambda: err_tail.extend(proc.stderr), daemon=True).start()
+    # logging accumulates, which surfaces as an opaque `load: timed out`. The
+    # whole stream is kept: kernel-compile and think-cap markers land early in
+    # a load that logs ~1,000 lines, far outside any tail.
+    err_lines = []
+    err_pump = threading.Thread(target=lambda: err_lines.extend(proc.stderr), daemon=True)
+    err_pump.start()
     budgets = {"until": 0.0}
     def read_line(context):
         rest = budgets["until"] - time.time()
@@ -487,17 +578,28 @@ def drive_session(daemon_bin, script, mapping, env, timeout):
             request = subst(op["send"], mapping)
             proc.stdin.write(json.dumps(request) + "\n")
             proc.stdin.flush()
-            if op.get("handshake"):
+            if op.get("handshake") or op.get("abort_at_commit_ready"):
+                # `abort_at_commit_ready` is the rollback probe: the attempt
+                # has prefilled and decoded in full, then the client aborts
+                # instead of committing, so the daemon must restore the
+                # conversation state it held before the attempt.
                 rid = request.get("id")
                 run["generates"].append(rid)
+                reply = "abort" if op.get("abort_at_commit_ready") else "commit"
                 while True:
                     event = json.loads(read_line("generate %s" % rid))
                     run["events"].append(event)
                     if event.get("id") == rid and event.get("type") == "commit_ready":
-                        commit = {"type": "commit", "id": rid, "attempt_id": request.get("attempt_id", 1)}
-                        proc.stdin.write(json.dumps(commit) + "\n")
+                        control = {"type": reply, "id": rid, "attempt_id": request.get("attempt_id", 1)}
+                        proc.stdin.write(json.dumps(control) + "\n")
+                        proc.stdin.flush()
                     if event.get("id") == rid and event.get("type") in ("done", "error"):
                         break
+                if op.get("capture_text"):
+                    # A later turn quotes this answer back as its assistant
+                    # history (`$CAPTURE_<name>`), so the session can append a
+                    # turn to the conversation the daemon already holds.
+                    mapping["$CAPTURE_" + op["capture_text"]] = visible_text(id_events(run, rid))
             elif "expect_terminal" in op:
                 wait_for(op["expect_terminal"], "terminal")
             elif op.get("expect") == "loaded" and "assert_loaded" in op:
@@ -517,7 +619,9 @@ def drive_session(daemon_bin, script, mapping, env, timeout):
         except subprocess.TimeoutExpired:
             proc.kill()
         run["vram_raw"] = best_effort(["rocm-smi", "--showmeminfo", "vram"], 500)
-        run["stderr_tail"] = "".join(list(err_tail))[-4000:]
+        err_pump.join(timeout=10)
+        run["stderr"] = "".join(err_lines)
+        run["stderr_tail"] = run["stderr"][-4000:]
     return run
 
 def split_env(cmd):
@@ -698,7 +802,14 @@ def execute_row(ctx, row, out, timeout):
                 break
     for cmd in row.get("commands", {}).get("positive", []):
         positives += [r for r in [exec_probe(sub, cmd, timeout)] if "skipped" not in r]
-    detail["logs"] = save_logs(out, row["id"], "positive", positives)
+    # Session transcripts (wire events + the full daemon stderr) are evidence
+    # like command logs, and the stderr carries the markers `require`/`forbid`
+    # judge (think-cap, runtime kernel compiles).
+    session_logs = [{"cmd": "%s session %d" % (ctx["daemon_bin"], i),
+                     "out": "".join(json.dumps(e) + "\n" for e in s.get("events", []))
+                            + "--- daemon stderr ---\n" + s.get("stderr", "")}
+                    for i, s in enumerate(sessions)]
+    detail["logs"] = save_logs(out, row["id"], "positive", positives + session_logs)
     broken = next((s["broken"] for s in sessions if s.get("broken")), "")
     if broken:
         detail["stderr_tail"] = next(s.get("stderr_tail", "") for s in sessions if s.get("broken"))
@@ -754,7 +865,7 @@ def execute_row(ctx, row, out, timeout):
     else:
         return "failed", "unknown predicate %s" % kind, detail
     if good:
-        good, note = eval_markers("\n".join(r.get("out", "") for r in positives), pred, note)
+        good, note = eval_markers("\n".join(r.get("out", "") for r in positives + session_logs), pred, note)
     detail["positive_note"] = note
     if not good:
         return "failed", "positive: %s" % note, detail
@@ -806,16 +917,60 @@ def show_plan(rows, ctx):
         if row.get("probe") == "none":
             print("   !! no existing probe: %s" % row.get("note", ""))
 
+FAKE_DAEMON = r'''#!/usr/bin/env python3
+# Self-test stand-in for the daemon's JSONL wire. MODE: ok | drift (the turn after
+# an abort answers differently: rollback left residue) | nocache (never serves a
+# held conversation).
+import json, sys
+MODE = "%s"
+held, residue = 0, False
+def say(e): sys.stdout.write(json.dumps(e) + "\n"); sys.stdout.flush()
+lines = iter(sys.stdin)
+for line in lines:
+    m = json.loads(line)
+    t = m.get("type")
+    if t == "load": say({"type": "loaded", "arch": "fake"})
+    elif t == "unload": say({"type": "unloaded"})
+    elif t == "reset":
+        held = 0; say({"type": "reset", "rolled_back": True, "attempt_id": m["attempt_id"]})
+    elif t == "generate":
+        msgs = m.get("messages") or [{"role": "user", "content": m["prompt"]}]
+        if m.get("max_think_tokens"): sys.stderr.write("[think-cap] fake close\n")
+        prior = [x["content"] for x in msgs if x["role"] == "assistant"]
+        text = "answer %%d after %%r%%s" %% (len(msgs), prior[-1] if prior else "", " residue" if residue else "")
+        cached = 0 if MODE == "nocache" or held == 0 or len(msgs) == 1 else 5
+        rid, att = m["id"], m["attempt_id"]
+        say({"type": "token", "id": rid, "text": text, "attempt_id": att})
+        say({"type": "commit_ready", "id": rid, "attempt_id": att})
+        ctl = json.loads(next(lines))
+        if ctl["type"] == "abort":
+            residue = MODE == "drift"
+            say({"type": "done", "id": rid, "finish_reason": "aborted", "attempt_id": att})
+        else:
+            held = len(msgs); residue = False
+            say({"type": "done", "id": rid, "cached_tokens": cached, "finish_reason": "stop", "attempt_id": att})
+'''
+
 def self_test():
     checks = []
     def check(name, cond):
         checks.append((name, bool(cond)))
+    # Scratch homes follow TMPDIR, never a fixed path.
+    os.environ.setdefault("MATRIX_ISOLATED_HOME", tempfile.mkdtemp(prefix="device-mesh-self-test."))
     good, msg = eval_cargo(SAMPLE_CARGO_PASS, 5)
     check("cargo-pass", good and "passed=5" in msg)
     check("cargo-min-bound", not eval_cargo(SAMPLE_CARGO_PASS, 6)[0])
     check("cargo-fail", not eval_cargo(SAMPLE_CARGO_FAIL, 1)[0])
     check("cargo-no-summary", not eval_cargo("nothing here", 1)[0])
     check("cargo-not-bare-ok", parse_cargo("all ok folks")["passed"] == 0)
+    with tempfile.TemporaryDirectory() as td:
+        hd = os.path.join(td, "home-x", ".hipfire")
+        os.makedirs(hd)
+        sleeper = subprocess.Popen(["sleep", "30"])
+        open(os.path.join(hd, "daemon-GPU-a.pid"), "w").write("%d\n" % sleeper.pid)
+        check("reservation-holder-seen", sleeper.pid in reservation_holders(td))
+        sleeper.kill(); sleeper.wait()
+        check("reservation-released-after-exit", not wait_reservations_released(td, 5))
     check("cmd-timeout-kills-tree", run_cmd(["sh", "-c", "sleep 30 & wait"], None, 1)["rc"] == 124)
     # A daemon that logs >64 KiB to stderr before answering must not stall.
     chatty = os.path.join(isolated_env(None)["HIPFIRE_HOME"], "chatty-daemon.sh")
@@ -991,6 +1146,50 @@ def self_test():
     finally:
         globals()["exec_probe"] = orig_probe
     check("negative-env-substituted", captured and captured[0]["row_env"] == {"CLI": "/bin/hipfire"})
+    # The lane's transition rows, end to end against a fake daemon: captures
+    # reach the appended turn, the abort lands at commit_ready, and the
+    # predicate rejects rollback residue and an append that was not served
+    # from the held conversation (planted negatives).
+    row = next(r for r in load_catalogue(repo_root())["rows"] if r["id"] == "dflash-think-close")
+    verdicts = {}
+    for mode in ("ok", "drift", "nocache"):
+        fake = os.path.join(os.environ["MATRIX_ISOLATED_HOME"], "fake-daemon-%s.py" % mode)
+        with open(fake, "w") as fh:
+            fh.write(FAKE_DAEMON % mode)
+        os.chmod(fake, 0o755)
+        run = drive_session(fake, row["positive_session"], {}, {}, 10)
+        good, note = eval_wire([run], "wire_transitions", row["predicate"])
+        if good:
+            good, note = eval_markers(run.get("stderr", ""), row["predicate"], note)
+        verdicts[mode] = (good, note, run)
+    ok_run = verdicts["ok"][2]
+    check("transitions-ok", verdicts["ok"][0] and not ok_run["broken"])
+    check("transitions-capture-substituted",
+          "$CAPTURE" not in json.dumps(ok_run["events"]) and "answer 1 after" in visible_text(id_events(ok_run, "cap2")))
+    check("transitions-abort-lands", (terminal_of(ok_run, "ab3") or {}).get("finish_reason") == "aborted")
+    check("transitions-rollback-residue-fails", not verdicts["drift"][0] and "cap3 vs cap3b" in verdicts["drift"][1])
+    check("transitions-uncached-append-fails", not verdicts["nocache"][0] and "cached_tokens" in verdicts["nocache"][1])
+    check("transitions-missing-think-cap-fails",
+          not eval_markers("no marker here", {"require": ["[think-cap]"]}, "")[0])
+    check("runtime-compile-marker-fails",
+          not eval_markers("  gated_delta_net_q8_fast_stream: hipcc compiled (gfx1100, key 1)",
+                           {"forbid": row["predicate"]["forbid"]}, "")[0])
+    # The process exit status is a verdict (#666 B9): a skipped or failed row
+    # exits 1, all-current exits 0, an unknown --rows id exits 2.
+    orig_execute, orig_platform = execute_row, platform_probe
+    exits = {}
+    try:
+        globals()["platform_probe"] = lambda: {}
+        for disposition in ("hardware-blocked", "failed", "current"):
+            globals()["execute_row"] = lambda ctx, row, out, timeout, _d=disposition: (_d, "planted", {})
+            exits[disposition] = main(["--rows", "g2-loader-refusal-unit",
+                                       "--out", os.path.join(os.environ["MATRIX_ISOLATED_HOME"], "exit-" + disposition)])
+    finally:
+        globals()["execute_row"], globals()["platform_probe"] = orig_execute, orig_platform
+    check("exit-skip-is-not-pass", exits["hardware-blocked"] == 1)
+    check("exit-failed", exits["failed"] == 1)
+    check("exit-current", exits["current"] == 0)
+    check("exit-unknown-row", main(["--rows", "no-such-row"]) == 2)
     for name, ok in checks:
         print("   [%s] %s" % ("PASS" if ok else "FAIL", name))
     print("device_mesh_matrix: self-test %s (%d checks)" % ("OK" if all(ok for _, ok in checks) else "FAILED", len(checks)))
@@ -1000,7 +1199,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="G1-G4 device-mesh acceptance matrix runner")
     ap.add_argument("--plan", action="store_true", help="print rows, run nothing")
     ap.add_argument("--host-class", default="", help="filter rows by host class")
-    ap.add_argument("--only", default="", help="run a single row id")
+    ap.add_argument("--rows", default="", help="comma-separated row ids to run (exactly these)")
     ap.add_argument("--out", default="", help="receipt directory")
     ap.add_argument("--timeout", type=int, default=900, help="per-command seconds")
     ap.add_argument("--self-test", action="store_true")
@@ -1010,11 +1209,14 @@ def main(argv=None):
     root = repo_root()
     catalogue = load_catalogue(root)
     rows = catalogue["rows"]
-    if args.only:
-        rows = [r for r in rows if r["id"] == args.only]
-        if not rows:
-            print("unknown row: %s" % args.only, file=sys.stderr)
+    if args.rows:
+        wanted = [r for r in args.rows.split(",") if r]
+        known = {r["id"]: r for r in rows}
+        unknown = [r for r in wanted if r not in known]
+        if unknown:
+            print("unknown row(s): %s" % ", ".join(unknown), file=sys.stderr)
             return 2
+        rows = [known[r] for r in dict.fromkeys(wanted)]
     elif args.host_class:
         rows = [r for r in rows if args.host_class in r.get("hosts", [])]
     cli_bin, daemon_bin = find_bins(root)
@@ -1083,6 +1285,9 @@ def main(argv=None):
         except Exception as exc:  # never abort the matrix on one row
             disposition, note, detail = "failed", "runner exception: %s" % exc, {}
         elapsed = round(time.time() - start, 1)
+        stuck = wait_reservations_released(out)
+        if stuck:
+            print("warning: %s: daemon(s) %s still hold a GPU reservation after 120s" % (row["id"], sorted(stuck)))
         path = make_receipt(ctx, row, out, disposition, note, detail, elapsed)
         summary["rows"].append({"id": row["id"], "milestone": row["milestone"], "disposition": disposition,
                                 "note": note, "elapsed_s": elapsed, "receipt": path})
@@ -1093,7 +1298,9 @@ def main(argv=None):
     for e in summary["rows"]:
         counts[e["disposition"]] = counts.get(e["disposition"], 0) + 1
     print("summary: %s" % json.dumps(counts))
-    return 0
+    # The exit status is a verdict (#666 B9): 0 only when every selected row
+    # is `current`. A failed, skipped or hardware-blocked row is not a pass.
+    return 0 if summary["rows"] and all(e["disposition"] == "current" for e in summary["rows"]) else 1
 
 if __name__ == "__main__":
     sys.exit(main())

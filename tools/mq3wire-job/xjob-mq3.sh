@@ -16,7 +16,6 @@ for f in "" .ple-q4; do [ -e $MD/$MODEL$f ] || ln $SRC/$MODEL$f $MD/ || { echo "
 for p in code prose; do head -c 512 $XN/prompts/$p-1k.txt > $X/prompts/$p-128.txt; cp -f $XN/prompts/$p-1k.txt $X/prompts/$p-1k.txt; done
 export HIPFIRE_HOME=$X/home/.hipfire HOME=$X/home HIPFIRE_DAEMON_BIN=$B/daemon HIPFIRE_REGISTRY_URL=http://127.0.0.1:1/v1.json HIPFIRE_NO_REGISTRY_FETCH=1
 for v in $(compgen -e); do case $v in HIPFIRE_DEVICES|HIPFIRE_LOCK_DIR|HIPFIRE_FABRIC_ADMISSION|HIPFIRE_HOME|HIPFIRE_DAEMON_BIN|HIPFIRE_REGISTRY_URL|HIPFIRE_NO_REGISTRY_FETCH) ;; HIPFIRE_*|GPU_MAX_HW_QUEUES) unset $v;; esac; done
-export HIPFIRE_JINJA_CHAT=0
 T0=$(date +%s)
 { echo "date=$(date -u +%FT%TZ) FABRIC_JOB=${FABRIC_JOB:-} FABRIC_CARDS=${FABRIC_CARDS:-}"; uptime; cat /proc/loadavg; echo "GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-unset (HIP default 4)}"
   env | grep -E '^(HIPFIRE|GPU_MAX|ROCR|HSA)' | sort; echo "CELLS=$CELLS CAP=$CAP"

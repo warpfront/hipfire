@@ -207,9 +207,6 @@ pub fn populate(registry: &mut KernelRegistry) {
         // is the correct gate; the gfx12 sibling is reached inside the method, so
         // HasWmmaW32 (gfx12-excluding) would be wrong.
         (KernelKey::FusedGateUpHfp4G32, ArchPredicate::HasWmma),
-        // Paro4G128T fused: generic wave32 kernels, no ISA-specific intrinsics.
-        // Previously gated on HasDp4a (has_dot2_f32_f16) which excluded gfx906/gfx1010.
-        (KernelKey::FusedGateUpParo4G128T, ArchPredicate::Always),
         // Q8_0 gate+up: plain wave32 kernel (`gpu.fused_gate_up_q8_0`),
         // no arch gate — mirrors the Q4K row. Used by qwen2 FFN.
         (KernelKey::FusedGateUpQ8_0, ArchPredicate::Always),
@@ -220,38 +217,6 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedGateUpMfp4G32E8, ArchPredicate::Always),
     ];
     for &(key, arch) in gate_up_variants {
-        registry.register(KernelVariant {
-            key,
-            arch_required: arch,
-            shape_gate: None,
-            steps: &[PipelineOp::Gemv],
-            has_awq: false,
-            tile: TileImpl::None,
-        });
-    }
-
-    // ── Fused QKVZA Paro4G128T (dp4a) ────────────────────────────
-    let qkvza_paro_variants: &[(KernelKey, ArchPredicate)] = &[
-        // Paro4G128T QKVZA: generic wave32 kernels.
-        (KernelKey::FusedQkvzaParo4G128T, ArchPredicate::Always),
-    ];
-    for &(key, arch) in qkvza_paro_variants {
-        registry.register(KernelVariant {
-            key,
-            arch_required: arch,
-            shape_gate: None,
-            steps: &[PipelineOp::Gemv],
-            has_awq: false,
-            tile: TileImpl::None,
-        });
-    }
-
-    // ── Fused QKV Paro4G128T (3-way FullAttn, dp4a) ─────────────
-    let qkv_paro_variants: &[(KernelKey, ArchPredicate)] = &[
-        // Paro4G128T QKV (3-way): generic wave32 kernels.
-        (KernelKey::FusedQkvParo4G128T, ArchPredicate::Always),
-    ];
-    for &(key, arch) in qkv_paro_variants {
         registry.register(KernelVariant {
             key,
             arch_required: arch,

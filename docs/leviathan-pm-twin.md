@@ -362,6 +362,36 @@ scalar-destination-pair MODEL LIMITATION. The new templates are 505–524;
 later pre-existing positional template ids move by 20 without changing
 their findings. No tile STATE-CAP refusal was observed in the scan.
 
+## GGUF-native decode GEMV shim (gfx1201, Route A, proof only)
+
+`scripts/pm-leviathan-twin.py --family ggml-mmvq --arch gfx1201` compiles
+`kernels/src/ggml_mmvq_shim.hip` with the portable core flags plus the recipe of
+`scripts/build-ggml-mmvq-shim.sh` (`-ffp-contract=fast-honor-pragmas -DGGML_USE_HIP
+-Ithird_party/ggml/{include,src,src/ggml-cuda}`) and requires the result to equal the
+shipped runtime object `kernels/ggml_mmvq_shim_gfx1201.co` byte for byte: that object
+is the anchor, so no second copy is committed. It seals all five exports,
+`ggml_q8_1_quantize_gfx1201` and `ggml_mmvq_{iq4_xs,q4_k,q6_k,q8_0}_gfx1201`, into
+`kernels/ggml_mmvq_shim_pm_gfx1201.hxaco` (+ `.hxaco.sha256`, `.twin.json`). The manifest
+pins the source, the `third_party/ggml/PIN` commit file, the flags and every export's seal
+report. `hip_twin_ggml_mmvq` checks committed files only: provenance, that the twin covers
+every kernel of the anchor, per-export reseal, full device-ELF identity, explicit kernargs
+(producer 5 args / segment 288; mmvq 4 args / segment 28 / 896 B LDS), and rejection of a
+different architecture or an absent symbol.
+
+The shared extracted device-ELF sha256 is
+`e59bc73ff31d37aa3833cda34f83593ff99c944f32f1cf9456ef9e5736d02548` (14,968 bytes); the
+19,064-byte anchor container sha256 is
+`8b50bc03ef6f719478cba6d22aa5f6c734339dab9907d6bceaf217c9492e1a4c` and the same-size
+sealed container sha256 is
+`d126becf2f5f668cb5a9a42c54b9f0ec392d691a7f7a7d845b78c0a75cf610e7`.
+
+Dispatch stays on HIP (`S1_IMAGE`). Ledger status is OPEN and is pinned negatively by
+`hip_twin_ggml_mmvq::ledger_verdict_is_pinned_open_for_q4_k_only`: four exports verify and
+`ggml_mmvq_q4_k_gfx1201` reports one `d16_hi` load use, identically in anchor and twin.
+The ledger allowlist mirrors exactly that anchor finding and its four multi-axis
+region-conversion refusals for the twin. These are existing classes, not discharged
+obligations. Stable pool keys require no edits to any previously committed row.
+
 ## gfx942 FP8 grouped MoE: typed CDNA Route A
 
 The same pattern seals the production object of
@@ -388,3 +418,33 @@ checked evidence without invoking a compiler; `ledger_cfg_pins` and
 receipt is not yet recorded: `twin.json` carries a `gpu_oracle` entry only after
 an MI300X run bound to both image hashes, and the test fails a committed
 receipt that is partial or stale.
+
+## Twin identity vs. exploration diagnostics
+
+A twin's identity is what its seal claims about the bytes: device-ELF, `.text` and
+bundle hashes, `lift_identity`, ABI, the hazard checker result (`findings`, `blocking`,
+`advisory`, `bypasses`, `hazard.*`, `unreachable_instructions`) and the structural counts
+of the typed CFG wait ledger (`ledger.verifier`, `labels`, `branches`, `barriers`, `waitcnt*`,
+`memory.*`). All of these are compared exactly when a fresh seal is checked against the
+recorded `seal.reports`.
+
+The gfx942 ledger replay additionally records what the verifier explored while proving
+those claims: `hazards.ledger.steps` (instruction visits) and `hazards.ledger.label_states`
+(distinct label/in-flight-state pairs). These are *diagnostics*, listed in
+`hip_twin::LEDGER_DIAGNOSTIC_FIELDS`. They depend on the verifier's search strategy, so
+they may change when the replay is made cheaper or more precise without any change to
+the bytes or the findings; they are not part of a twin's identity and are never pinned.
+
+- `hip_twin::pinned_report(&report)` returns the report with those two counters removed
+  from `hazards.ledger`. Tests compare `pinned_report(fresh)` with `pinned_report(recorded)`,
+  never the raw reports. Only the two known counters, and only when they are integers, are
+  removed; everything else, including any unknown or malformed field, still has to match.
+- `hip_twin::ledger_diagnostics(&report)` reads the counters for informational output only
+  (`cdna_rip942_corpus` prints them when they move from the recorded values).
+- Committed `kernels/*.twin.json` files are unchanged. Their legacy reports keep the
+  counters in place and normalize exactly like fresh reports; a regenerated manifest
+  may carry different counters with identical pinned claims.
+- A change in findings, hazards, bytes or any structural count is a changed claim and fails
+  the same checks even when the counters moved too (`diagnostics_tests` in `hip_twin.rs`,
+  `exploration_counters_are_diagnostics_but_hazards_findings_and_claims_stay_pinned` in
+  `hip_twin_gfx942_glue_elem`).

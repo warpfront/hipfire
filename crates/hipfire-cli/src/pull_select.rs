@@ -48,7 +48,6 @@ pub(crate) struct DeclaredSidecar<'a> {
 /// The entry's declared optional sidecars, in fetch order.
 pub(crate) fn declared_sidecars(entry: &ModelEntry) -> impl Iterator<Item = DeclaredSidecar<'_>> {
     [
-        ("TriAttention", entry.triattn.as_ref(), false),
         ("MTP", entry.mtp.as_ref(), true),
         ("DSpark", entry.dspark.as_ref(), true),
         ("DFlash", entry.dflash.as_ref(), true),

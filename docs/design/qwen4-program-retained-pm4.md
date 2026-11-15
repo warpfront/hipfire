@@ -132,7 +132,8 @@ review.
 ## Baseline (measured, this box)
 
 Fixture: `~/.hipfire/models/qwen3.8-flash-next.mq4r` (`.mq4r` + gfx1151 + single
-GPU ⇒ `retained_redline_default` is true, `crates/hipfire-runtime/src/config.rs`).
+GPU; since HIPF-254 Qwen4 on gfx1100/gfx1151 is no longer a `retained_redline_default`,
+so set `HIPFIRE_REPLAY_BACKEND=redline` to reproduce this route).
 
 ```bash
 # Reproduced 2026-09-20. Isolated HOME is required: the daemon takes an flock on

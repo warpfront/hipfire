@@ -44,9 +44,8 @@
 //! target-lossless per-position sampling property.
 //!
 //! Env-free by construction: the `HIPFIRE_DFLASH_ADAPTIVE_B=0` kill-switch is
-//! resolved by `build_dflash_speculator` (mirroring DSpark's
-//! `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0` in `dspark_core`), so this controller is
-//! unit-testable without a device — see the tests below.
+//! resolved by `build_dflash_speculator`, so this controller is unit-testable
+//! without a device — see the tests below.
 
 /// Trailing verify cycles of acceptance history before the width may shrink.
 pub const ADAPTIVE_WINDOW: usize = 8;
@@ -64,8 +63,7 @@ pub const ADAPTIVE_CTX_GATE: usize = 2048;
 /// Trailing-τ proposal-width controller.
 ///
 /// Consumed by the qwen35 DFlash speculator (`hipfire-arch-qwen35`), which
-/// feeds one `accepted` count per verify cycle. Only the chain proposal width
-/// shrinks — DDTree's node budget is structural and is never fed here.
+/// feeds one `accepted` count per verify cycle.
 /// Reset to full at request start via the speculator's `configure_request`.
 pub struct DflashAdaptiveBlock {
     full: usize,

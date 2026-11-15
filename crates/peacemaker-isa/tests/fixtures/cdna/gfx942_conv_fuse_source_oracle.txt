@@ -1,0 +1,12 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.16)
+[rocblas] loaded for gfx942
+module arm: hipcc source (module qwen4_g942_conv_fuse)
+  qwen4_g942_conv_fuse: hipcc compiled (gfx942, key dd8c1b4b6da27a7f)
+  tensor_ops: hipcc compiled (gfx942, key a54af22a341a12b5)
+  convert_f32_to_bf16: hipcc compiled (gfx942, key c0ec9b2422684d90)
+hyper_norm_bf16x: cumulative PASS 146 FAIL 0
+  qwen4_gemv_bf16_xf32: hipcc compiled (gfx942, key c2ade363749ef5f0)
+hyper_write_norm_bf16x: cumulative PASS 658 FAIL 0
+RESULT cases PASS 658 FAIL 0 | controls DETECTED 33 MISSED 0
+PASS

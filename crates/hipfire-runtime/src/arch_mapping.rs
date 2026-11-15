@@ -6,8 +6,8 @@
 //! Single source of truth for `model_type` / `general.architecture` → `arch_id`.
 //!
 //! Why this table exists: three independent `model_type -> arch_id` maps
-//! drifted (safetensors_source.rs, quantize/src/pipeline.rs,
-//! quantize/src/pipeline_gguf.rs). One silently defaulted to llama (0) on
+//! drifted (safetensors_source.rs, quantize/src/pipeline.rs, and the GGUF
+//! quantizer pipeline removed in 0.5.0). One silently defaulted to llama (0) on
 //! unknown input, another returned UNCLAIMED, the third lacked entries. This
 //! module is the sole authority; the other sites call [`lookup_model_type`].
 //!

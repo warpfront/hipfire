@@ -188,12 +188,12 @@ not infer a KLD from a sibling model or a sibling codec.
 
 ### Current quality methodology
 
-Current quality pins are defined in [`../../AGENTS.md`](../../AGENTS.md) § 5
-(Pinned Hugging Face bench fixture and Quality pins), not by the historical
+Current quality pins are data in [`../../fixtures/pins.toml`](../../fixtures/pins.toml)
+(the `kld` pins; method in [`../fixtures.md`](../fixtures.md#quality-pins)), not by the historical
 table below. The scorer is teacher-forced `eval_hipfire --scoring-mode prefill
 --max-chunks 24` with `HIPFIRE_GRAPH=0`, `HIPFIRE_NORMALIZE_PROMPT=0`, and a
 fresh `HOME` and kernel cache. The public WT2 and heldout-code24 reference
-digests are recorded in `AGENTS.md`. A bit-exact claim requires reproducing the
+digests are the `reference` pins in `fixtures/pins.toml`. A bit-exact claim requires reproducing the
 arch's `.kldseq` byte for byte. Public reproduction instructions are in
 [`kld/VERIFY.md`](https://huggingface.co/hipfire-models/qwen3.8-27b/blob/main/kld/VERIFY.md)
 on the model's Hugging Face repo.
@@ -201,10 +201,10 @@ on the model's Hugging Face repo.
 **Shipped XTS trunks (separate from the August `xt` grid).** The canonical
 dense registry tag `qwen3.8:27b-mq4-xts` resolves to
 `qwen3.8-27b.mq4-xts`: an H2 symmetric MQ4V2 XT trunk (qt44) with per-group AWQ
-alpha and three GPTQ scale-refit rounds. Its size and SHA-256 pin is in
-`AGENTS.md` § 5 (`3e38ccba…f6f8ae`). The canonical Flash-Next registry artifact
+alpha and three GPTQ scale-refit rounds. Its size and SHA-256 pin is
+`pin:model/qwen3.8-27b.mq4-xts` (`3e38ccba…f6f8ae`). The canonical Flash-Next registry artifact
 is `qwen3.8-flash-next.mq4-xts` (tag `qwen3.8:flash-next-mq4-xts`), which uses
-qt44 and qt53 expert roles; its pin is also in `AGENTS.md` § 5, and its
+qt44 and qt53 expert roles; its pin is `pin:model/qwen3.8-flash-next.mq4-xts` (split base `pin:model/qwen3.8-flash-next-base.mq4-xts`), and its
 file-name constants are `FLASH_NEXT_XTS_*` in
 `crates/hipfire-registry/src/lib.rs`. These XTS artifacts are not rows of the
 historical `mq4-xt` grid below: the grid's `mq4-xt` cell is a different, August
@@ -396,9 +396,10 @@ before role lifts.
 
 ## 5 · Migration
 
-- **File extensions do not move.** `mq4r_redline_default` keys on the `.mq4r`
-  extension, and the golden fixtures are SHA-256 pinned. Renaming artifacts
-  would break sealed evidence. The product name lives in the registry card.
+- **File extensions do not move.** The golden fixtures are SHA-256 pinned, so
+  renaming artifacts would break sealed evidence. `mq4r_redline_default` keys on
+  the route SKU (HFQ `hipfire_route_sku` metadata, else the registry card's
+  `quant`), never on the extension. The product name lives in the registry card.
 - **`qt` numbers never move.** Existing files keep loading forever.
 - **Withdraw codec generations from user-facing names** (`mq4v2`, `mq4c`). They
   are days old and cost nothing to retire; the qt rows stay permanently.

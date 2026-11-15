@@ -258,9 +258,8 @@ host_cpu_weights={} cpu_offload_active={}",
             .expect("q8 kv");
     let dn_state =
         DeltaNetState::new_with_quant(gpu, &config, StateQuant::Q8).expect("q8 dn state");
-    // Default Q8 build runs with F16 error-feedback; the orchestrator enforces
-    // non-empty EF agreement across arms (both-active normally, both-empty
-    // only under an explicit HIPFIRE_DN_STATE_EF=0 opt-out).
+    // Q8 build runs with F16 error-feedback; the orchestrator enforces
+    // non-empty EF agreement across arms.
     let scratch = Qwen35Scratch::new(gpu, &config, REPEAT_WINDOW).expect("scratch");
     ModelSlot {
         name: name.to_string(),
@@ -952,10 +951,7 @@ fn run_orchestrator() {
     let first_tag = win_field(ew[0], "tag");
     let (eager_ef, graph_ef) = (ef_len(eager_dir, first_tag), ef_len(graph_dir, first_tag));
     assert_eq!(eager_ef, graph_ef, "dn_ef length diverged across arms");
-    assert!(
-        eager_ef > 0,
-        "dn_ef empty on both arms (HIPFIRE_DN_STATE_EF=0 set?)"
-    );
+    assert!(eager_ef > 0, "dn_ef empty on both arms");
 
     for (name, text, is_graph) in [
         ("eager", eager.as_str(), false),
@@ -1557,9 +1553,8 @@ fn run_cpu_ref_worker(out_dir: PathBuf) {
     let (model, head_path) = cpu_require_fixture();
     std::fs::create_dir_all(&out_dir).expect("create ref out dir");
     assert!(
-        hipfire_dispatch::moe_cpu_experts_enabled() && hipfire_dispatch::cpu_exec_enabled(),
-        "ref worker must run with memory.offload_exec=cpu (per-Command HIPFIRE_OFFLOAD_EXEC) \
-         and the expert splice unset"
+        hipfire_dispatch::cpu_exec_enabled(),
+        "ref worker must run with memory.offload_exec=cpu (per-Command HIPFIRE_OFFLOAD_EXEC)"
     );
 
     let mut gpu = Gpu::init().expect("Gpu::init");
@@ -1599,9 +1594,8 @@ fn run_cpu_ref_worker(out_dir: PathBuf) {
         "loader did not set the host CPU-weight gate"
     );
     lines.push(format!(
-        "CPU-ORACLE role=ref exec=cpu cpu_exec={} moe_cpu_experts={} host_cpu_weights={}",
+        "CPU-ORACLE role=ref exec=cpu cpu_exec={} host_cpu_weights={}",
         u8::from(hipfire_dispatch::cpu_exec_enabled()),
-        u8::from(hipfire_dispatch::moe_cpu_experts_enabled()),
         u8::from(gpu.owns_host_cpu_weights()),
     ));
     lines.push(format!("MODEL vocab={vocab} eos={eos} n={n} roles=ref"));
@@ -2042,7 +2036,7 @@ fn run_cpu_verify_worker(out_dir: PathBuf) {
         .collect();
     std::fs::create_dir_all(&out_dir).expect("create verify out dir");
     assert!(
-        hipfire_dispatch::moe_cpu_experts_enabled() && hipfire_dispatch::cpu_exec_enabled(),
+        hipfire_dispatch::cpu_exec_enabled(),
         "verify worker must run with memory.offload_exec=cpu (per-Command HIPFIRE_OFFLOAD_EXEC)"
     );
 
@@ -2083,9 +2077,8 @@ fn run_cpu_verify_worker(out_dir: PathBuf) {
         "loader did not set the host CPU-weight gate"
     );
     lines.push(format!(
-        "CPU-ORACLE role=verify exec=cpu cpu_exec={} moe_cpu_experts={} host_cpu_weights={}",
+        "CPU-ORACLE role=verify exec=cpu cpu_exec={} host_cpu_weights={}",
         u8::from(hipfire_dispatch::cpu_exec_enabled()),
-        u8::from(hipfire_dispatch::moe_cpu_experts_enabled()),
         u8::from(gpu.owns_host_cpu_weights()),
     ));
     lines.push(format!("MODEL vocab={vocab} eos={eos} n={n} roles=verify"));
@@ -2128,7 +2121,7 @@ fn run_cpu_verify_worker(out_dir: PathBuf) {
     assert!(
         m > 0,
         "calibration one-row step took 0 CPU steps: the CPU expert splice is not armed \
-         (host placement / memory.offload_exec=cpu / HIPFIRE_MOE_CPU_EXPERTS)"
+         (host placement / memory.offload_exec=cpu)"
     );
     assert_eq!(cal.advance, 1, "calibration step must commit one token");
     assert_eq!(
@@ -2857,11 +2850,6 @@ fn run_cpu_orchestrator() {
             .unwrap_or_else(|| panic!("{role}: no CPU-ORACLE line"));
         assert_eq!(win_field(oracle, "exec"), "cpu", "{role}: {oracle}");
         assert_eq!(win_field(oracle, "cpu_exec"), "1", "{role}: {oracle}");
-        assert_eq!(
-            win_field(oracle, "moe_cpu_experts"),
-            "1",
-            "{role}: {oracle}"
-        );
         assert_eq!(
             win_field(oracle, "host_cpu_weights"),
             "1",

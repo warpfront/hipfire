@@ -23,7 +23,7 @@
 # Env vars:
 #   HIPFIRE_A_REF       branch/commit for side A (default: master)
 #   HIPFIRE_B_REF       branch/commit for side B (default: upstream/integration/dispatch-unification)
-#   HIPFIRE_KV_MODE     KV mode (default: asym3)
+#   HIPFIRE_KV_MODE     KV mode (default: fwht3)
 #   HIPFIRE_A_OUT       output directory (default: /tmp/hipfire-ab-<timestamp>)
 #   HIPFIRE_MODELS_DIR  models directory (default: ~/.hipfire/models)
 #   HIPFIRE_GPUS        space-separated GPU indices (default: "0 1")
@@ -42,7 +42,7 @@ cd "$(dirname "$0")/.."
 # ── Configuration ─────────────────────────────────────────────────────────
 A_REF="${HIPFIRE_A_REF:-master}"
 B_REF="${HIPFIRE_B_REF:-upstream/integration/dispatch-unification}"
-KV_MODE="${HIPFIRE_KV_MODE:-asym3}"
+KV_MODE="${HIPFIRE_KV_MODE:-fwht3}"
 OUT="${HIPFIRE_A_OUT:-/tmp/hipfire-ab-$(date +%Y%m%d-%H%M%S)}"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 BENCH_EXE="target/release/examples/bench_qwen35_mq4"

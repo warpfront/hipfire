@@ -9,9 +9,13 @@ tag's own section is the text it shipped with. (Comparing older sections to the
 newest tag rather than their own tag grandfathers edits made before it.) New
 notes go in a new top section (e.g. `## Unreleased`), never in a shipped one.
 
+The region above the newest `## vX.Y.Z...` heading must hold at most one
+`## Unreleased` heading and no repeated bullet line (a `merge=union` merge of
+stacked branches pastes both sides and leaves exactly those).
+
 Usage: check-changelog.py [--repo DIR] [--changelog PATH]
-Exit 0 = clean, 1 = a released section changed, 2 = usage/git error.
-Needs tags (CI checks out with fetch-depth: 0).
+Exit 0 = clean, 1 = a released section changed or the unreleased region is
+duplicated, 2 = usage/git error. Needs tags (CI checks out with fetch-depth: 0).
 """
 import argparse
 import re
@@ -48,6 +52,33 @@ def first_diff_line(a: str, b: str) -> int:
     return min(len(a.splitlines()), len(b.splitlines())) + 1
 
 
+def unreleased_errors(text: str) -> list[str]:
+    """Duplicate `## Unreleased` headings or bullet lines above the newest release."""
+    errors = []
+    region = []
+    for line in text.splitlines():
+        if HEADING.match(line):
+            break
+        region.append(line)
+    headings = [i for i, line in enumerate(region, 1) if line.rstrip() == "## Unreleased"]
+    if len(headings) > 1:
+        errors.append(
+            f"{len(headings)} `## Unreleased` headings above the newest release "
+            f"(lines {', '.join(map(str, headings))}); keep one top section"
+        )
+    seen: dict[str, int] = {}
+    for i, line in enumerate(region, 1):
+        if not line.lstrip().startswith("- "):
+            continue
+        if line in seen:
+            errors.append(
+                f"line {i}: duplicated entry (first at line {seen[line]}): {line.strip()[:80]}"
+            )
+        else:
+            seen[line] = i
+    return errors
+
+
 def check(repo: Path, changelog: Path) -> list[str]:
     tags = git(repo, "tag", "--list", "v*", "--sort=-v:refname")
     if tags.returncode != 0:
@@ -59,11 +90,11 @@ def check(repo: Path, changelog: Path) -> list[str]:
         if shown.returncode == 0:
             reference = tag, sections(shown.stdout)
             break
+    errors = unreleased_errors(changelog.read_text())
     if reference is None:
-        return []
+        return errors
     ref_tag, released = reference
     current = sections(changelog.read_text())
-    errors = []
     for version in sorted(set(tagged) & set(released)):
         body = current.get(version)
         if body is None:

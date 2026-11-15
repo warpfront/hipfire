@@ -54,6 +54,8 @@ op_table!(DsOp {
     Write2st64B64,
     AddU32,
     AddRtnU32,
+    OrB32,
+    OrRtnB32,
     MaxU32,
     MaxI32,
     MaxF32,
@@ -94,12 +96,13 @@ impl DsOp {
             Self::Write2B32 | Self::Write2st64B32 => (0, 1, 1),
             Self::Write2B64 | Self::Write2st64B64 => (0, 2, 2),
             Self::AddU32
+            | Self::OrB32
             | Self::MaxU32
             | Self::MaxI32
             | Self::MaxF32
             | Self::MinF32
             | Self::AddF32 => (0, 1, 0),
-            Self::AddRtnU32 => (1, 1, 0),
+            Self::AddRtnU32 | Self::OrRtnB32 => (1, 1, 0),
             Self::SwizzleB32 => (1, 0, 0),
             Self::PermuteB32 | Self::BpermuteB32 => (1, 1, 0),
             Self::Nop => (0, 0, 0),
@@ -167,12 +170,13 @@ impl DsOp {
             | Self::Write2st64B64
             | Self::Nop => MemKind::DsStore,
             Self::AddU32
+            | Self::OrB32
             | Self::MaxU32
             | Self::MaxI32
             | Self::MaxF32
             | Self::MinF32
             | Self::AddF32 => MemKind::DsAtomic,
-            Self::AddRtnU32 => MemKind::DsAtomicRtn,
+            Self::AddRtnU32 | Self::OrRtnB32 => MemKind::DsAtomicRtn,
             Self::SwizzleB32 | Self::PermuteB32 | Self::BpermuteB32 => MemKind::DsXlane,
         }
     }
@@ -428,8 +432,12 @@ fn swizzle_offset(imm: u16) -> String {
     format!(" offset:{imm}")
 }
 
-impl fmt::Display for Ds {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Ds {
+    pub(crate) fn fmt_assembly(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_impl(f, true)
+    }
+
+    fn fmt_impl(&self, f: &mut fmt::Formatter<'_>, lossless: bool) -> fmt::Result {
         let (wv, w0, w1) = self.op.widths();
         f.write_str(self.op.name())?;
         let mut sep = " ";
@@ -451,7 +459,7 @@ impl fmt::Display for Ds {
             if self.offset1 != 0 {
                 write!(f, " offset1:{}", self.offset1)?
             }
-        } else if self.op == DsOp::SwizzleB32 {
+        } else if self.op == DsOp::SwizzleB32 && !lossless {
             f.write_str(&swizzle_offset(self.offset()))?;
         } else if self.offset() != 0 {
             write!(f, " offset:{}", self.offset())?;
@@ -460,6 +468,12 @@ impl fmt::Display for Ds {
             f.write_str(" gds")?;
         }
         Ok(())
+    }
+}
+
+impl fmt::Display for Ds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_impl(f, false)
     }
 }
 
@@ -496,6 +510,8 @@ impl DsOp {
                 Self::Write2st64B64 => 79,
                 Self::AddU32 => 0,
                 Self::AddRtnU32 => 32,
+                Self::OrB32 => 10,
+                Self::OrRtnB32 => 42,
                 Self::MaxU32 => 8,
                 Self::MaxI32 => 6,
                 Self::MaxF32 => 19,
@@ -506,6 +522,7 @@ impl DsOp {
                 Self::BpermuteB32 => 63,
                 Self::Nop => 20,
             }),
+            Arch::Gfx950 => None,
         }
     }
     /// llvm-mc mnemonic (no encoding suffix).
@@ -536,6 +553,8 @@ impl DsOp {
             Self::Write2st64B64 => "ds_write2st64_b64",
             Self::AddU32 => "ds_add_u32",
             Self::AddRtnU32 => "ds_add_rtn_u32",
+            Self::OrB32 => "ds_or_b32",
+            Self::OrRtnB32 => "ds_or_rtn_b32",
             Self::MaxU32 => "ds_max_u32",
             Self::MaxI32 => "ds_max_i32",
             Self::MaxF32 => "ds_max_f32",

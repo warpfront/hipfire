@@ -13,7 +13,7 @@
 This branch introduces a new `hipfire-dispatch` crate that factors GPU kernel
 selection into a clean family/table/model_ext architecture, migrates callers
 toward it, makes `new-dispatch` a default feature, and removes a large pile of
-env-var-gated experimental PARO code paths. The *library design* is genuinely
+env-var-gated experimental code paths. The *library design* is genuinely
 good: type-safe `KernelKey` enum, declarative dispatch tables, predicate-based
 arch/shape gating, zero new external dependencies, and 97 CPU-only tests that
 all pass.
@@ -91,8 +91,7 @@ Overall Health Score: **6.5 / 10 (Grade C)**
   (test-only).
 - **Touched crates**: `hipfire-arch-{llama,qwen2,qwen35,deepseek4}`,
   `hipfire-runtime`, `rdna-compute`, `hipfire-quantize`.
-- **Removed**: `paro_la_gates_codec.rs` (321), `test_gemv_paro4g128.rs` (665),
-  `fused_rmsnorm_paro4g128t_rotate.hip` (186), and ~12 `HIPFIRE_PARO_*` env-var
+- **Removed**: several experimental codec/test/kernel files and ~12 env-var
   gates.
 - **Design docs added**: `.opencode/plans/2026-05-30-hipfire-dispatch.md` (672),
   `.opencode/plan/arch-routing-centralization.md` (746).
@@ -193,7 +192,7 @@ paths most likely to regress. **Recommendation**: add assertions or mark
 **Effort**: Moderate.
 
 ### [TEST-002] No coherence-gate evidence for a dispatch change
-**Location**: branch-wide (rotation, GEMV, Q8HFQ, ParoQ4G128 routing changed).
+**Location**: branch-wide (rotation, GEMV, Q8HFQ routing changed).
 **What**: CLAUDE.md: "Any change to kernels, quant formats, dispatch, fusion,
 rotation, rmsnorm, or the forward pass MUST pass `./scripts/coherence-gate.sh`."
 Tests validate *routing decisions* only; no test or artifact shows numerical
@@ -256,10 +255,9 @@ to `.opencode/.gitignore`. The two plan `.md` files are intentional — keep.
 ### [DEPS-001] / [ARCH-004] `dispatch.rs` remains a 33,172-line god-file
 **Location**: `crates/rdna-compute/src/dispatch.rs`. **What**: verified
 34,284 → 33,172 lines — the refactor removed only ~1,100 net lines of a 33k-line
-file. Dead `gemv_paro4g128*` / `fused_*_paro4g128t` methods remain after the
-PARO4G128/T dtypes were dropped (`1a02aabe`). **Why**: the stated goal was to
+file. Dead per-dtype methods remain after dtypes were dropped (`1a02aabe`). **Why**: the stated goal was to
 *centralize* dispatch; the central file is barely dented and still mixes dozens
-of concerns. **Recommendation**: schedule extraction of the now-orphaned PARO
+of concerns. **Recommendation**: schedule extraction of the now-orphaned
 methods and migrate remaining families out before claiming the file shrank.
 **Effort**: Significant. *(Counted under Architecture; listed here for the
 god-file metric.)*
@@ -353,8 +351,7 @@ dtype-matching boilerplate; init-time table validation fails fast.
   `hipfire-runtime/src/llama.rs` (compiles, has CORR-001) and one in
   `hipfire-arch-llama/src/arch.rs` (doesn't compile). Unclear which is canonical;
   the duplication is itself a half-migrated smell.
-- **[S3] Dead PARO4G128T `Gpu` methods** linger in `dispatch.rs` after the dtypes
-  were removed.
+- **[S3] Dead `Gpu` methods** linger in `dispatch.rs` after dtypes were removed.
 - **[S4]** Design intent is well captured in `.opencode/plans/`.
 
 ### 4. DevOps & CI/CD (Score: 4/10, D)
@@ -442,7 +439,7 @@ deletions reference-clean.
 | S3 | Suggestion | Testing | Arch lists duplicated (no DRY) | `dispatch-tests/src/*.rs` |
 | S3 | Suggestion | Architecture | Family ownership inconsistent (OnceLock vs new()) | `deepseek4/forward.rs:139` vs `llama/arch.rs` |
 | S3 | Suggestion | Architecture | Two parallel new-dispatch integrations | runtime/llama.rs vs arch crates |
-| S3 | Suggestion | Architecture | Dead PARO4G128T Gpu methods linger | `rdna-compute/src/dispatch.rs` |
+| S3 | Suggestion | Architecture | Dead Gpu methods linger | `rdna-compute/src/dispatch.rs` |
 | S3 | Suggestion | Style | ~20 dead-code warnings (feature on) | arch new-dispatch path |
 | S3 | Suggestion | Docs | Public dispatch enums lack rustdoc | `dispatch/src/types.rs` |
 | S3 | Suggestion | Docs | Plan docs overstate shipped scope | `.opencode/plans/` |
@@ -483,7 +480,7 @@ deletions reference-clean.
 ### P3 — Long-term (Next Quarter)
 | # | Action | Category | Effort | Finding |
 |---|--------|----------|--------|---------|
-| 13 | Extract orphaned PARO methods; continue shrinking `dispatch.rs` | Architecture | Significant | ARCH-004 |
+| 13 | Extract orphaned methods; continue shrinking `dispatch.rs` | Architecture | Significant | ARCH-004 |
 | 14 | Unify the two new-dispatch integration sites | Architecture | Moderate | parallel paths |
 
 ### Quick Wins Summary

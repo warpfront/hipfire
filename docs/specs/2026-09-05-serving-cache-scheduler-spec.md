@@ -303,7 +303,7 @@ If sampled speculation is later enabled, implement target-distribution-preservin
 | MTP + grammar or non-greedy sampler | AR selected before execution until exact joint acceptance is implemented and validated |
 | Vision + paged | Preserve parent's batched vision behavior and M-RoPE; same-request MTP remains off |
 | Vision + prefix reuse | Off until pixel/embedding/position identity and hybrid snapshots pass the dedicated image oracle; text-only prefixes are not assumed safe |
-| Adaptive KV/CASK/window compaction + shared pages | Do not infer compatibility; in-place conversion/compaction requires private destinations and a new state identity |
+| Adaptive KV/window compaction + shared pages | Do not infer compatibility; in-place conversion/compaction requires private destinations and a new state identity |
 | Paged + HipGraph/retained replay | Ordinary HIP until separately supported and certified; never reuse the plain-AR tape for ragged multi-slot work |
 | Other model families / TP / EP / PP | Preserve existing route; no inherited slot/cache admission from a generic capability flag |
 

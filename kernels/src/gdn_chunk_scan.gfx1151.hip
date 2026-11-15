@@ -44,6 +44,14 @@ __device__ __forceinline__ gs_bfrag gs_frag(const unsigned short*p,int pitch,int
 #pragma unroll
  for(int e=0;e<16;++e)u.h[e]=p[r*pitch+k0+e];
  return u.v;}
+// gfx11 WMMA rounds a sum differently for +0 and -0 zero products (see gdn_chunk_scan.gfx1201.hip,
+// gs_split): the two WMMAs whose operand holds structural zeros (D = A.z, O += D.score) take their
+// later-row-dependent operand split by sign (x- first, then x+), so a partial tile's last row rounds
+// exactly as inside the completed tile.
+__device__ __forceinline__ void gs_split(gs_bfrag x,gs_bfrag&pos,gs_bfrag&neg){union{unsigned short h[16];gs_bfrag v;}u,p,n;u.v=x;
+#pragma unroll
+ for(int e=0;e<16;++e){const unsigned b=u.h[e];const bool s=(b>>15)!=0;p.h[e]=s?0:(unsigned short)b;n.h[e]=s?(unsigned short)b:(unsigned short)0x8000u;}
+ pos=p.v;neg=n.v;}
 // LDS-only workgroup barrier: the "local" fences keep in-flight global
 // prefetches in flight. Each wave waits for its own LDS ops (lgkmcnt(0), vmcnt
 // and expcnt left open: gfx11 s_waitcnt 0xFC07) before it signals. The fence's
@@ -63,12 +71,23 @@ struct __attribute__((aligned(16))) GsLds{
 };
 static_assert(sizeof(unsigned short)*GS_D*GS_KTP<=sizeof(unsigned short)*GS_BV*GS_KP,"transposed K fits the z tile");
 
+// State entry/exit modes: the same kernargs and semantics as
+// `gdn_chunk_scan` (gdn_chunk_scan.gfx1201.hip), whose header documents them.
+#define GS_ENTRY_Q8 0
+#define GS_ENTRY_Q8EF 1
+#define GS_ENTRY_F32 2
+#define GS_EXIT_SEAL 0
+#define GS_EXIT_F32 1
+#define GS_EXIT_SEAM 2
+#define GS_EXIT_NONE 3
+#define GS_EXIT_EF 4
 extern "C" __launch_bounds__(GS_NT,1)
 __global__ void gdn_chunk_scan_gfx1151(
  const unsigned short* __restrict__ q,const unsigned short* __restrict__ k,const unsigned short* __restrict__ v,
  const unsigned short* __restrict__ A,const float* __restrict__ G,const float* __restrict__ beta,
- signed char* __restrict__ sq,float* __restrict__ sc,_Float16* __restrict__ ef,float* __restrict__ out,int row0,int T){
- if(T<=0||T>512)return;
+ signed char* __restrict__ sq,float* __restrict__ sc,_Float16* __restrict__ ef,float* __restrict__ out,int row0,int T,
+ const float* h0,float* ht,int entry_mode,int exit_mode){
+ if(T<0||T>512)return;
  const int head=(int)blockIdx.y;
  const int tid=(int)threadIdx.x,lane=tid&31,lo=lane&15,hi=lane>>4;
  const int wave=__builtin_amdgcn_readfirstlane(tid>>5);
@@ -85,7 +104,8 @@ __global__ void gdn_chunk_scan_gfx1151(
 #pragma unroll
   for(int e=0;e<8;++e){const int key=(kt0+ki)*16+gs_acc_row(lane,e);
    const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+key;
-   St[t][e]=(float)sq[off]*sc[head*GS_D+vv]+(float)ef[off];
+   if(entry_mode==GS_ENTRY_F32)St[t][e]=h0[off];
+   else{const float res=entry_mode==GS_ENTRY_Q8EF?(float)ef[off]:0.0f;St[t][e]=(float)sq[off]*sc[head*GS_D+vv]+res;}
   }}
  auto stage_state=[&](){
 #pragma unroll
@@ -167,7 +187,7 @@ __global__ void gdn_chunk_scan_gfx1151(
 #pragma unroll
   for(int kk=0;kk<4;++kk){
 #pragma unroll
-   for(int j=0;j<2;++j)Dacc[j]=gs_mma(aa[kk],gs_frag(&sm.state[0][0],GS_KP,(ntb+j)*16,kk*16,lane),Dacc[j]);}
+   for(int j=0;j<2;++j){gs_bfrag zp,zn;gs_split(gs_frag(&sm.state[0][0],GS_KP,(ntb+j)*16,kk*16,lane),zp,zn);Dacc[j]=gs_mma(aa[kk],zn,Dacc[j]);Dacc[j]=gs_mma(aa[kk],zp,Dacc[j]);}}
 #pragma unroll
   for(int j=0;j<2;++j)for(int e=0;e<8;++e){int tok=mt*16+gs_acc_row(lane,e);sm.d[(ntb+j)*16+lo][tok]=gs_b16(Dacc[j][e]);}
   GS_BAR();
@@ -179,7 +199,7 @@ __global__ void gdn_chunk_scan_gfx1151(
 #pragma unroll
   for(int kk=0;kk<4;++kk){gs_bfrag score=gs_frag(&sm.score[0][0],GS_AP,mt*16,kk*16,lane);
 #pragma unroll
-   for(int j=0;j<2;++j)O[j]=gs_mma(gs_frag(&sm.d[0][0],GS_AP,(ntb+j)*16,kk*16,lane),score,O[j]);}
+   for(int j=0;j<2;++j){gs_bfrag dp,dn;gs_split(gs_frag(&sm.d[0][0],GS_AP,(ntb+j)*16,kk*16,lane),dp,dn);O[j]=gs_mma(dn,score,O[j]);O[j]=gs_mma(dp,score,O[j]);}}
   // WMMA needs every lane active. Without this pin, clang sinks the O
   // WMMAs (only used by the store) into `if(tok<rows)`, and on a partial
   // chunk the masked lanes' operand rows come out undefined.
@@ -213,6 +233,14 @@ __global__ void gdn_chunk_scan_gfx1151(
   GS_BAR();
  }
 
+ if((exit_mode&3)==GS_EXIT_NONE)return;
+ if((exit_mode&3)==GS_EXIT_F32){
+#pragma unroll
+  for(int ki=0;ki<2;++ki)for(int vi=0;vi<2;++vi){int t=ki*2+vi,vv=vbase+(vt0+vi)*16+lo;
+#pragma unroll
+   for(int e=0;e<8;++e)ht[((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e)]=St[t][e];}
+  return;
+ }
  // The old EF was folded into St before the scan so it participates in every
  // output and decay.  The dead state staging tile holds the full-row reductions.
  float vmax[2]={0,0};
@@ -224,6 +252,7 @@ __global__ void gdn_chunk_scan_gfx1151(
    for(int e=0;e<8;++e)vmax[vi]=fmaxf(vmax[vi],fabsf(St[t][e]));}
   vmax[vi]=fmaxf(vmax[vi],__shfl_xor(vmax[vi],16));if(hi==0)reinterpret_cast<float*>(&sm.state[0][0])[(swave>>1)*GS_BV+vv-vbase]=vmax[vi];}
  GS_BAR();
+ const bool gs_wef=(exit_mode&GS_EXIT_EF)!=0,gs_seam=(exit_mode&3)==GS_EXIT_SEAM;
 #pragma unroll
  for(int vi=0;vi<2;++vi){int vv=vbase+(vt0+vi)*16+lo;float mx=0;
 #pragma unroll
@@ -231,5 +260,10 @@ __global__ void gdn_chunk_scan_gfx1151(
 #pragma unroll
   for(int ki=0;ki<2;++ki){int t=ki*2+vi;
 #pragma unroll
-   for(int e=0;e<8;++e){const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e);float qf=fminf(fmaxf(rintf(St[t][e]*inv),-128.0f),127.0f);sq[off]=(signed char)qf;ef[off]=(_Float16)(St[t][e]-qf*scale);}}}
+   for(int e=0;e<8;++e){const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e);float qf=fminf(fmaxf(rintf(St[t][e]*inv),-128.0f),127.0f);sq[off]=(signed char)qf;
+    const float qs=qf*scale;
+    // `ht` mirrors the next launch's entry reconstruction (int-converted code + stored EF); see gdn_chunk_scan.gfx1201.hip.
+    const _Float16 eh=(_Float16)(St[t][e]-qs);
+    if(gs_wef)ef[off]=eh;
+    if(gs_seam)ht[off]=(float)(signed char)qf*scale+(float)eh;}}}
 }

@@ -30,7 +30,7 @@ use hipfire_dispatch::pipeline::dump_hidden_localize;
 use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_dispatch::pipeline::gated_mlp::{GatedMlpOp, MlpOutput};
 use hipfire_dispatch::pipeline::hybrid;
-use hipfire_dispatch::pipeline::hybrid::{AttentionTap, MixerOutput};
+use hipfire_dispatch::pipeline::hybrid::MixerOutput;
 use hipfire_dispatch::pipeline::sealed_moe::MoeRouteProducerProof;
 use hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall;
 use hipfire_dispatch::pipeline::superop;
@@ -550,30 +550,14 @@ impl hipfire_dispatch::families::moe::RoutedExpertWeights for MoeFfnWeights {
     }
 }
 
-/// Build the complete typed Qwen softmax/shared decode recipe from the
-/// caller-owned weights and scratch. `normalization` is either `Provided` for
-/// an already prepared activation or `RmsNorm` for the shared prologue.
-#[allow(clippy::too_many_arguments)]
-fn moe_params_for_decode<'a>(
-    ffn: &'a MoeFfnWeights,
-    x_norm: &'a GpuTensor,
-    x_residual: &'a GpuTensor,
-    config: &Qwen35Config,
-    s: &MoeScratchRef<'a>,
-    x_rot_prerotated: bool,
-    ep_routed_out: Option<&'a GpuTensor>,
-    ep_skip_shared: bool,
-    defer_routed_combine: bool,
-    ep_mode: MoeEpMode,
-    normalization: hipfire_dispatch::families::moe::MoeNormalization<'a>,
-) -> hipfire_dispatch::families::moe::MoeParams<'a> {
-    let hidden = config.dim;
-    let mi = config.moe_intermediate_size;
-    let smi = config.shared_expert_intermediate_size;
-    let k = config.num_experts_per_tok;
-    let n_exp = config.num_experts;
+/// The decode `MoeDtypes` of one MoE layer, from its loaded weights. Single
+/// source for the decode recipe and the load-time host-top-K graph decision
+/// (#1149).
+pub(crate) fn moe_decode_dtypes(
+    ffn: &MoeFfnWeights,
+) -> hipfire_dispatch::families::moe::MoeDtypes<'_> {
     let (per_expert_gate_up, per_expert_down) = ffn.per_expert_tier_tables();
-    let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
+    hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
         shared: Some(hipfire_dispatch::families::moe::MoeSharedDtypes {
             selector: ffn.shared_expert_gate.gpu_dtype,
@@ -607,10 +591,36 @@ fn moe_params_for_decode<'a>(
                 .unwrap_or(DType::F32)
         },
         routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
-        has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
-    };
+    }
+}
+
+/// Build the complete typed Qwen softmax/shared decode recipe from the
+/// caller-owned weights and scratch. `normalization` is either `Provided` for
+/// an already prepared activation or `RmsNorm` for the shared prologue.
+#[allow(clippy::too_many_arguments)]
+fn moe_params_for_decode<'a>(
+    ffn: &'a MoeFfnWeights,
+    x_norm: &'a GpuTensor,
+    x_residual: &'a GpuTensor,
+    config: &Qwen35Config,
+    s: &MoeScratchRef<'a>,
+    x_rot_prerotated: bool,
+    ep_routed_out: Option<&'a GpuTensor>,
+    ep_skip_shared: bool,
+    defer_routed_combine: bool,
+    ep_mode: MoeEpMode,
+    normalization: hipfire_dispatch::families::moe::MoeNormalization<'a>,
+) -> hipfire_dispatch::families::moe::MoeParams<'a> {
+    let hidden = config.dim;
+    let mi = config.moe_intermediate_size;
+    let smi = config.shared_expert_intermediate_size;
+    let k = config.num_experts_per_tok;
+    let n_exp = config.num_experts;
+    let moe_dtypes = moe_decode_dtypes(ffn);
+    let per_expert_mixed =
+        moe_dtypes.per_expert_gate_up.is_some() || moe_dtypes.per_expert_down.is_some();
     crate::qwen35::weights::trace_moe_arm(
         "decode",
         moe_dtypes.routed_gate_up,
@@ -620,7 +630,7 @@ fn moe_params_for_decode<'a>(
             owners.gate_up.iter().all(|b| b.buf.is_host_mapped())
                 && owners.down.iter().all(|b| b.buf.is_host_mapped())
         }),
-        per_expert_gate_up.is_some() || per_expert_down.is_some(),
+        per_expert_mixed,
     );
     let shared = Some(hipfire_dispatch::families::moe::MoeSharedDecode {
         weights: hipfire_dispatch::families::moe::MoeSharedWeights {
@@ -672,28 +682,6 @@ fn moe_params_for_decode<'a>(
         routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
         routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
         routed_experts: ffn,
-        routed_gate_up_paro: ffn.experts.first().and_then(|e| {
-            e.gate_up
-                .paro
-                .as_ref()
-                .map(|p| hipfire_dispatch::families::gemv::GivensRef {
-                    pairs: &p.pairs,
-                    theta: &p.theta,
-                    scales: &p.channel_scales,
-                    krot: p.krot as usize,
-                })
-        }),
-        routed_down_paro: ffn.experts.first().and_then(|e| {
-            e.down
-                .paro
-                .as_ref()
-                .map(|p| hipfire_dispatch::families::gemv::GivensRef {
-                    pairs: &p.pairs,
-                    theta: &p.theta,
-                    scales: &p.channel_scales,
-                    krot: p.krot as usize,
-                })
-        }),
         router_logits: s.router_logits,
         x_rot_local: s.x_rot_local,
         gate_up_buf: s.gate_up_buf,
@@ -1366,14 +1354,13 @@ impl Qwen35Scratch {
             // prefill (PREFILL_MAX_BATCH=256 → ceil(256/batch_mult) calls per
             // FA layer) for ~linearly less VRAM at long context.
             //
-            // The per-position size scales with kv_max_seq (= physical_cap
-            // post-eviction), and that scaling is what made #85 visible: at
-            // max_seq=170k, no CASK, 27B (n_heads=24, head_dim=256) the old
+            // The per-position size scales with kv_max_seq, and that scaling
+            // is what made #85 visible: at
+            // max_seq=170k, 27B (n_heads=24, head_dim=256) the old
             // batch_mult=64 → 2.1 GB just for these partials, exceeding VRAM
             // headroom on 24 GB cards. Cutting batch_mult by 4× (16) keeps
             // the prefill chunking moderate while saving 1.6 GB at that
-            // worst-case shape; CASK-on workloads (small physical_cap) are
-            // unaffected because the buffer is already tiny there.
+            // worst-case shape.
             //
             // On the gfx1100 tile32/tile128 split the legacy formula
             // incidentally gave 64 batched rows; 16 regressed prefill, 32
@@ -1418,7 +1405,7 @@ impl Qwen35Scratch {
             // uses attention_q8_0_kv while a captured-and-replayed forward
             // uses attention_flash_q8_0 — same math, different fp32
             // reduction order, observed as ~0.44 logit delta direct-vs-graph
-            // on shisa-Qwen3.6-A3B-PARO (see
+            // on a Qwen3.6-A3B MoE checkpoint (see
             // .scratch/hipgraph-moe-drift-audit.md Part A). Aligning the
             // default flips both paths to `attention_flash_q8_0` and makes
             // direct vs graph byte-identical at the cost of moving small-
@@ -1501,17 +1488,14 @@ impl Qwen35Scratch {
                 .as_deref()
                 == Some("1")
             {
-                // Ordinary reuse cache: tape-free and capped at legacy ≤512
+                // Ordinary reuse cache: capped at legacy ≤512
                 // even under a larger requested ceiling — only a fully
                 // admitted request allocates the larger owned PBS, after
-                // Q8+EF/KV/free-VRAM checks in the inner entry. Tree/tape
-                // wrappers use separate owned tape-enabled scratch, never
-                // this cache. Other arches keep their existing sizing and
-                // tape behavior.
+                // Q8+EF/KV/free-VRAM checks in the inner entry.
                 // Sizing is the pure `implicit_reuse_pbs_plan` the CPU
                 // admission tests read for the same default/explicit cases.
-                let (max_batch, cap_tape) = super::prefill::implicit_reuse_pbs_plan_for_gpu(gpu);
-                s.prefill_batch = match PrefillBatchScratch::new_opt(gpu, config, max_batch, cap_tape) {
+                let max_batch = super::prefill::implicit_reuse_pbs_plan_for_gpu(gpu);
+                s.prefill_batch = match PrefillBatchScratch::new(gpu, config, max_batch) {
                     Ok(prefill) => Some(prefill),
                     Err(error) => {
                         cleanup_allocations!();
@@ -1664,6 +1648,28 @@ fn ar_graph_trace_enabled() -> bool {
     })
 }
 
+/// True when any of the given MoE layers resolves decode to the host top-K
+/// fallback (`MoeResolution::use_gpu_topk == false`). Qwen decode never sets a
+/// route policy or selection bias, so the base resolution is the effective one.
+pub(crate) fn moe_layers_use_host_topk<'a>(
+    layers: impl IntoIterator<Item = hipfire_dispatch::families::moe::MoeDtypes<'a>>,
+    k: usize,
+    arch_has_wmma: bool,
+) -> bool {
+    layers.into_iter().any(|dtypes| {
+        !hipfire_dispatch::families::moe::MoeResolution::resolve_arch(&dtypes, k, arch_has_wmma)
+            .use_gpu_topk
+    })
+}
+
+/// MoE half of the AR decode hipGraph gate. Dense models always pass; MoE
+/// models need every layer to resolve decode to GPU top-K (#1149).
+/// `moe_host_topk` is evaluated only for MoE models.
+#[inline]
+fn ar_graph_moe_admitted(num_experts: usize, moe_host_topk: impl FnOnce() -> bool) -> bool {
+    num_experts == 0 || !moe_host_topk()
+}
+
 #[inline]
 fn ar_graph_eligible_for_kv(
     requested: bool,
@@ -1702,13 +1708,12 @@ fn ar_graph_binding(
     for t in kv_cache.k_gpu.iter().chain(&kv_cache.v_gpu) {
         mix(t.buf.as_ptr());
     }
-    for t in dn_state
-        .s_matrices
-        .iter()
-        .chain(&dn_state.s_scales)
-        .chain(&dn_state.conv_states)
-        .chain(&dn_state.s_ef_residual)
-    {
+    // Every owned family, GDN carry included: an exchange or reallocation of
+    // any of them changes the identity. Reset and same-pointer restore do not
+    // (the captured decode graph stays valid across them); the owner
+    // generation (`dn_state.stream.generation`) is for component-executor
+    // graph keys, not this decode graph.
+    for t in dn_state.families().into_iter().flatten() {
         mix(t.buf.as_ptr());
     }
     mix(s.pos_buf.as_ptr());
@@ -1771,6 +1776,22 @@ fn ar_graph_binding(
     h.max(1)
 }
 
+/// Decode/verify reads the Q8/EF planes directly; they are authoritative only on a
+/// `Sealed` stream (CHUNK-CANONICAL-DESIGN §3.5). An `Open` ordinary-prefill phase must be
+/// finished by `DeltaNetState::seal_streams` at the actual prompt end first; fail closed
+/// instead of decoding from a stale quantized plane.
+pub(crate) fn refuse_open_gdn_stream(dn_state: &DeltaNetState, site: &str) -> HipResult<()> {
+    if dn_state.stream.is_open() {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "{site}: the GDN stream is Open; seal it at the prompt end before decode/verify"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -1783,6 +1804,7 @@ pub fn forward_scratch(
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
+    refuse_open_gdn_stream(dn_state, "forward_scratch")?;
     #[cfg(feature = "moe-oracle")]
     crate::qwen35::oracle::set_decode_position(pos).map_err(|e| HipError::new(0, &e))?;
     let required_tokens = checked_kv_end(pos, 1, "forward_scratch")?;
@@ -1797,60 +1819,10 @@ pub fn forward_scratch(
     )?;
     kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
     let dim = config.dim;
-    // hipGraph capture for MoE was previously gated off-by-default behind
-    // HIPFIRE_GRAPH_MOE=1 because of a known drift bug (task #100): under
-    // capture, A3B accumulated a per-step ~1-ULP delta that compounded
-    // through the KV cache + GDN state and crossed the top-1 margin at
-    // step ~7 (q8 KV) or ~114 (asym3 KV), producing visible token-loop
-    // attractors by step 30-50 ("- **One**\n- **One**\n…").
-    //
-    // Root cause (fixed 2026-05-21): `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed`
-    // used K_TOP=8 concurrent `atomicAdd` writes per output row. FP32
-    // addition is non-associative, so the final bits depend on wavefront
-    // scheduling order. Under hipGraph replay that order differs from
-    // direct execution (graph scheduling pipelines kernels differently),
-    // introducing the systematic per-step delta. The kernel's own header
-    // (`kernels/src/gemv_hfq4g256_moe_down.hip:14-19`) had already flagged
-    // this non-determinism but rated it negligible based on the
-    // direct-only smoke test — capture amplifies the effect.
-    //
-    // Fix: the MoE FFN decode path now uses the atomic-free expand+combine
-    // pattern already used in prefill (`forward_prefill_batch_with_pbs`
-    // L5217-5232): `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`
-    // writes one row per (expert-rank, m), then `moe_down_combine_k8_batched`
-    // sums K_TOP slots into x_residual in a fixed iteration order. The
-    // resulting MoE FFN output is byte-deterministic under both direct
-    // execution and hipGraph replay.
-    //
-    // `experimental.graph.moe` remains the explicit policy control. The atomic
-    // fix is necessary but not sufficient — the CPU-topK fallback path
-    // (when not all gate-side MoE weights are MQ4G256, e.g. router=Q8 per
-    // the post-2026-04 router-attractor fix) calls `download_f32(router_logits)`,
-    // a sync D2H that fails under graph capture with hipError 906. Until
-    // that D2H is migrated to a capture-safe equivalent, opting in only
-    // works for models where the runtime takes the use_gpu_topk path.
-    //
-    // Reproducer used to characterize the fix:
-    //   hipfire config set experimental.graph.forward true
-    //   hipfire config set experimental.graph.moe true
-    //   HIPFIRE_SMOKE_KV=q8 \
-    //   HIPFIRE_SMOKE_MODE=chat HIPFIRE_SMOKE_STEPS=200 \
-    //   HIPFIRE_SMOKE_PROMPT="Count from one to twenty in English." \
-    //   ./target/release/examples/a3b_smoke_forward <uniform-mq4-a3b>
-    //
-    // Graph policy is resolved once from TOML before GPU initialization and is
-    // carried directly by the GPU feature snapshot.
-    // Default-ON (2026-06-16): cross-arch A/B validated — gfx12 +4.2% A3B mq4
-    // decode, coherence-gate clean (fluent at decode pos 1-4 on current ROCm).
-    // Opt out with `experimental.graph.moe = false`. Both root causes of the prior
-    // crash/drift are fixed:
-    //   1. atomicAdd drift (task #100, 2026-05-21): expand+combine pattern.
-    //   2. CPU-topK fallback D2H: `download_f32(router_logits)` replaced by
-    //      GPU `softmax_f32` + `moe_topk_renorm_k8` + small [k] D2H — fully
-    //      capture-safe. Mixed-kmap A3B (Q8 router, post-PR #199) no longer
-    //      crashes with hipError 906 under AR graph capture.
-    // Validated + flipped to default-on 2026-06-16.
-    let allow_moe = gpu.flags.graph_moe;
+    // MoE configs capture like dense ones. The two historical MoE capture
+    // blockers are fixed: the atomicAdd down-projection drift (task #100,
+    // 2026-05-21: expand + fixed-order combine) and the CPU-topK router
+    // `download_f32` D2H (now GPU softmax + top-k renorm + a small [k] D2H).
     // hipGraph per-forward-pass capture/replay default policy:
     //   - gfx12 (RDNA4): default-ON. +2.4-2.7% decode on 9B Qwen 3.5
     //     MFP4G32 (5-run mean, all positive, tight variance, 2026-05-11).
@@ -1861,14 +1833,8 @@ pub fn forward_scratch(
     //     and consistent across model sizes.
     //   - other archs (RDNA1/2, CDNA): default-OFF (opt-in via
     //     `experimental.graph.forward = true`) since not yet A/B'd on those.
-    //   - MoE configs follow `experimental.graph.moe`. The ~30-50-token
-    //     attractor drift in the use_gpu_topk MoE down step was fixed
-    //     2026-05-21 (task #100 — atomicAdd → expand+combine), but the
-    //     CPU-topK fallback's `download_f32(router_logits)` D2H sync
-    //     remains capture-incompatible, so mixed-kmap A3B (post-PR #199)
-    //     can crash under graph capture even with the fix. Once that
-    //     D2H is migrated to a capture-safe path, the MoE default can
-    //     be flipped to follow the arch defaults.
+    //   - MoE configs follow the same policy (both capture blockers fixed,
+    //     see above).
     // An explicit `experimental.graph.forward = false` always wins.
     let graph_override = gpu.flags.graph_forward;
     let graph_arch_default = gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
@@ -1921,13 +1887,19 @@ pub fn forward_scratch(
         gpu.graphs.ar_forward_replay_enabled = false;
         gpu.graphs.ar_forward_kernel_dirty = true;
     }
-    // MoE models require `experimental.graph.moe` in addition to the
-    // arch/kill-switch guards. Dense models (num_experts==0) are unaffected.
+    // MoE models follow the same arch/kill-switch guards as dense, and every
+    // MoE layer must resolve decode to GPU top-K: the host top-K fallback
+    // downloads router output mid-forward, which
+    // a capture cannot record (#1149, hipError 906). That resolution is decided
+    // once per model (load-time, cached on the weights). Dense models
+    // (num_experts==0) are unaffected.
     let graph_would_be_used = ar_graph_test
         && graph_enabled
         && graph_eligible
         && !gpu.replay.is_enabled()
-        && (config.num_experts == 0 || allow_moe);
+        && ar_graph_moe_admitted(config.num_experts, || {
+            weights.moe_decode_host_topk(config, gpu.arch_caps.has_wmma())
+        });
     // A CPU-executed step (memory.offload_exec=cpu over a spilled prefix) is a
     // host sync point — a D2H and an H2D around the multiplication — so it can
     // neither be recorded into a hipGraph nor replayed out of one. Take the
@@ -2253,13 +2225,10 @@ pub fn forward_scratch_embed(
 
 /// Write `(t, h, w)` for sequence position `pos` into `scratch.pos_buf3`.
 ///
-/// `compact_offset` mirrors what the 1D path does to `pos_buf` after a
-/// TriAttention compaction: absolute rope phase = physical index + offset.
-/// Note the daemon does NOT build an `MropeCtx` while eviction is armed
-/// (physical indices are renumbered there, so `MropeCtx::positions` — which is
-/// indexed by physical position — would be misaligned), so in practice this
-/// arm sees `compact_offset == 0`. It is applied anyway so the mrope branch
-/// never silently disagrees with its 1D twin.
+/// `compact_offset` mirrors what the 1D path does to `pos_buf`: absolute rope
+/// phase = physical index + offset. It is always 0 now that KV eviction is
+/// gone; it is applied anyway so the mrope branch never silently disagrees
+/// with its 1D twin.
 fn upload_mrope_pos3(
     gpu: &mut Gpu,
     scratch: &Qwen35Scratch,
@@ -2429,6 +2398,7 @@ fn forward_scratch_layers(
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
+    refuse_open_gdn_stream(dn_state, "forward_scratch_layers")?;
     let ctx = DispatchCtx::new(gpu);
     if let Some(mc) = mrope {
         debug_assert_eq!(
@@ -2454,11 +2424,8 @@ fn forward_scratch_layers(
         }
         Ok(())
     };
-    let tap_enabled = hipfire_runtime::triattn::tap_enabled();
     let mut delta_layer_idx = 0usize;
     let combine_next_rms = moe_combine_next_rms_enabled(gpu, weights, config);
-    let reuse_fused_rotation =
-        hipfire_config::developer_var("HIPFIRE_MOE_COMBINE_NEXT_RMS_RENORM").as_deref() != Ok("1");
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
@@ -2483,16 +2450,12 @@ fn forward_scratch_layers(
             )?;
             finish_layer(gpu, layer_idx - 1)?;
         }
-        let tap_fn = |gpu: &mut Gpu| {
-            triattn_tap(gpu, layer_idx, s, config).map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-        let tap = tap_enabled.then_some(&tap_fn as AttentionTap<'_>);
         let mixer = binding.mixer(
             layer,
             layer_idx,
             delta_layer_idx,
-            fused_transition && reuse_fused_rotation,
-            tap,
+            fused_transition,
+            None,
             MixerOutput::Residual,
         );
         execute_steps(gpu, &ctx, &[mixer]).map_err(|e| HipError::new(0, &e.to_string()))?;
@@ -2562,11 +2525,7 @@ pub(crate) fn forward_scratch_dense_layer(
         mrope_section: None,
     };
     let layer = &weights.layers[layer_idx];
-    let tap_fn = |gpu: &mut Gpu| {
-        triattn_tap(gpu, layer_idx, s, config).map_err(|e| DispatchError::Hip(e.to_string()))
-    };
-    let tap = hipfire_runtime::triattn::tap_enabled().then_some(&tap_fn as AttentionTap<'_>);
-    let mixer = binding.mixer(layer, layer_idx, 0, false, tap, MixerOutput::Residual);
+    let mixer = binding.mixer(layer, layer_idx, 0, false, None, MixerOutput::Residual);
     let ffn = super::program::dense_ffn(&binding.dims, s, layer, MlpOutput::Residual)
         .expect("dense layer");
     execute_steps(gpu, &ctx, &[mixer, Step::GatedMlp(ffn)])
@@ -3070,12 +3029,6 @@ impl PreparedMoeShard {
                 "qwen35: post-load EP shard refuses AWQ pointer tables",
             ));
         }
-        if ffn.paro_shared.is_some() {
-            return Err(HipError::new(
-                0,
-                "qwen35: post-load EP shard refuses ParoQuant rotation sidecars",
-            ));
-        }
         // The only sanctioned Single -> EP transition: rebuild planner input
         // from the attested plan and rerun the ordinary manifest/expert
         // planners. Ownership comes from the planner, never from `e % N`.
@@ -3557,39 +3510,6 @@ fn shard_all_moe_layers_inner(
             _ => unreachable!("EP shard admission passed layer {index}"),
         };
         shard.commit(gpu, ffn);
-    }
-    Ok(())
-}
-
-/// TriAttention tap helper (inline from original forward).
-fn triattn_tap(
-    gpu: &mut Gpu,
-    layer_idx: usize,
-    s: &Qwen35Scratch,
-    config: &Qwen35Config,
-) -> HipResult<()> {
-    let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
-        gpu,
-        layer_idx,
-        &s.fa_q.buf,
-        1,
-        config.n_heads,
-        config.head_dim,
-    )?;
-    if !gpu_handled {
-        let n_q = config.n_heads * config.head_dim;
-        let q_cpu = gpu.download_f32(&s.fa_q)?;
-        if hipfire_runtime::triattn::tap_needs_k() {
-            let n_k = config.n_kv_heads * config.head_dim;
-            let k_cpu = gpu.download_f32(&s.fa_k)?;
-            hipfire_runtime::triattn::record_prerope_qk(
-                layer_idx,
-                &q_cpu[..n_q],
-                Some(&k_cpu[..n_k]),
-            );
-        } else {
-            hipfire_runtime::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
-        }
     }
     Ok(())
 }
@@ -4452,7 +4372,6 @@ fn forward_prefill_dense_tp_batched(
                         BatchSemantics::Sequential,
                         chunk_start,
                         n,
-                        None,
                         false,
                     )?;
                     Ok(())
@@ -4503,7 +4422,6 @@ fn forward_prefill_dense_tp_batched(
                                 n_v_heads,
                                 hd,
                                 BatchSemantics::Sequential,
-                                None,
                                 captures
                                     .as_ref()
                                     .and_then(|caps| caps[rank].tape.as_deref())
@@ -4515,8 +4433,7 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
-                                None,  // commit_stride: TP ranks keep legacy cadence
-                                false, // Chunk scan is single-GPU ordinary prefill only
+                                hipfire_dispatch::pipeline::batched_deltanet::GdnPrefillRoute::Legacy, // TP ranks keep the per-call recurrence
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -4628,8 +4545,6 @@ fn forward_prefill_dense_tp_batched(
                             let max_ctx = chunk_start + n;
                             let ctx = DispatchCtx::new(&gpus.devices[rank]);
                             let cfg = &configs[rank];
-                            let tap_fn = super::program::batched_attention_tap(cfg);
-                            let tap = tap_fn.get();
                             if let Err(e) = hipfire_dispatch::pipeline::batched_attention::batch_chunk_full_attn_attn(
                                 &mut gpus.devices[rank],
                                 false,
@@ -4644,7 +4559,6 @@ fn forward_prefill_dense_tp_batched(
                                 max_ctx,
                                 &ctx,
                                 BatchSemantics::Sequential,
-                                None,
                                 q8_flags[rank],
                                 q8_flags[rank],
                                 kv_layer_idx,
@@ -4652,7 +4566,7 @@ fn forward_prefill_dense_tp_batched(
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                                 None, // commit_stride: TP ranks keep legacy cadence
-                                tap,
+                                None,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -4864,24 +4778,22 @@ pub fn forward_prefill_dense_tp_with_hidden(
     if cap == 0 {
         return Err(HipError::new(0, "prefill_max_batch is zero"));
     }
-    // ── Allocate per-rank PBS + N*dim partial (transactional, cap_gdn_tape=false) ──
+    // ── Allocate per-rank PBS + N*dim partial (transactional) ──
     let mut pbs_vec: Vec<PrefillBatchScratch> = Vec::with_capacity(tp);
     let mut partials: Vec<GpuTensor> = Vec::with_capacity(tp);
     for rank in 0..tp {
-        let pbs =
-            match PrefillBatchScratch::new_opt(&mut gpus.devices[rank], &configs[rank], cap, false)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    for (i, prev) in pbs_vec.drain(..).enumerate() {
-                        let _ = prev.free_gpu(&mut gpus.devices[i]);
-                    }
-                    for (i, prev) in partials.drain(..).enumerate() {
-                        let _ = gpus.devices[i].free_tensor(prev);
-                    }
-                    return Err(e);
+        let pbs = match PrefillBatchScratch::new(&mut gpus.devices[rank], &configs[rank], cap) {
+            Ok(p) => p,
+            Err(e) => {
+                for (i, prev) in pbs_vec.drain(..).enumerate() {
+                    let _ = prev.free_gpu(&mut gpus.devices[i]);
                 }
-            };
+                for (i, prev) in partials.drain(..).enumerate() {
+                    let _ = gpus.devices[i].free_tensor(prev);
+                }
+                return Err(e);
+            }
+        };
         pbs_vec.push(pbs);
         let partial = match gpus.devices[rank].alloc_tensor(&[cap * dim], DType::F32) {
             Ok(t) => t,
@@ -5102,13 +5014,13 @@ impl Qwen35Bindings<'_> {
         }
     }
 
-    fn mixer<'s>(&'s self, tap: Option<AttentionTap<'s>>) -> Step<'s> {
+    fn mixer<'s>(&'s self) -> Step<'s> {
         self.program().mixer(
             self.layer,
             self.layer_idx,
             self.delta_layer_idx,
             self.precomputed_attn_x_rot,
-            tap,
+            None,
             MixerOutput::Residual,
         )
     }
@@ -5151,7 +5063,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         op: &OpBinding,
     ) -> Result<(), DispatchError> {
         match op_code(op) {
-            q35_op::PROJ_QKV | q35_op::PROJ_QKVZA => match self.mixer(None) {
+            q35_op::PROJ_QKV | q35_op::PROJ_QKVZA => match self.mixer() {
                 Step::DeltaNetMixer(op) => op.project(gpu, ctx),
                 Step::GatedAttention(op) => op.project(gpu, ctx),
                 _ => Err(wrong_layer("PROJ")),
@@ -5168,7 +5080,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         op: &OpBinding,
     ) -> Result<(), DispatchError> {
         match op_code(op) {
-            q35_op::RESID_WO => match self.mixer(None) {
+            q35_op::RESID_WO => match self.mixer() {
                 Step::DeltaNetMixer(op) => op.output(gpu, ctx),
                 Step::GatedAttention(op) => op.output(gpu, ctx, self.fa_output_prerotated),
                 _ => Err(wrong_layer("RESID_WO")),
@@ -5184,7 +5096,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         _ctx: &DispatchCtx,
         _op: &OpBinding,
     ) -> Result<(), DispatchError> {
-        match self.mixer(None) {
+        match self.mixer() {
             Step::DeltaNetMixer(op) => op.gated_norm(gpu),
             _ => Err(wrong_layer("NORM_GATED")),
         }
@@ -5197,11 +5109,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         op: &OpBinding,
     ) -> Result<(), DispatchError> {
         let (s, config, layer_idx) = (self.s, self.config, self.layer_idx);
-        let tap_fn = |gpu: &mut Gpu| {
-            triattn_tap(gpu, layer_idx, s, config).map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-        let tap = hipfire_runtime::triattn::tap_enabled().then_some(&tap_fn as AttentionTap<'_>);
-        let prerotated = match (op_code(op), self.mixer(tap)) {
+        let prerotated = match (op_code(op), self.mixer()) {
             (q35_op::ATTEND_FULL, Step::GatedAttention(op)) => op.attend(gpu, ctx)?,
             (q35_op::ATTEND_DN_PREP, Step::DeltaNetMixer(op)) => return op.prepare(gpu),
             (code, _) => {
@@ -5444,7 +5352,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         _ctx: &DispatchCtx,
         _op: &OpBinding,
     ) -> Result<(), DispatchError> {
-        match self.mixer(None) {
+        match self.mixer() {
             Step::DeltaNetMixer(op) => op.recur(gpu),
             _ => Err(wrong_layer("RECUR_GDN")),
         }
@@ -5539,18 +5447,10 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
 /// that layer's normalized MQ activation. The whole-model admission check is
 /// intentionally strict so every deferred producer has exactly one compatible
 /// consumer and no fallback projection can observe an incomplete residual.
-/// Enabled by default for the admitted mq4r shape; set
-/// `HIPFIRE_MOE_COMBINE_NEXT_RMS=0` to restore the two-dispatch schedule.
+/// Enabled for the admitted mq4r shape; other shapes keep the two-dispatch
+/// schedule.
 fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config) -> bool {
-    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let requested = *REQUESTED.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_MOE_COMBINE_NEXT_RMS")
-            .ok()
-            .as_deref()
-            != Some("0")
-    });
-    if !requested
-        || !(gpu.arch_caps.is_gfx1100() || hybrid::gfx1151_radiowave(gpu))
+    if !(gpu.arch_caps.is_gfx1100() || hybrid::gfx1151_radiowave(gpu))
         || config.dim != 2_048
         || config.num_experts_per_tok != 8
         || config.n_layers < 2
@@ -5665,6 +5565,59 @@ pub fn forward_with_embedding(
 mod tests {
     use super::*;
     use hipfire_dispatch::pipeline::superop::SuperOpKind;
+
+    fn moe_dtypes(
+        gate_up: DType,
+        down: DType,
+    ) -> hipfire_dispatch::families::moe::MoeDtypes<'static> {
+        hipfire_dispatch::families::moe::MoeDtypes {
+            router: DType::MQ4G256,
+            shared: Some(hipfire_dispatch::families::moe::MoeSharedDtypes {
+                selector: DType::MQ4G256,
+                gate: DType::MQ4G256,
+                up: DType::MQ4G256,
+                down: DType::MQ4G256,
+            }),
+            experts_all_gate_up_mq4: matches!(gate_up, DType::MQ4G256 | DType::MQ4G256V2),
+            routed_gate_up: gate_up,
+            routed_down: down,
+            routed_has_mixed_experts: false,
+            per_expert_gate_up: None,
+            per_expert_down: None,
+        }
+    }
+
+    /// #1149: one host-top-K MoE layer keeps the whole model's AR decode
+    /// graph eager; all-GPU-top-K MoE and dense models keep the old gate.
+    #[test]
+    fn ar_graph_gate_runs_eager_when_any_moe_layer_uses_host_topk() {
+        let gpu_topk = moe_dtypes(DType::MQ4G256, DType::MQ4G256);
+        // Split V2/V1 header pairing: not indexable, so decode falls back to
+        // host top-K (the qt13 mixed-header class).
+        let host_topk = moe_dtypes(DType::MQ6G256V2, DType::MQ4G256);
+        for wmma in [false, true] {
+            assert!(!moe_layers_use_host_topk([gpu_topk, gpu_topk], 8, wmma));
+            assert!(moe_layers_use_host_topk(
+                [gpu_topk, host_topk, gpu_topk],
+                8,
+                wmma
+            ));
+            // Router widths the GPU top-K kernel cannot select also fall back.
+            assert!(moe_layers_use_host_topk([gpu_topk], 6, wmma));
+            assert!(!moe_layers_use_host_topk(std::iter::empty(), 8, wmma));
+        }
+
+        let decide = |n_exp, layers: &[_]| {
+            ar_graph_moe_admitted(n_exp, || {
+                moe_layers_use_host_topk(layers.iter().copied(), 8, false)
+            })
+        };
+        assert!(decide(256, &[gpu_topk, gpu_topk]));
+        assert!(!decide(256, &[gpu_topk, host_topk]));
+        assert!(decide(0, &[]));
+        // Dense models never evaluate the layer scan.
+        assert!(ar_graph_moe_admitted(0, || panic!("dense must not scan")));
+    }
 
     #[test]
     fn x_rot_covers_deltanet_value_width_for_moe_configs() {

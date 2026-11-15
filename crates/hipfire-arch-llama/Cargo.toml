@@ -47,9 +47,6 @@ required-features = ["lab"]
 name = "qwen3_dspark_bench"
 required-features = ["lab"]
 
-[[example]]
-name = "qwen3_dspark_load_smoke"
-required-features = ["lab"]
 
 [[example]]
 name = "qwen3_dspark_parity"

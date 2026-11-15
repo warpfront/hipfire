@@ -2987,10 +2987,11 @@ mod tests {
     }
     fn insn(name: &str, ops: Vec<Operand>) -> Inst {
         let r = crate::isa::gfx12().iter().find(|r| r.name == name).unwrap();
-        Inst::from_parts(
+        Inst::from_encoding(
             Arch::Gfx1201,
             r.op,
             r.form,
+            r.variant,
             Default::default(),
             ops.into_iter().collect(),
             Default::default(),
@@ -3099,10 +3100,11 @@ mod tests {
             )
         };
         let ops = vec![v(0), v(1), v(2), v(1), v(0), v(3)];
-        let i = Inst::from_parts(
+        let i = Inst::from_encoding(
             Arch::Gfx1201,
             x.op,
             x.form,
+            x.variant,
             FormFields::Vopd {
                 y_op: y.op,
                 x_operands: 3,
@@ -3146,10 +3148,11 @@ mod tests {
             let y = table.iter().find(|r| r.name == name).unwrap();
             let mut ops = vec![v(0), v(1), v(1)];
             ops.extend(rhs);
-            let i = Inst::from_parts(
+            let i = Inst::from_encoding(
                 Arch::Gfx1201,
                 x.op,
                 x.form,
+                x.variant,
                 FormFields::Vopd {
                     y_op: y.op,
                     x_operands: 2,
@@ -3634,10 +3637,11 @@ mod tests {
                 )
             };
             let r = table.iter().find(|r| r.name == name).unwrap();
-            let base = Inst::from_parts(
+            let base = Inst::from_encoding(
                 arch,
                 r.op,
                 r.form,
+                r.variant,
                 Default::default(),
                 ops.into_iter().collect(),
                 Default::default(),
@@ -4333,10 +4337,11 @@ mod tests {
     fn fmamk_and_fmaak_use_the_literal_constant() {
         let build = |name: &str| {
             let r = crate::isa::gfx12().iter().find(|r| r.name == name).unwrap();
-            Inst::from_parts(
+            Inst::from_encoding(
                 Arch::Gfx1201,
                 r.op,
                 r.form,
+                r.variant,
                 Default::default(),
                 vec![v(0), v(1), v(2)].into_iter().collect(),
                 Default::default(),
@@ -4385,10 +4390,11 @@ mod tests {
             .iter()
             .find(|r| r.name == name)
             .unwrap_or_else(|| panic!("{name} is not in the {arch:?} table"));
-        Inst::from_parts(
+        Inst::from_encoding(
             arch,
             r.op,
             r.form,
+            r.variant,
             Default::default(),
             ops.into_iter().collect(),
             Default::default(),
@@ -4945,10 +4951,11 @@ mod tests {
                 .iter()
                 .find(|r| r.name == "v_fmamk_f32")
                 .unwrap();
-            let i = Inst::from_parts(
+            let i = Inst::from_encoding(
                 arch,
                 r.op,
                 r.form,
+                r.variant,
                 Default::default(),
                 vec![v(0), v(1), v(2)].into_iter().collect(),
                 Default::default(),
@@ -4972,10 +4979,11 @@ mod tests {
                 t.iter().find(|r| r.name == "v_dual_mul_f32").unwrap(),
                 t.iter().find(|r| r.name == "v_dual_add_f32").unwrap(),
             );
-            let i = Inst::from_parts(
+            let i = Inst::from_encoding(
                 arch,
                 x.op,
                 x.form,
+                x.variant,
                 FormFields::Vopd {
                     y_op: y.op,
                     x_operands: 3,
@@ -5914,10 +5922,11 @@ mod tests {
             .find(|r| r.name == "s_fmaak_f32")
             .unwrap();
         let build = |k: f32| {
-            Inst::from_parts(
+            Inst::from_encoding(
                 arch,
                 r.op,
                 r.form,
+                r.variant,
                 Default::default(),
                 vec![sreg(0), sreg(1), sreg(2)].into_iter().collect(),
                 Default::default(),
@@ -7140,10 +7149,11 @@ mod tests {
         }
         let t = table(arch);
         let row = t.iter().find(|r| r.name == name).unwrap();
-        let i = Inst::from_parts(
+        let i = Inst::from_encoding(
             arch,
             row.op,
             row.form,
+            row.variant,
             FormFields::Vopd {
                 y_op: row.op,
                 x_operands: 3,

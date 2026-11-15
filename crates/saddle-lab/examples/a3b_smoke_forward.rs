@@ -10,10 +10,6 @@
 //!   cargo run --release --features deltanet --example a3b_smoke_forward -- \
 //!       ~/.hipfire/models/qwen3.5-35b-a3b.mq4
 //!
-//!   # ParoQuant / HF safetensors directory (auto-routes by path-is-dir):
-//!   cargo run --release --features deltanet --example a3b_smoke_forward -- \
-//!       ~/.hipfire/models/shisa-Qwen3.6-35B-A3B-PARO-packed
-//!
 //!   # Optional: generate N tokens greedily to probe short-term stability.
 //!   HIPFIRE_SMOKE_STEPS=8 cargo run --release ...
 
@@ -31,7 +27,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: a3b_smoke_forward <model.mq4 | safetensors-dir>");
+        eprintln!("Usage: a3b_smoke_forward <model.mq4>");
         std::process::exit(1);
     }
     let model_path = Path::new(&args[1]);
@@ -43,46 +39,11 @@ fn main() {
     eprintln!("Opening: {}", model_path.display());
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
 
-    // Auto-route safetensors directories (ParoQuant / HF native) — mirrors
-    // eval_hipfire.rs:165-176 and daemon.rs:1500-1504. HFQ files take the
-    // canonical HFQ path below.
+    // Safetensors model directories are refused (their only qwen35 loader was
+    // the removed ParoQuant one). HFQ files take the canonical HFQ path below.
     let (config, weights, tokenizer) = if model_path.is_dir() {
-        use hipfire_runtime::model_source::ModelSource;
-        use hipfire_runtime::safetensors_source::SafetensorsSource;
-        let source = SafetensorsSource::open(model_path).expect("safetensors open");
-        let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
-        assert!(
-            config.num_experts > 0,
-            "this smoke test expects a MoE model"
-        );
-        eprintln!(
-            "A3B config: dim={}, layers={}, experts={}, top_k={}, moe_inter={}, shared_inter={}",
-            config.dim,
-            config.n_layers,
-            config.num_experts,
-            config.num_experts_per_tok,
-            config.moe_intermediate_size,
-            config.shared_expert_intermediate_size
-        );
-        eprintln!("Loading weights via safetensors (ParoQuant path) ...");
-        let weights = {
-            let mut paro_source =
-                qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
-            let paro_layout = qwen35::Layout::single(config.n_layers);
-            qwen35::load_weights(
-                &mut paro_source,
-                std::slice::from_mut(&mut gpu),
-                &paro_layout,
-            )
-            .expect("load_weights")
-        };
-        let tok_path = source
-            .tokenizer_json_path()
-            .expect("tokenizer.json in safetensors directory");
-        let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
-            .expect("tokenizer parse")
-            .expect("tokenizer load");
-        (config, weights, tokenizer)
+        eprintln!("{}", hipfire_runtime::hfq::REMOVED_SAFETENSORS_DIR_MSG);
+        std::process::exit(1)
     } else {
         let mut hfq = HfqFile::open(model_path).expect("open model");
         let config = qwen35::config_from_hfq(&hfq).expect("read config");
@@ -118,35 +79,10 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(256usize);
     // Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the
-    // production CLI default). asym3/asym4 engage the Givens-rotated 3/4-bit
-    // KV path and always-on flash; f32 falls back to plain attention_f32.
+    // production CLI default). f32 falls back to plain attention_f32.
     let kv_mode = std::env::var("HIPFIRE_SMOKE_KV").unwrap_or_else(|_| "q8".to_string());
     eprintln!("KV cache mode: {kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
-        "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .expect("kv cache alloc"),
-        "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .expect("kv cache alloc"),
-        "asym2" => KvCache::new_gpu_asym2(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .expect("kv cache alloc"),
         _ => KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,

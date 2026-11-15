@@ -940,9 +940,8 @@ def test_lane_uses_the_draft_it_actually_holds(tmp_path, monkeypatch):
     assert argv[argv.index("--draft") + 1].endswith("legacy-dense-dflash-mq4.hfq")
 
 
-def test_lane_without_any_declared_draft_skips_rather_than_fails(tmp_path, monkeypatch):
-    """The lane had no artifact to speculate with. Failing it would be a false
-    negative on evidence it never had; passing it would claim coverage."""
+def test_lane_without_any_declared_draft_skips_at_mode_level(tmp_path, monkeypatch):
+    """Mode level still records `skip` (no harness invoked); the fixture verdict fails it."""
     argv, res = _dflash_env(tmp_path, monkeypatch, FIX, "battery-dflash", [])
     assert res["status"] == "skip", res
     assert "qwen38-27b-dflash-mq4.hfq" in res["reason"]
@@ -956,16 +955,35 @@ def test_chain_dflash_keeps_chain_mode(tmp_path, monkeypatch):
     assert "--prompts-file" not in argv  # chain carries its own prompts
 
 
-def test_skip_does_not_fail_the_fixture_but_a_real_failure_does(tmp_path, monkeypatch):
-    """Regression pin: `all(status == "pass")` counted a skip as a failure."""
-    assert run_mod._run_fixture_harness.__doc__ is not None
-    graded = {"battery": {"status": "pass"}, "battery-dflash": {"status": "skip", "reason": "no draft"}}
-    ungraded = {m: r for m, r in graded.items() if r.get("status") != "skip"}
-    assert all(r["status"] == "pass" for r in ungraded.values())
-    # and a genuine failure alongside a skip must still fail
-    graded_fail = {"battery": {"status": "fail", "reason": "attractor"}, "battery-dflash": {"status": "skip"}}
-    ungraded_fail = {m: r for m, r in graded_fail.items() if r.get("status") != "skip"}
-    assert not all(r["status"] == "pass" for r in ungraded_fail.values())
+def _fixture_verdict(monkeypatch, canned):
+    monkeypatch.setattr(run_mod, "_run_harness_mode", lambda *a: dict(canned[a[5]]))
+    return run_mod._run_fixture_harness(".", {"tag": "X"}, {}, ".", "0", list(canned), {}, ".")
+
+
+_OK = {"exit": 0, "seconds": 0.0, "rows": [], "status": "pass", "reason": ""}
+_SKIP = {"exit": 0, "seconds": 0.0, "rows": [], "status": "skip", "reason": "none of ['d.hfq'] present for fixture X"}
+
+
+def test_all_modes_skipped_fails_the_fixture(monkeypatch):
+    res = _fixture_verdict(monkeypatch, {"battery": _SKIP, "battery-dflash": _SKIP})
+    assert res["status"] == "fail"
+    assert "battery-dflash: skipped" in res["reason"] and "skip is not pass" in res["reason"]
+
+
+def test_one_pass_one_skip_fails_the_fixture(monkeypatch):
+    res = _fixture_verdict(monkeypatch, {"battery": _OK, "battery-dflash": _SKIP})
+    assert res["status"] == "fail"
+    assert "battery-dflash: skipped" in res["reason"] and "battery:" not in res["reason"]
+
+
+def test_all_modes_pass_passes_the_fixture(monkeypatch):
+    res = _fixture_verdict(monkeypatch, {"battery": _OK, "battery-dflash": _OK})
+    assert res["status"] == "pass" and res["reason"] == ""
+
+
+def test_self_test_returns_zero(capsys):
+    assert run_mod.self_test() == 0
+    assert "hw-gate run.py: self-test OK" in capsys.readouterr().out
 
 
 def test_fixtures_manifest_declares_dflash_routes(tmp_path):

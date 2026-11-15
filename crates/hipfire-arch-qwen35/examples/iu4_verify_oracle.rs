@@ -39,7 +39,7 @@
 use hipfire_arch_qwen35::load_qwen35_bundle;
 use hipfire_arch_qwen35::qwen35::LayerWeights;
 use hipfire_runtime::kv_backend::KvBackend;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::ffi::c_void;
 
@@ -640,7 +640,6 @@ fn run() -> R<usize> {
     rep.line(format!("env {env:?}"));
 
     let src = ModelSource::from_path(&model)?;
-    let cask = CaskConfig::default();
     let mut lc = LoadCtx {
         path: &model,
         max_seq: 4096,
@@ -663,7 +662,6 @@ fn run() -> R<usize> {
         kv_backend: KvBackend::default(),
         kv_adaptive_override: None,
         state_quant_override: None,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,
@@ -674,6 +672,7 @@ fn run() -> R<usize> {
         gemma4_draft_len: 3,
         xdna: None,
         batch_request: Default::default(),
+        ep_ar_wire: Default::default(),
     };
     let b = load_qwen35_bundle(src, &mut lc).map_err(|e| e.to_string())?;
     rep.line(format!(

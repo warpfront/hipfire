@@ -283,15 +283,21 @@ impl Backend for Builder {
     }
     fn exec_from_scc(&mut self, auth: &Auth) -> Result<(), String> {
         self.seal.check(auth)?;
-        self.push(Instruction::new(
-            "s_cselect_b32 exec_lo, -1, 0",
-            vec![],
-            vec![],
-        ))
+        let text = if self.spec.arch.wave64() {
+            "s_cselect_b64 exec, -1, 0"
+        } else {
+            "s_cselect_b32 exec_lo, -1, 0"
+        };
+        self.push(Instruction::new(text, vec![], vec![]))
     }
     fn exec_all(&mut self, auth: &Auth) -> Result<(), String> {
         self.seal.check(auth)?;
-        self.push(Instruction::new("s_mov_b32 exec_lo, -1", vec![], vec![]))
+        let text = if self.spec.arch.wave64() {
+            "s_mov_b64 exec, -1"
+        } else {
+            "s_mov_b32 exec_lo, -1"
+        };
+        self.push(Instruction::new(text, vec![], vec![]))
     }
     fn loop_(
         &mut self,

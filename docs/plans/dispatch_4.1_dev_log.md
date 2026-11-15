@@ -38,8 +38,6 @@
 - k≠8 (1,2,4,6,7,9,16) → CPU fallback ✅
 - Non-indexable routed (Q8) → fallback even with k=8 ✅
 - MQ6 indexable ✅
-- Paro indexable (with sidecar) ✅
-- Paro without sidecar → fallback ✅
 - `needs_x_rot_local` when gate-side MQ4 ✅
 - All-F32 → no rotation ✅
 

@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Root-side copy lane and head-lag bookkeeping of the multicard native-MTP
-//! lanes (`release-0.4.3/mgmtp/DESIGN.md` §5.2, `AGENTS.md:940-1179`).
+//! lanes (`release-0.4.3/mgmtp/DESIGN.md` §5.2, `docs/fixtures.md` § "Flash-Next fixture caveats").
 //!
 //! Host only. [`crate::mesh_lane_protocol::MeshRoot`] owns one [`CopyLane`]
 //! per armed request: the request-local [`MtpCopyContext`] seeded from the

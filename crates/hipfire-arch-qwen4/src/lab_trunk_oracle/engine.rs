@@ -148,12 +148,13 @@ pub fn localize_bundle(
 }
 
 /// This thread's trunk-shard route for the NEXT program builds: the mixer HC writes of the
-/// forward carry the fused all-reduce through `exchange` (`Some((exchange, rank))`), or none
+/// forward carry the fused all-reduce through `exchange` with mixer partials of the given wire
+/// format (`Some((exchange, rank, mixer))`), or none
 /// (`None`). The FFN route stays off: the oracle runs the TP mixer only (see the example's
 /// design note). Per thread: call on the rank's own thread.
-pub fn install_route(route: Option<(Exchange, usize)>) {
-    crate::trunk_route::install(route.map(|(exchange, rank)| {
-        crate::trunk_route::TrunkShardRoute::new(exchange, rank, true, false)
+pub fn install_route(route: Option<(Exchange, usize, ArHcPartial)>) {
+    crate::trunk_route::install(route.map(|(exchange, rank, mixer)| {
+        crate::trunk_route::TrunkShardRoute::new(exchange, rank, true, false, mixer)
     }));
 }
 
@@ -187,6 +188,8 @@ pub struct Geometry {
 pub struct TpHook {
     pub exchange: Exchange,
     pub rank: usize,
+    /// Wire format of the mixer partials (`topology.ep_ar_wire`).
+    pub mixer: ArHcPartial,
 }
 
 /// What [`run_case`] returns.
@@ -410,7 +413,7 @@ fn run_case_inner(
             Block::Ffn => (plan.ffn.clone(), None),
         };
         if let Some(hook) = tp_here {
-            install_route(Some((hook.exchange.clone(), hook.rank)));
+            install_route(Some((hook.exchange.clone(), hook.rank, hook.mixer)));
         }
         let ran = segment(bundle, forward, gpu, ops);
         install_route(None);

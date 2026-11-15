@@ -274,9 +274,9 @@ fn documented_formats_are_accepted() {
     let tmp = tempfile::tempdir().unwrap();
     let input = llama(&tmp.path().join("ck"));
     for format in [
-        "mq4", "mq4v2", "mq4v1", "mq4g256", "magnum", "mq4c", "mq6", "mq6v2", "mq5v2", "mq3v2",
-        "mq2v2", "hf4", "hfq4", "hfq4g256", "hf6", "hfq6", "hfq6g256", "q8", "q8f16", "q4f16",
-        "mq3", "hfp4", "mfp4", "mfp4e8", "f16", "bf16", "oracle",
+        "mq4", "mq4v2", "mq4v1", "mq4g256", "magnum", "mq6", "mq6v2", "mq5v2", "mq3v2", "hf4",
+        "hfq4", "hfq4g256", "hf6", "hfq6", "hfq6g256", "q8", "q8f16", "mq3", "mfp4e8", "f16",
+        "bf16", "oracle",
     ] {
         let out_path = tmp.path().join(format!("{format}.hfq"));
         let out = quantize(
@@ -291,6 +291,40 @@ fn documented_formats_are_accepted() {
             &[],
         );
         assert!(out.status.success(), "--format {format}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn removed_formats_are_refused_before_reading_input() {
+    // The full table is unit-tested in `removed_formats.rs`; this pins the
+    // binary wiring: exit 2, no output, the message names format and qt.
+    let tmp = tempfile::tempdir().unwrap();
+    let input = llama(&tmp.path().join("ck"));
+    for (format, qt, nearest) in [
+        ("mq4c", "45", "mq4"),
+        ("q4f16", "0", "hfq4"),
+        ("mfp2e8-gptq", "37", "mfp4e8-gptq"),
+    ] {
+        let out_path = tmp.path().join("o.hfq");
+        let out = quantize(
+            &[
+                "--input",
+                input.to_str().unwrap(),
+                "--output",
+                out_path.to_str().unwrap(),
+                "--format",
+                format,
+            ],
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(2), "{format}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(
+            err.contains(&format!("--format {format} (qt {qt}) was removed in 0.5.0"))
+                && err.contains(&format!("use --format {nearest}")),
+            "{format}: {err}"
+        );
+        assert!(!out_path.exists());
     }
 }
 
@@ -367,4 +401,86 @@ fn flags_a_route_never_reads_are_rejected() {
     // Typos in --kmap-mode no longer fall back to `alternating`.
     let out = quantize(&["--input", "x", "--output", o, "--kmap-mode", "ful"], &[]);
     assert_eq!(out.status.code(), Some(2));
+}
+
+/// `[4, K]` llama projections with a ragged K (SmolLM2's hidden 960 and an
+/// odd 1000). The floor-stride kernels (HFQ6G256, HFQ4G256, HFQ2G128,
+/// HFQ3G128, Q4F16G64, Q8F16, Q4K) read `K / group` groups per row, so no
+/// format may write them for such a K; any group codec must be row-sized.
+#[test]
+fn ragged_k_is_never_packed_across_rows() {
+    let mut bad = Vec::new();
+    for k in [960usize, 1000] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ck");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({"model_type": "llama", "num_hidden_layers": 1}).to_string(),
+        )
+        .unwrap();
+        let names = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+        ];
+        let data: Vec<(String, Vec<u8>)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.to_string(), bf16_bytes(4 * k, i)))
+            .collect();
+        let views: HashMap<String, TensorView> = data
+            .iter()
+            .map(|(n, b)| {
+                (
+                    n.clone(),
+                    TensorView::new(Dtype::BF16, vec![4, k], b).unwrap(),
+                )
+            })
+            .collect();
+        safetensors::serialize_to_file(&views, None, &dir.join("model.safetensors")).unwrap();
+        for format in ["hfq6", "mq3", "mq6", "q4k-q8embed"] {
+            let out_path = tmp.path().join(format!("{format}.hfq"));
+            let out = quantize(
+                &[
+                    "--input",
+                    dir.to_str().unwrap(),
+                    "--output",
+                    out_path.to_str().unwrap(),
+                    "--format",
+                    format,
+                ],
+                &[],
+            );
+            assert!(out.status.success(), "--format {format}: {}", stderr(&out));
+            let hfq = HfqFile::open(&out_path).unwrap();
+            for info in hfq.tensor_infos().iter().filter(|i| i.shape.len() == 2) {
+                let (rows, kk) = (info.shape[0] as usize, info.shape[1] as usize);
+                // (group, bytes per group, kernel reads a ragged tail?)
+                let (g, b, tail_ok) = match info.quant_type {
+                    0 => (64, 36, false),
+                    3 => (32, 34, false),
+                    4 => (256, 144, false),
+                    6 => (256, 136, false),
+                    7 => (128, 72, true),
+                    8 => (256, 200, false),
+                    10 => (128, 40, false),
+                    12 => (128, 56, false),
+                    _ => continue,
+                };
+                if !(tail_ok || kk % g == 0) || info.data_size != rows * kk.div_ceil(g) * b {
+                    bad.push(format!(
+                        "K={k} --format {format}: {} qt{} size={} perrow={}",
+                        info.name,
+                        info.quant_type,
+                        info.data_size,
+                        rows * kk.div_ceil(g) * b
+                    ));
+                }
+            }
+        }
+    }
+    for line in &bad {
+        eprintln!("RAGGED {line}");
+    }
+    assert!(bad.is_empty(), "{} ragged floor-stride tensors", bad.len());
 }

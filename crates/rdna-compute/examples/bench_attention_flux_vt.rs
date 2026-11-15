@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Philipp Hug
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! A/B the new V-transposed WMMA flash kernel against the incumbent v5 (and
-//! v6, the only variant within noise of it on gfx1151) at the real FLUX.1-dev
+//! A/B the new V-transposed WMMA flash kernel against the incumbent v5 at the
+//! real FLUX.1-dev
 //! MMDiT attention shape: `n_q = n_kv = 4608`, 24 heads, head_dim 128, Q/out
 //! f32, K/V f16, non-causal.
 //!
@@ -24,7 +24,7 @@
 //! Env: `REPS` (default 5), `WARM` (default 2), `N` (default 4608),
 //! `HEADS` (default 24), `PEAK_TF` (measured f16 WMMA peak, for a `%peak`
 //! column; omit to hide it), `SKIP_VTK` (drop every gfx11-wave32-only kernel,
-//! for a gfx12 part), `SKIP_SUPERSEDED` (drop v5, v6, `vt` and `vtk`, leaving
+//! for a gfx12 part), `SKIP_SUPERSEDED` (drop v5, `vt` and `vtk`, leaving
 //! the `v2` / routed A/B — the sweep's own length moves the iGPU clock, so a
 //! short run keeps the absolute figures comparable).
 //!
@@ -35,7 +35,7 @@
 //! run and both orders' medians. The block-per-variant sweep gives whichever
 //! kernel runs first a several-percent head start on a small part, which is
 //! larger than most deltas worth measuring. Accepted names are `vt`, `vtk`,
-//! `v2`, `v5`, `v6` and `routed`; an unknown name is an error rather than a
+//! `v2`, `v5` and `routed`; an unknown name is an error rather than a
 //! silent skip, and naming a gfx11-wave32-only kernel (`vt`, `vtk`, `v2`) on a
 //! gfx12 part fails at launch — use the plain sweep with `SKIP_VTK` there.
 //! Example: `AB=v2,v5 REPS=9`.
@@ -69,13 +69,10 @@ fn launch_named(
         "v5" => {
             gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(q, k, v, out, n, n, heads, heads, HD)
         }
-        "v6" => {
-            gpu.attention_dflash_wmma_m64_n32_f16kv_v6_f32(q, k, v, out, n, n, heads, heads, HD)
-        }
         "routed" => gpu.attention_flux_best_f16kv_f32(q, k, v, out, n, n, heads, heads, HD),
         other => {
             return Err(format!(
-                "AB: '{other}' is not a variant. Accepted: vt, vtk, v2, v5, v6, routed."
+                "AB: '{other}' is not a variant. Accepted: vt, vtk, v2, v5, routed."
             ))
         }
     };
@@ -422,8 +419,8 @@ fn main() {
     );
     println!("{}", "-".repeat(88));
 
-    // `SKIP_SUPERSEDED` drops the four kernels no live route can pick on a
-    // gfx11 part — v5, v6, vt and vtk — leaving the v2 / routed pair.
+    // `SKIP_SUPERSEDED` drops the three kernels no live route can pick on a
+    // gfx11 part — v5, vt and vtk — leaving the v2 / routed pair.
     // It exists because the run length is itself a confounder on a 16 CU iGPU:
     // adding four more variants to the sweep pushed `v2` from 34.3 ms to
     // 41.1 ms in the same session purely through clock drift, so a comparison
@@ -437,11 +434,6 @@ fn main() {
             "v5 m64_n32 (incumbent)",
             attention_dflash_wmma_m64_n32_f16kv_v5_f32
         )
-    } else {
-        f64::NAN
-    };
-    let t_v6 = if include_superseded {
-        variant!("v6 m64_n32", attention_dflash_wmma_m64_n32_f16kv_v6_f32)
     } else {
         f64::NAN
     };
@@ -584,11 +576,7 @@ fn main() {
 
     println!();
     if t_new.is_finite() {
-        println!(
-            "new vs v5: {:.2}x    new vs v6: {:.2}x",
-            t_v5 / t_new,
-            t_v6 / t_new
-        );
+        println!("new vs v5: {:.2}x", t_v5 / t_new);
         println!("routed vs v5: {:.2}x", t_v5 / t_best);
     }
     // `v2 vs routed` needs neither v5 nor vt, so it is printed on its own —

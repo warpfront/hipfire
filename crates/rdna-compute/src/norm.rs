@@ -90,9 +90,9 @@ pub fn restore_gdn_requant_frame_checkpoint(frame: u32) {
 /// Q8 DeltaNet-state requant cadence for batched (n_tokens>1) launches.
 /// `false` (DEFAULT) = single-end requant at the last token only (MQ4-fast path,
 /// recovers the per-token-requant DFlash regression). `true` = per-token Q8
-/// roundtrip (PARO drift-echo correctness, ~1.8× slower batched). Strictly OFF
-/// for MQ4/HFQ; opt in via `HIPFIRE_DN_REQUANT_PER_TOKEN=1` for PARO checkpoints
-/// (shisa-ai A3B). For n_tokens==1 (AR decode / DFlash draft) both are identical.
+/// roundtrip (higher drift-echo correctness, ~1.8× slower batched). Strictly OFF
+/// for MQ4/HFQ; opt in via `HIPFIRE_DN_REQUANT_PER_TOKEN=1` for checkpoints
+/// that need it (shisa-ai A3B). For n_tokens==1 (AR decode / DFlash draft) both are identical.
 pub(crate) fn dn_requant_per_token() -> bool {
     // Truthy (non-empty, non-"0") predicate preserved verbatim from the
     // cached form; only the process-global cache is gone (the snapshot is
@@ -139,6 +139,106 @@ pub enum GdnScanOut {
     /// gfx1201 only: the same values rounded to bf16 RNE, half the bytes. Read
     /// only by the LA output producers' `_xbf16` twins.
     Bf16,
+}
+
+#[cfg(feature = "deltanet")]
+use crate::gdn_stream::{
+    next_boundary, GdnAppendSchedule, GdnCarryGeometry, GdnCarryView, GdnLiveState, GdnPrefillPlan,
+    GdnQ8Planes, GdnScanAlgorithm, GdnScanEntry, GdnScanExit, GdnSeqInputs, GdnStateQuant,
+    GdnStreamConsts, GdnStreamInput, GdnStreamMeta, GdnStreamPhase, GdnStreamRaw, GdnStreamScratch,
+    GdnStreamWorkspace, GdnTensorFormat, GDN_STREAM_SCHEMA_VERSION, GS_ENTRY_F32, GS_ENTRY_Q8,
+    GS_ENTRY_Q8EF, GS_EXIT_EF, GS_EXIT_F32, GS_EXIT_NONE, GS_EXIT_SEAL, GS_EXIT_SEAM,
+};
+
+/// Device addresses of the per-row inputs and the `out` plane of one chunk-scan launch.
+#[cfg(feature = "deltanet")]
+#[derive(Clone, Copy)]
+pub(crate) struct GdnScanPtrs {
+    pub q: *mut c_void,
+    pub k: *mut c_void,
+    pub v: *mut c_void,
+    pub a: *mut c_void,
+    pub g: *mut c_void,
+    pub beta: *mut c_void,
+    pub out: *mut c_void,
+}
+
+/// Lowered typed entry/exit modes: the plane pointers and mode words of one launch.
+#[cfg(feature = "deltanet")]
+#[derive(Clone, Copy)]
+pub(crate) struct GdnScanState {
+    pub sq: *mut c_void,
+    pub sc: *mut c_void,
+    pub ef: *mut c_void,
+    pub h0: *mut c_void,
+    pub ht: *mut c_void,
+    pub entry_mode: i32,
+    pub exit_mode: i32,
+}
+
+/// `p + bytes` on a device address (never dereferenced on the host).
+#[cfg(feature = "deltanet")]
+fn padd(p: *mut c_void, bytes: usize) -> *mut c_void {
+    (p as *mut u8).wrapping_add(bytes) as *mut c_void
+}
+
+/// Resolved geometry, modules and borrowed views of one Scan64 stream call.
+#[cfg(feature = "deltanet")]
+struct GdnStreamCtx<'a> {
+    hk: usize,
+    hv: usize,
+    scan_module: &'static str,
+    scan_twin: bool,
+    /// The multi-segment bf16 kernel (and batched KKT) serve aligned runs.
+    mseg: bool,
+    kkt_batched: bool,
+    planes: GdnQ8Planes<'a>,
+    carry: GdnCarryView<'a>,
+    consts: GdnStreamConsts<'a>,
+    /// Byte strides of one row of x / alpha+beta / q+k planes / v plane / out / A.
+    xrow: usize,
+    arow: usize,
+    qrow: usize,
+    vrow: usize,
+    orow: usize,
+    a_row: usize,
+    conv_bytes: usize,
+}
+
+#[cfg(feature = "deltanet")]
+impl<'a> GdnStreamCtx<'a> {
+    /// The live Q8 planes as a scan entry (plain Q8 reconstructs without EF).
+    fn q8_entry(&self) -> GdnScanEntry<'a> {
+        match self.planes.ef {
+            Some(ef) => GdnScanEntry::Q8Ef {
+                codes: self.planes.codes,
+                scales: self.planes.scales,
+                ef,
+            },
+            None => GdnScanEntry::Q8 {
+                codes: self.planes.codes,
+                scales: self.planes.scales,
+            },
+        }
+    }
+
+    /// Exit of a launch whose last tile ends at absolute row `end`: a commit seam
+    /// quantizes (and reconstructs the next tile entry), anything else keeps the
+    /// FP32 accumulator.
+    fn exit_at(&self, end: u64) -> GdnScanExit<'a> {
+        if end % 512 == 0 {
+            GdnScanExit::Seam {
+                codes: self.planes.codes,
+                scales: self.planes.scales,
+                ef: self.planes.ef,
+                next: self.carry.tile_entry_f32,
+            }
+        } else {
+            GdnScanExit::F32 {
+                state: self.carry.tile_entry_f32,
+            }
+        }
+    }
 }
 
 /// Rows one launch may cover on an axis the kernel reads from `blockIdx.y`.
@@ -242,9 +342,6 @@ impl Gpu {
         self.bind_thread()?;
         let batch = if x.shape.len() > 1 { x.shape[0] } else { 1 };
         let n = x.shape.last().copied().unwrap() as i32;
-        // Generic RMSNorm is route-neutral. DeepSeek-only experiments must not
-        // leak into Qwen/MiniMax through process-wide environment state.
-        let warp_reduce = false;
         let x_ptr = x.buf.as_ptr();
         let w_ptr = weight.buf.as_ptr();
         let out_ptr = out.buf.as_ptr();
@@ -262,8 +359,6 @@ impl Gpu {
             && disjoint;
         let symbol = if rowsplit {
             "rmsnorm_f32_rowsplit"
-        } else if warp_reduce {
-            "rmsnorm_f32_warp_reduce"
         } else {
             "rmsnorm_f32"
         };
@@ -284,7 +379,7 @@ impl Gpu {
         ];
 
         let block_size = 256u32.min(n as u32);
-        let shared_mem = if warp_reduce { 8 * 4 } else { block_size * 4 };
+        let shared_mem = block_size * 4;
         let grid = if rowsplit {
             [n as u32 / 256, 1, 1]
         } else {
@@ -1124,8 +1219,8 @@ impl Gpu {
     /// Mirrors the host `softmax_temp_into` (apply temp to each logit, max over
     /// scaled logits, exp(scaled - max), normalize). The GPU reduction order
     /// (tree) differs from the host sequential sum, so the result is
-    /// DISTRIBUTION-parity, NOT byte-identical — used only behind the
-    /// HIPFIRE_DFLASH_FAST_SAMPLE opt-in in the DFlash sampled path.
+    /// DISTRIBUTION-parity, NOT byte-identical — used only on the DFlash
+    /// sampled path.
     pub fn softmax_temp_batched_into_f32(
         &mut self,
         logits: &GpuTensor,
@@ -1186,8 +1281,8 @@ impl Gpu {
     ///
     /// `tau_cut` is found by bisection over the mass predicate (no sort); see the
     /// kernel doc in `softmax_temp_batched.hip`. Distribution-parity (tree
-    /// reduction), not byte-parity, to the host softmax — used behind
-    /// HIPFIRE_DFLASH_FAST_SAMPLE.
+    /// reduction), not byte-parity, to the host softmax — used on the DFlash
+    /// sampled path.
     #[allow(clippy::too_many_arguments)]
     pub fn softmax_temp_topp_batched_into_f32(
         &mut self,
@@ -1272,6 +1367,31 @@ impl Gpu {
         head_dim: usize,
         freq_base: f32,
     ) -> HipResult<()> {
+        self.rope_scaled_f32(
+            q,
+            k,
+            pos_buf,
+            n_heads_q,
+            n_heads_k,
+            head_dim,
+            freq_base,
+            crate::rope::RopeLlama3::OFF,
+        )
+    }
+
+    /// [`Self::rope_f32`] with the Llama-3 inverse-frequency remap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_scaled_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        freq_base: f32,
+        llama3: crate::rope::RopeLlama3,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("rope", kernels::ROPE_SRC, "rope_f32")?;
         let func = &self.functions["rope_f32"];
@@ -1283,6 +1403,7 @@ impl Gpu {
         let nhk = n_heads_k as i32;
         let hd = head_dim as i32;
         let fb = freq_base;
+        let (l3f, l3m, l3a) = (llama3.inv_factor, llama3.smooth_mul, llama3.smooth_add);
 
         let mut params: Vec<*mut c_void> = vec![
             &q_ptr as *const _ as *mut c_void,
@@ -1292,6 +1413,9 @@ impl Gpu {
             &nhk as *const _ as *mut c_void,
             &hd as *const _ as *mut c_void,
             &fb as *const _ as *mut c_void,
+            &l3f as *const _ as *mut c_void,
+            &l3m as *const _ as *mut c_void,
+            &l3a as *const _ as *mut c_void,
         ];
 
         let half = (head_dim / 2) as u32;
@@ -1313,6 +1437,9 @@ impl Gpu {
                 b.push_i32(nhk);
                 b.push_i32(hd);
                 b.push_f32(fb);
+                b.push_f32(l3f);
+                b.push_f32(l3m);
+                b.push_f32(l3a);
                 b
             },
         )
@@ -1332,11 +1459,38 @@ impl Gpu {
         freq_base: f32,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.rope_batched_scaled_f32(
+            q,
+            k,
+            positions,
+            n_heads_q,
+            n_heads_k,
+            head_dim,
+            freq_base,
+            batch_size,
+            crate::rope::RopeLlama3::OFF,
+        )
+    }
+
+    /// [`Self::rope_batched_f32`] with the Llama-3 inverse-frequency remap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_batched_scaled_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        freq_base: f32,
+        batch_size: usize,
+        llama3: crate::rope::RopeLlama3,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if batch_size > GRID_Y_ROW_CHUNK {
             let (q_row, k_row) = (n_heads_q * head_dim * 4, n_heads_k * head_dim * 4);
             for (r0, rows) in grid_y_row_chunks(batch_size) {
-                self.rope_batched_f32(
+                self.rope_batched_scaled_f32(
                     &rows_tensor(q, r0, rows, q_row),
                     &rows_tensor(k, r0, rows, k_row),
                     &rows_tensor(positions, r0, rows, 4),
@@ -1345,6 +1499,7 @@ impl Gpu {
                     head_dim,
                     freq_base,
                     rows,
+                    llama3,
                 )?;
             }
             return Ok(());
@@ -1362,6 +1517,7 @@ impl Gpu {
         let mut hd = head_dim as i32;
         let mut fb = freq_base;
         let mut bs = batch_size as i32;
+        let (mut l3f, mut l3m, mut l3a) = (llama3.inv_factor, llama3.smooth_mul, llama3.smooth_add);
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
@@ -1371,6 +1527,9 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
             &mut fb as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
+            &mut l3f as *mut _ as *mut c_void,
+            &mut l3m as *mut _ as *mut c_void,
+            &mut l3a as *mut _ as *mut c_void,
         ];
         let half = (head_dim / 2) as u32;
         let block = 256u32.min(half);
@@ -1391,6 +1550,9 @@ impl Gpu {
                 b.push_i32(hd);
                 b.push_f32(fb);
                 b.push_i32(bs);
+                b.push_f32(l3f);
+                b.push_f32(l3m);
+                b.push_f32(l3a);
                 b
             },
         )
@@ -2372,106 +2534,6 @@ impl Gpu {
         result
     }
 
-    /// 2-D spatial RoPE applied IN-PLACE to the Q and K slices of a
-    /// fused interleaved `[n_patches, 3 * hidden]` QKV buffer. V is
-    /// left untouched. Companion to [`Self::rope_2d_halfsplit_f32`].
-    ///
-    /// The fused-QKV variant matches the natural output layout of a
-    /// single QKV GEMM (one row per patch, `[Q-all-heads, K-all-heads,
-    /// V-all-heads]` along the second axis) — same layout
-    /// `vit_attention_opt` expects — so the encoder block becomes:
-    ///
-    /// ```text
-    /// single QKV GEMM  →  rope_2d_halfsplit_qkv_interleaved_f32  →  vit_attention_opt
-    /// ```
-    ///
-    /// without intermediate split/merge copies.
-    ///
-    /// `cos_table` and `sin_table` are the precomputed per-patch tables
-    /// of shape `[n_patches, head_dim]` produced by
-    /// `hipfire_arch_dots_ocr::rope::build_rope_2d_tables`.
-    pub fn rope_2d_halfsplit_qkv_interleaved_f32(
-        &mut self,
-        qkv: &GpuTensor,
-        cos_table: &GpuTensor,
-        sin_table: &GpuTensor,
-        n_patches: usize,
-        n_heads: usize,
-        head_dim: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        assert!(
-            head_dim % 4 == 0,
-            "rope_2d_halfsplit_qkv_interleaved_f32: head_dim={head_dim} must be a multiple of 4 \
-             (the dots.ocr quarter-repeat layout splits head_dim into [hc, wc, hc, wc])",
-        );
-        assert!(
-            n_patches > 0,
-            "rope_2d_halfsplit_qkv_interleaved_f32: n_patches must be > 0"
-        );
-        assert!(
-            n_heads > 0,
-            "rope_2d_halfsplit_qkv_interleaved_f32: n_heads must be > 0"
-        );
-        self.ensure_kernel(
-            "rope_2d_halfsplit_qkv_interleaved",
-            kernels::ROPE_2D_HALFSPLIT_QKV_INTERLEAVED_SRC,
-            "rope_2d_halfsplit_qkv_interleaved_f32",
-        )?;
-
-        let qkvp = qkv.buf.as_ptr();
-        let cp = cos_table.buf.as_ptr();
-        let sp = sin_table.buf.as_ptr();
-        let np = n_patches as i32;
-        let nh = n_heads as i32;
-        let hd = head_dim as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &qkvp as *const _ as *mut c_void,
-            &cp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &np as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-        ];
-
-        let half = (head_dim / 2) as u32;
-        let grid = [n_patches as u32, n_heads as u32, 1];
-        let block = [half, 1, 1];
-        // Bytes-touched estimate: per thread we RMW two Q entries + two
-        // K entries (= 4 × 2 × 4 = 32 bytes) plus 4 cos/sin reads (= 16
-        // bytes). Threads per kernel = n_patches * n_heads * head_dim/2.
-        let bytes = (n_patches * n_heads * head_dim * 4 * 4)             // Q+K RMW (read+write each)
-                  + (n_patches * head_dim * 4 * 2); // cos+sin reads
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "rope_2d",
-            "rope_2d_halfsplit_qkv_interleaved_f32",
-            bytes,
-        );
-        let result = self.launch_maybe_blob(
-            "rope_2d_halfsplit_qkv_interleaved_f32",
-            grid,
-            block,
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qkvp);
-                b.push_ptr(cp);
-                b.push_ptr(sp);
-                b.push_i32(np);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
     /// Split a fused interleaved `[n_patches, 3 * hidden]` QKV buffer
     /// into three separate `[n_patches, hidden]` Q, K, V buffers.
     /// Used by the dots.ocr vision encoder when feeding the
@@ -3101,32 +3163,6 @@ impl Gpu {
         result
     }
 
-    /// Softplus activation, in-place.
-    #[cfg(feature = "deltanet")]
-    pub fn softplus_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel("softplus", kernels::SOFTPLUS_SRC, "softplus_f32")?;
-        let func = &self.functions["softplus_f32"];
-        let mut xp = x.buf.as_ptr();
-        let mut n = x.numel() as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut n as *mut _ as *mut c_void,
-        ];
-        let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
-    }
-
     /// L2 normalization per head, in-place. One warp per head.
     #[cfg(feature = "deltanet")]
     pub fn l2_norm_f32(
@@ -3206,113 +3242,6 @@ impl Gpu {
         // (the Q8 residual WMMA consumer would otherwise reuse stale X).
         self.invalidate_x_caches_for(out.buf.as_ptr());
         result
-    }
-
-    /// Per-row temperature-scaled softmax probability gather. For each row
-    /// `r` in `[0, n_rows)`, returns `probs_out[r] = softmax(logits[r] / temp)[indices[r]]`
-    /// — i.e., the softmax probability of the specified token id in that
-    /// row's temperature-scaled distribution.
-    ///
-    /// Used by MTP residual-acceptance sampling spec-decode:
-    ///   - n_rows = 1: gather `p_draft(c_k)` after each draft sample
-    ///   - n_rows = K: batched gather of `p_target(c_k)` over K verify
-    ///     positions, avoiding the 6 MB D2H of full verify logits
-    ///
-    /// Launch: `n_rows` blocks × 256 threads. Numerically stable via
-    /// max-subtraction inside the kernel. `temp` must be > 0.
-    ///
-    /// Output D2H: `n_rows × 4` bytes (typically ≤ 24 B for K ≤ 6).
-    pub fn softmax_prob_gather_batched_f32(
-        &mut self,
-        logits: &GpuTensor,    // [n_rows × vocab] f32
-        indices: &GpuTensor,   // [n_rows] i32 (we use F32 storage; caller reinterprets)
-        probs_out: &GpuTensor, // [n_rows] f32
-        vocab: usize,
-        temperature: f32,
-        n_rows: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        assert!(
-            temperature > 0.0,
-            "softmax_prob_gather_batched: temperature must be > 0"
-        );
-        assert!(
-            n_rows >= 1,
-            "softmax_prob_gather_batched: n_rows must be >= 1"
-        );
-        self.ensure_kernel(
-            "softmax_prob_gather_batched",
-            kernels::SOFTMAX_PROB_GATHER_BATCHED_SRC,
-            "softmax_prob_gather_batched",
-        )?;
-        let func = &self.functions["softmax_prob_gather_batched"];
-        let mut lp = logits.buf.as_ptr();
-        let mut ip = indices.buf.as_ptr();
-        let mut pp = probs_out.buf.as_ptr();
-        let mut vs = vocab as i32;
-        let mut tp = temperature;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut lp as *mut _ as *mut c_void,
-            &mut ip as *mut _ as *mut c_void,
-            &mut pp as *mut _ as *mut c_void,
-            &mut vs as *mut _ as *mut c_void,
-            &mut tp as *mut _ as *mut c_void,
-        ];
-        let nth: u32 = 256;
-        let lds: u32 = nth * 4 + 4; // scratch[256] + s_target slot
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_rows as u32, 1, 1],
-                [nth, 1, 1],
-                lds,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
-    }
-
-    /// 1D causal conv (kernel_size=4) for decode. Updates ring buffer state.
-    #[cfg(feature = "deltanet")]
-    pub fn conv1d_decode_f32(
-        &mut self,
-        output: &GpuTensor,
-        input: &GpuTensor,
-        weight: &GpuTensor,
-        state: &GpuTensor,
-        n_channels: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "conv1d_decode",
-            kernels::CONV1D_DECODE_SRC,
-            "conv1d_decode_f32",
-        )?;
-        let func = &self.functions["conv1d_decode_f32"];
-        let mut op = output.buf.as_ptr();
-        let mut ip = input.buf.as_ptr();
-        let mut wp = weight.buf.as_ptr();
-        let mut sp = state.buf.as_ptr();
-        let mut nc = n_channels as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut op as *mut _ as *mut c_void,
-            &mut ip as *mut _ as *mut c_void,
-            &mut wp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void,
-        ];
-        let block = 256u32;
-        let grid = ((n_channels as u32) + block - 1) / block;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
     }
 
     /// LFM2 LIV double-gated short-conv, single-token decode. Reads the in_proj
@@ -4487,210 +4416,6 @@ impl Gpu {
         }
         result
     }
-    /// Tree-aware variant of `gated_delta_net_q8_batch_seq`. Per-token
-    /// S-tile persist-write so sibling tokens read the parent's post-update
-    /// state via `s_tape_q8[parent_indices[t]]`. `parent_indices[t] < 0`
-    /// means "read pre-block initial state from `s_q8_init`".
-    ///
-    /// Does NOT advance persistent `s_q8_init` / `s_scales_init` (those
-    /// are the pre-block snapshot, read-only). Caller runs linear replay
-    /// on the accepted spine post-acceptance to commit the trajectory.
-    ///
-    /// Tape layout (caller responsibility):
-    /// - `s_tape_q8`:     `[n_tokens × n_heads × HD × HD]` i8 (scratch)
-    /// - `s_tape_scales`: `[n_tokens × n_heads × HD]` f32 (scratch)
-    /// - `parent_indices`: `[n_tokens]` i32 (host materialized by
-    ///   `ddtree::linearize_tree`; spine topology is [-1, 0, 1, 2, ...])
-    #[cfg(feature = "deltanet")]
-    pub fn gated_delta_net_q8_tree_batch_seq(
-        &mut self,
-        q_batch: &GpuTensor,
-        k_batch: &GpuTensor,
-        v_batch: &GpuTensor,
-        gate_batch: &GpuTensor,
-        beta_batch: &GpuTensor,
-        s_q8_init: &GpuTensor,
-        s_scales_init: &GpuTensor,
-        s_tape_q8: &GpuTensor,
-        s_tape_scales: &GpuTensor,
-        parent_indices: &GpuTensor,
-        output_batch: &GpuTensor,
-        n_tokens: usize,
-        n_heads: usize,
-        head_dim: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "gated_delta_net_q8_tree",
-            kernels::GATED_DELTA_NET_Q8_TREE_SRC,
-            "gated_delta_net_q8_tree",
-        )?;
-
-        let n_tiles = (128 / 4) as u32;
-
-        let mut qp = q_batch.buf.as_ptr();
-        let mut kp = k_batch.buf.as_ptr();
-        let mut vp = v_batch.buf.as_ptr();
-        let mut gp = gate_batch.buf.as_ptr();
-        let mut bp = beta_batch.buf.as_ptr();
-        let mut sip = s_q8_init.buf.as_ptr();
-        let mut scip = s_scales_init.buf.as_ptr();
-        let mut stp = s_tape_q8.buf.as_ptr();
-        let mut stsp = s_tape_scales.buf.as_ptr();
-        let mut pp = parent_indices.buf.as_ptr();
-        let mut op = output_batch.buf.as_ptr();
-        let mut nt = n_tokens as i32;
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut gp as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut sip as *mut _ as *mut c_void,
-            &mut scip as *mut _ as *mut c_void,
-            &mut stp as *mut _ as *mut c_void,
-            &mut stsp as *mut _ as *mut c_void,
-            &mut pp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut nt as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-        ];
-
-        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "deltanet",
-            "gated_delta_net_q8_tree_batch_seq",
-            bytes,
-        );
-        let result = self.launch_maybe_blob(
-            "gated_delta_net_q8_tree",
-            [n_heads as u32, n_tiles, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(gp);
-                b.push_ptr(bp);
-                b.push_ptr(sip);
-                b.push_ptr(scip);
-                b.push_ptr(stp);
-                b.push_ptr(stsp);
-                b.push_ptr(pp);
-                b.push_ptr(op);
-                b.push_i32(nt);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
-    /// FP32 tree-aware GDN recurrence — full-precision counterpart of
-    /// `gated_delta_net_q8_tree_batch_seq`. No scales tape and no per-token
-    /// dequant/requant: `s_f32_init` (pre-block snapshot) and `s_tape_f32`
-    /// (per-node tape) are plain f32. Used by the FP32 `StateQuant`
-    /// spec-decode tree-verify path.
-    #[cfg(feature = "deltanet")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gated_delta_net_f32_tree_batch_seq(
-        &mut self,
-        q_batch: &GpuTensor,
-        k_batch: &GpuTensor,
-        v_batch: &GpuTensor,
-        gate_batch: &GpuTensor,
-        beta_batch: &GpuTensor,
-        s_f32_init: &GpuTensor,
-        s_tape_f32: &GpuTensor,
-        parent_indices: &GpuTensor,
-        output_batch: &GpuTensor,
-        n_tokens: usize,
-        n_heads: usize,
-        head_dim: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "gated_delta_net_f32_tree",
-            kernels::GATED_DELTA_NET_F32_TREE_SRC,
-            "gated_delta_net_f32_tree",
-        )?;
-
-        let n_tiles = (128 / 4) as u32;
-
-        let mut qp = q_batch.buf.as_ptr();
-        let mut kp = k_batch.buf.as_ptr();
-        let mut vp = v_batch.buf.as_ptr();
-        let mut gp = gate_batch.buf.as_ptr();
-        let mut bp = beta_batch.buf.as_ptr();
-        let mut sip = s_f32_init.buf.as_ptr();
-        let mut stp = s_tape_f32.buf.as_ptr();
-        let mut pp = parent_indices.buf.as_ptr();
-        let mut op = output_batch.buf.as_ptr();
-        let mut nt = n_tokens as i32;
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut gp as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut sip as *mut _ as *mut c_void,
-            &mut stp as *mut _ as *mut c_void,
-            &mut pp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut nt as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-        ];
-
-        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "deltanet",
-            "gated_delta_net_f32_tree_batch_seq",
-            bytes,
-        );
-        let result = self.launch_maybe_blob(
-            "gated_delta_net_f32_tree",
-            [n_heads as u32, n_tiles, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(gp);
-                b.push_ptr(bp);
-                b.push_ptr(sip);
-                b.push_ptr(stp);
-                b.push_ptr(pp);
-                b.push_ptr(op);
-                b.push_i32(nt);
-                b.push_i32(nh);
-                b.push_i32(hd);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
     /// Batched-sequential FP32 GDN recurrence — full-precision, same 32×32-tile
     /// parallelism as `gated_delta_net_q8_batch_seq`. Use on the FP32
     /// `StateQuant` batched prefill/verify path instead of the slow
@@ -5802,7 +5527,8 @@ impl Gpu {
     /// over `a` holding the batched KKT's A for all `n_tokens` rows. Between
     /// segments the state takes the q8/scale/EF round trip in registers, so
     /// `out` and the final state are byte-identical; only the last segment
-    /// stores the state.
+    /// stores the state. The state enters as Q8 + EF and leaves quantized at the
+    /// call end; [`Self::gdn_chunk_scan_layer_mseg_ex`] takes explicit modes.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_chunk_scan_layer_mseg(
@@ -5821,57 +5547,32 @@ impl Gpu {
         n_key_heads: usize,
         n_value_heads: usize,
     ) -> HipResult<()> {
-        const MODULE: &str = "gdn_chunk_scan_bf16_mseg";
         Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
-        self.bind_thread()?;
-        self.ensure_kernel(MODULE, kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC, MODULE)?;
-        // Same frame cadence as one reservation per segment launch.
-        for row0 in (0..n_tokens).step_by(512) {
-            let _frame = reserve_gdn_requant_frames((n_tokens - row0).min(512) as u32);
+        if n_tokens == 0 {
+            return Ok(());
         }
-        let (qp, kp, vp, ap) = (
-            q.buf.as_ptr(),
-            k.buf.as_ptr(),
-            v.buf.as_ptr(),
-            a.buf.as_ptr(),
-        );
-        let (gp, bp) = (g.buf.as_ptr(), beta.buf.as_ptr());
-        let (sqp, scp, efp, op) = (
-            state_q8.buf.as_ptr(),
-            state_scales.buf.as_ptr(),
-            ef_residual.buf.as_ptr(),
-            out.buf.as_ptr(),
-        );
-        let r0 = 0i32;
-        let nt = n_tokens as i32;
-        let (hk, hv) = (n_key_heads as u32, n_value_heads as u32);
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &ap as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-            &bp as *const _ as *mut c_void,
-            &sqp as *const _ as *mut c_void,
-            &scp as *const _ as *mut c_void,
-            &efp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &r0 as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-            &hk as *const _ as *mut c_void,
-            &hv as *const _ as *mut c_void,
-        ];
-        self.launch_maybe_blob(MODULE, [1, hv, 1], [512, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            for p in [qp, kp, vp, ap, gp, bp, sqp, scp, efp, op] {
-                b.push_ptr(p);
-            }
-            b.push_i32(r0);
-            b.push_i32(nt);
-            b.push_u32(hk);
-            b.push_u32(hv);
-            b
-        })
+        self.gdn_chunk_scan_layer_mseg_ex(
+            q,
+            k,
+            v,
+            a,
+            g,
+            beta,
+            &GdnScanEntry::Q8Ef {
+                codes: state_q8,
+                scales: state_scales,
+                ef: ef_residual,
+            },
+            &GdnScanExit::Seal {
+                codes: state_q8,
+                scales: state_scales,
+                ef: Some(ef_residual),
+            },
+            out,
+            n_tokens,
+            n_key_heads,
+            n_value_heads,
+        )
     }
 
     /// Resolve the gfx1100/gfx1151/gfx1201 chunk scan modules before any
@@ -6005,6 +5706,41 @@ impl Gpu {
         n_key_heads: usize,
         n_value_heads: usize,
     ) -> HipResult<()> {
+        self.gdn_chunk_prep_launch(
+            [
+                input,
+                conv_weight,
+                conv_state,
+                g,
+                beta,
+                dt_bias,
+                a_log,
+                q,
+                k,
+                v,
+            ]
+            .map(|t| t.buf.as_ptr()),
+            n_tokens,
+            q_scale,
+            eps,
+            n_key_heads,
+            n_value_heads,
+        )
+    }
+
+    /// [`Self::gdn_chunk_prep`] over device addresses in the argument order
+    /// `[input, conv_weight, conv_state, g, beta, dt_bias, a_log, q, k, v]` (row
+    /// views of larger planes: the stream executor preps tile groups in place).
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_prep_launch(
+        &mut self,
+        ptrs: [*mut c_void; 10],
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+        n_key_heads: usize,
+        n_value_heads: usize,
+    ) -> HipResult<()> {
         Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
         self.gdn_chunk_prep_module()?;
         let gfx11 = self.gdn_chunk_prep_gfx11();
@@ -6024,16 +5760,7 @@ impl Gpu {
             [chunks, units_y, 1]
         };
 
-        let xp = input.buf.as_ptr();
-        let wp = conv_weight.buf.as_ptr();
-        let sp = conv_state.buf.as_ptr();
-        let gp = g.buf.as_ptr();
-        let bp = beta.buf.as_ptr();
-        let dtp = dt_bias.buf.as_ptr();
-        let alp = a_log.buf.as_ptr();
-        let qp = q.buf.as_ptr();
-        let kp = k.buf.as_ptr();
-        let vp = v.buf.as_ptr();
+        let [xp, wp, sp, gp, bp, dtp, alp, qp, kp, vp] = ptrs;
         let nt = n_tokens as i32;
         let qs = q_scale;
         let ep = eps;
@@ -6126,25 +5853,48 @@ impl Gpu {
         n_key_heads: usize,
         n_value_heads: usize,
     ) -> HipResult<()> {
+        self.gdn_chunk_prep_fixup_launch(
+            [
+                input,
+                conv_weight,
+                conv_state,
+                g,
+                beta,
+                dt_bias,
+                a_log,
+                q,
+                k,
+                v,
+            ]
+            .map(|t| t.buf.as_ptr()),
+            n_tokens,
+            q_scale,
+            eps,
+            n_key_heads,
+            n_value_heads,
+        )
+    }
+
+    /// [`Self::gdn_chunk_prep_fixup`] over device addresses in the argument order
+    /// `[input, conv_weight, conv_state, g, beta, dt_bias, a_log, q, k, v]` (row
+    /// views of larger planes: the stream executor completes the fused QKVZA's
+    /// whole-tile run in place). Mirrors [`Self::gdn_chunk_prep_launch`].
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_prep_fixup_launch(
+        &mut self,
+        ptrs: [*mut c_void; 10],
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+        n_key_heads: usize,
+        n_value_heads: usize,
+    ) -> HipResult<()> {
         const MODULE: &str = "gdn_chunk_prep_fixup";
         Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
         self.gdn_chunk_prep_fixup_prepare()?;
         let grid_x = n_tokens.div_ceil(64).max(n_tokens.div_ceil(128)) as u32;
         let grid_y = (1 + (2 * n_key_heads + n_value_heads).div_ceil(8)) as u32;
         let (hk, hv) = (n_key_heads as u32, n_value_heads as u32);
-        let ptrs = [
-            input,
-            conv_weight,
-            conv_state,
-            g,
-            beta,
-            dt_bias,
-            a_log,
-            q,
-            k,
-            v,
-        ]
-        .map(|t| t.buf.as_ptr());
         let nt = n_tokens as i32;
         let mut params: Vec<*mut c_void> =
             ptrs.iter().map(|p| p as *const _ as *mut c_void).collect();
@@ -6193,14 +5943,35 @@ impl Gpu {
         n_key_heads: usize,
         n_value_heads: usize,
     ) -> HipResult<()> {
+        self.gdn_chunk_kkt_batched_launch(
+            k.buf.as_ptr(),
+            g.buf.as_ptr(),
+            beta.buf.as_ptr(),
+            a.buf.as_ptr(),
+            n_tokens,
+            n_key_heads,
+            n_value_heads,
+        )
+    }
+
+    /// [`Self::gdn_chunk_kkt_solve_batched`] over device addresses (row views of a
+    /// larger plane: the stream executor solves tile groups in place).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_chunk_kkt_batched_launch(
+        &mut self,
+        kp: *mut c_void,
+        gp: *mut c_void,
+        bp: *mut c_void,
+        ap: *mut c_void,
+        n_tokens: usize,
+        n_key_heads: usize,
+        n_value_heads: usize,
+    ) -> HipResult<()> {
         Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
         self.bind_thread()?;
         const SYMBOL: &str = "gdn_chunk_kkt_solve_batched";
         self.ensure_kernel(SYMBOL, kernels::GDN_CHUNK_KKT_SOLVE_BATCHED_SRC, SYMBOL)?;
-        let kp = k.buf.as_ptr();
-        let gp = g.buf.as_ptr();
-        let bp = beta.buf.as_ptr();
-        let ap = a.buf.as_ptr();
         let r0 = 0i32;
         let nt = n_tokens as i32;
         let (hk, hv) = (n_key_heads as u32, n_value_heads as u32);
@@ -6235,12 +6006,269 @@ impl Gpu {
         )
     }
 
+    /// One non-batched KKT launch (`gdn_chunk_kkt_solve` / `_gfx1100`, `t <= 512`):
+    /// k/g/beta are read from row `row0` and the A blocks land at `ap`, relative
+    /// to that segment. The caller has resolved the module.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_chunk_kkt_segment_launch(
+        &mut self,
+        kp: *mut c_void,
+        gp: *mut c_void,
+        bp: *mut c_void,
+        ap: *mut c_void,
+        row0: i32,
+        t: usize,
+        hk: u32,
+        hv: u32,
+    ) -> HipResult<()> {
+        let gfx1100 = self.gdn_chunk_kkt_gfx1100();
+        let (symbol, heads) = if gfx1100 {
+            ("gdn_chunk_kkt_solve_gfx1100", 48u32)
+        } else {
+            ("gdn_chunk_kkt_solve", hk)
+        };
+        let nt = t as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &row0 as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        if !gfx1100 {
+            params.push(&hk as *const _ as *mut c_void);
+            params.push(&hv as *const _ as *mut c_void);
+        }
+        self.launch_maybe_blob(
+            symbol,
+            [t.div_ceil(64) as u32, heads, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(ap);
+                b.push_i32(row0);
+                b.push_i32(nt);
+                if !gfx1100 {
+                    b.push_u32(hk);
+                    b.push_u32(hv);
+                }
+                b
+            },
+        )
+    }
+
+    /// Bind one state-plane kernarg slot, refusing two different buffers: the
+    /// scan kernels load and store the Q8 planes through one pointer set.
+    #[cfg(feature = "deltanet")]
+    fn gdn_scan_bind(slot: &mut *mut c_void, ptr: *mut c_void, what: &str) -> HipResult<()> {
+        if !slot.is_null() && *slot != ptr {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("GDN chunk scan: entry and exit name different {what} planes"),
+            ));
+        }
+        *slot = ptr;
+        Ok(())
+    }
+
+    /// Lower the typed entry/exit modes to the kernel's mode words and plane pointers.
+    #[cfg(feature = "deltanet")]
+    fn gdn_scan_state(entry: &GdnScanEntry<'_>, exit: &GdnScanExit<'_>) -> HipResult<GdnScanState> {
+        let mut s = GdnScanState {
+            sq: std::ptr::null_mut(),
+            sc: std::ptr::null_mut(),
+            ef: std::ptr::null_mut(),
+            h0: std::ptr::null_mut(),
+            ht: std::ptr::null_mut(),
+            entry_mode: GS_ENTRY_Q8,
+            exit_mode: GS_EXIT_NONE,
+        };
+        let p = |t: &GpuTensor| t.buf.as_ptr();
+        match entry {
+            GdnScanEntry::Q8 { codes, scales } => {
+                s.sq = p(codes);
+                s.sc = p(scales);
+                s.entry_mode = GS_ENTRY_Q8;
+            }
+            GdnScanEntry::Q8Ef { codes, scales, ef } => {
+                s.sq = p(codes);
+                s.sc = p(scales);
+                s.ef = p(ef);
+                s.entry_mode = GS_ENTRY_Q8EF;
+            }
+            GdnScanEntry::F32 { state } => {
+                s.h0 = p(state);
+                s.entry_mode = GS_ENTRY_F32;
+            }
+        }
+        match exit {
+            GdnScanExit::Seal { codes, scales, ef }
+            | GdnScanExit::Seam {
+                codes, scales, ef, ..
+            } => {
+                Self::gdn_scan_bind(&mut s.sq, p(codes), "code")?;
+                Self::gdn_scan_bind(&mut s.sc, p(scales), "scale")?;
+                let mut mode = if matches!(exit, GdnScanExit::Seal { .. }) {
+                    GS_EXIT_SEAL
+                } else {
+                    GS_EXIT_SEAM
+                };
+                if let Some(ef) = ef {
+                    Self::gdn_scan_bind(&mut s.ef, p(ef), "EF")?;
+                    mode |= GS_EXIT_EF;
+                }
+                if let GdnScanExit::Seam { next, .. } = exit {
+                    s.ht = p(next);
+                }
+                s.exit_mode = mode;
+            }
+            GdnScanExit::F32 { state } => {
+                s.ht = p(state);
+                s.exit_mode = GS_EXIT_F32;
+            }
+            GdnScanExit::Discard => s.exit_mode = GS_EXIT_NONE,
+        }
+        Ok(s)
+    }
+
+    /// Launch one chunk-scan kernel (`mseg`: the multi-segment bf16 module). The
+    /// caller resolved the module and the heads.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_scan_launch(
+        &mut self,
+        module: &str,
+        twin: bool,
+        p: &GdnScanPtrs,
+        s: &GdnScanState,
+        row0: i32,
+        t: i32,
+        hk: u32,
+        hv: u32,
+    ) -> HipResult<()> {
+        let (qp, kp, vp, ap, gp, bp, op) = (p.q, p.k, p.v, p.a, p.g, p.beta, p.out);
+        let (sqp, scp, efp, h0p, htp) = (s.sq, s.sc, s.ef, s.h0, s.ht);
+        let (em, xm) = (s.entry_mode, s.exit_mode);
+        // The gfx1151 twin runs one BV=64 value half of a head per 256-thread
+        // workgroup; every other scan module runs both halves in 512 threads.
+        let (grid, block) = if twin {
+            ([2, 48, 1], [256, 1, 1])
+        } else {
+            ([1, hv, 1], [512, 1, 1])
+        };
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sqp as *const _ as *mut c_void,
+            &scp as *const _ as *mut c_void,
+            &efp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &row0 as *const _ as *mut c_void,
+            &t as *const _ as *mut c_void,
+        ];
+        if !twin {
+            params.push(&hk as *const _ as *mut c_void);
+            params.push(&hv as *const _ as *mut c_void);
+        }
+        params.push(&h0p as *const _ as *mut c_void);
+        params.push(&htp as *const _ as *mut c_void);
+        params.push(&em as *const _ as *mut c_void);
+        params.push(&xm as *const _ as *mut c_void);
+        self.launch_maybe_blob(module, grid, block, 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            for ptr in [qp, kp, vp, ap, gp, bp, sqp, scp, efp, op] {
+                b.push_ptr(ptr);
+            }
+            b.push_i32(row0);
+            b.push_i32(t);
+            if !twin {
+                b.push_u32(hk);
+                b.push_u32(hv);
+            }
+            b.push_ptr(h0p);
+            b.push_ptr(htp);
+            b.push_i32(em);
+            b.push_i32(xm);
+            b
+        })
+    }
+
+    /// [`Self::gdn_chunk_scan_layer_mseg`] with explicit state entry/exit modes
+    /// ([`GdnScanEntry`], [`GdnScanExit`]). The multi-segment kernel quantizes
+    /// between its own 512-row segments in registers; `exit` applies to the last
+    /// segment (`Seam` is only meaningful when `n_tokens % 512 == 0`).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_scan_layer_mseg_ex(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        a: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        entry: &GdnScanEntry<'_>,
+        exit: &GdnScanExit<'_>,
+        out: &GpuTensor,
+        n_tokens: usize,
+        n_key_heads: usize,
+        n_value_heads: usize,
+    ) -> HipResult<()> {
+        const MODULE: &str = "gdn_chunk_scan_bf16_mseg";
+        Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
+        if n_tokens == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gdn_chunk_scan_layer_mseg: zero rows (use gdn_chunk_scan_segment_ex for a pure state conversion)",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(MODULE, kernels::GDN_CHUNK_SCAN_BF16_MSEG_SRC, MODULE)?;
+        let state = Self::gdn_scan_state(entry, exit)?;
+        // Same frame cadence as one reservation per segment launch.
+        for row0 in (0..n_tokens).step_by(512) {
+            let _frame = reserve_gdn_requant_frames((n_tokens - row0).min(512) as u32);
+        }
+        let ptrs = GdnScanPtrs {
+            q: q.buf.as_ptr(),
+            k: k.buf.as_ptr(),
+            v: v.buf.as_ptr(),
+            a: a.buf.as_ptr(),
+            g: g.buf.as_ptr(),
+            beta: beta.buf.as_ptr(),
+            out: out.buf.as_ptr(),
+        };
+        self.gdn_scan_launch(
+            MODULE,
+            false,
+            &ptrs,
+            &state,
+            0,
+            n_tokens as i32,
+            n_key_heads as u32,
+            n_value_heads as u32,
+        )
+    }
+
     /// GDN KKT solve and fused scan for one legacy segment.
     /// All parent arrays remain unsliced; `row0` selects the segment and state
     /// stays the single unsliced persistent owner. `out` is `[T][n_value_heads][128]` in
     /// `out_fmt` elements (4 or 2 bytes). `kkt = false` skips the KKT launch
     /// when [`Self::gdn_chunk_kkt_solve_batched`] already wrote this segment's
-    /// A blocks and `a` points at the segment's first row.
+    /// A blocks and `a` points at the segment's first row. The state enters as
+    /// Q8 + EF and leaves quantized (call end); see
+    /// [`Self::gdn_chunk_scan_segment_ex`] for the explicit modes.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_chunk_scan_segment(
@@ -6262,142 +6290,1105 @@ impl Gpu {
         n_key_heads: usize,
         n_value_heads: usize,
     ) -> HipResult<()> {
+        if n_tokens == 0 {
+            return Ok(());
+        }
+        self.gdn_chunk_scan_segment_ex(
+            q,
+            k,
+            v,
+            a,
+            g,
+            beta,
+            &GdnScanEntry::Q8Ef {
+                codes: state_q8,
+                scales: state_scales,
+                ef: ef_residual,
+            },
+            &GdnScanExit::Seal {
+                codes: state_q8,
+                scales: state_scales,
+                ef: Some(ef_residual),
+            },
+            out,
+            out_fmt,
+            row0,
+            n_tokens,
+            kkt,
+            n_key_heads,
+            n_value_heads,
+        )
+    }
+
+    /// [`Self::gdn_chunk_scan_segment`] with explicit state entry/exit modes.
+    /// `n_tokens == 0` is a pure state conversion (`kkt` must be false): open
+    /// (Q8 -> FP32 `Exit::F32`) or seal (FP32 `Entry::F32` -> Q8 `Exit::Seal`).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_scan_segment_ex(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        a: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        entry: &GdnScanEntry<'_>,
+        exit: &GdnScanExit<'_>,
+        out: &GpuTensor,
+        out_fmt: GdnScanOut,
+        row0: usize,
+        n_tokens: usize,
+        kkt: bool,
+        n_key_heads: usize,
+        n_value_heads: usize,
+    ) -> HipResult<()> {
         Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
+        if kkt && n_tokens == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gdn_chunk_scan_segment: a KKT solve over zero rows",
+            ));
+        }
         self.bind_thread()?;
         let kkt_gfx1100 = self.gdn_chunk_kkt_gfx1100();
-        let (kkt_module, kkt_source, kkt_symbol, kkt_rows, kkt_heads, kkt_block) = if kkt_gfx1100 {
-            (
-                "gdn_chunk_kkt_solve_gfx1100",
-                kernels::GDN_CHUNK_KKT_SOLVE_GFX1100_SRC,
-                "gdn_chunk_kkt_solve_gfx1100",
-                64,
-                48,
-                128,
-            )
-        } else {
-            (
-                "gdn_chunk_kkt_solve",
-                kernels::GDN_CHUNK_KKT_SOLVE_SRC,
-                "gdn_chunk_kkt_solve",
-                64,
-                n_key_heads as u32,
-                128,
-            )
-        };
         if kkt && kkt_gfx1100 {
             Self::gdn_chunk_fixed_heads(n_key_heads, n_value_heads)?;
         }
         if kkt {
-            self.ensure_kernel(kkt_module, kkt_source, kkt_symbol)?;
+            let (kkt_module, kkt_source) = if kkt_gfx1100 {
+                (
+                    "gdn_chunk_kkt_solve_gfx1100",
+                    kernels::GDN_CHUNK_KKT_SOLVE_GFX1100_SRC,
+                )
+            } else {
+                ("gdn_chunk_kkt_solve", kernels::GDN_CHUNK_KKT_SOLVE_SRC)
+            };
+            self.ensure_kernel(kkt_module, kkt_source, kkt_module)?;
         }
         let (scan_module, scan_source) = self.gdn_chunk_scan_module(out_fmt)?;
         self.ensure_kernel(scan_module, scan_source, scan_module)?;
-        // The gfx1151 twin runs one BV=64 value half of a head per 256-thread
-        // workgroup; every other scan module runs both halves in 512 threads.
         let gfx1151_twin = scan_module == "gdn_chunk_scan_gfx1151";
         if gfx1151_twin {
             Self::gdn_chunk_fixed_heads(n_key_heads, n_value_heads)?;
         }
-        let (scan_grid, scan_block) = if gfx1151_twin {
-            ([2, 48, 1], [256, 1, 1])
-        } else {
-            ([1, n_value_heads as u32, 1], [512, 1, 1])
-        };
+        let state = Self::gdn_scan_state(entry, exit)?;
 
         let kp = k.buf.as_ptr();
         let gp = g.buf.as_ptr();
         let bp = beta.buf.as_ptr();
         let ap = a.buf.as_ptr();
         let r0 = row0 as i32;
-        let nt = n_tokens as i32;
         let (hk, hv) = (n_key_heads as u32, n_value_heads as u32);
         if kkt {
-            let mut kkt_params: Vec<*mut c_void> = vec![
-                &kp as *const _ as *mut c_void,
-                &gp as *const _ as *mut c_void,
-                &bp as *const _ as *mut c_void,
-                &ap as *const _ as *mut c_void,
-                &r0 as *const _ as *mut c_void,
-                &nt as *const _ as *mut c_void,
-            ];
-            if !kkt_gfx1100 {
-                kkt_params.push(&hk as *const _ as *mut c_void);
-                kkt_params.push(&hv as *const _ as *mut c_void);
-            }
-            self.launch_maybe_blob(
-                kkt_symbol,
-                [((n_tokens + kkt_rows - 1) / kkt_rows) as u32, kkt_heads, 1],
-                [kkt_block, 1, 1],
-                0,
-                &mut kkt_params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(kp);
-                    b.push_ptr(gp);
-                    b.push_ptr(bp);
-                    b.push_ptr(ap);
-                    b.push_i32(r0);
-                    b.push_i32(nt);
-                    if !kkt_gfx1100 {
-                        b.push_u32(hk);
-                        b.push_u32(hv);
-                    }
-                    b
-                },
-            )?;
+            self.gdn_chunk_kkt_segment_launch(kp, gp, bp, ap, r0, n_tokens, hk, hv)?;
         }
 
         // Preserve the incumbent deterministic frame cadence even though the
         // required EF path does not consume the stochastic seed.
         let _frame = reserve_gdn_requant_frames(n_tokens as u32);
-        let qp = q.buf.as_ptr();
-        let vp = v.buf.as_ptr();
-        let sqp = state_q8.buf.as_ptr();
-        let scp = state_scales.buf.as_ptr();
-        let efp = ef_residual.buf.as_ptr();
-        let op = out.buf.as_ptr();
-        let mut scan_params: Vec<*mut c_void> = vec![
+        let ptrs = GdnScanPtrs {
+            q: q.buf.as_ptr(),
+            k: kp,
+            v: v.buf.as_ptr(),
+            a: ap,
+            g: gp,
+            beta: bp,
+            out: out.buf.as_ptr(),
+        };
+        self.gdn_scan_launch(
+            scan_module,
+            gfx1151_twin,
+            &ptrs,
+            &state,
+            r0,
+            n_tokens as i32,
+            hk,
+            hv,
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // Canonical GDN prefill stream (CHUNK-CANONICAL-DESIGN §3.3). The edge
+    // executor runs the head to the next absolute 64-row tile boundary and the
+    // incomplete final tile from the saved raw prefix, with the incumbent bulk
+    // kernels in between; quantization happens only at absolute 512-row seams
+    // and at `gdn_stream_seal`.
+    // ------------------------------------------------------------------
+
+    /// Allocate the fixed 64-row edge workspace of the Scan64 stream executor.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_stream_workspace_alloc(
+        &mut self,
+        n_key_heads: usize,
+        n_value_heads: usize,
+        out_fmt: GdnScanOut,
+    ) -> HipResult<GdnStreamWorkspace> {
+        Self::gdn_chunk_check_heads(n_key_heads, n_value_heads)?;
+        let (hk, hv) = (n_key_heads, n_value_heads);
+        let out_elem = match out_fmt {
+            GdnScanOut::F32 => 4,
+            GdnScanOut::Bf16 => 2,
+        };
+        let sizes = crate::gdn_stream::stream_workspace_plane_bytes(hk, hv, out_elem);
+        let mut made: Vec<GpuTensor> = Vec::with_capacity(sizes.len());
+        for bytes in sizes {
+            match self.zeros(&[bytes], DType::Raw) {
+                Ok(t) => made.push(t),
+                Err(e) => {
+                    for t in made {
+                        let _ = self.free_tensor(t);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let mut it = made.into_iter();
+        let mut next = || it.next().expect("workspace plane");
+        Ok(GdnStreamWorkspace {
+            hk,
+            hv,
+            out_fmt,
+            x: next(),
+            alpha: next(),
+            beta: next(),
+            q: next(),
+            k: next(),
+            v: next(),
+            a: next(),
+            out: next(),
+            conv: next(),
+        })
+    }
+
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_stream_workspace_free(&mut self, ws: GdnStreamWorkspace) -> HipResult<()> {
+        let GdnStreamWorkspace {
+            x,
+            alpha,
+            beta,
+            q,
+            k,
+            v,
+            a,
+            out,
+            conv,
+            ..
+        } = ws;
+        for t in [x, alpha, beta, q, k, v, a, out, conv] {
+            self.free_tensor(t)?;
+        }
+        Ok(())
+    }
+
+    /// Validate the plan, geometry and every borrowed buffer extent of the Scan64
+    /// executor and resolve all device modules, without touching any state.
+    #[cfg(feature = "deltanet")]
+    fn gdn_stream_context<'a>(
+        &mut self,
+        plan: &GdnPrefillPlan,
+        consts: &GdnStreamConsts<'a>,
+        live: &GdnLiveState<'a>,
+        carry: &GdnCarryView<'a>,
+        ws: &GdnStreamWorkspace,
+    ) -> HipResult<GdnStreamCtx<'a>> {
+        let fail = |m: String| hip_bridge::HipError::new(0, &format!("gdn_stream: {m}"));
+        if plan.algorithm != GdnScanAlgorithm::Scan64 || plan.micro_rows != 64 {
+            return Err(fail(format!(
+                "the edge executor runs Scan64 (micro_rows 64), plan is {:?}/{}",
+                plan.algorithm, plan.micro_rows
+            )));
+        }
+        if plan.commit_rows != 512 {
+            return Err(fail(format!("commit_rows {} != 512", plan.commit_rows)));
+        }
+        let out_fmt = match plan.scan_output_format {
+            GdnTensorFormat::F32 => GdnScanOut::F32,
+            GdnTensorFormat::Bf16 => GdnScanOut::Bf16,
+            GdnTensorFormat::F16 => return Err(fail("the scan has no f16 output plane".into())),
+        };
+        match (plan.state_quant, live.planes.ef.is_some()) {
+            (GdnStateQuant::Q8, false) | (GdnStateQuant::Q8Ef, true) => {}
+            (GdnStateQuant::F32, _) => {
+                return Err(fail(
+                    "Scan64 streams carry a Q8/Q8Ef state (F32 has no seam)".into(),
+                ));
+            }
+            (q, has_ef) => {
+                return Err(fail(format!(
+                    "plan state {q:?} but EF plane present = {has_ef}"
+                )));
+            }
+        }
+        if ws.out_fmt != out_fmt || ws.hk != consts.n_key_heads || ws.hv != consts.n_value_heads {
+            return Err(fail(
+                "workspace was allocated for another geometry/output format".into(),
+            ));
+        }
+        let (hk, hv) = (consts.n_key_heads, consts.n_value_heads);
+        Self::gdn_chunk_check_heads(hk, hv)?;
+        let xdim = (2 * hk + hv) * 128;
+        let geom = GdnCarryGeometry {
+            hk,
+            hv,
+            head_dim: 128,
+            conv_hist_rows: 3,
+            micro_rows: 64,
+        };
+        carry.check(&geom).map_err(fail)?;
+        let state_elems = hv * 128 * 128;
+        let need = |what: &str, have: usize, want: usize| -> HipResult<()> {
+            if have < want {
+                Err(fail(format!("{what}: {have} bytes, needs {want}")))
+            } else {
+                Ok(())
+            }
+        };
+        let p = live.planes;
+        need("state codes", p.codes.byte_size(), state_elems)?;
+        need("state scales", p.scales.byte_size(), hv * 128 * 4)?;
+        if let Some(ef) = p.ef {
+            need("state EF", ef.byte_size(), state_elems * 2)?;
+        }
+        need("live conv", live.conv.byte_size(), geom.conv_bytes())?;
+        need("conv weight", consts.conv_weight.byte_size(), xdim * 4 * 4)?;
+        need("dt_bias", consts.dt_bias.byte_size(), hv * 4)?;
+        need("a_log", consts.a_log.byte_size(), hv * 4)?;
+
+        // Every module the executor can launch, resolved before any mutation.
+        self.gdn_chunk_prepare(out_fmt)?;
+        let (scan_module, scan_source) = self.gdn_chunk_scan_module(out_fmt)?;
+        self.ensure_kernel(scan_module, scan_source, scan_module)?;
+        let scan_twin = scan_module == "gdn_chunk_scan_gfx1151";
+        if self.gdn_chunk_prep_gfx11() || self.gdn_chunk_kkt_gfx1100() || scan_twin {
+            Self::gdn_chunk_fixed_heads(hk, hv)?;
+        }
+        let kkt_batched = self.gdn_kkt_batched_enabled();
+        let mseg = kkt_batched && self.gdn_scan_mseg_enabled(out_fmt, 512);
+        let out_elem = match out_fmt {
+            GdnScanOut::F32 => 4,
+            GdnScanOut::Bf16 => 2,
+        };
+        Ok(GdnStreamCtx {
+            hk,
+            hv,
+            scan_module,
+            scan_twin,
+            mseg,
+            kkt_batched,
+            planes: live.planes,
+            carry: *carry,
+            consts: *consts,
+            xrow: xdim * 4,
+            arow: hv * 4,
+            qrow: hk * 128 * 2,
+            vrow: hv * 128 * 2,
+            orow: hv * 128 * out_elem,
+            a_row: hv * 64 * 2,
+            conv_bytes: geom.conv_bytes(),
+        })
+    }
+
+    #[cfg(feature = "deltanet")]
+    fn gdn_stream_check_meta(plan: &GdnPrefillPlan, meta: &GdnStreamMeta) -> HipResult<()> {
+        // A sealed state that no stream has bound yet (`GdnStreamMeta::sealed_at`)
+        // has recipe 0; every other state must match the plan exactly.
+        let unbound = meta.phase == GdnStreamPhase::Sealed && meta.recipe_id == 0;
+        if meta.recipe_id != plan.recipe_id && !unbound {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gdn_stream: recipe {:#x} != plan recipe {:#x}",
+                    meta.recipe_id, plan.recipe_id
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "deltanet")]
+    fn gdn_stream_cp(
+        &self,
+        dst: &GpuTensor,
+        dst_off: usize,
+        src: &GpuTensor,
+        src_off: usize,
+        bytes: usize,
+    ) -> HipResult<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.memcpy_dtod_at_ordered_async(&dst.buf, dst_off, &src.buf, src_off, bytes)
+    }
+
+    /// Prep the rows at `x` (conv ring `conv`, in/out gates `g`/`b`, planes q/k/v).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_stream_prep(
+        &mut self,
+        c: &GdnStreamCtx<'_>,
+        x: *mut c_void,
+        conv: *mut c_void,
+        g: *mut c_void,
+        b: *mut c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        t: usize,
+    ) -> HipResult<()> {
+        let cs = &c.consts;
+        self.gdn_chunk_prep_launch(
+            [
+                x,
+                cs.conv_weight.buf.as_ptr(),
+                conv,
+                g,
+                b,
+                cs.dt_bias.buf.as_ptr(),
+                cs.a_log.buf.as_ptr(),
+                q,
+                k,
+                v,
+            ],
+            t,
+            cs.q_scale,
+            cs.eps,
+            c.hk,
+            c.hv,
+        )
+    }
+
+    /// [`Self::gdn_stream_prep`] for rows whose q/k/v the fused QKVZA already
+    /// wrote: the completion pass (tile heads, C64 gates, conv ring).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_stream_prep_fixup(
+        &mut self,
+        c: &GdnStreamCtx<'_>,
+        x: *mut c_void,
+        conv: *mut c_void,
+        g: *mut c_void,
+        b: *mut c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        t: usize,
+    ) -> HipResult<()> {
+        let cs = &c.consts;
+        self.gdn_chunk_prep_fixup_launch(
+            [
+                x,
+                cs.conv_weight.buf.as_ptr(),
+                conv,
+                g,
+                b,
+                cs.dt_bias.buf.as_ptr(),
+                cs.a_log.buf.as_ptr(),
+                q,
+                k,
+                v,
+            ],
+            t,
+            cs.q_scale,
+            cs.eps,
+            c.hk,
+            c.hv,
+        )
+    }
+
+    #[cfg(feature = "deltanet")]
+    fn gdn_stream_kkt(&mut self, c: &GdnStreamCtx<'_>, p: &GdnScanPtrs, t: usize) -> HipResult<()> {
+        if c.kkt_batched {
+            self.gdn_chunk_kkt_batched_launch(p.k, p.g, p.beta, p.a, t, c.hk, c.hv)
+        } else {
+            self.gdn_chunk_kkt_segment_launch(p.k, p.g, p.beta, p.a, 0, t, c.hk as u32, c.hv as u32)
+        }
+    }
+
+    /// One scan launch with the stream's entry authority: the first launch of an
+    /// Open phase reconstructs the live Q8(+EF) state once; every other launch
+    /// continues from the FP32 tile-entry plane.
+    #[cfg(feature = "deltanet")]
+    fn gdn_stream_scan(
+        &mut self,
+        c: &GdnStreamCtx<'_>,
+        p: &GdnScanPtrs,
+        t: usize,
+        mseg: bool,
+        exit: &GdnScanExit<'_>,
+        open: &mut bool,
+    ) -> HipResult<()> {
+        if *open && matches!(exit, GdnScanExit::Discard) {
+            // A transient replay cannot reconstruct as it goes: convert the live
+            // state into the carry first.
+            self.gdn_stream_convert(
+                c,
+                &c.q8_entry(),
+                &GdnScanExit::F32 {
+                    state: c.carry.tile_entry_f32,
+                },
+            )?;
+            *open = false;
+        }
+        let entry = if *open {
+            *open = false;
+            c.q8_entry()
+        } else {
+            GdnScanEntry::F32 {
+                state: c.carry.tile_entry_f32,
+            }
+        };
+        let state = Self::gdn_scan_state(&entry, exit)?;
+        let (module, twin) = if mseg {
+            ("gdn_chunk_scan_bf16_mseg", false)
+        } else {
+            (c.scan_module, c.scan_twin)
+        };
+        self.gdn_scan_launch(
+            module,
+            twin,
+            p,
+            &state,
+            0,
+            t as i32,
+            c.hk as u32,
+            c.hv as u32,
+        )
+    }
+
+    /// Pure state conversion (`T = 0` scan): open (Q8 -> FP32) or seal (FP32 -> Q8).
+    #[cfg(feature = "deltanet")]
+    fn gdn_stream_convert(
+        &mut self,
+        c: &GdnStreamCtx<'_>,
+        entry: &GdnScanEntry<'_>,
+        exit: &GdnScanExit<'_>,
+    ) -> HipResult<()> {
+        let state = Self::gdn_scan_state(entry, exit)?;
+        let nul = std::ptr::null_mut();
+        let p = GdnScanPtrs {
+            q: nul,
+            k: nul,
+            v: nul,
+            a: nul,
+            g: nul,
+            beta: nul,
+            out: nul,
+        };
+        self.gdn_scan_launch(
+            c.scan_module,
+            c.scan_twin,
+            &p,
+            &state,
+            0,
+            0,
+            c.hk as u32,
+            c.hv as u32,
+        )
+    }
+
+    /// Append `rows` raw rows of one Scan64 layer at absolute `start_pos`
+    /// (CHUNK-CANONICAL-DESIGN §3.3). Preflight first (plan, meta, geometry,
+    /// every borrowed extent, every module) with no mutation; then: reconstruct
+    /// the live Q8(+EF) state once if the phase is Sealed; replay the head tile
+    /// (saved raw prefix + the new rows to the next absolute tile boundary) in the
+    /// workspace from `tile_entry_*`; run the whole tiles through the incumbent
+    /// bulk kernels (one multi-segment launch per aligned run on gfx1201 bf16);
+    /// replay the incomplete final tile as a transient run and save its raw
+    /// prefix. Outputs are published for the new rows only, in `out`
+    /// (`[rows][n_value_heads][128]` in the plan's scan output format).
+    ///
+    /// `raw.alpha`/`raw.beta` rows past the head are rewritten in place (gates /
+    /// sigmoid), as in the whole-call route. Returns the candidate metadata; the
+    /// caller commits it only after every layer succeeded (device state is not
+    /// rolled back here: use the owner's transaction ticket).
+    ///
+    /// `raw.input == FusedPrepped` (gfx1201 A4 fused `qkvzagdn` projection): the
+    /// whole-tile run's plain `gdn_chunk_prep` is replaced by
+    /// `gdn_chunk_prep_fixup` over the same pointers and row count. Admitted
+    /// only when [`GdnAppendSchedule::fused_prep_eligible`] holds (no head
+    /// replay, at least one complete tile; fails closed before any mutation
+    /// otherwise, never converted to Raw). The fused GEMM stores the raw rows
+    /// the fixup reads for the complete prefix plus every raw tail row (the
+    /// producer export mask), so the raw tail `[rc, n)` is saved to the carry
+    /// pending buffers before any in-place gate rewrite, the fixup runs with
+    /// `T = rc` (never `n`), and a non-empty tail is then prepped raw from the
+    /// ring saved in `tile_entry_conv` and scanned with a Discard exit.
+    /// Byte-exactness: the fused
+    /// epilogue and the fixup run the plain prep's per-element expressions
+    /// (`gdn_arith::IU4_G12`: one arithmetic with the separate SETs), the C64
+    /// gate chunks and 128-row producer tiles start at the call's first row,
+    /// which is an absolute tile boundary, and the persistent ring is updated by
+    /// the fixup from the last three prefix raw rows exactly as the plain prep does.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_stream_append(
+        &mut self,
+        plan: &GdnPrefillPlan,
+        meta: &GdnStreamMeta,
+        start_pos: u64,
+        rows: usize,
+        consts: &GdnStreamConsts<'_>,
+        raw: &GdnStreamRaw<'_>,
+        scratch: &GdnStreamScratch<'_>,
+        out: &GpuTensor,
+        live: &GdnLiveState<'_>,
+        carry: &GdnCarryView<'_>,
+        ws: &GdnStreamWorkspace,
+    ) -> HipResult<GdnStreamMeta> {
+        let fail = |m: String| hip_bridge::HipError::new(0, &format!("gdn_stream_append: {m}"));
+        self.bind_thread()?;
+        let c = self.gdn_stream_context(plan, consts, live, carry, ws)?;
+        Self::gdn_stream_check_meta(plan, meta)?;
+        let sched = GdnAppendSchedule::new(meta, start_pos, rows, 64, 512).map_err(fail)?;
+        let (rc, rt) = (sched.bulk_complete, sched.bulk_tail);
+        let r = rc + rt;
+        let fused = raw.input == GdnStreamInput::FusedPrepped;
+        if fused {
+            if !sched.fused_prep_eligible(self.iu4_gdn_tail_export()) {
+                return Err(fail(format!(
+                    "fused-prepped input needs no head replay, a complete-tile prefix and, \
+                     for a tail, a producer bundle with the final-tile raw export \
+                     (head {}, complete rows {rc}, tail rows {rt})",
+                    sched.head
+                )));
+            }
+            // JIT/load failure must precede every mutation.
+            self.gdn_chunk_prep_fixup_prepare()?;
+        }
+        let need = |what: &str, have: usize, want: usize| -> HipResult<()> {
+            if have < want {
+                Err(fail(format!("{what}: {have} bytes, needs {want}")))
+            } else {
+                Ok(())
+            }
+        };
+        need("raw qkv", raw.qkv.byte_size(), rows * c.xrow)?;
+        need("raw alpha", raw.alpha.byte_size(), rows * c.arow)?;
+        need("raw beta", raw.beta.byte_size(), rows * c.arow)?;
+        need("out", out.byte_size(), rows * c.orow)?;
+        need("scratch q", scratch.q.byte_size(), r * c.qrow)?;
+        need("scratch k", scratch.k.byte_size(), r * c.qrow)?;
+        need("scratch v", scratch.v.byte_size(), r * c.vrow)?;
+        need(
+            "scratch A",
+            scratch.a.byte_size(),
+            r.div_ceil(64) * 64 * c.a_row,
+        )?;
+
+        // ---- mutation ----
+        // One frame reservation per appended row, as the whole-call route made
+        // per segment (the scan itself consumes no stochastic seed).
+        let _frames = reserve_gdn_requant_frames(rows as u32);
+        let (xrow, arow, orow) = (c.xrow, c.arow, c.orow);
+        let mut open = meta.phase == GdnStreamPhase::Sealed;
+        if open {
+            // The tile entry of the first (clipped) tile is the live ring.
+            self.gdn_stream_cp(carry.tile_entry_conv, 0, live.conv, 0, c.conv_bytes)?;
+        }
+        let end = start_pos + rows as u64;
+        let ptr = |t: &GpuTensor| t.buf.as_ptr();
+
+        if sched.head {
+            let (m, kh) = (sched.head_pending, sched.head_new);
+            let hr = m + kh;
+            self.gdn_stream_cp(&ws.x, 0, carry.pending_qkv, 0, m * xrow)?;
+            self.gdn_stream_cp(&ws.x, m * xrow, raw.qkv, 0, kh * xrow)?;
+            self.gdn_stream_cp(&ws.alpha, 0, carry.pending_alpha, 0, m * arow)?;
+            self.gdn_stream_cp(&ws.alpha, m * arow, raw.alpha, 0, kh * arow)?;
+            self.gdn_stream_cp(&ws.beta, 0, carry.pending_beta, 0, m * arow)?;
+            self.gdn_stream_cp(&ws.beta, m * arow, raw.beta, 0, kh * arow)?;
+            self.gdn_stream_cp(&ws.conv, 0, carry.tile_entry_conv, 0, c.conv_bytes)?;
+            let p = GdnScanPtrs {
+                q: ptr(&ws.q),
+                k: ptr(&ws.k),
+                v: ptr(&ws.v),
+                a: ptr(&ws.a),
+                g: ptr(&ws.alpha),
+                beta: ptr(&ws.beta),
+                out: ptr(&ws.out),
+            };
+            self.gdn_stream_prep(
+                &c,
+                ptr(&ws.x),
+                ptr(&ws.conv),
+                p.g,
+                p.beta,
+                p.q,
+                p.k,
+                p.v,
+                hr,
+            )?;
+            self.gdn_stream_kkt(&c, &p, hr)?;
+            let exit = if !sched.head_complete {
+                GdnScanExit::Discard
+            } else {
+                c.exit_at(start_pos + kh as u64)
+            };
+            self.gdn_stream_scan(&c, &p, hr, false, &exit, &mut open)?;
+            // Only the new rows are published; the replayed pending rows were
+            // published by earlier appends.
+            self.gdn_stream_cp(out, 0, &ws.out, m * orow, kh * orow)?;
+            self.gdn_stream_cp(live.conv, 0, &ws.conv, 0, c.conv_bytes)?;
+            if !sched.head_complete {
+                self.gdn_stream_cp(carry.pending_qkv, m * xrow, raw.qkv, 0, kh * xrow)?;
+                self.gdn_stream_cp(carry.pending_alpha, m * arow, raw.alpha, 0, kh * arow)?;
+                self.gdn_stream_cp(carry.pending_beta, m * arow, raw.beta, 0, kh * arow)?;
+            }
+        }
+
+        if r > 0 {
+            let kh = sched.head_new;
+            let pb = start_pos + kh as u64;
+            let xb = padd(ptr(raw.qkv), kh * xrow);
+            let alb = padd(ptr(raw.alpha), kh * arow);
+            let beb = padd(ptr(raw.beta), kh * arow);
+            let ob = padd(ptr(out), kh * orow);
+            let (qs, ks, vs, asp) = (
+                ptr(scratch.q),
+                ptr(scratch.k),
+                ptr(scratch.v),
+                ptr(scratch.a),
+            );
+            let live_conv = ptr(live.conv);
+            // The incomplete final tile's raw prefix is the next append's replay
+            // input: save it before any prep rewrites alpha/beta in place.
+            if rt > 0 {
+                self.gdn_stream_cp(carry.pending_qkv, 0, raw.qkv, (kh + rc) * xrow, rt * xrow)?;
+                self.gdn_stream_cp(
+                    carry.pending_alpha,
+                    0,
+                    raw.alpha,
+                    (kh + rc) * arow,
+                    rt * arow,
+                )?;
+                self.gdn_stream_cp(carry.pending_beta, 0, raw.beta, (kh + rc) * arow, rt * arow)?;
+            }
+            if rc > 0 {
+                if fused {
+                    // The fused projection already wrote q/k/v for every row but
+                    // the 3-row tile heads; the completion pass finishes those,
+                    // the C64 gates and the ring over the complete prefix only
+                    // (T = rc); a raw tail is prepped below.
+                    self.gdn_stream_prep_fixup(&c, xb, live_conv, alb, beb, qs, ks, vs, rc)?;
+                } else {
+                    self.gdn_stream_prep(&c, xb, live_conv, alb, beb, qs, ks, vs, rc)?;
+                }
+            }
+            if rt > 0 {
+                // The ring after the whole tiles is the incomplete tile's entry.
+                self.gdn_stream_cp(carry.tile_entry_conv, 0, live.conv, 0, c.conv_bytes)?;
+                self.gdn_stream_prep(
+                    &c,
+                    padd(xb, rc * xrow),
+                    live_conv,
+                    padd(alb, rc * arow),
+                    padd(beb, rc * arow),
+                    padd(qs, rc * c.qrow),
+                    padd(ks, rc * c.qrow),
+                    padd(vs, rc * c.vrow),
+                    rt,
+                )?;
+            }
+            let rows_at = |start: usize| GdnScanPtrs {
+                q: padd(qs, start * c.qrow),
+                k: padd(ks, start * c.qrow),
+                v: padd(vs, start * c.vrow),
+                a: padd(asp, start * c.a_row),
+                g: padd(alb, start * arow),
+                beta: padd(beb, start * arow),
+                out: padd(ob, start * orow),
+            };
+            // Whole tiles: a clipped first frame up to the next absolute seam,
+            // then seam-aligned frames.
+            let mut done = 0usize;
+            if rc > 0 && pb % 512 != 0 {
+                let len = rc.min((next_boundary(pb, 512) - pb) as usize);
+                let p = rows_at(0);
+                self.gdn_stream_kkt(&c, &p, len)?;
+                self.gdn_stream_scan(&c, &p, len, false, &c.exit_at(pb + len as u64), &mut open)?;
+                done = len;
+            }
+            if rc > done {
+                let aligned = rc - done;
+                if c.mseg && aligned > 512 {
+                    let p = rows_at(done);
+                    self.gdn_stream_kkt(&c, &p, aligned)?;
+                    let exit = c.exit_at(pb + rc as u64);
+                    self.gdn_stream_scan(&c, &p, aligned, true, &exit, &mut open)?;
+                } else {
+                    let mut off = done;
+                    while off < rc {
+                        let len = (rc - off).min(512);
+                        let p = rows_at(off);
+                        self.gdn_stream_kkt(&c, &p, len)?;
+                        let exit = c.exit_at(pb + (off + len) as u64);
+                        self.gdn_stream_scan(&c, &p, len, false, &exit, &mut open)?;
+                        off += len;
+                    }
+                }
+            }
+            if rt > 0 {
+                let p = rows_at(rc);
+                self.gdn_stream_kkt(&c, &p, rt)?;
+                self.gdn_stream_scan(&c, &p, rt, false, &GdnScanExit::Discard, &mut open)?;
+            }
+        }
+        if sched.meta.pending_rows == 0 {
+            // Pending 0: the tile entry's ring is the live ring.
+            self.gdn_stream_cp(carry.tile_entry_conv, 0, live.conv, 0, c.conv_bytes)?;
+        }
+        debug_assert!(!open && sched.meta.position == end);
+        let mut next = sched.meta;
+        next.recipe_id = plan.recipe_id;
+        Ok(next)
+    }
+
+    /// Quantize an Open stream's end state exactly once for decode/verify
+    /// (CHUNK-CANONICAL-DESIGN §3.5): at a commit seam (or an opened phase with
+    /// no rows) the live Q8 planes already hold it; with whole tiles only the
+    /// FP32 tile entry is quantized; with a pending prefix that tile is replayed
+    /// from `tile_entry_*` and its end state quantized. The live ring is already
+    /// the ring at `position` and is not touched. A Sealed meta is returned as is.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_stream_seal(
+        &mut self,
+        plan: &GdnPrefillPlan,
+        meta: &GdnStreamMeta,
+        consts: &GdnStreamConsts<'_>,
+        live: &GdnLiveState<'_>,
+        carry: &GdnCarryView<'_>,
+        ws: &GdnStreamWorkspace,
+    ) -> HipResult<GdnStreamMeta> {
+        let fail = |m: String| hip_bridge::HipError::new(0, &format!("gdn_stream_seal: {m}"));
+        self.bind_thread()?;
+        let c = self.gdn_stream_context(plan, consts, live, carry, ws)?;
+        Self::gdn_stream_check_meta(plan, meta)?;
+        let sealed = GdnStreamMeta {
+            schema_version: GDN_STREAM_SCHEMA_VERSION,
+            recipe_id: plan.recipe_id,
+            phase: GdnStreamPhase::Sealed,
+            position: meta.position,
+            phase_start: meta.phase_start,
+            frame_base: meta.position,
+            tile_base: meta.position,
+            pending_rows: 0,
+            owner_generation: meta.owner_generation,
+        };
+        if meta.phase == GdnStreamPhase::Sealed {
+            return Ok(GdnStreamMeta {
+                recipe_id: plan.recipe_id,
+                ..*meta
+            });
+        }
+        // Validates phase_start / tile_base / pending / frame_base consistency.
+        GdnAppendSchedule::new(meta, meta.position, 1, 64, 512).map_err(fail)?;
+        let m = meta.pending_rows as usize;
+        let ptr = |t: &GpuTensor| t.buf.as_ptr();
+        if meta.position == meta.frame_base {
+            return Ok(sealed);
+        }
+        let f32_entry = GdnScanEntry::F32 {
+            state: carry.tile_entry_f32,
+        };
+        let seal_exit = GdnScanExit::Seal {
+            codes: live.planes.codes,
+            scales: live.planes.scales,
+            ef: live.planes.ef,
+        };
+        if m == 0 {
+            self.gdn_stream_convert(&c, &f32_entry, &seal_exit)?;
+            return Ok(sealed);
+        }
+        let (xrow, arow) = (c.xrow, c.arow);
+        self.gdn_stream_cp(&ws.x, 0, carry.pending_qkv, 0, m * xrow)?;
+        self.gdn_stream_cp(&ws.alpha, 0, carry.pending_alpha, 0, m * arow)?;
+        self.gdn_stream_cp(&ws.beta, 0, carry.pending_beta, 0, m * arow)?;
+        self.gdn_stream_cp(&ws.conv, 0, carry.tile_entry_conv, 0, c.conv_bytes)?;
+        let p = GdnScanPtrs {
+            q: ptr(&ws.q),
+            k: ptr(&ws.k),
+            v: ptr(&ws.v),
+            a: ptr(&ws.a),
+            g: ptr(&ws.alpha),
+            beta: ptr(&ws.beta),
+            out: ptr(&ws.out),
+        };
+        self.gdn_stream_prep(&c, ptr(&ws.x), ptr(&ws.conv), p.g, p.beta, p.q, p.k, p.v, m)?;
+        self.gdn_stream_kkt(&c, &p, m)?;
+        let mut open = false;
+        self.gdn_stream_scan(&c, &p, m, false, &seal_exit, &mut open)?;
+        Ok(sealed)
+    }
+
+    /// Append rows of the sequential (C = 1) algorithm: the recurrence continues
+    /// from the FP32 accumulator `carry_f32` between calls and quantizes only at
+    /// absolute 512-row seams (`frame` of the plain-Q8 stochastic rounding is the
+    /// absolute seam position). At a frame start the live Q8(+EF) planes are the
+    /// authoritative entry; mid-frame the FP32 carry is. Prepared inputs only
+    /// ([`GdnSeqInputs`]); the caller's producer owns the convolution.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_stream_append_sequential(
+        &mut self,
+        plan: &GdnPrefillPlan,
+        meta: &GdnStreamMeta,
+        start_pos: u64,
+        rows: usize,
+        inp: &GdnSeqInputs<'_>,
+        out: &GpuTensor,
+        planes: &GdnQ8Planes<'_>,
+        carry_f32: &GpuTensor,
+        n_heads: usize,
+    ) -> HipResult<GdnStreamMeta> {
+        let fail =
+            |m: String| hip_bridge::HipError::new(0, &format!("gdn_stream_append_sequential: {m}"));
+        self.bind_thread()?;
+        self.gdn_seq_check_plan(plan, planes, carry_f32, n_heads)?;
+        Self::gdn_stream_check_meta(plan, meta)?;
+        let sched = GdnAppendSchedule::new(meta, start_pos, rows, 1, 512).map_err(fail)?;
+        let ratio = inp.qk_head_ratio;
+        if ratio == 0 || n_heads % ratio != 0 {
+            return Err(fail(format!(
+                "qk_head_ratio {ratio} does not divide {n_heads} heads"
+            )));
+        }
+        let (qrow, vrow, grow) = ((n_heads / ratio) * 128 * 4, n_heads * 128 * 4, n_heads * 4);
+        let need = |what: &str, have: usize, want: usize| -> HipResult<()> {
+            if have < want {
+                Err(fail(format!("{what}: {have} bytes, needs {want}")))
+            } else {
+                Ok(())
+            }
+        };
+        need("q", inp.q.byte_size(), rows * qrow)?;
+        need("k", inp.k.byte_size(), rows * qrow)?;
+        need("v", inp.v.byte_size(), rows * vrow)?;
+        need("gate", inp.gate.byte_size(), rows * grow)?;
+        need("beta", inp.beta.byte_size(), rows * grow)?;
+        need("out", out.byte_size(), rows * vrow)?;
+
+        let phase_start = if meta.phase == GdnStreamPhase::Open {
+            meta.phase_start
+        } else {
+            start_pos
+        };
+        let end = start_pos + rows as u64;
+        let _frames = reserve_gdn_requant_frames(rows as u32);
+        let mut s = start_pos;
+        while s < end {
+            let e = end.min(next_boundary(s, 512));
+            let (off, len) = ((s - start_pos) as usize, (e - s) as usize);
+            let entry = if s == phase_start || s % 512 == 0 {
+                match planes.ef {
+                    Some(ef) => GdnScanEntry::Q8Ef {
+                        codes: planes.codes,
+                        scales: planes.scales,
+                        ef,
+                    },
+                    None => GdnScanEntry::Q8 {
+                        codes: planes.codes,
+                        scales: planes.scales,
+                    },
+                }
+            } else {
+                GdnScanEntry::F32 { state: carry_f32 }
+            };
+            let exit = if e % 512 == 0 {
+                GdnScanExit::Seal {
+                    codes: planes.codes,
+                    scales: planes.scales,
+                    ef: planes.ef,
+                }
+            } else {
+                GdnScanExit::F32 { state: carry_f32 }
+            };
+            let state = Self::gdn_scan_state(&entry, &exit)?;
+            let ptr = |t: &GpuTensor, row: usize, stride: usize| padd(t.buf.as_ptr(), row * stride);
+            self.gdn_seq_launch(
+                [
+                    ptr(inp.q, off, qrow),
+                    ptr(inp.k, off, qrow),
+                    ptr(inp.v, off, vrow),
+                    ptr(inp.gate, off, grow),
+                    ptr(inp.beta, off, grow),
+                    ptr(out, off, vrow),
+                ],
+                &state,
+                len,
+                n_heads,
+                ratio,
+                e as u32,
+            )?;
+            s = e;
+        }
+        let mut next = sched.meta;
+        next.recipe_id = plan.recipe_id;
+        Ok(next)
+    }
+
+    /// Seal the sequential algorithm: a seam (or an opened phase with no rows)
+    /// already left the quantized state in the live planes; mid-frame the FP32
+    /// carry is quantized once.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_stream_seal_sequential(
+        &mut self,
+        plan: &GdnPrefillPlan,
+        meta: &GdnStreamMeta,
+        planes: &GdnQ8Planes<'_>,
+        carry_f32: &GpuTensor,
+        n_heads: usize,
+    ) -> HipResult<GdnStreamMeta> {
+        self.bind_thread()?;
+        self.gdn_seq_check_plan(plan, planes, carry_f32, n_heads)?;
+        Self::gdn_stream_check_meta(plan, meta)?;
+        let sealed = GdnStreamMeta {
+            schema_version: GDN_STREAM_SCHEMA_VERSION,
+            recipe_id: plan.recipe_id,
+            phase: GdnStreamPhase::Sealed,
+            position: meta.position,
+            phase_start: meta.phase_start,
+            frame_base: meta.position,
+            tile_base: meta.position,
+            pending_rows: 0,
+            owner_generation: meta.owner_generation,
+        };
+        if meta.phase == GdnStreamPhase::Sealed {
+            return Ok(GdnStreamMeta {
+                recipe_id: plan.recipe_id,
+                ..*meta
+            });
+        }
+        GdnAppendSchedule::new(meta, meta.position, 1, 1, 512).map_err(|m| {
+            hip_bridge::HipError::new(0, &format!("gdn_stream_seal_sequential: {m}"))
+        })?;
+        if meta.position == meta.phase_start || meta.position % 512 == 0 {
+            return Ok(sealed);
+        }
+        let entry = GdnScanEntry::F32 { state: carry_f32 };
+        let exit = GdnScanExit::Seal {
+            codes: planes.codes,
+            scales: planes.scales,
+            ef: planes.ef,
+        };
+        let state = Self::gdn_scan_state(&entry, &exit)?;
+        let nul = std::ptr::null_mut();
+        self.gdn_seq_launch([nul; 6], &state, 0, n_heads, 1, meta.position as u32)?;
+        Ok(sealed)
+    }
+
+    #[cfg(feature = "deltanet")]
+    fn gdn_seq_check_plan(
+        &mut self,
+        plan: &GdnPrefillPlan,
+        planes: &GdnQ8Planes<'_>,
+        carry_f32: &GpuTensor,
+        n_heads: usize,
+    ) -> HipResult<()> {
+        let fail =
+            |m: String| hip_bridge::HipError::new(0, &format!("gdn_stream (sequential): {m}"));
+        if plan.algorithm != GdnScanAlgorithm::Sequential || plan.micro_rows != 1 {
+            return Err(fail(format!(
+                "plan is {:?}/{}, not Sequential/1",
+                plan.algorithm, plan.micro_rows
+            )));
+        }
+        if plan.commit_rows != 512 {
+            return Err(fail(format!("commit_rows {} != 512", plan.commit_rows)));
+        }
+        match (plan.state_quant, planes.ef.is_some()) {
+            (GdnStateQuant::Q8, false) | (GdnStateQuant::Q8Ef, true) => {}
+            (q, has_ef) => {
+                return Err(fail(format!(
+                    "plan state {q:?} with EF plane present = {has_ef}"
+                )));
+            }
+        }
+        let elems = n_heads * 128 * 128;
+        for (what, have, want) in [
+            ("state codes", planes.codes.byte_size(), elems),
+            ("state scales", planes.scales.byte_size(), n_heads * 128 * 4),
+            ("FP32 carry", carry_f32.byte_size(), elems * 4),
+        ] {
+            if have < want {
+                return Err(fail(format!("{what}: {have} bytes, needs {want}")));
+            }
+        }
+        if let Some(ef) = planes.ef {
+            if ef.byte_size() < elems * 2 {
+                return Err(fail(format!(
+                    "state EF: {} bytes, needs {}",
+                    ef.byte_size(),
+                    elems * 2
+                )));
+            }
+        }
+        self.ensure_kernel(
+            "gated_delta_net_q8_fast_stream",
+            kernels::GATED_DELTA_NET_Q8_FAST_STREAM_SRC,
+            "gated_delta_net_q8_fast_stream",
+        )
+    }
+
+    /// One `gated_delta_net_q8_fast_stream` launch over `len` rows
+    /// (`rows = [q, k, v, gate, beta, out]` already offset to the first row).
+    /// `len == 0` is a pure state conversion.
+    #[cfg(feature = "deltanet")]
+    fn gdn_seq_launch(
+        &mut self,
+        rows: [*mut c_void; 6],
+        s: &GdnScanState,
+        len: usize,
+        n_heads: usize,
+        qk_ratio: usize,
+        frame: u32,
+    ) -> HipResult<()> {
+        const SYMBOL: &str = "gated_delta_net_q8_fast_stream";
+        let [qp, kp, vp, gp, bp, op] = rows;
+        let (sqp, scp, efp, h0p, htp) = (s.sq, s.sc, s.ef, s.h0, s.ht);
+        let (nt, nh, hd, fr, qr) = (len as i32, n_heads as i32, 128i32, frame, qk_ratio as i32);
+        let (em, xm) = (s.entry_mode, s.exit_mode);
+        let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
             &kp as *const _ as *mut c_void,
             &vp as *const _ as *mut c_void,
-            &ap as *const _ as *mut c_void,
             &gp as *const _ as *mut c_void,
             &bp as *const _ as *mut c_void,
             &sqp as *const _ as *mut c_void,
             &scp as *const _ as *mut c_void,
-            &efp as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
-            &r0 as *const _ as *mut c_void,
             &nt as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &fr as *const _ as *mut c_void,
+            &efp as *const _ as *mut c_void,
+            &qr as *const _ as *mut c_void,
+            &h0p as *const _ as *mut c_void,
+            &htp as *const _ as *mut c_void,
+            &em as *const _ as *mut c_void,
+            &xm as *const _ as *mut c_void,
         ];
-        if !gfx1151_twin {
-            scan_params.push(&hk as *const _ as *mut c_void);
-            scan_params.push(&hv as *const _ as *mut c_void);
-        }
         self.launch_maybe_blob(
-            scan_module,
-            scan_grid,
-            scan_block,
+            SYMBOL,
+            [n_heads as u32, 32, 1],
+            [32, 1, 1],
             0,
-            &mut scan_params,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(ap);
-                b.push_ptr(gp);
-                b.push_ptr(bp);
-                b.push_ptr(sqp);
-                b.push_ptr(scp);
-                b.push_ptr(efp);
-                b.push_ptr(op);
-                b.push_i32(r0);
-                b.push_i32(nt);
-                if !gfx1151_twin {
-                    b.push_u32(hk);
-                    b.push_u32(hv);
+                for ptr in [qp, kp, vp, gp, bp, sqp, scp, op] {
+                    b.push_ptr(ptr);
                 }
+                b.push_i32(nt);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_u32(fr);
+                b.push_ptr(efp);
+                b.push_i32(qr);
+                b.push_ptr(h0p);
+                b.push_ptr(htp);
+                b.push_i32(em);
+                b.push_i32(xm);
                 b
             },
         )
@@ -6571,136 +7562,6 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
-    }
-    /// Tree-aware variant of `conv1d_silu_split_f32_n`. `parent_indices[t]`
-    /// is the linear slot index of token t's parent within the block, or
-    /// a negative sentinel for pre-block ancestors: -1 selects conv_state[0]
-    /// (most recent pre-block), -2 → state[1], -3 → state[2].
-    ///
-    /// Does NOT update conv_state — caller runs linear conv1d on the
-    /// accepted spine post-acceptance to advance state.
-    ///
-    /// Port of SGLang's `HAS_EAGLE_TREE_CUSTOM_ATTN_MASK` branch in
-    /// `causal_conv1d_update`. parent_indices supersedes retrieve_next_token
-    /// / retrieve_next_sibling / retrieve_parent_token (the tree is already
-    /// materialized host-side by `ddtree::linearize_tree`).
-    #[cfg(feature = "deltanet")]
-    pub fn conv1d_silu_split_tree_f32_n(
-        &mut self,
-        q_out: &GpuTensor,
-        k_out: &GpuTensor,
-        v_out: &GpuTensor,
-        input: &GpuTensor,
-        weight: &GpuTensor,
-        state: &GpuTensor,
-        parent_indices: &GpuTensor,
-        k_dim: usize,
-        v_dim: usize,
-        n_tokens: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "conv1d_silu_split_tree",
-            kernels::CONV1D_SILU_SPLIT_TREE_SRC,
-            "conv1d_silu_split_tree_f32",
-        )?;
-        let qp = q_out.buf.as_ptr();
-        let kp = k_out.buf.as_ptr();
-        let vp = v_out.buf.as_ptr();
-        let ip = input.buf.as_ptr();
-        let wp = weight.buf.as_ptr();
-        let sp = state.buf.as_ptr();
-        let pp = parent_indices.buf.as_ptr();
-        let kd = k_dim as i32;
-        let vd = v_dim as i32;
-        let nt = n_tokens as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void,
-            &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void,
-            &ip as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &sp as *const _ as *mut c_void,
-            &pp as *const _ as *mut c_void,
-            &kd as *const _ as *mut c_void,
-            &vd as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void,
-        ];
-        let n_channels = 2 * k_dim + v_dim;
-        let block = 256u32;
-        let grid = ((n_channels as u32) + block - 1) / block;
-        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "deltanet",
-            "conv1d_silu_split_tree_f32_n",
-            bytes,
-        );
-        let result = self.launch_maybe_blob(
-            "conv1d_silu_split_tree_f32",
-            [grid, 1, 1],
-            [block, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp);
-                b.push_ptr(kp);
-                b.push_ptr(vp);
-                b.push_ptr(ip);
-                b.push_ptr(wp);
-                b.push_ptr(sp);
-                b.push_ptr(pp);
-                b.push_i32(kd);
-                b.push_i32(vd);
-                b.push_i32(nt);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
-    /// Compute cross-entropy loss for a single token on GPU.
-    /// Returns -log(softmax(logits)[target]). Downloads 4 bytes instead of 600KB.
-    pub fn cross_entropy_loss(
-        &mut self,
-        logits: &GpuTensor,
-        target_buf: &DeviceBuffer,
-        loss_buf: &GpuTensor,
-        vocab_size: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "cross_entropy_loss",
-            kernels::CROSS_ENTROPY_LOSS_SRC,
-            "cross_entropy_loss",
-        )?;
-        let func = &self.functions["cross_entropy_loss"];
-        let mut lp = logits.buf.as_ptr();
-        let mut tp = target_buf.as_ptr();
-        let mut op = loss_buf.buf.as_ptr();
-        let mut vs = vocab_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut lp as *mut _ as *mut c_void,
-            &mut tp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut vs as *mut _ as *mut c_void,
-        ];
-        let block_size = 256u32;
-        let shared_mem = (block_size * 4) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
     }
 
     // ═══ Vision encoder dispatch (GEMM, LayerNorm, GELU, bias-add) ═══

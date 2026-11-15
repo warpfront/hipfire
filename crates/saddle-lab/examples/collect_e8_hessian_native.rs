@@ -109,7 +109,6 @@ fn main() {
     unsafe {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         std::env::set_var("HIPFIRE_GRAPH", "0");
-        std::env::set_var("HIPFIRE_GRAPH_MOE", "0");
     }
 
     // -------- load model + tokenizer --------

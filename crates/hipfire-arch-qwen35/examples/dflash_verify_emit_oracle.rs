@@ -481,7 +481,6 @@ fn run() -> Result<bool, String> {
             Some(&mut ring),
             None,
             None,
-            None,
         ),
         "seed prefill",
     )?;

@@ -251,9 +251,10 @@ fn emulator_of(program: &peacemaker_ir::Program, symbol: &str) -> Result<Value, 
             .insts
             .get(*id)
             .ok_or_else(|| format!("{symbol}: dangling instruction"))?;
-        let x = isa::lookup(arch, inst.op, inst.form)
+        let x = isa::lookup_inst(arch, &inst)
+            .ok()
             .map(|row| row.name)
-            .or_else(|| inst.op.name(arch))
+            .or_else(|| inst.name(arch))
             .unwrap_or("unknown");
         count(x);
         if let FormFields::Vopd { y_op, .. } = &inst.fields {

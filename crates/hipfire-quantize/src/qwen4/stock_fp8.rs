@@ -679,6 +679,26 @@ fn assemble_layer(
     Ok(([gate_up, down], geometry))
 }
 
+/// Validate one `mtp.*` source tensor and classify it as omitted from the
+/// AR artifact.  The tensor itself is kept whole in the [`Omitted`] record:
+/// the MTP sidecar producer plans its entries from exactly these records.
+fn omit_mtp_tensor(tensor: SourceTensor, census: &mut SourceCensus) -> Result<Omitted, Qwen4Error> {
+    match tensor.dtype.as_str() {
+        FP8_DTYPE => census.f8_mtp += 1,
+        "BF16" => {}
+        other => {
+            return invalid(format!(
+                "mtp tensor {} has dtype {other}, expected F8_E4M3 or BF16",
+                tensor.name
+            ));
+        }
+    }
+    Ok(Omitted {
+        tensor,
+        reason: "mtp",
+    })
+}
+
 /// Classify every source tensor and plan the stock-FP8 entries.  Reads only
 /// the three I64 records and the PLE scale records.  `index` is the Flash-Next
 /// manifest (production only).
@@ -705,19 +725,7 @@ fn plan_stock_entries(
         }
         let name = tensor.name.clone();
         if name.starts_with("mtp.") {
-            match tensor.dtype.as_str() {
-                FP8_DTYPE => census.f8_mtp += 1,
-                "BF16" => {}
-                other => {
-                    return invalid(format!(
-                        "mtp tensor {name} has dtype {other}, expected F8_E4M3 or BF16"
-                    ));
-                }
-            }
-            omitted.push(Omitted {
-                tensor,
-                reason: "mtp",
-            });
+            omitted.push(omit_mtp_tensor(tensor, &mut census)?);
             continue;
         }
         if is_vision_tensor(&name) {
@@ -1911,3 +1919,10 @@ pub(crate) fn write_stock_fp8_artifact(
 
 #[cfg(test)]
 mod tests;
+
+// The sidecar producer lives in its own file beside this one but is a child
+// module, so it reuses this producer's planner, scan, copier and reopen
+// checks without widening their visibility.
+#[path = "stock_fp8_mtp.rs"]
+mod mtp_sidecar;
+pub(crate) use mtp_sidecar::run_stock_fp8_mtp_sidecar_cli;

@@ -594,10 +594,10 @@ pub fn lift_text(
                     let mut parts = text.split_whitespace();
                     let (mnemonic, operand) =
                         (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-                    if Some(mnemonic) != inst.op.name(arch) {
+                    if Some(mnemonic) != inst.name(arch) {
                         return Err(fail(
                             va,
-                            format!("line {line_no}: {text:?} is not {:?}", inst.op.name(arch)),
+                            format!("line {line_no}: {text:?} is not {:?}", inst.name(arch)),
                         ));
                     }
                     let named = labels

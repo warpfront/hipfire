@@ -241,7 +241,7 @@ def test_driver_passes_the_callers_full_environment_to_the_daemon(tmp_path):
         "ROCR_VISIBLE_DEVICES": "1",
         "HIPFIRE_DEVICES": "1",
         "AGENTIC_SENTINEL": "sentinel-value",
-        "HIPFIRE_KV_MODE": "asym3",  # the gate's own `env` override
+        "HIPFIRE_KV_MODE": "fwht3",  # the gate's own `env` override
         "HIPFIRE_GRAPH": "1",
     }
     proc, out, _ = _run_driver(
@@ -257,7 +257,7 @@ def test_gate_launches_driver_with_its_env_overrides_only():
     """The gate adds HIPFIRE_KV_MODE/HIPFIRE_GRAPH via `env`; no clean env anywhere."""
     text = GATE.read_text()
     assert re.search(
-        r"env HIPFIRE_KV_MODE=asym3 \\\n\s+HIPFIRE_GRAPH=1 \\\n"
+        r"env HIPFIRE_KV_MODE=fwht3 \\\n\s+HIPFIRE_GRAPH=1 \\\n"
         r"\s+python3 scripts/agentic_gate_driver\.py",
         text,
     )

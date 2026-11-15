@@ -44,7 +44,7 @@ fn unsupported_expert_formats(weights: &Gemma4Weights) -> Option<String> {
 
 /// Resolve the full-attention KV tier from the raw `kv_cache` value through
 /// [`GEMMA4_FULL_POLICY`](hipfire_runtime::kv_mode::GEMMA4_FULL_POLICY):
-/// `auto`/`q8` → Q8, `legacy-asym3` → the previous Givens asym3 tier.
+/// `auto`/`q8` → Q8.
 /// Unsupported names fall back to Q8 with the returned warning; fp8/bf16 fail
 /// closed (no Gemma4 attend site admits a native tier).
 fn resolve_full_kv_tier(mode_raw: &str) -> Result<(FullKvTier, Option<&'static str>), String> {
@@ -52,9 +52,8 @@ fn resolve_full_kv_tier(mode_raw: &str) -> Result<(FullKvTier, Option<&'static s
     let rr = kv_mode::resolve(mode_raw, &kv_mode::GEMMA4_FULL_POLICY);
     match rr.mode {
         KvMode::Q8 => Ok((FullKvTier::Q8, rr.warning)),
-        KvMode::Asym3 => Ok((FullKvTier::LegacyAsym3, rr.warning)),
         other => Err(format!(
-            "gemma4: kv_cache={mode_raw} ({other:?}) has no full-attention KV tier; use auto, q8 or legacy-asym3"
+            "gemma4: kv_cache={mode_raw} ({other:?}) has no full-attention KV tier; use auto or q8"
         )),
     }
 }
@@ -130,14 +129,16 @@ mod tests {
                 "{raw:?}"
             );
         }
-        assert_eq!(
-            resolve_full_kv_tier("legacy-asym3"),
-            Ok((FullKvTier::LegacyAsym3, None))
-        );
-        // Bare asym3 is the Qwen FWHT alias: no hd512 FWHT tier, so q8 + warning.
-        let (tier, warning) = resolve_full_kv_tier("asym3").unwrap();
-        assert_eq!(tier, FullKvTier::Q8);
-        assert!(warning.is_some());
+        // Removed in 0.5.0 (Givens asym3 and its aliases): q8 + a warning
+        // naming the removal.
+        for raw in ["legacy-asym3", "asym3", "turbo3"] {
+            let (tier, warning) = resolve_full_kv_tier(raw).unwrap();
+            assert_eq!(tier, FullKvTier::Q8, "{raw}");
+            assert!(
+                warning.is_some_and(|w| w.contains("removed in 0.5.0")),
+                "{raw}"
+            );
+        }
         // Native presets fail closed instead of silently becoming q8.
         assert!(resolve_full_kv_tier("fp8").is_err());
         assert!(resolve_full_kv_tier("bf16").is_err());

@@ -61,9 +61,17 @@ type CheckpointKey = (CacheDomain, u64, u64);
 /// collision-resistant fingerprint closes that wrong-state restore — a
 /// fingerprint match now also certifies the prefix contents.
 pub fn prefix_fingerprint(tokens: &[u32]) -> u64 {
+    prefix_fingerprint_chain(tokens, &[])
+}
+
+/// [`prefix_fingerprint`] of `head ++ tail` without concatenating them: the
+/// live-conversation checkpoint callers hash the committed conversation plus
+/// the tokens of the chunk being prefilled. `prefix_fingerprint_chain(a, b)
+/// == prefix_fingerprint(&[a, b].concat())`.
+pub fn prefix_fingerprint_chain(head: &[u32], tail: &[u32]) -> u64 {
     use sha2::{Digest as Sha256Digest, Sha256};
     let mut h = Sha256::new();
-    for &t in tokens {
+    for &t in head.iter().chain(tail) {
         h.update(t.to_le_bytes());
     }
     let d = h.finalize();

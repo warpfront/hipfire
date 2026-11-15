@@ -196,7 +196,7 @@ impl Default for ArchCaps {
 ///
 /// Consumed by `hipfire_engine::scheduler::is_batch_eligible` together with
 /// [`ArchCaps`]: each field snapshots one request/topology input (`pp`,
-/// `ep`, image/tools/stop payloads, `speculator`/`kv_adaptive`/`pflash`
+/// `ep`, image/tools/stop payloads, `speculator`/`kv_adaptive`
 /// activity, single-user history, think mode, continuous-batch opt-in and
 /// size). Nothing in production constructs this struct today — it is built
 /// in unit tests; the daemon's live request path decides through
@@ -218,8 +218,6 @@ pub struct BatchEligibilityRequest {
     pub has_speculator: bool,
     /// Whether adaptive KV is active (`m.kv_adaptive.is_some()`).
     pub has_adaptive: bool,
-    /// Whether PFlash is active for this request (`pflash_active`).
-    pub has_pflash: bool,
     /// Whether `messages` is not a single user turn (multi-turn history).
     pub has_messages_history: bool,
     /// Whether `ThinkMode` is `NonThink` (batch requires non-thinking).

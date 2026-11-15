@@ -59,14 +59,7 @@ impl SpecTarget for LlamaBundle {
         block_size: usize,
     ) -> Result<Box<dyn SpecScratch>, String> {
         let block_size = block_size.max(2);
-        // The tree-verify arm linearizes a DDTree of up to `dense_tree_verify_nodes`
-        // slots into ONE batched forward, so the verify scratch must hold the larger
-        // of the chain block and the (clamped) tree size — else a big
-        // `HIPFIRE_DDTREE_BUDGET` overflows `pbs.max_batch` and panics.
-        let max_batch = block_size.max(hipfire_runtime::dflash_generic::dense_tree_verify_nodes(
-            &gpu.flags,
-        ));
-        let pbs = PrefillBatchScratch::new(gpu, &self.config, max_batch, self.kv.physical_cap)
+        let pbs = PrefillBatchScratch::new(gpu, &self.config, block_size, self.kv.physical_cap)
             .map_err(|e| format!("LlamaSpecScratch PrefillBatchScratch: {e:?}"))?;
         Ok(Box::new(LlamaSpecScratch { pbs }))
     }
@@ -99,12 +92,10 @@ impl SpecTarget for LlamaBundle {
         // KV: one batched `forward_prefill_batch` call (same chunking as
         // AR's). Otherwise: per token through the AR decode forward, which appends
         // one position's `num_extract × dim` residual per call (extract order).
-        // The spec loop never evicts, so `has_eviction` is false.
         let batched = llama::llama_batched_prefill_eligible(
             &gpu.arch,
             hipfire_runtime::config::get().prefill_batched,
             self.kv.quant_q8,
-            false,
             tokens.len(),
         );
         let step = if batched { tokens.len() } else { 1 };
@@ -309,45 +300,6 @@ impl SpecTarget for LlamaBundle {
         .map_err(|e| format!("{e:?}"))
     }
 
-    fn verify_tree_logits(
-        &mut self,
-        gpu: &mut Gpu,
-        tokens: &[u32],
-        mask_block: &[f32],
-        depth_positions: &[i32],
-        position: usize,
-        scratch: &mut dyn SpecScratch,
-        hidden_out: Option<&mut Vec<f32>>,
-    ) -> Result<Vec<f32>, String> {
-        let s = scratch
-            .as_any_mut()
-            .downcast_mut::<LlamaSpecScratch>()
-            .ok_or("verify_tree_logits: scratch is not LlamaSpecScratch")?;
-        let extract = &self.dflash_extract_layers;
-        let mut sink = match hidden_out {
-            Some(h) if !extract.is_empty() => Some(llama::HiddenCaptureSink {
-                extract_layers: extract,
-                hidden: h,
-                hidden_gpu: None,
-            }),
-            _ => None,
-        };
-        hipfire_runtime::llama_spec::verify_tree_logits(
-            gpu,
-            &self.weights,
-            &self.config,
-            tokens,
-            mask_block,
-            depth_positions,
-            position,
-            &mut self.kv,
-            &self.scratch,
-            &s.pbs,
-            sink.as_mut(),
-        )
-        .map_err(|e| format!("{e:?}"))
-    }
-
     fn commit_prefix(
         &mut self,
         _gpu: &mut Gpu,
@@ -420,11 +372,12 @@ impl SpecTarget for LlamaBundle {
     ///
     /// Runs a 1-token capture-armed forward via
     /// `forward_scratch_embed` + `forward_scratch_compute_capture`, reusing the
-    /// same `HiddenCaptureSink` path as `spec_advance`. The `layers` parameter
-    /// comes from the generic drafter's `DsparkConfig::target_layer_ids` and may
-    /// differ from `self.dflash_extract_layers` (e.g. when the bundle was not
-    /// configured as a DFlash target), so we use the argument directly rather
-    /// than `self.dflash_extract_layers`.
+    /// same `HiddenCaptureSink` path as `spec_advance`. `layers` comes from the
+    /// generic drafter's `DsparkConfig::target_layer_ids`; it is also recorded as
+    /// the bundle's extract layers (as qwen35 does), so every later
+    /// `verify_block_capture_gpu` hands DSpark its accepted-prefix hidden. Without
+    /// that the daemon's DSpark verify captured nothing: every window re-ran this
+    /// bootstrap forward and drafted from a single context slot.
     fn capture_seed_main_hidden(
         &mut self,
         gpu: &mut Gpu,
@@ -432,6 +385,7 @@ impl SpecTarget for LlamaBundle {
         position: usize,
         layers: &[usize],
     ) -> Result<Vec<f32>, String> {
+        self.set_dflash_extract_layers(layers.to_vec());
         let mut hidden_out: Vec<f32> = Vec::new();
         let mut sink = llama::HiddenCaptureSink {
             extract_layers: layers,

@@ -7,7 +7,6 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::pipeline_gguf::GgufFormat;
 use crate::reap_overlay;
 
 // ─── HFQ File Format ────────────────────────────────────────────────────────
@@ -48,8 +47,7 @@ impl QuantType {
             21 => Some(Self::HFP4G32),
             24 => Some(Self::MFP4G32),
             22 => Some(Self::TidI32),
-            28 => Some(Self::PARO4G128),
-            29 => Some(Self::PARO4G128T),
+            // 28/29: reserved (formerly PARO4G128/PARO4G128T, removed in 0.5.0); never reused.
             30 => Some(Self::MQ4G256Lloyd),
             31 => Some(Self::MQ5G256),
             32 => Some(Self::MFP4G32Lloyd),
@@ -128,8 +126,7 @@ pub(crate) enum QuantType {
     // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
     // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
     // HFP8E4M3G32 = 27, // v2  — HFP8 E4M3 family
-    PARO4G128 = 28,  // ParoQuant native AWQ W4 + pairwise activation rotation metadata
-    PARO4G128T = 29, // ParoQuant engine-tiled qweight [M/8, K] for coalesced GEMV reads
+    // 28/29: reserved (formerly PARO4G128/PARO4G128T, removed in 0.5.0) — DO NOT REUSE.
     // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
     MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
     // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
@@ -286,13 +283,6 @@ pub(crate) enum QuantLevel {
     Q8,
     /// Promote to 6-bit variant of the base format (edge layers, MoE expert FFN).
     Promote6,
-    /// Override the default for a specific tensor class (today: lm_head)
-    /// to a CLI-specified format. Currently unused on this branch (no emission
-    /// site); kept so origin/master's lm_head-format override match arms
-    /// compile after the merge. Re-wire to `--lm-head-format` when the
-    /// configurable-kmap-pair refactor lands here.
-    #[allow(dead_code)]
-    Override(GgufFormat),
     /// Use the base format as-is.
     Base,
 }
@@ -939,8 +929,8 @@ mod maple_dtype_tests {
             assert_eq!(qt as u8, id);
             assert_eq!(QuantType::from_u8(id), Some(qt));
         }
-        // Neighbours are unassigned: 130 is the compact-Hessian record id
-        // (not a QuantType) and 135 is unallocated.
+        // Neighbours have no QuantType: 130 is the compact-Hessian record id and
+        // 135 is E8P-I4, whose (135,136) expert pair the qwen4 crate owns.
         assert_eq!(QuantType::from_u8(130), None);
         assert_eq!(QuantType::from_u8(135), None);
     }
@@ -961,5 +951,11 @@ mod maple_dtype_tests {
                 .count();
             assert_eq!(hits, 1, "{qt:?} (id {id}) must resolve from exactly one id");
         }
+    }
+
+    #[test]
+    fn removed_ids_28_and_29_stay_reserved() {
+        assert_eq!(QuantType::from_u8(28), None);
+        assert_eq!(QuantType::from_u8(29), None);
     }
 }

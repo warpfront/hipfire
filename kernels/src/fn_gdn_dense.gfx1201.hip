@@ -720,3 +720,43 @@ static __device__ __forceinline__ void fn_gdn_dense_gate_i8_body(
 FNGD_GATE_I8_ENTRY(fn_gdn_dense_gate_i8, 24)
 // TP2 trunk shard: 24 value heads = 12 head pairs per row (out projection K = 3072).
 FNGD_GATE_I8_ENTRY(fn_gdn_dense_gate_i8_p12, 12)
+
+// ---------------------------------------------------------------------------
+// Canonical Scan64 stream glue (CHUNK-CANONICAL-DESIGN §3.3): the Qwen4 live
+// convolution ring is `[3][channels]` indexed by the absolute row position mod
+// 3 (BF16-rounded F32), the stream prep (`gdn_chunk_prep`) keeps `[channel][3]`
+// newest-first raw F32 and reads F32 conv weights / gate constants.
+
+// ring -> stream layout at position `pm3 + 3k` (`pm3` = position mod 3).
+extern "C" __global__ __launch_bounds__(256) void fn_gdn_dense_ring_to_stream(
+    const float* ring, float* stream, int channels, int pm3) {
+    const int ch = (int)blockIdx.x * 256 + (int)threadIdx.x;
+    if (ch >= channels) return;
+    for (int k = 0; k < 3; ++k)
+        stream[ch * 3 + k] = ring[((pm3 + 2 - k) % 3) * channels + ch];
+}
+
+// stream layout -> ring at position `pm3 + 3k`; the ring holds BF16 roundings.
+extern "C" __global__ __launch_bounds__(256) void fn_gdn_dense_ring_from_stream(
+    const float* stream, float* ring, int channels, int pm3) {
+    const int ch = (int)blockIdx.x * 256 + (int)threadIdx.x;
+    if (ch >= channels) return;
+    for (int k = 0; k < 3; ++k)
+        ring[((pm3 + 2 - k) % 3) * channels + ch] = bf(stream[ch * 3 + k]);
+}
+
+// BF16 model constants -> F32 (exact): conv weight `[channels][4]`, then a_log
+// and dt_bias `[heads]` each, into `out` in that order.
+extern "C" __global__ __launch_bounds__(256) void fn_gdn_dense_stream_consts(
+    const __hip_bfloat16* conv_w, const __hip_bfloat16* a_log, const __hip_bfloat16* dt_bias,
+    float* out, int channels, int heads) {
+    const int i = (int)blockIdx.x * 256 + (int)threadIdx.x;
+    const int cw = channels * 4;
+    if (i < cw) {
+        out[i] = bf16_to_f32(conv_w[i]);
+    } else if (i < cw + heads) {
+        out[i] = bf16_to_f32(a_log[i - cw]);
+    } else if (i < cw + 2 * heads) {
+        out[i] = bf16_to_f32(dt_bias[i - cw - heads]);
+    }
+}

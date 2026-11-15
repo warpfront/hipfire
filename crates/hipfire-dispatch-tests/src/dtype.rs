@@ -26,7 +26,6 @@ const QUANTIZED_DTYPES: &[DType] = &[
     DType::HFQ2G256,
     DType::HFQ2G128,
     DType::HFQ6G256,
-    DType::ParoQ4G128,
     DType::Raw,
 ];
 
@@ -115,7 +114,6 @@ fn awq_sidecar_not_on_non_awq_dtypes() {
     assert!(!DType::F16.supports_awq_sidecar());
     assert!(!DType::Q8_0.supports_awq_sidecar());
     assert!(!DType::HFP4G32.supports_awq_sidecar());
-    assert!(!DType::ParoQ4G128.supports_awq_sidecar());
 }
 
 // ─── Quant family dispatch dimensions ──────────────────────────
@@ -142,7 +140,6 @@ fn rotation_plan_covers_every_dtype() {
         dtype_rotation_plan(DType::MQ8G256),
         RotationPlan::Mq8Internal
     );
-    assert_eq!(dtype_rotation_plan(DType::ParoQ4G128), RotationPlan::Givens);
 }
 
 #[test]
@@ -167,13 +164,9 @@ fn rotation_plan_matches_legacy_needs_fwht() {
 }
 
 #[test]
-fn post_rotation_variant_paro_is_plain_mq_is_prerotated() {
+fn post_rotation_variant_mq_is_prerotated() {
     use hipfire_dispatch::types::{dtype_post_rotation_variant, GemvVariant};
     use rdna_compute::DType;
-    assert_eq!(
-        dtype_post_rotation_variant(DType::ParoQ4G128),
-        GemvVariant::Plain
-    );
     assert_eq!(
         dtype_post_rotation_variant(DType::MQ4G256),
         GemvVariant::Prerotated
@@ -241,8 +234,8 @@ fn run_rejects_tag_plan_mismatch() {
         awq: false,
         batched: false,
     };
-    let givens = RotationTag {
-        plan: RotationPlan::Givens,
+    let other_plan = RotationTag {
+        plan: RotationPlan::FwhtG128,
         awq: false,
         batched: false,
     };
@@ -253,7 +246,7 @@ fn run_rejects_tag_plan_mismatch() {
     };
     assert!(check_rotation_tag(want, want).is_ok());
     assert!(
-        check_rotation_tag(want, givens).is_err(),
+        check_rotation_tag(want, other_plan).is_err(),
         "plan mismatch must reject"
     );
     assert!(
@@ -280,9 +273,5 @@ fn rotate_variant_selection() {
     assert_eq!(
         select_rotation_variant(RotationPlan::FwhtG128, false, false),
         RotationVariant::PlainG128
-    );
-    assert_eq!(
-        select_rotation_variant(RotationPlan::Givens, false, false),
-        RotationVariant::Givens
     );
 }

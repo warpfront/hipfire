@@ -1,0 +1,374 @@
+{
+  "cases_fail": 0,
+  "cases_pass": 276,
+  "controls_detected": 18,
+  "controls_missed": 0,
+  "extra": {
+    "n_experts": 12
+  },
+  "families": {
+    "down": {
+      "fail": 0,
+      "pass": 138
+    },
+    "gate_up": {
+      "fail": 0,
+      "pass": 138
+    }
+  },
+  "image": "/scratch/quant/fn-fp8/beat/WC8/twine/moe-gemm.elf",
+  "image_env": "HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE",
+  "oracle": "qwen4_g942_moe_gemm_oracle",
+  "quick": false,
+  "rows": [
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=1 layout=full",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=1 layout=all_pad",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=1 layout=all_skip",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=1 layout=one_expert",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=1 layout=mixed_skip",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=1 layout=partial_nrows",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=5 layout=partial_nrows",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=5 layout=full",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=10 layout=mixed_skip",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=10 layout=full",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=55 layout=full",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=79 layout=partial_nrows",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=79 layout=full",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=80 layout=mixed_skip",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=80 layout=full",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=80 layout=all_pad",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=80 layout=all_skip",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=80 layout=one_expert",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=80 layout=partial_nrows",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=81 layout=full",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=160 layout=partial_nrows",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=160 layout=full",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=320 layout=mixed_skip",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "baseline_p1": 0,
+      "case": "w0 gate_up x_bf16 tiles=320 layout=full",
+      "family": "gate_up",
+      "guards_ok": true,
+      "module": 0,
+      "ok": true,
+      "product": 0,
+      "reference_repeat": 0
+    },
+    {
+      "control": "x_f32_bf16exact tile_count_minus_1",
+      "detected": true,
+      "differing_bytes": 81831,
+      "guards_ok": true
+    },
+    {
+      "control": "x_f32_bf16exact wrong_entry(qwen4_g942_moe_gemm_xbf16)",
+      "detected": true,
+      "differing_bytes": 5102019,
+      "guards_ok": true
+    },
+    {
+      "control": "x_f32_bf16exact flip_weight_code_byte",
+      "detected": true,
+      "differing_bytes": 168,
+      "guards_ok": true
+    },
+    {
+      "control": "x_f32_bf16exact flip_s_inv_byte",
+      "detected": true,
+      "differing_bytes": 29223,
+      "guards_ok": true
+    },
+    {
+      "control": "x_f32_bf16exact flip_x_byte",
+      "detected": true,
+      "differing_bytes": 71443,
+      "guards_ok": true
+    },
+    {
+      "control": "x_f32_bf16exact flip_sorted_row_id",
+      "detected": true,
+      "differing_bytes": 4863,
+      "guards_ok": true
+    },
+    {
+      "control": "x_f32_bf16exact wrong_expert_id",
+      "detected": true,
+      "differing_bytes": 77986,
+      "guards_ok": true
+    },
+    {
+      "control": "x_f32_bf16exact wrong_nrows",
+      "detected": true,
+      "differing_bytes": 5109,
+      "guards_ok": true
+    },
+    {
+      "control": "x_f32_bf16exact tile_skipped",
+      "detected": true,
+      "differing_bytes": 81720,
+      "guards_ok": true
+    },
+    {
+      "control": "x_bf16 tile_count_minus_1",
+      "detected": true,
+      "differing_bytes": 81831,
+      "guards_ok": true
+    },
+    {
+      "control": "x_bf16 wrong_entry(qwen4_g942_moe_gemm_f32)",
+      "detected": true,
+      "differing_bytes": 5209064,
+      "guards_ok": true
+    },
+    {
+      "control": "x_bf16 flip_weight_code_byte",
+      "detected": true,
+      "differing_bytes": 168,
+      "guards_ok": true
+    },
+    {
+      "control": "x_bf16 flip_s_inv_byte",
+      "detected": true,
+      "differing_bytes": 29223,
+      "guards_ok": true
+    },
+    {
+      "control": "x_bf16 flip_x_byte",
+      "detected": true,
+      "differing_bytes": 71443,
+      "guards_ok": true
+    },
+    {
+      "control": "x_bf16 flip_sorted_row_id",
+      "detected": true,
+      "differing_bytes": 4863,
+      "guards_ok": true
+    },
+    {
+      "control": "x_bf16 wrong_expert_id",
+      "detected": true,
+      "differing_bytes": 77986,
+      "guards_ok": true
+    },
+    {
+      "control": "x_bf16 wrong_nrows",
+      "detected": true,
+      "differing_bytes": 5109,
+      "guards_ok": true
+    },
+    {
+      "control": "x_bf16 tile_skipped",
+      "detected": true,
+      "differing_bytes": 81720,
+      "guards_ok": true
+    }
+  ],
+  "seed": 5568495662576762881
+}

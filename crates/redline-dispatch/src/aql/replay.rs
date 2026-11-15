@@ -10,10 +10,44 @@ use redline_rocr::packet::{
     PacketError, PacketImage,
 };
 use redline_rocr::{
-    CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx10Pm4CommandBuffer, Gfx12Pm4CommandBuffer,
-    GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel, Pm4BuildError, QueueDepthReport,
-    QueueSet, RuntimeError,
+    CompletionSignal, DEFAULT_WAIT_TIMEOUT, Gfx10Pm4CommandBuffer, Gfx10Scratch,
+    Gfx12Pm4CommandBuffer, GpuDevice, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
+    Pm4BuildError, QueueDepthReport, QueueSet, RuntimeError,
 };
+
+/// Publish each lane's PM4 scratch ring as its queue's own, so a queue
+/// restored after KFD eviction keeps it ([`QueueSet::bind_scratch`],
+/// HIPF-347). Lane `i` of every phase runs on queue `i`, so all of a lane's
+/// streams must share one ring.
+fn bind_lane_scratch(
+    queues: &mut QueueSet,
+    phases: &[Vec<Gfx10Pm4CommandBuffer>],
+) -> Result<(), ReplayError> {
+    let mut rings = Vec::new();
+    for phase in phases {
+        rings.resize(rings.len().max(phase.len()), None);
+        for (lane, commands) in phase.iter().enumerate() {
+            match (rings[lane], commands.scratch()) {
+                (_, None) => {}
+                (None, Some(&ring)) => rings[lane] = Some(ring),
+                (Some(bound), Some(ring)) if bound == *ring => {}
+                (Some(_), Some(_)) => {
+                    return Err(ReplayError::PolicyShapeMismatch {
+                        detail: format!("PM4 lane {lane} streams use two scratch rings"),
+                    });
+                }
+            }
+        }
+    }
+    for (lane, ring) in rings.iter().enumerate() {
+        if let Some(ring) = ring {
+            queues
+                .bind_scratch(lane, ring)
+                .expect("one queue per phase lane");
+        }
+    }
+    Ok(())
+}
 
 fn retained_queue_size(
     required_packets: usize,
@@ -102,6 +136,7 @@ impl SingleQueuePm4Ib {
             commands.len_dwords(),
             None,
             None,
+            None,
         )
     }
 
@@ -119,6 +154,7 @@ impl SingleQueuePm4Ib {
             Some(ib_pool),
             &commands.as_bytes(),
             commands.len_dwords(),
+            None,
             None,
             None,
         )
@@ -149,6 +185,7 @@ impl SingleQueuePm4Ib {
             timed.len_dwords(),
             Some(timestamps),
             Some(frequency_hz),
+            None,
         )
     }
 
@@ -166,6 +203,7 @@ impl SingleQueuePm4Ib {
             commands.len_dwords(),
             None,
             None,
+            commands.scratch(),
         )
     }
 
@@ -184,6 +222,7 @@ impl SingleQueuePm4Ib {
             commands.len_dwords(),
             None,
             None,
+            commands.scratch(),
         )
     }
 
@@ -221,6 +260,7 @@ impl SingleQueuePm4Ib {
             timed.len_dwords(),
             Some(timestamps),
             Some(frequency_hz),
+            None,
         )
     }
 
@@ -245,6 +285,7 @@ impl SingleQueuePm4Ib {
             timed.len_dwords(),
             Some(timestamps),
             Some(frequency_hz),
+            None,
         )
     }
 
@@ -285,6 +326,7 @@ impl SingleQueuePm4Ib {
             timed.len_dwords(),
             Some(timestamps),
             Some(frequency_hz),
+            commands.scratch(),
         )
     }
 
@@ -312,6 +354,7 @@ impl SingleQueuePm4Ib {
             timed.len_dwords(),
             Some(timestamps),
             Some(frequency_hz),
+            commands.scratch(),
         )
     }
 
@@ -345,9 +388,11 @@ impl SingleQueuePm4Ib {
             timed.len_dwords(),
             Some(timestamps),
             Some(frequency_hz),
+            commands.scratch(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_encoded(
         device: &GpuDevice,
         pool: &KernargPool,
@@ -356,6 +401,7 @@ impl SingleQueuePm4Ib {
         dwords: u32,
         timestamps: Option<KernargBuffer>,
         timestamp_frequency_hz: Option<u64>,
+        scratch: Option<&Gfx10Scratch>,
     ) -> Result<Self, ReplayError> {
         if dwords == 0 {
             return Err(ReplayError::EmptyGraph);
@@ -376,7 +422,12 @@ impl SingleQueuePm4Ib {
         let packet =
             PacketImage::pm4_indirect_buffer(indirect.address(), dwords, completion.raw())?;
         let queue_size = *device.queue_size_range().start();
-        let queues = QueueSet::create(device, 1, queue_size)?;
+        let mut queues = QueueSet::create(device, 1, queue_size)?;
+        if let Some(scratch) = scratch {
+            queues
+                .bind_scratch(0, scratch)
+                .expect("one queue was just created");
+        }
         Ok(Self {
             queues,
             completion,
@@ -1105,7 +1156,7 @@ impl PhasedMultiQueuePm4Ib {
         phases: &[Vec<Gfx10Pm4CommandBuffer>],
     ) -> Result<Self, ReplayError> {
         let frequency_hz = device.gpu_timestamp_frequency_hz()?;
-        Self::create_encoded(
+        let mut graph = Self::create_encoded(
             device,
             pool,
             phases,
@@ -1117,7 +1168,9 @@ impl PhasedMultiQueuePm4Ib {
                 (commands.as_bytes(), commands.len_dwords())
             },
             Some(frequency_hz),
-        )
+        )?;
+        bind_lane_scratch(&mut graph.queues, phases)?;
+        Ok(graph)
     }
 
     fn create_profiled_native_legacy(
@@ -1242,7 +1295,8 @@ impl PhasedMultiQueuePm4Ib {
             *device.queue_size_range().start(),
             *device.queue_size_range().end(),
         )?;
-        let queues = QueueSet::create(device, queue_count, queue_size)?;
+        let mut queues = QueueSet::create(device, queue_count, queue_size)?;
+        bind_lane_scratch(&mut queues, phases)?;
         Ok(Self {
             queues,
             phase_completions: vec![completions],
@@ -4045,5 +4099,88 @@ mod tests {
             })),
             CancelEvidence::InactivatedOnly
         );
+    }
+
+    /// HIPF-347: every retained gfx10/gfx11 queue owns its lane's scratch ring
+    /// in `amd_queue_t`, which the command processor restores after a KFD
+    /// eviction; a queue without a ring keeps ROCr's zeros. Live GPU, opt-in:
+    /// `REDLINE_TEST_AQL=1` on a gfx10/gfx11 device.
+    #[test]
+    fn legacy_pm4_graphs_publish_each_lane_scratch_ring_when_enabled() {
+        use redline_rocr::{
+            Gfx10ScratchFamily, Gfx10ScratchPlan, GpuSelector, Runtime, load_symbols,
+        };
+        if std::env::var_os("REDLINE_TEST_AQL").is_none() {
+            return;
+        }
+        let runtime = Runtime::initialize(load_symbols().unwrap()).unwrap();
+        let device = runtime.select_gpu(GpuSelector::Ordinal(0)).unwrap();
+        let family = match &device.name()[..5] {
+            "gfx10" => Gfx10ScratchFamily::Gfx10,
+            "gfx11" => Gfx10ScratchFamily::Gfx11,
+            _ => return,
+        };
+        let pool = KernargPool::discover(&device).unwrap();
+        let local = KernargPool::discover_device_local(&device).unwrap();
+        let plan =
+            Gfx10ScratchPlan::new(family, device.scratch_topology().unwrap(), 512, 256 << 20)
+                .unwrap();
+        let backings = [(); 2].map(|()| {
+            local
+                .allocate_scratch_backing(plan.backing_bytes() as usize)
+                .unwrap()
+        });
+        let [a, b] = [0, 1].map(|i| plan.bind(backings[i].address() as u64).unwrap());
+        let stream = |ring: Option<Gfx10Scratch>| {
+            let mut commands = Gfx10Pm4CommandBuffer::new();
+            if let Some(ring) = ring {
+                commands = commands.with_scratch(ring);
+            }
+            commands.wait_compute_idle();
+            commands
+        };
+        let bound = |ring: &Gfx10Scratch| Some((ring.tmpring_size(), ring.base_address()));
+
+        let single =
+            SingleQueuePm4Ib::create_profiled_gfx11(&device, &pool, &stream(Some(a))).unwrap();
+        assert_eq!(single.queues.scratch_binding(0), bound(&a));
+        let with_ib_pool = SingleQueuePm4Ib::create_profiled_legacy_with_ib_pool(
+            &device,
+            &pool,
+            &local,
+            &stream(Some(b)),
+        )
+        .unwrap();
+        assert_eq!(with_ib_pool.queues.scratch_binding(0), bound(&b));
+        let ringless =
+            SingleQueuePm4Ib::create_profiled_gfx11(&device, &pool, &stream(None)).unwrap();
+        assert_eq!(ringless.queues.scratch_binding(0), Some((0, 0)));
+
+        let lanes = vec![stream(Some(a)), stream(Some(b))];
+        let phased = PhasedMultiQueuePm4Ib::create_profiled_gfx11(
+            &device,
+            &pool,
+            std::slice::from_ref(&lanes),
+        )
+        .unwrap();
+        let native = PhasedMultiQueuePm4Ib::create_profiled_native_gfx11(
+            &device,
+            &pool,
+            &[lanes.clone(), lanes],
+        )
+        .unwrap();
+        for graph in [&phased, &native] {
+            assert_eq!(graph.queues.scratch_binding(0), bound(&a));
+            assert_eq!(graph.queues.scratch_binding(1), bound(&b));
+        }
+        // Lane 0 cannot own two rings across phases.
+        assert!(matches!(
+            PhasedMultiQueuePm4Ib::create_profiled_gfx11(
+                &device,
+                &pool,
+                &[vec![stream(Some(a))], vec![stream(Some(b))]],
+            ),
+            Err(ReplayError::PolicyShapeMismatch { .. })
+        ));
     }
 }

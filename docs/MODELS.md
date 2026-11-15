@@ -38,7 +38,7 @@ Default serve pre-warm tag is `qwen3.5:9b` (`CONFIG.md` → `default_model`). Pe
 
 ## Registry tags (from `registry/models.json`)
 
-Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (registry `default_kv_mode` when set; else empty), **Notes** (`desc`, condensed). `default_kv_mode = "q8"` is the universal fallback and is **not** lowered into config: the global `kv_cache=auto` resolves per [`CONFIG.md`](CONFIG.md#mode-k-and-v) (Qwen: native `fp8` on eligible exact gfx1201, otherwise q8). A non-q8 registry value (DeepSeek V4 `f32`, Maple-Preview `bf16`) is lowered to `kv_cache`. KV names `asymN` / `turboN` / `legacy-asymN` are **deprecated since 0.4.0, removal in 0.5.0**; use `fwhtN` or `q8`.
+Fields: **Tag**, **File** (`file`), **Size GB** (`size_gb`), **Min VRAM GB** (`min_vram_gb`), **Default KV** (registry `default_kv_mode` when set; else empty), **Notes** (`desc`, condensed). `default_kv_mode = "q8"` is the universal fallback and is **not** lowered into config: the global `kv_cache=auto` resolves per [`CONFIG.md`](CONFIG.md#mode-k-and-v) (Qwen: native `fp8` on eligible exact gfx1201, otherwise q8). A non-q8 registry value (DeepSeek V4 `f32`, Maple-Preview `bf16`) is lowered to `kv_cache`. KV names `asymN` / `turboN` / `legacy-asymN` were **removed in 0.5.0** and are rejected; use `fwhtN` or `q8`.
 
 Optional split-base PLE map (`ple`, an object keyed by format token: lowercase letters and digits such as `q4` = 4-bit Lloyd-Max rows and `q8` = the exact Q8F16 rows; each value is `{file, sha256, size_bytes}`) names the PLE row sidecars of a split entry; `registry_gen.py` pins every one from the live Hugging Face tree (an LFS sha256 is required). The entry's `file` must be a split base (`<name>-base.<ext>`). A sidecar's `file` is either the per-base `<file>.ple-<key>` or, for the Flash-Next split family (`qwen3.8-flash-next-base.<ext>`) only, the shared `qwen3.8-flash-next.ple-<key>`, which every entry naming it must pin identically. An unknown key (a future `q2`) parses and validates, so a newer registry stays readable; a client plans only the formats it can load (today `q4` and `q8`) and ignores the rest with a note. `q8` is the exact reference: a verified grandfathered monolithic embeds it, and it is the fallback when a lossy format a client wants is unpublished; an explicit `--ple q8` never falls back. `hipfire pull` and the on-demand load download a shared file once, verify it against the pin, and install `<base file>.ple-<key>` (the name the loader opens) as a hard link to it, never a second copy; an existing file under that name that is not the verified shared file is left untouched and reported. `hipfire rm` removes the shared file with the last base that links it. Entries without a `ple` map are unchanged. (This replaces the earlier fixed `ple_q4` / `ple_q8` fields.)
 
@@ -48,7 +48,7 @@ Optional split-base PLE map (`ple`, an object keyed by format token: lowercase l
 |---|---|---:|---:|---|---|
 | `qwen3.5:0.8b` | `qwen3.5-0.8b.mq4` | 0.55 | 2.0 | q8 | MQ4 default small |
 | `qwen3.5:0.8b-mq6` | `qwen3.5-0.8b.mq6` | 0.67 | 2.2 | q8 | MQ6 |
-| `qwen3.5:2b` | `qwen3.5-2b.mq4` | 1.29 | 2.8 | | MQ4 (registry desc still mentions legacy HF4 naming) |
+| `qwen3.5:2b` | `qwen3.5-2b.mq4` | 1.29 | 2.8 | | MQ4 (MQ4G256 v1, qt=13) |
 | `qwen3.5:2b-hf6` | `qwen3.5-2b.hf6` | 1.6 | 3 | | HF6 |
 | `qwen3.5:2b-mq3` | `qwen3.5-2b.mq3` | 1.16 | 2.7 | | MQ3 |
 | `qwen3.5:2b-mq6` | `qwen3.5-2b.mq6` | 1.63 | 3.1 | | MQ6 |
@@ -72,10 +72,10 @@ Sizes below are **registry declarations**, not a substitute for runtime MoE layo
 | `qwen3.6:35b-a3b` | `qwen3.6-35b-a3b.mq4p` | 19.8 | 22 | q8 | Default graded mq4p SKU |
 | `qwen3.6:35b-a3b-mq2` | `qwen3.6-35b-a3b.mq2` | 11.6 | 14 | | Floor SKU |
 | `qwen3.6:35b-a3b-mq3p` | `qwen3.6-35b-a3b.mq3p` | 17.2 | 20 | | MQ3+P graded |
-| `qwen3.6:35b-a3b-mq4p` | `qwen3.6-35b-a3b.mq4p` | 19.8 | 22 | | MQ4+P graded |
+| `qwen3.6:35b-a3b-mq4p` | (alias of `qwen3.6:35b-a3b`) | | | | Same `qwen3.6-35b-a3b.mq4p` file; kept as an alias so the old tag still resolves |
 | `qwen3.6:35b-a3b-mfp4` | `qwen3.6-35b-a3b.mfp4` | 20.2 | 22 | | MFP4-E8 |
 | `qwen3.6:35b-a3b-mq4r` | `qwen3.6-35b-a3b.mq4r` | 18.7 | 22 | | Uniform MQ4G256V1/qt13 Redline speed SKU; zero qt44/graded experts. Dated tok/s in registry text is not a live baseline. |
-| `qwen3.6:35b-a3b-mq4rs` | `qwen3.6-35b-a3b-d53.mq4rs` | 18.7 | 22 | q8 | Symmetric-expert MQ4 (qt44 gate/up + qt53 down, MQ4G256V2/MQ4G128V2). Loads on gfx1201 only, where it takes the int4-activation expert prefill; other GPUs refuse it unless `HIPFIRE_MOE_SYM_IU4=0` accepts the qt53 F32 prefill fallback (about 5x slower than the IU4 route on gfx1201). No MTP sidecar registered. |
+| `qwen3.6:35b-a3b-mq4rs` | `qwen3.6-35b-a3b-d53.mq4rs` | 18.7 | 22 | q8 | Symmetric-expert MQ4 (qt44 gate/up + qt53 down, MQ4G256V2/MQ4G128V2). Loads on gfx1100, gfx1151 and gfx1201, where it takes the int4-activation expert prefill (vs the qt53 F32 fallback: 3.25x at pp512 and 2.03x at pp16384 on gfx1100, 3.37x and 2.80x on gfx1151, about 5x on gfx1201); other GPUs refuse it unless `HIPFIRE_MOE_SYM_IU4=0` accepts the fallback. No MTP sidecar registered. |
 | `qwen3.6:35b-a3b-mq5` | `qwen3.6-35b-a3b.mq5` | 23.7 | 26 | | Quality SKU |
 | `qwen3.6:35b-a3b-mq6` | `qwen3.6-35b-a3b.mq6` | 27.7 | 30 | | Max quality |
 
@@ -85,7 +85,7 @@ The `qwen3.6:35b-a3b*` entries and both `ornith-1.5:35b-a3b*` entries carry an `
 
 | Tag | File | Size GB | Min VRAM | Default KV | Notes |
 |---|---|---:|---:|---|---|
-| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Registry also lists a `triattn` sidecar (deprecated CASK, removal in 0.5.0: `pull` fetches it, nothing attaches it by default); template not effort-native — `reasoning_effort` dropped+warned, never converted to a cap |
+| `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | **Retired** in 0.5.0; replacement `qwen3.8:27b`; a verified local copy still loads (see the retirement rules under Flash-Next) |
 | `qwen3.6:27b-mq3` | `qwen3.6-27b.mq3` | 10.7 | 12 | | MQ3 alpha |
 
 ### Qwen 3.8 dense
@@ -96,7 +96,7 @@ The `qwen3.6:35b-a3b*` entries and both `ornith-1.5:35b-a3b*` entries carry an `
 | `qwen3.8:27b-mq3` | `qwen3.8-27b.mq3` | 12.62 | 14 | q8 | MQ3V2 base |
 | `qwen3.8:27b-mq3-pro` | `qwen3.8-27b.mq3-pro` | 13.18 | 15 | q8 | MQ3V2 Pro |
 | `qwen3.8:27b-mq4-xt` | `qwen3.8-27b.mq4-xt` | 14.99 | 16 | q8 | MQ4V2 XT (speed; supersedes legacy `.mq4r`) |
-| `qwen3.8:27b-mq4-xts` | `qwen3.8-27b.mq4-xts` | 14.99 | 16 | q8 | MQ4V2 XT, symmetric (H2); int4-activation prefill on gfx1201/gfx1100/gfx1151; canonical dense fixture ([`AGENTS.md`](../AGENTS.md) §5) |
+| `qwen3.8:27b-mq4-xts` | `qwen3.8-27b.mq4-xts` | 14.99 | 16 | q8 | MQ4V2 XT, symmetric (H2); int4-activation prefill on gfx1201/gfx1100/gfx1151; canonical dense fixture (`pin:model/qwen3.8-27b.mq4-xts`, [`fixtures.md`](fixtures.md)) |
 | `qwen3.8:27b` | `qwen3.8-27b.mq4` | 15.66 | 17 | q8 | MQ4V2 base; default; effort-native (`low`/`medium`/`xhigh`, default `xhigh`); uncapped think span unless explicit integer cap |
 | `qwen3.8:27b-mq4-pro` | `qwen3.8-27b.mq4-pro` | 16.46 | 18 | q8 | MQ4V2 Pro |
 | `qwen3.8:27b-mq5-xt` | `qwen3.8-27b.mq5-xt` | 18.18 | 20 | q8 | MQ5V2 XT |
@@ -112,7 +112,7 @@ MQ2V2 is not registered. Explicit `qwen3.8:27b-mq4` aliases to `qwen3.8:27b`. Le
 
 | Tag | File (wire registry) | Size GB | Min VRAM | Notes |
 |---|---|---:|---:|---|
-| `qwen3.8:flash-next`, `qwen3.8:flash-next-mq4`, `qwen3.8:flash-next-gptq3`, `qwen3.8:flash-next-mq4-xts` | `qwen3.8-flash-next-base.mq4-xts` | 70.9 | 72 | MQ4 XTS split base; PLE rows from the shared sidecar pair (below) |
+| `qwen3.8:flash-next` (aliases `qwen3.8:flash`, `qwen3.8:flash-next-mq4`, `qwen3.8:flash-next-gptq3`, `qwen3.8:flash-next-mq4-xts`) | `qwen3.8-flash-next-base.mq4-xts` | 70.9 | 72 | MQ4 XTS split base; PLE rows from the shared sidecar pair (below) |
 | `qwen3.8:flash-next-mq3-xts` | `qwen3.8-flash-next-base.mq3-xts` | 59.1 | 64 | MQ3 XTS split base: W3 GPTQ on 16,839 of 24,576 routed experts, PLE rows from the shared sidecar (below) |
 | `qwen3.8:flash-next-mq2-xts` | `qwen3.8-flash-next-base.mq2-xts` | 46.9 | 48 | MQ2 XTS split base: 6,306 hot MQ4 XTS experts, E8P 2-bit on the other 18,270, PLE rows from the shared sidecar (below) |
 | `qwen3.8:flash-next-mq2-xts-4500` | `qwen3.8-flash-next-base.mq2-xts-4500` | 44.5 | 48 | MQ2 XTS split base: 4,500 hot MQ4 XTS experts, E8P 2-bit on the other 20,076, PLE rows from the shared sidecar (below) |
@@ -153,7 +153,7 @@ points at the monolithic files. No Hugging Face files are deleted or altered
 by the tag retirement below.
 The historical RTN-asymmetric `qwen3.8-flash-next.mq4`
 (`qwen3.8:flash-next-rtn-asym`) is a different artifact and is never migrated.
-Fixture identity and recipe history: [`AGENTS.md`](../AGENTS.md#pinned-flash-next-bench-fixture).
+Fixture identity and recipe history: [`fixtures.md`](fixtures.md#pinned-flash-next-bench-fixture) (values: `pin:model/qwen3.8-flash-next-base.mq4-xts` in [`fixtures/pins.toml`](../fixtures/pins.toml)).
 
 **Known limit: host RAM on a 16 GB card.** Measured sizing finding: an RX 9070 XT (16 GB) host with 64 GB RAM (TTM cap 31 GiB) cannot load Qwen3.8 Flash-Next, whose 38–61 GB of host-mapped routed experts exceed that cap. Flash-Next on a 16 GB card needs at least 128 GB of host RAM. (Details and the `HIPFIRE_EMU=rx9070xt` capacity profile: [`EMU.md`](EMU.md#measured-sizing-finding-flash-next-on-a-16-gb-card).)
 
@@ -164,8 +164,10 @@ Other Flash-Next identities, retained for provenance and not the default:
 | `qwen3.8:flash-next-rtn-asym` | `qwen3.8-flash-next.mq4` | 125.3 | 128 | **Retired**; previous RTN-asymmetric rung; existing verified local file still supported |
 | `qwen3.8:flash-next-mq6q8-pleq8` | `qwen3.8-flash-next.mq6q8-pleq8` | 125.5 | 128 | **Retired**; earlier rung; existing verified local file still supported |
 
-Only the two tags marked **Retired** are retired. New clients refuse
-`hipfire pull <retired-tag>` and name `qwen3.8:flash-next` as the replacement;
+Only the tags marked **Retired** are retired (these two and, since 0.5.0, the
+dense `qwen3.6:27b` and its draft `qwen3.6:27b-draft`). New clients refuse
+`hipfire pull <retired-tag>` and name the replacement (`qwen3.8:flash-next`;
+`qwen3.8:27b` / `qwen3.8:27b-draft-mq4` for the 3.6 27B pair);
 this also applies when the old file is already installed or `--force` is used.
 `run` and `serve` accept the old tag, bare filename or installed model path
 after SHA-256 and size verification, without redownloading it. An explicit
@@ -176,7 +178,7 @@ download. Local `hipfire list` marks installed models `[retired]` (JSON:
 exclude them.
 
 A compiled `RETIRED_MODELS` table preserves the repository, filename, SHA-256
-and size independently of the available catalog. Neither retired artifact had
+and size independently of the available catalog. No retired artifact had
 sidecar, overlay or hotset pins; none are invented. Local
 verification reuses the existing `VerifiedCache` in
 `<HIPFIRE_HOME>/cache/verified-artifacts.json`; unchanged verified files avoid
@@ -184,7 +186,7 @@ another full hash. Retirement does not invent overlay or hotset identities
 where none existed, migrate the old bytes, or delete or alter any Hugging Face
 object.
 
-Both retired entries are removed from the raw remote registry as well as the
+All retired entries are removed from the raw remote registry as well as the
 new client's bundled/loaded available view; no retirement wire fields are
 added. Source inspection shows that 0.4.2 rejects the new generic `ple` schema
 and falls back to its cache or bundle, not that it accepts the current wire
@@ -296,8 +298,8 @@ later loads skip the 125 GB read until the file changes.
 | `qwen3.5:9b-draft` | `qwen35-9b-dflash-mq4.hfq` | 0.55 | 6 | `qwen3.5:9b` |
 | `qwen3.5:27b-draft` | `qwen35-27b-dflash-mq4.hfq` | 0.92 | 16 | `qwen3.5:27b` |
 | `qwen3.5:27b-draft-mq3` | `qwen35-27b-dflash-mq3.hfq` | 0.67 | 12 | `qwen3.5:27b` (mq3 draft) |
-| `qwen3.6:27b-draft` | `qwen36-27b-dflash-mq4.hfq` | 0.92 | 16 | `qwen3.6:27b` |
-| `qwen3.6:27b-draft-mq3` | `qwen36-27b-dflash-mq3.hfq` | 0.67 | 12 | `qwen3.6:27b` |
+| `qwen3.6:27b-draft` | `qwen36-27b-dflash-mq4.hfq` | 0.92 | 16 | **Retired** in 0.5.0 with `qwen3.6:27b`; replacement `qwen3.8:27b-draft-mq4` |
+| `qwen3.6:27b-draft-mq3` | `qwen36-27b-dflash-mq3.hfq` | 0.67 | 12 | `qwen3.6:27b-mq3` |
 | `qwen3.8:27b-draft-mq3` | `qwen38-27b-dflash-mq3.hfq` | 0.98 | 16 | `qwen3.8:27b*` (same-bit alt) |
 | `qwen3.8:27b-draft-mq4` | `qwen38-27b-dflash-mq4.hfq` | 1.21 | 16 | `qwen3.8:27b*` (recommended controller) |
 | `qwen3.8:27b-draft-mq5` | `qwen38-27b-dflash-mq5.hfq` | 1.43 | 16 | `qwen3.8:27b*` (same-bit alt) |
@@ -306,7 +308,7 @@ later loads skip the 125 GB read until the file changes.
 
 DSpark draft sidecars are declared on the DeepSeek V4 Flash entries (`deepseek-v4-flash` → `deepseek-v4-flash-0731-dspark.mq2r`, `deepseek-v4-flash:mq2lloyd` → `deepseek-v4-flash-0731-dspark.mq2lloyd`, `deepseek-v4-flash-preview` → `deepseek-v4-flash-dspark.mq2lloyd`); the preview entry also declares an MTP sidecar (`deepseek-v4-flash-mtp.mq2lloyd`). `speculation` accepts `dspark` ([`CONFIG.md`](CONFIG.md#speculative-decode)); see [`GLOSSARY.md`](GLOSSARY.md) for the DSpark path.
 
-Draft **loading** is registry-driven: `hipfire pull <tag>` fetches the draft sidecar alongside the target, and `dflash_mode` / `speculation` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)) decides what happens next — the schema default `dflash_mode` is **`off`** (pull ≠ enable) with one registry-scoped exception: the Qwen3.8-27B tiers that declare a paired draft (`qwen3.8:27b` and the `mq3*` / `mq4*` tiers) get `auto` from the registry layer, so the draft is used when its file is present and the load keeps MTP `auto` when it is absent (which is AR for this Qwen35 producer, since it declares no measured AR floor; `--spec mtp` opts in; an explicit `dflash_mode=off` wins; [`CONFIG.md`](CONFIG.md#qwen38-27b-paired-dflash-default)). Elsewhere `auto` uses the sidecar when present (AR otherwise); `on` requires it and fails the load without it. Override the sidecar with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` or `run --model-draft`. Watch for `DFlash draft loaded:` in load output. Several tags may share one `dflash.file`; `hipfire rm` keeps that file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
+Draft **loading** is registry-driven: `hipfire pull <tag>` fetches the draft sidecar alongside the target, and `dflash_mode` / `speculation` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)) decides what happens next — the schema default `dflash_mode` is **`off`** (pull ≠ enable) with one registry-scoped exception: the Qwen3.8-27B tiers that declare a paired draft (`qwen3.8:27b` and the `mq3*` / `mq4*` / `mq5*` tiers) get `auto` from the registry layer, so the draft is used when its file is present and the load keeps MTP `auto` when it is absent (which is AR for this Qwen35 producer, since it declares no measured AR floor; `--spec mtp` opts in; an explicit `dflash_mode=off` wins; [`CONFIG.md`](CONFIG.md#qwen38-27b-paired-dflash-default)). The `mq5*` tiers also set `dflash_min_vram_gb: 28`: on a device with less total VRAM (a 24 GB card), `auto` skips their draft with one log line, because the draft plus KV growth runs out of memory there at ~5k context (#1151); `dflash_mode on` still forces it. The `mq6*` tiers declare no draft. Elsewhere `auto` uses the sidecar when present (AR otherwise); `on` requires it and fails the load without it. Override the sidecar with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` or `run --model-draft`. Watch for `DFlash draft loaded:` in load output. Several tags may share one `dflash.file`; `hipfire rm` keeps that file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
 
 Vision-tower **loading** is registry-driven the same way: every `qwen3.8:27b*` tier declares the shared `vision.file` (`qwen3.8-27b-vision.hfq`, llama.cpp mmproj-style), so `hipfire pull <tag>` fetches the tower once and every text quant tier serves images without requantizing the trunk. The loader opens the sidecar as a separate pack and applies it with the trunk's vision config. `vision_mode` ([`CONFIG.md`](CONFIG.md#vision-tower), [`env-vars.md`](env-vars.md)) decides what happens next — **`off`** never loads the tower (even an explicit `--vision` is skipped, the daemon's `dflash_mode=off`-style hard override, so those loads pay no tower VRAM); **`auto`** (the default) uses the registry/sibling sidecar when present and stays silently text-only when absent — the Qwen3.5/3.8-VL tower is loaded on demand from host/disk and streamed per block through two small VRAM staging buffers during each image encode, so a text load pays no resident tower VRAM; **`resident`** uploads the whole tower into VRAM at load (~0.94 GiB on the 27B) for the lowest first-image latency, with the same sidecar-missing behaviour as `auto`; `on` streams like `auto` but requires the declared sidecar and fails the load closed without it. A trunk with an embedded tower declares no sidecar and is unaffected by this key. Override per load with `run --vision` / `serve --vision` or `HIPFIRE_VISION_SIDECAR` (empty opts out); a `<trunk-stem>-vision.hfq` file beside the trunk is also discovered. `hipfire rm` keeps the shared file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
 
@@ -360,7 +362,7 @@ A separate, optional Flash-Next EP2 sidecar, `<model file name>.ep.hot-units` (t
 |---|---|---:|---:|---|
 | `deepseek-v4-flash` | `deepseek-v4-flash-0731.mq2r` | 82 | 96 | Current 0731 release, MQ2R (default SKU); KV `f32`; target-aligned DSpark sidecar; default low `reasoning_effort`, uncapped think span (no named budget) |
 | `deepseek-v4-flash:mq2lloyd` | `deepseek-v4-flash-0731.mq2lloyd` | 86.2 | 96 | Previous default (MQ2-Lloyd), retained; KV `f32`; DSpark sidecar |
-| `deepseek-v4-flash-preview` | `deepseek-v4-flash.mq2lloyd` | 82 | 96 | Prior preview package, retained under an explicit preview identity; declares MTP and DSpark sidecars |
+| `deepseek-v4-flash-preview` | `deepseek-v4-flash.mq2lloyd` | 82 | 96 | Prior preview package, retained under an explicit preview identity; declares MTP and DSpark sidecars. Same tensor census as `deepseek-v4-flash:mq2lloyd` but a different file (`nwoolmer/hipfire-deepseek-v4-flash`, sha256 `ab8a8900…` vs 0731 `521c9687…`), so it is not an alias |
 | `minimax-m2.7` | `MiniMax-M2.7.mq2` | 79.2 | 96 | arch_id=10 Mixtral-style MoE |
 | `north-mini-code` | `north-mini-code.mq4.hfq` | 16 | 24 | Cohere2-MoE arch_id=12; registry `sampling` block is **inert metadata** today |
 | `vibethinker:3b` | `vibethinker-3b.mq4.hfq` | 1.82 | 3.5 | Qwen2 MQ4 |
@@ -376,6 +378,8 @@ A separate, optional Flash-Next EP2 sidecar, `<model file name>.ep.hot-units` (t
 | `bonsai:27b-tq2` | `bonsai-27b.tq2` | 7.16 | 8 | q8 | TQ2G128 ternary, 2.125 bpw; the `bonsai` alias target |
 
 Registry `desc` carries dated KLD and tok/s figures for these tags; they are registry text, not a live baseline.
+
+These artifacts cannot be re-quantized with the current tree: they are passthroughs of PrismML's GGUF Q1_0 / Q2_0 blocks, and GGUF weight input to the quantizer was removed in 0.5.0 (see [GGUF](#gguf)). The published files keep loading; rebuilding them needs a pre-0.5.0 quantizer.
 
 ### Maple-Preview (natively ternary MoE)
 
@@ -395,7 +399,7 @@ Registry `desc` carries dated KLD and tok/s figures for these tags; they are reg
 | Tag | File | Size GB | Min VRAM | Notes |
 |---|---|---:|---:|---|
 | `flux.schnell:1` | `flux-schnell-transformer.hfq` | 23.8 | 24 | Step-distilled (4 default steps); pull fetches the trunk plus T5 / CLIP / VAE sidecars |
-| `flux.dev:1` | `flux-dev-transformer.hfq` | 23.8 | 24 | **Local-only placeholder**: FLUX.1-dev packs are not redistributable and are never uploaded |
+| `flux.dev:1` | `flux-dev-transformer.hfq` | 23.8 | 24 | **Not currently downloadable**: `hipfire-models/flux` was never published (HTTP 404, even for org members), so the row has no sha256 or size and `hipfire pull` fails. FLUX.1-dev packs are not redistributable; place locally built packs by hand |
 
 Served by `hipfire img <tag>` and `/v1/images/generations`; see [`IMAGEGEN.md`](IMAGEGEN.md) and [`CLI.md`](CLI.md).
 
@@ -403,9 +407,9 @@ Served by `hipfire img <tag>` and `/v1/images/generations`; see [`IMAGEGEN.md`](
 
 | Tag | File | Size GB | Min VRAM | Notes (registry `desc`) |
 |---|---|---:|---:|---|
-| `lfm2.5:350m` | `lfm2.5-350m.q8` | 0.38 | 1.9 | 350M dense; default artifact is **Q8** file |
-| `lfm2.5:1.2b` | `lfm2.5-1.2b.mq4` | 0.7 | 2.2 | 1.2B Instruct dense |
-| `lfm2.5:1.2b-thinking` | `lfm2.5-1.2b-thinking.mq4` | 0.7 | 2.2 | 1.2B Thinking dense |
+| `lfm2.5:350m` | `lfm2.5-350m.q8` | 0.38 | 1.9 | 350M dense; every tensor Q8F16 |
+| `lfm2.5:1.2b` | `lfm2.5-1.2b.mq4` | 0.7 | 2.2 | 1.2B Instruct dense; MQ4 (qt=13) with Q8F16 non-matmul tensors |
+| `lfm2.5:1.2b-thinking` | `lfm2.5-1.2b-thinking.mq4` | 0.7 | 2.2 | 1.2B Thinking dense; MQ4 (qt=13) with Q8F16 non-matmul tensors |
 | `lfm2.5:8b-a1b` | `lfm2.5-8b-a1b.mq4` | 4.66 | 6.2 | 8B-A1B MoE |
 
 Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) with `repeat_penalty` 1.05 — applied by the CLI resolver. Do not treat a registry `sampling` field as active defaults.
@@ -594,6 +598,89 @@ directory, so run it somewhere disposable or delete them afterwards. `--format
 q4k` is refused at load: Q4K (qt=4) is a GGUF/Maple-side container outside the
 dense HFQ decode set, which this encoder's host decoder does not implement.
 
+### LightOnOCR-3 0.8B (arch 5 — local-only row, no Hub artifact)
+
+`lightonai/LightOnOCR-3-0.8B` — Apache-2.0 document-OCR VLM on the
+Qwen3.5-VL architecture (24 hybrid DeltaNet/`full_attention` layers, tied
+248,320 vocab, `model.visual.*` patch-16 ViT tower). Registered local-only
+as `lightonocr3:0.8b` (aliases `lightonocr3`, `lightonocr3:0.8b-mq4`); the
+family `lightonocr3`/`lightonocr` maps to arch 5 in `scripts/registry_gen.py`.
+
+| Tag | File | Size GB | Min VRAM | Notes |
+|---|---|---:|---:|---|
+| `lightonocr3:0.8b` | `lightonocr3-0.8b.mq4` | 0.56 | 2 | MQ4G256V2 trunk (0.52 GiB); `--vision-only` sidecar `lightonocr3-0.8b.vl` (0.21 GiB, F16 tower) declared in the `vision` slot |
+| `lightonocr3:0.8b-q8` | `lightonocr3-0.8b.q8` | 0.82 | 2 | Q8 trunk (all weights Q8 interleaved, embed/norms F16; 0.77 GiB) — the high-fidelity tier; same shared `lightonocr3-0.8b.vl` tower pack (byte-identical F16 bytes) |
+
+Build from a flat copy of the whole HF snapshot, in one directory:
+`model.safetensors`, `config.json`, `generation_config.json`,
+`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`,
+`vocab.json`, `merges.txt`, `preprocessor_config.json` and
+`processor_config.json`. The trunk quantizer reads `config.json` from that
+directory (a `source/` subdirectory is not descended into), and it folds
+`chat_template.jinja` into the embedded `tokenizer_config` when the latter
+carries no inline template — so the template file is an input, not decoration.
+
+```bash
+hipfire quantize <snapshot-dir> --format mq4 --output <out>/lightonocr3-0.8b.mq4
+hipfire quantize <snapshot-dir> --format q8  --output <out>/lightonocr3-0.8b.q8
+# vision tower, once per quant dir — <stem>.vl (the quant suffix is stripped):
+hipfire-quantize --input <snapshot-dir> --vision-only \
+    --output <out>/lightonocr3-0.8b.vl          # one pack, both trunks
+```
+
+The registry pins are exactly what those three commands emit:
+
+| File | Size (B) | SHA-256 |
+|---|---:|---|
+| `lightonocr3-0.8b.mq4` | 557,869,696 | `578bc68062822f960823d5fe987ea1e5125d3e56b81f489ef27e2e877a1189c0` |
+| `lightonocr3-0.8b.q8` | 822,227,584 | `8fa2093744a69d67b553875bcc1695fd039665938bcddaa29072005639fc2a4e` |
+| `lightonocr3-0.8b.vl` | 227,722,240 | `708c7b798b075c3b6f1a2c50b0d4fca3ffd4eebb8ff220baadcb5762360e9079` |
+
+`sha256sum` the outputs against that table after building. The **embedded
+metadata is part of the identity**: `config.json`, `generation_config.json`,
+`tokenizer.json`, `tokenizer_config.json` (with `chat_template.jinja` folded
+in) are serialized into the container, and the data starts on a 4096-byte
+boundary after them. Dropping `chat_template.jinja` alone takes the MQ4 file
+to 557,865,600 B / `3db40068…` — one page smaller, no weight changed — which is
+exactly how a build from an incomplete snapshot ends up "not reproducing" the
+row. Keep the snapshot complete, and re-pin only if the table above stops
+matching.
+
+Put the artifacts wherever your local catalog points: register them in
+`~/.hipfire/models.toml` with absolute paths (one quant per directory, the
+store convention), or drop them in `~/.hipfire/models/`, which the registry
+lookup falls back to — either tag then resolves from there.
+
+The model card's trained default is thinking **off**; the registry row lowers
+it as `recommended_settings` (`reasoning_effort: none`, temperature 0.2,
+top_p 0.9), and a request that wants the card's sampling sends those fields
+itself. (Measured on gfx1100: a request that omits `reasoning_effort` returns
+the same page text in `content`, so this is the card's setting, not a
+requirement for getting text back.) The card's prompt modes work verbatim: an
+empty prompt transcribes the page, `grounding` returns
+`![label](x0,y0,x1,y1)` bounding boxes in 0–1000 coordinates. Image turns need
+the tower; `vision_mode` defaults to `auto`, so a `<stem>.vl` beside the trunk
+loads with no configuration:
+
+```bash
+hipfire config lightonocr3:0.8b set vision.mode auto        # auto is the default
+# One-shot: transcription is an empty prompt (add "grounding" for boxes).
+hipfire run lightonocr3:0.8b "" --image page.png
+hipfire run lightonocr3:0.8b grounding --image page.png
+# Served, with the card's sampling:
+hipfire serve lightonocr3:0.8b-q8 127.0.0.1:9425
+curl -s 127.0.0.1:9425/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"lightonocr3:0.8b-q8","reasoning_effort":"none","temperature":0.2,
+       "top_p":0.9,
+       "messages":[{"role":"user","content":[{"type":"image_url",
+       "image_url":{"url":"data:image/png;base64,<page bytes>"}}]}]}'
+```
+
+Measured on gfx1100 with a 7812-patch page: `run --image` on the MQ4 tier
+prefills 1908 vision rows in 121 ms and decodes 1107 tokens in 2.7 s; the q8
+serve request returns the same text with `finish_reason: length` at the token
+budget.
+
 ---
 
 ## Aliases
@@ -608,7 +695,7 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `qwen3.5:latest` | `qwen3.5:9b` |
 | `qwen3.5:small` | `qwen3.5:0.8b` |
 | `qwen3.5:large` | `qwen3.5:27b` |
-| `qwen3.6` / `qwen3.6:a3b` | `qwen3.6:35b-a3b` |
+| `qwen3.6` / `qwen3.6:a3b` / `qwen3.6:35b-a3b-mq4p` | `qwen3.6:35b-a3b` |
 | `ornith` / `ornith-1.5` / `ornith1.5` / `ornith1.5:35b-a3b` | `ornith-1.5:35b-a3b` |
 | `ornith-1.5:fast` / `ornith-1.5:35b-a3b-fast` | `ornith-1.5:35b-a3b-mq4r` |
 | `qwen3.8` / `qwen3.8:latest` | `qwen3.8:27b` |
@@ -626,11 +713,13 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `deepseek4:mq2lloyd` / `deepseek-v4:mq2lloyd` / `deepseek-v4-flash-0731:mq2lloyd` / `ds4:mq2lloyd` (also `:0731-mq2lloyd`) | `deepseek-v4-flash:mq2lloyd` |
 | `deepseek4:preview` / `deepseek-v4:preview` / `ds4:preview` | `deepseek-v4-flash-preview` |
 | `bonsai` | `bonsai:27b-tq2` |
-| `qwen3.8:flash` | `qwen3.8:flash-next` |
+| `qwen3.8:flash` / `qwen3.8:flash-next-mq4` / `qwen3.8:flash-next-gptq3` / `qwen3.8:flash-next-mq4-xts` | `qwen3.8:flash-next` |
 | `muse-glimmer:30b-draft` / `muse-glimmer:30b:draft` / `muse-glimmer-30b:draft` | `muse-glimmer:draft` |
 | `vibethinker` | `vibethinker:3b` |
 | `qwen3.5:*-mq4` / `*-hf4` / several `*-hf6` | same-size primary or mq6 tag (see registry) |
 | `qwen3.5:9b:draft` etc. | matching `*-draft` tags |
+| `lightonocr3` / `lightonocr3:0.8b-mq4` | `lightonocr3:0.8b` |
+| `lightonocr3:q8` | `lightonocr3:0.8b-q8` |
 
 ---
 
@@ -641,7 +730,7 @@ Runtime dispatch uses HFQ `arch_id` ([`architecture-ids.md`](architecture-ids.md
 | Family | arch_id | Crate | Registry examples |
 |---|---:|---|---|
 | LLaMA / Mistral / plain Qwen3 path | 0 / 1 | `hipfire-arch-llama` | `qwen3:8b`, `qwen3:0.6b` (HF4 dense) |
-| Qwen3.5 dense hybrid | 5 | `hipfire-arch-qwen35` | `qwen3.5:*`, `qwen3.6:27b`, `qwen3.8:27b*`, carnice/qwopus dense |
+| Qwen3.5 dense hybrid | 5 | `hipfire-arch-qwen35` | `qwen3.5:*`, `qwen3.6:27b-mq3` (and the retired `qwen3.6:27b`), `qwen3.8:27b*`, carnice/qwopus dense, `lightonocr3:0.8b` (VL) |
 | Qwen3.5 / 3.6 MoE A3B | 6 | `hipfire-arch-qwen35` | `*:35b-a3b*`, `ornith-1.5:35b-a3b*`, `nex-n2:mini` |
 | Qwen2 | 7 | `hipfire-arch-qwen2` | `vibethinker:3b`, `vibethinker:3b-mq6` (support, not admission) |
 | DeepSeek V4 Flash | 9 | `hipfire-arch-deepseek4` | `deepseek-v4-flash`, `deepseek-v4-flash:mq2lloyd`, `deepseek-v4-flash-preview` |
@@ -692,15 +781,9 @@ See [`QUANTIZE.md`](QUANTIZE.md) and [`QUANTIZATION.md`](QUANTIZATION.md).
 
 Requires `config.json` + `.safetensors`. Architectures the **engine** loads are those with arch crates / loaders above; the quantizer may accept more shapes than inference can run.
 
-### GGUF (deprecated, removal in 0.5.0)
+### GGUF
 
-GGUF weight input is deprecated since 0.4.0: GGUF→mqN is lossy double quantization; use llama.cpp for GGUF.
-
-```bash
-hipfire quantize ./model.Q4_K_M.gguf --install --register my:tag
-```
-
-Dequant path support is format-specific (common Q4_0 / Q8_0 / Q4_K / Q6_K / F16 / BF16 / F32). Unsupported GGUF quants fail closed in the quantizer.
+GGUF **weight** input to the quantizer was removed in 0.5.0: GGUF→mqN is lossy double quantization; quantize from the original safetensors, or use llama.cpp for GGUF. `hipfire quantize` refuses a `.gguf` input with an error naming the removal.
 
 #### GGUF-native serving (developer tools, gfx1201, default off)
 
@@ -713,10 +796,10 @@ With `HIPFIRE_GGUF_NATIVE=1`, `eval_hipfire`, `bench_qwen35_mq4` and `gguf_nativ
 ```text
 ~/.hipfire/models/
   <registry file names>
-  optional sibling drafts (DFlash / DSpark / MTP / vision sidecars); legacy .triattn*.bin sidecars (CASK, deprecated since 0.4.0, removal in 0.5.0)
+  optional sibling drafts (DFlash / DSpark / MTP / vision sidecars)
 ```
 
-Extension hints (loader recognizes several): `.mq4`, `.mq6`, `.mq4p`, `.mq4r`, `.mq2`, `.mq2lloyd`, `.mq2r`, `.mfp4`, `.hf4`, `.hf6`, `.hfq`, `.q8`, and related graded names as produced by quant tooling. Exact dtype routing is loader/kernel source, not this table. Selecting the MQ4R and DeepSeek V4 MQ2R routes by file extension is **deprecated since 0.4.0, removal in 0.5.0** (0.5.0 selects by HFQ metadata; no runtime warning).
+Extension hints (loader recognizes several): `.mq4`, `.mq6`, `.mq4p`, `.mq4r`, `.mq2`, `.mq2lloyd`, `.mq2r`, `.mfp4`, `.hf4`, `.hf6`, `.hfq`, `.q8`, and related graded names as produced by quant tooling. Exact dtype routing is loader/kernel source, not this table. Selecting the MQ4R / MQ4RS and DeepSeek V4 MQ2R routes by file extension was **removed in 0.5.0**: the route is selected by HFQ metadata, falling back to the registry card `quant`.
 
 ---
 

@@ -38,12 +38,6 @@ mod kernels {
     pub const CONV1D_SILU_SPLIT_SRC: &str =
         include_str!("../../../kernels/src/conv1d_silu_split.hip");
     #[cfg(not(feature = "deltanet"))]
-    pub const CONV1D_SILU_SPLIT_TREE_SRC: &str =
-        include_str!("../../../kernels/src/conv1d_silu_split_tree.hip");
-    #[cfg(not(feature = "deltanet"))]
-    pub const GATED_DELTA_NET_Q8_TREE_SRC: &str =
-        include_str!("../../../kernels/src/gated_delta_net_q8_tree.hip");
-    #[cfg(not(feature = "deltanet"))]
     pub const SCALE_F32_SRC: &str = include_str!("../../../kernels/src/scale_f32.hip");
     #[cfg(not(feature = "deltanet"))]
     pub const GATED_NORM_SRC: &str = include_str!("../../../kernels/src/gated_norm.hip");
@@ -117,7 +111,7 @@ pub enum RegistryError {
 }
 
 fn prepend_kv_slot_desc(body: &str) -> String {
-    // Same assembly as attention.rs `ensure_givens4_kernel`.
+    // Same assembly as attention.rs `ensure_kernel` callers of kv_slot_desc.h.
     format!(
         "{}\n{}",
         kernels::KV_SLOT_DESC_H,
@@ -156,27 +150,21 @@ fn q8_flash_prefill_wmma_gfx11_hd256_source() -> String {
 }
 
 fn assemble_asym(body: &str) -> String {
-    // The slot descriptor appears in asym3 but not all the other asym bodies.
+    // Same assembly as attention.rs `ensure_fwht_kv_kernel`. The slot
+    // descriptor appears in asym3 but not all the other asym bodies.
     let needs_slot = body.contains("#include \"kv_slot_desc.h\"");
     let stripped = body
         .replace("#include \"turbo_common.h\"", "")
-        .replace("#include \"givens_common.h\"", "")
         .replace("#include \"kv_slot_desc.h\"", "");
     if needs_slot {
         format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}",
             kernels::TURBO_COMMON_H,
-            kernels::GIVENS_COMMON_SRC,
             kernels::KV_SLOT_DESC_H,
             stripped
         )
     } else {
-        format!(
-            "{}\n{}\n{}",
-            kernels::TURBO_COMMON_H,
-            kernels::GIVENS_COMMON_SRC,
-            stripped
-        )
+        format!("{}\n{}", kernels::TURBO_COMMON_H, stripped)
     }
 }
 
@@ -252,16 +240,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         kernels::CONV1D_SILU_SPLIT_SRC,
         ["conv1d_silu_split_f32", "conv1d_silu_split_f32_masked",]
     );
-    add!(
-        "conv1d_silu_split_tree",
-        kernels::CONV1D_SILU_SPLIT_TREE_SRC,
-        ["conv1d_silu_split_tree_f32"]
-    );
-    add!(
-        "gated_delta_net_q8_tree",
-        kernels::GATED_DELTA_NET_Q8_TREE_SRC,
-        ["gated_delta_net_q8_tree"]
-    );
     add!("sigmoid_mul", kernels::SIGMOID_MUL_SRC, ["sigmoid_mul_f32"]);
     add!("topk_logits", kernels::TOPK_LOGITS_SRC, ["topk_logits_f32"]);
     add!("scale_f32", kernels::SCALE_F32_SRC, ["scale_f32"]);
@@ -318,6 +296,25 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gated_delta_net_q8",
             "gated_delta_net_q8_independent_masked",
         ]
+    );
+    // Q8 DeltaNet recurrence of the default (Q8 state) Qwen3.5/3.6 route: the
+    // fast kernel (`Gpu::gated_delta_net_q8`, no per-token requant) and its
+    // stream twin (`gdn_seq_check_plan`, the Sequential canonical-prefill
+    // plan every Q8 layer resolves to outside the Scan64 admission: 9B
+    // dense, A3B/MoE off gfx1201, gfx9). Neither launcher has an arch gate,
+    // and since #1136 the source compiles for wave64 targets too.
+    add!(
+        "gated_delta_net_q8_fast",
+        kernels::GATED_DELTA_NET_Q8_FAST_SRC,
+        [
+            "gated_delta_net_q8_fast",
+            "gated_delta_net_q8_fast_independent_masked",
+        ]
+    );
+    add!(
+        "gated_delta_net_q8_fast_stream",
+        kernels::GATED_DELTA_NET_Q8_FAST_STREAM_SRC,
+        ["gated_delta_net_q8_fast_stream"]
     );
     // DFlash verify tape capture (`Gpu::tape_copy_batched`, tape_copy.rs): the
     // kernel source has no arch guard and the launcher no arch gate
@@ -440,11 +437,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "fused_gate_up_hfq4g256_stage_x32_gfx1100",
             kernels::FUSED_GATE_UP_HFQ4G256_STAGE_X32_GFX1100_SRC,
             ["fused_gate_up_hfq4g256_stage_x32_gfx1100"]
-        );
-        add!(
-            "kv_cache_write_asym3_q8_pair_gfx1100",
-            assemble_asym(kernels::KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC),
-            ["kv_cache_write_asym3_q8_pair_gfx1100"]
         );
         // Default-on int8 small-batch verify GEMV (`gemv_q8x.rs`): the
         // activation quantizer and every v4/v3 batch x residual variant, each
@@ -583,28 +575,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
 
-    // KV paths: precompile's asym3/q8 assembly mirrors the runtime header
+    // KV paths: precompile's q8 assembly mirrors the runtime header
     // stripping; FP8 substitutions are only admitted for observed gfx1201.
-    add!(
-        "kv_cache_write_asym_k_givens3",
-        assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC),
-        ["kv_cache_write_asym_k_givens3"]
-    );
-    add!(
-        "kv_cache_write_asym_k_givens3_batched",
-        assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC),
-        ["kv_cache_write_asym_k_givens3_batched"]
-    );
-    add!(
-        "attention_flash_asym3_tile",
-        assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_SRC),
-        ["attention_flash_asym3_tile"]
-    );
-    add!(
-        "attention_flash_asym3_tile_batched",
-        assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC),
-        ["attention_flash_asym3_tile_batched"]
-    );
     add!(
         "attention_flash_asym_reduce_batched",
         kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
@@ -684,9 +656,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         kernels::ATTENTION_FLASH_Q8_0_REDUCE_SKIP_SRC,
         ["attention_flash_q8_0_reduce_skip"]
     );
-    // Multi-slot (slot-descriptor) launches of the q8 and asym3 KV routes run
+    // Multi-slot (slot-descriptor) launches of the q8 KV route run
     // separately named `*_paged` modules (attention.rs `ensure_kv_slot_kernel`,
-    // `ensure_givens4_kv_slot_kernel`, `attention_q8_0_flash_prefill_wmma_slots`).
+    // `ensure_fwht_kv_slot_kernel`, `attention_q8_0_flash_prefill_wmma_slots`).
     add!(
         "kv_cache_write_q8_0_batched_paged",
         kernels::kv_slot_desc_paged_source(
@@ -707,30 +679,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     );
     add!(
         "attention_flash_q8_0_tile_batched_paged",
-        kernels::kv_slot_givens4_paged_source(
+        kernels::kv_slot_fwht_paged_source(
             kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
             "attention_flash_q8_0_tile_batched",
             "attention_flash_q8_0_tile_batched_paged"
         ),
         ["attention_flash_q8_0_tile_batched_paged"]
-    );
-    add!(
-        "kv_cache_write_asym_k_givens3_batched_paged",
-        kernels::kv_slot_givens4_paged_source(
-            kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC,
-            "kv_cache_write_asym_k_givens3_batched",
-            "kv_cache_write_asym_k_givens3_batched_paged"
-        ),
-        ["kv_cache_write_asym_k_givens3_batched_paged"]
-    );
-    add!(
-        "attention_flash_asym3_tile_batched_paged",
-        kernels::kv_slot_givens4_paged_source(
-            kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,
-            "attention_flash_asym3_tile_batched",
-            "attention_flash_asym3_tile_batched_paged"
-        ),
-        ["attention_flash_asym3_tile_batched_paged"]
     );
     if matches!(arch, "gfx1100" | "gfx1151") {
         // gfx11 admits the multi-slot WMMA prefill tile by default
@@ -857,14 +811,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "fused_silu_mul_mq_rotate_awq",
             kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC,
             ["fused_silu_mul_mq_rotate_awq"]
-        );
-        add!(
-            "gated_delta_net_q8_fast",
-            kernels::GATED_DELTA_NET_Q8_FAST_SRC,
-            [
-                "gated_delta_net_q8_fast",
-                "gated_delta_net_q8_fast_independent_masked",
-            ]
         );
         add!(
             "gdn_pre_batched_gfx1201",
@@ -1270,7 +1216,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::CONV1D_GATED_DECODE_SRC,
             ["conv1d_gated_decode_f32"]
         );
-        add!("sample_top_p", kernels::SAMPLE_TOP_P_SRC, ["sample_top_p"]);
         add!(
             "sample_rows_pf",
             kernels::SAMPLE_ROWS_PF_SRC,
@@ -1400,14 +1345,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "fused_silu_mul_mq_rotate_awq_i4_hin",
             kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_SRC,
             ["fused_silu_mul_mq_rotate_awq_i4_hin"]
-        );
-        add!(
-            "gated_delta_net_q8_fast",
-            kernels::GATED_DELTA_NET_Q8_FAST_SRC,
-            [
-                "gated_delta_net_q8_fast",
-                "gated_delta_net_q8_fast_independent_masked"
-            ]
         );
         add!(
             "gdn_chunk_prep_gfx11",
@@ -1746,7 +1683,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "fn_gdn_dense_gate_bf16in",
                 "fn_gdn_dense_gate_i8",
                 "fn_gdn_dense_gate_i8_p12",
-                "fn_gdn_dense_gate_rotate_bf16in"
+                "fn_gdn_dense_gate_rotate_bf16in",
+                "fn_gdn_dense_ring_to_stream",
+                "fn_gdn_dense_ring_from_stream",
+                "fn_gdn_dense_stream_consts"
             ]
         );
         add!(
@@ -2351,6 +2291,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemm_q8_0_wmma_gfx1151_xlds",
             kernels::GEMM_Q8_0_WMMA_GFX1151_XLDS_SRC,
             ["gemm_q8_0_wmma_gfx1151_xlds"]
+        );
+        // Exact-gfx1151 1..=16-row F16-weight WMMA (DSpark drafter head; same switch).
+        add!(
+            "gemm_f16_wmma_gfx1151_xlds",
+            kernels::GEMM_F16_WMMA_GFX1151_XLDS_SRC,
+            ["gemm_f16_wmma_gfx1151_xlds"]
         );
         add!(
             "gemm_mqv2_wmma_gfx1151_mw_lds",
@@ -3850,6 +3796,54 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             crate::tensor_ops::QSA_LANES_FUSE_SRC.into(),
             extra_flags,
         ));
+        // Flash-Next default route on exact gfx1201, loaded after ready on a cold
+        // kernel cache (one-shot `hipfire run`, R9700, 2026-11-14): the lane WMMA
+        // GEMMs (`lane_wmma.rs`, HIPFIRE_QWEN4_LANE_WMMA default on) and their
+        // tuned prefill tiles (`lane_wmma_tile.rs`, HIPFIRE_QWEN4_PREFILL_LWMMA_TILE
+        // default on) of 16..511-row prefill/verify, and the MQ6 symmetric-grid
+        // check the A8 trunk runs at load (`Gpu::qwen4_mq6_sym_check`).
+        entries.push(entry(
+            arch,
+            "qwen4_lane_wmma",
+            &QWEN4_LANE_WMMA_SYMBOLS,
+            crate::lane_wmma::LANE_WMMA_SRC.into(),
+            extra_flags,
+        ));
+        add!(
+            "qwen4_lwmma_tile",
+            crate::lane_wmma_tile::LANE_WMMA_TILE_SRC,
+            [
+                "lwmma_tile_bf16_t1_b32x32w2x1g4",
+                "lwmma_tile_bf16_t1_b32x64w2x2",
+                "lwmma_tile_bf16_t1_b64x64w4x1",
+                "lwmma_tile_bf16_t2_b16x32w1x1g4",
+                "lwmma_tile_bf16_t2_b32x64w2x2",
+                "lwmma_tile_bf16_t2_b64x64w4x1",
+                "lwmma_tile_bf16_t2_b64x64w4x2",
+                "lwmma_tile_bf16_t2_b32x128w2x2",
+                "lwmma_tile_bf16_t2_b64x128w4x2",
+                "lwmma_tile_bf16_t2_b64x128w2x4",
+            ]
+        );
+        add!(
+            "qwen4_mq6_sym_check_gfx1201",
+            crate::kernels::QWEN4_MQ6_SYM_CHECK_GFX1201_SRC,
+            ["qwen4_mq6_sym_check_gfx1201"]
+        );
+        // Flash-Next wide-pass gate/up (`moe32_gu_applies`, HIPFIRE_QWEN4_MOE32_GU
+        // default on, exact gfx1201, 9..=verify-window rows of the 1280 x 2560
+        // expert projection; gemm.rs:51078).
+        add!(
+            "gemm_mq4g256v2_moe_grouped_top10_g32",
+            kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+            [
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r8",
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r4",
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r4_pair",
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r8_nodz",
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r4_nodz",
+            ]
+        );
         // Default >= 512-row prefill: BF16 -> F16 WMMA projections (HC
         // input_mix_down 160 x 80 split-K tile + reducer, router/shared 128 x
         // 128, wider projections 128 x 256), the HC read-up tile, and the
@@ -3945,6 +3939,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "qwen4_moe_group_prefix",
                 "qwen4_moe_group_scatter",
             ]
+        );
+        // Down A4 producer of the A3B symmetric IU4 expert route (down k == 512; the
+        // embedded K3 producer serves only k == 640).
+        add!(
+            "qwen4_moe_rotate128_i4",
+            kernels::QWEN4_MOE_ROTATE128_I4_SRC,
+            ["qwen4_moe_rotate128_i4"]
         );
         add!(
             "qwen4_moe_sym_check_gfx1100",
@@ -4951,15 +4952,6 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         kernels::FUSED_QKVZA_Q8_0_SRC,
         ["fused_qkvza_q8_0"]
     );
-    // ParoQ4G64 scalar projections and its group-sized out-of-place rotation;
-    // these launchers have no architecture gate.
-    add!("gemm_hfq4g64", kernels::GEMM_HFQ4G64_SRC, ["gemm_hfq4g64"]);
-    add!("gemv_hfq4g64", kernels::GEMV_HFQ4G64_SRC, ["gemv_hfq4g64"]);
-    add!(
-        "givens_rotate_to_g64_f32",
-        kernels::GIVENS_ROTATE_TO_G64_SRC,
-        ["givens_rotate_to_g64_f32"]
-    );
     // DFlash2's HC-state mean capture uses the same scalar source on all arches.
     add!(
         "hc_mean_capture",
@@ -5073,7 +5065,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     // sink, source constant and symbol are the ones named below, symbol ==
     // module unless noted). RDNA-core arches only.
     if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
-        // Sampled DFlash (`HIPFIRE_DFLASH_FAST_SAMPLE` default on): sampling.rs
+        // Sampled DFlash: sampling.rs
         // `batched_categorical_sample_f32` / `chain_accept_spec_f32`.
         add!(
             "batched_categorical_sample",
@@ -5701,7 +5693,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     }
     // Batched Q8_0 flash tile (`attention_flash_q8_0_tile_batched` /
     // `_masked` / windowed callers, attention.rs `launch_asym_flash_batched`);
-    // gfx1100 carries it above. Source goes through `ensure_givens4_kernel`'s
+    // gfx1100 carries it above. Source goes through `ensure_fwht_kv_kernel`'s
     // strip-and-prepend, i.e. `assemble_asym`.
     if matches!(arch, "gfx1151" | "gfx1201") {
         add!(
@@ -6499,9 +6491,38 @@ static QSA_LANES_FUSE_SYMBOLS: std::sync::LazyLock<Vec<&'static str>> =
             .collect()
     });
 
+/// `qwen4_lane_wmma` exports (`kernels/src/qwen4_lane_wmma.gfx1201.hip` generator
+/// macros): `lwmma_gemm_<w>_t<T>_m<M>_n<N>`, `lwmma_gemm_bf16_t2_m<M>_n1_multi` and
+/// `lwmma_read_up_<w>_t<T>_g<G>`.
+static QWEN4_LANE_WMMA_NAMES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    let mut names = Vec::new();
+    for w in ["bf16", "w8"] {
+        for t in 1..=3 {
+            for m in 1..=4 {
+                for n in 1..=2 {
+                    names.push(format!("lwmma_gemm_{w}_t{t}_m{m}_n{n}"));
+                }
+            }
+        }
+    }
+    for m in 1..=4 {
+        names.push(format!("lwmma_gemm_bf16_t2_m{m}_n1_multi"));
+    }
+    for w in ["bf16", "w8"] {
+        for t in 1..=3 {
+            for g in [1, 2, 4] {
+                names.push(format!("lwmma_read_up_{w}_t{t}_g{g}"));
+            }
+        }
+    }
+    names
+});
+static QWEN4_LANE_WMMA_SYMBOLS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| QWEN4_LANE_WMMA_NAMES.iter().map(String::as_str).collect());
+
 /// JIT modules that the admitted default Redline programs load
-/// (`hipfire-runtime` `retained_redline_default`: MQ4R on gfx1100/gfx1151/
-/// gfx1201, Qwen3.5 dense on gfx1201, DeepSeek4 MQ2R on gfx1151) and that the
+/// (`hipfire-runtime` `retained_redline_default`: the MQ4R SKU on gfx1100/gfx1151/
+/// gfx1201, Qwen3.5 dense on gfx1201, the DeepSeek4 MQ2R SKU on gfx1151) and that the
 /// installer inventory [`entries`] does not carry. Module names are the ones
 /// the programs' captures record; each source is the expression the cited
 /// launcher passes to `ensure_kernel` on the default route. railgun's JIT
@@ -7319,7 +7340,6 @@ pub enum KernelSpecRoute {
     Ar,
     NativeMtp,
     DFlash,
-    DDTree,
     DSpark,
 }
 
@@ -11482,7 +11502,7 @@ mod tests {
             assert!(by_name.contains_key(module), "missing P0 module {module}");
             count += 1;
         }
-        assert_eq!(count, 92);
+        assert_eq!(count, 86);
         // Modules added since the P0 capture: the scalar-prefill runtime's BR/BC
         // specialization, the `HIPFIRE_G12_DEC_NORM` decode twins, the five
         // multi-slot `*_paged` modules of the q8/asym3 routes, the H2 decode /
@@ -11493,10 +11513,10 @@ mod tests {
         // gathers, the 27B AR route's plain q8 attention and slab sigmoid
         // producer, plus the opt-in twins, decode twins, QSA modules, slab
         // planner, pruned router, Q8 wide module, the fast narrow Q8 GEMV
-        // module and DFlash-draft overwrite twins and the one-token-per-wave HC read-up twin. Those 160 are the pre-S1 inventory; the S1 slow-link kernels
+        // module and DFlash-draft overwrite twins and the one-token-per-wave HC read-up twin. Those 158 are the pre-S1 inventory; the S1 slow-link kernels
         // add exactly the modules in `S1_ADDED_MODULES` (not P0 modules, not
         // in the provenance fixture), each its own isolated source.
-        const PRE_S1_ADDED_SINCE_P0: usize = 160;
+        const PRE_S1_ADDED_SINCE_P0: usize = 158;
         const S1_ADDED_MODULES: [&str; 1] = ["slowlink_prefill"];
         for module in S1_ADDED_MODULES {
             assert!(by_name.contains_key(module), "missing S1 module {module}");
@@ -11581,17 +11601,12 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // Later ParoQ4G64 and DFlash2 launchers add their own modules, not P0 rows.
-        const G64_AND_HC_CAPTURE_ADDED_MODULES: [&str; 4] = [
-            "gemm_hfq4g64",
-            "gemv_hfq4g64",
-            "givens_rotate_to_g64_f32",
-            "hc_mean_capture",
-        ];
-        for module in G64_AND_HC_CAPTURE_ADDED_MODULES {
+        // Later DFlash2 launchers add their own modules, not P0 rows.
+        const HC_CAPTURE_ADDED_MODULES: [&str; 1] = ["hc_mean_capture"];
+        for module in HC_CAPTURE_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
-                "missing G64/HC capture module {module}"
+                "missing HC capture module {module}"
             );
             assert!(
                 !expected
@@ -11719,12 +11734,8 @@ mod tests {
             );
         }
         // Shared-launcher modules the packs lacked (LFM2 decode, plain Q8 GEMV).
-        const SHARED_LAUNCHER_ADDED_MODULES: [&str; 4] = [
-            "rope",
-            "conv1d_gated_decode",
-            "sample_top_p",
-            "sample_rows_pf",
-        ];
+        const SHARED_LAUNCHER_ADDED_MODULES: [&str; 3] =
+            ["rope", "conv1d_gated_decode", "sample_rows_pf"];
         for module in SHARED_LAUNCHER_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
@@ -12189,6 +12200,29 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Default-route modules a cold empty-cache run JIT-compiled after the pack:
+        // the canonical-GDN Sequential stream executor (9B, A3B) and the gfx1201
+        // Flash-Next lane WMMA, prefill tile, MQ6 symmetric check and wide-pass
+        // gate/up modules.
+        const PACK_FIX_ADDED_MODULES: [&str; 5] = [
+            "gated_delta_net_q8_fast_stream",
+            "qwen4_lane_wmma",
+            "qwen4_lwmma_tile",
+            "qwen4_mq6_sym_check_gfx1201",
+            "gemm_mq4g256v2_moe_grouped_top10_g32",
+        ];
+        for module in PACK_FIX_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing pack-fix module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -12202,7 +12236,7 @@ mod tests {
                 + MQ6_I8_ADDED_MODULES.len()
                 + HC_DOWN_FUSED_ADDED_MODULES.len()
                 + SHARED_I8_ADDED_MODULES.len()
-                + G64_AND_HC_CAPTURE_ADDED_MODULES.len()
+                + HC_CAPTURE_ADDED_MODULES.len()
                 + HC_ROW_FOLD_ADDED_MODULES.len()
                 + MOE_FRONT_ADDED_MODULES.len()
                 + MQ4RS_DECODE_ADDED_MODULES.len()
@@ -12236,7 +12270,8 @@ mod tests {
                 + LANE_LEVIATHAN_ADDED_MODULES.len()
                 + ARGMAX_PAIR_MERGE_ADDED_MODULES.len()
                 + TRUNK_REDUCTION_PARTITION_ADDED_MODULES.len()
-                + TOPK8_ROWS_ADDED_MODULES.len(),
+                + TOPK8_ROWS_ADDED_MODULES.len()
+                + PACK_FIX_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
@@ -12273,7 +12308,7 @@ mod tests {
         let gemv = squeeze(include_str!("gemv.rs"));
         let norm = squeeze(include_str!("norm.rs"));
         let sampling = squeeze(include_str!("sampling.rs"));
-        let rows: [(&str, &str, &str, &str, &str); 5] = [
+        let rows: [(&str, &str, &str, &str, &str); 4] = [
             (
                 "gemv_q8_0_wide",
                 "GEMV_Q8_0_WIDE_SRC",
@@ -12288,13 +12323,6 @@ mod tests {
                 "conv1d_gated_decode_f32",
                 "norm",
                 kernels::CONV1D_GATED_DECODE_SRC,
-            ),
-            (
-                "sample_top_p",
-                "SAMPLE_TOP_P_SRC",
-                "sample_top_p",
-                "sampling",
-                kernels::SAMPLE_TOP_P_SRC,
             ),
             (
                 "sample_rows_pf",
@@ -13856,6 +13884,17 @@ mod tests {
                 exp.push_str(&body[last..]);
                 let exp = exp.split("##").map(str::trim).collect::<Vec<_>>().join("");
                 scan_kernels(&exp, defs, fdefs, out, depth + 1);
+            } else if let Some(body) = defs.get(word) {
+                // An object-like macro that lists generator invocations
+                // (`#define ENTRIES_T1 ENTRY(1, ...) ENTRY_G4(1, ...)`) expands
+                // where it is used, like a generator macro.
+                let generates = body.contains("__global__")
+                    || c_idents(body)
+                        .iter()
+                        .any(|&(a, b)| fdefs.contains_key(&body[a..b]));
+                if depth <= 4 && generates {
+                    scan_kernels(body, defs, fdefs, out, depth + 1);
+                }
             }
         }
     }
@@ -14927,8 +14966,6 @@ extern "C" __global__ void NAMED(int* p) {}
                 ("q8_0", "q8_0"),
                 ("fp8", "q8"),
                 ("q8", "fp8"),
-                ("asym4", "asym4"),
-                ("asym3", "asym3"),
                 ("fwht4", "fwht4"),
                 ("fp16", "fp16"),
             ] {

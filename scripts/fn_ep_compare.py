@@ -22,7 +22,12 @@ The EP arm must equal the reference byte for byte (hashes of bytes):
   * mirrors: for every EP record every peer rank's logits mirror sha256 equals
     rank 0's (one entry per rank);
   * state: for every (prompt, step) the EP arm has a digest for EVERY rank and
-    every digest row (names and values) equals the reference rank 0's;
+    every digest row both arms hold equals the reference rank 0's (family `state`);
+  * state rows: both arms hold the same row NAMES (family `state_rows`). Rows only
+    one arm has (for example the capture-ring rows of a load that attached the
+    native MTP head on one arm only) are reported ONCE, grouped, as a separate
+    `state_rows` message, not as a failure of every state record; the verdict
+    still fails, and a differing row both arms hold still fails `state`;
   * with --ref-ranks R > 1 the reference (itself EP, R ranks) is also checked
     against itself (families mirrors / state_ranks / state, messages prefixed
     "reference"): R mirror hashes equal to its own logits sha, and state
@@ -57,6 +62,7 @@ import io
 import json
 import math
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -128,6 +134,7 @@ class Verdict:
         self.max_report = max_report
         self.families = {}
         self.first = None
+        self.first_by_family = {}
         self.mismatches = []
 
     def family(self, name):
@@ -143,6 +150,7 @@ class Verdict:
         entry.update(detail)
         if self.first is None:
             self.first = entry
+        self.first_by_family.setdefault(name, entry)
         if len(self.mismatches) < self.max_report:
             self.mismatches.append(entry)
 
@@ -241,15 +249,54 @@ def load_state(arm_dir):
     return out
 
 
+def _row_groups(names):
+    """`row_capture[0].ring`, ... -> `row_capture x108, row_capture_output x1`: names grouped by leading token."""
+    groups = {}
+    for name in names:
+        key = re.split(r"[\[.]", name, maxsplit=1)[0]
+        groups[key] = groups.get(key, 0) + 1
+    return ", ".join("%s x%d" % (key, count) for key, count in sorted(groups.items()))
+
+
 def diff_digest(ref_rows, ep_rows):
+    """Split two digests: (notes on the rows both hold, names only in ref_rows, names only in ep_rows)."""
+    ref_map, ep_map = dict(ref_rows), dict(ep_rows)
+    only_ref = [name for name, _ in ref_rows if name not in ep_map]
+    only_ep = [name for name, _ in ep_rows if name not in ref_map]
     notes = []
-    if [n for n, _ in ref_rows] != [n for n, _ in ep_rows]:
-        notes.append("row names differ (%d vs %d rows)" % (len(ref_rows), len(ep_rows)))
-    ep_map = dict(ep_rows)
+    if [name for name, _ in ref_rows if name in ep_map] != [name for name, _ in ep_rows if name in ref_map]:
+        notes.append("common row order differs")
     for name, value in ref_rows:
         if name in ep_map and ep_map[name] != value:
             notes.append("%s: %s vs %s" % (name, value, ep_map[name]))
-    return notes
+    return notes, only_ref, only_ep
+
+
+class RowSets:
+    """Rows only one side of a digest comparison holds, collected over every compared record and reported once."""
+
+    def __init__(self, v):
+        self.v = v
+        self.only_ref = {}
+        self.only_ep = {}
+        self.records = 0
+        self.affected = 0
+
+    def add(self, only_ref, only_ep):
+        self.v.checked("state_rows")
+        self.records += 1
+        if only_ref or only_ep:
+            self.affected += 1
+            self.only_ref.update(dict.fromkeys(only_ref))
+            self.only_ep.update(dict.fromkeys(only_ep))
+
+    def report(self, ref_label, ep_label, scope=""):
+        if not self.affected:
+            return
+        parts = ["%d row(s) only in %s (%s)" % (len(names), label, _row_groups(names))
+                 for label, names in ((ref_label, self.only_ref), (ep_label, self.only_ep)) if names]
+        self.v.fail("state_rows", "%sstate digest row sets differ in %d of %d record(s): %s; the rows both sides hold "
+                    "are compared separately (family state)" % (scope, self.affected, self.records, "; ".join(parts)))
 
 
 def check_state(v, ref, ep, ranks):
@@ -261,6 +308,7 @@ def check_state(v, ref, ep, ranks):
     ep_keys = sorted(set((p, s) for (p, s, r) in ep))
     if ep_keys != ref_keys:
         v.fail("state_set", "state (prompt, step) sets differ: reference %s vs EP %s" % (ref_keys[:6], ep_keys[:6]))
+    rows = RowSets(v)
     for prompt, step in ref_keys:
         ref_rows = ref[(prompt, step, 0)]
         have = sorted(r for (p, s, r) in ep if p == prompt and s == step)
@@ -270,11 +318,13 @@ def check_state(v, ref, ep, ranks):
                    % (prompt, step, have, ranks - 1), prompt=prompt, step=step)
         for rank in have:
             v.checked("state")
-            notes = diff_digest(ref_rows, ep[(prompt, step, rank)])
+            notes, only_ref, only_ep = diff_digest(ref_rows, ep[(prompt, step, rank)])
             if notes:
                 v.fail("state", "prompt=%d step=%d rank %d: %d digest row(s) differ from reference rank 0: %s"
                        % (prompt, step, rank, len(notes), "; ".join(notes[:4])),
                        prompt=prompt, step=step, rank=rank)
+            rows.add(only_ref, only_ep)
+    rows.report("reference", "EP")
 
 
 def check_reference(v, ref_logits, ref_state, ref_ranks):
@@ -290,6 +340,7 @@ def check_reference(v, ref_logits, ref_state, ref_ranks):
             if bad:
                 v.fail("mirrors", "reference prompt=%d step=%d: rank(s) %s logits mirror != rank 0" % (prompt, step, bad),
                        prompt=prompt, step=step, ranks=bad)
+    rows = RowSets(v)
     for prompt, step in sorted(set((p, s) for (p, s, _) in ref_state)):
         have = sorted(r for (p, s, r) in ref_state if p == prompt and s == step)
         v.checked("state_ranks")
@@ -303,11 +354,13 @@ def check_reference(v, ref_logits, ref_state, ref_ranks):
             if rank == 0:
                 continue
             v.checked("state")
-            notes = diff_digest(base, ref_state[(prompt, step, rank)])
+            notes, only_ref, only_ep = diff_digest(base, ref_state[(prompt, step, rank)])
             if notes:
                 v.fail("state", "reference prompt=%d step=%d rank %d: %d digest row(s) differ from reference rank 0: %s"
                        % (prompt, step, rank, len(notes), "; ".join(notes[:4])),
                        prompt=prompt, step=step, rank=rank)
+            rows.add(only_ref, only_ep)
+    rows.report("reference rank 0", "the other reference ranks", scope="reference ")
 
 
 # ------------------------------------------------------------------- main
@@ -382,6 +435,9 @@ def run(argv):
         print("first mismatch [%s]: %s" % (v.first["check"], v.first["message"]))
         if v.first.get("raw"):
             print("     " + v.first["raw"])
+        rows = v.first_by_family.get("state_rows")
+        if rows is not None and rows is not v.first:
+            print("state_rows: %s" % rows["message"])
     line = summary_line(v, shape, args.ref_dir, args.ep_dir)
     print(line)
     if args.json:
@@ -1354,7 +1410,8 @@ def _write(path, data, mode="w"):
         handle.write(data)
 
 
-def _arm(root, name, shas, tokens, ranks=1, mirrors=None, state=None, flip_state_rank=None, raw=None, completed=True):
+def _arm(root, name, shas, tokens, ranks=1, mirrors=None, state=None, flip_state_rank=None, raw=None, completed=True,
+         extra_rows=None):
     d = os.path.join(root, name)
     meta = {"completed": completed, "ranks": ranks, "max_seq": 512, "tokens": len(shas) - 1, "vocab": 4,
             "model_sha256": "m", "prompts": [{"prompt": 0, "token_count": 3, "file_md5": "f", "ids_md5": "i"}]}
@@ -1372,7 +1429,7 @@ def _arm(root, name, shas, tokens, ranks=1, mirrors=None, state=None, flip_state
             _write(os.path.join(d, "logits-p0-s%d.f32" % step), struct.pack("<%df" % len(values), *values), "wb")
     lines = []
     for rank in range(ranks):
-        digest = [["position", "9"], ["gdn[0].recurrent", state or "s0"]]
+        digest = [["position", "9"], ["gdn[0].recurrent", state or "s0"]] + [list(row) for row in (extra_rows or [])]
         if rank == flip_state_rank:
             digest[1][1] = "deadbeef"
         lines.append(json.dumps({"kind": "state", "prompt": 0, "step": 1, "rank": rank, "digest": digest}))
@@ -1456,6 +1513,29 @@ def self_test():
         expect("reference rank-1 state differs", code, 1)
         if "reference prompt=0 step=1 rank 1" not in out or "gdn[0].recurrent" not in out:
             failures.append("reference rank-1 state diff not reported: %s" % out)
+
+        # Rows only one arm holds (a single card that attached the native MTP head): ONE separate state_rows
+        # message, no failure of the state family; a differing row both arms hold still fails state.
+        ring = [["row_capture[0].ring", "r0"], ["row_capture[1].ring", "r1"], ["row_capture_output", "o"]]
+        ring_single = _arm(tmp, "single_ring", good, [7, 8], extra_rows=ring)
+        code, out = _quiet(ring_single, _arm(tmp, "ep_noring", good, [7, 8], ranks=2))
+        expect("extra rows only in reference", code, 1)
+        if re.search(r"^FAIL state\s+checked", out, re.M) or "FAIL state_rows checked=2 failed=1" not in out:
+            failures.append("extra-only rows must fail only family state_rows, once: %s" % out)
+        if ("only in reference (row_capture x2, row_capture_output x1)" not in out
+                or "differ in 2 of 2 record(s)" not in out):
+            failures.append("extra-only rows not summarised: %s" % out)
+        code, out = _quiet(_arm(tmp, "single_noring", good, [7, 8]),
+                           _arm(tmp, "ep_ring", good, [7, 8], ranks=2, extra_rows=ring))
+        expect("extra rows only in EP", code, 1)
+        if "only in EP (row_capture x2, row_capture_output x1)" not in out:
+            failures.append("EP-only rows not reported: %s" % out)
+        expect("equal extra rows", _quiet(ring_single, _arm(tmp, "ep_ring2", good, [7, 8], ranks=2, extra_rows=ring))[0], 0)
+        code, out = _quiet(ring_single, _arm(tmp, "ep_ring_flip", good, [7, 8], ranks=2, flip_state_rank=1))
+        expect("extra rows plus a differing common row", code, 1)
+        if (not re.search(r"^FAIL state\s+checked=2 failed=1", out, re.M) or "gdn[0].recurrent" not in out
+                or not re.search(r"^state_rows: .*only in reference", out, re.M)):
+            failures.append("differing common row must fail state and still print the state_rows message: %s" % out)
 
     for line in failures:
         print("SELF-TEST FAIL:", line)

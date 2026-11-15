@@ -25,9 +25,9 @@ use serde_json::json;
 fn every_known_model_type_resolves_identically_through_all_three_consumers() {
     // Consumer 1: hipfire-runtime::arch_mapping::lookup_model_type (single source)
     // Consumer 2: safetensors_source::derive_arch_id (Dir loader path)
-    // Consumer 3 & 4: the two quantize pipelines (pipeline.rs, pipeline_gguf.rs)
-    //   — both now delegate to lookup_model_type, so testing lookup suffices to
-    //   stand in for them. This test would fail if any pipeline re-introduced a
+    // Consumer 3: the quantize pipeline (pipeline.rs)
+    //   — it delegates to lookup_model_type, so testing lookup suffices to
+    //   stand in for it. This test would fail if any pipeline re-introduced a
     //   private map.
     // Table-driven: iterate the canonical table directly.
     for (model_type, expected_arch) in MODEL_TYPE_TO_ARCH_ID {
@@ -143,7 +143,7 @@ fn gemma4_variants_route_correctly_and_gemma4_unified_assistant_is_22() {
 
 #[test]
 fn muse_glimmer_variants_present_and_gguf_would_no_longer_default_to_llama() {
-    // Previously pipeline_gguf.rs lacked muse_glimmer entirely and silently tagged it 0.
+    // The removed GGUF quantizer pipeline lacked muse_glimmer entirely and silently tagged it 0.
     for (mt, expected) in [
         ("muse_glimmer", 14),
         ("muse_glimmer_text", 14),

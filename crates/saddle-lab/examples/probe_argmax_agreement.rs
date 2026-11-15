@@ -122,27 +122,11 @@ fn main() {
     // KV caches sized for prompt + n_steps + headroom.
     let kv_seq = prompt_tokens.len() + n_steps + 16;
     let kv_mode_str = match hipfire_runtime::config::get().kv_mode.as_str() {
-        "auto" => "asym3".to_string(),
+        "auto" => "q8".to_string(),
         mode => mode.to_string(),
     };
     let mk_kv = |gpu: &mut rdna_compute::Gpu, cfg: &qwen35::Qwen35Config| -> llama::KvCache {
         match kv_mode_str.as_str() {
-            "asym3" => llama::KvCache::new_gpu_asym3(
-                gpu,
-                cfg.n_layers,
-                cfg.n_kv_heads,
-                cfg.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
-            "asym4" => llama::KvCache::new_gpu_asym4(
-                gpu,
-                cfg.n_layers,
-                cfg.n_kv_heads,
-                cfg.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
             _ => {
                 llama::KvCache::new_gpu_q8(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, kv_seq)
                     .unwrap()

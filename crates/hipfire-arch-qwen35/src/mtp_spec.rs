@@ -27,7 +27,7 @@
 //!      `[0..pos+1)`.
 //! ```
 //!
-//! Greedy-only (temp=0). No DDTree, no PLD, no rejection sampling — that's
+//! Greedy-only (temp=0). No PLD, no rejection sampling — that's
 //! Task 11 territory.
 
 use crate::mtp_head::{
@@ -165,18 +165,6 @@ impl MtpSamplingConfig {
 /// repeat buffer's 2048-token capacity.
 pub const PENALTY_REPEAT_CAP: usize = 2048;
 
-fn mtp_device_token_chain_enabled_from_env() -> bool {
-    // Default on: this path is token-identical in greedy mode and removes the
-    // proposal-loop host data dependency needed for later graph capture.
-    match hipfire_config::developer_var("HIPFIRE_MTP_DEVICE_TOKEN_CHAIN") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        Err(_) => true,
-    }
-}
-
 fn mtp_snapshot_overlap_enabled_from_env() -> bool {
     // Default off: current gfx1201 benches show this stream split regresses,
     // but the hook is useful as an opt-in cross-arch experiment.
@@ -187,40 +175,6 @@ fn mtp_snapshot_overlap_enabled_from_env() -> bool {
         }
         Err(_) => false,
     }
-}
-
-fn mtp_gpu_greedy_accept_enabled_from_env() -> bool {
-    // Default on for greedy device-token-chain MTP: candidates and verify
-    // argmaxes are already on-device, so the prefix accept + bonus selection
-    // can stay there until a compact two-int result is needed on host.
-    match hipfire_config::developer_var("HIPFIRE_MTP_GPU_ACCEPT") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        Err(_) => true,
-    }
-}
-
-fn mtp_q8_verify_wmma_enabled_from_env_value(value: Option<&str>) -> bool {
-    match value {
-        None => true,
-        Some(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-    }
-}
-
-fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
-    // Default on for MTP q8 verify: the chunked dispatch only routes to gfx12
-    // WMMA when the arch/shape supports it, otherwise it falls back to scalar.
-    // Prompt-sweep parity is clean; opt out with HIPFIRE_MTP_Q8_VERIFY_WMMA=0.
-    mtp_q8_verify_wmma_enabled_from_env_value(
-        hipfire_config::developer_var("HIPFIRE_MTP_Q8_VERIFY_WMMA")
-            .ok()
-            .as_deref(),
-    )
 }
 
 /// Default draft-confidence cutoff (adaptive-K) per arch.
@@ -884,7 +838,7 @@ impl MtpSpecState {
 
     /// Like [`Self::new_for_slot`] but allocates the MTP head's KV cache in
     /// the requested format. Used by `mtp_only_demo` to A/B kv-mode variants
-    /// (q8/asym3/fwht4) per the 2026-05-16 feat/fwht prose-τ findings.
+    /// (q8/fwht4) per the 2026-05-16 feat/fwht prose-τ findings.
     pub fn new_for_slot_with_kv_mode(
         gpu: &mut Gpu,
         target: &ModelSlot,
@@ -1077,7 +1031,7 @@ impl MtpSpecState {
             + PENALTY_REPEAT_CAP + rows // mtp_sample_repeat_buf
             + 1 + 1 + 2 * max_n // gather idx/prob draft + verify
             + cvs.map_or(0, |c| max_n * c); // mtp_lm_logits_compressed
-        let pbs = PrefillBatchScratch::projected_allocation_bytes(config, rows, true)
+        let pbs = PrefillBatchScratch::projected_allocation_bytes(config, rows)
             .map_err(|e| format!("MTP trunk PBS sizing: {e}"))?;
         let pbs = usize::try_from(pbs).map_err(|_| "MTP trunk PBS sizing overflow".to_string())?;
         Ok(f32_elems * 4
@@ -1630,7 +1584,6 @@ fn mtp_verify_graph_eligible(
                     .map(|e| e.down.gpu_dtype)
                     .unwrap_or(DType::F32),
                 routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
-                has_paro_shared: ffn.paro_shared.is_some(),
                 per_expert_gate_up,
                 per_expert_down,
             };
@@ -1680,7 +1633,7 @@ struct MtpVerifyGraphKey {
     /// Those pools are grow-never-shrink, so a moved (or newly zeroed) slot identifies
     /// growth or free — no contents hashed and no converted activation values cached
     /// here. Unused cells stay `0`.
-    scratch: [usize; 32],
+    scratch: [usize; 27],
 }
 
 /// Capture-identity key for the narrow MTP verify graph.
@@ -1724,7 +1677,7 @@ fn mtp_verify_graph_key(
             .s_matrices
             .first()
             .map_or(0, |t| t.buf.as_ptr() as usize),
-        scratch: [0usize; 32],
+        scratch: [0usize; 27],
     };
 
     // Global conversion/attention scratch pools (grow-never-shrink) in ScratchState
@@ -1736,35 +1689,27 @@ fn mtp_verify_graph_key(
     key.scratch[3] = tensor_ptr(&gpu.scratch.mq_signs2_128);
     key.scratch[4] = tensor_ptr(&gpu.scratch.mq_x_rot);
     key.scratch[5] = tensor_ptr(&gpu.scratch.gemv_residual_tmp);
-    key.scratch[6] = tensor_ptr(&gpu.scratch.paro_x_scratch);
-    key.scratch[7] = buffer_ptr(&gpu.scratch.gdn_pair_counters);
-    key.scratch[8] = tensor_ptr(&gpu.scratch.argmax_host);
-    key.scratch[9] = buffer_ptr(&gpu.scratch.mq_x_rot_fp8);
-    key.scratch[10] = buffer_ptr(&gpu.scratch.mq_x_q8);
-    key.scratch[11] = buffer_ptr(&gpu.scratch.mq_x_scales);
-    key.scratch[12] = buffer_ptr(&gpu.scratch.mq_rmsnorm_wavegrid_scratch);
-    key.scratch[13] = buffer_ptr(&gpu.scratch.fp16_x_scratch);
-    key.scratch[14] = buffer_ptr(&gpu.scratch.qsa_select_scores);
-    key.scratch[15] = buffer_ptr(&gpu.scratch.gdn_state_f32);
-    key.scratch[16] = buffer_ptr(&gpu.scratch.fp8_x_scratch);
-    key.scratch[17] = buffer_ptr(&gpu.scratch.q8_1_mmq_x_scratch);
-    key.scratch[18] = buffer_ptr(&gpu.scratch.int4_mmq_x_scratch);
-    key.scratch[19] = buffer_ptr(&gpu.scratch.int8_mmq_x_scratch);
-    key.scratch[20] = buffer_ptr(&gpu.scratch.mq4v2_fp8_x_scratch);
-    key.scratch[21] = buffer_ptr(&gpu.scratch.mq4v2_fp8_half_sums_scratch);
-    key.scratch[22] = buffer_ptr(&gpu.scratch.mq4v2_fp8_row_scales_scratch);
-    key.scratch[23] = buffer_ptr(&gpu.scratch.fp8_f2_weights);
-    key.scratch[24] = buffer_ptr(&gpu.scratch.ksplit_det_partials);
-    key.scratch[25] = buffer_ptr(&gpu.scratch.sample_partials);
-    key.scratch[26] = buffer_ptr(&gpu.scratch.fa2_q16_scratch);
-    key.scratch[27] = buffer_ptr(&gpu.scratch.fa2_fp8_q_scratch);
-
-    // paro_fused_scratch is an optional Vec of 4 tensor buffers (indices 0..3).
-    if let Some(bufs) = &gpu.scratch.paro_fused_scratch {
-        for (i, t) in bufs.iter().take(4).enumerate() {
-            key.scratch[28 + i] = t.buf.as_ptr() as usize;
-        }
-    }
+    key.scratch[6] = buffer_ptr(&gpu.scratch.gdn_pair_counters);
+    key.scratch[7] = tensor_ptr(&gpu.scratch.argmax_host);
+    key.scratch[8] = buffer_ptr(&gpu.scratch.mq_x_rot_fp8);
+    key.scratch[9] = buffer_ptr(&gpu.scratch.mq_x_q8);
+    key.scratch[10] = buffer_ptr(&gpu.scratch.mq_x_scales);
+    key.scratch[11] = buffer_ptr(&gpu.scratch.mq_rmsnorm_wavegrid_scratch);
+    key.scratch[12] = buffer_ptr(&gpu.scratch.fp16_x_scratch);
+    key.scratch[13] = buffer_ptr(&gpu.scratch.qsa_select_scores);
+    key.scratch[14] = buffer_ptr(&gpu.scratch.gdn_state_f32);
+    key.scratch[15] = buffer_ptr(&gpu.scratch.fp8_x_scratch);
+    key.scratch[16] = buffer_ptr(&gpu.scratch.q8_1_mmq_x_scratch);
+    key.scratch[17] = buffer_ptr(&gpu.scratch.int4_mmq_x_scratch);
+    key.scratch[18] = buffer_ptr(&gpu.scratch.int8_mmq_x_scratch);
+    key.scratch[19] = buffer_ptr(&gpu.scratch.mq4v2_fp8_x_scratch);
+    key.scratch[20] = buffer_ptr(&gpu.scratch.mq4v2_fp8_half_sums_scratch);
+    key.scratch[21] = buffer_ptr(&gpu.scratch.mq4v2_fp8_row_scales_scratch);
+    key.scratch[22] = buffer_ptr(&gpu.scratch.fp8_f2_weights);
+    key.scratch[23] = buffer_ptr(&gpu.scratch.ksplit_det_partials);
+    key.scratch[24] = buffer_ptr(&gpu.scratch.sample_partials);
+    key.scratch[25] = buffer_ptr(&gpu.scratch.fa2_q16_scratch);
+    key.scratch[26] = buffer_ptr(&gpu.scratch.fa2_fp8_q_scratch);
 
     key
 }
@@ -1923,25 +1868,16 @@ pub(crate) fn mtp_trunk_verify_lm_head(
     }
     match w_out.gpu_dtype {
         DType::Q8_0 => {
-            if mtp_q8_verify_wmma_enabled_from_env() {
-                gpu.gemm_q8_0_batched_chunked(
-                    &w_out.buf,
-                    verify_hidden,
-                    logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            } else {
-                gpu.gemm_q8_0_batched_f32_chunked(
-                    &w_out.buf,
-                    verify_hidden,
-                    logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            }
+            // The chunked dispatch takes WMMA where the arch/shape supports it
+            // and falls back to the scalar chunks otherwise.
+            gpu.gemm_q8_0_batched_chunked(
+                &w_out.buf,
+                verify_hidden,
+                logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
         }
         DType::HFQ4G256 => {
             gpu.gemm_hfq4g256_batched_lmhead(
@@ -2397,8 +2333,9 @@ fn mtp_verify_accept_impl(
         let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
         gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
 
-        let use_gpu_accept =
-            !is_external && use_device_token_chain && mtp_gpu_greedy_accept_enabled_from_env();
+        // Greedy device-token-chain MTP: candidates and verify argmaxes are
+        // already on-device, so the prefix accept + bonus selection stays there.
+        let use_gpu_accept = !is_external && use_device_token_chain;
         let accepted = if use_gpu_accept {
             let candidate_device = state.mtp_token_chain.sub_offset(1, drafts_generated);
             let accept_result = state.verify_argmax.sub_offset(0, 2);
@@ -2548,9 +2485,9 @@ fn mtp_accept_and_rollback(
                         None,
                         None,
                         None,
-                        None,
                     )
                 })?;
+                dn_state.seal_streams(gpu, cur_pos + advance)?;
             } else {
                 gpu.graphs.ar_graph_eligible = false;
                 qwen35::forward_scratch(
@@ -2669,7 +2606,6 @@ fn mtp_verify_forward_graphed(
             None,
             Some(&state.verify_hidden),
             Some(&mut state.trunk_gdn_tape),
-            None,
             Some(&state.trunk_pbs),
             None,
             None,
@@ -2734,7 +2670,6 @@ fn mtp_verify_forward_graphed(
             None,
             Some(&state.verify_hidden),
             Some(&mut state.trunk_gdn_tape),
-            None,
             false,
             qwen35::DflashFusionCtx::Off,
         )?;
@@ -2892,7 +2827,6 @@ fn mtp_shared_verify_accept_rollback_inner(
             None,
             Some(&state.verify_hidden),
             verify_tape,
-            None,
             Some(&state.trunk_pbs),
             None,
             None,
@@ -3571,7 +3505,7 @@ mod lazy_state_bytes_tests {
             + 2 * max_n;
         let expect = small * 4
             + snap
-            + PrefillBatchScratch::projected_allocation_bytes(&c, rows, true).unwrap() as usize
+            + PrefillBatchScratch::projected_allocation_bytes(&c, rows).unwrap() as usize
             + GdnTape::requested_bytes(&c, rows, true)
             + Qwen35MtpHeadScratch::requested_bytes("gfx1100", &h, None)
             + Qwen35MtpHeadKvCache::q8_requested_bytes(&h);
@@ -3621,14 +3555,19 @@ pub fn prefill_trunk_and_mtp_cache(
         prompt_tokens,
         start_pos,
         route,
-        |_gpu, _target, _kv, _committed_pos| Ok(()),
+        None,
+        |_gpu, _target, _kv, _committed_pos, _turn| Ok(()),
     )
 }
 
 /// Like [`prefill_trunk_and_mtp_cache`], but invokes `on_committed_boundary`
 /// after each trunk chunk and its MTP fill commit, with the trunk DeltaNet
 /// state and the exclusive end position of the committed prefix
-/// (`start_pos + tokens_written_so_far`).
+/// (`start_pos + tokens_written_so_far`), and the flag `false`. Before
+/// forwarding the chunk that holds `turn_boundary`, it is invoked once more
+/// with that chunk's start position and the flag `true` (the newest existing
+/// chunk end at or before the boundary, or the prefill start; see
+/// `prompt_frame::chunk_holds_turn_boundary`). The chunk plan never changes.
 ///
 /// The callback runs while `target.kv_cache` holds the just-written prefix.
 /// Failures propagate and abort the remaining prefill (caller must free MTP
@@ -3642,10 +3581,11 @@ pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
     prompt_tokens: &[u32],
     start_pos: usize,
     route: MtpPromptRoute,
+    turn_boundary: Option<usize>,
     on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize, bool) -> HipResult<()>,
 {
     let mut parts = MtpPrefillTarget {
         weights: &target.weights,
@@ -3662,6 +3602,7 @@ where
         prompt_tokens,
         start_pos,
         route,
+        turn_boundary,
         on_committed_boundary,
     )
 }
@@ -3686,10 +3627,11 @@ pub fn prefill_trunk_and_mtp_cache_parts<F>(
     prompt_tokens: &[u32],
     start_pos: usize,
     route: MtpPromptRoute,
+    turn_boundary: Option<usize>,
     mut on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize) -> HipResult<()>,
+    F: FnMut(&mut Gpu, &DeltaNetState, &KvCache, usize, bool) -> HipResult<()>,
 {
     let Some(head_rows) =
         mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
@@ -3848,6 +3790,19 @@ where
                         .unwrap_or(remaining.min(trunk_chunk_max).max(1))
                 }
             };
+            if hipfire_runtime::prompt_frame::chunk_holds_turn_boundary(
+                start_pos + off,
+                outer,
+                turn_boundary,
+            ) {
+                on_committed_boundary(
+                    gpu,
+                    target.dn_state,
+                    &*target.kv_cache,
+                    start_pos + off,
+                    true,
+                )?;
+            }
             let end = off + outer;
             let chunk = &prompt_tokens[off..end];
             let chunk_start_pos = start_pos + off;
@@ -3880,7 +3835,6 @@ where
                     &target.scratch,
                     None,
                     Some(&chunk_hidden),
-                    None,
                     None,
                 )?,
             }
@@ -3956,12 +3910,22 @@ where
             }
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
-            on_committed_boundary(gpu, target.dn_state, &*target.kv_cache, committed_pos)?;
+            on_committed_boundary(
+                gpu,
+                target.dn_state,
+                &*target.kv_cache,
+                committed_pos,
+                false,
+            )?;
             // `prefill_progress` for the request's prompt prefill (live only
             // inside a `prompt_phase`; silent for decode-time replays).
             hipfire_runtime::prefill_progress::report(end, prompt_tokens.len());
             off = end;
         }
+        // The prompt spine ends ordinary prefill: one seal before decode/verify.
+        target
+            .dn_state
+            .seal_streams(gpu, start_pos + prompt_tokens.len())?;
 
         let last = prompt_tokens.len() - 1;
         gpu.hip
@@ -4260,7 +4224,6 @@ pub fn spec_step_mtp(
         None, // hidden_rb: not used here (DFlash drafter not in the loop)
         Some(&state.verify_hidden),
         verify_tape,
-        None, // tree_verify
         Some(&state.trunk_pbs),
         None,  // mask_override
         None,  // max_layer
@@ -4384,13 +4347,7 @@ pub fn spec_step_mtp(
     // Instrument first cycle: print tape_captured so we can confirm the MoE
     // batched verify populates the tape (HIPFIRE_DEBUG_BATCH=1 already prints
     // eligibility; this one-shot print on cycle 0 is unconditional for W3e).
-    // HIPFIRE_MTP_TAPE_REPLAY=0 forces the original full-replay path (A/B gate).
-    let use_tape_replay = tape_captured
-        && advance >= 2
-        && hipfire_config::developer_var("HIPFIRE_MTP_TAPE_REPLAY")
-            .ok()
-            .as_deref()
-            != Some("0");
+    let use_tape_replay = tape_captured && advance >= 2;
     state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
     if use_tape_replay {
         // Batched verify populated the tape this cycle — cheap GDN-only replay.
@@ -4406,7 +4363,7 @@ pub fn spec_step_mtp(
             advance,
         )?;
     } else {
-        // Either tape not captured, HIPFIRE_MTP_TAPE_REPLAY=0 (A/B gate), or advance=1
+        // Either tape not captured or advance=1
         // (decode-mode-GEMV vs batch-WMMA ULP mismatch — use decode path for identity).
         if advance >= 2 {
             let replay = &verify_tokens[..advance];
@@ -4425,9 +4382,9 @@ pub fn spec_step_mtp(
                     None,
                     None,
                     None,
-                    None,
                 )
             })?;
+            target.dn_state.seal_streams(gpu, cur_pos + advance)?;
         } else {
             // advance == 1: only the seed (last_committed) is "replayed". This
             // happens when EOS hits with accept_count==0 AND bonus==eos
@@ -4650,7 +4607,6 @@ pub fn spec_step_mtp_compressed(
         None,
         Some(&state.verify_hidden),
         None,
-        None,
         Some(&state.trunk_pbs),
         None,  // mask_override
         None,  // max_layer
@@ -4736,9 +4692,9 @@ pub fn spec_step_mtp_compressed(
                 None,
                 None,
                 None,
-                None,
             )
         })?;
+        target.dn_state.seal_streams(gpu, cur_pos + advance)?;
     } else {
         gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
         qwen35::forward_scratch(
@@ -5133,7 +5089,6 @@ pub fn mtp_draft_phase_inner(
     // k==0 one-token path: never run device-token chain / proposal graph
     // (both assume max_n ≥ 1 for candidate buffer views).
     let use_device_token_chain = max_n > 0
-        && mtp_device_token_chain_enabled_from_env()
         && mtp_device_token_chain_eligible_for(trunk_weights.embd_format, use_sampling, use_p_min);
     if use_device_token_chain && !use_full_vocab {
         assert!(
@@ -6085,12 +6040,6 @@ mod tests {
 
     #[test]
     fn proposal_graph_policy_is_opt_in_and_q8_device_chain_only() {
-        assert!(mtp_q8_verify_wmma_enabled_from_env_value(None));
-        assert!(!mtp_q8_verify_wmma_enabled_from_env_value(Some("0")));
-        assert!(!mtp_q8_verify_wmma_enabled_from_env_value(Some("off")));
-        assert!(mtp_q8_verify_wmma_enabled_from_env_value(Some("1")));
-        assert!(mtp_q8_verify_wmma_enabled_from_env_value(Some("ON")));
-
         assert_eq!(
             mtp_proposal_graph_policy_from_env_value(None),
             MtpProposalGraphPolicy::Off
@@ -6134,7 +6083,7 @@ mod tests {
             MtpProposalGraphPolicy::Auto,
             true,
             false,
-            crate::mtp_head::MtpKvMode::Asym3,
+            crate::mtp_head::MtpKvMode::Fwht4,
         ));
         assert!(mtp_proposal_graph_eligible_for(
             MtpProposalGraphPolicy::On,

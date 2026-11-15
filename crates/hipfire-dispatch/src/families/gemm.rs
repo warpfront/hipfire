@@ -89,9 +89,8 @@ pub fn run_q8_projection_fresh(
     k: usize,
     batch_size: usize,
     x_f16: &GpuTensor,
-    enable_wmma: bool,
 ) -> hip_bridge::HipResult<()> {
-    if enable_wmma && gpu.arch_caps.has_wmma() && k % 32 == 0 {
+    if gpu.arch_caps.has_wmma() && k % 32 == 0 {
         gpu.deepseek4_convert_f32_to_f16(x, x_f16, (batch_size * k) as i64)?;
         gpu.gemm_q8_0_wmma(w, x_f16, y, m, k, batch_size)
     } else {
@@ -608,7 +607,6 @@ impl GemmFamily {
             // `(a, x, y, m, k, batch_size)` signature.
             K::GemmF16 => hip!(gpu.gemm_f16(w.buf, x, y, m, k, batch_size)),
             K::GemmF16Tiled => hip!(gpu.gemm_f16_tiled(w.buf, x, y, m, k, batch_size)),
-            K::GemmF16WmmaMb4 => hip!(gpu.gemm_f16_wmma_mb4(w.buf, x, y, m, k, batch_size)),
             K::GemmF16WmmaMb8 => hip!(gpu.gemm_f16_wmma_mb8(w.buf, x, y, m, k, batch_size)),
             K::GemmF32Batched => hip!(gpu.gemm_f32_batched(w.buf, x, y, m, k, batch_size)),
             // Pure BF16 x BF16 -> F32. Takes `&DeviceBuffer` rather than the
@@ -630,7 +628,6 @@ impl GemmFamily {
                 }
                 hip!(gpu.gemm_bf16_mfma_gfx942(&w.buf.buf, &x.buf, &y.buf, m, k, batch_size))
             }
-            K::GemmQ8_0WmmaX64 => hip!(gpu.gemm_q8_0_wmma_x64(w.buf, x, y, m, k, batch_size)),
             K::GemmQ8_0ResidualWmma => {
                 hip!(gpu.gemm_q8_0_residual_wmma(w.buf, x, y, m, k, batch_size))
             }
@@ -675,11 +672,6 @@ impl GemmFamily {
             // `(w.buf, x, y, m, k, batch_size)` is byte-identical, and each method
             // keeps its own internal arch routing (WMMA for batch>1 on gfx11/12,
             // dp4a on gfx906, fp16/scalar fallback) so output is preserved exactly.
-            // Scalar Q8 kernel, F32 in/out, launched in 64-row chunks
-            // (`q8_0_batched_chunks`, #732).
-            K::GemmQ8_0Batched => {
-                hip!(gpu.gemm_q8_0_batched_f32_chunked(w.buf, x, y, m, k, batch_size))
-            }
             K::GemmHfq4G256BatchedLmhead => {
                 hip!(gpu.gemm_hfq4g256_batched_lmhead(w.buf, x, y, m, k, batch_size))
             }

@@ -1024,7 +1024,7 @@ impl Model {
             admit_pinned_control(
                 offload_exec,
                 gpu.is_uma(),
-                hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled(),
+                hipfire_dispatch::cpu_exec::cpu_exec_enabled(),
             )?;
             if hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()?.is_some() {
                 return Err("fixed hotset conflicts with HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS".into());
@@ -1557,7 +1557,7 @@ fn check_strict_binding(
 ) -> Result<Value, String> {
     let pins = strict_g1_image_pins()?;
     let arch = gpu.arch.clone();
-    let cpu_owned = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled();
+    let cpu_owned = hipfire_dispatch::cpu_exec::cpu_exec_enabled();
     let mut in_scope: Vec<&StrictLaunchWitness> = Vec::new();
     let mut out_of_scope = 0usize;
     for w in witnesses {

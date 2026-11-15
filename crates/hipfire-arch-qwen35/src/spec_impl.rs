@@ -193,12 +193,15 @@ impl SpecTarget for ModelSlot {
                 None,
                 None,
                 None,
-                None,
             )
             .map_err(|e| e.to_string())?;
             pos += end - off;
             off = end;
         }
+        // Ordinary prefill ends here; seal once before decode/verify.
+        self.dn_state
+            .seal_streams(gpu, pos)
+            .map_err(|e| format!("qwen35 spec_advance seal: {e}"))?;
         // Last-position logits (the per-token forward left last-token logits in
         // scratch.logits). Hand the host row through for temp>0 first-token draws.
         let logits = gpu
@@ -369,9 +372,13 @@ impl SpecTarget for ModelSlot {
             None,
             None,
             None,
-            None,
         )
         .map_err(|e| e.to_string())?;
+        // The replay is a verify-phase rollback, not a prompt: it must hand
+        // decode a Sealed stream at the committed end.
+        self.dn_state
+            .seal_streams(gpu, position + accept_len + 1)
+            .map_err(|e| format!("commit_prefix seal: {e}"))?;
         Ok(())
     }
 
@@ -612,7 +619,6 @@ impl SpecTarget for ModelSlot {
             &mut self.dn_state,
             &self.scratch,
             Some(&mut ring),
-            None,
             None,
             None,
         )

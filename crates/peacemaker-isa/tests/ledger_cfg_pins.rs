@@ -15,8 +15,8 @@
 //!   converted kernel of its blockDim. Every pool must pass the dispatcher-only verifier
 //!   (`verify_dispatcher_emitted`: any hazard outside the exact body spans is fatal, no
 //!   allowance) and then the strict one (`verify_emitted`): a strict report is accepted only
-//!   inside a body span and only through an exact `POOL_BODY` entry (template id, body pc,
-//!   category).
+//!   inside a body span and only through an exact `POOL_BODY` entry (module/symbol,
+//!   body pc, category, instruction and need), never a scan-position template id.
 //!
 //! Every outcome lands in exactly one bucket: verified, finding (a real missing wait on a
 //! feasible path) or unsupported (an input the verifier refuses rather than skips). A finding
@@ -194,13 +194,29 @@ impl Report {
     }
 }
 
-/// The gfx942 anchors (hipcc) and twins (PM) with typed coverage: the rows16 BF16 MFMA object
-/// and the FP8 grouped MoE object. Each is lifted by `peacemaker_lift::cdna` and every kernel is
+/// The gfx942 anchors (hipcc) and twins (PM) with typed coverage: the rows16 and P1b wide
+/// BF16 MFMA objects and the FP8 grouped MoE object. Each is lifted and every kernel is
 /// certified by `peacemaker_isa::cdna::lifted::certify` (CDNA hazards + typed CFG wait ledger).
 /// Their absence fails the gate. Every other gfx942 image stays an explicit not-verified entry.
 /// Each entry is the committed file and the exact kernel symbols it must contain, and nothing
 /// else.
-const CDNA_CERTIFIED: [(&str, &[&str]); 4] = [
+const CDNA_CERTIFIED: [(&str, &[&str]); 34] = [
+    (
+        "qwen4_g942_gdn_lanes_verify_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_gdn_lanes_conv_params_k4",
+            "qwen4_g942_gdn_lanes_step_f32",
+            "qwen4_g942_gdn_lanes_gate_batched",
+        ],
+    ),
+    (
+        "qwen4_g942_gdn_lanes_verify_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_gdn_lanes_conv_params_k4",
+            "qwen4_g942_gdn_lanes_step_f32",
+            "qwen4_g942_gdn_lanes_gate_batched",
+        ],
+    ),
     (
         "gemm_bf16_mfma_gfx942_rows16_hipcc_gfx942.co",
         &[
@@ -215,6 +231,22 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 4] = [
             "gemm_bf16_mfma_gfx942",
             "gemm_bf16_mfma_gfx942_rows16",
             "gemm_bf16_mfma_gfx942_rows16_x2",
+        ],
+    ),
+    (
+        "gemm_bf16_mfma_wide_gfx942_hipcc_gfx942.co",
+        &[
+            "gemm_bf16_mfma_gfx942_wide64",
+            "gemm_bf16_mfma_gfx942_wide64_m32",
+            "gemm_bf16_mfma_gfx942_wide64_m64",
+        ],
+    ),
+    (
+        "gemm_bf16_mfma_wide_gfx942_pm_gfx942.hxaco",
+        &[
+            "gemm_bf16_mfma_gfx942_wide64",
+            "gemm_bf16_mfma_gfx942_wide64_m32",
+            "gemm_bf16_mfma_gfx942_wide64_m64",
         ],
     ),
     (
@@ -233,6 +265,209 @@ const CDNA_CERTIFIED: [(&str, &[&str]); 4] = [
             "gemm_fp8b128_moe_tile_desc_pad16",
         ],
     ),
+    (
+        "qwen4_g942_glue_elem_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_gemm_bf16_rows16_hc_act",
+            "qwen4_g942_gemm_bf16_rows16_hc_act_x2",
+        ],
+    ),
+    (
+        "qwen4_g942_glue_elem_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_gemm_bf16_rows16_hc_act",
+            "qwen4_g942_gemm_bf16_rows16_hc_act_x2",
+        ],
+    ),
+    (
+        "qwen4_g942_glue_moe_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_moe_group_scatter_desc",
+            "qwen4_g942_moe_unscatter_act",
+            "qwen4_g942_moe_combine_shared_add",
+        ],
+    ),
+    (
+        "qwen4_g942_glue_moe_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_moe_group_scatter_desc",
+            "qwen4_g942_moe_unscatter_act",
+            "qwen4_g942_moe_combine_shared_add",
+        ],
+    ),
+    (
+        "qwen4_g942_hc_gates_hipcc_gfx942.co",
+        &[
+            "gemv_bf16_xf32_k4_rows_tiled_r2",
+            "gemv_bf16_xf32_k4_rows_tiled_r3",
+            "gemv_bf16_xf32_k4_rows_tiled_r4",
+            "gemv_bf16_xf32_k4_rows_tiled_r5",
+            "gemv_bf16_xf32_k4_rows_tiled_r6",
+            "gemv_bf16_xf32_k4_rows_tiled_r7",
+            "gemv_bf16_xf32_k4_rows_tiled_r8",
+        ],
+    ),
+    (
+        "qwen4_gdn_lanes_step_f32_gfx942_hipcc_gfx942.co",
+        &["qwen4_gdn_lanes_step_f32_gfx942"],
+    ),
+    (
+        "qwen4_gdn_lanes_step_f32_gfx942_pm_gfx942.hxaco",
+        &["qwen4_gdn_lanes_step_f32_gfx942"],
+    ),
+    (
+        "qwen4_qsa_lanes_f32_gfx942_hipcc_gfx942.co",
+        &[
+            "qwen4_qsa_lanes_prologue_f32_gfx942",
+            "qwen4_qsa_lanes_pool_f32_gfx942",
+            "qwen4_qsa_lanes_scores_rows8_f32_gfx942",
+            "qwen4_qsa_lanes_select_from_scores_gfx942",
+            "qwen4_qsa_lanes_attention_f32_gfx942",
+            "qwen4_qsa_lanes_attention_fp8_fnuz_gfx942",
+        ],
+    ),
+    (
+        "qwen4_qsa_lanes_f32_gfx942_pm_gfx942.hxaco",
+        &[
+            "qwen4_qsa_lanes_prologue_f32_gfx942",
+            "qwen4_qsa_lanes_pool_f32_gfx942",
+            "qwen4_qsa_lanes_scores_rows8_f32_gfx942",
+            "qwen4_qsa_lanes_select_from_scores_gfx942",
+            "qwen4_qsa_lanes_attention_f32_gfx942",
+            "qwen4_qsa_lanes_attention_fp8_fnuz_gfx942",
+        ],
+    ),
+    (
+        "qwen4_gdn_lanes_step_capture_f32_gfx942_hipcc_gfx942.co",
+        &["qwen4_gdn_lanes_step_capture_f32_gfx942"],
+    ),
+    (
+        "qwen4_gdn_lanes_step_capture_f32_gfx942_pm_gfx942.hxaco",
+        &["qwen4_gdn_lanes_step_capture_f32_gfx942"],
+    ),
+    (
+        "qwen4_g942_hc_gates_pm_gfx942.hxaco",
+        &[
+            "gemv_bf16_xf32_k4_rows_tiled_r2",
+            "gemv_bf16_xf32_k4_rows_tiled_r3",
+            "gemv_bf16_xf32_k4_rows_tiled_r4",
+            "gemv_bf16_xf32_k4_rows_tiled_r5",
+            "gemv_bf16_xf32_k4_rows_tiled_r6",
+            "gemv_bf16_xf32_k4_rows_tiled_r7",
+            "gemv_bf16_xf32_k4_rows_tiled_r8",
+        ],
+    ),
+    (
+        "qwen4_g942_gdn_verify_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_gdn_verify_capture_f32",
+            "qwen4_g942_gdn_verify_rollback_f32",
+            "qwen4_g942_gdn_verify_conv_params_k4",
+            "qwen4_g942_gdn_verify_gate_batched",
+        ],
+    ),
+    (
+        "qwen4_g942_gdn_verify_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_gdn_verify_capture_f32",
+            "qwen4_g942_gdn_verify_rollback_f32",
+            "qwen4_g942_gdn_verify_conv_params_k4",
+            "qwen4_g942_gdn_verify_gate_batched",
+        ],
+    ),
+    (
+        "qwen4_g942_gemv_mq2g256v2_xbatch_gfx942_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_gemv_mq2g256v2_xbatch4_k2048",
+            "qwen4_g942_gemv_mq2g256v2_xbatch4_k2560",
+            "qwen4_g942_gemv_mq2g256v2_xbatch8_k2048",
+            "qwen4_g942_gemv_mq2g256v2_xbatch8_k2560",
+        ],
+    ),
+    (
+        "qwen4_g942_gemv_mq2g256v2_xbatch_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_gemv_mq2g256v2_xbatch4_k2048",
+            "qwen4_g942_gemv_mq2g256v2_xbatch4_k2560",
+            "qwen4_g942_gemv_mq2g256v2_xbatch8_k2048",
+            "qwen4_g942_gemv_mq2g256v2_xbatch8_k2560",
+        ],
+    ),
+    (
+        "qwen4_g942_qsa_row_attention_hipcc_gfx942.co",
+        &["qwen4_g942_qsa_row_f32", "qwen4_g942_qsa_row_fp8_fnuz"],
+    ),
+    (
+        "qwen4_g942_qsa_row_attention_pm_gfx942.hxaco",
+        &["qwen4_g942_qsa_row_f32", "qwen4_g942_qsa_row_fp8_fnuz"],
+    ),
+    (
+        "qwen4_g942_moe_gemm_hipcc_gfx942.co",
+        &["qwen4_g942_moe_gemm_f32", "qwen4_g942_moe_gemm_xbf16"],
+    ),
+    (
+        "qwen4_g942_moe_gemm_pm_gfx942.hxaco",
+        &["qwen4_g942_moe_gemm_f32", "qwen4_g942_moe_gemm_xbf16"],
+    ),
+    (
+        "qwen4_g942_rows16_grid_hipcc_gfx942.co",
+        &["qwen4_g942_rows16_grid", "qwen4_g942_rows16_grid_x2"],
+    ),
+    (
+        "qwen4_g942_rows16_grid_pm_gfx942.hxaco",
+        &["qwen4_g942_rows16_grid", "qwen4_g942_rows16_grid_x2"],
+    ),
+    (
+        "qwen4_g942_moe_wide_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_moe_wide_router",
+            "qwen4_g942_moe_wide_group_scatter_desc",
+            "qwen4_g942_moe_wide_unscatter_act",
+            "qwen4_g942_moe_wide_combine_shared_add",
+        ],
+    ),
+    (
+        "qwen4_g942_moe_wide_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_moe_wide_router",
+            "qwen4_g942_moe_wide_group_scatter_desc",
+            "qwen4_g942_moe_wide_unscatter_act",
+            "qwen4_g942_moe_wide_combine_shared_add",
+        ],
+    ),
+    (
+        "qwen4_g942_conv_fuse_hipcc_gfx942.co",
+        &[
+            "qwen4_g942_hyper_norm_bf16x",
+            "qwen4_g942_hyper_write_norm_bf16x",
+        ],
+    ),
+    (
+        "qwen4_g942_conv_fuse_pm_gfx942.hxaco",
+        &[
+            "qwen4_g942_hyper_norm_bf16x",
+            "qwen4_g942_hyper_write_norm_bf16x",
+        ],
+    ),
+];
+
+/// The FP8 prologue's exact remaining refusal. Mixed-FMA now discharges the
+/// attention encoding obligation, so both images positively certify it above;
+/// this is a typed proof, not an expansion of the frozen five-entry seal.
+const QSA_OPEN_FP8: [(&str, &str); 1] = [
+    (
+        "qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942",
+        "qwen4_qsa_lanes_prologue_fp8_fnuz_gfx942: dword 1254: generated instruction v_cvt_pk_fp8_f32 (ENC_VOP3 opcode 674, gfx942) has no hand-written model",
+    ),
+];
+
+/// Kernels of a `CDNA_CERTIFIED` image that stay OPEN: present in the lifted object, never
+/// launched, and still refused by `certify` with the pinned error `(symbol, refusal)`. Keyed
+/// by image file; every other kernel of the image is certified exactly as listed above. An
+/// image absent here is certified whole.
+const CDNA_OPEN: [(&str, &[(&str, &str)]); 2] = [
+    ("qwen4_qsa_lanes_f32_gfx942_hipcc_gfx942.co", &QSA_OPEN_FP8),
+    ("qwen4_qsa_lanes_f32_gfx942_pm_gfx942.hxaco", &QSA_OPEN_FP8),
 ];
 
 /// The gfx942 device ELF of `bytes`: itself when raw, else the single native
@@ -263,18 +498,51 @@ fn gfx942_elf(bytes: &[u8]) -> Result<&[u8], String> {
     Ok(payloads[idx])
 }
 
-/// Typed lift + certify of every kernel; returns the kernel names on success.
-fn certify_gfx942(bytes: &[u8]) -> Result<Vec<String>, String> {
+/// Typed lift + certify of every kernel; returns the certified kernel names and the OPEN
+/// outcomes on success.
+/// Every kernel not in `open` must certify. Every `open` kernel `(symbol, refusal)` must be
+/// present, MUST be certified through the same `certify` call, and must be refused with
+/// exactly `refusal`: a success or any other error fails. An OPEN outcome is never verified.
+fn certify_gfx942(
+    file: &str,
+    bytes: &[u8],
+    open: &[(&str, &str)],
+) -> Result<(Vec<String>, Vec<String>), String> {
     let elf = gfx942_elf(bytes)?;
     let lifted = peacemaker_lift::cdna::lift_object(elf).map_err(|e| format!("cdna lift: {e}"))?;
     peacemaker_lift::cdna::checked(&lifted).map_err(|e| format!("cdna checked: {e}"))?;
-    let mut names = Vec::new();
-    for kernel in &lifted.kernels {
-        peacemaker_isa::cdna::lifted::certify(kernel)
-            .map_err(|e| format!("cdna certify {}: {e}", kernel.image.name))?;
-        names.push(kernel.image.name.clone());
+    for (name, _) in open {
+        if !lifted.kernels.iter().any(|k| k.image.name == *name) {
+            return Err(format!("open kernel {name} is absent from the object"));
+        }
     }
-    Ok(names)
+    let mut names = Vec::new();
+    let mut notes = Vec::new();
+    for kernel in &lifted.kernels {
+        let certified = peacemaker_isa::cdna::lifted::certify(kernel);
+        match open.iter().find(|(name, _)| *name == kernel.image.name) {
+            None => {
+                certified.map_err(|e| format!("cdna certify {}: {e}", kernel.image.name))?;
+                names.push(kernel.image.name.clone());
+            }
+            Some((name, refusal)) => match certified {
+                Ok(_) => {
+                    return Err(format!(
+                        "OPEN kernel {name} unexpectedly certifies; review the pin"
+                    ))
+                }
+                Err(e) if e.to_string() == *refusal => notes.push(format!(
+                    "{file}#{name}: gfx942, OPEN kernel of a certified image, refused as pinned (not verified)"
+                )),
+                Err(e) => {
+                    return Err(format!(
+                        "OPEN kernel {name}: refusal changed: got `{e}`, pinned `{refusal}`"
+                    ))
+                }
+            },
+        }
+    }
+    Ok((names, notes))
 }
 
 #[test]
@@ -291,8 +559,13 @@ fn every_committed_image_verifies_or_is_an_explicit_allowlist_entry() {
     let mut gfx942 = Vec::new();
     for image in &images {
         if let Some((_, expected)) = CDNA_CERTIFIED.iter().find(|(f, _)| *f == image.file) {
-            match certify_gfx942(&image.bytes) {
-                Ok(names) => {
+            let open: &[(&str, &str)] = CDNA_OPEN
+                .iter()
+                .find(|(f, _)| *f == image.file)
+                .map_or(&[], |(_, open)| *open);
+            match certify_gfx942(&image.file, &image.bytes, open) {
+                Ok((names, notes)) => {
+                    gfx942.extend(notes);
                     let mut got = names.clone();
                     got.sort();
                     let mut want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
@@ -349,10 +622,44 @@ fn error_pc(error: &str) -> Option<usize> {
         .ok()
 }
 
-/// The `POOL_BODY` entry a strict report of a pool is, by template id, body pc and the exact
-/// instruction and need, or why it is none. A pc outside every body span (a dispatcher pc,
-/// a region's entry or exit label) has no entry by construction.
-fn classify_body(emitted: &Emitted, error: &str) -> Result<usize, String> {
+/// Match a finding by stable module/symbol, body pc, instruction and need. The category
+/// is checked against the corresponding standalone finding by the exhaustive pool test.
+fn body_entry(target: &str, body_pc: usize, error: &str) -> Result<usize, String> {
+    let i = POOL_BODY
+        .iter()
+        .position(|a| a.target == target && a.body_pc == body_pc)
+        .ok_or_else(|| format!("unlisted body finding: {target}, body pc {body_pc}"))?;
+    let a = &POOL_BODY[i];
+    if !error.contains(a.insn) || !error.contains(a.need) {
+        return Err(format!(
+            "{target} body pc {body_pc} is listed for {} {} but the report differs",
+            a.insn, a.need
+        ));
+    }
+    Ok(i)
+}
+
+/// Resolve the emission-local template id before looking up a stable body key.
+/// A dispatcher pc or a region's entry/exit label has no entry by construction.
+fn body_entry_for_template(
+    tid_targets: &[(u32, String)],
+    tid: u32,
+    body_pc: usize,
+    error: &str,
+) -> Result<usize, String> {
+    let target = tid_targets
+        .iter()
+        .find(|(id, _)| *id == tid)
+        .map(|(_, target)| target.as_str())
+        .ok_or_else(|| format!("template {tid} is not a converted region"))?;
+    body_entry(target, body_pc, error)
+}
+
+fn classify_body(
+    emitted: &Emitted,
+    tid_targets: &[(u32, String)],
+    error: &str,
+) -> Result<usize, String> {
     let pc = error_pc(error).ok_or("not a hazard report")?;
     let region = emitted
         .proof
@@ -369,18 +676,7 @@ fn classify_body(emitted: &Emitted, error: &str) -> Result<usize, String> {
     let body_pc = pc
         .checked_sub(region.entry_pc + 2)
         .ok_or_else(|| format!("pc {pc} is the region entry of template {tid}"))?;
-    let i = POOL_BODY
-        .iter()
-        .position(|a| a.tid == tid && a.body_pc == body_pc)
-        .ok_or_else(|| format!("unlisted body finding: template {tid}, body pc {body_pc}"))?;
-    let a = &POOL_BODY[i];
-    if !error.contains(a.insn) || !error.contains(a.need) {
-        return Err(format!(
-            "template {tid} body pc {body_pc} is listed for {} {} but the report differs",
-            a.insn, a.need
-        ));
-    }
-    Ok(i)
+    body_entry_for_template(tid_targets, tid, body_pc, error)
 }
 
 #[derive(Default)]
@@ -560,7 +856,11 @@ fn check_pool(
             let listed: Vec<u32> = hosted
                 .iter()
                 .copied()
-                .filter(|t| POOL_BODY.iter().any(|a| a.tid == *t))
+                .filter(|t| {
+                    tid_targets.iter().any(|(id, target)| {
+                        *id == *t && POOL_BODY.iter().any(|a| a.target == target)
+                    })
+                })
                 .collect();
             if dispatcher.suppressed != 0 || !listed.is_empty() {
                 report.unmatched.push(format!(
@@ -590,7 +890,7 @@ fn check_pool(
                     .push(format!("[POOL STATE CAP] {target}: {why}: {e}")),
             }
         }
-        Err(e) => match classify_body(emitted, &e) {
+        Err(e) => match classify_body(emitted, tid_targets, &e) {
             // A summarized region is not walked by the dispatcher-only verifier, so whether
             // it counted this body finding as suppressed depends on the summary; the strict
             // walk is what finds it and the exact entry is what accepts it.
@@ -660,18 +960,19 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
         }
     }
     assert!(!by_block.is_empty(), "no kernel converts to a region");
-    // The body entries are literal: each names a template id of this scan and the `pins`
-    // finding it is the pool-hosted copy of (same target, instruction, need and category),
-    // and each template has at most one.
+    // Every stable key names exactly one converted module/symbol and the `pins`
+    // finding it is the hosted copy of (same instruction, need and category).
     for a in POOL_BODY {
-        if !by_block
+        if by_block
             .values()
             .flatten()
-            .any(|r| r.tid == a.tid && r.target == a.target)
+            .filter(|r| r.target == a.target)
+            .count()
+            != 1
         {
             report.unmatched.push(format!(
-                "[POOL BODY ENTRY] template {} is not {} in this scan",
-                a.tid, a.target
+                "[POOL BODY ENTRY] {} is not exactly one region in this scan",
+                a.target
             ));
         }
         let prefix = match a.category {
@@ -686,14 +987,14 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
                 && f.why.starts_with(prefix)
         }) {
             report.unmatched.push(format!(
-                "[POOL BODY ENTRY] template {}: no `pins` finding of {} with {} {} and category {:?}",
-                a.tid, a.target, a.insn, a.need, a.category
+                "[POOL BODY ENTRY] {}: no `pins` finding with {} {} and category {:?}",
+                a.target, a.insn, a.need, a.category
             ));
         }
-        if POOL_BODY.iter().filter(|b| b.tid == a.tid).count() != 1 {
+        if POOL_BODY.iter().filter(|b| b.target == a.target).count() != 1 {
             report.unmatched.push(format!(
-                "[POOL BODY ENTRY] template {} has more than one entry",
-                a.tid
+                "[POOL BODY ENTRY] {} has more than one entry",
+                a.target
             ));
         }
     }
@@ -798,8 +1099,8 @@ fn lifted_pools_dispatcher_is_fatal_and_bodies_match_exact_entries() {
     for (i, a) in POOL_BODY.iter().enumerate() {
         if !used.contains(&i) {
             report.unmatched.push(format!(
-                "[STALE POOL BODY] template {} body pc {} ({}) no longer occurs",
-                a.tid, a.body_pc, a.target
+                "[STALE POOL BODY] {} body pc {} no longer occurs",
+                a.target, a.body_pc
             ));
         }
     }
@@ -928,4 +1229,76 @@ fn state_cap_table_is_pinned_to_standalone_unsupported_rows() {
         why: "test",
     }];
     assert!(check_state_cap_table(&bogus, UNSUPPORTED).is_err());
+}
+
+/// Frozen mechanically from af76fde0b1's complete positional table, before removing tids.
+/// Equality of all predicate fields proves equality of the accepted finding sets, not
+/// merely equality of the findings the current verifier happens to emit.
+#[test]
+fn stable_body_keys_accept_exactly_the_legacy_finding_set() {
+    let legacy: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("ledger_cfg_pins/legacy_pool_body.json")).unwrap();
+    assert_eq!(
+        POOL_BODY
+            .iter()
+            .filter(|row| legacy.iter().any(|old| old["target"] == row.target))
+            .count(),
+        legacy.len()
+    );
+    let tids: Vec<(u32, String)> = legacy
+        .iter()
+        .map(|r| {
+            (
+                r["tid"].as_u64().unwrap() as u32,
+                r["target"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    let mut shifted: Vec<(u32, String)> = tids
+        .iter()
+        .map(|(tid, target)| (tid + 1, target.clone()))
+        .collect();
+    // A new image sorting before every existing template. It has no finding entry.
+    shifted.push((16, "a_new_image.hxaco#new_kernel".into()));
+    for old in &legacy {
+        let tid = old["tid"].as_u64().unwrap() as u32;
+        let target = old["target"].as_str().unwrap();
+        let pc = old["body_pc"].as_u64().unwrap() as usize;
+        let insn = old["insn"].as_str().unwrap();
+        let need = old["need"].as_str().unwrap();
+        let category = match old["category"].as_str().unwrap() {
+            "ModelLimit" => Category::ModelLimit,
+            "Candidate" => Category::Candidate,
+            other => panic!("unknown legacy category {other}"),
+        };
+        let i = POOL_BODY
+            .iter()
+            .position(|row| row.target == target)
+            .unwrap();
+        let row = &POOL_BODY[i];
+        // Every field of the old acceptance predicate survives unchanged, and there is
+        // exactly one old tid and one new target for each predicate.
+        assert_eq!(
+            (row.target, row.body_pc, row.category, row.insn, row.need),
+            (target, pc, category, insn, need)
+        );
+        assert_eq!(tids.iter().filter(|(t, _)| *t == tid).count(), 1);
+        assert_eq!(tids.iter().filter(|(_, t)| t == target).count(), 1);
+        let error = format!("pc {pc} {insn} (after label `.Lt{tid}b_0`): {need}");
+        assert_eq!(body_entry_for_template(&tids, tid, pc, &error), Ok(i));
+        let shifted_error = error.replace(&format!(".Lt{tid}b_"), &format!(".Lt{}b_", tid + 1));
+        assert_eq!(
+            body_entry_for_template(&shifted, tid + 1, pc, &shifted_error),
+            Ok(i)
+        );
+        // Counterexamples remain rejected; renumbering is the only allowed difference.
+        assert!(body_entry_for_template(&tids, tid, pc + 1, &error).is_err());
+        assert!(
+            body_entry_for_template(&tids, tid, pc, &error.replace(insn, "`changed`")).is_err()
+        );
+        assert!(
+            body_entry_for_template(&tids, tid, pc, &error.replace(need, "needs changed")).is_err()
+        );
+        assert!(body_entry_for_template(&shifted, 16, pc, &error).is_err());
+    }
 }

@@ -150,7 +150,7 @@ pub(crate) fn family_of(inst: &Inst) -> &'static str {
 }
 
 fn opcode_name(inst: &Inst, arch: Arch) -> Option<&'static str> {
-    inst.op.name(arch)
+    inst.name(arch)
 }
 
 /// WAR def set mirroring `ledger_replay.rs:131-144`: loads plus the ALU
@@ -208,7 +208,7 @@ pub(crate) fn operand_mask(inst: &Inst, arch: Arch, index: usize) -> u32 {
         Some(Operand::Reg(r)) if r.kind == Kind::V && r.len == 1 => {}
         _ => return u32::MAX,
     }
-    let name = inst.op.name(arch).unwrap_or("");
+    let name = inst.name(arch).unwrap_or("");
     if index == 0
         && inst.effects.mem.as_ref().is_some_and(|m| is_load(m.class))
         && name.contains("d16")
@@ -282,7 +282,7 @@ fn counter_at(index: usize) -> Counter {
 /// instruction's return form (`@rtn` / `@nortn` rules).
 pub(crate) fn unit_weights(inst: &Inst, arch: Arch) -> [u8; N] {
     let mut units = [0u8; N];
-    let Some(row) = crate::isa::lookup(arch, inst.op, inst.form) else {
+    let Some(row) = crate::isa::lookup_inst(arch, &inst).ok() else {
         return units;
     };
     for (counter, weight) in row.counter_rules(crate::isa::atomic_returns(arch, &inst.mods.cpol)) {
@@ -1055,10 +1055,11 @@ mod c5_tests {
                     .iter()
                     .find(|row| row.name == name)
                     .expect(name);
-                Inst::from_parts(
+                Inst::from_encoding(
                     arch,
                     row.op,
                     row.form,
+                    row.variant,
                     FormFields::None,
                     SmallVec::from_vec(operands),
                     Modifiers::default(),
@@ -1694,7 +1695,7 @@ mod c5_tests {
             }
             let blamed = replay.events.iter().any(|event| {
                 event.class == MemClass::DsStore
-                    && body.insts.get(event.inst).unwrap().op.name(Arch::Gfx1201)
+                    && body.insts.get(event.inst).unwrap().name(Arch::Gfx1201)
                         == Some("ds_store_2addr_b64")
                     && event.src_locks.0.iter().any(|reg| {
                         (0..reg.len).any(|i| touch.contains(&(reg.kind, reg.base + u16::from(i))))
@@ -1763,7 +1764,6 @@ mod c5_tests {
                 .insts
                 .get(event.inst)
                 .unwrap()
-                .op
                 .name(Arch::Gfx1201)
                 .unwrap_or("?");
             let expected = if name.contains("b32") {
@@ -1778,7 +1778,7 @@ mod c5_tests {
         for event in &smem {
             let retired = replay.facts.iter().any(|fact| {
                 fact.satisfies.contains(&event.id)
-                    && body.insts.get(fact.wait).unwrap().op.name(Arch::Gfx1201)
+                    && body.insts.get(fact.wait).unwrap().name(Arch::Gfx1201)
                         == Some("s_wait_kmcnt")
             });
             assert!(
@@ -1795,9 +1795,7 @@ mod c5_tests {
         let wait_ids: Vec<_> = body
             .layout
             .iter()
-            .filter(|id| {
-                body.insts.get(**id).unwrap().op.name(Arch::Gfx1201) == Some("s_wait_kmcnt")
-            })
+            .filter(|id| body.insts.get(**id).unwrap().name(Arch::Gfx1201) == Some("s_wait_kmcnt"))
             .copied()
             .collect();
         assert_eq!(wait_ids.len(), 7);

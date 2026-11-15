@@ -150,7 +150,6 @@ fn main() {
             None,
             None,
             None,
-            None,
         )
         .expect("prefix prefill");
 
@@ -166,7 +165,6 @@ fn main() {
             &scratch,
             None,
             Some(&h_buf),
-            None,
             None,
         )
         .expect("scored prefill");

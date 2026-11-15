@@ -3,13 +3,29 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Process-start hooks that run before any config, protocol or GPU work:
-//! opt-in structured logging and the one-line GPU memory fault hint.
+//! opt-in structured logging, the one-line GPU memory fault hint and, on
+//! Windows, the low priority class warning.
 
 /// Run once, first thing in `main`: structured logging, then the fault hint
 /// (registered before any HIP call so the first error 700 is observed).
 pub(crate) fn init() {
     init_tracing();
     hip_bridge::register_first_illegal_address_hook(report_gpu_memory_fault);
+    #[cfg(windows)]
+    warn_low_priority_class();
+}
+
+/// Windows only (#1144): an Idle/BelowNormal class is inherited from the
+/// launcher (Task Scheduler's default task priority 7 is BelowNormal) and the
+/// daemon never raises it, so say so once on stderr, with the fix.
+#[cfg(windows)]
+fn warn_low_priority_class() {
+    use hipfire_config::process_priority;
+    if let Some(warning) =
+        process_priority::current().and_then(process_priority::low_priority_warning)
+    {
+        eprintln!("{warning}");
+    }
 }
 
 /// Install opt-in structured diagnostics on stderr. Stdout is reserved for the

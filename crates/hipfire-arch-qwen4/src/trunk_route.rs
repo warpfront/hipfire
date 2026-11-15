@@ -9,23 +9,28 @@
 //! Every EP rank runs its forward on its own thread (rank 0 on the caller's, a peer on its
 //! pool worker), so the route is a thread-local installed when that rank attaches its EP
 //! tables ([`install`]) and read where the forward builds its HC writes. It is leaked once
-//! per load (a few bytes): the forward borrows it as `&'static dyn HyperWriteAr`.
+//! per load (a few bytes): the forward borrows its two write sites ([`attn_writer`],
+//! [`ffn_writer`]) as `&'static dyn HyperWriteAr`.
+//!
+//! The two sites may send their partials in different wire formats ([`ArHcPartial`]). The FFN
+//! partial is already bf16-exact (`bf16_scaled_add` stores the bf16-rounded shared + routed
+//! sum), so it always travels as bf16. The mixer out-projection partial (GDN `out_proj` / QSA
+//! `o_proj`) is a raw f32 GEMV output: by default (`topology.ep_ar_wire = "bf16"`) it is rounded
+//! to bf16 before the fold; with `"f32"` it travels unrounded and the fold rounds `p0 + p1` to
+//! bf16 once, like one card's K sum.
 
 use hipfire_dispatch::pipeline::{HyperWriteAr, QsaSelectGather, RowGather};
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
-use rdna_compute::ar_hc_write::{sp_even_split, SpAgElem, StreamKind};
+use rdna_compute::ar_hc_write::{sp_even_split, ArHcPartial, SpAgElem, StreamKind};
 use rdna_compute::{Gpu, GpuTensor};
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-/// Switch of the sequence-parallel prefill route: unset (or `1` / `on` / `true`) = ON wherever
-/// the trunk-shard route runs (exact gfx1201 EP2, `HIPFIRE_QWEN4_EP_TRUNK_SHARD`); `0` / `off` /
-/// `false` is the kill switch (the all-reduce route); any other value is off (fail safe).
-pub(crate) const SP_ENV: &str = "HIPFIRE_QWEN4_EP_SEQ_PARALLEL";
-
-/// Smallest chunk (rows) of the wide sequence-parallel band (any HC route; the sub-512 band is
-/// [`SP_SUB512_MIN_ROWS`]..=511 on the prefill lane WMMA HC read): both halves (`n / 2` rows, floored) must
+/// Smallest chunk (rows) of the wide sequence-parallel band outside the ordinary-prefill intent
+/// (any HC route; the sub-512 band is [`SP_SUB512_MIN_ROWS`]..=511 on the prefill lane WMMA HC
+/// read; under the ordinary-prefill intent every chunk of [`SP_SUB512_MIN_ROWS`] rows and up, see
+/// [`sp_rows_in_band`]): both halves (`n / 2` rows, floored) must
 /// sit on the same side of every HC read / write kernel-route threshold as the whole chunk
 /// (`wide_exact_rows` / the few-row limit up to `WIDE_VERIFY_MAX_ROWS`, the F16 WMMA and BF16
 /// stream floor `QWEN4_F16_WMMA_MIN_TOKENS`, the HC up `_v2` floor, the HC down fused floors), so
@@ -34,94 +39,42 @@ pub(crate) const SP_ENV: &str = "HIPFIRE_QWEN4_EP_SEQ_PARALLEL";
 // selector-receipt: receipts/selectors/sp_min_rows.json
 pub(crate) const SP_MIN_ROWS: usize = 3072;
 
-/// Whether the raw [`SP_ENV`] value asks for the sequence-parallel prefill route.
-pub(crate) fn sp_switch(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), None | Some("" | "1" | "on" | "true"))
-}
-
-/// Whether the process asks for the sequence-parallel prefill route ([`SP_ENV`], [`sp_switch`]).
-pub(crate) fn sp_requested() -> bool {
-    sp_switch(hipfire_config::developer_var(SP_ENV).ok().as_deref())
-}
-
-/// Switch of the sub-512 sequence-parallel band: unset (or `1` / `on` / `true`) = ON wherever the
-/// sequence-parallel prefill route runs ([`SP_ENV`]); `0` / `off` / `false` is the kill switch
-/// (chunks below [`SP_MIN_ROWS`] keep the all-reduce route); any other value is off (fail safe).
-/// A trunk-shard prefill chunk of [`SP_SUB512_MIN_ROWS`]..=511 rows then also runs
-/// sequence-parallel, provided its HC read is the pinned-split-K prefill lane WMMA entry for the
-/// whole chunk AND for both halves (`Gpu::prefill_lwmma_hc_applies`, checked by the forward):
-/// that entry is row-count invariant, so a row's bytes do not depend on which half carries it.
-pub(crate) const SP_SUB512_ENV: &str = "HIPFIRE_QWEN4_EP_SP_SUB512";
-
 /// Fewest rows of a sub-512 sequence-parallel chunk: both halves (the smaller is `n / 2`) above
 /// the few-row window (`WIDE_VERIFY_MAX_ROWS`, 64), where the HC read leaves the lane WMMA
 /// decode arm and the HC8 decode route for the prefill lane WMMA entry. Pinned by a unit test.
 pub(crate) const SP_SUB512_MIN_ROWS: usize =
     2 * (rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS + 1);
 
-static SP_SUB512_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    sp_switch(hipfire_config::developer_var(SP_SUB512_ENV).ok().as_deref())
-});
+/// Whether a forward routes at its real row extent: the routing row count equals the launch
+/// rows (`route_n == n`, no scope substituted the count), OR the ordinary-prefill intent is open
+/// (`ordinary`: `Gpu::ordinary_prefill_active`). Under that intent `Gpu::route_rows` returns the
+/// canonical chunk for EVERY extent and every row-keyed route is the canonical one for any launch
+/// extent (a 1-row, a 25-row and a 4096-row launch pick the same kernels), so own-row halves and
+/// masked tiles pick exactly the kernels the whole-chunk launch picks. Only a scope that
+/// substitutes the count while per-extent routes still exist (the invariant profile, the append
+/// route, a route-rows cap) leaves `route_n != n` without the intent: those keep the all-rows
+/// routes. Pure. The one predicate of the sequence-parallel admission and of the partial tile
+/// mask (`ep_partial_mask_active`).
+pub(crate) fn routes_at_real_extent(n: usize, route_n: usize, ordinary: bool) -> bool {
+    route_n == n || ordinary
+}
 
 /// Whether an `n`-row chunk is inside a sequence-parallel row band: at least [`SP_MIN_ROWS`], or
-/// (`sub512`, [`SP_SUB512_ENV`]) [`SP_SUB512_MIN_ROWS`]..=511 rows. The forward adds the HC route
-/// check of the sub-512 band.
-pub(crate) fn sp_rows_in_band(n: usize, sub512: bool) -> bool {
+/// [`SP_SUB512_MIN_ROWS`]..=511 rows, or, under the ordinary-prefill intent (`ordinary`),
+/// [`SP_SUB512_MIN_ROWS`] rows and up (the 512..3071 gap only keeps the halves on one side of
+/// row-count thresholds, which the intent removes). The forward adds the HC route check of the
+/// sub-512 band outside the intent.
+pub(crate) fn sp_rows_in_band(n: usize, ordinary: bool) -> bool {
     n >= SP_MIN_ROWS
-        || (sub512
-            && (SP_SUB512_MIN_ROWS..rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS).contains(&n))
+        || (n >= SP_SUB512_MIN_ROWS
+            && (ordinary || n < rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS))
 }
 
-/// [`sp_rows_in_band`] with this process's [`SP_SUB512_ENV`].
-pub(crate) fn sp_chunk_rows_in_band(n: usize) -> bool {
-    sp_rows_in_band(n, *SP_SUB512_ON)
-}
-
-/// Switch of sequence-parallel HC for EP prefill WAVES (`forward_lanes_scoped`) of at least
-/// [`SP_SUB512_MIN_ROWS`] rows, on top of [`SP_SUB512_ENV`]: unset / `1` / `on` / `true` is on,
-/// `0` / `off` / `false` is the kill switch, any other value is off.
-pub(crate) const SP_SUB512_WAVE_ENV: &str = "HIPFIRE_QWEN4_EP_SP_SUB512_WAVE";
-
-static SP_SUB512_WAVE_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    sp_switch(
-        hipfire_config::developer_var(SP_SUB512_WAVE_ENV)
-            .ok()
-            .as_deref(),
-    )
-});
-
-/// Whether an `n`-row EP prefill wave runs its joint HC sequence-parallel: the sub-512 switch
-/// (`sub512`, [`SP_SUB512_ENV`]) and the wave switch (`wave`, [`SP_SUB512_WAVE_ENV`]) are both on
-/// and `n >= `[`SP_SUB512_MIN_ROWS`]. The wave's routing-row cap of 511 keeps every launch and
-/// both halves on sub-512 routes (waves are capped at 2048 rows).
-pub(crate) fn sp_wave_rows_in_band_from(n: usize, sub512: bool, wave: bool) -> bool {
-    sub512 && wave && n >= SP_SUB512_MIN_ROWS
-}
-
-/// [`sp_wave_rows_in_band_from`] with this process's switches.
+/// Whether an `n`-row EP prefill wave runs its joint HC sequence-parallel: `n >=`
+/// [`SP_SUB512_MIN_ROWS`]. The wave's routing-row cap of 511 keeps every launch and both
+/// halves on sub-512 routes (waves are capped at 2048 rows).
 pub(crate) fn sp_wave_rows_in_band(n: usize) -> bool {
-    sp_wave_rows_in_band_from(n, *SP_SUB512_ON, *SP_SUB512_WAVE_ON)
-}
-
-/// Switch of the sequence-parallel QSA indexer inside a sequence-parallel chunk (each rank selects
-/// its own work-balanced rows and the block ids are all-gathered): unset (or `1` / `on` / `true`)
-/// = ON wherever the sequence-parallel prefill route runs ([`SP_ENV`]); `0` / `off` / `false` is
-/// the kill switch (every rank selects every row); any other value is off (fail safe).
-pub(crate) const SP_INDEXER_ENV: &str = "HIPFIRE_QWEN4_EP_SP_INDEXER";
-
-/// Whether the raw [`SP_INDEXER_ENV`] value asks for the sequence-parallel QSA indexer.
-pub(crate) fn sp_indexer_switch(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), None | Some("" | "1" | "on" | "true"))
-}
-
-/// Whether the process asks for the sequence-parallel QSA indexer ([`SP_INDEXER_ENV`],
-/// [`sp_indexer_switch`]).
-pub(crate) fn sp_indexer_requested() -> bool {
-    sp_indexer_switch(
-        hipfire_config::developer_var(SP_INDEXER_ENV)
-            .ok()
-            .as_deref(),
-    )
+    n >= SP_SUB512_MIN_ROWS
 }
 
 /// The row split of one sequence-parallel chunk on one rank: `own` / `peer` are
@@ -154,25 +107,28 @@ pub(crate) struct TrunkShardRoute {
     /// The FFN writes carry it (the sealed MoE then yields this rank's partial: no row
     /// gather).
     ffn: bool,
-    /// [`SP_ENV`] was on when the route was installed.
-    sp_on: bool,
-    /// [`SP_INDEXER_ENV`] was on when the route was installed.
-    sp_indexer_on: bool,
+    /// Wire format of the mixer writes' partials (`topology.ep_ar_wire`).
+    mixer: ArHcPartial,
     /// The sequence-parallel split of the chunk program being executed ([`sp_begin`] /
-    /// [`sp_end`]); `None` outside one. A mutex, not a cell: the route is a `Sync`
-    /// [`HyperWriteAr`], though only its own rank thread ever touches the state.
+    /// [`sp_end`]); `None` outside one. A mutex, not a cell: the route is `Sync` (a
+    /// [`RowGather`] / [`QsaSelectGather`]), though only its own rank thread ever touches the state.
     sp: Mutex<Option<SpRows>>,
 }
 
 impl TrunkShardRoute {
-    pub(crate) fn new(exchange: Arc<ArHcExchange>, rank: usize, attn: bool, ffn: bool) -> Self {
+    pub(crate) fn new(
+        exchange: Arc<ArHcExchange>,
+        rank: usize,
+        attn: bool,
+        ffn: bool,
+        mixer: ArHcPartial,
+    ) -> Self {
         Self {
             exchange,
             rank,
             attn,
             ffn,
-            sp_on: sp_requested(),
-            sp_indexer_on: sp_indexer_requested(),
+            mixer,
             sp: Mutex::new(None),
         }
     }
@@ -180,12 +136,13 @@ impl TrunkShardRoute {
     fn sp_state(&self) -> Option<SpRows> {
         *self.sp.lock().unwrap_or_else(|p| p.into_inner())
     }
-}
 
-impl HyperWriteAr for TrunkShardRoute {
-    fn ar_hyper_write(
+    /// The fused all-reduce + HC write of one site, its partial sent as `partial_fmt`.
+    #[allow(clippy::too_many_arguments)]
+    fn site_write(
         &self,
         gpu: &mut Gpu,
+        partial_fmt: ArHcPartial,
         partial: &GpuTensor,
         streams: &GpuTensor,
         gates: &GpuTensor,
@@ -219,6 +176,7 @@ impl HyperWriteAr for TrunkShardRoute {
                         .sub(row0 * kind.row_bytes())
                         .cast::<c_void>(),
                     kind,
+                    partial_fmt,
                     gates
                         .buf
                         .as_ptr()
@@ -243,12 +201,52 @@ impl HyperWriteAr for TrunkShardRoute {
                 partial.buf.as_ptr(),
                 streams.buf.as_ptr(),
                 StreamKind::from_state_bf16(state_bf16),
+                partial_fmt,
                 gates.buf.as_ptr(),
                 rows,
                 std::ptr::null_mut(),
             )
         }
         .map_err(|error| format!("rank {}: {error}", self.rank))
+    }
+}
+
+/// One write site of this thread's route, by the wire format of its partials: the mixer (bf16
+/// or f32, `topology.ep_ar_wire`) or the FFN (bf16). Stateless: a write runs this thread's
+/// installed route (the forward builds and executes its HC writes on its rank's thread, like the
+/// route's sequence-parallel state).
+pub(crate) struct SiteWriter {
+    partial: ArHcPartial,
+}
+
+static BF16_SITE: SiteWriter = SiteWriter {
+    partial: ArHcPartial::Bf16,
+};
+static F32_SITE: SiteWriter = SiteWriter {
+    partial: ArHcPartial::F32,
+};
+
+fn site(partial: ArHcPartial) -> &'static dyn HyperWriteAr {
+    match partial {
+        ArHcPartial::Bf16 => &BF16_SITE,
+        ArHcPartial::F32 => &F32_SITE,
+    }
+}
+
+impl HyperWriteAr for SiteWriter {
+    fn ar_hyper_write(
+        &self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+        streams: &GpuTensor,
+        gates: &GpuTensor,
+        rows: usize,
+        state_bf16: bool,
+    ) -> Result<(), String> {
+        ROUTE
+            .with(Cell::get)
+            .ok_or_else(|| "trunk-shard write without a route on this thread".to_string())?
+            .site_write(gpu, self.partial, partial, streams, gates, rows, state_bf16)
     }
 }
 
@@ -346,20 +344,21 @@ pub(crate) fn install(route: Option<TrunkShardRoute>) {
     ROUTE.with(|cell| cell.set(leaked));
 }
 
-/// The writer of the mixer HC writes, when this thread's route carries them.
+/// The writer of the mixer HC writes (the route's mixer wire), when this thread's route carries
+/// them.
 pub(crate) fn attn_writer() -> Option<&'static dyn HyperWriteAr> {
     ROUTE
         .with(Cell::get)
         .filter(|r| r.attn)
-        .map(|r| r as &dyn HyperWriteAr)
+        .map(|r| site(r.mixer))
 }
 
-/// The writer of the FFN HC writes, when this thread's route carries them.
+/// The writer of the FFN HC writes (bf16 partials), when this thread's route carries them.
 pub(crate) fn ffn_writer() -> Option<&'static dyn HyperWriteAr> {
     ROUTE
         .with(Cell::get)
         .filter(|r| r.ffn)
-        .map(|r| r as &dyn HyperWriteAr)
+        .map(|_| site(ArHcPartial::Bf16))
 }
 
 /// Whether this thread's FFN is the partial route (no expert-row gather).
@@ -368,12 +367,12 @@ pub(crate) fn ffn_partial_active() -> bool {
 }
 
 /// This thread's route when it can run sequence-parallel chunks: installed with both writers
-/// ([`attn_writer`], [`ffn_writer`]), [`SP_ENV`] on at install and an exchange with the dense
-/// mailbox region the SP launches need.
+/// ([`attn_writer`], [`ffn_writer`]) and an exchange with the dense mailbox region the SP
+/// launches need.
 pub(crate) fn sp_route() -> Option<&'static TrunkShardRoute> {
     ROUTE
         .with(Cell::get)
-        .filter(|r| r.attn && r.ffn && r.sp_on && r.exchange.sp_available())
+        .filter(|r| r.attn && r.ffn && r.exchange.sp_available())
 }
 
 /// The row split of an `n`-row chunk on this thread's rank, `None` without an [`sp_route`].
@@ -398,12 +397,9 @@ pub(crate) fn sp_end() {
 }
 
 /// The sequence-parallel QSA selection of this thread's rank: `(rank, route)` when this thread's
-/// [`sp_route`] exists and [`SP_INDEXER_ENV`] was on at install, else `None` (every rank selects
-/// every row).
+/// [`sp_route`] exists, else `None` (every rank selects every row).
 pub(crate) fn sp_qsa_gather() -> Option<(usize, &'static dyn QsaSelectGather)> {
-    sp_route()
-        .filter(|r| r.sp_indexer_on)
-        .map(|r| (r.rank, r as &'static dyn QsaSelectGather))
+    sp_route().map(|r| (r.rank, r as &'static dyn QsaSelectGather))
 }
 
 /// The work-balanced row split of the QSA indexer select of an `n`-row tile starting at
@@ -443,17 +439,15 @@ pub(crate) fn qsa_select_split(n: usize, position_start: usize) -> [(usize, usiz
     [(0, s), (s, n - s)]
 }
 
-/// Resolve the SP kernels of `exchange` on `gpu` when [`SP_ENV`] is on and the exchange has a
-/// dense mailbox region (load time: JIT is not capture-safe); a no-op otherwise.
+/// Resolve the SP kernels of `exchange` on `gpu` when it has a dense mailbox region (load time:
+/// JIT is not capture-safe); a no-op otherwise.
 pub(crate) fn sp_prepare(exchange: &ArHcExchange, gpu: &mut Gpu) -> Result<(), String> {
-    if sp_requested() && exchange.sp_available() {
+    if exchange.sp_available() {
         exchange
             .sp_ensure_kernels(gpu)
             .map_err(|e| format!("resolve the sequence-parallel kernels: {e}"))?;
-        if sp_indexer_requested() {
-            gpu.ensure_qsa_sp_select_kernels()
-                .map_err(|e| format!("resolve the sequence-parallel QSA select kernels: {e}"))?;
-        }
+        gpu.ensure_qsa_sp_select_kernels()
+            .map_err(|e| format!("resolve the sequence-parallel QSA select kernels: {e}"))?;
     }
     Ok(())
 }
@@ -466,7 +460,13 @@ mod tests {
     fn route_is_per_thread_and_clearable() {
         assert!(attn_writer().is_none() && ffn_writer().is_none() && !ffn_partial_active());
         let x = Arc::new(ArHcExchange::new(8).unwrap());
-        install(Some(TrunkShardRoute::new(x.clone(), 0, false, true)));
+        install(Some(TrunkShardRoute::new(
+            x.clone(),
+            0,
+            false,
+            true,
+            ArHcPartial::F32,
+        )));
         assert!(attn_writer().is_none());
         assert!(ffn_writer().is_some() && ffn_partial_active());
         std::thread::spawn(|| assert!(ffn_writer().is_none()))
@@ -474,6 +474,27 @@ mod tests {
             .unwrap();
         install(None);
         assert!(ffn_writer().is_none() && !ffn_partial_active());
+    }
+
+    /// The mixer writer follows the route's `topology.ep_ar_wire`; the FFN writer is always bf16.
+    #[test]
+    fn mixer_writer_follows_the_route_wire_and_ffn_stays_bf16() {
+        let x = Arc::new(ArHcExchange::new(8).unwrap());
+        let is = |w: Option<&'static dyn HyperWriteAr>, site: &'static SiteWriter| {
+            std::ptr::addr_eq(
+                w.unwrap() as *const dyn HyperWriteAr,
+                site as *const SiteWriter,
+            )
+        };
+        for (mixer, want) in [
+            (ArHcPartial::Bf16, &BF16_SITE),
+            (ArHcPartial::F32, &F32_SITE),
+        ] {
+            install(Some(TrunkShardRoute::new(x.clone(), 0, true, true, mixer)));
+            assert!(is(attn_writer(), want), "{mixer:?}");
+            assert!(is(ffn_writer(), &BF16_SITE), "{mixer:?}");
+        }
+        install(None);
     }
 
     /// `SP_MIN_ROWS` keeps the own-row halves (`SP_MIN_ROWS / 2` rows, the smaller half of any
@@ -533,7 +554,8 @@ mod tests {
         assert_eq!(rdna_compute::hc8::MAX_ROWS, WIDE_VERIFY_MAX_ROWS);
         assert!(rdna_compute::gemv::LANE_WMMA_MIN_ROWS <= WIDE_VERIFY_MAX_ROWS);
         for n in SP_SUB512_MIN_ROWS..QWEN4_F16_WMMA_MIN_TOKENS {
-            assert!(sp_rows_in_band(n, true), "{n}");
+            assert!(sp_rows_in_band(n, false), "{n}");
+            assert!(sp_rows_in_band(n, true), "{n} ordinary");
             let [a, b] = sp_even_split(n);
             for half in [a.1, b.1] {
                 assert!(half > WIDE_VERIFY_MAX_ROWS, "{n}: {half}");
@@ -548,65 +570,85 @@ mod tests {
         }
         let below = SP_SUB512_MIN_ROWS - 1;
         assert!(sp_even_split(below)[1].1 <= WIDE_VERIFY_MAX_ROWS);
+        assert!(!sp_rows_in_band(below, false));
         assert!(!sp_rows_in_band(below, true));
     }
 
     #[test]
-    fn sp_bands_follow_the_sub512_switch() {
-        for (n, on, off) in [
-            (64, false, false),
-            (129, false, false),
-            (130, true, false),
-            (149, true, false),
-            (511, true, false),
-            (512, false, false),
-            (1192, false, false),
-            (3071, false, false),
-            (SP_MIN_ROWS, true, true),
-            (16384, true, true),
+    fn sp_bands_are_the_row_floors() {
+        for (n, on) in [
+            (64, false),
+            (129, false),
+            (130, true),
+            (149, true),
+            (511, true),
+            (512, false),
+            (1192, false),
+            (3071, false),
+            (SP_MIN_ROWS, true),
+            (16384, true),
         ] {
-            assert_eq!(sp_rows_in_band(n, true), on, "{n} on");
-            assert_eq!(sp_rows_in_band(n, false), off, "{n} off");
+            assert_eq!(sp_rows_in_band(n, false), on, "{n}");
         }
-        assert_ne!(SP_SUB512_ENV, SP_ENV);
+    }
+
+    /// Under the ordinary-prefill intent the band is every chunk of `SP_SUB512_MIN_ROWS` rows and
+    /// up (the 512..3071 gap included); both halves stay above the few-row window for every
+    /// admitted chunk.
+    #[test]
+    fn sp_band_under_the_ordinary_intent_is_every_chunk_from_130_rows() {
+        use rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+        for (n, on) in [
+            (64, false),
+            (129, false),
+            (130, true),
+            (149, true),
+            (511, true),
+            (512, true),
+            (1192, true),
+            (3071, true),
+            (SP_MIN_ROWS, true),
+            (4096, true),
+            (16384, true),
+        ] {
+            assert_eq!(sp_rows_in_band(n, true), on, "{n}");
+        }
+        for n in SP_SUB512_MIN_ROWS..=16384 {
+            let [a, b] = sp_even_split(n);
+            assert!(
+                a.1 > WIDE_VERIFY_MAX_ROWS && b.1 > WIDE_VERIFY_MAX_ROWS,
+                "{n}"
+            );
+            assert!(SpRows::of(0, n).own.1 > WIDE_VERIFY_MAX_ROWS, "{n}");
+            assert!(SpRows::of(1, n).own.1 > WIDE_VERIFY_MAX_ROWS, "{n}");
+        }
+    }
+
+    /// A forward routes at its real extent when no scope substituted the row count, or under the
+    /// ordinary-prefill intent (whose `route_n` is the canonical chunk for every `n`).
+    #[test]
+    fn routes_at_real_extent_is_the_row_count_or_the_ordinary_intent() {
+        const CANON: usize = rdna_compute::prefill_invariant::QWEN4_PREFILL_CANON_ROWS;
+        // No substituted count: always at the real extent.
+        for n in [1usize, 25, 130, 4096, 8192] {
+            assert!(routes_at_real_extent(n, n, false), "{n}");
+            assert!(routes_at_real_extent(n, n, true), "{n} ordinary");
+        }
+        // A substituted count (invariant profile, append route, cap) keeps the all-rows routes.
+        for n in [1usize, 25, 130, 4096] {
+            assert!(!routes_at_real_extent(n, CANON, false), "{n} substituted");
+            assert!(!routes_at_real_extent(n, 511, false), "{n} capped");
+        }
+        // The ordinary intent: canonical route rows for every extent.
+        for n in [1usize, 25, 129, 130, 512, 3071, 4096] {
+            assert!(routes_at_real_extent(n, CANON, true), "{n} ordinary");
+        }
     }
 
     #[test]
-    fn sp_wave_band_needs_both_switches_and_the_floor() {
+    fn sp_wave_band_is_the_sub512_floor() {
         for n in [129usize, 130, 596, 1192, 2048] {
-            for sub512 in [false, true] {
-                for wave in [false, true] {
-                    assert_eq!(
-                        sp_wave_rows_in_band_from(n, sub512, wave),
-                        sub512 && wave && n >= 130,
-                        "{n} {sub512} {wave}"
-                    );
-                }
-            }
-        }
-        assert_ne!(SP_SUB512_WAVE_ENV, SP_SUB512_ENV);
-    }
-
-    #[test]
-    fn sp_switch_is_default_on_with_a_kill_switch() {
-        for on in [
-            None,
-            Some(""),
-            Some("1"),
-            Some("on"),
-            Some("true"),
-            Some(" 1 "),
-        ] {
-            assert!(sp_switch(on), "{on:?}");
-        }
-        for off in [
-            Some("0"),
-            Some("off"),
-            Some("false"),
-            Some("lab"),
-            Some("2"),
-        ] {
-            assert!(!sp_switch(off), "{off:?}");
+            assert_eq!(sp_wave_rows_in_band(n), n >= SP_SUB512_MIN_ROWS, "{n}");
         }
     }
 
@@ -633,30 +675,6 @@ mod tests {
             };
             assert!(a.own.1 >= floor && b.own.1 >= floor);
         }
-    }
-
-    #[test]
-    fn sp_indexer_switch_is_default_on_with_a_kill_switch() {
-        for on in [
-            None,
-            Some(""),
-            Some("1"),
-            Some("on"),
-            Some("true"),
-            Some(" 1 "),
-        ] {
-            assert!(sp_indexer_switch(on), "{on:?}");
-        }
-        for off in [
-            Some("0"),
-            Some("off"),
-            Some("false"),
-            Some("lab"),
-            Some("2"),
-        ] {
-            assert!(!sp_indexer_switch(off), "{off:?}");
-        }
-        assert_ne!(SP_INDEXER_ENV, SP_ENV);
     }
 
     /// The work of a range of rows `[first, first + rows)` of a tile at `position_start`.

@@ -18,7 +18,7 @@
 #   to the daemon's stdin JSONL "generate" schema. This script proves the
 #   end-to-end path fires:
 #     1. JSONL with structured `tools` parses without daemon error.
-#     2. `HIPFIRE_JINJA_CHAT=1` + structured tools routes through
+#     2. A model chat template + structured tools routes through
 #        `JinjaChatFrame::render_messages(messages, Some(&tools), None)`.
 #     3. Model emits non-zero tokens (proves prompt was built and decoded).
 #
@@ -240,12 +240,11 @@ with open(jsonl_path, "w") as f:
     f.write(json.dumps({"type": "unload"}) + "\n")
 PY
 
-# ---- Spawn daemon with Jinja path forced on --------------------------------
+# ---- Spawn daemon (Jinja path is the default with a model template) -------
 STDIN_FIFO="$(mktemp -u /tmp/agentic-gate-jinja-tools-fifo.XXXXXX)"
 mkfifo "$STDIN_FIFO"
 
-env HIPFIRE_JINJA_CHAT=1 \
-    HIPFIRE_KV_MODE=q8 \
+env HIPFIRE_KV_MODE=q8 \
     HIPFIRE_GRAPH=1 \
     "$EXE" < "$STDIN_FIFO" > "$OUTPUT_FILE" 2>&1 &
 DAEMON_PID=$!
@@ -313,7 +312,6 @@ print(f"# Agentic gate (Jinja + structured tools): {label}")
 print()
 print(f"- model        : {label}")
 print(f"- drafter      : {pathlib.Path(drafter_path).name if drafter_path else '(none — AR path)'}")
-print(f"- jinja env    : HIPFIRE_JINJA_CHAT=1")
 print(f"- tools field  : structured (1 function: get_weather)")
 print(f"- tokens emit  : {len(toks)}")
 print(f"- path taken   : {'DFlash' if took_dflash else 'AR'}"

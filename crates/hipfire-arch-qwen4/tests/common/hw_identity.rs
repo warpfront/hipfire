@@ -408,7 +408,6 @@ pub fn config_identity(env: &BTreeMap<String, String>, model: &Value) -> Value {
         "graph": {
             "HIPFIRE_GRAPH": get("HIPFIRE_GRAPH"),
             "HIPFIRE_AR_GRAPH": get("HIPFIRE_AR_GRAPH"),
-            "HIPFIRE_GRAPH_MOE": get("HIPFIRE_GRAPH_MOE"),
         },
         "binary": binary_identity(),
         "compiled_sources": compiled_sources(),
@@ -445,7 +444,6 @@ pub fn receipt(gpu: &Gpu, model: &Path) -> Value {
         "resolved_graph_flags": {
             "graph_forward": gpu.flags.graph_forward,
             "graph_ar": gpu.flags.graph_ar,
-            "graph_moe": gpu.flags.graph_moe,
             "force_blob_path": gpu.flags.force_blob_path,
         },
         "git": {

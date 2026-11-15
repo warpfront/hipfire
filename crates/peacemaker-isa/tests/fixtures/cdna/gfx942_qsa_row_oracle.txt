@@ -1,0 +1,18 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.16)
+  pre-compiled kernels: /scratch/quant/fn-fp8/beat/WC8/twine/kcache/gfx942
+[rocblas] loaded for gfx942
+module arm: code object /scratch/quant/fn-fp8/beat/WC8/twine/qsa-device.elf
+  tensor_ops: hipcc compiled (gfx942, key a54af22a341a12b5)
+f32 Geo { nh: 24, nkv: 2, hd: 256 }: cumulative PASS 312 FAIL 0
+f32 Geo { nh: 24, nkv: 2, hd: 128 }: cumulative PASS 384 FAIL 0
+f32 Geo { nh: 8, nkv: 1, hd: 256 }: cumulative PASS 456 FAIL 0
+f32 Geo { nh: 6, nkv: 3, hd: 98 }: cumulative PASS 528 FAIL 0
+f32 Geo { nh: 16, nkv: 4, hd: 64 }: cumulative PASS 600 FAIL 0
+f32 Geo { nh: 4, nkv: 2, hd: 384 }: cumulative PASS 672 FAIL 0
+fp8_fnuz Geo { nh: 24, nkv: 2, hd: 256 }: cumulative PASS 984 FAIL 0
+fp8_fnuz Geo { nh: 8, nkv: 2, hd: 256 }: cumulative PASS 1056 FAIL 0
+fp8_fnuz Geo { nh: 12, nkv: 4, hd: 256 }: cumulative PASS 1128 FAIL 0
+fp8_fnuz Geo { nh: 16, nkv: 2, hd: 256 }: cumulative PASS 1200 FAIL 0
+RESULT cases PASS 1200 FAIL 0 | controls DETECTED 12 MISSED 0
+PASS

@@ -44,7 +44,7 @@ impl ArchModel for Lfm2MoeBundle {
             vision_weights,
         } = *self;
         // Vision FIRST so its buffers are returned before the big text-tower
-        // pool drain reuses VRAM (pointer-keyed leak class; see AGENTS.md).
+        // pool drain reuses VRAM (pointer-keyed leak class; see docs/testing.md §2B).
         if let Some(vw) = vision_weights {
             vw.free_gpu(gpu);
         }

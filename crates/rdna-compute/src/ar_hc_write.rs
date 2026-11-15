@@ -8,17 +8,23 @@
 //! resolves the kernel, picks the launch geometry, launches it, and carries the
 //! host numerics model used by the oracles.
 //!
-//! Wire: one 16-byte granule is `{bf16(p0) | bf16(p1) << 16, tag, bf16(p2) | bf16(p3) << 16,
-//! tag}` for four consecutive partial floats; a granule is accepted only when both tags equal
-//! the launch's generation. A rank's mailbox holds two banks (generation parity) of
-//! [`ar_hc_bank_bytes`] bytes that the PEER writes.
+//! Wire: four consecutive partial values (a granule) travel in one of two formats
+//! ([`ArHcPartial`]): bf16-rounded (the FFN partial, already bf16-exact, so the rounding is
+//! the identity) or unrounded f32 (the mixer out-projection partial, a raw f32 GEMV output).
+//! Tagged records carry the launch's generation tag twice (`{d0d1, tag, d2d3, tag}` per bf16
+//! granule; `{p0, tag, p1, tag}`, `{p2, tag, p3, tag}` per f32 granule) and are accepted only
+//! when both tags match; the dense wire carries the payload alone (`{d0d1, d2d3}` / `{p0, p1, p2,
+//! p3}`), validated per dword by the EMPTY marker. A rank's mailbox holds two banks (generation
+//! parity) of [`ar_hc_bank_bytes`] bytes that the PEER writes.
 //!
 //! Numerics (the identity contract of the TP2 trunk shard): the fold is
-//! `m = 0.0f + (bf16(p_first) + bf16(p_second))` in rank order, fp32 add of two
-//! bf16-rounded partials, identical bits on both ranks, followed by the production
-//! `hyper_write_bf16x2` expression. TP2 is therefore NOT byte-equal to one card (the
-//! partials split a K sum and each is rounded to bf16 once); the per-element bound against
-//! the exact f32 sum is [`ar_hc_fold_bound`].
+//! `m = 0.0f + (p_first + p_second)` in rank order of the two partials as they travel,
+//! identical bits on both ranks, followed by the production `hyper_write_bf16x2` expression
+//! (which rounds `m` to bf16 once, as one card rounds its single f32 K sum). TP2 is still NOT
+//! byte-equal to one card: the two K halves sum in a different order than one card's K loop
+//! (and the FFN partials split a bf16 combine chain), so `bf16(m)` can land on the other side of
+//! a bf16 rounding boundary; the per-element bound against the exact sum is
+//! [`ArHcPartial::fold_bound`].
 
 use crate::dispatch::Gpu;
 use crate::kernels;
@@ -27,8 +33,9 @@ use std::ffi::c_void;
 
 /// Hidden width of one HC stream (Flash-Next).
 pub const AR_HC_HIDDEN: usize = 2560;
-/// Bytes per tagged granule (four bf16 partial values and the tag twice).
-pub const AR_HC_GRANULE_BYTES: usize = 16;
+/// Bytes of the largest granule: four f32 partial values on the tagged wire (two
+/// `{value, tag, value, tag}` records).
+pub const AR_HC_GRANULE_BYTES: usize = 32;
 /// Partial floats per granule.
 pub const AR_HC_GRANULE_VALUES: usize = 4;
 /// Granules per lane the kernel is instantiated for.
@@ -63,19 +70,26 @@ const KERNEL_D8: &str = "ar_hc_write_d8_gfx1201";
 const KERNEL_D8_F32S: &str = "ar_hc_write_d8_f32s_gfx1201";
 const KERNEL_S: &str = "ar_hc_write_s_gfx1201";
 const KERNEL_S_F32S: &str = "ar_hc_write_s_f32s_gfx1201";
+const KERNEL_P32: &str = "ar_hc_write_p32_gfx1201";
+const KERNEL_P32_F32S: &str = "ar_hc_write_p32_f32s_gfx1201";
+const KERNEL_P32_D16: &str = "ar_hc_write_p32_d16_gfx1201";
+const KERNEL_P32_D16_F32S: &str = "ar_hc_write_p32_d16_f32s_gfx1201";
+const KERNEL_P32_S: &str = "ar_hc_write_p32_s_gfx1201";
+const KERNEL_P32_S_F32S: &str = "ar_hc_write_p32_s_f32s_gfx1201";
 /// Most rows of a branch-split launch (tagged wire, `HIPFIRE_EP_AR_FAST_APPLY`): one lane per
 /// (granule, branch) item, 4 * rows * 640 items within [`AR_HC_MAX_BLOCKS`] blocks of at most
 /// [`AR_HC_MAX_LANES`] lanes (12 rows: 64 x 480).
 // selector-receipt: receipts/selectors/ar_hc_split_max_rows.json
 pub const AR_HC_SPLIT_MAX_ROWS: usize = 12;
 
-/// The mailbox wire format of one transport (fixed per [`ArHcExchange`] at construction).
+/// The mailbox wire format of one launch ([`ArHcExchange`] picks it per launch from the row
+/// count; each wire has its own mailbox region).
 ///
-/// * `Tagged`: the original 16-byte granule `{d0d1, tag, d2d3, tag}` (8 payload bytes per 16
-///   wire bytes), validated by the generation tag. The kill-switch format.
-/// * `Dense`: an 8-byte granule `{d0d1, d2d3}` (all 8 bytes payload), validated per dword by
-///   the EMPTY marker `0xFFFF_FFFF`; the consumer re-arms what it read, so the mailbox is
-///   EMPTY at the start of every launch (see the kernel header for the argument).
+/// * `Tagged`: records `{payload, tag, payload, tag}` validated by the generation tag (one per
+///   bf16 granule, two per f32 granule: half the wire bytes are tags). The kill-switch format.
+/// * `Dense`: the granule's payload alone (8 bytes bf16, 16 bytes f32), validated per dword by
+///   the EMPTY marker `0xFFFF_FFFF`; the consumer re-arms what it read, so the mailbox is EMPTY
+///   at the start of every launch (see the kernel header for the argument).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ArHcWire {
     Tagged,
@@ -83,11 +97,13 @@ pub enum ArHcWire {
 }
 
 impl ArHcWire {
-    /// Wire bytes of one granule (four bf16 partial values).
-    pub fn granule_bytes(self) -> usize {
-        match self {
-            Self::Tagged => 16,
-            Self::Dense => 8,
+    /// Wire bytes of one granule (four partial values) of `partial`.
+    pub fn granule_bytes(self, partial: ArHcPartial) -> usize {
+        match (self, partial) {
+            (Self::Tagged, ArHcPartial::Bf16) => 16,
+            (Self::Tagged, ArHcPartial::F32) => AR_HC_GRANULE_BYTES,
+            (Self::Dense, ArHcPartial::Bf16) => 8,
+            (Self::Dense, ArHcPartial::F32) => 16,
         }
     }
 
@@ -104,6 +120,53 @@ impl ArHcWire {
         match self {
             Self::Tagged => "tagged",
             Self::Dense => "dense",
+        }
+    }
+}
+
+/// Format of the partial values on the wire, chosen per write site by the caller.
+///
+/// * `Bf16`: each value rounded to bf16 before it leaves the rank. For partials that are
+///   already bf16-exact (the trunk shard's FFN partial: `bf16_scaled_add` stores the
+///   bf16-rounded shared + routed sum) the rounding is the identity and the wire carries half
+///   the bytes.
+/// * `F32`: the f32 value unrounded (the mixer out-projection partial, a raw f32 GEMV output;
+///   rounding each half to bf16 moved one card's `bf16(m)` on about a third of the elements).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ArHcPartial {
+    Bf16,
+    F32,
+}
+
+impl ArHcPartial {
+    /// Both formats, in report order.
+    pub const ALL: [Self; 2] = [Self::Bf16, Self::F32];
+
+    /// The folded block output of one element: `0.0 + (first + second)` over the two partials
+    /// as they travel (bf16-rounded or f32), `first` being rank 0's.
+    pub fn fold(self, first: f32, second: f32) -> f32 {
+        match self {
+            Self::Bf16 => 0.0f32 + (bf16_round(first) + bf16_round(second)),
+            Self::F32 => 0.0f32 + (first + second),
+        }
+    }
+
+    /// Per-element bound of [`Self::fold`] against the exact sum `p0 + p1`: bf16, one rounding
+    /// per partial (unit roundoff `2^-8`) plus the fp32 add, `(2^-8 + 2^-23)(|p0| + |p1|)`; f32,
+    /// the one fp32 add (unit roundoff `2^-24`; the add of two floats is exact in the subnormal
+    /// range), `2^-24 (|p0| + |p1|)`.
+    pub fn fold_bound(self, p0: f32, p1: f32) -> f64 {
+        let unit = match self {
+            Self::Bf16 => 2f64.powi(-8) + 2f64.powi(-23),
+            Self::F32 => 2f64.powi(-24),
+        };
+        unit * (f64::from(p0).abs() + f64::from(p1).abs())
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::F32 => "f32",
         }
     }
 }
@@ -129,20 +192,26 @@ impl StreamKind {
         }
     }
 
-    /// The device entry of this kind on `wire`.
-    pub fn symbol(self, wire: ArHcWire) -> &'static str {
-        match (wire, self) {
-            (ArHcWire::Tagged, Self::Bf16) => KERNEL,
-            (ArHcWire::Tagged, Self::F32) => KERNEL_F32S,
-            (ArHcWire::Dense, Self::Bf16) => KERNEL_D8,
-            (ArHcWire::Dense, Self::F32) => KERNEL_D8_F32S,
+    /// The device entry of this kind on `wire` for `partial`.
+    pub fn symbol(self, wire: ArHcWire, partial: ArHcPartial) -> &'static str {
+        match (partial, wire, self) {
+            (ArHcPartial::Bf16, ArHcWire::Tagged, Self::Bf16) => KERNEL,
+            (ArHcPartial::Bf16, ArHcWire::Tagged, Self::F32) => KERNEL_F32S,
+            (ArHcPartial::Bf16, ArHcWire::Dense, Self::Bf16) => KERNEL_D8,
+            (ArHcPartial::Bf16, ArHcWire::Dense, Self::F32) => KERNEL_D8_F32S,
+            (ArHcPartial::F32, ArHcWire::Tagged, Self::Bf16) => KERNEL_P32,
+            (ArHcPartial::F32, ArHcWire::Tagged, Self::F32) => KERNEL_P32_F32S,
+            (ArHcPartial::F32, ArHcWire::Dense, Self::Bf16) => KERNEL_P32_D16,
+            (ArHcPartial::F32, ArHcWire::Dense, Self::F32) => KERNEL_P32_D16_F32S,
         }
     }
-    /// The branch-split tagged entry of this kind ([`ar_hc_split_geometry`]).
-    pub fn split_symbol(self) -> &'static str {
-        match self {
-            Self::Bf16 => KERNEL_S,
-            Self::F32 => KERNEL_S_F32S,
+    /// The branch-split tagged entry of this kind for `partial` ([`ar_hc_split_geometry`]).
+    pub fn split_symbol(self, partial: ArHcPartial) -> &'static str {
+        match (partial, self) {
+            (ArHcPartial::Bf16, Self::Bf16) => KERNEL_S,
+            (ArHcPartial::Bf16, Self::F32) => KERNEL_S_F32S,
+            (ArHcPartial::F32, Self::Bf16) => KERNEL_P32_S,
+            (ArHcPartial::F32, Self::F32) => KERNEL_P32_S_F32S,
         }
     }
     /// Bytes per stream element.
@@ -178,15 +247,17 @@ impl StreamKind {
     }
 }
 
-/// Bytes of one mailbox bank able to hold `max_rows` rows of partials on the TAGGED wire (the
-/// larger of the two: a dense bank fits in it).
+/// Bytes of one mailbox bank able to hold `max_rows` rows of partials of either format on the
+/// TAGGED wire (the largest: a dense bank fits in it).
 pub fn ar_hc_bank_bytes(max_rows: usize) -> usize {
     ar_hc_bank_bytes_for(ArHcWire::Tagged, max_rows)
 }
 
-/// Bytes of one mailbox bank able to hold `max_rows` rows of partials on `wire`.
+/// Bytes of one mailbox bank able to hold `max_rows` rows of partials of either format on
+/// `wire` (sized for f32 partials, the larger).
 pub fn ar_hc_bank_bytes_for(wire: ArHcWire, max_rows: usize) -> usize {
-    (max_rows * AR_HC_HIDDEN / AR_HC_GRANULE_VALUES * wire.granule_bytes()).next_multiple_of(256)
+    (max_rows * AR_HC_HIDDEN / AR_HC_GRANULE_VALUES * wire.granule_bytes(ArHcPartial::F32))
+        .next_multiple_of(256)
 }
 
 /// Launch geometry for `rows` rows: `(blocks, lanes)`. Granules per lane stay within
@@ -270,6 +341,7 @@ impl Gpu {
         &mut self,
         kind: StreamKind,
         wire: ArHcWire,
+        partial: ArHcPartial,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch != "gfx1201" {
@@ -283,17 +355,17 @@ impl Gpu {
         } else {
             kernels::AR_HC_WRITE_GFX1201_HIPBF16_SRC
         };
-        self.ensure_kernel(KERNEL, src, kind.symbol(wire))?;
+        self.ensure_kernel(KERNEL, src, kind.symbol(wire, partial))?;
         if wire == ArHcWire::Tagged && self.flags.ep_ar_fast_apply_enabled() {
-            self.ensure_kernel(KERNEL, src, kind.split_symbol())?;
+            self.ensure_kernel(KERNEL, src, kind.split_symbol(partial))?;
         }
         Ok(())
     }
 
-    /// Push this rank's f32 partial `[rows, 2560]` (bf16-rounded) into the peer's mailbox,
-    /// wait (bounded) for the peer's, fold in rank order and apply the production BF16
-    /// HC write to `streams` (`[rows, 4, 2560]` of `kind`, in place) with the row gate
-    /// logits `gates` (`[rows, 4]` f32). Operands are device pointers (the caller slices
+    /// Push this rank's f32 partial `[rows, 2560]` (in the `partial_fmt` wire format) into the
+    /// peer's mailbox, wait (bounded) for the peer's, fold in rank order and apply the
+    /// production BF16 HC write to `streams` (`[rows, 4, 2560]` of `kind`, in place) with the
+    /// row gate logits `gates` (`[rows, 4]` f32). Operands are device pointers (the caller slices
     /// long row ranges into <= [`AR_HC_ROW_CAP`] launches by offsetting them).
     /// `peer_mailbox` is the PEER's mailbox (peer access enabled), `local_mailbox` this
     /// rank's own; each holds two banks `bank_stride` bytes apart. `generation` is this
@@ -313,6 +385,7 @@ impl Gpu {
         streams: *mut c_void,
         kind: StreamKind,
         wire: ArHcWire,
+        partial_fmt: ArHcPartial,
         gates: *const c_void,
         peer_mailbox: *mut c_void,
         local_mailbox: *const c_void,
@@ -323,7 +396,7 @@ impl Gpu {
         geometry: (u32, u32),
         mixed_dbg: *mut c_void,
     ) -> HipResult<()> {
-        self.ensure_ar_hc_write_gfx1201_kernel(kind, wire)?;
+        self.ensure_ar_hc_write_gfx1201_kernel(kind, wire, partial_fmt)?;
         let fail = |what: &str| HipError::new(0, &format!("ar_hc_write_gfx1201: {what}"));
         if ar_hc_geometry_with(rows, geometry.0, geometry.1).is_none() {
             return Err(fail(&format!("unsupported row count {rows}")));
@@ -358,8 +431,8 @@ impl Gpu {
             .then(|| ar_hc_split_geometry(rows))
             .flatten();
         let (symbol, geometry) = match split {
-            Some(g) => (kind.split_symbol(), g),
-            None => (kind.symbol(wire), geometry),
+            Some(g) => (kind.split_symbol(partial_fmt), g),
+            None => (kind.symbol(wire, partial_fmt), geometry),
         };
         let gen_ptr = generation.as_ptr();
         let stride_arg = u32::try_from(bank_stride).map_err(|_| fail("bank stride exceeds u32"))?;
@@ -423,14 +496,17 @@ pub fn ar_hc_granules_per_lane(rows: usize, geometry: (u32, u32)) -> usize {
 const SP_MODULE: &str = "sp_hc_rs_ag_gfx1201";
 const SP_RS_D8: &str = "sp_hc_rs_d8_gfx1201";
 const SP_RS_D8_F32S: &str = "sp_hc_rs_d8_f32s_gfx1201";
+const SP_RS_P32_D16: &str = "sp_hc_rs_p32_d16_gfx1201";
+const SP_RS_P32_D16_F32S: &str = "sp_hc_rs_p32_d16_f32s_gfx1201";
 const SP_AG_BF16: &str = "sp_ag_rows_bf16_d8_gfx1201";
 const SP_AG_F32BF16: &str = "sp_ag_rows_f32bf16_d8_gfx1201";
 
 /// Most rows of EACH range (own / peer) one SP launch serves; the caller slices longer ranges
 /// with [`sp_slices`].
 pub const SP_ROW_CAP: usize = AR_HC_ROW_CAP;
-/// Bytes of one dense granule (four bf16 values).
-pub const SP_GRANULE_BYTES: usize = 8;
+/// Bytes of one all-gather granule (four bf16 values). A reduce-scatter granule is
+/// [`ArHcWire::granule_bytes`] of [`ArHcWire::Dense`] for its [`ArHcPartial`].
+pub const SP_AG_GRANULE_BYTES: usize = 8;
 /// Granules per row of a hidden-width tile.
 pub const SP_GRANULES_PER_ROW: usize = AR_HC_HIDDEN / AR_HC_GRANULE_VALUES;
 /// Most granules a launch can poll (`blocks x lanes x AR_HC_KMAX`).
@@ -483,11 +559,13 @@ impl SpAgElem {
     }
 }
 
-/// Device entry of the reduce-scatter for `kind`.
-pub fn sp_rs_symbol(kind: StreamKind) -> &'static str {
-    match kind {
-        StreamKind::Bf16 => SP_RS_D8,
-        StreamKind::F32 => SP_RS_D8_F32S,
+/// Device entry of the reduce-scatter for `kind` and `partial`.
+pub fn sp_rs_symbol(kind: StreamKind, partial: ArHcPartial) -> &'static str {
+    match (partial, kind) {
+        (ArHcPartial::Bf16, StreamKind::Bf16) => SP_RS_D8,
+        (ArHcPartial::Bf16, StreamKind::F32) => SP_RS_D8_F32S,
+        (ArHcPartial::F32, StreamKind::Bf16) => SP_RS_P32_D16,
+        (ArHcPartial::F32, StreamKind::F32) => SP_RS_P32_D16_F32S,
     }
 }
 
@@ -562,7 +640,7 @@ pub fn sp_ag_rows_per_launch(row_elems: usize, bank_stride: usize) -> usize {
         return 0;
     }
     SP_ROW_CAP
-        .min(bank_stride / SP_GRANULE_BYTES / gpr)
+        .min(bank_stride / SP_AG_GRANULE_BYTES / gpr)
         .min(SP_MAX_POLL_GRANULES / gpr)
 }
 
@@ -621,8 +699,12 @@ pub fn sp_f32bf16_wire(x: f32) -> f32 {
 }
 
 impl Gpu {
-    /// Resolve the reduce-scatter kernel of `kind` before graph capture.
-    pub fn ensure_sp_hc_rs_gfx1201_kernel(&mut self, kind: StreamKind) -> HipResult<()> {
+    /// Resolve the reduce-scatter kernel of `kind` and `partial` before graph capture.
+    pub fn ensure_sp_hc_rs_gfx1201_kernel(
+        &mut self,
+        kind: StreamKind,
+        partial: ArHcPartial,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch != "gfx1201" {
             return Err(HipError::new(
@@ -631,7 +713,7 @@ impl Gpu {
             ));
         }
         let src = self.sp_hc_rs_ag_src();
-        self.ensure_kernel(SP_MODULE, src, sp_rs_symbol(kind))
+        self.ensure_kernel(SP_MODULE, src, sp_rs_symbol(kind, partial))
     }
 
     /// Resolve the all-gather kernel of `elem` before graph capture.
@@ -657,16 +739,17 @@ impl Gpu {
         }
     }
 
-    /// Reduce-scatter fused into the HC write: push `bf16(partial)` of the PEER row range
-    /// into the peer's dense mailbox, wait (bounded) for the peer's partial of the OWN range,
-    /// fold in rank order and apply the production HC write to the own rows of `streams`
-    /// only. `partial` (`[rows, 2560]` f32), `streams` (`[rows, 4, 2560]` of `kind`) and
-    /// `gates` (`[rows, 4]` f32) are the full-tile base pointers; `own` / `peer` are
-    /// `(row0, rows)` of the tile (disjoint, each at most [`SP_ROW_CAP`], not both empty; an
-    /// empty own range still pushes). `peer_mailbox` / `local_mailbox` address the DENSE
+    /// Reduce-scatter fused into the HC write: push the partial of the PEER row range (in the
+    /// `partial_fmt` wire format) into the peer's dense mailbox, wait (bounded) for the peer's
+    /// partial of the OWN range, fold in rank order and apply the production HC write to the
+    /// own rows of `streams` only. `partial` (`[rows, 2560]` f32), `streams` (`[rows, 4, 2560]`
+    /// of `kind`) and `gates` (`[rows, 4]` f32) are the full-tile base pointers; `own` / `peer`
+    /// are `(row0, rows)` of the tile (disjoint, each at most [`SP_ROW_CAP`], not both empty;
+    /// an empty own range still pushes). `peer_mailbox` / `local_mailbox` address the DENSE
     /// region of the peer's / this rank's mailbox, `bank_stride` its bank size. `mixed_dbg`
     /// (oracle only) receives the folded `m` of the own rows at the full-tile offset. The
-    /// own rows are bit-identical to those of `ar_hc_write_d8_*` over the same partials.
+    /// own rows are bit-identical to those of the dense all-reduce of the same format
+    /// over the same partials.
     /// One launch; both ranks must issue mirrored launches in the same order.
     ///
     /// # Safety
@@ -678,6 +761,7 @@ impl Gpu {
         partial: *mut c_void,
         streams: *mut c_void,
         kind: StreamKind,
+        partial_fmt: ArHcPartial,
         gates: *const c_void,
         peer_mailbox: *mut c_void,
         local_mailbox: *const c_void,
@@ -689,7 +773,7 @@ impl Gpu {
         geometry: (u32, u32),
         mixed_dbg: *mut c_void,
     ) -> HipResult<()> {
-        self.ensure_sp_hc_rs_gfx1201_kernel(kind)?;
+        self.ensure_sp_hc_rs_gfx1201_kernel(kind, partial_fmt)?;
         let fail = |what: &str| HipError::new(0, &format!("sp_hc_rs_gfx1201: {what}"));
         if own.1 + peer.1 == 0 {
             return Err(fail("empty own and peer ranges"));
@@ -713,7 +797,9 @@ impl Gpu {
             )));
         }
         let granules = own.1.max(peer.1) * SP_GRANULES_PER_ROW;
-        if granules * SP_GRANULE_BYTES > bank_stride || !bank_stride.is_multiple_of(256) {
+        if granules * ArHcWire::Dense.granule_bytes(partial_fmt) > bank_stride
+            || !bank_stride.is_multiple_of(256)
+        {
             return Err(fail(&format!(
                 "bank stride {bank_stride} cannot hold {granules} dense granules"
             )));
@@ -752,7 +838,7 @@ impl Gpu {
             &mixed_dbg as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            sp_rs_symbol(kind),
+            sp_rs_symbol(kind, partial_fmt),
             [geometry.0, 1, 1],
             [geometry.1, 1, 1],
             0,
@@ -828,7 +914,7 @@ impl Gpu {
             )));
         }
         let granules = own.1.max(peer.1) * gpr;
-        if granules * SP_GRANULE_BYTES > bank_stride || !bank_stride.is_multiple_of(256) {
+        if granules * SP_AG_GRANULE_BYTES > bank_stride || !bank_stride.is_multiple_of(256) {
             return Err(fail(&format!(
                 "bank stride {bank_stride} cannot hold {granules} dense granules"
             )));
@@ -905,18 +991,6 @@ pub fn bf16_round(x: f32) -> f32 {
     f32::from_bits(u32::from(bf16_bits(x)) << 16)
 }
 
-/// The folded block output of one element: `0.0 + (first + second)` over the two
-/// bf16-rounded partials, `first` being rank 0's.
-pub fn ar_hc_fold(first: f32, second: f32) -> f32 {
-    0.0f32 + (bf16_round(first) + bf16_round(second))
-}
-
-/// Per-element bound of [`ar_hc_fold`] against the exact sum `p0 + p1` (one bf16 rounding
-/// per partial, unit roundoff `2^-8`, plus the fp32 add): `(2^-8 + 2^-23)(|p0| + |p1|)`.
-pub fn ar_hc_fold_bound(p0: f32, p1: f32) -> f64 {
-    (2f64.powi(-8) + 2f64.powi(-23)) * (f64::from(p0).abs() + f64::from(p1).abs())
-}
-
 /// The row gate of one HC branch (`hyper_write_bf16x2`): three bf16 roundings around a
 /// sigmoid. `expf` here is the host libm (the device uses its own; oracles that compare
 /// bytes use the device `hyper_write` for the HC half).
@@ -942,6 +1016,7 @@ pub fn hc_inject_f32(gate: f32, m: f32, stream: f32) -> f32 {
 /// [`ar_hc_write_model`] for F32 streams (`[rows][4][2560]` f32, `hyper_write_f32`'s
 /// arithmetic): the folded `m` is the same; every stream goes through [`hc_inject_f32`].
 pub fn ar_hc_write_model_f32(
+    partial: ArHcPartial,
     p0: &[f32],
     p1: &[f32],
     streams: &mut [f32],
@@ -962,7 +1037,7 @@ pub fn ar_hc_write_model_f32(
         ];
         for col in 0..AR_HC_HIDDEN {
             let i = row * AR_HC_HIDDEN + col;
-            let m = ar_hc_fold(p0[i], p1[i]);
+            let m = partial.fold(p0[i], p1[i]);
             mixed[i] = m;
             for (br, gate) in g.iter().enumerate() {
                 let s = &mut streams[row * 4 * AR_HC_HIDDEN + br * AR_HC_HIDDEN + col];
@@ -974,9 +1049,11 @@ pub fn ar_hc_write_model_f32(
 }
 
 /// Host model of the whole fused launch for one rank-agnostic result: folds the two ranks'
-/// partials (`[rows * 2560]` each, rank 0 first) and applies the HC write to `streams`
-/// (`[rows][4][2560]` bf16 bits) with `gates` (`[rows][4]`). Returns the folded `m`.
+/// partials (`[rows * 2560]` each, rank 0 first) as they travel in `partial` format and applies
+/// the HC write to `streams` (`[rows][4][2560]` bf16 bits) with `gates` (`[rows][4]`). Returns
+/// the folded `m`.
 pub fn ar_hc_write_model(
+    partial: ArHcPartial,
     p0: &[f32],
     p1: &[f32],
     streams: &mut [u16],
@@ -997,7 +1074,7 @@ pub fn ar_hc_write_model(
         ];
         for col in 0..AR_HC_HIDDEN {
             let i = row * AR_HC_HIDDEN + col;
-            let m = ar_hc_fold(p0[i], p1[i]);
+            let m = partial.fold(p0[i], p1[i]);
             mixed[i] = m;
             for (br, gate) in g.iter().enumerate() {
                 let s = &mut streams[row * 4 * AR_HC_HIDDEN + br * AR_HC_HIDDEN + col];
@@ -1163,14 +1240,22 @@ mod tests {
 
     #[test]
     fn bank_bytes_are_aligned_and_sized() {
-        assert_eq!(ar_hc_bank_bytes(1), (640 * 16usize).next_multiple_of(256));
-        assert_eq!(ar_hc_bank_bytes(8), 8 * 640 * 16);
-        assert_eq!(ar_hc_bank_bytes(256), 256 * 640 * 16);
-        assert!(ar_hc_bank_bytes(37) % 256 == 0);
+        assert_eq!(ar_hc_bank_bytes(1), (640 * 32usize).next_multiple_of(256));
+        assert_eq!(ar_hc_bank_bytes(8), 8 * 640 * 32);
+        assert_eq!(ar_hc_bank_bytes(256), 256 * 640 * 32);
+        assert_eq!(ar_hc_bank_bytes_for(ArHcWire::Dense, 256), 256 * 640 * 16);
+        // every granule format fits its wire's bank
+        for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+            for partial in ArHcPartial::ALL {
+                assert!(256 * 640 * wire.granule_bytes(partial) <= ar_hc_bank_bytes_for(wire, 256));
+            }
+        }
+        assert!(ar_hc_bank_bytes(37).is_multiple_of(256));
     }
 
-    /// One bf16 rounding per partial and one fp32 add stay within the stated bound of the
-    /// exact sum, across 8 binades of partial magnitude and skewed ratios.
+    /// Each format's fold stays within its stated bound of the exact sum (bf16: one rounding
+    /// per partial plus the fp32 add; f32: the one fp32 add), across 10 binades of partial
+    /// magnitude and skewed ratios.
     #[test]
     fn fold_bound_holds_for_random_partials() {
         let mut rng = Rng(0x0b0b_0b0b_1234_5678);
@@ -1178,36 +1263,63 @@ mod tests {
             let mag = 2f32.powi(-6 + rng.below(10) as i32);
             let a = (rng.unit() - 0.5) * 2.0 * mag;
             let b = (rng.unit() - 0.5) * 2.0 * mag * 2f32.powi(rng.below(5) as i32 - 2);
-            let m = ar_hc_fold(a, b);
             let exact = f64::from(a) + f64::from(b);
-            assert!(
-                (f64::from(m) - exact).abs() <= ar_hc_fold_bound(a, b),
-                "a {a} b {b} m {m}"
-            );
+            for partial in ArHcPartial::ALL {
+                let m = partial.fold(a, b);
+                assert!(
+                    (f64::from(m) - exact).abs() <= partial.fold_bound(a, b),
+                    "{} a {a} b {b} m {m}",
+                    partial.name()
+                );
+            }
         }
     }
 
-    /// Both ranks fold the same two bf16 values in the same (rank) order, so the folded value
-    /// is the same bits whichever rank computes it; swapping the operands is a different
-    /// (equally bounded) sum only through fp32 non-associativity of -0.0/rounding, which the
-    /// rank order removes. The identity the kernel needs: `fold(first, second)` is a pure
-    /// function of the two rounded values.
+    /// Both ranks fold the same two values in the same (rank) order, so the folded value is
+    /// the same bits whichever rank computes it. The bf16 fold is a pure function of the two
+    /// rounded partials; the f32 fold is the correctly rounded f32 sum of the two partials (no
+    /// bf16 rounding of either). Both are commutative for two operands and normalize -0.0 to
+    /// +0.0, and they agree on bf16-exact partials (the FFN partial's case).
     #[test]
-    fn fold_is_a_pure_function_of_the_two_rounded_partials() {
+    fn folds_are_pure_functions_of_the_travelling_partials() {
         let mut rng = Rng(77);
+        // |a|, |b| in [1, 2) x 2^e with |e| <= 10, so the f64 sum is exact and its f32 cast
+        // is the one correctly rounded result
+        let signed = |rng: &mut Rng| {
+            let sign = if rng.below(2) == 0 { 1.0f32 } else { -1.0 };
+            (rng.unit() + 1.0) * sign
+        };
         for _ in 0..200_000 {
-            let a = (rng.unit() - 0.5) * 8.0;
-            let b = (rng.unit() - 0.5) * 8.0;
-            let m = ar_hc_fold(a, b);
+            let a = signed(&mut rng);
+            let b = signed(&mut rng) * 2f32.powi(rng.below(21) as i32 - 10);
+            let m = ArHcPartial::F32.fold(a, b);
+            let exact = (f64::from(a) + f64::from(b)) as f32;
+            assert_eq!(m.to_bits(), (0.0f32 + exact).to_bits(), "a {a} b {b}");
+            let mb = ArHcPartial::Bf16.fold(a, b);
             assert_eq!(
-                m.to_bits(),
-                ar_hc_fold(bf16_round(a), bf16_round(b)).to_bits()
+                mb.to_bits(),
+                ArHcPartial::Bf16
+                    .fold(bf16_round(a), bf16_round(b))
+                    .to_bits()
             );
-            // commutative in fp32 for two operands
-            assert_eq!(m.to_bits(), ar_hc_fold(b, a).to_bits());
+            assert_eq!(
+                ArHcPartial::F32
+                    .fold(bf16_round(a), bf16_round(b))
+                    .to_bits(),
+                mb.to_bits()
+            );
+            for partial in ArHcPartial::ALL {
+                assert_eq!(partial.fold(a, b).to_bits(), partial.fold(b, a).to_bits());
+            }
         }
+        // the f32 partials are not rounded to bf16 before the add
+        let (a, b) = (1.0f32 + 2f32.powi(-12), 2f32.powi(-12));
+        assert_eq!(ArHcPartial::F32.fold(a, b), 1.0 + 2f32.powi(-11));
+        assert_eq!(ArHcPartial::Bf16.fold(a, b), 1.0 + 2f32.powi(-12));
         // negative zero: 0.0 + (-0.0 + -0.0) is +0.0, as the kernel's `xi = 0.0f; xi + (..)`
-        assert_eq!(ar_hc_fold(-0.0, -0.0).to_bits(), 0.0f32.to_bits());
+        for partial in ArHcPartial::ALL {
+            assert_eq!(partial.fold(-0.0, -0.0).to_bits(), 0.0f32.to_bits());
+        }
     }
 
     #[test]
@@ -1232,12 +1344,16 @@ mod tests {
             let s0: Vec<u16> = (0..rows * 4 * AR_HC_HIDDEN)
                 .map(|_| bf16_bits((rng.unit() - 0.5) * 4.0))
                 .collect();
+            for partial in ArHcPartial::ALL {
+                let mut a = s0.clone();
+                let mut b = s0.clone();
+                let ma = ar_hc_write_model(partial, &p0, &p1, &mut a, &gates, rows);
+                let mb = ar_hc_write_model(partial, &p0, &p1, &mut b, &gates, rows);
+                assert_eq!(a, b);
+                assert_eq!(ma, mb);
+            }
             let mut a = s0.clone();
-            let mut b = s0.clone();
-            let ma = ar_hc_write_model(&p0, &p1, &mut a, &gates, rows);
-            let mb = ar_hc_write_model(&p0, &p1, &mut b, &gates, rows);
-            assert_eq!(a, b);
-            assert_eq!(ma, mb);
+            let ma = ar_hc_write_model(ArHcPartial::F32, &p0, &p1, &mut a, &gates, rows);
             for row in 0..rows {
                 for br in 0..4 {
                     let g = f64::from(hc_gate(gates[row * 4 + br]));
@@ -1288,7 +1404,7 @@ mod tests {
                 })
                 .collect();
             let mut got = s0.clone();
-            let m = ar_hc_write_model_f32(&p0, &p1, &mut got, &gates, rows);
+            let m = ar_hc_write_model_f32(ArHcPartial::F32, &p0, &p1, &mut got, &gates, rows);
             for row in 0..rows {
                 for br in 0..4 {
                     let gate_logit = bf16_round(gates[row * 4 + br]);
@@ -1305,16 +1421,19 @@ mod tests {
             }
             // Same bf16 streams: the F32 and BF16-bit models agree bit for bit.
             let bits: Vec<u16> = s0.iter().map(|&v| bf16_bits(v)).collect();
-            let mut bf = bits.clone();
-            let mut f = bits
+            let f0 = bits
                 .iter()
                 .map(|&b| f32::from_bits(u32::from(b) << 16))
                 .collect::<Vec<_>>();
-            let mb = ar_hc_write_model(&p0, &p1, &mut bf, &gates, rows);
-            let mf = ar_hc_write_model_f32(&p0, &p1, &mut f, &gates, rows);
-            assert_eq!(mb, mf);
-            for (b, f) in bf.iter().zip(&f) {
-                assert_eq!(f32::from_bits(u32::from(*b) << 16).to_bits(), f.to_bits());
+            for partial in ArHcPartial::ALL {
+                let mut bf = bits.clone();
+                let mut f = f0.clone();
+                let mb = ar_hc_write_model(partial, &p0, &p1, &mut bf, &gates, rows);
+                let mf = ar_hc_write_model_f32(partial, &p0, &p1, &mut f, &gates, rows);
+                assert_eq!(mb, mf);
+                for (b, f) in bf.iter().zip(&f) {
+                    assert_eq!(f32::from_bits(u32::from(*b) << 16).to_bits(), f.to_bits());
+                }
             }
         }
     }
@@ -1325,13 +1444,30 @@ mod tests {
         assert_eq!(StreamKind::F32.row_bytes(), 4 * 2560 * 4);
         assert_eq!(StreamKind::from_state_bf16(true), StreamKind::Bf16);
         assert_eq!(StreamKind::from_state_bf16(false), StreamKind::F32);
-        for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
-            assert_ne!(StreamKind::Bf16.symbol(wire), StreamKind::F32.symbol(wire));
+        for partial in ArHcPartial::ALL {
+            for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+                assert_ne!(
+                    StreamKind::Bf16.symbol(wire, partial),
+                    StreamKind::F32.symbol(wire, partial)
+                );
+            }
+            assert_ne!(
+                StreamKind::Bf16.symbol(ArHcWire::Tagged, partial),
+                StreamKind::Bf16.symbol(ArHcWire::Dense, partial)
+            );
         }
-        assert_ne!(
-            StreamKind::Bf16.symbol(ArHcWire::Tagged),
-            StreamKind::Bf16.symbol(ArHcWire::Dense)
-        );
+        for kind in StreamKind::ALL {
+            assert_ne!(
+                kind.split_symbol(ArHcPartial::Bf16),
+                kind.split_symbol(ArHcPartial::F32)
+            );
+            for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+                assert_ne!(
+                    kind.symbol(wire, ArHcPartial::Bf16),
+                    kind.symbol(wire, ArHcPartial::F32)
+                );
+            }
+        }
         assert_eq!(StreamKind::F32.alignment(), 16);
     }
 
@@ -1343,27 +1479,31 @@ mod tests {
             kernels::AR_HC_WRITE_GFX1201_SRC,
             kernels::AR_HC_WRITE_GFX1201_HIPBF16_SRC,
         ] {
-            for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
-                for kind in StreamKind::ALL {
-                    assert!(
-                        src.contains(&format!("void {}(", kind.symbol(wire))),
-                        "{}",
-                        kind.symbol(wire)
-                    );
+            for partial in ArHcPartial::ALL {
+                for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+                    for kind in StreamKind::ALL {
+                        let symbol = kind.symbol(wire, partial);
+                        assert!(src.contains(&format!("void {symbol}(")), "{symbol}");
+                    }
                 }
-            }
-            for kind in StreamKind::ALL {
-                assert!(src.contains(&format!("void {}(", kind.split_symbol())));
+                for kind in StreamKind::ALL {
+                    let symbol = kind.split_symbol(partial);
+                    assert!(src.contains(&format!("void {symbol}(")), "{symbol}");
+                }
             }
         }
         assert!(kernels::AR_HC_WRITE_GFX1201_HIPBF16_SRC.starts_with("#define ARHC_RND_HIP_BF16"));
         assert!(kernels::SP_HC_RS_AG_GFX1201_HIPBF16_SRC.starts_with("#define ARHC_RND_HIP_BF16"));
         let src = kernels::AR_HC_WRITE_GFX1201_SRC;
         for inst in [
-            "arhc_entry<true, false>",
-            "arhc_entry<false, false>",
-            "arhc_entry<true, true>",
-            "arhc_entry<false, true>",
+            "arhc_entry<true, false, false>",
+            "arhc_entry<false, false, false>",
+            "arhc_entry<true, true, false>",
+            "arhc_entry<false, true, false>",
+            "arhc_entry<true, false, true>",
+            "arhc_entry<false, false, true>",
+            "arhc_entry<true, true, true>",
+            "arhc_entry<false, true, true>",
         ] {
             assert!(src.contains(inst), "{inst}");
         }
@@ -1412,21 +1552,23 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let image = std::fs::read(&obj).unwrap();
-        for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+        for partial in ArHcPartial::ALL {
+            for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+                for kind in StreamKind::ALL {
+                    let symbol = kind.symbol(wire, partial);
+                    assert!(
+                        image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
+                        "{symbol} missing"
+                    );
+                }
+            }
             for kind in StreamKind::ALL {
-                let symbol = kind.symbol(wire);
+                let symbol = kind.split_symbol(partial);
                 assert!(
                     image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
                     "{symbol} missing"
                 );
             }
-        }
-        for kind in StreamKind::ALL {
-            let symbol = kind.split_symbol();
-            assert!(
-                image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
-                "{symbol} missing"
-            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1574,8 +1716,10 @@ mod tests {
         assert!(src.contains("#define HF_WAIT_SITE_SP_HC_RS_GFX1201 12u"));
         assert!(src.contains("#define HF_WAIT_SITE_SP_AG_ROWS_GFX1201 13u"));
         assert!(src.contains(&format!("#define AR_HC_KMAX {AR_HC_KMAX}")));
-        for kind in StreamKind::ALL {
-            assert!(src.contains(&format!("void {}(", sp_rs_symbol(kind))));
+        for partial in ArHcPartial::ALL {
+            for kind in StreamKind::ALL {
+                assert!(src.contains(&format!("void {}(", sp_rs_symbol(kind, partial))));
+            }
         }
         for elem in SpAgElem::ALL {
             assert!(src.contains(&format!("void {}(", elem.symbol())));
@@ -1628,9 +1772,9 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let image = std::fs::read(&obj).unwrap();
-        let symbols = StreamKind::ALL
-            .map(sp_rs_symbol)
+        let symbols = ArHcPartial::ALL
             .into_iter()
+            .flat_map(|partial| StreamKind::ALL.map(|kind| sp_rs_symbol(kind, partial)))
             .chain(SpAgElem::ALL.map(SpAgElem::symbol));
         for symbol in symbols {
             assert!(

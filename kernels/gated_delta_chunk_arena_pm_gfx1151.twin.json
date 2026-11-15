@@ -126,13 +126,13 @@
           }
         ],
         "compared_to_incumbent": true,
-        "incumbent_sha256": "b88f0d60c14e70cbe36e0be9830c6c05c5f792aafcc9863e30fafacd71b56650",
+        "incumbent_sha256": "c489769a6eb42ce39a5b7d79f62c4c4ea9491b631acbbb2a10aa3beaa9ddc3df",
         "incumbent_symbol": "gated_delta_chunk_gate_wmma_arena",
         "kernarg_segment_size": 104
       },
       "arch": "gfx1151",
-      "elf_bytes": 27920,
-      "elf_sha256": "ea1ddac1c2b3053ab920a00df19744a176057f3a76c2f72f932dc5b766d7bf26",
+      "elf_bytes": 30096,
+      "elf_sha256": "e2807c968c65109bdd8a0ca0bb157f4a4b754bc08f1c86d022ef54e74c089e6b",
       "hazards": {
         "advisory": 190,
         "blocking": 0,
@@ -140,16 +140,16 @@
         "findings": 190,
         "pm_ir_obligations": 0
       },
-      "hxaco_bytes": 32016,
-      "hxaco_sha256": "ccaadf100fda128b575d01e174cb47ba6ddd974e90c8ceb2ec375866bf2b38dc",
+      "hxaco_bytes": 34192,
+      "hxaco_sha256": "79e91ec0828c6c0b84c76f907919f6d7e03b041b76ea5f066bf92cd23773db21",
       "kernel": "gated_delta_chunk_gate_wmma_arena_pm_gfx1151",
       "lds": 31168,
       "lift_identity": "emit::checked ok; emitted bytes == input ELF",
       "rsrc2": 132,
       "scratch": 0,
       "sgprs": 80,
-      "text_bytes": 22904,
-      "text_sha256": "511a65b5f2e4c3718c1dd6201382e35887a161df1f0039be5f92d11a662777c5",
+      "text_bytes": 25044,
+      "text_sha256": "6fe2e9fe0c948deb75d81c6cb79e31d950db0040e40f04c630f9937102edfe62",
       "user_sgprs": 2,
       "vgprs": 240,
       "wavefront_size": 32
@@ -159,8 +159,8 @@
     {
       "symbol": "gated_delta_chunk_gate_wmma_arena_pm_gfx1151",
       "judged_candidate": "incumbent-hipcc",
-      "judged_code_sha256": "511a65b5f2e4c3718c1dd6201382e35887a161df1f0039be5f92d11a662777c5",
-      "twin_text_sha256": "511a65b5f2e4c3718c1dd6201382e35887a161df1f0039be5f92d11a662777c5",
+      "judged_code_sha256": "6fe2e9fe0c948deb75d81c6cb79e31d950db0040e40f04c630f9937102edfe62",
+      "twin_text_sha256": "6fe2e9fe0c948deb75d81c6cb79e31d950db0040e40f04c630f9937102edfe62",
       "equal": true
     }
   ]

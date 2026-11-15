@@ -9,8 +9,8 @@
 //! future `hipfire-arch-llama`, etc.) and depend on this crate for
 //! shared infrastructure: HFQ/GGUF file readers, the LLaMA-style
 //! scratch / KV / sampler primitives, tokenizer, prompt framing, eos
-//! filter, loop guard, eviction (TriAttn, CASK), spec-decode primitives
-//! (DFlash, DDTree), demand paging (cpu_router, weight_pager), and the
+//! filter, loop guard, spec-decode primitives
+//! (DFlash), demand paging (cpu_router, weight_pager), and the
 //! [`arch::Architecture`] trait.
 
 pub mod admission;
@@ -19,20 +19,16 @@ pub mod arch;
 pub mod arch_mapping;
 pub mod arch_model;
 pub mod arch_spec;
-pub mod augmentor;
 pub mod batch_sampler;
 pub mod bf16_loader;
 pub mod cache_plan;
 #[cfg(feature = "deltanet")]
-pub mod cask;
 pub mod chatml;
 pub mod checkpoint_pool;
 pub mod config;
 pub mod coproc;
 #[cfg(feature = "deltanet")]
 pub mod cpu_router;
-#[cfg(feature = "deltanet")]
-pub mod ddtree;
 pub mod device_mesh;
 #[cfg(feature = "deltanet")]
 pub mod dflash;
@@ -83,7 +79,6 @@ pub mod mq_i4;
 pub mod mq_i4_reference;
 pub mod multi_gpu;
 pub mod offload_calibrate;
-pub mod paro;
 pub mod ple_convert;
 pub mod ple_hot_pack;
 pub mod ple_hot_store;
@@ -95,6 +90,7 @@ pub mod prefix_index;
 pub mod rank_pool;
 pub mod reset_core;
 pub mod rope;
+pub mod route_sku;
 pub mod safetensors_source;
 pub mod sampler;
 /// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU
@@ -127,7 +123,6 @@ pub mod spec_sampling;
 pub mod swap;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
-pub mod triattn;
 pub mod trunk_overlay;
 pub mod verified_cache;
 /// Shared-weight host protocol v1 (`HIPFIRE_WEIGHT_HOST`): identities, typed

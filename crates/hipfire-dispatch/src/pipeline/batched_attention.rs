@@ -76,7 +76,7 @@ impl KvView<'_> {
     }
 }
 
-/// Pre-RoPE Q/K observer (TriAttention): `(gpu, layer, q, k, rows)` over the
+/// Pre-RoPE Q/K observer (diagnostic tap): `(gpu, layer, q, k, rows)` over the
 /// normed, un-rotated `[rows, heads, head_dim]` batches. Its presence keeps
 /// the unfused prep so Q/K exist in memory before RoPE.
 pub type BatchedAttentionTap<'a> =
@@ -971,7 +971,6 @@ pub fn batch_chunk_full_attn_prepare(
     _max_ctx_len: usize,
     _ctx: &DispatchCtx,
     batch_semantics: BatchSemantics<'_>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     _kv_layer_idx: usize,
     layer_idx: usize,
     fusion: DflashFusionCtx,
@@ -991,10 +990,10 @@ pub fn batch_chunk_full_attn_prepare(
     // read the physical slots in `pbs.positions`). `pos_offset` is the
     // cache's compact offset, like `upload_mrope_pos3`.
     if let Some(mrope) = pbs.mrope {
-        if tree_verify.is_some() || batch_semantics.is_independent() {
+        if batch_semantics.is_independent() {
             return Err(HipError::new(
                 0,
-                "VL mrope rows cannot run under tree verify or independent batches",
+                "VL mrope rows cannot run under independent batches",
             ));
         }
         if gfx12_fa_prep || gfx12_fa_prep_fp8q || fa_gate_in_place {
@@ -1024,7 +1023,7 @@ pub fn batch_chunk_full_attn_prepare(
     // S6-fa-prep-q8-pair: exact gfx1100 fold of steps 3-5 (deinterleave +
     // Q/K rmsnorm + half-split RoPE, 4 launches) into one
     // qwen35_fa_prep_batched_gfx1100 launch. Bit-exact (same reduction tree,
-    // same RoPE expression/phase, explicit old-TU FMA formation); the triattn
+    // same RoPE expression/phase, explicit old-TU FMA formation); the diagnostic
     // tap needs pre-RoPE Q, legacy interleaved RoPE needs its own kernel, and
     // every other shape/arch/ctx keeps the old path. Admitted for DFlash
     // chain verify and, since gfx11-1, ordinary prefill (DflashFusionCtx::Off:
@@ -1034,14 +1033,7 @@ pub fn batch_chunk_full_attn_prepare(
     // Admitted geometries are 16Q/2K and 24Q/4K (Qwen3.8-27B FA is 24/4);
     // HD must be 256 and n_rot 64.
     let fa_prep_n_rot = config.n_rot;
-    // 39aa358: in DDTree verify, rotate at DEPTH positions; KV writes below
-    // still use flat physical slots. The fused kernel takes the same buffer
-    // choice, so tree mode stays fused.
-    let fa_prep_rope_pos_buf = if tree_verify.is_some() {
-        &pbs.rope_positions
-    } else {
-        &pbs.positions
-    };
+    let fa_prep_rope_pos_buf = &pbs.positions;
     let fa_prep_shape_ok = matches!((config.n_heads, config.n_kv_heads), (16, 2) | (24, 4))
         && config.head_dim == 256
         && fa_prep_n_rot == 64;
@@ -1141,7 +1133,7 @@ pub fn batch_chunk_full_attn_prepare(
         )?;
     } else {
         // Fused deinterleave + Q-rmsnorm — one launch instead of two, no Q
-        // global-memory round trip. K-norm, triattn tap, and RoPE below are
+        // global-memory round trip. K-norm, the diagnostic tap, and RoPE below are
         // unchanged.
         fa_prep_unfused_qk_norm(gpu, layer, config, pbs, n)?;
 
@@ -1153,14 +1145,7 @@ pub fn batch_chunk_full_attn_prepare(
         // pos_offset = compact_offset so new Q/K rotate at ABSOLUTE phase
         // after eviction (cached keys are absolute-phased); pbs.positions
         // stays physical for the KV-write below. 0 when no compaction.
-        // 39aa358: in DDTree verify, rotate at DEPTH positions (correct
-        // sibling phases); KV writes below still use flat physical
-        // slots. Linear path unchanged.
-        let rope_pos_buf = if tree_verify.is_some() {
-            &pbs.rope_positions
-        } else {
-            &pbs.positions
-        };
+        let rope_pos_buf = &pbs.positions;
         fa_prep_unfused_rope(
             gpu,
             config,
@@ -1600,13 +1585,13 @@ fn fa_pm_kv_keys(codec: FaPrefillKvCodec) -> (KernelKey, KernelKey) {
 /// ([`batch_chunk_full_attn_attn`]) or MoE (`execute_attention_moe_layer_batched`) wrapper. Every
 /// condition of the existing whole-chunk PM attend in `batch_chunk_fa_attend` (which runs
 /// before and bypasses the multirow-tile fallback, so `fa_attn_multirow` is not a refusal): no
-/// tree, no independent lanes, whole-chunk `start_pos + n == max_ctx_len` within the physical
+/// no independent lanes, whole-chunk `start_pos + n == max_ctx_len` within the physical
 /// cap, a supported PM codec ([`fa_pm_kv_codec`]: actual native FP8 first, then actual
 /// plain Q8 with 8-bit V; `None` keeps the incumbent route), the codec-resolved
 /// PM + Q-prep flags (`fa_prefill_pm_flag` / `fa_prefill_pm_qprep_flag`: resolved per
 /// codec, so FP8 honors the FP8 opt-in and Q8 the Q8 qualification) and the raw gfx1201
 /// inventory with H16/KV2/D256 and a 64-wide rotary (`fa_prefill_pm_qprep_admitted`,
-/// which refuses capture and replay recording and the legacy interleaved RoPE), no triattn
+/// which refuses capture and replay recording and the legacy interleaved RoPE), no diagnostic
 /// tap (it needs the pre-RoPE F32 Q this route never materializes), and a KV tier plan that
 /// is exactly the codec-paired full-causal write + masked attend pair ([`fa_pm_kv_keys`])
 /// the PM direct attention serves (no window, no givens). The dense wrapper additionally
@@ -1622,7 +1607,6 @@ pub fn fa_pm_qprep_admitted(
     start_pos: usize,
     max_ctx_len: usize,
     batch_semantics: BatchSemantics<'_>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     tap_active: bool,
 ) -> bool {
     let n_rot = config.n_rot;
@@ -1631,7 +1615,6 @@ pub fn fa_pm_qprep_admitted(
         None => return false,
     };
     if !gpu.fa_prefill_pm_qprep_flag(Some(codec))
-        || tree_verify.is_some()
         || batch_semantics.is_independent()
         || tap_active
         || max_ctx_len > kv_cache.physical_cap
@@ -1835,7 +1818,6 @@ pub fn batch_chunk_fa_attend(
     max_ctx_len: usize,
     ctx: &DispatchCtx,
     batch_semantics: BatchSemantics<'_>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     layer_idx: usize,
     multirow: bool,
     commit_stride: Option<usize>,
@@ -1873,8 +1855,7 @@ pub fn batch_chunk_fa_attend(
     // Codec-resolved flags preserve the FP8 opt-in and the Q8 qualification.
     // Only unprepared/F32 Q belongs here. Prepared Raw FP8 codes plus scales
     // must retain their encoding through dispatch, never the PM Q16 ingress.
-    if tree_verify.is_none()
-        && !gfx12_fa_prep_fp8q
+    if !gfx12_fa_prep_fp8q
         && max_ctx_len <= kv_cache.physical_cap
         && start_pos.checked_add(n) == Some(max_ctx_len)
         && gpu.fa_prefill_pm_admitted(
@@ -1900,12 +1881,20 @@ pub fn batch_chunk_fa_attend(
             start_pos,
             max_ctx_len,
             ctx,
-            None,
             layer_idx,
             None,
         );
     }
     if gfx12_fa_prep_fp8q {
+        // Ordinary prefill: one Q-resident launch over the whole call. The body
+        // computes every (row, head) from that row's own Q codes, scale and
+        // causal KV prefix, so a row's bytes do not depend on how the prompt
+        // was split into calls (CHUNK-CANONICAL-DESIGN §1.3).
+        if fa_fp8q_canonical_prefill(gpu, kv_cache, n, start_pos, max_ctx_len, false) {
+            return batch_chunk_fa_attend_canonical_fp8q(
+                gpu, config, pbs, s, kv_cache, n, start_pos, layer_idx,
+            );
+        }
         // Newly admitted ragged chunks (never produced by the incumbent
         // admission: its Some(512) arm requires n % 512 == 0) take the direct
         // range route and return before the aligned/F32 segment paths.
@@ -1942,8 +1931,7 @@ pub fn batch_chunk_fa_attend(
                     && (config.n_heads, config.n_kv_heads) == (16, 2)
                     && fa_a3b_native_prefill_rows(n, Some(stride), max_ctx_len)))
             && n <= 32768
-            && max_ctx_len <= 262_144
-            && tree_verify.is_none();
+            && max_ctx_len <= 262_144;
         let q_codes = gfx12_fa_prep_fp8q.then(|| {
             let bytes = n * config.n_heads * (config.head_dim + 4);
             GpuTensor {
@@ -1969,7 +1957,6 @@ pub fn batch_chunk_fa_attend(
                 start_pos,
                 max_ctx_len,
                 ctx,
-                None,
                 layer_idx,
                 None,
             )?;
@@ -1992,12 +1979,6 @@ pub fn batch_chunk_fa_attend(
                     .as_deref(),
                 Some("0") | Some("off") | Some("false")
             )
-            && !matches!(
-                hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
-                    .ok()
-                    .as_deref(),
-                Some("scalar") | Some("batched")
-            )
             && ctx.workload == DispatchWorkload::Standard
             && config.n_heads == 24
             && config.n_kv_heads == 4
@@ -2007,8 +1988,7 @@ pub fn batch_chunk_fa_attend(
             && (n <= WIDENED_COMMIT_ROWS || n % WIDENED_COMMIT_ROWS == 0)
             && gpu.fa2_gfx11_ctx_admitted(max_ctx_len)
             && start_pos.checked_add(n) == Some(max_ctx_len)
-            && max_ctx_len <= kv_cache.physical_cap
-            && tree_verify.is_none();
+            && max_ctx_len <= kv_cache.physical_cap;
         if q8_wide_runs {
             execute_fa_attend_step(
                 gpu,
@@ -2024,7 +2004,6 @@ pub fn batch_chunk_fa_attend(
                 start_pos,
                 max_ctx_len,
                 ctx,
-                None,
                 layer_idx,
                 None,
             )?;
@@ -2057,7 +2036,6 @@ pub fn batch_chunk_fa_attend(
                 start_pos + off,
                 start_pos + off + seg_n,
                 ctx,
-                tree_verify,
                 layer_idx,
                 None,
             )?;
@@ -2085,7 +2063,6 @@ pub fn batch_chunk_fa_attend(
             start_pos,
             max_ctx_len,
             ctx,
-            tree_verify,
             layer_idx,
             None,
         );
@@ -2153,7 +2130,7 @@ pub fn batch_chunk_fa_attend(
         // front end, split the live KV tile range to restore occupancy at
         // small verifier batches, then combine CK-style LSE/Oacc partials.
         // Fail closed to the exact measured shape and eager sequential route;
-        // `multirow` admission above already excludes tree, independent,
+        // `multirow` admission above already excludes independent,
         // graph-capture, and retained/PM4 recording paths. The split records
         // live in the shared `flash_partials` scratch, whose size follows
         // `HIPFIRE_FLASH_PARTIALS_BATCH` and the KV capacity; when it is too
@@ -2236,7 +2213,6 @@ pub fn batch_chunk_fa_attend(
         start_pos,
         max_ctx_len,
         ctx,
-        tree_verify,
         layer_idx,
         None,
     )
@@ -2344,6 +2320,111 @@ pub fn batch_chunk_fa_attend_ragged_fp8q(
     Ok(())
 }
 
+/// Ordinary-prefill fp8q attention is one call-shape-independent route: any
+/// 1..=32768-row true-prefill call (`start_pos + n == max_ctx_len`, inside the
+/// physical cache) on the native fp8 tier. Verify and capture keep their
+/// own admission.
+fn fa_fp8q_canonical_prefill(
+    gpu: &Gpu,
+    kv_cache: &KvView<'_>,
+    n: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    is_tree: bool,
+) -> bool {
+    gpu.ordinary_prefill_active()
+        && !is_tree
+        && (1..=32768).contains(&n)
+        && start_pos.checked_add(n) == Some(max_ctx_len)
+        && (1..=262_144).contains(&max_ctx_len)
+        && max_ctx_len <= kv_cache.physical_cap
+}
+
+/// [`fa_fp8q_canonical_prefill`] attend: write all `n` K/V rows, then one direct
+/// Q-resident launch over the whole prepared two-plane Raw Q into the F32
+/// output. Rows past the first 512 are run in grid z by the same body.
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_fa_attend_canonical_fp8q(
+    gpu: &mut Gpu,
+    config: &HybridDims,
+    pbs: &BatchScratch<'_>,
+    s: &FlashScratch<'_>,
+    kv_cache: &KvView<'_>,
+    n: usize,
+    start_pos: usize,
+    layer_idx: usize,
+) -> HipResult<()> {
+    // Tier validation only: a one-row call resolves the same codec as any
+    // batched one, so derive the plan at the batched arity.
+    let plan = KvTierPlan::derive(KvTierInputs {
+        pos: start_pos,
+        flash_mode: s.flash_mode as usize,
+        capture_mode: gpu.graphs.capture_mode,
+        batch_size: n.max(2),
+        is_tree: false,
+        ..kv_cache.tier_inputs()
+    })
+    .map_err(|e| HipError::new(0, &e.to_string()))?;
+    if plan.write_key != crate::types::KernelKey::KvWriteFp8E4m3Batched
+        || plan.attend_key != crate::types::KernelKey::AttnFp8E4m3KvBatchedMasked
+        || plan.window > 0
+        || plan.uses_givens
+        || plan.v_mode_bits != 8
+    {
+        return Err(HipError::new(
+            0,
+            "canonical fp8q prefill requires the native fp8 batched full-causal KV tier",
+        ));
+    }
+    let q_bytes = n * config.n_heads * (config.head_dim + 4);
+    let q_raw = GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(pbs.fa_q_batch.buf.as_ptr(), q_bytes) },
+        shape: vec![q_bytes],
+        dtype: DType::Raw,
+    };
+    for (cache, src) in [
+        (&kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch),
+        (&kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch),
+    ] {
+        gpu.kv_cache_write_fp8_e4m3_batched(
+            cache,
+            src,
+            &pbs.positions,
+            config.n_kv_heads,
+            config.head_dim,
+            n,
+        )?;
+    }
+    let max_ctx_len = start_pos + n;
+    if (config.n_heads, config.n_kv_heads) == (16, 2) {
+        gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201(
+            &q_raw,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &pbs.fa_attn_out_batch,
+            &pbs.positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            max_ctx_len,
+            n,
+        )
+    } else {
+        gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201(
+            &q_raw,
+            &kv_cache.k_gpu[layer_idx],
+            &kv_cache.v_gpu[layer_idx],
+            &pbs.fa_attn_out_batch,
+            &pbs.positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            max_ctx_len,
+            n,
+        )
+    }
+}
+
 /// Shared KV-write + flash-attention dispatch tail (F2 extraction).
 ///
 /// `batch_chunk_fa_attend` calls this with the chunk's own FA tensors; the
@@ -2369,25 +2450,38 @@ pub fn execute_fa_attend_step(
     start_pos: usize,
     max_ctx_len: usize,
     ctx: &DispatchCtx,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     layer_idx: usize,
     a4_epilogue: Option<(&GpuTensor, &GpuTensor)>,
 ) -> HipResult<()> {
-    let is_tree = tree_verify.is_some();
-    let (block_start, block_cols) = match tree_verify.as_ref() {
-        Some(_) => (start_pos, n),
-        None => (0, 0),
+    let is_tree = false;
+    let (block_start, block_cols) = (0, 0);
+    let tree_bias = None;
+    let derive_plan = |batch_size: usize| {
+        KvTierPlan::derive(KvTierInputs {
+            pos: start_pos,
+            flash_mode: s.flash_mode as usize,
+            capture_mode: gpu.graphs.capture_mode,
+            batch_size,
+            is_tree,
+            ..kv_cache.tier_inputs()
+        })
+        .map_err(|e| HipError::new(0, &e.to_string()))
     };
-    let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
-    let plan = KvTierPlan::derive(KvTierInputs {
-        pos: start_pos,
-        flash_mode: s.flash_mode as usize,
-        capture_mode: gpu.graphs.capture_mode,
-        batch_size: n,
-        is_tree,
-        ..kv_cache.tier_inputs()
-    })
-    .map_err(|e| HipError::new(0, &e.to_string()))?;
+    let mut plan = derive_plan(n)?;
+    // A one-row call of an ordinary prefill is still a prefill row: the Q8 tier resolves its
+    // batched write and attend keys (not the decode kernels, whose arithmetic differs from the
+    // bulk route) and the launchers take the actual extent `n == 1`.
+    if n == 1
+        && !is_tree
+        && gpu.ordinary_prefill_active()
+        && plan.write_key == crate::types::KernelKey::KvWriteQ8_0
+        && matches!(
+            plan.attend_key,
+            crate::types::KernelKey::AttnQ8_0Kv | crate::types::KernelKey::AttnFlashQ8_0
+        )
+    {
+        plan = derive_plan(2)?;
+    }
     let io = AttnParams {
         q,
         k,
@@ -2529,7 +2623,6 @@ impl FaPairStage {
             start_c,
             max_ctx_len,
             ctx,
-            None,
             layer_idx,
             None,
         )?;
@@ -2588,7 +2681,6 @@ fn batch_chunk_fa_attend_a4(
         start_pos,
         max_ctx_len,
         ctx,
-        None,
         layer_idx,
         Some((&pbs.fa_q_full_batch, awq)),
     )?;
@@ -2634,7 +2726,7 @@ fn gfx12_fa_prep_geometry_admitted(
 
 /// Admission shared by dense and resident-MoE callers. The H16 extension
 /// requires the actual native tier and whole physical prefix; no PM Q16,
-/// alternate codec, tree, window or independent-lane encoding can reach it.
+/// alternate codec, window or independent-lane encoding can reach it.
 #[allow(clippy::too_many_arguments)]
 pub fn gfx12_fa_prep_fp8q_admitted(
     gpu: &Gpu,
@@ -2645,7 +2737,6 @@ pub fn gfx12_fa_prep_fp8q_admitted(
     start_pos: usize,
     max_ctx_len: usize,
     batch_semantics: BatchSemantics<'_>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     multirow: bool,
     fusion: DflashFusionCtx,
     commit_stride: Option<usize>,
@@ -2653,6 +2744,10 @@ pub fn gfx12_fa_prep_fp8q_admitted(
 ) -> bool {
     let native_a3b = (config.n_heads, config.n_kv_heads) == (16, 2)
         && fa_a3b_native_prefill_rows(n, commit_stride, max_ctx_len);
+    // Ordinary prefill admits every call extent so no row changes attention
+    // arithmetic with the outer split ([`fa_fp8q_canonical_prefill`]).
+    let canonical = fa_fp8q_canonical_prefill(gpu, kv_cache, n, start_pos, max_ctx_len, false);
+    let shape_free = native_a3b || canonical;
     if !gfx12_fa_prep_geometry_admitted(gpu, config, fusion, n, tap_active)
         || gpu.fp8_verify_scope
         || !gpu.flags.gfx12_fa_prep_fp8q
@@ -2661,10 +2756,9 @@ pub fn gfx12_fa_prep_fp8q_admitted(
         || multirow
         || batch_semantics.is_independent()
         || !kv_cache.quant_fp8
-        || !(native_a3b || (64..=32768).contains(&n))
-        || !(native_a3b || (64..=262_144).contains(&max_ctx_len))
-        || tree_verify.is_some()
-        || !(native_a3b
+        || !(shape_free || (64..=32768).contains(&n))
+        || !(shape_free || (64..=262_144).contains(&max_ctx_len))
+        || !(shape_free
             || fa_fp8q_incumbent_shape(n, commit_stride)
             || (fa_ragged_packet_enabled()
                 && fa_ragged_packet_split(
@@ -2678,21 +2772,23 @@ pub fn gfx12_fa_prep_fp8q_admitted(
     {
         return false;
     }
-    if (config.n_heads, config.n_kv_heads) == (16, 2) {
-        if !gpu.flags.gfx12_fa2_prefill
-            || start_pos.checked_add(n) != Some(max_ctx_len)
-            || max_ctx_len > kv_cache.physical_cap
-        {
+    let h16 = (config.n_heads, config.n_kv_heads) == (16, 2);
+    if h16 && !gpu.flags.gfx12_fa2_prefill {
+        return false;
+    }
+    if h16 || canonical {
+        if start_pos.checked_add(n) != Some(max_ctx_len) || max_ctx_len > kv_cache.physical_cap {
             return false;
         }
         // Like dense qresident, this is replay-idempotent: derive the real
         // capture plan rather than imposing the eager-only PM restriction.
+        // A one-row call resolves the same codec at batched arity.
         return matches!(
             KvTierPlan::derive(KvTierInputs {
                 pos: start_pos,
                 flash_mode: s.flash_mode as usize,
                 capture_mode: gpu.graphs.capture_mode,
-                batch_size: n,
+                batch_size: n.max(2),
                 is_tree: false,
                 ..kv_cache.tier_inputs()
             }),
@@ -2721,7 +2817,6 @@ pub fn batch_chunk_full_attn_attn(
     max_ctx_len: usize,
     ctx: &DispatchCtx,
     batch_semantics: BatchSemantics<'_>,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
     q8_wmma_arch: bool,
     arch_has_wmma: bool,
     kv_layer_idx: usize,
@@ -2755,17 +2850,19 @@ pub fn batch_chunk_full_attn_attn(
             start_pos,
             max_ctx_len,
             batch_semantics,
-            tree_verify,
             fa_attn_multirow,
             fusion,
             commit_stride,
             tap.is_some(),
         );
     let gfx12_fa_prep = gfx12_fa_prep_f32 || gfx12_fa_prep_fp8q;
-    // Only the new ragged shape is admitted outside the incumbent n/commit
-    // predicate. It keeps the F32 attention output (no A4 attention epilogue:
-    // the A4 attend step cannot express the two-plane range launches).
-    let newly_admitted_ragged = gfx12_fa_prep_fp8q && !fa_fp8q_incumbent_shape(n, commit_stride);
+    // Only the new ragged shape and ordinary-prefill calls below 64 rows are
+    // admitted outside the incumbent n/commit predicate. They keep the F32
+    // attention output (no A4 attention epilogue: the A4 attend step cannot
+    // express the range or sub-64 launches); the epilogue writes the same bytes
+    // the separate sigmoid/rotate producer forms from that output.
+    let newly_admitted_ragged =
+        gfx12_fa_prep_fp8q && (n < 64 || !fa_fp8q_incumbent_shape(n, commit_stride));
     let pair_q8_writes = dflash_fa_batch_fusion_admitted(gpu, config, fusion, n, tap.is_some());
     // The fp8q prep can leave the sigmoid gate in `fa_q_full_batch` (no
     // 4·n·q_dim-byte copy, and its gate half is never read by the prep) when
@@ -2830,7 +2927,6 @@ pub fn batch_chunk_full_attn_attn(
             start_pos,
             max_ctx_len,
             batch_semantics,
-            tree_verify,
             tap.is_some(),
         );
     if fa_pm_qprep {
@@ -2850,7 +2946,6 @@ pub fn batch_chunk_full_attn_attn(
             max_ctx_len,
             ctx,
             batch_semantics,
-            tree_verify,
             kv_layer_idx,
             layer_idx,
             fusion,
@@ -2894,7 +2989,6 @@ pub fn batch_chunk_full_attn_attn(
                     max_ctx_len,
                     ctx,
                     batch_semantics,
-                    tree_verify,
                     layer_idx,
                     fa_attn_multirow,
                     commit_stride,

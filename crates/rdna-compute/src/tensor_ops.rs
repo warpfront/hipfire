@@ -17,6 +17,12 @@ use crate::{DType, Gpu, GpuTensor};
 pub(crate) mod npu_arena;
 pub use npu_arena::*;
 
+// Absolute-position WY (C16) chunk-scan stream with F32 continuation and
+// replay of the incomplete tile: a child module so it shares the chunk
+// launchers' private validators and state converters.
+#[path = "gdn_wy_stream.rs"]
+pub mod gdn_wy_stream;
+
 // Multi-lane QSA decode core (fn-lanes, exact gfx1201): a child module so it
 // shares the singleton launchers' private validators and route predicates.
 #[path = "qsa_core_lanes.rs"]
@@ -28,6 +34,12 @@ pub use qsa_core_lanes::{
     QSA_LANES_MODULE, QSA_LANES_POOL_SYMBOL, QSA_LANES_PROLOGUE_SYMBOL, QSA_LANES_SELECT_SYMBOL,
 };
 pub(crate) use qsa_core_lanes::{QSA_LANES_FUSE_SRC, QSA_LANES_SRC};
+
+// The same core on exact gfx942 (F32 / E4M3-FNUZ K/V, F32 index keys): admission only, the
+// kernels and launcher live in `cdna/gfx942_qsa_lanes.rs`.
+#[path = "qsa_core_lanes_gfx942.rs"]
+mod qsa_core_lanes_gfx942;
+pub use qsa_core_lanes_gfx942::{qsa_core_lanes_gfx942, qsa_core_lanes_gfx942_min};
 
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
@@ -1056,7 +1068,12 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         arch_gfx942: gpu.arch == "gfx942",
         pipe_enabled: *QWEN4_GDN_PIPE,
     });
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    if gpu.arch_caps.is_gfx942()
+        && kernel == "gated_delta_step_halves_state128_persistent256_capture_f32"
+    {
+        return gated_delta_step_batched_g942_capture(gpu, p);
+    }
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let frame = if format.has_frame_kernarg() {
         checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?
     } else {
@@ -1093,13 +1110,149 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     )
 }
 
-/// Rollback kernel of a state's STORAGE format (`format.storage()`): the Q8Ef
-/// rollback is the plain-Q8 replay (the ring is plain Q8); the Q8Ef entry set
-/// has no rollback kernel.
-fn gdn_rollback_kernel(storage: GdnStateFormat) -> &'static str {
-    match storage.storage() {
-        GdnStateFormat::F32 => "gated_delta_rollback_layers_f32",
-        GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => "gated_delta_rollback_layers_q8",
+/// The exact-gfx942 verify-capture module's launch of the F32 capture recurrence
+/// ([`gated_delta_step_batched`] after its validation): F32 state (no residual pointer, no
+/// requantization frame) and the row-state ring (the capture), so the kernargs are exactly
+/// [`gdn_batched_kernargs`]' for that case, written out here so this launch's ABI is checked
+/// against the module's declaration. A function of its own: the launcher's other launches
+/// name no gfx942 symbol.
+fn gated_delta_step_batched_g942_capture(
+    gpu: &mut Gpu,
+    p: &GatedDeltaStepBatched<'_>,
+) -> HipResult<()> {
+    let row_states = p
+        .row_states
+        .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+    let rows = checked_i32(p.rows, "GDN batched rows")?;
+    let qkv_width = checked_i32(p.qkv_width, "GDN batched qkv width")?;
+    let key_heads = checked_i32(p.key_heads, "GDN batched key heads")?;
+    let value_heads = checked_i32(p.value_heads, "GDN batched value heads")?;
+    let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
+    let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
+    let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
+    let kernel = "qwen4_g942_gdn_verify_capture_f32";
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.projection.buf.as_ptr());
+    args.push_ptr(p.gate.buf.as_ptr());
+    args.push_ptr(p.beta.buf.as_ptr());
+    args.push_ptr(p.state.buf.as_ptr());
+    args.push_ptr(p.output.buf.as_ptr());
+    args.push_ptr(row_states.buf.as_ptr());
+    args.push_i32(rows);
+    args.push_i32(qkv_width);
+    args.push_i32(key_heads);
+    args.push_i32(value_heads);
+    args.push_i32(key_dim);
+    args.push_i32(value_dim);
+    args.push_f32((p.key_dim as f32).sqrt().recip());
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [value_heads_grid, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// Load `kernel` from the `tensor_ops` module itself and return it, whatever the arch routes
+/// the public launchers to: the byte-compare REFERENCE of the exact-gfx942 verify-module oracle
+/// cases (`gdn_capture_f32_gfx942_oracle`), which launch the `tensor_ops` convolution and
+/// gated-norm kernels directly through [`Gpu::launch_kernel_blob`].
+#[doc(hidden)]
+pub fn lab_ensure_tensor_ops_kernel(gpu: &mut Gpu, kernel: &str) -> HipResult<()> {
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)
+}
+
+/// Load the single-row QSA attention entry `kernel` (a `tensor_ops` name) the way the public
+/// launcher does and return the symbol to launch: on exact gfx942 the `qwen4_g942_qsa_row_*`
+/// entry of the gfx942 row module (hipcc source, or the `HIPFIRE_QWEN4_G942_QSA_ROW_IMAGE` code
+/// object), elsewhere `kernel` itself from `tensor_ops`. The module under test of
+/// `qwen4_g942_qsa_row_oracle`, which launches it directly through [`Gpu::launch_kernel_blob`].
+#[doc(hidden)]
+pub fn lab_ensure_qsa_row_entry(gpu: &mut Gpu, kernel: &'static str) -> HipResult<&'static str> {
+    crate::cdna::gfx942::ensure_qsa_row_kernel(gpu, kernel)
+}
+
+/// Bind `entry` (`qwen4_g942_hyper_norm_bf16x` or `qwen4_g942_hyper_write_norm_bf16x`) of the
+/// exact-gfx942 conv-fuse module the way the public launchers do (hipcc source, or the
+/// `HIPFIRE_QWEN4_G942_CONV_FUSE_IMAGE` code object) and return the symbol to launch. The module
+/// under test of `qwen4_g942_conv_fuse_oracle`, which launches it directly through
+/// [`Gpu::launch_kernel_blob`]. An entry that is not one of the module's two is an error.
+#[doc(hidden)]
+pub fn lab_ensure_conv_fuse_entry(gpu: &mut Gpu, entry: &str) -> HipResult<&'static str> {
+    let symbol = [
+        crate::cdna::gfx942::QWEN4_G942_HYPER_NORM_BF16X,
+        crate::cdna::gfx942::QWEN4_G942_HYPER_WRITE_NORM_BF16X,
+    ]
+    .into_iter()
+    .find(|name| *name == entry)
+    .ok_or_else(|| {
+        HipError::new(
+            0,
+            &format!("{entry} is not an entry of the conv-fuse module"),
+        )
+    })?;
+    crate::cdna::gfx942::g942_conv_fuse_ensure(gpu, symbol)?;
+    Ok(symbol)
+}
+
+/// Bind `entry` (`qwen4_g942_rows16_grid` or `qwen4_g942_rows16_grid_x2`) of the exact-gfx942
+/// row-grid module the way the public launcher does (hipcc source, or the
+/// `HIPFIRE_QWEN4_G942_ROWS16_GRID_IMAGE` code object) and return the symbol to launch. The module
+/// under test of `qwen4_g942_rows16_grid_oracle`, which launches it directly through
+/// [`Gpu::launch_kernel_blob`]. An entry that is not one of the module's two is an error.
+#[doc(hidden)]
+pub fn lab_ensure_rows16_grid_entry(gpu: &mut Gpu, entry: &str) -> HipResult<&'static str> {
+    let symbol = crate::cdna::gfx942::QWEN4_G942_ROWS16_GRID_ENTRIES
+        .into_iter()
+        .find(|name| *name == entry)
+        .ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!("{entry} is not an entry of the row-grid module"),
+            )
+        })?;
+    crate::cdna::gfx942::g942_rows16_grid_ensure(gpu, symbol)?;
+    Ok(symbol)
+}
+
+/// Load entry `entry` of the exact-gfx942 wide MoE glue module (`qwen4_g942_moe_wide`: hipcc
+/// source, or the `HIPFIRE_QWEN4_G942_MOE_WIDE_IMAGE` code object) the way the public launchers
+/// do and return the symbol to launch. The module under test of `qwen4_g942_moe_wide_oracle`,
+/// which launches it directly through [`Gpu::launch_kernel_blob`].
+#[doc(hidden)]
+pub fn lab_ensure_moe_wide_entry(gpu: &mut Gpu, entry: &str) -> HipResult<&'static str> {
+    crate::cdna::gfx942::ensure_moe_wide_entry(gpu, entry)
+}
+
+/// Load entry `entry` of the exact-gfx942 wide MoE GEMM module (`qwen4_g942_moe_gemm`: hipcc
+/// source, or the `HIPFIRE_QWEN4_G942_MOE_GEMM_IMAGE` code object) and return the symbol to
+/// launch. The module under test of `qwen4_g942_moe_gemm_oracle`.
+#[doc(hidden)]
+pub fn lab_ensure_moe_gemm_entry(gpu: &mut Gpu, entry: &str) -> HipResult<&'static str> {
+    crate::cdna::gfx942::ensure_moe_gemm_entry(gpu, entry)
+}
+
+/// Load the narrow production FP8 grouped GEMM entry (`gemm_fp8b128_moe_grouped_bf16mfma` /
+/// `_xbf16`) from its own hipcc module and return the symbol to launch: the REFERENCE of
+/// `qwen4_g942_moe_gemm_oracle` at tile counts the public launcher already routes to the wide
+/// module.
+#[doc(hidden)]
+pub fn lab_ensure_moe_gemm_narrow(gpu: &mut Gpu, x_bf16: bool) -> HipResult<&'static str> {
+    crate::cdna::gfx942::ensure_moe_gemm_narrow(gpu, x_bf16)
+}
+
+/// Single-launch rollback kernel of a state's STORAGE format. Q8Ef has no
+/// single-launch kernel: its rollback must carry the residual and runs
+/// [`gated_delta_rollback_layers_ef`] instead.
+fn gdn_rollback_kernel(storage: GdnStateFormat) -> Option<&'static str> {
+    match storage {
+        GdnStateFormat::F32 => Some("gated_delta_rollback_layers_f32"),
+        GdnStateFormat::Q8 => Some("gated_delta_rollback_layers_q8"),
+        GdnStateFormat::Q8Ef => None,
     }
 }
 
@@ -1110,11 +1263,9 @@ fn gdn_rollback_kernel(storage: GdnStateFormat) -> &'static str {
 /// ring slot `from` and leaves the last kept row's state in slot
 /// `to + keep - 1`. 128-wide heads.
 ///
-/// Rollback is storage-based: there is no EF rollback kernel.  A
-/// [`GdnStateFormat::Q8Ef`] rollback replays the plain-Q8 ring with
-/// `gated_delta_rollback_layers_q8` (the ring holds no residual), and the
-/// CALLER then zeroes every rolled-back layer's live residual with
-/// [`gdn_q8ef_residual_zero`] in stream order.
+/// A [`GdnStateFormat::Q8Ef`] state is refused: replaying only its plain-Q8
+/// ring would discard the residual. Its rollback is
+/// [`gated_delta_rollback_layers_ef`].
 pub struct GatedDeltaRollbackLayers<'a> {
     pub table: &'a GpuTensor,
     pub discard: &'a GpuTensor,
@@ -1148,8 +1299,16 @@ pub fn gated_delta_rollback_layers(
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     let storage = p.format.storage();
-    let kernel = gdn_rollback_kernel(storage);
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    let Some(kernel) = gdn_rollback_kernel(p.format) else {
+        return Err(HipError::new(
+            0,
+            "GDN rollback: a Q8Ef state rolls back with its residual (gated_delta_rollback_layers_ef)",
+        ));
+    };
+    if gpu.arch_caps.is_gfx942() && kernel == "gated_delta_rollback_layers_f32" {
+        return gated_delta_rollback_layers_g942(gpu, p);
+    }
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.table.buf.as_ptr());
     args.push_ptr(p.discard.buf.as_ptr());
@@ -1181,6 +1340,146 @@ pub fn gated_delta_rollback_layers(
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
+}
+
+/// The exact-gfx942 verify-rollback module's launch of the F32 rollback
+/// ([`gated_delta_rollback_layers`] after its validation). F32 state has no requantization
+/// frame, so the kernargs are the generic launch's without it, written out here so this
+/// launch's ABI is checked against the module's declaration. A function of its own: the
+/// launcher's other launches name no gfx942 symbol.
+fn gated_delta_rollback_layers_g942(
+    gpu: &mut Gpu,
+    p: &GatedDeltaRollbackLayers<'_>,
+) -> HipResult<()> {
+    let kernel = "qwen4_g942_gdn_verify_rollback_f32";
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.table.buf.as_ptr());
+    args.push_ptr(p.discard.buf.as_ptr());
+    for (value, label) in [
+        (p.rows, "GDN rollback rows"),
+        (p.keep, "GDN rollback kept rows"),
+        (p.from, "GDN rollback source slot"),
+        (p.to, "GDN rollback target slot"),
+        (p.qkv_width, "GDN rollback qkv width"),
+        (p.key_heads, "GDN rollback key heads"),
+        (p.value_heads, "GDN rollback value heads"),
+    ] {
+        args.push_i32(checked_i32(value, label)?);
+    }
+    args.push_f32(128f32.sqrt().recip());
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [
+            checked_u32(p.value_heads, "GDN rollback value-head grid")?,
+            checked_u32(p.layers, "GDN rollback layer grid")?,
+            1,
+        ],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// One layer of a Q8Ef verify rollback ([`gated_delta_rollback_layers_ef`]).
+pub struct GatedDeltaRollbackEfLayer<'a> {
+    /// The captured recurrence input of the verify: the `rows`-row convolution
+    /// output `[rows, qkv]`, then gate and beta `[rows, value_heads]` each
+    /// (F32).
+    pub recurrence: &'a GpuTensor,
+    /// The layer's plain-Q8 slot ring (`Raw`, `slot_units` bytes per slot).
+    pub ring: &'a GpuTensor,
+    /// The layer's live F16 residual. The caller first restores the ENTRY
+    /// residual (the residual before the verify) into it; the replay leaves
+    /// the last kept row's residual in it.
+    pub residual: &'a GpuTensor,
+}
+
+/// Q8Ef partial verify rollback: re-run the first `keep` of `rows` captured
+/// rows of every layer from ring slot `from` and the entry residual with the
+/// capture kernel (`gated_delta_step_*_capture_q8ef`: the single-row AR step's
+/// residual-fed per-row boundary), leaving the last kept row's slot in ring
+/// slot `to + keep - 1` and its residual in the live plane. Unlike the plain-Q8
+/// replay this is the AR chain's own state, so nothing is zeroed and no
+/// stochastic surrogate runs. One capture launch per layer.
+pub struct GatedDeltaRollbackEf<'a> {
+    pub layers: &'a [GatedDeltaRollbackEfLayer<'a>],
+    pub discard: &'a GpuTensor,
+    pub rows: usize,
+    pub keep: usize,
+    pub from: usize,
+    pub to: usize,
+    pub qkv_width: usize,
+    pub key_heads: usize,
+    pub value_heads: usize,
+    /// Absolute position of the last kept row.
+    pub position: usize,
+}
+
+pub fn gated_delta_rollback_layers_ef(
+    gpu: &mut Gpu,
+    p: &GatedDeltaRollbackEf<'_>,
+) -> HipResult<()> {
+    let value = checked_product(p.value_heads, 128, "GDN EF rollback value width")?;
+    if p.keep == 0
+        || p.keep > p.rows
+        || p.key_heads == 0
+        || !p.value_heads.is_multiple_of(p.key_heads)
+        || p.qkv_width != 2 * 128 * p.key_heads + value
+        || p.discard.numel() < checked_product(p.keep, value, "GDN EF rollback output")?
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let format = GdnStateFormat::Q8Ef;
+    let slot = format.storage().state_units(p.value_heads, 128, 128);
+    let qkv_rows = checked_product(p.rows, p.qkv_width, "GDN EF rollback input rows")?;
+    let head_rows = checked_product(p.rows, p.value_heads, "GDN EF rollback parameter rows")?;
+    let kept_qkv = checked_product(p.keep, p.qkv_width, "GDN EF rollback kept rows")?;
+    let kept_heads = checked_product(p.keep, p.value_heads, "GDN EF rollback kept parameters")?;
+    let output = p
+        .discard
+        .sub_offset(0, checked_product(p.keep, value, "GDN EF rollback output")?);
+    for layer in p.layers {
+        if layer.recurrence.numel()
+            < checked_add(
+                qkv_rows,
+                checked_product(2, head_rows, "GDN EF rollback parameters")?,
+                "GDN EF rollback input",
+            )?
+        {
+            return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+        }
+        let projection = layer.recurrence.sub_offset(0, kept_qkv);
+        let gate = layer.recurrence.sub_offset(qkv_rows, kept_heads);
+        let beta = layer
+            .recurrence
+            .sub_offset(qkv_rows + head_rows, kept_heads);
+        let state = layer.ring.sub_offset(p.from * slot, slot);
+        let ring = layer.ring.sub_offset(p.to * slot, p.keep * slot);
+        gated_delta_step_batched(
+            gpu,
+            &GatedDeltaStepBatched {
+                projection: &projection,
+                gate: &gate,
+                beta: &beta,
+                state: &state,
+                format,
+                residual: Some(layer.residual),
+                output: &output,
+                row_states: Some(&ring),
+                rows: p.keep,
+                qkv_width: p.qkv_width,
+                key_heads: p.key_heads,
+                value_heads: p.value_heads,
+                key_dim: 128,
+                value_dim: 128,
+                position: p.position + 1 - p.keep,
+            },
+        )?;
+    }
+    Ok(())
 }
 /// Whether [`gated_delta_step_gate_wmma`] applies: the Qwen4 F16 prefill
 /// route (gfx11 WMMA, >= QWEN4_F16_WMMA_MIN_TOKENS rows, no recorder or capture,
@@ -2309,7 +2608,9 @@ pub struct HyperNextGates<'a> {
 /// from a previous call's `next`) replaces `p.gates` as the gate source;
 /// `next` also computes the next hyper write's gate quarters (its norm and k4
 /// gate GEMV of these streams, bitwise); `clear` is zero-filled (a
-/// `zero_f32`).
+/// `zero_f32`). Exact gfx942 admits up to
+/// [`crate::cdna::gfx942::LANE_ALLROWS_MAX_ROWS`] rows (its single-device lane step's all-rows HC
+/// segment); every other arch keeps the `WIDE_VERIFY_MAX_ROWS` bound.
 pub fn hyper_write_norm(
     gpu: &mut Gpu,
     p: &HyperWrite<'_>,
@@ -2325,12 +2626,17 @@ pub fn hyper_write_norm(
     let wide = checked_product(p.branches, p.hidden, "HC write width")?;
     // Token rows: one block per (branch, row).
     let rows = p.input.numel() / wide.max(1);
+    let max_rows = if gpu.arch_caps.is_gfx942() {
+        crate::cdna::gfx942::LANE_ALLROWS_MAX_ROWS
+    } else {
+        crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+    };
     let quarters_ok = |q: &GpuTensor| q.dtype == DType::F32 && q.numel() == 16 * rows;
     if p.state_bf16
         || p.branches != 4
         || p.hidden != 2560
         || rows == 0
-        || rows > crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+        || rows > max_rows
         || norm_weight.dtype != DType::BF16
         || p.input.numel() != rows * wide
         || p.output.numel() != rows * wide
@@ -4533,47 +4839,7 @@ fn gated_delta_conv_batched_impl(
     let start_cursor = checked_i32(p.start_cursor, "GDN batched convolution cursor")?;
     let grid = blocks(p.channels)?;
     let row_grid = checked_u32(p.rows.div_ceil(16), "GDN batched convolution row grid")?;
-    let kernel = if qk_norm.is_some() {
-        "gated_delta_conv_qknorm_bf16_f32_batched_k4"
-    } else {
-        "gated_delta_conv_bf16_f32_batched_k4"
-    };
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
-    let mut args = KernargBlob::new();
-    for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
-        args.push_ptr(tensor.buf.as_ptr());
-    }
-    args.push_i32(rows);
-    args.push_i32(channels);
-    args.push_i32(history_rows);
-    args.push_i32(kernel_size);
-    args.push_i32(start_cursor);
-    let start_cursor_offset = args.len() - 4;
-    // H5's `output_bf16` is a flag word: bit 0 = packed BF16 output, bit 1 =
-    // also store the unnormalized Q/K convolution (debug / capture).
-    args.push_i32(i32::from(output_bf16) | qk_norm.map_or(0, |n| 2 * i32::from(n.keep_qk_conv)));
-    args.push_i32(i32::from(input_bf16));
-    let (param_elements, param_heads) = match params {
-        Some(q) => {
-            for tensor in [q.a, q.b, q.a_log, q.dt_bias, q.gate, q.beta] {
-                args.push_ptr(tensor.buf.as_ptr());
-            }
-            (q.rows * q.heads, q.heads)
-        }
-        None => {
-            for _ in 0..6 {
-                args.push_ptr(std::ptr::null());
-            }
-            (0, 1)
-        }
-    };
-    args.push_i32(checked_i32(param_elements, "GDN batched parameter extent")?);
-    args.push_i32(checked_i32(param_heads, "GDN batched parameter heads")?);
-    if let Some(norm) = qk_norm {
-        args.push_ptr(norm.qn);
-        args.push_ptr(norm.kn);
-    }
-    args.pad_to(16);
+    let (param_elements, param_heads) = params.map_or((0, 1), |q| (q.rows * q.heads, q.heads));
     let param_grid = checked_u32(param_elements.div_ceil(256), "GDN batched parameter grid")?;
     // Compact 1-D grid: `conv_blocks * row_grid` convolution tiles (block `i`
     // is channel block `i % conv_blocks`, row block `i / conv_blocks`), then the
@@ -4592,6 +4858,61 @@ fn gated_delta_conv_batched_impl(
         )?,
         "GDN batched convolution launch grid",
     )?;
+    if qk_norm.is_none() && gpu.arch_caps.is_gfx942() {
+        return gated_delta_conv_batched_g942(
+            gpu,
+            p,
+            params,
+            GdnConvG942 {
+                rows,
+                channels,
+                history_rows,
+                kernel_size,
+                start_cursor,
+                output_bf16,
+                input_bf16,
+                param_elements,
+                param_heads,
+                total_grid,
+            },
+        );
+    }
+    let kernel = if qk_norm.is_some() {
+        "gated_delta_conv_qknorm_bf16_f32_batched_k4"
+    } else {
+        "gated_delta_conv_bf16_f32_batched_k4"
+    };
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_i32(rows);
+    args.push_i32(channels);
+    args.push_i32(history_rows);
+    args.push_i32(kernel_size);
+    args.push_i32(start_cursor);
+    let start_cursor_offset = args.len() - 4;
+    // H5's `output_bf16` is a flag word: bit 0 = packed BF16 output, bit 1 =
+    // also store the unnormalized Q/K convolution (debug / capture).
+    args.push_i32(i32::from(output_bf16) | qk_norm.map_or(0, |n| 2 * i32::from(n.keep_qk_conv)));
+    args.push_i32(i32::from(input_bf16));
+    if let Some(q) = params {
+        for tensor in [q.a, q.b, q.a_log, q.dt_bias, q.gate, q.beta] {
+            args.push_ptr(tensor.buf.as_ptr());
+        }
+    } else {
+        for _ in 0..6 {
+            args.push_ptr(std::ptr::null());
+        }
+    }
+    args.push_i32(checked_i32(param_elements, "GDN batched parameter extent")?);
+    args.push_i32(checked_i32(param_heads, "GDN batched parameter heads")?);
+    if let Some(norm) = qk_norm {
+        args.push_ptr(norm.qn);
+        args.push_ptr(norm.kn);
+    }
+    args.pad_to(16);
     // `start_cursor` is `start_position % history_rows` for the chunk (the
     // kernel advances the ring per row from there), so the declared binding
     // re-derives it at the replay position.
@@ -4604,6 +4925,78 @@ fn gated_delta_conv_batched_impl(
     gpu.launch_blob_recorded(
         kernel,
         [total_grid, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: &start_cursor_binding,
+        },
+    )
+}
+
+/// The resolved geometry of one batched GDN convolution launch
+/// ([`gated_delta_conv_batched_impl`] after its validation).
+struct GdnConvG942 {
+    rows: i32,
+    channels: i32,
+    history_rows: i32,
+    kernel_size: i32,
+    start_cursor: i32,
+    output_bf16: bool,
+    input_bf16: bool,
+    param_elements: usize,
+    param_heads: usize,
+    total_grid: u32,
+}
+
+/// The exact-gfx942 verify convolution module's launch of the un-normalized params kernel
+/// (no Q/K norm tail), written out here so this launch's ABI is checked against the module's
+/// declaration. A function of its own: the launcher's other launches name no gfx942 symbol.
+fn gated_delta_conv_batched_g942(
+    gpu: &mut Gpu,
+    p: &GatedDeltaConvBatched<'_>,
+    params: Option<&GatedDeltaParamsBatched<'_>>,
+    g: GdnConvG942,
+) -> HipResult<()> {
+    let kernel = "qwen4_g942_gdn_verify_conv_params_k4";
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, kernel)?;
+    let mut args = KernargBlob::new();
+    for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    args.push_i32(g.rows);
+    args.push_i32(g.channels);
+    args.push_i32(g.history_rows);
+    args.push_i32(g.kernel_size);
+    args.push_i32(g.start_cursor);
+    let start_cursor_offset = args.len() - 4;
+    args.push_i32(i32::from(g.output_bf16));
+    args.push_i32(i32::from(g.input_bf16));
+    if let Some(q) = params {
+        for tensor in [q.a, q.b, q.a_log, q.dt_bias, q.gate, q.beta] {
+            args.push_ptr(tensor.buf.as_ptr());
+        }
+    } else {
+        for _ in 0..6 {
+            args.push_ptr(std::ptr::null());
+        }
+    }
+    args.push_i32(checked_i32(
+        g.param_elements,
+        "GDN batched parameter extent",
+    )?);
+    args.push_i32(checked_i32(g.param_heads, "GDN batched parameter heads")?);
+    args.pad_to(16);
+    let start_cursor_binding = [crate::replay::ReplayKernargBinding::PositionModU32 {
+        offset: start_cursor_offset,
+        addend: 0,
+        modulus: u32::try_from(p.history_rows)
+            .map_err(|_| HipError::new(0, "GDN batched convolution history rows exceed u32"))?,
+    }];
+    gpu.launch_blob_recorded(
+        kernel,
+        [g.total_grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -4846,11 +5239,12 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
     let value_heads = checked_i32(p.value_heads, "GDN batched gate heads")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched gate width")?;
     let value_heads_grid = checked_u32(elements / p.value_dim, "GDN batched gate grid")?;
-    gpu.ensure_kernel_public(
-        "tensor_ops",
-        TENSOR_OPS_SRC,
-        "gated_delta_gate_bf16_f32_batched",
-    )?;
+    let gate_kernel = if gpu.arch_caps.is_gfx942() {
+        "qwen4_g942_gdn_verify_gate_batched"
+    } else {
+        "gated_delta_gate_bf16_f32_batched"
+    };
+    crate::cdna::gfx942::ensure_gdn_verify_kernel(gpu, gate_kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.recurrent_output, p.z, p.norm, p.output] {
         args.push_ptr(tensor.buf.as_ptr());
@@ -4860,7 +5254,7 @@ pub fn gated_delta_gate_batched(gpu: &mut Gpu, p: &GatedDeltaGateBatched<'_>) ->
     args.push_i32(value_dim);
     args.pad_to(16);
     gpu.launch_blob_recorded(
-        "gated_delta_gate_bf16_f32_batched",
+        gate_kernel,
         [value_heads_grid, 1, 1],
         [32, 1, 1],
         0,
@@ -9953,7 +10347,7 @@ pub fn indexed_attention_attention(
     let (kernel_name, shared_mem) =
         match p.selected_len.checked_mul(QSA_ATTENTION_LDS_BYTES_PER_ROW) {
             Some(bytes)
-                if gpu.arch_caps.has_gfx11_plus_simt()
+                if gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
                     // The kernel adds 32 bytes of static LDS (per-wave maxes).
                     && bytes + 32 <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
                     && bytes <= u32::MAX as usize =>
@@ -9962,7 +10356,20 @@ pub fn indexed_attention_attention(
             }
             _ => (serial, 0),
         };
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
+    // Exact gfx942 launches the two parallel entries from the single-row module, under the
+    // module's own symbols (the per-context function table is keyed by entry name; the
+    // device body is this module's, byte for byte). Selected here, where the launch names
+    // them, so this site's ABI is checked against the module's declaration.
+    let kernel_name = if gpu.arch_caps.is_gfx942() {
+        match kernel_name {
+            "indexed_attention_attention_f32" => "qwen4_g942_qsa_row_f32",
+            "indexed_attention_attention_fp8_fnuz" => "qwen4_g942_qsa_row_fp8_fnuz",
+            other => other,
+        }
+    } else {
+        kernel_name
+    };
+    crate::cdna::gfx942::ensure_qsa_row_kernel(gpu, kernel_name)?;
     let mut args = KernargBlob::new();
     for tensor in [
         p.q_with_gate,
@@ -22761,14 +23168,17 @@ mod gdn_q8ef_tests {
 
     #[test]
     fn gdn_q8ef_live_layout_rollback_converters_and_chunk_selection() {
-        // Storage-based rollback: no EF rollback kernel.
-        assert_eq!(gdn_rollback_kernel(F32), "gated_delta_rollback_layers_f32");
-        assert_eq!(gdn_rollback_kernel(Q8), "gated_delta_rollback_layers_q8");
+        // The single-launch rollback has no Q8Ef kernel: a Q8Ef state rolls
+        // back with its residual (`gated_delta_rollback_layers_ef`).
         assert_eq!(
-            gdn_rollback_kernel(EF.storage()),
-            "gated_delta_rollback_layers_q8"
+            gdn_rollback_kernel(F32),
+            Some("gated_delta_rollback_layers_f32")
         );
-        assert_eq!(gdn_rollback_kernel(EF), "gated_delta_rollback_layers_q8");
+        assert_eq!(
+            gdn_rollback_kernel(Q8),
+            Some("gated_delta_rollback_layers_q8")
+        );
+        assert_eq!(gdn_rollback_kernel(EF), None);
         assert!(EF.storage().has_frame_kernarg());
         // Frames: plain Q8 only.
         assert!(Q8.has_frame_kernarg());

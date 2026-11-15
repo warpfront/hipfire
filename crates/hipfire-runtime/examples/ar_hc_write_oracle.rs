@@ -7,22 +7,25 @@
 //!
 //! ```text
 //! ar_hc_write_oracle [--rows 1,8,32,100,256] [--iters 2000] [--devices 0,1] [--out DIR]
-//!                    [--stream f32|bf16|both] [--wire tagged|dense|hybrid]
+//!                    [--stream f32|bf16|both] [--partial f32|bf16|both] [--wire tagged|dense|hybrid]
 //! ```
 //!
 //! `--stream` picks the HC stream kind(s) under test (default `both`): `bf16` = BF16 bits
 //! (`hyper_write_bf16x2`, REF `state_bf16 = true`), `f32` = F32 words holding BF16-exact
-//! values (`hyper_write_f32`, REF `state_bf16 = false`: decode, verify, short chunks). Every
-//! row of the receipt carries its `stream` kind.
+//! values (`hyper_write_f32`, REF `state_bf16 = false`: decode, verify, short chunks).
+//! `--partial` picks the wire format(s) of the partials (default `both`, `ArHcPartial`): `f32`
+//! (the mixer write) or `bf16` (the FFN write). Every row of the receipt carries its `stream`
+//! kind and `partial` format.
 //!
 //! Per iteration (one "layer" of chained streams): fresh random partials (distinct per
 //! rank), fresh gate logits. The fused launch is checked against REF = the host fold
-//! (`ar_hc_fold`, exact IEEE adds of the two bf16-rounded partials) uploaded as `mixed` and
-//! applied by the PRODUCTION `hyper_write` kernel to an identical copy of the streams:
+//! (`ArHcPartial::fold`: the exact IEEE add of the two partials as they travel) uploaded as
+//! `mixed` and applied by the PRODUCTION `hyper_write` kernel to an identical copy of the streams:
 //!  * fused streams byte-equal to REF streams, on both ranks;
 //!  * rank 0 streams byte-equal to rank 1 streams;
 //!  * the kernel's folded `m` (debug output) byte-equal to the host fold, on both ranks;
-//!  * `|m - (p0 + p1)| <= (2^-8 + 2^-23)(|p0| + |p1|)` against the exact sum.
+//!  * `|m - (p0 + p1)| <= ArHcPartial::fold_bound` against the exact sum (f32 partials
+//!    `2^-24 (|p0| + |p1|)`, bf16 partials `(2^-8 + 2^-23)(|p0| + |p1|)`).
 //! On the dense wire every iteration also checks that the bank the launch used is back to
 //! all-EMPTY (0xFF) in the rank's own mailbox (the consumer re-arm).
 //! Also a bounded-wait fault check at the end (rank 1 skips a launch; rank 0's wait must
@@ -35,7 +38,7 @@
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
 use hipfire_runtime::ar_hc_exchange::ArHcMode;
 use rdna_compute::ar_hc_write::{
-    ar_hc_fold, ar_hc_fold_bound, bf16_bits, bf16_round, ArHcWire, StreamKind, AR_HC_HIDDEN,
+    bf16_bits, bf16_round, ArHcPartial, ArHcWire, StreamKind, AR_HC_HIDDEN,
 };
 use rdna_compute::tensor_ops::{hyper_write, HyperWrite};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -144,7 +147,7 @@ fn alloc_f32(gpu: &mut Gpu, n: usize) -> GpuTensor {
 }
 
 struct RankResult {
-    tallies: Vec<(StreamKind, usize, Tally)>,
+    tallies: Vec<(ArHcPartial, StreamKind, usize, Tally)>,
     streams: Vec<(usize, Vec<u8>)>,
     fault: Option<String>,
     rnd: Option<String>,
@@ -156,6 +159,7 @@ fn run_rank(
     device: i32,
     rows_list: Vec<usize>,
     kinds: Vec<StreamKind>,
+    partials: Vec<ArHcPartial>,
     iters: usize,
     fault: bool,
     rnd: bool,
@@ -180,11 +184,12 @@ fn run_rank(
     barrier.wait();
     let mut tallies = Vec::new();
     let mut last_streams = Vec::new();
-    let cases: Vec<(StreamKind, usize)> = kinds
+    let cases: Vec<(ArHcPartial, StreamKind, usize)> = partials
         .iter()
-        .flat_map(|&kind| rows_list.iter().map(move |&rows| (kind, rows)))
+        .flat_map(|&p| kinds.iter().map(move |&kind| (p, kind)))
+        .flat_map(|(p, kind)| rows_list.iter().map(move |&rows| (p, kind, rows)))
         .collect();
-    for &(kind, rows) in &cases {
+    for &(fmt, kind, rows) in &cases {
         let n = rows * AR_HC_HIDDEN;
         let wide = rows * 4 * AR_HC_HIDDEN;
         // BF16-bit streams: F32-typed tensors of `wide` elements (2x oversize, the production
@@ -235,7 +240,7 @@ fn run_rank(
                 ),
             });
             let m_host: Vec<f32> = (0..n)
-                .map(|i| ar_hc_fold(host_p[0][i], host_p[1][i]))
+                .map(|i| fmt.fold(host_p[0][i], host_p[1][i]))
                 .collect();
             gpu.hip
                 .memcpy_htod(&partial.buf, &bytes_f32(&host_p[rank]))
@@ -264,6 +269,7 @@ fn run_rank(
                     partial.buf.as_ptr(),
                     streams.buf.as_ptr(),
                     kind,
+                    fmt,
                     gates.buf.as_ptr(),
                     rows,
                     dbg.buf.as_ptr(),
@@ -303,8 +309,9 @@ fn run_rank(
                     tally.fused_ne_ref += 1;
                     tally.first.get_or_insert_with(|| {
                         format!(
-                            "{} rows {rows} iter {it} rank {rank}: mailbox bank {bank} byte {at} not re-armed ({:#04x})",
+                            "{} streams {} partials rows {rows} iter {it} rank {rank}: mailbox bank {bank} byte {at} not re-armed ({:#04x})",
                             kind.name(),
+                            fmt.name(),
                             mb[bank * stride + at]
                         )
                     });
@@ -323,8 +330,9 @@ fn run_rank(
             let note = |t: &mut Tally, what: String| {
                 if t.first.is_none() {
                     t.first = Some(format!(
-                        "{} rows {rows} iter {it} rank {rank}: {what}",
-                        kind.name()
+                        "{} streams {} partials rows {rows} iter {it} rank {rank}: {what}",
+                        kind.name(),
+                        fmt.name()
                     ));
                 }
             };
@@ -349,7 +357,7 @@ fn run_rank(
             }
             for i in 0..n {
                 let (a, b) = (host_p[0][i], host_p[1][i]);
-                let allowed = ar_hc_fold_bound(a, b);
+                let allowed = fmt.fold_bound(a, b);
                 let err = (f64::from(got_m[i]) - (f64::from(a) + f64::from(b))).abs();
                 if allowed > 0.0 {
                     tally.max_bound_ratio = tally.max_bound_ratio.max(err / allowed);
@@ -380,14 +388,15 @@ fn run_rank(
                 tally.fused_ne_ref += 1;
                 tally.first.get_or_insert_with(|| {
                     format!(
-                        "{} rows {rows}: rank 0 and rank 1 final streams differ",
-                        kind.name()
+                        "{} streams {} partials rows {rows}: rank 0 and rank 1 final streams differ",
+                        kind.name(),
+                        fmt.name()
                     )
                 });
             }
         }
         barrier.wait();
-        tallies.push((kind, rows, tally));
+        tallies.push((fmt, kind, rows, tally));
         for t in [
             streams,
             ref_streams,
@@ -416,6 +425,7 @@ fn run_rank(
                     partial.buf.as_ptr(),
                     streams.buf.as_ptr(),
                     StreamKind::Bf16,
+                    ArHcPartial::F32,
                     gates.buf.as_ptr(),
                     rows,
                     std::ptr::null_mut::<c_void>(),
@@ -463,6 +473,7 @@ fn main() {
     let mut fault = true;
     let mut rnd = true;
     let mut kinds = StreamKind::ALL.to_vec();
+    let mut partials = ArHcPartial::ALL.to_vec();
     let mut wire = hipfire_runtime::ar_hc_exchange::ar_hc_mode_from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -500,6 +511,15 @@ fn main() {
                     other => panic!("--stream takes f32|bf16|both, got {other}"),
                 };
             }
+            "--partial" => {
+                i += 1;
+                partials = match args[i].as_str() {
+                    "bf16" => vec![ArHcPartial::Bf16],
+                    "f32" => vec![ArHcPartial::F32],
+                    "both" => ArHcPartial::ALL.to_vec(),
+                    other => panic!("--partial takes f32|bf16|both, got {other}"),
+                };
+            }
             "--wire" => {
                 i += 1;
                 wire = match args[i].as_str() {
@@ -524,15 +544,18 @@ fn main() {
     let shared = Arc::new(Mutex::new(Vec::new()));
     let handles: Vec<_> = (0..2)
         .map(|rank| {
-            let (x, b, s, rl, kinds) = (
+            let (x, b, s, rl, kinds, partials) = (
                 x.clone(),
                 barrier.clone(),
                 shared.clone(),
                 rows_list.clone(),
                 kinds.clone(),
+                partials.clone(),
             );
             let dev = devices[rank];
-            std::thread::spawn(move || run_rank(rank, dev, rl, kinds, iters, fault, rnd, x, b, s))
+            std::thread::spawn(move || {
+                run_rank(rank, dev, rl, kinds, partials, iters, fault, rnd, x, b, s)
+            })
         })
         .collect();
     let results: Vec<Result<RankResult, String>> = handles
@@ -548,17 +571,17 @@ fn main() {
                 failed = true;
             }
             Ok(res) => {
-                for (kind, rows, t) in &res.tallies {
+                for (fmt, kind, rows, t) in &res.tallies {
                     let bad = t.fused_ne_ref + t.m_ne_ref + t.bound;
                     eprintln!(
-                        "rank {rank} {} rows {rows}: {} iters fused!=REF {} m!=host {} bound {} (max ratio {:.3}){}",
-                        kind.name(), t.iters, t.fused_ne_ref, t.m_ne_ref, t.bound, t.max_bound_ratio,
+                        "rank {rank} {} streams {} partials rows {rows}: {} iters fused!=REF {} m!=host {} bound {} (max ratio {:.3}){}",
+                        kind.name(), fmt.name(), t.iters, t.fused_ne_ref, t.m_ne_ref, t.bound, t.max_bound_ratio,
                         t.first.as_deref().map_or(String::new(), |f| format!(" FIRST: {f}"))
                     );
                     failed |= bad != 0;
                     json_rows.push(format!(
-                        "{{\"rank\":{rank},\"stream\":\"{}\",\"rows\":{rows},\"iters\":{},\"fused_ne_ref\":{},\"m_ne_host\":{},\"bound_violations\":{},\"max_bound_ratio\":{:.4},\"pass\":{}}}",
-                        kind.name(), t.iters, t.fused_ne_ref, t.m_ne_ref, t.bound, t.max_bound_ratio, bad == 0
+                        "{{\"rank\":{rank},\"stream\":\"{}\",\"partial\":\"{}\",\"rows\":{rows},\"iters\":{},\"fused_ne_ref\":{},\"m_ne_host\":{},\"bound_violations\":{},\"max_bound_ratio\":{:.4},\"pass\":{}}}",
+                        kind.name(), fmt.name(), t.iters, t.fused_ne_ref, t.m_ne_ref, t.bound, t.max_bound_ratio, bad == 0
                     ));
                 }
                 if let Some(f) = &res.fault {
@@ -577,10 +600,11 @@ fn main() {
         }
     }
     let receipt = format!(
-        "{{\"oracle\":\"ar_hc_write_oracle\",\"wire\":\"{}\",\"pass\":{},\"iters\":{iters},\"streams\":[{}],\"devices\":[{},{}],\"results\":[{}]}}",
+        "{{\"oracle\":\"ar_hc_write_oracle\",\"wire\":\"{}\",\"pass\":{},\"iters\":{iters},\"streams\":[{}],\"partials\":[{}],\"devices\":[{},{}],\"results\":[{}]}}",
         wire.name(),
         !failed,
         kinds.iter().map(|k| format!("\"{}\"", k.name())).collect::<Vec<_>>().join(","),
+        partials.iter().map(|p| format!("\"{}\"", p.name())).collect::<Vec<_>>().join(","),
         devices[0], devices[1], json_rows.join(",")
     );
     let _ = std::fs::create_dir_all(&out);

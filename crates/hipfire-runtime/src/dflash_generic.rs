@@ -27,34 +27,12 @@
 //!   5. greedy-accept the longest matching prefix + bonus, append ONLY the
 //!      committed-prefix hidden to `target_hidden_host`, and advance.
 //!
-//! **Linear chain is the SHIPPED DEFAULT.** The DDTree tree-SWOR arm raises τ
-//! (acceptance) but costs more per cycle, and net loses to chain on every
-//! drafter measured (DeltaNet + non-DeltaNet qwen3-8b/Bielik) — the DFlash
-//! drafter emits independent per-position marginals, so a tree branch has no
-//! joint to exploit. Opt IN to the tree with the CLI `--ddtree` flag (sets
-//! `HIPFIRE_DFLASH_TREE=1`). Both arms are lossless at temp 0 and
-//! distribution-exact at temp>0 (chain via naive sampling, tree via SWOR).
-//!
-//! The chain (linear) verify supports BOTH greedy (temp≈0) and a
-//! distribution-EXACT temp>0 path: SpecInfer NAIVE sampling (draw `x ~
-//! softmax(target_logits/temp)` per position, accept the drafted token it lands
-//! on, else emit the draw as the bonus — see [`crate::ddtree::naive_sample_chain`]).
-//! So [`supports_temp_verify`](Speculator::supports_temp_verify) is `true` for the
-//! chain.
-//!
-//! The tree arm (opt-in; `--ddtree` / `HIPFIRE_DFLASH_TREE=1`) verifies the WHOLE bounded
-//! DDTree in ONE tree-masked target forward ([`SpecTarget::verify_tree_logits`])
-//! and walks the per-node logits with the q-exploiting without-replacement
-//! speculative sampler ([`crate::ddtree::sample_verified_tree_swor`]). This is
-//! ALSO distribution-exact at temp>0, so a tree-enabled speculator reports
-//! `supports_temp_verify = true` and temp>0 routes
-//! through the single-pass tree-SWOR rather than the chain naive sampler. At
-//! temp 0 the greedy argmax walk through the tree is lossless == AR.
+//! The chain verify supports BOTH greedy (temp≈0) and a distribution-EXACT
+//! temp>0 path: SpecInfer NAIVE sampling (draw `x ~ softmax(target_logits/temp)`
+//! per position, accept the drafted token it lands on, else emit the draw as the
+//! bonus — see [`crate::spec_sampling::naive_sample_chain`]). So
+//! [`supports_temp_verify`](Speculator::supports_temp_verify) is `true`.
 
-use crate::ddtree::{
-    build_ddtree_tree_bounded, linearize_tree_with_parents, naive_sample_chain,
-    sample_verified_tree, sample_verified_tree_swor, swor_draft_candidates, topk_from_logits,
-};
 use crate::dflash::{draft_forward, DflashConfig, DflashScratch, DflashWeights};
 use crate::hfq::HfqFile;
 use crate::llama;
@@ -62,60 +40,9 @@ use crate::spec::{
     accept_greedy_prefix, PrefillOutcome, SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch,
     SpecStep, SpecTarget, Speculator,
 };
+use crate::spec_sampling::naive_sample_chain;
 use rdna_compute::Gpu;
 use std::path::Path;
-
-/// Tree-verify defaults (overridable via `HIPFIRE_DDTREE_BUDGET` / `_TOPK`).
-const DEFAULT_TREE_BUDGET: usize = 8;
-const DEFAULT_TREE_TOPK: usize = 2;
-
-/// Effective tree node budget for this config, clamped so the linearized tree
-/// (`budget` nodes + 1 seed) can never exceed the dense verify kernel's batch
-/// ceiling. Single source of truth shared by the tree builder ([`TreeMode`])
-/// and the verify-scratch sizer ([`dense_tree_verify_nodes`]) so the two can't
-/// disagree.
-fn clamped_tree_budget(flags: &rdna_compute::FeatureFlags) -> usize {
-    flags
-        .ddtree_budget
-        .unwrap_or(DEFAULT_TREE_BUDGET)
-        .clamp(1, crate::llama::PREFILL_MAX_BATCH - 1)
-}
-
-/// Linearized node count (clamped `budget` + seed) the dense DFlash tree-verify
-/// scratch must hold, or `0` when the tree arm is disabled. `SpecTarget::
-/// new_spec_scratch` sizes `PrefillBatchScratch` to at least this, so a large
-/// `HIPFIRE_DDTREE_BUDGET` (or `--draft-max`) can't overflow the verify batch —
-/// the `forward_prefill_batch_tree: tree size N exceeds max_batch` panic.
-pub fn dense_tree_verify_nodes(flags: &rdna_compute::FeatureFlags) -> usize {
-    if flags.dflash_tree {
-        clamped_tree_budget(flags) + 1
-    } else {
-        0
-    }
-}
-
-/// Resolved tree-mode policy, read once at build time from the environment.
-///
-/// `enabled` gates the whole arm (`HIPFIRE_DFLASH_TREE=1`). When off the
-/// speculator is byte-for-byte the original chain path. `budget` caps the tree
-/// node count (passed as `max_nodes` to [`build_ddtree_tree_bounded`]); `topk`
-/// is the per-position breadth (the second dim of the top-K marginal arrays).
-#[derive(Debug, Clone, Copy)]
-struct TreeMode {
-    enabled: bool,
-    budget: usize,
-    topk: usize,
-}
-
-impl TreeMode {
-    fn from_flags(flags: &rdna_compute::FeatureFlags) -> Self {
-        TreeMode {
-            enabled: flags.dflash_tree,
-            budget: clamped_tree_budget(flags),
-            topk: flags.ddtree_topk.unwrap_or(DEFAULT_TREE_TOPK),
-        }
-    }
-}
 
 /// Target-generic chain-mode DFlash speculator.
 ///
@@ -138,9 +65,6 @@ pub struct GenericDflashSpeculator {
     verify_scratch: Option<Box<dyn SpecScratch>>,
     block_size: usize,
     ctx_capacity: usize,
-    /// Tree-verify policy (default OFF; opt in via `--ddtree` / `HIPFIRE_DFLASH_TREE=1`). When
-    /// `enabled` is false the `step` takes the original single-path chain verify.
-    tree: TreeMode,
     /// Xorshift64* RNG state for the temp>0 chain naive sampler. Bit-compatible
     /// with the qwen35 spec sampler's seed so the chain draws are deterministic.
     rng_state: u64,
@@ -151,7 +75,7 @@ pub struct GenericDflashSpeculator {
     /// Per-request nucleus/top-k truncation from [`Speculator::set_sampling`].
     /// Defaults `1.0` / `0` (disabled) so a speculator whose `set_sampling` is
     /// never called behaves exactly as today — byte-identical draws via the
-    /// `top_k == 0 && top_p >= 0.999` fast path in [`crate::ddtree::naive_sample_chain`].
+    /// `top_k == 0 && top_p >= 0.999` fast path in [`naive_sample_chain`].
     sample_top_p: f32,
     sample_top_k: usize,
 }
@@ -251,196 +175,6 @@ impl GenericDflashSpeculator {
         Ok(step.cap_emit(1))
     }
 
-    /// Single-pass SWOR tree-verify step. Builds a bounded DDTree from the
-    /// per-position draft marginals, LINEARIZES it, verifies the WHOLE tree in
-    /// ONE tree-masked target forward ([`SpecTarget::verify_tree_logits`]), then
-    /// walks the per-node target logits with the distribution-exact
-    /// without-replacement speculative sampler ([`sample_verified_tree_swor`] at
-    /// temp>0; [`sample_verified_tree`]'s greedy argmax walk at temp 0).
-    ///
-    /// This is the q-exploiting SWOR that supersedes the prior linear-n-best
-    /// (N forwards/cycle, 2.4× loss) AND the host-side `naive_sample_chain`
-    /// temp>0 (which collapses on high-entropy prompts because it ignores `q`).
-    /// The whole verify is ONE forward.
-    ///
-    /// LOSSLESS at temp 0: the greedy walk follows the target argmax through the
-    /// tree exactly as a chain verify would, so every committed token is the
-    /// target's own greedy continuation. DISTRIBUTION-EXACT at temp>0: every
-    /// emitted token is a draw from the (residual) target, so the output marginal
-    /// equals `softmax(target_logits / temp)` regardless of the draft `q`
-    /// (validated by the `*_preserves_target_distribution` MC tests).
-    ///
-    /// Hidden capture (H2): `verify_tree_logits` captures one residual-hidden row
-    /// per linearized slot. We append, in committed order, the seed slot (0) plus
-    /// each accepted node's slot (`node_idx + 1`) — `accept_len + 1` rows total —
-    /// so the cumulative `target_hidden_host` grows by exactly `accept + 1`,
-    /// matching `draft_forward`'s incremental contract. The bonus row is NOT
-    /// appended (its hidden materializes next cycle when it forwards as slot 0).
-    #[allow(clippy::too_many_arguments)]
-    fn step_tree(
-        &mut self,
-        gpu: &mut Gpu,
-        target: &mut dyn SpecTarget,
-        position: usize,
-        seed: u32,
-        draft_logits: &[f32],
-        vocab: usize,
-        b: usize,
-        temp: f32,
-        max_emit: usize,
-    ) -> Result<SpecStep, String> {
-        let ne = self.feature_rows();
-        let h = self.config.hidden;
-        let depth = b - 1; // drafted positions = block_size - 1
-
-        // Per-position top-K marginals from the draft logits, then the bounded
-        // best-first DDTree (Algorithm 1). topk is capped to vocab defensively.
-        let topk = self.tree.topk.min(vocab).max(1);
-        let (top_tokens, top_log_probs) = topk_from_logits(draft_logits, depth, vocab, topk);
-        let tree = build_ddtree_tree_bounded(
-            &top_tokens,
-            &top_log_probs,
-            depth,
-            topk,
-            0,
-            self.tree.budget,
-            f32::NEG_INFINITY,
-        );
-
-        // Linearize: slot 0 = seed; slots 1.. = tree.nodes (topological order).
-        // mask_block is the [big_n × big_n] additive ancestor-visibility bias;
-        // depth_positions carry each slot's DEPTH RoPE position (position + depth)
-        // — the verify rotates Q/K at these so the bushy-tree verify is lossless.
-        let (verify_tokens, depth_positions, mask_block, _parents) =
-            linearize_tree_with_parents(&tree, seed, position as u32);
-        let big_n = verify_tokens.len();
-        debug_assert_eq!(big_n, 1 + tree.num_nodes());
-
-        let vs = self
-            .verify_scratch
-            .as_mut()
-            .ok_or("GenericDflashSpeculator: verify scratch already freed")?;
-
-        // ── ONE tree-masked verify forward → per-node target logits + hidden ──
-        let mut block_hidden: Vec<f32> = Vec::with_capacity(big_n * ne * h);
-        let logits_per_slot = target.verify_tree_logits(
-            gpu,
-            &verify_tokens,
-            &mask_block,
-            &depth_positions,
-            position,
-            vs.as_mut(),
-            Some(&mut block_hidden),
-        )?;
-        debug_assert_eq!(logits_per_slot.len(), big_n * vocab);
-        debug_assert_eq!(block_hidden.len(), big_n * ne * h);
-
-        // ── Accept walk: greedy (temp≈0) or q-exploiting SWOR (temp>0) ────────
-        let (accepted_nodes, bonus): (Vec<usize>, u32) = if temp <= 1e-6 {
-            sample_verified_tree(&tree, &logits_per_slot, vocab, 0.0, &mut self.rng_state)
-        } else {
-            // Draw the draft's per-position SWOR candidates + full q from the SAME
-            // draft logits the tree was built from (sequential SWOR mirror of the
-            // device Gumbel-top-k sampler). The walk then reuses target draws that
-            // land on a drafted child; the output marginal stays target-exact.
-            let (draft_q, pos_cands) =
-                swor_draft_candidates(draft_logits, depth, vocab, topk, temp, &mut self.rng_state);
-            sample_verified_tree_swor(
-                &tree,
-                &logits_per_slot,
-                &draft_q,
-                &pos_cands,
-                depth,
-                topk,
-                vocab,
-                temp,
-                &mut self.rng_state,
-            )
-        };
-        let mut accepted_nodes = accepted_nodes;
-        let mut accept_len = accepted_nodes.len();
-        let mut bonus = bonus;
-        // Cap accept walk BEFORE KV/hidden commit so emit (= accept_len + 1)
-        // never exceeds max_emit. When the walk accepted past the budget, the
-        // next accepted node's token IS the walk's boundary draw — keep it.
-        // Re-argmax here would bias every length-capped temp>0 request.
-        let max_accept = max_emit.saturating_sub(1);
-        if accept_len > max_accept {
-            let boundary = tree.nodes[accepted_nodes[max_accept]].token;
-            accepted_nodes.truncate(max_accept);
-            accept_len = max_accept;
-            bonus = boundary;
-        }
-
-        // Build the committed token block [seed, accepted node tokens…].
-        let mut committed_block: Vec<u32> = Vec::with_capacity(accept_len + 1);
-        committed_block.push(seed);
-        for &ni in &accepted_nodes {
-            committed_block.push(tree.nodes[ni].token);
-        }
-
-        // ── KV commit fixup (the bushy-tree correctness gate) ─────────────────
-        // The tree forward wrote every node's KV at CONTIGUOUS physical slots
-        // [position .. position+big_n) in linearized order, each RoPE'd at its
-        // DEPTH. The next cycle reads physical slot `position+k` as the k-th
-        // COMMITTED token. That alignment holds ONLY when the accepted path is
-        // the linearized SPINE prefix (`accepted_nodes[i] == i`): then linear
-        // slot == commit index == depth, so the committed KV is already correct
-        // (verified byte-identical to AR at topk=1, where every accept is a
-        // spine accept). When the greedy/SWOR walk detours to a non-spine
-        // sibling, the committed token's KV sits at a DIFFERENT physical slot
-        // with a DIFFERENT depth-RoPE phase → the next cycle reads stale KV and
-        // emits a duplicate/garbage token. Re-commit those cycles with ONE
-        // causal verify over the committed block at contiguous absolute
-        // positions (overwrites the scattered KV with correct phases). Pure
-        // attention ⇒ no recurrent state to restore; the rejected-tail KV is
-        // overwritten next cycle as usual. Cost: +1 forward only on detour
-        // cycles (spine accepts — the common case — stay single-pass).
-        let spine_accept = accepted_nodes.iter().enumerate().all(|(i, &ni)| ni == i);
-        if spine_accept {
-            target.commit_prefix(gpu, &committed_block, accept_len, position, vs.as_mut())?;
-        } else {
-            // Causal re-verify over [seed, accepted…] fixes the committed KV.
-            // Discard its argmax/hidden — the accept decision + hidden already
-            // came from the (correct, depth-RoPE) tree forward above.
-            let _ = target.verify_block(gpu, &committed_block, position, vs.as_mut(), None)?;
-            target.commit_prefix(gpu, &committed_block, accept_len, position, vs.as_mut())?;
-        }
-
-        // ── H2 hidden truncation: append the committed slots' hidden in order ─
-        // Committed linearized slots: seed = slot 0, accepted node i = slot
-        // (node_idx + 1). Gather their per-slot residual-hidden rows (ne × h each)
-        // → exactly accept_len + 1 rows. Bonus row excluded.
-        let row_stride = ne * h;
-        let push_slot = |host: &mut Vec<f32>, slot: usize| {
-            host.extend_from_slice(&block_hidden[slot * row_stride..(slot + 1) * row_stride]);
-        };
-        push_slot(&mut self.target_hidden_host, 0); // seed
-        for &ni in &accepted_nodes {
-            push_slot(&mut self.target_hidden_host, ni + 1);
-        }
-        debug_assert_eq!(
-            self.target_hidden_host.len(),
-            committed_host_len(position, accept_len, ne, h),
-            "host buffer length mismatch after tree-SWOR commit"
-        );
-
-        // Lower: emit = accepted node tokens + bonus (seed dropped); next_seed = bonus.
-        // Pre-commit clamp above guarantees emit.len() <= max_emit; cap_emit is defense.
-        let emit = accepted_nodes
-            .iter()
-            .map(|&ni| tree.nodes[ni].token)
-            .chain(std::iter::once(bonus));
-        let step = SpecStep::new(emit, bonus, depth, accept_len);
-        debug_assert!(
-            step.emit.len() <= max_emit && !step.emit.is_empty(),
-            "tree emit len {} vs max_emit {}",
-            step.emit.len(),
-            max_emit
-        );
-        Ok(step.cap_emit(max_emit))
-    }
-
     /// Shared chain-verify tail: H2 hidden truncation + SpecStep construction.
     ///
     /// Called after both the greedy and temp>0 chain arms have computed `accepted`
@@ -537,9 +271,8 @@ fn committed_block_hidden_elems(accepted: usize, num_extract: usize, hidden: usi
 /// shrink, `boundary_token` becomes the new bonus — callers pass:
 /// - greedy chain: `target_pick[max_accept]` (argmax at the boundary row);
 /// - sampled chain: `drafts[max_accept]` (the walk's matched draw at that row);
-/// - tree SWOR/greedy: `tree.nodes[accepted_nodes[max_accept]].token`.
 ///
-/// Never substitutes argmax for a sampled/SWOR boundary draw.
+/// Never substitutes argmax for a sampled boundary draw.
 fn clamp_accept_to_budget(
     accepted: usize,
     bonus: u32,
@@ -701,8 +434,7 @@ impl Speculator for GenericDflashSpeculator {
 
         // positions_q: absolute positions of the block slots [position .. position+b).
         // positions_k: context positions [0 .. position) then block [position .. position+b).
-        // (The generic path has no FlashCASK eviction, so positions are contiguous —
-        // matching the qwen35 pre-eviction layout byte-for-byte.)
+        // (Positions are contiguous.)
         let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
         let positions_k: Vec<i32> = (0i32..(position + b) as i32).collect();
 
@@ -743,7 +475,7 @@ impl Speculator for GenericDflashSpeculator {
         let draft_logits = target.lm_head_logits(gpu, &draft_hidden, batch)?;
         debug_assert_eq!(draft_logits.len(), batch * self.config.vocab_size);
         let vocab = self.config.vocab_size;
-        let drafts: Vec<u32> = match self.scratch.online.as_mut().filter(|_| !self.tree.enabled) {
+        let drafts: Vec<u32> = match self.scratch.online.as_mut() {
             // Developer online draft tuner: re-rank the host top-K. Drafts stay
             // deterministic, which both the greedy accept and the temp>0 naive
             // sampling verify (exact for any deterministic draft) require.
@@ -765,33 +497,12 @@ impl Speculator for GenericDflashSpeculator {
             block[i + 1] = d;
         }
 
-        // ── Tree-verify arm (opt-in; --ddtree / HIPFIRE_DFLASH_TREE=1) ─────
-        // Build a bounded DDTree from the per-position draft marginals and verify
-        // the WHOLE tree in ONE tree-masked forward (`verify_tree_logits`), then
-        // walk it with the distribution-exact SWOR sampler. temp 0 → greedy
-        // (lossless == AR); temp>0 → q-exploiting SWOR (distribution-exact). This
-        // arm CARRIES temp>0 — the chain naive-sampling path below is skipped when
-        // the tree is enabled.
-        if self.tree.enabled {
-            return self.step_tree(
-                gpu,
-                target,
-                position,
-                seed,
-                &draft_logits,
-                vocab,
-                b,
-                temp,
-                max_emit,
-            );
-        }
-
         // ── 4t. temp>0 chain naive-sampling verify (distribution-exact) ─────
         // When the request temperature is >0,
         // verify the chain by drawing x ~ softmax(target_logits/temp) per position
         // and accepting the longest prefix where draft[i] == x_i (SpecInfer NAIVE
         // sampling — distribution-EXACT at any temperature; see
-        // `ddtree::naive_sample_chain`). We need the FULL per-position target
+        // `spec_sampling::naive_sample_chain`). We need the FULL per-position target
         // logits, so this arm uses `verify_block_logits` instead of `verify_block`
         // (which only returns the argmax). The same H2 truncation applies: append
         // only the first accepted+1 rows of the captured hidden.
@@ -1017,14 +728,13 @@ impl Speculator for GenericDflashSpeculator {
     }
 
     fn supports_temp_verify(&self) -> bool {
-        // BOTH the chain path (SpecInfer naive sampling) and the tree arm
-        // (q-exploiting SWOR — `step_tree` + `sample_verified_tree_swor`) are
-        // distribution-EXACT at temp>0, so temp>0 always routes through spec.
+        // The chain path (SpecInfer naive sampling) is distribution-EXACT at
+        // temp>0, so temp>0 always routes through spec.
         true
     }
 
     fn requires_greedy(&self) -> bool {
-        // Chain and tree-SWOR both honor temp>0 distribution-correctly.
+        // The chain honors temp>0 distribution-correctly.
         false
     }
 
@@ -1136,7 +846,6 @@ pub fn build_generic_dflash_speculator(
         verify_scratch: Some(verify_scratch),
         block_size,
         ctx_capacity,
-        tree: TreeMode::from_flags(&gpu.flags),
         // Fixed deterministic seed (matches the qwen35 dflash_spec default).
         rng_state: 0x13579BDF,
         // Greedy until a request calls `set_sampling`. Truncation defaults
@@ -1352,7 +1061,7 @@ mod tests {
 
         let mut rng = 0xDEAD_BEEF_u64;
         let (accepted, bonus) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng);
+            crate::spec_sampling::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng);
         assert_eq!(accepted, 0, "empty-draft chain accepts nothing");
         assert_eq!(
             bonus, last_argmax,
@@ -1366,8 +1075,15 @@ mod tests {
         let tied = [1.0f32, 5.0, 5.0, 0.0];
         assert_eq!(crate::llama::argmax(&tied), 1);
         let mut rng_tie = 1u64;
-        let (_, tbonus) =
-            crate::ddtree::naive_sample_chain(&tied, &[], tied.len(), 0.0, 1.0, 0, &mut rng_tie);
+        let (_, tbonus) = crate::spec_sampling::naive_sample_chain(
+            &tied,
+            &[],
+            tied.len(),
+            0.0,
+            1.0,
+            0,
+            &mut rng_tie,
+        );
         assert_eq!(tbonus, 1);
         assert_eq!(rng_tie, 1);
 
@@ -1396,7 +1112,7 @@ mod tests {
 
         let mut rng_a = seed;
         let (acc_a, tok_a) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_a);
+            crate::spec_sampling::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_a);
         assert_eq!(acc_a, 0, "first-token empty-draft never accepts drafts");
         assert!(
             (tok_a as usize) < vocab,
@@ -1408,7 +1124,7 @@ mod tests {
         // Same seed → identical draw and identical post-state (deterministic).
         let mut rng_b = seed;
         let (acc_b, tok_b) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_b);
+            crate::spec_sampling::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_b);
         assert_eq!(acc_b, 0);
         assert_eq!(tok_b, tok_a);
         assert_eq!(rng_b, rng_a);
@@ -1417,7 +1133,7 @@ mod tests {
         // Later step_one_token / chain verify continue from this rng_state.
         let mut rng_c = rng_a;
         let (_acc_c, _tok_c) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_c);
+            crate::spec_sampling::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_c);
         assert_ne!(rng_c, rng_a, "second draw continues the RNG stream");
 
         // temp≈0 branch remains last_argmax / llama::argmax (byte-identical).
@@ -1425,7 +1141,7 @@ mod tests {
         assert_eq!(last_argmax, 1);
         let mut rng_g = seed;
         let (_, gbonus) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng_g);
+            crate::spec_sampling::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng_g);
         assert_eq!(gbonus, last_argmax);
         assert_eq!(rng_g, seed, "greedy first token must not advance rng");
     }

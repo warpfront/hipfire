@@ -176,7 +176,6 @@ Workspace crates with a path dependency on this crate:
 
 - `hipfire-generate`
 - `hipfire-loader`
-- `hipfire-quantize`
 - `hipfire-runtime`
 - `saddle-lab`
 

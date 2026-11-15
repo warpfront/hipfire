@@ -487,8 +487,7 @@ impl Gpu {
     /// the dispatches themselves consult:
     ///
     /// - `gemm_mq4g256v2_batched_lmhead`'s `wmma_eligible` gate:
-    ///   `HIPFIRE_FP16=0` (`fp16_disabled`) or `HIPFIRE_LM_HEAD_WMMA=0`
-    ///   (`lm_head_wmma_disabled`) sends the head to the scalar
+    ///   `HIPFIRE_FP16=0` (`fp16_disabled`) sends the head to the scalar
     ///   `gemm_mq4g256v2_xbatch`.
     /// - `HIPFIRE_HFQ4G256_LDSSTAGE=1` (`hfq4g256_ldsstage_wmma`): gate/up,
     ///   residual (wo/down, the S4 F16 producers) and the WMMA lm_head take
@@ -507,7 +506,6 @@ impl Gpu {
         arch == "gfx1201"
             && flags.wmma_batch_tiles
             && !flags.fp16_disabled
-            && !flags.lm_head_wmma_disabled
             && !flags.hfq4g256_ldsstage_wmma
     }
 

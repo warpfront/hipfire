@@ -944,16 +944,8 @@ pub enum DType {
     TQ2G128,  // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
     // Phase 4: ternary kernels wire GPU decode/dispatch; this Task 7 slice is
     // CPU-foundation only (variant + byte-size + RawCodec load mapping).
-    BQ1G128,    // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
-    HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
-    ParoQ4G128, // ParoQuant: AWQ-packed INT4 G128 repacked to HFQ4G128 layout at load.
-    // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
-    // is that weight_gemv applies Givens rotation to activations before GEMV.
-    // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
-    ParoQ4G64, // ParoQuant group_size=64 twin of ParoQ4G128: HFQ4-G64 layout, 40 bytes per
-    // 64 elements (f32 scale + f32 zero + 32 B nibbles), Givens rotation in 64-channel
-    // blocks. A distinct dtype so a G64 tensor can never reach a G128 kernel (or the
-    // reverse); `paro_group_size` is the one place either width is read from.
+    BQ1G128,  // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
+    HFQ6G256, // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     /// OCP FP8 E4M3 (e4m3fn) with 128x128 block scales (qt=55 `FP8E4M3B128`).
     /// Tensor logical shape `[E, R, K]` (E=1 allowed). Payload is E consecutive
     /// expert blocks of stride [`crate::fp8_e4m3::b128_block_stride`]: `codes u8[R*K]`
@@ -1079,8 +1071,6 @@ impl DType {
             | DType::MFP3G32E8
             | DType::MFP2G32E8
             | DType::MFP4G32E8G128
-            | DType::ParoQ4G128
-            | DType::ParoQ4G64
             | DType::Raw
             | DType::MQ3I4G128R256
             | DType::MQ3I4G128R128
@@ -1126,9 +1116,6 @@ impl DType {
             DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ2G256V2 => grouped(256, 72),
             DType::MQ3G256Lloyd => grouped(256, 112),
             DType::MQ4G256Lloyd => grouped(256, 160),
-            // HFQ4-G128 layout, see the variant.
-            DType::ParoQ4G128 => grouped(128, 72),
-            DType::ParoQ4G64 => grouped(64, 40),
             // E8 formats: a 16-byte row header, then per-32 blocks.
             DType::MFP4G32E8 => blocks.checked_mul(17)?.checked_add(16),
             DType::MFP3G32E8 => blocks.checked_mul(13)?.checked_add(16),
@@ -1155,17 +1142,6 @@ impl DType {
             | DType::E8PI4G128R128
             | DType::MQ4G256V2P
             | DType::MQ4G128V2P => None,
-            _ => None,
-        }
-    }
-
-    /// Paro group width: the HFQ4 group of the repacked weight and the Givens
-    /// block of its activation rotation (the two are the same in ParoQuant).
-    /// `None` for every non-Paro dtype.
-    pub fn paro_group_size(self) -> Option<usize> {
-        match self {
-            DType::ParoQ4G128 => Some(128),
-            DType::ParoQ4G64 => Some(64),
             _ => None,
         }
     }
@@ -1804,6 +1780,10 @@ pub struct Gpu {
     /// Arenas whose cleanup failed before they could enter the owner map.
     /// They have no tensor owner and are retried during explicit/Gpu teardown.
     orphan_vmm_arenas: Vec<VmmArena>,
+    /// Verdict of the one-time virtual-address reservation probe
+    /// ([`Self::vmm_runtime_refusal`]): `None` = the runtime reserved a range,
+    /// `Some(reason)` = it could not. Decided once per device owner.
+    vmm_runtime_probe: std::sync::OnceLock<Option<String>>,
     /// `hipHostMalloc(hipHostMallocMapped)` owners, keyed by the **device-visible**
     /// base address kernels are handed. The value is the *host* pointer that
     /// `hipHostFree` needs, which `hipHostGetDevicePointer` may alias differently
@@ -1872,8 +1852,16 @@ pub struct Gpu {
     pub(crate) kernel_timing_replay_baseline: crate::replay::ReplayObservation,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
+    /// Device lane tables of the gfx942 batched GDN decode core
+    /// ([`crate::cdna::gfx942::Gfx942Device::qwen4_gdn_lanes_step_f32`]), keyed by
+    /// their content: built once per layer and lane set, never rewritten.
+    pub(crate) gdn_lanes_f32_tables: crate::cdna::gfx942::GdnLanesTableCache,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
+    /// Device lane tables of the gfx942 batched QSA decode core
+    /// ([`crate::cdna::gfx942::Gfx942Device::qwen4_qsa_lanes_core`]), keyed by their content:
+    /// built once per layer and lane set, never rewritten.
+    pub(crate) qsa_lanes_gfx942_tables: crate::cdna::gfx942::QsaLanesTableCache,
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
@@ -2026,8 +2014,13 @@ pub struct Gpu {
     /// ROUTING predicate sees `prefill_invariant::QWEN4_PREFILL_CANON_ROWS`
     /// via `Gpu::route_rows` while launches keep the real row count.
     /// Also set for one gfx1151 Flash-Next prefill tile of fewer than 512 rows
-    /// on the agent-turn append route (`HIPFIRE_QWEN4_APPEND_WMMA`).
+    /// on the agent-turn append route.
     pub prefill_invariant_scope: bool,
+    /// True while an ordinary (non-verify, non-decode) prefill forward runs
+    /// ([`Gpu::ordinary_prefill_enter`]): GDN/FFN/attention producers take the canonical
+    /// bulk recipe for every actual row count, and the Qwen4 route rows are the canonical
+    /// chunk ([`Gpu::route_rows`]) WITHOUT the invariant profile's IU4 suppression.
+    pub ordinary_prefill_scope: bool,
     /// Row-exact rows of the verify forward in flight (`0` = not a verify
     /// forward). Widens the few-row routes (`Gpu::few_row_limit`) so an
     /// n-row verify is bitwise the sequential decode rows; prefill and every
@@ -2049,8 +2042,7 @@ pub struct Gpu {
     /// installed budget id. `None` when emulation is off (the default).
     pub(crate) emu: Option<crate::emu::EmuGpuState>,
     /// True while a Qwen4 prefill tile runs on the agent-turn append route
-    /// (`HIPFIRE_QWEN4_APPEND_WMMA`, see
-    /// `prefill_invariant::qwen4_append_wmma_route`): the symmetric IU4 MoE arm
+    /// (see `prefill_invariant::qwen4_append_wmma_route`): the symmetric IU4 MoE arm
     /// is suppressed so the MoE takes the F16 WMMA grouped arm, exactly as
     /// `HIPFIRE_QWEN4_MOE_SYM_IU4=0` does, for that tile only.
     pub qwen4_append_f16_moe_scope: bool,
@@ -2096,7 +2088,8 @@ pub const STEADY_READBACK_PINNED_ENV: &str = "HIPFIRE_STEADY_READBACK_PINNED";
 pub struct KvFitFloor {
     /// The published (admitted) context in tokens.
     pub admitted_tokens: usize,
-    /// The fit's full per-request reserve (prefill + charged checkpoints + MTP).
+    /// What a request still allocates after its prefill scratch is resident (the fit's MTP
+    /// scratch; the prefill scratch and the charged checkpoints are not counted again).
     pub reserve_bytes: usize,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
@@ -3244,6 +3237,7 @@ impl Gpu {
             vmm_generations: HashMap::new(),
             vmm_generation_counter: 0,
             orphan_vmm_arenas: Vec::new(),
+            vmm_runtime_probe: std::sync::OnceLock::new(),
             host_mapped: HashMap::new(),
             host_leases: HostLeaseTable::new(),
             device_wait: None,
@@ -3268,6 +3262,7 @@ impl Gpu {
             kernel_timing_pool: None,
             #[cfg(feature = "kernel-timing")]
             kernel_timing_replay_baseline: crate::replay::ReplayObservation::default(),
+            gdn_lanes_f32_tables: Default::default(),
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
                 mq_signs2: None,
@@ -3287,8 +3282,6 @@ impl Gpu {
                 ggml: Default::default(),
                 q8x_act: None,
                 mq6_fp8_x_rot: None,
-                paro_x_scratch: None,
-                paro_fused_scratch: None,
                 fp16_x_scratch: None,
                 fp16_x_scratch_bytes: 0,
                 lane_wmma_scratch: None,
@@ -3362,6 +3355,7 @@ impl Gpu {
                 pm_decode,
             },
             replay: crate::replay::ReplayController::from_config(),
+            qsa_lanes_gfx942_tables: Default::default(),
             mq4v2_symmetric: false,
             fp8_verify_scope: false,
             iu4_verify_scope: false,
@@ -3427,6 +3421,7 @@ impl Gpu {
             qwen4_moe_down_a8_scratch_bytes: 0,
             lane_rows_scope: false,
             prefill_invariant_scope: false,
+            ordinary_prefill_scope: false,
             wide_verify_rows: 0,
             lane_row_exact_scope: false,
             prefill_lwmma_dense_hold: false,
@@ -3499,86 +3494,6 @@ impl Gpu {
         }
     }
 
-    /// Dequantize a TQ2-G128 (ternary) weight [M × K] into an FP16 buffer
-    /// [M × K] row-major. The FP16 buffer must be pre-allocated to M*K*2 bytes.
-    ///
-    /// This is the prefill route for the low-bit formats: they have no tiled
-    /// GEMM of their own, so a chunk of N tokens would otherwise re-read every
-    /// weight row N times through the scalar GEMV. Dequantising once into a
-    /// scratch and handing the chunk to the F16 GEMM amortises that read.
-    pub fn dequantize_tq2g128_to_f16(
-        &mut self,
-        w_packed: &DeviceBuffer,
-        w_fp16: &DeviceBuffer,
-        m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        // bind_thread: skip — thin delegator; dequantize_lowbit_to_f16 binds.
-        self.dequantize_lowbit_to_f16(
-            "dequant_tq2g128_to_f16",
-            kernels::DEQUANT_TQ2G128_TO_F16_SRC,
-            w_packed,
-            w_fp16,
-            m,
-            k,
-        )
-    }
-
-    /// Binary sibling of [`Self::dequantize_tq2g128_to_f16`].
-    pub fn dequantize_bq1g128_to_f16(
-        &mut self,
-        w_packed: &DeviceBuffer,
-        w_fp16: &DeviceBuffer,
-        m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        // bind_thread: skip — thin delegator; dequantize_lowbit_to_f16 binds.
-        self.dequantize_lowbit_to_f16(
-            "dequant_bq1g128_to_f16",
-            kernels::DEQUANT_BQ1G128_TO_F16_SRC,
-            w_packed,
-            w_fp16,
-            m,
-            k,
-        )
-    }
-
-    /// Shared body for the two low-bit dequants. Both kernels take the same
-    /// (A, W_f16, M, K) kernargs and the same [M, groups] × [32] geometry, so
-    /// one body keeps them from drifting.
-    fn dequantize_lowbit_to_f16(
-        &mut self,
-        name: &'static str,
-        src: &'static str,
-        w_packed: &DeviceBuffer,
-        w_fp16: &DeviceBuffer,
-        m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        assert_eq!(k % 128, 0, "{name}: K must be a multiple of 128 (got {k})");
-        self.ensure_kernel(name, src, name)?;
-        let mut w_in = w_packed.as_ptr();
-        let mut w_out = w_fp16.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut w_in as *mut _ as *mut c_void,
-            &mut w_out as *mut _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-        ];
-        let groups = (k / 128) as u32;
-        launch_params_blob!(
-            self,
-            name,
-            [m as u32, groups, 1],
-            [32, 1, 1],
-            0,
-            params; w_in, w_out, mi, ki
-        )
-    }
-
     /// Dequantize an HFQ4-G256 weight [M × K] into an FP16 buffer [M × K]
     /// row-major. The FP16 buffer must be pre-allocated to M*K*2 bytes.
     ///
@@ -3620,90 +3535,6 @@ impl Gpu {
             "hfq4g256_dequantize_to_f16",
             [m as u32, groups, 1],
             [128, 1, 1],
-            0,
-            params; w_in, w_out, mi, ki
-        )
-    }
-
-    /// Dequantize MFP4G32-Lloyd matrix [M x K] to FP16 [M x K] row-major.
-    /// Input `w_mq4` = full tensor bytes (32-B codebook prefix + M rows).
-    /// Output `w_fp16` = FP16 row-major (M x K), in the ROTATED domain.
-    /// Grid: [M, K/256]. Block: [32]. Mirrors dequantize_hfq4g256_to_f16 shape.
-    pub fn dequantize_mfp4g32_lloyd_to_f16(
-        &mut self,
-        w_mq4: &DeviceBuffer,
-        w_fp16: &DeviceBuffer,
-        m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        assert!(
-            k % 256 == 0,
-            "mfp4g32_lloyd dequant: K must be multiple of 256 (got {k})"
-        );
-        self.ensure_kernel(
-            "dequantize_mfp4g32_lloyd_to_f16",
-            kernels::DEQUANTIZE_MFP4G32_LLOYD_TO_F16_SRC,
-            "dequantize_mfp4g32_lloyd_to_f16",
-        )?;
-        let mut w_in = w_mq4.as_ptr();
-        let mut w_out = w_fp16.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut w_in as *mut _ as *mut c_void,
-            &mut w_out as *mut _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-        ];
-        let groups = (k / 256) as u32;
-        launch_params_blob!(
-            self,
-            "dequantize_mfp4g32_lloyd_to_f16",
-            [m as u32, groups, 1],
-            [32, 1, 1],
-            0,
-            params; w_in, w_out, mi, ki
-        )
-    }
-
-    /// Dequantize an mfp4+P matrix [M x K] to FP16 [M x K] row-major.
-    /// Input `w_mq4` = full tensor bytes (M rows, NO prefix; byte-identical to mfp4).
-    /// Output `w_fp16` = FP16 row-major (M x K), in the ROTATED domain.
-    /// Decodes the per-block scale byte as E4M3 (FP8). Grid: [M, K/256]. Block: [32].
-    pub fn dequantize_mfp4g32_p_to_f16(
-        &mut self,
-        w_mq4: &DeviceBuffer,
-        w_fp16: &DeviceBuffer,
-        m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        assert!(
-            k % 256 == 0,
-            "mfp4g32_p dequant: K must be multiple of 256 (got {k})"
-        );
-        self.ensure_kernel(
-            "dequantize_mfp4g32_p_to_f16",
-            kernels::DEQUANTIZE_MFP4G32_P_TO_F16_SRC,
-            "dequantize_mfp4g32_p_to_f16",
-        )?;
-        let mut w_in = w_mq4.as_ptr();
-        let mut w_out = w_fp16.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut w_in as *mut _ as *mut c_void,
-            &mut w_out as *mut _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-        ];
-        let groups = (k / 256) as u32;
-        launch_params_blob!(
-            self,
-            "dequantize_mfp4g32_p_to_f16",
-            [m as u32, groups, 1],
-            [32, 1, 1],
             0,
             params; w_in, w_out, mi, ki
         )
@@ -6043,15 +5874,55 @@ impl Gpu {
         prepared.checked_ptr(generation, ptr, k, n)
     }
 
+    /// True while an ordinary prefill forward is in flight ([`Self::ordinary_prefill_enter`])
+    /// and no verify scope is open: numerical producer policy is then the canonical
+    /// long-prefill recipe for EVERY valid row, never a function of the outer call's row
+    /// count. Verify intent ([`Self::iu4_verify_scope`], [`Self::fp8_verify_scope`], a wide
+    /// verify forward) always wins.
+    #[inline]
+    pub fn ordinary_prefill_active(&self) -> bool {
+        self.ordinary_prefill_scope
+            && !self.iu4_verify_scope
+            && !self.fp8_verify_scope
+            && self.wide_verify_rows == 0
+    }
+
+    /// Open the ordinary-prefill intent; returns the previous value for
+    /// [`Self::ordinary_prefill_exit`]. Every row-count numerical selector
+    /// (`n >= 64` producer gates, route rows of the Qwen4 policy) takes the bulk recipe
+    /// for any actual extent `n >= 1` while it is set. Actual extents still govern buffer
+    /// validation, grids, masks and token counts. Callers restore on every return path.
+    #[inline]
+    pub fn ordinary_prefill_enter(&mut self) -> bool {
+        // bind_thread: skip — host-side scope flag, no HIP call.
+        std::mem::replace(&mut self.ordinary_prefill_scope, true)
+    }
+
+    /// Restore the value [`Self::ordinary_prefill_enter`] returned.
+    #[inline]
+    pub fn ordinary_prefill_exit(&mut self, prev: bool) {
+        // bind_thread: skip — host-side scope flag, no HIP call.
+        self.ordinary_prefill_scope = prev;
+    }
+
+    /// Row admission of a bulk prefill producer: the historic `n >= 64` outside the ordinary
+    /// prefill intent; any positive actual extent inside it (the physical-extent half of the
+    /// decision stays with the callee's own bounds).
+    #[inline]
+    pub(crate) fn prefill_rows_admit(&self, n: usize) -> bool {
+        n >= 64 || (n > 0 && self.ordinary_prefill_active())
+    }
+
     /// The A8 projection route. Off inside the IU4 verify scope, whose
-    /// producers must not depend on the row count.
+    /// producers must not depend on the row count. Ordinary prefill intent keeps the route
+    /// for every row count ([`Self::prefill_rows_admit`]).
     pub fn a8_prefill_active(&self, n: usize, k: usize) -> bool {
         self.flags.a8_prefill_enabled()
             && self.mq4v2_symmetric
             && !self.iu4_verify_scope
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && n >= 64
+            && self.prefill_rows_admit(n)
             && k > 0
             && k % 256 == 0
     }
@@ -6060,11 +5931,14 @@ impl Gpu {
     /// IU4 + gfx1100/gfx1151 + eager (no replay/capture) + the K constraint
     /// of the IU4 MMQ consumer. Every producer grid is row-parallel, and the
     /// gfx11 IU4 MMQ base entry handles partial 128-row tiles.
+    /// An A8-owned shape never takes the sidecar (as on gfx1201): a fused A8
+    /// producer owns it, else the consumer's standalone A8 quantizer does.
     pub fn iu4_producer_sidecar_active(&self, batch: usize, k: usize) -> bool {
         self.flags.iu4_producer_sidecar_enabled()
+            && !self.a8_prefill_active(batch, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && self.prefill_rows_admit(batch)
             && k > 0
             && k % 256 == 0
     }
@@ -6082,7 +5956,7 @@ impl Gpu {
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && (batch >= 64 || (self.iu4_verify_scope && batch >= 1))
+            && (self.prefill_rows_admit(batch) || (self.iu4_verify_scope && batch >= 1))
             && k > 0
             && k % 256 == 0
     }
@@ -6099,7 +5973,7 @@ impl Gpu {
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && (batch >= 64 || (self.iu4_verify_scope && batch >= 1))
+            && (self.prefill_rows_admit(batch) || (self.iu4_verify_scope && batch >= 1))
             && k > 0
             && k % 256 == 0
     }
@@ -6194,9 +6068,10 @@ impl Gpu {
     pub fn iu4_gfx11_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx11_producer_quant_fused_enabled()
             && self.flags.iu4_prefill_enabled()
+            && !self.a8_prefill_active(batch, k)
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && self.prefill_rows_admit(batch)
             && k > 0
             && k % 256 == 0
     }
@@ -6215,7 +6090,7 @@ impl Gpu {
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 64
+            && self.prefill_rows_admit(batch)
             && k > 0
             && k % 256 == 0
     }
@@ -7120,7 +6995,14 @@ impl Gpu {
         let byte_size = numel
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
-        let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        let mut arena =
+            VmmArena::reserve(&self.hip, self.device_id, byte_size).map_err(|mut err| {
+                err.message.push_str(
+                "; this runtime could not reserve the virtual address range a VMM tensor needs \
+                 (a KV cache can use --kv-backend legacy / memory.kv_backend = legacy instead)",
+            );
+                err
+            })?;
         if hipfire_config::developer_var("HIPFIRE_OFFLOAD_DEBUG").is_ok() {
             eprintln!(
                 "[offload-debug] device-vmm base=0x{:x} req={} reserved={} gran={}",
@@ -8684,6 +8566,31 @@ impl Gpu {
             .mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)
     }
 
+    /// Why this runtime cannot back a VMM KV cache, or `None` when it can.
+    ///
+    /// [`Self::vmm_recommended_granularity`] only queries a driver constant and
+    /// passes on stacks whose `hipMemAddressReserve` then returns
+    /// `hipErrorOutOfMemory` (#1058: gfx1100, in-tree amdgpu 6.8 under ROCm
+    /// 10.0), which made an automatically selected VMM backend fail the load
+    /// after every weight was uploaded. This runs the real reservation once
+    /// (see [`hip_bridge::probe_va_reservation`]); admission turns a refusal into
+    /// the legacy backend with the reason attached. The verdict is cached for the
+    /// life of this `Gpu`.
+    pub fn vmm_runtime_refusal(&self) -> Option<String> {
+        self.vmm_runtime_probe
+            .get_or_init(|| {
+                if let Err(err) = self.vmm_recommended_granularity() {
+                    return Some(format!("hipMemGetAllocationGranularity failed: {err}"));
+                }
+                hip_bridge::probe_va_reservation(&self.hip, self.device_id)
+                    .err()
+                    .map(|err| {
+                        format!("a probe reservation of virtual address space failed: {err}")
+                    })
+            })
+            .clone()
+    }
+
     pub fn vmm_allocation_count(&self) -> usize {
         // bind_thread: skip — pure length read, touches no device state.
         self.vmm_arenas.len() + self.orphan_vmm_arenas.len()
@@ -9294,9 +9201,8 @@ impl Gpu {
     }
 
     /// [`Self::memset_stream_ordered`] without the per-call wait: with a steady copy stream
-    /// and `flags.lane_reset_batch` the fill is only enqueued and recorded in `batch`, and
-    /// [`Self::memset_batch_sync`] waits for the whole run once. With no steady stream or with
-    /// the kill switch (`HIPFIRE_LANE_RESET_BATCH=0`) it is exactly the blocking
+    /// the fill is only enqueued and recorded in `batch`, and [`Self::memset_batch_sync`]
+    /// waits for the whole run once. With no steady stream it is exactly the blocking
     /// [`Self::memset_stream_ordered`]. The caller keeps `buf` alive until the batch is
     /// synced. A failed enqueue waits for the fills already in flight before returning, so
     /// no write outlives the error.
@@ -9308,9 +9214,6 @@ impl Gpu {
         value: i32,
         size: usize,
     ) -> HipResult<()> {
-        if !self.flags.lane_reset_batch {
-            return self.memset_stream_ordered(buf, value, size);
-        }
         self.bind_thread()?;
         match self.steady_copy_stream() {
             Some(stream) => {
@@ -9864,6 +9767,23 @@ impl Gpu {
     pub fn pool_parked_bytes(&self) -> usize {
         // bind_thread: skip — pure read of the pool's host-side byte counter, no HIP call.
         self.pool.pooled_bytes()
+    }
+
+    /// Test seam (the daemon's `serve-fault-inject` build): the pool allocation
+    /// after `after_allocs` further ones is forced to miss the free lists and fail
+    /// as an injected `hipErrorOutOfMemory`, so the production out-of-memory retry
+    /// (drain every pooled buffer, allocate again once) runs at a chosen moment.
+    /// `None` disarms. Inert unless a test arms it.
+    pub fn inject_pool_oom(&mut self, after_allocs: Option<u32>) {
+        // bind_thread: skip — arms a host-side counter, no HIP call.
+        self.pool.inject_oom(after_allocs);
+    }
+
+    /// `(drains, injected_oom)`: times a drain returned pooled buffers to HIP, and
+    /// injected out-of-memory failures consumed ([`Self::inject_pool_oom`]).
+    pub fn pool_drain_counters(&self) -> (u64, u64) {
+        // bind_thread: skip — pure read of host-side counters, no HIP call.
+        (self.pool.drains, self.pool.injected_oom)
     }
 
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
@@ -10606,31 +10526,6 @@ impl Gpu {
     /// HFQ4-G128 GEMV: flat 4-bit with 128-weight groups.
     /// K must be multiple of 128.
 
-    /// ParoQuant Givens rotation: apply learned pairwise rotations + channel
-    /// scaling to activation vector x in-place. Called before GEMV on
-    /// ParoQ4G128 weights.
-    ///
-    /// x: [seq_len, hidden_dim] F16 (modified in place)
-    /// pairs: [krot, hidden_dim] I16
-    /// theta: [krot, hidden_dim/2] F16
-    /// channel_scales: [hidden_dim] F16
-
-    /// Out-of-place Givens rotation. Reads `x_in`, writes rotated
-    /// activations to `x_out`. Replaces the
-    /// `copy_d2d + givens_rotate` pair used by `rotate_x_paro_for` —
-    /// one graph node + one inter-node dependency removed.
-    #[allow(clippy::too_many_arguments)]
-
-    /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
-    /// rotation. Single-launch replacement for the
-    /// `silu_mul_f32 + givens_rotate` pair used by the ParoQuant routed
-    /// gate→down hop. Same shared-memory + grid contract as
-    /// `givens_rotate`, plus two additional input pointers (gate, up)
-    /// and a separate output pointer.
-    #[allow(clippy::too_many_arguments)]
-
-    /// Ensure the ParoQuant activation scratch buffer is allocated (F32, sized for dim).
-
     /// Device-to-device copy.
     ///
     /// Routes through `memcpy_dtod_auto` so it picks `memcpy_dtod_async` on
@@ -10656,73 +10551,6 @@ impl Gpu {
         );
         self.memcpy_dtod_auto(&dst.buf, &src.buf, n_bytes)
     }
-
-    /// PARO4-G128 GEMV: ParoQuant pair-rotated activation + W4 weights.
-    /// K must be multiple of 128 and M must be a multiple of the AWQ pack size
-    /// (8). Each block computes one packed output column (8 output rows).
-
-    /// Residual PARO4-G128 GEMV: y += A(x) where x is pair-rotated per
-    /// ParoQuant metadata. One block computes one AWQ packed output column.
-
-    /// PARO4-G128 fused SwiGLU down projection: y += W * (silu(gate) * up).
-    /// Saves the standalone `silu_mul_f32` launch and ffn_hidden global write/read.
-
-    /// PARO4-G128T direct GEMV for tiny-M projections. This keeps the Paro
-    /// rotation inside the GEMV block instead of materializing x_rot globally.
-
-    /// Residual PARO4-G128T direct GEMV for tiny-M projections.
-
-    /// PARO4-G128 activation pre-rotation. This materializes the ParoQuant
-    /// channel-scale + pair-rotation transform once per projection so the
-    /// packed GEMV does not repeat it for every 8-output pack.
-
-    /// PARO4-G128 fused SwiGLU activation + Paro pre-rotation. This is the
-    /// useful fused shape for down projection: `x_rot = rotate(silu(gate)*up)`.
-
-    /// PARO4-G128T activation pre-rotation. Same math as PARO4-G128, but
-    /// theta is stored as precomputed f16 sin/cos pairs in the payload.
-
-    /// PARO4-G128T fused SwiGLU activation + Paro pre-rotation.
-
-    /// PARO4-G128 GEMV over an already materialized Paro-rotated activation.
-
-    /// Residual PARO4-G128 GEMV over an already materialized Paro-rotated
-    /// activation.
-
-    /// PARO4-G128T GEMV over an already materialized Paro-rotated activation.
-    /// The payload stores qweight as [M/8, K], making the inner-loop reads
-    /// contiguous for the GEMV access pattern.
-
-    /// Residual PARO4-G128T GEMV over an already materialized Paro-rotated
-    /// activation.
-
-    /// PARO4-G128T prerotated GEMV with four output lanes per block. This
-    /// duplicates qweight reads relative to the 8-lane pack but lowers
-    /// accumulator/register pressure for empirical Atlas testing.
-
-    /// Residual PARO4-G128T pack4 prerotated GEMV.
-
-    /// PARO4-G128T prerotated GEMV with two output lanes per block. This is
-    /// an Atlas probe for whether lower accumulator pressure beats duplicate
-    /// qweight traffic on the residual/down hot path.
-
-    /// Residual PARO4-G128T pack2 prerotated GEMV.
-
-    /// PARO4-G128T prerotated GEMV with one output lane per block.
-
-    /// Residual PARO4-G128T pack1 prerotated GEMV.
-
-    /// PARO4-G128 rotate-once wrapper used for env-gated runtime probes.
-
-    /// PARO4-G128 rotate-once residual wrapper used for env-gated runtime probes.
-
-    /// PARO4-G128 fused SwiGLU rotate-once down projection.
-
-    /// PARO4-G128T rotate-once wrapper for engine-tiled qweight payloads.
-
-    /// PARO4-G128T rotate-once residual wrapper for engine-tiled qweight payloads.
-
-    /// PARO4-G128T fused SwiGLU rotate-once down projection.
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Registry precompilation (profiling)
@@ -11549,10 +11377,6 @@ mod tests {
         assert_eq!(DType::MQ4G128V2.row_bytes(640), Some(5 * 68));
         assert_eq!(DType::MQ4G128V2.row_bytes(129), Some(2 * 68));
         assert_eq!(DType::MQ6G256V2.row_bytes(2560), Some(10 * 200));
-        assert_eq!(DType::ParoQ4G128.row_bytes(128), Some(72));
-        // SmolLM2-360M: K=960 is 15 G64 groups; it is not a whole number of G128 groups.
-        assert_eq!(DType::ParoQ4G64.row_bytes(960), Some(15 * 40));
-        assert_eq!(DType::ParoQ4G64.row_bytes(64), Some(40));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(2560), Some(16 + 80 + 80 * 16));
         assert_eq!(DType::MFP4G32E8.row_bytes(4096), Some(2192));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(4096), Some(2192));

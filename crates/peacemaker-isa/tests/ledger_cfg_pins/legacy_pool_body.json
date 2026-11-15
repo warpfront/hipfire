@@ -1,0 +1,2146 @@
+[
+  {
+    "tid": 29,
+    "target": "gated_delta_vector_pm_gfx1201.hxaco#gated_delta_net_vector_serial_f32_pm_gfx1201",
+    "body_pc": 367,
+    "category": "Candidate",
+    "insn": "`v_add_co_u32 v25, s3, v25, s14`",
+    "need": "needs Store wait 0 (War { reg: \"v[25:26]\" })"
+  },
+  {
+    "tid": 30,
+    "target": "gated_delta_vector_pm_gfx1201.hxaco#causal_conv_depthwise_silu_rows_f32_pm_gfx1201",
+    "body_pc": 545,
+    "category": "Candidate",
+    "insn": "`v_add_co_u32 v22, vcc_lo, v22, s38`",
+    "need": "needs Store wait 0 (War { reg: \"v[22:23]\" })"
+  },
+  {
+    "tid": 54,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m32n16_gfx1201",
+    "body_pc": 357,
+    "category": "Candidate",
+    "insn": "`v_and_b32_e32 v8, 0x3f00, v86`",
+    "need": "needs Ds wait 1 (War { reg: \"v[8:9]\" })"
+  },
+  {
+    "tid": 55,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m32n16_gfx1201",
+    "body_pc": 358,
+    "category": "Candidate",
+    "insn": "`v_and_b32_e32 v8, 0x3f00, v86`",
+    "need": "needs Ds wait 1 (War { reg: \"v[8:9]\" })"
+  },
+  {
+    "tid": 56,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m32n32_gfx1201",
+    "body_pc": 403,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v26, 4, v44`",
+    "need": "needs Ds wait 1 (War { reg: \"v[26:27]\" })"
+  },
+  {
+    "tid": 57,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m32n32_gfx1201",
+    "body_pc": 402,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v26, 4, v44`",
+    "need": "needs Ds wait 1 (War { reg: \"v[26:27]\" })"
+  },
+  {
+    "tid": 58,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16_gfx1201",
+    "body_pc": 346,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 59,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n16_gfx1201",
+    "body_pc": 346,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 60,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n32_gfx1201",
+    "body_pc": 381,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v20, 12, v30`",
+    "need": "needs Ds wait 0 (War { reg: \"v[20:21]\" })"
+  },
+  {
+    "tid": 61,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n32_gfx1201",
+    "body_pc": 383,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v20, 12, v30`",
+    "need": "needs Ds wait 0 (War { reg: \"v[20:21]\" })"
+  },
+  {
+    "tid": 62,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n48_gfx1201",
+    "body_pc": 433,
+    "category": "Candidate",
+    "insn": "`v_alignbit_b32 v30, v61, v60, 24`",
+    "need": "needs Ds wait 1 (War { reg: \"v[30:31]\" })"
+  },
+  {
+    "tid": 63,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n48_gfx1201",
+    "body_pc": 435,
+    "category": "Candidate",
+    "insn": "`v_alignbit_b32 v30, v61, v60, 24`",
+    "need": "needs Ds wait 1 (War { reg: \"v[30:31]\" })"
+  },
+  {
+    "tid": 64,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16y_gfx1201",
+    "body_pc": 358,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 65,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_m64n16y_gfx1201",
+    "body_pc": 358,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 66,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16_x4_gfx1201",
+    "body_pc": 402,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 67,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m32n32_x4_gfx1201",
+    "body_pc": 459,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v26, 4, v44`",
+    "need": "needs Ds wait 1 (War { reg: \"v[26:27]\" })"
+  },
+  {
+    "tid": 68,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n48_x4_gfx1201",
+    "body_pc": 480,
+    "category": "Candidate",
+    "insn": "`v_alignbit_b32 v30, v61, v60, 24`",
+    "need": "needs Ds wait 1 (War { reg: \"v[30:31]\" })"
+  },
+  {
+    "tid": 69,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_m64n16y_x4_gfx1201",
+    "body_pc": 416,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 70,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_gfx1201",
+    "body_pc": 163,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 2, v0`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 71,
+    "target": "gemm_mq6sym_i8_hipcc_gfx1201.co#gemm_mq6sym_i8_set_bf16_gfx1201",
+    "body_pc": 162,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 2, v0`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 72,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m32n16_gfx1201",
+    "body_pc": 357,
+    "category": "Candidate",
+    "insn": "`v_and_b32_e32 v8, 0x3f00, v86`",
+    "need": "needs Ds wait 1 (War { reg: \"v[8:9]\" })"
+  },
+  {
+    "tid": 73,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m32n16_gfx1201",
+    "body_pc": 358,
+    "category": "Candidate",
+    "insn": "`v_and_b32_e32 v8, 0x3f00, v86`",
+    "need": "needs Ds wait 1 (War { reg: \"v[8:9]\" })"
+  },
+  {
+    "tid": 74,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m32n32_gfx1201",
+    "body_pc": 403,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v26, 4, v44`",
+    "need": "needs Ds wait 1 (War { reg: \"v[26:27]\" })"
+  },
+  {
+    "tid": 75,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m32n32_gfx1201",
+    "body_pc": 402,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v26, 4, v44`",
+    "need": "needs Ds wait 1 (War { reg: \"v[26:27]\" })"
+  },
+  {
+    "tid": 76,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16_gfx1201",
+    "body_pc": 346,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 77,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n16_gfx1201",
+    "body_pc": 346,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 78,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n32_gfx1201",
+    "body_pc": 381,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v20, 12, v30`",
+    "need": "needs Ds wait 0 (War { reg: \"v[20:21]\" })"
+  },
+  {
+    "tid": 79,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n32_gfx1201",
+    "body_pc": 383,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v20, 12, v30`",
+    "need": "needs Ds wait 0 (War { reg: \"v[20:21]\" })"
+  },
+  {
+    "tid": 80,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n48_gfx1201",
+    "body_pc": 433,
+    "category": "Candidate",
+    "insn": "`v_alignbit_b32 v30, v61, v60, 24`",
+    "need": "needs Ds wait 1 (War { reg: \"v[30:31]\" })"
+  },
+  {
+    "tid": 81,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n48_gfx1201",
+    "body_pc": 435,
+    "category": "Candidate",
+    "insn": "`v_alignbit_b32 v30, v61, v60, 24`",
+    "need": "needs Ds wait 1 (War { reg: \"v[30:31]\" })"
+  },
+  {
+    "tid": 82,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16y_gfx1201",
+    "body_pc": 358,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 83,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_m64n16y_gfx1201",
+    "body_pc": 358,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 84,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16_x4_gfx1201",
+    "body_pc": 402,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 85,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m32n32_x4_gfx1201",
+    "body_pc": 459,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v26, 4, v44`",
+    "need": "needs Ds wait 1 (War { reg: \"v[26:27]\" })"
+  },
+  {
+    "tid": 86,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n48_x4_gfx1201",
+    "body_pc": 480,
+    "category": "Candidate",
+    "insn": "`v_alignbit_b32 v30, v61, v60, 24`",
+    "need": "needs Ds wait 1 (War { reg: \"v[30:31]\" })"
+  },
+  {
+    "tid": 87,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_m64n16y_x4_gfx1201",
+    "body_pc": 416,
+    "category": "Candidate",
+    "insn": "`v_and_or_b32 v10, v28, 63, v15`",
+    "need": "needs Ds wait 1 (War { reg: \"v[10:11]\" })"
+  },
+  {
+    "tid": 88,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_gfx1201",
+    "body_pc": 163,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 2, v0`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 89,
+    "target": "gemm_mq6sym_i8_pm_gfx1201.hxaco#gemm_mq6sym_i8_set_bf16_gfx1201",
+    "body_pc": 162,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 2, v0`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 93,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_dequant_q4_k_f16_gfx1201",
+    "body_pc": 143,
+    "category": "ModelLimit",
+    "insn": "`global_load_d16_hi_u8 v6, v[3:4], off offset:4`",
+    "need": "needs Load wait 0 (Use { reg: \"v6\" })"
+  },
+  {
+    "tid": 94,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_dequant_q5_k_f16_gfx1201",
+    "body_pc": 143,
+    "category": "ModelLimit",
+    "insn": "`global_load_d16_hi_u8 v7, v[3:4], off offset:4`",
+    "need": "needs Load wait 0 (Use { reg: \"v7\" })"
+  },
+  {
+    "tid": 95,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_dequant_q6_k_f16_gfx1201",
+    "body_pc": 195,
+    "category": "Candidate",
+    "insn": "`global_load_d16_hi_u8 v0, v[7:8], off offset:32`",
+    "need": "needs Store wait 0 (War { reg: \"v0\" })"
+  },
+  {
+    "tid": 96,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_dequant_iq4_xs_f32_gfx1201",
+    "body_pc": 252,
+    "category": "Candidate",
+    "insn": "`v_and_b32_e32 v8, 0x7fffffff, v7`",
+    "need": "needs Store wait 1 (War { reg: \"v8\" })"
+  },
+  {
+    "tid": 97,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_dequant_q4_k_f32_gfx1201",
+    "body_pc": 152,
+    "category": "ModelLimit",
+    "insn": "`global_load_d16_hi_u8 v5, v[1:2], off offset:4`",
+    "need": "needs Load wait 0 (Use { reg: \"v5\" })"
+  },
+  {
+    "tid": 98,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_dequant_q5_k_f32_gfx1201",
+    "body_pc": 152,
+    "category": "ModelLimit",
+    "insn": "`global_load_d16_hi_u8 v5, v[3:4], off offset:4`",
+    "need": "needs Load wait 0 (Use { reg: \"v5\" })"
+  },
+  {
+    "tid": 99,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_dequant_q6_k_f32_gfx1201",
+    "body_pc": 161,
+    "category": "ModelLimit",
+    "insn": "`global_load_d16_hi_u8 v1, v[2:3], off`",
+    "need": "needs Load wait 0 (Use { reg: \"v1\" })"
+  },
+  {
+    "tid": 100,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_dequant_q8_0_f32_gfx1201",
+    "body_pc": 167,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v2, v5, 16, 1`",
+    "need": "needs Store wait 0 (War { reg: \"v2\" })"
+  },
+  {
+    "tid": 103,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_get_row_q4_k_f32_gfx1201",
+    "body_pc": 45,
+    "category": "ModelLimit",
+    "insn": "`global_load_d16_hi_u8 v4, v[1:2], off offset:4`",
+    "need": "needs Load wait 0 (Use { reg: \"v4\" })"
+  },
+  {
+    "tid": 104,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_get_row1_q4_k_f32_gfx1201",
+    "body_pc": 38,
+    "category": "ModelLimit",
+    "insn": "`global_load_d16_hi_u8 v4, v[1:2], off offset:4`",
+    "need": "needs Load wait 0 (Use { reg: \"v4\" })"
+  },
+  {
+    "tid": 105,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_get_row_q5_k_f32_gfx1201",
+    "body_pc": 45,
+    "category": "ModelLimit",
+    "insn": "`global_load_d16_hi_u8 v5, v[1:2], off offset:4`",
+    "need": "needs Load wait 0 (Use { reg: \"v5\" })"
+  },
+  {
+    "tid": 106,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_get_row1_q5_k_f32_gfx1201",
+    "body_pc": 38,
+    "category": "ModelLimit",
+    "insn": "`global_load_d16_hi_u8 v5, v[1:2], off offset:4`",
+    "need": "needs Load wait 0 (Use { reg: \"v5\" })"
+  },
+  {
+    "tid": 107,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_get_row_q6_k_f32_gfx1201",
+    "body_pc": 66,
+    "category": "ModelLimit",
+    "insn": "`global_load_d16_hi_u8 v0, v[4:5], off`",
+    "need": "needs Load wait 1 (Use { reg: \"v0\" })"
+  },
+  {
+    "tid": 108,
+    "target": "ggml_convert_shim_gfx1201.co#ggml_get_row1_q6_k_f32_gfx1201",
+    "body_pc": 18,
+    "category": "ModelLimit",
+    "insn": "`v_sub_co_u32 v2, s3, v0, v1`",
+    "need": "needs Km wait 0 (Waw { reg: \"s[4:6]\" })"
+  },
+  {
+    "tid": 265,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r1",
+    "body_pc": 259,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v20, v18, 16, 1`",
+    "need": "needs Ds wait 0 (War { reg: \"v20\" })"
+  },
+  {
+    "tid": 266,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r1_zinit",
+    "body_pc": 254,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v19, v17, 16, 1`",
+    "need": "needs Ds wait 0 (War { reg: \"v19\" })"
+  },
+  {
+    "tid": 267,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r2",
+    "body_pc": 1304,
+    "category": "Candidate",
+    "insn": "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 268,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r2_zinit",
+    "body_pc": 1275,
+    "category": "Candidate",
+    "insn": "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 269,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r3",
+    "body_pc": 1402,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v29, v32`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 270,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r3_zinit",
+    "body_pc": 1373,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v29, v32`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 271,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r4",
+    "body_pc": 1509,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v45, v46`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 272,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r4_zinit",
+    "body_pc": 1480,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v45, v46`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 273,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r5",
+    "body_pc": 1618,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v43, v45`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 274,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r5_zinit",
+    "body_pc": 1589,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v43, v45`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 275,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r6",
+    "body_pc": 1727,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v57, v59`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 276,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r6_zinit",
+    "body_pc": 1698,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v57, v59`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 277,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r7",
+    "body_pc": 1824,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v56, v58`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 278,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r7_zinit",
+    "body_pc": 1795,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v56, v58`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 279,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r8",
+    "body_pc": 1928,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v49, v52`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 280,
+    "target": "moe_shared_down_combine_hipcc_gfx1201.co#moe_shared_down_combine_rows_r8_zinit",
+    "body_pc": 1899,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v49, v52`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 281,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r1",
+    "body_pc": 259,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v20, v18, 16, 1`",
+    "need": "needs Ds wait 0 (War { reg: \"v20\" })"
+  },
+  {
+    "tid": 282,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r1_zinit",
+    "body_pc": 254,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v19, v17, 16, 1`",
+    "need": "needs Ds wait 0 (War { reg: \"v19\" })"
+  },
+  {
+    "tid": 283,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r2",
+    "body_pc": 1304,
+    "category": "Candidate",
+    "insn": "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 284,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r2_zinit",
+    "body_pc": 1275,
+    "category": "Candidate",
+    "insn": "`v_dual_add_f32 v5, v10, v12 :: v_dual_add_f32 v6, v8, v9`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 285,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r3",
+    "body_pc": 1402,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v29, v32`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 286,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r3_zinit",
+    "body_pc": 1373,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v29, v32`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 287,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r4",
+    "body_pc": 1509,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v45, v46`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 288,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r4_zinit",
+    "body_pc": 1480,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v45, v46`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 289,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r5",
+    "body_pc": 1618,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v43, v45`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 290,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r5_zinit",
+    "body_pc": 1589,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v43, v45`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 291,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r6",
+    "body_pc": 1727,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v57, v59`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 292,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r6_zinit",
+    "body_pc": 1698,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v57, v59`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 293,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r7",
+    "body_pc": 1824,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v56, v58`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 294,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r7_zinit",
+    "body_pc": 1795,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v56, v58`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 295,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r8",
+    "body_pc": 1928,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v49, v52`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 296,
+    "target": "moe_shared_down_combine_pm_gfx1201.hxaco#moe_shared_down_combine_rows_r8_zinit",
+    "body_pc": 1899,
+    "category": "Candidate",
+    "insn": "`v_add_f32_e32 v5, v49, v52`",
+    "need": "needs Ds wait 0 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 577,
+    "target": "topk8_rows_mq6g256v2_hipcc_gfx1201.co#topk8_partial_f32_rows",
+    "body_pc": 274,
+    "category": "Candidate",
+    "insn": "`v_cndmask_b32_e64 v1, 0x7fffffff, v6, s2`",
+    "need": "needs Store wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 578,
+    "target": "topk8_rows_mq6g256v2_hipcc_gfx1201.co#topk8_rescore_mq6g256v2_k2560_rows",
+    "body_pc": 75,
+    "category": "ModelLimit",
+    "insn": "`v_cmp_eq_u32_e64 s3, 0, v2`",
+    "need": "needs Km wait 0 (Waw { reg: \"s4\" })"
+  },
+  {
+    "tid": 581,
+    "target": "topk8_rows_mq6g256v2_pm_gfx1201.hxaco#topk8_partial_f32_rows",
+    "body_pc": 274,
+    "category": "Candidate",
+    "insn": "`v_cndmask_b32_e64 v1, 0x7fffffff, v6, s2`",
+    "need": "needs Store wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 582,
+    "target": "topk8_rows_mq6g256v2_pm_gfx1201.hxaco#topk8_rescore_mq6g256v2_k2560_rows",
+    "body_pc": 75,
+    "category": "ModelLimit",
+    "insn": "`v_cmp_eq_u32_e64 s3, 0, v2`",
+    "need": "needs Km wait 0 (Waw { reg: \"s4\" })"
+  },
+  {
+    "tid": 365,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m1_n1",
+    "body_pc": 440,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v5, 2, v15`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 366,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m1_n2",
+    "body_pc": 530,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 367,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m2_n1",
+    "body_pc": 677,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v12, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 368,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m2_n2",
+    "body_pc": 667,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v9, 0x400, v36`",
+    "need": "needs Ds wait 1 (War { reg: \"v9\" })"
+  },
+  {
+    "tid": 369,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m3_n1",
+    "body_pc": 818,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v17, 0x400, v25`",
+    "need": "needs Ds wait 0 (War { reg: \"v17\" })"
+  },
+  {
+    "tid": 370,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m3_n2",
+    "body_pc": 970,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v52`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 371,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m4_n1",
+    "body_pc": 996,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v33`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 372,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t1_m4_n2",
+    "body_pc": 1217,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v33, 0x400, v68`",
+    "need": "needs Ds wait 2 (War { reg: \"v33\" })"
+  },
+  {
+    "tid": 373,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n1",
+    "body_pc": 683,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v5, 2, v15`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 374,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n2",
+    "body_pc": 871,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 375,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n1",
+    "body_pc": 1353,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v12, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 376,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n2",
+    "body_pc": 1387,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v9, 0x400, v33`",
+    "need": "needs Ds wait 1 (War { reg: \"v9\" })"
+  },
+  {
+    "tid": 377,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n1",
+    "body_pc": 1835,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v17, 0x400, v25`",
+    "need": "needs Ds wait 0 (War { reg: \"v17\" })"
+  },
+  {
+    "tid": 378,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n2",
+    "body_pc": 1835,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v49`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 379,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n1",
+    "body_pc": 2269,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v33`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 380,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n2",
+    "body_pc": 2412,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v33, 0x400, v65`",
+    "need": "needs Ds wait 2 (War { reg: \"v33\" })"
+  },
+  {
+    "tid": 381,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m1_n1",
+    "body_pc": 1108,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v5, 2, v12`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 382,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m1_n2",
+    "body_pc": 1187,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 383,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m2_n1",
+    "body_pc": 1967,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v12, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 384,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m2_n2",
+    "body_pc": 2020,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v9, 0x400, v33`",
+    "need": "needs Ds wait 1 (War { reg: \"v9\" })"
+  },
+  {
+    "tid": 385,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m3_n1",
+    "body_pc": 2805,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v17, 0x400, v25`",
+    "need": "needs Ds wait 0 (War { reg: \"v17\" })"
+  },
+  {
+    "tid": 386,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m3_n2",
+    "body_pc": 2801,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v49`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 387,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m4_n1",
+    "body_pc": 3687,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v33`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 388,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t3_m4_n2",
+    "body_pc": 3661,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v33, 0x400, v65`",
+    "need": "needs Ds wait 2 (War { reg: \"v33\" })"
+  },
+  {
+    "tid": 389,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m1_n1",
+    "body_pc": 647,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v6, 2, v15`",
+    "need": "needs Store wait 0 (War { reg: \"v[6:7]\" })"
+  },
+  {
+    "tid": 390,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m1_n2",
+    "body_pc": 972,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 391,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m2_n1",
+    "body_pc": 948,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v13, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 392,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m2_n2",
+    "body_pc": 1190,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v20, 0xc00, v20`",
+    "need": "needs Ds wait 0 (War { reg: \"v20\" })"
+  },
+  {
+    "tid": 393,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m3_n1",
+    "body_pc": 1118,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v10, 0x800, v10`",
+    "need": "needs Ds wait 0 (War { reg: \"v10\" })"
+  },
+  {
+    "tid": 394,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m3_n2",
+    "body_pc": 1521,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v5, 0x1000, v4`",
+    "need": "needs Ds wait 5 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 395,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m4_n1",
+    "body_pc": 1343,
+    "category": "ModelLimit",
+    "insn": "`v_cmp_gt_i32_e64 s1, s16, v9`",
+    "need": "needs Km wait 0 (Waw { reg: \"s[2:3]\" })"
+  },
+  {
+    "tid": 396,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t1_m4_n2",
+    "body_pc": 1833,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+    "need": "needs Ds wait 8 (War { reg: \"v2\" })"
+  },
+  {
+    "tid": 397,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m1_n1",
+    "body_pc": 1030,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v5, 2, v13`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 398,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m1_n2",
+    "body_pc": 1307,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 399,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m2_n1",
+    "body_pc": 1734,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v12, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 400,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m2_n2",
+    "body_pc": 1876,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 401,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m3_n1",
+    "body_pc": 2124,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x800, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 402,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m3_n2",
+    "body_pc": 2427,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v2, 0x1000, v1`",
+    "need": "needs Ds wait 5 (War { reg: \"v2\" })"
+  },
+  {
+    "tid": 403,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m4_n1",
+    "body_pc": 2552,
+    "category": "ModelLimit",
+    "insn": "`v_cmp_gt_i32_e64 s1, s16, v69`",
+    "need": "needs Km wait 0 (Waw { reg: \"s[2:3]\" })"
+  },
+  {
+    "tid": 404,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t2_m4_n2",
+    "body_pc": 3023,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+    "need": "needs Ds wait 8 (War { reg: \"v2\" })"
+  },
+  {
+    "tid": 405,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m1_n1",
+    "body_pc": 1341,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v5, 2, v12`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 406,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m1_n2",
+    "body_pc": 1624,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 407,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m2_n1",
+    "body_pc": 2421,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v12, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 408,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m2_n2",
+    "body_pc": 2453,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 409,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m3_n1",
+    "body_pc": 3070,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x800, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 410,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m3_n2",
+    "body_pc": 3380,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v2, 0x1000, v1`",
+    "need": "needs Ds wait 5 (War { reg: \"v2\" })"
+  },
+  {
+    "tid": 411,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m4_n1",
+    "body_pc": 4005,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 412,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_w8_t3_m4_n2",
+    "body_pc": 4305,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+    "need": "needs Ds wait 8 (War { reg: \"v2\" })"
+  },
+  {
+    "tid": 413,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m1_n1_multi",
+    "body_pc": 818,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v5, 0x80, v4`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 414,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m2_n1_multi",
+    "body_pc": 1494,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v5, 0x80, v4`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 415,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m3_n1_multi",
+    "body_pc": 1993,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v17, 0x400, v25`",
+    "need": "needs Ds wait 0 (War { reg: \"v17\" })"
+  },
+  {
+    "tid": 416,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_gemm_bf16_t2_m4_n1_multi",
+    "body_pc": 2423,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v33`",
+    "need": "needs Ds wait 0 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 417,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g1",
+    "body_pc": 293,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v36`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 418,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g2",
+    "body_pc": 293,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v35`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 419,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t1_g4",
+    "body_pc": 295,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v37`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 420,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g1",
+    "body_pc": 378,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v36`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 421,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g2",
+    "body_pc": 378,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v35`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 422,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t2_g4",
+    "body_pc": 380,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v37`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 423,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g1",
+    "body_pc": 469,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v35`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 424,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g2",
+    "body_pc": 469,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v35`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 425,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_bf16_t3_g4",
+    "body_pc": 480,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v35`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 427,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t1_g2",
+    "body_pc": 583,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 428,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t1_g4",
+    "body_pc": 590,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 430,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t2_g2",
+    "body_pc": 663,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 431,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t2_g4",
+    "body_pc": 670,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 433,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t3_g2",
+    "body_pc": 751,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 434,
+    "target": "qwen4_lane_wmma_multi_hipcc_gfx1201.co#lwmma_read_up_w8_t3_g4",
+    "body_pc": 758,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 435,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m1_n1",
+    "body_pc": 440,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v5, 2, v15`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 436,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m1_n2",
+    "body_pc": 530,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 437,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m2_n1",
+    "body_pc": 677,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v12, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 438,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m2_n2",
+    "body_pc": 667,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v9, 0x400, v36`",
+    "need": "needs Ds wait 1 (War { reg: \"v9\" })"
+  },
+  {
+    "tid": 439,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m3_n1",
+    "body_pc": 818,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v17, 0x400, v25`",
+    "need": "needs Ds wait 0 (War { reg: \"v17\" })"
+  },
+  {
+    "tid": 440,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m3_n2",
+    "body_pc": 970,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v52`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 441,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m4_n1",
+    "body_pc": 996,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v33`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 442,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t1_m4_n2",
+    "body_pc": 1217,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v33, 0x400, v68`",
+    "need": "needs Ds wait 2 (War { reg: \"v33\" })"
+  },
+  {
+    "tid": 443,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n1",
+    "body_pc": 683,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v5, 2, v15`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 444,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n2",
+    "body_pc": 871,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 445,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n1",
+    "body_pc": 1353,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v12, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 446,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n2",
+    "body_pc": 1387,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v9, 0x400, v33`",
+    "need": "needs Ds wait 1 (War { reg: \"v9\" })"
+  },
+  {
+    "tid": 447,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n1",
+    "body_pc": 1835,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v17, 0x400, v25`",
+    "need": "needs Ds wait 0 (War { reg: \"v17\" })"
+  },
+  {
+    "tid": 448,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n2",
+    "body_pc": 1835,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v49`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 449,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n1",
+    "body_pc": 2269,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v33`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 450,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n2",
+    "body_pc": 2412,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v33, 0x400, v65`",
+    "need": "needs Ds wait 2 (War { reg: \"v33\" })"
+  },
+  {
+    "tid": 451,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m1_n1",
+    "body_pc": 1108,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v5, 2, v12`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 452,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m1_n2",
+    "body_pc": 1187,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 453,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m2_n1",
+    "body_pc": 1967,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v12, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 454,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m2_n2",
+    "body_pc": 2020,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v9, 0x400, v33`",
+    "need": "needs Ds wait 1 (War { reg: \"v9\" })"
+  },
+  {
+    "tid": 455,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m3_n1",
+    "body_pc": 2805,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v17, 0x400, v25`",
+    "need": "needs Ds wait 0 (War { reg: \"v17\" })"
+  },
+  {
+    "tid": 456,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m3_n2",
+    "body_pc": 2801,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v49`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 457,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m4_n1",
+    "body_pc": 3687,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v33`",
+    "need": "needs Ds wait 1 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 458,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t3_m4_n2",
+    "body_pc": 3661,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v33, 0x400, v65`",
+    "need": "needs Ds wait 2 (War { reg: \"v33\" })"
+  },
+  {
+    "tid": 459,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m1_n1",
+    "body_pc": 647,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v6, 2, v15`",
+    "need": "needs Store wait 0 (War { reg: \"v[6:7]\" })"
+  },
+  {
+    "tid": 460,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m1_n2",
+    "body_pc": 972,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 461,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m2_n1",
+    "body_pc": 948,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v13, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 462,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m2_n2",
+    "body_pc": 1190,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v20, 0xc00, v20`",
+    "need": "needs Ds wait 0 (War { reg: \"v20\" })"
+  },
+  {
+    "tid": 463,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m3_n1",
+    "body_pc": 1118,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v10, 0x800, v10`",
+    "need": "needs Ds wait 0 (War { reg: \"v10\" })"
+  },
+  {
+    "tid": 464,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m3_n2",
+    "body_pc": 1521,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v5, 0x1000, v4`",
+    "need": "needs Ds wait 5 (War { reg: \"v5\" })"
+  },
+  {
+    "tid": 465,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m4_n1",
+    "body_pc": 1343,
+    "category": "ModelLimit",
+    "insn": "`v_cmp_gt_i32_e64 s1, s16, v9`",
+    "need": "needs Km wait 0 (Waw { reg: \"s[2:3]\" })"
+  },
+  {
+    "tid": 466,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t1_m4_n2",
+    "body_pc": 1833,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+    "need": "needs Ds wait 8 (War { reg: \"v2\" })"
+  },
+  {
+    "tid": 467,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m1_n1",
+    "body_pc": 1030,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v5, 2, v13`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 468,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m1_n2",
+    "body_pc": 1307,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 469,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m2_n1",
+    "body_pc": 1734,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v12, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 470,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m2_n2",
+    "body_pc": 1876,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 471,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m3_n1",
+    "body_pc": 2124,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x800, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 472,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m3_n2",
+    "body_pc": 2427,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v2, 0x1000, v1`",
+    "need": "needs Ds wait 5 (War { reg: \"v2\" })"
+  },
+  {
+    "tid": 473,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m4_n1",
+    "body_pc": 2552,
+    "category": "ModelLimit",
+    "insn": "`v_cmp_gt_i32_e64 s1, s16, v69`",
+    "need": "needs Km wait 0 (Waw { reg: \"s[2:3]\" })"
+  },
+  {
+    "tid": 474,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t2_m4_n2",
+    "body_pc": 3023,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+    "need": "needs Ds wait 8 (War { reg: \"v2\" })"
+  },
+  {
+    "tid": 475,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m1_n1",
+    "body_pc": 1341,
+    "category": "Candidate",
+    "insn": "`v_lshlrev_b32_e32 v5, 2, v12`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 476,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m1_n2",
+    "body_pc": 1624,
+    "category": "Candidate",
+    "insn": "`v_lshrrev_b32_e32 v3, 4, v11`",
+    "need": "needs Store wait 0 (War { reg: \"v[3:4]\" })"
+  },
+  {
+    "tid": 477,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m2_n1",
+    "body_pc": 2421,
+    "category": "Candidate",
+    "insn": "`v_bfe_u32 v5, v12, 5, 3`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 478,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m2_n2",
+    "body_pc": 2453,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 479,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m3_n1",
+    "body_pc": 3070,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x800, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 480,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m3_n2",
+    "body_pc": 3380,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v2, 0x1000, v1`",
+    "need": "needs Ds wait 5 (War { reg: \"v2\" })"
+  },
+  {
+    "tid": 481,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m4_n1",
+    "body_pc": 4005,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0xc00, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 482,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_w8_t3_m4_n2",
+    "body_pc": 4305,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v2, 0x1400, v1`",
+    "need": "needs Ds wait 8 (War { reg: \"v2\" })"
+  },
+  {
+    "tid": 483,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m1_n1_multi",
+    "body_pc": 818,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v5, 0x80, v4`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 484,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m2_n1_multi",
+    "body_pc": 1494,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v5, 0x80, v4`",
+    "need": "needs Store wait 0 (War { reg: \"v[5:6]\" })"
+  },
+  {
+    "tid": 485,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m3_n1_multi",
+    "body_pc": 1993,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v17, 0x400, v25`",
+    "need": "needs Ds wait 0 (War { reg: \"v17\" })"
+  },
+  {
+    "tid": 486,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_gemm_bf16_t2_m4_n1_multi",
+    "body_pc": 2423,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v25, 0x400, v33`",
+    "need": "needs Ds wait 0 (War { reg: \"v25\" })"
+  },
+  {
+    "tid": 487,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g1",
+    "body_pc": 293,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v36`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 488,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g2",
+    "body_pc": 293,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v35`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 489,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t1_g4",
+    "body_pc": 295,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v37`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 490,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g1",
+    "body_pc": 378,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v36`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 491,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g2",
+    "body_pc": 378,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v35`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 492,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t2_g4",
+    "body_pc": 380,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v37`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 493,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g1",
+    "body_pc": 469,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v35`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 494,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g2",
+    "body_pc": 469,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v35`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 495,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_bf16_t3_g4",
+    "body_pc": 480,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, 0x400, v35`",
+    "need": "needs Ds wait 1 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 497,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t1_g2",
+    "body_pc": 583,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 498,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t1_g4",
+    "body_pc": 590,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 500,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t2_g2",
+    "body_pc": 663,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 501,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t2_g4",
+    "body_pc": 670,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 503,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t3_g2",
+    "body_pc": 751,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 504,
+    "target": "qwen4_lane_wmma_multi_pm_gfx1201.hxaco#lwmma_read_up_w8_t3_g4",
+    "body_pc": 758,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v3, 0xc00, v3`",
+    "need": "needs Ds wait 0 (War { reg: \"v3\" })"
+  },
+  {
+    "tid": 259,
+    "target": "moe_route_scatter_wide_hipcc_gfx1201.co#moe_router_softmax_top10_f32_fast",
+    "body_pc": 255,
+    "category": "Candidate",
+    "insn": "`v_mov_b32_e32 v2, v1`",
+    "need": "needs Store wait 0 (War { reg: \"v[2:5]\" })"
+  },
+  {
+    "tid": 260,
+    "target": "moe_route_scatter_wide_hipcc_gfx1201.co#moe_scatter_fused_k8",
+    "body_pc": 19,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, s4, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 261,
+    "target": "moe_route_scatter_wide_hipcc_gfx1201.co#moe_scatter_fused_top10_pmask",
+    "body_pc": 19,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, s4, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 262,
+    "target": "moe_route_scatter_wide_pm_gfx1201.hxaco#moe_router_softmax_top10_f32_fast",
+    "body_pc": 255,
+    "category": "Candidate",
+    "insn": "`v_mov_b32_e32 v2, v1`",
+    "need": "needs Store wait 0 (War { reg: \"v[2:5]\" })"
+  },
+  {
+    "tid": 263,
+    "target": "moe_route_scatter_wide_pm_gfx1201.hxaco#moe_scatter_fused_k8",
+    "body_pc": 19,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, s4, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 264,
+    "target": "moe_route_scatter_wide_pm_gfx1201.hxaco#moe_scatter_fused_top10_pmask",
+    "body_pc": 19,
+    "category": "Candidate",
+    "insn": "`v_add_nc_u32_e32 v1, s4, v1`",
+    "need": "needs Ds wait 0 (War { reg: \"v1\" })"
+  },
+  {
+    "tid": 533,
+    "target": "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_nt1",
+    "body_pc": 126,
+    "category": "Candidate",
+    "insn": "`flat_load_b128 v[0:3], v[6:7], off offset:8`",
+    "need": "needs Load wait 0 (War { reg: \"v[0:1]\" })"
+  },
+  {
+    "tid": 534,
+    "target": "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_nt2",
+    "body_pc": 234,
+    "category": "ModelLimit",
+    "insn": "`flat_load_d16_hi_b16 v32, v[72:73], off`",
+    "need": "needs Load wait 0 (Use { reg: \"v32\" })"
+  },
+  {
+    "tid": 535,
+    "target": "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_planar_nt1",
+    "body_pc": 130,
+    "category": "ModelLimit",
+    "insn": "`flat_load_d16_b16 v32, v[6:7], off`",
+    "need": "needs Load wait 0 (Use { reg: \"v32\" })"
+  },
+  {
+    "tid": 536,
+    "target": "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_planar_nt2",
+    "body_pc": 242,
+    "category": "ModelLimit",
+    "insn": "`flat_load_d16_b16 v32, v[72:73], off`",
+    "need": "needs Load wait 0 (Use { reg: \"v32\" })"
+  },
+  {
+    "tid": 537,
+    "target": "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_nt1",
+    "body_pc": 115,
+    "category": "Candidate",
+    "insn": "`flat_load_b128 v[12:15], v[12:13], off offset:20`",
+    "need": "needs Load wait 0 (War { reg: \"v[12:13]\" })"
+  },
+  {
+    "tid": 538,
+    "target": "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_nt2",
+    "body_pc": 282,
+    "category": "ModelLimit",
+    "insn": "`v_cvt_f32_f16_e32 v63, v24.l`",
+    "need": "needs Load wait 0 (Use { reg: \"v24\" })"
+  },
+  {
+    "tid": 539,
+    "target": "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_planar_nt1",
+    "body_pc": 116,
+    "category": "Candidate",
+    "insn": "`flat_load_b128 v[8:11], v[1:2], off`",
+    "need": "needs Load wait 0 (War { reg: \"v[8:9]\" })"
+  },
+  {
+    "tid": 540,
+    "target": "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_down_planar_nt2",
+    "body_pc": 284,
+    "category": "ModelLimit",
+    "insn": "`v_cvt_f32_f16_e32 v65, v24.l`",
+    "need": "needs Load wait 0 (Use { reg: \"v24\" })"
+  },
+  {
+    "tid": 541,
+    "target": "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
+    "body_pc": 168,
+    "category": "ModelLimit",
+    "insn": "`flat_load_d16_hi_b16 v36, v[21:22], off`",
+    "need": "needs Load wait 0 (Use { reg: \"v36\" })"
+  },
+  {
+    "tid": 542,
+    "target": "qwen4_moe_ep_a8_rot_hipcc_gfx1201.co#qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
+    "body_pc": 180,
+    "category": "ModelLimit",
+    "insn": "`v_cmp_le_u32_e64 s1, s5, v2`",
+    "need": "needs Km wait 0 (Waw { reg: \"s[2:3]\" })"
+  },
+  {
+    "tid": 543,
+    "target": "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_nt1",
+    "body_pc": 126,
+    "category": "Candidate",
+    "insn": "`flat_load_b128 v[0:3], v[6:7], off offset:8`",
+    "need": "needs Load wait 0 (War { reg: \"v[0:1]\" })"
+  },
+  {
+    "tid": 544,
+    "target": "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_nt2",
+    "body_pc": 234,
+    "category": "ModelLimit",
+    "insn": "`flat_load_d16_hi_b16 v32, v[72:73], off`",
+    "need": "needs Load wait 0 (Use { reg: \"v32\" })"
+  },
+  {
+    "tid": 545,
+    "target": "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_planar_nt1",
+    "body_pc": 130,
+    "category": "ModelLimit",
+    "insn": "`flat_load_d16_b16 v32, v[6:7], off`",
+    "need": "needs Load wait 0 (Use { reg: \"v32\" })"
+  },
+  {
+    "tid": 546,
+    "target": "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_planar_nt2",
+    "body_pc": 242,
+    "category": "ModelLimit",
+    "insn": "`flat_load_d16_b16 v32, v[72:73], off`",
+    "need": "needs Load wait 0 (Use { reg: \"v32\" })"
+  },
+  {
+    "tid": 547,
+    "target": "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_nt1",
+    "body_pc": 115,
+    "category": "Candidate",
+    "insn": "`flat_load_b128 v[12:15], v[12:13], off offset:20`",
+    "need": "needs Load wait 0 (War { reg: \"v[12:13]\" })"
+  },
+  {
+    "tid": 548,
+    "target": "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_nt2",
+    "body_pc": 282,
+    "category": "ModelLimit",
+    "insn": "`v_cvt_f32_f16_e32 v63, v24.l`",
+    "need": "needs Load wait 0 (Use { reg: \"v24\" })"
+  },
+  {
+    "tid": 549,
+    "target": "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_planar_nt1",
+    "body_pc": 116,
+    "category": "Candidate",
+    "insn": "`flat_load_b128 v[8:11], v[1:2], off`",
+    "need": "needs Load wait 0 (War { reg: \"v[8:9]\" })"
+  },
+  {
+    "tid": 550,
+    "target": "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_down_planar_nt2",
+    "body_pc": 284,
+    "category": "ModelLimit",
+    "insn": "`v_cvt_f32_f16_e32 v65, v24.l`",
+    "need": "needs Load wait 0 (Use { reg: \"v24\" })"
+  },
+  {
+    "tid": 551,
+    "target": "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_rot_planar_nt1",
+    "body_pc": 168,
+    "category": "ModelLimit",
+    "insn": "`flat_load_d16_hi_b16 v36, v[21:22], off`",
+    "need": "needs Load wait 0 (Use { reg: \"v36\" })"
+  },
+  {
+    "tid": 552,
+    "target": "qwen4_moe_ep_a8_rot_pm_gfx1201.hxaco#qwen4_moe_ep_a8_gate_up_rot_planar_nt2",
+    "body_pc": 180,
+    "category": "ModelLimit",
+    "insn": "`v_cmp_le_u32_e64 s1, s5, v2`",
+    "need": "needs Km wait 0 (Waw { reg: \"s[2:3]\" })"
+  },
+  {
+    "tid": 505,
+    "target": "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t1_b32x32w2x1g4",
+    "body_pc": 742,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 506,
+    "target": "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t1_b32x64w2x2",
+    "body_pc": 712,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 507,
+    "target": "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t1_b64x64w4x1",
+    "body_pc": 1034,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 508,
+    "target": "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b16x32w1x1g4",
+    "body_pc": 320,
+    "category": "ModelLimit",
+    "insn": "`v_cmp_ne_u32_e64 s1, 0, v45`",
+    "need": "needs Km wait 0 (Waw { reg: \"s[2:3]\" })"
+  },
+  {
+    "tid": 509,
+    "target": "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b32x64w2x2",
+    "body_pc": 799,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 510,
+    "target": "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x64w4x1",
+    "body_pc": 1202,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 511,
+    "target": "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x64w4x2",
+    "body_pc": 768,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 512,
+    "target": "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b32x128w2x2",
+    "body_pc": 1101,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 513,
+    "target": "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x128w4x2",
+    "body_pc": 1062,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 514,
+    "target": "qwen4_lwmma_tile_hipcc_gfx1201.co#lwmma_tile_bf16_t2_b64x128w2x4",
+    "body_pc": 1000,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 515,
+    "target": "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t1_b32x32w2x1g4",
+    "body_pc": 742,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 516,
+    "target": "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t1_b32x64w2x2",
+    "body_pc": 712,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 517,
+    "target": "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t1_b64x64w4x1",
+    "body_pc": 1034,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 518,
+    "target": "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b16x32w1x1g4",
+    "body_pc": 320,
+    "category": "ModelLimit",
+    "insn": "`v_cmp_ne_u32_e64 s1, 0, v45`",
+    "need": "needs Km wait 0 (Waw { reg: \"s[2:3]\" })"
+  },
+  {
+    "tid": 519,
+    "target": "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b32x64w2x2",
+    "body_pc": 799,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 520,
+    "target": "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x64w4x1",
+    "body_pc": 1202,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 521,
+    "target": "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x64w4x2",
+    "body_pc": 768,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 522,
+    "target": "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b32x128w2x2",
+    "body_pc": 1101,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 523,
+    "target": "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x128w4x2",
+    "body_pc": 1062,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  },
+  {
+    "tid": 524,
+    "target": "qwen4_lwmma_tile_pm_gfx1201.hxaco#lwmma_tile_bf16_t2_b64x128w2x4",
+    "body_pc": 1000,
+    "category": "Candidate",
+    "insn": "`v_or_b32_e32 v4, 1, v3`",
+    "need": "needs Store wait 0 (War { reg: \"v[4:5]\" })"
+  }
+]

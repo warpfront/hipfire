@@ -22,7 +22,7 @@ use hipfire_loader::admission::{
 };
 use hipfire_registry::{receipts, ModelEntry, RegistryV1};
 use hipfire_runtime::device_mesh::{DeviceMesh, DimKind};
-use hipfire_runtime::loader_api::{CaskConfig, ModelSource, SpecLoadCfg};
+use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fmt::Write as _;
@@ -33,7 +33,33 @@ use types::{gib, Finding, FitDevice, FitHost, PlacementPlan, Verdict};
 /// `plan.basis` in the JSON report.
 const PLAN_BASIS: &str = "pre-load";
 /// The text plan's `basis` line: what its numbers are, and what the load adds.
+#[cfg(not(windows))]
 const PLAN_BASIS_TEXT: &str = "pre-load estimate from file headers + sysfs; the load re-measures free VRAM after weights, drafts and scratch (max_seq fit) and may admit less";
+#[cfg(windows)]
+const PLAN_BASIS_TEXT: &str = "pre-load estimate from file headers + HIP free VRAM; the load re-measures free VRAM after weights, drafts and scratch (max_seq fit) and may admit less";
+
+/// Machine-fact fix lines. `hipfire doctor` exists only on Linux; native
+/// Windows reads the GPUs from HIP and `hipfire diag` shows what HIP reports
+/// (#1145).
+#[cfg(not(windows))]
+mod gpu_fix {
+    pub(super) const NO_GPU: &str = "no AMD GPU detected in the KFD topology";
+    pub(super) const RUN_DIAGNOSTIC: &str = "run `hipfire doctor`";
+    pub(super) const NO_FREE_COUNTER: &str =
+        "run `hipfire doctor` and check amdgpu sysfs memory counters";
+    pub(super) const REFUSED: &str =
+        "correct hardware.devices or the GPU visibility override, then run `hipfire doctor`";
+    pub(super) const VISIBILITY: &str = "set `hardware.devices` to a listed GPU, or unset incompatible ROCR_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES overrides";
+}
+#[cfg(windows)]
+mod gpu_fix {
+    pub(super) const NO_GPU: &str = "no AMD GPU visible to the HIP runtime";
+    pub(super) const RUN_DIAGNOSTIC: &str = "run `hipfire diag`";
+    pub(super) const NO_FREE_COUNTER: &str =
+        "run `hipfire diag` (it shows the free VRAM HIP reports to the daemon)";
+    pub(super) const REFUSED: &str = "correct HIP_VISIBLE_DEVICES, then run `hipfire diag`";
+    pub(super) const VISIBILITY: &str = "run `hipfire config reset hardware.devices` (native Windows has no KFD topology) and select the card with HIP_VISIBLE_DEVICES";
+}
 
 #[derive(Args, Debug)]
 pub(crate) struct FitArgs {
@@ -321,27 +347,35 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
     let (mut machine, host_notes) = host::detect_with_notes(paths);
     let mut findings = preflight_findings(paths);
     if let Some(error) = visibility_error {
-        findings.push(Finding::fails("admission", error.to_string(),
-            "set `hardware.devices` to a listed GPU, or unset incompatible ROCR_VISIBLE_DEVICES/HIP_VISIBLE_DEVICES overrides"));
+        findings.push(Finding::fails(
+            "admission",
+            error.to_string(),
+            gpu_fix::VISIBILITY,
+        ));
     }
     for note in host_notes
         .iter()
         .filter(|note| note.starts_with("load refused:"))
     {
-        findings.push(Finding::fails("admission", note,
-            note.split_once("fix:").map(|(_, fix)| fix.trim()).unwrap_or("correct hardware.devices or the GPU visibility override, then run `hipfire doctor`")));
+        findings.push(Finding::fails(
+            "admission",
+            note,
+            note.split_once("fix:")
+                .map(|(_, fix)| fix.trim())
+                .unwrap_or(gpu_fix::REFUSED),
+        ));
     }
     if machine.devices.is_empty() {
         findings.push(Finding::undetermined(
             "vram",
-            "no AMD GPU detected in the KFD topology",
-            Some("run `hipfire doctor`".into()),
+            gpu_fix::NO_GPU,
+            Some(gpu_fix::RUN_DIAGNOSTIC.into()),
         ));
     } else if machine.devices[0].free.is_none() {
         findings.push(Finding::undetermined(
             "vram",
             "free device memory counter is unavailable; capacity cannot be determined",
-            Some("run `hipfire doctor` and check amdgpu sysfs memory counters".into()),
+            Some(gpu_fix::NO_FREE_COUNTER.into()),
         ));
     }
     supply_visible_device_count(process, &machine);
@@ -617,7 +651,7 @@ fn analyze_model(
         .map(|m| m.len())
         .or(result.model.size_bytes);
     let FitLoad {
-        params,
+        mut params,
         selector,
         draft_missing,
     } = match model_params(paths, input, Some(tag), entry, &path, args) {
@@ -636,6 +670,7 @@ fn analyze_model(
     let Some(device) = machine.devices.first() else {
         return Ok(result);
     };
+    apply_dflash_vram_floor(&mut params, device, &mut result.notes);
     let inputs = admission_inputs(&params);
     let admitted = match inputs.admit(&path, device) {
         Ok(admitted) => admitted,
@@ -819,7 +854,7 @@ fn analyze_model(
                 _ => result.findings.push(Finding::undetermined(
                     "weights",
                     "weight size or free GPU memory is unavailable",
-                    Some("run `hipfire doctor`".into()),
+                    Some(gpu_fix::RUN_DIAGNOSTIC.into()),
                 )),
             }
             result.findings.push(Finding::undetermined(
@@ -888,7 +923,7 @@ fn model_params(
     {
         crate::DflashSidecar::Unresolved => None,
         crate::DflashSidecar::Found(draft) => {
-            params["draft"] = json!(draft.display().to_string());
+            crate::wire_registry_draft(&mut params, &draft, entry);
             None
         }
         crate::DflashSidecar::NotPulled(file) => Some(MissingDraft {
@@ -918,8 +953,12 @@ fn model_params(
         if let Ok(value) = hipfire_config::developer_var(variable) {
             params[key] = json!(value);
             if key == "draft" {
-                // The ladder names the draft (or opts out): none is missing.
+                // The ladder names the draft (or opts out): none is missing,
+                // and the daemon applies no registry floor to it.
                 draft_missing = None;
+                if let Some(params) = params.as_object_mut() {
+                    params.remove(hipfire_config::dflash_floor::DFLASH_MIN_VRAM_PARAM);
+                }
             }
         }
     }
@@ -946,12 +985,6 @@ fn model_params(
     // daemon/main.rs:2132-2146: retain the explicit experimental PP gates.
     params["_pp_dflash"] = json!(
         hipfire_config::developer_var("HIPFIRE_PP_DFLASH")
-            .ok()
-            .as_deref()
-            == Some("1")
-    );
-    params["_pp_pflash"] = json!(
-        hipfire_config::developer_var("HIPFIRE_PP_PFLASH")
             .ok()
             .as_deref()
             == Some("1")
@@ -998,6 +1031,34 @@ fn report_missing_draft(result: &mut Analysis, params: &Value, tag: &str, missin
             "DFlash draft {} is not installed{size}; speculation.dflash = auto runs without it, `hipfire pull {tag}` fetches it",
             missing.file
         ));
+    }
+}
+
+/// The daemon's registry DFlash VRAM floor (#1151) for the planned device:
+/// below `dflash_min_vram_gb`, `auto` loads no draft and `on` loads it with a
+/// warning. Fit reads a discrete card's `mem_info_vram_total`; it does not
+/// model the HIP pool total of a unified-memory device, so that plans paired.
+fn apply_dflash_vram_floor(params: &mut Value, device: &FitDevice, notes: &mut Vec<String>) {
+    use hipfire_config::dflash_floor::{dflash_vram_gate, DflashVramGate, DFLASH_MIN_VRAM_PARAM};
+    if str_param(params, "draft").is_none() {
+        return;
+    }
+    let total = device.vram_total.filter(|_| !device.unified_memory);
+    match dflash_vram_gate(
+        params["dflash_mode"].as_str().unwrap_or("auto"),
+        params[DFLASH_MIN_VRAM_PARAM].as_f64(),
+        total,
+    ) {
+        DflashVramGate::Pair => {}
+        DflashVramGate::Skip(reason) => {
+            if let Some(params) = params.as_object_mut() {
+                params.remove("draft");
+            }
+            notes.push(format!(
+                "DFlash draft not paired: {reason}; speculation.dflash = on forces it"
+            ));
+        }
+        DflashVramGate::Forced(warning) => notes.push(warning),
     }
 }
 
@@ -1654,7 +1715,6 @@ struct AdmissionInputs<'a> {
     kv_k: Option<&'a str>,
     kv_v: Option<&'a str>,
     kv_adaptive: Option<&'a str>,
-    cask: CaskConfig,
     options: SourceAdmissionOptions,
     error: Option<String>,
 }
@@ -1666,10 +1726,9 @@ impl AdmissionInputs<'_> {
             kv_k: self.kv_k,
             kv_v: self.kv_v,
             kv_adaptive: self.kv_adaptive,
-            cask: Some(&self.cask),
             deepseek4_heterogeneous: self.options.non_single_compute,
             qwen_default_q8: qwen_default_q8_enabled(),
-            vmm_runtime_available: true,
+            vmm_runtime_refusal: None,
             free_vram_bytes: device.free.and_then(|n| usize::try_from(n).ok()),
         }
     }
@@ -1808,8 +1867,6 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         ngram_draft: params["ngram_draft"].as_bool(),
         ngram_k: usize_param(params, "ngram_k"),
         ngram_min_count: params["ngram_min_count"].as_u64().map(|v| v as u32),
-        ddtree_budget: usize_param(params, "ddtree_budget"),
-        ddtree_topk: usize_param(params, "ddtree_topk"),
         dspark: params["dspark_mode"]
             .as_str()
             .and_then(hipfire_config::parse_tri_state),
@@ -1820,18 +1877,6 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         dflash_adaptive_b: Some(params["dflash_adaptive_b"].as_bool().unwrap_or(false)),
         dflash_block: Some(dflash_block),
         dflash_block_auto,
-    };
-    // :1906-1972: keep a CaskConfig even when eviction is off, exactly as
-    // admission's hints do; cask option below is SIDECAR presence, not enabled.
-    let enabled = params["cask"].as_bool().unwrap_or(false);
-    let cask = CaskConfig {
-        sidecar: str_param(params, "cask_sidecar").map(str::to_owned),
-        cask_m_folding: enabled && draft.is_none(),
-        budget: usize_param(params, "cask_budget").unwrap_or(512),
-        beta: usize_param(params, "cask_beta").unwrap_or(128),
-        handoff_tokens: usize_param(params, "cask_handoff_tokens").unwrap_or(0),
-        core_frac: params["cask_core_frac"].as_f64().unwrap_or(0.5) as f32,
-        fold_m: usize_param(params, "cask_fold_m").unwrap_or(2),
     };
     // :2152-2183: parse even an empty placement string (daemon refuses it).
     let placement = params["deepseek4_compute_placement"]
@@ -1847,12 +1892,9 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         spec,
         kv_adaptive: qwen4_kv_adaptive_requested(kv_adaptive),
         eagle_drafter: str_param(params, "drafter").is_some(),
-        cask: cask.sidecar.is_some(),
         state_quant: str_param(params, "state_quant").is_some(),
         non_single_compute: !matches!(placement, hipfire_config::Deepseek4ComputePlacement::Single),
         expert_count_override: usize_param(params, "deepseek4_experts_per_token").is_some(),
-        pflash: str_param(params, "prefill_drafter").is_some()
-            || params["prefill_compression"].as_str().unwrap_or("off") != "off",
     };
     // :2115-2197: source-independent pre-admission feature refusals. They must
     // not become a successful fit merely because a non-Qwen4 carrier is used.
@@ -1864,12 +1906,6 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         Some(
             "DFlash speculative decode requires pp=1; reload without a draft or set topology.pp=1.",
         )
-    } else if pp > 1 && options.cask {
-        Some(
-            "CASK / TriAttention eviction requires pp=1; reload without CASK or set topology.pp=1.",
-        )
-    } else if pp > 1 && options.pflash && params["_pp_pflash"].as_bool() != Some(true) {
-        Some("PFlash prefill compression requires pp=1; turn off prefill compression or set topology.pp=1.")
     } else if tp > 1 && options.expert_count_override {
         Some("DeepSeek V4 experts-per-token override requires tp=1; reload without the experts-per-token override.")
     } else {
@@ -1891,7 +1927,6 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         kv_k,
         kv_v,
         kv_adaptive,
-        cask,
         options,
         error,
     }
@@ -1966,6 +2001,34 @@ mod tests {
             historical: false,
             note: None,
         }
+    }
+
+    #[test]
+    fn dflash_vram_floor_drops_the_auto_draft_on_a_smaller_card() {
+        // #1151, mirroring the daemon: a simulated 24 GB card is below a
+        // 28 GiB floor, the 32 GB test card clears it.
+        let params = |mode: &str| {
+            json!({"dflash_mode": mode, "draft": "/m/qwen38-27b-dflash-mq5.hfq",
+                "dflash_min_vram_gb": 28.0})
+        };
+        let xtx = FitDevice {
+            arch: "gfx1100".into(),
+            vram_total: Some(25_753_026_560),
+            ..device()
+        };
+        let mut notes = Vec::new();
+        let mut auto = params("auto");
+        apply_dflash_vram_floor(&mut auto, &xtx, &mut notes);
+        assert!(auto.get("draft").is_none());
+        assert!(notes[0].contains("DFlash draft not paired"), "{notes:?}");
+        let mut on = params("on");
+        apply_dflash_vram_floor(&mut on, &xtx, &mut notes);
+        assert!(on.get("draft").is_some());
+        assert!(notes[1].contains("speculation.dflash = on"), "{notes:?}");
+        let mut paired = params("auto");
+        apply_dflash_vram_floor(&mut paired, &device(), &mut notes);
+        assert!(paired.get("draft").is_some());
+        assert_eq!(notes.len(), 2);
     }
 
     fn report() -> Report {
@@ -2093,7 +2156,7 @@ mod tests {
         let params = json!({"max_seq": 65536, "pp": 2, "kv_mode": "q8", "kv_backend": "vmm",
             "kv_k": "fwht3", "kv_v": "q8", "kv_adaptive": "off",
             "mtp_mode": "on", "mtp_k": 3, "ngram_draft": true, "ngram_k": 8,
-            "ngram_min_count": 2, "ddtree_budget": 16, "ddtree_topk": 4,
+            "ngram_min_count": 2,
             "dspark_mode": "off", "dflash_mode": "off", "dflash_block": 8,
             "dflash_adaptive_b": true, "head": "head.hfq"});
         let a = admission_inputs(&params);
@@ -2111,8 +2174,6 @@ mod tests {
         assert_eq!(a.options.spec.mtp, Some(true));
         assert_eq!(a.options.spec.mtp_k, Some(3));
         assert_eq!(a.options.spec.ngram_draft, Some(true));
-        assert_eq!(a.options.spec.ddtree_budget, Some(16));
-        assert_eq!(a.options.spec.ddtree_topk, Some(4));
         assert_eq!(a.options.spec.dspark, Some(false));
         assert_eq!(a.options.spec.dflash_block, Some(8));
         assert_eq!(a.options.spec.dflash_adaptive_b, Some(true));
@@ -2144,38 +2205,23 @@ mod tests {
     }
 
     #[test]
-    fn admission_inputs_gates_sidecars_and_maps_cask_flags() {
+    fn admission_inputs_gates_sidecars_and_maps_flags() {
         let params = json!({"draft": "draft.hfq", "dflash_mode": "off", "vision": "vision.hfq",
-            "vision_mode": "off", "cask": true, "cask_sidecar": "eviction.hfq",
-            "cask_budget": 768, "cask_beta": 256, "cask_handoff_tokens": 128,
-            "cask_core_frac": 0.25, "cask_fold_m": 3, "state_quant": "off",
-            "prefill_drafter": "prefill.hfq", "drafter": "eagle.hfq",
+            "vision_mode": "off", "state_quant": "off",
+            "drafter": "eagle.hfq",
             "deepseek4_experts_per_token": 4});
         let a = admission_inputs(&params);
         assert!(a.error.is_none());
         assert!(a.draft.is_none() && a.vision.is_none());
-        assert!(a.cask.cask_m_folding);
-        assert_eq!(
-            (
-                a.cask.budget,
-                a.cask.beta,
-                a.cask.handoff_tokens,
-                a.cask.fold_m
-            ),
-            (768, 256, 128, 3)
-        );
-        assert_eq!(a.cask.core_frac, 0.25);
-        assert!(a.options.cask && a.options.state_quant && a.options.pflash);
+        assert!(a.options.state_quant);
         assert!(a.options.eagle_drafter && a.options.expert_count_override);
         let params = json!({"draft": "draft.hfq", "dflash_mode": "auto",
-            "vision": "vision.hfq", "vision_mode": "auto", "cask": true});
+            "vision": "vision.hfq", "vision_mode": "auto"});
         let a = admission_inputs(&params);
         assert_eq!(a.draft, Some("draft.hfq"));
         assert_eq!(a.vision, Some("vision.hfq"));
-        assert!(!a.cask.cask_m_folding);
-        assert!(!a.options.cask); // only a sidecar activates this admission gate
-                                  // tp>1: an `auto` pairing is dropped (DFlash is not served on EP/TP),
-                                  // an explicit `on` keeps the draft for the tp>1 refusal.
+        // tp>1: an `auto` pairing is dropped (DFlash is not served on EP/TP),
+        // an explicit `on` keeps the draft for the tp>1 refusal.
         let auto_tp = json!({"draft": "draft.hfq", "dflash_mode": "auto", "tp": 2});
         assert_eq!(admission_inputs(&auto_tp).draft, None);
         let on_tp = json!({"draft": "draft.hfq", "dflash_mode": "on", "tp": 2});

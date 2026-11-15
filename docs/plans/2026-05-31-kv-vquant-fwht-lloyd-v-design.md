@@ -214,7 +214,7 @@ yet gated — gate before defaulting it.)
 
 - **Plain Q4-V (unrotated uniform 4-bit):** dropped for now — suspected dead end; revisit only if
   Lloyd-V underperforms and we want to attribute rotation-vs-codebook.
-- Adaptive per-block MQ-Lloyd refit and ParoQuant learned rotation for KV — weight-static
+- Adaptive per-block MQ-Lloyd refit and learned rotation for KV — weight-static
   techniques that don't transfer to a dynamic cache without offline calibration.
 - Hardware-aware setup wizard / VRAM autodetect / Hermes-autoconfigure (companion doc).
 - DFlash `hidden_rb` full-ctx over-allocation (separate ~24–32k DFlash ceiling track).

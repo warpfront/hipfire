@@ -370,8 +370,9 @@ fn scan_module(
             if let Ok((inst, n)) = &decoded {
                 if *n == line.words.len() {
                     checked_instructions += 1;
-                    let decoded_name =
-                        peacemaker_ir::isa::lookup(arch, inst.op, inst.form).map(|row| row.name);
+                    let decoded_name = peacemaker_ir::isa::lookup_inst(arch, &inst)
+                        .ok()
+                        .map(|row| row.name);
                     // gfx11 objdump can elide the optional e64 spelling on a VOP3,
                     // but the form and full instruction words must still agree.
                     let rendered_matches = decoded_name == Some(spelling.as_str())

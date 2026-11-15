@@ -119,8 +119,9 @@ Three naming decisions, each deliberate:
   self-describe by qt, so no file is ever ambiguous; redefining qt=13 would make the scored
   baseline (`WT2 0.043776`) ambiguous by date, which is the same silent-reinterpretation hazard
   that produced the qt=43 / GLW mess. qt=13 stays reachable as `mq4v1`.
-- **Not `mq4r`.** `.mq4r` is a live file extension in `crates/hipfire-cli/src/main.rs:63` that
-  selects the Redline replay backend, and denotes "MQ4 gate + graded experts"
+- **Not `mq4r`.** `mq4r` is a live route SKU that selects the Redline replay backend (HFQ
+  `hipfire_route_sku` metadata or the registry card's `quant`, `crates/hipfire-runtime/src/route_sku.rs`;
+  `.mq4r` stays a model file extension), and denotes "MQ4 gate + graded experts"
   (`qwen35.rs:6011`). `mq4c` names the **padded-compat** v1.5 form (136 B), not the retired 132 B compact.
 - **`mq4_k` names its provenance.** Hierarchical sub-scale quantization is GGML's k-quant
   design; what is ours is the FWHT rotation beneath it and the per-16 granularity. Per
@@ -490,7 +491,7 @@ relatively less of the damage. "Codebooks are for the sub-4-bit tier" is defensi
 | **qt=45** batched prefill WMMA GEMM + batched lm_head GEMM | **gfx12-only** (`HasWmmaGfx12`); **not** admitted on gfx11 |
 | Unsupported batched prefill | **per-token decode fallback** (does not dispatch a foreign-arch WMMA kernel) |
 | FusedQkv / FusedGateUp decode registrations | remain **cross-arch** (not narrowed to gfx12) |
-| Prefill LA admission (qt=44) | **qwen35 only**: gfx1100/1101/1102/1150/1151 + gfx1200/1201; gfx11 opt-out `HIPFIRE_MQV2_GFX11_WMMA=0`. Plain-Llama dense (`llama::is_batchable_la`) **refuses V2 on every arch** (per-token decode) until `forward_prefill_chunk` grows V2 arms |
+| Prefill LA admission (qt=44) | **qwen35 only**: gfx1100/1101/1102/1150/1151 + gfx1200/1201. Plain-Llama dense (`llama::is_batchable_la`) **refuses V2 on every arch** (per-token decode) until `forward_prefill_chunk` grows V2 arms |
 | Exact parity examples | `mq4v2_parity`, `mq4v2_gemm_parity`, `mq4v2_fused_parity`, `mq4v2_residual_parity`, `mq4c_parity`; BT screens `test_mq4v2_*_bt_gfx{1100,1151,1201}.rs` |
 | Qwen3.8 fixture-bound KLD | qt=44 `ctl` WT2 0.039033 / v6 0.544517; `ctl2` WT2 0.032495; `attn` WT2 0.025437 (§ 5) |
 | gfx1010 | scalar fused decode TUs compile; batched prefill falls back as above |

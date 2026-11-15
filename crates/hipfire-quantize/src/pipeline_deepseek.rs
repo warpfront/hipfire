@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
+use crate::dequant::dequantize_hfq_q8f16;
 use crate::hfq::*;
-use crate::pipeline_gguf::dequantize_hfq_q8f16;
 use crate::quant_e8::*;
 use crate::quant_fwht::*;
 
@@ -214,8 +214,12 @@ pub(crate) fn build_deepseek4_dspark_e8soa_sidecar(
             }
             tensors.push(HfqTensor {
                 name: name.clone(),
-                quant_type: QuantType::from_u8(qt)
-                    .ok_or_else(|| format!("{name}: unknown source qt={qt}"))?,
+                quant_type: QuantType::from_u8(qt).ok_or_else(|| {
+                    match hipfire_runtime::hfq::removed_quant_type_error(u32::from(qt)) {
+                        Some(msg) => format!("{name}: {msg}"),
+                        None => format!("{name}: unknown source qt={qt}"),
+                    }
+                })?,
                 shape,
                 group_size: gs,
                 data: bytes,

@@ -720,15 +720,14 @@ struct UnitSlotState {
     forwards: u64,
 }
 
-/// The D2 tail's pool made visible to the unit stage (the tail's prefill flag; see
-/// [`crate::expert_unit_tail::EP_UNIT_TAIL_PREFILL_ENV`]).
+/// The D2 tail's pool made visible to the unit stage.
 ///
 /// At the start of every staged forward ([`Qwen4ExpertStage::slab_prime`]) the stage asks the
 /// rank's tail which owned units of each mixed layer a slot serves as of the last retirement
 /// ([`crate::expert_unit_tail_rank::UnitTailRank::live_slots`]) and plans the layer
 /// ([`unit_stage_forward_plan`]): the layer's two pointer tables name the slots of those units
 /// and the per-layer H2D copy skips their bytes. Until [`Qwen4GpuForward::link_unit_tail_stage`]
-/// runs (and always with the tail or its prefill flag off) the stage is byte-for-byte the static
+/// runs (and always with the tail off) the stage is byte-for-byte the static
 /// one: this value is not even built.
 ///
 /// # Why a named slot cannot be overwritten during the forward
@@ -1320,17 +1319,10 @@ impl Qwen4ExpertStage {
                 Ok(bytes) => bytes,
                 Err(reason) => return off(&reason),
             };
-            let admitted = crate::expert_residency::check_host_ram(
+            let admitted = crate::expert_residency::admit_stage_mirrors(
                 mirror_bytes,
-                rdna_compute::kv_slots::mem_available_bytes(),
-                crate::expert_residency::ttm_pool_estimate(),
-            )
-            .and_then(|()| {
-                crate::expert_residency::check_gtt_cap(
-                    mirror_bytes,
-                    crate::expert_residency::gtt_budget(),
-                )
-            });
+                bundle.weights.ep_later_host_bytes,
+            );
             if let Err(reason) = admitted {
                 return off(&format!("restore copies: {reason}"));
             }
@@ -2141,27 +2133,20 @@ impl Qwen4ExpertStage {
             Ok([&weights.experts_gate_up, &weights.experts_down])
         };
         // A borrowed stage's pinned restore copies of the two lent layers sit on top of the
-        // placement's pinned experts: refused here as the S2 stage refuses its own (the loader's
-        // plan-time aggregate check already counted them).
+        // placement's pinned experts: refused here as the S2 stage refuses its own. Only this
+        // rank's copies: the later ranks' are in `ep_later_host_bytes` already (the loader's
+        // `qwen4_unit_borrow_restore_bytes` per pending rank).
         if let Some(lent) = borrow {
-            let layer_bytes = (0..placement.ranks)
-                .map(|rank| plan.stage_borrow_buffer_bytes(rank).iter().sum::<u64>())
-                .max()
-                .unwrap_or(0) as usize;
-            let mirror_bytes =
-                crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, placement.ranks)
-                    .map_err(invalid)?;
-            let admitted = crate::expert_residency::check_host_ram(
+            let layer_bytes = plan
+                .stage_borrow_buffer_bytes(placement.rank)
+                .iter()
+                .sum::<u64>() as usize;
+            let mirror_bytes = crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, 1)
+                .map_err(invalid)?;
+            let admitted = crate::expert_residency::admit_stage_mirrors(
                 mirror_bytes,
-                rdna_compute::kv_slots::mem_available_bytes(),
-                crate::expert_residency::ttm_pool_estimate(),
-            )
-            .and_then(|()| {
-                crate::expert_residency::check_gtt_cap(
-                    mirror_bytes,
-                    crate::expert_residency::gtt_budget(),
-                )
-            });
+                bundle.weights.ep_later_host_bytes,
+            );
             if let Err(reason) = admitted {
                 return off(&format!(
                     "restore copies of the lent stage layers: {reason}"
@@ -2302,10 +2287,10 @@ impl Qwen4ExpertStage {
             let _ = stage.free_gpu(gpu);
             return Err(error);
         }
-        // The D2 tail's prefill visibility (its prefill flag on): keep each mixed layer's static
+        // The D2 tail's prefill visibility (the tail configured): keep each mixed layer's static
         // sources so a staged forward can name live tail slots ([`UnitSlotStage`]). Built only
         // then; every other load keeps exactly the static stage.
-        if crate::expert_unit_tail::ep_unit_tail_prefill_requested() {
+        if crate::expert_unit_tail::ep_unit_tail_configured() {
             let mut slot_layers = Vec::new();
             for (layer, regions, cpu, layout, _) in &layouts {
                 if !mixed_layers.contains(layer) {
@@ -3891,7 +3876,7 @@ mod tests {
             }
         }
 
-        /// The static tables `new_units` uploads (no slot): the flag-off result.
+        /// The static tables `new_units` uploads (no slot): the untailed result.
         fn static_tables(&self) -> [Vec<u8>; 2] {
             [&self.gate_up, &self.down].map(|entries| {
                 unit_stage_table_bufs(entries, &self.regions, &self.dst, &self.buf, self.bases)

@@ -1171,7 +1171,6 @@ pub(crate) fn source_dtype(dtype: &str) -> Result<DType, String> {
         "MFP4G32E8G128" => DType::MFP4G32E8G128,
         "MFP3G32E8" => DType::MFP3G32E8,
         "MFP2G32E8" => DType::MFP2G32E8,
-        "PAROQ4G128" => DType::ParoQ4G128,
         "FP8E4M3B128" => DType::FP8E4M3B128,
         "FP8E4M3PT" => DType::FP8E4M3PT,
         "RAW" => DType::Raw,
@@ -1249,8 +1248,6 @@ fn quant_block_bytes(dtype: DType) -> usize {
         DType::BQ1G128 => 18,
         DType::F32 => 4,
         DType::F16 | DType::BF16 => 2,
-        DType::ParoQ4G128 => 72,
-        DType::ParoQ4G64 => 40,
         DType::Raw => 1,
         // Keep this arm in sync if a new storage dtype is added. `size()` is
         // a conservative byte alignment for formats without a block codec.
@@ -1273,7 +1270,10 @@ fn expected_float_bytes(shape: &[usize], dtype: DType) -> Option<usize> {
 /// expert dimensions; every dimension before K contributes to the row count.
 /// In particular, MQ4G128V2 is `rows * ceil(K/128) * 68`, not a flat
 /// `ceil(rows*K/128)` calculation.
-fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>, String> {
+pub(crate) fn expected_payload_bytes(
+    shape: &[usize],
+    dtype: DType,
+) -> Result<Option<usize>, String> {
     if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
         return Ok(expected_float_bytes(shape, dtype));
     }
@@ -1289,6 +1289,14 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
         // `K % 128 != 0`; per-row kernels read past such a buffer. A conv1d
         // `[C, 1, W]` is packed flat.
         DType::HFQ4G128 if shape.len() == 2 => 1,
+        // Floor-stride codecs: the kernels read `K / group` groups per row and
+        // support no ragged tail, so a `[rows, K]` matrix needs K aligned.
+        // Older quantizers packed ragged-K matrices flat across rows. A conv1d
+        // `[C, 1, W]` is packed flat.
+        DType::HFQ6G256 | DType::HFQ4G256 | DType::Q4K if shape.len() == 2 => 256,
+        DType::HFQ2G128 | DType::HFQ3G128 if shape.len() == 2 => 128,
+        DType::Q4F16G64 if shape.len() == 2 => 64,
+        DType::Q8_0 if shape.len() == 2 => 32,
         // qt=55 is expert-blocked, not row-strided: `[E, R, K]` (or `[R, K]`)
         // is E blocks of `b128_block_stride(R, K)` bytes.
         DType::FP8E4M3B128 => {
@@ -1328,8 +1336,11 @@ fn expected_payload_bytes(shape: &[usize], dtype: DType) -> Result<Option<usize>
         .try_fold(1usize, |product, &dim| product.checked_mul(dim))
         .ok_or_else(|| format!("{dtype:?} payload row count overflows usize"))?;
     let row_bytes = match dtype {
-        // `DType::row_bytes` has no HFQ4G128 arm; ParoQ4G128 is its layout.
-        DType::HFQ4G128 => DType::ParoQ4G128.row_bytes(k),
+        // `DType::row_bytes` has no HFQ4G128 arm: 72 bytes per 128-wide group.
+        DType::HFQ4G128 => k.div_ceil(128).checked_mul(72),
+        DType::HFQ2G128 | DType::HFQ3G128 | DType::Q4F16G64 | DType::Q4K | DType::Q8_0 => {
+            (k / k_alignment).checked_mul(quant_block_bytes(dtype))
+        }
         _ => dtype.row_bytes(k),
     };
     row_bytes
@@ -4458,6 +4469,43 @@ mod tests {
         assert_eq!(
             expected_payload_bytes(&[64, 1, 4], DType::HFQ4G128).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn floor_stride_extent_refuses_ragged_k() {
+        // K=1000 is not a whole number of 64-, 128- or 256-element groups.
+        for dtype in [
+            DType::HFQ6G256,
+            DType::HFQ4G256,
+            DType::HFQ2G128,
+            DType::HFQ3G128,
+            DType::Q4F16G64,
+        ] {
+            assert!(
+                expected_payload_bytes(&[2560, 1000], dtype).is_err(),
+                "{dtype:?}"
+            );
+            // A flat-packed conv1d `[C, 1, 4]` has no row extent.
+            assert_eq!(expected_payload_bytes(&[64, 1, 4], dtype).unwrap(), None);
+        }
+        // The flat SmolLM2 HFQ6 gate_proj [2560, 960]: 9600 groups of 200 B.
+        assert!(validate_payload_extent(&[2560, 960], DType::HFQ6G256, 1_920_000).is_err());
+        assert_eq!(
+            expected_payload_bytes(&[960, 2560], DType::HFQ6G256).unwrap(),
+            Some(960 * 10 * 200)
+        );
+        assert_eq!(
+            expected_payload_bytes(&[960, 2560], DType::HFQ2G128).unwrap(),
+            Some(960 * 20 * 40)
+        );
+        assert_eq!(
+            expected_payload_bytes(&[960, 2560], DType::HFQ3G128).unwrap(),
+            Some(960 * 20 * 56)
+        );
+        assert_eq!(
+            expected_payload_bytes(&[960, 2560], DType::Q4F16G64).unwrap(),
+            Some(960 * 40 * 36)
         );
     }
 

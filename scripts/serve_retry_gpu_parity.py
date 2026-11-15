@@ -114,10 +114,9 @@ class DaemonSession:
             run_env.update(env)
         # Graph paths must stay enabled so the harness can prove the
         # graph-enabled route was exercised before rollback (not an
-        # always-clean graph-off run). Cask stays off for determinism.
+        # always-clean graph-off run).
         run_env["HIPFIRE_AR_GRAPH"] = "1"
         run_env["HIPFIRE_GRAPH"] = "1"
-        run_env.setdefault("HIPFIRE_CASK_OFF", "1")
 
         self.proc = subprocess.Popen(
             [str(self.binary)],

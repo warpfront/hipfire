@@ -44,8 +44,7 @@
 //! Pure attention: verify's accepted-prefix KV is already correct; the
 //! rejected tail is overwritten by the next verify. `commit_prefix` is a
 //! no-op. `kv_cache_mut` stays at its `None` default — `Qwen2State` is
-//! not a `llama::KvCache`, so arch_id=8 has no FlashCASK eviction
-//! (the daemon's eviction sites are `if let Some(ev)`-gated).
+//! not a `llama::KvCache`.
 
 use crate::dots_ocr::{DotsOcrConfig, DotsOcrWeights};
 use hipfire_arch_qwen2::qwen2;
@@ -190,5 +189,5 @@ impl SpecTarget for DotsOcrBundle {
     }
 
     // kv_cache_mut: defaulted to `None` — Qwen2State is not a
-    // `llama::KvCache`; arch_id=8 has no FlashCASK eviction.
+    // `llama::KvCache`.
 }

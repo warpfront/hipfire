@@ -402,6 +402,7 @@ pub fn build_pm(root: &Path, images: &[String], syms: &mut Symbols) -> Result<()
                         'v'
                     },
                     text: format!("{}:{}", a.name, a.value_kind),
+                    fields: Vec::new(),
                 });
             }
             let end = args.iter().map(|a| a.offset + a.size).max().unwrap_or(0);
@@ -490,6 +491,7 @@ pub fn read_gfx942_object(bytes: &[u8]) -> Result<BTreeMap<String, Gfx942Kernel>
                     'v'
                 },
                 text: format!("{}:{}", a.name, a.value_kind),
+                fields: Vec::new(),
             });
         }
         let end = args.iter().map(|a| a.offset + a.size).max().unwrap_or(0);
@@ -925,6 +927,7 @@ pub fn build_external(root: &Path, fixture: &str, syms: &mut Symbols) -> Result<
                 size,
                 kind,
                 text: format!("{aname}:{vk}"),
+                fields: Vec::new(),
             });
         }
         expect_t8_layout(symbol, &args, end, segment)?;

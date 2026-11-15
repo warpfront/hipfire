@@ -103,7 +103,7 @@ fn run_reference(path: &str, seed: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>) {
     let mut kv = make_kv(&mut gpu, &config);
     let mut dn = DeltaNetState::new_with_quant(&mut gpu, &config, StateQuant::FP32).expect("dn");
     qwen35::forward_prefill_batch(
-        &mut gpu, &weights, &config, seed, 0, &mut kv, &mut dn, &scratch, None, None, None, None,
+        &mut gpu, &weights, &config, seed, 0, &mut kv, &mut dn, &scratch, None, None, None,
     )
     .expect("reference batched prefill");
     let mut tokens = Vec::with_capacity(decode);

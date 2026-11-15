@@ -1774,7 +1774,6 @@ fn qt44_ref<'a>(t: &'a GpuTensor, m: usize, k: usize, awq: Option<&'a GpuTensor>
         m,
         k,
         row_stride: 0,
-        rotation: None,
         awq_scale: awq,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,

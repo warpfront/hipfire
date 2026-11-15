@@ -12,9 +12,15 @@
 //   O    = e^G (q S) + (q k^T e^{G_i - G_j}, j <= i) Vnew
 //   S    = e^{G_last} S + (k e^{G_last - G})^T Vnew
 // T = (I - L)^-1 is computed in F32 by forward substitution (L is strictly lower), then
-// rounded to F16 for the WMMA operand.  The other products are F16 WMMA with F32
-// accumulation (q/k are BF16 values; S, T, Vnew and the decayed operands round to F16),
-// so the route is KLD-gated; the gate is gated_delta_gate_bf16_f32_batched's expression.
+// rounded to F16.  The products against the state and the Gram matrices are F16 WMMA with F32
+// accumulation (q/k are BF16 values; S, T, Vnew and the decayed operands round to F16), so the
+// route is KLD-gated; the gate is gated_delta_gate_bf16_f32_batched's expression.  The two
+// lower-triangular products (T Dm and P Vnew, over the chunk's own rows) are F32 fma in
+// ascending row order on the F16-rounded operands, not WMMA: the WMMA sum of a row whose
+// A operand is zero past the diagonal still depends (one F32 ulp) on the B rows past it, i.e. on
+// rows that arrive later, so a partial chunk's published rows would differ from the same
+// rows of the completed chunk.  Row i's output here depends only on rows <= i, so any
+// partition of the stream into calls (gdn_wy_stream) reproduces the one-call bytes.
 // Wave w owns value columns 16w .. 16w + 15 of S as eight C-layout tiles in
 // registers; a C tile becomes a B operand by swapping half-waves.  The next
 // chunk's inputs are prefetched into registers during the current one; the
@@ -55,6 +61,33 @@ static __device__ __forceinline__ gc_h16 gc_c_to_b(const gc_f8 c, int hi) {
         out[2 * p + 1] = __builtin_amdgcn_perm(b, a, 0x07060302u);
     }
     return __builtin_bit_cast(gc_h16, out);
+}
+// Lower-triangular product R[2r + hi] = sum_{m <= 2r + hi} A[2r + hi][m] * x[m] in the C layout,
+// with x the column (this lane's) of the C-layout tile `c` rounded to F16: F32 fma, m ascending,
+// per-row accumulators (the column values are formed pair by pair by swapping half-waves).  A WMMA
+// product over the full 16-row K also sums A == 0 terms whose B operand rows lie past the row's own,
+// and the hardware sum is not neutral to them (one F32 ulp): a row's value would depend on later
+// rows, so the tile's rows could not be published before the tile is complete.  Here row i reads
+// columns m <= i only; the m = 2q + 1 term of the even row 2q is selected out, not multiplied by
+// a zero.
+static __device__ __forceinline__ gc_f8 gc_tri(const _Float16 (*A)[16], const gc_f8 c, int hi) {
+    gc_f8 R = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+        const float own = (float)(_Float16)c[q];
+        const float oth = __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(
+            __builtin_bit_cast(unsigned int, own), __builtin_bit_cast(unsigned int, own), 0x76543210u, 0xfedcba98u, false, false));
+        const float x0 = hi ? oth : own;  // row 2q
+        const float x1 = hi ? own : oth;  // row 2q + 1
+#pragma unroll
+        for (int r = q; r < 8; ++r) {
+            const gc_h2 a = *(const gc_h2*)&A[2 * r + hi][2 * q];
+            R[r] = fmaf((float)a[0], x0, R[r]);
+            if (r > q) R[r] = fmaf((float)a[1], x1, R[r]);
+            else R[r] = hi ? fmaf((float)a[1], x1, R[r]) : R[r];
+        }
+    }
+    return R;
 }
 // gfx1151: six waves per SIMD (<= 240 VGPRs: 1536-VGPR files, 24-VGPR granules) keeps three
 // 8-wave blocks per WGP, so its 20 WGPs hold all 48 value-head blocks at once; at five waves
@@ -251,11 +284,9 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
 #pragma unroll
         for (int r = 0; r < 8; ++r) Dm[r] = vb_s[2 * r + hi][dv0 + l16] - Ks[r];
         GC_BARRIER();  // T, P ready
-        gc_f8 Vn = {0, 0, 0, 0, 0, 0, 0, 0};
-        Vn = GC_WMMA(*(const gc_h16*)&t_s[l16][0], gc_c_to_b(Dm, hi), Vn);
+        const gc_f8 Vn = gc_tri(t_s, Dm, hi);
+        const gc_f8 O = gc_tri(p_s, Vn, hi);
         const gc_h16 vb = gc_c_to_b(Vn, hi);
-        gc_f8 O = {0, 0, 0, 0, 0, 0, 0, 0};
-        O = GC_WMMA(*(const gc_h16*)&p_s[l16][0], vb, O);
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int i = 2 * r + hi;

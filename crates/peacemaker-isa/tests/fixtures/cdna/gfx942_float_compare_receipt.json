@@ -1,0 +1,24 @@
+{
+  "binary_path": "/scratch/quant/fn-fp8/beat/WC8/twine/target/release/examples/cdna_compare_hw_oracle",
+  "binary_sha256": "6c54fd00ab0bc4a01c50b70c6939b84b81c042f339fa6756c4fcbe5911eae544",
+  "ledger": {
+    "class": "oracle",
+    "cmd": "bash /scratch/quant/fn-fp8/beat/WC8/twine/run-compiler-oracles.sh",
+    "end": "2026-11-13T00:52:53+00:00",
+    "exit": 0,
+    "line": 323,
+    "loadavg": "2.04 1.44 1.66",
+    "min_free_ram_pct": 97,
+    "owner": "TwinWide942e.compiler",
+    "peak_runnable": 11,
+    "run_s": 11,
+    "start": "2026-11-13T00:52:42+00:00",
+    "wait_s": 1246
+  },
+  "raw_log_sha256": "47bd3f792b01b814e0babab7cd1a283a2510a1ba08eb63a571cc8558a71ad7df",
+  "raw_oracle_sha256": "2f4464a834311580205b8902e6dbe1fd2e5d59c6fa130f1b77d2d089f5561aa3",
+  "remote_oracle": "/scratch/quant/fn-fp8/beat/WC8/twine/out/compare-r2/receipt.json",
+  "schema": "cdna_compare_hw_oracle/receipt-1",
+  "source_tip": "55e9a736fe94cdc36f9c26844ed959542dbe2099",
+  "status": "PASS"
+}

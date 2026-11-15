@@ -46,7 +46,6 @@ class Daemon:
             HIPFIRE_REPLAY_BACKEND="shadow",
             HIPFIRE_REPLAY_MANUAL_CAPTURE="1",
             HIPFIRE_KV_MODE=kv_mode,
-            HIPFIRE_CASK_OFF="1",
             HIPFIRE_AR_GRAPH="0",
             HIPFIRE_GRAPH="0",
         )
@@ -166,7 +165,12 @@ def qwen4_shadow_failures(shadow):
     if not identity.get("dispatch_equals_launches"):
         failures.append(
             f"prepared dispatches {identity.get('dispatch_count')} != "
-            f"captured launches {capture.get('launches')}"
+            f"captured body launches {capture.get('body_launches', capture.get('launches'))}"
+        )
+    if not int(capture.get("body_launches") or 0) < int(capture.get("launches") or 0):
+        failures.append(
+            f"shadow plan covers the whole window ({capture.get('body_launches')} body of "
+            f"{capture.get('launches')} launches): the LM head would replay twice"
         )
     if identity.get("queue_count") != 1 or identity.get("phase_count") != 1:
         failures.append(f"prepared route is not single-queue/single-phase: {identity!r}")
@@ -257,7 +261,7 @@ def dflash_shadow_failures(shadow):
     if not identity.get("dispatch_equals_launches"):
         failures.append(
             f"prepared dispatches {identity.get('dispatch_count')} != "
-            f"captured launches {capture.get('launches')}"
+            f"captured body launches {capture.get('body_launches', capture.get('launches'))}"
         )
     if identity.get("queue_count") != 1 or identity.get("phase_count") != 1:
         failures.append(
@@ -662,10 +666,8 @@ def main():
         choices=("q8", "fp32", "q4"),
         help=(
             "DeltaNet state precision for the run. Omit to validate the production "
-            "default: Q8 with default-on deterministic error feedback (q8_ef). "
-            "Pass fp32 only when explicitly testing the FP32 state route. If "
-            "HIPFIRE_DN_STATE_EF=0 selects legacy stochastic Q8, byte parity is "
-            "meaningless; re-enable EF or use fp32 plus HIPFIRE_DETERMINISTIC=1."
+            "default: Q8 with deterministic error feedback (q8_ef). "
+            "Pass fp32 only when explicitly testing the FP32 state route."
         ),
     )
     parser.add_argument(

@@ -7,8 +7,8 @@
 //! Model: `$HIPFIRE_NPU_TRUNK_TEST_MODEL`, default `/home/kaden/qcal/models/qwen3.8-flash-next-gptq3.mq4`.
 //!
 //! Model pin: `qwen3.8-flash-next-gptq3.mq4`, md5 `be007fc3219e9f6cdb1d4dfa8380625f` (recorded in
-//! `docs/npu/coop-flashnext.md:135`, observed on `/home/kaden/pm-wave/fngptq/models/...`; AGENTS.md:703 calls
-//! the old filename a byte-identical alias). The 125 GB file is NOT hashed here (a full digest per test run is
+//! `docs/npu/coop-flashnext.md:135`, observed on `/home/kaden/pm-wave/fngptq/models/...`; fixtures/pins.toml
+//! pin:model/qwen3.8-flash-next.mq4-xts lists the old filename as an alias). The 125 GB file is NOT hashed here (a full digest per test run is
 //! not feasible); the test checks the exact file size of the default path and the HFQM index extent, prints the
 //! path, and asserts the raw quant type of each tensor is MQ6G256V2 (qt 47).
 //!

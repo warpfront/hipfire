@@ -1,6 +1,6 @@
 ---
 name: astrea
-description: Use for hipfire quant calibration, imatrix-driven experiments, KLD/PPL quality evaluation, k-map/format selection, MQ/HFQ/HFP/MFP tradeoff work, ParoQuant-style weight transform planning, and KV policy planning. Use when deciding whether a calibrated model candidate should be promoted, rejected, packaged, or sent through Atlas for AR/DFlash perf validation.
+description: Use for hipfire quant calibration, imatrix-driven experiments, KLD/PPL quality evaluation, k-map/format selection, MQ/HFQ/HFP/MFP tradeoff work, and KV policy planning. Use when deciding whether a calibrated model candidate should be promoted, rejected, packaged, or sent through Atlas for AR/DFlash perf validation.
 ---
 
 # Astrea
@@ -14,11 +14,10 @@ routes live in canonical owners — link them; do not copy inventories here.
 
 ## Reach for this when
 
-- Calibrating or comparing weight formats (MQ / HFQ / HFP / MFP / Q8 / F16 / Paro)
+- Calibrating or comparing weight formats (MQ / HFQ / HFP / MFP / Q8 / F16)
 - Joining GGUF imatrix coverage to HFQ tensor names
 - Building mixed-format promotion policies under a size budget
 - Planning KV-cache policy profiles for Atlas join
-- Importing/oracling ParoQuant (`PARO4G128`) checkpoints
 - Deciding promote / reject / iterate from measured KLD/PPL + runtime evidence
 
 ## Canonical owners (read these; do not fork)
@@ -45,7 +44,7 @@ Executable truth for CLI flags: `python3 scripts/astrea.py <cmd> --help`.
    path is DFlash-relevant, DFlash rows — via the Atlas skill/methodology.
 3. **`bundle-plan` is a package contract artifact, not a model writer.** Do
    not claim Astrea packaged a loadable model unless a real writer path ran
-   (`promote`, `calibrate --write-candidate`, or `paro-import`).
+   (`promote`, or `calibrate --write-candidate`).
 4. **Do not invent gates.** Pick routes from `docs/VALIDATION.md`. There is
    no universal GPU/coherence replacement gate. Retired
    `scripts/coherence-gate-*.sh` batteries are historical reproduction only.
@@ -79,15 +78,10 @@ python3 scripts/astrea.py policy --model MODEL --base-format FMT --promotion-for
   [--method METHOD] [--objective OBJ] [--domain weights|kv] [--model-family FAMILY]
 python3 scripts/astrea.py promote --policy POLICY.json --source-dir BF16_DIR --output CANDIDATE.hfq \
   [--max-tensors N] [--tensor-filter NAME]
-python3 scripts/astrea.py kv-profile --model MODEL [--mode MODE] [--triattn PATH] \
+python3 scripts/astrea.py kv-profile --model MODEL [--mode MODE] \
   [--model-family FAMILY] [--engine-root REPO]
 python3 scripts/astrea.py bundle-plan --model MODEL --output MODEL.hfq \
-  [--include weights|paro|kv-policy|triattn|evidence] [--triattn PATH] [--policy-id ID]
-python3 scripts/astrea.py paro-probe --model MODEL [--local-only] [--max-modules N]
-python3 scripts/astrea.py paro-import --model MODEL --output OUT.hfq \
-  [--layout native|engine] [--copy-floats f16|q8] [--local-only]
-python3 scripts/astrea.py paro-oracle --source PARO_SAFE_DIR --hfq MODEL.hfq \
-  [--module MODULE] [--samples N] [--atol TOL]
+  [--include weights|kv-policy|evidence] [--policy-id ID]
 python3 scripts/astrea.py report ARTIFACT.json ...
 ```
 
@@ -128,18 +122,15 @@ script or `--help` rather than trusting a skill-local table.
    embedded KV policy. Include a live baseline mode and each candidate mode
    under investigation. Output is a policy/evidence shape for Atlas join, not
    proof that kernels/loader implement the mode.
-9. **Paro lane** — `paro-probe` → `paro-import` (writes loadable `PARO4G128`)
-   → `paro-oracle` against the PyTorch source before quality or perf claims.
-   See `docs/QUANTIZATION.md` Paro payload contract.
-10. **`bundle-plan`** — future single-file package shape (weights, paro, kv-policy,
-    triattn, evidence). Deferred loader/daemon work stays deferred until source
+9. **`bundle-plan`** — future single-file package shape (weights, kv-policy,
+    evidence). Deferred loader/daemon work stays deferred until source
     implements it.
-11. **Atlas perf** — if quality improves and the candidate touches runtime
+10. **Atlas perf** — if quality improves and the candidate touches runtime
     formats on AR and/or DFlash paths, collect phase-aware rows per
     `.agents/skills/hipfire-kernel-atlas/` and
     `docs/methodology/kernel-atlas.md`. Follow
     `docs/methodology/perf-benchmarking.md` for fresh-process / noise rules.
-12. **`report`** — summarize artifacts; recommend promote, reject, or iterate.
+11. **`report`** — summarize artifacts; recommend promote, reject, or iterate.
     Promotion into product defaults still requires an admissions row when that
     registry defines one — currently fail closed on empty records.
 
@@ -148,9 +139,6 @@ script or `--help` rather than trusting a skill-local table.
 - Start high-signal paths (e.g. `mfp4` + `imatrix-scale`, or MQ4 activation-aware
   recipes) and **compare stacks empirically** — do not treat a single past run
   as a permanent win.
-- ParoQuant remains a first-class transform lane: probe/import/oracle are
-  executable; fused runtime inverse + matvec still need producer-consumer proof
-  before ship language.
 - MoE policies must separate router, expert, and shared dense tensors; expert
   promotion needs hit-distribution + quality deltas, not name lists alone.
 - KV: product defaults and mode math live in `docs/QUANTIZATION.md` /

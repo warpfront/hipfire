@@ -1,0 +1,281 @@
+{
+  "schema": "promotion-lane-policy-v1",
+  "classes": {
+    "gfx1100": {
+      "gate": "candidate",
+      "budget_minutes": 15,
+      "required": [
+        "dense-27b-ar",
+        "dflash-think-close",
+        "cold-archive-9b",
+        "cold-archive-27b",
+        "cold-archive-a3b"
+      ]
+    },
+    "gfx1201": {
+      "gate": "candidate",
+      "budget_minutes": 15,
+      "required": [
+        "dense-27b-ar",
+        "dflash-think-close",
+        "cold-archive-9b",
+        "cold-archive-27b",
+        "cold-archive-a3b",
+        "cold-archive-flashnext"
+      ]
+    },
+    "gfx942": {
+      "gate": "secondary",
+      "budget_minutes": 60,
+      "required": [
+        "dense-27b-ar",
+        "dflash-think-close",
+        "cold-archive-9b",
+        "cold-archive-27b",
+        "cold-archive-a3b"
+      ]
+    }
+  },
+  "transitions_required": [
+    "forced-advance",
+    "append",
+    "rollback"
+  ],
+  "waiver_grantors": [
+    "Kaden",
+    "fivetide"
+  ],
+  "waiver_max_days": 7,
+  "gate_policy_approvers": [
+    "Kaden",
+    "fivetide"
+  ],
+  "gate_policy_paths": [
+    "scripts/promotion-lane/**",
+    "scripts/device_mesh_matrix.py",
+    "scripts/device-mesh/**",
+    "scripts/hw-gate/**",
+    "scripts/check-attribution.py",
+    "scripts/ci-gates.sh",
+    "scripts/layering.txt",
+    "scripts/check-layering.py",
+    "scripts/ratchet-diff.sh",
+    "scripts/leanup-ratchets.sh",
+    ".github/workflows/**",
+    "crates/rdna-compute/tests/kernel_registry_coverage.rs"
+  ],
+  "perf": {
+    "measure": {
+      "bench_args": [
+        "--backend",
+        "noslots",
+        "--workload",
+        "stateless",
+        "--json"
+      ],
+      "proc_timeout_s": 600,
+      "max_pressure": {
+        "cpu": 0.1,
+        "memory": 0.005
+      },
+      "pressure_retries": 2,
+      "pressure_wait_s": 60
+    },
+    "judge": {
+      "procs_per_arm": 3,
+      "bootstrap_draws": 4000,
+      "bootstrap_seed": 20261115,
+      "ci": 0.95,
+      "floor": 0.02,
+      "aa_multiplier": 3,
+      "baseline_max_age_days": 7
+    },
+    "fixtures": {
+      "qwen3.8-27b.mq4-xts": {
+        "size_bytes": 14987185152,
+        "sha256": "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae"
+      },
+      "qwen38-27b-dflash-mq4.hfq": {
+        "size_bytes": 1209603072,
+        "sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc"
+      },
+      "qwen3.6-35b-a3b-d53.mq4rs": {
+        "size_bytes": 18700570368,
+        "sha256": "8806a742d558ebe43256010096cd82cfac3a20be5218ad56a3f74267db001894"
+      },
+      "qwen3.8-flash-next-gptq3.mq4": {
+        "size_bytes": 125288544792,
+        "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972"
+      }
+    },
+    "prompts": {
+      "code-134": {
+        "file": "scripts/promotion-lane/perf-prompts/code-134.txt",
+        "sha256": "00b2e074e127a6a9d1376278bef732933760ab706057ec755a8c2642217b557a"
+      },
+      "long-5900": {
+        "file": "scripts/promotion-lane/perf-prompts/long-5900.txt",
+        "sha256": "0884736d8905a9e1506c5981c0dd5760d295c680ea7998f0212cf5e97206f28f"
+      }
+    },
+    "procs": {
+      "27b-ar-code": {
+        "model": "qwen3.8:27b-mq4-xts",
+        "files": [
+          "qwen3.8-27b.mq4-xts"
+        ],
+        "spec": "off",
+        "prompt": "code-134",
+        "max_tokens": 128,
+        "runs": 6,
+        "discard": 2
+      },
+      "27b-dflash-code": {
+        "model": "qwen3.8:27b-mq4-xts",
+        "files": [
+          "qwen3.8-27b.mq4-xts",
+          "qwen38-27b-dflash-mq4.hfq"
+        ],
+        "spec": "dflash",
+        "prompt": "code-134",
+        "max_tokens": 128,
+        "runs": 6,
+        "discard": 2
+      },
+      "27b-ar-long": {
+        "model": "qwen3.8:27b-mq4-xts",
+        "files": [
+          "qwen3.8-27b.mq4-xts"
+        ],
+        "spec": "off",
+        "prompt": "long-5900",
+        "max_tokens": 16,
+        "runs": 5,
+        "discard": 2
+      },
+      "a3b-mq4rs-code": {
+        "model": "qwen3.6:35b-a3b-mq4rs",
+        "files": [
+          "qwen3.6-35b-a3b-d53.mq4rs"
+        ],
+        "spec": "off",
+        "prompt": "code-134",
+        "max_tokens": 128,
+        "runs": 6,
+        "discard": 2
+      },
+      "flashnext-code": {
+        "model_file": "qwen3.8-flash-next-gptq3.mq4",
+        "files": [
+          "qwen3.8-flash-next-gptq3.mq4"
+        ],
+        "spec": "default",
+        "prompt": "code-134",
+        "max_tokens": 128,
+        "runs": 6,
+        "discard": 2,
+        "max_pressure": {
+          "memory": 0.03
+        }
+      }
+    },
+    "rows": {
+      "perf-27b-ar-decode": {
+        "proc": "27b-ar-code",
+        "metric": "decode_tok_s"
+      },
+      "perf-27b-dflash-decode": {
+        "proc": "27b-dflash-code",
+        "metric": "decode_tok_s"
+      },
+      "perf-27b-ttft-134": {
+        "proc": "27b-ar-code",
+        "metric": "ttft_ms"
+      },
+      "perf-27b-ttft-5900": {
+        "proc": "27b-ar-long",
+        "metric": "ttft_ms"
+      },
+      "perf-27b-cold": {
+        "proc": "27b-ar-code",
+        "metric": "cold_wall_tok_s"
+      },
+      "perf-a3b-mq4rs-decode": {
+        "proc": "a3b-mq4rs-code",
+        "metric": "decode_tok_s"
+      },
+      "perf-a3b-mq4rs-cold": {
+        "proc": "a3b-mq4rs-code",
+        "metric": "cold_wall_tok_s"
+      },
+      "perf-flashnext-decode": {
+        "proc": "flashnext-code",
+        "metric": "decode_tok_s"
+      }
+    },
+    "classes": {
+      "gfx1100": {
+        "calibration": "A/A 2026-11-15 hipx xtx: 2 pair jobs of beta 93e625af99 (lane/PERF-ROWS.md)",
+        "rows": {
+          "perf-27b-ar-decode": {
+            "aa_half_width": 0.00593,
+            "aa_trials": 3
+          },
+          "perf-27b-dflash-decode": {
+            "aa_half_width": 0.00111,
+            "aa_trials": 3
+          },
+          "perf-27b-ttft-134": {
+            "aa_half_width": 0.00654,
+            "aa_trials": 3
+          },
+          "perf-27b-ttft-5900": {
+            "aa_half_width": 0.00376,
+            "aa_trials": 3
+          },
+          "perf-27b-cold": {
+            "aa_half_width": 0.0287,
+            "aa_trials": 3
+          }
+        }
+      },
+      "gfx1201": {
+        "calibration": "A/A 2026-11-15 hiptrx B: 2 pair jobs of beta 93e625af99, second PSI-gated (lane/PERF-ROWS.md)",
+        "rows": {
+          "perf-27b-ar-decode": {
+            "aa_half_width": 0.00607,
+            "aa_trials": 3
+          },
+          "perf-27b-dflash-decode": {
+            "aa_half_width": 0.00797,
+            "aa_trials": 3
+          },
+          "perf-27b-ttft-134": {
+            "aa_half_width": 0.00572,
+            "aa_trials": 3
+          },
+          "perf-27b-ttft-5900": {
+            "aa_half_width": 0.01431,
+            "aa_trials": 3
+          },
+          "perf-27b-cold": {
+            "aa_half_width": 0.00496,
+            "aa_trials": 3
+          },
+          "perf-a3b-mq4rs-decode": {
+            "aa_half_width": 0.00613,
+            "aa_trials": 3
+          },
+          "perf-a3b-mq4rs-cold": {
+            "aa_half_width": 0.02612,
+            "aa_trials": 3
+          },
+          "perf-flashnext-decode": {
+            "aa_half_width": 0.00786,
+            "aa_trials": 3
+          }
+        }
+      }
+    }
+  }
+}

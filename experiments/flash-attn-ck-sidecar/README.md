@@ -20,32 +20,31 @@ Current scope:
 - MHA, MQA, and GQA;
 - dense FP16 head dimension 64;
 - gfx1100 F32-Q/Q8-K/Q8-V causal GQA at head dimension 256;
-- gfx1100 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
-- gfx1201 F32-Q/Asym3-Givens-K/Q8-V causal GQA at head dimension 256;
 - gfx1100/gfx1201 F32-Q/Asym3-FWHT-K/Q8-V causal GQA at head dimension 256;
-- gfx1100/gfx1201 F32-Q/Asym4-Givens-K/Q8-V causal GQA at head dimension 256;
 - gfx1100/gfx1201 F32-Q/Asym4-FWHT-K/Q8-V causal GQA at head dimension 256;
 - raw HIP stream and element-stride inputs.
 
 The Q8 cell vector-decodes both packed caches into F16, invokes the CK D256
-pipeline, and converts output back to F32. The Asym3 cells additionally apply
-the selected Givens or FWHT query transform before the same CK pipeline.
+pipeline, and converts output back to F32. The Asym3 cell additionally applies
+the FWHT query transform before the same CK pipeline.
 
-ABI v4 gives Givens and FWHT K caches distinct format IDs; Q8 V remains a
+ABI v4 gives the FWHT K caches their own format IDs; Q8 V remains a
 separate format, and callers provide explicit K/V row and head byte strides
-plus both transform tables. The D256 Givens and FWHT cells transform Q and
+plus both transform tables. The D256 FWHT cells transform Q and
 decode packed K and Q8 V into caller-owned F16 staging before invoking CK.
 D512 remains `recognized-no-cell`: its layout is validated but no capability
 is published. This keeps each unimplemented packed loader fail-closed.
-Asym4-Givens and Asym4-FWHT also have independent format IDs and packed-loader
-contracts. D256 K uses `4 + D/2` bytes per head, Q8 V uses `(D/32) * 34`,
-Givens requires `D/2` transform elements, and FWHT4+Q8-V requires 128. Both
-loaders stage through the same caller-owned dense workspace before CK.
+Asym4-FWHT has its own format ID and packed-loader contract. D256 K uses
+`4 + D/2` bytes per head, Q8 V uses `(D/32) * 34`, and FWHT4+Q8-V requires
+128 transform elements. Both loaders stage through the same caller-owned dense workspace before CK.
 Packed staging currently requires contiguous `[row, head, dim]` Q and output;
 the ABI validator rejects non-contiguous element strides rather than ignoring them.
 The Rust loader accepts ABI v3 sidecars for their original dense/Q8 cells by
 passing the unchanged v3 struct prefix; v3 quantized format IDs 4+ are rejected
 because their old generic meaning is not the explicit v4 Asym3 contract.
+Format IDs 4 (Asym3-Givens), 6 (Lloyd) and 7 (Asym4-Givens) are retired with
+the 0.5.0 Givens KV removal: this sidecar no longer publishes them, and the
+Rust loader still accepts older v4 sidecars that do but never requests them.
 
 ## Build
 
@@ -103,7 +102,7 @@ HIP_VISIBLE_DEVICES=0 \
 ```
 
 The pure-HIP smoke runs dense FP16 MHA/MQA/GQA, packed Q8 D256 GQA,
-and Asym3-Givens/FWHT D256 GQA cases against CPU references. Quantized references
+and Asym3/Asym4-FWHT D256 GQA cases against CPU references. Quantized references
 use reconstructed values, so they check packed loading and attention
 independently of quantization error.
 
@@ -116,9 +115,7 @@ Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
 | FP16 MHA D64, non-causal, default stream | `4.062802e-05` | `6.646507e-06` |
 | FP16 MQA D64, non-causal, default stream | `4.367530e-05` | `6.348691e-06` |
 | F32/Q8/Q8 GQA D256, causal | `4.766881e-05` | `7.248458e-06` |
-| F32/Asym3-Givens/Q8 GQA D256, causal | `6.110966e-05` | `1.009769e-05` |
 | F32/Asym3-FWHT/Q8 GQA D256, causal | `7.408857e-05` | `1.015317e-05` |
-| F32/Asym4-Givens/Q8 GQA D256, causal | `5.862117e-05` | `1.000180e-05` |
 | F32/Asym4-FWHT/Q8 GQA D256, causal | `6.847084e-05` | `1.012444e-05` |
 
 ## Optional Rust loader

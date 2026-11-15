@@ -1,0 +1,252 @@
+{
+  "baseline_compiler": "00818bfb54",
+  "deferred_index_mode": [
+    "s_set_gpr_idx_on",
+    "s_set_gpr_idx_off"
+  ],
+  "images": [
+    {
+      "image": "kernels/qwen4_g942_qsa_row_attention_hipcc_gfx942.co",
+      "instructions": 3376,
+      "native_elf_sha256": "1caa4bd326be42faeab2f09fc43ff7a5b46a63e3a29cbe0f552bd44a88443b0a",
+      "unmodelled_instances": []
+    },
+    {
+      "image": "kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co",
+      "instructions": 4692,
+      "native_elf_sha256": "270be116b70b220a899b84578fd0b5c14d26ec6aa5bf32482767f93083b83f07",
+      "unmodelled_instances": [
+        {
+          "address": "000000003738",
+          "assembly": "s_set_gpr_idx_on s38, gpr_idx(SRC0)",
+          "baseline_refusal": "generated instruction s_set_gpr_idx_on (ENC_SOPC opcode 17, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_hyper_norm_bf16x",
+          "words": [
+            3205562662
+          ]
+        },
+        {
+          "address": "000000003740",
+          "assembly": "s_set_gpr_idx_off",
+          "baseline_refusal": "generated instruction s_set_gpr_idx_off (ENC_SOPP opcode 28, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_hyper_norm_bf16x",
+          "words": [
+            3214671872
+          ]
+        },
+        {
+          "address": "00000000379C",
+          "assembly": "s_set_gpr_idx_on s38, gpr_idx(SRC0)",
+          "baseline_refusal": "generated instruction s_set_gpr_idx_on (ENC_SOPC opcode 17, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_hyper_norm_bf16x",
+          "words": [
+            3205562662
+          ]
+        },
+        {
+          "address": "0000000037A4",
+          "assembly": "s_set_gpr_idx_off",
+          "baseline_refusal": "generated instruction s_set_gpr_idx_off (ENC_SOPP opcode 28, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_hyper_norm_bf16x",
+          "words": [
+            3214671872
+          ]
+        },
+        {
+          "address": "000000004D34",
+          "assembly": "s_set_gpr_idx_on s28, gpr_idx(SRC0)",
+          "baseline_refusal": "generated instruction s_set_gpr_idx_on (ENC_SOPC opcode 17, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_hyper_norm_bf16x",
+          "words": [
+            3205562652
+          ]
+        },
+        {
+          "address": "000000004D3C",
+          "assembly": "s_set_gpr_idx_off",
+          "baseline_refusal": "generated instruction s_set_gpr_idx_off (ENC_SOPP opcode 28, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_hyper_norm_bf16x",
+          "words": [
+            3214671872
+          ]
+        },
+        {
+          "address": "000000004D98",
+          "assembly": "s_set_gpr_idx_on s28, gpr_idx(SRC0)",
+          "baseline_refusal": "generated instruction s_set_gpr_idx_on (ENC_SOPC opcode 17, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_hyper_norm_bf16x",
+          "words": [
+            3205562652
+          ]
+        },
+        {
+          "address": "000000004DA0",
+          "assembly": "s_set_gpr_idx_off",
+          "baseline_refusal": "generated instruction s_set_gpr_idx_off (ENC_SOPP opcode 28, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_conv_fuse_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_hyper_norm_bf16x",
+          "words": [
+            3214671872
+          ]
+        }
+      ]
+    },
+    {
+      "image": "kernels/qwen4_g942_rows16_grid_hipcc_gfx942.co",
+      "instructions": 6748,
+      "native_elf_sha256": "694829847c2d50f0b74198ce5437cb2e31cca3eed261ed979d4c9c75ab2627d4",
+      "unmodelled_instances": []
+    },
+    {
+      "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+      "instructions": 4385,
+      "native_elf_sha256": "ffcd2dc8ac4c35eb5bb42a2b0e36259d12f142db897e62e9e8af06377662cf51",
+      "unmodelled_instances": [
+        {
+          "address": "0000000030DC",
+          "assembly": "v_cmp_nlg_f32_e64 s[0:1], |v10|, s15",
+          "baseline_refusal": "generated instruction v_cmp_nlg_f32 (ENC_VOP3 opcode 74, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_router",
+          "words": [
+            3494510848,
+            7946
+          ]
+        },
+        {
+          "address": "0000000030E4",
+          "assembly": "v_cmp_nlg_f32_e64 s[4:5], |v11|, s15",
+          "baseline_refusal": "generated instruction v_cmp_nlg_f32 (ENC_VOP3 opcode 74, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_router",
+          "words": [
+            3494510852,
+            7947
+          ]
+        },
+        {
+          "address": "0000000030FC",
+          "assembly": "v_cmp_nlg_f32_e64 s[12:13], |v8|, s15",
+          "baseline_refusal": "generated instruction v_cmp_nlg_f32 (ENC_VOP3 opcode 74, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_router",
+          "words": [
+            3494510860,
+            7944
+          ]
+        },
+        {
+          "address": "000000003118",
+          "assembly": "v_cmp_nlg_f32_e64 s[16:17], |v9|, s15",
+          "baseline_refusal": "generated instruction v_cmp_nlg_f32 (ENC_VOP3 opcode 74, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_router",
+          "words": [
+            3494510864,
+            7945
+          ]
+        },
+        {
+          "address": "000000003134",
+          "assembly": "v_cmp_nlg_f32_e64 s[18:19], |v6|, s15",
+          "baseline_refusal": "generated instruction v_cmp_nlg_f32 (ENC_VOP3 opcode 74, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_router",
+          "words": [
+            3494510866,
+            7942
+          ]
+        },
+        {
+          "address": "000000003144",
+          "assembly": "v_cmp_nlg_f32_e64 s[20:21], |v7|, s15",
+          "baseline_refusal": "generated instruction v_cmp_nlg_f32 (ENC_VOP3 opcode 74, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_router",
+          "words": [
+            3494510868,
+            7943
+          ]
+        },
+        {
+          "address": "000000003150",
+          "assembly": "v_cmp_nlg_f32_e64 s[22:23], |v4|, s15",
+          "baseline_refusal": "generated instruction v_cmp_nlg_f32 (ENC_VOP3 opcode 74, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_router",
+          "words": [
+            3494510870,
+            7940
+          ]
+        },
+        {
+          "address": "00000000315C",
+          "assembly": "v_cmp_nlg_f32_e64 s[24:25], |v5|, s15",
+          "baseline_refusal": "generated instruction v_cmp_nlg_f32 (ENC_VOP3 opcode 74, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_router",
+          "words": [
+            3494510872,
+            7941
+          ]
+        },
+        {
+          "address": "00000000323C",
+          "assembly": "v_cmp_ge_u64_e32 vcc, v[16:17], v[12:13]",
+          "baseline_refusal": "generated instruction v_cmp_ge_u64 (ENC_VOPC opcode 238, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_router",
+          "words": [
+            2111576336
+          ]
+        },
+        {
+          "address": "0000000042E0",
+          "assembly": "v_cmp_ge_u64_e32 vcc, v[2:3], v[0:1]",
+          "baseline_refusal": "generated instruction v_cmp_ge_u64 (ENC_VOPC opcode 238, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_router",
+          "words": [
+            2111570178
+          ]
+        },
+        {
+          "address": "000000004858",
+          "assembly": "v_cmp_ge_u64_e32 vcc, v[4:5], v[2:3]",
+          "baseline_refusal": "generated instruction v_cmp_ge_u64 (ENC_VOPC opcode 238, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_router",
+          "words": [
+            2111571204
+          ]
+        },
+        {
+          "address": "000000004BFC",
+          "assembly": "ds_or_b32 v2, v3",
+          "baseline_refusal": "generated instruction ds_or_b32 (ENC_DS opcode 10, gfx942) has no hand-written model",
+          "image": "kernels/qwen4_g942_moe_wide_hipcc_gfx942.co",
+          "symbol": "qwen4_g942_moe_wide_group_scatter_desc",
+          "words": [
+            3625189376,
+            770
+          ]
+        }
+      ]
+    },
+    {
+      "image": "kernels/qwen4_g942_moe_gemm_hipcc_gfx942.co",
+      "instructions": 1737,
+      "native_elf_sha256": "116e454a721b9264a3331e5bb7e3a220517826c8c295b00827872b2c1a0dc1b2",
+      "unmodelled_instances": []
+    }
+  ],
+  "method": "Every llvm-objdump-18 gfx942 instruction word decoded by the compiled baseline Inst::decode; all Xml/unsupported and unverified rows recorded, not only first refusals. Padding included.",
+  "source_tip": "8231c29205"
+}

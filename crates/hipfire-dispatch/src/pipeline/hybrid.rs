@@ -22,7 +22,7 @@ use crate::families::attention::{AttentionFamily, AttnParams};
 use crate::families::gemv::WeightRef;
 use crate::families::kv_tier::{KvTierInputs, KvTierPlan};
 use crate::pipeline::steps::{execute_steps, GemvInput, Step};
-use crate::types::{dtype_rotation_plan, DispatchError, KernelKey, RotationPlan};
+use crate::types::{dtype_rotation_plan, DispatchError, KernelKey};
 use hip_bridge::DeviceBuffer;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::LazyLock;
@@ -180,13 +180,9 @@ fn gdn_compact2(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
 /// measured +0.45%, while profiling confirmed 853 -> 805 dispatches/token and
 /// a net 64.35 us/token reduction in GPU compute. Exact gfx1201 runs the same
 /// `gated_delta_net_q8_compact3_b2` object for the same shape (its state,
-/// output and EF bytes equal the materialized repeat-interleave route). Set
-/// `HIPFIRE_GDN_COMPACT3=0` to restore explicit Q/K materialization.
+/// output and EF bytes equal the materialized repeat-interleave route).
 fn gdn_compact3(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| developer_var("HIPFIRE_GDN_COMPACT3").as_deref() != Some("0"));
-    *ENABLED
-        && (gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions(gpu))
+    (gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions(gpu))
         && q8_state
         && dims.linear_key_heads * 3 == dims.linear_value_heads
         && dims.is_dense_27b_shape()
@@ -210,10 +206,7 @@ pub fn gdn_compact_qk_div(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> Optio
 /// A3B route remains isolated from the 48-head Qwen3.6-27B route (gfx1100 and
 /// exact gfx1201, each with its own k6144 entry symbol); on gfx1100 the latter
 /// measured +0.45% over a 512-token A/B/B/A and removes 48 dispatches/token.
-/// Set `HIPFIRE_GATED_NORM_MQ_ROTATE=0` to restore both explicit operations.
 pub fn gated_norm_mq_rotate(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>) -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| developer_var("HIPFIRE_GATED_NORM_MQ_ROTATE").as_deref() != Some("0"));
     let n_v_heads = dims.linear_value_heads;
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
         || gfx1151_radiowave(gpu)
@@ -226,8 +219,7 @@ pub fn gated_norm_mq_rotate(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>) ->
         || (gfx1101_campaign(gpu) && dims.dim == 2_560 && n_v_heads == 32)
         || ((gpu.arch_caps.is_gfx1100() || gfx1201_state_fusions(gpu))
             && dims.is_dense_27b_shape());
-    *ENABLED
-        && admitted_arch_shape
+    admitted_arch_shape
         && dims.linear_value_dim == 128
         && wo.k == n_v_heads * dims.linear_value_dim
         && is_mq4(wo.dtype)
@@ -261,12 +253,9 @@ fn kv_write_fold_route_supported(plan: &KvTierPlan) -> bool {
 /// partial half-split RoPE into one head-local launch on the certified gfx1100
 /// shapes (and their exact-gfx1201 twins). The Qwen3.6-27B q24k4 route
 /// measured +0.64% over a 512-token A/B/B/A on gfx1100 and reduced 757 -> 709
-/// dispatches/token. Set `HIPFIRE_QWEN35_FA_PREP_FUSE=0` to retain the legacy
-/// path. The legacy interleaved-RoPE compatibility mode and diagnostic tap
-/// retain the established multi-dispatch path.
+/// dispatches/token. Other shapes, the legacy interleaved-RoPE compatibility
+/// mode and the diagnostic tap retain the established multi-dispatch path.
 pub fn fused_attention_prep(gpu: &Gpu, dims: &HybridDims) -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| developer_var("HIPFIRE_QWEN35_FA_PREP_FUSE").as_deref() != Some("0"));
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100() || gfx1151_radiowave(gpu))
         && dims.n_heads == 16
         && dims.n_kv_heads == 2)
@@ -277,8 +266,7 @@ pub fn fused_attention_prep(gpu: &Gpu, dims: &HybridDims) -> bool {
             && dims.is_dense_27b_shape()
             && dims.n_heads == 24
             && dims.n_kv_heads == 4);
-    *ENABLED
-        && admitted_arch_shape
+    admitted_arch_shape
         && !gpu.flags.rope_interleaved_legacy
         && dims.head_dim == 256
         && dims.n_rot == 64
@@ -288,10 +276,7 @@ pub fn fused_attention_prep(gpu: &Gpu, dims: &HybridDims) -> bool {
 /// epilogue on certified gfx1100/MQ4 shapes. Extending the existing Q8 reducer
 /// to Qwen3.6-27B's asym3 route measured +0.37% over a 512-token A/B/B/A and
 /// reduced 709 -> 677 dispatches/token; a 1025-token replay remained exact.
-/// Set `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE=0` to retain the legacy path.
 pub fn fused_attention_epilogue(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>) -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| developer_var("HIPFIRE_QWEN35_FA_EPILOGUE_FUSE").as_deref() != Some("0"));
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100() || gfx1151_radiowave(gpu))
         && dims.n_heads == 16
         && dims.n_kv_heads == 2)
@@ -302,20 +287,15 @@ pub fn fused_attention_epilogue(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>
             && dims.is_dense_27b_shape()
             && dims.n_heads == 24
             && dims.n_kv_heads == 4);
-    *ENABLED && admitted_arch_shape && dims.head_dim == 256 && is_mq4(wo.dtype)
+    admitted_arch_shape && dims.head_dim == 256 && is_mq4(wo.dtype)
 }
 
 /// fp8: admitted only for the flash-tile attend key whose [2+head_dim] f32
 /// partials the shared q8 gated reducer consumes unmodified (StageB S6). The
 /// scalar fp8 reader writes final output directly and has no fused path, so
 /// it must never set output_gate.
-fn attention_epilogue_route_supported(
-    is_gfx1201: bool,
-    q8_route: bool,
-    asym3_route: bool,
-    fp8_route: bool,
-) -> bool {
-    q8_route || fp8_route || (!is_gfx1201 && asym3_route)
+fn attention_epilogue_route_supported(q8_route: bool, fp8_route: bool) -> bool {
+    q8_route || fp8_route
 }
 
 /// Pure core of [`conv_scalar_prep`]: the arch, env `mode` and shape decision.
@@ -408,8 +388,7 @@ pub fn conv_qknorm(gpu: &Gpu, dims: &HybridDims, q8_state: bool) -> bool {
 /// RMS norm (plus the input basis the first weight needs) followed by one
 /// projection per `(weight, output)` pair sharing that normalized input. The
 /// fusion table rewrites the projections into fused qkv/qkvza/gate-up kernels.
-/// Givens (ParoQuant) weights take a plain norm and rotate per GEMV; every
-/// other format rotates once in the norm and the GEMVs read it prerotated.
+/// Every format rotates once in the norm and the GEMVs read it prerotated.
 #[allow(clippy::too_many_arguments)]
 pub fn normed_projection<const N: usize>(
     gpu: &mut Gpu,
@@ -446,7 +425,6 @@ pub fn normed_projection<const N: usize>(
             } else {
                 let plain_w = WeightRef {
                     row_stride: 0,
-                    rotation: None,
                     awq_scale: None,
                     ..*w
                 };
@@ -464,19 +442,13 @@ pub fn normed_projection<const N: usize>(
         return Ok(());
     }
     let rotation = dtype_rotation_plan(first.dtype);
-    let givens = rotation == RotationPlan::Givens;
     // The AWQ scale is consumed by the norm, never by the GEMV.
     let weights = projections.map(|(w, _)| WeightRef {
         row_stride: 0,
-        rotation: if givens { w.rotation } else { None },
         awq_scale: None,
         ..w
     });
-    let input = if givens {
-        GemvInput::Raw(normed)
-    } else {
-        GemvInput::Prerotated(normed)
-    };
+    let input = GemvInput::Prerotated(normed);
     let gemv = |i: usize| {
         let i = i.min(N - 1);
         Step::Gemv {
@@ -495,7 +467,7 @@ pub fn normed_projection<const N: usize>(
             awq_scale: first.awq_scale,
             k: first.k,
             eps,
-            rotation: if givens { RotationPlan::None } else { rotation },
+            rotation,
             rows: 1,
         },
         gemv(0),
@@ -1092,9 +1064,7 @@ pub fn kv_attention(
     let plan = kv.tier_plan(gpu, row.position)?;
     let route = |write, attend| plan.write_key == write && plan.attend_key == attend;
     let fused_epilogue_route = attention_epilogue_route_supported(
-        gpu.arch_caps.is_gfx1201(),
         route(KernelKey::KvWriteQ8_0, KernelKey::AttnFlashQ8_0),
-        route(KernelKey::KvWriteAsym3, KernelKey::AttnFlashAsym3),
         route(KernelKey::KvWriteFp8E4m3, KernelKey::AttnFlashFp8E4m3),
     );
     let fused_epilogue = fused_attention_epilogue(gpu, dims, wo) && fused_epilogue_route;
@@ -1621,16 +1591,8 @@ mod tests {
 
     #[test]
     fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {
-        assert!(attention_epilogue_route_supported(true, true, false, false));
-        assert!(attention_epilogue_route_supported(true, false, false, true));
-        assert!(!attention_epilogue_route_supported(
-            true, false, true, false
-        ));
-        assert!(attention_epilogue_route_supported(
-            false, false, true, false
-        ));
-        assert!(!attention_epilogue_route_supported(
-            true, false, false, false
-        ));
+        assert!(attention_epilogue_route_supported(true, false));
+        assert!(attention_epilogue_route_supported(false, true));
+        assert!(!attention_epilogue_route_supported(false, false));
     }
 }

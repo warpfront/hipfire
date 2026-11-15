@@ -167,10 +167,9 @@ pub const CROSS_MAX_ACTIVE: &str = "3";
 /// (between the two, the previous step's mode holds).
 pub const CROSS_MAX_ACTIVE_N: usize = 3;
 /// The arms of an `ep2` cohort at [`CROSS_LANES`] lanes. The copy lane is on
-/// by default on EP serve (`HIPFIRE_EP_MTP_LANE_COPY`) only for steps of at
-/// most `ep::COPY_WIDE_LANES` lanes ([`EP2_COPY_LANES`]), so no cohort at
-/// [`CROSS_LANES`] covers it: `lane_copy` runs in the [`EP2_COPY_ARMS`] cohort
-/// only.
+/// by default on EP serve only for steps of at most `ep::COPY_WIDE_LANES` lanes
+/// ([`EP2_COPY_LANES`]), so no cohort at [`CROSS_LANES`] covers it: `lane_copy`
+/// runs in the [`EP2_COPY_ARMS`] cohort only.
 pub const EP2_ARMS: [&str; 4] = ["lane_ar", "lane_batched", "lane_adaptive", CROSS_ARM];
 /// The arms of an `ep2` cohort at any other lane count ([`CROSS_ARM`] has no
 /// such cohort).

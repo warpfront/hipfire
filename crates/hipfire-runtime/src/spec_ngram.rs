@@ -23,11 +23,11 @@
 //! (high prompt-copy). On pure-attention targets the verify is block-parallel,
 //! so model-free spec wins broadly.
 
-use crate::ddtree::sample_host_nucleus;
 use crate::spec::{
     accept_greedy_prefix, NgramCache, PldMatcher, PrefillOutcome, SpecAdvance, SpecGrammar,
     SpecRequestConfig, SpecScratch, SpecStep, SpecTarget, Speculator,
 };
+use crate::spec_sampling::sample_host_nucleus;
 use rdna_compute::Gpu;
 
 /// A token-only block drafter: it proposes a continuation block from the
@@ -383,7 +383,6 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ddtree::sample_host_nucleus;
     use crate::llama;
 
     // ── Task 4: ChainSpeculator first-token sampling seams ───────────────

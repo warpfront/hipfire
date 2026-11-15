@@ -1,0 +1,51 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "arch": "gfx942",
+  "constant": "QWEN4_G942_MQ2_XBATCH_MAX_ROWS",
+  "value": 8,
+  "kind": "max",
+  "row_key": "rows",
+  "covers": true,
+  "candidate": "qwen4_g942_gemv_mq2g256v2_xbatch (x-batched MQ2G256V2 GEMV, one weight pass per chunk)",
+  "incumbent": "one-row MQ2G256V2 GEMV per activation row",
+  "card": "MI300X, bin c3 (65498eece7; module source identical on 1085f38918), qwen4_g942_mq2_xbatch_oracle source arm, 2026-11-13T00:25Z, oracle sha256 5a683cbf76ca06d3e91f32f340ab9889462ed0d715110951a0e2b83d397d2b5f",
+  "summary": "8 is the kernel's structural row capacity (its widest instance is the eight-row body; rows <= 4 use the four-row body), not a performance crossover: the launcher splits larger batches into chunks of at most 8 rows. The oracle ran 864 cases, 0 failing: b = 1..16 activation rows (so 9..16 exercise the 8-row chunking), k in {2048, 2560}, m from 1 to 248320, narrow and wide; kernel and wrapper outputs byte-equal to the one-row GEMV with intact guards. The hipcc-xbatch-vs-singleton count is informational (the non-exact hipcc build), not the shipped module.",
+  "cases": 864,
+  "failing_cases": 0,
+  "rows_tested": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16
+  ],
+  "k_tested": [
+    2048,
+    2560
+  ],
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/gfx942_mq2_xbatch/mq2_xbatch_oracle.json",
+      "sha256": "d0fd5b33a03ac80cabc2fd807bbbd655ba96a6360f08fc488ddb0d75fc48209a"
+    },
+    {
+      "path": "receipts/selectors/evidence/gfx942_mq2_xbatch/ident.txt",
+      "sha256": "7554bbcc5907605ebd50b901da00fd1c65d5d438134dce4eb7922a7cf55122c1"
+    },
+    {
+      "path": "kernels/src/qwen4_g942_gemv_mq2g256v2_xbatch.gfx942.hip",
+      "sha256": "2bd7f03ff9027f4ad38145e0b34b665ffa8eee3fd63000be9cf828267f78bec5"
+    }
+  ]
+}

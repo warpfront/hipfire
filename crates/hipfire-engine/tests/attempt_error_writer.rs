@@ -33,7 +33,7 @@ fn parse_error_line(line: &str) -> serde_json::Value {
     v
 }
 
-/// Mirrors generate-arm invalid tools/messages/pflash + mid-generation
+/// Mirrors generate-arm invalid tools/messages/override + mid-generation
 /// failures: after TLS activation, the writer used by those sites must echo
 /// the nonzero active id and typed fields. Signature has no attempt_id param.
 #[test]
@@ -43,7 +43,7 @@ fn active_attempt_writer_echoes_nonzero_tls_id() {
     assert_eq!(active_attempt_id(), attempt);
 
     let mut buf = Vec::new();
-    // Same writer family as invalid-tools / invalid-messages / pflash override.
+    // Same writer family as invalid-tools / invalid-messages / override.
     emit_for_announced_key(&mut buf, "req-tools", attempt, |buf| {
         emit_active_attempt_error(
             buf,
@@ -64,11 +64,11 @@ fn active_attempt_writer_echoes_nonzero_tls_id() {
             false,
         );
     });
-    emit_for_announced_key(&mut buf, "req-pflash", attempt, |buf| {
+    emit_for_announced_key(&mut buf, "req-override", attempt, |buf| {
         emit_active_attempt_error(
             buf,
-            Some("req-pflash"),
-            "invalid pflash override: bad alpha",
+            Some("req-override"),
+            "invalid override: bad alpha",
             "validation",
             false,
             false,
@@ -91,7 +91,7 @@ fn active_attempt_writer_echoes_nonzero_tls_id() {
     for (line, expect_id, class, retryable) in [
         (lines[0], "req-tools", "validation", false),
         (lines[1], "req-msgs", "validation", false),
-        (lines[2], "req-pflash", "validation", false),
+        (lines[2], "req-override", "validation", false),
         (lines[3], "req-gen", "internal", false),
         (lines[4], "req-write", "internal", false),
         (lines[5], "req-typed", "transient", true),

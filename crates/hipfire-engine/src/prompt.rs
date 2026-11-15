@@ -68,9 +68,19 @@ pub fn parse_generate_messages(
     Ok(Some(messages))
 }
 
+/// Whether a generate request carries an image on the wire: a file `image`, the
+/// legacy single `image_base64`, or the `images_base64` list. Every image
+/// request leaves the batch/lane routes for the singleton vision path, so each
+/// route that must refuse images asks this one question.
+pub fn wire_has_image(msg: &serde_json::Value) -> bool {
+    msg.get("image").is_some()
+        || msg.get("image_base64").is_some()
+        || msg.get("images_base64").is_some()
+}
+
 /// Stateless prompt rendering for a batch lane, reusing the production
 /// `ChatFrame`/`JinjaChatFrame` path. Called with `seq_pos=0`, no tools/
-/// messages/PFlash, retains `started_in_think` for barrier gating.
+/// messages, retains `started_in_think` for barrier gating.
 /// Plain fallback on Jinja render failure is preserved only when no explicit
 /// `reasoning_effort` was supplied; explicit effort render errors are
 /// surfaced as `Err` (request validation) instead of hidden by Plain.
@@ -88,11 +98,7 @@ pub fn batch_render_prompt_tokens(
     enable_thinking: bool,
     reasoning_effort: Option<&str>,
 ) -> Result<(Vec<u32>, bool), String> {
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-        .ok()
-        .as_deref()
-        != Some("0");
-    let try_jinja = jinja_enabled && chat_template.is_some();
+    let try_jinja = chat_template.is_some();
     let q_tokens = tokenizer.encode(prompt);
     let system_prompt = system;
     let mut started_in_think = matches!(

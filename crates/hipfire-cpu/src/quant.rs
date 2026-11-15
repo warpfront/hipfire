@@ -2104,7 +2104,7 @@ mod test {
         //         activation, not a plain FWHT of f32
         //   21/24/32/33/35-37 HFP4/MFP4/... — decoders not implemented;
         //         qt 34's AoS E8 row header is handled explicitly
-        //   28/29 PARO4G128(-T) — a Givens rotation on the *activation*
+        //   28/29 reserved: formerly PARO4G128/PARO4G128T, removed in 0.5.0
         //   38/39 MQ{2,3}G256GL — MoE-indexed only, no dense GEMV kernel exists
         //   22    TidI32 — a routing table, not a weight
         for qt in [

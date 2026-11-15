@@ -74,7 +74,6 @@ fn wref(buf: &GpuTensor, m: usize) -> WeightRef<'_> {
         m,
         k: K,
         row_stride: K,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,

@@ -204,7 +204,6 @@ fn q8_ref(buf: &GpuTensor, m: usize, k: usize) -> WeightRef<'_> {
         m,
         k,
         row_stride: k / 32 * 34,
-        rotation: None,
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,

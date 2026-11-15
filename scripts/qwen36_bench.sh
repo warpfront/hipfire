@@ -5,7 +5,7 @@
 # hipfire — see LICENSE and NOTICE in the project root.
 
 # Qwen3.6-27B full-genre bench with its new z-lab DFlash draft.
-# 3 runs each × (code, prose, instruct) × (DFlash linear, DDTree b12-k2).
+# 3 runs each × (code, prose, instruct), DFlash linear.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -71,7 +71,7 @@ run_one() {
     printf '%s' "$blob" | python3 -c "$PARSE_PY" "$label" "$genre"
 }
 
-for cfg in "3.6-linear|" "3.6-ddtree-b12|--ddtree-batched --ddtree-budget 12 --ddtree-topk 2"; do
+for cfg in "3.6-linear|"; do
     label=${cfg%|*}; args=${cfg#*|}; read -ra argv <<<"$args"
     run_one "$label" "code"     "$CODE_PROMPT"     "${argv[@]}"
     run_one "$label" "prose"    "$PROSE_PROMPT"    "${argv[@]}"

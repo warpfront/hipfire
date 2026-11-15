@@ -1,0 +1,686 @@
+{
+  "anchor": {
+    "bytes": 29024,
+    "file": "qwen4_g942_glue_moe_hipcc_gfx942.co",
+    "sha256": "e3304e667978ca5c8b32c9cd6b2d8a1580a1d6121e9327bd1bfd36afe39ff4c1"
+  },
+  "arch": "gfx942",
+  "compiler": {
+    "flags": [
+      "--genco",
+      "--offload-arch=gfx942",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6"
+    ],
+    "invocation": "hipcc <flags> -o <anchor.co> kernels/src/qwen4_g942_glue_moe.hip",
+    "version": [
+      "HIP version: 7.16.26385-0000000",
+      "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)",
+      "Target: x86_64-unknown-linux-gnu",
+      "Thread model: posix"
+    ]
+  },
+  "gpu_oracle": {
+    "status": "PASS",
+    "target": "gfx942",
+    "input_hxaco_sha256": "e119080be0607d15f9af1fa4cae965597ec768c239ae9dc2403c2453d65928b3",
+    "hipcc_image_sha256": "e3304e667978ca5c8b32c9cd6b2d8a1580a1d6121e9327bd1bfd36afe39ff4c1",
+    "pm_device_elf_sha256": "fe59ba859b903dd0ed37a0929c06e1a766007bf7cfe67c71f24fbbbd21f23ff0",
+    "hipcc_device_elf_sha256": "fe59ba859b903dd0ed37a0929c06e1a766007bf7cfe67c71f24fbbbd21f23ff0",
+    "case_count": 3,
+    "failed_cases": 0,
+    "coverage": "scatter descriptors, unscatter activation and combine/shared-add; owner Tier C rows 1..128; all exact",
+    "oracle": "test_kernelsQA --expected-arch gfx942 --filter qwen4_g942_fold_moe",
+    "image_env": "HIPFIRE_QWEN4_G942_FOLD_MOE_IMAGE=/scratch/quant/fn-fp8/beat/moeglue-twin.elf",
+    "ledger": {
+      "owner": "Twin942c",
+      "class": "oracle",
+      "path": "/scratch/quant/fn-fp8/beat/ledger.jsonl",
+      "line": 117,
+      "start": "2026-11-11T04:00:41+00:00",
+      "end": "2026-11-11T04:00:48+00:00",
+      "exit": 0
+    }
+  },
+  "hxaco": {
+    "bytes": 29024,
+    "file": "qwen4_g942_glue_moe_pm_gfx942.hxaco",
+    "sha256": "e119080be0607d15f9af1fa4cae965597ec768c239ae9dc2403c2453d65928b3"
+  },
+  "module": "qwen4_g942_glue_moe_pm_gfx942",
+  "seal": {
+    "reports": [
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 60,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 68
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 24928,
+        "elf_sha256": "fe59ba859b903dd0ed37a0929c06e1a766007bf7cfe67c71f24fbbbd21f23ff0",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 723,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 0,
+            "rewritten_instructions": 0,
+            "s_nop": 16,
+            "s_nop_wait_states": 26,
+            "violations": 0
+          },
+          "instructions": 577,
+          "kernel": "qwen4_g942_moe_group_scatter_desc",
+          "ledger": {
+            "barriers": 23,
+            "branches": 39,
+            "label_states": 813,
+            "labels": 35,
+            "memory": {
+              "ds_load": 43,
+              "ds_store": 18,
+              "smem": 3,
+              "vmem_atomic": 0,
+              "vmem_load": 1,
+              "vmem_store": 8
+            },
+            "steps": 10517,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 54,
+            "waitcnt_lgkmcnt_partial": 6,
+            "waitcnt_vmcnt_partial": 0
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 29024,
+        "hxaco_sha256": "e119080be0607d15f9af1fa4cae965597ec768c239ae9dc2403c2453d65928b3",
+        "kernel": "qwen4_g942_moe_group_scatter_desc",
+        "lds": 49152,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 3,
+        "rsrc2": 132,
+        "scratch": 0,
+        "sgprs": 41,
+        "text_bytes": 2892,
+        "text_sha256": "b916b4644e21790a7831fd81b15974e088912da091775f6ee23478fe1189d615",
+        "user_sgprs": 2,
+        "vgprs": 52,
+        "wavefront_size": 64
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 28,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 76,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 88,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_x"
+            },
+            {
+              "name": "",
+              "offset": 92,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_y"
+            },
+            {
+              "name": "",
+              "offset": 96,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_z"
+            },
+            {
+              "name": "",
+              "offset": 100,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_x"
+            },
+            {
+              "name": "",
+              "offset": 102,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_y"
+            },
+            {
+              "name": "",
+              "offset": 104,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_z"
+            },
+            {
+              "name": "",
+              "offset": 106,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_x"
+            },
+            {
+              "name": "",
+              "offset": 108,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_y"
+            },
+            {
+              "name": "",
+              "offset": 110,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_z"
+            },
+            {
+              "name": "",
+              "offset": 128,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_x"
+            },
+            {
+              "name": "",
+              "offset": 136,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_y"
+            },
+            {
+              "name": "",
+              "offset": 144,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_z"
+            },
+            {
+              "name": "",
+              "offset": 152,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_grid_dims"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 344
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 24928,
+        "elf_sha256": "fe59ba859b903dd0ed37a0929c06e1a766007bf7cfe67c71f24fbbbd21f23ff0",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 388,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 0,
+            "rewritten_instructions": 0,
+            "s_nop": 13,
+            "s_nop_wait_states": 22,
+            "violations": 0
+          },
+          "instructions": 275,
+          "kernel": "qwen4_g942_moe_unscatter_act",
+          "ledger": {
+            "barriers": 0,
+            "branches": 7,
+            "label_states": 10,
+            "labels": 5,
+            "memory": {
+              "ds_load": 0,
+              "ds_store": 0,
+              "smem": 9,
+              "vmem_atomic": 0,
+              "vmem_load": 5,
+              "vmem_store": 3
+            },
+            "steps": 485,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 11,
+            "waitcnt_lgkmcnt_partial": 0,
+            "waitcnt_vmcnt_partial": 2
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 29024,
+        "hxaco_sha256": "e119080be0607d15f9af1fa4cae965597ec768c239ae9dc2403c2453d65928b3",
+        "kernel": "qwen4_g942_moe_unscatter_act",
+        "lds": 0,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 3,
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 32,
+        "text_bytes": 1552,
+        "text_sha256": "0d1de816bfc9867924cf317a63388fb775c3bde466b65654f7539f707e99ae96",
+        "user_sgprs": 2,
+        "vgprs": 8,
+        "wavefront_size": 64
+      },
+      {
+        "abi": {
+          "args": [
+            {
+              "name": "",
+              "offset": 0,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 8,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 16,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 24,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 32,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 40,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 44,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 48,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 52,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "by_value"
+            },
+            {
+              "name": "",
+              "offset": 56,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 64,
+              "pointer": true,
+              "size": 8,
+              "value_kind": "global_buffer"
+            },
+            {
+              "name": "",
+              "offset": 72,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_x"
+            },
+            {
+              "name": "",
+              "offset": 76,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_y"
+            },
+            {
+              "name": "",
+              "offset": 80,
+              "pointer": false,
+              "size": 4,
+              "value_kind": "hidden_block_count_z"
+            },
+            {
+              "name": "",
+              "offset": 84,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_x"
+            },
+            {
+              "name": "",
+              "offset": 86,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_y"
+            },
+            {
+              "name": "",
+              "offset": 88,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_group_size_z"
+            },
+            {
+              "name": "",
+              "offset": 90,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_x"
+            },
+            {
+              "name": "",
+              "offset": 92,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_y"
+            },
+            {
+              "name": "",
+              "offset": 94,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_remainder_z"
+            },
+            {
+              "name": "",
+              "offset": 112,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_x"
+            },
+            {
+              "name": "",
+              "offset": 120,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_y"
+            },
+            {
+              "name": "",
+              "offset": 128,
+              "pointer": false,
+              "size": 8,
+              "value_kind": "hidden_global_offset_z"
+            },
+            {
+              "name": "",
+              "offset": 136,
+              "pointer": false,
+              "size": 2,
+              "value_kind": "hidden_grid_dims"
+            }
+          ],
+          "compared_to_incumbent": false,
+          "kernarg_segment_size": 328
+        },
+        "arch": "gfx942",
+        "codec": "peacemaker_cdna",
+        "elf_bytes": 24928,
+        "elf_sha256": "fe59ba859b903dd0ed37a0929c06e1a766007bf7cfe67c71f24fbbbd21f23ff0",
+        "hazards": {
+          "advisory": 0,
+          "arch": "gfx942",
+          "blocking": 0,
+          "bypasses": 0,
+          "checked": true,
+          "dwords": 2655,
+          "findings": 0,
+          "hazard": {
+            "checker": "peacemaker_isa::cdna::hazard::check",
+            "inserted_nops": 0,
+            "mfma": 0,
+            "rewritten_instructions": 0,
+            "s_nop": 34,
+            "s_nop_wait_states": 68,
+            "violations": 0
+          },
+          "instructions": 2241,
+          "kernel": "qwen4_g942_moe_combine_shared_add",
+          "ledger": {
+            "barriers": 0,
+            "branches": 156,
+            "label_states": 149,
+            "labels": 138,
+            "memory": {
+              "ds_load": 0,
+              "ds_store": 0,
+              "smem": 53,
+              "vmem_atomic": 0,
+              "vmem_load": 12,
+              "vmem_store": 1
+            },
+            "steps": 3070,
+            "verifier": "peacemaker_isa::ledger_cfg::verify_with_branch_proofs",
+            "waitcnt": 62,
+            "waitcnt_lgkmcnt_partial": 0,
+            "waitcnt_vmcnt_partial": 0
+          },
+          "unreachable_instructions": 0
+        },
+        "hxaco_bytes": 29024,
+        "hxaco_sha256": "e119080be0607d15f9af1fa4cae965597ec768c239ae9dc2403c2453d65928b3",
+        "kernel": "qwen4_g942_moe_combine_shared_add",
+        "lds": 0,
+        "lift_identity": "emit::checked ok; emitted bytes == input ELF",
+        "lifted_kernels": 3,
+        "rsrc2": 388,
+        "scratch": 0,
+        "sgprs": 54,
+        "text_bytes": 10620,
+        "text_sha256": "dd24647361fa899082bef2cad7277ed4c1a2adf60b5227ce49fc3a3ffcf31ce0",
+        "user_sgprs": 2,
+        "vgprs": 8,
+        "wavefront_size": 64
+      }
+    ],
+    "tool": "peacemaker-isa example hip_twin (gfx942 Route A: typed lift, full device-ELF identity, bundle)"
+  },
+  "source": {
+    "bytes": 14083,
+    "path": "kernels/src/qwen4_g942_glue_moe.hip",
+    "sha256": "0f2e37e06e386ceaf9c95defeda3e7cd7d73355bf4367fb96fb39108ca0eb2bc"
+  },
+  "symbols": [
+    "qwen4_g942_moe_group_scatter_desc",
+    "qwen4_g942_moe_unscatter_act",
+    "qwen4_g942_moe_combine_shared_add"
+  ]
+}

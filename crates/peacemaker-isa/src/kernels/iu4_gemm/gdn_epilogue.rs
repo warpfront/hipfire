@@ -104,6 +104,7 @@ const S1: u8 = 98;
 const S2: u8 = 99;
 const OUTOFF: u8 = 101;
 const RAWOFF: u8 = 102;
+const RAWTAIL: u8 = 74; // N & ~63: tokens t + 3 >= RAWTAIL also export their raw row
 
 /// GDN-phase register ranges (the K-loop/store ranges end at `GDN`).
 pub(crate) fn plan(p: &mut RegPlan) -> Result<(), String> {
@@ -341,14 +342,21 @@ fn token(
     load_row(w, ring, 3, (j + 3) % 4)?;
     let b = w.isa();
     // Raw row for the completion pass: tile positions 0..2 / 125..127 and the
-    // last three tokens. Others (and tokens >= N) go past num_records.
+    // tokens at or past the last full 64-token chunk minus its 3-row halo
+    // (`t + 3 >= N & ~63`; all tokens when N < 64). Others (and tokens >= N)
+    // go past num_records.
     sop(b, format!("s_cmp_lt_u32 s{T}, 3"), &[], &[T])?;
     sop(b, format!("s_cselect_b32 s{S0}, 1, 0"), &[S0], &[])?;
     sop(b, format!("s_cmp_ge_u32 s{T}, 0x7d"), &[], &[T])?;
     sop(b, format!("s_cselect_b32 s{S1}, 1, 0"), &[S1], &[])?;
     sop(b, format!("s_or_b32 s{S0}, s{S0}, s{S1}"), &[S0], &[S0, S1])?;
     sop(b, format!("s_add_co_i32 s{S1}, s{TG}, 3"), &[S1], &[TG])?;
-    sop(b, format!("s_cmp_ge_u32 s{S1}, s{N}"), &[], &[S1, N])?;
+    sop(
+        b,
+        format!("s_cmp_ge_u32 s{S1}, s{RAWTAIL}"),
+        &[],
+        &[S1, RAWTAIL],
+    )?;
     sop(b, format!("s_cselect_b32 s{S1}, 1, 0"), &[S1], &[])?;
     sop(b, format!("s_or_b32 s{S0}, s{S0}, s{S1}"), &[S0], &[S0, S1])?;
     sop(
@@ -579,6 +587,12 @@ pub(crate) fn emit(wg: &mut Wg, g: &Gen, (ra, rw, rd, rs): Lds) -> Result<(), St
         b,
         format!("s_mul_i32 s{}, s{N}, 0xa000", RAWD + 2),
         &[RAWD + 2],
+        &[N],
+    )?;
+    sop(
+        b,
+        format!("s_and_b32 s{RAWTAIL}, s{N}, 0xffffffc0"),
+        &[RAWTAIL],
         &[N],
     )?;
     sop(
@@ -1077,6 +1091,10 @@ mod tests {
             (RING_ROWS - 1) * ROW_BYTES + 512
         );
         assert!(check_lds_access(&source, &spec.symbol(), 20479).is_err());
+        // Raw QKV export threshold: `t + 3 >= N & ~63`, hoisted once per epilogue.
+        assert_eq!(source.matches("s_and_b32 s74, s23, 0xffffffc0").count(), 1);
+        assert_eq!(source.matches("s_cmp_ge_u32 s98, s74").count(), 4);
+        assert!(!source.contains("s_cmp_ge_u32 s98, s23"));
         for (from, to) in [
             (
                 "v_mad_u32_u24 v180, v180, 0x210, v185",

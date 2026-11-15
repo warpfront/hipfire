@@ -88,7 +88,6 @@ CERTIFIED_PM4_POLICY = {
     "HIPFIRE_REPLAY_PM4_STATEFUL": "static",
     "HIPFIRE_REPLAY_PM4_WAIT_POLICY": "resource",
     "HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY": "required-only",
-    "HIPFIRE_REPLAY_PM4_GCR_TRIM": "1",
     "HIPFIRE_REPLAY_PM4_NATIVE_PHASES": "0",
     "HIPFIRE_REPLAY_PM4_DYNAMIC_GRID": "0",
 }
@@ -742,7 +741,6 @@ class Daemon:
             HIPFIRE_REPLAY_BACKEND=configured_backend,
             HIPFIRE_REPLAY_TRANSPORT=transport,
             HIPFIRE_KV_MODE=kv_mode,
-            HIPFIRE_CASK_OFF="1",
             HIPFIRE_AR_GRAPH="1",
             HIPFIRE_GRAPH="1",
             HIPFIRE_DPM_WARMUP_SECS=str(dpm_warmup_secs),
@@ -1359,7 +1357,6 @@ def run_coherence_smoke(args, backend):
         HIPFIRE_REPLAY_BACKEND=configured_backend,
         HIPFIRE_REPLAY_TRANSPORT=args.transport,
         HIPFIRE_KV_MODE=args.kv_mode,
-        HIPFIRE_CASK_OFF="1",
         HIPFIRE_AR_GRAPH="1",
         HIPFIRE_GRAPH="1",
     )
@@ -1664,7 +1661,6 @@ def run_pm4_multiturn_session(args):
         HIPFIRE_REPLAY_BACKEND=configured_backend,
         HIPFIRE_REPLAY_TRANSPORT="pm4",
         HIPFIRE_KV_MODE=args.kv_mode,
-        HIPFIRE_CASK_OFF="1",
         HIPFIRE_AR_GRAPH="1",
         HIPFIRE_GRAPH="1",
     )

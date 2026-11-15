@@ -159,7 +159,7 @@ environment variable.
 | `--spec <mode>` (alias `--speculation`) | Speculation mode for every load: `off`, `auto`, `ngram`, `dflash`, `mtp`, `dspark`; `off` disables MTP/DFlash |
 | `--idle-timeout <s>` | Idle model-unload timeout, 0..86400 s (`0` = never); overrides `serve.idle_timeout_seconds` |
 | `--tp N` | Tensor/expert-parallel degree (1..64) |
-| `--continuous-batch-size N` | Number of eligible concurrent batched lanes, 1..256 (`1` keeps sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits |
+| `--continuous-batch-size N` | Number of eligible concurrent batched lanes, 1..256 (`1` keeps sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits Flash-Next (qwen4 fn-lanes) stores hold at most 64 lanes: `--continuous-batch-size 65..256` is accepted by the schema but the load logs `[daemon] qwen4 lanes refused: lanes=N outside the lane store capacity 1..=64 — fallback to sequential`. On gfx942 the stock-FP8 artifact serves 32 and 64 lanes (lane store ~259 MiB per lane at `max_seq` 16384, ~16.6 GB at 64 [MEAS, 2,069 MiB for 8]); the load line reads `qwen4 fn-lanes staged: topology=single lanes=64 row_budget=...`; a store larger than free device memory is refused with `lane store needs <N> MiB, <M> MiB free`. |
 | `--vision <path>` | Vision-tower sidecar wired into every model load; overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Honored by foreground serve only: `-d` does not forward it to the child |
 | `--ui` | Serve the embedded chat UI (see below) |
 | `--open` | Open the chat UI in the default browser once serving; implies `--ui` |
@@ -501,7 +501,7 @@ through to per-model / registry / daemon defaults when omitted):
 | `model` | Tag or path of an installed model; reloads if different from the resident model. A registry model that is not installed is 404 ("run `hipfire pull`") unless `serve.allow_request_pull = true`; a file outside the models directory, the catalog and the pre-warm model is 404 unless `serve.allow_request_paths = true`. |
 | `max_tokens` / `max_completion_tokens` | Omitted: the configured default (Qwen tags 81920, DeepSeek V4 Flash 393216, else `generation.max_tokens`) is fitted to the context left after the prompt, minus 64. Explicit and at or above the loaded context: 400. Never triggers a reload. |
 | `messages` | OpenAI chat messages (required for useful chat) |
-| `messages[].content[].image_url` | One base64 PNG/JPEG data URI for VL models; remote URLs and multiple images are rejected |
+| `messages[].content[].image_url` | Base64 PNG/JPEG data URIs for VL models; remote URLs are rejected. Any number of images, in any message: each is rendered at its message position through the model's chat template, so an image conversation keeps its full history, and a client that resends earlier images every turn is not charged for them again (the resident conversation is continued in place; only images that are new to it are encoded). dots-OCR and LFM2-VL render one image per request. The experimental multi-slot route accepts one image and renders a single-turn prompt. |
 | `stream`, `stream_options.include_usage` | Streaming + optional usage on stream end |
 | `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty` | Sampling; explicit request values win, otherwise per-model TOML / registry-card values are applied. On the Qwen AR samplers (GPU kernel and the CPU sampler used by Flash-Next AR, grammar-constrained Qwen turns and the multi-slot VL first token) `top_k` keeps at most k candidates from a 64-wide gather (absent = 20; `0` or > 64 = 64) and `min_p` drops candidates below `min_p` × the top candidate's probability, both before `top_p`. At `temperature: 0` all three are no-ops. Other routes do not apply every field yet: Gemma4 eager, LFM2, Cohere2, MiniMax, DeepSeek V4 AR, LLaMA AR and single-slot Qwen3.5-VL image turns ignore the request `top_k`; those plus Muse Glimmer, DeepSeek V4 speculative and n-gram speculative decoding ignore `min_p`; Qwen2, Maple and dots.ocr text decode greedily. |
 | `seed` | OpenAI-compatible sampling seed: non-negative integer (≤ u64::MAX). Same seed is reproducible only when prompt, sampling parameters, and execution shape match. Cold vs prefix-resumed and solo vs co-batched shapes may differ until `serve.batch_invariant` is implemented; `null`/omitted = fresh entropy. Negative/fractional/non-integer values are rejected. |
@@ -740,9 +740,10 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
   "reasoning_effort": "low"
 }'
 
-# Qwen3.6 — no native effort: effort is dropped+warned; set an explicit cap if wanted
+# Qwen3.5 — no native effort: effort is dropped+warned; set an explicit cap if wanted
+# (the retired qwen3.6:27b behaved the same and still loads from a verified install)
 curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "model": "qwen3.6:27b",
+  "model": "qwen3.5:27b",
   "messages": [{"role": "user", "content": "hi"}],
   "reasoning_effort": "low",
   "max_think_tokens": 2048
@@ -983,6 +984,9 @@ request run alone on the singleton route. **Default off, experimental.**
   projection once over all rows, bound to the BF16 trunk and the resident FP8
   expert class) but not every single-stage probe, so gfx942 shares all of
   those stages or none; the GDN and QSA cores run one launch per lane there.
+  Steps of 9..=64 rows (more than 8 lanes) run those shared stages, and the
+  routed MoE, once over all rows (always on for gfx942 by arch, no env switch; G0 identical to the singletons at 16 / 32 / 64
+  lanes, see [env-vars.md](env-vars.md)).
   Measured on one MI300X (`hipfire bench --backend batch`, 16 prompts x 128
   tokens, 4 fresh loads): C8 151 tok/s aggregate (TTFT 1.88 s, 208 tok/s
   steady decode) against C1 60 tok/s, every stream's text identical to C1.

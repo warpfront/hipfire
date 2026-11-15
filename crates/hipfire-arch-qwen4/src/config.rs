@@ -35,6 +35,9 @@ pub const ARCHITECTURE_NAME: &str = "Qwen4ExpForConditionalGeneration";
 pub const FLASH_NEXT_PROFILE_ID: &str = "qwen3.8-flash-next";
 /// Stable profile id of the AR-only Flash-Next profile ([`Qwen4Profile::FlashNextArOnly`]).
 pub const FLASH_NEXT_AR_ONLY_PROFILE_ID: &str = "qwen3.8-flash-next-ar";
+/// Stable profile id of the stock-FP8 Flash-Next profile WITH its MTP head sidecar
+/// ([`Qwen4Profile::FlashNextStockMtp`]).
+pub const FLASH_NEXT_STOCK_MTP_PROFILE_ID: &str = "qwen3.8-flash-next-fp8-mtp";
 /// Stable profile id of the head-dropped packed Flash-Next profile
 /// ([`Qwen4Profile::FlashNextHeadless`]).
 pub const FLASH_NEXT_HEADLESS_PROFILE_ID: &str = "qwen3.8-flash-next-headless";
@@ -255,6 +258,11 @@ pub enum Qwen4Profile {
     /// entry point sees a head-free profile instead of a config that claims a
     /// head the artifact does not carry.
     FlashNextArOnly,
+    /// The pinned Flash-Next geometry on the stock-FP8 recipe WITH the native MTP head
+    /// loaded from the `<model>.mtp` sidecar.  Never parsed from a config: artifact
+    /// admission derives it through [`Qwen4Config::into_stock_mtp`] only when a sidecar
+    /// bound.  Headed, not packed, bound to the stock-FP8 numerical pins.
+    FlashNextStockMtp,
     /// The pinned PACKED Flash-Next trunk loaded without its native MTP head
     /// (the TP trunk shard runs AR-only, `HIPFIRE_QWEN4_EP_TRUNK_SHARD`).  Unlike
     /// [`Self::FlashNextArOnly`] it is NOT the stock-FP8 recipe: the artifact is the
@@ -274,6 +282,7 @@ impl Qwen4Profile {
         match self {
             Self::FlashNext => FLASH_NEXT_PROFILE_ID,
             Self::FlashNextArOnly => FLASH_NEXT_AR_ONLY_PROFILE_ID,
+            Self::FlashNextStockMtp => FLASH_NEXT_STOCK_MTP_PROFILE_ID,
             Self::FlashNextHeadless => FLASH_NEXT_HEADLESS_PROFILE_ID,
             Self::Synthetic(profile) => &profile.id,
         }
@@ -283,7 +292,10 @@ impl Qwen4Profile {
     pub const fn is_flash_next(&self) -> bool {
         matches!(
             self,
-            Self::FlashNext | Self::FlashNextArOnly | Self::FlashNextHeadless
+            Self::FlashNext
+                | Self::FlashNextArOnly
+                | Self::FlashNextStockMtp
+                | Self::FlashNextHeadless
         )
     }
 
@@ -292,6 +304,12 @@ impl Qwen4Profile {
     /// predicate that does not imply the recipe is [`Self::is_headless`].
     pub const fn is_ar_only(&self) -> bool {
         matches!(self, Self::FlashNextArOnly)
+    }
+
+    /// The stock-FP8 numerical pins (F32 GDN state, BF16 trunk): the head-free
+    /// [`Self::FlashNextArOnly`] and the headed [`Self::FlashNextStockMtp`].
+    pub const fn is_stock_fp8(&self) -> bool {
+        matches!(self, Self::FlashNextArOnly | Self::FlashNextStockMtp)
     }
 
     /// Flash-Next geometry admitted without the native MTP head, under either recipe
@@ -317,9 +335,10 @@ impl Qwen4Profile {
 
     pub const fn equation_source(&self) -> Qwen4EquationSource {
         match self {
-            Self::FlashNext | Self::FlashNextArOnly | Self::FlashNextHeadless => {
-                Qwen4EquationSource::PinnedUpstream
-            }
+            Self::FlashNext
+            | Self::FlashNextArOnly
+            | Self::FlashNextStockMtp
+            | Self::FlashNextHeadless => Qwen4EquationSource::PinnedUpstream,
             Self::Synthetic(profile) => profile.equation_source,
         }
     }
@@ -1152,6 +1171,7 @@ impl Qwen4Config {
         match &self.profile {
             Qwen4Profile::FlashNext
             | Qwen4Profile::FlashNextArOnly
+            | Qwen4Profile::FlashNextStockMtp
             | Qwen4Profile::FlashNextHeadless => self.validate_flash_next()?,
             Qwen4Profile::Synthetic(profile) => self.validate_synthetic(profile)?,
         }
@@ -1303,6 +1323,12 @@ impl Qwen4Config {
         match self.profile {
             Qwen4Profile::FlashNext => {}
             Qwen4Profile::FlashNextArOnly => return Ok(self),
+            Qwen4Profile::FlashNextStockMtp => {
+                return Err(format!(
+                    "qwen4: profile {} is the headed stock-FP8 form, not the AR-only one",
+                    self.profile.id()
+                ))
+            }
             Qwen4Profile::FlashNextHeadless => {
                 return Err(format!(
                 "qwen4: profile {} is the packed head-dropped form, not the stock-FP8 AR-only one",
@@ -1319,6 +1345,34 @@ impl Qwen4Config {
         self.drop_head(Qwen4Profile::FlashNextArOnly)
     }
 
+    /// The headed stock-FP8 form of a validated Flash-Next config:
+    /// [`Qwen4Profile::FlashNextStockMtp`] with the native MTP head kept.  Selected only
+    /// when a `<model>.mtp` sidecar bound to the stock-FP8 artifact.  Only the checkpoint
+    /// profile ([`Qwen4Profile::FlashNext`]) converts.
+    pub fn into_stock_mtp(mut self) -> Result<Self, String> {
+        match self.profile {
+            Qwen4Profile::FlashNext => {}
+            Qwen4Profile::FlashNextStockMtp => return Ok(self),
+            Qwen4Profile::FlashNextArOnly | Qwen4Profile::FlashNextHeadless => {
+                return Err(format!(
+                    "qwen4: profile {} is head-free; the stock-FP8 MTP form needs the checkpoint profile {}",
+                    self.profile.id(),
+                    FLASH_NEXT_PROFILE_ID
+                ))
+            }
+            Qwen4Profile::Synthetic(_) => {
+                return Err(format!(
+                    "qwen4: profile {} has no stock-FP8 MTP form (only Flash-Next does)",
+                    self.profile.id()
+                ))
+            }
+        }
+        self.validate()?;
+        self.profile = Qwen4Profile::FlashNextStockMtp;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// The head-dropped PACKED form of a validated Flash-Next config: the
     /// [`Qwen4Profile::FlashNextHeadless`] profile with no MTP head (`mtp` and its scalar
     /// mirrors cleared), geometry unchanged. Selected by the trunk shard's load
@@ -1329,7 +1383,7 @@ impl Qwen4Config {
         match self.profile {
             Qwen4Profile::FlashNext => {}
             Qwen4Profile::FlashNextHeadless => return Ok(self),
-            Qwen4Profile::FlashNextArOnly => {
+            Qwen4Profile::FlashNextArOnly | Qwen4Profile::FlashNextStockMtp => {
                 return Err(format!(
                 "qwen4: profile {} is the stock-FP8 AR-only form; it has no packed headless form",
                 self.profile.id()
@@ -2553,6 +2607,7 @@ fn validate_profile_id(id: &str) -> Result<(), String> {
     }
     if id.eq_ignore_ascii_case(FLASH_NEXT_PROFILE_ID)
         || id.eq_ignore_ascii_case(FLASH_NEXT_AR_ONLY_PROFILE_ID)
+        || id.eq_ignore_ascii_case(FLASH_NEXT_STOCK_MTP_PROFILE_ID)
         || id.eq_ignore_ascii_case(FLASH_NEXT_HEADLESS_PROFILE_ID)
     {
         return Err(format!(
@@ -3149,6 +3204,42 @@ mod tests {
         headless.mtp_num_hidden_layers = 0;
         assert!(headless.validate().is_err());
         assert!(validate_profile_id(FLASH_NEXT_AR_ONLY_PROFILE_ID).is_err());
+    }
+
+    /// U1: the headed stock-FP8 profile derives from the checkpoint profile only, keeps the
+    /// head, is stock-pinned but neither headless nor packed.
+    #[test]
+    fn stock_mtp_profile_is_flash_next_with_mtp_and_stock_pins() {
+        let flash = compact_test_config();
+        let stock = flash.clone().into_stock_mtp().expect("headed stock form");
+        assert_eq!(stock.profile, Qwen4Profile::FlashNextStockMtp);
+        assert_eq!(stock.profile.id(), "qwen3.8-flash-next-fp8-mtp");
+        assert_eq!(stock.profile.id(), FLASH_NEXT_STOCK_MTP_PROFILE_ID);
+        let profile = &stock.profile;
+        assert!(profile.is_stock_fp8() && profile.is_flash_next());
+        assert!(!profile.is_headless() && !profile.is_packed_flash_next());
+        assert!(!profile.is_ar_only() && !profile.developer_only());
+        assert_eq!(stock.mtp, flash.mtp);
+        assert_eq!(stock.mtp_num_hidden_layers, 1);
+        stock.validate().expect("headed stock validates");
+        assert_eq!(stock.clone().into_stock_mtp().unwrap(), stock);
+        // ArOnly / Headless / Synthetic refuse, naming the profile.
+        let ar = flash.clone().into_ar_only().unwrap();
+        let error = ar.into_stock_mtp().unwrap_err();
+        assert!(error.contains("qwen3.8-flash-next-ar"), "{error}");
+        let headless = flash.clone().into_headless().unwrap();
+        let error = headless.into_stock_mtp().unwrap_err();
+        assert!(error.contains("qwen3.8-flash-next-headless"), "{error}");
+        let mut synthetic = flash.clone();
+        synthetic.profile = Qwen4Profile::Synthetic(Qwen4SyntheticProfile {
+            id: "dev".into(),
+            equation_source: Qwen4EquationSource::PinnedUpstream,
+        });
+        assert!(synthetic.into_stock_mtp().is_err());
+        // The other derived forms refuse the headed stock one.
+        assert!(stock.clone().into_ar_only().is_err());
+        assert!(stock.clone().into_headless().is_err());
+        assert!(validate_profile_id(FLASH_NEXT_STOCK_MTP_PROFILE_ID).is_err());
     }
 
     /// The head-dropped packed profile (trunk shard load) is derived like the stock AR-only

@@ -85,8 +85,8 @@ sheep-math with reasoning-in-history; ag1-3 = tool-call → ERROR → retry → 
 Cannot run for the jinja path: cache is DISABLED under jinja today (daemon
 8857-8864) and the daemon doesn't thread `preserve_thinking` (render_messages ctx
 omits it) → the cache benefit doesn't exist until item-4 wiring lands. This is THE
-test that must pass post-wiring (deterministic DeltaNet state via HIPFIRE_DN_STATE_EF
-or FP32 + HIPFIRE_DETERMINISTIC=1, else stochastic Q8 masks corruption).
+test that must pass post-wiring (deterministic DeltaNet state via Q8 error feedback
+or FP32 + HIPFIRE_DETERMINISTIC=1, else stochastic quantized state masks corruption).
 
 ## Verdict
 - froggeric render is **durable for the cache/reasoning path** (byte-identical to
@@ -97,5 +97,5 @@ or FP32 + HIPFIRE_DETERMINISTIC=1, else stochastic Q8 masks corruption).
   (1) the cache-under-jinja wiring (item-4) doesn't exist, so flipping gains nothing
   for caching; (2) the `| tojson` tool-render skew should be fixed first.
 - Recommend: land item-4 wiring → run ① byte-identity → fix tojson/preserve_order →
-  then flip default behind the existing `HIPFIRE_JINJA_CHAT` flag with ChatScaffold
+  then flip the Jinja chat default on with ChatScaffold
   fallback retained.

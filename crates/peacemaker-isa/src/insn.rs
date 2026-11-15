@@ -57,7 +57,12 @@ impl Instruction {
     }
     pub fn validate(&self, arch: Arch) -> Result<(), String> {
         let mnemonic = self.mnemonic();
-        arch.check_mnemonic(mnemonic)?;
+        if let Some(cdna) = arch.cdna() {
+            // CDNA text is whatever the typed parser accepts (labels and branches included).
+            crate::cdna::lower::classify(&self.text, cdna)?;
+        } else {
+            arch.check_mnemonic(mnemonic)?;
+        }
         if mnemonic.starts_with("scratch_") {
             return Err("scratch instructions are forbidden".into());
         }

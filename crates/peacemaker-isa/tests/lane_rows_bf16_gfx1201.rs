@@ -1336,7 +1336,7 @@ fn unsupported_ops(program: &Program, symbol: &str) -> Result<BTreeSet<String>, 
             .insts
             .get(*id)
             .ok_or("layout names a missing instruction")?;
-        match peacemaker_ir::isa::lookup(program.target.arch, inst.op, inst.form) {
+        match peacemaker_ir::isa::lookup_inst(program.target.arch, &inst).ok() {
             None => {
                 set.insert("<unknown decoded opcode>".to_string());
             }

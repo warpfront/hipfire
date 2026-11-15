@@ -25,7 +25,6 @@ pm4_queues = "1"
 pm4_register_policy = "static"
 pm4_wait_policy = "resource"
 pm4_acquire_policy = "required-only"
-pm4_gcr_trim = true
 pm4_dynamic_grid = false
 
 # gfx1151 policy formerly set with HIPFIRE_GFX1151_PM4_* variables.

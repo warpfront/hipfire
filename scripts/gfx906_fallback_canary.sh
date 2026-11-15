@@ -73,9 +73,9 @@ echo "  (last tok/s is the most-recent run; first run includes JIT cost)"
 echo
 
 run_bench "default (wave64 FP16 hybrid)" \
-    env HIPFIRE_KV_MODE=asym3
+    env HIPFIRE_KV_MODE=fwht3
 run_bench "fallback (HIPFIRE_FP16=0)" \
-    env HIPFIRE_KV_MODE=asym3 HIPFIRE_FP16=0
+    env HIPFIRE_KV_MODE=fwht3 HIPFIRE_FP16=0
 
 cat <<'EOF'
 

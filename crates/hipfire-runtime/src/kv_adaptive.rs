@@ -10,8 +10,6 @@
 //! would let seq_pos overflow the binding buffer. n_kv_heads cancels in each
 //! per-buffer ratio, so the caps are `max_seq * floor_bph / cur_bph`.
 use crate::llama::VMode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 /// K-cache tier. Mirrors VMode for the V side. fwht4/fwht2 rotate 128-wide,
 /// fwht3 rotates 256-wide.
@@ -123,10 +121,6 @@ pub struct KvAdaptive {
     /// refuse until unload/reload; reset does not clear poison.
     poisoned: bool,
     poison_reason: Option<String>,
-    /// Optional one-way transition into an eviction policy. The shared gate
-    /// stays closed until every adaptive transcode has completed successfully.
-    handoff_at: Option<usize>,
-    eviction_ready: Option<Arc<AtomicBool>>,
 }
 
 impl KvAdaptive {
@@ -199,8 +193,6 @@ impl KvAdaptive {
             margin: crate::llama::PREFILL_MAX_BATCH,
             poisoned: false,
             poison_reason: None,
-            handoff_at: None,
-            eviction_ready: None,
         };
         s.recompute_thresholds();
         s
@@ -262,44 +254,13 @@ impl KvAdaptive {
         self.cur_k = KMode::Fwht4;
         self.cur_v = crate::llama::VMode::Q8;
         self.next_step = 0;
-        if let Some(ready) = &self.eviction_ready {
-            ready.store(false, Ordering::Release);
-        }
-    }
-
-    /// Configure a one-way transition to eviction at a committed position.
-    /// The returned gate is consumed by the eviction context; it remains
-    /// closed until all remaining adaptive steps have succeeded.
-    pub fn configure_eviction_handoff(&mut self, at: usize) -> Arc<AtomicBool> {
-        let ready = Arc::new(AtomicBool::new(false));
-        self.handoff_at = Some(at);
-        self.eviction_ready = Some(Arc::clone(&ready));
-        ready
-    }
-
-    pub fn handoff_at(&self) -> Option<usize> {
-        self.handoff_at
-    }
-
-    pub fn handoff_complete(&self) -> bool {
-        self.eviction_ready
-            .as_ref()
-            .is_some_and(|ready| ready.load(Ordering::Acquire))
-    }
-
-    pub fn eviction_gate(&self) -> Option<Arc<AtomicBool>> {
-        self.eviction_ready.as_ref().map(Arc::clone)
     }
 
     fn target_step_count(&self, seq_pos: usize) -> usize {
-        if self.handoff_at.is_some_and(|at| seq_pos >= at) {
-            self.steps.len()
-        } else {
-            self.thresholds
-                .iter()
-                .take_while(|&&threshold| seq_pos >= threshold)
-                .count()
-        }
+        self.thresholds
+            .iter()
+            .take_while(|&&threshold| seq_pos >= threshold)
+            .count()
     }
 
     /// Atomically restore controller + cache encoding to the adaptive start
@@ -333,7 +294,7 @@ impl KvAdaptive {
     /// Apply ALL downshift steps whose threshold seq_pos has crossed (handles
     /// coincident thresholds — e.g. V→lloyd3 and K→fwht2 sharing a binding
     /// point). Called after each committed token write at the same site as
-    /// `maybe_evict`. The common case (no threshold crossed) is a single integer
+    /// the token write. The common case (no threshold crossed) is a single integer
     /// compare returning an empty Vec. Returns the steps applied this call.
     ///
     /// On any transcode failure after zero or more successful steps in this
@@ -358,7 +319,6 @@ impl KvAdaptive {
             ));
         }
         let mut applied = Vec::new();
-        let handoff_crossed = self.handoff_at.is_some_and(|at| seq_pos >= at);
         let target_step_count = self.target_step_count(seq_pos);
         while self.next_step < target_step_count {
             let step = self.steps[self.next_step];
@@ -378,19 +338,6 @@ impl KvAdaptive {
             }
             applied.push(step);
             self.next_step += 1;
-        }
-        if handoff_crossed {
-            // Release only after every transcode above completed. Eviction's
-            // Acquire pairs with this store, so it cannot observe stale mode
-            // flags or cache bytes on another serving thread.
-            if let Some(ready) = &self.eviction_ready {
-                if !ready.swap(true, Ordering::AcqRel) {
-                    eprintln!(
-                        "[adaptive-kv] handoff complete @ pos {seq_pos}: K={:?} V={:?}; eviction active",
-                        self.cur_k, self.cur_v
-                    );
-                }
-            }
         }
         Ok(applied)
     }
@@ -549,28 +496,6 @@ mod tests {
         assert_eq!(a.cur_v, VMode::Q8);
         assert_eq!(a.next_step, 0);
         assert!(!a.is_poisoned());
-    }
-
-    #[test]
-    fn handoff_forces_floor_and_reset_recloses_gate() {
-        let mut a = KvAdaptive::from_preset(Preset::Aggressive, 10_000, 4, 256);
-        let first_natural_threshold = a.thresholds[0];
-        let handoff_at = first_natural_threshold / 2;
-        let gate = a.configure_eviction_handoff(handoff_at);
-
-        assert!(!gate.load(Ordering::Acquire));
-        assert_eq!(a.target_step_count(handoff_at - 1), 0);
-        assert_eq!(
-            a.target_step_count(handoff_at),
-            a.steps.len(),
-            "handoff must finish every remaining transcode before eviction"
-        );
-
-        gate.store(true, Ordering::Release);
-        assert!(a.handoff_complete());
-        a.reset();
-        assert!(!gate.load(Ordering::Acquire));
-        assert!(!a.handoff_complete());
     }
 
     #[test]

@@ -82,7 +82,12 @@ __global__ void gdn_chunk_prep(
                 const float other = __shfl_up(pair, d, 32);
                 if (lane >= d) pair += other;
             }
-            const float before = pair - g0 - g1;
+            // Exclusive prefix = the previous lane's inclusive scan value (lane 0: 0). It
+            // depends only on lanes below this one, so a row's gate cumsum never depends on
+            // rows after it (`pair - g0 - g1` made the last valid row of a partial tile round
+            // differently from the same row inside the completed tile).
+            float before = __shfl_up(pair, 1, 32);
+            if (lane == 0) before = 0.0f;
             if (r0 < rows)
                 a[(long long)(chunk0 + r0) * hv + h] = before + g0;
             if (r1 < rows)

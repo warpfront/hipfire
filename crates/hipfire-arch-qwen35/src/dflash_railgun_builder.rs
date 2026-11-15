@@ -350,7 +350,6 @@ fn named_allocations(gpu: &Gpu, request: &WindowRequest<'_>) -> Vec<(String, u64
             ffn_hidden_batch,
             dn_normed_rot_batch,
             positions,
-            rope_positions,
             pos3,
             tokens,
             fa_q_full_batch,
@@ -2033,14 +2032,13 @@ impl WindowBuilder for RailgunWindowBuilder {
         // GDN requant frames. The incumbent HIP-graph verify bakes the frame at
         // capture and a replay reserves none, so the railgun route supplies the
         // plan's authored frame and reserves nothing (the global counter stays
-        // where HIP leaves it). That is byte-exact only where the frame cannot
-        // matter, which `admit_window` guarantees for `Whole16`
-        // (`gdn_frame_independent`): with error feedback on, the Q8 requant is
+        // where HIP leaves it). That is byte-exact because the frame cannot
+        // matter: Q8 state always carries error feedback, so its requant is
         // deterministic round-to-nearest and never reads `frame`
         // (`kernels/src/gated_delta_net_q8.hip:158-163`,
         // `gated_delta_net_q8_fast.hip:533-535`, `..._lanes_varrows.hip`: `frame`
         // appears only in the `else` stochastic seed); FP32 and Q4 state take no
-        // frame at all. EF off is refused as `gdn_frame_dependent`.
+        // frame at all.
         for (id, _frames) in gdn_words(prepared.plan().program()) {
             let authored = prepared.plan().program().words[id.0 as usize].authored;
             inputs.gdn_frames.insert(id, authored);

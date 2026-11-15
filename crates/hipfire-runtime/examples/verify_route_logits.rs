@@ -170,7 +170,6 @@ fn main() {
         config.head_dim,
         1,
         false,
-        false,
     ) {
         eprintln!("verify_route_logits: native fp8 KV refused: {reason}");
         std::process::exit(1);
@@ -206,7 +205,6 @@ fn main() {
         None,
         None,
         None,
-        None,
     )
     .expect("forward_prefill_batch prefix");
     eprintln!("prefill: {:.2}s", t0.elapsed().as_secs_f64());
@@ -235,7 +233,6 @@ fn main() {
             &scratch,
             None,
             Some(&h_buf),
-            None,
             None,
             None,
             None,

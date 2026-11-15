@@ -1,0 +1,22 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "WIDE_MAX_ROWS",
+  "value": 64,
+  "row_key": "rows",
+  "covers": true,
+  "arch": "gfx942",
+  "card": "MI300X; beat ledger row 150, Twin942d.combined oracle, 2026-11-11T12:03:03+00:00..12:03:36+00:00",
+  "summary": "64 is the immutable kernel's structural row capacity (WD_XROWS=64, four 16-column MFMA chains), not an extrapolated performance crossover. The launcher partitions larger batches into slices of at most 64. Its source-pinning unit test checks WIDE_MAX_ROWS and WIDE_XROWS against WD_XROWS. On the combined owner binary, both source and exact-image Tier C passed every direct wide/route cell at rows 1..64,65,257,1025 with F32/BF16 X and F32/BF16 D, all MFMA_SHAPES plus the four-member mixed-dtype group: 4008 bitwise checks and 12 correctly declined untouched outputs per arm. The committed log is the exact-image arm (4/4 family cases, zero skipped/failed); the source arm has SHA256 69c064c081f52a252d8fa582dcada93828ec787fe4ac521881ab833256646238. No speedup or permission to enable the default-off wide route is claimed.",
+  "oracle_binary_sha256": "ef8d2fe64aa18c0654a4cf0c763a9607d287d8cdc371c6d4e8f2162e2cba8038",
+  "device_elf_sha256": "141276895e3dd53cb51746e7fb8f761d2e29929dc36147c719d0fe8355dec1e6",
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/gfx942_wide_capacity.txt",
+      "sha256": "c938dc2b62b573393535c26f2aba67469e5a05f249760e85e09bc22ae80b8ae0"
+    },
+    {
+      "path": "kernels/src/gemm_bf16_mfma_wide.gfx942.hip",
+      "sha256": "49f356151cf2fac0c31e6e965bf7cf7e5a9968e2c8970e90f691e4acac512567"
+    }
+  ]
+}

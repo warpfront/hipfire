@@ -269,7 +269,7 @@ fn plan_phases(
     let dim = target.config.dim;
     let vocab = target.config.vocab_size;
 
-    if !dflash_verify_hip_graph_route_ok(gpu, target, verify_scratch, b, true) {
+    if !dflash_verify_hip_graph_route_ok(gpu, target, verify_scratch, b) {
         return Err(
             "plan_dflash_verify: this window does not take the HIP-graph verify body \
              (env gate, embedding format, pbs eligibility or IU4 scope); the emitted twin \
@@ -277,7 +277,6 @@ fn plan_phases(
                 .into(),
         );
     }
-    let moe_env = hipfire_config::developer_var("HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD").ok();
     let head_dtype = target.weights.output.gpu_dtype;
     if !dflash_batched_lm_head_supported(head_dtype) {
         return Err(format!(
@@ -285,12 +284,7 @@ fn plan_phases(
              (per-row GEMV + D2H is not plannable)"
         ));
     }
-    if dflash_moe_verify_graph_lmhead_eligible(
-        target.config.num_experts,
-        false,
-        false,
-        moe_env.as_deref(),
-    ) {
+    if dflash_moe_verify_graph_lmhead_eligible(target.config.num_experts, false) {
         return Err(
             "plan_dflash_verify: the MoE extended verify graph (lm_head+argmax captured) is \
              not planned; dense chain verify only"
@@ -298,7 +292,7 @@ fn plan_phases(
         );
     }
 
-    let fusion = dflash_verify_fusion_ctx(gpu, target, false, b, required_tokens);
+    let fusion = dflash_verify_fusion_ctx(gpu, target, b, required_tokens);
     let final_hidden = verify_scratch.final_hidden.sub_offset(0, b * dim);
     let math = verify_dense_math(gpu);
 
@@ -325,7 +319,6 @@ fn plan_phases(
             Some(hidden_rb),
             Some(&final_hidden),
             gdn_tape,
-            None,
             false, // DFlash computes all verify logits from final_hidden
             fusion,
         )

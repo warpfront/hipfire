@@ -78,12 +78,12 @@ All line numbers in `crates/hipfire-arch-qwen35/src/qwen35.rs` unless noted.
 3. **`is_batchable_la(dt, arch)`** (:7406) — LA-weight batchability. E8 clause
    `e8_with_wmma` (:7519): `MFP4G32E8 && arch∈{gfx1100..1201} && HIPFIRE_E8_GFX12=1`.
 4. **`moe_ffn_batched_admissible(ffn, admit_mq6, arch)`** (:7901) — computes
-   `admit_e8`, `admit_paro`, then delegates to `_for_dtypes`.
+   `admit_e8`, then delegates to `_for_dtypes`.
    - **`admit_e8`** (:7911): `arch∈{gfx1100..1201} && HIPFIRE_E8_GFX12=1`.
    - **`admit_mq6`** (:7823) = `mq6_batched_admit_enabled_from_env(`
      `HIPFIRE_MOE_MQ6_ADMIT, arch)` (:7893). **Default: `gfx11*||gfx12*`**
      (was `gfx12*` only — the silent gfx11 prefill regression).
-5. **`moe_ffn_batched_admissible_for_dtypes(dtypes, admit_mq6, admit_paro,
+5. **`moe_ffn_batched_admissible_for_dtypes(dtypes, admit_mq6,
    admit_e8)`** (:7700) — the arms (first match wins):
    - `routed_ok = routed_mixed_merged || (expert_gate_up_uniform &&
      expert_down_uniform)` (:7706). `routed_mixed_merged = expert_dtype_tags.
@@ -93,7 +93,7 @@ All line numbers in `crates/hipfire-arch-qwen35/src/qwen35.rs` unless noted.
      MQ6 is why gfx11 needed the widen). Returns early — never reaches the E8
      arms below.
    - uniform-E8 / Q8-shared arm (:7732); uniform-E8 / {Q8,E8}-shared arm (:7749);
-     PARO (:7766); uniform MQ6 (:7776); uniform MQ4 (:7784).
+     uniform MQ6 (:7776); uniform MQ4 (:7784).
 6. **Tag table** (:4940, in `load_moe_ffn`) — per-expert `gpu_dtype → u8` tag:
    `0=MQ6, 1=MQ2L, 2=MQ4, 3=MQ3L, 4=MFP4G32E8`. (E8 was the missing tag → fell
    through `_=>2` (MQ4) → read as MQ4 → NaN. This was the whole bug.)

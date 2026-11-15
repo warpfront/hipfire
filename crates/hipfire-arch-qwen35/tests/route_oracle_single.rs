@@ -41,7 +41,7 @@
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch, StateQuant};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::llama::{KvCache, VMode};
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -62,7 +62,7 @@ const REPEAT_WINDOW: usize = 64;
 /// oracle never relies on that — the tier is constructed explicitly.
 const PINNED_KV_TIER: &str = "fwht3";
 /// Env knob selecting load B's KV tier. Unset (or `fwht3`) = same pinned
-/// tier as A (green). Set to `q8`/`asym3` for the anti-vacuity red run.
+/// tier as A (green). Set to `q8` for the anti-vacuity red run.
 const KV_TIER_B_ENV: &str = "HIPFIRE_ROUTE_ORACLE_KV_B";
 
 // Fixture identities (full-file sha256, exact bytes). The dense pin is the
@@ -123,17 +123,9 @@ fn build_kv(
             head_dim,
             MAX_SEQ,
             MAX_SEQ,
+            VMode::Q8,
         )
         .expect("fwht3 KV"),
-        "asym3" => KvCache::new_gpu_asym3_capped_filtered(
-            gpu,
-            is_kv_layer,
-            n_kv_heads,
-            head_dim,
-            MAX_SEQ,
-            MAX_SEQ,
-        )
-        .expect("asym3 KV"),
         "q8" => KvCache::new_gpu_q8_capped_filtered(
             gpu,
             is_kv_layer,
@@ -143,7 +135,7 @@ fn build_kv(
             MAX_SEQ,
         )
         .expect("q8 KV"),
-        other => panic!("{KV_TIER_B_ENV}='{other}' unknown (expected fwht3|asym3|q8)"),
+        other => panic!("{KV_TIER_B_ENV}='{other}' unknown (expected fwht3|q8)"),
     }
 }
 
@@ -375,7 +367,7 @@ fn decode_run(path: &str, kv_tier: &str, prompt_tokens: &[u32], label: &str) -> 
     for t in kv.k_gpu.iter().chain(kv.v_gpu.iter()) {
         kv_payload.push(download_bytes(&gpu, t));
     }
-    // Rotation tables (FWHT signs / Givens cos-sin): fixed-seed state, part of
+    // Rotation tables (FWHT sign tables): fixed-seed state, part of
     // the reproducible identity. Absent on the q8 tier — record length-tagged.
     for t in [&kv.givens_cos, &kv.givens_sin].into_iter().flatten() {
         kv_payload.push(download_bytes(&gpu, t));

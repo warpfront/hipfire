@@ -11,6 +11,7 @@
 
 pub mod calibration;
 pub mod devices;
+pub mod dflash_floor;
 pub mod effective;
 pub mod emu;
 pub mod emu_budget;
@@ -21,6 +22,7 @@ pub mod host_memory;
 pub mod http_auth;
 pub mod intent;
 pub mod load_summary;
+pub mod process_priority;
 pub mod rocm;
 pub mod secret;
 pub mod tuning;
@@ -49,13 +51,14 @@ pub enum ConfigError {
     #[error("unknown configuration key '{0}'")]
     UnknownKey(String),
     #[error(
-        "configuration key '{key}' was removed in {removed_in} ({reason}); it has no effect — \
-         delete it from config.toml if it is still set"
+        "configuration key '{key}' was removed in {removed_in} ({reason}); replacement: \
+         {replacement} — delete it from config.toml"
     )]
     RetiredKey {
         key: &'static str,
         removed_in: &'static str,
         reason: &'static str,
+        replacement: &'static str,
     },
     #[error("invalid value for {key}: {message}")]
     InvalidValue { key: String, message: String },
@@ -497,6 +500,17 @@ impl ConfigField {
 
         if valid {
             Ok(())
+        } else if let Some(message) = matches!(self.key, "memory.kv_cache" | "memory.kv_k")
+            .then(|| match value {
+                ConfigValue::String(v) => removed_kv_name_error(v),
+                _ => None,
+            })
+            .flatten()
+        {
+            Err(ConfigError::InvalidValue {
+                key: self.key.to_owned(),
+                message,
+            })
         } else if matches!(self.rule, ValueRule::KvBackend)
             && matches!(value, ConfigValue::String(v) if v == "contiguous")
         {
@@ -565,6 +579,14 @@ fn parse_bool(raw: &str) -> Option<bool> {
     }
 }
 
+/// The schema boolean grammar (`1/true/on/yes`, `0/false/off/no`, ASCII
+/// case-insensitive; anything else is `None`) for the flags GC legacy-spelling
+/// harness. Pure; same function as the private schema parse.
+#[doc(hidden)]
+pub fn legacy_spelling_schema_bool(raw: &str) -> Option<bool> {
+    parse_bool(raw)
+}
+
 fn valid_advanced_kv(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("advanced:k=") else {
         return false;
@@ -586,24 +608,7 @@ fn expand_tilde(value: &str) -> PathBuf {
 
 // Qwen-only K/V axis overrides. Empty is the unset default (not an authored
 // format); consumers omit BuiltIn empty values from IPC.
-const KV_K_NAMES: &[&str] = &[
-    "",
-    "q8",
-    "fwht2",
-    "fwht3",
-    "fwht4",
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
-    "asym2",
-    "asym3",
-    "asym4",
-    "turbo",
-    "turbo2",
-    "turbo3",
-    "turbo4",
-    "legacy-asym2",
-    "legacy-asym3",
-    "legacy-asym4",
-];
+const KV_K_NAMES: &[&str] = &["", "q8", "fwht2", "fwht3", "fwht4"];
 const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 
 // The union of every KV-mode name any SITE accepts. This is the config
@@ -612,28 +617,36 @@ const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 // which warn and fall back for anything they cannot allocate. `bf16` is
 // maple's default plus the Qwen quality-control arm; `fp8` is admitted at
 // the single-GPU Qwen sites under the carrier's exact gfx1201/geometry guards.
-// `legacy-asym3` is the Gemma4 lowered full-tier opt-out back to Givens asym3
-// (on Qwen it names the same legacy K as `--kv-k legacy-asym3`).
 const KV_MODES: &[&str] = &[
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3 (asymN / turbo*)
-    "auto",
-    "f32",
-    "f16",
-    "bf16",
-    "q8",
-    "asym4",
-    "asym3",
-    "asym2",
-    "fwht4",
-    "fwht3",
-    "fwht2",
-    "turbo",
-    "turbo4",
-    "turbo3",
-    "turbo2",
-    "fp8",
-    "legacy-asym3",
+    "auto", "f32", "f16", "bf16", "q8", "fwht4", "fwht3", "fwht2", "fp8",
 ];
+
+/// KV names removed in 0.5.0: the Givens `legacy-asymN` tiers and the
+/// `asymN` / `turbo*` aliases of `fwhtN`. Rejected by `memory.kv_cache` /
+/// `memory.kv_k` validation, the CLI/env parsers and the daemon load request.
+pub const REMOVED_KV_NAMES: &[&str] = &[
+    "asym2",
+    "asym3",
+    "asym4",
+    "legacy-asym2",
+    "legacy-asym3",
+    "legacy-asym4",
+    "turbo",
+    "turbo2",
+    "turbo3",
+    "turbo4",
+];
+
+/// The 0.5.0 removal message for an authored KV name, `None` for every other
+/// name (including unset / `auto`).
+pub fn removed_kv_name_error(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    REMOVED_KV_NAMES.contains(&name).then(|| {
+        format!(
+            "KV name '{name}' was removed in 0.5.0 (Givens asym KV and the asymN/turboN aliases); use fwht2|fwht3|fwht4 or q8"
+        )
+    })
+}
 // GDN/DeltaNet recurrent-state storage names accepted by `memory.state_quant`.
 // A schema allow-list only: the Qwen3.5 (`parse_state_quant`) and Qwen4
 // (`resolve_state_format`) loaders each honor or refuse what they cannot serve
@@ -788,7 +801,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_KV_MODE"),
-        "KV cache format; auto inherits the registry recommendation, then q8 — except single-GPU Qwen on exact gfx1201, where auto means native fp8 (stage-b FA2 arithmetic). DeepSeek V4 currently supports f32 and f16. asymN and turbo* are deprecated (removal in 0.5.0); use fwhtN or q8."
+        "KV cache format; auto inherits the registry recommendation, then q8 — except single-GPU Qwen on exact gfx1201, where auto means native fp8 (stage-b FA2 arithmetic). DeepSeek V4 currently supports f32 and f16."
     ),
     field!(
         "memory.kv_adaptive",
@@ -800,7 +813,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_KV_ADAPTIVE"),
-        "Runtime VRAM-fit KV precision policy."
+        "Runtime VRAM-fit KV precision policy. Requires an FWHT K mode (memory.kv_cache fwht*) to take effect; `advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>` sets explicit K/V floor tiers."
     ),
     field!(
         "memory.state_quant",
@@ -1175,7 +1188,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         None,
-        "Logical KV context capacity."
+        "Logical KV context capacity. Allocated at load, so a change takes effect on the next load."
     ),
     field!(
         "memory.kv_backend",
@@ -1199,7 +1212,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         None,
-        "Qwen-only K-axis override; empty leaves the mode-preset K unchanged. asymN, turboN and legacy-asymN are deprecated (removal in 0.5.0); use fwhtN or q8."
+        "Qwen-only K-axis override; empty leaves the mode-preset K unchanged. asymN, turbo* and legacy-asymN were removed in 0.5.0; use fwhtN or q8."
     ),
     field!(
         "memory.kv_v",
@@ -1223,7 +1236,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         None,
-        "Visible reasoning mode."
+        "Visible reasoning mode. Interacts with speculation.dflash: an active thinking budget (max_think_tokens > 0) makes DFlash fall back to plain decode, so turn thinking off to use spec-decode."
     ),
     field!(
         "reasoning.effort",
@@ -1235,7 +1248,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         None,
-        "Model-specific reasoning effort; auto preserves the carrier fallback."
+        "Model-specific reasoning effort; auto preserves the carrier fallback. The offered levels come from the model's chat template, so they differ per model (Qwen3.8 has low/medium/xhigh); a level the model lacks is projected up to its next real one, never down. A model with no native effort falls back to the reasoning.budget ladder."
     ),
     field!(
         "reasoning.budget",
@@ -1247,7 +1260,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         None,
-        "Named per-turn reasoning budget."
+        "Named per-turn reasoning budget. A cap, not a reasoning dial: it truncates <think>, it does not shape it. On a model with a native reasoning.effort (Qwen3.8, DeepSeek4) set the effort instead; a budget below what that effort spends force-closes <think> mid-thought. Only applies when thinking is on."
     ),
     field!(
         "reasoning.max_tokens",
@@ -1404,6 +1417,17 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_SERVE_BATCH_SAMPLED",
         "Default on (applies only with serve.vmm_batch). Admit sampled (temperature>0) requests to the VMM batch route only in the lane mode the singleton route selects for them, each proven byte-identical to that singleton (AR, native MTP, FAST_SAMPLE selector-chain DFlash). 0 is the kill switch: sampled requests stay on the serialized singleton route."
+    ),
+    bridge_field!(
+        "serve.batch_exact",
+        "serve_batch_exact",
+        Serve,
+        Process,
+        DefaultValue::String("off"),
+        ValueRule::Enum(&["off", "greedy", "seeded"]),
+        true,
+        "HIPFIRE_QWEN4_LANE_ROW_EXACT",
+        "Opt-in (default off). Flash-Next native-MTP lanes on exact gfx1201: greedy makes greedy output independent of batch composition, seeded also seeded sampled requests. Costs decode step time at C4/C8 (0.54-0.74x tok/s measured on R9700 EP2); off is the default."
     ),
     field!(
         "serve.queue_timeout_ms",
@@ -1664,7 +1688,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_DFLASH_LOOKUP"),
-        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. auto (default) and on/1 arm it on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no CACTUS); off/0 disables it. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
+        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. auto (default) and on/1 arm it on a singleton DFlash2 selector chain (no retained-PM4 verify, no CACTUS); off/0 disables it. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
     ),
     field!(
         "speculation.dflash",
@@ -1676,7 +1700,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_DFLASH_MODE"),
-        "DFlash eligibility policy."
+        "DFlash eligibility policy. DFlash needs its own paired draft and never falls back to the MTP head. A thinking budget routes a DFlash draft to plain decode: the dispatch gate bails when max_think_tokens > 0 and the think block is not closed (the default thinking-on path sets a budget), so turn thinking off, or set its budget to 0, and use greedy to get spec-decode."
     ),
     field!(
         "vision.mode",
@@ -1713,117 +1737,6 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_DFLASH_NGRAM_BLOCK"),
         "Verify-path n-gram defense."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.sidecar",
-        "cask_sidecar",
-        Memory,
-        ModelLoad,
-        DefaultValue::String(""),
-        ValueRule::String,
-        true,
-        true,
-        Some("HIPFIRE_CASK_SIDECAR"),
-        "Deprecated CASK (removal in 0.5.0): TriAttention sidecar path; empty disables eviction."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.enabled",
-        "cask",
-        Memory,
-        ModelLoad,
-        DefaultValue::Bool(false),
-        ValueRule::Bool,
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): enable core-aware m-folding."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.budget",
-        "cask_budget",
-        Memory,
-        ModelLoad,
-        DefaultValue::Integer(512),
-        ValueRule::Integer {
-            min: 64,
-            max: 65536
-        },
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): active-token target after eviction."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.beta",
-        "cask_beta",
-        Memory,
-        ModelLoad,
-        DefaultValue::Integer(128),
-        ValueRule::Integer { min: 0, max: 65536 },
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): eviction hysteresis."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.handoff_tokens",
-        "cask_handoff_tokens",
-        Memory,
-        ModelLoad,
-        DefaultValue::Integer(0),
-        ValueRule::Integer { min: 0, max: 1048576 },
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): one-way kv_adaptive to plain TriAttention handoff position; zero disables it."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.core_fraction",
-        "cask_core_frac",
-        Memory,
-        ModelLoad,
-        DefaultValue::Float(0.5),
-        ValueRule::Float {
-            min: 0.0,
-            max: 1.0,
-            min_inclusive: true
-        },
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): fraction of the budget retained as core."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.fold",
-        "cask_fold_m",
-        Memory,
-        ModelLoad,
-        DefaultValue::Integer(2),
-        ValueRule::Integer { min: 1, max: 16 },
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): merge factor."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
-    field!(
-        "memory.cask.auto_attach",
-        "cask_auto_attach",
-        Memory,
-        ModelLoad,
-        DefaultValue::Bool(false),
-        ValueRule::Bool,
-        true,
-        true,
-        None,
-        "Deprecated CASK (removal in 0.5.0): discover a matching TriAttention sidecar when explicitly enabled."
     ),
     field!(
         "prompt.normalize",
@@ -1984,201 +1897,6 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PROMPT_CACHE_UNBOUNDED",
         "Remove the assistant-turn cache capacity bound."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.mode",
-        "prefill_compression",
-        Speculation,
-        ModelLoad,
-        DefaultValue::String("off"),
-        ValueRule::Enum(&["off", "auto", "always"]),
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): speculative-prefill policy."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.threshold",
-        "prefill_threshold",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(32768),
-        ValueRule::Integer {
-            min: 0,
-            max: 1048576
-        },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): auto-mode token threshold."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.keep_ratio",
-        "prefill_keep_ratio",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Float(0.05),
-        ValueRule::Float {
-            min: 0.0,
-            max: 1.0,
-            min_inclusive: false
-        },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): retained-token ratio."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.alpha",
-        "prefill_alpha",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Float(0.85),
-        ValueRule::Float {
-            min: 0.0,
-            max: 1.0,
-            min_inclusive: true
-        },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): block-selection strictness."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.min_keep",
-        "prefill_min_keep",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(2048),
-        ValueRule::Integer {
-            min: 0,
-            max: 1048576
-        },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): retained-token floor."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.sink",
-        "prefill_sink",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(256),
-        ValueRule::Integer { min: 0, max: 65536 },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): always-retained prompt prefix."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.recent",
-        "prefill_recent",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(1024),
-        ValueRule::Integer { min: 0, max: 65536 },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): always-retained prompt tail."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.block",
-        "prefill_block",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(128),
-        ValueRule::Integer { min: 1, max: 4096 },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): scoring block size."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.drafter",
-        "prefill_drafter",
-        Speculation,
-        ModelLoad,
-        DefaultValue::String(""),
-        ValueRule::String,
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): drafter path."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.drafter_device",
-        "prefill_drafter_device",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(-1),
-        ValueRule::Integer { min: -1, max: 15 },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): drafter device; -1 uses the target device."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.profile",
-        "prefill_profile",
-        Speculation,
-        Diagnostic,
-        DefaultValue::Bool(false),
-        ValueRule::Bool,
-        false,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): emit PFlash stage timings."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.sparse_threshold",
-        "prefill_sparse_threshold",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(32768),
-        ValueRule::Integer {
-            min: 0,
-            max: 1048576
-        },
-        true,
-        true,
-        None,
-        "Deprecated PFlash (removal in 0.5.0): sparse-attention threshold."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    field!(
-        "speculation.prefill.drafter_kv",
-        "prefill_drafter_kv",
-        Speculation,
-        ModelLoad,
-        DefaultValue::String("q8"),
-        ValueRule::Enum(&["q8", "fwht4", "fwht3", "fwht2"]),
-        true,
-        true,
-        Some("HIPFIRE_PFLASH_DRAFTER_KV"),
-        "Deprecated PFlash (removal in 0.5.0): KV quantization used by the PFlash drafter scorer."
-    ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
-    diagnostic_field!(
-        "diagnostic.pflash.score_layer",
-        "pflash_score_layer",
-        DefaultValue::Null,
-        ValueRule::NullableInteger { min: 0, max: 65535 },
-        "HIPFIRE_PFLASH_SCORE_LAYER",
-        "Deprecated PFlash (removal in 0.5.0): override the PFlash scoring layer; null uses model policy."
-    ),
     field!(
         "speculation.mtp",
         "mtp_mode",
@@ -2228,18 +1946,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Native Qwen4 MTP n-gram copy lane (verbatim-copy matcher, adaptive take of up to the row-exact verify rows minus one, row-0 confirmation only until the copy source is established, kept on floor-retired requests). on/1 arms it wherever the native Qwen4 n-gram source is armed (triple 5/1/63); off/0 keeps the 5/3/3 pool with row-0 confirmation on every takeover (kill switch); auto (default) arms it for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 and leaves every other GPU off."
     ),
     field!(
-        "speculation.mtp_sampled",
-        "mtp_sampled",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Bool(true),
-        ValueRule::Bool,
-        false,
-        false,
-        Some("HIPFIRE_MTP_SAMPLED"),
-        "Qwen4 (Flash-Next) native MTP for sampled (temperature > 0) requests: lossless speculative rejection sampling against the AR sampler's distribution. On by default; off routes sampled requests to AR."
-    ),
-    field!(
         "speculation.mode",
         "speculation",
         Speculation,
@@ -2249,7 +1955,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_SPECULATION"),
-        "Canonical speculative-decoding selector."
+        "Canonical speculative-decoding selector. Forcing `dflash` needs a DFlash draft and never aliases to the MTP head; use `mtp` for the head. speculation.dflash and speculation.mtp still filter each mechanism under `auto`."
     ),
     field!(
         "speculation.dspark_confidence",
@@ -2300,30 +2006,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Minimum n-gram match count."
     ),
     field!(
-        "speculation.ddtree_budget",
-        "ddtree_budget",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(0),
-        ValueRule::Integer { min: 0, max: 64 },
-        true,
-        true,
-        Some("HIPFIRE_DDTREE_BUDGET"),
-        "DFlash verify-tree node budget; zero selects chain mode."
-    ),
-    field!(
-        "speculation.ddtree_topk",
-        "ddtree_topk",
-        Speculation,
-        ModelLoad,
-        DefaultValue::Integer(4),
-        ValueRule::Integer { min: 1, max: 8 },
-        true,
-        true,
-        Some("HIPFIRE_DDTREE_TOPK"),
-        "DFlash verify-tree fanout."
-    ),
-    field!(
         "prompt.chat_template",
         "chat_template",
         Prompt,
@@ -2346,15 +2028,6 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_DEFAULT_CHATML"),
         "Allow the fallback ChatML frame when no template resolves."
-    ),
-    process_bool_field!(
-        "prompt.jinja_chat",
-        "jinja_chat",
-        Prompt,
-        true,
-        false,
-        "HIPFIRE_JINJA_CHAT",
-        "Render chat prompts through the model Jinja template; set HIPFIRE_JINJA_CHAT=0 for the hand-rolled ChatScaffold path."
     ),
     process_field!(
         "hardware.devices",
@@ -2401,6 +2074,18 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         Some("HIPFIRE_TOPOLOGY_HETERO_EXPERTS"),
         "Qwen4 (Flash-Next) heterogeneous expert split: the gfx arch of the device that holds and computes cold routed experts (v1: \"gfx1151\" only), beside a gfx1201 primary that runs the trunk and hot experts. Needs hardware.devices = \"gfx1201,gfx1151\" (the gfx1201 first) and hardware.allow_mixed_arch; cannot combine with topology.ep or topology.pp (Qwen4 admits no tp > 1). A key on any other device set refuses the load. Opt-in; null = off."
+    ),
+    field!(
+        "topology.ep_ar_wire",
+        "ep_ar_wire",
+        Hardware,
+        ModelLoad,
+        DefaultValue::String("bf16"),
+        ValueRule::Enum(topology::EP_AR_WIRES),
+        false,
+        true,
+        None,
+        "Wire format of the mixer (GDN out_proj / QSA o_proj) partials in the Flash-Next two-card trunk-shard all-reduce (topology.ep = 2 over exactly two gfx1201 cards): bf16 (default; each rank's f32 partial is rounded to bf16 before the fold) or f32 (the partials travel unrounded and the fold rounds p0 + p1 once, closer to one card at about 2% decode and prefill cost). The FFN partials always travel as bf16 (they are bf16-exact). Ignored by every other load."
     ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",
@@ -2547,17 +2232,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Minimum batch size for rocBLAS dispatch."
     ),
     diagnostic_field!(
-        "diagnostic.kernel.ddtree_logw_cutoff",
-        "ddtree_logw_cutoff",
-        DefaultValue::Null,
-        ValueRule::NullableFloat {
-            min: 0.0,
-            max: f64::MAX
-        },
-        "HIPFIRE_DDTREE_LOGW_CUTOFF",
-        "Positive DDTree cumulative-log-weight expansion cutoff."
-    ),
-    diagnostic_field!(
         "diagnostic.kernel.lloyd_mb4",
         "lloyd_mb4",
         DefaultValue::Null,
@@ -2666,15 +2340,6 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PREFILL_CHUNK_ROWS",
         "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung). Resident Qwen3.5/3.6 MoE models (fully resident, single device, grouped MQ4 producers) take one widened rung instead: unset requests 4096 rows, admitted only when the projected prefill batch scratch plus grouped/projection workspace plus the 1 GiB margin fit the free VRAM, else the incumbent 512 (arch default) ceiling with no intermediate rung; an explicit value below 4096 or HIPFIRE_PREFILL_MAX_BATCH keeps the incumbent, one at or above 4096 requests the admitted rung (the actual admitted chunk is logged as `prefill_chunk: requested=… admitted=…`). Dense Qwen3.5/3.6 keeps the 8192 ladder above. Qwen4 (Flash-Next) rounds it down to 256 rows; its auto expert placement is sized from the same chunk: the explicit value, else 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere; exact gfx1100 on a measured narrow discrete host link (below 16 GB/s, probed before placement is sized) defaults to 8192, ceding resident expert layers for the wider chunk (an explicit value never probes and is authoritative for placement; 1536 opts out)."
     ),
-    process_bool_field!(
-        "speculation.draft_f16",
-        "draft_f16",
-        Speculation,
-        true,
-        false,
-        "HIPFIRE_DRAFT_F16",
-        "Keep DFlash draft activations in FP16."
-    ),
     diagnostic_bool_field!(
         "diagnostic.prompt_token_heat",
         "prompt_token_heat",
@@ -2782,22 +2447,6 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_MOE_GROUPED_I8",
         "Override grouped MoE i8 dispatch."
-    ),
-    process_auto_bool_field!(
-        "kernel.moe_paro_i8",
-        "moe_paro_i8",
-        Kernel,
-        true,
-        "HIPFIRE_MOE_PARO_I8",
-        "Override architecture-selected Paro grouped-GEMM i8 dispatch."
-    ),
-    process_auto_bool_field!(
-        "kernel.moe_paro_i8_k8",
-        "moe_paro_i8_k8",
-        Kernel,
-        true,
-        "HIPFIRE_MOE_PARO_I8_K8",
-        "Override architecture-selected Paro grouped-GEMM i8 K8 dispatch."
     ),
     process_auto_bool_field!(
         "kernel.rdna3_hfq4_qkvza_k2048",
@@ -3290,15 +2939,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable weight-only MMQ dispatch."
     ),
     process_bool_field!(
-        "kernel.lm_head_wmma",
-        "lm_head_wmma",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_LM_HEAD_WMMA",
-        "Allow WMMA LM-head dispatch."
-    ),
-    process_bool_field!(
         "kernel.lm_head_overwrite",
         "lm_head_overwrite",
         Kernel,
@@ -3540,15 +3180,6 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_MOE_HFQ6_V2",
         "Enable HFQ6 grouped MoE v2 dispatch."
     ),
-    process_bool_field!(
-        "kernel.moe_grouped_gemm",
-        "moe_grouped_gemm",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_MOE_GROUPED_GEMM",
-        "Allow grouped-GEMM MoE prefill."
-    ),
     diagnostic_bool_field!(
         "diagnostic.blob_force",
         "blob_force",
@@ -3579,15 +3210,6 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_AR_GRAPH",
         "Allow autoregressive forward graph capture when otherwise eligible. Default on, except Windows gfx1100, where it defaults off (opt-in) because graph replay silently produced wrong output (#655); an explicit true/false or HIPFIRE_AR_GRAPH always wins."
-    ),
-    process_bool_field!(
-        "experimental.graph.moe",
-        "graph_moe",
-        Experimental,
-        true,
-        true,
-        "HIPFIRE_GRAPH_MOE",
-        "Allow graph capture for supported MoE forward paths."
     ),
     process_bool_field!(
         "kernel.deterministic",
@@ -3650,24 +3272,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Fuse the Gemma 4 E-series PLE activation and strided multiply; auto enables validated gfx1100/gfx1201."
     ),
     process_bool_field!(
-        "kernel.deepseek4_q8_wmma",
-        "deepseek4_q8_wmma",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_DEEPSEEK4_Q8_WMMA",
-        "Allow DeepSeek4 Q8 WMMA prefill."
-    ),
-    process_bool_field!(
-        "kernel.deepseek4_q8_4w",
-        "deepseek4_q8_4w",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_DEEPSEEK4_Q8_4W",
-        "Allow the DeepSeek4 four-wave Q8 WMMA tile."
-    ),
-    process_bool_field!(
         "kernel.rope_interleaved_legacy",
         "rope_interleaved_legacy",
         Kernel,
@@ -3711,51 +3315,6 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_FORCE_UNFUSED",
         "Force supported projection paths to remain unfused."
-    ),
-    process_bool_field!(
-        "speculation.dflash_tree",
-        "dflash_tree",
-        Speculation,
-        false,
-        true,
-        "HIPFIRE_DFLASH_TREE",
-        "Enable DDTree tree-SWOR verification."
-    ),
-    process_bool_field!(
-        "speculation.ddtree_tree_la",
-        "ddtree_tree_la",
-        Speculation,
-        true,
-        true,
-        "HIPFIRE_DDTREE_TREE_LA",
-        "Allow DDTree linearized-ancestor tape replay."
-    ),
-    process_bool_field!(
-        "speculation.dflash_fast_sample",
-        "dflash_fast_sample",
-        Speculation,
-        true,
-        true,
-        "HIPFIRE_DFLASH_FAST_SAMPLE",
-        "Allow DFlash GPU sampling on sampled verification."
-    ),
-    process_bool_field!(
-        "speculation.dflash_q8_lmhead_wmma",
-        "dflash_q8_lmhead_wmma",
-        Speculation,
-        true,
-        true,
-        "HIPFIRE_DFLASH_Q8_LMHEAD_WMMA",
-        "Allow Q8 WMMA LM-head dispatch during DFlash verification."
-    ),
-    process_bool_field!(
-        "fusions.qkv_bias",
-        "fuse_qkv_bias",
-        Fusions,
-        true,
-        false,
-        "HIPFIRE_FUSE_QKV_BIAS",
-        "Fold supported QKV bias additions into fused QKV decode."
     ),
     diagnostic_bool_field!(
         "diagnostic.qkv_bias",
@@ -3926,13 +3485,6 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_REPLAY_PM4_ACQUIRE_POLICY",
         "Cache-acquire policy between retained PM4 launches."
     ),
-    diagnostic_bool_field!(
-        "diagnostic.replay.pm4_gcr_trim",
-        "replay_pm4_gcr_trim",
-        true,
-        "HIPFIRE_REPLAY_PM4_GCR_TRIM",
-        "Trim redundant GCR operations on supported retained PM4 routes."
-    ),
     process_auto_bool_field!(
         "replay.pm4_gfx11_vmem_acquire",
         "replay_pm4_gfx11_vmem_acquire",
@@ -3975,15 +3527,6 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS",
         "gfx1151 compute-resource-limits packet policy."
     ),
-    // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CU masking on RDNA hung the R9700 MES (2026-10-14); refused
-    diagnostic_field!(
-        "diagnostic.replay.gfx1151_cu_count",
-        "gfx1151_redline_cu_count",
-        DefaultValue::String("all"),
-        ValueRule::String,
-        "HIPFIRE_GFX1151_REDLINE_CU_COUNT",
-        "Refused: any value other than all fails PM4 replay preparation (CU masks on RDNA hung the R9700 MES on 2026-10-14). Default all."
-    ),
     diagnostic_field!(
         "diagnostic.replay.gfx1151_entry_acquire",
         "gfx1151_pm4_entry_acquire",
@@ -4022,18 +3565,6 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         Some("HIPFIRE_QWEN4_NPU_TRUNK_CAL"),
         "NPU trunk calibration path; empty resolves to <hipfire home>/npu-trunk/calibration.json; absent file uses the keyed builtin; never read when effectively off."
-    ),
-    field!(
-        "fusions.policy",
-        "fusion_policy",
-        Fusions,
-        ModelLoad,
-        DefaultValue::String("safe"),
-        ValueRule::Enum(&["safe", "off"]),
-        true,
-        false,
-        None,
-        "Certified fusion policy; individual kernel selection remains compiled."
     ),
 ];
 
@@ -4077,6 +3608,7 @@ const BOOTSTRAP_ENV: &[&str] = &[
 pub fn is_developer_key(key: &str) -> bool {
     key.strip_prefix(DEVELOPER_PREFIX)
         .is_some_and(valid_developer_suffix)
+        && retired_config_key(key).is_none()
 }
 
 /// `developer.*` keys with a typed boolean value: `true`, `false`, `1` or `0`
@@ -4169,21 +3701,6 @@ fn valid_developer_suffix(suffix: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-/// Key prefixes (canonical names) of the CASK and PFlash research features,
-/// deprecated since 0.4.0 with removal in 0.5.0.
-const DEPRECATED_KEY_PREFIXES: &[&str] =
-    &["memory.cask.", "speculation.prefill.", "diagnostic.pflash."];
-
-/// True when `key` (canonical or legacy flat name) belongs to a deprecated
-/// CASK/PFlash family: `memory.cask.*`, `speculation.prefill.*` or
-/// `diagnostic.pflash.*`.
-pub fn is_deprecated_key(key: &str) -> bool {
-    let canonical = field(key).map_or(key, |schema| schema.key);
-    DEPRECATED_KEY_PREFIXES
-        .iter()
-        .any(|prefix| canonical.starts_with(prefix))
-}
-
 pub fn canonical_config_key(key: &str) -> Option<String> {
     field(key)
         .map(|schema| schema.key.to_owned())
@@ -4191,27 +3708,557 @@ pub fn canonical_config_key(key: &str) -> Option<String> {
 }
 
 /// A config key that shipped in a release and was later removed from the
-/// schema. Through its deprecation window (until `ignored_until`) a config
-/// file that still sets it loads with a warning and the value is ignored;
-/// keys that never shipped stay unknown and fail the load.
+/// schema. Setting it (config file, `config set`) fails with
+/// [`ConfigError::RetiredKey`], which names the removal and its replacement;
+/// keys that never shipped stay unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetiredConfigKey {
     pub key: &'static str,
     pub legacy_key: &'static str,
     pub shipped_in: &'static str,
     pub removed_in: &'static str,
-    pub ignored_until: &'static str,
     pub reason: &'static str,
+    pub replacement: &'static str,
 }
 
-pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[RetiredConfigKey {
-    key: "kernel.mw16",
-    legacy_key: "mw16",
-    shipped_in: "0.3.1",
-    removed_in: "0.4.1",
-    ignored_until: "0.5.0",
-    reason: "the MW16 GEMM experiment was removed",
-}];
+pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
+    RetiredConfigKey {
+        key: "kernel.mw16",
+        legacy_key: "mw16",
+        shipped_in: "0.3.1",
+        removed_in: "0.4.1",
+        reason: "the MW16 GEMM experiment was removed",
+        replacement: "none; the default GEMM path applies",
+    },
+    RetiredConfigKey {
+        key: "kernel.moe_paro_i8",
+        legacy_key: "moe_paro_i8",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "ParoQuant was removed",
+        replacement: "none; ParoQuant models are no longer supported, use an MQ4 or HFQ4 model",
+    },
+    RetiredConfigKey {
+        key: "kernel.moe_paro_i8_k8",
+        legacy_key: "moe_paro_i8_k8",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "ParoQuant was removed",
+        replacement: "none; ParoQuant models are no longer supported, use an MQ4 or HFQ4 model",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.mode",
+        legacy_key: "prefill_compression",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.threshold",
+        legacy_key: "prefill_threshold",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.keep_ratio",
+        legacy_key: "prefill_keep_ratio",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.alpha",
+        legacy_key: "prefill_alpha",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.min_keep",
+        legacy_key: "prefill_min_keep",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.sink",
+        legacy_key: "prefill_sink",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.recent",
+        legacy_key: "prefill_recent",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.block",
+        legacy_key: "prefill_block",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.drafter",
+        legacy_key: "prefill_drafter",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.drafter_device",
+        legacy_key: "prefill_drafter_device",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.profile",
+        legacy_key: "prefill_profile",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.sparse_threshold",
+        legacy_key: "prefill_sparse_threshold",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "speculation.prefill.drafter_kv",
+        legacy_key: "prefill_drafter_kv",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "diagnostic.pflash.score_layer",
+        legacy_key: "pflash_score_layer",
+        shipped_in: "0.1.20",
+        removed_in: "0.5.0",
+        reason: "PFlash speculative-prefill compression was removed",
+        replacement: "none; prefix caching (the existing prompt-prefix cache) replaces it",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.sidecar",
+        legacy_key: "cask_sidecar",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.enabled",
+        legacy_key: "cask",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.budget",
+        legacy_key: "cask_budget",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.beta",
+        legacy_key: "cask_beta",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.handoff_tokens",
+        legacy_key: "cask_handoff_tokens",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.core_fraction",
+        legacy_key: "cask_core_frac",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.fold",
+        legacy_key: "cask_fold_m",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "memory.cask.auto_attach",
+        legacy_key: "cask_auto_attach",
+        shipped_in: "0.1.7",
+        removed_in: "0.5.0",
+        reason: "CASK / TriAttention KV eviction was removed",
+        replacement: "none; full KV (use a larger memory.max_seq or KV quantization)",
+    },
+    RetiredConfigKey {
+        key: "diagnostic.replay.gfx1151_cu_count",
+        legacy_key: "gfx1151_redline_cu_count",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "CU masking on RDNA hung the R9700 MES (2026-10-14) and was refused; the knob (HIPFIRE_GFX1151_REDLINE_CU_COUNT) was removed",
+        replacement: "none; the full CU set is always used",
+    },
+    RetiredConfigKey {
+        key: "fusions.policy",
+        legacy_key: "fusion_policy",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "nothing ever read it",
+        replacement: "none; per-kernel fusion selection is unchanged",
+    },
+    RetiredConfigKey {
+        key: "speculation.dflash_tree",
+        legacy_key: "dflash_tree",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "DDTree tree verify was removed (research-only; the linear chain won on every drafter measured)",
+        replacement: "none; DFlash always verifies the linear chain",
+    },
+    RetiredConfigKey {
+        key: "speculation.ddtree_budget",
+        legacy_key: "ddtree_budget",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "DDTree tree verify was removed (research-only; the linear chain won on every drafter measured)",
+        replacement: "none; DFlash always verifies the linear chain",
+    },
+    RetiredConfigKey {
+        key: "speculation.ddtree_topk",
+        legacy_key: "ddtree_topk",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "DDTree tree verify was removed (research-only; the linear chain won on every drafter measured)",
+        replacement: "none; DFlash always verifies the linear chain",
+    },
+    RetiredConfigKey {
+        key: "speculation.ddtree_tree_la",
+        legacy_key: "ddtree_tree_la",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "DDTree tree verify was removed (research-only; the linear chain won on every drafter measured)",
+        replacement: "none; DFlash always verifies the linear chain",
+    },
+    RetiredConfigKey {
+        key: "diagnostic.kernel.ddtree_logw_cutoff",
+        legacy_key: "ddtree_logw_cutoff",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "DDTree tree verify was removed (research-only; the linear chain won on every drafter measured)",
+        replacement: "none; DFlash always verifies the linear chain",
+    },
+    RetiredConfigKey {
+        key: "speculation.dflash_q8_lmhead_wmma",
+        legacy_key: "dflash_q8_lmhead_wmma",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DFlash Q8 LM-head opt-out of WMMA was removed (HIPF-396)",
+        replacement: "none; WMMA runs wherever the arch has it",
+    },
+    RetiredConfigKey {
+        key: "speculation.mtp_sampled",
+        legacy_key: "mtp_sampled",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "the sampled native MTP opt-out was removed (HIPF-396)",
+        replacement: "none; sampled native MTP is on wherever the GDN state format admits it",
+    },
+    RetiredConfigKey {
+        key: "prompt.jinja_chat",
+        legacy_key: "jinja_chat",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the Jinja chat opt-out was removed (HIPF-396)",
+        replacement: "none; chat prompts render through the model template when one is present",
+    },
+    RetiredConfigKey {
+        key: "speculation.draft_f16",
+        legacy_key: "draft_f16",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DFlash draft F16→F32 lift opt-out was removed (HIPF-396)",
+        replacement: "none; F16 draft weights always stay F16",
+    },
+    RetiredConfigKey {
+        key: "experimental.graph.moe",
+        legacy_key: "graph_moe",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the MoE graph-capture opt-out was removed (HIPF-396)",
+        replacement: "experimental.graph.forward = false disables forward graph capture for every model",
+    },
+    RetiredConfigKey {
+        key: "kernel.lm_head_wmma",
+        legacy_key: "lm_head_wmma",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the LM-head WMMA opt-out was removed (HIPF-396)",
+        replacement: "none; WMMA runs wherever the arch has it (kernel.fp16 = false still forces the scalar head)",
+    },
+    RetiredConfigKey {
+        key: "kernel.moe_grouped_gemm",
+        legacy_key: "moe_grouped_gemm",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the grouped-GEMM MoE prefill opt-out was removed (HIPF-396)",
+        replacement: "none; grouped-GEMM MoE prefill runs wherever the arch has WMMA",
+    },
+    RetiredConfigKey {
+        key: "kernel.deepseek4_q8_wmma",
+        legacy_key: "deepseek4_q8_wmma",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DeepSeek4 Q8 WMMA prefill opt-out was removed (HIPF-396)",
+        replacement: "none; WMMA runs wherever the arch has it",
+    },
+    RetiredConfigKey {
+        key: "kernel.deepseek4_q8_4w",
+        legacy_key: "deepseek4_q8_4w",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DeepSeek4 four-wave Q8 WMMA tile opt-out was removed (HIPF-396)",
+        replacement: "none; the tile is chosen by shape",
+    },
+    RetiredConfigKey {
+        key: "speculation.dflash_fast_sample",
+        legacy_key: "dflash_fast_sample",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the DFlash GPU sampling opt-out was removed (HIPF-396)",
+        replacement: "none; sampled DFlash verification always samples on the GPU",
+    },
+    RetiredConfigKey {
+        key: "fusions.qkv_bias",
+        legacy_key: "fuse_qkv_bias",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the QKV bias fold opt-out was removed (HIPF-396)",
+        replacement: "none; supported QKV bias additions are always folded",
+    },
+    RetiredConfigKey {
+        key: "diagnostic.replay.pm4_gcr_trim",
+        legacy_key: "replay_pm4_gcr_trim",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the retained PM4 GCR trim opt-out was removed (HIPF-396)",
+        replacement: "none; supported retained PM4 routes always trim redundant GCR operations",
+    },
+    RetiredConfigKey {
+        key: "developer.lane_reset_batch",
+        legacy_key: "lane_reset_batch",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the lane reset batching kill switch was removed (HIPF-396)",
+        replacement: "none; supported lane resets always batch their zero-fills on the steady copy stream",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_balanced_owners",
+        legacy_key: "ep_balanced_owners",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the balanced EP owner kill switch was removed (HIPF-396)",
+        replacement: "none; balanced EP owners are always used on gfx1201 at 2 to 4 ranks, other arches and larger N keep the static split",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_pinned_owners",
+        legacy_key: "ep_unit_pinned_owners",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the unit-pinned EP owner kill switch was removed (HIPF-396)",
+        replacement: "none; unit-pinned EP owners are always used where balanced ownership and a per-expert unit plan admit them",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_owner_routed_prefill",
+        legacy_key: "ep_owner_routed_prefill",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the owner-routed EP prefill kill switch was removed (HIPF-396)",
+        replacement: "none; owner-routed prefill is always used where its admission conditions hold",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_append_wmma",
+        legacy_key: "qwen4_append_wmma",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 append WMMA kill switch was removed (HIPF-396)",
+        replacement: "none; the WMMA append route runs on gfx1151 prefill tiles of HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS..511 rows",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_mtp_experts_resident",
+        legacy_key: "ep_mtp_experts_resident",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP MTP experts-resident kill switch was removed (HIPF-396)",
+        replacement: "none; an EP load of two or more ranks keeps the native MTP head's owned routed-expert slice VRAM-resident whenever the head is attached",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_mtp_lane_copy",
+        legacy_key: "ep_mtp_lane_copy",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP MTP lane-copy kill switch was removed (HIPF-396)",
+        replacement: "none; the copy lane follows the singleton policy, and speculation.mtp_ngram_copy = off still disables it",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_mtp_reserve_share",
+        legacy_key: "ep_mtp_reserve_share",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP MTP reserve-sharing kill switch was removed (HIPF-396)",
+        replacement: "none; native-MTP lanes always share the decoupled reserve on an EP load",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_draft_sharded_moe",
+        legacy_key: "qwen4_draft_sharded_moe",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 sharded draft MoE kill switch was removed (HIPF-396)",
+        replacement: "none; on a two-rank EP load, a batched draft pass of two to eight ops, each owned by one rank, runs the head MoE once over all the round's rows on both ranks",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ep_draft_split",
+        legacy_key: "qwen4_ep_draft_split",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP draft-split kill switch was removed (HIPF-396)",
+        replacement: "none; an EP root gives head lanes owner ranks whenever every rank's MTP head can run lane-local",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_tail_fill_overlap",
+        legacy_key: "ep_unit_tail_fill_overlap",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP unit-tail fill-overlap kill switch was removed (HIPF-396)",
+        replacement: "none; the tail's fill issue always overlaps the next forward",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_tail_peer",
+        legacy_key: "ep_unit_tail_peer",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP unit-tail peer-board kill switch was removed (HIPF-396)",
+        replacement: "none; the peer board is used whenever the D2 tail runs on a mesh of two or more ranks",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_tail_peer_reserve",
+        legacy_key: "ep_unit_tail_peer_reserve",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP unit-tail peer-reserve kill switch was removed (HIPF-396)",
+        replacement: "none; the peer quarantine reserve is always on",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_tail_pins",
+        legacy_key: "ep_unit_tail_pins",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP unit-tail pins kill switch was removed (HIPF-396)",
+        replacement: "none; the tail always keeps pinned owners where they are admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_tail_prefill",
+        legacy_key: "ep_unit_tail_prefill",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP unit-tail prefill kill switch was removed (HIPF-396)",
+        replacement: "none; the tail's full-table prefill always follows its publications",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_tail_log_direct",
+        legacy_key: "ep_tail_log_direct",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP tail direct-log kill switch was removed (HIPF-396)",
+        replacement: "none; the few-row MoE call always logs its slot under the tail",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_expert_stage",
+        legacy_key: "ep_expert_stage",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the EP expert-stage kill switch was removed (HIPF-396)",
+        replacement: "none; the EP expert stage is on wherever owner-routed prefill is admitted on gfx1201; HIPFIRE_QWEN4_EXPERT_STAGE=0 forces expert staging off",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_hc8_plan_charge",
+        legacy_key: "ep_hc8_plan_charge",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP hc8 plan-charge kill switch was removed (HIPF-396)",
+        replacement: "none; the plan always charges an applied hc8 sidecar at its E4M3 size",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_reserve_census",
+        legacy_key: "ep_reserve_census",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP reserve census kill switch was removed (HIPF-396)",
+        replacement: "none; the EP reserve census is always on for two or more EP ranks",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_compact_scratch",
+        legacy_key: "qwen4_compact_scratch",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 compact scratch kill switch was removed (HIPF-396)",
+        replacement: "none; the compact scratch plan is always used where its gate admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.moe_cpu_experts",
+        legacy_key: "moe_cpu_experts",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the MoE CPU experts kill switch was removed (HIPF-396)",
+        replacement: "set memory.offload_exec to pcie to turn host expert execution off",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_decode_share_shadows",
+        legacy_key: "qwen4_decode_share_shadows",
+        shipped_in: "0.4.4",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 decode-share shadows kill switch was removed (HIPF-396)",
+        replacement: "none; shadows always borrow the donor tail on admitted gfx1201 decode-share loads",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_capture_ring_compact",
+        legacy_key: "qwen4_capture_ring_compact",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 compact capture ring kill switch was removed (HIPF-396)",
+        replacement: "none; the capture ring always uses the compact rows + 1 slot layout",
+    },
+];
 
 pub fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKey> {
     RETIRED_CONFIG_KEYS
@@ -4227,22 +4274,9 @@ pub fn unknown_key(key: &str) -> ConfigError {
             key: retired.key,
             removed_in: retired.removed_in,
             reason: retired.reason,
+            replacement: retired.replacement,
         },
         None => ConfigError::UnknownKey(key.to_owned()),
-    }
-}
-
-impl RetiredConfigKey {
-    fn warning(&self, path: &Path) -> String {
-        format!(
-            "ignored {} in {}: removed in {} ({}); the setting has no effect and is \
-             accepted with this warning until {} — delete it from the file",
-            self.key,
-            path.display(),
-            self.removed_in,
-            self.reason,
-            self.ignored_until
-        )
     }
 }
 
@@ -4706,16 +4740,18 @@ pub fn qwen4_ep_sampled_wide_verify() -> bool {
     developer_bool(QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV, false)
 }
 
-/// `HIPFIRE_QWEN4_LANE_ROW_EXACT` (developer, default `0` = off): which Flash-Next lane
-/// classes keep every all-rows (9..=64-row) lane step bitwise their <=8-row rows, so output
-/// does not depend on batch composition. Unset, `0`, `off`, `false`: no lane is row-exact
-/// (the default: concurrent native-MTP output at >= 3 lanes may depend on batch composition;
-/// C1 and AR steps of <= 8 rows stay exact). `greedy`: greedy lanes; `seeded` (also `1`, `on`,
-/// `true`): greedy lanes and sampled lanes with an explicit request seed. Opting in costs
-/// step time on the exact steps (CHANGELOG). Unrecognised values warn once and mean `0`.
+/// `serve.batch_exact` (user config key, default `off`; `--batch-exact` on `hipfire serve` /
+/// `hipfire run`): which Flash-Next lane classes keep every all-rows (9..=64-row) lane step
+/// bitwise their <=8-row rows, so output does not depend on batch composition. `off`: no
+/// lane is row-exact (the default: concurrent native-MTP output at >= 3 lanes may depend on
+/// batch composition; C1 and AR steps of <= 8 rows stay exact). `greedy`: greedy lanes;
+/// `seeded`: greedy lanes and sampled lanes with an explicit request seed. Opting in costs
+/// step time on the exact steps (CHANGELOG). This environment variable is the documented
+/// compatibility override of that key; it also accepts `1`/`on`/`true` (= `seeded`) and
+/// `0`/`false` (= `off`), and an unrecognised value warns once and means `off`.
 pub const QWEN4_LANE_ROW_EXACT_ENV: &str = "HIPFIRE_QWEN4_LANE_ROW_EXACT";
 
-/// Lane classes that run their all-rows steps row-exact ([`QWEN4_LANE_ROW_EXACT_ENV`]).
+/// Lane classes that run their all-rows steps row-exact (`serve.batch_exact`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneRowExact {
     /// No lane is row-exact (default).
@@ -4726,8 +4762,8 @@ pub enum LaneRowExact {
     GreedySeeded,
 }
 
-/// Pure parse of [`QWEN4_LANE_ROW_EXACT_ENV`]: trimmed, ASCII case-insensitive; `greedy` is
-/// `Greedy`; `seeded`, `1`, `on`, `true` are `GreedySeeded`; unset, `0`, `off`, `false` and
+/// Pure parse of the `serve.batch_exact` value: trimmed, ASCII case-insensitive; `greedy` is
+/// `Greedy`; `seeded`, `1`, `on`, `true` are `GreedySeeded`; unset, `off`, `0`, `false` and
 /// anything unrecognised are `Off`.
 pub fn parse_lane_row_exact(raw: Option<&str>) -> LaneRowExact {
     let Some(raw) = raw else {
@@ -4740,21 +4776,12 @@ pub fn parse_lane_row_exact(raw: Option<&str>) -> LaneRowExact {
     }
 }
 
-/// [`QWEN4_LANE_ROW_EXACT_ENV`] read once per process through the developer snapshot.
+/// `serve.batch_exact` as the process snapshot renders it ([`QWEN4_LANE_ROW_EXACT_ENV`]),
+/// read once per process. Absent (the default) and `off` are [`LaneRowExact::Off`]. The
+/// env spellings are normalised and validated by the env layer ([`load_env_layer`]).
 pub fn qwen4_lane_row_exact() -> LaneRowExact {
-    static MODE: LazyLock<LaneRowExact> = LazyLock::new(|| {
-        let raw = developer_var(QWEN4_LANE_ROW_EXACT_ENV).ok();
-        if let Some(v) = raw.as_deref() {
-            let t = v.trim().to_ascii_lowercase();
-            if !matches!(
-                t.as_str(),
-                "" | "seeded" | "1" | "on" | "true" | "greedy" | "0" | "off" | "false"
-            ) {
-                eprintln!("[WARN] {QWEN4_LANE_ROW_EXACT_ENV}={v} is not seeded|greedy|0; using 0");
-            }
-        }
-        parse_lane_row_exact(raw.as_deref())
-    });
+    static MODE: LazyLock<LaneRowExact> =
+        LazyLock::new(|| parse_lane_row_exact(process_value(QWEN4_LANE_ROW_EXACT_ENV).as_deref()));
     *MODE
 }
 
@@ -4934,17 +4961,21 @@ pub fn developer_bool(name: &str, default: bool) -> bool {
 pub fn developer_typed_bool(name: &str) -> Option<bool> {
     typed_developer_bool_value(name, process_value(name).as_deref())
 }
-/// Pure body of [`developer_typed_bool`] for unit tests.
-fn typed_developer_bool_value(name: &str, raw: Option<&str>) -> Option<bool> {
+/// Pure body of [`developer_typed_bool`] for unit tests and the flags GC
+/// legacy-spelling harness.
+#[doc(hidden)]
+pub fn typed_developer_bool_value(name: &str, raw: Option<&str>) -> Option<bool> {
     let raw = raw?;
     match parse_typed_bool(raw) {
         Some(value) => Some(value),
         None => panic!("{name}={raw:?} is not a boolean: expected true, false, 1 or 0"),
     }
 }
-/// Pure truth table behind [`developer_bool`], split out so unit tests can
-/// pin the contract without touching the process-global snapshot.
-fn parse_developer_bool(raw: Option<&str>, default: bool) -> bool {
+/// Pure truth table behind [`developer_bool`], split out so unit tests and the
+/// flags GC legacy-spelling harness can pin the contract without touching the
+/// process-global snapshot.
+#[doc(hidden)]
+pub fn parse_developer_bool(raw: Option<&str>, default: bool) -> bool {
     match raw {
         Some("1") => true,
         Some("0") => false,
@@ -5161,18 +5192,16 @@ pub fn mtp_host_spill_reason() -> &'static str {
 /// MTP divergent-render checkpoint + strict-prefix terminal-repair policy.
 ///
 /// Resolved once at drafter construction from the documented process-snapshot
-/// keys (see `docs/env-vars.md`): `HIPFIRE_DFLASH_CKPT_RESUME` (shared with the
-/// DFlash divergent-render path — there is no MTP-only twin),
+/// keys (see `docs/env-vars.md`):
 /// `HIPFIRE_CACHE_CKPT_INTERVAL` / `HIPFIRE_CACHE_CKPT_MAX`, and
 /// `HIPFIRE_SPEC_WINDOW_ROLLBACK`. Defaults match the MTP PRs that introduced
-/// the consumers: resume on, rollback on, interval 2048 (floor 256), cap 8
+/// the consumers: rollback on, interval 2048 (floor 256), cap 8
 /// (floor 1). Reads go through the versioned [`ProcessConfig`] snapshot so
 /// TOML `[developer]` overrides and the env-beats-config-beats-default
 /// precedence apply; arch crates receive these resolved values and perform
 /// no policy reads of their own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MtpCachePolicy {
-    pub checkpoint_resume: bool,
     pub checkpoint_interval: usize,
     pub checkpoint_cap: usize,
     pub window_rollback: bool,
@@ -5182,7 +5211,6 @@ pub struct MtpCachePolicy {
 /// per-repair or per-step.
 pub fn mtp_cache_policy() -> MtpCachePolicy {
     MtpCachePolicy {
-        checkpoint_resume: developer_bool("HIPFIRE_DFLASH_CKPT_RESUME", true),
         checkpoint_interval: developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -5252,6 +5280,17 @@ pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151: usize = 8;
 /// proves the arch at that many rows (`rdna_compute::prefill_invariant`
 /// re-exports this value).
 pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201: usize = 8;
+/// gfx942 (MI300X) row-exact verify rows. M-K measured `forward_chunk(N)`
+/// bitwise equal to N single-row `forward_token`s on the default (MFMA) route
+/// at N = 1, 2, 3, 4, 6, 8 and 16 (both contexts, six fresh processes, max
+/// |diff| 0, argmax N/N); the singleton drafter never drafts past
+/// [`QWEN4_FEW_ROW_ROUTE_ROWS`] rows (depth <= 7), and N = 5 and 7 are covered
+/// only by the end-to-end greedy identity oracle. Rows 9..=16 are measured by
+/// M-K but not served: raising this needs the drafter, floor and capture
+/// tables widened with it. Not valid under `HIPFIRE_G942_TRUNK_GEMV=1`,
+/// whose one-row decode is not bitwise the chunk for N >= 2 (the drafter
+/// refuses native MTP there).
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942: usize = 8;
 /// Per-arch proven row-exact Qwen4 verify rows without the developer/oracle
 /// overrides (other arches [`QWEN4_FEW_ROW_ROUTE_ROWS`]). The runtime value is
 /// `rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows`, which layers
@@ -5261,6 +5300,7 @@ pub fn qwen4_row_exact_verify_rows_table(gpu_arch: &str) -> usize {
     match gpu_arch {
         "gfx1151" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151,
         "gfx1201" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201,
+        "gfx942" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX942,
         _ => QWEN4_FEW_ROW_ROUTE_ROWS,
     }
 }
@@ -5281,13 +5321,6 @@ pub fn mtp_k_default(model_arch: u32, row_exact_verify_rows: usize) -> usize {
     } else {
         MTP_K_DEFAULT
     }
-}
-/// Sampled native-MTP enablement (`speculation.mtp_sampled`, env override
-/// `HIPFIRE_MTP_SAMPLED`, default on; `0` opts out). On, the Qwen4 MTP
-/// drafter verifies temperature > 0 requests by speculative rejection
-/// sampling; off leaves them to AR.
-pub fn mtp_sampled_enabled() -> bool {
-    developer_bool("HIPFIRE_MTP_SAMPLED", true)
 }
 /// MTP prompt-fill route opt-out (`HIPFIRE_MTP_OWN_PREFILL=1`). Strict
 /// snapshot boolean, default off: the MTP prompt fill prefills the trunk
@@ -5712,12 +5745,11 @@ impl ConfigPaths {
 
 pub fn load_global(paths: &ConfigPaths) -> Result<LoadedConfig> {
     if paths.config_toml.exists() {
-        let (layer, warnings) = load_toml_layer_with_warnings(&paths.config_toml)?;
         return Ok(LoadedConfig {
-            layer,
+            layer: load_toml_layer(&paths.config_toml)?,
             path: paths.config_toml.clone(),
             format: ConfigFormat::Toml,
-            warnings,
+            warnings: Vec::new(),
         });
     }
     if paths.config_json.exists() {
@@ -6290,6 +6322,27 @@ pub fn legacy_devices_env_set() -> bool {
     env::var_os("HIPFIRE_DEVICES").is_some() || env::var_os("HIPFIRE_DEVICE").is_some()
 }
 
+/// Maps every accepted `HIPFIRE_QWEN4_LANE_ROW_EXACT` spelling onto a `serve.batch_exact`
+/// value (trimmed, ASCII case-insensitive): `greedy`; `seeded`/`1`/`on`/`true` -> `seeded`;
+/// empty/`0`/`off`/`false` -> `off`. Anything else warns once and means `off`, as before
+/// the key existed.
+fn normalize_lane_row_exact_env(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "greedy" => "greedy",
+        "seeded" | "1" | "on" | "true" => "seeded",
+        "" | "0" | "off" | "false" => "off",
+        _ => {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "[WARN] {QWEN4_LANE_ROW_EXACT_ENV}={raw} is not off|greedy|seeded; using off"
+                );
+            });
+            "off"
+        }
+    }
+}
+
 pub fn load_env_layer() -> Result<ConfigLayer> {
     let mut layer = ConfigLayer::default();
     let mut stable_names = BTreeSet::new();
@@ -6302,6 +6355,9 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
             continue;
         };
         let value = match (field.legacy_key, raw.as_str()) {
+            ("serve_batch_exact", _) => {
+                ConfigValue::String(normalize_lane_row_exact_env(&raw).to_owned())
+            }
             ("default_chatml", "0") => ConfigValue::Bool(false),
             ("dflash_ngram_block", "1") => ConfigValue::Bool(true),
             ("prompt_normalize", "0" | "false" | "off" | "no") => ConfigValue::Bool(false),
@@ -6339,6 +6395,10 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
         let Some(key) = developer_key_for_env(name) else {
             continue;
         };
+        // A removed env flag is ignored, not a load failure.
+        if retired_config_key(&key).is_some() {
+            continue;
+        }
         let Ok(raw) = raw.into_string() else {
             continue;
         };
@@ -6347,15 +6407,9 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
     Ok(layer)
 }
 
-/// Load a TOML config layer. Retired keys ([`RETIRED_CONFIG_KEYS`]) are
-/// dropped; use [`load_toml_layer_with_warnings`] to report them.
+/// Load a TOML config layer. A retired key ([`RETIRED_CONFIG_KEYS`]) or any
+/// other unknown key fails the load.
 pub fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {
-    load_toml_layer_with_warnings(path).map(|(layer, _)| layer)
-}
-
-/// Load a TOML config layer, ignoring retired keys with one warning each.
-/// Every other unknown key still fails the load.
-pub fn load_toml_layer_with_warnings(path: &Path) -> Result<(ConfigLayer, Vec<String>)> {
     let raw = read_string(path)?;
     let table = toml::from_str::<toml::Table>(&raw).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
@@ -6372,17 +6426,10 @@ pub fn load_toml_layer_with_warnings(path: &Path) -> Result<(ConfigLayer, Vec<St
     let mut flat = BTreeMap::new();
     flatten_toml("", &table, &mut flat, path)?;
     let mut layer = ConfigLayer::default();
-    let mut warnings = Vec::new();
     for (key, value) in flat {
-        if field(&key).is_none() {
-            if let Some(retired) = retired_config_key(&key) {
-                warnings.push(retired.warning(path));
-                continue;
-            }
-        }
         layer.set(&key, value)?;
     }
-    Ok((layer, warnings))
+    Ok(layer)
 }
 
 fn flatten_toml(
@@ -6902,7 +6949,6 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
                 ConfigValue::String("auto".to_owned()),
             ),
             ("experimental.graph.ar", ConfigValue::Bool(true)),
-            ("experimental.graph.moe", ConfigValue::Bool(true)),
             ("diagnostic.prompt_token_heat", ConfigValue::Bool(false)),
             ("diagnostic.prompt_heat_json", ConfigValue::Bool(false)),
             ("diagnostic.prompt_heat_limit", ConfigValue::Integer(64)),
@@ -6957,7 +7003,6 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
                 "diagnostic.replay.pm4_acquire_policy",
                 ConfigValue::String("required-only".to_owned()),
             ),
-            ("diagnostic.replay.pm4_gcr_trim", ConfigValue::Bool(true)),
             (
                 "diagnostic.replay.pm4_dynamic_grid",
                 ConfigValue::Bool(false),
@@ -7003,41 +7048,57 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_key_covers_cask_and_pflash_families() {
-        for key in [
-            "memory.cask.enabled",
-            "cask",
-            "cask_sidecar",
-            "speculation.prefill.mode",
-            "prefill_compression",
-            "prefill_drafter",
-            "prefill_threshold",
-            "diagnostic.pflash.score_layer",
-            "pflash_score_layer",
-        ] {
-            assert!(is_deprecated_key(key), "{key} must be deprecated");
+    fn serve_batch_exact_key_and_env_override_round_trip() {
+        let f = field("serve.batch_exact").expect("serve.batch_exact schema field");
+        assert_eq!(f.env_compat, Some(QWEN4_LANE_ROW_EXACT_ENV));
+        assert!(matches!(f.default, DefaultValue::String("off")));
+        for ok in ["off", "greedy", "seeded"] {
+            assert!(f.validate(&ConfigValue::String(ok.into())).is_ok(), "{ok}");
         }
-        for key in [
-            "kv_cache",
-            "speculation.mode",
-            "speculation",
-            "ple_format",
-            "memory.ple_format",
-            "max_seq",
-            "nonexistent.key",
+        assert!(f.validate(&ConfigValue::String("on".into())).is_err());
+        // Default: no value in the process snapshot, which the runtime reads as Off.
+        let process =
+            ProcessConfig::from_resolved(&resolve([]).expect("empty resolve")).expect("process");
+        assert_eq!(process.legacy_value(QWEN4_LANE_ROW_EXACT_ENV), None);
+        assert_eq!(
+            parse_lane_row_exact(process.legacy_value(QWEN4_LANE_ROW_EXACT_ENV).as_deref()),
+            LaneRowExact::Off
+        );
+        // The env layer keeps every legacy spelling's meaning (`load_env_layer` maps the
+        // variable through `normalize_lane_row_exact_env`; the ambient env is not mutated).
+        for (spelling, key_value, mode) in [
+            ("1", "seeded", LaneRowExact::GreedySeeded),
+            ("on", "seeded", LaneRowExact::GreedySeeded),
+            (" TRUE ", "seeded", LaneRowExact::GreedySeeded),
+            ("seeded", "seeded", LaneRowExact::GreedySeeded),
+            ("greedy", "greedy", LaneRowExact::Greedy),
+            ("0", "off", LaneRowExact::Off),
+            ("false", "off", LaneRowExact::Off),
+            ("junk", "off", LaneRowExact::Off),
         ] {
-            assert!(!is_deprecated_key(key), "{key} must not be deprecated");
-        }
-        for field in fields() {
-            let family = ["memory.cask.", "speculation.prefill.", "diagnostic.pflash."]
-                .iter()
-                .any(|prefix| field.key.starts_with(prefix));
-            assert_eq!(is_deprecated_key(field.key), family, "{}", field.key);
+            let mut env_layer = ConfigLayer::default();
+            env_layer
+                .set(
+                    "serve.batch_exact",
+                    ConfigValue::String(normalize_lane_row_exact_env(spelling).to_owned()),
+                )
+                .expect("normalised value validates");
+            let process = ProcessConfig::from_resolved(
+                &resolve([NamedLayer {
+                    source: ConfigSource::LegacyEnv {
+                        name: QWEN4_LANE_ROW_EXACT_ENV.into(),
+                    },
+                    layer: env_layer,
+                }])
+                .expect("env resolve"),
+            )
+            .expect("process");
+            let rendered = process.legacy_value(QWEN4_LANE_ROW_EXACT_ENV);
+            assert_eq!(rendered.as_deref(), Some(key_value), "{spelling:?}");
             assert_eq!(
-                is_deprecated_key(field.legacy_key),
-                family,
-                "{}",
-                field.legacy_key
+                parse_lane_row_exact(rendered.as_deref()),
+                mode,
+                "{spelling:?}"
             );
         }
     }
@@ -7595,55 +7656,21 @@ mod tests {
     }
 
     #[test]
-    fn ep_mtp_experts_resident_is_on_unless_exactly_zero() {
-        use memory::parse_ep_mtp_experts_resident as parse;
-        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
-        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
-        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
-        // The process snapshot of a test binary carries no knob: the default is on.
-        assert!(memory::ep_mtp_experts_resident());
-        assert_eq!(
-            developer_key_for_env("HIPFIRE_EP_MTP_EXPERTS_RESIDENT").as_deref(),
-            Some("developer.ep_mtp_experts_resident")
-        );
-    }
-
-    #[test]
-    fn ep_hc8_plan_charge_is_on_unless_exactly_zero() {
-        use memory::parse_ep_hc8_plan_charge as parse;
-        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
-        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
-        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
-        assert!(memory::ep_hc8_plan_charge());
-        assert_eq!(
-            developer_key_for_env("HIPFIRE_EP_HC8_PLAN_CHARGE").as_deref(),
-            Some("developer.ep_hc8_plan_charge")
-        );
-    }
-
-    #[test]
-    fn ep_reserve_census_is_on_unless_exactly_zero() {
-        use memory::parse_ep_reserve_census as parse;
-        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
-        assert!(parse(Some("true")) && parse(Some("00")) && parse(Some("2")));
-        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
-        assert!(memory::ep_reserve_census());
-        assert_eq!(
-            developer_key_for_env("HIPFIRE_EP_RESERVE_CENSUS").as_deref(),
-            Some("developer.ep_reserve_census")
-        );
-    }
-
-    #[test]
     fn ep_hot_units_policy_and_sidecar_path() {
         use memory::{parse_ep_hot_units as parse, EpHotUnits};
         assert_eq!(parse(None), Ok(EpHotUnits::Discover));
         assert_eq!(parse(Some("0")), Ok(EpHotUnits::Off));
         assert_eq!(parse(Some(" 0 ")), Ok(EpHotUnits::Off));
         assert_eq!(parse(Some("")), Ok(EpHotUnits::Off));
+        // Absolute on this platform (`/m/...` has no drive, so it is relative on Windows).
+        let sidecar = if cfg!(windows) {
+            r"C:\m\q.mq4.ep.hot-units"
+        } else {
+            "/m/q.mq4.ep.hot-units"
+        };
         assert_eq!(
-            parse(Some(" /m/q.mq4.ep.hot-units ")),
-            Ok(EpHotUnits::Explicit("/m/q.mq4.ep.hot-units".into()))
+            parse(Some(&format!(" {sidecar} "))),
+            Ok(EpHotUnits::Explicit(sidecar.into()))
         );
         for bad in ["1", "on", "q.ep.hot-units", "./q.ep.hot-units"] {
             let error = parse(Some(bad)).unwrap_err();
@@ -8459,7 +8486,7 @@ mod tests {
             }
         }
         values.values.insert(
-            "developer.dspark_q8_wmma".into(),
+            "developer.dspark_debug".into(),
             ConfigValue::String("1".into()),
         );
         values
@@ -8475,7 +8502,7 @@ mod tests {
             .filter_map(|schema| schema.env_compat)
             .collect();
         names.extend([
-            "HIPFIRE_DSPARK_Q8_WMMA",
+            "HIPFIRE_DSPARK_DEBUG",
             "HIPFIRE_NGRAM_WINDOW",
             "NOT_HIPFIRE",
         ]);
@@ -9088,29 +9115,6 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
     }
 
     #[test]
-    fn experimental_memory_and_prefill_features_default_off() {
-        assert_eq!(
-            field("memory.cask.enabled").unwrap().default.to_value(),
-            ConfigValue::Bool(false)
-        );
-        assert_eq!(
-            field("memory.cask.auto_attach").unwrap().default.to_value(),
-            ConfigValue::Bool(false)
-        );
-        assert_eq!(
-            field("memory.cask.sidecar").unwrap().default.to_value(),
-            ConfigValue::String(String::new())
-        );
-        assert_eq!(
-            field("speculation.prefill.mode")
-                .unwrap()
-                .default
-                .to_value(),
-            ConfigValue::String("off".into())
-        );
-    }
-
-    #[test]
     fn deepseek4_expert_fanout_is_optional_and_bounded() {
         let field = field("model.deepseek4_experts_per_token").unwrap();
         assert_eq!(field.default.to_value(), ConfigValue::Null);
@@ -9373,9 +9377,44 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
     }
 
     #[test]
-    fn retired_keys_warn_and_are_ignored() {
+    fn removed_kv_names_fail_validation_cli_and_toml_load() {
+        let cache = field("memory.kv_cache").expect("memory.kv_cache schema field");
+        let k = field("memory.kv_k").expect("memory.kv_k schema field");
+        for name in REMOVED_KV_NAMES {
+            for f in [cache, k] {
+                let err = f.parse_cli(name).unwrap_err().to_string();
+                assert!(err.contains("removed in 0.5.0"), "{} {name}: {err}", f.key);
+                assert!(err.contains("fwht"), "{} {name}: {err}", f.key);
+            }
+            assert!(removed_kv_name_error(name).is_some(), "{name}");
+        }
+        assert!(removed_kv_name_error("fwht3").is_none());
+        assert!(removed_kv_name_error("auto").is_none());
+        // A config file that still authors a removed KV value fails the load.
+        for (key, body) in [
+            (
+                "kv_cache",
+                "schema_version = 1\n[memory]\nkv_cache = \"turbo3\"\n",
+            ),
+            (
+                "kv_k",
+                "schema_version = 1\n[memory]\nkv_k = \"legacy-asym3\"\n",
+            ),
+        ] {
+            let root = temp_root(&format!("removed-kv-{key}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_toml, body).unwrap();
+            let err = load_global(&paths).unwrap_err().to_string();
+            assert!(err.contains("removed in 0.5.0"), "{key}: {err}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn retired_keys_fail_the_load_naming_removal_and_replacement() {
         // kernel.mw16 shipped in 0.3.1/0.4.0 and was removed in 0.4.1. A file
-        // written by those releases must still load through the window.
+        // that still sets it is a user-facing error, never a silent ignore.
         for (name, body) in [
             (
                 "canonical",
@@ -9390,29 +9429,21 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
             fs::create_dir_all(&root).unwrap();
             let paths = ConfigPaths::under(&root);
             fs::write(&paths.config_toml, body).unwrap();
-            let loaded = load_global(&paths).unwrap();
-            assert_eq!(loaded.format, ConfigFormat::Toml);
-            assert_eq!(
-                loaded.layer.get("memory.max_seq"),
-                Some(&ConfigValue::Integer(8192))
+            let err = load_global(&paths).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::RetiredKey {
+                        key: "kernel.mw16",
+                        ..
+                    }
+                ),
+                "{name}: {err:?}"
             );
-            assert_eq!(
-                loaded.layer.values.len(),
-                1,
-                "{name}: retired key must be dropped"
-            );
-            assert_eq!(loaded.warnings.len(), 1, "{name}: {:?}", loaded.warnings);
-            let warning = &loaded.warnings[0];
-            for needle in ["kernel.mw16", "removed in 0.4.1", "until 0.5.0"] {
-                assert!(warning.contains(needle), "{name}: {warning}");
+            for needle in ["kernel.mw16", "removed in 0.4.1", "replacement:"] {
+                assert!(err.to_string().contains(needle), "{name}: {err}");
             }
-            assert!(resolve([NamedLayer {
-                source: ConfigSource::GlobalUser { path: loaded.path },
-                layer: loaded.layer,
-            }])
-            .is_ok());
-            // Setting a retired key is still refused: it has no effect. The
-            // error names the removal instead of calling the key unknown.
+            // `config set` of a retired key names the removal too.
             let err = ConfigLayer::default()
                 .set_cli("kernel.mw16", "true")
                 .unwrap_err();
@@ -9432,6 +9463,74 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
                 ConfigLayer::default().set_cli("kernel.mw17", "true"),
                 Err(ConfigError::UnknownKey(_))
             ));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn removed_paro_keys_fail_the_load_naming_removal_and_replacement() {
+        for key in ["moe_paro_i8", "moe_paro_i8_k8"] {
+            let root = temp_root(&format!("retired-paro-{key}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(
+                &paths.config_toml,
+                format!("schema_version = 1\n[kernel]\n{key} = true\n"),
+            )
+            .unwrap();
+            let err = load_global(&paths).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::RetiredKey {
+                        removed_in: "0.5.0",
+                        ..
+                    }
+                ),
+                "{key}: {err:?}"
+            );
+            for needle in [key, "removed in 0.5.0", "ParoQuant", "replacement:"] {
+                assert!(err.to_string().contains(needle), "{key}: {err}");
+            }
+            assert!(matches!(
+                ConfigLayer::default().set_cli(&format!("kernel.{key}"), "true"),
+                Err(ConfigError::RetiredKey { .. })
+            ));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn retired_gfx1151_cu_count_fails_the_load() {
+        for (name, body) in [
+            (
+                "canonical",
+                "schema_version = 1\n[diagnostic.replay]\ngfx1151_cu_count = \"all\"\n",
+            ),
+            (
+                "legacy",
+                "schema_version = 1\ngfx1151_redline_cu_count = \"all\"\n",
+            ),
+        ] {
+            let root = temp_root(&format!("retired-cu-count-{name}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_toml, body).unwrap();
+            let err = load_global(&paths).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::RetiredKey {
+                        key: "diagnostic.replay.gfx1151_cu_count",
+                        ..
+                    }
+                ),
+                "{name}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("removed in 0.5.0"),
+                "{name}: {err}"
+            );
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -9466,6 +9565,65 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
     }
 
     #[test]
+    fn removed_pflash_keys_fail_the_load_naming_prefix_caching() {
+        for (name, body) in [
+            (
+                "canonical",
+                "schema_version = 1\n[speculation.prefill]\nmode = \"auto\"\n",
+            ),
+            (
+                "legacy",
+                "schema_version = 1\nprefill_compression = \"auto\"\n",
+            ),
+            (
+                "diagnostic",
+                "schema_version = 1\n[diagnostic.pflash]\nscore_layer = 3\n",
+            ),
+        ] {
+            let root = temp_root(&format!("retired-pflash-{name}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_toml, body).unwrap();
+            let err = load_global(&paths).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RetiredKey { .. }),
+                "{name}: {err:?}"
+            );
+            for needle in ["removed in 0.5.0", "prefix caching"] {
+                assert!(err.to_string().contains(needle), "{name}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn removed_cask_keys_fail_the_load_naming_full_kv() {
+        for (name, body) in [
+            (
+                "canonical",
+                "schema_version = 1\n[memory.cask]\nenabled = true\n",
+            ),
+            ("legacy", "schema_version = 1\ncask_sidecar = \"a.bin\"\n"),
+            (
+                "auto_attach",
+                "schema_version = 1\n[memory.cask]\nauto_attach = true\n",
+            ),
+        ] {
+            let root = temp_root(&format!("retired-cask-{name}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_toml, body).unwrap();
+            let err = load_global(&paths).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RetiredKey { .. }),
+                "{name}: {err:?}"
+            );
+            for needle in ["removed in 0.5.0", "full KV"] {
+                assert!(err.to_string().contains(needle), "{name}: {err}");
+            }
+        }
+    }
+
+    #[test]
     fn retired_keys_are_not_live_schema_keys() {
         for retired in RETIRED_CONFIG_KEYS {
             assert!(field(retired.key).is_none(), "{} is live", retired.key);
@@ -9474,7 +9632,7 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
                 "{} is live",
                 retired.legacy_key
             );
-            assert!(!retired.ignored_until.is_empty() && !retired.shipped_in.is_empty());
+            assert!(!retired.replacement.is_empty() && !retired.shipped_in.is_empty());
         }
     }
 
@@ -9855,23 +10013,7 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         assert_eq!(k_resolved.source, ConfigSource::BuiltIn);
         assert_eq!(v_resolved.source, ConfigSource::BuiltIn);
 
-        for name in [
-            "",
-            "q8",
-            "fwht2",
-            "fwht3",
-            "fwht4",
-            "asym2",
-            "asym3",
-            "asym4",
-            "turbo",
-            "turbo2",
-            "turbo3",
-            "turbo4",
-            "legacy-asym2",
-            "legacy-asym3",
-            "legacy-asym4",
-        ] {
+        for name in ["", "q8", "fwht2", "fwht3", "fwht4"] {
             assert_eq!(
                 k.parse_cli(name).unwrap(),
                 ConfigValue::String(name.into()),
@@ -9890,11 +10032,11 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         assert!(k.parse_cli("auto").is_err());
 
         let mut layer = ConfigLayer::default();
-        layer.set_cli("memory.kv_k", "legacy-asym3").unwrap();
+        layer.set_cli("memory.kv_k", "fwht3").unwrap();
         layer.set_cli("memory.kv_v", "lloyd3").unwrap();
         assert_eq!(
             layer.get("memory.kv_k"),
-            Some(&ConfigValue::String("legacy-asym3".into()))
+            Some(&ConfigValue::String("fwht3".into()))
         );
         assert_eq!(
             layer.get("memory.kv_v"),
@@ -10407,6 +10549,41 @@ pub mod topology {
         Ok(Some(arch.to_owned()))
     }
 
+    /// Values of `topology.ep_ar_wire`.
+    pub const EP_AR_WIRES: &[&str] = &["bf16", "f32"];
+
+    /// `topology.ep_ar_wire`: wire format of the mixer partials in the Flash-Next two-card
+    /// trunk-shard all-reduce. A typed load setting (no environment spelling): the CLI forwards it
+    /// in the load request and the loader hands it to the carrier.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub enum EpArWire {
+        /// Each rank's f32 mixer partial is rounded to bf16 before the fold (the default).
+        #[default]
+        Bf16,
+        /// The mixer partials travel as f32; the fold rounds `p0 + p1` once.
+        F32,
+    }
+
+    impl EpArWire {
+        /// Parse a `topology.ep_ar_wire` value; unset or empty is the default.
+        pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+            match raw.map(str::trim).filter(|v| !v.is_empty()) {
+                None | Some("bf16") => Ok(Self::Bf16),
+                Some("f32") => Ok(Self::F32),
+                Some(other) => Err(format!(
+                    "topology.ep_ar_wire = {other:?} is not a valid all-reduce wire (allowed: bf16, f32)"
+                )),
+            }
+        }
+
+        pub fn name(self) -> &'static str {
+            match self {
+                Self::Bf16 => "bf16",
+                Self::F32 => "f32",
+            }
+        }
+    }
+
     /// Pure parser behind [`ep`]: unset or empty is 1 (the default); an
     /// integer outside `1..=`[`EP_MAX_DEGREE`] is a refusal naming the range.
     pub fn parse_ep(raw: Option<&str>) -> Result<usize, String> {
@@ -10685,6 +10862,46 @@ pub mod topology {
                     "{err}"
                 );
                 assert!(resolve_pp(requested, Some("0")).is_err());
+            }
+        }
+
+        #[test]
+        fn ep_ar_wire_is_a_typed_bf16_default_setting() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "topology.ep_ar_wire")
+                .expect("topology.ep_ar_wire is in the schema");
+            assert_eq!(
+                field.env_compat, None,
+                "a typed setting, no environment spelling"
+            );
+            assert!(matches!(field.default, crate::DefaultValue::String("bf16")));
+            for ok in EP_AR_WIRES {
+                assert!(field
+                    .validate(&crate::ConfigValue::String((*ok).to_owned()))
+                    .is_ok());
+                assert!(field.parse_cli(ok).is_ok());
+            }
+            for bad in ["fp32", "F32", "bf16 ", "dense", ""] {
+                assert!(
+                    field
+                        .validate(&crate::ConfigValue::String(bad.to_owned()))
+                        .is_err(),
+                    "{bad:?}"
+                );
+            }
+            assert_eq!(EpArWire::parse(None), Ok(EpArWire::Bf16));
+            assert_eq!(EpArWire::parse(Some("")), Ok(EpArWire::Bf16));
+            assert_eq!(EpArWire::parse(Some("bf16")), Ok(EpArWire::Bf16));
+            assert_eq!(EpArWire::parse(Some(" f32 ")), Ok(EpArWire::F32));
+            let err = EpArWire::parse(Some("fp32")).unwrap_err();
+            assert!(
+                err.contains("topology.ep_ar_wire") && err.contains("bf16, f32"),
+                "{err}"
+            );
+            assert_eq!(EpArWire::default(), EpArWire::Bf16);
+            for wire in [EpArWire::Bf16, EpArWire::F32] {
+                assert_eq!(EpArWire::parse(Some(wire.name())), Ok(wire));
             }
         }
 
@@ -11059,8 +11276,7 @@ pub mod memory {
     /// discovers `<base>.ep.expert-hotset` when the variable is unset, the drop-zero planar expert
     /// repack (F1, `HIPFIRE_QWEN4_EXPERT_DROP_ZERO`) follows it, and `hipfire pull` fetches the
     /// pinned sidecar. The decoupled unit reserve stays opt-in (`HIPFIRE_EP_UNIT_RESERVE=1`).
-    /// Kill switches: `HIPFIRE_QWEN4_EP_EXPERT_HOTSET=0`, `HIPFIRE_QWEN4_EXPERT_DROP_ZERO=0`,
-    /// `HIPFIRE_EP_UNIT_PINNED_OWNERS=0`.
+    /// Kill switches: `HIPFIRE_QWEN4_EP_EXPERT_HOTSET=0`, `HIPFIRE_QWEN4_EXPERT_DROP_ZERO=0`.
     pub const EP_EXPERT_HOTSET_DEFAULT_ON: bool = true;
 
     /// Optional override of the PLE hot-rank sidecar path
@@ -11550,52 +11766,6 @@ pub mod memory {
 
     /// Pure truth table behind [`ep_share_host`]: only a trimmed `0` is off.
     pub fn parse_ep_share_host(raw: Option<&str>) -> bool {
-        raw.map(str::trim) != Some("0")
-    }
-
-    /// Developer kill switch `HIPFIRE_EP_MTP_EXPERTS_RESIDENT` for the expert-parallel
-    /// native-MTP head's routed experts: default on, each rank of an EP load (2 or more
-    /// ranks) with the head attached keeps ITS OWNED slice of them (experts `e % ranks ==
-    /// rank`, 256 of 512 on EP2) VRAM-resident, charged to the rank's expert budget before the
-    /// trunk unit ranking walk, instead of pinned host RAM read over PCIe on every decode
-    /// step. Exactly `0` restores the host-mapped head placement.
-    pub fn ep_mtp_experts_resident() -> bool {
-        parse_ep_mtp_experts_resident(process_value("HIPFIRE_EP_MTP_EXPERTS_RESIDENT").as_deref())
-    }
-
-    /// Pure truth table behind [`ep_mtp_experts_resident`]: only a trimmed `0` is off.
-    pub fn parse_ep_mtp_experts_resident(raw: Option<&str>) -> bool {
-        raw.map(str::trim) != Some("0")
-    }
-
-    /// Developer kill switch `HIPFIRE_EP_HC8_PLAN_CHARGE` for the expert-parallel plan's
-    /// charge of the `<model>.hc8` sidecar: default on, the plan and every rank's fit census
-    /// charge the replicated HC mixer tensors at their E4M3 size (the bytes the applied
-    /// sidecar leaves allocated) instead of the manifest's BF16 size. Exactly `0` restores the
-    /// BF16 charge.
-    pub fn ep_hc8_plan_charge() -> bool {
-        parse_ep_hc8_plan_charge(process_value("HIPFIRE_EP_HC8_PLAN_CHARGE").as_deref())
-    }
-
-    /// Pure truth table behind [`ep_hc8_plan_charge`]: only a trimmed `0` is off.
-    pub fn parse_ep_hc8_plan_charge(raw: Option<&str>) -> bool {
-        raw.map(str::trim) != Some("0")
-    }
-
-    /// Developer kill switch `HIPFIRE_EP_RESERVE_CENSUS` for the expert-parallel (2 or more
-    /// ranks) reserve census: default on, an EP load charges the measured HIP runtime
-    /// (`QWEN4_EP2_RUNTIME_OVERHEAD_GFX1201_BYTES` on an exact gfx1201 EP2 load) and so
-    /// retires the historical single-device floor, sizes the trunk-shard rank's GDN state,
-    /// MTP capture ring and shared-expert INT8 shadows at the rank-local width instead of the
-    /// global one, and returns the pre-shard shared-expert copies from the device pool to HIP
-    /// after the shard. Exactly `0` restores the earlier EP behaviour byte for byte (floor
-    /// kept, global census terms, no pool drain). Read once per load.
-    pub fn ep_reserve_census() -> bool {
-        parse_ep_reserve_census(process_value("HIPFIRE_EP_RESERVE_CENSUS").as_deref())
-    }
-
-    /// Pure truth table behind [`ep_reserve_census`]: only a trimmed `0` is off.
-    pub fn parse_ep_reserve_census(raw: Option<&str>) -> bool {
         raw.map(str::trim) != Some("0")
     }
 

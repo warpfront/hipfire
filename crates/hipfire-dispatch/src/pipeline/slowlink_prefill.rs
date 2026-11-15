@@ -868,7 +868,6 @@ impl<'a> PreparedChunkCall<'a> {
             if selection.cpu_split
                 || selection.cpu_deferred_experts
                 || selection.down_last_combine
-                || selection.ninepath_d3
                 || selection.ninepath_d4
                 || !selection.resolution.use_gpu_topk
                 || !selection
@@ -2484,12 +2483,11 @@ fn run_k1_cohort(
                 let tmp = aggregate
                     .then(|| routes.view(layout.k1_tmp, slots * d.hidden * F32_BYTES, DType::F32));
                 view.down_expanded = tmp.as_ref().unwrap_or(&y0);
-                super::decode_gate_up_stage(gpu, &view, dt.resolution, dt.input, false, dt.route)?;
-                super::decode_activation_stage(gpu, &view, dt.resolution, dt.route, None)?;
+                super::decode_gate_up_stage(gpu, &view, dt.resolution, dt.input, dt.route)?;
+                super::decode_activation_stage(gpu, &view, dt.route, None)?;
                 super::decode_down_stage(
                     gpu,
                     &view,
-                    dt.resolution,
                     view.x_residual,
                     false,
                     false,
@@ -2703,13 +2701,7 @@ pub fn finish_shared(
             ))?;
             let gate = super::slice_moe_f32_view(shared.gate_out, 0, smi);
             let up = super::slice_moe_f32_view(shared.up_out, 0, smi);
-            super::decode_activation_stage(
-                gpu,
-                &params,
-                selection.resolution,
-                selection.route,
-                Some((&gate, &up)),
-            )?;
+            super::decode_activation_stage(gpu, &params, selection.route, Some((&gate, &up)))?;
             super::decode_shared_down_stage(
                 call.call.dispatch_ctx(),
                 gpu,
@@ -4425,20 +4417,12 @@ pub mod selftest {
                 &p,
                 selection.resolution,
                 input,
-                false,
                 selection.route,
             )?;
-            super::super::decode_activation_stage(
-                gpu,
-                &p,
-                selection.resolution,
-                selection.route,
-                Some((&gate, &up)),
-            )?;
+            super::super::decode_activation_stage(gpu, &p, selection.route, Some((&gate, &up)))?;
             super::super::decode_down_stage(
                 gpu,
                 &p,
-                selection.resolution,
                 p.x_residual,
                 false,
                 false,

@@ -6,17 +6,11 @@
 
 # fetch_calibration_corpus.sh — build a corpus by concatenating one or
 # more HuggingFace datasets, flattened to a ChatML-wrapped plain-text
-# stream. **Used by two distinct flows; do not confuse them:**
-#
-#   1. Sidecar calibration  — feed to `triattn_validate --corpus`,
-#      produces `.triattn.bin`.
-#
-#   2. DFlash draft training — feed to `generate_target_responses.py`
+# stream. **Used for DFlash draft training — feed to `generate_target_responses.py`
 #      (Phase C2 of task #93), then to `dflash_train_poc.py` after
 #      target-regeneration. Produces `.hfq` draft weights.
 #
-# Same recipes (`agentic`, `agentic_xl`, `reasoning`, `blended`, `all`)
-# serve both flows; the consumer differs. The legacy file name kept for
+# The legacy file name kept for
 # git history continuity — do not rename.
 #
 # Recipes (bundles):

@@ -61,14 +61,8 @@ fn main() {
     let x = gpu.upload_f32(&x_host, &[BATCH, X_DIM]).expect("upload x");
     let w = upload_f16(&gpu, &w_bits, &[N_CTRL, X_DIM]);
     let base = upload_f16(&gpu, &base_bits, &[N_CTRL]);
-    let inv = gpu.zeros(&[BATCH], DType::F32).expect("inv scratch");
     let reference = gpu.zeros(&[BATCH, N_CTRL], DType::F32).expect("reference");
     let fused = gpu.zeros(&[BATCH, N_CTRL], DType::F32).expect("fused24");
-    let candidates = [
-        gpu.zeros(&[BATCH, N_CTRL], DType::F32).expect("B1"),
-        gpu.zeros(&[BATCH, N_CTRL], DType::F32).expect("B2"),
-        gpu.zeros(&[BATCH, N_CTRL], DType::F32).expect("B4"),
-    ];
 
     gpu.hc_compute_control_batched(
         &x,
@@ -90,20 +84,6 @@ fn main() {
         BATCH as i32,
     )
     .expect("fused24");
-    for (index, tiles) in [1usize, 2, 4].into_iter().enumerate() {
-        gpu.hc_compute_control_wmma_batched_gfx1201(
-            &x,
-            &w,
-            &base,
-            &inv,
-            &candidates[index],
-            N_CTRL as i32,
-            X_DIM as i32,
-            BATCH as i32,
-            tiles,
-        )
-        .expect("candidate");
-    }
     gpu.hip.device_synchronize().expect("parity sync");
     let expected = gpu.download_f32(&reference).expect("download reference");
     let fused_actual = gpu.download_f32(&fused).expect("download fused24");
@@ -116,24 +96,6 @@ fn main() {
         "fused24 raw_mismatches={fused_mismatches}/{}",
         expected.len()
     );
-    for (index, tiles) in [1usize, 2, 4].into_iter().enumerate() {
-        let actual = gpu
-            .download_f32(&candidates[index])
-            .expect("download candidate");
-        let mut err2 = 0.0f64;
-        let mut ref2 = 0.0f64;
-        let mut max_abs = 0.0f32;
-        for (&a, &b) in expected.iter().zip(&actual) {
-            let delta = (a - b).abs();
-            max_abs = max_abs.max(delta);
-            err2 += (delta as f64) * (delta as f64);
-            ref2 += (a as f64) * (a as f64);
-        }
-        println!(
-            "B{tiles} rel_rmse={:.8} max_abs={max_abs:.8}",
-            (err2 / ref2.max(f64::MIN_POSITIVE)).sqrt()
-        );
-    }
 
     for _ in 0..3 {
         gpu.hc_compute_control_batched(
@@ -175,24 +137,4 @@ fn main() {
         "fused24 baseline_us={baseline_us:.3} candidate_us={fused_us:.3} speedup_x={:.3}",
         baseline_us / fused_us
     );
-    for (index, tiles) in [1usize, 2, 4].into_iter().enumerate() {
-        let candidate_us = event_us(&mut gpu, |gpu| {
-            gpu.hc_compute_control_wmma_batched_gfx1201(
-                &x,
-                &w,
-                &base,
-                &inv,
-                &candidates[index],
-                N_CTRL as i32,
-                X_DIM as i32,
-                BATCH as i32,
-                tiles,
-            )
-            .expect("time candidate")
-        });
-        println!(
-            "B{tiles} baseline_us={baseline_us:.3} candidate_us={candidate_us:.3} speedup_x={:.3}",
-            baseline_us / candidate_us
-        );
-    }
 }

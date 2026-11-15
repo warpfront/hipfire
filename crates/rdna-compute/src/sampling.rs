@@ -11,21 +11,6 @@ use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::{HipError, HipResult};
 
-/// Whether the multi-workgroup parallel sampler is enabled (default ON).
-/// `HIPFIRE_SAMPLE_PARALLEL=0` forces the legacy single-block kernel (for
-/// byte-exact A/B and as a fallback). Snapshot-backed, no per-flag cache.
-fn sample_parallel_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_SAMPLE_PARALLEL", true)
-}
-
-/// Whether the tie-safe fast reducer is enabled (default ON). This keeps the
-/// exact legacy parallel reducer available as a same-binary correctness and
-/// performance control without falling all the way back to the single-block
-/// sampler.
-fn sample_fast_stable_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_SAMPLE_FAST", true)
-}
-
 /// HIP source for the default parallel sampler module (`sample_top_p_parallel`,
 /// TOP_K 20). Shared by runtime ensure_kernel and the kernel registry so the
 /// cache hash is identical.
@@ -136,10 +121,7 @@ impl ParallelExactVariant {
 /// Whether the fast-stable reducer is used for a request (width 21 covers
 /// top_k<=20, width 65 covers 21..=64; vocab-guarded).
 fn sample_fast_stable_eligible(top_k_req: i32, vocab_size: usize) -> bool {
-    sample_fast_stable_enabled()
-        && top_k_req > 0
-        && top_k_req <= 64
-        && vocab_size <= SAMPLE_N_BLOCKS as usize * 256 * 16
+    top_k_req > 0 && top_k_req <= 64 && vocab_size <= SAMPLE_N_BLOCKS as usize * 256 * 16
 }
 
 /// What [`Gpu::sample_top_p_pf_enqueue`] enqueued, i.e. how the caller must
@@ -306,82 +288,25 @@ impl Gpu {
         // top_k → 20 (== kernel TOP_K, no cut), min_p → 0.0 (disabled).
         let top_k_req = top_k.map(|k| k as i32).unwrap_or(20);
         let min_p_val = min_p.unwrap_or(0.0);
-        // Multi-workgroup parallel sampler (default ON): splits the 150K-vocab
-        // top-K scan across N blocks instead of the single-block kernel that
-        // idles 95 of 96 CUs (~305 us/token on gfx1100 A3B decode). Byte-
-        // identical token for distinct logits. Opt out: HIPFIRE_SAMPLE_PARALLEL=0.
-        if sample_parallel_enabled() {
-            return self.sample_top_p_parallel_impl(
-                logits,
-                result_buf,
-                repeat_buf,
-                vocab_size,
-                temperature,
-                top_p,
-                rng_state,
-                repeat_window,
-                repeat_penalty,
-                presence_penalty,
-                frequency_penalty,
-                top_k_req,
-                min_p_val,
-            );
-        }
-        self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
-        let func = &self.functions["sample_top_p"];
-
-        let mut logits_ptr = logits.buf.as_ptr();
-        let mut result_ptr = result_buf.buf.as_ptr();
-        let mut repeat_ptr = repeat_buf.buf.as_ptr();
-        let mut vs = vocab_size as i32;
-        let mut temp = temperature;
-        let mut tp = top_p;
-        let mut rng = rng_state;
-        let mut rw = repeat_window as i32;
-        let mut rp = repeat_penalty;
-        let mut pp = presence_penalty;
-        let mut fp = frequency_penalty;
-        let mut tk = top_k_req;
-        let mut mp = min_p_val;
-
-        let mut params: Vec<*mut std::ffi::c_void> = vec![
-            &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
-            &mut result_ptr as *mut _ as *mut std::ffi::c_void,
-            &mut repeat_ptr as *mut _ as *mut std::ffi::c_void,
-            &mut vs as *mut _ as *mut std::ffi::c_void,
-            &mut temp as *mut _ as *mut std::ffi::c_void,
-            &mut tp as *mut _ as *mut std::ffi::c_void,
-            &mut rng as *mut _ as *mut std::ffi::c_void,
-            &mut rw as *mut _ as *mut std::ffi::c_void,
-            &mut rp as *mut _ as *mut std::ffi::c_void,
-            &mut pp as *mut _ as *mut std::ffi::c_void,
-            &mut fp as *mut _ as *mut std::ffi::c_void,
-            &mut tk as *mut _ as *mut std::ffi::c_void,
-            &mut mp as *mut _ as *mut std::ffi::c_void,
-        ];
-
-        // W7 P2b: gather TOP_K widened 20→64. LDS = nthreads*TOP_K*8; with
-        // TOP_K=64 the block must be 128 threads (128*64*8 = 64 KiB, the RDNA
-        // wave32 group-segment limit; 256 would request 128 KiB and fail).
-        let block_size = 128u32;
-        let shared_mem = block_size * 64 * 4 * 2;
-
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )?;
-        }
-
-        let mut out = [0u8; 8];
-        self.hip.memcpy_dtoh(&mut out, &result_buf.buf)?;
-        let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
-        let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
-        Ok((token_id, new_rng))
+        // Multi-workgroup parallel sampler: splits the 150K-vocab top-K scan
+        // across N blocks instead of the single-block kernel that idles 95 of
+        // 96 CUs (~305 us/token on gfx1100 A3B decode). Byte-identical token
+        // to the single-block kernel for distinct logits.
+        self.sample_top_p_parallel_impl(
+            logits,
+            result_buf,
+            repeat_buf,
+            vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            repeat_window,
+            repeat_penalty,
+            presence_penalty,
+            frequency_penalty,
+            top_k_req,
+            min_p_val,
+        )
     }
 
     /// Multi-workgroup parallel implementation of [`sample_top_p_pf`]. Up to
@@ -472,9 +397,7 @@ impl Gpu {
     /// `result_buf`, which may be a 2-element sub-view
     /// ([`GpuTensor::sub_offset`]); NO host readback or sync is performed.
     ///
-    /// Returns `Ok(None)` (nothing enqueued) when the parallel sampler is
-    /// disabled (`HIPFIRE_SAMPLE_PARALLEL=0`); the caller must then use the
-    /// singleton `sample_top_p_pf`. [`SampleEnqueued::Fast`] means a
+    /// Returns which reducer was enqueued. [`SampleEnqueued::Fast`] means a
     /// `token_id == u32::MAX` result must be re-run via
     /// [`Self::sample_top_p_pf_exact_enqueue`] with the ORIGINAL `rng_state`
     /// (the penalty prepass already ran in place and must not be repeated).
@@ -494,11 +417,8 @@ impl Gpu {
         frequency_penalty: f32,
         top_k: Option<u32>,
         min_p: Option<f32>,
-    ) -> HipResult<Option<SampleEnqueued>> {
+    ) -> HipResult<SampleEnqueued> {
         self.bind_thread()?;
-        if !sample_parallel_enabled() {
-            return Ok(None);
-        }
         let top_k_req = top_k.map(|k| k as i32).unwrap_or(20);
         let min_p_val = min_p.unwrap_or(0.0);
         let variant = self.sample_parallel_prepare(top_k_req)?;
@@ -523,7 +443,7 @@ impl Gpu {
                 top_k_req,
                 min_p_val,
             )?;
-            return Ok(Some(SampleEnqueued::Fast));
+            return Ok(SampleEnqueued::Fast);
         }
         self.enqueue_sample_exact(
             &variant,
@@ -536,7 +456,7 @@ impl Gpu {
             top_k_req,
             min_p_val,
         )?;
-        Ok(Some(SampleEnqueued::Exact))
+        Ok(SampleEnqueued::Exact)
     }
 
     /// Enqueue the exact parallel reducer (partial + finalize) WITHOUT the
@@ -881,73 +801,6 @@ impl Gpu {
         Ok((token_id, new_rng))
     }
 
-    /// Launch sampling kernel only (no readback). For use during graph capture.
-    pub fn sample_top_p_launch(
-        &mut self,
-        logits: &GpuTensor,
-        result_buf: &GpuTensor,
-        repeat_buf: &GpuTensor,
-        vocab_size: usize,
-        temperature: f32,
-        top_p: f32,
-        rng_state: u32,
-        repeat_window: usize,
-        repeat_penalty: f32,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
-        let func = &self.functions["sample_top_p"];
-
-        let mut logits_ptr = logits.buf.as_ptr();
-        let mut result_ptr = result_buf.buf.as_ptr();
-        let mut repeat_ptr = repeat_buf.buf.as_ptr();
-        let mut vs = vocab_size as i32;
-        let mut temp = temperature;
-        let mut tp = top_p;
-        let mut rng = rng_state;
-        let mut rw = repeat_window as i32;
-        let mut rp = repeat_penalty;
-        // Graph-capture path does not expose presence/frequency penalties.
-        let mut pp = 0.0f32;
-        let mut fp = 0.0f32;
-        // Graph-capture path uses legacy candidate caps (no cut, min_p off).
-        let mut tk = 20i32;
-        let mut mp = 0.0f32;
-
-        let mut params: Vec<*mut std::ffi::c_void> = vec![
-            &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
-            &mut result_ptr as *mut _ as *mut std::ffi::c_void,
-            &mut repeat_ptr as *mut _ as *mut std::ffi::c_void,
-            &mut vs as *mut _ as *mut std::ffi::c_void,
-            &mut temp as *mut _ as *mut std::ffi::c_void,
-            &mut tp as *mut _ as *mut std::ffi::c_void,
-            &mut rng as *mut _ as *mut std::ffi::c_void,
-            &mut rw as *mut _ as *mut std::ffi::c_void,
-            &mut rp as *mut _ as *mut std::ffi::c_void,
-            &mut pp as *mut _ as *mut std::ffi::c_void,
-            &mut fp as *mut _ as *mut std::ffi::c_void,
-            &mut tk as *mut _ as *mut std::ffi::c_void,
-            &mut mp as *mut _ as *mut std::ffi::c_void,
-        ];
-
-        // W7 P2b: gather TOP_K widened 20→64. LDS = nthreads*TOP_K*8; with
-        // TOP_K=64 the block must be 128 threads (128*64*8 = 64 KiB, the RDNA
-        // wave32 group-segment limit; 256 would request 128 KiB and fail).
-        let block_size = 128u32;
-        let shared_mem = block_size * 64 * 4 * 2;
-
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
-    }
-
     /// Top-K=1024 extraction over a logits vector. Populates an 8 KB
     /// buffer with [1024 × u32 indices | 1024 × f32 values]. One
     /// device→host copy pulls the whole thing. The host then runs its
@@ -995,7 +848,7 @@ impl Gpu {
     /// Per-row top-K + log-sum-exp over `[B × vocab]` f32 logits.
     /// Writes `top_idx[B × K]` and `top_logp[B × K]` where `top_logp[r,k] =
     /// logit[r, top_idx[r,k]] - log_z[r]` with `log_z` = row-wise
-    /// log-sum-exp. Replaces 20 ms of CPU sort + log_z per DDTree cycle.
+    /// log-sum-exp. Replaces a CPU sort + log_z.
     ///
     /// Constraints: K ≤ 16 (kernel-enforced). For larger K, extend MAX_K in
     /// the kernel source and the per-thread arrays.
@@ -1416,200 +1269,6 @@ impl Gpu {
             .chunks_exact(2)
             .map(|pair| (pair[0], pair[1]))
             .collect())
-    }
-    /// Per-row Gumbel-top-k SWOR sampler: draws `k` tokens WITHOUT replacement
-    /// from `softmax(logits/temp)` per row of `[batch × vocab]`, returning the
-    /// draw-ordered token ids (`top_idx`) and their true log-probs (`top_logp`),
-    /// both `[batch × k]`. Keeps the draft logits device-resident — only B×k come
-    /// back, vs the prior [B × vocab] D2H for host Gumbel sampling.
-    #[allow(clippy::too_many_arguments)]
-    pub fn ddtree_gumbel_topk_batched_f32(
-        &mut self,
-        logits: &GpuTensor,   // [batch × vocab]
-        top_idx: &GpuTensor,  // [batch × k] i32
-        top_logp: &GpuTensor, // [batch × k] f32
-        vocab: usize,
-        k: usize,
-        batch: usize,
-        temp: f32,
-        seed: u64,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        assert!((1..=8).contains(&k), "gumbel_topk: k={k} must be in [1,8]");
-        self.ensure_kernel(
-            "ddtree_gumbel_topk_batched",
-            kernels::DDTREE_GUMBEL_TOPK_BATCHED_SRC,
-            "ddtree_gumbel_topk_batched_f32",
-        )?;
-        let func = &self.functions["ddtree_gumbel_topk_batched_f32"];
-        let mut lp = logits.buf.as_ptr();
-        let mut ti = top_idx.buf.as_ptr();
-        let mut tl = top_logp.buf.as_ptr();
-        let mut vs = vocab as i32;
-        let mut kk = k as i32;
-        let mut tp = temp;
-        let mut sd = (seed | 1) as u32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut lp as *mut _ as *mut c_void,
-            &mut ti as *mut _ as *mut c_void,
-            &mut tl as *mut _ as *mut c_void,
-            &mut vs as *mut _ as *mut c_void,
-            &mut kk as *mut _ as *mut c_void,
-            &mut tp as *mut _ as *mut c_void,
-            &mut sd as *mut _ as *mut c_void,
-        ];
-        const MAX_K: u32 = 8;
-        let nth: u32 = 256;
-        let lds = ((32 + nth * MAX_K * 2) * 4) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [batch as u32, 1, 1],
-                [nth, 1, 1],
-                lds,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
-    }
-
-    /// Fused on-device SWOR tree-verify walk. One workgroup runs the whole
-    /// sequential descent; each per-slot vocab sweep (target softmax, draft
-    /// softmax, recursive `relu(p−q)` residual, renorm, categorical draw) is
-    /// block-parallel. Replaces the host O(vocab·k)/slot loop and the q D2H.
-    /// `out` (i32 `[2 + num_pos]`): `out[0]`=accept_len, `out[1]`=bonus token,
-    /// `out[2+i]`=accepted child node index.
-    #[allow(clippy::too_many_arguments)]
-    pub fn ddtree_swor_walk_f32(
-        &mut self,
-        target_logits: &GpuTensor, // [n_slots * vocab]
-        draft_logits: &GpuTensor,  // [num_pos * vocab]
-        pos_cands: &GpuTensor,     // [num_pos * k] i32
-        slot_depth: &GpuTensor,    // [n_slots] i32
-        child_of_cand: &GpuTensor, // [n_slots * k] i32
-        p_res: &GpuTensor,         // scratch [vocab]
-        q_pos: &GpuTensor,         // scratch [vocab]
-        out: &GpuTensor,           // [2 + num_pos] i32
-        temp: f32,
-        k: usize,
-        vocab: usize,
-        n_slots: usize,
-        num_pos: usize,
-        seed: u64,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        assert!((1..=8).contains(&k), "swor_walk: k={k} must be in [1,8]");
-        self.ensure_kernel(
-            "ddtree_swor_walk",
-            kernels::DDTREE_SWOR_WALK_SRC,
-            "ddtree_swor_walk_f32",
-        )?;
-        let mut tl = target_logits.buf.as_ptr();
-        let mut dl = draft_logits.buf.as_ptr();
-        let mut pc = pos_cands.buf.as_ptr();
-        let mut sd = slot_depth.buf.as_ptr();
-        let mut cc = child_of_cand.buf.as_ptr();
-        let mut pr = p_res.buf.as_ptr();
-        let mut qp = q_pos.buf.as_ptr();
-        let mut op = out.buf.as_ptr();
-        let mut tp = temp;
-        let mut kk = k as i32;
-        let mut vs = vocab as i32;
-        let mut ns = n_slots as i32;
-        let mut np = num_pos as i32;
-        let mut sd_seed = (seed | 1) as u32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut tl as *mut _ as *mut c_void,
-            &mut dl as *mut _ as *mut c_void,
-            &mut pc as *mut _ as *mut c_void,
-            &mut sd as *mut _ as *mut c_void,
-            &mut cc as *mut _ as *mut c_void,
-            &mut pr as *mut _ as *mut c_void,
-            &mut qp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut tp as *mut _ as *mut c_void,
-            &mut kk as *mut _ as *mut c_void,
-            &mut vs as *mut _ as *mut c_void,
-            &mut ns as *mut _ as *mut c_void,
-            &mut np as *mut _ as *mut c_void,
-            &mut sd_seed as *mut _ as *mut c_void,
-        ];
-        self.launch_maybe_blob(
-            "ddtree_swor_walk_f32",
-            [1, 1, 1],
-            [256, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(tl);
-                b.push_ptr(dl);
-                b.push_ptr(pc);
-                b.push_ptr(sd);
-                b.push_ptr(cc);
-                b.push_ptr(pr);
-                b.push_ptr(qp);
-                b.push_ptr(op);
-                b.push_f32(tp);
-                b.push_i32(kk);
-                b.push_i32(vs);
-                b.push_i32(ns);
-                b.push_i32(np);
-                b.push_u32(sd_seed);
-                b
-            },
-        )
-    }
-
-    /// Stage 3a: on-GPU ddtree attention-mask builder.
-    ///
-    /// Reads `parent_indices[big_n]` (i32, device-resident) and fills
-    /// `attn_bias[big_n * big_n]` (f32, row-major). Thread `i` walks the
-    /// parent chain from `i` up to the root (-1 sentinel), setting 0.0 for
-    /// each visited ancestor and -INF everywhere else. Exactly mirrors the
-    /// host `visibility` bottom-up pass + row-major flatten in ddtree.rs.
-    ///
-    /// Grid: [big_n, 1, 1]. Block: [big_n, 1, 1]. At big_n ≤ 61 this is
-    /// 61 threads total — occupancy is trivial; the kernel runs < 1 µs.
-    pub fn ddtree_build_attn_mask_f32(
-        &mut self,
-        parent_indices: &GpuTensor, // [big_n] i32 (stored as Raw, 4*big_n bytes)
-        attn_bias: &GpuTensor,      // [big_n * big_n] f32
-        big_n: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        // The kernel launches blockDim.x = big_n (one thread per tree row); AMD
-        // hardware caps blockDim.x at 1024. In practice big_n = 1 + max_budget ≤ 61,
-        // so 1024 is already generous — a larger value would otherwise fail the
-        // launch with an opaque invalid-configuration error instead of this assert.
-        assert!(
-            big_n >= 1 && big_n <= 1024,
-            "ddtree_build_attn_mask: big_n={big_n} exceeds the 1024 blockDim.x cap (big_n = 1 + max_budget, normally ≤ 61)"
-        );
-        self.ensure_kernel(
-            "ddtree_build_attn_mask",
-            kernels::DDTREE_BUILD_ATTN_MASK_SRC,
-            "ddtree_build_attn_mask_f32",
-        )?;
-        let func = &self.functions["ddtree_build_attn_mask_f32"];
-        let mut pi = parent_indices.buf.as_ptr();
-        let mut ab = attn_bias.buf.as_ptr();
-        let mut nn = big_n as i32;
-        let mut params: Vec<*mut std::ffi::c_void> = vec![
-            &mut pi as *mut _ as *mut std::ffi::c_void,
-            &mut ab as *mut _ as *mut std::ffi::c_void,
-            &mut nn as *mut _ as *mut std::ffi::c_void,
-        ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [big_n as u32, 1, 1],
-                [big_n as u32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
     }
 
     /// C8 Kernel 0: batched categorical sampler over already-softmax'd probs.

@@ -751,7 +751,7 @@ pub fn forward_batch(
     // Gate on chunk size: below MOE_GROUPED_GATE rows the 256 experts get too
     // few rows each to fill a BLOCK_M tile, so the per-token indexed path wins;
     // at/above it the grouped path is faster + coherent for the dtype pairs
-    // with grouped kernels (validated by coherence-gate-minimax.sh). Require
+    // with grouped kernels (validated by the former MiniMax coherence battery). Require
     // every layer to be eligible before allocating grouped scratch: MiniMax
     // k-maps can use MQ4 for down even when gate_up is MQ2-Lloyd, and that
     // combination must retain the indexed path rather than failing mid-pass.

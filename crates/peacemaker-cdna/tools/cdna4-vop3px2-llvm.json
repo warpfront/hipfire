@@ -1,0 +1,19 @@
+{
+  "arch": "gfx950",
+  "tool": "/opt/rocm/llvm/bin/llvm-mc -triple=amdgcn-amd-amdhsa -mcpu=gfx950 --disassemble --show-encoding",
+  "status": "unverified",
+  "scope": "Decode discriminator correction only. Not a hardware receipt or encoding promotion.",
+  "xml_discrepancy": "ENC_VOP3PX2 lists d3ad/d3ae at word 0 although OP and ENCODING fields are in word 2. Actual instructions have d3ac at word 0 and d3ad/d3ae at word 2.",
+  "rows": [
+    {
+      "name": "V_MFMA_SCALE_F32_16X16X128_F8F6F4",
+      "bytes": "0000acd3102302000008add300110204",
+      "assembly": "v_mfma_scale_f32_16x16x128_f8f6f4 v[0:3], v[0:7], v[8:15], v[0:3], v16, v17 op_sel_hi:[0,0,0]"
+    },
+    {
+      "name": "V_MFMA_SCALE_F32_32X32X64_F8F6F4",
+      "bytes": "0000acd3102302000008aed300110204",
+      "assembly": "v_mfma_scale_f32_32x32x64_f8f6f4 v[0:15], v[0:7], v[8:15], v[0:15], v16, v17 op_sel_hi:[0,0,0]"
+    }
+  ]
+}

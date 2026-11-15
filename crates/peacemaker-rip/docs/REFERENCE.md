@@ -1,6 +1,6 @@
 # `.rip` language reference
 
-This reference targets RDNA gfx1151 and gfx1201, wave32. gfx1100 uses the gfx11 instruction spellings below. `.rip` is an evaluated kernel-authoring language, not rustc and not device Rust.
+This reference targets RDNA gfx1100/gfx1151/gfx1201 (wave32) and CDNA3 gfx942 (MI300X, wave64). `.rip` is an evaluated kernel-authoring language, not rustc and not device Rust.
 
 ## 1. Mental model
 
@@ -14,9 +14,9 @@ The runtime Driver checks LDS ownership, publication, draining and workgroup-uni
 
 The preferred entry signature is `fn emit(spec: Spec) -> Result<Emitted, String>`. The injected `Spec` has `arch: Arch`, `variant: String`, and `kind`. Declare a unit `enum Kind { Default, Other }` to make `spec.kind` the matching enum variant (case-insensitive matching against `spec.variant`); without a matching variant, `kind` is the variant string. Match `spec.kind` to choose emission routines. The alternate entry is `fn emit(arch: Arch, variant: String) -> Result<Emitted, String>`; it receives the same architecture and variant string separately. Finish with `builder.finish()`, not `Ok(())`.
 
-`Arch::{Gfx1100,Gfx1151,Gfx1201}` are available. `arch.gfx12() -> bool`, `arch.name() -> String`, and `arch.buffer_offset_max() -> u32` inspect it; for example `let name = spec.arch.name();`.
+`Arch::{Gfx942,Gfx1100,Gfx1151,Gfx1201}` are available. `arch.gfx12() -> bool`, `arch.name() -> String`, and `arch.buffer_offset_max() -> u32` inspect it; for example `let name = spec.arch.name();`.
 
-`check` defaults to gfx1151 and gfx1201; `--arch all` includes gfx1100. Pass `--variant default` explicitly when there is no `Kind`. When omitted, the CLI uses the script's declared `Kind` variants. Variant and architecture selection happen at emission time, not at kernel launch.
+`check` defaults to gfx1151 and gfx1201; `--arch all` includes gfx1100 and gfx942. Pass `--variant default` explicitly when there is no `Kind`. When omitted, the CLI uses the script's declared `Kind` variants. Variant and architecture selection happen at emission time, not at kernel launch.
 
 ## 3. The evaluated Rust subset
 
@@ -81,7 +81,7 @@ fn main() -> u32 { total(Pair { x: 4u32, y: 9u32 }) }
 | `system_sgpr_workgroup_id_y` | bool | enable workgroup y ID |
 | `workgroup_size` | u16 | metadata maximum flat workgroup size |
 | `group_segment_fixed_size` | u32 | statically allocated LDS bytes |
-| `wave32` | bool | must be true (`builder requires wave32`) |
+| `wave32` | bool | true for RDNA; false for gfx942 (wave64) |
 | `cu_mode` | bool | CU mode; metadata WGP mode is its inverse |
 
 `KernargLayout::new(size: u32) -> KernargLayout` sets total bytes, including padding; example `KernargLayout::new(16)`. `.pointer(name: str, offset: u32) -> KernargLayout` adds an eight-byte global pointer; example `.pointer("input", 0)`. `.hidden(name: str, offset: u32, size: u32, value_kind: str) -> KernargLayout` adds explicit-sized metadata; example `.hidden("count", 8, 4, "by_value")`. `.validate() -> Result<(), String>` checks layout bounds/overlap; example `layout.validate()?`. These are metadata, not argument loads; offsets and total size must match the host's packed argument bytes. Metadata kernarg alignment is eight bytes.
@@ -116,6 +116,7 @@ Manual VGPR granule padding is **not required by RegPlan or the emitter**: the e
 |---|---|
 | `v(n), s(n) -> RegRef` | one VGPR/SGPR; `v(3)`, `s(4)` |
 | `vr(base,len), sr(base,len) -> RegRef` | contiguous range (second argument is length, not last index); `sr(8,4)` is s[8:11] |
+| `a(n), ar(base,len) -> RegRef` | CDNA AGPR or contiguous AGPR range, distinct from VGPRs; `ar(0,4)` |
 | `lit(x: u32) -> String` | canonical decimal for 0..64 and bit patterns -16..-1, hex otherwise; `lit(128)` is `"0x80"` |
 | `op(b,text,defs:&[RegRef],uses:&[RegRef]) -> Result<(),String>` | given instruction text; `op(wg.isa(),"v_mov_b32_e32 v1, 0",&[v(1)],&[])?` |
 | `mem(b,text,defs,uses,class) -> Result<(),String>` | given text with memory classification; `mem(wg.isa(),text,&[v(1)],&[v(0),sr(8,4)],MemoryClass::VmemLoad)?` |
@@ -292,6 +293,16 @@ wg.skip_if(c, ".Lskip_doc", |w| {
     Ok(())
 })?;
 ```
+
+### CDNA3 launch and instruction ABI
+
+gfx942 uses wave64: EXEC and VCC are two dwords, and lane IDs are `v0 & 63`. The kernarg pointer is s[0:1]; workgroup x and optionally y follow user SGPRs in order, just as on gfx11. Use `wave32: false`. The emitted CDNA descriptor includes `.amdhsa_accum_offset` and metadata `.wavefront_size: 64`, not RDNA wave32 directives.
+
+AGPRs are a separate ownership bank: `RegPlan::new(256,100)?.with_agpr_budget(16)?` enables the budget, `p.a::<4>("acc", 0, Live::Whole)?` allocates ownership, and `a(0)` / `ar(0,4)` declare effects. Instruction effects come from CDNA typed footprints, including MFMA accumulator read/write operands. `op`/`mem` accept native CDNA spellings, such as `v_mfma_f32_16x16x16bf16_1k`, the architecture's FP8 MFMA variants, `ds_read_*`/`ds_write_*`, `global_load_*`/`global_store_*` and `buffer_load_*`/`buffer_store_*`. Do not substitute RDNA `ds_load_*` spellings.
+
+Workgroup ownership, publication, loop joins and barrier-uniformity checks are unchanged. gfx942 has one full `s_barrier` and no split barrier. LDS/SMEM retire on LGKMcnt; global/buffer loads and stores share VMcnt. CDNA's `s_waitcnt` immediate layout is not gfx11's layout. Lowering uses the existing checked CDNA builder and native codec; `check --arch gfx942` also lifts the final ELF and runs the CDNA hazard checker and path-sensitive wait-ledger replay without suppressing findings.
+
+The CDNA footprint conservatively requires M0 initialized before DS memory accesses (ISA §11.3.1); use `op(wg.isa(), "s_mov_b32 m0, -1", &[], &[])?;`. Whether gfx942 hardware ignores M0 for plain LDS, as LLVM assumes, remains **OPEN**. An uninitialized M0 is an R0604 error, pinned by a negative test, not an allowlisted exception.
 
 ## 9. RDNA launch ABI
 

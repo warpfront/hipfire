@@ -1496,6 +1496,14 @@ Typical message: `` register read before it is defined: s2 in `s_mov_b32 s20, s2
 
 The usual mistake is carrying a gfx11 habit to gfx12: on gfx11 the workgroup id x arrives in `s2` (declared in the register plan), on gfx12 it is `ttmp9` and `s2` holds nothing. Read the register the architecture defines, or write the register (a `v_mov_b32` / `s_mov_b32`) somewhere in the kernel before it is read. The failing script reads `s2` and is shown for gfx1201 only; on gfx1151 it is accepted.
 
+On gfx942 the final native CDNA lift checks individual dwords in every register
+bank, including AGPRs and special registers. Entry definitions come from the
+descriptor's user/workgroup SGPR allocation, `v0`, and the full 64-bit EXEC mask.
+This remains a whole-kernel, not per-path, definedness check; hazard and CFG
+wait-ledger checks are separate. In particular, initialize M0 explicitly before
+DS accesses (`s_mov_b32 m0, -1`). Whether gfx942 hardware ignores M0 for ordinary
+LDS is **OPEN**, so an uninitialized M0 is not suppressed.
+
 Fails:
 
 ```rip fails=R0604 arch=gfx1201

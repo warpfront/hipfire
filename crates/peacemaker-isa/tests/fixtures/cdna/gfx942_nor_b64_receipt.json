@@ -1,0 +1,21 @@
+{
+  "status": "PASS",
+  "oracle": "cdna_nor_hw_oracle",
+  "source_commit": "a6d8cc59651784c9b4d147a0104795d8968a1a98",
+  "binary_sha256": "b52f61e31c73c24c895a466a4f321965b7125e8f525753de5fe5cc957a89d04f",
+  "raw_receipt_sha256": "ea513a5badc215117f6dbdd3d3e490c787ca512cc3cf8703806357fd0b8af49f",
+  "raw_log_sha256": "1e155276f15a207ff187c6ccdfa695c34ab5022200ccd7a5edda80c60dfd6c6b",
+  "ledger": {
+    "owner": "TwinWide942d",
+    "class": "oracle",
+    "start": "2026-11-12T22:59:32+00:00",
+    "end": "2026-11-12T22:59:32+00:00",
+    "wait_s": 0,
+    "run_s": 0,
+    "exit": 0,
+    "loadavg": "1.21 0.55 0.50",
+    "peak_runnable": 0,
+    "min_free_ram_pct": 97,
+    "cmd": "bash /scratch/quant/fn-fp8/beat/WC8/twinc/run-nor.sh"
+  }
+}

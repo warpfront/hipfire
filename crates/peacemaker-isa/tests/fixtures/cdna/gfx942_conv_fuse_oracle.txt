@@ -1,0 +1,9 @@
+[hip-bridge] GPU_PINNED_MIN_XFER_SIZE=100000: pageable weight copies staged out of reclaim
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.16)
+  pre-compiled kernels: /scratch/quant/fn-fp8/beat/WC8/twine/kcache/gfx942
+[rocblas] loaded for gfx942
+module arm: code object /scratch/quant/fn-fp8/beat/WC8/twine/conv-fuse.elf
+hyper_norm_bf16x: cumulative PASS 146 FAIL 0
+hyper_write_norm_bf16x: cumulative PASS 658 FAIL 0
+RESULT cases PASS 658 FAIL 0 | controls DETECTED 33 MISSED 0
+PASS

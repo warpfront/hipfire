@@ -47,6 +47,11 @@
 //!    allowlist row must still be needed: a `module` row goes stale when the
 //!    module is no longer called or when the registry now satisfies it; a
 //!    `dynamic` row goes stale when its site vanishes.
+//! 4. A `no-caller` row is a claim the gate checks: it fails as soon as
+//!    scanned production code calls (by name) a function containing one of
+//!    the module's sites. A launcher that is called but whose branch naming
+//!    the module cannot be taken is `unreachable-branch` instead. So wiring a
+//!    parked kernel into a route fails here until it is registered (packed).
 //!
 //! Fixture `tests/fixtures/lazy-kernel-allowlist.tsv`: header-less or with
 //! the header `kind<TAB>name<TAB>category<TAB>reason`, `#` comments and blank
@@ -2200,7 +2205,8 @@ pub mod scanner {
                     return unknown("self");
                 }
                 if c0.is_uppercase() {
-                    return self.ev_const(fi, lo, name, segs.len() > 1);
+                    let qual = (segs.len() > 1).then(|| segs[segs.len() - 2]);
+                    return self.ev_const(fi, lo, name, qual);
                 }
                 return unknown(format!("path {}", segs.join("::")));
             }
@@ -2717,7 +2723,9 @@ pub mod scanner {
 
         // ---- consts
 
-        fn ev_const(&self, fi: usize, q: usize, name: &str, is_path: bool) -> V {
+        /// `qual` is the path segment before `name` (`copy` in
+        /// `railgun::copy::MODULE`), `None` for a bare name.
+        fn ev_const(&self, fi: usize, q: usize, name: &str, qual: Option<&str>) -> V {
             let f = &self.files[fi];
             let mut cands: Vec<(usize, usize)> = Vec::new();
             if let Some(list) = f.const_by_name.get(name) {
@@ -2743,8 +2751,27 @@ pub mod scanner {
             }
             if cands.is_empty() {
                 if let Some(all) = self.consts_by_name.get(name) {
-                    if (is_path && !all.is_empty()) || all.len() == 1 {
+                    if qual.is_some() || all.len() == 1 {
                         cands = all.clone();
+                    }
+                    // A qualified path names one module: keep only consts of
+                    // files that module path can denote (`<qual>.rs` or
+                    // `<qual>/mod.rs`) when any exists, so
+                    // `railgun::copy::MODULE` is not every `MODULE` const.
+                    if let Some(qual) = qual {
+                        let file_mod = format!("/{qual}.rs");
+                        let dir_mod = format!("/{qual}/mod.rs");
+                        let narrowed: Vec<(usize, usize)> = cands
+                            .iter()
+                            .copied()
+                            .filter(|&(cf, _)| {
+                                let rel = &self.files[cf].rel;
+                                rel.ends_with(&file_mod) || rel.ends_with(&dir_mod)
+                            })
+                            .collect();
+                        if !narrowed.is_empty() {
+                            cands = narrowed;
+                        }
                     }
                 }
             }
@@ -2963,10 +2990,22 @@ pub mod scanner {
         }
     }
 
+    /// A call of a function by name (`name(` or `.name(`) inside a scanned
+    /// production function.
+    #[derive(Clone, Debug)]
+    pub struct Call {
+        pub file: String,
+        pub line: u32,
+        /// Enclosing function.
+        pub caller: String,
+    }
+
     pub struct Scan {
         pub sites: Vec<Site>,
         /// Human-readable list of discovered wrapper functions.
         pub wrappers: Vec<String>,
+        /// Callee name -> every production call of it (test code is stripped).
+        pub calls: BTreeMap<String, Vec<Call>>,
         pub files: usize,
         pub tokens: usize,
     }
@@ -3178,11 +3217,26 @@ pub mod scanner {
             }
         }
         wrappers.sort();
+        let mut calls: BTreeMap<String, Vec<Call>> = BTreeMap::new();
+        for f in &files {
+            for (name, idxs) in &f.calls {
+                for &i in idxs {
+                    if let Some(fid) = inner_fn(f, i) {
+                        calls.entry(name.clone()).or_default().push(Call {
+                            file: f.rel.clone(),
+                            line: f.line(i),
+                            caller: f.fns[fid].name.clone(),
+                        });
+                    }
+                }
+            }
+        }
         let tokens = files.iter().map(File::n).sum();
         let _ = root_count;
         Scan {
             sites,
             wrappers,
+            calls,
             files: files.len(),
             tokens,
         }
@@ -3371,6 +3425,7 @@ const CATEGORIES: &[&str] = &[
     "non-target-arch",
     "developer-opt-in",
     "no-caller",
+    "unreachable-branch",
     "codec-outside-core-rungs",
     "config-opt-in",
     "dynamic-enumerated",
@@ -3544,6 +3599,32 @@ fn locations(sites: &[&scanner::Site]) -> String {
     out.join("; ")
 }
 
+/// Production calls of the functions that contain `sites` (self-recursion
+/// excluded), formatted for a failure; `None` when no scanned code calls them.
+/// A `no-caller` row is only true while this is `None`: once a route calls the
+/// loading function, the module is reachable and belongs in the registry.
+fn production_callers(scan: &Scan, sites: &[&scanner::Site]) -> Option<String> {
+    let mut out: Vec<String> = sites
+        .iter()
+        .flat_map(|s| {
+            scan.calls
+                .get(&s.fn_name)
+                .into_iter()
+                .flatten()
+                .filter(move |c| c.caller != s.fn_name)
+                .map(move |c| {
+                    format!(
+                        "`{}` ({}:{}) from {}:{} (`{}`)",
+                        s.fn_name, s.file, s.line, c.file, c.line, c.caller
+                    )
+                })
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    (!out.is_empty()).then(|| out.join("; "))
+}
+
 /// Core of the gate, separated for the scanner unit tests: returns failures.
 fn check(
     scan: &Scan,
@@ -3601,12 +3682,19 @@ fn check(
                     "{FIXTURE_REL}:{}: stale module allowlist row `{}` ({}): no runtime call site names it any more",
                     a.line, a.name, a.category
                 )),
-                Some(_) => {
+                Some(sites) => {
                     if unmet_groups(&a.name, registry).is_ok() {
                         failures.push(format!(
                             "{FIXTURE_REL}:{}: stale module allowlist row `{}` ({}): the registry now satisfies its required arches",
                             a.line, a.name, a.category
                         ));
+                    } else if a.category == "no-caller" {
+                        if let Some(callers) = production_callers(scan, sites) {
+                            failures.push(format!(
+                                "{FIXTURE_REL}:{}: module allowlist row `{}` claims no-caller, but production code calls the function that loads it: {callers}; register the module for the arches that route reaches or reclassify the row",
+                                a.line, a.name
+                            ));
+                        }
                     }
                 }
             },
@@ -4266,6 +4354,64 @@ impl Gpu {
             .all(|x| x.starts_with(FIXTURE_REL) && x.contains("stale")),
         "{f:?}"
     );
+}
+
+/// Promotion-lane rule (b), planted negative of the 2026-11-11 pack hole:
+/// 174e89a045 parked `gated_delta_net_q8_fast_stream` behind a `no-caller`
+/// row, 3f4ae83087 wired its caller 38 minutes later and left the row, so the
+/// module stayed out of the pack and the first 9B/A3B prompt hipcc-compiled
+/// it. A production-reachable module cannot hide behind `no-caller`.
+#[test]
+fn no_caller_row_fails_once_production_calls_its_loader() {
+    let parked = r#"
+impl Gpu {
+    fn gdn_stream(&mut self) {
+        self.ensure_kernel("gated_delta_net_q8_fast_stream", SRC, "f");
+    }
+}
+"#;
+    let wired = r#"
+impl Gpu {
+    fn gdn_stream(&mut self) {
+        self.ensure_kernel("gated_delta_net_q8_fast_stream", SRC, "f");
+    }
+    fn prefill_sequential(&mut self) {
+        self.gdn_stream();
+    }
+}
+"#;
+    let row = Allow {
+        kind: "module".to_string(),
+        name: "gated_delta_net_q8_fast_stream".to_string(),
+        category: "no-caller".to_string(),
+        line: 332,
+    };
+    let unpacked: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+    let mut packed = unpacked.clone();
+    packed.insert(
+        "gated_delta_net_q8_fast_stream".into(),
+        ["gfx1100", "gfx1201"].into_iter().collect(),
+    );
+
+    // Parked: no production caller, the claim holds.
+    let f = check(&scan1(parked), &unpacked, std::slice::from_ref(&row));
+    assert!(f.is_empty(), "{f:?}");
+    // Wired with the row left behind: the gate fails and names the caller.
+    let f = check(&scan1(wired), &unpacked, std::slice::from_ref(&row));
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert!(
+        f[0].contains("claims no-caller") && f[0].contains("prefill_sequential"),
+        "{f:?}"
+    );
+    // Wired with neither row nor registry entry: unregistered module.
+    let f = check(&scan1(wired), &unpacked, &[]);
+    assert!(
+        f.len() == 1 && f[0].contains("gated_delta_net_q8_fast_stream"),
+        "{f:?}"
+    );
+    // The fix: registered (packed), row deleted.
+    let f = check(&scan1(wired), &packed, &[]);
+    assert!(f.is_empty(), "{f:?}");
 }
 
 #[test]

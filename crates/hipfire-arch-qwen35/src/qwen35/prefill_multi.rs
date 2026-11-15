@@ -120,7 +120,7 @@ pub fn multi_chunk_row_cap(gpu: &Gpu) -> usize {
 /// exact only when (a) the device's effective cap exceeds the product cap,
 /// (b) every singleton arm it must match runs the one-tile F16-WMMA chain the
 /// exact wide kernels reproduce ([`Gpu::mq4_verify_singleton_chain`]: refused
-/// under `HIPFIRE_FP16=0`, `HIPFIRE_LM_HEAD_WMMA=0`,
+/// under `HIPFIRE_FP16=0` or
 /// `HIPFIRE_HFQ4G256_LDSSTAGE=1`), and (c) the trunk and head are dense
 /// MQ4G256V2: every projection of every layer and the lm_head (no MoE,
 /// Lloyd, MQ3/MQ6, Q8 or other dtypes), with `w_down.k == hidden_dim` (the
@@ -685,7 +685,6 @@ fn lane_fa_plan_ok(
 ///   semantics, [`Gpu::lane_fa_batch_admitted`] (exact gfx1201, VerifyAttn on,
 ///   head_dim 256 GQA group 6 tile 128, no capture / recording / G0
 ///   observation, every request 1..=32 rows), at most `LANE_FA_MAX` requests,
-///   no triattn tap (it would interleave per-request recording with the prep);
 /// * no request on the segment-twin arm (`twin_attn`);
 /// * per request: ChainVerify (prep unfused: `gfx12_fa_prep_admitted` false;
 ///   attend via `verify_tile_attend`), native fp8 KV with `compact_offset 0`
@@ -708,7 +707,6 @@ fn lane_fa_chunk_admitted(
         || reqs.is_empty()
         || reqs.len() > rdna_compute::lane_fa::LANE_FA_MAX
         || twin_attn.iter().any(|&t| t)
-        || hipfire_runtime::triattn::tap_enabled()
     {
         return false;
     }
@@ -739,13 +737,7 @@ fn lane_fa_chunk_admitted(
             || !kv.quant_fp8
             || kv.compact_offset != 0
             || !(MIN_BATCH..64).contains(&n)
-            || gfx12_fa_prep_admitted(
-                gpu,
-                &hybrid_dims(config),
-                r.fusion,
-                n,
-                hipfire_runtime::triattn::tap_enabled(),
-            )
+            || gfx12_fa_prep_admitted(gpu, &hybrid_dims(config), r.fusion, n, false)
             || multirow
             || !lane_fa_plan_ok(gpu, s, kv, r.start_pos, n)
             || s.flash_partials.numel()
@@ -1061,7 +1053,6 @@ fn rows_view(
             v(&pbs.dn_normed_rot_batch, v_dim),
         );
         set(&mut p.positions, v(&pbs.positions, 1));
-        set(&mut p.rope_positions, v(&pbs.rope_positions, 1));
         set(&mut p.pos3, v(&pbs.pos3, 3));
         set(&mut p.ext_emb_index, v(&pbs.ext_emb_index, 1));
         set(&mut p.tokens, v(&pbs.tokens, 1));
@@ -1348,12 +1339,11 @@ pub fn forward_prefill_batch_multi(
     )?;
     if cb_upload_coalesce_enabled() {
         // One upload of every lane's positions. Each per-lane call below (all
-        // Sequential, no tree ctx, no active mask, not pre-uploaded) is a
+        // Sequential, no active mask, not pre-uploaded) is a
         // single `memcpy_htod` of `start_pos..start_pos + n` into its row view
         // of `pbs.positions`, and the views are contiguous in lane order
         // (`offs` = cumulative rows), so the concatenation written at offset 0
         // of `pbs.positions` is the same bytes at the same addresses.
-        // `rope_positions` is written only for a tree ctx (None here).
         let positions: Vec<i32> = reqs
             .iter()
             .flat_map(|r| (0..r.tokens.len()).map(move |i| (r.start_pos + i) as i32))
@@ -1365,13 +1355,13 @@ pub fn forward_prefill_batch_multi(
         gpu.hip.memcpy_htod(&pbs.positions.buf, bytes)?;
     } else {
         for (r, view) in reqs.iter().zip(&views) {
-            batch_chunk_upload_positions(gpu, view, sem, r.start_pos, r.tokens.len(), None, false)?;
+            batch_chunk_upload_positions(gpu, view, sem, r.start_pos, r.tokens.len(), false)?;
         }
     }
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
     let arch_has_wmma = q8_wmma_arch;
     let tapes = reqs.iter().any(|r| r.gdn_tape.is_some());
-    let workload = prefill_dispatch_workload(hidden_out.is_some(), tapes, false);
+    let workload = prefill_dispatch_workload(hidden_out.is_some(), tapes);
     // MTP / plain requests keep the attend crossover; a ChainVerify request
     // attends through the tile + reduce (`verify_tile_attend`).
     let ctx = DispatchCtx::new(gpu).with_workload(workload);
@@ -1484,8 +1474,6 @@ pub fn forward_prefill_batch_multi(
     let dims = hybrid_dims(config);
     let batch = pbs.view();
     let flash = flash_scratch(s);
-    let tap_fn = batched_attention_tap(config);
-    let tap = tap_fn.get();
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
@@ -1655,7 +1643,7 @@ pub fn forward_prefill_batch_multi(
                     for (r, view) in reqs.iter_mut().zip(&views) {
                         let n = r.tokens.len();
                         let sink = (*TAPE_COPY_BATCH).then_some(&mut tape_copies);
-                        let parents = batch_chunk_delta_net_pre_gdn(
+                        batch_chunk_delta_net_pre_gdn(
                             gpu,
                             &layer.mixer_view(),
                             &dims,
@@ -1667,16 +1655,12 @@ pub fn forward_prefill_batch_multi(
                             n_v_heads,
                             hd,
                             sem,
-                            None,
                             r.gdn_tape.map(gdn_tape_view).as_ref(),
                             0,
                             delta_layer_idx,
                             r.fusion,
                             sink,
                         )?;
-                        if parents.is_some() {
-                            return refuse("tree recurrence in a linear verify");
-                        }
                         let d = &*r.dn_state;
                         gpu.gated_delta_net_q8_batch_seq(
                             &view.dn_q_batch,
@@ -1872,8 +1856,7 @@ pub fn forward_prefill_batch_multi(
                         } else {
                             &ctx
                         };
-                        let gfx12_fa_prep =
-                            gfx12_fa_prep_admitted(gpu, &dims, r.fusion, n, tap.is_some());
+                        let gfx12_fa_prep = gfx12_fa_prep_admitted(gpu, &dims, r.fusion, n, false);
                         let multirow = q8_multirow_attn_admitted(
                             gpu.arch_caps.arch(),
                             r.kv_cache.quant_q8,
@@ -1900,14 +1883,13 @@ pub fn forward_prefill_batch_multi(
                             max_ctx_len,
                             rctx,
                             sem,
-                            None,
                             kv_layer_idx,
                             layer_idx,
                             r.fusion,
                             gfx12_fa_prep,
                             false,
                             false,
-                            tap,
+                            None,
                         )?;
                         if twin {
                             // The singleton attend's paired write; the attention
@@ -1928,13 +1910,8 @@ pub fn forward_prefill_batch_multi(
                         } else {
                             // Same S6 paired Q8 K/V-write admission as the singleton
                             // attend (byte-identical to the two batched writes).
-                            let pair_q8_writes = dflash_fa_batch_fusion_admitted(
-                                gpu,
-                                &dims,
-                                r.fusion,
-                                n,
-                                tap.is_some(),
-                            );
+                            let pair_q8_writes =
+                                dflash_fa_batch_fusion_admitted(gpu, &dims, r.fusion, n, false);
                             batch_chunk_fa_attend(
                                 gpu,
                                 &dims,
@@ -1946,7 +1923,6 @@ pub fn forward_prefill_batch_multi(
                                 max_ctx_len,
                                 rctx,
                                 sem,
-                                None,
                                 layer_idx,
                                 multirow,
                                 None,
@@ -2079,9 +2055,8 @@ mod pack_tests {
 
     /// Every switch that moves a singleton (`<= 63`-row) dense MQ4G256V2 arm
     /// off the one-tile F16-WMMA chain the wide kernels reproduce.
-    const SINGLETON_ARM_SWITCHES: [(&str, fn(&mut FeatureFlags)); 4] = [
+    const SINGLETON_ARM_SWITCHES: [(&str, fn(&mut FeatureFlags)); 3] = [
         ("HIPFIRE_FP16=0", |f| f.fp16_disabled = true),
-        ("HIPFIRE_LM_HEAD_WMMA=0", |f| f.lm_head_wmma_disabled = true),
         ("HIPFIRE_HFQ4G256_LDSSTAGE=1", |f| {
             f.hfq4g256_ldsstage_wmma = true
         }),

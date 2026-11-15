@@ -37,6 +37,16 @@ pub struct GpuPool {
     pub total_allocated: usize,
     pub total_reused: usize,
     pub total_new: usize,
+    /// Times a drain returned at least one pooled buffer to HIP (the
+    /// out-of-memory retries, the VMM pre-map drain and the unload drain).
+    pub drains: u64,
+    /// Test seam: allocations still to let through before one is forced to miss
+    /// the free lists and fail as an injected `hipErrorOutOfMemory`, so the real
+    /// retry in `alloc_in` (drain every free list, allocate again once) runs on
+    /// demand. `None` outside a test that armed it; one match on the alloc path.
+    oom_countdown: Option<u32>,
+    /// Injected out-of-memory failures consumed so far.
+    pub injected_oom: u64,
 }
 
 impl GpuPool {
@@ -46,6 +56,9 @@ impl GpuPool {
             total_allocated: 0,
             total_reused: 0,
             total_new: 0,
+            drains: 0,
+            oom_countdown: None,
+            injected_oom: 0,
         }
     }
 
@@ -83,8 +96,22 @@ impl GpuPool {
     }
 
     fn alloc_in<M: DeviceMemory>(&mut self, mem: &M, size: usize) -> HipResult<DeviceBuffer> {
+        // Test seam: the armed allocation is forced down the miss path below and
+        // fails as an injected hipErrorOutOfMemory, whatever the free lists hold.
+        let injected = match self.oom_countdown {
+            Some(0) => {
+                self.oom_countdown = None;
+                self.injected_oom += 1;
+                true
+            }
+            Some(n) => {
+                self.oom_countdown = Some(n - 1);
+                false
+            }
+            None => false,
+        };
         let bucket = Self::bucket_key(size);
-        if let Some(list) = self.free_lists.get_mut(&bucket) {
+        if let Some(list) = self.free_lists.get_mut(&bucket).filter(|_| !injected) {
             // Best fit, newest first: a rebuild with the same request sizes
             // then reuses every pooled buffer whatever order they were freed
             // in. LIFO pop could hand a small request the large buffer and
@@ -115,7 +142,15 @@ impl GpuPool {
         let actual = if size < MIN_ALLOC { MIN_ALLOC } else { size };
         self.total_new += 1;
         self.total_allocated += actual;
-        match mem.malloc(actual) {
+        let first = if injected {
+            Err(hip_bridge::HipError::new(
+                HIP_ERROR_OUT_OF_MEMORY,
+                "injected hipMalloc out of memory (test seam)",
+            ))
+        } else {
+            mem.malloc(actual)
+        };
+        match first {
             Err(e) if e.code == HIP_ERROR_OUT_OF_MEMORY && self.pooled_bytes() > 0 => {
                 let pooled = self.pooled_bytes();
                 self.drain_in(mem);
@@ -127,6 +162,15 @@ impl GpuPool {
             }
             r => r,
         }
+    }
+
+    /// Arm (`Some(n)`) or disarm (`None`) the injected out-of-memory seam: the
+    /// allocation after `n` further ones is forced to miss the free lists and
+    /// fail as `hipErrorOutOfMemory` before `hipMalloc`. An empty pool fails it
+    /// exactly as a real out-of-memory with nothing to return does; a non-empty
+    /// pool takes the production drain-and-retry-once path.
+    pub fn inject_oom(&mut self, after_allocs: Option<u32>) {
+        self.oom_countdown = after_allocs;
     }
 
     /// Bytes parked in the free lists (allocated from HIP, owned by no tensor).
@@ -153,11 +197,14 @@ impl GpuPool {
     }
 
     fn drain_in<M: DeviceMemory>(&mut self, mem: &M) {
+        let mut any = false;
         for (_, list) in self.free_lists.drain() {
             for buf in list {
+                any = true;
                 let _ = mem.free(buf);
             }
         }
+        self.drains += u64::from(any);
     }
 }
 
@@ -309,5 +356,87 @@ mod tests {
             }
             rebuilt.into_iter().for_each(|b| pool.free(b));
         }
+    }
+
+    #[test]
+    fn injected_oom_runs_the_real_drain_and_retry_and_leaves_live_buffers() {
+        // Plenty of room: only the armed seam makes this allocation fail, so the
+        // drain-and-retry below is the production path, not a capacity artefact.
+        let mem = FakeMemory::new(1 << 20);
+        let mut pool = GpuPool::new();
+        let live = pool.alloc_in(&mem, 4096).unwrap();
+        let live_addr = live.as_ptr() as usize;
+        let parked: Vec<_> = (0..3).map(|_| pool.alloc_in(&mem, 1024).unwrap()).collect();
+        parked.into_iter().for_each(|b| pool.free(b));
+        assert_eq!(pool.pooled_bytes(), 3072);
+        assert_eq!((pool.drains, pool.injected_oom), (0, 0));
+
+        // The next allocation WOULD be served from the free list; the seam forces
+        // it to miss, fail, drain every pooled buffer and retry once.
+        pool.inject_oom(Some(0));
+        let mallocs = mem.mallocs.get();
+        let fresh = pool.alloc_in(&mem, 1024).unwrap();
+        assert_eq!(fresh.size(), 1024);
+        assert_eq!(
+            mem.mallocs.get() - mallocs,
+            1,
+            "the injected failure never reaches hipMalloc; only the retry does"
+        );
+        assert_eq!(mem.frees.get(), 3, "every parked buffer returned to HIP");
+        assert_eq!(pool.pooled_bytes(), 0);
+        assert_eq!((pool.drains, pool.injected_oom), (1, 1));
+        assert!(
+            mem.live.borrow().contains_key(&live_addr),
+            "a buffer a tensor still owns is not touched by the drain"
+        );
+        // One-shot: the next miss reaches hipMalloc without a drain.
+        pool.free(fresh);
+        let again = pool.alloc_in(&mem, 16384).unwrap();
+        assert_eq!((pool.drains, pool.injected_oom), (1, 1));
+        pool.free(again);
+        pool.free(live);
+    }
+
+    #[test]
+    fn injected_oom_fires_after_the_armed_number_of_allocations() {
+        let mem = FakeMemory::new(1 << 20);
+        let mut pool = GpuPool::new();
+        let a = pool.alloc_in(&mem, 1024).unwrap();
+        pool.free(a);
+        pool.inject_oom(Some(2));
+        let a = pool.alloc_in(&mem, 1024).unwrap();
+        let b = pool.alloc_in(&mem, 2048).unwrap();
+        assert_eq!((pool.drains, pool.injected_oom), (0, 0), "two let through");
+        pool.free(a);
+        pool.free(b);
+        let c = pool.alloc_in(&mem, 2048).unwrap();
+        assert_eq!((pool.drains, pool.injected_oom), (1, 1), "the third fires");
+        assert_eq!(pool.pooled_bytes(), 0);
+        pool.free(c);
+    }
+
+    #[test]
+    fn injected_oom_with_an_empty_pool_fails_like_a_real_one() {
+        let mem = FakeMemory::new(1 << 20);
+        let mut pool = GpuPool::new();
+        pool.inject_oom(Some(0));
+        let err = pool.alloc_in(&mem, 2048).err().expect("must fail");
+        assert_eq!(err.code, HIP_ERROR_OUT_OF_MEMORY);
+        assert_eq!(mem.mallocs.get(), 0);
+        assert_eq!((pool.drains, pool.injected_oom), (0, 1));
+    }
+
+    #[test]
+    fn disarming_clears_an_unconsumed_injection() {
+        let mem = FakeMemory::new(1 << 20);
+        let mut pool = GpuPool::new();
+        let a = pool.alloc_in(&mem, 1024).unwrap();
+        pool.free(a);
+        pool.inject_oom(Some(0));
+        pool.inject_oom(None);
+        let a = pool.alloc_in(&mem, 1024).unwrap();
+        assert_eq!((pool.drains, pool.injected_oom), (0, 0));
+        assert_eq!(mem.mallocs.get(), 1, "served from the free list");
+        pool.free(a);
     }
 }

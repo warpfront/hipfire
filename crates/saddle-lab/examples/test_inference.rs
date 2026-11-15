@@ -194,48 +194,6 @@ fn main() {
         Ok(format!("im_start={} im_end={}", im_start[0], im_end[0]))
     });
 
-    // Test 6: Givens4 KV cache allocates correctly
-    test!("givens4 KV cache allocates", 5000, {
-        let kv_seq = 128;
-        let kv = llama::KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .map_err(|e| format!("{e}"))?;
-        assert!(kv.quant_asym3, "quant_asym3 should be true");
-        assert!(kv.givens_cos.is_some(), "givens_cos missing");
-        assert!(kv.givens_sin.is_some(), "givens_sin missing");
-        Ok(format!(
-            "givens4 allocated for {} layers, hd={}",
-            config.n_layers, config.head_dim
-        ))
-    });
-
-    // Test 7: Givens4 forward doesn't hang
-    test!("givens4 forward completes (no hang)", 15000, {
-        let kv_seq = 128;
-        let mut kv = llama::KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .map_err(|e| format!("{e}"))?;
-        let mut dn = DeltaNetState::new(&mut gpu, &config).map_err(|e| format!("{e}"))?;
-        let tokens = tokenizer.encode("Hello world");
-        let t0 = Instant::now();
-        for (pos, &tok) in tokens.iter().enumerate() {
-            let _ = qwen35::forward(&mut gpu, &weights, &config, tok, pos, &mut kv, &mut dn)
-                .map_err(|e| format!("{e}"))?;
-        }
-        let ms = t0.elapsed().as_millis();
-        Ok(format!("{} tokens in {ms}ms", tokens.len()))
-    });
-
     // Test 8: Speed sanity check (should be >10 tok/s for any model)
     test!("decode speed > 10 tok/s", 30000, {
         let kv_seq = 256;

@@ -85,7 +85,7 @@ per-expert `down_proj.awq_scale.weight` sidecars + build an `expert_down_awq_ptr
 [n_exp] table (mirror `expert_down_ptrs`, qwen35.rs ~579/2105); (2) ExpertWeights
 field; (3) dispatch in the MoE decode forward (`moe_ffn_decode_impl`): when down
 has awq_scale, call the `_awq_indexed` silu-rotate (pass ptr table + topk_indices)
-instead of the plain `fused_silu_mul_mq_rotate`. Gate behind HIPFIRE_MOE_AWQ.
+instead of the plain `fused_silu_mul_mq_rotate`.
 
 ### 3a-NAV. Dispatch wiring runs THROUGH the unified MoE dispatch family (KEY)
 
@@ -106,15 +106,14 @@ So AWQ-down dispatch is a MULTI-CRATE change, NOT a kernel swap:
 2. MoeFamily::run silu-rotate step: when expert_down_awq_ptrs.is_some(), call
    fused_silu_mul_mq_rotate_awq_indexed (pass ptr table + topk_indices) instead
    of fused_silu_mul_rotate_mq_batched.
-3. Loader (qwen35.rs load_moe_ffn @4331, NOT paro_load_moe_ffn): per-expert
+3. Loader (qwen35.rs load_moe_ffn @4331): per-expert
    down.awq_scale = load_awq_scale(hfq, gpu, "...experts.{x}.down_proj.weight", mi)
    (hfq.rs:589; load_weight_tensor does NOT auto-load it). Build
    expert_down_awq_ptrs from e.down.awq_scale (mirror expert_down_ptrs @~4402).
-   Add the field to MoeFfnWeights (@566) + ALL constructors (paro_load_moe_ffn
-   @1959 builds an empty/None table).
+   Add the field to MoeFfnWeights (@566) + ALL constructors.
 4. rdna-compute launcher for the indexed kernel (or call from the run impl).
 
-Gate on down.awq_scale.is_some() (auto-detect) + HIPFIRE_MOE_AWQ kill-switch.
+Gate on down.awq_scale.is_some() (auto-detect; the env kill-switch was removed).
 Prefill (MoePrefillParams) mirrors decode. Test file ready:
 /workspace/nex-n2-mq4awq-down.hfq (down-only AWQ, gate_up plain).
 
@@ -148,7 +147,7 @@ AWQ needs `FWHT(hidden / s_e)` *per routed expert*. Design:
 
 ### 3d. Dispatch (`crates/rdna-compute/src/moe.rs`)
 Detect AWQ (sidecars present) → route to the `_awq` MoE GEMV path + pass the
-scale tables. Gate behind a flag (`HIPFIRE_MOE_AWQ`) until validated.
+scale tables. Always on when the sidecars are present.
 
 ---
 

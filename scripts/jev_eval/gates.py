@@ -43,12 +43,7 @@ Gates:
   5   error replies end to end: 422 + required_max_seq for an over-long
       state, 422 for a malformed request, 422 naming Jev's per-question
       (32000) and request (64000) token limits, without required_max_seq; a
-      normal decide succeeds after each. With --cask the over-long reply is
-      the eviction-limit 422 instead (no required_max_seq; the message names
-      the limit).
-  0   (--cask only, per daemon) CASK is really configured: an over-limit
-      decide gets the eviction-limit 422 (only reachable with eviction on),
-      then a normal decide succeeds.
+      normal decide succeeds after each.
   S1  session cache reuse: a session decide between two chat turns leaves
       the chat prompt cache usable. (a) no delta, default env: turn 2 text
       bit-identical to a run without the decide, decide start=extend with 0
@@ -56,7 +51,7 @@ Gates:
       (b) delta (decide includes the next user turn), exact env: same text,
       conversation prefill > 0, turn 2 cached_tokens == E. INCONCLUSIVE when
       the no-decide baseline gets no cache hit (no chat cache: Llama
-      carrier, --cask).
+      carrier).
   S2  session exactness (exact env), split like gate 1 (human ruling): vs a
       one-call full prefill of the same session tokens (`_debug_no_snapshot`,
       run last: it ends reset and clears the assistant-turn cache).
@@ -83,15 +78,14 @@ Gates:
       then S4r reruns it with a shared prefix longer than the first prefill
       chunk + 2048 tokens, so a checkpoint lies inside it.
   S5  session error replies: both / neither / empty / non-list messages ->
-      422; an over-long conversation (over max_seq, or over the eviction
-      limit with --cask) with 128 questions -> 422 (+ required_max_seq >
-      max_seq without --cask) in <= 4x the time of the same refusal with 1
+      422; an over-long conversation (over max_seq) with 128 questions
+      -> 422 (+ required_max_seq > max_seq) in <= 4x the time of the same refusal with 1
       question + 0.25 s (refused after the probe and one question render,
       not 128); then a session decide still extends with zero delta.
   S1-S5 are INCONCLUSIVE when the model has no Jinja chat template (session
   mode's spec §12.5 400). On an arch that is not `cache_capable` (the Llama
   carrier) the chat path keeps no conversation: S1 is INCONCLUSIVE, S2 and
-  S4 compare answers only (as under --cask), and S3/S5 still expect the
+  S4 compare answers only, and S3/S5 still expect the
   decide's own extend. An arch without prefill checkpoints (not in
   CHECKPOINT_ARCHES: the Llama carrier) cannot resume, so there S3 passes on
   extend + cold and S4 is PASS/FAIL on the answers, never INCONCLUSIVE for
@@ -108,12 +102,6 @@ Gates:
       `jinja lookup` trace line in daemon stderr says hit=true). (c) no leak
       over N session decides (extend and cold, a chat turn re-establishing
       the cache after each cold).
-
---cask loads every daemon with the load params `hipfire serve` sends when
-config has cask on (cask, cask_sidecar, cask_budget, cask_beta, cask_core_frac,
-cask_fold_m), defaults read from ~/.hipfire/config.json, so every gate
-(including 1a exact-mode equality) runs with eviction configured. The
-floor probe (1b) loads without CASK.
 
 Why two modes for gate 1: one-call vs split prefill differs by an inherent,
 deterministic precision property of kernels whose route or rounding depends
@@ -407,170 +395,12 @@ def gate_leak(d, n):
         d, n, lambda i: need_answers(d.decide(STATE, QUESTIONS), f"leak iter {i}"), "decides")
 
 
-def cask_limit(cask):
-    """Decide's eviction-safe limit: min(cask_budget, physical_cap). The load
-    requires max_seq >= budget + beta + 4 and physical_cap is clamped to at
-    least that, so the budget always binds."""
-    return cask["cask_budget"]
-
-
-LOREM = "lorem ipsum dolor sit amet "   # 5-7 tokens per repetition
-JEV_QUESTION_LIMIT = 32000
-JEV_REQUEST_LIMIT = 64000
-
-# ---- session mode (spec §12.8) ---------------------------------------------
-SESSION_SYS = "You are a customer support agent for an online shop."
-CONV_C = [{"role": "system", "content": SESSION_SYS},
-          {"role": "user", "content": "Order #3527 was placed 21 days ago and tracking has not "
-                                      "updated. Reply in one short sentence."}]
-CONV_U = [{"role": "system", "content": "You are a poet."},
-          {"role": "user", "content": "Write one short line about rain."}]
-X_USER = {"role": "user", "content": "Name three primary colours in one short sentence."}
-# A 2-3k-token system turn shared by CONV_L and CONV_X: the chat prefill of
-# one leaves a DeltaNet checkpoint inside the prefix the other shares (the
-# first checkpoint lands at the first prefill chunk, ar.rs:3880).
-LONG_SYS = SESSION_SYS + " Policy notes: " + LOREM * 400
-# S4r: a shared prefix longer than the first prefill chunk (256-512 tokens)
-# + ckpt_interval (2048), for a rerun when S4 found no checkpoint inside it.
-LONG_SYS_RERUN = SESSION_SYS + " Policy notes: " + LOREM * 900
-CONV_L = [{"role": "system", "content": LONG_SYS}, CONV_C[1]]
-CONV_X = [{"role": "system", "content": LONG_SYS}, X_USER]
-FOLLOW = {"role": "user", "content": "Thanks. What should I do next? Reply in one short sentence."}
-SESSION_Q = {
-    "escalate": {"type": "noul",
-                 "instructions": "Should this conversation be escalated to a human agent?"},
-    "topic": {"type": "choice", "instructions": "What is the conversation about?",
-              "criteria": {"shipping": "Delivery, tracking, lost parcels",
-                           "billing": "Payments, refunds", "other": "Anything else"}},
-    "mood": {"type": "score", "instructions": "How frustrated is the customer?",
-             "criteria": ["Calm", "Mildly annoyed", "Frustrated", "Furious"]},
-}
-
-
-def chat_turn(d, messages, max_tokens=1024):
-    """One greedy chat turn; returns the conversation extended by the reply.
-    The chat path does not store a length-capped turn in its prompt cache,
-    which would make the reuse gates vacuous, so that fails the setup. The
-    Llama-carrier generate route reports no `finish_reason` (nor
-    `cached_tokens`); there a turn that stopped short of `max_tokens` ended
-    on EOS."""
-    text, done = d.chat(messages, max_tokens=max_tokens)
-    reason = done.get("finish_reason")
-    ended = reason == "stop" if reason is not None else done.get("tokens", max_tokens) < max_tokens
-    if not ended:
-        raise AssertionError(f"setup: chat turn finish_reason={reason!r} tokens="
-                             f"{done.get('tokens')} (need 'stop', or < {max_tokens} tokens)")
-    return messages + [{"role": "assistant", "content": text}]
-
-
-def session(d, messages, what, **extra):
-    r = d.session_decide(messages, SESSION_Q, **extra)
-    return need_answers(r, what), r.get("timing", {})
-
-
-def session_unavailable(d):
-    """The spec §12.5 400 for a model without a Jinja chat template (e.g. an
-    HFQ file with none embedded and no override): session mode cannot run,
-    so the session gates are INCONCLUSIVE rather than FAIL. Returns the
-    message, or None when session mode is available."""
-    d.reset()
-    r = d.session_decide(CONV_C, {"escalate": SESSION_Q["escalate"]})
-    e = r.get("error") or {}
-    if e.get("status") == 400 and "chat template" in e.get("message", ""):
-        return e["message"]
-    return None
-
-
-# Archs whose chat path takes DeltaNet prefill checkpoints (Qwen35Carrier,
-# arch 5/6), the only ones a session decide can resume from (spec §12.2).
-# The Llama carrier keeps none: its starts are extend or cold only.
-CHECKPOINT_ARCHES = {"qwen3_5", "qwen3_5_moe"}
-
-
-def resumable(d):
-    return d.info.get("arch") in CHECKPOINT_ARCHES
-
-
-def run_session_gates(d, gates):
-    """Run [(name, fn, *args)] session gates, or report each INCONCLUSIVE
-    when the loaded model has no chat template for session mode."""
-    why = session_unavailable(d)
-    if why is None:
-        return [run(name, fn, *args) for name, fn, *args in gates]
-    res = []
-    for name, *_ in gates:
-        detail = f"session mode unavailable on this model: 400 {why!r}"
-        print(f"{LABEL[INCONCLUSIVE]:<12} gate {name}: {detail}", flush=True)
-        res.append((name, (INCONCLUSIVE, detail)))
-    return res
-
-
-def max_dlogp(a, b):
-    return max(dlogp(a[n], b[n]) for n in a)
-
-
-def gate_session_reuse(d, with_delta, reuse=True):
-    d.reset()
-    conv = chat_turn(d, CONV_C)
-    nxt = conv + [FOLLOW]
-    base_text, base_done = d.chat(nxt)
-    base_cached = base_done.get("cached_tokens", 0)
-    if not reuse or base_cached == 0:
-        return INCONCLUSIVE, (f"no-decide baseline cached_tokens={base_cached}: no chat prompt "
-                              f"cache to preserve on this arch/config")
-    d.reset()
-    if chat_turn(d, CONV_C) != conv:
-        return False, "setup: greedy turn 1 is not reproducible after reset"
-    _, t = session(d, nxt if with_delta else conv, "session decide")
-    text, done = d.chat(nxt)
-    cached = done.get("cached_tokens", 0)
-    cpt = t.get("conversation_prefill_tokens")
-    delta_ok = (cpt or 0) > 0 if with_delta else cpt == 0
-    ok = (text == base_text and len(text) > 0 and t.get("start") == "extend" and delta_ok
-          and cached == t.get("prefix_tokens") and cached >= base_cached)
-    return ok, (f"{'delta' if with_delta else 'no delta'}: next-turn text identical="
-                f"{text == base_text}; decide start={t.get('start')} (extend), "
-                f"conversation_prefill_tokens={cpt} ({'>0' if with_delta else '==0'}); "
-                f"next turn cached_tokens={cached} (== decide prefix_tokens "
-                f"{t.get('prefix_tokens')}, >= no-decide {base_cached}); "
-                f"texts {base_text[:40]!r} / {text[:40]!r}")
-
-
-def conv_text(messages):
-    return "\n\n".join(f"{m['role']}: {m['content']}" for m in messages)
-
-
-def session_floor_request(messages):
-    """The S2/S4 floor probe request: a v1 decide over the conversation's text
-    with the session questions, so the floor is per SESSION_Q question."""
-    return {"state": conv_text(messages), "questions": SESSION_Q}
-
-
-def drift_vs_floor(ans, ref, floor, source):
-    """Human ruling (spec §12.8): a conversation the model partly generated by
-    token-by-token decode is not bit-identical to a prefill of the same
-    tokens (the precision property of gate 1b), so per question its drift
-    vs the one-call reference must be <= FLOOR_FACTOR x the measured
-    one-call vs token-by-token floor."""
-    if floor is None:
-        return False, f"decode-built leg: no floor ({source} failed)"
-    rows, ok = [], True
-    for n in ans:
-        drift = dlogp(ans[n], ref[n])
-        pq = floor["per_question"][n]
-        fl = dlogp(pq["a_answer"], pq["c_answer"])
-        q_ok = drift <= FLOOR_FACTOR * fl
-        ok &= q_ok
-        rows.append(f"{n}: drift={drift:.4f} 2xfloor={FLOOR_FACTOR * fl:.4f} {'ok' if q_ok else 'OVER'}")
-    return ok, f"[{'; '.join(rows)}] (floor: {source})"
-
-
 def gate_session_exact(d, reuse=True, floor=None, floor_src="n/a"):
     """(a) prefill-built conversations: Δ == 0 vs the one-call full prefill
     (cold start with another conversation cached; extend over the
     conversation that cold decide committed). (b) decode-built: a warm
     extend right after the chat turn, drift <= 2 x floor per question.
-    Without a chat prompt cache (--cask, Llama carrier) the warm leg starts
+    Without a chat prompt cache (Llama carrier) the warm leg starts
     cold, is prefill-built and must be exact too."""
     d.reset()
     conv = chat_turn(d, CONV_C)
@@ -691,13 +521,11 @@ def gate_session_leak(d, n, reuse=True, resumable=True):
     return True, detail + " (need extend, cold and resume)"
 
 
-def session_oversized(d, max_seq, cask):
-    """An over-long conversation (over max_seq; with --cask over the eviction
-    limit) is refused after the probe and R_0 only, however many questions
+def session_oversized(d, max_seq):
+    """An over-long conversation (over max_seq) is refused after the probe and R_0 only, however many questions
     (spec §12.5): the 128-question refusal must take about as long as the
     1-question one, well below 128 whole-conversation renders."""
-    limit = cask_limit(cask) if cask else max_seq
-    big = [{"role": "system", "content": SESSION_SYS + " Policy notes: " + LOREM * (limit // 4)},
+    big = [{"role": "system", "content": SESSION_SYS + " Policy notes: " + LOREM * (max_seq // 4)},
            CONV_C[1]]
     many = {f"q{i:03}": SESSION_Q["escalate"] for i in range(128)}
     times, errs = [], []
@@ -707,18 +535,14 @@ def session_oversized(d, max_seq, cask):
         times.append(time.monotonic() - t0)
         errs.append(r.get("error") or {})
     e1, e = errs
-    if cask:
-        shape = (e.get("status") == 422 and "required_max_seq" not in e
-                 and f"limited to {limit} tokens" in e.get("message", ""))
-    else:
-        req = e.get("required_max_seq")
-        shape = (e.get("status") == 422 and isinstance(req, int) and not isinstance(req, bool)
-                 and req > max_seq)
+    req = e.get("required_max_seq")
+    shape = (e.get("status") == 422 and isinstance(req, int) and not isinstance(req, bool)
+             and req > max_seq)
     shape = shape and e1.get("status") == 422
     fast = times[1] <= FAST_REFUSAL_FACTOR * times[0] + 0.25
     return shape and fast, (f"over-long conversation x128 questions: status={e.get('status')} "
                             f"required_max_seq={e.get('required_max_seq')} "
-                            f"({'absent' if cask else f'> {max_seq}'}) message={e.get('message')!r}; "
+                            f"(> {max_seq}) message={e.get('message')!r}; "
                             f"{times[1]:.3f}s vs 1 question {times[0]:.3f}s "
                             f"(<= {FAST_REFUSAL_FACTOR}x + 0.25s) -> {shape and fast}")
 
@@ -726,12 +550,12 @@ def session_oversized(d, max_seq, cask):
 FAST_REFUSAL_FACTOR = 4
 
 
-def gate_session_errors(d, reuse=True, max_seq=8192, cask=None):
+def gate_session_errors(d, reuse=True, max_seq=8192):
     d.reset()
     conv = chat_turn(d, CONV_C)
     session(d, conv, "commit")
     notes, ok = [], True
-    ok_o, note = session_oversized(d, max_seq, cask)
+    ok_o, note = session_oversized(d, max_seq)
     notes.append(note)
     ok &= ok_o
     for label, fields in [("state and messages", {"state": "s", "messages": conv}),
@@ -832,56 +656,26 @@ def gate_spec_leak(d, n):
     return ok and covered, f"{detail}; starts={starts} (need extend and cold)"
 
 
-def check_cask_over_limit(d, cask):
-    """Over the eviction limit: 422, no required_max_seq, message names the limit."""
-    limit = cask_limit(cask)
-    if limit >= JEV_QUESTION_LIMIT * 4 // 7:
-        raise AssertionError(f"cask_budget {limit} too large: an over-limit state would hit "
-                             f"Jev's {JEV_QUESTION_LIMIT}-token per-question limit first")
-    # limit/4 reps x 5-7 tokens = 1.25-1.75 x limit: over the eviction limit,
-    # under Jev's per-question limit (checked before it).
-    r = d.decide(LOREM * (limit // 4), QUESTIONS)
-    e = r.get("error") or {}
-    ok = (e.get("status") == 422 and "required_max_seq" not in e
-          and f"limited to {limit} tokens" in e.get("message", ""))
-    return ok, (f"over eviction limit: status={e.get('status')} "
-                f"required_max_seq={e.get('required_max_seq')} (absent) "
-                f"message={e.get('message')!r} (names limit {limit}) -> {ok}")
-
-
-def gate_cask_configured(d, cask):
-    ok, note = check_cask_over_limit(d, cask)
-    r = d.decide(STATE, QUESTIONS)
-    after = "answers" in r
-    return ok and after, (f"{note}; normal decide succeeds={after}"
-                          + ("" if after else f" reply={r}"))
-
-
-def gate_errors(d, max_seq, cask=None):
+def gate_errors(d, max_seq):
     notes, ok = [], True
-    if cask:
-        # (i) under CASK: over the eviction limit -> 422, no required_max_seq.
-        ok_i, note = check_cask_over_limit(d, cask)
-        notes.append(note)
-    else:
-        # (i) state longer than the loaded max_seq -> 422 + required_max_seq.
-        # max_seq/4 reps x 5-7 tokens: over max_seq, under Jev's per-question
-        # limit (32000). Guard against exceeding the per-question limit.
-        reps = max_seq // 4
-        long_state = LOREM * reps
-        # Rough estimate: 5-7 tokens per LOREM rep; verify not exceeding 32k.
-        # If it would, skip the test (clear sign max_seq is too large).
-        estimated_tokens = reps * 7 + len(QUESTIONS) * 100  # rough full-prompt estimate
-        if estimated_tokens >= JEV_QUESTION_LIMIT:
-            raise AssertionError(f"max_seq {max_seq} too large: over-length test would hit "
-                                 f"Jev's per-question limit ({JEV_QUESTION_LIMIT}) instead of "
-                                 f"required_max_seq, making the gate ineffective")
-        r = d.decide(long_state, QUESTIONS)
-        e = r.get("error") or {}
-        req = e.get("required_max_seq")
-        ok_i = (e.get("status") == 422 and isinstance(req, int) and not isinstance(req, bool)
-                and req > max_seq)
-        notes.append(f"over-long: status={e.get('status')} required_max_seq={req} (> {max_seq}) -> {ok_i}")
+    # (i) state longer than the loaded max_seq -> 422 + required_max_seq.
+    # max_seq/4 reps x 5-7 tokens: over max_seq, under Jev's per-question
+    # limit (32000). Guard against exceeding the per-question limit.
+    reps = max_seq // 4
+    long_state = LOREM * reps
+    # Rough estimate: 5-7 tokens per LOREM rep; verify not exceeding 32k.
+    # If it would, skip the test (clear sign max_seq is too large).
+    estimated_tokens = reps * 7 + len(QUESTIONS) * 100  # rough full-prompt estimate
+    if estimated_tokens >= JEV_QUESTION_LIMIT:
+        raise AssertionError(f"max_seq {max_seq} too large: over-length test would hit "
+                             f"Jev's per-question limit ({JEV_QUESTION_LIMIT}) instead of "
+                             f"required_max_seq, making the gate ineffective")
+    r = d.decide(long_state, QUESTIONS)
+    e = r.get("error") or {}
+    req = e.get("required_max_seq")
+    ok_i = (e.get("status") == 422 and isinstance(req, int) and not isinstance(req, bool)
+            and req > max_seq)
+    notes.append(f"over-long: status={e.get('status')} required_max_seq={req} (> {max_seq}) -> {ok_i}")
     ok &= ok_i
     after_i = "answers" in d.decide(STATE, QUESTIONS)
     notes.append(f"decide after={after_i}")
@@ -932,53 +726,32 @@ def run(name, fn, *args):
     return name, res
 
 
-def with_daemon(model, max_seq, log, env, body, cask=None, params=None):
+def with_daemon(model, max_seq, log, env, body, params=None):
     d = Daemon(stderr=log, env=env)
     try:
-        info = d.load(model, max_seq=max_seq, params={**(cask or {}), **(params or {})})
+        info = d.load(model, max_seq=max_seq, params=params)
         d.info = info
         print(f"loaded {model}: arch={info.get('arch')} max_seq={max_seq}"
               f"{' env=' + json.dumps(env) if env else ''}"
-              f"{' cask=' + json.dumps(cask) if cask else ''}"
               f"{' params=' + json.dumps(params) if params else ''}"
               f" cache_capable={info.get('cache_capable')}", flush=True)
-        pre = [run("0 CASK configured", gate_cask_configured, d, cask)] if cask else []
-        return pre + body(d)
+        return body(d)
     finally:
         d.close()
-
-
-def serve_cask_params(args):
-    """The cask* load params `hipfire serve` sends (crates/hipfire-cli/src/main.rs
-    load params), defaults from ~/.hipfire/config.json."""
-    cfg_path = Path.home() / ".hipfire/config.json"
-    cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
-    sidecar = args.cask_sidecar or cfg.get("cask_sidecar", "")
-    if not sidecar or not Path(sidecar).is_file():
-        raise SystemExit(f"--cask needs a sidecar file (got {sidecar!r}); pass --cask-sidecar")
-    return {"cask": True, "cask_sidecar": sidecar,
-            "cask_budget": int(cfg.get("cask_budget", 16384)),
-            "cask_beta": int(cfg.get("cask_beta", 128)),
-            "cask_core_frac": float(cfg.get("cask_core_frac", 0.5)),
-            "cask_fold_m": int(cfg.get("cask_fold_m", 2))}
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--max-seq", type=int, default=None,
-                    help="default 8192; with --cask the serve config max_seq (131072)")
-    ap.add_argument("--cask", action="store_true",
-                    help="load every daemon with CASK eviction configured as serve does")
-    ap.add_argument("--cask-sidecar", help="override config.json cask_sidecar")
+                    help="default 8192")
     ap.add_argument("--leak-n", type=int, default=1000)
     ap.add_argument("--daemon-log", help="redirect daemon/probe stderr to this file prefix")
     ap.add_argument("--draft", help="DFlash drafter path: run only gate S6 on a daemon loaded "
                                     "with it (load param `draft`)")
     a = ap.parse_args()
-    cask = serve_cask_params(a) if a.cask else None
     if a.max_seq is None:
-        a.max_seq = 131072 if cask else 8192
+        a.max_seq = 8192
     if a.draft:
         return main_draft(a)
     logs = []
@@ -1009,32 +782,27 @@ def main():
         # v1 decide over CONV_C's text with the session questions. The probe
         # loads with max_seq 512, so S4's ~2k-token conversation cannot be
         # probed; S4 uses the same per-question floor (stated in its detail).
-        # Not needed under --cask (no chat cache, so no decode-built leg).
-        fl_short = (None, "not measured (--cask: no decode-built leg)")
-        if cask is None:
-            src = "exact-env split_prefill_probe one-call vs token-by-token, CONV_C text"
-            try:
-                f = measure_floor(a.model, f"{a.daemon_log}.probe-session" if a.daemon_log else None,
-                                  session_floor_request(CONV_C), EXACT_ENV)
-                fl_short = (f, src)
-                print(f"session floor ({src}): " + ", ".join(
-                    f"{n}={dlogp(v['a_answer'], v['c_answer']):.4f}"
-                    for n, v in f["per_question"].items()), flush=True)
-            except Exception as ex:  # noqa: BLE001 - the decode-built legs then FAIL
-                traceback.print_exc()
-                fl_short = (None, f"{src}: probe failed: {ex}")
+        src = "exact-env split_prefill_probe one-call vs token-by-token, CONV_C text"
+        try:
+            f = measure_floor(a.model, f"{a.daemon_log}.probe-session" if a.daemon_log else None,
+                              session_floor_request(CONV_C), EXACT_ENV)
+            fl_short = (f, src)
+            print(f"session floor ({src}): " + ", ".join(
+                f"{n}={dlogp(v['a_answer'], v['c_answer']):.4f}"
+                for n, v in f["per_question"].items()), flush=True)
+        except Exception as ex:  # noqa: BLE001 - the decode-built legs then FAIL
+            traceback.print_exc()
+            fl_short = (None, f"{src}: probe failed: {ex}")
         fl_long = (fl_short[0], fl_short[1] + " (the probe's max_seq 512 cannot host the "
                                               "~2k-token S4 conversation)")
 
-        # Two notions of reuse (spec §12.2, §12.5): the decide's own (off under
-        # eviction: every start cold), and the chat path's prompt cache (also
-        # needs a `cache_capable` arch; the Llama carrier's chat path keeps no
-        # conversation, so there a chat turn is never extended and the gates
-        # that need one compare answers only, as under --cask).
-        decide_reuse = cask is None
+        # Two notions of reuse (spec §12.2, §12.5): the decide's own, and the chat
+        # path's prompt cache (also needs a `cache_capable` arch; the Llama
+        # carrier's chat path keeps no conversation, so there a chat turn is
+        # never extended and the gates that need one compare answers only).
 
         def chat_cache(d):
-            return decide_reuse and bool(d.info.get("cache_capable"))
+            return bool(d.info.get("cache_capable"))
 
         def exact_body(d):
             cc = chat_cache(d)
@@ -1044,15 +812,15 @@ def main():
                 ("S1b session reuse with delta (exact)", gate_session_reuse, d, True, cc),
                 ("S2 session exactness (exact)", gate_session_exact, d, cc, *fl_short),
                 ("S4 session stale cache (exact)", gate_session_stale, d, cc, LONG_SYS,
-                 decide_reuse, *fl_long, resumable(d))])
+                 True, *fl_long, resumable(d))])
             if cc and r[-1][1][0] == INCONCLUSIVE and "resume not exercised" in r[-1][1][1]:
                 # fl_long is the CONV_C floor (the probe cannot host the long
                 # conversation; stated in the detail), reused for the rerun.
                 r.append(run("S4r session stale cache, longer shared prefix (exact)",
-                              gate_session_stale, d, cc, LONG_SYS_RERUN, decide_reuse, *fl_long,
+                              gate_session_stale, d, cc, LONG_SYS_RERUN, True, *fl_long,
                               resumable(d)))
             return r
-        results += with_daemon(a.model, a.max_seq, log("exact"), EXACT_ENV, exact_body, cask)
+        results += with_daemon(a.model, a.max_seq, log("exact"), EXACT_ENV, exact_body)
 
         def default_body(d):
             r = []
@@ -1061,15 +829,14 @@ def main():
             r += [run("1c restore order-invariance", gate_restore_order, d),
                   run("3 model left clean", gate_clean, d),
                   run("4 no leak", gate_leak, d, a.leak_n),
-                  run("5 error replies", gate_errors, d, a.max_seq, cask)]
+                  run("5 error replies", gate_errors, d, a.max_seq)]
             r += run_session_gates(d, [
                 ("S1a session reuse, no delta", gate_session_reuse, d, False, chat_cache(d)),
-                ("S3 session no leak", gate_session_leak, d, a.leak_n, decide_reuse,
+                ("S3 session no leak", gate_session_leak, d, a.leak_n, True,
                  resumable(d)),
-                ("S5 session error replies", gate_session_errors, d, decide_reuse, a.max_seq,
-                 cask)])
+                ("S5 session error replies", gate_session_errors, d, True, a.max_seq)])
             return r
-        results += with_daemon(a.model, a.max_seq, log("default"), None, default_body, cask)
+        results += with_daemon(a.model, a.max_seq, log("default"), None, default_body)
     finally:
         for f in logs:
             f.close()
@@ -1086,8 +853,6 @@ def summarize(results):
 def main_draft(a):
     """Gate S6 only: one default-env daemon with the DFlash drafter loaded and
     the prompt-cache trace on (S6b reads it from the daemon stderr log)."""
-    if a.cask:
-        raise SystemExit("--draft does not combine with --cask")
     if a.daemon_log:
         log_path = f"{a.daemon_log}.draft"
     else:

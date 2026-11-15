@@ -51,7 +51,7 @@ use hip_bridge::KernargBlob;
 use hipfire_arch_qwen35::load_qwen35_bundle;
 use hipfire_arch_qwen35::qwen35::LayerWeights;
 use hipfire_runtime::kv_backend::KvBackend;
-use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource, SequenceHint, SpecLoadCfg};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// The existing kernel sources, byte-for-byte the text `rdna_compute::kernels`
@@ -1051,7 +1051,7 @@ fn sampled_head(
     let hidden = gpu.zeros(&[NMAX * case.k], DType::F32)?;
     let rotated = gpu.zeros(&[NMAX * case.k], DType::F32)?;
     // Backend policy only: the private CB owner predicate needs the state oracle.
-    for fixture in ["arch", "fp16", "head", "tiles", "lds"] {
+    for fixture in ["arch", "fp16", "tiles", "lds"] {
         let mut flags = (*gpu.flags).clone();
         let arch = if fixture == "arch" {
             "gfx1100"
@@ -1060,7 +1060,6 @@ fn sampled_head(
         };
         match fixture {
             "fp16" => flags.fp16_disabled = true,
-            "head" => flags.lm_head_wmma_disabled = true,
             "tiles" => flags.wmma_batch_tiles = false,
             "lds" => flags.hfq4g256_ldsstage_wmma = true,
             _ => {}
@@ -1370,7 +1369,6 @@ fn run() -> R<usize> {
     ));
 
     let src = ModelSource::from_path(&args.model)?;
-    let cask = CaskConfig::default();
     let mut lc = LoadCtx {
         path: &args.model,
         max_seq: 4096,
@@ -1393,7 +1391,6 @@ fn run() -> R<usize> {
         kv_backend: KvBackend::default(),
         kv_adaptive_override: None,
         state_quant_override: None,
-        cask: &cask,
         pp: 1,
         pp_layer_counts: None,
         admitted_mesh: None,
@@ -1404,6 +1401,7 @@ fn run() -> R<usize> {
         gemma4_draft_len: 3,
         xdna: None,
         batch_request: Default::default(),
+        ep_ar_wire: Default::default(),
     };
     let b = load_qwen35_bundle(src, &mut lc).map_err(|e| e.to_string())?;
     let dn = b

@@ -15,41 +15,13 @@ use std::sync::LazyLock;
 
 use serde::Serialize;
 
-use crate::{developer_key_for_env, fields, is_deprecated_key, BOOTSTRAP_ENV};
+use crate::{developer_key_for_env, fields, BOOTSTRAP_ENV};
 
 const INVENTORY_DOC: &str = include_str!("../../../docs/env-vars.md");
-
-/// Release a deprecation started in / is removed in.
-const DEPRECATED_SINCE: &str = "0.4.0";
-const REMOVED_IN: &str = "0.5.0";
 
 /// Names `load_env_layer` handles outside the schema (`HIPFIRE_DEVICE` is the
 /// singular spelling of `HIPFIRE_DEVICES`).
 const STABLE_ENV: &[&str] = &["HIPFIRE_DEVICES", "HIPFIRE_DEVICE"];
-
-/// Deprecated variables that are not the `env_compat` of a deprecated schema
-/// key. `only_value` limits the deprecation to one value (`=0` is the legacy
-/// contiguous DFlash opt-in; other window values are supported).
-struct DeprecatedEnv {
-    name: &'static str,
-    only_value: Option<&'static str>,
-    replacement: &'static str,
-}
-
-const DEPRECATED_ENV: &[DeprecatedEnv] = &[
-    DeprecatedEnv {
-        name: "HIPFIRE_DFLASH_WINDOW",
-        only_value: Some("0"),
-        replacement: "unset it (the draft-declared window applies)",
-    },
-    DeprecatedEnv {
-        name: "HIPFIRE_DFLASH_CTX_CAP",
-        only_value: None,
-        replacement: "unset it (the draft-declared window applies)",
-    },
-];
-
-const NO_REPLACEMENT: &str = "no replacement (feature removed)";
 
 /// How one set variable relates to hipfire.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -62,11 +34,6 @@ pub enum EnvStatus {
     Bootstrap,
     /// Documented in the env-vars inventory but not a config key.
     Runtime,
-    Deprecated {
-        since: &'static str,
-        removed: &'static str,
-        replacement: String,
-    },
     /// Not a hipfire variable; `suggestion` is the nearest known name.
     Unknown { suggestion: Option<String> },
 }
@@ -77,11 +44,6 @@ impl EnvStatus {
             Self::Applies { key } => format!("applies {key}"),
             Self::Bootstrap => "bootstrap".into(),
             Self::Runtime => "runtime".into(),
-            Self::Deprecated {
-                since,
-                removed,
-                replacement,
-            } => format!("DEPRECATED since {since}, removed in {removed}: {replacement}"),
             Self::Unknown {
                 suggestion: Some(name),
             } => format!("UNKNOWN: not a hipfire variable (typo? did you mean {name})"),
@@ -107,7 +69,7 @@ pub fn is_secret_name(name: &str) -> bool {
 }
 
 /// Inventory rows of `docs/env-vars.md`: name → status word of the generated
-/// table (`stable`, `experimental`, `developer`, `harness`, `deprecated`), when
+/// table (`stable`, `experimental`, `developer`, `harness`), when
 /// the row has one.
 pub fn inventory() -> &'static BTreeMap<&'static str, Option<&'static str>> {
     static INVENTORY: LazyLock<BTreeMap<&'static str, Option<&'static str>>> =
@@ -116,13 +78,7 @@ pub fn inventory() -> &'static BTreeMap<&'static str, Option<&'static str>> {
 }
 
 fn parse_inventory(doc: &'static str) -> BTreeMap<&'static str, Option<&'static str>> {
-    const STATUSES: [&str; 5] = [
-        "stable",
-        "experimental",
-        "developer",
-        "harness",
-        "deprecated",
-    ];
+    const STATUSES: [&str; 4] = ["stable", "experimental", "developer", "harness"];
     let mut names: BTreeMap<&'static str, Option<&'static str>> = BTreeMap::new();
     for line in doc.lines() {
         let Some(rest) = line.strip_prefix("| `") else {
@@ -158,26 +114,6 @@ fn schema_env_key(name: &str) -> Option<&'static crate::ConfigField> {
 
 fn is_bootstrap(name: &str) -> bool {
     BOOTSTRAP_ENV.contains(&name) || STABLE_ENV.contains(&name)
-}
-
-fn deprecated(name: &str, value: &str) -> Option<EnvStatus> {
-    let replacement = if let Some(entry) = DEPRECATED_ENV.iter().find(|entry| entry.name == name) {
-        if entry.only_value.is_some_and(|only| only != value.trim()) {
-            return None;
-        }
-        entry.replacement
-    } else if schema_env_key(name).is_some_and(|field| is_deprecated_key(field.key))
-        || inventory().get(name) == Some(&Some("deprecated"))
-    {
-        NO_REPLACEMENT
-    } else {
-        return None;
-    };
-    Some(EnvStatus::Deprecated {
-        since: DEPRECATED_SINCE,
-        removed: REMOVED_IN,
-        replacement: replacement.to_owned(),
-    })
 }
 
 /// Every `HIPFIRE_*` name hipfire documents or consumes.
@@ -230,10 +166,7 @@ fn suggest(name: &str) -> Option<String> {
 }
 
 /// Classify one variable.
-pub fn classify(name: &str, value: &str) -> EnvStatus {
-    if let Some(status) = deprecated(name, value) {
-        return status;
-    }
+pub fn classify(name: &str) -> EnvStatus {
     if is_bootstrap(name) {
         return EnvStatus::Bootstrap;
     }
@@ -264,7 +197,7 @@ where
         .into_iter()
         .filter(|(name, _)| name.starts_with("HIPFIRE_"))
         .map(|(name, value)| {
-            let status = classify(&name, &value);
+            let status = classify(&name);
             let value = if is_secret_name(&name) {
                 "(set)".to_owned()
             } else {
@@ -307,7 +240,6 @@ mod tests {
         let names = inventory();
         assert!(names.len() > 1000, "parsed {} names", names.len());
         assert!(names.contains_key("HIPFIRE_KV_MODE"));
-        assert_eq!(names.get("HIPFIRE_CASK_SIDECAR"), Some(&Some("deprecated")));
     }
 
     #[test]
@@ -339,36 +271,6 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_names_name_since_removal_and_replacement() {
-        let status = one("HIPFIRE_DFLASH_CTX_CAP", "4096").status;
-        assert_eq!(
-            status.label(),
-            "DEPRECATED since 0.4.0, removed in 0.5.0: unset it (the draft-declared window applies)"
-        );
-        // Only `=0` is the deprecated window value.
-        assert_eq!(
-            one("HIPFIRE_DFLASH_WINDOW", "0")
-                .status
-                .kind_is_deprecated(),
-            true
-        );
-        assert_ne!(
-            one("HIPFIRE_DFLASH_WINDOW", "4096")
-                .status
-                .kind_is_deprecated(),
-            true
-        );
-        // env_compat of a deprecated schema key.
-        let cask = fields()
-            .iter()
-            .find(|f| f.env_compat.is_some() && is_deprecated_key(f.key))
-            .expect("a deprecated key has an env alias");
-        assert!(one(cask.env_compat.unwrap(), "1")
-            .status
-            .kind_is_deprecated());
-    }
-
-    #[test]
     fn unknown_names_get_the_nearest_suggestion() {
         let entry = one(&env_name("KVMODE"), "q8");
         assert_eq!(
@@ -396,11 +298,5 @@ mod tests {
         ]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].value, "(set)");
-    }
-
-    impl EnvStatus {
-        fn kind_is_deprecated(&self) -> bool {
-            matches!(self, Self::Deprecated { .. })
-        }
     }
 }

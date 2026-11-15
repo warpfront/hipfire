@@ -20,10 +20,12 @@
 //! gfx10+ AMDHSA `s_code_end` padding): accepted once, after the last kernel, nothing may follow it
 //! in `.text`, and it is optional in the source (the typed [`link_encoded`] paths never add it).
 //!
-//! gfx942 (CDNA3, wave64) has no text front end here: its kernels are typed
-//! (`crate::cdna`), encoded by `peacemaker_cdna`, and linked through
-//! [`link_encoded`] / [`link_encoded_versioned`] as code object v5 or v6 with
-//! the same descriptor, metadata and ELF writers (the `.amdhsa_*` directive
+//! gfx942 (CDNA3, wave64) text goes through the same front end: every
+//! instruction is parsed by `peacemaker_cdna::text::parse_line` and encoded by
+//! `peacemaker_cdna` (the codec the typed `crate::cdna` builder uses), labels
+//! and branches resolve as on RDNA, and the kernels link as code object v5 or v6
+//! (as [`link_encoded`] / [`link_encoded_versioned`] do) with the same
+//! descriptor, metadata and ELF writers (the `.amdhsa_*` directive
 //! semantics are those of `llvm-mc -mcpu=gfx942`; see `descriptor`).
 mod descriptor;
 mod elf;
@@ -51,14 +53,20 @@ fn ir_arch(arch: Arch) -> Result<IrArch, String> {
         Arch::Gfx1151 => Ok(IrArch::Gfx1151),
         Arch::Gfx1200 => Ok(IrArch::Gfx1200),
         Arch::Gfx1201 => Ok(IrArch::Gfx1201),
-        Arch::Gfx942 => Err(
-            "gfx942 code is emitted by the typed cdna builder, not the RDNA text assembler".into(),
-        ),
+        Arch::Gfx942 => Err("gfx942 has no RDNA codec architecture".into()),
     }
 }
 
 /// Encode one instruction line (no label operands) onto `out`; returns its dword count.
 fn encode_into(line: &str, arch: Arch, out: &mut Vec<u32>) -> Result<usize, String> {
+    if let Some(cdna) = arch.cdna() {
+        // CDNA: the same typed parser and codec the checked cdna builder encodes with.
+        let inst =
+            peacemaker_cdna::text::parse_line(line, cdna).map_err(|e| format!("{line}: {e}"))?;
+        let before = out.len();
+        inst.encode(cdna, out).map_err(|e| format!("{line}: {e}"))?;
+        return Ok(out.len() - before);
+    }
     let inst = peacemaker_lift::text::parse_line(line, ir_arch(arch)?)
         .map_err(|e| format!("{line}: {e}"))?;
     let words = if arch.gfx12() {
@@ -119,7 +127,7 @@ pub fn assemble_with_regions(
 ) -> Result<Vec<u8>, String> {
     let mut section = Section::None;
     let mut target = false;
-    let mut version = false;
+    let mut version: Option<u32> = None;
     let mut kernels: Vec<Kernel<'_>> = Vec::new();
     // Kernel symbol attributes: (.protected, .globl, .type @function).
     let mut attributes: HashMap<&str, [bool; 3]> = HashMap::new();
@@ -145,12 +153,15 @@ pub fn assemble_with_regions(
                 target = true;
             }
             ".amdhsa_code_object_version" => {
-                if rest != "6" {
-                    return Err(format!(
-                        "code object version {rest}: the native writer emits version 6"
-                    ));
-                }
-                version = true;
+                version = match (rest, arch.wave64()) {
+                    ("6", _) => Some(6),
+                    ("5", true) => Some(5),
+                    _ => {
+                        return Err(format!(
+                            "code object version {rest}: the native writer emits version 6 (5 or 6 on gfx942)"
+                        ))
+                    }
+                };
             }
             ".text" if rest.is_empty() => section = Section::Text,
             ".section" if rest == ".rodata,\"a\",@progbits" => section = Section::Rodata,
@@ -318,9 +329,9 @@ pub fn assemble_with_regions(
             }
         }
     }
-    if !target || !version {
+    let Some(version) = version.filter(|_| target) else {
         return Err("missing .amdgcn_target or .amdhsa_code_object_version".into());
-    }
+    };
     if code_end == CodeEnd::Aligned {
         return Err("the end-of-text `.p2alignl` is not followed by its `.fill`".into());
     }
@@ -375,7 +386,7 @@ pub fn assemble_with_regions(
     let region_bytes = regions::encode(region_proofs, &kernels, &labels)?;
     elf::link_with_regions(
         arch,
-        6,
+        version,
         &linked,
         &metadata,
         code_end == CodeEnd::Filled,

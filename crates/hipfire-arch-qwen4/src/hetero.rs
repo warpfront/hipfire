@@ -51,7 +51,10 @@ pub(crate) fn requested() -> Result<Option<String>, String> {
     // `None`: the cards cannot be told before the runtime loads (no KFD
     // topology); the attach's `check_primary` still holds the primary.
     if let Some(devices) = hipfire_config::devices::startup_devices() {
-        check_devices(&devices.iter().map(|d| d.arch.as_str()).collect::<Vec<_>>(), &arch)?;
+        check_devices(
+            &devices.iter().map(|d| d.arch.as_str()).collect::<Vec<_>>(),
+            &arch,
+        )?;
     }
     Ok(Some(arch))
 }
@@ -123,10 +126,10 @@ pub fn hetero_decode_rows() -> usize {
 /// The prefill chunk under the split: the mailbox's prefill slot and the expert
 /// device's scratch are sized for it, and the load's prefill chunk is clamped
 /// to it (`gpu_forward::qwen4_prefill_chunk_requested`).
-pub const HETERO_PREFILL_MAX_ROWS: usize = 4096;
+pub const HETERO_PREFILL_CHUNK_ROWS: usize = 4096;
 
 /// The load's hetero prefill chunk: `HIPFIRE_HETERO_PREFILL_ROWS` (whole
-/// 256-row steps, 512..=8192) or [`HETERO_PREFILL_MAX_ROWS`]. Read once.
+/// 256-row steps, 512..=8192) or [`HETERO_PREFILL_CHUNK_ROWS`]. Read once.
 pub fn hetero_prefill_rows() -> usize {
     static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *ROWS.get_or_init(|| {
@@ -135,7 +138,7 @@ pub fn hetero_prefill_rows() -> usize {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .map(|r| r / 256 * 256)
             .filter(|r| (512..=8192).contains(r))
-            .unwrap_or(HETERO_PREFILL_MAX_ROWS)
+            .unwrap_or(HETERO_PREFILL_CHUNK_ROWS)
     })
 }
 

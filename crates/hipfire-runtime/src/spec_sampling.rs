@@ -26,6 +26,10 @@
 //! shared request-seeded RNG), and a draft is accepted iff it equals its
 //! row's draw. Every emitted token is one AR draw in AR's order, so a seeded
 //! request emits AR's exact tokens wherever the verify logits equal AR's.
+//!
+//! [`naive_sample_chain`] is the dense-row form of SpecInfer naive sampling
+//! used by the target-generic DFlash chain and the Glimmer drafter, and
+//! [`sample_host_nucleus`] is its one-row temperature/top-k/top-p draw.
 
 use crate::llama::{CPU_SAMPLE_LEGACY_POOL, CPU_SAMPLE_WIDE_POOL};
 use crate::sampler::SamplerConfig;
@@ -616,6 +620,233 @@ impl SpecRng {
     pub fn next_f32(&mut self) -> f32 {
         (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32
     }
+}
+
+// ─── Dense host chain sampling (SpecInfer naive) ─────────────────────────
+
+/// SpecInfer NAIVE-sampling acceptance for a LINEAR (chain) DFlash block —
+/// distribution-EXACT at any temperature.
+///
+/// `logits_per_pos` is the target's full per-position logits, row-major
+/// `[(depth + 1) × vocab]`, where `depth = drafts.len()`: row `i` is the
+/// target distribution at block position `i` (the prediction after the prefix
+/// `[seed, drafts[0..i]]`). `drafts[i]` is the draft's token at position `i`.
+///
+/// At each position `i` draw `x_i ~ softmax(logits_i / temp)` (the argmax when
+/// `temp <= 0`). Accept the longest prefix where `drafts[i] == x_i`; the first
+/// mismatch's `x_i` is the bonus. If every draft is accepted, the bonus is the
+/// target draw at the final row `depth`. Because every emitted token (the
+/// accepted drafts AND the bonus) is a genuine draw from the target
+/// distribution, the output marginal equals `softmax(logits/temp)` EXACTLY — no
+/// rejection ratio, no dependence on the draft probabilities (the draft only
+/// affects HOW MANY target draws get reused, i.e. acceptance length, not WHAT is
+/// emitted).
+///
+/// At `temp <= 0` this reduces EXACTLY to greedy accept (`accept_greedy_prefix`
+/// against the per-position argmax): each draw is the row argmax, so the
+/// accepted prefix and bonus are the target's own greedy continuation.
+///
+/// The per-row draw honours `temp` + `top_k` + nucleus (`top_p`) via
+/// [`sample_host_nucleus`] when truncation is requested, and falls back to the
+/// plain temperature-only softmax draw otherwise. Passing `top_p = 1.0, top_k = 0`
+/// reproduces the temperature-only behaviour bit-for-bit (same softmax path and
+/// same single `rng_state` advance per row).
+///
+/// Returns `(accepted, bonus)`: `accepted` is the number of accepted drafts
+/// (`0..=depth`) and `bonus` is the target draw at the divergence position.
+/// Threads the SAME `rng_state` (xorshift, bit-compatible with the qwen35 spec
+/// sampler) so the sampler is deterministic given a seed.
+pub fn naive_sample_chain(
+    logits_per_pos: &[f32],
+    drafts: &[u32],
+    vocab: usize,
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    rng_state: &mut u64,
+) -> (usize, u32) {
+    let depth = drafts.len();
+    debug_assert_eq!(logits_per_pos.len(), (depth + 1) * vocab);
+    let mut p: Vec<f32> = Vec::with_capacity(vocab);
+    for i in 0..=depth {
+        let row = &logits_per_pos[i * vocab..(i + 1) * vocab];
+        let x: u32 = if temp > 0.0 {
+            if top_k == 0 && top_p >= 0.999 {
+                // Unchanged legacy draw — byte-identical when no truncation is asked for.
+                host_softmax_temp_into(row, temp, &mut p);
+                let u = xorshift_unit(rng_state);
+                sample_unnormalized(&p, u)
+            } else {
+                sample_host_nucleus(row, temp, top_p, top_k, rng_state)
+            }
+        } else {
+            let mut bi = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (t, &v) in row.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = t;
+                }
+            }
+            bi as u32
+        };
+        // At the final row there is no draft to match — `x` is always the bonus.
+        if i == depth || drafts[i] != x {
+            return (i, x);
+        }
+    }
+    unreachable!("naive_sample_chain loop always returns at i == depth");
+}
+
+/// Xorshift64* → uniform [0, 1). Bit-compatible with the qwen35 spec sampler's
+/// RNG (`speculative::xorshift_next_unit`) so the chain accept walk is
+/// deterministic given a seed and consistent with the qwen35 DFlash path.
+#[inline]
+fn xorshift_unit(state: &mut u64) -> f32 {
+    let mut s = *state;
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    *state = s;
+    ((s >> 40) as f32) * (1.0 / 16_777_216.0)
+}
+
+/// Temperature softmax of one logits row into `out`.
+fn host_softmax_temp_into(logits: &[f32], temp: f32, out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(logits.len());
+    let inv_t = 1.0 / temp;
+    let mut max = f32::NEG_INFINITY;
+    for &v in logits {
+        let s = v * inv_t;
+        if s > max {
+            max = s;
+        }
+    }
+    let mut sum = 0.0f32;
+    for &v in logits {
+        let e = (v * inv_t - max).exp();
+        out.push(e);
+        sum += e;
+    }
+    let inv = 1.0 / sum;
+    for p in out.iter_mut() {
+        *p *= inv;
+    }
+}
+
+/// Sample an index from a possibly sub-normalized weight vector. Falls back to
+/// argmax if total positive mass is ≤ 0.
+fn sample_unnormalized(w: &[f32], u: f32) -> u32 {
+    let mut sum = 0.0f32;
+    for &x in w {
+        if x > 0.0 {
+            sum += x;
+        }
+    }
+    if sum <= 0.0 {
+        let mut bi = 0usize;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &x) in w.iter().enumerate() {
+            if x > bv {
+                bv = x;
+                bi = i;
+            }
+        }
+        return bi as u32;
+    }
+    let target = u * sum;
+    let mut acc = 0.0f32;
+    for (i, &x) in w.iter().enumerate() {
+        if x > 0.0 {
+            acc += x;
+            if target < acc {
+                return i as u32;
+            }
+        }
+    }
+    (w.len() - 1) as u32
+}
+
+/// Host-side temperature + top-k + nucleus sample of one logits row.
+///
+/// Mirrors the Qwen35 chain DFlash prefill / `spec_step_dflash` host path:
+/// softmax(`/temp`) → optional top-k keep+renorm → optional top-p nucleus →
+/// one categorical draw from the shared xorshift stream. Used by
+/// [`crate::spec_ngram::ChainSpeculator`] for the first post-prefill token so
+/// the seed matches later `verify_block_sampled` policy (temp/top_p/top_k) and
+/// the same `rng_state` sequence `set_sampling` reseeds per request.
+///
+/// - `top_k == 0` or `top_k >= vocab` disables the top-k cut. Pass the AR
+///   candidate cap ([`crate::llama::ar_candidate_cap`]) to reproduce AR.
+/// - `top_p >= 1.0` disables the nucleus.
+/// - Caller must gate greedy (`temp <= 1e-6`) before calling; this always
+///   advances `rng_state` once on the multinomial path.
+pub fn sample_host_nucleus(
+    logits: &[f32],
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    rng_state: &mut u64,
+) -> u32 {
+    let mut probs = Vec::with_capacity(logits.len());
+    host_softmax_temp_into(logits, temp, &mut probs);
+    if top_k > 0 && top_k < probs.len() {
+        let mut order: Vec<usize> = (0..probs.len()).collect();
+        order.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut kept_mass = 0.0f32;
+        for (rank, &idx) in order.iter().enumerate() {
+            if rank < top_k {
+                kept_mass += probs[idx];
+            } else {
+                probs[idx] = 0.0;
+            }
+        }
+        if kept_mass > 0.0 {
+            let inv = 1.0 / kept_mass;
+            for p in probs.iter_mut() {
+                *p *= inv;
+            }
+        }
+    }
+    if top_p < 1.0 {
+        // In-place nucleus: sort desc, cut at first cum >= top_p, renorm kept.
+        let mut order: Vec<usize> = (0..probs.len()).collect();
+        order.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut cum = 0.0f64;
+        let mut kept_mass = 0.0f64;
+        let mut cutoff = order.len();
+        for (rank, &idx) in order.iter().enumerate() {
+            cum += probs[idx] as f64;
+            kept_mass += probs[idx] as f64;
+            if cum >= top_p as f64 {
+                cutoff = rank + 1;
+                break;
+            }
+        }
+        let inv = if kept_mass > 0.0 {
+            1.0f64 / kept_mass
+        } else {
+            0.0
+        };
+        for (rank, &idx) in order.iter().enumerate() {
+            if rank < cutoff {
+                probs[idx] = (probs[idx] as f64 * inv) as f32;
+            } else {
+                probs[idx] = 0.0;
+            }
+        }
+    }
+    let u = xorshift_unit(rng_state);
+    sample_unnormalized(&probs, u)
 }
 
 #[cfg(test)]
@@ -2012,5 +2243,116 @@ mod tests {
         assert!(wrong.entries().iter().all(|&(t, _)| t < 20));
         let tv = tv_between(&right, &wrong, vocab);
         assert!(tv > 0.05, "gather-first matched policy-first (tv {tv})");
+    }
+
+    // ── Dense host chain sampling (SpecInfer naive) ─────────────────────────
+
+    // softmax(logits / temp) — the reference marginal.
+    fn host_softmax_ref(logits: &[f32], temp: f32) -> Vec<f32> {
+        let inv = 1.0 / temp;
+        let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut e: Vec<f32> = logits.iter().map(|&v| ((v - m) * inv).exp()).collect();
+        let s: f32 = e.iter().sum();
+        for x in e.iter_mut() {
+            *x /= s;
+        }
+        e
+    }
+
+    #[test]
+    fn sample_host_nucleus_deterministic_and_advances_rng() {
+        // Peaked row: token 2 dominates after softmax; top_k=1 forces it.
+        let logits = [0.0f32, 1.0, 5.0, 0.5];
+        let mut rng_a = 0x13579BDFu64;
+        let mut rng_b = 0x13579BDFu64;
+        let t1 = sample_host_nucleus(&logits, 1.0, 1.0, 1, &mut rng_a);
+        let t2 = sample_host_nucleus(&logits, 1.0, 1.0, 1, &mut rng_b);
+        assert_eq!(t1, 2);
+        assert_eq!(t2, 2);
+        assert_ne!(rng_a, 0x13579BDF, "rng must advance once");
+        assert_eq!(rng_a, rng_b);
+    }
+
+    #[test]
+    fn sample_host_nucleus_top_k_masks_tail() {
+        // Two near-equal peaks; top_k=1 keeps only the higher logit index 0.
+        let logits = [3.0f32, 2.999, -10.0, -10.0];
+        let mut rng = 0x13579BDFu64;
+        for _ in 0..16 {
+            let t = sample_host_nucleus(&logits, 1.0, 1.0, 1, &mut rng);
+            assert_eq!(t, 0, "top_k=1 must never pick the masked tail");
+        }
+    }
+
+    #[test]
+    fn naive_sample_chain_temp0_is_argmax() {
+        // temp <= 0 ⇒ each position's draw is the row argmax, so the accept walk
+        // is identical to greedy accept_greedy_prefix against the argmax. Here the
+        // draft matches the argmax at position 0 (token 2) but not position 1
+        // (argmax 4 ≠ draft 1) ⇒ accept 1, bonus = argmax at pos 1 = 4.
+        let vocab = 6usize;
+        let drafts = [2u32, 1];
+        let mut logits = vec![0.0f32; (drafts.len() + 1) * vocab];
+        let at = |pos: usize, tok: usize| pos * vocab + tok;
+        logits[at(0, 2)] = 10.0; // pos 0 argmax = 2 (== draft 0 ⇒ accept)
+        logits[at(1, 4)] = 10.0; // pos 1 argmax = 4 (!= draft 1 ⇒ stop)
+        logits[at(2, 5)] = 10.0; // pos 2 argmax = 5 (unused)
+        let mut rng = 0x1u64;
+        let (accepted, bonus) = naive_sample_chain(&logits, &drafts, vocab, 0.0, 1.0, 0, &mut rng);
+        assert_eq!(accepted, 1);
+        assert_eq!(bonus, 4);
+
+        // Full accept: both drafts equal the argmax ⇒ accept 2, bonus = argmax at
+        // the final row (pos 2) = 5.
+        let drafts_full = [2u32, 4];
+        let (acc_f, bonus_f) =
+            naive_sample_chain(&logits, &drafts_full, vocab, 0.0, 1.0, 0, &mut rng);
+        assert_eq!(acc_f, 2);
+        assert_eq!(bonus_f, 5);
+    }
+
+    #[test]
+    fn naive_sample_chain_preserves_target_distribution() {
+        // Monte-Carlo distribution fidelity exercising the ACTUAL shipped RNG path
+        // (xorshift_unit + host_softmax_temp_into + sample_unnormalized): the RNG
+        // is the thing that silently reintroduces bias, so the test must run the
+        // real sampler, not an injected host sampler.
+        //
+        // Setup: a depth-1 chain (one draft) whose draft token is NOT the target
+        // mode, so the position-0 emitted token (accept ? draft : bonus) is purely
+        // a target draw. Its marginal must equal softmax(logits_0 / temp) EXACTLY
+        // within MC noise, at every temperature.
+        let vocab = 6usize;
+        let logits0 = [2.0f32, 0.5, -1.0, 1.2, 0.0, 0.8];
+        // Draft token 4 (a middling-prob token), deliberately != most argmaxes.
+        let draft = 4u32;
+        let mut full = vec![0.0f32; 2 * vocab];
+        full[..vocab].copy_from_slice(&logits0);
+        // Row 1 (bonus-on-full-accept) — arbitrary; only reached when draft accepted.
+        full[vocab..].copy_from_slice(&[0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        for &temp in &[0.5f32, 0.7, 1.0, 1.5] {
+            let target = host_softmax_ref(&logits0, temp);
+            let n_runs = 200_000u32;
+            let mut hist = vec![0u64; vocab];
+            let mut rng = 0xC0FFEE_1234_5678_u64 ^ ((temp.to_bits() as u64) << 8);
+            for _ in 0..n_runs {
+                let (accepted, bonus) =
+                    naive_sample_chain(&full, &[draft], vocab, temp, 1.0, 0, &mut rng);
+                // Position-0 emitted token = accepted draft (if accept) else bonus.
+                let emitted = if accepted >= 1 { draft } else { bonus };
+                hist[emitted as usize] += 1;
+            }
+            let mut tv = 0.0f64;
+            for t in 0..vocab {
+                let emp = hist[t] as f64 / n_runs as f64;
+                tv += (emp - target[t] as f64).abs();
+            }
+            tv *= 0.5;
+            assert!(
+                tv < 0.01,
+                "naive chain sampling must preserve the target distribution at temp={temp}; TV={tv:.4} hist={hist:?}"
+            );
+        }
     }
 }

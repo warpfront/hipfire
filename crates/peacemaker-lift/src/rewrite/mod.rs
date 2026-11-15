@@ -309,7 +309,9 @@ impl SourceMap {
 /// The table mnemonic of `inst` (by opcode and form: VMEM forms share opcode ids, so
 /// `Opcode::name` alone can name the wrong form).
 pub fn mnemonic(inst: &peacemaker_ir::inst::Inst) -> &'static str {
-    peacemaker_ir::isa::lookup(Arch::Gfx1201, inst.op, inst.form).map_or("", |row| row.name)
+    peacemaker_ir::isa::lookup_inst(Arch::Gfx1201, &inst)
+        .ok()
+        .map_or("", |row| row.name)
 }
 
 /// Block and instruction id at layout index `at` of `kernel`.

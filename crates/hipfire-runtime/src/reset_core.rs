@@ -85,7 +85,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         // Qwen4 has no captured decode graph, but the route-level rollback
         // still invalidates the shared graph/replay state.
         graphs: true,
-        // Qwen4 refuses external drafters (DFlash, n-gram, DDTree, EAGLE); the
+        // Qwen4 refuses external drafters (DFlash, n-gram, EAGLE); the
         // native MTP head's state resets inside Qwen4Bundle::reset.
         drafter: true,
         adaptive: true, // n/a: Qwen4 admission rejects adaptive KV

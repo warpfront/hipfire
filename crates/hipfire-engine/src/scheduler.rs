@@ -800,7 +800,7 @@ pub fn is_batch_eligible(
     if req.has_image || req.has_tools || req.has_stop {
         return false;
     }
-    if req.has_speculator || req.has_adaptive || req.has_pflash {
+    if req.has_speculator || req.has_adaptive {
         return false;
     }
     if req.has_messages_history {
@@ -1273,8 +1273,6 @@ pub fn daemon_regular_with_admission(
         None => DaemonMsg::Regular(value),
     }
 }
-
-pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;
 
 /// Error from the real GPU batch driver. Host stub never errors.
 #[derive(Debug)]

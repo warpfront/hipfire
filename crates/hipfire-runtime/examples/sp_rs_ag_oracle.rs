@@ -3,26 +3,28 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte oracle (and bench) of the sequence-parallel exchange launches
-//! (`sp_hc_rs_d8_*` reduce-scatter fused into the HC write, `sp_ag_rows_*` row all-gather,
-//! `rdna_compute::ar_hc_write::sp_*`) against the product all-reduce launch
-//! (`ar_hc_write_d8_*`) on two gfx1201 cards, both on the DENSE wire of one `ArHcExchange`.
+//! (`sp_hc_rs_{d8,p32_d16}_*` reduce-scatter fused into the HC write, `sp_ag_rows_*` row
+//! all-gather, `rdna_compute::ar_hc_write::sp_*`) against the product all-reduce launch
+//! (`ar_hc_write_{d8,p32_d16}_*`) on two gfx1201 cards, both on the DENSE wire of one `ArHcExchange`.
 //!
 //! ```text
 //! sp_rs_ag_oracle [--rows 1,2,7,16,255,256,300,511,512,513,613,1025,3073,3585] [--iters 200] [--case-iters 3]
-//!                 [--devices 0,1] [--out DIR] [--stream bf16|f32|both] [--no-fault] [--bench]
+//!                 [--devices 0,1] [--out DIR] [--stream bf16|f32|both] [--partial bf16|f32|both]
+//!                 [--no-fault] [--bench]
 //! ```
 //!
-//! Per (stream kind, row count, split) case, `--case-iters` steps; then a chained loop of
+//! Per (stream kind, partial format, row count, split) case, `--case-iters` steps; then a chained loop of
 //! `--iters` steps rotating over every case, alternating the launch order (AR, RS, AG... on
 //! even steps, AG, RS, AR, AG on odd ones) on the SAME exchange (generation consistency).
 //! Splits of the tile between the two ranks: `even` (rank 0 takes the extra row), `reverse`
 //! (rank 1 takes it; one rank owns zero rows when `rows == 1`) and `skew` (rank 0 owns
 //! `rows / 4`). Each step checks, on both ranks:
-//!  (i) RS vs AR: identical random partials (distinct per rank), gates and streams; copy A gets
-//!      the product `ar_hc_write_d8_*` launch on all rows, copy B the RS launch. Own rows of B
-//!      are byte-equal to the same rows of A, the other rows of B are byte-equal to the initial
-//!      streams, the debug `m` of own rows is bit-equal to A's and to the host fold, `m` of the
-//!      other rows was never written;
+//!  (i) RS vs AR: identical random partials (distinct per rank), gates and streams, both sent in
+//!      the case's partial format (`ArHcPartial`: f32 = the mixer write, bf16 = the FFN write);
+//!      copy A gets the product dense all-reduce launch on all rows, copy B the RS launch. Own
+//!      rows of B are byte-equal to the same rows of A, the other rows of B are byte-equal to the
+//!      initial streams, the debug `m` of own rows is bit-equal to A's and to the host fold, `m`
+//!      of the other rows was never written;
 //!  (ii) AG: each rank fills only its own rows of a `[rows][row_elems]` buffer with random
 //!      finite bf16 (garbage elsewhere; a NaN-pair dword is planted at random). After the
 //!      gather both ranks' buffers equal the concatenation, a NaN-pair dword `0xFFFF_FFFF`
@@ -40,8 +42,8 @@
 use hip_bridge::DeviceBuffer;
 use hipfire_runtime::ar_hc_exchange::{ArHcExchange, ArHcMode};
 use rdna_compute::ar_hc_write::{
-    ar_hc_fold, bf16_bits, bf16_round, sp_ag_rows_per_launch, sp_even_split, sp_slices,
-    sp_wire_dword, ArHcWire, SpAgElem, StreamKind, AR_HC_HIDDEN, SP_ROW_CAP,
+    bf16_bits, bf16_round, sp_ag_rows_per_launch, sp_even_split, sp_slices, sp_wire_dword,
+    ArHcPartial, ArHcWire, SpAgElem, StreamKind, AR_HC_HIDDEN, SP_ROW_CAP,
 };
 use rdna_compute::Gpu;
 use std::ffi::c_void;
@@ -227,6 +229,7 @@ fn ar_all(
     x: &ArHcExchange,
     d: &mut Dev,
     kind: StreamKind,
+    fmt: ArHcPartial,
     streams: *mut c_void,
     dbg: *mut c_void,
     rows: usize,
@@ -245,6 +248,7 @@ fn ar_all(
                 off(partial, done * H * 4),
                 off(streams, done * kind.row_bytes()),
                 kind,
+                fmt,
                 off(gates, done * 16),
                 n,
                 off(dbg, done * H * 4),
@@ -266,6 +270,7 @@ fn rs_all(
     x: &ArHcExchange,
     d: &mut Dev,
     kind: StreamKind,
+    fmt: ArHcPartial,
     streams: *mut c_void,
     dbg: *mut c_void,
     own: (usize, usize),
@@ -283,6 +288,7 @@ fn rs_all(
                 partial,
                 streams,
                 kind,
+                fmt,
                 gates,
                 (own.0 + oo, on),
                 (peer.0 + po, pn),
@@ -379,13 +385,15 @@ enum Phase {
     Ag(SpAgElem, usize),
 }
 
-/// One full step: RS vs AR over `rows` rows of `kind` at `split`, then the four AG rounds.
+/// One full step: RS vs AR over `rows` rows of `kind` with `fmt` partials at `split`, then the
+/// four AG rounds.
 #[allow(clippy::too_many_arguments)]
 fn step(
     d: &mut Dev,
     x: &ArHcExchange,
     bar: &Barrier,
     kind: StreamKind,
+    fmt: ArHcPartial,
     rows: usize,
     split: &Split,
     init: &[u8],
@@ -435,8 +443,8 @@ fn step(
     for phase in order {
         bar.wait();
         match phase {
-            Phase::Ar => ar_all(x, d, kind, sa, da, rows, &mut fails)?,
-            Phase::Rs => rs_all(x, d, kind, sb, db, own, peer, &mut fails)?,
+            Phase::Ar => ar_all(x, d, kind, fmt, sa, da, rows, &mut fails)?,
+            Phase::Rs => rs_all(x, d, kind, fmt, sb, db, own, peer, &mut fails)?,
             Phase::Ag(elem, row_elems) => {
                 ag_phase(d, x, elem, row_elems, rows, split, &mut rng, &mut fails)?
             }
@@ -480,7 +488,7 @@ fn step(
     }
     let m_bits = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
     for i in o0 * H..o1 * H {
-        if m_bits(&dbg_b, i) != ar_hc_fold(p[0][i], p[1][i]).to_bits() {
+        if m_bits(&dbg_b, i) != fmt.fold(p[0][i], p[1][i]).to_bits() {
             fails.push(format!("RS m != host fold at element {i}"));
             break;
         }
@@ -596,6 +604,7 @@ fn ag_phase(
 #[derive(Clone, Debug)]
 struct Case {
     kind: &'static str,
+    partial: &'static str,
     rows: usize,
     split: String,
     steps: usize,
@@ -604,9 +613,10 @@ struct Case {
 }
 
 impl Case {
-    fn new(kind: &'static str, rows: usize, split: &str) -> Self {
+    fn new(kind: &'static str, partial: &'static str, rows: usize, split: &str) -> Self {
         Self {
             kind,
+            partial,
             rows,
             split: split.to_string(),
             steps: 0,
@@ -620,8 +630,8 @@ impl Case {
         if self.first.is_none() {
             if let Some(f) = fails.into_iter().next() {
                 self.first = Some(format!(
-                    "{} rows {} split {} iter {it} rank {rank}: {f}",
-                    self.kind, self.rows, self.split
+                    "{} streams {} partials rows {} split {} iter {it} rank {rank}: {f}",
+                    self.kind, self.partial, self.rows, self.split
                 ));
             }
         }
@@ -631,6 +641,7 @@ impl Case {
 #[derive(Clone, Debug)]
 struct BenchRow {
     kind: &'static str,
+    partial: &'static str,
     ar_us: f64,
     rs_us: f64,
     ag_bf16_us: f64,
@@ -650,6 +661,7 @@ struct Config {
     iters: usize,
     case_iters: usize,
     kinds: Vec<StreamKind>,
+    partials: Vec<ArHcPartial>,
     fault: bool,
     bench: bool,
 }
@@ -687,6 +699,7 @@ fn time_us(
 fn bench_rank(
     d: &mut Dev,
     kinds: &[StreamKind],
+    partials: &[ArHcPartial],
     bar: &Barrier,
     x: &ArHcExchange,
 ) -> Result<Vec<BenchRow>, String> {
@@ -704,7 +717,10 @@ fn bench_rank(
     let split = sp_even_split(ROWS);
     let (own, peer) = (split[rank], split[1 - rank]);
     let mut out = Vec::new();
-    for &kind in kinds {
+    for (&kind, &fmt) in kinds
+        .iter()
+        .flat_map(|k| partials.iter().map(move |p| (k, p)))
+    {
         d.gpu
             .hip
             .memset(&d.streams_a, 0, ROWS * kind.row_bytes())
@@ -716,12 +732,14 @@ fn bench_rank(
         let ag32 = d.ag32.as_ptr();
         // SAFETY (all closures): full 4096-row tiles of live allocations on this device.
         let ar_us = time_us(d, bar, &mut |d: &mut Dev| unsafe {
-            x.write(rank, &mut d.gpu, partial, sa, kind, gates, ROWS, null)
+            x.write(rank, &mut d.gpu, partial, sa, kind, fmt, gates, ROWS, null)
                 .map_err(es)
         })?;
         let rs_us = time_us(d, bar, &mut |d: &mut Dev| unsafe {
-            x.sp_rs_write(rank, &mut d.gpu, partial, sa, kind, gates, own, peer, null)
-                .map_err(es)
+            x.sp_rs_write(
+                rank, &mut d.gpu, partial, sa, kind, fmt, gates, own, peer, null,
+            )
+            .map_err(es)
         })?;
         let ag_bf16_us = time_us(d, bar, &mut |d: &mut Dev| unsafe {
             x.sp_ag_rows(rank, &mut d.gpu, ag16, SpAgElem::Bf16, H, own, peer)
@@ -732,13 +750,16 @@ fn bench_rank(
                 .map_err(es)
         })?;
         let rs_ag_us = time_us(d, bar, &mut |d: &mut Dev| unsafe {
-            x.sp_rs_write(rank, &mut d.gpu, partial, sa, kind, gates, own, peer, null)
-                .map_err(es)?;
+            x.sp_rs_write(
+                rank, &mut d.gpu, partial, sa, kind, fmt, gates, own, peer, null,
+            )
+            .map_err(es)?;
             x.sp_ag_rows(rank, &mut d.gpu, ag16, SpAgElem::Bf16, H, own, peer)
                 .map_err(es)
         })?;
         out.push(BenchRow {
             kind: kind.name(),
+            partial: fmt.name(),
             ar_us,
             rs_us,
             ag_bf16_us,
@@ -780,17 +801,19 @@ fn run_rank(
         .collect();
     let init_of = |kind: StreamKind| &inits.iter().find(|(k, _)| *k == kind).unwrap().1;
     // per-case phase, then the chained loop over the same cases
-    let mut all: Vec<(StreamKind, usize, Split)> = Vec::new();
+    let mut all: Vec<(StreamKind, ArHcPartial, usize, Split)> = Vec::new();
     for &kind in &cfg.kinds {
-        for &rows in &cfg.rows_list {
-            for split in splits_for(rows) {
-                all.push((kind, rows, split));
+        for &fmt in &cfg.partials {
+            for &rows in &cfg.rows_list {
+                for split in splits_for(rows) {
+                    all.push((kind, fmt, rows, split));
+                }
             }
         }
     }
     let mut cases = Vec::new();
-    for (ci, (kind, rows, split)) in all.iter().enumerate() {
-        let mut case = Case::new(kind.name(), *rows, split.name);
+    for (ci, (kind, fmt, rows, split)) in all.iter().enumerate() {
+        let mut case = Case::new(kind.name(), fmt.name(), *rows, split.name);
         for it in 0..cfg.case_iters {
             let seed = 0x1000_0000 + (ci * 64 + it) as u64;
             let fails = step(
@@ -798,6 +821,7 @@ fn run_rank(
                 &x,
                 &bar,
                 *kind,
+                *fmt,
                 *rows,
                 split,
                 init_of(*kind),
@@ -808,15 +832,16 @@ fn run_rank(
         }
         cases.push(case);
     }
-    let mut chained = Case::new("chained", 0, "rotating");
+    let mut chained = Case::new("chained", "", 0, "rotating");
     for it in 0..cfg.iters {
-        let (kind, rows, split) = &all[it % all.len()];
+        let (kind, fmt, rows, split) = &all[it % all.len()];
         let seed = 0x2000_0000 + it as u64;
         let fails = step(
             &mut d,
             &x,
             &bar,
             *kind,
+            *fmt,
             *rows,
             split,
             init_of(*kind),
@@ -825,8 +850,9 @@ fn run_rank(
         )?;
         if !fails.is_empty() && chained.first.is_none() {
             chained.first = Some(format!(
-                "{} rows {rows} split {} iter {it} rank {rank}: {}",
+                "{} streams {} partials rows {rows} split {} iter {it} rank {rank}: {}",
                 kind.name(),
+                fmt.name(),
                 split.name,
                 fails[0]
             ));
@@ -858,6 +884,7 @@ fn run_rank(
                             partial,
                             streams,
                             StreamKind::Bf16,
+                            ArHcPartial::Bf16,
                             gates,
                             (0, 1),
                             (1, 1),
@@ -891,7 +918,7 @@ fn run_rank(
     }
     bar.wait();
     let bench = if cfg.bench {
-        bench_rank(&mut d, &cfg.kinds, &bar, &x)?
+        bench_rank(&mut d, &cfg.kinds, &cfg.partials, &bar, &x)?
     } else {
         Vec::new()
     };
@@ -915,6 +942,7 @@ fn main() {
         iters: 200,
         case_iters: 3,
         kinds: StreamKind::ALL.to_vec(),
+        partials: ArHcPartial::ALL.to_vec(),
         fault: true,
         bench: false,
     };
@@ -960,6 +988,15 @@ fn main() {
                     other => panic!("--stream takes f32|bf16|both, got {other}"),
                 };
             }
+            "--partial" => {
+                i += 1;
+                cfg.partials = match args[i].as_str() {
+                    "bf16" => vec![ArHcPartial::Bf16],
+                    "f32" => vec![ArHcPartial::F32],
+                    "both" => ArHcPartial::ALL.to_vec(),
+                    other => panic!("--partial takes f32|bf16|both, got {other}"),
+                };
+            }
             "--no-fault" => cfg.fault = false,
             "--bench" => cfg.bench = true,
             other => panic!("unknown argument {other}"),
@@ -1003,8 +1040,9 @@ fn main() {
             failed |= bad;
             if bad || c.kind == "chained" {
                 eprintln!(
-                    "rank {rank} {} rows {} split {}: {} steps, {} failures{}",
+                    "rank {rank} {} streams {} partials rows {} split {}: {} steps, {} failures{}",
                     c.kind,
+                    c.partial,
                     c.rows,
                     c.split,
                     c.steps,
@@ -1015,8 +1053,8 @@ fn main() {
                 );
             }
             json_rows.push(format!(
-                "{{\"rank\":{rank},\"stream\":\"{}\",\"rows\":{},\"split\":\"{}\",\"steps\":{},\"failures\":{},\"pass\":{}}}",
-                c.kind, c.rows, c.split, c.steps, c.fails, !bad
+                "{{\"rank\":{rank},\"stream\":\"{}\",\"partial\":\"{}\",\"rows\":{},\"split\":\"{}\",\"steps\":{},\"failures\":{},\"pass\":{}}}",
+                c.kind, c.partial, c.rows, c.split, c.steps, c.fails, !bad
             ));
         }
         for f in &res.faults {
@@ -1025,21 +1063,22 @@ fn main() {
         }
         for b in &res.bench {
             eprintln!(
-                "rank {rank} bench {} (4096-row tile): AR {:.1} us  RS {:.1}  AG bf16 {:.1}  AG f32bf16 {:.1}  RS+AG {:.1}  (RS+AG / AR = {:.3})",
-                b.kind, b.ar_us, b.rs_us, b.ag_bf16_us, b.ag_f32bf16_us, b.rs_ag_us, b.rs_ag_us / b.ar_us
+                "rank {rank} bench {} streams {} partials (4096-row tile): AR {:.1} us  RS {:.1}  AG bf16 {:.1}  AG f32bf16 {:.1}  RS+AG {:.1}  (RS+AG / AR = {:.3})",
+                b.kind, b.partial, b.ar_us, b.rs_us, b.ag_bf16_us, b.ag_f32bf16_us, b.rs_ag_us, b.rs_ag_us / b.ar_us
             );
             json_bench.push(format!(
-                "{{\"rank\":{rank},\"stream\":\"{}\",\"tile_rows\":4096,\"ar_us\":{:.2},\"rs_us\":{:.2},\"ag_bf16_us\":{:.2},\"ag_f32bf16_us\":{:.2},\"rs_ag_us\":{:.2}}}",
-                b.kind, b.ar_us, b.rs_us, b.ag_bf16_us, b.ag_f32bf16_us, b.rs_ag_us
+                "{{\"rank\":{rank},\"stream\":\"{}\",\"partial\":\"{}\",\"tile_rows\":4096,\"ar_us\":{:.2},\"rs_us\":{:.2},\"ag_bf16_us\":{:.2},\"ag_f32bf16_us\":{:.2},\"rs_ag_us\":{:.2}}}",
+                b.kind, b.partial, b.ar_us, b.rs_us, b.ag_bf16_us, b.ag_f32bf16_us, b.rs_ag_us
             ));
         }
     }
     let receipt = format!(
-        "{{\"oracle\":\"sp_rs_ag_oracle\",\"pass\":{},\"iters\":{},\"case_iters\":{},\"streams\":[{}],\"devices\":[{},{}],\"results\":[{}],\"bench\":[{}]}}",
+        "{{\"oracle\":\"sp_rs_ag_oracle\",\"pass\":{},\"iters\":{},\"case_iters\":{},\"streams\":[{}],\"partials\":[{}],\"devices\":[{},{}],\"results\":[{}],\"bench\":[{}]}}",
         !failed,
         cfg.iters,
         cfg.case_iters,
         cfg.kinds.iter().map(|k| format!("\"{}\"", k.name())).collect::<Vec<_>>().join(","),
+        cfg.partials.iter().map(|p| format!("\"{}\"", p.name())).collect::<Vec<_>>().join(","),
         devices[0],
         devices[1],
         json_rows.join(","),

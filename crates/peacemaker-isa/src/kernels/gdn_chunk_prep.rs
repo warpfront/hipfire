@@ -30,7 +30,8 @@
 //!    select, minus the prescale correction).
 //!  * **gate** - `g = softplus(a + dt_bias[h]) * (-expf(a_log[h]))`; `beta = 1 / (1 + expf(-b))` with the full
 //!    division graph; the prefix is the Hillis-Steele scan `d = 1, 2, 4, 8, 16` over `pair = g0 + g1` through
-//!    `ds_bpermute_b32` (lane `l - d`, guard `l >= d`), `before = (pair - g0) - g1`, `a0 = g0 + before`,
+//!    `ds_bpermute_b32` (lane `l - d`, guard `l >= d`), `before` = the previous lane's inclusive value (one more
+//!    bpermute at lane `l - 1`, 0 on lane 0: causal, no dependence on later rows), `a0 = g0 + before`,
 //!    `a1 = g1 + a0`; out-of-range rows contribute `+0`.
 //!  * **conv + SiLU** - `y = fma(w0, win0, fma(w1, win1, fma(w3, cur, w2 * win2)))`, `out = y / (1 + expf(-y))`
 //!    (full division graph, one per channel).
@@ -1097,17 +1098,21 @@ fn gate_body(b: &mut Builder) -> R {
             &[v(PAIR), v(BEF), s(ge)],
         )?;
     }
-    vop(
-        b,
-        format!("v_sub_f32_e32 v{BEF}, v{PAIR}, v{G0}"),
-        &[BEF],
-        &[PAIR, G0],
+    // before = shfl_up(inclusive, 1), 0 on lane 0 (the incumbent's causal exclusive prefix: it
+    // depends only on the lanes below, so a partial tile's last row rounds as in the full tile).
+    b.ds_crosslane(
+        Instruction::new(
+            format!("ds_bpermute_b32 v{OTH}, v{GAD}, v{PAIR}"),
+            vec![v(OTH)],
+            vec![v(GAD), v(PAIR)],
+        )
+        .memory(MemoryClass::DsLoad),
     )?;
-    vop(
+    op(
         b,
-        format!("v_sub_f32_e32 v{BEF}, v{BEF}, v{G1}"),
-        &[BEF],
-        &[BEF, G1],
+        format!("v_cndmask_b32_e64 v{BEF}, 0, v{OTH}, s{GE}"),
+        &[v(BEF)],
+        &[v(OTH), s(GE)],
     )?;
     vop(
         b,

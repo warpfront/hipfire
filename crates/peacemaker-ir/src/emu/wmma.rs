@@ -786,10 +786,11 @@ mod tests {
             crate::isa::gfx1151()
         };
         let row = table.iter().find(|r| r.name == name).unwrap();
-        Inst::from_parts(
+        Inst::from_encoding(
             arch,
             row.op,
             row.form,
+            row.variant,
             FormFields::default(),
             ops.into_iter().collect(),
             mods,
