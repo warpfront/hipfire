@@ -39,15 +39,7 @@ sha2.workspace = true
 # CPU crate keeps a GPU-free dependency list.
 hipfire-cpu = { path = "../hipfire-cpu" }
 
-[[example]]
-name = "test_qwen35_load_multi"
-path = "examples/test_qwen35_load_multi.rs"
-required-features = ["deltanet"]
 
-[[example]]
-name = "test_qwen35_state_multi"
-path = "examples/test_qwen35_state_multi.rs"
-required-features = ["deltanet"]
 
 [[example]]
 # CPU-only: builds/checks the committed MTP draft-vocab subset (src/draft_vocab.rs).
