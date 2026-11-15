@@ -35,6 +35,14 @@ git show <sha>:<path> > <path>
 | `ds4_parent_moe_smoke` | `crates/hipfire-ds4-parent/examples/ds4_parent_moe_smoke.rs` | `bf6ec9ddf240` | 337 | Gate 4 parent-MoE smoke: load one real layer with experts and run parent_moe_forward over 16 rows of plausible activations. |
 | `ds4_parent_seq_plog` | `crates/hipfire-ds4-parent/examples/ds4_parent_seq_plog.rs` | `bf6ec9ddf240` | 108 | Sequential parent forward (token-by-token) for long-seq diagnostics. |
 
+## hipfire-quantize
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `mq35_vq_fit` | `crates/hipfire-quantize/examples/mq35_vq_fit.rs` | `3243261ea933` | 494 | MQ3.5GL VQ fit & evaluation on real post-FWHT weights. |
+| `mq_family_mse` | `crates/hipfire-quantize/examples/mq_family_mse.rs` | `3243261ea933` | 941 | MQ family MSE harness — rotated-domain quality vs bpw. |
+| `poly_fit` | `crates/hipfire-quantize/examples/poly_fit.rs` | `3243261ea933` | 513 | Polynomial codebook fit on real post-FWHT weights. |
+
 ## hipfire-runtime
 
 | Example | Path | Last commit | LOC | Purpose |

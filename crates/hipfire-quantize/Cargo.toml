@@ -62,22 +62,13 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 name = "deepseek4_dequant_check"
 required-features = ["lab"]
 
-[[example]]
-name = "mq35_vq_fit"
-required-features = ["lab"]
 
 [[example]]
 name = "mq_composable_bench"
 required-features = ["lab"]
 
-[[example]]
-name = "mq_family_mse"
-required-features = ["lab"]
 
 [[example]]
 name = "mq_kld_proxy"
 required-features = ["lab"]
 
-[[example]]
-name = "poly_fit"
-required-features = ["lab"]
