@@ -2159,7 +2159,7 @@ const LANE_CARRY_FIELDS: [ScratchField; 10] = [
 
 /// Rows a lane step's carry buffers cover at most (`WIDE_VERIFY_MAX_ROWS`); a
 /// wider step (a prefill wave) keeps its mixers whole instead.
-const LANE_CARRY_MAX_ROWS: usize = 64;
+const LANE_CARRY_MAX_ROWS: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
 
 /// Logical row width of a [`LANE_CARRY_FIELDS`] member, as [`SegViews::new`]
 /// views it.
