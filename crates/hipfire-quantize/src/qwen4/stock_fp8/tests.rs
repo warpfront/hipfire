@@ -1018,7 +1018,57 @@ fn p5_refusals_leave_no_output_and_name_the_cause() {
 
 #[test]
 fn p6_written_sidecar_rebinds_and_a_flipped_payload_byte_is_named() {
-    let (fixture, pin) = ar_fixture();
+    // The loader's bind admits the base's config through the strict nested
+    // runtime envelope and derives the expected entries from it, so this base
+    // carries the headed stock config (the 31-entry production head) instead
+    // of the producer tests' two-key stub.
+    let fixture = Fixture::new();
+    let layers: Vec<&str> = (0..48)
+        .map(|idx| {
+            if idx % 4 == 3 {
+                "full_attention"
+            } else {
+                "linear_attention"
+            }
+        })
+        .collect();
+    let mut text = json!({
+        "model_type": "qwen4_exp_text", "dtype": "bfloat16",
+        "hidden_size": 2560, "vocab_size": 248320, "num_hidden_layers": 48,
+        "max_position_embeddings": 262144, "num_attention_heads": 24,
+        "num_key_value_heads": 2, "head_dim": 256, "partial_rotary_factor": 0.25,
+        "rope_parameters": {"rope_theta": 10000000.0}, "attention_bias": false,
+        "layer_types": layers, "full_attention_interval": 4,
+        "linear_num_key_heads": 16, "linear_num_value_heads": 48,
+        "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4, "mamba_ssm_dtype": "float32",
+        "indexer_n_heads": 4, "indexer_kv_heads": 1, "indexer_head_dim": 128,
+        "indexer_budget": 2048, "indexer_compress_ratio": 4
+    });
+    let rest = json!({
+        "num_experts": 512, "num_experts_per_tok": 10,
+        "moe_intermediate_size": 640, "shared_expert_intermediate_size": 640,
+        "hc_count": 4, "hc_lowrank": 320, "ple_layer_ids": [2],
+        "ple_conv_kernel_size": 4, "ple_embed_dim": 2560,
+        "split_ngram_parts": 128, "heads_per_ngram": 8, "ngram_size": 3,
+        "ngram_vocab_size_base": 20000000, "make_ngram_vocab_size_divisible_by": 128,
+        "eos_token_id": 248044, "tie_word_embeddings": false,
+        "mtp_num_hidden_layers": 1, "mtp_use_dedicated_embeddings": false,
+        "output_gate_type": "sigmoid",
+        "mtp": {"hybrid": true, "layer_types": ["full_attention"],
+                "num_hidden_layers": 1, "rope_theta": 10000000.0}
+    });
+    text.as_object_mut()
+        .unwrap()
+        .extend(rest.as_object().unwrap().clone());
+    let config = json!({
+        "model_type": "qwen4_exp",
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "text_config": text
+    });
+    fs::write(fixture.src.path().join("config.json"), config.to_string()).unwrap();
+    let pin = fixture.write_manifest(None);
+    fixture.compact(Some(&pin)).unwrap();
     let wrong = sha_hex(b"not the base");
     assert!(mtp_run(
         &fixture,
