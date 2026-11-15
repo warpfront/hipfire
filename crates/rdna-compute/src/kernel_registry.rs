@@ -3887,6 +3887,21 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_mq4g256v2_moe_grouped_top10_g32_r4_nodz",
             ]
         );
+        // Flash-Next routed MoE down (`MoeDownKernel::O8R16`) with dead stores
+        // skipped (exact gfx1201): the launcher builds this module from the
+        // o8_r16 source with the HF_NODZ prefix (`moe.rs`, `source_nodz`); the
+        // source here must be byte-identical to that string.
+        entries.push(entry(
+            arch,
+            "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151_nodz",
+            &["gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151_nodz"],
+            format!(
+                "#define HF_NODZ 1\n#define gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151 gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151_nodz\n{}",
+                kernels::GEMM_MQ4G128V2_MOE_GROUPED_TOP10_O8_R16_GFX1151_SRC
+            )
+            .into(),
+            extra_flags,
+        ));
         // Default >= 512-row prefill: BF16 -> F16 WMMA projections (HC
         // input_mix_down 160 x 80 split-K tile + reducer, router/shared 128 x
         // 128, wider projections 128 x 256), the HC read-up tile, and the
@@ -12198,11 +12213,12 @@ mod tests {
         // gfx1201 Flash-Next default-route modules a cold empty-cache run
         // JIT-compiled after the pack: lane WMMA, prefill tile, MQ6 symmetric
         // check and wide-pass gate/up.
-        const PACK_FIX_ADDED_MODULES: [&str; 4] = [
+        const PACK_FIX_ADDED_MODULES: [&str; 5] = [
             "qwen4_lane_wmma",
             "qwen4_lwmma_tile",
             "qwen4_mq6_sym_check_gfx1201",
             "gemm_mq4g256v2_moe_grouped_top10_g32",
+            "gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151_nodz",
         ];
         for module in PACK_FIX_ADDED_MODULES {
             assert!(

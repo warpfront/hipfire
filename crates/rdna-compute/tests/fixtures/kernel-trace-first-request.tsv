@@ -84,3 +84,6 @@ gfx1201	qwen4_mq6_sym_check_gfx1201	qwen4_mq6_sym_check_gfx1201
 # 0.4.7 candidate): the gfx1201 lane WMMA GEMMs and prefill tile hipcc-compiled.
 gfx1201	qwen4_lane_wmma	lwmma_gemm_bf16_t2_m2_n1
 gfx1201	qwen4_lwmma_tile	lwmma_tile_bf16_t2_b32x64w2x2
+# 0.4.7 candidate lane cold-archive-flashnext (gfx1201, ~150-token prompt): the dead-store-skipping
+# routed MoE down module hipcc-compiled after ready.
+gfx1201	gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151_nodz	gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151_nodz

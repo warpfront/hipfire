@@ -32,7 +32,7 @@
 ### Fixes: Flash-Next on gfx1201
 
 - **Fixed: Flash-Next expert parallelism (EP2 on two R9700) no longer aborts the load with `thread 'hipfire-qwen4-ep-rank1' has overflowed its stack`.** Peer ranks ran on 2 MiB worker threads while rank 0 runs on the 8 MiB main thread; the official 0.4.6 binaries (rustc 1.99.1) overflowed the peer rank in every EP2 load. Every rank worker now gets an 8 MiB stack, so the `RUST_MIN_STACK=8388608` workaround is no longer needed. (new fix; also proposed for beta)
-- **Fixed (kernel packs): a cold `hipfire run` of Flash-Next on gfx1201 no longer hipcc-compiles kernels the prebuilt pack lacked: the A8-trunk MQ6 symmetric-grid check during load (`qwen4_mq6_sym_check_gfx1201`), and after ready the lane WMMA GEMMs and prefill tiles (`qwen4_lane_wmma`, `qwen4_lwmma_tile`) and the wide-pass gate/up (`gemm_mq4g256v2_moe_grouped_top10_g32`) (the gfx1201 Flash-Next part of beta 7cec18dd79).**
+- **Fixed (kernel packs): a cold `hipfire run` of Flash-Next on gfx1201 no longer hipcc-compiles kernels the prebuilt pack lacked: the A8-trunk MQ6 symmetric-grid check during load (`qwen4_mq6_sym_check_gfx1201`), and after ready the lane WMMA GEMMs and prefill tiles (`qwen4_lane_wmma`, `qwen4_lwmma_tile`) the wide-pass gate/up (`gemm_mq4g256v2_moe_grouped_top10_g32`) (the gfx1201 Flash-Next part of beta 7cec18dd79) and the dead-store-skipping routed MoE down (`gemm_mq4g128v2_moe_grouped_top10_o8_r16_gfx1151_nodz`, new: v0.4.6 and beta do not pack it).**
 
 ### Fixes: native Windows
 
