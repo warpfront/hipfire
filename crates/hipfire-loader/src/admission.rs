@@ -56,16 +56,6 @@ impl KvBackendRequest {
     }
 }
 
-/// The sampled per-load switch only changes implicit Qwen defaults.
-pub fn qwen_default_q8_enabled() -> bool {
-    !matches!(
-        hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8")
-            .ok()
-            .as_deref(),
-        Some("0")
-    )
-}
-
 /// Effective Qwen3.5 V axis: a typed `kv_v` wins, else developer
 /// `HIPFIRE_KV_V` (empty / `q8` = neutral). Resolved once in admission so
 /// VMM sizing and the carrier load see the same pair. The env fallback only

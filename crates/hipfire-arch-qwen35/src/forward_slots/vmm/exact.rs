@@ -99,46 +99,13 @@ pub(super) fn supports(
     Ok(())
 }
 
-/// `HIPFIRE_A3B_VMM_BATCH` kill switch (developer, read once per process): on
-/// unless `0`; `0` refuses MoE layers on the exact route again, so A3B serves
-/// through the previous (sequential singleton / multi-slot) route.
-fn a3b_vmm_batch_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_A3B_VMM_BATCH").as_deref() != Ok("0")
-    });
-    *ENABLED
-}
-
-/// `HIPFIRE_A3B_LANE_HEAD` kill switch (developer, read once per process): on
-/// unless `0`; `0` keeps the previous head of the exact batch route (per-row
-/// norm + rotate, then the PM multi-column lm_head per run of consecutive
-/// slots).
-fn a3b_lane_head_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_A3B_LANE_HEAD").as_deref() != Ok("0")
-    });
-    *ENABLED
-}
-
-/// `HIPFIRE_A3B_LANE_PROJ` kill switch (developer, read once per process): on
-/// unless `0`; `0` runs the A3B projection groups (DeltaNet QKVZA, FullAttention
-/// QKV, the MoE router / selector / shared gate / shared up quartet) as one
-/// `pm_xbatch` launch per weight again instead of one lane-batched
-/// multi-weight launch per group.
-fn a3b_lane_proj_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_A3B_LANE_PROJ").as_deref() != Ok("0")
-    });
-    *ENABLED
-}
-
 /// One lane-batched multi-weight launch per run of consecutive rows for the
 /// projection group `ws` (`(weight, [n][m] output)`, all reading `x_rot`
 /// `[n][k]`): per row the singleton's `fused_qkvza_mq4g256v2` /
 /// `fused_qkv_mq4g256v2` bytes (`Gpu::gemv_mq4g256v2_lane_proj`). `false`
-/// (nothing launched) when the group is not admitted: switch off, a weight that
-/// is not plain MQ4G256V2 (AWQ, other codecs), K != 2048, or a
-/// non-gfx1201 device; the caller then runs the `pm_xbatch` loop.
+/// (nothing launched) when the group is not admitted: a weight that is not
+/// plain MQ4G256V2 (AWQ, other codecs), K != 2048, or a non-gfx1201 device;
+/// the caller then runs the `pm_xbatch` loop.
 fn lane_proj_group(
     gpu: &mut Gpu,
     x_rot: &GpuTensor,
@@ -146,7 +113,7 @@ fn lane_proj_group(
     n: usize,
 ) -> HipResult<bool> {
     use rdna_compute::lane_proj::LaneProjSegment;
-    if !a3b_lane_proj_enabled() || ws.is_empty() {
+    if ws.is_empty() {
         return Ok(false);
     }
     let plain = ws
@@ -193,8 +160,7 @@ fn a3b_moe_layer_admitted(
     let v2 = |w: &WeightTensor| {
         w.gpu_dtype == DType::MQ4G256V2 && w.awq_scale.is_none() && !gpu.host_located(&w.buf)
     };
-    a3b_vmm_batch_enabled()
-        && gpu.arch_caps.is_gfx1201()
+    gpu.arch_caps.is_gfx1201()
         && config.dim == 2048
         && config.num_experts == 256
         && config.num_experts_per_tok == 8
@@ -659,16 +625,6 @@ fn stage_residual_input(
     }
 }
 
-/// `HIPFIRE_A3B_LANE_WO` kill switch (developer, read once per process): on
-/// unless `0`; `0` keeps the A3B `wo` residual on the PM x-batch launch instead
-/// of the lane-batched residual GEMV (`Gpu::gemv_mq4g256v2_residual_lanes`).
-fn a3b_lane_wo_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_A3B_LANE_WO").as_deref() != Ok("0")
-    });
-    *ENABLED
-}
-
 /// Batched residual projection `x_batch[r] += W · staged[r]` for every
 /// decode row: per column the singleton's `gemv_mq4g256v2_residual`. The A3B
 /// MoE layers' `wo` (MQ4G256V2, no AWQ) runs the lane-batched kernel
@@ -689,8 +645,7 @@ fn batched_residual(
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
         )
         && w.gpu_dtype == DType::MQ4G256V2
-        && w.awq_scale.is_none()
-        && a3b_lane_wo_enabled();
+        && w.awq_scale.is_none();
     for (b0, nb) in xbatch_chunks(n) {
         let x = stage.sub_offset(b0 * w.k, nb * w.k);
         let y = x_batch.sub_offset(b0 * w.m, nb * w.m);
@@ -1420,8 +1375,7 @@ pub(super) fn decode(
     // keeps the singleton head.
     let out = &weights.output;
     let vocab = config.vocab_size;
-    let lane_head = a3b_lane_head_enabled()
-        && n >= 2
+    let lane_head = n >= 2
         && out.gpu_dtype == DType::MQ4G256V2
         && out.awq_scale.is_none()
         && out.m == vocab

@@ -2128,8 +2128,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["deinterleave_q_rmsnorm_f32_batched"]
         );
         // Exact-gfx1151 pure byte-copy DFlash/DeltaNet helpers; same module and
-        // symbol names, source and recipe as gfx1100/gfx1201 (HIPFIRE_DN_SNAPSHOT_BULK_OFF,
-        // HIPFIRE_HIDDEN_SCATTER_FUSE_OFF kill switches unchanged).
+        // symbol names, source and recipe as gfx1100/gfx1201
+        // (HIPFIRE_HIDDEN_SCATTER_FUSE_OFF kill switch unchanged).
         add!(
             "dflash_hidden_commit5_gfx1100",
             crate::dflash_hidden_scatter::DFLASH_HIDDEN_SCATTER_SRC,
@@ -4580,7 +4580,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201"]
         );
         // A3B VMM exact batch route: lane-batched multi-weight projection GEMV
-        // (`lane_proj.rs`, `HIPFIRE_A3B_LANE_PROJ`).
+        // (`lane_proj.rs`).
         add!(
             "gemv_mq4g256v2_lane_proj_k2048_gfx1201",
             kernels::GEMV_MQ4G256V2_LANE_PROJ_K2048_GFX1201_SRC,
