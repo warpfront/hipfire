@@ -301,8 +301,7 @@ impl Gpu {
     }
 
     /// Batched F32 GEMM for the bridge (`dspine_gemm_f32_batch_gfx1100`):
-    /// Y[n*M + m] = A[m, K] · B[n, K], 8 outputs per block, bit-identical
-    /// reduction to `gemm_f32_batched`.
+    /// Y[n*M + m] = A[m, K] · B[n, K], 16x16 outputs per block.
     pub fn dspine_gemm_f32_batch(
         &mut self,
         a: &GpuTensor,
@@ -319,8 +318,15 @@ impl Gpu {
                 "dspine bridge kernels are gfx1100-only in v1",
             ));
         }
-        const SYM: &str = "dspine_gemm_f32_batch_gfx1100";
-        self.ensure_kernel(SYM, DSPINE_SRC, SYM)?;
+        let use_legacy =
+            std::env::var_os("HIPFIRE_DSPINE_BRIDGE_OLD_GEMM").as_deref()
+                == Some(std::ffi::OsStr::new("1"));
+        let sym = if use_legacy {
+            "dspine_gemm_f32_batch_legacy_gfx1100"
+        } else {
+            "dspine_gemm_f32_batch_gfx1100"
+        };
+        self.ensure_kernel(sym, DSPINE_SRC, sym)?;
 
         let mut a_ptr = a.buf.as_ptr();
         let mut b_ptr = b_arg.buf.as_ptr();
@@ -344,8 +350,12 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            SYM,
-            [((m + 15) / 16) as u32, ((n + 3) / 4) as u32, 1],
+            sym,
+            [
+                ((m + 15) / 16) as u32,
+                if use_legacy { ((n + 3) / 4) as u32 } else { 1 },
+                1,
+            ],
             [512, 1, 1],
             0,
             &mut params,
@@ -384,8 +394,15 @@ impl Gpu {
                 "dspine bridge kernels are gfx1100-only in v1",
             ));
         }
-        const SYM: &str = "dspine_delta_finish_gfx1100";
-        self.ensure_kernel(SYM, DSPINE_SRC, SYM)?;
+        let use_legacy =
+            std::env::var_os("HIPFIRE_DSPINE_BRIDGE_OLD_GEMM").as_deref()
+                == Some(std::ffi::OsStr::new("1"));
+        let sym = if use_legacy {
+            "dspine_delta_finish_legacy_gfx1100"
+        } else {
+            "dspine_delta_finish_gfx1100"
+        };
+        self.ensure_kernel(sym, DSPINE_SRC, sym)?;
 
         let mut w_ptr = write_w.buf.as_ptr();
         let mut msg_ptr = message.buf.as_ptr();
@@ -413,8 +430,12 @@ impl Gpu {
             &mut t_val as *mut _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            SYM,
-            [((h + 15) / 16) as u32, ((n + 3) / 4) as u32, 1],
+            sym,
+            [
+                ((h + 15) / 16) as u32,
+                if use_legacy { ((n + 3) / 4) as u32 } else { 1 },
+                1,
+            ],
             [512, 1, 1],
             0,
             &mut params,
