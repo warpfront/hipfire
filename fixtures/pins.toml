@@ -36,7 +36,7 @@ sha256 = "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae"
 recipe = "H2, symmetric MQ4V2 XT (qt44) with per-group AWQ alpha and three GPTQ scale-refit rounds on the v5 Hessian"
 date = "2026-09-29"
 pinned_in = "dbc8275fe9"
-mirrored_in = ["registry/models.json", "registry/v1.json"]
+mirrored_in = ["registry/models.json", "registry/v1.json", "scripts/hw-gate/fixtures.json"]
 note = "qwen3.8-27b.mq4-xt has exactly the same size; only the digest tells them apart"
 
 [model."qwen3.8-27b.mq4-xts-qat-r7s200"]
