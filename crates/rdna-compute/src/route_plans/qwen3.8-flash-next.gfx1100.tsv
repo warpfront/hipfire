@@ -18,6 +18,7 @@
 # walk ar 3-depth_32768 daemon_sha256=450defeda44b9fc8 model=/home/kaden/qcal/release-0.4.3/xtx-fn-offload/models/mq4/qwen3.8-flash-next.mq4-xts requests=2 env={"HIPFIRE_DPM_WARMUP_SECS": "10", "HIPFIRE_EMIT_TOKEN_IDS": "1", "HIPFIRE_KV_MODE": "q8", "HIPFIRE_LOG": "info,hipfire_arch_qwen4::session_pair=debug,hipfire_arch_qwen4::slowlink_prefill=debug,hipfire_arch_qwen4::slowlink_admission=debug", "HIPFIRE_NO_REGISTRY_FETCH": "1", "HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_QWEN4_D2_DEFAULT": "0", "HIPFIRE_ROUTE_PLAN": "0", "HIPFIRE_SESSION_CACHE_BYTES": "0", "HIPFIRE_STATE_QUANT": "q8"} direct_loads=0
 # walk native_mtp mtp daemon_sha256=c31d7877b7893b0c model=/home/kaden/qcal/release-0.4.3/xtx-fn-offload/models/mq4/qwen3.8-flash-next.mq4-xts requests=38 env={"HIPFIRE_KV_MODE": "q8", "HIPFIRE_NO_REGISTRY_FETCH": "1", "HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_QWEN4_D2_DEFAULT": "0", "HIPFIRE_ROUTE_PLAN": "0", "HIPFIRE_STATE_QUANT": "q8"} direct_loads=0
 # walk native_mtp 4-depth_8192-mtp daemon_sha256=450defeda44b9fc8 model=/home/kaden/qcal/release-0.4.3/xtx-fn-offload/models/mq4/qwen3.8-flash-next.mq4-xts requests=2 env={"HIPFIRE_DPM_WARMUP_SECS": "10", "HIPFIRE_EMIT_TOKEN_IDS": "1", "HIPFIRE_KV_MODE": "q8", "HIPFIRE_LOG": "info,hipfire_arch_qwen4::session_pair=debug,hipfire_arch_qwen4::slowlink_prefill=debug,hipfire_arch_qwen4::slowlink_admission=debug", "HIPFIRE_NO_REGISTRY_FETCH": "1", "HIPFIRE_PLE_FORMAT": "q4", "HIPFIRE_QWEN4_D2_DEFAULT": "0", "HIPFIRE_ROUTE_PLAN": "0", "HIPFIRE_SESSION_CACHE_BYTES": "0", "HIPFIRE_STATE_QUANT": "q8"} direct_loads=0
+# re-pin (perf/gfx1201-bf16-gemv-row-body): kernels/src/qwen4_gemv_bf16_xf32.hip's guard/comment admit gfx1201 (8a4b2c84… -> 32ebc3e1…).
 ar	hip	add	add_f32	b0561ebf265bfbf523e63f43f4d1544d1ceaf593f476438009635f15662121dd
 ar	hip	convert_f32_to_f16	convert_f32_to_f16	630c799ead88296f06798f9c12b2170eef37b92d1eb9fdf39a6837cf0bca94f4
 ar	hip	copy_f32_buffer	copy_f32_buffer	37f48e35951c52ae23d574eebf97a714594e27995099b4837ad30489d563c57d
@@ -57,7 +58,7 @@ ar	hip	qsa_decode_splitkv_q8	qsa_decode_splitkv_merge_f32,qsa_decode_splitkv_par
 ar	hip	qsa_filter_select	qsa_filter_compact,qsa_filter_finish,qsa_filter_threshold	99f0cdb2aa0313fef50a62a63175647b3eae559018abd254249e33f401a0bc4d
 ar	hip	qwen4_gemm_mqv2_wmma_gfx11_bt	gemm_mq6g256v2_wmma_gfx11_bt8_x4	a49cd9ca8bc32256d6f69e5d56b9606ca354c2a1bcb12627ad04e5518f211b8a
 ar	hip	qwen4_gemm_wmma_lds256	gemm_wmma_lds_64_64_32_64_k64_p,gemm_wmma_lds_80_32_80_16_k64_p	6fe7d75ec00cf96da61e423f3a9edbbe80639cc1a736d9019e5e60b96a00a23d
-ar	hip	qwen4_gemv_bf16_xf32	gemv_bf16_xf32_bf16_scaled_add,gemv_bf16_xf32_k4,gemv_bf16_xf32_x4,hyper_write_norm_f32	8a4b2c8402369979f8432599150ad24dbbfe337490d16aa893c516608ae6831b
+ar	hip	qwen4_gemv_bf16_xf32	gemv_bf16_xf32_bf16_scaled_add,gemv_bf16_xf32_k4,gemv_bf16_xf32_x4,hyper_write_norm_f32	32ebc3e174097daa95973d5b76c2cc063d1177ea0ac92ba26b428a30e44b42b7
 ar	hip	qwen4_gemv_mq4g256	hyper_read_projected_rotate_f32,mq_rotate_x_f16	1fbb17ecfab27b67e9cec914af95dbf09993b5f096b69b8dc0e08912dd149e2e
 ar	hip	qwen4_gemv_mq6g256v2	gemv_mq6g256v2_x4	7f1d4a49e921e57b21d3d669d517742c039e18c5fbdcaa771834ec9a1def28bc
 ar	hip	qwen4_hc_streams_init_from_embed_batched	hc_streams_init_from_embed_batched_bf16	787acbd1a749e1fc28687fbcf31633eeb55da3b85c442e74f139199971744f39
@@ -112,7 +113,7 @@ native_mtp	hip	qsa_decode_splitkv_q8	qsa_decode_splitkv_merge_f32,qsa_decode_spl
 native_mtp	hip	qsa_filter_select	qsa_filter_compact,qsa_filter_finish,qsa_filter_threshold	99f0cdb2aa0313fef50a62a63175647b3eae559018abd254249e33f401a0bc4d
 native_mtp	hip	qwen4_gemm_mqv2_wmma_gfx11_bt	gemm_mq6g256v2_wmma_gfx11_bt8_x4	a49cd9ca8bc32256d6f69e5d56b9606ca354c2a1bcb12627ad04e5518f211b8a
 native_mtp	hip	qwen4_gemm_wmma_lds256	gemm_wmma_lds_64_64_32_64_k64_p,gemm_wmma_lds_80_32_80_16_k64_p	6fe7d75ec00cf96da61e423f3a9edbbe80639cc1a736d9019e5e60b96a00a23d
-native_mtp	hip	qwen4_gemv_bf16_xf32	gemv_bf16_xf32_bf16_scaled_add,gemv_bf16_xf32_k4,gemv_bf16_xf32_k4_rows_r2,gemv_bf16_xf32_k4_rows_r3,gemv_bf16_xf32_k4_rows_r4,gemv_bf16_xf32_x4,gemv_bf16_xf32_x4_rows_r2,gemv_bf16_xf32_x4_rows_r3,gemv_bf16_xf32_x4_rows_r4,hyper_write_norm_f32	8a4b2c8402369979f8432599150ad24dbbfe337490d16aa893c516608ae6831b
+native_mtp	hip	qwen4_gemv_bf16_xf32	gemv_bf16_xf32_bf16_scaled_add,gemv_bf16_xf32_k4,gemv_bf16_xf32_k4_rows_r2,gemv_bf16_xf32_k4_rows_r3,gemv_bf16_xf32_k4_rows_r4,gemv_bf16_xf32_x4,gemv_bf16_xf32_x4_rows_r2,gemv_bf16_xf32_x4_rows_r3,gemv_bf16_xf32_x4_rows_r4,hyper_write_norm_f32	32ebc3e174097daa95973d5b76c2cc063d1177ea0ac92ba26b428a30e44b42b7
 native_mtp	hip	qwen4_gemv_mq4g256	hyper_read_projected_rotate_f32,mq_rotate_x_f16	1fbb17ecfab27b67e9cec914af95dbf09993b5f096b69b8dc0e08912dd149e2e
 native_mtp	hip	qwen4_gemv_mq6g256v2	gemv_mq6g256v2_x4	7f1d4a49e921e57b21d3d669d517742c039e18c5fbdcaa771834ec9a1def28bc
 native_mtp	hip	qwen4_gemv_q8_0	topk8_partial_f32	85e67d2af6d072fa3ba985960d7120402fd884a63754c4eb79c5f1889122db41
