@@ -579,6 +579,7 @@ fn mock_runtime() -> HipRuntime {
         own_vmm_handles: Default::default(),
         slabs: Default::default(),
         stream_wait_caps: std::array::from_fn(|_| AtomicU8::new(0)),
+        plan: Default::default(),
         kernel_timing_control: std::sync::OnceLock::new(),
     }
 }
