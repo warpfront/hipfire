@@ -32,6 +32,10 @@ run python3 scripts/check-changelog.py
 run python3 scripts/check-conflict-markers.py
 run python3 scripts/check-selector-receipts.py
 run python3 scripts/check-env-docs.py
+# Fixture and quality pins (fixtures/pins.toml): schema, provenance, prompt
+# md5s, mirrored digests, and every `pin:<kind>/<id>` citation resolves.
+run python3 scripts/check-pins.py --self-test
+run python3 scripts/check-pins.py
 run python3 scripts/check-lifecycle.py
 run python3 scripts/check-mtp-parity-ratchet.py --self-test
 run python3 scripts/check-mtp-parity-ratchet.py fixture
