@@ -745,7 +745,7 @@ __global__ void dspine_prepare_read_snap_gfx1100(
 // lane-strided accumulation and shuffle tree, so values stay bit-identical.
 extern "C" __launch_bounds__(512, 2)
 __global__ void dspine_gemm_f32_batch_gfx1100(
-    const float* __restrict__ A,
+    const unsigned short* __restrict__ A,  // [M,K] bf16 raw, widened exactly
     const float* __restrict__ B,
     float* __restrict__ Y,
     long long M,
@@ -758,7 +758,7 @@ __global__ void dspine_gemm_f32_batch_gfx1100(
     const int n_group = wave >> 2;
     const long long m0 = (long long)blockIdx.x * 16 + (long long)m_group * 4;
     const int n0 = blockIdx.y * 8 + n_group * 2;
-    const float* a[4] = {
+    const unsigned short* a[4] = {
         A + m0 * K,
         A + (m0 + 1) * K,
         A + (m0 + 2) * K,
@@ -771,7 +771,7 @@ __global__ void dspine_gemm_f32_batch_gfx1100(
             b[j] = n0 + j < N ? B[(long long)(n0 + j) * K + k] : 0.0f;
         }
         for (int i = 0; i < 4; ++i) {
-            const float av = a[i][k];
+            const float av = dspine_bf16_to_f32_bits(a[i][k]);
             for (int j = 0; j < 2; ++j) {
                 acc[i][j] += av * b[j];
             }
@@ -799,7 +799,7 @@ __global__ void dspine_gemm_f32_batch_gfx1100(
 // ── delta GEMM + finish, 16x8 tile ──────────────────────────────────────
 extern "C" __launch_bounds__(512, 2)
 __global__ void dspine_delta_finish_gfx1100(
-    const float* __restrict__ write_w,
+    const unsigned short* __restrict__ write_w,  // [H,R] bf16 raw, widened exactly
     const float* __restrict__ message,
     float* __restrict__ x,
     const float* __restrict__ rms,
@@ -814,7 +814,7 @@ __global__ void dspine_delta_finish_gfx1100(
     const int n_group = wave >> 2;
     const long long m0 = (long long)blockIdx.x * 16 + (long long)m_group * 4;
     const int n0 = blockIdx.y * 8 + n_group * 2;
-    const float* w[4] = {
+    const unsigned short* w[4] = {
         write_w + m0 * R,
         write_w + (m0 + 1) * R,
         write_w + (m0 + 2) * R,
@@ -829,7 +829,7 @@ __global__ void dspine_delta_finish_gfx1100(
                          : 0.0f;
         }
         for (int i = 0; i < 4; ++i) {
-            const float weight = w[i][k];
+            const float weight = dspine_bf16_to_f32_bits(w[i][k]);
             for (int j = 0; j < 2; ++j) {
                 acc[i][j] += weight * msg[j];
             }

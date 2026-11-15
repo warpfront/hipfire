@@ -165,10 +165,12 @@ pub struct SerialTables {
 /// shared trunk loop splices a bridge write after every draft layer.
 ///
 /// Storage policy (semantics-map §3/§6): the codebook stays raw BF16 (a
-/// gather table, never a GEMM operand); every GEMM weight is lifted
-/// BF16→F32 at load (exact) and rides `gemm_f32_batched` in its natural
-/// [out, in] row-major layout — no host transposes. Activations are F32 end
-/// to end in the bridge; the kernels mirror `cpu_oracle` operation order.
+/// gather table, never a GEMM operand). The fused bridge GEMMs ride BF16
+/// twins of their weight operands (`*_b`, widened bit-exactly in-kernel,
+/// halving A traffic); the F32 lifts stay the legacy and exact-lattice
+/// operands. No host transposes: every GEMM weight is [out, in] row-major.
+/// Activations are F32 end to end in the bridge; the kernels mirror
+/// `cpu_oracle` operation order.
 pub struct DspineBridge {
     pub cfg: DspineConfig,
     h: usize,
@@ -180,6 +182,13 @@ pub struct DspineBridge {
     early_w: Vec<GpuTensor>, // 4 × [C, H] f32 (layers 0..3)
     write_w: Vec<GpuTensor>, // 5 × [H, R] f32
     packed_w: GpuTensor,    // [3R, C] f32 = gate ⊕ predecessor_gate ⊕ prev
+    // E3 bf16 twins for the fused bridge GEMMs (traffic halves; widening is
+    // exact so results stay bit-identical). The f32 fields above remain the
+    // legacy-path and exact-lattice operands.
+    read_w_b: GpuTensor,        // [C, H] bf16 raw
+    early_w_b: Vec<GpuTensor>,  // 4 × [C, H] bf16 raw
+    write_w_b: Vec<GpuTensor>,  // 5 × [H, R] bf16 raw
+    packed_w_b: GpuTensor,      // [3R, C] bf16 raw
     // Standalone predecessor/value projections for the refinement lattice
     // (the packed concat is consumed by the trunk bridge; the lattice reads
     // them row-wise per predecessor candidate).
@@ -329,6 +338,64 @@ impl DspineBridge {
             gpu.upload_f32(&f32_data, &[3 * r, c])
                 .map_err(|e| format!("dspine upload packed_w: {e}"))?
         };
+        // E3 twins: raw bf16 uploads of the same payloads for the fused GEMMs.
+        let read_w_b = {
+            let (meta, raw) = hfq
+                .tensor_data("selected_prefix_bridge.read_weight")
+                .ok_or("dspine tensor missing: selected_prefix_bridge.read_weight")?;
+            assert_eq!(meta.quant_type, 16);
+            assert_eq!(meta.shape, vec![c as u32, h as u32]);
+            gpu.upload_raw(raw, &[c * h])
+                .map_err(|e| format!("dspine upload read_w_b: {e}"))?
+        };
+        let mut early_w_b = Vec::with_capacity(4);
+        {
+            let (meta, raw) = hfq
+                .tensor_data("selected_prefix_bridge.early_read_weights")
+                .ok_or("dspine tensor missing: selected_prefix_bridge.early_read_weights")?;
+            assert_eq!(meta.quant_type, 16);
+            assert_eq!(meta.shape, vec![4u32, c as u32, h as u32]);
+            for i in 0..4usize {
+                let slice = &raw[i * c * h * 2..(i + 1) * c * h * 2];
+                early_w_b.push(
+                    gpu.upload_raw(slice, &[c * h])
+                        .map_err(|e| format!("dspine upload early_b[{i}]: {e}"))?,
+                );
+            }
+        }
+        let mut write_w_b = Vec::with_capacity(5);
+        {
+            let (meta, raw) = hfq
+                .tensor_data("selected_prefix_bridge.feature_write_weights")
+                .ok_or("dspine tensor missing: selected_prefix_bridge.feature_write_weights")?;
+            assert_eq!(meta.quant_type, 16);
+            assert_eq!(meta.shape, vec![5u32, h as u32, r as u32]);
+            for i in 0..5usize {
+                let slice = &raw[i * h * r * 2..(i + 1) * h * r * 2];
+                write_w_b.push(
+                    gpu.upload_raw(slice, &[h * r])
+                        .map_err(|e| format!("dspine upload write_b[{i}]: {e}"))?,
+                );
+            }
+        }
+        let packed_w_b = {
+            let names = [
+                "selected_prefix_bridge.gate.weight",
+                "selected_prefix_bridge.predecessor_gate.weight",
+                "selected_prefix_bridge.prev.weight",
+            ];
+            let mut raw_bytes = Vec::with_capacity(3 * r * c * 2);
+            for name in names {
+                let (meta, raw) = hfq
+                    .tensor_data(name)
+                    .ok_or_else(|| format!("dspine tensor missing: {name}"))?;
+                assert_eq!(meta.quant_type, 16);
+                assert_eq!(meta.shape, vec![r as u32, c as u32]);
+                raw_bytes.extend_from_slice(raw);
+            }
+            gpu.upload_raw(&raw_bytes, &[3 * r * c])
+                .map_err(|e| format!("dspine upload packed_w_b: {e}"))?
+        };
         let gate_bias = lift_bf16_tensor(
             gpu,
             hfq,
@@ -425,6 +492,10 @@ impl DspineBridge {
             early_w,
             write_w,
             packed_w,
+            read_w_b,
+            early_w_b,
+            write_w_b,
+            packed_w_b,
             pred_gate,
             prev_w,
             gate_bias,
@@ -850,6 +921,10 @@ impl DspineBridge {
             early_w,
             write_w,
             packed_w,
+            read_w_b,
+            early_w_b,
+            write_w_b,
+            packed_w_b,
             pred_gate,
             prev_w,
             gate_bias,
@@ -875,6 +950,14 @@ impl DspineBridge {
             let _ = gpu.free_tensor(t);
         }
         let _ = gpu.free_tensor(packed_w);
+        let _ = gpu.free_tensor(read_w_b);
+        for t in early_w_b {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in write_w_b {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = gpu.free_tensor(packed_w_b);
         let _ = gpu.free_tensor(pred_gate);
         let _ = gpu.free_tensor(prev_w);
         let _ = gpu.free_tensor(gate_bias);
@@ -943,6 +1026,12 @@ impl crate::dflash::DraftLayerBridge for DspineBridge {
         } else {
             &self.read_w
         };
+        // Fused path reads the bf16 twins; the legacy path keeps `w` (f32).
+        let w_b = if li < self.early_w_b.len() {
+            &self.early_w_b[li]
+        } else {
+            &self.read_w_b
+        };
         static FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let fused = *FUSED.get_or_init(|| {
             std::env::var_os("HIPFIRE_DSPINE_FUSED_BRIDGE").map_or(true, |v| v != "0")
@@ -972,7 +1061,7 @@ impl crate::dflash::DraftLayerBridge for DspineBridge {
                 gpu.hip.device_synchronize()?;
             }
             let tq = std::time::Instant::now();
-            gpu.dspine_gemm_f32_batch(w, &self.s_normed, &self.s_projected, c, h, b)?;
+            gpu.dspine_gemm_f32_batch(w_b, &self.s_normed, &self.s_projected, c, h, b)?;
             if diag {
                 gpu.hip.device_synchronize()?;
                 us[2] = tq.elapsed().as_micros();
@@ -998,7 +1087,7 @@ impl crate::dflash::DraftLayerBridge for DspineBridge {
                 gpu.hip.device_synchronize()?;
             }
             let tq = std::time::Instant::now();
-            gpu.dspine_gemm_f32_batch(&self.packed_w, &self.s_codes, &self.s_packed, 3 * r, c, b)?;
+            gpu.dspine_gemm_f32_batch(&self.packed_w_b, &self.s_codes, &self.s_packed, 3 * r, c, b)?;
             if diag {
                 gpu.hip.device_synchronize()?;
                 us[4] = tq.elapsed().as_micros();
@@ -1017,7 +1106,7 @@ impl crate::dflash::DraftLayerBridge for DspineBridge {
             }
             let tq = std::time::Instant::now();
             gpu.dspine_delta_finish(
-                &self.write_w[li],
+                &self.write_w_b[li],
                 &self.s_message,
                 &scratch.x,
                 &self.s_rms,
