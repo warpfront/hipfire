@@ -73,9 +73,6 @@ required-features = ["reference-parity"]
 name = "qwen4_wide_verify"
 required-features = ["reference-parity"]
 
-[[example]]
-name = "qwen4_rowtile_capture"
-required-features = ["reference-parity"]
 
 [[example]]
 name = "qwen4_legacy_mq4_rowtile_oracle"
@@ -186,9 +183,6 @@ required-features = ["lab"]
 name = "qwen4_gdn_in_probe"
 required-features = ["lab"]
 
-[[example]]
-name = "qwen4_cost_prompts"
-required-features = ["lab"]
 
 [[test]]
 name = "mtp_takeover_fill_hw"

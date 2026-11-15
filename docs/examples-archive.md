@@ -14,6 +14,13 @@ commit (the last commit that touched it) and re-add its `[[example]]` block
 git show <sha>:<path> > <path>
 ```
 
+## hipfire-arch-qwen4
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `qwen4_cost_prompts` | `crates/hipfire-arch-qwen4/examples/qwen4_cost_prompts.rs` | `4612a5d28322` | 606 | Offline cost-curve fixtures, generated from corpus messages, NOT byte-identical replicas of the 22-cell benchmark. |
+| `qwen4_rowtile_capture` | `crates/hipfire-arch-qwen4/examples/qwen4_rowtile_capture.rs` | `a26defedb9ab` | 1547 | Live eager rowtile operand producer (Flash-Next serve loader capture). |
+
 ## hipfire-ds4-parent
 
 | Example | Path | Last commit | LOC | Purpose |
