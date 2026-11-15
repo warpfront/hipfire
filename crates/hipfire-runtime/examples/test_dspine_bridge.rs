@@ -12,8 +12,6 @@
 
 use hipfire_runtime::dspine::cpu_oracle;
 use rdna_compute::{DType, Gpu};
-use std::io::Write;
-use std::process::Command;
 use std::time::Instant;
 
 /// Deterministic pseudo-random f32 in [-1, 1] (xorshift64 white noise; no
@@ -44,73 +42,7 @@ fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-fn bridge_gemm_ab_child() -> Result<(), String> {
-    const H: usize = 5120;
-    const R: usize = 512;
-    const N: usize = 16;
-    const M: usize = 1024;
-    let mut gpu = Gpu::init().map_err(|e| format!("GPU init failed: {e}"))?;
-    let a = prng(211, M * H);
-    let b = prng(223, N * H);
-    let write_w = prng(227, H * R);
-    let message = prng(229, N * R);
-    let x = prng(233, N * H);
-    let rms: Vec<f32> = prng(239, N).iter().map(|&v| v.abs() + 0.1).collect();
-
-    let a_t = gpu.upload_f32(&a, &[M, H]).map_err(|e| format!("{e}"))?;
-    let b_t = gpu.upload_f32(&b, &[N, H]).map_err(|e| format!("{e}"))?;
-    let y_t = gpu.alloc_tensor(&[N, M], DType::F32).map_err(|e| format!("{e}"))?;
-    let write_t = gpu.upload_f32(&write_w, &[H, R]).map_err(|e| format!("{e}"))?;
-    let message_t = gpu.upload_f32(&message, &[N, R]).map_err(|e| format!("{e}"))?;
-    let x_t = gpu.upload_f32(&x, &[N, H]).map_err(|e| format!("{e}"))?;
-    let rms_t = gpu.upload_f32(&rms, &[N]).map_err(|e| format!("{e}"))?;
-
-    gpu.dspine_gemm_f32_batch(&a_t, &b_t, &y_t, M, H, N)
-        .map_err(|e| format!("{e}"))?;
-    let y = gpu.download_f32(&y_t).map_err(|e| format!("{e}"))?;
-    gpu.dspine_delta_finish(&write_t, &message_t, &x_t, &rms_t, H, R, N, 16)
-        .map_err(|e| format!("{e}"))?;
-    let x = gpu.download_f32(&x_t).map_err(|e| format!("{e}"))?;
-
-    let mut output = Vec::with_capacity((y.len() + x.len()) * 4);
-    for value in y.iter().chain(&x) {
-        output.extend_from_slice(&value.to_le_bytes());
-    }
-    std::io::stdout()
-        .lock()
-        .write_all(&output)
-        .map_err(|e| format!("write comparison output: {e}"))?;
-    Ok(())
-}
-
-fn run_bridge_gemm_ab_child(use_legacy: bool) -> Result<Vec<u8>, String> {
-    let executable = std::env::current_exe().map_err(|e| format!("current executable: {e}"))?;
-    let mut command = Command::new(executable);
-    command.arg("--bridge-gemm-ab-child");
-    if use_legacy {
-        command.env("HIPFIRE_DSPINE_BRIDGE_OLD_GEMM", "1");
-    } else {
-        command.env_remove("HIPFIRE_DSPINE_BRIDGE_OLD_GEMM");
-    }
-    let output = command.output().map_err(|e| format!("run comparison child: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "comparison child failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(output.stdout)
-}
-
 fn main() {
-    if std::env::args().any(|arg| arg == "--bridge-gemm-ab-child") {
-        if let Err(e) = bridge_gemm_ab_child() {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
     let mut gpu = Gpu::init().expect("GPU init failed");
     eprintln!("GPU: {} ({:.1} GB VRAM)", gpu.arch, {
         let (_, total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
@@ -146,34 +78,6 @@ fn main() {
     const V: usize = 4096; // synthetic codebook rows (real one is 248320)
 
     eprintln!("\n--- DSpine bridge kernels (gfx1100) ---");
-    if std::env::args().any(|arg| arg == "--bridge-gemm-ab") {
-        test!("bridge GEMM new vs legacy bitwise", {
-            const N: usize = 16;
-            const M: usize = 1024;
-            const GEMM_BYTES: usize = N * M * std::mem::size_of::<f32>();
-            const DELTA_BYTES: usize = N * H * std::mem::size_of::<f32>();
-            const OUTPUT_BYTES: usize = GEMM_BYTES + DELTA_BYTES;
-            let old = run_bridge_gemm_ab_child(true)?;
-            let new = run_bridge_gemm_ab_child(false)?;
-            if old.len() < OUTPUT_BYTES || new.len() < OUTPUT_BYTES {
-                return Err("comparison child output is truncated".to_string());
-            }
-            let old = &old[old.len() - OUTPUT_BYTES..];
-            let new = &new[new.len() - OUTPUT_BYTES..];
-            let gemm_identical = old[..GEMM_BYTES] == new[..GEMM_BYTES];
-            let delta_identical = old[GEMM_BYTES..] == new[GEMM_BYTES..];
-            eprintln!(
-                "RESULT bridge_gemm_bitwise={} delta_finish_bitwise={}",
-                if gemm_identical { "identical" } else { "different" },
-                if delta_identical { "identical" } else { "different" },
-            );
-            if !gemm_identical || !delta_identical {
-                return Err("bridge GEMM or delta finish differs from legacy".to_string());
-            }
-            Ok::<(), String>(())
-        });
-    }
-
     test!("prepare_read: rms + normalized rows", {
         let m = T;
         let x = prng(42, m * H);
