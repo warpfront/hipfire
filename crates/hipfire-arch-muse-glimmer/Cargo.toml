@@ -42,6 +42,3 @@ serde_json.workspace = true
 name = "bench_lm_head"
 required-features = ["lab"]
 
-[[example]]
-name = "verify_batch_glimmer"
-required-features = ["lab"]

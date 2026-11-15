@@ -39,6 +39,12 @@ git show <sha>:<path> > <path>
 |---|---|---|---|---|
 | `qwen3_dspark_load_smoke` | `crates/hipfire-arch-llama/examples/qwen3_dspark_load_smoke.rs` | `3c16c169462a` | 136 | Load only the Qwen3-8B DSpark sidecar HFQ and verify every body layer and DSpark global tensor lands on the GPU. |
 
+## hipfire-arch-muse-glimmer
+
+| Example | Path | Last commit | LOC | Purpose |
+|---|---|---|---|---|
+| `verify_batch_glimmer` | `crates/hipfire-arch-muse-glimmer/examples/verify_batch_glimmer.rs` | `bf6ec9ddf240` | 122 | Batched verify parity harness for Muse Glimmer. |
+
 ## hipfire-arch-qwen35
 
 | Example | Path | Last commit | LOC | Purpose |
