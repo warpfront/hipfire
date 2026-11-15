@@ -16,7 +16,7 @@
  │    Setting                 Change                                    Closer to full model          Prompt speed                  Typing speed              │
  │[x] Prompt processing       Fast (4-bit math) → Accurate (fp8)        40% closer                    4,641 → 3,852 tok/s           unchanged                 │
  │      writes                kernel.iu4_prefill = false                WT2 KLD 0.0696 → 0.0419       pp8192 · 1.2× slower                                    │
- │      measured: AGENTS.md:639-642; CHANGELOG.md:1770 · cross-card: A4 on card C vs fp8 on card A, 300 W                                                     │
+ │      measured: fixtures/pins.toml; CHANGELOG.md:1770 · cross-card: A4 on card C vs fp8 on card A, 300 W                                                    │
  │[x] Flash-Next experts      Fast (4-bit) → Accurate (16-bit)          not measured here             not measured here             unchanged                 │
  │      writes                developer.qwen4_moe_sym_iu4 = false                                                                                             │
  │      measured: only Strix Halo measured                                                                                                                    │

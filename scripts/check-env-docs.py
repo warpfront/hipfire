@@ -10,7 +10,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs" / "env-vars.md"
-REFERENCE_DOCS = [ROOT / "AGENTS.md", ROOT / "README.md", ROOT / "CONTRIBUTING.md"]
+# docs/testing.md and docs/fixtures.md hold the playbook and fixture text
+# moved out of AGENTS.md; their HIPFIRE_* tokens stay covered.
+REFERENCE_DOCS = [
+    ROOT / "AGENTS.md",
+    ROOT / "README.md",
+    ROOT / "CONTRIBUTING.md",
+    ROOT / "docs" / "testing.md",
+    ROOT / "docs" / "fixtures.md",
+]
 DIRECT_ENV = re.compile(
     r'\b(?:std::)?env::var(?:_os)?\(\s*"(HIPFIRE_[A-Z0-9_]+)"\s*\)',
     re.MULTILINE,

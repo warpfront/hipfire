@@ -1,0 +1,789 @@
+# SPDX-License-Identifier: Apache-2.0
+# hipfire fixture and quality pins: the machine-checkable facts behind the
+# rules in AGENTS.md. Prose (what each fixture is, how a pin is reproduced,
+# caveats) lives in docs/fixtures.md; this file holds the values.
+#
+# Schema and rules: scripts/check-pins.py (run by scripts/ci-gates.sh).
+#   [<kind>."<id>"]  kind = model | draft | sidecar | reference | prompt | evaluator | kld
+#   status    current | previous | historical | retired
+#   date      YYYY-MM-DD the pin entered the repo (or the stated pin date)
+#   pinned_in commit that introduced the pin (git log -S on AGENTS.md)
+#   mirrored_in  files that carry a copy of the same digest; check-pins fails
+#                when a copy drifts (registry, compiled pins, gate JSON)
+# Cite a pin from docs or scripts as `pin:<kind>/<id>`; check-pins fails on a
+# citation of a pin that does not exist.
+#
+# Re-pin: edit the entry here in the same commit as the change that moves it,
+# with its evaluator (build commit + binary md5) and receipt path, and update
+# `kld/VERIFY.md` on the model's Hugging Face repo. Never edit a value without
+# a receipt; superseded current pins become `previous`, not deleted.
+
+schema = "hipfire.pins"
+version = 1
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+[model."qwen3.8-27b.mq4-xts"]
+status = "current"
+role = "canonical dense Qwen3.8-27B MQ4V2/DFlash acceptance, perf and quality trunk"
+hf_repo = "hipfire-models/qwen3.8-27b"
+file = "qwen3.8-27b.mq4-xts"
+registry_tag = "qwen3.8:27b-mq4-xts"
+size_bytes = 14987185152
+sha256 = "3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae"
+recipe = "H2, symmetric MQ4V2 XT (qt44) with per-group AWQ alpha and three GPTQ scale-refit rounds on the v5 Hessian"
+date = "2026-09-29"
+pinned_in = "dbc8275fe9"
+mirrored_in = ["registry/models.json", "registry/v1.json"]
+note = "qwen3.8-27b.mq4-xt has exactly the same size; only the digest tells them apart"
+
+[model."qwen3.8-27b.mq4-xts-qat-r7s200"]
+status = "retired"
+role = "2026-09-23 mq4-xts test upload (QAT r7s200); not comparable"
+hf_repo = "hipfire-models/qwen3.8-27b"
+file = "qwen3.8-27b.mq4-xts"
+size_bytes = 14987185152
+sha256 = "de8ee8256033c3690b0f1a2aff14e77cc88fff490e118648b04a833a3f2969b5"
+date = "2026-09-23"
+pinned_in = "dbc8275fe9"
+
+[model."qwen3.8-27b.mq4-xt"]
+status = "historical"
+role = "previous dense pin: asymmetric Qwen3.8-27B MQ4V2 XT, re-issued 2026-09-15 with AWQ sidecars"
+hf_repo = "hipfire-models/qwen3.8-27b"
+file = "qwen3.8-27b.mq4-xt"
+registry_tag = "qwen3.8:27b-mq4-xt"
+size_bytes = 14987185152
+sha256 = "80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3"
+date = "2026-09-15"
+pinned_in = "aa1456aa7e"
+mirrored_in = ["registry/v1.json", "crates/hipfire-registry/src/lib.rs"]
+
+[model."qwen3.8-27b.mq4-xt-no-awq"]
+status = "retired"
+role = "prior qwen3.8-27b.mq4-xt upload without AWQ sidecars (WT2 KLD 0.057 vs 0.048); discarded, not comparable"
+hf_repo = "hipfire-models/qwen3.8-27b"
+file = "qwen3.8-27b.mq4-xt"
+size_bytes = 14980361216
+sha256 = "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7"
+date = "2026-09-07"
+pinned_in = "7babf58ff1"
+mirrored_in = ["scripts/hw-gate/fixtures.json"]
+
+[model."qwen3.6-27b.mq4"]
+status = "retired"
+role = "dense pin before Qwen3.8-27B; retired in 0.5.0 (pull refuses it, replacement qwen3.8:27b; a verified local copy still loads)"
+hf_repo = "hipfire-models/qwen3.6-27b"
+file = "qwen3.6-27b.mq4"
+registry_tag = "qwen3.6:27b"
+size_bytes = 14984158208
+sha256 = "86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc"
+date = "2026-05-30"
+pinned_in = "1cafa19236"
+mirrored_in = ["crates/hipfire-registry/src/lib.rs"]
+
+[model."qwen3.6-35b-a3b.mq4-awq-mi300x"]
+status = "current"
+role = "Qwen3.6-35B-A3B MoE DFlash perf/profiling target"
+file = "qwen3.6-35b-a3b.mq4-awq-mi300x"
+md5 = "edde51ec1dac0f2bd42cff5ef1cb8944"
+date = "2026-05-30"
+pinned_in = "1cafa19236"
+
+[model."qwen3.8-flash-next-base.mq4-xts"]
+status = "current"
+role = "canonical Flash-Next trunk (MQ4 XTS split base; PLE rows are the shared sidecar rows)"
+hf_repo = "hipfire-models/qwen3.8-flash-next"
+file = "qwen3.8-flash-next-base.mq4-xts"
+registry_tag = "qwen3.8:flash-next-mq4-xts"
+aliases = ["qwen3.8:flash-next", "qwen3.8:flash-next-mq4", "qwen3.8:flash-next-gptq3", "qwen3.8:flash"]
+size_bytes = 70888270360
+sha256 = "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45"
+ple_source_rows = "18e2fef1"
+download_bytes_with_ple_q4 = 100008416792
+download_bytes_with_ple_q8 = 125288539672
+min_build = "cb566dab9"
+validated_on = "fe77c0837"
+date = "2026-10-16"
+pinned_in = "8dc6ed6ab9"
+mirrored_in = ["registry/v1.json", "crates/hipfire-registry/src/lib.rs", "tests/test_perf_config_receipt.py"]
+
+[model."qwen3.8-flash-next.mq4-xts"]
+status = "previous"
+role = "equivalent monolithic Flash-Next MQ4 XTS (the previous pin; grandfathered identity served from a verified local copy); base + shared q8 rows is byte-equivalent to it"
+hf_repo = "hipfire-models/qwen3.8-flash-next"
+file = "qwen3.8-flash-next.mq4-xts"
+aliases = ["qwen3.8-flash-next-gptq3.mq4"]
+size_bytes = 125288544792
+sha256 = "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972"
+md5 = "be007fc3219e9f6cdb1d4dfa8380625f"
+date = "2026-10-02"
+pinned_in = "0d7d4966d8"
+mirrored_in = ["crates/hipfire-registry/src/lib.rs", "crates/hipfire-runtime/src/verified_cache.rs", "tests/test_perf_config_receipt.py"]
+
+[model."qwen3.8-flash-next.mq4"]
+status = "retired"
+role = "RTN-asymmetric Flash-Next pin from 2026-09-28 to 2026-10-02 (still on HF; pull refuses the tag)"
+hf_repo = "hipfire-models/qwen3.8-flash-next"
+file = "qwen3.8-flash-next.mq4"
+registry_tag = "qwen3.8:flash-next-rtn-asym"
+size_bytes = 125288540696
+sha256 = "8aa01cf41bf2a90b319b9a1c70837baf51a2f92811af551f59b59d418518f650"
+md5 = "001878abd9b68218876ac0ae732e481b"
+sha256_before_qt54_retag = "cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6"
+date = "2026-09-28"
+pinned_in = "99053963be"
+mirrored_in = ["crates/hipfire-registry/src/lib.rs"]
+
+[model."qwen3.8-flash-next.mq6q8-pleq8"]
+status = "retired"
+role = "Flash-Next pin before the RTN-asymmetric one; differs from it only in its Q8F16 head (still on HF; pull refuses the tag)"
+hf_repo = "hipfire-models/qwen3.8-flash-next"
+file = "qwen3.8-flash-next.mq6q8-pleq8"
+registry_tag = "qwen3.8:flash-next-mq6q8-pleq8"
+size_bytes = 125467331096
+sha256 = "c0628b848077f02afed9ce5a4daa0598c379aa1d1e5ca0c0b24ddd04b49773a9"
+sha256_before_qt54_retag = "58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed"
+date = "2026-09-22"
+pinned_in = "822b48fb54"
+mirrored_in = ["crates/hipfire-registry/src/lib.rs"]
+
+[model."qwen3.8-flash-next.stock-fp8.hfq"]
+status = "current"
+role = "gfx942 (MI300X) Flash-Next stock FP8 quality-pin model"
+file = "qwen3.8-flash-next.stock-fp8.hfq"
+size_bytes = 181924966424
+sha256 = "650e7f43f9293110f1ab789c256f13a5043e8523da3f05834dcc681b5203c592"
+date = "2026-11-11"
+pinned_in = "cd97a8182a"
+
+# ---------------------------------------------------------------------------
+# DFlash drafts
+# ---------------------------------------------------------------------------
+
+[draft."qwen38-27b-dflash-mq4.hfq"]
+status = "current"
+role = "measured draft identity (acceptance/perf pin) paired with the canonical dense trunk: the registry sidecar, or a local copy of the registry draft (the same bytes)"
+pairs_with = "qwen3.8-27b.mq4-xts"
+file = "qwen38-27b-dflash-mq4.hfq"
+registry_tag = "qwen3.8:27b-draft"
+sha256 = "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc"
+date = "2026-09-07"
+pinned_in = "7babf58ff1"
+mirrored_in = ["registry/v1.json", "scripts/hw-gate/fixtures.json", "scripts/device-mesh/matrix.json"]
+
+[draft."qwen36-35b-a3b-dflash-mq4.hfq"]
+status = "current"
+role = "Qwen3.6-35B-A3B MoE DFlash draft"
+pairs_with = "qwen3.6-35b-a3b.mq4-awq-mi300x"
+file = "qwen36-35b-a3b-dflash-mq4.hfq"
+md5 = "8254bbe1ffe31edf2b38f3889d6325f1"
+date = "2026-05-30"
+pinned_in = "1cafa19236"
+
+[draft."qwen35-9b-dflash-mq4.hfq"]
+status = "historical"
+role = "registry-present smoke draft (decimal size)"
+hf_repo = "hipfire-models/qwen3.5-9b"
+file = "qwen35-9b-dflash-mq4.hfq"
+md5 = "590f35403cd7f1d634945233234a12b7"
+size_mb = 557
+date = "2026-04-25"
+pinned_in = "8b53bd9226"
+
+[draft."qwen35-27b-dflash-mq4.hfq"]
+status = "historical"
+role = "registry-present smoke draft (decimal size)"
+hf_repo = "hipfire-models/qwen3.5-27b"
+file = "qwen35-27b-dflash-mq4.hfq"
+md5 = "7b6df2a4ee1c8d933f0a52e187d1860b"
+size_mb = 919
+date = "2026-04-25"
+pinned_in = "8b53bd9226"
+
+# ---------------------------------------------------------------------------
+# Sidecars (Flash-Next shared PLE rows, overlays, hot sets)
+# ---------------------------------------------------------------------------
+
+[sidecar."qwen3.8-flash-next.ple-q4"]
+status = "current"
+role = "shared PLE rows, 4-bit Lloyd-Max, rank order (hipfire pull --ple auto fetches q4 on gfx1151)"
+binds_to = "qwen3.8-flash-next-base.mq4-xts"
+hf_repo = "hipfire-models/qwen3.8-flash-next"
+file = "qwen3.8-flash-next.ple-q4"
+size_bytes = 29120146432
+sha256 = "fc78d30b9d2376db2b713732e80de2069f1cd1d6e1e40b50c716927dcc18ee1e"
+date = "2026-10-16"
+pinned_in = "8dc6ed6ab9"
+mirrored_in = ["registry/v1.json", "crates/hipfire-registry/src/lib.rs"]
+
+[sidecar."qwen3.8-flash-next.ple-q8"]
+status = "current"
+role = "shared PLE rows, exact Q8F16 (hipfire pull --ple auto fetches q8 off gfx1151); byte-identical to the monolithic file's embedded rows"
+binds_to = "qwen3.8-flash-next-base.mq4-xts"
+hf_repo = "hipfire-models/qwen3.8-flash-next"
+file = "qwen3.8-flash-next.ple-q8"
+size_bytes = 54400269312
+sha256 = "a655edc25402d0dfbef276cb3c5ca57724fa1074976d8a9029371a3a52eca89c"
+date = "2026-10-16"
+pinned_in = "8dc6ed6ab9"
+mirrored_in = ["registry/v1.json", "crates/hipfire-registry/src/lib.rs"]
+
+[sidecar."qwen3.8-flash-next-base.mq4-xts.trunk-overlay"]
+status = "current"
+role = "trunk overlay re-bound to the split base"
+binds_to = "qwen3.8-flash-next-base.mq4-xts"
+file = "qwen3.8-flash-next-base.mq4-xts.trunk-overlay"
+sha256 = "e3e352ca7fdcb0890fb0c6ddc07903cbbd9ceab65ad24ed5af0637e7dd92e4a6"
+date = "2026-10-16"
+pinned_in = "8dc6ed6ab9"
+mirrored_in = ["crates/hipfire-registry/src/lib.rs"]
+
+[sidecar."qwen3.8-flash-next-base.mq4-xts.expert-hotset"]
+status = "current"
+role = "expert hot set re-bound to the split base"
+binds_to = "qwen3.8-flash-next-base.mq4-xts"
+file = "qwen3.8-flash-next-base.mq4-xts.expert-hotset"
+sha256 = "911430746607f0a15f388594302304d1ce0283f1787e3f3d6aa32005d0a067a1"
+date = "2026-10-16"
+pinned_in = "8dc6ed6ab9"
+mirrored_in = ["crates/hipfire-registry/src/lib.rs"]
+
+[sidecar."qwen3.8-flash-next.mq4-xts.trunk-overlay"]
+status = "previous"
+role = "monolith-bound trunk overlay; serves grandfathered monolithic installs (stays on HF)"
+binds_to = "qwen3.8-flash-next.mq4-xts"
+file = "qwen3.8-flash-next.mq4-xts.trunk-overlay"
+sha256 = "df49bc0aa601c2e26556261effd680f0be5d216804a1c5976a8a07ccd66840fd"
+date = "2026-10-16"
+pinned_in = "8dc6ed6ab9"
+mirrored_in = ["crates/hipfire-registry/src/lib.rs"]
+
+[sidecar."qwen3.8-flash-next.mq4-xts.expert-hotset"]
+status = "previous"
+role = "monolith-bound expert hot set; serves grandfathered monolithic installs (stays on HF)"
+binds_to = "qwen3.8-flash-next.mq4-xts"
+file = "qwen3.8-flash-next.mq4-xts.expert-hotset"
+sha256 = "7f6760e11a86e4ffe0b05c050ce64e6eb772ab748b6b11c8b2e6dbc566e57086"
+date = "2026-10-16"
+pinned_in = "8dc6ed6ab9"
+mirrored_in = ["crates/hipfire-registry/src/lib.rs"]
+
+# ---------------------------------------------------------------------------
+# KLD references
+# ---------------------------------------------------------------------------
+
+[reference."qwen3.8-27b.ref_wt2.bin"]
+status = "current"
+corpus = "WT2"
+file = "qwen3.8-27b.ref_wt2.bin"
+sha256 = "8c545178fb43647499c4c7bdd33178c24fd402615c641add9ed51a0c9a43234a"
+date = "2026-09-29"
+pinned_in = "dbc8275fe9"
+
+[reference."heldout-code24.gptqsym.kldref.bin"]
+status = "current"
+corpus = "code24"
+file = "heldout-code24.gptqsym.kldref.bin"
+sha256 = "43ab7591f2acf6b5b4058b77253109230d96591be02469ddef55235102ec7582"
+date = "2026-09-29"
+pinned_in = "dbc8275fe9"
+
+[reference."fn-bf16-wt2-24x2048.v3.kldref"]
+status = "current"
+corpus = "WT2"
+shape = "24 x 2048"
+teacher = "BF16"
+file = "fn-bf16-wt2-24x2048.v3.kldref"
+sha256 = "fafb91dc8d9636a49335ce8a89738a7ec9181f925914240debb8f0c9d56fd569"
+date = "2026-11-11"
+pinned_in = "cd97a8182a"
+
+[reference."fn-bf16-code24-24x512.v3.kldref"]
+status = "current"
+corpus = "code24"
+shape = "24 x 512"
+teacher = "BF16"
+file = "fn-bf16-code24-24x512.v3.kldref"
+sha256 = "0d6c6a8cf00062cfeafc4be206a44b3cb68622f9174fe852ff1d2bea99b1f28b"
+date = "2026-11-11"
+pinned_in = "cd97a8182a"
+
+# ---------------------------------------------------------------------------
+# Prompt fixtures (md5 verified against the committed file by check-pins)
+# ---------------------------------------------------------------------------
+
+[prompt."merge_sort_thinking_off"]
+status = "current"
+role = "A3B MoE DFlash perfmaxx prompt"
+path = "benchmarks/prompts/merge_sort_thinking_off.txt"
+md5 = "253c7ac50857fe6d0e10fb0d2c5e35c0"
+date = "2026-05-30"
+pinned_in = "1cafa19236"
+
+[prompt."humaneval_3_below_zero"]
+status = "current"
+role = "A3B MoE DFlash perfmaxx prompt"
+path = "benchmarks/prompts/humaneval_3_below_zero.txt"
+md5 = "37c5aad9f9efe93b5c47f27256bdf149"
+date = "2026-05-30"
+pinned_in = "1cafa19236"
+
+[prompt."lru_cache_pep8_strict"]
+status = "current"
+role = "code prompt of the 2026-09-23 Qwen4 MTP vs AR measurement"
+path = "benchmarks/prompts/lru_cache_pep8_strict.txt"
+md5 = "df5dedc8040ce70ba55080c4548e6024"
+date = "2026-09-23"
+pinned_in = "1f88748d9c"
+
+[prompt."prose_river_short"]
+status = "current"
+role = "prose prompt of the 2026-09-23 Qwen4 MTP vs AR measurement"
+path = "benchmarks/prompts/prose_river_short.txt"
+md5 = "07a7880965142971dbb3cc7493f8fb94"
+date = "2026-09-23"
+pinned_in = "1f88748d9c"
+
+# ---------------------------------------------------------------------------
+# Evaluator builds
+# ---------------------------------------------------------------------------
+
+[evaluator."eval_hipfire-40c52c783a-gfx1201"]
+status = "current"
+tool = "eval_hipfire"
+commit = "40c52c783a"
+branch = "canon-cand"
+binary_md5 = "8b9ac50188aa0052211ea562d90d6b9f"
+build_arch = ["gfx1201"]
+toolchain = "ROCm 10.1 / HIP 7.16 / clang 24 (lld 24, code object v6)"
+receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
+date = "2026-11-12"
+pinned_in = "947a59a8ac"
+
+[evaluator."eval_hipfire-40c52c783a-gfx11"]
+status = "current"
+tool = "eval_hipfire"
+commit = "40c52c783a"
+branch = "canon-cand"
+binary_md5 = "546b5f3a183b891b5a60fb5fccb36305"
+build_arch = ["gfx1100", "gfx1151"]
+toolchain = "ROCm 10.1 / HIP 7.16 / clang 24 (lld 24, code object v6)"
+receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
+date = "2026-11-12"
+pinned_in = "947a59a8ac"
+
+[evaluator."qwen4_kld-165cf0e962"]
+status = "current"
+tool = "qwen4_kld"
+commit = "165cf0e962"
+branch = "v0.4.6"
+binary_md5 = "bf9f63552f3c18aae0bb203eae6ed6ef"
+binary_sha256 = "0e7d566d41da9a5d8aa827c0b01a2e232fe6fcba9df3309c763819225cf4fd90"
+build_arch = ["gfx942"]
+toolchain = "ROCm 10.1 / HIP 7.16.26385 / clang 24"
+receipt = "/home/kaden/qcal/release-0.5.0/s0/PIN-GFX942.md"
+date = "2026-11-11"
+pinned_in = "cd97a8182a"
+
+[evaluator."qwen4_kld-8842531d0e"]
+status = "current"
+role = "candidate qwen4_kld that reproduces both gfx942 pinned sequences byte for byte (gfx942 rows unchanged by the canonical GDN re-pin)"
+tool = "qwen4_kld"
+commit = "8842531d0e"
+binary_md5 = "d7b5741db5590851c0362c22d0e75a0a"
+build_arch = ["gfx942"]
+receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
+date = "2026-11-12"
+pinned_in = "947a59a8ac"
+
+# ---------------------------------------------------------------------------
+# KLD pins: Qwen3.8-27B (eval_hipfire --scoring-mode prefill --max-chunks 24)
+# and Flash-Next gfx942 (qwen4_kld eval --decode). Method: docs/fixtures.md.
+# ---------------------------------------------------------------------------
+
+# Current: canonical GDN prefill re-pin (ROCm 10.1 / HIP 7.16 / clang 24).
+
+[kld."gfx1201.a4.wt2"]
+status = "current"
+arch = "gfx1201"
+route = "A4 (default)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "WT2"
+kld = 0.070184
+kldseq_sha256 = "b12344933a335f5e4228f0feef076c227e281b1ff41d87bcdb31571256b8ff6b"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+evaluator = "eval_hipfire-40c52c783a-gfx1201"
+receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
+date = "2026-11-12"
+pinned_in = "947a59a8ac"
+
+[kld."gfx1201.a4.code24"]
+status = "current"
+arch = "gfx1201"
+route = "A4 (default)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "code24"
+kld = 0.054421
+kldseq_sha256 = "c4515cbe74f89cf2fef3c1f0d26e3de0c39af8918b9f90cbbdad13cca25f11a3"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+evaluator = "eval_hipfire-40c52c783a-gfx1201"
+receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
+date = "2026-11-12"
+pinned_in = "947a59a8ac"
+
+[kld."gfx1201.fp8.wt2"]
+status = "current"
+arch = "gfx1201"
+route = "native fp8 (HIPFIRE_IU4_PREFILL=0)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "WT2"
+kld = 0.041267
+kldseq_sha256 = "6b5b901694794a04096dd060ce10f4f0787ce00117440a63d1bd5b932ea7ba39"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+evaluator = "eval_hipfire-40c52c783a-gfx1201"
+receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
+date = "2026-11-12"
+pinned_in = "947a59a8ac"
+
+[kld."gfx1201.fp8.code24"]
+status = "current"
+arch = "gfx1201"
+route = "native fp8 (HIPFIRE_IU4_PREFILL=0)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "code24"
+kld = 0.029258
+kldseq_sha256 = "a74aff5367db0b983c7d3c8352ac24f46e8eb7e5b76dd02c648a29e57c331129"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+evaluator = "eval_hipfire-40c52c783a-gfx1201"
+receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
+date = "2026-11-12"
+pinned_in = "947a59a8ac"
+
+[kld."gfx1100.a4.wt2"]
+status = "current"
+arch = "gfx1100"
+route = "A4 (default)"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "WT2"
+kld = 0.069955
+kldseq_sha256 = "bb80365b8a1ad14d8c8199f6726dfc27897b340f369ddaae46ccea99694c992d"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+evaluator = "eval_hipfire-40c52c783a-gfx11"
+receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
+date = "2026-11-12"
+pinned_in = "947a59a8ac"
+
+[kld."gfx1100.a4.code24"]
+status = "current"
+arch = "gfx1100"
+route = "A4 (default)"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "code24"
+kld = 0.054395
+kldseq_sha256 = "2eeae80fc7e7d94bc5c4be1d0c7008e32050e4c098f03702b0feef1bcd73dc50"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+evaluator = "eval_hipfire-40c52c783a-gfx11"
+receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
+date = "2026-11-12"
+pinned_in = "947a59a8ac"
+
+[kld."gfx1151.a4.wt2"]
+status = "current"
+arch = "gfx1151"
+route = "A4 (default), warm kernel cache"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "WT2"
+kld = 0.069955
+kldseq_sha256 = "6aa50d12c7256cb4de88feddafbfd7226ca2817d98154b57b3979ee65909cc68"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+evaluator = "eval_hipfire-40c52c783a-gfx11"
+receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
+date = "2026-11-12"
+pinned_in = "947a59a8ac"
+
+[kld."gfx1151.a4.code24"]
+status = "current"
+arch = "gfx1151"
+route = "A4 (default), warm kernel cache"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "code24"
+kld = 0.054395
+kldseq_sha256 = "d1e0004402e688109ef2c91cb06b0a26007700661a0fc288d960971e79e31131"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+evaluator = "eval_hipfire-40c52c783a-gfx11"
+receipt = "/home/kaden/qcal/release-0.5.0/reliability/chunkfix/runs-canon/G4/"
+date = "2026-11-12"
+pinned_in = "947a59a8ac"
+
+[kld."gfx942.fn-fp8.wt2"]
+status = "current"
+arch = "gfx942"
+route = "Flash-Next stock FP8 AR (default route, qwen4_kld eval --decode), BF16 teacher"
+kv_flags = ""
+corpus = "WT2"
+kld = 0.018734
+kldseq_sha256 = "d4b4d4adaa338cf4d738394b8fcaa2c481b2895d56753a4b35710c5d32d3be68"
+model = "qwen3.8-flash-next.stock-fp8.hfq"
+reference = "fn-bf16-wt2-24x2048.v3.kldref"
+evaluator = "qwen4_kld-165cf0e962"
+receipt = "/home/kaden/qcal/release-0.5.0/s0/PIN-GFX942.md"
+date = "2026-11-11"
+pinned_in = "cd97a8182a"
+
+[kld."gfx942.fn-fp8.code24"]
+status = "current"
+arch = "gfx942"
+route = "Flash-Next stock FP8 AR (default route, qwen4_kld eval --decode), BF16 teacher"
+kv_flags = ""
+corpus = "code24"
+kld = 0.023527
+kldseq_sha256 = "5255454e0c638d46443ceabd1b316a5daf28ecf387a8293def6c6da46019327f"
+model = "qwen3.8-flash-next.stock-fp8.hfq"
+reference = "fn-bf16-code24-24x512.v3.kldref"
+evaluator = "qwen4_kld-165cf0e962"
+receipt = "/home/kaden/qcal/release-0.5.0/s0/PIN-GFX942.md"
+control_env = "HIPFIRE_G942_TRUNK_GEMV=1"
+control_kld = 0.023089
+control_kldseq_sha256_prefix = "f3acb89b"
+date = "2026-11-11"
+pinned_in = "cd97a8182a"
+
+# Previous: pre-canonical RDNA pins (ROCm 10.1 / HIP 7.16), superseded by the
+# canonical GDN prefill re-pin of 2026-11-12.
+
+[kld."gfx1201.a4.wt2.pre-canonical"]
+status = "previous"
+arch = "gfx1201"
+route = "A4 (default)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "WT2"
+kld = 0.069571
+kldseq_sha256 = "ff88c49910be618a98a917afc40d4b01ceeb7c6299c62f1c553444c11b402841"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+toolchain = "ROCm 10.1 / HIP 7.16 / clang 24"
+date = "2026-10-08"
+pinned_in = "586c054017"
+
+[kld."gfx1201.a4.code24.pre-canonical"]
+status = "previous"
+arch = "gfx1201"
+route = "A4 (default)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "code24"
+kld = 0.052119
+kldseq_sha256 = "9b0616316f50e9a654690d06d594d57466430d0a4a67041ec4ff0128d830910e"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+toolchain = "ROCm 10.1 / HIP 7.16 / clang 24"
+date = "2026-10-08"
+pinned_in = "586c054017"
+
+[kld."gfx1201.fp8.wt2.pre-canonical"]
+status = "previous"
+arch = "gfx1201"
+route = "native fp8 (HIPFIRE_IU4_PREFILL=0)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "WT2"
+kld = 0.041859
+kldseq_sha256 = "a4f68b12cf777a99dfc8ac1f398f41ec96614da118e9071e02951ca80dc5b113"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+toolchain = "ROCm 10.1 / HIP 7.16 / clang 24"
+date = "2026-10-08"
+pinned_in = "586c054017"
+
+[kld."gfx1201.fp8.code24.pre-canonical"]
+status = "previous"
+arch = "gfx1201"
+route = "native fp8 (HIPFIRE_IU4_PREFILL=0)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "code24"
+kld = 0.029867
+kldseq_sha256 = "8373bc27da1fa88245b18bdb2ae90caebd275c06d1ecaf0dce1b9dc4855ca38e"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+toolchain = "ROCm 10.1 / HIP 7.16 / clang 24"
+date = "2026-10-08"
+pinned_in = "586c054017"
+
+[kld."gfx1100.a4.wt2.pre-canonical"]
+status = "previous"
+arch = "gfx1100"
+route = "A4 (default)"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "WT2"
+kld = 0.069312
+kldseq_sha256 = "3169b09310d7598852a6eaa1f32f41aa54b531737c4d4ddd29b8dc90f546e7b2"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+toolchain = "ROCm 10.1 / HIP 7.16 / clang 24"
+date = "2026-10-08"
+pinned_in = "586c054017"
+
+[kld."gfx1100.a4.code24.pre-canonical"]
+status = "previous"
+arch = "gfx1100"
+route = "A4 (default)"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "code24"
+kld = 0.052757
+kldseq_sha256 = "27d837f388f3294d645b825d1cff7d1b06d219595f4459e9efc3fc4af2f93311"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+toolchain = "ROCm 10.1 / HIP 7.16 / clang 24"
+date = "2026-10-08"
+pinned_in = "586c054017"
+
+[kld."gfx1151.a4.wt2.pre-canonical"]
+status = "previous"
+arch = "gfx1151"
+route = "A4 (default), warm kernel cache"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "WT2"
+kld = 0.070054
+kldseq_sha256 = "2355f76cfd730cae26cdad027b3de00aeb14b0af8bb666eef934680bd14ca225"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+toolchain = "ROCm 10.1 / HIP 7.16 / clang 24"
+date = "2026-10-08"
+pinned_in = "586c054017"
+
+[kld."gfx1151.a4.code24.pre-canonical"]
+status = "previous"
+arch = "gfx1151"
+route = "A4 (default), warm kernel cache"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "code24"
+kld = 0.050338
+kldseq_sha256 = "9caca85b4bf9c4049c921d85afc372ffcbb4698642313d5ce605eb1b2bb8feb0"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+toolchain = "ROCm 10.1 / HIP 7.16 / clang 24"
+date = "2026-10-08"
+pinned_in = "586c054017"
+
+# Historical: HIP 7.15 pins (same rows).
+
+[kld."gfx1201.a4.wt2.hip715"]
+status = "historical"
+arch = "gfx1201"
+route = "A4 (default)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "WT2"
+kld = 0.069571
+kldseq_sha256 = "483cfc58b4cc71ea3a9a71c657833e34aa847f513aceae50c1c0f0dfe65ae898"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+toolchain = "HIP 7.15"
+date = "2026-09-29"
+pinned_in = "dbc8275fe9"
+
+[kld."gfx1201.a4.code24.hip715"]
+status = "historical"
+arch = "gfx1201"
+route = "A4 (default)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "code24"
+kld = 0.052119
+kldseq_sha256 = "6339dc9e54bbd498774667cfe25c8405049d20c2c61e930ab7e783b662c5f13a"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+toolchain = "HIP 7.15"
+date = "2026-09-29"
+pinned_in = "dbc8275fe9"
+
+[kld."gfx1201.fp8.wt2.hip715"]
+status = "historical"
+arch = "gfx1201"
+route = "native fp8 (HIPFIRE_IU4_PREFILL=0)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "WT2"
+kld = 0.041859
+kldseq_sha256 = "19227d5fb08eb3bf10207eef6f5cc81addbb20befe90519a9692827d53c96508"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+toolchain = "HIP 7.15"
+date = "2026-09-29"
+pinned_in = "dbc8275fe9"
+
+[kld."gfx1201.fp8.code24.hip715"]
+status = "historical"
+arch = "gfx1201"
+route = "native fp8 (HIPFIRE_IU4_PREFILL=0)"
+kv_flags = "--kv-mode fp8 --kv-v q8"
+corpus = "code24"
+kld = 0.029867
+kldseq_sha256 = "5e7ac9dcd264a930e35b0bd627232bcecea11665ec669a8640cd014cfe22ba3a"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+toolchain = "HIP 7.15"
+date = "2026-09-29"
+pinned_in = "dbc8275fe9"
+
+[kld."gfx1100.a4.wt2.hip715"]
+status = "historical"
+arch = "gfx1100"
+route = "A4 (default)"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "WT2"
+kld = 0.068687
+kldseq_sha256 = "ccf95389f9dd5e45b3927c98bd8bafac93ae3922417e6730c280fd9e6dce6dcd"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+toolchain = "HIP 7.15"
+date = "2026-09-29"
+pinned_in = "dbc8275fe9"
+
+[kld."gfx1100.a4.code24.hip715"]
+status = "historical"
+arch = "gfx1100"
+route = "A4 (default)"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "code24"
+kld = 0.052666
+kldseq_sha256 = "a7eac2b4d06bfd96ead1889dcbaa0cf230dc32cfdc55a82ae73bccedbcbe532f"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+toolchain = "HIP 7.15"
+date = "2026-09-29"
+pinned_in = "dbc8275fe9"
+
+[kld."gfx1151.a4.wt2.hip715"]
+status = "historical"
+arch = "gfx1151"
+route = "A4 (default), warm kernel cache"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "WT2"
+kld = 0.068955
+kldseq_sha256 = "c1056943318f2abb667a149d73548e0087fb506724f48dfa14dc2e292d3bdff2"
+model = "qwen3.8-27b.mq4-xts"
+reference = "qwen3.8-27b.ref_wt2.bin"
+toolchain = "HIP 7.15"
+date = "2026-09-29"
+pinned_in = "dbc8275fe9"
+
+[kld."gfx1151.a4.code24.hip715"]
+status = "historical"
+arch = "gfx1151"
+route = "A4 (default), warm kernel cache"
+kv_flags = "--kv-mode q8 --kv-v q8"
+corpus = "code24"
+kld = 0.051358
+kldseq_sha256 = "04f06883e2a95306ebeead6d6bf256e8381128e4c115c6593b99c95f594fb308"
+model = "qwen3.8-27b.mq4-xts"
+reference = "heldout-code24.gptqsym.kldref.bin"
+toolchain = "HIP 7.15"
+date = "2026-09-29"
+pinned_in = "dbc8275fe9"

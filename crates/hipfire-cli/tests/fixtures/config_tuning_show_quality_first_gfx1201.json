@@ -35,7 +35,7 @@
         "slower": "1.2× slower",
         "typing": "unchanged",
         "caveat": "cross-card: A4 on card C vs fp8 on card A, 300 W",
-        "source": "AGENTS.md:639-642; CHANGELOG.md:1770"
+        "source": "fixtures/pins.toml; CHANGELOG.md:1770"
       }
     },
     {

@@ -48,8 +48,9 @@ hipfire run qwen3.5:4b "Explain WMMA in one paragraph."
 **Acceptance / validation fixture** (dense claims, DFlash, promotion-shaped
 reports): registry tag `qwen3.8:27b-mq4-xts` → on-disk
 `~/.hipfire/models/qwen3.8-27b.mq4-xts`, with measured draft
-`~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq` (see
-[`AGENTS.md`](../../../AGENTS.md) §5 pin). Do not treat a small-model smoke
+`~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq` (pins
+`pin:model/qwen3.8-27b.mq4-xts` and `pin:draft/qwen38-27b-dflash-mq4.hfq`;
+see [`docs/fixtures.md`](../../../docs/fixtures.md)). Do not treat a small-model smoke
 pass as acceptance evidence.
 
 ```bash

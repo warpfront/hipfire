@@ -41,6 +41,7 @@ import json
 import re
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -66,11 +67,12 @@ FLASH_NEXT_XTS_MONOLITHIC_FILES = (
     FLASH_NEXT_XTS_CANONICAL_FILE,
     FLASH_NEXT_XTS_LEGACY_FILE,
 )
-FLASH_NEXT_XTS_SPLIT_BASE_FILE = "qwen3.8-flash-next-base.mq4-xts"
-FLASH_NEXT_XTS_SPLIT_BASE_SHA256 = (
-    "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45"
-)
-FLASH_NEXT_XTS_SPLIT_BASE_SIZE = 70888270360
+# The split base identity is the fixture pin (fixtures/pins.toml).
+with open(Path(__file__).resolve().parents[1] / "fixtures" / "pins.toml", "rb") as _f:
+    _SPLIT_BASE_PIN = tomllib.load(_f)["model"]["qwen3.8-flash-next-base.mq4-xts"]
+FLASH_NEXT_XTS_SPLIT_BASE_FILE = _SPLIT_BASE_PIN["file"]
+FLASH_NEXT_XTS_SPLIT_BASE_SHA256 = _SPLIT_BASE_PIN["sha256"]
+FLASH_NEXT_XTS_SPLIT_BASE_SIZE = _SPLIT_BASE_PIN["size_bytes"]
 FLASH_NEXT_XTS_TAG = "qwen3.8:flash-next"
 FLASH_NEXT_XTS_ALIAS_TAGS = (
     "qwen3.8:flash",

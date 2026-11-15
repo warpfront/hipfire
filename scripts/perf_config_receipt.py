@@ -73,18 +73,25 @@ import os
 import re
 import sys
 import tempfile
+import tomllib
 
 SCHEMA_VERSION = 1
 RAW_CAP = 40  # raw lines kept per category (counts always cover every line)
 EXPECTED_OVERLAY_TENSORS = 108
 
-# Model layout identities (whole-file sha256 / byte size).
-SPLIT_BASE_NAME = "qwen3.8-flash-next-base.mq4-xts"
-SPLIT_BASE_SHA256 = "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45"
-SPLIT_BASE_BYTES = 70888270360
-MONOLITH_NAMES = ("qwen3.8-flash-next.mq4-xts", "qwen3.8-flash-next-gptq3.mq4")
-MONOLITH_SHA256 = "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972"
-MONOLITH_BYTES = 125288544792
+# Model layout identities (whole-file sha256 / byte size), from the fixture
+# pins (fixtures/pins.toml).
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
+                       "fixtures", "pins.toml"), "rb") as _f:
+    _MODEL_PINS = tomllib.load(_f)["model"]
+_SPLIT_PIN = _MODEL_PINS["qwen3.8-flash-next-base.mq4-xts"]
+_MONOLITH_PIN = _MODEL_PINS["qwen3.8-flash-next.mq4-xts"]
+SPLIT_BASE_NAME = _SPLIT_PIN["file"]
+SPLIT_BASE_SHA256 = _SPLIT_PIN["sha256"]
+SPLIT_BASE_BYTES = _SPLIT_PIN["size_bytes"]
+MONOLITH_NAMES = (_MONOLITH_PIN["file"], *_MONOLITH_PIN["aliases"])
+MONOLITH_SHA256 = _MONOLITH_PIN["sha256"]
+MONOLITH_BYTES = _MONOLITH_PIN["size_bytes"]
 LAYOUT_SPLIT = "split base (fresh pull)"
 LAYOUT_MONOLITH = "monolith (grandfathered)"
 LAYOUT_UNKNOWN = "unknown"

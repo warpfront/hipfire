@@ -1767,7 +1767,7 @@ fn main() {
                     .and_then(|p| p.get("dflash_mode"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("auto");
-                // `HIPFIRE_DFLASH_DRAFT` (documented in AGENTS.md §7) forces a
+                // `HIPFIRE_DFLASH_DRAFT` (documented in docs/testing.md §7) forces a
                 // draft path for clients that cannot pass `params.draft` (the
                 // serve prewarm / HTTP-reload path has no --model-draft flag):
                 // non-empty → wins over params.draft; explicitly EMPTY → opt out

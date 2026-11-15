@@ -96,14 +96,14 @@ from wire ids. A product row must satisfy measured model bpw ∈ [N, N+1).
 ### Shipped XTS artifacts
 
 Two MQ4 XTS artifacts are the canonical pinned fixtures. Both are identified by
-file size and SHA-256, never by file name; the pin tables live in
-[AGENTS.md](../AGENTS.md) §5 (“Pinned Hugging Face bench fixture” and “Pinned
-Flash-Next bench fixture”) and the registry rows in [MODELS.md](MODELS.md).
+file size and SHA-256, never by file name; the size and digest pins are data in
+[`fixtures/pins.toml`](../fixtures/pins.toml) (described in
+[`fixtures.md`](fixtures.md)) and the registry rows in [MODELS.md](MODELS.md).
 
-| Artifact | Registry tag | Canonical file | Size (B) | SHA-256 |
-|---|---|---|---:|---|
-| Dense Qwen3.8-27B | `qwen3.8:27b-mq4-xts` | `qwen3.8-27b.mq4-xts` | 14987185152 | `3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae` |
-| Qwen3.8-Flash-Next (arch 16) | `qwen3.8:flash-next-mq4-xts` (also `qwen3.8:flash-next`, `-mq4`, `-gptq3`) | `qwen3.8-flash-next.mq4-xts` | 125288544792 | `8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972` |
+| Artifact | Registry tag | Canonical file | Size + SHA-256 pin |
+|---|---|---|---|
+| Dense Qwen3.8-27B | `qwen3.8:27b-mq4-xts` | `qwen3.8-27b.mq4-xts` | `pin:model/qwen3.8-27b.mq4-xts` |
+| Qwen3.8-Flash-Next (arch 16) | `qwen3.8:flash-next-mq4-xts` (also `qwen3.8:flash-next`, `-mq4`, `-gptq3`) | `qwen3.8-flash-next.mq4-xts` | `pin:model/qwen3.8-flash-next.mq4-xts` (split base published under the tag: `pin:model/qwen3.8-flash-next-base.mq4-xts`) |
 
 - **Dense XTS** is the symmetric MQ4V2 XT body (qt 44) of the H2 checkpoint. The
   file `qwen3.8-27b.mq4-xt` has exactly the same size, so only the digest tells

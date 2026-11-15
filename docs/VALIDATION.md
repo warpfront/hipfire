@@ -440,13 +440,18 @@ cargo test -p rdna-compute --lib -- --test-threads=1
 
 ### Documentation checks
 
-The shipped automated documentation-specific check is
-[`scripts/check-env-docs.py`](../scripts/check-env-docs.py). It validates
-environment-variable reference coverage and config ownership; it is not a
-general Markdown link, lifecycle-label, or semantic-drift checker. Beta does
+The shipped automated documentation-specific checks are
+[`scripts/check-env-docs.py`](../scripts/check-env-docs.py), which validates
+environment-variable reference coverage and config ownership, and
+[`scripts/check-pins.py`](../scripts/check-pins.py), which validates
+[`fixtures/pins.toml`](../fixtures/pins.toml) (schema, provenance of current
+KLD pins, prompt md5s against the committed files, mirrored digests) and that
+every `pin:<kind>/<id>` cited in the root rule files, `docs/`, `.agents/` and
+`scripts/` exists. Neither is a general Markdown link, lifecycle-label, or
+semantic-drift checker. Beta does
 not currently ship a standalone `check-docs-reliability.py` command or a
 documentation-only pre-commit gate. For documentation-only changes, run the
-env/docs check plus `git diff --check`, and inspect changed links and commands
+env/docs and pins checks plus `git diff --check`, and inspect changed links and commands
 against the current tree.
 
 ### Maintained manual harness roles
@@ -812,4 +817,6 @@ blocked on purpose.
 - Admission registry: [`admissions.yml`](admissions.yml)
 - Redline policy: [`REDLINE.md`](REDLINE.md)
 - Perf protocol: [`methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md)
+- Testing playbook (setup, smoke tests, reporting bars): [`testing.md`](testing.md)
+- Fixture and quality pins: [`fixtures.md`](fixtures.md), values in [`../fixtures/pins.toml`](../fixtures/pins.toml) (`scripts/check-pins.py`)
 - Engineering lessons (bitwise-gate discipline, gate gaps, measurement rules): [`methodology/lessons-0.4.5.md`](methodology/lessons-0.4.5.md)

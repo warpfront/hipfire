@@ -341,7 +341,7 @@ Codec MSE is **not** a KLD proxy. Product quality is §8 / the ladder checkpoint
 The data in this section is a **historical, fixture-bound** August 2026 sweep,
 kept separate from current quality pins (see
 [`ladder.md`](ladder.md#current-quality-methodology) and
-[`../../AGENTS.md`](../../AGENTS.md) § 5). It records evidence, not shipping
+[`../fixtures.md`](../fixtures.md#quality-pins)). It records evidence, not shipping
 status. Full record:
 [`../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md`](../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md).
 

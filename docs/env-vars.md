@@ -19,7 +19,8 @@ This page has two layers:
 Detailed procedures belong in domain owners ([`CONFIG.md`](CONFIG.md), [`SERVE.md`](SERVE.md), [`multi-gpu.md`](multi-gpu.md), [`REDLINE.md`](REDLINE.md), [`VALIDATION.md`](VALIDATION.md), methodology pages). This file does not host validation matrices or benchmark floors.
 
 Coverage check for top-level docs: `scripts/check-env-docs.py` (every
-`HIPFIRE_*` in `AGENTS.md` / `README.md` / `CONTRIBUTING.md` must appear
+`HIPFIRE_*` in `AGENTS.md` / `README.md` / `CONTRIBUTING.md` /
+`docs/testing.md` / `docs/fixtures.md` must appear
 somewhere in this file).
 
 ---
@@ -1108,7 +1109,7 @@ Read only by `crates/hipfire-runtime/tests/hf_tokenizer_differential.rs` (see [`
 
 ## Manual — top-level doc references
 
-The canonical documentation checker requires every `HIPFIRE_*` token in `AGENTS.md`, `README.md`, and `CONTRIBUTING.md` to appear in this file. Tokens historically routed from those surfaces (keep listed even if a root file is later thinned):
+The canonical documentation checker requires every `HIPFIRE_*` token in `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `docs/testing.md` and `docs/fixtures.md` to appear in this file. Tokens historically routed from those surfaces (keep listed even if a root file is later thinned):
 
 `HIPFIRE_ATTN_FLASH`, `HIPFIRE_DFLASH_DRAFT`, `HIPFIRE_GRAPH`, `HIPFIRE_HOST_TIMING`, `HIPFIRE_KV_MODE`, `HIPFIRE_LM_HEAD_F16`, `HIPFIRE_LOCAL`, `HIPFIRE_NORMALIZE_PROMPT`, `HIPFIRE_PROMPT_HEAT_JSON`, `HIPFIRE_PROMPT_HEAT_LIMIT`, `HIPFIRE_PROMPT_TOKEN_HEAT`, `HIPFIRE_VERIFY_GRAPH`.
 

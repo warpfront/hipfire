@@ -364,7 +364,7 @@ thin `hipfire quantize` wrapper does not expose it. Source: `crates/hipfire-quan
 
 The direct producer does not claim to reproduce the shipped XTS file: the pinned
 Flash-Next XTS artifact is defined by size and SHA-256 in
-[AGENTS.md](../AGENTS.md) §5 (its experts are GPTQ-solved, a calibrated recipe this
+`pin:model/qwen3.8-flash-next.mq4-xts` ([`fixtures/pins.toml`](../fixtures/pins.toml)) (its experts are GPTQ-solved, a calibrated recipe this
 route does not read). Check any candidate against that pin before comparing results.
 
 ### PLE row sidecars (`.ple-q4`, `.ple-q8`)

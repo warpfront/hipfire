@@ -88,6 +88,8 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Container install / run | [`docs/CONTAINER.md`](CONTAINER.md) | shipped / ref-pinned | |
 | NixOS notes | [`docs/NIXOS.md`](NIXOS.md) | shipped / ref-pinned | |
 | Perf claim protocol (warmup, fresh-process, noise) | [`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.md) | shipped / ref-pinned | Numbers live in measured owners, not here. |
+| Fixture and quality pins (model / draft / reference digests, `.kldseq` hashes, KLD values, evaluator builds, prompt md5s) | [`fixtures/pins.toml`](../fixtures/pins.toml), prose in [`docs/fixtures.md`](fixtures.md) | shipped / ref-pinned | Checked by [`scripts/check-pins.py`](../scripts/check-pins.py); cite pins as `pin:<kind>/<id>`. |
+| Testing playbook (setup, smoke tests, reporting, pitfalls) | [`docs/testing.md`](testing.md) | shipped / ref-pinned | Route selection stays in `VALIDATION.md`. |
 | Engineering lessons, 0.4.5 cycle (lever selection, measurement hygiene, gate discipline) | [`docs/methodology/lessons-0.4.5.md`](methodology/lessons-0.4.5.md) | shipped / ref-pinned | Authoritative over older rules in `AGENTS.md` / `CLAUDE.md`; quoted numbers are fixture-bound examples. |
 | Bench-suite layout | [`docs/methodology/bench-suite.md`](methodology/bench-suite.md) | shipped / ref-pinned | |
 | CPU-exec offload benchmark handoff (`memory.offload_exec`) | [`docs/methodology/cpu-exec-offload-benchmark-handoff.md`](methodology/cpu-exec-offload-benchmark-handoff.md) | shipped / ref-pinned | Method, fixture identity and gotchas for the pcie-vs-cpu A/B; results live in `docs/perf-checkpoints/`. |
@@ -138,6 +140,9 @@ Every current top-level page, exactly once.
 |---|---|---|
 | [`INDEX.md`](INDEX.md) | shipped / ref-pinned | Navigation, lifecycle, ownership. |
 | [`VALIDATION.md`](VALIDATION.md) | shipped / ref-pinned | Validation route selector. |
+| [`testing.md`](testing.md) | shipped / ref-pinned | Testing playbook (setup, smoke tests, reporting, pitfalls, flag table), moved out of `AGENTS.md`. |
+| [`fixtures.md`](fixtures.md) | shipped / ref-pinned | Bench and quality fixtures; values are `fixtures/pins.toml`. |
+| [`codegraph.md`](codegraph.md) | shipped / ref-pinned | CodeGraph usage contract and CLI. |
 | [`admissions.yml`](admissions.yml) | shipped / ref-pinned | Admission registry (schema v2; exactly one record). |
 | [`GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | Onboarding. |
 | [`PICK-A-MODEL.md`](PICK-A-MODEL.md) | shipped / ref-pinned | VRAM tier → tag → speculation setting; tok/s copied from historical BENCHMARKS.md fixtures. |
