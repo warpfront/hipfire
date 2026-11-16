@@ -82,6 +82,12 @@ pub(crate) struct KfdNode {
     pub arch: String,
     /// Never printed.
     pub bdf: PciBdf,
+    /// KFD topology node id: the `<N>` of libhsakmt's per-node
+    /// `HSA_OVERRIDE_GFX_VERSION_<N>`.
+    pub node: u32,
+    /// `HSA_OVERRIDE_GFX_VERSION_<node>`, trimmed; `None` when unset or empty.
+    /// libhsakmt reads it before the global variable.
+    pub node_override: Option<String>,
 }
 
 /// `/dev/kfd` as this user sees it.
@@ -466,8 +472,12 @@ pub(crate) fn gather(root: &Path, inputs: &Inputs<'_>) -> RuntimeFacts {
             devices
                 .into_iter()
                 .map(|device| KfdNode {
+                    node_override: (inputs.env)(&format!("{HSA_OVERRIDE_VAR}_{}", device.node))
+                        .map(|value| value.trim().to_owned())
+                        .filter(|value| !value.is_empty()),
                     arch: device.arch,
                     bdf: device.bdf,
+                    node: device.node,
                 })
                 .collect::<Vec<_>>(),
             None,
@@ -1105,53 +1115,161 @@ fn check_rocm_version_floor(facts: &RuntimeFacts) -> Option<Check> {
     Some(rows.finish(ID))
 }
 
+/// First ROCm release whose libhsakmt refuses an `HSA_OVERRIDE_GFX_VERSION`
+/// that changes a GPU's major version (rocm-systems#5686, first shipped in
+/// 7.14, so in every 10.x). One refused GPU fails the whole topology read, so
+/// ROCr finds no GPU at all and `hipInit` returns `hipErrorNoDevice`.
+const OVERRIDE_MAJOR_LOCK_ROCM: &str = "7.14";
+
+/// `Some(true)` when the selected ROCm refuses a cross-major override,
+/// `Some(false)` when it applies it, `None` when the version is unknown.
+fn override_major_locked(facts: &RuntimeFacts) -> Option<bool> {
+    let version = facts.rocm.version.as_deref()?;
+    if rdna_compute::kernel_pack::rocm_admitted(version, OVERRIDE_MAJOR_LOCK_ROCM, "1000000") {
+        Some(true)
+    } else if rdna_compute::kernel_pack::rocm_admitted(version, "0", OVERRIDE_MAJOR_LOCK_ROCM) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// An override value as libhsakmt parses it: `major.minor.stepping` with
+/// major <= 63 and minor, stepping <= 255. On a GPU node, any other non-empty
+/// value fails the whole topology read in every ROCm release.
+fn hsakmt_override(value: &str) -> Option<[u64; 3]> {
+    let mut parts = value.split('.').map(|part| part.parse::<u64>().ok());
+    let (Some(Some(major)), Some(Some(minor)), Some(Some(stepping)), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    (major <= 63 && minor <= 255 && stepping <= 255).then_some([major, minor, stepping])
+}
+
+/// `gfx1036` → `[10, 3, 6]`, `gfx90a` → `[9, 0, 10]`: the inverse of the
+/// KFD `gfx_target_version` naming (decimal major, one hex digit each for
+/// minor and stepping).
+fn arch_version(arch: &str) -> Option<[u64; 3]> {
+    let digits = arch.strip_prefix("gfx")?;
+    let split = digits.len().checked_sub(2).filter(|&at| at > 0)?;
+    let (major, rest) = digits.split_at(split);
+    let hex = |at: usize| u64::from_str_radix(rest.get(at..=at)?, 16).ok();
+    Some([major.parse().ok()?, hex(0)?, hex(1)?])
+}
+
+/// libhsakmt applies `HSA_OVERRIDE_GFX_VERSION_<node>` (else the global
+/// `HSA_OVERRIDE_GFX_VERSION`) to every KFD GPU node while it reads the
+/// topology, before `ROCR_VISIBLE_DEVICES` filters anything, so one bad value
+/// for any node (an iGPU included) takes every GPU down. The per-node `<N>`
+/// is libhsakmt's own node index, which is the KFD sysfs node id whenever
+/// every node is usable.
 fn check_hsa_override(facts: &RuntimeFacts) -> Check {
     const ID: &str = "hsa_override";
     const FIX: &str = "`unset HSA_OVERRIDE_GFX_VERSION` (and remove it from your shell profile or \
          service unit) unless you rely on it for a GPU ROCm does not support";
-    let Some(value) = facts.hsa_override.as_deref() else {
-        return single(ID, CheckStatus::Pass, "not set", None);
-    };
-    let Some(forced) = override_arch(value) else {
-        return single(
-            ID,
-            CheckStatus::Warn,
-            "HSA_OVERRIDE_GFX_VERSION is set but is not a valid major.minor.stepping \
-             version (for example 11.0.0)",
-            Some(FIX.to_owned()),
-        );
-    };
-    let arches = distinct_arches(&facts.kfd_nodes);
-    match arches.iter().find(|arch| **arch != forced) {
-        Some(real) => single(
-            ID,
-            CheckStatus::Warn,
-            format!(
-                "{HSA_OVERRIDE_VAR}={} makes ROCm report {forced} for the {real} GPU: \
-                 hipfire then builds and runs {forced} kernels on it",
-                value.trim()
-            ),
-            Some(FIX.to_owned()),
-        ),
-        None if arches.is_empty() && facts.kfd_topology_error.is_some() => single(
-            ID,
-            CheckStatus::Info,
-            format!("set to {forced}; the KFD topology is unreadable, so it was not compared against the GPU"),
-            None,
-        ),
-        None if arches.is_empty() => single(
-            ID,
-            CheckStatus::Info,
-            format!("set to {forced}; no KFD GPU to compare against"),
-            None,
-        ),
-        None => single(
-            ID,
-            CheckStatus::Info,
-            format!("set to the GPU's own ISA ({forced}): redundant"),
-            None,
-        ),
+    const INVALID: &str =
+        "is set but is not a valid major.minor.stepping version (for example 11.0.0)";
+    if facts.kfd_nodes.is_empty() {
+        let Some(value) = facts.hsa_override.as_deref() else {
+            return single(ID, CheckStatus::Pass, "not set", None);
+        };
+        let Some(forced) = override_arch(value) else {
+            return single(
+                ID,
+                CheckStatus::Warn,
+                format!("{HSA_OVERRIDE_VAR} {INVALID}"),
+                Some(FIX.to_owned()),
+            );
+        };
+        let detail = if facts.kfd_topology_error.is_some() {
+            format!("set to {forced}; the KFD topology is unreadable, so it was not compared against the GPU")
+        } else {
+            format!("set to {forced}; no KFD GPU to compare against")
+        };
+        return single(ID, CheckStatus::Info, detail, None);
     }
+    let locked = override_major_locked(facts);
+    // A per-node pin is worth suggesting only when the global override is
+    // legal for some GPU that has no pin of its own, i.e. someone relies on it.
+    let global_fits_a_gpu = facts
+        .hsa_override
+        .as_deref()
+        .and_then(hsakmt_override)
+        .is_some_and(|requested| {
+            facts.kfd_nodes.iter().any(|node| {
+                node.node_override.is_none()
+                    && arch_version(&node.arch).is_some_and(|own| own[0] == requested[0])
+            })
+        });
+    let mut rows = Rows::default();
+    for node in &facts.kfd_nodes {
+        let (var, value) = match (node.node_override.as_deref(), facts.hsa_override.as_deref()) {
+            (Some(value), _) => (format!("{HSA_OVERRIDE_VAR}_{}", node.node), value),
+            (None, Some(value)) => (HSA_OVERRIDE_VAR.to_owned(), value),
+            (None, None) => continue,
+        };
+        let unset_fix = if node.node_override.is_some() {
+            format!("`unset {var}`")
+        } else {
+            FIX.to_owned()
+        };
+        let Some(requested) = hsakmt_override(value) else {
+            rows.fail(
+                format!(
+                    "{var} {INVALID}: ROCm then fails to read the KFD topology and finds no GPU \
+                     (hipInit: hipErrorNoDevice)"
+                ),
+                unset_fix,
+            );
+            continue;
+        };
+        let forced = override_arch(value)
+            .unwrap_or_else(|| format!("{}.{}.{}", requested[0], requested[1], requested[2]));
+        let own = arch_version(&node.arch);
+        let cross_major = own.is_some_and(|own| own[0] != requested[0]);
+        if cross_major && locked != Some(false) {
+            let mut fix = unset_fix;
+            if let (None, Some([major, minor, stepping]), true) =
+                (node.node_override.as_deref(), own, global_fits_a_gpu)
+            {
+                let _ = write!(
+                    fix,
+                    "; to keep it for the other GPUs, pin the {} GPU (KFD node {}) to its own \
+                     ISA with `{HSA_OVERRIDE_VAR}_{}={major}.{minor}.{stepping}`",
+                    node.arch, node.node, node.node
+                );
+            }
+            let consequence = "ROCm 7.14 and later (every 10.x) refuse an override that changes \
+                 a GPU's major version and then find no GPU at all (hipInit: hipErrorNoDevice)";
+            let detail = format!(
+                "{var}={value} asks ROCm to report the {} GPU as {forced}",
+                node.arch
+            );
+            match locked {
+                Some(_) => rows.fail(format!("{detail}: {consequence}"), fix),
+                None => rows.warn(
+                    format!("{detail}; the ROCm version is unknown, and {consequence}"),
+                    fix,
+                ),
+            }
+        } else if forced != node.arch {
+            rows.warn(
+                format!(
+                    "{var}={value} makes ROCm report {forced} for the {} GPU: \
+                     hipfire then builds and runs {forced} kernels on it",
+                    node.arch
+                ),
+                unset_fix,
+            );
+        } else {
+            rows.info(format!("set to the GPU's own ISA ({forced}): redundant"));
+        }
+    }
+    if rows.is_empty() {
+        return single(ID, CheckStatus::Pass, "not set", None);
+    }
+    rows.finish(ID)
 }
 
 fn check_kernel_pack(facts: &RuntimeFacts) -> Option<Check> {
@@ -1515,6 +1633,8 @@ mod tests {
             kfd_nodes: vec![KfdNode {
                 arch: "gfx1201".to_owned(),
                 bdf: bdf(),
+                node: 1,
+                node_override: None,
             }],
             rocm: RocmFacts {
                 root: Some(PathBuf::from(format!("{FAKE_HOME}/rocm"))),
@@ -1755,6 +1875,8 @@ mod tests {
         facts.kfd_nodes.push(KfdNode {
             arch: "gfx1100".to_owned(),
             bdf: second,
+            node: 2,
+            node_override: None,
         });
         let check = expect(&facts, "kfd_gpus", CheckStatus::Pass);
         assert_eq!(check.detail, "GPU0 gfx1201, GPU1 gfx1100");
@@ -1775,6 +1897,8 @@ mod tests {
         facts.kfd_nodes.push(KfdNode {
             arch: "gfx1201".to_owned(),
             bdf: second,
+            node: 2,
+            node_override: None,
         });
         assert_eq!(
             only(&facts, "firmware").detail,
@@ -1952,6 +2076,7 @@ mod tests {
             "set to the GPU's own ISA (gfx1201): redundant"
         );
 
+        // ROCm 7.2 (the fixture's) still applies an override across major versions.
         facts.hsa_override = Some("11.0.0".to_owned());
         let check = expect(&facts, "hsa_override", CheckStatus::Warn);
         assert_eq!(
@@ -1961,10 +2086,127 @@ mod tests {
         );
         assert!(fix_of(&check).starts_with("`unset HSA_OVERRIDE_GFX_VERSION`"));
 
+        // libhsakmt fails the whole topology read on a value it cannot parse.
         facts.hsa_override = Some("not-a-version /home/fakeuser".to_owned());
-        let check = expect(&facts, "hsa_override", CheckStatus::Warn);
+        let check = expect(&facts, "hsa_override", CheckStatus::Fail);
         assert!(check.detail.contains("not a valid major.minor.stepping"));
+        assert!(check.detail.contains("hipErrorNoDevice"));
         assert!(fix_of(&check).starts_with("`unset HSA_OVERRIDE_GFX_VERSION`"));
+    }
+
+    /// A 7900 XTX (gfx1100, KFD node 1) beside a Ryzen iGPU (gfx1036, KFD
+    /// node 2) on ROCm 10.0, the shape of GitHub #1156.
+    fn xtx_with_igpu(rocm: &str) -> RuntimeFacts {
+        let mut facts = healthy();
+        facts.rocm.version = Some(rocm.to_owned());
+        facts.gpus[0].device_id = "744c".to_owned();
+        facts.kfd_nodes[0].arch = "gfx1100".to_owned();
+        let igpu = PciBdf::parse("0000:7c:00.0").unwrap();
+        facts.gpus.push(PciGpu {
+            bdf: Some(igpu),
+            device_id: "164e".to_owned(),
+            ..facts.gpus[0].clone()
+        });
+        facts.kfd_nodes.push(KfdNode {
+            arch: "gfx1036".to_owned(),
+            bdf: igpu,
+            node: 2,
+            node_override: None,
+        });
+        facts.hsa_override = Some("11.0.0".to_owned());
+        facts
+    }
+
+    #[test]
+    fn cross_major_override_fails_from_rocm_7_14() {
+        let facts = xtx_with_igpu("10.0.0");
+        let check = expect(&facts, "hsa_override", CheckStatus::Fail);
+        assert_eq!(
+            check.detail,
+            "set to the GPU's own ISA (gfx1100): redundant; \
+             HSA_OVERRIDE_GFX_VERSION=11.0.0 asks ROCm to report the gfx1036 GPU as gfx1100: \
+             ROCm 7.14 and later (every 10.x) refuse an override that changes a GPU's major \
+             version and then find no GPU at all (hipInit: hipErrorNoDevice)"
+        );
+        let fix = fix_of(&check);
+        assert!(fix.starts_with("`unset HSA_OVERRIDE_GFX_VERSION`"));
+        assert!(fix.ends_with(
+            "pin the gfx1036 GPU (KFD node 2) to its own ISA with \
+             `HSA_OVERRIDE_GFX_VERSION_2=10.3.6`"
+        ));
+        assert!(render_text(&assess(&facts)).contains("FAIL hsa_override: "));
+
+        // The first release with the check, and a single dGPU overridden down a major:
+        // no GPU takes the override, so there is nothing to pin.
+        expect(&xtx_with_igpu("7.14.0"), "hsa_override", CheckStatus::Fail);
+        let mut single_gpu = xtx_with_igpu("10.1.0");
+        single_gpu.kfd_nodes.pop();
+        single_gpu.hsa_override = Some("10.3.0".to_owned());
+        let check = expect(&single_gpu, "hsa_override", CheckStatus::Fail);
+        assert!(check.detail.contains("as gfx1030: ROCm 7.14 and later"));
+        assert!(!fix_of(&check).contains("pin"));
+
+        // Every GPU refuses it: one finding, one fix line.
+        let mut all = xtx_with_igpu("10.1.0");
+        all.kfd_nodes[0].arch = "gfx1201".to_owned();
+        all.kfd_nodes[1].arch = "gfx1201".to_owned();
+        let check = expect(&all, "hsa_override", CheckStatus::Fail);
+        assert!(!check.detail.contains("; "));
+        assert_eq!(fix_of(&check).lines().count(), 1);
+        assert!(!fix_of(&check).contains("pin"));
+
+        // Older ROCm applies it; an unknown version cannot tell.
+        let check = expect(&xtx_with_igpu("7.2.4"), "hsa_override", CheckStatus::Warn);
+        assert!(check
+            .detail
+            .contains("makes ROCm report gfx1100 for the gfx1036 GPU"));
+        let mut unknown = xtx_with_igpu("10.0.0");
+        unknown.rocm.version = None;
+        let check = expect(&unknown, "hsa_override", CheckStatus::Warn);
+        assert!(check.detail.contains("the ROCm version is unknown"));
+    }
+
+    #[test]
+    fn per_node_override_takes_precedence() {
+        // Pinning the iGPU to its own ISA keeps the global override legal.
+        let mut facts = xtx_with_igpu("10.0.0");
+        facts.kfd_nodes[1].node_override = Some("10.3.6".to_owned());
+        let check = expect(&facts, "hsa_override", CheckStatus::Info);
+        assert_eq!(
+            check.detail,
+            "set to the GPU's own ISA (gfx1100): redundant; \
+             set to the GPU's own ISA (gfx1036): redundant"
+        );
+
+        // A per-node value alone counts, and its fix names that variable.
+        facts.hsa_override = None;
+        facts.kfd_nodes[1].node_override = Some("11.0.0".to_owned());
+        let check = expect(&facts, "hsa_override", CheckStatus::Fail);
+        assert!(check
+            .detail
+            .starts_with("HSA_OVERRIDE_GFX_VERSION_2=11.0.0 asks ROCm to report"));
+        assert_eq!(fix_of(&check), "`unset HSA_OVERRIDE_GFX_VERSION_2`");
+
+        facts.kfd_nodes[1].node_override = Some("gfx1036".to_owned());
+        let check = expect(&facts, "hsa_override", CheckStatus::Fail);
+        assert!(check
+            .detail
+            .starts_with("HSA_OVERRIDE_GFX_VERSION_2 is set but is not a valid"));
+
+        facts.kfd_nodes[1].node_override = None;
+        expect(&facts, "hsa_override", CheckStatus::Pass);
+    }
+
+    #[test]
+    fn arch_versions_invert_kfd_names() {
+        assert_eq!(arch_version("gfx1036"), Some([10, 3, 6]));
+        assert_eq!(arch_version("gfx90a"), Some([9, 0, 10]));
+        assert_eq!(arch_version("gfx1201"), Some([12, 0, 1]));
+        assert_eq!(arch_version("gfx1"), None);
+        assert_eq!(hsakmt_override("11.0.0"), Some([11, 0, 0]));
+        assert_eq!(hsakmt_override("9.0.10"), Some([9, 0, 10]));
+        assert_eq!(hsakmt_override("64.0.0"), None);
+        assert_eq!(hsakmt_override("11.0"), None);
     }
 
     // ---- kernel_pack -------------------------------------------------------
@@ -2148,6 +2390,8 @@ mod tests {
         facts.kfd_nodes.push(KfdNode {
             arch: "gfx1201".to_owned(),
             bdf: second,
+            node: 2,
+            node_override: None,
         });
         let check = expect(&facts, "render_node", CheckStatus::Fail);
         assert!(check.detail.contains("GPU0") && check.detail.contains("GPU1"));
@@ -2320,11 +2564,12 @@ mod tests {
         root
     }
 
-    fn gather_fake(root: &FakeRoot, env_value: Option<&str>) -> RuntimeFacts {
+    /// `gather` over `root` with exactly the variables in `vars` set.
+    fn gather_fake(root: &FakeRoot, vars: &[(&str, &str)]) -> RuntimeFacts {
         let env = |key: &str| {
-            (key == "HSA_OVERRIDE_GFX_VERSION")
-                .then(|| env_value.map(str::to_owned))
-                .flatten()
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
         };
         let daemon_version =
             |_: &Path| Some("hipfire-daemon 0.4.3 0123456789abcdef0123".to_owned());
@@ -2354,7 +2599,13 @@ mod tests {
     #[test]
     fn gather_reads_a_fake_root() {
         let root = fake_host();
-        let facts = gather_fake(&root, Some(" 12.0.1 "));
+        let facts = gather_fake(
+            &root,
+            &[
+                ("HSA_OVERRIDE_GFX_VERSION", " 12.0.1 "),
+                ("HSA_OVERRIDE_GFX_VERSION_1", " 12.0.0 "),
+            ],
+        );
         assert_eq!(facts.kernel, "6.14.0-fake");
         assert!(facts.amdgpu_module_loaded);
         assert_eq!(facts.amdgpu_dkms_version.as_deref(), Some("6.12.12"));
@@ -2383,6 +2634,8 @@ mod tests {
             vec![KfdNode {
                 arch: "gfx1201".to_owned(),
                 bdf: PciBdf::parse("0000:03:00.0").unwrap(),
+                node: 1,
+                node_override: Some("12.0.0".to_owned()),
             }]
         );
         assert_eq!(
@@ -2531,7 +2784,7 @@ mod tests {
         let nodes = host.path("sys/class/kfd/kfd/topology/nodes");
         std::fs::remove_dir_all(&nodes).unwrap();
         std::fs::write(&nodes, "").unwrap();
-        let facts = gather_fake(&host, None);
+        let facts = gather_fake(&host, &[]);
         assert!(facts.kfd_nodes.is_empty());
         assert!(facts
             .kfd_topology_error
@@ -2588,7 +2841,7 @@ mod tests {
         let nodes = host.path("sys/class/kfd/kfd/topology/nodes");
         std::fs::remove_dir_all(&nodes).unwrap();
         std::fs::create_dir_all(&nodes).unwrap();
-        let facts = gather_fake(&host, None);
+        let facts = gather_fake(&host, &[]);
         assert_eq!(facts.kfd_topology_error, None);
         assert!(facts.kfd_nodes.is_empty());
         assert!(only(&facts, "kfd_gpus")
@@ -2596,7 +2849,7 @@ mod tests {
             .contains("KFD did not register"));
 
         // A readable host reports known zero scratch.
-        let facts = gather_fake(&fake_host(), None);
+        let facts = gather_fake(&fake_host(), &[]);
         assert_eq!(facts.pci_read_error, None);
         assert_eq!(facts.kfd_topology_error, None);
         assert_eq!(facts.kho_scratch_bytes, Some(0));
