@@ -72,12 +72,6 @@ use rdna_compute::Gpu;
 /// [`crate::lane_exec::PROVISION_MAP_REFUSED`]).
 pub const LANE_PAGE_BUDGET_REFUSED: &str = "lane page budget: ";
 
-/// `HIPFIRE_QWEN4_LANE_PAGE_BUDGET` (default on, `0` restores admission by
-/// slots and length only).
-pub fn page_budget_enabled() -> bool {
-    hipfire_config::qwen4_lane_page_budget()
-}
-
 /// Free bytes per rank the budget never hands out
 /// (`HIPFIRE_QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB`, default 256).
 pub fn page_margin_bytes() -> u64 {
@@ -1406,17 +1400,15 @@ impl Qwen4Bundle {
 
     /// The page budget's decision for a request reserving `rows` rows: this
     /// rank's numbers (single device) or every rank's (EP, evaluated once on the
-    /// root so all ranks share the verdict and the slot). Today's admission
-    /// under the kill switch and on a pipeline-parallel store, which has no
-    /// per-rank lane pages.
+    /// root so all ranks share the verdict and the slot). Admission by slots
+    /// and length only on a pipeline-parallel store, which has no per-rank
+    /// lane pages.
     pub fn lane_page_decision(
         &mut self,
         gpu: &mut Gpu,
         rows: usize,
     ) -> Result<PageDecision, String> {
-        // The kill switch measures nothing: today's admission, exactly.
-        let enabled = page_budget_enabled();
-        if !enabled || self.pp.is_some() {
+        if self.pp.is_some() {
             return Ok(page_decision(false, &[], 0));
         }
         let ranks = if self.ep.is_some() {
@@ -1440,13 +1432,13 @@ impl Qwen4Bundle {
     }
 
     /// Reserve `rows` context rows for the just-admitted lane of `epoch` on
-    /// every rank (host only; a no-op under the kill switch).
+    /// every rank (host only; a no-op on a pipeline-parallel store).
     pub fn reserve_lane_pages(
         &mut self,
         epoch: &RequestEpoch,
         rows: usize,
     ) -> Result<(), BundleError> {
-        if !page_budget_enabled() || self.pp.is_some() {
+        if self.pp.is_some() {
             return Ok(());
         }
         if self.ep.is_some() {

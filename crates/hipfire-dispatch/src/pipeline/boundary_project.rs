@@ -27,8 +27,6 @@
 //!
 //! Supported weight dtypes: `MQ4G256V2` (qt44, optional AWQ sidecar), `Q8_0`,
 //! `MQ8G256` (device layout B) and `F32`; anything else is a named refusal.
-//! `HIPFIRE_RAON_A8_REUSE` / `HIPFIRE_RAON_A8_FUSE_ROUND` switch the shared
-//! quantization and the fused round off (bit-identical either way).
 
 use std::sync::LazyLock;
 
@@ -363,25 +361,6 @@ fn is_mq8(w: &WeightRef<'_>) -> bool {
     w.dtype == DType::MQ8G256
 }
 
-/// `HIPFIRE_RAON_A8_REUSE=0` restores one activation quantization per projection (the
-/// pre-reuse behavior). Bit-identical either way. Read once.
-fn a8_reuse_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_RAON_A8_REUSE", true));
-    *ON
-}
-
-/// `HIPFIRE_RAON_A8_FUSE_ROUND=0` runs the projection's BF16 output round as its own pass
-/// (`bf16_round_trip_f32_strided`) instead of the GEMM epilogue (Q8_0: the W8A8 i8-MMQ `_bf16`
-/// entries on gfx1201 / gfx1100 and the F16 wmma `gemm_q8_0_wmma_bf16` on gfx1100; MQ8G256: the
-/// prefill GEMM's BF16 epilogue); bit-identical either way. Read once.
-fn a8_fuse_round_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_RAON_A8_FUSE_ROUND", true)
-    });
-    *ON
-}
-
 /// An activation plane quantized once for the projections of one node.
 #[derive(Clone, Copy, Debug)]
 enum PreparedAct {
@@ -467,9 +446,6 @@ fn prepare_a8(
     route: RowsRoute,
     tier: PrefillActTier,
 ) -> Result<Option<PreparedAct>, DispatchError> {
-    if !a8_reuse_enabled() {
-        return Ok(None);
-    }
     match w.dtype {
         DType::MQ8G256 => {
             if route == RowsRoute::Decode || (rows == 2 && route == RowsRoute::Verify) {
@@ -525,7 +501,7 @@ fn project_batched(
             w.m,
             w.k,
             rows,
-            round == OutRound::Bf16 && a8_fuse_round_enabled(),
+            round == OutRound::Bf16,
         )
         .map(|run| rounded = run.bf16_fused)
         .map_err(|e| e.to_string()),
@@ -616,7 +592,7 @@ fn mq8_project(
     if exact {
         mq8_gemv_rows(gpu, w.buf, &acts, y, w.m)
     } else {
-        rounded = round == OutRound::Bf16 && a8_fuse_round_enabled();
+        rounded = round == OutRound::Bf16;
         mq8_prefill_gemm(gpu, w.buf, &acts, y, w.m, rounded)
     }
     .map_err(|e| err(format!("raon projection (MQ8, rows={rows}): {e}")))?;
@@ -702,17 +678,8 @@ fn project_shared_f16(
                 .into(),
         ));
     }
-    let fused = q8_0_prefill_gemm_f16x(
-        gpu,
-        w.buf,
-        x16,
-        y,
-        w.m,
-        w.k,
-        rows,
-        round == OutRound::Bf16 && a8_fuse_round_enabled(),
-    )
-    .map_err(|e| err(format!("raon projection (rows={rows}): {e}")))?;
+    let fused = q8_0_prefill_gemm_f16x(gpu, w.buf, x16, y, w.m, w.k, rows, round == OutRound::Bf16)
+        .map_err(|e| err(format!("raon projection (rows={rows}): {e}")))?;
     if round == OutRound::Bf16 && !fused {
         round_bf16_rows(gpu, y, rows, w.m)?;
     }

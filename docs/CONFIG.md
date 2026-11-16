@@ -1459,8 +1459,7 @@ LCP prefix matches the prior bake. Unedited rich `reasoning_content` history
 hits; edited or mismatched history falls back to a plain retokenized render
 (cold or checkpoint path) instead of replaying stale tokens.
 
-Tool argument replay is on by default (`HIPFIRE_QWEN4_TOOL_ARG_REPLAY=0` opts out).
-It restores original producer argument ordering, not lexical sorting, on the last
+Tool argument replay restores original producer argument ordering, not lexical sorting, on the last
 echoed Qwen4 or dense Qwen assistant tool turn in the active committed conversation. Typed
 values and byte-identical echoes are unchanged. A repaired render is accepted
 only if it strictly extends every committed token; otherwise the original safe
@@ -2468,6 +2467,36 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.qwen4_token_readback_early` | `qwen4_token_readback_early` | 0.4.3 | 0.5.0 | none; the sampled token is always read back early through the pinned buffer |
 | `developer.qwen4_vmm_gfx1100` | `qwen4_vmm_gfx1100` | 0.4.5 | 0.5.0 | none; gfx1100 is always a certified Qwen4 VMM arch |
 | `developer.qwen4_wave_head_one` | `qwen4_wave_head_one` | 0.4.5 | 0.5.0 | none; the final rows of EP waves are always head-one-treated |
+| `developer.ep_compact_scratch` | `ep_compact_scratch` | 0.4.5 | 0.5.0 | none; an expert-parallel load takes the compact forward scratch plan its source admits |
+| `developer.ep_gather_direct` | `ep_gather_direct` | 0.4.5 | 0.5.0 | none; loads with a direct source always gather owned experts with parallel O_DIRECT reads |
+| `developer.ep_mtp_lanes` | `ep_mtp_lanes` | 0.4.5 | 0.5.0 | none; EP loads with serve.batch_spec and --spec mtp always stage native-MTP lanes |
+| `developer.ep_share_host` | `ep_share_host` | 0.4.5 | 0.5.0 | none; the ranks of one process always share one pinned host copy of a replicated host-mapped weight |
+| `developer.flux_f16_act` | `flux_f16_act` | 0.3.1 | 0.5.0 | none; FLUX activations are always carried as f16 |
+| `developer.flux_gemm_lds` | `flux_gemm_lds` | 0.3.1 | 0.5.0 | none; FLUX GEMMs always take the LDS-staged macro-tile route when K is a multiple of 64 |
+| `developer.flux_gemm_wide` | `flux_gemm_wide` | 0.3.1 | 0.5.0 | none; FLUX GEMMs always pick the per-arch macro-tile |
+| `developer.flux_mod_gemv` | `flux_mod_gemv` | 0.3.1 | 0.5.0 | none; FLUX modulation linears always run as GEMVs into one per-forward buffer |
+| `developer.gated_delta_vector_chunked` | `gated_delta_vector_chunked` | 0.4.5 | 0.5.0 | none; the chunked core runs wherever its arch and shape admission holds |
+| `developer.img_cond_cache` | `img_cond_cache` | 0.3.1 | 0.5.0 | none; prompt conditioning is always cached per daemon |
+| `developer.lane_admit_coalesce_first` | `lane_admit_coalesce_first` | 0.4.5 | 0.5.0 | none; a lone request that stays a lane always waits one coalescing gap; HIPFIRE_LANE_ADMIT_COALESCE_MS=0 turns the wait off |
+| `developer.lane_early_first_token` | `lane_early_first_token` | 0.4.5 | 0.5.0 | none; a lane's first token always streams in its prefill step |
+| `developer.lane_first_token_before_mesh` | `lane_first_token_before_mesh` | 0.4.5 | 0.5.0 | none; prefill ticks always stream before the EP mesh decode window |
+| `developer.qwen4_direct_load` | `qwen4_direct_load` | 0.4.3 | 0.5.0 | none; discrete GPUs always use the direct weight reader |
+| `developer.qwen4_ep_lone_mtp_lane` | `qwen4_ep_lone_mtp_lane` | 0.4.5 | 0.5.0 | none; a lone EP request with native MTP always enters the lane driver |
+| `developer.qwen4_lane_page_budget` | `qwen4_lane_page_budget` | 0.4.5 | 0.5.0 | none; Qwen4 lane admission always applies the page budget |
+| `developer.qwen4_tool_arg_replay` | `qwen4_tool_arg_replay` | 0.4.2 | 0.5.0 | none; tool argument replay always runs |
+| `developer.raon_a8_fuse_round` | `raon_a8_fuse_round` | 0.4.5 | 0.5.0 | none; Raon GEMMs always round BF16 in the epilogue |
+| `developer.raon_a8_reuse` | `raon_a8_reuse` | 0.4.5 | 0.5.0 | none; Raon always reuses a prepared A8 activation |
+| `developer.raon_attn_tiled` | `raon_attn_tiled` | 0.4.5 | 0.5.0 | none; Raon MLA always runs the tiled kernels |
+| `developer.raon_mhc_bf16_streams` | `raon_mhc_bf16_streams` | 0.4.5 | 0.5.0 | none; Raon mHC stream planes are BF16 wherever the fused aggregate and BF16 selectors admit it |
+| `developer.raon_mhc_fused` | `raon_mhc_fused` | 0.4.5 | 0.5.0 | none; the Raon mHC route finalize is fused wherever its shape admission holds |
+| `developer.raon_mla_absorb` | `raon_mla_absorb` | 0.4.5 | 0.5.0 | none; Raon attends over the latent cache once a context exceeds the mirror budget |
+| `developer.raon_railgun_local_corpus` | `raon_railgun_local_corpus` | 0.4.5 | 0.5.0 | none; the per-user receipt corpus is provisioned at first load when buildable; HIPFIRE_RAON_RAILGUN=0 stays the hard kill |
+| `developer.raon_rda_fused_prep` | `raon_rda_fused_prep` | 0.4.5 | 0.5.0 | none; the fused RDA producer runs wherever its wave admission holds |
+| `developer.raon_rda_segment` | `raon_rda_segment` | 0.4.5 | 0.5.0 | none; chunked RDA prefill always runs in 256-row segments |
+| `developer.spec_window_rollback` | `spec_window_rollback` | 0.3.1 | 0.5.0 | none; strict-prefix terminal repair always replays the retained window |
+| `developer.vae_conv` | `vae_conv` | 0.3.1 | 0.5.0 | none; VAE convolutions take the f16 GEMM route wherever K admits it |
+| `developer.vae_fuse_norm` | `vae_fuse_norm` | 0.3.1 | 0.5.0 | none; VAE GroupNorm and SiLU are always fused |
+| `developer.vae_gpu` | `vae_gpu` | 0.3.1 | 0.5.0 | none; the FLUX pipeline always decodes on the GPU |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 

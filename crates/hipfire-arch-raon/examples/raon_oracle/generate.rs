@@ -103,8 +103,7 @@ pub fn run(_fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, S
     let max_seq = (prompt.len() + n_new + 64).max(512);
     let mut bundle = load_bundle(&mut gpu, ModelSource::Hfq(hfq), &model, max_seq)?;
     // `--mirror-budget-rows N`: force the decompressed-route mirror budget (rows) so the
-    // beyond-budget routes (capacity refusal / absorbed with HIPFIRE_RAON_MLA_ABSORB=1) run
-    // at test-sized contexts.
+    // beyond-budget (absorbed) route runs at test-sized contexts.
     if let Some(v) = opts.get("mirror-budget-rows") {
         let rows = v
             .parse::<usize>()

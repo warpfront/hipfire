@@ -315,7 +315,7 @@ const CFG_RDA_HEAD_DIM: BindSource =
     BindSource::Config(&["rda_config.head_dim", "linear_value_head_dim", "head_dim"]);
 
 /// Rows of one RDA launch: `crates/hipfire-dispatch/src/pipeline/rda.rs::RDA_SEGMENT_ROWS` (the layer runs as 256-row
-/// segments whenever the chunked core is on and the chunk has more rows).
+/// segments whenever the chunked core runs and the chunk has more rows).
 const SEGMENT_ROWS: BindSource = BindSource::Derived(Expr::Const(256));
 
 const CHUNK_ADMIT: RowDomainV1 = RowDomainV1 {
@@ -323,14 +323,14 @@ const CHUNK_ADMIT: RowDomainV1 = RowDomainV1 {
     max_rows: None,
     predicate:
         "crates/rdna-compute/src/gated_delta_vector_chunk.rs::GATED_DELTA_VECTOR_CHUNK_MIN_ROWS",
-    kill_env: Some("HIPFIRE_GATED_DELTA_VECTOR_CHUNKED"),
+    kill_env: None,
 };
 
 const WAVE_ADMIT: RowDomainV1 = RowDomainV1 {
     min_rows: 64,
     max_rows: None,
     predicate: "crates/hipfire-dispatch/src/pipeline/rda.rs::RDA_WAVE_MIN_ROWS",
-    kill_env: Some("HIPFIRE_RAON_RDA_FUSED_PREP"),
+    kill_env: None,
 };
 
 // ================================================================================
@@ -1344,10 +1344,7 @@ mod tests {
                 w.work.admit.predicate,
                 "crates/rdna-compute/src/gated_delta_vector_chunk.rs::GATED_DELTA_VECTOR_CHUNK_MIN_ROWS"
             );
-            assert_eq!(
-                w.work.admit.kill_env,
-                Some("HIPFIRE_GATED_DELTA_VECTOR_CHUNKED")
-            );
+            assert_eq!(w.work.admit.kill_env, None);
             assert_eq!(w.work.pipe, Pipe::WmmaF16);
             assert_eq!(w.work.op_class, op_class::RECURRENCE);
         }
@@ -1357,7 +1354,7 @@ mod tests {
                 w.work.admit.predicate,
                 "crates/hipfire-dispatch/src/pipeline/rda.rs::RDA_WAVE_MIN_ROWS"
             );
-            assert_eq!(w.work.admit.kill_env, Some("HIPFIRE_RAON_RDA_FUSED_PREP"));
+            assert_eq!(w.work.admit.kill_env, None);
         }
         assert_eq!(conv_prepare::WORK.work.op_class, op_class::CONV);
         assert_eq!(conv_prepare::WORK.work.pipe, Pipe::ValuF32);

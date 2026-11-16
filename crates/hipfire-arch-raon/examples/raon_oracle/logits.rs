@@ -249,7 +249,7 @@ pub fn run(fixtures: &Path, opts: &BTreeMap<String, String>) -> Result<Value, St
     let src = ModelSource::from_path(&model_path)?;
     let mut bundle = load_bundle(&mut gpu, src, &model_path, max_seq)?;
     // `--mirror-budget-rows N`: force the decompressed-route mirror budget so
-    // the beyond-budget (absorbed, HIPFIRE_RAON_MLA_ABSORB=1) route can be
+    // the beyond-budget (absorbed) route can be
     // scored on the KLD corpora.
     if let Some(v) = opts.get("mirror-budget-rows") {
         let rows = v

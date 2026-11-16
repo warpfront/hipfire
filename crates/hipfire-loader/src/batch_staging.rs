@@ -599,48 +599,19 @@ pub fn qwen4_lane_capacity_refusal(requested: usize) -> Option<String> {
         .then(|| format!("lanes={requested} outside the lane store capacity 1..={max}"))
 }
 
-/// Kill switch of EP native-MTP lanes: exact `0` keeps the AR lane store (as
-/// before the mesh lane protocol); unset (the default) or any other value
-/// stages native-MTP lanes.
-pub const EP_MTP_LANES_ENV: &str = "HIPFIRE_EP_MTP_LANES";
-
-/// [`EP_MTP_LANES_ENV`] from the process configuration (default on).
-pub fn ep_mtp_lanes_enabled() -> bool {
-    hipfire_config::developer_bool(EP_MTP_LANES_ENV, true)
-}
-
-/// Why an EP load that carries the MTP head still stages AR lanes: the
-/// `HIPFIRE_EP_MTP_LANES=0` kill switch (EP lanes are AR lanes, as before the
-/// mesh lane protocol). Sampled requests (`serve.batch_sampled`) take the mesh
-/// native-MTP lanes too (root-drawn Leviathan acceptance). `None` = stage MTP
-/// lanes.
-pub fn ep_spec_off_reason(enabled: bool) -> Option<&'static str> {
-    (!enabled).then_some("HIPFIRE_EP_MTP_LANES=0")
-}
-
 /// What an EP load reserves for the lane store its batch staging will make:
 /// `(spec_k, copy)` for [`BatchLoadRequest`](crate::admission::BatchLoadRequest)
 /// (`(None, false)` = AR lanes). The same predicate and K the staging applies
 /// (`stage_qwen4_lanes`), so the resident-expert split reserves the bytes the
 /// spec store will commit: `serve.batch_spec` on, native MTP explicitly on
-/// (EP attaches heads only then), the kill switch off,
+/// (EP attaches heads only then),
 /// K = the load's resolved draft depth clamped to the lane ring.
 pub fn ep_spec_lane_reservation(
     batch_spec: bool,
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
     gpu_arch: &str,
 ) -> (Option<usize>, bool) {
-    ep_spec_lane_reservation_with(ep_mtp_lanes_enabled(), batch_spec, spec, gpu_arch)
-}
-
-/// [`ep_spec_lane_reservation`] with the kill switch's state passed in (pure; the tests).
-fn ep_spec_lane_reservation_with(
-    enabled: bool,
-    batch_spec: bool,
-    spec: hipfire_runtime::loader_api::SpecLoadCfg,
-    gpu_arch: &str,
-) -> (Option<usize>, bool) {
-    let admitted = batch_spec && spec.mtp == Some(true) && ep_spec_off_reason(enabled).is_none();
+    let admitted = batch_spec && spec.mtp == Some(true);
     if !admitted {
         return (None, false);
     }
@@ -664,7 +635,7 @@ fn ep_spec_lane_reservation_with(
 /// - `single`: one-device budget check here, then `stage_lanes`.
 /// - `ep`: replicated rank stores (the arch fans staging out and budgets
 ///   every rank against its own free memory). With `serve.batch_spec`, the MTP
-///   head loaded and no kill switch (`HIPFIRE_EP_MTP_LANES=0`) set, native-MTP
+///   head loaded, native-MTP
 ///   lanes are staged with the default
 ///   copy lane ([`hipfire_arch_qwen4::ep::ep_default_copy_config`]) and the
 ///   mesh lane transaction is armed
@@ -740,7 +711,7 @@ fn stage_qwen4_lanes(
         other => other.to_string(),
     };
     // PP stages AR lanes only: a spec config is never forwarded there. EP
-    // stages native-MTP lanes unless the kill switch says no.
+    // stages native-MTP lanes.
     let spec_off_reason: Option<String> = match (natural_spec_off, topology) {
         (None, "pp") => {
             eprintln!(
@@ -748,12 +719,6 @@ fn stage_qwen4_lanes(
             );
             Some("native-MTP unsupported under topology.pp".to_string())
         }
-        (None, "ep") => ep_spec_off_reason(ep_mtp_lanes_enabled()).map(|reason| {
-            eprintln!(
-                "[daemon] qwen4 fn-lanes: EP native-MTP lanes off ({reason}); staging AR lanes"
-            );
-            reason.to_string()
-        }),
         (reason, _) => reason.map(str::to_string),
     };
     let spec_k = if topology == "ep" {
@@ -1173,8 +1138,7 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
 #[cfg(test)]
 mod tests {
     use super::{
-        d2_single_card_lane_refusal, ep_spec_lane_reservation, ep_spec_lane_reservation_with,
-        ep_spec_off_reason, qwen4_lane_capacity_refusal,
+        d2_single_card_lane_refusal, ep_spec_lane_reservation, qwen4_lane_capacity_refusal,
     };
     use hipfire_runtime::loader_api::SpecLoadCfg;
 
@@ -1226,11 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn ep_native_mtp_lanes_stage_unless_killed() {
-        assert_eq!(ep_spec_off_reason(true), None);
-        assert_eq!(ep_spec_off_reason(false), Some("HIPFIRE_EP_MTP_LANES=0"));
-        // Default (variable unset) stages native-MTP lanes.
-        assert!(super::ep_mtp_lanes_enabled());
+    fn ep_native_mtp_lanes_stage_by_default() {
         let on = SpecLoadCfg {
             mtp: Some(true),
             mtp_k: Some(3),
@@ -1241,11 +1201,6 @@ mod tests {
             Some(3),
             "the default reserves the native-MTP lane store"
         );
-        // `HIPFIRE_EP_MTP_LANES=0`: the AR lane store, no spec K, no copy lane.
-        assert_eq!(
-            ep_spec_lane_reservation_with(false, true, on, "gfx1201"),
-            (None, false)
-        );
     }
 
     #[test]
@@ -1255,22 +1210,22 @@ mod tests {
             mtp_k: Some(3),
             ..SpecLoadCfg::default()
         };
-        let (k, _) = ep_spec_lane_reservation_with(true, true, on, "gfx1201");
+        let (k, _) = ep_spec_lane_reservation(true, on, "gfx1201");
         assert_eq!(k, Some(3));
         // K is capped at the EP lane depth (`HIPFIRE_EP_MTP_LANE_K`, default 5).
         let wide = SpecLoadCfg {
             mtp_k: Some(63),
             ..on
         };
-        let (k, _) = ep_spec_lane_reservation_with(true, true, wide, "gfx1201");
+        let (k, _) = ep_spec_lane_reservation(true, wide, "gfx1201");
         assert_eq!(k, Some(5));
         // `serve.batch_spec` off, MTP not explicit: AR store.
         assert_eq!(
-            ep_spec_lane_reservation_with(true, false, on, "gfx1201"),
+            ep_spec_lane_reservation(false, on, "gfx1201"),
             (None, false)
         );
         assert_eq!(
-            ep_spec_lane_reservation_with(true, true, SpecLoadCfg::default(), "gfx1201"),
+            ep_spec_lane_reservation(true, SpecLoadCfg::default(), "gfx1201"),
             (None, false)
         );
     }

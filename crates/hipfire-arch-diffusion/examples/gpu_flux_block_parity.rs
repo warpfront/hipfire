@@ -141,8 +141,7 @@ fn main() {
     let mut gpu = Gpu::init().expect("GPU init failed");
     // This example does not go through `FluxPipeBundle::ensure_gpu`, so it
     // installs the diffusion stream itself — once, before any upload. See
-    // `flux_gpu::install_forward_stream`: permanent by design, and unrelated
-    // to `HIPFIRE_FLUX_F16_ACT`, which selects the activation layout only.
+    // `flux_gpu::install_forward_stream`: permanent by design.
     install_forward_stream(&mut gpu).expect("install forward stream");
     let mut gw = GpuFluxWeights {
         tensors: HashMap::new(),

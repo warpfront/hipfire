@@ -3225,9 +3225,6 @@ pub fn qwen_jinja_cached_history_tokens(
     let Some(prefix) = producer_prefix.filter(|p| !p.is_empty()) else {
         return Ok(baseline);
     };
-    if !hipfire_config::developer_bool("HIPFIRE_QWEN4_TOOL_ARG_REPLAY", true) {
-        return Ok(baseline);
-    }
     Ok(qwen_accept_tool_argument_replay(
         frame, hist, prefix, baseline, render,
     ))

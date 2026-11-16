@@ -112,8 +112,8 @@ pub(crate) fn qwen4_unit_arena_payload<'a>(
         let gathered = if plan.geometry().is_mq4_planar() {
             match direct {
                 // Parallel O_DIRECT reads of exactly the owned experts' shipped spans, then a
-                // parallel repack: no serial mmap page-fault walk (`HIPFIRE_EP_GATHER_DIRECT=0`
-                // keeps that path).
+                // parallel repack: no serial mmap page-fault walk (that path stays for loads
+                // without a direct source: UMA, overlays).
                 Some(direct) => {
                     let located = |name: &str| {
                         source

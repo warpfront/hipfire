@@ -272,7 +272,6 @@ pub struct CondCache {
     /// Most-recently-used first.
     entries: Vec<CondEntry>,
     capacity: usize,
-    enabled: bool,
 }
 
 impl Default for CondCache {
@@ -287,25 +286,11 @@ impl CondCache {
     /// enough for an interactive prompt-rotation session.
     pub const CAPACITY: usize = 8;
 
-    /// Enabled unless `HIPFIRE_IMG_COND_CACHE=0`. When disabled, nothing is
-    /// stored at all: conditioning takes the `CondSlot::Owned` path and is
-    /// freed after the denoise loop, so the kill-switch reproduces the
-    /// uncached behaviour rather than only skipping the lookup.
-    ///
-    /// Read once, at pipe load. Flipping the env var mid-session takes effect
-    /// on the next model load, not the next request.
     pub fn new() -> Self {
-        let enabled =
-            hipfire_config::developer_var("HIPFIRE_IMG_COND_CACHE").map_or(true, |v| v != "0");
         Self {
             entries: Vec::new(),
             capacity: Self::CAPACITY,
-            enabled,
         }
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
     }
 
     pub fn len(&self) -> usize {
@@ -316,12 +301,8 @@ impl CondCache {
         self.entries.is_empty()
     }
 
-    /// Index of the entry for `(prompt, family, t5_seq)`, promoting it to
-    /// MRU. Always `None` when the cache is disabled.
+    /// Index of the entry for `(prompt, family, t5_seq)`, promoting it to MRU.
     fn lookup(&mut self, prompt: &str, family: FluxFamily, t5_seq: usize) -> Option<usize> {
-        if !self.enabled {
-            return None;
-        }
         let pos = self
             .entries
             .iter()
@@ -575,7 +556,7 @@ impl FluxPipeBundle {
         // Before ANY upload: install the stream the whole diffusion path runs
         // on, once, permanently, for this `Gpu`. See
         // `flux_gpu::install_forward_stream` — it is deliberately not tied to
-        // the activation dtype, and `HIPFIRE_FLUX_F16_ACT` does not affect it.
+        // the activation dtype.
         flux_gpu::install_forward_stream(gpu)?;
         if self.gpu_weights.is_none() {
             // Streaming first: it never builds the ~47 GB f32 host table, and
@@ -1807,7 +1788,7 @@ fn ensure_conditioning(
     // two DIFFERENT pre-tokenized inputs at the same `t5_seq` would both hit
     // in one process — the second silently getting the first's conditioning.
     // Uncacheable requests encode, run, and free.
-    let cacheable = is_cacheable(b.cond_cache.is_enabled(), input.prompt_key);
+    let cacheable = is_cacheable(input.prompt_key);
     let t5_seq = input.txt_ids.len();
     let family = b.transformer_cfg.family;
     if cacheable {
@@ -1993,22 +1974,22 @@ fn klein_conditioning(
     Ok(dev)
 }
 
-/// Whether a request's conditioning may enter the cache: the cache must be on
-/// AND the request must carry a real prompt key.
+/// Whether a request's conditioning may enter the cache: it must carry a real
+/// prompt key.
 ///
 /// A standalone function so the rule is unit-testable without a device — see
 /// `absent_prompt_key_bypasses_the_cache`.
-fn is_cacheable(cache_enabled: bool, prompt_key: Option<&str>) -> bool {
-    cache_enabled && prompt_key.is_some()
+fn is_cacheable(prompt_key: Option<&str>) -> bool {
+    prompt_key.is_some()
 }
 
 /// Where this generation's conditioning lives.
 ///
 /// `Cached` is an index into `b.cond_cache`, which owns the device tensor and
 /// frees it on eviction. `Owned` is a one-shot the caller must free after the
-/// denoise loop — the path taken when the cache is off or the request carries
-/// no prompt key, so an uncacheable request cannot leak and cannot pollute the
-/// cache with a key that is not really a key.
+/// denoise loop — the path taken when the request carries no prompt key, so an
+/// uncacheable request cannot leak and cannot pollute the cache with a key that
+/// is not really a key.
 enum CondSlot {
     Cached(usize),
     Owned(CondEntry),
@@ -2268,35 +2249,29 @@ fn denoise_and_decode(
     }
 
     // Unpack → scale → VAE decode → PNG (identical to CPU). The decode runs
-    // on the GPU by default (`vae_gpu` — parity vs ComfyUI rel_l2 0.0031 on
+    // on the GPU (`vae_gpu` — parity vs ComfyUI rel_l2 0.0031 on
     // the golden latent); the single-threaded CPU `vae::decode` of a 1024²
-    // image takes minutes, so `HIPFIRE_VAE_GPU=0` is the escape hatch back to
-    // the reference, not the normal route.
+    // image takes minutes, so this path never falls back to it.
     let packed_in = patch_size * patch_size * ch;
     let ch_unpacked = packed_in / 4;
     let denormed = scheduler::denormalize_packed(&latents, n_img, packed_in, &b.meta.latent_norm);
     let scaled = scheduler::unpack_latents(&denormed, n_img, ch_unpacked, latent_h, latent_w);
     lap("latent_unpack", &mut stage);
-    let image = if hipfire_config::developer_var("HIPFIRE_VAE_GPU").map_or(true, |v| v != "0") {
-        let img = match b.gpu_vae.as_ref() {
-            // The normal route: weights already resident from `ensure_gpu`.
-            Some(gv) => vae_gpu::gpu_decode(gpu, gv, &scaled, latent_h, latent_w)?.0,
-            // Callers that reached here without `ensure_gpu` having uploaded
-            // the VAE still decode correctly, just at the old per-generation
-            // upload cost.
-            None => {
-                let gv = vae_gpu::GpuVaeDecoderWeights::from_host(gpu, &b.vae)?;
-                lap("vae_upload", &mut stage);
-                let out = vae_gpu::gpu_decode(gpu, &gv, &scaled, latent_h, latent_w);
-                gv.free_gpu(gpu);
-                out?.0
-            }
-        };
-        lap("vae_decode", &mut stage);
-        img
-    } else {
-        vae::decode(&b.vae, &scaled, latent_h, latent_w)
+    let image = match b.gpu_vae.as_ref() {
+        // The normal route: weights already resident from `ensure_gpu`.
+        Some(gv) => vae_gpu::gpu_decode(gpu, gv, &scaled, latent_h, latent_w)?.0,
+        // Callers that reached here without `ensure_gpu` having uploaded
+        // the VAE still decode correctly, just at the old per-generation
+        // upload cost.
+        None => {
+            let gv = vae_gpu::GpuVaeDecoderWeights::from_host(gpu, &b.vae)?;
+            lap("vae_upload", &mut stage);
+            let out = vae_gpu::gpu_decode(gpu, &gv, &scaled, latent_h, latent_w);
+            gv.free_gpu(gpu);
+            out?.0
+        }
     };
+    lap("vae_decode", &mut stage);
     let up = vae_upscale(b);
     let png = postprocess_png(&image, input.width * up, input.height * up);
     lap("png_encode", &mut stage);
@@ -2875,7 +2850,6 @@ mod cond_cache_tests {
         CondCache {
             entries: Vec::new(),
             capacity,
-            enabled: true,
         }
     }
 
@@ -2911,19 +2885,6 @@ mod cond_cache_tests {
         assert_eq!(lookup(&mut c, "first", 8), Some(0));
         assert_eq!(lookup(&mut c, "third", 8), Some(0));
         assert_eq!(c.len(), 2);
-    }
-
-    #[test]
-    fn disabled_cache_never_reports_a_hit() {
-        // `HIPFIRE_IMG_COND_CACHE=0` must reproduce uncached behaviour, not
-        // just skip the eviction bookkeeping: an entry can still be resident
-        // (the in-flight run needs somewhere to hold its device tensor) and
-        // must still miss.
-        let mut c = cache(4);
-        c.enabled = false;
-        c.push(entry("held", 256));
-        assert_eq!(c.len(), 1, "entry is resident");
-        assert_eq!(lookup(&mut c, "held", 256), None, "but must not be reused");
     }
 
     #[test]
@@ -2963,18 +2924,13 @@ mod cond_cache_tests {
     /// restatement of it.
     #[test]
     fn absent_prompt_key_bypasses_the_cache() {
-        assert!(!is_cacheable(true, None), "no prompt key must not cache");
-        assert!(
-            !is_cacheable(false, Some("a prompt")),
-            "disabled must not cache"
-        );
-        assert!(!is_cacheable(false, None));
-        assert!(is_cacheable(true, Some("a prompt")));
+        assert!(!is_cacheable(None), "no prompt key must not cache");
+        assert!(is_cacheable(Some("a prompt")));
 
         // And the empty string is NOT special-cased into a bypass: a caller
         // that genuinely conditions on an empty prompt still gets a cache
         // entry, which is correct — an empty prompt is a real prompt.
-        assert!(is_cacheable(true, Some("")));
+        assert!(is_cacheable(Some("")));
 
         // A cache that DID receive two `""`-keyed entries at the same t5_seq
         // would hand the second caller the first's tensor. Pinned here so the

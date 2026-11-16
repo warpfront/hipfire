@@ -125,10 +125,6 @@ pub struct Qwen35MtpDrafter {
     /// Position of the newest user-turn snapshot in `checkpoints`, protected from
     /// recycling until the next user turn replaces it.
     pinned_boundary: Option<usize>,
-    /// Strict-prefix terminal-repair enablement, resolved once at construction
-    /// from [`hipfire_config::mtp_cache_policy`] (config-owned). The repair
-    /// path performs no policy reads of its own.
-    window_rollback: bool,
     /// Trunk route for prompt fill, forced advance and terminal-repair replay,
     /// resolved once at construction from [`hipfire_config::mtp_own_prefill`].
     prompt_route: MtpPromptRoute,
@@ -168,7 +164,6 @@ impl Qwen35MtpDrafter {
             checkpoint_cap: policy.checkpoint_cap,
             turn_boundary: None,
             pinned_boundary: None,
-            window_rollback: policy.window_rollback,
             prompt_route,
         }
     }
@@ -745,9 +740,6 @@ impl MtpDrafter for Qwen35MtpDrafter {
         window_seed: u32,
         consumed: &[u32],
     ) -> Result<bool, String> {
-        if !self.window_rollback {
-            return Ok(false);
-        }
         let Some((saved_start, saved_seed)) = self.last_window.take() else {
             return Ok(false);
         };

@@ -121,25 +121,19 @@ Developer knobs, not product configuration: every default is the measured
 winner, and each flag exists so the alternative can be benched in one session
 against one binary. The accessor's doc comment is the authority on semantics;
 this table is the index. The table describes the FLUX.1 path; on a FLUX.2 pipe
-`HIPFIRE_FLUX_F16_ACT` is ignored (that forward is f32-activation only) and
-`HIPFIRE_FLUX_GUIDANCE` is unreachable (Klein has no guidance embedder).
+activations stay f32 between kernels, and each GEMM casts its f32 input to f16
+(`cast_act`) before the WMMA GEMM. `HIPFIRE_FLUX_GUIDANCE` is unreachable
+(Klein has no guidance embedder).
 
 | flag | default | effect when set |
 |---|---|---|
-| `HIPFIRE_FLUX_F16_ACT` | on | `=0` runs the f32 activation path. Read once per process — the upload path and the forward must agree, because the f16 path splits `single_blocks.*.linear2.weight` into `.w_attn`/`.w_mlp` at upload and the f32 path keeps the fused tensor. |
 | `HIPFIRE_FLUX_GEMM_PIPE` | per-arch table (`Gpu::LDS_PIPE_ON`: gfx1151 on, others off) | `=1` forces the software-pipelined LDS GEMM main loop, `=0` the plain one. Both arms are compiled into the same module and are bit-exact, so an A/B measures only the main loop. A tile with no compiled `_p` twin always gets the plain loop. |
-| `HIPFIRE_FLUX_MOD_GEMV` | on | `=0` restores the per-block `mod_linear`/`linear` GEMM route. On, the 76 batch-1 modulation linears per step run as GEMVs into one `ModAll` buffer instead of one 128-row WMMA macro-tile each. Read once per process. |
 | `HIPFIRE_FLUX_ATTN` | measured per-arch route (`v2` on gfx1150/gfx1151/gfx1100, else `vt`) | `vt`, `vtk`, `v2` or `v5` pins the FLUX attention route. `v5` is F32-only; asking for F16 through it errors. Any other value is an error, so a typo cannot silently bench the default twice. |
-| `HIPFIRE_FLUX_GEMM_LDS` | on | `=0` forces the old 16-step WMMA GEMM instead of the LDS-staged 128x128 macro-tile kernel. The LDS kernel needs `K % 64 == 0` (true of every FLUX.1-dev linear); a ragged K falls back regardless. |
-| `HIPFIRE_FLUX_GEMM_WIDE` | on | `=0` pins the fixed 128x128 tile instead of the per-arch measured macro-tile (`_auto`). The per-arch winners differ — gfx1100's best tile is a 27% loss on gfx1151 — so there is no single tile. |
-| `HIPFIRE_FLUX_WPAD` | `64` | row pitch, in elements, added to every WMMA-GEMM-consumed FLUX weight at upload (must be a multiple of 16); `=0` uploads everything packed at `K`. Modulation weights, any `K` not a multiple of 64, and the `HIPFIRE_FLUX_GEMM_LDS=0`/`HIPFIRE_FLUX_GEMM_WIDE=0` fallback routes stay packed regardless. Bit-exact with the packed layout; gfx1151 measured 2.677 s/step padded vs 3.275 s/step packed on a 3-step probe. |
+| `HIPFIRE_FLUX_WPAD` | `64` | row pitch, in elements, added to every WMMA-GEMM-consumed FLUX weight at upload (must be a multiple of 16); `=0` uploads everything packed at `K`. Modulation weights and any `K` not a multiple of 64 stay packed regardless. Bit-exact with the packed layout; gfx1151 measured 2.677 s/step padded vs 3.275 s/step packed on a 3-step probe. |
 | `HIPFIRE_T5_GPU` | on | `=0` sends T5 and CLIP conditioning back to the host `t5::encode`/`clip::encode` f32 reference. That is the numeric-oracle escape hatch, not a normal route: the host encode is 54.9 s per prompt at real geometry. |
-| `HIPFIRE_IMG_COND_CACHE` | on | `=0` disables the conditioning cache completely — nothing is stored, conditioning takes the owned path and is freed after the denoise loop. Read once at pipe load. |
 | `HIPFIRE_IMG_PROFILE` | off | any value but `0` prints per-stage wall time on the GPU txt2img path. |
 | `HIPFIRE_PROFILE` | off | when set, the GPU txt2img path additionally prints a per-kernel-family table for each denoise step, plus a `gap` line (sum of the families vs the step wall time). |
 | `HIPFIRE_VAE_PROFILE` | off | any value but `0` prints per-kernel call counts and wall time for the GPU VAE decode. |
-| `HIPFIRE_VAE_CONV` | GEMM route | `=direct` pins the naive one-thread-per-output conv kernel and uploads the conv weights f32 to match. The GEMM route is also skipped automatically when some conv's K is not a multiple of 16. |
 | `HIPFIRE_VAE_IM2COL_MAP` | `lds` | `c` selects the channel-fastest scalar gather, `p` the pixel-fastest one (~6x worse). The default stages a halo patch through LDS so each input element crosses DRAM once instead of nine times. |
 | `HIPFIRE_VAE_IM2COL_TILE` | `64:8:16` (c_tile clamped to divide `c_in`) | `<c_tile>:<th>:<tw>` overrides the im2col workgroup tile. LDS cost is `c_tile*(th+2)*(tw+2)*2` bytes. A malformed value is an error, not a silent fallback. |
 | `HIPFIRE_VAE_TRANSPOSE` | naive scatter | `=tiled` selects the 32x32 LDS-tile transpose. The default won on the VAE's skinny shapes (347 vs 524 ms over a decode). |
-| `HIPFIRE_VAE_FUSE_NORM` | on | `=0` restores a separate GroupNorm + SiLU pair instead of folding the SiLU into the norm kernel. |

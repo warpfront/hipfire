@@ -68,11 +68,8 @@
 //! halves fail independently: an error in one errors only its own lanes and
 //! the other half's committed tokens are still emitted. The executor half's
 //! prefill ticks (first tokens) are emitted between the halves, before the
-//! mesh window (`HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH`; `emit_tick` is the one
-//! per-tick emission both positions use). Route mix by step
-//! concurrency is logged once per drive (`[fn-lane-mesh-mix]`). An AR EP store
-//! (kill switch `HIPFIRE_EP_MTP_LANES=0`) keeps the executor
-//! path unchanged.
+//! mesh window (`emit_tick` is the one per-tick emission both positions use).
+//! Route mix by step concurrency is logged once per drive (`[fn-lane-mesh-mix]`).
 
 use crate::ar::*;
 use crate::batch::{
@@ -83,8 +80,7 @@ use crate::common::{emit_committed_event, fit_max_tokens_if};
 use hipfire_arch_qwen4::bundle::{Qwen4Bundle, Qwen4PpLaneExecutor};
 use hipfire_arch_qwen4::ep_mesh_serve::{MeshDecodeRequest, MeshStepFacts};
 use hipfire_arch_qwen4::lane::pages::{
-    long_prefill_route_rows, page_budget_enabled, reservation_rows, PageDecision, PageVerdict,
-    LANE_PAGE_BUDGET_REFUSED,
+    long_prefill_route_rows, reservation_rows, PageDecision, PageVerdict, LANE_PAGE_BUDGET_REFUSED,
 };
 use hipfire_arch_qwen4::lane::{LaneSampling, LaneSpecStats, LaneStatus};
 use hipfire_arch_qwen4::lane_exec::{
@@ -405,53 +401,6 @@ fn forwarded_tokens(seed: u32, committed: &[u32], skip_seed: bool) -> Vec<u32> {
     }
 }
 
-/// `HIPFIRE_LANE_EARLY_FIRST_TOKEN`: unset / anything but exact `0` streams a lane's
-/// prompt-completing pick in the step whose prefill committed it; `0` (kill switch) defers it
-/// to the lane's first decode advance (as its plan seed, after that step's window).
-pub const LANE_EARLY_FIRST_TOKEN_ENV: &str = "HIPFIRE_LANE_EARLY_FIRST_TOKEN";
-
-fn early_first_token_from(value: Option<&str>) -> bool {
-    value.map(str::trim) != Some("0")
-}
-
-static LANE_EARLY_FIRST_TOKEN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    early_first_token_from(
-        hipfire_config::developer_var(LANE_EARLY_FIRST_TOKEN_ENV)
-            .ok()
-            .as_deref(),
-    )
-});
-
-fn early_first_token_enabled() -> bool {
-    *LANE_EARLY_FIRST_TOKEN
-}
-
-/// `HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH`: unset / anything but exact `0` streams the executor
-/// half's prefill ticks (the early first tokens, abort / stop / EOS / length finishes and the
-/// `prefill_progress` events of the lanes whose prompt chunk this step ran) right after the
-/// executor commits and BEFORE the step's EP mesh decode window runs; `0` (kill switch)
-/// emits them after that window, with the rest of the tick. Meaningful only with
-/// `HIPFIRE_LANE_EARLY_FIRST_TOKEN` on, and only on a step that carries a mesh window.
-pub const LANE_FIRST_TOKEN_BEFORE_MESH_ENV: &str = "HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH";
-
-/// `early`: the resolved `HIPFIRE_LANE_EARLY_FIRST_TOKEN` (off: nothing to move, today's order).
-fn first_token_before_mesh_from(early: bool, value: Option<&str>) -> bool {
-    early && value.map(str::trim) != Some("0")
-}
-
-static LANE_FIRST_TOKEN_BEFORE_MESH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    first_token_before_mesh_from(
-        early_first_token_enabled(),
-        hipfire_config::developer_var(LANE_FIRST_TOKEN_BEFORE_MESH_ENV)
-            .ok()
-            .as_deref(),
-    )
-});
-
-fn first_token_before_mesh_enabled() -> bool {
-    *LANE_FIRST_TOKEN_BEFORE_MESH
-}
-
 /// `HIPFIRE_LANE_ADMIT_COALESCE_MS`: the quiet gap (ms) a lane-admission tick waits for one
 /// more arrival before its new prompts prefill (unset: [`ADMIT_COALESCE_DEFAULT_MS`]; `0`
 /// is the kill switch; values above [`ADMIT_COALESCE_MAX_MS`] are clamped). The whole wait of
@@ -461,7 +410,7 @@ const ADMIT_COALESCE_DEFAULT_MS: u64 = 2;
 const ADMIT_COALESCE_MAX_MS: u64 = 20;
 const ADMIT_COALESCE_GAPS: u32 = 5;
 /// Queued requests that make a tick a burst on their own; below it only a lone fresh request
-/// that stays a lane arms the wait ([`coalesce_arms`], `HIPFIRE_LANE_ADMIT_COALESCE_FIRST`).
+/// that stays a lane arms the wait ([`coalesce_arms`]).
 const ADMIT_COALESCE_MIN_QUEUED: usize = 2;
 
 fn admit_coalesce_from(value: Option<&str>) -> Option<Duration> {
@@ -485,45 +434,17 @@ fn admit_coalesce_gap() -> Option<Duration> {
     *LANE_ADMIT_COALESCE
 }
 
-/// `HIPFIRE_LANE_ADMIT_COALESCE_FIRST`: unset / anything but exact `0` also arms the admission
-/// wait on a single queued request whose front can take a free lane now, where a lone request
-/// stays a lane (`qwen4_lone_request_takes_lane`: EP / PP lanes): the first arrival waits one
-/// gap for a second (a gap with no arrival ends the wait), re-armed per arrival within the
-/// tick's whole budget. `0` (kill switch) arms it from [`ADMIT_COALESCE_MIN_QUEUED`] queued
-/// requests only, as before. A topology that hands a lone request to the singleton route
-/// (single device, PP with a speculator) never waits for it, whatever this says;
-/// `HIPFIRE_LANE_ADMIT_COALESCE_MS=0` still turns the whole wait off.
-pub const LANE_ADMIT_COALESCE_FIRST_ENV: &str = "HIPFIRE_LANE_ADMIT_COALESCE_FIRST";
-
-fn admit_coalesce_first_from(value: Option<&str>) -> bool {
-    value.map(str::trim) != Some("0")
-}
-
-static LANE_ADMIT_COALESCE_FIRST: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    admit_coalesce_first_from(
-        hipfire_config::developer_var(LANE_ADMIT_COALESCE_FIRST_ENV)
-            .ok()
-            .as_deref(),
-    )
-});
-
-fn admit_coalesce_first_enabled() -> bool {
-    *LANE_ADMIT_COALESCE_FIRST
-}
-
 /// Whether a tick's admission waits for stragglers (the caller also needs the queue front to
 /// be assignable and a gap configured): a burst of [`ADMIT_COALESCE_MIN_QUEUED`] or more
-/// queued requests always does; a lone one only with `first` on, not already held by the page
-/// budget (`held_by_pages`: a wait cannot admit it sooner) and where it stays a lane
+/// queued requests always does; a lone one only when not already held by the page budget
+/// (`held_by_pages`: a wait cannot admit it sooner) and where it stays a lane
 /// (`lone_takes_lane`, consulted only then).
 fn coalesce_arms(
-    first: bool,
     queued: usize,
     held_by_pages: bool,
     lone_takes_lane: impl FnOnce() -> bool,
 ) -> bool {
-    queued >= ADMIT_COALESCE_MIN_QUEUED
-        || (first && queued == 1 && !held_by_pages && lone_takes_lane())
+    queued >= ADMIT_COALESCE_MIN_QUEUED || (queued == 1 && !held_by_pages && lone_takes_lane())
 }
 
 /// The timeout of the tick's next straggler wait, `elapsed` into it: one `gap`, never past
@@ -740,7 +661,7 @@ fn lane_step_failed(
     message: &str,
     requeue: &mut RequeueBook,
 ) -> Result<(), String> {
-    if page_budget_enabled() && message.contains(PROVISION_MAP_REFUSED) {
+    if message.contains(PROVISION_MAP_REFUSED) {
         let candidate = match &sched.lanes[idx] {
             BatchLane::Running(l) | BatchLane::Seeding(l) if l.streamed_tokens.is_empty() => {
                 Some((l.key.clone(), l.ticket.admission))
@@ -932,8 +853,7 @@ fn gate_page_decision(
 
 /// The lane page budget at the queue front (see `hipfire_arch_qwen4::lane::pages`): before the
 /// front request takes a lane, reserve-check its worst-case context growth against every rank's
-/// free device pages. `Proceed` with nothing when the kill switch is set
-/// (`HIPFIRE_QWEN4_LANE_PAGE_BUDGET=0`), nothing is assignable, the request goes back to the
+/// free device pages. `Proceed` with nothing when nothing is assignable, the request goes back to the
 /// singleton, the admission below refuses it on its own terms, or the budget cannot be measured.
 fn page_budget_gate(
     sched: &ContinuousBatchScheduler,
@@ -944,9 +864,6 @@ fn page_budget_gate(
     requeued: &RequeueBook,
     wait: &mut Option<PageWait>,
 ) -> Result<PageGate, String> {
-    if !page_budget_enabled() {
-        return Ok(PageGate::proceed(None, None, None));
-    }
     let Some(key) = sched.assignable_front().cloned() else {
         return Ok(PageGate::proceed(None, None, None));
     };
@@ -1133,8 +1050,7 @@ struct PlannedStep {
 /// batched draft (one D2H per draft step); `fwd` is provision + forward
 /// (synchronized by the pick download); then `commit` (the executor's commit and the
 /// mesh decode window) and `emit`, which also holds the prefill ticks emitted before the
-/// mesh window (`HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH`). Rows by
-/// kind, decoding/active lanes, the queue and the committed tokens follow.
+/// mesh window. Rows by kind, decoding/active lanes, the queue and the committed tokens follow.
 struct StepTrace {
     origin: Instant,
     last: Instant,
@@ -1693,9 +1609,7 @@ fn emit_tick(
         // The prompt-completing pick streams in THIS step (it is the lane's
         // committed first token; its next decode advance then skips it as the
         // plan seed), not one decode step later with that step's window.
-        // `HIPFIRE_LANE_EARLY_FIRST_TOKEN=0` restores the deferred emission.
-        let early = early_first_token_enabled()
-            && !advance.committed_ids.is_empty()
+        let early = !advance.committed_ids.is_empty()
             && matches!(sched.lanes[idx], BatchLane::Running(_))
             && controls[idx]
                 .as_ref()
@@ -1985,12 +1899,9 @@ pub fn drive_qwen4_lane_batch(
             // at most (a gap with no arrival ends the wait); a queue behind a full lane set and
             // a lone request a single device hands back to the singleton route never wait.
             if let Some(gap) = admit_coalesce_gap().filter(|_| barrier.is_none()) {
-                if coalesce_arms(
-                    admit_coalesce_first_enabled(),
-                    sched.inbox.len(),
-                    page_wait.is_some(),
-                    || qwen4_lone_request_takes_lane(m),
-                ) && sched.assignable_front().is_some()
+                if coalesce_arms(sched.inbox.len(), page_wait.is_some(), || {
+                    qwen4_lone_request_takes_lane(m)
+                }) && sched.assignable_front().is_some()
                 {
                     let started = Instant::now();
                     while barrier.is_none() {
@@ -2363,7 +2274,7 @@ pub fn drive_qwen4_lane_batch(
             // were Decoding when the step was planned, never a lane this step prefilled, so a
             // lane finished here is not in it. Every other tick keeps its place below.
             let mut early_emit = Duration::ZERO;
-            if first_token_before_mesh_enabled() && !mesh_requests.is_empty() {
+            if !mesh_requests.is_empty() {
                 let t_early = Instant::now();
                 let (prefill, rest): (Vec<_>, Vec<_>) = ticks
                     .into_iter()
@@ -2601,7 +2512,7 @@ mod tests {
     }
 
     /// Every failure site of a lane step (draft, executor, mesh) goes through `lane_step_failed`, which
-    /// requeues only a mapping refusal of a request that streamed nothing and only with the budget on.
+    /// requeues only a mapping refusal of a request that streamed nothing.
     #[test]
     fn every_step_failure_site_goes_through_the_requeue_rule() {
         let src = include_str!("fn_batch.rs");
@@ -2611,7 +2522,6 @@ mod tests {
         assert_eq!(body.matches("lane_step_failed(").count(), 3);
         let rule = prod.find("fn lane_step_failed(").expect("rule");
         let rule_src = &prod[rule..(rule + 2400).min(prod.len())];
-        assert!(rule_src.contains("page_budget_enabled()"));
         assert!(rule_src.contains("PROVISION_MAP_REFUSED"));
         assert!(rule_src.contains("streamed_tokens.is_empty()"));
     }
@@ -2664,10 +2574,9 @@ mod tests {
         );
     }
 
-    /// The gate sits before the lane assignment and the reservation after the admission, and the
-    /// kill switch short-circuits the gate before anything is read or rendered.
+    /// The gate sits before the lane assignment and the reservation after the admission.
     #[test]
-    fn the_page_gate_precedes_assignment_and_the_kill_switch_precedes_the_gate() {
+    fn the_page_gate_precedes_assignment() {
         let src = include_str!("fn_batch.rs");
         let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
         let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
@@ -2681,16 +2590,6 @@ mod tests {
             .find(".reserve_pages(&epoch, lane_rows)")
             .expect("reservation");
         assert!(gate < assign && assign < admit && admit < reserve);
-        let gate_fn = prod.find("fn page_budget_gate(").expect("gate fn");
-        let gate_src = &prod[gate_fn..];
-        let switch = gate_src
-            .find("if !page_budget_enabled()")
-            .expect("kill switch");
-        let first_read = gate_src.find("sched.assignable_front()").expect("peek");
-        assert!(
-            switch < first_read,
-            "the kill switch is the first thing the gate checks"
-        );
     }
 
     /// The elastic reserve gives its bank back before the page numbers are read: the `admit`
@@ -2910,32 +2809,6 @@ mod tests {
     }
 
     #[test]
-    fn early_first_token_is_on_unless_exact_zero() {
-        use super::early_first_token_from;
-        for on in [None, Some(""), Some("1"), Some("on"), Some(" 1 ")] {
-            assert!(early_first_token_from(on), "{on:?}");
-        }
-        for off in [Some("0"), Some(" 0\n")] {
-            assert!(!early_first_token_from(off), "{off:?}");
-        }
-    }
-
-    #[test]
-    fn first_token_before_mesh_is_on_unless_exact_zero_and_needs_the_early_first_token() {
-        use super::first_token_before_mesh_from;
-        for on in [None, Some(""), Some("1"), Some("on"), Some(" 1 ")] {
-            assert!(first_token_before_mesh_from(true, on), "{on:?}");
-        }
-        for off in [Some("0"), Some(" 0\n")] {
-            assert!(!first_token_before_mesh_from(true, off), "{off:?}");
-        }
-        // With the early first token off there is no first token to move: today's order.
-        for any in [None, Some("1"), Some("0")] {
-            assert!(!first_token_before_mesh_from(false, any), "{any:?}");
-        }
-    }
-
-    #[test]
     fn only_the_executors_prefill_rows_are_prefill_ticks() {
         use super::is_prefill_tick;
         use hipfire_runtime::slot_batch::{
@@ -2989,7 +2862,7 @@ mod tests {
             .find("executor.commit_step(&plan, out)")
             .expect("executor commit");
         let early = body
-            .find("if first_token_before_mesh_enabled() && !mesh_requests.is_empty()")
+            .find("if !mesh_requests.is_empty()")
             .expect("before-mesh emission");
         let mesh = body.find("ep_mesh_decode_step").expect("mesh half");
         let rest = body
@@ -3047,17 +2920,6 @@ mod tests {
     }
 
     #[test]
-    fn admit_coalesce_first_is_on_unless_exact_zero() {
-        use super::admit_coalesce_first_from;
-        for on in [None, Some(""), Some("1"), Some("on"), Some(" 1 ")] {
-            assert!(admit_coalesce_first_from(on), "{on:?}");
-        }
-        for off in [Some("0"), Some(" 0\n")] {
-            assert!(!admit_coalesce_first_from(off), "{off:?}");
-        }
-    }
-
-    #[test]
     fn the_wait_budget_is_five_gaps_with_a_free_lane_left() {
         use super::{coalesce_next_wait, ADMIT_COALESCE_GAPS};
         let gap = Duration::from_millis(2);
@@ -3099,15 +2961,14 @@ mod tests {
         assert!(block.contains(".filter(|_| barrier.is_none())"));
         let arms = block.find("coalesce_arms(").expect("arming rule");
         let rest = &block[arms..];
-        let first = rest.find("admit_coalesce_first_enabled()").expect("switch");
         let held = rest.find("page_wait.is_some()").expect("page hold");
         let topology = rest
-            .find("|| qwen4_lone_request_takes_lane(m)")
+            .find("qwen4_lone_request_takes_lane(m)")
             .expect("lone topology");
         let front = rest
             .find("sched.assignable_front().is_some()")
             .expect("assignable front");
-        assert!(first < held && held < topology && topology < front);
+        assert!(held < topology && topology < front);
         assert!(rest.contains("coalesce_next_wait(gap, started.elapsed(), room)"));
         let recv = rest.find("inbox.recv_timeout(wait)").expect("one gap");
         let none = rest.find("Err(_) => break").expect("empty gap ends");
@@ -3123,7 +2984,7 @@ mod tests {
         let src = include_str!("fn_batch.rs");
         let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
         let at = prod
-            .find("let early = early_first_token_enabled()")
+            .find("let early = !advance.committed_ids.is_empty()")
             .expect("early emit");
         let body = &prod[at..];
         let flag = body
@@ -3231,25 +3092,20 @@ mod tests {
     /// only delay its singleton start). On a lane topology a session-reuse hand-back still
     /// waited its one gap: the probe runs at assignment, after the wait.
     #[test]
-    fn a_lone_request_waits_only_where_it_stays_a_lane_and_the_switch_is_on() {
+    fn a_lone_request_waits_only_where_it_stays_a_lane() {
         use super::{coalesce_arms, lone_arrival_hands_back};
-        // A burst arms whatever the switch and topology, without asking the topology.
-        for first in [true, false] {
-            for queued in [2usize, 3, 8] {
-                assert!(coalesce_arms(first, queued, false, || {
-                    panic!("burst: no topology probe")
-                }));
-            }
-            assert!(!coalesce_arms(first, 0, false, || panic!("empty queue")));
+        // A burst arms whatever the topology, without asking the topology.
+        for queued in [2usize, 3, 8] {
+            assert!(coalesce_arms(queued, false, || {
+                panic!("burst: no topology probe")
+            }));
         }
-        // A lone fresh request: on where it stays a lane, off with the kill switch (today's
-        // `>= 2` rule), never when the page budget already holds it.
-        assert!(coalesce_arms(true, 1, false, || true));
-        assert!(!coalesce_arms(true, 1, false, || false));
-        assert!(!coalesce_arms(false, 1, false, || {
-            panic!("kill switch: no topology probe")
-        }));
-        assert!(!coalesce_arms(true, 1, true, || {
+        assert!(!coalesce_arms(0, false, || panic!("empty queue")));
+        // A lone fresh request: on where it stays a lane, never when the page budget already
+        // holds it.
+        assert!(coalesce_arms(1, false, || true));
+        assert!(!coalesce_arms(1, false, || false));
+        assert!(!coalesce_arms(1, true, || {
             panic!("page-held: no topology probe")
         }));
         for (topology, speculator, armed) in [
@@ -3262,7 +3118,7 @@ mod tests {
         ] {
             let lone_lane = crate::batch::qwen4_lone_lane(topology, speculator);
             assert_eq!(
-                coalesce_arms(true, 1, false, || lone_lane),
+                coalesce_arms(1, false, || lone_lane),
                 armed,
                 "{topology} speculator={speculator}"
             );
@@ -3289,14 +3145,9 @@ mod tests {
     struct Coalesce {
         /// `HIPFIRE_LANE_ADMIT_COALESCE_MS` (`0`: the whole wait is off).
         gap_ms: u64,
-        /// `HIPFIRE_LANE_ADMIT_COALESCE_FIRST`.
-        first: bool,
     }
 
-    const COALESCE_DEFAULT: Coalesce = Coalesce {
-        gap_ms: 2,
-        first: true,
-    };
+    const COALESCE_DEFAULT: Coalesce = Coalesce { gap_ms: 2 };
 
     /// [`simulate_burst_at`] for `n` requests of which the last `late` land during the first
     /// lane step (50 ms in, long past the coalescing budget) and the rest are in the inbox when
@@ -3405,7 +3256,7 @@ mod tests {
             // The driver's coalescing wait (first tick only: later ticks have nothing queued).
             if step == 0
                 && coalesce.gap_ms > 0
-                && super::coalesce_arms(coalesce.first, sched.inbox.len(), false, || lone_lane)
+                && super::coalesce_arms(sched.inbox.len(), false, || lone_lane)
                 && sched.assignable_front().is_some()
             {
                 let gap = Duration::from_millis(coalesce.gap_ms);
@@ -3463,19 +3314,9 @@ mod tests {
     fn simultaneous_arrivals_on_ep_and_pp_decode_as_lanes_from_the_first_step() {
         for topology in ["ep", "pp"] {
             for n in [1usize, 4, 8] {
-                // Simultaneous arrivals are lanes from step 0 with the lone-first wait on or
-                // killed, and with the whole wait off: nothing to join, same ids.
-                for coalesce in [
-                    COALESCE_DEFAULT,
-                    Coalesce {
-                        first: false,
-                        ..COALESCE_DEFAULT
-                    },
-                    Coalesce {
-                        gap_ms: 0,
-                        ..COALESCE_DEFAULT
-                    },
-                ] {
+                // Simultaneous arrivals are lanes from step 0 with the wait on and with the
+                // whole wait off: nothing to join, same ids.
+                for coalesce in [COALESCE_DEFAULT, Coalesce { gap_ms: 0 }] {
                     let (active, ids, _) = simulate_burst_at(topology, coalesce, &vec![0; n], 6)
                         .expect("EP/PP lone request takes a lane");
                     assert_eq!(active, vec![n; 6], "{topology} C{n}: active from step 0");
@@ -3495,23 +3336,18 @@ mod tests {
         // The daemon dispatched request 0 alone; 7 more land during its first
         // step (past the coalescing wait): they are lanes at step 1 (active 8), not a
         // queue behind a singleton, and every lane's ids are the solo ids.
-        for first in [true, false] {
-            let arrivals = [0, 50, 50, 50, 50, 50, 50, 50];
-            let coalesce = Coalesce {
-                first,
-                ..COALESCE_DEFAULT
-            };
-            let (active, ids, _) = simulate_burst_at("ep", coalesce, &arrivals, 6).expect("lane");
-            assert_eq!(active, vec![1, 8, 8, 8, 8, 8], "first={first}");
-            // A late lane starts at its own position 0 at the step it joins.
-            for (i, lane_ids) in ids.iter().enumerate() {
-                let expect = if i == 0 { 6 } else { 5 };
-                assert_eq!(lane_ids.len(), expect, "lane {i}");
-                let solo = (0..lane_ids.len())
-                    .map(|g| scripted_next(&[i as u32 + 1, 7, 11], g))
-                    .collect::<Vec<_>>();
-                assert_eq!(lane_ids, &solo);
-            }
+        let arrivals = [0, 50, 50, 50, 50, 50, 50, 50];
+        let (active, ids, _) =
+            simulate_burst_at("ep", COALESCE_DEFAULT, &arrivals, 6).expect("lane");
+        assert_eq!(active, vec![1, 8, 8, 8, 8, 8]);
+        // A late lane starts at its own position 0 at the step it joins.
+        for (i, lane_ids) in ids.iter().enumerate() {
+            let expect = if i == 0 { 6 } else { 5 };
+            assert_eq!(lane_ids.len(), expect, "lane {i}");
+            let solo = (0..lane_ids.len())
+                .map(|g| scripted_next(&[i as u32 + 1, 7, 11], g))
+                .collect::<Vec<_>>();
+            assert_eq!(lane_ids, &solo);
         }
         assert_eq!(
             simulate_burst("ep", 8, 7, 6).expect("lane").0,
@@ -3520,7 +3356,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_first_request_waits_exactly_one_gap_and_the_kill_switch_restores_no_wait() {
+    fn a_lone_first_request_waits_exactly_one_gap() {
         for topology in ["ep", "pp"] {
             let run = |coalesce| {
                 simulate_burst_at(topology, coalesce, &[0], 3).expect("EP/PP lone request lane")
@@ -3528,22 +3364,10 @@ mod tests {
             // A lone request with no second arrival: one gap, not more (<= 2 ms by default).
             let (active, _, waited) = run(COALESCE_DEFAULT);
             assert_eq!((active, waited), (vec![1, 1, 1], 2), "{topology}");
-            let (_, _, waited) = run(Coalesce {
-                gap_ms: 20,
-                ..COALESCE_DEFAULT
-            });
+            let (_, _, waited) = run(Coalesce { gap_ms: 20 });
             assert_eq!(waited, 20, "{topology}: one gap at the clamp");
-            // `HIPFIRE_LANE_ADMIT_COALESCE_FIRST=0`: today's `>= 2` rule, no wait for a lone one.
-            let (_, _, waited) = run(Coalesce {
-                first: false,
-                ..COALESCE_DEFAULT
-            });
-            assert_eq!(waited, 0, "{topology}: kill switch");
             // `HIPFIRE_LANE_ADMIT_COALESCE_MS=0`: the whole wait is off.
-            let (_, _, waited) = run(Coalesce {
-                gap_ms: 0,
-                ..COALESCE_DEFAULT
-            });
+            let (_, _, waited) = run(Coalesce { gap_ms: 0 });
             assert_eq!(waited, 0, "{topology}: gap off");
         }
     }
@@ -3554,13 +3378,8 @@ mod tests {
             let at = |arrivals: &[u64], coalesce| {
                 simulate_burst_at(topology, coalesce, arrivals, 5).expect("lane")
             };
-            let off = Coalesce {
-                first: false,
-                ..COALESCE_DEFAULT
-            };
             // Two arrivals 1 ms after the first: the lone first request waits for them (each
-            // re-arms the gap; one empty gap ends it) and all three prefill in step 0. With the
-            // kill switch the first request runs alone and they join one step later.
+            // re-arms the gap; one empty gap ends it) and all three prefill in step 0.
             let (active, ids, waited) = at(&[0, 1, 1], COALESCE_DEFAULT);
             assert_eq!((active, waited), (vec![3; 5], 3), "{topology}");
             let solo = |i: usize, len: usize| {
@@ -3570,17 +3389,6 @@ mod tests {
             };
             for (i, lane_ids) in ids.iter().enumerate() {
                 assert_eq!(lane_ids, &solo(i, 5), "{topology} lane {i}");
-            }
-            let (active, ids, waited) = at(&[0, 1, 1], off);
-            assert_eq!((active, waited), (vec![1, 3, 3, 3, 3], 0), "{topology}");
-            for (i, lane_ids) in ids.iter().enumerate() {
-                let len = if i == 0 { 5 } else { 4 };
-                assert_eq!(lane_ids, &solo(i, len), "{topology} lane {i}");
-            }
-            // A burst (two queued at the first drain) waits under either switch.
-            for coalesce in [COALESCE_DEFAULT, off] {
-                let (active, _, waited) = at(&[0, 0, 1], coalesce);
-                assert_eq!((active, waited), (vec![3; 5], 3), "{topology}");
             }
             // An arrival past the gap is one step later; it never extends the wait.
             let (active, _, waited) = at(&[0, 3], COALESCE_DEFAULT);
@@ -3610,12 +3418,12 @@ mod tests {
         assert!(simulate_burst("single", 8, 0, 3).is_none());
         assert!(crate::batch::qwen4_lone_lane("ep", true));
         assert!(!crate::batch::qwen4_lone_lane("pp", true));
-        // Neither singleton-route topology waits for a lone request, with the new switch on.
+        // Neither singleton-route topology waits for a lone request.
         for (topology, speculator) in [("single", false), ("single", true), ("pp", true)] {
             let lone_lane = crate::batch::qwen4_lone_lane(topology, speculator);
             assert!(!lone_lane, "{topology} speculator={speculator}");
             assert!(
-                !super::coalesce_arms(true, 1, false, || lone_lane),
+                !super::coalesce_arms(1, false, || lone_lane),
                 "{topology} speculator={speculator}"
             );
         }
