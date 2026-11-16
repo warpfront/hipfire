@@ -103,11 +103,11 @@ pub enum StreamMixStage<'a> {
         controls: StreamControls<'a>,
     },
     /// [`Route`](Self::Route) followed by [`Aggregate`](Self::Aggregate) of the same
-    /// site, outputs bit-identical to running the two stages in order. With
-    /// `HIPFIRE_RAON_MHC_FUSED=1` (gfx-independent, prefill rows >=
-    /// [`MHC_FUSED_MIN_ROWS`], supported geometry) the old streams are read once for
-    /// both the weightless RMS and the aggregate instead of twice; otherwise it
-    /// launches the two stages.
+    /// site, outputs bit-identical to running the two stages in order. Where the
+    /// fused kernel is admitted (gfx-independent: prefill rows >=
+    /// [`MHC_FUSED_MIN_ROWS`] on a supported geometry) the old streams are read
+    /// once for both the weightless RMS and the aggregate instead of twice;
+    /// otherwise it launches the two stages.
     RouteAggregate {
         /// Old streams `[rows, n, width]` (read).
         streams: &'a GpuTensor,
@@ -477,12 +477,11 @@ pub fn preload_stream_mix(gpu: &mut Gpu) -> Result<(), DispatchError> {
 /// speculative verify (rows <= 16) keep the two-stage chain.
 pub const MHC_FUSED_MIN_ROWS: usize = 64;
 
-/// `HIPFIRE_RAON_MHC_FUSED`: default ON (bit-identical); `0` kills; `1` fuses the Helmert route finalize into
-/// the aggregate (one pass over the old streams), `0` is the kill switch.
+/// Whether the Helmert route finalize fuses into the aggregate (one pass over the
+/// old streams): prefill batches of at least [`MHC_FUSED_MIN_ROWS`] rows on a
+/// supported geometry.
 fn mhc_fused_admitted(n: usize, width: usize, rows: usize) -> bool {
-    rows >= MHC_FUSED_MIN_ROWS
-        && Gpu::stream_mix_route_aggregate_supported(n, width)
-        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_FUSED", true)
+    rows >= MHC_FUSED_MIN_ROWS && Gpu::stream_mix_route_aggregate_supported(n, width)
 }
 
 /// Selector projection `selector_out[r, :] = selector . streams[r, :]` of a

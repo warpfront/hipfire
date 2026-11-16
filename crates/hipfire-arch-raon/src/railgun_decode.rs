@@ -19,9 +19,9 @@
 //! * `1` forces the owner (whatever the arch or corpus) and logs every
 //!   decline once per kind.
 //!
-//! With no corpus anywhere the owner (unless `HIPFIRE_RAON_RAILGUN_LOCAL_CORPUS=0`)
-//! builds the per-user one once, right after the decode graph's warm-up step,
-//! from the objects the process loaded (see [`crate::railgun_provision`]).
+//! With no corpus anywhere the owner builds the per-user one once, right after
+//! the decode graph's warm-up step, from the objects the process loaded (see
+//! [`crate::railgun_provision`]).
 //!
 //! A step through the owner:
 //!
@@ -88,7 +88,7 @@ use crate::forward::{
 };
 use crate::mla::MlaRoute;
 use crate::railgun_provision::{
-    locate_binary, provision, BinaryLookup, ProvisionSpec, BINARY, ENV_LOCAL_CORPUS, TIMEOUT,
+    locate_binary, provision, BinaryLookup, ProvisionSpec, BINARY, TIMEOUT,
 };
 
 /// `HIPFIRE_RAON_RAILGUN`: `auto` (default) | `1` | `0` (hard kill).
@@ -537,9 +537,6 @@ pub struct Candidates<'a> {
     pub pack: Option<&'a str>,
     /// The per-user directory a first-load build publishes to.
     pub local: Option<&'a str>,
-    /// `HIPFIRE_RAON_RAILGUN_LOCAL_CORPUS` (default on): a missing corpus may
-    /// be built into `local`.
-    pub may_provision: bool,
 }
 
 /// The first of `dirs` that holds a corpus.
@@ -566,7 +563,7 @@ pub fn decide_owner(
     has_index: &dyn Fn(&str) -> bool,
 ) -> Result<OwnerPlan, NoOwner> {
     let env = c.env.filter(|d| !d.is_empty());
-    let buildable = c.may_provision && c.local.is_some();
+    let buildable = c.local.is_some();
     match mode {
         RailgunMode::Off => Err(NoOwner::Killed),
         RailgunMode::Force => {
@@ -1370,9 +1367,9 @@ impl RaonRailgunOwner {
     /// before reading anything else. An unrecognised spelling fails closed to
     /// `0` with a message. In `auto` an explicitly set
     /// `HIPFIRE_RAON_RAILGUN_CORPUS` that holds no corpus is reported once;
-    /// every other reason for no owner is silent. With no corpus anywhere and
-    /// `HIPFIRE_RAON_RAILGUN_LOCAL_CORPUS` not `0`, the owner is created
-    /// waiting to build the per-user corpus after the decode graph's warm-up.
+    /// every other reason for no owner is silent. With no corpus anywhere the
+    /// owner is created, waiting to build the per-user corpus after the decode
+    /// graph's warm-up.
     pub(crate) fn from_config(b: &RaonBundle, gpu: &Gpu) -> Option<Box<Self>> {
         let mode = parse_mode(gpu.flags.raon_railgun.as_deref()).unwrap_or_else(|e| {
             eprintln!("[raon-railgun] {e}");
@@ -1413,7 +1410,6 @@ impl RaonRailgunOwner {
                 env: env_corpus.as_deref(),
                 pack: pack_corpus.as_deref(),
                 local: Some(&local_corpus),
-                may_provision: hipfire_config::developer_bool(ENV_LOCAL_CORPUS, true),
             },
             &|dir| Path::new(dir).join(railgun_corpus::CORPUS_INDEX).is_file(),
         );

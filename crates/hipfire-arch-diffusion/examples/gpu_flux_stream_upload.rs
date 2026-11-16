@@ -182,8 +182,8 @@ fn main() {
     let rss_after_eager = peak_rss_mib();
 
     // ── bit-for-bit comparison ─────────────────────────────────────────
-    // Compare the UPLOADED key sets, not the manifest key list. With the
-    // default `HIPFIRE_FLUX_F16_ACT`, the upload convention splits every
+    // Compare the UPLOADED key sets, not the manifest key list. The upload
+    // convention splits every
     // `single_blocks.N.linear2.weight` along K into `.linear2.w_attn.weight`
     // and `.linear2.w_mlp.weight` (see `upload_flux_key` / `stream_into` in
     // `flux_gpu.rs`), so the fused manifest name is a key of NEITHER map and

@@ -302,13 +302,11 @@ pub fn generate_img(
     // Conditioning-cache state, read after the generation borrow
     // ends. The cache itself lives in the bundle (so it is
     // daemon-lifetime by construction and needs no daemon-side
-    // storage); these two fields exist so a client — or the
+    // storage); this field exists so a client — or the
     // serve harness — can tell a cached prompt from a re-encoded
     // one without timing it. `cond_cached` counts resident
-    // `(prompt, t5_seq)` entries; it is 0 whenever
-    // `HIPFIRE_IMG_COND_CACHE=0`, which clears after each run.
+    // `(prompt, t5_seq)` entries.
     let cond_cached = pipe.bundle.cond_cache.len();
-    let cond_cache_on = pipe.bundle.cond_cache.is_enabled();
     match result {
         Ok(out) => {
             let png_b64 = base64::engine::general_purpose::STANDARD.encode(&out.png);
@@ -323,7 +321,6 @@ pub fn generate_img(
                 "height": oh,
                 "steps": steps,
                 "backend": backend,
-                "cond_cache": cond_cache_on,
                 "cond_cached": cond_cached,
                 "references": references.len(),
                 "ms": started.elapsed().as_millis() as u64,

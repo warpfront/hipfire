@@ -12,13 +12,12 @@
 //!
 //! `digest` runs `--calls` consecutive calls (conv histories and recurrent state chain) per row count and
 //! prints one JSON line per case with an FNV-1a digest of `gated`, the recurrent state and the three conv
-//! histories; two processes with different `HIPFIRE_RAON_RDA_*` flags are bit-identical iff the digests
+//! histories; two builds (or processes) are bit-identical iff the digests
 //! agree. `bench` times `--layers` back-to-back layer calls over `--sets` rotating input sets (so the raw
 //! planes are not cache-warm) and prints ms per layer / per `--layers` layers.
 //!
 //! Build: cargo build --release -j 8 -p hipfire-arch-raon --features lab --example rda_layer_node
-//! Run (GPU, through fabric): rda_layer_node digest | bench, flags via HIPFIRE_RAON_RDA_FUSED_PREP /
-//! HIPFIRE_RAON_RDA_SEGMENT / HIPFIRE_GATED_DELTA_VECTOR_CHUNKED.
+//! Run (GPU, through fabric): rda_layer_node digest | bench.
 
 use hipfire_dispatch::pipeline::rda::{
     rda_forward_rows, RdaGeometry, RdaLayer, RdaLayerState, RdaProjected, RdaScratch,
@@ -193,15 +192,6 @@ fn arg(args: &[String], key: &str) -> Option<String> {
         .and_then(|p| args.get(p + 1).cloned())
 }
 
-fn flags() -> serde_json::Value {
-    let e = |k: &str| std::env::var(k).unwrap_or_default();
-    json!({
-        "HIPFIRE_RAON_RDA_FUSED_PREP": e("HIPFIRE_RAON_RDA_FUSED_PREP"),
-        "HIPFIRE_RAON_RDA_SEGMENT": e("HIPFIRE_RAON_RDA_SEGMENT"),
-        "HIPFIRE_GATED_DELTA_VECTOR_CHUNKED": e("HIPFIRE_GATED_DELTA_VECTOR_CHUNKED"),
-    })
-}
-
 fn digest(gpu: &mut Gpu, args: &[String]) -> Res<()> {
     let rows_list: Vec<usize> = arg(args, "--rows")
         .unwrap_or_else(|| "64,512,4096,16384".into())
@@ -254,7 +244,7 @@ fn digest(gpu: &mut Gpu, args: &[String]) -> Res<()> {
             "{}",
             json!({"record": "digest", "rows": rows, "calls": calls, "chunk": chunk, "digest": format!("{h:016x}"),
                    "gated_parts": gated_h, "state": format!("{sh:016x}"), "hist": hh,
-                   "finite": st.iter().all(|x| x.is_finite()), "flags": flags()})
+                   "finite": st.iter().all(|x| x.is_finite())})
         );
         for t in [l.state, l.hq, l.hk, l.hv, gated] {
             gpu.free_tensor(t)?;
@@ -329,7 +319,7 @@ fn bench(gpu: &mut Gpu, args: &[String]) -> Res<()> {
     println!(
         "{}",
         json!({"record": "bench", "rows": rows, "layers": layers, "sets": sets, "reps_ms": ms,
-               "median_ms": median, "ms_per_layer": median / layers as f64, "flags": flags()})
+               "median_ms": median, "ms_per_layer": median / layers as f64})
     );
     Ok(())
 }

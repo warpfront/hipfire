@@ -2,8 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Chunked (C64) generic gated delta rule with per-key-channel diagonal log decay
-//! (`HIPFIRE_GATED_DELTA_VECTOR_CHUNKED`, developer, default ON on gfx1201; `=0` kills).
+//! Chunked (C64) generic gated delta rule with per-key-channel diagonal log decay.
 //!
 //! [`Gpu::gated_delta_net_vector_chunked_f32`] takes the same [`GatedDeltaVectorLaunch`] as the
 //! serial [`Gpu::gated_delta_net_vector_serial_f32`] and produces the same outputs and final state
@@ -33,7 +32,6 @@ use crate::profile;
 use crate::DType;
 use hip_bridge::{HipResult, KernargBlob};
 use std::ffi::c_void;
-use std::sync::LazyLock;
 
 pub const GATED_DELTA_VECTOR_CHUNK_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_vector_chunk.gfx1201.hip");
@@ -55,18 +53,9 @@ const SCAN_VTILES: u32 = 8;
 /// the earlier 320-thread block did not, measured).
 const PREP_WGS_PER_MP: u32 = 2;
 
-static FLAG: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GATED_DELTA_VECTOR_CHUNKED", true));
-
-/// `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED` (default on; `0` kills).
-pub fn chunked_enabled() -> bool {
-    *FLAG
-}
-
 /// Why a launch keeps the serial kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatedDeltaVectorChunkRefusal {
-    FlagOff,
     Arch,
     HeadDim,
     DeviceIndirection,
@@ -76,7 +65,6 @@ pub enum GatedDeltaVectorChunkRefusal {
 impl std::fmt::Display for GatedDeltaVectorChunkRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::FlagOff => "HIPFIRE_GATED_DELTA_VECTOR_CHUNKED is off",
             Self::Arch => "no chunked RDA kernel for this architecture (exact gfx1201 only)",
             Self::HeadDim => "chunked RDA is specialized for head_dim 128",
             Self::DeviceIndirection => {
@@ -87,21 +75,8 @@ impl std::fmt::Display for GatedDeltaVectorChunkRefusal {
     }
 }
 
-/// Pure admission of the chunked route (the flag, the exact arch, the launch shape).
-pub fn chunked_admission(
-    flag: bool,
-    arch: &str,
-    head_dim: usize,
-    n_tokens: usize,
-    device_indirection: bool,
-) -> Result<(), GatedDeltaVectorChunkRefusal> {
-    if !flag {
-        return Err(GatedDeltaVectorChunkRefusal::FlagOff);
-    }
-    chunked_supported(arch, head_dim, n_tokens, device_indirection)
-}
-
-/// [`chunked_admission`] without the flag: whether the kernel itself supports the launch.
+/// Whether the chunked kernel admits the launch: exact `gfx1201`, `head_dim` 128, host slot and token
+/// count, prefill rows >= 64.
 pub fn chunked_supported(
     arch: &str,
     head_dim: usize,
@@ -461,7 +436,7 @@ mod tests {
 
     #[test]
     fn admission_is_gfx1201_head128_host_slot_prefill_rows() {
-        let ok = |arch, hd, n, ind| chunked_admission(true, arch, hd, n, ind);
+        let ok = chunked_supported;
         assert_eq!(ok("gfx1201", 128, 64, false), Ok(()));
         assert_eq!(ok("gfx1201", 128, 4096, false), Ok(()));
         assert_eq!(
@@ -487,10 +462,6 @@ mod tests {
         assert_eq!(
             ok("gfx1201", 128, 4096, true),
             Err(GatedDeltaVectorChunkRefusal::DeviceIndirection)
-        );
-        assert_eq!(
-            chunked_admission(false, "gfx1201", 128, 4096, false),
-            Err(GatedDeltaVectorChunkRefusal::FlagOff)
         );
     }
 

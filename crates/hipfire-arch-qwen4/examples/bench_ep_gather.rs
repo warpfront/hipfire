@@ -4,7 +4,7 @@
 
 //! CPU-only A/B of the EP unit-arena gather on a real Flash-Next artifact: the
 //! serial walk over the mapped stacks (`gather_arena_mq4_planar`, the
-//! `HIPFIRE_EP_GATHER_DIRECT=0` path) against the parallel `O_DIRECT` fetch +
+//! path of loads without a direct source) against the parallel `O_DIRECT` fetch +
 //! parallel repack (`gather_arena_mq4_planar_fetched`). For each requested layer
 //! and both tiers of rank 0 and rank 1 it drops the layer's spans from the page
 //! cache, times each way and compares the two arenas byte for byte (SHA-256).

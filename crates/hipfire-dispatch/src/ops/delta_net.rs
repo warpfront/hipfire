@@ -346,8 +346,8 @@ pub struct GatedDeltaOp<'a> {
     pub slot: usize,
     pub strides: GatedDeltaStrides,
     /// Preallocated chunked-RDA workspace. `Some` offers the launch to the chunked kernel
-    /// (`HIPFIRE_GATED_DELTA_VECTOR_CHUNKED`, default on, exact gfx1201, `head_dim` 128, host slot and
-    /// token count, `n_tokens >= 64`); `None`, flag off or any other shape runs the serial kernel.
+    /// (exact gfx1201, `head_dim` 128, host slot and token count, `n_tokens >= 64`); `None` or any
+    /// other shape runs the serial kernel.
     pub chunk_scratch:
         Option<&'a rdna_compute::gated_delta_vector_chunk::GatedDeltaVectorChunkScratch>,
 }
@@ -399,8 +399,7 @@ pub fn execute_gated_delta(
         state_slot_stride: s.state_slot,
     };
     if let Some(scratch) = op.chunk_scratch {
-        if rdna_compute::gated_delta_vector_chunk::chunked_admission(
-            rdna_compute::gated_delta_vector_chunk::chunked_enabled(),
+        if rdna_compute::gated_delta_vector_chunk::chunked_supported(
             &gpu.arch,
             op.key_dim,
             op.n_tokens,

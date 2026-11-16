@@ -1367,7 +1367,7 @@ impl RaonState {
             "raon state: a context of {rows} rows exceeds the maximum context of {max} tokens the \
              decompressed MLA route can hold on this device (expanded K/V mirror {} B/token, \
              admission budget {max} rows, slot reserve {} rows); \
-             the absorbed route (HIPFIRE_RAON_MLA_ABSORB=1, not bit-exact) attends over the latent cache beyond it",
+             the absorbed route (not bit-exact) attends over the latent cache beyond it",
             mirror_row_bytes(&self.dims),
             self.max_seq
         )
@@ -1719,10 +1719,9 @@ impl ElemKind {
     }
 }
 
-/// `HIPFIRE_RAON_MHC_FUSED=1` + `HIPFIRE_RAON_MHC_BF16_STREAMS=1` (see
-/// [`crate::mhc::bf16_streams_enabled`]): the mHC stream ping-pong planes are
-/// BF16 bits instead of F32 planes carrying BF16 values (same values, half the
-/// bytes). Every other scratch buffer is unchanged.
+/// Where [`crate::mhc::bf16_streams_enabled`] admits it, the mHC stream
+/// ping-pong planes are BF16 bits instead of F32 planes carrying BF16 values
+/// (same values, half the bytes). Every other scratch buffer is unchanged.
 fn retarget_stream_kinds(d: &RaonStateDims, specs: &mut [(&'static str, ElemKind, Vec<usize>)]) {
     if !crate::mhc::bf16_streams_enabled(d.n_streams, d.hidden) {
         return;

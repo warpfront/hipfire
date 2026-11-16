@@ -3344,7 +3344,7 @@ pub fn qwen4_ep_vram_layers(
         &config,
     )?;
     // The plan every rank's `load_qwen4_rank` takes (`qwen4_ep_scratch_mode`: the
-    // `Full` plan unless `HIPFIRE_EP_COMPACT_SCRATCH` admits the compact one).
+    // compact plan where the source admits it, else `Full`).
     let scratch_mode = qwen4_ep_scratch_mode(gpu, hfq, &config, &manifest)?;
     // PrefBorrow D3: decide the tail-borrow plan before anything reads the prompt chunk.
     qwen4_ep_tail_borrow_publish(
@@ -3913,12 +3913,6 @@ const QWEN4_EP_UNIT_RESERVE_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE";
 /// the weight shadows in the donor segments (S4) instead of keeping them dedicated VRAM.
 const QWEN4_EP_UNIT_RESERVE_SHADOWS_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE_SHADOWS";
 
-/// `HIPFIRE_EP_COMPACT_SCRATCH` (EpPrefill; developer variable, default ON): an expert-parallel load
-/// takes the compact forward scratch plan (`FnSymGfx1201`, the single-device gfx1201 default) at the
-/// unchanged 4096-row EP chunk. Exact `0` keeps the `Full` plan. The plan is decided
-/// identically by the planner and by every rank.
-const QWEN4_EP_COMPACT_SCRATCH_ENV: &str = "HIPFIRE_EP_COMPACT_SCRATCH";
-
 /// The EP prefill chunk a compact load keeps (the plan's own default is the 16384 rows that change
 /// greedy output, which owes a KLD check); an explicit `HIPFIRE_PREFILL_CHUNK_ROWS` still wins.
 const QWEN4_EP_COMPACT_CHUNK_ROWS: usize = 4096;
@@ -3930,13 +3924,9 @@ fn qwen4_ep_scratch_mode(
     manifest: &hipfire_arch_qwen4::weights::Qwen4Manifest,
 ) -> Result<hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode, String> {
     use hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode;
-    let mode = if hipfire_config::developer_var(QWEN4_EP_COMPACT_SCRATCH_ENV).as_deref() == Ok("0")
-    {
-        Qwen4ForwardScratchMode::Full
-    } else {
+    let mode =
         hipfire_arch_qwen4::artifact::source_forward_scratch_mode(gpu, hfq, config, manifest)
-            .map_err(|error| error.to_string())?
-    };
+            .map_err(|error| error.to_string())?;
     if mode == Qwen4ForwardScratchMode::FnSymGfx1201 {
         hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(Some(
             QWEN4_EP_COMPACT_CHUNK_ROWS,
@@ -6225,8 +6215,7 @@ pub fn qwen4_preload_resource_plan(
     };
     // Load-upload transient: applicable finite branch only (direct ring vs
     // range fallback), never an extra copy of final host destinations.
-    let direct_branch =
-        !use_ranges && hipfire_config::memory::qwen4_direct_load() && !hfq.has_overlay();
+    let direct_branch = !use_ranges && !hfq.has_overlay();
     let staging_upload_bytes = if direct_branch {
         hipfire_runtime::hfq_parallel::reader_tuning().staging_bytes()
     } else {
@@ -7389,9 +7378,8 @@ fn load_qwen4_rank_unscoped(
     if use_ranges {
         hfq.drop_mmap();
     }
-    // Direct weight reads (HIPFIRE_QWEN4_DIRECT_LOAD, default on; exactly
-    // `0` is the old mmap + single-thread-copy path): discrete GPUs only.
-    let direct_source = if use_ranges || !hipfire_config::memory::qwen4_direct_load() {
+    // Direct weight reads: discrete GPUs only.
+    let direct_source = if use_ranges {
         None
     } else if hfq.has_overlay() {
         None
@@ -9661,9 +9649,7 @@ fn load_qwen4_rank_unscoped(
                 units,
                 placement.rank,
                 entry,
-                direct_source
-                    .as_ref()
-                    .filter(|_| hipfire_config::memory::ep_gather_direct()),
+                direct_source.as_ref(),
             ) {
                 return payload;
             }

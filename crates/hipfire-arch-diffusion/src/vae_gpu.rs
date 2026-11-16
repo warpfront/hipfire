@@ -79,7 +79,7 @@ pub struct GpuVaeDecoderWeights {
     /// dtype, so the decode reads them straight out of residency instead of
     /// casting a fresh f16 copy per conv per generation. False means the
     /// weights are f32 and the decode must take the direct-conv route
-    /// (`HIPFIRE_VAE_CONV=direct`, or a K the GEMM cannot take).
+    /// (a K the GEMM cannot take).
     pub conv_w_f16: bool,
     pub conv_in_w: GpuTensor,
     pub conv_in_b: GpuTensor,
@@ -446,10 +446,9 @@ impl GpuVaeDecoderWeights {
     /// Upload every decoder weight of a loaded host [`VaeDecoderWeights`].
     /// The host copy stays untouched and remains the source of truth.
     ///
-    /// Conv weights land as f16 (the GEMM operand dtype) unless the direct
-    /// route is pinned by `HIPFIRE_VAE_CONV=direct` or some conv's K is not a
-    /// multiple of 16; norms and biases are read as f32 by their kernels and
-    /// stay f32.
+    /// Conv weights land as f16 (the GEMM operand dtype) unless some conv's K
+    /// is not a multiple of 16; norms and biases are read as f32 by their
+    /// kernels and stay f32.
     ///
     /// **Failure frees what it uploaded.** ~150 device allocations happen here
     /// and `GpuTensor` has no `Drop`; every one of them is owned by an
@@ -459,9 +458,7 @@ impl GpuVaeDecoderWeights {
     /// propagated the error and the caller's next `img_generate` retried
     /// against a device that the previous attempt had already filled.
     pub fn from_host(gpu: &mut Gpu, host: &VaeDecoderWeights) -> Result<Self, String> {
-        let gemm =
-            hipfire_config::developer_var("HIPFIRE_VAE_CONV").map_or(true, |v| v != "direct");
-        let f16 = gemm && all_convs_gemm_ready(host);
+        let f16 = all_convs_gemm_ready(host);
         let mut led = UploadLedger::default();
         match Self::upload_into(gpu, &mut led, host, f16) {
             Ok(slots) => Ok(GpuVaeDecoderWeights {
@@ -833,13 +830,10 @@ struct Run<'a> {
     /// true (default): 3x3 convs route im2col -> WMMA f16 GEMM -> transpose,
     /// reading the f16-resident conv weights directly. False when the weights
     /// were uploaded f32 for the direct one-thread-per-output kernel
-    /// (`HIPFIRE_VAE_CONV=direct`, or a decoder with a K the GEMM can't take)
+    /// (a decoder with a K the GEMM can't take)
     /// — it tracks [`GpuVaeDecoderWeights::conv_w_f16`], so the route and the
     /// resident dtype can never disagree.
     conv_gemm: bool,
-    /// Fold the SiLU that follows every non-attention GroupNorm into the
-    /// norm kernel. `HIPFIRE_VAE_FUSE_NORM=0` restores the separate pair.
-    fuse_norm: bool,
     /// Per-conv f16 column-matrix budget in bytes.
     im2col_budget: usize,
     prof: bool,
@@ -850,8 +844,6 @@ struct Run<'a> {
 impl<'a> Run<'a> {
     fn new(gpu: &'a mut Gpu, groups: usize, conv_gemm: bool) -> Self {
         let prof = hipfire_config::developer_var("HIPFIRE_VAE_PROFILE").map_or(false, |v| v != "0");
-        let fuse_norm =
-            hipfire_config::developer_var("HIPFIRE_VAE_FUSE_NORM").map_or(true, |v| v != "0");
         let budget_mb = hipfire_config::developer_var("HIPFIRE_VAE_IM2COL_MB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -862,7 +854,6 @@ impl<'a> Run<'a> {
             groups,
             eps: 1e-6,
             conv_gemm,
-            fuse_norm,
             im2col_budget: budget_mb * 1024 * 1024,
             prof,
             started: std::time::Instant::now(),
@@ -948,15 +939,6 @@ impl<'a> Run<'a> {
             .map_err(|e| format!("vae gpu: free {what}: {e:?}"))
     }
 
-    fn silu(&mut self, x: &GpuTensor) -> Result<GpuTensor, String> {
-        let y = self.alloc(&x.shape)?;
-        self.timed("silu", |gpu| {
-            gpu.silu_f32(x, &y)
-                .map_err(|e| format!("vae gpu: silu: {e:?}"))
-        })?;
-        Ok(y)
-    }
-
     fn groupnorm(
         &mut self,
         x: &GpuTensor,
@@ -976,7 +958,7 @@ impl<'a> Run<'a> {
     }
 
     /// GroupNorm immediately followed by SiLU — the pair every VAE resnet and
-    /// the decoder tail run. Fused into one kernel by default: the separate
+    /// the decoder tail run. Fused into one kernel: the separate
     /// SiLU is a whole extra read+write pass over a tensor that reaches
     /// 512 MB at the 1024x1024 tail, and it computes the same f32 expression
     /// on the same value, so the fused result is bit-identical.
@@ -988,12 +970,6 @@ impl<'a> Run<'a> {
         gamma: &GpuTensor,
         beta: &GpuTensor,
     ) -> Result<GpuTensor, String> {
-        if !self.fuse_norm {
-            let n = self.groupnorm(x, c, hw, gamma, beta)?;
-            let a = self.silu(&n)?;
-            self.free(n, "groupnorm_silu.norm")?;
-            return Ok(a);
-        }
         let y = self.alloc(&x.shape)?;
         let groups = self.groups;
         let eps = self.eps;
@@ -1054,8 +1030,7 @@ impl<'a> Run<'a> {
         if k % 16 != 0 {
             return Err(format!(
                 "vae gpu: conv3x3 {c_in}->{c_out}: K={k} is not a multiple of 16, but the \
-                 conv weights are f16-resident for the GEMM route; re-upload with \
-                 HIPFIRE_VAE_CONV=direct"
+                 conv weights are f16-resident for the GEMM route"
             ));
         }
         // Rows per band: whole rows only, at least one, capped so the f16
@@ -1197,8 +1172,7 @@ impl<'a> Run<'a> {
     /// input is prepared position-major f16 (a fused transpose+cast when it
     /// arrives channel-major), the GEMM fuses the bias, and a channel-major
     /// result (the resnet shortcuts) transposes once on the way out. The
-    /// naive per-thread kernel is the `HIPFIRE_VAE_CONV=direct` fallback and
-    /// the route for ragged c_in.
+    /// naive per-thread kernel is the fallback for ragged c_in.
     fn conv1x1(
         &mut self,
         x: &GpuTensor,
@@ -1221,8 +1195,7 @@ impl<'a> Run<'a> {
         if c_in % 16 != 0 {
             return Err(format!(
                 "vae gpu: conv1x1 {c_in}->{c_out}: c_in is not a multiple of 16, but the \
-                 conv weights are f16-resident for the GEMM route; re-upload with \
-                 HIPFIRE_VAE_CONV=direct"
+                 conv weights are f16-resident for the GEMM route"
             ));
         }
         let held_xf;
@@ -1335,7 +1308,7 @@ impl<'a> Run<'a> {
     /// map for the q/k/v projections; scores and ctx are WMMA GEMMs too
     /// (`scores = k.q^T` with k first so the layout lands untransposed,
     /// `ctx = probs . v` with channel-major v as the A operand). The naive
-    /// kernels stay as the `HIPFIRE_VAE_CONV=direct` / ragged-c fallback.
+    /// kernels stay as the ragged-c fallback.
     fn mid_attn(
         &mut self,
         x: GpuTensor,
