@@ -618,6 +618,11 @@ fn main() {
     let logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
     eprintln!("PREFILL_NEXT_TOKEN  token_id={next_token}");
+    // The single prefill→decode seal at the actual prompt end, as serving does
+    // (`DeltaNetState::seal_streams`); decode refuses an Open GDN stream.
+    dn_state
+        .seal_streams(&mut gpu, prefill_len)
+        .expect("seal GDN streams at prompt end");
 
     // === WARMUP ===
     eprintln!("\n=== warmup ({warmup_len} tokens — untimed, lets JIT settle) ===");
