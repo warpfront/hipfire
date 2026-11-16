@@ -263,7 +263,7 @@ host_cpu_weights={} cpu_offload_active={}",
     let scratch = Qwen35Scratch::new(gpu, &config, REPEAT_WINDOW).expect("scratch");
     ModelSlot {
         name: name.to_string(),
-        hfq,
+        hfq: Some(hfq),
         config,
         weights,
         kv_cache,

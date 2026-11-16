@@ -2608,8 +2608,8 @@ fn spec_trace_json(t: &SpecTrace) -> Value {
 /// max_tokens-mid-draft variants. Returns (report, pass).
 fn spec_phase(ctx: Ctx, args: &Args, fx: &[Fixture], ar_refs: &[Trace]) -> Result<(Value, bool)> {
     let Ctx { mut gpu, b } = ctx;
-    let mut slot = ModelSlot::from_bundle(b, Path::new(&args.model))
-        .map_err(|(_, e)| format!("ModelSlot::from_bundle: {e}"))?;
+    let mut slot =
+        ModelSlot::from_bundle(b).map_err(|(_, e)| format!("ModelSlot::from_bundle: {e}"))?;
     let head_path = args
         .mtp_head
         .clone()
@@ -6522,8 +6522,8 @@ fn dflash_probe_phase(
         .ok_or("--dflash-draft required")?;
     let windows = args.dflash_probe_window.unwrap_or(0);
     let Ctx { mut gpu, b } = ctx;
-    let mut slot = ModelSlot::from_bundle(b, Path::new(&args.model))
-        .map_err(|(_, e)| format!("ModelSlot::from_bundle: {e}"))?;
+    let mut slot =
+        ModelSlot::from_bundle(b).map_err(|(_, e)| format!("ModelSlot::from_bundle: {e}"))?;
     if slot.config.num_experts > 0 {
         return Err(
             "DFlash Gate 0 covers dense targets only (MoE uses the draft FFN graph route)".into(),

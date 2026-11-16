@@ -505,7 +505,6 @@ impl Carrier for Qwen2Carrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
@@ -639,7 +638,6 @@ impl Carrier for Qwen4Carrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
@@ -11289,11 +11287,11 @@ impl Carrier for Qwen35Carrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         // qwen35 moves its bundle out of `state` into the RAII Qwen35SlotGuard
-        // (lazy HfqFile reopen, bundle restored on Drop — the #462 guard).
-        Ok(Box::new(Qwen35SlotGuard::take(state, model_path)?))
+        // (bundle restored on Drop — the #462 guard). The model file is never
+        // reopened: the slot is assembled from the resident bundle alone.
+        Ok(Box::new(Qwen35SlotGuard::take(state)?))
     }
     fn make_spec_emitter<'a>(
         &self,
@@ -11858,7 +11856,6 @@ impl Carrier for LlamaCarrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
@@ -12337,7 +12334,6 @@ impl Carrier for Deepseek4Carrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         if state
             .as_ref()
@@ -12606,7 +12602,6 @@ impl Carrier for MinimaxCarrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state
             .as_mut()
@@ -12708,7 +12703,6 @@ impl Carrier for Lfm2MoeCarrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state
             .as_mut()
@@ -13125,7 +13119,6 @@ impl Carrier for RaonCarrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state
             .as_mut()
@@ -13249,7 +13242,6 @@ impl Carrier for Cohere2MoeCarrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state
             .as_mut()
@@ -13473,7 +13465,6 @@ impl Carrier for Gemma4Carrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state
             .as_mut()
@@ -13682,7 +13673,6 @@ impl Carrier for MuseGlimmerCarrier {
     fn spec_target_guard<'m>(
         &self,
         _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         Err("muse_glimmer: spec decode not yet wired (AR-only)".into())
     }
@@ -18096,7 +18086,7 @@ mod raon_carrier_tests {
     fn spec_target_guard_refuses_a_state_that_is_not_a_raon_bundle() {
         let mut empty: Option<Box<dyn hipfire_runtime::arch_model::ArchModel>> = None;
         let error = RaonCarrier
-            .spec_target_guard(&mut empty, "raon.hfq")
+            .spec_target_guard(&mut empty)
             .err()
             .expect("an empty state is not a Raon bundle");
         assert!(error.contains("raon1_mini"), "{error}");

@@ -19,7 +19,6 @@ use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_runtime::spec::{SpecTarget, SpecTargetGuard, Speculator};
 use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
 use std::any::Any;
-use std::path::Path;
 
 /// RAII scope that moves the live `Qwen35Bundle` out of `m.state`, lends it to
 /// the spec-decode loop as a [`ModelSlot`], and — on `Drop`, via *every* exit
@@ -32,15 +31,14 @@ use std::path::Path;
 /// return" cross-request state-bleed class (#462): there is no longer a code
 /// path on which the bundle fails to return to `m.state`.
 ///
-/// The `HfqFile` (an mmap handle that `ModelSlot` carries but the spec kernels
-/// never read) is opened **lazily**, on the first [`model_slot`](Self::model_slot)
-/// call. Two payoffs: (1) an autoregressive caller that only needs the bundle fields
-/// never pays the mmap, and (2) an open failure leaves the bundle parked for
-/// `Drop` to restore — so a reopen error can surface as `Err` without ever
-/// leaving `m.state == None`.
+/// The slot is assembled from the parked bundle alone, on the first
+/// [`model_slot`](Self::model_slot) call: the guard runs once per generation, so
+/// it never reopens or re-validates the model file (a symmetric MQ3 open checks
+/// every qt49 group, ~1 s on a 27B). An assembly refusal leaves the bundle
+/// parked for `Drop` to restore — so it surfaces as `Err` without ever leaving
+/// `m.state == None`.
 pub struct Qwen35SlotGuard<'m> {
     state_back: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-    model_path: String,
     // `Option` only so `Drop` can move the contents out; it is `Some` for the
     // guard's entire observable lifetime.
     parked: Option<Parked>,
@@ -52,16 +50,15 @@ pub struct Qwen35SlotGuard<'m> {
 
 // Both variants hold the same ~5.6 KB of live model state by value — that is
 // the point: the guard *moves* the bundle, it does not copy it. The two differ
-// by only the lazily-opened `HfqFile` handle + name + slot_config (~240 B), so
-// boxing to flatten the delta would mean boxing BOTH variants (two ~5.8 KB
-// heap alloc/free per generation) for no real saving on a short-lived
-// stack-local guard. Keep it inline.
+// by only the slot's name + slot_config, so boxing to flatten the delta would
+// mean boxing BOTH variants (two ~5.8 KB heap alloc/free per generation) for no
+// real saving on a short-lived stack-local guard. Keep it inline.
 #[allow(clippy::large_enum_variant)]
 enum Parked {
-    /// The bundle as taken — fields untouched, no `HfqFile` opened yet.
+    /// The bundle as taken — fields untouched.
     Bundle(Qwen35Bundle),
-    /// The bundle assembled into a `ModelSlot` (HfqFile opened) for the spec
-    /// helpers. `Drop` rebuilds the bundle from these fields.
+    /// The bundle assembled into a `ModelSlot` for the spec helpers. `Drop`
+    /// rebuilds the bundle from these fields.
     Slot(ModelSlot),
 }
 
@@ -72,7 +69,6 @@ impl<'m> Qwen35SlotGuard<'m> {
     /// out and dropped.
     pub fn take(
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        model_path: &str,
     ) -> Result<Self, String> {
         if !state
             .as_ref()
@@ -89,26 +85,25 @@ impl<'m> Qwen35SlotGuard<'m> {
         let vmm_store = bundle.vmm_store.take();
         Ok(Self {
             state_back: state,
-            model_path: model_path.to_string(),
             parked: Some(Parked::Bundle(bundle)),
             vmm_store,
         })
     }
 
-    /// Borrow the target as a concrete [`ModelSlot`], opening the `HfqFile` on
-    /// first use. On reopen failure the bundle stays parked (so `Drop` still
-    /// restores it) and the error is returned. The arch-erased
+    /// Borrow the target as a concrete [`ModelSlot`], assembling it from the
+    /// parked bundle on first use. On refusal the bundle stays parked (so `Drop`
+    /// still restores it) and the error is returned. The arch-erased
     /// [`SpecTargetGuard::slot`] impl upcasts this to `&mut dyn SpecTarget`.
     pub fn model_slot(&mut self) -> Result<&mut ModelSlot, String> {
         if let Some(Parked::Bundle(_)) = self.parked {
             let Some(Parked::Bundle(bundle)) = self.parked.take() else {
                 unreachable!("guarded by the if-let above")
             };
-            // The bundle→slot field transform + `HfqFile` reopen is qwen35 field
-            // knowledge, owned by the arch crate. It is fallible-WITHOUT-loss: on
-            // reopen failure the bundle comes back in the `Err`, so we re-park it
-            // for `Drop` to restore — never leaving `m.state == None` (#462 guard).
-            match ModelSlot::from_bundle(bundle, Path::new(&self.model_path)) {
+            // The bundle→slot field transform is qwen35 field knowledge, owned
+            // by the arch crate. It is fallible-WITHOUT-loss: on refusal the
+            // bundle comes back in the `Err`, so we re-park it for `Drop` to
+            // restore — never leaving `m.state == None` (#462 guard).
+            match ModelSlot::from_bundle(bundle) {
                 Ok(slot) => self.parked = Some(Parked::Slot(slot)),
                 Err((bundle, msg)) => {
                     self.parked = Some(Parked::Bundle(bundle));
@@ -127,8 +122,8 @@ impl Drop for Qwen35SlotGuard<'_> {
     fn drop(&mut self) {
         let mut bundle = match self.parked.take() {
             Some(Parked::Bundle(b)) => b,
-            // slot.hfq (mmap), slot.name, slot.slot_config drop inside
-            // `into_bundle`; the five live pieces go back into the bundle.
+            // slot.name and slot.slot_config drop inside `into_bundle`; the
+            // live pieces go back into the bundle.
             Some(Parked::Slot(slot)) => slot.into_bundle(),
             None => return, // only reachable if `Drop` ran twice — it cannot.
         };
@@ -227,8 +222,8 @@ impl Drop for Qwen35DenseTpGuard<'_> {
 }
 
 // The spec-decode target borrow is now dispatched per-arch by each carrier's
-// `Carrier::spec_target_guard` (qwen35 → the move-out + lazy-`HfqFile`-reopen
-// [`Qwen35SlotGuard`] above; the pure-attention arms → the generic
+// `Carrier::spec_target_guard` (qwen35 → the move-out [`Qwen35SlotGuard`] above;
+// the pure-attention arms → the generic
 // `hipfire_runtime::spec::InPlaceGuard<B>`). The daemon resolves the carrier via
 // `hipfire_loader::carrier_for(arch_id)` and never arch-matches itself.
 

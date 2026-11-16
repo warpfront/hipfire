@@ -94,7 +94,7 @@ fn check(path: &str, draft: Option<&str>, spec_cfg: SpecLoadCfg, expected: &str)
     assert_eq!(spec.name(), expected, "speculator route");
     let carrier = hipfire_loader::carrier_for(m.arch_id).expect("carrier");
     let mut guard = carrier
-        .spec_target_guard(&mut m.state, &m.model_path)
+        .spec_target_guard(&mut m.state)
         .expect("spec target guard");
     let target = guard.slot().expect("spec target");
 

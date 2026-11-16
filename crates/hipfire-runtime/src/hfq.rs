@@ -613,6 +613,9 @@ pub struct RecommendedSampling {
     pub repeat_penalty: Option<f32>,
 }
 
+/// Backs [`HfqFile::open_count`].
+static HFQ_OPEN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct HfqFile {
     /// Open container file, shared with every range reader handed out by
     /// [`Self::tensor_range`] / [`Self::span_range`].
@@ -1030,6 +1033,15 @@ impl HfqFile {
                 .is_some_and(|overlay| overlay.has_awq_sidecars())
     }
 
+    /// Process-wide count of container opens ([`Self::open_at_offset`] calls,
+    /// failed ones included; every `open*` entry funnels through it). An open
+    /// parses the index and, for a symmetric MQ3 file, validates every qt49
+    /// group (~1 s on a 27B), so request paths must not open: the spec-route
+    /// test pins that a generation leaves this count unchanged.
+    pub fn open_count() -> u64 {
+        HFQ_OPEN_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Open an HFQM container that lives inside a larger file, starting at
     /// `base_offset`. Used by the bundled `.mq4-mtp` loader to parse the
     /// MTP section embedded after the trunk's tensor data.
@@ -1041,6 +1053,7 @@ impl HfqFile {
     /// Callers passing `base_offset = 0` go through the canonical [`Self::open`]
     /// entry point.
     pub fn open_at_offset(path: &Path, base_offset: u64) -> std::io::Result<Self> {
+        HFQ_OPEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let file = File::open(path)?;
         let source_file_identity = capture_file_identity(path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;

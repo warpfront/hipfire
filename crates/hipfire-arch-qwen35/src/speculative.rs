@@ -36,7 +36,7 @@ use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache, VMode};
 use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
+use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::dflash_sampled_accept::DflashAcceptScratch;
 use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
@@ -814,7 +814,11 @@ impl Default for ModelSlotConfig {
 /// share one `Gpu` instance.
 pub struct ModelSlot {
     pub name: String,
-    pub hfq: HfqFile,
+    /// The model file, held by [`load`](Self::load) for [`load_tokenizer`](Self::load_tokenizer).
+    /// `None` for a slot lent from a loaded bundle ([`from_bundle`](Self::from_bundle)):
+    /// the weights are resident and the spec kernels never read the file, so
+    /// the per-generation slot neither reopens nor re-validates it.
+    pub hfq: Option<HfqFile>,
     pub config: Qwen35Config,
     pub weights: Qwen35Weights,
     pub kv_cache: KvCache,
@@ -837,17 +841,19 @@ pub struct ModelSlot {
 
 impl ModelSlot {
     /// Assemble the spec-decode target slot from a live [`Qwen35Bundle`] that was
-    /// parked out of `ModelState`, opening the model's `HfqFile` (the mmap handle
-    /// `ModelSlot` carries but the spec kernels never read).
+    /// parked out of `ModelState`. Runs once per speculative generation, so it
+    /// touches no file: the slot carries no `HfqFile` (`hfq: None`) — reopening
+    /// the model would re-run the open-time body validation (every qt49 group of
+    /// a symmetric MQ3 file, ~1 s on a 27B) on every request.
     ///
-    /// **Fallible WITHOUT loss:** on a reopen failure the bundle is handed BACK in
-    /// the `Err` so the caller's RAII guard can re-park it and restore it into
+    /// **Fallible WITHOUT loss:** on a refusal the bundle is handed BACK in the
+    /// `Err` so the caller's RAII guard can re-park it and restore it into
     /// `ModelState` on `Drop` — consuming the bundle on the error path would drop
     /// it and leave `m.state == None`, reintroducing the #462 cross-request
     /// state-bleed class this seam exists to prevent. This is the only piece of
     /// `Qwen35Bundle` field knowledge the loader's guard previously inlined; it
     /// lives here so the loader never names the bundle's fields.
-    pub fn from_bundle(bundle: Qwen35Bundle, path: &Path) -> Result<Self, (Qwen35Bundle, String)> {
+    pub fn from_bundle(bundle: Qwen35Bundle) -> Result<Self, (Qwen35Bundle, String)> {
         // Batch owners (fixed-lane staging or the per-request VMM store) are
         // outside the spec slot. Refuse WITHOUT loss rather than dropping
         // them here: a dropped store would leak its request VMM leases and
@@ -868,10 +874,6 @@ impl ModelSlot {
                 "ModelSlot::from_bundle: weight-host imported weights are not admitted to speculative decode".into(),
             ));
         }
-        let hfq = match HfqFile::open(path) {
-            Ok(h) => h,
-            Err(e) => return Err((bundle, format!("reopen model: {e}"))),
-        };
         let Qwen35Bundle {
             config,
             weights,
@@ -893,7 +895,7 @@ impl ModelSlot {
         let _ = pp_scratch_set;
         Ok(Self {
             name: String::from("target"),
-            hfq,
+            hfq: None,
             config,
             weights,
             kv_cache,
@@ -906,8 +908,8 @@ impl ModelSlot {
         })
     }
 
-    /// Disassemble the slot back into a [`Qwen35Bundle`] — the `HfqFile` mmap,
-    /// `name`, and `slot_config` drop here; the five live pieces return to the
+    /// Disassemble the slot back into a [`Qwen35Bundle`] — `hfq` (if any),
+    /// `name`, and `slot_config` drop here; the live pieces return to the
     /// bundle. The inverse of [`from_bundle`](Self::from_bundle); the loader's
     /// guard calls this on `Drop` to restore `ModelState`.
     pub fn into_bundle(self) -> Qwen35Bundle {
@@ -1031,7 +1033,7 @@ impl ModelSlot {
 
         Ok(Self {
             name,
-            hfq,
+            hfq: Some(hfq),
             config,
             weights,
             kv_cache,
@@ -1047,12 +1049,15 @@ impl ModelSlot {
     /// Load the tokenizer from this slot's HFQ metadata. Each slot technically
     /// carries its own tokenizer; callers should validate that two slots'
     /// tokenizers are compatible via `Tokenizer::is_compatible_with` before
-    /// sharing. Returns the underlying `TokenizerError` on failure so callers
-    /// can surface specific diagnostics (e.g. `MissingMergeResult` from a
-    /// truncated quantizer output) rather than a generic "no tokenizer"
-    /// message — see #203.
-    pub fn load_tokenizer(&self) -> Result<Tokenizer, TokenizerError> {
-        Tokenizer::from_hfq_metadata(&self.hfq.metadata_json)
+    /// sharing. The error carries the specific `TokenizerError` diagnostic (e.g.
+    /// `MissingMergeResult` from a truncated quantizer output) rather than a
+    /// generic "no tokenizer" message — see #203. A slot lent from a bundle
+    /// holds no file and refuses.
+    pub fn load_tokenizer(&self) -> Result<Tokenizer, String> {
+        let hfq = self.hfq.as_ref().ok_or(
+            "ModelSlot::load_tokenizer: a slot lent from a loaded bundle holds no model file",
+        )?;
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())
     }
 
     /// Single-token forward pass. Writes logits into `self.scratch.logits`.

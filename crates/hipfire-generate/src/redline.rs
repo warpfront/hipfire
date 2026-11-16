@@ -3011,7 +3011,7 @@ pub fn redline_shadow_dflash_verify_pm4(
     }
     let count = iterations.max(12);
     let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
-    let mut guard = Qwen35SlotGuard::take(&mut loaded.state, &loaded.model_path)?;
+    let mut guard = Qwen35SlotGuard::take(&mut loaded.state)?;
     let slot = guard.model_slot()?;
     // The gfx1100 split-KV verifier is admitted only beyond its resolved
     // crossover. Start the shadow at no less than the 8K boundary so
@@ -4079,7 +4079,7 @@ pub fn railgun_g0_dflash_cycle(
         .as_mut()
         .filter(|s| s.name() == "dflash")
         .ok_or("railgun_g0_dflash_cycle requires a loaded DFlash sidecar")?;
-    let mut guard = Qwen35SlotGuard::take(&mut loaded.state, &loaded.model_path)?;
+    let mut guard = Qwen35SlotGuard::take(&mut loaded.state)?;
     let slot = guard.model_slot()?;
     spec.reset(gpu)?;
     redline_reset_qwen_slot(gpu, slot)?;

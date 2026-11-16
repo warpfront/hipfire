@@ -4460,17 +4460,16 @@ pub fn generate_spec(
             return None;
         }
     }
-    // Arch-dispatched target borrow via `Carrier::spec_target_guard()`
-    // (`m.model_path` is a disjoint field → no borrow conflict with the
-    // `&mut m.state` the guard takes). qwen35 moves the bundle out + reopens its
-    // HfqFile (restored on Drop); the pure-attention arms borrow in place. The
-    // boxed `SpecTargetGuard` yields `&mut dyn SpecTarget` either way. A dense-TP
-    // trunk lives in `m.ep`, not `m.state`, and takes its own move-out guard.
+    // Arch-dispatched target borrow via `Carrier::spec_target_guard()`. qwen35
+    // moves the bundle out (restored on Drop; the model file is never reopened);
+    // the pure-attention arms borrow in place. The boxed `SpecTargetGuard` yields
+    // `&mut dyn SpecTarget` either way. A dense-TP trunk lives in `m.ep`, not
+    // `m.state`, and takes its own move-out guard.
     let mut guard = match if hipfire_loader::spec_build::is_qwen35_dense_tp(&m.ep) {
         hipfire_loader::spec_build::Qwen35DenseTpGuard::take(&mut m.ep)
             .map(|g| Box::new(g) as Box<dyn hipfire_runtime::spec::SpecTargetGuard + '_>)
     } else {
-        carrier.spec_target_guard(&mut m.state, &m.model_path)
+        carrier.spec_target_guard(&mut m.state)
     } {
         Ok(g) => g,
         Err(e) => {

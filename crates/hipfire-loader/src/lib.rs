@@ -227,12 +227,12 @@ pub trait Carrier: Send + Sync {
     /// Borrow this model's spec-decode target out of `state`, arch-erased as a
     /// [`SpecTargetGuard`]. This is the daemon's single dispatch for the
     /// spec-decode path — it then only ever sees `&mut dyn SpecTarget`, never an
-    /// arch type. Default (AR-only carriers): `Err` WITHOUT touching `state` —
-    /// only an override may `state.take()`.
+    /// arch type. It runs once per generation, so it must never reopen or
+    /// re-validate the model file. Default (AR-only carriers): `Err` WITHOUT
+    /// touching `state` — only an override may `state.take()`.
     fn spec_target_guard<'m>(
         &self,
         _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-        _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         Err(format!(
             "{}: spec-decode target unsupported; load without speculation: --spec off \
