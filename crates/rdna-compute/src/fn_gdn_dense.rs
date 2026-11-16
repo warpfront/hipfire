@@ -13,7 +13,7 @@
 //! rebuilds `code * scale + ef` on entry and stores the new residual on exit, so the residual
 //! persists across prefill launches. Exit Q8 uses
 //! round-to-nearest-even, not the pipe128 recurrence's stochastic rounding.
-//! Default on for admitted steps; `HIPFIRE_FN_GDN_DENSE_SCAN=0` opts out.
+//! On for every admitted step.
 //!
 //! `HIPFIRE_QWEN4_GDN_CHAIN_FUSE` (exact gfx1201, default on, `0` restores the v1 producer and
 //! the F32 projection): the qkv projection arrives as BF16 bits (the producer only reads it
@@ -248,8 +248,7 @@ pub fn edge_workspace_bytes(key_heads: usize, value_heads: usize, rows: usize) -
 /// (S2: Q8/EF/F32 tile-entry state, absolute seams); this predicate never selects the route
 /// by row count.
 pub fn applies_edge(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
-    gpu.flags.fn_gdn_dense_scan
-        && admits_state(&gpu.arch, p.format, p.residual.is_some())
+    admits_state(&gpu.arch, p.format, p.residual.is_some())
         && p.row_states.is_none()
         && p.rows > 0
         && geometry_runs(
@@ -290,8 +289,7 @@ pub fn stream_geometry_admitted(
         )
 }
 
-/// [`stream_geometry_admitted`] under this device's flags (`HIPFIRE_FN_GDN_DENSE_SCAN`,
-/// `HIPFIRE_QWEN4_GDN_CHAIN_FUSE`).
+/// [`stream_geometry_admitted`] under this device's flags (`HIPFIRE_QWEN4_GDN_CHAIN_FUSE`).
 pub fn stream_admitted(
     gpu: &Gpu,
     format: GdnStateFormat,
@@ -300,16 +298,15 @@ pub fn stream_admitted(
     key_dim: usize,
     value_dim: usize,
 ) -> bool {
-    gpu.flags.fn_gdn_dense_scan
-        && stream_geometry_admitted(
-            &gpu.arch,
-            format,
-            key_heads,
-            value_heads,
-            key_dim,
-            value_dim,
-            gpu.flags.qwen4_gdn_chain_fuse_enabled(),
-        )
+    stream_geometry_admitted(
+        &gpu.arch,
+        format,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        gpu.flags.qwen4_gdn_chain_fuse_enabled(),
+    )
 }
 
 thread_local! {
@@ -339,8 +336,7 @@ fn admits_state(arch: &str, format: GdnStateFormat, has_residual: bool) -> bool 
 /// its live residual), no capture/recording, and the mseg segment geometry. Other steps retain
 /// the incumbent recurrence.
 pub fn applies(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
-    gpu.flags.fn_gdn_dense_scan
-        && admits_state(&gpu.arch, p.format, p.residual.is_some())
+    admits_state(&gpu.arch, p.format, p.residual.is_some())
         && p.row_states.is_none()
         && geometry_runs(
             p.key_heads,

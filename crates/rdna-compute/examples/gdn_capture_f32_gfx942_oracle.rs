@@ -34,8 +34,7 @@
 //! the lane-swap and unlaunched-lane controls.
 //!
 //! Prints one line per case and a final `gdn_capture_f32_gfx942_oracle: PASS|FAIL`.
-//! Exit 0 = PASS, 1 = a mismatch / undetected control, 2 = not exact gfx942 (or
-//! `HIPFIRE_QWEN4_GDN_PIPE=0`, which would change the reference kernel).
+//! Exit 0 = PASS, 1 = a mismatch / undetected control, 2 = not exact gfx942.
 
 use rdna_compute::tensor_ops::{
     gated_delta_rollback_layers, gated_delta_step_batched, GatedDeltaRollbackLayers,
@@ -965,13 +964,6 @@ fn main() {
         eprintln!(
             "gdn_capture_f32_gfx942_oracle: needs exact gfx942, this device is {}",
             gpu.arch
-        );
-        std::process::exit(2);
-    }
-    if std::env::var("HIPFIRE_QWEN4_GDN_PIPE").as_deref() == Ok("0") {
-        eprintln!(
-            "gdn_capture_f32_gfx942_oracle: HIPFIRE_QWEN4_GDN_PIPE=0 selects persistent256 as \
-             the reference; unset it"
         );
         std::process::exit(2);
     }

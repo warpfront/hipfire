@@ -39,9 +39,8 @@
 //!   position (blocks past the visible prefix are rewritten as huge keys per
 //!   position). The tape's kernels and grids must not depend on the capture
 //!   position.
-//! * Production route (default on for exact gfx1201; `HIPFIRE_QWEN4_QSA_BF16_SPLIT=0`
-//!   must force the incumbent): the public mirrored select eager and recorded,
-//!   below and above the crossover.
+//! * Production route (exact gfx1201 and gfx1100): the public mirrored select eager and
+//!   recorded, below and above the crossover.
 //! * `#[ignore]`d `qsa_bf16_split_crossover_table`: graph-replayed GPU time of
 //!   the fused incumbent, split select and split filter.
 //! * Wide verify: `qsa_bf16_wide_rows_*` compares every logical R=1..64
@@ -61,7 +60,6 @@
 //! Missing hardware, unsupported architecture and candidate refusal are fatal.
 //!
 //!   cargo test -p rdna-compute --release --features lab --test qsa_bf16_scores -- --nocapture
-//!   HIPFIRE_QWEN4_QSA_BF16_SPLIT=0 cargo test -p rdna-compute --release --features lab --test qsa_bf16_scores -- --nocapture
 //!   cargo test -p rdna-compute --release --features lab --test qsa_bf16_scores -- --ignored --nocapture qsa_bf16_split_crossover_table
 #![cfg(feature = "lab")]
 
@@ -1952,25 +1950,14 @@ fn qsa_bf16_split_recorded_replay_matches_fused_at_positions() {
 // ---------------------------------------------------------------------------
 // production route
 
-/// `false`: `HIPFIRE_QWEN4_QSA_BF16_SPLIT=0` (the kill switch; must force the
-/// incumbent); `true`: unset or any other value (the default route on exact
-/// gfx1201).
-fn split_switch() -> bool {
-    std::env::var("HIPFIRE_QWEN4_QSA_BF16_SPLIT").as_deref() != Ok("0")
-}
-
 #[test]
 fn qsa_bf16_split_production_route_matches_fused() {
     let mut gpu = gpu_for_gate();
-    // gfx1100 is admitted unless the kill switch HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0
-    // is set in the process env (the knob is read once by the library).
-    let gfx1100_knob = std::env::var("HIPFIRE_QWEN4_QSA_SPLIT_GFX1100").as_deref() != Ok("0");
-    let arch_admitted = gpu.arch_caps.is_gfx1201() || (gpu.arch_caps.is_gfx1100() && gfx1100_knob);
     assert!(
         gpu.arch_caps.is_gfx1201() || gpu.arch_caps.is_gfx1100(),
         "this production split-route gate requires gfx1201 or gfx1100"
     );
-    let split_on = split_switch() && arch_admitted;
+    let split_on = true;
     let fx = Fixture::new(&mut gpu, PRODUCTION);
     let reserved =
         reserve_qsa_bf16_split_scratch(&mut gpu, DType::BF16).expect("reserve split scratch");

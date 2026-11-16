@@ -75,13 +75,6 @@ const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");
 const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_select_exact.hip");
-/// `HIPFIRE_QWEN4_GDN_PIPE=0` keeps the non-capture batched GDN recurrence of
-/// gfx1201 (F32 and Q8 state) and gfx942 (F32 state) on
-/// `gated_delta_step_halves_state128_persistent256_{f32,q8}` instead of the
-/// register-resident `gated_delta_step_pipe128_{f32,q8}` (bytewise identical
-/// results; the Q8 kernel is gfx1201-only).  Read once.
-static QWEN4_GDN_PIPE: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_GDN_PIPE", true));
 /// `HIPFIRE_QWEN4_QSA_PM` (on unless `0`) runs the gathered route's producer
 /// and attention from the certified builder module (`kernels::QSA_GATHER_PM_*`,
 /// same ABI, grid, LDS and output bytes as the hipcc kernels) instead of the
@@ -524,7 +517,7 @@ pub const GDN_PAIR_COUNTERS_BYTES: usize = GDN_PAIR_COUNTERS * 4;
 
 /// u32 counters of the fused lanes GDN Core ([`GdnCoreLanesPlan::launch_rotated`]):
 /// per lane `value_heads / 2` head-pair counters, then `key_heads` key-head
-/// counters. Only `HIPFIRE_QWEN4_GDN_LANES_FUSE` sizes the allocation this large.
+/// counters. Only the fused GDN lanes Core sizes the allocation this large.
 const GDN_LANE_FUSE_COUNTERS: usize = 1024;
 
 /// Allocate and zero the fused GDN step's head-pair arrival counters if they
@@ -879,8 +872,6 @@ struct GdnBatchedSelect {
     arch_gfx1201: bool,
     /// `gpu.arch == "gfx942"`.
     arch_gfx942: bool,
-    /// `HIPFIRE_QWEN4_GDN_PIPE`.
-    pipe_enabled: bool,
 }
 
 impl GdnBatchedSelect {
@@ -914,7 +905,7 @@ fn gdn_batched_kernel(s: &GdnBatchedSelect) -> (&'static str, bool) {
                 GdnStateFormat::F32 => true,
                 GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => false,
             });
-    let pipe128 = !canon && !s.captured && pipe128_arch && s.pipe_enabled;
+    let pipe128 = !canon && !s.captured && pipe128_arch;
     let kernel = match (s.captured, s.format) {
         (true, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
         (false, GdnStateFormat::F32) if pipe128 => "gated_delta_step_pipe128_f32",
@@ -1050,7 +1041,6 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
         },
         arch_gfx1201: gpu.arch == "gfx1201",
         arch_gfx942: gpu.arch == "gfx942",
-        pipe_enabled: *QWEN4_GDN_PIPE,
     });
     if gpu.arch_caps.is_gfx942()
         && kernel == "gated_delta_step_halves_state128_persistent256_capture_f32"
@@ -3312,13 +3302,8 @@ pub fn hyper_read_up_fused_entry(
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
-/// `HIPFIRE_QWEN4_HC_UP_ROT` (developer, default off): the gfx1201 `low_rank == 320` HC read tail
-/// of at most eight rows also writes the next mixer's `mq_rotate_x` of `mixed`
-/// ([`hyper_read_up_fused_rotate`]). Read once.
-static QWEN4_HC_UP_ROT: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_ROT", true));
 
-/// [`hyper_read_up_fused`] on exact gfx1201 (`HIPFIRE_QWEN4_HC_UP_ROT`, `low_rank == 320`,
+/// [`hyper_read_up_fused`] on exact gfx1201 (`low_rank == 320`,
 /// `hidden % 256 == 0`, 2..=8 rows, F32 `rotated`, not recording or capturing) in the one launch
 /// `hyper_read_up_fused_f32_sx_t1_k320_rot`: `mixed` is bitwise the t1 entry's and `rotated`
 /// bitwise `mq_rotate_x(mixed)`; the next matching `rotate_x_mq_batched(mixed, rotated, hidden,
@@ -3336,8 +3321,7 @@ pub fn hyper_read_up_fused_rotate(
         gpu.arch_caps.is_gfx1201(),
         p.rows,
     );
-    if !*QWEN4_HC_UP_ROT
-        || route != HyperReadUpFusedEntry::TwinT1
+    if route != HyperReadUpFusedEntry::TwinT1
         || p.low_rank != 320
         || p.hidden % 256 != 0
         || !(2..=8).contains(&p.rows)
@@ -4041,7 +4025,7 @@ impl GdnCoreLanesPlan<'_, '_> {
         Ok(())
     }
 
-    /// [`Self::launch`] under `HIPFIRE_QWEN4_GDN_LANES_FUSE`: ONE launch
+    /// [`Self::launch`] with the fused prologue/epilogue: ONE launch
     /// (`gated_delta_step_gate_norm128_q8_lanes_fuse`) runs the convolution + gate
     /// parameters as the step block's prologue, and, with `rotation`, the output
     /// projection's `mq_rotate_x` of every lane's gated output as its epilogue.
@@ -4200,8 +4184,7 @@ pub const GDN_CORE_LANE_ROWS: usize = 8;
 pub struct GdnCoreRowsLane<'a> {
     /// The qkv projection rows `[rows, qkv]` the per-lane route copies into
     /// `conv.input` (the capture's `inputs`); the lanes kernel does that copy.
-    /// When the in-projection wrote the capture in place
-    /// (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`) this IS `conv.input` and the kernel's copy
+    /// When the in-projection wrote the capture in place this IS `conv.input` and the kernel's copy
     /// stores each element onto itself (the same bits), as the per-lane route skips it.
     pub projection: &'a GpuTensor,
     pub conv: GatedDeltaConvBatched<'a>,
@@ -4441,7 +4424,7 @@ fn rows_step_kernargs(
 
 /// Admission of the per-lane verify chains of 2..=[`GDN_CORE_LANES_MAX`] lanes
 /// with 2..=[`GDN_CORE_LANE_ROWS`] rows each as three launches (see
-/// [`GdnCoreRowsPlan::launch`]), under `HIPFIRE_QWEN4_GDN_LANES_ROWS`
+/// [`GdnCoreRowsPlan::launch`]), on the verify-rows core
 /// ([`crate::feature_flags::FeatureFlags::qwen4_gdn_lanes_rows_enabled`]: exact
 /// gfx1201, opt-in, killed by `HIPFIRE_QWEN4_GDN_LANES=0`). Lanes hold Q8 slots on the exact-gfx1201
 /// 128x128 route with their capture ring armed (`step.row_states`: the
@@ -8230,22 +8213,15 @@ fn indexed_attention_select_rows8_core(
     Ok(mirror.is_some())
 }
 
-/// `HIPFIRE_QWEN4_QSA_BF16_SPLIT` (on unless `0`) routes BF16-pooled QSA selection on exact
-/// gfx1201 through the split score / select pair
-/// ([`indexed_attention_select_bf16_split`]): the exact hipcc BF16 score kernels
-/// of `kernels/src/qsa_bf16_scores.hip`, then the exact filter trio
-/// (`qsa_filter_select.hip`), both from the dedicated
-/// [`Gpu::qsa_select_scores`] slot, from [`QSA_BF16_SPLIT_MIN_BLOCKS`] pooled
-/// blocks. Selected indices and the mirror are byte-identical to the fused
-/// `indexed_attention_select_bf16_batched` incumbent. Default on, and only on
-/// exact gfx1201 and exact gfx1100 ([`qsa_bf16_split_arch`]; gfx1100 has the
-/// kill switch `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0`; the other architectures
-/// keep the incumbent whatever the switch says); `0` is the kill switch and always
-/// keeps the incumbent, as does `HIPFIRE_QWEN4_QSA_FILTER_SELECT=0` (the
-/// select-from-scores arm never beats the filter on gfx1201). Read once.
-static QWEN4_QSA_BF16_SPLIT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_BF16_SPLIT", true)
-});
+// BF16-pooled QSA selection on exact gfx1201 and exact gfx1100 goes through the split score /
+// select pair ([`indexed_attention_select_bf16_split`]): the exact hipcc BF16 score kernels
+// of `kernels/src/qsa_bf16_scores.hip`, then the exact filter trio
+// (`qsa_filter_select.hip`), both from the dedicated
+// [`Gpu::qsa_select_scores`] slot, from [`QSA_BF16_SPLIT_MIN_BLOCKS`] pooled
+// blocks. Selected indices and the mirror are byte-identical to the fused
+// `indexed_attention_select_bf16_batched` incumbent, which every other architecture
+// keeps ([`qsa_bf16_split_arch`]), as does `HIPFIRE_QWEN4_QSA_FILTER_SELECT=0` (the
+// select-from-scores arm never beats the filter on gfx1201).
 
 /// Pooled blocks from which the split route replaces the fused BF16 selector
 /// for calls of at most [`QSA_BF16_SPLIT_MANY_ROWS`] rows (decode, verify, small
@@ -8282,37 +8258,24 @@ struct QsaBf16SplitRoute {
     bounded: bool,
 }
 
-/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100` (on unless `0`) is the kill switch for
-/// exact gfx1100 (7900 XTX) on the BF16 split route: unset/1 admits it under
-/// exactly the gfx1201 conditions and crossovers (measured on gfx1100, see
-/// [`QSA_BF16_SPLIT_MIN_BLOCKS`]); `0` restores the fused selector there.
-/// Byte identity on gfx1100 is proven by the route tests (knob on/off) and the
-/// exhaustive score gate (255 / 257 / 2048 / 8192 / 32768 / 65536 blocks,
-/// 27,648 launches bit-exact over 4.3e9 cells). Read once.
-static QWEN4_QSA_SPLIT_GFX1100: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SPLIT_GFX1100", true)
-});
-
 /// Pure admission predicate behind [`qsa_bf16_split_arch`].
 fn qsa_bf16_split_arch_admits(
     is_gfx1201: bool,
     is_gfx1100: bool,
-    gfx1100_knob: bool,
     parallel_qsa_gdn: bool,
     forced_serial: bool,
 ) -> bool {
-    (is_gfx1201 || (is_gfx1100 && gfx1100_knob)) && parallel_qsa_gdn && !forced_serial
+    (is_gfx1201 || is_gfx1100) && parallel_qsa_gdn && !forced_serial
 }
 
-/// Exact gfx1201, or exact gfx1100 unless
-/// `HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0`; gfx1151 keeps its PM routes and every
+/// Exact gfx1201 or exact gfx1100 (byte identity on gfx1100 is proven by the exhaustive score
+/// gate); gfx1151 keeps its PM routes and every
 /// other arch keeps the fused selector. The route, the scratch reserve and the
 /// expert-residency census all call this one fn, so they agree in a process.
 fn qsa_bf16_split_arch(gpu: &Gpu) -> bool {
     qsa_bf16_split_arch_admits(
         gpu.arch_caps.is_gfx1201(),
         gpu.arch_caps.is_gfx1100(),
-        *QWEN4_QSA_SPLIT_GFX1100,
         gpu.arch_caps.has_qwen4_parallel_qsa_gdn(),
         select_forced_serial(),
     )
@@ -8338,8 +8301,7 @@ fn qsa_bf16_split_route(
     gpu: &Gpu,
     p: &IndexedAttentionSelectBatch<'_>,
 ) -> Option<QsaBf16SplitRoute> {
-    if !*QWEN4_QSA_BF16_SPLIT
-        || !QWEN4_QSA_FILTER_SELECT.unwrap_or(true)
+    if !QWEN4_QSA_FILTER_SELECT.unwrap_or(true)
         || *QWEN4_QSA_SELECT_EXACT
         || gpu.graphs.capture_mode
         || !qsa_bf16_split_arch(gpu)
@@ -8418,11 +8380,11 @@ fn qsa_bf16_split_reserve_layout() -> HipResult<QsaBf16SplitLayout> {
 }
 
 /// Whether [`reserve_qsa_bf16_split_scratch`] reserves anything for `pooled`:
-/// switch on, exact gfx1201 parallel-QSA arch, BF16 pooled keys. Pure metadata
+/// exact gfx1201 / gfx1100 parallel-QSA arch, BF16 pooled keys. Pure metadata
 /// (no allocation, no device call); the runtime block-count crossover is not
 /// part of the reservation.
 fn qsa_bf16_split_reserves(gpu: &Gpu, pooled: DType) -> bool {
-    *QWEN4_QSA_BF16_SPLIT && pooled == DType::BF16 && qsa_bf16_split_arch(gpu)
+    pooled == DType::BF16 && qsa_bf16_split_arch(gpu)
 }
 
 /// Bytes of the QSA split-route selector scratch that
@@ -13020,21 +12982,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qsa_bf16_split_arch_predicate_is_gfx1201_or_gfx1100_unless_killed() {
+    fn qsa_bf16_split_arch_predicate_is_gfx1201_or_gfx1100() {
         let f = qsa_bf16_split_arch_admits;
-        // gfx1201: admitted whatever the gfx1100 knob says.
-        assert!(f(true, false, false, true, false));
-        assert!(f(true, false, true, true, false));
-        // gfx1100: admitted with the knob (default), not with the kill switch.
-        assert!(f(false, true, true, true, false));
-        assert!(!f(false, true, false, true, false));
+        assert!(f(true, false, true, false));
+        assert!(f(false, true, true, false));
         // other arch: never.
-        assert!(!f(false, false, true, true, false));
-        assert!(!f(false, false, false, true, false));
+        assert!(!f(false, false, true, false));
         // conjunction terms still gate both archs.
         for (a, b) in [(true, false), (false, true)] {
-            assert!(!f(a, b, true, false, false));
-            assert!(!f(a, b, true, true, true));
+            assert!(!f(a, b, false, false));
+            assert!(!f(a, b, true, true));
         }
     }
 
@@ -15350,8 +15307,8 @@ mod tests {
     /// the persistent256 kernel byte for byte (output, final F32 state, and
     /// the Q8 codes and scales), across the 256-row parameter-block boundary
     /// and ragged row counts, on a nonzero random start state at a nonzero
-    /// position.  Both kernels are launched by name, so the
-    /// `HIPFIRE_QWEN4_GDN_PIPE` selection is not under test.  gfx1201 runs
+    /// position.  Both kernels are launched by name, so the route
+    /// selection is not under test.  gfx1201 runs
     /// the F32 and Q8 kernels over rows 1..=1000; gfx942 has only the F32
     /// kernel (its persistent256 F32 arithmetic is `__fmaf_rn`-pinned) and
     /// adds a 1536-row case.  Other archs skip.
@@ -22957,7 +22914,6 @@ mod gdn_q8ef_tests {
         qwen4_scope: bool,
         policy: Qwen4GdnPrefill,
         arch: &str,
-        pipe_enabled: bool,
     ) -> (&'static str, bool) {
         gdn_batched_kernel(&GdnBatchedSelect {
             captured,
@@ -22966,7 +22922,6 @@ mod gdn_q8ef_tests {
             policy,
             arch_gfx1201: arch == "gfx1201",
             arch_gfx942: arch == "gfx942",
-            pipe_enabled,
         })
     }
 
@@ -22977,11 +22932,10 @@ mod gdn_q8ef_tests {
         qwen4_scope: bool,
         policy: Qwen4GdnPrefill,
         arch: &str,
-        pipe_enabled: bool,
     ) -> (&'static str, bool) {
         let canon = !captured && format == Q8 && qwen4_scope && policy == Qwen4GdnPrefill::Canon;
         let pipe128_arch = arch == "gfx1201" || (arch == "gfx942" && format == F32);
-        let pipe128 = !canon && !captured && pipe128_arch && pipe_enabled;
+        let pipe128 = !canon && !captured && pipe128_arch;
         let kernel = match (captured, format) {
             (true, F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
             (false, F32) if pipe128 => "gated_delta_step_pipe128_f32",
@@ -23007,45 +22961,41 @@ mod gdn_q8ef_tests {
             for scope in [false, true] {
                 for policy in policies {
                     for arch in ["gfx1151", "gfx1201", "gfx942", "gfx1100"] {
-                        for pipe in [false, true] {
-                            // Plain F32 / Q8 selection is the frozen selector.
-                            for format in [F32, Q8] {
-                                assert_eq!(
-                                    batched(format, captured, scope, policy, arch, pipe),
-                                    frozen_plain(format, captured, scope, policy, arch, pipe),
-                                    "{} captured={captured} scope={scope} {policy:?} {arch} pipe={pipe}",
-                                    format.name()
-                                );
-                            }
-                            // Q8Ef is the Q8 twin in every branch: same
-                            // branch structure and pipe128 geometry, `_q8` ->
-                            // `_q8ef`.
-                            let (q8_kernel, q8_pipe) =
-                                batched(Q8, captured, scope, policy, arch, pipe);
-                            let (ef_kernel, ef_pipe) =
-                                batched(EF, captured, scope, policy, arch, pipe);
-                            let twin = format!("{}ef", q8_kernel);
-                            assert!(q8_kernel.ends_with("_q8"), "{q8_kernel}");
-                            assert_eq!(ef_kernel, twin);
-                            assert_eq!(ef_pipe, q8_pipe);
-                            checked += 1;
+                        // Plain F32 / Q8 selection is the frozen selector.
+                        for format in [F32, Q8] {
+                            assert_eq!(
+                                batched(format, captured, scope, policy, arch),
+                                frozen_plain(format, captured, scope, policy, arch),
+                                "{} captured={captured} scope={scope} {policy:?} {arch}",
+                                format.name()
+                            );
                         }
+                        // Q8Ef is the Q8 twin in every branch: same
+                        // branch structure and pipe128 geometry, `_q8` ->
+                        // `_q8ef`.
+                        let (q8_kernel, q8_pipe) = batched(Q8, captured, scope, policy, arch);
+                        let (ef_kernel, ef_pipe) = batched(EF, captured, scope, policy, arch);
+                        let twin = format!("{}ef", q8_kernel);
+                        assert!(q8_kernel.ends_with("_q8"), "{q8_kernel}");
+                        assert_eq!(ef_kernel, twin);
+                        assert_eq!(ef_pipe, q8_pipe);
+                        checked += 1;
                     }
                 }
             }
         }
-        assert_eq!(checked, 2 * 2 * 3 * 4 * 2);
+        assert_eq!(checked, 2 * 2 * 3 * 4);
         // The named branches of the Q8Ef set.
         let wy = Qwen4GdnPrefill::Wy;
         assert_eq!(
-            batched(EF, true, true, wy, "gfx1201", true),
+            batched(EF, true, true, wy, "gfx1201"),
             (
                 "gated_delta_step_halves_state128_persistent256_capture_q8ef",
                 false
             )
         );
         assert_eq!(
-            batched(EF, false, true, Qwen4GdnPrefill::Canon, "gfx1201", true),
+            batched(EF, false, true, Qwen4GdnPrefill::Canon, "gfx1201"),
             (
                 "gated_delta_step_halves_state128_persistent256_canon_q8ef",
                 false
@@ -23053,20 +23003,20 @@ mod gdn_q8ef_tests {
         );
         // Canon needs the Qwen4 scope.
         assert_eq!(
-            batched(EF, false, false, Qwen4GdnPrefill::Canon, "gfx1201", true),
+            batched(EF, false, false, Qwen4GdnPrefill::Canon, "gfx1201"),
             ("gated_delta_step_pipe128_q8ef", true)
         );
         assert_eq!(
-            batched(EF, false, false, wy, "gfx1151", true),
+            batched(EF, false, false, wy, "gfx1151"),
             ("gated_delta_step_halves_state128_persistent256_q8ef", false)
         );
         // gfx942 pipes F32 only.
         assert_eq!(
-            batched(EF, false, false, wy, "gfx942", true),
+            batched(EF, false, false, wy, "gfx942"),
             ("gated_delta_step_halves_state128_persistent256_q8ef", false)
         );
         assert_eq!(
-            batched(F32, false, false, wy, "gfx942", true),
+            batched(F32, false, false, wy, "gfx942"),
             ("gated_delta_step_pipe128_f32", true)
         );
         // Only a Q8-family state outside capture in the scope reads the policy.

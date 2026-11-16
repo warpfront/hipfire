@@ -3641,7 +3641,7 @@ impl Gpu {
                 false,
             )
         };
-        // HIPFIRE_QWEN4_MOE_DOWN_DNI: gfx1201 per-pick K = 640 down, <= 8 rows, eager: eight weight
+        // dni (default on, Gpu::set_moe_down_dni): gfx1201 per-pick K = 640 down, <= 8 rows, eager: eight weight
         // rows per wave, four waves per block (32 rows), software-pipelined loads (bitwise the r4
         // kernel). Grid [M / 32, k_top, N], block 128.
         let dni = r4

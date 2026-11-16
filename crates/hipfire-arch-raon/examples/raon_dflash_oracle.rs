@@ -125,8 +125,8 @@
 //!   so a generation never forgets its early tokens; here `--tokens` is the generation length, so
 //!   the default window always covers the whole oracle generation. Absent flags leave the
 //!   neutral path unchanged.
-//! * `--draft-penalty on|off` (`sampled`, `greedy`; default: follow `HIPFIRE_DFLASH_DRAFT_PENALTY`,
-//!   itself default on): whether the DFlash2 selector scores its candidates after the request's
+//! * `--draft-penalty on|off` (`sampled`, `greedy`; default on): whether the DFlash2 selector
+//!   scores its candidates after the request's
 //!   penalties (history = emitted prefix plus the drafts selected for earlier rows, the history
 //!   of the verify row that will judge the draft) or from the raw target head. Output is the
 //!   AR stream / law either way; only tau changes, printed as `tau` (greedy: mean
@@ -161,7 +161,7 @@
 //!   median / mean device-synced draft-forward and selector ms of both arms (the graph
 //!   arm's warm-up windows excluded from the steady-state figure) and the graph counters.
 //!   `--fc-compare on` (default) adds an informational eager arm with the skinny staged `fc`
-//!   projection forced off (`HIPFIRE_DFLASH_FC_SKINNY=0`'s route) and reports how many windows'
+//!   projection forced off (the batched WMMA GEMM route) and reports how many windows'
 //!   draft tokens / confidences / hidden rows it changes and both arms' draft and head+selector ms.
 //!
 //! Exit status: 0 pass, 1 verdict failed, 2 usage / runtime error.
@@ -297,7 +297,7 @@ struct PenaltyOpts {
     frequency: f32,
     window: usize,
     /// `--draft-penalty on|off`: the selector scores its candidates after the request's
-    /// penalties (`HIPFIRE_DFLASH_DRAFT_PENALTY`); `None` follows the env var (default on).
+    /// penalties; `None` keeps the default (on).
     draft_penalty: Option<bool>,
 }
 
@@ -364,12 +364,11 @@ impl PenaltyOpts {
         set_draft_penalty_override(self.draft_penalty);
     }
 
-    /// `on` / `off` for the print lines: the flag, else the env var (default on).
+    /// `on` / `off` for the print lines: the flag, else the default (on).
     fn draft_penalty_label(&self) -> &'static str {
         match self.draft_penalty {
-            Some(true) => "on",
             Some(false) => "off",
-            None => "env",
+            _ => "on",
         }
     }
 

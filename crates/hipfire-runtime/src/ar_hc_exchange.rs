@@ -8,7 +8,7 @@
 //!
 //! Each rank owns one fine-grained VRAM mailbox that the PEER writes (`hipDeviceMallocFinegrained`):
 //! a TAGGED region (two banks sized for 32-byte tagged granules of four f32 partials; bf16
-//! partials use 16-byte granules of the same slots) and, unless `HIPFIRE_EP_AR_WIRE_DENSE=0`, a
+//! partials use 16-byte granules of the same slots), a
 //! DENSE region (two banks sized for 16-byte untagged f32 granules, 8 bytes for bf16 partials,
 //! EMPTY = all ones; launches of at least [`AR_HC_DENSE_MIN_ROWS`] rows use it, see the kernel
 //! header for the argument; the SP all-gather uses it with 8-byte granules), and one 256-byte block holding the
@@ -37,8 +37,6 @@
 //! rank's pool abort ([`ArHcExchange::abort`]) releases a waiting peer at once, and a timed-out
 //! wait aborts the gate for both ranks. The gate couples the two ranks' host timelines at
 //! every launch; the retained / persistent path will replace it with device-side boundaries.
-//! `HIPFIRE_EP_AR_HOST_GATE=0` ([`AR_HOST_GATE_ENV`]) is the kill switch (launch ungated, as
-//! before).
 
 use crate::ep_row_gather::{DEFAULT_BARRIER_TIMEOUT, SLOW_BARRIER_REPORT};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED};
@@ -82,14 +80,12 @@ pub struct ArHcExchange {
     arrivals: [AtomicU64; 2],
     /// Set by [`ArHcExchange::abort`] (a failed rank) or a timed-out gate wait.
     gate_aborted: AtomicBool,
-    /// [`AR_HOST_GATE_ENV`] at construction: `false` launches ungated (the kill switch).
-    host_gate_on: bool,
 }
 
 /// Which mailbox wires a transport uses (see the kernel header for the two formats).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArHcMode {
-    /// Every launch on the tagged wire (the kill-switch format).
+    /// Every launch on the tagged wire (oracles and benches).
     Tagged,
     /// Every launch on the dense wire (oracles and benches).
     Dense,
@@ -114,28 +110,11 @@ impl ArHcMode {
 // selector-receipt: receipts/selectors/ar_hc_dense_min_rows.json
 pub const AR_HC_DENSE_MIN_ROWS: usize = 16;
 
-/// `HIPFIRE_EP_AR_WIRE_DENSE` (developer, default on): `0` selects the tagged granule wire for
-/// every launch (the kill switch); anything else the hybrid default.
-pub const AR_WIRE_DENSE_ENV: &str = "HIPFIRE_EP_AR_WIRE_DENSE";
-
-/// The mode the process selects (`HIPFIRE_EP_AR_WIRE_DENSE`).
-pub fn ar_hc_mode_from_env() -> ArHcMode {
-    if hipfire_config::developer_bool(AR_WIRE_DENSE_ENV, true) {
-        ArHcMode::Hybrid
-    } else {
-        ArHcMode::Tagged
-    }
-}
-
-/// `HIPFIRE_EP_AR_HOST_GATE` (developer, default on): `0` launches every all-reduce / SP launch
-/// without the host arrival gate (the kill switch: the device wait alone, as before).
-pub const AR_HOST_GATE_ENV: &str = "HIPFIRE_EP_AR_HOST_GATE";
-
 impl ArHcExchange {
-    /// Transport for launches of up to `max_rows` rows each (<= [`AR_HC_ROW_CAP`]) in the mode
-    /// `HIPFIRE_EP_AR_WIRE_DENSE` selects (hybrid unless killed).
+    /// Transport for launches of up to `max_rows` rows each (<= [`AR_HC_ROW_CAP`]) in the
+    /// hybrid mode.
     pub fn new(max_rows: usize) -> HipResult<Self> {
-        Self::with_mode(max_rows, ar_hc_mode_from_env())
+        Self::with_mode(max_rows, ArHcMode::Hybrid)
     }
 
     /// [`Self::new`] in an explicit mode (oracles and benches).
@@ -155,7 +134,6 @@ impl ArHcExchange {
             enabled: AtomicBool::new(true),
             arrivals: [AtomicU64::new(0), AtomicU64::new(0)],
             gate_aborted: AtomicBool::new(false),
-            host_gate_on: hipfire_config::developer_bool(AR_HOST_GATE_ENV, true),
         })
     }
 
@@ -166,9 +144,6 @@ impl ArHcExchange {
     /// the peer fails at once too). A wait that passes [`SLOW_BARRIER_REPORT`] is reported
     /// once while still waiting, so a stall that later resolves stays visible.
     fn host_gate(&self, rank: usize) -> HipResult<()> {
-        if !self.host_gate_on {
-            return Ok(());
-        }
         let peer = 1 - rank;
         let ticket = self.arrivals[rank].fetch_add(1, Ordering::AcqRel) + 1;
         let span = hip_bridge::site_ledger::begin();
@@ -1065,21 +1040,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// A transport with the gate forced on or off whatever the process environment says.
-    fn gated(on: bool) -> Arc<ArHcExchange> {
-        let mut x = ArHcExchange::with_mode(1, ArHcMode::Tagged).unwrap();
-        x.host_gate_on = on;
-        Arc::new(x)
-    }
-
-    /// The kill switch launches ungated: no arrival is counted and no peer is awaited.
-    #[test]
-    fn host_gate_off_never_waits() {
-        let x = gated(false);
-        for _ in 0..3 {
-            x.host_gate(0).unwrap();
-        }
-        assert_eq!(x.arrivals[0].load(Ordering::Acquire), 0);
+    fn gated() -> Arc<ArHcExchange> {
+        Arc::new(ArHcExchange::with_mode(1, ArHcMode::Tagged).unwrap())
     }
 
     /// The host gate lets a launch through only once the peer's host arrived at the same
@@ -1087,7 +1049,7 @@ mod tests {
     /// launching, and mirrored sequences cross in order.
     #[test]
     fn host_gate_waits_for_a_stalled_peer_and_crosses_in_order() {
-        let x = gated(true);
+        let x = gated();
         let peer = {
             let x = x.clone();
             std::thread::spawn(move || {
@@ -1112,7 +1074,7 @@ mod tests {
     /// `skip_launch` (fault oracles) arrives without a launch.
     #[test]
     fn host_gate_abort_releases_and_skip_launch_arrives() {
-        let x = gated(true);
+        let x = gated();
         let aborter = {
             let x = x.clone();
             std::thread::spawn(move || {

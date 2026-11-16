@@ -17,8 +17,8 @@
 //! the limit.
 //!
 //! The test runs only on gfx1151 and asserts that the head's tiles take the
-//! MQ4G256V2 PM route (`Gpu::gemm_mq4g256v2_pm_applies`); it fails, rather than
-//! passing vacuously, when `HIPFIRE_QWEN4_MQ4_X4_PM=0` or a graph capture
+//! MQ4G256V2 PM route (`Gpu::gemm_mq4g256v2_xf16_applies`); it fails, rather than
+//! passing vacuously, when a graph capture
 //! keeps the launch off that route.
 //!
 //! `#[ignore]`d: needs a gfx1151 GPU with about 12 GB of free VRAM.
@@ -92,9 +92,9 @@ fn run(rows: usize) {
     for tile_rows in [TILE, rows % TILE] {
         if tile_rows > 0 {
             assert!(
-                gpu.gemm_mq4g256v2_pm_applies(K, tile_rows),
+                gpu.gemm_mq4g256v2_xf16_applies(K, tile_rows),
                 "{tile_rows}-row tile is off the MQ4G256V2 PM route \
-                 (HIPFIRE_QWEN4_MQ4_X4_PM=0, graph capture or replay recording?)"
+                 (graph capture or replay recording?)"
             );
         }
     }

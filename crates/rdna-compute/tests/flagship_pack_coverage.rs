@@ -475,9 +475,8 @@ fn portable_flagship_subset_is_registered_on_every_release_arch() {
     );
 }
 
-/// The exact BF16 split QSA selector is the exact-gfx1100 Flash-Next default
-/// (`HIPFIRE_QWEN4_QSA_SPLIT_GFX1100`, on unless `0`), so the gfx1100 AR and
-/// native-MTP route module sets must carry its two modules. The v0.4.4
+/// The exact BF16 split QSA selector is the exact-gfx1100 Flash-Next default, so the
+/// gfx1100 AR and native-MTP route module sets must carry its two modules. The v0.4.4
 /// `flagship-pack-gfx1100.tsv` predates the default and is never regenerated;
 /// the required set is therefore its measured fn-ar / fn-mtp modules plus the
 /// walked gfx1100 plan's hip modules (which include the split modules) plus

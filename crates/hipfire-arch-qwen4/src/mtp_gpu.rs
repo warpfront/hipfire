@@ -258,48 +258,33 @@ fn det_dense_shape_ok(m: usize, k: usize, n: usize) -> bool {
     m != 0 && m % 16 == 0 && k != 0 && k % 64 == 0 && n >= 1
 }
 
-/// `HIPFIRE_QWEN4_MTP_TOKEN_RING` (default on; `0` restores the blocking
-/// `Gpu::upload_stream_ordered` of every head step's token ids): whether the
-/// token ids stage through a pinned, event-fenced [`LaneTokenRing`] and enqueue
-/// on the active stream without a host stream synchronize. Read once, when a
-/// scratch is built.
-pub const MTP_TOKEN_RING_ENV: &str = "HIPFIRE_QWEN4_MTP_TOKEN_RING";
-
 /// Pinned slots of an MTP token ring. A head round uploads up to about nine
 /// times between two host waits at the widest served shape, so the ring must
 /// not wrap inside one step: a slot is reused only long after its copy ran.
 const MTP_TOKEN_RING_SLOTS: usize = 16;
 
-/// The token ring of a scratch uploading at most `capacity` bytes, or `None`
-/// when [`MTP_TOKEN_RING_ENV`] is `0`.
-fn new_token_ring(capacity: usize) -> Option<LaneTokenRing> {
-    hipfire_config::developer_bool(MTP_TOKEN_RING_ENV, true)
-        .then(|| LaneTokenRing::with_slots(capacity, MTP_TOKEN_RING_SLOTS))
+/// The token ring of a scratch uploading at most `capacity` bytes.
+fn new_token_ring(capacity: usize) -> LaneTokenRing {
+    LaneTokenRing::with_slots(capacity, MTP_TOKEN_RING_SLOTS)
 }
 
-/// Upload `bytes` (token ids) into `dst`. With a ring, on the steady copy
-/// stream and outside graph capture / replay recording, the copy stages
-/// through a pinned slot and is enqueued without a host synchronize (the slot
-/// is fenced by its own event). Every other case keeps
-/// `Gpu::upload_stream_ordered`: a captured or recorded copy would bake the
-/// host pointer, and with no steady copy stream the blocking copy is the
-/// ordering.
+/// Upload `bytes` (token ids) into `dst`. On the steady copy stream and outside graph
+/// capture / replay recording, the copy stages through a pinned slot of `ring` and is
+/// enqueued without a host synchronize (the slot is fenced by its own event). Every other
+/// case keeps `Gpu::upload_stream_ordered`: a captured or recorded copy would bake the
+/// host pointer, and with no steady copy stream the blocking copy is the ordering.
 fn upload_token_ids(
-    ring: Option<&mut LaneTokenRing>,
+    ring: &mut LaneTokenRing,
     gpu: &Gpu,
     dst: &hip_bridge::DeviceBuffer,
     bytes: &[u8],
 ) -> Result<(), MtpGpuError> {
-    match ring {
-        Some(ring)
-            if gpu.steady_copy_stream().is_some()
-                && !gpu.graphs.capture_mode
-                && !gpu.replay.is_recording() =>
-        {
-            ring.stage(gpu, bytes.len())?.copy_from_slice(bytes);
-            ring.upload(gpu, dst, bytes.len())?;
-        }
-        _ => gpu.upload_stream_ordered(dst, bytes)?,
+    if gpu.steady_copy_stream().is_some() && !gpu.graphs.capture_mode && !gpu.replay.is_recording()
+    {
+        ring.stage(gpu, bytes.len())?.copy_from_slice(bytes);
+        ring.upload(gpu, dst, bytes.len())?;
+    } else {
+        gpu.upload_stream_ordered(dst, bytes)?;
     }
     Ok(())
 }
@@ -508,8 +493,8 @@ pub struct MtpGpuScratch {
     moe_scalar: GpuTensor,
     host_token_bytes: [u8; 4],
     /// Pinned, event-fenced staging of the head step's token upload
-    /// ([`upload_token_ids`]); `None` when [`MTP_TOKEN_RING_ENV`] is `0`.
-    token_ring: Option<LaneTokenRing>,
+    /// ([`upload_token_ids`]).
+    token_ring: LaneTokenRing,
 }
 
 impl MtpGpuScratch {
@@ -720,7 +705,7 @@ impl MtpGpuScratch {
 
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         // The ring drains its pending copies before `token_ids` is freed.
-        let ring_error = self.token_ring.and_then(|ring| ring.free_gpu(gpu));
+        let ring_error = self.token_ring.free_gpu(gpu);
         let tensors = [
             self.token_ids,
             self.embedding_rot,
@@ -3883,7 +3868,7 @@ impl Qwen4MtpGpu {
             .host_token_bytes
             .copy_from_slice(&(token as i32).to_ne_bytes());
         upload_token_ids(
-            self.scratch.token_ring.as_mut(),
+            &mut self.scratch.token_ring,
             gpu,
             &self.scratch.token_ids.buf,
             &self.scratch.host_token_bytes,

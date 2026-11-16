@@ -571,7 +571,7 @@ pub const CURATED: &[SettingKnob] = &[
             "Follows the trailing 8-cycle acceptance depth (τ̂+2 rows), shrunk only past 2k context where the fixed full block loses throughput. This is not output-identical: realized tokens can differ from fixed-B (observed even at temp 0) because a narrower verify window moves window boundaries; per-position sampling stays target-lossless."
         ),
         "Opt in for long-context DFlash sessions after measuring your workload; off keeps the fixed full block. Mutually exclusive with the retained PM4 verify route (PM4 loads keep the fixed B=16 shape).",
-        Some("HIPFIRE_DFLASH_ADAPTIVE_B=0 forces the fixed block even when enabled. Short contexts always get the full block."),
+        Some("Short contexts always get the full block."),
     )
     .with_option_help(&[
         ("true", "Size the draft batch to recent acceptance (context-gated, seeded at full)."),

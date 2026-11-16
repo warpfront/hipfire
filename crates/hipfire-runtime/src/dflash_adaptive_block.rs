@@ -43,8 +43,8 @@
 //! at temp 0 on gfx1151): shrinking trades token-identity, never the
 //! target-lossless per-position sampling property.
 //!
-//! Env-free by construction: the `HIPFIRE_DFLASH_ADAPTIVE_B=0` kill-switch is
-//! resolved by `build_dflash_speculator`, so this controller is unit-testable
+//! Env-free by construction: the load knob is resolved by
+//! `build_dflash_speculator`, so this controller is unit-testable
 //! without a device — see the tests below.
 
 /// Trailing verify cycles of acceptance history before the width may shrink.

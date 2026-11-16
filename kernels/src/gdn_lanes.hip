@@ -77,7 +77,7 @@ extern "C" __global__ void gated_delta_step_gate_norm128_q8_lanes(
 }
 
 // ---------------------------------------------------------------------------
-// HIPFIRE_QWEN4_GDN_LANES_FUSE (default off): the Core of up to 8 lanes in ONE
+// Fused lanes Core: the Core of up to 8 lanes in ONE
 // launch. gated_delta_conv_params_bf16_f32_lanes is the prologue of the step
 // block, and the output projection's mq_rotate_x is the epilogue (the head-pair
 // arrival-counter rotation of gated_delta_step_gate_norm128_body, one counter

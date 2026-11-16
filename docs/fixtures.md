@@ -118,7 +118,7 @@ v0.4.6), ROCm 10.1 / HIP 7.16.26385 / clang 24. Each cell was reproduced in two
 fresh processes with separate HOME and empty `HIPFIRE_KERNEL_CACHE`
 (byte-identical), and once more on a warm cache (byte-identical to the cold
 pair). v0.4.6 already contains the HC quarters-gates route
-(`HIPFIRE_QWEN4_G942_HC_QUARTERS_GATES`, default on), so these are its
+(default on then, unconditional now), so these are its
 numerics. Planted control: `HIPFIRE_G942_TRUNK_GEMV=1` moves the code24 hash
 (the `control_*` fields of `pin:kld/gfx942.fn-fp8.code24`). Receipt:
 `/home/kaden/qcal/release-0.5.0/s0/PIN-GFX942.md`.

@@ -72,13 +72,6 @@ use hipfire_runtime::spec::{request_rng_state, SpecRequestConfig};
 use rdna_compute::Gpu;
 use std::ops::Range;
 
-static CB_SAMPLED_PACKED_HEAD: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_SAMPLED_PACKED_HEAD")
-        .ok()
-        .as_deref()
-        != Some("0")
-});
-
 /// The singleton's verify block for remaining output budget `max_emit`
 /// (`E > 0`): `B = min(block_size, max(E, 2))`. Even `E = 1` verifies two rows
 /// (the accept clamp `max_accept = E - 1` then keeps zero drafts).
@@ -365,8 +358,7 @@ fn cb_sampled_packed_head_admitted(
     rows: usize,
 ) -> bool {
     let head = &weights.output;
-    *CB_SAMPLED_PACKED_HEAD
-        && lanes.len() > 1
+    lanes.len() > 1
         && lanes.iter().any(|l| l.state.sample_temp > 1e-6)
         && gpu.mq4_verify_singleton_chain()
         && head.gpu_dtype == rdna_compute::DType::MQ4G256V2

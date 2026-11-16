@@ -723,8 +723,7 @@ fn sha_hex(source: &str) -> String {
     format!("{:x}", Sha256::digest(source.as_bytes()))
 }
 
-/// The exact BF16 split QSA selector is the gfx1100 default
-/// (`HIPFIRE_QWEN4_QSA_SPLIT_GFX1100` on unless `0`), so its two modules are in
+/// The exact BF16 split QSA selector is the gfx1100 default, so its two modules are in
 /// the gfx1100 plan of BOTH spec routes with exactly the symbols the split
 /// launchers bind (`tensor_ops::qsa_bf16_split_select`: rows8/rows16 scores and
 /// the filter trio); a post-ready first split load no longer binds lazily.

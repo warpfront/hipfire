@@ -144,7 +144,7 @@ a new arm.
   `verify_block_logits` for greedy too: row `r` is `apply_logit_policy_cpu`-penalized against
   `suffix_W(emitted ‖ drafts[..r])`, then greedy takes the argmax of the penalized row and sampled
   builds `p` from it. The one-token window and the retired AR step penalize the same way. The
-  draft proposal is penalized too (`HIPFIRE_DFLASH_DRAFT_PENALTY`, default on): the selector
+  draft proposal is penalized too: the selector
   rescoring each row's raw top-K candidates with the same policy over `emitted ‖ drafts selected
   for earlier rows` (`SelectorPenalty`, host-side walk), so `q` tracks the penalized `p` and tau
   holds; it never changes the output, only acceptance. A neutral request keeps the device argmax

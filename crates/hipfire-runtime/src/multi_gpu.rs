@@ -204,13 +204,6 @@ pub struct Gpus {
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
 
-/// Kill switch for the symmetric direct-peer-read TP allreduce:
-/// `HIPFIRE_TP_PEER_DIRECT=0` restores the rooted gather/fold/broadcast.
-/// Default on for the n == 2 peer-access fast path.
-fn tp_peer_direct_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_TP_PEER_DIRECT", true)
-}
-
 /// Architecture defaults for the homogeneous TP2 whole-token decode graph
 /// when `HIPFIRE_TP_FULL_GRAPH` is unset. Both admitted exact architectures
 /// have an independent hardware receipt and retain `=0` as the kill switch.
@@ -305,11 +298,10 @@ fn tp_peer_alternating_for_mesh<'a>(
 // Defer snapshot reads until earlier opt-ins pass, just like the decode gate.
 fn tp2_whole_token_graph_admitted<'a>(
     full_graph: bool,
-    peer_direct: impl FnOnce() -> bool,
     peer_alternating: impl FnOnce() -> bool,
     arches: impl ExactSizeIterator<Item = &'a str>,
 ) -> bool {
-    full_graph && peer_direct() && peer_alternating() && tp2_graph_topology(arches).is_some()
+    full_graph && peer_alternating() && tp2_graph_topology(arches).is_some()
 }
 
 fn tp_graph_payload_layout(bytes: usize) -> Option<(usize, usize)> {
@@ -1517,7 +1509,6 @@ impl Gpus {
     fn tp2_whole_token_graph_requested(&self) -> bool {
         tp2_whole_token_graph_admitted(
             self.tp_full_graph_effective(),
-            tp_peer_direct_enabled,
             || self.tp_peer_alternating_effective(),
             self.devices.iter().map(|device| device.arch.as_str()),
         )
@@ -1529,8 +1520,8 @@ impl Gpus {
     /// gfx1201 TP2 pairs).
     /// Call before [`Self::enable_peer_all`], as
     /// for the gfx1201 signal tape. Returns `Ok(false)` and touches nothing
-    /// unless the graph is requested, both the direct-peer and alternating
-    /// protocols are enabled, and the mesh is exactly two gfx1100 ranks or
+    /// unless the graph is requested, the alternating
+    /// protocol is enabled, and the mesh is exactly two gfx1100 ranks or
     /// exactly two gfx1201 ranks.
     /// Otherwise prepares `barriers` signal generations (resolving the signal
     /// kernels now, since JIT is not capture-safe) and the coherent payload
@@ -2975,8 +2966,8 @@ impl Gpus {
     /// rank.
     ///
     /// Two ranks take the symmetric direct-peer read
-    /// ([`Self::all_reduce_sum_f32_peer_direct_add`]; kill switch
-    /// `HIPFIRE_TP_PEER_DIRECT=0`); any other rank count uses the rooted
+    /// ([`Self::all_reduce_sum_f32_peer_direct_add`]); any other rank count
+    /// (or no peer access) uses the rooted
     /// gather/fold/broadcast. `partial_slot` is `Some(0 | 1)` only when the
     /// caller alternates two distinct partial buffers on consecutive calls;
     /// with the alternating protocol effectively enabled for this mesh
@@ -3007,7 +2998,7 @@ impl Gpus {
         if let Some(fmt) = self.tp_exchange16_for(rows, count) {
             return self.all_reduce_peer_add16(fmt, partials, residuals, count, partial_slot);
         }
-        if self.devices.len() != 2 || !self.peer_access_enabled || !tp_peer_direct_enabled() {
+        if self.devices.len() != 2 || !self.peer_access_enabled {
             return self.all_reduce_sum_f32_peer_rooted_add(partials, residuals, count);
         }
         match partial_slot {
@@ -3859,18 +3850,15 @@ mod tests {
     #[test]
     fn tp2_whole_token_graph_requires_all_opt_ins() {
         for full_graph in [false, true] {
-            for peer_direct in [false, true] {
-                for peer_alternating in [false, true] {
-                    assert_eq!(
-                        tp2_whole_token_graph_admitted(
-                            full_graph,
-                            || peer_direct,
-                            || peer_alternating,
-                            ["gfx1100", "gfx1100"].into_iter(),
-                        ),
-                        full_graph && peer_direct && peer_alternating,
-                    );
-                }
+            for peer_alternating in [false, true] {
+                assert_eq!(
+                    tp2_whole_token_graph_admitted(
+                        full_graph,
+                        || peer_alternating,
+                        ["gfx1100", "gfx1100"].into_iter(),
+                    ),
+                    full_graph && peer_alternating,
+                );
             }
         }
     }
@@ -3879,14 +3867,7 @@ mod tests {
     fn tp2_whole_token_graph_short_circuits_disabled_opt_ins() {
         assert!(!tp2_whole_token_graph_admitted(
             false,
-            || panic!("direct flag must not be read when full graph is off"),
             || panic!("alternating flag must not be read when full graph is off"),
-            ["gfx1100", "gfx1100"].into_iter(),
-        ));
-        assert!(!tp2_whole_token_graph_admitted(
-            true,
-            || false,
-            || panic!("alternating flag must not be read when direct peer is off"),
             ["gfx1100", "gfx1100"].into_iter(),
         ));
     }
@@ -3922,14 +3903,13 @@ mod tests {
                 "must refuse {arches:?}",
             );
             assert!(
-                !tp2_whole_token_graph_admitted(true, || true, || true, arches.iter().copied()),
+                !tp2_whole_token_graph_admitted(true, || true, arches.iter().copied()),
                 "must reject {arches:?}",
             );
         }
         for arches in [["gfx1100", "gfx1100"], ["gfx1201", "gfx1201"]] {
             assert!(tp2_whole_token_graph_admitted(
                 true,
-                || true,
                 || true,
                 arches.into_iter(),
             ));
@@ -3976,13 +3956,11 @@ mod tests {
             assert_eq!(full_graph(None), arch_default);
             assert!(tp2_whole_token_graph_admitted(
                 full_graph(Some("1")),
-                || true,
                 || tp_peer_alternating_for_mesh(None, Some("1"), arches.into_iter()),
                 arches.into_iter(),
             ));
             assert!(!tp2_whole_token_graph_admitted(
                 full_graph(Some("0")),
-                || panic!("direct flag must not be read when full graph is off"),
                 || panic!("alternating flag must not be read when full graph is off"),
                 arches.into_iter(),
             ));
@@ -3994,7 +3972,6 @@ mod tests {
         ] {
             assert!(!tp2_whole_token_graph_admitted(
                 tp_full_graph_requested(Some("1"), tp2_graph_topology(arches.iter().copied())),
-                || true,
                 || tp_peer_alternating_for_mesh(None, Some("1"), arches.iter().copied()),
                 arches.iter().copied(),
             ));
@@ -4013,7 +3990,6 @@ mod tests {
         assert!(!tp_peer_alternating_requested(None, false));
         assert!(!tp2_whole_token_graph_admitted(
             true,
-            || true,
             || tp_peer_alternating_requested(Some("0"), true),
             ["gfx1100", "gfx1100"].into_iter(),
         ));

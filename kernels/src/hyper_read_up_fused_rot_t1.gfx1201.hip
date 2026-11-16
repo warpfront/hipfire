@@ -4,7 +4,7 @@
 //
 // `hyper_read_up_fused_f32_sx_t1_k320_rot` is `hyper_read_up_fused_f32_sx_t1_k320`
 // (hyper_read_up_fused_twin_t1.gfx1201.hip) plus the `mq_rotate_x` of the `mixed` rows it writes,
-// in the same launch (opt-in `HIPFIRE_QWEN4_HC_UP_ROT`).  The mixed values are computed by the
+// in the same launch.  The mixed values are computed by the
 // same text as the t1 / k320 entries, so `mixed` is bitwise theirs.  The rotation follows the
 // fused GDN step's pair-arrival pattern (tensor_ops.hip `gated_delta_step_gate_norm128_*`): a
 // 256-column group of one token is written by 32 blocks (8 columns each); the wave of the

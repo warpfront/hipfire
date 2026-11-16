@@ -55,7 +55,7 @@ const INC_GRP_PLANAR: &str =
     include_str!("../../../kernels/src/gemm_mq4g128v2p_moe_grouped_top10_o8_r16.gfx1201.hip");
 
 // Best-exact per-pick reference (the MoeDn32 `dni` kernel): first a lab-only source loaded by absolute
-// path, now shipped as the default gfx1201 <= 8-row down (`HIPFIRE_QWEN4_MOE_DOWN_DNI`, 7a1f00cb4), so the
+// path, now shipped as the default gfx1201 <= 8-row down (7a1f00cb4), so the
 // timing arm reads the in-tree source and states "A8 vs the best exact decode" next to the incumbent.
 const DNI_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g128v2_moe_down_top10_dni.gfx1201.hip");

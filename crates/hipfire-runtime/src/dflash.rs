@@ -2196,15 +2196,11 @@ impl DflashScratch {
     /// Allocate the lane-batched ctx/fc workspace ([`DraftLaneWorkspace`]) on
     /// this scratch (idempotent). Only the shared continuous-batching draft
     /// scratch calls this. A no-op (`Ok`, nothing allocated) unless the batched
-    /// context path can ever be admitted: `HIPFIRE_CB_DRAFT_LANE_CTX` not `0`,
-    /// exact gfx1201, and an MQ scratch (`mq_x_rot` present). On `Err` nothing
+    /// context path can ever be admitted: exact gfx1201 and an MQ scratch
+    /// (`mq_x_rot` present). On `Err` nothing
     /// is left allocated by this call; the caller still owns (and frees) `self`.
     pub fn enable_lane_workspace(&mut self, gpu: &mut Gpu, cfg: &DflashConfig) -> HipResult<()> {
-        if self.lane_ws.is_some()
-            || self.mq_x_rot.is_none()
-            || !lanes::draft_lane_ctx_enabled()
-            || gpu.arch != "gfx1201"
-        {
+        if self.lane_ws.is_some() || self.mq_x_rot.is_none() || gpu.arch != "gfx1201" {
             return Ok(());
         }
         self.lane_ws = Some(DraftLaneWorkspace::alloc(gpu, cfg)?);
@@ -2503,18 +2499,12 @@ fn gemm_dispatch_shared<const N: usize>(
     Ok(())
 }
 
-/// `HIPFIRE_DFLASH_FC_SKINNY=0` (developer kill switch, default on): the staged
-/// `fc` projection of a window's few new feature rows goes back to the batched
-/// WMMA GEMM instead of [`Gpu::gemm_f16_skinny_xf32`].
-static FC_SKINNY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_DFLASH_FC_SKINNY").map_or(true, |v| v.trim() != "0")
-});
-
-/// 0 = follow `HIPFIRE_DFLASH_FC_SKINNY`, 1 = force off, 2 = force on.
+/// Developer oracle hook state for the skinny staged `fc` projection:
+/// 0 = default (on), 1 = force off, 2 = force on.
 static FC_SKINNY_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Developer oracle hook: force the skinny staged `fc` projection on / off for
-/// every later draft forward in this process (`None`: back to the env switch).
+/// every later draft forward in this process (`None`: back to the default, on).
 pub fn set_fc_skinny_override(on: Option<bool>) {
     let v = match on {
         None => 0,
@@ -2525,11 +2515,7 @@ pub fn set_fc_skinny_override(on: Option<bool>) {
 }
 
 fn fc_skinny_on() -> bool {
-    match FC_SKINNY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => *FC_SKINNY,
-    }
+    FC_SKINNY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 1
 }
 
 /// [`gemm_dispatch`] for the draft's staged `fc` projection (`n` new feature

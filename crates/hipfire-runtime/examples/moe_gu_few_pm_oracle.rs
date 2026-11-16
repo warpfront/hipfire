@@ -13,7 +13,7 @@
 //!   * `hipcc`   — `gemm_mq4g256v2_moe_grouped_top10_few_with(.., pm = false)`;
 //!   * `pm`      — the same with `pm = true` (the module, at every row count);
 //!   * `product` — `gemm_mq4g256v2_moe_grouped_top10` (the product route: the module at the row counts
-//!                 of `MOE_GU_FEW_PM_ROWS` unless `HIPFIRE_QWEN4_MOE_GU_FEW_PM=0`, else hipcc).
+//!                 of `MOE_GU_FEW_PM_ROWS`, else hipcc).
 //! EVERY output word (NaN payloads, zeros, dead-slot words and unwritten sentinel words) of `pm` and
 //! `product` must equal `hipcc`. Routing modes: `uniform` (top-10 uniform), `corr` (8 lanes x rows/8
 //! positions sharing a base route with probability `--corr`), `same` (every row the same 10 experts:

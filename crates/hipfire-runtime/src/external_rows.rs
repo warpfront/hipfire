@@ -74,13 +74,6 @@ fn reader_count(groups: usize, max_readers: usize) -> usize {
 /// step plans a few dozen reads, a prefill chunk thousands.
 const INLINE_FETCH_MAX_READS: usize = 64;
 
-/// Whether small fetches try their reads inline first
-/// (`HIPFIRE_PLE_INLINE_FETCH`, default on; `0` keeps the blocking readers for
-/// every fetch).  Read once when a [`RowStore`] is built.
-fn inline_fetch_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_PLE_INLINE_FETCH", true)
-}
-
 /// Pages inserted into the cache per state-lock hold when a multi-group
 /// request's reads are published.
 const PUBLISH_BATCH: usize = 512;
@@ -1027,14 +1020,7 @@ impl RowStore {
             descriptors: descriptors.clone(),
             data_offset: layout.encoding.shard_header_bytes() as u64,
         });
-        Self::spawn(
-            name,
-            source,
-            descriptors,
-            layout,
-            rows,
-            inline_fetch_enabled(),
-        )
+        Self::spawn(name, source, descriptors, layout, rows, true)
     }
 
     /// A row store over a rank-ordered PLE table ([`HotRowStore::open_table`]):
@@ -1095,14 +1081,7 @@ impl RowStore {
             rows_per_shard: rows_per_shard as u64,
             row_bytes: store.encoded_row_bytes(),
         });
-        let rows = Self::spawn(
-            name,
-            source,
-            Vec::new().into(),
-            layout,
-            staging_rows,
-            inline_fetch_enabled(),
-        )?;
+        let rows = Self::spawn(name, source, Vec::new().into(), layout, staging_rows, true)?;
         rows.attach_hot_store(store).map_err(invalid)?;
         Ok(rows)
     }
@@ -1847,7 +1826,7 @@ struct RowStoreInner {
     /// Reader ceiling of one request's scattered reads.
     max_readers: usize,
     /// Small fetches try their reads against the page cache inline first
-    /// ([`inline_fetch_enabled`], fixed at construction).
+    /// (fixed at construction; tests pin `false` for the blocking reference).
     inline_fetch: bool,
     rows_per_shard: usize,
     rows_per_page: usize,
@@ -3930,7 +3909,7 @@ mod tests {
         }
 
         /// A store over any positional source, with the inline fetch fixed by
-        /// `inline_fetch` instead of `HIPFIRE_PLE_INLINE_FETCH`.
+        /// `inline_fetch`.
         fn from_test_positional(
             metadata: Fixture,
             rows_per_shard: usize,
