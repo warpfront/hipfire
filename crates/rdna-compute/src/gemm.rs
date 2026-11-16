@@ -405,17 +405,13 @@ static DISPATCH_GFX1100_DENSE_GATE_UP_LANE0_HEADERS: LazyLock<bool> = LazyLock::
     hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS", false)
 });
 
-// Kept (HIPF-396): `[developer] gate_up_bt = false` pins bt1 at B64 in the
-// certified gfx1201 batched Redline profile (docs/configs/batched-redline-pm4-product.toml).
-static GATE_UP_BT: LazyLock<bool> = LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(true)
-});
-
+/// `gate_up_bt` is [`crate::feature_flags::FeatureFlags::gate_up_bt`]
+/// (`HIPFIRE_GATE_UP_BT`, kept: `kernel.gate_up_bt = false` pins bt1 at B64 in
+/// the certified gfx1201 batched Redline profile,
+/// docs/configs/batched-redline-pm4-product.toml).
 #[inline]
-fn gfx12_bt_tile(batch_size: usize) -> usize {
-    if !*GATE_UP_BT || batch_size < 64 {
+fn gfx12_bt_tile(gate_up_bt: bool, batch_size: usize) -> usize {
+    if !gate_up_bt || batch_size < 64 {
         return 1;
     }
     // Exact divisors take precedence over masked tiles, including N >= 192.
@@ -442,8 +438,9 @@ impl Gpu {
     /// historical n-keyed choice is unchanged.
     #[inline]
     fn ordinary_bt_tile(&self, batch_size: usize) -> usize {
-        let tile = gfx12_bt_tile(batch_size);
-        if tile == 1 && batch_size > 0 && *GATE_UP_BT && self.ordinary_prefill_active() {
+        let gate_up_bt = self.flags.gate_up_bt;
+        let tile = gfx12_bt_tile(gate_up_bt, batch_size);
+        if tile == 1 && batch_size > 0 && gate_up_bt && self.ordinary_prefill_active() {
             12
         } else {
             tile
@@ -1318,14 +1315,6 @@ mod iu4_tail_export_tests {
         ));
     }
 }
-/// B-1 slab activation layout (`HIPFIRE_A4_SLAB`, default on; `=0` opts
-/// out): the default gfx1201 A4 producers store each K128 block's
-/// `block_i4_128` bytes as `[d 4N][s 4N][qs 0..31: 32N][qs 32..63: 32N]`
-/// and the `_b1s` bundle stages them as whole lines. Bit-identical outputs
-/// (same bytes, moved); the K-loop runs the same cycles at a higher clock
-/// under the 300 W cap. Parsed once so a producer and its consumers agree.
-static A4_SLAB: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A4_SLAB", true));
 /// gfx1201 GDN input projection merge on the non-fused IU4 verify path
 /// (`HIPFIRE_GDN_ZBA_FOLD`, default on; `=0` restores the four separate QKV,
 /// Z, beta and alpha SETs): one QKV + Z fold launch, or the Z fold SET +
@@ -2308,11 +2297,19 @@ impl Gpu {
         self.mq4v2_symmetric && *DISPATCH_IU4_SYMFOLD && self.flags.g12_iu4_isa
     }
 
+    /// B-1 slab activation layout (`HIPFIRE_A4_SLAB` / `kernel.a4_slab`,
+    /// `FeatureFlags::a4_slab`, default on; `=0` opts out; resolved once at init
+    /// so a producer and its consumers agree): the default gfx1201 A4 producers
+    /// store each K128 block's `block_i4_128` bytes as
+    /// `[d 4N][s 4N][qs 0..31: 32N][qs 32..63: 32N]` and the `_b1s` bundle stages
+    /// them as whole lines. Bit-identical outputs (same bytes, moved); the K-loop
+    /// runs the same cycles at a higher clock under the 300 W cap.
+    ///
     /// True when the slab producer twins may run: their only consumer is the
     /// `_b1s` bundle, and they emit through the one-pass gfx1201 A4C2 path
     /// (`-DIU4_A4_CANDIDATES=2`), the only emit with a slab store.
     pub fn a4_slab_active(&self) -> bool {
-        *A4_SLAB
+        self.flags.a4_slab
             && self.arch == "gfx1201"
             && !*G12_IU4_B1_CONTROL
             && self.g12_iu4_isa_requested()
@@ -44504,7 +44501,7 @@ impl Gpu {
         // 512 x 2560 0.31 -> 0.21 ms).  Below that wave count (M = 48) or
         // below 1024 tokens the exact-divisor order stays.
         let bt12_waves = m.div_ceil(16) * batch_size.div_ceil(192);
-        let bt_b = if *GATE_UP_BT && batch_size >= 1024 && bt12_waves >= 256 {
+        let bt_b = if self.flags.gate_up_bt && batch_size >= 1024 && bt12_waves >= 256 {
             12
         } else {
             self.ordinary_bt_tile(batch_size)
@@ -49982,26 +49979,24 @@ impl Gpu {
     }
 }
 
-/// `HIPFIRE_QWEN4_MOE_SYM_IU4` (`developer.qwen4_moe_sym_iu4`, a typed
-/// boolean: `true`/`false`/`1`/`0`; any other spelling is rejected when the
-/// process configuration is built) selects the grouped symmetric IU4 MoE
-/// route (fn-moe-sym) for Qwen4 prefill on layers whose every routed-expert
-/// header passed [`Gpu::qwen4_moe_sym_check`]: true requests it, false keeps
-/// the whole incumbent route (scatter, producers and GEMMs), and unset follows
-/// the arch descriptor's `default_requested` ([`MoeSymIu4Kernel`]): requested on
-/// gfx1100, gfx1151 and gfx1201 (an asymmetric artifact fails the check and stays on
-/// the incumbent); `=0` is the kill switch on every arch. `=1` on a device without a
-/// descriptor, or without the exact C2 candidate set, prints one diagnostic and
-/// keeps the incumbent ([`sym_iu4_request`]). Read once.
-pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<Option<bool>> =
-    LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_QWEN4_MOE_SYM_IU4"));
+// `HIPFIRE_QWEN4_MOE_SYM_IU4` (`developer.qwen4_moe_sym_iu4`, a typed boolean:
+// `true`/`false`/`1`/`0`; any other spelling is rejected when the process
+// configuration is built) is `FeatureFlags::qwen4_moe_sym_iu4`. It selects the
+// grouped symmetric IU4 MoE route (fn-moe-sym) for Qwen4 prefill on layers whose
+// every routed-expert header passed [`Gpu::qwen4_moe_sym_check`]: true requests it,
+// false keeps the whole incumbent route (scatter, producers and GEMMs), and unset
+// follows the arch descriptor's `default_requested` ([`MoeSymIu4Kernel`]):
+// requested on gfx1100, gfx1151 and gfx1201 (an asymmetric artifact fails the
+// check and stays on the incumbent); `=0` is the kill switch on every arch. `=1` on
+// a device without a descriptor, or without the exact C2 candidate set, prints one
+// diagnostic and keeps the incumbent ([`sym_iu4_request`]).
 
 /// `HIPFIRE_MOE_SYM_IU4` (`developer.moe_sym_iu4`, a typed boolean:
 /// `true`/`false`/`1`/`0`) selects the symmetric IU4 grouped routed-expert
 /// prefill route for loader-verified symmetric qt44-gate_up / qt53-down MoE
 /// artifacts (A3B-class geometry). Default ON by capability: unset and `true`
 /// request the route, `false` is the kill switch (the qt53 F32 fallback then
-/// runs, ~3.7x slower at prefill sizes). Independent of [`QWEN4_MOE_SYM_IU4`].
+/// runs, ~3.7x slower at prefill sizes). Independent of `HIPFIRE_QWEN4_MOE_SYM_IU4`.
 /// Read once.
 pub(crate) static MOE_SYM_IU4: LazyLock<Option<bool>> =
     LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_MOE_SYM_IU4"));
@@ -51689,13 +51684,13 @@ impl Gpu {
     pub fn qwen4_moe_sym_iu4_requested(&self) -> bool {
         match sym_iu4_request(
             self.qwen4_moe_sym_kernel(),
-            *QWEN4_MOE_SYM_IU4,
+            self.flags.qwen4_moe_sym_iu4,
             &self.flags.hipcc_extra_flags,
         ) {
             SymIu4Request::Requested => true,
             SymIu4Request::Off => false,
             SymIu4Request::Unsupported(reason) => {
-                if *QWEN4_MOE_SYM_IU4 == Some(true) {
+                if self.flags.qwen4_moe_sym_iu4 == Some(true) {
                     static NOTICE: std::sync::Once = std::sync::Once::new();
                     NOTICE.call_once(|| {
                         eprintln!("{}", sym_iu4_unsupported_notice(&self.arch, reason));

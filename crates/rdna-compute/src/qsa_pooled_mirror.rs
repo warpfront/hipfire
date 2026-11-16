@@ -34,22 +34,20 @@ const THREADS: usize = 256;
 /// Elements per thread of both kernels.
 const PER_THREAD: usize = 4;
 
-/// `HIPFIRE_QWEN4_QSA_POOLED_BF16` (developer bool, on unless `0`), read once.
-static QWEN4_QSA_POOLED_BF16: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_POOLED_BF16", true)
-});
 /// The same switch `tensor_ops` reads for the PM score kernels
 /// (`HIPFIRE_QWEN4_QSA_SCORE_PM`, on unless `0`): the mirror is only consumed
 /// by the PM BF16 score kernel, so it is not admitted without it.
 static QWEN4_QSA_SCORE_PM: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SCORE_PM", true));
 
-/// Load-time admission, no GPU launch: the switch is on, exact gfx1151,
+/// Load-time admission, no GPU launch: the switch is on
+/// (`HIPFIRE_QWEN4_QSA_POOLED_BF16` / `attention.qwen4_qsa_pooled_bf16`,
+/// `FeatureFlags::qwen4_qsa_pooled_bf16`, on unless `0`), exact gfx1151,
 /// F32 QSA state, `index_dim` 128, and the builder BF16 score module
 /// (`kernels::QSA_SELECT_BF16_PM_GFX1151`, the PM scorer's switch on) exists.
 pub fn qsa_pooled_bf16_mirror_enabled(gpu: &Gpu, format: QsaKvFormat, index_dim: usize) -> bool {
     qsa_pooled_bf16_mirror_admits(
-        *QWEN4_QSA_POOLED_BF16,
+        gpu.flags.qwen4_qsa_pooled_bf16,
         *QWEN4_QSA_SCORE_PM,
         !crate::kernels::QSA_SELECT_BF16_PM_GFX1151.is_empty(),
         gpu.arch_caps.is_gfx1151(),
