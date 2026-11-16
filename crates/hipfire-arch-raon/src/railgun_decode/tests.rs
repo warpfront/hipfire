@@ -554,7 +554,6 @@ fn c<'a>(env: Option<&'a str>, pack: Option<&'a str>) -> Candidates<'a> {
         env,
         pack,
         local: None,
-        may_provision: false,
     }
 }
 
@@ -1446,12 +1445,11 @@ fn replacing_a_quiescent_program_drops_the_old_one() {
 
 // ----------------------------------------------------- first-load provisioning
 
-fn cands<'a>(local: Option<&'a str>, may_provision: bool) -> Candidates<'a> {
+fn cands<'a>(local: Option<&'a str>) -> Candidates<'a> {
     Candidates {
         env: None,
         pack: Some("pack"),
         local,
-        may_provision,
     }
 }
 
@@ -1460,7 +1458,7 @@ fn auto_without_any_corpus_waits_to_build_the_per_user_one() {
     let s = structural();
     let none = has_index(&[]);
     assert_eq!(
-        decide_owner(RailgunMode::Auto, &s, &cands(Some("local"), true), &none),
+        decide_owner(RailgunMode::Auto, &s, &cands(Some("local")), &none),
         Ok(OwnerPlan {
             corpus_dir: None,
             loud: false,
@@ -1470,16 +1468,16 @@ fn auto_without_any_corpus_waits_to_build_the_per_user_one() {
 }
 
 #[test]
-fn the_consent_variable_off_means_no_build_and_no_owner() {
+fn without_a_per_user_directory_nothing_is_built() {
     let s = structural();
     let none = has_index(&[]);
-    match decide_owner(RailgunMode::Auto, &s, &cands(Some("local"), false), &none) {
-        Err(NoOwner::NoCorpus(why)) => assert!(why.contains("local"), "{why}"),
+    match decide_owner(RailgunMode::Auto, &s, &cands(None), &none) {
+        Err(NoOwner::NoCorpus(why)) => assert!(why.contains("per-user: none"), "{why}"),
         other => panic!("expected NoCorpus, got {other:?}"),
     }
     // Forced: the owner exists, declines loudly, builds nothing.
     assert_eq!(
-        decide_owner(RailgunMode::Force, &s, &cands(Some("local"), false), &none),
+        decide_owner(RailgunMode::Force, &s, &cands(None), &none),
         Ok(OwnerPlan {
             corpus_dir: None,
             loud: true,
@@ -1504,11 +1502,11 @@ fn an_existing_corpus_is_used_and_never_rebuilt() {
     for mode in [RailgunMode::Auto, RailgunMode::Force] {
         let loud = mode == RailgunMode::Force;
         assert_eq!(
-            decide_owner(mode, &s, &cands(Some("local"), true), &both),
+            decide_owner(mode, &s, &cands(Some("local")), &both),
             want("pack", loud)
         );
         assert_eq!(
-            decide_owner(mode, &s, &cands(Some("local"), true), &local_only),
+            decide_owner(mode, &s, &cands(Some("local")), &local_only),
             want("local", loud)
         );
     }
@@ -1520,7 +1518,7 @@ fn an_explicit_directory_without_a_corpus_is_never_replaced_by_a_build() {
     let none = has_index(&[]);
     let explicit = Candidates {
         env: Some("env"),
-        ..cands(Some("local"), true)
+        ..cands(Some("local"))
     };
     assert!(matches!(
         decide_owner(RailgunMode::Auto, &s, &explicit, &none),
@@ -1534,7 +1532,7 @@ fn a_structurally_unsuitable_context_never_builds_a_corpus() {
     s.arch = "gfx1151";
     let none = has_index(&[]);
     assert_eq!(
-        decide_owner(RailgunMode::Auto, &s, &cands(Some("local"), true), &none),
+        decide_owner(RailgunMode::Auto, &s, &cands(Some("local")), &none),
         Err(NoOwner::Refused(RaonRailgunRefusal::WrongArch {
             arch: "gfx1151".into()
         }))

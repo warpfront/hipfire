@@ -30,7 +30,7 @@ use rdna_compute::gated_delta_vector::{
     RdaPrepareLaunch, GATED_DELTA_VECTOR_HEAD_DIM,
 };
 use rdna_compute::gated_delta_vector_chunk::{
-    chunked_enabled, GatedDeltaVectorChunkScratch, GATED_DELTA_VECTOR_CHUNK_MIN_ROWS,
+    GatedDeltaVectorChunkScratch, GATED_DELTA_VECTOR_CHUNK_MIN_ROWS,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -135,8 +135,8 @@ pub struct RdaScratch {
     pub beta: GpuTensor,
     /// BF16-rounded recurrence output (`out = cast_model(y)`) `[N, P]`.
     pub y: GpuTensor,
-    /// Chunked-RDA workspace, allocated unless `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED=0`, on a
-    /// device that has the chunked kernel; `None` keeps the serial recurrence.
+    /// Chunked-RDA workspace, allocated on a device that has the chunked kernel; `None` keeps the
+    /// serial recurrence.
     pub chunk: Option<GatedDeltaVectorChunkScratch>,
 }
 
@@ -165,7 +165,7 @@ impl RdaScratch {
             log_alpha: plane(gpu, p)?,
             beta: plane(gpu, geom.n_heads)?,
             y: plane(gpu, p)?,
-            chunk: if chunked_enabled() && gpu.gated_delta_vector_chunked_arch_supported() {
+            chunk: if gpu.gated_delta_vector_chunked_arch_supported() {
                 Some(
                     gpu.alloc_gated_delta_vector_chunk_scratch(
                         chunk_scratch_rows(max_rows),
@@ -188,8 +188,8 @@ impl RdaScratch {
         let mut elems = [max_rows * p; 8].to_vec();
         elems.push(max_rows * geom.n_heads);
         let planes: usize = elems.into_iter().map(|e| (e * 4).max(256)).sum();
-        // Charged exactly when `new` allocates it: flag on and an arch with the kernel.
-        let chunk = if chunked_enabled() && chunked_arch {
+        // Charged exactly when `new` allocates it: an arch with the kernel.
+        let chunk = if chunked_arch {
             GatedDeltaVectorChunkScratch::required_bytes(chunk_scratch_rows(max_rows), geom.n_heads)
         } else {
             0
@@ -325,11 +325,10 @@ pub fn rda_forward_rows_taped(
         ),
     };
 
-    // Wave-per-tile conv+prepare (exact gfx1201 / gfx1100) and gated norm (exact gfx1201): ordinary prefill rows,
-    // no tape.
+    // Wave-per-tile conv+prepare (exact gfx1201 / gfx1100) and gated norm (exact gfx1201), bit-identical
+    // to the incumbent launches: ordinary prefill rows, no tape.
     let wave_ok = tape.is_none()
         && n >= RDA_WAVE_MIN_ROWS
-        && fused_prep_enabled()
         && kd == GATED_DELTA_VECTOR_HEAD_DIM
         && geom.conv_kernel == 4
         && p % 4 == 0;
@@ -337,8 +336,9 @@ pub fn rda_forward_rows_taped(
     let wave_norm = wave_ok && gpu.rda_wave_kernels_arch_supported();
     // Segmented producer -> core -> norm: each segment's planes are produced right before the chunked core
     // consumes them and the norm right after, so the segment's working set stays in the last-level cache.
+    // Bit-identical: segments are whole C64 chunks.
     let seg_rows = match scratch.chunk.as_ref() {
-        Some(c) if tape.is_none() && segment_enabled() => c.segment_rows().min(RDA_SEGMENT_ROWS),
+        Some(c) if tape.is_none() => c.segment_rows().min(RDA_SEGMENT_ROWS),
         _ => usize::MAX,
     };
 
@@ -452,22 +452,6 @@ pub const RDA_WAVE_MIN_ROWS: usize = 64;
 /// segment). 192-256 rows measured best (R9700, 4096-row layer: 3.60-3.65 ms vs 3.84 ms at 512 and 4.84 ms
 /// unsegmented/unfused); at 256 a segment's producer planes, `y` and the core workspace stay cache-resident.
 pub const RDA_SEGMENT_ROWS: usize = 256;
-
-/// `HIPFIRE_RAON_RDA_FUSED_PREP` (developer, exact gfx1201; conv+prepare also exact gfx1100): the three RDA convs + `raon_rda_prepare` run as one
-/// launch (no conv planes) and the gated norm as one wave per (row, head); both bit-identical to the
-/// incumbent launches. `=0` restores them.
-fn fused_prep_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| hipfire_config::developer_bool("HIPFIRE_RAON_RDA_FUSED_PREP", true))
-}
-
-/// `HIPFIRE_RAON_RDA_SEGMENT` (developer): with the chunked core, an ordinary prefill chunk runs its RDA layer
-/// as consecutive core-segment-sized row ranges (producer, core, gated norm per range) so the planes the core
-/// consumes are still cache-resident. Bit-identical (segments are whole C64 chunks). `=0` restores one pass.
-fn segment_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| hipfire_config::developer_bool("HIPFIRE_RAON_RDA_SEGMENT", true))
-}
 
 /// Tensors of one row range of an RDA layer (all row-contiguous, row stride = plane width).
 struct RowsIo<'a> {

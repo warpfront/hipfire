@@ -38,9 +38,6 @@ use railgun_corpus::sha256_hex;
 
 /// The shipped subcommand binary.
 pub const BINARY: &str = "railgun-jit-corpus";
-/// `HIPFIRE_RAON_RAILGUN_LOCAL_CORPUS`: `0` forbids spawning the subcommand
-/// (default `1`).
-pub const ENV_LOCAL_CORPUS: &str = "HIPFIRE_RAON_RAILGUN_LOCAL_CORPUS";
 /// Wall-clock cap of one run; the child is killed past it.
 pub const TIMEOUT: Duration = Duration::from_secs(180);
 /// Refusal record, in the hot cache directory.

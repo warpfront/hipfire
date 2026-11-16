@@ -2913,21 +2913,10 @@ fn qwen4_lane_promotion_supported(topology: &str) -> bool {
 /// speculator too (native MTP lanes are first-class there: a one-lane MTP
 /// cohort is the singleton's step, 1.004x traced; the served EOS-on burst
 /// checkpoint on 5fab83b69a serialized every story C4 / C8 cell behind its
-/// first arrival); `HIPFIRE_QWEN4_EP_LONE_MTP_LANE=0` restores the MTP
-/// singleton there. PP with a speculator keeps the singleton route (a one-lane
+/// first arrival). PP with a speculator keeps the singleton route (a one-lane
 /// MTP cohort there is not measured).
 pub(crate) fn qwen4_lone_lane(topology: &str, has_speculator: bool) -> bool {
-    qwen4_lone_lane_with(topology, has_speculator, qwen4_ep_lone_mtp_lane_enabled())
-}
-
-/// `HIPFIRE_QWEN4_EP_LONE_MTP_LANE` (developer; default on, `0` off).
-fn qwen4_ep_lone_mtp_lane_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_EP_LONE_MTP_LANE", true)
-}
-
-fn qwen4_lone_lane_with(topology: &str, has_speculator: bool, ep_mtp_lane: bool) -> bool {
-    !qwen4_lane_promotion_supported(topology)
-        && (!has_speculator || (ep_mtp_lane && topology == "ep"))
+    !qwen4_lane_promotion_supported(topology) && (!has_speculator || topology == "ep")
 }
 
 /// [`qwen4_lone_lane`] for the loaded model (requires a staged lane store).
@@ -6828,8 +6817,7 @@ mod tests {
     fn lone_request_takes_a_lane_exactly_where_promotion_is_refused() {
         // EP/PP cannot promote a singleton, so the lone request is a lane;
         // single keeps the singleton (promotion covers it); a speculator keeps
-        // the singleton on PP, while on EP the lone MTP request is a lane too
-        // (`HIPFIRE_QWEN4_EP_LONE_MTP_LANE`).
+        // the singleton on PP, while on EP the lone MTP request is a lane too.
         for (topology, speculator, lane) in [
             ("single", false, false),
             ("single", true, false),
@@ -6936,18 +6924,6 @@ mod tests {
         // Qwen3.5 and the rest of the batching routes still refuse it.
         assert!(min_tokens_batch_refusal(4, true, false, 1, true, false).is_some());
         assert!(min_tokens_batch_refusal(4, true, true, 1, true, false).is_none());
-    }
-
-    #[test]
-    fn a_lone_ep_mtp_request_takes_a_lane_unless_killed() {
-        assert!(qwen4_lone_lane_with("ep", true, true));
-        assert!(!qwen4_lone_lane_with("ep", true, false));
-        // The kill switch touches only EP with a speculator.
-        assert!(qwen4_lone_lane_with("ep", false, false));
-        assert!(qwen4_lone_lane_with("pp", false, false));
-        assert!(!qwen4_lone_lane_with("pp", true, true));
-        assert!(!qwen4_lone_lane_with("single", true, true));
-        assert!(!qwen4_lone_lane_with("single", false, true));
     }
 
     #[test]

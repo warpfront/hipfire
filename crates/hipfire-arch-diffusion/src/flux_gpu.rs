@@ -40,8 +40,7 @@
 //! Measured on gfx1150 at real 3072/24/128 geometry
 //! (per-call census): 1786 → 988 kernel launches per denoise step,
 //! 190 → 0 host-synchronous D2D copies, 18.2 → 14.0 s/step projection.
-//! `HIPFIRE_FLUX_F16_ACT=0` restores the all-f32 activation path — see
-//! [`f16_activations_enabled`].
+//! Activations are carried between kernels as f16.
 //!
 //! The host tables are the source of truth — `free_gpu` returns all GPU
 //! buffers to the pool without touching the host copy.
@@ -54,7 +53,7 @@ use crate::flux::{
 };
 use crate::manifest::{expected_flux_keys, TS_EMBED_DIM};
 use hipfire_runtime::model_source::ModelSource;
-use rdna_compute::gemm::{GemmEpilogue, LdsTile};
+use rdna_compute::gemm::GemmEpilogue;
 use rdna_compute::profile::SpanProfiler;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::RefCell;
@@ -66,53 +65,6 @@ use std::sync::OnceLock;
 /// as a constant so the fused `layernorm_modulate` call and the legacy
 /// `layernorm_batched` call cannot drift apart.
 const LN_EPS: f32 = 1e-6;
-
-/// The fixed 128×128 / 32×64 k64 macro-tile, i.e. the tile
-/// `Gpu::gemm_f16_x_f16_wmma_lds_auto` falls back to. Used by the f16 path
-/// when `HIPFIRE_FLUX_GEMM_WIDE=0` pins the narrow tile for an A/B, because
-/// the fused-epilogue entries are tile-parameterised (`Gpu::LDS_EPI_TILES`)
-/// while the standalone `gemm_f16_x_f16_wmma_lds` kernel is not.
-const NARROW_TILE: LdsTile = LdsTile::new(128, 128, 32, 64, 64, false);
-
-/// Are activations carried between kernels as f16?
-///
-/// Default ON. `HIPFIRE_FLUX_F16_ACT=0` restores the all-f32 activation path:
-/// every GEMM casts its activation to an f16 scratch first, GELU / modulate /
-/// gated-add / QK-RMSNorm / RoPE / the `linear2` row assembly stay separate
-/// launches, and the six per-double-block concat copies come back. That old
-/// path is retained as the A/B reference and the escape hatch for a numerical
-/// regression; it is ~2× the launches and ~2.5× the activation traffic.
-///
-/// Read once per process: the upload path (`upload_flux_key`) and the forward
-/// must agree, because the f16 path splits `single_blocks.*.linear2.weight`
-/// into two tensors at upload time and the f32 path keeps the fused one.
-pub fn f16_activations_enabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_FLUX_F16_ACT").map_or(true, |v| v != "0")
-    })
-}
-
-/// Are the batch-1 modulation linears run as GEMVs into one per-forward
-/// buffer ([`ModAll`]) instead of one 128-row WMMA macro-tile GEMM each?
-///
-/// Default ON. Every modulation linear is applied to a SINGLE `d`-wide vector
-/// (`silu(vec)`) — 76 of them per denoise step at FLUX geometry — so the
-/// 128-row tile streams the whole `[6d, d]` / `[3d, d]` weight to compute one
-/// real output row and 127 rows of padding. A GEMV reads the same weight
-/// bytes and does 1/128th of the arithmetic.
-///
-/// `HIPFIRE_FLUX_MOD_GEMV=0` restores the per-block `Gpuf::mod_linear` /
-/// `Gpuf::linear` GEMM route, so the two can be A/B-ed in one session.
-///
-/// Read once per process, like [`f16_activations_enabled`], so a mid-run
-/// environment change cannot make two blocks disagree.
-pub fn mod_gemv_enabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_FLUX_MOD_GEMV").map_or(true, |v| v != "0")
-    })
-}
 
 // ─── Per-kernel-family step profiling (`HIPFIRE_PROFILE`) ──────────────────
 //
@@ -256,27 +208,6 @@ impl ModAll {
     }
 }
 
-/// Where a block body gets its modulation vector.
-///
-/// `dv` is `silu(vec)` and `dv16` its f16 cast (present exactly when
-/// [`f16_activations_enabled`]); both are hoisted out of the block loop by
-/// the caller. `all` is the pre-computed GEMV buffer when
-/// [`mod_gemv_enabled`], and `None` on the retained GEMM route — in which
-/// case the block runs its own batch-1 linear off `dv16`/`dv`.
-struct ModSrc<'a> {
-    dv: &'a GpuTensor,
-    dv16: Option<&'a GpuTensor>,
-    all: Option<&'a ModAll>,
-}
-
-/// One block's `6d`/`3d` modulation vector: either a borrowed view into
-/// [`ModAll`] or a tensor this block allocated. `Gpuf::release_mod` frees only
-/// the owned form — `Gpu::free_tensor` rejects a `sub_offset` view, loudly.
-struct ModVec {
-    t: GpuTensor,
-    owned: bool,
-}
-
 /// Install the real HIP stream the diffusion path runs on. Call **once at
 /// model-load time**, before any weight upload, from whatever owns the `Gpu`.
 ///
@@ -293,33 +224,10 @@ struct ModVec {
 /// time, in one place, rather than in a per-forward constructor: an install
 /// buried in the forward would change global behaviour as a side effect of
 /// the first denoise step, and would make it look like a property of the
-/// activation dtype. It is not. [`f16_activations_enabled`] selects the
-/// activation LAYOUT only; it does not and must not decide whether the
-/// diffusion path is asynchronous.
+/// activation dtype. It is not.
 pub fn install_forward_stream(gpu: &mut Gpu) -> Result<(), String> {
     gpu.ensure_capture_stream()
         .map_err(|e| format!("flux gpu: install forward stream: {e:?}"))
-}
-
-/// Is the LDS-staged macro-tile GEMM route enabled? `HIPFIRE_FLUX_GEMM_LDS=0`
-/// pins the 16-step kernel (and, on the f16 path, the unfused epilogue) for a
-/// same-session A/B. Cached: `gemm_epi` is called ~700 times per denoise step
-/// and a `getenv` per call is pure launch-path overhead.
-fn gemm_lds_enabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_FLUX_GEMM_LDS").map_or(true, |v| v != "0")
-    })
-}
-
-/// Is the per-arch wide macro-tile selection enabled? `HIPFIRE_FLUX_GEMM_WIDE=0`
-/// pins the fixed 128x128 tile. Cached for the same reason as
-/// [`gemm_lds_enabled`].
-fn gemm_wide_enabled() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_FLUX_GEMM_WIDE").map_or(true, |v| v != "0")
-    })
 }
 
 // ─── Padded weight rows (`HIPFIRE_FLUX_WPAD`) ─────────────────────────────
@@ -373,7 +281,7 @@ static PAD_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// arch can be swept without a rebuild; a value that is not a multiple of 16
 /// is rejected loudly rather than silently misaligning every staging load.
 ///
-/// Cached like [`gemm_lds_enabled`] — this is read once per GEMM call site.
+/// Cached: this is read once per GEMM call site.
 fn weight_pad() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(
@@ -398,26 +306,18 @@ fn weight_pad() -> usize {
 
 /// Can the GEMM route that will actually run honour a row pitch?
 ///
-/// Only the LDS-staged `_auto_ld` / `_auto_epi_ld` entries take `lda`/`ldx`.
-/// `HIPFIRE_FLUX_GEMM_WIDE=0` routes [`Gpuf::gemm_pre`] to the non-tiled
-/// `gemm_f16_x_f16_wmma_lds`, and `HIPFIRE_FLUX_GEMM_LDS=0` (or a K that is
-/// not a multiple of 64) routes both entries to the 16-step
-/// `gemm_f16_x_f16_wmma`; none of those three takes a pitch, and each would
-/// read the pad as data. So a weight is padded only when the pitch-aware
-/// route is the one selected — which also keeps both existing A/B knobs
-/// measuring what they measured before instead of silently changing shape.
+/// Only the LDS-staged `_auto_ld` / `_auto_epi_ld` entries take `lda`/`ldx`;
+/// a K that is not a multiple of 64 routes to the 16-step
+/// `gemm_f16_x_f16_wmma`, which takes no pitch and would read the pad as data.
 fn pitch_route_ok(k: usize) -> bool {
-    k % 64 == 0 && gemm_lds_enabled() && gemm_wide_enabled()
+    k % 64 == 0
 }
 
 /// Is `name` a modulation weight (`*_mod.lin`, `*.modulation.lin`,
 /// `final_layer.adaLN_modulation.1`)?
 ///
-/// Those stay PACKED. Their default consumer is `gemv_f16_bias_xf32`
-/// ([`mod_gemv_enabled`]), which walks a weight row contiguously and has no
-/// pitch argument at all; and on the forced-GEMM route
-/// (`HIPFIRE_FLUX_MOD_GEMV=0`) they are batch-1 GEMMs whose cost is streaming
-/// the weight once, not the staging pattern the pad fixes.
+/// Those stay PACKED. Their consumer is `gemv_f16_bias_xf32`, which walks a
+/// weight row contiguously and has no pitch argument at all.
 fn is_mod_weight(name: &str) -> bool {
     name.ends_with("_mod.lin.weight")
         || name.ends_with(".modulation.lin.weight")
@@ -617,13 +517,8 @@ fn log_weight_pad_once() {
         let extra = PAD_BYTES.load(Ordering::Relaxed);
         if extra == 0 {
             eprintln!(
-                "flux gpu: weight rows PACKED at K (row pad {}, pitch-aware GEMM route {})",
-                weight_pad(),
-                if gemm_lds_enabled() && gemm_wide_enabled() {
-                    "on"
-                } else {
-                    "off"
-                }
+                "flux gpu: weight rows PACKED at K (row pad {})",
+                weight_pad()
             );
         } else {
             eprintln!(
@@ -774,11 +669,10 @@ impl GpuFluxWeights {
                         ));
                     }
                 }
-                // The f16-activation forward reads the single-block `linear2`
-                // weight as two K-halves (see `upload_flux_key`): apply the
-                // same split here, so the streamed map and the eager map
-                // expose the same keys.
-                if f16_activations_enabled() && is_single_linear2(&key.name) {
+                // The forward reads the single-block `linear2` weight as two
+                // K-halves (see `upload_flux_key`): apply the same split here,
+                // so the streamed map and the eager map expose the same keys.
+                if is_single_linear2(&key.name) {
                     let (d, k) = (key.rows, key.cols);
                     if k <= d || words.len() != d * k {
                         return Err(format!(
@@ -979,13 +873,8 @@ fn upload_mmdit_weight(
 ///
 /// The split is done on the HOST, where the f32 table is already contiguous —
 /// on the device it would be `d` strided copies per block. The two halves
-/// together are exactly the same size as the fused original, so only ONE
-/// layout is uploaded and the checkpoint's VRAM footprint is unchanged:
-/// the split when [`f16_activations_enabled`], the fused original when the
-/// kill switch is set. Keeping both would have cost an extra 3.6 GB at FLUX
-/// geometry (`d x 5d` f16 per single block, 38 of them), which is why the
-/// choice is exclusive rather than additive. Both readers gate on the same
-/// function, so they cannot disagree.
+/// together are exactly the same size as the fused original, so the
+/// checkpoint's VRAM footprint is unchanged.
 pub fn upload_flux_key(
     gpu: &mut Gpu,
     name: &str,
@@ -993,7 +882,7 @@ pub fn upload_flux_key(
     shape: [usize; 2],
     tensors: &mut HashMap<String, GpuTensor>,
 ) -> Result<(), String> {
-    if f16_activations_enabled() && is_single_linear2(name) {
+    if is_single_linear2(name) {
         let (d, k) = (shape[0], shape[1]);
         if k <= d || data.len() != d * k {
             return Err(format!(
@@ -1125,29 +1014,16 @@ pub fn gpu_double_block(
     let mut f = Gpuf::new(gpu, gw, cfg)?;
     // The block bodies take `silu(vec)`, which the full forward hoists out of
     // the block loop; a single-block entry point has to produce it itself.
-    let (dv, dv16) = f.mod_vectors(cfg, vec)?;
+    let dv = f.silu(vec)?;
     // Only block `b`'s weights need to be uploaded for this entry point, so
     // the GEMV buffer is filled for that block alone; the rest of the
     // index-addressed buffer is never read. See `Gpuf::build_mod_all`.
-    let mod_all = match mod_gemv_enabled() {
-        true => Some(f.build_mod_all(cfg, &dv, b..b + 1, 0..0)?),
-        false => None,
-    };
-    let ms = ModSrc {
-        dv: &dv,
-        dv16: dv16.as_ref(),
-        all: mod_all.as_ref(),
-    };
-    let (oi, ot) = f.double_block(cfg, b, img, txt, &ms, n_img, n_txt, grid)?;
+    let mod_all = f.build_mod_all(cfg, &dv, b..b + 1, 0..0)?;
+    let (oi, ot) = f.double_block(cfg, b, img, txt, &mod_all, n_img, n_txt, grid)?;
     let out = (f.download(&oi)?, f.download(&ot)?);
     f.free(oi)?;
     f.free(ot)?;
-    if let Some(m) = mod_all {
-        f.free(m.buf)?;
-    }
-    if let Some(t) = dv16 {
-        f.free(t)?;
-    }
+    f.free(mod_all.buf)?;
     f.free(dv)?;
     f.finish()?;
     Ok(out)
@@ -1167,26 +1043,13 @@ pub fn gpu_single_block(
     act: MlpAct,
 ) -> Result<Vec<f32>, String> {
     let mut f = Gpuf::new(gpu, gw, cfg)?;
-    let (dv, dv16) = f.mod_vectors(cfg, vec)?;
+    let dv = f.silu(vec)?;
     // Block `b` only — see the note in [`gpu_double_block`].
-    let mod_all = match mod_gemv_enabled() {
-        true => Some(f.build_mod_all(cfg, &dv, 0..0, b..b + 1)?),
-        false => None,
-    };
-    let ms = ModSrc {
-        dv: &dv,
-        dv16: dv16.as_ref(),
-        all: mod_all.as_ref(),
-    };
-    let o = f.single_block(cfg, b, fused, &ms, n_img, grid, act)?;
+    let mod_all = f.build_mod_all(cfg, &dv, 0..0, b..b + 1)?;
+    let o = f.single_block(cfg, b, fused, &mod_all, n_img, grid, act)?;
     let out = f.download(&o)?;
     f.free(o)?;
-    if let Some(m) = mod_all {
-        f.free(m.buf)?;
-    }
-    if let Some(t) = dv16 {
-        f.free(t)?;
-    }
+    f.free(mod_all.buf)?;
     f.free(dv)?;
     f.finish()?;
     Ok(out)
@@ -1201,11 +1064,9 @@ struct Gpuf<'a> {
     /// uploads per denoise step and leaked both buffers every time. Held for
     /// the lifetime of the `Gpuf` and released by [`Gpuf::finish`].
     ln_affine: Option<(usize, GpuTensor, GpuTensor)>,
-    /// f16 activations between kernels (see [`f16_activations_enabled`]).
-    f16_act: bool,
     /// dtype of the attention Q and the attention output. F16 only when the
-    /// f16 activation path is on AND the tuned FLUX attention route is the one
-    /// that has f16 Q/out instantiations (`vt`/`vtk`, hd 128, wave32 WMMA).
+    /// tuned FLUX attention route is the one that has f16 Q/out
+    /// instantiations (`vt`/`vtk`, hd 128, wave32 WMMA).
     /// `HIPFIRE_FLUX_ATTN=v5` and the portable `attention_dflash_f32` fallback
     /// are both f32-only, so they pin this back to F32.
     qo_dt: DType,
@@ -1224,24 +1085,18 @@ impl<'a> Gpuf<'a> {
         gw: &'a GpuFluxWeights,
         cfg: &'a FluxDiffusionConfig,
     ) -> Result<Self, String> {
-        let f16_act = f16_activations_enabled();
         // The WMMA FLUX attention family is the one `Gpuf::attention_into`
         // routes to; it is hd-128 wave32 only, and every member takes f16 K/V.
         let wmma_attn = cfg.head_dim == 128 && gpu.arch_caps.has_wmma_w32();
         let v5 = hipfire_config::developer_var("HIPFIRE_FLUX_ATTN").is_ok_and(|v| v == "v5");
-        let qo_f16 = f16_act && wmma_attn && !v5;
+        let qo_f16 = wmma_attn && !v5;
         Ok(Self {
             gpu,
             gw,
             cfg,
             ln_affine: None,
-            f16_act,
             qo_dt: if qo_f16 { DType::F16 } else { DType::F32 },
-            kv_dt: if f16_act && wmma_attn {
-                DType::F16
-            } else {
-                DType::F32
-            },
+            kv_dt: if wmma_attn { DType::F16 } else { DType::F32 },
             prof: SpanProfiler::new(step_profile_enabled()),
         })
     }
@@ -1513,42 +1368,26 @@ impl<'a> Gpuf<'a> {
         // the FLUX shapes. It
         // needs K % 64 == 0 — true of every FLUX.1-dev linear — so the 16-step
         // kernel stays the fallback for a ragged K.
-        // `HIPFIRE_FLUX_GEMM_LDS=0` forces the old 16-step kernel, so the two
-        // routes can be A/B-ed in one session on the real forward rather than
-        // compared across commits.
         //
         // `_auto` picks the macro-tile per arch from measurement rather than
         // from a capability predicate. The wide tiles are worth 1.17x/1.28x/
         // 1.41x on gfx1150/gfx1151/gfx1100 over the fixed 128×128, and the
         // per-arch winners genuinely differ — gfx1100's best tile is a 27%
         // LOSS on gfx1151 — so a single tile is not available.
-        // `HIPFIRE_FLUX_GEMM_WIDE=0` pins the fixed 128×128 kernel for A/B.
-        // Both read through the process-cached accessors: this is on the
-        // per-GEMM path (hundreds of calls per step), and a `getenv` per call
-        // is both wasted work and a mid-run flip the rest of the forward would
-        // not see.
-        let lds_enabled = gemm_lds_enabled();
-        let wide = gemm_wide_enabled();
         // Captured instead of `?`-propagated directly so `end` always
         // runs before this function returns, on every branch — otherwise an
         // early return on a launch error would skip it and leak `t`'s two
         // hipEvents (`PendingTimer` cannot free them itself: destroying a
         // HIP event needs a `HipRuntime` handle, which it deliberately does
         // not own — same reason `GpuTensor`/`DeviceBuffer` have no `Drop`).
-        let r: Result<(), String> = if lds_enabled && k % 64 == 0 {
+        let r: Result<(), String> = if k % 64 == 0 {
             let bias_arg = if has_bias { Some(bias) } else { None };
-            if wide {
-                // `lda` is the weight's stored pitch; the activation is
-                // always packed, so `ldx = k`. Padding the activation as well
-                // measured as a loss on gfx1151 (see the WPAD section above).
-                self.gpu
-                    .gemm_f16_x_f16_wmma_lds_auto_ld(b, a_f16, &y, bias_arg, n, k, m, lda, k)
-                    .map_err(|e| format!("flux gpu: wmma lds auto gemm [{m}x{k}]·[{n}x{k}]: {e:?}"))
-            } else {
-                self.gpu
-                    .gemm_f16_x_f16_wmma_lds(b, a_f16, &y, bias_arg, n, k, m)
-                    .map_err(|e| format!("flux gpu: wmma lds gemm [{m}x{k}]·[{n}x{k}]: {e:?}"))
-            }
+            // `lda` is the weight's stored pitch; the activation is always
+            // packed, so `ldx = k`. Padding the activation as well measured
+            // as a loss on gfx1151 (see the WPAD section above).
+            self.gpu
+                .gemm_f16_x_f16_wmma_lds_auto_ld(b, a_f16, &y, bias_arg, n, k, m, lda, k)
+                .map_err(|e| format!("flux gpu: wmma lds auto gemm [{m}x{k}]·[{n}x{k}]: {e:?}"))
         } else {
             self.gpu
                 .gemm_f16_x_f16_wmma(b, a_f16, &y, n, k, m)
@@ -1572,8 +1411,6 @@ impl<'a> Gpuf<'a> {
     // ─── f16-activation path helpers ────────────────────────────────────
     //
     // Everything below exists to keep activations in f16 between kernels.
-    // They are only reached when `self.f16_act`; `HIPFIRE_FLUX_F16_ACT=0`
-    // routes the block bodies to the f32 helpers above instead.
 
     /// An **uninitialized** `[shape]` tensor of an explicit dtype. Same
     /// contract as [`Gpuf::alloc`] — every caller pure-assigns the buffer.
@@ -1593,11 +1430,9 @@ impl<'a> Gpuf<'a> {
     /// the residual stream being updated in place.
     ///
     /// The fused-epilogue entries exist only for the LDS-staged kernel and
-    /// only for `K % 64 == 0`. A ragged K, or `HIPFIRE_FLUX_GEMM_LDS=0`,
-    /// falls back to [`Gpuf::gemm_epi_unfused`], which reproduces the same
-    /// arithmetic with the pre-existing standalone kernels — slower, but it
-    /// keeps both A/B knobs meaningful on the f16 path and gives the fused
-    /// kernels an independent cross-check at lab geometry.
+    /// only for `K % 64 == 0`. A ragged K falls back to
+    /// [`Gpuf::gemm_epi_unfused`], which reproduces the same arithmetic with
+    /// the pre-existing standalone kernels.
     #[allow(clippy::too_many_arguments)]
     fn gemm_epi(
         &mut self,
@@ -1621,48 +1456,33 @@ impl<'a> Gpuf<'a> {
                  (got {k})"
             ));
         }
-        // Same invariant as `gemm_pre`: neither the unfused fallback below nor
-        // the narrow-tile arm can express a pitch, and `weight_pitch` never
-        // pads a weight whose consumer is one of them.
+        // Same invariant as `gemm_pre`: the unfused fallback below cannot
+        // express a pitch, and `weight_pitch` never pads a weight whose
+        // consumer is it.
         if lda != k && !pitch_route_ok(k) {
             return Err(format!(
                 "flux gpu: gemm_epi [{batch}x{k}]·[{m}x{k}]: row pitch {lda} but the pitch-aware \
                  LDS route is not selected"
             ));
         }
-        if !gemm_lds_enabled() || k % 64 != 0 {
+        if k % 64 != 0 {
             return self.gemm_epi_unfused(w_f16, x_f16, y, bias, batch, m, k, epi, family);
         }
         let t = self
             .prof
             .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), family);
-        let r = if gemm_wide_enabled() {
-            // Weight at its stored pitch, activation packed — see `gemm_pre`.
-            self.gpu.gemm_f16_x_f16_wmma_lds_auto_epi_ld(
-                w_f16, x_f16, y, bias, m, k, batch, epi, lda, k,
-            )
-        } else {
-            self.gpu.gemm_f16_x_f16_wmma_lds_epi(
-                w_f16,
-                x_f16,
-                y,
-                bias,
-                m,
-                k,
-                batch,
-                NARROW_TILE,
-                epi,
-            )
-        };
+        // Weight at its stored pitch, activation packed — see `gemm_pre`.
+        let r = self
+            .gpu
+            .gemm_f16_x_f16_wmma_lds_auto_epi_ld(w_f16, x_f16, y, bias, m, k, batch, epi, lda, k);
         self.prof
             .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r.map_err(|e| format!("flux gpu: wmma lds {epi:?} [{batch}x{k}]·[{m}x{k}]: {e:?}"))
     }
 
     /// [`Gpuf::gemm_epi`] decomposed into the standalone kernels, for the
-    /// shapes and flag states the fused entries do not cover — i.e. only when
-    /// `HIPFIRE_FLUX_GEMM_LDS=0` or `K % 64 != 0`, so the GEMM itself is
-    /// always the 16-step kernel here.
+    /// shapes the fused entries do not cover — i.e. only when `K % 64 != 0`,
+    /// so the GEMM itself is always the 16-step kernel here.
     ///
     /// Applies the `GemmEpilogue` steps in the documented order: `acc`,
     /// `+= addin`, `+= bias`, `gelu`, then the gated store. The result is the
@@ -1689,8 +1509,8 @@ impl<'a> Gpuf<'a> {
         let acc = self.alloc(&[batch, m])?;
         // One span over the whole decomposed sequence: it is `family`'s one
         // GEMM, just spelled as several launches instead of one fused kernel
-        // (this fallback is only reached with `HIPFIRE_FLUX_GEMM_LDS=0` or a
-        // ragged K — not the default path).
+        // (this fallback is only reached with a ragged K — not the default
+        // path).
         let t = self
             .prof
             .begin(&self.gpu.hip, self.gpu.active_stream.as_ref(), family);
@@ -1753,23 +1573,6 @@ impl<'a> Gpuf<'a> {
             .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r?;
         self.free(acc)
-    }
-
-    /// `silu(vec)` plus, on the f16 path, its f16 copy — the pair every block
-    /// body's modulation linears take. `forward_parts` builds these once for
-    /// the whole forward; the single-block public entry points have to build
-    /// their own. Both are owned by the caller.
-    fn mod_vectors(
-        &mut self,
-        cfg: &FluxDiffusionConfig,
-        vec: &GpuTensor,
-    ) -> Result<(GpuTensor, Option<GpuTensor>), String> {
-        let dv = self.silu(vec)?;
-        let dv16 = match self.f16_act {
-            true => Some(self.cast_act(&dv, 1, cfg.hidden_size)?),
-            false => None,
-        };
-        Ok((dv, dv16))
     }
 
     /// A modulation linear (`*_mod.lin` / `modulation.lin`) over the
@@ -1897,54 +1700,6 @@ impl<'a> Gpuf<'a> {
         self.prof
             .end(&self.gpu.hip, self.gpu.active_stream.as_ref(), t);
         r
-    }
-
-    /// Double block `b`'s `[6d]` modulation vector for `stem` (`"img"` /
-    /// `"txt"`) — a view into [`ModAll`] on the GEMV route, a fresh batch-1
-    /// linear otherwise.
-    fn mod_double(
-        &mut self,
-        ms: &ModSrc<'_>,
-        b: usize,
-        stem: &str,
-        d: usize,
-    ) -> Result<ModVec, String> {
-        if let Some(all) = ms.all {
-            return Ok(ModVec {
-                t: all.double(b, stem == "img"),
-                owned: false,
-            });
-        }
-        self.mod_owned(ms, &format!("double_blocks.{b}.{stem}_mod.lin.weight"), d)
-    }
-
-    /// Single block `b`'s `[3d]` modulation vector. See [`Gpuf::mod_double`].
-    fn mod_single(&mut self, ms: &ModSrc<'_>, b: usize, d: usize) -> Result<ModVec, String> {
-        if let Some(all) = ms.all {
-            return Ok(ModVec {
-                t: all.single(b),
-                owned: false,
-            });
-        }
-        self.mod_owned(ms, &format!("single_blocks.{b}.modulation.lin.weight"), d)
-    }
-
-    /// The retained per-block GEMM route: one batch-1 linear, owned by the
-    /// block.
-    fn mod_owned(&mut self, ms: &ModSrc<'_>, wname: &str, d: usize) -> Result<ModVec, String> {
-        let t = match ms.dv16 {
-            Some(dv16) => self.mod_linear(wname, dv16, d)?,
-            None => self.linear(wname, ms.dv, d, 1, "mod.gemv")?,
-        };
-        Ok(ModVec { t, owned: true })
-    }
-
-    /// Free a [`ModVec`] iff the block owns it.
-    fn release_mod(&mut self, m: ModVec) -> Result<(), String> {
-        match m.owned {
-            true => self.free(m.t),
-            false => Ok(()),
-        }
     }
 
     /// Weightless LayerNorm fused with the adaLN-Zero affine, emitting
@@ -2301,36 +2056,22 @@ impl<'a> Gpuf<'a> {
         // block (57 redundant launches per denoise step at FLUX geometry).
         // Hoisting is bit-identical: silu is a deterministic elementwise map.
         let dv = self.silu(&vec)?;
-        // ...and, on the f16 path, its f16 copy: the three modulation linears
+        // ...and its f16 copy: the three modulation linears
         // per block all take the SAME `[1, d]` activation, so casting it here
         // instead of inside `linear` removes 76 cast launches and 76
         // alloc/free pairs per denoise step.
-        let dv16 = match self.f16_act {
-            true => Some(self.cast_act(&dv, 1, d)?),
-            false => None,
-        };
-        // ...and, on the GEMV route, every block's modulation vector: 76
-        // batch-1 linears whose activation is this same `dv`, run once here
-        // as GEMVs into ONE buffer instead of once per block through the
-        // 128-row WMMA macro-tile (127/128 padding rows) with its own
-        // alloc/free pair. `HIPFIRE_FLUX_MOD_GEMV=0` — see
-        // [`mod_gemv_enabled`].
-        let mod_all = match mod_gemv_enabled() {
-            true => {
-                Some(self.build_mod_all(cfg, &dv, 0..cfg.num_layers, 0..cfg.num_single_layers)?)
-            }
-            false => None,
-        };
-        let ms = ModSrc {
-            dv: &dv,
-            dv16: dv16.as_ref(),
-            all: mod_all.as_ref(),
-        };
+        let dv16 = self.cast_act(&dv, 1, d)?;
+        // ...and every block's modulation vector: 76 batch-1 linears whose
+        // activation is this same `dv`, run once here as GEMVs into ONE buffer
+        // instead of once per block through the 128-row WMMA macro-tile
+        // (127/128 padding rows) with its own alloc/free pair.
+        let mod_all = self.build_mod_all(cfg, &dv, 0..cfg.num_layers, 0..cfg.num_single_layers)?;
 
         // Double blocks. Each block returns fresh streams, so the previous
         // pair dies as soon as the new one exists.
         for b in 0..cfg.num_layers {
-            let (ni, nt) = self.double_block(cfg, b, &img, &txt, &ms, n_img, n_txt, input.grid)?;
+            let (ni, nt) =
+                self.double_block(cfg, b, &img, &txt, &mod_all, n_img, n_txt, input.grid)?;
             self.free(img)?;
             self.free(txt)?;
             img = ni;
@@ -2349,7 +2090,8 @@ impl<'a> Gpuf<'a> {
         self.free(img)?;
         self.free(txt)?;
         for b in 0..cfg.num_single_layers {
-            let next = self.single_block(cfg, b, &fused, &ms, n_img, input.grid, input.mlp_act)?;
+            let next =
+                self.single_block(cfg, b, &fused, &mod_all, n_img, input.grid, input.mlp_act)?;
             self.free(fused)?;
             fused = next;
         }
@@ -2362,56 +2104,31 @@ impl<'a> Gpuf<'a> {
         // shapes, so it is not a slot of `mod_all` — it stays on the GEMM
         // route as a single batch-1 launch per forward.
         self.free(vec)?;
-        let adain = match ms.dv16 {
-            Some(dv16) => self.mod_linear("final_layer.adaLN_modulation.1.weight", dv16, d)?,
-            None => self.linear(
-                "final_layer.adaLN_modulation.1.weight",
-                ms.dv,
-                d,
-                1,
-                "mod.gemv",
-            )?,
-        };
-        if let Some(m) = mod_all {
-            self.free(m.buf)?;
-        }
-        if let Some(t) = dv16 {
-            self.free(t)?;
-        }
+        let adain = self.mod_linear("final_layer.adaLN_modulation.1.weight", &dv16, d)?;
+        self.free(mod_all.buf)?;
+        self.free(dv16)?;
         self.free(dv)?;
         let img_only = fused.sub_offset(n_txt * d, n_img * d);
         let (shift, scale) = match input.final_order {
             FinalAdaLNOrder::ShiftScale => (adain.sub_offset(0, d), adain.sub_offset(d, d)),
             FinalAdaLNOrder::ScaleShift => (adain.sub_offset(d, d), adain.sub_offset(0, d)),
         };
-        let out = if self.f16_act {
-            let h16 = self.ln_mod(
-                &img_only,
-                &shift,
-                &scale,
-                n_img,
-                d,
-                DType::F16,
-                "final.ln_mod",
-            )?;
-            self.free(adain)?;
-            self.free(fused)?;
-            let w = self.gw.get("final_layer.linear.weight");
-            let bias = self.gw.get("final_layer.linear.bias");
-            let lda = Self::wlda(w, "final_layer.linear.weight", d)?;
-            let out = self.gemm_pre(&h16, w, bias, n_img, patch_in, d, true, "final.gemm", lda)?;
-            self.free(h16)?;
-            out
-        } else {
-            let normed = self.layernorm(&img_only, n_img, d)?;
-            let h = self.modulate(&normed, &shift, &scale, n_img, d)?;
-            self.free(normed)?;
-            self.free(adain)?;
-            self.free(fused)?;
-            let out = self.linear("final_layer.linear.weight", &h, d, n_img, "final.gemm")?;
-            self.free(h)?;
-            out
-        };
+        let h16 = self.ln_mod(
+            &img_only,
+            &shift,
+            &scale,
+            n_img,
+            d,
+            DType::F16,
+            "final.ln_mod",
+        )?;
+        self.free(adain)?;
+        self.free(fused)?;
+        let w = self.gw.get("final_layer.linear.weight");
+        let bias = self.gw.get("final_layer.linear.bias");
+        let lda = Self::wlda(w, "final_layer.linear.weight", d)?;
+        let out = self.gemm_pre(&h16, w, bias, n_img, patch_in, d, true, "final.gemm", lda)?;
+        self.free(h16)?;
         parts.push(("final".into(), self.download(&out)?));
         self.free(out)?;
         Ok(parts)
@@ -2440,13 +2157,11 @@ impl<'a> Gpuf<'a> {
     //   from the derived grid, so a reference image can sit at a different
     //   time id than the generated grid.
     //
-    // **Activations are f32 on this path regardless of
-    // [`f16_activations_enabled`]** (weights are still f16 — that is the GEMM
-    // operand dtype, not an activation choice). The f16 activation layout is
-    // a perf wave of its own: it needs FLUX.2 spellings of `qkv_prep_f16` /
-    // `proj_mlp_f16`, a SwiGLU epilogue and a `GemmEpilogue` for the fused
-    // single-block projection. Correctness first; `HIPFIRE_FLUX_F16_ACT` is
-    // simply inert here for now.
+    // **Activations are f32 on this path** (weights are still f16 — that is
+    // the GEMM operand dtype, not an activation choice). The f16 activation
+    // layout is a perf wave of its own: it needs FLUX.2 spellings of
+    // `qkv_prep` / `proj_mlp`, a SwiGLU epilogue and a `GemmEpilogue` for the
+    // fused single-block projection. Correctness first.
 
     /// Full FLUX.2 (Klein) MMDiT forward, returning the same named
     /// intermediates as the CPU [`crate::flux::forward_parts`] FLUX.2 branch
@@ -2502,8 +2217,7 @@ impl<'a> Gpuf<'a> {
         // it is computed once and the three `[6d]`/`[6d]`/`[3d]` results are
         // GEMV'd into one `[15d]` buffer — every slot is pure-assigned below,
         // so the buffer needs no memset. There are three of these per
-        // forward, not 76, so [`mod_gemv_enabled`]'s per-block GEMM A/B has
-        // nothing to measure here and the kill switch is not consulted.
+        // forward, not 76.
         let stemb = self.silu(&temb)?;
         self.free(temb)?;
         let mods = self.alloc(&[15 * d])?;
@@ -3160,14 +2874,6 @@ impl<'a> Gpuf<'a> {
             .map_err(|e| format!("flux gpu: gated_add: {e:?}"))
     }
 
-    fn gelu(&mut self, x: &GpuTensor, total: usize) -> Result<GpuTensor, String> {
-        let out = self.alloc(&[total])?;
-        self.gpu
-            .gelu_tanh_f32(x, &out, total)
-            .map_err(|e| format!("flux gpu: gelu: {e:?}"))?;
-        Ok(out)
-    }
-
     /// Dense multi-head attention (n_q == n_kv for FLUX square blocks).
     /// Routes through the tuned bidirectional DFlash family instead of the
     /// naive thread-per-element `attention_dense_f32`: the wave32-WMMA
@@ -3227,414 +2933,14 @@ impl<'a> Gpuf<'a> {
         Ok(out)
     }
 
-    /// Per-stream double-block prep: modulation → layernorm → adaLN → qkv →
-    /// QK-RMSNorm. Returns `(q, k, v, modu)`, all contiguous `[n, d]`(q/k/v).
-    fn qkv_prep(
-        &mut self,
-        cfg: &FluxDiffusionConfig,
-        b: usize,
-        stem: &str,
-        x: &GpuTensor,
-        ms: &ModSrc<'_>,
-        heads: usize,
-        hd: usize,
-        n: usize,
-    ) -> Result<(GpuTensor, GpuTensor, GpuTensor, ModVec), String> {
-        let d = cfg.hidden_size;
-        let p = |s: &str| format!("double_blocks.{b}.{stem}_{s}");
-        let modu = self.mod_double(ms, b, stem, d)?;
-        let normed = self.layernorm(x, n, d)?;
-        let h = self.modulate(
-            &normed,
-            &modu.t.sub_offset(0, d),
-            &modu.t.sub_offset(d, d),
-            n,
-            d,
-        )?;
-        self.free(normed)?;
-        let qkv_name = p("attn.qkv.weight");
-        let qkv_w = self.gw.get(&qkv_name);
-        let qkv_b = self.gw.get(&p("attn.qkv.bias"));
-        // `[3d, lda]` sliced along M into three `[d, lda]` weights: row `m`
-        // starts at `m·lda`, so both the offset and the length scale with the
-        // stored pitch, not with the logical K.
-        let lda = Self::wlda(qkv_w, &qkv_name, d)?;
-        // One f32→f16 cast of `h` feeds all three qkv GEMMs.
-        let h16 = self.cast_act(&h, n, d)?;
-        self.free(h)?;
-        let q = self.gemm_pre(
-            &h16,
-            &qkv_w.sub_offset(0, d * lda),
-            &qkv_b.sub_offset(0, d),
-            n,
-            d,
-            d,
-            true,
-            "gemm.qkv",
-            lda,
-        )?;
-        let k = self.gemm_pre(
-            &h16,
-            &qkv_w.sub_offset(d * lda, d * lda),
-            &qkv_b.sub_offset(d, d),
-            n,
-            d,
-            d,
-            true,
-            "gemm.qkv",
-            lda,
-        )?;
-        let v = self.gemm_pre(
-            &h16,
-            &qkv_w.sub_offset(2 * d * lda, d * lda),
-            &qkv_b.sub_offset(2 * d, d),
-            n,
-            d,
-            d,
-            true,
-            "gemm.qkv",
-            lda,
-        )?;
-        self.free(h16)?;
-        // QK-RMSNorm is out-of-place, so the pre-norm q/k die here.
-        let qn = self.qk_rmsnorm(
-            &q,
-            self.gw.get(&p("attn.norm.query_norm.scale")),
-            n,
-            heads,
-            hd,
-        )?;
-        self.free(q)?;
-        let kn = self.qk_rmsnorm(
-            &k,
-            self.gw.get(&p("attn.norm.key_norm.scale")),
-            n,
-            heads,
-            hd,
-        )?;
-        self.free(k)?;
-        Ok((qn, kn, v, modu))
-    }
-
-    /// Per-stream gated residual + re-modulated MLP after joint attention.
-    fn proj_mlp(
-        &mut self,
-        cfg: &FluxDiffusionConfig,
-        b: usize,
-        stem: &str,
-        att_slice: &GpuTensor,
-        org: &GpuTensor,
-        modu: &GpuTensor,
-        n: usize,
-    ) -> Result<GpuTensor, String> {
-        let d = cfg.hidden_size;
-        let p = |s: &str| format!("double_blocks.{b}.{stem}_{s}");
-        let proj = self.linear(&p("attn.proj.weight"), att_slice, d, n, "gemm.proj")?;
-        let acc = self.copy_of(org, n, d)?;
-        self.acc_gated(&acc, &modu.sub_offset(2 * d, d), &proj, n, d)?;
-        self.free(proj)?;
-        let normed2 = self.layernorm(&acc, n, d)?;
-        let h2 = self.modulate(
-            &normed2,
-            &modu.sub_offset(3 * d, d),
-            &modu.sub_offset(4 * d, d),
-            n,
-            d,
-        )?;
-        self.free(normed2)?;
-        let m0 = self.linear(&p("mlp.0.weight"), &h2, d, n, "gemm.mlp_in")?;
-        self.free(h2)?;
-        let mg = self.gelu(&m0, n * 4 * d)?;
-        self.free(m0)?;
-        let m1 = self.linear(&p("mlp.2.weight"), &mg, 4 * d, n, "gemm.mlp_out")?;
-        self.free(mg)?;
-        self.acc_gated(&acc, &modu.sub_offset(5 * d, d), &m1, n, d)?;
-        self.free(m1)?;
-        Ok(acc)
-    }
-
-    /// Dispatch one double block to the f16-activation body or the retained
-    /// all-f32 body (`HIPFIRE_FLUX_F16_ACT=0`). `dv` is `silu(vec)`, hoisted
-    /// out of the block loop by the caller.
-    #[allow(clippy::too_many_arguments)]
-    fn double_block(
-        &mut self,
-        cfg: &FluxDiffusionConfig,
-        b: usize,
-        img: &GpuTensor,
-        txt: &GpuTensor,
-        ms: &ModSrc<'_>,
-        n_img: usize,
-        n_txt: usize,
-        grid: (usize, usize),
-    ) -> Result<(GpuTensor, GpuTensor), String> {
-        match ms.dv16 {
-            Some(_) => self.double_block_f16(cfg, b, img, txt, ms, n_img, n_txt, grid),
-            None => self.double_block_f32(cfg, b, img, txt, ms, n_img, n_txt, grid),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn double_block_f32(
-        &mut self,
-        cfg: &FluxDiffusionConfig,
-        b: usize,
-        img: &GpuTensor,
-        txt: &GpuTensor,
-        ms: &ModSrc<'_>,
-        n_img: usize,
-        n_txt: usize,
-        grid: (usize, usize),
-    ) -> Result<(GpuTensor, GpuTensor), String> {
-        let d = cfg.hidden_size;
-        let heads = cfg.num_attention_heads;
-        let hd = cfg.head_dim;
-        let n_kv = n_img + n_txt;
-        let (i_q, i_k, i_v, i_mod) = self.qkv_prep(cfg, b, "img", img, ms, heads, hd, n_img)?;
-        let (t_q, t_k, t_v, t_mod) = self.qkv_prep(cfg, b, "txt", txt, ms, heads, hd, n_txt)?;
-
-        // Joint attention over the text-first concat; image rows get 2D RoPE.
-        // The three concat buffers are written in full by the copies below
-        // (n_txt + n_img == n_kv rows each), so they need no memset.
-        let q_all = self.alloc(&[n_kv, d])?;
-        let k_all = self.alloc(&[n_kv, d])?;
-        let v_all = self.alloc(&[n_kv, d])?;
-        self.copy_into(&q_all, &t_q, 0, n_txt, d)?;
-        self.copy_into(&q_all, &i_q, n_txt, n_img, d)?;
-        self.copy_into(&k_all, &t_k, 0, n_txt, d)?;
-        self.copy_into(&k_all, &i_k, n_txt, n_img, d)?;
-        self.copy_into(&v_all, &t_v, 0, n_txt, d)?;
-        self.copy_into(&v_all, &i_v, n_txt, n_img, d)?;
-        for t in [i_q, i_k, i_v, t_q, t_k, t_v] {
-            self.free(t)?;
-        }
-        let axes_dim = cfg.axes_dim;
-        self.gpu
-            .rope_2d_flux_f32(
-                &q_all, n_txt, n_img, heads, hd, grid.1, axes_dim, cfg.theta, None,
-            )
-            .map_err(|e| format!("double rope q: {e:?}"))?;
-        self.gpu
-            .rope_2d_flux_f32(
-                &k_all, n_txt, n_img, heads, hd, grid.1, axes_dim, cfg.theta, None,
-            )
-            .map_err(|e| format!("double rope k: {e:?}"))?;
-        let att = self.attention(&q_all, &k_all, &v_all, n_kv, heads, hd)?;
-        for t in [q_all, k_all, v_all] {
-            self.free(t)?;
-        }
-
-        let img_out = self.proj_mlp(
-            cfg,
-            b,
-            "img",
-            &att.sub_offset(n_txt * d, n_img * d),
-            img,
-            &i_mod.t,
-            n_img,
-        )?;
-        let txt_out = self.proj_mlp(
-            cfg,
-            b,
-            "txt",
-            &att.sub_offset(0, n_txt * d),
-            txt,
-            &t_mod.t,
-            n_txt,
-        )?;
-        self.free(att)?;
-        self.release_mod(i_mod)?;
-        self.release_mod(t_mod)?;
-        Ok((img_out, txt_out))
-    }
-
-    /// Dispatch one single block. `dv` is `silu(vec)`, hoisted by the caller.
-    #[allow(clippy::too_many_arguments)]
-    fn single_block(
-        &mut self,
-        cfg: &FluxDiffusionConfig,
-        b: usize,
-        fused: &GpuTensor,
-        ms: &ModSrc<'_>,
-        n_img: usize,
-        grid: (usize, usize),
-        act: MlpAct,
-    ) -> Result<GpuTensor, String> {
-        match ms.dv16 {
-            Some(_) => self.single_block_f16(cfg, b, fused, ms, n_img, grid, act),
-            None => self.single_block_f32(cfg, b, fused, ms, n_img, grid, act),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn single_block_f32(
-        &mut self,
-        cfg: &FluxDiffusionConfig,
-        b: usize,
-        fused: &GpuTensor,
-        ms: &ModSrc<'_>,
-        n_img: usize,
-        grid: (usize, usize),
-        act: MlpAct,
-    ) -> Result<GpuTensor, String> {
-        let d = cfg.hidden_size;
-        let heads = cfg.num_attention_heads;
-        let hd = cfg.head_dim;
-        let f = 4 * d;
-        let n_all = fused.numel() / d;
-        let modu = self.mod_single(ms, b, d)?;
-        let s1 = modu.t.sub_offset(0, d);
-        let c1 = modu.t.sub_offset(d, d);
-        let g1 = modu.t.sub_offset(2 * d, d);
-        let normed = self.layernorm(fused, n_all, d)?;
-        let x_mod = self.modulate(&normed, &s1, &c1, n_all, d)?;
-        self.free(normed)?;
-
-        // linear1 fused weight split by rows → contiguous q/k/v + mlp.
-        let l1_name = format!("single_blocks.{b}.linear1.weight");
-        let l1_w = self.gw.get(&l1_name);
-        let l1_b = self.gw.get(&format!("single_blocks.{b}.linear1.bias"));
-        // Row slices of a `[7d, lda]` weight — see `qkv_prep` on why the M
-        // offsets scale with the stored pitch.
-        let lda = Self::wlda(l1_w, &l1_name, d)?;
-        // One f32→f16 cast of `x_mod` feeds all four linear1 GEMMs.
-        let x16 = self.cast_act(&x_mod, n_all, d)?;
-        self.free(x_mod)?;
-        let q = self.gemm_pre(
-            &x16,
-            &l1_w.sub_offset(0, d * lda),
-            &l1_b.sub_offset(0, d),
-            n_all,
-            d,
-            d,
-            true,
-            "gemm.single_l1_qkv",
-            lda,
-        )?;
-        let k = self.gemm_pre(
-            &x16,
-            &l1_w.sub_offset(d * lda, d * lda),
-            &l1_b.sub_offset(d, d),
-            n_all,
-            d,
-            d,
-            true,
-            "gemm.single_l1_qkv",
-            lda,
-        )?;
-        let v = self.gemm_pre(
-            &x16,
-            &l1_w.sub_offset(2 * d * lda, d * lda),
-            &l1_b.sub_offset(2 * d, d),
-            n_all,
-            d,
-            d,
-            true,
-            "gemm.single_l1_qkv",
-            lda,
-        )?;
-        let mlp = self.gemm_pre(
-            &x16,
-            &l1_w.sub_offset(3 * d * lda, 4 * d * lda),
-            &l1_b.sub_offset(3 * d, 4 * d),
-            n_all,
-            f,
-            d,
-            true,
-            "gemm.single_l1_mlp",
-            lda,
-        )?;
-        self.free(x16)?;
-        let qn = self.qk_rmsnorm(
-            &q,
-            self.gw
-                .get(&format!("single_blocks.{b}.norm.query_norm.scale")),
-            n_all,
-            heads,
-            hd,
-        )?;
-        self.free(q)?;
-        let kn = self.qk_rmsnorm(
-            &k,
-            self.gw
-                .get(&format!("single_blocks.{b}.norm.key_norm.scale")),
-            n_all,
-            heads,
-            hd,
-        )?;
-        self.free(k)?;
-        let (q, k) = (qn, kn);
-        // RoPE the trailing image rows before attention.
-        let axes_dim = cfg.axes_dim;
-        self.gpu
-            .rope_2d_flux_f32(
-                &q,
-                n_all - n_img,
-                n_img,
-                heads,
-                hd,
-                grid.1,
-                axes_dim,
-                cfg.theta,
-                None,
-            )
-            .map_err(|e| format!("single rope q: {e:?}"))?;
-        self.gpu
-            .rope_2d_flux_f32(
-                &k,
-                n_all - n_img,
-                n_img,
-                heads,
-                hd,
-                grid.1,
-                axes_dim,
-                cfg.theta,
-                None,
-            )
-            .map_err(|e| format!("single rope k: {e:?}"))?;
-        let att = self.attention(&q, &k, &v, n_all, heads, hd)?;
-        for t in [q, k, v] {
-            self.free(t)?;
-        }
-        let mlp_g = match act {
-            MlpAct::GeluTanh => self.gelu(&mlp, n_all * f)?,
-            MlpAct::Silu => self.silu(&mlp)?,
-        };
-        self.free(mlp)?;
-        // linear2 input cat [att(d), mlp_g(4d)] per token (fused K interleave).
-        // The two chunks cover all 5d columns of every row, so no memset.
-        let fused2 = self.alloc(&[n_all, 5 * d])?;
-        self.assemble_rows(&fused2, 5 * d, n_all, &[(0, &att, d), (d, &mlp_g, f)])?;
-        self.free(att)?;
-        self.free(mlp_g)?;
-        let out = self.linear(
-            &format!("single_blocks.{b}.linear2.weight"),
-            &fused2,
-            5 * d,
-            n_all,
-            "gemm.single_l2",
-        )?;
-        self.free(fused2)?;
-        let next = self.copy_of(fused, n_all, d)?;
-        self.acc_gated(&next, &g1, &out, n_all, d)?;
-        self.free(out)?;
-        // `g1` is a view into `modu`, so `modu` must outlive the gated add.
-        self.release_mod(modu)?;
-        Ok(next)
-    }
-
-    // ─── f16-activation block bodies ────────────────────────────────────
+    // ─── block bodies ──────────────────────────────────────────────────────
 
     /// Per-stream double-block prep, writing q/k/v **directly into the row
     /// range this stream owns in the text-first joint concat**.
     ///
-    /// This is the structural difference from [`Gpuf::qkv_prep`]: there, each
-    /// stream's q/k/v were three standalone `[n, d]` buffers that
-    /// `double_block` then copied into the joint buffers — six `copy_d2d`
-    /// calls per block, all host-synchronous because no stream was active.
-    /// Here the GEMM's destination IS the sub-range, so the copies do not
-    /// exist. `row0` is the stream's first row in the concat (0 for text,
-    /// `n_txt` for image).
+    /// The GEMM writes straight into this stream's sub-range of the joint
+    /// buffer, so no q/k/v copies are needed. `row0` is the stream's first
+    /// row in the concat (0 for text, `n_txt` for image).
     ///
     /// `rope` carries the image grid width for the image stream and `None`
     /// for the text stream: the joint RoPE rotates only the image rows, and
@@ -3642,7 +2948,7 @@ impl<'a> Gpuf<'a> {
     /// `txt_attn.norm.*`), so the fused norm+RoPE kernel runs once per stream
     /// over that stream's rows rather than once over the joint buffer.
     #[allow(clippy::too_many_arguments)]
-    fn qkv_prep_f16(
+    fn qkv_prep(
         &mut self,
         cfg: &FluxDiffusionConfig,
         b: usize,
@@ -3723,7 +3029,7 @@ impl<'a> Gpuf<'a> {
     /// Per-stream gated residual + re-modulated MLP, with every elementwise
     /// pass folded into a GEMM epilogue: three launches replace the
     /// cast/GEMM/copy/gated-add/layernorm/modulate/cast/GEMM/GELU/cast/GEMM/
-    /// gated-add chain of [`Gpuf::proj_mlp`].
+    /// gated-add chain an unfused block would run.
     ///
     /// The `proj` GEMM writes `acc = org + gate·(proj + bias)` with `org` as
     /// the residual operand and a fresh `acc` as the destination, so the
@@ -3731,7 +3037,7 @@ impl<'a> Gpuf<'a> {
     /// hands in a borrowed tensor). The `mlp.2` GEMM then gates in place, with
     /// `acc` as both residual and destination.
     #[allow(clippy::too_many_arguments)]
-    fn proj_mlp_f16(
+    fn proj_mlp(
         &mut self,
         cfg: &FluxDiffusionConfig,
         b: usize,
@@ -3831,13 +3137,13 @@ impl<'a> Gpuf<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn double_block_f16(
+    fn double_block(
         &mut self,
         cfg: &FluxDiffusionConfig,
         b: usize,
         img: &GpuTensor,
         txt: &GpuTensor,
-        ms: &ModSrc<'_>,
+        ms: &ModAll,
         n_img: usize,
         n_txt: usize,
         grid: (usize, usize),
@@ -3847,8 +3153,8 @@ impl<'a> Gpuf<'a> {
         let hd = cfg.head_dim;
         let n_kv = n_img + n_txt;
         let (qo_dt, kv_dt) = (self.qo_dt, self.kv_dt);
-        let i_mod = self.mod_double(ms, b, "img", d)?;
-        let t_mod = self.mod_double(ms, b, "txt", d)?;
+        let i_mod = ms.double(b, true);
+        let t_mod = ms.double(b, false);
 
         // Joint text-first buffers. `*_pre` take the qkv GEMM stores; the
         // fused norm+RoPE is out-of-place (the kernel marks both operands
@@ -3860,15 +3166,13 @@ impl<'a> Gpuf<'a> {
         let q_all = self.alloc_dt(&[n_kv, d], qo_dt)?;
         let k_all = self.alloc_dt(&[n_kv, d], kv_dt)?;
         let bufs = [&q_pre, &k_pre, &v_all, &q_all, &k_all];
-        self.qkv_prep_f16(
-            cfg, b, "txt", txt, &t_mod.t, n_txt, 0, bufs, heads, hd, None,
-        )?;
-        self.qkv_prep_f16(
+        self.qkv_prep(cfg, b, "txt", txt, &t_mod, n_txt, 0, bufs, heads, hd, None)?;
+        self.qkv_prep(
             cfg,
             b,
             "img",
             img,
-            &i_mod.t,
+            &i_mod,
             n_img,
             n_txt,
             bufs,
@@ -3885,37 +3189,35 @@ impl<'a> Gpuf<'a> {
             self.free(t)?;
         }
 
-        let img_out = self.proj_mlp_f16(
+        let img_out = self.proj_mlp(
             cfg,
             b,
             "img",
             &att.sub_offset(n_txt * d, n_img * d),
             img,
-            &i_mod.t,
+            &i_mod,
             n_img,
         )?;
-        let txt_out = self.proj_mlp_f16(
+        let txt_out = self.proj_mlp(
             cfg,
             b,
             "txt",
             &att.sub_offset(0, n_txt * d),
             txt,
-            &t_mod.t,
+            &t_mod,
             n_txt,
         )?;
         self.free(att)?;
-        self.release_mod(i_mod)?;
-        self.release_mod(t_mod)?;
         Ok((img_out, txt_out))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn single_block_f16(
+    fn single_block(
         &mut self,
         cfg: &FluxDiffusionConfig,
         b: usize,
         fused: &GpuTensor,
-        ms: &ModSrc<'_>,
+        ms: &ModAll,
         n_img: usize,
         grid: (usize, usize),
         act: MlpAct,
@@ -3928,26 +3230,26 @@ impl<'a> Gpuf<'a> {
         let n_txt = n_all - n_img;
         let (qo_dt, kv_dt) = (self.qo_dt, self.kv_dt);
         let sb = |s: &str| format!("single_blocks.{b}.{s}");
-        let modu = self.mod_single(ms, b, d)?;
+        let modu = ms.single(b);
         let x16 = self.ln_mod(
             fused,
-            &modu.t.sub_offset(0, d),
-            &modu.t.sub_offset(d, d),
+            &modu.sub_offset(0, d),
+            &modu.sub_offset(d, d),
             n_all,
             d,
             DType::F16,
             "norm.ln_mod",
         )?;
 
-        // linear1 split by output rows into q/k/v + mlp, as before, but each
-        // GEMM now stores the dtype its consumer wants.
+        // linear1 split by output rows into q/k/v + mlp; each GEMM stores the
+        // dtype its consumer wants.
         let q_pre = self.alloc_dt(&[n_all, d], DType::F16)?;
         let k_pre = self.alloc_dt(&[n_all, d], DType::F16)?;
         let v = self.alloc_dt(&[n_all, d], kv_dt)?;
         let l1_name = sb("linear1.weight");
         let l1_w = self.gw.get(&l1_name);
         let l1_b = self.gw.get(&sb("linear1.bias"));
-        // Row slices of `[7d, l1_lda]` — see the f32 `qkv_prep`.
+        // Row slices of `[7d, l1_lda]`.
         let l1_lda = Self::wlda(l1_w, &l1_name, d)?;
         for (i, dst) in [&q_pre, &k_pre, &v].into_iter().enumerate() {
             let epi = GemmEpilogue {
@@ -4080,7 +3382,7 @@ impl<'a> Gpuf<'a> {
 
         let next = self.alloc(&[n_all, d])?;
         {
-            let gate = modu.t.sub_offset(2 * d, d);
+            let gate = modu.sub_offset(2 * d, d);
             let epi = GemmEpilogue {
                 addin: Some(&tmp),
                 gate: Some(&gate),
@@ -4106,7 +3408,6 @@ impl<'a> Gpuf<'a> {
         }
         self.free(tmp)?;
         self.free(mlp16)?;
-        self.release_mod(modu)?;
         Ok(next)
     }
 }
@@ -4249,9 +3550,9 @@ mod tests {
     }
 
     /// The pad is a pure function of (name, K), and it is what both the
-    /// uploader and every GEMM call site read. These are the three classes
-    /// that must NOT move: modulation weights (the GEMV reads a packed row),
-    /// a K the LDS route cannot take, and the kill switch.
+    /// uploader and every GEMM call site read. These are the two classes
+    /// that must NOT move: modulation weights (the GEMV reads a packed row)
+    /// and a K the LDS route cannot take.
     #[test]
     fn modulation_weights_are_never_padded() {
         for name in [
@@ -4309,8 +3610,7 @@ mod tests {
     /// The other half of the same contract: a non-modulation weight on a K
     /// the LDS route takes DOES move by exactly the configured pad. Written
     /// against `weight_pad()`/`pitch_route_ok()` rather than the literal 64
-    /// so the test still means something under `HIPFIRE_FLUX_WPAD=0` and
-    /// under the `HIPFIRE_FLUX_GEMM_{LDS,WIDE}=0` A/B knobs.
+    /// so the test still means something under `HIPFIRE_FLUX_WPAD=0`.
     #[test]
     fn a_gemm_weight_moves_by_exactly_the_configured_pad() {
         for k in [3072usize, 12288, 15360] {

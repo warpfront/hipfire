@@ -924,8 +924,7 @@ not once per tile. A load without lanes is unchanged.
 mixed store (`ep_lane_store_device_bytes_mixed`: the first 3 slots with MTP state, the rest AR-only) to the decoupled census
 and takes the plan when it holds more resident layers than the ordinary lane placement. A native-MTP store on that load
 is admitted only when every mesh window fits the resident scratch bank. A store that does not fit is refused at staging
-with a label, and the daemon stages AR lanes instead (`spec=off (...)`). Without `--spec mtp`, or with
-`HIPFIRE_EP_MTP_LANES=0`, the lanes are AR lanes.
+with a label, and the daemon stages AR lanes instead (`spec=off (...)`). Without `--spec mtp` the lanes are AR lanes.
 
 Mesh window phases against the borrow window (a borrowed epoch is only ever opened by a prompt forward of more than 512
 rows, inside `forward_chunk`): the verify (`forward_lanes`) enters through `ep_reserve_lane_step_enter` (restores a dirty
@@ -1628,8 +1627,7 @@ and EP2 mq4; see the stage-policy bullet below); the serve figures are in the
   gather has a peer. The load reserves the spec lane store before it splits
   the experts. The stage line reports `spec=mtp K=.. executor=ep-mesh
   copy=on|off`; a store that does not fit is a labeled refusal and AR lanes
-  (`spec=off (...)`), never a narrower MTP store. `HIPFIRE_EP_MTP_LANES=0` is
-  the kill switch (EP lanes are AR lanes, as before). Sampled requests
+  (`spec=off (...)`), never a narrower MTP store. Sampled requests
   (`serve.batch_sampled`, neutral penalties) run on the same lanes: rank 0
   reads the head's exact candidates and its target logits rows, and the root
   alone draws every proposal and every Leviathan accept/residual/bonus.

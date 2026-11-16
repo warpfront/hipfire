@@ -5196,6 +5196,245 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "the gfx11 lean prefill scratch kill switch was removed (HIPF-396)",
         replacement: "none; the admitted fused gfx1100 and gfx1151 route takes the 64-row lean scratch",
+    },    RetiredConfigKey {
+        key: "developer.ep_compact_scratch",
+        legacy_key: "ep_compact_scratch",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP compact forward scratch kill switch was removed (HIPF-396)",
+        replacement: "none; an expert-parallel load takes the compact forward scratch plan its source admits",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_gather_direct",
+        legacy_key: "ep_gather_direct",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP direct unit-arena gather kill switch was removed (HIPF-396)",
+        replacement: "none; loads with a direct source always gather owned experts with parallel O_DIRECT reads",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_mtp_lanes",
+        legacy_key: "ep_mtp_lanes",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP native-MTP lanes kill switch was removed (HIPF-396)",
+        replacement: "none; EP loads with serve.batch_spec and --spec mtp always stage native-MTP lanes",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_share_host",
+        legacy_key: "ep_share_host",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP shared pinned host copy kill switch was removed (HIPF-396)",
+        replacement: "none; the ranks of one process always share one pinned host copy of a replicated host-mapped weight",
+    },
+    RetiredConfigKey {
+        key: "developer.flux_f16_act",
+        legacy_key: "flux_f16_act",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the FLUX f16 activation kill switch was removed (HIPF-396)",
+        replacement: "none; FLUX activations are always carried as f16",
+    },
+    RetiredConfigKey {
+        key: "developer.flux_gemm_lds",
+        legacy_key: "flux_gemm_lds",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the FLUX LDS GEMM kill switch was removed (HIPF-396)",
+        replacement: "none; FLUX GEMMs always take the LDS-staged macro-tile route when K is a multiple of 64",
+    },
+    RetiredConfigKey {
+        key: "developer.flux_gemm_wide",
+        legacy_key: "flux_gemm_wide",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the FLUX wide GEMM tile kill switch was removed (HIPF-396)",
+        replacement: "none; FLUX GEMMs always pick the per-arch macro-tile",
+    },
+    RetiredConfigKey {
+        key: "developer.flux_mod_gemv",
+        legacy_key: "flux_mod_gemv",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the FLUX modulation GEMV kill switch was removed (HIPF-396)",
+        replacement: "none; FLUX modulation linears always run as GEMVs into one per-forward buffer",
+    },
+    RetiredConfigKey {
+        key: "developer.gated_delta_vector_chunked",
+        legacy_key: "gated_delta_vector_chunked",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the chunked vector gated-delta kill switch was removed (HIPF-396)",
+        replacement: "none; the chunked core runs wherever its arch and shape admission holds",
+    },
+    RetiredConfigKey {
+        key: "developer.img_cond_cache",
+        legacy_key: "img_cond_cache",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the image conditioning cache kill switch was removed (HIPF-396)",
+        replacement: "none; prompt conditioning is always cached per daemon",
+    },
+    RetiredConfigKey {
+        key: "developer.lane_admit_coalesce_first",
+        legacy_key: "lane_admit_coalesce_first",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the lone-first-arrival admission coalescing kill switch was removed (HIPF-396)",
+        replacement: "none; a lone request that stays a lane always waits one coalescing gap; HIPFIRE_LANE_ADMIT_COALESCE_MS=0 turns the wait off",
+    },
+    RetiredConfigKey {
+        key: "developer.lane_early_first_token",
+        legacy_key: "lane_early_first_token",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the early lane first token kill switch was removed (HIPF-396)",
+        replacement: "none; a lane's first token always streams in its prefill step",
+    },
+    RetiredConfigKey {
+        key: "developer.lane_first_token_before_mesh",
+        legacy_key: "lane_first_token_before_mesh",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the first token before the EP mesh window kill switch was removed (HIPF-396)",
+        replacement: "none; prefill ticks always stream before the EP mesh decode window",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_direct_load",
+        legacy_key: "qwen4_direct_load",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 direct weight load kill switch was removed (HIPF-396)",
+        replacement: "none; discrete GPUs always use the direct weight reader",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ep_lone_mtp_lane",
+        legacy_key: "qwen4_ep_lone_mtp_lane",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP lone native-MTP lane kill switch was removed (HIPF-396)",
+        replacement: "none; a lone EP request with native MTP always enters the lane driver",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_page_budget",
+        legacy_key: "qwen4_lane_page_budget",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 lane page budget kill switch was removed (HIPF-396)",
+        replacement: "none; Qwen4 lane admission always applies the page budget",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_tool_arg_replay",
+        legacy_key: "qwen4_tool_arg_replay",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the tool argument replay kill switch was removed (HIPF-396)",
+        replacement: "none; tool argument replay always runs",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_a8_fuse_round",
+        legacy_key: "raon_a8_fuse_round",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Raon A8 fused BF16 rounding kill switch was removed (HIPF-396)",
+        replacement: "none; Raon GEMMs always round BF16 in the epilogue",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_a8_reuse",
+        legacy_key: "raon_a8_reuse",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Raon A8 reuse kill switch was removed (HIPF-396)",
+        replacement: "none; Raon always reuses a prepared A8 activation",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_attn_tiled",
+        legacy_key: "raon_attn_tiled",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Raon tiled MLA attention kill switch was removed (HIPF-396)",
+        replacement: "none; Raon MLA always runs the tiled kernels",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_mhc_bf16_streams",
+        legacy_key: "raon_mhc_bf16_streams",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Raon mHC BF16 streams kill switch was removed (HIPF-396)",
+        replacement: "none; Raon mHC stream planes are BF16 wherever the fused aggregate and BF16 selectors admit it",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_mhc_fused",
+        legacy_key: "raon_mhc_fused",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Raon fused mHC aggregate kill switch was removed (HIPF-396)",
+        replacement: "none; the Raon mHC route finalize is fused wherever its shape admission holds",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_mla_absorb",
+        legacy_key: "raon_mla_absorb",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Raon absorbed MLA kill switch was removed (HIPF-396)",
+        replacement: "none; Raon attends over the latent cache once a context exceeds the mirror budget",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_railgun_local_corpus",
+        legacy_key: "raon_railgun_local_corpus",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Raon per-user railgun corpus kill switch was removed (HIPF-396)",
+        replacement: "none; the per-user receipt corpus is provisioned at first load when buildable; HIPFIRE_RAON_RAILGUN=0 stays the hard kill",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_rda_fused_prep",
+        legacy_key: "raon_rda_fused_prep",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Raon RDA fused prepare kill switch was removed (HIPF-396)",
+        replacement: "none; the fused RDA producer runs wherever its wave admission holds",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_rda_segment",
+        legacy_key: "raon_rda_segment",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Raon RDA 256-row segments kill switch was removed (HIPF-396)",
+        replacement: "none; chunked RDA prefill always runs in 256-row segments",
+    },
+    RetiredConfigKey {
+        key: "developer.spec_window_rollback",
+        legacy_key: "spec_window_rollback",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the speculative window rollback kill switch was removed (HIPF-396)",
+        replacement: "none; strict-prefix terminal repair always replays the retained window",
+    },
+    RetiredConfigKey {
+        key: "developer.vae_conv",
+        legacy_key: "vae_conv",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the VAE GEMM convolution kill switch was removed (HIPF-396)",
+        replacement: "none; VAE convolutions take the f16 GEMM route wherever K admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.vae_fuse_norm",
+        legacy_key: "vae_fuse_norm",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the VAE fused GroupNorm+SiLU kill switch was removed (HIPF-396)",
+        replacement: "none; VAE GroupNorm and SiLU are always fused",
+    },
+    RetiredConfigKey {
+        key: "developer.vae_gpu",
+        legacy_key: "vae_gpu",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the GPU VAE decode kill switch was removed (HIPF-396)",
+        replacement: "none; the FLUX pipeline always decodes on the GPU",
     },
 ];
 
@@ -5724,20 +5963,6 @@ pub fn qwen4_lane_row_exact() -> LaneRowExact {
     *MODE
 }
 
-/// `HIPFIRE_QWEN4_LANE_PAGE_BUDGET` (developer, default ON, exact `0` is the kill switch):
-/// Flash-Next Qwen4 VMM lanes (single device and EP) reserve a request's worst-case context
-/// growth when it is admitted and admit it only while the unmapped growth already promised to
-/// live lanes plus its own fits the device's free memory (minus the load-time lane charge not
-/// yet consumed and a safety margin); a request that does not fit stays queued and is retried
-/// at the next step boundary instead of failing mid-step on a mapping refusal. `0` restores the
-/// previous admission (slots and context length only) exactly.
-pub const QWEN4_LANE_PAGE_BUDGET_ENV: &str = "HIPFIRE_QWEN4_LANE_PAGE_BUDGET";
-
-/// [`QWEN4_LANE_PAGE_BUDGET_ENV`] read through the process snapshot.
-pub fn qwen4_lane_page_budget() -> bool {
-    developer_bool(QWEN4_LANE_PAGE_BUDGET_ENV, true)
-}
-
 /// `HIPFIRE_QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB` (developer): free device memory, in MiB, the lane
 /// page budget keeps untouched on every rank (unmodelled transient allocations, driver slack).
 /// Unset or unparsable = [`QWEN4_LANE_PAGE_BUDGET_MARGIN_DEFAULT_MIB`].
@@ -6103,10 +6328,9 @@ pub fn mtp_host_spill_reason() -> &'static str {
 ///
 /// Resolved once at drafter construction from the documented process-snapshot
 /// keys (see `docs/env-vars.md`):
-/// `HIPFIRE_CACHE_CKPT_INTERVAL` / `HIPFIRE_CACHE_CKPT_MAX`, and
-/// `HIPFIRE_SPEC_WINDOW_ROLLBACK`. Defaults match the MTP PRs that introduced
-/// the consumers: rollback on, interval 2048 (floor 256), cap 8
-/// (floor 1). Reads go through the versioned [`ProcessConfig`] snapshot so
+/// `HIPFIRE_CACHE_CKPT_INTERVAL` / `HIPFIRE_CACHE_CKPT_MAX`. Defaults match
+/// the MTP PRs that introduced the consumers: interval 2048 (floor 256),
+/// cap 8 (floor 1). Reads go through the versioned [`ProcessConfig`] snapshot so
 /// TOML `[developer]` overrides and the env-beats-config-beats-default
 /// precedence apply; arch crates receive these resolved values and perform
 /// no policy reads of their own.
@@ -6114,7 +6338,6 @@ pub fn mtp_host_spill_reason() -> &'static str {
 pub struct MtpCachePolicy {
     pub checkpoint_interval: usize,
     pub checkpoint_cap: usize,
-    pub window_rollback: bool,
 }
 /// Resolve the [`MtpCachePolicy`] from the process snapshot. Called once at
 /// load (mirrors `build_dflash_speculator`'s one-shot resolution); never
@@ -6131,7 +6354,6 @@ pub fn mtp_cache_policy() -> MtpCachePolicy {
             .and_then(|v| v.parse().ok())
             .unwrap_or(8usize)
             .max(1),
-        window_rollback: developer_bool("HIPFIRE_SPEC_WINDOW_ROLLBACK", true),
     }
 }
 /// MTP n-gram-modifier explicit-arm check (`speculation.mtp_ngram`, env
@@ -8720,14 +8942,6 @@ mod tests {
         // The process snapshot of a test binary carries no knob.
         assert_eq!(memory::hfq_reader_lanes(), Ok(None));
         assert_eq!(memory::hfq_reader_chunk_mib(), Ok(None));
-    }
-
-    #[test]
-    fn ep_gather_direct_is_on_unless_exactly_zero() {
-        use memory::parse_ep_gather_direct as parse;
-        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
-        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
-        assert!(memory::ep_gather_direct());
     }
 
     #[test]
@@ -12817,21 +13031,6 @@ pub mod memory {
         super::developer_typed_bool("HIPFIRE_QWEN4_SP_TOUCHED")
     }
 
-    /// Developer kill switch `HIPFIRE_QWEN4_DIRECT_LOAD` for the discrete-GPU
-    /// Qwen4 direct weight reader (parallel `O_DIRECT`/buffered file reads
-    /// straight into pinned or staged device memory). Default on; exactly `0`
-    /// restores the unchanged mmap + single-thread copy path. Unified-memory
-    /// devices never take the direct reader regardless of this value.
-    pub fn qwen4_direct_load() -> bool {
-        parse_qwen4_direct_load(process_value("HIPFIRE_QWEN4_DIRECT_LOAD").as_deref())
-    }
-
-    /// Pure truth table behind [`qwen4_direct_load`]: only a trimmed `0` is
-    /// off; unset, empty and every other spelling keep the default (on).
-    pub fn parse_qwen4_direct_load(raw: Option<&str>) -> bool {
-        raw.map(str::trim) != Some("0")
-    }
-
     /// Env name of the HFQ weight reader's lane count ([`hfq_reader_lanes`]).
     pub const HFQ_READER_LANES_ENV: &str = "HIPFIRE_HFQ_READER_LANES";
     /// Env name of the HFQ weight reader's read size ([`hfq_reader_chunk_mib`]).
@@ -12896,31 +13095,6 @@ pub mod memory {
     /// reader read. Unset keeps the built-in default.
     pub fn hfq_reader_chunk_mib() -> std::result::Result<Option<usize>, String> {
         parse_hfq_reader_chunk_mib(process_value(HFQ_READER_CHUNK_MIB_ENV).as_deref())
-    }
-
-    /// Developer kill switch `HIPFIRE_EP_GATHER_DIRECT` for the expert-parallel unit-arena
-    /// gather (`qwen4_unit_arena_payload`): default on, the owned experts' shipped spans are
-    /// read with the parallel `O_DIRECT` reader and repacked on every core. Exactly `0` keeps
-    /// the serial walk over the mapped stacks (mmap page faults + single-thread repack).
-    pub fn ep_gather_direct() -> bool {
-        parse_ep_gather_direct(process_value("HIPFIRE_EP_GATHER_DIRECT").as_deref())
-    }
-
-    /// Pure truth table behind [`ep_gather_direct`]: only a trimmed `0` is off.
-    pub fn parse_ep_gather_direct(raw: Option<&str>) -> bool {
-        raw.map(str::trim) != Some("0")
-    }
-
-    /// Developer kill switch `HIPFIRE_EP_SHARE_HOST` for sharing one pinned host copy of a
-    /// replicated host-mapped weight (the EP embedding table) between the ranks of one
-    /// process. Default on; exactly `0` pins one private copy per rank as before.
-    pub fn ep_share_host() -> bool {
-        parse_ep_share_host(process_value("HIPFIRE_EP_SHARE_HOST").as_deref())
-    }
-
-    /// Pure truth table behind [`ep_share_host`]: only a trimmed `0` is off.
-    pub fn parse_ep_share_host(raw: Option<&str>) -> bool {
-        raw.map(str::trim) != Some("0")
     }
 
     /// Environment variable of the hot-unit loan's sidecar: [`ep_hot_units`].
@@ -13785,17 +13959,6 @@ pub mod memory {
             assert_eq!(OffloadExec::Pcie.to_string(), "pcie");
             assert_eq!(OffloadExec::Cpu.to_string(), "cpu");
             assert_eq!(OffloadExec::Passback.to_string(), "passback");
-        }
-
-        #[test]
-        fn qwen4_direct_load_is_default_on_and_only_zero_is_off() {
-            assert!(parse_qwen4_direct_load(None));
-            assert!(parse_qwen4_direct_load(Some("")));
-            assert!(parse_qwen4_direct_load(Some("1")));
-            assert!(parse_qwen4_direct_load(Some(" 1 ")));
-            assert!(parse_qwen4_direct_load(Some("true")));
-            assert!(!parse_qwen4_direct_load(Some("0")));
-            assert!(!parse_qwen4_direct_load(Some(" 0 ")));
         }
 
         #[test]

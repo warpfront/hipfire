@@ -42,14 +42,10 @@ pub const RAON_SELECTOR_EPS: f32 = 1e-5;
 
 /// Whether the mHC stream ping-pong planes are stored as BF16 bits (the values
 /// they carry are bf16-rounded at every write, so this is lossless and halves
-/// every four-stream pass). Default ON (bit-identical values); requires `HIPFIRE_RAON_MHC_FUSED` not `0` (the
-/// fused route+aggregate is the only reader besides the selector GEMM, postmix
-/// and mean) and `HIPFIRE_RAON_MHC_BF16_STREAMS=1`, and a geometry the fused
-/// kernel is instantiated for. `HIPFIRE_RAON_MHC_FUSED=0` kills both.
+/// every four-stream pass). Needs a geometry the fused route+aggregate kernel is
+/// instantiated for and BF16 selectors; otherwise the planes stay F32.
 pub fn bf16_streams_enabled(streams: usize, width: usize) -> bool {
     Gpu::stream_mix_route_aggregate_supported(streams, width)
-        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_FUSED", true)
-        && hipfire_config::developer_bool("HIPFIRE_RAON_MHC_BF16_STREAMS", true)
         && crate::weights::mhc_selectors_all_bf16()
 }
 
@@ -332,7 +328,7 @@ impl RaonMhcSite {
 
     /// [`Self::route`] then [`Self::aggregate`] as one stage (`pre/post/res` into
     /// `work`, `out[rows, width]` the normed aggregate). Bit-identical to the two
-    /// calls; with `HIPFIRE_RAON_MHC_FUSED=1` the old streams are read once.
+    /// calls; where the fused kernel is admitted the old streams are read once.
     pub fn route_aggregate(
         &self,
         gpu: &mut Gpu,

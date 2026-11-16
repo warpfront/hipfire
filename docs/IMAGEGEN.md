@@ -230,7 +230,7 @@ the table in the crate README lists them.
 
 - One image per request; `euler` (flow-match) is the only sampler, and
   `negative_prompt` is refused (no CFG pass).
-- FLUX.1 runs f16 activations by default (`HIPFIRE_FLUX_F16_ACT=0` for f32).
+- FLUX.1 runs f16 activations.
 - Width and height must be multiples of 16: the VAE factor is 8 and the
   latent is packed in 2x2 patches. Klein never upscales a reference image;
   it is area-capped at 1 MP.

@@ -143,7 +143,7 @@ impl RaonWork {
             + RdaScratch::required_bytes(&rda_geom, rows, chunked_rda_arch)
             + RaonMoeScratch::required_bytes(&moe_dims, rows)?
             + RaonDenseScratch::required_bytes(&moe_dims, rows)?
-            + RaonMlaWork::required_bytes(cfg, rows)?)
+            + RaonMlaWork::required_bytes(cfg, rows))
     }
 
     /// Allocate the module scratch for at most `rows` rows.
@@ -268,7 +268,7 @@ pub enum TapSite {
 
 /// Observer of the stream state (`[rows, streams, hidden]` F32 holding BF16
 /// values). Oracle only: a tap downloads and is not graph-capturable. With BF16
-/// stream planes (`HIPFIRE_RAON_MHC_BF16_STREAMS=1`) the forward widens them
+/// stream planes (`mhc::bf16_streams_enabled`) the forward widens them
 /// exactly into a temporary F32 tensor first, so a tap always sees F32.
 pub type LayerTap<'a> =
     &'a mut dyn FnMut(&mut Gpu, TapSite, &GpuTensor, usize) -> Result<(), String>;
