@@ -1322,9 +1322,8 @@ pub(crate) struct CohortProj {
 pub(crate) enum CohortDownScales {
     /// No routed expert carries a down scale: the plain silu+rotate producer.
     None,
-    /// Every routed expert carries one and the device pointer table exists.
-    /// Not admitted: the merged program has no per-expert AWQ silu+rotate
-    /// producer, so the scale would be dropped.
+    /// Every routed expert carries one and the device pointer table exists:
+    /// the per-expert AWQ silu+rotate producer.
     PerExpert,
     /// Some but not all (or all without the pointer table). Never admitted:
     /// a missing scale would silently change the layer's math.
@@ -1361,10 +1360,12 @@ pub(crate) struct CohortFacts {
     pub routed_down_scales: CohortDownScales,
 }
 
-/// Resolved cohort route for one layer. The merged program has one route:
-/// the plain silu+rotate expert-down producer.
+/// Resolved cohort route for one layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CohortPlan;
+pub(crate) struct CohortPlan {
+    /// Route the expert-down silu+rotate through the per-expert AWQ table.
+    pub down_awq: bool,
+}
 
 /// Why the cohort declined a layer. The reasons are fixed strings so a served
 /// model that misses the merged program says exactly what to change.
@@ -1404,7 +1405,7 @@ impl CohortDecline {
             Self::RoutedGateUpProj => "routed gate_up is not MQ4G256V2 [1024,2048]",
             Self::RoutedDownProj => "routed down is not MQ4G256V2 [2048,512]",
             Self::XnormScale => "an x_norm reader (router/shared/gate_up) carries an AWQ scale",
-            Self::RoutedDownScale => "routed down carries AWQ scales",
+            Self::RoutedDownScale => "routed down AWQ scales are partial or missing their table",
         }
     }
 }
@@ -1434,8 +1435,9 @@ pub(crate) fn cohort_precheck(n: usize, gfx1100: bool) -> Result<(), CohortDecli
 /// one activation basis: same dtype/shape, and either no AWQ scale or a scale
 /// the single rotate already applies. AWQ scales are per *input* channel, so
 /// the routed `gate_up` shares its scale with the router and the shared expert;
-/// a per-expert `down_proj` scale needs the indexed AWQ silu+rotate producer,
-/// which this program does not run, so it declines that scale too.
+/// a per-expert `down_proj` scale rides its own table and is applied by the
+/// indexed silu+rotate *before* the FWHT, which is why it is the one scale this
+/// program can carry today.
 pub(crate) fn cohort_admit(f: &CohortFacts) -> Result<CohortPlan, CohortDecline> {
     cohort_precheck(f.n, f.gfx1100)?;
     if f.dim != 2048 || f.mi != 512 || f.smi != 512 || f.k_top != 8 || f.n_exp != 256 {
@@ -1487,11 +1489,12 @@ pub(crate) fn cohort_admit(f: &CohortFacts) -> Result<CohortPlan, CohortDecline>
     if f.routed_gate_up_awq {
         return Err(CohortDecline::XnormScale);
     }
-    // down_proj reads a per-expert hidden, so its scale is per expert. This
-    // program only runs the plain silu+rotate producer, so any routed down
-    // scale (full or partial) stays on the per-slot program.
+    // down_proj reads a per-expert hidden, so its scale is per expert and is
+    // applied by the indexed silu+rotate. Partial coverage never rides the
+    // plain producer: that would drop a scale.
     match (f.routed_down_scales, down.awq) {
-        (CohortDownScales::None, false) => Ok(CohortPlan),
+        (CohortDownScales::None, false) => Ok(CohortPlan { down_awq: false }),
+        (CohortDownScales::PerExpert, true) => Ok(CohortPlan { down_awq: true }),
         _ => Err(CohortDecline::RoutedDownScale),
     }
 }
@@ -1506,7 +1509,8 @@ static SLOTS_COHORT_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::A
 /// Force the merged multi-slot MoE program on (`Some(true)`), off
 /// (`Some(false)`) or back to `HIPFIRE_MOE_SLOTS_COHORT` (`None`). Same shape
 /// as `rdna_compute::prefill_invariant::set_qwen4_wide_verify_rows_override`:
-/// a lab/oracle hook, not a production route.
+/// a lab/oracle hook, not a production route. `scripts/check_slots_moe_cohort.py`
+/// drives it through the engine A/B.
 pub fn set_slots_moe_cohort_override(on: Option<bool>) {
     SLOTS_COHORT_OVERRIDE.store(
         match on {
@@ -1534,13 +1538,15 @@ fn slots_cohort_enabled() -> bool {
 /// merged program must be diagnosable from its own serve log.
 /// One line per process for the first admitted layer. The decline path is
 /// logged the same way; without this, "the merged program ran" has no
-/// observable signal except its launch names.
-fn log_cohort_admit_once(layer: u16) {
+/// observable signal except its launch names, and `scripts/check_slots_moe_cohort.py`
+/// needs exactly that to prove each arm did what it claims.
+fn log_cohort_admit_once(layer: u16, plan: CohortPlan) {
     static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if LOGGED.set(()).is_ok() {
         eprintln!(
-            "[hipfire] slots MoE cohort: merged program admitted on layer {}",
-            layer
+            "[hipfire] slots MoE cohort: merged program admitted on layer {} \
+             (down_awq={})",
+            layer, plan.down_awq
         );
     }
 }
@@ -1642,8 +1648,8 @@ fn slots_moe_cohort(
             .any(|expert| expert.gate_up.awq_scale.is_some()),
         routed_down_scales,
     };
-    match cohort_admit(&facts) {
-        Ok(CohortPlan) => {}
+    let plan = match cohort_admit(&facts) {
+        Ok(plan) => plan,
         Err(decline) => {
             // `Rows` (one live row — the ordinary single-slot step) and `Arch`
             // (this program is gfx1100-only) mean the program does not apply,
@@ -1655,7 +1661,20 @@ fn slots_moe_cohort(
             return Ok(false);
         }
     };
-    log_cohort_admit_once(ffn.layer_idx);
+    log_cohort_admit_once(ffn.layer_idx, plan);
+    // Resolve the per-expert down-AWQ table here, before the first launch.
+    // Admission only reaches `down_awq` through `CohortDownScales::PerExpert`,
+    // which already requires the table, so this cannot be `None` in practice —
+    // but a serving daemon must fall back to the per-slot program rather than
+    // panic half-way through the layer's sequence if that invariant ever slips.
+    let down_awq_ptrs = if plan.down_awq {
+        match ffn.expert_down_awq_ptrs.as_ref() {
+            Some(ptrs) => Some(ptrs),
+            None => return Ok(false),
+        }
+    } else {
+        None
+    };
     let Some(logits) = pbs.moe_router_logits_batch.as_ref() else {
         return Ok(false);
     };
@@ -1757,7 +1776,24 @@ fn slots_moe_cohort(
         dim,
         n,
     )?;
-    gpu.fused_silu_mul_rotate_mq_batched(gate, up, rot, mi, n * k_top)?;
+    // AWQ: `down_proj` is pre-scaled by a per-expert `s`, so its input must be
+    // divided by that same table before the FWHT — the indexed producer does
+    // exactly that, at the same flat slot order (`tok * 8 + rank`) the slots
+    // gate/up GEMV wrote. Without scales this is the byte-identical plain
+    // producer.
+    if let Some(ptrs) = down_awq_ptrs {
+        gpu.fused_silu_mul_rotate_mq_awq_indexed_batched(
+            gate,
+            up,
+            ptrs,
+            topk_i,
+            rot,
+            mi,
+            n * k_top,
+        )?;
+    } else {
+        gpu.fused_silu_mul_rotate_mq_batched(gate, up, rot, mi, n * k_top)?;
+    }
     gpu.gemv_mq4g256v2_moe_ninepath_rpb8_slots_gfx1100(
         &ffn.expert_down_ptrs,
         topk_i,
@@ -5529,8 +5565,9 @@ pub fn forward_batch_slots_opts(
     }
     let n = batch.total_rows();
     // Per-step composition census, shared with the retained-PM4 body
-    // (`forward_batch_slots_redline`): a parity diff can then compare the exact
-    // live-row shape a step was given. `HIPFIRE_SLOT_TRACE=1` only, so it costs
+    // (`forward_batch_slots_redline`): a parity diff, or the cohort A/B in
+    // scripts/check_slots_moe_cohort.py, can then compare the exact live-row
+    // shape a step was given. `HIPFIRE_SLOT_TRACE=1` only, so it costs
     // nothing otherwise.
     if gpu.slot_trace() {
         eprintln!(
@@ -6152,11 +6189,14 @@ mod tests {
 
     #[test]
     fn cohort_admits_plain_v2_layer_without_down_awq() {
-        assert_eq!(cohort_admit(&cohort_base()), Ok(CohortPlan));
+        assert_eq!(
+            cohort_admit(&cohort_base()),
+            Ok(CohortPlan { down_awq: false })
+        );
     }
 
     #[test]
-    fn cohort_refuses_per_expert_down_awq_without_its_producer() {
+    fn cohort_admits_per_expert_down_awq() {
         let facts = CohortFacts {
             routed_down: Some(CohortProj {
                 awq: true,
@@ -6165,7 +6205,7 @@ mod tests {
             routed_down_scales: CohortDownScales::PerExpert,
             ..cohort_base()
         };
-        assert_eq!(cohort_admit(&facts), Err(CohortDecline::RoutedDownScale));
+        assert_eq!(cohort_admit(&facts), Ok(CohortPlan { down_awq: true }));
     }
 
     #[test]

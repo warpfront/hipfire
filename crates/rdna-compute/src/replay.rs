@@ -1375,6 +1375,25 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
+        // qt44/AWQ trunks (`.mq4r` with `awq_scale` sidecars) do NOT launch the
+        // `_f16` or `_wavegrid` twins: `awq_norm_kernel()` / `awq_norm_dec_kernel()`
+        // launch these two names, with the same six-pointer ABI as `_awq_f16`
+        // (x, weight, awq_scale, signs1, signs2, x_rot) followed by K and eps.
+        // Without the entry every AWQ layer's normalize+rotate recorded no
+        // effects, so the retained PM4 tape could not prove its boundaries were
+        // independent and emitted a compute-idle wait on both sides of it.
+        "fused_rmsnorm_mq_rotate_awq" | "fused_rmsnorm_mq_rotate_awq_g12dec" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+        ]),
+        // Standalone AWQ FWHT rotation (`rotate_x_mq_awq`, launched from
+        // scratch.rs): x, x_rot, awq_scale, signs1, signs2, then K. `mq_rotate_x`
+        // is the same launch one slot shorter (no awq_scale).
+        "rotate_x_mq_awq" => Some(vec![read(0), write(8), read(16), read(24), read(32)]),
         // The bounded-wait kernels (these two wavegrids and
         // `hc_compute_control_vec4_finalize`) end with an `hf_device_wait_block*`
         // that is deliberately not listed. It points at the Gpu-lifetime,
@@ -1629,6 +1648,29 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "softmax_f32" => Some(vec![write(0)]),
         "moe_topk_renorm_k8" => Some(vec![read(0), write(8), write(16)]),
         "fused_silu_mul_mq_rotate" => Some(vec![read(0), read(8), read(16), read(24), write(32)]),
+        // AWQ twins of the silu+FWHT producer. The single-scale form
+        // (gate, up, awq_scale, signs1, signs2, x_rot, K) is the shared/F1
+        // expert-down producer; the indexed form selects the scale per routed
+        // slot from a device pointer table (gate, up, ptrs, topk, signs1,
+        // signs2, x_rot, K, n_exp). Both run on the AWQ single-row program and
+        // the indexed one also on the multi-slot cohort.
+        "fused_silu_mul_mq_rotate_awq" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+        ]),
+        "fused_silu_mul_mq_rotate_awq_indexed" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            read(40),
+            write(48),
+        ]),
         "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
         | "gemv_mq4g256v2_xbatch_residual_sigmoid"
@@ -2187,10 +2229,15 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_asym_k_fwht3"
         | "kv_cache_write_q8_0_pair"
         | "mq_rotate_x"
+        | "rotate_x_mq_awq"
         | "repeat_interleave_qk_f32"
         | "rope_partial_halfsplit_f32"
         | "rope_partial_halfsplit_f32_headgrid"
         | "conv1d_gated_decode_f32" => Some(48),
+        // 6 pointers + K + eps = 56 explicit bytes, padded to 16 B. Same ABI as
+        // `fused_rmsnorm_mq_rotate_awq_f16`, plus nothing: the AWQ scale is its
+        // own pointer slot, which `_f16` also carries.
+        "fused_rmsnorm_mq_rotate_awq" | "fused_rmsnorm_mq_rotate_awq_g12dec" => Some(64),
         "conv1d_silu_split_f32_lanes" => Some(304),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
@@ -2210,6 +2257,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100"
         | "attention_q8_0_kv" => Some(64),
+        // 6 pointers + K = 52 explicit bytes, padded to 16 B.
+        "fused_silu_mul_mq_rotate_awq" => Some(64),
+        // 7 pointers + K + n_exp = 64 explicit bytes (already 16 B aligned).
+        "fused_silu_mul_mq_rotate_awq_indexed" => Some(64),
         // 10 pointers + eps + freq_base = 88 explicit bytes, padded to 16 B.
         "qwen35_fa_prep_kvwrite_gfx1100" => Some(96),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
@@ -10072,6 +10123,131 @@ mod tests {
                 "{reduce}"
             );
         }
+    }
+
+    #[test]
+    fn awq_rotate_launches_keep_typed_replay_contracts() {
+        use RecordedAccessMode::{Read, Write};
+        // gfx1100 qt44 AWQ trunk (`.mq4r` with `awq_scale` sidecars) launches
+        // these names, not the `_f16` / `_wavegrid` twins. A missing contract
+        // leaves them untyped (`no_effects`), and the retained PM4 tape then
+        // emits a compute-idle wait on both sides of every layer's rotate.
+        for kernel in [
+            "fused_rmsnorm_mq_rotate_awq",
+            "fused_rmsnorm_mq_rotate_awq_g12dec",
+        ] {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for _ in 0..6 {
+                blob.push_ptr(std::ptr::null());
+            }
+            blob.push_i32(2_048);
+            blob.push_f32(0.0);
+            assert_eq!(blob.len(), 56, "{kernel}");
+            blob.pad_to(16);
+            assert_eq!(expected_kernarg_bytes(kernel), Some(blob.len()), "{kernel}");
+            let modes: Vec<_> = pointer_effects(kernel)
+                .unwrap_or_else(|| panic!("{kernel} contract"))
+                .iter()
+                .map(|e| (e.offset, e.mode))
+                .collect();
+            assert_eq!(
+                modes,
+                vec![
+                    (0, Read),
+                    (8, Read),
+                    (16, Read),
+                    (24, Read),
+                    (32, Read),
+                    (40, Write)
+                ],
+                "{kernel}"
+            );
+        }
+
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(2_048);
+        assert_eq!(blob.len(), 44);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes("rotate_x_mq_awq"), Some(blob.len()));
+        let modes: Vec<_> = pointer_effects("rotate_x_mq_awq")
+            .expect("AWQ rotate contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![(0, Read), (8, Write), (16, Read), (24, Read), (32, Read)]
+        );
+    }
+
+    #[test]
+    fn awq_silu_launches_keep_typed_replay_contracts() {
+        use RecordedAccessMode::{Read, Write};
+        // The two AWQ expert-down silu+FWHT producers: the single-scale form
+        // (`fused_silu_mul_rotate_mq_awq` / `_batched`) and the per-expert
+        // indexed form the multi-slot cohort and the single-row AWQ program
+        // launch. Neither is in the `_f16`/wavegrid table, so without these
+        // entries a cold kernel pack records them as no-effects launches.
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..6 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(2_048);
+        assert_eq!(blob.len(), 52);
+        blob.pad_to(16);
+        assert_eq!(
+            expected_kernarg_bytes("fused_silu_mul_mq_rotate_awq"),
+            Some(blob.len())
+        );
+        let modes: Vec<_> = pointer_effects("fused_silu_mul_mq_rotate_awq")
+            .expect("AWQ silu contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                (0, Read),
+                (8, Read),
+                (16, Read),
+                (24, Read),
+                (32, Read),
+                (40, Write)
+            ]
+        );
+
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..7 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(2_048);
+        blob.push_i32(256);
+        assert_eq!(blob.len(), 64);
+        blob.pad_to(16);
+        assert_eq!(
+            expected_kernarg_bytes("fused_silu_mul_mq_rotate_awq_indexed"),
+            Some(blob.len())
+        );
+        let modes: Vec<_> = pointer_effects("fused_silu_mul_mq_rotate_awq_indexed")
+            .expect("AWQ indexed silu contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                (0, Read),
+                (8, Read),
+                (16, Read),
+                (24, Read),
+                (32, Read),
+                (40, Read),
+                (48, Write)
+            ]
+        );
     }
 
     #[test]
