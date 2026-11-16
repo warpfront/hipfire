@@ -2480,14 +2480,7 @@ mod tests {
 /// `gemm_f16_wmma_mb8` (the pre-LDS path); anything else (default `auto`)
 /// lets [`vit_lds_route`] pick the LDS-tiled WMMA GEMM. Read once.
 fn vit_gemm_mb8() -> bool {
-    use std::sync::LazyLock;
-    static MB8: LazyLock<bool> = LazyLock::new(|| {
-        matches!(
-            hipfire_config::developer_var("HIPFIRE_VIT_GEMM").as_deref(),
-            Ok("mb8")
-        )
-    });
-    *MB8
+    rdna_compute::FeatureFlags::process().vit_gemm.as_deref() == Some("mb8")
 }
 
 /// K granularity of the LDS GEMM entries (`K % 64 == 0`).
@@ -2731,11 +2724,10 @@ enum VitAttn {
 /// naive inside the dispatcher.
 fn select_vit_attn(gpu: &Gpu, head_dim: usize) -> HipResult<VitAttn> {
     let has_wmma = gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12();
-    let var = hipfire_config::developer_var("HIPFIRE_VIT_ATTN");
-    match var.as_deref() {
-        Ok("naive") => Ok(VitAttn::Naive),
-        Ok("qtiled") => Ok(VitAttn::QTiled),
-        Ok("wmma") => {
+    match gpu.flags.vit_attn.as_deref() {
+        Some("naive") => Ok(VitAttn::Naive),
+        Some("qtiled") => Ok(VitAttn::QTiled),
+        Some("wmma") => {
             if has_wmma && head_dim <= 80 {
                 Ok(VitAttn::Wmma)
             } else {

@@ -77,14 +77,16 @@ impl DecodeShareMode {
     /// only for an explicit request, so a load the default does not admit
     /// stays silent and exactly as today.
     pub fn explicit() -> bool {
-        hipfire_config::developer_var(DECODE_SHARE_ENV).is_ok()
+        rdna_compute::FeatureFlags::process()
+            .qwen4_decode_share
+            .is_some()
     }
 
     /// The mode from the process snapshot ([`DECODE_SHARE_ENV`]).
     pub fn from_env() -> Self {
         Self::parse(
-            hipfire_config::developer_var(DECODE_SHARE_ENV)
-                .ok()
+            rdna_compute::FeatureFlags::process()
+                .qwen4_decode_share
                 .as_deref(),
         )
     }

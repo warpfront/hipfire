@@ -3030,9 +3030,8 @@ pub fn forward_prefill_batch_ep(
                                                                                          // in Gpus (shared with TP), lazily sized to the largest count seen;
                                                                                          // rooted and unrooted share the same lease guard, so the canonical
                                                                                          // default introduces no new lease conflict.
-    let ep_peer_ar_var = hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE");
-    let ep_peer_ar = ep_peer_ar_var.as_deref();
-    let ep_ar_canonical = !matches!(ep_peer_ar, Ok("0") | Ok("1"));
+    let ep_peer_ar = gpus.devices[0].flags.ep_peer_allreduce;
+    let ep_ar_canonical = ep_peer_ar.is_none();
     let mut t_chunk = 0.0f64;
     let mut t_ar = 0.0f64;
     let mut t_add = 0.0f64;
@@ -3230,7 +3229,7 @@ pub fn forward_prefill_batch_ep(
                     "canonical rooted-peer (fixed left fold over ranks)"
                 } else if ep_ar_canonical {
                     "RCCL (canonical rooted-peer unavailable: peer access disabled)"
-                } else if ep_peer_ar == Ok("0") {
+                } else if ep_peer_ar == Some(false) {
                     "RCCL (HIPFIRE_EP_PEER_ALLREDUCE=0)"
                 } else {
                     "legacy unrooted peer (HIPFIRE_EP_PEER_ALLREDUCE=1)"
@@ -3243,7 +3242,7 @@ pub fn forward_prefill_batch_ep(
             } else if use_rooted {
                 gpus.all_reduce_sum_f32_peer_rooted(&refs, n * dim)
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
-            } else if ep_ar_canonical || ep_peer_ar == Ok("0") {
+            } else if ep_ar_canonical || ep_peer_ar == Some(false) {
                 gpus.all_reduce_sum_f32(&refs, n * dim)
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
             } else {

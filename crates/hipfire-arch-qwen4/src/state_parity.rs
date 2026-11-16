@@ -2981,7 +2981,7 @@ pub fn run_mtp_fill_digest(
             eprintln!("mtp-fill digest: length {length} start {prefix_len} seed {seed}");
         }
         Ok(json!({
-            "batched_fill": hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_BATCHED_FILL", true),
+            "batched_fill": rdna_compute::FeatureFlags::process().qwen4_mtp_batched_fill,
             "max_seq": max_seq,
             "warm_prefix": prefix_len,
             "rows": rows,

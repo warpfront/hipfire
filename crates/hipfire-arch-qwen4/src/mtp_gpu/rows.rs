@@ -39,11 +39,12 @@ use crate::program::Qwen4LayerScratch;
 /// pass per lane) are the draft's cost. `config` is the trunk config (the
 /// profile lives on it, not on the MTP geometry).
 pub(crate) fn draft_rounds_enabled(config: &Qwen4Config) -> bool {
-    hipfire_config::developer_bool(
-        MTP_DRAFT_ROUNDS_ENV,
-        hipfire_config::topology::qwen4_ep().is_ok_and(|ep| ep >= 2)
-            || config.profile.is_stock_fp8(),
-    )
+    rdna_compute::FeatureFlags::process()
+        .qwen4_mtp_draft_rounds
+        .unwrap_or_else(|| {
+            hipfire_config::topology::qwen4_ep().is_ok_and(|ep| ep >= 2)
+                || config.profile.is_stock_fp8()
+        })
 }
 
 /// `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS_XBATCH` (default on; `0` ranks every row

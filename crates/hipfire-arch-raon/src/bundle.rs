@@ -108,9 +108,12 @@ impl PrefillMode {
     /// `HIPFIRE_RAON_PREFILL` (`serial` | `batched`); unset means batched.
     /// Anything else is a named error, never a silent fallback.
     pub fn from_env() -> Result<Self, String> {
-        match hipfire_config::developer_var("HIPFIRE_RAON_PREFILL") {
-            Err(_) => Ok(Self::Batched),
-            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+        match rdna_compute::FeatureFlags::process()
+            .raon_prefill
+            .as_deref()
+        {
+            None => Ok(Self::Batched),
+            Some(v) => match v.trim().to_ascii_lowercase().as_str() {
                 "" | "batched" => Ok(Self::Batched),
                 "serial" => Ok(Self::Serial),
                 other => Err(format!(

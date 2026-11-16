@@ -2781,7 +2781,9 @@ impl<'a> LoadShape<'a> {
     ) -> Result<Self, String> {
         let explicit = crate::expert_residency::expert_vram_layers_from_env()
             .map_err(|error| format!("qwen4: {error}"))?;
-        let stage = hipfire_config::developer_var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV).ok();
+        let stage = rdna_compute::FeatureFlags::process()
+            .qwen4_expert_stage
+            .clone();
         Ok(Self {
             arch,
             unified_memory,

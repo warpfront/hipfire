@@ -95,7 +95,7 @@ pub fn forward_ep(
         })
         // The dump synchronizes and downloads inside the layer loop; it is a
         // deliberately direct diagnostic route, never a captured product path.
-        && hipfire_config::developer_var("HIPFIRE_EP_DUMP_POS").is_err();
+        && gpus.devices[0].flags.ep_dump_pos.is_none();
 
     if tp_graph_admitted {
         forward_ep_tp_graph(
@@ -383,13 +383,14 @@ fn forward_ep_direct(
     // Divergence-localization dump: HIPFIRE_EP_DUMP_POS="0,64,...,302" prints a
     // per-(position, layer, rank) fingerprint of the residual streams so EP
     // forwards can be compared across tp counts / arches. Diagnostic only.
-    let dump_pos_hit = hipfire_config::developer_var("HIPFIRE_EP_DUMP_POS")
-        .ok()
-        .map(|s| {
+    let dump_pos_hit = gpus.devices[0]
+        .flags
+        .ep_dump_pos
+        .as_deref()
+        .is_some_and(|s| {
             s.split(',')
                 .any(|x| x.trim().parse::<u32>() == Ok(position))
-        })
-        .unwrap_or(false);
+        });
     let t_layers = std::time::Instant::now();
     let program = ds4_lower_program();
     for l in 0..cfg.num_hidden_layers {

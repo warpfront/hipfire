@@ -3062,9 +3062,9 @@ pub fn qwen4_ep_vram_layers(
     if units_path.is_none() {
         // The D2 tail only exists over a per-expert unit plan: refuse before any load work.
         use hipfire_arch_qwen4::expert_unit_tail as tail;
-        let raw = hipfire_config::developer_var(tail::EP_UNIT_TAIL_ENV).ok();
+        let raw = gpu.flags.ep_unit_tail.as_deref();
         if raw.is_some()
-            && tail::parse_ep_unit_tail(raw.as_deref())
+            && tail::parse_ep_unit_tail(raw)
                 .map_err(|error| format!("qwen4: {error}"))?
                 .is_some()
         {
@@ -3783,8 +3783,8 @@ fn qwen4_ep_tail_borrow_publish(
         conflict,
     };
     let resolution = gf::resolve_ep_tail_borrow(
-        hipfire_config::developer_var(gf::EP_TAIL_BORROW_ENV)
-            .ok()
+        rdna_compute::FeatureFlags::process()
+            .qwen4_ep_tail_borrow
             .as_deref(),
         gf::EP_TAIL_BORROW_DEFAULT_ON,
         &facts,
@@ -3872,9 +3872,12 @@ fn qwen4_unit_borrow_restore_bytes(
 /// tail off. The same value serves the plan walk and the per-rank fit check.
 fn qwen4_ep_unit_tail_delta_mib(unit_bytes: u64) -> Result<i64, String> {
     use hipfire_arch_qwen4::expert_unit_tail as tail;
-    let raw = hipfire_config::developer_var(tail::EP_UNIT_TAIL_ENV).ok();
-    let config =
-        tail::resolve_ep_unit_tail(raw.as_deref()).map_err(|error| format!("qwen4: {error}"))?;
+    let config = tail::resolve_ep_unit_tail(
+        rdna_compute::FeatureFlags::process()
+            .ep_unit_tail
+            .as_deref(),
+    )
+    .map_err(|error| format!("qwen4: {error}"))?;
     Ok(config.map_or(0, |config| {
         tail::ep_unit_tail_budget_delta_mib(&config, unit_bytes)
     }))
@@ -3897,8 +3900,8 @@ fn qwen4_ep_units_flag(
 ) -> Option<std::path::PathBuf> {
     use hipfire_arch_qwen4::expert_ep_units as units;
     let policy = units::ep_units_policy(
-        hipfire_config::developer_var(units::EP_EXPERT_HOTSET_ENV)
-            .ok()
+        rdna_compute::FeatureFlags::process()
+            .qwen4_ep_expert_hotset
             .as_deref(),
     );
     let sidecar = match src {
@@ -4155,8 +4158,8 @@ fn qwen4_ep_hot_loan(
         return Ok(None);
     }
     let tail_on = hipfire_arch_qwen4::expert_unit_tail::resolve_ep_unit_tail(
-        hipfire_config::developer_var(hipfire_arch_qwen4::expert_unit_tail::EP_UNIT_TAIL_ENV)
-            .ok()
+        rdna_compute::FeatureFlags::process()
+            .ep_unit_tail
             .as_deref(),
     )
     .map_err(|error| format!("qwen4: {error}"))?
@@ -5694,11 +5697,9 @@ pub fn qwen4_preload_resource_plan(
         // Component envelope only: without measuring the ordinary host link,
         // include the possible borrowed-stage owner unless explicitly off.
         // This does not select a stage or enter placement's charged reserve.
-        stage_enabled: hipfire_config::developer_var(
-            hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV,
-        )
-        .ok()
-        .as_deref()
+        stage_enabled: rdna_compute::FeatureFlags::process()
+            .qwen4_expert_stage
+            .as_deref()
             != Some("0"),
         num_hidden_layers: config.num_hidden_layers,
         num_experts: config.num_experts,
@@ -6273,11 +6274,9 @@ fn preload_s1_union(
         explicit_vram_layers: explicit,
         hotset_sidecar,
         whole_first,
-        stage_opt_out: hipfire_config::developer_var(
-            hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV,
-        )
-        .ok()
-        .as_deref()
+        stage_opt_out: rdna_compute::FeatureFlags::process()
+            .qwen4_expert_stage
+            .as_deref()
             == Some("0"),
         npu_trunk,
         chunk_rows_env: chunk_rows_env.as_deref(),
@@ -7572,9 +7571,7 @@ fn load_qwen4_rank_unscoped(
     let slowlink_profile = {
         use hipfire_arch_qwen4::slowlink_admission as s1;
         let chunk_rows_env = hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS").ok();
-        let stage_env =
-            hipfire_config::developer_var(hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV)
-                .ok();
+        let stage_env = ctx.gpu.flags.qwen4_expert_stage.clone();
         // Sealed layout/panel/codec/kernel verdicts admit before
         // materialization (never the recipe name or a raw offload veto); an
         // actually CPU-split sealed selection refuses at the dispatch gate.

@@ -933,7 +933,7 @@ fn print_step_family_profile(
 /// hatch when a numeric question needs the f32 oracle, not the normal route
 /// (the host encode is 54.9 s per prompt at real geometry).
 pub fn text_encoders_on_gpu() -> bool {
-    hipfire_config::developer_var("HIPFIRE_T5_GPU").map_or(true, |v| v != "0")
+    rdna_compute::FeatureFlags::process().t5_gpu
 }
 
 /// Final-head adaLN chunk order for a checkpoint family.

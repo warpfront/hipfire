@@ -82,7 +82,11 @@ impl RollbackMode {
     /// The process default, read once.
     pub fn process_default() -> Result<Self, String> {
         static MODE: LazyLock<Result<RollbackMode, String>> = LazyLock::new(|| {
-            RollbackMode::parse(hipfire_config::developer_var(ROLLBACK_ENV).ok().as_deref())
+            RollbackMode::parse(
+                rdna_compute::FeatureFlags::process()
+                    .raon_dflash_rollback
+                    .as_deref(),
+            )
         });
         MODE.clone()
     }

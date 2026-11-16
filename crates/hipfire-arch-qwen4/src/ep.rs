@@ -800,8 +800,7 @@ fn install_unit_tail(
     peer_board: &Mutex<Option<Arc<crate::expert_unit_tail::PeerBoard>>>,
 ) -> Result<(), String> {
     use crate::expert_unit_tail as tail;
-    let raw = hipfire_config::developer_var(tail::EP_UNIT_TAIL_ENV).ok();
-    let Some(config) = tail::resolve_ep_unit_tail(raw.as_deref())? else {
+    let Some(config) = tail::resolve_ep_unit_tail(gpu.flags.ep_unit_tail.as_deref())? else {
         return Ok(());
     };
     let Some(plan) = bundle.weights.ep_unit_plan() else {

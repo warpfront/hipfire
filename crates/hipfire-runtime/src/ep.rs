@@ -86,13 +86,15 @@ enum DecodeArMode {
     Rccl,
 }
 
-static DECODE_AR_MODE: std::sync::LazyLock<DecodeArMode> = std::sync::LazyLock::new(|| {
-    match hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() {
-        Ok("1") => DecodeArMode::LegacyPeer,
-        Ok("0") => DecodeArMode::Rccl,
-        _ => DecodeArMode::Canonical,
+impl DecodeArMode {
+    fn from_flag(flag: Option<bool>) -> Self {
+        match flag {
+            Some(true) => Self::LegacyPeer,
+            Some(false) => Self::Rccl,
+            None => Self::Canonical,
+        }
     }
-});
+}
 
 fn all_reduce_sum_f32_decode(
     gpus: &mut Gpus,
@@ -107,7 +109,7 @@ fn all_reduce_sum_f32_decode(
             .all_reduce_sum_f32_peer_rooted_leased(lease, refs, count)
             .map_err(hip_err);
     }
-    let mode = *DECODE_AR_MODE;
+    let mode = DecodeArMode::from_flag(gpus.devices[0].flags.ep_peer_allreduce_decode);
     let use_rooted = mode == DecodeArMode::Canonical && gpus.peer_access_enabled;
     // Selection log line: names the active path (once per process).
     static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
