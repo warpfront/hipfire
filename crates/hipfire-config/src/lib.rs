@@ -3014,6 +3014,88 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_QKVZA_SPLIT_TAIL",
         "Enable the RDNA3 QKVZA split-tail prefill route."
     ),
+    // Kept kernel-side developer flags given typed keys (HIPF-430 stage 1). Their
+    // env spellings keep the exact legacy grammar (see `load_env_layer`); TOML and
+    // `config set` use the schema boolean grammar.
+    process_bool_field!(
+        "kernel.cb_verify_pm",
+        "cb_verify_pm",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_CB_VERIFY_PM",
+        "Run the 64..=128-row exact wide-verify kernels from the embedded PeaceMaker bundle (default on; false or HIPFIRE_CB_VERIFY_PM=0 runs their byte-identical hipcc twins). Only meaningful with the wide verify route (HIPFIRE_CB_VERIFY_CHUNK128)."
+    ),
+    process_bool_field!(
+        "kernel.draft_collapse_off",
+        "draft_collapse_off",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_DRAFT_COLLAPSE_OFF",
+        "Kill switch of the DFlash draft GEMM launch collapse (gfx1100 rotate-to-F16 + overwrite GEMMs, gfx1201 draft overwrite GEMM); true restores the scalar draft embeddings and memset + residual."
+    ),
+    process_bool_field!(
+        "kernel.hidden_scatter_fuse_off",
+        "hidden_scatter_fuse_off",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_HIDDEN_SCATTER_FUSE_OFF",
+        "Kill switch of the fused DFlash hidden-ring scatter kernels; true restores the per-row copy loops (byte-identical reference arm)."
+    ),
+    process_bool_field!(
+        "kernel.gate_up_bt",
+        "gate_up_bt",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_GATE_UP_BT",
+        "Batch-tiled (bt4/bt8/bt12) gfx12 MQ V2 WMMA projection kernels for 64+ rows (default on); false keeps the one-tile (bt1) kernel at every batch. Pinned off by the certified gfx1201 batched Redline profile."
+    ),
+    process_bool_field!(
+        "kernel.a4_slab",
+        "a4_slab",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_A4_SLAB",
+        "gfx1201 B-1 slab layout of the A4 activation producers and `_b1s` consumers (default on, byte-identical); false keeps the token-order block_i4_128 layout."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_moe_ep_a8",
+        "qwen4_moe_ep_a8",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_MOE_EP_A8",
+        "Qwen4 Flash-Next A8 routed-MoE chain on exact gfx1201: auto (default) runs it only inside expert-parallel forwards below the owner-routed floor; true runs it in every forward it serves; false keeps the A4 chain everywhere."
+    ),
+    process_bool_field!(
+        "attention.qwen4_qsa_wmma_gather",
+        "qwen4_qsa_wmma_gather",
+        Attention,
+        true,
+        true,
+        "HIPFIRE_QWEN4_QSA_WMMA_GATHER",
+        "Qwen4 QSA prefill attention chunks past the dense route run the gathered F16 WMMA kernels (gfx1151 F32/q8 state, gfx1201 fp8 state; default on); false keeps the hg4 kernel."
+    ),
+    process_bool_field!(
+        "attention.qwen4_qsa_pooled_bf16",
+        "qwen4_qsa_pooled_bf16",
+        Attention,
+        true,
+        true,
+        "HIPFIRE_QWEN4_QSA_POOLED_BF16",
+        "Derived BF16 mirror of the Qwen4 QSA pooled index keys for the PM BF16 score kernel (exact gfx1151, F32 state, index_dim 128; default on); false scores from the F32 keys."
+    ),
+    diagnostic_field!(
+        "diagnostic.dump_hidden",
+        "dump_hidden",
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        "HIPFIRE_DUMP_HIDDEN",
+        "File prefix of the hidden-state / router-logit dumps; set (even empty) arms the dump and vetoes the fusions that would hide the dumped tensors."
+    ),
     process_field!(
         "attention.ck_runtime_lib",
         "ck_runtime_lib",
@@ -4245,6 +4327,81 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "the Qwen4 compact capture ring kill switch was removed (HIPF-396)",
         replacement: "none; the capture ring always uses the compact rows + 1 slot layout",
+    },
+    // Developer spellings of the kept flags promoted to typed keys (HIPF-430). The
+    // typed key owns the `HIPFIRE_*` spelling, so a `[developer]` entry would be
+    // silently ignored; fail it with the replacement instead.
+    RetiredConfigKey {
+        key: "developer.cb_verify_pm",
+        legacy_key: "developer.cb_verify_pm",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_CB_VERIFY_PM is unchanged",
+        replacement: "kernel.cb_verify_pm",
+    },
+    RetiredConfigKey {
+        key: "developer.draft_collapse_off",
+        legacy_key: "developer.draft_collapse_off",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_DRAFT_COLLAPSE_OFF is unchanged",
+        replacement: "kernel.draft_collapse_off",
+    },
+    RetiredConfigKey {
+        key: "developer.hidden_scatter_fuse_off",
+        legacy_key: "developer.hidden_scatter_fuse_off",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_HIDDEN_SCATTER_FUSE_OFF is unchanged",
+        replacement: "kernel.hidden_scatter_fuse_off",
+    },
+    RetiredConfigKey {
+        key: "developer.gate_up_bt",
+        legacy_key: "developer.gate_up_bt",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_GATE_UP_BT is unchanged",
+        replacement: "kernel.gate_up_bt",
+    },
+    RetiredConfigKey {
+        key: "developer.a4_slab",
+        legacy_key: "developer.a4_slab",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_A4_SLAB is unchanged",
+        replacement: "kernel.a4_slab",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_moe_ep_a8",
+        legacy_key: "developer.qwen4_moe_ep_a8",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_MOE_EP_A8 is unchanged",
+        replacement: "kernel.qwen4_moe_ep_a8",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_qsa_wmma_gather",
+        legacy_key: "developer.qwen4_qsa_wmma_gather",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_QSA_WMMA_GATHER is unchanged",
+        replacement: "attention.qwen4_qsa_wmma_gather",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_qsa_pooled_bf16",
+        legacy_key: "developer.qwen4_qsa_pooled_bf16",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_QSA_POOLED_BF16 is unchanged",
+        replacement: "attention.qwen4_qsa_pooled_bf16",
+    },
+    RetiredConfigKey {
+        key: "developer.dump_hidden",
+        legacy_key: "developer.dump_hidden",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_DUMP_HIDDEN is unchanged",
+        replacement: "diagnostic.dump_hidden",
     },
 ];
 
@@ -6331,6 +6488,37 @@ fn normalize_lane_row_exact_env(raw: &str) -> &'static str {
     }
 }
 
+/// The exact legacy env grammar of the kept developer flags promoted to typed
+/// keys (HIPF-430): each raw value maps to the value the old `developer_*` /
+/// `FeatureFlags` reader produced, so an env setting behaves as before
+/// (unrecognised spellings included; none fails the load). `None`: the schema
+/// grammar of the key applies.
+fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
+    Some(match legacy_key {
+        // `parse_legacy_flag_bool(..).unwrap_or(true)`: only its false spellings are off.
+        "cb_verify_pm" => {
+            ConfigValue::Bool(!matches!(raw, "0" | "false" | "FALSE" | "off" | "OFF"))
+        }
+        // `== "1"`.
+        "draft_collapse_off" | "hidden_scatter_fuse_off" => ConfigValue::Bool(raw == "1"),
+        // `!= "0" && !is_empty()`.
+        "gate_up_bt" => ConfigValue::Bool(!matches!(raw, "0" | "")),
+        // `developer_bool(name, true)`: only exact `0` is off.
+        "a4_slab" | "qwen4_qsa_wmma_gather" | "qwen4_qsa_pooled_bf16" => {
+            ConfigValue::Bool(raw != "0")
+        }
+        // Trimmed exact `1` / `0`; anything else is the load-conditional default.
+        "qwen4_moe_ep_a8" => match raw.trim() {
+            "1" => ConfigValue::Bool(true),
+            "0" => ConfigValue::Bool(false),
+            _ => ConfigValue::String("auto".to_owned()),
+        },
+        // Presence arms the dump; the value (even empty or `null`) is the file prefix.
+        "dump_hidden" => ConfigValue::String(raw.to_owned()),
+        _ => return None,
+    })
+}
+
 pub fn load_env_layer() -> Result<ConfigLayer> {
     let mut layer = ConfigLayer::default();
     let mut stable_names = BTreeSet::new();
@@ -6350,7 +6538,10 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
             ("dflash_ngram_block", "1") => ConfigValue::Bool(true),
             ("prompt_normalize", "0" | "false" | "off" | "no") => ConfigValue::Bool(false),
             ("prompt_normalize", _) => ConfigValue::Bool(true),
-            _ => field.parse_cli(&raw)?,
+            _ => match promoted_flag_env_value(field.legacy_key, &raw) {
+                Some(value) => value,
+                None => field.parse_cli(&raw)?,
+            },
         };
         layer.set(field.key, value)?;
     }
@@ -7266,6 +7457,61 @@ mod tests {
             assert_eq!(parse_developer_bool(Some(""), default), default);
             assert_eq!(parse_developer_bool(Some("2"), default), default);
         }
+    }
+
+    /// The env spelling of each flag promoted in HIPF-430 resolves, through the
+    /// typed key and its rendered `HIPFIRE_*` value, to what the old reader
+    /// returned for the raw string; no spelling fails the load.
+    #[test]
+    fn promoted_flag_env_values_keep_the_legacy_reader_grammar() {
+        let inputs = [
+            "", "0", "1", " 1", "0 ", "true", "false", "TRUE", "FALSE", "True", "False", "on",
+            "off", "ON", "OFF", "yes", "no", "2", "garbage", "null", "auto",
+        ];
+        let on = |key: &str, raw: &str| {
+            let schema = FIELDS.iter().find(|f| f.legacy_key == key).unwrap();
+            let value = promoted_flag_env_value(key, raw).unwrap();
+            schema.validate(&value).unwrap();
+            render_compat_value(&value)
+        };
+        for raw in inputs {
+            for key in ["a4_slab", "qwen4_qsa_wmma_gather", "qwen4_qsa_pooled_bf16"] {
+                let want = parse_developer_bool(Some(raw), true);
+                assert_eq!(on(key, raw).as_deref() == Some("1"), want, "{key}={raw:?}");
+            }
+            for key in ["draft_collapse_off", "hidden_scatter_fuse_off"] {
+                assert_eq!(
+                    on(key, raw).as_deref() == Some("1"),
+                    raw == "1",
+                    "{key}={raw:?}"
+                );
+            }
+            let gate_up_bt = raw != "0" && !raw.is_empty();
+            assert_eq!(
+                on("gate_up_bt", raw).as_deref() == Some("1"),
+                gate_up_bt,
+                "{raw:?}"
+            );
+            let cb_off = matches!(raw, "0" | "false" | "FALSE" | "off" | "OFF");
+            assert_eq!(
+                on("cb_verify_pm", raw).as_deref() == Some("1"),
+                !cb_off,
+                "{raw:?}"
+            );
+            let ep_a8 = match raw.trim() {
+                "1" => "1",
+                "0" => "0",
+                _ => "auto",
+            };
+            assert_eq!(
+                on("qwen4_moe_ep_a8", raw).as_deref(),
+                Some(ep_a8),
+                "{raw:?}"
+            );
+            assert_eq!(on("dump_hidden", raw).as_deref(), Some(raw));
+        }
+        // Keys outside the promoted set keep the schema grammar.
+        assert_eq!(promoted_flag_env_value("fp16", "0"), None);
     }
 
     const SYM_IU4_KEY: &str = "developer.qwen4_moe_sym_iu4";

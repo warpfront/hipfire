@@ -12739,7 +12739,7 @@ impl Qwen4GpuForward {
             )
             .map_err(invalid)?;
             match sym_iu4_kill_verdict(
-                hipfire_config::developer_typed_bool("HIPFIRE_QWEN4_MOE_SYM_IU4"),
+                gpu.flags.qwen4_moe_sym_iu4,
                 gpu.qwen4_moe_sym_kernel().is_some(),
                 bundle.weights.ep_placement().is_some(),
             ) {

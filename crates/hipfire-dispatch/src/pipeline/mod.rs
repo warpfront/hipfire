@@ -2022,9 +2022,8 @@ pub fn dump_hidden_localize(
     layer_idx: usize,
     tag: &str,
 ) {
-    let prefix = match hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
-        Ok(prefix) => prefix,
-        Err(_) => return,
+    let Some(prefix) = gpu.flags.dump_hidden.as_deref() else {
+        return;
     };
     // A readback cannot happen inside a window whose contents are being recorded
     // or replayed, nor while a hipGraph is capturing.
@@ -4503,7 +4502,7 @@ fn shared_down_collectors_active(gpu: &Gpu) -> bool {
     gpu.active_capture.is_some()
         || gpu.hessian_capture.is_some()
         || moe_dump::enabled()
-        || hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN").is_ok()
+        || gpu.flags.dump_hidden.is_some()
 }
 
 fn prefill_shared_down_sigmoid_epi_admitted(
@@ -4993,7 +4992,7 @@ fn decode_gate_side_stage(
                 && gpu.active_capture.is_none()
                 && gpu.hessian_capture.is_none()
                 && !moe_dump::enabled()
-                && hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN").is_err()
+                && gpu.flags.dump_hidden.is_none()
                 && p.ep_mode == crate::families::moe::MoeEpMode::None
                 && p.ep_row_gather.is_none()
             {
@@ -5192,7 +5191,7 @@ fn decode_route_gpu_stage(
     // Skipped for experts-only: no router ran, so the buffer holds
     // root-distributed IDs' stale logits, not this call's routing.
     if !skip_routing {
-        if let Ok(dump_path) = hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
+        if let Some(dump_path) = gpu.flags.dump_hidden.clone() {
             if gpu.hip.device_synchronize().is_ok() {
                 if let Ok(all) = gpu.download_f32(p.router_logits) {
                     use std::io::Write;

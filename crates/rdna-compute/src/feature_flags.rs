@@ -1029,6 +1029,37 @@ pub struct FeatureFlags {
     /// unless the value is exactly `0` (kill switch); acted on for exact gfx1100
     /// only (`qwen4_hc_mix_fill80_gfx1100_enabled`).
     pub qwen4_hc_mix_fill80_gfx1100: bool,
+
+    // ── Kept developer flags with typed keys (HIPF-430) ─────────────────
+    /// `HIPFIRE_GATE_UP_BT` / `kernel.gate_up_bt` (default on; `0` or empty is
+    /// off): the gfx12 MQ V2 WMMA projections take the bt4/bt8/bt12 batch tiles
+    /// at 64+ rows (`Gpu::ordinary_bt_tile`); off keeps bt1.
+    pub gate_up_bt: bool,
+    /// `HIPFIRE_A4_SLAB` / `kernel.a4_slab` (default on; exact `0` is off): the
+    /// gfx1201 B-1 slab A4 activation layout (`Gpu::a4_slab_active`).
+    pub a4_slab: bool,
+    /// `HIPFIRE_QWEN4_MOE_EP_A8` / `kernel.qwen4_moe_ep_a8`, tri-state: `None`
+    /// (unset / `auto` / any other value) follows the EP scope, `Some(true)` (trimmed
+    /// exact `1`) forces the A8 chain, `Some(false)` (trimmed exact `0`) kills it.
+    pub qwen4_moe_ep_a8: Option<bool>,
+    /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER` / `attention.qwen4_qsa_wmma_gather`
+    /// (default on; exact `0` is off): `tensor_ops::qsa_gathered_wmma_enabled`.
+    pub qwen4_qsa_wmma_gather: bool,
+    /// `HIPFIRE_QWEN4_QSA_POOLED_BF16` / `attention.qwen4_qsa_pooled_bf16`
+    /// (default on; exact `0` is off): `qsa_pooled_bf16_mirror_enabled`.
+    pub qwen4_qsa_pooled_bf16: bool,
+    /// `HIPFIRE_QWEN4_MOE_SYM_IU4` / `developer.qwen4_moe_sym_iu4`, typed
+    /// boolean: `None` unset (the arch descriptor's `default_requested`), else
+    /// the value (`Gpu::qwen4_moe_sym_iu4_requested`).
+    pub qwen4_moe_sym_iu4: Option<bool>,
+    /// `HIPFIRE_NO_DEVICE_COMPILER` / `diagnostic.compiler.no_device_compiler`:
+    /// treat the device compiler as absent. The compiler probe runs without a
+    /// `Gpu`, so it reads [`Self::no_device_compiler_from_active_config`].
+    pub no_device_compiler: bool,
+    /// `HIPFIRE_DUMP_HIDDEN` / `diagnostic.dump_hidden`: file prefix of the
+    /// hidden-state / router-logit dumps. `Some` (even empty) arms the dump and
+    /// vetoes the fusions that would hide the dumped tensors.
+    pub dump_hidden: Option<String>,
 }
 
 /// `HIPFIRE_QWEN4_MOE_GLUE_FOLD` sub-fold X8a: the owner tile mask (`ep_tile_mask_pm`) is
@@ -1102,6 +1133,11 @@ pub fn resolve_graph_ar(raw: Option<&str>, arch: &str, windows: bool) -> bool {
     }
 }
 
+/// `HIPFIRE_NO_DEVICE_COMPILER` grammar: set to anything but `0` or empty.
+fn no_device_compiler(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v != "0" && !v.is_empty())
+}
+
 impl FeatureFlags {
     pub fn from_process_config(arch: &str, config: &ProcessConfig) -> Self {
         Self::from_lookup(arch, |name| config.legacy_value(name).ok_or(()))
@@ -1109,6 +1145,17 @@ impl FeatureFlags {
 
     pub fn from_active_config(arch: &str) -> Self {
         Self::from_process_config(arch, hipfire_config::active_or_local_process_config())
+    }
+
+    /// [`Self::no_device_compiler`] of the active process config, for the
+    /// device-compiler probe (`KernelCompiler::new`, `local_toolchain_id`),
+    /// which runs before and without a `Gpu`.
+    pub fn no_device_compiler_from_active_config() -> bool {
+        no_device_compiler(
+            hipfire_config::active_or_local_process_config()
+                .legacy_value("HIPFIRE_NO_DEVICE_COMPILER")
+                .as_deref(),
+        )
     }
 
     fn from_lookup(arch: &str, value: impl Fn(&str) -> std::result::Result<String, ()>) -> Self {
@@ -1736,6 +1783,25 @@ impl FeatureFlags {
                 .ok()
                 .as_deref()
                 != Some("0"),
+            gate_up_bt: value("HIPFIRE_GATE_UP_BT").map_or(true, |v| v != "0" && !v.is_empty()),
+            a4_slab: value("HIPFIRE_A4_SLAB").ok().as_deref() != Some("0"),
+            qwen4_moe_ep_a8: match value("HIPFIRE_QWEN4_MOE_EP_A8").as_deref().map(str::trim) {
+                Ok("1") => Some(true),
+                Ok("0") => Some(false),
+                _ => None,
+            },
+            qwen4_qsa_wmma_gather: value("HIPFIRE_QWEN4_QSA_WMMA_GATHER").ok().as_deref()
+                != Some("0"),
+            qwen4_qsa_pooled_bf16: value("HIPFIRE_QWEN4_QSA_POOLED_BF16").ok().as_deref()
+                != Some("0"),
+            qwen4_moe_sym_iu4: hipfire_config::typed_developer_bool_value(
+                "HIPFIRE_QWEN4_MOE_SYM_IU4",
+                value("HIPFIRE_QWEN4_MOE_SYM_IU4").ok().as_deref(),
+            ),
+            no_device_compiler: no_device_compiler(
+                value("HIPFIRE_NO_DEVICE_COMPILER").ok().as_deref(),
+            ),
+            dump_hidden: value("HIPFIRE_DUMP_HIDDEN").ok(),
         }
     }
 
@@ -2648,6 +2714,14 @@ impl FeatureFlags {
             mq6_resid_port_gfx1100: false,
             qwen4_qsa_hg4_q8_lite: false,
             qwen4_hc_mix_fill80_gfx1100: false,
+            gate_up_bt: false,
+            a4_slab: false,
+            qwen4_moe_ep_a8: None,
+            qwen4_qsa_wmma_gather: false,
+            qwen4_qsa_pooled_bf16: false,
+            qwen4_moe_sym_iu4: None,
+            no_device_compiler: false,
+            dump_hidden: None,
         }
     }
 }

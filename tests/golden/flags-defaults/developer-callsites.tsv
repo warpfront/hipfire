@@ -23,7 +23,6 @@ developer_callsite	*	HIPFIRE_A4_ATTN_EPI#developer_bool=true
 developer_callsite	*	HIPFIRE_A4_FA_GATE_IL#developer_bool=true
 developer_callsite	*	HIPFIRE_A4_HIN_TOKFAST#developer_bool=true
 developer_callsite	*	HIPFIRE_A4_RMS_FDIV#developer_bool=true
-developer_callsite	*	HIPFIRE_A4_SLAB#developer_bool=true
 developer_callsite	*	HIPFIRE_A8_APF_K32#developer_bool=false
 developer_callsite	*	HIPFIRE_ALLOW_BF16_QUANTIZED_TARGET#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_ALLOW_MQ2_LLOYD#developer_var=ok.as_deref.==Some("1")
@@ -187,9 +186,6 @@ developer_callsite	*	HIPFIRE_DSPARK_ZERO_CTX#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_DTOD_DUMP#developer_bool=false
 developer_callsite	*	HIPFIRE_DTOD_DUMP#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DTOH_DUMP#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_DUMP_HIDDEN#developer_var=-
-developer_callsite	*	HIPFIRE_DUMP_HIDDEN#developer_var=is_err
-developer_callsite	*	HIPFIRE_DUMP_HIDDEN#developer_var=is_ok
 developer_callsite	*	HIPFIRE_DUMP_HIDDEN_POS#developer_var=ok.and_then.unwrap_or(0usize)
 developer_callsite	*	HIPFIRE_E8_DGPU_TWIN#developer_bool=false
 developer_callsite	*	HIPFIRE_E8_GFX12#developer_var=ok.as_deref.==Some("1")
@@ -299,7 +295,6 @@ developer_callsite	*	HIPFIRE_G942_ROWS16_CHAIN#developer_bool=true
 developer_callsite	*	HIPFIRE_G942_TRUNK_GEMV#developer_bool=false
 developer_callsite	*	HIPFIRE_GATED_DELTA_VECTOR_CHUNKED#developer_bool=true
 developer_callsite	*	HIPFIRE_GATED_DELTA_VECTOR_PM#developer_bool=true
-developer_callsite	*	HIPFIRE_GATE_UP_BT#developer_var=map.unwrap_or(true)
 developer_callsite	*	HIPFIRE_GDN_BLK#developer_var=ok.and_then.map.unwrap_or(128)
 developer_callsite	*	HIPFIRE_GDN_CHUNKED#developer_var=map.unwrap_or(false)
 developer_callsite	*	HIPFIRE_GDN_CHUNK_PM#developer_bool=true
@@ -544,7 +539,6 @@ developer_callsite	*	HIPFIRE_MTP_SNAPSHOT_OVERLAP#developer_var=-
 developer_callsite	*	HIPFIRE_MTP_TRACE#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_MTP_TRACE#developer_var=map.unwrap_or(false)
 developer_callsite	*	HIPFIRE_MTP_VERIFY_DECOUPLE#developer_var=ok
-developer_callsite	*	HIPFIRE_NO_DEVICE_COMPILER#developer_var_os=is_some_and
 developer_callsite	*	HIPFIRE_NO_Q8_ROUTER#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_NO_SPILL#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_NPU_TRUNK_PACK_A_PM#developer_bool=true
@@ -683,7 +677,6 @@ developer_callsite	*	HIPFIRE_QWEN4_MOE_DOWN_C8_PM_BLOCKS#developer_var=ok.and_th
 developer_callsite	*	HIPFIRE_QWEN4_MOE_DOWN_DNI#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_MOE_DOWN_TWIN#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE#developer_bool=true
-developer_callsite	*	HIPFIRE_QWEN4_MOE_EP_A8#developer_var=as_deref.map
 developer_callsite	*	HIPFIRE_QWEN4_MOE_EP_A8_NT#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_QWEN4_MOE_FRONT_FUSE#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_MOE_GATEUP_TWIN#developer_bool=true
@@ -694,7 +687,6 @@ developer_callsite	*	HIPFIRE_QWEN4_MOE_GU_C8_PM_BLOCKS#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_QWEN4_MOE_GU_FEW_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_MOE_ROUTE_SCATTER#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_MOE_SYM_DOWN_RR#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_QWEN4_MOE_SYM_IU4#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_QWEN4_MOE_SYM_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_MQ4_ROWS_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_MQ4_X4_PM#developer_bool=true
@@ -730,14 +722,12 @@ developer_callsite	*	HIPFIRE_QWEN4_QSA_FILTER_FEW_ROWS32#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_QSA_LANES_FUSE#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_NORM_EPI#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_PM#developer_bool=true
-developer_callsite	*	HIPFIRE_QWEN4_QSA_POOLED_BF16#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SCORE_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SCORE_ROWS32#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SELECT_EXACT#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SELECT_PM#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SELECT_PM_DECODE#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_QSA_SPLIT_GFX1100#developer_bool=true
-developer_callsite	*	HIPFIRE_QWEN4_QSA_WMMA_GATHER#developer_bool=true
 developer_callsite	*	HIPFIRE_QWEN4_REQUANT#developer_var=-
 developer_callsite	*	HIPFIRE_QWEN4_REQUANT#developer_var=ok
 developer_callsite	*	HIPFIRE_QWEN4_ROUTE_TRACE#developer_var=ok.filter

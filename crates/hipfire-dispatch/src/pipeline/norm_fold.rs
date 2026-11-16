@@ -41,7 +41,7 @@ pub(super) fn launchable(gpu: &Gpu) -> bool {
         && gpu.hessian_capture.is_none()
         && gpu.active_capture.is_none()
         && !super::moe_dump::enabled()
-        && hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN").is_err()
+        && gpu.flags.dump_hidden.is_none()
 }
 
 /// A MQ4G256V2 projection weight the fold can stream: hidden 2048, no AWQ.

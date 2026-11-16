@@ -42,14 +42,6 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 
-/// Developer switch of the A8 EP chain. Unset: ON only inside an expert-parallel prefill forward
-/// BELOW the owner-routed floor ([`Gpu::qwen4_ep_a8_scope`]: the sub-512-row prompts on the
-/// lowered-floor tile route, where it is quality-neutral vs the exact route); every >= 512-row
-/// forward and the single-card chain keep A4 (A8 measured +4.4% pp4096 prefill time there with no
-/// measurable KLD gain). Exact `1`: on in every forward the chain serves; exact `0`: the kill
-/// switch (the A4 chain everywhere).
-pub const QWEN4_MOE_EP_A8_FLAG: &str = "HIPFIRE_QWEN4_MOE_EP_A8";
-
 /// Developer switch of the wide-verify int8 routed-MoE chain of the Qwen4 Flash-Next EP2 decode /
 /// verify path (exact gfx1201, source rows in the g32 window [`Gpu::moe_wide_verify_rows`]: 9..=64): this
 /// module's A8 gate/up + down kernels and the BF16-row grouped combine replace the g32 gate/up, the
@@ -80,18 +72,8 @@ const ROT_COLS_PER_CTA: usize = 128;
 /// Developer override of the tile-run width (`1` or `2`; unset or anything else: [`ep_a8_select_nt`]).
 pub const QWEN4_MOE_EP_A8_NT_ENV: &str = "HIPFIRE_QWEN4_MOE_EP_A8_NT";
 
-static EP_A8: LazyLock<Option<bool>> = LazyLock::new(|| {
-    match hipfire_config::developer_var(QWEN4_MOE_EP_A8_FLAG)
-        .as_deref()
-        .map(str::trim)
-    {
-        Ok("1") => Some(true),
-        Ok("0") => Some(false),
-        _ => None,
-    }
-});
 /// `HIPFIRE_QWEN4_MOE_GU_A8`, parsed once: exact `1` / `0`, anything else (unset and `2` included) is `None`
-/// (the default: on). Same parse as [`EP_A8`]; the `2` (unmasked) half is [`GU_A8_UNMASKED`].
+/// (the default: on). Same parse as `FeatureFlags::qwen4_moe_ep_a8`; the `2` (unmasked) half is [`GU_A8_UNMASKED`].
 static GU_A8: LazyLock<Option<bool>> = LazyLock::new(|| {
     match hipfire_config::developer_var(QWEN4_MOE_GU_A8_FLAG)
         .as_deref()
@@ -330,13 +312,22 @@ impl Gpu {
 }
 
 impl Gpu {
-    /// Whether the EP owner-routed symmetric MoE prefill chain runs its A8 kernels
-    /// (default on, `HIPFIRE_QWEN4_MOE_EP_A8=0` kills it; exact gfx1201, eager: never while a graph is captured or a replay
-    /// recorded, where a lazy int8-scratch growth would invalidate the capture and the A4 chain's
-    /// pre-reserved scratch is the one in force). Flag read once per process.
+    /// Whether the EP owner-routed symmetric MoE prefill chain runs its A8 kernels: exact gfx1201,
+    /// eager (never while a graph is captured or a replay recorded, where a lazy int8-scratch growth
+    /// would invalidate the capture and the A4 chain's pre-reserved scratch is the one in force),
+    /// and `HIPFIRE_QWEN4_MOE_EP_A8` / `kernel.qwen4_moe_ep_a8` (`FeatureFlags::qwen4_moe_ep_a8`,
+    /// tri-state). Unset (`auto`): on only inside an expert-parallel prefill forward BELOW the
+    /// owner-routed floor ([`Gpu::qwen4_ep_a8_scope`]: the sub-512-row prompts on the lowered-floor
+    /// tile route, where it is quality-neutral vs the exact route); every >= 512-row forward and
+    /// the single-card chain keep A4 (A8 measured +4.4% pp4096 prefill time there with no
+    /// measurable KLD gain). Exact `1`: on in every forward the chain serves; exact `0`: the kill
+    /// switch (the A4 chain everywhere).
     pub fn qwen4_moe_ep_a8_requested(&self) -> bool {
-        ep_a8_requested(&self.arch, *EP_A8, self.qwen4_ep_a8_scope)
-            && !self.graphs.capture_mode
+        ep_a8_requested(
+            &self.arch,
+            self.flags.qwen4_moe_ep_a8,
+            self.qwen4_ep_a8_scope,
+        ) && !self.graphs.capture_mode
             && !self.replay.is_recording()
     }
 
@@ -363,7 +354,9 @@ impl Gpu {
         // Load-time (no forward scope yet): the caller is the EP load, so the unset flag counts as on.
         // The wide-verify chain (`HIPFIRE_QWEN4_MOE_GU_A8`) reads the same scratch, so it reserves
         // it even when the prefill switch is off.
-        if !ep_a8_requested(&self.arch, *EP_A8, true) && !gu_a8_enabled(&self.arch, *GU_A8) {
+        if !ep_a8_requested(&self.arch, self.flags.qwen4_moe_ep_a8, true)
+            && !gu_a8_enabled(&self.arch, *GU_A8)
+        {
             return Ok(());
         }
         // The wide-verify window never exceeds the chunk cap, but a smaller `max_rows` must still
@@ -973,7 +966,6 @@ mod tests {
         for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", ""] {
             assert!(!ep_a8_requested(arch, Some(true), true), "{arch}");
         }
-        assert_eq!(QWEN4_MOE_EP_A8_FLAG, "HIPFIRE_QWEN4_MOE_EP_A8");
     }
 
     /// `HIPFIRE_QWEN4_MOE_GU_A8`: default on (unset / exact `1`), exact `0` kills, exact gfx1201 only,

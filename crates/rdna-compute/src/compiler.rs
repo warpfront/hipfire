@@ -543,9 +543,9 @@ fn probe_device_compiler() -> DeviceCompilerProbe {
     // of PATH, which silently defeated PATH-shadowing and made
     // "pin these exact code objects" quietly recompile instead. Verified:
     // a pinned cross-machine run reported 0 recompiles while actually
-    // executing locally-built blobs.
-    let disabled = hipfire_config::developer_var_os("HIPFIRE_NO_DEVICE_COMPILER")
-        .is_some_and(|v| v != "0" && !v.is_empty());
+    // executing locally-built blobs. The probe runs before and without a
+    // `Gpu`, so it reads the resolved process config through `FeatureFlags`.
+    let disabled = crate::feature_flags::FeatureFlags::no_device_compiler_from_active_config();
 
     let hipcc_out = if disabled || resolved_hipcc.is_none() {
         None

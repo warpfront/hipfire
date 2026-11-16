@@ -331,6 +331,37 @@ binary/registry locations, kernel cache, spill directory, and quant diagnostic
 output. Examples and tests may still inject compatibility variables before
 startup.
 
+### Kept developer flags with typed keys (HIPF-430)
+
+Developer flags kept on purpose by the HIPF-396 sweeps get a typed,
+process-scoped key whose env spelling is the flag, and a `FeatureFlags` field
+resolved once at GPU init; code reads the field, never the environment. The
+field type follows the flag: a plain switch is a `bool` key and field, a
+tri-state is an `auto`/`true`/`false` key and an `Option<bool>` field (`None` =
+the load- or arch-conditional default), a value-carrying flag is a nullable
+string key and an `Option<String>` field. A key added this way keeps the exact
+legacy grammar of its environment variable (see
+[`env-vars.md`](env-vars.md#manual--kept-developer-flags-kernel-side-hipf-430)),
+while `config set` and TOML use the schema grammar. The `[developer]` spelling it
+replaces is a removed key that fails the load and names the replacement (see
+[Lifecycle status](#lifecycle-status)). Restart the daemon after changing one.
+
+| Key | Env | Default | Effect |
+|---|---|---|---|
+| `kernel.cb_verify_pm` | `HIPFIRE_CB_VERIFY_PM` | `true` | `false` runs the byte-identical hipcc `_k32` twins of the 64..=128-row wide-verify kernels instead of the PeaceMaker bundle. |
+| `kernel.draft_collapse_off` | `HIPFIRE_DRAFT_COLLAPSE_OFF` | `false` | `true` disables the DFlash draft GEMM launch collapse (reference arm). |
+| `kernel.hidden_scatter_fuse_off` | `HIPFIRE_HIDDEN_SCATTER_FUSE_OFF` | `false` | `true` restores the DFlash hidden-ring row-copy loops (reference arm). |
+| `kernel.gate_up_bt` | `HIPFIRE_GATE_UP_BT` | `true` | `false` keeps the one-tile (bt1) gfx12 MQ V2 WMMA projection kernel at every batch; pinned by `docs/configs/batched-redline-pm4-product.toml`. |
+| `kernel.a4_slab` | `HIPFIRE_A4_SLAB` | `true` | `false` keeps the token-order gfx1201 A4 activation layout instead of the B-1 slab layout (byte-identical values). |
+| `kernel.qwen4_moe_ep_a8` | `HIPFIRE_QWEN4_MOE_EP_A8` | `"auto"` | Qwen4 A8 routed-MoE chain on exact gfx1201: `auto` inside EP prefill below the owner-routed floor only, `true` in every forward it serves, `false` never. |
+| `attention.qwen4_qsa_wmma_gather` | `HIPFIRE_QWEN4_QSA_WMMA_GATHER` | `true` | `false` keeps Qwen4 QSA prefill attention on the hg4 kernel instead of the gathered F16 WMMA route. |
+| `attention.qwen4_qsa_pooled_bf16` | `HIPFIRE_QWEN4_QSA_POOLED_BF16` | `true` | `false` drops the BF16 mirror of the pooled QSA index keys (exact gfx1151). |
+| `diagnostic.dump_hidden` | `HIPFIRE_DUMP_HIDDEN` | `null` | A file prefix arms the hidden-state / router-logit dumps (the empty string too). |
+
+The kept flags that already had a key are documented with them:
+`kernel.fp16`, `kernel.rocblas_off`, `kernel.hfq4g128_mmq`, `kernel.iu4_prefill`,
+`diagnostic.compiler.no_device_compiler` and `developer.qwen4_moe_sym_iu4`.
+
 ### Qwen4 expert-parallel and NPU controls
 
 Typed schema keys (process-scoped, except `topology.ep_ar_wire`, which is per load):
@@ -2273,16 +2304,27 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.ep_balanced_owners` | `ep_balanced_owners` | 0.4.2 | 0.5.0 | none; balanced owners are always used where balanced ownership is admitted |
 | `developer.ep_owner_routed_prefill` | `ep_owner_routed_prefill` | 0.4.2 | 0.5.0 | none; owner-routed prefill runs wherever its admission conditions hold |
 | `developer.qwen4_append_wmma` | `qwen4_append_wmma` | 0.4.3 | 0.5.0 | none; the WMMA append route runs on gfx1151 prefill chunks of 48 to 511 rows when the prefill PM invariant is off (`HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS` moves the lower bound) |
+| `developer.cb_verify_pm` | `developer.cb_verify_pm` | 0.4.2 | 0.5.0 | `kernel.cb_verify_pm` (HIPF-430; `HIPFIRE_CB_VERIFY_PM` unchanged) |
+| `developer.draft_collapse_off` | `developer.draft_collapse_off` | 0.3.1 | 0.5.0 | `kernel.draft_collapse_off` (HIPF-430; `HIPFIRE_DRAFT_COLLAPSE_OFF` unchanged) |
+| `developer.hidden_scatter_fuse_off` | `developer.hidden_scatter_fuse_off` | 0.3.1 | 0.5.0 | `kernel.hidden_scatter_fuse_off` (HIPF-430; `HIPFIRE_HIDDEN_SCATTER_FUSE_OFF` unchanged) |
+| `developer.gate_up_bt` | `developer.gate_up_bt` | 0.3.1 | 0.5.0 | `kernel.gate_up_bt` (HIPF-430; `HIPFIRE_GATE_UP_BT` unchanged) |
+| `developer.a4_slab` | `developer.a4_slab` | 0.4.0 | 0.5.0 | `kernel.a4_slab` (HIPF-430; `HIPFIRE_A4_SLAB` unchanged) |
+| `developer.qwen4_moe_ep_a8` | `developer.qwen4_moe_ep_a8` | 0.4.5 | 0.5.0 | `kernel.qwen4_moe_ep_a8` (HIPF-430; `HIPFIRE_QWEN4_MOE_EP_A8` unchanged) |
+| `developer.qwen4_qsa_wmma_gather` | `developer.qwen4_qsa_wmma_gather` | 0.4.1 | 0.5.0 | `attention.qwen4_qsa_wmma_gather` (HIPF-430; `HIPFIRE_QWEN4_QSA_WMMA_GATHER` unchanged) |
+| `developer.qwen4_qsa_pooled_bf16` | `developer.qwen4_qsa_pooled_bf16` | 0.4.3 | 0.5.0 | `attention.qwen4_qsa_pooled_bf16` (HIPF-430; `HIPFIRE_QWEN4_QSA_POOLED_BF16` unchanged) |
+| `developer.dump_hidden` | `developer.dump_hidden` | 0.3.1 | 0.5.0 | `diagnostic.dump_hidden` (HIPF-430; `HIPFIRE_DUMP_HIDDEN` unchanged) |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 269 schema keys, plus the `developer.<name>` namespace.
+**Count:** 278 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
 | `attention.ck_runtime_lib` | `ck_runtime_lib` | `HIPFIRE_FLASH_ATTN_CK_LIB` | experimental |
 | `attention.ck_workspace_bytes` | `ck_workspace_bytes` | `HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES` | experimental |
 | `attention.flash` | `flash_mode` | `HIPFIRE_ATTN_FLASH` | stable |
+| `attention.qwen4_qsa_pooled_bf16` | `qwen4_qsa_pooled_bf16` | `HIPFIRE_QWEN4_QSA_POOLED_BF16` | experimental |
+| `attention.qwen4_qsa_wmma_gather` | `qwen4_qsa_wmma_gather` | `HIPFIRE_QWEN4_QSA_WMMA_GATHER` | experimental |
 | `attention.yarn_factor` | `yarn_factor` | `HIPFIRE_YARN_FACTOR` | stable |
 | `decide.calibration.choice` | `decide_calibration_choice` |  | stable |
 | `decide.calibration.noul` | `decide_calibration_noul` |  | stable |
@@ -2292,6 +2334,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `diagnostic.compiler.no_device_compiler` | `no_device_compiler` | `HIPFIRE_NO_DEVICE_COMPILER` | experimental |
 | `diagnostic.draft_gemm_dump` | `draft_gemm_dump` | `HIPFIRE_DRAFT_GEMM_DUMP` | experimental |
 | `diagnostic.draft_subphase` | `draft_subphase` | `HIPFIRE_DRAFT_SUBPHASE` | experimental |
+| `diagnostic.dump_hidden` | `dump_hidden` | `HIPFIRE_DUMP_HIDDEN` | experimental |
 | `diagnostic.gemm_dump` | `gemm_dump` | `HIPFIRE_GEMM_DUMP` | experimental |
 | `diagnostic.kernel.fp16_layer_max` | `fp16_layer_max` | `HIPFIRE_FP16_LAYER_MAX` | experimental |
 | `diagnostic.kernel.fp16_layer_min` | `fp16_layer_min` | `HIPFIRE_FP16_LAYER_MIN` | experimental |
@@ -2352,11 +2395,14 @@ branch) or a misspelled key is unknown and fails the load with
 | `hardware.tp_use_rccl` | `tp_use_rccl` | `HIPFIRE_TP_USE_RCCL` | stable |
 | `hardware.uniform_vram_tolerance_gb` | `uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | stable |
 | `image.decode` | `image_decode` | `HIPFIRE_IMAGE_DECODE` | stable |
+| `kernel.a4_slab` | `a4_slab` | `HIPFIRE_A4_SLAB` | experimental |
 | `kernel.attn_qresident` | `attn_qresident` | `HIPFIRE_ATTN_QRESIDENT` | stable |
 | `kernel.attn_qresident_v2` | `attn_qresident_v2` | `HIPFIRE_ATTN_QRESIDENT_V2` | stable |
 | `kernel.calib_force_bf16` | `calib_force_bf16` | `HIPFIRE_CALIB_BF16` | experimental |
+| `kernel.cb_verify_pm` | `cb_verify_pm` | `HIPFIRE_CB_VERIFY_PM` | experimental |
 | `kernel.deterministic` | `deterministic` | `HIPFIRE_DETERMINISTIC` | experimental |
 | `kernel.dot2_gemv` | `dot2_gemv` | `HIPFIRE_DOT2_GEMV` | experimental |
+| `kernel.draft_collapse_off` | `draft_collapse_off` | `HIPFIRE_DRAFT_COLLAPSE_OFF` | experimental |
 | `kernel.draft_shared_ctx_kv_rotation` | `draft_shared_ctx_kv_rotation` | `HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION` | stable |
 | `kernel.draft_shared_ffn_rotation` | `draft_shared_ffn_rotation` | `HIPFIRE_DRAFT_SHARED_FFN_ROTATION` | stable |
 | `kernel.draft_shared_qkv_rotation` | `draft_shared_qkv_rotation` | `HIPFIRE_DRAFT_SHARED_QKV_ROTATION` | stable |
@@ -2366,6 +2412,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.g12_a4c2` | `g12_a4c2` | `HIPFIRE_G12_A4C2` | stable |
 | `kernel.g12_dec_norm` | `g12_dec_norm` | `HIPFIRE_G12_DEC_NORM` | stable |
 | `kernel.g12_norm` | `g12_norm` | `HIPFIRE_G12_NORM` | stable |
+| `kernel.gate_up_bt` | `gate_up_bt` | `HIPFIRE_GATE_UP_BT` | experimental |
 | `kernel.gate_up_nosync` | `gate_up_nosync` | `HIPFIRE_GATE_UP_NOSYNC` | experimental |
 | `kernel.gcn5_wave64_hybrid` | `gcn5_wave64_hybrid` | `HIPFIRE_GCN5_WAVE64_HYBRID` | experimental |
 | `kernel.gemma4_batched_embedding_prefill` | `gemma4_batched_embedding_prefill` | `HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL` | experimental |
@@ -2410,6 +2457,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.hfq4_mmq_gfx906_y64` | `hfq4_mmq_gfx906_y64` | `HIPFIRE_HFQ4_MMQ_GFX906_Y64` | experimental |
 | `kernel.hfq4_mmq_rdna2` | `hfq4_mmq_rdna2` | `HIPFIRE_HFQ4_MMQ_RDNA2` | experimental |
 | `kernel.hfq4g128_mmq` | `hfq4g128_mmq` | `HIPFIRE_HFQ4G128_MMQ` | stable |
+| `kernel.hidden_scatter_fuse_off` | `hidden_scatter_fuse_off` | `HIPFIRE_HIDDEN_SCATTER_FUSE_OFF` | experimental |
 | `kernel.iu4_prefill` | `iu4_prefill` | `HIPFIRE_IU4_PREFILL` | stable |
 | `kernel.lloyd_force_baseline` | `lloyd_force_baseline` | `HIPFIRE_LLOYD_FORCE_BASELINE` | experimental |
 | `kernel.lm_head_f16` | `lm_head_f16` | `HIPFIRE_LM_HEAD_F16` | stable |
@@ -2430,6 +2478,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.prefill_batched` | `prefill_batched` | `HIPFIRE_PREFILL_BATCHED` | stable |
 | `kernel.q8_batched_legacy` | `q8_batched_legacy` | `HIPFIRE_Q8_BATCHED_LEGACY` | experimental |
 | `kernel.qkvza_split_tail` | `qkvza_split_tail` | `HIPFIRE_QKVZA_SPLIT_TAIL` | experimental |
+| `kernel.qwen4_moe_ep_a8` | `qwen4_moe_ep_a8` | `HIPFIRE_QWEN4_MOE_EP_A8` | experimental |
 | `kernel.rdna3_hfq4_lm_head_k2048` | `rdna3_hfq4_lm_head_k2048` | `HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048` | experimental |
 | `kernel.rdna3_hfq4_moe_gate_up_k2048` | `rdna3_hfq4_moe_gate_up_k2048` | `HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048` | experimental |
 | `kernel.rdna3_hfq4_qkv_wave64` | `rdna3_hfq4_qkv_wave64` | `HIPFIRE_RDNA3_HFQ4_QKV_WAVE64` | experimental |
