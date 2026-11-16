@@ -400,6 +400,9 @@ fn run(raw: &[String]) -> Result<()> {
     // `scratch.tmp` is the last row's post-output-norm hidden (the head's input),
     // left by the legacy last-token path of the final chunk.
     let (_, hidden_raw) = download(&gpu, &bundle.scratch.tmp, dim, "last hidden row")?;
+    // The single prefill→decode seal at the actual prompt end, as serving does
+    // (`DeltaNetState::seal_streams`); decode refuses an Open GDN stream.
+    bundle.dn_state.seal_streams(&mut gpu, n)?;
 
     let mut generated: Vec<u32> = Vec::with_capacity(GREEDY_TOKENS);
     let mut decode_logits: Vec<u8> = Vec::new();

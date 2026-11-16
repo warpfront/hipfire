@@ -765,6 +765,10 @@ fn dump(args: &[String]) -> Result<()> {
     manifest
         .graph_witnesses
         .push(graph_witness(&gpu, "post_prefill".into()));
+    // The single prefill→decode seal at the actual prompt end, as serving does
+    // (`DeltaNetState::seal_streams`), after the prefill snapshot; the
+    // teacher-forced continuation refuses an Open GDN stream.
+    dn.seal_streams(&mut gpu, rows)?;
     for pos in rows..total {
         qwen35::forward_scratch(
             &mut gpu,
