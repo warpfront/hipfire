@@ -2945,29 +2945,35 @@ fn moe_dtypes_mq6() -> MoeDtypes<'static> {
 fn mq3v25_route_requires_marker_flag_multirow_and_exact_arch() {
     use crate::families::gemm::mq3v25_route;
     for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+        let consumer = matches!(arch, "gfx1100" | "gfx1201");
         let mut flags = rdna_compute::FeatureFlags::for_test(arch);
         flags.iu4_prefill = Some(true);
-        let default_on = arch == "gfx1201";
-        assert_eq!(mq3v25_route(&flags, true, 8192, 4096), default_on, "{arch}");
-        assert!(!mq3v25_route(&flags, false, 8192, 4096), "{arch}");
-        assert!(!mq3v25_route(&flags, true, 1, 4096), "{arch}");
-
-        flags.mq3v25_a4 = Some(true);
-        let forced_on = matches!(arch, "gfx1100" | "gfx1201");
-        assert_eq!(mq3v25_route(&flags, true, 8192, 4096), forced_on, "{arch}");
-        assert!(!mq3v25_route(&flags, false, 8192, 4096), "{arch}");
-        assert!(!mq3v25_route(&flags, true, 1, 4096), "{arch}");
-        if arch == "gfx1100" {
-            assert!(!mq3v25_route(&flags, true, 8192, 4100));
-            assert!(!mq3v25_route(&flags, true, 64, 4096));
-        }
-        if arch == "gfx1201" {
-            // Speculative-verify widths stay on the fp16 WMMA route; A4 from 17 rows.
-            for n in [2, 3, 4, 8, 16] {
-                assert!(!mq3v25_route(&flags, true, n, 4096), "n={n}");
+        for a4 in [None, Some(true)] {
+            flags.mq3v25_a4 = a4;
+            assert_eq!(
+                mq3v25_route(&flags, true, 8192, 4096),
+                consumer,
+                "{arch} {a4:?}"
+            );
+            assert!(!mq3v25_route(&flags, false, 8192, 4096), "{arch}");
+            assert!(!mq3v25_route(&flags, true, 1, 4096), "{arch}");
+            if arch == "gfx1100" {
+                assert!(!mq3v25_route(&flags, true, 127, 4096));
+                assert!(mq3v25_route(&flags, true, 128, 4096));
+                assert!(mq3v25_route(&flags, true, 129, 4096));
+                assert!(mq3v25_route(&flags, true, 4097, 4096));
+                assert!(mq3v25_route(&flags, true, 8193, 4096));
+                assert!(!mq3v25_route(&flags, true, 8192, 4100));
+                assert!(!mq3v25_route(&flags, true, 64, 4096));
             }
-            for n in [17, 24, 64, 8192] {
-                assert!(mq3v25_route(&flags, true, n, 4096), "n={n}");
+            if arch == "gfx1201" {
+                // Speculative-verify widths stay on the fp16 WMMA route; A4 from 17 rows.
+                for n in [2, 3, 4, 8, 16] {
+                    assert!(!mq3v25_route(&flags, true, n, 4096), "n={n}");
+                }
+                for n in [17, 24, 64, 8192] {
+                    assert!(mq3v25_route(&flags, true, n, 4096), "n={n}");
+                }
             }
         }
 

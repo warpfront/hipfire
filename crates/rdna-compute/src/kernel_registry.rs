@@ -3907,8 +3907,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     if arch == "gfx1100" {
-        // Symmetric qt49 MQ3V25 A4 full-tile consumer (`HIPFIRE_MQ3V25_A4=1`,
-        // `Gpu::gemm_mq3v25_residual_iu4`).
+        // Symmetric qt49 MQ3V25 A4 full-tile consumer (default on gfx1100;
+        // `HIPFIRE_MQ3V25_A4=0` kills; `Gpu::gemm_mq3v25_residual_iu4`).
         add!(
             "gemm_mq3v25_iu4_v2c_gfx1100",
             kernels::GEMM_MQ3V25_RESIDUAL_IU4_V2C_GFX11_SRC,

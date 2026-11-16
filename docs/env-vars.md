@@ -636,6 +636,7 @@ refused at load under PP; Single and EP session behavior is unchanged.
 | Variable | Notes |
 |---|---|
 | `HIPFIRE_GRAPH` | hipGraph capture opt-in (quality caveats; AR-oriented). Raon-1-mini (arch 19) decode defaults to a captured graph (one per admitted context bucket, replayed per token; re-recorded when the latent mapping or K/V mirror grows); `HIPFIRE_GRAPH=0` is the per-launch eager control. A failed capture is an error, never a silent eager fallback. |
+| `HIPFIRE_MQ3V25_A4` | Symmetric MQ3 (qt49, `mq3v2.symmetric`) W3A4 integer-WMMA prefill. Default on for exact gfx1100 and gfx1201 with a symmetric qt49 artifact; `=0` is the kill switch and restores the F16 route (as does `kernel.iu4_prefill=false`). gfx1151 and other arches stay F16. |
 | `HIPFIRE_VERIFY_GRAPH` / `_TIMING` / `_TREE` | verify-side graph diag |
 | `HIPFIRE_MMQ` / `HIPFIRE_WO_MMQ` | MMQ activation |
 | `HIPFIRE_MMQ_SCREEN` / `HIPFIRE_MMQ_SCREEN_THRESHOLD` / `HIPFIRE_MMQ_MIN_BATCH` | screening |

@@ -515,8 +515,9 @@ pub struct FeatureFlags {
     pub lloyd_mb4: Option<Mb4Mode>,
     pub mq3_mb4: Option<Mb4Mode>,
     /// Symmetric qt49 (MQ3V2 `mq3v2.symmetric`) W3A4 prefill override
-    /// (`HIPFIRE_MQ3V25_A4`). Unset follows the per-arch default of
-    /// [`Self::mq3v25_a4_enabled`]; `0` is the kill switch.
+    /// (`HIPFIRE_MQ3V25_A4`). Unset is on wherever a production consumer
+    /// exists (gfx1100, gfx1201; see [`Self::mq3v25_a4_enabled`]); `0` is the
+    /// kill switch; shares the `kernel.iu4_prefill` opt-out.
     pub mq3v25_a4: Option<bool>,
     /// Symmetric qt49 W3A8 prefill on exact gfx1201 (`HIPFIRE_MQ3V25_A8=1`,
     /// developer, default off). Wins over A4 when both are requested.
@@ -1768,18 +1769,28 @@ impl FeatureFlags {
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
 
+    /// Arches with a production MQ3V25 A4 consumer
+    /// (`Gpu::gemm_mq3v25_residual_iu4`): exact gfx1100 and gfx1201.
+    fn mq3v25_a4_consumer_arch(&self) -> bool {
+        matches!(self.arch.as_str(), "gfx1100" | "gfx1201")
+    }
+
     /// Symmetric qt49 W3A4 prefill for an artifact whose loader validated the
-    /// `mq3v2.symmetric` zero contract (`symmetric`). Shares the W4A4 opt-out
-    /// (`kernel.iu4_prefill`). Default on exact gfx1201; exact gfx1100 runs
-    /// only on `HIPFIRE_MQ3V25_A4=1`; every other arch keeps the F16 route.
+    /// `mq3v2.symmetric` zero contract (`symmetric`). Default on wherever the
+    /// consumer exists (exact gfx1100, gfx1201); `HIPFIRE_MQ3V25_A4=0` is the
+    /// kill switch and it shares the W4A4 opt-out (`kernel.iu4_prefill`).
+    /// gfx1151 and every other arch keep the F16 route. Known trade on gfx1100:
+    /// the V2C GEMMs engage only from 128 rows, but this predicate also selects
+    /// the wide route's static GDN chunk-scan recipe, so prompts under 128
+    /// tokens prefill slower than the F16 route (measured: -4.5% prefill at
+    /// pp127, +7.1% TTFT at 44 tokens). The GDN recipe is fixed once per
+    /// prefix, so a short follow-up turn on a cached prefix may pay the same
+    /// cost (not measured).
     pub fn mq3v25_a4_enabled(&self, symmetric: bool) -> bool {
         symmetric
             && self.iu4_prefill_enabled()
-            && match self.arch.as_str() {
-                "gfx1201" => self.mq3v25_a4.unwrap_or(true),
-                "gfx1100" => self.mq3v25_a4.unwrap_or(false),
-                _ => false,
-            }
+            && self.mq3v25_a4_consumer_arch()
+            && self.mq3v25_a4.unwrap_or(true)
     }
 
     /// Symmetric qt49 W3A8 prefill: explicit developer opt-in on exact
@@ -2989,6 +3000,29 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1151").fn_lane_pm_rows_enabled());
+    }
+
+    /// MQ3V25 A4 is default-on on the arches with a consumer (gfx1100,
+    /// gfx1201); `Some(false)` and `iu4_prefill=false` kill it; gfx1151 and
+    /// others stay off even when forced.
+    #[test]
+    fn mq3v25_a4_defaults_on_consumer_arches_and_zero_kills() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let on = matches!(arch, "gfx1100" | "gfx1201");
+            let mut f = FeatureFlags::for_test(arch);
+            f.iu4_prefill = Some(true);
+            assert_eq!(f.mq3v25_a4_enabled(true), on, "{arch}: unset");
+            assert!(!f.mq3v25_a4_enabled(false), "{arch}: asymmetric");
+            f.mq3v25_a4 = Some(true);
+            assert_eq!(f.mq3v25_a4_enabled(true), on, "{arch}: 1");
+            f.mq3v25_a4 = Some(false);
+            assert!(!f.mq3v25_a4_enabled(true), "{arch}: 0");
+            f.mq3v25_a4 = None;
+            f.iu4_prefill = Some(false);
+            assert!(!f.mq3v25_a4_enabled(true), "{arch}: iu4 off");
+        }
     }
 
     /// The MQ6 split rows kernels default on for exact gfx1201 / gfx1100: `0`
