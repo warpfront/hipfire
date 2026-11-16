@@ -261,32 +261,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -296,32 +285,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -334,32 +312,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -369,32 +336,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -407,32 +363,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -442,32 +387,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -480,32 +414,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -515,32 +438,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -751,32 +663,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -784,32 +685,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -819,32 +709,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -852,32 +731,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -890,32 +758,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -923,32 +780,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -958,32 +804,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -991,32 +826,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1029,32 +853,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1062,32 +875,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1097,32 +899,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1130,32 +921,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1168,32 +948,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1201,32 +970,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1236,32 +994,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1269,32 +1016,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1553,32 +1289,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1588,32 +1313,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1621,32 +1335,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1656,32 +1359,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1691,32 +1383,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1724,32 +1405,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1762,32 +1432,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1797,32 +1456,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1830,32 +1478,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1865,32 +1502,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1900,32 +1526,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1933,32 +1548,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -1971,32 +1575,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2006,32 +1599,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2039,32 +1621,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2074,32 +1645,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2109,32 +1669,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2142,32 +1691,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2180,32 +1718,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2215,32 +1742,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2248,32 +1764,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2283,32 +1788,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2318,32 +1812,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2351,32 +1834,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2679,32 +2151,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2714,32 +2175,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2749,32 +2199,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2782,32 +2221,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2817,32 +2245,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2852,32 +2269,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2887,32 +2293,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2920,32 +2315,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2958,32 +2342,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -2993,32 +2366,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3028,32 +2390,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3061,32 +2412,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3096,32 +2436,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3131,32 +2460,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3166,32 +2484,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3199,32 +2506,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3237,32 +2533,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3272,32 +2557,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3307,32 +2581,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3340,32 +2603,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3375,32 +2627,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3410,32 +2651,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3445,32 +2675,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3478,32 +2697,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3516,32 +2724,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3551,32 +2748,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3586,32 +2772,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3619,32 +2794,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3654,32 +2818,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3689,32 +2842,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3724,32 +2866,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -3757,32 +2888,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4132,32 +3252,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4167,32 +3276,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4202,32 +3300,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4237,32 +3324,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4270,32 +3346,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4305,32 +3370,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4340,32 +3394,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4375,32 +3418,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4410,32 +3442,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4443,32 +3464,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4481,32 +3491,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4516,32 +3515,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4551,32 +3539,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4586,32 +3563,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4619,32 +3585,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4654,32 +3609,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4689,32 +3633,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4724,32 +3657,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4759,32 +3681,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4792,32 +3703,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4830,32 +3730,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4865,32 +3754,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4900,32 +3778,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4935,32 +3802,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -4968,32 +3824,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5003,32 +3848,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5038,32 +3872,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5073,32 +3896,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5108,32 +3920,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5141,32 +3942,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5179,32 +3969,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5214,32 +3993,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5249,32 +4017,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5284,32 +4041,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5317,32 +4063,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5352,32 +4087,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5387,32 +4111,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5422,32 +4135,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5457,32 +4159,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5490,32 +4181,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5912,32 +4592,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5947,32 +4616,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -5982,32 +4640,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6017,32 +4664,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6052,32 +4688,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6085,32 +4710,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6120,32 +4734,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6155,32 +4758,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6190,32 +4782,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6225,32 +4806,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6260,32 +4830,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6293,32 +4852,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6331,32 +4879,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6366,32 +4903,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6401,32 +4927,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6436,32 +4951,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6471,32 +4975,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6504,32 +4997,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6539,32 +5021,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6574,32 +5045,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6609,32 +5069,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6644,32 +5093,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6679,32 +5117,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6712,32 +5139,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6750,32 +5166,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6785,32 +5190,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6820,32 +5214,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6855,32 +5238,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6890,32 +5262,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6923,32 +5284,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6958,32 +5308,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -6993,32 +5332,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7028,32 +5356,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7063,32 +5380,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7098,32 +5404,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7131,32 +5426,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7169,32 +5453,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7204,32 +5477,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7239,32 +5501,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7274,32 +5525,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7309,32 +5549,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7342,32 +5571,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7377,32 +5595,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7412,32 +5619,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7447,32 +5643,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7482,32 +5667,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7517,32 +5691,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -7550,32 +5713,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8019,32 +6171,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8054,32 +6195,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8089,32 +6219,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8124,32 +6243,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8159,32 +6267,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8194,32 +6291,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8227,32 +6313,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8262,32 +6337,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8297,32 +6361,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8332,32 +6385,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8367,32 +6409,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8402,32 +6433,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8437,32 +6457,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8470,32 +6479,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8508,32 +6506,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8543,32 +6530,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8578,32 +6554,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8613,32 +6578,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8648,32 +6602,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8683,32 +6626,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8716,32 +6648,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8751,32 +6672,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8786,32 +6696,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8821,32 +6720,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8856,32 +6744,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8891,32 +6768,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8926,32 +6792,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8959,32 +6814,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -8997,32 +6841,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9032,32 +6865,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9067,32 +6889,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9102,32 +6913,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9137,32 +6937,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9172,32 +6961,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9205,32 +6983,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9240,32 +7007,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9275,32 +7031,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9310,32 +7055,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9345,32 +7079,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9380,32 +7103,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9415,32 +7127,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9448,32 +7149,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9486,32 +7176,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9521,32 +7200,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9556,32 +7224,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9591,32 +7248,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9626,32 +7272,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9661,32 +7296,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9694,32 +7318,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9729,32 +7342,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9764,32 +7366,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9799,32 +7390,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9834,32 +7414,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9869,32 +7438,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9904,32 +7462,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -9937,32 +7484,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10453,32 +7989,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10488,32 +8013,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10523,32 +8037,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10558,32 +8061,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10593,32 +8085,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10628,32 +8109,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10663,32 +8133,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10696,32 +8155,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10731,32 +8179,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10766,32 +8203,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10801,32 +8227,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10836,32 +8251,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10871,32 +8275,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10906,32 +8299,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10941,32 +8323,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -10974,32 +8345,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11012,32 +8372,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11047,32 +8396,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11082,32 +8420,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11117,32 +8444,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11152,32 +8468,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11187,32 +8492,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11222,32 +8516,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11255,32 +8538,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11290,32 +8562,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11325,32 +8586,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11360,32 +8610,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11395,32 +8634,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11430,32 +8658,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11465,32 +8682,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11500,32 +8706,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11533,32 +8728,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11571,32 +8755,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11606,32 +8779,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11641,32 +8803,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11676,32 +8827,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11711,32 +8851,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11746,32 +8875,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11781,32 +8899,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11814,32 +8921,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11849,32 +8945,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11884,32 +8969,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11919,32 +8993,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11954,32 +9017,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -11989,32 +9041,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12024,32 +9065,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12059,32 +9089,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12092,32 +9111,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12130,32 +9138,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12165,32 +9162,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12200,32 +9186,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12235,32 +9210,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12270,32 +9234,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12305,32 +9258,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12340,32 +9282,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v17, v106
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v105
+	v_dual_fmac_f32 v24, v16, v105 :: v_dual_mul_f32 v25, v27, v106
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v108
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v109
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v110
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v111
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v112
-	v_mul_f32_e32 v25, v27, v106
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v105
+	v_dual_fmac_f32 v24, v19, v108 :: v_dual_fmac_f32 v25, v26, v105
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v107
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v108
+	v_dual_fmac_f32 v24, v20, v109 :: v_dual_fmac_f32 v25, v29, v108
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v109
+	v_dual_fmac_f32 v24, v21, v110 :: v_dual_fmac_f32 v25, v30, v109
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v110
+	v_dual_fmac_f32 v24, v22, v111 :: v_dual_fmac_f32 v25, v31, v110
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v111
+	v_dual_fmac_f32 v24, v23, v112 :: v_dual_fmac_f32 v25, v32, v111
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v112
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12373,32 +9304,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v17, v114
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v16, v113
+	v_dual_fmac_f32 v24, v16, v113 :: v_dual_mul_f32 v25, v27, v114
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v18, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v19, v116
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v20, v117
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v21, v118
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v22, v119
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v23, v120
-	v_mul_f32_e32 v25, v27, v114
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v26, v113
+	v_dual_fmac_f32 v24, v19, v116 :: v_dual_fmac_f32 v25, v26, v113
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v28, v115
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v29, v116
+	v_dual_fmac_f32 v24, v20, v117 :: v_dual_fmac_f32 v25, v29, v116
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v30, v117
+	v_dual_fmac_f32 v24, v21, v118 :: v_dual_fmac_f32 v25, v30, v117
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v31, v118
+	v_dual_fmac_f32 v24, v22, v119 :: v_dual_fmac_f32 v25, v31, v118
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v32, v119
+	v_dual_fmac_f32 v24, v23, v120 :: v_dual_fmac_f32 v25, v32, v119
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v33, v120
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12408,32 +9328,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12443,32 +9352,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12478,32 +9376,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12513,32 +9400,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12548,32 +9424,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12583,32 +9448,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12618,32 +9472,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(2)
 	v_mul_f32_e32 v24, v106, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v105, v16
+	v_dual_fmac_f32 v24, v105, v16 :: v_dual_mul_f32 v25, v106, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v107, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v108, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v109, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v110, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v111, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v112, v23
-	v_mul_f32_e32 v25, v106, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v105, v26
+	v_dual_fmac_f32 v24, v108, v19 :: v_dual_fmac_f32 v25, v105, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v107, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v108, v29
+	v_dual_fmac_f32 v24, v109, v20 :: v_dual_fmac_f32 v25, v108, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v109, v30
+	v_dual_fmac_f32 v24, v110, v21 :: v_dual_fmac_f32 v25, v109, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v110, v31
+	v_dual_fmac_f32 v24, v111, v22 :: v_dual_fmac_f32 v25, v110, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v111, v32
+	v_dual_fmac_f32 v24, v112, v23 :: v_dual_fmac_f32 v25, v111, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v112, v33
 	s_delay_alu instid0(VALU_DEP_1)
@@ -12651,32 +9494,21 @@ gemv_mq4g256v2_rows_x4_t8_pm_gfx1100:
 	s_waitcnt vmcnt(0)
 	v_mul_f32_e32 v24, v114, v17
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v113, v16
+	v_dual_fmac_f32 v24, v113, v16 :: v_dual_mul_f32 v25, v114, v27
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v24, v115, v18
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v116, v19
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v117, v20
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v118, v21
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v119, v22
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v24, v120, v23
-	v_mul_f32_e32 v25, v114, v27
-	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v113, v26
+	v_dual_fmac_f32 v24, v116, v19 :: v_dual_fmac_f32 v25, v113, v26
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v115, v28
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v116, v29
+	v_dual_fmac_f32 v24, v117, v20 :: v_dual_fmac_f32 v25, v116, v29
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v117, v30
+	v_dual_fmac_f32 v24, v118, v21 :: v_dual_fmac_f32 v25, v117, v30
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v118, v31
+	v_dual_fmac_f32 v24, v119, v22 :: v_dual_fmac_f32 v25, v118, v31
 	s_delay_alu instid0(VALU_DEP_1)
-	v_fmac_f32_e32 v25, v119, v32
+	v_dual_fmac_f32 v24, v120, v23 :: v_dual_fmac_f32 v25, v119, v32
 	s_delay_alu instid0(VALU_DEP_1)
 	v_fmac_f32_e32 v25, v120, v33
 	s_delay_alu instid0(VALU_DEP_1)
