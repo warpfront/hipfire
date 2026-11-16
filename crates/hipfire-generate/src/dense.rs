@@ -4766,10 +4766,7 @@ pub fn generate_muse_glimmer(
     let mut spec_accepted: usize = 0;
     // Request-local profit guard: default on for greedy spec; kill-switch or
     // timing-distorting diag/audit modes disable it for this request only.
-    let profit_guard_env_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD")
-        .ok()
-        .as_deref()
-        == Some("0");
+    let profit_guard_env_off = !gpu.flags.glimmer_spec_profit_guard;
     let profit_guard_diag_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG")
         .ok()
         .as_deref()

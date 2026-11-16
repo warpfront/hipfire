@@ -284,8 +284,10 @@ pub fn resolve_ep_unit_tail(raw: Option<&str>) -> Result<Option<EpUnitTailConfig
 /// Whether [`EP_UNIT_TAIL_ENV`] was set to a tail (not unset, not off): an explicit tail on a load
 /// without a unit plan is a load error; the shipped default silently stays off there.
 pub fn ep_unit_tail_explicit() -> bool {
-    let raw = hipfire_config::developer_var(EP_UNIT_TAIL_ENV).ok();
-    raw.is_some() && parse_ep_unit_tail(raw.as_deref()).is_ok_and(|config| config.is_some())
+    let raw = rdna_compute::FeatureFlags::process()
+        .ep_unit_tail
+        .as_deref();
+    raw.is_some() && parse_ep_unit_tail(raw).is_ok_and(|config| config.is_some())
 }
 
 /// Whether [`EP_UNIT_TAIL_ENV`] asks for a tail in this process. A configured tail's pool is
@@ -294,8 +296,8 @@ pub fn ep_unit_tail_explicit() -> bool {
 /// follow the tail's publications (the dynamic pins of [`pins`]).
 pub fn ep_unit_tail_configured() -> bool {
     resolve_ep_unit_tail(
-        hipfire_config::developer_var(EP_UNIT_TAIL_ENV)
-            .ok()
+        rdna_compute::FeatureFlags::process()
+            .ep_unit_tail
             .as_deref(),
     )
     .is_ok_and(|config| config.is_some())

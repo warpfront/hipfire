@@ -1374,8 +1374,7 @@ impl RaonRailgunOwner {
     /// `HIPFIRE_RAON_RAILGUN_LOCAL_CORPUS` not `0`, the owner is created
     /// waiting to build the per-user corpus after the decode graph's warm-up.
     pub(crate) fn from_config(b: &RaonBundle, gpu: &Gpu) -> Option<Box<Self>> {
-        let raw = hipfire_config::developer_var(ENV_ENABLE).ok();
-        let mode = parse_mode(raw.as_deref()).unwrap_or_else(|e| {
+        let mode = parse_mode(gpu.flags.raon_railgun.as_deref()).unwrap_or_else(|e| {
             eprintln!("[raon-railgun] {e}");
             RailgunMode::Off
         });

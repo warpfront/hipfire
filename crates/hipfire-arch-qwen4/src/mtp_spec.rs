@@ -10701,8 +10701,7 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.g942_refused = false;
         self.retained = None;
         self.floor_pending = None;
-        self.floor_enabled =
-            hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0");
+        self.floor_enabled = rdna_compute::FeatureFlags::process().mtp_ar_floor;
         self.floor.clear_call_log();
         self.floor.reset_request(
             singleton_floor_min_windows(),
@@ -10941,7 +10940,7 @@ pub fn native_mtp_proposal_drafts(max_k: usize, gpu_arch: &str) -> usize {
 /// `HIPFIRE_QWEN4_MTP_BATCHED_FILL`: the batched prompt-fill Append pass is on
 /// unless set to `0`; read at every `mtp_prefill`.
 pub(crate) fn mtp_batched_fill_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_BATCHED_FILL", true)
+    rdna_compute::FeatureFlags::process().qwen4_mtp_batched_fill
 }
 
 /// Whether this GPU's prompt fill wants the Append scratch: batched fill on,

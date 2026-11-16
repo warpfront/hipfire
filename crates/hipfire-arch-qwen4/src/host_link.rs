@@ -540,7 +540,9 @@ pub fn link_route_choices(arch: &str, link: HostLink) -> Vec<RouteChoice> {
         arch,
         link,
         crate::gpu_forward::Qwen4ForwardScratchMode::FnSymGfx1201,
-        env(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV).as_deref(),
+        rdna_compute::FeatureFlags::process()
+            .qwen4_expert_stage
+            .as_deref(),
         env(crate::gpu_forward::QWEN4_PREFILL_CHUNK_ROWS_ENV).as_deref(),
         env(crate::gpu_forward::QWEN4_EXPERT_STAGE_MIN_ROWS_ENV).as_deref(),
     )

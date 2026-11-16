@@ -352,7 +352,7 @@ impl LaneDepthCost {
 /// `HIPFIRE_MTP_AR_FLOOR` (`0` opts out), read the way the drafter's
 /// `configure_request` reads it.
 pub(crate) fn floor_env_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_MTP_AR_FLOOR").as_deref() != Ok("0")
+    rdna_compute::FeatureFlags::process().mtp_ar_floor
 }
 
 /// `HIPFIRE_QWEN4_EP_LANE_AR_FLOOR` (developer; default off, `1` on): whether EP mesh

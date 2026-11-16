@@ -272,7 +272,7 @@ pub struct Qwen4Bundle {
 /// ([`Qwen4Bundle::apply_penalty_table`]) on the AR greedy row and the
 /// sampled-MTP target rows. Diagnostic / A-B only; read once per request.
 pub fn penalty_prepass_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_QWEN4_PENALTY_PREPASS").as_deref() != Ok("0")
+    rdna_compute::FeatureFlags::process().qwen4_penalty_prepass
 }
 
 /// Device bytes of one session-cache snapshot holding `p` rows per token

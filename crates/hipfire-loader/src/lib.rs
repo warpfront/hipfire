@@ -3400,7 +3400,7 @@ fn resolve_route_plan(
     // Developer kill switch, and how route walks (scripts/route_plan_walk.py)
     // observe a route's whole lazy closure without the plan they regenerate.
     // Qwen3.5 resolves its axes (and logs them for the walk) before refusing.
-    let route_plan_off = !hipfire_config::developer_bool("HIPFIRE_ROUTE_PLAN", true);
+    let route_plan_off = !rdna_compute::FeatureFlags::process().route_plan;
     const ROUTE_PLAN_OFF: &str = "HIPFIRE_ROUTE_PLAN=0";
     match hfq.arch_id {
         // Qwen3.5 dense (5) and MoE (6: A3B, Qwen3.6, Ornith) share the qwen35
@@ -3795,7 +3795,7 @@ fn begin_route_kernels(
     // Resolve first: a walk (`HIPFIRE_ROUTE_PLAN=0`) still needs the axes
     // line the resolver logs, then loads lazily with nothing preloaded.
     let resolved = resolve_route_plan(req, gpu);
-    if !hipfire_config::developer_bool("HIPFIRE_ROUTE_PLAN", true) {
+    if !gpu.flags.route_plan {
         eprintln!(
             "  kernels: {LAZY_KERNELS_NOTE} [HIPFIRE_ROUTE_PLAN=0: route walk, nothing preloaded]"
         );

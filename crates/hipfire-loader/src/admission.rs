@@ -2927,7 +2927,14 @@ pub fn admit_source_with_options(
                 .resolve(gpu_arch);
             qwen4_pp_env_refusal(
                 pp,
-                &|name| hipfire_config::developer_var(name).ok(),
+                &|name| match name {
+                    hipfire_arch_qwen4::gpu_forward::QWEN4_EXPERT_STAGE_ENV => {
+                        rdna_compute::FeatureFlags::process()
+                            .qwen4_expert_stage
+                            .clone()
+                    }
+                    _ => hipfire_config::developer_var(name).ok(),
+                },
                 npu,
                 hipfire_config::memory::session_cache_disk_bytes(),
             )?;

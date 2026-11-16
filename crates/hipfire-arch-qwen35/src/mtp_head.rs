@@ -76,17 +76,12 @@ use std::path::{Path, PathBuf};
 /// Kill switch for the kv_only MTP fill concat acceleration
 /// (`HIPFIRE_MTP_FILL_FAST=0` restores the per-row D2D concat loop).
 pub(crate) fn mtp_fill_fast_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_MTP_FILL_FAST", true));
-    *ON
+    rdna_compute::FeatureFlags::process().mtp_fill_fast
 }
 
 /// Restore the incumbent v1 GEMM with `HIPFIRE_MTP_FILL_PM_GEMM=0`.
 fn mtp_fill_pm_gemm_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_MTP_FILL_PM_GEMM", true)
-    });
-    *ON
+    rdna_compute::FeatureFlags::process().mtp_fill_pm_gemm
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────

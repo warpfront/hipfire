@@ -456,8 +456,9 @@ enum RowsExactMode {
 }
 
 static ROWS_EXACT_MODE: std::sync::LazyLock<RowsExactMode> = std::sync::LazyLock::new(|| {
-    match hipfire_config::developer_var("HIPFIRE_RAON_VERIFY_ROWEXACT")
-        .ok()
+    match rdna_compute::FeatureFlags::process()
+        .raon_verify_rowexact
+        .as_deref()
         .map(|v| v.trim().to_ascii_lowercase())
         .as_deref()
     {

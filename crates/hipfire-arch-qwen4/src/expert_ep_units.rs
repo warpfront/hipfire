@@ -1592,11 +1592,11 @@ pub fn ep_unit_stage_switches_on(switches: &EpUnitStageSwitches<'_>) -> bool {
 /// [`ep_unit_stage_switches_on`] with the switches read from the process
 /// configuration, for `arch`.
 pub fn ep_unit_stage_on(arch: &str) -> bool {
-    let var = |name: &str| hipfire_config::developer_var(name).ok();
-    let expert_stage = var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV);
     ep_unit_stage_switches_on(&EpUnitStageSwitches {
         arch,
-        expert_stage: expert_stage.as_deref(),
+        expert_stage: rdna_compute::FeatureFlags::process()
+            .qwen4_expert_stage
+            .as_deref(),
     })
 }
 

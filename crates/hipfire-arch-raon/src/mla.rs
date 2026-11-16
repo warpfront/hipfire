@@ -163,10 +163,10 @@ pub enum MlaRoute {
     Absorbed,
 }
 
-fn parse_flag(name: &str, default: bool) -> Result<bool, String> {
-    match hipfire_config::developer_var(name) {
-        Err(_) => Ok(default),
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+fn parse_flag(name: &str, raw: Option<&str>, default: bool) -> Result<bool, String> {
+    match raw {
+        None => Ok(default),
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
             "" => Ok(default),
             "1" | "true" | "on" => Ok(true),
             "0" | "false" | "off" => Ok(false),
@@ -184,16 +184,29 @@ impl MlaPolicy {
     };
 
     pub fn from_env() -> Result<Self, String> {
-        let tiled = parse_flag("HIPFIRE_RAON_ATTN_TILED", Self::DEFAULT.tiled)?;
-        let forced = matches!(
-            hipfire_config::developer_var("HIPFIRE_RAON_MIRROR_Q8")
-                .map(|v| v.trim().to_ascii_lowercase()),
-            Ok(v) if v == "force"
-        );
-        let mirror_q8 = forced || parse_flag("HIPFIRE_RAON_MIRROR_Q8", Self::DEFAULT.mirror_q8)?;
+        let dev = |name: &str| hipfire_config::developer_var(name).ok();
+        let tiled = parse_flag(
+            "HIPFIRE_RAON_ATTN_TILED",
+            dev("HIPFIRE_RAON_ATTN_TILED").as_deref(),
+            Self::DEFAULT.tiled,
+        )?;
+        let mirror_raw = rdna_compute::FeatureFlags::process()
+            .raon_mirror_q8
+            .as_deref();
+        let forced = mirror_raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("force"));
+        let mirror_q8 = forced
+            || parse_flag(
+                "HIPFIRE_RAON_MIRROR_Q8",
+                mirror_raw,
+                Self::DEFAULT.mirror_q8,
+            )?;
         Ok(Self {
             tiled,
-            absorb: parse_flag("HIPFIRE_RAON_MLA_ABSORB", Self::DEFAULT.absorb)?,
+            absorb: parse_flag(
+                "HIPFIRE_RAON_MLA_ABSORB",
+                dev("HIPFIRE_RAON_MLA_ABSORB").as_deref(),
+                Self::DEFAULT.absorb,
+            )?,
             mirror_q8: mirror_q8 && tiled,
             mirror_q8_forced: forced && tiled,
         })

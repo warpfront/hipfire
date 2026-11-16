@@ -219,9 +219,12 @@ pub(crate) fn lm_head_storage() -> Storage {
 /// Always-active FFN storage: `HIPFIRE_RAON_SHARED_FFN=qt44` (default, unset) | `q8f16` |
 /// `bf16`. An unknown value is an error, never a silent default.
 pub(crate) fn shared_ffn_storage() -> Result<SharedFfn, String> {
-    match hipfire_config::developer_var("HIPFIRE_RAON_SHARED_FFN") {
-        Ok(v) => SharedFfn::parse(&v).map_err(|e| format!("HIPFIRE_RAON_SHARED_FFN: {e}")),
-        Err(_) => Ok(SharedFfn::Qt44),
+    match rdna_compute::FeatureFlags::process()
+        .raon_shared_ffn
+        .as_deref()
+    {
+        Some(v) => SharedFfn::parse(v).map_err(|e| format!("HIPFIRE_RAON_SHARED_FFN: {e}")),
+        None => Ok(SharedFfn::Qt44),
     }
 }
 

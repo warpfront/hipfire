@@ -3096,6 +3096,272 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_DUMP_HIDDEN",
         "File prefix of the hidden-state / router-logit dumps; set (even empty) arms the dump and vetoes the fusions that would hide the dumped tensors."
     ),
+    // Kept arch-crate and runtime developer flags given typed keys (HIPF-430
+    // stage 2). Same contract as the kernel-side block above: the env spelling
+    // keeps the exact legacy grammar (`promoted_flag_env_value`); value-carrying
+    // and multi-valued flags are nullable strings parsed by their arch crate.
+    process_bool_field!(
+        "speculation.glimmer_spec_profit_guard",
+        "glimmer_spec_profit_guard",
+        Speculation,
+        true,
+        true,
+        "HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD",
+        "Glimmer greedy DFlash request-local profit guard (default on); false keeps speculating when the spec windows lose to AR. Pinned off by dense_rollback_gpu."
+    ),
+    process_auto_bool_field!(
+        "topology.ep_peer_allreduce",
+        "ep_peer_allreduce",
+        Hardware,
+        true,
+        "HIPFIRE_EP_PEER_ALLREDUCE",
+        "Qwen3.5 EP prefill routed-partial reduce: auto (default) the canonical rooted peer reduce (RCCL without peer access); true the legacy unrooted peer reduce; false RCCL. Diagnostic variants for EP proof runs."
+    ),
+    process_auto_bool_field!(
+        "topology.ep_peer_allreduce_decode",
+        "ep_peer_allreduce_decode",
+        Hardware,
+        true,
+        "HIPFIRE_EP_PEER_ALLREDUCE_DECODE",
+        "EP decode all-reduce: auto (default) the canonical rooted peer reduce (RCCL without peer access); true the legacy unrooted peer reduce; false RCCL."
+    ),
+    diagnostic_field!(
+        "diagnostic.ep_dump_pos",
+        "ep_dump_pos",
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        "HIPFIRE_EP_DUMP_POS",
+        "DeepSeek V4 EP divergence dump: comma-separated positions whose per-layer, per-rank residual fingerprints are printed; set (any value) also keeps the forward off the captured TP graph."
+    ),
+    process_field!(
+        "topology.ep_unit_tail",
+        "ep_unit_tail",
+        Hardware,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_EP_UNIT_TAIL",
+        "Qwen4 EP D2 expert unit tail `T,F[,b=N]`; unset is the shipped default tail over a per-expert unit plan, empty / 0 / off disables it."
+    ),
+    process_field!(
+        "topology.qwen4_ep_tail_borrow",
+        "qwen4_ep_tail_borrow",
+        Hardware,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_QWEN4_EP_TAIL_BORROW",
+        "Qwen4 EP prefill borrow of the D2 tail: unset or empty the shipped default (8192 rows), 0 off, 1 8192 rows, an integer that many rows; anything else is a load error."
+    ),
+    process_field!(
+        "memory.qwen4_decode_share",
+        "qwen4_decode_share",
+        Memory,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_QWEN4_DECODE_SHARE",
+        "Qwen4 decode-share mode (off | bind | bank | fixed | on, case-insensitive); unset or auto is the product default (on), any other value is off."
+    ),
+    process_field!(
+        "topology.qwen4_ep_expert_hotset",
+        "qwen4_ep_expert_hotset",
+        Hardware,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_QWEN4_EP_EXPERT_HOTSET",
+        "Qwen4 EP per-expert plan sidecar path; empty or 0 keeps whole-layer placement, unset follows the shipped discovery default."
+    ),
+    process_field!(
+        "topology.qwen4_ep_draft_vocab_shard",
+        "qwen4_ep_draft_vocab_shard",
+        Hardware,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD",
+        "Qwen4 EP vocabulary-sharded MQ2 draft head: unset attaches when the target shard exchange is attached, 0 off, 1 requires it."
+    ),
+    process_bool_field!(
+        "speculation.mtp_ar_floor",
+        "mtp_ar_floor",
+        Speculation,
+        true,
+        true,
+        "HIPFIRE_MTP_AR_FLOOR",
+        "Qwen4 MTP AR floor (default on); false never falls back to AR when MTP windows lose. Pinned off by MTP GPU tests and oracles."
+    ),
+    process_field!(
+        "memory.qwen4_expert_stage",
+        "qwen4_expert_stage",
+        Memory,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_QWEN4_EXPERT_STAGE",
+        "Qwen4 long-prefill expert staging: exact 1 opts in, exact 0 opts out, anything else (unset) follows the arch policy."
+    ),
+    process_auto_bool_field!(
+        "speculation.qwen4_mtp_draft_rounds",
+        "qwen4_mtp_draft_rounds",
+        Speculation,
+        true,
+        "HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS",
+        "Qwen4 batched MTP head rounds: auto (default) on for EP >= 2 or stock-FP8 loads, true on for every load, false off."
+    ),
+    process_bool_field!(
+        "speculation.qwen4_mtp_batched_fill",
+        "qwen4_mtp_batched_fill",
+        Speculation,
+        true,
+        true,
+        "HIPFIRE_QWEN4_MTP_BATCHED_FILL",
+        "Qwen4 MTP batched prompt-fill Append pass (default on); false runs the serial fill (mtp_takeover_fill_hw reference arm)."
+    ),
+    process_bool_field!(
+        "kernel.qwen4_penalty_prepass",
+        "qwen4_penalty_prepass",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_QWEN4_PENALTY_PREPASS",
+        "Qwen4 GPU repeat/presence/frequency penalty prepass (default on, bit-identical); false applies the penalties on the host (A/B arm)."
+    ),
+    process_field!(
+        "vision.vit_attn",
+        "vit_attn",
+        Vision,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_VIT_ATTN",
+        "Qwen3.5-VL vision tower attention kernel: naive | qtiled | wmma; anything else (unset, auto) picks by arch and head_dim."
+    ),
+    process_field!(
+        "vision.vit_gemm",
+        "vit_gemm",
+        Vision,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_VIT_GEMM",
+        "Qwen3.5-VL vision tower GEMM: mb8 forces the register-blocked WMMA GEMM; anything else (unset, auto) lets the LDS-tiled route pick."
+    ),
+    process_bool_field!(
+        "speculation.mtp_fill_fast",
+        "mtp_fill_fast",
+        Speculation,
+        true,
+        true,
+        "HIPFIRE_MTP_FILL_FAST",
+        "Qwen3.5 MTP kv_only prompt-fill concat acceleration (default on); false restores the per-row D2D concat loop."
+    ),
+    process_bool_field!(
+        "speculation.mtp_fill_pm_gemm",
+        "mtp_fill_pm_gemm",
+        Speculation,
+        true,
+        true,
+        "HIPFIRE_MTP_FILL_PM_GEMM",
+        "Qwen3.5 MTP prompt-fill PeaceMaker GEMM (default on); false restores the incumbent v1 GEMM."
+    ),
+    process_bool_field!(
+        "speculation.dflash_prefill_device",
+        "dflash_prefill_device",
+        Speculation,
+        true,
+        true,
+        "HIPFIRE_DFLASH_PREFILL_DEVICE",
+        "DFlash cold prefill keeps the hidden rows on device (default on); false restores the per-piece host capture."
+    ),
+    process_bool_field!(
+        "speculation.dflash_prefill_scatter_fast",
+        "dflash_prefill_scatter_fast",
+        Speculation,
+        true,
+        true,
+        "HIPFIRE_DFLASH_PREFILL_SCATTER_FAST",
+        "DFlash prefill pitched hidden-row scatter (default on); false restores the per-block scatter."
+    ),
+    process_bool_field!(
+        "kernel.route_plan",
+        "route_plan",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_ROUTE_PLAN",
+        "Preload the load's sealed kernel route plan (default on); false loads every kernel lazily (scripts/route_plan_walk.py)."
+    ),
+    process_bool_field!(
+        "kernel.t5_gpu",
+        "t5_gpu",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_T5_GPU",
+        "Diffusion T5/CLIP text conditioning on the GPU (default on); false runs the f32 host reference encoders."
+    ),
+    process_field!(
+        "attention.raon_mirror_q8",
+        "raon_mirror_q8",
+        Attention,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_RAON_MIRROR_Q8",
+        "Raon MLA Q8 K/V mirror: 1/true/on (default) or 0/false/off, force takes Q8 for speculative slots too; anything else is a load error."
+    ),
+    process_field!(
+        "kernel.raon_prefill",
+        "raon_prefill",
+        Kernel,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_RAON_PREFILL",
+        "Raon prefill mode: batched (default) or serial (oracle); anything else is a load error."
+    ),
+    process_field!(
+        "speculation.raon_dflash_rollback",
+        "raon_dflash_rollback",
+        Speculation,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_RAON_DFLASH_ROLLBACK",
+        "Raon DFlash rollback mode: recurrence (default, also unset or empty) or replay, case-insensitive; anything else is an error."
+    ),
+    process_field!(
+        "kernel.raon_railgun",
+        "raon_railgun",
+        Kernel,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_RAON_RAILGUN",
+        "Raon railgun decode: auto (default, also unset or empty), 1/true/on forces it, 0/false/off disables it; anything else logs an error and is off."
+    ),
+    process_field!(
+        "speculation.raon_verify_rowexact",
+        "raon_verify_rowexact",
+        Speculation,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_RAON_VERIFY_ROWEXACT",
+        "Raon row-exact verify blocks: auto (default, per arch), 1/on/true every block, 0/off/false never; anything else warns and is auto."
+    ),
+    process_field!(
+        "kernel.raon_shared_ffn",
+        "raon_shared_ffn",
+        Kernel,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_RAON_SHARED_FFN",
+        "Quantizer only: storage of the Raon always-active FFN weights, qt44 (default) | q8f16 | bf16 (exact); anything else is a conversion error."
+    ),
     process_field!(
         "attention.ck_runtime_lib",
         "ck_runtime_lib",
@@ -4402,6 +4668,231 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "promoted to a typed key (HIPF-430); HIPFIRE_DUMP_HIDDEN is unchanged",
         replacement: "diagnostic.dump_hidden",
+    },
+    // HIPF-430 stage 2 (arch-crate and runtime flags).
+    RetiredConfigKey {
+        key: "developer.glimmer_spec_profit_guard",
+        legacy_key: "developer.glimmer_spec_profit_guard",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD is unchanged",
+        replacement: "speculation.glimmer_spec_profit_guard",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_peer_allreduce",
+        legacy_key: "developer.ep_peer_allreduce",
+        shipped_in: "0.2.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_EP_PEER_ALLREDUCE is unchanged",
+        replacement: "topology.ep_peer_allreduce",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_peer_allreduce_decode",
+        legacy_key: "developer.ep_peer_allreduce_decode",
+        shipped_in: "0.2.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_EP_PEER_ALLREDUCE_DECODE is unchanged",
+        replacement: "topology.ep_peer_allreduce_decode",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_dump_pos",
+        legacy_key: "developer.ep_dump_pos",
+        shipped_in: "0.2.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_EP_DUMP_POS is unchanged",
+        replacement: "diagnostic.ep_dump_pos",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_unit_tail",
+        legacy_key: "developer.ep_unit_tail",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_EP_UNIT_TAIL is unchanged",
+        replacement: "topology.ep_unit_tail",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ep_tail_borrow",
+        legacy_key: "developer.qwen4_ep_tail_borrow",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_EP_TAIL_BORROW is unchanged",
+        replacement: "topology.qwen4_ep_tail_borrow",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_decode_share",
+        legacy_key: "developer.qwen4_decode_share",
+        shipped_in: "0.4.4",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_DECODE_SHARE is unchanged",
+        replacement: "memory.qwen4_decode_share",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ep_expert_hotset",
+        legacy_key: "developer.qwen4_ep_expert_hotset",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_EP_EXPERT_HOTSET is unchanged",
+        replacement: "topology.qwen4_ep_expert_hotset",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ep_draft_vocab_shard",
+        legacy_key: "developer.qwen4_ep_draft_vocab_shard",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD is unchanged",
+        replacement: "topology.qwen4_ep_draft_vocab_shard",
+    },
+    RetiredConfigKey {
+        key: "developer.mtp_ar_floor",
+        legacy_key: "developer.mtp_ar_floor",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_MTP_AR_FLOOR is unchanged",
+        replacement: "speculation.mtp_ar_floor",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_expert_stage",
+        legacy_key: "developer.qwen4_expert_stage",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_EXPERT_STAGE is unchanged",
+        replacement: "memory.qwen4_expert_stage",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_mtp_draft_rounds",
+        legacy_key: "developer.qwen4_mtp_draft_rounds",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS is unchanged",
+        replacement: "speculation.qwen4_mtp_draft_rounds",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_mtp_batched_fill",
+        legacy_key: "developer.qwen4_mtp_batched_fill",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_MTP_BATCHED_FILL is unchanged",
+        replacement: "speculation.qwen4_mtp_batched_fill",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_penalty_prepass",
+        legacy_key: "developer.qwen4_penalty_prepass",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_PENALTY_PREPASS is unchanged",
+        replacement: "kernel.qwen4_penalty_prepass",
+    },
+    RetiredConfigKey {
+        key: "developer.vit_attn",
+        legacy_key: "developer.vit_attn",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_VIT_ATTN is unchanged",
+        replacement: "vision.vit_attn",
+    },
+    RetiredConfigKey {
+        key: "developer.vit_gemm",
+        legacy_key: "developer.vit_gemm",
+        shipped_in: "0.4.4",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_VIT_GEMM is unchanged",
+        replacement: "vision.vit_gemm",
+    },
+    RetiredConfigKey {
+        key: "developer.mtp_fill_fast",
+        legacy_key: "developer.mtp_fill_fast",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_MTP_FILL_FAST is unchanged",
+        replacement: "speculation.mtp_fill_fast",
+    },
+    RetiredConfigKey {
+        key: "developer.mtp_fill_pm_gemm",
+        legacy_key: "developer.mtp_fill_pm_gemm",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_MTP_FILL_PM_GEMM is unchanged",
+        replacement: "speculation.mtp_fill_pm_gemm",
+    },
+    RetiredConfigKey {
+        key: "developer.dflash_prefill_device",
+        legacy_key: "developer.dflash_prefill_device",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_DFLASH_PREFILL_DEVICE is unchanged",
+        replacement: "speculation.dflash_prefill_device",
+    },
+    RetiredConfigKey {
+        key: "developer.dflash_prefill_scatter_fast",
+        legacy_key: "developer.dflash_prefill_scatter_fast",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_DFLASH_PREFILL_SCATTER_FAST is unchanged",
+        replacement: "speculation.dflash_prefill_scatter_fast",
+    },
+    RetiredConfigKey {
+        key: "developer.route_plan",
+        legacy_key: "developer.route_plan",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_ROUTE_PLAN is unchanged",
+        replacement: "kernel.route_plan",
+    },
+    RetiredConfigKey {
+        key: "developer.t5_gpu",
+        legacy_key: "developer.t5_gpu",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_T5_GPU is unchanged",
+        replacement: "kernel.t5_gpu",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_mirror_q8",
+        legacy_key: "developer.raon_mirror_q8",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_RAON_MIRROR_Q8 is unchanged",
+        replacement: "attention.raon_mirror_q8",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_prefill",
+        legacy_key: "developer.raon_prefill",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_RAON_PREFILL is unchanged",
+        replacement: "kernel.raon_prefill",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_dflash_rollback",
+        legacy_key: "developer.raon_dflash_rollback",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_RAON_DFLASH_ROLLBACK is unchanged",
+        replacement: "speculation.raon_dflash_rollback",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_railgun",
+        legacy_key: "developer.raon_railgun",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_RAON_RAILGUN is unchanged",
+        replacement: "kernel.raon_railgun",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_verify_rowexact",
+        legacy_key: "developer.raon_verify_rowexact",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_RAON_VERIFY_ROWEXACT is unchanged",
+        replacement: "speculation.raon_verify_rowexact",
+    },
+    RetiredConfigKey {
+        key: "developer.raon_shared_ffn",
+        legacy_key: "developer.raon_shared_ffn",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-430); HIPFIRE_RAON_SHARED_FFN is unchanged",
+        replacement: "kernel.raon_shared_ffn",
     },
 ];
 
@@ -6503,10 +6994,27 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
         "draft_collapse_off" | "hidden_scatter_fuse_off" => ConfigValue::Bool(raw == "1"),
         // `!= "0" && !is_empty()`.
         "gate_up_bt" => ConfigValue::Bool(!matches!(raw, "0" | "")),
-        // `developer_bool(name, true)`: only exact `0` is off.
-        "a4_slab" | "qwen4_qsa_wmma_gather" | "qwen4_qsa_pooled_bf16" => {
-            ConfigValue::Bool(raw != "0")
-        }
+        // `developer_bool(name, true)`, `!= Some("0")`, `map_or(true, |v| v != "0")`:
+        // only exact `0` is off.
+        "a4_slab"
+        | "qwen4_qsa_wmma_gather"
+        | "qwen4_qsa_pooled_bf16"
+        | "glimmer_spec_profit_guard"
+        | "mtp_ar_floor"
+        | "qwen4_mtp_batched_fill"
+        | "qwen4_penalty_prepass"
+        | "mtp_fill_fast"
+        | "mtp_fill_pm_gemm"
+        | "dflash_prefill_device"
+        | "dflash_prefill_scatter_fast"
+        | "route_plan"
+        | "t5_gpu" => ConfigValue::Bool(raw != "0"),
+        // Untrimmed exact `1` / `0`; anything else is the conditional default.
+        "ep_peer_allreduce" | "ep_peer_allreduce_decode" | "qwen4_mtp_draft_rounds" => match raw {
+            "1" => ConfigValue::Bool(true),
+            "0" => ConfigValue::Bool(false),
+            _ => ConfigValue::String("auto".to_owned()),
+        },
         // Trimmed exact `1` / `0`; anything else is the load-conditional default.
         "qwen4_moe_ep_a8" => match raw.trim() {
             "1" => ConfigValue::Bool(true),
@@ -6515,6 +7023,23 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
         },
         // Presence arms the dump; the value (even empty or `null`) is the file prefix.
         "dump_hidden" => ConfigValue::String(raw.to_owned()),
+        // Value-carrying and multi-valued selectors: the raw value, parsed (with
+        // its own errors and quirks) by the arch crate that owns it.
+        "ep_dump_pos"
+        | "ep_unit_tail"
+        | "qwen4_ep_tail_borrow"
+        | "qwen4_decode_share"
+        | "qwen4_ep_expert_hotset"
+        | "qwen4_ep_draft_vocab_shard"
+        | "qwen4_expert_stage"
+        | "vit_attn"
+        | "vit_gemm"
+        | "raon_mirror_q8"
+        | "raon_prefill"
+        | "raon_dflash_rollback"
+        | "raon_railgun"
+        | "raon_verify_rowexact"
+        | "raon_shared_ffn" => ConfigValue::String(raw.to_owned()),
         _ => return None,
     })
 }
@@ -7475,7 +8000,21 @@ mod tests {
             render_compat_value(&value)
         };
         for raw in inputs {
-            for key in ["a4_slab", "qwen4_qsa_wmma_gather", "qwen4_qsa_pooled_bf16"] {
+            for key in [
+                "a4_slab",
+                "qwen4_qsa_wmma_gather",
+                "qwen4_qsa_pooled_bf16",
+                "glimmer_spec_profit_guard",
+                "mtp_ar_floor",
+                "qwen4_mtp_batched_fill",
+                "qwen4_penalty_prepass",
+                "mtp_fill_fast",
+                "mtp_fill_pm_gemm",
+                "dflash_prefill_device",
+                "dflash_prefill_scatter_fast",
+                "route_plan",
+                "t5_gpu",
+            ] {
                 let want = parse_developer_bool(Some(raw), true);
                 assert_eq!(on(key, raw).as_deref() == Some("1"), want, "{key}={raw:?}");
             }
@@ -7508,7 +8047,38 @@ mod tests {
                 Some(ep_a8),
                 "{raw:?}"
             );
-            assert_eq!(on("dump_hidden", raw).as_deref(), Some(raw));
+            for key in [
+                "ep_peer_allreduce",
+                "ep_peer_allreduce_decode",
+                "qwen4_mtp_draft_rounds",
+            ] {
+                let want = match raw {
+                    "1" => "1",
+                    "0" => "0",
+                    _ => "auto",
+                };
+                assert_eq!(on(key, raw).as_deref(), Some(want), "{key}={raw:?}");
+            }
+            for key in [
+                "dump_hidden",
+                "ep_dump_pos",
+                "ep_unit_tail",
+                "qwen4_ep_tail_borrow",
+                "qwen4_decode_share",
+                "qwen4_ep_expert_hotset",
+                "qwen4_ep_draft_vocab_shard",
+                "qwen4_expert_stage",
+                "vit_attn",
+                "vit_gemm",
+                "raon_mirror_q8",
+                "raon_prefill",
+                "raon_dflash_rollback",
+                "raon_railgun",
+                "raon_verify_rowexact",
+                "raon_shared_ffn",
+            ] {
+                assert_eq!(on(key, raw).as_deref(), Some(raw), "{key}={raw:?}");
+            }
         }
         // Keys outside the promoted set keep the schema grammar.
         assert_eq!(promoted_flag_env_value("fp16", "0"), None);

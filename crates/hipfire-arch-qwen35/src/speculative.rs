@@ -6942,10 +6942,7 @@ pub fn scatter_hidden_prefill_to_interleaved(
     n_rows: usize,
     dst_modulus: usize,
 ) -> HipResult<()> {
-    static FAST: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_DFLASH_PREFILL_SCATTER_FAST", true)
-    });
-    if !*FAST {
+    if !gpu.flags.dflash_prefill_scatter_fast {
         return scatter_hidden_block_to_interleaved(
             gpu,
             hidden_rb,

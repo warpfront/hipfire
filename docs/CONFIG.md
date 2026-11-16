@@ -369,6 +369,48 @@ The kept flags that already had a key are documented with them:
 `kernel.fp16`, `kernel.rocblas_off`, `kernel.hfq4g128_mmq`, `kernel.iu4_prefill`,
 `diagnostic.compiler.no_device_compiler` and `developer.qwen4_moe_sym_iu4`.
 
+Stage 2 (arch-crate and runtime flags). Value-carrying and multi-valued flags
+are nullable strings whose raw value the owning arch crate parses; readers
+without a `Gpu` use `FeatureFlags::process()`:
+
+| Key | Env | Default | Effect |
+|---|---|---|---|
+| `speculation.glimmer_spec_profit_guard` | `HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD` | `true` | `false` keeps Glimmer greedy DFlash speculating when its windows lose to AR (pinned by `dense_rollback_gpu`). |
+| `topology.ep_peer_allreduce` | `HIPFIRE_EP_PEER_ALLREDUCE` | `"auto"` | Qwen3.5 EP prefill reduce: `auto` canonical rooted peer, `true` legacy unrooted peer, `false` RCCL. |
+| `topology.ep_peer_allreduce_decode` | `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` | `"auto"` | EP decode all-reduce, same values as `topology.ep_peer_allreduce`. |
+| `diagnostic.ep_dump_pos` | `HIPFIRE_EP_DUMP_POS` | `null` | Comma-separated positions for the DeepSeek V4 EP residual fingerprint dump; set also keeps the forward off the TP graph. |
+| `topology.ep_unit_tail` | `HIPFIRE_EP_UNIT_TAIL` | `null` | Qwen4 EP D2 unit tail `T,F[,b=N]`; empty / `0` / `off` disables, unset is the shipped default. |
+| `topology.qwen4_ep_tail_borrow` | `HIPFIRE_QWEN4_EP_TAIL_BORROW` | `null` | Qwen4 EP prefill tail borrow: `0` off, `1` 8192 rows, an integer that many rows. |
+| `memory.qwen4_decode_share` | `HIPFIRE_QWEN4_DECODE_SHARE` | `null` | Qwen4 decode-share mode `auto`/`bind`/`bank`/`fixed`/`on`; anything else is off. |
+| `topology.qwen4_ep_expert_hotset` | `HIPFIRE_QWEN4_EP_EXPERT_HOTSET` | `null` | Qwen4 EP per-expert plan sidecar path; empty or `0` keeps whole-layer placement. |
+| `topology.qwen4_ep_draft_vocab_shard` | `HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD` | `null` | Qwen4 EP vocabulary-sharded MQ2 draft head: `1`/`true`/`on` requires it, other values off, unset follows the target exchange. |
+| `speculation.mtp_ar_floor` | `HIPFIRE_MTP_AR_FLOOR` | `true` | `false` disables the Qwen4 MTP AR floor (forced-route tests and oracles). |
+| `memory.qwen4_expert_stage` | `HIPFIRE_QWEN4_EXPERT_STAGE` | `null` | Qwen4 long-prefill expert staging: `1` on, `0` off, anything else the arch policy. |
+| `speculation.qwen4_mtp_draft_rounds` | `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS` | `"auto"` | Qwen4 batched MTP head rounds: `auto` on for EP >= 2 or stock-FP8, `true` always, `false` never. |
+| `speculation.qwen4_mtp_batched_fill` | `HIPFIRE_QWEN4_MTP_BATCHED_FILL` | `true` | `false` runs the serial Qwen4 MTP prompt fill (reference arm). |
+| `kernel.qwen4_penalty_prepass` | `HIPFIRE_QWEN4_PENALTY_PREPASS` | `true` | `false` applies Qwen4 sampling penalties on the host instead of the GPU prepass. |
+| `vision.vit_attn` | `HIPFIRE_VIT_ATTN` | `null` | Qwen3.5-VL tower attention `naive`/`qtiled`/`wmma`; anything else picks by arch. |
+| `vision.vit_gemm` | `HIPFIRE_VIT_GEMM` | `null` | `mb8` forces the register-blocked Qwen3.5-VL tower GEMM. |
+| `speculation.mtp_fill_fast` | `HIPFIRE_MTP_FILL_FAST` | `true` | `false` restores the Qwen3.5 MTP per-row prompt-fill concat loop. |
+| `speculation.mtp_fill_pm_gemm` | `HIPFIRE_MTP_FILL_PM_GEMM` | `true` | `false` restores the incumbent Qwen3.5 MTP prompt-fill GEMM. |
+| `speculation.dflash_prefill_device` | `HIPFIRE_DFLASH_PREFILL_DEVICE` | `true` | `false` restores the DFlash per-piece host capture at cold prefill. |
+| `speculation.dflash_prefill_scatter_fast` | `HIPFIRE_DFLASH_PREFILL_SCATTER_FAST` | `true` | `false` restores the DFlash per-block prefill scatter. |
+| `kernel.route_plan` | `HIPFIRE_ROUTE_PLAN` | `true` | `false` loads kernels lazily with nothing preloaded (route walks). |
+| `kernel.t5_gpu` | `HIPFIRE_T5_GPU` | `true` | `false` runs the diffusion T5/CLIP conditioning on the host f32 reference. |
+| `attention.raon_mirror_q8` | `HIPFIRE_RAON_MIRROR_Q8` | `null` | Raon MLA Q8 mirror: on / off / `force`; anything else fails the load. |
+| `kernel.raon_prefill` | `HIPFIRE_RAON_PREFILL` | `null` | Raon prefill `batched` (default) or `serial`. |
+| `speculation.raon_dflash_rollback` | `HIPFIRE_RAON_DFLASH_ROLLBACK` | `null` | Raon DFlash rollback `recurrence` (default) or `replay`. |
+| `kernel.raon_railgun` | `HIPFIRE_RAON_RAILGUN` | `null` | Raon railgun decode `auto` / on / off. |
+| `speculation.raon_verify_rowexact` | `HIPFIRE_RAON_VERIFY_ROWEXACT` | `null` | Raon row-exact verify blocks `auto` / on / off. |
+| `kernel.raon_shared_ffn` | `HIPFIRE_RAON_SHARED_FFN` | `null` | Quantizer only: Raon always-active FFN storage `qt44` / `q8f16` / `bf16`. |
+
+The kept runtime, prompt and CLI flags `HIPFIRE_DEFAULT_CHATML`,
+`HIPFIRE_NORMALIZE_PROMPT`, `HIPFIRE_PREFILL_BATCHED`, `HIPFIRE_MTP_MODE`,
+`HIPFIRE_TP_USE_RCCL`, `HIPFIRE_DFLASH_LOOKUP`, `HIPFIRE_SERVE_BATCH_SAMPLED`
+and `HIPFIRE_SERVE_BATCH_SPEC` are env aliases of existing keys and are read
+through the resolved config. `HIPFIRE_NO_REGISTRY_FETCH` stays a bootstrap
+variable (above).
+
 ### Qwen4 expert-parallel and NPU controls
 
 Typed schema keys (process-scoped, except `topology.ep_ar_wire`, which is per load):
@@ -2320,10 +2362,38 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.qwen4_qsa_wmma_gather` | `developer.qwen4_qsa_wmma_gather` | 0.4.1 | 0.5.0 | `attention.qwen4_qsa_wmma_gather` (HIPF-430; `HIPFIRE_QWEN4_QSA_WMMA_GATHER` unchanged) |
 | `developer.qwen4_qsa_pooled_bf16` | `developer.qwen4_qsa_pooled_bf16` | 0.4.3 | 0.5.0 | `attention.qwen4_qsa_pooled_bf16` (HIPF-430; `HIPFIRE_QWEN4_QSA_POOLED_BF16` unchanged) |
 | `developer.dump_hidden` | `developer.dump_hidden` | 0.3.1 | 0.5.0 | `diagnostic.dump_hidden` (HIPF-430; `HIPFIRE_DUMP_HIDDEN` unchanged) |
+| `developer.glimmer_spec_profit_guard` | `developer.glimmer_spec_profit_guard` | 0.3.1 | 0.5.0 | `speculation.glimmer_spec_profit_guard` (HIPF-430; `HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD` unchanged) |
+| `developer.ep_peer_allreduce` | `developer.ep_peer_allreduce` | 0.2.1 | 0.5.0 | `topology.ep_peer_allreduce` (HIPF-430; `HIPFIRE_EP_PEER_ALLREDUCE` unchanged) |
+| `developer.ep_peer_allreduce_decode` | `developer.ep_peer_allreduce_decode` | 0.2.1 | 0.5.0 | `topology.ep_peer_allreduce_decode` (HIPF-430; `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` unchanged) |
+| `developer.ep_dump_pos` | `developer.ep_dump_pos` | 0.2.1 | 0.5.0 | `diagnostic.ep_dump_pos` (HIPF-430; `HIPFIRE_EP_DUMP_POS` unchanged) |
+| `developer.ep_unit_tail` | `developer.ep_unit_tail` | 0.4.5 | 0.5.0 | `topology.ep_unit_tail` (HIPF-430; `HIPFIRE_EP_UNIT_TAIL` unchanged) |
+| `developer.qwen4_ep_tail_borrow` | `developer.qwen4_ep_tail_borrow` | 0.4.5 | 0.5.0 | `topology.qwen4_ep_tail_borrow` (HIPF-430; `HIPFIRE_QWEN4_EP_TAIL_BORROW` unchanged) |
+| `developer.qwen4_decode_share` | `developer.qwen4_decode_share` | 0.4.4 | 0.5.0 | `memory.qwen4_decode_share` (HIPF-430; `HIPFIRE_QWEN4_DECODE_SHARE` unchanged) |
+| `developer.qwen4_ep_expert_hotset` | `developer.qwen4_ep_expert_hotset` | 0.4.5 | 0.5.0 | `topology.qwen4_ep_expert_hotset` (HIPF-430; `HIPFIRE_QWEN4_EP_EXPERT_HOTSET` unchanged) |
+| `developer.qwen4_ep_draft_vocab_shard` | `developer.qwen4_ep_draft_vocab_shard` | 0.4.5 | 0.5.0 | `topology.qwen4_ep_draft_vocab_shard` (HIPF-430; `HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD` unchanged) |
+| `developer.mtp_ar_floor` | `developer.mtp_ar_floor` | 0.4.1 | 0.5.0 | `speculation.mtp_ar_floor` (HIPF-430; `HIPFIRE_MTP_AR_FLOOR` unchanged) |
+| `developer.qwen4_expert_stage` | `developer.qwen4_expert_stage` | 0.4.1 | 0.5.0 | `memory.qwen4_expert_stage` (HIPF-430; `HIPFIRE_QWEN4_EXPERT_STAGE` unchanged) |
+| `developer.qwen4_mtp_draft_rounds` | `developer.qwen4_mtp_draft_rounds` | 0.4.5 | 0.5.0 | `speculation.qwen4_mtp_draft_rounds` (HIPF-430; `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS` unchanged) |
+| `developer.qwen4_mtp_batched_fill` | `developer.qwen4_mtp_batched_fill` | 0.4.1 | 0.5.0 | `speculation.qwen4_mtp_batched_fill` (HIPF-430; `HIPFIRE_QWEN4_MTP_BATCHED_FILL` unchanged) |
+| `developer.qwen4_penalty_prepass` | `developer.qwen4_penalty_prepass` | 0.4.1 | 0.5.0 | `kernel.qwen4_penalty_prepass` (HIPF-430; `HIPFIRE_QWEN4_PENALTY_PREPASS` unchanged) |
+| `developer.vit_attn` | `developer.vit_attn` | 0.4.0 | 0.5.0 | `vision.vit_attn` (HIPF-430; `HIPFIRE_VIT_ATTN` unchanged) |
+| `developer.vit_gemm` | `developer.vit_gemm` | 0.4.4 | 0.5.0 | `vision.vit_gemm` (HIPF-430; `HIPFIRE_VIT_GEMM` unchanged) |
+| `developer.mtp_fill_fast` | `developer.mtp_fill_fast` | 0.4.2 | 0.5.0 | `speculation.mtp_fill_fast` (HIPF-430; `HIPFIRE_MTP_FILL_FAST` unchanged) |
+| `developer.mtp_fill_pm_gemm` | `developer.mtp_fill_pm_gemm` | 0.4.2 | 0.5.0 | `speculation.mtp_fill_pm_gemm` (HIPF-430; `HIPFIRE_MTP_FILL_PM_GEMM` unchanged) |
+| `developer.dflash_prefill_device` | `developer.dflash_prefill_device` | 0.4.2 | 0.5.0 | `speculation.dflash_prefill_device` (HIPF-430; `HIPFIRE_DFLASH_PREFILL_DEVICE` unchanged) |
+| `developer.dflash_prefill_scatter_fast` | `developer.dflash_prefill_scatter_fast` | 0.4.2 | 0.5.0 | `speculation.dflash_prefill_scatter_fast` (HIPF-430; `HIPFIRE_DFLASH_PREFILL_SCATTER_FAST` unchanged) |
+| `developer.route_plan` | `developer.route_plan` | 0.4.3 | 0.5.0 | `kernel.route_plan` (HIPF-430; `HIPFIRE_ROUTE_PLAN` unchanged) |
+| `developer.t5_gpu` | `developer.t5_gpu` | 0.3.1 | 0.5.0 | `kernel.t5_gpu` (HIPF-430; `HIPFIRE_T5_GPU` unchanged) |
+| `developer.raon_mirror_q8` | `developer.raon_mirror_q8` | 0.4.5 | 0.5.0 | `attention.raon_mirror_q8` (HIPF-430; `HIPFIRE_RAON_MIRROR_Q8` unchanged) |
+| `developer.raon_prefill` | `developer.raon_prefill` | 0.4.5 | 0.5.0 | `kernel.raon_prefill` (HIPF-430; `HIPFIRE_RAON_PREFILL` unchanged) |
+| `developer.raon_dflash_rollback` | `developer.raon_dflash_rollback` | 0.4.5 | 0.5.0 | `speculation.raon_dflash_rollback` (HIPF-430; `HIPFIRE_RAON_DFLASH_ROLLBACK` unchanged) |
+| `developer.raon_railgun` | `developer.raon_railgun` | 0.4.5 | 0.5.0 | `kernel.raon_railgun` (HIPF-430; `HIPFIRE_RAON_RAILGUN` unchanged) |
+| `developer.raon_verify_rowexact` | `developer.raon_verify_rowexact` | 0.4.5 | 0.5.0 | `speculation.raon_verify_rowexact` (HIPF-430; `HIPFIRE_RAON_VERIFY_ROWEXACT` unchanged) |
+| `developer.raon_shared_ffn` | `developer.raon_shared_ffn` | 0.4.5 | 0.5.0 | `kernel.raon_shared_ffn` (HIPF-430; `HIPFIRE_RAON_SHARED_FFN` unchanged) |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 278 schema keys, plus the `developer.<name>` namespace.
+**Count:** 306 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -2332,6 +2402,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `attention.flash` | `flash_mode` | `HIPFIRE_ATTN_FLASH` | stable |
 | `attention.qwen4_qsa_pooled_bf16` | `qwen4_qsa_pooled_bf16` | `HIPFIRE_QWEN4_QSA_POOLED_BF16` | experimental |
 | `attention.qwen4_qsa_wmma_gather` | `qwen4_qsa_wmma_gather` | `HIPFIRE_QWEN4_QSA_WMMA_GATHER` | experimental |
+| `attention.raon_mirror_q8` | `raon_mirror_q8` | `HIPFIRE_RAON_MIRROR_Q8` | experimental |
 | `attention.yarn_factor` | `yarn_factor` | `HIPFIRE_YARN_FACTOR` | stable |
 | `decide.calibration.choice` | `decide_calibration_choice` |  | stable |
 | `decide.calibration.noul` | `decide_calibration_noul` |  | stable |
@@ -2342,6 +2413,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `diagnostic.draft_gemm_dump` | `draft_gemm_dump` | `HIPFIRE_DRAFT_GEMM_DUMP` | experimental |
 | `diagnostic.draft_subphase` | `draft_subphase` | `HIPFIRE_DRAFT_SUBPHASE` | experimental |
 | `diagnostic.dump_hidden` | `dump_hidden` | `HIPFIRE_DUMP_HIDDEN` | experimental |
+| `diagnostic.ep_dump_pos` | `ep_dump_pos` | `HIPFIRE_EP_DUMP_POS` | experimental |
 | `diagnostic.gemm_dump` | `gemm_dump` | `HIPFIRE_GEMM_DUMP` | experimental |
 | `diagnostic.kernel.fp16_layer_max` | `fp16_layer_max` | `HIPFIRE_FP16_LAYER_MAX` | experimental |
 | `diagnostic.kernel.fp16_layer_min` | `fp16_layer_min` | `HIPFIRE_FP16_LAYER_MIN` | experimental |
@@ -2486,6 +2558,10 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.q8_batched_legacy` | `q8_batched_legacy` | `HIPFIRE_Q8_BATCHED_LEGACY` | experimental |
 | `kernel.qkvza_split_tail` | `qkvza_split_tail` | `HIPFIRE_QKVZA_SPLIT_TAIL` | experimental |
 | `kernel.qwen4_moe_ep_a8` | `qwen4_moe_ep_a8` | `HIPFIRE_QWEN4_MOE_EP_A8` | experimental |
+| `kernel.qwen4_penalty_prepass` | `qwen4_penalty_prepass` | `HIPFIRE_QWEN4_PENALTY_PREPASS` | experimental |
+| `kernel.raon_prefill` | `raon_prefill` | `HIPFIRE_RAON_PREFILL` | experimental |
+| `kernel.raon_railgun` | `raon_railgun` | `HIPFIRE_RAON_RAILGUN` | experimental |
+| `kernel.raon_shared_ffn` | `raon_shared_ffn` | `HIPFIRE_RAON_SHARED_FFN` | experimental |
 | `kernel.rdna3_hfq4_lm_head_k2048` | `rdna3_hfq4_lm_head_k2048` | `HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048` | experimental |
 | `kernel.rdna3_hfq4_moe_gate_up_k2048` | `rdna3_hfq4_moe_gate_up_k2048` | `HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048` | experimental |
 | `kernel.rdna3_hfq4_qkv_wave64` | `rdna3_hfq4_qkv_wave64` | `HIPFIRE_RDNA3_HFQ4_QKV_WAVE64` | experimental |
@@ -2509,6 +2585,8 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.rocblas_all_archs` | `rocblas_all_archs` | `HIPFIRE_ROCBLAS_ALL_ARCHS` | experimental |
 | `kernel.rocblas_off` | `rocblas_off` | `HIPFIRE_ROCBLAS_OFF` | stable |
 | `kernel.rope_interleaved_legacy` | `rope_interleaved_legacy` | `HIPFIRE_ROPE_INTERLEAVED_LEGACY` | experimental |
+| `kernel.route_plan` | `route_plan` | `HIPFIRE_ROUTE_PLAN` | experimental |
+| `kernel.t5_gpu` | `t5_gpu` | `HIPFIRE_T5_GPU` | experimental |
 | `kernel.verify_attn` | `verify_attn` | `HIPFIRE_VERIFY_ATTN` | stable |
 | `kernel.wo_mmq` | `wo_mmq` | `HIPFIRE_WO_MMQ` | experimental |
 | `memory.gpu_layer_budget` | `gpu_layer_budget` | `HIPFIRE_GPU_LAYER_BUDGET` | stable |
@@ -2530,6 +2608,8 @@ branch) or a misspelled key is unknown and fails the load with
 | `memory.ple_prewarm_bytes` | `ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | stable |
 | `memory.prompt_cache_capacity` | `prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | stable |
 | `memory.prompt_cache_unbounded` | `prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | experimental |
+| `memory.qwen4_decode_share` | `qwen4_decode_share` | `HIPFIRE_QWEN4_DECODE_SHARE` | experimental |
+| `memory.qwen4_expert_stage` | `qwen4_expert_stage` | `HIPFIRE_QWEN4_EXPERT_STAGE` | experimental |
 | `memory.session_cache_bytes` | `session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | stable |
 | `memory.session_cache_dir` | `session_cache_dir` | `HIPFIRE_SESSION_CACHE_DIR` | stable |
 | `memory.session_cache_disk_bytes` | `session_cache_disk_bytes` | `HIPFIRE_SESSION_CACHE_DISK_BYTES` | stable |
@@ -2592,19 +2672,37 @@ branch) or a misspelled key is unknown and fails the load with
 | `speculation.dflash_block` | `dflash_block` | `HIPFIRE_DFLASH_BLOCK` | stable |
 | `speculation.dflash_lookup` | `dflash_lookup` | `HIPFIRE_DFLASH_LOOKUP` | stable |
 | `speculation.dflash_ngram_block` | `dflash_ngram_block` | `HIPFIRE_DFLASH_NGRAM_BLOCK` | stable |
+| `speculation.dflash_prefill_device` | `dflash_prefill_device` | `HIPFIRE_DFLASH_PREFILL_DEVICE` | experimental |
+| `speculation.dflash_prefill_scatter_fast` | `dflash_prefill_scatter_fast` | `HIPFIRE_DFLASH_PREFILL_SCATTER_FAST` | experimental |
 | `speculation.dspark_confidence` | `dspark_conf_threshold` |  | experimental |
+| `speculation.glimmer_spec_profit_guard` | `glimmer_spec_profit_guard` | `HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD` | experimental |
 | `speculation.mode` | `speculation` | `HIPFIRE_SPECULATION` | stable |
 | `speculation.mtp` | `mtp_mode` | `HIPFIRE_MTP_MODE` | stable |
+| `speculation.mtp_ar_floor` | `mtp_ar_floor` | `HIPFIRE_MTP_AR_FLOOR` | experimental |
+| `speculation.mtp_fill_fast` | `mtp_fill_fast` | `HIPFIRE_MTP_FILL_FAST` | experimental |
+| `speculation.mtp_fill_pm_gemm` | `mtp_fill_pm_gemm` | `HIPFIRE_MTP_FILL_PM_GEMM` | experimental |
 | `speculation.mtp_k` | `mtp_k` | `HIPFIRE_MTP_K` | stable |
 | `speculation.mtp_ngram` | `mtp_ngram` | `HIPFIRE_MTP_NGRAM` | stable |
 | `speculation.mtp_ngram_copy` | `mtp_ngram_copy` | `HIPFIRE_MTP_NGRAM_COPY` | stable |
 | `speculation.ngram` | `ngram_mode` | `HIPFIRE_NGRAM_DRAFT` | stable |
 | `speculation.ngram_k` | `ngram_k` | `HIPFIRE_NGRAM_DRAFT_K` | stable |
 | `speculation.ngram_min_count` | `ngram_min_count` | `HIPFIRE_NGRAM_MIN_COUNT` | stable |
+| `speculation.qwen4_mtp_batched_fill` | `qwen4_mtp_batched_fill` | `HIPFIRE_QWEN4_MTP_BATCHED_FILL` | experimental |
+| `speculation.qwen4_mtp_draft_rounds` | `qwen4_mtp_draft_rounds` | `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS` | experimental |
+| `speculation.raon_dflash_rollback` | `raon_dflash_rollback` | `HIPFIRE_RAON_DFLASH_ROLLBACK` | experimental |
+| `speculation.raon_verify_rowexact` | `raon_verify_rowexact` | `HIPFIRE_RAON_VERIFY_ROWEXACT` | experimental |
 | `topology.ep` | `ep` | `HIPFIRE_TOPOLOGY_EP` | experimental |
 | `topology.ep_ar_wire` | `ep_ar_wire` |  | experimental |
+| `topology.ep_peer_allreduce` | `ep_peer_allreduce` | `HIPFIRE_EP_PEER_ALLREDUCE` | experimental |
+| `topology.ep_peer_allreduce_decode` | `ep_peer_allreduce_decode` | `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` | experimental |
+| `topology.ep_unit_tail` | `ep_unit_tail` | `HIPFIRE_EP_UNIT_TAIL` | experimental |
 | `topology.pp` | `pp` | `HIPFIRE_TOPOLOGY_PP` | experimental |
+| `topology.qwen4_ep_draft_vocab_shard` | `qwen4_ep_draft_vocab_shard` | `HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD` | experimental |
+| `topology.qwen4_ep_expert_hotset` | `qwen4_ep_expert_hotset` | `HIPFIRE_QWEN4_EP_EXPERT_HOTSET` | experimental |
+| `topology.qwen4_ep_tail_borrow` | `qwen4_ep_tail_borrow` | `HIPFIRE_QWEN4_EP_TAIL_BORROW` | experimental |
 | `vision.mode` | `vision_mode` | `HIPFIRE_VISION_MODE` | stable |
+| `vision.vit_attn` | `vit_attn` | `HIPFIRE_VIT_ATTN` | experimental |
+| `vision.vit_gemm` | `vit_gemm` | `HIPFIRE_VIT_GEMM` | experimental |
 | `developer.<name>` | | `HIPFIRE_<NAME>` | developer |
 
 <!-- lifecycle-table:end -->

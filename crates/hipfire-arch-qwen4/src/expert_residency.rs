@@ -2794,13 +2794,9 @@ pub fn expert_hotset_budget(
 /// placement charges use [`expert_stage_placement_enabled`] and the stage
 /// this switch alone turns on borrows donor layers (no dedicated VRAM).
 pub fn expert_stage_enabled(gpu: &rdna_compute::Gpu) -> bool {
-    expert_stage_switch(
-        &gpu.arch,
-        hipfire_config::developer_var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV)
-            .ok()
-            .as_deref(),
-        || crate::host_link::host_link(gpu),
-    )
+    expert_stage_switch(&gpu.arch, gpu.flags.qwen4_expert_stage.as_deref(), || {
+        crate::host_link::host_link(gpu)
+    })
 }
 
 /// [`expert_stage_enabled`] with the env value and the (lazily measured)
@@ -2830,8 +2826,8 @@ pub(crate) fn expert_stage_switch(
 pub fn expert_stage_placement_enabled(arch: &str) -> bool {
     expert_stage_placement_switch(
         arch,
-        hipfire_config::developer_var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV)
-            .ok()
+        rdna_compute::FeatureFlags::process()
+            .qwen4_expert_stage
             .as_deref(),
     )
 }

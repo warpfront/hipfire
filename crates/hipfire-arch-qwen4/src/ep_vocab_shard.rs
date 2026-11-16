@@ -99,8 +99,8 @@ pub const DRAFT_SHARD_ROWS: usize = crate::mtp_gpu::MTP_DRAFT_LANES_MAX;
 /// What the raw `HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD` value asks for (same grammar).
 pub fn draft_vocab_shard_switch() -> ShardSwitch {
     parse_switch(
-        hipfire_config::developer_var(DRAFT_VOCAB_SHARD_ENV)
-            .ok()
+        rdna_compute::FeatureFlags::process()
+            .qwen4_ep_draft_vocab_shard
             .as_deref(),
     )
 }

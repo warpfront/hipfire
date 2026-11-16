@@ -1060,6 +1060,72 @@ pub struct FeatureFlags {
     /// hidden-state / router-logit dumps. `Some` (even empty) arms the dump and
     /// vetoes the fusions that would hide the dumped tensors.
     pub dump_hidden: Option<String>,
+
+    // ── Kept arch-crate and runtime flags with typed keys (HIPF-430 stage 2) ──
+    // Read from `Gpu::flags`, or from [`FeatureFlags::process`] where no `Gpu`
+    // exists. Bools: exact `0` is off, anything else on (default on).
+    // `Option<bool>`: exact `1` = `Some(true)`, exact `0` = `Some(false)`, else
+    // `None` (the conditional default). `Option<String>`: the raw value, parsed
+    // by the arch crate that owns the flag (its grammar and errors unchanged).
+    /// `HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD` / `speculation.glimmer_spec_profit_guard`.
+    pub glimmer_spec_profit_guard: bool,
+    /// `HIPFIRE_EP_PEER_ALLREDUCE` / `topology.ep_peer_allreduce`: `None` canonical
+    /// rooted peer reduce, `Some(true)` legacy unrooted peer, `Some(false)` RCCL.
+    pub ep_peer_allreduce: Option<bool>,
+    /// `HIPFIRE_EP_PEER_ALLREDUCE_DECODE` / `topology.ep_peer_allreduce_decode`,
+    /// same values as [`Self::ep_peer_allreduce`] for the EP decode all-reduce.
+    pub ep_peer_allreduce_decode: Option<bool>,
+    /// `HIPFIRE_EP_DUMP_POS` / `diagnostic.ep_dump_pos`.
+    pub ep_dump_pos: Option<String>,
+    /// `HIPFIRE_EP_UNIT_TAIL` / `topology.ep_unit_tail`.
+    pub ep_unit_tail: Option<String>,
+    /// `HIPFIRE_QWEN4_EP_TAIL_BORROW` / `topology.qwen4_ep_tail_borrow`.
+    pub qwen4_ep_tail_borrow: Option<String>,
+    /// `HIPFIRE_QWEN4_DECODE_SHARE` / `memory.qwen4_decode_share`.
+    pub qwen4_decode_share: Option<String>,
+    /// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET` / `topology.qwen4_ep_expert_hotset`.
+    pub qwen4_ep_expert_hotset: Option<String>,
+    /// `HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD` / `topology.qwen4_ep_draft_vocab_shard`.
+    pub qwen4_ep_draft_vocab_shard: Option<String>,
+    /// `HIPFIRE_MTP_AR_FLOOR` / `speculation.mtp_ar_floor`.
+    pub mtp_ar_floor: bool,
+    /// `HIPFIRE_QWEN4_EXPERT_STAGE` / `memory.qwen4_expert_stage`.
+    pub qwen4_expert_stage: Option<String>,
+    /// `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS` / `speculation.qwen4_mtp_draft_rounds`:
+    /// `None` = on for EP >= 2 or stock-FP8 loads.
+    pub qwen4_mtp_draft_rounds: Option<bool>,
+    /// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` / `speculation.qwen4_mtp_batched_fill`.
+    pub qwen4_mtp_batched_fill: bool,
+    /// `HIPFIRE_QWEN4_PENALTY_PREPASS` / `kernel.qwen4_penalty_prepass`.
+    pub qwen4_penalty_prepass: bool,
+    /// `HIPFIRE_VIT_ATTN` / `vision.vit_attn`.
+    pub vit_attn: Option<String>,
+    /// `HIPFIRE_VIT_GEMM` / `vision.vit_gemm`.
+    pub vit_gemm: Option<String>,
+    /// `HIPFIRE_MTP_FILL_FAST` / `speculation.mtp_fill_fast`.
+    pub mtp_fill_fast: bool,
+    /// `HIPFIRE_MTP_FILL_PM_GEMM` / `speculation.mtp_fill_pm_gemm`.
+    pub mtp_fill_pm_gemm: bool,
+    /// `HIPFIRE_DFLASH_PREFILL_DEVICE` / `speculation.dflash_prefill_device`.
+    pub dflash_prefill_device: bool,
+    /// `HIPFIRE_DFLASH_PREFILL_SCATTER_FAST` / `speculation.dflash_prefill_scatter_fast`.
+    pub dflash_prefill_scatter_fast: bool,
+    /// `HIPFIRE_ROUTE_PLAN` / `kernel.route_plan`.
+    pub route_plan: bool,
+    /// `HIPFIRE_T5_GPU` / `kernel.t5_gpu`.
+    pub t5_gpu: bool,
+    /// `HIPFIRE_RAON_MIRROR_Q8` / `attention.raon_mirror_q8`.
+    pub raon_mirror_q8: Option<String>,
+    /// `HIPFIRE_RAON_PREFILL` / `kernel.raon_prefill`.
+    pub raon_prefill: Option<String>,
+    /// `HIPFIRE_RAON_DFLASH_ROLLBACK` / `speculation.raon_dflash_rollback`.
+    pub raon_dflash_rollback: Option<String>,
+    /// `HIPFIRE_RAON_RAILGUN` / `kernel.raon_railgun`.
+    pub raon_railgun: Option<String>,
+    /// `HIPFIRE_RAON_VERIFY_ROWEXACT` / `speculation.raon_verify_rowexact`.
+    pub raon_verify_rowexact: Option<String>,
+    /// `HIPFIRE_RAON_SHARED_FFN` / `kernel.raon_shared_ffn` (quantizer only).
+    pub raon_shared_ffn: Option<String>,
 }
 
 /// `HIPFIRE_QWEN4_MOE_GLUE_FOLD` sub-fold X8a: the owner tile mask (`ep_tile_mask_pm`) is
@@ -1152,6 +1218,16 @@ impl FeatureFlags {
             == Some("1")
     }
 
+    /// The active process config's flags resolved once, for readers with no
+    /// `Gpu` (loader placement and admission, arch-crate load policy, the
+    /// quantizer). Resolved for no arch: read only arch-independent fields
+    /// (the HIPF-430 stage 2 block) here; arch-gated fields come from `Gpu::flags`.
+    pub fn process() -> &'static Self {
+        static FLAGS: std::sync::LazyLock<FeatureFlags> =
+            std::sync::LazyLock::new(|| FeatureFlags::from_active_config(""));
+        &FLAGS
+    }
+
     fn from_lookup(arch: &str, value: impl Fn(&str) -> std::result::Result<String, ()>) -> Self {
         Self::from_lookup_on_host(arch, cfg!(windows), value)
     }
@@ -1163,6 +1239,12 @@ impl FeatureFlags {
         windows: bool,
         value: impl Fn(&str) -> std::result::Result<String, ()>,
     ) -> Self {
+        let on_unless_zero = |name: &str| value(name).ok().as_deref() != Some("0");
+        let exact_tri = |name: &str| match value(name).ok().as_deref() {
+            Some("1") => Some(true),
+            Some("0") => Some(false),
+            _ => None,
+        };
         let parse_bool =
             |name: &str| -> Option<bool> { parse_legacy_flag_bool(value(name).ok().as_deref()) };
 
@@ -1796,6 +1878,34 @@ impl FeatureFlags {
             ),
             no_device_compiler: value("HIPFIRE_NO_DEVICE_COMPILER").as_deref() == Ok("1"),
             dump_hidden: value("HIPFIRE_DUMP_HIDDEN").ok(),
+            glimmer_spec_profit_guard: on_unless_zero("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD"),
+            ep_peer_allreduce: exact_tri("HIPFIRE_EP_PEER_ALLREDUCE"),
+            ep_peer_allreduce_decode: exact_tri("HIPFIRE_EP_PEER_ALLREDUCE_DECODE"),
+            ep_dump_pos: value("HIPFIRE_EP_DUMP_POS").ok(),
+            ep_unit_tail: value("HIPFIRE_EP_UNIT_TAIL").ok(),
+            qwen4_ep_tail_borrow: value("HIPFIRE_QWEN4_EP_TAIL_BORROW").ok(),
+            qwen4_decode_share: value("HIPFIRE_QWEN4_DECODE_SHARE").ok(),
+            qwen4_ep_expert_hotset: value("HIPFIRE_QWEN4_EP_EXPERT_HOTSET").ok(),
+            qwen4_ep_draft_vocab_shard: value("HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD").ok(),
+            mtp_ar_floor: on_unless_zero("HIPFIRE_MTP_AR_FLOOR"),
+            qwen4_expert_stage: value("HIPFIRE_QWEN4_EXPERT_STAGE").ok(),
+            qwen4_mtp_draft_rounds: exact_tri("HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS"),
+            qwen4_mtp_batched_fill: on_unless_zero("HIPFIRE_QWEN4_MTP_BATCHED_FILL"),
+            qwen4_penalty_prepass: on_unless_zero("HIPFIRE_QWEN4_PENALTY_PREPASS"),
+            vit_attn: value("HIPFIRE_VIT_ATTN").ok(),
+            vit_gemm: value("HIPFIRE_VIT_GEMM").ok(),
+            mtp_fill_fast: on_unless_zero("HIPFIRE_MTP_FILL_FAST"),
+            mtp_fill_pm_gemm: on_unless_zero("HIPFIRE_MTP_FILL_PM_GEMM"),
+            dflash_prefill_device: on_unless_zero("HIPFIRE_DFLASH_PREFILL_DEVICE"),
+            dflash_prefill_scatter_fast: on_unless_zero("HIPFIRE_DFLASH_PREFILL_SCATTER_FAST"),
+            route_plan: on_unless_zero("HIPFIRE_ROUTE_PLAN"),
+            t5_gpu: on_unless_zero("HIPFIRE_T5_GPU"),
+            raon_mirror_q8: value("HIPFIRE_RAON_MIRROR_Q8").ok(),
+            raon_prefill: value("HIPFIRE_RAON_PREFILL").ok(),
+            raon_dflash_rollback: value("HIPFIRE_RAON_DFLASH_ROLLBACK").ok(),
+            raon_railgun: value("HIPFIRE_RAON_RAILGUN").ok(),
+            raon_verify_rowexact: value("HIPFIRE_RAON_VERIFY_ROWEXACT").ok(),
+            raon_shared_ffn: value("HIPFIRE_RAON_SHARED_FFN").ok(),
         }
     }
 
@@ -2716,6 +2826,34 @@ impl FeatureFlags {
             qwen4_moe_sym_iu4: None,
             no_device_compiler: false,
             dump_hidden: None,
+            glimmer_spec_profit_guard: false,
+            ep_peer_allreduce: None,
+            ep_peer_allreduce_decode: None,
+            ep_dump_pos: None,
+            ep_unit_tail: None,
+            qwen4_ep_tail_borrow: None,
+            qwen4_decode_share: None,
+            qwen4_ep_expert_hotset: None,
+            qwen4_ep_draft_vocab_shard: None,
+            mtp_ar_floor: false,
+            qwen4_expert_stage: None,
+            qwen4_mtp_draft_rounds: None,
+            qwen4_mtp_batched_fill: false,
+            qwen4_penalty_prepass: false,
+            vit_attn: None,
+            vit_gemm: None,
+            mtp_fill_fast: false,
+            mtp_fill_pm_gemm: false,
+            dflash_prefill_device: false,
+            dflash_prefill_scatter_fast: false,
+            route_plan: false,
+            t5_gpu: false,
+            raon_mirror_q8: None,
+            raon_prefill: None,
+            raon_dflash_rollback: None,
+            raon_railgun: None,
+            raon_verify_rowexact: None,
+            raon_shared_ffn: None,
         }
     }
 }

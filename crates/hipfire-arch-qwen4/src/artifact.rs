@@ -1949,8 +1949,8 @@ pub fn expert_drop_zero_requested_for(model: &std::path::Path) -> bool {
         hipfire_config::developer_var(EXPERT_DROP_ZERO_ENV)
             .ok()
             .as_deref(),
-        hipfire_config::developer_var(crate::expert_ep_units::EP_EXPERT_HOTSET_ENV)
-            .ok()
+        rdna_compute::FeatureFlags::process()
+            .qwen4_ep_expert_hotset
             .as_deref(),
         hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
         || hipfire_config::memory::ep_expert_hotset_sidecar_path(model).is_file(),

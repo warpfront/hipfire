@@ -656,10 +656,8 @@ pub fn load_dflash_state(
 /// paired all-sliding draft therefore keeps every piece on device.
 /// `HIPFIRE_DFLASH_PREFILL_DEVICE=0` restores the per-piece capture.
 pub fn dflash_prefill_host_required(ctx_mode: DraftCtxMode, prompt_len: usize) -> bool {
-    static DEVICE_PREFILL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_DFLASH_PREFILL_DEVICE", true)
-    });
-    !*DEVICE_PREFILL || draft_seed_backfill_reads_host(ctx_mode, prompt_len)
+    !rdna_compute::FeatureFlags::process().dflash_prefill_device
+        || draft_seed_backfill_reads_host(ctx_mode, prompt_len)
 }
 
 /// Cold/suffix DFlash prefill finishing steps shared by the singleton and the
