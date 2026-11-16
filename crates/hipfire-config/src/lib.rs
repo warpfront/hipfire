@@ -3151,7 +3151,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::NullableString,
         true,
         "HIPFIRE_QWEN4_EP_TAIL_BORROW",
-        "Qwen4 EP prefill borrow of the D2 tail: unset or empty the shipped default (8192 rows), 0 off, 1 8192 rows, an integer that many rows; anything else is a load error."
+        "Qwen4 EP prefill borrow of the D2 tail: unset or empty the shipped default (8192 rows), 0 off, 1 8192 rows, an integer that many rows; anything else (or an out-of-range count) prints a note and the borrow stays off."
     ),
     process_field!(
         "memory.qwen4_decode_share",
@@ -8094,7 +8094,8 @@ mod tests {
             .iter()
             .filter(|f| promoted_flag_env_value(f.legacy_key, "").is_some())
             .collect();
-        assert_eq!(promoted.len(), 9);
+        // 9 kernel-side (stage 1) + 28 arch-crate / runtime (stage 2).
+        assert_eq!(promoted.len(), 37);
         for f in promoted {
             let dev = developer_key_for_env(f.env_compat.unwrap()).unwrap();
             let err = ConfigLayer::default().set_cli(&dev, "1").unwrap_err();

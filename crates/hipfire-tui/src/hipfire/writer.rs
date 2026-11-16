@@ -473,6 +473,14 @@ mod tests {
             write_value(&path, "offload_exec", "").is_err(),
             "empty input must not make a non-nullable enum clearable"
         );
+        // A nullable string: "" is a live value for its legacy grammar (it turns the
+        // decode share off), so the unset row's empty buffer must clear, not store it.
+        assert_eq!(
+            write_value(&path, "memory.qwen4_decode_share", "").unwrap(),
+            Value::Null
+        );
+        let loaded = load_global(&ConfigPaths::under(&*root)).unwrap();
+        assert!(loaded.layer.get("memory.qwen4_decode_share").is_none());
     }
 
     /// The option list a user can cycle through must be what the schema accepts:
