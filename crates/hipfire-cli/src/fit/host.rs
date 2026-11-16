@@ -139,6 +139,12 @@ fn query_hip_devices() -> Result<Vec<HipDevice>, String> {
         .collect()
 }
 
+/// `hipMemGetInfo` on native Windows (and DXGI `QueryVideoMemoryInfo`, which
+/// `hipfire diag` reports) is scoped to the calling process, so the free figure
+/// a fresh `hipfire fit` reads never subtracts another process's VRAM (#1160).
+#[cfg(any(windows, test))]
+const WINDOWS_FREE_NOTE: &str = "GPU free memory is hipMemGetInfo's, which on native Windows subtracts only this process's own allocations: VRAM held by a running hipfire daemon, the desktop or other applications is not counted, so the plan can promise room the card does not have (check Task Manager's dedicated GPU memory before loading)";
+
 /// Machine facts from the HIP device list (native Windows: no KFD topology,
 /// sysfs or `/proc`). Logical order is HIP's, as in the daemon; VRAM total is
 /// `hipMemGetInfo`'s and free goes through `uma_memory::device_free_from`, the
@@ -172,7 +178,7 @@ fn detect_hip(
         .calibration
         .as_ref()
         .map(|_| calibration::detect_host_at(root));
-    let devices = observed
+    let devices: Vec<FitDevice> = observed
         .iter()
         .enumerate()
         .map(|(index, gpu)| {
@@ -238,6 +244,7 @@ fn detect_hip(
                 unified_memory,
                 vram_total,
                 free,
+                free_this_process_only: true,
                 link: Some(link),
                 capacity: None,
                 capacity_shown: None,
@@ -248,6 +255,9 @@ fn detect_hip(
             }
         })
         .collect();
+    if devices.iter().any(|device| device.free.is_some()) {
+        notes.push(WINDOWS_FREE_NOTE.to_owned());
+    }
     (
         FitHost {
             ram_total: memory.map(|memory| memory.total_physical_bytes),
@@ -586,6 +596,7 @@ fn fit_device(
         unified_memory,
         vram_total,
         free,
+        free_this_process_only: false,
         link: Some(link),
         capacity: None,
         capacity_shown: None,
@@ -1253,7 +1264,8 @@ mod tests {
             ]),
             Some(windows_memory()),
         );
-        assert!(notes.is_empty(), "{notes:?}");
+        // #1160: hipMemGetInfo is per process on Windows; the report says so once.
+        assert_eq!(notes, [WINDOWS_FREE_NOTE]);
         assert_eq!(host.ram_total, Some(64 * GIB));
         assert_eq!(host.mem_available, Some(40 * GIB));
         assert_eq!(
@@ -1268,6 +1280,7 @@ mod tests {
             (Some(24 * GIB), Some(22 * GIB))
         );
         assert!(!first.unified_memory);
+        assert!(first.free_this_process_only && host.devices[1].free_this_process_only);
         assert_eq!(first.env_selector, "0");
         assert!(first.config_selector.is_empty());
         let second = &host.devices[1];

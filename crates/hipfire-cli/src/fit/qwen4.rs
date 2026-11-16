@@ -496,6 +496,7 @@ mod tests {
             unified_memory: false,
             vram_total: free,
             free,
+            free_this_process_only: false,
             link: None,
             capacity: None,
             capacity_shown: None,

@@ -141,6 +141,12 @@ pub(crate) struct FitDevice {
     /// the load, derived without HIP on Linux (see `fit/host.rs`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free: Option<u64>,
+    /// `free` subtracts only this process's own allocations, not VRAM other
+    /// processes hold: native Windows, where `hipMemGetInfo` is per process
+    /// (#1160). The report then says "free to this process" instead of naming
+    /// what other processes hold.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub free_this_process_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<LinkFacts>,
     /// Tokens of context the model being fitted projects on this GPU (`0`: its

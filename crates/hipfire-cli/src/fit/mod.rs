@@ -1460,9 +1460,15 @@ fn render_text(report: &Report, verbose: bool) -> String {
                 )
             })
             .unwrap_or_default();
+        // Native Windows: hipMemGetInfo ignores other processes' VRAM (#1160).
+        let memory = if device.free_this_process_only {
+            format!("{free} of {total} free to this process")
+        } else {
+            format!("{free} free of {total}")
+        };
         let _ = writeln!(
             out,
-            "  GPU{} {}  {free} free of {total}{cap_text}  link: {link}",
+            "  GPU{} {}  {memory}{cap_text}  link: {link}",
             device.index, device.arch
         );
     }
@@ -1976,6 +1982,7 @@ mod tests {
             unified_memory: false,
             vram_total: Some(32 << 30),
             free: Some(31 << 30),
+            free_this_process_only: false,
             link: None,
             capacity: None,
             capacity_shown: None,

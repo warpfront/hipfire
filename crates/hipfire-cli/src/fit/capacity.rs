@@ -145,9 +145,15 @@ pub(crate) fn tokens_phrase(capacity: usize, window: Option<usize>) -> String {
 
 /// `2.7 GiB free of 31.9 GiB; 29.2 GiB held by other processes or the desktop`.
 /// A unified-memory GPU has no private pool to subtract from, so it states the
-/// free figure alone.
+/// free figure alone. Where free counts only this process's allocations
+/// (native Windows, #1160) the difference is not what others hold, so it is
+/// not named.
 pub(crate) fn memory_phrase(free: u64, device: Option<&FitDevice>) -> String {
     match device {
+        Some(device) if device.free_this_process_only => match device.vram_total {
+            Some(total) => format!("{} of {} free to this process", gib(free), gib(total)),
+            None => format!("{} free to this process", gib(free)),
+        },
         Some(device) if !device.unified_memory => match device.vram_total {
             Some(total) => format!(
                 "{} free of {}; {} {HELD_BY}",
@@ -429,6 +435,7 @@ mod tests {
             unified_memory: false,
             vram_total: Some(32 << 30),
             free: Some(free_gib << 30),
+            free_this_process_only: false,
             link: None,
             capacity: None,
             capacity_shown: None,
@@ -695,5 +702,22 @@ mod tests {
             "up to {} tokens (pre-load estimate: ",
             roomy.card_cap
         )));
+    }
+
+    /// #1160: on native Windows free is hipMemGetInfo's, per process, so the
+    /// difference to the total is not what other processes hold.
+    #[test]
+    fn process_scoped_free_does_not_name_other_processes() {
+        let mut gpu = device(0, 23);
+        gpu.free_this_process_only = true;
+        assert_eq!(
+            memory_phrase(23 << 30, Some(&gpu)),
+            "23.0 GiB of 32.0 GiB free to this process"
+        );
+        gpu.vram_total = None;
+        assert_eq!(
+            memory_phrase(23 << 30, Some(&gpu)),
+            "23.0 GiB free to this process"
+        );
     }
 }
