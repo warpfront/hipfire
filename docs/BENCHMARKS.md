@@ -1,33 +1,92 @@
 # Benchmarks
 
-Published **historical** tables only. Every number here is a retained,
-fixture-bound observation from an earlier campaign. None of these rows is a
-live floor, product default, admission, or route certificate. Per
+## Current scoreboard: beta `ed92048043` (measured 2026-11-16)
+
+**Truth state:** measured (not admitted). Every cell below names its commit,
+model file, fixture and date, and its raw per-process JSON is cited by a
+`raw` ledger row (ids `SB16-*`) in [`registry/receipts-v1.json`](../registry/receipts-v1.json)
+`ledger` ([`PERF-LEDGER.md`](PERF-LEDGER.md)), which also carries each row's
+95% CI. None of these numbers is a speed floor, admission or route
+certificate; product admission stays in [`admissions.yml`](admissions.yml).
+
+| Field | Value |
+|---|---|
+| Build | `ed920480432141e1e0414be337c72efc50ea3960` (beta), release archive from [`scripts/build-binary-archive.sh`](../scripts/build-binary-archive.sh), one per arch |
+| Cards | R9700 (gfx1201, one card), 7900 XTX (gfx1100), Strix Halo (gfx1151); each cell an exclusive timing reservation |
+| Models | `qwen3.8:27b` (= `qwen3.8-27b.mq4-xts`, sha256 `3e38ccba…`), `qwen3.6:35b-a3b-mq4rs` (`8806a742…`), `qwen3.8:27b-mq3-xt` (`3e04fc8d…`), and the unregistered symmetric file `qwen3.8-27b.mq3-xts` (`68d5e6b9…`) loaded by path; Flash-Next GPTQ3 monolith (`8b15b6fe…`, by path) on R9700 only |
+| Config | defaults (speculation, KV mode, backend); clean `HIPFIRE_HOME` |
+| Prefill / AR | `hipfire bench --matrix --pp 512,2048,8192 --ctx 128,8192 --tg 128 --warmups 2 --runs 3` (synthetic ids; AR decode at context 128 and 8192) |
+| Speculative decode | default speculation, greedy, `--max-tokens 256 --min-tokens 256`; code `benchmarks/prompts/humaneval_0_has_close_elements.txt` (md5 `5333a1f7…`), prose `prose_river_short.txt` (md5 `07a78809…`); τ = tokens per verify window |
+| TTFT | `hipfire bench --ttft --prompt-file benchmarks/prompts/ttft_511.txt` (511 tokens, md5 `7423e894…`), time to first streamed token |
+| Statistic | 4 fresh processes per cell and fixture; per process the median of its runs, per cell the median of the 4 process medians; 95% bootstrap CI over processes in the ledger |
+
+Prefill and AR decode in tok/s; speculative decode in tok/s with τ in brackets;
+TTFT in ms. Each value is the median of 4 fresh processes; the last column is
+the row's widest 95% CI half-width relative to its median (the ledger row has
+every CI).
+
+| card | model | pp512 | pp2048 | pp8192 | tg128 @128 | tg128 @8K | spec route | code tok/s (τ) | prose tok/s (τ) | TTFT 511 ms | widest CI ± |
+|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| R9700 | `qwen3.8:27b` (mq4-xts) | 4,948 | 5,350 | 5,195 | 38.6 | 37.7 | dflash | 163.7 (6.26) | 52.2 (1.11) | 143 | 17.8% |
+| R9700 | `qwen3.6:35b-a3b-mq4rs` | 11,612 | 18,268 | 20,586 | 249.7 | 232.4 | AR | 243.8 | 244.7 | 64 | 0.4% |
+| R9700 | `qwen3.8:27b-mq3-xt` | 613 | 608 | 610 | 42.6 | 41.6 | dflash | 94.2 (2.75) | 55.5 (1.22) | 674 | 0.9% |
+| R9700 | `qwen3.8-27b.mq3-xts` (file) | 3,164 | 3,547 | 3,532 | 47.3 | 45.9 | AR | 47.1 | 47.1 | 185 | 0.4% |
+| R9700 | Flash-Next GPTQ3 monolith (file) | 1,229 | 2,508 | 6,782 | 32.6 | 31.6 | mtp+ngram | 73.7 (3.86) | 59.0 (0.97) | 637 | 8.8% |
+| 7900 XTX | `qwen3.8:27b` (mq4-xts) | 2,570 | 2,804 | 2,712 | 50.7 | 49.2 | dflash | 82.8 (3.54) | 54.0 (1.45) | 319 | 0.2% |
+| 7900 XTX | `qwen3.6:35b-a3b-mq4rs` | 6,364 | 5,675 | 3,856 | 213.0 | 202.6 | AR | 207.3 | 208.6 | 109 | 0.4% |
+| 7900 XTX | `qwen3.8:27b-mq3-xt` | 514 | 514 | 507 | 51.7 | 49.6 | dflash | 53.2 (3.48) | 29.9 (1.30) | 1,015 | 0.3% |
+| 7900 XTX | `qwen3.8-27b.mq3-xts` (file) | 1,890 | 2,125 | 2,087 | 58.6 | 56.0 | AR | 58.2 | 58.3 | 471 | 0.4% |
+| Strix Halo | `qwen3.8:27b` (mq4-xts) | 1,230 | 1,214 | 1,156 | 15.0 | 14.6 | dflash | 35.8 (3.54) | 25.8 (1.45) | 780 | 6.2% |
+| Strix Halo | `qwen3.6:35b-a3b-mq4rs` | 2,672 | 3,105 | 2,326 | 84.7 | 80.6 | AR | 84.5 | 84.7 | 218 | 0.2% |
+| Strix Halo | `qwen3.8:27b-mq3-xt` | 260 | 258 | 255 | 18.6 | 18.0 | dflash | 31.3 (3.48) | 18.9 (1.30) | 1,999 | 1.3% |
+| Strix Halo | `qwen3.8-27b.mq3-xts` (file) | 260 | 258 | 254 | 18.8 | 18.2 | AR | 18.8 | 18.8 | 1,949 | 0.6% |
+
+Reading notes (details in the ledger rows' receipts):
+
+- "spec route" is what the default configuration ran. The 27B registry tiers
+  pair a DFlash draft by default; `qwen3.6:35b-a3b-mq4rs` runs plain AR (MTP
+  `auto` declines without a measured AR floor); the unregistered
+  `qwen3.8-27b.mq3-xts`, loaded by path, gets no draft and runs AR.
+- The speculative rows decode exactly 256 tokens (`--min-tokens 256`). The code
+  answer ends at 173 tokens, so the code row includes decoding past EOS, where
+  DFlash acceptance drops: on the 7900 XTX `qwen3.8:27b` reaches 249.6 tok/s
+  (τ 12.31) at its natural 173-token length against 82.8 (τ 3.54) at 256.
+- On `qwen3.8:27b-mq3-xt`, default DFlash is slower than AR on the prose
+  prompt on the 7900 XTX (29.9 vs 51.7 tok/s).
+- R9700 `qwen3.8:27b` tg128 @128: one of the four processes ran at 31.7 tok/s
+  (the others 38.6), hence its 17.8% CI.
+- Flash-Next is the retired GPTQ3 monolith on one R9700 (host-mapped experts,
+  default MTP + n-gram route), measured only where a card had room.
+
+## Historical tables
+
+Everything below this heading is a retained, fixture-bound observation from
+an earlier campaign (April–July 2026 builds). None of these rows is a live
+floor, product default, admission, or route certificate. Per
 [`INDEX.md`](INDEX.md), a **measured** claim requires a named fixture, binary
 and model identity, and a measurement date on the same report — these tables
-do not carry that full identity manifest, so this page is **historical** only
+do not carry that full identity manifest, so they are **historical** only
 (the inventory date below is not a measurement date).
 
-**Current release numbers are not on this page.** Dated v0.4.4 measurements
-(card, fixture, method, date and build per row) are in the README's
+The tables below were taken on older builds, most with the `asym3` KV mode
+removed in 0.5.0; they are not the current speed of any listed card or model.
+Dated v0.4.4 measurements are in the README's
 [Measured performance (v0.4.4)](../README.md#measured-performance-v044) table
-and the [CHANGELOG](../CHANGELOG.md) entries it cites. The tables below were
-taken on older builds, most with the `asym3` KV mode removed in 0.5.0; they
-are not the current speed of any listed card or model. The v0.4.5 Flash-Next
+and the [CHANGELOG](../CHANGELOG.md) entries it cites. The v0.4.5 Flash-Next
 EP2 serve measurement (2x R9700, 2026-11-11) is the **measured** (not admitted)
 record [`perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md`](perf-checkpoints/2026-11-11-flash-next-ep2-cp20.md);
 it has no [`admissions.yml`](admissions.yml) row and is not a product floor.
 
 | Field | Value |
 |---|---|
-| Page state | **historical** (see [`INDEX.md`](INDEX.md)) |
+| Page state (tables below) | **historical** (see [`INDEX.md`](INDEX.md)) |
 | Inventory date | 2026-07-19 |
 | Audited source ref | `692a726dde53508cb53de1a74c720e75a7c9f33e` |
 | Comparison base | `origin/beta` @ `9ffb18da9d1377dfbf759db82641ea039b2e522e` |
 
 ## How to read this page
 
-1. Treat every table on this page as **historical** only. Do not upgrade a row
+1. Treat every table outside the current scoreboard as **historical** only. Do not upgrade a row
    to **measured** without a complete per-table date, fixture, and
    binary/model-identity evidence manifest **and** a fresh protocol-compliant
    run under

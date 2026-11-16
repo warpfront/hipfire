@@ -103,7 +103,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Speculation feature inventory | [`docs/speculation-support-inventory.md`](speculation-support-inventory.md) | shipped / ref-pinned | Current speculation capability inventory. Capability is not admission or a performance floor; verify in source before product claims. |
 | Model-load refusal wording inventory | [`docs/load-refusal-wording.md`](load-refusal-wording.md) | shipped / ref-pinned | Audit of the user-reachable model-load refusal strings (before/after, setting named, excluded areas). |
 | Spec-decode durability note (2026-06-23) | [`docs/spec-decode-durability-2026-06-23.md`](spec-decode-durability-2026-06-23.md) | historical | Dated 2026-06-23 fixture/tables report; not current validation. |
-| Published benchmark tables | [`docs/BENCHMARKS.md`](BENCHMARKS.md) | historical | Unmanifested / incomplete evidence identity on tables → historical only; not live floors or admissions. |
+| Published benchmark tables | [`docs/BENCHMARKS.md`](BENCHMARKS.md) | measured (top scoreboard) / historical (rest) | The top scoreboard (beta `ed92048043`, 2026-11-16) is measured, receipted by `raw` ledger rows `SB16-*`; unmanifested older tables → historical only. None are live floors or admissions. |
 | Dated perf campaign checkpoints | [`docs/perf-checkpoints/`](perf-checkpoints/) | measured | Immutable bodies; amend only via new dated files. |
 | Dependency adoption log | [`docs/dependency-adoption-log.md`](dependency-adoption-log.md) | historical | |
 | DeepSeek4 PR body archive | [`docs/deepseek4-pr-body.md`](deepseek4-pr-body.md) | historical | |
@@ -163,7 +163,7 @@ Every current top-level page, exactly once.
 | [`NIXOS.md`](NIXOS.md) | shipped / ref-pinned | NixOS. |
 | [`REDLINE.md`](REDLINE.md) | shipped / ref-pinned | Redline certification policy. |
 | [`GOLDEN-REDLINE.md`](GOLDEN-REDLINE.md) | branch-implemented | Sealed fixture reproduction and OpenAI-client setup. |
-| [`BENCHMARKS.md`](BENCHMARKS.md) | historical | Dated/historical bench tables; incomplete manifests stay historical-only. |
+| [`BENCHMARKS.md`](BENCHMARKS.md) | measured / historical | Current measured scoreboard on top (ledger rows `SB16-*`); dated historical bench tables below; incomplete manifests stay historical-only. |
 | [`PERF-LEDGER.md`](PERF-LEDGER.md) | shipped / ref-pinned | Perf ledger (`registry/receipts-v1.json` `ledger`): provenance, guard rule, how a perf claim is admitted. |
 | [`speculation-support-inventory.md`](speculation-support-inventory.md) | shipped / ref-pinned | Current speculation capability inventory. |
 | [`load-refusal-wording.md`](load-refusal-wording.md) | shipped / ref-pinned | Model-load refusal wording inventory. |

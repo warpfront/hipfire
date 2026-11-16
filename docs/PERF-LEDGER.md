@@ -8,8 +8,10 @@ of [`registry/receipts-v1.json`](../registry/receipts-v1.json), next to the
 stays, with its status and caveat.
 
 The seed is the 2026-11-15 PerfLedger audit (built against beta `a3a096297d`;
-the file's `ledger_source` field says so). It holds 63 rows: 33 `raw`, 30
-`prose`, 0 `contributor`.
+the file's `ledger_source` field says so): 63 rows, 33 `raw` and 30 `prose`.
+The 2026-11-16 scoreboard of beta `ed92048043` (section `SB-2026-11-16`, ids
+`SB16-*`, shown in [`BENCHMARKS.md`](BENCHMARKS.md)) added 65 `raw` rows, so the
+ledger holds 128 rows: 98 `raw`, 30 `prose`, 0 `contributor`.
 
 ## Row fields
 
