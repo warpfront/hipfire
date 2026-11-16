@@ -208,7 +208,7 @@ pub(crate) struct GdnReplaySharedScratch {
 
 impl Gpu {
     /// Process-static part of [`Self::gdn_replay_ml_eligible`]: exact
-    /// gfx1201, the `HIPFIRE_GDN_REPLAY_ML_OFF` opt-out, the fast
+    /// gfx1201, the fast
     /// (single-end requant) GDN kernel, head_dim 128 and GQA divisibility.
     /// A replay tape arms its multi-layer tables at construction iff this
     /// holds, so the replay route never depends on later memory pressure.
@@ -220,7 +220,6 @@ impl Gpu {
         value_head_dim: usize,
     ) -> bool {
         self.arch_caps.is_gfx1201()
-            && !self.flags.gdn_replay_ml_off
             && !crate::norm::dn_requant_per_token()
             && key_head_dim == DFLASH_GDN_REPLAY_HEAD_DIM
             && value_head_dim == DFLASH_GDN_REPLAY_HEAD_DIM

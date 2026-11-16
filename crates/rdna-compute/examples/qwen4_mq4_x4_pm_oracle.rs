@@ -4,7 +4,7 @@
 
 //! Byte oracle of the gfx1151 MQ4G256V2 prefill route (`Gpu::gemm_mq4g256v2_xf16`,
 //! `_xf16_regions`, `Gpu::gemm_mq4g256v2_hcw`): the certified PM module
-//! `qwen4_mq4_x4_pm_gfx1151` (or, with the PM flag off, its exact hipcc bt4 fallback)
+//! `qwen4_mq4_x4_pm_gfx1151`
 //! against the route it replaced.
 //!
 //! Weights are random valid MQ4G256V2 (finite normal f16 scale/zero per half group,
@@ -242,13 +242,13 @@ fn main() {
         eprintln!("qwen4_mq4_x4_pm_oracle: needs exact gfx1151 (got {arch}); nothing was checked");
         std::process::exit(2);
     }
-    let pm = gpu.gemm_mq4g256v2_pm_applies(2560, 96);
+    let pm = gpu.gemm_mq4g256v2_xf16_applies(2560, 96);
     println!(
         "qwen4_mq4_x4_pm_oracle: route={}",
         if pm {
             "embedded PM image qwen4_mq4_x4_pm_gfx1151 (bf16out, regions and hcw checked)"
         } else {
-            "PM off: hipcc bt4 on the shared F16 x (bf16out, regions and hcw not available)"
+            "route does not apply (bf16out, regions and hcw not checked)"
         }
     );
 
@@ -513,7 +513,7 @@ fn main() {
         if pm {
             "on"
         } else {
-            "off (hipcc bt4 fallback; bf16out/regions/hcw skipped)"
+            "off (route does not apply; bf16out/regions/hcw skipped)"
         }
     );
 }

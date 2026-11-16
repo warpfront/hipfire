@@ -957,8 +957,7 @@ pub(crate) fn g942_hc_gates_ensure(gpu: &mut Gpu, func: &str) -> HipResult<()> {
 }
 
 impl Gfx942Device<'_> {
-    /// The HC read's down projection and its activation as ONE launch (C1 fold,
-    /// kill switch `HIPFIRE_QWEN4_G942_FOLD_ELEM`):
+    /// The HC read's down projection and its activation as ONE launch (C1 fold):
     /// `out[b, m] = hc_act(Σ_k a[m, k] · x[b, k])`, `hc_act(v) = bf16(silu(bf16(bf16(v) · scale)))`
     /// in the unfused chain's expressions (see `kernels/src/qwen4_g942_glue_elem.hip`).
     ///

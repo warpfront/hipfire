@@ -5,7 +5,7 @@
 //! S3 per-pick routed-DOWN byte oracle (and in-process A/B timer) on the REAL expert tensors of a
 //! `.mq4-xts` artifact: the production `gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded`
 //! (-> `..._k640_r4`, shipped or F1 planar twin) versus the `dni` kernel selected by
-//! `HIPFIRE_QWEN4_MOE_DOWN_DNI` (`Gpu::set_moe_down_dni`), bit for bit.
+//! `Gpu::set_moe_down_dni`, bit for bit.
 //!
 //! Per layer (the rank's owned experts uploaded in the shipped layout, or repacked planar with
 //! `--planar`) and per case (rows x routing mode x seed): the same top-10 local ids (`-1` for picks

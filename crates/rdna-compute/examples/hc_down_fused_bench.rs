@@ -132,10 +132,9 @@ fn main() {
         BYTES_BEFORE_1201
     };
     println!(
-        "arch {} applies(320,10240,4096)={} HIPFIRE_QWEN4_HC_DOWN_FUSED={:?}",
+        "arch {} applies(320,10240,4096)={}",
         gpu.arch,
-        gpu.qwen4_hc_down_fused_applies(M, K, 4096),
-        std::env::var("HIPFIRE_QWEN4_HC_DOWN_FUSED").unwrap_or_default()
+        gpu.qwen4_hc_down_fused_applies(M, K, 4096)
     );
     println!(
         "bytes/row accounting (weight shadow excluded, see the header): before = {bytes_before} B; \

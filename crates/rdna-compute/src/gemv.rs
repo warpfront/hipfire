@@ -2600,9 +2600,7 @@ impl Gpu {
             &self.hip,
             &mut self.pool,
             self.device_id,
-            self.active_stream
-                .as_ref()
-                .filter(|_| self.flags.stream_ordered_copies),
+            self.active_stream.as_ref(),
         )
     }
 
@@ -2616,9 +2614,7 @@ impl Gpu {
             &self.hip,
             &mut self.pool,
             self.device_id,
-            self.active_stream
-                .as_ref()
-                .filter(|_| self.flags.stream_ordered_copies),
+            self.active_stream.as_ref(),
         )
     }
 

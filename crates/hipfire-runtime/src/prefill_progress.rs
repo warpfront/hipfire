@@ -17,9 +17,7 @@
 //!   (a single-chunk prompt, or the final chunk, produces no event — the first
 //!   token/`done` event already says prefill finished);
 //! - `done`/`total` count prompt tokens this request prefills (a cache-hit
-//!   prefix is not counted in either);
-//! - on by default; `HIPFIRE_PREFILL_PROGRESS=0` (read through
-//!   [`hipfire_config::developer_var`]) suppresses every event.
+//!   prefix is not counted in either).
 //!
 //! Chunk loops that own the request writer call [`emit_to`]. Loops that live
 //! in crates without the writer (the Qwen3.5 MTP/DFlash prompt prefill) call
@@ -34,22 +32,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::io::Write;
-use std::sync::LazyLock;
-
-/// Kill-switch variable (`0` disables the event; anything else keeps it on).
-pub const ENV_VAR: &str = "HIPFIRE_PREFILL_PROGRESS";
-
-/// Pure gate: the event is on unless the value is exactly `"0"`.
-pub fn gate(value: Option<&str>) -> bool {
-    value != Some("0")
-}
-
-/// Process-wide gate, read once through the developer-var snapshot.
-pub fn enabled() -> bool {
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| gate(hipfire_config::developer_var(ENV_VAR).ok().as_deref()));
-    *ENABLED
-}
 
 /// The `done < total` rule: a chunk reports only while prefill is incomplete.
 /// `done == 0` and `total == 0` never report (nothing prefilled / nothing to do).
@@ -73,16 +55,10 @@ pub fn event(id: &str, attempt_id: Option<u64>, done: usize, total: usize) -> se
     value
 }
 
-/// One whole newline-terminated wire line, or `None` when `gated` is off or the
-/// `done < total` rule says no event. `gated` is the resolved kill-switch.
-fn line(
-    gated: bool,
-    id: &str,
-    attempt_id: Option<u64>,
-    done: usize,
-    total: usize,
-) -> Option<Vec<u8>> {
-    if !gated || !should_report(done, total) {
+/// One whole newline-terminated wire line, or `None` when the `done < total`
+/// rule says no event.
+fn line(id: &str, attempt_id: Option<u64>, done: usize, total: usize) -> Option<Vec<u8>> {
+    if !should_report(done, total) {
         return None;
     }
     let mut bytes = event(id, attempt_id, done, total).to_string().into_bytes();
@@ -92,13 +68,12 @@ fn line(
 
 fn write_line<W: Write + ?Sized>(
     out: &mut W,
-    gated: bool,
     id: &str,
     attempt_id: Option<u64>,
     done: usize,
     total: usize,
 ) {
-    if let Some(bytes) = line(gated, id, attempt_id, done, total) {
+    if let Some(bytes) = line(id, attempt_id, done, total) {
         // One `write_all` of the whole line keeps it atomic w.r.t. other
         // writers on the same handle; flush so it precedes the first token.
         let _ = out.write_all(&bytes);
@@ -106,8 +81,8 @@ fn write_line<W: Write + ?Sized>(
     }
 }
 
-/// Emit one progress event to `out` (the request's own writer). No-op when the
-/// kill switch is off or `done >= total`.
+/// Emit one progress event to `out` (the request's own writer). No-op when
+/// `done >= total`.
 pub fn emit_to<W: Write + ?Sized>(
     out: &mut W,
     id: &str,
@@ -115,7 +90,7 @@ pub fn emit_to<W: Write + ?Sized>(
     done: usize,
     total: usize,
 ) {
-    write_line(out, enabled(), id, attempt_id, done, total);
+    write_line(out, id, attempt_id, done, total);
 }
 
 type Sink = Box<dyn FnMut(&[u8])>;
@@ -191,24 +166,20 @@ pub fn scope_with_sink(id: &str, attempt_id: Option<u64>, sink: Sink) -> Scope {
     Scope { previous }
 }
 
-fn report_gated(gated: bool, done: usize, total: usize) {
+/// Report prompt prefill progress for the thread's active request. No-op
+/// outside a [`prompt_phase`], without an active [`scope`], or at
+/// `done >= total`.
+pub fn report(done: usize, total: usize) {
     if !PROMPT_PHASE.with(Cell::get) {
         return;
     }
     ACTIVE.with(|active| {
         if let Some(target) = active.borrow_mut().as_mut() {
-            if let Some(bytes) = line(gated, &target.id, target.attempt_id, done, total) {
+            if let Some(bytes) = line(&target.id, target.attempt_id, done, total) {
                 (target.sink)(&bytes);
             }
         }
     });
-}
-
-/// Report prompt prefill progress for the thread's active request. No-op
-/// outside a [`prompt_phase`], without an active [`scope`], with the kill
-/// switch off, or at `done >= total`.
-pub fn report(done: usize, total: usize) {
-    report_gated(enabled(), done, total);
 }
 
 #[cfg(test)]
@@ -250,7 +221,7 @@ mod tests {
     #[test]
     fn event_line_escapes_hostile_id() {
         let id = "a\"b\\c\nd}";
-        let bytes = line(true, id, Some(1), 1, 2).expect("line");
+        let bytes = line(id, Some(1), 1, 2).expect("line");
         let v = parse(&bytes);
         assert_eq!(v["id"], id);
         assert_eq!(v["type"], "prefill_progress");
@@ -264,28 +235,17 @@ mod tests {
         assert!(!should_report(9000, 9000));
         assert!(!should_report(9001, 9000));
         assert!(!should_report(0, 0));
-        assert!(line(true, "r", Some(1), 512, 512).is_none());
-        assert!(line(true, "r", Some(1), 512, 1024).is_some());
-    }
-
-    #[test]
-    fn kill_switch_gate() {
-        assert!(gate(None));
-        assert!(gate(Some("1")));
-        assert!(gate(Some("")));
-        assert!(!gate(Some("0")));
-        assert!(line(gate(Some("0")), "r", Some(1), 512, 1024).is_none());
-        assert!(line(gate(None), "r", Some(1), 512, 1024).is_some());
+        assert!(line("r", Some(1), 512, 512).is_none());
+        assert!(line("r", Some(1), 512, 1024).is_some());
     }
 
     #[test]
     fn write_line_emits_one_flushed_line() {
         let mut out: Vec<u8> = Vec::new();
-        write_line(&mut out, true, "r1", Some(2), 512, 1024);
+        write_line(&mut out, "r1", Some(2), 512, 1024);
         assert_eq!(parse(&out)["done"], 512);
         out.clear();
-        write_line(&mut out, true, "r1", Some(2), 1024, 1024);
-        write_line(&mut out, false, "r1", Some(2), 512, 1024);
+        write_line(&mut out, "r1", Some(2), 1024, 1024);
         assert!(out.is_empty());
     }
 
@@ -307,15 +267,14 @@ mod tests {
                 None,
                 Box::new(move |bytes| inner.borrow_mut().push(parse(bytes))),
             );
-            report_gated(true, 256, 1024);
-            report_gated(true, 1024, 1024);
-            report_gated(false, 512, 1024);
+            report(256, 1024);
+            report(1024, 1024);
             let inner_events = inner_seen.borrow();
             assert_eq!(inner_events.len(), 1);
             assert_eq!(inner_events[0]["id"], "inner");
             assert!(inner_events[0].get("attempt_id").is_none());
         }
-        report_gated(true, 512, 1024);
+        report(512, 1024);
         let events = seen.borrow();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["id"], "outer");
@@ -326,7 +285,7 @@ mod tests {
     #[test]
     fn report_without_scope_is_noop() {
         let _phase = prompt_phase();
-        report_gated(true, 1, 2);
+        report(1, 2);
     }
 
     #[test]
@@ -338,14 +297,14 @@ mod tests {
             Some(1),
             Box::new(move |bytes| sink.borrow_mut().push(parse(bytes))),
         );
-        report_gated(true, 512, 1024);
+        report(512, 1024);
         assert!(seen.borrow().is_empty());
         {
             let _phase = prompt_phase();
-            report_gated(true, 512, 1024);
+            report(512, 1024);
             assert_eq!(seen.borrow().len(), 1);
         }
-        report_gated(true, 512, 1024);
+        report(512, 1024);
         assert_eq!(seen.borrow().len(), 1, "phase ended with its guard");
     }
 }

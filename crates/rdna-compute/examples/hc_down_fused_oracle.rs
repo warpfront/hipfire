@@ -24,8 +24,7 @@
 //! F16-range-edge BF16 patterns in the weight rows).
 //!
 //! Exit 0: every case byte-identical. 1: a mismatch (first (row, col, bits) printed) or a wrong
-//! applies() verdict. 2: the fused route does not apply here (kill switch
-//! `HIPFIRE_QWEN4_HC_DOWN_FUSED=0`, other arch).
+//! applies() verdict. 2: the fused route does not apply here (arch is not gfx1201/gfx1151).
 //! `ROWS=a,b,..` overrides the row list. Receipt: `HC_DOWN_ORACLE_RECEIPT` (default
 //! `./hc-down-fused-oracle.txt`).
 //!
@@ -235,15 +234,11 @@ fn le_u16(bytes: &[u8]) -> Vec<u16> {
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let arch = gpu.arch.to_string();
-    let switch = std::env::var("HIPFIRE_QWEN4_HC_DOWN_FUSED").unwrap_or_default();
     let probe_rows = 4096;
     let applies = gpu.qwen4_hc_down_fused_applies(M, K, probe_rows);
-    println!("arch {arch} HIPFIRE_QWEN4_HC_DOWN_FUSED={switch:?} applies(320,10240,{probe_rows})={applies}");
+    println!("arch {arch} applies(320,10240,{probe_rows})={applies}");
     if !applies {
-        eprintln!(
-            "the fused route does not apply (kill switch HIPFIRE_QWEN4_HC_DOWN_FUSED={switch:?} \
-             or arch {arch} is not gfx1201/gfx1151): the oracle needs the switch on"
-        );
+        eprintln!("the fused route does not apply: arch {arch} is not gfx1201/gfx1151");
         std::process::exit(2);
     }
 
@@ -286,11 +281,7 @@ fn main() {
         }
     )
     .unwrap();
-    writeln!(
-        receipt,
-        "switch HIPFIRE_QWEN4_HC_DOWN_FUSED={switch:?} scale={SCALE} m={M} k={K}"
-    )
-    .unwrap();
+    writeln!(receipt, "scale={SCALE} m={M} k={K}").unwrap();
 
     let mut failures = 0usize;
     let mut cases = 0usize;
@@ -327,7 +318,7 @@ fn main() {
             } else {
                 rdna_compute::gemm::HC_DOWN_FUSED_MIN_ROWS
             };
-            let expect_applies = switch != "0" && rows >= min_rows;
+            let expect_applies = rows >= min_rows;
             if case_applies != expect_applies {
                 failures += 1;
                 let line = format!(

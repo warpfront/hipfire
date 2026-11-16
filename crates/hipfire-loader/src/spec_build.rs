@@ -257,9 +257,7 @@ pub fn build_speculator(
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Option<Box<dyn Speculator>> {
     if let Some(df) = dflash {
-        // `None` = loader default (off: fixed block); env
-        // HIPFIRE_DFLASH_ADAPTIVE_B=0 still wins inside the constructor when
-        // the knob is on, mirroring the DSpark opt-out.
+        // `None` = loader default (off: fixed block).
         return Some(build_dflash_speculator(
             df,
             spec.dflash_adaptive_b.unwrap_or(false),

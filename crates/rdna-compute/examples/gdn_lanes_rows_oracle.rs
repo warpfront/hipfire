@@ -16,10 +16,10 @@
 //! The groups are the interpreter's: lanes with one row are AR lanes (the
 //! per-row branch: `gated_delta_conv_params` + `gated_delta_step_gated`; two or
 //! more of them go through `gated_delta_core_lanes`, launched as
-//! `launch_rotated`: ONE fused launch under HIPFIRE_QWEN4_GDN_LANES_FUSE, beta's
+//! `launch_rotated`: ONE fused launch, beta's
 //! default), lanes with 2..=8 rows are verify lanes (the capture chain; two or more
-//! of them go through `gated_delta_core_lanes_rows`, gated on
-//! HIPFIRE_QWEN4_GDN_LANES_ROWS); a set with a single member runs per lane in
+//! of them go through `gated_delta_core_lanes_rows`, the verify-rows core); a set
+//! with a single member runs per lane in
 //! both arms, exactly as `execute_gated_delta_net_core_lanes` does. A MIXED
 //! group is both sets of one layer: every kernel of each set launches once for
 //! the whole group (one-row kernels over the AR lanes, rows kernels over the
@@ -396,7 +396,7 @@ struct Arm {
     rot: Guarded,
     lanes: Vec<LaneBufs>,
     /// Per logical lane: a verify lane's qkv projection rows sit IN its capture `inputs`
-    /// (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`: the in-projection wrote the capture in place), so
+    /// (the in-projection wrote the capture in place), so
     /// its lane's `projection` IS its `conv.input` and the per-lane chain issues no copy.
     alias: Vec<bool>,
 }
@@ -763,7 +763,7 @@ fn verify_lane<'a>(v: &'a Vw, w: &'a Weights) -> GdnCoreRowsLane<'a> {
 /// output projection's rotating gate).
 fn verify_per_lane(gpu: &mut Gpu, l: &GdnCoreRowsLane<'_>, rot: &GpuTensor, rotate: bool) {
     // As `execute_gated_delta_net_hc_impl`: no copy when the in-projection already wrote the
-    // capture's `inputs` (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`, `projection` IS `conv.input`).
+    // capture's `inputs` (`projection` IS `conv.input`).
     if l.projection.buf.as_ptr() != l.conv.input.buf.as_ptr() {
         gpu.copy_d2d(l.projection, l.conv.input, l.conv.input.byte_size())
             .expect("capture input copy");
@@ -1001,7 +1001,7 @@ fn run_candidate(
     if let Some(plan) = ar_plan {
         grouping.ar_grouped = true;
         // As `execute_gated_delta_net_core_lanes` launches it: `launch_rotated`
-        // (the fused one-launch kernel under HIPFIRE_QWEN4_GDN_LANES_FUSE), with the
+        // (the fused one-launch kernel), with the
         // output projection's rotation scratch only for a group of AR lanes alone.
         let rot_all = arm.rot.view(0, arm.cap * VALUE);
         let rotation = (rotate && verify_lanes.is_empty()).then_some(&rot_all);
@@ -1033,7 +1033,7 @@ fn expected_counts(rows: &[usize], fuse: bool) -> ((u64, u64), (u64, u64)) {
     let ar = rows.iter().filter(|&&r| r == 1).count() as u64;
     let verify = rows.iter().filter(|&&r| r >= 2).count() as u64;
     let per_lane = (2 * ar + 3 * verify, verify);
-    // Two or more AR lanes: the fused one-launch kernel (HIPFIRE_QWEN4_GDN_LANES_FUSE,
+    // Two or more AR lanes: the fused one-launch kernel (
     // beta's default) or the two incumbent lane launches.
     let ar_launches = if ar >= 2 {
         if fuse {
@@ -1809,7 +1809,7 @@ struct Cli {
     bench: Option<usize>,
     bench_runs: usize,
     /// `--alias-capture`: every even lane's verify rows are projected into its capture `inputs`
-    /// in place (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`), so grouped sets mix aliased and copied
+    /// in place, so grouped sets mix aliased and copied
     /// lanes; the matrix only (no controls, no timing).
     alias: bool,
 }
@@ -2020,8 +2020,8 @@ fn main() {
     let default_enabled = gpu.flags.qwen4_gdn_lanes_enabled();
     let rows_default_enabled = gpu.flags.qwen4_gdn_lanes_rows_enabled();
     // The oracle runs the candidate routes whatever the defaults are (the rows
-    // route is gated on HIPFIRE_QWEN4_GDN_LANES_ROWS; the one-row group runs its
-    // fused kernel under HIPFIRE_QWEN4_GDN_LANES_FUSE, left at the process value).
+    // route is the verify-rows core; the one-row group runs its
+    // fused kernel, left at the process value).
     {
         let flags = Arc::make_mut(&mut gpu.flags);
         flags.qwen4_gdn_lanes = true;

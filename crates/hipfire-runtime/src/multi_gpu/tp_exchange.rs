@@ -37,7 +37,7 @@ use std::sync::LazyLock;
 use hip_bridge::{DeviceBuffer, HipError, HipResult};
 pub use rdna_compute::norm::TpExchange16;
 
-use super::{tp_graph_payload_offset, tp_peer_direct_enabled, Gpus};
+use super::{tp_graph_payload_offset, Gpus};
 
 /// Developer knob selecting the dense TP partial exchange format.
 pub const TP_EXCHANGE_ENV: &str = "HIPFIRE_TP_EXCHANGE";
@@ -256,8 +256,8 @@ impl Gpus {
     /// The 16-bit twin of the shared residual reduction
     /// [`Gpus::all_reduce_sum_f32_peer_add_routed`]: `residual[r] +=
     /// r(partial[0]) + r(partial[1]) + ...` in rank order on every rank.
-    /// Two ranks take the symmetric direct-peer read (kill switch
-    /// `HIPFIRE_TP_PEER_DIRECT=0`, alternating slots / whole-token graph
+    /// Two ranks take the symmetric direct-peer read (alternating slots /
+    /// whole-token graph
     /// capture as for the f32 route); other rank counts the rooted
     /// gather/fold/broadcast.
     pub(super) fn all_reduce_peer_add16(
@@ -274,7 +274,7 @@ impl Gpus {
                 "all_reduce_peer_add16: partial_slot must be 0 or 1",
             ));
         }
-        if self.devices.len() == 2 && tp_peer_direct_enabled() {
+        if self.devices.len() == 2 {
             let alternating = partial_slot.filter(|_| self.tp_peer_alternating_effective());
             return self.direct_add16(fmt, partials, residuals, count, alternating);
         }
