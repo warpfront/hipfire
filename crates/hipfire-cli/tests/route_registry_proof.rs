@@ -48,7 +48,11 @@ fn legacy_sku(file: &str) -> Option<RouteSku> {
 
 /// The removed `retained_redline_default`, extension rules and all, verbatim
 /// except that the process-config CPU-offload check (path independent, and
-/// unset in a test process) is omitted from both sides.
+/// unset in a test process) is omitted from both sides, and that the removed
+/// gfx1100 Qwen3.5-dense `.mq3-xt` extension rule is left out: its successor is
+/// a decode-weight-format capability ([`route_sku::DenseWeights`]), not an
+/// SKU, so the live side is asked with no dense weights and the format rule is
+/// proven by `hipfire-runtime`'s config tests instead.
 fn legacy_retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
@@ -74,15 +78,7 @@ fn legacy_retained_redline_default(
     if model_arch.eq_ignore_ascii_case("qwen4") && matches!(gpu_arch, "gfx1100" | "gfx1151") {
         return false;
     }
-    if gpu_arch == "gfx1100"
-        && model_arch.eq_ignore_ascii_case("qwen3_5")
-        && pp == 1
-        && tp == 1
-        && !has_drafter
-        && ext("mq3-xt")
-    {
-        return true;
-    }
+    // (gfx1100 Qwen3.5-dense `.mq3-xt` rule: see the doc comment.)
     if matches!(gpu_arch, "gfx1100" | "gfx1151" | "gfx1201") && pp == 1 && tp == 1 && ext("mq4r") {
         return true;
     }
@@ -147,8 +143,8 @@ fn registry_identity_route_equals_the_removed_extension_route_for_every_artifact
                         let is = retained_redline_default(
                             gpu_arch,
                             model_arch,
-                            &entry.file,
                             new,
+                            None,
                             pp,
                             tp,
                             ep,

@@ -1931,11 +1931,14 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
-                let route = match hipfire_runtime::route_sku::resolve_path(
+                // One open yields the SKU and the decode weight format (tensor
+                // index + HFQ metadata, never the name): the latter is the
+                // gfx1100 Qwen3.5-dense retained-default capability.
+                let identity = match hipfire_runtime::route_sku::identify_path(
                     std::path::Path::new(path),
                     route_sku_hint.as_deref(),
                 ) {
-                    Ok(route) => route,
+                    Ok(identity) => identity,
                     Err(err) => {
                         emit_uncorrelated_error(
                             &mut stdout,
@@ -1949,6 +1952,7 @@ fn main() {
                         continue;
                     }
                 };
+                let (route, dense_weights) = (identity.route, identity.dense_weights);
                 let route_sku = route.map(|route| route.sku);
                 if let Some(route) = route {
                     eprintln!(
@@ -2475,8 +2479,8 @@ fn main() {
                         let redline_default = hipfire_runtime::config::retained_redline_default(
                             &gpu.arch,
                             arch,
-                            path,
                             route_sku,
+                            dense_weights,
                             pp,
                             tp, hipfire_loader::admission::effective_ep(m.arch_id),
                             drafter.is_some(),

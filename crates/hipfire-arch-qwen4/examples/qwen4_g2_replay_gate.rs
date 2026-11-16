@@ -272,15 +272,14 @@ impl RouteFacts {
     /// The daemon's decision: `retained_redline_default` and no platform
     /// refusal. The same function the product calls, not a copy of it.
     fn default_route(&self) -> bool {
-        let route =
-            hipfire_runtime::route_sku::resolve_path(std::path::Path::new(&self.model_path), None)
-                .unwrap_or_else(|error| panic!("route identity: {error}"))
-                .map(|route| route.sku);
+        let identity =
+            hipfire_runtime::route_sku::identify_path(std::path::Path::new(&self.model_path), None)
+                .unwrap_or_else(|error| panic!("route identity: {error}"));
         hipfire_runtime::config::retained_redline_default(
             &self.gpu_arch,
             &self.model_arch,
-            &self.model_path,
-            route,
+            identity.route.map(|route| route.sku),
+            identity.dense_weights,
             self.pp,
             self.tp,
             self.ep,

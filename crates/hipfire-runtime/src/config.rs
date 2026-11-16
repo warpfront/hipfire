@@ -8,7 +8,7 @@
 //! `RuntimeConfig::get()` accessor. Runtime hot paths access config
 //! fields instead of hitting `std::env::var` on every call.
 
-use crate::route_sku::RouteSku;
+use crate::route_sku::{DenseWeights, RouteSku};
 use std::sync::OnceLock;
 
 /// Automatic Redline runtime default for single-GPU MQ4R models. The SKU is
@@ -41,11 +41,13 @@ pub fn mq4r_redline_default(gpu_arch: &str, route: Option<RouteSku>, pp: usize, 
 /// MTP-off load replays), byte-identical greedy text to the HIP graph.
 /// The symmetric-expert A3B SKU (`qwen3_5_moe`, [`RouteSku::Mq4rs`]) on exact gfx1201 is
 /// admitted the same way (single GPU, no drafter, PM4 transport), with greedy
-/// ids identical to the HIP route. The Qwen3.5 dense `.mq3-xt` file on exact
-/// gfx1100 is admitted for single-GPU plain-AR decode (no drafter): its
-/// retained PM4 tape needs the GFX10/GFX11 scratch rings (`gemv_mq3g256v2_residual`
-/// has a 16-byte private segment), and served `generate` greedy ids are
-/// identical to the HIP graph with ~1.17x the decode tok/s. `replay.backend = "hip"` opts out. A Qwen3.5-family process configured
+/// ids identical to the HIP route. A Qwen3.5 dense trunk on exact gfx1100 is
+/// admitted for single-GPU plain-AR decode (no drafter) when its decode weight
+/// format ([`DenseWeights`], read from the tensor index and HFQ metadata, never
+/// the file name) is in [`gfx1100_dense_weights_qualified`]: the MQ3G256V2
+/// tape needs the GFX10/GFX11 scratch rings (`gemv_mq3g256v2_residual` has a
+/// 16-byte private segment), and served `generate` greedy ids are identical to
+/// the HIP graph at x1.06-1.17 the decode tok/s. `replay.backend = "hip"` opts out. A Qwen3.5-family process configured
 /// for CPU-executed partial offload (`memory.offload_exec = "cpu"` with a
 /// spill on either tier — an explicit layer or routed-expert count, or
 /// explicit `auto`) gets no retained default: its
@@ -61,8 +63,8 @@ pub fn mq4r_redline_default(gpu_arch: &str, route: Option<RouteSku>, pp: usize, 
 pub fn retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
-    model_path: &str,
     route: Option<RouteSku>,
+    weights: Option<DenseWeights>,
     pp: usize,
     tp: usize,
     ep: usize,
@@ -84,17 +86,14 @@ pub fn retained_redline_default(
     if is_qwen35_family(model_arch) && cpu_offload_configured() {
         return false;
     }
-    // gfx1100 `.mq3-xt` (Qwen3.5 dense, plain AR): selected by file extension;
-    // its receipts are the 27B served identity + tok/s in CHANGELOG.md.
+    // gfx1100 Qwen3.5 dense plain AR: a qualified decode weight format; the
+    // receipts per format are the 27B served identity + tok/s in REDLINE.md §3.
     if gpu_arch == "gfx1100"
         && model_arch.eq_ignore_ascii_case("qwen3_5")
         && pp == 1
         && tp == 1
         && !has_drafter
-        && std::path::Path::new(model_path)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq3-xt"))
+        && weights.is_some_and(gfx1100_dense_weights_qualified)
     {
         return true;
     }
@@ -128,6 +127,18 @@ pub fn retained_redline_default(
 
 fn is_qwen35_family(model_arch: &str) -> bool {
     model_arch.eq_ignore_ascii_case("qwen3_5") || model_arch.eq_ignore_ascii_case("qwen3_5_moe")
+}
+
+/// Decode weight formats whose gfx1100 Qwen3.5-dense retained PM4 tape has its
+/// own served greedy-identity and decode-timing receipts (REDLINE.md §3):
+/// MQ3G256V2 (qt49), symmetric and asymmetric, and symmetric MQ4G256V2 (qt44,
+/// the default 27B `mq4-xts`). Asymmetric MQ4G256V2 has no receipts yet. A
+/// format joins only with both receipts.
+pub fn gfx1100_dense_weights_qualified(weights: DenseWeights) -> bool {
+    matches!(
+        weights,
+        DenseWeights::Mq3V2 { .. } | DenseWeights::Mq4V2 { symmetric: true }
+    )
 }
 
 fn cpu_offload_configured() -> bool {
@@ -324,10 +335,10 @@ mod legacy_spelling_golden;
 #[cfg(test)]
 mod tests {
     use super::{
-        mq4r_redline_default as mq4r_with_route, retained_redline_default as redline_with_route,
-        RuntimeConfig,
+        gfx1100_dense_weights_qualified, mq4r_redline_default as mq4r_with_route,
+        retained_redline_default as redline_with_route, RuntimeConfig,
     };
-    use crate::route_sku::RouteSku;
+    use crate::route_sku::{DenseWeights, RouteSku};
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
     /// The SKU a fixture name stands for. Production resolves the SKU from the
@@ -361,8 +372,8 @@ mod tests {
         redline_with_route(
             gpu_arch,
             model_arch,
-            model_path,
             fixture_route(model_path),
+            None,
             pp,
             tp,
             ep,
@@ -393,7 +404,7 @@ mod tests {
                 ("gfx1201", "qwen3_5_moe"),
             ] {
                 assert!(
-                    !redline_with_route(arch, model_arch, name, None, 1, 1, 1, false),
+                    !redline_with_route(arch, model_arch, None, None, 1, 1, 1, false),
                     "{name} with no resolved SKU on {arch}"
                 );
             }
@@ -402,8 +413,8 @@ mod tests {
         assert!(redline_with_route(
             "gfx1100",
             "qwen3_6_moe",
-            "/m/blob",
             Some(RouteSku::Mq4r),
+            None,
             1,
             1,
             1,
@@ -412,8 +423,8 @@ mod tests {
         assert!(redline_with_route(
             "gfx1201",
             "qwen3_5_moe",
-            "/m/blob",
             Some(RouteSku::Mq4rs),
+            None,
             1,
             1,
             1,
@@ -422,8 +433,8 @@ mod tests {
         assert!(redline_with_route(
             "gfx1151",
             "deepseek4",
-            "/m/blob",
             Some(RouteSku::Mq2r),
+            None,
             1,
             1,
             1,
@@ -435,8 +446,8 @@ mod tests {
         assert!(!redline_with_route(
             "gfx1100",
             "qwen3_5_moe",
-            "/m/blob",
             Some(RouteSku::Mq4rs),
+            None,
             1,
             1,
             1,
@@ -686,56 +697,52 @@ mod tests {
     }
 
     #[test]
-    fn gfx1100_qwen35_mq3_xt_plain_ar_is_admitted_and_nothing_wider() {
-        let f = "/models/qwen3.8-27b.mq3-xt";
-        assert!(retained_redline_default(
-            "gfx1100", "qwen3_5", f, 1, 1, false
-        ));
-        assert!(retained_redline_default(
-            "gfx1100",
-            "qwen3_5",
-            "/models/QWEN3.8-27B.MQ3-XT",
-            1,
-            1,
-            false
-        ));
-        // A drafter, multi-GPU, other GPU arches, other families and other
-        // extensions each keep the HIP graph (no widening without their own
-        // identity + timing receipts).
-        assert!(!retained_redline_default(
-            "gfx1100", "qwen3_5", f, 1, 1, true
-        ));
-        assert!(!retained_redline_default(
-            "gfx1100", "qwen3_5", f, 2, 1, false
-        ));
-        assert!(!retained_redline_default(
-            "gfx1100", "qwen3_5", f, 1, 2, false
-        ));
-        for arch in ["gfx1030", "gfx1101", "gfx1151", "gfx1200", "gfx942"] {
-            assert!(
-                !retained_redline_default(arch, "qwen3_5", f, 1, 1, false),
-                "{arch} must stay on HIP for .mq3-xt"
-            );
+    fn gfx1100_qwen35_dense_admits_qualified_weight_formats_and_nothing_wider() {
+        let gfx1100 = |model_arch: &str, weights, pp, tp, ep, has_drafter| {
+            redline_with_route(
+                "gfx1100",
+                model_arch,
+                None,
+                weights,
+                pp,
+                tp,
+                ep,
+                has_drafter,
+            )
+        };
+        let qualified = [
+            DenseWeights::Mq3V2 { symmetric: false },
+            DenseWeights::Mq3V2 { symmetric: true },
+            DenseWeights::Mq4V2 { symmetric: true },
+        ];
+        for w in qualified {
+            assert!(gfx1100_dense_weights_qualified(w));
+            assert!(gfx1100("qwen3_5", Some(w), 1, 1, 1, false), "{w:?}");
+            // A drafter, multi-GPU and expert parallelism keep the HIP graph.
+            assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 1, true), "{w:?}");
+            assert!(!gfx1100("qwen3_5", Some(w), 2, 1, 1, false), "{w:?}");
+            assert!(!gfx1100("qwen3_5", Some(w), 1, 2, 1, false), "{w:?}");
+            assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 2, false), "{w:?}");
+            // Other GPU arches (gfx1201 admits every Qwen3.5 dense format on
+            // its own rule) and other families stay on HIP.
+            for arch in ["gfx1030", "gfx1101", "gfx1151", "gfx1200", "gfx942"] {
+                assert!(
+                    !redline_with_route(arch, "qwen3_5", None, Some(w), 1, 1, 1, false),
+                    "{arch} must stay on HIP for {w:?}"
+                );
+            }
+            for model_arch in ["qwen3_5_moe", "qwen3", "qwen4", "gemma4", "deepseek4"] {
+                assert!(
+                    !gfx1100(model_arch, Some(w), 1, 1, 1, false),
+                    "{model_arch} {w:?} must stay on HIP on gfx1100"
+                );
+            }
         }
-        for model_arch in ["qwen3_5_moe", "qwen3", "gemma4", "deepseek4"] {
-            assert!(
-                !retained_redline_default("gfx1100", model_arch, f, 1, 1, false),
-                "{model_arch} .mq3-xt must stay on HIP on gfx1100"
-            );
-        }
-        for path in [
-            "/models/qwen3.8-27b.mq3",
-            "/models/qwen3.8-27b.mq4",
-            "/models/qwen3.8-27b.mq3-xts",
-            "/models/qwen3.8-27b.mq4-xts",
-        ] {
-            assert!(
-                !retained_redline_default("gfx1100", "qwen3_5", path, 1, 1, false),
-                "{path} must stay on HIP on gfx1100"
-            );
-        }
-        // The extension is not an MQ4R: the narrow MQ4R predicate stays untouched.
-        assert!(!mq4r_redline_default("gfx1100", f, 1, 1));
+        // Unqualified (no receipts) or unknown formats keep the HIP graph.
+        let w = DenseWeights::Mq4V2 { symmetric: false };
+        assert!(!gfx1100_dense_weights_qualified(w));
+        assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 1, false), "{w:?}");
+        assert!(!gfx1100("qwen3_5", None, 1, 1, 1, false));
     }
 
     #[test]

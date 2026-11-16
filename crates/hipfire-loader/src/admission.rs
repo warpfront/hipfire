@@ -261,22 +261,22 @@ pub(crate) fn qwen4_native_mtp(
     }
     let route = hipfire_runtime::route_sku::resolve_path(std::path::Path::new(path), None)?
         .map(|route| route.sku);
-    qwen4_native_mtp_routed(spec, gpu_arch, path, route, pp, tp, ep)
+    qwen4_native_mtp_routed(spec, gpu_arch, route, pp, tp, ep)
 }
 
 /// [`qwen4_native_mtp`] with the file's route SKU already resolved.
 pub(crate) fn qwen4_native_mtp_routed(
     spec: SpecLoadCfg,
     gpu_arch: &str,
-    path: &str,
     route: Option<hipfire_runtime::route_sku::RouteSku>,
     pp: usize,
     tp: usize,
     ep: usize,
 ) -> Result<bool, String> {
     use hipfire_config::load_summary::{note, Facet};
+    // Qwen4 is not a Qwen3.5-dense trunk: no dense-weights admission applies.
     let retained = hipfire_runtime::config::retained_redline_default(
-        gpu_arch, "qwen4", path, route, pp, tp, ep, true,
+        gpu_arch, "qwen4", route, None, pp, tp, ep, true,
     );
     let floor = hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR;
     let verdict = qwen4_native_mtp_for_floor(spec.mtp, retained, floor);
@@ -4050,7 +4050,7 @@ mod tests {
         // An MQ4R-SKU load on a retained-default GPU is the retained AR route.
         let sku = Some(hipfire_runtime::route_sku::RouteSku::Mq4r);
         let routed = |mtp, gpu_arch: &str, route| {
-            qwen4_native_mtp_routed(with(mtp), gpu_arch, hfq, route, 1, 1, 1)
+            qwen4_native_mtp_routed(with(mtp), gpu_arch, route, 1, 1, 1)
         };
         assert_eq!(routed(None, "gfx1201", sku), Ok(false));
         assert!(routed(Some(true), "gfx1201", sku).is_err());

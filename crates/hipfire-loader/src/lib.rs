@@ -3651,8 +3651,9 @@ fn resolve_qwen4_route_plan(
     let route = hipfire_runtime::route_sku::resolve(hfq, None)
         .map_err(|error| format!("route identity: {error}"))?
         .map(|route| route.sku);
+    // Qwen4 is not a Qwen3.5-dense trunk: no dense-weights admission applies.
     if hipfire_runtime::config::retained_redline_default(
-        &gpu.arch, "qwen4", req.path, route, req.pp, 1, ep, true,
+        &gpu.arch, "qwen4", route, None, req.pp, 1, ep, true,
     ) {
         return Err("retained Redline route".into());
     }

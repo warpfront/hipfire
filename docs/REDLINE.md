@@ -158,7 +158,7 @@ After a successful model load, the daemon may request Auto via
 `ReplayController::configure_model_default` when `retained_redline_default`
 matches. **Current automatic runtime selection is only** the MQ4R predicate
 `mq4r_redline_default` (single-GPU MQ4R SKU on the exact GPU-arch allowlist),
-the gfx1201 A3B MQ4RS SKU (`qwen3_5_moe`, no drafter, pp=tp=1) plus Qwen3.5 dense and Qwen4 (Flash-Next) plain-AR predicates below, the gfx1100 Qwen3.5 dense `.mq3-xt` plain-AR predicate (extension-selected), and
+the gfx1201 A3B MQ4RS SKU (`qwen3_5_moe`, no drafter, pp=tp=1) plus Qwen3.5 dense and Qwen4 (Flash-Next) plain-AR predicates below, the gfx1100 Qwen3.5 dense plain-AR predicate (selected by the decode weight format, never the file name), and
 the gfx1151 DeepSeek4 MQ2R SKU AR predicate. Existing LFM `.mq4` registry evidence is not
 auto-selected because it is not an MQ4R SKU (not because LFM is categorically
 model-family exempt).
@@ -266,36 +266,60 @@ the 0.4.1 qualification run 80 of H2's 898 boundary waits were elided by the
 `ROC_GLOBAL_CU_MASK` does not constrain the
 Redline PM4 queue.
 
-#### gfx1100 Qwen3.5 dense `.mq3-xt` plain-AR runtime default
+#### gfx1100 Qwen3.5 dense plain-AR runtime default (qualified weight formats)
 
 `retained_redline_default` — source: `crates/hipfire-runtime/src/config.rs`.
 
 ```text
 exact GPU arch is gfx1100
 AND model_arch is qwen3_5 (dense, arch_id 5)
-AND model extension is .mq3-xt, case-insensitive
+AND the file's DenseWeights is in gfx1100_dense_weights_qualified:
+      MQ3G256V2 (qt49), symmetric or asymmetric
+      MQ4G256V2 (qt44), symmetric
 AND pipeline parallelism == 1
 AND tensor parallelism == 1
+AND expert parallelism == 1
 AND no drafter is installed
+AND no CPU-executed partial offload
 ```
 
-The `.mq3-xt` decode tape contains `gemv_mq3g256v2_residual`, which has a
+`DenseWeights` (`crates/hipfire-runtime/src/route_sku.rs`) is a property of the
+bytes: the one quant type of every trunk projection (`*.layers.<n>.*proj*.weight`)
+and the separate `lm_head`, plus the `mq3v2.symmetric` / `mq4v2.symmetric` marker.
+The daemon reads it with the route SKU from one open (`identify_path`). A copy,
+hard link or rename of a file takes the same route; mixed-format trunks and every
+other format keep the HIP graph. Until 0.5.0 this rule selected `.mq3-xt` by file
+extension, the last name-selected route.
+
+The MQ3G256V2 decode tape contains `gemv_mq3g256v2_residual`, which has a
 16-byte private segment per lane, so the route needs the GFX10/GFX11 PM4
 scratch rings (`HIPFIRE_PMSCRATCH_PM4_SCRATCH`, default on; at `=0` the prepare
 refuses and the load falls back closed to the HIP graph). Each lane's ring is also
 published in its queue's `amd_queue_t` scratch fields (`QueueSet::bind_scratch`):
 the command processor reloads the scratch registers from there when KFD maps the
-queue again after an eviction, and a queue without them stalls (HIPF-347). Receipts (xtx, qwen3.8-27b
-`.mq3-xt`, served daemon `generate`, driver `tools/redline/serve_identity_ab.py`
-which acks `commit_ready` as `serve` does): greedy token ids identical between
-the retained route (default selection and explicit `redline`), the HIP graph and
-the ring kill switch on story / code / 4,519-token prompts x 512 tokens, with a
-`HIPFIRE_REPLAY_ROUTE_PROOF ... replays=511..512` marker on every retained
-request and the fallback message on the kill-switch arm (fabric j4449, j4456);
-served decode 62.5 vs 53.4 tok/s at ctx ~30 and 58.7 vs 50.6 at ctx ~4.5K
-(x1.17 / x1.16, ABBAABBA fresh daemons, j4456). Opt-out and limits are those of
-the gfx1201 Qwen3.5 section; no other gfx1100 format or family is admitted
-without its own identity and timing receipts.
+queue again after an eviction, and a queue without them stalls (HIPF-347). The
+MQ4G256V2 tape has no scratch kernel.
+
+Receipts per format (xtx, qwen3.8-27b, served daemon `generate`, driver
+`tools/redline/serve_identity_ab.py`, which acks `commit_ready` as `serve` does;
+greedy token ids identical between the retained route and the HIP graph on
+story / code / 4,519-token / repeated-story prompts x 512 tokens, with a
+`HIPFIRE_REPLAY_ROUTE_PROOF ... replays=511..512` marker on every retained request):
+
+| Format | File | Identity | Served decode, retained vs HIP graph |
+|---|---|---|---|
+| MQ3G256V2 asymmetric | `.mq3-xt` | j4449, j4456 (+ ring kill switch) | 62.5 vs 53.4 tok/s at ctx ~30, 58.7 vs 50.6 at ctx ~4.5K (x1.17 / x1.16, j4456) |
+| MQ3G256V2 symmetric (+ AWQ sidecars: the tape runs `fused_rmsnorm_mq_rotate_awq_g12dec` / `rotate_x_mq_awq` / `fused_silu_mul_mq_rotate_awq`) | `.mq3-xts`, sha256 `68d5e6b9…bfe7` | j5269 (+ ring kill switch; the 4,519-token prompt takes the gfx1100 W3A4 prefill) | tg128@ctx128 60.9 vs 54.3 tok/s, x1.121 [1.116, 1.122] (4 fresh daemons per arm, j5270) |
+| MQ4G256V2 symmetric (+ AWQ sidecars) | `.mq4-xts`, sha256 `3e38ccba…f8ae` | j5271, j5273 | 53.7 vs 50.5 tok/s at ctx ~30 (x1.063 [1.059, 1.066]), 50.95 vs 48.1 at ctx ~4.5K (x1.059 [1.056, 1.063]), 4 fresh daemons per arm, j5271; product default tg128@ctx128 54.1 vs 50.9 (x1.062 [1.061, 1.063], 4 fresh daemons per arm, j5273) |
+
+Default selection by format (fabric j5273, no backend env): the daemon logged
+`enabling fail-closed retained default`, replayed every request and matched the
+HIP graph's ids for `.mq3-xts`, `.mq4-xts` and the `.mq3-xt` bytes loaded under
+the name `renamed-mq3xt.bin` (same ids as the `.mq3-xt` receipts above).
+
+Opt-out and limits are those of the gfx1201 Qwen3.5 section. A format joins the
+qualified set only with its own identity and timing receipts (asymmetric
+MQ4G256V2 has none yet).
 
 #### gfx1201 Qwen4 (Flash-Next) plain-AR runtime default
 
@@ -1204,7 +1228,7 @@ Prefer paths and symbols over line numbers.
 
 | Concern | Stable source path and symbols |
 |---|---|
-| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default`: `mq4r_redline_default` (MQ4R SKU + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic except the Muse Glimmer and Gemma 4 withholds), Qwen3.5 dense (`qwen3_5`) and Qwen4 (`qwen4`) on exact gfx1201 with `pp=tp=1` and no drafter, Qwen3.5 dense `.mq3-xt` on exact gfx1100 with `pp=tp=1` and no drafter, the A3B MQ4RS SKU on exact gfx1201 with `pp=tp=1` and no drafter, and DeepSeek4 MQ2R on gfx1151 AR (SKU identity: `crates/hipfire-runtime/src/route_sku.rs`). Expert-parallel loads (`ep` > 1) and Qwen3.5 under CPU-executed partial offload are never admitted. Existing LFM `.mq4` sealed evidence has no automatic selector. |
+| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default`: `mq4r_redline_default` (MQ4R SKU + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic except the Muse Glimmer and Gemma 4 withholds), Qwen3.5 dense (`qwen3_5`) and Qwen4 (`qwen4`) on exact gfx1201 with `pp=tp=1` and no drafter, Qwen3.5 dense on exact gfx1100 with a qualified decode weight format (`gfx1100_dense_weights_qualified`: MQ3G256V2, symmetric MQ4G256V2), `pp=tp=1` and no drafter, the A3B MQ4RS SKU on exact gfx1201 with `pp=tp=1` and no drafter, and DeepSeek4 MQ2R on gfx1151 AR (SKU and dense-weights identity: `crates/hipfire-runtime/src/route_sku.rs`, `identify_path`). Expert-parallel loads (`ep` > 1) and Qwen3.5 under CPU-executed partial offload are never admitted. Existing LFM `.mq4` sealed evidence has no automatic selector. |
 | Model-load application and diagnostic handlers | `crates/hipfire-daemon/src/main.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
 | Qwen model boundary and route | `crates/hipfire-arch-qwen35/src/qwen35.rs` — `forward_scratch`; `prepare_scratch_inputs`; `set_forward_eligible`; `should_route_aql`; `should_route_pm4`; `finish_capture`; `prepare_*` |
 | LFM decode path and registry evidence | `crates/hipfire-arch-lfm2moe/src/forward.rs` — `decode_step`; `decode_step_with_graph`. Sealed LFM retained-PM4 evidence/admission: [`admissions.yml`](admissions.yml) row `lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar` (no current runtime selector). |

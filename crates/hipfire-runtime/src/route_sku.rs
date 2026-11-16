@@ -22,6 +22,12 @@
 //! 3. DeepSeek V4 only: the structural MQ2R P3 tensor map in the tensor index
 //!    (554 dense MFP4G32E8SOA tensors, Q8F16 embedding);
 //! 4. otherwise no SKU, and no automatic Redline route.
+//!
+//! The same rule covers the dense decode weight format ([`DenseWeights`]): the
+//! one quant type of a dense trunk's projections, read from the tensor index
+//! and the symmetric-zero metadata markers. The gfx1100 Qwen3.5-dense retained
+//! default keys on it; it replaced the `.mq3-xt` extension rule, the last
+//! name-selected route. [`identify_path`] reads both facts from one open.
 
 use crate::hfq::HfqFile;
 
@@ -183,19 +189,111 @@ pub fn resolve(hfq: &HfqFile, registry_quant: Option<&str>) -> Result<Option<Rou
     }))
 }
 
-/// [`resolve`] over the file at `path`. A path that is not an HFQ container
-/// (an HF snapshot directory, GGUF) has no HFQ identity, so only the registry
-/// card can name its SKU.
+/// The route identity of a model file: its SKU ([`resolve`]) and its dense
+/// decode weight format ([`dense_weights`]), both read from one open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identity {
+    pub route: Option<Route>,
+    pub dense_weights: Option<DenseWeights>,
+}
+
+/// [`Identity`] of the file at `path`, opening it once (an open validates the
+/// whole symmetric-MQ3 body, so callers needing both facts use this). A path
+/// that is not an HFQ container (an HF snapshot directory, GGUF) has no HFQ
+/// identity: only the registry card can name its SKU, and it has no dense
+/// weights.
+pub fn identify_path(
+    path: &std::path::Path,
+    registry_quant: Option<&str>,
+) -> Result<Identity, String> {
+    match HfqFile::open_at_offset(path, 0) {
+        Ok(hfq) => Ok(Identity {
+            route: resolve(&hfq, registry_quant)?,
+            dense_weights: dense_weights(&hfq),
+        }),
+        Err(_) => Ok(Identity {
+            route: registry_route(registry_quant).map(|sku| Route {
+                sku,
+                source: RouteSource::Registry,
+            }),
+            dense_weights: None,
+        }),
+    }
+}
+
+/// The route SKU of the file at `path` ([`identify_path`] without the dense
+/// weights).
 pub fn resolve_path(
     path: &std::path::Path,
     registry_quant: Option<&str>,
 ) -> Result<Option<Route>, String> {
-    match HfqFile::open_at_offset(path, 0) {
-        Ok(hfq) => resolve(&hfq, registry_quant),
-        Err(_) => Ok(registry_route(registry_quant).map(|sku| Route {
-            sku,
-            source: RouteSource::Registry,
-        })),
+    identify_path(path, registry_quant).map(|identity| identity.route)
+}
+
+/// HFQ quant type of MQ4G256V2.
+const QT_MQ4G256V2: u8 = 44;
+/// HFQ quant type of MQ3G256V2.
+const QT_MQ3G256V2: u8 = 49;
+
+/// The decode weight format of a dense trunk: the one quant type every trunk
+/// projection weight and the separate `lm_head` share, plus the format's
+/// symmetric-zero metadata marker. A property of the bytes (tensor index and
+/// HFQ metadata), never of the file name. Retained-Redline admission rules
+/// that depend on the decode kernels key on this, not on a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenseWeights {
+    /// MQ3G256V2 (qt49); `symmetric` is the `mq3v2.symmetric` marker.
+    Mq3V2 { symmetric: bool },
+    /// MQ4G256V2 (qt44); `symmetric` is the `mq4v2.symmetric` marker.
+    Mq4V2 { symmetric: bool },
+}
+
+/// A trunk projection weight the decode GEMVs read: a 2-D `*.weight` under a
+/// `layers.<n>` block whose module name contains `proj` (q/k/v/o, gate/up/down,
+/// the linear-attention `in_proj_*` / `out_proj`). MTP-head and vision-tower
+/// tensors are not trunk weights; AWQ sidecars end in `.awq_scale.weight`.
+fn is_trunk_projection(name: &str) -> bool {
+    if name.starts_with("mtp") || name.contains("visual") || name.contains("vision") {
+        return false;
+    }
+    let Some(module) = name.strip_suffix(".weight") else {
+        return false;
+    };
+    let leaf = module.rsplit('.').next().unwrap_or(module);
+    module.contains(".layers.") && leaf.contains("proj")
+}
+
+/// The [`DenseWeights`] of an opened HFQ file: `Some` only when the file
+/// stores a separate `lm_head.weight`, has at least one trunk projection, and
+/// every trunk projection plus the `lm_head` has the same qt44 or qt49 type.
+/// A tied-embedding file (no `lm_head.weight`) decodes its head on
+/// `embed_tokens` in another format, which no receipt covers, so it is `None`.
+pub fn dense_weights(hfq: &HfqFile) -> Option<DenseWeights> {
+    let mut qt = None;
+    let mut has_lm_head = false;
+    for tensor in hfq.tensors() {
+        let is_head = tensor.name == "lm_head.weight";
+        if !(is_head || is_trunk_projection(&tensor.name)) {
+            continue;
+        }
+        has_lm_head |= is_head;
+        match qt {
+            None => qt = Some(tensor.quant_type),
+            Some(seen) if seen != tensor.quant_type => return None,
+            Some(_) => {}
+        }
+    }
+    if !has_lm_head {
+        return None;
+    }
+    match qt? {
+        QT_MQ3G256V2 => Some(DenseWeights::Mq3V2 {
+            symmetric: hfq.mq3v2_symmetric(),
+        }),
+        QT_MQ4G256V2 => Some(DenseWeights::Mq4V2 {
+            symmetric: hfq.mq4v2_symmetric(),
+        }),
+        _ => None,
     }
 }
 
@@ -248,15 +346,31 @@ mod tests {
         metadata: &str,
         tensors: &[(String, u8)],
     ) -> std::path::PathBuf {
+        let tensors: Vec<(String, u8, Vec<u8>)> = tensors
+            .iter()
+            .map(|(tensor, qt)| (tensor.clone(), *qt, Vec::new()))
+            .collect();
+        write_hfq_with_data(dir, name, arch_id, metadata, &tensors)
+    }
+
+    /// An HFQ container whose tensors carry the given payload bytes, in index
+    /// order after the index.
+    fn write_hfq_with_data(
+        dir: &std::path::Path,
+        name: &str,
+        arch_id: u32,
+        metadata: &str,
+        tensors: &[(String, u8, Vec<u8>)],
+    ) -> std::path::PathBuf {
         let mut index = Vec::new();
         index.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
-        for (tensor, qt) in tensors {
+        for (tensor, qt, data) in tensors {
             index.extend_from_slice(&(tensor.len() as u16).to_le_bytes());
             index.extend_from_slice(tensor.as_bytes());
             index.push(*qt);
             index.push(0); // no dims
             index.extend_from_slice(&0u32.to_le_bytes()); // group size
-            index.extend_from_slice(&0u64.to_le_bytes()); // data size
+            index.extend_from_slice(&(data.len() as u64).to_le_bytes());
         }
         let data_offset = 32 + metadata.len() + index.len();
         let mut bytes = Vec::new();
@@ -268,6 +382,9 @@ mod tests {
         bytes.extend_from_slice(&(data_offset as u64).to_le_bytes());
         bytes.extend_from_slice(metadata.as_bytes());
         bytes.extend_from_slice(&index);
+        for (_, _, data) in tensors {
+            bytes.extend_from_slice(data);
+        }
         let path = dir.join(name);
         std::fs::write(&path, bytes).unwrap();
         path
@@ -373,5 +490,129 @@ mod tests {
         assert_eq!(resolve(&open(&lloyd), None), Ok(None));
         let other_arch = write_hfq(dir.path(), "o.bin", 6, meta, &ds4_tensors(554));
         assert_eq!(resolve(&open(&other_arch), None), Ok(None));
+    }
+
+    /// A Qwen3.5-dense trunk index: one linear-attention and one full-attention
+    /// layer of projections, norms, AWQ sidecars, an MTP and a vision tensor,
+    /// and an `lm_head`, every projection at `qt`.
+    fn dense_trunk(qt: u8) -> Vec<(String, u8)> {
+        let p = "model.language_model.layers";
+        let mut tensors = vec![
+            ("model.language_model.embed_tokens.weight".to_string(), 3),
+            ("lm_head.weight".to_string(), qt),
+            (format!("{p}.0.input_layernorm.weight"), 1),
+            (format!("{p}.0.linear_attn.in_proj_qkv.awq_scale.weight"), 1),
+            ("mtp.layers.0.mlp.down_proj.weight".to_string(), 13),
+            ("model.visual.blocks.0.attn.proj.weight".to_string(), 1),
+        ];
+        for m in [
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_a",
+            "in_proj_b",
+            "out_proj",
+        ] {
+            tensors.push((format!("{p}.0.linear_attn.{m}.weight"), qt));
+        }
+        for m in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            tensors.push((format!("{p}.1.self_attn.{m}.weight"), qt));
+        }
+        for l in 0..2 {
+            for m in ["gate_proj", "up_proj", "down_proj"] {
+                tensors.push((format!("{p}.{l}.mlp.{m}.weight"), qt));
+            }
+        }
+        tensors
+    }
+
+    /// One symmetric group of `qt`: both halves `d = 1.0`, `z = -k * d`
+    /// (MQ3V2: 104 B, k = 4; MQ4V2: 136 B, k = 8), zero codes.
+    fn symmetric_group(qt: u8) -> Vec<u8> {
+        let (len, z) = match qt {
+            QT_MQ3G256V2 => (104, -4.0f32),
+            _ => (136, -8.0f32),
+        };
+        let mut group = vec![0u8; len];
+        for half in 0..2 {
+            group[half * 4..half * 4 + 2].copy_from_slice(&half::f16::ONE.to_le_bytes());
+            group[half * 4 + 2..half * 4 + 4]
+                .copy_from_slice(&half::f16::from_f32(z).to_le_bytes());
+        }
+        group
+    }
+
+    fn dense_weights_at(path: &std::path::Path) -> Option<DenseWeights> {
+        identify_path(path, None).unwrap().dense_weights
+    }
+
+    #[test]
+    fn dense_weights_come_from_the_bytes_and_a_rename_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let qwen = r#"{"architecture":"qwen3_5"}"#;
+        let sym3 = r#"{"architecture":"qwen3_5","mq3v2.symmetric":1}"#;
+        let sym4 = r#"{"architecture":"qwen3_5","mq4v2.symmetric":1}"#;
+        let cases = [
+            (qwen, QT_MQ3G256V2, DenseWeights::Mq3V2 { symmetric: false }),
+            (sym3, QT_MQ3G256V2, DenseWeights::Mq3V2 { symmetric: true }),
+            (qwen, QT_MQ4G256V2, DenseWeights::Mq4V2 { symmetric: false }),
+            (sym4, QT_MQ4G256V2, DenseWeights::Mq4V2 { symmetric: true }),
+        ];
+        for (i, (meta, qt, want)) in cases.into_iter().enumerate() {
+            // Every trunk projection carries one symmetric group, so the
+            // open-time symmetric-zero validation passes.
+            let tensors: Vec<(String, u8, Vec<u8>)> = dense_trunk(qt)
+                .into_iter()
+                .map(|(name, t)| {
+                    let data = if t == qt {
+                        symmetric_group(qt)
+                    } else {
+                        Vec::new()
+                    };
+                    (name, t, data)
+                })
+                .collect();
+            let mut answers = Vec::new();
+            // The same bytes under the shipped name, a sibling name, no
+            // extension and an unrelated one: one identity, one route answer.
+            for name in ["q.mq3-xt", "q.mq3-xts", "q.mq4-xts", "renamed", "r.bin"] {
+                let file = format!("{i}-{name}");
+                let path = write_hfq_with_data(dir.path(), &file, 5, meta, &tensors);
+                let weights = dense_weights_at(&path);
+                assert_eq!(weights, Some(want), "{name}");
+                answers.push(crate::config::retained_redline_default(
+                    "gfx1100", "qwen3_5", None, weights, 1, 1, 1, false,
+                ));
+            }
+            assert!(
+                answers.windows(2).all(|w| w[0] == w[1]),
+                "{want:?}: {answers:?}"
+            );
+            assert_eq!(
+                answers[0],
+                crate::config::gfx1100_dense_weights_qualified(want),
+                "{want:?}"
+            );
+        }
+        // Mixed projection formats, another format, a tied-embedding trunk (no
+        // `lm_head.weight`), no projections and a non-HFQ path have no
+        // dense-weights identity.
+        let mut mixed = dense_trunk(QT_MQ3G256V2);
+        mixed.push((
+            "model.language_model.layers.2.mlp.up_proj.weight".to_string(),
+            13,
+        ));
+        let mixed = write_hfq(dir.path(), "m.mq3-xt", 5, qwen, &mixed);
+        assert_eq!(dense_weights_at(&mixed), None);
+        let mq4 = write_hfq(dir.path(), "o.mq3-xt", 5, qwen, &dense_trunk(13));
+        assert_eq!(dense_weights_at(&mq4), None);
+        let tied: Vec<(String, u8)> = dense_trunk(QT_MQ3G256V2)
+            .into_iter()
+            .filter(|(name, _)| name != "lm_head.weight")
+            .collect();
+        let tied = write_hfq(dir.path(), "t.mq3-xt", 5, qwen, &tied);
+        assert_eq!(dense_weights_at(&tied), None);
+        let bare = write_hfq(dir.path(), "b.mq3-xt", 5, qwen, &[("w".to_string(), 49)]);
+        assert_eq!(dense_weights_at(&bare), None);
+        assert_eq!(dense_weights_at(dir.path()), None);
     }
 }
