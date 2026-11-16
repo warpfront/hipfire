@@ -32,6 +32,10 @@ run python3 scripts/check-changelog.py
 run python3 scripts/check-conflict-markers.py
 run python3 scripts/check-selector-receipts.py
 run python3 scripts/check-env-docs.py
+# POSIX-only libc externs (mmap, dlopen, clock_gettime, ...) that Windows
+# compiles: `cargo xwin check` never links, so they break only at an MSVC link.
+run python3 scripts/check-unix-externs.py --self-test
+run python3 scripts/check-unix-externs.py
 # Fixture and quality pins (fixtures/pins.toml): schema, provenance, prompt
 # md5s, mirrored digests, and every `pin:<kind>/<id>` citation resolves.
 run python3 scripts/check-pins.py --self-test
