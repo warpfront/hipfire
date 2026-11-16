@@ -342,9 +342,16 @@ the load- or arch-conditional default), a value-carrying flag is a nullable
 string key and an `Option<String>` field. A key added this way keeps the exact
 legacy grammar of its environment variable (see
 [`env-vars.md`](env-vars.md#manual--kept-developer-flags-kernel-side-hipf-430)),
-while `config set` and TOML use the schema grammar. The `[developer]` spelling it
-replaces is a removed key that fails the load and names the replacement (see
-[Lifecycle status](#lifecycle-status)). Restart the daemon after changing one.
+while `config set` and TOML use the schema grammar. The env grammar lives only in
+`promoted_flag_env_value` (`crates/hipfire-config/src/lib.rs`), which resolves
+each raw value to `1`, `0` or `auto` (or the raw string for a value-carrying
+key); the `FeatureFlags` reader tests only those resolved values. The
+`[developer]` spelling it replaces is a removed key that fails the load and names
+the replacement (see [Lifecycle status](#lifecycle-status)); the config test
+`promoted_flags_retire_their_developer_spelling` fails for a key with an env arm
+and no removed-key row. The TUI never arms a value-carrying key by accident:
+Enter on an empty buffer of a nullable string key keeps it unset. Restart the
+daemon after changing one.
 
 | Key | Env | Default | Effect |
 |---|---|---|---|

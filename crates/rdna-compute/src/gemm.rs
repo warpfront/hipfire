@@ -429,6 +429,17 @@ fn gfx12_bt_tile(gate_up_bt: bool, batch_size: usize) -> usize {
     unreachable!("batch sizes below 64 returned above")
 }
 
+/// Pure form of [`Gpu::ordinary_bt_tile`].
+#[inline]
+fn ordinary_bt_tile_for(gate_up_bt: bool, ordinary_prefill: bool, batch_size: usize) -> usize {
+    let tile = gfx12_bt_tile(gate_up_bt, batch_size);
+    if tile == 1 && batch_size > 0 && gate_up_bt && ordinary_prefill {
+        12
+    } else {
+        tile
+    }
+}
+
 impl Gpu {
     /// Batch tile of the gfx12 MQ V2 WMMA projection family. Under the ordinary
     /// prefill scope the arithmetic must not depend on the call's row count n:
@@ -438,13 +449,33 @@ impl Gpu {
     /// historical n-keyed choice is unchanged.
     #[inline]
     fn ordinary_bt_tile(&self, batch_size: usize) -> usize {
-        let gate_up_bt = self.flags.gate_up_bt;
-        let tile = gfx12_bt_tile(gate_up_bt, batch_size);
-        if tile == 1 && batch_size > 0 && gate_up_bt && self.ordinary_prefill_active() {
-            12
-        } else {
-            tile
+        ordinary_bt_tile_for(
+            self.flags.gate_up_bt,
+            self.ordinary_prefill_active(),
+            batch_size,
+        )
+    }
+}
+
+#[cfg(test)]
+mod bt_tile_tests {
+    use super::*;
+
+    /// `kernel.gate_up_bt = false` (the certified gfx1201 batched Redline pin)
+    /// keeps bt1 at every batch, in and out of the ordinary prefill scope; on,
+    /// ordinary prefill below 64 rows takes the masked BT12 tile.
+    #[test]
+    fn gate_up_bt_off_is_bt1_everywhere() {
+        for batch in [1, 8, 63, 64, 96, 128, 192, 256, 1024, 4096] {
+            for ordinary in [false, true] {
+                assert_eq!(ordinary_bt_tile_for(false, ordinary, batch), 1, "{batch}");
+            }
         }
+        assert_eq!(ordinary_bt_tile_for(true, true, 8), 12);
+        assert_eq!(ordinary_bt_tile_for(true, false, 8), 1);
+        assert_eq!(ordinary_bt_tile_for(true, false, 64), 4);
+        assert_eq!(ordinary_bt_tile_for(true, false, 128), 8);
+        assert_eq!(ordinary_bt_tile_for(true, true, 192), 12);
     }
 }
 

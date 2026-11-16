@@ -1133,11 +1133,6 @@ pub fn resolve_graph_ar(raw: Option<&str>, arch: &str, windows: bool) -> bool {
     }
 }
 
-/// `HIPFIRE_NO_DEVICE_COMPILER` grammar: set to anything but `0` or empty.
-fn no_device_compiler(raw: Option<&str>) -> bool {
-    raw.is_some_and(|v| v != "0" && !v.is_empty())
-}
-
 impl FeatureFlags {
     pub fn from_process_config(arch: &str, config: &ProcessConfig) -> Self {
         Self::from_lookup(arch, |name| config.legacy_value(name).ok_or(()))
@@ -1151,11 +1146,10 @@ impl FeatureFlags {
     /// device-compiler probe (`KernelCompiler::new`, `local_toolchain_id`),
     /// which runs before and without a `Gpu`.
     pub fn no_device_compiler_from_active_config() -> bool {
-        no_device_compiler(
-            hipfire_config::active_or_local_process_config()
-                .legacy_value("HIPFIRE_NO_DEVICE_COMPILER")
-                .as_deref(),
-        )
+        hipfire_config::active_or_local_process_config()
+            .legacy_value("HIPFIRE_NO_DEVICE_COMPILER")
+            .as_deref()
+            == Some("1")
     }
 
     fn from_lookup(arch: &str, value: impl Fn(&str) -> std::result::Result<String, ()>) -> Self {
@@ -1783,9 +1777,11 @@ impl FeatureFlags {
                 .ok()
                 .as_deref()
                 != Some("0"),
-            gate_up_bt: value("HIPFIRE_GATE_UP_BT").map_or(true, |v| v != "0" && !v.is_empty()),
+            // The env grammar of these keys lives in `hipfire_config`'s
+            // `promoted_flag_env_value`; the resolved value is `1`, `0` or `auto`.
+            gate_up_bt: value("HIPFIRE_GATE_UP_BT").as_deref() != Ok("0"),
             a4_slab: value("HIPFIRE_A4_SLAB").ok().as_deref() != Some("0"),
-            qwen4_moe_ep_a8: match value("HIPFIRE_QWEN4_MOE_EP_A8").as_deref().map(str::trim) {
+            qwen4_moe_ep_a8: match value("HIPFIRE_QWEN4_MOE_EP_A8").as_deref() {
                 Ok("1") => Some(true),
                 Ok("0") => Some(false),
                 _ => None,
@@ -1798,9 +1794,7 @@ impl FeatureFlags {
                 "HIPFIRE_QWEN4_MOE_SYM_IU4",
                 value("HIPFIRE_QWEN4_MOE_SYM_IU4").ok().as_deref(),
             ),
-            no_device_compiler: no_device_compiler(
-                value("HIPFIRE_NO_DEVICE_COMPILER").ok().as_deref(),
-            ),
+            no_device_compiler: value("HIPFIRE_NO_DEVICE_COMPILER").as_deref() == Ok("1"),
             dump_hidden: value("HIPFIRE_DUMP_HIDDEN").ok(),
         }
     }
@@ -6401,5 +6395,66 @@ mod tests {
                 "{arch}: lanes off"
             );
         }
+    }
+
+    /// Each typed key of a kept kernel-side flag (HIPF-430) reaches its own
+    /// `FeatureFlags` field and no other.
+    #[test]
+    fn kept_flag_keys_reach_their_own_field() {
+        use hipfire_config::ConfigValue::{Bool, String as Str};
+        let project = |f: &FeatureFlags| -> Vec<String> {
+            vec![
+                f.cb_verify_pm.to_string(),
+                f.draft_collapse_off.to_string(),
+                f.hidden_scatter_fuse_off.to_string(),
+                f.gate_up_bt.to_string(),
+                f.a4_slab.to_string(),
+                format!("{:?}", f.qwen4_moe_ep_a8),
+                f.qwen4_qsa_wmma_gather.to_string(),
+                f.qwen4_qsa_pooled_bf16.to_string(),
+                format!("{:?}", f.qwen4_moe_sym_iu4),
+                f.no_device_compiler.to_string(),
+                format!("{:?}", f.dump_hidden),
+            ]
+        };
+        let flags_for = |layer: ConfigLayer| {
+            let resolved = resolve([NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: "config.toml".into(),
+                },
+                layer,
+            }])
+            .unwrap();
+            FeatureFlags::from_process_config(
+                "gfx1201",
+                &ProcessConfig::from_resolved(&resolved).unwrap(),
+            )
+        };
+        let defaults = project(&flags_for(ConfigLayer::default()));
+        for (i, (key, value, want)) in [
+            ("kernel.cb_verify_pm", Bool(false), "false"),
+            ("kernel.draft_collapse_off", Bool(true), "true"),
+            ("kernel.hidden_scatter_fuse_off", Bool(true), "true"),
+            ("kernel.gate_up_bt", Bool(false), "false"),
+            ("kernel.a4_slab", Bool(false), "false"),
+            ("kernel.qwen4_moe_ep_a8", Bool(true), "Some(true)"),
+            ("attention.qwen4_qsa_wmma_gather", Bool(false), "false"),
+            ("attention.qwen4_qsa_pooled_bf16", Bool(false), "false"),
+            ("developer.qwen4_moe_sym_iu4", Bool(false), "Some(false)"),
+            ("diagnostic.compiler.no_device_compiler", Bool(true), "true"),
+            ("diagnostic.dump_hidden", Str(String::new()), "Some(\"\")"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut layer = ConfigLayer::default();
+            layer.set(key, value).unwrap();
+            let mut expect = defaults.clone();
+            expect[i] = want.to_owned();
+            assert_eq!(project(&flags_for(layer)), expect, "{key}");
+        }
+        let mut layer = ConfigLayer::default();
+        layer.set("kernel.qwen4_moe_ep_a8", Bool(false)).unwrap();
+        assert_eq!(flags_for(layer).qwen4_moe_ep_a8, Some(false));
     }
 }

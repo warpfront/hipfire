@@ -228,6 +228,12 @@ pub fn write_value(path: &Path, key: &str, raw: &str) -> Result<Value, WriteErro
         value: raw.to_owned(),
     };
     let config_value = match schema.parse_cli(raw) {
+        // A nullable string holds "" too, but the editor opens empty on an unset
+        // key, so Enter there must keep it unset (`diagnostic.dump_hidden = ""`
+        // would arm the dump).
+        Ok(_) if raw.is_empty() && matches!(schema.rule, ValueRule::NullableString) => {
+            ConfigValue::Null
+        }
         Ok(value) => value,
         // An empty buffer on a field that cannot hold the empty string is the
         // *unset* spelling, not a typo: the editor opens empty exactly when the
@@ -451,6 +457,14 @@ mod tests {
             write_value(&path, "session_cache_dir", "").unwrap(),
             Value::String(String::new())
         );
+        // A nullable string clears too: `diagnostic.dump_hidden = ""` would arm
+        // the hidden-state dump.
+        assert_eq!(
+            write_value(&path, "diagnostic.dump_hidden", "").unwrap(),
+            Value::Null
+        );
+        let loaded = load_global(&ConfigPaths::under(&*root)).unwrap();
+        assert!(loaded.layer.get("diagnostic.dump_hidden").is_none());
         // And a genuinely bad value is still rejected.
         assert!(write_value(&path, "gpu_layer_budget", "3x").is_err());
         // The empty-means-clear retry must not hand a non-nullable enum a clear
