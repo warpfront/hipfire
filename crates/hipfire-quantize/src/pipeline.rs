@@ -9898,6 +9898,7 @@ mod moe_expert_awq_sidecar_tests {
         let s2 = gen_fwht_signs(1042, 256);
         match qt {
             QuantType::MQ4G256 => quantize_mq4g256(w, &s1, &s2),
+            QuantType::MQ4G256V2 => quantize_mq4g256v2_selected(w, M, K, &s1, &s2),
             QuantType::MQ6G256 => quantize_mq6g256(w, &s1, &s2),
             QuantType::MQ3G256Lloyd => quantize_mq3g256_lloyd(w, &s1, &s2),
             QuantType::MQ2G256Lloyd => quantize_mq2g256_lloyd(w, &s1, &s2),
@@ -9966,12 +9967,13 @@ mod moe_expert_awq_sidecar_tests {
 
     /// Positive control: without tier map / graded, the AWQ arm runs, so every
     /// expert must carry a sidecar AND pre-scaled weights (proves the fixture
-    /// really arms expert AWQ, so the tests below cannot pass vacuously).
+    /// really arms expert AWQ, so the tests below cannot pass vacuously). The
+    /// fixture sets `use_mq4v2` (`--format mq4`), so the AWQ arm writes qt44.
     #[test]
     fn awq_arm_ships_sidecars_with_prescaled_weights() {
         in_awq_child("awq_arm_ships_sidecars_with_prescaled_weights", || {
             let seen = check_sidecar_iff_prescaled(&run(None, false));
-            assert_eq!(seen, vec![(QuantType::MQ4G256, true); N_EXP]);
+            assert_eq!(seen, vec![(QuantType::MQ4G256V2, true); N_EXP]);
         });
     }
 
