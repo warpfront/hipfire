@@ -7514,6 +7514,28 @@ mod tests {
         assert_eq!(promoted_flag_env_value("fp16", "0"), None);
     }
 
+    /// Every flag with a legacy env grammar arm was a `[developer]` read before
+    /// HIPF-430; the typed key now shadows that spelling, so it must fail the
+    /// load naming the key instead of being silently ignored (the certified
+    /// Redline profile pinned `[developer] gate_up_bt = false`).
+    #[test]
+    fn promoted_flags_retire_their_developer_spelling() {
+        let promoted: Vec<_> = FIELDS
+            .iter()
+            .filter(|f| promoted_flag_env_value(f.legacy_key, "").is_some())
+            .collect();
+        assert_eq!(promoted.len(), 9);
+        for f in promoted {
+            let dev = developer_key_for_env(f.env_compat.unwrap()).unwrap();
+            let err = ConfigLayer::default().set_cli(&dev, "1").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::RetiredKey { .. }),
+                "{dev}: {err:?}"
+            );
+            assert!(err.to_string().contains(f.key), "{dev}: {err}");
+        }
+    }
+
     const SYM_IU4_KEY: &str = "developer.qwen4_moe_sym_iu4";
     const SYM_IU4_ENV: &str = "HIPFIRE_QWEN4_MOE_SYM_IU4";
 
