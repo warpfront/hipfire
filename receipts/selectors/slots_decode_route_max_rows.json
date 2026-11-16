@@ -1,0 +1,16 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "constant": "SLOTS_DECODE_ROUTE_MAX_ROWS",
+  "value": 4,
+  "kind": "max",
+  "covers": true,
+  "arch": "gfx1100",
+  "card": "RX 7900 XTX",
+  "summary": "Qwen3.6-35B-A3B MQ4R-AWQ, 8-slot multi-slot serve, aggregate decode tok/s by concurrent width (256 tokens, 3 reps). Routes admitted at 1..=8 rows: c4 267, c5 227, c6 237, c8 249. Batched body at every width (HIPFIRE_SLOTS_GFX1100_ROUTES=0): c4 246, c5 274, c6 295, c8 341. Capped at 4 rows: c1 153, c2 213, c4 267, c5 287, c6 305, c8 351; paged c8 255 -> 367. The merged MoE cohort covers 2..=4 rows and the x-batch GEMV decodes 4 activations per weight row; at 5..=8 rows the routes ran one sealed MoE per row and a second GEMV pass. 4 is the widest width where the routes win.",
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/slots_decode_route_max_rows_gfx1100.txt",
+      "sha256": "3a1929e04c4a96519b66d9d092570b1991d1d6dd7f61efa0afe1f936ed9e019e"
+    }
+  ]
+}

@@ -635,6 +635,13 @@ impl PagePool {
         self.page_meta[phys as usize].state
     }
 
+    /// Snapshot of every physical page's lifecycle state, indexed by page id.
+    /// Used by a physical backend (VMM mapping) to reconcile its map set with
+    /// the logical allocator at admission/provisioning/release boundaries.
+    pub fn page_states(&self) -> Vec<PageState> {
+        self.page_meta.iter().map(|meta| meta.state).collect()
+    }
+
     /// Current generation of physical page `phys`.  A [`PageHandle`]
     /// carrying a mismatched generation is stale.
     pub fn page_generation(&self, phys: u32) -> u32 {
