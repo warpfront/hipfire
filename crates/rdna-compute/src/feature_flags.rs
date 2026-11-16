@@ -6595,4 +6595,86 @@ mod tests {
         layer.set("kernel.qwen4_moe_ep_a8", Bool(false)).unwrap();
         assert_eq!(flags_for(layer).qwen4_moe_ep_a8, Some(false));
     }
+
+    /// Each HIPF-430 stage 2 field reads its own env spelling, and only that one: setting one
+    /// name to a non-default value changes exactly its field (no crossed or dropped wires).
+    #[test]
+    fn stage2_fields_read_only_their_own_env_name() {
+        // (env, non-default value), in the order of `probe`.
+        const CASES: &[(&str, &str)] = &[
+            ("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD", "0"),
+            ("HIPFIRE_EP_PEER_ALLREDUCE", "1"),
+            ("HIPFIRE_EP_PEER_ALLREDUCE_DECODE", "0"),
+            ("HIPFIRE_EP_DUMP_POS", "x"),
+            ("HIPFIRE_EP_UNIT_TAIL", "x"),
+            ("HIPFIRE_QWEN4_EP_TAIL_BORROW", "x"),
+            ("HIPFIRE_QWEN4_DECODE_SHARE", "x"),
+            ("HIPFIRE_QWEN4_EP_EXPERT_HOTSET", "x"),
+            ("HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD", "x"),
+            ("HIPFIRE_MTP_AR_FLOOR", "0"),
+            ("HIPFIRE_QWEN4_EXPERT_STAGE", "x"),
+            ("HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS", "1"),
+            ("HIPFIRE_QWEN4_MTP_BATCHED_FILL", "0"),
+            ("HIPFIRE_QWEN4_PENALTY_PREPASS", "0"),
+            ("HIPFIRE_VIT_ATTN", "x"),
+            ("HIPFIRE_VIT_GEMM", "x"),
+            ("HIPFIRE_MTP_FILL_FAST", "0"),
+            ("HIPFIRE_MTP_FILL_PM_GEMM", "0"),
+            ("HIPFIRE_DFLASH_PREFILL_DEVICE", "0"),
+            ("HIPFIRE_DFLASH_PREFILL_SCATTER_FAST", "0"),
+            ("HIPFIRE_ROUTE_PLAN", "0"),
+            ("HIPFIRE_T5_GPU", "0"),
+            ("HIPFIRE_RAON_MIRROR_Q8", "x"),
+            ("HIPFIRE_RAON_PREFILL", "x"),
+            ("HIPFIRE_RAON_DFLASH_ROLLBACK", "x"),
+            ("HIPFIRE_RAON_RAILGUN", "x"),
+            ("HIPFIRE_RAON_VERIFY_ROWEXACT", "x"),
+            ("HIPFIRE_RAON_SHARED_FFN", "x"),
+        ];
+        fn probe(f: &FeatureFlags) -> Vec<String> {
+            vec![
+                format!("{:?}", f.glimmer_spec_profit_guard),
+                format!("{:?}", f.ep_peer_allreduce),
+                format!("{:?}", f.ep_peer_allreduce_decode),
+                format!("{:?}", f.ep_dump_pos),
+                format!("{:?}", f.ep_unit_tail),
+                format!("{:?}", f.qwen4_ep_tail_borrow),
+                format!("{:?}", f.qwen4_decode_share),
+                format!("{:?}", f.qwen4_ep_expert_hotset),
+                format!("{:?}", f.qwen4_ep_draft_vocab_shard),
+                format!("{:?}", f.mtp_ar_floor),
+                format!("{:?}", f.qwen4_expert_stage),
+                format!("{:?}", f.qwen4_mtp_draft_rounds),
+                format!("{:?}", f.qwen4_mtp_batched_fill),
+                format!("{:?}", f.qwen4_penalty_prepass),
+                format!("{:?}", f.vit_attn),
+                format!("{:?}", f.vit_gemm),
+                format!("{:?}", f.mtp_fill_fast),
+                format!("{:?}", f.mtp_fill_pm_gemm),
+                format!("{:?}", f.dflash_prefill_device),
+                format!("{:?}", f.dflash_prefill_scatter_fast),
+                format!("{:?}", f.route_plan),
+                format!("{:?}", f.t5_gpu),
+                format!("{:?}", f.raon_mirror_q8),
+                format!("{:?}", f.raon_prefill),
+                format!("{:?}", f.raon_dflash_rollback),
+                format!("{:?}", f.raon_railgun),
+                format!("{:?}", f.raon_verify_rowexact),
+                format!("{:?}", f.raon_shared_ffn),
+            ]
+        }
+        let unset = probe(&FeatureFlags::from_lookup("gfx1151", |_| Err(())));
+        for (i, (env, raw)) in CASES.iter().enumerate() {
+            let set = probe(&FeatureFlags::from_lookup("gfx1151", |name| {
+                if name == *env {
+                    Ok((*raw).to_owned())
+                } else {
+                    Err(())
+                }
+            }));
+            for (j, (before, after)) in unset.iter().zip(&set).enumerate() {
+                assert_eq!(before != after, i == j, "{env}={raw:?} moved field {j}");
+            }
+        }
+    }
 }
