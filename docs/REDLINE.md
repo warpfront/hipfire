@@ -180,6 +180,18 @@ route**: select `replay.backend = "redline"` explicitly or re-quantize it. A
 file whose `hipfire_route_sku` is not a known SKU, or a DeepSeek V4 file with
 MFP4G32E8SOA tensors that are not the exact MQ2R recipe, is refused at load.
 
+The drafter a load attached enters admission typed, as
+`AttachedDraft::{None, Dflash, NativeMtp, Other}` (from the loaded
+speculator's name), never as a yes/no: the two Qwen3.5-dense predicates admit
+`None` and `Dflash` (see "AR forwards of a load with a DFlash drafter" below),
+every other predicate admits `None` only, and the MQ4R SKU predicate does not
+read the drafter. A DFlash load that stages the continuous-batching
+speculative lanes (`continuous_batch_size > 1` with `serve_vmm_batch.spec`) is
+`Other`: the gfx1201 save-free DeltaNet verify of those lanes refuses under an
+enabled retained controller and exchanges the owners a tape would bake, so that
+load keeps the HIP route and logs `[redline] DFlash continuous-batching lanes
+requested: the retained default is withheld for this load`.
+
 Exclusions applied by `retained_redline_default` before any predicate matches
 (`crates/hipfire-runtime/src/config.rs`): expert-parallel loads (`ep` > 1)
 are never admitted, because a single-device retained tape cannot record the
@@ -226,7 +238,7 @@ exact GPU arch is gfx1201
 AND model_arch is qwen3_5 (dense, arch_id 5), any weight format
 AND pipeline parallelism == 1
 AND tensor parallelism == 1
-AND no drafter is installed
+AND the attached drafter is none or DFlash (AttachedDraft::None | Dflash)
 ```
 
 Plain-AR decode then runs as one retained PM4-IB submission per token (the
@@ -252,6 +264,45 @@ is `Ready`, `retained_body_active()` and the PM4/AQL routing predicates would
 read true for the whole prefill. The MoE prefill gates (symmetric IU4 experts,
 combine zinit, sealed retained admission) therefore evaluate exactly as on a
 fresh load; the next plain-AR `forward_scratch` re-arms eligibility.
+
+##### AR forwards of a load with a DFlash drafter
+
+Since 0.5.0 a Qwen3.5-dense load with a DFlash drafter keeps this route
+(`drafter=dflash` in the `[redline] enabling fail-closed retained default`
+line). Every eligible single-token AR forward of the load, plain-AR requests
+and spec-retired tokens alike, runs the same staged variant of
+`forward_scratch`:
+
+- `ArHiddenStaging` (`crates/hipfire-arch-qwen35/src/speculative.rs`), owned by
+  `Qwen35Scratch`, holds one stable F32 row per draft extraction layer. It is
+  installed once, when the DFlash sidecar is resolved at load
+  (`dflash_spec::with_ar_hidden_staging`), and never replaced, so the variant
+  does not flip while the drafter's lane state is attached, vacant or
+  restored.
+- Inside the forward each extraction layer's row goes to its staging row at
+  offset zero through the one recording-aware staging write
+  (`write_staging_rows`: a typed `copy_f32_buffer` launch while recording, an
+  async memcpy under a HipGraph capture, a D2D copy eagerly), so the tape and
+  the AR HipGraph contain the copies and bake no ring head.
+- Outside the tape, after the forward returns (the PM4 replay has completed
+  and been checked; a HipGraph launch is stream-synchronized first),
+  `DflashSpeculator::ar_step` commits the rows to its hidden ring, advances the
+  head once, scatters them into the draft's interleaved hidden and appends the
+  hidden log, so a later request on the prompt cache drafts from a whole
+  context. A plain-AR request ignores the staged rows.
+- The AR HipGraph binding (`ar_graph_binding`) and the retained tape include
+  the variant: a recording latches its identity (extraction layers, row width,
+  row bases) as a route identity, and a prepared route whose latched identity
+  differs from the live variant is poisoned before any retained submit and the
+  forward runs on HIP.
+- Every non-AR target operation of the DFlash speculator (prompt seed and
+  reseed, verify, GDN replay, hidden scatter, terminal repair, rewind) and the
+  per-token prefill fallback row clears the plain-AR eligibility before its
+  first launch, so `retained_body_active()` is false through that work.
+
+Retirement policy and verify defaults are unchanged. The kill switch is the
+ordinary one: `HIPFIRE_REPLAY_BACKEND=hip` keeps the whole load on the HIP
+route (the staged variant then runs as the AR HipGraph or eagerly).
 
 Opt-out: `replay.backend = "hip"` (or `HIPFIRE_REPLAY_BACKEND=hip`, or the
 wizard's built-in `hip` profile) restores the HIP AR graph for the process. A
@@ -279,7 +330,7 @@ AND the file's DenseWeights is in gfx1100_dense_weights_qualified:
 AND pipeline parallelism == 1
 AND tensor parallelism == 1
 AND expert parallelism == 1
-AND no drafter is installed
+AND the attached drafter is none or DFlash (AttachedDraft::None | Dflash)
 AND no CPU-executed partial offload
 ```
 
@@ -990,8 +1041,8 @@ No `arch_id` gate, apart from the exclusions listed in §3 (expert-parallel
 loads, Muse Glimmer, Gemma 4, and Qwen3.5 under CPU-executed partial offload).
 `gfx1200` and every other arch remain explicit opt-in.
 Separately, Qwen3.5 dense (`arch_id=5`) and Qwen4 (`arch_id=16`, Flash-Next)
-plain-AR decode (any weight format, no drafter) on exact gfx1201 defaults to
-retained PM4 (§3).
+plain-AR decode (any weight format, no drafter; a DFlash drafter on Qwen3.5
+dense) on exact gfx1201 defaults to retained PM4 (§3).
 Explicit backend selection (including the config wizard / profile backend)
 can request broader implemented paths or disable the automatic default.
 Explicit transport changes only the transport. Runtime default ≠ Section 7
@@ -1249,7 +1300,7 @@ Prefer paths and symbols over line numbers.
 
 | Concern | Stable source path and symbols |
 |---|---|
-| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default`: `mq4r_redline_default` (MQ4R SKU + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic except the Muse Glimmer and Gemma 4 withholds), Qwen3.5 dense (`qwen3_5`) and Qwen4 (`qwen4`) on exact gfx1201 with `pp=tp=1` and no drafter, Qwen3.5 dense on exact gfx1100 with a qualified decode weight format (`gfx1100_dense_weights_qualified`: MQ3G256V2, symmetric MQ4G256V2), `pp=tp=1` and no drafter, the A3B MQ4RS SKU on exact gfx1100 or gfx1201 (`A3B_MQ4RS_RETAINED_ARCHES`; gfx1151 stays on HIP) with `pp=tp=1` and no drafter, and DeepSeek4 MQ2R on gfx1151 AR (SKU and dense-weights identity: `crates/hipfire-runtime/src/route_sku.rs`, `identify_path`). Expert-parallel loads (`ep` > 1) and Qwen3.5 under CPU-executed partial offload are never admitted. Existing LFM `.mq4` sealed evidence has no automatic selector. |
+| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default` (the drafter typed as `AttachedDraft`): `mq4r_redline_default` (MQ4R SKU + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic except the Muse Glimmer and Gemma 4 withholds), Qwen3.5 dense (`qwen3_5`) on exact gfx1201 with `pp=tp=1` and no drafter or a DFlash drafter, Qwen4 (`qwen4`) on exact gfx1201 with `pp=tp=1` and no drafter, Qwen3.5 dense on exact gfx1100 with a qualified decode weight format (`gfx1100_dense_weights_qualified`: MQ3G256V2, symmetric MQ4G256V2), `pp=tp=1` and no drafter or a DFlash drafter, the A3B MQ4RS SKU on exact gfx1100 or gfx1201 (`A3B_MQ4RS_RETAINED_ARCHES`; gfx1151 stays on HIP) with `pp=tp=1` and no drafter, and DeepSeek4 MQ2R on gfx1151 AR (SKU and dense-weights identity: `crates/hipfire-runtime/src/route_sku.rs`, `identify_path`). Expert-parallel loads (`ep` > 1) and Qwen3.5 under CPU-executed partial offload are never admitted. Existing LFM `.mq4` sealed evidence has no automatic selector. |
 | Model-load application and diagnostic handlers | `crates/hipfire-daemon/src/main.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
 | Qwen model boundary and route | `crates/hipfire-arch-qwen35/src/qwen35.rs` — `forward_scratch`; `prepare_scratch_inputs`; `set_forward_eligible`; `should_route_aql`; `should_route_pm4`; `finish_capture`; `prepare_*` |
 | LFM decode path and registry evidence | `crates/hipfire-arch-lfm2moe/src/forward.rs` — `decode_step`; `decode_step_with_graph`. Sealed LFM retained-PM4 evidence/admission: [`admissions.yml`](admissions.yml) row `lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar` (no current runtime selector). |

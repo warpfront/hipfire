@@ -26,6 +26,53 @@ pub fn mq4r_redline_default(gpu_arch: &str, route: Option<RouteSku>, pp: usize, 
         && route == Some(RouteSku::Mq4r)
 }
 
+/// The speculative drafter a load attached, as the retained-Redline admission
+/// sees it. Admission is typed by drafter kind, never by model name: a kind
+/// joins a cell only once its retained AR continuation is proved there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachedDraft {
+    /// No drafter: plain-AR decode only.
+    None,
+    /// A DFlash drafter on a Qwen3.5 trunk. Its AR forwards stage the draft's
+    /// extraction-layer hidden rows into fixed load-lifetime rows inside the
+    /// retained tape and commit them outside it, so the drafter's context
+    /// survives a retained AR step.
+    Dflash,
+    /// A native MTP head (Qwen3.5/3.6 NextN, Flash-Next, DeepSeek V4).
+    NativeMtp,
+    /// Every other drafter (DSpark, EAGLE, DFlash2, n-gram, …).
+    Other,
+}
+
+impl AttachedDraft {
+    /// The kind of the load's speculator, by its `Speculator::name`.
+    ///
+    /// `batched_lanes` is whether the load stages the continuous-batching
+    /// speculative lanes (`continuous_batch_size > 1` with
+    /// `serve_vmm_batch.spec`). A DFlash load that serves through those lanes
+    /// is `Other`: its gfx1201 save-free DeltaNet verify refuses under an
+    /// enabled retained controller and swaps the owners a retained tape would
+    /// bake, so that load keeps the HIP route.
+    pub fn from_speculator(name: Option<&str>, batched_lanes: bool) -> Self {
+        match name {
+            None => Self::None,
+            Some("dflash") if !batched_lanes => Self::Dflash,
+            Some("mtp") => Self::NativeMtp,
+            Some(_) => Self::Other,
+        }
+    }
+
+    /// Stable label for load logs (`drafter=…`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "off",
+            Self::Dflash => "dflash",
+            Self::NativeMtp => "mtp",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Automatic retained-Redline admission for a loaded model.
 ///
 /// MQ4R ([`RouteSku::Mq4r`]) keeps its existing cross-model policy with three carve-outs. Muse
@@ -39,17 +86,19 @@ pub fn mq4r_redline_default(gpu_arch: &str, route: Option<RouteSku>, pp: usize, 
 /// selected explicitly. DeepSeek4 MQ2R is narrower still: only the certified
 /// gfx1151 single-GPU AR route is admitted, and an installed drafter keeps the
 /// model on its speculative execution path. Qwen3.5 dense (arch 5) on exact
-/// gfx1201 is admitted for any weight format on the single-GPU plain-AR route
-/// (no drafter): its retained PM4 decode tape is byte-identical to the HIP
-/// AR graph. Qwen4 (Flash-Next) on exact gfx1201 is admitted the same way:
-/// single GPU, no drafter (a native MTP head is a drafter, so only an
-/// MTP-off load replays), byte-identical greedy text to the HIP graph.
+/// gfx1201 is admitted for any weight format on the single-GPU plain-AR route,
+/// with no drafter or a DFlash drafter ([`AttachedDraft::Dflash`]): its
+/// retained PM4 decode tape is byte-identical to the HIP AR graph. Qwen4
+/// (Flash-Next) on exact gfx1201 is admitted the same way but with no drafter
+/// only (a native MTP head is a drafter, so only an MTP-off load replays),
+/// byte-identical greedy text to the HIP graph.
 /// The symmetric-expert A3B SKU (`qwen3_5_moe`, [`RouteSku::Mq4rs`]) on exact gfx1100 or
 /// gfx1201 (`A3B_MQ4RS_RETAINED_ARCHES`) is admitted the same way (single
 /// GPU, no drafter, PM4 transport), with greedy ids identical to the HIP route
 /// on both (gfx1100: x1.22-1.32 decode tok/s, REDLINE.md §11.6); gfx1151 has no
 /// receipts and stays on HIP. A Qwen3.5 dense trunk on exact gfx1100 is
-/// admitted for single-GPU plain-AR decode (no drafter) when its decode weight
+/// admitted for single-GPU AR decode (no drafter or a DFlash drafter) when its
+/// decode weight
 /// format ([`DenseWeights`], read from the tensor index and HFQ metadata, never
 /// the file name) is in [`gfx1100_dense_weights_qualified`]: the MQ3G256V2
 /// tape needs the GFX10/GFX11 scratch rings (`gemv_mq3g256v2_residual` has a
@@ -75,8 +124,12 @@ pub fn retained_redline_default(
     pp: usize,
     tp: usize,
     ep: usize,
-    has_drafter: bool,
+    draft: AttachedDraft,
 ) -> bool {
+    // Only the two Qwen3.5-dense cells admit a DFlash drafter; every other
+    // rule treats any attached drafter as excluding the load.
+    let qwen35_dense_draft_ok = matches!(draft, AttachedDraft::None | AttachedDraft::Dflash);
+    let has_drafter = draft != AttachedDraft::None;
     if ep != 1 {
         return false;
     }
@@ -99,7 +152,7 @@ pub fn retained_redline_default(
         && model_arch.eq_ignore_ascii_case("qwen3_5")
         && pp == 1
         && tp == 1
-        && !has_drafter
+        && qwen35_dense_draft_ok
         && weights.is_some_and(gfx1100_dense_weights_qualified)
     {
         return true;
@@ -107,13 +160,13 @@ pub fn retained_redline_default(
     if mq4r_redline_default(gpu_arch, route, pp, tp) {
         return true;
     }
-    if gpu_arch.eq_ignore_ascii_case("gfx1201")
-        && (model_arch.eq_ignore_ascii_case("qwen3_5") || model_arch.eq_ignore_ascii_case("qwen4"))
-        && pp == 1
-        && tp == 1
-        && !has_drafter
-    {
-        return true;
+    if gpu_arch.eq_ignore_ascii_case("gfx1201") && pp == 1 && tp == 1 {
+        if model_arch.eq_ignore_ascii_case("qwen3_5") && qwen35_dense_draft_ok {
+            return true;
+        }
+        if model_arch.eq_ignore_ascii_case("qwen4") && !has_drafter {
+            return true;
+        }
     }
     if A3B_MQ4RS_RETAINED_ARCHES
         .iter()
@@ -345,10 +398,13 @@ mod legacy_spelling_golden;
 mod tests {
     use super::{
         gfx1100_dense_weights_qualified, mq4r_redline_default as mq4r_with_route,
-        retained_redline_default as redline_with_route, RuntimeConfig,
+        retained_redline_default as redline_with_route, AttachedDraft as D, RuntimeConfig,
     };
     use crate::route_sku::{DenseWeights, RouteSku};
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
+
+    /// Every attached-draft kind, for truth tables.
+    const KINDS: [D; 4] = [D::None, D::Dflash, D::NativeMtp, D::Other];
 
     /// The SKU a fixture name stands for. Production resolves the SKU from the
     /// HFQ metadata or the registry card and never reads a name; these tests
@@ -376,7 +432,7 @@ mod tests {
         pp: usize,
         tp: usize,
         ep: usize,
-        has_drafter: bool,
+        draft: D,
     ) -> bool {
         redline_with_route(
             gpu_arch,
@@ -386,7 +442,7 @@ mod tests {
             pp,
             tp,
             ep,
-            has_drafter,
+            draft,
         )
     }
 
@@ -397,9 +453,9 @@ mod tests {
         model_path: &str,
         pp: usize,
         tp: usize,
-        has_drafter: bool,
+        draft: D,
     ) -> bool {
-        redline_with_ep(gpu_arch, model_arch, model_path, pp, tp, 1, has_drafter)
+        redline_with_ep(gpu_arch, model_arch, model_path, pp, tp, 1, draft)
     }
 
     #[test]
@@ -413,7 +469,7 @@ mod tests {
                 ("gfx1201", "qwen3_5_moe"),
             ] {
                 assert!(
-                    !redline_with_route(arch, model_arch, None, None, 1, 1, 1, false),
+                    !redline_with_route(arch, model_arch, None, None, 1, 1, 1, D::None),
                     "{name} with no resolved SKU on {arch}"
                 );
             }
@@ -427,7 +483,7 @@ mod tests {
             1,
             1,
             1,
-            false
+            D::None
         ));
         assert!(redline_with_route(
             "gfx1201",
@@ -437,7 +493,7 @@ mod tests {
             1,
             1,
             1,
-            false
+            D::None
         ));
         assert!(redline_with_route(
             "gfx1151",
@@ -447,7 +503,7 @@ mod tests {
             1,
             1,
             1,
-            false
+            D::None
         ));
         // A SKU only opens its own predicate.
         assert!(!mq4r_with_route("gfx1201", Some(RouteSku::Mq4rs), 1, 1));
@@ -460,30 +516,40 @@ mod tests {
             1,
             1,
             1,
-            false
+            D::None
         ));
     }
 
     #[test]
     fn expert_parallel_never_admits_retained_redline() {
         let fn_xts = "/models/qwen3.8-flash-next-gptq3.mq4";
-        assert!(redline_with_ep("gfx1201", "qwen4", fn_xts, 1, 1, 1, false));
+        assert!(redline_with_ep(
+            "gfx1201",
+            "qwen4",
+            fn_xts,
+            1,
+            1,
+            1,
+            D::None
+        ));
         for ep in [2, 4] {
-            assert!(!redline_with_ep(
-                "gfx1201", "qwen4", fn_xts, 1, 1, ep, false
-            ));
-            assert!(!redline_with_ep(
-                "gfx1201", "qwen3_5", fn_xts, 1, 1, ep, false
-            ));
-            assert!(!redline_with_ep(
-                "gfx1201",
-                "qwen4",
-                "/models/fn.mq4r",
-                1,
-                1,
-                ep,
-                false
-            ));
+            for draft in KINDS {
+                assert!(!redline_with_ep(
+                    "gfx1201", "qwen4", fn_xts, 1, 1, ep, draft
+                ));
+                assert!(!redline_with_ep(
+                    "gfx1201", "qwen3_5", fn_xts, 1, 1, ep, draft
+                ));
+                assert!(!redline_with_ep(
+                    "gfx1201",
+                    "qwen4",
+                    "/models/fn.mq4r",
+                    1,
+                    1,
+                    ep,
+                    draft
+                ));
+            }
         }
     }
 
@@ -639,7 +705,7 @@ mod tests {
                 f,
                 1,
                 1,
-                false
+                D::None
             ));
             assert!(retained_redline_default(
                 arch,
@@ -647,24 +713,27 @@ mod tests {
                 "/models/A3B.MQ4RS",
                 1,
                 1,
-                false
+                D::None
             ));
-            // drafter (MTP-loaded), multi-GPU, EP, other families, other SKUs
-            assert!(!retained_redline_default(
-                arch,
-                "qwen3_5_moe",
-                f,
-                1,
-                1,
-                true
-            ));
+            // any drafter (DFlash included), multi-GPU, EP, other families,
+            // other SKUs
+            for draft in [D::Dflash, D::NativeMtp, D::Other] {
+                assert!(!retained_redline_default(
+                    arch,
+                    "qwen3_5_moe",
+                    f,
+                    1,
+                    1,
+                    draft
+                ));
+            }
             assert!(!retained_redline_default(
                 arch,
                 "qwen3_5_moe",
                 f,
                 2,
                 1,
-                false
+                D::None
             ));
             assert!(!retained_redline_default(
                 arch,
@@ -672,22 +741,22 @@ mod tests {
                 f,
                 1,
                 2,
-                false
+                D::None
             ));
-            assert!(!redline_with_ep(arch, "qwen3_5_moe", f, 1, 1, 2, false));
-            assert!(!retained_redline_default(arch, "qwen3", f, 1, 1, false));
+            assert!(!redline_with_ep(arch, "qwen3_5_moe", f, 1, 1, 2, D::None));
+            assert!(!retained_redline_default(arch, "qwen3", f, 1, 1, D::None));
             assert!(!retained_redline_default(
                 arch,
                 "qwen3_5_moe",
                 "/models/a3b.mq4",
                 1,
                 1,
-                false
+                D::None
             ));
         }
         for arch in ["gfx1200", "gfx1101", "gfx1151", "gfx942"] {
             assert!(
-                !retained_redline_default(arch, "qwen3_5_moe", f, 1, 1, false),
+                !retained_redline_default(arch, "qwen3_5_moe", f, 1, 1, D::None),
                 "{arch} must stay on HIP"
             );
         }
@@ -704,24 +773,15 @@ mod tests {
             1,
             1,
             1,
-            false
+            D::None
         ));
         assert!(!super::A3B_MQ4RS_RETAINED_ARCHES.contains(&"gfx1151"));
     }
 
     #[test]
     fn gfx1100_qwen35_dense_admits_qualified_weight_formats_and_nothing_wider() {
-        let gfx1100 = |model_arch: &str, weights, pp, tp, ep, has_drafter| {
-            redline_with_route(
-                "gfx1100",
-                model_arch,
-                None,
-                weights,
-                pp,
-                tp,
-                ep,
-                has_drafter,
-            )
+        let gfx1100 = |model_arch: &str, weights, pp, tp, ep, draft| {
+            redline_with_route("gfx1100", model_arch, None, weights, pp, tp, ep, draft)
         };
         let qualified = [
             DenseWeights::Mq3V2 { symmetric: false },
@@ -730,23 +790,27 @@ mod tests {
         ];
         for w in qualified {
             assert!(gfx1100_dense_weights_qualified(w));
-            assert!(gfx1100("qwen3_5", Some(w), 1, 1, 1, false), "{w:?}");
-            // A drafter, multi-GPU and expert parallelism keep the HIP graph.
-            assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 1, true), "{w:?}");
-            assert!(!gfx1100("qwen3_5", Some(w), 2, 1, 1, false), "{w:?}");
-            assert!(!gfx1100("qwen3_5", Some(w), 1, 2, 1, false), "{w:?}");
-            assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 2, false), "{w:?}");
+            // No drafter or a DFlash drafter: the qualified plain-AR tape.
+            assert!(gfx1100("qwen3_5", Some(w), 1, 1, 1, D::None), "{w:?}");
+            assert!(gfx1100("qwen3_5", Some(w), 1, 1, 1, D::Dflash), "{w:?}");
+            // Any other drafter, multi-GPU and expert parallelism keep the HIP
+            // graph.
+            assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 1, D::NativeMtp), "{w:?}");
+            assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 1, D::Other), "{w:?}");
+            assert!(!gfx1100("qwen3_5", Some(w), 2, 1, 1, D::None), "{w:?}");
+            assert!(!gfx1100("qwen3_5", Some(w), 1, 2, 1, D::None), "{w:?}");
+            assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 2, D::None), "{w:?}");
             // Other GPU arches (gfx1201 admits every Qwen3.5 dense format on
             // its own rule) and other families stay on HIP.
             for arch in ["gfx1030", "gfx1101", "gfx1151", "gfx1200", "gfx942"] {
                 assert!(
-                    !redline_with_route(arch, "qwen3_5", None, Some(w), 1, 1, 1, false),
+                    !redline_with_route(arch, "qwen3_5", None, Some(w), 1, 1, 1, D::None),
                     "{arch} must stay on HIP for {w:?}"
                 );
             }
             for model_arch in ["qwen3_5_moe", "qwen3", "qwen4", "gemma4", "deepseek4"] {
                 assert!(
-                    !gfx1100(model_arch, Some(w), 1, 1, 1, false),
+                    !gfx1100(model_arch, Some(w), 1, 1, 1, D::None),
                     "{model_arch} {w:?} must stay on HIP on gfx1100"
                 );
             }
@@ -754,8 +818,9 @@ mod tests {
         // Unqualified (no receipts) or unknown formats keep the HIP graph.
         let w = DenseWeights::Mq4V2 { symmetric: false };
         assert!(!gfx1100_dense_weights_qualified(w));
-        assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 1, false), "{w:?}");
-        assert!(!gfx1100("qwen3_5", None, 1, 1, 1, false));
+        assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 1, D::None), "{w:?}");
+        assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 1, D::Dflash), "{w:?}");
+        assert!(!gfx1100("qwen3_5", None, 1, 1, 1, D::None));
     }
 
     #[test]
@@ -768,28 +833,19 @@ mod tests {
                 mq4r_redline_default(gpu_arch, "/models/muse-glimmer-30b.mq4r", 1, 1),
                 "extension-only policy still matches the Glimmer trunk"
             );
-            assert!(
-                !retained_redline_default(
-                    gpu_arch,
-                    "muse_glimmer",
-                    "/models/muse-glimmer-30b.mq4r",
-                    1,
-                    1,
-                    false,
-                ),
-                "glimmer must stay on HIP by default on {gpu_arch}"
-            );
-            assert!(
-                !retained_redline_default(
-                    gpu_arch,
-                    "muse_glimmer",
-                    "/models/muse-glimmer-30b.mq4r",
-                    1,
-                    1,
-                    true,
-                ),
-                "a loaded drafter does not re-admit glimmer on {gpu_arch}"
-            );
+            for draft in KINDS {
+                assert!(
+                    !retained_redline_default(
+                        gpu_arch,
+                        "muse_glimmer",
+                        "/models/muse-glimmer-30b.mq4r",
+                        1,
+                        1,
+                        draft,
+                    ),
+                    "glimmer must stay on HIP by default on {gpu_arch} (drafter {draft:?})"
+                );
+            }
             // The carve-out is glimmer-scoped, not a global MQ4R retreat.
             assert!(
                 retained_redline_default(
@@ -798,7 +854,7 @@ mod tests {
                     "/models/qwen3.6-35b-a3b.mq4r",
                     1,
                     1,
-                    false,
+                    D::None,
                 ),
                 "qwen MQ4R keeps auto-Redline on {gpu_arch}"
             );
@@ -818,9 +874,9 @@ mod tests {
                 "/models/gemma4-12b-it.mq4",
                 "/models/gemma4-e4b-it.q8.hfq",
             ] {
-                for has_drafter in [false, true] {
+                for draft in KINDS {
                     assert!(
-                        !retained_redline_default(gpu_arch, "gemma4", path, 1, 1, has_drafter),
+                        !retained_redline_default(gpu_arch, "gemma4", path, 1, 1, draft),
                         "gemma4 {path} must stay on HIP by default on {gpu_arch}"
                     );
                 }
@@ -834,51 +890,54 @@ mod tests {
             "/models/gemma4-12b-it.mq4r",
             1,
             1,
-            false,
+            D::None,
         ));
     }
 
     #[test]
     fn deepseek4_mq2r_redline_default_requires_gfx1151_ar() {
+        let mq2r = "/models/deepseek-v4-flash-0731.mq2r";
         assert!(retained_redline_default(
             "gfx1151",
             "deepseek4",
-            "/models/deepseek-v4-flash-0731.mq2r",
+            mq2r,
             1,
             1,
-            false,
+            D::None
         ));
-        assert!(!retained_redline_default(
-            "gfx1151",
-            "deepseek4",
-            "/models/deepseek-v4-flash-0731.mq2r",
-            1,
-            1,
-            true,
-        ));
+        for draft in [D::Dflash, D::NativeMtp, D::Other] {
+            assert!(!retained_redline_default(
+                "gfx1151",
+                "deepseek4",
+                mq2r,
+                1,
+                1,
+                draft
+            ));
+        }
         assert!(!retained_redline_default(
             "gfx1100",
             "deepseek4",
-            "/models/deepseek-v4-flash-0731.mq2r",
+            mq2r,
             1,
             1,
-            false,
+            D::None
         ));
         assert!(!retained_redline_default(
             "gfx1151",
             "qwen3_5_moe",
-            "/models/deepseek-v4-flash-0731.mq2r",
+            mq2r,
             1,
             1,
-            false,
+            D::None
         ));
         assert!(!retained_redline_default(
             "gfx1151",
             "deepseek4",
-            "/models/deepseek-v4-flash-0731.mq2r",
+            mq2r,
             2,
             1,
-            false,
+            D::None
         ));
         assert!(!retained_redline_default(
             "gfx1151",
@@ -886,37 +945,52 @@ mod tests {
             "/models/deepseek-v4-flash-0731.mq2",
             1,
             1,
-            false,
+            D::None,
         ));
     }
 
     #[test]
     fn qwen35_dense_redline_default_requires_gfx1201_single_gpu_ar() {
         let h2 = "/models/h2.group-alpha-refit.hfq";
-        assert!(retained_redline_default(
-            "gfx1201", "qwen3_5", h2, 1, 1, false
-        ));
-        // A drafter keeps the model on its speculative path.
-        assert!(!retained_redline_default(
-            "gfx1201", "qwen3_5", h2, 1, 1, true
-        ));
+        // No drafter, or a DFlash drafter whose AR forwards stage the draft's
+        // hidden rows inside the tape.
+        for draft in [D::None, D::Dflash] {
+            assert!(retained_redline_default(
+                "gfx1201", "qwen3_5", h2, 1, 1, draft
+            ));
+        }
+        // Any other drafter keeps the model on its speculative path.
+        for draft in [D::NativeMtp, D::Other] {
+            assert!(!retained_redline_default(
+                "gfx1201", "qwen3_5", h2, 1, 1, draft
+            ));
+        }
         // Pipeline / tensor parallel stay on HIP.
-        assert!(!retained_redline_default(
-            "gfx1201", "qwen3_5", h2, 2, 1, false
-        ));
-        assert!(!retained_redline_default(
-            "gfx1201", "qwen3_5", h2, 1, 2, false
-        ));
+        for draft in KINDS {
+            assert!(!retained_redline_default(
+                "gfx1201", "qwen3_5", h2, 2, 1, draft
+            ));
+            assert!(!retained_redline_default(
+                "gfx1201", "qwen3_5", h2, 1, 2, draft
+            ));
+        }
         // Exact gfx1201 only; other dense archs and the MoE sibling stay on HIP.
         for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
             assert!(!retained_redline_default(
-                gpu_arch, "qwen3_5", h2, 1, 1, false
+                gpu_arch,
+                "qwen3_5",
+                h2,
+                1,
+                1,
+                D::None
             ));
         }
         for model_arch in ["qwen3_5_moe", "qwen3", "qwen2", "gemma4"] {
-            assert!(!retained_redline_default(
-                "gfx1201", model_arch, h2, 1, 1, false
-            ));
+            for draft in KINDS {
+                assert!(!retained_redline_default(
+                    "gfx1201", model_arch, h2, 1, 1, draft
+                ));
+            }
         }
     }
 
@@ -924,22 +998,45 @@ mod tests {
     fn qwen4_redline_default_requires_gfx1201_single_gpu_without_mtp() {
         let fn_xts = "/models/qwen3.8-flash-next-gptq3.mq4";
         assert!(retained_redline_default(
-            "gfx1201", "qwen4", fn_xts, 1, 1, false
+            "gfx1201",
+            "qwen4",
+            fn_xts,
+            1,
+            1,
+            D::None
         ));
         // The native MTP head is a drafter: an MTP load keeps its spec path.
+        // The DFlash admission is Qwen3.5-dense only.
+        for draft in [D::Dflash, D::NativeMtp, D::Other] {
+            assert!(!retained_redline_default(
+                "gfx1201", "qwen4", fn_xts, 1, 1, draft
+            ));
+        }
         assert!(!retained_redline_default(
-            "gfx1201", "qwen4", fn_xts, 1, 1, true
+            "gfx1201",
+            "qwen4",
+            fn_xts,
+            2,
+            1,
+            D::None
         ));
         assert!(!retained_redline_default(
-            "gfx1201", "qwen4", fn_xts, 2, 1, false
-        ));
-        assert!(!retained_redline_default(
-            "gfx1201", "qwen4", fn_xts, 1, 2, false
+            "gfx1201",
+            "qwen4",
+            fn_xts,
+            1,
+            2,
+            D::None
         ));
         // A plain `.mq4` Flash-Next stays on HIP off gfx1201.
         for gpu_arch in ["gfx1100", "gfx1151", "gfx1200"] {
             assert!(!retained_redline_default(
-                gpu_arch, "qwen4", fn_xts, 1, 1, false
+                gpu_arch,
+                "qwen4",
+                fn_xts,
+                1,
+                1,
+                D::None
             ));
         }
         // HIPF-254: a Flash-Next `.mq4r` stays on HIP on gfx1100/gfx1151; the
@@ -947,7 +1044,12 @@ mod tests {
         let fn_mq4r = "/models/qwen3.8-flash-next.mq4r";
         for gpu_arch in ["gfx1100", "gfx1151"] {
             assert!(!retained_redline_default(
-                gpu_arch, "qwen4", fn_mq4r, 1, 1, false
+                gpu_arch,
+                "qwen4",
+                fn_mq4r,
+                1,
+                1,
+                D::None
             ));
             assert!(retained_redline_default(
                 gpu_arch,
@@ -955,12 +1057,82 @@ mod tests {
                 "/models/m.mq4r",
                 1,
                 1,
-                false
+                D::None
             ));
         }
         assert!(retained_redline_default(
-            "gfx1201", "qwen4", fn_mq4r, 1, 1, false
+            "gfx1201",
+            "qwen4",
+            fn_mq4r,
+            1,
+            1,
+            D::None
         ));
+    }
+
+    /// Every [`D`] kind against every admitted cell (single GPU): DFlash joins
+    /// exactly the two Qwen3.5-dense cells, the MQ4R SKU rule ignores the
+    /// drafter as before, and every other cell admits no drafter at all.
+    #[test]
+    fn attached_draft_admission_truth_table() {
+        let mq4 = Some(DenseWeights::Mq4V2 { symmetric: true });
+        let unqualified = Some(DenseWeights::Mq4V2 { symmetric: false });
+        let cells: [(&str, &str, Option<RouteSku>, Option<DenseWeights>, &[D]); 11] = [
+            ("gfx1201", "qwen3_5", None, mq4, &[D::None, D::Dflash]),
+            ("gfx1201", "qwen3_5", None, None, &[D::None, D::Dflash]),
+            ("gfx1100", "qwen3_5", None, mq4, &[D::None, D::Dflash]),
+            ("gfx1100", "qwen3_5", None, unqualified, &[]),
+            ("gfx1151", "qwen3_5", None, mq4, &[]),
+            ("gfx1201", "qwen4", None, None, &[D::None]),
+            ("gfx1201", "qwen3_6_moe", Some(RouteSku::Mq4r), None, &KINDS),
+            (
+                "gfx1201",
+                "qwen3_5_moe",
+                Some(RouteSku::Mq4rs),
+                None,
+                &[D::None],
+            ),
+            (
+                "gfx1100",
+                "qwen3_5_moe",
+                Some(RouteSku::Mq4rs),
+                None,
+                &[D::None],
+            ),
+            (
+                "gfx1151",
+                "deepseek4",
+                Some(RouteSku::Mq2r),
+                None,
+                &[D::None],
+            ),
+            ("gfx1201", "gemma4", Some(RouteSku::Mq4r), None, &[]),
+        ];
+        for (gpu_arch, model_arch, route, weights, admitted) in cells {
+            for draft in KINDS {
+                assert_eq!(
+                    redline_with_route(gpu_arch, model_arch, route, weights, 1, 1, 1, draft),
+                    admitted.contains(&draft),
+                    "{gpu_arch} {model_arch} {route:?} {weights:?} {draft:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attached_draft_kind_comes_from_the_speculator() {
+        assert_eq!(D::from_speculator(None, false), D::None);
+        assert_eq!(D::from_speculator(None, true), D::None);
+        assert_eq!(D::from_speculator(Some("dflash"), false), D::Dflash);
+        // A DFlash load serving through the continuous-batching DFlash lanes
+        // keeps the HIP route (their gfx1201 save-free verify).
+        assert_eq!(D::from_speculator(Some("dflash"), true), D::Other);
+        assert_eq!(D::from_speculator(Some("mtp"), false), D::NativeMtp);
+        for name in ["dspark", "eagle", "dflash2", "ngram", "spec"] {
+            assert_eq!(D::from_speculator(Some(name), false), D::Other, "{name}");
+        }
+        assert_eq!(D::Dflash.label(), "dflash");
+        assert_eq!(D::None.label(), "off");
     }
 
     #[test]

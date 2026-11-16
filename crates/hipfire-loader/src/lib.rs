@@ -2513,7 +2513,7 @@ fn resolve_qwen35_mtp_head_sourced(
 ///
 /// Hard errors before publish free the bundle and any preloaded VL weights.
 fn finish_qwen35_load(
-    bundle: Qwen35Bundle,
+    mut bundle: Qwen35Bundle,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
     physical_cap: usize,
     arch_id: u32,
@@ -2697,7 +2697,16 @@ fn finish_qwen35_load(
             ctx.spec
                 .dflash_block
                 .unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED),
-        ) {
+        )
+        // The load's AR hidden staging is resolved with the sidecar: every
+        // eligible AR forward of this load runs the staged variant.
+        .and_then(|s| {
+            hipfire_arch_qwen35::dflash_spec::with_ar_hidden_staging(
+                ctx.gpu,
+                &mut bundle.scratch,
+                s,
+            )
+        }) {
             Ok(s) => {
                 eprintln!(
                     "  DFlash draft loaded: {} (layers={}, hidden={}, block={}, runtime_block={})",
@@ -3110,7 +3119,6 @@ fn finish_qwen35_load(
 
     // Move adaptive controller out of the bundle before parking the rest in
     // `Box<dyn ArchModel>`. LoadedModel.kv_adaptive is the runtime home for downshift hooks.
-    let mut bundle = bundle;
     bundle.vision_config = vision_config;
     bundle.vision_weights = vision_weights;
     let kv_adaptive = bundle.kv_adaptive.take();
@@ -3653,7 +3661,14 @@ fn resolve_qwen4_route_plan(
         .map(|route| route.sku);
     // Qwen4 is not a Qwen3.5-dense trunk: no dense-weights admission applies.
     if hipfire_runtime::config::retained_redline_default(
-        &gpu.arch, "qwen4", route, None, req.pp, 1, ep, true,
+        &gpu.arch,
+        "qwen4",
+        route,
+        None,
+        req.pp,
+        1,
+        ep,
+        hipfire_runtime::config::AttachedDraft::NativeMtp,
     ) {
         return Err("retained Redline route".into());
     }

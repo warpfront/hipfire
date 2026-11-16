@@ -19,7 +19,9 @@ use super::weights::LayerWeights;
 use super::weights::MoeFfnWeights;
 use super::weights::Qwen35Weights;
 use super::weights::StateQuant;
+use crate::speculative::ArHiddenStaging;
 use crate::speculative::GdnTape;
+use crate::speculative::HiddenStage;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
@@ -1175,6 +1177,11 @@ pub struct Qwen35Scratch {
     // `HIPFIRE_PREFILL_MAX_BATCH=4096` cache sizing would give, only when the
     // implicit cache differs from them. RefCell for the same reason as above.
     pub reuse_virtual_pbs: std::cell::RefCell<Option<PrefillBatchScratch>>,
+    /// The load's AR hidden staging ([`ArHiddenStaging`]): `Some` exactly when
+    /// a DFlash drafter was attached at load, installed once by
+    /// [`Self::install_ar_hidden_staging`] and never replaced, so the
+    /// [`forward_scratch`] variant (staged or plain) is fixed for the load.
+    ar_hidden_staging: Option<ArHiddenStaging>,
 }
 
 fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
@@ -1433,6 +1440,7 @@ impl Qwen35Scratch {
             prefill_batch: None,
             widened_prefill_batch: std::cell::RefCell::new(None),
             reuse_virtual_pbs: std::cell::RefCell::new(None),
+            ar_hidden_staging: None,
         })
         .and_then(|mut s| {
             // Allocate MoE scratch only for MoE configs. Done after the
@@ -1505,6 +1513,33 @@ impl Qwen35Scratch {
             }
             Ok(s)
         })
+    }
+
+    /// Install the load's AR hidden staging: one stable `[hidden_dim]` F32 row
+    /// per draft extraction layer, which every eligible single-token AR
+    /// [`forward_scratch`] of this load then writes (inside its HipGraph or
+    /// retained tape). Called once, when the DFlash sidecar is resolved at
+    /// load; a second install is refused, so the variant never flips mid-load
+    /// (a retained tape bakes it).
+    pub fn install_ar_hidden_staging(
+        &mut self,
+        gpu: &mut Gpu,
+        extract_layers: &[usize],
+        hidden_dim: usize,
+    ) -> HipResult<()> {
+        if self.ar_hidden_staging.is_some() {
+            return Err(HipError::new(
+                0,
+                "Qwen35Scratch: the AR hidden staging is fixed at load; refusing a second install",
+            ));
+        }
+        self.ar_hidden_staging = Some(ArHiddenStaging::new(gpu, extract_layers, hidden_dim)?);
+        Ok(())
+    }
+
+    /// The load's AR hidden staging, `None` on a load without a DFlash drafter.
+    pub fn ar_hidden_staging(&self) -> Option<&ArHiddenStaging> {
+        self.ar_hidden_staging.as_ref()
     }
 
     /// Free all GPU tensors. Call before drop to return VRAM. Checked — reports first free failure.
@@ -1583,6 +1618,9 @@ impl Qwen35Scratch {
         }
         if let Some(pbs) = self.reuse_virtual_pbs.into_inner() {
             note(pbs.free_gpu(gpu));
+        }
+        if let Some(staging) = self.ar_hidden_staging {
+            note(staging.free_gpu(gpu));
         }
         match first_err {
             Some(e) => Err(e),
@@ -1689,12 +1727,13 @@ fn ar_graph_eligible_for_kv(
 
 /// Identity of the caller buffers the AR hipGraph bakes at capture: the
 /// model (embedding and lm_head), every KV tensor, every DeltaNet state
-/// tensor and every scratch buffer. The graph replays captured device
-/// pointers and ignores the buffers a later call passes, so a replay is valid
-/// only for the same allocations. A caller that passes a new `DeltaNetState`
-/// (or KV cache / scratch) for the next request must get a fresh capture, not
-/// a replay that reads and writes the previous request's state. Never 0 (the
-/// unbound value of `GraphState::ar_forward_binding`).
+/// tensor, every scratch buffer and the AR hidden-staging variant (staged or
+/// plain, its extraction layers and row bases). The graph replays captured
+/// device pointers and ignores the buffers a later call passes, so a replay is
+/// valid only for the same allocations. A caller that passes a new
+/// `DeltaNetState` (or KV cache / scratch) for the next request must get a
+/// fresh capture, not a replay that reads and writes the previous request's
+/// state. Never 0 (the unbound value of `GraphState::ar_forward_binding`).
 fn ar_graph_binding(
     weights: &Qwen35Weights,
     kv_cache: &llama::KvCache,
@@ -1702,11 +1741,11 @@ fn ar_graph_binding(
     s: &Qwen35Scratch,
 ) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    let mut mix = |p: *mut std::ffi::c_void| h = (h ^ p as u64).wrapping_mul(0x100_0000_01b3);
-    mix(weights.token_embd.buf.as_ptr());
-    mix(weights.output.buf.buf.as_ptr());
+    let mut mix = |v: u64| h = (h ^ v).wrapping_mul(0x100_0000_01b3);
+    mix(weights.token_embd.buf.as_ptr() as u64);
+    mix(weights.output.buf.buf.as_ptr() as u64);
     for t in kv_cache.k_gpu.iter().chain(&kv_cache.v_gpu) {
-        mix(t.buf.as_ptr());
+        mix(t.buf.as_ptr() as u64);
     }
     // Every owned family, GDN carry included: an exchange or reallocation of
     // any of them changes the identity. Reset and same-pointer restore do not
@@ -1714,10 +1753,10 @@ fn ar_graph_binding(
     // generation (`dn_state.stream.generation`) is for component-executor
     // graph keys, not this decode graph.
     for t in dn_state.families().into_iter().flatten() {
-        mix(t.buf.as_ptr());
+        mix(t.buf.as_ptr() as u64);
     }
-    mix(s.pos_buf.as_ptr());
-    mix(s.pos_buf3.as_ptr());
+    mix(s.pos_buf.as_ptr() as u64);
+    mix(s.pos_buf3.as_ptr() as u64);
     for t in [
         &s.x,
         &s.tmp,
@@ -1750,7 +1789,7 @@ fn ar_graph_binding(
         &s.x_rot,
         &s.flash_partials,
     ] {
-        mix(t.buf.as_ptr());
+        mix(t.buf.as_ptr() as u64);
     }
     for t in [
         &s.moe_router_logits,
@@ -1771,7 +1810,16 @@ fn ar_graph_binding(
     .into_iter()
     .flatten()
     {
-        mix(t.buf.as_ptr());
+        mix(t.buf.as_ptr() as u64);
+    }
+    if let Some(staging) = &s.ar_hidden_staging {
+        mix(1);
+        for &layer in staging.extract_layers() {
+            mix(layer as u64);
+        }
+        for row in staging.rows() {
+            mix(row.buf.as_ptr() as u64);
+        }
     }
     h.max(1)
 }
@@ -1792,8 +1840,20 @@ pub(crate) fn refuse_open_gdn_stream(dn_state: &DeltaNetState, site: &str) -> Hi
     Ok(())
 }
 
+/// Route-identity key under which a retained tape latches the AR
+/// hidden-staging variant it recorded ([`ArHiddenStaging::identity`]). An ASCII
+/// tag; sealed-MoE keys are table addresses.
+const AR_HIDDEN_STAGING_ROUTE_KEY: u64 = u64::from_be_bytes(*b"q35arhst");
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
+///
+/// The variant comes from the scratch, never from the caller: on a load with a
+/// DFlash drafter ([`Qwen35Scratch::ar_hidden_staging`]) every call also stages
+/// the extraction layers' hidden rows into the load's fixed rows, inside the
+/// AR HipGraph or retained tape when the call is eligible, so plain-AR requests
+/// and spec-retired tokens share one executor. The DFlash AR step commits the
+/// rows to its ring after the call ([`ArHiddenStaging::commit_to_ring`]).
 pub fn forward_scratch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -1803,6 +1863,63 @@ pub fn forward_scratch(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    let stage = scratch
+        .ar_hidden_staging
+        .as_ref()
+        .map(ArHiddenStaging::stage);
+    forward_scratch_staged(
+        gpu, weights, config, token, pos, kv_cache, dn_state, scratch, stage,
+    )
+}
+
+/// One non-AR single-token target row (the per-token prefill fallback of a
+/// prompt seed or verify) whose extraction-layer hidden rows go to
+/// `hidden_rb`'s own fixed-offset staging; the caller commits them with
+/// [`HiddenStateRingBuffer::commit_staging_to_ring`]. Never the plain-AR body:
+/// the retained eligibility is cleared before the first launch and the call
+/// is AR-graph ineligible, so it neither records, replays nor captures.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_scratch_ring_row(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: &HiddenStateRingBuffer,
+) -> HipResult<()> {
+    gpu.replay.enter_batched_forward();
+    gpu.graphs.ar_graph_eligible = false;
+    forward_scratch_staged(
+        gpu,
+        weights,
+        config,
+        token,
+        pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        Some(hidden_rb.staging_stage()),
+    )
+}
+
+/// The one single-token forward body of [`forward_scratch`] and
+/// [`forward_scratch_ring_row`]; `stage` receives the extraction-layer hidden
+/// rows.
+#[allow(clippy::too_many_arguments)]
+fn forward_scratch_staged(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    stage: Option<HiddenStage<'_>>,
 ) -> HipResult<()> {
     refuse_open_gdn_stream(dn_state, "forward_scratch")?;
     #[cfg(feature = "moe-oracle")]
@@ -1944,6 +2061,33 @@ pub fn forward_scratch(
     gpu.replay
         .begin_auto_capture_if_armed()
         .map_err(|reason| HipError::new(0, reason))?;
+    // The AR hidden-staging variant is part of the retained tape's binding: a
+    // recording latches it (layers and row bases), and a prepared route whose
+    // latched variant differs from this load's is refused before any retained
+    // submit, falling back closed to HIP. The variant is fixed at load, so this
+    // refuses only a broken contract.
+    let variant = scratch
+        .ar_hidden_staging
+        .as_ref()
+        .map(ArHiddenStaging::identity);
+    if gpu.replay.is_recording() {
+        if let Some(identity) = variant {
+            gpu.replay
+                .note_route_identity(AR_HIDDEN_STAGING_ROUTE_KEY, identity)
+                .map_err(|reason| HipError::new(0, &reason))?;
+        }
+    } else if (gpu.replay.should_route_pm4() || gpu.replay.should_route_aql())
+        && gpu.replay.route_identity(AR_HIDDEN_STAGING_ROUTE_KEY) != variant
+    {
+        gpu.replay.poison(
+            "qwen35 retained route binding changed: the AR hidden-staging variant differs \
+             from the recorded tape",
+        );
+        eprintln!(
+            "[redline] qwen35: AR hidden-staging variant differs from the retained tape; \
+             falling back to HIP"
+        );
+    }
 
     let pos_i32 = pos as i32;
     if gpu.replay.should_route_aql() {
@@ -2012,7 +2156,7 @@ pub fn forward_scratch(
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+            gpu, weights, config, pos, kv_cache, dn_state, scratch, stage, None,
         )?;
         gpu.graphs.ar_forward_kernel_dirty = false;
     } else if use_graph {
@@ -2034,7 +2178,7 @@ pub fn forward_scratch(
             gpu.active_stream.as_ref().unwrap(),
         )?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+            gpu, weights, config, pos, kv_cache, dn_state, scratch, stage, None,
         )?;
         gpu.graphs.end_graph_capture(
             &gpu.hip,
@@ -2058,7 +2202,7 @@ pub fn forward_scratch(
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+            gpu, weights, config, pos, kv_cache, dn_state, scratch, stage, None,
         )?;
     }
     if gpu.replay.should_auto_finalize_capture() {
@@ -2121,69 +2265,6 @@ pub fn prepare_scratch_inputs(
     }
     gpu.hip
         .memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
-    Ok(())
-}
-
-/// Same as `forward_scratch` but also extracts hidden states from the
-/// configured target layers into `hidden_rb`. Used by the DFlash draft path
-/// during target verification. `hidden_rb.advance_head()` is called once
-/// automatically at the end of the forward pass.
-pub fn forward_scratch_with_hidden(
-    gpu: &mut Gpu,
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    token: u32,
-    pos: usize,
-    kv_cache: &mut llama::KvCache,
-    dn_state: &mut DeltaNetState,
-    scratch: &Qwen35Scratch,
-    hidden_rb: &mut HiddenStateRingBuffer,
-) -> HipResult<()> {
-    let required_tokens = checked_kv_end(pos, 1, "forward_scratch_with_hidden")?;
-    super::prefill::release_widened_pbs_for_kv_growth(
-        gpu,
-        kv_cache,
-        config,
-        scratch,
-        required_tokens,
-    )?;
-    kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
-    let dim = config.dim;
-    let pos_i32 = pos as i32;
-    gpu.hip
-        .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => {
-            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::HFQ4G128 => {
-            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::F32 => {
-            gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::Ggml(dtype) => {
-            gpu.ggml_embedding_lookup(dtype, &weights.token_embd, &scratch.x, token, dim)?
-        }
-        _ => panic!("unsupported embedding format"),
-    }
-
-    forward_scratch_layers(
-        gpu,
-        weights,
-        config,
-        pos,
-        kv_cache,
-        dn_state,
-        scratch,
-        Some(hidden_rb),
-        None,
-    )?;
-    hidden_rb.advance_head();
     Ok(())
 }
 
@@ -2384,7 +2465,8 @@ pub fn forward_scratch_embed_mrope(
 /// Single-GPU decode layer loop over the declarative layer program
 /// (`super::program`): per layer one mixer step (`DeltaNetMixer` or
 /// `GatedAttention`) and one FFN step (`GatedMlp`, or the sealed MoE call).
-/// `hidden_rb` captures the post-layer hidden states speculative drafts read;
+/// `stage` receives the post-layer hidden rows of the extraction layers
+/// speculative drafts read (fixed offsets, committed by the owner afterwards);
 /// `mrope` switches full attention to the (t, h, w) RoPE of a VL step.
 #[allow(clippy::too_many_arguments)]
 fn forward_scratch_layers(
@@ -2395,7 +2477,7 @@ fn forward_scratch_layers(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     s: &Qwen35Scratch,
-    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    stage: Option<HiddenStage<'_>>,
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
     refuse_open_gdn_stream(dn_state, "forward_scratch_layers")?;
@@ -2416,13 +2498,12 @@ fn forward_scratch_layers(
     };
     // A layer's hidden state is final once its MoE combine has run, which the
     // fused transition defers into the start of the next layer.
-    let hidden_rb = hidden_rb.map(|rb| &*rb);
     let finish_layer = |gpu: &mut Gpu, layer_idx: usize| -> HipResult<()> {
         dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
-        if let Some((rb, slot)) = hidden_rb.and_then(|rb| Some((rb, rb.extract_slot(layer_idx)?))) {
-            rb.write_at_head(gpu, slot, &s.x)?;
+        match stage {
+            Some(stage) => stage.write_layer(gpu, layer_idx, &s.x),
+            None => Ok(()),
         }
-        Ok(())
     };
     let mut delta_layer_idx = 0usize;
     let combine_next_rms = moe_combine_next_rms_enabled(gpu, weights, config);

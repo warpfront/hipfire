@@ -12,7 +12,7 @@
 //! writes the table to `$ROUTE_PROOF_OUT`.
 
 use hipfire_registry::{ModelEntry, RETIRED_MODELS};
-use hipfire_runtime::config::retained_redline_default;
+use hipfire_runtime::config::{retained_redline_default, AttachedDraft};
 use hipfire_runtime::route_sku::{self, RouteSku};
 use std::path::{Path, PathBuf};
 
@@ -54,7 +54,9 @@ fn legacy_sku(file: &str) -> Option<RouteSku> {
 /// SKU, so the live side is asked with no dense weights and the format rule is
 /// proven by `hipfire-runtime`'s config tests instead. The `.mq4rs` arm carries
 /// the 0.5.0 gfx1100 admission (exact gfx1100 and gfx1201; gfx1151 stays on
-/// HIP) so the identity route is still proven equal on every input.
+/// HIP) and the gfx1201 Qwen3.5-dense arm the 0.5.0 DFlash admission (a DFlash
+/// drafter, like no drafter, takes it) so the identity route is still proven
+/// equal on every input.
 fn legacy_retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
@@ -62,8 +64,9 @@ fn legacy_retained_redline_default(
     pp: usize,
     tp: usize,
     ep: usize,
-    has_drafter: bool,
+    draft: AttachedDraft,
 ) -> bool {
+    let has_drafter = draft != AttachedDraft::None;
     let ext = |wanted: &str| {
         Path::new(model_path)
             .extension()
@@ -85,10 +88,11 @@ fn legacy_retained_redline_default(
         return true;
     }
     if gpu_arch.eq_ignore_ascii_case("gfx1201")
-        && (model_arch.eq_ignore_ascii_case("qwen3_5") || model_arch.eq_ignore_ascii_case("qwen4"))
         && pp == 1
         && tp == 1
-        && !has_drafter
+        && ((model_arch.eq_ignore_ascii_case("qwen3_5")
+            && matches!(draft, AttachedDraft::None | AttachedDraft::Dflash))
+            || (model_arch.eq_ignore_ascii_case("qwen4") && !has_drafter))
     {
         return true;
     }
@@ -132,7 +136,12 @@ fn registry_identity_route_equals_the_removed_extension_route_for_every_artifact
         ] {
             for model_arch in &arches {
                 for (pp, tp, ep) in [(1, 1, 1), (2, 1, 1), (1, 2, 1), (1, 1, 2)] {
-                    for has_drafter in [false, true] {
+                    for draft in [
+                        AttachedDraft::None,
+                        AttachedDraft::Dflash,
+                        AttachedDraft::NativeMtp,
+                        AttachedDraft::Other,
+                    ] {
                         let was = legacy_retained_redline_default(
                             gpu_arch,
                             model_arch,
@@ -140,22 +149,15 @@ fn registry_identity_route_equals_the_removed_extension_route_for_every_artifact
                             pp,
                             tp,
                             ep,
-                            has_drafter,
+                            draft,
                         );
                         let is = retained_redline_default(
-                            gpu_arch,
-                            model_arch,
-                            new,
-                            None,
-                            pp,
-                            tp,
-                            ep,
-                            has_drafter,
+                            gpu_arch, model_arch, new, None, pp, tp, ep, draft,
                         );
                         assert_eq!(
                             was, is,
                             "{tag} ({}) {gpu_arch} {model_arch} pp={pp} tp={tp} ep={ep} \
-                             drafter={has_drafter}",
+                             drafter={draft:?}",
                             entry.file
                         );
                     }

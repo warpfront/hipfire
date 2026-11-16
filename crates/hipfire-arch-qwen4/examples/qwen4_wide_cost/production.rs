@@ -607,7 +607,16 @@ pub(super) fn preload_retained_default(gpu_arch: &str, model_path: &str) -> bool
         .unwrap_or_else(|error| panic!("route identity: {error}"))
         .map(|route| route.sku);
     // Qwen4 is not a Qwen3.5-dense trunk: no dense-weights admission applies.
-    hipfire_runtime::config::retained_redline_default(gpu_arch, "qwen4", route, None, 1, 1, 1, true)
+    hipfire_runtime::config::retained_redline_default(
+        gpu_arch,
+        "qwen4",
+        route,
+        None,
+        1,
+        1,
+        1,
+        hipfire_runtime::config::AttachedDraft::NativeMtp,
+    )
 }
 
 /// The ordinary floor policy for a single-device Qwen4 planning load: the

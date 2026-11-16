@@ -55,7 +55,7 @@ fn main() {
     .unwrap();
     let mut dn_state =
         DeltaNetState::new_with_quant(&mut gpu, &config, qwen35::StateQuant::Q8).unwrap();
-    let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
+    let mut scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
     let sc = llama::SamplingConfig::text_thinking();
 
     // Optional hidden-state ring buffer for Phase 3 overhead measurement.
@@ -79,36 +79,31 @@ fn main() {
             "Hidden extraction: layers {:?} (n_layers={})",
             rb.extract_layers, config.n_layers
         );
+        // The DFlash load's AR variant: `forward_scratch` stages the rows,
+        // each step commits them to the ring.
+        scratch
+            .install_ar_hidden_staging(&mut gpu, &rb.extract_layers, config.dim)
+            .unwrap();
     }
+    let scratch = scratch;
 
     // Warmup: 16 forwards at positions 0..16 (fills some KV).
     let warmup_tok: u32 = 1;
     for pos in 0..16 {
-        if let Some(ref mut rb) = hidden_rb {
-            qwen35::forward_scratch_with_hidden(
-                &mut gpu,
-                &weights,
-                &config,
-                warmup_tok,
-                pos,
-                &mut kv_cache,
-                &mut dn_state,
-                &scratch,
-                rb,
-            )
-            .unwrap();
-        } else {
-            qwen35::forward_scratch(
-                &mut gpu,
-                &weights,
-                &config,
-                warmup_tok,
-                pos,
-                &mut kv_cache,
-                &mut dn_state,
-                &scratch,
-            )
-            .unwrap();
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &config,
+            warmup_tok,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .unwrap();
+        if let Some(rb) = &mut hidden_rb {
+            let staging = scratch.ar_hidden_staging().unwrap();
+            staging.commit_to_ring(&mut gpu, rb).unwrap();
         }
     }
     gpu.hip.device_synchronize().unwrap();
@@ -121,31 +116,20 @@ fn main() {
         history.push(warmup_tok);
     }
     for i in 0..iters {
-        if let Some(ref mut rb) = hidden_rb {
-            qwen35::forward_scratch_with_hidden(
-                &mut gpu,
-                &weights,
-                &config,
-                warmup_tok,
-                16 + i,
-                &mut kv_cache,
-                &mut dn_state,
-                &scratch,
-                rb,
-            )
-            .unwrap();
-        } else {
-            qwen35::forward_scratch(
-                &mut gpu,
-                &weights,
-                &config,
-                warmup_tok,
-                16 + i,
-                &mut kv_cache,
-                &mut dn_state,
-                &scratch,
-            )
-            .unwrap();
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &config,
+            warmup_tok,
+            16 + i,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .unwrap();
+        if let Some(rb) = &mut hidden_rb {
+            let staging = scratch.ar_hidden_staging().unwrap();
+            staging.commit_to_ring(&mut gpu, rb).unwrap();
         }
         if with_sample {
             let mut logits = gpu.download_f32(&scratch.logits).unwrap();

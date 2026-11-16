@@ -275,6 +275,12 @@ impl RouteFacts {
         let identity =
             hipfire_runtime::route_sku::identify_path(std::path::Path::new(&self.model_path), None)
                 .unwrap_or_else(|error| panic!("route identity: {error}"));
+        // The only drafter this Qwen4 bundle can carry is its native MTP head.
+        let draft = if self.has_drafter {
+            hipfire_runtime::config::AttachedDraft::NativeMtp
+        } else {
+            hipfire_runtime::config::AttachedDraft::None
+        };
         hipfire_runtime::config::retained_redline_default(
             &self.gpu_arch,
             &self.model_arch,
@@ -283,7 +289,7 @@ impl RouteFacts {
             self.pp,
             self.tp,
             self.ep,
-            self.has_drafter,
+            draft,
         ) && self.platform_refusal.is_none()
     }
 
