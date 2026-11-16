@@ -11,6 +11,11 @@
 use crate::route_sku::{DenseWeights, RouteSku};
 use std::sync::OnceLock;
 
+/// Exact GPU arches whose retained PM4 decode of the symmetric-expert A3B SKU
+/// ([`RouteSku::Mq4rs`]) has served greedy-identity and decode-timing receipts
+/// (REDLINE.md §11.6). gfx1151 is not one of them.
+const A3B_MQ4RS_RETAINED_ARCHES: [&str; 2] = ["gfx1100", "gfx1201"];
+
 /// Automatic Redline runtime default for single-GPU MQ4R models. The SKU is
 /// the file's identity ([`RouteSku::Mq4r`], see [`crate::route_sku`]); the
 /// file name is never read.
@@ -39,9 +44,11 @@ pub fn mq4r_redline_default(gpu_arch: &str, route: Option<RouteSku>, pp: usize, 
 /// AR graph. Qwen4 (Flash-Next) on exact gfx1201 is admitted the same way:
 /// single GPU, no drafter (a native MTP head is a drafter, so only an
 /// MTP-off load replays), byte-identical greedy text to the HIP graph.
-/// The symmetric-expert A3B SKU (`qwen3_5_moe`, [`RouteSku::Mq4rs`]) on exact gfx1201 is
-/// admitted the same way (single GPU, no drafter, PM4 transport), with greedy
-/// ids identical to the HIP route. A Qwen3.5 dense trunk on exact gfx1100 is
+/// The symmetric-expert A3B SKU (`qwen3_5_moe`, [`RouteSku::Mq4rs`]) on exact gfx1100 or
+/// gfx1201 (`A3B_MQ4RS_RETAINED_ARCHES`) is admitted the same way (single
+/// GPU, no drafter, PM4 transport), with greedy ids identical to the HIP route
+/// on both (gfx1100: x1.22-1.32 decode tok/s, REDLINE.md §11.6); gfx1151 has no
+/// receipts and stays on HIP. A Qwen3.5 dense trunk on exact gfx1100 is
 /// admitted for single-GPU plain-AR decode (no drafter) when its decode weight
 /// format ([`DenseWeights`], read from the tensor index and HFQ metadata, never
 /// the file name) is in [`gfx1100_dense_weights_qualified`]: the MQ3G256V2
@@ -108,7 +115,9 @@ pub fn retained_redline_default(
     {
         return true;
     }
-    if gpu_arch.eq_ignore_ascii_case("gfx1201")
+    if A3B_MQ4RS_RETAINED_ARCHES
+        .iter()
+        .any(|arch| gpu_arch.eq_ignore_ascii_case(arch))
         && model_arch.eq_ignore_ascii_case("qwen3_5_moe")
         && pp == 1
         && tp == 1
@@ -444,7 +453,7 @@ mod tests {
         assert!(!mq4r_with_route("gfx1201", Some(RouteSku::Mq4rs), 1, 1));
         assert!(!mq4r_with_route("gfx1201", Some(RouteSku::Mq2r), 1, 1));
         assert!(!redline_with_route(
-            "gfx1100",
+            "gfx1151",
             "qwen3_5_moe",
             Some(RouteSku::Mq4rs),
             None,
@@ -621,35 +630,10 @@ mod tests {
     }
 
     #[test]
-    fn a3b_mq4rs_takes_retained_redline_on_gfx1201_only() {
+    fn a3b_mq4rs_takes_retained_redline_on_gfx1100_and_gfx1201_only() {
         let f = "/models/qwen3.6-35b-a3b-d53.mq4rs";
-        assert!(retained_redline_default(
-            "gfx1201",
-            "qwen3_5_moe",
-            f,
-            1,
-            1,
-            false
-        ));
-        assert!(retained_redline_default(
-            "gfx1201",
-            "qwen3_5_moe",
-            "/models/A3B.MQ4RS",
-            1,
-            1,
-            false
-        ));
-        // drafter (MTP-loaded), other arches, multi-GPU, other families, other extensions
-        assert!(!retained_redline_default(
-            "gfx1201",
-            "qwen3_5_moe",
-            f,
-            1,
-            1,
-            true
-        ));
-        for arch in ["gfx1200", "gfx1100", "gfx1151", "gfx942"] {
-            assert!(!retained_redline_default(
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(retained_redline_default(
                 arch,
                 "qwen3_5_moe",
                 f,
@@ -657,43 +641,72 @@ mod tests {
                 1,
                 false
             ));
+            assert!(retained_redline_default(
+                arch,
+                "qwen3_5_moe",
+                "/models/A3B.MQ4RS",
+                1,
+                1,
+                false
+            ));
+            // drafter (MTP-loaded), multi-GPU, EP, other families, other SKUs
+            assert!(!retained_redline_default(
+                arch,
+                "qwen3_5_moe",
+                f,
+                1,
+                1,
+                true
+            ));
+            assert!(!retained_redline_default(
+                arch,
+                "qwen3_5_moe",
+                f,
+                2,
+                1,
+                false
+            ));
+            assert!(!retained_redline_default(
+                arch,
+                "qwen3_5_moe",
+                f,
+                1,
+                2,
+                false
+            ));
+            assert!(!redline_with_ep(arch, "qwen3_5_moe", f, 1, 1, 2, false));
+            assert!(!retained_redline_default(arch, "qwen3", f, 1, 1, false));
+            assert!(!retained_redline_default(
+                arch,
+                "qwen3_5_moe",
+                "/models/a3b.mq4",
+                1,
+                1,
+                false
+            ));
         }
-        assert!(!retained_redline_default(
-            "gfx1201",
+        for arch in ["gfx1200", "gfx1101", "gfx1151", "gfx942"] {
+            assert!(
+                !retained_redline_default(arch, "qwen3_5_moe", f, 1, 1, false),
+                "{arch} must stay on HIP"
+            );
+        }
+    }
+
+    #[test]
+    fn a3b_mq4rs_stays_on_hip_on_gfx1151() {
+        // Halo has no A3B MQ4RS retained receipts: the HIP graph keeps it.
+        assert!(!redline_with_route(
+            "gfx1151",
             "qwen3_5_moe",
-            f,
-            2,
+            Some(RouteSku::Mq4rs),
+            None,
             1,
-            false
-        ));
-        assert!(!retained_redline_default(
-            "gfx1201",
-            "qwen3_5_moe",
-            f,
-            1,
-            2,
-            false
-        ));
-        assert!(!retained_redline_default(
-            "gfx1201", "qwen3", f, 1, 1, false
-        ));
-        assert!(!retained_redline_default(
-            "gfx1201",
-            "qwen3_5_moe",
-            "/models/a3b.mq4",
             1,
             1,
             false
         ));
-        assert!(!redline_with_ep(
-            "gfx1201",
-            "qwen3_5_moe",
-            f,
-            1,
-            1,
-            2,
-            false
-        ));
+        assert!(!super::A3B_MQ4RS_RETAINED_ARCHES.contains(&"gfx1151"));
     }
 
     #[test]

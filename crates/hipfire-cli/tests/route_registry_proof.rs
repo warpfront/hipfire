@@ -52,7 +52,9 @@ fn legacy_sku(file: &str) -> Option<RouteSku> {
 /// gfx1100 Qwen3.5-dense `.mq3-xt` extension rule is left out: its successor is
 /// a decode-weight-format capability ([`route_sku::DenseWeights`]), not an
 /// SKU, so the live side is asked with no dense weights and the format rule is
-/// proven by `hipfire-runtime`'s config tests instead.
+/// proven by `hipfire-runtime`'s config tests instead. The `.mq4rs` arm carries
+/// the 0.5.0 gfx1100 admission (exact gfx1100 and gfx1201; gfx1151 stays on
+/// HIP) so the identity route is still proven equal on every input.
 fn legacy_retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
@@ -90,7 +92,7 @@ fn legacy_retained_redline_default(
     {
         return true;
     }
-    if gpu_arch.eq_ignore_ascii_case("gfx1201")
+    if matches!(gpu_arch, "gfx1100" | "gfx1201")
         && model_arch.eq_ignore_ascii_case("qwen3_5_moe")
         && pp == 1
         && tp == 1
