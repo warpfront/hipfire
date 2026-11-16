@@ -691,13 +691,6 @@ fn main() {
         );
         std::process::exit(2);
     }
-    if std::env::var("HIPFIRE_QWEN4_GDN_PIPE").as_deref() == Ok("0") {
-        eprintln!(
-            "gdn_lanes_verify_f32_gfx942_oracle: HIPFIRE_QWEN4_GDN_PIPE=0 changes the reference \
-             kernel; unset it"
-        );
-        std::process::exit(2);
-    }
     let image = match std::env::var("HIPFIRE_QWEN4_G942_GDN_LANES_VERIFY_IMAGE") {
         Ok(path) if !path.is_empty() => {
             let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);

@@ -36,8 +36,7 @@
 //!    [--reps 9] [--warm 3] [--skip-controls] [--skip-correctness]`
 //!
 //! Prints one line per case / control and a final `gdn_lanes_f32_gfx942_oracle: PASS|FAIL`.
-//! Exit 0 = PASS, 1 = a mismatch / undetected control, 2 = not exact gfx942 (or
-//! `HIPFIRE_QWEN4_GDN_PIPE=0`, which would change the reference kernel).
+//! Exit 0 = PASS, 1 = a mismatch / undetected control, 2 = not exact gfx942.
 
 use rdna_compute::cdna::gfx942::{Qwen4GdnLanesF32Lane, Qwen4GdnLanesF32Shape};
 use rdna_compute::tensor_ops::{gated_delta_step_batched, GatedDeltaStepBatched, GdnStateFormat};
@@ -591,13 +590,6 @@ fn main() {
         eprintln!(
             "gdn_lanes_f32_gfx942_oracle: needs exact gfx942, this device is {}",
             gpu.arch
-        );
-        std::process::exit(2);
-    }
-    if std::env::var("HIPFIRE_QWEN4_GDN_PIPE").as_deref() == Ok("0") {
-        eprintln!(
-            "gdn_lanes_f32_gfx942_oracle: HIPFIRE_QWEN4_GDN_PIPE=0 selects persistent256 as the \
-             per-lane reference; unset it"
         );
         std::process::exit(2);
     }

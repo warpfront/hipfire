@@ -2219,8 +2219,8 @@ pub struct DflashSpeculator {
     last_window: Option<DflashWindowMark>,
     /// Adaptive verify-block controller (trailing-τ proposal shrink),
     /// owned by `hipfire_runtime::dflash_adaptive_block` so the policy is
-    /// family-free. Disabled (fixed full block) when the load knob opted out,
-    /// `HIPFIRE_DFLASH_ADAPTIVE_B=0` wins, or the retained-PM4 verify route
+    /// family-free. Disabled (fixed full block) when the load knob opted out
+    /// or the retained-PM4 verify route
     /// was admitted (its replay is shape-frozen at B=16; see
     /// `build_dflash_speculator`). Reset to full at request start.
     adaptive: DflashAdaptiveBlock,
@@ -3263,9 +3263,7 @@ impl Speculator for DflashSpeculator {
 /// the env config the daemon's old `generate_dflash` read inline: checkpoint
 /// interval/cap
 /// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
-/// `ckpt_interval()`/`ckpt_max()` defaults), plus the adaptive-B kill-switch
-/// (`HIPFIRE_DFLASH_ADAPTIVE_B=0` forces the fixed full block). Called once
-/// at load.
+/// `ckpt_interval()`/`ckpt_max()` defaults). Called once at load.
 /// `adaptive_b` is the `SpecLoadCfg::dflash_adaptive_b` load param (None =
 /// default off).
 pub fn build_dflash_speculator(df: DflashState, adaptive_b: bool) -> Box<dyn Speculator> {
@@ -3279,16 +3277,7 @@ pub fn build_dflash_speculator(df: DflashState, adaptive_b: bool) -> Box<dyn Spe
         .and_then(|v| v.parse().ok())
         .unwrap_or(8usize)
         .max(1);
-    // Opt-in (load param, default off); HIPFIRE_DFLASH_ADAPTIVE_B=0 still
-    // forces the fixed block when the param is on.
-    // The load param ANDs into this here so the constructor stays the single
-    // env-touching site and `new` stays pure (mirrors
-    // build_dspark_speculator).
-    let adaptive_b = adaptive_b
-        && hipfire_config::developer_var("HIPFIRE_DFLASH_ADAPTIVE_B")
-            .ok()
-            .as_deref()
-            != Some("0");
+    // Opt-in (load param, default off).
     // Retained-PM4 verify replay is shape-frozen at B=16: an adaptive
     // controller shrinks windows below DFLASH_VERIFY_PM4_BLOCK, the PM4
     // window's `eligible_shape()` then refuses (`batch == B` only) and every

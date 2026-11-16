@@ -46,7 +46,7 @@
 //! pointer mismatches, and the flag off; `Some` for admitted 2 and 8 lane
 //! sets).
 //!
-//! `--fuse` (`HIPFIRE_QWEN4_GDN_LANES_FUSE`): the candidate is `GdnCoreLanesPlan::launch_rotated`
+//! `--fuse`: the candidate is `GdnCoreLanesPlan::launch_rotated`
 //! (`gated_delta_step_gate_norm128_q8_lanes_fuse`: the conv + gate-parameter launch as the
 //! step block's prologue, the output projection's `mq_rotate_x` as its epilogue, ONE launch per
 //! step). It is compared against the same per-lane singleton reference, and in addition: the
@@ -1185,7 +1185,7 @@ struct Cli {
     lanes: Vec<usize>,
     seed: u64,
     controls: bool,
-    /// Run the candidate through `launch_rotated` with `HIPFIRE_QWEN4_GDN_LANES_FUSE`.
+    /// Run the candidate through `launch_rotated` (the fused lanes Core).
     fuse: bool,
     /// `--bench ITERS`: time the incumbent chain against the fused launch (implies `--fuse`),
     /// then exit.

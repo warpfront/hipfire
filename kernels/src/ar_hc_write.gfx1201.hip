@@ -51,8 +51,8 @@
 // ---------------------------------------------------------------------------------------
 // Wire formats. ABI-identical entries per partial format: tagged (`ar_hc_write_*`,
 // `ar_hc_write_p32_*`) and dense (`ar_hc_write_d8_*`, `ar_hc_write_p32_d16_*`). The host picks one
-// PER LAUNCH from the row count (HIPFIRE_EP_AR_WIRE_DENSE, default on: dense from 16 rows,
-// tagged below; 0 = tagged always) and gives each wire its own mailbox region, so a slot is
+// PER LAUNCH from the row count (hybrid: dense from 16 rows,
+// tagged below) and gives each wire its own mailbox region, so a slot is
 // only ever written and read under one format. The partial values, the fold order and the HC
 // write are the same code in both; only what travels through the mailbox differs.
 //
@@ -773,7 +773,7 @@ __device__ __forceinline__ void arhc_split_entry(
 
 // Entries. Twelve ABI-identical kernels: {bf16, f32} partials x {BF16, F32} streams x
 // {tagged, dense, branch-split tagged} wire.
-//   bf16 partials (`ar_hc_write_*`): tagged 16-byte granule (kill switch HIPFIRE_EP_AR_WIRE_DENSE=0),
+//   bf16 partials (`ar_hc_write_*`): tagged 16-byte granule,
 //     dense `_d8_` 8-byte granule with receiver re-arm, branch-split `_s_`.
 //   f32 partials (`ar_hc_write_p32_*`): tagged two 16-byte records per granule, dense `_d16_` one
 //     16-byte record with receiver re-arm, branch-split `_s_`.

@@ -3712,7 +3712,7 @@ pub const GEMV_MQ4G256V2P_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC: &str = concat!(
     include_str!("../../../kernels/src/qwen4_gemv_mq4g256v2p_moe_gate_up_k8_indexed_batched.hip")
 );
 
-/// gfx1201 per-pick K = 640 down `dni` (`HIPFIRE_QWEN4_MOE_DOWN_DNI`): eight weight rows per wave, four
+/// gfx1201 per-pick K = 640 down `dni` (default on): eight weight rows per wave, four
 /// waves per block, software-pipelined loads; entries `gemv_mq4g128v2_moe_down_top10_dni_k640` (shipped
 /// layout) and `gemv_mq4g128v2p_moe_down_top10_dni_k640` (F1 planar). Same ABI and bitwise the
 /// `..._k640_r4` kernels; grid `[M / 32, k_top, N]`, block 128.
@@ -4669,8 +4669,7 @@ pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str =
 /// `[ceil(M/(16*wr)), ceil(N/256), 1]`, block `32*wr`, static LDS 40960). Entries
 /// `qwen4_mq4_x4_pm_gfx1151_{w4,w8}` (plain F32), `_{w4,w8}_bf16out`, `_w8_regions` and
 /// `_w8_hcw`, with the kernarg ABIs of the MQ6 entries. The runtime launches them for
-/// N >= 96 (`w4` for M <= 64); `HIPFIRE_QWEN4_MQ4_X4_PM=0` keeps hipcc bt4 and the
-/// unfused HC write.
+/// N >= 96 (`w4` for M <= 64).
 /// SHA-256 d9eb27bc771f2091904194ee0311dd63487c4a3a81ec1a82337cf44701177e98
 /// (`sha256sum kernels/qwen4_mq4_x4_pm_gfx1151.hxaco`).
 pub const QWEN4_MQ4_X4_PM_GFX1151: &[u8] =

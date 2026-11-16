@@ -2497,6 +2497,36 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.vae_conv` | `vae_conv` | 0.3.1 | 0.5.0 | none; VAE convolutions take the f16 GEMM route wherever K admits it |
 | `developer.vae_fuse_norm` | `vae_fuse_norm` | 0.3.1 | 0.5.0 | none; VAE GroupNorm and SiLU are always fused |
 | `developer.vae_gpu` | `vae_gpu` | 0.3.1 | 0.5.0 | none; the FLUX pipeline always decodes on the GPU |
+| `developer.cb_draft_lane_conv` | `cb_draft_lane_conv` | 0.4.2 | 0.5.0 | none; exact gfx1201 always runs the lane-batched draft convolution where admitted |
+| `developer.cb_draft_lane_ctx` | `cb_draft_lane_ctx` | 0.4.2 | 0.5.0 | none; exact gfx1201 always packs the draft ctx/fc rows where admitted |
+| `developer.cb_sampled_packed_head` | `cb_sampled_packed_head` | 0.4.2 | 0.5.0 | none; sampled chunks always share one exact F16 head where admitted |
+| `developer.dflash_adaptive_b` | | 0.4.0 | 0.5.0 | speculation.dflash_adaptive_b alone decides the adaptive verify block |
+| `developer.dflash_draft_penalty` | `dflash_draft_penalty` | 0.4.5 | 0.5.0 | none; the selector always scores candidates after the request's penalties |
+| `developer.dflash_fc_skinny` | `dflash_fc_skinny` | 0.4.5 | 0.5.0 | none; the staged fc projection takes gemm_f16_skinny_xf32 where admitted |
+| `developer.ep_ar_host_gate` | `ep_ar_host_gate` | 0.4.5 | 0.5.0 | none; every fused all-reduce launch passes the host arrival gate |
+| `developer.ep_ar_wire_dense` | `ep_ar_wire_dense` | 0.4.5 | 0.5.0 | none; the fused all-reduce always uses the hybrid tagged/dense wire |
+| `developer.fn_gdn_dense_scan` | `fn_gdn_dense_scan` | 0.4.1 | 0.5.0 | none; admitted gfx1201 GDN prefill steps always take the dense scan |
+| `developer.gdn_replay_ml_off` | `gdn_replay_ml_off` | 0.4.0 | 0.5.0 | none; gfx1201 always takes the two-launch multi-layer GDN replay where supported |
+| `developer.ple_inline_fetch` | `ple_inline_fetch` | 0.4.3 | 0.5.0 | none; small PLE fetches always try their reads inline first |
+| `developer.prefill_progress` | `prefill_progress` | 0.4.5 | 0.5.0 | none; the daemon always emits prefill_progress events |
+| `developer.qwen4_g942_fold_elem` | `qwen4_g942_fold_elem` | 0.4.6 | 0.5.0 | none; exact gfx942 always runs the folded HC down activation |
+| `developer.qwen4_g942_hc_quarters_gates` | `qwen4_g942_hc_quarters_gates` | 0.4.6 | 0.5.0 | none; exact gfx942 unfused HC writes always take the quarters-equivalent gates |
+| `developer.qwen4_gdn_capture_direct` | `qwen4_gdn_capture_direct` | 0.4.5 | 0.5.0 | none; exact gfx1201 verify lanes always write the capture in place where admitted |
+| `developer.qwen4_gdn_lanes_fuse` | `qwen4_gdn_lanes_fuse` | 0.4.5 | 0.5.0 | none; exact gfx1201 always runs the fused lanes Core (HIPFIRE_QWEN4_GDN_LANES=0 still kills the lanes route) |
+| `developer.qwen4_gdn_lanes_rows` | `qwen4_gdn_lanes_rows` | 0.4.5 | 0.5.0 | none; exact gfx1201 always runs the verify-rows lanes core (HIPFIRE_QWEN4_GDN_LANES=0 still kills the lanes route) |
+| `developer.qwen4_gdn_pipe` | `qwen4_gdn_pipe` | 0.4.1 | 0.5.0 | none; gfx1201 and gfx942 always take the pipe128 GDN recurrence where admitted |
+| `developer.qwen4_hc_down_fused` | `qwen4_hc_down_fused` | 0.4.3 | 0.5.0 | none; gfx1201 and gfx1151 always fuse the HC-down activation where admitted |
+| `developer.qwen4_hc_down_tile` | `qwen4_hc_down_tile` | 0.4.1 | 0.5.0 | none; gfx1201 and gfx1151 always take the HC-down tile where admitted |
+| `developer.qwen4_hc_pair_wide` | `qwen4_hc_pair_wide` | 0.4.5 | 0.5.0 | none; the wide verify takes the fused HC pair whenever the decode pair is on |
+| `developer.qwen4_hc_up_rot` | `qwen4_hc_up_rot` | 0.4.5 | 0.5.0 | none; exact gfx1201 always fuses the next mixer's rotation where admitted |
+| `developer.qwen4_moe_down_dni` | `qwen4_moe_down_dni` | 0.4.5 | 0.5.0 | none; exact gfx1201 always runs the dni per-pick down where admitted |
+| `developer.qwen4_moe_gu_few_pm` | `qwen4_moe_gu_few_pm` | 0.4.5 | 0.5.0 | none; exact gfx1201 always runs the PeaceMaker module at its row counts |
+| `developer.qwen4_mq4_x4_pm` | `qwen4_mq4_x4_pm` | 0.4.2 | 0.5.0 | none; exact gfx1151 always runs the certified PeaceMaker MQ4 prefill module |
+| `developer.qwen4_mtp_token_ring` | `qwen4_mtp_token_ring` | 0.4.5 | 0.5.0 | none; MTP token ids always stage through the pinned token ring outside capture |
+| `developer.qwen4_qsa_bf16_split` | `qwen4_qsa_bf16_split` | 0.4.3 | 0.5.0 | none; exact gfx1201 and gfx1100 always take the split selector where admitted |
+| `developer.qwen4_qsa_split_gfx1100` | `qwen4_qsa_split_gfx1100` | 0.4.5 | 0.5.0 | none; exact gfx1100 always takes the split selector where admitted |
+| `developer.stream_ordered_copies` | `stream_ordered_copies` | 0.4.5 | 0.5.0 | none; steady-state copies and fills always run on the active stream |
+| `developer.tp_peer_direct` | `tp_peer_direct` | 0.4.0 | 0.5.0 | none; two-rank peer meshes always take the symmetric direct-peer read |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 

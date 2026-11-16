@@ -1746,7 +1746,7 @@ pub struct Gpu {
     /// [`Gpu::set_moe32_gu`] overrides): the wide-pass gate/up `g32` kernel family replaces `o4_r8_x4`
     /// for more than 8 source rows on exact gfx1201 (shipped and planar layouts).
     pub(crate) moe32_gu: u8,
-    /// `HIPFIRE_QWEN4_MOE_DOWN_DNI` (default on, `0` kills; [`Gpu::set_moe_down_dni`] overrides): the
+    /// Default on ([`Gpu::set_moe_down_dni`] overrides for the byte oracle): the
     /// gfx1201 per-pick K = 640 down (<= 8 rows, eager) runs the `dni` kernel instead of `k640_r4`
     /// (bitwise equal output).
     pub(crate) moe_down_dni: bool,
@@ -3366,7 +3366,7 @@ impl Gpu {
                 Ok("2") => 2,
                 _ => 1,
             },
-            moe_down_dni: hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_DOWN_DNI", true),
+            moe_down_dni: true,
             moe_dead_stores: hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_DEAD_STORES", false),
             moe_dead_poison: hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_DEAD_POISON")
                 .ok()
@@ -9279,16 +9279,14 @@ impl Gpu {
         self.take_device_wait_error()
     }
 
-    /// The active stream when the steady-state copies run on it
-    /// (`HIPFIRE_STREAM_ORDERED_COPIES`, default on); `None` puts them back on the legacy null
-    /// stream. A blocking copy on the null stream enqueues a packet on its own hardware queue that
+    /// The active stream, which the steady-state copies run on; `None` (no active stream) puts
+    /// them on the legacy null stream. A blocking copy on the null stream enqueues a packet on
+    /// its own hardware queue that
     /// waits for the work queued on the active stream; when the queue mapper places that queue
     /// on the same CP pipe as the active stream's, the CP time-slices the two for as long as the
     /// packet waits, and every dispatch on the device pays the slice.
     pub fn steady_copy_stream(&self) -> Option<&hip_bridge::Stream> {
-        self.active_stream
-            .as_ref()
-            .filter(|_| self.flags.stream_ordered_copies)
+        self.active_stream.as_ref()
     }
 
     /// Blocking D→H copy of `src`'s first `dst.len()` bytes, ordered on

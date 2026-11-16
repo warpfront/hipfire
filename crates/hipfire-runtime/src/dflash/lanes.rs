@@ -15,38 +15,6 @@ use rdna_compute::draft_lane_conv::{DraftConvLane, DRAFT_CONV_LANES_MAX};
 use rdna_compute::draft_lane_rows::{DraftRowSpan, DRAFT_ROW_SPANS_MAX};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// `HIPFIRE_CB_DRAFT_LANE_CONV` (developer var; `0` is the kill switch):
-/// whether the DFlash2 prepare/finish convolutions of the batched lane draft
-/// run as one lane-batched launch per stage instead of one launch per lane
-/// (`Gpu::dynamic_causal_conv_f32_lanes`; exact gfx1201, never during graph
-/// capture, replay recording or G0 observation). Every output byte is
-/// identical either way; off restores the per-lane launches.
-static CB_DRAFT_LANE_CONV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_DRAFT_LANE_CONV").map_or(true, |v| v.trim() != "0")
-});
-
-/// Is the lane-batched draft convolution enabled for this process?
-fn draft_lane_conv_enabled() -> bool {
-    *CB_DRAFT_LANE_CONV
-}
-
-/// `HIPFIRE_CB_DRAFT_LANE_CTX` (developer var; `0` is the kill switch):
-/// whether the per-lane `fc` projection and the per-layer context K/V fill of
-/// the batched lane draft run as packed, lane-batched stages (gather, grouped
-/// rotate + GEMM per singleton arithmetic class, one norm, one RoPE, one
-/// scatter) instead of one GEMM chain per lane segment. Exact gfx1201, MQ4G256V2
-/// weights, never during graph capture, replay recording or
-/// G0 observation. Every output byte is identical either way; `0` restores the
-/// per-lane loops.
-static CB_DRAFT_LANE_CTX: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_CB_DRAFT_LANE_CTX").map_or(true, |v| v.trim() != "0")
-});
-
-/// Is the lane-batched ctx/fc path enabled for this process?
-pub(super) fn draft_lane_ctx_enabled() -> bool {
-    *CB_DRAFT_LANE_CTX
-}
-
 /// One lane of [`draft_forward_lanes`]: its own draft scratch (context rings,
 /// projection watermarks) and the singleton `draft_dflash_forward_rank`
 /// geometry (`ctx_slice = None`).
@@ -273,7 +241,7 @@ fn lane_fc_fill(
     Ok(())
 }
 
-// ─── Lane-batched fc / context fill (`HIPFIRE_CB_DRAFT_LANE_CTX`) ─────────
+// ─── Lane-batched fc / context fill ─────────
 //
 // Every ORIGINAL segment (an fc `ring_segments` piece, or one step of the
 // ctx-fill loop) keeps the arithmetic class today's per-lane code gives it:
@@ -437,14 +405,13 @@ fn wmma_chunk(rem: usize) -> usize {
     }
 }
 
-/// Process-level admission of the batched ctx/fc stages: switch on, exact
+/// Process-level admission of the batched ctx/fc stages: exact
 /// gfx1201, no graph capture / replay recording / G0 observation, no
 /// calibration tap armed, and the shared workspace plus the
 /// FWHT rotation scratch present. Per-stage (per-weight, per-plan) checks are
 /// in [`pool_admitted`].
 fn lane_rows_admitted(gpu: &Gpu, shared: &DflashScratch) -> bool {
-    draft_lane_ctx_enabled()
-        && gpu.arch == "gfx1201"
+    gpu.arch == "gfx1201"
         && !gpu.graphs.capture_mode
         && !gpu.replay.is_recording()
         && !gpu.replay.is_g0_observing()
@@ -868,7 +835,7 @@ fn lane_attention(
 /// shared one in shape (checked), and MQ draft weights with no shared
 /// rotation buffer are an error, not a panic.
 ///
-/// Lane-batched ctx/fc (`HIPFIRE_CB_DRAFT_LANE_CTX`, default on): when the
+/// Lane-batched ctx/fc: when the
 /// shared scratch carries a [`super::DraftLaneWorkspace`], the device is exact
 /// gfx1201 and no capture/replay/G0 is active, the `fc` projection and each
 /// layer's context fill of all lanes run as packed stages grouped by the
@@ -947,7 +914,7 @@ pub fn draft_forward_lanes(
         )?;
     }
     upload_slice_i32(gpu, &shared.positions_q, &shared.lane_positions_q)?;
-    // Lane-batched ctx/fc (`HIPFIRE_CB_DRAFT_LANE_CTX`): admission and the fc
+    // Lane-batched ctx/fc: admission and the fc
     // row plan are decided here, before any lane state is written. `None`
     // keeps the per-lane loops below.
     let lane_ctx_on = lane_rows_admitted(gpu, &*shared);
@@ -1025,10 +992,9 @@ pub fn draft_forward_lanes(
     // ── Per-layer decoder ────────────────────────────────────────────────
     let rows = total;
     // Lane table of the lane-batched convolution, built once from the lane
-    // geometry. `None` (kill switch, non-gfx1201, capture/replay/G0, more
+    // geometry. `None` (non-gfx1201, capture/replay/G0, more
     // lanes than the table holds) keeps the per-lane launches below.
-    let conv_lanes: Option<Vec<DraftConvLane>> = (draft_lane_conv_enabled()
-        && geos.len() <= DRAFT_CONV_LANES_MAX
+    let conv_lanes: Option<Vec<DraftConvLane>> = (geos.len() <= DRAFT_CONV_LANES_MAX
         && geos.iter().all(|g_| g_.b > 0)
         && gpu.draft_lane_conv_admitted())
     .then(|| {

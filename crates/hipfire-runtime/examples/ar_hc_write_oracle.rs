@@ -474,7 +474,7 @@ fn main() {
     let mut rnd = true;
     let mut kinds = StreamKind::ALL.to_vec();
     let mut partials = ArHcPartial::ALL.to_vec();
-    let mut wire = hipfire_runtime::ar_hc_exchange::ar_hc_mode_from_env();
+    let mut wire = ArHcMode::Hybrid;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {

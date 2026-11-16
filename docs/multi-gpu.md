@@ -1914,7 +1914,7 @@ the hand dense-TP routes' numeric contract: `x + (p0 + p1 + …)` and
 the rounded `r(p)` of the previous section; the no-target `AllReduce` stays
 f32), the same bytes on every rank. The transport is chosen once at
 provisioning, and each transport has exactly one route (no per-call choice;
-`peer_access_enabled`, `HIPFIRE_TP_PEER_DIRECT` and `hardware.tp_use_rccl` do
+`peer_access_enabled` and `hardware.tp_use_rccl` do
 not apply to it):
 
 - **Peer**: every rank pair is one device under `HIPFIRE_EMULATE_GPUS` or

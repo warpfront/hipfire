@@ -375,7 +375,7 @@ fn main() {
     let mut probe = true;
     let mut breakdown_mode = false;
     let mut push_lab = false;
-    let mut wire = hipfire_runtime::ar_hc_exchange::ar_hc_mode_from_env();
+    let mut wire = ArHcMode::Hybrid;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {

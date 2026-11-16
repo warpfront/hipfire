@@ -2065,7 +2065,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     }
     if arch == "gfx1151" {
         // Qwen4 HC input_mix_down (320 x 10240) + activation, one launch
-        // (HIPFIRE_QWEN4_HC_DOWN_FUSED; gemm.rs gemm_bf16_xf16_hc_down_fused).
+        // (gemm.rs gemm_bf16_xf16_hc_down_fused).
         add!(
             "qwen4_hc_down_fused_gfx1151",
             kernels::QWEN4_HC_DOWN_FUSED_GFX1151_SRC,
@@ -2752,7 +2752,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                     "gemv_mq4g256v2p_moe_gate_up_top10_indexed_batched",
                 ]
             );
-            // HIPFIRE_QWEN4_MOE_DOWN_DNI (default on, exact gfx1201, K = 640, <= 8 rows, eager):
+            // dni (default on, exact gfx1201, K = 640, <= 8 rows, eager):
             // per-pick down, shipped + planar entries in one module.
             add!(
                 "gemv_mq4g128v2_moe_down_top10_dni",
@@ -12072,7 +12072,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // `HIPFIRE_QWEN4_MOE_DOWN_DNI` (default on, exact gfx1201, <=8 rows): the per-pick K=640 down kernel.
+        // dni (default on, exact gfx1201, <=8 rows): the per-pick K=640 down kernel.
         const MOE_DOWN_DNI_ADDED_MODULES: [&str; 1] = ["gemv_mq4g128v2_moe_down_top10_dni"];
         for module in MOE_DOWN_DNI_ADDED_MODULES {
             assert!(

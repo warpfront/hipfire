@@ -177,8 +177,8 @@ pub(crate) struct MtpRowsScratch {
     /// [`draft_call_capacity`] rows every buffer above holds.
     call_rows: usize,
     /// Pinned, event-fenced staging of the round's token upload
-    /// ([`upload_token_ids`]); `None` when [`MTP_TOKEN_RING_ENV`] is `0`.
-    token_ring: Option<LaneTokenRing>,
+    /// ([`upload_token_ids`]).
+    token_ring: LaneTokenRing,
 }
 
 /// The exact-extent row views a `rows`-lane step needs (HyperNorm infers its
@@ -403,7 +403,7 @@ impl MtpRowsScratch {
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         // The ring drains its pending copies before `token_ids` is freed.
-        let ring_error = self.token_ring.and_then(|ring| ring.free_gpu(gpu));
+        let ring_error = self.token_ring.free_gpu(gpu);
         let tensors = [
             self.token_ids,
             self.embedding_rot,
@@ -646,7 +646,7 @@ fn stage_head_rows(
         token_bytes[row * 4..row * 4 + 4].copy_from_slice(&(lane.token as i32).to_ne_bytes());
     }
     upload_token_ids(
-        rs.token_ring.as_mut(),
+        &mut rs.token_ring,
         gpu,
         &rs.token_ids.buf,
         &token_bytes[..n * 4],

@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte-exactness gate for `hyper_read_up_fused_f32_sx_t1_k320_rot`
-//! (`HIPFIRE_QWEN4_HC_UP_ROT=1`, module `hyper_read_up_fused_rot_t1`): the HC read tail with the next
+//! (module `hyper_read_up_fused_rot_t1`): the HC read tail with the next
 //! mixer's FWHT rotation fused in. For 2..=8 rows (the lane-decode row counts) on randomized
 //! inputs: `mixed` must equal the production t1 entry's (`hyper_read_up_fused_entry` with
 //! `TwinT1`) bit for bit, and `rotated` must equal `rotate_x_mq_batched(mixed, ...)` run on that
@@ -70,8 +70,6 @@ const WIDE: usize = 4 * HIDDEN;
 #[test]
 #[ignore = "needs an exact gfx1201 GPU"]
 fn hyper_read_up_rot_matches_t1_and_mq_rotate_hw() {
-    // Read once per process by the launcher.
-    std::env::set_var("HIPFIRE_QWEN4_HC_UP_ROT", "1");
     let mut gpu = Gpu::init().expect("GPU required");
     if !gpu.arch_caps.is_gfx1201() {
         eprintln!("SKIP: requires exact gfx1201.");

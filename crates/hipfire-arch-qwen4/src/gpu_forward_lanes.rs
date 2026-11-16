@@ -18,10 +18,9 @@
 //!   lane's own row count; the dispatch interpreter launches consecutive GDN
 //!   and QSA Core steps of several lanes (AR rows and ragged verify windows)
 //!   as one multi-lane launch per kernel (`HIPFIRE_QWEN4_GDN_LANES`,
-//!   `HIPFIRE_QWEN4_GDN_LANES_ROWS`, `HIPFIRE_QWEN4_QSA_LANES`). A verify lane whose GDN
+//!   and the verify-rows core, `HIPFIRE_QWEN4_QSA_LANES`). A verify lane whose GDN
 //!   in-projection is its own launch over exactly that lane's rows writes the lane's capture
-//!   ring `inputs` in place and its Core skips the projection copy
-//!   (`HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT`).
+//!   ring `inputs` in place and its Core skips the projection copy.
 //! - **Row-local stages** run either per lane ([`StageShare::PerLane`], the
 //!   singleton's arm by construction) or once over every lane's rows
 //!   ([`StageShare::OnceAllRows`], in groups of at most [`LANE_MAX_ROWS`];
@@ -3632,7 +3631,7 @@ fn forward_lanes_scoped(
         }
         let mut steps: Vec<Step<'_>> = Vec::with_capacity(program.len() * lanes.len() * 2);
         let mut qsa_commits: Vec<QsaCommit> = Vec::new();
-        // `HIPFIRE_QWEN4_GDN_CAPTURE_DIRECT` (exact gfx1201, default on): a verify lane's GDN
+        // Capture written in place (exact gfx1201): a verify lane's GDN
         // qkv in-projection that runs as its own launch over exactly that lane's rows writes the
         // lane's capture `inputs` in place, and the lane's Core skips the
         // `copy_d2d(projection -> capture.inputs)` it otherwise issues per layer. The opt-in

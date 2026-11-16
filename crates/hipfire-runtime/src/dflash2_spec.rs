@@ -72,7 +72,7 @@ pub struct DraftWindowTrace {
 static WINDOW_TRACE: std::sync::Mutex<Option<Vec<DraftWindowTrace>>> = std::sync::Mutex::new(None);
 /// 0 = follow `HIPFIRE_DFLASH_DRAFT_GRAPH`, 1 = force off, 2 = force on.
 static DRAFT_GRAPH_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-/// 0 = follow `HIPFIRE_DFLASH_DRAFT_PENALTY`, 1 = force off, 2 = force on.
+/// 0 = default (on), 1 = force off, 2 = force on.
 static DRAFT_PENALTY_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Developer oracle hook: from now on every speculator window records a
@@ -104,7 +104,7 @@ pub fn set_draft_graph_override(on: Option<bool>) {
 }
 
 /// Developer oracle hook: force the draft-side penalty on (`Some(true)`), off
-/// (`Some(false)`), or back to `HIPFIRE_DFLASH_DRAFT_PENALTY` (`None`) for every
+/// (`Some(false)`), or back to the default, on (`None`), for every
 /// speculator built after this call.
 pub fn set_draft_penalty_override(on: Option<bool>) {
     let v = match on {
@@ -116,15 +116,9 @@ pub fn set_draft_penalty_override(on: Option<bool>) {
 }
 
 /// Whether the selector penalizes its candidate scores like the target
-/// ([`SelectorPenalty`]): default on, `HIPFIRE_DFLASH_DRAFT_PENALTY=0` kills it,
-/// [`set_draft_penalty_override`] wins.
+/// ([`SelectorPenalty`]): default on, [`set_draft_penalty_override`] wins.
 fn draft_penalty_enabled() -> bool {
-    match DRAFT_PENALTY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => hipfire_config::developer_var("HIPFIRE_DFLASH_DRAFT_PENALTY")
-            .map_or(true, |v| v.trim() != "0"),
-    }
+    DRAFT_PENALTY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 1
 }
 
 fn fnv1a_f32_bits(v: &[f32]) -> u64 {

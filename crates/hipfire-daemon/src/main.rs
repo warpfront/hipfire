@@ -20,7 +20,7 @@
 //!       Prompt-prefill progress, one line per completed chunk while `done < total`
 //!       (none for a single-chunk prompt or at `done == total`; counts exclude a
 //!       cache-hit prefix). Ordered after `gen_start` and before the first
-//!       `token`/`reasoning`. Default on; `HIPFIRE_PREFILL_PROGRESS=0` suppresses it.
+//!       `token`/`reasoning`.
 //!       Clients that do not know the type ignore it.
 //!   ← {"type":"token","id":"r1","text":"The"}
 //!   ← {"type":"done","id":"r1","tokens":42,"tok_s":44.5}
@@ -2091,8 +2091,7 @@ fn main() {
 
                 // DFlash adaptive verify-block (opt-in, default off): clamp(ceil(τ̂)+2,
                 // 2, full) over the trailing 8 verify cycles, full below 2k ctx.
-                // Mutually exclusive with the retained-PM4 route (fixed B=16 shape);
-                // HIPFIRE_DFLASH_ADAPTIVE_B=0 forces fixed.
+                // Mutually exclusive with the retained-PM4 route (fixed B=16 shape).
                 let adaptive_b = msg
                     .get("params")
                     .and_then(|p| p.get("dflash_adaptive_b"))

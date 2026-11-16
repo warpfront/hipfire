@@ -125,11 +125,6 @@ pub const CASES: &[Q4Case] = &[
         run: case_fold_elem_hc_down_act,
     },
     Q4Case {
-        name: "qwen4_g942_fold_elem_hc_read_route_digest",
-        timeout_s: 240,
-        run: case_fold_elem_route_digest,
-    },
-    Q4Case {
         name: "qwen4_hc_write_route_execute_hyper_write",
         timeout_s: 180,
         run: case_route_write,
@@ -821,7 +816,7 @@ fn case_hyper_write_norm(gpu: &mut Gpu) -> Result<String, String> {
     all(out)
 }
 
-/// `HIPFIRE_QWEN4_G942_HC_QUARTERS_GATES`: the gates an UNFUSED write computes
+/// gfx942 HC quarters gates: the gates an UNFUSED write computes
 /// (`execute_hyper_write` -> `hyper_write_gates`) are bitwise the gates the fused
 /// `hyper_write_norm_f32` produces as the next write's quarters, rows 1..=8 (the route's
 /// few-row range on gfx942). Per row count: `hyper_write_norm` with `next` writes the streams
@@ -982,7 +977,7 @@ fn case_route_final_read(gpu: &mut Gpu) -> Result<String, String> {
     run_route_read(gpu, true)
 }
 
-/// `HIPFIRE_QWEN4_G942_FOLD_ELEM` kernel pin: `qwen4_g942_gemm_bf16_rows16_hc_act`
+/// gfx942 C1 fold kernel pin: `qwen4_g942_gemm_bf16_rows16_hc_act`
 /// (`qwen4_g942_glue_elem.hip`, via `Gfx942Device::qwen4_hc_down_act_rows16`) must be
 /// BYTE-equal to the unfused launches it replaces on the same inputs: the rows16 BF16
 /// GEMM into F32, then `bf16_roundtrip_f32`, `scale_f32`, `bf16_roundtrip_f32`,
@@ -1074,59 +1069,6 @@ fn case_fold_elem_hc_down_act(gpu: &mut Gpu) -> Result<String, String> {
         free_all(gpu, vec![downt])?;
     }
     all(out)
-}
-
-/// Route digest for the `HIPFIRE_QWEN4_G942_FOLD_ELEM` on/off A/B: `execute_hyper_read`
-/// at rows 1..=17 (17 declines the fold: its rows16 entry takes 16) with the production
-/// F32 streams; SHA-256 over `normalized`, `low` and `mixed` bytes of every row count.
-/// Run the case under each setting of the switch: the two summaries must carry the same
-/// digest (the harness is one supervised process per case, so the switch is read once).
-fn case_fold_elem_route_digest(gpu: &mut Gpu) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let mut rng = Rng::new(0x4843_F101);
-    let wn = rng.vec_bf16_exact(HC_WIDE, -0.5, 0.5);
-    let down = rng.vec_bf16_exact(HC_LOW * HC_WIDE, -0.02, 0.02);
-    let upw = rng.vec_bf16_exact(HC_WIDE * HC_LOW, -0.1, 0.1);
-    let (wnt, downt, upt) = (
-        up_bf16(gpu, &wn)?,
-        up_bf16(gpu, &down)?,
-        up_bf16(gpu, &upw)?,
-    );
-    let mut digest = Sha256::new();
-    for rows in 1..=17usize {
-        let x = rng.vec(rows * HC_WIDE, -2.0, 2.0);
-        let xt = up_f32(gpu, &x)?;
-        let nt = sentinel_f32(gpu, rows * HC_WIDE)?;
-        let lowt = sentinel_f32(gpu, rows * HC_LOW)?;
-        let uot = sentinel_f32(gpu, rows * HC_WIDE)?;
-        let mt = sentinel_f32(gpu, rows * HIDDEN)?;
-        let rot = zeros_f32(gpu, rows * HC_WIDE)?;
-        let op = HyperReadOp {
-            state_bf16: false,
-            input: &xt,
-            norm_weight: &wnt,
-            input_mix_down: wref(&downt, HC_LOW, HC_WIDE),
-            input_mix_up: wref(&upt, HC_WIDE, HC_LOW),
-            normalized: &nt,
-            low: &lowt,
-            up: &uot,
-            mixed: &mt,
-            rows,
-            branches: HC_STREAMS,
-            hidden: HIDDEN,
-            low_rank: HC_LOW,
-            rotation: &rot,
-        };
-        execute_hyper_read(gpu, &op).map_err(de)?;
-        for t in [&nt, &lowt, &mt] {
-            digest.update(down_bytes(gpu, t)?);
-        }
-        free_all(gpu, vec![xt, nt, lowt, uot, mt, rot])?;
-    }
-    free_all(gpu, vec![wnt, downt, upt])?;
-    let digest = digest.finalize();
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(format!("fold_elem route digest rows 1..=17 sha256={hex}"))
 }
 
 /// `execute_hyper_write` (unfused path: gates = `hyper_norm` + BF16 gate GEMM,

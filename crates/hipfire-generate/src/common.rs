@@ -1216,8 +1216,7 @@ pub fn emit_committed_event(
 ///
 /// `done`/`total` are prompt tokens this request prefills (a cache-hit prefix
 /// is in neither). Writes nothing once `done >= total`, so single-chunk prompts
-/// and the final chunk stay silent, and nothing at all under
-/// `HIPFIRE_PREFILL_PROGRESS=0`. Call it where the chunk loop already returned
+/// and the final chunk stay silent. Call it where the chunk loop already returned
 /// control to the host (next to `check_abort`), with the same writer the
 /// request's token events use. See [`hipfire_runtime::prefill_progress`].
 pub fn emit_prefill_progress(
