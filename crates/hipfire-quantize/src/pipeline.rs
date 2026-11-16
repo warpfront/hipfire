@@ -6087,26 +6087,16 @@ fn handle_moe_expert_3d(
             // sidecar. Falls through to the format branches otherwise.
             //
             // The exponent is always the caller's fixed `--awq-alpha`, never the
-            // `--awq-a4-aware` per-tensor search. That search scores candidates
-            // with `w4a4_relative_output_mse` — qt44 weights and `block_i4_128`
-            // A4 activations — while this arm writes MQ4G256 (qt13), or MQ5G256
-            // / MQ6G256 under HIPFIRE_MOE_{DOWN_,EXPERTS_}MQ5/6. No route runs
-            // those experts with quantized activations: the grouped symmetric
-            // cores admit qt44 only (`grouped_moe_site_tiers`,
-            // crates/hipfire-dispatch/src/pipeline/moe_program.rs) and the
-            // routed-IU4 route refuses AWQ'd down tensors
-            // (`ExpertIu4Reject::DownAwq`,
-            // crates/hipfire-dispatch/src/families/moe_expert_iu4.rs). So the
-            // qt44+A4 surrogate picks an exponent for a codec and an activation
-            // path the experts never take — measured on Qwen3.6-35B-A3B expert
-            // `down_proj` (real BF16 weights, real per-expert imatrix rows), its
-            // choice matched the stored codec's own argmin for 12 of 48 experts.
-            // Scoring them with the codec they do run does not rescue it either:
-            // on held-out rows the per-expert pick is noise around the fixed
-            // exponent (+0.27 % stored error at the 128-row fit the search uses,
-            // -0.68 % at 1536 rows), whose aggregate optimum is 0.55 itself.
-            // The dense MQ4G256 arm in `handle_main_quant` keeps the fixed alpha
-            // for the same reason. `expert_awq_active` requires supports_g256.
+            // `--awq-a4-aware` per-tensor search. Under `--format mq4` / `mq4v2`
+            // this arm writes MQ4G256V2 (qt44); MQ5G256 / MQ6G256 still apply
+            // under HIPFIRE_MOE_{DOWN_,EXPERTS_}MQ5/6. `grouped_moe_site_tiers`
+            // admits symmetric-verified qt44 experts with no AWQ condition, so a
+            // `--mq4v2-symmetric --awq` MoE build can reach the
+            // quantized-activation grouped prefill. Keep the fixed alpha anyway:
+            // the search is noise around that exponent. Measurements:
+            // https://github.com/warpfront/hipfire/pull/1065. The dense MQ4G256
+            // arm in `handle_main_quant` keeps the fixed alpha for the same
+            // reason. `expert_awq_active` requires supports_g256.
             let awq_scales: Option<Vec<f32>> = awq_in_sum2_per_expert
                 .as_ref()
                 .and_then(|t| t.get(x))
@@ -9221,13 +9211,14 @@ mod route_sku_stamp_tests {
 
 /// Routed-expert AWQ exponent contract.
 ///
-/// `handle_moe_expert_3d` writes MQ4/MQ5/MQ6-G256 experts, which no route runs
-/// with quantized activations, so the `--awq-a4-aware` search (a qt44 + A4
-/// model) does not describe them and must not choose their exponent. The test
-/// pins the call site to the caller's fixed `--awq-alpha` through the real
-/// handler: the emitted weight bytes and the per-expert sidecars are recomputed
-/// from the fixed-alpha formula, which fails as soon as the search is wired
-/// back in for a fixture the two surrogates disagree on.
+/// `handle_moe_expert_3d` keeps the caller's fixed `--awq-alpha` for routed
+/// experts; the `--awq-a4-aware` search must not choose their exponent
+/// (https://github.com/warpfront/hipfire/pull/1065). Under `--format mq4` /
+/// `mq4v2` the AWQ arm writes qt44, and a `--mq4v2-symmetric --awq` MoE build
+/// can reach the quantized-activation grouped prefill. The test pins the call
+/// site through the real handler: the emitted weight bytes and the per-expert
+/// sidecars are recomputed from the fixed-alpha formula, which fails as soon
+/// as the search is wired back in for a fixture the two surrogates disagree on.
 #[cfg(test)]
 mod moe_expert_awq_alpha_tests {
     use super::*;
