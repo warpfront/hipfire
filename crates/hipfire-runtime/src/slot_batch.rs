@@ -286,11 +286,14 @@ impl BatchPlanner {
             verify_used += rows;
         }
 
+        // Continuous batching is not the multi-slot page pool: no page
+        // quantum, exactly the distribution it had before the pool existed.
         let mut alloc = self.scheduler.allocate_rows(
             work,
             row_budget - verify_used,
             prefill_min_tokens,
             &admitted,
+            false,
         );
         if !self.forced_prefill_len.is_empty() {
             // Re-allocate prefill rows: decode rows stay, each forced

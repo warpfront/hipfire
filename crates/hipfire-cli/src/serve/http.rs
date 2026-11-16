@@ -10,8 +10,10 @@
 //! I/O from business logic.
 
 use crate::serve::complete::{
-    complete_request_cancellable, completion_json, gate_endpoint_tools,
-    openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion, EndpointAdapterKind,
+    complete_request_cancellable, completion_json, completion_json_multi_with_last,
+    completion_usage, gate_endpoint_tools, openai_stream_delta_for_event,
+    openai_stream_logprobs_for_event, openai_stream_terminal_chunks_usage, request_choice_count,
+    Completion, EndpointAdapterKind,
 };
 use crate::serve::metrics::Metrics;
 use crate::serve::{anthropic, responses};
@@ -248,6 +250,8 @@ impl ResponseEncoding {
                 created,
                 model: model.to_owned(),
                 include_usage,
+                index: 0,
+                usage_override: None,
             },
             Self::Anthropic => StreamEncoder::Anthropic(anthropic::MessageStream::new(id, model)),
             Self::Responses(echo) => {
@@ -265,6 +269,10 @@ enum StreamEncoder {
         created: u64,
         model: String,
         include_usage: bool,
+        /// OpenAI choice index this encoder's frames carry.
+        index: usize,
+        /// Aggregate usage for the final choice of an `n > 1` stream.
+        usage_override: Option<serde_json::Value>,
     },
     Anthropic(anthropic::MessageStream),
     Responses(responses::ResponseStream),
@@ -276,13 +284,17 @@ impl StreamEncoder {
     fn preamble(&mut self) -> Vec<u8> {
         match self {
             Self::Chat {
-                id, created, model, ..
+                id,
+                created,
+                model,
+                index,
+                ..
             } => sse_data(&serde_json::json!({
                 "id": id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
-                "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
+                "choices": [{ "index": index, "delta": { "role": "assistant" }, "finish_reason": null }],
             })),
             Self::Anthropic(stream) => stream.preamble(),
             Self::Responses(stream) => stream.preamble(),
@@ -293,15 +305,29 @@ impl StreamEncoder {
     fn event(&mut self, event: &serde_json::Value) -> Option<Vec<u8>> {
         match self {
             Self::Chat {
-                id, created, model, ..
+                id,
+                created,
+                model,
+                index,
+                ..
             } => {
                 let delta = openai_stream_delta_for_event(event)?;
+                let mut choice = serde_json::json!({
+                    "index": index,
+                    "delta": delta,
+                    "finish_reason": null,
+                });
+                // `stream: true` + `logprobs` carries the sampled logprob on
+                // every token chunk it released one for.
+                if let Some(logprobs) = openai_stream_logprobs_for_event(event) {
+                    choice["logprobs"] = logprobs;
+                }
                 Some(sse_data(&serde_json::json!({
                     "id": id,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": model,
-                    "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                    "choices": [choice],
                 })))
             }
             Self::Anthropic(stream) => stream.event(event),
@@ -309,15 +335,43 @@ impl StreamEncoder {
         }
     }
 
-    /// The terminal frame: released tool calls, finish and usage.
-    fn terminal(&mut self, completion: &Completion) -> Vec<u8> {
+    /// Set the OpenAI choice index this encoder emits. Only the chat wire has
+    /// more than one choice; the other adapters refuse `n > 1` at the route.
+    fn set_choice_index(&mut self, index: usize) {
+        if let Self::Chat { index: current, .. } = self {
+            *current = index;
+        }
+    }
+
+    fn set_usage_override(&mut self, usage: Option<serde_json::Value>) {
+        if let Self::Chat { usage_override, .. } = self {
+            *usage_override = usage;
+        }
+    }
+
+    /// The terminal frame: released tool calls, finish and usage. `done`
+    /// appends OpenAI's `[DONE]` sentinel; earlier choices in an `n > 1`
+    /// stream omit it so the same SSE body can carry every choice.
+    fn terminal(&mut self, completion: &Completion, done: bool) -> Vec<u8> {
         match self {
-            Self::Chat { include_usage, .. } => {
+            Self::Chat {
+                include_usage,
+                index,
+                usage_override,
+                ..
+            } => {
                 let mut bytes = Vec::new();
-                for chunk in openai_stream_terminal_chunks(completion, *include_usage) {
+                for chunk in openai_stream_terminal_chunks_usage(
+                    completion,
+                    *include_usage && done,
+                    *index,
+                    usage_override.as_ref(),
+                ) {
                     bytes.extend_from_slice(&sse_data(&chunk));
                 }
-                bytes.extend_from_slice(b"data: [DONE]\n\n");
+                if done {
+                    bytes.extend_from_slice(b"data: [DONE]\n\n");
+                }
                 bytes
             }
             Self::Anthropic(stream) => stream.terminal(completion),
@@ -1373,6 +1427,13 @@ async fn handle_generation(
         Ok(request) => request,
         Err(message) => return api.error_response(&message, 400),
     };
+    let choices = match request_choice_count(&body_val) {
+        Ok(n) => n,
+        Err(error) => return api.error_response(&error.to_string(), 400),
+    };
+    if choices > 1 && api != WireApi::ChatCompletions {
+        return api.error_response("n > 1 is only supported on /v1/chat/completions", 400);
+    }
 
     let (is_eligible, model_for_lease) = {
         let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
@@ -2096,6 +2157,7 @@ async fn handle_streaming(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_owned();
+    let choices_total = request_choice_count(&body).unwrap_or(1) as usize;
     let mut encoder = encoding.stream(&id, created, &model);
     let mut first = VecDeque::from([ResponseChunk::plain(encoder.preamble())]);
     let sink = SseSink {
@@ -2107,21 +2169,58 @@ async fn handle_streaming(
         created,
         encoder: RefCell::new(encoder),
         stall_timeout: shared.stream_stall_timeout,
+        choices_total,
+        usage_prompt: Cell::new(0),
+        usage_completion: Cell::new(0),
+        usage_details: RefCell::new(None),
     };
 
     let body_cancelled = Arc::clone(&cancelled);
     let worker_shared = Arc::clone(&shared);
     tokio::task::spawn_blocking(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            complete_request_cancellable(
-                &worker_shared,
-                &body,
-                guard,
-                Some((sink.id.clone(), sink.created)),
-                &cancelled,
-                |event| sink.forward_event(event),
-                |completion| sink.deliver_terminal(completion),
-            )
+            let choices = choices_total;
+            let is_eligible = guard.is_eligible();
+            let model = body
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let base_seed = request_seed(&body);
+            let mut first_guard = Some(guard);
+            for choice in 0..choices {
+                sink.begin_choice(choice)?;
+                let guard = match first_guard.take() {
+                    Some(guard) => guard,
+                    None => worker_shared
+                        .admission
+                        .acquire_for(is_eligible, model.as_deref())
+                        .map_err(|error| anyhow!("{}", error.message))?,
+                };
+                // The route's permit is consumed by the first choice; later
+                // choices wait for their own. Distinct seeds keep the choices
+                // independent while the response id stays the request's.
+                let mut choice_body = body.clone();
+                if choices > 1 {
+                    choice_body["n"] = serde_json::json!(1);
+                    // Only a seed the client actually supplied fans out. An
+                    // absent seed stays absent so the engine's own sampler
+                    // stream decides (deriving from 0 made two separate
+                    // unseeded calls return the same choices), and a seed the
+                    // daemon rejects is passed through untouched so it is
+                    // rejected instead of laundered into a valid one.
+                    fan_out_seed(&mut choice_body, base_seed, choice as usize);
+                }
+                complete_request_cancellable(
+                    &worker_shared,
+                    &choice_body,
+                    guard,
+                    Some((sink.id.clone(), sink.created)),
+                    &cancelled,
+                    |event| sink.forward_event(event),
+                    |completion| sink.deliver_terminal(completion, choice + 1 == choices),
+                )?;
+            }
+            Ok::<(), anyhow::Error>(())
         }));
         let result = outcome.unwrap_or_else(|payload| {
             Err(anyhow!(
@@ -2164,6 +2263,24 @@ async fn handle_streaming(
         .unwrap()
 }
 
+/// The request's seed when it is a JSON unsigned integer, else `None`.
+/// Anything else (`-1`, a string, a float) is *not* rewritten by the `n`
+/// fan-out: it stays in the body so the daemon's single validation authority
+/// rejects it, exactly as it does for `n = 1`.
+fn request_seed(body: &serde_json::Value) -> Option<u64> {
+    body.get("seed").and_then(|v| v.as_u64())
+}
+
+/// Derive choice `choice`'s seed from a caller-supplied base. No base seed
+/// means the choice keeps whatever the client sent: deriving one from an
+/// absent seed made two separate unseeded `n = 2` calls return the same two
+/// choices. `wrapping_add` so `u64::MAX` cannot overflow.
+fn fan_out_seed(body: &mut serde_json::Value, base: Option<u64>, choice: usize) {
+    if let Some(seed) = base {
+        body["seed"] = serde_json::json!(seed.wrapping_add(choice as u64));
+    }
+}
+
 async fn handle_nonstreaming(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
@@ -2182,70 +2299,126 @@ async fn handle_nonstreaming(
     let shared_clone = Arc::clone(&shared);
     let body_for_worker = body;
     let staged_tx_clone = Arc::clone(&staged_tx);
-    let staged_tx_for_worker = Arc::clone(&staged_tx);
+    let staged_for_terminal = Arc::clone(&staged_tx);
     let stall_timeout = shared.stream_stall_timeout;
     tokio::task::spawn_blocking(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let staged_for_terminal = Arc::clone(&staged_tx_for_worker);
-            let terminal = |completion: &Completion| {
-                let bytes =
-                    serde_json::to_vec(&encoding.completion_body(completion)).map_err(|err| {
-                        hipfire_client::ClientError::Protocol(format!(
-                            "completion json serialize failed: {err}"
-                        ))
-                    })?;
-                if bytes.is_empty() {
-                    return Err(hipfire_client::ClientError::Protocol(
-                        "nonstream terminal body must be non-empty".into(),
-                    ));
+            let choices = request_choice_count(&body_for_worker)?;
+            let is_eligible = guard.is_eligible();
+            let model = body_for_worker
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let base_seed = request_seed(&body_for_worker);
+            let mut first_guard = Some(guard);
+            let mut completions = Vec::with_capacity(choices as usize);
+            for choice in 0..choices {
+                // Choice 0 uses the route's permit. Later choices re-enter
+                // admission only after the previous permit drops, so the
+                // route never holds more than one slot for one logical
+                // request.
+                let guard = match first_guard.take() {
+                    Some(guard) => guard,
+                    None => shared_clone
+                        .admission
+                        .acquire_for(is_eligible, model.as_deref())
+                        .map_err(|error| anyhow!("{}", error.message))?,
+                };
+                // Mirror the streaming fan-out: only a caller-supplied seed
+                // fans out, and an invalid one is left for the daemon to
+                // reject rather than laundered into 0..n.
+                let mut choice_body = body_for_worker.clone();
+                if choices > 1 {
+                    choice_body["n"] = serde_json::json!(1);
+                    fan_out_seed(&mut choice_body, base_seed, choice as usize);
                 }
-                let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-                // Stage exactly one JSON frame and block for ack (RAII guard cancels while awaiting).
-                {
-                    let mut lock = staged_for_terminal
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    if let Some(tx) = lock.take() {
-                        let _ = tx.send(Ok((bytes, ack_tx)));
-                    } else {
-                        return Err(hipfire_client::ClientError::Cancelled);
-                    }
+                // The last choice's terminal callback stages the whole
+                // response and parks on its flush ack, exactly as the
+                // single-choice body did: dropping the ack receiver and
+                // returning first registered sessions and pending tools for
+                // replies the client never received, and left
+                // `serve.stream_stall_timeout_ms` unable to bound a
+                // non-streaming request.
+                let is_last = choice + 1 == choices;
+                let terminal_completions = &completions;
+                let terminal_encoding = &encoding;
+                let terminal_staged = &staged_for_terminal;
+                let completion = complete_request_cancellable(
+                    &shared_clone,
+                    &choice_body,
+                    guard,
+                    None,
+                    &cancelled,
+                    |_event| Ok(()),
+                    move |completion| {
+                        if !is_last {
+                            return Ok(());
+                        }
+                        let json = if terminal_completions.is_empty() {
+                            terminal_encoding.completion_body(completion)
+                        } else {
+                            completion_json_multi_with_last(terminal_completions, completion)
+                        };
+                        let bytes = serde_json::to_vec(&json).map_err(|err| {
+                            hipfire_client::ClientError::Protocol(format!(
+                                "completion json serialize failed: {err}"
+                            ))
+                        })?;
+                        if bytes.is_empty() {
+                            return Err(hipfire_client::ClientError::Protocol(
+                                "completion json serialized to an empty body".into(),
+                            ));
+                        }
+                        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+                        // Stage exactly one JSON frame, then block for its
+                        // ack (the RAII guard cancels while awaiting).
+                        {
+                            let mut lock = terminal_staged
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            match lock.take() {
+                                Some(tx) => {
+                                    let _ = tx.send(Ok((bytes, ack_tx)));
+                                }
+                                None => return Err(hipfire_client::ClientError::Cancelled),
+                            }
+                        }
+                        wait_flush_ack(&ack_rx, stall_timeout)
+                            .map_err(|()| hipfire_client::ClientError::Cancelled)
+                    },
+                )?;
+                if !is_last {
+                    completions.push(completion);
                 }
-                match wait_flush_ack(&ack_rx, stall_timeout) {
-                    Ok(()) => Ok(()),
-                    Err(()) => Err(hipfire_client::ClientError::Cancelled),
-                }
-            };
-            complete_request_cancellable(
-                &shared_clone,
-                &body_for_worker,
-                guard,
-                None,
-                &cancelled,
-                |_event| Ok(()),
-                terminal,
-            )
+            }
+            Ok::<_, anyhow::Error>(completions)
         }));
-        // If terminal was never staged, propagate preterminal error via staged channel.
         let mut lock = staged_tx_clone
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        // The only reason the terminal was never staged is a preterminal
+        // failure (or a panic) before the last choice's callback ran.
         if let Some(tx) = lock.take() {
-            let failure = match outcome {
-                // Ok but terminal never called — report as error.
-                Ok(Ok(_completion)) => {
-                    RequestFailure::new("generation completed without a response body", 500)
+            match outcome {
+                Ok(Ok(_)) => {
+                    let _ = tx.send(Err(RequestFailure::new(
+                        "generation completed without staging a response body",
+                        500,
+                    )));
                 }
-                Ok(Err(error)) => RequestFailure::from_error(&error),
-                Err(payload) => RequestFailure::new(
-                    format!(
-                        "generation worker panicked: {}",
-                        panic_message(payload.as_ref())
-                    ),
-                    500,
-                ),
-            };
-            let _ = tx.send(Err(failure));
+                Ok(Err(error)) => {
+                    let _ = tx.send(Err(RequestFailure::from_error(&error)));
+                }
+                Err(payload) => {
+                    let _ = tx.send(Err(RequestFailure::new(
+                        format!(
+                            "generation worker panicked: {}",
+                            panic_message(payload.as_ref())
+                        ),
+                        500,
+                    )));
+                }
+            }
         }
     });
 
@@ -2441,6 +2614,13 @@ struct SseSink {
     /// unflushed, before the request is aborted and its permit released.
     /// `None` (standard route) waits for as long as the connection lives.
     stall_timeout: Option<Duration>,
+    /// Number of choices this response carries (`n`). `1` keeps the
+    /// historical single-choice stream.
+    choices_total: usize,
+    /// Aggregate usage across choices, emitted once on the final choice.
+    usage_prompt: Cell<u64>,
+    usage_completion: Cell<u64>,
+    usage_details: RefCell<Option<serde_json::Value>>,
 }
 
 /// How often a stalled send re-checks the channel.
@@ -2507,6 +2687,20 @@ impl SseSink {
         }
     }
 
+    /// Switch the encoder to choice `index` and emit its role delta. Choice 0
+    /// already has its role chunk in the committed preamble.
+    fn begin_choice(&self, index: usize) -> Result<(), hipfire_client::ClientError> {
+        if index == 0 {
+            return Ok(());
+        }
+        let bytes = {
+            let mut encoder = self.encoder.borrow_mut();
+            encoder.set_choice_index(index);
+            encoder.preamble()
+        };
+        self.send(ResponseChunk::plain(bytes))
+    }
+
     /// Forward one logical generate event. Delta-bearing events serialize to
     /// plain (no-ack) SSE bytes. No-delta mid-stream events are silent —
     /// terminal ack handles pure-tool delivery.
@@ -2553,8 +2747,40 @@ impl SseSink {
 
     /// Serialize the terminal (released tool calls, finish, usage; chat adds
     /// `[DONE]`) into one acknowledged chunk; wait until the socket flushed it.
-    fn deliver_terminal(&self, completion: &Completion) -> Result<(), hipfire_client::ClientError> {
-        let bytes = self.encoder.borrow_mut().terminal(completion);
+    fn deliver_terminal(
+        &self,
+        completion: &Completion,
+        last_choice: bool,
+    ) -> Result<(), hipfire_client::ClientError> {
+        if self.choices_total > 1 {
+            let usage = completion_usage(completion);
+            if self.usage_details.borrow().is_none() {
+                self.usage_prompt
+                    .set(usage["prompt_tokens"].as_u64().unwrap_or(0));
+                *self.usage_details.borrow_mut() = Some(usage["prompt_tokens_details"].clone());
+            }
+            self.usage_completion.set(
+                self.usage_completion
+                    .get()
+                    .saturating_add(usage["completion_tokens"].as_u64().unwrap_or(0)),
+            );
+            if last_choice {
+                let prompt = self.usage_prompt.get();
+                let completion_tokens = self.usage_completion.get();
+                self.encoder
+                    .borrow_mut()
+                    .set_usage_override(Some(serde_json::json!({
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt.saturating_add(completion_tokens),
+                        "prompt_tokens_details": self.usage_details.borrow().clone(),
+                    })));
+            }
+        }
+        let bytes = self.encoder.borrow_mut().terminal(completion, last_choice);
+        if !last_choice {
+            return self.send(ResponseChunk::plain(bytes));
+        }
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         self.terminal_sent.set(true);
         self.send(ResponseChunk::last(bytes, Some(ack_tx)))?;
@@ -2570,7 +2796,7 @@ impl SseSink {
     ///   event, then `[DONE]`).
     /// - Failure after the acknowledged terminal (e.g. the daemon commit):
     ///   nothing may follow it, so the body fails and the reader sees it torn.
-    fn finish(self, result: Result<Completion>, metrics: &Metrics) {
+    fn finish(self, result: Result<(), anyhow::Error>, metrics: &Metrics) {
         let Err(error) = result else {
             return;
         };
@@ -2611,6 +2837,35 @@ mod tests {
     use std::future::poll_fn;
     use std::task::Waker;
     use std::time::Duration;
+
+    /// `n > 1` fans out an explicit seed into distinct per-choice streams,
+    /// and does nothing at all without a valid one. Deriving from an absent
+    /// seed made two separate unseeded `n = 2` calls byte-identical, and
+    /// rewriting `-1` laundered a value the daemon rejects on `n = 1`.
+    #[test]
+    fn n_fan_out_seeds_only_a_caller_supplied_seed_and_never_overflows() {
+        assert_eq!(request_seed(&serde_json::json!({})), None);
+        assert_eq!(request_seed(&serde_json::json!({ "seed": -1 })), None);
+        assert_eq!(request_seed(&serde_json::json!({ "seed": "7" })), None);
+        assert_eq!(request_seed(&serde_json::json!({ "seed": 7 })), Some(7));
+
+        // No base seed: the body is left exactly as it came.
+        for original in [serde_json::json!({}), serde_json::json!({ "seed": -1 })] {
+            let mut body = original.clone();
+            let before = body.clone();
+            fan_out_seed(&mut body, None, 3);
+            assert_eq!(body, before);
+        }
+
+        let mut body = serde_json::json!({ "seed": 5 });
+        fan_out_seed(&mut body, Some(5), 2);
+        assert_eq!(body["seed"], 7);
+
+        // `u64::MAX + choice` must not overflow.
+        let mut body = serde_json::json!({ "seed": u64::MAX });
+        fan_out_seed(&mut body, Some(u64::MAX), 3);
+        assert_eq!(body["seed"], u64::MAX.wrapping_add(3));
+    }
 
     #[test]
     fn bearer_headers_require_one_matching_ascii_credential() {
@@ -2833,6 +3088,10 @@ mod tests {
             created: 0,
             encoder: RefCell::new(encoding.stream("chatcmpl-1-1", 0, "m")),
             stall_timeout: None,
+            choices_total: 1,
+            usage_prompt: Cell::new(0),
+            usage_completion: Cell::new(0),
+            usage_details: RefCell::new(None),
         };
         (sink, commit, rx)
     }
