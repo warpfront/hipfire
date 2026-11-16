@@ -1,0 +1,77 @@
+# hipfire — multi-slot engine over VMM KV, with vision + MTP, on port 9001.
+#
+# This is the manual-test recipe for the VMM slot route
+# (`docs/plans/2026-10-22-vmm-kv-multislot-engine.md`):
+#   * multi-slot engine (4 slots, per-slot ctx bound 262144);
+#   * per-slot VMM KV reservations (`--kv-backend vmm`), q8;
+#   * MTP speculative decode from the `.mtp` sidecar (`--spec mtp`);
+#   * vision from the `.vl` sidecar (`--vision`, `HIPFIRE_VISION_MODE=on`);
+#     image requests run the sequential VL path on their own slot owner.
+#
+# The model directory is bind-mounted read-only; it must contain the trunk and
+# its sidecars (qwen3.5-4b.mq4 / .mtp / .vl), because sidecars are resolved as
+# siblings of the trunk path.
+#
+# Build the image first (the default `full` target can JIT any route):
+#   docker build -f Containerfile --target full -t hipfire:dev .
+#   podman build -f Containerfile --target full -t hipfire:dev .
+#
+# Run:
+#   docker compose -f docker/compose.vmm-9001.yaml up
+#   curl -s http://127.0.0.1:9001/health
+#
+# Published on ALL host interfaces by default, the same way the other hipfire
+# service containers are reached from outside the host. The server has no
+# auth/TLS, so set HIPFIRE_BIND=127.0.0.1 to publish on loopback only.
+services:
+  hipfire-vmm:
+    build:
+      context: ..
+      dockerfile: Containerfile
+      target: full
+    image: ${HIPFIRE_IMAGE:-hipfire:dev}
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "${RENDER_GID:-109}"
+      - "${VIDEO_GID:-44}"
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      # The fixture: trunk + .mtp + .vl siblings.
+      - ${HIPFIRE_MODEL_DIR:-${HOME}/models/hipfire/Qwen/Qwen3.5-4B-MQ4}:/models:ro
+      - hipfire-kcache:/var/cache/hipfire
+    environment:
+      HIPFIRE_SERVE_MULTI_SLOT: "1"
+      HIPFIRE_SERVE_MULTI_SLOT_SLOTS: "4"
+      # Per-slot context ceiling: the fixture's trained maximum (262144).
+      # VMM maps KV on demand, so this is a bound, not a reservation.
+      HIPFIRE_SERVE_MULTI_SLOT_CTX: "262144"
+      HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK: "1024"
+      HIPFIRE_VISION_MODE: "on"
+      # Per-window MTP draft/accept trace in the container log (manual testing:
+      # `docker logs -f`). Remove for a quiet log.
+      HIPFIRE_MTP_TRACE: "1"
+    ports:
+      - "${HIPFIRE_BIND:-0.0.0.0}:9001:9001"
+    command:
+      - serve
+      - --model
+      - /models/qwen3.5-4b.mq4
+      - --vision
+      - /models/qwen3.5-4b.vl
+      - --kv-backend
+      - vmm
+      - --kv-mode
+      - q8
+      - --spec
+      - mtp
+      # Never unload the model for being idle (manual testing).
+      - --idle-timeout
+      - "0"
+      # Bind 0.0.0.0 inside the container so the published port reaches it.
+      - 0.0.0.0:9001
+
+volumes:
+  hipfire-kcache:

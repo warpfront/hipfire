@@ -33,6 +33,17 @@ use std::sync::mpsc::Sender;
 /// The engine splices the resulting embeddings at `<|image_pad|>` positions
 /// during a per-token prefill that uses `forward_scratch_embed_mrope`.
 ///
+/// One image in a multi-image VL request.
+#[derive(Clone, Debug)]
+pub struct VisualImage {
+    /// Vision-tower patch tensor from `extract_patches` (CPU).
+    pub patches: Vec<f32>,
+    pub grid_h: usize,
+    pub grid_w: usize,
+    /// Post-merge visual token count for this image.
+    pub n_visual_tokens: usize,
+}
+
 /// `mrope_positions` carries the 3D (t, h, w) position for every prompt token,
 /// already offset by `base` so values are absolute rope phases. `rope_delta`
 /// is added to the running sequence length for decode-step positions.
@@ -43,6 +54,10 @@ pub struct VisualData {
     pub grid_w: usize,
     /// Number of post-merge visual tokens to splice at image_pad positions.
     pub n_visual_tokens: usize,
+    /// Multi-image payload, in request order. Non-empty supersedes the
+    /// single-image `patches`/`grid_*` fields; each image runs through its own
+    /// grid so mixed aspect ratios are preserved.
+    pub images: Vec<VisualImage>,
     /// 3D M-RoPE positions for every prompt token, offset by base.
     pub mrope_positions: Vec<[i32; 3]>,
     /// rope_delta for decode positions past the prompt.
@@ -80,6 +95,12 @@ pub struct SubmitRequest {
     pub frequency_penalty: f32,
     /// min-p cutoff; 0.0 = off.
     pub min_p: f32,
+    /// OpenAI `top_logprobs` count when `logprobs: true`; `None` = no
+    /// logprobs. `Some(0)` asks for the chosen token's log-prob only. The slot
+    /// engine forces AR for these requests and downloads the sampled row once
+    /// per token (opt-in cost), then emits `Event::Token` with the chosen
+    /// log-prob and its top-K candidates.
+    pub logprobs_top_k: Option<usize>,
     /// Visual embeddings + M-RoPE for VL requests. None for text-only.
     pub visual_data: Option<VisualData>,
     /// JSON Schema for structured output (spec §7 G1/G2). When present, the
@@ -168,7 +189,7 @@ pub enum RejectClass {
     Cancel,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// `reused` — prompt tokens served from the session's existing KV;
     /// `prefill` — tokens actually prefilled this turn. Together they are the
@@ -181,6 +202,13 @@ pub enum Event {
     },
     Token {
         id: u32,
+        /// Log-probability of `id` under the row used for sampling, when the
+        /// request asked for logprobs.
+        logprob: Option<f32>,
+        /// Top-K candidates `(token_id, logprob)` for the same row, descending.
+        /// `None` when logprobs were not requested; `Some([])` is a valid
+        /// `top_logprobs: 0` response.
+        top_logprobs: Option<Vec<(u32, f32)>>,
     },
     /// `generated` — tokens delivered to the client (terminators excluded).
     Done {
@@ -241,6 +269,15 @@ pub struct EngineStats {
     pub swap_disk_used: u64,
     pub swap_host_budget: u64,
     pub swap_disk_budget: u64,
+    /// Mapped VMM KV bytes at the last completed step (`kv_backend=vmm`
+    /// only; 0 on the arena route). The VMM analogue of `pool_free_pages`:
+    /// it must plateau across identical request cycles, not climb.
+    pub mapped_kv_bytes: usize,
+    /// Decode-graph captures and replays performed by the active KV storage
+    /// route. Replays only happen when `HIPFIRE_SLOTS_DECODE_GRAPH=1`; a run
+    /// with the flag on and `graph_replays == 0` means capture never engaged.
+    pub graph_captures: usize,
+    pub graph_replays: usize,
 }
 
 impl EngineStats {
@@ -284,6 +321,15 @@ impl EngineStats {
         self.swap_disk_used = swap.store().disk_used();
         self.swap_host_budget = swap.store().host_budget();
         self.swap_disk_budget = swap.store().disk_budget();
+    }
+
+    pub fn note_mapped_kv_bytes(&mut self, n: usize) {
+        self.mapped_kv_bytes = n;
+    }
+
+    pub fn note_graph_stats(&mut self, captures: usize, replays: usize) {
+        self.graph_captures = captures;
+        self.graph_replays = replays;
     }
 }
 
@@ -345,8 +391,17 @@ pub struct SlotEngineConfig {
     /// Raw KV-mode string from the load request (empty = resolve from
     /// env/config in the engine).
     pub kv_mode_raw: String,
-    /// Effective KV backend (`legacy`/`vmm`); slot engines may refuse `vmm`.
+    /// Effective KV backend (`legacy`/`vmm`). `legacy` is the arena route;
+    /// `vmm` is per-slot VMM reservations (q8/fp8 KV, no prefix cache, MTP
+    /// yes / DFlash deferred, vision via the sequential VL path). The engine
+    /// re-checks every gate at load.
     pub kv_backend: String,
+    /// Multi-slot shared paged KV pool (`PagePool`) instead of fixed slabs.
+    pub multi_slot_paged: bool,
+    /// Physical pages in the shared paged pool; 0 = auto-size from free VRAM.
+    pub multi_slot_paged_pages: usize,
+    /// `arena` (default) or experimental `vmm` physical backend.
+    pub multi_slot_paged_backend: String,
     /// Cross-session prefix cache enabled (spec §4.5–4.6).
     pub prefix_cache: bool,
     /// Checkpoint pool max bytes; `prefix_cache` with `0` must refuse at
@@ -523,7 +578,15 @@ mod tests {
         let (tx, rx) = channel::<Event>();
         drop(rx);
         assert!(
-            send_event(&tx, Event::Token { id: 1 }).is_err(),
+            send_event(
+                &tx,
+                Event::Token {
+                    id: 1,
+                    logprob: None,
+                    top_logprobs: None
+                }
+            )
+            .is_err(),
             "a dropped receiver must be visible so the engine can free the slot"
         );
     }
@@ -540,7 +603,15 @@ mod tests {
             },
         )
         .unwrap();
-        send_event(&tx, Event::Token { id: 7 }).unwrap();
+        send_event(
+            &tx,
+            Event::Token {
+                id: 7,
+                logprob: None,
+                top_logprobs: None,
+            },
+        )
+        .unwrap();
         send_event(
             &tx,
             Event::Done {
@@ -557,7 +628,14 @@ mod tests {
                 prefill: 2
             }
         );
-        assert_eq!(rx.recv().unwrap(), Event::Token { id: 7 });
+        assert_eq!(
+            rx.recv().unwrap(),
+            Event::Token {
+                id: 7,
+                logprob: None,
+                top_logprobs: None
+            }
+        );
         assert_eq!(
             rx.recv().unwrap(),
             Event::Done {

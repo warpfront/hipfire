@@ -348,6 +348,7 @@ developer_callsite	*	HIPFIRE_LAB_MTP_ROUNDS_PROBE_MAX#developer_var=ok.and_then.
 developer_callsite	*	HIPFIRE_LAB_MTP_ROUNDS_PROBE_REPS#developer_var=ok.and_then.unwrap_or(0)
 developer_callsite	*	HIPFIRE_LAB_MTP_STALE_FILL#developer_var=ok
 developer_callsite	*	HIPFIRE_LANE_ADMIT_COALESCE_MS#developer_var=ok.as_deref
+developer_callsite	*	HIPFIRE_LAUNCH_DUMP#developer_var=ok.and_then.unwrap_or(0)
 developer_callsite	*	HIPFIRE_LDS_EPI_DIRECT#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_LFM2_CAPTURE_POSTMIXER#developer_var_os=is_some
 developer_callsite	*	HIPFIRE_LFM2_GRAPH#developer_var=ok.as_deref

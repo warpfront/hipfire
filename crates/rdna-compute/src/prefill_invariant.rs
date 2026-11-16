@@ -280,6 +280,66 @@ pub(crate) fn few_row_groups(rows: usize) -> impl Iterator<Item = (usize, usize)
         .map(move |start| (start, FEW_ROW_ROUTE_ROWS.min(rows - start)))
 }
 
+/// Kernel body a small-batch MQ4G256V2 (qt=44) projection takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FewRowMq4v2Route {
+    /// Not a few-row route: the caller's WMMA / scalar arms decide.
+    Incumbent,
+    /// One row on the arch residual GEMV (`gemv_hfq4g256_residual_mq4v2`).
+    ResidualGemv,
+    /// 2..=[`FEW_ROW_ROUTE_ROWS`] rows on the 4-wide x-batch GEMV.
+    XBatchGemv,
+}
+
+/// The few-row MQ4G256V2 reroute is **exact gfx1100 only**.
+///
+/// It exists for the gfx1100 retained slots tape: the x-batch GEMV writes `Y`
+/// outright, so the tape has no host `memset`/`convert_f32_to_f16`, and the
+/// WMMA tile is 16 rows where a slot step is 1..4. gfx1151/gfx1201 keep the
+/// incumbent kernels and their byte identity — the GEMV's f32-`x` accumulation
+/// differs from the WMMA arms, so routing a prefill tail of 1..=8 rows through
+/// it changes greedy output there (`HIPFIRE_PREFILL_CHUNK_ROWS=16`, a 22-token
+/// prompt, Qwen3.8-27B mq4-xts: digest `e4eb1f64` -> `d2847e5d` on gfx1151).
+///
+/// `k % 256 == 0` is the GEMV's own precondition; without it the caller's
+/// incumbent arm is the only valid body.
+///
+/// `slots_scope` is [`Gpu::slots_decode_scope`]: only the multi-slot layer body
+/// takes the reroute. A single-slot forward on gfx1100 (an ordinary prefill
+/// tail of 1..=8 rows, an MTP/DFlash verify) keeps the incumbent, so its bytes
+/// do not depend on whether its last chunk happens to be decode-width.
+pub fn few_row_mq4v2_route(
+    arch: &str,
+    batch_size: usize,
+    k: usize,
+    slots_scope: bool,
+) -> FewRowMq4v2Route {
+    if !slots_scope || arch != "gfx1100" || !k.is_multiple_of(256) {
+        return FewRowMq4v2Route::Incumbent;
+    }
+    match batch_size {
+        1 => FewRowMq4v2Route::ResidualGemv,
+        n if n <= FEW_ROW_ROUTE_ROWS => FewRowMq4v2Route::XBatchGemv,
+        _ => FewRowMq4v2Route::Incumbent,
+    }
+}
+
+/// Plain-GEMM (`Y = W·X`) sibling of [`few_row_mq4v2_route`]: 1..=
+/// [`FEW_ROW_ROUTE_ROWS`] rows go to the x-batch GEMV instead of
+/// `memset(y)` + WMMA. Same exact-gfx1100 gate and the same reason: the host
+/// zeroing inside a forward body is state a retained PM4 tape cannot replay.
+/// Multi-slot layer body only (`slots_scope`), as for [`few_row_mq4v2_route`].
+pub fn few_row_mq4v2_plain_route(
+    arch: &str,
+    batch_size: usize,
+    k: usize,
+    slots_scope: bool,
+) -> bool {
+    slots_scope
+        && arch == "gfx1100"
+        && k.is_multiple_of(256)
+        && (1..=FEW_ROW_ROUTE_ROWS).contains(&batch_size)
+}
 /// [`Gpu::qwen4_route_rows_cap`] of the exact EP joint prefill wave: one row under the 512-row
 /// floor of every row-keyed route (F16 WMMA, symmetric IU4, INT8 shared expert, fused front,
 /// BF16 streams), so a wide wave's MoE call takes the routes a sub-512-row lane's singleton takes.
@@ -844,6 +904,71 @@ mod tests {
     fn every_arch_is_at_the_few_row_limit() {
         for arch in ["gfx1151", "gfx1201", "gfx1100"] {
             assert_eq!(resolve_verify_rows(arch, 0, None, 8), 8, "{arch}");
+        }
+    }
+
+    /// The few-row MQ4G256V2 reroute is exact gfx1100. Every other arch — and
+    /// gfx1100 itself on a non-256 K — must reach the incumbent arm, because
+    /// the GEMV's f32-`x` accumulation differs from WMMA and changes greedy
+    /// output when a 1..=8-row prefill tail lands on it.
+    #[test]
+    fn few_row_mq4v2_reroute_is_exact_gfx1100() {
+        use FewRowMq4v2Route::*;
+        assert_eq!(few_row_mq4v2_route("gfx1100", 1, 4096, true), ResidualGemv);
+        for n in 2..=FEW_ROW_ROUTE_ROWS {
+            assert_eq!(
+                few_row_mq4v2_route("gfx1100", n, 4096, true),
+                XBatchGemv,
+                "n={n}"
+            );
+        }
+        assert_eq!(
+            few_row_mq4v2_route("gfx1100", FEW_ROW_ROUTE_ROWS + 1, 4096, true),
+            Incumbent
+        );
+        assert_eq!(few_row_mq4v2_route("gfx1100", 1, 4000, true), Incumbent);
+        for arch in [
+            "gfx1151", "gfx1150", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx942",
+        ] {
+            for n in 1..=FEW_ROW_ROUTE_ROWS {
+                assert_eq!(
+                    few_row_mq4v2_route(arch, n, 4096, true),
+                    Incumbent,
+                    "{arch} n={n}"
+                );
+                assert!(
+                    !few_row_mq4v2_plain_route(arch, n, 4096, true),
+                    "{arch} n={n}"
+                );
+            }
+        }
+        for n in 1..=FEW_ROW_ROUTE_ROWS {
+            assert!(few_row_mq4v2_plain_route("gfx1100", n, 4096, true), "n={n}");
+            assert!(
+                !few_row_mq4v2_plain_route("gfx1100", n, 4000, true),
+                "n={n}"
+            );
+        }
+        assert!(!few_row_mq4v2_plain_route(
+            "gfx1100",
+            FEW_ROW_ROUTE_ROWS + 1,
+            4096,
+            true
+        ));
+        // Outside the multi-slot layer body nothing reroutes, gfx1100 included:
+        // ordinary prefill tails and single-slot verify keep the incumbent.
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            for n in 1..=FEW_ROW_ROUTE_ROWS {
+                assert_eq!(
+                    few_row_mq4v2_route(arch, n, 4096, false),
+                    Incumbent,
+                    "{arch} n={n}"
+                );
+                assert!(
+                    !few_row_mq4v2_plain_route(arch, n, 4096, false),
+                    "{arch} n={n}"
+                );
+            }
         }
     }
 
