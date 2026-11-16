@@ -3401,19 +3401,15 @@ impl HiddenStateRingBuffer {
             .position(|&l| l == target_layer_idx)
     }
 
-    /// Copy `x` (shape `[hidden_dim]`) into the ring buffer slot for the given
-    /// extraction layer at the CURRENT head position. Call once per extracted
-    /// layer per forward pass, then `advance_head()` at the end of the forward
-    /// to move to the next slot.
-    pub fn write_at_head(&self, gpu: &mut Gpu, extract_idx: usize, x: &GpuTensor) -> HipResult<()> {
-        let offset = self.head * self.hidden_dim * 4;
-        gpu.hip.memcpy_dtod_at(
-            &self.layer_bufs[extract_idx].buf,
-            offset,
-            &x.buf,
-            0,
-            self.hidden_dim * 4,
-        )
+    /// This ring's own fixed-offset staging as a forward's hidden destination:
+    /// one row per extraction layer at offset zero, committed afterwards with
+    /// [`Self::commit_staging_to_ring`].
+    pub(crate) fn staging_stage(&self) -> HiddenStage<'_> {
+        HiddenStage {
+            extract_layers: &self.extract_layers,
+            rows: &self.staging_bufs,
+            hidden_dim: self.hidden_dim,
+        }
     }
 
     /// Advance the write head. Call once per forward pass, AFTER all layer
@@ -3501,29 +3497,12 @@ impl HiddenStateRingBuffer {
             n,
             self.max_batch
         );
-        let row_bytes = self.hidden_dim * 4;
-        let bytes = n * row_bytes;
-        // The software Redline recorder retains typed kernel launches, not HIP
-        // memcpy commands. During recording, express this byte-identical F32
-        // copy as a blob-backed kernel so recorded-HIP and PM4 refresh staging
-        // on every replay instead of committing stale rows to the hidden ring.
-        // HipGraph capture keeps the native async memcpy node below.
-        if gpu.replay.is_recording() {
-            return gpu.copy_f32_buffer(&self.staging_bufs[extract_idx], src, n * self.hidden_dim);
-        }
-        if let Some(stream) = gpu.active_stream.as_ref() {
-            gpu.hip.memcpy_dtod_async_at(
-                &self.staging_bufs[extract_idx].buf,
-                0,
-                &src.buf,
-                0,
-                bytes,
-                stream,
-            )
-        } else {
-            gpu.hip
-                .memcpy_dtod_at(&self.staging_bufs[extract_idx].buf, 0, &src.buf, 0, bytes)
-        }
+        write_staging_rows(
+            gpu,
+            &self.staging_bufs[extract_idx],
+            src,
+            n * self.hidden_dim,
+        )
     }
 
     /// Scatter staging buffers into `layer_bufs` at the current head, handling
@@ -3548,6 +3527,20 @@ impl HiddenStateRingBuffer {
         // Head/written advance only after successful enqueue, preserving the
         // existing stream synchronization boundary above.
         let delta = self.commit_delta(n);
+        self.apply_commit_delta(delta);
+        Ok(())
+    }
+
+    /// [`Self::commit_staging_to_ring`] for one row per extraction layer staged
+    /// outside this ring (the load's [`ArHiddenStaging`]): the same stream
+    /// synchronization, the same scatter at the current head, and the head
+    /// advanced once.
+    fn commit_row_to_ring(&mut self, gpu: &mut Gpu, rows: &[GpuTensor]) -> HipResult<()> {
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.stream_synchronize(stream)?;
+        }
+        self.emit_commit_rows(gpu, rows, 1)?;
+        let delta = self.commit_delta(1);
         self.apply_commit_delta(delta);
         Ok(())
     }
@@ -3594,10 +3587,17 @@ impl HiddenStateRingBuffer {
             n,
             self.max_batch
         );
+        self.emit_commit_rows(gpu, &self.staging_bufs, n)
+    }
+
+    /// The scatter of [`Self::emit_commit_staging`] from `staging` (one buffer
+    /// per extraction layer, at least `n` rows each) into the ring at the
+    /// current head.
+    fn emit_commit_rows(&self, gpu: &mut Gpu, staging: &[GpuTensor], n: usize) -> HipResult<bool> {
+        debug_assert_eq!(staging.len(), self.layer_bufs.len());
         let row_bytes = self.hidden_dim * 4;
         let head = self.head;
         let max_pos = self.max_positions;
-
         // S2 launch fusion: pure-copy commit5 kernel (exact gfx1100/gfx1151/gfx1201). Copies
         // staging[ext][r, :] -> layer_bufs[ext][(head + r) % max_pos, :] for
         // all five extracts in one launch (bit-identical: one writer per
@@ -3607,14 +3607,14 @@ impl HiddenStateRingBuffer {
         // (non-admitted arch, kill switch, capture/recording, non-5-extract or
         // non-F32 shapes, n > max_pos) falls through to today's loop.
         if gpu.dflash_hidden_commit5_applicable(
-            &self.staging_bufs,
+            staging,
             &self.layer_bufs,
             n,
             self.hidden_dim,
             max_pos,
         ) {
             gpu.dflash_hidden_commit5_launch(
-                &self.staging_bufs,
+                staging,
                 &self.layer_bufs,
                 head,
                 n,
@@ -3629,7 +3629,7 @@ impl HiddenStateRingBuffer {
                 gpu.hip.memcpy_dtod_at(
                     &self.layer_bufs[ei].buf,
                     head * row_bytes,
-                    &self.staging_bufs[ei].buf,
+                    &staging[ei].buf,
                     0,
                     n * row_bytes,
                 )?;
@@ -3638,14 +3638,14 @@ impl HiddenStateRingBuffer {
                 gpu.hip.memcpy_dtod_at(
                     &self.layer_bufs[ei].buf,
                     head * row_bytes,
-                    &self.staging_bufs[ei].buf,
+                    &staging[ei].buf,
                     0,
                     first * row_bytes,
                 )?;
                 gpu.hip.memcpy_dtod_at(
                     &self.layer_bufs[ei].buf,
                     0,
-                    &self.staging_bufs[ei].buf,
+                    &staging[ei].buf,
                     first * row_bytes,
                     (n - first) * row_bytes,
                 )?;
@@ -3755,6 +3755,179 @@ impl HiddenStateRingBuffer {
         self.head = 0;
         self.written = 0;
     }
+}
+
+/// Copy `elems` F32 values from `src` into `dst` at offset zero: the one
+/// recording-aware staging write every fixed-offset hidden stage uses (the
+/// verify ring's [`HiddenStateRingBuffer::write_rows_to_staging`] and the
+/// single-token forward's [`HiddenStage`]).
+///
+/// The software Redline recorder retains typed kernel launches, not HIP memcpy
+/// commands. During recording this byte-identical copy is the blob-backed
+/// `copy_f32_buffer` kernel, so recorded-HIP and PM4 refresh the staged rows on
+/// every replay instead of committing stale rows to the hidden ring. A HipGraph
+/// capture keeps the native async memcpy node; eager is a plain D2D copy.
+pub(crate) fn write_staging_rows(
+    gpu: &mut Gpu,
+    dst: &GpuTensor,
+    src: &GpuTensor,
+    elems: usize,
+) -> HipResult<()> {
+    if gpu.replay.is_recording() {
+        return gpu.copy_f32_buffer(dst, src, elems);
+    }
+    let bytes = elems * 4;
+    if let Some(stream) = gpu.active_stream.as_ref() {
+        gpu.hip
+            .memcpy_dtod_async_at(&dst.buf, 0, &src.buf, 0, bytes, stream)
+    } else {
+        gpu.hip.memcpy_dtod_at(&dst.buf, 0, &src.buf, 0, bytes)
+    }
+}
+
+/// Where a single-token target forward stages each extraction layer's
+/// post-layer hidden row: row `i` of `rows` (offset zero) for
+/// `extract_layers[i]`. The rows sit at fixed addresses, so a captured or
+/// recorded forward bakes no ring head; the owner commits them to its ring
+/// after the forward returns.
+#[derive(Clone, Copy)]
+pub(crate) struct HiddenStage<'a> {
+    pub(crate) extract_layers: &'a [usize],
+    pub(crate) rows: &'a [GpuTensor],
+    pub(crate) hidden_dim: usize,
+}
+
+impl HiddenStage<'_> {
+    /// Stage `x` as `layer_idx`'s row when `layer_idx` is an extraction layer.
+    pub(crate) fn write_layer(
+        &self,
+        gpu: &mut Gpu,
+        layer_idx: usize,
+        x: &GpuTensor,
+    ) -> HipResult<()> {
+        match self.extract_layers.iter().position(|&l| l == layer_idx) {
+            Some(slot) => write_staging_rows(gpu, &self.rows[slot], x, self.hidden_dim),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The AR hidden staging of a load with a DFlash drafter: one stable F32 row
+/// per draft extraction layer, owned by [`Qwen35Scratch`] for the load's
+/// lifetime and never moved.
+///
+/// It is installed once, when the DFlash sidecar is resolved at load, so every
+/// eligible single-token AR forward of that load runs the same staged variant
+/// of [`qwen35::forward_scratch`] (plain-AR requests and spec-retired tokens
+/// alike) and one retained tape or AR HipGraph serves both. Plain AR ignores the
+/// staged rows; [`crate::dflash_spec::DflashSpeculator`]'s AR step commits them
+/// to its hidden ring ([`Self::commit_to_ring`]) after the forward returns, so
+/// the drafter's context stays whole. The rows are never a borrow of the
+/// speculator's ring or `DflashState` (those move to VMM lanes and back).
+pub struct ArHiddenStaging {
+    extract_layers: Vec<usize>,
+    rows: Vec<GpuTensor>,
+    hidden_dim: usize,
+    /// The retained-tape route identity of this variant (layers and row
+    /// bases), built once here so the per-token check formats nothing.
+    identity: String,
+}
+
+impl ArHiddenStaging {
+    /// Allocate one `[hidden_dim]` F32 row per extraction layer.
+    pub fn new(gpu: &mut Gpu, extract_layers: &[usize], hidden_dim: usize) -> HipResult<Self> {
+        let mut rows = Vec::with_capacity(extract_layers.len());
+        for _ in extract_layers {
+            match gpu.alloc_tensor(&[hidden_dim], DType::F32) {
+                Ok(row) => rows.push(row),
+                Err(error) => {
+                    for row in rows {
+                        let _ = gpu.free_tensor(row);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let identity = ar_hidden_staging_identity(
+            extract_layers,
+            hidden_dim,
+            rows.iter().map(|row| row.buf.as_ptr() as u64),
+        );
+        Ok(Self {
+            extract_layers: extract_layers.to_vec(),
+            rows,
+            hidden_dim,
+            identity,
+        })
+    }
+
+    pub(crate) fn stage(&self) -> HiddenStage<'_> {
+        HiddenStage {
+            extract_layers: &self.extract_layers,
+            rows: &self.rows,
+            hidden_dim: self.hidden_dim,
+        }
+    }
+
+    pub fn extract_layers(&self) -> &[usize] {
+        &self.extract_layers
+    }
+
+    pub fn rows(&self) -> &[GpuTensor] {
+        &self.rows
+    }
+
+    /// The retained-tape route identity of this staged variant.
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Commit the rows the last forward staged to `ring` at its head and
+    /// advance the head once. Outside any capture or tape: after a HipGraph
+    /// launch the active stream is synchronized first, and a PM4 replay has
+    /// already completed (checked) when the forward returns. A ring whose
+    /// extraction layers differ from this staging is refused.
+    pub fn commit_to_ring(&self, gpu: &mut Gpu, ring: &mut HiddenStateRingBuffer) -> HipResult<()> {
+        if ring.extract_layers != self.extract_layers || ring.hidden_dim != self.hidden_dim {
+            return Err(HipError::new(
+                0,
+                "ArHiddenStaging::commit_to_ring: the ring's extraction layers or width differ \
+                 from the load's AR hidden staging",
+            ));
+        }
+        ring.commit_row_to_ring(gpu, &self.rows)
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
+        let mut first = Ok(());
+        for row in self.rows {
+            let freed = gpu.free_tensor(row);
+            if first.is_ok() {
+                first = freed;
+            }
+        }
+        first
+    }
+}
+
+/// Route identity of an AR hidden-staging variant: its extraction layers, row
+/// width and row bases. A retained tape latches it while recording; a replay
+/// whose live variant differs is refused (`forward_scratch`).
+fn ar_hidden_staging_identity(
+    extract_layers: &[usize],
+    hidden_dim: usize,
+    bases: impl Iterator<Item = u64>,
+) -> String {
+    use std::fmt::Write;
+    let mut identity = format!("ar-hidden-staging layers={extract_layers:?} row_f32={hidden_dim}");
+    for (i, base) in bases.enumerate() {
+        let _ = write!(
+            identity,
+            "{}{base:#x}",
+            if i == 0 { " bases=" } else { "," }
+        );
+    }
+    identity
 }
 
 /// Single-pass argmax for token sampling. Not SIMD-optimized — the logit
@@ -5805,8 +5978,8 @@ pub fn dflash_greedy_accept_commit_parts(
 ///
 /// Fallback: when the batched path is ineligible (non-MQ weights,
 /// non-Q8/asym KV cache, N < MIN_BATCH), `forward_prefill_batch` routes
-/// to the per-token loop using `forward_scratch_with_hidden`, so hidden
-/// extraction still works.
+/// to the per-token loop, which stages each row's hidden rows in the ring's
+/// staging and commits them, so hidden extraction still works.
 pub fn verify_dflash_block(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -11255,6 +11428,32 @@ fn ring_recycle_victim(
         .enumerate()
         .find(|&(_, p)| Some(p) != pin)
         .map(|(i, _)| i)
+}
+
+#[cfg(test)]
+mod ar_hidden_staging_identity_tests {
+    use super::ar_hidden_staging_identity;
+
+    /// The retained-tape identity of the AR staging names its layers, row
+    /// width and every row base, so a different variant (other layers, other
+    /// rows) never matches a latched tape.
+    #[test]
+    fn identity_names_layers_width_and_bases() {
+        let id =
+            ar_hidden_staging_identity(&[5, 19, 33], 5120, [0x1000u64, 0x2000, 0x3000].into_iter());
+        assert_eq!(
+            id,
+            "ar-hidden-staging layers=[5, 19, 33] row_f32=5120 bases=0x1000,0x2000,0x3000"
+        );
+        assert_ne!(
+            id,
+            ar_hidden_staging_identity(&[5, 19, 33], 5120, [0x1000u64, 0x2000, 0x4000].into_iter())
+        );
+        assert_ne!(
+            id,
+            ar_hidden_staging_identity(&[5, 19, 34], 5120, [0x1000u64, 0x2000, 0x3000].into_iter())
+        );
+    }
 }
 
 #[cfg(test)]

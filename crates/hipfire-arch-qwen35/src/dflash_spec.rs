@@ -11,7 +11,7 @@
 //! constructor). All types here are qwen35 + runtime types — no loader types —
 //! so the loader only calls in; it never owns the DFlash mechanics.
 use crate::dflash_verify_pm4::{DflashVerifyPm4, DFLASH_VERIFY_PM4_BLOCK};
-use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant};
+use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant};
 use crate::speculative::{
     apply_host_ar_trunc, sample_categorical, scatter_hidden_block_to_interleaved,
     scatter_hidden_prefill_to_interleaved, seed_target_hidden_dense_tp2_abortable,
@@ -33,6 +33,7 @@ use hipfire_runtime::spec::{
     request_rng_state, terminal_prefix_replay, PrefillOutcome, SpecGrammar, SpecRequestConfig,
     SpecStep, SpecTarget, Speculator,
 };
+use rdna_compute::replay::ReplayController;
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::Arc;
@@ -2157,6 +2158,40 @@ fn lower_qwen35(r: &SpecStepResult) -> SpecStep {
 /// promotion has moved it out (see [`DflashSpeculator::take_vmm_lane`]).
 const SINGLETON_VACANT: &str = "DFlash singleton lane state is vacant; prefill first";
 
+/// Clear the plain-AR retained eligibility at the entry of every non-AR target
+/// operation of this speculator (prompt seed and reseed, verify, GDN replay,
+/// hidden scatter, terminal repair, rewind) before its first launch. The
+/// eligibility a plain-AR forward leaves set is sticky; on a load whose AR tape
+/// is `Ready`, `retained_body_active()` would otherwise read true through that
+/// work. The next eligible `forward_scratch` re-arms it.
+fn enter_non_ar_target_work(replay: &mut ReplayController) {
+    replay.enter_batched_forward();
+}
+
+/// Install the target's AR hidden staging for this attached draft (one row per
+/// draft extraction layer, the ring's width) and hand the state back; on
+/// failure the state is freed. Called once at load, when the DFlash sidecar is
+/// resolved, so every eligible AR forward of the load runs the staged
+/// `forward_scratch` variant from its first token and the variant never flips
+/// while the lane state is attached, vacant or restored.
+pub fn with_ar_hidden_staging(
+    gpu: &mut Gpu,
+    target_scratch: &mut Qwen35Scratch,
+    df: DflashState,
+) -> Result<DflashState, String> {
+    match target_scratch.install_ar_hidden_staging(
+        gpu,
+        &df.hidden_rb.extract_layers,
+        df.hidden_rb.hidden_dim,
+    ) {
+        Ok(()) => Ok(df),
+        Err(e) => {
+            df.free_gpu(gpu);
+            Err(format!("DFlash AR hidden staging: {e}"))
+        }
+    }
+}
+
 /// DFlash speculator: wraps the qwen35 `spec_step_*` chain
 /// kernels behind the arch-generic [`Speculator`] trait.
 ///
@@ -2348,6 +2383,7 @@ impl Speculator for DflashSpeculator {
         resume_from: Option<usize>,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        enter_non_ar_target_work(&mut gpu.replay);
         self.adaptive.reset();
         if let Some(lk) = self.lookup.as_mut() {
             lk.end_request();
@@ -2501,6 +2537,7 @@ impl Speculator for DflashSpeculator {
         start_pos: usize,
         abort: &dyn Fn() -> bool,
     ) -> Result<bool, String> {
+        enter_non_ar_target_work(&mut gpu.replay);
         if tokens.is_empty() {
             return Ok(true);
         }
@@ -2560,9 +2597,13 @@ impl Speculator for DflashSpeculator {
         self.df.is_some()
     }
 
-    /// AR's single-token decode forward plus this position's hidden rows, then
-    /// the same scatter + log append a forced advance does, so the draft
-    /// context stays whole for a later request on this prompt cache.
+    /// AR's single-token decode forward on the load's own executor (PM4 where
+    /// admitted, else the AR HipGraph or eager), whose staged hidden rows are
+    /// then committed to the ring, scattered and logged exactly as a forced
+    /// advance does, so the draft context stays whole for a later request on
+    /// this prompt cache. The forward is the plain-AR `forward_scratch`; the
+    /// load's [`crate::speculative::ArHiddenStaging`] makes it the staged
+    /// variant, and everything head-dependent stays outside it.
     fn ar_step(
         &mut self,
         gpu: &mut Gpu,
@@ -2579,9 +2620,13 @@ impl Speculator for DflashSpeculator {
             .df
             .as_mut()
             .ok_or_else(|| SINGLETON_VACANT.to_string())?;
+        let staging = slot
+            .scratch
+            .ar_hidden_staging()
+            .ok_or("DflashSpeculator: the target load has no AR hidden staging")?;
         // No retained window: a terminal stop after this token flushes plainly.
         self.last_window = None;
-        qwen35::forward_scratch_with_hidden(
+        qwen35::forward_scratch(
             gpu,
             &slot.weights,
             &slot.config,
@@ -2590,9 +2635,11 @@ impl Speculator for DflashSpeculator {
             &mut slot.kv_cache,
             &mut slot.dn_state,
             &slot.scratch,
-            &mut df.hidden_rb,
         )
         .map_err(|e| e.to_string())?;
+        staging
+            .commit_to_ring(gpu, &mut df.hidden_rb)
+            .map_err(|e| e.to_string())?;
         scatter_hidden_block_to_interleaved(
             gpu,
             &df.hidden_rb,
@@ -2646,6 +2693,7 @@ impl Speculator for DflashSpeculator {
         temp: f32,
         max_emit: usize,
     ) -> Result<SpecStep, String> {
+        enter_non_ar_target_work(&mut gpu.replay);
         let t0 = cycle_trace::enabled().then(std::time::Instant::now);
         let slot = target
             .as_any_mut()
@@ -2943,6 +2991,7 @@ impl Speculator for DflashSpeculator {
     }
 
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        enter_non_ar_target_work(&mut gpu.replay);
         if cycle_trace::enabled() {
             cycle_trace::emit(&cycle_trace::reset_line(std::process::id(), self.trace_seq));
         }
@@ -2976,6 +3025,7 @@ impl Speculator for DflashSpeculator {
         window_seed: u32,
         consumed: &[u32],
     ) -> Result<bool, String> {
+        enter_non_ar_target_work(&mut gpu.replay);
         if let Some(lk) = self.lookup.as_mut() {
             // `emitted` shrinks to the consumed prefix: rebuild the history.
             lk.mark_dirty();
@@ -3071,6 +3121,7 @@ impl Speculator for DflashSpeculator {
         target: &mut dyn SpecTarget,
         position: usize,
     ) -> Result<usize, String> {
+        enter_non_ar_target_work(&mut gpu.replay);
         if let Some(lk) = self.lookup.as_mut() {
             // Divergent re-render: the request restarts from `prefill`; any
             // surviving history is rebuilt from the prompt.
@@ -4201,6 +4252,102 @@ impl DenseTpDflashSpeculator {
             dflash.free_gpu(&mut gpus.devices[rank]);
             let _ = gpus.devices[rank].free_tensor(tp_partial);
         }
+    }
+}
+
+#[cfg(test)]
+mod non_ar_entry_eligibility_tests {
+    use super::enter_non_ar_target_work;
+    use rdna_compute::replay::{ReplayBackendRequest, ReplayController, ShadowValidation};
+
+    fn passing() -> ShadowValidation {
+        ShadowValidation {
+            bit_exact: true,
+            guards_intact: true,
+            same_artifact: true,
+            abi_valid: true,
+            automatic_clocks: true,
+            gpu_timed: true,
+            speedup_over_hip: 2.0,
+        }
+    }
+
+    /// The sticky plain-AR eligibility left by an AR forward makes the retained
+    /// body active (recording, or a `Ready` route); a non-AR entry clears it.
+    #[test]
+    fn non_ar_entry_clears_a_live_retained_body() {
+        // Recording warmup with the last forward eligible.
+        let mut recording = ReplayController::new(ReplayBackendRequest::Auto);
+        assert!(recording.retained_body_active());
+        enter_non_ar_target_work(&mut recording);
+        assert!(!recording.retained_body_active());
+
+        // A prepared (`Ready`) route after an eligible AR forward.
+        let mut ready = ReplayController::new(ReplayBackendRequest::Auto);
+        ready.observe_shadow(passing());
+        ready.observe_shadow(passing());
+        ready.install_prepared_plan().unwrap();
+        ready.set_forward_eligible(true);
+        assert!(ready.retained_body_active());
+        enter_non_ar_target_work(&mut ready);
+        assert!(!ready.retained_body_active());
+        // The next eligible AR forward re-arms it.
+        ready.set_forward_eligible(true);
+        assert!(ready.retained_body_active());
+    }
+
+    /// The body of `fn name(` inside `src`, from the line after its opening
+    /// brace, searching from `from`.
+    fn body_after<'a>(src: &'a str, from: usize, name: &str) -> &'a str {
+        let sig = format!("fn {name}(");
+        let at = from + src[from..].find(&sig).unwrap_or_else(|| panic!("no {sig}"));
+        let open = at + src[at..].find("{\n").expect("body");
+        &src[open + 2..]
+    }
+
+    fn first_statement(body: &str) -> &str {
+        body.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("//"))
+            .expect("statement")
+    }
+
+    /// Every non-AR target entry clears the eligibility before its first
+    /// launch: the speculator's prompt seed/reseed, forced advance (hidden
+    /// scatter), verify step (GDN replay included), reset, terminal repair and
+    /// rewind, and the per-token prefill fallback row.
+    #[test]
+    fn every_non_ar_target_entry_clears_eligibility_first() {
+        let src = include_str!("dflash_spec.rs");
+        let impl_at = src
+            .find("impl Speculator for DflashSpeculator {")
+            .expect("impl");
+        for entry in [
+            "prefill",
+            "on_forced_advance",
+            "step",
+            "reset",
+            "repair_terminal_prefix",
+            "rewind_to",
+        ] {
+            assert_eq!(
+                first_statement(body_after(src, impl_at, entry)),
+                "enter_non_ar_target_work(&mut gpu.replay);",
+                "DflashSpeculator::{entry}"
+            );
+        }
+        // The AR step is the one entry that stays eligible.
+        assert_ne!(
+            first_statement(body_after(src, impl_at, "ar_step")),
+            "enter_non_ar_target_work(&mut gpu.replay);"
+        );
+        let forward = include_str!("qwen35/forward.rs");
+        assert_eq!(
+            first_statement(body_after(forward, 0, "forward_scratch_ring_row")),
+            "gpu.replay.enter_batched_forward();"
+        );
+        let prefill = include_str!("qwen35/prefill.rs");
+        assert!(prefill.contains("forward_scratch_ring_row("));
     }
 }
 

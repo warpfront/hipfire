@@ -185,11 +185,12 @@ gfx1151 has.
 `forward_scratch_layers` is the only single-GPU decode loop. The hand arms
 that served three cases are deleted, and each case now runs the step program:
 
-- **DFlash hidden capture** (`forward_scratch_with_hidden`: the per-token
-  prefill fallback). A layer's hidden row is
-  written to the ring buffer once the layer is final, which on the deferred
-  MoE combine (`moe_combine_next_rms_enabled`) is after the next layer's fused
-  combine + norm.
+- **DFlash hidden capture** (the staged `forward_scratch` of a load with a
+  DFlash drafter, and the per-token prefill fallback row). A layer's hidden
+  row is written to its fixed staging row once the layer is final, which on
+  the deferred MoE combine (`moe_combine_next_rms_enabled`) is after the next
+  layer's fused combine + norm; the owner commits the rows to its ring after
+  the forward.
 - **VL mrope**: `GatedAttentionOp::mrope` (`MropeRope`: the per-token
   `(t, h, w)` phases in `pos_buf3` and the section split) rotates with
   `rope_mrope_halfsplit_f32`; the fused FA prep and the folded KV write are
