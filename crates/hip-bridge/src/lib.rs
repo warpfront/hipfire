@@ -38,7 +38,7 @@ pub use ffi::weight_slab::{
     SLAB_ALIGN,
 };
 pub use ffi::{arm_hip_fault, declare_qwen4_host_mapping, keep_host_memory_out_of_reclaim};
-pub use ffi::{launch_counters, memory_effects};
+pub use ffi::{launch_counters, memory_effects, vmm_tlb_pokes};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, HostAllocOwner,

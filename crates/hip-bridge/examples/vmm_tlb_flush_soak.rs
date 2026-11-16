@@ -5,18 +5,19 @@
 //!
 //! Grows a `VmmArena` one chunk at a time, as a VMM KV context grows, and
 //! queues a device memset over the mapped prefix straight after each map, so
-//! GPU work touches freshly mapped pages with no host delay. On the in-tree
-//! amdgpu (ROCm/rocm-systems#11693: no TLB flush after a GEM VA map) gfx1201
-//! page-faults within ~10-50 maps without the poke; with it every round
-//! passes.
+//! GPU work touches freshly mapped pages with no host delay. Every map is at a
+//! fresh VA, so this exercises the fresh-map race of SDMA-written page tables
+//! (reported as page faults on a USB4-attached gfx1201); on a large-BAR card
+//! the default poke stays off here and the soak passes either way. The VA-reuse
+//! defect is `vmm::tests::vmm_va_reuse_reads_back_its_own_pages_hw`.
 //!
 //!   HIPFIRE_VMM_SMOKE_DEVICE=1 cargo run --release -p hip-bridge --features lab --example vmm_tlb_flush_soak -- [CHUNK_BYTES] [CHUNKS] [ROUNDS] [TOUCH]
-//!   HIPFIRE_VMM_TLB_POKE=0 ...   # the control: expected to fault on an affected driver
+//!   HIPFIRE_VMM_TLB_POKE=0 ...   # never poke; =1 pokes after every map
 //!
-//! Prints the mean wall time of a map (`map_next`, which includes the poke).
-//! `TOUCH=0` maps without the memsets (nothing reads the new pages, so the
-//! poke-off control cannot fault): the per-map cost of the poke is the
-//! difference between `HIPFIRE_VMM_TLB_POKE=1` and `=0` in that mode.
+//! Prints the mean wall time of a map (`map_next`, which includes any poke)
+//! and the number of pokes. `TOUCH=0` maps without the memsets: the per-map
+//! cost of the poke is the difference between `HIPFIRE_VMM_TLB_POKE=1` and
+//! `=0` in that mode.
 
 use hip_bridge::{HipRuntime, VmmArena};
 
@@ -72,7 +73,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut readback = vec![0u8; full.size()];
         hip.memcpy_dtoh(&mut readback, &full)?;
         let expect = ((round * 7919 + chunks - 1) as i32).to_ne_bytes();
-        if let Some(bad) = readback.chunks_exact(4).position(|word| word != expect) {
+        if let Some(bad) = readback
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .position(|word| *word != expect)
+        {
             return Err(format!("round {round}: word {bad} differs from the last memset").into());
         }
         arena.release(&hip)?;
@@ -82,13 +88,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let maps = rounds * chunks;
     println!(
-        "vmm_tlb_flush_soak: PASS ({maps} maps{}; mean map {:.1} us)",
+        "vmm_tlb_flush_soak: PASS ({maps} maps{}; mean map {:.1} us; {} TLB pokes)",
         if touch {
             ", each touched right away"
         } else {
             ", not touched"
         },
-        map_time.as_secs_f64() * 1e6 / maps as f64
+        map_time.as_secs_f64() * 1e6 / maps as f64,
+        hip_bridge::vmm_tlb_pokes()
     );
     Ok(())
 }

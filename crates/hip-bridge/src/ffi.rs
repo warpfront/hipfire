@@ -184,6 +184,10 @@ pub mod kernel_timing;
 
 pub(crate) mod weight_slab;
 
+pub(crate) mod vmm_tlb;
+pub use vmm_tlb::vmm_tlb_pokes;
+use vmm_tlb::{VMM_TLB_POKE_ARCHS, VMM_TLB_POKE_ENV};
+
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
 /// Phase 3a host-vs-GPU diagnostics to attribute the forward pass wall
 /// clock to specific HIP runtime calls.
@@ -568,58 +572,6 @@ impl Default for HipPointerAttribute {
             allocation_flags: 0,
         }
     }
-}
-
-/// `HIPFIRE_VMM_TLB_POKE` (developer): `1` forces and `0` disables the TLB
-/// flush after every VMM map ([`HipRuntime::mem_set_access`]). Unset: on when
-/// the loaded amdgpu is the in-tree module (no `/sys/module/amdgpu/version`;
-/// AMD's amdgpu-dkms declares one and flushes in the kernel), for the devices
-/// HIP reports as one of [`VMM_TLB_POKE_ARCHS`] only. Forced on, it pokes
-/// every device.
-pub const VMM_TLB_POKE_ENV: &str = "HIPFIRE_VMM_TLB_POKE";
-
-/// Archs the default poke covers: where the in-tree fault was reproduced and
-/// the poke measured (gfx1201). Other cards keep ROCm's behaviour unless
-/// `HIPFIRE_VMM_TLB_POKE=1`.
-pub const VMM_TLB_POKE_ARCHS: &[&str] = &["gfx1201"];
-
-/// The poke's throwaway allocation: large enough that HIP allocates and frees
-/// it through KFD (a 64 KiB block is cached by HIP and issues no ioctl).
-const VMM_TLB_POKE_BYTES: usize = 4 << 20;
-
-/// Which devices the poke covers, decided once per process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VmmTlbPoke {
-    /// `HIPFIRE_VMM_TLB_POKE=1`: every device.
-    Forced,
-    /// The in-tree amdgpu default: devices whose HIP arch is in
-    /// [`VMM_TLB_POKE_ARCHS`].
-    Archs,
-}
-
-/// `None` = the poke is off.
-fn vmm_tlb_poke_mode() -> Option<VmmTlbPoke> {
-    static MODE: std::sync::OnceLock<Option<VmmTlbPoke>> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        let in_tree = !std::path::Path::new("/sys/module/amdgpu/version").exists();
-        let forced = hipfire_config::developer_var(VMM_TLB_POKE_ENV).ok();
-        if !hipfire_config::developer_bool(VMM_TLB_POKE_ENV, in_tree) {
-            return None;
-        }
-        let mode = if forced.is_some() {
-            VmmTlbPoke::Forced
-        } else {
-            VmmTlbPoke::Archs
-        };
-        eprintln!(
-            "  hip-bridge: VMM TLB flush poke on ({}; one 4 MiB hipMalloc+hipFree per VMM map, {VMM_TLB_POKE_ENV}=0 disables)",
-            match mode {
-                VmmTlbPoke::Forced => "forced, every device".to_owned(),
-                VmmTlbPoke::Archs => format!("in-tree amdgpu, {VMM_TLB_POKE_ARCHS:?} devices"),
-            }
-        );
-        Some(mode)
-    })
 }
 
 #[repr(C)]
@@ -2803,6 +2755,7 @@ impl HipRuntime {
         sites::end(span, SiteApi::VmmUnmap, SiteDir::None, size);
         self.check(code, "hipMemUnmap")?;
         crate::registry::forget(ptr as usize);
+        vmm_tlb::note_unmap(ptr as usize, size);
         Ok(())
     }
 
@@ -2821,30 +2774,28 @@ impl HipRuntime {
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size, descs.as_ptr(), descs.len()) };
         self.check(code, "hipMemSetAccess")?;
-        if let Some(mode) = vmm_tlb_poke_mode() {
-            self.vmm_tlb_poke(descs, mode)?;
+        if let Some(mode) = vmm_tlb::mode() {
+            let reuse = mode == vmm_tlb::Mode::Auto && vmm_tlb::reuses_va(ptr as usize, size);
+            self.vmm_tlb_poke(descs, mode, reuse)?;
         }
         Ok(())
     }
 
-    /// Force a GPU TLB flush on every device `descs` grants access to, after a
-    /// VMM map. The in-tree amdgpu (mainline through at least 7.0) maps a HIP
-    /// VMM range through the DRM GEM VA ioctl, whose compute-context path neither
-    /// waits for the page-table update nor flushes the TLB
-    /// (ROCm/rocm-systems#11693; AMD's amdgpu-dkms adds both in
-    /// `amdgpu_gem_va_update_vm`). Work touching the new pages straight away then
-    /// page-faults (gfx1201: within ~10-50 fresh 1-2 MiB maps). KFD's unmap
-    /// ioctl does both, waits for its page-table update (queued behind the map's
-    /// on the same VM) and flushes the VM's TLB, so a throwaway `hipMalloc` +
-    /// `hipFree` large enough to bypass HIP's small-block cache (each call issues
-    /// the KFD alloc/map/unmap/free ioctls) flushes for us. Measured on gfx1201
-    /// (kernel 7.0.1, ROCm 7.2.2): 0 faults in 76,800 grow-and-touch maps
-    /// against a fault within ~50 without it; a 64 KiB poke (served from HIP's
-    /// cache, no ioctl) and a 500 us sleep both still fault.
-    /// `mode`: every device, or those whose HIP arch is in
-    /// [`VMM_TLB_POKE_ARCHS`] (asked of HIP by ordinal, not inferred from the
-    /// startup card list, whose PCI order need not be HIP's).
-    fn vmm_tlb_poke(&self, descs: &[HipMemAccessDesc], mode: VmmTlbPoke) -> HipResult<()> {
+    /// Flush the GPU TLB of the devices `descs` grants access to after a VMM
+    /// map, where [`vmm_tlb`] says the in-tree amdgpu needs it: `Forced` on
+    /// every device; `Auto` on [`VMM_TLB_POKE_ARCHS`] devices when the map
+    /// reuses a VA unmapped before (`reuse`) or the device's compute page
+    /// tables are written by SDMA. The flush is a throwaway `hipMalloc` +
+    /// `hipFree` large enough to bypass HIP's small-block cache: KFD's unmap
+    /// ioctl waits for the VM's page-table updates and flushes its TLB.
+    /// `hipFree` also drains the device. Refused (the map fails, the capture
+    /// stays intact) while a capture that `hipMalloc` would invalidate is open.
+    pub(crate) fn vmm_tlb_poke(
+        &self,
+        descs: &[HipMemAccessDesc],
+        mode: vmm_tlb::Mode,
+        reuse: bool,
+    ) -> HipResult<()> {
         let mut devices: Vec<i32> = descs
             .iter()
             .filter(|desc| desc.location.type_ == HIP_MEM_LOCATION_TYPE_DEVICE)
@@ -2852,10 +2803,11 @@ impl HipRuntime {
             .collect();
         devices.sort_unstable();
         devices.dedup();
-        if mode == VmmTlbPoke::Archs {
+        if mode == vmm_tlb::Mode::Auto {
             let mut kept = Vec::with_capacity(devices.len());
             for device in devices {
-                if self.vmm_tlb_poke_covers(device)? {
+                let (covered, sdma) = self.vmm_tlb_device(device)?;
+                if covered && (reuse || sdma) {
                     kept.push(device);
                 }
             }
@@ -2864,17 +2816,31 @@ impl HipRuntime {
         if devices.is_empty() {
             return Ok(());
         }
+        if let Some((capture_mode, thread)) =
+            vmm_tlb::captures().blocking(std::thread::current().id())
+        {
+            return Err(HipError::new(
+                vmm_tlb::HIP_ERROR_STREAM_CAPTURE_UNSUPPORTED,
+                &format!(
+                    "VMM TLB flush poke on devices {devices:?} refused: a mode-{capture_mode} \
+                     stream capture is open on thread {thread:?}, and the poke's hipMalloc \
+                     would invalidate it; map outside the capture"
+                ),
+            ));
+        }
         let current = self.current_device()?;
         let poked = devices.iter().try_for_each(|&device| {
             self.set_device(device)?;
             let mut ptr: *mut c_void = ptr::null_mut();
             // SAFETY: resolved HIP symbols; the out-param is a stack local and the
             // buffer is freed unused right away.
-            let code = unsafe { (self.fn_malloc)(&mut ptr, VMM_TLB_POKE_BYTES) };
+            let code = unsafe { (self.fn_malloc)(&mut ptr, vmm_tlb::VMM_TLB_POKE_BYTES) };
             self.check(code, "hipMalloc (VMM TLB flush poke)")?;
             // SAFETY: `ptr` came from the hipMalloc above and is not used again.
             let code = unsafe { (self.fn_free)(ptr) };
-            self.check(code, "hipFree (VMM TLB flush poke)")
+            self.check(code, "hipFree (VMM TLB flush poke)")?;
+            vmm_tlb::count_poke();
+            Ok(())
         });
         let restored = self.set_device(current);
         poked.and(restored).map_err(|err| HipError {
@@ -2886,25 +2852,40 @@ impl HipRuntime {
         })
     }
 
-    /// Whether HIP device `device` is one of [`VMM_TLB_POKE_ARCHS`]; cached
-    /// per ordinal (HIP ordinals are fixed for the process).
-    fn vmm_tlb_poke_covers(&self, device: i32) -> HipResult<bool> {
-        static COVERED: std::sync::Mutex<Vec<(i32, bool)>> = std::sync::Mutex::new(Vec::new());
-        let cached = COVERED
+    /// `(covered, sdma)` for HIP device `device`: its arch is one of
+    /// [`VMM_TLB_POKE_ARCHS`], and its compute page tables are written by
+    /// SDMA. Asked of HIP by ordinal (the startup card list's PCI order need not
+    /// be HIP's), cached per ordinal, and logged once for a covered device.
+    fn vmm_tlb_device(&self, device: i32) -> HipResult<(bool, bool)> {
+        static DEVICES: std::sync::Mutex<Vec<(i32, bool, bool)>> =
+            std::sync::Mutex::new(Vec::new());
+        let cached = DEVICES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .find(|(d, _)| *d == device)
-            .map(|(_, c)| *c);
-        if let Some(covered) = cached {
-            return Ok(covered);
+            .find(|(d, _, _)| *d == device)
+            .map(|&(_, covered, sdma)| (covered, sdma));
+        if let Some(decision) = cached {
+            return Ok(decision);
         }
-        let covered = VMM_TLB_POKE_ARCHS.contains(&self.get_arch(device)?.as_str());
-        COVERED
+        let arch = self.get_arch(device)?;
+        let covered = VMM_TLB_POKE_ARCHS.contains(&arch.as_str());
+        let sdma = covered && vmm_tlb::sdma_page_tables_sysfs(&self.device_pci_bus_id(device)?);
+        if covered {
+            eprintln!(
+                "  hip-bridge: VMM TLB flush poke, device {device} ({arch}, in-tree amdgpu): {} ({VMM_TLB_POKE_ENV}=0 disables, =1 forces every map)",
+                if sdma {
+                    "page tables written by SDMA, every map"
+                } else {
+                    "page tables written by the CPU, only maps over a reused VA"
+                }
+            );
+        }
+        DEVICES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((device, covered));
-        Ok(covered)
+            .push((device, covered, sdma));
+        Ok((covered, sdma))
     }
 
     /// # Safety
@@ -4351,7 +4332,9 @@ impl HipRuntime {
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_begin_capture)(stream.0, mode as c_uint) };
-        self.check(code, "hipStreamBeginCapture")
+        self.check(code, "hipStreamBeginCapture")?;
+        vmm_tlb::captures().begin(stream.0 as usize, mode, std::thread::current().id());
+        Ok(())
     }
 
     /// End capture on `stream`, returning the captured graph.
@@ -4362,6 +4345,8 @@ impl HipRuntime {
         // wrappers; out-params are stack locals. Destroy/sync require the caller
         // to have drained dependent work first where HIP demands it.
         let code = unsafe { (self.fn_stream_end_capture)(stream.0, &mut graph) };
+        // The capture ends whether or not HIP reports an error.
+        vmm_tlb::captures().end(stream.0 as usize);
         self.check(code, "hipStreamEndCapture")?;
         Ok(Graph(graph))
     }

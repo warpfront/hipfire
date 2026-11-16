@@ -4416,6 +4416,13 @@ pub const SITES: &[Site] = &[
         occurrences: 2,
         decisions: &["qwen4-f16-wmma-prefill"],
     },
+    // #1106: the TLB poke's hipMalloc/hipFree refuses while a hip-bridge capture is open.
+    Site {
+        file: "hip-bridge/src/ffi.rs",
+        function: "vmm_tlb_poke",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
     Site {
         file: "hip-bridge/src/ffi/kernel_timing/tests.rs",
         function: "<item>",

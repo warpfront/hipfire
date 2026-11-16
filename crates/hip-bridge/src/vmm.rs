@@ -2393,6 +2393,10 @@ mod tests {
         /// a runtime whose KFD cannot hand out a virtual range (#1058).
         fail_reserve: Cell<bool>,
         next_handle: Cell<usize>,
+        /// The next `hipMemSetAccess` fails (once).
+        fail_access: Cell<bool>,
+        /// Successful maps (`true`) and unmaps (`false`), absolute addresses.
+        va_events: std::cell::RefCell<Vec<(bool, usize, usize)>>,
     }
 
     impl RecordingDriver {
@@ -2405,6 +2409,8 @@ mod tests {
                 fail_map: Cell::new(false),
                 fail_reserve: Cell::new(false),
                 next_handle: Cell::new(0x100),
+                fail_access: Cell::new(false),
+                va_events: Default::default(),
             }
         }
 
@@ -2483,6 +2489,7 @@ mod tests {
             if self.fail_map.replace(false) {
                 return Err(HipError::new(1, "injected map failure"));
             }
+            self.va_events.borrow_mut().push((true, ptr as usize, size));
             Ok(())
         }
         unsafe fn mem_set_access(
@@ -2495,6 +2502,9 @@ mod tests {
                 offset: self.offset_of(ptr),
                 size,
             });
+            if self.fail_access.replace(false) {
+                return Err(HipError::new(1, "injected access failure"));
+            }
             Ok(())
         }
         unsafe fn mem_unmap(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
@@ -2502,6 +2512,9 @@ mod tests {
                 offset: self.offset_of(ptr),
                 size,
             });
+            self.va_events
+                .borrow_mut()
+                .push((false, ptr as usize, size));
             Ok(())
         }
         unsafe fn mem_release(&self, _: HipMemGenericAllocationHandle) -> HipResult<()> {
@@ -2793,5 +2806,169 @@ mod tests {
             ["abort_import", "map_next", "teardown_segments"],
             "unreviewed hipMemUnmap call site in the VMM module"
         );
+    }
+
+    /// The retire-every-VA invariant the VMM TLB poke relies on
+    /// (`ffi::vmm_tlb`): across growth, a failed access call (unmap + poison),
+    /// a refused retry, release and a second arena, no map ever lands on a range
+    /// unmapped before. hip-bridge never returns a VA to the driver
+    /// (`hipMemAddressFree` is not even loaded), so a fresh reservation cannot
+    /// overlap a retired one either.
+    #[test]
+    fn vmm_lifecycle_never_maps_over_an_unmapped_va() {
+        const MIB: usize = 1 << 20;
+        assert!(
+            !include_str!("ffi.rs").contains("\"hipMemAddressFree\""),
+            "hip-bridge must not hand VAs back to the driver"
+        );
+        let driver = RecordingDriver::new(2 * MIB);
+        let mut a = reserve_recorded(&driver, 64 * MIB);
+        for _ in 0..3 {
+            a.map_next(&driver, 2 * MIB, &[0]).unwrap();
+        }
+        driver.fail_access.set(true);
+        assert!(a.map_next(&driver, 2 * MIB, &[0]).is_err());
+        assert!(
+            a.map_next(&driver, 2 * MIB, &[0]).is_err(),
+            "a poisoned arena must not remap"
+        );
+        a.release(&driver).unwrap();
+        let mut b = reserve_recorded(&driver, 64 * MIB);
+        b.map_next(&driver, 8 * MIB, &[0]).unwrap();
+        b.map_next(&driver, 2 * MIB, &[0]).unwrap();
+        b.release(&driver).unwrap();
+
+        let mut unmapped = crate::ffi::vmm_tlb::UnmappedVa::default();
+        let (mut maps, mut unmaps) = (0, 0);
+        for &(is_map, start, len) in driver.va_events.borrow().iter() {
+            if is_map {
+                assert!(
+                    !unmapped.overlaps(start, len),
+                    "mapped 0x{start:x}+{len} over a VA unmapped before"
+                );
+                maps += 1;
+            } else {
+                unmapped.note(start, len);
+                unmaps += 1;
+            }
+        }
+        assert_eq!(
+            maps, 6,
+            "3 + the failed-access segment + 2 in the second arena"
+        );
+        assert!(unmaps >= 3, "the failed segment and both releases unmap");
+    }
+
+    fn vmm_hw_device() -> (HipRuntime, i32) {
+        let hip = HipRuntime::load().expect("HIP runtime unavailable: cannot run the VMM test");
+        let count = hip.device_count().expect("hipGetDeviceCount failed");
+        assert!(count > 0, "no HIP device visible");
+        hip.set_device(0).unwrap();
+        (hip, 0)
+    }
+
+    /// ROCm/rocm-systems#11693 with the VA reused explicitly: one 64 MiB
+    /// reservation, and per iteration a fresh physical handle mapped at it,
+    /// filled by a kernel, copied device-to-device by the GPU, read back and
+    /// unmapped. On the in-tree amdgpu (CPU-written page tables) the remapped
+    /// VA keeps translating to the previous handle for ~1-2 ms, so without
+    /// the flush some iterations read back zeros or the previous pattern
+    /// (gfx1100 and gfx1201). The default poke detects the reuse
+    /// (`ffi::vmm_tlb`) and flushes; `HIPFIRE_VMM_TLB_POKE=0` is the control
+    /// expected to fail there. 300 iterations.
+    #[test]
+    #[ignore = "requires a HIP device with VMM support (select the card with ROCR_VISIBLE_DEVICES)"]
+    fn vmm_va_reuse_reads_back_its_own_pages_hw() {
+        let (hip, device) = vmm_hw_device();
+        let iters = 300usize;
+        let prop = HipMemAllocationProp::device_pinned(device);
+        let gran = hip
+            .mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)
+            .unwrap();
+        let size = (64usize << 20).next_multiple_of(gran);
+        let va = hip.mem_address_reserve(size, gran).unwrap();
+        let access = [HipMemAccessDesc::read_write_device(device)];
+        let copy = hip.malloc(size).unwrap();
+        let pokes_before = crate::vmm_tlb_pokes();
+        let probe = 4096;
+        let offsets: Vec<usize> = (0..16)
+            .map(|i| (size / 16) * i + (i * 4096) % (size / 16))
+            .collect();
+        let mut corrupt = Vec::new();
+        for iter in 0..iters {
+            let handle = hip.mem_create(size, &prop).unwrap();
+            // SAFETY: `va..+size` is this test's reservation, unmapped at this
+            // point; `handle` covers `size`.
+            unsafe { hip.mem_map(va, size, handle) }.unwrap();
+            // SAFETY: the range was mapped just above.
+            unsafe { hip.mem_set_access(va, size, &access) }.unwrap();
+            // SAFETY: `va..+size` is mapped read-write and outlives `target`.
+            let target = unsafe { DeviceBuffer::from_raw(va, size) };
+            let value = 0x5a00_0000 | iter as i32;
+            hip.memset_d32_async(&target, value, size / 4, None)
+                .unwrap();
+            hip.memcpy_dtod(&copy, &target, size).unwrap();
+            hip.device_synchronize().unwrap();
+            let want = value.to_ne_bytes();
+            let mut bad = 0usize;
+            for buf in [&target, &copy] {
+                for &off in &offsets {
+                    let mut words = vec![0u8; probe];
+                    hip.memcpy_dtoh_at(&mut words, buf, off).unwrap();
+                    bad += words
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .filter(|w| **w != want)
+                        .count();
+                }
+            }
+            if bad != 0 {
+                corrupt.push((iter, bad));
+            }
+            // SAFETY: mapped above, nothing in flight (synchronized).
+            unsafe { hip.mem_unmap(va, size) }.unwrap();
+            // SAFETY: no mapped range references `handle` any more.
+            unsafe { hip.mem_release(handle) }.unwrap();
+        }
+        hip.free(copy).unwrap();
+        let pokes = crate::vmm_tlb_pokes() - pokes_before;
+        println!(
+            "vmm_va_reuse: {} / {iters} iterations corrupted, {pokes} TLB pokes, first {:?}",
+            corrupt.len(),
+            corrupt.iter().take(5).collect::<Vec<_>>()
+        );
+        assert!(
+            corrupt.is_empty(),
+            "{} / {iters} iterations read stale pages through a reused VA ({pokes} pokes)",
+            corrupt.len()
+        );
+    }
+
+    /// A poke while a global-mode capture is open would call `hipMalloc`, which
+    /// HIP refuses there and which invalidates the capture. The poke refuses
+    /// instead: the map fails, and the capture still ends cleanly. Outside the
+    /// capture the same poke runs.
+    #[test]
+    #[ignore = "requires a HIP device with VMM support (select the card with ROCR_VISIBLE_DEVICES)"]
+    fn vmm_tlb_poke_refuses_while_a_global_capture_is_open_hw() {
+        use crate::ffi::vmm_tlb;
+        let (hip, device) = vmm_hw_device();
+        let access = [HipMemAccessDesc::read_write_device(device)];
+        let stream = hip.stream_create().unwrap();
+        hip.stream_begin_capture(&stream, 0).unwrap();
+        let err = hip
+            .vmm_tlb_poke(&access, vmm_tlb::Mode::Forced, false)
+            .expect_err("a poke inside a global capture must refuse");
+        assert_eq!(err.code, vmm_tlb::HIP_ERROR_STREAM_CAPTURE_UNSUPPORTED);
+        assert!(err.to_string().contains("refused"), "{err}");
+        let graph = hip
+            .stream_end_capture(&stream)
+            .expect("the refused poke must leave the capture valid");
+        hip.graph_destroy(graph).unwrap();
+        let before = crate::vmm_tlb_pokes();
+        hip.vmm_tlb_poke(&access, vmm_tlb::Mode::Forced, false)
+            .expect("outside the capture the poke runs");
+        assert_eq!(crate::vmm_tlb_pokes(), before + 1);
     }
 }
