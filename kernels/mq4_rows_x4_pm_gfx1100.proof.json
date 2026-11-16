@@ -3,7 +3,7 @@
   "arch": "gfx1100",
   "builder_crate_version": "0.4.1",
   "builder_git_sha": "unknown",
-  "s_text_sha256": "468dc35086110f32a64ec7dbbf77e404798954f89184085204429e6dd48a97a8",
+  "s_text_sha256": "2656c5b0c8e6f0568ec5f29700491fe865a38d5c637ebbc6f073104a061ea819",
   "kernels": [
     {
       "kernel_id": "mq4_rows_x4",
@@ -29,7 +29,7 @@
         {
           "name": "weight_pointers",
           "kind": "s",
-          "base": 8,
+          "base": 80,
           "len": 8,
           "live": "Whole"
         },
@@ -232,14 +232,14 @@
         {
           "name": "workgroup_id",
           "kind": "s",
-          "base": 2,
+          "base": 14,
           "len": 1,
           "live": "Whole"
         },
         {
           "name": "workgroup_id_y",
           "kind": "s",
-          "base": 3,
+          "base": 15,
           "len": 1,
           "live": "Whole"
         },
@@ -420,7 +420,7 @@
         }
       ],
       "next_free_vgpr": 121,
-      "next_free_sgpr": 80,
+      "next_free_sgpr": 88,
       "waits": [
         {
           "pc_index": 5,
@@ -22771,7 +22771,7 @@
         "s_waitcnt (gfx12)",
         "scratch_*"
       ],
-      "s_text_sha256": "468dc35086110f32a64ec7dbbf77e404798954f89184085204429e6dd48a97a8"
+      "s_text_sha256": "2656c5b0c8e6f0568ec5f29700491fe865a38d5c637ebbc6f073104a061ea819"
     }
   ]
 }
