@@ -39,6 +39,22 @@ pinned_in = "dbc8275fe9"
 mirrored_in = ["registry/models.json", "registry/v1.json", "scripts/hw-gate/fixtures.json"]
 note = "qwen3.8-27b.mq4-xt has exactly the same size; only the digest tells them apart"
 
+[model."qwen3.8-27b.mq3-xts"]
+status = "current"
+role = "symmetric Qwen3.8-27B MQ3V2 XT (qt49 mq3v2.symmetric); W3A4 prefill tier beside qwen3.8-27b.mq3-xt"
+hf_repo = "hipfire-models/qwen3.8-27b"
+file = "qwen3.8-27b.mq3-xts"
+registry_tag = "qwen3.8:27b-mq3-xts"
+size_bytes = 11784440832
+sha256 = "68d5e6b98570201d21b53674d1b4d791f330fbdccc7bb89393dacf38363bbfe7"
+md5 = "e93ed7a87a00d44b41c1dfd0a2a747c9"
+recipe = "MQ3V2 final-code import of 496 tensors from template b1x.template.hfq (sha256 8801ce86b3e55348516aa9f5224f7f4d4e3fc4bcce8bd1e87b14601672313df8) on the v5 GPTQ Hessian qwen3.8-27b.v5-gptq.calib.hfq (sha256 45e8c4fdf3f6dfbbe75bb6f7af1f09494a8b0408225427236e4427d6ee4a3821), per-tensor sweep, symmetric (zero = -4 x scale)"
+date = "2026-10-29"
+pinned_in = "b3994c7b90"
+receipt = "/home/kaden/qcal/release-0.5.0/charter/next-lever/"
+mirrored_in = ["registry/models.json", "registry/v1.json"]
+note = "built in /home/kaden/qcal/release-0.4.3/mq3xts/; same size class as qwen3.8-27b.mq3-xt (6.8 MB larger); shares the 27B mtp, vision and DFlash draft; not on HF until published"
+
 [model."qwen3.8-27b.mq4-xts-qat-r7s200"]
 status = "retired"
 role = "2026-09-23 mq4-xts test upload (QAT r7s200); not comparable"

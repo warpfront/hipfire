@@ -746,6 +746,49 @@
         "size_bytes": 927611840
       }
     },
+    "qwen3.8:27b-mq3-xts": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq3-xts",
+      "size_gb": 11.78,
+      "size_bytes": 11784440832,
+      "sha256": "68d5e6b98570201d21b53674d1b4d791f330fbdccc7bb89393dacf38363bbfe7",
+      "min_vram_gb": 13,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ3V2 XT, symmetric (qt49 `mq3v2.symmetric`, zero = -4 x scale): a new tier beside qwen3.8:27b-mq3-xt, same 11.78 GB size (6.8 MB larger). Runs the int4-activation (W3A4) prefill on gfx1201 and gfx1100; gfx1151 keeps the F16 route. Teacher KLD vs the BF16 source (24 chunks, `eval_hipfire --scoring-mode prefill`): gfx1100 A4 (q8/q8 KV) WT2 0.1745 / code24 0.1132; gfx1100 F16 route (`HIPFIRE_MQ3V25_A4=0`) WT2 0.1514 / code24 0.1000; gfx1201 A4 (`--kv-mode fp8 --kv-v q8`) WT2 0.1767 / code24 0.1225. Versus qwen3.8:27b-mq3-xt (WT2 0.2483 / code24 0.1927 on F16) the paired KLD is about -0.07 on both corpora. R9700 (gfx1201) speed vs qwen3.8:27b-mq3-xt: pp4096 5.8x (3550 vs 610.5 tok/s), decode +2.6% (47.2 vs 46.0 tok/s). 7900 XTX (gfx1100) vs qwen3.8:27b-mq3-xt: pp4096 4.13x (2109 vs 511 tok/s), pp8192 4.06x, but decode -8.6% (52.6 vs 57.5 tok/s); prompts under 128 tokens prefill about 5-7% slower than this file's F16 route (the A4 GEMMs engage from 128 rows). Strix Halo (gfx1151, F16 route for both files): prefill equal (257 tok/s at pp4096), decode +0.7% (18.8 vs 18.6 tok/s).",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "medium"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "medium"
+        }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq3.hfq"
+      },
+      "mtp": {
+        "file": "qwen3.8-27b.mtp",
+        "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
+        "size_bytes": 225716224
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
+    },
     "qwen3.8:27b-mq3": {
       "repo": "hipfire-models/qwen3.8-27b",
       "file": "qwen3.8-27b.mq3",

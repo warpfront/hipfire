@@ -276,6 +276,7 @@ in `summary.json`):
 | mq2-base | `…/qwen3.8-27b.mq2v2.base.hfq` | `547bc0ae3dfefaef583c4f8756511f362389e93765f2136fab64691b778ac186` | 9574976512 | `8693a1305eec5f77eed8db19bd49a94b` |
 | mq2-pro | `…/qwen3.8-27b.mq2v2.pro.hfq` | `6cc00eddd39bbb06824905276bfa0fd34edeed40b3dd3020b7b7a0412b0fad1b` | 9971776512 | `4823a452391cb3cdc58616b327a74ed2` |
 | mq3-xt | `…/qwen3.8-27b.mq3v2.xt.hfq` | `3e04fc8db80bda557b965ec60ac876cf2500fced7f340624f3fcbeae134af5c5` | 11777616896 | `80bb9198e6a565fc006b2ae1b7c89eca` |
+| mq3-xts | `/home/kaden/qcal/release-0.4.3/mq3xts/out/qwen3.8-27b.mq3-xts` | `68d5e6b98570201d21b53674d1b4d791f330fbdccc7bb89393dacf38363bbfe7` | 11784440832 | `e93ed7a87a00d44b41c1dfd0a2a747c9` |
 | mq3-base | `…/qwen3.8-27b.mq3v2.base.hfq` | `09c3544690aceca29e1822d79adab6ffcc8fd9e4b58359fe8dfb185ef49811c9` | 12618796032 | `ad20b3d3a9a7254e7a9c596fc97b411a` |
 | mq3-pro | `…/qwen3.8-27b.mq3v2.pro.hfq` | `394c50966bf4f68172df8eb34cd7ded8f9d0576c9ef24ea6ba639a88c184f795` | 13184433152 | `b171dd618eecf1fe6aed2c1dc5eef4dc` |
 | mq4-xt | `…/qwen3.8-27b.mq4v2.xt.hfq` | `9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7` | 14980361216 | `e45d15bfe0c9a87132697101d17cbed6` |

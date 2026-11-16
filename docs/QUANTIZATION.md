@@ -108,6 +108,22 @@ file size and SHA-256, never by file name; the size and digest pins are data in
 - **Dense XTS** is the symmetric MQ4V2 XT body (qt 44) of the H2 checkpoint. The
   file `qwen3.8-27b.mq4-xt` has exactly the same size, so only the digest tells
   them apart.
+- **Dense MQ3 XTS** (`pin:model/qwen3.8-27b.mq3-xts`, tag `qwen3.8:27b-mq3-xts`) is the
+  symmetric MQ3V2 XT body (qt 49, `mq3v2.symmetric`, zero = -4 x scale), a new tier
+  beside `qwen3.8:27b-mq3-xt`. Recipe: MQ3V2 final-code import of 496 tensors from
+  `b1x.template.hfq` on the v5 GPTQ Hessian (`qwen3.8-27b.v5-gptq.calib.hfq`), built
+  2026-10-29. Teacher KLD (24 chunks, `eval_hipfire --scoring-mode prefill`, WT2 /
+  code24): gfx1100 A4 (q8/q8 KV) 0.1745 / 0.1132, gfx1100 F16 route
+  (`HIPFIRE_MQ3V25_A4=0`) 0.1514 / 0.1000, gfx1201 A4 (`--kv-mode fp8 --kv-v q8`)
+  0.1767 / 0.1225, against 0.2483 / 0.1927 for the published mq3-xt (paired about
+  -0.07 on both corpora). Disposition: gfx1201 runs the A4 (W3A4) prefill by
+  default; gfx1100 runs it by default once the companion route change lands
+  (prompts under 128 tokens prefill about 5-7% slower than the F16 route there,
+  because the A4 GEMMs engage from 128 rows); gfx1151 keeps the F16 route
+  (disclosed: no A4 prefill there). Speed vs mq3-xt: R9700 pp4096 5.8x, decode
+  +2.6%; 7900 XTX pp4096 4.13x, decode -8.6% (52.6 vs 57.5 tok/s); Strix Halo
+  prefill equal, decode +0.7%. Receipts:
+  `/home/kaden/qcal/release-0.5.0/charter/next-lever/`.
 - **Flash-Next XTS** per its pin: trunk and language head MQ6G256V2 (qt 47), routed
   experts MQ4G256V2 (qt 44, gate/up) + MQ4G128V2 (qt 53, down), Q8F16 (qt 3)
   embedding, MTP attention and PLE n-gram rows, with the raw-I64 metadata

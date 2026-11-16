@@ -93,6 +93,7 @@ The `qwen3.6:35b-a3b*` entries and both `ornith-1.5:35b-a3b*` entries carry an `
 | Tag | File | Size GB | Min VRAM | Default KV | Notes |
 |---|---|---:|---:|---|---|
 | `qwen3.8:27b-mq3-xt` | `qwen3.8-27b.mq3-xt` | 11.78 | 13 | q8 | MQ3V2 XT |
+| `qwen3.8:27b-mq3-xts` | `qwen3.8-27b.mq3-xts` | 11.78 | 13 | q8 | MQ3V2 XT, symmetric (qt49 `mq3v2.symmetric`); W3A4 prefill on gfx1201/gfx1100, F16 on gfx1151; paired KLD about -0.07 vs `qwen3.8:27b-mq3-xt` |
 | `qwen3.8:27b-mq3` | `qwen3.8-27b.mq3` | 12.62 | 14 | q8 | MQ3V2 base |
 | `qwen3.8:27b-mq3-pro` | `qwen3.8-27b.mq3-pro` | 13.18 | 15 | q8 | MQ3V2 Pro |
 | `qwen3.8:27b-mq4-xt` | `qwen3.8-27b.mq4-xt` | 14.99 | 16 | q8 | MQ4V2 XT (speed; supersedes legacy `.mq4r`) |
