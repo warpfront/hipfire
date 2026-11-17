@@ -4842,30 +4842,23 @@ mod spec_floor_driver_tests {
         let action = run.plan(&mut df, 15);
         assert_eq!(
             action,
-            Action::ArSynced,
-            "no load price: the floor calibrates"
+            Action::Native(15),
+            "no load price: no AR token runs for a price"
         );
-        run.window_done(action, 1, 0, 100, 101, true, &[7]);
-        run.mark(&mut df, t0 + Duration::from_millis(20));
-        let action = run.plan(&mut df, 15);
-        run.window_done(action, 1, 0, 101, 102, true, &[8]);
+        run.window_done(action, 12, 16, 100, 112, true, &[7; 12]);
         run.mark(&mut df, t0 + Duration::from_millis(40));
-        assert!(df.floor.calibrated());
-        assert_eq!(df.floor.ar_us(), 20_000.0);
         // A window that committed 12 tokens of which a strict-prefix repair
         // kept 5: the observation settles 5, never the full tail.
         let action = run.plan(&mut df, 15);
         assert_eq!(action, Action::Native(15));
-        run.window_done(action, 5, 16, 102, 107, false, &[1, 2, 3, 4, 5]);
+        run.window_done(action, 5, 16, 112, 117, false, &[1, 2, 3, 4, 5]);
         run.mark(&mut df, t0 + Duration::from_millis(120));
-        assert_eq!(observed_settled(), ["1", "1", "5"]);
-        assert_eq!(run.observed_windows, 3);
+        assert_eq!(observed_settled(), ["12", "5"]);
+        assert_eq!(run.observed_windows, 2);
         assert!((run.observed_wall_us - 120_000.0).abs() < 1.0);
-        // Only the AR token that followed an AR token is an AR price sample;
-        // the repaired window is not a window sample.
-        assert_eq!(df.prices.ar_price(100), Some(20_000.0));
-        assert_eq!(df.prices.window_price(16, 102), None);
-        assert_eq!(run.probe_tokens, 2);
+        assert!(!df.floor.calibrated());
+        assert_eq!(df.prices.ar_price(100), None);
+        assert_eq!(run.probe_tokens, 0);
     }
 
     #[test]
