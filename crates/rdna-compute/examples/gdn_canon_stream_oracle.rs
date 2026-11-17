@@ -2657,7 +2657,7 @@ fn ft_entry(
     gpu.mq4v2_symmetric = true;
     if !gpu.iu4_gdn_fold_active(FT_DIMS, FT_K) {
         return refuse(
-            "Gpu::iu4_gdn_fold_active is false (HIPFIRE_GDN_PREP_FUSED=0, IU4/symfold/B1_CONTROL flags, or not the certified _b1 bundle)"
+            "Gpu::iu4_gdn_fold_active is false (IU4/B1_CONTROL flags, or not the certified _b1 bundle)"
                 .into(),
         );
     }
