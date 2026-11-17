@@ -651,7 +651,7 @@ name = "test_serve_concurrent"
 required-features = ["lab"]
 
 [[example]]
-name = "test_slots_vmm_oracle"
+name = "test_slots_slab_oracle"
 required-features = ["lab"]
 
 [[example]]

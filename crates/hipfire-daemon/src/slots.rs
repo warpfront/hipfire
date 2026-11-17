@@ -2457,14 +2457,13 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
             // Arena route: the fixed `SlotPool` slabs.
             Ok(KvBackend::Legacy) => {}
             // VMM on this engine is the shared q8 page pool
-            // (`serve.multi_slot_paged_backend=vmm`), not a per-slot owner.
-            // That pool has no fp8 kernels.
+            // (`serve.multi_slot_paged_backend=vmm`). That pool has no fp8
+            // kernels.
             Ok(KvBackend::Vmm) => {
                 // `memory.kv_backend=vmm` is not an opt-in to the shared
                 // experimental pool. Require the explicit request that
-                // selects it, so an operator who authored `kv_backend=vmm`
-                // for a per-slot route is refused by name instead of being
-                // moved onto a different, experimental cache.
+                // selects it, so a bare `kv_backend=vmm` is refused by name
+                // instead of being moved onto the experimental cache.
                 if params
                     .and_then(|p| p.get("multi_slot_paged"))
                     .and_then(|v| v.as_bool())

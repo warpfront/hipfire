@@ -269,8 +269,8 @@ pub struct EngineStats {
     pub swap_disk_used: u64,
     pub swap_host_budget: u64,
     pub swap_disk_budget: u64,
-    /// Mapped VMM KV bytes at the last completed step (`kv_backend=vmm`
-    /// only; 0 on the arena route). The VMM analogue of `pool_free_pages`:
+    /// Mapped VMM KV bytes at the last completed step (VMM-backed shared
+    /// pool only, `serve.multi_slot_paged_backend=vmm`; 0 on the arena route). The VMM analogue of `pool_free_pages`:
     /// it must plateau across identical request cycles, not climb.
     pub mapped_kv_bytes: usize,
     /// Decode-graph captures and replays performed by the active KV storage
@@ -391,10 +391,10 @@ pub struct SlotEngineConfig {
     /// Raw KV-mode string from the load request (empty = resolve from
     /// env/config in the engine).
     pub kv_mode_raw: String,
-    /// Effective KV backend (`legacy`/`vmm`). `legacy` is the arena route;
-    /// `vmm` is per-slot VMM reservations (q8/fp8 KV, no prefix cache, MTP
-    /// yes / DFlash deferred, vision via the sequential VL path). The engine
-    /// re-checks every gate at load.
+    /// Effective KV backend (`legacy`/`vmm`). `legacy` is the slab or
+    /// arena-paged route; `vmm` alone is refused on the multi-slot engine (its
+    /// VMM cache is the shared pool, `multi_slot_paged_backend=vmm`). The
+    /// engine re-checks every gate at load.
     pub kv_backend: String,
     /// Multi-slot shared paged KV pool (`PagePool`) instead of fixed slabs.
     pub multi_slot_paged: bool,

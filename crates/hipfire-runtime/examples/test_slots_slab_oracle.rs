@@ -2,37 +2,26 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Multi-slot KV-storage oracle: `kv_backend=legacy` (arena) vs
-//! `kv_backend=vmm` (per-slot VMM reservations), on one GPU, in one process.
+//! Multi-slot slab-route oracle: composition determinism on the fixed
+//! per-slot slab (`kv_backend=legacy`, no shared page pool), on one GPU.
 //!
-//! Asserts the properties the VMM route is allowed to claim
-//! (`docs/plans/2026-10-22-vmm-kv-multislot-engine.md` §5, §11):
+//! * **Composition determinism (I9)**: repeating a run with the same batch
+//!   composition reproduces every id.
+//! * **Graph coverage**: with `HIPFIRE_SLOTS_DECODE_GRAPH=1`, the route must
+//!   have replayed a captured decode graph (`graph_replays > 0`).
 //!
-//! * **Isolation (I9)** — on the VMM route a request's FIRST generated token
-//!   comes from its own prefill, whose arithmetic is composition-independent
-//!   (per-slot singleton prefill). A concurrent lane must therefore emit the
-//!   same first token as that prompt run alone. Cross-slot KV contamination
-//!   (a row addressing the wrong owner) changes it immediately.
-//! * **Composition determinism (I9)** — repeating a run with the same batch
-//!   composition reproduces every id, on both storage routes.
-//! * **Graph coverage** — with `HIPFIRE_SLOTS_DECODE_GRAPH=1`, the VMM route
-//!   must have replayed a captured decode graph (`graph_replays > 0`).
-//!
-//! It deliberately does **not** assert lane-for-lane or cross-route equality:
-//! projection/attention arithmetic is row-count dependent on both routes, and
-//! a lane's row count changes as other lanes join or leave. The arena route
-//! demonstrates this even between two identical concurrent prompts (one may
-//! prefill in a mixed step, the other alone through the single-slot path), so
-//! the cross-route match is printed for information, not asserted.
+//! It deliberately does **not** assert lane-for-lane equality between serial
+//! and concurrent runs: projection/attention arithmetic is row-count
+//! dependent, and a lane's row count changes as other lanes join or leave.
 //!
 //! # Run
 //!
 //! ```text
-//! cargo run --release -p hipfire-runtime --features lab --example test_slots_vmm_oracle \
+//! cargo run --release -p hipfire-runtime --features lab --example test_slots_slab_oracle \
 //!   -- ~/models/hipfire/Qwen/Qwen3.5-4B-MQ4/qwen3.5-4b.mq4
 //! # graph arm
 //! HIPFIRE_SLOTS_DECODE_GRAPH=1 cargo run --release -p hipfire-runtime --features lab \
-//!   --example test_slots_vmm_oracle -- <model>
+//!   --example test_slots_slab_oracle -- <model>
 //! ```
 
 #[cfg(not(feature = "deltanet"))]
@@ -66,20 +55,15 @@ fn main() {
     }
 
     /// One engine: serial runs, then two identical bursts (one submission per
-    /// slot, all at once), then a consuming shutdown so the next route can load.
-    fn run_engine(
-        model_path: &str,
-        backend: &str,
-        prompts: &[Vec<u32>],
-        draft: Option<&Path>,
-    ) -> Run {
+    /// slot, all at once), then a consuming shutdown.
+    fn run_engine(model_path: &str, prompts: &[Vec<u32>], draft: Option<&Path>) -> Run {
         let engine = SlotEngine::spawn(EngineConfig {
             model_path: PathBuf::from(model_path),
             n_slots: prompts.len().max(N_SLOTS),
             cap_tokens: CAP_TOKENS,
             prefill_chunk: 512,
             host_budget_bytes: 4 * 1024 * 1024 * 1024,
-            swap_dir: std::env::temp_dir().join("hipfire-vmm-oracle-swap"),
+            swap_dir: std::env::temp_dir().join("hipfire-slab-oracle-swap"),
             swap_disk_bytes: 1 << 30,
             is_vl: false,
             vl_path: None,
@@ -87,9 +71,8 @@ fn main() {
             mtp_k: 0,
             mtp_mode: hipfire_config::MtpMode::Off,
             kv_mode_raw: "q8".to_string(),
-            kv_backend: backend.to_string(),
-            // Per-slot storage on both arms: this oracle compares the legacy
-            // arena with per-slot VMM reservations, not the shared paged pool.
+            kv_backend: "legacy".to_string(),
+            // The fixed per-slot slab, not the shared paged pool.
             multi_slot_paged: false,
             multi_slot_paged_pages: 0,
             multi_slot_paged_backend: "arena".to_string(),
@@ -104,7 +87,7 @@ fn main() {
             dflash_draft: draft.map(Path::to_path_buf),
             dflash_required: draft.is_some(),
         })
-        .unwrap_or_else(|e| panic!("SlotEngine::spawn({backend}): {e}"));
+        .unwrap_or_else(|e| panic!("SlotEngine::spawn: {e}"));
 
         let serial: Vec<Vec<u32>> = prompts.iter().map(|p| ask(&engine, p)).collect();
         let serial_repeat: Vec<Vec<u32>> = prompts.iter().map(|p| ask(&engine, p)).collect();
@@ -113,7 +96,7 @@ fn main() {
         let stats = engine.stats();
         engine
             .shutdown_engine()
-            .unwrap_or_else(|e| panic!("shutdown({backend}): {e}"));
+            .unwrap_or_else(|e| panic!("shutdown: {e}"));
         Run {
             serial,
             serial_repeat,
@@ -207,10 +190,10 @@ fn main() {
 
     let model_path = std::env::args()
         .nth(1)
-        .or_else(|| std::env::var("HIPFIRE_SLOTS_VMM_MODEL").ok());
+        .or_else(|| std::env::var("HIPFIRE_SLOTS_ORACLE_MODEL").ok());
     let Some(model_path) = model_path else {
         eprintln!(
-            "skip: pass a model path or set HIPFIRE_SLOTS_VMM_MODEL \
+            "skip: pass a model path or set HIPFIRE_SLOTS_ORACLE_MODEL \
              (e.g. ~/models/hipfire/Qwen/Qwen3.5-4B-MQ4/qwen3.5-4b.mq4)"
         );
         return;
@@ -219,71 +202,44 @@ fn main() {
     if let Some(d) = &draft {
         println!("draft: {}", d.display());
     }
-    println!("=== test_slots_vmm_oracle ===\nmodel: {model_path}");
+    println!("=== test_slots_slab_oracle ===\nmodel: {model_path}");
 
     let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     drop(hfq);
     let prompts: Vec<Vec<u32>> = PROMPTS.iter().map(|p| tokenizer.encode(p)).collect();
 
-    // One engine at a time: each spawn loads its own weights, and the
-    // consuming shutdown releases VRAM (and invalidates caches) before the
-    // next route loads.
-    let arena = run_engine(&model_path, "legacy", &prompts, draft.as_deref());
-    let vmm = run_engine(&model_path, "vmm", &prompts, draft.as_deref());
+    let slab = run_engine(&model_path, &prompts, draft.as_deref());
 
     // Composition determinism: the same serial run and the same burst
-    // reproduce every id on both storage routes.
-    for (name, run) in [("arena", &arena), ("vmm", &vmm)] {
-        assert_eq!(
-            run.serial, run.serial_repeat,
-            "{name}: repeating a serial run changed its ids"
-        );
-        assert_eq!(
-            run.burst, run.burst_repeat,
-            "{name}: repeating the same batch composition changed its ids"
-        );
-    }
-    // Isolation: a VMM lane's first token comes from its own singleton
-    // prefill, so concurrency must not change it.
-    for (i, _prompt) in prompts.iter().enumerate() {
-        assert_eq!(
-            vmm.burst[i][0], vmm.serial[i][0],
-            "vmm: prompt {i} first token changed under concurrency — a lane's \
-             prefill saw another lane's KV"
-        );
-    }
-    // Informational: how often the two storage routes agree lane-for-lane at
-    // the same burst. Differing is allowed (row-count-dependent arithmetic).
-    let cross: Vec<bool> = (0..prompts.len())
-        .map(|i| vmm.burst[i] == arena.burst[i])
-        .collect();
+    // reproduce every id.
+    assert_eq!(
+        slab.serial, slab.serial_repeat,
+        "repeating a serial run changed its ids"
+    );
+    assert_eq!(
+        slab.burst, slab.burst_repeat,
+        "repeating the same batch composition changed its ids"
+    );
 
     // Graph coverage: the flag is read once per process when the Gpu starts.
     if std::env::var("HIPFIRE_SLOTS_DECODE_GRAPH").as_deref() == Ok("1") {
         assert!(
-            vmm.stats.graph_replays > 0,
-            "HIPFIRE_SLOTS_DECODE_GRAPH=1 but the VMM route replayed no graph \
+            slab.stats.graph_replays > 0,
+            "HIPFIRE_SLOTS_DECODE_GRAPH=1 but the slab route replayed no graph \
              (captures {}, replays {})",
-            vmm.stats.graph_captures,
-            vmm.stats.graph_replays
-        );
-        assert!(
-            arena.stats.graph_replays > 0,
-            "HIPFIRE_SLOTS_DECODE_GRAPH=1 but the arena route replayed no graph"
+            slab.stats.graph_captures,
+            slab.stats.graph_replays
         );
     }
 
     // Optional JSON dump so two runs (graph off/on) can be diffed externally.
     if let Ok(path) = std::env::var("HIPFIRE_SLOTS_ORACLE_DUMP") {
         let dump = serde_json::json!({
-            "arena": { "serial": arena.serial, "burst": arena.burst },
-            "vmm": { "serial": vmm.serial, "burst": vmm.burst },
+            "slab": { "serial": slab.serial, "burst": slab.burst },
             "graph": {
-                "arena_captures": arena.stats.graph_captures,
-                "arena_replays": arena.stats.graph_replays,
-                "vmm_captures": vmm.stats.graph_captures,
-                "vmm_replays": vmm.stats.graph_replays,
+                "captures": slab.stats.graph_captures,
+                "replays": slab.stats.graph_replays,
             },
         });
         std::fs::write(&path, serde_json::to_vec(&dump).expect("serialize dump"))
@@ -291,12 +247,8 @@ fn main() {
         println!("dumped ids to {path}");
     }
     println!(
-        "arena: captures={} replays={} | vmm: captures={} replays={}",
-        arena.stats.graph_captures,
-        arena.stats.graph_replays,
-        vmm.stats.graph_captures,
-        vmm.stats.graph_replays
+        "slab: captures={} replays={}",
+        slab.stats.graph_captures, slab.stats.graph_replays
     );
-    println!("vmm/arena burst lane match (informational): {cross:?}");
-    println!("PASS: vmm first-token isolation + composition determinism on both routes");
+    println!("PASS: composition determinism on the slab route");
 }
