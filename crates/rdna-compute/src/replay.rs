@@ -2357,9 +2357,10 @@ fn encode_bound_kernarg(
 
 /// Fail-closed byte-equality gate for slice 1: the re-encoded segment must
 /// equal the recorded snapshot (after a survived relocation, everywhere
-/// except the moved pointer slots — checked by the refresh path with its own
-/// slot mask). `debug_assert` covers debug builds; `HIPFIRE_REPLAY_BINDINGS_VERIFY=1`
-/// promotes the check to a hard error in release for the harness.
+/// except the moved pointer slots — the relocation and refresh paths gate
+/// those with `verify_non_slot_bytes_identical`). `debug_assert` covers debug
+/// builds; `HIPFIRE_REPLAY_BINDINGS_VERIFY=1` promotes the check to a hard
+/// error in release for the harness.
 fn verify_bound_kernarg(kernel: &str, snapshot: &[u8], encoded: &[u8]) -> Result<(), String> {
     let mismatch = bound_kernarg_mismatch_message(kernel, snapshot, encoded);
     debug_assert!(
@@ -2735,7 +2736,7 @@ fn verify_non_slot_bytes_identical(
 ) -> Result<(), String> {
     if current.len() != expected.len() {
         return Err(format!(
-            "{kernel}: relocated kernarg length {} differs from the prepared segment prefix {}",
+            "{kernel}: re-encoded kernarg length {} differs from the prepared segment prefix {}",
             expected.len(),
             current.len()
         ));
@@ -2752,7 +2753,7 @@ fn verify_non_slot_bytes_identical(
     };
     let failure = |offset: usize| {
         format!(
-            "{kernel}: relocated kernarg differs from the prepared segment at non-slot offset \
+            "{kernel}: re-encoded kernarg differs from the prepared segment at non-slot offset \
              {offset}"
         )
     };
@@ -2774,10 +2775,43 @@ fn verify_non_slot_bytes_identical(
     Ok(())
 }
 
+/// Re-encode one prepared PM4 segment after scratch growth: pointer slots
+/// take the current bindings, the rest comes from the recorded `snapshot`.
+/// Fails closed, leaving `prepared` untouched, when any byte of the explicit
+/// prefix outside `exempt` (pointer slots and declared dynamic words, which
+/// replay patches each launch) differs from the live `prepared` segment.
+fn refresh_prepared_segment(
+    kernel: &str,
+    prepared: &mut [u8],
+    snapshot: &[u8],
+    layout: &LaunchBindingLayout,
+    bindings: &ReplayBindings,
+    explicit_len: usize,
+    exempt: &[(usize, usize)],
+) -> Result<(), String> {
+    let encoded = encode_bound_kernarg(snapshot, layout, bindings, kernel)?;
+    if explicit_len > encoded.len() || explicit_len > prepared.len() {
+        return Err(format!(
+            "{kernel}: explicit prefix {explicit_len} exceeds segment ({} vs {})",
+            encoded.len(),
+            prepared.len()
+        ));
+    }
+    verify_non_slot_bytes_identical(
+        kernel,
+        &prepared[..explicit_len],
+        &encoded[..explicit_len],
+        exempt,
+    )?;
+    prepared[..explicit_len].copy_from_slice(&encoded[..explicit_len]);
+    Ok(())
+}
+
 /// Per prepared dispatch, the sorted `(offset, len)` kernarg ranges a
-/// relocation must not hold to snapshot equality: typed pointer slots (8
-/// bytes), declared/synthesized/GDN u32 dynamic bindings (4 bytes), and the
-/// legacy GDN frame word at 76. Computed once when the PM4 tape is prepared.
+/// relocation or post-growth refresh must not hold to snapshot equality:
+/// typed pointer slots (8 bytes), declared/synthesized/GDN u32 dynamic
+/// bindings (4 bytes), and the legacy GDN frame word at 76. Computed once
+/// when the PM4 tape is prepared.
 fn bound_exempt_kernarg_ranges(
     launches: &[RecordedHipLaunch],
     prefix: usize,
@@ -5376,8 +5410,9 @@ pub struct PreparedPm4Replay {
     /// and the replay hot path does no re-encode work.
     bound_explicit_lens: Vec<usize>,
     /// Per prepared dispatch (aligned with `kernargs`): sorted `(offset, len)`
-    /// ranges excluded from the relocation non-slot-bytes gate (pointer slots
-    /// and u32 dynamic bindings). Precomputed once at prepare time.
+    /// ranges excluded from the relocation and post-growth refresh
+    /// non-slot-bytes gates (pointer slots and u32 dynamic bindings).
+    /// Precomputed once at prepare time.
     bound_exempt_ranges: Vec<Vec<(usize, usize)>>,
     encoded_revision: BindingRevision,
     /// Replay counters of the dispatch ledger (`HIPFIRE_REDLINE_LEDGER`);
@@ -8188,65 +8223,41 @@ impl ReplayController {
             }
         }
         self.binding_revision = next_revision;
-        // Re-encode every prepared typed segment in place. Non-slot bytes
-        // must match the pre-refresh buffer exactly; slot bytes take the new
-        // bases. `bound_explicit_lens` are the loader explicit-prefix lengths
-        // captured at prepare time.
+        // Re-encode every prepared typed segment in place. Slot bytes take the
+        // new bases; the declared dynamic words (patched at every replay) are
+        // exempt; every other byte must match the live segment exactly.
+        // `bound_explicit_lens` are the loader explicit-prefix lengths and
+        // `bound_exempt_ranges` the slot + dynamic-word ranges, both captured
+        // at prepare time.
         let mut reencoded = 0usize;
         let prepared = self
             .prepared_pm4
             .as_mut()
             .expect("prepared PM4 route checked above");
-        if prepared.bound_explicit_lens.len() != prepared.kernargs.len() {
+        if prepared.bound_explicit_lens.len() != prepared.kernargs.len()
+            || prepared.bound_exempt_ranges.len() != prepared.kernargs.len()
+        {
             return Err(
                 "retained PM4 binding cache disagrees with prepared kernarg count".to_owned(),
             );
         }
         for (index, kernarg) in prepared.kernargs.iter_mut().enumerate() {
-            let explicit_len = prepared.bound_explicit_lens[index];
             let launch = self.recorded.get(index).ok_or_else(|| {
                 format!("retained PM4 dispatch {index} outruns the recorded tape")
             })?;
             let Some(layout) = launch.binding_layout.as_ref() else {
                 continue;
             };
-            let encoded = encode_bound_kernarg(
+            refresh_prepared_segment(
+                &launch.kernel,
+                kernarg.as_mut_bytes(),
                 &launch.kernarg,
                 layout,
                 &self.replay_bindings,
-                &launch.kernel,
-            )?;
-            let bytes = kernarg.as_mut_bytes();
-            if explicit_len > encoded.len() || explicit_len > bytes.len() {
-                return Err(format!(
-                    "{}: explicit prefix {explicit_len} exceeds segment ({} vs {})",
-                    launch.kernel,
-                    encoded.len(),
-                    bytes.len()
-                ));
-            }
-            let mut slot_mask = vec![false; explicit_len];
-            for slot in &layout.slots {
-                for offset in slot.offset..slot.offset.saturating_add(8) {
-                    if offset < explicit_len {
-                        slot_mask[offset] = true;
-                    }
-                }
-            }
-            for (offset, (old, new)) in bytes[..explicit_len]
-                .iter()
-                .zip(encoded[..explicit_len].iter())
-                .enumerate()
-            {
-                if *old != *new && !slot_mask[offset] {
-                    return Err(format!(
-                        "{}: re-encoded kernarg differs from the prepared segment \
-                         at non-slot offset {offset} after scratch growth",
-                        launch.kernel
-                    ));
-                }
-            }
-            bytes[..explicit_len].copy_from_slice(&encoded[..explicit_len]);
+                prepared.bound_explicit_lens[index],
+                &prepared.bound_exempt_ranges[index],
+            )
+            .map_err(|reason| format!("{reason} after scratch growth"))?;
             reencoded += 1;
         }
         prepared.encoded_revision = next_revision;
@@ -13745,5 +13756,115 @@ mod tests {
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0], vec![(0, 8), (12, 4), (16, 8), (76, 4)]);
         assert_eq!(ranges[1], vec![(4, 4)]);
+    }
+
+    /// Post-growth refresh of a segment that replay already patched: one
+    /// pointer slot (0..8), one declared dynamic word (8..12) and one static
+    /// word (12..16). Only the slot and the dynamic word may differ from the
+    /// re-encoded snapshot; a changed static word fails closed.
+    #[test]
+    fn growth_refresh_exempts_slots_and_declared_dynamic_words_only() {
+        let base: u64 = 0x7f00_0001_0000;
+        let moved: u64 = 0x7f00_0009_0000;
+        let mut snapshot = vec![0u8; 16];
+        snapshot[0..8].copy_from_slice(&(base + 0x40).to_ne_bytes());
+        snapshot[8..12].copy_from_slice(&5u32.to_ne_bytes());
+        snapshot[12..16].copy_from_slice(&0x0000_0042u32.to_ne_bytes());
+        let mut issuer = Recorder::new();
+        let resource = issuer
+            .resource("refresh-fixture", 0x1_0000)
+            .expect("valid resource");
+        let mut bindings = ReplayBindings::new();
+        // SAFETY: synthetic non-deref'd address used only as binding identity
+        // in unit tests; never launched.
+        unsafe {
+            bindings.bind_resource(
+                resource,
+                ResourceBinding::new(
+                    base as usize as *mut std::ffi::c_void,
+                    0x1_0000,
+                    BindingRevision(0),
+                    AllocationPolicy::HipCoarse,
+                )
+                .expect("valid binding"),
+            );
+        }
+        let layout = LaunchBindingLayout {
+            abi: KernargAbi::new(16, 16, [KernargField::new(0, 8, 8).expect("valid field")])
+                .expect("valid ABI"),
+            slots: vec![KernargPointerSlot {
+                offset: 0,
+                resource,
+                interior_offset: 0x40,
+            }],
+        };
+        let mut launch = test_launch("refresh_fixture");
+        launch.kernarg = snapshot.clone();
+        launch.binding_layout = Some(layout);
+        let dynamic = [(
+            0usize,
+            ReplayKernargBinding::PositionPlusU32 {
+                offset: 8,
+                addend: 0,
+            },
+        )];
+        let exempt =
+            bound_exempt_kernarg_ranges(std::slice::from_ref(&launch), 1, &dynamic, &[]).remove(0);
+        assert_eq!(exempt, vec![(0, 8), (8, 4)]);
+        let layout = launch.binding_layout.as_ref().expect("typed");
+
+        // Replay patches the dynamic word in the prepared segment.
+        let mut prepared = snapshot.clone();
+        apply_kernarg_bindings_for_dispatch(&mut prepared, 0, 37, &dynamic).expect("patch");
+        assert_eq!(prepared[8..12], 37u32.to_ne_bytes());
+
+        // Scratch growth: the resource is rebound (grown, new base) at revision 1.
+        // SAFETY: as above.
+        unsafe {
+            bindings.bind_resource(
+                resource,
+                ResourceBinding::new(
+                    moved as usize as *mut std::ffi::c_void,
+                    0x2_0000,
+                    BindingRevision(1),
+                    AllocationPolicy::HipCoarse,
+                )
+                .expect("valid binding"),
+            );
+        }
+
+        // A static-word difference fails closed and leaves the segment as is.
+        let mut drifted = prepared.clone();
+        drifted[13] ^= 0xff;
+        let before = drifted.clone();
+        let error = refresh_prepared_segment(
+            "refresh_fixture",
+            &mut drifted,
+            &launch.kernarg,
+            layout,
+            &bindings,
+            16,
+            &exempt,
+        )
+        .expect_err("static word changed");
+        assert!(error.contains("non-slot offset 13"), "{error}");
+        assert_eq!(drifted, before);
+
+        // Only the slot and the dynamic word differ: the refresh succeeds and
+        // takes the new base; the next replay re-patches the dynamic word.
+        refresh_prepared_segment(
+            "refresh_fixture",
+            &mut prepared,
+            &launch.kernarg,
+            layout,
+            &bindings,
+            16,
+            &exempt,
+        )
+        .expect("slot and dynamic word only");
+        assert_eq!(prepared[0..8], (moved + 0x40).to_ne_bytes());
+        assert_eq!(prepared[12..16], 0x0000_0042u32.to_ne_bytes());
+        apply_kernarg_bindings_for_dispatch(&mut prepared, 0, 38, &dynamic).expect("patch");
+        assert_eq!(prepared[8..12], 38u32.to_ne_bytes());
     }
 }
