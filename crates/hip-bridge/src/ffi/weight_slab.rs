@@ -28,6 +28,22 @@
 //! tensors read as zeros exactly like the unwritten tail of a fresh
 //! allocation, and a kernel's masked over-read of a tensor's tail is
 //! deterministic.
+//!
+//! Reservation. A fixed slab capacity cannot keep the unused remainder small
+//! for every upload order: replaying the qwen3.8-27B load order (best fit over
+//! [`MAX_OPEN_SLABS`] slabs, 16-45 MiB projections) wasted from tens of MiB to
+//! over 2 GiB depending on the capacity, because the remainder of a slab that
+//! cannot take the next projection is lost. A loader that knows what a unit
+//! (one layer) uploads calls [`HipRuntime::slab_reserve`] first: it opens a
+//! slab of exactly that many bytes (2 MiB-rounded once), and while a
+//! reservation is in force an upload that fits no open slab is allocated
+//! directly instead of opening a mode-capacity slab.
+//!
+//! Packed allocations. [`HipRuntime::alloc_packed`] hands out several buffers
+//! carved from ONE fresh `hipMalloc` (per-layer GDN state, a DeltaNet
+//! snapshot), so the 2 MiB rounding is paid once. The slab is born sealed and
+//! its views are ordinary `SlabView` buffers: handles may be exchanged between
+//! owners, and the allocation is freed when the last view is freed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -66,20 +82,23 @@ pub enum SlabMode {
     Up2M,
     /// Tensors of at most 16 MiB are packed.
     Up16M,
+    /// Tensors of at most 64 MiB are packed.
+    Up64M,
 }
 
 /// Mode when `HIPFIRE_WEIGHT_SLAB` is unset.
 pub const DEFAULT_SLAB_MODE: SlabMode = SlabMode::Up2M;
 
 impl SlabMode {
-    /// Parse `off|2m|16m` (case-insensitive; `0`/`none` mean off).
+    /// Parse `off|2m|16m|64m` (case-insensitive; `0`/`none` mean off).
     pub fn parse(text: &str) -> Result<SlabMode, String> {
         match text.trim().to_ascii_lowercase().as_str() {
             "off" | "0" | "none" | "false" => Ok(SlabMode::Off),
             "2m" | "2mib" => Ok(SlabMode::Up2M),
             "16m" | "16mib" => Ok(SlabMode::Up16M),
+            "64m" | "64mib" => Ok(SlabMode::Up64M),
             other => Err(format!(
-                "HIPFIRE_WEIGHT_SLAB={other:?} is not one of off|2m|16m"
+                "HIPFIRE_WEIGHT_SLAB={other:?} is not one of off|2m|16m|64m"
             )),
         }
     }
@@ -89,6 +108,7 @@ impl SlabMode {
             SlabMode::Off => "off",
             SlabMode::Up2M => "2m",
             SlabMode::Up16M => "16m",
+            SlabMode::Up64M => "64m",
         }
     }
 
@@ -98,16 +118,23 @@ impl SlabMode {
             SlabMode::Off => 0,
             SlabMode::Up2M => 2 << 20,
             SlabMode::Up16M => 16 << 20,
+            SlabMode::Up64M => 64 << 20,
         }
     }
 
-    /// Capacity of a fresh slab (a multiple of [`ALLOC_GRANULE`], at least the
-    /// largest tensor the mode packs).
+    /// Capacity of a fresh slab that no reservation sized (a multiple of
+    /// [`ALLOC_GRANULE`], at least the largest tensor the mode packs). `64m`
+    /// uses four times its largest tensor: an unreserved load (MoE layers, the
+    /// non-qwen35 loaders) loses at most one open ring's remainder, and a
+    /// 45 MiB projection never strands a quarter of a slab. The qwen35 dense
+    /// loader reserves each layer's exact bytes instead of relying on this
+    /// figure (see the module docs).
     pub fn slab_bytes(self) -> usize {
         match self {
             SlabMode::Off => 0,
             SlabMode::Up2M => 32 << 20,
             SlabMode::Up16M => 64 << 20,
+            SlabMode::Up64M => 256 << 20,
         }
     }
 
@@ -226,6 +253,32 @@ fn align_up(value: usize) -> usize {
     (value + SLAB_ALIGN - 1) & !(SLAB_ALIGN - 1)
 }
 
+/// Where [`packed_layout`] puts each buffer of one packed allocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackedLayout {
+    /// Byte offset of each requested buffer (a zero-size request shares its
+    /// neighbour's offset and occupies nothing).
+    pub offsets: Vec<usize>,
+    /// Bytes of the allocation before ROCr's own 2 MiB rounding.
+    pub total: usize,
+}
+
+/// Back-to-back layout of `sizes`, each buffer starting on a [`SLAB_ALIGN`]
+/// boundary (the page granule a plain `hipMalloc` already returns, which
+/// satisfies every vector load the state kernels issue). Host-only.
+pub fn packed_layout(sizes: &[usize]) -> PackedLayout {
+    let mut offsets = Vec::with_capacity(sizes.len());
+    let mut cursor = 0usize;
+    for &size in sizes {
+        offsets.push(cursor);
+        cursor += align_up(size);
+    }
+    PackedLayout {
+        offsets,
+        total: cursor,
+    }
+}
+
 impl SlabBook {
     /// Best fit of `size` into the open slabs: a freed hole first (smallest
     /// that holds it), else the slab left with the least free space (oldest on
@@ -299,6 +352,25 @@ impl SlabBook {
             dead.extend(self.seal_one(oldest));
         }
         dead
+    }
+
+    /// Register a freshly allocated slab that holds `views` live views from
+    /// the start and is sealed: it never takes another placement, never
+    /// reuses a freed range, and is dead when the last view is released. Not
+    /// part of the scope counters (it is not a weight upload).
+    pub(crate) fn adopt_sealed(&mut self, base: usize, size: usize, views: usize) {
+        self.slabs.insert(
+            base,
+            SlabRec {
+                size,
+                cursor: size,
+                hwm: size,
+                live: views,
+                sealed: true,
+                retired: views == 0,
+                holes: BTreeMap::new(),
+            },
+        );
     }
 
     fn seal_one(&mut self, base: usize) -> Option<usize> {
@@ -384,6 +456,9 @@ struct SlabInner {
     /// installs its config snapshot after the runtime is created).
     scope_mode: Option<SlabMode>,
     depth: u32,
+    /// A [`HipRuntime::slab_reserve`] is in force: an upload that fits no open
+    /// slab is allocated directly. Cleared when the outermost scope closes.
+    reserved: bool,
     /// Counters when the outermost scope opened.
     scope_start: SlabStats,
     book: SlabBook,
@@ -397,6 +472,7 @@ impl Default for WeightSlabs {
                 mode: None,
                 scope_mode: None,
                 depth: 0,
+                reserved: false,
                 scope_start: SlabStats::default(),
                 book: SlabBook::default(),
                 owners: HashMap::new(),
@@ -487,6 +563,9 @@ impl HipRuntime {
                 return None;
             }
             inner.depth -= 1;
+            if inner.depth == 0 {
+                inner.reserved = false;
+            }
             if inner.depth > 0 {
                 return None;
             }
@@ -505,6 +584,10 @@ impl HipRuntime {
         for base in dead {
             let _ = self.slab_free_base(base);
         }
+        // Slabs whose every view was released during the load (a rolled-back
+        // load frees its weights with the deferred release) have nothing left
+        // to wait for: return them now, not at the next pool drain.
+        self.slab_flush();
         (summary.tensors > 0).then_some(summary)
     }
 
@@ -527,6 +610,14 @@ impl HipRuntime {
                 }
             }
             return Ok(Some(v));
+        }
+        // Nothing open takes it. A reservation sized the open slabs to what the
+        // loader announced, so an upload beyond it (a tensor the loader did not
+        // count) is a plain allocation; and `64m` never opens a whole
+        // mode-capacity slab for a tensor whose own allocation costs at most
+        // its 4 KiB page (the first upload of a load is a 10 KiB norm).
+        if inner.reserved || (mode == SlabMode::Up64M && size <= SMALL_ALLOC_LIMIT) {
+            return Ok(None);
         }
         // New slab: the mode's capacity, falling back to the smallest slab
         // that holds this tensor when the device cannot spare the full size.
@@ -556,6 +647,105 @@ impl HipRuntime {
             let _ = self.slab_free_base(base);
         }
         Ok(Some(view(ptr, size)))
+    }
+
+    /// Open a fresh slab of exactly `bytes` (rounded up to [`ALLOC_GRANULE`])
+    /// for the uploads that follow, and keep later uploads that fit no open
+    /// slab out of mode-capacity slabs (see the module docs). A no-op outside
+    /// an active scope; when the device cannot spare the slab the load simply
+    /// continues unreserved.
+    pub fn slab_reserve(&self, bytes: usize) -> HipResult<()> {
+        let mut inner = self.slabs.lock();
+        let mode = inner.scope_mode.unwrap_or(SlabMode::Off);
+        if inner.depth == 0 || bytes == 0 || mode == SlabMode::Off {
+            return Ok(());
+        }
+        let cap = bytes.div_ceil(ALLOC_GRANULE) * ALLOC_GRANULE;
+        let Ok(buf) = self.malloc(cap) else {
+            return Ok(());
+        };
+        if let Err(error) = self.memset(&buf, 0, cap) {
+            let _ = self.free(buf);
+            return Err(error);
+        }
+        let base = buf.as_ptr() as usize;
+        inner.owners.insert(base, buf);
+        let dead = inner.book.open_slab(base, cap);
+        inner.reserved = true;
+        drop(inner);
+        for base in dead {
+            let _ = self.slab_free_base(base);
+        }
+        Ok(())
+    }
+
+    /// Allocate one buffer per entry of `sizes`, all carved from a single
+    /// fresh `hipMalloc` laid out by [`packed_layout`], so ROCr's 2 MiB
+    /// rounding is paid once for the group. `zero` clears the whole
+    /// allocation. Each buffer is a `SlabView`: free it with
+    /// [`HipRuntime::free`] (immediately returns the allocation when it was
+    /// the last) and never pool it. A zero-size entry is an empty borrowed
+    /// descriptor with nothing to free. Under railgun recording or a plan tape
+    /// allocations are paired one to one, so each entry is its own
+    /// `hipMalloc` there.
+    pub fn alloc_packed(&self, sizes: &[usize], zero: bool) -> HipResult<Vec<DeviceBuffer>> {
+        let layout = packed_layout(sizes);
+        if layout.total == 0 || crate::registry::enabled() || self.plan.active() {
+            return self.alloc_each(sizes, zero);
+        }
+        let owner = self.malloc(layout.total)?;
+        if zero {
+            if let Err(error) = self.memset(&owner, 0, layout.total) {
+                let _ = self.free(owner);
+                return Err(error);
+            }
+        }
+        let base = owner.as_ptr() as usize;
+        let views = sizes.iter().filter(|&&size| size > 0).count();
+        {
+            let mut inner = self.slabs.lock();
+            inner.owners.insert(base, owner);
+            inner.book.adopt_sealed(base, layout.total, views);
+        }
+        Ok(sizes
+            .iter()
+            .zip(&layout.offsets)
+            .map(|(&size, &offset)| {
+                if size == 0 {
+                    // SAFETY: an empty (null, 0) borrowed descriptor never
+                    // reaches HIP.
+                    unsafe { DeviceBuffer::from_raw(std::ptr::null_mut(), 0) }
+                } else {
+                    view(base + offset, size)
+                }
+            })
+            .collect())
+    }
+
+    /// [`Self::alloc_packed`] without packing: one `hipMalloc` per entry.
+    fn alloc_each(&self, sizes: &[usize], zero: bool) -> HipResult<Vec<DeviceBuffer>> {
+        let mut out: Vec<DeviceBuffer> = Vec::with_capacity(sizes.len());
+        for &size in sizes {
+            let step = self.malloc(size).and_then(|buf| {
+                if zero && size > 0 {
+                    if let Err(error) = self.memset(&buf, 0, size) {
+                        let _ = self.free(buf);
+                        return Err(error);
+                    }
+                }
+                Ok(buf)
+            });
+            match step {
+                Ok(buf) => out.push(buf),
+                Err(error) => {
+                    for buf in out {
+                        let _ = self.free(buf);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Release one view. With `defer`, a slab that becomes dead stays
@@ -636,11 +826,60 @@ mod tests {
         assert_eq!(SlabMode::parse("off"), Ok(SlabMode::Off));
         assert_eq!(SlabMode::parse(" 2M "), Ok(SlabMode::Up2M));
         assert_eq!(SlabMode::parse("16m"), Ok(SlabMode::Up16M));
+        assert_eq!(SlabMode::parse("64m"), Ok(SlabMode::Up64M));
+        assert_eq!(SlabMode::parse(" 64MiB "), Ok(SlabMode::Up64M));
         assert!(SlabMode::parse("4m").is_err());
-        for mode in [SlabMode::Up2M, SlabMode::Up16M] {
+        assert!(SlabMode::parse("128m").is_err());
+        for mode in [SlabMode::Up2M, SlabMode::Up16M, SlabMode::Up64M] {
+            assert_eq!(SlabMode::parse(mode.name()), Ok(mode));
             assert_eq!(mode.slab_bytes() % ALLOC_GRANULE, 0);
             assert!(mode.slab_bytes() >= mode.max_tensor_bytes());
         }
+        assert_eq!(SlabMode::Up64M.max_tensor_bytes(), 64 * MIB);
+        assert_eq!(SlabMode::Up64M.slab_bytes(), 256 * MIB);
+    }
+
+    #[test]
+    fn packed_layout_is_page_aligned_and_dense() {
+        let layout = packed_layout(&[100, 4096, 5000, 0, 3 * MIB]);
+        assert_eq!(layout.offsets, vec![0, 4096, 8192, 16384, 16384]);
+        assert_eq!(layout.total, 16384 + 3 * MIB);
+        assert!(layout.offsets.iter().all(|o| o % SLAB_ALIGN == 0));
+        assert_eq!(packed_layout(&[]).total, 0);
+        // Nothing is wasted beyond page alignment: one rounding for the group.
+        let sizes = [3 * MIB, 5 * MIB / 2, 3 * MIB, 5 * MIB / 2];
+        let layout = packed_layout(&sizes);
+        assert_eq!(layout.total, 11 * MIB);
+        let separate: usize = sizes.iter().map(|&s| device_alloc_charge(s)).sum();
+        assert_eq!(separate, 16 * MIB);
+        assert_eq!(device_alloc_charge(layout.total), 12 * MIB);
+    }
+
+    #[test]
+    fn packed_slab_dies_with_its_last_view() {
+        let mut book = SlabBook::default();
+        let layout = packed_layout(&[MIB, 2 * MIB, 3 * MIB]);
+        let base = 0x8000_0000usize;
+        book.adopt_sealed(base, layout.total, 3);
+        // Adopting does not count as a weight upload, and a sealed packed slab
+        // never takes a placement or becomes an open slab.
+        assert_eq!(book.snapshot().views_created, 0);
+        assert_eq!(book.snapshot().slabs_created, 0);
+        assert_eq!(book.snapshot().live_views, 3);
+        assert_eq!(book.place(4096), None);
+        let (a, b, c) = (
+            base + layout.offsets[0],
+            base + layout.offsets[1],
+            base + layout.offsets[2],
+        );
+        // Release in an order different from allocation order: still one
+        // death, on the last view.
+        assert_eq!(book.release(b, 2 * MIB), Ok(Released::Held));
+        assert_eq!(book.release(a, MIB), Ok(Released::Held));
+        assert_eq!(book.release(c, 3 * MIB), Ok(Released::Dead { base }));
+        assert!(book.release(c, 3 * MIB).is_err());
+        book.remove(base);
+        assert_eq!(book.snapshot().slabs, 0);
     }
 
     #[test]

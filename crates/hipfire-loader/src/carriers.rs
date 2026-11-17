@@ -11281,6 +11281,9 @@ impl Carrier for Qwen35Carrier {
     fn name(&self) -> &'static str {
         "qwen35"
     }
+    fn weight_slab_default(&self, gpu_arch: &str) -> Option<hip_bridge::SlabMode> {
+        hipfire_arch_qwen35::carrier::weight_slab_default(gpu_arch)
+    }
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,

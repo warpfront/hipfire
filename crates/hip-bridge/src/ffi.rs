@@ -2225,17 +2225,15 @@ impl HipRuntime {
 
     // ── Memory management ───────────────────────────────────────
 
+    /// `hipMalloc`. Under `HIPFIRE_EMU` the ledger is charged what ROCr
+    /// really occupies (`device_alloc_charge`), not the requested size.
     pub fn malloc(&self, size: usize) -> HipResult<DeviceBuffer> {
         self.plan_deny("hipMalloc")?;
         let Some(budget) = crate::emu_budget::active() else {
             return self.malloc_raw(size);
         };
-        let (buf, token) = crate::emu_budget::charged_alloc(
-            &budget,
-            crate::emu_budget::Class::Device,
-            size,
-            || self.malloc_raw(size),
-        )?;
+        let (buf, token) =
+            crate::emu_budget::charged_device_alloc(&budget, size, || self.malloc_raw(size))?;
         Ok(buf.with_charge(token))
     }
 
@@ -2263,6 +2261,9 @@ impl HipRuntime {
     /// This is an optional ROCm capability. Loading `HipRuntime` remains
     /// compatible with runtimes that do not export `hipExtMallocWithFlags`;
     /// callers receive a scoped error only when they request signal memory.
+    /// Charged at the requested size under `HIPFIRE_EMU`: signal words are
+    /// not ledgered in `own_device_bytes` either (they are a few bytes of
+    /// system-visible memory, not a VRAM granule).
     pub fn malloc_signal(&self, size: usize) -> HipResult<DeviceBuffer> {
         self.plan_deny("hipMalloc(signal)")?;
         let Some(budget) = crate::emu_budget::active() else {
@@ -2289,12 +2290,9 @@ impl HipRuntime {
         let Some(budget) = crate::emu_budget::active() else {
             return self.malloc_finegrained_raw(size);
         };
-        let (buf, token) = crate::emu_budget::charged_alloc(
-            &budget,
-            crate::emu_budget::Class::Device,
-            size,
-            || self.malloc_finegrained_raw(size),
-        )?;
+        let (buf, token) = crate::emu_budget::charged_device_alloc(&budget, size, || {
+            self.malloc_finegrained_raw(size)
+        })?;
         Ok(buf.with_charge(token))
     }
 

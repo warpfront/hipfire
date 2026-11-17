@@ -2286,23 +2286,14 @@ struct Qwen35LazyCharges {
     mtp: usize,
 }
 
-/// Bytes of the checkpoint rings one load can populate at once.
-///
-/// Each snapshot mirrors `dn_state` ([`DeltaNetSnapshot::bytes_for`]); only the
-/// first of a ring is charged. `take_dn_checkpoint` adds further ones (up to
-/// the cap, `HIPFIRE_CACHE_CKPT_MAX`) only from memory the admitted context
-/// does not need (`Gpu::kv_fit_floor`). Two rings can be live together: the AR
-/// prefill ring (`LoadedModel.prefill_checkpoints`, cap `ckpt_max()`) and, when
-/// a DFlash or native-MTP speculator is attached, that speculator's own ring
-/// (cap = the same `HIPFIRE_CACHE_CKPT_MAX` knob). `ckpt_max()`,
-/// `mtp_cache_policy().checkpoint_cap` and the DFlash builder all read that
-/// one knob with default 8 and floor 1, so a single `cap` serves every ring.
-fn qwen35_checkpoint_ring_bytes(snapshot_bytes: usize, speculator_ring: bool) -> usize {
-    snapshot_bytes.saturating_mul(1 + usize::from(speculator_ring))
-}
-
 /// [`Qwen35LazyCharges`] for this load. `mtp` is the native-MTP head (and the
 /// requested chain depth) only when the MTP speculator is the one attached.
+///
+/// A checkpoint snapshot is charged at the device memory it really occupies
+/// ([`DeltaNetSnapshot::device_charge_for`]: every allocation ROCr-rounded),
+/// not at the raw bytes of the state it mirrors: a 27B snapshot of 386 MiB
+/// takes 530 MiB. The ring multiplier is
+/// [`admission::qwen35_checkpoint_ring_bytes`], shared with `hipfire fit`.
 fn qwen35_lazy_charges(
     config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     dn_state: &hipfire_arch_qwen35::qwen35::DeltaNetState,
@@ -2310,9 +2301,9 @@ fn qwen35_lazy_charges(
     speculator_ring: bool,
     mtp: Option<(&hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, usize)>,
 ) -> Result<Qwen35LazyCharges, String> {
-    let snapshot_bytes = usize::try_from(DeltaNetSnapshot::bytes_for(dn_state))
+    let snapshot_bytes = usize::try_from(DeltaNetSnapshot::device_charge_for(dn_state))
         .map_err(|_| "DeltaNet snapshot sizing overflow".to_string())?;
-    let checkpoints = qwen35_checkpoint_ring_bytes(snapshot_bytes, speculator_ring);
+    let checkpoints = admission::qwen35_checkpoint_ring_bytes(snapshot_bytes, speculator_ring);
     let mtp = match mtp {
         None => 0,
         Some((head, requested_k)) => {

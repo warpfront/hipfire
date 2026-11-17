@@ -12,7 +12,8 @@ Safe Rust FFI to the AMD HIP runtime via `dlopen` of `libamdhip64.so` — no lin
 - No link-time HIP. A missing or mismatched `libamdhip64.so` is a runtime `dlopen` failure, not a compile error.
 - `DeviceBuffer::from_raw` / `from_vmm_owner` are `unsafe` and do not own the backing memory — do not `drop` to free it.
 - VMM (`VmmArena`) reserves a stable VA range while paging physical backing; it keeps graph base pointers stable. See [`src/vmm.rs`](src/vmm.rs).
-- Weight slabs (`src/ffi/weight_slab.rs`, `HIPFIRE_WEIGHT_SLAB=off|2m|16m`): inside a load scope (`slab_scope_begin`/`slab_scope_end`) `HipRuntime::slab_alloc` sub-allocates small weight tensors at their exact size on a 4 KiB boundary from zero-filled, 2 MiB-multiple `hipMalloc` slabs. A view is a `DeviceBuffer` that reports `is_hip_allocation()` (so ownership checks accept it) and `is_slab_view()`; `HipRuntime::free` only releases it, and a sealed slab with no live view is freed by `free` at once or by `slab_flush` (the pool drain). `own_device_bytes` is charged at what ROCr occupies (`device_alloc_charge`: 4 KiB rounding up to 1 MiB, 2 MiB rounding above), a slab at its slab bytes.
+- Weight slabs (`src/ffi/weight_slab.rs`, `HIPFIRE_WEIGHT_SLAB=off|2m|16m|64m`): inside a load scope (`slab_scope_begin`/`slab_scope_end`) `HipRuntime::slab_alloc` sub-allocates small weight tensors at their exact size on a 4 KiB boundary from zero-filled, 2 MiB-multiple `hipMalloc` slabs. A view is a `DeviceBuffer` that reports `is_hip_allocation()` (so ownership checks accept it) and `is_slab_view()`; `HipRuntime::free` only releases it, and a sealed slab with no live view is freed by `free` at once or by `slab_flush` (the pool drain). `own_device_bytes` is charged at what ROCr occupies (`device_alloc_charge`: 4 KiB rounding up to 1 MiB, 2 MiB rounding above), a slab at its slab bytes. `64m` (tensors up to 64 MiB, 256 MiB unreserved slabs) is the qwen35 carrier's unset-env default on every arch: the dense layer loader calls `slab_reserve(bytes)` before each layer, which opens one slab of exactly that size (2 MiB rounding paid once per layer), and while a reservation is in force an upload that fits no open slab is allocated directly instead of opening a mode-capacity slab (a fixed capacity wastes tens of MiB to over 2 GiB depending on how it divides the upload order).
+- Packed allocations: `HipRuntime::alloc_packed(sizes, zero)` carves several buffers from ONE fresh `hipMalloc` (`packed_layout`: each sub-range on a 4 KiB boundary), so the 2 MiB rounding is paid once for the group. It is a sealed slab of `SlabView` buffers (not part of the scope counters): `HipRuntime::free` of a view releases it, the allocation is freed with the last view, and view handles may be exchanged between owners (`DeltaNetSnapshot::exchange_buffers`). DeltaNet snapshots (`DeltaNetSnapshot::new_for`) and the per-state GDN tensors and carry (`DeltaNetState`) use it. Under railgun registry recording or a plan tape every entry is its own `hipMalloc`.
 - `MappedHostBuffer` (`HipRuntime::mapped_host_buffer`) owns ONE `hipHostMalloc(Mapped | Coherent)` allocation (charged to the emu `HostPinned` class) and exposes its device alias only as a non-owning `Borrowed` `DeviceBuffer` — never register it as an owner or free it. Host bytes exist only inside a `MappedWrite` taken from the `Retired` phase; lifecycle `Retired → CpuWriting → Published → GpuReading → Retired` is a pure ledger (`MappedPhase`, one generation per `publish`). `publish` issues `fence(SeqCst)`, which orders host stores for other host threads only — it is NOT a GPU visibility proof; only an on-hardware oracle is (see `crates/hipfire-dispatch/examples/d2_mapped_return_pilot.rs`, built with `--features lab`). `mark_gpu_reading` (call right after enqueueing the consumer) records a timing-disabled retirement event; a failed record fails closed (only `retire`'s device synchronize retires it). `retire`/`try_retire` leave the phase unchanged on error, and Drop quiesces (event / device synchronize) or retains the allocation, mirroring `PinnedTransferBuffer`. A failed or null device alias refuses construction; there is no host-pointer fallback. Send, not Sync.
 - `PinnedTransferBuffer` readiness: after the queued downloads, `arm_ready` (event recorded on the buffer's stream) or `arm_ready_word` (`hipStreamWriteValue32` of a generation into a `SignalWord`) returns a non-`Clone` `#[must_use]` `InputReady`; `try_complete_ready` / `try_complete_ready_word` poll it and clear `pending` only for the matching, still-current token (a later enqueue or re-arm makes it stale; errors leave the accesses pending, fail closed), `complete_ready` is the blocking fallback. Every enqueue draws a process-wide monotonic sequence number and records its raw stream; `retire_behind(&proof)` retires ANOTHER buffer only when its last enqueue was on the proof's stream with a smaller sequence, otherwise it returns `false` and the caller must `complete()` it. `InputReady` and `MappedPublished` are distinct types (compile_fail doctest on `InputReady`); neither proves the other.
 - `SignalWord` (`HipRuntime::signal_word`) is 8 bytes of `hipExtMallocWithFlags(hipMallocSignalMemory = 0x2)`: host access ONLY through volatile `load`/`store` plus the explicit `load_acquire`/`store_release` fences, device view is a non-owning `Borrowed` `DeviceBuffer` (use `stream_write_signal` / `stream_wait_signal_gte`, which only accept 31-bit generations `1..=SIGNAL_GEN_MAX`, never `SIGNAL_ABORT`). `SIGNAL_ABORT` (`u32::MAX`) is `>=` every generation and releases any `Gte` wait; a word that holds it is dead (it would release every later wait), so abort poisons the owner. A queued wait means NO stream or device synchronize may run until the flag is stored: every error path between the wait enqueue and the flag store must store `SIGNAL_ABORT` first. `Drop` stores the abort value, drains the device, then `hipFree`s, and retains the allocation if the drain is not proved. `SignalGen` is the pure 31-bit counter and refuses wrap. `stream_wait_value32` (and `signal_word`) refuse unless `can_use_stream_wait_value(device)` — `hipDeviceGetAttribute(hipDeviceAttributeCanUseStreamWaitValue = 10013)` is non-zero; symbol presence alone is not capability. `10013` is the value in the ROCm header this bridge targets (`hip_runtime_api.h`, `hipDeviceAttributeAmdSpecificBegin = 10000` + 13).
@@ -26,6 +27,8 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
 ### Modules and exported symbols
 
 - [`src/emu_budget.rs`](src/emu_budget.rs)
+  - `charge_emu_runtime_reserve`
+  - `HIP_RUNTIME_RESERVE_BYTES`
 - [`src/error.rs`](src/error.rs)
   - `HIP_ERROR_ILLEGAL_ADDRESS`
   - `HIP_ERROR_INVALID_IMAGE`
@@ -274,12 +277,15 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `vmm_tlb_pokes`
 - [`src/ffi/weight_slab.rs`](src/ffi/weight_slab.rs)
   - `ALLOC_GRANULE`
+  - `alloc_packed`
   - `DEFAULT_SLAB_MODE`
   - `device_alloc_charge`
   - `from_env`
   - `from_env_explicit`
   - `max_tensor_bytes`
   - `name`
+  - `packed_layout`
+  - `PackedLayout`
   - `parse`
   - `set_slab_mode`
   - `SLAB_ALIGN`
@@ -288,6 +294,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `slab_flush`
   - `slab_mode`
   - `slab_release`
+  - `slab_reserve`
   - `slab_scope_active`
   - `slab_scope_begin`
   - `slab_scope_begin_with`
@@ -322,6 +329,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `as_ptr`
   - `byte_view`
   - `DeviceBuffer`
+  - `emu_budget`
   - `error`
   - `ffi`
   - `from_host_mapped`

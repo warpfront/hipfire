@@ -3215,6 +3215,113 @@ impl DeltaNetStateGeometry for DeltaNetStatePlan {
     }
 }
 
+/// Element count, dtype and BYTE size of one state tensor. The byte size is
+/// what the buffer holds: it differs from `numel * dtype.size()` for the
+/// quantized S (one byte, or one nibble, per element under an `F32` descriptor).
+#[derive(Clone, Copy)]
+struct StateTensorSpec {
+    numel: usize,
+    dtype: DType,
+    bytes: usize,
+}
+
+impl StateTensorSpec {
+    fn of(numel: usize, dtype: DType) -> Self {
+        Self {
+            numel,
+            dtype,
+            bytes: numel * dtype.size(),
+        }
+    }
+}
+
+/// The tensors of ONE LA layer of a single-device [`DeltaNetState`]. Every
+/// layer has the same set, so the packed allocation holds `n_layers` copies of
+/// [`Self::in_order`].
+struct LayerStateSpecs {
+    s: StateTensorSpec,
+    scales: StateTensorSpec,
+    /// `None` unless the error-feedback residual is on.
+    ef: Option<StateTensorSpec>,
+    conv: StateTensorSpec,
+    /// The four GDN carry tensors; `None` without a carry.
+    carry: Option<[StateTensorSpec; 4]>,
+}
+
+impl LayerStateSpecs {
+    fn new(
+        plan: &DeltaNetStatePlan,
+        batch: usize,
+        n_heads: usize,
+        s_dim: usize,
+        conv_state_size: usize,
+        carry: Option<&GdnCarryGeometry>,
+    ) -> Self {
+        let (s, scales) = match plan.quant {
+            StateQuant::FP32 => (
+                StateTensorSpec::of(plan.s_per_layer, DType::F32),
+                StateTensorSpec::of(batch * n_heads, DType::F32),
+            ),
+            // int8 / nibble-packed S: `s_per_layer` BYTES, per-row F32 scales.
+            StateQuant::Q8 | StateQuant::Q4 => (
+                StateTensorSpec {
+                    numel: plan.s_per_layer,
+                    dtype: DType::F32,
+                    bytes: plan.s_per_layer,
+                },
+                StateTensorSpec::of(batch * n_heads * s_dim, DType::F32),
+            ),
+        };
+        Self {
+            s,
+            scales,
+            ef: plan
+                .ef_per_layer
+                .map(|n| StateTensorSpec::of(n, DType::F16)),
+            conv: StateTensorSpec::of(conv_state_size, DType::F32),
+            carry: carry.map(|g| DeltaNetCarry::tensor_specs(g, batch)),
+        }
+    }
+
+    /// Allocation order within a layer: S, scales, EF residual (when on),
+    /// conv ring, then the carry tensors (when owned).
+    fn in_order(&self) -> Vec<StateTensorSpec> {
+        let mut specs = vec![self.s, self.scales];
+        specs.extend(self.ef);
+        specs.push(self.conv);
+        if let Some(carry) = self.carry {
+            specs.extend(carry);
+        }
+        specs
+    }
+}
+
+/// The next view of a packed allocation as a tensor of `spec`'s shape and dtype.
+fn packed_tensor(
+    views: &mut std::vec::IntoIter<hip_bridge::DeviceBuffer>,
+    spec: StateTensorSpec,
+) -> GpuTensor {
+    GpuTensor {
+        buf: views
+            .next()
+            .expect("alloc_packed returns one view per requested size"),
+        shape: vec![spec.numel],
+        dtype: spec.dtype,
+    }
+}
+
+/// Free one state tensor. A packed view is released at once, so the
+/// allocation it shares returns to HIP with the last view (`free_tensor`
+/// would park a dead allocation until the next pool drain); anything else goes
+/// back to the pool.
+fn free_state_tensor(gpu: &mut Gpu, tensor: GpuTensor) {
+    let _ = if tensor.buf.is_slab_view() {
+        gpu.release_tensor_immediate(tensor)
+    } else {
+        gpu.free_tensor(tensor)
+    };
+}
+
 /// Per-layer GPU buffers of the persistent GDN stream carry (CHUNK-CANONICAL
 /// design §3.2/§5): the FP32 tile-entry recurrent state, the conv history at
 /// the tile entry, and the raw pre-conv QKV / alpha / beta of the incomplete
@@ -3275,6 +3382,18 @@ impl DeltaNetCarry {
         }
         let [a, b, c, d]: [GpuTensor; 4] = out.try_into().ok().expect("four carry tensors");
         Ok([a, b, c, d])
+    }
+
+    /// Size, dtype and extent of the four carry tensors of one layer, in
+    /// canonical order ([`Self::alloc_layer`]'s buffers, `lanes` lane-major).
+    fn tensor_specs(geometry: &GdnCarryGeometry, lanes: usize) -> [StateTensorSpec; 4] {
+        [
+            geometry.state_bytes(),
+            geometry.conv_bytes(),
+            geometry.raw_qkv_bytes(),
+            geometry.raw_ab_bytes(),
+        ]
+        .map(|bytes| StateTensorSpec::of(lanes * (bytes / 4), DType::F32))
     }
 
     /// The four families, canonical order (state, conv, raw qkv, raw ab).
@@ -3477,20 +3596,19 @@ impl GdnStreamOwner {
             ));
         }
         let layers = self.layers();
+        // One zero-filled allocation holds every layer's carry tensors, so
+        // ROCr's 2 MiB rounding (each 3.0 / 2.5 MiB tensor used to occupy
+        // 4 MiB) is paid once. All-or-nothing: a failure leaves nothing to free.
+        let specs = DeltaNetCarry::tensor_specs(&geometry, self.lanes);
+        let sizes: Vec<usize> = (0..layers)
+            .flat_map(|_| specs.iter().map(|spec| spec.bytes))
+            .collect();
+        gpu.bind_thread()?;
+        let mut views = gpu.hip.alloc_packed(&sizes, true)?.into_iter();
         let mut bufs: [Vec<GpuTensor>; 4] = Default::default();
         for _ in 0..layers {
-            match DeltaNetCarry::alloc_layer(gpu, &geometry, self.lanes) {
-                Ok(layer) => {
-                    for (fam, t) in bufs.iter_mut().zip(layer) {
-                        fam.push(t);
-                    }
-                }
-                Err(e) => {
-                    for t in bufs.iter_mut().flat_map(|v| v.drain(..)) {
-                        let _ = gpu.free_tensor(t);
-                    }
-                    return Err(e);
-                }
+            for (fam, spec) in bufs.iter_mut().zip(specs) {
+                fam.push(packed_tensor(&mut views, spec));
             }
         }
         let [tile_state, tile_conv, raw_qkv, raw_ab] = bufs;
@@ -3795,7 +3913,7 @@ impl GdnStreamOwner {
                 .chain(c.raw_qkv)
                 .chain(c.raw_ab)
             {
-                let _ = gpu.free_tensor(t);
+                free_state_tensor(gpu, t);
             }
         }
     }
@@ -4042,76 +4160,46 @@ impl DeltaNetState {
         let plan = DeltaNetStatePlan::new(config, quant, batch, ef_enabled);
         let n_delta_layers = plan.n_layers;
 
-        // GpuTensor has no freeing Drop (free needs &mut Gpu). Mirror
-        // alloc_k_v_vmm_filtered: on any mid-loop failure free every tensor
-        // already pushed before propagating.
+        // Every tensor of every layer — S, scales, conv ring, EF residual and
+        // the GDN carry — is a view of ONE zero-filled allocation, so ROCr's
+        // 2 MiB rounding is paid once per state (each 1.5 MiB EF residual and
+        // 2.5 / 3.0 MiB carry tensor used to occupy 2 or 4 MiB). The
+        // allocation is all-or-nothing, so a failure leaves nothing to unwind;
+        // `GpuTensor` has no freeing Drop, so `free_gpu` releases the views
+        // and the allocation returns to HIP with the last one. It is made
+        // once, here: nothing reallocates a state tensor later, so addresses
+        // captured by graphs and replay tapes stay valid.
+        let layer = LayerStateSpecs::new(
+            &plan,
+            batch,
+            n_heads,
+            s_dim,
+            conv_state_size,
+            carry_geometry.as_ref(),
+        );
+        let in_order = layer.in_order();
+        let sizes: Vec<usize> = (0..n_delta_layers)
+            .flat_map(|_| in_order.iter().map(|spec| spec.bytes))
+            .collect();
+        gpu.bind_thread()?;
+        let mut views = gpu.hip.alloc_packed(&sizes, true)?.into_iter();
         let mut s_matrices = Vec::with_capacity(n_delta_layers);
         let mut s_scales = Vec::with_capacity(n_delta_layers);
         let mut conv_states = Vec::with_capacity(n_delta_layers);
         let mut s_ef_residual = Vec::with_capacity(if ef_enabled { n_delta_layers } else { 0 });
         let mut carry_bufs: [Vec<GpuTensor>; 4] = Default::default();
-        let result = (|| -> HipResult<()> {
-            for _ in 0..n_delta_layers {
-                match quant {
-                    StateQuant::FP32 => {
-                        s_matrices.push(gpu.zeros(&[plan.s_per_layer], DType::F32)?);
-                        s_scales.push(gpu.zeros(&[batch * n_heads], DType::F32)?);
-                    }
-                    StateQuant::Q8 => {
-                        // int8 state: one byte per element, per-row scales
-                        let bytes = plan.s_per_layer;
-                        let buf = gpu.hip.malloc(bytes)?;
-                        if let Err(e) = gpu.hip.memset(&buf, 0, bytes) {
-                            let _ = gpu.hip.free(buf);
-                            return Err(e);
-                        }
-                        s_matrices.push(GpuTensor {
-                            buf,
-                            shape: vec![bytes],
-                            dtype: DType::F32,
-                        });
-                        s_scales.push(gpu.zeros(&[batch * n_heads * s_dim], DType::F32)?);
-                    }
-                    StateQuant::Q4 => {
-                        // 4-bit nibble-packed: half a byte per element, per-row scales
-                        let bytes = plan.s_per_layer;
-                        let buf = gpu.hip.malloc(bytes)?;
-                        if let Err(e) = gpu.hip.memset(&buf, 0, bytes) {
-                            let _ = gpu.hip.free(buf);
-                            return Err(e);
-                        }
-                        s_matrices.push(GpuTensor {
-                            buf,
-                            shape: vec![bytes],
-                            dtype: DType::F32,
-                        });
-                        s_scales.push(gpu.zeros(&[batch * n_heads * s_dim], DType::F32)?);
-                    }
-                }
-                if let Some(ef_numel) = plan.ef_per_layer {
-                    s_ef_residual.push(gpu.zeros(&[ef_numel], DType::F16)?);
-                }
-                conv_states.push(gpu.zeros(&[conv_state_size], DType::F32)?);
-                if let Some(g) = &carry_geometry {
-                    let layer = DeltaNetCarry::alloc_layer(gpu, g, batch)?;
-                    for (fam, t) in carry_bufs.iter_mut().zip(layer) {
-                        fam.push(t);
-                    }
+        for _ in 0..n_delta_layers {
+            s_matrices.push(packed_tensor(&mut views, layer.s));
+            s_scales.push(packed_tensor(&mut views, layer.scales));
+            if let Some(ef) = layer.ef {
+                s_ef_residual.push(packed_tensor(&mut views, ef));
+            }
+            conv_states.push(packed_tensor(&mut views, layer.conv));
+            if let Some(specs) = layer.carry {
+                for (fam, spec) in carry_bufs.iter_mut().zip(specs) {
+                    fam.push(packed_tensor(&mut views, spec));
                 }
             }
-            Ok(())
-        })();
-        if let Err(err) = result {
-            for tensor in s_matrices
-                .drain(..)
-                .chain(s_scales.drain(..))
-                .chain(conv_states.drain(..))
-                .chain(s_ef_residual.drain(..))
-                .chain(carry_bufs.iter_mut().flat_map(|v| v.drain(..)))
-            {
-                let _ = gpu.free_tensor(tensor);
-            }
-            return Err(err);
         }
         let [tile_state, tile_conv, raw_qkv, raw_ab] = carry_bufs;
         let carry = carry_geometry.map(|geometry| DeltaNetCarry {
@@ -4134,25 +4222,26 @@ impl DeltaNetState {
 
     /// Free all GPU tensors. Call before drop to return VRAM.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        // Q8/Q4 S matrices are direct `hip.malloc` allocations (never drawn
-        // from the pool): return them to HIP, or every retired state would
-        // park its S bytes on a pool free list nothing allocates from.
+        // Every tensor is released at once: packed views return their shared
+        // allocation with the last one, pooled tensors go back to the pool, and
+        // the Q8/Q4 S buffers (a direct `hipMalloc` or a packed view, never
+        // pool-owned) free through HIP so no retired state parks its S bytes
+        // on a pool free list nothing allocates from.
         let direct = matches!(self.quant, StateQuant::Q8 | StateQuant::Q4);
         for t in self.s_matrices {
             if direct {
                 let _ = gpu.hip.free(t.buf);
             } else {
-                let _ = gpu.free_tensor(t);
+                free_state_tensor(gpu, t);
             }
         }
-        for t in self.s_scales {
-            let _ = gpu.free_tensor(t);
-        }
-        for t in self.conv_states {
-            let _ = gpu.free_tensor(t);
-        }
-        for t in self.s_ef_residual {
-            let _ = gpu.free_tensor(t);
+        for t in self
+            .s_scales
+            .into_iter()
+            .chain(self.conv_states)
+            .chain(self.s_ef_residual)
+        {
+            free_state_tensor(gpu, t);
         }
         GdnStreamOwner::free_carry(self.stream.carry, gpu);
         GdnStreamOwner::free_binding(self.stream.binding, gpu);
@@ -5200,5 +5289,105 @@ mod qt53_admission_tests {
             let err = check(&rows).expect_err("K");
             assert!(err.message.contains("moe_intermediate"), "{}", err.message);
         }
+    }
+}
+
+/// Packed layout of a single-device [`DeltaNetState`]: host-only arithmetic on
+/// the per-layer tensor specs the allocator carves one allocation from.
+#[cfg(test)]
+mod packed_state_tests {
+    use super::*;
+
+    const MIB: usize = 1 << 20;
+    /// qwen3.8-27B: 48 LA layers, 48 value heads, 128-wide heads, conv ring
+    /// of 10,240 channels x 3 taps, microtile 64.
+    const GEOM: GdnCarryGeometry = GdnCarryGeometry {
+        hk: 16,
+        hv: 48,
+        head_dim: 128,
+        conv_hist_rows: 3,
+        micro_rows: 64,
+    };
+
+    fn plan(quant: StateQuant, ef: bool) -> DeltaNetStatePlan {
+        DeltaNetStatePlan {
+            quant,
+            n_layers: 48,
+            s_per_layer: 48 * 128 * 128,
+            ef_per_layer: ef.then_some(48 * 128 * 128),
+        }
+    }
+
+    #[test]
+    fn q8_layer_keeps_the_established_tensor_shapes() {
+        let layer = LayerStateSpecs::new(
+            &plan(StateQuant::Q8, true),
+            1,
+            48,
+            128,
+            10_240 * 3,
+            Some(&GEOM),
+        );
+        // S: one byte per element under an F32 descriptor, as before.
+        assert_eq!((layer.s.numel, layer.s.bytes), (786_432, 786_432));
+        assert_eq!(layer.scales.bytes, 48 * 128 * 4);
+        assert_eq!(
+            layer.ef.map(|e| (e.numel, e.bytes)),
+            Some((786_432, 1_572_864))
+        );
+        assert_eq!(layer.conv.bytes, 10_240 * 3 * 4);
+        let carry = layer.carry.expect("carry");
+        assert_eq!(
+            carry.map(|c| c.bytes),
+            [3_145_728, 122_880, 2_621_440, 24_576]
+        );
+        let order: Vec<usize> = layer.in_order().iter().map(|s| s.bytes).collect();
+        assert_eq!(
+            order,
+            [786_432, 24_576, 1_572_864, 122_880, 3_145_728, 122_880, 2_621_440, 24_576]
+        );
+    }
+
+    #[test]
+    fn optional_tensors_follow_the_state() {
+        let plain = LayerStateSpecs::new(&plan(StateQuant::Q8, false), 1, 48, 128, 30_720, None);
+        assert!(plain.ef.is_none() && plain.carry.is_none());
+        assert_eq!(plain.in_order().len(), 3);
+        let fp32 = LayerStateSpecs::new(&plan(StateQuant::FP32, false), 2, 48, 128, 61_440, None);
+        assert_eq!(fp32.s.bytes, 786_432 * 4);
+        assert_eq!(fp32.scales.numel, 2 * 48);
+        // Lane-major carry scales with the batch.
+        let lanes = LayerStateSpecs::new(
+            &plan(StateQuant::Q8, true),
+            4,
+            48,
+            128,
+            122_880,
+            Some(&GEOM),
+        );
+        assert_eq!(lanes.carry.expect("carry")[0].bytes, 4 * 3_145_728);
+    }
+
+    #[test]
+    fn one_allocation_pays_the_rounding_once() {
+        let layer = LayerStateSpecs::new(
+            &plan(StateQuant::Q8, true),
+            1,
+            48,
+            128,
+            10_240 * 3,
+            Some(&GEOM),
+        );
+        let per_layer: Vec<usize> = layer.in_order().iter().map(|s| s.bytes).collect();
+        let sizes: Vec<usize> = (0..48).flat_map(|_| per_layer.iter().copied()).collect();
+        let separate: usize = sizes
+            .iter()
+            .map(|&s| hip_bridge::device_alloc_charge(s))
+            .sum();
+        let packed = hip_bridge::device_alloc_charge(hip_bridge::packed_layout(&sizes).total);
+        // State 36 + EF 72 + conv 5.6 + carry 271 MiB: ~529 MiB as separate
+        // allocations (EF and carry tensors rounded up), 386 MiB as one.
+        assert_eq!(separate / MIB, 529);
+        assert_eq!(packed, 386 * MIB);
     }
 }

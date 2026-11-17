@@ -7,6 +7,7 @@
 //! or start a daemon here; GPU-dependent placement remains explicitly bounded.
 
 mod capacity;
+mod emu;
 mod host;
 mod qwen4;
 mod remote;
@@ -344,8 +345,25 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
         Ok(hipfire_config::devices::Claim::Claimed)
     })
     .err();
-    let (mut machine, host_notes) = host::detect_with_notes(paths);
+    let (mut machine, mut host_notes) = host::detect_with_notes(paths);
     let mut findings = preflight_findings(paths);
+    // `HIPFIRE_EMU`: the machine the daemon would see under the profile.
+    match emu::options(process) {
+        Ok(None) => {}
+        Ok(Some(options)) => match emu::apply(&options, &mut machine) {
+            Ok(note) => host_notes.push(note),
+            Err(error) => findings.push(Finding::fails(
+                "admission",
+                error,
+                "unset HIPFIRE_EMU, or use a profile this GPU can stand in for (`hipfire emu list`)",
+            )),
+        },
+        Err(error) => findings.push(Finding::fails(
+            "admission",
+            error,
+            "unset HIPFIRE_EMU, or set it to a profile id from `hipfire emu list`",
+        )),
+    }
     if let Some(error) = visibility_error {
         findings.push(Finding::fails(
             "admission",
@@ -592,7 +610,7 @@ fn analyze_model(
     let card = crate::model_card(paths, registry, input);
     let entry = card.entry();
     let tag = card.tag().unwrap_or(input);
-    let local = crate::find_model_path(paths, registry, input);
+    let local = crate::locate_model_path(paths, registry, input)?;
     if local.is_none() && entry.is_none() {
         return Err(crate::unknown_model_error(registry, input));
     }
@@ -672,19 +690,23 @@ fn analyze_model(
     };
     apply_dflash_vram_floor(&mut params, device, &mut result.notes);
     let mut inputs = admission_inputs(&params);
-    inputs.draft_charge = paired_draft_bytes(
+    // An emulated device's free memory already excludes the HIP runtime the
+    // projection charges, so hand it back (a cold real card needs no hand-back).
+    inputs.runtime_in_free =
+        hipfire_config::active_process_config().map_or(0, emu::runtime_in_free);
+    let owners = speculation_owners(
+        paths,
+        entry,
+        &path,
         &inputs,
         &params,
         draft_missing.as_ref().filter(|_| !result.model.installed),
-        entry.and_then(|entry| entry.dflash_min_vram_gb),
         device,
+        args.no_fetch,
     );
-    if inputs.draft_charge > 0 {
-        result.notes.push(format!(
-            "DFlash draft reserve {} charged against free memory, as the load reserves it before it caps the context (draft file + 1/8 + 512 MiB); the speculation checkpoints the load also holds back are not projected",
-            gib(inputs.draft_charge)
-        ));
-    }
+    inputs.draft_charge = owners.draft;
+    inputs.checkpoint_charge = owners.checkpoints;
+    result.notes.extend(owners.notes);
     let admitted = match inputs.admit(&path, device) {
         Ok(admitted) => admitted,
         Err(detail) => match inputs.capacity_refusal(&path, device) {
@@ -901,6 +923,7 @@ struct FitLoad {
     draft_missing: Option<MissingDraft>,
 }
 
+#[derive(Debug)]
 struct MissingDraft {
     file: String,
     /// The registry's size for the draft; fit never fetches it.
@@ -1075,40 +1098,186 @@ fn apply_dflash_vram_floor(params: &mut Value, device: &FitDevice, notes: &mut V
     }
 }
 
-/// Device bytes the load reserves for the DFlash draft it pairs, charged
-/// against each GPU's free memory: the load reserves the draft before it caps
-/// the context (`max_seq budget: draft_reserve`), so the context left is net
-/// of it. The reserve is the load's own formula
-/// ([`hipfire_loader::admission::qwen35_draft_reserve_bytes`]) over the
-/// draft's file size. `missing` is a registry draft that is not pulled, passed
-/// only for a model fit read just the header of: `hipfire pull` fetches it
-/// with the model, so it counts at the registry size unless the mode would not
-/// pair it (`off`, `auto` on tp>1, or below the tier's `dflash_min_vram_gb`
-/// on this device under `auto`). 0 when no draft is paired.
-fn paired_draft_bytes(
-    inputs: &AdmissionInputs<'_>,
+/// The DFlash draft a fit pairs.
+#[derive(Debug)]
+enum PairedDraft<'a> {
+    /// No draft is paired (no draft, mode `off`, `auto` on tp>1, or below the
+    /// tier's `dflash_min_vram_gb` on this device under `auto`).
+    None,
+    /// The draft file the load would open.
+    Installed(&'a str),
+    /// A registry draft that is not pulled, for a model fit read just the
+    /// header of: `hipfire pull` fetches it with the model, so it counts.
+    NotPulled(&'a MissingDraft),
+}
+
+/// Which draft the load pairs on `device`, with the daemon's own gates.
+fn paired_draft<'a>(
+    inputs: &AdmissionInputs<'a>,
     params: &Value,
-    missing: Option<&MissingDraft>,
+    missing: Option<&'a MissingDraft>,
     floor_gb: Option<f64>,
     device: &FitDevice,
-) -> u64 {
+) -> PairedDraft<'a> {
     use hipfire_config::dflash_floor::{dflash_vram_gate, DflashVramGate};
-    use hipfire_loader::admission::qwen35_draft_reserve_bytes;
     if let Some(draft) = inputs.draft {
-        return std::fs::metadata(draft).map_or(0, |m| qwen35_draft_reserve_bytes(m.len()));
+        return PairedDraft::Installed(draft);
     }
-    let Some(size) = missing.and_then(|missing| missing.size_bytes) else {
-        return 0;
+    let Some(missing) = missing else {
+        return PairedDraft::None;
     };
     let mode = params["dflash_mode"].as_str().unwrap_or("auto");
     if mode == "off" || (mode == "auto" && inputs.tp > 1) {
-        return 0;
+        return PairedDraft::None;
     }
     let total = device.vram_total.filter(|_| !device.unified_memory);
     match dflash_vram_gate(mode, floor_gb, total) {
-        DflashVramGate::Skip(_) => 0,
-        DflashVramGate::Pair | DflashVramGate::Forced(_) => qwen35_draft_reserve_bytes(size),
+        DflashVramGate::Skip(_) => PairedDraft::None,
+        DflashVramGate::Pair | DflashVramGate::Forced(_) => PairedDraft::NotPulled(missing),
     }
+}
+
+/// What the speculation owners of a load take off free memory before the
+/// context is sized, and the notes that itemise it.
+#[derive(Default)]
+struct SpeculationOwners {
+    /// The paired DFlash draft and its owners ([`DflashSide`]), 0 when none.
+    draft: u64,
+    /// The DeltaNet checkpoint rings a request can fill.
+    checkpoints: u64,
+    notes: Vec<String>,
+}
+
+/// The owners the load creates besides the weights, KV and per-request
+/// prefill scratch, from the same functions the load charges
+/// ([`hipfire_loader::admission::qwen35_dflash_side`],
+/// [`hipfire_loader::admission::qwen35_checkpoint_rings_charge`]). The draft's
+/// header is the installed file's, or a header replica fetched the way the
+/// model's is; offline (or `--no-fetch`) only its registry size is charged,
+/// and the note says so. Empty for a source that is not a Qwen3.5 manifest.
+#[allow(clippy::too_many_arguments)]
+fn speculation_owners(
+    paths: &crate::Paths,
+    entry: Option<&ModelEntry>,
+    model: &Path,
+    inputs: &AdmissionInputs<'_>,
+    params: &Value,
+    missing: Option<&MissingDraft>,
+    device: &FitDevice,
+    no_fetch: bool,
+) -> SpeculationOwners {
+    use hipfire_loader::admission::{
+        qwen35_checkpoint_rings_charge, qwen35_dflash_side, DflashSide,
+    };
+    let mut owners = SpeculationOwners::default();
+    let Some(source) = model
+        .to_str()
+        .and_then(|path| ModelSource::from_path(path).ok())
+    else {
+        return owners;
+    };
+    let paired = paired_draft(
+        inputs,
+        params,
+        missing,
+        entry.and_then(|entry| entry.dflash_min_vram_gb),
+        device,
+    );
+    // The checkpoint rings exist whenever the source is a Qwen3.5 manifest; a
+    // paired DFlash speculator adds its own ring.
+    let speculator_ring = !matches!(paired, PairedDraft::None);
+    let Ok(rings) = qwen35_checkpoint_rings_charge(&source, speculator_ring) else {
+        return owners;
+    };
+    owners.checkpoints = rings;
+    owners.notes.push(format!(
+        "DeltaNet checkpoint rings {} charged against free memory (one snapshot per ring at the device memory ROCr occupies{}); further checkpoints take only memory the admitted context does not need. A native-MTP speculator's ring and state are not projected",
+        gib(rings),
+        if speculator_ring { ", the AR prefill ring plus the DFlash speculator's" } else { ", the AR prefill ring" }
+    ));
+    let block = inputs
+        .options
+        .spec
+        .dflash_block
+        .unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED);
+    // The draft file whose header is read, and what is charged when it cannot be.
+    let mut unavailable = None;
+    let (draft_file, fallback_bytes) = match paired {
+        PairedDraft::None => return owners,
+        PairedDraft::Installed(draft) => (
+            Some(std::path::PathBuf::from(draft)),
+            std::fs::metadata(draft).map_or(0, |m| m.len()),
+        ),
+        PairedDraft::NotPulled(missing) => {
+            let file = match entry {
+                _ if no_fetch => {
+                    unavailable = Some("--no-fetch".to_owned());
+                    None
+                }
+                None => {
+                    unavailable = Some("no registry entry".to_owned());
+                    None
+                }
+                Some(entry) => {
+                    match remote::sidecar_header_replica(
+                        paths,
+                        entry,
+                        &missing.file,
+                        missing.size_bytes,
+                    ) {
+                        Ok(replica) => Some(replica.path),
+                        Err(error) => {
+                            unavailable = Some(format!("{error:#}"));
+                            None
+                        }
+                    }
+                }
+            };
+            (file, missing.size_bytes.unwrap_or(0))
+        }
+    };
+    let side = draft_file
+        .as_deref()
+        .map(|file| qwen35_dflash_side(&source, file, block, inputs.max_seq));
+    match side {
+        Some(Ok(side)) => {
+            let DflashSide {
+                draft_weights,
+                draft_scratch,
+                hidden_ring,
+                verify_scratch,
+                target_snapshot,
+                gdn_tape,
+            } = side;
+            owners.draft = side.total();
+            owners.notes.push(format!(
+                "DFlash side {} charged against free memory, as the load budgets it before it caps the context: draft weights {}, draft scratch {}, hidden ring {}, verify scratch {}, target rollback snapshot {}, GDN tape {}",
+                gib(owners.draft),
+                gib(draft_weights),
+                gib(draft_scratch),
+                gib(hidden_ring),
+                gib(verify_scratch),
+                gib(target_snapshot),
+                gib(gdn_tape)
+            ));
+        }
+        Some(Err(error)) => {
+            owners.draft = fallback_bytes;
+            owners.notes.push(format!(
+                "DFlash side not projected ({error}); only the draft's {} file bytes are charged",
+                gib(fallback_bytes)
+            ));
+        }
+        None => {
+            owners.draft = fallback_bytes;
+            owners.notes.push(format!(
+                "DFlash draft header unavailable ({}); only its {} registry size is charged, not its scratch, hidden ring, verify scratch, rollback snapshot or GDN tape",
+                unavailable.unwrap_or_default(),
+                gib(fallback_bytes)
+            ));
+        }
+    }
+    owners
 }
 
 fn source_context(source: &ModelSource) -> Option<usize> {
@@ -1315,8 +1484,9 @@ fn link_routes(device: &FitDevice) -> Vec<Route> {
 }
 
 fn projection_json(p: Qwen35CardProjection) -> Value {
-    json!({"free": p.free, "weights": p.weights, "scratch": p.scratch,
-        "page_rounding": p.page_rounding, "bytes_per_token": p.bytes_per_token,
+    json!({"free": p.free, "weights": p.weights, "state": p.state, "runtime": p.runtime,
+        "scratch": p.scratch, "page_rounding": p.page_rounding,
+        "bytes_per_token": p.bytes_per_token, "partials_per_token": p.partials_per_token,
         "card_cap": p.card_cap, "model_ctx": p.model_ctx, "kv_mode": p.kv_mode})
 }
 
@@ -1335,10 +1505,12 @@ fn unchecked_context_finding(
             format!(
                 "the daemon does not check this context before load ({reason}); advisory only: \
                  the VMM admission projection would leave room for {} tokens against {max_seq} \
-                 (free {} - weights {} - prefill scratch {} - page rounding {})",
+                 (free {} - weights {} - DeltaNet state {} - HIP runtime {} - prefill scratch {} - page rounding {})",
                 p.card_cap,
                 gib(p.free as u64),
                 gib(p.weights as u64),
+                gib(p.state as u64),
+                gib(p.runtime as u64),
                 gib(p.scratch as u64),
                 gib(p.page_rounding as u64),
             ),
@@ -1772,9 +1944,14 @@ struct AdmissionInputs<'a> {
     kv_adaptive: Option<&'a str>,
     options: SourceAdmissionOptions,
     error: Option<String>,
-    /// Bytes of the paired DFlash draft ([`paired_draft_bytes`]), taken off
+    /// Bytes of the paired DFlash side ([`speculation_owners`]), taken off
     /// each GPU's free memory before the projection; 0 without a draft.
     draft_charge: u64,
+    /// Bytes of the DeltaNet checkpoint rings, taken off the same way.
+    checkpoint_charge: u64,
+    /// HIP runtime bytes the device's free memory already excludes (an
+    /// emulated device), handed back because the projection charges them.
+    runtime_in_free: u64,
 }
 
 impl AdmissionInputs<'_> {
@@ -1789,7 +1966,11 @@ impl AdmissionInputs<'_> {
             vmm_runtime_refusal: None,
             free_vram_bytes: device
                 .free
-                .map(|n| n.saturating_sub(self.draft_charge))
+                .map(|n| {
+                    n.saturating_add(self.runtime_in_free)
+                        .saturating_sub(self.draft_charge)
+                        .saturating_sub(self.checkpoint_charge)
+                })
                 .and_then(|n| usize::try_from(n).ok()),
         }
     }
@@ -1991,6 +2172,8 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         options,
         error,
         draft_charge: 0,
+        checkpoint_charge: 0,
+        runtime_in_free: 0,
     }
 }
 
@@ -2022,9 +2205,12 @@ mod tests {
         Qwen35CardProjection {
             free: 32 << 30,
             weights: 20 << 30,
+            state: 536 << 20,
+            runtime: 256 << 20,
             scratch: 1 << 30,
             page_rounding: 128 << 20,
             bytes_per_token: 49_152,
+            partials_per_token: 3_096,
             card_cap: 200_000,
             model_ctx: 262_144,
             kv_mode: "q8",
@@ -2095,57 +2281,64 @@ mod tests {
     }
 
     #[test]
-    fn paired_dflash_draft_is_charged_against_free_memory() {
+    fn paired_draft_follows_the_gates_and_the_owners_come_off_free_memory() {
         // A 20 GB 7900 XT (gfx1100) planning the default 27B with its paired
-        // mq4 draft: the projection sees free memory net of the draft reserve
-        // the load itself takes (file + 1/8 + 512 MiB).
+        // mq4 draft.
         let xt = FitDevice {
             arch: "gfx1100".into(),
             vram_total: Some(21_458_059_264),
             free: Some(21_458_059_264),
             ..device()
         };
-        let draft = std::env::temp_dir().join(format!(
-            "hipfire-fit-draft-charge-{}.hfq",
-            std::process::id()
+        let installed = json!({"dflash_mode": "auto", "draft": "/m/draft.hfq"});
+        let inputs = admission_inputs(&installed);
+        assert!(matches!(
+            paired_draft(&inputs, &installed, None, None, &xt),
+            PairedDraft::Installed("/m/draft.hfq")
         ));
-        std::fs::write(&draft, vec![0u8; 4096]).unwrap();
-        let installed = json!({"dflash_mode": "auto", "draft": draft.to_str().unwrap()});
+
+        // The DFlash side, the checkpoint rings and an emulated device's
+        // runtime hand-back all move the free figure the projection sees.
         let mut inputs = admission_inputs(&installed);
-        inputs.draft_charge = paired_draft_bytes(&inputs, &installed, None, None, &xt);
-        assert_eq!(inputs.draft_charge, 4096 + 512 + (512 << 20));
+        inputs.draft_charge = 2_000;
+        inputs.checkpoint_charge = 300;
+        inputs.runtime_in_free = 50;
         assert_eq!(
             inputs.hints(&xt).free_vram_bytes,
-            Some(21_458_059_264 - 4096 - 512 - (512 << 20))
+            Some(21_458_059_264 + 50 - 2_300)
         );
-        std::fs::remove_file(&draft).unwrap();
 
         // Not pulled yet (header-only fit): `hipfire pull` fetches it with the
-        // model, so `auto` counts its registry size unless the floor skips it.
-        // 1,897,674,368 B is the `draft_reserve` the daemon logs for this draft.
+        // model, so `auto` counts it unless the floor skips it.
         let missing = MissingDraft {
             file: "qwen38-27b-dflash-mq4.hfq".into(),
             size_bytes: Some(1_209_603_072),
         };
         for (mode, floor, tp, want) in [
-            ("auto", None, 1, 1_897_674_368),
-            ("on", Some(28.0), 1, 1_897_674_368),
-            ("auto", Some(28.0), 1, 0),
-            ("auto", None, 2, 0),
-            ("off", None, 1, 0),
+            ("auto", None, 1, true),
+            ("on", Some(28.0), 1, true),
+            ("auto", Some(28.0), 1, false),
+            ("auto", None, 2, false),
+            ("off", None, 1, false),
         ] {
             let params = json!({"dflash_mode": mode, "tp": tp});
             let inputs = admission_inputs(&params);
             assert_eq!(
-                paired_draft_bytes(&inputs, &params, Some(&missing), floor, &xt),
+                matches!(
+                    paired_draft(&inputs, &params, Some(&missing), floor, &xt),
+                    PairedDraft::NotPulled(_)
+                ),
                 want,
                 "{mode} {floor:?} tp={tp}"
             );
         }
-        // No draft at all: nothing is charged.
+        // No draft at all: nothing is paired or charged.
         let plain = json!({"dflash_mode": "auto"});
         let inputs = admission_inputs(&plain);
-        assert_eq!(paired_draft_bytes(&inputs, &plain, None, None, &xt), 0);
+        assert!(matches!(
+            paired_draft(&inputs, &plain, None, None, &xt),
+            PairedDraft::None
+        ));
         assert_eq!(inputs.hints(&xt).free_vram_bytes, Some(21_458_059_264));
     }
 
@@ -2354,7 +2547,8 @@ mod tests {
         );
         let failure = capacity::context_finding(projection(), 262_144, false, &device(), None);
         assert_eq!(failure.verdict, Verdict::DoesNotFit);
-        assert!(failure.detail.contains("49152 bytes"));
+        // 49,152 B of KV + 3,096 B of attention partials per token.
+        assert!(failure.detail.contains("52248 bytes"));
         assert!(failure.fix.unwrap().contains("200000"));
     }
 

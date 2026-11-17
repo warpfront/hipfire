@@ -512,7 +512,29 @@ impl PrefillBatchScratch {
         })
     }
 
+    /// Free every field through the pool: buffers up to the pool's park limit
+    /// stay parked for the next owner of the same shape, larger ones return
+    /// to HIP (see [`rdna_compute::pool::MAX_PARKED_BYTES`]). For an owner
+    /// freed once per request or call whose next owner has the same rows.
     pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
+        self.free_with(gpu, Gpu::free_tensor)
+    }
+
+    /// Free every field straight to HIP, parking nothing, synchronizing the
+    /// active stream first. For a rung that is being replaced or dropped: the
+    /// fields under the park limit (the F16 sidecars, the narrow
+    /// projections) are returned too, so no part of an old rung is left
+    /// hoarded in the pool (VRAM ledger: 5.07 GiB of freed prefill scratch at
+    /// the XTX 32K point).
+    pub fn release_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
+        self.free_with(gpu, Gpu::release_tensor_immediate)
+    }
+
+    fn free_with(
+        self,
+        gpu: &mut Gpu,
+        free: fn(&mut Gpu, GpuTensor) -> HipResult<()>,
+    ) -> HipResult<()> {
         let mut first_err: Option<HipError> = None;
         let mut note = |r: HipResult<()>| {
             if let Err(e) = r {
@@ -555,7 +577,7 @@ impl PrefillBatchScratch {
             self.fa_attn_out_rot_batch,
             self.mq_prologue_ctrl,
         ] {
-            note(gpu.free_tensor(t));
+            note(free(gpu, t));
         }
         if !self.lean {
             for t in [
@@ -564,7 +586,7 @@ impl PrefillBatchScratch {
                 self.ffn_hidden_f16_batch,
                 self.fa_attn_out_rot_f16_batch,
             ] {
-                note(gpu.free_tensor(t));
+                note(free(gpu, t));
             }
         }
         // `moe_router_score_views_batch` contains non-owning aliases of
@@ -591,7 +613,7 @@ impl PrefillBatchScratch {
             self.moe_y_down_grouped,
         ] {
             if let Some(t) = t {
-                note(gpu.free_tensor(t));
+                note(free(gpu, t));
             }
         }
         match first_err {

@@ -682,6 +682,23 @@ fn slot_snapshot_kv_tag(kv_mode: hipfire_runtime::kv_mode::KvMode) -> u32 {
     }
 }
 
+/// The DFlash draft the slots route pairs, for the placement's draft reserve.
+/// This route runs its DFlash2 chain at the unbatched proposal width
+/// (`DFLASH_BLOCK_UNBATCHED`, as the engine's own block pre-parse does).
+fn slots_dflash_draft<'a>(
+    cfg: &'a EngineConfig,
+    config: &'a crate::qwen35::Qwen35Config,
+) -> Option<crate::carrier::DflashDraft<'a>> {
+    cfg.dflash_draft
+        .as_deref()
+        .map(|path| crate::carrier::DflashDraft {
+            path,
+            target: config,
+            block: hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED,
+            context_rows: cfg.cap_tokens,
+        })
+}
+
 impl Rig {
     /// Resolve the placement the slots path loads with.
     ///
@@ -744,10 +761,9 @@ impl Rig {
             } else {
                 None
             };
-            let draft = crate::carrier::draft_device_reserve_bytes(
-                mtp_head.as_ref(),
-                cfg.dflash_draft.as_deref(),
-            );
+            let dflash = slots_dflash_draft(cfg, config);
+            let draft =
+                crate::carrier::draft_device_reserve_bytes(mtp_head.as_ref(), dflash.as_ref());
             let capacity = offload::weight_capacity(
                 free_vram,
                 kv.bytes,
@@ -789,10 +805,8 @@ impl Rig {
             // runs its own chain and stays on the device.
             None
         };
-        let draft = crate::carrier::draft_device_reserve_bytes(
-            mtp_head.as_ref(),
-            cfg.dflash_draft.as_deref(),
-        );
+        let dflash = slots_dflash_draft(cfg, config);
+        let draft = crate::carrier::draft_device_reserve_bytes(mtp_head.as_ref(), dflash.as_ref());
         // The slots KV footprint is an arena product, but the caller factored
         // it through `offload::kv_reserve`, so the shared line names its real
         // rows × stride shape.

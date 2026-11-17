@@ -1402,10 +1402,8 @@ impl OrdinaryWrapperGate {
 /// (no `free_virtual`, no `alloc_virtual`). A kept owner is held by
 /// `Qwen35Scratch::reuse_virtual_pbs` across calls, so its bytes are already
 /// absent from device-free bytes and offset the full owner charge. An owner of
-/// any other shape is released and replaced; its bytes would only return to
-/// the allocator pool (not guaranteed reclaimable for a different size
-/// bucket), so it earns no credit. The implicit cache's own bytes are never
-/// credited.
+/// any other shape is released to HIP and replaced; it earns no credit. The
+/// implicit cache's own bytes are never credited.
 fn wrapper_virtual_credit_bytes(
     config: &Qwen35Config,
     physical: Option<usize>,
@@ -1492,7 +1490,7 @@ fn ordinary_wrapper_pbs_prepare(
     );
     if plan.free_virtual {
         if let Some(old) = scratch.reuse_virtual_pbs.borrow_mut().take() {
-            old.free_gpu(gpu)?;
+            old.release_gpu(gpu)?;
         }
     }
     if plan.alloc_virtual {
@@ -2315,7 +2313,7 @@ fn dense_prefill_reservation_bytes(
         .checked_add(WIDENED_VRAM_HEADROOM_BYTES)
 }
 /// Retain a widened ordinary PBS while there is room for the minimum prefill
-/// and ordinary headroom. On a discrete gfx1201 card, future VMM KV growth
+/// and ordinary headroom. On discrete gfx1100/gfx1201, future VMM KV growth
 /// reclaims the cache just before mapping if that growth needs its memory.
 /// Reserving *all* unmapped KV here made mixed-size prefills repeatedly free
 /// and reallocate the same multi-gigabyte PBS despite no KV growth.
@@ -2349,17 +2347,59 @@ fn can_retain_widened_pbs(
         .is_ok_and(|cap| cap.bytes >= unmapped.saturating_add(minimum).saturating_add(128 << 20))
 }
 
-/// gfx1100 stays off the grow-only route on purpose: there, later pp8192
-/// requests fall back to 2×4096 chunks (the freed PBS sits in the process
-/// pool, which admission cannot see), and a same-binary e2e A/B measured that
-/// fallback 0.16–0.21% faster than retaining the 8192-row PBS (gfx11-1).
+/// Large PBS buffers are owned across requests, never bounced through the
+/// pool: above its park limit each bounce would be a real hipMalloc/hipFree.
+/// Use the same growth-priority lifecycle on discrete gfx1100 as gfx1201.
+/// UMA and the existing explicit opt-out keep the conservative lifecycle.
 fn widened_pbs_grow_only(gpu: &Gpu) -> bool {
-    gpu.arch == "gfx1201"
-        && !gpu.is_uma()
-        && hipfire_config::developer_var("HIPFIRE_WIDENED_PBS_GROW_ONLY")
+    widened_pbs_grow_only_for(
+        &gpu.arch,
+        gpu.is_uma(),
+        hipfire_config::developer_var("HIPFIRE_WIDENED_PBS_GROW_ONLY")
             .ok()
             .as_deref()
-            != Some("0")
+            == Some("0"),
+    )
+}
+
+fn widened_pbs_grow_only_for(arch: &str, uma: bool, disabled: bool) -> bool {
+    matches!(arch, "gfx1100" | "gfx1201") && !uma && !disabled
+}
+
+/// A short prompt/tail may use an existing larger owner, but on gfx1100 an
+/// admitted rung downgrade must shed the old larger owner. The gfx1201
+/// grow-only matching policy is unchanged.
+fn widened_pbs_rows_reusable(
+    arch: &str,
+    cached: (usize, bool),
+    needed: (usize, bool),
+    limit: usize,
+) -> bool {
+    cached.1 == needed.1 && cached.0 >= needed.0 && (arch != "gfx1100" || cached.0 <= limit)
+}
+
+/// Credit the retained gfx1100 owner in the once-per-prompt outer planner,
+/// just as the inner planner credits it. Otherwise its live bytes would be
+/// charged a second time and a repeated request would choose a smaller outer
+/// chunk despite reusing the very same scratch. No owner, UMA/opt-out, and
+/// every other architecture (including gfx1201) keep zero outer credit.
+fn retained_prefill_credit_bytes(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    owner: Option<&PrefillBatchScratch>,
+) -> usize {
+    if gpu.arch != "gfx1100" || !widened_pbs_grow_only(gpu) {
+        return 0;
+    }
+    owner
+        .and_then(|p| {
+            if p.lean {
+                lean_dense_prefill_allocation_bytes(config, p.max_batch)
+            } else {
+                dense_prefill_allocation_bytes(config, p.max_batch)
+            }
+        })
+        .unwrap_or(0)
 }
 
 /// Give a growing VMM KV mapping priority over optional cached PBS. This
@@ -2390,7 +2430,7 @@ pub(crate) fn release_widened_pbs_for_kv_growth(
         .is_some_and(|needed| gpu.planned_capacity().is_ok_and(|cap| cap.bytes >= needed));
     if !keep {
         if let Some(old) = scratch.widened_prefill_batch.borrow_mut().take() {
-            old.free_gpu(gpu)?;
+            old.release_gpu(gpu)?;
         }
     }
     Ok(())
@@ -2631,15 +2671,21 @@ pub fn ordinary_prefill_chunk_limit(
 /// bytes, so the result is a lower bound on the ceiling taken once that
 /// allocation has happened, provided nothing else shrinks free memory
 /// further. Lets a caller bound a prefill's chunk plan before the prefill's
-/// owners exist (VMM lane admission).
+/// owners exist (VMM lane admission). A retained gfx1100 PBS is credited by
+/// the same owner-aware query as the inner prefill, never charged twice;
+/// pass `None` when planning before the scratch owner exists.
 pub fn ordinary_prefill_chunk_limit_deducting(
     gpu: &Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     dn_state: &DeltaNetState,
     kv_cache: &llama::KvCache,
+    scratch: Option<&Qwen35Scratch>,
     free_deduction: usize,
 ) -> HipResult<usize> {
+    let retained = scratch.map(|s| s.widened_prefill_batch.borrow());
+    let cached = retained.as_ref().and_then(|p| p.as_ref());
+    let cached = cached.filter(|p| retained_prefill_credit_bytes(gpu, config, Some(p)) != 0);
     ordinary_prefill_chunk_limit_with_cache(
         gpu,
         weights,
@@ -2647,7 +2693,7 @@ pub fn ordinary_prefill_chunk_limit_deducting(
         dn_state,
         kv_cache,
         None,
-        None,
+        cached,
         RESIDENT_MOE_CHUNK_ROWS,
         free_deduction,
     )
@@ -3962,12 +4008,27 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 // legacy `prefill_batch` cache).
                 let mut cached = scratch.widened_prefill_batch.borrow_mut();
                 let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, owned_rows);
-                if !cached
-                    .as_ref()
-                    .is_some_and(|p| p.max_batch >= owned_rows && p.lean == lean)
-                {
+                // Reuse a successfully downgraded owner during the existing
+                // allocation-failure memo window too: rebuilding that same
+                // rung would now be a real hipMalloc/hipFree, not a pool hit.
+                let reuse_rows = if gpu.arch == "gfx1100" {
+                    widened_alloc_clamp(owned_rows)
+                } else {
+                    owned_rows
+                };
+                if !cached.as_ref().is_some_and(|p| {
+                    widened_pbs_rows_reusable(
+                        &gpu.arch,
+                        (p.max_batch, p.lean),
+                        (reuse_rows, lean),
+                        limit,
+                    )
+                }) {
+                    // A rung change returns the old scratch to HIP at once,
+                    // not to the pool: parked, its gigabytes would stay
+                    // invisible to admission and shrink the next rung.
                     if let Some(old) = cached.take() {
-                        let _ = old.free_gpu(gpu);
+                        old.release_gpu(gpu)?;
                     }
                     // Admission plans from device capacity; the allocation is
                     // the real check. Step down a rung only when it really
@@ -4004,9 +4065,23 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 own_pbs.as_ref().unwrap()
             }
             None => {
-                // `limit == max_batch` on every legacy path; on the admitted
-                // but memory-narrowed path it sizes the owned scratch to the
-                // executed 512 cadence instead of the unadmitted request.
+                // Admission can drop all the way to the incumbent 512-row
+                // path. Shed the previous larger owner here too, rather than
+                // leaving it resident just because `wide` is now false.
+                if gpu.arch == "gfx1100"
+                    && !gpu.graphs.capture_mode
+                    && !gpu.replay.is_recording()
+                    && scratch
+                        .widened_prefill_batch
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|p| p.max_batch > limit)
+                {
+                    if let Some(old) = scratch.widened_prefill_batch.borrow_mut().take() {
+                        old.release_gpu(gpu)?;
+                    }
+                }
+                // Size the incumbent scratch to the executed cadence.
                 own_pbs = Some(PrefillBatchScratch::new(gpu, config, plan.pbs_rows)?);
                 own_pbs.as_ref().unwrap()
             }
@@ -4267,7 +4342,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             if can_retain_widened_pbs(gpu, kv_cache, config, mq3_wide_projection(gpu, weights)) {
                 *scratch.widened_prefill_batch.borrow_mut() = Some(owned);
             } else {
-                let _ = owned.free_gpu(gpu);
+                let _ = owned.release_gpu(gpu);
             }
         }
     } else if let Some(owned) = own_pbs {
@@ -8320,6 +8395,62 @@ mod tests {
             [DType::Q8_0; 4],
             true
         ));
+    }
+
+    #[test]
+    fn widened_pbs_reuses_the_rung_and_short_tails_but_releases_a_downgrade() {
+        for lean in [false, true] {
+            for rows in [1024, 2048, 4096, 8192] {
+                for needed in [2, 134, rows / 2, rows] {
+                    assert!(widened_pbs_rows_reusable(
+                        "gfx1100",
+                        (rows, lean),
+                        (needed, lean),
+                        rows,
+                    ));
+                }
+                assert!(!widened_pbs_rows_reusable(
+                    "gfx1100",
+                    (rows, lean),
+                    (rows / 2, lean),
+                    rows / 2,
+                ));
+                assert!(!widened_pbs_rows_reusable(
+                    "gfx1100",
+                    (rows, lean),
+                    (rows, !lean),
+                    rows,
+                ));
+                assert!(!widened_pbs_rows_reusable(
+                    "gfx1100",
+                    (rows, lean),
+                    (rows * 2, lean),
+                    rows * 2,
+                ));
+                // gfx1201's existing larger-owner policy stays unchanged.
+                assert!(widened_pbs_rows_reusable(
+                    "gfx1201",
+                    (rows, lean),
+                    (rows / 2, lean),
+                    rows / 2,
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn widened_pbs_growth_priority_is_discrete_gfx1100_and_gfx1201_only() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(widened_pbs_grow_only_for(arch, false, false));
+            assert!(!widened_pbs_grow_only_for(arch, true, false), "UMA");
+            assert!(
+                !widened_pbs_grow_only_for(arch, false, true),
+                "explicit opt-out"
+            );
+        }
+        for arch in ["gfx1151", "gfx1200", "gfx942", "unknown"] {
+            assert!(!widened_pbs_grow_only_for(arch, false, false));
+        }
     }
 
     #[test]

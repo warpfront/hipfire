@@ -16,7 +16,7 @@ use crate::dispatch::{Gpu, HIP_DEVICE_ATTRIBUTE_INTEGRATED};
 use hip_bridge::{HipError, HipResult, HipRuntime, HIP_ERROR_OUT_OF_MEMORY};
 use hipfire_config::emu::{self, EmuOptions, EmuProfile, HostFacts, MemoryKind};
 use hipfire_config::emu_budget::{
-    self, AllocationClass, BudgetError, BudgetId, BudgetLimits, BudgetSnapshot,
+    self, AllocationClass, BudgetError, BudgetId, BudgetLimits, BudgetSnapshot, BudgetUsage,
 };
 
 /// Env spelling of the logical multi-GPU emulation knob (unrelated to SKU
@@ -115,6 +115,46 @@ pub(crate) fn budget_limits(
             profile.id
         )),
     }
+}
+
+/// Device bytes a profile's ledger commits at install for the HIP runtime
+/// ([`hip_bridge::HIP_RUNTIME_RESERVE_BYTES`]): the context, code objects and
+/// graph pools a physical card of that capacity also spends before the first
+/// model allocation. Discrete profiles only: a UMA scenario keeps the HIP
+/// runtime in host memory, which its host reserve already models.
+fn runtime_reserve_bytes(limits: &BudgetLimits) -> u64 {
+    if limits.uma {
+        0
+    } else {
+        hip_bridge::HIP_RUNTIME_RESERVE_BYTES as u64
+    }
+}
+
+/// `(free, total)` an installed profile reports before any model allocation:
+/// [`Gpu::device_mem_info`]'s capped figure with the runtime reserve already
+/// committed. Pure, so `hipfire fit` predicts exactly what the daemon sees
+/// without opening a GPU. `raw_free` is the UMA-safe free figure of the host
+/// device (`hipMemGetInfo`, or amdgpu sysfs when no runtime is open).
+pub fn initial_mem_info(options: &EmuOptions, raw_free: u64) -> Result<(u64, u64), String> {
+    let profile = emu::profile(&options.profile_id).map_err(|error| error.to_string())?;
+    let limits = budget_limits(profile, options)?;
+    let snapshot = BudgetSnapshot {
+        limits,
+        committed: BudgetUsage {
+            device_bytes: runtime_reserve_bytes(&limits),
+            ..BudgetUsage::default()
+        },
+        pending: BudgetUsage::default(),
+    };
+    Ok(crate::uma_memory::emu_capped_mem_info(raw_free, &snapshot))
+}
+
+/// [`runtime_reserve_bytes`] of the ledger limits `options` would install: the
+/// HIP runtime bytes the profile's free memory already excludes at the first
+/// model allocation (0 for a UMA profile).
+pub fn runtime_reserve(options: &EmuOptions) -> Result<u64, String> {
+    let profile = emu::profile(&options.profile_id).map_err(|error| error.to_string())?;
+    Ok(runtime_reserve_bytes(&budget_limits(profile, options)?))
 }
 
 /// `min(requested, free.saturating_sub(reserved))` — the Phase-2 handoff math.
@@ -236,8 +276,20 @@ pub(crate) fn install_for_device(
     let limits = budget_limits(profile, &options)
         .map_err(|message| HipError::new(0, &format!("HIPFIRE_EMU: {message}")))?;
     let budget = emu_budget::install(&pci_bdf, limits).map_err(|error| install_error(&error))?;
+    // The HIP runtime's own footprint is part of what a physical card of this
+    // capacity has already spent when the first model allocation arrives.
+    let runtime_reserve = runtime_reserve_bytes(&limits);
+    if runtime_reserve > 0 {
+        hip_bridge::charge_emu_runtime_reserve().map_err(|error| {
+            HipError::new(
+                0,
+                &format!("HIPFIRE_EMU: HIP runtime reserve {runtime_reserve} B refused: {error}"),
+            )
+        })?;
+    }
     eprintln!(
         "[emu] profile {} installed on device {device_id} ({pci_bdf}): capacity cap {} B \
+         less {runtime_reserve} B HIP runtime reserve \
          (capacity-only; execution stays on the physical {detected_arch} host)",
         profile.id, limits.device_bytes,
     );
@@ -536,6 +588,50 @@ mod tests {
             }),
         };
         assert!(budget_limits(uma_profile, &invalid).is_err());
+    }
+
+    #[test]
+    fn discrete_profile_reports_capacity_less_the_runtime_reserve() {
+        let reserve = hip_bridge::HIP_RUNTIME_RESERVE_BYTES as u64;
+        let options = EmuOptions {
+            profile_id: "rx7900xt".to_owned(),
+            uma: None,
+        };
+        // A 24 GiB host card: the 20 GiB profile caps free at capacity - reserve.
+        assert_eq!(
+            initial_mem_info(&options, 24 * GIB),
+            Ok((20 * GIB - reserve, 20 * GIB))
+        );
+        // A host with less free memory than the profile keeps its own figure.
+        assert_eq!(
+            initial_mem_info(&options, 10 * GIB),
+            Ok((10 * GIB, 20 * GIB))
+        );
+        assert!(initial_mem_info(
+            &EmuOptions {
+                profile_id: "no-such-card".to_owned(),
+                uma: None,
+            },
+            GIB
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn uma_profile_charges_no_runtime_reserve() {
+        let options = EmuOptions {
+            profile_id: "strix-point".to_owned(),
+            uma: Some(UmaScenario::default()),
+        };
+        let profile = emu::profile("strix-point").unwrap();
+        assert_eq!(
+            runtime_reserve_bytes(&budget_limits(profile, &options).unwrap()),
+            0
+        );
+        assert_eq!(
+            initial_mem_info(&options, 100 * GIB),
+            Ok((16 * GIB, 16 * GIB))
+        );
     }
 
     #[test]

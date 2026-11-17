@@ -1225,6 +1225,7 @@ impl Qwen35VmmStore {
                         config,
                         template_dn,
                         template_kv,
+                        None,
                         deduction,
                     ) {
                         Ok(min_ceiling) => engine.checkpoint_bound(prompt_len, min_ceiling),

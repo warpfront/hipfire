@@ -23,6 +23,7 @@ mod rocsolver;
 pub mod site_ledger;
 mod vmm;
 
+pub use emu_budget::{charge_emu_runtime_reserve, HIP_RUNTIME_RESERVE_BYTES};
 pub use error::{
     register_first_illegal_address_hook, HipError, HipErrorCode, HipResult, LaunchContext,
     HIP_ERROR_ILLEGAL_ADDRESS, HIP_ERROR_INVALID_IMAGE, HIP_ERROR_OUT_OF_MEMORY,
@@ -34,8 +35,8 @@ pub use ffi::kernel_timing::{
     reject_kernel_timing_backend, KernelTimingCoverage, KernelTimingPool, KernelTimingReport,
 };
 pub use ffi::weight_slab::{
-    device_alloc_charge, SlabMode, SlabScopeSummary, SlabStats, ALLOC_GRANULE, DEFAULT_SLAB_MODE,
-    SLAB_ALIGN,
+    device_alloc_charge, packed_layout, PackedLayout, SlabMode, SlabScopeSummary, SlabStats,
+    ALLOC_GRANULE, DEFAULT_SLAB_MODE, SLAB_ALIGN,
 };
 pub use ffi::{arm_hip_fault, declare_qwen4_host_mapping, keep_host_memory_out_of_reclaim};
 pub use ffi::{launch_counters, memory_effects, vmm_tlb_pokes};

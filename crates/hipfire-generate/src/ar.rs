@@ -4676,7 +4676,13 @@ pub fn generate(
             let deduction =
                 qwen35::prefill::request_kv_growth_deduction(gpu, kv, m.seq_pos + new_tokens.len());
             match qwen35::prefill::ordinary_prefill_chunk_limit_deducting(
-                gpu, weights, config, dn, kv, deduction,
+                gpu,
+                weights,
+                config,
+                dn,
+                kv,
+                Some(scratch),
+                deduction,
             ) {
                 Ok(limit) => limit,
                 Err(e) => {

@@ -85,6 +85,12 @@ pub mod dflash_verify_pm4;
 pub mod dflash_window_build;
 /// Compressed MTP draft vocabulary sliced from the trunk lm_head (exact gfx1100 default).
 pub mod draft_vocab;
+/// Device footprint of a Qwen3.5 load's weights, DeltaNet state, flash
+/// partials and paired DFlash draft, derived from config and file headers: the
+/// one set of terms the capacity projection, `hipfire fit` and the carrier's
+/// post-weight context cap all charge.
+#[cfg(feature = "deltanet")]
+pub mod footprint;
 /// SP3 Task 2 — `forward_batch_slots`, the N-slot forward pass. A PARALLEL
 /// entry point to `qwen35::forward_prefill_batch_with_pbs_opts` (never a
 /// modification of it — see the module doc for why), routing attention

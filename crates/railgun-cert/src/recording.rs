@@ -799,6 +799,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "deferred-free-while-capturing",
+        predicates: &[IsRecording, CaptureMode, GraphSlotCapturing],
+        condition: "Gpu::hip_free_allowed (dispatch.rs): no `hipFree` (nor the stream synchronize before it) while `capture_mode`, a verify/replay graph slot capture, `is_recording()` or a HIP plan is active, else the freed buffer parks in the GpuPool; qwen35 forward_prefill_batch_with_pbs_opts_inner sheds a larger widened prefill-batch owner on gfx1100 only when `!capture_mode && !is_recording()` (prefill.rs)",
+        effect: Lifecycle,
+        switches: "eager: return the buffer to HIP / release the widened owner; captured/recorded: keep it parked or resident",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "decides only whether memory is returned to the driver; no launch is selected or reshaped, and the recorded body still binds the same buffers",
+        reaches: &[],
+    },
+    Decision {
         id: "memcpy-htod-auto",
         predicates: &[CaptureMode],
         condition: "Gpu::memcpy_htod_auto: async H2D on the active stream while capturing, else synchronous (dispatch.rs:2336-2347); Gpu::htod_stream_ordered: async H2D on the active stream while capturing, else async H2D on the active stream plus one wait on it (blocking copy with no active stream); Gpu::upload_stream_ordered (HIPFIRE_STREAM_ORDERED_COPIES steady copy stream): the same split, async H2D on the steady copy stream while capturing, else async H2D plus one wait on that stream, falling back to memcpy_htod_auto with no stream",
@@ -2327,8 +2338,8 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
         function: "forward_prefill_batch_with_pbs_opts_inner",
-        occurrences: 2,
-        decisions: &["gfx1151-fa-pair-merge"],
+        occurrences: 4,
+        decisions: &["gfx1151-fa-pair-merge", "deferred-free-while-capturing"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
@@ -3170,6 +3181,12 @@ pub const SITES: &[Site] = &[
         function: "fp8_stream_active",
         occurrences: 2,
         decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "hip_free_allowed",
+        occurrences: 4,
+        decisions: &["deferred-free-while-capturing"],
     },
     Site {
         file: "rdna-compute/src/dispatch.rs",

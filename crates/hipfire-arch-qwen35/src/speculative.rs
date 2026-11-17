@@ -1290,6 +1290,15 @@ impl DnCbExtents {
 /// to match the source state's tensors. Allocate once per slot, reuse across
 /// all speculative cycles.
 ///
+/// Every backup buffer of every family and layer is a view of ONE device
+/// allocation ([`HipRuntime::alloc_packed`](hip_bridge::HipRuntime::alloc_packed),
+/// each sub-range on a 4 KiB boundary), so ROCr's 2 MiB rounding is paid once
+/// per snapshot instead of once per tensor (a 385 MiB snapshot of
+/// qwen3.8-27B occupied 530 MiB as ~400 separate allocations; it occupies
+/// 386 MiB packed). The views are `SlabView` buffers: every copy, bulk-table
+/// pointer and `exchange_buffers` handle swap works unchanged, and the
+/// allocation returns to HIP when its last view is freed.
+///
 /// Includes the default-on Q8 error-feedback residual (`s_ef_residual`) when
 pub struct DeltaNetSnapshot {
     s_matrix_bufs: Vec<DeviceBuffer>,
@@ -1513,23 +1522,15 @@ impl DeltaNetSnapshot {
         }
     }
 
-    /// Allocate backup buffers matching `state`'s shapes (incl. EF residual).
-    /// A mid-way allocation failure frees the buffers already allocated.
+    /// Allocate backup buffers matching `state`'s shapes (incl. EF residual and
+    /// GDN carry) as views of one packed allocation ([`Self::backup_sizes`]).
+    /// The allocation is all-or-nothing, so a failure leaves nothing behind.
     pub fn new_for(gpu: &mut Gpu, state: &DeltaNetState) -> HipResult<Self> {
+        let sizes = Self::backup_sizes(state);
+        let mut views = gpu.hip.alloc_packed(&sizes, false)?.into_iter();
         let mut bufs: [Vec<DeviceBuffer>; 8] = Default::default();
-        for (i, src) in live_families(state).into_iter().enumerate() {
-            bufs[i].reserve_exact(src.len());
-            for t in src {
-                match gpu.hip.malloc(t.buf.size()) {
-                    Ok(b) => bufs[i].push(b),
-                    Err(e) => {
-                        for b in bufs.into_iter().flatten() {
-                            let _ = gpu.hip.free(b);
-                        }
-                        return Err(e);
-                    }
-                }
-            }
+        for (back, live) in bufs.iter_mut().zip(live_families(state)) {
+            back.extend(views.by_ref().take(live.len()));
         }
         let [s_matrix_bufs, s_scale_bufs, conv_state_bufs, s_ef_residual_bufs, c0, c1, c2, c3] =
             bufs;
@@ -1654,6 +1655,39 @@ impl DeltaNetSnapshot {
             .flat_map(|fam| fam.iter())
             .map(|t| t.buf.size() as u64)
             .sum()
+    }
+
+    /// Byte size of every backup buffer of a snapshot of `state`, in family
+    /// order ([`live_families`]) and layer order within a family: one entry
+    /// per live tensor, the size it has today. The packed allocation lays
+    /// these out back to back.
+    fn backup_sizes(state: &DeltaNetState) -> Vec<usize> {
+        live_families(state)
+            .iter()
+            .flat_map(|fam| fam.iter())
+            .map(|t| t.buf.size())
+            .collect()
+    }
+
+    /// Device memory a snapshot really occupies when its backup buffers have
+    /// `allocation_sizes`: [`Self::new_for`] packs them into one allocation
+    /// ([`hip_bridge::packed_layout`], 4 KiB-aligned back to back), which ROCr
+    /// rounds once ([`hip_bridge::device_alloc_charge`]). Before the packing, a
+    /// 386 MiB snapshot of the 27B occupied 530 MiB because its 3 MiB and
+    /// 2.5 MiB carry tensors took 4 MiB each (`vram-ledger/LEDGER.md` §2).
+    ///
+    /// This is the one place that knows how a snapshot sits in device
+    /// memory: the post-load fit's checkpoint charge ([`Self::device_charge_for`]),
+    /// `hipfire fit` and the load's capacity projection
+    /// (`footprint::dn_snapshot_device_charge`) all read it.
+    pub fn device_charge_of(allocation_sizes: impl IntoIterator<Item = usize>) -> u64 {
+        let sizes: Vec<usize> = allocation_sizes.into_iter().collect();
+        hip_bridge::device_alloc_charge(hip_bridge::packed_layout(&sizes).total) as u64
+    }
+
+    /// [`Self::device_charge_of`] for a snapshot of `state`.
+    pub fn device_charge_for(state: &DeltaNetState) -> u64 {
+        Self::device_charge_of(Self::backup_sizes(state))
     }
 
     /// Number of EF residual backup buffers (0 when EF is off).
@@ -1987,6 +2021,12 @@ impl DeltaNetSnapshot {
     /// orphans this device memory — the source of the per-reset GPU-memory leak
     /// that OOMs long-lived serves (a fresh `hipMalloc` per reset, never freed).
     /// Every site that drops a snapshot must route through here.
+    ///
+    /// The buffers are views of one allocation ([`Self::new_for`]): each is
+    /// released through `HipRuntime::free`, never pooled, and the allocation
+    /// returns to HIP with the last view (after [`Self::exchange_buffers`]
+    /// some of this snapshot's views may live in a state, and the state's
+    /// own free releases them).
     pub fn free_gpu(self, gpu: &mut Gpu) {
         for b in self
             .s_matrix_bufs
@@ -11551,6 +11591,7 @@ pub fn dflash_seed_ceiling(
     config: &Qwen35Config,
     dn_state: &DeltaNetState,
     kv_cache: &KvCache,
+    scratch: Option<&Qwen35Scratch>,
     free_deduction: usize,
 ) -> HipResult<usize> {
     if dflash_legacy_prefill() {
@@ -11562,6 +11603,7 @@ pub fn dflash_seed_ceiling(
         config,
         dn_state,
         kv_cache,
+        scratch,
         free_deduction,
     )
 }
@@ -11734,6 +11776,7 @@ impl SeedPrefill {
             target.config,
             target.dn_state,
             target.kv_cache,
+            Some(target.scratch),
             qwen35::prefill::request_kv_growth_deduction(gpu, target.kv_cache, end_tokens),
         ) {
             Ok(limit) => limit,
@@ -13703,6 +13746,48 @@ mod dn_stream_tests {
             sn.stream_identity().schema_version,
             GDN_STREAM_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn snapshot_backups_pack_into_one_allocation() {
+        use hip_bridge::{device_alloc_charge, packed_layout, SLAB_ALIGN};
+
+        // Fake state: family order, layer by layer, one entry per live tensor.
+        let with = state(LIVE, Some(GEOM));
+        let sizes = DeltaNetSnapshot::backup_sizes(&with);
+        assert_eq!(sizes.len(), 8 * LAYERS);
+        assert_eq!(
+            sizes.iter().sum::<usize>() as u64,
+            DeltaNetSnapshot::bytes_for(&with)
+        );
+        let plain = DeltaNetSnapshot::backup_sizes(&state(LIVE, None));
+        assert_eq!(plain.len(), 4 * LAYERS, "no carry, no carry buffers");
+        assert_eq!(&sizes[..4 * LAYERS], &plain[..]);
+
+        // The layout is dense, page aligned and overlap free.
+        let layout = packed_layout(&sizes);
+        for ((off, size), next) in layout.offsets.iter().zip(&sizes).zip(&layout.offsets[1..]) {
+            assert_eq!(off % SLAB_ALIGN, 0);
+            assert_eq!(*next, off + size.next_multiple_of(SLAB_ALIGN));
+        }
+        assert!(layout.total >= sizes.iter().sum::<usize>());
+        assert!(layout.total < sizes.iter().sum::<usize>() + sizes.len() * SLAB_ALIGN);
+
+        // qwen3.8-27B (48 GDN layers): S 0.75 MiB, scales 24 KiB, conv
+        // 120 KiB, EF 1.5 MiB, carry 3.0 MiB / 120 KiB / 2.5 MiB / 24 KiB.
+        let layer = [
+            786_432, 24_576, 122_880, 1_572_864, 3_145_728, 122_880, 2_621_440, 24_576,
+        ];
+        let big: Vec<usize> = (0..48).flat_map(|_| layer).collect();
+        let mib = 1usize << 20;
+        let separate: usize = big.iter().map(|&s| device_alloc_charge(s)).sum();
+        let packed = device_alloc_charge(packed_layout(&big).total);
+        assert_eq!(
+            separate / mib,
+            529,
+            "ledger: a 385 MiB snapshot took 530 MiB"
+        );
+        assert_eq!(packed, 386 * mib, "one rounding for the whole snapshot");
     }
 
     #[test]

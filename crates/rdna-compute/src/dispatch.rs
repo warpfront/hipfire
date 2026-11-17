@@ -9338,7 +9338,9 @@ impl Gpu {
         Ok(tensor)
     }
 
-    /// Free a tensor. Contiguous buffers return to the pool. VMM owners run
+    /// Free a tensor. A contiguous buffer of at most
+    /// [`crate::pool::MAX_PARKED_BYTES`] returns to the pool; a larger one
+    /// goes back to HIP at once (see [`Self::pool_release`]). VMM owners run
     /// arena release once: success removes the registration; failure **retains**
     /// the arena for [`Self::retry_vmm_cleanup`] / [`Self::ensure_vmm_cleaned`]
     /// and returns the error (never a false clean free).
@@ -9406,10 +9408,57 @@ impl Gpu {
                 &format!("refusing to pool non-owning tensor at 0x{key:x}"),
             ))
         } else {
-            self.pool.free(tensor.buf);
-            Ok(())
+            self.pool_release(tensor.buf)
         }
     }
+
+    /// Hand a freed contiguous buffer to the pool, which parks it or, above
+    /// [`crate::pool::MAX_PARKED_BYTES`], returns it to HIP.
+    ///
+    /// The `hipFree` of a large buffer is ordered after the work queued on the
+    /// active stream (the same synchronization as
+    /// [`Self::release_tensor_immediate`]). It never runs while `hipFree` and
+    /// stream synchronization are illegal: a large buffer freed inside a HIP
+    /// graph capture, a PM4/plan recording or a capture-mode body stays
+    /// parked until the next drain or out-of-memory retry, which also keeps
+    /// its address valid for the graph or tape that recorded it. A caller that
+    /// frees a buffer above the limit more often than once per request owns
+    /// it instead (see the prefill scratch owner), or this path would
+    /// `hipMalloc` and `hipFree` it every time.
+    pub(crate) fn pool_release(&mut self, buf: DeviceBuffer) -> HipResult<()> {
+        let direct = buf.size() > crate::pool::MAX_PARKED_BYTES && self.hip_free_allowed();
+        if direct {
+            if let Some(stream) = self.active_stream.as_ref() {
+                if let Err(err) = self.hip.stream_synchronize(stream) {
+                    // Pending work could not be proven finished: park, never free.
+                    let _ = self.pool.release(&self.hip, buf, false);
+                    return Err(err);
+                }
+            }
+        }
+        self.pool.release(&self.hip, buf, direct)
+    }
+
+    /// Whether `hipFree`, and the stream synchronization before it, may run
+    /// now: false while a graph capture is open (the Gpu's capture flags and
+    /// a HIP query of the active stream, which also covers a capture begun
+    /// with [`Self::begin_stream_capture`]) or a plan/PM4 tape is recording.
+    /// An unanswerable query counts as "not allowed".
+    fn hip_free_allowed(&self) -> bool {
+        if self.graphs.capture_mode
+            || self.graphs.verify.capturing.is_some()
+            || self.graphs.replay.capturing.is_some()
+            || self.replay.is_recording()
+            || self.hip.plan_active()
+        {
+            return false;
+        }
+        match self.active_stream.as_ref() {
+            Some(stream) => matches!(self.hip.stream_is_capturing(stream), Ok(false)),
+            None => true,
+        }
+    }
+
     /// Calibration capture hook for an instrumented linear: if a collector is
     /// armed and `weight`'s buffer pointer is a known calibration target, invoke
     /// `capture(name, input)`. Zero-cost (`is_none()` + return) when no collector
@@ -9680,7 +9729,9 @@ impl Gpu {
     /// created (e.g. via [`Self::zeros`]) and must not race a pending async
     /// memset on the active stream, and for one-off load scratch the pool
     /// would otherwise keep. Rejects VMM owners and borrowed buffers
-    /// with the same policy as [`Self::free_tensor`].
+    /// with the same policy as [`Self::free_tensor`]. During graph capture or
+    /// tape/plan recording it falls back to `free_tensor`: no synchronization
+    /// or hipFree may invalidate the open capture or its recorded pointers.
     pub fn release_tensor_immediate(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         let key = tensor.buf.as_ptr() as usize;
@@ -9701,6 +9752,9 @@ impl Gpu {
                 0,
                 &format!("refusing to free non-owning tensor at 0x{key:x}"),
             ));
+        }
+        if !self.hip_free_allowed() {
+            return self.free_tensor(tensor);
         }
         // zeros() may have queued an async memset on the active stream; free
         // must not race that write.

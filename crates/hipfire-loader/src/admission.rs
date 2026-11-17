@@ -1374,19 +1374,49 @@ pub struct SequenceResolution {
 pub struct Qwen35CardProjection {
     /// Free device bytes before the load (`KvBackendHints::free_vram_bytes`).
     pub free: usize,
-    /// Projected resident weights: the HFQ file plus 12.5% and 512 MiB.
+    /// Projected resident weights: every tensor of the HFQ file at its
+    /// payload size, ROCr-rounded per allocation (device weights are exactly
+    /// the file, plus the rounding).
     pub weights: usize,
+    /// The DeltaNet recurrent state and stream carry the load allocates after
+    /// the weights (the default Q8 + error-feedback state).
+    pub state: usize,
+    /// The HIP runtime's own footprint (context, code objects, graph pools):
+    /// [`hip_bridge::HIP_RUNTIME_RESERVE_BYTES`].
+    pub runtime: usize,
     /// The minimum viable prefill scratch reservation.
     pub scratch: usize,
     /// VMM page rounding across the K/V owners.
     pub page_rounding: usize,
     /// Selected K+V bytes per token over the full-attention layers.
     pub bytes_per_token: usize,
+    /// Flash-attention partials per token of context capacity: the shared
+    /// partials buffer is sized from the load's provisional context, so every
+    /// token of it costs this on top of its KV bytes.
+    pub partials_per_token: usize,
     /// Largest context the remaining free memory holds.
     pub card_cap: usize,
     /// The checkpoint's trained window (`max_position_embeddings`).
     pub model_ctx: usize,
     pub kv_mode: &'static str,
+}
+
+impl Qwen35CardProjection {
+    /// Bytes charged before any KV token: everything the load makes resident
+    /// or reserves besides the KV rows and their per-token partials.
+    pub fn fixed_bytes(&self) -> usize {
+        self.weights
+            .saturating_add(self.state)
+            .saturating_add(self.runtime)
+            .saturating_add(self.scratch)
+            .saturating_add(self.page_rounding)
+    }
+
+    /// Bytes one token of context costs: its KV rows plus its share of the
+    /// flash-attention partials.
+    pub fn bytes_per_context_token(&self) -> usize {
+        self.bytes_per_token.saturating_add(self.partials_per_token)
+    }
 }
 
 /// The context a Qwen4 admission works from: an omitted `max_seq` on a
@@ -1929,18 +1959,290 @@ mod qwen35_measured_fit_tests {
     }
 }
 
-/// Device bytes a Qwen3.5 load reserves for a DFlash draft file of
-/// `file_bytes` before it caps the context (`max_seq budget: draft_reserve`):
-/// the carrier's own formula, for `hipfire fit`.
-pub fn qwen35_draft_reserve_bytes(file_bytes: u64) -> u64 {
-    hipfire_arch_qwen35::carrier::draft_reserve_for_bytes(file_bytes)
+/// The measured-term projection of the 27B (`vram-ledger/LEDGER.md` is the
+/// oracle), on a synthesized header: the 27B's real text config and a few
+/// tensors whose rounded device bytes are known by hand.
+#[cfg(test)]
+mod qwen35_projection_tests {
+    use super::*;
+    use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
+
+    const MIB: usize = 1 << 20;
+
+    fn qwen38_27b_metadata() -> String {
+        let layers: Vec<&str> = (0..64)
+            .map(|i| {
+                if i % 4 == 3 {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                }
+            })
+            .collect();
+        serde_json::json!({"config": {"text_config": {
+            "hidden_size": 5120, "num_hidden_layers": 64, "num_attention_heads": 24,
+            "num_key_value_heads": 4, "head_dim": 256, "intermediate_size": 17408,
+            "vocab_size": 248320, "rms_norm_eps": 1e-6,
+            "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16, "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128, "layer_types": layers,
+            "max_position_embeddings": 262144,
+        }}})
+        .to_string()
+    }
+
+    /// A header with the 27B's config and three tensors: a 3 MiB embedding
+    /// (one 4 MiB allocation), a 47,349,760 B MLP projection (46 MiB) and a
+    /// 100 B norm (one 4 KiB slab page).
+    fn synthetic_27b(name: &str) -> (std::path::PathBuf, usize) {
+        let tensor = |name: &str, quant_type: u8, bytes: usize| HfqMemTensor {
+            name: name.to_owned(),
+            quant_type,
+            shape: vec![4, 4],
+            group_size: 0,
+            data: vec![0u8; bytes],
+        };
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-projection-{}-{name}.hfq",
+            std::process::id()
+        ));
+        write_hfqm_package_mem(
+            &path,
+            5,
+            &qwen38_27b_metadata(),
+            &[
+                tensor("model.language_model.embed_tokens.weight", 3, 3 * MIB),
+                tensor(
+                    "model.language_model.layers.0.mlp.up_proj.weight",
+                    44,
+                    47_349_760,
+                ),
+                tensor("model.language_model.norm.weight", 2, 100),
+            ],
+        )
+        .unwrap();
+        // Under the qwen35 `64m` slab default: the 3 MiB embedding packs at its
+        // own size, the layer's 45.2 MiB projection rides the layer slab (one
+        // 2 MiB rounding: 46 MiB), the norm takes one 4 KiB page.
+        (path, 49 * MIB + 4096)
+    }
+
+    fn hints(free: usize) -> KvBackendHints<'static> {
+        KvBackendHints {
+            kv_mode: Some("q8"),
+            kv_k: None,
+            kv_v: None,
+            qwen_default_q8: true,
+            kv_adaptive: None,
+            deepseek4_heterogeneous: false,
+            vmm_runtime_refusal: None,
+            free_vram_bytes: Some(free),
+        }
+    }
+
+    #[test]
+    fn the_27b_projection_charges_measured_terms_not_a_padded_file() {
+        let (path, device_weights) = synthetic_27b("terms");
+        let source = ModelSource::from_path(path.to_str().unwrap()).unwrap();
+        // The 7900 XTX before any load: 23.98 GiB.
+        let free = 25_753_026_560usize;
+        let p = qwen35_card_projection(&source, "gfx1100", hints(free)).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // Weights are the tensors' rounded device bytes, not file + 12.5% + 512 MiB.
+        assert_eq!(p.weights, device_weights);
+        // Ledger: 391 MiB raw state + carry (one packed allocation), +5 MiB workspace.
+        assert_eq!(p.state, 411_582_464);
+        assert_eq!(p.runtime, 256 * MIB);
+        // Ledger: 34,816 B of q8 KV and 3,096 B of flash partials per token.
+        assert_eq!(p.bytes_per_token, 34_816);
+        assert_eq!(p.partials_per_token, 3_096);
+        assert_eq!(p.bytes_per_context_token(), 37_912);
+        // The 27B's minimum prefill scratch on gfx1100 (the daemon's
+        // `min_prefill=1456445696`).
+        assert_eq!(p.scratch, 1_456_445_696);
+        assert_eq!(p.page_rounding, QWEN35_VMM_PAGE_ROUNDING_BYTES);
+        assert_eq!(
+            p.fixed_bytes(),
+            p.weights + p.state + p.runtime + p.scratch + p.page_rounding
+        );
+        assert_eq!(p.card_cap, (free - p.fixed_bytes()) / 37_912);
+        assert_eq!(p.model_ctx, 262_144);
+    }
+
+    #[test]
+    fn a_real_27b_file_projects_its_measured_weights() {
+        // 1,347 tensors of the 14.99 GB `qwen3.8:27b-mq4-xts` file come to
+        // 14,567 MiB (payloads 14,279 MiB + 288 MiB of ROCr rounding) against
+        // the ledger's 14,337 + 283 MiB measured, where the old
+        // `file + file/8 + 512 MiB` was 16.2 GiB. The terms apart from the
+        // weights are the synthetic test's; here only the card cap moves.
+        let (path, device_weights) = synthetic_27b("file");
+        let source = ModelSource::from_path(path.to_str().unwrap()).unwrap();
+        let small = qwen35_card_projection(&source, "gfx1100", hints(25_753_026_560)).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let measured_weights = 14_567 * MIB;
+        let old_estimate = 14_987_185_152usize + 14_987_185_152 / 8 + 512 * MIB;
+        // The old padded estimate over-counted the rounded device weights by ~2 GiB.
+        assert!(old_estimate > measured_weights + 2_000 * MIB);
+        // Swapping the measured weights in, the cap is (free - fixed) / stride:
+        // (25.75 GB - 17.70 GB) / 37,912 B = 212K tokens on the XTX, before
+        // the speculation owners (the DFlash side and checkpoint rings) are
+        // netted off. The old projection said 194K at 16.2 GiB of weights and
+        // none of the state, partials or runtime.
+        let fixed = small.fixed_bytes() - device_weights + measured_weights;
+        let cap = (25_753_026_560usize - fixed) / small.bytes_per_context_token();
+        assert!((205_000..=220_000).contains(&cap), "{cap}");
+    }
+
+    #[test]
+    fn a_paired_draft_and_checkpoint_rings_cut_the_context_the_xtx_holds() {
+        let (path, _) = synthetic_27b("owners");
+        let source = ModelSource::from_path(path.to_str().unwrap()).unwrap();
+        let rings = qwen35_checkpoint_rings_charge(&source, true).unwrap();
+        let one = qwen35_checkpoint_rings_charge(&source, false).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // A snapshot is one packed allocation of the 386 MiB of state it
+        // mirrors (530 MiB as separate allocations); a paired speculator adds
+        // its own ring.
+        assert_eq!(one, 404_750_336);
+        assert_eq!(rings, 2 * 404_750_336);
+        assert_eq!(qwen35_checkpoint_ring_bytes(100, false), 100);
+        assert_eq!(qwen35_checkpoint_ring_bytes(100, true), 200);
+    }
+
+    #[test]
+    fn only_a_qwen35_manifest_has_a_footprint() {
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-projection-{}-arch.hfq",
+            std::process::id()
+        ));
+        write_hfqm_package_mem(
+            &path,
+            16,
+            &qwen38_27b_metadata(),
+            &[HfqMemTensor {
+                name: "t".into(),
+                quant_type: 2,
+                shape: vec![1],
+                group_size: 0,
+                data: vec![0u8; 4],
+            }],
+        )
+        .unwrap();
+        let source = ModelSource::from_path(path.to_str().unwrap()).unwrap();
+        let error = qwen35_checkpoint_rings_charge(&source, false).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(error.contains("not a Qwen3.5-family"), "{error}");
+    }
+}
+
+/// The HIP runtime's own device footprint ([`qwen35_card_projection`] charges
+/// it on a cold device; an emulated profile commits it at install).
+pub use hip_bridge::HIP_RUNTIME_RESERVE_BYTES;
+
+/// The paired DFlash draft and its owners on a Qwen3.5 load, itemised
+/// (`hipfire_arch_qwen35::footprint::dflash_side`): the same function the
+/// load's post-weight context cap charges, for `hipfire fit`.
+pub use hipfire_arch_qwen35::footprint::DflashSide;
+
+/// The Qwen3.5-family (arch 5|6) HFQ behind `source` with its config, for the
+/// pure footprint terms below. `Err` names why `source` is not one.
+fn qwen35_trunk(
+    source: &ModelSource,
+) -> Result<
+    (
+        &hipfire_runtime::hfq::HfqFile,
+        hipfire_arch_qwen35::qwen35::Qwen35Config,
+    ),
+    String,
+> {
+    let ModelSource::Hfq(hfq) = source else {
+        return Err("the Qwen3.5 footprint requires an HFQ weight manifest".into());
+    };
+    if !matches!(hfq.arch_id, 5 | 6) {
+        return Err(format!(
+            "arch_id {} is not a Qwen3.5-family manifest",
+            hfq.arch_id
+        ));
+    }
+    let config = hipfire_arch_qwen35::qwen35::config_from_metadata_json(&hfq.metadata_json)?;
+    Ok((hfq, config))
+}
+
+/// [`DflashSide`] of the draft file at `draft` paired to the Qwen3.5 trunk
+/// `source`. `draft` is the installed draft or a header replica of it (only
+/// its header is read). `dflash_block` is the resolved
+/// `speculation.dflash_block`; `max_seq` the requested context (0: the
+/// automatic one, sized to the trained window), which only a draft with a
+/// full-attention layer depends on.
+pub fn qwen35_dflash_side(
+    source: &ModelSource,
+    draft: &std::path::Path,
+    dflash_block: usize,
+    max_seq: usize,
+) -> Result<DflashSide, String> {
+    let (_, config) = qwen35_trunk(source)?;
+    let context_rows = match max_seq {
+        0 => trained_context(source).unwrap_or(0),
+        requested => requested,
+    };
+    hipfire_arch_qwen35::footprint::dflash_side_for_file(&config, draft, dflash_block, context_rows)
+}
+
+/// Bytes of the checkpoint rings one load can populate at once, from the
+/// charge of one snapshot (`DeltaNetSnapshot::device_charge_for`).
+///
+/// Each snapshot mirrors the DeltaNet state; only the first of a ring is
+/// charged. `take_dn_checkpoint` adds further ones (up to the cap,
+/// `HIPFIRE_CACHE_CKPT_MAX`) only from memory the admitted context does not
+/// need (`Gpu::kv_fit_floor`). Two rings can be live together: the AR prefill
+/// ring (`LoadedModel.prefill_checkpoints`, cap `ckpt_max()`) and, when a
+/// DFlash or native-MTP speculator is attached, that speculator's own ring
+/// (cap = the same `HIPFIRE_CACHE_CKPT_MAX` knob). `ckpt_max()`,
+/// `mtp_cache_policy().checkpoint_cap` and the DFlash builder all read that
+/// one knob with default 8 and floor 1, so a single `cap` serves every ring.
+pub fn qwen35_checkpoint_ring_bytes(snapshot_charge: usize, speculator_ring: bool) -> usize {
+    snapshot_charge.saturating_mul(1 + usize::from(speculator_ring))
+}
+
+/// [`qwen35_checkpoint_ring_bytes`] for the Qwen3.5 trunk `source`, from its
+/// config alone (the default Q8 + error-feedback state):
+/// `hipfire_arch_qwen35::footprint::dn_snapshot_device_charge`, which prices a
+/// snapshot as the one packed allocation the load makes (386 MiB on the 27B;
+/// 530 MiB before the state was packed). `hipfire fit` charges it before the load.
+pub fn qwen35_checkpoint_rings_charge(
+    source: &ModelSource,
+    speculator_ring: bool,
+) -> Result<u64, String> {
+    let (_, config) = qwen35_trunk(source)?;
+    let snapshot = usize::try_from(hipfire_arch_qwen35::footprint::dn_snapshot_device_charge(
+        &config,
+    ))
+    .map_err(|_| "DeltaNet snapshot sizing overflow".to_string())?;
+    Ok(qwen35_checkpoint_ring_bytes(snapshot, speculator_ring) as u64)
 }
 
 /// Only Qwen's single-card cache has the matching VMM KV-row accounting.
-/// The HFQ file is a lower bound on loaded weights; include 12.5% for
-/// expanded raw tensors/runtime state and 512 MiB for allocator/transients.
-/// Reserve only the minimum 512-row PBS plus the widened guard's existing
-/// 1 GiB headroom and 128 MiB for VMM page rounding across K/V owners.
+/// The terms are measured, not padded (`vram-ledger/LEDGER.md` §1, the
+/// default `qwen3.8:27b` on a 7900 XTX):
+///
+/// - weights: the file's tensors at their device size
+///   ([`hipfire_arch_qwen35::footprint::weights_device_bytes`], 14.2 GiB for
+///   the 14.99 GB 27B; the old `file + file/8 + 512 MiB` over-counted by
+///   2.25 GiB);
+/// - the DeltaNet recurrent state and stream carry the load allocates
+///   (393 MiB on the 27B, one packed allocation), derived from the config;
+/// - the HIP runtime ([`hip_bridge::HIP_RUNTIME_RESERVE_BYTES`], 256 MiB);
+/// - the minimum 512-row PBS plus the widened guard's existing 1 GiB
+///   headroom, and 128 MiB for VMM page rounding across K/V owners;
+/// - per token of context, its KV rows plus the flash-attention partials the
+///   load sizes from the provisional context (3,096 B/token on the 27B).
+///
+/// The caller nets out what only it knows is paired: the DFlash side
+/// ([`qwen35_dflash_side`]) and the checkpoint rings
+/// ([`qwen35_checkpoint_rings_charge`]). `free` is the device free memory
+/// before the load, cold: a caller whose figure already excludes the HIP
+/// runtime (an emulated device, which commits it at install) adds it back.
 /// Per-request prefill selects wider scratch from then-current mapped-KV free VRAM.
 ///
 /// The one projection admission refuses on ([`resolve_sequence`]); `hipfire
@@ -1988,29 +2290,34 @@ pub fn qwen35_card_projection(
     let free = hints
         .free_vram_bytes
         .ok_or("cannot query free VRAM for automatic VMM context")?;
-    let file_bytes = usize::try_from(
-        std::fs::metadata(hfq.path())
-            .map_err(|e| format!("Qwen weight size: {e}"))?
-            .len(),
-    )
-    .map_err(|_| "Qwen weight file size exceeds usize")?;
-    let weights = file_bytes
-        .saturating_add(file_bytes / 8)
-        .saturating_add(512 << 20);
+    let weights = usize::try_from(hipfire_arch_qwen35::footprint::weights_device_bytes(hfq))
+        .map_err(|_| "Qwen weight size exceeds usize")?;
+    let state = usize::try_from(hipfire_arch_qwen35::footprint::dn_state_device_charge(
+        &config,
+    ))
+    .map_err(|_| "Qwen DeltaNet state size exceeds usize")?;
+    let runtime = hip_bridge::HIP_RUNTIME_RESERVE_BYTES;
+    let partials_per_token =
+        hipfire_arch_qwen35::footprint::flash_partials_bytes_per_token(&config);
     let scratch =
         hipfire_arch_qwen35::qwen35::prefill::minimum_prefill_reservation_bytes(&config, gpu_arch)
             .ok_or("Qwen minimum prefill scratch sizing overflow")?;
     let card_cap = free
         .saturating_sub(weights)
+        .saturating_sub(state)
+        .saturating_sub(runtime)
         .saturating_sub(scratch)
         .saturating_sub(QWEN35_VMM_PAGE_ROUNDING_BYTES)
-        / bytes_per_token;
+        / bytes_per_token.saturating_add(partials_per_token);
     Ok(Qwen35CardProjection {
         free,
         weights,
+        state,
+        runtime,
         scratch,
         page_rounding: QWEN35_VMM_PAGE_ROUNDING_BYTES,
         bytes_per_token,
+        partials_per_token,
         card_cap,
         model_ctx,
         kv_mode: kv_mode::qwen_k_display_name(pair.k()),

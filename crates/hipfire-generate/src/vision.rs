@@ -1563,7 +1563,13 @@ pub fn generate_vl(
                 m.seq_pos + prompt_tokens.len(),
             );
             match qwen35::prefill::ordinary_prefill_chunk_limit_deducting(
-                gpu, weights, config, dn, kv, deduction,
+                gpu,
+                weights,
+                config,
+                dn,
+                kv,
+                Some(scratch),
+                deduction,
             ) {
                 Ok(limit) => limit,
                 Err(e) => {

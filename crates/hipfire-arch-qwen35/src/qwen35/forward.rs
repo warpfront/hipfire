@@ -1200,7 +1200,7 @@ fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
 /// at the decode tile and `batch_mult` rows (default 32) at the batched tile.
 /// Batched launchers sub-batch by the buffer's capacity, so the smaller
 /// buffer only costs extra launches past 32 rows.
-fn qwen35_flash_partials_len(
+pub(crate) fn qwen35_flash_partials_len(
     arch: &str,
     n_heads: usize,
     head_dim: usize,
@@ -1614,10 +1614,10 @@ impl Qwen35Scratch {
             note(pbs.free_gpu(gpu));
         }
         if let Some(pbs) = self.widened_prefill_batch.into_inner() {
-            note(pbs.free_gpu(gpu));
+            note(pbs.release_gpu(gpu));
         }
         if let Some(pbs) = self.reuse_virtual_pbs.into_inner() {
-            note(pbs.free_gpu(gpu));
+            note(pbs.release_gpu(gpu));
         }
         if let Some(staging) = self.ar_hidden_staging {
             note(staging.free_gpu(gpu));

@@ -3649,6 +3649,7 @@ where
             &target.config,
             &target.dn_state,
             &target.kv_cache,
+            Some(target.scratch),
             qwen35::prefill::request_kv_growth_deduction(
                 gpu,
                 &target.kv_cache,

@@ -10,6 +10,16 @@ use std::collections::HashMap;
 
 const MIN_ALLOC: usize = 256;
 
+/// Largest buffer the pool parks for reuse. A larger contiguous owner freed
+/// through [`GpuPool::release`] returns to HIP at once: such a buffer is a
+/// one-off (a prefill-scratch rung, a replaced weight), and parked it is
+/// invisible to HIP yet still counted as used, so admission and the KV fit
+/// see free VRAM shrink. VRAM ledger (2026-11-17, `vram-ledger/LEDGER.md` §2
+/// item 1): 5.07 GiB of freed prefill scratch sat parked at the XTX 32K
+/// point, collapsing the admitted prefill chunk from 8192 to 512 rows. The
+/// decode-hot scratch the pool exists for is far below this size.
+pub const MAX_PARKED_BYTES: usize = 64 << 20;
+
 /// The device allocator behind the pool: `HipRuntime` in production, a
 /// host-only fake in the unit tests.
 trait DeviceMemory {
@@ -29,7 +39,8 @@ impl DeviceMemory for HipRuntime {
 
 /// A pool of GPU buffers, bucketed by size.
 /// Requesting a buffer returns one from the pool (if available) or allocates new.
-/// Returning a buffer puts it back in the pool for reuse.
+/// Releasing a buffer of at most [`MAX_PARKED_BYTES`] parks it for reuse; a
+/// larger one goes back to HIP.
 pub struct GpuPool {
     /// Free buffers bucketed by size (rounded up to power of 2)
     free_lists: HashMap<usize, Vec<DeviceBuffer>>,
@@ -182,13 +193,40 @@ impl GpuPool {
             .sum()
     }
 
-    /// Return a buffer to the pool for reuse. The buffer's ACTUAL
-    /// capacity is what gets reused — we key the free-list by the
-    /// power-of-2 bucket so same-size-shaped requests hit the same
-    /// slot.
-    pub fn free(&mut self, buf: DeviceBuffer) {
+    /// Give a freed buffer back: park it for reuse, or return it to HIP.
+    ///
+    /// A buffer of at most [`MAX_PARKED_BYTES`] is parked. The buffer's
+    /// ACTUAL capacity is what gets reused: the free list is keyed by the
+    /// power-of-2 bucket so same-size-shaped requests hit the same slot.
+    ///
+    /// A larger buffer goes to HIP when `hip_free_ok`. The caller owns the
+    /// ordering: it must have made any pending work on the buffer finish
+    /// (the active stream is synchronized) and must pass `false` while a
+    /// stream capture or plan recording is open, where `hipFree` and the
+    /// synchronization before it are illegal. Such a buffer is parked
+    /// despite its size and goes to HIP at the next drain or out-of-memory
+    /// retry.
+    pub fn release(
+        &mut self,
+        hip: &HipRuntime,
+        buf: DeviceBuffer,
+        hip_free_ok: bool,
+    ) -> HipResult<()> {
+        self.release_in(hip, buf, hip_free_ok)
+    }
+
+    fn release_in<M: DeviceMemory>(
+        &mut self,
+        mem: &M,
+        buf: DeviceBuffer,
+        hip_free_ok: bool,
+    ) -> HipResult<()> {
+        if buf.size() > MAX_PARKED_BYTES && hip_free_ok {
+            return mem.free(buf);
+        }
         let bucket = Self::bucket_key(buf.size());
         self.free_lists.entry(bucket).or_default().push(buf);
+        Ok(())
     }
 
     /// Actually free all pooled buffers (call on cleanup).
@@ -268,6 +306,12 @@ mod tests {
         }
     }
 
+    /// Free a small test buffer through the production release path.
+    fn park(pool: &mut GpuPool, mem: &FakeMemory, buf: DeviceBuffer) {
+        assert!(buf.size() <= MAX_PARKED_BYTES, "park() is for pooled sizes");
+        pool.release_in(mem, buf, true).unwrap();
+    }
+
     #[test]
     fn oom_drains_pooled_buffers_and_retries_once() {
         let mem = FakeMemory::new(4096);
@@ -275,8 +319,8 @@ mod tests {
         for _ in 0..2 {
             let a = pool.alloc_in(&mem, 1024).unwrap();
             let b = pool.alloc_in(&mem, 1024).unwrap();
-            pool.free(a);
-            pool.free(b);
+            park(&mut pool, &mem, a);
+            park(&mut pool, &mem, b);
         }
         assert_eq!(pool.pooled_bytes(), 2048);
         // A different bucket cannot reuse the parked 1 KiB buffers and does
@@ -287,7 +331,7 @@ mod tests {
         assert_eq!(mem.mallocs.get() - mallocs, 2, "exactly one retry");
         assert_eq!(pool.pooled_bytes(), 0, "free lists drained");
         assert_eq!(mem.used(), 3072);
-        pool.free(big);
+        park(&mut pool, &mem, big);
     }
 
     #[test]
@@ -304,7 +348,7 @@ mod tests {
         let mem = FakeMemory::new(2048);
         let mut pool = GpuPool::new();
         let a = pool.alloc_in(&mem, 1024).unwrap();
-        pool.free(a);
+        park(&mut pool, &mem, a);
         let err = pool.alloc_in(&mem, 4096).err().expect("must fail");
         assert_eq!(err.code, HIP_ERROR_OUT_OF_MEMORY);
         assert_eq!(mem.mallocs.get(), 3, "first alloc, OOM, one retry");
@@ -317,7 +361,7 @@ mod tests {
         let mut mem = FakeMemory::new(4096);
         let mut pool = GpuPool::new();
         let a = pool.alloc_in(&mem, 1024).unwrap();
-        pool.free(a);
+        park(&mut pool, &mem, a);
         mem.fail_code = Some(1);
         let err = pool.alloc_in(&mem, 2048).err().expect("must fail");
         assert_eq!(err.code, 1);
@@ -340,7 +384,7 @@ mod tests {
             if reverse_free {
                 bufs.reverse();
             }
-            bufs.into_iter().for_each(|b| pool.free(b));
+            bufs.into_iter().for_each(|b| park(&mut pool, &mem, b));
             let rebuilt: Vec<_> = sizes
                 .iter()
                 .map(|&s| pool.alloc_in(&mem, s).unwrap())
@@ -354,7 +398,7 @@ mod tests {
             for (buf, &size) in rebuilt.iter().zip(&sizes) {
                 assert_eq!(buf.size(), size, "best fit takes the exact-size buffer");
             }
-            rebuilt.into_iter().for_each(|b| pool.free(b));
+            rebuilt.into_iter().for_each(|b| park(&mut pool, &mem, b));
         }
     }
 
@@ -367,7 +411,7 @@ mod tests {
         let live = pool.alloc_in(&mem, 4096).unwrap();
         let live_addr = live.as_ptr() as usize;
         let parked: Vec<_> = (0..3).map(|_| pool.alloc_in(&mem, 1024).unwrap()).collect();
-        parked.into_iter().for_each(|b| pool.free(b));
+        parked.into_iter().for_each(|b| park(&mut pool, &mem, b));
         assert_eq!(pool.pooled_bytes(), 3072);
         assert_eq!((pool.drains, pool.injected_oom), (0, 0));
 
@@ -390,11 +434,11 @@ mod tests {
             "a buffer a tensor still owns is not touched by the drain"
         );
         // One-shot: the next miss reaches hipMalloc without a drain.
-        pool.free(fresh);
+        park(&mut pool, &mem, fresh);
         let again = pool.alloc_in(&mem, 16384).unwrap();
         assert_eq!((pool.drains, pool.injected_oom), (1, 1));
-        pool.free(again);
-        pool.free(live);
+        park(&mut pool, &mem, again);
+        park(&mut pool, &mem, live);
     }
 
     #[test]
@@ -402,17 +446,17 @@ mod tests {
         let mem = FakeMemory::new(1 << 20);
         let mut pool = GpuPool::new();
         let a = pool.alloc_in(&mem, 1024).unwrap();
-        pool.free(a);
+        park(&mut pool, &mem, a);
         pool.inject_oom(Some(2));
         let a = pool.alloc_in(&mem, 1024).unwrap();
         let b = pool.alloc_in(&mem, 2048).unwrap();
         assert_eq!((pool.drains, pool.injected_oom), (0, 0), "two let through");
-        pool.free(a);
-        pool.free(b);
+        park(&mut pool, &mem, a);
+        park(&mut pool, &mem, b);
         let c = pool.alloc_in(&mem, 2048).unwrap();
         assert_eq!((pool.drains, pool.injected_oom), (1, 1), "the third fires");
         assert_eq!(pool.pooled_bytes(), 0);
-        pool.free(c);
+        park(&mut pool, &mem, c);
     }
 
     #[test]
@@ -431,12 +475,71 @@ mod tests {
         let mem = FakeMemory::new(1 << 20);
         let mut pool = GpuPool::new();
         let a = pool.alloc_in(&mem, 1024).unwrap();
-        pool.free(a);
+        park(&mut pool, &mem, a);
         pool.inject_oom(Some(0));
         pool.inject_oom(None);
         let a = pool.alloc_in(&mem, 1024).unwrap();
         assert_eq!((pool.drains, pool.injected_oom), (0, 0));
         assert_eq!(mem.mallocs.get(), 1, "served from the free list");
-        pool.free(a);
+        park(&mut pool, &mem, a);
+    }
+
+    #[test]
+    fn a_buffer_over_the_park_limit_returns_to_the_allocator() {
+        let mem = FakeMemory::new(4 * MAX_PARKED_BYTES);
+        let mut pool = GpuPool::new();
+        let big = pool.alloc_in(&mem, MAX_PARKED_BYTES + 1).unwrap();
+        assert_eq!(mem.used(), MAX_PARKED_BYTES + 1);
+        pool.release_in(&mem, big, true).unwrap();
+        assert_eq!(mem.frees.get(), 1, "the free reached the allocator");
+        assert_eq!(mem.used(), 0, "nothing stays live");
+        assert_eq!(pool.pooled_bytes(), 0, "nothing was parked");
+    }
+
+    #[test]
+    fn a_buffer_at_the_park_limit_is_pooled_and_reused() {
+        let mem = FakeMemory::new(4 * MAX_PARKED_BYTES);
+        let mut pool = GpuPool::new();
+        let at_limit = pool.alloc_in(&mem, MAX_PARKED_BYTES).unwrap();
+        let addr = at_limit.as_ptr() as usize;
+        pool.release_in(&mem, at_limit, true).unwrap();
+        assert_eq!(mem.frees.get(), 0, "the limit itself still parks");
+        assert_eq!(pool.pooled_bytes(), MAX_PARKED_BYTES);
+        let small = pool.alloc_in(&mem, 4096).unwrap();
+        let small_addr = small.as_ptr() as usize;
+        pool.release_in(&mem, small, true).unwrap();
+        let reused = pool.alloc_in(&mem, 4096).unwrap();
+        assert_eq!(
+            reused.as_ptr() as usize,
+            small_addr,
+            "a small buffer is reused"
+        );
+        let again = pool.alloc_in(&mem, MAX_PARKED_BYTES).unwrap();
+        assert_eq!(
+            again.as_ptr() as usize,
+            addr,
+            "the at-limit buffer is reused"
+        );
+        assert_eq!(mem.mallocs.get(), 2, "no allocation after the first two");
+        park(&mut pool, &mem, reused);
+        park(&mut pool, &mem, again);
+    }
+
+    #[test]
+    fn a_big_buffer_stays_parked_when_hipfree_is_not_allowed() {
+        let mem = FakeMemory::new(4 * MAX_PARKED_BYTES);
+        let mut pool = GpuPool::new();
+        let big = pool.alloc_in(&mem, MAX_PARKED_BYTES * 2).unwrap();
+        let addr = big.as_ptr() as usize;
+        // A stream capture is open: no free, no synchronization.
+        pool.release_in(&mem, big, false).unwrap();
+        assert_eq!(mem.frees.get(), 0);
+        assert_eq!(pool.pooled_bytes(), MAX_PARKED_BYTES * 2);
+        let reused = pool.alloc_in(&mem, MAX_PARKED_BYTES * 2).unwrap();
+        assert_eq!(reused.as_ptr() as usize, addr);
+        // Out of capture the same size goes back to the allocator.
+        pool.release_in(&mem, reused, true).unwrap();
+        assert_eq!(mem.frees.get(), 1);
+        assert_eq!(pool.pooled_bytes(), 0);
     }
 }

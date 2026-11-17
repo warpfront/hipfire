@@ -2934,6 +2934,158 @@ fn qwen35_hfq_backend<'a>(
     }
 }
 
+/// One dense DeltaNet layer's folded Z|beta|alpha upload
+/// ([`append_betaalpha_to_z`]): the row layout of the packed buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BetaAlphaFold {
+    total_rows: usize,
+    beta_row: usize,
+    alpha_row: usize,
+    row_bytes: usize,
+}
+
+impl BetaAlphaFold {
+    fn bytes(&self) -> usize {
+        self.total_rows * self.row_bytes
+    }
+}
+
+/// Whether layer `prefix` folds beta/alpha into Z, decided from the checkpoint
+/// metadata and the model dimensions alone, so [`load_layer_into`] knows
+/// before it uploads anything. Same predicate the fold has always used: the
+/// four projections (QKV, Z, beta, alpha) are MQ4V2 on disk, K is a whole
+/// number of groups, and the gfx12 A4 fold or the gfx11 symmetric fold is
+/// active for these dimensions. A K that is not a multiple of 256 declines
+/// here and fails in the ordinary load with its own message.
+fn betaalpha_fold_plan(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    prefix: &str,
+) -> Option<BetaAlphaFold> {
+    let hv = config.linear_num_value_heads;
+    let qkv_m = config.linear_num_key_heads * config.linear_key_head_dim * 2
+        + hv * config.linear_value_head_dim;
+    let z_m = hv * config.linear_value_head_dim;
+    let k = config.dim;
+    let all_mq4v2 = ["qkv", "z", "b", "a"].iter().all(|stem| {
+        find_qwen35_tensor(hfq, &format!("{prefix}.linear_attn.in_proj_{stem}.weight"))
+            .is_some_and(|(info, _)| info.quant_type == MQ4V2_G256_QT)
+    });
+    if !all_mq4v2 || k % 256 != 0 {
+        return None;
+    }
+    let gfx12 = gpu.iu4_gdn_fold_active([qkv_m, z_m, hv, hv], k);
+    if !(gfx12 || gpu.mq4v2_fold_betaalpha_active(qkv_m, z_m, hv, hv, k, 512)) {
+        return None;
+    }
+    let (total_rows, beta_row, alpha_row) = if gfx12 {
+        Gpu::iu4_gdn_fold_rows(z_m)
+    } else {
+        (gpu.mq4v2_fold_betaalpha_padded_m(z_m), z_m, z_m + hv)
+    };
+    Some(BetaAlphaFold {
+        total_rows,
+        beta_row,
+        alpha_row,
+        row_bytes: (k / 256) * rdna_compute::MQ4V2_GROUP_BYTES,
+    })
+}
+
+/// `read_proj` of a layer whose Z is folded: the Z projection keeps its shape,
+/// dtype and AWQ sidecar but uploads no codes (an empty descriptor), because
+/// [`append_betaalpha_to_z`] uploads the folded buffer in its place. Every
+/// other projection loads as usual.
+fn load_weight_tensor_fold_z(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+    candidates: fn(&str) -> Vec<String>,
+    target: MemoryTarget,
+) -> HipResult<WeightTensor> {
+    if !name.ends_with("linear_attn.in_proj_z.weight") {
+        return load_weight_tensor(hfq, gpu, name, m, k, candidates, target);
+    }
+    let matched = candidates(name)
+        .into_iter()
+        .find(|candidate| hfq.find_tensor_info(candidate).is_some());
+    // The same sidecar resolution `load_weight_tensor` applies after the codes.
+    let awq_scale = match matched.as_deref() {
+        Some(matched) => load_awq_scale_for(hfq, gpu, matched, k)
+            .or_else(|| load_awq_scale_for(hfq, gpu, name, k)),
+        None => load_awq_scale_for(hfq, gpu, name, k),
+    };
+    // SAFETY: an empty (null, 0) borrowed descriptor never reaches HIP; the
+    // fold replaces it before the layer is published, and a failed layer's
+    // free of it is a no-op error.
+    let empty = unsafe { DeviceBuffer::from_raw(std::ptr::null_mut(), 0) };
+    Ok(WeightTensor {
+        buf: GpuTensor {
+            buf: empty,
+            shape: vec![0],
+            dtype: DType::Raw,
+        },
+        gpu_dtype: DType::MQ4G256V2,
+        m,
+        k,
+        row_stride: 0,
+        awq_scale,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
+    })
+}
+
+/// Device bytes of one layer's uploads that a slab of a mode packing tensors of
+/// at most `max_tensor` bytes carries AND that ROCr would round: the tensors
+/// above 1 MiB (a smaller one costs only its 4 KiB page, packed or not),
+/// each at its 4 KiB-aligned slab size. The layer's small tensors (norms,
+/// scales, conv) ride in the slab's own 2 MiB rounding slack or in an older
+/// slab's remainder.
+fn slab_reservation_bytes(sizes: impl IntoIterator<Item = usize>, max_tensor: usize) -> usize {
+    sizes
+        .into_iter()
+        .filter(|&size| size > (1 << 20) && size <= max_tensor)
+        .map(|size| size.next_multiple_of(hip_bridge::SLAB_ALIGN))
+        .sum()
+}
+
+/// Announce a dense layer's upload size to the weight slabs (`64m` mode only):
+/// one slab sized to the layer pays ROCr's 2 MiB rounding once per layer. The
+/// per-layer count comes from the checkpoint index (raw projection codes
+/// upload at exactly their stored size), with the folded buffer standing in for
+/// Z. A host-placed layer uploads nothing to the device.
+fn reserve_layer_slab(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    prefix: &str,
+    residency: LayerResidency,
+    fold: Option<&BetaAlphaFold>,
+) -> HipResult<()> {
+    if residency.weights == WeightResidency::HostMapped
+        || gpu.hip.slab_mode() != hip_bridge::SlabMode::Up64M
+    {
+        return Ok(());
+    }
+    let needle = format!("{prefix}.");
+    let mut sizes: Vec<usize> = hfq
+        .tensors()
+        .iter()
+        .filter(|t| t.name.contains(&needle) && !t.name.starts_with("mtp"))
+        .filter(|t| fold.is_none() || !t.name.ends_with("linear_attn.in_proj_z.weight"))
+        .map(|t| t.data_size)
+        .collect();
+    sizes.extend(fold.map(BetaAlphaFold::bytes));
+    let bytes = slab_reservation_bytes(sizes, hip_bridge::SlabMode::Up64M.max_tensor_bytes());
+    if bytes == 0 {
+        return Ok(());
+    }
+    gpu.bind_thread()?;
+    gpu.hip.slab_reserve(bytes)
+}
+
 /// Build one layer's `LayerWeights` on `gpu`. Extracted for `load_weights_multi`
 /// so the multi-GPU loader can route each layer to its band-owning device
 /// without duplicating the tensor-name table. Master's `load_weights` keeps
@@ -2947,10 +3099,27 @@ fn load_layer_into(
     residency: LayerResidency,
 ) -> HipResult<LayerWeights> {
     debug_assert_eq!(p, &format!("layers.{layer_idx}"));
+    let dense = config.num_experts == 0;
+    // A dense DeltaNet layer's Z|beta|alpha fold is decided here, before any
+    // upload, so the unfused Z is never uploaded: no 16.7 MB upload + free per
+    // layer, and no dead range left in a weight slab.
+    let fold = if dense
+        && config.layer_types[layer_idx] == crate::qwen35::config::LayerType::LinearAttention
+    {
+        betaalpha_fold_plan(hfq, gpu, config, p)
+    } else {
+        None
+    };
+    if dense {
+        reserve_layer_slab(hfq, gpu, p, residency, fold.as_ref())?;
+    }
     // Partial GPU offload: the loader resolved this layer's storage tier once.
     // `LayerResidency::DEVICE` (the unset default) keeps every tensor
     // device-resident — the zero-diff regression guard.
     let mut b = qwen35_hfq_backend(hfq, gpu, layer_idx, residency.weights);
+    if fold.is_some() {
+        b.read_proj = load_weight_tensor_fold_z;
+    }
     let moe = |bk: &mut HfqBackend, cfg: &Qwen35Config, li: usize| {
         load_moe_ffn(
             bk.hfq,
@@ -2962,10 +3131,13 @@ fn load_layer_into(
         )
     };
     let mut layer = crate::layer_driver::load_layer(&mut b, config, layer_idx, moe)?;
-    if let LayerWeights::DeltaNet(dn) = &mut layer {
-        if let Err(e) = append_betaalpha_to_z(hfq, gpu, p, dn) {
-            layer.free_gpu(gpu);
-            return Err(e);
+    if let Some(fold) = fold {
+        let host = residency.weights == WeightResidency::HostMapped;
+        if let LayerWeights::DeltaNet(dn) = &mut layer {
+            if let Err(e) = append_betaalpha_to_z(hfq, gpu, p, dn, &fold, host) {
+                layer.free_gpu(gpu);
+                return Err(e);
+            }
         }
     }
     if let Err(e) = attach_awq_rcp_planes(hfq, gpu, p, &mut layer) {
@@ -3038,31 +3210,27 @@ fn attach_awq_rcp_planes(
 /// (M256 on Halo). gfx1201's fused A4 projection instead places beta at row
 /// 0 and alpha at row 64 of the extra tile (`Gpu::iu4_gdn_fold_rows`). Keep
 /// the original beta/alpha owners for decode/fallback.
+///
+/// `fold` came from [`betaalpha_fold_plan`], which also made the layer's Z
+/// an empty descriptor ([`load_weight_tensor_fold_z`]): this uploads the
+/// folded buffer straight into `dn.wz`, so there is no unfused Z to free. A
+/// spilled layer's folded rows go to host-mapped RAM, so the fold never pulls
+/// a spilled layer back into VRAM.
 fn append_betaalpha_to_z(
     hfq: &HfqFile,
     gpu: &mut Gpu,
     prefix: &str,
     dn: &mut DeltaNetLayerWeights,
+    fold: &BetaAlphaFold,
+    host: bool,
 ) -> HipResult<()> {
-    let (qkv, z, beta, alpha) = (&dn.wqkv, &mut dn.wz, &dn.w_beta, &dn.w_alpha);
-    let gfx12 = gpu.iu4_gdn_fold_active([qkv.m, z.m, beta.m, alpha.m], qkv.k);
-    if [qkv.gpu_dtype, z.gpu_dtype, beta.gpu_dtype, alpha.gpu_dtype] != [DType::MQ4G256V2; 4]
-        || !(gfx12 || gpu.mq4v2_fold_betaalpha_active(qkv.m, z.m, beta.m, alpha.m, qkv.k, 512))
-        || [z.k, beta.k, alpha.k] != [qkv.k; 3]
-    {
-        return Ok(());
-    }
-    let row_bytes = (z.k / 256) * rdna_compute::MQ4V2_GROUP_BYTES;
-    let (total, beta_row, alpha_row) = if gfx12 {
-        Gpu::iu4_gdn_fold_rows(z.m)
-    } else {
-        (gpu.mq4v2_fold_betaalpha_padded_m(z.m), z.m, z.m + beta.m)
-    };
-    let mut rows = vec![0u8; total * row_bytes];
+    let (z, beta, alpha) = (&mut dn.wz, &dn.w_beta, &dn.w_alpha);
+    let row_bytes = fold.row_bytes;
+    let mut rows = vec![0u8; fold.bytes()];
     for (stem, start, count) in [
         ("z", 0, z.m),
-        ("b", beta_row, beta.m),
-        ("a", alpha_row, alpha.m),
+        ("b", fold.beta_row, beta.m),
+        ("a", fold.alpha_row, alpha.m),
     ] {
         let name = format!("{prefix}.linear_attn.in_proj_{stem}.weight");
         let (info, data) = qwen35_tensor_data_cow(hfq, &name)
@@ -3075,27 +3243,12 @@ fn append_betaalpha_to_z(
         }
         rows[start * row_bytes..(start + count) * row_bytes].copy_from_slice(&data);
     }
-    // Partial offload: a spilled layer's Z lives in host-mapped RAM, and the
-    // folded Z|beta|alpha rows replace it there, so the fold never pulls a
-    // spilled layer back into VRAM. `free_tensor` returns a host-mapped owner
-    // through `hipHostFree`.
-    let host = gpu.host_located(&z.buf);
-    let packed = if host {
+    z.buf = if host {
         gpu.upload_raw_host(&rows, &[rows.len()])?
     } else {
         gpu.upload_raw(&rows, &[rows.len()])?
     };
-    let old = std::mem::replace(&mut z.buf, packed);
-    if host {
-        gpu.free_tensor(old)?;
-    } else if gfx12 {
-        // The replaced Z (16.7 MB per H2 layer) goes back to HIP, not to the
-        // buffer pool, which would otherwise hold it for the process and
-        // count against the post-weight KV capacity.
-        gpu.release_tensor_immediate(old)?;
-    } else {
-        gpu.free_tensor(old)?;
-    }
+
     Ok(())
 }
 
@@ -9432,5 +9585,56 @@ mod expert_iu4_load_tests {
                 .unwrap();
         assert_eq!(err, "alloc 512");
         assert_eq!(calls, [8192, 512]);
+    }
+}
+
+#[cfg(test)]
+mod slab_reservation_tests {
+    use super::*;
+
+    const MIB: usize = 1 << 20;
+
+    /// qwen3.8-27B mq4-xts dense GDN layer, device sizes: QKV, the folded
+    /// Z|beta|alpha buffer (6,272 rows of 2,720 B, standing in for Z), out
+    /// projection, gate/up/down, then the small tensors.
+    const GDN_LAYER: [usize; 11] = [
+        27_852_800, 17_059_840, 16_711_680, 47_349_760, 47_349_760, 47_349_760, 10_240, 130_560,
+        130_560, 43_520, 34_816,
+    ];
+
+    #[test]
+    fn reservation_counts_rounded_tensors_at_page_size() {
+        let max = hip_bridge::SlabMode::Up64M.max_tensor_bytes();
+        // Only tensors above 1 MiB and within the mode's limit count.
+        assert_eq!(
+            slab_reservation_bytes([MIB, MIB + 1, 65 * MIB], max),
+            MIB + 4096
+        );
+        assert_eq!(slab_reservation_bytes([675_430_400], max), 0);
+        assert_eq!(slab_reservation_bytes([], max), 0);
+        let big: usize = GDN_LAYER[..6].iter().sum();
+        assert_eq!(slab_reservation_bytes(GDN_LAYER, max), big);
+        // A mode with a smaller limit drops what it would not pack (only the
+        // 15.9 MiB out projection fits 16m).
+        assert_eq!(
+            slab_reservation_bytes(GDN_LAYER, hip_bridge::SlabMode::Up16M.max_tensor_bytes()),
+            16_711_680
+        );
+    }
+
+    #[test]
+    fn one_reserved_slab_beats_per_tensor_rounding() {
+        let max = hip_bridge::SlabMode::Up64M.max_tensor_bytes();
+        let slab = hip_bridge::device_alloc_charge(slab_reservation_bytes(GDN_LAYER, max));
+        let separate: usize = GDN_LAYER
+            .iter()
+            .map(|&size| hip_bridge::device_alloc_charge(size))
+            .sum::<usize>()
+            - GDN_LAYER[6..]
+                .iter()
+                .map(|&size| hip_bridge::device_alloc_charge(size))
+                .sum::<usize>();
+        assert_eq!(separate, 200 * MIB);
+        assert_eq!(slab, 196 * MIB);
     }
 }

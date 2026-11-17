@@ -80,8 +80,11 @@ const CHUNK_BYTES: usize = 64 << 20;
 const FIT_HEADROOM_BYTES: u64 = 64 << 20;
 /// Controlled-malloc size for the capacity check.
 const CONTROLLED_MALLOC_BYTES: usize = 64 << 20;
-/// Committed device bytes above which the Gpu is presumed to hold a model.
-const MODEL_FREE_BASELINE_LIMIT_BYTES: u64 = 256 << 20;
+/// Committed device bytes above which the Gpu is presumed to hold a model: the
+/// HIP runtime reserve every discrete profile commits at install, plus 256 MiB
+/// of `Gpu` initialization allocations.
+const MODEL_FREE_BASELINE_LIMIT_BYTES: u64 =
+    hip_bridge::HIP_RUNTIME_RESERVE_BYTES as u64 + (256 << 20);
 
 const FNV_OFFSET: u32 = 0x811C_9DC5;
 const FNV_PRIME: u32 = 0x0100_0193;
@@ -1401,6 +1404,20 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
             ));
         }
     }
+    // A discrete profile has already spent the HIP runtime's footprint, so its
+    // free memory starts below the advertised capacity like a physical card's.
+    if !limits.uma {
+        let reserve = hip_bridge::HIP_RUNTIME_RESERVE_BYTES as u64;
+        checks.push(check(
+            "runtime_reserve_committed_at_install",
+            snap0.committed.device_bytes >= reserve
+                && free0 as u64 <= limits.device_bytes.saturating_sub(reserve),
+            format!(
+                "committed {} B (reserve {reserve} B), free {free0} B of {} B",
+                snap0.committed.device_bytes, limits.device_bytes
+            ),
+        ));
+    }
 
     // Controlled small malloc.
     let remaining0 = device_remaining(limits.device_bytes, &snap0.committed, &snap0.pending);
@@ -1423,12 +1440,14 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
                 let snap1 = gpu
                     .emu_budget_snapshot()
                     .ok_or_else(|| err("budget vanished"))?;
-                let expected = charge_vector(&limits, AllocationClass::Device, size);
+                // hipMalloc is charged at what ROCr occupies (2 MiB granule above 1 MiB).
+                let charged = hip_bridge::device_alloc_charge(size as usize) as u64;
+                let expected = charge_vector(&limits, AllocationClass::Device, charged);
                 let delta = usage_delta(&snap1.committed, &snap0.committed);
                 checks.push(check(
                     "malloc_moves_ledger_by_charge",
                     delta == expected && snap1.pending == snap0.pending,
-                    format!("committed delta {delta:?} vs charge {expected:?} for {size} B"),
+                    format!("committed delta {delta:?} vs charge {expected:?} for {size} B (occupies {charged} B)"),
                 ));
                 let (free1, _) = gpu.device_mem_info()?;
                 let rem1 = device_remaining(limits.device_bytes, &snap1.committed, &snap1.pending);
@@ -1486,8 +1505,10 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
                 gpu.free_tensor(t2)?;
 
                 // Drain releases the charge of every parked buffer: the controlled one
-                // and any buffer an earlier section parked (so compare against the
-                // pre-drain parked bytes, not the section's opening snapshot).
+                // and any buffer an earlier section parked. Each buffer was charged at
+                // the size ROCr occupies, which is at least its requested size, so the
+                // release is at least the pre-drain parked bytes (and at least the
+                // controlled buffer's own charge).
                 let parked_pre = gpu.pool_parked_bytes() as u64;
                 let snap_pre = gpu
                     .emu_budget_snapshot()
@@ -1496,18 +1517,22 @@ fn run_capacity(gpu: &mut Gpu) -> HipResult<CapacitySection> {
                 let snap4 = gpu
                     .emu_budget_snapshot()
                     .ok_or_else(|| err("budget vanished"))?;
-                let expected_after = snap_pre.committed.device_bytes.checked_sub(parked_pre);
+                let released = snap_pre
+                    .committed
+                    .device_bytes
+                    .checked_sub(snap4.committed.device_bytes);
                 checks.push(check(
                     "pool_drain_releases_charge",
                     parked_pre >= size
-                        && expected_after == Some(snap4.committed.device_bytes)
+                        && released.is_some_and(|bytes| bytes >= parked_pre.max(charged))
                         && gpu.pool_parked_bytes() == 0,
                     format!(
-                        "device committed {} -> {} after draining {} parked B (controlled {} B)",
+                        "device committed {} -> {} after draining {} parked B (controlled {} B, occupies {} B)",
                         snap_pre.committed.device_bytes,
                         snap4.committed.device_bytes,
                         parked_pre,
-                        size
+                        size,
+                        charged
                     ),
                 ));
             }

@@ -50,25 +50,57 @@ pub struct Qwen35Bundle {
     /// lease without a release acknowledgement.
     pub weight_lease: Option<SharedWeightLease>,
 }
-/// Device bytes one draft file will take, estimated the way the loader's own
-/// admission estimates a weight file: file bytes + 1/8 for the expanded/AWQ
-/// tensors + 512 MiB of scratch. An over-estimate for a head that loads only its
-/// own layers, which is the safe direction — it can only make the trunk spill
-/// slightly more, never less. 0 for a path that does not exist.
-pub(crate) fn draft_file_reserve_bytes(path: &std::path::Path) -> u64 {
+/// Device bytes one MTP head file will take, estimated the way the loader's
+/// own admission once estimated a weight file: file bytes + 1/8 for the
+/// expanded/AWQ tensors + 512 MiB of scratch. An over-estimate for a head that
+/// loads only its own layers, which is the safe direction — it can only make
+/// the trunk spill slightly more, never less. 0 for a path that does not
+/// exist. (The DFlash draft is sized from its own header instead:
+/// [`dflash_device_reserve_bytes`].)
+pub(crate) fn mtp_head_file_reserve_bytes(path: &std::path::Path) -> u64 {
     let Ok(meta) = std::fs::metadata(path) else {
         return 0;
     };
-    draft_reserve_for_bytes(meta.len())
+    mtp_head_reserve_for_bytes(meta.len())
 }
 
-/// The `draft_file_reserve_bytes` formula for a known byte count: file bytes +
-/// 1/8 for the expanded/AWQ tensors + 512 MiB of scratch. Split out so the
-/// bundled-trailer arm (which knows its section size without a file of its
-/// own) charges the same estimate as a sidecar file of the same size, and so
-/// `hipfire fit` charges a draft it has not downloaded the way the load will.
-pub fn draft_reserve_for_bytes(file_bytes: u64) -> u64 {
+/// The `mtp_head_file_reserve_bytes` formula for a known byte count. Split out
+/// so the bundled-trailer arm (which knows its section size without a file of
+/// its own) charges the same estimate as a sidecar file of the same size.
+fn mtp_head_reserve_for_bytes(file_bytes: u64) -> u64 {
     file_bytes + file_bytes / 8 + (512 << 20)
+}
+
+/// The DFlash draft a load pairs, with the facts its device footprint depends
+/// on ([`crate::footprint::dflash_side`]).
+#[derive(Clone, Copy)]
+pub(crate) struct DflashDraft<'a> {
+    pub path: &'a std::path::Path,
+    pub target: &'a Qwen35Config,
+    /// `speculation.dflash_block`, resolved per serving configuration.
+    pub block: usize,
+    /// The context the load sizes (matters only to a draft with a
+    /// full-attention layer).
+    pub context_rows: usize,
+}
+
+/// Device bytes the paired DFlash draft and its owners take: its weights,
+/// scratch, hidden ring, verify scratch, the target's rollback snapshot and
+/// the GDN tape, all derived from the draft's header and the target's config
+/// (`crate::footprint::dflash_side`, 2.2 GiB for the 27B). 0 for a path that
+/// does not exist; a file whose header does not parse charges its own bytes
+/// (the load refuses such a draft with the parse error).
+pub(crate) fn dflash_device_reserve_bytes(draft: &DflashDraft<'_>) -> u64 {
+    let Ok(meta) = std::fs::metadata(draft.path) else {
+        return 0;
+    };
+    crate::footprint::dflash_side_for_file(
+        draft.target,
+        draft.path,
+        draft.block,
+        draft.context_rows,
+    )
+    .map_or(meta.len(), |side| side.total())
 }
 
 /// Where the MTP head that will load beside a trunk lives.
@@ -86,34 +118,33 @@ pub(crate) enum MtpHeadLocation {
 /// Device bytes the drafts take when they load beside a spilled trunk.
 ///
 /// Drafts stay on the GPU — they are not part of the trunk spill — so their
-/// bytes come out of the capacity the placement may spend. Pure (paths and a
-/// byte count in, bytes out; the only filesystem reads are the files' own
-/// lengths), so unit tests pin the arithmetic without a GPU. 0 when no draft
-/// is in play.
+/// bytes come out of the capacity the placement may spend. Only file headers
+/// and lengths are read, so unit tests pin the arithmetic without a GPU. 0
+/// when no draft is in play.
 ///
 /// `mtp_head` is the exact head that will load (`None` = none), and
-/// `dflash_draft` the DFlash draft file that will load on the slots route.
-/// The single caller that both resolvers share — this is what fixes the
-/// slots under-reserve, where the old inline probe charged only the MTP
-/// sidecar and silently dropped a DFlash draft.
+/// `dflash_draft` the DFlash draft that will load (sized from its own header,
+/// [`dflash_device_reserve_bytes`]). The single caller that both resolvers
+/// share — this is what fixes the slots under-reserve, where the old inline
+/// probe charged only the MTP sidecar and silently dropped a DFlash draft.
 pub(crate) fn draft_device_reserve_bytes(
     mtp_head: Option<&MtpHeadLocation>,
-    dflash_draft: Option<&std::path::Path>,
+    dflash_draft: Option<&DflashDraft<'_>>,
 ) -> u64 {
     let mut bytes = 0u64;
     match mtp_head {
         Some(MtpHeadLocation::Sidecar(path)) => {
-            bytes = bytes.saturating_add(draft_file_reserve_bytes(path));
+            bytes = bytes.saturating_add(mtp_head_file_reserve_bytes(path));
         }
         Some(MtpHeadLocation::Bundled { section_bytes }) => {
             if *section_bytes > 0 {
-                bytes = bytes.saturating_add(draft_reserve_for_bytes(*section_bytes));
+                bytes = bytes.saturating_add(mtp_head_reserve_for_bytes(*section_bytes));
             }
         }
         None => {}
     }
-    if let Some(path) = dflash_draft {
-        bytes = bytes.saturating_add(draft_file_reserve_bytes(path));
+    if let Some(draft) = dflash_draft {
+        bytes = bytes.saturating_add(dflash_device_reserve_bytes(draft));
     }
     bytes
 }
@@ -314,8 +345,16 @@ pub(crate) fn mtp_head_reserved(spec_mtp: Option<bool>) -> bool {
 /// drift. MTP not admitted (explicit off, or `auto` without a measured AR
 /// floor) means the head will not load; a named DFlash draft is still charged
 /// because the slots route runs its DFlash2 chain independently of the MTP gate.
-fn load_draft_reserve_bytes(trunk: &std::path::Path, ctx: &LoadCtx) -> u64 {
-    let dflash_draft: Option<&std::path::Path> = ctx.draft_path.map(std::path::Path::new);
+fn load_draft_reserve_bytes(trunk: &std::path::Path, ctx: &LoadCtx, config: &Qwen35Config) -> u64 {
+    let dflash_draft = ctx.draft_path.map(|path| DflashDraft {
+        path: std::path::Path::new(path),
+        target: config,
+        block: ctx
+            .spec
+            .dflash_block
+            .unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED),
+        context_rows: ctx.max_seq,
+    });
     let mtp_head: Option<MtpHeadLocation> = if mtp_head_reserved(ctx.spec.mtp) {
         match ctx.mtp_path.clone() {
             // An explicit CLI path is always a standalone sidecar file.
@@ -325,7 +364,7 @@ fn load_draft_reserve_bytes(trunk: &std::path::Path, ctx: &LoadCtx) -> u64 {
     } else {
         None
     };
-    draft_device_reserve_bytes(mtp_head.as_ref(), dflash_draft)
+    draft_device_reserve_bytes(mtp_head.as_ref(), dflash_draft.as_ref())
 }
 
 fn placement_capacity_inputs(
@@ -363,7 +402,7 @@ fn placement_capacity_inputs(
     // `auto` this producer declares no measured AR floor, so no head loads
     // and nothing is reserved.
     // (DSpark is a DeepSeek4 module and never attaches here.)
-    let draft_reservation = load_draft_reserve_bytes(hfq.path(), ctx);
+    let draft_reservation = load_draft_reserve_bytes(hfq.path(), ctx, config);
     let layer_bytes = crate::qwen35::load::qwen35_layer_bytes(hfq, config);
     let inputs = offload::CapacityInputs {
         free_vram,
@@ -459,6 +498,18 @@ pub(crate) fn unspillable_no_fit_refusal(
     )
 }
 
+/// Weight-slab packing of a Qwen3.5-family load on every GPU architecture when
+/// `HIPFIRE_WEIGHT_SLAB` is unset: tensors of at most 64 MiB share slabs, so
+/// ROCr's 2 MiB allocation rounding is paid once per layer instead of once per
+/// 16-45 MiB projection (~0.3 GiB on qwen3.8-27B). The dense layer loader
+/// sizes each layer's slab exactly (`load_layer_into`), so the slab capacity
+/// of [`hip_bridge::SlabMode::Up64M`] only serves loads that do not reserve.
+/// An explicit `HIPFIRE_WEIGHT_SLAB` always wins; output bytes are unchanged
+/// (same data at different addresses).
+pub fn weight_slab_default(_gpu_arch: &str) -> Option<hip_bridge::SlabMode> {
+    Some(hip_bridge::SlabMode::Up64M)
+}
+
 /// Build the Qwen35 GPU bundle from an HFQ source.
 ///
 /// CPU-only config/compat validation runs **before** weight upload. Every
@@ -520,7 +571,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     // expanded tensors) already own VRAM, while KV and lazy PBS do not.
     if let Some(mut sequence) = ctx.sequence {
         let reserve = sequence.reserve_bytes;
-        let capacity = (|| -> Result<(usize, usize, usize, usize, u64), String> {
+        let capacity = (|| -> Result<(usize, usize, usize, usize, u64, usize, usize), String> {
             let planned = ctx
                 .gpu
                 .planned_capacity()
@@ -536,16 +587,32 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
                 plan.adaptive.is_some(),
             )
             .ok_or("Qwen KV stride overflow")?;
-            let draft_reserve = load_draft_reserve_bytes(hfq.path(), ctx);
+            let draft_reserve = load_draft_reserve_bytes(hfq.path(), ctx, &config);
+            // Owners still to be allocated after the weights: the DeltaNet
+            // state and stream carry, and the flash-attention partials, whose
+            // size follows this very capacity (they are sized from the
+            // provisional context), so they ride on every token's cost.
+            let state = usize::try_from(crate::footprint::dn_state_device_charge(&config))
+                .unwrap_or(usize::MAX);
+            let partials = crate::footprint::flash_partials_bytes_per_token(&config);
             let card_cap = free
                 .saturating_sub(minimum)
                 .saturating_sub(reserve)
                 .saturating_sub(128 << 20)
                 .saturating_sub(usize::try_from(draft_reserve).unwrap_or(usize::MAX))
-                / stride;
-            Ok((free, minimum, stride, card_cap, draft_reserve))
+                .saturating_sub(state)
+                / (stride + partials);
+            Ok((
+                free,
+                minimum,
+                stride,
+                card_cap,
+                draft_reserve,
+                state,
+                partials,
+            ))
         })();
-        let (free, minimum, stride, card_cap, draft_reserve) = match capacity {
+        let (free, minimum, stride, card_cap, draft_reserve, state, partials) = match capacity {
             Ok(v) => v,
             Err(e) => {
                 weights.free_gpu(ctx.gpu);
@@ -553,7 +620,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
             }
         };
         eprintln!(
-            "max_seq budget: free_after_weights={free} min_prefill={minimum} vision_reserve={reserve} draft_reserve={draft_reserve} page_rounding={} kv_bytes_per_token={stride}",
+            "max_seq budget: free_after_weights={free} min_prefill={minimum} vision_reserve={reserve} draft_reserve={draft_reserve} dn_state={state} page_rounding={} kv_bytes_per_token={stride} flash_partials_bytes_per_token={partials}",
             128 << 20,
         );
         if sequence.automatic {
@@ -1674,8 +1741,26 @@ mod tests {
         assert!(s.contains("pending VMM"), "{s}");
     }
 
-    /// The draft-reserve arithmetic, pinned without a GPU: one file reserves
-    /// file + file/8 + 512 MiB, and MTP + DFlash charge independently and add.
+    /// A small dense hybrid config: enough for the DFlash footprint to have
+    /// every term, without a model file.
+    fn tiny_target() -> Qwen35Config {
+        let metadata = serde_json::json!({"config": {"text_config": {
+            "hidden_size": 256, "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 64, "intermediate_size": 512,
+            "vocab_size": 1000, "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 32, "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4, "linear_value_head_dim": 32,
+            "layer_types": ["linear_attention", "linear_attention",
+                "linear_attention", "full_attention"],
+            "max_position_embeddings": 4096,
+        }}});
+        crate::qwen35::config_from_metadata_json(&metadata.to_string()).unwrap()
+    }
+
+    /// The draft-reserve arithmetic, pinned without a GPU: an MTP head file
+    /// reserves file + file/8 + 512 MiB, a DFlash draft whose header does not
+    /// parse its own bytes (the load refuses it), and the two charge
+    /// independently and add.
     #[test]
     fn draft_reserve_charges_mtp_and_dflash() {
         let dir =
@@ -1689,28 +1774,49 @@ mod tests {
         };
         let file_len = 8 << 20;
         let mtp = write_sized("model.mtp", file_len);
-        let dflash = write_sized("draft.hfq", file_len);
-        let expect = file_len + file_len / 8 + (512 << 20);
-        assert_eq!(draft_file_reserve_bytes(&mtp), expect);
-        assert_eq!(draft_file_reserve_bytes(&dflash), expect);
-        assert_eq!(draft_file_reserve_bytes(&dir.join("missing.mtp")), 0);
+        let dflash_path = write_sized("draft.hfq", file_len);
+        let target = tiny_target();
+        fn draft<'a>(path: &'a std::path::Path, target: &'a Qwen35Config) -> DflashDraft<'a> {
+            DflashDraft {
+                path,
+                target,
+                block: 16,
+                context_rows: 4096,
+            }
+        }
+        let dflash = draft(&dflash_path, &target);
+        let expect_mtp = file_len + file_len / 8 + (512 << 20);
+        assert_eq!(mtp_head_file_reserve_bytes(&mtp), expect_mtp);
+        assert_eq!(mtp_head_file_reserve_bytes(&dir.join("missing.mtp")), 0);
+        let expect_dflash = file_len;
+        assert_eq!(dflash_device_reserve_bytes(&dflash), expect_dflash);
+        assert_eq!(
+            dflash_device_reserve_bytes(&draft(&dir.join("missing.hfq"), &target)),
+            0
+        );
         // Each side alone, then both together: the single helper both
         // resolvers call, so a slots load with a DFlash sidecar charges it.
         let mtp_sidecar = MtpHeadLocation::Sidecar(mtp);
-        assert_eq!(draft_device_reserve_bytes(Some(&mtp_sidecar), None), expect);
-        assert_eq!(draft_device_reserve_bytes(None, Some(&dflash)), expect);
+        assert_eq!(
+            draft_device_reserve_bytes(Some(&mtp_sidecar), None),
+            expect_mtp
+        );
+        assert_eq!(
+            draft_device_reserve_bytes(None, Some(&dflash)),
+            expect_dflash
+        );
         assert_eq!(
             draft_device_reserve_bytes(Some(&mtp_sidecar), Some(&dflash)),
-            expect.saturating_mul(2)
+            expect_mtp + expect_dflash
         );
         // A bundled head charges only its appended section, never the trunk.
         let bundled = MtpHeadLocation::Bundled {
             section_bytes: file_len,
         };
-        assert_eq!(draft_device_reserve_bytes(Some(&bundled), None), expect);
+        assert_eq!(draft_device_reserve_bytes(Some(&bundled), None), expect_mtp);
         assert_eq!(
             draft_device_reserve_bytes(Some(&bundled), Some(&dflash)),
-            expect.saturating_mul(2)
+            expect_mtp + expect_dflash
         );
         assert_eq!(draft_device_reserve_bytes(None, None), 0);
         let _ = std::fs::remove_dir_all(&dir);

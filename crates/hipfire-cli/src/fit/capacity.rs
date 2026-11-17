@@ -168,17 +168,16 @@ pub(crate) fn memory_phrase(free: u64, device: Option<&FitDevice>) -> String {
 }
 
 fn exceeds_free(p: &Qwen35CardProjection) -> bool {
-    p.weights
-        .saturating_add(p.scratch)
-        .saturating_add(p.page_rounding)
-        >= p.free
+    p.fixed_bytes() >= p.free
 }
 
 fn charges(p: &Qwen35CardProjection) -> String {
     format!(
-        "free {} - weights {} - prefill scratch {} - page rounding {}",
+        "free {} - weights {} - DeltaNet state {} - HIP runtime {} - prefill scratch {} - page rounding {}",
         gib(p.free as u64),
         gib(p.weights as u64),
+        gib(p.state as u64),
+        gib(p.runtime as u64),
         gib(p.scratch as u64),
         gib(p.page_rounding as u64)
     )
@@ -244,42 +243,45 @@ pub(crate) fn context_finding(
         return if automatic {
             Finding::fits("context", format!("automatic context: min(trained window {}, card capacity measured after weights load); projected {} ({charges})", p.model_ctx, tokens_phrase(p.card_cap, Some(p.model_ctx))))
         } else {
-            Finding::fits("context", format!("a {requested}-token context needs {requested} x {} bytes of KV; the projection leaves room for {} ({charges})", p.bytes_per_token, tokens_phrase(p.card_cap, Some(p.model_ctx))))
+            Finding::fits("context", format!("a {requested}-token context needs {requested} x {} bytes of KV and attention partials; the projection leaves room for {} ({charges})", p.bytes_per_context_token(), tokens_phrase(p.card_cap, Some(p.model_ctx))))
         };
     }
     if p.card_cap >= USEFUL_CONTEXT_FLOOR {
         return Finding::fails(
             "context",
-            format!("a {requested}-token context needs {requested} x {} bytes of KV; the projection leaves room for {} ({charges})", p.bytes_per_token, tokens_phrase(p.card_cap, Some(p.model_ctx))),
+            format!("a {requested}-token context needs {requested} x {} bytes of KV and attention partials; the projection leaves room for {} ({charges})", p.bytes_per_context_token(), tokens_phrase(p.card_cap, Some(p.model_ctx))),
             lower_context_fix(&p, better),
         );
     }
     // Too little room for any useful context: the model does not fit this
     // GPU's free memory, and lowering the context cannot fix that.
     let memory = memory_phrase(p.free as u64, Some(device));
-    let need = p
-        .weights
-        .saturating_add(p.scratch)
-        .saturating_add(p.page_rounding);
+    let need = p.fixed_bytes();
     let shortfall = if exceeds_free(&p) {
         format!(
-            "weights {} + prefill scratch {} + page rounding {} need {}, more than the free memory",
+            "weights {} + DeltaNet state {} + HIP runtime {} + prefill scratch {} + page rounding {} need {}, more than the free memory",
             gib(p.weights as u64),
+            gib(p.state as u64),
+            gib(p.runtime as u64),
             gib(p.scratch as u64),
             gib(p.page_rounding as u64),
             gib(need as u64)
         )
     } else if p.card_cap == 0 {
         format!(
-            "after weights {}, prefill scratch {} and page rounding {} no KV token fits",
+            "after weights {}, DeltaNet state {}, HIP runtime {}, prefill scratch {} and page rounding {} no KV token fits",
             gib(p.weights as u64),
+            gib(p.state as u64),
+            gib(p.runtime as u64),
             gib(p.scratch as u64),
             gib(p.page_rounding as u64)
         )
     } else {
         format!(
-            "after weights {}, prefill scratch {} and page rounding {} only {} tokens of KV fit, below {}",
+            "after weights {}, DeltaNet state {}, HIP runtime {}, prefill scratch {} and page rounding {} only {} tokens of KV fit, below {}",
             gib(p.weights as u64),
+            gib(p.state as u64),
+            gib(p.runtime as u64),
             gib(p.scratch as u64),
             gib(p.page_rounding as u64),
             p.card_cap,
@@ -305,12 +307,16 @@ pub(crate) fn context_finding(
 pub(crate) fn capacity_lines(p: &Value, device: Option<&FitDevice>) -> Vec<String> {
     let n = |key: &str| p[key].as_u64().unwrap_or(0);
     let estimate = format!(
-        "pre-load estimate: {} free - {} weights - {} prefill scratch - {} rounding; {} B/token",
+        "pre-load estimate: {} free - {} weights - {} DeltaNet state - {} HIP runtime - {} prefill scratch - {} rounding; {} B/token (KV {} + attention partials {})",
         gib(n("free")),
         gib(n("weights")),
+        gib(n("state")),
+        gib(n("runtime")),
         gib(n("scratch")),
         gib(n("page_rounding")),
-        n("bytes_per_token")
+        n("bytes_per_token").saturating_add(n("partials_per_token")),
+        n("bytes_per_token"),
+        n("partials_per_token")
     );
     if n("card_cap") > 0 {
         let window = p["model_ctx"].as_u64().map(|w| w as usize);
@@ -320,6 +326,8 @@ pub(crate) fn capacity_lines(p: &Value, device: Option<&FitDevice>) -> Vec<Strin
         )];
     }
     let needed = n("weights")
+        .saturating_add(n("state"))
+        .saturating_add(n("runtime"))
         .saturating_add(n("scratch"))
         .saturating_add(n("page_rounding"));
     let why = if needed >= n("free") {
@@ -444,7 +452,9 @@ mod tests {
         }
     }
 
-    /// 4B-class model: 3.2 GiB weights, 1.2 GiB scratch, 17408 B/token.
+    /// 4B-class model: 3.2 GiB weights, 1.2 GiB scratch, 17408 B/token. No
+    /// DeltaNet state, runtime reserve or partials: the numbers the tests
+    /// below were written against (`with_new_terms` adds them).
     fn projection(free_bytes: usize) -> Qwen35CardProjection {
         let weights = 3 * GIB_US + 200 * MIB;
         let scratch = GIB_US + 200 * MIB;
@@ -453,9 +463,12 @@ mod tests {
         Qwen35CardProjection {
             free: free_bytes,
             weights,
+            state: 0,
+            runtime: 0,
             scratch,
             page_rounding,
             bytes_per_token,
+            partials_per_token: 0,
             card_cap: free_bytes
                 .saturating_sub(weights)
                 .saturating_sub(scratch)
@@ -679,6 +692,45 @@ mod tests {
         ));
         // A lowering fix never goes past the window.
         assert!(lower_context_fix(&p, None).contains("at most 262144 "));
+    }
+
+    #[test]
+    fn state_runtime_and_partials_are_named_and_charged() {
+        // 27B-class terms: 536 MiB of DeltaNet state, the 256 MiB HIP runtime
+        // and 3,096 B/token of flash-attention partials on top of the KV rows.
+        let mut p = projection(30 * GIB_US);
+        p.state = 536 * MIB;
+        p.runtime = 256 * MIB;
+        p.partials_per_token = 3_096;
+        p.card_cap = (p.free - p.fixed_bytes()) / p.bytes_per_context_token();
+        assert_eq!(p.bytes_per_context_token(), 17_408 + 3_096);
+        let finding = context_finding(p, 8_192, false, &device(0, 30), None);
+        assert_eq!(finding.verdict, Verdict::Fits);
+        assert!(finding
+            .detail
+            .contains("20504 bytes of KV and attention partials"));
+        assert!(
+            finding.detail.contains("DeltaNet state"),
+            "{}",
+            finding.detail
+        );
+        assert!(finding.detail.contains("HIP runtime"), "{}", finding.detail);
+        let json = serde_json::json!({"free": p.free, "weights": p.weights, "state": p.state,
+            "runtime": p.runtime, "scratch": p.scratch, "page_rounding": p.page_rounding,
+            "bytes_per_token": p.bytes_per_token, "partials_per_token": p.partials_per_token,
+            "card_cap": p.card_cap});
+        let line = &capacity_lines(&json, None)[0];
+        assert!(line.contains("DeltaNet state"), "{line}");
+        assert!(
+            line.contains("20504 B/token (KV 17408 + attention partials 3096)"),
+            "{line}"
+        );
+        // The state and runtime count toward what the free memory must hold.
+        let tight = Qwen35CardProjection {
+            free: p.weights + p.scratch + p.page_rounding + 100 * MIB,
+            ..p
+        };
+        assert!(exceeds_free(&tight));
     }
 
     #[test]

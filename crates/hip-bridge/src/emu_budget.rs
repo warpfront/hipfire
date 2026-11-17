@@ -139,6 +139,55 @@ pub(crate) fn charged_free<L: Ledger>(
     result
 }
 
+/// Fixed footprint of the HIP runtime itself on a ROCr device: the context,
+/// kernel code objects, graph/PM4 pools and driver state that no hipfire
+/// allocation owns. VramLedger measured it as sysfs `mem_info_vram_used` minus
+/// hip-bridge's own ledger on the 7900 XTX serving `qwen3.8:27b`: 207 MiB idle,
+/// 245 MiB after an 8K prompt, 250 MiB after 32K (`vram-ledger/LEDGER.md` §1).
+/// 256 MiB covers the high end. The emu charges it at profile install and
+/// `hipfire fit` and the loader's capacity projection charge it, so a profile
+/// of N bytes leaves the same free memory a physical N-byte card does.
+pub const HIP_RUNTIME_RESERVE_BYTES: usize = 256 << 20;
+
+/// [`charged_alloc`] for a `hipMalloc`-class device allocation: the ledger is
+/// charged what ROCr really occupies ([`crate::device_alloc_charge`]: 4 KiB
+/// granule up to 1 MiB, 2 MiB above it), not the requested size. A card's
+/// free memory shrinks by the rounded figure, so an emulated card that
+/// charged the request would offer more room than the real one.
+pub(crate) fn charged_device_alloc<L: Ledger, T>(
+    ledger: &L,
+    size: usize,
+    raw: impl FnOnce() -> HipResult<T>,
+) -> HipResult<(T, Option<L::Token>)> {
+    charged_alloc(ledger, Class::Device, crate::device_alloc_charge(size), raw)
+}
+
+/// Charge `bytes` of device capacity for the process lifetime. The token is
+/// dropped, never released: a dropped token keeps its charge.
+fn charge_forever<L: Ledger>(ledger: &L, bytes: usize) -> HipResult<()> {
+    let ((), token) = charged_alloc(ledger, Class::Device, bytes, || Ok(()))?;
+    drop(token);
+    Ok(())
+}
+
+/// Charge [`HIP_RUNTIME_RESERVE_BYTES`] against the installed emu budget, once
+/// per process (`Gpu` init calls it at every profile install; the budget is a
+/// process singleton). A no-op without an installed budget. Fails with the
+/// usual out-of-memory refusal when the profile is smaller than the reserve.
+pub fn charge_emu_runtime_reserve() -> HipResult<()> {
+    static CHARGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering;
+    let Some(process) = active() else {
+        return Ok(());
+    };
+    if CHARGED.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+    charge_forever(&process, HIP_RUNTIME_RESERVE_BYTES).inspect_err(|_| {
+        CHARGED.store(false, Ordering::Release);
+    })
+}
+
 /// Capacity precheck that reserves nothing (used before irreversible setup).
 pub(crate) fn precheck<L: Ledger>(ledger: &L, class: Class, bytes: usize) -> HipResult<()> {
     if bytes == 0 {
@@ -474,5 +523,69 @@ mod tests {
             Class::HostPinned
         );
         assert!(vmm_class(0).is_err());
+    }
+
+    const MIB: usize = 1 << 20;
+
+    #[test]
+    fn device_alloc_is_charged_at_the_rounded_rocr_size() {
+        reset();
+        let ledger = Fake {
+            cap: (64 * MIB) as u64,
+        };
+        // 3 MiB occupies 4 MiB; 1 MiB + 1 B is above the 1 MiB small-allocation
+        // limit and takes a whole 2 MiB granule; 100 B takes one 4 KiB page.
+        for (size, charged) in [
+            (3 * MIB, 4 * MIB),
+            (MIB + 1, 2 * MIB),
+            (MIB, MIB),
+            (100, 4096),
+        ] {
+            let before = USED.get();
+            let ((), token) = charged_device_alloc(&ledger, size, || Ok(())).unwrap();
+            assert_eq!(USED.get() - before, charged as u64, "{size} B");
+            charged_free::<Fake>(token, || Ok(())).unwrap();
+        }
+        // The rounded figure is what the cap sees: 16 x 3 MiB requests are
+        // 48 MiB raw but 64 MiB occupied, so a 17th is refused.
+        reset();
+        let mut tokens = Vec::new();
+        for _ in 0..16 {
+            tokens.push(charged_device_alloc(&ledger, 3 * MIB, || Ok(())).unwrap().1);
+        }
+        assert_eq!(USED.get(), (64 * MIB) as u64);
+        let refused = charged_device_alloc(&ledger, 1, || Ok(()))
+            .err()
+            .expect("the rounded charges fill the cap");
+        assert_eq!(refused.code, HIP_ERROR_OUT_OF_MEMORY);
+    }
+
+    #[test]
+    fn runtime_reserve_is_charged_forever_and_shrinks_the_cap() {
+        reset();
+        let ledger = Fake {
+            cap: (HIP_RUNTIME_RESERVE_BYTES + 100) as u64,
+        };
+        charge_forever(&ledger, HIP_RUNTIME_RESERVE_BYTES).unwrap();
+        assert_eq!(
+            (USED.get(), RELEASED.get()),
+            (HIP_RUNTIME_RESERVE_BYTES as u64, 0)
+        );
+        // Only 100 B remain, so anything larger is refused as out-of-memory.
+        let refused = charged_alloc(&ledger, Class::Device, 101, || Ok(()))
+            .err()
+            .expect("the reserve took its share of the cap");
+        assert_eq!(refused.code, HIP_ERROR_OUT_OF_MEMORY);
+        // A profile smaller than the reserve cannot carry the runtime at all.
+        reset();
+        let tiny = Fake {
+            cap: (HIP_RUNTIME_RESERVE_BYTES - 1) as u64,
+        };
+        assert_eq!(
+            charge_forever(&tiny, HIP_RUNTIME_RESERVE_BYTES)
+                .unwrap_err()
+                .code,
+            HIP_ERROR_OUT_OF_MEMORY
+        );
     }
 }

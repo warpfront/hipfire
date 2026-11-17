@@ -50,7 +50,7 @@ const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 /// [`MQ_X_ROT_CHUNK_ROWS`] chunk of the widest rotated input. With staged
 /// features (`stage = Some(n)`) `fc` rotates at most `n` feature rows per
 /// call, so the feature width no longer sets the chunk.
-fn mq_x_rot_elems(inter: usize, qd: usize, fw: usize, stage: Option<usize>) -> usize {
+pub fn mq_x_rot_elems(inter: usize, qd: usize, fw: usize, stage: Option<usize>) -> usize {
     match stage {
         None => MQ_X_ROT_CHUNK_ROWS * inter.max(qd).max(fw),
         Some(n) => (MQ_X_ROT_CHUNK_ROWS * inter.max(qd)).max(n * fw),

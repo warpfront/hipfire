@@ -302,15 +302,17 @@ impl Gpu {
     }
 
     /// Drop one holder of the `shape` entry acquired at `base`. The entry
-    /// returns to the pool once no tape holds it and no replay graph can
-    /// reference it; otherwise it stays at its address until unload. A
-    /// holder whose entry was already drained (unload) is a no-op.
+    /// is released once no tape holds it and no replay graph can reference
+    /// it (parked in the pool, or returned to HIP above its park limit, which
+    /// the 27B's 72 MiB region exceeds); otherwise it stays at its address
+    /// until unload. A holder whose entry was already drained (unload) is a
+    /// no-op.
     pub fn dflash_gdn_replay_scratch_release(
         &mut self,
         shape: GdnReplayScratchShape,
         base: *mut c_void,
     ) {
-        // bind_thread: skip — bookkeeping; the buffer goes to the pool, no device call.
+        // bind_thread: only for the release below, which can reach hipFree.
         let Some(s) = self.dflash_gdn_replay_scratch.get_mut(&shape) else {
             return;
         };
@@ -320,7 +322,13 @@ impl Gpu {
         s.refs = s.refs.saturating_sub(1);
         if s.refs == 0 && self.graphs.replay_graph_count() == 0 {
             if let Some(old) = self.dflash_gdn_replay_scratch.remove(&shape) {
-                self.pool.free(old.buf);
+                // The last tape of a shape is freed with its speculator, never
+                // per verify cycle.
+                if let Err(err) = self.bind_thread().and_then(|()| self.pool_release(old.buf)) {
+                    eprintln!(
+                        "dflash_gdn_replay: releasing the shared replay scratch failed: {err}"
+                    );
+                }
             }
         }
     }
@@ -378,7 +386,9 @@ impl Gpu {
             .map(|(_, s)| s)
             .collect();
         for s in entries {
-            self.pool.free(s.buf);
+            if let Err(err) = self.pool_release(s.buf) {
+                eprintln!("dflash_gdn_replay: releasing the shared replay scratch failed: {err}");
+            }
         }
     }
 

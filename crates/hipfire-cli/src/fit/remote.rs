@@ -63,6 +63,29 @@ pub(crate) fn header_replica(
     Ok(replica)
 }
 
+/// Header-only replica of one registry sidecar file of `entry` (the paired
+/// DFlash draft): the same sparse fetch as [`header_replica`], cached beside
+/// the model's, so fit can read the draft's geometry without downloading it.
+pub(crate) fn sidecar_header_replica(
+    paths: &crate::Paths,
+    entry: &hipfire_registry::ModelEntry,
+    file: &str,
+    size_bytes: Option<u64>,
+) -> Result<Replica> {
+    ensure!(
+        Path::new(file).components().count() == 1
+            && matches!(
+                Path::new(file).components().next(),
+                Some(Component::Normal(_))
+            ),
+        "registry sidecar must have a plain file name"
+    );
+    let key = format!("{:x}", Sha256::digest(serde_json::to_vec(&(entry, file))?));
+    let destination = paths.root.join("cache/fit-headers").join(key).join(file);
+    let mut source = HttpRangeSource::new(crate::artifact_url(entry, file))?;
+    build_replica(&mut source, &destination, size_bytes)
+}
+
 pub(crate) struct RangeBytes {
     pub bytes: Vec<u8>,
     pub total: u64,
