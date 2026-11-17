@@ -2035,8 +2035,8 @@ pub struct Gpu {
     /// 9..=64-row arms that are NOT bitwise the <=8-row route (lane WMMA, the trunk A8 projections,
     /// the MoE int8 gate/up chain, the int8 down) refuse while it is set.
     pub lane_row_exact_scope: bool,
-    /// Set by the HC read around its SIMT down/up projections so the dense prefill lane WMMA knob
-    /// (`HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`) never takes the HC mixers (the HC route owns them).
+    /// Set by the HC read around its SIMT down/up projections so the dense prefill lane WMMA route
+    /// never takes the HC mixers (the HC route owns them).
     pub prefill_lwmma_dense_hold: bool,
     /// Actual singleton AR arithmetic for an eager verify window. The forward
     /// owner restores this host scope binding after success or error; it never
