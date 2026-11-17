@@ -103,6 +103,16 @@ impl PriceCell {
             (live[self.len / 2 - 1] + live[self.len / 2]) / 2.0
         })
     }
+
+    /// `(max − min) ÷ median` of the kept samples (the snapshot store's
+    /// tightness rule); `None` for an empty cell.
+    pub fn spread(&self) -> Option<f64> {
+        let median = self.median()?;
+        let live = &self.samples[..self.len];
+        let max = live.iter().copied().fold(f64::MIN, f64::max);
+        let min = live.iter().copied().fold(f64::MAX, f64::min);
+        Some((max - min) / median)
+    }
 }
 
 /// Opaque equality key of the executor a load's AR token runs on. The driver
@@ -274,6 +284,17 @@ impl LoadPrices {
             0 => self.ar[bucket].kept(),
             1..=LOAD_PRICE_WINDOW_ROWS => self.window[rows][bucket].kept(),
             _ => 0,
+        }
+    }
+
+    /// The AR cell (`rows == 0`) or the `rows`-row window cell at `ctx`'s
+    /// bucket; `None` for a row count outside the table.
+    pub fn cell(&self, rows: usize, ctx: usize) -> Option<&PriceCell> {
+        let bucket = price_bucket(ctx);
+        match rows {
+            0 => Some(&self.ar[bucket]),
+            1..=LOAD_PRICE_WINDOW_ROWS => Some(&self.window[rows][bucket]),
+            _ => None,
         }
     }
 }

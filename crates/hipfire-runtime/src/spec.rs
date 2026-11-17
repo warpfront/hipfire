@@ -1206,12 +1206,17 @@ pub enum FloorSnapshotSource {
     /// Measured by the load-time calibration, before the load accepted a
     /// request.
     LoadCalibrated,
+    /// Read from the install's snapshot store
+    /// ([`crate::spec_floor_store`]): an earlier load with the same key
+    /// calibrated it.
+    Cache,
 }
 
 impl FloorSnapshotSource {
     pub fn name(self) -> &'static str {
         match self {
             Self::LoadCalibrated => "load-calibrated",
+            Self::Cache => "cache",
         }
     }
 }
@@ -1242,6 +1247,10 @@ pub struct DriverFloor {
     /// The load's frozen prices ([`Self::freeze_snapshot`]); `None` runs the
     /// count line.
     snapshot: Option<(crate::spec_prices::PinnedPrices, FloorSnapshotSource)>,
+    /// The stored entry the snapshot is tied to (read from it or written
+    /// from it): deleted once the live prices drift from the snapshot
+    /// ([`Self::retire_stale_snapshot`]).
+    persisted: Option<crate::spec_floor_store::PersistedSnapshot>,
     /// Verified-row counts (bit `rows`, 0 = AR token, saturating at 127)
     /// already observed on this load: see [`Self::first_use`].
     warm_rows: u128,
@@ -1261,6 +1270,7 @@ impl DriverFloor {
             },
             prices: crate::spec_prices::LoadPrices::new(full_rows),
             snapshot: None,
+            persisted: None,
             warm_rows: 0,
         }
     }
@@ -1283,6 +1293,44 @@ impl DriverFloor {
     /// The load's frozen prices and their source.
     pub fn snapshot(&self) -> Option<(crate::spec_prices::PinnedPrices, FloorSnapshotSource)> {
         self.snapshot
+    }
+
+    /// Tie the snapshot to its stored entry.
+    pub fn persist_to(&mut self, persisted: crate::spec_floor_store::PersistedSnapshot) {
+        self.persisted = Some(persisted);
+    }
+
+    /// The stored entry the snapshot is tied to, until it is deleted.
+    pub fn persisted(&self) -> Option<&crate::spec_floor_store::PersistedSnapshot> {
+        self.persisted.as_ref()
+    }
+
+    /// At request end, never per token: when a full base-bucket cell of the
+    /// live prices drifts from the snapshot by more than
+    /// [`crate::spec_floor_store::SNAPSHOT_STALE_DRIFT`], delete the stored
+    /// entry and log it once. The load keeps deciding on its snapshot; the
+    /// next load with the key recalibrates. Returns the drift that deleted
+    /// it.
+    pub fn retire_stale_snapshot(&mut self) -> Option<f64> {
+        let (snapshot, _) = self.snapshot?;
+        self.persisted.as_ref()?;
+        let drift = crate::spec_floor_store::snapshot_drift(&snapshot, &self.prices)?;
+        if drift <= crate::spec_floor_store::SNAPSHOT_STALE_DRIFT {
+            return None;
+        }
+        let persisted = self.persisted.take()?;
+        let outcome = match persisted.store.remove(&persisted.key) {
+            Ok(true) => "deleted".to_owned(),
+            Ok(false) => "already gone".to_owned(),
+            Err(e) => format!("not deleted: {e}"),
+        };
+        eprintln!(
+            "[spec-floor] stored snapshot is stale: live prices drift {:.1}% from it (limit {:.0}%); entry {outcome} in {}; this load keeps it, the next load recalibrates",
+            drift * 100.0,
+            crate::spec_floor_store::SNAPSHOT_STALE_DRIFT * 100.0,
+            persisted.store.file().display()
+        );
+        Some(drift)
     }
 
     /// Empty the price cells (the load-time calibration's samples), keeping

@@ -30,7 +30,12 @@ use hipfire_arch_qwen35::speculative::ModelSlot;
 use hipfire_loader::spec_build::Qwen35SlotGuard;
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::spec::{DriverFloor, FloorControl, FloorSnapshotSource, Speculator};
+use hipfire_runtime::spec_floor_store::{
+    file_identity, tight_spread, FloorSnapshotKey, FloorSnapshotStore, PersistedSnapshot,
+};
 use hipfire_runtime::spec_prices::{PinnedPrices, PIN_MIN_WINDOW_SAMPLES};
+use hipfire_runtime::verified_cache::{StatKey, VerifiedCache};
+use std::path::Path;
 use std::time::Instant;
 
 /// The built-in calibration text: plain prose, encoded without a chat
@@ -79,6 +84,9 @@ pub struct SpecFloorCalibration {
     pub wall_ms: f64,
     /// Kept AR and full-block window samples when it stopped.
     pub kept: (usize, usize),
+    /// `(max − min) ÷ median` of the kept AR and full-block window samples
+    /// (the store's tightness rule); `None` for an empty cell.
+    pub spread: (Option<f64>, Option<f64>),
 }
 
 fn driver(spec: &mut dyn Speculator) -> Option<&mut DriverFloor> {
@@ -209,12 +217,14 @@ pub fn run_spec_floor_calibration(
     };
     let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
     let df = driver(spec).ok_or("the driver-owned floor went away")?;
+    let spread = |rows| df.prices.cell(rows, base).and_then(|cell| cell.spread());
     Ok(SpecFloorCalibration {
         snapshot,
         windows,
         ar_steps,
         wall_ms,
         kept: (df.prices.kept(0, base), df.prices.kept(full_rows, base)),
+        spread: (spread(0), spread(full_rows)),
     })
 }
 
@@ -241,13 +251,78 @@ fn count_line(reason: &str) {
     );
 }
 
+/// Where a load's snapshot is stored across loads (S2a-5b): the install's
+/// hipfire home, the daemon build and the drafter file. A caller without
+/// one (a test fixture) always calibrates and stores nothing.
+pub struct SpecFloorStoreCtx<'a> {
+    /// The hipfire home: the store is `<home>/cache/spec-floor-prices.json`.
+    pub home: &'a Path,
+    /// md5 of the daemon binary.
+    pub daemon_md5: &'a str,
+    /// The drafter file this load attached.
+    pub drafter: &'a Path,
+}
+
+/// The store key of this load, or why it has none (the store is then not
+/// used; the load still calibrates).
+fn snapshot_key(
+    ctx: &SpecFloorStoreCtx<'_>,
+    m_path: &str,
+    pp: usize,
+    block_size: usize,
+    slot: &ModelSlot,
+    gpu: &rdna_compute::Gpu,
+) -> Result<FloorSnapshotKey, String> {
+    let verified = VerifiedCache::in_home(ctx.home);
+    let identity = |path: &Path| {
+        let stat =
+            StatKey::of(&std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?);
+        let sha = verified.verified_digest(path, &stat);
+        file_identity(path, sha.as_deref())
+            .ok_or_else(|| format!("{}: no identity", path.display()))
+    };
+    let name = gpu
+        .hip
+        .get_device_name(gpu.device_id)
+        .map_err(|e| format!("device name: {e:?}"))?;
+    let (_, vram) = gpu
+        .hip
+        .get_vram_info()
+        .map_err(|e| format!("VRAM: {e:?}"))?;
+    let route = crate::qwen::spec_floor_route_key(gpu);
+    Ok(FloorSnapshotKey {
+        daemon_md5: ctx.daemon_md5.to_owned(),
+        target: identity(Path::new(m_path))?,
+        drafter: identity(ctx.drafter)?,
+        device: format!("{}|{name}|{vram}", gpu.arch),
+        hip_runtime: gpu
+            .hip
+            .runtime_version_raw()
+            .map_err(|e| format!("HIP runtime version: {e:?}"))?,
+        route: format!("{route:?}"),
+        kv: format!("{:?}", slot.slot_config.kv_mode),
+        gdn: format!("{:?}", slot.dn_state.quant),
+        block_size,
+        pp,
+        // Tensor-parallel loads never reach the store (count line).
+        tp: 1,
+    })
+}
+
 /// Give a qwen35 DFlash load with a driver-owned floor its frozen prices
-/// before it accepts a request (see the module doc). Loads without a
-/// driver-owned floor, and loads with `HIPFIRE_SPEC_RETIRE` set (every
-/// request runs the count line), are left alone. `Err` only when the reset
-/// after a calibration failed: the target and drafter state is then unknown
-/// and the load must not be published.
-pub fn prepare_spec_floor(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+/// before it accepts a request (see the module doc). With a `store`, a
+/// stored snapshot for the load's key is frozen instead of calibrating
+/// (`source = cache`), and a tight calibration ([`tight_spread`]) is
+/// written for the next load; a store error is never a load failure.
+/// Loads without a driver-owned floor, and loads with `HIPFIRE_SPEC_RETIRE`
+/// set (every request runs the count line), are left alone. `Err` only when
+/// the reset after a calibration failed: the target and drafter state is
+/// then unknown and the load must not be published.
+pub fn prepare_spec_floor(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    store: Option<&SpecFloorStoreCtx<'_>>,
+) -> Result<(), String> {
     let Some(spec) = m.speculator.as_mut() else {
         return Ok(());
     };
@@ -282,6 +357,32 @@ pub fn prepare_spec_floor(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> R
             return Ok(());
         }
     };
+    let keyed = store.and_then(|ctx| {
+        match snapshot_key(ctx, &m.model_path, m.pp, spec.block_size(), slot, gpu) {
+            Ok(key) => Some(PersistedSnapshot {
+                store: FloorSnapshotStore::in_home(ctx.home),
+                key,
+            }),
+            Err(e) => {
+                eprintln!("[spec-floor] snapshot store not used: {e}");
+                None
+            }
+        }
+    });
+    if let Some(persisted) = keyed.as_ref() {
+        if let Some(prices) = persisted.store.lookup(&persisted.key) {
+            drop(guard);
+            let df = driver(spec.as_mut()).ok_or("the driver-owned floor went away")?;
+            df.freeze_snapshot(prices, FloorSnapshotSource::Cache);
+            df.persist_to(persisted.clone());
+            log_snapshot(
+                "cache",
+                &prices,
+                &format!("from {}", persisted.store.file().display()),
+            );
+            return Ok(());
+        }
+    }
     let measured = run_spec_floor_calibration(gpu, spec.as_mut(), slot, &prompt, ctx_capacity);
     let reset = reset_after_spec_floor_calibration(gpu, spec.as_mut(), slot);
     drop(guard);
@@ -308,18 +409,51 @@ pub fn prepare_spec_floor(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> R
         .and_then(|spec| driver(spec.as_mut()))
         .ok_or("the driver-owned floor went away")?;
     df.freeze_snapshot(prices, FloorSnapshotSource::LoadCalibrated);
+    let (ar_spread, window_spread) = (
+        calibration.spread.0.unwrap_or(f64::INFINITY),
+        calibration.spread.1.unwrap_or(f64::INFINITY),
+    );
+    let stored = match keyed {
+        None => "not stored (no store)".to_owned(),
+        Some(_) if !tight_spread(ar_spread, window_spread) => format!(
+            "not stored (loose: AR spread {:.1}%, window spread {:.1}%)",
+            ar_spread * 100.0,
+            window_spread * 100.0
+        ),
+        Some(persisted) => {
+            match persisted
+                .store
+                .store(&persisted.key, &prices, ar_spread, window_spread)
+            {
+                Ok(()) => {
+                    let file = persisted.store.file().display().to_string();
+                    df.persist_to(persisted);
+                    format!("stored in {file}")
+                }
+                Err(e) => format!("not stored ({e})"),
+            }
+        }
+    };
+    log_snapshot(
+        "load-calibrated",
+        &prices,
+        &format!(
+            "{} windows, {} AR tokens, {:.0} ms; {stored}",
+            calibration.windows, calibration.ar_steps, calibration.wall_ms
+        ),
+    );
+    Ok(())
+}
+
+fn log_snapshot(source: &str, prices: &PinnedPrices, detail: &str) {
     let full = prices.window_us[prices.full_rows];
     eprintln!(
-        "[spec-floor] load-calibrated: ar_us={:.1} full-block window_us={:.1} ({} rows) break_even={:.3}; {} windows, {} AR tokens, {:.0} ms",
+        "[spec-floor] {source}: ar_us={:.1} full-block window_us={:.1} ({} rows) break_even={:.3}; {detail}",
         prices.ar_us,
         full,
         prices.full_rows,
         full / prices.ar_us,
-        calibration.windows,
-        calibration.ar_steps,
-        calibration.wall_ms
     );
-    Ok(())
 }
 
 #[cfg(test)]

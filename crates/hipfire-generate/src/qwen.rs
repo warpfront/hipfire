@@ -4726,8 +4726,8 @@ impl SpecFloorRun {
 
     /// The `done` envelope's `floor` object, built once at request end. A
     /// driver-owned speculator's (`df`) also names where its load's prices
-    /// came from: `load-calibrated`, or `count-line` for a load without a
-    /// snapshot.
+    /// came from: `load-calibrated`, `cache` (the install's snapshot store),
+    /// or `count-line` for a load without a snapshot.
     fn report(&self, df: Option<&hipfire_runtime::spec::DriverFloor>) -> serde_json::Value {
         let mut report = serde_json::json!({ "policy": self.policy.name() });
         if let Some(df) = df {
@@ -6789,9 +6789,14 @@ pub fn generate_spec(
         }
     }
 
-    // The last window is never observed (no next mark).
+    // The last window is never observed (no next mark). A stored snapshot
+    // whose live prices drifted is deleted here, once per request end, never
+    // per token; this load keeps deciding on it.
     let floor_report = (floor_owner == FloorOwner::Driver).then(|| match spec.floor_control() {
-        hipfire_runtime::spec::FloorControl::Driver(df) => floor_run.report(Some(df)),
+        hipfire_runtime::spec::FloorControl::Driver(df) => {
+            df.retire_stale_snapshot();
+            floor_run.report(Some(df))
+        }
         _ => floor_run.report(None),
     });
     // Snapshot the emitter's state needed by the post-loop bookkeeping before
