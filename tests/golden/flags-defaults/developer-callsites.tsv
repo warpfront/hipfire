@@ -618,7 +618,6 @@ developer_callsite	*	HIPFIRE_TP_PEER_ALTERNATING#developer_var=ok
 developer_callsite	*	HIPFIRE_TP_PEER_PUSH#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_TP_PEER_PUSH_FAULT#developer_var=is_ok
 developer_callsite	*	HIPFIRE_TP_PEER_PUSH_FAULT#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_V2B_A4_EPI#developer_var=as_deref
 developer_callsite	*	HIPFIRE_V2B_DOWN_SWZ#developer_var=ok.and_then.unwrap_or(V2B_DOWN_SWZ_GRP)
 developer_callsite	*	HIPFIRE_VAE_CONFIG_ONLY#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_VAE_IM2COL_MAP#developer_var=unwrap_or_default

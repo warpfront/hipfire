@@ -3101,6 +3101,24 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_QWEN4_MOE_EP_A8",
         "Qwen4 Flash-Next A8 routed-MoE chain on exact gfx1201: auto (default) runs it only inside expert-parallel forwards below the owner-routed floor; true runs it in every forward it serves; false keeps the A4 chain everywhere."
     ),
+    process_auto_bool_field!(
+        "kernel.mq6_i8",
+        "mq6_i8",
+        Kernel,
+        true,
+        "HIPFIRE_MQ6_I8",
+        "Exact-INT8 MQ6G256V2 prefill GEMM on gfx1201 / gfx1151 (eager, K % 256 == 0): auto (default) runs it in the Qwen4 forward at 512+ rows on the default archs; true runs it in any scope; false keeps the incumbent MQ6 route."
+    ),
+    process_field!(
+        "kernel.v2b_a4_epi",
+        "v2b_a4_epi",
+        Kernel,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_V2B_A4_EPI",
+        "Exact-gfx1151 V2B gate/up SiLU A4 epilogue arm: retile runs the M512xN128 twin in place of the fused A4 kernel (diagnostic bisect arm); anything else (unset) keeps the fused kernel."
+    ),
     process_bool_field!(
         "attention.qwen4_qsa_wmma_gather",
         "qwen4_qsa_wmma_gather",
@@ -4669,6 +4687,22 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_MOE_EP_A8 is unchanged",
         replacement: "kernel.qwen4_moe_ep_a8",
+    },
+    RetiredConfigKey {
+        key: "developer.mq6_i8",
+        legacy_key: "developer.mq6_i8",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-438); HIPFIRE_MQ6_I8 is unchanged",
+        replacement: "kernel.mq6_i8",
+    },
+    RetiredConfigKey {
+        key: "developer.v2b_a4_epi",
+        legacy_key: "developer.v2b_a4_epi",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-438); HIPFIRE_V2B_A4_EPI is unchanged",
+        replacement: "kernel.v2b_a4_epi",
     },
     RetiredConfigKey {
         key: "developer.qwen4_qsa_wmma_gather",
@@ -8937,6 +8971,12 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
             "0" => ConfigValue::Bool(false),
             _ => ConfigValue::String("auto".to_owned()),
         },
+        // `parse_legacy_flag_bool`: its true / false spellings; anything else is auto.
+        "mq6_i8" => match raw {
+            "1" | "true" | "TRUE" | "on" | "ON" => ConfigValue::Bool(true),
+            "0" | "false" | "FALSE" | "off" | "OFF" => ConfigValue::Bool(false),
+            _ => ConfigValue::String("auto".to_owned()),
+        },
         // Trimmed exact `1` / `0`; anything else is the load-conditional default.
         "qwen4_moe_ep_a8" => match raw.trim() {
             "1" => ConfigValue::Bool(true),
@@ -8961,7 +9001,8 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
         | "raon_dflash_rollback"
         | "raon_railgun"
         | "raon_verify_rowexact"
-        | "raon_shared_ffn" => ConfigValue::String(raw.to_owned()),
+        | "raon_shared_ffn"
+        | "v2b_a4_epi" => ConfigValue::String(raw.to_owned()),
         _ => return None,
     })
 }
@@ -9969,6 +10010,12 @@ mod tests {
                 Some(ep_a8),
                 "{raw:?}"
             );
+            let mq6_i8 = match raw {
+                "1" | "true" | "TRUE" | "on" | "ON" => "1",
+                "0" | "false" | "FALSE" | "off" | "OFF" => "0",
+                _ => "auto",
+            };
+            assert_eq!(on("mq6_i8", raw).as_deref(), Some(mq6_i8), "{raw:?}");
             for key in [
                 "ep_peer_allreduce",
                 "ep_peer_allreduce_decode",
@@ -9998,6 +10045,7 @@ mod tests {
                 "raon_railgun",
                 "raon_verify_rowexact",
                 "raon_shared_ffn",
+                "v2b_a4_epi",
             ] {
                 assert_eq!(on(key, raw).as_deref(), Some(raw), "{key}={raw:?}");
             }
@@ -10016,8 +10064,8 @@ mod tests {
             .iter()
             .filter(|f| promoted_flag_env_value(f.legacy_key, "").is_some())
             .collect();
-        // 9 kernel-side (stage 1) + 28 arch-crate / runtime (stage 2).
-        assert_eq!(promoted.len(), 37);
+        // 9 kernel-side (stage 1) + 28 arch-crate / runtime (stage 2) + 2 tier-B kernel-side (HIPF-438).
+        assert_eq!(promoted.len(), 39);
         for f in promoted {
             let dev = developer_key_for_env(f.env_compat.unwrap()).unwrap();
             let err = ConfigLayer::default().set_cli(&dev, "1").unwrap_err();
