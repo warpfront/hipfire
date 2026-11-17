@@ -12,7 +12,7 @@
       "granted_utc": "2026-11-17T22:18:56Z",
       "expires_utc": "2026-11-19T22:18:56Z",
       "rollback": "Close this waiver (closed_by) once a promoted beta carries the corrected relation; if warm DFlash TTFT regresses, revert slice 2a.",
-      "closed_by": null
+      "closed_by": "f26cbe040f promoted; beta now carries the corrected warm-vs-warm-AR relation (c6e586f526)"
     },
     {
       "sha": "ae7ce161dde055bdcffe766bd28ef6d1bcad8d54",
@@ -25,7 +25,7 @@
       "granted_utc": "2026-11-17T22:18:56Z",
       "expires_utc": "2026-11-19T22:18:56Z",
       "rollback": "Close this waiver (closed_by) once a promoted beta carries the corrected relation; if warm DFlash TTFT regresses, revert slice 2a.",
-      "closed_by": null
+      "closed_by": "f26cbe040f promoted; beta now carries the corrected warm-vs-warm-AR relation (c6e586f526)"
     }
   ]
 }
