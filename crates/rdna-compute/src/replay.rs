@@ -177,19 +177,9 @@ impl Pm4Architecture {
     }
 }
 
-/// Kill switch for retained gfx10/gfx11 PM4 scratch (private-segment) rings.
-/// Default on; `0`/`false`/`off` restores the pre-A5 behaviour where a kernel
-/// with a private segment refuses the retained route.
-const PM4_SCRATCH_ENV: &str = "HIPFIRE_PMSCRATCH_PM4_SCRATCH";
 /// Upper bound on one scratch ring's backing memory. The ring is sized for the
 /// device's full wave capacity; this only trims it for huge per-wave needs.
 const PM4_SCRATCH_RING_CAP_BYTES: u64 = 256 << 20;
-
-fn pm4_scratch_enabled() -> bool {
-    hipfire_config::developer_var(PM4_SCRATCH_ENV)
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
-        .unwrap_or(true)
-}
 
 /// The scratch rings one retained legacy (gfx10/gfx11) PM4 route owns: one
 /// constant `COMPUTE_TMPRING_SIZE` plan sized for the largest private segment
@@ -222,9 +212,6 @@ impl Pm4ScratchRings {
             Pm4Architecture::Gfx11 => Gfx10ScratchFamily::Gfx11,
             Pm4Architecture::Gfx12 => return Ok(none),
         };
-        if !pm4_scratch_enabled() {
-            return Ok(none);
-        }
         // Kernels whose descriptor cannot be adapted fail at their own
         // dispatch with the kernel's name; they do not size the ring.
         let required = kernels

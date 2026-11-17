@@ -985,11 +985,10 @@ mod tests {
     #[test]
     fn gfx1201_fp8_attention_policy_is_per_head() {
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlags::for_test("gfx1201"));
-        let caps = crate::arch_caps::ArchCaps::new("gfx1201", flags.clone());
+        let caps = crate::arch_caps::ArchCaps::new("gfx1201", flags);
         for eager in [true, false] {
             assert_eq!(
                 super::super::qsa_decode_attention_policy_with(
-                    &flags,
                     &caps,
                     QsaKvFormat::Fp8,
                     256,

@@ -3011,16 +3011,11 @@ mod g3 {
         let beta_src = beta_src.ok_or(
             "--g3 requires --beta-src ABS_FILE (mq_fwht256.h + tensor_ops.hip of 060cadcd3b)",
         )?;
-        for v in [
-            "HIPFIRE_QWEN4_QSA_SCORE_PM",
-            "HIPFIRE_QWEN4_QSA_SELECT_PM",
-            "HIPFIRE_QWEN4_QSA_SELECT_EXACT",
-        ] {
-            if std::env::var_os(v).is_some() {
-                return Err(format!(
-                    "{v} is set: --g3 checks the live route with default flags"
-                ));
-            }
+        if std::env::var_os("HIPFIRE_QWEN4_QSA_SELECT_EXACT").is_some() {
+            return Err(
+                "HIPFIRE_QWEN4_QSA_SELECT_EXACT is set: --g3 checks the live route with default flags"
+                    .into(),
+            );
         }
         let mut paths = Vec::new();
         for d in dirs {

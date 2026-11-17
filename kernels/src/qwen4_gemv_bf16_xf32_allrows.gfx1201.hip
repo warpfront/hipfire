@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// gfx1201 all-rows BF16 GEMV (HIPFIRE_QWEN4_BF16_ALLROWS): up to four BF16 matrices reading the
+// gfx1201 all-rows BF16 GEMV: up to four BF16 matrices reading the
 // same [rows, K] F32 x (the Flash-Next MoE call's router + shared selector + shared gate/up, or
 // the shared down), 9..=64 rows, in ONE launch with every weight loaded once per block.
 //

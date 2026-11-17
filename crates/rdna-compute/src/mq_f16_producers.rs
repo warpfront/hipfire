@@ -24,8 +24,8 @@
 //!
 //! Route contract (mirrored by the prefill hook predicate): validated gfx1100
 //! or gfx1201, with architecture-specific WMMA consumers,
-//! `DflashFusionCtx::ChainVerify`, N<=16, MQ4G256V2 weights, and
-//! `HIPFIRE_MQ_F16_PROJECTION_OFF != 1`. HipGraph/replay recording requires
+//! `DflashFusionCtx::ChainVerify`, N<=16, and MQ4G256V2 weights.
+//! HipGraph/replay recording requires
 //! the fixed-grid gfx1100 split-verifier experiment. Every failed predicate
 //! runs the pre-change path; these entries return
 //! `Err` on an unsupported arch or non-F16 input rather than silently

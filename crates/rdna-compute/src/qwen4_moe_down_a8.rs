@@ -68,12 +68,6 @@ const GROUPED_PLANAR_NODZ_PM_PERSIST_ENTRY: &str =
 /// Down projection output width the kernels are written for.
 const DOWN_M: usize = 2560;
 
-/// `HIPFIRE_QWEN4_MOE_DOWN_C8_PM` (on unless `0`): the gfx1201 grouped A8 down on the nodz path
-/// (M 2560 x K 640, planar experts) runs the persistent PeaceMaker module where
-/// [`Gpu::qwen4_moe_down_c8_pm_covers`] holds; `0` keeps the hipcc grouped entry. Read once.
-static QWEN4_MOE_DOWN_C8_PM: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_DOWN_C8_PM", true));
-
 /// Token rows the c8 down module is routed at: from 33. Served rocprof (j8197, kill switch vs module at
 /// 256 workgroups, per launch): rows 33..=40 0.92, 41..=48 0.95; rows 9..=32 stay on hipcc (1.08 / 1.13).
 pub fn qwen4_moe_down_c8_pm_rows(rows: usize) -> bool {
@@ -562,8 +556,7 @@ impl Gpu {
         n_exp: usize,
     ) -> HipResult<()> {
         debug_assert!(self.qwen4_moe_down_a8_applies_grouped(m, k, x_row_div, x_src_rows));
-        let pm = *QWEN4_MOE_DOWN_C8_PM
-            && !self.moe_dead_stores
+        let pm = !self.moe_dead_stores
             && qwen4_moe_down_c8_pm_rows(x_src_rows / DOWN_K_TOP)
             && self.qwen4_moe_down_c8_pm_covers(m, k, x_row_div, grouped_rows);
         self.qwen4_moe_down_a8_grouped_run(

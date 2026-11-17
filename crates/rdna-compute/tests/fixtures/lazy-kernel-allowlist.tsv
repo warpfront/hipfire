@@ -254,25 +254,23 @@ module	fused_qkvza_mq4g256_lloyd_rdna3	codec-outside-core-rungs	Dense MQ4G256Llo
 module	fused_qkvza_mq4g256v2_lloyd	codec-outside-core-rungs	MQ4G256V2Lloyd/MQ4 route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:39552
 module	fused_qkvza_mq4g256v2_lloyd_hoist_x32_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_LLOYD_MMQ_A4 (exact gfx1100 twin TU); rdna-compute/src/gemm.rs:43318-43324
 module	fused_qkvza_mq5g256v2	codec-outside-core-rungs	MQ5G256V2 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/fused_qkv.rs:696
-module	fused_rmsnorm_mq_rotate_awq_i4	developer-opt-in	Non-default developer override: HIPFIRE_RMSNORM_P1A_BATCHED; rdna-compute/src/gemv.rs:3801-3812
-module	fused_rmsnorm_mq_rotate_awq_i4_fold	developer-opt-in	Non-default developer override: HIPFIRE_RMSNORM_P1A_BATCHED; rdna-compute/src/gemv.rs:3949-3957
+module	fused_rmsnorm_mq_rotate_awq_i4	non-target-arch	Only arches other than gfx1100/gfx1151 reach the non-b8 IU4 RMSNorm producer; rdna-compute/src/gemv.rs:3863
+module	fused_rmsnorm_mq_rotate_awq_i4_fold	non-target-arch	ADD-epilogue fold producer: only the gfx1151 V2B tile leaves a residual add owed (gemm.rs:20512-20517), and gfx1151 takes the b8 fold entry, so no target arch reaches the non-b8 one; rdna-compute/src/gemv.rs:3996
 module	fused_rmsnorm_mq_rotate_awq_i4_gfx12	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:4073-4087
 module	fused_rmsnorm_mq_rotate_awq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:6839
 module	fused_rmsnorm_mq_rotate_awq_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:6831
 module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
-module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12_seq	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_RMSNORM_P1A_BATCHED; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_awq_wavegrid	developer-opt-in	Non-default developer override: HIPFIRE_AWQ_NORM_WAVEGRID; rdna-compute/src/gemv.rs:3047-3054
-module	fused_rmsnorm_mq_rotate_i4	developer-opt-in	Non-default developer override: HIPFIRE_RMSNORM_P1A_BATCHED; rdna-compute/src/gemv.rs:3801-3812
-module	fused_rmsnorm_mq_rotate_i4_fold	developer-opt-in	Non-default developer override: HIPFIRE_RMSNORM_P1A_BATCHED; rdna-compute/src/gemv.rs:3949-3957
+module	fused_rmsnorm_mq_rotate_i4	non-target-arch	Only arches other than gfx1100/gfx1151 reach the non-b8 IU4 RMSNorm producer; rdna-compute/src/gemv.rs:3863
+module	fused_rmsnorm_mq_rotate_i4_fold	non-target-arch	ADD-epilogue fold producer: only the gfx1151 V2B tile leaves a residual add owed (gemm.rs:20512-20517), and gfx1151 takes the b8 fold entry, so no target arch reaches the non-b8 one; rdna-compute/src/gemv.rs:3996
 module	fused_rmsnorm_mq_rotate_i4_gfx12	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:4073-4087
 module	fused_rmsnorm_mq_rotate_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:6843
 module	fused_rmsnorm_mq_rotate_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:6835
 module	fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
-module	fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12_seq	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_RMSNORM_P1A_BATCHED; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_plain	non-core-family	Non-core family route: DeepSeek4; hipfire-arch-deepseek4/src/forward.rs:11019
 module	fused_rmsnorm_mq_rotate_plain_nox	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/norm.rs:6501-6506
 module	fused_rmsnorm_mq_rotate_vecsum_sign_const	config-opt-in	Non-default configuration: kernel.rdna; rdna-compute/src/gemv.rs:2778-2783
@@ -512,7 +510,6 @@ module	gemm_mq4g256v2_residual_mmq_i8_gfx11_t256	config-opt-in	Non-default confi
 module	gemm_mq4g256v2_residual_mmq_i8_gfx12_apf0	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemm.rs:1650-1680
 module	gemm_mq4g256v2_residual_mmq_i8_lloyd_gfx11	developer-opt-in	Non-default developer override: HIPFIRE_LLOYD_MMQ_A4 (staged twin TU); rdna-compute/src/gemm.rs:23009
 module	gemm_mq4g256v2_residual_mmq_lloyd	codec-outside-core-rungs	MQ4G256V2Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:20952-21065
-module	gemm_mq4g256v2_residual_wmma_base	no-caller	Lab-only T0 reference arm (#[cfg(feature = "lab")]); only the lab example calls it; rdna-compute/src/gemm.rs:42083
 module	gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt12	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt12_lut	codec-outside-core-rungs	MQ4G256V2Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:35531-35560
 module	gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt4	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817

@@ -13,9 +13,6 @@ static PACK_PM_VERIFIED: LazyLock<bool> = LazyLock::new(|| {
     let digest = Sha256::digest(kernels::NPU_TRUNK_PACK_PM_GFX1151);
     format!("{digest:x}") == kernels::NPU_TRUNK_PACK_PM_GFX1151_SHA256.trim()
 });
-/// `HIPFIRE_NPU_TRUNK_PACK_A_PM` (developer, default on; `0` restores the hipcc A-pack producers).
-static PACK_PM_FLAG: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_NPU_TRUNK_PACK_A_PM", true));
 
 /// Which kernel produces the G80 A stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,8 +205,7 @@ impl Gpu {
         need(a, layout.a_bytes())?;
         unsafe { self.npu_trunk_pack_a_impl(x, rows, layout, a.buf.as_ptr(), d, PackRoute::Scalar) }
     }
-    /// Lab-only: the hipcc K = 2560 / 5120 producer regardless of `HIPFIRE_NPU_TRUNK_PACK_A_PM`
-    /// (the byte and timing oracle of the PM twin).
+    /// Lab-only: the hipcc K = 2560 / 5120 producer (the byte and timing oracle of the PM twin).
     #[cfg(feature = "lab")]
     pub fn npu_trunk_pack_a_bf16_hipcc(
         &mut self,
@@ -223,7 +219,7 @@ impl Gpu {
         need(a, layout.a_bytes())?;
         unsafe { self.npu_trunk_pack_a_impl(x, rows, layout, a.buf.as_ptr(), d, PackRoute::Hipcc) }
     }
-    /// Lab-only: the sealed PM twin regardless of `HIPFIRE_NPU_TRUNK_PACK_A_PM`.
+    /// Lab-only: the sealed PM twin.
     #[cfg(feature = "lab")]
     pub fn npu_trunk_pack_a_bf16_pm(
         &mut self,
@@ -249,10 +245,10 @@ impl Gpu {
         d: &GpuTensor,
     ) -> HipResult<()> {
         let fast = matches!(layout.k, 2560 | 5120) && self.arch_caps.is_gfx1151();
-        let route = match (fast, *PACK_PM_FLAG) {
-            (false, _) => PackRoute::Scalar,
-            (true, true) => PackRoute::Pm,
-            (true, false) => PackRoute::Hipcc,
+        let route = if fast {
+            PackRoute::Pm
+        } else {
+            PackRoute::Scalar
         };
         unsafe { self.npu_trunk_pack_a_impl(x, rows, layout, a, d, route) }
     }

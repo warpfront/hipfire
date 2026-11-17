@@ -37,7 +37,7 @@
 // owns 8 contiguous rows (two b128 Y accesses per fragment). Y is token-major
 // [N][M].
 //
-// ADD_TOUCH (the `_add_touch` entry, gfx1100 `HIPFIRE_V2C_ADDEPI`): the ADD
+// ADD_TOUCH (the `_add_touch` entry, gfx1100): the ADD
 // epilogue's residual read stalls every CTA after its K loop. Starting
 // TOUCH_LEAD epochs before the end, each thread loads one dword of one 64-byte
 // line of its tile's residual per epoch (128 tokens x 512 B = 1024 lines, four

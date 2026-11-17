@@ -5,7 +5,7 @@
 //! Byte oracle of `Gpu::gemv_mq2g256v2_xbatch` (the MTP draft head's batched ranking
 //! GEMV over the MQ2G256V2 copy): for every shape and B = 1..8, the whole `y` of the
 //! x-batched kernel (production chunks of eight on the gfx1201 PeaceMaker route,
-//! four on hipcc; `HIPFIRE_QWEN4_MTP_DRAFT_HEAD_PM=0` selects hipcc)
+//! four on hipcc)
 //! must equal the bytes of `Gpu::gemv_mq2g256v2` launched once per column. Random
 //! weights (finite f16 scale / zero-point headers, random packed 2-bit payloads) and
 //! random activations; shapes cover K = 256 .. 4352 and every M residue mod 4.

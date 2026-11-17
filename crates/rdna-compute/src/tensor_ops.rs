@@ -81,23 +81,6 @@ const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
 static QWEN4_QSA_F16_ARENA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_F16_ARENA", false)
 });
-/// `HIPFIRE_QWEN4_QSA_SCORE_PM` / `HIPFIRE_QWEN4_QSA_SELECT_PM` (each on
-/// unless `0`) use the certified builder rows16 F32/BF16 score and
-/// select-from-scores kernels on covered gfx1151 prefill and decode calls
-/// ([`qsa_select_pm_fits`]), with identical output bytes. For F32, `0` keeps
-/// the corresponding hipcc kernel; SCORE_PM=0 keeps the fused hipcc selector
-/// for BF16 arenas. SELECT_PM chooses PM versus hipcc selection. Read once.
-static QWEN4_QSA_SCORE_PM: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SCORE_PM", true));
-/// Select PM versus hipcc from-scores for either dtype; BF16 only reaches
-/// this choice when SCORE_PM is enabled, otherwise it stays fused hipcc.
-static QWEN4_QSA_SELECT_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SELECT_PM", true)
-});
-/// Disable PM admission below the prefill threshold with `0`. Read once.
-static QWEN4_QSA_SELECT_PM_DECODE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SELECT_PM_DECODE", true)
-});
 /// `HIPFIRE_QWEN4_QSA_SELECT_EXACT=1` runs the batched QSA selector on the
 /// `_exact` kernels (tile sort + fixed-order merge instead of the all-pairs
 /// ranks; selected indices and mirror byte-identical) for complete <= 2048
@@ -3103,22 +3086,15 @@ pub struct HyperReadUpFused<'a> {
     pub normalized_bf16: bool,
 }
 
-/// `HIPFIRE_QWEN4_HC_UP_TWIN` (default on; `0` restores `hyper_read_up_fused_f32`
-/// for every row count): on exact gfx1151 the Qwen4 HC read tail runs the
-/// bitwise twin `hyper_read_up_fused_f32_sx` on batches of
-/// [`QWEN4_HC_UP_TWIN_MIN_ROWS`] rows or more. Read once.
-static QWEN4_HC_UP_TWIN: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_TWIN", true));
-
 /// Smallest row count (inclusive) that takes the `hyper_read_up_fused` twin.
 const QWEN4_HC_UP_TWIN_MIN_ROWS: usize = 16;
 
 /// Whether [`hyper_read_up_fused`] launches `hyper_read_up_fused_f32_sx`
-/// instead of `hyper_read_up_fused_f32`. The twin is bitwise the incumbent: only
-/// its output stores move, so the wave-uniform X loads become scalar loads.
+/// instead of `hyper_read_up_fused_f32` on exact gfx1151. The twin is bitwise the incumbent:
+/// only its output stores move, so the wave-uniform X loads become scalar loads.
 /// Decode/verify-sized batches below 16 rows keep the incumbent.
-fn qwen4_hc_up_twin_applies(enabled: bool, exact_gfx1151: bool, rows: usize) -> bool {
-    enabled && exact_gfx1151 && rows >= QWEN4_HC_UP_TWIN_MIN_ROWS
+fn qwen4_hc_up_twin_applies(exact_gfx1151: bool, rows: usize) -> bool {
+    exact_gfx1151 && rows >= QWEN4_HC_UP_TWIN_MIN_ROWS
 }
 
 /// Largest row count (inclusive) that takes the `hyper_read_up_fused` twin on exact gfx1201:
@@ -3128,22 +3104,10 @@ fn qwen4_hc_up_twin_applies(enabled: bool, exact_gfx1151: bool, rows: usize) -> 
 // selector-receipt: receipts/selectors/qwen4_hc_up_twin_gfx1201_max_rows.json
 const QWEN4_HC_UP_TWIN_GFX1201_MAX_ROWS: usize = 8;
 
-/// The gfx1201 admission of the sx twin (`HIPFIRE_QWEN4_HC_UP_TWIN` kill switch applies).
-fn qwen4_hc_up_twin_gfx1201_applies(enabled: bool, exact_gfx1201: bool, rows: usize) -> bool {
-    enabled && exact_gfx1201 && rows <= QWEN4_HC_UP_TWIN_GFX1201_MAX_ROWS
+/// The gfx1201 admission of the one-token-per-wave twin.
+fn qwen4_hc_up_twin_gfx1201_applies(exact_gfx1201: bool, rows: usize) -> bool {
+    exact_gfx1201 && rows <= QWEN4_HC_UP_TWIN_GFX1201_MAX_ROWS
 }
-
-/// `HIPFIRE_QWEN4_HC_UP_T1` (developer, default on; `0` falls back from the one-token-per-wave
-/// entry to the `_sx` twin on the gfx1201 rows it admits). Read once.
-static QWEN4_HC_UP_T1: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_T1", true));
-
-/// `HIPFIRE_QWEN4_HC_UP_T1_K320` (developer, default off): on the gfx1201 rows that take the t1
-/// entry, `low_rank == 320` launches `hyper_read_up_fused_f32_sx_t1_k320` instead (same module,
-/// grid, block, LDS and arguments; bitwise the t1 output). Read once.
-static QWEN4_HC_UP_T1_K320: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_T1_K320", true)
-});
 
 /// Entry of the HC read tail `hyper_read_up_fused` (same arguments, block and dynamic LDS).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3160,23 +3124,16 @@ pub enum HyperReadUpFusedEntry {
     TwinT1K320,
 }
 
-/// The entry [`hyper_read_up_fused`] launches. `twin_enabled` = `HIPFIRE_QWEN4_HC_UP_TWIN`,
-/// `t1_enabled` = `HIPFIRE_QWEN4_HC_UP_T1`. gfx1201 (exact, rows <= 8) takes `TwinT1`, or
-/// `Twin` with the T1 switch off; gfx1151 (exact, rows >= 16) takes `Twin`.
+/// The entry [`hyper_read_up_fused`] launches: gfx1201 (exact, rows <= 8) takes `TwinT1`,
+/// gfx1151 (exact, rows >= 16) takes `Twin`, everything else the incumbent.
 fn hyper_read_up_fused_route(
-    twin_enabled: bool,
-    t1_enabled: bool,
     exact_gfx1151: bool,
     exact_gfx1201: bool,
     rows: usize,
 ) -> HyperReadUpFusedEntry {
-    if qwen4_hc_up_twin_gfx1201_applies(twin_enabled, exact_gfx1201, rows) {
-        if t1_enabled {
-            HyperReadUpFusedEntry::TwinT1
-        } else {
-            HyperReadUpFusedEntry::Twin
-        }
-    } else if qwen4_hc_up_twin_applies(twin_enabled, exact_gfx1151, rows) {
+    if qwen4_hc_up_twin_gfx1201_applies(exact_gfx1201, rows) {
+        HyperReadUpFusedEntry::TwinT1
+    } else if qwen4_hc_up_twin_applies(exact_gfx1151, rows) {
         HyperReadUpFusedEntry::Twin
     } else {
         HyperReadUpFusedEntry::Incumbent
@@ -3185,13 +3142,10 @@ fn hyper_read_up_fused_route(
 
 /// Same arguments, block and dynamic LDS for every entry: on exact gfx1151 with at least 16
 /// rows the launch is the bitwise twin `hyper_read_up_fused_f32_sx`; on exact gfx1201 with at
-/// most 8 rows it is the one-token-per-wave `hyper_read_up_fused_f32_sx_t1`
-/// (`HIPFIRE_QWEN4_HC_UP_T1=0`: the sx twin); `HIPFIRE_QWEN4_HC_UP_TWIN=0` forces the
-/// incumbent `hyper_read_up_fused_f32` everywhere.
+/// most 8 rows it is the one-token-per-wave `hyper_read_up_fused_f32_sx_t1` (the
+/// `low_rank == 320` build `_t1_k320` when it applies).
 pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
     let mut entry = hyper_read_up_fused_route(
-        *QWEN4_HC_UP_TWIN,
-        *QWEN4_HC_UP_T1,
         gpu.arch_caps.is_gfx1151(),
         gpu.arch_caps.is_gfx1201(),
         p.rows,
@@ -3200,14 +3154,10 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
     // t1 entry, whose grid `[hidden / 8, ceil(rows / 8)]` runs each eight-token tile with the
     // very device body the <= 8-row group launches run (one token per wave, no state shared
     // across `blockIdx.y`), in one launch, instead of the incumbent's 128-token row grid.
-    if entry == HyperReadUpFusedEntry::Incumbent
-        && *QWEN4_HC_UP_TWIN
-        && *QWEN4_HC_UP_T1
-        && gpu.lane_hc_allrows_applies(p.rows)
-    {
+    if entry == HyperReadUpFusedEntry::Incumbent && gpu.lane_hc_allrows_applies(p.rows) {
         entry = HyperReadUpFusedEntry::TwinT1;
     }
-    if entry == HyperReadUpFusedEntry::TwinT1 && *QWEN4_HC_UP_T1_K320 && p.low_rank == 320 {
+    if entry == HyperReadUpFusedEntry::TwinT1 && p.low_rank == 320 {
         entry = HyperReadUpFusedEntry::TwinT1K320;
     }
     hyper_read_up_fused_entry(gpu, p, entry)
@@ -3303,8 +3253,6 @@ pub fn hyper_read_up_fused_rotate(
     rotated: &GpuTensor,
 ) -> HipResult<bool> {
     let route = hyper_read_up_fused_route(
-        *QWEN4_HC_UP_TWIN,
-        *QWEN4_HC_UP_T1,
         gpu.arch_caps.is_gfx1151(),
         gpu.arch_caps.is_gfx1201(),
         p.rows,
@@ -7240,7 +7188,7 @@ pub struct IndexedAttentionSelectBatch<'a> {
     /// Exact BF16 copy of `pooled` rows [0, block_count) (pooled values are BF16-rounded
     /// at pooling). When Some (dtype BF16, numel >= block_count*index_dim) and the gfx1151
     /// PM BF16 score kernel covers the call (same admission as the PM F32 score: eager,
-    /// `qsa_select_pm_fits`, HIPFIRE_QWEN4_QSA_SCORE_PM on, pooled F32), the score reads it;
+    /// `qsa_select_pm_fits`, pooled F32), the score reads it;
     /// otherwise `pooled`. Selection bytes identical either way.
     pub pooled_bf16: Option<&'a GpuTensor>,
     /// Extent-check metadata only (never a kernel argument): the mirror's
@@ -7385,12 +7333,12 @@ fn indexed_attention_select_batch_impl(
     let shape_blocks = p.shape_blocks;
     let parallel =
         gpu.arch_caps.has_qwen4_parallel_qsa_gdn() && shape_blocks > 0 && !select_forced_serial();
-    // Live F32 launches use the score/select pair. Covered BF16 prefill
-    // launches use the builder score with either select kernel; SCORE_PM=0
-    // keeps the fused BF16 selector. The opt-in exact selector keeps its route.
+    // Live F32 launches use the score/select pair. Covered BF16 launches use
+    // the builder score with the builder select. The opt-in exact selector
+    // keeps its route.
     if parallel
         && !*QWEN4_QSA_SELECT_EXACT
-        && (p.pooled.dtype == DType::F32 || (qsa_select_pm_fits(gpu, p) && *QWEN4_QSA_SCORE_PM))
+        && (p.pooled.dtype == DType::F32 || qsa_select_pm_fits(gpu, p))
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.index_heads == 4
@@ -7659,8 +7607,6 @@ impl QsaSelectPmArm {
 /// Pooled blocks the builder selector serves: its per-lane bit-sliced
 /// counters take at most 511 packets of 32 keys per wave.
 const QSA_SELECT_PM_MAX_BLOCKS: usize = 511 * 8 * 32;
-/// Prefill admission remains independent of the decode kill switch.
-const QSA_SELECT_PM_MIN_ROWS: usize = 512;
 
 /// The exact selector (`indexed_attention_select_exact.hip`) is `mov_dpp8`
 /// code, gfx11+ ISA only: gfx942 gets the parallel incumbent selector, never
@@ -7675,9 +7621,6 @@ fn qsa_select_exact_arch(caps: &crate::arch_caps::ArchCaps) -> bool {
 /// offsets below the out-of-range offset (pooled extents use its element size).
 fn qsa_select_pm_fits(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> bool {
     let rows = gpu.route_rows(p.rows).max(p.rows);
-    if rows < QSA_SELECT_PM_MIN_ROWS && !*QWEN4_QSA_SELECT_PM_DECODE {
-        return false;
-    }
     qsa_select_pm_shape_fits(
         // Threshold input under the invariant profile; never below the real
         // rows, which the shape's raw-offset bounds are checked against.
@@ -7719,25 +7662,14 @@ pub(crate) fn qsa_select_pm_shape_fits(
         && below(rows.checked_mul(capacity).and_then(|n| n.checked_mul(4)))
 }
 
-pub(crate) fn qsa_select_pm_selected(fits: bool, score: bool, select: bool) -> QsaSelectPmArm {
-    if !fits {
-        return QsaSelectPmArm::Hipcc;
-    }
-    match (score, select) {
-        (false, false) => QsaSelectPmArm::Hipcc,
-        (true, false) => QsaSelectPmArm::ScoreOnly,
-        (false, true) => QsaSelectPmArm::SelectOnly,
-        (true, true) => QsaSelectPmArm::Both,
-    }
-}
-
-/// The route's arm: `HIPFIRE_QWEN4_QSA_SCORE_PM` / `HIPFIRE_QWEN4_QSA_SELECT_PM`
-/// (each on unless `0`) where the builder pair covers the call.
+/// The route's arm: the builder score and select pair wherever it covers the
+/// call, hipcc otherwise.
 fn qsa_select_pm_arm(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> QsaSelectPmArm {
-    if !qsa_select_pm_fits(gpu, p) {
-        return QsaSelectPmArm::Hipcc;
+    if qsa_select_pm_fits(gpu, p) {
+        QsaSelectPmArm::Both
+    } else {
+        QsaSelectPmArm::Hipcc
     }
-    qsa_select_pm_selected(true, *QWEN4_QSA_SCORE_PM, *QWEN4_QSA_SELECT_PM)
 }
 
 /// Lab entry with an explicit arm (grouping, scratch and mirror persistence;
@@ -7907,8 +7839,8 @@ fn qsa_select_score_symbol(arm: QsaScoreArm, many_rows: bool, rows32: bool) -> Q
 /// BF16 requires the PM rows16 score from `qsa_select_bf16_pm_gfx1151`;
 /// there is no hipcc BF16 rows score. Both dtypes select using hipcc or the
 /// existing PM select module, with identical kernargs, grids and output bytes.
-/// `HIPFIRE_QWEN4_QSA_FILTER_SELECT=1` replaces the select launch of large,
-/// eager, gfx11+ calls with the exact filter trio ([`qsa_filter_production`]).
+/// On exact gfx1151 the exact filter trio ([`qsa_filter_production`]) replaces
+/// the select launch of large, eager calls.
 fn indexed_attention_select_rows8(
     gpu: &mut Gpu,
     p: &IndexedAttentionSelectBatch<'_>,
@@ -7991,7 +7923,7 @@ fn indexed_attention_select_rows8_core(
         (group, s.scores, s.cand, s.ctl)
     } else {
         let group = score_group.min(p.rows);
-        if gpu.flags.qwen4_qsa_scores_reserve_enabled() && p.shape_blocks > stride {
+        if gpu.arch_caps.is_gfx1201() && p.shape_blocks > stride {
             // The block count grows by one every compress-ratio tokens: an exact-size
             // request regrows the shared scratch (device sync + free + malloc, and the
             // captured-state invalidation) every few decode steps (served EP2 MTP:
@@ -8208,8 +8140,7 @@ fn indexed_attention_select_rows8_core(
 // [`Gpu::qsa_select_scores`] slot, from [`QSA_BF16_SPLIT_MIN_BLOCKS`] pooled
 // blocks. Selected indices and the mirror are byte-identical to the fused
 // `indexed_attention_select_bf16_batched` incumbent, which every other architecture
-// keeps ([`qsa_bf16_split_arch`]), as does `HIPFIRE_QWEN4_QSA_FILTER_SELECT=0` (the
-// select-from-scores arm never beats the filter on gfx1201).
+// keeps ([`qsa_bf16_split_arch`]).
 
 /// Pooled blocks from which the split route replaces the fused BF16 selector
 /// for calls of at most [`QSA_BF16_SPLIT_MANY_ROWS`] rows (decode, verify, small
@@ -8289,8 +8220,7 @@ fn qsa_bf16_split_route(
     gpu: &Gpu,
     p: &IndexedAttentionSelectBatch<'_>,
 ) -> Option<QsaBf16SplitRoute> {
-    if !QWEN4_QSA_FILTER_SELECT.unwrap_or(true)
-        || *QWEN4_QSA_SELECT_EXACT
+    if *QWEN4_QSA_SELECT_EXACT
         || gpu.graphs.capture_mode
         || !qsa_bf16_split_arch(gpu)
         || !qsa_bf16_split_covers(p)
@@ -8728,20 +8658,6 @@ const QSA_FILTER_FEW_ROWS: usize = 16;
 static QWEN4_QSA_FILTER_FEW_ROWS32: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_FILTER_FEW_ROWS32", false)
 });
-/// `HIPFIRE_QWEN4_QSA_FILTER_SELECT` routes eager gfx11+ calls of more than
-/// [`qsa_filter_min_blocks`] blocks and at most
-/// [`QSA_SELECT_FROM_SCORES_MAX_BUDGET`] budget blocks through the filter
-/// trio instead of select-from-scores. Unset: on for exact gfx1151 (where it
-/// was measured), off elsewhere; `1` forces it on for any gfx11+, `0` is the
-/// kill switch. Read once.
-static QWEN4_QSA_FILTER_SELECT: std::sync::LazyLock<Option<bool>> =
-    std::sync::LazyLock::new(|| {
-        match hipfire_config::process_value("HIPFIRE_QWEN4_QSA_FILTER_SELECT").as_deref() {
-            Some("1") => Some(true),
-            Some("0") => Some(false),
-            _ => None,
-        }
-    });
 
 #[derive(Clone, Copy, Debug)]
 struct QsaFilterCfg {
@@ -8791,7 +8707,7 @@ fn qsa_filter_few_rows(gpu: &Gpu, rows: usize) -> bool {
 }
 
 /// Production admission of the filter route for a call the score/select
-/// route already admitted: switch on (default: exact gfx1151), gfx11+ SIMT, eager, more than
+/// route already admitted: exact gfx1151, eager, more than
 /// [`qsa_filter_min_blocks`] blocks for the select it replaces, budget within
 /// the select bound.
 fn qsa_filter_production(
@@ -8799,8 +8715,7 @@ fn qsa_filter_production(
     p: &IndexedAttentionSelectBatch<'_>,
     pm: QsaSelectPmArm,
 ) -> Option<QsaFilterCfg> {
-    (QWEN4_QSA_FILTER_SELECT.unwrap_or(gpu.arch_caps.is_gfx1151())
-        && gpu.arch_caps.has_gfx11_plus_simt()
+    (gpu.arch_caps.is_gfx1151()
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.block_count > qsa_filter_min_blocks(qsa_filter_few_rows(gpu, p.rows), pm.select())
@@ -10450,11 +10365,10 @@ const QSA_ATTENTION_HG12_MIN_ROWS: usize = 16;
 const QSA_ATTENTION_HG4_MIN_ROWS: usize = 2;
 
 /// Whether the grouped prefill attention runs its low-LDS twin
-/// (`indexed_attention_attention_q8_batched_hg4_lite`): q8 K/V on exact gfx1100
-/// with `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE` not `0`. The kernel symbol and the
-/// dynamic-LDS size both follow from this one decision.
-fn qsa_attention_hg4_lite(flags: &crate::feature_flags::FeatureFlags, format: QsaKvFormat) -> bool {
-    format == QsaKvFormat::Q8 && flags.qwen4_qsa_hg4_q8_lite_enabled()
+/// (`indexed_attention_attention_q8_batched_hg4_lite`): q8 K/V on exact gfx1100.
+/// The kernel symbol and the dynamic-LDS size both follow from this one decision.
+fn qsa_attention_hg4_lite(caps: &crate::arch_caps::ArchCaps, format: QsaKvFormat) -> bool {
+    format == QsaKvFormat::Q8 && caps.is_gfx1100()
 }
 
 /// Which GQA-group-specialised batch attention routes a (`n_heads`, `n_kv_heads`) shape
@@ -10515,7 +10429,7 @@ fn qsa_attention_hg4_lds_bytes(
     }
     let bytes = qsa_attention_hg4_lds_bytes_for(
         shape_selected,
-        qsa_attention_hg4_lite(&gpu.flags, p.format),
+        qsa_attention_hg4_lite(&gpu.arch_caps, p.format),
     )?;
     (bytes <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES).then_some(bytes as u32)
 }
@@ -10715,8 +10629,7 @@ fn indexed_attention_attention_batch_launch(
     if allow_fast && !decode && qsa_dense_wmma_applies(gpu, p, end_position) {
         return qsa_dense_wmma(gpu, p, end_position);
     }
-    // Split decode, default on (HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0 kill switch):
-    // eager hd256 admitted decode calls, split-K for F32 K/V (exact gfx1151)
+    // Split decode: eager hd256 admitted decode calls, split-K for F32 K/V (exact gfx1151)
     // and split-KV for q8 K/V (exact gfx1151 and gfx1100); KLD-gated, not
     // bit-exact. The reference entry (`allow_fast = false`) stays per-head.
     if allow_fast {
@@ -10781,7 +10694,7 @@ fn indexed_attention_attention_batch_launch(
         )
     } else if let Some(bytes) = hg4_bytes {
         (
-            if qsa_attention_hg4_lite(&gpu.flags, p.format) {
+            if qsa_attention_hg4_lite(&gpu.arch_caps, p.format) {
                 "indexed_attention_attention_q8_batched_hg4_lite"
             } else {
                 p.format.kernel([
@@ -10907,7 +10820,7 @@ fn indexed_attention_attention_batch_launch(
 }
 
 /// Split count of the production QSA split-K decode route
-/// (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`, default on): 32. Chosen from an R9700 (gfx1201)
+/// (exact gfx1151): 32. Chosen from an R9700 (gfx1201)
 /// sweep as the lowest summed time over the 1131- and 8188-token cases (79.04 us),
 /// pending Strix Halo KLD and performance. A compromise: S16 is fastest at
 /// 1131 tokens (22.46 us vs 24.71 us at S32), S32 fastest at 8188 (54.33 us vs
@@ -11019,8 +10932,8 @@ pub enum QsaDecodeAttentionPolicy {
     PerHead,
 }
 
-/// The policy proper. Inputs only: the architecture and flag (F32 split-K:
-/// gfx1151; q8 split-KV: gfx1151 or gfx1100; `HIPFIRE_QWEN4_QSA_DECODE_SPLITK`), K/V format, head_dim, head grouping, the
+/// The policy proper. Inputs only: the architecture (F32 split-K: gfx1151; q8
+/// split-KV: gfx1151 or gfx1100), K/V format, head_dim, head grouping, the
 /// context-derived `max_selected` (LDS fit of the F32 slice; the q8 split-KV
 /// LDS is fixed) and the launch mode (`eager`: no recorder or capture armed;
 /// both split routes bake their grid, LDS and position into the launch and
@@ -11035,7 +10948,6 @@ fn qsa_decode_attention_policy_for(
     eager: bool,
 ) -> QsaDecodeAttentionPolicy {
     qsa_decode_attention_policy_with(
-        &gpu.flags,
         &gpu.arch_caps,
         format,
         head_dim,
@@ -11049,7 +10961,6 @@ fn qsa_decode_attention_policy_for(
 /// [`qsa_decode_attention_policy_for`] over the flags and architecture alone
 /// (no device), so the policy is unit-testable without a GPU.
 fn qsa_decode_attention_policy_with(
-    flags: &crate::feature_flags::FeatureFlags,
     arch_caps: &crate::arch_caps::ArchCaps,
     format: QsaKvFormat,
     head_dim: usize,
@@ -11059,7 +10970,6 @@ fn qsa_decode_attention_policy_with(
     eager: bool,
 ) -> QsaDecodeAttentionPolicy {
     let split_k = eager
-        && flags.qwen4_qsa_decode_splitk_enabled()
         && arch_caps.is_gfx1151()
         && format == QsaKvFormat::F32
         && head_dim == 256
@@ -11082,7 +10992,6 @@ fn qsa_decode_attention_policy_with(
         };
     }
     let split_kv_q8 = eager
-        && flags.qwen4_qsa_decode_splitkv_q8_enabled()
         && (arch_caps.is_gfx1151() || arch_caps.is_gfx1100())
         && qsa_decode_splitkv_q8_geometry_fits(format, head_dim, n_heads, n_kv_heads);
     if split_kv_q8 {
@@ -13007,16 +12916,10 @@ mod tests {
         assert!(qsa_attention_hg4_lds_bytes_for(4089, true).unwrap() > limit);
     }
 
-    /// The lite twin serves q8 K/V on exact gfx1100 unless
-    /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE=0`; every other format and architecture
-    /// keeps the shipped kernel (and its LDS size).
+    /// The lite twin serves q8 K/V on exact gfx1100; every other format and
+    /// architecture keeps the shipped kernel (and its LDS size).
     #[test]
-    fn qsa_attention_hg4_lite_is_q8_exact_gfx1100_with_a_kill_switch() {
-        let flags = |arch: &str, switch: bool| {
-            let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
-            flags.qwen4_qsa_hg4_q8_lite = switch;
-            flags
-        };
+    fn qsa_attention_hg4_lite_is_q8_exact_gfx1100() {
         for format in [
             QsaKvFormat::F32,
             QsaKvFormat::Fp8,
@@ -13024,15 +12927,13 @@ mod tests {
             QsaKvFormat::Fp8Fnuz,
         ] {
             for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx942"] {
+                let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlags::for_test(arch));
+                let caps = crate::arch_caps::ArchCaps::new(arch, flags);
                 let expect = format == QsaKvFormat::Q8 && arch == "gfx1100";
                 assert_eq!(
-                    qsa_attention_hg4_lite(&flags(arch, true), format),
+                    qsa_attention_hg4_lite(&caps, format),
                     expect,
                     "{arch} {format:?}"
-                );
-                assert!(
-                    !qsa_attention_hg4_lite(&flags(arch, false), format),
-                    "{arch} {format:?}: kill switch"
                 );
             }
         }
@@ -13040,25 +12941,18 @@ mod tests {
 
     /// The decode attention policy over the flags and architecture alone:
     /// F32 K/V keeps split-K (exact gfx1151), q8 K/V at 24 query heads over 2
-    /// KV heads takes split-KV (exact gfx1151 and gfx1100), everything else (recorded/captured, kill switch, other
+    /// KV heads takes split-KV (exact gfx1151 and gfx1100), everything else (recorded/captured,
     /// geometry or architecture) stays per-head. Row counts are not an input.
     #[test]
     fn qsa_decode_attention_policy_routes_f32_split_k_and_q8_split_kv() {
-        let policy = |arch: &str,
-                      switch: bool,
-                      format,
-                      heads: usize,
-                      kv_heads: usize,
-                      head_dim: usize,
-                      eager: bool| {
-            let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
-            flags.qwen4_qsa_decode_splitk = switch;
-            let flags = std::sync::Arc::new(flags);
-            let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
-            qsa_decode_attention_policy_with(
-                &flags, &caps, format, head_dim, heads, kv_heads, 2051, eager,
-            )
-        };
+        let policy =
+            |arch: &str, format, heads: usize, kv_heads: usize, head_dim: usize, eager: bool| {
+                let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlags::for_test(arch));
+                let caps = crate::arch_caps::ArchCaps::new(arch, flags);
+                qsa_decode_attention_policy_with(
+                    &caps, format, head_dim, heads, kv_heads, 2051, eager,
+                )
+            };
         let q8 = QsaDecodeAttentionPolicy::SplitKvQ8 {
             splits: QSA_DECODE_SPLITK_SPLITS,
         };
@@ -13068,89 +12962,67 @@ mod tests {
         };
         let per_head = QsaDecodeAttentionPolicy::PerHead;
         // q8: exact gfx1151, eager, 24 / 2 / 256.
-        assert_eq!(
-            policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 256, true),
-            q8
-        );
+        assert_eq!(policy("gfx1151", QsaKvFormat::Q8, 24, 2, 256, true), q8);
         // Recorded or captured launch.
         assert_eq!(
-            policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 256, false),
-            per_head
-        );
-        // Kill switch.
-        assert_eq!(
-            policy("gfx1151", false, QsaKvFormat::Q8, 24, 2, 256, true),
+            policy("gfx1151", QsaKvFormat::Q8, 24, 2, 256, false),
             per_head
         );
         // Wrong head geometry.
         assert_eq!(
-            policy("gfx1151", true, QsaKvFormat::Q8, 12, 1, 256, true),
+            policy("gfx1151", QsaKvFormat::Q8, 12, 1, 256, true),
             per_head
         );
         assert_eq!(
-            policy("gfx1151", true, QsaKvFormat::Q8, 24, 4, 256, true),
+            policy("gfx1151", QsaKvFormat::Q8, 24, 4, 256, true),
             per_head
         );
         assert_eq!(
-            policy("gfx1151", true, QsaKvFormat::Q8, 24, 2, 128, true),
+            policy("gfx1151", QsaKvFormat::Q8, 24, 2, 128, true),
             per_head
         );
         // Another architecture.
         assert_eq!(
-            policy("gfx1201", true, QsaKvFormat::Q8, 24, 2, 256, true),
+            policy("gfx1201", QsaKvFormat::Q8, 24, 2, 256, true),
             per_head
         );
-        // gfx1100 takes q8 split-KV (eager, flag on) but never the F32 split-K.
+        // gfx1100 takes q8 split-KV (eager) but never the F32 split-K.
+        assert_eq!(policy("gfx1100", QsaKvFormat::Q8, 24, 2, 256, true), q8);
         assert_eq!(
-            policy("gfx1100", true, QsaKvFormat::Q8, 24, 2, 256, true),
-            q8
-        );
-        assert_eq!(
-            policy("gfx1100", true, QsaKvFormat::Q8, 24, 2, 256, false),
+            policy("gfx1100", QsaKvFormat::Q8, 24, 2, 256, false),
             per_head
         );
         assert_eq!(
-            policy("gfx1100", false, QsaKvFormat::Q8, 24, 2, 256, true),
+            policy("gfx1100", QsaKvFormat::Q8, 12, 1, 256, true),
             per_head
         );
         assert_eq!(
-            policy("gfx1100", true, QsaKvFormat::Q8, 12, 1, 256, true),
+            policy("gfx1100", QsaKvFormat::F32, 24, 2, 256, true),
             per_head
         );
         assert_eq!(
-            policy("gfx1100", true, QsaKvFormat::F32, 24, 2, 256, true),
-            per_head
-        );
-        assert_eq!(
-            policy("gfx1101", true, QsaKvFormat::Q8, 24, 2, 256, true),
+            policy("gfx1101", QsaKvFormat::Q8, 24, 2, 256, true),
             per_head
         );
         // F32 K/V is unchanged: split-K, never split-KV.
         assert_eq!(
-            policy("gfx1151", true, QsaKvFormat::F32, 24, 2, 256, true),
+            policy("gfx1151", QsaKvFormat::F32, 24, 2, 256, true),
             f32_split_k
         );
         assert_eq!(
-            policy("gfx1151", true, QsaKvFormat::F32, 24, 2, 256, false),
+            policy("gfx1151", QsaKvFormat::F32, 24, 2, 256, false),
             per_head
         );
         assert_eq!(
-            policy("gfx1151", false, QsaKvFormat::F32, 24, 2, 256, true),
-            per_head
-        );
-        assert_eq!(
-            policy("gfx1201", true, QsaKvFormat::F32, 24, 2, 256, true),
+            policy("gfx1201", QsaKvFormat::F32, 24, 2, 256, true),
             per_head
         );
         // The q8 split-KV LDS is fixed: a selected list far past the F32 slice
         // limit still takes it.
-        let mut flags = crate::feature_flags::FeatureFlags::for_test("gfx1151");
-        flags.qwen4_qsa_decode_splitk = true;
-        let flags = std::sync::Arc::new(flags);
-        let caps = crate::arch_caps::ArchCaps::new("gfx1151", flags.clone());
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlags::for_test("gfx1151"));
+        let caps = crate::arch_caps::ArchCaps::new("gfx1151", flags);
         assert_eq!(
             qsa_decode_attention_policy_with(
-                &flags,
                 &caps,
                 QsaKvFormat::Q8,
                 256,
@@ -13163,7 +13035,6 @@ mod tests {
         );
         assert_eq!(
             qsa_decode_attention_policy_with(
-                &flags,
                 &caps,
                 QsaKvFormat::F32,
                 256,
@@ -13234,14 +13105,13 @@ mod tests {
         for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201"] {
             for format in [QsaKvFormat::F32, QsaKvFormat::Q8, QsaKvFormat::Fp8] {
                 for eager in [true, false] {
-                    let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
-                    flags.qwen4_qsa_decode_splitk = true;
-                    let flags = std::sync::Arc::new(flags);
-                    let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
+                    let flags =
+                        std::sync::Arc::new(crate::feature_flags::FeatureFlags::for_test(arch));
+                    let caps = crate::arch_caps::ArchCaps::new(arch, flags);
                     for selected in [1usize, 2051, 8192] {
                         assert_eq!(
                             qsa_decode_attention_policy_with(
-                                &flags, &caps, format, 256, 12, 2, selected, eager
+                                &caps, format, 256, 12, 2, selected, eager
                             ),
                             QsaDecodeAttentionPolicy::PerHead,
                             "{arch} {format:?} eager={eager} selected={selected}"
@@ -13383,10 +13253,8 @@ mod tests {
 
     #[test]
     fn qsa_row_policy_thresholds_and_raw_selected_offsets() {
-        let mut flags = crate::feature_flags::FeatureFlags::for_test("gfx1151");
-        flags.qwen4_qsa_decode_splitk = true;
-        let flags = std::sync::Arc::new(flags);
-        let caps = crate::arch_caps::ArchCaps::new("gfx1151", flags.clone());
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlags::for_test("gfx1151"));
+        let caps = crate::arch_caps::ArchCaps::new("gfx1151", flags);
         let threshold = (QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
             - QSA_DECODE_SPLITK_STATIC_LDS_BYTES)
             / QSA_DECODE_SPLITK_GROUP_LDS_BYTES_PER_ROW
@@ -13435,7 +13303,7 @@ mod tests {
                                 storage.as_ptr() as usize + row * capacity * 4,
                             );
                             let eager = qsa_decode_attention_policy_with(
-                                &flags, &caps, p.format, 256, 24, 2, want, true,
+                                &caps, p.format, 256, 24, 2, want, true,
                             );
                             assert_eq!(
                                 eager,
@@ -13451,7 +13319,7 @@ mod tests {
                             );
                             assert_eq!(
                                 qsa_decode_attention_policy_with(
-                                    &flags, &caps, p.format, 256, 24, 2, want, false,
+                                    &caps, p.format, 256, 24, 2, want, false,
                                 ),
                                 QsaDecodeAttentionPolicy::PerHead,
                             );
@@ -22463,27 +22331,6 @@ mod route_selector_tests {
     use super::*;
 
     #[test]
-    fn qsa_select_switches_preserve_all_four_arms() {
-        for fits in [false, true] {
-            for score in [false, true] {
-                for select in [false, true] {
-                    let old = if !fits {
-                        QsaSelectPmArm::Hipcc
-                    } else {
-                        match (score, select) {
-                            (false, false) => QsaSelectPmArm::Hipcc,
-                            (true, false) => QsaSelectPmArm::ScoreOnly,
-                            (false, true) => QsaSelectPmArm::SelectOnly,
-                            (true, true) => QsaSelectPmArm::Both,
-                        }
-                    };
-                    assert_eq!(qsa_select_pm_selected(fits, score, select), old);
-                }
-            }
-        }
-    }
-
-    #[test]
     fn qsa_select_shape_thresholds_and_raw_offsets() {
         for halo in [false, true] {
             for dtype in [DType::F32, DType::BF16, DType::F16] {
@@ -22586,47 +22433,43 @@ mod hc_up_twin_route_tests {
 
     #[test]
     fn qwen4_hc_up_twin_route_table() {
-        // (enabled, exact_gfx1151, rows, expected)
-        let cases: [(bool, bool, usize, bool); 10] = [
-            (false, true, 145, false),
-            (false, true, 16, false),
-            (true, false, 145, false),
-            (true, true, 1, false),
-            (true, true, 15, false),
-            (true, true, 16, true),
-            (true, true, 145, true),
-            (true, true, 401, true),
-            (true, true, 529, true),
-            (true, false, 16, false),
+        // (exact_gfx1151, rows, expected)
+        let cases: [(bool, usize, bool); 8] = [
+            (false, 145, false),
+            (true, 1, false),
+            (true, 15, false),
+            (true, 16, true),
+            (true, 145, true),
+            (true, 401, true),
+            (true, 529, true),
+            (false, 16, false),
         ];
-        for (enabled, exact, rows, want) in cases {
+        for (exact, rows, want) in cases {
             assert_eq!(
-                qwen4_hc_up_twin_applies(enabled, exact, rows),
+                qwen4_hc_up_twin_applies(exact, rows),
                 want,
-                "enabled={enabled} exact_gfx1151={exact} rows={rows}"
+                "exact_gfx1151={exact} rows={rows}"
             );
         }
     }
 
     #[test]
     fn qwen4_hc_up_twin_gfx1201_route_table() {
-        // (enabled, exact_gfx1201, rows, expected)
-        let cases: [(bool, bool, usize, bool); 9] = [
-            (false, true, 1, false),
-            (false, true, 8, false),
-            (true, false, 1, false),
-            (true, true, 1, true),
-            (true, true, 7, true),
-            (true, true, 8, true),
-            (true, true, 9, false),
-            (true, true, 16, false),
-            (true, true, 529, false),
+        // (exact_gfx1201, rows, expected)
+        let cases: [(bool, usize, bool); 7] = [
+            (false, 1, false),
+            (true, 1, true),
+            (true, 7, true),
+            (true, 8, true),
+            (true, 9, false),
+            (true, 16, false),
+            (true, 529, false),
         ];
-        for (enabled, exact, rows, want) in cases {
+        for (exact, rows, want) in cases {
             assert_eq!(
-                qwen4_hc_up_twin_gfx1201_applies(enabled, exact, rows),
+                qwen4_hc_up_twin_gfx1201_applies(exact, rows),
                 want,
-                "enabled={enabled} exact_gfx1201={exact} rows={rows}"
+                "exact_gfx1201={exact} rows={rows}"
             );
         }
     }
@@ -22634,39 +22477,29 @@ mod hc_up_twin_route_tests {
     #[test]
     fn hyper_read_up_fused_route_table() {
         use HyperReadUpFusedEntry::{Incumbent, Twin, TwinT1};
-        // (twin_enabled, t1_enabled, exact_gfx1151, exact_gfx1201, rows, expected)
-        let cases: [(bool, bool, bool, bool, usize, HyperReadUpFusedEntry); 20] = [
-            // gfx1201: T1 by default for rows <= 8.
-            (true, true, false, true, 1, TwinT1),
-            (true, true, false, true, 5, TwinT1),
-            (true, true, false, true, 8, TwinT1),
-            (true, true, false, true, 9, Incumbent),
-            (true, true, false, true, 16, Incumbent),
-            (true, true, false, true, 529, Incumbent),
-            // T1 switch off: the sx twin.
-            (true, false, false, true, 1, Twin),
-            (true, false, false, true, 8, Twin),
-            (true, false, false, true, 9, Incumbent),
-            // HIPFIRE_QWEN4_HC_UP_TWIN=0 forces the incumbent.
-            (false, true, false, true, 1, Incumbent),
-            (false, true, false, true, 8, Incumbent),
-            (false, false, false, true, 8, Incumbent),
-            // gfx1151: unchanged (sx twin at >= 16 rows, T1 never).
-            (true, true, true, false, 15, Incumbent),
-            (true, true, true, false, 16, Twin),
-            (true, true, true, false, 145, Twin),
-            (true, false, true, false, 145, Twin),
-            (false, true, true, false, 145, Incumbent),
-            (true, true, true, false, 1, Incumbent),
+        // (exact_gfx1151, exact_gfx1201, rows, expected)
+        let cases: [(bool, bool, usize, HyperReadUpFusedEntry); 12] = [
+            // gfx1201: T1 for rows <= 8.
+            (false, true, 1, TwinT1),
+            (false, true, 5, TwinT1),
+            (false, true, 8, TwinT1),
+            (false, true, 9, Incumbent),
+            (false, true, 16, Incumbent),
+            (false, true, 529, Incumbent),
+            // gfx1151: sx twin at >= 16 rows, T1 never.
+            (true, false, 15, Incumbent),
+            (true, false, 16, Twin),
+            (true, false, 145, Twin),
+            (true, false, 1, Incumbent),
             // Other architectures: incumbent.
-            (true, true, false, false, 1, Incumbent),
-            (true, true, false, false, 145, Incumbent),
+            (false, false, 1, Incumbent),
+            (false, false, 145, Incumbent),
         ];
-        for (twin, t1, gfx1151, gfx1201, rows, want) in cases {
+        for (gfx1151, gfx1201, rows, want) in cases {
             assert_eq!(
-                hyper_read_up_fused_route(twin, t1, gfx1151, gfx1201, rows),
+                hyper_read_up_fused_route(gfx1151, gfx1201, rows),
                 want,
-                "twin={twin} t1={t1} gfx1151={gfx1151} gfx1201={gfx1201} rows={rows}"
+                "gfx1151={gfx1151} gfx1201={gfx1201} rows={rows}"
             );
         }
     }
