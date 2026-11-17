@@ -10882,12 +10882,18 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
     #[test]
     fn documented_config_profiles_match_the_schema() {
         let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/configs");
-        for name in ["user.toml", "developer.toml", "redline-pm4.toml"] {
-            let path = docs.join(name);
+        let mut checked = 0;
+        for entry in fs::read_dir(&docs).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                continue;
+            }
             load_toml_layer(&path).unwrap_or_else(|error| {
                 panic!("{} is not a valid config profile: {error}", path.display())
             });
+            checked += 1;
         }
+        assert!(checked >= 4, "expected the shipped profiles under {docs:?}");
     }
 
     #[test]

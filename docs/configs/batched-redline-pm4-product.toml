@@ -14,7 +14,6 @@ backend = "redline"
 transport = "pm4"
 
 [diagnostic.replay]
-independent_batch = true
 manual_capture = false
 pm4_queues = "1"
 pm4_register_policy = "static"
