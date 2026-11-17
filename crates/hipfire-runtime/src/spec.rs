@@ -1188,6 +1188,10 @@ pub trait Speculator {
 /// ([`crate::spec_economics::replay_call_log`]).
 pub const DRIVER_FLOOR_CALL_PREFIX: &str = "QWEN35_DFLASH_FLOOR_CALL";
 
+/// AR tokens a losing driver-floor verdict takes to re-price AR where the
+/// request is (the [`DriverFloor`] probe set).
+pub const DRIVER_FLOOR_PROBE_TOKENS: usize = 4;
+
 /// Who decides, per window, whether a request speculates or runs an AR token.
 pub enum FloorControl<'a> {
     /// No measured floor: a speculator with an AR step keeps the count-based
@@ -1808,6 +1812,13 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
 
     fn request_stats(&self) -> MtpRequestStats {
         self.arch.request_stats()
+    }
+
+    /// Native MTP decides speculate-vs-AR inside its own step: Qwen4's
+    /// measured floor (depth, copy and timing owner), or no AR step at all
+    /// (qwen35 MTP). The driver arms no retire policy for it.
+    fn floor_control(&mut self) -> FloorControl<'_> {
+        FloorControl::Producer
     }
 
     fn token_logits(&self, index: usize) -> Option<&[f32]> {

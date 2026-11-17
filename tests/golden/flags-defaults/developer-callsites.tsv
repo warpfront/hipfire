@@ -151,6 +151,7 @@ developer_callsite	*	HIPFIRE_DFLASH_DRAFT#developer_var=ok
 developer_callsite	*	HIPFIRE_DFLASH_DRAFT_GRAPH#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_DFLASH_DRAFT_PENALTY#developer_var=map_or(true, |v| v.trim() != "0")
 developer_callsite	*	HIPFIRE_DFLASH_FC_SKINNY#developer_var=map_or(true, |v| v.trim() != "0")
+developer_callsite	*	HIPFIRE_DFLASH_FLOOR_CALL_LOG#developer_var=is_ok_and
 developer_callsite	*	HIPFIRE_DFLASH_LEGACY_PREFILL#developer_bool=false
 developer_callsite	*	HIPFIRE_DFLASH_LOGIT_DUMP#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DFLASH_ONLINE_DUMP#developer_var=-

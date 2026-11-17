@@ -1973,8 +1973,25 @@ pub const DECISIONS: &[Decision] = &[
         evidence: "no admission, plan or launch reads capturing_graph: the route is admitted under hipGraph capture (one cached plan, a preflight that never grows scratch, fixed-pointer launches), so the token only changes the logged value",
         reaches: &[],
     },
+    Decision {
+        id: "dflash-floor-price-route-key",
+        predicates: &[ReplayState],
+        condition: "hipfire-generate qwen.rs spec_floor_route_key, once at the start of a speculative request on a driver-owned floor (qwen35 DFlash): `gpu.replay.state()` classed as Hip / Fallback / retained (any recording stage) plus `uses_pm4_transport()` forms the ArRouteKey of the load's in-memory AR price cache; a key change clears the AR prices and pins",
+        effect: Oracle,
+        switches: "only which per-load AR price the speculate-vs-AR floor starts from (or whether it calibrates); no launch, kernel or replay body depends on it",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "host bookkeeping read outside every forward; the AR token and the speculative window run the same executors whatever the key says, so recorded and eager programs are unaffected",
+        reaches: &[],
+    },
 ];
 pub const SITES: &[Site] = &[
+    Site {
+        file: "hipfire-generate/src/qwen.rs",
+        function: "spec_floor_route_key",
+        occurrences: 1,
+        decisions: &["dflash-floor-price-route-key"],
+    },
     Site {
         file: "hipfire-arch-raon/src/bundle.rs",
         function: "resolve",

@@ -34,6 +34,13 @@ trunk with `scripts/check_fixture.sh [PATH]` (size + SHA-256 against the pin)
 and require the pinned digest. Reports that use a trunk with a different digest
 are not comparable and should be discarded.
 
+Speculation policy: since SPEC-AR-FLOOR S2a a greedy DFlash request on this
+trunk runs the measured speculate-vs-AR floor (the `done` envelope's `floor`
+object), so a decode number is comparable only with the same policy. Compare
+DFlash rows by `client_span_tok_s` (`hipfire bench --json`, client wall time)
+as well as `decode_tok_s`; `HIPFIRE_SPEC_RETIRE=1.5` reproduces the pre-floor
+policy on the same binary.
+
 Historical: the previous dense pin was the asymmetric Qwen3.8-27B MQ4V2 XT
 (`pin:model/qwen3.8-27b.mq4-xt`; re-issued 2026-09-15 with AWQ sidecars, the
 prior upload `pin:model/qwen3.8-27b.mq4-xt-no-awq` lacked them, WT2 KLD 0.057

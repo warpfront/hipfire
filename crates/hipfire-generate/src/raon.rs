@@ -540,6 +540,7 @@ pub fn generate_raon_spec(
     sampling: RaonSampling,
     cactus_delta: f32,
     request_seed: u64,
+    seed_explicit: bool,
     max_tokens: usize,
     max_think_tokens: usize,
     stop: &[String],
@@ -613,6 +614,7 @@ pub fn generate_raon_spec(
         sampling.frequency_penalty,
         cactus_delta,
         request_seed,
+        seed_explicit,
         None,
         enable_thinking,
     ) {

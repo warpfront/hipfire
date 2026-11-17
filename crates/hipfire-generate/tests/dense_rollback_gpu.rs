@@ -308,6 +308,7 @@ fn run_generate_with(
             false,
             None,
             12345,
+            false,
         );
     }
     let bytes = finish_stdout_capture(saved, &path);
@@ -903,6 +904,7 @@ fn run_glimmer_abort(
             false,
             None,
             12345,
+            false,
         );
     }
     let bytes = finish_stdout_capture(saved, &path);

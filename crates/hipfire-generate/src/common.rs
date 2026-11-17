@@ -1859,11 +1859,15 @@ pub struct SpecRun {
     pub generated: usize,
     pub spec_cycles: usize,
     pub spec_accepted: usize,
-    /// Context position where the spec-retire policy switched this request to
-    /// AR (`hipfire_runtime::spec_retire`); `None` while it speculated throughout.
+    /// Context position of the request's first spec → AR retirement (the
+    /// count line or the driver-owned floor); `None` while it never retired.
     pub spec_retired_at: Option<usize>,
-    /// Tokens decoded as plain AR after retirement (not counted in `spec_cycles`).
+    /// Every AR token the request decoded (the driver floor's calibration and
+    /// probe tokens included; not counted in `spec_cycles`).
     pub ar_steps: usize,
+    /// The driver-owned floor's `done` object (`FloorControl::Driver`
+    /// speculators only).
+    pub floor: Option<serde_json::Value>,
     /// Full committed stream (from the emitter) for the wrapper's cache store.
     /// Empty for emitters that don't track it. Deepseek4 and qwen35 both expose
     /// streamed tokens for asst-turn cache replay on safe terminals.
