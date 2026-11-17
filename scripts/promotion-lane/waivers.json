@@ -1,4 +1,31 @@
 {
   "schema": "promotion-lane-waivers-v1",
-  "waivers": []
+  "waivers": [
+    {
+      "sha": "ae7ce161dde055bdcffe766bd28ef6d1bcad8d54",
+      "class": "gfx1100",
+      "rows": [
+        "perf-27b-dflash-warm-ttft"
+      ],
+      "reason": "Beta's warm_over_cold_ttft relation reads ~1.0 on SPEC-AR-FLOOR slice 2a because load-time calibration makes the first DFlash request warm (warm DFlash TTFT cand/beta 1.0016 R9700, 0.9978 XTX), and on gfx1100 it flakes for beta's own product (AR cold noise). The corrected warm-vs-warm-AR relation (c6e586f526, approved) applies once promoted.",
+      "granted_by": "Kaden",
+      "granted_utc": "2026-11-17T22:18:56Z",
+      "expires_utc": "2026-11-19T22:18:56Z",
+      "rollback": "Close this waiver (closed_by) once a promoted beta carries the corrected relation; if warm DFlash TTFT regresses, revert slice 2a.",
+      "closed_by": null
+    },
+    {
+      "sha": "ae7ce161dde055bdcffe766bd28ef6d1bcad8d54",
+      "class": "gfx1201",
+      "rows": [
+        "perf-27b-dflash-warm-ttft"
+      ],
+      "reason": "Beta's warm_over_cold_ttft relation reads ~1.0 on SPEC-AR-FLOOR slice 2a because load-time calibration makes the first DFlash request warm (warm DFlash TTFT cand/beta 1.0016 R9700, 0.9978 XTX), and on gfx1100 it flakes for beta's own product (AR cold noise). The corrected warm-vs-warm-AR relation (c6e586f526, approved) applies once promoted.",
+      "granted_by": "Kaden",
+      "granted_utc": "2026-11-17T22:18:56Z",
+      "expires_utc": "2026-11-19T22:18:56Z",
+      "rollback": "Close this waiver (closed_by) once a promoted beta carries the corrected relation; if warm DFlash TTFT regresses, revert slice 2a.",
+      "closed_by": null
+    }
+  ]
 }

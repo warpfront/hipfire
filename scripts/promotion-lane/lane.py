@@ -227,6 +227,12 @@ def evidence_problem(row, transition):
     return "unknown transition %r" % (transition,)
 
 
+def waivable_rows(policy, cls):
+    """A class's required correctness rows plus its perf rows (VALIDATION.md: waivers name perf rows the same way)."""
+    perf_rows = policy.get("perf", {}).get("classes", {}).get(cls, {}).get("rows", {})
+    return set(policy["classes"][cls]["required"]) | set(perf_rows)
+
+
 def validate_waivers(policy, doc):
     """Schema problems, plus grantor and expiry span of every open waiver."""
     if doc is None:
@@ -243,8 +249,8 @@ def validate_waivers(policy, doc):
             problems.append("%s: sha must be 40-hex" % tag)
         if waiver.get("class") not in policy["classes"]:
             problems.append("%s: class %r is not a policy class" % (tag, waiver.get("class")))
-        elif not is_str_list(waiver.get("rows")) or not set(waiver["rows"]) <= set(policy["classes"][waiver["class"]]["required"]):
-            problems.append("%s: rows must be a non-empty subset of the class's required rows" % tag)
+        elif not is_str_list(waiver.get("rows")) or not set(waiver["rows"]) <= waivable_rows(policy, waiver["class"]):
+            problems.append("%s: rows must be a non-empty subset of the class's required or perf rows" % tag)
         for key in ("reason", "granted_by", "rollback"):
             if not isinstance(waiver.get(key), str) or not waiver[key]:
                 problems.append("%s: %s must be a non-empty string" % (tag, key))
@@ -1109,6 +1115,12 @@ def _self_test_check(t):
     ok_matrix = _matrix()
     t(check_tree(SELF_POLICY, ok_matrix, None) == [], "valid synthetic tree must pass check")
     t(check_tree(SELF_POLICY, ok_matrix, {"schema": WAIVERS_SCHEMA, "waivers": []}) == [], "empty waivers pass")
+    perf_policy = json.loads(json.dumps(SELF_POLICY))
+    perf_policy.setdefault("perf", {}).setdefault("classes", {})["gfx1100"] = {"rows": {"perf-x": {}}}
+    t(validate_waivers(perf_policy, {"schema": WAIVERS_SCHEMA, "waivers": [_waiver("a" * 40, rows=("perf-x",))]}) == [],
+      "a waiver may name a perf row of its class")
+    t(validate_waivers(perf_policy, {"schema": WAIVERS_SCHEMA, "waivers": [_waiver("a" * 40, rows=("perf-y",))]}) != [],
+      "a waiver naming an unknown row is rejected")
     t(validate_policy(json.loads(json.dumps(SELF_POLICY))) == [], "self policy valid")
     t(validate_policy({"schema": "nope"}) != [], "bad policy schema rejected")
     bad = json.loads(json.dumps(SELF_POLICY))
