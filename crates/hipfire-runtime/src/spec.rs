@@ -1201,7 +1201,10 @@ pub enum FloorControl<'a> {
     /// The speculator decides inside its own step (Qwen4 native MTP's floor);
     /// the driver arms no retire policy for it.
     Producer,
-    /// The driver decides with this load-lifetime floor and price cache.
+    /// The driver decides with this load-lifetime floor and price cache. The
+    /// speculator's [`SpecStep::proposed`] is the window's verified rows
+    /// (seed included), on the same scale as the `full_rows` its
+    /// [`DriverFloor`] was built with.
     Driver(&'a mut DriverFloor),
 }
 
