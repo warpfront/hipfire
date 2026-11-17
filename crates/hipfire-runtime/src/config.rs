@@ -294,6 +294,10 @@ pub struct RuntimeConfig {
     /// `HIPFIRE_NPU_SPILLOVER`). Default false; snapshotted once here, never
     /// re-read from the environment on hot paths.
     pub npu_spillover: bool,
+    /// `memory.embed_host` / `HIPFIRE_EMBED_HOST` (default on): a Qwen3.5-family
+    /// load on a discrete GPU places its untied passthrough token embedding in
+    /// pinned host RAM. Read by the loader and the capacity projection.
+    pub embed_host: bool,
 }
 
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
@@ -407,6 +411,7 @@ impl RuntimeConfig {
             mtp_k: value("HIPFIRE_MTP_K").and_then(|value| value.parse().ok()),
             yarn_factor: value("HIPFIRE_YARN_FACTOR").and_then(|value| value.parse().ok()),
             npu_spillover: value("HIPFIRE_NPU_SPILLOVER").as_deref() == Some("1"),
+            embed_host: value("HIPFIRE_EMBED_HOST").as_deref() != Some("0"),
         }
     }
 }

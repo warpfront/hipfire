@@ -1484,7 +1484,8 @@ fn link_routes(device: &FitDevice) -> Vec<Route> {
 }
 
 fn projection_json(p: Qwen35CardProjection) -> Value {
-    json!({"free": p.free, "weights": p.weights, "state": p.state, "runtime": p.runtime,
+    json!({"free": p.free, "weights": p.weights, "host_pinned": p.host_pinned,
+        "state": p.state, "runtime": p.runtime,
         "scratch": p.scratch, "page_rounding": p.page_rounding,
         "bytes_per_token": p.bytes_per_token, "partials_per_token": p.partials_per_token,
         "card_cap": p.card_cap, "model_ctx": p.model_ctx, "kv_mode": p.kv_mode})
@@ -1972,6 +1973,7 @@ impl AdmissionInputs<'_> {
                         .saturating_sub(self.checkpoint_charge)
                 })
                 .and_then(|n| usize::try_from(n).ok()),
+            unified_memory: device.unified_memory,
         }
     }
 
@@ -2205,6 +2207,7 @@ mod tests {
         Qwen35CardProjection {
             free: 32 << 30,
             weights: 20 << 30,
+            host_pinned: 0,
             state: 536 << 20,
             runtime: 256 << 20,
             scratch: 1 << 30,

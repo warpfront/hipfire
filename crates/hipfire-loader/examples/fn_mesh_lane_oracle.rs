@@ -3698,6 +3698,7 @@ fn load_with_lane_reservation(
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
+            unified_memory: gpu.is_uma(),
         },
         SourceAdmissionOptions {
             spec,

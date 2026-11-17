@@ -505,11 +505,30 @@ mod host {
         }
     }
 
+    /// Install the local process configuration with `memory.embed_host` off,
+    /// before anything reads it: the shared seal describes device-resident
+    /// owners only (`shared_weights` refuses a host-mapped weight), so the host
+    /// loads the token embedding into VRAM, where every tenant maps it.
+    fn install_device_resident_config() -> Result<(), String> {
+        let mut process = hipfire_config::load_local_process_config()
+            .map_err(|e| format!("process configuration: {e}"))?;
+        process
+            .values
+            .set(
+                "memory.embed_host",
+                hipfire_config::ConfigValue::Bool(false),
+            )
+            .map_err(|e| format!("process configuration: {e}"))?;
+        hipfire_config::install_process_config(process)
+            .map_err(|_| "process configuration was initialized before startup".to_string())
+    }
+
     fn serve(args: &Args) -> Result<i32, String> {
         // Bootstrap read: `0` is the feature kill switch for hosts too.
         if std::env::var_os("HIPFIRE_WEIGHT_HOST").is_some_and(|v| v == "0") {
             return Err("HIPFIRE_WEIGHT_HOST=0: shared-weight host disabled".into());
         }
+        install_device_resident_config()?;
         install_signal_waiter()?;
         let nofile = raise_nofile_limit()?;
         check_socket_dir(&args.socket)?;

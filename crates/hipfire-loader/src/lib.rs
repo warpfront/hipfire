@@ -3294,6 +3294,7 @@ pub fn load_model_with_gemma4_drafter(
             ),
             vmm_runtime_refusal: vmm_runtime_refusal.as_deref(),
             free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
+            unified_memory: gpu.is_uma(),
         },
         crate::admission::SourceAdmissionOptions {
             spec,
@@ -4851,6 +4852,7 @@ pub fn load_model_ep_with_kv_mode(
             vmm_runtime_refusal: (!vmm_runtime_available)
                 .then_some("the HIP runtime has no VMM allocation granularity on every rank"),
             free_vram_bytes: None, // EP has no single-card KV capacity envelope.
+            unified_memory: false, // read only by the projection, which needs free_vram_bytes.
         },
     )?;
     let warning = crate::admission::legacy_warning(

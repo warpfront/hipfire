@@ -709,6 +709,7 @@ fn admit_and_load(
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: gpu.vmm_runtime_refusal().as_deref(),
             free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
+            unified_memory: gpu.is_uma(),
         },
     )
     .expect("admit fixture source");

@@ -177,6 +177,10 @@ pub struct KvBackendHints<'a> {
     pub vmm_runtime_refusal: Option<&'a str>,
     /// Free device bytes before this load, queried from HIP at admission.
     pub free_vram_bytes: Option<usize>,
+    /// The device is a unified-memory GPU (`Gpu::is_uma`; `hipfire fit`: the
+    /// device's own fact). The Qwen3.5 projection keeps the token embedding in
+    /// VRAM there (`memory.embed_host` applies to discrete GPUs only).
+    pub unified_memory: bool,
 }
 
 impl KvBackendHints<'_> {
@@ -190,6 +194,7 @@ impl KvBackendHints<'_> {
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: Some("no device was probed"),
             free_vram_bytes: None,
+            unified_memory: false,
         }
     }
 }
@@ -1376,8 +1381,13 @@ pub struct Qwen35CardProjection {
     pub free: usize,
     /// Projected resident weights: every tensor of the HFQ file at its
     /// payload size, ROCr-rounded per allocation (device weights are exactly
-    /// the file, plus the rounding).
+    /// the file, plus the rounding), less a token embedding the load pins in
+    /// host RAM ([`Self::host_pinned`]).
     pub weights: usize,
+    /// Token embedding bytes the load places in pinned host RAM instead of
+    /// VRAM (`memory.embed_host` on a discrete GPU); 0 when it stays on the card.
+    /// Not charged against `free`.
+    pub host_pinned: usize,
     /// The DeltaNet recurrent state and stream carry the load allocates after
     /// the weights (the default Q8 + error-feedback state).
     pub state: usize,
@@ -2037,6 +2047,7 @@ mod qwen35_projection_tests {
             deepseek4_heterogeneous: false,
             vmm_runtime_refusal: None,
             free_vram_bytes: Some(free),
+            unified_memory: false,
         }
     }
 
@@ -2067,6 +2078,54 @@ mod qwen35_projection_tests {
         );
         assert_eq!(p.card_cap, (free - p.fixed_bytes()) / 37_912);
         assert_eq!(p.model_ctx, 262_144);
+    }
+
+    #[test]
+    fn an_untied_embedding_is_charged_to_host_on_a_discrete_gpu_only() {
+        let tensor = |name: &str, bytes: usize| HfqMemTensor {
+            name: name.to_owned(),
+            quant_type: 3,
+            shape: vec![4, 4],
+            group_size: 0,
+            data: vec![0u8; bytes],
+        };
+        let path = std::env::temp_dir().join(format!(
+            "hipfire-projection-{}-embed-host.hfq",
+            std::process::id()
+        ));
+        write_hfqm_package_mem(
+            &path,
+            5,
+            &qwen38_27b_metadata(),
+            &[
+                tensor("model.language_model.embed_tokens.weight", 3 * MIB),
+                tensor("lm_head.weight", 3 * MIB),
+            ],
+        )
+        .unwrap();
+        let source = ModelSource::from_path(path.to_str().unwrap()).unwrap();
+        let free = 25_753_026_560usize;
+        let discrete = qwen35_card_projection(&source, "gfx1100", hints(free)).unwrap();
+        let unified = qwen35_card_projection(
+            &source,
+            "gfx1100",
+            KvBackendHints {
+                unified_memory: true,
+                ..hints(free)
+            },
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&path);
+        // `memory.embed_host` defaults on: the discrete card holds only the
+        // lm_head (3 MiB at its 4 KiB-aligned slab size), the embedding is
+        // pinned host RAM and not charged against free VRAM.
+        assert!(hipfire_runtime::config::get().embed_host);
+        assert_eq!(discrete.weights, 3 * MIB);
+        assert_eq!(discrete.host_pinned, 3 * MIB);
+        // Unified memory keeps the table on the device.
+        assert_eq!(unified.weights, 6 * MIB);
+        assert_eq!(unified.host_pinned, 0);
+        assert!(discrete.card_cap > unified.card_cap);
     }
 
     #[test]
@@ -2290,8 +2349,16 @@ pub fn qwen35_card_projection(
     let free = hints
         .free_vram_bytes
         .ok_or("cannot query free VRAM for automatic VMM context")?;
-    let weights = usize::try_from(hipfire_arch_qwen35::footprint::weights_device_bytes(hfq))
-        .map_err(|_| "Qwen weight size exceeds usize")?;
+    let weights = usize::try_from(hipfire_arch_qwen35::footprint::weights_device_bytes(
+        hfq,
+        hints.unified_memory,
+    ))
+    .map_err(|_| "Qwen weight size exceeds usize")?;
+    let host_pinned = usize::try_from(hipfire_arch_qwen35::footprint::token_embd_host_bytes(
+        hfq,
+        hints.unified_memory,
+    ))
+    .map_err(|_| "Qwen embedding size exceeds usize")?;
     let state = usize::try_from(hipfire_arch_qwen35::footprint::dn_state_device_charge(
         &config,
     ))
@@ -2312,6 +2379,7 @@ pub fn qwen35_card_projection(
     Ok(Qwen35CardProjection {
         free,
         weights,
+        host_pinned,
         state,
         runtime,
         scratch,
@@ -5339,6 +5407,7 @@ mod tests {
                 deepseek4_heterogeneous: false,
                 vmm_runtime_refusal: None,
                 free_vram_bytes: None,
+                unified_memory: false,
             };
             let admit = |request, arch| {
                 super::super::admit_source(
@@ -5380,6 +5449,7 @@ mod tests {
                 deepseek4_heterogeneous: false,
                 vmm_runtime_refusal,
                 free_vram_bytes: None,
+                unified_memory: false,
             };
             let admit = |request, arch, refusal| {
                 super::super::admit_source(
@@ -5522,6 +5592,7 @@ mod tests {
                         vmm_runtime_refusal: (!vmm_runtime_available)
                             .then_some("the test runtime has no VMM"),
                         free_vram_bytes: None,
+                        unified_memory: false,
                     },
                 )
             };
@@ -5595,6 +5666,7 @@ mod tests {
                 deepseek4_heterogeneous: false,
                 vmm_runtime_refusal: None,
                 free_vram_bytes: Some(24 << 30),
+                unified_memory: false,
             };
             let omitted = super::super::admit_source(
                 path.to_str().unwrap(),

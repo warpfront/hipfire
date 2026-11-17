@@ -1897,6 +1897,15 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PROMPT_CACHE_UNBOUNDED",
         "Remove the assistant-turn cache capacity bound."
     ),
+    process_bool_field!(
+        "memory.embed_host",
+        "embed_host",
+        Memory,
+        true,
+        false,
+        "HIPFIRE_EMBED_HOST",
+        "Keep the Qwen3.5/3.6/3.8 token embedding table in pinned host RAM instead of VRAM on a discrete GPU (default on; the gather kernels read one row per token over PCIe, byte-identical output). A tied lm_head, a widen-to-f32 table and unified-memory GPUs keep the device copy; false restores it everywhere."
+    ),
     field!(
         "speculation.mtp",
         "mtp_mode",

@@ -58,6 +58,7 @@ use hipfire_runtime::weight_backend::dequant_norm;
 use hipfire_runtime::weight_backend::dequant_weight_raw;
 use hipfire_runtime::weight_backend::load_awq_scale_for;
 use hipfire_runtime::weight_backend::load_embedding;
+use hipfire_runtime::weight_backend::load_embedding_at;
 use hipfire_runtime::weight_backend::resolve_lm_head;
 use hipfire_runtime::weight_backend::HfqBackend;
 use hipfire_runtime::weight_backend::MemoryTarget;
@@ -2665,6 +2666,88 @@ impl<'a> HfqSource<'a> {
         Self { hfq, c }
     }
 }
+
+/// Whether the checkpoint carries its own `lm_head.weight` (an untied output
+/// projection), as opposed to reusing `embed_tokens.weight`.
+fn hfq_has_separate_lm_head(hfq: &HfqFile) -> bool {
+    qwen35_tensor_name_candidates("lm_head.weight")
+        .iter()
+        .any(|n| hfq.find_tensor_info(n).is_some())
+}
+
+/// Where a Qwen3.5-family load places its `token_embd` table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedPlacement {
+    /// Pinned host RAM, read by the kernels through its device alias.
+    Host,
+    /// VRAM: `memory.embed_host` is off or the GPU has unified memory.
+    Device,
+    /// VRAM although host placement is on, for the stated reason.
+    Declined(&'static str),
+}
+
+/// The one `token_embd` placement decision (`memory.embed_host`,
+/// `HIPFIRE_EMBED_HOST`, default on). On a discrete GPU the table goes to pinned
+/// host RAM: every reader is a row gather (`embedding_lookup_*`, including the
+/// DFlash and MTP draft lookups), so a token reads one row (5,440 B for Q8_0 at
+/// dim 5120) over PCIe through the pinned allocation's device alias and the
+/// kernels see identical bytes, while the table (1,288 MiB on the 27B) leaves
+/// VRAM. The device copy stays when the switch is off; on a unified-memory GPU
+/// (`Gpu::is_uma`, whose VRAM is already system RAM, so there is nothing to
+/// gain); when the table is the tied lm_head (the output GEMV would stream the
+/// whole table over PCIe per token); and for a widen-to-f32 format, which has
+/// no host-mapped upload (`load_embedding_at`). Pure: the loader and the
+/// capacity projection ([`host_placed_token_embd`]) share it.
+pub fn embed_placement(
+    enabled: bool,
+    unified_memory: bool,
+    lm_head_separate: bool,
+    quant_type: u8,
+) -> EmbedPlacement {
+    if !enabled || unified_memory {
+        return EmbedPlacement::Device;
+    }
+    if !lm_head_separate {
+        return EmbedPlacement::Declined(
+            "lm_head is tied to token_embd (the output GEMV would read the whole table over \
+             PCIe per token)",
+        );
+    }
+    match hipfire_runtime::weight_backend::embed_classify(quant_type) {
+        Ok(hipfire_runtime::weight_backend::EmbedPlan::Raw(_)) => EmbedPlacement::Host,
+        _ => EmbedPlacement::Declined(
+            "the table's format widens to f32 and has no host-mapped upload",
+        ),
+    }
+}
+
+/// `hfq`'s token embedding and its [`embed_placement`] under the process
+/// configuration; `None` when the file has no `embed_tokens.weight`.
+fn hfq_embed_placement(
+    hfq: &HfqFile,
+    unified_memory: bool,
+) -> Option<(&HfqTensorInfo, EmbedPlacement)> {
+    let info = qwen35_tensor_name_candidates("embed_tokens.weight")
+        .iter()
+        .find_map(|name| hfq.find_tensor_info(name))?;
+    let placement = embed_placement(
+        hipfire_runtime::config::get().embed_host,
+        unified_memory,
+        hfq_has_separate_lm_head(hfq),
+        info.quant_type,
+    );
+    Some((info, placement))
+}
+
+/// The token embedding tensor a load of `hfq` places in pinned host RAM
+/// instead of VRAM ([`embed_placement`]), or `None` when it stays on the card.
+pub fn host_placed_token_embd(hfq: &HfqFile, unified_memory: bool) -> Option<&HfqTensorInfo> {
+    match hfq_embed_placement(hfq, unified_memory)? {
+        (info, EmbedPlacement::Host) => Some(info),
+        _ => None,
+    }
+}
+
 impl WeightSource for HfqSource<'_> {
     type Layer = LayerWeights;
 
@@ -2731,7 +2814,33 @@ impl WeightSource for HfqSource<'_> {
         }
         let (embd_meta, embd_data) = qwen35_tensor_data_cow(self.hfq, "embed_tokens.weight")
             .ok_or_else(|| HipError::new(0, "embed_tokens not found"))?;
-        let out = load_embedding(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)?;
+        let target = match embed_placement(
+            hipfire_runtime::config::get().embed_host,
+            gpu.is_uma(),
+            hfq_has_separate_lm_head(self.hfq),
+            embd_meta.quant_type,
+        ) {
+            EmbedPlacement::Host => {
+                eprintln!(
+                    "  token_embd: {:.2} GiB in pinned host memory (memory.embed_host)",
+                    embd_data.len() as f64 / (1u64 << 30) as f64
+                );
+                MemoryTarget::HostMapped
+            }
+            EmbedPlacement::Device => MemoryTarget::Device,
+            EmbedPlacement::Declined(reason) => {
+                eprintln!("  token_embd stays in VRAM (memory.embed_host): {reason}");
+                MemoryTarget::Device
+            }
+        };
+        let out = load_embedding_at(
+            gpu,
+            embd_meta.quant_type,
+            &embd_data,
+            c.vocab_size,
+            c.dim,
+            target,
+        )?;
         drop(embd_data);
         Ok(out)
     }
@@ -2750,9 +2859,7 @@ impl WeightSource for HfqSource<'_> {
     ) -> HipResult<(WeightTensor, bool)> {
         let c = self.c;
         let hfq = &*self.hfq;
-        let has_separate = qwen35_tensor_name_candidates("lm_head.weight")
-            .iter()
-            .any(|n| hfq.find_tensor_info(n).is_some());
+        let has_separate = hfq_has_separate_lm_head(hfq);
         let (mut output, aliases) = resolve_lm_head(
             gpu,
             has_separate,
@@ -9636,5 +9743,46 @@ mod slab_reservation_tests {
                 .sum::<usize>();
         assert_eq!(separate, 200 * MIB);
         assert_eq!(slab, 196 * MIB);
+    }
+}
+
+#[cfg(test)]
+mod embed_placement_tests {
+    use super::{embed_placement, EmbedPlacement};
+
+    const Q8_0: u8 = 3;
+    const HFQ4G256: u8 = 6;
+    /// Widen-to-f32 format (MQ4G256V2): no host-mapped upload exists.
+    const MQ4G256V2: u8 = 44;
+
+    #[test]
+    fn switch_off_or_unified_memory_keeps_the_device_copy_for_every_shape() {
+        for (enabled, unified) in [(false, false), (false, true), (true, true)] {
+            for separate in [false, true] {
+                for qt in [Q8_0, HFQ4G256, MQ4G256V2, 200] {
+                    assert_eq!(
+                        embed_placement(enabled, unified, separate, qt),
+                        EmbedPlacement::Device
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn untied_passthrough_embedding_on_a_discrete_gpu_goes_to_the_host() {
+        for qt in [Q8_0, HFQ4G256] {
+            assert_eq!(embed_placement(true, false, true, qt), EmbedPlacement::Host);
+        }
+    }
+
+    #[test]
+    fn tied_lm_head_or_widened_format_declines_host_placement() {
+        for (separate, qt) in [(false, Q8_0), (true, MQ4G256V2), (true, 200)] {
+            assert!(matches!(
+                embed_placement(true, false, separate, qt),
+                EmbedPlacement::Declined(_)
+            ));
+        }
     }
 }

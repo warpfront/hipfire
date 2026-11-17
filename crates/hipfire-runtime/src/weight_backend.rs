@@ -121,6 +121,23 @@ pub fn load_embedding(
     vocab: usize,
     dim: usize,
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+    load_embedding_at(gpu, quant_type, data, vocab, dim, MemoryTarget::Device)
+}
+
+/// [`load_embedding`] with an explicit placement. `HostMapped` pins the table in
+/// system RAM that the lookup kernels read through its device alias (one row per
+/// token), so the bytes the kernels see are identical and only the VRAM charge
+/// moves. Only the passthrough formats (`EmbedPlan::Raw`) have a host-mapped
+/// upload; the widen-to-f32 formats fail closed with [`HOST_DECODE_REFUSAL`]
+/// instead of silently landing in VRAM.
+pub fn load_embedding_at(
+    gpu: &mut Gpu,
+    quant_type: u8,
+    data: &[u8],
+    vocab: usize,
+    dim: usize,
+    target: MemoryTarget,
+) -> HipResult<(GpuTensor, EmbeddingFormat)> {
     match embed_classify(quant_type)? {
         EmbedPlan::Raw(fmt) => {
             validate_row_extent(
@@ -130,10 +147,16 @@ pub fn load_embedding(
                 dim,
                 "token_embd",
             )?;
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let buf = match target {
+                MemoryTarget::Device => gpu.upload_raw(data, &[data.len()])?,
+                MemoryTarget::HostMapped => gpu.upload_raw_host_mapped(data, &[data.len()])?,
+            };
             Ok((buf, fmt))
         }
         EmbedPlan::HostF32 => {
+            if target == MemoryTarget::HostMapped {
+                return Err(HipError::new(0, HOST_DECODE_REFUSAL));
+            }
             // dequant_f32 uploads with shape [n] (1D). The embedding-lookup
             // kernels compute byte offsets from token_id + dim against buf
             // directly and never read the shape, so the 1D vs 2D difference

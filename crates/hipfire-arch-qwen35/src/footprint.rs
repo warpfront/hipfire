@@ -63,22 +63,29 @@ fn weight_tensor_charge(bytes: usize, slab: SlabMode) -> u64 {
 /// the 27B paid 283 MiB of per-tensor rounding (ledger §1).
 ///
 /// It charges the steady state after the load: the Z|beta|alpha fold copy
-/// stands in for Z (no unfused Z is uploaded), and the token embedding is
-/// device-resident.
-pub fn weights_device_bytes(hfq: &HfqFile) -> u64 {
+/// stands in for Z (no unfused Z is uploaded). The token embedding is charged
+/// only when it stays on the card: on a discrete GPU (`unified_memory` false)
+/// with `memory.embed_host` on, the load pins it in host RAM
+/// ([`crate::qwen35::load::host_placed_token_embd`], 1,288 MiB on the 27B) and
+/// [`token_embd_host_bytes`] reports it instead.
+pub fn weights_device_bytes(hfq: &HfqFile, unified_memory: bool) -> u64 {
+    let host_embed = crate::qwen35::load::host_placed_token_embd(hfq, unified_memory)
+        .map(|info| info.name.as_str());
+    let tensors = hfq
+        .tensor_infos()
+        .iter()
+        .filter(|tensor| Some(tensor.name.as_str()) != host_embed);
     let slab = SlabMode::from_env_explicit()
         .or_else(|| crate::carrier::weight_slab_default(""))
         .unwrap_or(hip_bridge::DEFAULT_SLAB_MODE);
     if slab != SlabMode::Up64M {
-        return hfq
-            .tensor_infos()
-            .iter()
+        return tensors
             .map(|tensor| weight_tensor_charge(tensor.data_size, slab))
             .sum();
     }
     let mut layer_slabs: std::collections::BTreeMap<&str, usize> = Default::default();
     let mut total = 0u64;
-    for tensor in hfq.tensor_infos() {
+    for tensor in tensors {
         let size = tensor.data_size;
         let layer = tensor
             .name
@@ -94,6 +101,14 @@ pub fn weights_device_bytes(hfq: &HfqFile) -> u64 {
         }
     }
     total + charged(layer_slabs.into_values())
+}
+
+/// Pinned host bytes of the token embedding a load of `hfq` keeps off the card
+/// ([`weights_device_bytes`] leaves them out): the table's payload, 0 when it
+/// stays in VRAM.
+pub fn token_embd_host_bytes(hfq: &HfqFile, unified_memory: bool) -> u64 {
+    crate::qwen35::load::host_placed_token_embd(hfq, unified_memory)
+        .map_or(0, |info| info.data_size as u64)
 }
 
 /// A DFlash2 draft's selector codebooks stay in host memory

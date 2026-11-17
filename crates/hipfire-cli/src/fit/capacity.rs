@@ -173,14 +173,25 @@ fn exceeds_free(p: &Qwen35CardProjection) -> bool {
 
 fn charges(p: &Qwen35CardProjection) -> String {
     format!(
-        "free {} - weights {} - DeltaNet state {} - HIP runtime {} - prefill scratch {} - page rounding {}",
+        "free {} - weights {} - DeltaNet state {} - HIP runtime {} - prefill scratch {} - page rounding {}{}",
         gib(p.free as u64),
         gib(p.weights as u64),
         gib(p.state as u64),
         gib(p.runtime as u64),
         gib(p.scratch as u64),
-        gib(p.page_rounding as u64)
+        gib(p.page_rounding as u64),
+        host_pinned_note(p.host_pinned as u64)
     )
+}
+
+/// `; token embedding 1.3 GiB in pinned host RAM` when the load keeps the
+/// table off the card (`memory.embed_host`), else nothing.
+fn host_pinned_note(bytes: u64) -> String {
+    if bytes == 0 {
+        String::new()
+    } else {
+        format!("; token embedding {} in pinned host RAM", gib(bytes))
+    }
 }
 
 /// `a, b, or c`.
@@ -307,7 +318,7 @@ pub(crate) fn context_finding(
 pub(crate) fn capacity_lines(p: &Value, device: Option<&FitDevice>) -> Vec<String> {
     let n = |key: &str| p[key].as_u64().unwrap_or(0);
     let estimate = format!(
-        "pre-load estimate: {} free - {} weights - {} DeltaNet state - {} HIP runtime - {} prefill scratch - {} rounding; {} B/token (KV {} + attention partials {})",
+        "pre-load estimate: {} free - {} weights - {} DeltaNet state - {} HIP runtime - {} prefill scratch - {} rounding; {} B/token (KV {} + attention partials {}){}",
         gib(n("free")),
         gib(n("weights")),
         gib(n("state")),
@@ -316,7 +327,8 @@ pub(crate) fn capacity_lines(p: &Value, device: Option<&FitDevice>) -> Vec<Strin
         gib(n("page_rounding")),
         n("bytes_per_token").saturating_add(n("partials_per_token")),
         n("bytes_per_token"),
-        n("partials_per_token")
+        n("partials_per_token"),
+        host_pinned_note(n("host_pinned"))
     );
     if n("card_cap") > 0 {
         let window = p["model_ctx"].as_u64().map(|w| w as usize);
@@ -463,6 +475,7 @@ mod tests {
         Qwen35CardProjection {
             free: free_bytes,
             weights,
+            host_pinned: 0,
             state: 0,
             runtime: 0,
             scratch,
