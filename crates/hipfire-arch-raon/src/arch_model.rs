@@ -62,6 +62,12 @@ impl ArchModel for RaonBundle {
             .is_some_and(|session| session.plan_is_live(self, prompt, route, reused))
     }
 
+    /// The DFlash2 target restores the same cold-exact snapshots as AR
+    /// (`SpecTarget::session_begin`, boundary stops in `spec_advance`).
+    fn spec_session_reuse(&self) -> bool {
+        true
+    }
+
     fn session_commit(&mut self) {
         if let Some(session) = self.session.as_mut() {
             session.commit();

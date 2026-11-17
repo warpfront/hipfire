@@ -552,25 +552,21 @@ impl RaonBundle {
         Some(result)
     }
 
-    /// Prefill `prompt` skipping the `reused` tokens `ArchModel::session_plan`
-    /// returned (0 = cold): begin through the driver (restore, or cold reset),
-    /// run the rest in prefill chunks that stop at every armed snapshot
-    /// boundary, and leave the LAST prompt token's logits in
-    /// [`logits`](Self::logits). Without a cache `reused` must be 0. Reports
-    /// `prefill_progress` after every chunk. A failure leaves the slot
-    /// partially advanced: the caller resets it.
+    /// Begin a prefill of `prompt` on `route` that skips the `reused` tokens
+    /// `ArchModel::session_plan` returned (0 = cold): restore through the
+    /// driver, or cold reset, and arm the snapshot boundaries the prefill
+    /// reports through [`session_piece_end`](Self::session_piece_end) and
+    /// [`session_reached`](Self::session_reached). Without a cache `reused`
+    /// must be 0.
     ///
     /// The driver runs without live continuation, so every resume point is a
     /// position of the cold chunk grid and the result equals a cold prefill's.
-    ///
-    /// Returns with the decode stream drained (see [`drain_decode_stream`]), so
-    /// the caller's logits readback, whichever stream it uses, has nothing in
-    /// flight to wait on.
-    pub fn session_prefill(
+    pub(crate) fn session_begin(
         &mut self,
         gpu: &mut Gpu,
         prompt: &[u32],
         reused: usize,
+        route: SessionRoute,
     ) -> Result<(), String> {
         require_whole_band(&self.weights, "session prefill")?;
         let len = prompt.len();
@@ -586,7 +582,7 @@ impl RaonBundle {
             ));
         }
         match self.with_session(|session, bundle| {
-            session.begin(gpu, bundle, prompt, SessionRoute::Ar, reused, false)
+            session.begin(gpu, bundle, prompt, route, reused, false)
         }) {
             Some(result) => {
                 result?;
@@ -604,29 +600,53 @@ impl RaonBundle {
                 self.state.n_tokens()
             ));
         }
-        let step = self.prefill_step_rows();
+        Ok(())
+    }
+
+    /// End of the prefill piece that starts at `pos` of a prefill ending at
+    /// `end`: one prefill step, cut at the next armed snapshot boundary.
+    pub(crate) fn session_piece_end(&self, pos: usize, end: usize) -> Result<usize, String> {
+        let boundary = self.session.as_ref().and_then(SessionDriver::next_boundary);
+        crate::session::piece_end(pos, end, self.prefill_step_rows(), boundary)
+    }
+
+    /// After a prefill piece that ended at `pos`: capture the snapshot armed
+    /// there, if any.
+    pub(crate) fn session_reached(&mut self, gpu: &mut Gpu, pos: usize) -> Result<(), String> {
+        if self.session.as_ref().and_then(SessionDriver::next_boundary) != Some(pos) {
+            return Ok(());
+        }
+        self.with_session(|session, bundle| session.at_turn_boundary(gpu, bundle, pos))
+            .unwrap_or(Ok(()))
+    }
+
+    /// Prefill `prompt` skipping the `reused` tokens `ArchModel::session_plan`
+    /// returned (0 = cold): begin through the driver
+    /// ([`session_begin`](Self::session_begin)), run the rest in prefill
+    /// chunks that stop at every armed snapshot boundary, and leave the LAST
+    /// prompt token's logits in [`logits`](Self::logits). Reports
+    /// `prefill_progress` after every chunk. A failure leaves the slot
+    /// partially advanced: the caller resets it.
+    ///
+    /// Returns with the decode stream drained (see [`drain_decode_stream`]), so
+    /// the caller's logits readback, whichever stream it uses, has nothing in
+    /// flight to wait on.
+    pub fn session_prefill(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        reused: usize,
+    ) -> Result<(), String> {
+        self.session_begin(gpu, prompt, reused, SessionRoute::Ar)?;
+        let len = prompt.len();
         let mut pos = reused;
         while pos < len {
-            let boundary = self.session.as_ref().and_then(SessionDriver::next_boundary);
-            if boundary.is_some_and(|b| b <= pos) {
-                return Err(format!(
-                    "raon1_mini: session boundary {} is not past position {pos}",
-                    boundary.unwrap_or(0)
-                ));
-            }
-            let stop = boundary.unwrap_or(len).min(len);
-            for piece in prompt[pos..stop].chunks(step) {
-                pos += piece.len();
-                drain_decode_stream(gpu)?;
-                self.forward_chunk(gpu, piece, pos == len)?;
-                hipfire_runtime::prefill_progress::report(pos, len);
-            }
-            if boundary == Some(stop) {
-                self.with_session(|session, bundle| {
-                    session.at_boundary(gpu, bundle, &prompt[..stop])
-                })
-                .unwrap_or(Ok(()))?;
-            }
+            let end = self.session_piece_end(pos, len)?;
+            drain_decode_stream(gpu)?;
+            self.forward_chunk(gpu, &prompt[pos..end], end == len)?;
+            pos = end;
+            hipfire_runtime::prefill_progress::report(pos, len);
+            self.session_reached(gpu, pos)?;
         }
         drain_decode_stream(gpu)
     }
