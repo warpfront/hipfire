@@ -3,18 +3,17 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte oracle (+ bench): the one-launch all-rows BF16 GEMVs
-//! (`HIPFIRE_QWEN4_BF16_ALLROWS`, module `qwen4_gemv_bf16_xf32_allrows`) for the
+//! (module `qwen4_gemv_bf16_xf32_allrows`) for the
 //! Flash-Next MoE call's router / selector / shared gate / up / shared down at
 //! 9..=64 rows, on REAL weights (HFQM container, read-only) or `--synthetic`.
 //!
 //! Ground truth is the per-row singleton `gemv_bf16_xf32` (one launch per row and
 //! part). Arms, each compared word for word against it (all live words plus the
 //! guard words each side, outputs sentinel-poisoned):
-//!   group           flag off, routed launcher (today's route; the incumbent for rows <= 8)
-//!   allrows_routed  flag on, routed launcher (all-rows arm for 9..=64 rows)
-//!   direct_<tile>   flag on, explicit tile entry, every `Bf16AllRowsTile::ALL`, rows 1..=64
+//!   allrows_routed  routed launcher (all-rows arm for 9..=64 rows; the few-row route for 2..=8)
+//!   direct_<tile>   explicit tile entry, every `Bf16AllRowsTile::ALL`, rows 1..=64
 //! for the x4 parts call and, per part, `gemm_bf16_xf32_multirow`. Rows 1 has no routed
-//! launcher (both need >= 2 rows), so only the direct arms run there.
+//! launcher (it needs >= 2 rows), so only the direct arms run there.
 //!
 //! Negative controls (each must be detected): row offset, poisoned pad row, wrong K.
 //!
@@ -346,10 +345,6 @@ fn expected(live: &[u32], pad_rows_after: usize) -> Vec<u32> {
     v
 }
 
-fn set_allrows(gpu: &mut Gpu, on: bool) {
-    Arc::make_mut(&mut gpu.flags).qwen4_bf16_allrows = on;
-}
-
 /// X `[rows * k]`: every row distinct; magnitudes and patterns per `family`.
 fn gen_x(k: usize, family: usize, rows: usize, rng: &mut Rng) -> Vec<f32> {
     let mut x = Vec::with_capacity(rows * k);
@@ -433,7 +428,6 @@ fn reference(
     k: usize,
     nrows: usize,
 ) -> Vec<Vec<u32>> {
-    set_allrows(gpu, true);
     ms.iter()
         .enumerate()
         .map(|(p, &m)| {
@@ -459,7 +453,6 @@ fn reference(
 
 #[derive(Clone, Copy)]
 enum Arm {
-    Group,
     Routed,
     Direct(Bf16AllRowsTile),
 }
@@ -467,7 +460,6 @@ enum Arm {
 impl Arm {
     fn name(self) -> String {
         match self {
-            Arm::Group => "group".into(),
             Arm::Routed => "allrows_routed".into(),
             Arm::Direct(t) => format!("direct_{}", t.entry().rsplit('_').next().unwrap()),
         }
@@ -475,21 +467,17 @@ impl Arm {
 }
 
 fn run_x4(gpu: &mut Gpu, arm: Arm, parts: Parts, x: &GpuTensor, k: usize, rows: usize) {
-    set_allrows(gpu, !matches!(arm, Arm::Group));
     match arm {
-        Arm::Group | Arm::Routed => hip(gpu.gemv_bf16_xf32_x4_rows(parts, x, k, rows), "x4 routed"),
+        Arm::Routed => hip(gpu.gemv_bf16_xf32_x4_rows(parts, x, k, rows), "x4 routed"),
         Arm::Direct(t) => hip(
             gpu.gemv_bf16_xf32_x4_rows_allrows_tile(t, parts, x, k, rows),
             "x4 direct",
         ),
     }
-    set_allrows(gpu, true);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_mr(
     gpu: &mut Gpu,
-    arm: Arm,
     w: &GpuTensor,
     x: &GpuTensor,
     y: &GpuTensor,
@@ -497,9 +485,7 @@ fn run_mr(
     k: usize,
     rows: usize,
 ) {
-    set_allrows(gpu, matches!(arm, Arm::Routed));
     hip(gpu.gemm_bf16_xf32_multirow(w, x, y, m, k, rows), "multirow");
-    set_allrows(gpu, true);
 }
 
 /// One call shape: `parts` = `(bf16 bytes [m, k], m)`; every part also runs alone through
@@ -532,11 +518,7 @@ fn check_case(
             };
             for rows in rows_list {
                 let detail = format!("{tag} rows={rows} seed={seed} family={family}");
-                let mut arms: Vec<Arm> = if rows >= 2 {
-                    vec![Arm::Group, Arm::Routed]
-                } else {
-                    vec![]
-                };
+                let mut arms: Vec<Arm> = if rows >= 2 { vec![Arm::Routed] } else { vec![] };
                 arms.extend(Bf16AllRowsTile::ALL.map(Arm::Direct));
                 for &arm in &arms {
                     let outs: Vec<Out> = ms.iter().map(|&m| alloc_out(gpu, rows * m)).collect();
@@ -557,13 +539,11 @@ fn check_case(
                     continue;
                 }
                 for (p, &m) in ms.iter().enumerate() {
-                    for arm in [Arm::Group, Arm::Routed] {
-                        let o = alloc_out(gpu, rows * m);
-                        run_mr(gpu, arm, &ws[p], &x, &o.live, m, k, rows);
-                        let bad = mismatches(&fetch(gpu, &o), &expected(&refs[p][..rows * m], 0));
-                        rep.record(&format!("{label} mr[m={m}] {}", arm.name()), &detail, bad);
-                        free_outs(gpu, vec![o]);
-                    }
+                    let o = alloc_out(gpu, rows * m);
+                    run_mr(gpu, &ws[p], &x, &o.live, m, k, rows);
+                    let bad = mismatches(&fetch(gpu, &o), &expected(&refs[p][..rows * m], 0));
+                    rep.record(&format!("{label} mr[m={m}] allrows_routed"), &detail, bad);
+                    free_outs(gpu, vec![o]);
                 }
             }
             let _ = gpu.free_tensor(x);
@@ -595,72 +575,49 @@ fn launches(gpu: &mut Gpu, f: impl FnOnce(&mut Gpu)) -> usize {
     n
 }
 
-/// Before any other launch: flag on loads only the all-rows entries for 9..=64 rows (no
-/// `_x4_rows_r<R>`, no `multirow_pto2`), flag off loads the incumbent; then launch counts.
+/// Before any other launch: the routed launchers load only the all-rows entries for
+/// 9..=64 rows (no `_x4_rows_r<R>`, no `multirow_pto2`); then launch counts.
 fn route_proof(gpu: &mut Gpu) {
     let (m, k) = (64usize, SHARD_N);
     let w = upload_bf16(gpu, &vec![0x3f; m * k * 2], m, k);
     let x = upload_f32(gpu, &vec![0.5f32; MAXR * k]);
     let y = alloc_out(gpu, MAXR * m);
     let parts = parts4(&[&w], &[&y.live], &[m]);
-    let go = |gpu: &mut Gpu, on: bool, rows: usize| {
-        set_allrows(gpu, on);
+    for rows in [9, 30, MAXR] {
         hip(gpu.gemv_bf16_xf32_x4_rows(parts, &x, k, rows), "proof x4");
         hip(
             gpu.gemm_bf16_xf32_multirow(&w, &x, &y.live, m, k, rows),
             "proof multirow",
         );
-    };
-    for rows in [9, 30, MAXR] {
-        go(gpu, true, rows);
     }
     let loaded = gpu.loaded_kernel_names();
     assert!(
         loaded
             .iter()
             .any(|n| n.starts_with("gemv_bf16_xf32_x4_rows_allrows_")),
-        "flag on: no gemv_bf16_xf32_x4_rows_allrows_* entry loaded"
+        "no gemv_bf16_xf32_x4_rows_allrows_* entry loaded"
     );
     for n in &loaded {
         assert!(
             !n.starts_with("gemv_bf16_xf32_x4_rows_r")
                 && !n.contains("gemm_bf16_xf32_multirow_pto2"),
-            "flag on: incumbent {n} was loaded"
+            "incumbent {n} was loaded at 9..=64 rows"
         );
     }
-    go(gpu, false, 30);
-    let loaded = gpu.loaded_kernel_names();
-    for want in ["gemv_bf16_xf32_x4_rows_r8", "gemm_bf16_xf32_multirow_pto2"] {
-        assert!(
-            loaded.iter().any(|n| n == want),
-            "flag off: incumbent {want} not loaded"
+    let x4 = launches(gpu, |g| {
+        hip(g.gemv_bf16_xf32_x4_rows(parts, &x, k, 30), "count x4");
+    });
+    let multirow = launches(gpu, |g| {
+        hip(
+            g.gemm_bf16_xf32_multirow(&w, &x, &y.live, m, k, 30),
+            "count multirow",
         );
-    }
-    let mut counts = [0usize; 4];
-    for (i, on) in [false, true].into_iter().enumerate() {
-        set_allrows(gpu, on);
-        counts[2 * i] = launches(gpu, |g| {
-            hip(g.gemv_bf16_xf32_x4_rows(parts, &x, k, 30), "count x4");
-        });
-        counts[2 * i + 1] = launches(gpu, |g| {
-            hip(
-                g.gemm_bf16_xf32_multirow(&w, &x, &y.live, m, k, 30),
-                "count multirow",
-            );
-        });
-    }
-    set_allrows(gpu, true);
-    assert_eq!(
-        counts[0],
-        30usize.div_ceil(8),
-        "flag off x4 launches at 30 rows"
-    );
-    assert_eq!(counts[2], 1, "flag on x4 launches at 30 rows");
-    assert_eq!(counts[3], 1, "flag on multirow launches at 30 rows");
+    });
+    assert_eq!(x4, 1, "x4 launches at 30 rows");
+    assert_eq!(multirow, 1, "multirow launches at 30 rows");
     println!(
-        "bf16_allrows_oracle: route proof ok (flag on -> *_allrows_* only, flag off -> incumbent); \
-         launches at 30 rows: x4 off={} on={}, multirow off={} on={}",
-        counts[0], counts[2], counts[1], counts[3]
+        "bf16_allrows_oracle: route proof ok (9..=64 rows -> *_allrows_* only); \
+         launches at 30 rows: x4={x4} multirow={multirow}"
     );
     for t in [x, w, y.whole] {
         let _ = gpu.free_tensor(t);
@@ -672,7 +629,6 @@ fn route_proof(gpu: &mut Gpu) {
 /// Run the three controls on the router weight; returns how many were detected.
 fn controls(gpu: &mut Gpu, rep: &mut Report, router: &[u8], rng: &mut Rng) -> usize {
     let (m, k, rows) = (512usize, HIDDEN, 30usize);
-    set_allrows(gpu, true);
     let w = upload_bf16(gpu, router, m, k);
     let mut hx = gen_x(k, 1, rows + 1, rng);
     let clean = upload_f32(gpu, &hx);
@@ -1158,45 +1114,30 @@ impl Bench {
 
 fn bench(gpu: &mut Gpu, layer: &Layer, reps: usize, rng: &mut Rng) {
     let b = Bench::new(gpu, layer, rng);
-    let mut t: HashMap<(usize, usize, bool), f64> = HashMap::new();
+    let mut t: HashMap<(usize, usize), f64> = HashMap::new();
     println!(
         "bf16_allrows_oracle: bench, median of {reps} samples x {CALLS_PER_SAMPLE} back-to-back calls (one graph replay per sample, device time)"
     );
-    println!("| case | rows | off us | on us | speedup | launches off->on |");
-    println!("|---|---:|---:|---:|---:|---|");
+    println!("| case | rows | us | launches |");
+    println!("|---|---:|---:|---:|");
     for (case, name) in CASES.iter().enumerate() {
         for rows in BENCH_ROWS {
-            let mut us = [0.0f64; 2];
-            let mut n = [0usize; 2];
-            for (i, on) in [false, true].into_iter().enumerate() {
-                set_allrows(gpu, on);
-                us[i] = time_us(gpu, reps, |g| b.call(g, case, rows));
-                n[i] = launches(gpu, |g| b.call(g, case, rows));
-                t.insert((case, rows, on), us[i]);
-            }
-            println!(
-                "| {name} | {rows} | {:.2} | {:.2} | {:.3}x | {}->{} |",
-                us[0],
-                us[1],
-                us[0] / us[1],
-                n[0],
-                n[1]
-            );
+            let us = time_us(gpu, reps, |g| b.call(g, case, rows));
+            let n = launches(gpu, |g| b.call(g, case, rows));
+            t.insert((case, rows), us);
+            println!("| {name} | {rows} | {us:.2} | {n} |");
         }
     }
-    set_allrows(gpu, true);
     println!("bf16_allrows_oracle: implied marginal ms per added row, 48 MoE layers");
     println!("  (8 -> 30 rows is the AR8 -> 30-row verify step; 16 -> 48 rows the wide span)");
     for (case, name) in [(5usize, "V1 set"), (8, "V2 set")] {
-        let ms = |lo: usize, hi: usize, on: bool| {
-            (t[&(case, hi, on)] - t[&(case, lo, on)]) / (hi - lo) as f64 * 48.0 / 1000.0
+        let ms = |lo: usize, hi: usize| {
+            (t[&(case, hi)] - t[&(case, lo)]) / (hi - lo) as f64 * 48.0 / 1000.0
         };
         println!(
-            "  {name}: 8->30 off {:.4} on {:.4} ms/row | 16->48 off {:.4} on {:.4} ms/row",
-            ms(8, 30, false),
-            ms(8, 30, true),
-            ms(16, 48, false),
-            ms(16, 48, true)
+            "  {name}: 8->30 {:.4} ms/row | 16->48 {:.4} ms/row",
+            ms(8, 30),
+            ms(16, 48)
         );
     }
     println!(
@@ -1546,7 +1487,6 @@ fn reread(
     out: Option<&str>,
     rng: &mut Rng,
 ) -> usize {
-    set_allrows(gpu, true);
     println!(
         "bf16_allrows_oracle: --reread arms incumbent_chunks / exact_one / lwmma_one (lwmma mismatch is EXPECTED, reported only)"
     );

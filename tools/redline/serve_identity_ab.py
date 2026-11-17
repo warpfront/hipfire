@@ -14,7 +14,6 @@ is printed even when the retained route replayed every token.
 Arms (each a fresh daemon + model load):
   on    HIPFIRE_REPLAY_BACKEND=redline                           (retained PM4 + scratch rings)
   hip   HIPFIRE_REPLAY_BACKEND=hip                               (HIP graph)
-  kill  HIPFIRE_REPLAY_BACKEND=redline HIPFIRE_PMSCRATCH_PM4_SCRATCH=0 (route falls back to HIP)
   dflt  no HIPFIRE_REPLAY_BACKEND at all (the product default decision)
 """
 import argparse, hashlib, json, os, re, select, signal, subprocess, sys, time
@@ -30,7 +29,6 @@ BASE_ENV = {"HIPFIRE_EMIT_TOKEN_IDS": "1", "HIPFIRE_REPLAY_ROUTE_PROOF_LOG": "1"
 ARMS = {
     "on": {"HIPFIRE_REPLAY_BACKEND": "redline", "HIPFIRE_REPLAY_TRANSPORT": "pm4"},
     "hip": {"HIPFIRE_REPLAY_BACKEND": "hip"},
-    "kill": {"HIPFIRE_REPLAY_BACKEND": "redline", "HIPFIRE_REPLAY_TRANSPORT": "pm4", "HIPFIRE_PMSCRATCH_PM4_SCRATCH": "0"},
     "dflt": {},
 }
 
@@ -38,7 +36,7 @@ ARMS = {
 class Daemon:
     def __init__(self, binary, arm, log, timeout):
         env = dict(os.environ)
-        for k in ("HIPFIRE_REPLAY_BACKEND", "HIPFIRE_REPLAY_TRANSPORT", "HIPFIRE_PMSCRATCH_PM4_SCRATCH",
+        for k in ("HIPFIRE_REPLAY_BACKEND", "HIPFIRE_REPLAY_TRANSPORT",
                   "HIPFIRE_REPLAY_MANUAL_CAPTURE"):
             env.pop(k, None)
         env.update(BASE_ENV)
@@ -179,11 +177,6 @@ def ident(args):
             report["failures"].append("dflt: no 'enabling fail-closed retained default' line (default did not select the route)")
         if arm != "dflt" and p["retained_default_line"] != 0:
             report["failures"].append(f"{arm}: unexpected automatic retained default")
-        if arm == "kill":
-            if p["marks"]:
-                report["failures"].append("kill: unexpected ROUTE_PROOF markers")
-            if not p["fallbacks"]:
-                report["failures"].append("kill: no 'falling back to HIP' message")
         if arm == "hip":
             if p["marks"] or p["redline_lines"]:
                 report["failures"].append("hip: retained route engaged")
@@ -257,6 +250,6 @@ ap.add_argument("--reps", type=int, default=4)
 ap.add_argument("--long-reps", type=int, default=2)
 a = ap.parse_args()
 if a.arms is None:
-    a.arms = "on,hip,kill" if a.mode == "ident" else "on,hip"
+    a.arms = "on,hip"
 os.makedirs(a.out, exist_ok=True)
 sys.exit(ident(a) if a.mode == "ident" else ab(a))

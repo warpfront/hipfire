@@ -7,7 +7,7 @@
 //! `topk_values_batched_f32` (DFlash2 selector, raw top-K) and
 //! `argmax_f32_batched` (verify argmax) launch one 256-thread block per row;
 //! the top-K merges 256 x K candidates on a single thread. On exact gfx1201,
-//! gfx1151 and gfx1100 (opt out with `HIPFIRE_SELECT_REGRID_OFF=1`) both route through
+//! gfx1151 and gfx1100 both route through
 //! `kernels/src/select_regrid.hip` instead: 1024 threads per row with wave32
 //! butterflies. Outputs are byte-identical to the shipping kernels for every
 //! input (see the kernel header for the argument; `test_select_regrid`
@@ -67,12 +67,10 @@ pub const SELECT_REGRID_BLOCK: u32 = 1024;
 impl Gpu {
     /// Exact gfx1201, gfx1151 or gfx1100 (the archs `test_select_regrid` and
     /// `topk_tie_exact_gpu` byte-check; all three are wave32 and the kernels
-    /// use only `__shfl_xor` and 1024-thread blocks), not opted out, and no
-    /// open Redline recording (the re-grid kernels are not in Redline's kernel
-    /// tables).
+    /// use only `__shfl_xor` and 1024-thread blocks), and no open Redline
+    /// recording (the re-grid kernels are not in Redline's kernel tables).
     pub fn select_regrid_enabled(&self) -> bool {
         (self.arch_caps.is_gfx1201() || self.arch_caps.is_gfx1151() || self.arch_caps.is_gfx1100())
-            && !self.flags.select_regrid_off
             && !self.replay.is_recording()
     }
 

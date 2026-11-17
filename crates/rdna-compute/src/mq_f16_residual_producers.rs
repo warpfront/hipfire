@@ -29,7 +29,7 @@
 //! kernel symbols as `gemm_mq4g256v2_residual_wmma` (same modules, same
 //! grids) with the sidecar pointer wired directly as X, bypassing
 //! `ensure_fp16_x`. Tier selection (default-on ldsstage on exact gfx1100,
-//! split-K table, base fallback, `residual_ksplit_off`) mirrors that
+//! split-K table, base fallback) mirrors that
 //! function exactly; the hook falls back to the old path wherever this entry returns Err.
 
 use std::ffi::c_void;
@@ -570,7 +570,7 @@ impl Gpu {
     /// (DType::F16, e.g. an S4 sidecar) is wired straight in, bypassing
     /// `ensure_fp16_x` and its `convert_f32_to_f16` launch. Tier selection
     /// mirrors that function: default-on ldsstage on exact gfx1100, split-K
-    /// table, base fallback (`residual_ksplit_off` forces base); exact gfx1201
+    /// table, base fallback; exact gfx1201
     /// mirrors `gemm_hfq4g256_residual_wmma_gfx12_mq4v2`'s N<=16 pick. Any shape
     /// outside the routed verify domain (other arches, `batch_size > 16`,
     /// `K % 256 != 0`) returns Err so the caller keeps the old path.
@@ -647,13 +647,8 @@ impl Gpu {
                 )
             };
         }
-        // Shared verify-tier pick (same helper as the F32 entry): the kill
-        // switch dominates both optimized tiers and restores base.
-        match Self::residual_verify_tier(
-            self.flags.residual_ksplit_off,
-            self.flags.residual_ldsstage,
-            k,
-        ) {
+        // Shared verify-tier pick (same helper as the F32 entry).
+        match Self::residual_verify_tier(self.flags.residual_ldsstage, k) {
             ResidualVerifyTier::LdsStage => {
                 return self.gemm_residual_f16_one(
                     a_raw,

@@ -6,7 +6,7 @@
 //! (`gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s`, and its small-N `..._b1s_v64` twin) against the
 //! shipped object. The product launcher is `Gpu::gemm_qkvza_set_g12_iu4_prepared`
 //! (`crates/rdna-compute/src/gemm.rs`): admitted for `0 < n <= 128` and the 27B GDN dims
-//! `[10240, 6144, 48, 48]`, symbol `_v64` unless `HIPFIRE_VERIFY_V64=0`.
+//! `[10240, 6144, 48, 48]`, symbol `_v64`.
 //!
 //! # Shape grammar
 //! `N=<tokens>[,K=<k>]` (`K` default 5120, `K % 256 == 0`, `1 <= N <= 128`). The row counts are the
@@ -353,8 +353,8 @@ impl Workload for Qkvzaset {
         crate::common::shipped_object(
             rdna_compute::kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S,
             "kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco",
-            "crates/rdna-compute/src/gemm.rs Gpu::gemm_qkvza_set_g12_iu4_prepared (symbol `_v64` unless \
-             HIPFIRE_VERIFY_V64=0; module gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s via g12_iu4_b1s_image)",
+            "crates/rdna-compute/src/gemm.rs Gpu::gemm_qkvza_set_g12_iu4_prepared (symbol `_v64`; \
+             module gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s via g12_iu4_b1s_image)",
             &symbol,
             &[&symbol],
             json!({"variant": self.variant.name(), "symbol": symbol}),

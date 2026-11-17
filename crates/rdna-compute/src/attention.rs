@@ -11539,7 +11539,6 @@ impl Gpu {
             && n_kv_heads > 0
             && n_heads % n_kv_heads == 0
             && matches!(n_heads / n_kv_heads, 1 | 2 | 4 | 8 | 16)
-            && hipfire_config::developer_bool("HIPFIRE_Q8_PREFILL_GQA_WMMA", true)
     }
 
     /// Causal attention of `batch` consecutive query rows (`positions`, i32,

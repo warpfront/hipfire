@@ -74,9 +74,6 @@ const MQ6_I8_PM_ENTRY_F32_NORM_ROPE: &str = "gemm_mq6g256v2_mmq_i8_pm_set_nr_gfx
 /// Rows per CTA and tokens per CTA of that entry, its threads and dynamic LDS.
 const MQ6_I8_PM_NR_ROWS: usize = 256;
 const MQ6_I8_PM_NR_TOKENS: usize = 128;
-/// `HIPFIRE_QWEN4_QSA_NORM_EPI` (developer, kill switch): on unless `0`; acted on for exact gfx1201 only.
-static QWEN4_QSA_NORM_EPI: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_NORM_EPI", true));
 /// Head width and RoPE width the entry is built for.
 pub const QSA_NORM_EPI_HEAD_DIM: usize = 256;
 pub const QSA_NORM_EPI_ROTARY_DIM: usize = 64;
@@ -475,8 +472,8 @@ impl Gpu {
     }
 
     /// Whether [`Gpu::gemm_mq6g256v2_i8_prequant_norm_rope`] would launch the
-    /// fused entry for these arguments: `HIPFIRE_QWEN4_QSA_NORM_EPI` on (exact
-    /// gfx1201), the MQ6 INT8 route admitted ([`Gpu::gemm_mq6g256v2_i8_applies`]),
+    /// fused entry for these arguments: exact gfx1201, the MQ6 INT8 route
+    /// admitted ([`Gpu::gemm_mq6g256v2_i8_applies`]),
     /// the PM twin admitted for F32 `y`, `m % 256 == 0`, and `head_stride_rows`
     /// (`head_mask + 1`: 512 for the interleaved q-gate rows, 256 for plain k
     /// rows) dividing `m`.
@@ -488,7 +485,7 @@ impl Gpu {
         y: &GpuTensor,
         head_stride_rows: usize,
     ) -> bool {
-        (self.arch == "gfx1201" && *QWEN4_QSA_NORM_EPI)
+        self.arch == "gfx1201"
             && y.dtype == DType::F32
             && matches!(head_stride_rows, 256 | 512)
             && m % head_stride_rows == 0

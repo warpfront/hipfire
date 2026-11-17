@@ -33,10 +33,10 @@
 //! Ignored hardware gates refuse fatally on missing devices, unsupported
 //! architectures, unadmitted rows, launch errors, or mismatches. Run serially:
 //!
-//!   HIPFIRE_QWEN4_QSA_DECODE_SPLITK=1 cargo test -p rdna-compute --release --features lab --test qsa_decode_splitk qsa_splitk_wide_ \
+//!   cargo test -p rdna-compute --release --features lab --test qsa_decode_splitk qsa_splitk_wide_ \
 //!       -- --ignored --nocapture --test-threads=1
 //!
-//! Run the separate timing diagnostic with HIPFIRE_QWEN4_QSA_DECODE_SPLITK=0.
+//! Run the separate timing diagnostic the same way (`qsa_splitk_timing_table`).
 //! This file never changes environment variables.
 
 #![cfg(feature = "lab")]
@@ -1294,11 +1294,6 @@ fn time_us(gpu: &mut Gpu, mut call: impl FnMut(&mut Gpu)) -> f64 {
 #[test]
 #[ignore = "needs a HIP device"]
 fn qsa_splitk_timing_table() {
-    assert_eq!(
-        std::env::var("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").as_deref(),
-        Ok("0"),
-        "HIPFIRE_QWEN4_QSA_DECODE_SPLITK must be 0: split-K is the default on gfx1151, and the production-dispatch row is the incumbent route only with it off"
-    );
     let mut gpu = Gpu::init().expect("gpu init");
     println!(
         "arch={} FABRIC_JOB={} (timings: {CALLS_PER_SAMPLE} calls/sample, median of {SAMPLES}, \
@@ -1797,10 +1792,6 @@ fn qsa_splitk_wide_production_reference_bytes() {
         matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201" | "gfx1100"),
         "strict G1 unsupported architecture: {}",
         gpu.arch
-    );
-    assert!(
-        gpu.arch != "gfx1151" || gpu.flags.qwen4_qsa_decode_splitk_enabled(),
-        "strict Halo G1 requires production split-K enabled; use HIPFIRE_QWEN4_QSA_DECODE_SPLITK=1"
     );
     let split_limit = split_lds_max_selected();
     let full_cap = split_limit.max(PER_HEAD_LDS_MAX_SELECTED) + 256;

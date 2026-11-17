@@ -28,9 +28,8 @@
 //!     (c) the production launcher
 //!         (`gemm_mq4g256v2_moe_grouped_top10_silu_bf16out`,
 //!          `gemm_mq4g128v2_moe_grouped_top10_xf16`), which picks its entry
-//!          from the device and the `HIPFIRE_QWEN4_MOE_X_LDS` flag (default
-//!          `auto`: the LDS entry on gfx1151; with `=0`, (c) is the per-wave
-//!          entry again; this example reads no environment variable itself).
+//!          from the device: the LDS entry on exact gfx1151, the per-wave
+//!          entry elsewhere (this example reads no environment variable itself).
 //! The direct launches load the production module names, so the oracle and
 //! the launcher share one compiled object. (b) and (c) must equal (a) over
 //! the WHOLE buffer, poison and guard bytes included.

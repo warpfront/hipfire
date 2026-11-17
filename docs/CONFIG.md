@@ -688,8 +688,7 @@ to the exact F32 state on every arch, gfx1151 and gfx1100 included. On exact gfx
 `kv_cache = "fp8"` (same geometry requirement, refused rather than rewritten
 when the model does not meet it). On every other arch `auto` never picks
 `q8`; an explicit `q8` needs head_dim 256.
-On gfx1151 and gfx1100 the decode attention follows the K/V format under the
-`HIPFIRE_QWEN4_QSA_DECODE_SPLITK` switch (`=0` disables both routes): split-KV
+On gfx1151 and gfx1100 the decode attention follows the K/V format: split-KV
 for q8 K/V (exact gfx1151 and exact gfx1100), split-K for the F32 state
 (exact gfx1151 only). Both are KLD-gated, not bit-exact against the per-head
 kernel.
@@ -911,13 +910,11 @@ context then tracks the tokens touched, not `max_seq`: the load logs
 growth logs `qwen4 QSA context mapped for N tokens`. Mapped pages stay owned
 until unload, and VMM is not eviction.
 
-On gfx1151 two exact QSA selection levers are on by default (kill switches in
-[env-vars](env-vars.md)): each layer keeps a BF16 mirror of its pooled index
-keys (`HIPFIRE_QWEN4_QSA_POOLED_BF16`; 256 bytes per pooled block, i.e.
+On gfx1151 two exact QSA selection levers are on: each layer keeps a BF16 mirror of its pooled index
+keys (`HIPFIRE_QWEN4_QSA_POOLED_BF16`, a kill switch in [env-vars](env-vars.md); 256 bytes per pooled block, i.e.
 16 MiB per QSA layer at 256K, charged in admission and never snapshotted),
-and long-context score/select calls use the sampled filter select
-(`HIPFIRE_QWEN4_QSA_FILTER_SELECT`). Selection, attention and logits are
-byte-identical with either off.
+and long-context score/select calls use the sampled filter select. Selection,
+attention and logits are byte-identical with the mirror off.
 
 Qwen4 `max_seq` on a **unified-memory APU** (gfx1151): omission is
 **automatic** under VMM (legacy storage refuses it and needs an explicit
@@ -2603,6 +2600,49 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.moe_grouped_k2_pm` | `moe_grouped_k2_pm` | 0.4.5 | 0.5.0 | none; exact gfx1100 always runs the twin where admitted |
 | `developer.moe_rotate_i4_pm` | `moe_rotate_i4_pm` | 0.4.3 | 0.5.0 | none; exact gfx1201 always runs the twin where the symmetric IU4 route admits it |
 | `kernel.gfx11_iu4_symfold` | `gfx11_iu4_symfold` | 0.4.0 | 0.5.0 | none; symmetric MQ4V2 artifacts always take the signed-weight IU4 fold |
+| `developer.mq4v2_k512_r2` | `mq4v2_k512_r2` | 0.4.4 | 0.5.0 | none; the k512 shared-expert GEMV always runs its two-row kernel where admitted |
+| `developer.mq6_resid_pm_gfx1100` | `mq6_resid_pm_gfx1100` | 0.4.5 | 0.5.0 | none; exact gfx1100 always runs the MQ6 residual PM twin where admitted |
+| `developer.mq6_resid_port_gfx1100` | `mq6_resid_port_gfx1100` | 0.4.5 | 0.5.0 | none; exact gfx1100 always runs the card-proven MQ6 residual ports where admitted |
+| `developer.mq_f16_projection_off` | `mq_f16_projection_off` | 0.3.1 | 0.5.0 | none; the F16 projection producers are always used where admitted |
+| `developer.mq_f16_residual_off` | `mq_f16_residual_off` | 0.3.1 | 0.5.0 | none; the F16 residual producers are always used where admitted |
+| `developer.mq_prologue_fuse_off` | `mq_prologue_fuse_off` | 0.3.1 | 0.5.0 | none; producer + GEMM prologues are always fused where admitted |
+| `developer.npu_trunk_pack_a_pm` | `npu_trunk_pack_a_pm` | 0.4.5 | 0.5.0 | none; exact gfx1151 always runs the PM pack-A producer |
+| `developer.pmscratch_pm4_scratch` | `pmscratch_pm4_scratch` | 0.4.5 | 0.5.0 | none; retained PM4 dispatch always uses the scratch rings where admitted |
+| `developer.q8_gemv_fast` | `q8_gemv_fast` | 0.4.5 | 0.5.0 | none; the fast Q8 GEMV is always used where admitted |
+| `developer.q8_prefill_gqa_wmma` | `q8_prefill_gqa_wmma` | 0.4.2 | 0.5.0 | none; Q8 prefill attention always takes the GQA WMMA kernel where admitted |
+| `developer.qwen4_bf16_allrows` | `qwen4_bf16_allrows` | 0.4.5 | 0.5.0 | none; exact gfx1201 9..=64-row BF16 router / shared GEMVs always run in one launch |
+| `developer.qwen4_bf16_rows_otile` | `qwen4_bf16_rows_otile` | 0.4.5 | 0.5.0 | none; exact gfx1201 always takes the output-tiled BF16 rows GEMVs where admitted |
+| `developer.qwen4_hc_mix_fill80_gfx1100` | `qwen4_hc_mix_fill80_gfx1100` | 0.4.5 | 0.5.0 | none; exact gfx1100 always takes the 80x32 fill tile where admitted |
+| `developer.qwen4_hc_up_t1` | `qwen4_hc_up_t1` | 0.4.5 | 0.5.0 | none; exact gfx1201 <= 8-row HC read-ups always take the t1 entry |
+| `developer.qwen4_hc_up_t1_k320` | `qwen4_hc_up_t1_k320` | 0.4.5 | 0.5.0 | none; t1 HC read-ups with low_rank 320 always take the k320 entry |
+| `developer.qwen4_hc_up_twin` | `qwen4_hc_up_twin` | 0.4.3 | 0.5.0 | none; the HC read-up twins are always used where admitted |
+| `developer.qwen4_lane_wmma` | `qwen4_lane_wmma` | 0.4.5 | 0.5.0 | none; exact gfx1201 16..=64-row BF16 rows projections always take the lane WMMA route |
+| `developer.qwen4_moe_down_c8_pm` | `qwen4_moe_down_c8_pm` | 0.4.5 | 0.5.0 | none; the PM C8 down module is always used where admitted |
+| `developer.qwen4_moe_down_twin` | `qwen4_moe_down_twin` | 0.4.3 | 0.5.0 | none; exact gfx1151 always runs the X-in-LDS down twin where admitted |
+| `developer.qwen4_moe_gateup_twin` | `qwen4_moe_gateup_twin` | 0.4.3 | 0.5.0 | none; exact gfx1151 always runs the pipelined gate/up twin where admitted |
+| `developer.qwen4_moe_gu_c8_pm` | `qwen4_moe_gu_c8_pm` | 0.4.5 | 0.5.0 | none; the PM C8 gate/up entries are always used where admitted |
+| `developer.qwen4_moe_x_lds` | `qwen4_moe_x_lds` | 0.4.2 | 0.5.0 | none; the gfx1151 F16 WMMA MoE route always takes the X-LDS entries |
+| `developer.qwen4_mq6_r8_pk` | `qwen4_mq6_r8_pk` | 0.4.5 | 0.5.0 | none; exact gfx1201 3..=8-row MQ6 projections always take the packed-epilogue kernels |
+| `developer.qwen4_mq6_x4_pm` | `qwen4_mq6_x4_pm` | 0.4.1 | 0.5.0 | none; the PM MQ6 overwrite GEMM is always used where admitted |
+| `developer.qwen4_mtp_draft_head_pm` | `qwen4_mtp_draft_head_pm` | 0.4.5 | 0.5.0 | none; the PM draft-head GEMV is always used where admitted |
+| `developer.qwen4_prefill_lwmma_dense` | `qwen4_prefill_lwmma_dense` | 0.4.5 | 0.5.0 | none; dense BF16 prefill GEMMs above 64 rows always take the lane-WMMA kernels where admitted |
+| `developer.qwen4_qsa_decode_splitk` | `qwen4_qsa_decode_splitk` | 0.4.3 | 0.5.0 | none; QSA decode attention always splits where admitted (F32 split-K on gfx1151, q8 split-KV on gfx1151 and gfx1100) |
+| `developer.qwen4_qsa_filter_select` | `qwen4_qsa_filter_select` | 0.4.3 | 0.5.0 | none; exact gfx1151 always takes the filter trio where admitted, other arches never do |
+| `developer.qwen4_qsa_hg4_q8_lite` | `qwen4_qsa_hg4_q8_lite` | 0.4.5 | 0.5.0 | none; exact gfx1100 q8 grouped prefill attention always takes the low-LDS twin |
+| `developer.qwen4_qsa_norm_epi` | `qwen4_qsa_norm_epi` | 0.4.4 | 0.5.0 | none; exact gfx1201 always fuses q/k norm + RoPE into the PM GEMM epilogue where admitted |
+| `developer.qwen4_qsa_scores_reserve` | `qwen4_qsa_scores_reserve` | 0.4.5 | 0.5.0 | none; exact gfx1201 always reserves the QSA score scratch at its shape bound |
+| `developer.qwen4_qsa_score_pm` | `qwen4_qsa_score_pm` | 0.4.1 | 0.5.0 | none; exact gfx1151 always uses the PM score kernels where admitted |
+| `developer.qwen4_qsa_select_pm` | `qwen4_qsa_select_pm` | 0.4.1 | 0.5.0 | none; exact gfx1151 always uses the PM select kernel where admitted |
+| `developer.qwen4_qsa_select_pm_decode` | `qwen4_qsa_select_pm_decode` | 0.4.3 | 0.5.0 | none; the PM QSA score/select pair runs at every admitted row count |
+| `developer.qwen4_trunk_a8_x4_shard` | `qwen4_trunk_a8_x4_shard` | 0.4.5 | 0.5.0 | none; the EP2 trunk-shard GDN group always takes the m32n32 x4 tile where measured |
+| `developer.qwen4_trunk_iu4_ragged` | `qwen4_trunk_iu4_ragged` | 0.4.2 | 0.5.0 | none; ragged prefill chunks always arm on the zab trunk A4 route where admitted |
+| `developer.residual_ksplit_off` | `residual_ksplit_off` | 0.3.1 | 0.5.0 | none; exact gfx1100 N<=16 residuals always take the ldsstage / split-K tiers where admitted |
+| `developer.rmsnorm_p1a_batched` | `rmsnorm_p1a_batched` | 0.4.0 | 0.5.0 | none; the batched phase-1a RMSNorm producers are always used where admitted |
+| `developer.select_regrid_off` | `select_regrid_off` | 0.4.0 | 0.5.0 | none; the regridded top-K / argmax kernels are always used where admitted |
+| `developer.v2b_pm` | `v2b_pm` | 0.4.0 | 0.5.0 | none; gfx1151 V2B entries always run their builder twins where admitted |
+| `developer.v2b_zba_scatter` | `v2b_zba_scatter` | 0.4.0 | 0.5.0 | none; the V2B Z|beta|alpha SET always scatters where admitted |
+| `developer.v2c_addepi` | `v2c_addepi` | 0.4.0 | 0.5.0 | none; the V2C ADD always takes the residual-touch entry |
+| `developer.verify_v64` | `verify_v64` | 0.4.5 | 0.5.0 | none; the verify GEMM always takes the wave64 variant where admitted |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 

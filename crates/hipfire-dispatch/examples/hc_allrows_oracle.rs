@@ -410,7 +410,7 @@ fn synthetic_weights(gpu: &mut Gpu) -> R<WeightSet> {
     })
 }
 
-/// Minimal HFQM index reader (tensor name -> byte range), as `otile_bf16_rows_oracle`.
+/// Minimal HFQM index reader (tensor name -> byte range).
 struct Hfq {
     file: File,
     tensors: BTreeMap<String, (u64, u64, Vec<u32>, u8)>,

@@ -2,7 +2,7 @@
 
 > **Historical research note: superseded by the 0.4.2 serving route.** This file records a design study (no hardware run) for splitting dense 27B IU4 prefill GEMM columns between the GPU and the NPU, whose mixed-mode numeric contract uses IEF15 on the NPU columns from the 2026-10 NPU research cycle. It is not current guidance, and any figure in it is a dated fixture-bound measurement or an explicitly labelled historical estimate, not a product claim. The shipped 0.4.2 NPU route is the Flash-Next gfx1151 trunk input projection described in [npu-trunk.md](npu-trunk.md): `HIPFIRE_QWEN4_NPU_TRUNK=off|auto|on|emulate` (default `auto`, effectively `off` on every architecture except gfx1151), calibration schema 4, BF16-direct only. There is **no I32 serving contract** (no int32 partial, combine or fold exists in the product route). The out-projection program exists but is **not wired** into serving; `qsa.o` and the GDN o-projection are **not shipped**. Environment-variable names and flag syntax below are historical proposals or experiment switches, not supported configuration.
 >
-> Nothing here was implemented as a serving route; the measured prototypes that followed ([coop-down27.md](coop-down27.md), [coop-epi-fuse.md](coop-epi-fuse.md)) were killed. The `W:` source references point at the 0.4.1 beta checkout. The GPU-side switches named below (`HIPFIRE_V2B_ADDEPI`, `HIPFIRE_V2B_ZBA_SCATTER`) are developer-only GPU kernel selectors of that checkout and are not NPU configuration.
+> Nothing here was implemented as a serving route; the measured prototypes that followed ([coop-down27.md](coop-down27.md), [coop-epi-fuse.md](coop-epi-fuse.md)) were killed. The `W:` source references point at the 0.4.1 beta checkout. The GPU-side kernel paths of that checkout cited below were developer-only and are not NPU configuration.
 
 Design only, 2026-10-03. No hardware, builds or tests were run for this document. Scope is dense 27B pp8192 on Halo (gfx1151); Flash-Next is out of scope.
 
@@ -34,9 +34,9 @@ NPU owns **whole output features** (weight rows), statically per GEMM, as a lead
 (All numbers are the measured Halo trace of `D27` §1 except the windows, which are the ESTIMATE optimum of §4.)
 
 **Epilogue details.**
-- **o_proj.** The existing GPU route already SETs a delta and records `residual_fold_pending` (`W:gemm.rs:20860-20985`, kill switch `HIPFIRE_V2B_ADDEPI=0`). The next RMSNorm lands `RN(x+delta)` (`W:gemv.rs:3448-3454`); any other reader flushes (`W:gemm.rs:21342-21367`). Eligibility is `W:prefill.rs:223-238`. An NPU window is just a column slice of the same delta buffer; the same flush covers it.
+- **o_proj.** The existing GPU route already SETs a delta and records `residual_fold_pending` (`W:gemm.rs:20860-20985`). The next RMSNorm lands `RN(x+delta)` (`W:gemv.rs:3448-3454`); any other reader flushes (`W:gemm.rs:21342-21367`). Eligibility is `W:prefill.rs:223-238`. An NPU window is just a column slice of the same delta buffer; the same flush covers it.
 - **down.** The existing ADD is `gemm_mq4g256v2_mmq_add_prequant_iu4` (`W:gemm.rs:21206`). The NPU part must not ADD in place. It writes its f32 delta; the GPU adds `RN(old+delta)` once, as one extra pass (model: 12 B per element).
-- **Z.** `HIPFIRE_V2B_ZBA_SCATTER=0` fallback, or `gemm_zba_v2b_scatter`, is hipcc-only (no PM entry, `W:gemm.rs:743-757`). The GPU part (rows `[n,6400)`) needs a **current-fold column-windowed entry**, preserving the β/α scatter and the 160-row discard; it must not use the killed GPU IEF15 fold.
+- **Z.** `gemm_zba_v2b_scatter` is hipcc-only (no PM entry, `W:gemm.rs:743-757`). The GPU part (rows `[n,6400)`) needs a **current-fold column-windowed entry**, preserving the β/α scatter and the 160-row discard; it must not use the killed GPU IEF15 fold.
 - **Current-contract partials fallback** (NPU int32 `C_e`, GPU folds) is a separate **write bound ~3.3 TOPS** (**MEASURED**, `D27` §4, w1 `logs/dense27b/w1-be0be55.log`). It is not part of IEF15, and there is **no claim of current-f32 parity for IEF**.
 
 **Current GPU range API gap.** Nothing in the tree accepts a feature window with a full output stride:

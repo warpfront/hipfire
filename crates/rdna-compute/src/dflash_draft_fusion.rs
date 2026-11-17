@@ -34,8 +34,8 @@ pub enum DraftCollapseGemm {
 ///
 /// Mirrors the gfx1100 production tier in
 /// [`Gpu::gemm_mq4g256v2_residual_wmma`]: non-replay, non-capture,
-/// `batch <= 16`, default ksplit policy (`HIPFIRE_RESIDUAL_KSPLIT_OFF` and
-/// default-on `HIPFIRE_RESIDUAL_LDSSTAGE` both veto). Anything else resolves to
+/// `batch <= 16`, default ksplit policy (default-on `HIPFIRE_RESIDUAL_LDSSTAGE`
+/// vetoes). Anything else resolves to
 /// [`Off`](DraftCollapseV2::Off) so the caller keeps today's path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DraftCollapseV2 {
@@ -129,7 +129,7 @@ impl Gpu {
         if has_awq {
             return DraftCollapseV2::Off;
         }
-        if self.flags.residual_ksplit_off || self.flags.residual_ldsstage {
+        if self.flags.residual_ldsstage {
             return DraftCollapseV2::Off;
         }
         match draft_collapse_ksplit_kw(k) {

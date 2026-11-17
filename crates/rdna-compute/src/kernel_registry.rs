@@ -1434,7 +1434,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::TOPK_LOGSUMEXP_BATCHED_SRC,
             ["topk_logsumexp_batched_f32"]
         );
-        // Qwen4 QSA split-KV decode for q8 K/V on exact gfx1151 and gfx1100 (same HIPFIRE_QWEN4_QSA_DECODE_SPLITK switch; KLD-gated; tensor_ops.rs qsa_decode_splitkv_q8_launch).
+        // Qwen4 QSA split-KV decode for q8 K/V on exact gfx1151 and gfx1100 (KLD-gated; tensor_ops.rs qsa_decode_splitkv_q8_launch).
         add!(
             "qsa_decode_splitkv_q8",
             kernels::QSA_DECODE_SPLITKV_Q8_SRC,
@@ -2371,7 +2371,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "qsa_pooled_f32_low_nonzero_count"
             ]
         );
-        // Exact-gfx1151 Qwen4 QSA split-K decode (default on (exact gfx1151; =0 kill switch) HIPFIRE_QWEN4_QSA_DECODE_SPLITK; KLD-gated; tensor_ops.rs qsa_decode_splitk_launch).
+        // Exact-gfx1151 Qwen4 QSA split-K decode (KLD-gated; tensor_ops.rs qsa_decode_splitk_launch).
         add!(
             "qsa_decode_splitk",
             kernels::QSA_DECODE_SPLITK_SRC,
@@ -2663,8 +2663,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_mq6g256v2_f32_rows_x4_split_r8_w4_s1",
             ]
         );
-        // Packed-epilogue MQ6 rows kernels (`HIPFIRE_QWEN4_MQ6_R8_PK`, exact
-        // gfx1201 only): same (W, S) exports as the `_split_` family above.
+        // Packed-epilogue MQ6 rows kernels (exact gfx1201 only): same (W, S)
+        // exports as the `_split_` family above.
         if arch == "gfx1201" {
             add!(
                 "gemm_mq6g256v2_f32_rows_pk",
@@ -3065,7 +3065,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
         // Fused router + scatter, one launch.
         if arch == "gfx1201" {
-            // Output-tiled Qwen4 decode BF16 rows GEMVs (HIPFIRE_QWEN4_BF16_ROWS_OTILE, default on).
+            // Output-tiled Qwen4 decode BF16 rows GEMVs.
             add!(
                 "qwen4_gemv_bf16_xf32_otile",
                 kernels::QWEN4_GEMV_BF16_XF32_OTILE_SRC,
@@ -3092,8 +3092,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 kernels::QWEN4_GEMV_BF16_XF32_LANE_ALLROWS_SRC,
                 ["gemv_bf16_xf32_k4_rows_lane_t8"]
             );
-            // `HIPFIRE_QWEN4_BF16_ALLROWS` (default on, `=0` kills it): the MoE call's router / shared
-            // GEMVs of 9..=64 rows in one launch.
+            // The MoE call's router / shared GEMVs of 9..=64 rows in one launch.
             add!(
                 "qwen4_gemv_bf16_xf32_allrows",
                 kernels::QWEN4_GEMV_BF16_XF32_ALLROWS_SRC,
@@ -12029,7 +12028,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // `HIPFIRE_QWEN4_BF16_ALLROWS` (default on, exact gfx1201): the all-rows BF16 router / shared GEMVs.
+        // Exact gfx1201: the all-rows BF16 router / shared GEMVs.
         const BF16_ALLROWS_ADDED_MODULES: [&str; 1] = ["qwen4_gemv_bf16_xf32_allrows"];
         for module in BF16_ALLROWS_ADDED_MODULES {
             assert!(
@@ -12085,7 +12084,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // `HIPFIRE_QWEN4_MQ6_R8_PK` (default on, exact gfx1201, 3..=8 rows): packed-epilogue MQ6 rows kernels.
+        // Exact gfx1201, 3..=8 rows: packed-epilogue MQ6 rows kernels.
         const MQ6_R8_PK_ADDED_MODULES: [&str; 1] = ["gemm_mq6g256v2_f32_rows_pk"];
         for module in MQ6_R8_PK_ADDED_MODULES {
             assert!(

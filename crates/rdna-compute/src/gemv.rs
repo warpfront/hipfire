@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 
-/// Lower row bound of the Qwen4 lane WMMA route (`HIPFIRE_QWEN4_LANE_WMMA`, [`Gpu::lane_wmma_applies`]); the upper
+/// Lower row bound of the Qwen4 lane WMMA route ([`Gpu::lane_wmma_applies`]); the upper
 /// bound is [`WIDE_VERIFY_MAX_ROWS`]. Measured on R9700 layer 4 cold: HC down/up and the dense BF16 rows beat the
 /// SIMT all-rows kernels from 16 rows; <= 8-row decode/verify keeps the bitwise SIMT path.
 // selector-receipt: receipts/selectors/qwen4_lane_wmma_min_rows.json
@@ -443,12 +443,6 @@ pub const Q8_0_FAST_ROWS_PER_BLOCK: usize = 8;
 /// Threads per block of `gemv_q8_0_fast_r*`.
 pub const Q8_0_FAST_THREADS: usize = Q8_0_FAST_ROWS_PER_BLOCK * 32;
 
-/// `HIPFIRE_Q8_GEMV_FAST` (developer, read once, default on): `0` keeps the one-wave-per-row
-/// narrow kernel for the row-exact multi-row route too. The two are bit-identical; the switch
-/// is a kill switch / A-B handle only (the decode `gemv_q8_0` never takes the fast kernel).
-static Q8_0_GEMV_FAST: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_Q8_GEMV_FAST", true));
-
 /// Whether `gemv_q8_0_fast_r*` serves a Q8_0 weight of in-dim `k` on `arch`: exact
 /// gfx1100 / gfx1201 (wave32), the narrow arm (`k` above the wide cutoff), an even
 /// block count per row (`k % 64 == 0`: every row start and every staged chunk 4-byte
@@ -830,12 +824,6 @@ fn gfx942_rotate_live_validation_enabled() -> bool {
 pub(crate) fn fp8_prod_inreg(k: usize) -> bool {
     k <= 17408
 }
-/// Phase-1a-batched fp8 SHORT RMSNorm: up to 8 row loads in flight per wave
-/// instead of one, same arithmetic order (bit-identical rms). Default on;
-/// `HIPFIRE_RMSNORM_P1A_BATCHED=0` selects the single-outstanding `_SEQ` twin.
-fn rmsnorm_p1a_batched() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_RMSNORM_P1A_BATCHED", true)
-}
 /// Opt-in gfx1100 AWQ RMSNorm wavegrid (`HIPFIRE_AWQ_NORM_WAVEGRID=1`),
 /// frozen per process. `Gpu` init also reads it to allocate the bounded-wait
 /// error block before any capture.
@@ -1214,8 +1202,8 @@ pub(crate) fn mq6_split_name(x4: bool, rows: usize, w: usize, s: usize) -> &'sta
     names!(3 4 5 6 7 8)
 }
 
-/// `(W, S)` of the packed-epilogue MQ6 kernels (`HIPFIRE_QWEN4_MQ6_R8_PK`,
-/// opt-in) for `rows` and total output rows `m_total`, or `None` to keep the
+/// `(W, S)` of the packed-epilogue MQ6 kernels (exact gfx1201) for `rows` and total output
+/// rows `m_total`, or `None` to keep the
 /// incumbent route: 3..=8 rows and trunk-sized shapes (`m_total <= 16384`: the
 /// GDN / QSA projections and out projections, never the LM head) only. The
 /// launch geometry is the incumbent's ([`mq6_rows_split_config`]), so the only
@@ -3792,9 +3780,8 @@ impl Gpu {
     /// gfx1100 IU4 RMSNorm producers run their `_b8` batched-Phase-1a twins
     /// (bit-identical; see `FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC`); gfx1151 runs
     /// the `_b8_gfx1151` one-pass-emit twins and the `_fold_b8` folds.
-    /// `HIPFIRE_RMSNORM_P1A_BATCHED=0` keeps the single-outstanding incumbents.
     fn gfx11_rmsnorm_p1a_b8(&self) -> bool {
-        (self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1151()) && rmsnorm_p1a_batched()
+        self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1151()
     }
 
     /// C2 IU4 producer: RMSNorm/FWHT + in-register `block_i4_128` sidecar.
@@ -3987,7 +3974,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<crate::scratch::Int4MmqPrepared> {
         self.ensure_mq_signs()?;
-        let b8 = self.arch_caps.is_gfx1151() && rmsnorm_p1a_batched();
+        let b8 = self.arch_caps.is_gfx1151();
         let (source, kernel) = match (awq.is_some(), b8) {
             (true, false) => (
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC,
@@ -4387,26 +4374,15 @@ impl Gpu {
         }
         let mut row_scale_shift = fp8_row_scale_shift()?;
         self.ensure_mq_signs()?;
-        let p1a = rmsnorm_p1a_batched();
         let (module, source, kernel) = match (awq, fp8_prod_inreg(k), k <= 6144) {
-            (Some(_), true, true) if p1a => (
+            (Some(_), true, true) => (
                 "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_INREG_SHORT_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12",
             ),
-            (Some(_), true, true) => (
-                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12_seq",
-                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_INREG_SHORT_SEQ_GFX12_SRC,
-                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12",
-            ),
-            (None, true, true) if p1a => (
+            (None, true, true) => (
                 "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_FP8_INREG_SHORT_GFX12_SRC,
-                "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12",
-            ),
-            (None, true, true) => (
-                "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12_seq",
-                kernels::FUSED_RMSNORM_MQ_ROTATE_FP8_INREG_SHORT_SEQ_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12",
             ),
             (Some(_), true, false) => (
@@ -12207,8 +12183,7 @@ impl Gpu {
     /// `y[row] += sigmoid(c_buf[0]) * acc`. Fail-closed to exact
     /// gfx1100|gfx1201, M=2048, K=512. 40-byte ABI (A/x/y/c_buf/M/K); block
     /// 32, LDS 0. gfx1201 runs two rows per wave (grid M/2, byte-exact with
-    /// the one-row kernel; `HIPFIRE_MQ4V2_K512_R2=0` keeps the one-row grid M
-    /// kernel for A/B); gfx1100 keeps the one-row kernel. Does not mutate
+    /// the one-row kernel); gfx1100 keeps the one-row kernel. Does not mutate
     /// `c_buf`.
     pub fn gemv_mq4g256v2_residual_sigmoid_scaled_k512(
         &mut self,
@@ -12219,8 +12194,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        let two_row = self.arch_caps.is_gfx1201()
-            && hipfire_config::developer_bool("HIPFIRE_MQ4V2_K512_R2", true);
+        let two_row = self.arch_caps.is_gfx1201();
         self.gemv_mq4g256v2_residual_sigmoid_scaled_k512_dispatch(a_raw, x, y, c_buf, m, k, two_row)
     }
 
@@ -19235,10 +19209,10 @@ impl Gpu {
     }
 
     /// Whether the narrow-arm row-exact multi-row group (K > 1536, `rows >= 2`) runs
-    /// `gemv_q8_0_fast_r*` here: exact gfx1100 / gfx1201 (wave32), `HIPFIRE_Q8_GEMV_FAST`
-    /// not `0`, and [`q8_0_fast_admits`] for the shape and operand alignment.
+    /// `gemv_q8_0_fast_r*` here: exact gfx1100 / gfx1201 (wave32) and
+    /// [`q8_0_fast_admits`] for the shape and operand alignment.
     pub(crate) fn q8_0_fast_narrow_ok(&self, k: usize, a_addr: usize, x_addr: usize) -> bool {
-        *Q8_0_GEMV_FAST && q8_0_fast_admits(&self.arch, k, a_addr, x_addr)
+        q8_0_fast_admits(&self.arch, k, a_addr, x_addr)
     }
 
     /// One `gemv_q8_0_fast_r<rows>` launch (`rows` in `2..=Q8_0_ROWS_EXACT_KERNELS`):
@@ -19777,7 +19751,7 @@ impl Gpu {
     /// `qwen4_gemv_bf16_xf32_otile`, [`BF16_K4_OTILE_ROWS_PER_BLOCK`] output rows per
     /// workgroup). Every output word is bitwise the incumbent
     /// `gemv_bf16_xf32_k4_rows_r<R>`'s. Needs `k % 32 == 0`. Taken by the incumbent
-    /// launcher when `HIPFIRE_QWEN4_BF16_ROWS_OTILE` is on (exact gfx1201).
+    /// launcher on exact gfx1201.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_bf16_xf32_k4_rows_otile(
         &mut self,
@@ -20112,7 +20086,7 @@ impl Gpu {
     }
 
     /// Whether a lane WMMA projection of `rows` activation rows is taken: the
-    /// `HIPFIRE_QWEN4_LANE_WMMA` flag (exact gfx1201) and [`LANE_WMMA_MIN_ROWS`]..=[`WIDE_VERIFY_MAX_ROWS`] rows. Pure; outputs are NOT bitwise the SIMT
+    /// gfx1201 lane WMMA gate and [`LANE_WMMA_MIN_ROWS`]..=[`WIDE_VERIFY_MAX_ROWS`] rows. Pure; outputs are NOT bitwise the SIMT
     /// route's (f32 summation order differs), but are deterministic. Refused inside the lane row-exact
     /// scope ([`Gpu::lane_row_exact_scope`]) and for a prefill call at or above the lowered prefill
     /// floor ([`Gpu::prefill_small_lane_rows`]), which takes the prefill entries instead.
@@ -20125,13 +20099,13 @@ impl Gpu {
 
     /// Whether a dense BF16 prefill GEMM of `rows` rows takes the lane WMMA kernel above
     /// [`WIDE_VERIFY_MAX_ROWS`] (or from the lowered prefill floor,
-    /// [`Gpu::qwen4_prefill_lwmma_floor`]; `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`, default on) while the route is
+    /// [`Gpu::qwen4_prefill_lwmma_floor`]) while the route is
     /// below the F16 WMMA prefill threshold ([`crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS`]). Not
     /// bitwise the SIMT route; deterministic; each row is bitwise the same across call sizes
     /// (pinned split-K). Refused in the lane row-exact scope and under the HC hold
     /// ([`Gpu::prefill_lwmma_dense_hold`]).
     pub fn prefill_lwmma_dense_applies(&self, rows: usize) -> bool {
-        self.flags.qwen4_prefill_lwmma_dense_enabled()
+        self.flags.qwen4_lane_wmma_enabled()
             && !self.lane_row_exact_scope
             && !self.prefill_lwmma_dense_hold
             && (rows > WIDE_VERIFY_MAX_ROWS || self.prefill_small_lane_rows(rows))
@@ -22686,7 +22660,7 @@ impl Gpu {
     }
 
     /// Body of [`Gpu::gemv_bf16_xf32_x4_rows`]; `otile` admits the output-tiled
-    /// entries (`HIPFIRE_QWEN4_BF16_ROWS_OTILE`) for 2..=[`FEW_ROW_ROUTE_ROWS`]
+    /// entries (exact gfx1201) for 2..=[`FEW_ROW_ROUTE_ROWS`]
     /// rows. The eight-row groups of a wider call pass `false`, so rows above
     /// eight stay on the incumbent route. `lane_wmma` admits the (non-bitwise) lane-WMMA and
     /// lab row-tile routes above eight rows; the `_exact` entry passes `false`.
@@ -22788,7 +22762,7 @@ impl Gpu {
     /// grid = the sum of the part row counts, with a load schedule that keeps more
     /// weight and activation loads in flight. Every output word is bitwise the
     /// incumbent `gemv_bf16_xf32_x4_rows_r<R>`'s. Needs `k % 8 == 0`. Taken by the
-    /// incumbent launcher when `HIPFIRE_QWEN4_BF16_ROWS_OTILE` is on (exact gfx1201).
+    /// incumbent launcher on exact gfx1201.
     pub fn gemv_bf16_xf32_x4_rows_otile(
         &mut self,
         parts: [(&GpuTensor, &GpuTensor, usize); 4],
@@ -22822,7 +22796,7 @@ impl Gpu {
     }
 
     /// Whether the MoE call's BF16 router / shared-expert GEMVs of `rows` activation rows take
-    /// the one-launch all-rows arm (`HIPFIRE_QWEN4_BF16_ALLROWS`, exact gfx1201): the flag and
+    /// the one-launch all-rows arm (exact gfx1201): the arch and
     /// more than [`FEW_ROW_ROUTE_ROWS`] and at most [`WIDE_VERIFY_MAX_ROWS`] rows. Pure; each
     /// output is bitwise the incumbent route's, so no scope or recording state changes it.
     pub fn bf16_allrows_applies(&self, rows: usize) -> bool {
@@ -22836,8 +22810,8 @@ impl Gpu {
     /// the sum of the parts' `ceil(m / TM)` output tiles, block = `ceil(rows / TN)` waves.
     /// Every weight is loaded once per output tile and applied to every row; each output word is
     /// bitwise the single-row `gemv_bf16_xf32` value (and so the incumbent row-group launches').
-    /// Any `k > 0`; no activation row past `rows` is read, no output past it written. Needs the
-    /// `HIPFIRE_QWEN4_BF16_ALLROWS` flag on gfx1201.
+    /// Any `k > 0`; no activation row past `rows` is read, no output past it written. Exact
+    /// gfx1201 only.
     pub fn gemv_bf16_xf32_x4_rows_allrows(
         &mut self,
         parts: [(&GpuTensor, &GpuTensor, usize); 4],
@@ -22862,9 +22836,7 @@ impl Gpu {
     ) -> HipResult<()> {
         let bad = |msg: &str| Err(hip_bridge::HipError::new(1, msg));
         if !self.flags.qwen4_bf16_allrows_enabled() {
-            return bad(
-                "gemv_bf16_xf32_x4_rows_allrows needs HIPFIRE_QWEN4_BF16_ALLROWS on gfx1201",
-            );
+            return bad("gemv_bf16_xf32_x4_rows_allrows needs exact gfx1201");
         }
         if !(1..=WIDE_VERIFY_MAX_ROWS).contains(&rows) || k == 0 || k > i32::MAX as usize {
             return bad("gemv_bf16_xf32_x4_rows_allrows needs 1..=64 rows and 0 < K <= i32::MAX");

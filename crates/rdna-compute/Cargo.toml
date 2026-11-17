@@ -79,10 +79,6 @@ name = "device_wait_deadline"
 required-features = ["lab"]
 
 [[example]]
-name = "otile_bf16_rows_oracle"
-required-features = ["lab"]
-
-[[example]]
 name = "bf16_allrows_oracle"
 required-features = ["lab"]
 
