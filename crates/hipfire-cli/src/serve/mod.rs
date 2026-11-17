@@ -2049,8 +2049,8 @@ pub(crate) fn serve_foreground(
     // Multi-slot prefill scratch rows, mirroring
     // `serve_engine::multi_slot_scratch_rows` (`multi_slot_scratch_rows`
     // below). The paged pool has one **total** row budget: a single slot may
-    // use the full `prefill_chunk`, and every slot's verify rows must fit (64
-    // is the VMM reserve-slack upper bound per speculative slot). The
+    // use the full `prefill_chunk`, and every slot's verify rows must fit
+    // (`MAX_VERIFY_ROWS_PER_SLOT`, the VMM reserve slack per speculative slot). The
     // fixed-slab pool keeps `slots x chunk`, so concurrent prompts keep
     // companion-independent chunk boundaries. The built-in
     // `serve.max_batch_tokens` default (4096) exceeds that for the documented
@@ -3016,9 +3016,10 @@ pub(crate) fn supervise_engine(shared: &ServeShared) -> Result<()> {
     Ok(())
 }
 
-/// Verify rows one speculative slot may inject in a step (the VMM
-/// reserve-slack upper bound), as in `serve_engine`.
-const MAX_VERIFY_ROWS_PER_SLOT: u64 = 64;
+/// Verify rows one speculative slot may inject in a step: the engine's VMM
+/// reserve slack (`VMM_RESERVE_SLACK_ROWS`), shared through
+/// `hipfire_runtime::slot_batch::SPEC_SLACK_ROWS_PER_SLOT`.
+const MAX_VERIFY_ROWS_PER_SLOT: u64 = hipfire_runtime::slot_batch::SPEC_SLACK_ROWS_PER_SLOT as u64;
 
 /// Multi-slot prefill scratch rows, the step's trunk-row ceiling; mirrors
 /// `serve_engine::multi_slot_scratch_rows`. Paged: one total budget,
@@ -3039,7 +3040,9 @@ pub(crate) fn multi_slot_scratch_rows(
 /// How [`multi_slot_scratch_rows`] was derived, for the clamp and refusal text.
 fn multi_slot_scratch_formula(prefill_chunk: u64, n_slots: u64, paged: bool) -> String {
     if paged {
-        format!("max(prefill_chunk {prefill_chunk}, 64 verify rows x {n_slots} slots), paged pool")
+        format!(
+            "max(prefill_chunk {prefill_chunk}, {MAX_VERIFY_ROWS_PER_SLOT} verify rows x {n_slots} slots), paged pool"
+        )
     } else {
         format!("{n_slots} slots x prefill_chunk {prefill_chunk}, fixed-slab pool")
     }

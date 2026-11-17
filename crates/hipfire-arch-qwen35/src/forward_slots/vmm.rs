@@ -134,8 +134,9 @@ const VMM_MAP_DEVICE_RESERVE_BYTES: usize = 512 << 20;
 
 /// Rows past `prompt + max_tokens` a lane may still write: the last
 /// speculative window (DFlash block, at most 63 rows; MTP `k + 1`) and the
-/// finish drain.
-pub const VMM_RESERVE_SLACK_ROWS: usize = 64;
+/// finish drain. Shared with the serve CLI through
+/// [`hipfire_runtime::slot_batch::SPEC_SLACK_ROWS_PER_SLOT`].
+pub const VMM_RESERVE_SLACK_ROWS: usize = hipfire_runtime::slot_batch::SPEC_SLACK_ROWS_PER_SLOT;
 
 /// Device bytes a VMM KV map can use: HIP's free figure plus the buffers the
 /// pool parks (a VMM map returns them to HIP before mapping,
