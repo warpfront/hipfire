@@ -981,18 +981,6 @@ pub trait Speculator {
         None
     }
 
-    /// Who decides speculate-vs-AR for this speculator's requests
-    /// ([`FloorControl`]). Default [`FloorControl::Unsupported`]: a speculator
-    /// with an AR step keeps the count-based [`crate::spec_retire`] policy.
-    fn floor_control(&mut self) -> FloorControl<'_> {
-        FloorControl::Unsupported
-    }
-
-    /// A new speculation epoch of the running request (the driver-owned
-    /// floor re-armed at a think-close): reset request-local width state
-    /// learned before it. Default no-op.
-    fn rearm_spec_epoch(&mut self) {}
-
     /// Repair a terminal that consumed only a strict prefix of the most recent
     /// speculative window. Implementations with a retained pre-window snapshot
     /// restore it and replay only the state-committable prefix, leaving the last
@@ -1026,17 +1014,6 @@ pub trait Speculator {
     /// Returns `Err` when any HIP free/memset that must succeed for a clean
     /// drafter fails so production rollback can attest `rolled_back:false`.
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String>;
-
-    /// Return to the drafter state of a fresh load after load-time work ran
-    /// windows through this speculator (the driver floor's calibration):
-    /// everything [`Self::reset`] clears plus the load-scoped state a later
-    /// request would otherwise inherit (learned window-kind prices, ring
-    /// cursors). The driver floor's snapshot stays. The target's KV /
-    /// recurrent state is the caller's, as for [`Self::reset`]. Default:
-    /// [`Self::reset`].
-    fn reset_to_load(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        self.reset(gpu)
-    }
 
     /// Rewind drafter-local GPU state for an intra-request strict-prefix
     /// realignment. Request-local policy and telemetry must survive. Stateless
@@ -1192,161 +1169,6 @@ pub trait Speculator {
     /// [`SpecRequestConfig::logprobs`]. Default `None`.
     fn token_logits(&self, _index: usize) -> Option<&[f32]> {
         None
-    }
-}
-
-/// Prefix of the driver-owned floor's exact call-log lines
-/// ([`crate::spec_economics::replay_call_log`]).
-pub const DRIVER_FLOOR_CALL_PREFIX: &str = "QWEN35_DFLASH_FLOOR_CALL";
-
-/// Where a load's frozen speculate-vs-AR prices came from (the `done`
-/// envelope's `floor.source`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FloorSnapshotSource {
-    /// Measured by the load-time calibration, before the load accepted a
-    /// request.
-    LoadCalibrated,
-    /// Read from the install's snapshot store
-    /// ([`crate::spec_floor_store`]): an earlier load with the same key
-    /// calibrated it.
-    Cache,
-}
-
-impl FloorSnapshotSource {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::LoadCalibrated => "load-calibrated",
-            Self::Cache => "cache",
-        }
-    }
-}
-
-/// Who decides, per window, whether a request speculates or runs an AR token.
-pub enum FloorControl<'a> {
-    /// No measured floor: a speculator with an AR step keeps the count-based
-    /// [`crate::spec_retire`] policy.
-    Unsupported,
-    /// The speculator decides inside its own step (Qwen4 native MTP's floor);
-    /// the driver arms no retire policy for it.
-    Producer,
-    /// The driver decides with this load-lifetime floor and price cache. The
-    /// speculator's [`SpecStep::proposed`] is the window's verified rows
-    /// (seed included), on the same scale as the `full_rows` its
-    /// [`DriverFloor`] was built with.
-    Driver(&'a mut DriverFloor),
-}
-
-/// The driver-owned floor of one speculator: allocated once at speculator
-/// build, lives for the load.
-#[derive(Clone, Debug)]
-pub struct DriverFloor {
-    pub floor: crate::spec_economics::FixedFloor,
-    /// Wall-time price cells: the load-time calibration's samples, then every
-    /// request's, for reports only (no request decides on them).
-    pub prices: crate::spec_prices::LoadPrices,
-    /// The load's frozen prices ([`Self::freeze_snapshot`]); `None` runs the
-    /// count line.
-    snapshot: Option<(crate::spec_prices::PinnedPrices, FloorSnapshotSource)>,
-    /// The stored entry the snapshot is tied to (read from it or written
-    /// from it): deleted once the live prices drift from the snapshot
-    /// ([`Self::retire_stale_snapshot`]).
-    persisted: Option<crate::spec_floor_store::PersistedSnapshot>,
-    /// Verified-row counts (bit `rows`, 0 = AR token, saturating at 127)
-    /// already observed on this load: see [`Self::first_use`].
-    warm_rows: u128,
-}
-
-impl DriverFloor {
-    /// A floor for a load whose full block verifies `full_rows` rows.
-    /// `call_log` writes the floor's exact call log
-    /// ([`DRIVER_FLOOR_CALL_PREFIX`]) on stderr.
-    pub fn new(full_rows: usize, call_log: bool) -> Self {
-        let floor = crate::spec_economics::FixedFloor::fixed();
-        Self {
-            floor: if call_log {
-                floor.with_call_log_enabled(DRIVER_FLOOR_CALL_PREFIX, "qwen35-dflash", true)
-            } else {
-                floor
-            },
-            prices: crate::spec_prices::LoadPrices::new(full_rows),
-            snapshot: None,
-            persisted: None,
-            warm_rows: 0,
-        }
-    }
-
-    /// Freeze the load's prices: every request on the load decides on
-    /// `prices`, in every context bucket. Once per load; a second call is
-    /// refused (returns `false`) and leaves the first snapshot in place.
-    pub fn freeze_snapshot(
-        &mut self,
-        prices: crate::spec_prices::PinnedPrices,
-        source: FloorSnapshotSource,
-    ) -> bool {
-        if self.snapshot.is_some() {
-            return false;
-        }
-        self.snapshot = Some((prices, source));
-        true
-    }
-
-    /// The load's frozen prices and their source.
-    pub fn snapshot(&self) -> Option<(crate::spec_prices::PinnedPrices, FloorSnapshotSource)> {
-        self.snapshot
-    }
-
-    /// Tie the snapshot to its stored entry.
-    pub fn persist_to(&mut self, persisted: crate::spec_floor_store::PersistedSnapshot) {
-        self.persisted = Some(persisted);
-    }
-
-    /// The stored entry the snapshot is tied to, until it is deleted.
-    pub fn persisted(&self) -> Option<&crate::spec_floor_store::PersistedSnapshot> {
-        self.persisted.as_ref()
-    }
-
-    /// At request end, never per token: when a full base-bucket cell of the
-    /// live prices drifts from the snapshot by more than
-    /// [`crate::spec_floor_store::SNAPSHOT_STALE_DRIFT`], delete the stored
-    /// entry and log it once. The load keeps deciding on its snapshot; the
-    /// next load with the key recalibrates. Returns the drift that deleted
-    /// it.
-    pub fn retire_stale_snapshot(&mut self) -> Option<f64> {
-        let (snapshot, _) = self.snapshot?;
-        self.persisted.as_ref()?;
-        let drift = crate::spec_floor_store::snapshot_drift(&snapshot, &self.prices)?;
-        if drift <= crate::spec_floor_store::SNAPSHOT_STALE_DRIFT {
-            return None;
-        }
-        let persisted = self.persisted.take()?;
-        let outcome = match persisted.store.remove(&persisted.key) {
-            Ok(true) => "deleted".to_owned(),
-            Ok(false) => "already gone".to_owned(),
-            Err(e) => format!("not deleted: {e}"),
-        };
-        eprintln!(
-            "[spec-floor] stored snapshot is stale: live prices drift {:.1}% from it (limit {:.0}%); entry {outcome} in {}; this load keeps it, the next load recalibrates",
-            drift * 100.0,
-            crate::spec_floor_store::SNAPSHOT_STALE_DRIFT * 100.0,
-            persisted.store.file().display()
-        );
-        Some(drift)
-    }
-
-    /// Empty the price cells (the load-time calibration's samples), keeping
-    /// the snapshot and the first-use marks.
-    pub fn clear_prices(&mut self) {
-        self.prices = crate::spec_prices::LoadPrices::new(self.prices.full_rows());
-    }
-
-    /// `true` the first time a window of `rows` verified rows (0: an AR
-    /// token) is observed on this load: it carries the width's or route's
-    /// first-use cost and is never recorded as a load price.
-    pub fn first_use(&mut self, rows: usize) -> bool {
-        let bit = 1u128 << rows.min(127);
-        let first = self.warm_rows & bit == 0;
-        self.warm_rows |= bit;
-        first
     }
 }
 
@@ -1933,13 +1755,6 @@ impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
 
     fn request_stats(&self) -> MtpRequestStats {
         self.arch.request_stats()
-    }
-
-    /// Native MTP decides speculate-vs-AR inside its own step: Qwen4's
-    /// measured floor (depth, copy and timing owner), or no AR step at all
-    /// (qwen35 MTP). The driver arms no retire policy for it.
-    fn floor_control(&mut self) -> FloorControl<'_> {
-        FloorControl::Producer
     }
 
     fn token_logits(&self, index: usize) -> Option<&[f32]> {

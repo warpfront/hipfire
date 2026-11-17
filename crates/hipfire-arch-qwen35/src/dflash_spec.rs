@@ -1450,15 +1450,10 @@ mod lookup {
     }
 
     impl LookupState {
-        /// The controller of a fresh load: default policy, no prices.
-        fn fresh_controller() -> LookupController {
-            LookupController::new(LookupPolicy::default(), true)
-        }
-
         fn new(ctx: MtpCopyContext, tail: bool, max_rows: usize) -> Self {
             Self {
                 ctx,
-                ctl: Self::fresh_controller(),
+                ctl: LookupController::new(LookupPolicy::default(), true),
                 tail,
                 max_rows,
                 prompt_len: 0,
@@ -1484,13 +1479,6 @@ mod lookup {
             self.prompt_len = 0;
             self.dirty = false;
             self.proposal.clear();
-        }
-
-        /// Forget the load-scoped window prices and acceptance tables (back
-        /// to the controller a fresh load builds), then end the request.
-        pub fn reset_to_load(&mut self) {
-            self.ctl = Self::fresh_controller();
-            self.end_request();
         }
 
         /// A rewind / terminal repair may have shrunk or rewritten `emitted`:
@@ -2268,9 +2256,6 @@ pub struct DflashSpeculator {
     /// `HIPFIRE_DFLASH_RAILGUN_WINDOW=1` was read at build: the unset path
     /// never constructs it, so it is the incumbent speculator exactly.
     railgun: Option<crate::dflash_railgun::RailgunWindowOwner>,
-    /// The driver-owned speculate-vs-AR floor and per-load price cache
-    /// (`Speculator::floor_control`): allocated here, lives for the load.
-    floor: hipfire_runtime::spec::DriverFloor,
 }
 
 /// Pre-window mark of the last completed window (terminal-prefix repair).
@@ -2288,17 +2273,8 @@ impl DflashSpeculator {
     /// `adaptive_b` is the already-resolved knob (load param AND env
     /// kill-switch AND the retained-PM4 gate folded by `build_dflash_speculator`)
     /// — likewise env-free and PM4-free here.
-    /// `floor_call_log` writes the driver floor's exact call log
-    /// (`HIPFIRE_DFLASH_FLOOR_CALL_LOG`, read by `build_dflash_speculator`).
-    pub fn new(
-        df: DflashState,
-        ck_interval: usize,
-        ck_cap: usize,
-        adaptive_b: bool,
-        floor_call_log: bool,
-    ) -> Self {
+    pub fn new(df: DflashState, ck_interval: usize, ck_cap: usize, adaptive_b: bool) -> Self {
         let adaptive = DflashAdaptiveBlock::new(df.block_size, adaptive_b);
-        let floor = hipfire_runtime::spec::DriverFloor::new(df.block_size, floor_call_log);
         Self {
             df: Some(df),
             vacant: None,
@@ -2325,15 +2301,7 @@ impl DflashSpeculator {
             trace_cyc: 0,
             lookup: None,
             railgun: None,
-            floor,
         }
-    }
-
-    /// The live singleton lane state, read-only (`None` while vacant): the
-    /// state digests of `hipfire-generate`'s `spec_floor_schedule_hw` gate.
-    #[doc(hidden)]
-    pub fn lane_state(&self) -> Option<&DflashState> {
-        self.df.as_ref()
     }
 
     /// Borrow the retained-PM4 verify route (report / phase inspection).
@@ -2627,22 +2595,6 @@ impl Speculator for DflashSpeculator {
 
     fn supports_ar_step(&self) -> bool {
         self.df.is_some()
-    }
-
-    /// The driver owns speculate-vs-AR while the singleton lane state is
-    /// present (a vacant speculator has no AR step).
-    fn floor_control(&mut self) -> hipfire_runtime::spec::FloorControl<'_> {
-        if self.df.is_some() {
-            hipfire_runtime::spec::FloorControl::Driver(&mut self.floor)
-        } else {
-            hipfire_runtime::spec::FloorControl::Unsupported
-        }
-    }
-
-    /// A floor re-arm (think-close) reopens the adaptive window at the full
-    /// block, so a width shrunk on the earlier text is not judged on the new.
-    fn rearm_spec_epoch(&mut self) {
-        self.adaptive.reset();
     }
 
     /// AR's single-token decode forward on the load's own executor (PM4 where
@@ -3065,23 +3017,6 @@ impl Speculator for DflashSpeculator {
         Ok(())
     }
 
-    /// [`Self::reset`] plus the load-scoped state a fresh load has not
-    /// built yet: the hidden-ring cursor, the lookup controller's prices and
-    /// acceptance tables, and the turn-boundary pin. (The sampling RNG is
-    /// re-seeded by every request's `set_sampling`.)
-    fn reset_to_load(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        self.reset(gpu)?;
-        if let Some(df) = self.df.as_mut() {
-            df.hidden_rb.reset();
-        }
-        if let Some(lk) = self.lookup.as_mut() {
-            lk.reset_to_load();
-        }
-        self.turn_boundary = None;
-        self.pinned_boundary = None;
-        Ok(())
-    }
-
     fn repair_terminal_prefix(
         &mut self,
         gpu: &mut Gpu,
@@ -3333,9 +3268,7 @@ pub fn build_dflash_speculator(df: DflashState, adaptive_b: bool) -> Box<dyn Spe
         );
     }
     let adaptive_b = adaptive_b && !pm4_replay;
-    let floor_call_log = hipfire_config::developer_var("HIPFIRE_DFLASH_FLOOR_CALL_LOG")
-        .is_ok_and(|value| value == "1");
-    let mut speculator = DflashSpeculator::new(df, ck_interval, ck_cap, adaptive_b, floor_call_log);
+    let mut speculator = DflashSpeculator::new(df, ck_interval, ck_cap, adaptive_b);
     speculator.configure_lookup(
         hipfire_config::dflash_lookup_enabled(),
         hipfire_config::dflash_lookup_tail_enabled(),

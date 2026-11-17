@@ -1132,9 +1132,6 @@ fn main() {
     // context is created.
 
     let mut stdout = std::io::stdout();
-    // The daemon build identity of the speculation-floor snapshot store
-    // (SPEC-AR-FLOOR S2a-5b), hashed off the load path from process start.
-    let daemon_md5 = hipfire_runtime::spec_floor_store::BinaryDigest::of_current_exe();
     let Some((process_config, pending_message, acknowledge_config, startup_model)) =
         receive_startup_config(&mut stdout).unwrap_or_else(|error| {
             eprintln!("FATAL: failed to resolve startup configuration: {error}");
@@ -2706,50 +2703,6 @@ fn main() {
                                 continue;
                             }
                         };
-                        // Speculation floor prices are fixed at load
-                        // (SPEC-AR-FLOOR S2a-5): a qwen35 DFlash load with a
-                        // driver-owned floor calibrates here, on its final
-                        // route and executors, before `loaded`; no request
-                        // ever calibrates. Only a failed reset after the
-                        // calibration (state unknown) fails the load.
-                        // A stored snapshot for the load's key (daemon
-                        // build, files, GPU, runtime, route, formats) is
-                        // used instead of calibrating; a store error is a
-                        // miss, never a load failure.
-                        let floor_home = hipfire_config::hipfire_home().ok();
-                        let floor_store = match (
-                            floor_home.as_deref(),
-                            daemon_md5.get(),
-                            draft_path.as_deref(),
-                        ) {
-                            (Some(home), Some(md5), Some(drafter)) => {
-                                Some(hipfire_generate::spec_floor_load::SpecFloorStoreCtx {
-                                    home,
-                                    daemon_md5: md5,
-                                    drafter: Path::new(drafter),
-                                })
-                            }
-                            _ => None,
-                        };
-                        if let Err(floor_err) =
-                            hipfire_generate::spec_floor_load::prepare_spec_floor(
-                                &mut m,
-                                &mut gpu,
-                                floor_store.as_ref(),
-                            )
-                        {
-                            let rollback_err = hipfire_loader::unload_model(m, &mut gpu).err();
-                            let mut msg = format!(
-                                "load failed: {floor_err}{}",
-                                no_model_loaded_suffix(model.is_some())
-                            );
-                            if let Some(rb) = rollback_err {
-                                msg.push_str(&format!("; model rollback also failed: {rb}"));
-                            }
-                            emit_uncorrelated_error(&mut stdout, None, &msg, "gpu", false, false);
-                            let _ = stdout.flush();
-                            continue;
-                        }
                         // FIX #1 (deferred model retirement, after staging):
                         // the new model is fully staged — NOW retire the
                         // prior model before publishing. Single-GPU/pp models

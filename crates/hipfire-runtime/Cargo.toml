@@ -114,8 +114,6 @@ minijinja = { workspace = true, features = ["loop_controls", "json", "preserve_o
 minijinja-contrib = { workspace = true, features = ["pycompat"] }
 tracing = "0.1"
 sha2.workspace = true
-# The daemon build identity in the speculation-floor snapshot key (`spec_floor_store`).
-md5 = "0.7"
 # Canonical host-side quant decoder: `weight_backend::dequantize_to_f32`
 # delegates the block-quantized formats to `hipfire_cpu::quant`, so there is one
 # decoder rather than a transcription. `hipfire-cpu` is a leaf (rayon only).
@@ -129,6 +127,7 @@ hipfire-cpu = { path = "../hipfire-cpu" }
 [dev-dependencies]
 # HF reference oracle only: pure-Rust regex, no runtime dependency or C++ trainer.
 tokenizers = { version = "=0.22.2", default-features = false, features = ["fancy-regex"] }
+md5 = "0.7"
 # SHA-256 of the decoded RGB buffer for the `imagedec` PIL-parity test.
 sha2.workspace = true
 # `tests/cpu_quant_cross_check.rs`: holds `hipfire-cpu`'s transcription of the

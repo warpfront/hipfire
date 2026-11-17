@@ -115,14 +115,8 @@ pub mod hc8_sidecar;
 pub mod ngram_mod;
 pub mod offload;
 pub mod spec_economics;
-/// Per-install store of the driver floor's load snapshots
-/// (`<HIPFIRE_HOME>/cache/spec-floor-prices.json`).
-pub mod spec_floor_store;
 pub mod spec_lookup;
 pub mod spec_ngram;
-/// Per-load, in-memory speculation prices (AR token and settled window by
-/// context bucket). Pure CPU.
-pub mod spec_prices;
 /// Per-request spec → AR retirement policy. Pure math, no GPU types.
 pub mod spec_retire;
 pub mod spec_sampling;

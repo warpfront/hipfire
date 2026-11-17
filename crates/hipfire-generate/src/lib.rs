@@ -47,10 +47,6 @@ pub mod ar;
 /// `generate_multi` alone is ~5,300 lines.
 pub mod qwen;
 
-/// The driver-owned speculate-vs-AR floor's load-time calibration
-/// (SPEC-AR-FLOOR S2a-5): prices fixed at load, never inside a request.
-pub mod spec_floor_load;
-
 /// DeepSeek-V4 plus the smaller dense and MoE architectures: LFM2.5,
 /// MiniMax-M2, Cohere2-MoE, Gemma4, Muse Glimmer, Qwen2, LLaMA.
 pub mod dense;

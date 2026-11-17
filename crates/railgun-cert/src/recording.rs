@@ -1973,42 +1973,8 @@ pub const DECISIONS: &[Decision] = &[
         evidence: "no admission, plan or launch reads capturing_graph: the route is admitted under hipGraph capture (one cached plan, a preflight that never grows scratch, fixed-pointer launches), so the token only changes the logged value",
         reaches: &[],
     },
-    Decision {
-        id: "dflash-floor-price-route-key",
-        predicates: &[ReplayState],
-        condition: "hipfire-generate qwen.rs spec_floor_route_key, once at the start of a speculative request and once at the load-time calibration (spec_floor_load.rs) on a driver-owned floor (qwen35 DFlash): `gpu.replay.state()` classed as Hip / Fallback / retained (any recording stage) plus `uses_pm4_transport()` forms the ArRouteKey of the load's in-memory AR price cells; a key change clears the AR cells and their pins",
-        effect: Oracle,
-        switches: "only which in-memory price cells the load's wall times land in (the load-time calibration's pin, then reports); the frozen snapshot every request decides on never changes; no launch, kernel or replay body depends on it",
-        kernels: &[],
-        verdict: Invariant,
-        evidence: "host bookkeeping read outside every forward; the AR token and the speculative window run the same executors whatever the key says, so recorded and eager programs are unaffected",
-        reaches: &[],
-    },
-    Decision {
-        id: "dflash-floor-first-use-marker",
-        predicates: &[ReplayState],
-        condition: "rdna-compute dispatch.rs Gpu::first_use_marker, read by hipfire-generate qwen.rs at every loop mark on a driver-owned floor and by spec_floor_load.rs at every step of the load-time calibration (qwen35 DFlash): `self.replay.state()` with the bound-kernel, replay-tape and graph-blob counts; a change across a window marks it cold, so it is never a price sample",
-        effect: Oracle,
-        switches: "only whether the speculate-vs-AR floor prices that window's wall time; no launch, kernel or replay body depends on it",
-        kernels: &[],
-        verdict: Invariant,
-        evidence: "host bookkeeping read between forwards; the next window and AR token run the same executors whatever the marker says, so recorded and eager programs are unaffected",
-        reaches: &[],
-    },
 ];
 pub const SITES: &[Site] = &[
-    Site {
-        file: "hipfire-generate/src/qwen.rs",
-        function: "spec_floor_route_key",
-        occurrences: 1,
-        decisions: &["dflash-floor-price-route-key"],
-    },
-    Site {
-        file: "rdna-compute/src/dispatch.rs",
-        function: "first_use_marker",
-        occurrences: 1,
-        decisions: &["dflash-floor-first-use-marker"],
-    },
     Site {
         file: "hipfire-arch-raon/src/bundle.rs",
         function: "resolve",

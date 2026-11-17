@@ -42,8 +42,11 @@ pub const LOOKUP_MAX_ROWS: usize = 16;
 /// Candidates of one window (rows minus the seed).
 pub const LOOKUP_MAX_CANDIDATES: usize = LOOKUP_MAX_ROWS - 1;
 
-use crate::spec_prices::{price_bucket, PriceCell, PRICE_BUCKETS};
-
+/// Samples kept per price cell (median of the last `PRICE_WINDOW`).
+const PRICE_WINDOW: usize = 8;
+/// Context buckets of the price book: `<=2K, <=8K, <=16K, <=32K, >32K` (the H0 trace buckets).
+pub const PRICE_BUCKET_EDGES: [usize; 4] = [2048, 8192, 16384, 32768];
+const PRICE_BUCKETS: usize = PRICE_BUCKET_EDGES.len() + 1;
 const PRICE_KINDS: usize = 3;
 const PRICE_ROWS: usize = LOOKUP_MAX_ROWS + 1;
 
@@ -368,9 +371,58 @@ pub fn choose_lookup(
     }
 }
 
-/// Measured full-window prices, one [`PriceCell`] per `(kind, rows, context bucket)`
-/// (`crate::spec_prices`). The first observation of each cell is discarded (first-bind /
-/// capture); the price is the median of the last kept observations. Fixed storage, load-scoped.
+#[derive(Clone, Copy, Debug)]
+struct PriceCell {
+    discarded_first: bool,
+    len: usize,
+    head: usize,
+    samples: [f64; PRICE_WINDOW],
+}
+
+impl PriceCell {
+    const EMPTY: Self = Self {
+        discarded_first: false,
+        len: 0,
+        head: 0,
+        samples: [0.0; PRICE_WINDOW],
+    };
+
+    fn observe(&mut self, us: f64) {
+        if !self.discarded_first {
+            // First observation of a cell carries first-bind / graph-capture cost.
+            self.discarded_first = true;
+            return;
+        }
+        self.samples[self.head] = us;
+        self.head = (self.head + 1) % PRICE_WINDOW;
+        self.len = (self.len + 1).min(PRICE_WINDOW);
+    }
+
+    fn median(&self) -> Option<f64> {
+        if self.len == 0 {
+            return None;
+        }
+        let mut sorted = self.samples;
+        let live = &mut sorted[..self.len];
+        live.sort_by(f64::total_cmp);
+        Some(if self.len % 2 == 1 {
+            live[self.len / 2]
+        } else {
+            (live[self.len / 2 - 1] + live[self.len / 2]) / 2.0
+        })
+    }
+}
+
+fn price_bucket(ctx: usize) -> usize {
+    PRICE_BUCKET_EDGES
+        .iter()
+        .position(|&edge| ctx <= edge)
+        .unwrap_or(PRICE_BUCKET_EDGES.len())
+}
+
+/// Measured full-window prices, one cell per `(kind, rows, context bucket)`. The first
+/// observation of each cell is discarded (first-bind / capture); the price is the median of the
+/// last `PRICE_WINDOW` kept observations. Fixed storage, load-scoped.
 #[derive(Clone, Debug)]
 pub struct LookupPriceBook {
     cells: [[[PriceCell; PRICE_BUCKETS]; PRICE_ROWS]; PRICE_KINDS],

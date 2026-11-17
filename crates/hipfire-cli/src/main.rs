@@ -816,10 +816,6 @@ pub(crate) struct BenchArgs {
     /// unchanged.
     #[arg(long = "min-tokens")]
     min_tokens: Option<usize>,
-    /// Send this wire `seed` on every standard-bench generate request
-    /// (warmups and measured runs). Absent sends no seed.
-    #[arg(long, value_name = "U64")]
-    seed: Option<u64>,
     /// Sweep closed-loop concurrency levels, e.g. `1,2,4,8`: at each level K,
     /// K client lanes drain the shape's N requests. Absent leaves bench on
     /// its single-stream path, unchanged.
@@ -6938,7 +6934,6 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         args.min_tokens.map_or(0, |tokens| tokens as u64),
         std::sync::atomic::Ordering::Relaxed,
     );
-    *BENCH_SEED.lock().unwrap_or_else(|e| e.into_inner()) = args.seed;
     if let Some(spec) = args.concurrency.clone() {
         return bench_concurrency_command(paths, &args, &spec);
     }
@@ -7044,33 +7039,14 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         let mut spec_tau: Vec<Option<f64>> = Vec::new();
         let mut spec_mtp: Vec<Option<serde_json::Value>> = Vec::new();
         let mut power_runs = Vec::new();
-        // Client-side timing: each run from request send to `done` received,
-        // as this process sees it, so work outside the daemon's own timers
-        // (a forward that finishes after `done`, a wait before the next
-        // request starts) is counted.
-        let mut client_wall_ms = Vec::new();
-        let mut client_send_ms = Vec::new();
-        let mut client_tokens = Vec::new();
-        let mut client_span: Option<(Instant, Instant)> = None;
         for _ in 0..args.runs {
             let sampler = power.start_run();
-            let request = bench_generate_request_reasoning(
+            let done = bench_generate_with_reasoning(
+                &mut engine,
                 &prompt,
                 args.standard_max_tokens() as u64,
                 args.reasoning_on,
-            );
-            let sent = Instant::now();
-            let done = engine.generate(&request, |_| Ok(()))?;
-            let received = Instant::now();
-            let first_sent = client_span.map_or(sent, |(first, _)| first);
-            client_span = Some((first_sent, received));
-            client_send_ms.push(duration_ms(sent - first_sent));
-            client_wall_ms.push(duration_ms(received - sent));
-            client_tokens.push(
-                done.get("tokens")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-            );
+            )?;
             power_runs.push(sampler.finish());
             if let Some(monitor) = spill.as_mut() {
                 if let Some(message) = monitor.check() {
@@ -7160,12 +7136,6 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 "spec_tau": spec_tau,
                 "spec_mtp": spec_mtp,
                 "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
-                "seed": args.seed,
-                "client_wall_ms": client_wall_ms,
-                "client_send_ms": client_send_ms,
-                "client_tokens": client_tokens,
-                "client_span_tok_s": client_span
-                    .and_then(|(first, last)| client_span_tok_s(&client_tokens, last - first)),
             }),
             &loaded,
         );
@@ -7177,12 +7147,6 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             print_sample_row("prefill", sample_stats(&prefill));
             print_sample_row("wall", sample_stats(&wall));
             print_sample_row("ttft ms", sample_stats(&ttft));
-            print_sample_row("client ms", sample_stats(&client_wall_ms));
-            if let Some((first, last)) = client_span {
-                if let Some(rate) = client_span_tok_s(&client_tokens, last - first) {
-                    println!("client span   {rate:.2} tok/s");
-                }
-            }
         }
         Ok(())
     }
@@ -7884,33 +7848,6 @@ fn bench_min_tokens_field(flag: u64, max_tokens: u64) -> Option<u64> {
     (flag > 0 && max_tokens > 1).then(|| flag.min(max_tokens))
 }
 
-/// `--seed` of the running bench, sent as the wire `seed` by every bench
-/// generate request; `None` sends none.
-static BENCH_SEED: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
-
-/// Milliseconds of `elapsed`, rounded to 0.01 ms.
-fn duration_ms(elapsed: Duration) -> f64 {
-    (elapsed.as_secs_f64() * 100_000.0).round() / 100.0
-}
-
-/// Generated tokens of the measured runs per second of client wall time,
-/// from the first measured send to the last `done`. `None` for an empty span.
-fn client_span_tok_s(tokens: &[u64], span: Duration) -> Option<f64> {
-    let secs = span.as_secs_f64();
-    (secs > 0.0).then(|| {
-        let rate = tokens.iter().sum::<u64>() as f64 / secs;
-        (rate * 100.0).round() / 100.0
-    })
-}
-
-/// Set the wire `seed` of a bench generate request; `None` leaves the
-/// request without one (the daemon then derives a per-request seed).
-fn apply_bench_seed(request: &mut serde_json::Value, seed: Option<u64>) {
-    if let Some(seed) = seed {
-        request["seed"] = serde_json::json!(seed);
-    }
-}
-
 fn bench_generate_request_reasoning(
     prompt: &str,
     max_tokens: u64,
@@ -7935,10 +7872,6 @@ fn bench_generate_request_reasoning(
     ) {
         request["min_tokens"] = serde_json::json!(min_tokens);
     }
-    apply_bench_seed(
-        &mut request,
-        *BENCH_SEED.lock().unwrap_or_else(|e| e.into_inner()),
-    );
     if !reasoning_on {
         request["max_think_tokens"] = serde_json::json!(1);
         request["assistant_prefix"] = serde_json::json!("closed_think");
@@ -8060,6 +7993,16 @@ fn bench_spec_warning(selector: Option<&str>, routes: &[Option<String>]) -> Opti
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
     Ok(engine.generate(&bench_generate_request(prompt, max_tokens), |_| Ok(()))?)
+}
+
+fn bench_generate_with_reasoning(
+    engine: &mut Engine,
+    prompt: &str,
+    max_tokens: u64,
+    reasoning_on: bool,
+) -> Result<serde_json::Value> {
+    let request = bench_generate_request_reasoning(prompt, max_tokens, reasoning_on);
+    Ok(engine.generate(&request, |_| Ok(()))?)
 }
 
 fn bench_probe(
@@ -8557,7 +8500,6 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             speculation: None,
             reasoning_on: false,
             min_tokens: None,
-            seed: None,
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
@@ -20011,7 +19953,6 @@ effort = "high"
             speculation: None,
             reasoning_on: false,
             min_tokens: None,
-            seed: None,
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
@@ -20057,32 +19998,6 @@ effort = "high"
         assert_eq!(bench_min_tokens_field(256, 1), None);
         // Unset: the standard request carries no `min_tokens` key at all.
         assert!(bench_generate_request("p", 128).get("min_tokens").is_none());
-    }
-
-    #[test]
-    fn bench_seed_flag_parses_and_sets_the_wire_seed() {
-        assert_eq!(parse_bench_args(&[]).seed, None);
-        assert_eq!(parse_bench_args(&["--seed", "7"]).seed, Some(7));
-        assert_eq!(
-            parse_bench_args(&["--seed", "18446744073709551615"]).seed,
-            Some(u64::MAX)
-        );
-        let mut request = serde_json::json!({ "type": "generate" });
-        apply_bench_seed(&mut request, None);
-        assert!(request.get("seed").is_none());
-        apply_bench_seed(&mut request, Some(7));
-        assert_eq!(request["seed"].as_u64(), Some(7));
-    }
-
-    #[test]
-    fn client_span_rate_is_measured_tokens_over_the_client_span() {
-        assert_eq!(
-            client_span_tok_s(&[128, 128, 64], Duration::from_millis(3200)),
-            Some(100.0)
-        );
-        assert_eq!(client_span_tok_s(&[128], Duration::ZERO), None);
-        assert_eq!(client_span_tok_s(&[], Duration::from_secs(1)), Some(0.0));
-        assert_eq!(duration_ms(Duration::from_micros(12_346)), 12.35);
     }
 
     #[test]
