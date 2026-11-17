@@ -275,16 +275,8 @@ pub(crate) fn qwen4_native_mtp_routed(
 ) -> Result<bool, String> {
     use hipfire_config::load_summary::{note, Facet};
     // Qwen4 is not a Qwen3.5-dense trunk: no dense-weights admission applies.
-    // The question is whether a native-MTP load would take the retained route.
     let retained = hipfire_runtime::config::retained_redline_default(
-        gpu_arch,
-        "qwen4",
-        route,
-        None,
-        pp,
-        tp,
-        ep,
-        hipfire_runtime::config::AttachedDraft::NativeMtp,
+        gpu_arch, "qwen4", route, None, pp, tp, ep, true,
     );
     let floor = hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR;
     let verdict = qwen4_native_mtp_for_floor(spec.mtp, retained, floor);

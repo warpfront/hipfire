@@ -185,12 +185,11 @@ gfx1151 has.
 `forward_scratch_layers` is the only single-GPU decode loop. The hand arms
 that served three cases are deleted, and each case now runs the step program:
 
-- **DFlash hidden capture** (the staged `forward_scratch` of a load with a
-  DFlash drafter, and the per-token prefill fallback row). A layer's hidden
-  row is written to its fixed staging row once the layer is final, which on
-  the deferred MoE combine (`moe_combine_next_rms_enabled`) is after the next
-  layer's fused combine + norm; the owner commits the rows to its ring after
-  the forward.
+- **DFlash hidden capture** (`forward_scratch_with_hidden`: the per-token
+  prefill fallback). A layer's hidden row is
+  written to the ring buffer once the layer is final, which on the deferred
+  MoE combine (`moe_combine_next_rms_enabled`) is after the next layer's fused
+  combine + norm.
 - **VL mrope**: `GatedAttentionOp::mrope` (`MropeRope`: the per-token
   `(t, h, w)` phases in `pos_buf3` and the section split) rotates with
   `rope_mrope_halfsplit_f32`; the fused FA prep and the folded KV write are
@@ -306,7 +305,7 @@ checked token by token against beta (`move-audit.diff`), not on hardware; the
 A3B native FP8 prefill A/B above covers the MoE attention too.
 
 Slice 4 (HIPF-120) adds: `dump_qwen35_hidden_states` (every layer's captured
-hidden row through `forward_scratch` with `ArHiddenStaging`) byte-compared against the
+hidden row through `forward_scratch_with_hidden`) byte-compared against the
 hand arms on 9B, 27B-xt and A3B, plus 16 4B formats in Loki's review; MTP
 battery tau per turn on dense 27B-xt, A3B and Ornith (also the Q8 27B
 sidecar, A3B KV q8/fwht2/fwht4/asym3 and the captured proposal graph); 9B and

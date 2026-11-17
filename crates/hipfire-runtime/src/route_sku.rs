@@ -580,14 +580,7 @@ mod tests {
                 let weights = dense_weights_at(&path);
                 assert_eq!(weights, Some(want), "{name}");
                 answers.push(crate::config::retained_redline_default(
-                    "gfx1100",
-                    "qwen3_5",
-                    None,
-                    weights,
-                    1,
-                    1,
-                    1,
-                    crate::config::AttachedDraft::None,
+                    "gfx1100", "qwen3_5", None, weights, 1, 1, 1, false,
                 ));
             }
             assert!(

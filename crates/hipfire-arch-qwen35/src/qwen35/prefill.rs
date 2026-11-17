@@ -13,7 +13,7 @@ use super::config::MaskEmbedOverride;
 use super::config::Qwen35Config;
 use super::forward::checked_kv_end;
 use super::forward::forward_scratch;
-use super::forward::forward_scratch_ring_row;
+use super::forward::forward_scratch_with_hidden;
 use super::forward::moe_ffn_has_mq3_experts_uniform;
 use super::forward::moe_ffn_has_mq3_structural;
 use super::forward::moe_ffn_has_unsupported_mq3_experts_uniform;
@@ -3799,16 +3799,14 @@ fn forward_prefill_batch_with_pbs_opts_inner(
              weights, dn_state quant != Q8, or HIPFIRE_PREFILL_BATCHED=0).",
         );
         // Fallback: per-token loop, byte-identical to decode. If hidden
-        // extraction is requested, each row stages its extraction-layer rows
-        // in the ring's own fixed-offset staging and commits them (head + 1);
-        // that row is never the plain-AR body, so its retained eligibility is
-        // cleared before the first launch (`forward_scratch_ring_row`).
+        // extraction is requested, use the with_hidden variant so the ring
+        // buffer still gets populated correctly (each call advances head by 1).
         // When per-token hidden output is also requested, extract post-norm
         // hidden row-by-row into the caller's buffer.
         let dim = config.dim;
         for (i, &tok) in tokens.iter().enumerate() {
             if let Some(rb) = hidden_rb.as_mut() {
-                forward_scratch_ring_row(
+                forward_scratch_with_hidden(
                     gpu,
                     weights,
                     config,
@@ -3819,7 +3817,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     scratch,
                     rb,
                 )?;
-                rb.commit_staging_to_ring(gpu, 1)?;
             } else {
                 // One-shot: mark this forward AR-graph-eligible iff it's plain
                 // single-token decode (consumed inside forward_scratch).
@@ -3836,8 +3833,8 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 )?;
             }
             if let Some(dst) = per_token_hidden_out {
-                // scratch.tmp holds post-output-norm hidden after every
-                // single-token forward — it's the same buffer
+                // scratch.tmp holds post-output-norm hidden after
+                // forward_scratch_{with_hidden,layers} — it's the same buffer
                 // lm_head reads from. Copy into the caller's output.
                 gpu.hip
                     .memcpy_dtod_at(&dst.buf, i * dim * 4, &scratch.tmp.buf, 0, dim * 4)?;

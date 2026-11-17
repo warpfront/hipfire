@@ -2,8 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Dump per-layer hidden states from `qwen35::forward_scratch` (the staged
-//! AR variant: every layer an extraction layer)
+//! Dump per-layer hidden states from `qwen35::forward_scratch_with_hidden`
 //! for offline comparison against an HF transformers oracle.
 //!
 //! Used by the engine-drift-floor investigation tooling — see
@@ -11,7 +10,7 @@
 //! methodology and the matching HF oracle script + comparator.
 //!
 //! Reads chunk-N tokens from a hipfire-β kldref so the input matches the
-//! eval pipeline byte-for-byte, runs `forward_scratch` per
+//! eval pipeline byte-for-byte, runs `forward_scratch_with_hidden` per
 //! position with ALL layers configured as extraction targets, and writes a
 //! single HFHS binary containing post-layer hidden states for every layer +
 //! every position.
@@ -19,8 +18,7 @@
 //! Reuses the existing `HiddenStateRingBuffer` from spec-decode infra
 //! (which already supports per-layer extraction at arbitrary indices) —
 //! this example just overrides `extract_layers` to span the full layer
-//! range, installs the scratch's AR hidden staging for the same layers and
-//! commits each forward's staged rows to the ring.
+//! range.
 //!
 //! Output format mirrors `scripts/dump_hf_hidden_states.py`:
 //!   magic 8B = b"HFHS\0\0\0\0"
@@ -178,7 +176,7 @@ fn main() {
         .expect("kv cache fp32"),
         other => panic!("unknown --kv-mode: {other}"),
     };
-    let mut scratch = Qwen35Scratch::new(&mut gpu, &config, 64).expect("scratch");
+    let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).expect("scratch");
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn state");
 
     // -------- HiddenStateRingBuffer, overriding extract_layers to all layers --------
@@ -201,16 +199,11 @@ fn main() {
             as f64
             / (1024.0 * 1024.0)
     );
-    scratch
-        .install_ar_hidden_staging(&mut gpu, &hidden_rb.extract_layers, config.dim)
-        .expect("AR hidden staging");
-    let scratch = scratch;
-    let staging = scratch.ar_hidden_staging().expect("AR hidden staging");
 
-    // -------- per-token forward, head advances per committed row --------
+    // -------- per-token forward, head advances per call --------
     let t0 = std::time::Instant::now();
     for (pos, &tok) in tokens.iter().enumerate() {
-        qwen35::forward_scratch(
+        qwen35::forward_scratch_with_hidden(
             &mut gpu,
             &weights,
             &config,
@@ -219,11 +212,9 @@ fn main() {
             &mut kv_cache,
             &mut dn_state,
             &scratch,
+            &mut hidden_rb,
         )
-        .expect("forward_scratch");
-        staging
-            .commit_to_ring(&mut gpu, &mut hidden_rb)
-            .expect("commit staged hidden rows");
+        .expect("forward_scratch_with_hidden");
         if pos == 0 || (pos + 1) % 256 == 0 {
             eprintln!(
                 "  pos {:4}/{}: {:.1}s elapsed",

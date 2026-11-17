@@ -2475,17 +2475,7 @@ fn main() {
                         // stage of the new model so a staging failure rolls
                         // back only `m` and keeps the prior usable.
                         let arch = hipfire_loader::arch_label(m.arch_id);
-                        // A DFlash load that stages the continuous-batching
-                        // speculative lanes keeps the HIP route: their gfx1201
-                        // save-free verify refuses under an enabled retained
-                        // controller (`AttachedDraft::from_speculator`).
-                        let batched_spec_lanes = parsed_continuous_batch_size > 1
-                            && parsed_vmm_batch.is_some_and(|params| params.spec);
                         let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
-                        let attached = hipfire_runtime::config::AttachedDraft::from_speculator(
-                            drafter,
-                            batched_spec_lanes,
-                        );
                         let redline_default = hipfire_runtime::config::retained_redline_default(
                             &gpu.arch,
                             arch,
@@ -2493,26 +2483,17 @@ fn main() {
                             dense_weights,
                             pp,
                             tp, hipfire_loader::admission::effective_ep(m.arch_id),
-                            attached,
+                            drafter.is_some(),
                         ) && hipfire_config::devices::redline_platform_refusal().map_or(true, |refusal| {
                             eprintln!("[redline] retained default refused: {refusal}; using the HIP graph");
                             false
                         });
-                        if drafter == Some("dflash")
-                            && attached != hipfire_runtime::config::AttachedDraft::Dflash
-                            && !redline_default
-                        {
-                            eprintln!(
-                                "[redline] DFlash continuous-batching lanes requested: the retained \
-                                 default is withheld for this load (save-free verify keeps HIP)"
-                            );
-                        }
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
                                 "[redline] enabling fail-closed retained default on {} \
                                  (model_arch={arch}, drafter={}, transport={})",
                                 gpu.arch,
-                                attached.label(),
+                                drafter.unwrap_or("off"),
                                 gpu.replay.transport_name()
                             );
                         }

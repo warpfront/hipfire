@@ -779,7 +779,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "replay-recorder-lifecycle",
         predicates: &[IsRecording, ReplayState],
-        condition: "`should_auto_finalize_capture` (replay.rs:4586-4588) in qwen35 forward_scratch_staged (forward.rs; the one single-token body behind forward_scratch and forward_scratch_ring_row, so the AR hidden-staging variant of a DFlash load finalizes the same one-shot capture), deepseek4 decode_step_with_graph (forward.rs:3642), lfm2moe decode_step_with_retained_replay (state checks, forward.rs:106-170); gemma4 `graph_exact` keeps its AR HipGraph off while `is_recording()` (forward.rs)",
+        condition: "`should_auto_finalize_capture` (replay.rs:4586-4588) in qwen35 forward_scratch (forward.rs:1831), deepseek4 decode_step_with_graph (forward.rs:3642), lfm2moe decode_step_with_retained_replay (state checks, forward.rs:106-170); gemma4 `graph_exact` keeps its AR HipGraph off while `is_recording()` (forward.rs)",
         effect: Lifecycle,
         switches: "finish the one-shot capture after the recorded forward",
         kernels: &[],
@@ -1181,12 +1181,12 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "replay-enabled-process-route",
         predicates: &[ReplayEnabled],
-        condition: "process-level `replay.is_enabled()`: qwen35 AR HipGraph off (forward.rs forward_scratch_staged, both AR hidden-staging variants), DS4 retained FFN split tape (forward.rs:4402-4417) and eligibility (3487-3500), lfm2moe eligibility (forward.rs:57)",
+        condition: "process-level `replay.is_enabled()`: qwen35 AR HipGraph off (forward.rs:1712-1716), DS4 retained FFN split tape (forward.rs:4402-4417) and eligibility (3487-3500), lfm2moe eligibility (forward.rs:57)",
         effect: ProcessRoute,
         switches: "Redline process: split-FFN tape body, no AR HipGraph; HIP process: ffn_stub + routed FFN, AR HipGraph",
         kernels: &[],
         verdict: Invariant,
-        evidence: "fixed by the backend request for the whole process, so the eager and recorded forward of one process agree. Arm-3 condition: a railgun process must present the same `is_enabled()` as the pre-railgun default (true for H2/MQ4R/DS4 Redline defaults, and for a gfx1100/gfx1201 Qwen3.5-dense load with a DFlash drafter since SPEC-AR-FLOOR S1, whose admission is typed by `AttachedDraft`)",
+        evidence: "fixed by the backend request for the whole process, so the eager and recorded forward of one process agree. Arm-3 condition: a railgun process must present the same `is_enabled()` as the pre-railgun default (true for H2/MQ4R/DS4 Redline defaults)",
         reaches: &[],
     },
     Decision {
@@ -1711,17 +1711,6 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
-        id: "qwen35-ar-hidden-staging-route-identity",
-        predicates: &[IsRecording],
-        condition: "hipfire-arch-qwen35 forward_scratch_staged (qwen35/forward.rs): on a load with a DFlash drafter the scratch's ArHiddenStaging (fixed at load) is the forward's variant; while `gpu.replay.is_recording()` the tape latches its identity (extraction layers, row width, row bases) as route identity AR_HIDDEN_STAGING_ROUTE_KEY, and a prepared PM4/AQL route whose latched identity differs from the live variant (None on a plain load) is poisoned before any retained submit",
-        effect: Lifecycle,
-        switches: "latch the variant identity (recording) vs retained replay or HIP fallback for one AR forward; selects no kernel",
-        kernels: &[],
-        verdict: Invariant,
-        evidence: "the identity is a host string built once at install; noting it launches nothing, and the refusal branch poisons before the replay branch so the forward runs the HIP body with the same kernels. The variant never changes after load (install_ar_hidden_staging refuses a second install), so on a served load the refusal is unreachable",
-        reaches: &[],
-    },
-    Decision {
         id: "qwen4-gdn-slot-retained-identity",
         predicates: &[ReplayEnabled, IsRecording],
         condition: "hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): with a replay backend enabled (`gpu.replay.is_enabled()`) the forward reads the live GDN recurrent ring slot; a recording tape latches it as route identity QWEN4_GDN_SLOT_IDENTITY_KEY (only while `is_recording()`), and a plain-AR forward whose live slot differs from the latched one is not retained-eligible and runs on HIP (MTP verify windows move the slot via set_gdn_live; HIPF-294)",
@@ -1829,16 +1818,13 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "dflash-hidden-staging-recorded-copy",
         predicates: &[IsRecording],
-        condition: "write_staging_rows (speculative.rs), the one fixed-offset staging write behind HiddenStateRingBuffer::write_rows_to_staging (verify, prompt seed, per-token prefill fallback rows) and HiddenStage::write_layer (forward_scratch's ArHiddenStaging rows on a load with a DFlash drafter), uses copy_f32_buffer when is_recording(), otherwise native D2D memcpy (async on the active stream under HipGraph capture)",
+        condition: "HiddenStateRingBuffer::write_rows_to_staging uses copy_f32_buffer when is_recording(), otherwise native D2D memcpy (speculative.rs:3471-3485)",
         effect: KernelSelection,
-        switches: "recorded: one typed copy_f32_buffer launch per extraction layer, grid ceil(n * hidden_dim / 256), block 256 (n = 1 row per layer in the attached plain-AR tape); eager/HipGraph: D2D memcpy of the same n * hidden_dim * 4 bytes at offset zero",
+        switches: "recorded: one typed copy_f32_buffer launch per extraction layer, grid ceil(n * hidden_dim / 256), block 256; eager/HipGraph: D2D memcpy of the same n * hidden_dim * 4 bytes at offset zero",
         kernels: &["copy_f32_buffer"],
         verdict: ByteExact,
         evidence: "copy-only assignment dst[i] = src[i], bounded by n, with no arithmetic (kernels/src/copy_f32_buffer.hip:7-12); dispatch.rs:6773-6807 records the same source/destination pointers and element count through the blob funnel",
-        reaches: &[
-            reach(DflashGfx1201, "verify hidden extraction into each fixed staging buffer before ring commit", "g0; arm3"),
-            reach(H2Gfx1201, "plain-AR and spec-retired AR forwards of a load with a DFlash drafter: each extraction layer's row into the load's ArHiddenStaging, committed to the drafter's ring outside the tape", "g0; arm3"),
-        ],
+        reaches: &[reach(DflashGfx1201, "verify hidden extraction into each fixed staging buffer before ring commit", "g0; arm3")],
     },
     Decision {
         id: "qwen4-mesh-refuses-retained-replay",
@@ -2210,13 +2196,9 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
-        function: "forward_scratch_staged",
-        occurrences: 3,
-        decisions: &[
-            "replay-enabled-process-route",
-            "replay-recorder-lifecycle",
-            "qwen35-ar-hidden-staging-route-identity",
-        ],
+        function: "forward_scratch",
+        occurrences: 2,
+        decisions: &["replay-enabled-process-route", "replay-recorder-lifecycle"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
@@ -2400,7 +2382,7 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/speculative.rs",
-        function: "write_staging_rows",
+        function: "write_rows_to_staging",
         occurrences: 1,
         decisions: &["dflash-hidden-staging-recorded-copy"],
     },
