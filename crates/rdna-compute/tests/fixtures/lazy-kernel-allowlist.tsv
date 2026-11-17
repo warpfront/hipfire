@@ -255,8 +255,8 @@ module	fused_qkvza_mq4g256_lloyd_rdna3	codec-outside-core-rungs	Dense MQ4G256Llo
 module	fused_qkvza_mq4g256v2_lloyd	codec-outside-core-rungs	MQ4G256V2Lloyd/MQ4 route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:39552
 module	fused_qkvza_mq4g256v2_lloyd_hoist_x32_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_LLOYD_MMQ_A4 (exact gfx1100 twin TU); rdna-compute/src/gemm.rs:43318-43324
 module	fused_qkvza_mq5g256v2	codec-outside-core-rungs	MQ5G256V2 route absent from admitted core artifact rungs; hipfire-dispatch/src/families/fused_qkv.rs:696
-module	fused_rmsnorm_mq_rotate_awq_i4	non-target-arch	Only arches other than gfx1100/gfx1151 reach the non-b8 IU4 RMSNorm producer; rdna-compute/src/gemv.rs:3863
-module	fused_rmsnorm_mq_rotate_awq_i4_fold	non-target-arch	ADD-epilogue fold producer: only the gfx1151 V2B tile leaves a residual add owed (gemm.rs:20512-20517), and gfx1151 takes the b8 fold entry, so no target arch reaches the non-b8 one; rdna-compute/src/gemv.rs:3996
+module	fused_rmsnorm_mq_rotate_awq_i4	unreachable-branch	Unreachable launcher branch: the only production caller (try_iu4_rmsnorm_prepared, batched.rs:377) is gated by iu4_producer_sidecar_enabled (exact gfx1100/gfx1151), and both take the b8 entry; only the gdn_canonical_producer_oracle example reaches it; rdna-compute/src/gemv.rs:3863
+module	fused_rmsnorm_mq_rotate_awq_i4_fold	unreachable-branch	Unreachable launcher branch: only the gfx1151 V2B tile leaves a residual add owed (gemm.rs:20512-20517), and gfx1151 takes the b8 fold entry; rdna-compute/src/gemv.rs:3996
 module	fused_rmsnorm_mq_rotate_awq_i4_gfx12	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:4073-4087
 module	fused_rmsnorm_mq_rotate_awq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:6839
 module	fused_rmsnorm_mq_rotate_awq_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:6831
@@ -264,8 +264,8 @@ module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default 
 module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_awq_wavegrid	developer-opt-in	Non-default developer override: HIPFIRE_AWQ_NORM_WAVEGRID; rdna-compute/src/gemv.rs:3047-3054
-module	fused_rmsnorm_mq_rotate_i4	non-target-arch	Only arches other than gfx1100/gfx1151 reach the non-b8 IU4 RMSNorm producer; rdna-compute/src/gemv.rs:3863
-module	fused_rmsnorm_mq_rotate_i4_fold	non-target-arch	ADD-epilogue fold producer: only the gfx1151 V2B tile leaves a residual add owed (gemm.rs:20512-20517), and gfx1151 takes the b8 fold entry, so no target arch reaches the non-b8 one; rdna-compute/src/gemv.rs:3996
+module	fused_rmsnorm_mq_rotate_i4	unreachable-branch	Unreachable launcher branch: the only production caller (try_iu4_rmsnorm_prepared, batched.rs:377) is gated by iu4_producer_sidecar_enabled (exact gfx1100/gfx1151), and both take the b8 entry; only the gdn_canonical_producer_oracle example reaches it; rdna-compute/src/gemv.rs:3863
+module	fused_rmsnorm_mq_rotate_i4_fold	unreachable-branch	Unreachable launcher branch: only the gfx1151 V2B tile leaves a residual add owed (gemm.rs:20512-20517), and gfx1151 takes the b8 fold entry; rdna-compute/src/gemv.rs:3996
 module	fused_rmsnorm_mq_rotate_i4_gfx12	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:4073-4087
 module	fused_rmsnorm_mq_rotate_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:6843
 module	fused_rmsnorm_mq_rotate_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:6835
@@ -528,7 +528,7 @@ module	gemm_mq4g256v2_residual_wmma_fp8_v2_b64x256_gfx1201_symfold	config-opt-in
 module	gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201_symfold	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds	developer-opt-in	Non-default developer override: HIPFIRE_RESIDUAL_LDSSTAGE; rdna-compute/src/gemm.rs:38593-38607
-module	gemm_mq4g256v2p_moe_grouped_top10_g32	developer-opt-in	Planar layout exists only on multi-GPU EP loads (gpu_forward.rs:12833) and there the default takes the embedded PM twin (nodz and HIPFIRE_QWEN4_MOE_GU_C8_PM default on, gemm.rs:51437-51441); hipcc compile needs HIPFIRE_QWEN4_MOE_GU_C8_PM=0 (gemm.rs:236) or HIPFIRE_QWEN4_MOE_DEAD_STORES=1 (dispatch.rs:3226), or the moe_gu_c8_pm_oracle example; rdna-compute/src/gemm.rs:51576
+module	gemm_mq4g256v2p_moe_grouped_top10_g32	developer-opt-in	Planar layout exists only on multi-GPU EP loads (gpu_forward.rs:12833) and there the default takes the embedded PM twin (nodz); hipcc compile needs HIPFIRE_QWEN4_MOE_DEAD_STORES=1 (dispatch.rs:3226), or the moe_gu_c8_pm_oracle example; rdna-compute/src/gemm.rs:51576
 module	gemm_mq4g256v2_residual_wmma_gfx11_bt_lloyd	developer-opt-in	Non-default Lloyd (qt52) weights, N<64 BT route (HIPFIRE_LLOYD_F16_GFX11); rdna-compute/src/gemm.rs:42161
 module	gemm_mq4v2_packed_gfx1100	developer-opt-in	Non-default developer override: HIPFIRE_GFX1100_PACKED_MQ4_PREFILL; rdna-compute/src/packed_mq4.rs:4
 module	gemm_mq5g256v2_residual_wmma	codec-outside-core-rungs	Non-slab MQ5G256V2 layout absent from core XTS artifact rungs; rdna-compute/src/gemm.rs:41418-42059
@@ -1196,7 +1196,6 @@ dynamic	crates/rdna-compute/src/gemm.rs::launch_qkvza_hfq3_mmq_tile	dynamic-lazy
 dynamic	crates/rdna-compute/src/gemm.rs::launch_qkvza_hfq4_mmq_tile	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/gemm.rs:9252
 dynamic	crates/rdna-compute/src/gemm.rs::moe_scatter_stable_top10_with	dynamic-enumerated	Forwarded finite variants are enumerated by kernel_registry::entries and checked at scanned callers; rdna-compute/src/gemm.rs:48943
 dynamic	crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_check	dynamic-enumerated	Beta MoeSymIu4Kernel checker factory returns a finite per-arch descriptor, not a synthesized name; function-pointer invocation is unresolved by the scanner; gemm.rs:49323-49326,50261-50262.
-dynamic	crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm	dynamic-enumerated	Beta MoeSymIu4Kernel hipcc_twin is the finite gfx1151 same-binary control descriptor; scanner cannot resolve the selected optional twin field; gemm.rs:49286-49293,51530-51532.
 dynamic	crates/rdna-compute/src/gemm_vt.rs::launch_gemm_vt	dynamic-enumerated	Forwarded finite variants are enumerated by kernel_registry::entries and checked at scanned callers; rdna-compute/src/gemm_vt.rs:222
 dynamic	crates/rdna-compute/src/gemv.rs::gemm_lowbit_prefill	dynamic-lazy	Forwards a caller module; static callers are checked separately. Non-core, config and codec variants retain explicit module exceptions; rdna-compute/src/gemv.rs:9878
 dynamic	crates/rdna-compute/src/gemv.rs::gemv_hfq4g256_residual_mq4v2	dynamic-enumerated	Arch/codec/tile-name composition; current default variants are enumerated by kernel_registry::entries; gemv.rs:11609-11619

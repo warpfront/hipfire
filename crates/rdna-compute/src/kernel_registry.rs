@@ -3787,9 +3787,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         ));
         // Flash-Next default route on exact gfx1201, loaded after ready on a cold
         // kernel cache (one-shot `hipfire run`, R9700, 2026-11-14): the lane WMMA
-        // GEMMs (`lane_wmma.rs`, HIPFIRE_QWEN4_LANE_WMMA default on) and their
-        // tuned prefill tiles (`lane_wmma_tile.rs`, HIPFIRE_QWEN4_PREFILL_LWMMA_TILE
-        // default on) of 16..511-row prefill/verify, and the MQ6 symmetric-grid
+        // GEMMs (`lane_wmma.rs`) and their tuned prefill tiles (`lane_wmma_tile.rs`)
+        // of 16..511-row prefill/verify, and the MQ6 symmetric-grid
         // check the A8 trunk runs at load (`Gpu::qwen4_mq6_sym_check`).
         entries.push(entry(
             arch,

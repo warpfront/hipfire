@@ -6653,8 +6653,7 @@ pub(crate) fn expert_iu4_load_decision(
 const EXPERT_IU4_ARTIFACT_CLASS: &str =
     "symmetric qt44 gate_up + qt53 down routed experts (MQ4G256V2 + MQ4G128V2)";
 const EXPERT_IU4_REMEDY: &str = "run on a GPU with the symmetric IU4 MoE route (gfx1100, \
-    gfx1151 or gfx1201; on gfx1151 unset HIPFIRE_QWEN4_MOE_SYM_PM=0, which deselects the native \
-    image the route needs), use the qt44 (mq4r/mq4rs) artifact, or set HIPFIRE_MOE_SYM_IU4=0 to \
+    gfx1151 or gfx1201), use the qt44 (mq4r/mq4rs) artifact, or set HIPFIRE_MOE_SYM_IU4=0 to \
     explicitly accept the much slower qt53 F32 prefill fallback";
 
 /// `DispatchError::UnsupportedVariant::arch` is `&'static str`; map the arches
