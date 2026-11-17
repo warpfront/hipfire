@@ -351,10 +351,12 @@ pub struct FeatureFlags {
     /// else (default) keeps the single-buffer kernel until measured.
     pub gfx12_mq6_fp8_db: bool,
     /// Exact-INT8 MQ6G256V2 prefill GEMM on gfx1201 / gfx1151
-    /// (`HIPFIRE_MQ6_I8`, developer): `Some(true)` (`1`) on for any scope,
-    /// `Some(false)` (`0`) off, unset = the per-arch default
+    /// (`HIPFIRE_MQ6_I8` / `kernel.mq6_i8`, auto-bool): `Some(true)` (`1`,
+    /// `true`, `on`) on for any scope, `Some(false)` (`0`, `false`, `off`) off,
+    /// `None` (unset, `auto`, anything else) = the per-arch default
     /// (`crate::gemm_mq6_i8::MQ6_I8_DEFAULT_ARCHS`, qwen4 scope)
-    /// (`Gpu::gemm_mq6g256v2_i8_applies`).
+    /// (`Gpu::gemm_mq6g256v2_i8_applies`). Kept: an opt-in outside the default
+    /// scope, not a default-ON kill switch.
     pub mq6_i8: Option<bool>,
     /// Certified-builder (PeaceMaker) twin of the exact-INT8 MQ6G256V2 GEMM on
     /// exact gfx1201 (`HIPFIRE_MQ6_I8_PM`, developer): `Some(false)` (`0`) keeps
@@ -838,6 +840,11 @@ pub struct FeatureFlags {
     /// `HIPFIRE_A4_SLAB` / `kernel.a4_slab` (default on; exact `0` is off): the
     /// gfx1201 B-1 slab A4 activation layout (`Gpu::a4_slab_active`).
     pub a4_slab: bool,
+    /// `HIPFIRE_V2B_A4_EPI` / `kernel.v2b_a4_epi` (exact `retile`; unset and
+    /// any other value keep the default fused A4 kernel): the exact-gfx1151 V2B
+    /// gate/up SiLU launch runs the stage-1 M512xN128 twin instead of the fused
+    /// A4 epilogue. Kept as the diagnostic bisect arm of the A4 fusion.
+    pub v2b_a4_retile: bool,
     /// `HIPFIRE_QWEN4_MOE_EP_A8` / `kernel.qwen4_moe_ep_a8`, tri-state: `None`
     /// (unset / `auto` / any other value) follows the EP scope, `Some(true)` (trimmed
     /// exact `1`) forces the A8 chain, `Some(false)` (trimmed exact `0`) kills it.
@@ -1531,6 +1538,7 @@ impl FeatureFlags {
             // `promoted_flag_env_value`; the resolved value is `1`, `0` or `auto`.
             gate_up_bt: value("HIPFIRE_GATE_UP_BT").as_deref() != Ok("0"),
             a4_slab: value("HIPFIRE_A4_SLAB").ok().as_deref() != Some("0"),
+            v2b_a4_retile: value("HIPFIRE_V2B_A4_EPI").as_deref() == Ok("retile"),
             qwen4_moe_ep_a8: match value("HIPFIRE_QWEN4_MOE_EP_A8").as_deref() {
                 Ok("1") => Some(true),
                 Ok("0") => Some(false),
@@ -2336,6 +2344,7 @@ impl FeatureFlags {
             lloyd_f16_gfx11: false,
             gate_up_bt: false,
             a4_slab: false,
+            v2b_a4_retile: false,
             qwen4_moe_ep_a8: None,
             qwen4_qsa_wmma_gather: false,
             qwen4_qsa_pooled_bf16: false,
@@ -5139,6 +5148,8 @@ mod tests {
                 f.hidden_scatter_fuse_off.to_string(),
                 f.gate_up_bt.to_string(),
                 f.a4_slab.to_string(),
+                f.v2b_a4_retile.to_string(),
+                format!("{:?}", f.mq6_i8),
                 format!("{:?}", f.qwen4_moe_ep_a8),
                 f.qwen4_qsa_wmma_gather.to_string(),
                 f.qwen4_qsa_pooled_bf16.to_string(),
@@ -5167,6 +5178,8 @@ mod tests {
             ("kernel.hidden_scatter_fuse_off", Bool(true), "true"),
             ("kernel.gate_up_bt", Bool(false), "false"),
             ("kernel.a4_slab", Bool(false), "false"),
+            ("kernel.v2b_a4_epi", Str("retile".to_owned()), "true"),
+            ("kernel.mq6_i8", Bool(true), "Some(true)"),
             ("kernel.qwen4_moe_ep_a8", Bool(true), "Some(true)"),
             ("attention.qwen4_qsa_wmma_gather", Bool(false), "false"),
             ("attention.qwen4_qsa_pooled_bf16", Bool(false), "false"),

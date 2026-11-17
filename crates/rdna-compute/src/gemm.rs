@@ -1433,27 +1433,6 @@ fn v2b_a4_pm_image() -> HipResult<&'static [u8]> {
     )
 }
 
-/// `HIPFIRE_V2B_A4_EPI` arm of the gfx1151 V2B gate/up SiLU launch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum A4Mode {
-    /// `retile`: the stage-1 m512 twin replaces the V2B SiLU launch; `h`
-    /// is written exactly as before.
-    Retile,
-    /// Unset, `1` or any other value (default): the fused kernel also writes
-    /// the down-proj A4 sidecar.
-    Fused,
-}
-
-/// Current `HIPFIRE_V2B_A4_EPI` arm. Read on every call (not cached) so one
-/// process can switch arms; `retile` is the diagnostic bisect arm.
-/// Only exact gfx1151 V2B shapes are admitted (`Gpu::a4_epi_admitted`).
-fn v2b_a4_mode() -> A4Mode {
-    match hipfire_config::developer_var("HIPFIRE_V2B_A4_EPI").as_deref() {
-        Ok("retile") => A4Mode::Retile,
-        _ => A4Mode::Fused,
-    }
-}
-
 /// Builder twin of a hipcc V2B entry (gfx1151 only: the V2B tile is), with
 /// the builder ADD's log2 raster group; `None` keeps the hipcc entry.
 /// The Z|beta|alpha `_set_zba` scatter stays on hipcc; the ADD twin takes power-of-two groups
@@ -37494,7 +37473,7 @@ impl Gpu {
             ),
         };
         let a4_retile = tile == Iu4V2Tile::V2b
-            && v2b_a4_mode() == A4Mode::Retile
+            && self.flags.v2b_a4_retile
             && self.a4_epi_admitted(Some(tile), gate_m, up_m, k, batch_size);
         let v2b_pm = match tile {
             Iu4V2Tile::V2b => v2b_pm_entry(kernel_name, 0, gate_m, k).map(|(name, _)| name),
@@ -37618,7 +37597,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<Option<crate::scratch::Int4MmqDownPrepared>> {
-        if v2b_a4_mode() != A4Mode::Fused {
+        if self.flags.v2b_a4_retile {
             return Ok(None);
         }
         let tile = self.iu4_v2_tile(gate_m, k, batch_size);
