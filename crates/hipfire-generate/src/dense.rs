@@ -598,6 +598,9 @@ pub fn generate_deepseek4_spec(
             logprobs_top_k: None,
         },
         temp, // temp>0 → DSpark sampled verify (routed here only when supports_temp_verify)
+        // DS4 speculators have no driver-owned floor; the flag is read only
+        // for `FloorControl::Driver`.
+        false,
     ) {
         Some(r) => r,
         // Abort / error early-exit already wrote its own done/error envelope.
@@ -2916,6 +2919,8 @@ fn generate_gemma4_spec(
             logprobs_top_k,
         },
         sampler_cfg.temperature,
+        // Dense speculators have no driver-owned floor (see above).
+        false,
     ) else {
         // generate_spec already wrote the terminal event.
         return;

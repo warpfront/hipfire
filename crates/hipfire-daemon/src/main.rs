@@ -4179,6 +4179,7 @@ fn main() {
                         enable_thinking_jinja,
                         logprobs_top_k,
                         request_seed,
+                        client_seed.is_some(),
                     );
                     if let Some(drive_res) = hipfire_generate::batch::drive_promoted(
                         batch_scheduler.as_mut(),
