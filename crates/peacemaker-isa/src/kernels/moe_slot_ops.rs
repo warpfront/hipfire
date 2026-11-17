@@ -190,7 +190,10 @@ fn plan(arch: Arch) -> Result<RegPlan, String> {
 
 /// The builder-emitted kernel (gfx1100, gfx1151, gfx1150 and gfx1201; every other target is refused before any builder exists).
 pub fn emit(arch: Arch) -> Result<Emitted, String> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201
+    ) {
         return Err(format!(
             "{KERNEL_ID}: built for gfx1100, gfx1151, gfx1150 and gfx1201 only, not {}",
             arch.name()

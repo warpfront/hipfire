@@ -8,11 +8,17 @@ use crate::inst::{Arch, Inst};
 use smallvec::SmallVec;
 
 pub fn decode(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeError> {
-    assert!(matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150));
+    assert!(matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150
+    ));
     super::gfx12::decode_for(arch, words)
 }
 pub fn encode(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeError> {
-    assert!(matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150));
+    assert!(matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150
+    ));
     super::gfx12::encode_for(arch, inst)
 }
 

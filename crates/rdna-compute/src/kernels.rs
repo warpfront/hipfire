@@ -4444,6 +4444,14 @@ pub const QWEN4_MOE_IU4_SYM_GFX1151_SRC: &str = concat!(
 /// (`.text` grows by the fill, bytes before it are unchanged).
 pub const QWEN4_MOE_IU4_SYM_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco");
+/// gfx1150 build of the grouped symmetric IU4 MoE NT1 MQ4 GEMMs
+/// (`kernels/qwen4_moe_iu4_sym_pm_gfx1150.hxaco`, module `qwen4_moe_iu4_sym_pm_gfx1150`,
+/// entries `qwen4_moe_{gate_up_silu,down}_iu4_sym_pm_gfx1150`, 64-byte ABI, frozen at the
+/// gfx1100/gfx1151 NT1 kernarg size). SHA-256 6e680a37845605401880826948e7730669c5c7ca261fe68a55a4185cd8111f57
+/// (contracts `crates/peacemaker-isa/kernels/qwen4_moe_sym.gfx1150.*.contract.json`; M7 obligation-free).
+/// Certified NT1 only — W2/W3/E8P variants are not admitted for gfx1150.
+pub const QWEN4_MOE_IU4_SYM_PM_GFX1150: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1150.hxaco");
 pub const QWEN4_MOE_IU4_SYM_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco");
 /// DESIGN F1: drop-zero planar twin of [`QWEN4_MOE_IU4_SYM_PM_GFX1201`] (module
@@ -4858,8 +4866,8 @@ fn strip_exact_arch_guard(src: &str, guard: &str) -> String {
 }
 /// Exact arch-guard text of the stable-grouping source (`#if`/`#error`/`#endif`).
 pub const QWEN4_MOE_SCATTER_STABLE_TOP10_ARCH_GUARD: &str = concat!(
-    "#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__) && !defined(__gfx1151__) && !defined(__gfx1201__) && !defined(__gfx942__)\n",
-    "#error \"qwen4_moe_scatter_stable_top10.hip is gfx1100/gfx1151/gfx1201/gfx942-only\"\n",
+    "#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__) && !defined(__gfx1151__) && !defined(__gfx1150__) && !defined(__gfx1201__) && !defined(__gfx942__)\n",
+    "#error \"qwen4_moe_scatter_stable_top10.hip is gfx1100/gfx1151/gfx1150/gfx1201/gfx942-only\"\n",
     "#endif\n",
 );
 /// The stable grouping assembled for the gfx1100 sealed expert-slab:
@@ -10606,6 +10614,11 @@ pub const MOE_SLOT_OPS_PM_GFX1100: &[u8] =
 /// Builder (PeaceMaker) grouped BF16-input down combine for gfx1151 (`kernels/moe_slot_ops_pm_gfx1151.hxaco`).
 pub const MOE_SLOT_OPS_PM_GFX1151: &[u8] =
     include_bytes!("../../../kernels/moe_slot_ops_pm_gfx1151.hxaco");
+/// Builder (PeaceMaker) grouped BF16-input down combine for gfx1150 (`kernels/moe_slot_ops_pm_gfx1150.hxaco`).
+/// SHA-256 f733e649daacbe4e9fc83ca06eff78e7f2236e6c2aab1f61d2345196096d1f12 (contract
+/// `crates/peacemaker-isa/kernels/moe_slot_ops_pm.gfx1150.contract.json`, M7 byte-exact, obligations {}).
+pub const MOE_SLOT_OPS_PM_GFX1150: &[u8] =
+    include_bytes!("../../../kernels/moe_slot_ops_pm_gfx1150.hxaco");
 
 /// Certified PeaceMaker BF16 grouped expert combine v2 twin, gfx1201
 /// (`peacemaker-isa emit --kernel moe_slot_ops_v2_pm --arch gfx1201`, 48-byte kernarg), a

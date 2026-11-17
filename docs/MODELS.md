@@ -75,7 +75,7 @@ Sizes below are **registry declarations**, not a substitute for runtime MoE layo
 | `qwen3.6:35b-a3b-mq4p` | (alias of `qwen3.6:35b-a3b`) | | | | Same `qwen3.6-35b-a3b.mq4p` file; kept as an alias so the old tag still resolves |
 | `qwen3.6:35b-a3b-mfp4` | `qwen3.6-35b-a3b.mfp4` | 20.2 | 22 | | MFP4-E8 |
 | `qwen3.6:35b-a3b-mq4r` | `qwen3.6-35b-a3b.mq4r` | 18.7 | 22 | | Uniform MQ4G256V1/qt13 Redline speed SKU; zero qt44/graded experts. Dated tok/s in registry text is not a live baseline. |
-| `qwen3.6:35b-a3b-mq4rs` | `qwen3.6-35b-a3b-d53.mq4rs` | 18.7 | 22 | q8 | Symmetric-expert MQ4 (qt44 gate/up + qt53 down, MQ4G256V2/MQ4G128V2). Loads on gfx1100, gfx1151 and gfx1201, where it takes the int4-activation expert prefill (vs the qt53 F32 fallback: 3.25x at pp512 and 2.03x at pp16384 on gfx1100, 3.37x and 2.80x on gfx1151, about 5x on gfx1201); other GPUs refuse it unless `HIPFIRE_MOE_SYM_IU4=0` accepts the fallback. No MTP sidecar registered. |
+| `qwen3.6:35b-a3b-mq4rs` | `qwen3.6-35b-a3b-d53.mq4rs` | 18.7 | 22 | q8 | Symmetric-expert MQ4 (qt44 gate/up + qt53 down, MQ4G256V2/MQ4G128V2). Loads on gfx1100, gfx1151 and gfx1201, where it takes the int4-activation expert prefill (gfx1150 has the NT1 objects admitted but is pending qualification, never the default) (vs the qt53 F32 fallback: 3.25x at pp512 and 2.03x at pp16384 on gfx1100, 3.37x and 2.80x on gfx1151, about 5x on gfx1201); other GPUs refuse it unless `HIPFIRE_MOE_SYM_IU4=0` accepts the fallback. No MTP sidecar registered. |
 | `qwen3.6:35b-a3b-mq5` | `qwen3.6-35b-a3b.mq5` | 23.7 | 26 | | Quality SKU |
 | `qwen3.6:35b-a3b-mq6` | `qwen3.6-35b-a3b.mq6` | 27.7 | 30 | | Max quality |
 

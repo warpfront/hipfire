@@ -74,7 +74,9 @@ mod kernels {
     pub const RAILGUN_FILL_SRC: &str = include_str!("../../../kernels/src/railgun_fill.hip");
 }
 
-pub const SUPPORTED_ARCHES: &[&str] = &["gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942"];
+pub const SUPPORTED_ARCHES: &[&str] = &[
+    "gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942", "gfx1150",
+];
 
 #[derive(Debug, Clone)]
 pub struct KernelEntry {
@@ -4348,6 +4350,41 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "hc_row_fold",
             crate::hc_row_fold::SRC,
             ["hc_row_fold_norm_gate"]
+        );
+    }
+    if arch == "gfx1150" {
+        // v1 NT1 / MQ4 admission: only the modules the aggregate symmetric-IU4 descriptor
+        // needs. The GEMM image (`qwen4_moe_iu4_sym_pm_gfx1150.hxaco`) is embedded, not
+        // compiled; the hipcc twin and checker are the gfx1151 source compiled for this arch.
+        add!(
+            "mq_rotate_x_i4",
+            kernels::MQ_ROTATE_X_I4_SRC,
+            ["mq_rotate_x_i4"]
+        );
+        add!(
+            "qwen4_moe_iu4_sym_gfx1151",
+            kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC,
+            [
+                "qwen4_moe_down_iu4_sym_gfx1151",
+                "qwen4_moe_down_iu4_sym_gfx1151_nt4",
+                "qwen4_moe_gate_up_silu_iu4_sym_gfx1151",
+                "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4",
+                "qwen4_moe_sym_check_gfx1151",
+            ]
+        );
+        add!(
+            "qwen4_moe_rotate128_i4",
+            kernels::QWEN4_MOE_ROTATE128_I4_SRC,
+            ["qwen4_moe_rotate128_i4"]
+        );
+        add!(
+            "qwen4_moe_scatter_stable_top10",
+            kernels::QWEN4_MOE_SCATTER_STABLE_TOP10_SRC,
+            [
+                "qwen4_moe_group_prefix",
+                "qwen4_moe_group_ranks",
+                "qwen4_moe_group_scatter",
+            ]
         );
     }
     // Default-on `HIPFIRE_QWEN4_HC_ROW_FOLD` on gfx1201: the MoE-tail and mixer-tail row
@@ -8942,6 +8979,10 @@ fn walked_arch_images(arch: &str) -> &'static [&'static [u8]] {
             kernels::EP_TILE_PULL_PM_GFX1100,
             kernels::EP_TILE_PULL_N8_PM_GFX1100,
         ],
+        "gfx1150" => &[
+            kernels::QWEN4_MOE_IU4_SYM_PM_GFX1150,
+            kernels::MOE_SLOT_OPS_PM_GFX1150,
+        ],
         "gfx1151" => &[
             kernels::NPU_TRUNK_PM_GFX1151,
             kernels::NPU_TRUNK_ARENA_PM_GFX1151,
@@ -9010,7 +9051,7 @@ fn walked_arch_images(arch: &str) -> &'static [&'static [u8]] {
 static WALKED_ARCH_IMAGE_SHA: std::sync::LazyLock<Vec<(&'static str, String, &'static [u8])>> =
     std::sync::LazyLock::new(|| {
         use sha2::{Digest, Sha256};
-        ["gfx1100", "gfx1151", "gfx1201"]
+        ["gfx1100", "gfx1150", "gfx1151", "gfx1201"]
             .into_iter()
             .flat_map(|arch| {
                 walked_arch_images(arch)

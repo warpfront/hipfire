@@ -67,7 +67,7 @@ fn e8p_gfx1151_names_and_abi() {
         s1151(Codec::E8p, Kind::Down, true, Negative::None).variant(),
         "down_e8p_acc"
     );
-    assert_eq!(gfx11::ARCHES, [Arch::Gfx1100, Arch::Gfx1151]);
+    assert_eq!(gfx11::ARCHES, [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1150]);
     assert_eq!(gfx11::KERNARG_BYTES, 64);
     let layout = s1151(Codec::E8p, Kind::Down, false, Negative::None).kernargs();
     assert_eq!(layout.size, 64);
@@ -593,7 +593,8 @@ fn image(arch: Arch, text: &str) -> Vec<u8> {
 #[test]
 fn committed_e8p_images_are_byte_identical_to_the_emission() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels");
-    for arch in gfx11::ARCHES {
+    // gfx1150 is admitted to the NT1 MQ4 module only (P0 decision); no E8P bundle is committed for it.
+    for arch in [Arch::Gfx1100, Arch::Gfx1151] {
         let module = Codec::E8p.module(arch);
         let want = image(arch, &module_source(arch, Codec::E8p, Negative::None));
         let file = dir.join(format!("{module}.hxaco"));

@@ -716,7 +716,10 @@ pub fn oracle_assemble_link_bundle(
     output: &Path,
     arch: &str,
 ) -> Result<BuildOutput> {
-    if !matches!(arch, "gfx1201" | "gfx1200" | "gfx1100" | "gfx1151" | "gfx1150") {
+    if !matches!(
+        arch,
+        "gfx1201" | "gfx1200" | "gfx1100" | "gfx1151" | "gfx1150"
+    ) {
         return Err(format!("unsupported AMDGPU architecture: {arch}"));
     }
     let stem = output.with_extension("");
