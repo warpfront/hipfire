@@ -1264,7 +1264,7 @@ fn rule_user_sgpr(
 }
 
 fn rule_wave64(symbol: &str, arch: Arch, wave: Wave, out: &mut Vec<Finding>) {
-    if wave == Wave::Wave64 && matches!(arch, Arch::Gfx1100 | Arch::Gfx1151) {
+    if wave == Wave::Wave64 && matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150) {
         for rule in [
             "gfx11-wave64-valu-partial-forwarding",
             "gfx11-wave64-valu-mask-write",
@@ -1345,7 +1345,7 @@ pub fn check_body(
         rule_trans_use(&stream, &mut out);
         rule_mad64(&stream, &mut out);
     }
-    if advisory && matches!(arch, Arch::Gfx1100 | Arch::Gfx1151) {
+    if advisory && matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150) {
         rule_vmem_to_scalar_write(&stream, &mut out);
         rule_vgpr_war_async(&stream, &mut out);
     }

@@ -79,6 +79,9 @@ pub struct Gfx1100;
 /// RDNA3.5 (Strix Halo).
 #[derive(Clone, Copy, Debug)]
 pub struct Gfx1151;
+/// RDNA3.5 (Strix Point): the gfx1151 instruction family under its own ELF machine.
+#[derive(Clone, Copy, Debug)]
+pub struct Gfx1150;
 /// RDNA4 (Navi 48).
 #[derive(Clone, Copy, Debug)]
 pub struct Gfx1201;
@@ -94,6 +97,7 @@ impl Target for Gfx942 {
 }
 impl sealed::Sealed for Gfx1100 {}
 impl sealed::Sealed for Gfx1151 {}
+impl sealed::Sealed for Gfx1150 {}
 impl sealed::Sealed for Gfx1201 {}
 impl Target for Gfx1100 {
     const NAME: &'static str = "gfx1100";
@@ -103,6 +107,12 @@ impl Target for Gfx1100 {
 }
 impl Target for Gfx1151 {
     const NAME: &'static str = "gfx1151";
+    const LDS_BYTES: u32 = 65536;
+    type Waits = Gfx11Waits;
+    type Barrier = Full;
+}
+impl Target for Gfx1150 {
+    const NAME: &'static str = "gfx1150";
     const LDS_BYTES: u32 = 65536;
     type Waits = Gfx11Waits;
     type Barrier = Full;
@@ -131,4 +141,5 @@ impl<T: Target<Barrier = Split>> SplitBarrier for T {}
 pub trait MmaIu4: Target {}
 impl MmaIu4 for Gfx1100 {}
 impl MmaIu4 for Gfx1151 {}
+impl MmaIu4 for Gfx1150 {}
 impl MmaIu4 for Gfx1201 {}

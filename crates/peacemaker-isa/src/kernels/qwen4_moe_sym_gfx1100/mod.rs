@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! gfx11 (gfx1100, gfx1151) NT1 grouped symmetric IU4 MoE GEMMs (Consumer24 B4; Halo E8P port): gate/up+SwiGLU
+//! gfx11 (gfx1100, gfx1151, gfx1150) NT1 grouped symmetric IU4 MoE GEMMs (Consumer24 B4; Halo E8P port): gate/up+SwiGLU
 //! and down, over MQ4 (QT44/QT53 pointer-addressed), planar W2 (`d*(2c-3)`),
 //! planar W3 (`d*(2c-7)`) and planar E8P-I4 (`d*(2C+s)/4`, LUT/MASK stage in LDS; see [`e8p`])
 //! expert tensors, each in a BF16 entry and a
@@ -90,8 +90,8 @@
 //! so each epoch contributes `2C/4` instead of `(2C + s)/4`). The symbol is unchanged so
 //! the object is drop-in; keep these out of every candidate module.
 use peacemaker_author::{
-    prime, retire_cur, rotate, End, Free, Full, Gfx1100, Gfx1151, Gfx11Waits, MmaIu4, Published,
-    Ring, Scc, Target, WgUniform, Workgroup,
+    prime, retire_cur, rotate, End, Free, Full, Gfx1100, Gfx1150, Gfx1151, Gfx11Waits, MmaIu4,
+    Published, Ring, Scc, Target, WgUniform, Workgroup,
 };
 use peacemaker_isa::{
     insn::{Instruction, MemoryClass},
@@ -124,8 +124,8 @@ impl<T: Target<Waits = Gfx11Waits, Barrier = Full> + MmaIu4> Gfx11 for T {}
 
 type Wg<'b, T> = Workgroup<'b, T, Builder>;
 
-/// The architectures [`emit`] builds: gfx1100 (RDNA3) and gfx1151 (RDNA3.5).
-pub const ARCHES: [Arch; 2] = [Arch::Gfx1100, Arch::Gfx1151];
+/// The architectures [`emit`] builds: gfx1100 (RDNA3), gfx1151 (RDNA3.5) and gfx1150 (RDNA3.5).
+pub const ARCHES: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1150];
 
 pub const KERNARG_BYTES: u32 = 64;
 pub const VGPR_CEILING: u16 = 256;
@@ -817,12 +817,13 @@ fn body<T: Gfx11>(wg: &mut Wg<'_, T>, g: &Gen) -> Result<(), String> {
     wg.end(end)
 }
 
-/// Emit one gfx11 kernel for `spec.arch` (gfx1100 or gfx1151): one instruction path, the arch-typed builder and arch names.
+/// Emit one gfx11 kernel for `spec.arch` (gfx1100, gfx1151 or gfx1150): one instruction path, the arch-typed builder and arch names.
 pub fn emit(spec: Spec) -> Result<Emitted, String> {
     spec.validate()?;
     match spec.arch {
         Arch::Gfx1100 => emit_on::<Gfx1100>(spec),
         Arch::Gfx1151 => emit_on::<Gfx1151>(spec),
+        Arch::Gfx1150 => emit_on::<Gfx1150>(spec),
         a => Err(format!(
             "qwen4_moe_sym_gfx11: no gfx11 target for {}",
             a.name()

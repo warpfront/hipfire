@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! cargo run -p peacemaker-isa --release --features toolchain --example emit_qwen4_moe_sym_gfx1100 -- \
-//!     [--arch gfx1100|gfx1151] [--codec legacy|e8p|all|w3] [--out-dir REPO_ROOT] [--receipt FILE] [--work-dir DIR] [--evidence-dir DIR] [--seed N] [--p1-only]
+//!     [--arch gfx1100|gfx1151|gfx1150] [--codec legacy|e8p|all|w3|mq4] [--out-dir REPO_ROOT] [--receipt FILE] [--work-dir DIR] [--evidence-dir DIR] [--seed N] [--p1-only]
 //! ```
 //!
 //! `--codec legacy` (default, the original behaviour): three modules `kernels/qwen4_moe_iu4_sym{,_w2,_w3}_pm_gfx1100.hxaco`;
@@ -15,7 +15,10 @@
 //! `qwen4_moe_{gate_up_silu,down}_iu4_sym_e8p_pm_gfx1100[_acc]`, 1,536 B static LDS stage, default receipt
 //! `rcpt/k2e8p.p1.json`); `all`: both. `--arch gfx1151` (default gfx1100) emits the same E8P module for the Halo
 //! (`kernels/qwen4_moe_iu4_sym_e8p_pm_gfx1151.hxaco`, contracts `crates/peacemaker-isa/kernels/qwen4_moe_sym.gfx1151.*_e8p*.contract.json`,
-//! negatives under `kernels/qwen4_moe_gfx1151_negative/`) and requires `--codec e8p`. Re-running `legacy` against the committed tree proves the old bytes are unchanged
+//! negatives under `kernels/qwen4_moe_gfx1151_negative/`) and requires `--codec e8p`.
+//! `--arch gfx1150` (RDNA3.5, the gfx1151 instruction family under its own ELF machine) emits the NT1 MQ4 module
+//! `kernels/qwen4_moe_iu4_sym_pm_gfx1150.hxaco` (entries `qwen4_moe_{gate_up_silu,down}_iu4_sym_pm_gfx1150[_acc]`)
+//! and requires `--codec mq4` — its W2/W3/E8P modules stay unadmitted. Re-running `legacy` against the committed tree proves the old bytes are unchanged
 //! (an identical existing artifact is accepted, a different one is an error). Each module has the
 //! four entries `{gate_up, down} x {BF16, _acc}`. Per module: builder-proof inspection, independent
 //! source wait/hazard replay, native build (+ ROCm assembler/linker `.text` identity), per-symbol M7
@@ -106,13 +109,15 @@ mod app {
     type R<T> = Result<T, String>;
 
     /// Which codec modules a run emits: the committed MQ4/W2/W3 set (default), the E8P module, both,
-    /// or the W3 module alone (the gfx1100 W3 K2 of the decode+prefill MQ3 tier).
+    /// the W3 module alone (the gfx1100 W3 K2 of the decode+prefill MQ3 tier), or the NT1 MQ4 module
+    /// only (`--arch gfx1150`, the gfx1150 admission).
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum CodecSet {
         Legacy,
         E8p,
         All,
         W3,
+        Mq4,
     }
 
     impl CodecSet {
@@ -122,6 +127,7 @@ mod app {
                 Self::E8p => vec![Codec::E8p],
                 Self::All => Codec::ALL.iter().copied().chain([Codec::E8p]).collect(),
                 Self::W3 => vec![Codec::W3],
+                Self::Mq4 => vec![Codec::Mq4],
             }
         }
     }
@@ -1351,7 +1357,8 @@ mod app {
                     o.arch = match value("--arch")?.as_str() {
                         "gfx1100" => Arch::Gfx1100,
                         "gfx1151" => Arch::Gfx1151,
-                        other => return Err(format!("--arch {other} (gfx1100|gfx1151)")),
+                        "gfx1150" => Arch::Gfx1150,
+                        other => return Err(format!("--arch {other} (gfx1100|gfx1151|gfx1150)")),
                     }
                 }
                 "--out-dir" => o.out_dir = PathBuf::from(value("--out-dir")?),
@@ -1365,7 +1372,8 @@ mod app {
                         "e8p" => CodecSet::E8p,
                         "all" => CodecSet::All,
                         "w3" => CodecSet::W3,
-                        other => return Err(format!("--codec {other} (legacy|e8p|all|w3)")),
+                        "mq4" => CodecSet::Mq4,
+                        other => return Err(format!("--codec {other} (legacy|e8p|all|w3|mq4)")),
                     }
                 }
                 "--work-dir" => {
@@ -1386,6 +1394,13 @@ mod app {
         if o.arch == Arch::Gfx1151 && o.codecs != CodecSet::E8p {
             return Err(
                 "--arch gfx1151 requires --codec e8p (the MQ4/W2/W3 modules are gfx1100-only)"
+                    .into(),
+            );
+        }
+        // gfx1150 is admitted as the NT1 MQ4 module only (W2/W3/E8P are not admitted yet).
+        if o.arch == Arch::Gfx1150 && o.codecs != CodecSet::Mq4 {
+            return Err(
+                "--arch gfx1150 requires --codec mq4 (NT1 anchor; W2/W3/E8P are not admitted yet)"
                     .into(),
             );
         }

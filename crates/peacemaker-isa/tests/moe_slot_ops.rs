@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! A3B path-parity PM combine twin (gfx1201, gfx1100, gfx1151): the ordered BF16 grouped expert combine
+//! A3B path-parity PM combine twin (gfx1201, gfx1100, gfx1151, gfx1150): the ordered BF16 grouped expert combine
 //! `moe_down_combine_grouped_bf16in_pm_<arch>` in module `moe_slot_ops_pm_<arch>`. The structural tests run on
 //! every arch; the CPU-interpreter tests run the gfx1201 object.
 //!
@@ -33,7 +33,7 @@ const KERNARG_BYTES: usize = 48;
 const OFFSETS: [u32; 8] = [0, 8, 16, 24, 32, 36, 40, 44];
 
 /// Every arch the combine is emitted for.
-const ARCHS: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
+const ARCHS: [Arch; 4] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1150, Arch::Gfx1201];
 
 fn bundle_path(module: &str) -> String {
     format!(
@@ -81,7 +81,7 @@ fn emission_is_deterministic_and_targets_for_the_supported_archs_on(arch: Arch) 
         serde_json::to_string(&p2).unwrap()
     );
     assert!(t1.contains(&format!("{symbol}:")));
-    // Every architecture but gfx1100, gfx1151 and gfx1201 is refused, not silently emitted.
+    // Every architecture but gfx1100, gfx1151, gfx1150 and gfx1201 is refused, not silently emitted.
     for arch in [Arch::Gfx1200, Arch::Gfx942] {
         assert!(ops::emit(arch).is_err(), "{arch:?}");
         assert!(ops::emit_module(arch).is_err(), "{arch:?}");

@@ -128,6 +128,7 @@ fn arch_of_mach(mach: u32) -> Option<Arch> {
         0x033 => Arch::Gfx1010,
         0x036 => Arch::Gfx1030,
         0x041 => Arch::Gfx1100,
+        0x043 => Arch::Gfx1150,
         0x048 => Arch::Gfx1200,
         0x04a => Arch::Gfx1151,
         0x04e => Arch::Gfx1201,
@@ -141,6 +142,7 @@ fn arch_of_name(name: &str) -> Option<Arch> {
         "gfx1030" => Arch::Gfx1030,
         "gfx1100" => Arch::Gfx1100,
         "gfx1151" => Arch::Gfx1151,
+        "gfx1150" => Arch::Gfx1150,
         "gfx1200" => Arch::Gfx1200,
         "gfx1201" => Arch::Gfx1201,
         _ => return None,
@@ -248,7 +250,7 @@ pub fn lift_object(bytes: &[u8], options: Options) -> Result<Lifted<Program>, Li
     let target = target_of(&source, arch)?;
     if !matches!(
         arch,
-        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1200 | Arch::Gfx1201
     ) {
         return Err(module_error(
             Rule::UnsupportedArch,
@@ -417,7 +419,7 @@ fn decode_body(
     while at < words.len() {
         let va = entry_va + 4 * at as u64;
         let (mut inst, n) = match arch {
-            Arch::Gfx1100 | Arch::Gfx1151 => gfx11::decode(arch, &words[at..]),
+            Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 => gfx11::decode(arch, &words[at..]),
             _ => gfx12::decode_for(arch, &words[at..]),
         }
         .map_err(|e| rejected(name, va, Rule::Decode, e))?;

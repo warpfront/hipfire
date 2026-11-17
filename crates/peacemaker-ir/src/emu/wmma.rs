@@ -39,7 +39,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         (Arch::Gfx1201, "v_wmma_f32_16x16x16_fp8_bf8") => Shape::F8(mma::Fmt::Fp8, mma::Fmt::Bf8),
         (Arch::Gfx1201, "v_wmma_f32_16x16x16_bf8_fp8") => Shape::F8(mma::Fmt::Bf8, mma::Fmt::Fp8),
         (Arch::Gfx1201, "v_wmma_f32_16x16x16_bf8_bf8") => Shape::F8(mma::Fmt::Bf8, mma::Fmt::Bf8),
-        (Arch::Gfx1151, "v_wmma_i32_16x16x16_iu4") => Shape::Iu4 { k: 16 },
+        (Arch::Gfx1151 | Arch::Gfx1150, "v_wmma_i32_16x16x16_iu4") => Shape::Iu4 { k: 16 },
         (Arch::Gfx1201, "v_wmma_i32_16x16x32_iu4") => Shape::Iu4 { k: 32 },
         _ => return Err(format!("{name} on {arch:?}: no source-verified fragment mapping and probed numerics; refusing to approximate")),
     };

@@ -29,14 +29,16 @@ fn arch_name(arch: Arch) -> &'static str {
     match arch {
         Arch::Gfx1100 => "gfx1100",
         Arch::Gfx1151 => "gfx1151",
+        Arch::Gfx1150 => "gfx1150",
         Arch::Gfx1201 => "gfx1201",
-        _ => unreachable!("census accepts gfx1100, gfx1151 or gfx1201 only"),
+        _ => unreachable!("census accepts gfx1100, gfx1151, gfx1150 or gfx1201 only"),
     }
 }
 fn xml_sha(arch: Arch) -> &'static str {
     match arch {
         Arch::Gfx1100 => "6eee5f8737172adf08c0e7d5994ea916e9555b9c23ccb9ec80d9ee38678733b4",
         Arch::Gfx1151 => "c36b6d79b1e940d74107221c985f5a7fde248025da251d2c6ef756c4cd31391a",
+        Arch::Gfx1150 => "c36b6d79b1e940d74107221c985f5a7fde248025da251d2c6ef756c4cd31391a",
         Arch::Gfx1201 => "f8a290c8471e26a1071b08b61a33e4d9efa46ec6cedcdb8e5ba57d7969b60692",
         _ => unreachable!(),
     }
@@ -712,11 +714,12 @@ fn run() -> Result<()> {
         .collect::<Vec<_>>();
     let [arch_arg, registry, compiled, output, objdump, xml_tsv, builders @ ..] = args.as_slice()
     else {
-        return Err("usage: pm-census <gfx1100|gfx1151|gfx1201> <registry.tsv> <compiled/arch> <output-dir> <llvm-objdump> <arch-encodings.tsv> [builder.hxaco ...]".into());
+        return Err("usage: pm-census <gfx1100|gfx1151|gfx1150|gfx1201> <registry.tsv> <compiled/arch> <output-dir> <llvm-objdump> <arch-encodings.tsv> [builder.hxaco ...]".into());
     };
     let arch = match arch_arg.to_str() {
         Some("gfx1100") => Arch::Gfx1100,
         Some("gfx1151") => Arch::Gfx1151,
+        Some("gfx1150") => Arch::Gfx1150,
         Some("gfx1201") => Arch::Gfx1201,
         _ => return Err("unsupported census architecture".into()),
     };

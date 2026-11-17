@@ -368,8 +368,10 @@ impl State {
         if (mode >> 12) & 255 != 0xf0 || mode & (1 << 26) != 0 {
             return Err("only RNE with preserved denormals and FP16_OVFL=0 is modeled".into());
         }
-        if arch == Arch::Gfx1151 && mode & ((1 << 23) | (1 << 21)) != ((1 << 23) | (1 << 21)) {
-            return Err("gfx1151 emulator requires IEEE_MODE and DX10_CLAMP".into());
+        if matches!(arch, Arch::Gfx1151 | Arch::Gfx1150)
+            && mode & ((1 << 23) | (1 << 21)) != ((1 << 23) | (1 << 21))
+        {
+            return Err("gfx1151/gfx1150 emulator requires IEEE_MODE and DX10_CLAMP".into());
         }
         let mut st = Self {
             s: [0; 106],
