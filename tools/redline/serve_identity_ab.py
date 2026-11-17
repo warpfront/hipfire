@@ -8,8 +8,8 @@ A client that never acks makes every turn abort, roll back, and invalidate the
 request-local replay observation window, so no HIPFIRE_REPLAY_ROUTE_PROOF marker
 is printed even when the retained route replayed every token.
 
-  tools/redline/serve_identity_ab.py ident --daemon D --model M --out DIR [--tokens 512]
-  tools/redline/serve_identity_ab.py ab    --daemon D --model M --out DIR [--rounds 2] [--tokens 512]
+  tools/redline/serve_identity_ab.py ident --daemon D --model M --out DIR [--tokens 512] [--route-sku SKU]
+  tools/redline/serve_identity_ab.py ab    --daemon D --model M --out DIR [--rounds 2] [--tokens 512] [--route-sku SKU]
 
 Arms (each a fresh daemon + model load):
   on    HIPFIRE_REPLAY_BACKEND=redline                           (retained PM4 + scratch rings)
@@ -46,27 +46,34 @@ class Daemon:
         self.timeout = timeout
         self.log = log
         self.p = subprocess.Popen([binary], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=open(log, "w"), text=True, bufsize=1, start_new_session=True)
+                                  stderr=open(log, "w"), bufsize=0, start_new_session=True)
+        self.buf = b""
 
     def send(self, m):
-        self.p.stdin.write(json.dumps(m, separators=(",", ":")) + "\n")
+        self.p.stdin.write((json.dumps(m, separators=(",", ":")) + "\n").encode())
         self.p.stdin.flush()
 
     def recv(self):
-        r, _, _ = select.select([self.p.stdout], [], [], self.timeout)
-        if not r:
-            raise TimeoutError("daemon silent")
-        line = self.p.stdout.readline()
-        if not line:
-            raise RuntimeError("daemon exited")
+        while b"\n" not in self.buf:
+            r, _, _ = select.select([self.p.stdout], [], [], self.timeout)
+            if not r:
+                raise TimeoutError("daemon silent")
+            data = os.read(self.p.stdout.fileno(), 1 << 16)
+            if not data:
+                raise RuntimeError("daemon exited")
+            self.buf += data
+        line, self.buf = self.buf.split(b"\n", 1)
         try:
             return json.loads(line)
         except Exception:
             return None
 
-    def load(self, model, max_seq):
-        self.send({"type": "load", "model": model, "params": {"max_seq": max_seq, "kv_mode": "q8", "dflash_mode": "off",
-                   "mtp_mode": "off", "dspark_mode": "off", "tp": 1, "pp": 1}})
+    def load(self, model, max_seq, route_sku=None):
+        params = {"max_seq": max_seq, "kv_mode": "q8", "dflash_mode": "off",
+                  "mtp_mode": "off", "dspark_mode": "off", "tp": 1, "pp": 1}
+        if route_sku:
+            params["route_sku"] = route_sku
+        self.send({"type": "load", "model": model, "params": params})
         while True:
             j = self.recv()
             if j and j.get("type") == "error":
@@ -137,7 +144,7 @@ def ident(args):
         d = Daemon(args.daemon, arm, log, args.timeout)
         rows = {}
         try:
-            d.load(args.model, args.max_seq)
+            d.load(args.model, args.max_seq, args.route_sku)
             for name, prompt in prompts:
                 r = d.generate(f"{arm}-{name}", prompt, args.tokens)
                 rows[name] = r
@@ -197,7 +204,7 @@ def ab(args):
         d = Daemon(args.daemon, arm, log, args.timeout)
         row = {"index": i, "arm": arm, "story": [], "long": []}
         try:
-            d.load(args.model, args.max_seq)
+            d.load(args.model, args.max_seq, args.route_sku)
             d.generate(f"ab{i}-warm", STORY, args.tokens)
             for k in range(args.reps):
                 r = d.generate(f"ab{i}-story{k}", STORY, args.tokens)
@@ -240,6 +247,9 @@ ap.add_argument("--model", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--tokens", type=int, default=512)
 ap.add_argument("--max-seq", type=int, default=8192)
+ap.add_argument("--route-sku", default=None,
+                help="forward params.route_sku in the load request (the CLI does this from the registry card quant, "
+                     "e.g. mq4rs); needed on an unregistered model path or the default arm never selects SKU-keyed routes")
 ap.add_argument("--timeout", type=float, default=300)
 ap.add_argument("--arms", default=None)
 ap.add_argument("--rounds", type=int, default=2)

@@ -362,7 +362,10 @@ queue again after an eviction, and a queue without them stalls (HIPF-347). The
 MQ4G256V2 tape has no scratch kernel.
 
 Receipts per format (xtx, qwen3.8-27b, served daemon `generate`, driver
-`tools/redline/serve_identity_ab.py`, which acks `commit_ready` as `serve` does;
+`tools/redline/serve_identity_ab.py`, which acks `commit_ready` as `serve` does and reads daemon stdout as raw bytes with its own line
+buffer (no lost messages). Pass `--route-sku <sku>` (e.g. `mq4rs`) to forward `route_sku` in the load
+request as the CLI does; on an unregistered model path without it the default arm never selects
+SKU-keyed routes;
 greedy token ids identical between the retained route and the HIP graph on
 story / code / 4,519-token / repeated-story prompts x 512 tokens, with a
 `HIPFIRE_REPLAY_ROUTE_PROOF ... replays=511..512` marker on every retained request):
