@@ -2152,6 +2152,13 @@ pub const FIXED_HYSTERESIS: f32 = 0.03;
 /// [`FIXED_HYSTERESIS`].
 pub const FIXED_SCOUT_SHARE: f32 = 0.02;
 
+/// Yield (settled tokens ÷ verified rows, decayed) at or below which a
+/// fixed-window request with no AR price runs its AR probe set, which then
+/// prices AR. Above it no AR token ever runs just to obtain a price, so a cell
+/// that loses above this yield stays unpriced until some other request on the
+/// load prices AR. Global, relative to the window's own width.
+pub const FIXED_SUSPECT_YIELD: f32 = 0.5;
+
 /// One finished window as the fixed-window floor prices it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FloorObservation {
@@ -2179,6 +2186,9 @@ struct FixedState {
     prev_ar: bool,
     /// The window planned while retired is a scout.
     scout: bool,
+    /// Decayed (settled tokens, verified rows) of the windows observed while
+    /// AR has no price.
+    yield_rows: (f32, f32),
 }
 
 impl FixedFloor {
@@ -2199,6 +2209,11 @@ impl FixedFloor {
 /// never read the per-depth tables, the cost fit, `ROW_COST_PRIOR`, an
 /// agreement or `window_cost`.
 ///
+/// - With no AR price ([`Self::calibrate_from`] not called) no AR token runs
+///   to obtain one: windows are observed without a verdict, and only when,
+///   after [`FLOOR_PROBE_WINDOWS`] windows, the decayed settled count is at
+///   most [`FIXED_SUSPECT_YIELD`] of the decayed verified rows does the probe
+///   set run; its mean prices AR and the floor decides.
 /// - No verdict before [`FLOOR_PROBE_WINDOWS`] windows of the epoch.
 /// - Losing: both memories above `ar_us × (1 + FIXED_HYSTERESIS)`; a tie
 ///   keeps speculating. A losing verdict first runs `probe_tokens` AR tokens
@@ -2304,8 +2319,11 @@ impl<const W: usize, const E: usize> Floor<W, E> {
     }
 
     fn plan_fixed_inner(&mut self, width: usize) -> Action {
-        if !self.calibrated || self.probe_left > 0 {
+        if self.probe_left > 0 {
             return Action::ArSynced;
+        }
+        if !self.calibrated {
+            return Action::Native(width);
         }
         if !self.retired || self.fixed.scout {
             return Action::Native(width);
@@ -2331,7 +2349,7 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         match observation.action {
             Action::ArSynced | Action::ArHeadFree => self.observe_fixed_ar(observation.us),
             Action::Native(_) | Action::Interleaved => {
-                self.observe_fixed_window(observation.settled, observation.us)
+                self.observe_fixed_window(observation.settled, observation.rows, observation.us)
             }
         }
     }
@@ -2340,15 +2358,6 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         let after_ar = self.fixed.prev_ar;
         self.fixed.prev_ar = true;
         let priced = after_ar && valid_us(us);
-        if !self.calibrated {
-            // The first AR token of a request is never priced; the second
-            // prices AR (an invalid timing prices it 0, which retires).
-            if after_ar {
-                self.calibrated = true;
-                self.ar_us = if priced { us } else { 0.0 };
-            }
-            return;
-        }
         if self.probe_left > 0 && !self.retired {
             self.probe_left -= 1;
             if priced {
@@ -2358,9 +2367,16 @@ impl<const W: usize, const E: usize> Floor<W, E> {
                 if !self.probe_samples.is_empty() {
                     self.ar_us =
                         self.probe_samples.iter().sum::<f32>() / self.probe_samples.len() as f32;
+                } else if !self.calibrated {
+                    // No priced probe: no AR price, which retires.
+                    self.ar_us = 0.0;
                 }
+                self.calibrated = true;
                 self.decide_fixed();
             }
+            return;
+        }
+        if !self.calibrated {
             return;
         }
         if self.retired && priced {
@@ -2373,9 +2389,10 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         }
     }
 
-    fn observe_fixed_window(&mut self, settled: usize, us: f32) {
+    fn observe_fixed_window(&mut self, settled: usize, rows: usize, us: f32) {
         self.fixed.prev_ar = false;
         if !self.calibrated {
+            self.observe_fixed_unpriced(settled, rows, us);
             return;
         }
         if valid_us(us) {
@@ -2409,6 +2426,40 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         }
         self.count_probe();
         self.decide_fixed();
+    }
+
+    /// A window while AR has no price: realized cost and yield accumulate;
+    /// after the probe windows a low yield starts the probe set that prices AR.
+    fn observe_fixed_unpriced(&mut self, settled: usize, rows: usize, us: f32) {
+        let decay = self.decay;
+        if valid_us(us) {
+            self.fixed.last_window = Some((us, settled));
+            decay_add(&mut self.combined, us, settled as f32, decay);
+            decay_add(
+                &mut self.slow,
+                us,
+                settled as f32,
+                decay.max(FLOOR_RETIRE_DECAY),
+            );
+        }
+        decay_add(
+            &mut self.fixed.yield_rows,
+            settled as f32,
+            rows as f32,
+            decay,
+        );
+        self.count_probe();
+        let (settled, rows) = self.fixed.yield_rows;
+        if !self.probing()
+            && self.probe_tokens > 0
+            && self.probe_left == 0
+            && rows > 0.0
+            && settled <= FIXED_SUSPECT_YIELD * rows
+        {
+            self.probe_left = self.probe_tokens;
+            self.probe_samples.clear();
+            self.probed_at = Some(self.observed);
+        }
     }
 
     /// A new epoch: the verdict needs [`FLOOR_PROBE_WINDOWS`] fresh windows.
@@ -9737,14 +9788,44 @@ mod fixed_floor_tests {
     }
 
     #[test]
-    fn own_calibration_takes_two_ar_tokens_and_prices_only_the_second() {
+    fn no_ar_token_runs_for_a_price_above_the_suspect_yield() {
+        // A winning request with no AR price (12 of 16 rows settled) never
+        // runs an AR token and never decides.
         let mut floor = FixedFloor::fixed(PROBES);
-        assert_eq!(step(&mut floor, 1, 0.0, 999.0), Action::ArSynced);
-        assert!(!floor.calibrated());
-        assert_eq!(step(&mut floor, 1, 0.0, AR), Action::ArSynced);
+        for _ in 0..200 {
+            assert_eq!(step(&mut floor, 12, 40.0, AR), native());
+        }
+        assert!(!floor.calibrated() && !floor.retired());
+        // At exactly half the rows the probe set runs once the probe windows
+        // are seen; the first probe follows a window and is unpriced.
+        let mut floor = FixedFloor::fixed(PROBES);
+        for _ in 0..FLOOR_PROBE_WINDOWS {
+            assert_eq!(step(&mut floor, 8, 800.0, AR), native());
+        }
+        for us in [9_999.0, AR, AR, AR] {
+            assert_eq!(floor.plan_fixed(WIDTH), Action::ArSynced);
+            ar(&mut floor, Action::ArSynced, us);
+        }
         assert!(floor.calibrated());
         assert_eq!(floor.ar_us(), AR);
+        assert!(floor.retired(), "100 µs per token loses to 25: retired");
+        // A low-yield request that wins once priced keeps speculating.
+        let mut floor = FixedFloor::fixed(PROBES);
+        for _ in 0..FLOOR_PROBE_WINDOWS {
+            step(&mut floor, 2, 40.0, AR);
+        }
+        for _ in 0..PROBES {
+            ar(&mut floor, Action::ArSynced, AR);
+        }
+        assert!(floor.calibrated() && !floor.retired());
         assert_eq!(floor.plan_fixed(WIDTH), native());
+        // No priced probe: no AR price, which retires.
+        let mut floor = FixedFloor::fixed(1);
+        for _ in 0..FLOOR_PROBE_WINDOWS {
+            step(&mut floor, 1, 40.0, AR);
+        }
+        assert_eq!(step(&mut floor, 1, 40.0, AR), Action::ArSynced);
+        assert!(floor.calibrated() && floor.retired());
     }
 
     #[test]
