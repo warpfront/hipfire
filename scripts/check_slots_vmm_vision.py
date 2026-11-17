@@ -10,7 +10,8 @@ path and text requests on the batched `_vmm` path. A *text continuation* of an
 image conversation needs M-RoPE phases too (`pos + rope_delta`); the `_vmm`
 kernels have no M-RoPE writer. This check drives the feature end to end:
 
-  1. image turn + question through a multi-slot `--kv-backend vmm` serve;
+  1. image turn + question through a multi-slot serve on the shared VMM
+     page pool (`serve.multi_slot_paged` + `HIPFIRE_SLOTS_PAGED_BACKEND=vmm`);
   2. a text follow-up on the same conversation (the post-image continuation);
   3. a plain text request (no image) on the same engine;
   4. a prompt longer than `serve.multi_slot_prefill_chunk` with a fact at the
@@ -92,17 +93,12 @@ def main() -> int:
     ap.add_argument(
         "--image2",
         default="benchmarks/vision/images/scene_1.jpg",
-        help="second image for the multi-image check (skipped when absent)",
+        help="second image for the one-image-per-request refusal check (skipped when absent)",
     )
     ap.add_argument("--port", type=int, default=11577)
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--chunk", type=int, default=512)
     ap.add_argument("--spec", default="off", choices=["off", "mtp", "dflash"])
-    ap.add_argument(
-        "--paged-vmm",
-        action="store_true",
-        help="test batched vision on the shared paged pool over VMM",
-    )
     ap.add_argument("--timeout", type=float, default=300.0)
     args = ap.parse_args()
 
@@ -151,11 +147,10 @@ def main() -> int:
         "--idle-timeout",
         "0",
     ]
-    if args.paged_vmm:
-        env["HIPFIRE_SERVE_MULTI_SLOT_PAGED"] = "1"
-        env["HIPFIRE_SLOTS_PAGED_BACKEND"] = "vmm"
-    else:
-        cmd.extend(["--kv-backend", "vmm"])
+    # The multi-slot VMM cache is the shared page pool on the VMM backend;
+    # `--kv-backend vmm` alone is refused on the multi-slot engine.
+    env["HIPFIRE_SERVE_MULTI_SLOT_PAGED"] = "1"
+    env["HIPFIRE_SLOTS_PAGED_BACKEND"] = "vmm"
     cmd.append(f"127.0.0.1:{args.port}")
     proc = subprocess.Popen(
         cmd,
@@ -227,13 +222,15 @@ def main() -> int:
                 "thinking_budget": "off",
                 "stream": False,
             }
-            multi_answer = answer_text(post_chat(args.port, multi, args.timeout))
-            print(
-                f"[check] multi-image first-image answer "
-                f"({time.monotonic() - t0:.1f}s): {multi_answer!r}"
-            )
-            if "dog" not in multi_answer.lower():
-                failures.append(f"multi-image check did not identify the dog: {multi_answer!r}")
+            # The gateway forwards at most one image per request to the
+            # multi-slot route; a second image is a typed 400.
+            try:
+                post_chat(args.port, multi, args.timeout)
+                failures.append("a two-image request was accepted on the multi-slot route")
+            except urllib.error.HTTPError as exc:
+                print(f"[check] two-image request: HTTP {exc.code}")
+                if exc.code != 400:
+                    failures.append(f"two-image request returned HTTP {exc.code}, expected 400")
 
         # Follow-up: the same image conversation, text only. Its KV carries the
         # image turn's compressed-grid phases, so the request needs the

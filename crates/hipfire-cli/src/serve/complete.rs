@@ -1146,18 +1146,7 @@ impl SemanticEventFold {
                         forward.push(serde_json::json!({ "type": "reasoning", "text": text }));
                     } else {
                         self.content.push_str(text);
-                        let mut logical = serde_json::json!({ "type": "token", "text": text });
-                        // Logprobs ride the daemon's token envelope and must
-                        // survive the fold: the non-stream path reads the RAW
-                        // event, so rebuilding the logical token without them
-                        // left `stream: true` + `logprobs` silently empty.
-                        if let Some(lp) = event.get("logprob") {
-                            logical["logprob"] = lp.clone();
-                        }
-                        if let Some(top) = event.get("top_logprobs") {
-                            logical["top_logprobs"] = top.clone();
-                        }
-                        forward.push(logical);
+                        forward.push(serde_json::json!({ "type": "token", "text": text }));
                     }
                 }
             }
@@ -1816,27 +1805,6 @@ pub(crate) fn project_request_contract(
     })
 }
 
-/// OpenAI `n`: one request may ask for up to [`MAX_CHOICES`] independent
-/// completions. The HTTP layer fans them out; each choice is a separate
-/// daemon attempt with its own sampler stream. Values outside the bound and
-/// non-integers are typed 400s, never silently clamped.
-pub(crate) const MAX_CHOICES: u64 = 8;
-
-pub(crate) fn request_choice_count(body: &serde_json::Value) -> Result<u64> {
-    match body.get("n").filter(|n| !n.is_null()) {
-        None => Ok(1),
-        Some(n) => {
-            let Some(n) = n.as_u64() else {
-                bail_invalid!("n must be an integer between 1 and {MAX_CHOICES}");
-            };
-            if n == 0 || n > MAX_CHOICES {
-                bail_invalid!("n must be an integer between 1 and {MAX_CHOICES}");
-            }
-            Ok(n)
-        }
-    }
-}
-
 /// vLLM-compatible `min_tokens`: absent or `null` is 0; otherwise a
 /// non-negative integer no larger than `max_tokens` (400 otherwise, never a
 /// silent clamp).
@@ -1853,8 +1821,17 @@ fn project_min_tokens(body: &serde_json::Value, max_tokens: u64) -> Result<u64> 
     Ok(min_tokens)
 }
 
+/// Every serve route returns one completion per request: `n` other than 1
+/// is refused rather than silently answered with a single choice.
 fn validate_single_choice(body: &serde_json::Value) -> Result<()> {
-    request_choice_count(body).map(drop)
+    if let Some(n) = body.get("n").filter(|n| !n.is_null()) {
+        if n.as_u64() != Some(1) {
+            bail_invalid!(
+                "n != 1 is not supported on this serve route (one completion per request)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Multi-slot request-field checks. Unsupported OpenAI request fields must be
@@ -2315,11 +2292,6 @@ pub(crate) fn complete_request_attempt(
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
         let resolved = runtime.ensure_model(&model, &shared.meta, ModelOrigin::Request)?;
-        if !runtime.multi_slot_enabled && images_base64.len() > 1 {
-            return Err(invalid_request!(
-                "multiple images require experimental multi-slot serve"
-            ));
-        }
         if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
             if let Err(error) = runtime.engine.reset(attempt_id) {
                 if force_reset {
@@ -2401,18 +2373,8 @@ pub(crate) fn complete_request_attempt(
                     "experimental multi-slot supports at most one image_url per request"
                 ),
             }
-        } else if images_base64.len() == 1 {
-            // Keep the historical single-image wire field for the standard
-            // daemon, which does not know `images_base64`.
-            generate["image_base64"] =
-                serde_json::Value::String(images_base64.into_iter().next().expect("one image"));
         } else if !images_base64.is_empty() {
-            generate["images_base64"] = serde_json::Value::Array(
-                images_base64
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            );
+            generate["images_base64"] = serde_json::json!(images_base64);
         }
         for (key, config_key) in [
             ("temperature", "generation.temperature"),
@@ -3262,7 +3224,6 @@ pub(crate) fn request_images_base64(messages: Option<&serde_json::Value>) -> Res
         return Ok(Vec::new());
     };
     let mut images = Vec::new();
-    const MAX_IMAGES: usize = 8;
     for message in messages {
         if normalized_role(message).is_none() {
             continue;
@@ -3294,9 +3255,6 @@ pub(crate) fn request_images_base64(messages: Option<&serde_json::Value>) -> Res
                 })?;
             if payload.is_empty() {
                 bail_invalid!("image_url data URI has an empty base64 payload");
-            }
-            if images.len() >= MAX_IMAGES {
-                bail_invalid!("at most {MAX_IMAGES} image_url parts are supported per request");
             }
             images.push(payload.to_owned());
         }
@@ -3644,62 +3602,6 @@ pub(crate) fn completion_json(completion: &Completion) -> serde_json::Value {
         "hipfire": completion_hipfire(completion),
     })
 }
-/// Serialize `n` independent completions as one OpenAI response: those already
-/// collected plus the one the terminal callback is delivering. The first
-/// completion supplies the response id/timings envelope; every choice keeps
-/// its own message and finish reason. Prompt usage is counted once (the
-/// choices share one request), completion usage is summed.
-///
-/// The non-streaming handler serializes and flushes inside the last choice's
-/// terminal callback (the pre-`n` body staged and parked on the flush ack
-/// there), and `Completion` is not `Clone`, so the last one arrives by
-/// reference.
-pub(crate) fn completion_json_multi_with_last(
-    previous: &[Completion],
-    last: &Completion,
-) -> serde_json::Value {
-    completion_json_multi_over(previous.iter().chain(std::iter::once(last)))
-}
-
-fn completion_json_multi_over<'a>(
-    completions: impl Iterator<Item = &'a Completion>,
-) -> serde_json::Value {
-    let mut completions = completions.peekable();
-    let Some(first) = completions.peek() else {
-        return serde_json::Value::Null;
-    };
-    let mut out = completion_json(first);
-    let mut choices = Vec::new();
-    let mut completion_tokens = 0u64;
-    let mut first_usage = serde_json::Value::Null;
-    for (index, completion) in completions.enumerate() {
-        if index == 0 {
-            first_usage = completion_usage(completion);
-        }
-        let mut one = completion_json(completion);
-        let mut choice = one["choices"][0].take();
-        choice["index"] = serde_json::json!(index);
-        choices.push(choice);
-        completion_tokens = completion_tokens.saturating_add(
-            completion
-                .done
-                .get("tokens")
-                .or_else(|| completion.done.get("completion_tokens"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-        );
-    }
-    out["choices"] = serde_json::Value::Array(choices);
-    let prompt_tokens = first_usage["prompt_tokens"].as_u64().unwrap_or(0);
-    out["usage"] = serde_json::json!({
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens.saturating_add(completion_tokens),
-        "prompt_tokens_details": first_usage["prompt_tokens_details"].clone(),
-    });
-    out
-}
-
 /// `completion_tokens` is the daemon's `done.tokens` verbatim (committed
 /// tokens; drafted/rejected spec tokens never count). Terminator policy is
 /// per arch and pinned, not unified, for 0.4.1: Qwen AR/spec/batch count the
@@ -3880,32 +3782,6 @@ pub(crate) fn openai_stream_delta_for_event(
     }
 }
 
-/// The OpenAI `choices[i].logprobs` object for one streamed `token` event, or
-/// `None` when the event carries no sampled logprob.
-///
-/// The daemon attaches `logprob` + `top_logprobs` to the token envelope when
-/// the request asked for them; the gateway used to forward only `text`, so
-/// `stream: true` + `logprobs` answered with no logprobs at all. The event's
-/// entries are already the OpenAI entry shape (`token`, `logprob`, `bytes`).
-/// One event is one released text chunk, not one sampled token — the slot
-/// emitter releases after its decoder step — so such a chunk yields one entry.
-pub(crate) fn openai_stream_logprobs_for_event(
-    event: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    if event.get("type").and_then(serde_json::Value::as_str) != Some("token") {
-        return None;
-    }
-    let logprob = event.get("logprob").and_then(serde_json::Value::as_f64)?;
-    let mut entry = serde_json::json!({
-        "token": event.get("text").and_then(serde_json::Value::as_str).unwrap_or_default(),
-        "logprob": logprob,
-    });
-    if let Some(top) = event.get("top_logprobs") {
-        entry["top_logprobs"] = top.clone();
-    }
-    Some(serde_json::json!({ "content": [entry] }))
-}
-
 /// Lower shared adapter results into an OpenAI stream `delta` tool_calls object.
 pub(crate) fn openai_tool_call_delta_from_adapter(
     adapted: &[OpenAiToolCallAdapterResult],
@@ -3934,27 +3810,6 @@ pub(crate) fn openai_stream_terminal_chunks(
     completion: &Completion,
     include_usage: bool,
 ) -> Vec<serde_json::Value> {
-    openai_stream_terminal_chunks_at(completion, include_usage, 0)
-}
-
-/// [`openai_stream_terminal_chunks`] for one choice index in an `n > 1`
-/// stream. The caller appends `[DONE]` only after the last choice.
-pub(crate) fn openai_stream_terminal_chunks_at(
-    completion: &Completion,
-    include_usage: bool,
-    index: usize,
-) -> Vec<serde_json::Value> {
-    openai_stream_terminal_chunks_usage(completion, include_usage, index, None)
-}
-
-/// [`openai_stream_terminal_chunks_at`] with an aggregate usage override for
-/// an `n > 1` stream's final choice.
-pub(crate) fn openai_stream_terminal_chunks_usage(
-    completion: &Completion,
-    include_usage: bool,
-    index: usize,
-    usage_override: Option<&serde_json::Value>,
-) -> Vec<serde_json::Value> {
     let finish_reason = openai_finish_reason(&completion.done);
     let mut chunks = Vec::new();
 
@@ -3969,7 +3824,7 @@ pub(crate) fn openai_stream_terminal_chunks_usage(
             "created": completion.created,
             "model": completion.model,
             "choices": [{
-                "index": index,
+                "index": 0,
                 "delta": delta,
                 "finish_reason": null
             }],
@@ -3981,7 +3836,7 @@ pub(crate) fn openai_stream_terminal_chunks_usage(
         "object": "chat.completion.chunk",
         "created": completion.created,
         "model": completion.model,
-        "choices": [{ "index": index, "delta": {}, "finish_reason": finish_reason }],
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
         "timings": completion_timings(completion),
         "hipfire": completion_hipfire(completion),
     }));
@@ -3993,7 +3848,7 @@ pub(crate) fn openai_stream_terminal_chunks_usage(
             "created": completion.created,
             "model": completion.model,
             "choices": [],
-            "usage": usage_override.cloned().unwrap_or_else(|| completion_usage(completion)),
+            "usage": completion_usage(completion),
         }));
     }
 
@@ -5388,30 +5243,6 @@ mod tests {
     }
 
     #[test]
-    fn completion_json_multi_indexes_choices_and_sums_completion_usage() {
-        let a = sample_completion("red", Vec::new(), "stop");
-        let b = sample_completion("blue", Vec::new(), "length");
-        let json = completion_json_multi_with_last(&[a], &b);
-        assert_eq!(json["choices"][0]["index"], 0);
-        assert_eq!(json["choices"][1]["index"], 1);
-        assert_eq!(json["choices"][0]["message"]["content"], "red");
-        assert_eq!(json["choices"][1]["message"]["content"], "blue");
-        assert_eq!(json["choices"][1]["finish_reason"], "length");
-        // Prompt is counted once; completion tokens are the per-choice sum.
-        assert_eq!(json["usage"]["prompt_tokens"], 3);
-        assert_eq!(json["usage"]["completion_tokens"], 10);
-        assert_eq!(json["usage"]["total_tokens"], 13);
-    }
-
-    #[test]
-    fn openai_stream_terminal_chunks_carry_the_choice_index() {
-        let completion = sample_completion("red", Vec::new(), "stop");
-        let chunks = openai_stream_terminal_chunks_at(&completion, false, 3);
-        assert_eq!(chunks[0]["choices"][0]["index"], 3);
-        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "stop");
-    }
-
-    #[test]
     fn completion_json_pure_tool_turn_uses_null_content() {
         let completion = sample_completion(
             "",
@@ -5475,40 +5306,6 @@ mod tests {
         assert_eq!(json["choices"][0]["message"]["content"], "hello world");
         assert!(json["choices"][0]["message"].get("tool_calls").is_none());
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
-    }
-
-    /// `stream: true` + `logprobs`: the daemon's token envelope carries the
-    /// sampled logprob and its top-k, and the SSE chunk must carry them as
-    /// OpenAI `choices[0].logprobs.content`. Without a logprob the chunk has
-    /// no `logprobs` key at all (same shape as a request that did not ask).
-    #[test]
-    fn openai_stream_chunk_carries_asked_logprobs_only() {
-        let event = serde_json::json!({
-            "type": "token",
-            "id": "r1",
-            "text": "hello",
-            "logprob": -0.25,
-            "top_logprobs": [
-                { "token": "hello", "logprob": -0.25, "bytes": [104, 101, 108, 108, 111] },
-                { "token": "help", "logprob": -2.5, "bytes": [104, 101, 108, 112] }
-            ]
-        });
-        let logprobs = openai_stream_logprobs_for_event(&event).expect("logprobs");
-        assert_eq!(logprobs["content"][0]["token"], "hello");
-        assert_eq!(logprobs["content"][0]["logprob"], -0.25);
-        assert_eq!(logprobs["content"][0]["top_logprobs"][1]["token"], "help");
-        // Reasoning events and unlogged tokens carry nothing.
-        assert!(openai_stream_logprobs_for_event(&serde_json::json!({
-            "type": "reasoning",
-            "text": "plan",
-            "logprob": -0.1
-        }))
-        .is_none());
-        assert!(openai_stream_logprobs_for_event(&serde_json::json!({
-            "type": "token",
-            "text": "hi"
-        }))
-        .is_none());
     }
 
     #[test]
@@ -7384,47 +7181,6 @@ mod tests {
         );
     }
 
-    /// The streamed delta is built from the fold's **logical** event, while
-    /// the non-stream response is built from the **raw** one. A logical token
-    /// event that dropped `logprob` therefore made `stream: true` + `logprobs`
-    /// silently empty (measured on gfx1100: non-stream 12 entries, stream
-    /// 0/14 chunks) while non-stream kept working. The fold must carry both.
-    #[test]
-    fn fold_preserves_logprobs_on_the_logical_token_event() {
-        let mut fold = SemanticEventFold::new();
-        fold.begin_attempt("req-lp", 3);
-        let logical = fold
-            .push(&serde_json::json!({
-                "type": "token",
-                "text": "Rivers",
-                "logprob": -0.25,
-                "top_logprobs": [
-                    { "token": "Rivers", "logprob": -0.25, "bytes": [82] },
-                    { "token": "R", "logprob": -1.5, "bytes": [82] }
-                ],
-                "id": "req-lp",
-                "attempt_id": 3
-            }))
-            .unwrap();
-        assert_eq!(logical.len(), 1);
-        assert_eq!(logical[0]["text"], "Rivers");
-        assert!((logical[0]["logprob"].as_f64().unwrap() + 0.25).abs() < 1e-6);
-        assert_eq!(logical[0]["top_logprobs"][1]["token"], "R");
-        // ...and it reaches the OpenAI chunk shape the SSE encoder emits.
-        assert_eq!(
-            openai_stream_logprobs_for_event(&logical[0]).unwrap()["content"][0]["token"],
-            "Rivers"
-        );
-        // A token event without logprobs stays byte-identical (no field).
-        let plain = fold
-            .push(&serde_json::json!({
-                "type": "token", "text": " flow", "id": "req-lp", "attempt_id": 3
-            }))
-            .unwrap();
-        assert!(plain[0].get("logprob").is_none());
-        assert!(openai_stream_logprobs_for_event(&plain[0]).is_none());
-    }
-
     #[test]
     fn logprob_entry_builds_bytes_and_top() {
         let event = serde_json::json!({
@@ -8507,13 +8263,13 @@ mod tests {
 
     /// Unsupported OpenAI request fields must be refused here — the daemon
     /// has typed refusals for them, but this gateway builds the generate
-    /// message from scratch and would strip the fields first (a silent
-    /// semantic downgrade). `n` is no longer in this set: the HTTP layer
-    /// fans it out and `request_choice_count` bounds it.
+    /// message from scratch and would strip the fields first (silent
+    /// semantic downgrade: `n: 2` returning one completion).
     #[test]
     fn project_request_contract_refuses_unsupported_fields() {
         let resolved = contract_resolved_with_system("");
         let cases = [
+            serde_json::json!({"n": 2}),
             serde_json::json!({"best_of": 2}),
             serde_json::json!({"logit_bias": {"5": 10}}),
             serde_json::json!({"echo": true}),
@@ -8534,7 +8290,7 @@ mod tests {
                 "unexpected error for {k}: {err}"
             );
         }
-        // n in range (and absent/null) must pass.
+        // n=1 is the only legal arity and must pass.
         let body = serde_json::json!({
             "max_tokens": 16, "n": 1,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -8542,16 +8298,15 @@ mod tests {
         assert!(project_request_contract(&body, &resolved, false, true).is_ok());
     }
 
-    /// `n` is parsed at the gateway: 1..=MAX_CHOICES is legal (the HTTP layer
-    /// fans it out), while zero, over-max and non-integers are typed 400s on
-    /// both routes.
+    /// `n != 1` is refused as a typed 400 on BOTH routes (standard and
+    /// multi-slot); `n: 1` and an absent/null `n` pass on both.
     #[test]
-    fn project_request_contract_bounds_n_on_every_route() {
+    fn project_request_contract_refuses_n_on_every_route() {
         let resolved = contract_resolved_with_system("");
         for multi_slot in [false, true] {
             for bad in [
+                serde_json::json!(2),
                 serde_json::json!(0),
-                serde_json::json!(9),
                 serde_json::json!("1"),
             ] {
                 let body = serde_json::json!({
@@ -8565,11 +8320,7 @@ mod tests {
                     "multi_slot={multi_slot} n={bad}: not a typed invalid request: {err}"
                 );
             }
-            for ok in [
-                serde_json::json!(1),
-                serde_json::json!(2),
-                serde_json::Value::Null,
-            ] {
+            for ok in [serde_json::json!(1), serde_json::Value::Null] {
                 let body = serde_json::json!({
                     "max_tokens": 16, "n": ok,
                     "messages": [{ "role": "user", "content": "hi" }]
@@ -8741,15 +8492,6 @@ mod tests {
                 .map(drop),
             ),
             (
-                "at most 8 image_url",
-                request_images_base64(Some(&serde_json::json!([
-                    {"role": "user", "content":
-                        (0..9).map(|_| image("data:image/png;base64,AA")).collect::<Vec<_>>()
-                    }
-                ])))
-                .map(drop),
-            ),
-            (
                 "only base64 PNG and JPEG image_url data URIs",
                 request_images_base64(Some(&serde_json::json!([
                     {"role": "user", "content": [image("data:image/gif;base64,AA")]}
@@ -8761,8 +8503,8 @@ mod tests {
                 contract(serde_json::json!({"max_tokens": 0})),
             ),
             (
-                "n must be an integer",
-                contract(serde_json::json!({"max_tokens": 8, "n": 9})),
+                "n != 1",
+                contract(serde_json::json!({"max_tokens": 8, "n": 2})),
             ),
             (
                 "temperature must be within",

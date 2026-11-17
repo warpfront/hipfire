@@ -700,6 +700,7 @@ pub(crate) fn route_capabilities(
         // spelled out separately.
         "refused_request_fields": if multi_slot {
             serde_json::json!([
+                "n",
                 "best_of",
                 "logit_bias",
                 "echo",
@@ -5234,14 +5235,21 @@ mod capabilities_tests {
             "stop sequences are supported"
         );
         assert!(
-            !refused.iter().any(|v| v == "response_format:json_object"),
-            "json_object is enforced as a permissive object schema"
-        );
-        assert!(
             !refused.iter().any(|v| v == "logprobs"),
             "logprobs are supported (AR fallback)"
         );
-        for field in ["best_of", "logit_bias", "echo", "suffix", "tools+image"] {
+        assert!(
+            !refused.iter().any(|v| v == "response_format:json_object"),
+            "json_object is enforced as a permissive object schema"
+        );
+        for field in [
+            "n",
+            "best_of",
+            "logit_bias",
+            "echo",
+            "suffix",
+            "tools+image",
+        ] {
             assert!(
                 refused.iter().any(|v| v == field),
                 "refusal list must contain {field}"
