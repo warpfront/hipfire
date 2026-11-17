@@ -86,8 +86,9 @@ impl AttachedDraft {
 /// selected explicitly. DeepSeek4 MQ2R is narrower still: only the certified
 /// gfx1151 single-GPU AR route is admitted, and an installed drafter keeps the
 /// model on its speculative execution path. Qwen3.5 dense (arch 5) on exact
-/// gfx1201 is admitted for any weight format on the single-GPU plain-AR route,
-/// with no drafter or a DFlash drafter ([`AttachedDraft::Dflash`]): its
+/// gfx1201 is admitted for any weight format on the single-GPU plain-AR route
+/// (no drafter), and with a DFlash drafter ([`AttachedDraft::Dflash`]) only for
+/// symmetric MQ4G256V2 ([`dflash_pm4_weights_qualified`]): its
 /// retained PM4 decode tape is byte-identical to the HIP AR graph. Qwen4
 /// (Flash-Next) on exact gfx1201 is admitted the same way but with no drafter
 /// only (a native MTP head is a drafter, so only an MTP-off load replays),
@@ -157,7 +158,7 @@ pub fn retained_redline_default(
         && tp == 1
         && qwen35_dense_draft_ok
         && weights.is_some_and(|w| match draft {
-            AttachedDraft::Dflash => gfx1100_dflash_weights_qualified(w),
+            AttachedDraft::Dflash => dflash_pm4_weights_qualified(w),
             _ => gfx1100_dense_weights_qualified(w),
         })
     {
@@ -167,7 +168,16 @@ pub fn retained_redline_default(
         return true;
     }
     if gpu_arch.eq_ignore_ascii_case("gfx1201") && pp == 1 && tp == 1 {
-        if model_arch.eq_ignore_ascii_case("qwen3_5") && qwen35_dense_draft_ok {
+        // Plain AR: any weight format. A DFlash drafter narrows this to the
+        // symmetric MQ4G256V2 trunk, the only format with a measured DFlash
+        // PM4 receipt on gfx1201 (as on gfx1100).
+        if model_arch.eq_ignore_ascii_case("qwen3_5")
+            && match draft {
+                AttachedDraft::None => true,
+                AttachedDraft::Dflash => weights.is_some_and(dflash_pm4_weights_qualified),
+                _ => false,
+            }
+        {
             return true;
         }
         if model_arch.eq_ignore_ascii_case("qwen4") && !has_drafter {
@@ -210,8 +220,9 @@ pub fn gfx1100_dense_weights_qualified(weights: DenseWeights) -> bool {
 }
 
 /// The subset of [`gfx1100_dense_weights_qualified`] with a DFlash-paired
-/// receipt on gfx1100: symmetric MQ4G256V2 only. DFlash + MQ3G256V2 has none.
-pub fn gfx1100_dflash_weights_qualified(weights: DenseWeights) -> bool {
+/// receipt on gfx1100 and gfx1201: symmetric MQ4G256V2 only. DFlash +
+/// MQ3G256V2 or asymmetric MQ4G256V2 has none.
+pub fn dflash_pm4_weights_qualified(weights: DenseWeights) -> bool {
     matches!(weights, DenseWeights::Mq4V2 { symmetric: true })
 }
 
@@ -969,13 +980,24 @@ mod tests {
     #[test]
     fn qwen35_dense_redline_default_requires_gfx1201_single_gpu_ar() {
         let h2 = "/models/h2.group-alpha-refit.hfq";
-        // No drafter, or a DFlash drafter whose AR forwards stage the draft's
-        // hidden rows inside the tape.
-        for draft in [D::None, D::Dflash] {
-            assert!(retained_redline_default(
-                "gfx1201", "qwen3_5", h2, 1, 1, draft
-            ));
-        }
+        // No drafter, any weight format; a DFlash drafter only with symmetric
+        // MQ4G256V2 weights (see `attached_draft_admission_truth_table`).
+        assert!(retained_redline_default(
+            "gfx1201",
+            "qwen3_5",
+            h2,
+            1,
+            1,
+            D::None
+        ));
+        assert!(!retained_redline_default(
+            "gfx1201",
+            "qwen3_5",
+            h2,
+            1,
+            1,
+            D::Dflash
+        ));
         // Any other drafter keeps the model on its speculative path.
         for draft in [D::NativeMtp, D::Other] {
             assert!(!retained_redline_default(
@@ -1088,17 +1110,20 @@ mod tests {
     }
 
     /// Every [`D`] kind against every admitted cell (single GPU): DFlash joins
-    /// exactly the two Qwen3.5-dense cells (on gfx1100 symmetric MQ4 only;
-    /// gfx1100 + Mq3V2 admits no drafter), the MQ4R SKU rule ignores the
+    /// exactly the two Qwen3.5-dense cells (on both archs symmetric MQ4 only;
+    /// gfx1100 + Mq3V2 admits no drafter, gfx1201 + Mq3V2 / asymmetric MQ4 /
+    /// unknown weights admits plain AR only), the MQ4R SKU rule ignores the
     /// drafter as before, and every other cell admits no drafter at all.
     #[test]
     fn attached_draft_admission_truth_table() {
         let mq4 = Some(DenseWeights::Mq4V2 { symmetric: true });
         let mq3 = Some(DenseWeights::Mq3V2 { symmetric: true });
         let unqualified = Some(DenseWeights::Mq4V2 { symmetric: false });
-        let cells: [(&str, &str, Option<RouteSku>, Option<DenseWeights>, &[D]); 12] = [
+        let cells: [(&str, &str, Option<RouteSku>, Option<DenseWeights>, &[D]); 14] = [
             ("gfx1201", "qwen3_5", None, mq4, &[D::None, D::Dflash]),
-            ("gfx1201", "qwen3_5", None, None, &[D::None, D::Dflash]),
+            ("gfx1201", "qwen3_5", None, None, &[D::None]),
+            ("gfx1201", "qwen3_5", None, mq3, &[D::None]),
+            ("gfx1201", "qwen3_5", None, unqualified, &[D::None]),
             ("gfx1100", "qwen3_5", None, mq4, &[D::None, D::Dflash]),
             ("gfx1100", "qwen3_5", None, mq3, &[D::None]),
             ("gfx1100", "qwen3_5", None, unqualified, &[]),

@@ -184,8 +184,8 @@ The drafter a load attached enters admission typed, as
 `AttachedDraft::{None, Dflash, NativeMtp, Other}` (from the loaded
 speculator's name), never as a yes/no: the two Qwen3.5-dense predicates admit
 `None` and `Dflash` (see "AR forwards of a load with a DFlash drafter" below;
-on gfx1100 a DFlash drafter is admitted for symmetric MQ4G256V2 only, there is
-no DFlash + MQ3G256V2 receipt), every other predicate admits `None` only, and the MQ4R SKU predicate does not
+on gfx1100 and gfx1201 a DFlash drafter is admitted for symmetric MQ4G256V2
+only, there is no DFlash + MQ3G256V2 receipt), every other predicate admits `None` only, and the MQ4R SKU predicate does not
 read the drafter. A DFlash load that stages the continuous-batching
 speculative lanes (`continuous_batch_size > 1` with `serve_vmm_batch.spec`) is
 `Other`: the gfx1201 save-free DeltaNet verify of those lanes refuses under an
@@ -238,11 +238,16 @@ admission requirements for any later promotion claim.
 
 ```text
 exact GPU arch is gfx1201
-AND model_arch is qwen3_5 (dense, arch_id 5), any weight format
+AND model_arch is qwen3_5 (dense, arch_id 5)
+AND the attached drafter is none (any weight format)
+    or DFlash (the file's DenseWeights is symmetric MQ4G256V2 only,
+    dflash_pm4_weights_qualified)
 AND pipeline parallelism == 1
 AND tensor parallelism == 1
-AND the attached drafter is none or DFlash (AttachedDraft::None | Dflash)
 ```
+
+DFlash-attached PM4 is admitted only for symmetric MQ4V2 trunks, the measured
+`qwen3.8:27b` default, on gfx1100 and gfx1201.
 
 Plain-AR decode then runs as one retained PM4-IB submission per token (the
 first eligible forward records as ordinary HIP, then the tape is prepared).
@@ -331,7 +336,7 @@ AND the file's DenseWeights is in gfx1100_dense_weights_qualified:
       MQ3G256V2 (qt49), symmetric or asymmetric
       MQ4G256V2 (qt44), symmetric
       (with a DFlash drafter: symmetric MQ4G256V2 only,
-      gfx1100_dflash_weights_qualified; no DFlash + MQ3G256V2 receipt)
+      dflash_pm4_weights_qualified; no DFlash + MQ3G256V2 receipt)
 AND pipeline parallelism == 1
 AND tensor parallelism == 1
 AND expert parallelism == 1
@@ -1046,8 +1051,8 @@ No `arch_id` gate, apart from the exclusions listed in §3 (expert-parallel
 loads, Muse Glimmer, Gemma 4, and Qwen3.5 under CPU-executed partial offload).
 `gfx1200` and every other arch remain explicit opt-in.
 Separately, Qwen3.5 dense (`arch_id=5`) and Qwen4 (`arch_id=16`, Flash-Next)
-plain-AR decode (any weight format, no drafter; a DFlash drafter on Qwen3.5
-dense) on exact gfx1201 defaults to retained PM4 (§3).
+plain-AR decode (any weight format, no drafter; with a DFlash drafter on Qwen3.5
+dense, symmetric MQ4G256V2 only) on exact gfx1201 defaults to retained PM4 (§3).
 Explicit backend selection (including the config wizard / profile backend)
 can request broader implemented paths or disable the automatic default.
 Explicit transport changes only the transport. Runtime default ≠ Section 7
@@ -1305,7 +1310,7 @@ Prefer paths and symbols over line numbers.
 
 | Concern | Stable source path and symbols |
 |---|---|
-| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default` (the drafter typed as `AttachedDraft`): `mq4r_redline_default` (MQ4R SKU + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic except the Muse Glimmer and Gemma 4 withholds), Qwen3.5 dense (`qwen3_5`) on exact gfx1201 with `pp=tp=1` and no drafter or a DFlash drafter, Qwen4 (`qwen4`) on exact gfx1201 with `pp=tp=1` and no drafter, Qwen3.5 dense on exact gfx1100 with a qualified decode weight format (`gfx1100_dense_weights_qualified`: MQ3G256V2, symmetric MQ4G256V2), `pp=tp=1` and no drafter, or a DFlash drafter with symmetric MQ4G256V2 only (`gfx1100_dflash_weights_qualified`), the A3B MQ4RS SKU on exact gfx1100 or gfx1201 (`A3B_MQ4RS_RETAINED_ARCHES`; gfx1151 stays on HIP) with `pp=tp=1` and no drafter, and DeepSeek4 MQ2R on gfx1151 AR (SKU and dense-weights identity: `crates/hipfire-runtime/src/route_sku.rs`, `identify_path`). Expert-parallel loads (`ep` > 1) and Qwen3.5 under CPU-executed partial offload are never admitted. Existing LFM `.mq4` sealed evidence has no automatic selector. |
+| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default` (the drafter typed as `AttachedDraft`): `mq4r_redline_default` (MQ4R SKU + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic except the Muse Glimmer and Gemma 4 withholds), Qwen3.5 dense (`qwen3_5`) on exact gfx1201 with `pp=tp=1` and no drafter, or a DFlash drafter with symmetric MQ4G256V2 only (`dflash_pm4_weights_qualified`), Qwen4 (`qwen4`) on exact gfx1201 with `pp=tp=1` and no drafter, Qwen3.5 dense on exact gfx1100 with a qualified decode weight format (`gfx1100_dense_weights_qualified`: MQ3G256V2, symmetric MQ4G256V2), `pp=tp=1` and no drafter, or a DFlash drafter with symmetric MQ4G256V2 only (`dflash_pm4_weights_qualified`), the A3B MQ4RS SKU on exact gfx1100 or gfx1201 (`A3B_MQ4RS_RETAINED_ARCHES`; gfx1151 stays on HIP) with `pp=tp=1` and no drafter, and DeepSeek4 MQ2R on gfx1151 AR (SKU and dense-weights identity: `crates/hipfire-runtime/src/route_sku.rs`, `identify_path`). Expert-parallel loads (`ep` > 1) and Qwen3.5 under CPU-executed partial offload are never admitted. Existing LFM `.mq4` sealed evidence has no automatic selector. |
 | Model-load application and diagnostic handlers | `crates/hipfire-daemon/src/main.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
 | Qwen model boundary and route | `crates/hipfire-arch-qwen35/src/qwen35.rs` — `forward_scratch`; `prepare_scratch_inputs`; `set_forward_eligible`; `should_route_aql`; `should_route_pm4`; `finish_capture`; `prepare_*` |
 | LFM decode path and registry evidence | `crates/hipfire-arch-lfm2moe/src/forward.rs` — `decode_step`; `decode_step_with_graph`. Sealed LFM retained-PM4 evidence/admission: [`admissions.yml`](admissions.yml) row `lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar` (no current runtime selector). |

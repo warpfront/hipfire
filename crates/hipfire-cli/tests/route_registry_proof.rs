@@ -54,9 +54,10 @@ fn legacy_sku(file: &str) -> Option<RouteSku> {
 /// SKU, so the live side is asked with no dense weights and the format rule is
 /// proven by `hipfire-runtime`'s config tests instead. The `.mq4rs` arm carries
 /// the 0.5.0 gfx1100 admission (exact gfx1100 and gfx1201; gfx1151 stays on
-/// HIP) and the gfx1201 Qwen3.5-dense arm the 0.5.0 DFlash admission (a DFlash
-/// drafter, like no drafter, takes it) so the identity route is still proven
-/// equal on every input.
+/// HIP). The gfx1201 Qwen3.5-dense arm admits no drafter only: its DFlash
+/// admission is narrowed to symmetric MQ4G256V2 weights, and this proof asks
+/// the live side with no dense weights, so a DFlash load is refused on both
+/// sides (the weights rule is proven by `hipfire-runtime`'s config tests).
 fn legacy_retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
@@ -90,8 +91,7 @@ fn legacy_retained_redline_default(
     if gpu_arch.eq_ignore_ascii_case("gfx1201")
         && pp == 1
         && tp == 1
-        && ((model_arch.eq_ignore_ascii_case("qwen3_5")
-            && matches!(draft, AttachedDraft::None | AttachedDraft::Dflash))
+        && ((model_arch.eq_ignore_ascii_case("qwen3_5") && draft == AttachedDraft::None)
             || (model_arch.eq_ignore_ascii_case("qwen4") && !has_drafter))
     {
         return true;
