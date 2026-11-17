@@ -49,6 +49,7 @@ use std::any::Any;
 
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::dflash2_spec::trim_feature_rows;
+use hipfire_runtime::session_cache::SessionRoute;
 use hipfire_runtime::spec::{RowPick, SpecAdvance, SpecScratch, SpecTarget};
 use hipfire_runtime::spec_retire::BreakEven;
 use rdna_compute::tensor_ops::{argmax_f32, argmax_f32_host_stream_ordered, ArgmaxF32};
@@ -613,6 +614,20 @@ impl SpecTarget for RaonBundle {
             .map_err(|e| format!("raon1_mini reset_recurrent: {e}"))
     }
 
+    /// Restore the planned prefix (or cold-start) and arm the snapshot
+    /// boundaries [`spec_advance`](SpecTarget::spec_advance) captures; the
+    /// cold reset when no cache is attached.
+    fn session_begin(
+        &mut self,
+        gpu: &mut Gpu,
+        prompt: &[u32],
+        reused: usize,
+        route: SessionRoute,
+    ) -> Result<bool, String> {
+        RaonBundle::session_begin(self, gpu, prompt, reused, route)?;
+        Ok(true)
+    }
+
     fn new_spec_scratch(
         &mut self,
         gpu: &mut Gpu,
@@ -684,9 +699,12 @@ impl SpecTarget for RaonBundle {
         } else {
             0
         };
-        let n_chunks = tokens.len().div_ceil(chunk);
+        // Pieces of the AR prefill's grid (`session_prefill`), cut at every
+        // armed session boundary so a speculative prefill captures the same
+        // cold-exact snapshots.
+        let end = tokens.len();
         let mut off = 0usize;
-        for (ci, piece) in tokens.chunks(chunk).enumerate() {
+        while off < end {
             if abort() {
                 let _ = self.reset(gpu);
                 if let Some(out) = hidden_out.as_deref_mut() {
@@ -694,7 +712,9 @@ impl SpecTarget for RaonBundle {
                 }
                 return Ok(SpecAdvance::Aborted);
             }
-            let last = ci + 1 == n_chunks;
+            let piece_end = self.session_piece_end(start_pos + off, start_pos + end)? - start_pos;
+            let piece = &tokens[off..piece_end];
+            let last = piece_end == end;
             let span = hidden_out
                 .as_ref()
                 .and_then(|_| chunk_span(off, piece.len(), first_kept));
@@ -707,7 +727,8 @@ impl SpecTarget for RaonBundle {
                 }
                 _ => self.forward_chunk(gpu, piece, last)?,
             }
-            off += piece.len();
+            off = piece_end;
+            self.session_reached(gpu, start_pos + off)?;
         }
         let last_argmax = argmax_f32_host_stream_ordered(gpu, self.logits())
             .map_err(|e| format!("raon1_mini spec_advance argmax: {e:?}"))?;

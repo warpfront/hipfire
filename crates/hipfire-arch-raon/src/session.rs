@@ -77,6 +77,23 @@ fn grid_boundaries(
     boundaries
 }
 
+/// End of the prefill piece that starts at `pos` of a prefill ending at
+/// `end`: one `step`-row chunk, cut at the next armed `boundary`. A boundary
+/// at or below `pos` was skipped, which would lose its snapshot: an error.
+pub(crate) fn piece_end(
+    pos: usize,
+    end: usize,
+    step: usize,
+    boundary: Option<usize>,
+) -> Result<usize, String> {
+    if let Some(b) = boundary.filter(|&b| b <= pos) {
+        return Err(format!(
+            "raon1_mini: session boundary {b} is not past position {pos}"
+        ));
+    }
+    Ok(boundary.map_or(end, |b| b.min(end)).min(pos + step.max(1)))
+}
+
 /// The decoded fields of a snapshot's metadata.
 struct Meta {
     position: usize,
@@ -282,7 +299,16 @@ impl SessionState for RaonBundle {
 
 #[cfg(test)]
 mod tests {
-    use super::{grid_boundaries, session_stride, SESSION_STRIDE_TOKENS};
+    use super::{grid_boundaries, piece_end, session_stride, SESSION_STRIDE_TOKENS};
+
+    #[test]
+    fn pieces_are_steps_cut_at_the_boundary() {
+        assert_eq!(piece_end(0, 5000, 512, None), Ok(512));
+        assert_eq!(piece_end(4608, 5000, 512, None), Ok(5000));
+        assert_eq!(piece_end(1024, 5000, 512, Some(1300)), Ok(1300));
+        assert_eq!(piece_end(1024, 1200, 512, Some(2048)), Ok(1200));
+        assert!(piece_end(2048, 5000, 512, Some(2048)).is_err());
+    }
 
     #[test]
     fn stride_is_the_smallest_width_multiple_covering_the_base_stride() {

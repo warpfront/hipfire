@@ -511,12 +511,11 @@ fn spec_prompt_matches_ar(
 ///   no `reasoning_effort` is forwarded (the template reads none), and a
 ///   request the shared body would render differently
 ///   ([`spec_prompt_matches_ar`]) takes the AR route;
-/// * the speculative route prefills cold and never touches the session
-///   cache (the AR route reuses cold-exact session snapshots): the device
-///   state (the bundle's public reset also forgets the live session state),
-///   the conversation mirror and the assistant-turn cache are cleared first,
-///   so the shared body plans a cold prefill of the full render and never
-///   splices cached tokens into it;
+/// * the speculative route reuses the AR route's cold-exact session snapshots:
+///   the shared body plans the deepest one the draft can resume
+///   (`ArchModel::spec_session_reuse`), else prefills cold; the conversation
+///   mirror and the assistant-turn cache are cleared first, so the shared body
+///   never splices cached tokens into the render;
 /// * the sampling is the AR route's: `top_k` and the presence penalty after
 ///   the card defaults ([`RaonSampling::resolve`]), the penalty window sized
 ///   to cover the generation, and the penalties over the generated tokens
@@ -582,7 +581,7 @@ pub fn generate_raon_spec(
     m.conversation_tokens.clear();
     m.asst_turn_cache.clear();
     // The speculative prefill and verify windows may grow the context up to
-    // the reserved rows: session snapshots (kept for the AR route) yield first.
+    // the reserved rows: session snapshots yield first, before the plan.
     if let Some(b) = m.raon_mut() {
         let cap = b.max_seq();
         b.release_session_for_growth(gpu, cap);
