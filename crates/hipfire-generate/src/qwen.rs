@@ -4486,6 +4486,8 @@ struct SpecFloorRun {
     rearm_due: bool,
     rearmed: bool,
     mark: Option<Instant>,
+    /// The load's first-use marker at the last loop mark.
+    first_use: Option<rdna_compute::FirstUseMarker>,
     pending: Option<SpecFloorPending>,
     prev_observed_ar: bool,
     probe_tokens: usize,
@@ -4493,6 +4495,7 @@ struct SpecFloorRun {
     retires: usize,
     rearms: usize,
     observed_windows: usize,
+    cold_windows: usize,
     observed_wall_us: f64,
     observed_priced_us: f64,
     retired_at: Option<usize>,
@@ -4506,6 +4509,7 @@ impl SpecFloorRun {
             rearm_due: false,
             rearmed: false,
             mark: None,
+            first_use: None,
             pending: None,
             prev_observed_ar: false,
             probe_tokens: 0,
@@ -4513,6 +4517,7 @@ impl SpecFloorRun {
             retires: 0,
             rearms: 0,
             observed_windows: 0,
+            cold_windows: 0,
             observed_wall_us: 0.0,
             observed_priced_us: 0.0,
             retired_at: None,
@@ -4541,18 +4546,26 @@ impl SpecFloorRun {
 
     /// The loop mark of the next window: observe the previous window with
     /// its loop-to-loop wall time, then apply a think-close re-arm it carried.
+    /// `first_use` is the load's marker now: a window across which it changed
+    /// paid first-use cost (kernel bind or JIT, tape record or re-arm) and is
+    /// observed unpriced, as is the load's first window at its row count.
     /// Returns the position of a retirement this observation caused, and
     /// whether the speculator's epoch must re-arm.
     fn mark(
         &mut self,
         df: &mut hipfire_runtime::spec::DriverFloor,
         now: Instant,
+        first_use: rdna_compute::FirstUseMarker,
     ) -> (Option<usize>, bool) {
         let previous = self.mark.replace(now);
+        let paid = self
+            .first_use
+            .replace(first_use)
+            .is_some_and(|before| before != first_use);
         let retired = match (self.pending.take(), previous) {
             (Some(pending), Some(at)) => {
                 let us = now.saturating_duration_since(at).as_secs_f64() * 1e6;
-                self.observe(df, pending, us as f32)
+                self.observe(df, pending, us as f32, paid)
             }
             _ => None,
         };
@@ -4569,23 +4582,31 @@ impl SpecFloorRun {
         df: &mut hipfire_runtime::spec::DriverFloor,
         pending: SpecFloorPending,
         us: f32,
+        paid: bool,
     ) -> Option<usize> {
         use hipfire_runtime::spec_economics::{Action, FloorObservation};
         let ar = matches!(pending.obs.action, Action::ArSynced | Action::ArHeadFree);
+        // The price clock prices from the pinned snapshot, never the wall, so
+        // first-use cost cannot reach it; on the wall clock both checks run so
+        // the row count is marked warm either way.
+        let cold = matches!(self.policy, SpecFloorPolicy::Floor)
+            && (df.first_use(pending.obs.rows) | paid);
         let priced = match self.policy {
             SpecFloorPolicy::CountsPinned(pinned) if ar => pinned.ar_us,
             SpecFloorPolicy::CountsPinned(pinned) => pinned.window(pending.obs.rows),
             _ => us,
         };
         self.observed_windows += 1;
+        self.cold_windows += usize::from(cold);
         self.observed_wall_us += f64::from(us);
         self.observed_priced_us += f64::from(priced);
         let was_retired = df.floor.retired();
         df.floor.observe_fixed(FloorObservation {
             us: priced,
+            cold,
             ..pending.obs
         });
-        if pending.steady {
+        if pending.steady && !cold {
             if !ar {
                 df.prices.record_window(pending.obs.rows, pending.ctx, us);
             } else if self.prev_observed_ar {
@@ -4637,6 +4658,7 @@ impl SpecFloorRun {
                 settled,
                 rows,
                 us: 0.0,
+                cold: false,
             },
             ctx,
             end,
@@ -4667,6 +4689,7 @@ impl SpecFloorRun {
             report["retires"] = serde_json::json!(self.retires);
             report["rearms"] = serde_json::json!(self.rearms);
             report["observed_windows"] = serde_json::json!(self.observed_windows);
+            report["cold_windows"] = serde_json::json!(self.cold_windows);
             report["observed_wall_us"] = serde_json::json!(round(self.observed_wall_us));
             report["observed_priced_us"] = serde_json::json!(round(self.observed_priced_us));
         }
@@ -4810,11 +4833,10 @@ mod spec_floor_driver_tests {
 
     fn logged_driver() -> DriverFloor {
         LOGGED.with(|lines| lines.borrow_mut().clear());
-        DriverFloor {
-            floor: FixedFloor::fixed(hipfire_runtime::spec::DRIVER_FLOOR_PROBE_TOKENS)
-                .with_call_log_to("T", "driver-test", true, capture),
-            prices: LoadPrices::new(16),
-        }
+        let mut df = DriverFloor::new(16, hipfire_runtime::spec::DRIVER_FLOOR_PROBE_TOKENS, false);
+        df.floor = FixedFloor::fixed(hipfire_runtime::spec::DRIVER_FLOOR_PROBE_TOKENS)
+            .with_call_log_to("T", "driver-test", true, capture);
+        df
     }
 
     fn observed_settled() -> Vec<String> {
@@ -4831,13 +4853,59 @@ mod spec_floor_driver_tests {
         })
     }
 
+    /// A warm load's first-use marker (`kernels` bumped by a bind or JIT).
+    fn marker(kernels: usize) -> rdna_compute::FirstUseMarker {
+        rdna_compute::FirstUseMarker {
+            kernels,
+            recorded_launches: 0,
+            graph_blobs: 0,
+            replay_state: rdna_compute::replay::ReplayState::Ready,
+        }
+    }
+
+    #[test]
+    fn first_use_windows_are_observed_unpriced_and_never_retire() {
+        // R9700 R2 shape: a load-priced request whose first windows pay
+        // binds and capture (the first at its width, then two marker
+        // changes) at 1.3 s each, then wins warm at 10 ms per token against
+        // 20.
+        let mut df = logged_driver();
+        let mut run = SpecFloorRun::new(SpecFloorPolicy::Floor, None);
+        df.floor.reset_fixed(4);
+        df.floor.calibrate_from(20_000.0);
+        let mut now = Instant::now();
+        let mut kernels = 10;
+        for i in 0..40 {
+            let (retired, _) = run.mark(&mut df, now, marker(kernels));
+            assert_eq!(retired, None);
+            let cold = i < 3;
+            if (1..3).contains(&i) {
+                kernels += 1;
+            }
+            now += Duration::from_millis(if cold { 1_300 } else { 40 });
+            assert_eq!(run.plan(&mut df, 15), Action::Native(15));
+            run.window_done(Action::Native(15), 4, 16, 0, 0, true, &[1; 4]);
+        }
+        assert_eq!(run.cold_windows, 3);
+        assert_eq!(run.probe_tokens, 0);
+        assert!(!df.floor.retired());
+        let spec = df
+            .floor
+            .fixed_spec_us_per_token()
+            .expect("warm windows priced");
+        assert!(
+            (spec - 10_000.0).abs() < 1.0,
+            "cold cost never priced: {spec}"
+        );
+    }
+
     #[test]
     fn the_settled_count_after_repair_reaches_the_observation() {
         let mut df = logged_driver();
         let mut run = SpecFloorRun::new(SpecFloorPolicy::Floor, None);
         run.start(&mut df, 100);
         let t0 = Instant::now();
-        let (retired, rearm) = run.mark(&mut df, t0);
+        let (retired, rearm) = run.mark(&mut df, t0, marker(0));
         assert_eq!((retired, rearm), (None, false), "nothing to observe yet");
         let action = run.plan(&mut df, 15);
         assert_eq!(
@@ -4846,13 +4914,13 @@ mod spec_floor_driver_tests {
             "no load price: no AR token runs for a price"
         );
         run.window_done(action, 12, 16, 100, 112, true, &[7; 12]);
-        run.mark(&mut df, t0 + Duration::from_millis(40));
+        run.mark(&mut df, t0 + Duration::from_millis(40), marker(0));
         // A window that committed 12 tokens of which a strict-prefix repair
         // kept 5: the observation settles 5, never the full tail.
         let action = run.plan(&mut df, 15);
         assert_eq!(action, Action::Native(15));
         run.window_done(action, 5, 16, 112, 117, false, &[1, 2, 3, 4, 5]);
-        run.mark(&mut df, t0 + Duration::from_millis(120));
+        run.mark(&mut df, t0 + Duration::from_millis(120), marker(0));
         assert_eq!(observed_settled(), ["12", "5"]);
         assert_eq!(run.observed_windows, 2);
         assert!((run.observed_wall_us - 120_000.0).abs() < 1.0);
@@ -4869,8 +4937,12 @@ mod spec_floor_driver_tests {
         assert_eq!(df.floor.ar_us(), 20_000.0);
         let t0 = Instant::now();
         let mut retired_at = None;
-        for i in 0..8u64 {
-            let (retired, _) = run.mark(&mut df, t0 + Duration::from_micros(i * 1_234_567));
+        for i in 0..13u64 {
+            let (retired, _) = run.mark(
+                &mut df,
+                t0 + Duration::from_micros(i * 1_234_567),
+                marker(0),
+            );
             retired_at = retired_at.or(retired);
             let action = run.plan(&mut df, 15);
             let at = 100 + 2 * i as usize;
@@ -4878,13 +4950,14 @@ mod spec_floor_driver_tests {
         }
         // 75 ms per 2 tokens against 20 ms per AR token loses on the pinned
         // prices whatever the wall clock read; the price clock has no probes.
-        assert_eq!(retired_at, Some(106));
-        assert_eq!(run.retired_at, Some(106));
+        assert_eq!(retired_at, Some(116));
+        assert_eq!(run.retired_at, Some(116));
         assert_eq!(run.retires, 1);
         assert_eq!(run.probe_tokens, 0);
-        // Three windows at the pinned window price, then retired AR tokens at
-        // the pinned AR price.
-        assert!((run.observed_priced_us - (3.0 * 75_000.0 + 4.0 * 20_000.0)).abs() < 1.0);
+        // The priced minimum of windows at the pinned window price, then
+        // retired AR tokens at the pinned AR price.
+        let windows = hipfire_runtime::spec_economics::FIXED_MIN_PRICED_WINDOWS as f64;
+        assert!((run.observed_priced_us - (windows * 75_000.0 + 4.0 * 20_000.0)).abs() < 1.0);
     }
 
     #[test]
@@ -4896,7 +4969,7 @@ mod spec_floor_driver_tests {
         let t0 = Instant::now();
         let mut now = t0;
         let mut step = |run: &mut SpecFloorRun, df: &mut DriverFloor, consumed: &[u32]| {
-            let (_, rearm) = run.mark(df, now);
+            let (_, rearm) = run.mark(df, now, marker(0));
             now += Duration::from_millis(100);
             let action = run.plan(df, 15);
             run.window_done(action, consumed.len(), 16, 0, 0, true, consumed);
@@ -5910,7 +5983,9 @@ pub fn generate_spec(
         // sticky `retire` verdict.
         let floor_action = if floor_policy.driver() {
             let (retired_at, rearm) = match spec.floor_control() {
-                hipfire_runtime::spec::FloorControl::Driver(df) => floor_run.mark(df, mtp_outer_t0),
+                hipfire_runtime::spec::FloorControl::Driver(df) => {
+                    floor_run.mark(df, mtp_outer_t0, gpu.first_use_marker())
+                }
                 _ => (None, false),
             };
             if rearm {

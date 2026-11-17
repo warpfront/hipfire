@@ -1984,6 +1984,17 @@ pub const DECISIONS: &[Decision] = &[
         evidence: "host bookkeeping read outside every forward; the AR token and the speculative window run the same executors whatever the key says, so recorded and eager programs are unaffected",
         reaches: &[],
     },
+    Decision {
+        id: "dflash-floor-first-use-marker",
+        predicates: &[ReplayState],
+        condition: "rdna-compute dispatch.rs Gpu::first_use_marker, read by hipfire-generate qwen.rs at every loop mark on a driver-owned floor (qwen35 DFlash): `self.replay.state()` with the bound-kernel, replay-tape and graph-blob counts; a change across a window marks it cold, so the floor observes it unpriced",
+        effect: Oracle,
+        switches: "only whether the speculate-vs-AR floor prices that window's wall time; no launch, kernel or replay body depends on it",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "host bookkeeping read between forwards; the next window and AR token run the same executors whatever the marker says, so recorded and eager programs are unaffected",
+        reaches: &[],
+    },
 ];
 pub const SITES: &[Site] = &[
     Site {
@@ -1991,6 +2002,12 @@ pub const SITES: &[Site] = &[
         function: "spec_floor_route_key",
         occurrences: 1,
         decisions: &["dflash-floor-price-route-key"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "first_use_marker",
+        occurrences: 1,
+        decisions: &["dflash-floor-first-use-marker"],
     },
     Site {
         file: "hipfire-arch-raon/src/bundle.rs",

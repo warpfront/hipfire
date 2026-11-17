@@ -2083,6 +2083,20 @@ pub struct Gpu {
 /// stream wait. Read once when the [`Gpu`] is constructed.
 pub const STEADY_READBACK_PINNED_ENV: &str = "HIPFIRE_STEADY_READBACK_PINNED";
 
+/// What [`Gpu::first_use_marker`] compares: two markers differ when first-use
+/// cost was paid between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirstUseMarker {
+    /// Bound kernel functions plus loaded modules.
+    pub kernels: usize,
+    /// Launches on the replay tape.
+    pub recorded_launches: usize,
+    /// Captured HIP-graph kernarg blobs.
+    pub graph_blobs: usize,
+    /// Replay lifecycle stage.
+    pub replay_state: crate::replay::ReplayState,
+}
+
 /// See [`Gpu::kv_fit_floor`]: plain data, no behaviour.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KvFitFloor {
@@ -6131,6 +6145,20 @@ impl Gpu {
     pub fn graph_blob_count(&self) -> usize {
         // bind_thread: skip — reads a captured-graph counter, no HIP calls.
         self.graphs.capture_blobs.len()
+    }
+
+    /// This load's first-use state: it changes whenever the load pays
+    /// first-use cost (a kernel bound or compiled, a launch recorded on the
+    /// replay tape, a graph blob captured, a replay lifecycle transition such
+    /// as a tape recorded, validated or re-armed). Field reads only.
+    pub fn first_use_marker(&self) -> FirstUseMarker {
+        // bind_thread: skip — reads counters and the replay state, no HIP calls.
+        FirstUseMarker {
+            kernels: self.functions.len() + self.modules.len(),
+            recorded_launches: self.replay.recorded_launches().len(),
+            graph_blobs: self.graphs.capture_blobs.len(),
+            replay_state: self.replay.state(),
+        }
     }
 
     /// Debug-only assertion that the HipGraph and Replay tapes would agree.
