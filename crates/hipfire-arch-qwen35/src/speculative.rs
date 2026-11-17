@@ -3405,7 +3405,7 @@ impl HiddenStateRingBuffer {
     /// one row per extraction layer at offset zero, committed afterwards with
     /// [`Self::commit_staging_to_ring`].
     pub(crate) fn staging_stage(&self) -> HiddenStage<'_> {
-        HiddenStage {
+        HiddenStage::Rows {
             extract_layers: &self.extract_layers,
             rows: &self.staging_bufs,
             hidden_dim: self.hidden_dim,
@@ -3760,7 +3760,7 @@ impl HiddenStateRingBuffer {
 /// Copy `elems` F32 values from `src` into `dst` at offset zero: the one
 /// recording-aware staging write every fixed-offset hidden stage uses (the
 /// verify ring's [`HiddenStateRingBuffer::write_rows_to_staging`] and the
-/// single-token forward's [`HiddenStage`]).
+/// single-token forward's [`HiddenStage::Rows`]).
 ///
 /// The software Redline recorder retains typed kernel launches, not HIP memcpy
 /// commands. During recording this byte-identical copy is the blob-backed
@@ -3785,29 +3785,47 @@ pub(crate) fn write_staging_rows(
     }
 }
 
-/// Where a single-token target forward stages each extraction layer's
-/// post-layer hidden row: row `i` of `rows` (offset zero) for
-/// `extract_layers[i]`. The rows sit at fixed addresses, so a captured or
-/// recorded forward bakes no ring head; the owner commits them to its ring
-/// after the forward returns.
+/// Where a single-token target forward writes each extraction layer's
+/// post-layer hidden row.
 #[derive(Clone, Copy)]
-pub(crate) struct HiddenStage<'a> {
-    pub(crate) extract_layers: &'a [usize],
-    pub(crate) rows: &'a [GpuTensor],
-    pub(crate) hidden_dim: usize,
+pub(crate) enum HiddenStage<'a> {
+    /// Row `i` of `rows` (offset zero) for `extract_layers[i]`. The rows sit at
+    /// fixed addresses, so a captured or recorded forward bakes no ring head;
+    /// the owner commits them to its ring after the forward returns.
+    Rows {
+        extract_layers: &'a [usize],
+        rows: &'a [GpuTensor],
+        hidden_dim: usize,
+    },
+    /// Straight into the ring at its current head
+    /// ([`HiddenStateRingBuffer::write_rows_at_head`]); the owner advances the
+    /// head once after the forward. Eager only: the copy offsets bake the
+    /// head, so a captured or recorded forward must use [`Self::Rows`]. Needs no
+    /// commit, hence no stream synchronization after the forward.
+    RingHead(&'a HiddenStateRingBuffer),
 }
 
 impl HiddenStage<'_> {
-    /// Stage `x` as `layer_idx`'s row when `layer_idx` is an extraction layer.
+    /// Write `x` as `layer_idx`'s row when `layer_idx` is an extraction layer.
     pub(crate) fn write_layer(
         &self,
         gpu: &mut Gpu,
         layer_idx: usize,
         x: &GpuTensor,
     ) -> HipResult<()> {
-        match self.extract_layers.iter().position(|&l| l == layer_idx) {
-            Some(slot) => write_staging_rows(gpu, &self.rows[slot], x, self.hidden_dim),
-            None => Ok(()),
+        match *self {
+            Self::Rows {
+                extract_layers,
+                rows,
+                hidden_dim,
+            } => match extract_layers.iter().position(|&l| l == layer_idx) {
+                Some(slot) => write_staging_rows(gpu, &rows[slot], x, hidden_dim),
+                None => Ok(()),
+            },
+            Self::RingHead(ring) => match ring.extract_slot(layer_idx) {
+                Some(slot) => ring.write_rows_at_head(gpu, slot, x, 1),
+                None => Ok(()),
+            },
         }
     }
 }
@@ -3862,7 +3880,7 @@ impl ArHiddenStaging {
     }
 
     pub(crate) fn stage(&self) -> HiddenStage<'_> {
-        HiddenStage {
+        HiddenStage::Rows {
             extract_layers: &self.extract_layers,
             rows: &self.rows,
             hidden_dim: self.hidden_dim,

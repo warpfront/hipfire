@@ -1874,11 +1874,21 @@ pub fn forward_scratch(
 }
 
 /// One non-AR single-token target row (the per-token prefill fallback of a
-/// prompt seed or verify) whose extraction-layer hidden rows go to
-/// `hidden_rb`'s own fixed-offset staging; the caller commits them with
-/// [`HiddenStateRingBuffer::commit_staging_to_ring`]. Never the plain-AR body:
-/// the retained eligibility is cleared before the first launch and the call
-/// is AR-graph ineligible, so it neither records, replays nor captures.
+/// prompt seed, forced advance or verify) that also writes its
+/// extraction-layer hidden rows to `hidden_rb` and advances its head once.
+/// Never the plain-AR body: the retained eligibility is cleared before the
+/// first launch and the call is AR-graph ineligible, so it neither records,
+/// replays nor captures its own graph.
+///
+/// Eagerly the rows go straight to the ring at its head, as the ordinary
+/// prefill route writes a chunk's rows, so the host never waits on the
+/// stream after the forward. A staged commit here
+/// ([`HiddenStateRingBuffer::commit_staging_to_ring`]) synchronizes the stream
+/// on the full forward, which the end-of-request forced advance of a DFlash
+/// request then spends inside the request instead of overlapping the next
+/// one. Inside an outer HipGraph capture the head must not be baked, so the
+/// rows go through the ring's fixed-offset staging and are committed after
+/// the forward.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward_scratch_ring_row(
     gpu: &mut Gpu,
@@ -1889,10 +1899,24 @@ pub(crate) fn forward_scratch_ring_row(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
-    hidden_rb: &HiddenStateRingBuffer,
+    hidden_rb: &mut HiddenStateRingBuffer,
 ) -> HipResult<()> {
     gpu.replay.enter_batched_forward();
     gpu.graphs.ar_graph_eligible = false;
+    if gpu.graphs.capture_mode {
+        forward_scratch_staged(
+            gpu,
+            weights,
+            config,
+            token,
+            pos,
+            kv_cache,
+            dn_state,
+            scratch,
+            Some(hidden_rb.staging_stage()),
+        )?;
+        return hidden_rb.commit_staging_to_ring(gpu, 1);
+    }
     forward_scratch_staged(
         gpu,
         weights,
@@ -1902,8 +1926,10 @@ pub(crate) fn forward_scratch_ring_row(
         kv_cache,
         dn_state,
         scratch,
-        Some(hidden_rb.staging_stage()),
-    )
+        Some(HiddenStage::RingHead(hidden_rb)),
+    )?;
+    hidden_rb.advance_head();
+    Ok(())
 }
 
 /// The one single-token forward body of [`forward_scratch`] and
@@ -2466,7 +2492,8 @@ pub fn forward_scratch_embed_mrope(
 /// (`super::program`): per layer one mixer step (`DeltaNetMixer` or
 /// `GatedAttention`) and one FFN step (`GatedMlp`, or the sealed MoE call).
 /// `stage` receives the post-layer hidden rows of the extraction layers
-/// speculative drafts read (fixed offsets, committed by the owner afterwards);
+/// speculative drafts read ([`HiddenStage`]: fixed-offset rows the owner
+/// commits afterwards, or the ring at its head when eager);
 /// `mrope` switches full attention to the (t, h, w) RoPE of a VL step.
 #[allow(clippy::too_many_arguments)]
 fn forward_scratch_layers(

@@ -1829,7 +1829,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "dflash-hidden-staging-recorded-copy",
         predicates: &[IsRecording],
-        condition: "write_staging_rows (speculative.rs), the one fixed-offset staging write behind HiddenStateRingBuffer::write_rows_to_staging (verify, prompt seed, per-token prefill fallback rows) and HiddenStage::write_layer (forward_scratch's ArHiddenStaging rows on a load with a DFlash drafter), uses copy_f32_buffer when is_recording(), otherwise native D2D memcpy (async on the active stream under HipGraph capture)",
+        condition: "write_staging_rows (speculative.rs), the one fixed-offset staging write behind HiddenStateRingBuffer::write_rows_to_staging (verify, prompt seed) and HiddenStage::Rows in HiddenStage::write_layer (forward_scratch's ArHiddenStaging rows on a load with a DFlash drafter; a per-token prefill fallback row only inside a HipGraph capture, eagerly it is HiddenStage::RingHead, a D2D copy to the ring at its head), uses copy_f32_buffer when is_recording(), otherwise native D2D memcpy (async on the active stream under HipGraph capture)",
         effect: KernelSelection,
         switches: "recorded: one typed copy_f32_buffer launch per extraction layer, grid ceil(n * hidden_dim / 256), block 256 (n = 1 row per layer in the attached plain-AR tape); eager/HipGraph: D2D memcpy of the same n * hidden_dim * 4 bytes at offset zero",
         kernels: &["copy_f32_buffer"],
@@ -1839,6 +1839,17 @@ pub const DECISIONS: &[Decision] = &[
             reach(DflashGfx1201, "verify hidden extraction into each fixed staging buffer before ring commit", "g0; arm3"),
             reach(H2Gfx1201, "plain-AR and spec-retired AR forwards of a load with a DFlash drafter: each extraction layer's row into the load's ArHiddenStaging, committed to the drafter's ring outside the tape", "g0; arm3"),
         ],
+    },
+    Decision {
+        id: "dflash-fallback-row-hidden-destination",
+        predicates: &[CaptureMode],
+        condition: "forward_scratch_ring_row (qwen35/forward.rs), the per-token prefill fallback row that carries a DFlash hidden ring (prompt seed, end-of-request forced advance, verify fallback): eagerly (`!capture_mode`) HiddenStage::RingHead writes each extraction layer's row straight to the ring at its head and the ring advances once; inside an outer HipGraph capture HiddenStage::Rows writes the ring's fixed-offset staging and commit_staging_to_ring scatters it after the forward",
+        effect: LaunchMechanism,
+        switches: "eager: one D2D copy per extraction layer into the ring at its head, no stream sync after the forward; captured: one staging copy per layer, then the commit scatter after a stream sync",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "both destinations receive the same post-layer rows by pure copies (speculative.rs HiddenStage::write_layer, HiddenStateRingBuffer::write_rows_at_head, emit_commit_rows); the row clears the plain-AR eligibility before its first launch, so is_recording() is false through it",
+        reaches: &[],
     },
     Decision {
         id: "qwen4-mesh-refuses-retained-replay",
@@ -2207,6 +2218,12 @@ pub const SITES: &[Site] = &[
         function: "forward_scratch_layers_multi",
         occurrences: 2,
         decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
+        function: "forward_scratch_ring_row",
+        occurrences: 1,
+        decisions: &["dflash-fallback-row-hidden-destination"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/forward.rs",

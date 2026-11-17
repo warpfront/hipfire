@@ -3799,10 +3799,11 @@ fn forward_prefill_batch_with_pbs_opts_inner(
              weights, dn_state quant != Q8, or HIPFIRE_PREFILL_BATCHED=0).",
         );
         // Fallback: per-token loop, byte-identical to decode. If hidden
-        // extraction is requested, each row stages its extraction-layer rows
-        // in the ring's own fixed-offset staging and commits them (head + 1);
-        // that row is never the plain-AR body, so its retained eligibility is
-        // cleared before the first launch (`forward_scratch_ring_row`).
+        // extraction is requested, each row writes its extraction-layer rows
+        // to the ring and advances its head once (`forward_scratch_ring_row`:
+        // straight to the ring at the head eagerly, no stream sync); that row
+        // is never the plain-AR body, so its retained eligibility is cleared
+        // before the first launch.
         // When per-token hidden output is also requested, extract post-norm
         // hidden row-by-row into the caller's buffer.
         let dim = config.dim;
@@ -3819,7 +3820,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     scratch,
                     rb,
                 )?;
-                rb.commit_staging_to_ring(gpu, 1)?;
             } else {
                 // One-shot: mark this forward AR-graph-eligible iff it's plain
                 // single-token decode (consumed inside forward_scratch).
