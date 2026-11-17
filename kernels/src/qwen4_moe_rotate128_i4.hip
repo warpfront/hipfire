@@ -15,7 +15,7 @@
 // x = p * (K/128) + group, keeping the row count out of the 65535-bounded
 // grid y.
 
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__) && !defined(__gfx1151__) && !defined(__gfx1201__)
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__) && !defined(__gfx1151__) && !defined(__gfx1150__) && !defined(__gfx1201__)
 #error "qwen4_moe_rotate128_i4.hip is gfx1100/gfx1151/gfx1201-only"
 #endif
 

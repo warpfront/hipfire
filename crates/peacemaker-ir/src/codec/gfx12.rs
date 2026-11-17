@@ -599,7 +599,9 @@ fn special_mods(arch: Arch, row: &OpRow, words: &[u32], mods: &mut Modifiers) {
             | field_value(arch, "SRC1_ABS", row, words) << 1) as u8;
     }
     mods.cpol = cache_policy(arch, row, words);
-    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150) && row.name.starts_with("s_waitcnt") {
+    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150)
+        && row.name.starts_with("s_waitcnt")
+    {
         let bits = words[0] as u16;
         let mut wait = WaitImm::default();
         match row.name {

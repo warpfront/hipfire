@@ -51246,6 +51246,15 @@ static SLAB_K2_GFX1100_W3: SlabK2 = SlabK2 {
     ],
     code_bits: 3,
 };
+static SLAB_K2_GFX1150_MQ4: SlabK2 = SlabK2 {
+    module: "qwen4_moe_iu4_sym_pm_gfx1150",
+    image: kernels::QWEN4_MOE_IU4_SYM_PM_GFX1150,
+    entries: [
+        "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1150",
+        "qwen4_moe_down_iu4_sym_pm_gfx1150",
+    ],
+    code_bits: 4,
+};
 static SLAB_K2_GFX1151_E8P: SlabK2 = SlabK2 {
     module: "qwen4_moe_iu4_sym_e8p_pm_gfx1151",
     image: kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1151,
@@ -51257,12 +51266,13 @@ static SLAB_K2_GFX1151_E8P: SlabK2 = SlabK2 {
 };
 
 /// The sealed-slab NT1 K2 modules that exist per (`arch`, slab codec `codec`): gfx1100 MQ4 (0) and
-/// E8P (3), gfx1201 E8P (3), gfx1151 E8P (3, `qwen4_moe_iu4_sym_e8p_pm_gfx1151`, the gfx1100 arm
-/// with only arch-forced deltas). Inventory, NOT permission: serving selection goes through
+/// E8P (3), gfx1150 MQ4 (0), gfx1201 E8P (3), gfx1151 E8P (3, `qwen4_moe_iu4_sym_e8p_pm_gfx1151`,
+/// the gfx1100 arm with only arch-forced deltas). Inventory, NOT permission: serving selection goes through
 /// [`slab_k2_entry`] (admission-gated).
 pub(crate) fn slab_k2_metadata(arch: &str, codec: u8) -> Option<&'static SlabK2> {
     match (arch, codec) {
         ("gfx1100", 0) => Some(&SLAB_K2_GFX1100_MQ4),
+        ("gfx1150", 0) => Some(&SLAB_K2_GFX1150_MQ4),
         ("gfx1100", 3) => Some(&SLAB_K2_GFX1100_E8P),
         ("gfx1100", 1) => Some(&SLAB_K2_GFX1100_W3),
         ("gfx1201", 3) => Some(&SLAB_K2_GFX1201_E8P),
@@ -51273,7 +51283,7 @@ pub(crate) fn slab_k2_metadata(arch: &str, codec: u8) -> Option<&'static SlabK2>
 
 /// Raw (ungated) K2 inventory of the sealed slab per (`arch`, slab codec `codec`): `(module,
 /// [gate/up, down] serving entries)`. It is [`slab_k2_metadata`] plus the trunk builder modules the
-/// slab route also launches as K2 on gfx1201 and gfx1151: the MQ4 (0) NT4 entries
+/// slab route also launches as K2 on gfx1201, gfx1151 and gfx1150: the MQ4 (0) NT1/NT4 entries
 /// (`qwen4_moe_iu4_sym_pm_<arch>`) and the MQ3-I4 (1) entries (gfx1201 NT1
 /// `qwen4_moe_iu4_sym_w3_pm_gfx1201`, gfx1151 NT4 `qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151`). Inventory
 /// only: it never consults [`crate::qwen4_slab_codec_admitted`] or any other admission, so the
@@ -51490,10 +51500,20 @@ fn moe_sym_iu4_checker_gfx1201() -> MoeSymIu4Checker {
     }
 }
 
-/// The three aggregate symmetric-IU4 MoE descriptors: gfx1100 MQ4 (NT1), gfx1151 MQ4 (NT4) and
-/// gfx1201 MQ4 (NT4 resident, NT8 host-mapped). The gfx1100 row reuses the sealed-slab MQ4 K2
-/// module and serving entries ([`SLAB_K2_GFX1100_MQ4`]): one source for the NT1 entries.
-static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 3] = [
+/// Header checker of the gfx1150 descriptor (RDNA3.5: the gfx1151 checker module compiled for gfx1150).
+fn moe_sym_iu4_checker_gfx1150() -> MoeSymIu4Checker {
+    MoeSymIu4Checker {
+        module: QWEN4_MOE_SYM_MODULE,
+        source: qwen4_moe_sym_gfx1151_hipcc_src,
+        symbol: QWEN4_MOE_SYM_CHECK,
+    }
+}
+
+/// The four aggregate symmetric-IU4 MoE descriptors: gfx1100 MQ4 (NT1), gfx1100-style gfx1150 MQ4
+/// (NT1; default off — KLD pending), gfx1151 MQ4 (NT4) and gfx1201 MQ4 (NT4 resident, NT8
+/// host-mapped). The gfx1100 and gfx1150 rows reuse the sealed-slab MQ4 K2 modules and serving
+/// entries ([`SLAB_K2_GFX1100_MQ4`], [`SLAB_K2_GFX1150_MQ4`]): one source for the NT1 entries.
+static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 4] = [
     MoeSymIu4Kernel {
         arch: "gfx1100",
         qt: crate::expert_capabilities::QT_MQ4_XTS,
@@ -51526,6 +51546,36 @@ static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 3] = [
         },
         checker: moe_sym_iu4_checker_gfx1100,
         default_requested: true,
+    },
+    MoeSymIu4Kernel {
+        arch: "gfx1150",
+        qt: crate::expert_capabilities::QT_MQ4_XTS,
+        module: "qwen4_moe_iu4_sym_pm_gfx1150",
+        image: kernels::QWEN4_MOE_IU4_SYM_PM_GFX1150,
+        entries: [
+            [
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1150",
+                "qwen4_moe_down_iu4_sym_pm_gfx1150",
+            ],
+            [
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1150",
+                "qwen4_moe_down_iu4_sym_pm_gfx1150",
+            ],
+        ],
+        tiles_per_cta: [1, 1],
+        block_threads: QWEN4_MOE_SYM_NT1_BLOCK,
+        lds_bytes: [[0, 0], [0, 0]],
+        max_slots: QWEN4_MOE_SYM_PM_MAX_SLOTS,
+        down_row_repeat: None,
+        gate_producer: MoeSymIu4GateProducer {
+            module: "mq_rotate_x_i4",
+            require_c2: false,
+        },
+        down_producer: MoeSymIu4DownProducer::Hipcc {
+            module: QWEN4_MOE_ROTATE128_I4,
+        },
+        checker: moe_sym_iu4_checker_gfx1150,
+        default_requested: false,
     },
     MoeSymIu4Kernel {
         arch: "gfx1151",
@@ -55987,7 +56037,7 @@ mod tests {
     #[test]
     fn every_slab_k2_metadata_symbol_has_a_kernel_abi_contract() {
         let mut rows = 0;
-        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+        for arch in ["gfx1100", "gfx1150", "gfx1151", "gfx1201"] {
             for codec in 0u8..=255 {
                 let Some(k2) = slab_k2_metadata(arch, codec) else {
                     continue;
@@ -56016,8 +56066,8 @@ mod tests {
                 }
             }
         }
-        // gfx1100 MQ4 + W3 + E8P, gfx1151 E8P, gfx1201 E8P.
-        assert_eq!(rows, 5);
+        // gfx1100 MQ4 + W3 + E8P, gfx1151 E8P, gfx1150 MQ4, gfx1201 E8P.
+        assert_eq!(rows, 6);
     }
 
     /// Every symbol the MoE selectors can hand to `qwen4_moe_sym_gemm` /
@@ -56064,7 +56114,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(descriptor_entries, 12);
+        assert_eq!(descriptor_entries, 16);
         // The wide-tile / host-mapped NT8 pair tables and the measured-shape stream8 entry.
         for (arch_index, arch) in ["gfx1151", "gfx1201"].into_iter().enumerate() {
             for width in 0..2 {
@@ -57386,19 +57436,19 @@ mod route_selector_tests {
             .unwrap()
     }
 
-    /// A descriptor exists exactly for the three arches that ship MQ4 aggregate kernels, for the
+    /// A descriptor exists exactly for the four arches that ship MQ4 aggregate kernels, for the
     /// MQ4 pair only; every other arch (including the gfx11 siblings and gfx12 base) and every
     /// other codec (E8P, W3, W2, uncovered MQ4 generations) has none.
     #[test]
     fn moe_sym_iu4_capability_descriptor_truth_table() {
         use crate::expert_capabilities::{QT_MQ4_XTS, REGISTRY_PAIRS};
-        assert_eq!(MOE_SYM_IU4_KERNELS.len(), 3);
+        assert_eq!(MOE_SYM_IU4_KERNELS.len(), 4);
         for arch in MOE_SYM_ARCHES {
             let caps = moe_sym_caps(arch);
             for qt in REGISTRY_PAIRS {
                 let found = moe_sym_iu4_kernel(&caps, qt);
-                let expected =
-                    matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") && qt == QT_MQ4_XTS;
+                let expected = matches!(arch, "gfx1100" | "gfx1150" | "gfx1151" | "gfx1201")
+                    && qt == QT_MQ4_XTS;
                 assert_eq!(found.is_some(), expected, "{arch} {qt:?}");
                 if let Some(row) = found {
                     assert_eq!((row.arch, row.qt), (arch, qt));
@@ -57756,7 +57806,7 @@ mod route_selector_tests {
     #[test]
     fn moe_sym_iu4_capability_artifact_closure() {
         use crate::kernel_registry::entries;
-        let contracts: [(&str, &str); 10] = [
+        let contracts: [(&str, &str); 12] = [
             (
                 "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100",
                 include_str!(
@@ -57767,6 +57817,18 @@ mod route_selector_tests {
                 "qwen4_moe_down_iu4_sym_pm_gfx1100",
                 include_str!(
                     "../../peacemaker-isa/kernels/qwen4_moe_sym.gfx1100.down.contract.json"
+                ),
+            ),
+            (
+                "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1150",
+                include_str!(
+                    "../../peacemaker-isa/kernels/qwen4_moe_sym.gfx1150.gate_up.contract.json"
+                ),
+            ),
+            (
+                "qwen4_moe_down_iu4_sym_pm_gfx1150",
+                include_str!(
+                    "../../peacemaker-isa/kernels/qwen4_moe_sym.gfx1150.down.contract.json"
                 ),
             ),
             (
@@ -57818,8 +57880,9 @@ mod route_selector_tests {
                 ),
             ),
         ];
-        let images: [(&str, &[u8]); 3] = [
+        let images: [(&str, &[u8]); 4] = [
             ("gfx1100", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1100),
+            ("gfx1150", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1150),
             ("gfx1151", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151),
             ("gfx1201", kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201),
         ];

@@ -446,7 +446,10 @@ pub fn dot2_f32(arch: Arch, a: [u16; 2], b: [u16; 2], c: u32, bf16: bool) -> Res
 /// opcodes): the sum is exact and CLAMP is ONE final signed i32 saturation (per-term saturation refuted: 1,674-2,322
 /// mismatches in each signed clamp variant on GFX1151). GFX1100 has no probe receipt, so CLAMP there is refused.
 pub fn dot_i32(arch: Arch, a: &[i32], b: &[i32], c: i32, clamp: bool) -> Result<i32, String> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201
+    ) {
         return Err(format!("integer dot is not defined for {arch:?}"));
     }
     if clamp && arch == Arch::Gfx1100 {

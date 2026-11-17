@@ -268,7 +268,10 @@ mod arch_tests {
         assert_eq!(arch.wmma_iu4(), Arch::Gfx1151.wmma_iu4());
         assert_eq!(arch.buffer_offset_max(), Arch::Gfx1151.buffer_offset_max());
         assert_eq!(arch.dependency_wait(), Arch::Gfx1151.dependency_wait());
-        assert_eq!(arch.min_user_system_sgprs(), Arch::Gfx1151.min_user_system_sgprs());
+        assert_eq!(
+            arch.min_user_system_sgprs(),
+            Arch::Gfx1151.min_user_system_sgprs()
+        );
         assert_eq!(arch.cdna(), Arch::Gfx1151.cdna());
     }
 }

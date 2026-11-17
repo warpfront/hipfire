@@ -38,8 +38,8 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
-#if !defined(__gfx1151__) && defined(__HIP_DEVICE_COMPILE__)
-#error "qwen4_moe_iu4_sym.gfx1151.hip is gfx1151-only"
+#if !defined(__gfx1151__) && !defined(__gfx1150__) && defined(__HIP_DEVICE_COMPILE__)
+#error "qwen4_moe_iu4_sym.gfx1151.hip is gfx1151/gfx1150-only"
 #endif
 
 #ifndef HIPFIRE_BLOCK_I4_128_QUANT_HIP

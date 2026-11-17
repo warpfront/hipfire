@@ -734,10 +734,13 @@ mod tests {
             ("gfx1100", QT_MQ4_XTS | QT_E8P | QT_W3) => true,
             _ => false,
         };
+        // gfx1150 MQ4_XTS has K2 only (no K1 slab GEMV): prefill admitted, decode/stage not.
+        let prefill = slab || (arch == "gfx1150" && qt == QT_MQ4_XTS);
         // gfx1100 W3 (the lossy opt-in MQ3 tier) has K1 and K2: decode, prefill and stage.
         let decode = slab;
         match route {
-            Route::PrefillK2 | Route::Stage => slab,
+            Route::PrefillK2 => prefill,
+            Route::Stage => slab,
             Route::DecodeGemv => decode,
             Route::TierStage => match qt {
                 QT_MQ4_XTS => true,
@@ -782,6 +785,7 @@ mod tests {
                     let want = match (arch, qt, route) {
                         ("gfx1201" | "gfx1151", QT_MQ4_XTS | QT_W3 | QT_E8P, _)
                         | ("gfx1100", QT_MQ4_XTS | QT_E8P | QT_W3, _) => Admitted,
+                        ("gfx1150", QT_MQ4_XTS, Route::PrefillK2) => Admitted,
                         _ => NoKernel,
                     };
                     assert_eq!(

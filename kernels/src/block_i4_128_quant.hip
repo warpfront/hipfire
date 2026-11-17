@@ -30,7 +30,7 @@
 // The host now passes -DIU4_A4_CANDIDATES=2 on gfx1201 too (HIPFIRE_G12_A4C2,
 // default on), served by the one-pass emit_iu4_sidecar_c2_gfx12 below.
 #ifndef IU4_A4_CANDIDATES
-#if defined(__gfx1100__) || defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1151__) || defined(__gfx1150__)
 #define IU4_A4_CANDIDATES 8
 #else
 #define IU4_A4_CANDIDATES 1
@@ -438,7 +438,7 @@ __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
             if constexpr (Exact) {
                 quantize_block_i4_128_wave<false>(xv, out, lane);
             } else {
-#if defined(__gfx1201__) || defined(__gfx1100__) || defined(__gfx1151__)
+#if defined(__gfx1201__) || defined(__gfx1100__) || defined(__gfx1151__) || defined(__gfx1150__)
                 quantize_block_i4_128_wave<true>(xv, out, lane);
 #else
                 quantize_block_i4_128_wave<false>(xv, out, lane);

@@ -662,6 +662,11 @@ const OBJ_PM_GFX1100: ObjectRefV1 = ObjectRefV1::Embedded {
     artifact: "kernels/qwen4_moe_iu4_sym_pm_gfx1100.hxaco",
     sha256: "831db6f9f1b45e22cc4e3b99d1f67d510b305230eb32ef0a09e0c91088f24bad",
 };
+const OBJ_PM_GFX1150: ObjectRefV1 = ObjectRefV1::Embedded {
+    module: "qwen4_moe_iu4_sym_pm_gfx1150",
+    artifact: "kernels/qwen4_moe_iu4_sym_pm_gfx1150.hxaco",
+    sha256: "6e680a37845605401880826948e7730669c5c7ca261fe68a55a4185cd8111f57",
+};
 const OBJ_STREAM8_GFX1151: ObjectRefV1 = ObjectRefV1::Embedded {
     module: "qwen4_moe_gate_up_stream8_pm_gfx1151",
     artifact: "kernels/qwen4_moe_gate_up_stream8_pm_gfx1151.hxaco",
@@ -792,6 +797,26 @@ const C_NT4_DOWN_RR4: &[(&str, u64)] = &[
 // group_segment_fixed = the object's `.group_segment_fixed_size` (equals
 // `Spec::lds_bytes` = NT * 2048 for NT>1 gate/up, else 0), segment 64 / align 8,
 // `.max_flat_workgroup_size` = block, wavefront 32, no hidden words, in every PM entry.
+
+// gfx1150 (NT1 only; the gfx1100 row's sibling, `MOE_SYM_IU4_KERNELS[3]`).
+const GFX1150_GATE_UP: ExportV1 = export(
+    "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1150",
+    Arch::Gfx1150,
+    OBJ_PM_GFX1150,
+    64,
+    0,
+    GRID_X_RR1,
+    C_NT1_GATE_UP,
+);
+const GFX1150_DOWN: ExportV1 = export(
+    "qwen4_moe_down_iu4_sym_pm_gfx1150",
+    Arch::Gfx1150,
+    OBJ_PM_GFX1150,
+    128,
+    0,
+    GRID_X_RR1,
+    C_NT1_DOWN,
+);
 
 // gfx1100 (NT1 only; `MOE_SYM_IU4_KERNELS[0]`, `qwen4_moe_sym_nt1_gemm`).
 const GFX1100_GATE_UP: ExportV1 = export(
@@ -1240,6 +1265,7 @@ pub static QWEN4_MOE_SYM_GATE_UP: KernelAbiV1 = KernelAbiV1 {
     domain: &DOMAIN_GATE_UP,
     exports: &[
         GFX1100_GATE_UP,
+        GFX1150_GATE_UP,
         GFX1151_GATE_UP_NT1,
         GFX1151_GATE_UP_NT4,
         GFX1151_GATE_UP_STREAM8,
@@ -1265,6 +1291,7 @@ pub static QWEN4_MOE_SYM_DOWN: KernelAbiV1 = KernelAbiV1 {
     domain: &DOMAIN_DOWN,
     exports: &[
         GFX1100_DOWN,
+        GFX1150_DOWN,
         GFX1151_DOWN_NT1,
         GFX1151_DOWN_NT4,
         GFX1201_DOWN_NT1,

@@ -46,6 +46,9 @@ pub const MOE_DOWN_COMBINE_BF16IN_PM_GFX1100_SYMBOL: &str =
 /// The gfx1151 twin of [`MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL`].
 pub const MOE_DOWN_COMBINE_BF16IN_PM_GFX1151_SYMBOL: &str =
     "moe_down_combine_grouped_bf16in_pm_gfx1151";
+/// The gfx1150 twin of [`MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL`].
+pub const MOE_DOWN_COMBINE_BF16IN_PM_GFX1150_SYMBOL: &str =
+    "moe_down_combine_grouped_bf16in_pm_gfx1150";
 /// Threads per workgroup (v1: one output column per thread; v2: eight
 /// contiguous columns per thread).
 pub const MOE_DOWN_COMBINE_BF16IN_BLOCK: u32 = 256;
@@ -68,6 +71,10 @@ fn moe_slot_ops_kernel(arch: &str) -> Option<(&'static [u8], &'static str)> {
             kernels::MOE_SLOT_OPS_PM_GFX1100,
             MOE_DOWN_COMBINE_BF16IN_PM_GFX1100_SYMBOL,
         )),
+        "gfx1150" => Some((
+            kernels::MOE_SLOT_OPS_PM_GFX1150,
+            MOE_DOWN_COMBINE_BF16IN_PM_GFX1150_SYMBOL,
+        )),
         "gfx1151" => Some((
             kernels::MOE_SLOT_OPS_PM_GFX1151,
             MOE_DOWN_COMBINE_BF16IN_PM_GFX1151_SYMBOL,
@@ -87,6 +94,10 @@ pub fn moe_slot_ops_pm_names(arch: &str) -> Option<(&'static str, &'static str)>
         "gfx1100" => Some((
             "moe_slot_ops_pm_gfx1100",
             MOE_DOWN_COMBINE_BF16IN_PM_GFX1100_SYMBOL,
+        )),
+        "gfx1150" => Some((
+            "moe_slot_ops_pm_gfx1150",
+            MOE_DOWN_COMBINE_BF16IN_PM_GFX1150_SYMBOL,
         )),
         "gfx1151" => Some((
             "moe_slot_ops_pm_gfx1151",
@@ -227,7 +238,7 @@ pub fn moe_combine_v2_shape_supported(
 
 impl Gpu {
     /// This device has the embedded builder object of the slot ops
-    /// (`kernels::MOE_SLOT_OPS_PM_GFX1100` / `_GFX1151` / `_GFX1201` on that arch; every other arch: no).
+    /// (`kernels::MOE_SLOT_OPS_PM_GFX1100` / `_GFX1150` / `_GFX1151` / `_GFX1201` on that arch; every other arch: no).
     pub fn moe_slot_ops_available(&self) -> bool {
         moe_slot_ops_kernel(&self.arch).is_some()
     }
@@ -391,9 +402,10 @@ mod tests {
     const A3B_DIM: usize = 2048;
 
     #[test]
-    fn kernel_selection_covers_gfx1100_gfx1151_and_gfx1201_only() {
+    fn kernel_selection_covers_gfx1100_gfx1150_gfx1151_and_gfx1201_only() {
         for (arch, want) in [
             ("gfx1100", MOE_DOWN_COMBINE_BF16IN_PM_GFX1100_SYMBOL),
+            ("gfx1150", MOE_DOWN_COMBINE_BF16IN_PM_GFX1150_SYMBOL),
             ("gfx1151", MOE_DOWN_COMBINE_BF16IN_PM_GFX1151_SYMBOL),
             ("gfx1201", MOE_DOWN_COMBINE_BF16IN_PM_GFX1201_SYMBOL),
         ] {
@@ -408,7 +420,7 @@ mod tests {
 
     #[test]
     fn embedded_image_exports_the_launcher_symbol() {
-        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+        for arch in ["gfx1100", "gfx1150", "gfx1151", "gfx1201"] {
             let (image, symbol) = moe_slot_ops_kernel(arch).unwrap();
             assert!(
                 image.windows(4).any(|w| w == b"\x7fELF"),
