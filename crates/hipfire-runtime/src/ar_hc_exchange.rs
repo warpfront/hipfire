@@ -489,7 +489,7 @@ impl ArHcExchange {
             let n = slice.min(rows - done);
             let wire = self.wire_for(n);
             let region = self.region_offset(wire);
-            let geometry = ar_hc_launch_geometry(n, gpu.flags.ep_ar_wide_grid_enabled())
+            let geometry = ar_hc_launch_geometry(n)
                 .ok_or_else(|| err(format!("ar_hc_exchange: no launch geometry for {n} rows")))?;
             let dbg = if mixed_dbg.is_null() {
                 mixed_dbg

@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Lab oracle for the exact PeaceMaker twin of the down A4 producer
-//! (`Gpu::qwen4_moe_rotate128_i4_pm`, flag `HIPFIRE_MOE_ROTATE_I4_PM`, bundle
+//! (`Gpu::qwen4_moe_rotate128_i4_pm`, `PrefillRoute::MoeRotateI4Pm`, bundle
 //! `kernels/moe_rotate_i4_pm_gfx1201.hxaco`) against the HIP incumbent
 //! (`Gpu::qwen4_moe_rotate128_i4_incumbent`, module `qwen4_moe_rotate128_i4`).
 //!

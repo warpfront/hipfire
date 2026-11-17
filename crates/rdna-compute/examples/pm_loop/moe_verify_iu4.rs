@@ -26,7 +26,7 @@
 //! (`qwen4_moe_sym_gate_up_symbol`, `qwen4_moe_sym_gemm_symbols_wide`,
 //! `qwen4_moe_rotate128_i4_gp_selected`) and refuses unless it agrees with the per-arch default
 //! plan this module documents and returns from `pm_objects` (an env override such as
-//! `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR`, `HIPFIRE_MOE_ROTATE_I4_PM=0`
+//! `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR`
 //! would otherwise change what is launched but not what is
 //! certified). Expected plans: gfx1201 resident gate NT4 / down gp-NT4, host-mapped gate NT8 /
 //! down gp-NT8 (gate NT8 also resident once `slots >= 128 E`); gfx1151 NT4/NT4 (rr 1);

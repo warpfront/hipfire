@@ -311,7 +311,7 @@ pub(crate) fn try_a8_rmsnorm_prepared(
     // twin consumer enforces the same A4 predicate).
     let lloyd_next = next.dtype == DType::MQ4G256V2Lloyd && lloyd_mmq_a4_route(gpu, n, k);
     let next_is_a8 = next.dtype == DType::MQ4G256V2 || lloyd_next;
-    if !gpu.flags.a8_fused_prod || (!gpu.a8_prefill_active(n, k) && !lloyd_next) || !next_is_a8 {
+    if (!gpu.a8_prefill_active(n, k) && !lloyd_next) || !next_is_a8 {
         return Ok(None);
     }
     // The norm reads `x`: land any residual add a folded GEMM left owed to it.
@@ -333,7 +333,7 @@ fn try_a8_hin_prepared(
     // Lloyd rides the A4 predicate in place of the symmetric-file requirement.
     let lloyd_down = down.dtype == DType::MQ4G256V2Lloyd && lloyd_mmq_a4_route(gpu, n, k);
     let down_is_a8 = down.dtype == DType::MQ4G256V2 || lloyd_down;
-    if !gpu.flags.a8_fused_prod || (!gpu.a8_prefill_active(n, k) && !lloyd_down) || !down_is_a8 {
+    if (!gpu.a8_prefill_active(n, k) && !lloyd_down) || !down_is_a8 {
         return Ok(None);
     }
     let Some(awq) = down.awq_scale else {

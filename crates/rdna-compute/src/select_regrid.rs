@@ -20,8 +20,8 @@
 //! defined: the published kernel pack pins its source.
 //!
 //! On exact gfx1201 the argmax runs the PeaceMaker builder twin
-//! `argmax_f32_batched_regrid_pm_gfx1201` (`HIPFIRE_ARGMAX_REGRID_PM=0` keeps the hipcc
-//! kernel; byte-identical, checked by `examples/argmax_regrid_pm_oracle.rs`).
+//! `argmax_f32_batched_regrid_pm_gfx1201` (byte-identical to the hipcc kernel, checked by
+//! `examples/argmax_regrid_pm_oracle.rs`).
 
 use crate::dispatch::{Gpu, GpuTensor};
 use crate::kernels;
@@ -37,7 +37,7 @@ pub const TOPK_VALUES_REGRID_SYMBOL: &str = "topk_values_regrid_f32";
 /// Argmax re-grid entry.
 pub const ARGMAX_REGRID_SYMBOL: &str = "argmax_f32_batched_regrid";
 /// Builder (PeaceMaker) twin of [`ARGMAX_REGRID_SYMBOL`] (module key == device symbol),
-/// gfx1201 only, default on (`HIPFIRE_ARGMAX_REGRID_PM=0` opts out).
+/// gfx1201 only.
 pub const ARGMAX_REGRID_PM_GFX1201_SYMBOL: &str = "argmax_f32_batched_regrid_pm_gfx1201";
 /// Largest row length the PM twin's 32-bit byte extents admit; longer rows take the hipcc re-grid.
 pub const ARGMAX_REGRID_PM_MAX_N: usize = 1 << 29;
@@ -154,7 +154,7 @@ impl Gpu {
     }
 
     /// Batched argmax over `[batch x n]` rows with the shipping kernel's
-    /// exact tie order. On exact gfx1201 (opt out with `HIPFIRE_ARGMAX_REGRID_PM=0`)
+    /// exact tie order. On exact gfx1201
     /// and `n <= ARGMAX_REGRID_PM_MAX_N` the builder twin runs, otherwise the
     /// hipcc re-grid kernel; both are byte-identical to the shipping argmax.
     pub(crate) fn argmax_f32_batched_regrid(
@@ -164,8 +164,7 @@ impl Gpu {
         n: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if self.flags.argmax_regrid_pm && self.arch_caps.is_gfx1201() && n <= ARGMAX_REGRID_PM_MAX_N
-        {
+        if self.arch_caps.is_gfx1201() && n <= ARGMAX_REGRID_PM_MAX_N {
             return self.argmax_f32_batched_regrid_pm(data, result, n, batch_size);
         }
         self.argmax_f32_batched_regrid_hipcc(data, result, n, batch_size)
@@ -246,7 +245,7 @@ impl Gpu {
         )
     }
 
-    /// The hipcc re-grid batched argmax on ANY arch, ignoring `HIPFIRE_ARGMAX_REGRID_PM` and
+    /// The hipcc re-grid batched argmax on ANY arch, ignoring the PM twin and
     /// [`Self::select_regrid_enabled`] (parity gates and the PM oracle's reference arm).
     pub fn argmax_f32_batched_regrid_hipcc_forced(
         &mut self,

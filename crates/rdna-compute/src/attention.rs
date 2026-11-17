@@ -582,8 +582,8 @@ fn fp8_decode_gqa_pair_for_heads(
 }
 
 /// gfx1201 fp8 decode attention through the GQA-shared tile and the
-/// head-dim-split reduce (default on; `HIPFIRE_FP8_DECODE_ATTN_GQA=0` restores
-/// `attention_flash_fp8_e4m3_tile` + `attention_flash_q8_0_reduce`). Both
+/// head-dim-split reduce. The reference pair is
+/// `attention_flash_fp8_e4m3_tile` + `attention_flash_q8_0_reduce`. Both
 /// pairs write byte-identical partials and output. The tile's geometry is
 /// compile-time: head_dim 256, tile 128, and either GQA group 6 (any kv head
 /// count: H2 decode, H24/KV4) or, exactly, H16/KV2 at GQA group 8 (A3B).
@@ -595,12 +595,7 @@ fn fp8_decode_attn_gqa_pair(
     head_dim: usize,
     tile_size: usize,
 ) -> Option<&'static DecodeGqaPair> {
-    if !(gpu.arch_caps.is_gfx1201()
-        && head_dim == 256
-        && n_kv_heads > 0
-        && tile_size == 128
-        && hipfire_config::developer_bool("HIPFIRE_FP8_DECODE_ATTN_GQA", true))
-    {
+    if !(gpu.arch_caps.is_gfx1201() && head_dim == 256 && n_kv_heads > 0 && tile_size == 128) {
         return None;
     }
     fp8_decode_gqa_pair_for_heads(n_heads, n_kv_heads)
@@ -628,8 +623,8 @@ fn fp8_decode_attn_gqa_vmm_route(
 }
 
 /// gfx1151 Q8_0 decode attention through the GQA-shared tile and the
-/// head-dim-split reduce (default on; `HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA=0`
-/// restores `attention_flash_q8_0_tile` + `attention_flash_q8_0_reduce`). Both
+/// head-dim-split reduce. The reference pair is
+/// `attention_flash_q8_0_tile` + `attention_flash_q8_0_reduce`. Both
 /// pairs write byte-identical partials and output. The tile's geometry is
 /// compile-time: head_dim 256, GQA group 6, tile 128, full causal (H2 decode).
 fn q8_decode_attn_gqa_gfx1151_admitted(
@@ -646,7 +641,6 @@ fn q8_decode_attn_gqa_gfx1151_admitted(
         && n_kv_heads > 0
         && n_heads == 6 * n_kv_heads
         && tile_size == 128
-        && hipfire_config::developer_bool("HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA", true)
 }
 
 /// gfx1151 Q8_0 decode attention for the Gemma 4 26B-A4B shapes through a
@@ -656,7 +650,6 @@ fn q8_decode_attn_gqa_gfx1151_admitted(
 /// paired with `attention_flash_q8_0_reduce_skip`; not bit-identical
 /// (different summation order). Reached only through the Gemma 4 decode entry
 /// point ([`Gpu::attention_flash_q8_0_windowed_gemma`]).
-/// `HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA=0` restores the swa tile.
 fn q8_decode_attn_gqa_gemma_gfx1151(
     gpu: &Gpu,
     n_heads: usize,
@@ -664,11 +657,7 @@ fn q8_decode_attn_gqa_gemma_gfx1151(
     head_dim: usize,
     tile_size: usize,
 ) -> Option<&'static str> {
-    if !gpu.arch_caps.is_gfx1151()
-        || tile_size != 128
-        || n_kv_heads == 0
-        || !hipfire_config::developer_bool("HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA", true)
-    {
+    if !gpu.arch_caps.is_gfx1151() || tile_size != 128 || n_kv_heads == 0 {
         return None;
     }
     match (head_dim, n_heads / n_kv_heads, n_heads % n_kv_heads) {
@@ -729,9 +718,9 @@ const Q8_DECODE_GQA_GFX1151: DecodeGqaPair = DecodeGqaPair {
 };
 
 /// gfx1100 Q8_0 gated-AWQ decode attention through the GQA-shared tile and
-/// the load-ahead reduce (default on; `HIPFIRE_GFX1100_DECODE_ATTN_GQA=0`
-/// restores `attention_flash_q8_0_tile` +
-/// `attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100`). Both pairs
+/// the load-ahead reduce. The reference pair is
+/// `attention_flash_q8_0_tile` +
+/// `attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100`. Both pairs
 /// write byte-identical partials and output. The tile's geometry is
 /// compile-time: head_dim 256, GQA group 6, tile 128, full causal (H2 decode).
 /// The reduce keeps 2 * max_tiles f32 of dynamic LDS.
@@ -751,7 +740,6 @@ fn q8_decode_attn_gqa_gfx1100_admitted(
         && tile_size == 128
         && window <= 0
         && max_tiles <= Q8_DECODE_GQA_REDUCE_MAX_TILES
-        && hipfire_config::developer_bool("HIPFIRE_GFX1100_DECODE_ATTN_GQA", true)
 }
 
 /// LDS bound of the gfx1100 load-ahead reduce: 2 * max_tiles f32 of dynamic
@@ -8595,26 +8583,16 @@ impl Gpu {
         }
         // The 16-query screen passed on these two exact cards only.
         let q16_tile = matches!(self.arch.as_str(), "gfx1100" | "gfx1151");
-        // Warp-specialized K/V fill: bit-exact, screened +30% FA2 on
-        // gfx1100 and gfx1151 (the Q16 cards). `HIPFIRE_FA2_FILL=0`
-        // restores the all-wave fill.
-        let fill = q16_tile && hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
-        // Exact-gfx1100 variant of the fill body (bit-exact): CU mode,
-        // bank-conflict-free helper plane stores, O rescale skipped when
-        // alpha == 1.0f, opaque sacc zeros with clamped Q rows, heaviest q
-        // tiles dispatched first; its own entry symbols. Kernel -24.7% at
-        // N4096@4096 and -28.5% at N4096@0 on a real H2 layer.
-        // `HIPFIRE_GFX1100_FA2_R3=0` restores the shared gfx11 body.
-        let r3 = fill
-            && self.arch == "gfx1100"
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_R3", true);
-        // Exact gfx1151 runs its own twin of the fill build (CU mode,
-        // heaviest q-tile first, conflict-free helper V stores; the same
-        // arithmetic, bit-identical). `HIPFIRE_GFX1151_FA2_TWIN=0` restores
-        // the gfx11 module.
-        let twin = fill
-            && self.arch == "gfx1151"
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_FA2_TWIN", true);
+        // The Q16 cards run warp-specialized K/V fill builds (bit-exact,
+        // screened +30% FA2): exact gfx1100 its CU-mode variant of the fill
+        // body (bank-conflict-free helper plane stores, O rescale skipped
+        // when alpha == 1.0f, opaque sacc zeros with clamped Q rows,
+        // heaviest q tiles dispatched first; kernel -24.7% at N4096@4096 and
+        // -28.5% at N4096@0 on a real H2 layer), exact gfx1151 its own twin
+        // (CU mode, heaviest q-tile first, conflict-free helper V stores;
+        // the same arithmetic, bit-identical).
+        let r3 = self.arch == "gfx1100";
+        let twin = self.arch == "gfx1151";
         let (module, preconvert) = if r3 {
             (
                 "attention_q8_0_fa2_gqa_gfx1100",
@@ -8646,8 +8624,8 @@ impl Gpu {
                 let src = format!(
                     "{}#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 {}\n#define HIPFIRE_FA2_FILL {}\n{}{}",
                     if r3 { "// HIPFIRE_COMPILER_FLAGS: -mcumode\n" } else { "" },
-                    u8::from(q16_tile),
-                    u8::from(fill),
+                    u8::from(r3),
+                    u8::from(r3),
                     if r3 { "#define HIPFIRE_FA2_GFX1100 1\n" } else { "" },
                     kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC
                 );

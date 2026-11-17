@@ -4,8 +4,8 @@
 
 //! PeaceMaker twins of the chunked-GDN prefill recurrence + gated RMSNorm
 //! (`gated_delta_chunk_gate_wmma`, the NPU-arena `..._arena` entry and the opt-in inline-Q8
-//! `gated_delta_chunk_gate_q8_wmma` pair) on exact gfx1151 and exact gfx1100
-//! (`HIPFIRE_GDN_CHUNK_PM`, developer, default on; `=0` restores the hipcc kernels).
+//! `gated_delta_chunk_gate_q8_wmma` pair) on exact gfx1151 and exact gfx1100; every
+//! other arch / variant runs the hipcc kernels.
 //!
 //! Each twin is the shipped hipcc kernel itself: `kernels/gated_delta_chunk_*_pm_gfx11*.hip`
 //! `#include`s the shared source under a per-arch symbol rename and nothing else, and
@@ -25,7 +25,6 @@ use crate::tensor_ops::{
     gdn_chunk_kernel_name, gdn_chunk_module_name, gdn_chunk_source, GdnStateFormat,
 };
 use hip_bridge::{HipError, HipResult};
-use std::sync::LazyLock;
 
 /// One sealed twin module (one kernel).
 #[derive(Debug, PartialEq, Eq)]
@@ -128,9 +127,6 @@ pub const TWINS: [&Twin; 5] = [
     &GFX1100_F32,
 ];
 
-static FLAG: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GDN_CHUNK_PM", true));
-
 /// The twin of an exact arch and variant, if one is sealed.
 pub fn twin_for(arch: &str, variant: Variant) -> Option<&'static Twin> {
     TWINS
@@ -138,30 +134,10 @@ pub fn twin_for(arch: &str, variant: Variant) -> Option<&'static Twin> {
         .find(|t| t.arch == arch && t.variant == variant)
 }
 
-/// Why a launch keeps the hipcc kernel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GdnChunkPmRefusal {
-    Disabled,
-    /// No twin is sealed for this arch / variant (the default-on flag is not a refusal worth logging).
-    NoTwin,
-}
-
-/// Pure admission: flag on and an exact-arch twin of the variant.
-pub fn admission(
-    flag: bool,
-    arch: &str,
-    variant: Variant,
-) -> Result<&'static Twin, GdnChunkPmRefusal> {
-    if !flag {
-        return Err(GdnChunkPmRefusal::Disabled);
-    }
-    twin_for(arch, variant).ok_or(GdnChunkPmRefusal::NoTwin)
-}
-
 impl Gpu {
     /// Load the chunk kernel of a launch and return the symbol to launch: the sealed PM twin of this
-    /// exact arch under `HIPFIRE_GDN_CHUNK_PM` (default on), else the hipcc incumbent
-    /// (`gdn_chunk_{module,source,kernel}_name`). Kernargs, grid and block are the same either way.
+    /// exact arch and variant, else the hipcc incumbent (`gdn_chunk_{module,source,kernel}_name`).
+    /// Kernargs, grid and block are the same either way.
     pub(crate) fn gdn_chunk_ensure(
         &mut self,
         format: GdnStateFormat,
@@ -169,13 +145,12 @@ impl Gpu {
         arena: bool,
     ) -> HipResult<&'static str> {
         let variant = Variant::of(format, inline, arena);
-        let pm = admission(*FLAG, &self.arch, variant).is_ok();
+        let pm = twin_for(&self.arch, variant).is_some();
         self.gdn_chunk_load(variant, pm)
     }
 
-    /// Lab oracle entry: load the sealed twin (`pm`) or the hipcc incumbent of `variant`, whatever
-    /// `HIPFIRE_GDN_CHUNK_PM` says, and return the symbol to launch (an error when `pm` and this arch
-    /// has no twin of the variant).
+    /// Lab oracle entry: load the sealed twin (`pm`) or the hipcc incumbent of `variant` and
+    /// return the symbol to launch (an error when `pm` and this arch has no twin of the variant).
     #[cfg(feature = "lab")]
     pub fn lab_gdn_chunk_load(&mut self, variant: Variant, pm: bool) -> HipResult<&'static str> {
         self.gdn_chunk_load(variant, pm)
@@ -271,24 +246,6 @@ mod tests {
         shas.sort_unstable();
         shas.dedup();
         assert_eq!(shas.len(), TWINS.len());
-    }
-
-    #[test]
-    fn admission_flag_and_arch() {
-        assert_eq!(admission(true, "gfx1151", Variant::F32), Ok(&GFX1151_F32));
-        assert_eq!(admission(true, "gfx1100", Variant::F32), Ok(&GFX1100_F32));
-        assert_eq!(
-            admission(false, "gfx1151", Variant::F32),
-            Err(GdnChunkPmRefusal::Disabled)
-        );
-        assert_eq!(
-            admission(true, "gfx1201", Variant::F32),
-            Err(GdnChunkPmRefusal::NoTwin)
-        );
-        assert_eq!(
-            admission(true, "gfx1100", Variant::Q8),
-            Err(GdnChunkPmRefusal::NoTwin)
-        );
     }
 
     /// The variant split mirrors the product's module / kernel names: each twin's symbol is the

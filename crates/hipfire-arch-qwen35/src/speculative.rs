@@ -2835,29 +2835,25 @@ impl GdnTape {
             // 1-3 below launch-for-launch. q_raw/k_raw keep the old
             // in-place-norm postcondition (normed values), so step 4 and
             // every later consumer observe identical bytes.
-            let fused = if gpu.flags.gdn_pre_fuse_off {
-                false
-            } else {
-                gpu.dflash_gdn_pre_replay_gfx1100(
-                    &self.qkv_bufs[la_idx],
-                    conv_weight,
-                    &dn_state.conv_states[la_idx],
-                    &self.q_raw_scratch,
-                    &self.k_raw_scratch,
-                    &self.v_scratch,
-                    &self.q_scratch,
-                    &self.k_scratch,
-                    n_v_heads,
-                    n_key_heads,
-                    hd,
-                    k_dim,
-                    v_dim,
-                    self.qkv_dim,
-                    n_steps,
-                    1.0 / (hd as f32).sqrt(),
-                    config.norm_eps,
-                )?
-            };
+            let fused = gpu.dflash_gdn_pre_replay_gfx1100(
+                &self.qkv_bufs[la_idx],
+                conv_weight,
+                &dn_state.conv_states[la_idx],
+                &self.q_raw_scratch,
+                &self.k_raw_scratch,
+                &self.v_scratch,
+                &self.q_scratch,
+                &self.k_scratch,
+                n_v_heads,
+                n_key_heads,
+                hd,
+                k_dim,
+                v_dim,
+                self.qkv_dim,
+                n_steps,
+                1.0 / (hd as f32).sqrt(),
+                config.norm_eps,
+            )?;
             if !fused {
                 // 1. conv1d + SiLU + split — advances conv_state, writes
                 //    (q_raw, k_raw, v) into scratch.

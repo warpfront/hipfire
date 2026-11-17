@@ -50,8 +50,8 @@ pub const AR_HC_ROW_CAP: usize = 256;
 /// Default launch shape, the Gate 0b best at 8 rows (16 blocks x 256 lanes).
 pub const AR_HC_DEFAULT_BLOCKS: u32 = 16;
 pub const AR_HC_DEFAULT_LANES: u32 = 256;
-/// Block count the wide launch shape starts from ([`ar_hc_launch_geometry`],
-/// `HIPFIRE_EP_AR_WIDE_GRID`): every block of the cap.
+/// Block count the wide launch shape starts from ([`ar_hc_launch_geometry`]): every block of
+/// the cap.
 pub const AR_HC_WIDE_BLOCKS: u32 = AR_HC_MAX_BLOCKS as u32;
 /// Most granules per lane the wide launch shape takes (up to 153 rows at 64 x 512); a
 /// launch that would need more keeps the default shape. Lab bench j8304 (f32 streams, pipelined
@@ -76,7 +76,7 @@ const KERNEL_P32_D16: &str = "ar_hc_write_p32_d16_gfx1201";
 const KERNEL_P32_D16_F32S: &str = "ar_hc_write_p32_d16_f32s_gfx1201";
 const KERNEL_P32_S: &str = "ar_hc_write_p32_s_gfx1201";
 const KERNEL_P32_S_F32S: &str = "ar_hc_write_p32_s_f32s_gfx1201";
-/// Most rows of a branch-split launch (tagged wire, `HIPFIRE_EP_AR_FAST_APPLY`): one lane per
+/// Most rows of a branch-split launch (tagged wire): one lane per
 /// (granule, branch) item, 4 * rows * 640 items within [`AR_HC_MAX_BLOCKS`] blocks of at most
 /// [`AR_HC_MAX_LANES`] lanes (12 rows: 64 x 480).
 // selector-receipt: receipts/selectors/ar_hc_split_max_rows.json
@@ -301,22 +301,19 @@ pub fn ar_hc_geometry(rows: usize) -> Option<(u32, u32)> {
     ar_hc_geometry_with(rows, AR_HC_DEFAULT_BLOCKS, AR_HC_DEFAULT_LANES)
 }
 
-/// Launch geometry of a product launch of `rows` rows on the non-split entries. `wide`
-/// (`HIPFIRE_EP_AR_WIDE_GRID`, [`crate::feature_flags::FeatureFlags::ep_ar_wide_grid_enabled`]):
+/// Launch geometry of a product launch of `rows` rows on the non-split entries:
 /// [`AR_HC_WIDE_BLOCKS`] blocks of up to [`AR_HC_MAX_LANES`] lanes whenever that holds at most
 /// [`AR_HC_WIDE_KMAX`] granules per lane, so a launch of up to 51 rows runs one granule per
 /// lane (24 rows: 64 x 256, 48 rows: 64 x 480) instead of the 16-block default (24 rows: 4
-/// granules per lane, 48 rows: 20 x 256 at 6); larger launches keep the default. The
-/// decode-width launch is latency-bound in its per-lane fold/apply chain (the served C4 / C8
-/// verify step's 24 / 48-row launch took 20-36 us, rocprof j8299), so spreading the granules
-/// over 4x the waves shortens it. Byte-identical: the push, poll, fold and apply of a granule
-/// do not depend on the lane or block that runs it. Not wide: [`ar_hc_geometry`].
-pub fn ar_hc_launch_geometry(rows: usize, wide: bool) -> Option<(u32, u32)> {
-    let spread = wide
-        .then(|| ar_hc_geometry_with(rows, AR_HC_WIDE_BLOCKS, AR_HC_MAX_LANES as u32))
-        .flatten()
-        .filter(|&g| ar_hc_granules_per_lane(rows, g) <= AR_HC_WIDE_KMAX);
-    spread.or_else(|| ar_hc_geometry(rows))
+/// granules per lane, 48 rows: 20 x 256 at 6); larger launches keep the default
+/// ([`ar_hc_geometry`]). The decode-width launch is latency-bound in its per-lane fold/apply
+/// chain (the served C4 / C8 verify step's 24 / 48-row launch took 20-36 us, rocprof j8299),
+/// so spreading the granules over 4x the waves shortens it. Byte-identical: the push, poll,
+/// fold and apply of a granule do not depend on the lane or block that runs it.
+pub fn ar_hc_launch_geometry(rows: usize) -> Option<(u32, u32)> {
+    ar_hc_geometry_with(rows, AR_HC_WIDE_BLOCKS, AR_HC_MAX_LANES as u32)
+        .filter(|&g| ar_hc_granules_per_lane(rows, g) <= AR_HC_WIDE_KMAX)
+        .or_else(|| ar_hc_geometry(rows))
 }
 
 /// Launch geometry `(blocks, lanes)` of a branch-split launch of `rows` rows (1 ..=
@@ -350,13 +347,9 @@ impl Gpu {
                 &format!("ar_hc_write_gfx1201 requires gfx1201, got {}", self.arch),
             ));
         }
-        let src = if self.flags.ep_ar_fast_apply_enabled() {
-            kernels::AR_HC_WRITE_GFX1201_SRC
-        } else {
-            kernels::AR_HC_WRITE_GFX1201_HIPBF16_SRC
-        };
+        let src = kernels::AR_HC_WRITE_GFX1201_SRC;
         self.ensure_kernel(KERNEL, src, kind.symbol(wire, partial))?;
-        if wire == ArHcWire::Tagged && self.flags.ep_ar_fast_apply_enabled() {
+        if wire == ArHcWire::Tagged {
             self.ensure_kernel(KERNEL, src, kind.split_symbol(partial))?;
         }
         Ok(())
@@ -372,7 +365,7 @@ impl Gpu {
     /// rank's [`AR_HC_GEN_BYTES`] block. `mixed_dbg` (oracle only, null otherwise) receives
     /// the folded `m`. One launch. Tagged launches of at most [`AR_HC_SPLIT_MAX_ROWS`] rows
     /// take the branch-split entry at [`ar_hc_split_geometry`] instead of `geometry`
-    /// (`HIPFIRE_EP_AR_FAST_APPLY`, byte-identical).
+    /// (byte-identical).
     ///
     /// # Safety
     /// Every pointer must address live device memory of the extents above on this rank's
@@ -427,7 +420,7 @@ impl Gpu {
                 kind.alignment()
             )));
         }
-        let split = (wire == ArHcWire::Tagged && self.flags.ep_ar_fast_apply_enabled())
+        let split = (wire == ArHcWire::Tagged)
             .then(|| ar_hc_split_geometry(rows))
             .flatten();
         let (symbol, geometry) = match split {
@@ -729,14 +722,9 @@ impl Gpu {
         self.ensure_kernel(SP_MODULE, src, elem.symbol())
     }
 
-    /// SP module source: bf16 rounding by selects, or the `hip_bfloat16` casts under
-    /// `HIPFIRE_EP_AR_FAST_APPLY=0` (bit-identical either way).
+    /// SP module source (bf16 rounding by selects, bit-identical to the `hip_bfloat16` casts).
     fn sp_hc_rs_ag_src(&self) -> &'static str {
-        if self.flags.ep_ar_fast_apply_enabled() {
-            kernels::SP_HC_RS_AG_GFX1201_SRC
-        } else {
-            kernels::SP_HC_RS_AG_GFX1201_HIPBF16_SRC
-        }
+        kernels::SP_HC_RS_AG_GFX1201_SRC
     }
 
     /// Reduce-scatter fused into the HC write: push the partial of the PEER row range (in the
@@ -1170,15 +1158,14 @@ mod tests {
         );
     }
 
-    /// The wide launch shape (`HIPFIRE_EP_AR_WIDE_GRID`) covers every row count the default
-    /// covers, within the block/lane/KMAX caps, runs one granule per lane up to 51 rows (the
-    /// 24- and 48-row decode verify launches), at most AR_HC_WIDE_KMAX up to 153 rows, keeps
-    /// the default shape above, and is the default shape when not wide.
+    /// The wide launch shape covers every row count the default covers, within the
+    /// block/lane/KMAX caps, runs one granule per lane up to 51 rows (the 24- and 48-row decode
+    /// verify launches), at most AR_HC_WIDE_KMAX up to 153 rows, and keeps the default shape
+    /// above.
     #[test]
     fn wide_launch_geometry_spreads_decode_widths_one_granule_per_lane() {
         for rows in 1..=AR_HC_ROW_CAP {
-            assert_eq!(ar_hc_launch_geometry(rows, false), ar_hc_geometry(rows));
-            let (b, t) = ar_hc_launch_geometry(rows, true).expect("wide covers every row count");
+            let (b, t) = ar_hc_launch_geometry(rows).expect("wide covers every row count");
             assert!(b as usize <= AR_HC_MAX_BLOCKS && t as usize <= AR_HC_MAX_LANES);
             let k = ar_hc_granules_per_lane(rows, (b, t));
             assert!(k <= AR_HC_KMAX, "rows {rows}: {b}x{t} at {k}");
@@ -1196,10 +1183,10 @@ mod tests {
                 assert_eq!(Some((b, t)), ar_hc_geometry(rows), "rows {rows}");
             }
         }
-        assert_eq!(ar_hc_launch_geometry(24, true), Some((64, 256)));
-        assert_eq!(ar_hc_launch_geometry(48, true), Some((64, 480)));
-        assert!(ar_hc_launch_geometry(0, true).is_none());
-        assert!(ar_hc_launch_geometry(AR_HC_ROW_CAP + 1, true).is_none());
+        assert_eq!(ar_hc_launch_geometry(24), Some((64, 256)));
+        assert_eq!(ar_hc_launch_geometry(48), Some((64, 480)));
+        assert!(ar_hc_launch_geometry(0).is_none());
+        assert!(ar_hc_launch_geometry(AR_HC_ROW_CAP + 1).is_none());
     }
 
     /// A branch-split launch gives every (granule, branch) item exactly one lane, keeps the
@@ -1475,26 +1462,19 @@ mod tests {
     /// the F32 instantiation.
     #[test]
     fn kernel_source_has_both_entries() {
-        for src in [
-            kernels::AR_HC_WRITE_GFX1201_SRC,
-            kernels::AR_HC_WRITE_GFX1201_HIPBF16_SRC,
-        ] {
-            for partial in ArHcPartial::ALL {
-                for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
-                    for kind in StreamKind::ALL {
-                        let symbol = kind.symbol(wire, partial);
-                        assert!(src.contains(&format!("void {symbol}(")), "{symbol}");
-                    }
-                }
+        let src = kernels::AR_HC_WRITE_GFX1201_SRC;
+        for partial in ArHcPartial::ALL {
+            for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
                 for kind in StreamKind::ALL {
-                    let symbol = kind.split_symbol(partial);
+                    let symbol = kind.symbol(wire, partial);
                     assert!(src.contains(&format!("void {symbol}(")), "{symbol}");
                 }
             }
+            for kind in StreamKind::ALL {
+                let symbol = kind.split_symbol(partial);
+                assert!(src.contains(&format!("void {symbol}(")), "{symbol}");
+            }
         }
-        assert!(kernels::AR_HC_WRITE_GFX1201_HIPBF16_SRC.starts_with("#define ARHC_RND_HIP_BF16"));
-        assert!(kernels::SP_HC_RS_AG_GFX1201_HIPBF16_SRC.starts_with("#define ARHC_RND_HIP_BF16"));
-        let src = kernels::AR_HC_WRITE_GFX1201_SRC;
         for inst in [
             "arhc_entry<true, false, false>",
             "arhc_entry<false, false, false>",

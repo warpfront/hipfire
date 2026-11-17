@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Certified gfx1201 PeaceMaker twin of the down A4 producer `qwen4_moe_rotate128_i4`
-//! (`HIPFIRE_MOE_ROTATE_I4_PM`, `PrefillRoute::MoeRotateI4Pm`).
+//! (`PrefillRoute::MoeRotateI4Pm`).
 //!
 //! The kernel computes exactly what the incumbent HIP `qwen4_moe_rotate128_i4` computes: grouped
 //! BF16 SwiGLU rows `h` `[P, K]` -> FWHT128 (`mq_rotate_x_128_v2` arithmetic) -> `block_i4_128`
@@ -162,18 +162,16 @@ pub fn moe_rotate_i4_pm_shape_supported(k: usize, grouped_rows: usize, total_slo
     validate_moe_rotate_i4_pm(k, grouped_rows, total_slots).is_ok()
 }
 
-/// Pure selection of the rotate twin: the resolved typed flag (unset follows the exact-gfx1201
-/// qualification, `0` kills), the
-/// exact-gfx1201 raw inventory, the requested symmetric IU4 route, the exact C2 producer
-/// candidate set and a supported shape. Any miss keeps the incumbent.
+/// Pure selection of the rotate twin: the exact-gfx1201 raw inventory, the requested
+/// symmetric IU4 route, the exact C2 producer candidate set and a supported shape. Any miss
+/// keeps the incumbent.
 pub fn moe_rotate_i4_pm_selection(
-    flag: bool,
     arch: &str,
     iu4_requested: bool,
     c2_candidates: bool,
     shape_supported: bool,
 ) -> bool {
-    flag && raw_inventory(arch, PrefillRoute::MoeRotateI4Pm)
+    raw_inventory(arch, PrefillRoute::MoeRotateI4Pm)
         && iu4_requested
         && c2_candidates
         && shape_supported
@@ -195,8 +193,7 @@ impl Gpu {
 
     /// Whether [`Gpu::qwen4_moe_rotate128_i4`] runs the PM twin for this launch: see
     /// [`moe_rotate_i4_pm_selection`]. The requested-IU4 conjunct is either symmetric IU4 route
-    /// ([`Gpu::qwen4_moe_sym_iu4_requested`] or [`Gpu::moe_sym_iu4_requested`]); the device flag
-    /// is the once-resolved `flags.moe_rotate_i4_pm`.
+    /// ([`Gpu::qwen4_moe_sym_iu4_requested`] or [`Gpu::moe_sym_iu4_requested`]).
     pub fn moe_rotate_i4_pm_selected(
         &self,
         k: usize,
@@ -204,7 +201,6 @@ impl Gpu {
         total_slots: usize,
     ) -> bool {
         moe_rotate_i4_pm_selection(
-            self.flags.moe_rotate_i4_pm,
             &self.arch,
             self.qwen4_moe_sym_iu4_requested() || self.moe_sym_iu4_requested(),
             self.iu4_a4_c2_candidates_exact(),
@@ -347,7 +343,7 @@ impl Gpu {
     /// Down A4 producer, certified PM twin ([`MOE_ROTATE_I4_PM_GFX1201_SYMBOL`], bundle
     /// `kernels::MOE_ROTATE_I4_PM_GFX1201`), stream-ordered on the active stream. Same operands,
     /// sidecar handle and bytes as [`Gpu::qwen4_moe_rotate128_i4_incumbent`]. Explicit lab entry:
-    /// it never consults `HIPFIRE_MOE_ROTATE_I4_PM`, and errors on a device without the bundle,
+    /// it skips the route selection, and errors on a device without the bundle,
     /// a non-C2 producer candidate set or an unsupported shape
     /// ([`validate_moe_rotate_i4_pm`]); there is no HIP fallback here.
     pub fn qwen4_moe_rotate128_i4_pm(
@@ -571,29 +567,18 @@ mod tests {
 
     #[test]
     fn selection_needs_every_conjunct() {
-        assert!(moe_rotate_i4_pm_selection(
-            true, "gfx1201", true, true, true
-        ));
+        assert!(moe_rotate_i4_pm_selection("gfx1201", true, true, true));
         // Each conjunct alone refuses.
-        assert!(!moe_rotate_i4_pm_selection(
-            false, "gfx1201", true, true, true
-        ));
-        assert!(!moe_rotate_i4_pm_selection(
-            true, "gfx1201", false, true, true
-        ));
-        assert!(!moe_rotate_i4_pm_selection(
-            true, "gfx1201", true, false, true
-        ));
-        assert!(!moe_rotate_i4_pm_selection(
-            true, "gfx1201", true, true, false
-        ));
-        // An explicit flag never opts in off the raw inventory (no card or model-name gates:
+        assert!(!moe_rotate_i4_pm_selection("gfx1201", false, true, true));
+        assert!(!moe_rotate_i4_pm_selection("gfx1201", true, false, true));
+        assert!(!moe_rotate_i4_pm_selection("gfx1201", true, true, false));
+        // Off the raw inventory the twin never runs (no card or model-name gates:
         // the inventory is the exact-architecture bundle table).
         for arch in [
             "gfx1151", "gfx1100", "gfx1200", "gfx942", "gfx906", "unknown",
         ] {
             assert!(
-                !moe_rotate_i4_pm_selection(true, arch, true, true, true),
+                !moe_rotate_i4_pm_selection(arch, true, true, true),
                 "{arch}"
             );
         }

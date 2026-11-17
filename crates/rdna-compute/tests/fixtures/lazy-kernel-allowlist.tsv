@@ -82,7 +82,7 @@ module	attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11	config-opt-in	Non-default con
 module	attention_q8_0_fa2_gqa_fwht4k_gfx11	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:9362
 module	attention_q8_0_fa2_gqa_fwht4k_gfx1201	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:8306
 module	attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:9638
-module	attention_q8_0_fa2_gqa_gfx11	developer-opt-in	Non-default developer override: HIPFIRE_FA2_FILL / HIPFIRE_GFX1100_FA2_R3; rdna-compute/src/attention.rs:7977
+module	attention_q8_0_fa2_gqa_gfx11	non-target-arch	Non-Q16 gfx11 cards (gfx1100/gfx1151 run their own fill builds); rdna-compute/src/attention.rs:7977
 module	attention_q8_0_fa2_gqa_gfx1201	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:6094
 module	attention_q8_0_fa2_gqa_partial_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_FA2_SPLIT_VERIFY; rdna-compute/src/attention.rs:8723
 module	attention_q8_0_kv_batched_vmm	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/attention.rs:4299
@@ -280,17 +280,14 @@ module	fused_rmsnorm_mq_rotate_vecsum_sign_const	config-opt-in	Non-default confi
 module	fused_rmsnorm_mq_rotate_vecsum_sign_lds	config-opt-in	Non-default configuration: kernel.rdna; rdna-compute/src/gemv.rs:2777
 module	fused_rmsnorm_mq_rotate_wavegrid	config-opt-in	Non-default configuration: kernel.rdna; rdna-compute/src/gemv.rs:2770-2772
 module	fused_silu_mul_mq_rotate_awq_hin_bf16_fp8_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
-module	fused_silu_mul_mq_rotate_awq_hin_fp8_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_silu_mul_mq_rotate_awq_i4_hin_bf16_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_BF16_H_A4; rdna-compute/src/gemv.rs:4863-4874
 module	fused_silu_mul_mq_rotate_awq_i4_hin_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A4_SLAB / HIPFIRE_G12_IU4_B1_CONTROL; rdna-compute/src/gemv.rs:4885-4889
-module	fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab	developer-opt-in	Non-default developer override: HIPFIRE_A4_HIN_TOKFAST; rdna-compute/src/gemv.rs:4868-4884
 module	fused_silu_mul_mq_rotate_awq_i8_hin_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:6946
 module	fused_silu_mul_mq_rotate_awq_i8_hin_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:6941
 module	fused_silu_mul_mq_rotate_awq_indexed	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; hipfire-dispatch/src/pipeline/mod.rs:4658-4668
 module	fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_silu_mul_mq_rotate_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_silu_mul_mq_rotate_hin_bf16_fp8_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
-module	fused_silu_mul_mq_rotate_hin_fp8_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_silu_mul_mq_rotate_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	gated_add_f32	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/flux_gpu.rs:1736
@@ -314,7 +311,7 @@ module	gated_delta_vector_chunk_gfx1201	non-core-family	Chunked vector GDN, gfx1
 module	gated_norm_mq_rotate_awq_gfx1100	non-core-family	Non-core family route: LFM2; rdna-compute/src/gemv.rs:5301-5306
 module	gated_norm_mq_rotate_awq_gfx1151	non-core-family	Non-core family route: LFM2; rdna-compute/src/gemv.rs:5287-5293
 module	gated_norm_mq_rotate_awq_gfx1201	non-core-family	Non-core family route: LFM2; rdna-compute/src/gemv.rs:5273-5279
-module	gated_norm_mq_rotate_awq_i4_gfx11	developer-opt-in	Non-default developer override: HIPFIRE_GFX1100_GATED_NORM_V2; rdna-compute/src/gemv.rs:5845-5860
+module	gated_norm_mq_rotate_awq_i4_gfx11	non-target-arch	Non-target gfx11 (gfx1100/gfx1151 run the v2 producers); rdna-compute/src/gemv.rs:5845-5860
 module	gated_norm_mq_rotate_awq_i4_gfx12	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:5436-5467
 module	gated_norm_mq_rotate_awq_i4_gfx12_xbf16	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:5436-5467
 module	gated_norm_mq_rotate_awq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:7051
@@ -323,7 +320,7 @@ module	gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default dev
 module	gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12_xbf16	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	gated_norm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	gated_norm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12_xbf16	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
-module	gated_norm_mq_rotate_i4_gfx11	developer-opt-in	Non-default developer override: HIPFIRE_GFX1100_GATED_NORM_V2; rdna-compute/src/gemv.rs:5845-5860
+module	gated_norm_mq_rotate_i4_gfx11	non-target-arch	Non-target gfx11 (gfx1100/gfx1151 run the v2 producers); rdna-compute/src/gemv.rs:5845-5860
 module	gated_norm_mq_rotate_i4_gfx12	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:5436-5467
 module	gated_norm_mq_rotate_i4_gfx12_xbf16	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:5436-5467
 module	gated_norm_mq_rotate_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:7055
@@ -407,7 +404,6 @@ module	gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt8_lut	codec-outside-core-rungs	MQ
 module	gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_s2bt8	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_s2bt8_lut	codec-outside-core-rungs	MQ4G256V2Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:35531-35560
 module	gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
-module	gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_silu_h	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_silu_h_bf16	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
 module	gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
@@ -511,14 +507,11 @@ module	gemm_mq4g256_lloyd_residual_wmma_mb4_rdna3	codec-outside-core-rungs	Dense
 module	gemm_mq4g256_lloyd_residual_wmma_rdna3	codec-outside-core-rungs	Dense MQ4G256Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:2031-2700
 module	gemm_mq4g256_lloyd_residual_wmma_rdna4	codec-outside-core-rungs	Dense MQ4G256Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:2031-2700
 module	gemm_mq4g256v2_moe_grouped_top10_simt	codec-outside-core-rungs	Non-slab MQ4G256V2 layout absent from core XTS artifact rungs; rdna-compute/src/gemm.rs:47813-47830
-module	gemm_mq4g256v2_residual_iu4_v2c_gfx11	developer-opt-in	Non-default developer override: HIPFIRE_GFX1100_PM_GEMM; rdna-compute/src/gemm.rs:956-967
+module	gemm_mq4g256v2_residual_iu4_v2c_gfx11	non-target-arch	V2C shapes with M >= 2^22 only (gfx1100 runs the builder V2C tile below that); rdna-compute/src/gemm.rs:956-967
 module	gemm_mq4g256v2_residual_mmq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemm.rs:1650-1680
 module	gemm_mq4g256v2_residual_mmq_i8_gfx11_t256	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemm.rs:1650-1680
 module	gemm_mq4g256v2_residual_mmq_i8_gfx12_apf0	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemm.rs:1650-1680
 module	gemm_mq4g256v2_residual_mmq_i8_lloyd_gfx11	developer-opt-in	Non-default developer override: HIPFIRE_LLOYD_MMQ_A4 (staged twin TU); rdna-compute/src/gemm.rs:23009
-module	gemm_mq4g256v2_residual_mmq_iu4_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_G12_RASTER / HIPFIRE_IU4_SYMFOLD; rdna-compute/src/gemm.rs:21648-21700
-module	gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold	developer-opt-in	Non-default developer override: HIPFIRE_G12_IU4_ISA / HIPFIRE_G12_RASTER; rdna-compute/src/gemm.rs:21636-21660
-module	gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r	developer-opt-in	Non-default developer override: HIPFIRE_G12_IU4_ISA / HIPFIRE_G12_IU4_V3; rdna-compute/src/gemm.rs:21625-21634
 module	gemm_mq4g256v2_residual_mmq_lloyd	codec-outside-core-rungs	MQ4G256V2Lloyd/MQ4Lloyd route absent from admitted core artifact rungs; rdna-compute/src/gemm.rs:20952-21065
 module	gemm_mq4g256v2_residual_wmma_base	no-caller	Lab-only T0 reference arm (#[cfg(feature = "lab")]); only the lab example calls it; rdna-compute/src/gemm.rs:42083
 module	gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt12	config-opt-in	Non-default configuration: kernel.iu; rdna-compute/src/gemm.rs:11817
@@ -1069,7 +1062,6 @@ module	rmsnorm_f32_staged_buf	non-core-family	Non-core family route: DeepSeek4; 
 module	rmsnorm_reduce_gfx1100	config-opt-in	Non-default configuration: kernel.rdna; rdna-compute/src/gemv.rs:2767-2769
 module	rmsnorm_reduce_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemv.rs:3288-3305
 module	rmsnorm_residual_add	non-core-family	Non-core family route: Muse Glimmer, Gemma, LFM2; hipfire-arch-muse-glimmer/src/forward.rs:871
-module	rope_2d_flux_f32	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/flux_gpu.rs:3067
 module	rope_2d_flux_f32_fast	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/flux_gpu.rs:3067
 module	rope_2d_halfsplit	non-core-family	Non-core family route: EmbeddingGemma, dots.ocr; forward.rs:344
 module	rope_mrope_halfsplit_batched_f32	config-opt-in	Non-default configuration: serve.multi_slot / vision.mode; hipfire-arch-qwen35/src/forward_slots.rs:2891

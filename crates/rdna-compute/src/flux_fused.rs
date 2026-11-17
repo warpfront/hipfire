@@ -561,7 +561,6 @@ mod tests {
     #[test]
     fn rope_kernels_take_four_axes_and_an_id_table() {
         for (name, src) in [
-            ("rope_2d_flux_f32", crate::kernels::ROPE_2D_FLUX_F32_SRC),
             (
                 "rope_2d_flux_f32_fast",
                 crate::kernels::ROPE_2D_FLUX_F32_FAST_SRC,

@@ -2814,15 +2814,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Use the 16-wave low-footprint IU4 full-tile entry on gfx1100 (default on); ignored on other architectures. Set false or HIPFIRE_GFX11_IU4_SHAPE=0 to restore the prior gfx1100 shape."
     ),
     process_bool_field!(
-        "kernel.gfx11_iu4_symfold",
-        "gfx11_iu4_symfold",
-        Kernel,
-        true,
-        true,
-        "HIPFIRE_IU4_SYMFOLD",
-        "Exploit symmetric MQ4V2 weights on exact gfx1100/gfx1151 by rebiasing q to q-8 and using signed-weight IU4 WMMA (default on for symmetric artifacts only); set false or HIPFIRE_IU4_SYMFOLD=0 to opt out. Asymmetric artifacts and other architectures are unchanged."
-    ),
-    process_bool_field!(
         "kernel.gfx11_a8_prefill",
         "gfx11_a8_prefill",
         Kernel,
@@ -4012,8 +4003,6 @@ const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.moe_router_topk_multirow",
     "developer.moe_combine_v2",
     "developer.fa_prefill_pm_qprep",
-    "developer.moe_rotate_i4_pm",
-    "developer.gdn_chunk_prep_pm",
     "developer.moe_shared_down_sigmoid_epi",
 ];
 
@@ -6001,6 +5990,326 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "the verify tape copy batching kill switch was removed (HIPF-396)",
         replacement: "none; singleton chain-verify tape copies are always one batched launch",
+    },
+    RetiredConfigKey {
+        key: "developer.a3b_moe_dedup",
+        legacy_key: "a3b_moe_dedup",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the A3B lane MoE decode dedup kill switch was removed (HIPF-396)",
+        replacement: "none; A3B lane decode of 2+ lanes always runs the expert-deduplicating routed kernels",
+    },
+    RetiredConfigKey {
+        key: "developer.a3b_moe_dedup_down",
+        legacy_key: "a3b_moe_dedup_down",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the A3B lane MoE routed-down dedup kill switch was removed (HIPF-396)",
+        replacement: "none; A3B lane decode of 2+ lanes always runs the expert-deduplicating routed down",
+    },
+    RetiredConfigKey {
+        key: "developer.a4_hin_tokfast",
+        legacy_key: "a4_hin_tokfast",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the A4 slab HIN producer token-fastest grid kill switch was removed (HIPF-396)",
+        replacement: "none; the slab HIN producer always runs the token-fastest grid",
+    },
+    RetiredConfigKey {
+        key: "developer.a8_fused_prod",
+        legacy_key: "a8_fused_prod",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the fused A8 sidecar producer kill switch was removed (HIPF-396)",
+        replacement: "none; admitted A8 prefill sites always emit the A8 sidecar from the fused producers",
+    },
+    RetiredConfigKey {
+        key: "developer.argmax_regrid_pm",
+        legacy_key: "argmax_regrid_pm",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the gfx1201 PeaceMaker batched argmax kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always runs the builder argmax twin where the row length admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.bf16_h_fp8",
+        legacy_key: "bf16_h_fp8",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the fp8 bf16 SiLU-h kill switch was removed (HIPF-396)",
+        replacement: "none; the fp8 F2 and v2 SiLU-h routes always hand off packed bf16 h",
+    },
+    RetiredConfigKey {
+        key: "developer.ddtree_topk_direct_off",
+        legacy_key: "ddtree_topk_direct_off",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the DDTree direct top-K opt-out was removed (HIPF-396)",
+        replacement: "none; the switch had no consumer left",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_ar_fast_apply",
+        legacy_key: "ep_ar_fast_apply",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP2 all-reduce HC apply fast-path kill switch was removed (HIPF-396)",
+        replacement: "none; the gfx1201 EP2 AR / SP HC apply always rounds by selects and splits short tagged launches",
+    },
+    RetiredConfigKey {
+        key: "developer.ep_ar_wide_grid",
+        legacy_key: "ep_ar_wide_grid",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the EP2 all-reduce wide launch grid kill switch was removed (HIPF-396)",
+        replacement: "none; the gfx1201 EP2 AR non-split entries always take the wide launch grid where it fits",
+    },
+    RetiredConfigKey {
+        key: "developer.fa2_fill",
+        legacy_key: "fa2_fill",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx11 FA2 warp-specialized fill kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1100 and gfx1151 always run their warp-specialized FA2 fill builds",
+    },
+    RetiredConfigKey {
+        key: "developer.flux_rope_fast",
+        legacy_key: "flux_rope_fast",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the FLUX RoPE fast-kernel kill switch was removed (HIPF-396)",
+        replacement: "none; FLUX RoPE always runs the tuned kernel",
+    },
+    RetiredConfigKey {
+        key: "developer.fp8_decode_attn_gqa",
+        legacy_key: "fp8_decode_attn_gqa",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1201 fp8 GQA decode attention kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1201 fp8 decode attention always takes the GQA-shared tile where its shape admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.fp8_silu_h",
+        legacy_key: "fp8_silu_h",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the fp8 paired-row SiLU-h epilogue kill switch was removed (HIPF-396)",
+        replacement: "none; the gfx1201 fp8 v2 gate/up always uses the SiLU-h epilogue where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.g12_fp8_isa",
+        legacy_key: "g12_fp8_isa",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1201 builder fp8 GEMM kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1201 fp8 prefill always takes the builder F2 GEMM where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.g12_iu4_isa",
+        legacy_key: "g12_iu4_isa",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1201 builder IU4 GEMM kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1201 symmetric A4 prefill always takes the builder _b1 GEMM where the shape admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.g12_iu4_v3",
+        legacy_key: "g12_iu4_v3",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1201 K1 IU4 module kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1201 symmetric IU4 always uses the K1 V3 module where the builder GEMM does not run",
+    },
+    RetiredConfigKey {
+        key: "developer.g12_raster",
+        legacy_key: "g12_raster",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1201 banded IU4 raster kill switch was removed (HIPF-396)",
+        replacement: "none; the gfx1201 asymmetric IU4 GEMM always uses the banded raster module",
+    },
+    RetiredConfigKey {
+        key: "developer.gated_delta_vector_pm",
+        legacy_key: "gated_delta_vector_pm",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the gated-delta vector PeaceMaker twin kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1100 and gfx1201 always run the twins where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.gdn_chunk_pm",
+        legacy_key: "gdn_chunk_pm",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the chunked-GDN PeaceMaker twin kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1151 and gfx1100 always run the sealed twins of their variants",
+    },
+    RetiredConfigKey {
+        key: "developer.gdn_chunk_prep_pm",
+        legacy_key: "gdn_chunk_prep_pm",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the GDN chunk-prep PeaceMaker twin switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always runs the twin where the chunk scan admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.gdn_kkt_gfx1100",
+        legacy_key: "gdn_kkt_gfx1100",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1100 GDN KKT kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1100 always takes its GDN KKT path",
+    },
+    RetiredConfigKey {
+        key: "developer.gdn_persistent_staged",
+        legacy_key: "gdn_persistent_staged",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the gfx12 GDN persistent staged-body kill switch was removed (HIPF-396)",
+        replacement: "none; gfx12 always compiles the staged persistent GDN body",
+    },
+    RetiredConfigKey {
+        key: "developer.gdn_pre_fuse_off",
+        legacy_key: "gdn_pre_fuse_off",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the GDN pre-kernel fusion opt-out was removed (HIPF-396)",
+        replacement: "none; the fused GDN pre-kernels always run where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.gdn_prep_fused",
+        legacy_key: "gdn_prep_fused",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1201 fused QKVZA+GDN prep kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1201 always takes the fused GDN prep route where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.gdn_prep_gfx11",
+        legacy_key: "gdn_prep_gfx11",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx11 row-major GDN prep kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1100 and gfx1151 always take the row-major GDN prep",
+    },
+    RetiredConfigKey {
+        key: "developer.gdn_scan_mseg",
+        legacy_key: "gdn_scan_mseg",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the GDN multi-segment chunk-scan kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1201 always runs one chunk-scan launch per layer where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1100_decode_attn_gqa",
+        legacy_key: "gfx1100_decode_attn_gqa",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1100 Q8 GQA decode attention kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1100 Q8 decode attention always takes the GQA-shared tile where its shape admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1100_fa2_r3",
+        legacy_key: "gfx1100_fa2_r3",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1100 FA2 r3 fill kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1100 always runs its CU-mode FA2 fill variant",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1100_gated_norm_v2",
+        legacy_key: "gfx1100_gated_norm_v2",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1100 gated-norm v2 kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1100 always runs the v2 gated-norm IU4 producers",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1100_pm_gemm",
+        legacy_key: "gfx1100_pm_gemm",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1100 builder V2C GEMM kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1100 always runs the builder V2C tile where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1151_fa2_twin",
+        legacy_key: "gfx1151_fa2_twin",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1151 FA2 twin kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1151 always runs its FA2 fill twin",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1151_q8_decode_attn_gqa",
+        legacy_key: "gfx1151_q8_decode_attn_gqa",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1151 Q8 GQA decode attention kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1151 Q8 decode attention always takes the GQA-shared tile where its shape admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1151_q8_decode_attn_gqa_gemma",
+        legacy_key: "gfx1151_q8_decode_attn_gqa_gemma",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the gfx1151 Gemma Q8 GQA decode attention kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1151 Gemma 4 Q8 decode always takes the GQA tile where its shape admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.iu4_bafold",
+        legacy_key: "iu4_bafold",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the IU4 DeltaNet beta/alpha fold kill switch was removed (HIPF-396)",
+        replacement: "none; the beta/alpha fold always applies where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.iu4_v2b",
+        legacy_key: "iu4_v2b",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1151 IU4 V2B GEMM kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1151 always takes the V2B tile where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.iu4_v2c",
+        legacy_key: "iu4_v2c",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1100 IU4 V2C GEMM kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1100 always takes the V2C tile where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.iu4_x5",
+        legacy_key: "iu4_x5",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx11 IU4 X5 packet kill switch was removed (HIPF-396)",
+        replacement: "none; gfx11 IU4 always uses X5 packets where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.moe_grouped_k2_pm",
+        legacy_key: "moe_grouped_k2_pm",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the gfx1100 grouped MoE k2 PeaceMaker twin kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1100 always runs the twin where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.moe_rotate_i4_pm",
+        legacy_key: "moe_rotate_i4_pm",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the gfx1201 PeaceMaker down-A4 producer switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always runs the twin where the symmetric IU4 route admits it",
+    },
+    RetiredConfigKey {
+        key: "kernel.gfx11_iu4_symfold",
+        legacy_key: "gfx11_iu4_symfold",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the symmetric MQ4V2 IU4 rebias fold switch was removed (HIPF-396)",
+        replacement: "none; symmetric MQ4V2 artifacts always take the signed-weight IU4 fold",
     },
 ];
 
@@ -10023,56 +10332,6 @@ mod tests {
         const ENV: &str = "HIPFIRE_FA_PREFILL_PM_QPREP";
         assert!(is_developer_key(KEY));
         assert!(is_typed_bool_developer_key(KEY));
-        assert_eq!(typed_developer_bool_value(ENV, None), None);
-        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
-            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
-            let mut layer = ConfigLayer::default();
-            layer.set_cli(KEY, raw).unwrap();
-            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
-            layer.validate().unwrap();
-        }
-        for bad in ["", "2", "on", "off", "yes", "maybe"] {
-            let mut layer = ConfigLayer::default();
-            assert!(matches!(
-                layer.set_cli(KEY, bad),
-                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
-            ));
-            assert!(layer.values.is_empty());
-        }
-    }
-
-    #[test]
-    fn moe_rotate_i4_pm_is_a_typed_bool_developer_key() {
-        const KEY: &str = "developer.moe_rotate_i4_pm";
-        const ENV: &str = "HIPFIRE_MOE_ROTATE_I4_PM";
-        assert!(is_developer_key(KEY));
-        assert!(is_typed_bool_developer_key(KEY));
-        assert_eq!(typed_developer_bool_value(ENV, None), None);
-        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
-            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
-            let mut layer = ConfigLayer::default();
-            layer.set_cli(KEY, raw).unwrap();
-            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
-            layer.validate().unwrap();
-        }
-        for bad in ["", "2", "on", "off", "yes", "maybe"] {
-            let mut layer = ConfigLayer::default();
-            assert!(matches!(
-                layer.set_cli(KEY, bad),
-                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
-            ));
-            assert!(layer.values.is_empty());
-        }
-    }
-
-    #[test]
-    fn gdn_chunk_prep_pm_is_a_typed_bool_developer_key() {
-        const KEY: &str = "developer.gdn_chunk_prep_pm";
-        const ENV: &str = "HIPFIRE_GDN_CHUNK_PREP_PM";
-        assert!(is_developer_key(KEY));
-        assert!(is_typed_bool_developer_key(KEY));
-        // Unset is None: the consumer resolves it with `PrefillRoute::GdnChunkPrepPm`, which
-        // has no qualified row, so unset is off.
         assert_eq!(typed_developer_bool_value(ENV, None), None);
         for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
             assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));

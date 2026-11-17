@@ -2288,7 +2288,7 @@ impl Moe {
                 "nt": entry.spec.nt,
                 "selection": {
                     "residency": "vram (host-mapped experts take the NT8 twin)",
-                    "rule": "down: NT4 always (resident); grouped plane whenever the PM rotate twin is selected (HIPFIRE_MOE_ROTATE_I4_PM) on exact gfx1201",
+                    "rule": "down: NT4 always (resident); grouped plane whenever the PM rotate twin is selected (PrefillRoute::MoeRotateI4Pm) on exact gfx1201",
                     "total_slots": p.total_slots(),
                     "n_experts": p.geo.experts,
                 },

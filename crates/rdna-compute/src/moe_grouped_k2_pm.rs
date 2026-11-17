@@ -2,8 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! gfx1100 PeaceMaker twin of the grouped MoE GEMM `gemm_mq4g256v2_moe_grouped_wmma_k2`
-//! (`HIPFIRE_MOE_GROUPED_K2_PM`, developer, default on; `=0` restores the hipcc kernel).
+//! gfx1100 PeaceMaker twin of the grouped MoE GEMM `gemm_mq4g256v2_moe_grouped_wmma_k2`.
 //!
 //! `kernels/gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hxaco` is the card-judged, bit-identical
 //! hipcc candidate `R1Moe-04-xlds-w4-t2` sealed by `scripts/pm-hip-twin.sh` (route A: lift
@@ -19,7 +18,6 @@
 //! the incumbent kernel name.
 
 use crate::dispatch::Gpu;
-use std::sync::LazyLock;
 
 pub const MODULE: &str = "gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100";
 pub const SYMBOL: &str = "gemm_mq4g256v2_moe_grouped_wmma_k2_pm_gfx1100";
@@ -34,14 +32,10 @@ pub const SLOT_TILE: usize = 16;
 /// MQ4G256V2 group width: `K` must be a whole number of groups.
 pub const K_GROUP: usize = 256;
 
-static FLAG: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_MOE_GROUPED_K2_PM", true));
-
 /// Why a grouped MoE launch keeps the hipcc kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoeGroupedK2PmRefusal {
-    Disabled,
-    /// Not exact gfx1100 (the default-on flag is not a refusal worth logging there).
+    /// Not exact gfx1100 (the incumbent, not a refusal worth logging there).
     Arch,
     /// A BF16-output (`gfx11_entry`) or non-default row-tile entry: hipcc only.
     Entry,
@@ -52,7 +46,6 @@ pub enum MoeGroupedK2PmRefusal {
 impl std::fmt::Display for MoeGroupedK2PmRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Disabled => "HIPFIRE_MOE_GROUPED_K2_PM is off",
             Self::Arch => "exact gfx1100 only",
             Self::Entry => "the F32 16-row entry only",
             Self::Rows => "needs M % 64 == 0",
@@ -64,7 +57,7 @@ impl std::fmt::Display for MoeGroupedK2PmRefusal {
 impl MoeGroupedK2PmRefusal {
     fn log_once(self) {
         let index = match self {
-            Self::Disabled | Self::Arch | Self::Entry => return,
+            Self::Arch | Self::Entry => return,
             Self::Rows => 0,
             Self::K => 1,
         };
@@ -75,19 +68,16 @@ impl MoeGroupedK2PmRefusal {
     }
 }
 
-/// Pure admission: flag on, exact gfx1100, the F32 entry (`gfx11_entry` none, 16-row tile
+/// Pure admission: exact gfx1100, the F32 entry (`gfx11_entry` none, 16-row tile
 /// launcher), `M % 64 == 0` and `K % 256 == 0`.
 pub fn admission(
-    flag: bool,
     arch: &str,
     has_gfx11_entry: bool,
     rows_per_block: usize,
     m: usize,
     k: usize,
 ) -> Result<(), MoeGroupedK2PmRefusal> {
-    if !flag {
-        Err(MoeGroupedK2PmRefusal::Disabled)
-    } else if arch != "gfx1100" {
+    if arch != "gfx1100" {
         Err(MoeGroupedK2PmRefusal::Arch)
     } else if has_gfx11_entry || rows_per_block != SLOT_TILE {
         Err(MoeGroupedK2PmRefusal::Entry)
@@ -117,7 +107,7 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> bool {
-        match admission(*FLAG, &self.arch, has_gfx11_entry, rows_per_block, m, k) {
+        match admission(&self.arch, has_gfx11_entry, rows_per_block, m, k) {
             Ok(()) => true,
             Err(reason) => {
                 reason.log_once();
@@ -141,37 +131,33 @@ mod tests {
 
     #[test]
     fn admission_arch_entry_and_shape() {
-        assert_eq!(admission(true, "gfx1100", false, 16, 512, 2048), Ok(()));
-        assert_eq!(admission(true, "gfx1100", false, 16, 64, 256), Ok(()));
-        assert_eq!(
-            admission(false, "gfx1100", false, 16, 512, 2048),
-            Err(MoeGroupedK2PmRefusal::Disabled)
-        );
+        assert_eq!(admission("gfx1100", false, 16, 512, 2048), Ok(()));
+        assert_eq!(admission("gfx1100", false, 16, 64, 256), Ok(()));
         for arch in ["gfx1101", "gfx1151", "gfx1201", "gfx942", ""] {
             assert_eq!(
-                admission(true, arch, false, 16, 512, 2048),
+                admission(arch, false, 16, 512, 2048),
                 Err(MoeGroupedK2PmRefusal::Arch),
                 "{arch}"
             );
         }
         assert_eq!(
-            admission(true, "gfx1100", true, 16, 512, 2048),
+            admission("gfx1100", true, 16, 512, 2048),
             Err(MoeGroupedK2PmRefusal::Entry)
         );
         assert_eq!(
-            admission(true, "gfx1100", false, 64, 512, 2048),
+            admission("gfx1100", false, 64, 512, 2048),
             Err(MoeGroupedK2PmRefusal::Entry)
         );
         for m in [0, 16, 32, 96, 513] {
             assert_eq!(
-                admission(true, "gfx1100", false, 16, m, 2048),
+                admission("gfx1100", false, 16, m, 2048),
                 Err(MoeGroupedK2PmRefusal::Rows),
                 "M {m}"
             );
         }
         for k in [0, 128, 255, 257, 1000] {
             assert_eq!(
-                admission(true, "gfx1100", false, 16, 512, k),
+                admission("gfx1100", false, 16, 512, k),
                 Err(MoeGroupedK2PmRefusal::K),
                 "K {k}"
             );
