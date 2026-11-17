@@ -1,13 +1,13 @@
 # hipfire — multi-slot engine over VMM KV, with vision + MTP, on port 9001.
 #
-# This is the manual-test recipe for the VMM slot route
-# (`docs/plans/2026-10-22-vmm-kv-multislot-engine.md`):
+# This is the manual-test recipe for the shared VMM page pool
+# (`docs/plans/2026-10-25-vmm-backed-shared-paged-kv.md`):
 #   * multi-slot engine (4 slots, per-slot ctx bound 262144);
 #   * the shared VMM page pool (`--multi-slot-paged` with
 #     `serve.multi_slot_paged_backend=vmm`), q8;
 #   * MTP speculative decode from the `.mtp` sidecar (`--spec mtp`);
 #   * vision from the `.vl` sidecar (`--vision`, `HIPFIRE_VISION_MODE=on`);
-#     image requests run the sequential VL path against their slot's pages.
+#     image requests run the batched VL path on the shared pool.
 #
 # The model directory is bind-mounted read-only; it must contain the trunk and
 # its sidecars (qwen3.5-4b.mq4 / .mtp / .vl), because sidecars are resolved as
