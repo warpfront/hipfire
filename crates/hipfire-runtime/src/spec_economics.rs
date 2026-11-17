@@ -2159,6 +2159,18 @@ pub const FIXED_SCOUT_SHARE: f32 = 0.02;
 /// load prices AR. Global, relative to the window's own width.
 pub const FIXED_SUSPECT_YIELD: f32 = 0.5;
 
+/// Priced windows of an epoch before the fixed-window floor decides (cold
+/// windows never count). [`FLOOR_PROBE_WINDOWS`] (3) is the MTP floor's
+/// probe span, and on DFlash it decides a tie: a window settles 1 to 16
+/// tokens, so 3 windows of a request's opening (R9700 R2: 1, 2, 2 tokens
+/// where the request averages 2.1; R4: 3 tokens) price a winning route as
+/// losing. 8 windows cut the standard error of the sampled yield by
+/// √(8/3) ≈ 1.6×, and bound what a genuinely losing request pays for the
+/// wait: 5 more windows, each costing at most one window minus the AR token
+/// it settles (about 5 × 16 ms on the R9700, under 2% of a 256-token
+/// request). Global: never keyed by model, card, format or prompt.
+pub const FIXED_MIN_PRICED_WINDOWS: usize = 8;
+
 /// One finished window as the fixed-window floor prices it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FloorObservation {
@@ -2170,6 +2182,12 @@ pub struct FloorObservation {
     pub rows: usize,
     /// Wall µs of the window, loop to loop.
     pub us: f32,
+    /// The window carried first-use cost (the load's first window at its
+    /// width or route, a tape recorded or re-armed, a kernel bound or
+    /// compiled during it): observed, never priced, never counted toward
+    /// the [`FIXED_MIN_PRICED_WINDOWS`] priced windows a verdict needs, so it
+    /// cannot retire. Mirrors the MTP floor's first-use rule.
+    pub cold: bool,
 }
 
 /// Fixed-window state (see [`Floor::plan_fixed`]).
@@ -2214,7 +2232,9 @@ impl FixedFloor {
 ///   after [`FLOOR_PROBE_WINDOWS`] windows, the decayed settled count is at
 ///   most [`FIXED_SUSPECT_YIELD`] of the decayed verified rows does the probe
 ///   set run; its mean prices AR and the floor decides.
-/// - No verdict before [`FLOOR_PROBE_WINDOWS`] windows of the epoch.
+/// - No verdict before [`FIXED_MIN_PRICED_WINDOWS`] priced windows of the epoch. A
+///   window with first-use cost ([`FloorObservation::cold`]) is observed but
+///   never priced or counted; a cold AR token is never priced.
 /// - Losing: both memories above `ar_us × (1 + FIXED_HYSTERESIS)`; a tie
 ///   keeps speculating. A losing verdict first runs `probe_tokens` AR tokens
 ///   (at most once per [`FLOOR_PROBE_WINDOWS`] windows), re-prices AR by the
@@ -2287,11 +2307,12 @@ impl<const W: usize, const E: usize> Floor<W, E> {
                 "observe_fixed",
                 self.id,
                 format_args!(
-                    ",\"action\":{},\"settled\":{},\"rows\":{},\"us\":{}{}",
+                    ",\"action\":{},\"settled\":{},\"rows\":{},\"us\":{},\"cold\":{}{}",
                     FloorRouteName(observation.action),
                     observation.settled,
                     observation.rows,
                     FloorBits(observation.us),
+                    observation.cold,
                     self.after()
                 ),
             );
@@ -2346,18 +2367,32 @@ impl<const W: usize, const E: usize> Floor<W, E> {
     }
 
     fn observe_fixed_inner(&mut self, observation: FloorObservation) {
-        match observation.action {
-            Action::ArSynced | Action::ArHeadFree => self.observe_fixed_ar(observation.us),
-            Action::Native(_) | Action::Interleaved => {
-                self.observe_fixed_window(observation.settled, observation.rows, observation.us)
-            }
+        let FloorObservation {
+            action,
+            settled,
+            rows,
+            us,
+            cold,
+        } = observation;
+        match action {
+            Action::ArSynced | Action::ArHeadFree => self.observe_fixed_ar(us, cold),
+            Action::Native(_) | Action::Interleaved if cold => self.observe_fixed_cold(),
+            Action::Native(_) | Action::Interleaved => self.observe_fixed_window(settled, rows, us),
         }
     }
 
-    fn observe_fixed_ar(&mut self, us: f32) {
+    /// A speculative window with first-use cost: no memory, yield, scout
+    /// charge or window count moves, and no verdict runs. A cold scout keeps
+    /// its allowance (the next plan scouts again, warm).
+    fn observe_fixed_cold(&mut self) {
+        self.fixed.prev_ar = false;
+        self.fixed.scout = false;
+    }
+
+    fn observe_fixed_ar(&mut self, us: f32, cold: bool) {
         let after_ar = self.fixed.prev_ar;
         self.fixed.prev_ar = true;
-        let priced = after_ar && valid_us(us);
+        let priced = after_ar && !cold && valid_us(us);
         if self.probe_left > 0 && !self.retired {
             self.probe_left -= 1;
             if priced {
@@ -2462,7 +2497,8 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         }
     }
 
-    /// A new epoch: the verdict needs [`FLOOR_PROBE_WINDOWS`] fresh windows.
+    /// A new epoch: the verdict needs [`FIXED_MIN_PRICED_WINDOWS`] fresh priced
+    /// windows (cold windows never count).
     fn start_fixed_epoch(&mut self) {
         self.retired = false;
         self.probes = 0;
@@ -2477,7 +2513,12 @@ impl<const W: usize, const E: usize> Floor<W, E> {
     }
 
     fn decide_fixed(&mut self) {
-        if self.retired || !self.calibrated || self.probing() || self.probe_left > 0 {
+        if self.retired
+            || !self.calibrated
+            || self.observed < FIXED_MIN_PRICED_WINDOWS
+            || self.probing()
+            || self.probe_left > 0
+        {
             return;
         }
         if !valid_us(self.ar_us) {
@@ -2717,6 +2758,7 @@ fn replay_call<const W: usize, const E: usize>(
                 settled: json_usize(value, "settled")?,
                 rows: json_usize(value, "rows")?,
                 us: json_f32(value, "us")?,
+                cold: json_bool(value, "cold")?,
             });
             None
         }
@@ -9743,6 +9785,7 @@ mod fixed_floor_tests {
             settled,
             rows: WIDTH + 1,
             us,
+            cold: false,
         });
     }
 
@@ -9752,6 +9795,7 @@ mod fixed_floor_tests {
             settled: 1,
             rows: 0,
             us,
+            cold: false,
         });
     }
 
@@ -9780,11 +9824,100 @@ mod fixed_floor_tests {
     /// token against 25), its last window 200 µs for 4 tokens.
     fn retired() -> FixedFloor {
         let mut floor = calibrated(0);
-        for _ in 0..FLOOR_PROBE_WINDOWS {
+        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
             assert_eq!(step(&mut floor, 4, 200.0, AR), native());
         }
         assert!(floor.retired());
         floor
+    }
+
+    fn cold_window(floor: &mut FixedFloor, settled: usize, us: f32) {
+        assert_eq!(floor.plan_fixed(WIDTH), native());
+        floor.observe_fixed(FloorObservation {
+            action: native(),
+            settled,
+            rows: WIDTH + 1,
+            us,
+            cold: true,
+        });
+    }
+
+    #[test]
+    fn cold_windows_never_retire_a_warm_winner() {
+        // R9700 R2 shape: first-use windows (bind, tape capture, JIT) cost
+        // hundreds of warm windows, then warm windows win at 10 µs per token
+        // against 25. Priced and unpriced AR, with and without probes.
+        for probes in [0, PROBES] {
+            for mut floor in [calibrated(probes), FixedFloor::fixed(probes)] {
+                for _ in 0..2 * FLOOR_PROBE_WINDOWS {
+                    cold_window(&mut floor, 2, 50_000.0);
+                    assert!(!floor.retired());
+                }
+                assert_eq!(floor.fixed_spec_us_per_token(), None, "cold is unpriced");
+                for _ in 0..200 {
+                    assert_eq!(step(&mut floor, 12, 120.0, AR), native());
+                }
+                assert!(!floor.retired());
+                let spec = floor
+                    .fixed_spec_us_per_token()
+                    .expect("warm windows priced");
+                assert!((spec - 10.0).abs() < 1e-3, "cold cost never priced: {spec}");
+            }
+        }
+    }
+
+    #[test]
+    fn losing_windows_retire_after_the_priced_minimum_despite_cold_ones() {
+        // Cold windows interleaved with losing ones (50 µs per token against
+        // 25): no verdict until FIXED_MIN_PRICED_WINDOWS priced windows,
+        // then retired, with no probe (probe_tokens 0).
+        let mut floor = calibrated(0);
+        cold_window(&mut floor, 1, 9_000.0);
+        for _ in 0..FIXED_MIN_PRICED_WINDOWS - 1 {
+            assert_eq!(step(&mut floor, 4, 200.0, AR), native());
+            cold_window(&mut floor, 1, 9_000.0);
+            assert!(!floor.retired());
+        }
+        assert_eq!(step(&mut floor, 4, 200.0, AR), native());
+        assert!(floor.retired(), "losing after the priced minimum");
+        assert_eq!(floor.plan_fixed(WIDTH), Action::ArHeadFree);
+        // With probes: the losing verdict probes AR, then retires.
+        let mut floor = calibrated(PROBES);
+        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
+            cold_window(&mut floor, 1, 9_000.0);
+            step(&mut floor, 4, 200.0, AR);
+        }
+        for _ in 0..PROBES {
+            assert_eq!(step(&mut floor, 4, 200.0, AR), Action::ArSynced);
+        }
+        assert!(floor.retired());
+    }
+
+    #[test]
+    fn a_cold_ar_token_is_never_priced() {
+        let mut floor = calibrated(PROBES);
+        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
+            step(&mut floor, 1, 30.0, AR);
+        }
+        // Losing at 30 against 25 × 1.03: probes; the first follows a window,
+        // the second is cold, the last two price AR at 40.
+        for (us, cold) in [
+            (1_000.0, false),
+            (5_000.0, true),
+            (40.0, false),
+            (40.0, false),
+        ] {
+            assert_eq!(floor.plan_fixed(WIDTH), Action::ArSynced);
+            floor.observe_fixed(FloorObservation {
+                action: Action::ArSynced,
+                settled: 1,
+                rows: 0,
+                us,
+                cold,
+            });
+        }
+        assert_eq!(floor.ar_us(), 40.0);
+        assert!(!floor.retired());
     }
 
     #[test]
@@ -9808,6 +9941,13 @@ mod fixed_floor_tests {
         }
         assert!(floor.calibrated());
         assert_eq!(floor.ar_us(), AR);
+        // Priced now; the verdict waits for the priced minimum.
+        assert!(!floor.retired());
+        // The losing verdict, past the probe spacing, re-prices AR once more
+        // and retires.
+        for _ in 0..FIXED_MIN_PRICED_WINDOWS + PROBES {
+            step(&mut floor, 8, 800.0, AR);
+        }
         assert!(floor.retired(), "100 µs per token loses to 25: retired");
         // A low-yield request that wins once priced keeps speculating.
         let mut floor = FixedFloor::fixed(PROBES);
@@ -9825,14 +9965,18 @@ mod fixed_floor_tests {
             step(&mut floor, 1, 40.0, AR);
         }
         assert_eq!(step(&mut floor, 1, 40.0, AR), Action::ArSynced);
-        assert!(floor.calibrated() && floor.retired());
+        assert!(floor.calibrated() && !floor.retired());
+        for _ in FLOOR_PROBE_WINDOWS..FIXED_MIN_PRICED_WINDOWS {
+            step(&mut floor, 1, 40.0, AR);
+        }
+        assert!(floor.retired());
     }
 
     #[test]
     fn no_verdict_before_the_probe_windows_and_the_probe_set_is_bounded() {
         let mut floor = calibrated(PROBES);
         // Losing windows: no verdict inside the epoch's first windows.
-        for _ in 0..FLOOR_PROBE_WINDOWS - 1 {
+        for _ in 0..FIXED_MIN_PRICED_WINDOWS - 1 {
             assert_eq!(step(&mut floor, 1, 500.0, AR), native());
             assert!(!floor.retired() && !floor.needs_ar_sample());
         }
@@ -9852,7 +9996,7 @@ mod fixed_floor_tests {
     #[test]
     fn probes_reprice_ar_by_the_mean_of_the_priced_tokens() {
         let mut floor = calibrated(PROBES);
-        for _ in 0..FLOOR_PROBE_WINDOWS {
+        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
             step(&mut floor, 1, 30.0, AR);
         }
         // 30 µs per token loses to 25 × 1.03; the first probe follows a
@@ -9884,7 +10028,7 @@ mod fixed_floor_tests {
             assert!(!floor.retired(), "{per_token} µs per token must not retire");
         }
         let mut floor = calibrated(0);
-        for _ in 0..FLOOR_PROBE_WINDOWS {
+        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
             step(&mut floor, 4, 4.0 * AR * 1.04, AR);
         }
         assert!(floor.retired(), "above the band retires");
@@ -9896,7 +10040,7 @@ mod fixed_floor_tests {
         let mut floor = FixedFloor::fixed(PROBES);
         floor.calibrate_from(f32::NAN);
         assert_eq!(floor.ar_us(), 0.0);
-        for i in 0..FLOOR_PROBE_WINDOWS {
+        for i in 0..FIXED_MIN_PRICED_WINDOWS {
             assert!(!floor.retired(), "window {i}");
             step(&mut floor, 8, 10.0, AR);
         }
@@ -9915,16 +10059,17 @@ mod fixed_floor_tests {
     #[test]
     fn a_truncated_window_keeps_its_full_cost() {
         let mut floor = calibrated(0);
-        // 2 windows of 4 tokens at 20 µs (80 µs) win; one settling nothing
-        // costs 200 µs: about 50 µs per token on both memories, a loss.
-        step(&mut floor, 4, 80.0, AR);
-        step(&mut floor, 4, 80.0, AR);
-        step(&mut floor, 0, 200.0, AR);
+        // Windows of 4 tokens at 20 µs (80 µs) win; one settling nothing
+        // costs 2,000 µs: about 90 µs per token on both memories, a loss.
+        for _ in 1..FIXED_MIN_PRICED_WINDOWS {
+            step(&mut floor, 4, 80.0, AR);
+        }
+        step(&mut floor, 0, 2_000.0, AR);
         assert!(floor.retired());
         let mut floor = calibrated(0);
-        step(&mut floor, 4, 80.0, AR);
-        step(&mut floor, 4, 80.0, AR);
-        step(&mut floor, 4, 80.0, AR);
+        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
+            step(&mut floor, 4, 80.0, AR);
+        }
         assert!(!floor.retired());
     }
 
@@ -9994,7 +10139,7 @@ mod fixed_floor_tests {
         assert!(!floor.retired());
         assert_eq!(floor.ar_us(), AR);
         assert_eq!(floor.fixed_spec_us_per_token(), None);
-        for _ in 0..FLOOR_PROBE_WINDOWS - 1 {
+        for _ in 0..FIXED_MIN_PRICED_WINDOWS - 1 {
             step(&mut floor, 1, 500.0, AR);
             assert!(!floor.retired());
         }

@@ -1210,6 +1210,9 @@ pub enum FloorControl<'a> {
 pub struct DriverFloor {
     pub floor: crate::spec_economics::FixedFloor,
     pub prices: crate::spec_prices::LoadPrices,
+    /// Verified-row counts (bit `rows`, 0 = AR token, saturating at 127)
+    /// already observed on this load: see [`Self::first_use`].
+    warm_rows: u128,
 }
 
 impl DriverFloor {
@@ -1225,7 +1228,19 @@ impl DriverFloor {
                 floor
             },
             prices: crate::spec_prices::LoadPrices::new(full_rows),
+            warm_rows: 0,
         }
+    }
+
+    /// `true` the first time a window of `rows` verified rows (0: an AR
+    /// token) is observed on this load: it carries the width's or route's
+    /// first-use cost and is observed unpriced
+    /// ([`crate::spec_economics::FloorObservation::cold`]).
+    pub fn first_use(&mut self, rows: usize) -> bool {
+        let bit = 1u128 << rows.min(127);
+        let first = self.warm_rows & bit == 0;
+        self.warm_rows |= bit;
+        first
     }
 }
 
