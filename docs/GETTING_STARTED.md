@@ -206,6 +206,16 @@ no `HIPFIRE_*` feature overrides, verifies every index against that toolchain,
 and writes byte-reproducible tarballs. `--rocm-min X.Y --rocm-max-exclusive X.Y`
 declares a range other than the default; it must contain the build's ROCm.
 
+Release Rust toolchain: the binary archives (`scripts/build-binary-archive.sh`,
+used by the release workflow and the promotion lane) and the release container
+build with the rustc named in `scripts/release-toolchain.txt`, not `stable`;
+day-to-day builds are unaffected. Each archive's `manifest.json` (also attached
+as `<archive>.manifest.json`) records that rustc's version and commit hash, so
+a release can be checked against the lane archive that gated it. To bump it,
+change that one line in its own commit and land it through the promotion lane
+(the lane host needs `rustup toolchain install <version> --profile minimal`
+first; the script refuses a missing toolchain).
+
 ### Windows — status
 
 > **Native Windows and WSL2 are both untested on GPU hardware.** The only

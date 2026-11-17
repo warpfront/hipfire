@@ -42,8 +42,12 @@ ARG HIPFIRE_REVISION
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential git pkg-config python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
+# The release Rust toolchain (scripts/release-toolchain.txt), the same rustc as
+# the release binary archives.
+COPY scripts/release-toolchain.txt /root/release-toolchain.txt
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain stable --profile minimal
+        | sh -s -- -y --default-toolchain "$(tr -d '[:space:]' < /root/release-toolchain.txt)" --profile minimal \
+    && rm /root/release-toolchain.txt
 ENV PATH="/root/.cargo/bin:${PATH}" \
     CARGO_TARGET_DIR=/hipfire/target
 WORKDIR /hipfire

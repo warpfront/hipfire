@@ -98,7 +98,9 @@ one-shot speed 42%); the lane exists to stop that class of escape.
 ### What runs
 
 1. The candidate builds its own archive with
-   [`scripts/build-binary-archive.sh`](../scripts/build-binary-archive.sh) at its SHA.
+   [`scripts/build-binary-archive.sh`](../scripts/build-binary-archive.sh) at its SHA,
+   with the release rustc pinned in `scripts/release-toolchain.txt` (the
+   compiler the release binaries use; recorded in the archive's `manifest.json`).
 2. [`scripts/promotion-lane/lane.py`](../scripts/promotion-lane/lane.py) `run`
    installs it into a fresh directory and runs
    [`scripts/device_mesh_matrix.py`](../scripts/device_mesh_matrix.py)

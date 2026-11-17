@@ -20,15 +20,25 @@
 #   bin/kernels/compiled/<arch>/   indexed kernel objects for <arch> only
 #   LICENSE
 #   NOTICE
+#   manifest.json                  tag, commit, arch and the rustc that built
+#                                  the binaries (also written beside the
+#                                  archive as <stem>.manifest.json)
 # Run it with `HIPFIRE_DAEMON_BIN=<dir>/bin/daemon <dir>/bin/hipfire ...` when
 # it is not installed under $HIPFIRE_HOME/bin.
 #
-# Needs git, cargo, GNU tar, gzip, strip (binutils) and hipcc; no GPU. The source is
+# Needs git, rustup, GNU tar, gzip, strip (binutils) and hipcc; no GPU. The source is
 # `git archive` of the commit, so local edits never reach an archive. The
 # binaries link the build host's glibc, so a host needs a glibc at least that
 # new; the release workflow builds in the ROCm 10.1 Ubuntu 26.04 image, the same
 # toolchain as the kernel packs. Tarballs are reproducible given the same
 # binaries: sorted members, owner 0, the commit's timestamp, gzip -n.
+#
+# Rust is pinned: every cargo/rustc call uses the toolchain named in
+# scripts/release-toolchain.txt (`cargo +<version>`), whatever the host's
+# default is; release.yml installs that version and the promotion lane builds
+# through this script, so a released binary and the lane archive that gated it
+# come from the same compiler. The binaries must embed only that rustc's
+# commit hash, or the build fails.
 #
 # Usage: scripts/build-binary-archive.sh --tag TAG [--commit REV] [--out DIR]
 #            [--target-dir DIR] [--packs DIR] [arch ...]
@@ -61,7 +71,7 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         --help|-h)
-            sed -n '7,40p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '7,49p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         -*)
@@ -75,6 +85,13 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 command -v strip >/dev/null 2>&1 || { echo "ERROR: strip (binutils) is required" >&2; exit 2; }
+TOOLCHAIN_FILE="$REPO/scripts/release-toolchain.txt"
+[ -f "$TOOLCHAIN_FILE" ] || { echo "ERROR: $TOOLCHAIN_FILE is missing" >&2; exit 2; }
+TOOLCHAIN="$(tr -d '[:space:]' < "$TOOLCHAIN_FILE")"
+[[ "$TOOLCHAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || { echo "ERROR: $TOOLCHAIN_FILE must hold one Rust version (x.y.z), got '$TOOLCHAIN'" >&2; exit 2; }
+command -v rustup >/dev/null 2>&1 \
+    || { echo "ERROR: rustup is required (the release toolchain $TOOLCHAIN is selected with cargo +$TOOLCHAIN)" >&2; exit 2; }
 [ "${#ARCHS[@]}" -gt 0 ] || ARCHS=(gfx1151 gfx1201 gfx1100)
 [ -n "$TAG" ] || { echo "ERROR: --tag is required" >&2; exit 2; }
 if ! git check-ref-format "refs/tags/$TAG" >/dev/null 2>&1 || [[ "$TAG" == -* ]]; then
@@ -119,23 +136,46 @@ BUILD_ENV=(
     "LANG=C.UTF-8"
     "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}"
     "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}"
+    "RUSTUP_TOOLCHAIN=$TOOLCHAIN"
+    "RUSTUP_AUTO_INSTALL=0"
     "CARGO_TARGET_DIR=$TARGET_DIR"
     "HIPFIRE_KERNEL_CACHE=$WORK/kernel-cache"
     "HIPFIRE_BUILD_COMMIT_OVERRIDE=$COMMIT"
     "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES:--1}"
     "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:--1}"
 )
-for name in ROCM_PATH HIP_PATH HIPFIRE_ROCM_ROOT HIPFIRE_ROCM_PATH HIPFIRE_HIPCC HIPFIRE_ROCM_STRICT RUSTUP_TOOLCHAIN HIPFIRE_DEVICES CUDA_VISIBLE_DEVICES CARGO_BUILD_JOBS HIPFIRE_PACK_JOBS; do
+for name in ROCM_PATH HIP_PATH HIPFIRE_ROCM_ROOT HIPFIRE_ROCM_PATH HIPFIRE_HIPCC HIPFIRE_ROCM_STRICT HIPFIRE_DEVICES CUDA_VISIBLE_DEVICES CARGO_BUILD_JOBS HIPFIRE_PACK_JOBS; do
     if [ -n "${!name:-}" ]; then
         BUILD_ENV+=("$name=${!name}")
     fi
 done
 
+# The pinned toolchain must already be installed: never fall back to another
+# rustc, and never install one behind the caller's back.
+INSTALLED="$("${BUILD_ENV[@]}" rustup toolchain list)" || INSTALLED=""
+grep -q "^$TOOLCHAIN-" <<<"$INSTALLED" \
+    || { echo "ERROR: release toolchain $TOOLCHAIN (scripts/release-toolchain.txt) is not installed; install it with:" >&2
+         echo "  rustup toolchain install $TOOLCHAIN --profile minimal" >&2; exit 2; }
+RUSTC_VV="$("${BUILD_ENV[@]}" rustc +"$TOOLCHAIN" -vV)"
+RUSTC_VERSION="$(sed -n '1p' <<<"$RUSTC_VV")"
+RUSTC_RELEASE="$(sed -n 's/^release: //p' <<<"$RUSTC_VV")"
+RUSTC_HASH="$(sed -n 's/^commit-hash: //p' <<<"$RUSTC_VV")"
+RUSTC_HOST="$(sed -n 's/^host: //p' <<<"$RUSTC_VV")"
+[ "$RUSTC_RELEASE" = "$TOOLCHAIN" ] && [[ "$RUSTC_HASH" =~ ^[0-9a-f]{40}$ ]] \
+    || { echo "ERROR: rustc +$TOOLCHAIN reports release '$RUSTC_RELEASE' commit '$RUSTC_HASH'" >&2; exit 1; }
+
 cd "$SRC"
-echo "=== hipfire binary archives: $TAG @ $COMMIT (${ARCHS[*]}) ==="
-"${BUILD_ENV[@]}" cargo build --release --locked -p hipfire-daemon -p hipfire-cli
+echo "=== hipfire binary archives: $TAG @ $COMMIT (${ARCHS[*]}) with $RUSTC_VERSION ==="
+"${BUILD_ENV[@]}" cargo +"$TOOLCHAIN" build --release --locked -p hipfire-daemon -p hipfire-cli
 [ -x "$TARGET_DIR/release/hipfire" ] && [ -x "$TARGET_DIR/release/daemon" ] \
     || { echo "ERROR: hipfire or daemon missing after build" >&2; exit 1; }
+# std's panic locations embed /rustc/<commit-hash>/; any other hash means
+# part of the binary came from another compiler.
+for bin in hipfire daemon; do
+    hashes="$(grep -aoE '/rustc/[0-9a-f]{40}/' "$TARGET_DIR/release/$bin" | sort -u | tr '\n' ' ')"
+    [ "$hashes" = "/rustc/$RUSTC_HASH/ " ] \
+        || { echo "ERROR: $bin embeds rustc hashes '$hashes', expected /rustc/$RUSTC_HASH/ ($RUSTC_VERSION)" >&2; exit 1; }
+done
 
 for arch in "${ARCHS[@]}"; do
     compiled="$SRC/kernels/compiled/$arch"
@@ -163,9 +203,13 @@ for arch in "${ARCHS[@]}"; do
     cp "$SRC/LICENSE" "$SRC/NOTICE" "$stage/"
 
     stem="hipfire-$TAG-linux-rocm-$arch-x64"
+    printf '{\n  "schema": "hipfire-binary-archive-manifest-v1",\n  "tag": "%s",\n  "commit": "%s",\n  "arch": "%s",\n  "rustc": {\n    "release": "%s",\n    "commit_hash": "%s",\n    "host": "%s",\n    "version": "%s"\n  }\n}\n' \
+        "${TAG//\"/\\\"}" "$COMMIT" "$arch" "$RUSTC_RELEASE" "$RUSTC_HASH" "$RUSTC_HOST" "$RUSTC_VERSION" \
+        > "$stage/manifest.json"
+    cp "$stage/manifest.json" "$OUT/$stem.manifest.json"
     tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
         --mtime="@$COMMIT_EPOCH" --mode='a+rX,u+w,go-w' \
-        -C "$stage" -cf - bin LICENSE NOTICE | gzip -9n > "$OUT/$stem.tar.gz"
+        -C "$stage" -cf - bin LICENSE NOTICE manifest.json | gzip -9n > "$OUT/$stem.tar.gz"
     (cd "$OUT" && sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256")
     echo "packed $OUT/$stem.tar.gz ($(wc -c < "$OUT/$stem.tar.gz") bytes, sha256 $(cut -d' ' -f1 "$OUT/$stem.tar.gz.sha256"))"
 done
