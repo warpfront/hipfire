@@ -5148,11 +5148,18 @@ mod tests {
     /// The DFlash VRAM floor the bundled Qwen3.8-27B MQ5V2 tiers declare
     /// (#1151: measured peak VRAM with the draft on a 32 GB card, plus margin).
     const QWEN38_27B_MQ5_DFLASH_FLOOR_GB: f64 = 28.0;
+    /// The DFlash VRAM floor the bundled Qwen3.8-27B MQ3V2 tiers declare: under
+    /// a 20 GiB card the mq3-xts + draft 8-turn chain reaches 35.5K, under 16 GiB
+    /// it admits ~1.9K context and fails at turn 3 (vram-diet RESULT-B).
+    const QWEN38_27B_MQ3_DFLASH_FLOOR_GB: f64 = 18.0;
 
     #[test]
-    fn bundled_qwen38_27b_mq5_pairs_its_draft_above_the_vram_floor() {
+    fn bundled_qwen38_27b_floored_tiers_pair_their_draft_above_the_vram_floor() {
         use hipfire_config::dflash_floor::{dflash_vram_gate, DflashVramGate};
-        // `mem_info_vram_total` of a 7900 XTX (24 GB) and an R9700 (32 GB).
+        // `mem_info_vram_total` of a 16 GB card (RX 7800 XT / RX 9070 XT), a
+        // 7900 XT (20 GB), a 7900 XTX (24 GB) and an R9700 (32 GB).
+        const CARD_16GB: u64 = 17_163_091_968;
+        const XT_20GB: u64 = 21_458_059_264;
         const XTX_24GB: u64 = 25_753_026_560;
         const R9700_32GB: u64 = 34_208_743_424;
         let registry = bundled().unwrap();
@@ -5165,47 +5172,78 @@ mod tests {
         assert_eq!(
             floored,
             [
+                "qwen3.8:27b-mq3",
+                "qwen3.8:27b-mq3-pro",
+                "qwen3.8:27b-mq3-xt",
+                "qwen3.8:27b-mq3-xts",
                 "qwen3.8:27b-mq5",
                 "qwen3.8:27b-mq5-pro",
                 "qwen3.8:27b-mq5-xt"
             ],
-            "only the Qwen3.8-27B MQ5V2 tiers carry a DFlash floor"
+            "only the Qwen3.8-27B MQ3V2 and MQ5V2 tiers carry a DFlash floor"
         );
+        // (draft file, floor, largest card `auto` skips, smallest card it pairs).
         for tag in floored {
+            let (file, want, below, above) = if tag.starts_with("qwen3.8:27b-mq3") {
+                (
+                    "qwen38-27b-dflash-mq3.hfq",
+                    QWEN38_27B_MQ3_DFLASH_FLOOR_GB,
+                    CARD_16GB,
+                    XT_20GB,
+                )
+            } else {
+                (
+                    "qwen38-27b-dflash-mq5.hfq",
+                    QWEN38_27B_MQ5_DFLASH_FLOOR_GB,
+                    XTX_24GB,
+                    R9700_32GB,
+                )
+            };
             let entry = &registry.models[tag];
             let draft = entry.dflash.as_ref().expect("floored tiers pair a draft");
-            assert_eq!(draft.file, "qwen38-27b-dflash-mq5.hfq", "{tag}");
+            assert_eq!(draft.file, file, "{tag}");
             assert!(
                 draft.sha256.is_some() && draft.size_bytes.is_some(),
                 "{tag}"
             );
             let floor = entry.dflash_min_vram_gb;
-            assert_eq!(floor, Some(QWEN38_27B_MQ5_DFLASH_FLOOR_GB), "{tag}");
-            // 24 GB: `auto` skips the draft, `on` forces it with a warning.
+            assert_eq!(floor, Some(want), "{tag}");
+            // Below the floor `auto` skips the draft, `on` forces it with a warning.
             assert!(
                 matches!(
-                    dflash_vram_gate("auto", floor, Some(XTX_24GB)),
+                    dflash_vram_gate("auto", floor, Some(below)),
                     DflashVramGate::Skip(_)
                 ),
                 "{tag}"
             );
             assert!(
                 matches!(
-                    dflash_vram_gate("on", floor, Some(XTX_24GB)),
+                    dflash_vram_gate("on", floor, Some(below)),
                     DflashVramGate::Forced(_)
                 ),
                 "{tag}"
             );
-            // 32 GB: paired.
+            // At or above it: paired.
             assert_eq!(
-                dflash_vram_gate("auto", floor, Some(R9700_32GB)),
+                dflash_vram_gate("auto", floor, Some(above)),
                 DflashVramGate::Pair,
                 "{tag}"
             );
         }
-        // MQ4-and-below tiers pair everywhere; MQ6V2 stays unpaired.
-        let (_, mq4) = registry.model("qwen3.8:27b-mq4").unwrap();
-        assert!(mq4.dflash.is_some() && mq4.dflash_min_vram_gb.is_none());
+        // The MQ4 tiers pair everywhere, the 24 GB XTX (23.98 GiB) included;
+        // MQ6V2 stays unpaired.
+        for tag in [
+            "qwen3.8:27b-mq4",
+            "qwen3.8:27b-mq4-pro",
+            "qwen3.8:27b-mq4-xt",
+            "qwen3.8:27b-mq4-xts",
+        ] {
+            let (_, mq4) = registry.model(tag).unwrap();
+            assert!(
+                mq4.dflash.is_some() && mq4.dflash_min_vram_gb.is_none(),
+                "{tag}"
+            );
+        }
         let (_, mq6) = registry.model("qwen3.8:27b-mq6").unwrap();
         assert!(mq6.dflash.is_none());
     }

@@ -30,7 +30,9 @@ alone; see the KV notes in
 The default `qwen3.8:27b` is `qwen3.8:27b-mq4-xts` (14.99 GB). On the 27B tiers
 that pair a DFlash draft (`mq3*`, `mq4*`), `dflash_mode` resolves to `auto`, so
 a pulled draft (1.21 GB for mq4, 0.98 GB for mq3) loads beside the weights and
-takes context room. Each result below is one load running an 8-turn document
+takes context room. The `mq3*` tiers pair their draft only on a card with at
+least 18 GiB of VRAM (`dflash_min_vram_gb`): a 16 GB card loads them without it.
+Each result below is one load running an 8-turn document
 chain that grows to a 35.5K-token prompt (greedy, thinking off, default KV). The
 card's capacity was emulated with `HIPFIRE_EMU` on a 7900 XTX (gfx1100) or an
 R9700 (gfx1201), headless, on build `bbe7d51a2c`. The emulation caps hipfire's
@@ -42,7 +44,7 @@ admit less context than these numbers.
 |---|---|---|
 | 7900 XTX (24 GB) | `qwen3.8:27b` (defaults, paired DFlash) | Admitted context 104,086 (no emulation). The 35.5K chain completes; DFlash decode averaged 50.1 tok/s. |
 | 7900 XT (20 GB) | `qwen3.8:27b` with `hipfire config qwen3.8:27b set dflash_mode off`, or `qwen3.8:27b-mq3-xts` | Defaults (mq4-xts + draft): admitted context 15,420, out of memory on a 17.7K-token prompt. mq4-xts AR: context 80,956, the chain completes at 47.2 tok/s. mq3-xts + draft: context 123,361, the chain completes at 26.7 tok/s; gfx1100 has no PM4 decode route for MQ3 + DFlash yet. |
-| 16 GB (7800 XT, 9070 XT) | `qwen3.8:27b-mq3-xts` with `hipfire config qwen3.8:27b-mq3-xts set dflash_mode off`, or `qwen3.5:9b` | `qwen3.8:27b` (mq4-xts) is refused at load: AR on both 7800 XT and 9070 XT emulation, and with the draft on the 9070 XT. 9070 XT emulation, mq3-xts AR (fp8 KV): context 77,220, the chain completes at 43.7 tok/s. mq3-xts + draft: context 8,128, out of memory on a 21.8K-token prompt. |
+| 16 GB (7800 XT, 9070 XT) | `qwen3.8:27b-mq3-xts` (defaults: below the 18 GiB floor its draft is not paired), or `qwen3.5:9b` | `qwen3.8:27b` (mq4-xts) is refused at load: AR on both 7800 XT and 9070 XT emulation, and with the draft on the 9070 XT. 9070 XT emulation, mq3-xts AR (fp8 KV): context 77,220, the chain completes at 43.7 tok/s. mq3-xts + draft (forced with `dflash_mode on`): context 8,128, out of memory on a 21.8K-token prompt. |
 
 `hipfire fit qwen3.8:27b --ctx N` evaluates every `qwen3.8:27b-*` tier on your
 GPU, with the paired draft charged against free memory, and names the
@@ -108,8 +110,9 @@ separate surface: [IMAGEGEN.md](IMAGEGEN.md).
   Qwen4); Qwen3.5-class and DeepSeek V4 stay AR until `--spec mtp` opts in.
   DFlash stays off. Force plain AR with
   `hipfire config set speculation off`. Exception: `qwen3.8:27b` and its
-  `mq3*` / `mq4*` tiers, and the `mq5*` tiers on a card with at least
-  28 GiB of VRAM, resolve `dflash_mode=auto` from the registry, so a
+  `mq4*` tiers, the `mq3*` tiers on a card with at least 18 GiB of VRAM,
+  and the `mq5*` tiers on a card with at least 28 GiB, resolve
+  `dflash_mode=auto` from the registry, so a
   paired draft file that is present is used (absent: MTP `auto` as before,
   which is AR for this Qwen35 producer);
   `hipfire config <tag> set dflash_mode off` opts out

@@ -831,6 +831,7 @@
         "sha256": "dd335fb2634c371d120077c2fe754643c91b27f32d0c32668278fe4b8f1ca319",
         "size_bytes": 984978432
       },
+      "dflash_min_vram_gb": 18,
       "mtp": {
         "file": "qwen3.8-27b.mtp",
         "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
@@ -880,6 +881,7 @@
         "sha256": "dd335fb2634c371d120077c2fe754643c91b27f32d0c32668278fe4b8f1ca319",
         "size_bytes": 984978432
       },
+      "dflash_min_vram_gb": 18,
       "mtp": {
         "file": "qwen3.8-27b.mtp",
         "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
@@ -925,6 +927,7 @@
         "sha256": "dd335fb2634c371d120077c2fe754643c91b27f32d0c32668278fe4b8f1ca319",
         "size_bytes": 984978432
       },
+      "dflash_min_vram_gb": 18,
       "mtp": {
         "file": "qwen3.8-27b.mtp",
         "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
@@ -972,6 +975,7 @@
         "sha256": "dd335fb2634c371d120077c2fe754643c91b27f32d0c32668278fe4b8f1ca319",
         "size_bytes": 984978432
       },
+      "dflash_min_vram_gb": 18,
       "mtp": {
         "file": "qwen3.8-27b.mtp",
         "sha256": "f0d46d07ded75abc095ebfdbccc167c68418a6515b187bf810395faa460bd32e",
