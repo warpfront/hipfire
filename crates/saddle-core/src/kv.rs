@@ -234,6 +234,27 @@ fn checked_round_up(value: usize, alignment: usize) -> Result<usize, KvChunkPlan
     }
 }
 
+/// Token horizon of one VMM tensor's growth plan: its reserve at the current
+/// stride, the constructor `physical_cap`, and the admitted context, so chunk
+/// rounding never maps past the admitted context. A tensor already mapped
+/// past the admitted context keeps a horizon covering that mapping, so the
+/// plan never sees a mapping larger than its own reserve.
+fn vmm_side_cap(
+    reserve_bytes: usize,
+    bytes_per_token: usize,
+    physical_cap: usize,
+    admitted: Option<usize>,
+    mapped_bytes: usize,
+) -> usize {
+    let side_cap = (reserve_bytes / bytes_per_token).min(physical_cap);
+    match admitted {
+        Some(admitted) if admitted < side_cap => {
+            side_cap.min(admitted.max(mapped_bytes.div_ceil(bytes_per_token)))
+        }
+        _ => side_cap,
+    }
+}
+
 impl std::fmt::Display for ParseKvBackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.value == "contiguous" {
@@ -360,6 +381,12 @@ pub struct KvCache {
     /// absolute phase, and the cache write still lands at `pos` (physical).
     /// Zero when no compaction has happened.
     pub compact_offset: usize,
+    /// Admitted context in tokens, set once the loader's measured post-load
+    /// fit publishes a context below `physical_cap` (see
+    /// [`Self::admit_context`]). VMM growth never maps past it and every
+    /// write beyond it is refused, so a request can never grow this cache
+    /// past the context the load admitted. `None` = `physical_cap`.
+    pub admitted_tokens: Option<usize>,
 }
 
 /// Per-tier arena plan for a flat multi-slot KV pool (the `SlotEngine`
@@ -1186,6 +1213,7 @@ impl KvCache {
             v_mode: VMode::Q8,
             layer_is_boundary: self.layer_is_boundary.clone(),
             compact_offset: 0,
+            admitted_tokens: None,
         })
     }
 
@@ -1434,6 +1462,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -1484,6 +1513,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -1595,6 +1625,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -1685,6 +1716,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             // V is bf16 too. `VMode::Q8` is the struct's default and is never
             // read on this path — the tier decode reaches `KTier::Bf16` before
             // any v_mode branch.
@@ -1765,6 +1797,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             // V is bf16 too; `VMode::Q8` is never read on this path.
             v_mode: VMode::Q8,
         })
@@ -1966,19 +1999,53 @@ impl KvCache {
         Ok(Some(capacity))
     }
 
+    /// Tokens this cache may hold: `physical_cap`, lowered to the admitted
+    /// context once [`Self::admit_context`] published one. Request admission
+    /// and every KV write compare against this, never the bare `physical_cap`.
+    pub fn context_capacity(&self) -> usize {
+        self.admitted_tokens.map_or(self.physical_cap, |admitted| {
+            admitted.min(self.physical_cap)
+        })
+    }
+
+    /// Publish the load's admitted context (the measured post-load fit).
+    /// Below `physical_cap` it becomes the ceiling of every write and of VMM
+    /// growth; at or above it the ceiling is cleared. Kernel strides and the
+    /// reserved VA keep `physical_cap`, so the attention routes are unchanged.
+    pub fn admit_context(&mut self, tokens: usize) -> HipResult<()> {
+        if tokens == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "KV admitted context must be at least one token",
+            ));
+        }
+        self.admitted_tokens = (tokens < self.physical_cap).then_some(tokens);
+        Ok(())
+    }
+
+    /// Refuse a write that needs more tokens than [`Self::context_capacity`].
+    fn check_context_capacity(&self, required_tokens: usize) -> HipResult<()> {
+        if required_tokens <= self.context_capacity() {
+            return Ok(());
+        }
+        let message = match self.admitted_tokens {
+            Some(admitted) if admitted < self.physical_cap => format!(
+                "KV write requires {required_tokens} tokens but the admitted context is {admitted} (physical_cap {})",
+                self.physical_cap
+            ),
+            _ => format!(
+                "KV write requires {required_tokens} tokens but physical_cap is {}",
+                self.physical_cap
+            ),
+        };
+        Err(hip_bridge::HipError::new(0, &message))
+    }
+
     pub fn require_mapped_capacity(&self, required_tokens: usize) -> HipResult<()> {
         let Some(mapped_tokens) = self.mapped_token_capacity()? else {
             return Ok(());
         };
-        if required_tokens > self.physical_cap {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "KV write requires {required_tokens} tokens but physical_cap is {}",
-                    self.physical_cap
-                ),
-            ));
-        }
+        self.check_context_capacity(required_tokens)?;
         if required_tokens > mapped_tokens {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -1993,14 +2060,16 @@ impl KvCache {
     /// Grow VMM tensors for one side (K or V).
     ///
     /// `bytes_per_token` is the **current** encoding stride. `physical_cap` is
-    /// the constructor token horizon. Per-tensor max tokens is
-    /// `min(physical_cap, reserve_bytes / current_stride)` so adaptive
-    /// floor-reserved arenas never plan growth past the stable VA.
+    /// the constructor token horizon and `admitted` the published context.
+    /// Per-tensor max tokens is [`vmm_side_cap`] so adaptive floor-reserved
+    /// arenas never plan growth past the stable VA and chunk rounding never
+    /// maps past the admitted context.
     fn grow_vmm_tensors(
         gpu: &mut Gpu,
         tensors: &mut [GpuTensor],
         bytes_per_token: usize,
         physical_cap: usize,
+        admitted: Option<usize>,
         required_tokens: usize,
     ) -> HipResult<usize> {
         if bytes_per_token == 0 {
@@ -2030,7 +2099,13 @@ impl KvCache {
             })?;
             // Full reserved VA size (shape × dtype), independent of mapped prefix.
             let reserve_bytes = tensor.byte_size();
-            let side_cap = (reserve_bytes / bytes_per_token).min(physical_cap);
+            let side_cap = vmm_side_cap(
+                reserve_bytes,
+                bytes_per_token,
+                physical_cap,
+                admitted,
+                mapped,
+            );
             if side_cap == 0 {
                 return Err(hip_bridge::HipError::new(
                     0,
@@ -2133,7 +2208,13 @@ impl KvCache {
                 let granularity = gpu.vmm_granularity(tensor).ok_or_else(|| {
                     hip_bridge::HipError::new(0, "VMM KV tensor has no allocation granularity")
                 })?;
-                let side_cap = (tensor.byte_size() / stride).min(self.physical_cap);
+                let side_cap = vmm_side_cap(
+                    tensor.byte_size(),
+                    stride,
+                    self.physical_cap,
+                    self.admitted_tokens,
+                    mapped,
+                );
                 let plan = KvChunkPlan::new(
                     stride,
                     side_cap,
@@ -2166,15 +2247,7 @@ impl KvCache {
         let Some(fast_capacity) = self.fast_mapped_token_capacity()? else {
             return Ok(());
         };
-        if required_tokens > self.physical_cap {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "KV write requires {required_tokens} tokens but physical_cap is {}",
-                    self.physical_cap
-                ),
-            ));
-        }
+        self.check_context_capacity(required_tokens)?;
         if required_tokens <= fast_capacity {
             return Ok(());
         }
@@ -2187,6 +2260,7 @@ impl KvCache {
             &mut self.k_gpu,
             k_bytes_per_token,
             self.physical_cap,
+            self.admitted_tokens,
             required_tokens,
         )?;
         Self::grow_vmm_tensors(
@@ -2194,22 +2268,28 @@ impl KvCache {
             &mut self.v_gpu,
             v_bytes_per_token,
             self.physical_cap,
+            self.admitted_tokens,
             required_tokens,
         )?;
         self.require_mapped_capacity(required_tokens)?;
         let mapped = self.mapped_token_capacity()?.unwrap_or(0);
+        let admitted = self
+            .admitted_tokens
+            .map(|tokens| format!(" / admitted={tokens}"))
+            .unwrap_or_default();
         eprintln!(
-            "KV cache: mapped_prefix={fast_capacity}->{mapped} / physical_cap={} / max_seq={}",
+            "KV cache: mapped_prefix={fast_capacity}->{mapped} / physical_cap={} / max_seq={}{admitted}",
             self.physical_cap, self.max_seq,
         );
         Ok(())
     }
 
     /// Context bound a per-request VMM owner can address: positions
-    /// `[0, logical_bound)`. Never silently below the request's admitted
-    /// context — admission compares against this and refuses.
+    /// `[0, logical_bound)`, never past the admitted context. Never silently
+    /// below the request's admitted context — admission compares against
+    /// this and refuses.
     pub fn vmm_logical_bound(&self) -> usize {
-        self.max_seq.min(self.physical_cap)
+        self.max_seq.min(self.context_capacity())
     }
 
     /// `_vmm` kernel format of this per-request owner. Only Q8 (K+V Q8_0)
@@ -3142,6 +3222,7 @@ impl KvCache {
             givens_sin: Some(s2),
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8, // start tier
         };
         if let Err(err) = cache.ensure_mapped_capacity(gpu, 1) {
@@ -3239,6 +3320,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -3402,6 +3484,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -3516,6 +3599,7 @@ impl KvCache {
             givens_sin,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode,
         };
         // Map initial prefix before any write; roll back on failure.
@@ -3634,6 +3718,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         };
         // Map initial prefix before any write; roll back on failure.
@@ -3745,6 +3830,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -3793,6 +3879,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -3843,6 +3930,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -3895,6 +3983,7 @@ impl KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -3982,6 +4071,7 @@ impl KvCache {
             givens_sin: Some(s2),
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode,
         })
     }
@@ -4083,6 +4173,7 @@ impl KvCache {
             givens_sin: Some(s2),
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -4251,6 +4342,7 @@ impl KvCache {
             givens_sin: Some(s2),
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode,
         })
     }
@@ -4357,6 +4449,7 @@ impl KvCache {
             givens_sin: Some(s2),
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode,
         })
     }
@@ -4534,8 +4627,64 @@ mod vmm_layout_tests {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode,
         }
+    }
+
+    #[test]
+    fn admitted_context_caps_writes_below_physical_cap() {
+        let mut kv = flag_standin(KvMode::Q8, VMode::Q8, 4, 256);
+        assert_eq!(kv.context_capacity(), 128);
+        assert!(kv.check_context_capacity(128).is_ok());
+        assert!(kv.admit_context(0).is_err());
+        kv.admit_context(100).unwrap();
+        assert_eq!(kv.admitted_tokens, Some(100));
+        assert_eq!(kv.context_capacity(), 100);
+        assert_eq!(kv.vmm_logical_bound(), 100);
+        assert!(kv.check_context_capacity(100).is_ok());
+        let refused = kv.check_context_capacity(101).unwrap_err().to_string();
+        assert!(
+            refused.contains("admitted context is 100") && refused.contains("physical_cap 128"),
+            "{refused}"
+        );
+        // At or above physical_cap the ceiling clears: physical_cap rules.
+        kv.admit_context(128).unwrap();
+        assert_eq!(kv.admitted_tokens, None);
+        assert_eq!(kv.context_capacity(), 128);
+        assert!(kv.check_context_capacity(129).is_err());
+    }
+
+    #[test]
+    fn vmm_side_cap_never_plans_past_admitted_context() {
+        // Fit20GB shape: reserve for 61,768 tokens, admitted 15,420.
+        let stride = 4352;
+        let reserve = 61_768 * stride;
+        assert_eq!(vmm_side_cap(reserve, stride, 61_768, None, 0), 61_768);
+        assert_eq!(
+            vmm_side_cap(reserve, stride, 61_768, Some(15_420), 0),
+            15_420
+        );
+        let plan =
+            KvChunkPlan::new(stride, 15_420, DEFAULT_KV_CHUNK_TOKENS, 2 << 20, 2 << 20).unwrap();
+        // Growth toward the admitted context stops at it (to the granule),
+        // never a whole chunk past it.
+        let full = plan.mapped_bytes_for_tokens(15_420).unwrap();
+        assert!(full >= 15_420 * stride && full < 15_420 * stride + (2 << 20));
+        assert!(plan.mapped_bytes_for_tokens(15_421).is_err());
+        // A mapping already past the admitted context stays inside the plan.
+        let over = 20_000 * stride;
+        let cap = vmm_side_cap(reserve, stride, 61_768, Some(15_420), over);
+        assert_eq!(cap, 20_000);
+        // The reserve and physical_cap still bound the horizon.
+        assert_eq!(
+            vmm_side_cap(reserve, stride, 10_000, Some(15_420), 0),
+            10_000
+        );
+        assert_eq!(
+            vmm_side_cap(100 * stride, stride, 61_768, Some(15_420), 0),
+            100
+        );
     }
 
     fn vmm_mask_dims(
@@ -4902,6 +5051,7 @@ mod bf16_tier_projection_tests {
             givens_sin: None,
             layer_is_boundary: Vec::new(),
             compact_offset: 0,
+            admitted_tokens: None,
         }
     }
 
@@ -5374,6 +5524,7 @@ mod fp8_bf16_format_tests {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         }
     }

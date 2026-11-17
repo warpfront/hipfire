@@ -106,20 +106,30 @@ fn static_server_error() -> Response<BoxBody> {
         .expect("static 500 response builds")
 }
 
-fn openai_error_body(message: &str, status: u16) -> serde_json::Value {
+/// OpenAI error body; `code` is the machine-readable `error.code`
+/// (`context_length_exceeded`), omitted when the failure has none.
+fn openai_error_body(message: &str, status: u16, code: Option<&str>) -> serde_json::Value {
     let error_type = if (400..500).contains(&status) {
         "invalid_request_error"
     } else {
         "server_error"
     };
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "error": { "message": message, "type": error_type }
-    })
+    });
+    if let Some(code) = code {
+        body["error"]["code"] = serde_json::Value::from(code);
+    }
+    body
+}
+
+fn openai_error_coded(message: &str, status: u16, code: Option<&str>) -> Response<BoxBody> {
+    json_response_result(&openai_error_body(message, status, code), status)
+        .unwrap_or_else(|_| static_server_error())
 }
 
 pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
-    json_response_result(&openai_error_body(message, status), status)
-        .unwrap_or_else(|_| static_server_error())
+    openai_error_coded(message, status, None)
 }
 
 pub(crate) fn admission_error_response(
@@ -2283,6 +2293,9 @@ const TRANSIENT_RETRY_AFTER_SECS: u64 = 1;
 pub(crate) struct RequestFailure {
     message: String,
     status: u16,
+    /// OpenAI `error.code`: `context_length_exceeded` for a daemon
+    /// `context_length` refusal, else none.
+    code: Option<&'static str>,
 }
 
 impl RequestFailure {
@@ -2290,17 +2303,26 @@ impl RequestFailure {
         Self {
             message: message.into(),
             status,
+            code: None,
         }
     }
 
     fn from_error(error: &anyhow::Error) -> Self {
-        Self::new(error.to_string(), request_error_status(error))
+        Self {
+            code: request_error_code(error),
+            ..Self::new(error.to_string(), request_error_status(error))
+        }
     }
 
     /// The JSON error response ending this request; counts it as failed.
     fn respond(&self, api: WireApi, metrics: &Metrics) -> Response<BoxBody> {
         metrics.record_failure();
-        let mut resp = api.error_response(&self.message, self.status);
+        let mut resp = match api {
+            WireApi::ChatCompletions | WireApi::OpenAiResponses => {
+                openai_error_coded(&self.message, self.status, self.code)
+            }
+            WireApi::AnthropicMessages => api.error_response(&self.message, self.status),
+        };
         if self.status == 503 {
             resp.headers_mut().insert(
                 header::RETRY_AFTER,
@@ -2312,7 +2334,7 @@ impl RequestFailure {
 
     /// The error event and `[DONE]` that end a chat stream failing after commit.
     fn sse_event(&self) -> Vec<u8> {
-        let mut bytes = sse_data(&openai_error_body(&self.message, self.status));
+        let mut bytes = sse_data(&openai_error_body(&self.message, self.status, self.code));
         bytes.extend_from_slice(b"data: [DONE]\n\n");
         bytes
     }
@@ -2351,6 +2373,18 @@ pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
     } else {
         500
     }
+}
+
+/// OpenAI `error.code` of a failed completion: a daemon `context_length`
+/// refusal (the request does not fit the load's admitted context) is
+/// `context_length_exceeded`, the code OpenAI-compatible clients match on.
+fn request_error_code(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<hipfire_client::ClientError>())
+        .and_then(hipfire_client::ClientError::typed_daemon)
+        .filter(|typed| typed.class == hipfire_client::error_class::CONTEXT_LENGTH)
+        .map(|_| "context_length_exceeded")
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -3164,6 +3198,35 @@ mod tests {
             ))),
             500
         );
+    }
+
+    /// A daemon `context_length` refusal is an OpenAI 400 with
+    /// `error.code = context_length_exceeded`, through context layers and in
+    /// the stream's error event; other classes carry no code.
+    #[test]
+    fn context_length_refusal_is_context_length_exceeded() {
+        let refusal = typed_daemon_error(
+            "context_length",
+            "context length exceeded: prompt (17724 tokens) + max_tokens (256) exceeds the admitted context of 15420 tokens",
+        )
+        .context("streaming completion failed");
+        let failure = RequestFailure::from_error(&refusal);
+        assert_eq!(failure.status, 400);
+        assert_eq!(failure.code, Some("context_length_exceeded"));
+        let body = openai_error_body(&failure.message, failure.status, failure.code);
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let sse = String::from_utf8(failure.sse_event()).unwrap();
+        assert!(
+            sse.contains("\"code\":\"context_length_exceeded\""),
+            "{sse}"
+        );
+        for class in ["validation", "transient", "internal"] {
+            let failure = RequestFailure::from_error(&typed_daemon_error(class, "boom"));
+            assert_eq!(failure.code, None, "class {class}");
+            let body = openai_error_body(&failure.message, failure.status, failure.code);
+            assert!(body["error"].get("code").is_none(), "class {class}");
+        }
     }
 
     #[test]

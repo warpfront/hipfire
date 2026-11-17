@@ -2574,7 +2574,7 @@ fn memory_admitted_rung_planned(
     Ok(WIDENED_COMMIT_ROWS)
 }
 /// Physical KV bytes this request will still map to reach `end_tokens` rows
-/// (clamped to the cache's physical capacity). Zero on non-VMM KV, when the
+/// (clamped to the cache's admitted context). Zero on non-VMM KV, when the
 /// mapping already covers the request, or if the query errors. Feed to
 /// [`ordinary_prefill_chunk_limit_deducting`] so the once-per-prompt chunk
 /// ceiling is sized against memory the same request is about to map.
@@ -2584,7 +2584,7 @@ pub fn request_kv_growth_deduction(
     end_tokens: usize,
 ) -> usize {
     kv_cache
-        .planned_mapped_growth_bytes(gpu, end_tokens.min(kv_cache.physical_cap))
+        .planned_mapped_growth_bytes(gpu, end_tokens.min(kv_cache.context_capacity()))
         .unwrap_or(0)
 }
 

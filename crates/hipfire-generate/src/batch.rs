@@ -2040,15 +2040,15 @@ fn vmm_lane_engines(
 
 /// Whether the singleton's speculator would run a `prompt_len`-token
 /// request speculatively: prompt + fitted budget + one draft block within
-/// its context capacity (qwen.rs `spec_ctx_request_fits`; otherwise the
-/// singleton itself decodes AR).
+/// its context capacity, never past the admitted context (qwen.rs
+/// `generate_dflash`; otherwise the singleton itself decodes AR).
 fn singleton_spec_fits(m: &LoadedModel, prompt_len: usize, max_tokens: usize) -> bool {
     m.speculator.as_ref().is_some_and(|sp| {
         crate::common::spec_ctx_request_fits(
             prompt_len,
             crate::common::fit_max_tokens(max_tokens, prompt_len, m.physical_cap),
             sp.block_size(),
-            sp.ctx_capacity(),
+            sp.ctx_capacity().min(m.physical_cap),
         )
     })
 }

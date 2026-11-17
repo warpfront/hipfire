@@ -505,13 +505,15 @@ impl Qwen35RequestState {
             max_seq: template_kv.max_seq,
             physical_cap: Some(template_kv.physical_cap),
         };
-        let kv = <KvCache as KvCacheExt>::from_mode_with_backend(
+        let mut kv = <KvCache as KvCacheExt>::from_mode_with_backend(
             mode_of(format),
             KvBackend::Vmm,
             KvTarget::Single(gpu),
             &dims,
         )
         .map_err(|e| format!("VMM executor: request KV ({:?}): {e}", mode_of(format)))?;
+        // Never maps past the context the load admitted (the template's).
+        kv.admitted_tokens = template_kv.admitted_tokens;
         // The request owner mirrors the template's carry geometry and recipe:
         // an owner exchange or `copy_dn_from` between them must be
         // identity-compatible, and its carry bytes are charged with the state.

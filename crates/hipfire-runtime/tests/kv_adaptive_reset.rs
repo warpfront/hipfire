@@ -40,6 +40,7 @@ fn flag_standin(mode: KvMode, v_mode: VMode, n_kv_heads: usize, head_dim: usize)
         givens_sin: None,
         layer_is_boundary: vec![],
         compact_offset: 0,
+        admitted_tokens: None,
         v_mode,
     }
 }

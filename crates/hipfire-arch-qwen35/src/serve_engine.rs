@@ -2124,6 +2124,7 @@ impl ModelRig {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         }
     }

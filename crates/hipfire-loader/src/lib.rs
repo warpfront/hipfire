@@ -3108,10 +3108,16 @@ fn finish_qwen35_load(
                     // checkpoint, and the checkpoint term is the ring's own two-snapshot
                     // budget (the gate charges each extra snapshot separately), so neither
                     // is charged again here.
+                    let admitted_tokens = ctx.max_seq.min(physical_cap);
                     ctx.gpu.kv_fit_floor = Some(rdna_compute::KvFitFloor {
-                        admitted_tokens: ctx.max_seq.min(physical_cap),
+                        admitted_tokens,
                         reserve_bytes: m.transient.saturating_sub(m.prefill + m.checkpoints),
                     });
+                    // The KV owner was built for the pre-fit cap: it never maps
+                    // past the admitted context, whatever a request asks for.
+                    if let Err(e) = bundle.kv_cache.admit_context(admitted_tokens) {
+                        fit_refusal = Some(format!("Qwen VMM load: {e}"));
+                    }
                 }
             }
         }

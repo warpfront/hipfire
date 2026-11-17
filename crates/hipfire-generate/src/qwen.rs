@@ -3600,16 +3600,30 @@ pub fn generate_dflash(
     // slower. Emit a correlated info event and hand the request back to the
     // caller's AR fallthrough (handled=false: no gen_start/done yet). Mirrors
     // the hard guard in generate_spec (belt-and-suspenders last line).
+    // The target's admitted context bounds every route: the speculator was
+    // built before the measured post-load fit and can report the larger
+    // pre-fit capacity, so on its own it would let a session grow the
+    // target KV past the admitted context until the pool runs out.
+    let admitted = m.physical_cap;
     let spec_ctx_capacity = m
         .speculator
         .as_ref()
-        .map(|s| s.ctx_capacity())
-        .unwrap_or(usize::MAX);
+        .map_or(usize::MAX, |s| s.ctx_capacity())
+        .min(admitted);
     let spec_block_size = m.speculator.as_ref().map(|s| s.block_size()).unwrap_or(0);
     // An omitted client max_tokens fits the target context first (the same
     // budget the AR fallback would use), then the draft capacity decides
     // spec vs AR.
-    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len(), m.physical_cap);
+    let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len(), admitted);
+    // A conversation (cached prefix included) that cannot fit the admitted
+    // context is refused here, before any allocation or route choice.
+    if let Some(message) =
+        crate::common::context_length_refusal(prompt_tokens.len(), max_tokens, admitted)
+    {
+        emit_active_attempt_error(stdout, Some(id), &message, "context_length", false, false);
+        let _ = stdout.flush();
+        return true;
+    }
     // Shared margin with the `generate_spec` hard guard below: prompt +
     // budget + one draft block must fit, so any request the loop would refuse
     // falls back to AR here instead of erroring after `gen_start`.
@@ -4396,8 +4410,11 @@ pub fn generate_spec(
     // (`configure_request`) and only shrinks it after 8 observed cycles, so
     // the request-start capacity checks below see the full block while the
     // in-loop overflow guard re-reads the live value each cycle.
+    // Never past the target's admitted context (`m.physical_cap`): a
+    // speculator built before the measured post-load fit reports the
+    // pre-fit capacity.
     let (block_size, ctx_capacity) = match m.speculator.as_ref() {
-        Some(s) => (s.block_size(), s.ctx_capacity()),
+        Some(s) => (s.block_size(), s.ctx_capacity().min(m.physical_cap)),
         None => {
             crate::ar::emit_active_route_error(
                 stdout,

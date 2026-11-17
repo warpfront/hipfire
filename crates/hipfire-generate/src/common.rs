@@ -1016,6 +1016,25 @@ pub fn spec_ctx_request_fits(
         <= ctx_capacity
 }
 
+/// Refusal of a request that cannot fit the load's admitted context
+/// (`LoadedModel::physical_cap`: `max_seq` after the measured post-load fit),
+/// checked before anything is allocated. `prompt_len` is the whole rendered
+/// conversation: a cached prefix occupies the same KV rows as a cold one.
+/// `Some(message)` names the admitted limit; `None` admits.
+pub fn context_length_refusal(
+    prompt_len: usize,
+    max_tokens: usize,
+    admitted: usize,
+) -> Option<String> {
+    (prompt_len.saturating_add(max_tokens) > admitted).then(|| {
+        format!(
+            "context length exceeded: prompt ({prompt_len} tokens) + max_tokens ({max_tokens}) \
+             exceeds the admitted context of {admitted} tokens (this load's max_seq); shorten \
+             the conversation or lower max_tokens"
+        )
+    })
+}
+
 /// Room [`fit_max_tokens`] leaves below the context cap. Covers the
 /// end-of-turn trailer and one speculative draft block, so a fitted request
 /// passes both the AR budget guard and [`spec_ctx_request_fits`].
@@ -2320,8 +2339,8 @@ mod tests {
     }
 
     use super::{
-        fit_max_tokens, latch_request_think_cap, spec_ctx_request_fits, FitMaxTokensGuard,
-        FIT_MAX_TOKENS_MARGIN,
+        context_length_refusal, fit_max_tokens, latch_request_think_cap, spec_ctx_request_fits,
+        FitMaxTokensGuard, FIT_MAX_TOKENS_MARGIN,
     };
 
     #[test]
@@ -2401,6 +2420,37 @@ mod tests {
             0,
             usize::MAX - 1
         ));
+    }
+
+    #[test]
+    fn context_length_refusal_holds_the_admitted_context() {
+        // Fit20GB: 20 GiB card, admitted 15,420 of a 61,768-token KV reserve.
+        // The session chain's turns 1-3 fit with a 256-token budget; turn 4's
+        // 17,724-token conversation (cached prefix 13,592 + new turn) does not.
+        let admitted = 15_420;
+        for prompt in [4_160, 8_851, 13_515] {
+            assert_eq!(context_length_refusal(prompt, 256, admitted), None);
+        }
+        let refused = context_length_refusal(17_724, 256, admitted).expect("turn 4 refused");
+        assert!(refused.contains("17724 tokens"), "{refused}");
+        assert!(
+            refused.contains("admitted context of 15420 tokens"),
+            "{refused}"
+        );
+        // Exactly at the limit fits; one past it refuses.
+        assert_eq!(context_length_refusal(15_164, 256, admitted), None);
+        assert!(context_length_refusal(15_165, 256, admitted).is_some());
+        assert!(context_length_refusal(15_421, 0, admitted).is_some());
+        // A huge budget saturates instead of wrapping into a false fit.
+        assert!(context_length_refusal(1, usize::MAX, admitted).is_some());
+        // An omitted max_tokens is fitted to the room left, then admitted.
+        let _fit = FitMaxTokensGuard::set(true);
+        let fitted = fit_max_tokens(32_768, 13_515, admitted);
+        assert_eq!(fitted, admitted - 13_515 - FIT_MAX_TOKENS_MARGIN);
+        assert_eq!(context_length_refusal(13_515, fitted, admitted), None);
+        // A prompt already at the limit leaves no room: still refused.
+        let none_left = fit_max_tokens(32_768, admitted, admitted);
+        assert!(context_length_refusal(admitted, none_left, admitted).is_some());
     }
 
     #[test]

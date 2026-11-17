@@ -5158,6 +5158,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5200,6 +5201,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5261,6 +5263,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5303,6 +5306,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5345,6 +5349,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5392,6 +5397,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5439,6 +5445,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5515,6 +5522,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5584,6 +5592,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5652,6 +5661,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5699,6 +5709,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5750,6 +5761,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5801,6 +5813,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -5852,6 +5865,7 @@ impl KvCacheExt for KvCache {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         })
     }
@@ -7753,6 +7767,7 @@ mod tests {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         };
         cache.free_gpu(&mut gpu).expect("empty free");
@@ -7799,6 +7814,7 @@ mod tests {
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            admitted_tokens: None,
             v_mode: VMode::Q8,
         };
         hip_bridge::inject_vmm_fault(hip_bridge::VmmFaultKind::Unmap, 1);
