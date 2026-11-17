@@ -5,7 +5,7 @@
 
 """GPU check: VMM multi-slot eviction → swap-in → continuation reuse.
 
-Two slots, three one-turn conversations. The third admission evicts the LRU
+Two slots on the shared VMM page pool, three one-turn conversations. The third admission evicts the LRU
 idle session to host swap. Following up on the evicted conversation must:
 
   * restore its KV/DeltaNet state (`swap-in` in the slot trace),
@@ -72,11 +72,6 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--port", type=int, default=11584)
     ap.add_argument("--ctx", type=int, default=2048)
-    ap.add_argument(
-        "--paged-vmm",
-        action="store_true",
-        help="test the shared paged pool on the VMM backend instead of per-request VMM owners",
-    )
     ap.add_argument("--timeout", type=float, default=180.0)
     args = ap.parse_args()
 
@@ -112,11 +107,10 @@ def main() -> int:
         "--idle-timeout",
         "0",
     ]
-    if args.paged_vmm:
-        env["HIPFIRE_SERVE_MULTI_SLOT_PAGED"] = "1"
-        env["HIPFIRE_SLOTS_PAGED_BACKEND"] = "vmm"
-    else:
-        serve_args.extend(["--kv-backend", "vmm"])
+    # The multi-slot VMM cache is the shared page pool on the VMM backend;
+    # `--kv-backend vmm` alone is refused on the multi-slot engine.
+    env["HIPFIRE_SERVE_MULTI_SLOT_PAGED"] = "1"
+    env["HIPFIRE_SLOTS_PAGED_BACKEND"] = "vmm"
     serve_args.append(f"127.0.0.1:{args.port}")
     proc = subprocess.Popen(
         serve_args,

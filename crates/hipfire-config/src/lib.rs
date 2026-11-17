@@ -1055,12 +1055,14 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         Some("HIPFIRE_SERVE_MULTI_SLOT_PAGED_BACKEND"),
-        "Physical backend for the shared paged KV pool. `vmm` is the multi-slot VMM cache: \
-         one shared pool, VA-only at load, 2 MiB granule groups mapped as pages become \
-         resident and unmapped when the request releases them. `memory.kv_backend=vmm` selects \
-         this same pool; it is not a second, per-slot VMM cache. `arena` (default) preallocates \
-         the pool and is used only with `memory.kv_backend=legacy`. `vmm` admits q8 equal-stride \
-         pools only. MoE prompt chunks are isolated single-slot steps. Not a production default."
+        "Physical backend for the shared paged KV pool (`serve.multi_slot_paged`). `vmm` \
+         reserves VA only at load and maps 2 MiB granule groups as pages first become \
+         resident; a mapped granule stays mapped until the engine shuts down, and freed pages \
+         are reused in place (a used VA is never remapped). `arena` (default) preallocates the \
+         pool. `memory.kv_backend=vmm` does not select this pool: on the multi-slot engine it is \
+         refused unless `serve.multi_slot_paged` is on and this key is `vmm`. `vmm` admits q8 \
+         equal-stride pools only. On MoE models, prompt chunks run in their own forward, apart \
+         from decode. Not a production default."
     ),
     field!(
         "generation.temperature",
