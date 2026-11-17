@@ -6061,40 +6061,11 @@ pub(crate) fn batch_chunk_upload_positions(
     Ok(())
 }
 
-/// `HIPFIRE_GDN_MOE_CHUNK_SCAN` (`developer.gdn_moe_chunk_scan`, a typed
-/// boolean: `true`/`false`/`1`/`0`; any other spelling is rejected when the
-/// process configuration is built). The explicit value, read once: `true`/`1`
-/// arms the dense GDN chunk-scan route for admitted MoE LA layers,
-/// `false`/`0` is the kill switch. Unset (`None`) follows
-/// `prefill_route_capabilities` qualification of the running architecture.
-fn gdn_moe_chunk_scan_explicit() -> Option<bool> {
-    static EXPLICIT: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_typed_bool("HIPFIRE_GDN_MOE_CHUNK_SCAN")
-    });
-    *EXPLICIT
-}
-
-/// Pure resolution of the MoE chunk-scan flag: an explicit value wins on any
-/// architecture, unset follows the architecture's qualification.
-fn gdn_moe_chunk_scan_resolve(explicit: Option<bool>, qualified: bool) -> bool {
-    explicit.unwrap_or(qualified)
-}
-
-/// Whether the MoE chunk scan is on for `arch`: the explicit
-/// `HIPFIRE_GDN_MOE_CHUNK_SCAN` value, else qualification. Admission is
-/// [`GdnMoeChunkScanInputs::admitted`].
-fn gdn_moe_chunk_scan_on(arch: &str) -> bool {
-    gdn_moe_chunk_scan_resolve(
-        gdn_moe_chunk_scan_explicit(),
-        prefill_route_capabilities::qualified(arch, PrefillRoute::GdnMoeChunkScan),
-    )
-}
-
 /// Layer-independent, row-independent inputs of the MoE GDN chunk-scan admission. The outer
 /// call's rows, tape and intent are never inputs (CHUNK-CANONICAL-DESIGN §1.1).
 #[derive(Clone, Copy)]
 struct GdnMoeChunkScanInputs {
-    /// Resolved `HIPFIRE_GDN_MOE_CHUNK_SCAN` ([`gdn_moe_chunk_scan_on`]).
+    /// Resolved `HIPFIRE_GDN_MOE_CHUNK_SCAN` (`FeatureFlags::gdn_moe_chunk_scan`).
     enabled: bool,
     /// Chunk-scan capability: the global flag on exact gfx1201, outside FP8
     /// verify, HIP-graph capture and Redline recording.
@@ -6230,7 +6201,7 @@ pub(crate) fn resolve_gdn_stream_plans(
         GdnStateQuant::Q8Ef
     };
     let moe_common = GdnMoeChunkScanInputs {
-        enabled: gdn_moe_chunk_scan_on(&gpu.arch),
+        enabled: gpu.flags.gdn_moe_chunk_scan,
         capable: gpu.flags.gfx12_gdn_chunk_scan
             && gpu.arch_caps.is_gfx1201()
             && !gpu.fp8_verify_scope
@@ -8360,46 +8331,6 @@ mod tests {
         }
     }
 
-    /// `HIPFIRE_GDN_MOE_CHUNK_SCAN` resolution: an explicit `1`/`0` wins on any
-    /// architecture; unset follows qualification.
-    #[test]
-    fn gdn_moe_chunk_scan_flag_resolution_truth_table() {
-        for qualified in [false, true] {
-            assert!(gdn_moe_chunk_scan_resolve(Some(true), qualified));
-            assert!(!gdn_moe_chunk_scan_resolve(Some(false), qualified));
-            assert_eq!(gdn_moe_chunk_scan_resolve(None, qualified), qualified);
-        }
-    }
-    /// The resolver over the real capability table: for every architecture and
-    /// explicit value, `gdn_moe_chunk_scan_resolve` fed the actual
-    /// `qualified(arch, GdnMoeChunkScan)` equals `prefill_route_capabilities::enabled`.
-    /// An explicit `1`/`0` wins on every architecture; unset follows `qualified`
-    /// (so this stays valid whichever architectures the table qualifies).
-    #[test]
-    fn gdn_moe_chunk_scan_flag_follows_the_capability_table_per_arch() {
-        for arch in ["gfx1201", "gfx1100", "gfx1151", "gfx1030"] {
-            let qualified =
-                prefill_route_capabilities::qualified(arch, PrefillRoute::GdnMoeChunkScan);
-            for explicit in [None, Some(true), Some(false)] {
-                let resolved = gdn_moe_chunk_scan_resolve(explicit, qualified);
-                assert_eq!(
-                    resolved,
-                    prefill_route_capabilities::enabled(
-                        explicit,
-                        arch,
-                        PrefillRoute::GdnMoeChunkScan
-                    ),
-                    "arch={arch} explicit={explicit:?}"
-                );
-                assert_eq!(
-                    resolved,
-                    explicit.unwrap_or(qualified),
-                    "arch={arch} explicit={explicit:?}"
-                );
-            }
-        }
-    }
-
     /// `HIPFIRE_GDN_MOE_CHUNK_SCAN` admission: the flag, the chunk-scan
     /// capability, head geometry and a complete Q8 state must all hold. The outer
     /// call's rows, tape and intent are not inputs.
@@ -8475,7 +8406,7 @@ mod tests {
             for qualified in [false, true] {
                 for value_heads in [32usize, 48, 64] {
                     let admitted = GdnMoeChunkScanInputs {
-                        enabled: gdn_moe_chunk_scan_resolve(explicit, qualified),
+                        enabled: explicit.unwrap_or(qualified),
                         capable: true,
                         geometry: gdn_chunk_head_geometry_supported(16, value_heads, 128, 128, 4),
                         q8_state: true,

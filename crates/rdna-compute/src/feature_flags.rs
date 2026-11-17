@@ -641,6 +641,13 @@ pub struct FeatureFlags {
     /// The same `HIPFIRE_FA_PREFILL_PM_QPREP` key resolved for the native fp8-E4M3 KV codec;
     /// qualification as [`Self::fa_prefill_pm_fp8_kv`] (on only on exact gfx1201 when unset).
     pub fa_prefill_pm_qprep_fp8_kv: bool,
+    /// `HIPFIRE_GDN_MOE_CHUNK_SCAN` (`developer.gdn_moe_chunk_scan`, typed bool:
+    /// `true`/`false`/`1`/`0`, anything else fails the process config): the
+    /// Qwen3.5 MoE GDN chunk-scan prefill route. Unset follows
+    /// `PrefillRoute::GdnMoeChunkScan` qualification (on only on exact gfx1201);
+    /// an explicit value wins on any arch, admission still applies. Kept: per-arch
+    /// qualification with a `1` opt-in elsewhere and a `0` A/B arm.
+    pub gdn_moe_chunk_scan: bool,
     /// gfx1201 packet-minimal Q128 FA2 body (`HIPFIRE_GFX12_FA_PACKET`,
     /// `kernel.gfx12_fa_packet`). Default ON on exact gfx1201; `=0` opts out
     /// to the route-N body. Exact stage-b arithmetic; any raw-O bit difference
@@ -894,6 +901,28 @@ pub struct FeatureFlags {
     pub qwen4_ep_expert_hotset: Option<String>,
     /// `HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD` / `topology.qwen4_ep_draft_vocab_shard`.
     pub qwen4_ep_draft_vocab_shard: Option<String>,
+    /// `HIPFIRE_QWEN4_EXPERT_DROP_ZERO` / `memory.qwen4_expert_drop_zero`, tri-state
+    /// (untrimmed exact `1` -> `Some(true)`, exact `0` -> `Some(false)`, anything else
+    /// `None`): the drop-zero planar repack of the symmetric Flash-Next routed experts
+    /// on exact-gfx1201 EP loads. `None` follows the shipped EP expert hot set
+    /// (`hipfire_arch_qwen4::artifact::expert_drop_zero_default_requested`). Kept:
+    /// load-conditional default, `1` opts in without the hot set.
+    pub qwen4_expert_drop_zero: Option<bool>,
+    /// `HIPFIRE_TP_EXCHANGE` / `topology.tp_exchange`: the raw dense-TP partial
+    /// exchange selector (`auto`, `f32`, `bf16`, `f16`; unset or empty = `auto`),
+    /// parsed by `hipfire_runtime::multi_gpu::tp_exchange::parse_tp_exchange`
+    /// (an invalid value reports and uses f32). Kept: multi-valued A/B knob.
+    pub tp_exchange: Option<String>,
+    /// `HIPFIRE_TP_PEER_ALTERNATING` / `topology.tp_peer_alternating`, tri-state
+    /// (untrimmed exact `1` / `0`, anything else `None`): TP2 alternating-partial
+    /// direct-peer reduction. `None` follows the mesh's effective whole-token graph
+    /// request. Kept: tri-state, off on meshes without the graph.
+    pub tp_peer_alternating: Option<bool>,
+    /// `HIPFIRE_TP_PEER_PUSH` / `topology.tp_peer_push`, tri-state (untrimmed exact
+    /// `1` / `0`, anything else `None`): the gfx1201 tagged peer-VRAM TP residual
+    /// reduction. `None` = on for four ranks, off for a pair. Kept: TP2 opt-in
+    /// (+0.6% decode, below the default bar) and TP4 kill switch.
+    pub tp_peer_push: Option<bool>,
     /// `HIPFIRE_MTP_AR_FLOOR` / `speculation.mtp_ar_floor`.
     pub mtp_ar_floor: bool,
     /// `HIPFIRE_QWEN4_EXPERT_STAGE` / `memory.qwen4_expert_stage`.
@@ -1432,6 +1461,15 @@ impl FeatureFlags {
                 arch,
                 crate::prefill_route_capabilities::PrefillRoute::FaPrefillPmQprep,
             ),
+            gdn_moe_chunk_scan: crate::prefill_route_capabilities::enabled(
+                value("HIPFIRE_GDN_MOE_CHUNK_SCAN").ok().map(|raw| {
+                    hipfire_config::parse_typed_bool(&raw).expect(
+                        "HIPFIRE_GDN_MOE_CHUNK_SCAN is not a boolean: expected true, false, 1 or 0",
+                    )
+                }),
+                arch,
+                crate::prefill_route_capabilities::PrefillRoute::GdnMoeChunkScan,
+            ),
             gfx12_fa_packet: parse_bool("HIPFIRE_GFX12_FA_PACKET").unwrap_or(arch == "gfx1201"),
             attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT").unwrap_or(arch == "gfx1201"),
             attn_qresident_v2: parse_bool("HIPFIRE_ATTN_QRESIDENT_V2").unwrap_or(arch == "gfx1201"),
@@ -1563,6 +1601,10 @@ impl FeatureFlags {
             qwen4_decode_share: value("HIPFIRE_QWEN4_DECODE_SHARE").ok(),
             qwen4_ep_expert_hotset: value("HIPFIRE_QWEN4_EP_EXPERT_HOTSET").ok(),
             qwen4_ep_draft_vocab_shard: value("HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD").ok(),
+            qwen4_expert_drop_zero: exact_tri("HIPFIRE_QWEN4_EXPERT_DROP_ZERO"),
+            tp_exchange: value("HIPFIRE_TP_EXCHANGE").ok(),
+            tp_peer_alternating: exact_tri("HIPFIRE_TP_PEER_ALTERNATING"),
+            tp_peer_push: exact_tri("HIPFIRE_TP_PEER_PUSH"),
             mtp_ar_floor: on_unless_zero("HIPFIRE_MTP_AR_FLOOR"),
             qwen4_expert_stage: value("HIPFIRE_QWEN4_EXPERT_STAGE").ok(),
             qwen4_mtp_draft_rounds: exact_tri("HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS"),
@@ -2291,6 +2333,7 @@ impl FeatureFlags {
             fa_prefill_pm_fp8_kv: false,
             fa_prefill_pm_qprep: false,
             fa_prefill_pm_qprep_fp8_kv: false,
+            gdn_moe_chunk_scan: false,
             gfx12_fa_packet: false,
             attn_qresident: false,
             attn_qresident_v2: false,
@@ -2360,6 +2403,10 @@ impl FeatureFlags {
             qwen4_decode_share: None,
             qwen4_ep_expert_hotset: None,
             qwen4_ep_draft_vocab_shard: None,
+            qwen4_expert_drop_zero: None,
+            tp_exchange: None,
+            tp_peer_alternating: None,
+            tp_peer_push: None,
             mtp_ar_floor: false,
             qwen4_expert_stage: None,
             qwen4_mtp_draft_rounds: None,
@@ -4240,6 +4287,28 @@ mod tests {
         }
     }
 
+    /// `HIPFIRE_GDN_MOE_CHUNK_SCAN`: unset follows `GdnMoeChunkScan` qualification (exact
+    /// gfx1201 only); an explicit typed bool wins on every arch.
+    #[test]
+    fn gdn_moe_chunk_scan_defaults_to_qualification_with_explicit_override() {
+        for arch in [
+            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx1030", "unknown",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(unset.gdn_moe_chunk_scan, arch == "gfx1201", "{arch}");
+            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                let flags = FeatureFlags::from_lookup(arch, |name| {
+                    if name == "HIPFIRE_GDN_MOE_CHUNK_SCAN" {
+                        Ok(raw.to_owned())
+                    } else {
+                        Err(())
+                    }
+                });
+                assert_eq!(flags.gdn_moe_chunk_scan, want, "{arch}: {raw}");
+            }
+        }
+    }
+
     #[test]
     fn fa_prefill_pm_qprep_defaults_to_qualification_with_explicit_override() {
         use crate::prefill_route_capabilities::{qualified, PrefillRoute};
@@ -5156,6 +5225,11 @@ mod tests {
                 format!("{:?}", f.qwen4_moe_sym_iu4),
                 f.no_device_compiler.to_string(),
                 format!("{:?}", f.dump_hidden),
+                f.gdn_moe_chunk_scan.to_string(),
+                format!("{:?}", f.qwen4_expert_drop_zero),
+                format!("{:?}", f.tp_exchange),
+                format!("{:?}", f.tp_peer_alternating),
+                format!("{:?}", f.tp_peer_push),
             ]
         };
         let flags_for = |layer: ConfigLayer| {
@@ -5186,6 +5260,15 @@ mod tests {
             ("developer.qwen4_moe_sym_iu4", Bool(false), "Some(false)"),
             ("diagnostic.compiler.no_device_compiler", Bool(true), "true"),
             ("diagnostic.dump_hidden", Str(String::new()), "Some(\"\")"),
+            ("developer.gdn_moe_chunk_scan", Bool(false), "false"),
+            ("memory.qwen4_expert_drop_zero", Bool(true), "Some(true)"),
+            (
+                "topology.tp_exchange",
+                Str("bf16".to_owned()),
+                "Some(\"bf16\")",
+            ),
+            ("topology.tp_peer_alternating", Bool(false), "Some(false)"),
+            ("topology.tp_peer_push", Bool(true), "Some(true)"),
         ]
         .into_iter()
         .enumerate()
@@ -5235,6 +5318,11 @@ mod tests {
             ("HIPFIRE_RAON_RAILGUN", "x"),
             ("HIPFIRE_RAON_VERIFY_ROWEXACT", "x"),
             ("HIPFIRE_RAON_SHARED_FFN", "x"),
+            ("HIPFIRE_GDN_MOE_CHUNK_SCAN", "1"),
+            ("HIPFIRE_QWEN4_EXPERT_DROP_ZERO", "1"),
+            ("HIPFIRE_TP_EXCHANGE", "x"),
+            ("HIPFIRE_TP_PEER_ALTERNATING", "0"),
+            ("HIPFIRE_TP_PEER_PUSH", "1"),
         ];
         fn probe(f: &FeatureFlags) -> Vec<String> {
             vec![
@@ -5266,6 +5354,11 @@ mod tests {
                 format!("{:?}", f.raon_railgun),
                 format!("{:?}", f.raon_verify_rowexact),
                 format!("{:?}", f.raon_shared_ffn),
+                format!("{:?}", f.gdn_moe_chunk_scan),
+                format!("{:?}", f.qwen4_expert_drop_zero),
+                format!("{:?}", f.tp_exchange),
+                format!("{:?}", f.tp_peer_alternating),
+                format!("{:?}", f.tp_peer_push),
             ]
         }
         let unset = probe(&FeatureFlags::from_lookup("gfx1151", |_| Err(())));

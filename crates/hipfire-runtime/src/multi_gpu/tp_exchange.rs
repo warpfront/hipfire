@@ -106,8 +106,8 @@ pub fn parse_tp_exchange(raw: Option<&str>) -> Result<TpExchangeMode, String> {
 /// value is reported on stderr and falls back to f32, the lossless route.
 pub fn tp_exchange_mode() -> TpExchangeMode {
     static MODE: LazyLock<TpExchangeMode> = LazyLock::new(|| {
-        let raw = hipfire_config::developer_var(TP_EXCHANGE_ENV).ok();
-        parse_tp_exchange(raw.as_deref()).unwrap_or_else(|error| {
+        let raw = rdna_compute::FeatureFlags::process().tp_exchange.as_deref();
+        parse_tp_exchange(raw).unwrap_or_else(|error| {
             eprintln!("  {error}; using the f32 exchange");
             TpExchangeMode::Fixed(None)
         })
