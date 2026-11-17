@@ -3686,8 +3686,8 @@ pub(crate) fn completion_timings(completion: &Completion) -> serde_json::Value {
         "spec_retired": done.get("spec_retired"),
         "spec_retired_at": done.get("spec_retired_at"),
         "ar_tokens": done.get("ar_tokens"),
-        // qwen35 DFlash speculate-vs-AR floor: policy, AR price, probes,
-        // scouts, retire/re-arm counts and observed window time.
+        // qwen35 DFlash speculate-vs-AR floor: policy, pinned prices,
+        // schedule, checkpoint decisions and observed window time.
         "floor": done.get("floor"),
         "mtp_window_timings": done.get("mtp_window_timings"),
     })

@@ -14,6 +14,7 @@
 //! with identical arithmetic.
 
 use crate::spec::MtpWindow;
+use crate::spec_prices::{PinnedPrices, LOAD_PRICE_WINDOW_ROWS};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -370,6 +371,22 @@ struct FloorBits(f32);
 impl std::fmt::Display for FloorBits {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "\"{:08x}\"", self.0.to_bits())
+    }
+}
+
+/// A list of `f32` as `[bits,...]` ([`FloorBits`]).
+struct FloorBitsList<'a>(&'a [f32]);
+
+impl std::fmt::Display for FloorBitsList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[")?;
+        for (i, &value) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{}", FloorBits(value))?;
+        }
+        f.write_str("]")
     }
 }
 
@@ -2140,39 +2157,63 @@ impl<const W: usize, const E: usize> Floor<W, E> {
 /// width the speculator chose, speculate or AR.
 pub type FixedFloor = Floor<1, 1>;
 
-/// No-loss tolerance of the fixed-window verdict: speculation loses only
-/// when its realized cost per settled token is above `ar_us × (1 +
-/// FIXED_HYSTERESIS)` on both memories, and a scout re-arms only below `ar_us
-/// × (1 − FIXED_HYSTERESIS)`. Global: never keyed by model, card, format or
-/// prompt.
-pub const FIXED_HYSTERESIS: f32 = 0.03;
+/// One-sided z of the fixed-window retire test: an epoch retires only when
+/// its settled tokens fall below break-even by more than `FIXED_RETIRE_Z`
+/// standard deviations of a geometric accept run at break-even (a 90% test).
+/// Global: never keyed by model, card, format or prompt.
+pub const FIXED_RETIRE_Z: f64 = 1.28;
 
-/// Share of every priced retired AR token's wall time a retired fixed-window
-/// request saves toward its next scout window. Global like
-/// [`FIXED_HYSTERESIS`].
-pub const FIXED_SCOUT_SHARE: f32 = 0.02;
+/// Share of the AR tokens after a retirement that a re-entry epoch may cost:
+/// the next epoch starts after `ceil((d + 1) / FIXED_SCOUT_SHARE)` AR tokens,
+/// `d` the token deficit of the retiring epoch's last ≤ 16 windows. Global.
+pub const FIXED_SCOUT_SHARE: f64 = 0.02;
 
-/// Yield (settled tokens ÷ verified rows, decayed) at or below which a
-/// fixed-window request with no AR price runs its AR probe set, which then
-/// prices AR. Above it no AR token ever runs just to obtain a price, so a cell
-/// that loses above this yield stays unpriced until some other request on the
-/// load prices AR. Global, relative to the window's own width.
-pub const FIXED_SUSPECT_YIELD: f32 = 0.5;
+/// Yield (settled tokens ÷ verified rows) at or below which a fixed-window
+/// request on an unpriced load runs its calibration probe once. Above it no
+/// AR token ever runs just to obtain a price, so a cell that loses above this
+/// yield stays unpriced until some other request on the load prices AR.
+/// Global, relative to the window's own width.
+pub const FIXED_SUSPECT_YIELD: f64 = 0.5;
 
-/// Priced windows of an epoch before the fixed-window floor decides (cold
-/// windows never count). [`FLOOR_PROBE_WINDOWS`] (3) is the MTP floor's
-/// probe span, and on DFlash it decides a tie: a window settles 1 to 16
-/// tokens, so 3 windows of a request's opening (R9700 R2: 1, 2, 2 tokens
-/// where the request averages 2.1; R4: 3 tokens) price a winning route as
-/// losing. 8 windows cut the standard error of the sampled yield by
-/// √(8/3) ≈ 1.6×, and bound what a genuinely losing request pays for the
-/// wait: 5 more windows, each costing at most one window minus the AR token
-/// it settles (about 5 × 16 ms on the R9700, under 2% of a 256-token
-/// request). Global: never keyed by model, card, format or prompt.
-pub const FIXED_MIN_PRICED_WINDOWS: usize = 8;
+/// Windows of one judged block, and the epoch checkpoint after which the
+/// checkpoints double (3, 8, 16, 32, …). Structure of the retire rule, not a
+/// tuning knob.
+const FIXED_BLOCK: usize = 16;
 
-/// One finished window as the fixed-window floor prices it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Break-even slots by verified rows: index `rows` for `1..=16`, index 0 for
+/// any other row count (priced at the full block).
+const FIXED_ROW_SLOTS: usize = LOAD_PRICE_WINDOW_ROWS + 1;
+
+fn fixed_row_slot(rows: usize) -> usize {
+    if rows <= LOAD_PRICE_WINDOW_ROWS {
+        rows
+    } else {
+        0
+    }
+}
+
+/// An epoch checkpoint: 3, 8, 16 windows, then every doubling.
+pub fn fixed_checkpoint(windows: usize) -> bool {
+    matches!(windows, 3 | 8) || (windows >= FIXED_BLOCK && windows.is_power_of_two())
+}
+
+/// The retire line of windows whose break-even sum is `break_even` (Σb, in AR
+/// tokens) and whose geometric accept-run variance at break-even is
+/// `variance` (Σ b(b−1)): judged windows fail iff their settled tokens are
+/// below it and `break_even` exceeds their count.
+pub fn fixed_retire_line(break_even: f64, variance: f64) -> f64 {
+    break_even - FIXED_RETIRE_Z * variance.max(0.0).sqrt()
+}
+
+/// AR tokens before the epoch after a retirement whose last ≤ 16 windows fell
+/// `deficit` tokens short of break-even.
+pub fn fixed_reentry_gap(deficit: f64) -> usize {
+    ((deficit.max(0.0) + 1.0) / FIXED_SCOUT_SHARE).ceil() as usize
+}
+
+/// One finished window as the fixed-window floor counts it: token counts
+/// only, never its wall time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FloorObservation {
     /// What [`Floor::plan_fixed`] returned for the window.
     pub action: Action,
@@ -2180,86 +2221,138 @@ pub struct FloorObservation {
     pub settled: usize,
     /// Verified rows (drafts plus the seed); 0 for an AR token.
     pub rows: usize,
-    /// Wall µs of the window, loop to loop.
-    pub us: f32,
-    /// The window carried first-use cost (the load's first window at its
-    /// width or route, a tape recorded or re-armed, a kernel bound or
-    /// compiled during it): observed, never priced, never counted toward
-    /// the [`FIXED_MIN_PRICED_WINDOWS`] priced windows a verdict needs, so it
-    /// cannot retire. Mirrors the MTP floor's first-use rule.
-    pub cold: bool,
+}
+
+/// One judged checkpoint of the fixed-window floor: the whole epoch at
+/// [`fixed_checkpoint`] windows, or one completed 16-window block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FixedCheckpoint {
+    /// Windows of the epoch at the checkpoint.
+    pub windows: usize,
+    /// A completed block judged alone, not the whole epoch.
+    pub block: bool,
+    /// Settled tokens of the judged windows.
+    pub settled: usize,
+    /// Σb and the retire line of the judged windows; `None` while the load's
+    /// prices are not pinned (no verdict).
+    pub priced: Option<(f64, f64)>,
+    /// Below the line with Σb above the window count.
+    pub fails: bool,
+    /// This checkpoint retired the request.
+    pub retired: bool,
+}
+
+/// Window and settled-token counts of judged windows, by verified rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct FixedTally {
+    windows: usize,
+    settled: usize,
+    rows: usize,
+    by_rows: [usize; FIXED_ROW_SLOTS],
+}
+
+impl FixedTally {
+    fn add(&mut self, settled: usize, rows: usize) {
+        self.windows += 1;
+        self.settled += settled;
+        self.rows += rows;
+        self.by_rows[fixed_row_slot(rows)] += 1;
+    }
+
+    /// (Σb, Σ b(b−1)) under the break-even table `b`.
+    fn break_even(&self, b: &[f64; FIXED_ROW_SLOTS]) -> (f64, f64) {
+        self.by_rows
+            .iter()
+            .zip(b)
+            .fold((0.0, 0.0), |(sum, var), (&n, &b)| {
+                (
+                    sum + n as f64 * b,
+                    var + n as f64 * (b * (b - 1.0)).max(0.0),
+                )
+            })
+    }
+
+    fn judge(
+        &self,
+        b: Option<&[f64; FIXED_ROW_SLOTS]>,
+        windows: usize,
+        block: bool,
+    ) -> FixedCheckpoint {
+        let priced = b.map(|b| {
+            let (sum, var) = self.break_even(b);
+            (sum, fixed_retire_line(sum, var))
+        });
+        FixedCheckpoint {
+            windows,
+            block,
+            settled: self.settled,
+            priced,
+            fails: priced.is_some_and(|(sum, line)| {
+                sum > self.windows as f64 && (self.settled as f64) < line
+            }),
+            retired: false,
+        }
+    }
 }
 
 /// Fixed-window state (see [`Floor::plan_fixed`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct FixedState {
-    /// Scout allowance in wall µs, earned by priced AR tokens while retired.
-    allowance: f32,
-    /// (wall µs, settled tokens) of the last speculative window observed with
-    /// a valid timing: what one scout is charged by.
-    last_window: Option<(f32, usize)>,
-    /// The previous observed action was an AR token (an AR token after a
-    /// speculative window pays capture or graph re-capture and is never
-    /// priced).
-    prev_ar: bool,
-    /// The window planned while retired is a scout.
-    scout: bool,
-    /// Decayed (settled tokens, verified rows) of the windows observed while
-    /// AR has no price.
-    yield_rows: (f32, f32),
-    /// The load's last wall-clock request ended retired and losing
-    /// ([`Floor::set_fixed_carry`]): the first verdict of this request comes
-    /// after [`FLOOR_PROBE_WINDOWS`] priced windows instead of
-    /// [`FIXED_MIN_PRICED_WINDOWS`]. Cleared by the first verdict that does
-    /// not probe, so a request whose fresh windows are not losing continues
-    /// under the 8-window rule.
-    carry: bool,
+    /// Break-even in AR tokens by row slot, from the load's pinned prices
+    /// ([`Floor::pin_fixed`]); `None` while unpriced.
+    break_even: Option<[f64; FIXED_ROW_SLOTS]>,
+    /// The epoch's windows.
+    epoch: FixedTally,
+    /// The current 16-window block.
+    block: FixedTally,
+    /// The last completed block failed.
+    block_failed: bool,
+    /// (settled, row slot) of the epoch's last ≤ 16 windows, a ring.
+    recent: [(usize, usize); FIXED_BLOCK],
+    recent_len: usize,
+    recent_head: usize,
+    /// AR tokens still to run before the next epoch while retired.
+    reentry_left: usize,
+    /// The request ran its calibration probe (once per request).
+    probe_ran: bool,
+    /// Checkpoints judged by the last observation (an epoch checkpoint and a
+    /// block can fall on one window).
+    checkpoints: [Option<FixedCheckpoint>; 2],
 }
 
 impl FixedFloor {
-    /// A fresh fixed-window floor taking `probe_tokens` AR tokens to re-price
-    /// AR before a losing verdict retires (0: retire on the verdict). The
-    /// probe sample storage is reserved here, never per token.
+    /// A fresh fixed-window floor whose calibration probe runs `probe_tokens`
+    /// AR tokens (0: never).
     pub fn fixed(probe_tokens: usize) -> Self {
-        let mut floor =
-            Self::with_retire_after([1.0], FLOOR_PROBE_WINDOWS).with_retire_evidence(probe_tokens);
-        floor.probe_samples.reserve(probe_tokens);
-        floor
+        Self::with_retire_after([1.0], FLOOR_PROBE_WINDOWS).with_retire_evidence(probe_tokens)
     }
 }
 
-/// The fixed-window entry points. They price speculation from the realized
-/// wall time per settled token of every settled window (`combined`, `slow`)
-/// against the AR price (`ar_us`), with the probe and retire fields. They
-/// never read the per-depth tables, the cost fit, `ROW_COST_PRIOR`, an
+/// The fixed-window entry points. Every decision is a function of token
+/// counts and the load's pinned prices ([`Self::pin_fixed`]): the floor
+/// never sees a wall time. They reuse the AR price, probe and retire fields
+/// and never read the per-depth tables, the cost fit, `ROW_COST_PRIOR`, an
 /// agreement or `window_cost`.
 ///
-/// - With no AR price ([`Self::calibrate_from`] not called) no AR token runs
-///   to obtain one: windows are observed without a verdict, and only when,
-///   after [`FLOOR_PROBE_WINDOWS`] windows, the decayed settled count is at
-///   most [`FIXED_SUSPECT_YIELD`] of the decayed verified rows does the probe
-///   set run; its mean prices AR and the floor decides.
-/// - No verdict before [`FIXED_MIN_PRICED_WINDOWS`] priced windows of the epoch
-///   ([`FLOOR_PROBE_WINDOWS`] for the first verdict while the load's carry is
-///   set, [`Self::set_fixed_carry`]). A
-///   window with first-use cost ([`FloorObservation::cold`]) is observed but
-///   never priced or counted; a cold AR token is never priced.
-/// - Losing: both memories above `ar_us × (1 + FIXED_HYSTERESIS)`; a tie
-///   keeps speculating. A losing verdict first runs `probe_tokens` AR tokens
-///   (at most once per [`FLOOR_PROBE_WINDOWS`] windows), re-prices AR by the
-///   mean of the priced ones and decides again; an invalid AR price retires.
-/// - Retirement is not sticky: every priced retired AR token updates `ar_us`
-///   (the floor's decay) and saves [`FIXED_SCOUT_SHARE`] of its time; when the
-///   allowance covers one scout's charge (`max(us − settled × ar_us, 0) +
-///   ar_us` of the last speculative window) the next plan is one speculative
-///   window, charged its actual cost. A scout below `ar_us × (1 −
-///   FIXED_HYSTERESIS)` per settled token starts a new epoch as its first
-///   window.
-/// - An AR token whose previous observed action was not AR is never priced.
+/// - Break-even of a window: `b = pinned window price(rows) ÷ pinned AR
+///   price`, in AR tokens; a row count with no pinned price takes the full
+///   block's.
+/// - Retire rule: at [`fixed_checkpoint`] windows of the epoch, and on each
+///   completed 16-window block alone, the judged windows fail when `Σs <
+///   Σb − FIXED_RETIRE_Z × sqrt(Σ b(b−1))` with `Σb` above their count. A
+///   failing epoch checkpoint retires; two consecutive failing blocks retire.
+///   No re-price probe, no hysteresis, no minimum-window constant.
+/// - Re-entry: a retired request runs [`fixed_reentry_gap`] AR tokens, then a
+///   new epoch judged by the same rule.
+/// - Unpriced: no verdict. Once the epoch has [`FLOOR_PROBE_WINDOWS`] windows
+///   and its settled tokens are at most [`FIXED_SUSPECT_YIELD`] of its
+///   verified rows, the calibration probe (`probe_tokens` AR tokens) runs once
+///   per request; counts keep accumulating and the rule applies from the
+///   first checkpoint after a pin.
 impl<const W: usize, const E: usize> Floor<W, E> {
-    /// Start a request: clear every observation (the AR price included) and
-    /// the fixed-window state, keeping the floor id, the call log and the
-    /// probe storage. No allocation.
+    /// Start a request: clear every observation, the pin and the
+    /// fixed-window state, keeping the floor id, the call log and the probe
+    /// size. No allocation.
     pub fn reset_fixed(&mut self, probe_tokens: usize) {
         let log = self.call_log.take();
         self.reset_request(FLOOR_PROBE_WINDOWS, DEFAULT_DECAY, probe_tokens);
@@ -2274,26 +2367,37 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         }
     }
 
-    /// Price AR from a load-scoped measurement instead of this request's own
-    /// calibration tokens (an invalid price retires at the first verdict).
-    pub fn calibrate_from(&mut self, ar_us: f32) {
-        self.calibrated = true;
-        self.ar_us = if valid_us(ar_us) { ar_us } else { 0.0 };
+    /// Price the request from the load's pinned prices: every later
+    /// checkpoint is judged on them. An invalid AR price leaves the floor
+    /// unpriced.
+    pub fn pin_fixed(&mut self, prices: &PinnedPrices) {
+        self.pin_fixed_inner(prices);
         if let Some(log) = self.call_log {
             log.emit(
-                "calibrate_from",
+                "pin_fixed",
                 self.id,
-                format_args!(",\"ar_us\":{}{}", FloorBits(ar_us), self.after()),
+                format_args!(
+                    ",\"ar_us\":{},\"window_us\":{},\"full_rows\":{}{}",
+                    FloorBits(prices.ar_us),
+                    FloorBitsList(&prices.window_us),
+                    prices.full_rows,
+                    self.after()
+                ),
             );
         }
     }
 
-    /// The next window: [`Action::ArSynced`] while AR is being priced (the
-    /// request's calibration, or the probes of a losing verdict),
-    /// [`Action::ArHeadFree`] while retired, else [`Action::Native`] with
-    /// exactly `width` (a retired request's scout included).
+    /// The next window: [`Action::ArSynced`] while the calibration probe
+    /// runs, [`Action::ArHeadFree`] while retired, else [`Action::Native`]
+    /// with exactly `width`.
     pub fn plan_fixed(&mut self, width: usize) -> Action {
-        let ret = self.plan_fixed_inner(width);
+        let ret = if self.probe_left > 0 {
+            Action::ArSynced
+        } else if self.retired {
+            Action::ArHeadFree
+        } else {
+            Action::Native(width)
+        };
         if let Some(log) = self.call_log {
             log.emit(
                 "plan_fixed",
@@ -2316,20 +2420,18 @@ impl<const W: usize, const E: usize> Floor<W, E> {
                 "observe_fixed",
                 self.id,
                 format_args!(
-                    ",\"action\":{},\"settled\":{},\"rows\":{},\"us\":{},\"cold\":{}{}",
+                    ",\"action\":{},\"settled\":{},\"rows\":{}{}",
                     FloorRouteName(observation.action),
                     observation.settled,
                     observation.rows,
-                    FloorBits(observation.us),
-                    observation.cold,
                     self.after()
                 ),
             );
         }
     }
 
-    /// Start a new epoch (a think-close): un-retire, forget the realized
-    /// memories and any running probe, keep the AR price.
+    /// Start a new epoch (a think-close): un-retire, forget the epoch's
+    /// counts and any running probe, keep the pin.
     pub fn rearm_fixed(&mut self) {
         self.start_fixed_epoch();
         if let Some(log) = self.call_log {
@@ -2337,240 +2439,127 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         }
     }
 
-    /// The load's carry for this request (call after [`Self::reset_fixed`],
-    /// which clears it): `true` when the load's last wall-clock request
-    /// ended retired with speculation measured losing. While set, the first
-    /// verdict needs [`FLOOR_PROBE_WINDOWS`] priced windows, and still needs
-    /// both fresh memories losing.
-    pub fn set_fixed_carry(&mut self, carry: bool) {
-        self.fixed.carry = carry;
-        if let Some(log) = self.call_log {
-            log.emit(
-                "set_fixed_carry",
-                self.id,
-                format_args!(",\"carry\":{carry}{}", self.after()),
-            );
-        }
+    /// The checkpoints the last [`Self::observe_fixed`] judged.
+    pub fn fixed_checkpoints(&self) -> impl Iterator<Item = FixedCheckpoint> + '_ {
+        self.fixed.checkpoints.iter().flatten().copied()
     }
 
-    /// Realized speculative wall µs per settled token of the epoch (the fast
-    /// memory), when any window was priced.
-    pub fn fixed_spec_us_per_token(&self) -> Option<f32> {
-        (self.combined.1 > 0.0).then(|| self.combined.0 / self.combined.1)
+    /// The pinned break-even of a window of `rows` verified rows, in AR
+    /// tokens, once priced.
+    pub fn fixed_break_even(&self, rows: usize) -> Option<f64> {
+        self.fixed.break_even.map(|b| b[fixed_row_slot(rows)])
     }
 
-    /// The window planned while retired is a scout.
-    pub fn fixed_scouting(&self) -> bool {
-        self.fixed.scout
+    /// AR tokens a retired request still runs before its next epoch.
+    pub fn fixed_reentry_left(&self) -> usize {
+        self.fixed.reentry_left
     }
 
-    fn plan_fixed_inner(&mut self, width: usize) -> Action {
-        if self.probe_left > 0 {
-            return Action::ArSynced;
+    fn pin_fixed_inner(&mut self, prices: &PinnedPrices) {
+        if !valid_us(prices.ar_us) {
+            return;
         }
-        if !self.calibrated {
-            return Action::Native(width);
+        let ar = f64::from(prices.ar_us);
+        let mut table = [0.0; FIXED_ROW_SLOTS];
+        for (slot, b) in table.iter_mut().enumerate() {
+            let window = prices.window(slot);
+            *b = if valid_us(window) {
+                f64::from(window) / ar
+            } else {
+                0.0
+            };
         }
-        if !self.retired || self.fixed.scout {
-            return Action::Native(width);
-        }
-        if self
-            .fixed_scout_charge()
-            .is_some_and(|charge| self.fixed.allowance >= charge)
-        {
-            self.fixed.scout = true;
-            return Action::Native(width);
-        }
-        Action::ArHeadFree
-    }
-
-    /// One scout's charge from the last speculative window: its cost above
-    /// the AR tokens it settled, plus one AR token.
-    fn fixed_scout_charge(&self) -> Option<f32> {
-        let (us, settled) = self.fixed.last_window?;
-        valid_us(self.ar_us).then(|| (us - settled as f32 * self.ar_us).max(0.0) + self.ar_us)
+        self.calibrated = true;
+        self.ar_us = prices.ar_us;
+        self.fixed.break_even = Some(table);
     }
 
     fn observe_fixed_inner(&mut self, observation: FloorObservation) {
-        let FloorObservation {
-            action,
-            settled,
-            rows,
-            us,
-            cold,
-        } = observation;
-        match action {
-            Action::ArSynced | Action::ArHeadFree => self.observe_fixed_ar(us, cold),
-            Action::Native(_) | Action::Interleaved if cold => self.observe_fixed_cold(),
-            Action::Native(_) | Action::Interleaved => self.observe_fixed_window(settled, rows, us),
+        self.fixed.checkpoints = [None; 2];
+        match observation.action {
+            Action::ArSynced | Action::ArHeadFree => self.observe_fixed_ar(),
+            Action::Native(_) | Action::Interleaved => {
+                self.observe_fixed_window(observation.settled, observation.rows)
+            }
         }
     }
 
-    /// A speculative window with first-use cost: no memory, yield, scout
-    /// charge or window count moves, and no verdict runs. A cold scout keeps
-    /// its allowance (the next plan scouts again, warm).
-    fn observe_fixed_cold(&mut self) {
-        self.fixed.prev_ar = false;
-        self.fixed.scout = false;
-    }
-
-    fn observe_fixed_ar(&mut self, us: f32, cold: bool) {
-        let after_ar = self.fixed.prev_ar;
-        self.fixed.prev_ar = true;
-        let priced = after_ar && !cold && valid_us(us);
-        if self.probe_left > 0 && !self.retired {
+    fn observe_fixed_ar(&mut self) {
+        if self.probe_left > 0 {
             self.probe_left -= 1;
-            if priced {
-                self.probe_samples.push(us);
+        } else if self.retired {
+            self.fixed.reentry_left = self.fixed.reentry_left.saturating_sub(1);
+            if self.fixed.reentry_left == 0 {
+                self.start_fixed_epoch();
             }
-            if self.probe_left == 0 {
-                if !self.probe_samples.is_empty() {
-                    self.ar_us =
-                        self.probe_samples.iter().sum::<f32>() / self.probe_samples.len() as f32;
-                } else if !self.calibrated {
-                    // No priced probe: no AR price, which retires.
-                    self.ar_us = 0.0;
-                }
-                self.calibrated = true;
-                self.decide_fixed();
-            }
-            return;
-        }
-        if !self.calibrated {
-            return;
-        }
-        if self.retired && priced {
-            self.ar_us = if valid_us(self.ar_us) {
-                self.ar_us * self.decay + us * (1.0 - self.decay)
-            } else {
-                us
-            };
-            self.fixed.allowance += FIXED_SCOUT_SHARE * us;
         }
     }
 
-    fn observe_fixed_window(&mut self, settled: usize, rows: usize, us: f32) {
-        self.fixed.prev_ar = false;
-        if !self.calibrated {
-            self.observe_fixed_unpriced(settled, rows, us);
-            return;
-        }
-        if valid_us(us) {
-            self.fixed.last_window = Some((us, settled));
-        }
+    fn observe_fixed_window(&mut self, settled: usize, rows: usize) {
         if self.retired {
-            if !std::mem::take(&mut self.fixed.scout) {
-                return;
-            }
-            let charge = (valid_us(us) && valid_us(self.ar_us))
-                .then(|| (us - settled as f32 * self.ar_us).max(0.0) + self.ar_us);
-            // An unpriced scout spends the whole allowance.
-            self.fixed.allowance = charge.map_or(0.0, |c| (self.fixed.allowance - c).max(0.0));
-            let wins = settled > 0
-                && charge.is_some()
-                && us / (settled as f32) < self.ar_us * (1.0 - FIXED_HYSTERESIS);
-            if !wins {
-                return;
-            }
-            self.start_fixed_epoch();
+            return;
         }
-        if valid_us(us) {
-            let decay = self.decay;
-            decay_add(&mut self.combined, us, settled as f32, decay);
-            decay_add(
-                &mut self.slow,
-                us,
-                settled as f32,
-                decay.max(FLOOR_RETIRE_DECAY),
-            );
-        }
-        self.count_probe();
-        self.decide_fixed();
-    }
-
-    /// A window while AR has no price: realized cost and yield accumulate;
-    /// after the probe windows a low yield starts the probe set that prices AR.
-    fn observe_fixed_unpriced(&mut self, settled: usize, rows: usize, us: f32) {
-        let decay = self.decay;
-        if valid_us(us) {
-            self.fixed.last_window = Some((us, settled));
-            decay_add(&mut self.combined, us, settled as f32, decay);
-            decay_add(
-                &mut self.slow,
-                us,
-                settled as f32,
-                decay.max(FLOOR_RETIRE_DECAY),
-            );
-        }
-        decay_add(
-            &mut self.fixed.yield_rows,
-            settled as f32,
-            rows as f32,
-            decay,
-        );
-        self.count_probe();
-        let (settled, rows) = self.fixed.yield_rows;
-        if !self.probing()
+        let fixed = &mut self.fixed;
+        fixed.epoch.add(settled, rows);
+        fixed.block.add(settled, rows);
+        fixed.recent[fixed.recent_head] = (settled, fixed_row_slot(rows));
+        fixed.recent_head = (fixed.recent_head + 1) % FIXED_BLOCK;
+        fixed.recent_len = (fixed.recent_len + 1).min(FIXED_BLOCK);
+        let windows = fixed.epoch.windows;
+        if fixed.break_even.is_none()
+            && !fixed.probe_ran
             && self.probe_tokens > 0
-            && self.probe_left == 0
-            && rows > 0.0
-            && settled <= FIXED_SUSPECT_YIELD * rows
+            && windows >= FLOOR_PROBE_WINDOWS
+            && fixed.epoch.settled as f64 <= FIXED_SUSPECT_YIELD * fixed.epoch.rows as f64
         {
+            fixed.probe_ran = true;
             self.probe_left = self.probe_tokens;
-            self.probe_samples.clear();
-            self.probed_at = Some(self.observed);
+        }
+        let b = fixed.break_even.as_ref();
+        let mut retire = None;
+        if fixed_checkpoint(windows) {
+            let checkpoint = fixed.epoch.judge(b, windows, false);
+            if checkpoint.fails {
+                retire = Some(0);
+            }
+            fixed.checkpoints[0] = Some(checkpoint);
+        }
+        if fixed.block.windows == FIXED_BLOCK {
+            let checkpoint = fixed.block.judge(b, windows, true);
+            if checkpoint.fails && fixed.block_failed && retire.is_none() {
+                retire = Some(1);
+            }
+            fixed.block_failed = checkpoint.fails;
+            fixed.block = FixedTally::default();
+            fixed.checkpoints[1] = Some(checkpoint);
+        }
+        if let (Some(slot), Some(b)) = (retire, fixed.break_even) {
+            let recent = &fixed.recent[..fixed.recent_len];
+            let deficit = recent.iter().map(|&(_, slot)| b[slot]).sum::<f64>()
+                - recent
+                    .iter()
+                    .map(|&(settled, _)| settled as f64)
+                    .sum::<f64>();
+            fixed.reentry_left = fixed_reentry_gap(deficit);
+            if let Some(checkpoint) = &mut fixed.checkpoints[slot] {
+                checkpoint.retired = true;
+            }
+            self.retired = true;
+            self.probe_left = 0;
         }
     }
 
-    /// A new epoch: the verdict needs [`FIXED_MIN_PRICED_WINDOWS`] fresh priced
-    /// windows (cold windows never count).
+    /// A new epoch: fresh counts, checkpoints from 3 windows again.
     fn start_fixed_epoch(&mut self) {
         self.retired = false;
-        self.probes = 0;
-        self.observed = 0;
-        self.combined = (0.0, 0.0);
-        self.slow = (0.0, 0.0);
         self.probe_left = 0;
-        self.probe_samples.clear();
-        self.probed_at = None;
-        self.fixed.scout = false;
-        self.fixed.allowance = 0.0;
-    }
-
-    fn decide_fixed(&mut self) {
-        let min_windows = if self.fixed.carry {
-            FLOOR_PROBE_WINDOWS
-        } else {
-            FIXED_MIN_PRICED_WINDOWS
-        };
-        if self.retired
-            || !self.calibrated
-            || self.observed < min_windows
-            || self.probing()
-            || self.probe_left > 0
-        {
-            return;
-        }
-        if !valid_us(self.ar_us) {
-            self.retired = true;
-            self.fixed.carry = false;
-            return;
-        }
-        let line = self.ar_us * (1.0 + FIXED_HYSTERESIS);
-        let loses = |(us, tokens): (f32, f32)| us > line * tokens;
-        if !(loses(self.combined) && loses(self.slow)) {
-            self.fixed.carry = false;
-            return;
-        }
-        if self.should_probe() {
-            self.probe_left = self.probe_tokens;
-            self.probe_samples.clear();
-            self.probed_at = Some(self.observed);
-            return;
-        }
-        self.retired = true;
-        self.fixed.carry = false;
-        self.fixed.allowance = 0.0;
+        let fixed = &mut self.fixed;
+        fixed.epoch = FixedTally::default();
+        fixed.block = FixedTally::default();
+        fixed.block_failed = false;
+        fixed.recent_len = 0;
+        fixed.recent_head = 0;
+        fixed.reentry_left = 0;
     }
 }
 
@@ -2686,6 +2675,29 @@ fn json_native_window(value: &serde_json::Value) -> Result<NativeWindow, String>
     }
 }
 
+/// The [`PinnedPrices`] of a `pin_fixed` line.
+fn json_pinned(value: &serde_json::Value) -> Result<PinnedPrices, String> {
+    let logged = json_field(value, "window_us")?
+        .as_array()
+        .ok_or("`window_us` is not an array")?;
+    let mut window_us = [0.0f32; LOAD_PRICE_WINDOW_ROWS + 1];
+    if logged.len() != window_us.len() {
+        return Err(format!(
+            "`window_us` has {} rows, expected {}",
+            logged.len(),
+            window_us.len()
+        ));
+    }
+    for (us, bits) in window_us.iter_mut().zip(logged) {
+        *us = json_bits(bits)?;
+    }
+    Ok(PinnedPrices {
+        ar_us: json_f32(value, "ar_us")?,
+        window_us,
+        full_rows: json_usize(value, "full_rows")?,
+    })
+}
+
 /// An [`Action`] from its log name ([`action_name`]).
 fn json_action(name: &str) -> Result<Action, String> {
     match name {
@@ -2777,8 +2789,8 @@ fn replay_call<const W: usize, const E: usize>(
             floor.reset_fixed(json_usize(value, "probe_tokens")?);
             None
         }
-        "calibrate_from" => {
-            floor.calibrate_from(json_f32(value, "ar_us")?);
+        "pin_fixed" => {
+            floor.pin_fixed(&json_pinned(value)?);
             None
         }
         "plan_fixed" => {
@@ -2790,17 +2802,11 @@ fn replay_call<const W: usize, const E: usize>(
                 action: json_action(json_str(value, "action")?)?,
                 settled: json_usize(value, "settled")?,
                 rows: json_usize(value, "rows")?,
-                us: json_f32(value, "us")?,
-                cold: json_bool(value, "cold")?,
             });
             None
         }
         "rearm_fixed" => {
             floor.rearm_fixed();
-            None
-        }
-        "set_fixed_carry" => {
-            floor.set_fixed_carry(json_bool(value, "carry")?);
             None
         }
         "reset_request" => {
@@ -9806,397 +9812,398 @@ mod derived_k_tests {
 mod fixed_floor_tests {
     use super::*;
 
-    /// AR price of the scripted requests: 25 µs (every share and decay step
-    /// below is exact in f32).
-    const AR: f32 = 25.0;
     const WIDTH: usize = 15;
-    const PROBES: usize = 4;
+    const FULL: usize = WIDTH + 1;
+    const PROBES: usize = 6;
 
     fn native() -> Action {
         Action::Native(WIDTH)
     }
 
-    fn window(floor: &mut FixedFloor, settled: usize, us: f32) {
+    /// Pinned prices: AR `ar_us`, the full block `window_us`, no other row
+    /// count priced.
+    fn prices(ar_us: f32, window_us: f32) -> PinnedPrices {
+        let mut rows = [0.0; LOAD_PRICE_WINDOW_ROWS + 1];
+        rows[FULL] = window_us;
+        PinnedPrices {
+            ar_us,
+            window_us: rows,
+            full_rows: FULL,
+        }
+    }
+
+    /// b = 2 exactly (200 µs window, 100 µs AR).
+    fn b2() -> PinnedPrices {
+        prices(100.0, 200.0)
+    }
+
+    /// R9700 `qwen3.8:27b-mq3-xt` (§7.10): 39.5 ms window, 23.4 ms AR.
+    fn r9700_mq3() -> PinnedPrices {
+        prices(23_400.0, 39_500.0)
+    }
+
+    /// XTX `qwen3.8:27b-mq3-xt` on PM4 AR (§7.10): 76 ms window, 17.45 ms AR.
+    fn xtx_mq3() -> PinnedPrices {
+        prices(17_450.0, 76_000.0)
+    }
+
+    fn pinned(prices: &PinnedPrices) -> FixedFloor {
+        let mut floor = FixedFloor::fixed(PROBES);
+        floor.pin_fixed(prices);
+        floor
+    }
+
+    fn window(floor: &mut FixedFloor, settled: usize) {
         floor.observe_fixed(FloorObservation {
             action: native(),
             settled,
-            rows: WIDTH + 1,
-            us,
-            cold: false,
+            rows: FULL,
         });
     }
 
-    fn ar(floor: &mut FixedFloor, action: Action, us: f32) {
+    fn ar(floor: &mut FixedFloor, action: Action) {
         floor.observe_fixed(FloorObservation {
             action,
             settled: 1,
             rows: 0,
-            us,
-            cold: false,
         });
     }
 
-    /// Plan, then observe what was planned: an AR token at `ar_us`, or a
-    /// window settling `settled` tokens in `us`.
-    fn step(floor: &mut FixedFloor, settled: usize, us: f32, ar_us: f32) -> Action {
+    /// Plan, then observe what was planned: an AR token, or a window
+    /// settling `settled` tokens.
+    fn step(floor: &mut FixedFloor, settled: usize) -> Action {
         let action = floor.plan_fixed(WIDTH);
         match action {
             Action::Native(width) => {
                 assert_eq!(width, WIDTH, "plan_fixed never changes the width");
-                window(floor, settled, us);
+                window(floor, settled);
             }
-            Action::ArSynced | Action::ArHeadFree => ar(floor, action, ar_us),
+            Action::ArSynced | Action::ArHeadFree => ar(floor, action),
             Action::Interleaved => panic!("plan_fixed returned Interleaved"),
         }
         action
     }
 
-    fn calibrated(probe_tokens: usize) -> FixedFloor {
-        let mut floor = FixedFloor::fixed(probe_tokens);
-        floor.calibrate_from(AR);
-        floor
-    }
-
-    /// A floor retired by losing windows (4 tokens per 200 µs: 50 µs per
-    /// token against 25), its last window 200 µs for 4 tokens.
-    fn retired() -> FixedFloor {
-        let mut floor = calibrated(0);
-        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
-            assert_eq!(step(&mut floor, 4, 200.0, AR), native());
+    /// The window (1-based, of `counts`) at which `counts` retire the floor,
+    /// if they do; every count is a planned speculative window.
+    fn retired_at(floor: &mut FixedFloor, counts: &[usize]) -> Option<usize> {
+        for (i, &settled) in counts.iter().enumerate() {
+            assert_eq!(step(floor, settled), native());
+            if floor.retired() {
+                return Some(i + 1);
+            }
         }
-        assert!(floor.retired());
-        floor
+        None
     }
 
-    fn cold_window(floor: &mut FixedFloor, settled: usize, us: f32) {
-        assert_eq!(floor.plan_fixed(WIDTH), native());
-        floor.observe_fixed(FloorObservation {
-            action: native(),
-            settled,
-            rows: WIDTH + 1,
-            us,
-            cold: true,
-        });
+    /// The most settled tokens over `windows` windows that retire at that
+    /// checkpoint under `prices`, with the tokens front-loaded (full windows
+    /// first) so no earlier checkpoint fires first.
+    fn retire_bound(prices: &PinnedPrices, windows: usize) -> Option<usize> {
+        (0..=windows * FULL).rev().find(|&total| {
+            let counts: Vec<usize> = (0..windows)
+                .map(|i| total.saturating_sub(i * FULL).min(FULL))
+                .collect();
+            let mut floor = pinned(prices);
+            for (i, &settled) in counts.iter().enumerate() {
+                window(&mut floor, settled);
+                if floor.retired() {
+                    return i + 1 == windows;
+                }
+            }
+            false
+        })
     }
 
     #[test]
-    fn cold_windows_never_retire_a_warm_winner() {
-        // R9700 R2 shape: first-use windows (bind, tape capture, JIT) cost
-        // hundreds of warm windows, then warm windows win at 10 µs per token
-        // against 25. Priced and unpriced AR, with and without probes.
-        for probes in [0, PROBES] {
-            for mut floor in [calibrated(probes), FixedFloor::fixed(probes)] {
-                for _ in 0..2 * FLOOR_PROBE_WINDOWS {
-                    cold_window(&mut floor, 2, 50_000.0);
-                    assert!(!floor.retired());
-                }
-                assert_eq!(floor.fixed_spec_us_per_token(), None, "cold is unpriced");
-                for _ in 0..200 {
-                    assert_eq!(step(&mut floor, 12, 120.0, AR), native());
-                }
-                assert!(!floor.retired());
-                let spec = floor
-                    .fixed_spec_us_per_token()
-                    .expect("warm windows priced");
-                assert!((spec - 10.0).abs() < 1e-3, "cold cost never priced: {spec}");
+    fn retire_line_matches_hand_computed_values() {
+        // b = 2: Σb = Σ b(b−1) = 2n.
+        assert!((fixed_retire_line(16.0, 16.0) - (16.0 - 1.28 * 4.0)).abs() < 1e-12);
+        assert!((fixed_retire_line(16.0, 16.0) - 10.88).abs() < 1e-12);
+        assert!((fixed_retire_line(6.0, 6.0) - 2.864_653_129_237_532).abs() < 1e-12);
+        assert!((fixed_retire_line(32.0, 32.0) - 24.759_226_560_649_75).abs() < 1e-12);
+        // b = 1.69, 8 windows: 13.52 − 1.28 × sqrt(8 × 1.69 × 0.69).
+        let b: f64 = 1.69;
+        let line = fixed_retire_line(8.0 * b, 8.0 * b * (b - 1.0));
+        assert!((line - 9.610_485_206_576_14).abs() < 1e-9, "{line}");
+        // b = 4.36, 3 and 8 windows.
+        let b: f64 = 4.36;
+        let line = fixed_retire_line(3.0 * b, 3.0 * b * (b - 1.0));
+        assert!((line - 4.594_381_936_476_284).abs() < 1e-9, "{line}");
+        let line = fixed_retire_line(8.0 * b, 8.0 * b * (b - 1.0));
+        assert!((line - 21.023_043_728_148_668).abs() < 1e-9, "{line}");
+        // A negative variance (b < 1) counts as none.
+        assert_eq!(fixed_retire_line(2.0, -1.0), 2.0);
+    }
+
+    #[test]
+    fn retire_thresholds_match_the_ruling_table() {
+        // §7.10: the largest settled count that retires at n = 3, 8, 16.
+        for (prices, bounds) in [
+            (r9700_mq3(), [None, Some(9), Some(21)]),
+            (prices(23_400.0, 39_078.0), [None, Some(9), Some(21)]), // b 1.67
+            (prices(20_000.0, 49_000.0), [Some(3), Some(12), Some(29)]), // b 2.45
+            (xtx_mq3(), [Some(4), Some(21), Some(50)]),
+        ] {
+            for (windows, want) in [3, 8, 16].into_iter().zip(bounds) {
+                // Every real window settles at least one token, so a bound
+                // below the window count cannot happen (R9700 at n = 3: 2).
+                let got = retire_bound(&prices, windows).filter(|&s| s >= windows);
+                assert_eq!(got, want, "{prices:?} at {windows} windows");
             }
         }
     }
 
     #[test]
-    fn losing_windows_retire_after_the_priced_minimum_despite_cold_ones() {
-        // Cold windows interleaved with losing ones (50 µs per token against
-        // 25): no verdict until FIXED_MIN_PRICED_WINDOWS priced windows,
-        // then retired, with no probe (probe_tokens 0).
-        let mut floor = calibrated(0);
-        cold_window(&mut floor, 1, 9_000.0);
-        for _ in 0..FIXED_MIN_PRICED_WINDOWS - 1 {
-            assert_eq!(step(&mut floor, 4, 200.0, AR), native());
-            cold_window(&mut floor, 1, 9_000.0);
-            assert!(!floor.retired());
+    fn checkpoints_are_3_8_16_and_every_doubling() {
+        let at: Vec<usize> = (1..=600).filter(|&n| fixed_checkpoint(n)).collect();
+        assert_eq!(at, [3, 8, 16, 32, 64, 128, 256, 512]);
+        // Each checkpoint (and each 16th window) is judged exactly once.
+        let mut floor = pinned(&b2());
+        let mut judged = Vec::new();
+        for _ in 0..80 {
+            window(&mut floor, 2);
+            judged.extend(floor.fixed_checkpoints().map(|c| (c.windows, c.block)));
         }
-        assert_eq!(step(&mut floor, 4, 200.0, AR), native());
-        assert!(floor.retired(), "losing after the priced minimum");
+        assert_eq!(
+            judged,
+            [
+                (3, false),
+                (8, false),
+                (16, false),
+                (16, true),
+                (32, false),
+                (32, true),
+                (48, true),
+                (64, false),
+                (64, true),
+                (80, true),
+            ]
+        );
+        assert!(!floor.retired(), "break-even exactly never retires");
+    }
+
+    #[test]
+    fn break_even_at_or_below_the_window_count_never_retires() {
+        // b = 1: a window costs one AR token; every count keeps speculating.
+        let mut floor = pinned(&prices(100.0, 100.0));
+        assert_eq!(retired_at(&mut floor, &[1; 300]), None);
+        // b < 1 (a nonsense pin): no variance, still never.
+        let mut floor = pinned(&prices(100.0, 50.0));
+        assert_eq!(retired_at(&mut floor, &[1; 300]), None);
+    }
+
+    #[test]
+    fn a_marginal_r9700_winner_never_retires() {
+        // R9700 `mq3-xt` lighthouse: 13 tokens in its first 8 windows (the
+        // incumbent's recorded opening), then the request's 2.24 per window.
+        let opening = [1, 2, 2, 1, 2, 2, 1, 2];
+        let mut counts = opening.to_vec();
+        counts.extend([2, 2, 3, 2].iter().cycle().take(110));
+        let mut floor = pinned(&r9700_mq3());
+        assert_eq!(retired_at(&mut floor, &counts), None);
+        // Even the opening repeated for 256 windows (1.625 per window, a
+        // loss inside the noise against b = 1.69) keeps speculating.
+        let mut floor = pinned(&r9700_mq3());
+        let repeated: Vec<usize> = opening.iter().copied().cycle().take(256).collect();
+        assert_eq!(retired_at(&mut floor, &repeated), None);
+    }
+
+    #[test]
+    fn an_x1_like_loser_retires_by_window_8() {
+        // XTX `mq3-xt` PM4 prices, about 2.3 tokens per window.
+        let steady = [2, 2, 3, 2, 3, 2, 2, 3, 2, 2];
+        let mut floor = pinned(&xtx_mq3());
+        assert_eq!(retired_at(&mut floor, &steady), Some(8));
         assert_eq!(floor.plan_fixed(WIDTH), Action::ArHeadFree);
-        // With probes: the losing verdict probes AR, then retires.
-        let mut floor = calibrated(PROBES);
-        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
-            cold_window(&mut floor, 1, 9_000.0);
-            step(&mut floor, 4, 200.0, AR);
-        }
-        for _ in 0..PROBES {
-            assert_eq!(step(&mut floor, 4, 200.0, AR), Action::ArSynced);
-        }
-        assert!(floor.retired());
+        // The incumbent's recorded X1 opening (1, 1, 2) retires at 3.
+        let recorded = [1, 1, 2, 5, 3, 4, 1, 2, 2, 1];
+        let mut floor = pinned(&xtx_mq3());
+        assert_eq!(retired_at(&mut floor, &recorded), Some(3));
+        let checkpoint = floor.fixed_checkpoints().next().unwrap();
+        assert!(checkpoint.fails && checkpoint.retired && !checkpoint.block);
+        assert_eq!(checkpoint.settled, 4);
     }
 
     #[test]
-    fn a_cold_ar_token_is_never_priced() {
-        let mut floor = calibrated(PROBES);
-        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
-            step(&mut floor, 1, 30.0, AR);
+    fn two_consecutive_failing_blocks_retire_a_long_epoch() {
+        // b = 2: 32 windows of 3 tokens, then 1 token per window. The epoch
+        // stays above its line at 64 (128 vs 113.5), but blocks 3 and 4
+        // (16 vs 24.76 each) both fail: retired at window 64 by the pair.
+        let mut counts = vec![3; 32];
+        counts.extend([1; 40]);
+        let mut floor = pinned(&b2());
+        assert_eq!(retired_at(&mut floor, &counts), Some(64));
+        let judged: Vec<FixedCheckpoint> = floor.fixed_checkpoints().collect();
+        assert_eq!(judged.len(), 2);
+        assert!(!judged[0].fails && !judged[0].block, "epoch passes");
+        assert!(judged[1].block && judged[1].fails && judged[1].retired);
+        // One failing block between passing ones never retires.
+        let mut counts = vec![3; 32];
+        counts.extend([1; 16]);
+        counts.extend([3; 40]);
+        let mut floor = pinned(&b2());
+        assert_eq!(retired_at(&mut floor, &counts), None);
+    }
+
+    #[test]
+    fn reentry_gap_and_budget() {
+        assert_eq!(fixed_reentry_gap(0.0), 50);
+        assert_eq!(fixed_reentry_gap(-3.0), 50, "a surplus is no deficit");
+        assert_eq!(fixed_reentry_gap(4.52), 276);
+        // The new epoch costs at most the share of the gap: (d + 1) ≤ 0.02 R.
+        for deficit in [0.0, 0.3, 4.52, 13.04, 41.7] {
+            let gap = fixed_reentry_gap(deficit);
+            assert!(deficit + 1.0 <= FIXED_SCOUT_SHARE * gap as f64 + 1e-9);
+            assert!(deficit + 1.0 > FIXED_SCOUT_SHARE * (gap - 1) as f64);
         }
-        // Losing at 30 against 25 × 1.03: probes; the first follows a window,
-        // the second is cold, the last two price AR at 40.
-        for (us, cold) in [
-            (1_000.0, false),
-            (5_000.0, true),
-            (40.0, false),
-            (40.0, false),
-        ] {
-            assert_eq!(floor.plan_fixed(WIDTH), Action::ArSynced);
-            floor.observe_fixed(FloorObservation {
-                action: Action::ArSynced,
-                settled: 1,
-                rows: 0,
-                us,
-                cold,
-            });
+        // b = 2, 8 windows of 1 token: retired at 8 (8 < 10.88), deficit
+        // 16 − 8 = 8, so R = ceil(9 / 0.02) = 450 AR tokens, then a new epoch
+        // judged from 3 windows again.
+        let mut floor = pinned(&b2());
+        assert_eq!(retired_at(&mut floor, &[1; 8]), Some(8));
+        assert_eq!(floor.fixed_reentry_left(), 450);
+        let mut ar_tokens = 0;
+        while step(&mut floor, 1) == Action::ArHeadFree {
+            ar_tokens += 1;
         }
-        assert_eq!(floor.ar_us(), 40.0);
+        assert_eq!(ar_tokens, 450);
         assert!(!floor.retired());
+        // The re-entry window above was the new epoch's first; two more
+        // 1-token windows reach its 3-window checkpoint (3 vs 2.86: keep).
+        assert_eq!(retired_at(&mut floor, &[1, 1]), None);
+        assert_eq!(floor.fixed_checkpoints().next().unwrap().windows, 3);
+        // Five more reach 8: retired again with the same gap.
+        assert_eq!(retired_at(&mut floor, &[1; 5]), Some(5));
+        assert_eq!(floor.fixed_reentry_left(), 450);
     }
 
     #[test]
-    fn no_ar_token_runs_for_a_price_above_the_suspect_yield() {
-        // A winning request with no AR price (12 of 16 rows settled) never
-        // runs an AR token and never decides.
+    fn the_deficit_covers_only_the_last_16_windows() {
+        // b = 2: 16 windows at break-even, then 1 token per window: the
+        // epoch fails at 32 (48 < 64 − 1.28 × 8 = 53.76), and the deficit
+        // counts windows 17–32 only: 32 − 16 = 16 → R = 850.
+        let mut counts = vec![2; 16];
+        counts.extend([1; 16]);
+        let mut floor = pinned(&b2());
+        assert_eq!(retired_at(&mut floor, &counts), Some(32));
+        assert_eq!(floor.fixed_reentry_left(), 850);
+    }
+
+    #[test]
+    fn unpriced_floor_never_decides_and_probes_once_at_the_suspect_yield() {
+        // Above the suspect yield (12 of 16 rows): no AR token, no verdict.
         let mut floor = FixedFloor::fixed(PROBES);
-        for _ in 0..200 {
-            assert_eq!(step(&mut floor, 12, 40.0, AR), native());
+        for _ in 0..300 {
+            assert_eq!(step(&mut floor, 12), native());
         }
         assert!(!floor.calibrated() && !floor.retired());
-        // At exactly half the rows the probe set runs once the probe windows
-        // are seen; the first probe follows a window and is unpriced.
+        // At exactly half the rows the calibration probe runs once, after
+        // the third window, for exactly PROBES AR tokens.
         let mut floor = FixedFloor::fixed(PROBES);
         for _ in 0..FLOOR_PROBE_WINDOWS {
-            assert_eq!(step(&mut floor, 8, 800.0, AR), native());
-        }
-        for us in [9_999.0, AR, AR, AR] {
-            assert_eq!(floor.plan_fixed(WIDTH), Action::ArSynced);
-            ar(&mut floor, Action::ArSynced, us);
-        }
-        assert!(floor.calibrated());
-        assert_eq!(floor.ar_us(), AR);
-        // Priced now; the verdict waits for the priced minimum.
-        assert!(!floor.retired());
-        // The losing verdict, past the probe spacing, re-prices AR once more
-        // and retires.
-        for _ in 0..FIXED_MIN_PRICED_WINDOWS + PROBES {
-            step(&mut floor, 8, 800.0, AR);
-        }
-        assert!(floor.retired(), "100 µs per token loses to 25: retired");
-        // A low-yield request that wins once priced keeps speculating.
-        let mut floor = FixedFloor::fixed(PROBES);
-        for _ in 0..FLOOR_PROBE_WINDOWS {
-            step(&mut floor, 2, 40.0, AR);
+            assert_eq!(step(&mut floor, 8), native());
         }
         for _ in 0..PROBES {
-            ar(&mut floor, Action::ArSynced, AR);
+            assert_eq!(step(&mut floor, 1), Action::ArSynced);
         }
-        assert!(floor.calibrated() && !floor.retired());
-        assert_eq!(floor.plan_fixed(WIDTH), native());
-        // No priced probe: no AR price, which retires.
-        let mut floor = FixedFloor::fixed(1);
-        for _ in 0..FLOOR_PROBE_WINDOWS {
-            step(&mut floor, 1, 40.0, AR);
+        // Still unpriced: windows run, no second probe, no verdict.
+        for _ in 0..100 {
+            assert_eq!(step(&mut floor, 1), native());
         }
-        assert_eq!(step(&mut floor, 1, 40.0, AR), Action::ArSynced);
-        assert!(floor.calibrated() && !floor.retired());
-        for _ in FLOOR_PROBE_WINDOWS..FIXED_MIN_PRICED_WINDOWS {
-            step(&mut floor, 1, 40.0, AR);
+        assert!(!floor.retired());
+        // A probe of 0 tokens never runs one.
+        let mut floor = FixedFloor::fixed(0);
+        for _ in 0..50 {
+            assert_eq!(step(&mut floor, 1), native());
         }
-        assert!(floor.retired());
     }
 
     #[test]
-    fn no_verdict_before_the_probe_windows_and_the_probe_set_is_bounded() {
-        let mut floor = calibrated(PROBES);
-        // Losing windows: no verdict inside the epoch's first windows.
-        for _ in 0..FIXED_MIN_PRICED_WINDOWS - 1 {
-            assert_eq!(step(&mut floor, 1, 500.0, AR), native());
-            assert!(!floor.retired() && !floor.needs_ar_sample());
-        }
-        assert_eq!(step(&mut floor, 1, 500.0, AR), native());
-        // The losing verdict re-prices AR first: exactly PROBES AR tokens.
-        let mut probes = 0;
-        while floor.plan_fixed(WIDTH) == Action::ArSynced {
-            ar(&mut floor, Action::ArSynced, AR);
-            probes += 1;
-            assert!(probes <= PROBES, "probe set exceeds probe_tokens");
-        }
-        assert_eq!(probes, PROBES);
-        assert!(floor.retired(), "still losing after the re-price: retired");
-        assert_eq!(floor.plan_fixed(WIDTH), Action::ArHeadFree);
-    }
-
-    #[test]
-    fn probes_reprice_ar_by_the_mean_of_the_priced_tokens() {
-        let mut floor = calibrated(PROBES);
-        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
-            step(&mut floor, 1, 30.0, AR);
-        }
-        // 30 µs per token loses to 25 × 1.03; the first probe follows a
-        // window and is unpriced, the other three re-price AR at 40.
-        let prices = [1_000.0, 40.0, 40.0, 40.0];
-        for us in prices {
-            assert_eq!(floor.plan_fixed(WIDTH), Action::ArSynced);
-            ar(&mut floor, Action::ArSynced, us);
-        }
-        assert_eq!(floor.ar_us(), 40.0);
-        assert!(
-            !floor.retired(),
-            "speculation wins against the re-priced AR"
-        );
-        assert_eq!(floor.plan_fixed(WIDTH), native());
-        // A later losing verdict inside the next probe-window span retires
-        // without a second probe set.
-        step(&mut floor, 1, 400.0, AR);
-        assert!(floor.retired());
-    }
-
-    #[test]
-    fn a_tie_and_the_hysteresis_band_keep_speculating() {
-        for per_token in [AR, AR * 1.02] {
-            let mut floor = calibrated(0);
-            for _ in 0..20 {
-                assert_eq!(step(&mut floor, 4, 4.0 * per_token, AR), native());
-            }
-            assert!(!floor.retired(), "{per_token} µs per token must not retire");
-        }
-        let mut floor = calibrated(0);
-        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
-            step(&mut floor, 4, 4.0 * AR * 1.04, AR);
-        }
-        assert!(floor.retired(), "above the band retires");
-    }
-
-    #[test]
-    fn invalid_timings() {
-        // An invalid AR price retires at the first verdict, never before.
+    fn counts_before_the_pin_are_judged_from_the_next_checkpoint() {
+        // XTX `mq3-xt` loser, unpriced: no verdict at 3 (4 tokens would
+        // retire there when priced); the low yield starts the probe.
         let mut floor = FixedFloor::fixed(PROBES);
-        floor.calibrate_from(f32::NAN);
-        assert_eq!(floor.ar_us(), 0.0);
-        for i in 0..FIXED_MIN_PRICED_WINDOWS {
-            assert!(!floor.retired(), "window {i}");
-            step(&mut floor, 8, 10.0, AR);
+        assert_eq!(retired_at(&mut floor, &[1, 1, 2]), None);
+        assert!(floor.needs_ar_sample(), "the probe is running");
+        for _ in 0..PROBES {
+            assert_eq!(step(&mut floor, 1), Action::ArSynced);
         }
-        assert!(floor.retired());
-        // Unusable window timings count toward the epoch but price nothing:
-        // no evidence, no retirement.
-        let mut floor = calibrated(PROBES);
-        for _ in 0..10 {
-            step(&mut floor, 1, f32::INFINITY, AR);
-            step(&mut floor, 1, -1.0, AR);
+        // The pin lands; the 8-window checkpoint judges all 8 windows.
+        floor.pin_fixed(&xtx_mq3());
+        assert!(floor.calibrated());
+        assert_eq!(retired_at(&mut floor, &[2, 2, 3, 2, 3]), Some(5));
+        let checkpoint = floor.fixed_checkpoints().next().unwrap();
+        assert_eq!((checkpoint.windows, checkpoint.settled), (8, 16));
+        // An invalid AR price leaves the floor unpriced.
+        let mut floor = FixedFloor::fixed(0);
+        floor.pin_fixed(&prices(f32::NAN, 76_000.0));
+        assert!(!floor.calibrated());
+        assert_eq!(floor.fixed_break_even(FULL), None);
+        assert_eq!(retired_at(&mut floor, &[1; 64]), None);
+    }
+
+    #[test]
+    fn row_counts_without_a_pinned_price_take_the_full_block() {
+        let mut rows = [0.0; LOAD_PRICE_WINDOW_ROWS + 1];
+        rows[FULL] = 200.0;
+        rows[4] = 120.0;
+        let mut floor = pinned(&PinnedPrices {
+            ar_us: 100.0,
+            window_us: rows,
+            full_rows: FULL,
+        });
+        assert_eq!(floor.fixed_break_even(FULL), Some(2.0));
+        assert_eq!(floor.fixed_break_even(4), Some(1.2));
+        assert_eq!(floor.fixed_break_even(7), Some(2.0));
+        assert_eq!(floor.fixed_break_even(40), Some(2.0));
+        // Narrow 4-row windows at b = 1.2 settling 1 token: Σb 9.6 vs 8
+        // tokens at 8 windows, line 9.6 − 1.28 × sqrt(1.92) = 7.83: keep.
+        for _ in 0..8 {
+            floor.observe_fixed(FloorObservation {
+                action: Action::Native(3),
+                settled: 1,
+                rows: 4,
+            });
         }
         assert!(!floor.retired());
-        assert_eq!(floor.fixed_spec_us_per_token(), None);
+        let checkpoint = floor.fixed_checkpoints().next().unwrap();
+        let (sum, line) = checkpoint.priced.unwrap();
+        assert!((sum - 9.6).abs() < 1e-12);
+        assert!((line - (9.6 - 1.28 * 1.92f64.sqrt())).abs() < 1e-12);
     }
 
     #[test]
-    fn a_truncated_window_keeps_its_full_cost() {
-        let mut floor = calibrated(0);
-        // Windows of 4 tokens at 20 µs (80 µs) win; one settling nothing
-        // costs 2,000 µs: about 90 µs per token on both memories, a loss.
-        for _ in 1..FIXED_MIN_PRICED_WINDOWS {
-            step(&mut floor, 4, 80.0, AR);
-        }
-        step(&mut floor, 0, 2_000.0, AR);
-        assert!(floor.retired());
-        let mut floor = calibrated(0);
-        for _ in 0..FIXED_MIN_PRICED_WINDOWS {
-            step(&mut floor, 4, 80.0, AR);
-        }
-        assert!(!floor.retired());
-    }
-
-    #[test]
-    fn scout_cadence_and_charge() {
-        let mut floor = retired();
-        // Charge: max(200 − 4 × 25, 0) + 25 = 125 µs; each priced AR token
-        // saves 0.02 × 25 = 0.5 µs, so 250 priced tokens. The first AR token
-        // after the window is unpriced.
-        let mut tokens = 0;
-        while step(&mut floor, 4, 200.0, AR) == Action::ArHeadFree {
-            tokens += 1;
-            assert!(tokens <= 251, "no scout after {tokens} AR tokens");
-        }
-        assert_eq!(tokens, 251);
-        assert_eq!(floor.ar_us(), AR, "retired AR tokens keep re-pricing AR");
-        // The scout (200 µs for 4) lost: charged exactly, back on AR.
-        assert!(floor.retired());
-        assert_eq!(floor.fixed.allowance, 0.0);
-        assert_eq!(floor.plan_fixed(WIDTH), Action::ArHeadFree);
-    }
-
-    #[test]
-    fn scout_win_starts_a_new_epoch() {
-        let mut floor = retired();
-        floor.fixed.allowance = 1_000.0;
-        assert_eq!(floor.plan_fixed(WIDTH), native());
-        assert!(floor.fixed_scouting());
-        // 40 µs for 4 tokens: 10 µs per token, below 25 × 0.97.
-        window(&mut floor, 4, 40.0);
-        assert!(!floor.retired() && !floor.fixed_scouting());
-        assert_eq!(floor.probes, 1, "the scout is the epoch's first window");
-        assert_eq!(floor.plan_fixed(WIDTH), native());
-        // A scout inside the band does not re-arm.
-        let mut floor = retired();
-        floor.fixed.allowance = 1_000.0;
-        assert_eq!(floor.plan_fixed(WIDTH), native());
-        window(&mut floor, 4, 4.0 * AR * 0.98);
-        assert!(floor.retired());
-        assert_eq!(
-            floor.fixed.allowance,
-            1_000.0 - (98.0 - 100.0f32).max(0.0) - AR
-        );
-    }
-
-    #[test]
-    fn allowance_never_goes_negative() {
-        let mut floor = retired();
-        floor.fixed.allowance = 130.0;
-        assert_eq!(floor.plan_fixed(WIDTH), native());
-        window(&mut floor, 1, 10_000.0);
-        assert_eq!(floor.fixed.allowance, 0.0);
-        floor.fixed.allowance = 20_000.0;
-        assert_eq!(floor.plan_fixed(WIDTH), native());
-        window(&mut floor, 1, f32::NAN);
-        assert_eq!(
-            floor.fixed.allowance, 0.0,
-            "an unpriced scout spends it all"
-        );
-        assert!(floor.retired());
-    }
-
-    #[test]
-    fn rearm_un_retires_and_restarts_the_epoch_keeping_the_ar_price() {
-        let mut floor = retired();
+    fn rearm_un_retires_and_restarts_the_epoch_keeping_the_pin() {
+        let mut floor = pinned(&b2());
+        assert_eq!(retired_at(&mut floor, &[1; 8]), Some(8));
         floor.rearm_fixed();
-        assert!(!floor.retired());
-        assert_eq!(floor.ar_us(), AR);
-        assert_eq!(floor.fixed_spec_us_per_token(), None);
-        for _ in 0..FIXED_MIN_PRICED_WINDOWS - 1 {
-            step(&mut floor, 1, 500.0, AR);
-            assert!(!floor.retired());
-        }
+        assert!(!floor.retired() && floor.calibrated());
+        assert_eq!(floor.fixed_reentry_left(), 0);
+        // A fresh epoch: the 1-token windows retire again only at 8.
+        assert_eq!(retired_at(&mut floor, &[1; 8]), Some(8));
     }
 
     #[test]
     fn plan_returns_only_ar_or_the_given_width() {
         let mut floor = FixedFloor::fixed(PROBES);
         let mut seen = Vec::new();
-        for i in 0..400 {
+        for i in 0..2_000 {
+            if i == 40 {
+                floor.pin_fixed(&b2());
+            }
             let width = 1 + i % 15;
             let action = floor.plan_fixed(width);
             match action {
                 Action::Native(w) => {
                     assert_eq!(w, width);
-                    window(&mut floor, i % 5, 30.0 + (i % 7) as f32 * 40.0);
+                    floor.observe_fixed(FloorObservation {
+                        action,
+                        settled: i % 3,
+                        rows: width + 1,
+                    });
                 }
-                Action::ArSynced | Action::ArHeadFree => {
-                    ar(&mut floor, action, 20.0 + (i % 3) as f32)
-                }
+                Action::ArSynced | Action::ArHeadFree => ar(&mut floor, action),
                 Action::Interleaved => panic!("Interleaved"),
             }
             seen.push(action);
@@ -10204,34 +10211,35 @@ mod fixed_floor_tests {
         assert!(seen.contains(&Action::ArHeadFree) && seen.contains(&Action::ArSynced));
     }
 
-    /// The counts of a scripted request driven by a price snapshot: every
-    /// window observed at `window_us`, every AR token at `ar_us`.
-    fn price_clock(ar_us: f32, window_us: f32, settled: &[usize]) -> Vec<Action> {
-        let mut floor = FixedFloor::fixed(0);
-        floor.calibrate_from(ar_us);
-        let mut actions = Vec::new();
-        for &s in settled.iter().cycle().take(600) {
-            actions.push(step(&mut floor, s, window_us, ar_us));
-        }
-        actions
-    }
-
     #[test]
-    fn price_clock_is_a_pure_function_of_counts_and_the_snapshot() {
+    fn decisions_are_a_pure_function_of_counts_and_the_pin() {
         let counts = [1, 2, 1, 3, 1, 1, 6, 1, 2];
-        let a = price_clock(20_000.0, 75_000.0, &counts);
-        let b = price_clock(20_000.0, 75_000.0, &counts);
-        assert_eq!(a, b);
+        let run = |prices: &PinnedPrices| {
+            let mut floor = pinned(prices);
+            counts
+                .iter()
+                .cycle()
+                .take(1_500)
+                .map(|&s| step(&mut floor, s))
+                .collect::<Vec<_>>()
+        };
+        let a = run(&prices(20_000.0, 75_000.0));
+        assert_eq!(a, run(&prices(20_000.0, 75_000.0)));
         assert!(
             a.contains(&Action::ArHeadFree),
-            "the snapshot loses: retires"
+            "b 3.75 at 2 per window retires"
         );
         assert!(
-            a.iter().skip(10).any(|&action| action == native()),
-            "scouts keep running"
+            a.iter()
+                .skip_while(|&&x| x == native())
+                .any(|&x| x == native()),
+            "re-entry epochs run"
         );
-        let c = price_clock(40_000.0, 75_000.0, &counts);
-        assert_ne!(a, c, "a different snapshot decides differently");
+        assert_ne!(
+            a,
+            run(&prices(40_000.0, 75_000.0)),
+            "a different pin decides differently"
+        );
     }
 
     thread_local! {
@@ -10247,40 +10255,50 @@ mod fixed_floor_tests {
         const PREFIX: &str = "QWEN35_DFLASH_FLOOR_CALL";
         FIXED_LOGGED.with(|lines| lines.borrow_mut().clear());
         let mut floor = FixedFloor::fixed(PROBES).with_call_log_to(PREFIX, "unit", true, capture);
+        // Unpriced with a probe, pinned mid-request, retirement, re-entry, a
+        // re-arm; a second request pinned from the start with odd prices.
         floor.reset_fixed(PROBES);
-        // Own calibration, losing windows, probes, retirement, scouts, a
-        // re-arm, a second request priced from the load.
-        for i in 0..300 {
-            let us = if i % 11 == 0 {
-                f32::NAN
-            } else {
-                20.0 + (i % 9) as f32 * 9.0
-            };
-            step(&mut floor, i % 4, 60.0 + (i % 13) as f32 * 7.5, us);
-            if i == 150 {
+        for i in 0..900 {
+            if i == 20 {
+                floor.pin_fixed(&b2());
+            }
+            step(&mut floor, i % 4);
+            if i == 450 {
                 floor.rearm_fixed();
             }
         }
         floor.reset_fixed(PROBES);
-        floor.calibrate_from(22.5);
-        floor.set_fixed_carry(true);
-        for i in 0..200 {
-            step(&mut floor, 1 + i % 3, 70.0, 22.5);
+        let mut odd = prices(17_450.5, 76_000.25);
+        odd.window_us[3] = 21_333.3;
+        floor.pin_fixed(&odd);
+        for i in 0..400 {
+            let action = floor.plan_fixed(WIDTH);
+            match action {
+                Action::Native(_) => floor.observe_fixed(FloorObservation {
+                    action,
+                    settled: 1 + i % 3,
+                    rows: if i % 5 == 0 { 3 } else { FULL },
+                }),
+                _ => ar(&mut floor, action),
+            }
         }
         let lines = FIXED_LOGGED.with(|lines| std::mem::take(&mut *lines.borrow_mut()));
         for op in [
             "\"op\":\"reset_fixed\"",
-            "\"op\":\"calibrate_from\"",
+            "\"op\":\"pin_fixed\"",
             "\"op\":\"plan_fixed\"",
             "\"op\":\"observe_fixed\"",
             "\"op\":\"rearm_fixed\"",
-            "\"op\":\"set_fixed_carry\"",
             "\"ret\":\"Ar\"",
             "\"ret\":\"ArSample\"",
             "\"ret\":\"Batched:15\"",
         ] {
             assert!(lines.iter().any(|l| l.contains(op)), "no {op} line");
         }
+        assert!(
+            !lines.iter().any(|l| l.contains("\"us\"")),
+            "no wall time reaches the floor"
+        );
         let report = replay_call_log::<1, 1>(lines.iter().map(String::as_str), PREFIX, [1.0]);
         assert_eq!(report.malformed, 0, "{:?}", report.first_malformed);
         assert_eq!(report.orphan_calls, 0);
@@ -10292,59 +10310,5 @@ mod fixed_floor_tests {
             "{:?}",
             report.floors[0].first_mismatch
         );
-    }
-
-    /// Actions of `steps` planned windows, each settling `settled(i)` tokens
-    /// in `us(i)`, with AR at [`AR`].
-    fn schedule(
-        carry: bool,
-        steps: usize,
-        settled: impl Fn(usize) -> usize,
-        us: impl Fn(usize) -> f32,
-    ) -> Vec<Action> {
-        let mut floor = calibrated(0);
-        floor.set_fixed_carry(carry);
-        (0..steps)
-            .map(|i| step(&mut floor, settled(i), us(i), AR))
-            .collect()
-    }
-
-    #[test]
-    fn carry_retires_a_losing_request_after_the_probe_windows() {
-        let mut floor = calibrated(0);
-        floor.set_fixed_carry(true);
-        for _ in 0..FLOOR_PROBE_WINDOWS - 1 {
-            assert_eq!(step(&mut floor, 4, 200.0, AR), native());
-            assert!(!floor.retired());
-        }
-        assert_eq!(step(&mut floor, 4, 200.0, AR), native());
-        assert!(
-            floor.retired(),
-            "3 fresh losing windows retire under the carry"
-        );
-        // Without the carry the same windows wait for the full minimum.
-        let plain = schedule(false, FIXED_MIN_PRICED_WINDOWS + 1, |_| 4, |_| 200.0);
-        assert_eq!(plain[..FIXED_MIN_PRICED_WINDOWS], [native(); 8]);
-        assert_eq!(plain[FIXED_MIN_PRICED_WINDOWS], Action::ArHeadFree);
-    }
-
-    #[test]
-    fn carry_with_winning_fresh_windows_changes_nothing() {
-        // 4 tokens per 80 µs (20 per token against 25): never retires.
-        let with = schedule(true, 64, |_| 4, |_| 80.0);
-        assert_eq!(with, schedule(false, 64, |_| 4, |_| 80.0));
-        assert!(with.iter().all(|&a| a == native()));
-    }
-
-    #[test]
-    fn carry_whose_first_windows_win_falls_back_to_the_full_minimum() {
-        // Three winning windows, then losing ones: the carry is spent on the
-        // non-losing verdict at window 3, so the schedule equals the plain
-        // 8-window one.
-        let us = |i: usize| if i < FLOOR_PROBE_WINDOWS { 80.0 } else { 400.0 };
-        let with = schedule(true, 40, |_| 4, us);
-        assert_eq!(with, schedule(false, 40, |_| 4, us));
-        let first_ar = with.iter().position(|&a| a != native());
-        assert!(first_ar.is_some_and(|at| at >= FIXED_MIN_PRICED_WINDOWS));
     }
 }

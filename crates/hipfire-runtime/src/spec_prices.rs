@@ -15,11 +15,13 @@
 //! context buckets are its [`PRICE_BUCKET_EDGES`]; `spec_lookup`'s
 //! `LookupPriceBook` uses the same cell.
 //!
-//! Precedence of the prices a qwen35 DFlash request decides on, highest
-//! first: `HIPFIRE_SPEC_RETIRE` set (the count path) → in-request floor
-//! evidence (unseeded) → [`LoadPrices`] (seeds the floor's AR price; pins a
-//! seeded request's prices) → the drafter's `retire_break_even()` →
-//! `DEFAULT_BREAK_EVEN`.
+//! Wall time reaches a qwen35 DFlash request's speculate-vs-AR decision only
+//! through these cells: the floor decides on token counts and a bucket's
+//! [`PinnedPrices`]. Precedence, highest first: `HIPFIRE_SPEC_RETIRE` set
+//! (the count path) → the pinned prices of the request's start bucket,
+//! seeded or not → a seeded request without a pin: the drafter's
+//! `retire_break_even()`, else `DEFAULT_BREAK_EVEN` → an unseeded request
+//! without a pin: no verdict until a pin lands.
 
 /// Samples kept per price cell (median of the last `PRICE_WINDOW`).
 pub const PRICE_WINDOW: usize = 8;
@@ -30,9 +32,12 @@ pub const PRICE_BUCKETS: usize = PRICE_BUCKET_EDGES.len() + 1;
 /// Widest speculative window [`LoadPrices`] prices, in verified rows (seed
 /// included): the widest DFlash block.
 pub const LOAD_PRICE_WINDOW_ROWS: usize = 16;
-/// Kept samples the AR cell and the full-block window cell of a bucket both
-/// need before that bucket's [`PinnedPrices`] freeze.
-pub const PIN_MIN_SAMPLES: usize = 4;
+/// Kept AR samples a bucket needs before its [`PinnedPrices`] freeze.
+pub const PIN_MIN_AR_SAMPLES: usize = 4;
+/// Kept full-block window samples a bucket needs before its
+/// [`PinnedPrices`] freeze (a full cell: the window's settled count is the
+/// noisier side of a fixed-window floor's break-even).
+pub const PIN_MIN_WINDOW_SAMPLES: usize = PRICE_WINDOW;
 
 /// Context bucket of absolute position `ctx`.
 pub fn price_bucket(ctx: usize) -> usize {
@@ -177,8 +182,9 @@ impl LoadPrices {
     }
 
     /// One settled AR token of `us` at position `ctx`. The caller records
-    /// only an AR token whose previous action was also AR (no capture or
-    /// re-capture cost), so the AR cell keeps every sample.
+    /// only the third and later AR tokens of a run (the first two after a
+    /// speculative window still pay capture or graph re-capture), so the AR
+    /// cell keeps every sample.
     pub fn record_ar(&mut self, ctx: usize, us: f32) {
         if !(us.is_finite() && us > 0.0) {
             return;
@@ -202,8 +208,8 @@ impl LoadPrices {
 
     fn try_pin(&mut self, bucket: usize) {
         if self.pinned[bucket].is_some()
-            || self.ar[bucket].kept() < PIN_MIN_SAMPLES
-            || self.window[self.full_rows][bucket].kept() < PIN_MIN_SAMPLES
+            || self.ar[bucket].kept() < PIN_MIN_AR_SAMPLES
+            || self.window[self.full_rows][bucket].kept() < PIN_MIN_WINDOW_SAMPLES
         {
             return;
         }
@@ -299,10 +305,10 @@ mod tests {
     fn route_key_change_clears_ar_and_pinned_but_not_windows() {
         let mut prices = LoadPrices::new(16);
         assert!(!prices.set_route(ArRouteKey::new(1, true)));
-        for _ in 0..PIN_MIN_SAMPLES {
+        for _ in 0..PIN_MIN_AR_SAMPLES {
             prices.record_ar(100, 20_000.0);
         }
-        for _ in 0..=PIN_MIN_SAMPLES {
+        for _ in 0..=PIN_MIN_WINDOW_SAMPLES {
             prices.record_window(16, 100, 70_000.0);
         }
         assert!(prices.pinned(100).is_some());
@@ -316,13 +322,30 @@ mod tests {
     }
 
     #[test]
+    fn pin_needs_4_ar_and_8_full_block_window_samples() {
+        let mut prices = LoadPrices::new(16);
+        prices.set_route(ArRouteKey::new(2, true));
+        for _ in 0..PIN_MIN_AR_SAMPLES {
+            prices.record_ar(10, 20_000.0);
+        }
+        // The window cell discards its first observation: 1 + 7 kept.
+        for _ in 0..PIN_MIN_WINDOW_SAMPLES {
+            prices.record_window(16, 10, 80_000.0);
+        }
+        assert!(prices.pinned(10).is_none(), "7 kept window samples");
+        prices.record_window(16, 10, 80_000.0);
+        assert_eq!(PIN_MIN_WINDOW_SAMPLES, 8);
+        assert!(prices.pinned(10).is_some(), "8 kept window samples");
+    }
+
+    #[test]
     fn pin_freezes_once_and_falls_back_to_the_full_block() {
         let mut prices = LoadPrices::new(16);
         prices.set_route(ArRouteKey::new(0, false));
-        for _ in 0..PIN_MIN_SAMPLES - 1 {
+        for _ in 0..PIN_MIN_AR_SAMPLES - 1 {
             prices.record_ar(10, 20_000.0);
         }
-        for _ in 0..=PIN_MIN_SAMPLES {
+        for _ in 0..=PIN_MIN_WINDOW_SAMPLES {
             prices.record_window(16, 10, 80_000.0);
         }
         assert!(prices.pinned(10).is_none(), "AR cell short of samples");
