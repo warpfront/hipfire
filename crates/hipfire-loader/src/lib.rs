@@ -1166,6 +1166,17 @@ pub fn gemma4_eagle_spec_len(spec: Option<u64>) -> Result<usize, String> {
     }
 }
 
+/// A speculative request's terminal pending seed whose one-token forward is
+/// deferred to the next consumer of the live state (see
+/// [`LoadedModel::spec_deferred_seed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeferredSpecSeed {
+    /// The seed token (the request's last emitted token).
+    pub token: u32,
+    /// The position it is fed at; `seq_pos` is `position + 1` while deferred.
+    pub position: usize,
+}
+
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
 pub struct LoadedModel {
@@ -1237,6 +1248,13 @@ pub struct LoadedModel {
     /// `dflash: Option<DflashState>` field — the `DflashState` now lives inside
     /// the `DflashSpeculator` impl behind this trait object.
     pub speculator: Option<Box<dyn Speculator>>,
+    /// The terminal pending seed of the last speculative request, emitted and
+    /// counted in `seq_pos` / `conversation_tokens` but not yet fed to the
+    /// target and drafter (`hipfire_generate::qwen::generate_spec` defers that
+    /// one-token forward for a resident single-card Qwen3.5 target). The next
+    /// consumer of the live state feeds it first, unchanged; a cold prefill
+    /// drops it unfed. `None` whenever device state matches the host record.
+    pub spec_deferred_seed: Option<DeferredSpecSeed>,
     pub chat_template: Option<String>,
     /// Where `chat_template` came from after override/embedded/fallback
     /// selection (`None` iff `chat_template` is `None`): human-readable,
@@ -1298,6 +1316,7 @@ impl LoadedModel {
             decoded_vocab: None,
             model_path,
             speculator: None,
+            spec_deferred_seed: None,
             chat_template,
             chat_template_source,
             rec_temperature: None,

@@ -192,6 +192,9 @@ pub fn production_fail_closed_rollback(
     slot: Option<&mut dyn SpecTarget>,
     spec: Option<&mut dyn Speculator>,
 ) -> RollbackEpilogue {
+    // The reset below discards the live state, so a deferred terminal seed
+    // (`LoadedModel::spec_deferred_seed`) is dropped unfed.
+    m.spec_deferred_seed = None;
     if slot.is_none() && spec.is_none() {
         if let Some(epilogue) = qwen4_pp_rollback(m) {
             return epilogue;
@@ -417,6 +420,8 @@ pub fn production_cancel_epilogue(
     gpu: &mut rdna_compute::Gpu,
     eligible: bool,
 ) -> RollbackEpilogue {
+    // A kept prefix includes a deferred terminal seed: feed it first.
+    crate::qwen::settle_deferred_spec_seed(m, gpu);
     if let CancelDisposition::KeepCommitted { len } =
         cancel_disposition(eligible, Some(m.conversation_tokens.len()), m.seq_pos)
     {

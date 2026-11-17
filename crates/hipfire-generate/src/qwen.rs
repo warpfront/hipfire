@@ -3644,6 +3644,8 @@ pub fn generate_dflash(
                 spec_ctx_capacity
             ),
         );
+        // The AR body below continues the live state.
+        settle_deferred_spec_seed(m, gpu);
         return false;
     }
 
@@ -3785,6 +3787,18 @@ pub fn generate_dflash(
         Some(p) => p.rendered.clone(),
         None => prompt_tokens,
     };
+    // The previous turn's deferred terminal seed (`LoadedModel::spec_deferred_seed`):
+    // a cold prefill resets the state the seed extends, so it is dropped unfed
+    // and this prefill never waits for its forward; every reuse of the live
+    // state (prefix hit, checkpoint resume, session plan) feeds it first,
+    // before this request configures the speculator. A failed feed resets the
+    // live state, and the plan below then falls back to a cold prefill.
+    let live_state_survived = if session_reuse || cache_plan.as_ref().is_some_and(|p| p.cache_hit) {
+        settle_deferred_spec_seed(m, gpu)
+    } else {
+        drop_deferred_spec_seed(m);
+        true
+    };
     // The next user turn's re-render diverges right after this prompt's assistant
     // opener when the prompt is user-terminated: tell the speculator so its prefill
     // snapshots the recurrent state there (and keeps it through tool-result turns).
@@ -3817,8 +3831,11 @@ pub fn generate_dflash(
     // A speculator that resumes from the target's session cache plans against
     // the full canonical prompt: the deepest reuse point (live state of this
     // conversation's previous turn, or a cold-exact snapshot) it can resume.
+    // None survives a failed seed feed.
     let spec_session = match (m.state.as_deref(), m.speculator.as_deref()) {
-        (Some(model), Some(spec)) => plan_spec_session(model, spec, &prompt_tokens),
+        (Some(model), Some(spec)) if live_state_survived => {
+            plan_spec_session(model, spec, &prompt_tokens)
+        }
         _ => None,
     };
     if let Some((route, start)) = spec_session {
@@ -3852,6 +3869,20 @@ pub fn generate_dflash(
     } else {
         cache_plan.as_ref().and_then(|p| p.resume_from)
     };
+    let SpecPrefillPlan {
+        tokens: prefill_tokens,
+        start: prefill_start,
+        cache_hit,
+        cached_tokens: cached_tokens_dflash,
+        resume_from,
+    } = SpecPrefillPlan {
+        tokens: prefill_tokens,
+        start: prefill_start,
+        cache_hit,
+        cached_tokens: cached_tokens_dflash,
+        resume_from,
+    }
+    .unless_live_state_lost(live_state_survived, &prompt_tokens);
 
     // ── Grammar-guided decoding setup (dflash path) ─────────────
     //
@@ -4397,6 +4428,26 @@ pub fn generate_spec(
         return None;
     }
 
+    // Feed any terminal seed the previous request deferred before this one
+    // touches the live state (`generate_dflash` has already fed or dropped it
+    // on its own route; this covers every other caller). A failed feed resets
+    // the live state, so the request falls back to a cold prefill.
+    let live_state_survived = settle_deferred_spec_seed(m, gpu);
+    let SpecPrefillPlan {
+        tokens: prefill_tokens,
+        start: prefill_start,
+        cache_hit,
+        resume_from,
+        ..
+    } = SpecPrefillPlan {
+        tokens: prefill_tokens,
+        start: prefill_start,
+        cache_hit,
+        cached_tokens: prefill_start,
+        resume_from,
+    }
+    .unless_live_state_lost(live_state_survived, &prompt_tokens);
+
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // Acquire the target via the RAII slot guard — it restores the bundle into
@@ -4435,6 +4486,9 @@ pub fn generate_spec(
     let arch_id = m.arch_id;
     // Read before the slot guard takes `m.state`.
     let qwen4_target = m.qwen4().is_some();
+    // A resident single-card Qwen3.5 target defers the terminal pending-seed
+    // forward to the next consumer of its state (`LoadedModel::spec_deferred_seed`).
+    let defer_terminal_flush = m.pp <= 1 && m.qwen35().is_some();
     let carrier = match hipfire_loader::carrier_for(arch_id) {
         Some(c) => c,
         None => {
@@ -5733,6 +5787,14 @@ pub fn generate_spec(
     // seed is intentionally non-committable (DS4 empty-event EOS — position
     // still reflects already-processed prior seeds/drafts; no GPU forward /
     // history bake of the terminator). Cancel/error already returned above.
+    //
+    // A resident single-card Qwen3.5 target defers that forward instead
+    // (`LoadedModel::spec_deferred_seed`): the host record advances past the
+    // seed as if it were fed, and the next consumer of the live state feeds it
+    // (the same one-token forced advance at the same position) or, on a cold
+    // prefill, drops it. Fed here, the forward was still running when the next
+    // request arrived, and that request's prefill waited for it (~25 ms of
+    // warm TTFT on a 27B target) even when it then reset the state.
     if spec_should_flush_pending_seed(grammar_violated, pending_seed_committable) {
         let tx = spec_terminal_pending_seed_tx(seed_token);
         if check_abort(id) {
@@ -5758,71 +5820,79 @@ pub fn generate_spec(
             drop(guard);
             return None;
         }
-        let abort_latched = std::cell::Cell::new(false);
-        let abort_cb = || {
-            if check_abort(id) {
-                abort_latched.set(true);
-                true
-            } else {
-                false
-            }
-        };
-        let flush_res = match spec_forced_advance(
-            pp.as_deref_mut(),
-            gpu,
-            spec.as_mut(),
-            slot,
-            &tx.commit,
-            position,
-            &abort_cb,
-        ) {
-            Ok(true) => Ok(()),
-            Ok(false) => match slot.spec_advance(gpu, &tx.commit, position, false, &abort_cb, None)
-            {
-                Ok(SpecAdvance::Ready { .. }) => Ok(()),
-                Ok(SpecAdvance::Aborted) => {
+        if defer_terminal_flush && pp.is_none() {
+            m.spec_deferred_seed = Some(hipfire_loader::DeferredSpecSeed {
+                token: seed_token,
+                position,
+            });
+        } else {
+            let abort_latched = std::cell::Cell::new(false);
+            let abort_cb = || {
+                if check_abort(id) {
                     abort_latched.set(true);
-                    Ok(())
+                    true
+                } else {
+                    false
+                }
+            };
+            let flush_res = match spec_forced_advance(
+                pp.as_deref_mut(),
+                gpu,
+                spec.as_mut(),
+                slot,
+                &tx.commit,
+                position,
+                &abort_cb,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    match slot.spec_advance(gpu, &tx.commit, position, false, &abort_cb, None) {
+                        Ok(SpecAdvance::Ready { .. }) => Ok(()),
+                        Ok(SpecAdvance::Aborted) => {
+                            abort_latched.set(true);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 Err(e) => Err(e),
-            },
-            Err(e) => Err(e),
-        };
-        if let Err(e) = flush_res {
-            let ep = spec_rollback_live(
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                gpu,
-                pp.as_deref_mut(),
-                slot,
-                spec.as_mut(),
-            );
-            emit_spec_failure_terminal(stdout, id, "forced", &e.to_string(), &ep);
-            drop(guard);
-            return None;
-        }
-        let abort_observed = abort_latched.get() || check_abort(id);
-        if matches!(
-            classify_forced_gpu_advance(abort_observed),
-            ForcedGpuAdvanceKind::Cancelled
-        ) {
-            let ep = spec_rollback_live(
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                gpu,
-                pp.as_deref_mut(),
-                slot,
-                spec.as_mut(),
-            );
-            emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-            drop(guard);
-            return None;
+            };
+            if let Err(e) = flush_res {
+                let ep = spec_rollback_live(
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                    pp.as_deref_mut(),
+                    slot,
+                    spec.as_mut(),
+                );
+                emit_spec_failure_terminal(stdout, id, "forced", &e.to_string(), &ep);
+                drop(guard);
+                return None;
+            }
+            let abort_observed = abort_latched.get() || check_abort(id);
+            if matches!(
+                classify_forced_gpu_advance(abort_observed),
+                ForcedGpuAdvanceKind::Cancelled
+            ) {
+                let ep = spec_rollback_live(
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                    &mut m.dflash_checkpoints,
+                    &mut m.asst_turn_cache,
+                    gpu,
+                    pp.as_deref_mut(),
+                    slot,
+                    spec.as_mut(),
+                );
+                emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+                drop(guard);
+                return None;
+            }
         }
         position = position.saturating_add(tx.position_delta);
         // seed_token remains the flushed token; no further unprocessed seed.
@@ -10946,6 +11016,101 @@ fn spec_cancel_keeps_committed_prefix(m: &LoadedModel) -> bool {
         && m.qwen35().is_some_and(|b| b.kv_cache.compact_offset == 0)
 }
 
+/// Feed the terminal pending seed the last speculative request deferred
+/// ([`LoadedModel::spec_deferred_seed`]): the one-token forced advance its
+/// epilogue would have run, at the same position, so target and drafter end
+/// exactly where an immediate flush leaves them. No-op without a deferred
+/// seed. Every consumer of the live state other than a cold prefill calls this
+/// first.
+///
+/// Returns whether the live state survived. A failed advance takes the
+/// fail-closed reset (target, drafter and host record back to position 0), and
+/// this returns `false`: a caller that already planned to reuse the live state
+/// must replan a cold prefill ([`SpecPrefillPlan::unless_live_state_lost`])
+/// rather than prefill a suffix onto the reset state.
+pub fn settle_deferred_spec_seed(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> bool {
+    let Some(seed) = m.spec_deferred_seed.take() else {
+        return true;
+    };
+    if let Err(e) = feed_deferred_spec_seed(m, gpu, seed) {
+        eprintln!(
+            "[spec-deferred-seed] feeding token {} at position {} failed: {e}; resetting the conversation",
+            seed.token, seed.position
+        );
+        let _ = production_fail_closed_rollback(m, gpu, None, None);
+        return false;
+    }
+    true
+}
+
+/// The prefill a speculative request plans against the live state: the tokens
+/// to prefill from `start`, whether that reuses the live state, how many
+/// prompt tokens it reuses, and the checkpoint it resumes from.
+#[derive(Debug, PartialEq, Eq)]
+struct SpecPrefillPlan {
+    tokens: Vec<u32>,
+    start: usize,
+    cache_hit: bool,
+    cached_tokens: usize,
+    resume_from: Option<usize>,
+}
+
+impl SpecPrefillPlan {
+    /// This plan when the live state it was planned against survived the
+    /// deferred-seed settle; otherwise a cold prefill of the whole prompt.
+    fn unless_live_state_lost(self, live_state_survived: bool, prompt_tokens: &[u32]) -> Self {
+        if live_state_survived {
+            return self;
+        }
+        Self {
+            tokens: prompt_tokens.to_vec(),
+            start: 0,
+            cache_hit: false,
+            cached_tokens: 0,
+            resume_from: None,
+        }
+    }
+}
+
+fn feed_deferred_spec_seed(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    seed: hipfire_loader::DeferredSpecSeed,
+) -> Result<(), String> {
+    if m.seq_pos != seed.position + 1 {
+        return Err(format!(
+            "the host position {} does not follow the seed",
+            m.seq_pos
+        ));
+    }
+    let carrier = hipfire_loader::carrier_for(m.arch_id)
+        .ok_or_else(|| format!("no carrier for arch_id {}", m.arch_id))?;
+    let mut guard = carrier.spec_target_guard(&mut m.state)?;
+    let spec = m
+        .speculator
+        .as_mut()
+        .ok_or("the speculator is no longer loaded")?;
+    let slot = guard.slot()?;
+    let never = || false;
+    if spec.on_forced_advance(gpu, slot, &[seed.token], seed.position, &never)? {
+        return Ok(());
+    }
+    slot.spec_advance(gpu, &[seed.token], seed.position, false, &never, None)
+        .map(|_| ())
+}
+
+/// Drop a deferred terminal seed unfed, ahead of anything that discards the
+/// target and drafter state the seed would have extended: a cold prefill, or
+/// the daemon's `reset`, `unload` and `load`. The host record is cleared with
+/// it (as the cold prefill itself does), so no later plan can reuse a state
+/// that lacks the seed even if this request stops before its prefill.
+pub fn drop_deferred_spec_seed(m: &mut LoadedModel) {
+    if m.spec_deferred_seed.take().is_some() {
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+}
+
 /// `Speculator::prefill` of the spec loop, on the mesh for a pipeline-parallel
 /// Qwen4 model. The mesh form mirrors `MtpSpeculator::prefill`: a cache hit
 /// fills the suffix from `prefill_start`, a miss fills the whole prompt.
@@ -11514,5 +11679,42 @@ mod legacy_asst_turn_store_tests {
         assert!(reasoning.contains("plan") && !reasoning.contains("Answer"));
         assert_eq!(content.trim(), "Answer");
         assert!(!think.in_think());
+    }
+}
+
+#[cfg(test)]
+mod spec_prefill_plan_tests {
+    use super::SpecPrefillPlan;
+
+    fn hit_plan() -> SpecPrefillPlan {
+        SpecPrefillPlan {
+            tokens: vec![40, 41],
+            start: 3,
+            cache_hit: true,
+            cached_tokens: 3,
+            resume_from: Some(2),
+        }
+    }
+
+    #[test]
+    fn a_surviving_live_state_keeps_the_hit_plan() {
+        let prompt = [10, 11, 12, 40, 41];
+        assert_eq!(hit_plan().unless_live_state_lost(true, &prompt), hit_plan());
+    }
+
+    /// An injected settle failure (the deferred-seed feed hitting a pool
+    /// out-of-memory) resets the live state: the hit request must prefill the
+    /// whole prompt cold, exactly as a cache miss would.
+    #[test]
+    fn a_failed_seed_settle_turns_a_hit_into_a_cold_prefill() {
+        let prompt = [10, 11, 12, 40, 41];
+        let miss = SpecPrefillPlan {
+            tokens: prompt.to_vec(),
+            start: 0,
+            cache_hit: false,
+            cached_tokens: 0,
+            resume_from: None,
+        };
+        assert_eq!(hit_plan().unless_live_state_lost(false, &prompt), miss);
     }
 }

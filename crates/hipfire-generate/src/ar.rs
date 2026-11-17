@@ -2811,6 +2811,16 @@ pub fn generate(
         return;
     }
     let _route_scope = GenerationRouteScope::enter(selected_route, id);
+    // A deferred terminal seed of the previous speculative request
+    // (`LoadedModel::spec_deferred_seed`) is fed before any route reads the
+    // live state. The Qwen spec arm leaves it to `generate_dflash`, which drops
+    // it unfed when its cache plan prefills cold.
+    if !matches!(
+        selected_route,
+        GenerationRoute::QwenDflash | GenerationRoute::LlamaSpec | GenerationRoute::GlimmerSpec
+    ) {
+        crate::qwen::settle_deferred_spec_seed(m, gpu);
+    }
 
     match hipfire_loader::generation_early_route(m.arch_id) {
         Some(hipfire_loader::GenerationEarlyRoute::Gemma4) => {

@@ -976,6 +976,34 @@ fn receive_startup_config(
     }
 }
 
+/// How long the main loop waits for the next message before it feeds a
+/// deferred terminal seed ([`LoadedModel::spec_deferred_seed`]) on its own. A
+/// generate that arrives sooner decides for itself (a cold prefill drops the
+/// seed unfed, so its TTFT never includes that forward); an idle daemon feeds
+/// it here, off the next request's path.
+const DEFERRED_SPEC_SEED_IDLE: Duration = Duration::from_millis(10);
+
+fn recv_settling_deferred_seed(
+    inbox: &mut DaemonInbox,
+    model: &mut Option<LoadedModel>,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<DaemonMsg, mpsc::RecvError> {
+    if let Some(m) = model.as_mut().filter(|m| m.spec_deferred_seed.is_some()) {
+        match inbox.recv_timeout(DEFERRED_SPEC_SEED_IDLE) {
+            Ok(msg) => return Ok(msg),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // A pool out-of-memory armed by the previous message never
+                // reaches the idle settle.
+                #[cfg(feature = "serve-fault-inject")]
+                gpu.inject_pool_oom(None);
+                hipfire_generate::qwen::settle_deferred_spec_seed(m, gpu);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(mpsc::RecvError),
+        }
+    }
+    inbox.recv()
+}
+
 fn main() {
     process_init::init();
     tracing::info!(pid = std::process::id(), "daemon starting");
@@ -1281,7 +1309,7 @@ fn main() {
     let mut inbox = DaemonInbox::new(msg_rx);
     loop {
         request_guards::exit_if_gpu_poisoned(&mut stdout);
-        let Ok(daemon_msg) = inbox.recv() else {
+        let Ok(daemon_msg) = recv_settling_deferred_seed(&mut inbox, &mut model, &mut gpu) else {
             break;
         };
         let (msg, admission_from_message, mut singleton_transfer_from_message) = match daemon_msg {
@@ -1308,9 +1336,23 @@ fn main() {
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
         // An injected pool out-of-memory (`test_pool_oom_drain`,
-        // `test_fault_pool_oom_after`) never outlives the message that armed it.
+        // `test_fault_pool_oom_after`) never outlives the message that armed it,
+        // so it is cleared before the deferred-seed settle below.
         #[cfg(feature = "serve-fault-inject")]
         gpu.inject_pool_oom(None);
+        // Every message but a generate feeds a deferred terminal seed before it
+        // runs (generate routes decide for themselves), and so does weight-host
+        // lease reconciliation, which may move the resident state. `reset`,
+        // `unload` and `load` discard the state, so they drop the seed unfed.
+        if matches!(msg_type, "reset" | "unload" | "load") {
+            if let Some(m) = model.as_mut() {
+                hipfire_generate::qwen::drop_deferred_spec_seed(m);
+            }
+        } else if msg_type != "generate" || weight_host.is_some() {
+            if let Some(m) = model.as_mut() {
+                hipfire_generate::qwen::settle_deferred_spec_seed(m, &mut gpu);
+            }
+        }
         let idle = !batch_scheduler
             .as_ref()
             .is_some_and(|s| s.active_count() > 0);
@@ -3486,6 +3528,9 @@ fn main() {
                 if has_image && !has_vl {
                     refuse_image_without_vision(&mut stdout, id, vision_gated_off.as_deref());
                 } else if has_image && has_vl {
+                    // A vision turn reads or resets the live state itself; feed a
+                    // deferred terminal seed first.
+                    hipfire_generate::qwen::settle_deferred_spec_seed(m, &mut gpu);
                     // The qwen35-VL route decides for itself whether this prompt
                     // continues the resident conversation (it renders the whole
                     // history, so an ongoing image conversation keeps its KV and
@@ -3806,6 +3851,9 @@ fn main() {
                         false
                     };
                     if batch_eligible {
+                        // Lanes and the singleton fallthrough both start from the
+                        // live state; feed a deferred terminal seed first.
+                        hipfire_generate::qwen::settle_deferred_spec_seed(m, &mut gpu);
                         // Current request was already announced by the reader; promote to Queued.
                         let _ = batch_transition_to_queued(id, gen_attempt_id, admission);
                         // If already aborted, emit cancelled and do not enqueue.
