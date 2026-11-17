@@ -439,6 +439,7 @@ developer_callsite	*	HIPFIRE_LANE_ADMIT_COALESCE_FIRST#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_LANE_ADMIT_COALESCE_MS#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_LANE_EARLY_FIRST_TOKEN#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_LANE_FIRST_TOKEN_BEFORE_MESH#developer_var=ok.as_deref
+developer_callsite	*	HIPFIRE_LAUNCH_DUMP#developer_var=ok.and_then.unwrap_or(0)
 developer_callsite	*	HIPFIRE_LDS_EPI_DIRECT#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_LFM2_CAPTURE_POSTMIXER#developer_var_os=is_some
 developer_callsite	*	HIPFIRE_LFM2_GRAPH#developer_var=ok.as_deref
@@ -494,6 +495,7 @@ developer_callsite	*	HIPFIRE_MOE_ROUTER_SHARED_FUSE#developer_var=as_deref.==Ok(
 developer_callsite	*	HIPFIRE_MOE_ROUTER_TOPK_MULTIROW#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_MOE_SHARED_PREPARED_IU4#developer_typed_bool=-
+developer_callsite	*	HIPFIRE_MOE_SLOTS_COHORT#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_MOE_SYM_IU4#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_MOE_TIER_MAP#developer_var=-
 developer_callsite	*	HIPFIRE_MQ2_DOWN_ROWS#developer_var=as_deref
@@ -766,6 +768,7 @@ developer_callsite	*	HIPFIRE_REDLINE_IB_POOL#developer_var=as_deref.==Ok("vmem")
 developer_callsite	*	HIPFIRE_REDLINE_POOL_DEBUG#developer_var_os=is_some_and
 developer_callsite	*	HIPFIRE_REPLAY_GRAPH#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_REPLAY_PM4_STREAM_ACCOUNTING#developer_var=ok.as_deref.==Some("1")
+developer_callsite	*	HIPFIRE_REPLAY_STABLE_TILING#developer_var=ok.as_deref.is_some_and
 developer_callsite	*	HIPFIRE_RESIDUAL_CPOL#developer_var=ok
 developer_callsite	*	HIPFIRE_RMSNORM_P1A_BATCHED#developer_bool=true
 developer_callsite	*	HIPFIRE_ROCM_STRICT#developer_bool=false
@@ -774,9 +777,11 @@ developer_callsite	*	HIPFIRE_ROUTE_PLAN_SEAL#developer_bool=false
 developer_callsite	*	HIPFIRE_SCHED_PROFILE#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_SCHED_PROFILE#developer_var=ok.and_then.unwrap_or_else
 developer_callsite	*	HIPFIRE_SKIP_LLAMA_COMMIT_CHECK#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_SLOTS_PAGED#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_SLOTS_PAGED_PAGES#developer_var=ok.and_then.map.unwrap_or(legacy_equivalent)
-developer_callsite	*	HIPFIRE_SLOTS_PAGED_PAGES#developer_var=ok.and_then.map.unwrap_or_else
+developer_callsite	*	HIPFIRE_SLOTS_GFX1100_ROUTES#developer_var=as_deref.!=Ok("0")
+developer_callsite	*	HIPFIRE_SLOTS_PAGED#developer_var=ok.and_then
+developer_callsite	*	HIPFIRE_SLOTS_PAGED_BACKEND#developer_var=ok.as_deref
+developer_callsite	*	HIPFIRE_SLOTS_PAGED_BACKEND#developer_var=ok.filter.unwrap_or_else
+developer_callsite	*	HIPFIRE_SLOTS_PAGED_PAGES#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_SPEC_PHASES#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_SPEC_RETIRE#developer_var=ok
 developer_callsite	*	HIPFIRE_SPEC_WINDOW_ROLLBACK#developer_bool=true
