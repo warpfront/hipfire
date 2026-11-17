@@ -772,7 +772,7 @@ impl ResidentKvDiag {
                 KvBackendRequest::Automatic,
                 KvBackend::Legacy,
                 Some(
-                    "kv_backend not requested; the slot route defaults to legacy arenas (pass --kv-backend vmm for per-slot VMM KV)",
+                    "kv_backend not requested; the slot route defaults to legacy arenas (the VMM cache is the shared pool: --multi-slot-paged with serve.multi_slot_paged_backend=vmm)",
                 ),
             ),
         }
