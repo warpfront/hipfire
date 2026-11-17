@@ -3370,9 +3370,6 @@ pub fn generate_dflash(
     // request_seed_for: explicit wire `seed` wins, otherwise attempt-key +
     // counter entropy. Greedy requests never draw it.
     request_seed: u64,
-    // The request carried an explicit wire `seed` (`client_seed.is_some()`):
-    // its speculate-vs-AR decisions are count-only (`generate_spec`).
-    seed_explicit: bool,
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
     // Returns false in exactly one case: the request does not fit the loaded
@@ -3986,7 +3983,6 @@ pub fn generate_dflash(
             logprobs_top_k: None,
         },
         temp,
-        seed_explicit,
     ) {
         Some(r) => r,
         // Abort / error early-exit already wrote its own done/error envelope.
@@ -4395,11 +4391,10 @@ enum SpecFloorPolicy {
     Off,
     /// The count-based [`hipfire_runtime::spec_retire::SpecRetire`] line.
     CountsLine(hipfire_runtime::spec_retire::BreakEven),
-    /// The driver floor: token counts judged on the pinned prices of the
-    /// request's start bucket (`counts-pinned`), or no verdict while the
-    /// bucket is not pinned (`unpriced`; a pin landing mid-request applies
-    /// from the next checkpoint). Wall time never reaches a decision.
-    Floor(Option<hipfire_runtime::spec_prices::PinnedPrices>),
+    /// The driver floor: token counts judged on the load's frozen snapshot
+    /// (`counts-pinned`), from the request's first window. Wall time never
+    /// reaches a decision.
+    Floor(hipfire_runtime::spec_prices::PinnedPrices),
 }
 
 impl SpecFloorPolicy {
@@ -4407,8 +4402,7 @@ impl SpecFloorPolicy {
         match self {
             Self::Off => "off",
             Self::CountsLine(_) => "counts-line",
-            Self::Floor(Some(_)) => "counts-pinned",
-            Self::Floor(None) => "unpriced",
+            Self::Floor(_) => "counts-pinned",
         }
     }
 
@@ -4418,19 +4412,19 @@ impl SpecFloorPolicy {
     }
 }
 
-/// Request-start policy (SPEC-AR-FLOOR §7.3 contract 7 as amended by §7.10).
-/// `armed`: the retire policy may arm at all (greedy, or a sampled AR step,
-/// on a speculator with an AR step). `line`: the count line
+/// Request-start policy (SPEC-AR-FLOOR §7.3 contract 7 as amended by §7.10
+/// and §7.11). `armed`: the retire policy may arm at all (greedy, or a
+/// sampled AR step, on a speculator with an AR step). `line`: the count line
 /// ([`spec_retire_break_even`]; `None` never retires). `retire_env`:
-/// `HIPFIRE_SPEC_RETIRE` is set (today's count path, verbatim). `pinned`: the
-/// driver floor's frozen prices for the request's start bucket.
+/// `HIPFIRE_SPEC_RETIRE` is set (today's count path, verbatim). `snapshot`:
+/// the driver floor's frozen load prices. A wire seed is not an input: a
+/// seeded and an unseeded request take the same path in every load state.
 fn select_spec_floor_policy(
     owner: FloorOwner,
     armed: bool,
     retire_env: bool,
     line: Option<hipfire_runtime::spec_retire::BreakEven>,
-    seed_explicit: bool,
-    pinned: Option<hipfire_runtime::spec_prices::PinnedPrices>,
+    snapshot: Option<hipfire_runtime::spec_prices::PinnedPrices>,
 ) -> SpecFloorPolicy {
     let counts = line.map_or(SpecFloorPolicy::Off, SpecFloorPolicy::CountsLine);
     match owner {
@@ -4439,20 +4433,19 @@ fn select_spec_floor_policy(
         _ if !armed => SpecFloorPolicy::Off,
         FloorOwner::Unsupported => counts,
         FloorOwner::Driver if retire_env => counts,
-        // One clock: seeded or not, a pinned bucket decides on counts and
-        // its pinned prices.
-        FloorOwner::Driver if pinned.is_some() => SpecFloorPolicy::Floor(pinned),
-        // A seeded request on an unpriced bucket keeps the count line (C6).
-        FloorOwner::Driver if seed_explicit => counts,
-        FloorOwner::Driver => SpecFloorPolicy::Floor(None),
+        // A load without a snapshot (its calibration could not run or
+        // failed) keeps the count line.
+        FloorOwner::Driver => snapshot.map_or(counts, SpecFloorPolicy::Floor),
     }
 }
 
 /// The AR executor key of the coming request: the replay transport and the
 /// controller's class (HIP route, fallen back, or the retained route at any
 /// stage). The retained route's recording stages are one class, so its
-/// first-request warmup does not re-calibrate later requests.
-fn spec_floor_route_key(gpu: &rdna_compute::Gpu) -> hipfire_runtime::spec_prices::ArRouteKey {
+/// first-request warmup does not clear the load's price cells.
+pub(crate) fn spec_floor_route_key(
+    gpu: &rdna_compute::Gpu,
+) -> hipfire_runtime::spec_prices::ArRouteKey {
     use rdna_compute::replay::ReplayState;
     let class = match gpu.replay.state() {
         ReplayState::Hip => 0,
@@ -4469,18 +4462,37 @@ fn spec_floor_route_key(gpu: &rdna_compute::Gpu) -> hipfire_runtime::spec_prices
 /// AR tokens after a speculative window that are never a load price: they
 /// still pay tape capture or HIP-graph re-capture (the second carried 2–4 ms
 /// on the R9700 HIP-graph route, SPEC-AR-FLOOR §7.10 rule 6).
-const SPEC_FLOOR_UNPRICED_AR: usize = 2;
+pub(crate) const SPEC_FLOOR_UNPRICED_AR: usize = 2;
 
 /// Verified rows of a finished window for the driver floor and the load's
 /// price cells (0 for an AR token). A `FloorControl::Driver` speculator
 /// reports its verified rows as `SpecStep::proposed`: the qwen35 DFlash
 /// step's `drafted` is `[seed, d1..d(B-1)]`, so a full block is `B` rows,
 /// the `full_rows` its `DriverFloor` prices by.
-fn spec_floor_rows(ar_step: bool, proposed: usize) -> usize {
+pub(crate) fn spec_floor_rows(ar_step: bool, proposed: usize) -> usize {
     if ar_step {
         0
     } else {
         proposed
+    }
+}
+
+/// One observed window's loop-to-loop wall time `us` into the load's price
+/// cells: a speculative window of `rows` verified rows, or an AR token
+/// (`rows == 0`) after `ar_run` earlier AR tokens of its run. The caller
+/// passes only steady windows that paid no first-use cost; the first
+/// [`SPEC_FLOOR_UNPRICED_AR`] AR tokens of a run are never a price.
+pub(crate) fn spec_floor_record_price(
+    df: &mut hipfire_runtime::spec::DriverFloor,
+    rows: usize,
+    ctx: usize,
+    us: f32,
+    ar_run: usize,
+) {
+    if rows > 0 {
+        df.prices.record_window(rows, ctx, us);
+    } else if ar_run >= SPEC_FLOOR_UNPRICED_AR {
+        df.prices.record_ar(ctx, us);
     }
 }
 
@@ -4497,16 +4509,14 @@ struct SpecFloorPending {
 }
 
 /// One request's driver-floor bookkeeping: loop-to-loop timing (load prices
-/// only), the pending observation, the think-close re-arm, the schedule and
-/// the `done` counters. The floor and price cache live in the speculator's
-/// [`DriverFloor`] (passed per call).
+/// for reports only), the pending observation, the think-close re-arm, the
+/// schedule and the `done` counters. The floor and price cells live in the
+/// speculator's [`DriverFloor`] (passed per call).
 ///
 /// [`DriverFloor`]: hipfire_runtime::spec::DriverFloor
 #[derive(Debug)]
 struct SpecFloorRun {
     policy: SpecFloorPolicy,
-    /// Position at request start: the bucket whose pin the request uses.
-    start_ctx: usize,
     think_close: Option<u32>,
     rearm_due: bool,
     rearmed: bool,
@@ -4516,7 +4526,6 @@ struct SpecFloorRun {
     pending: Option<SpecFloorPending>,
     /// AR tokens observed since the last speculative window.
     ar_run: usize,
-    probe_tokens: usize,
     reentries: usize,
     retires: usize,
     rearms: usize,
@@ -4527,8 +4536,6 @@ struct SpecFloorRun {
     spec_wall_us: f64,
     spec_settled: usize,
     retired_at: Option<usize>,
-    /// Observation at which the start bucket's pin landed mid-request.
-    pinned_at: Option<usize>,
     /// Planned actions, run-length: (speculative, count).
     schedule: Vec<(bool, usize)>,
     /// Judged checkpoints with the position after their window.
@@ -4539,7 +4546,6 @@ impl SpecFloorRun {
     fn new(policy: SpecFloorPolicy, think_close: Option<u32>) -> Self {
         Self {
             policy,
-            start_ctx: 0,
             think_close,
             rearm_due: false,
             rearmed: false,
@@ -4547,7 +4553,6 @@ impl SpecFloorRun {
             first_use: None,
             pending: None,
             ar_run: 0,
-            probe_tokens: 0,
             reentries: 0,
             retires: 0,
             rearms: 0,
@@ -4558,25 +4563,20 @@ impl SpecFloorRun {
             spec_wall_us: 0.0,
             spec_settled: 0,
             retired_at: None,
-            pinned_at: None,
             schedule: Vec::new(),
             checkpoints: Vec::new(),
         }
     }
 
-    /// Request start at position `ctx`: reset the floor and pin it from the
-    /// start bucket's frozen prices when there are any. The schedule and
-    /// checkpoint storage is reserved here, never per token.
-    fn start(&mut self, df: &mut hipfire_runtime::spec::DriverFloor, ctx: usize) {
-        self.start_ctx = ctx;
+    /// Request start: reset the floor and pin it from the load's frozen
+    /// snapshot. The schedule and checkpoint storage is reserved here, never
+    /// per token.
+    fn start(&mut self, df: &mut hipfire_runtime::spec::DriverFloor) {
         let SpecFloorPolicy::Floor(pinned) = self.policy else {
             return;
         };
-        df.floor
-            .reset_fixed(hipfire_runtime::spec::DRIVER_FLOOR_PROBE_TOKENS);
-        if let Some(pinned) = pinned {
-            df.floor.pin_fixed(&pinned);
-        }
+        df.floor.reset_fixed();
+        df.floor.pin_fixed(&pinned);
         self.schedule.reserve(16);
         self.checkpoints.reserve(16);
     }
@@ -4616,7 +4616,7 @@ impl SpecFloorRun {
     }
 
     /// The floor counts the window; its wall time `us` goes only to the
-    /// load's price cells (and the report).
+    /// load's price cells (reports) and the report.
     fn observe(
         &mut self,
         df: &mut hipfire_runtime::spec::DriverFloor,
@@ -4635,7 +4635,7 @@ impl SpecFloorRun {
             self.spec_wall_us += f64::from(us);
             self.spec_settled += obs.settled;
         }
-        if let SpecFloorPolicy::Floor(Some(pinned)) = self.policy {
+        if let SpecFloorPolicy::Floor(pinned) = self.policy {
             self.observed_priced_us += f64::from(if ar {
                 pinned.ar_us
             } else {
@@ -4647,20 +4647,9 @@ impl SpecFloorRun {
         self.checkpoints
             .extend(df.floor.fixed_checkpoints().map(|c| (pending.end, c)));
         if pending.steady && !cold {
-            if !ar {
-                df.prices.record_window(obs.rows, pending.ctx, us);
-            } else if self.ar_run >= SPEC_FLOOR_UNPRICED_AR {
-                df.prices.record_ar(pending.ctx, us);
-            }
+            spec_floor_record_price(df, obs.rows, pending.ctx, us, self.ar_run);
         }
         self.ar_run = if ar { self.ar_run + 1 } else { 0 };
-        if self.policy == SpecFloorPolicy::Floor(None) {
-            if let Some(pinned) = df.prices.pinned(self.start_ctx) {
-                df.floor.pin_fixed(&pinned);
-                self.policy = SpecFloorPolicy::Floor(Some(pinned));
-                self.pinned_at = Some(self.observed_windows);
-            }
-        }
         let retired = df.floor.retired();
         self.reentries += usize::from(was_retired && !retired);
         (!was_retired && retired).then(|| {
@@ -4670,7 +4659,7 @@ impl SpecFloorRun {
         })
     }
 
-    /// The next window's action, counting probes and extending the schedule.
+    /// The next window's action, extending the schedule.
     fn plan(
         &mut self,
         df: &mut hipfire_runtime::spec::DriverFloor,
@@ -4678,7 +4667,6 @@ impl SpecFloorRun {
     ) -> hipfire_runtime::spec_economics::Action {
         use hipfire_runtime::spec_economics::Action;
         let action = df.floor.plan_fixed(width);
-        self.probe_tokens += usize::from(action == Action::ArSynced);
         let spec = matches!(action, Action::Native(_) | Action::Interleaved);
         match self.schedule.last_mut() {
             Some((kind, count)) if *kind == spec => *count += 1,
@@ -4736,9 +4724,17 @@ impl SpecFloorRun {
         out
     }
 
-    /// The `done` envelope's `floor` object, built once at request end.
+    /// The `done` envelope's `floor` object, built once at request end. A
+    /// driver-owned speculator's (`df`) also names where its load's prices
+    /// came from: `load-calibrated`, or `count-line` for a load without a
+    /// snapshot.
     fn report(&self, df: Option<&hipfire_runtime::spec::DriverFloor>) -> serde_json::Value {
         let mut report = serde_json::json!({ "policy": self.policy.name() });
+        if let Some(df) = df {
+            report["source"] = serde_json::json!(df
+                .snapshot()
+                .map_or("count-line", |(_, source)| source.name()));
+        }
         let (SpecFloorPolicy::Floor(pinned), Some(df)) = (self.policy, df) else {
             return report;
         };
@@ -4766,14 +4762,13 @@ impl SpecFloorRun {
                 })
             })
             .collect();
-        report["ar_us"] = serde_json::json!(pinned.map(|p| round(f64::from(p.ar_us), 10.0)));
+        report["ar_us"] = serde_json::json!(round(f64::from(pinned.ar_us), 10.0));
         report["break_even"] = serde_json::json!(df
             .floor
             .fixed_break_even(df.prices.full_rows())
             .map(|b| round(b, 1000.0)));
         report["spec_us_per_token"] = serde_json::json!((self.spec_settled > 0)
             .then(|| round(self.spec_wall_us / self.spec_settled as f64, 10.0)));
-        report["probe_tokens"] = serde_json::json!(self.probe_tokens);
         report["reentries"] = serde_json::json!(self.reentries);
         report["retires"] = serde_json::json!(self.retires);
         report["rearms"] = serde_json::json!(self.rearms);
@@ -4781,7 +4776,6 @@ impl SpecFloorRun {
         report["cold_windows"] = serde_json::json!(self.cold_windows);
         report["observed_wall_us"] = serde_json::json!(round(self.observed_wall_us, 10.0));
         report["observed_priced_us"] = serde_json::json!(round(self.observed_priced_us, 10.0));
-        report["pinned_at"] = serde_json::json!(self.pinned_at);
         report["schedule"] = serde_json::json!(self.schedule_string());
         report["checkpoints"] = serde_json::Value::Array(checkpoints);
         report
@@ -4813,37 +4807,41 @@ mod spec_floor_driver_tests {
         use FloorOwner::*;
         let line = Some(DEFAULT_BREAK_EVEN);
         let counts = SpecFloorPolicy::CountsLine(DEFAULT_BREAK_EVEN);
-        let pin = SpecFloorPolicy::Floor(Some(pinned()));
-        let unpriced = SpecFloorPolicy::Floor(None);
+        let pin = SpecFloorPolicy::Floor(pinned());
         let off = SpecFloorPolicy::Off;
-        // (owner, armed, HIPFIRE_SPEC_RETIRE set, line, seed, pinned) -> policy
+        let snap = Some(pinned());
+        // (owner, armed, HIPFIRE_SPEC_RETIRE set, line, snapshot) -> policy.
+        // No seed column: a seeded request takes the unseeded one's path.
         let table = [
-            (Driver, true, false, line, false, None, unpriced),
-            (Driver, true, false, line, false, Some(pinned()), pin),
-            (Driver, true, false, line, true, Some(pinned()), pin),
-            (Driver, true, false, line, true, None, counts),
-            (Driver, true, true, line, false, None, counts),
-            (Driver, true, true, line, true, Some(pinned()), counts),
+            (Driver, true, false, line, snap, pin),
+            // A load whose calibration could not run keeps the count line.
+            (Driver, true, false, line, None, counts),
+            (Driver, true, true, line, None, counts),
+            (Driver, true, true, line, snap, counts),
             // HIPFIRE_SPEC_RETIRE=0 (or malformed): never retire.
-            (Driver, true, true, None, false, None, off),
-            (Driver, false, false, line, false, None, off),
-            (Driver, false, false, None, true, Some(pinned()), off),
-            (Unsupported, true, false, line, false, None, counts),
-            (Unsupported, true, false, line, true, Some(pinned()), counts),
-            (Unsupported, true, true, line, false, None, counts),
-            (Unsupported, true, true, None, false, None, off),
-            (Unsupported, false, false, line, false, None, off),
-            (Producer, true, false, line, false, None, off),
-            (Producer, true, true, line, true, Some(pinned()), off),
-            (Producer, false, false, line, false, None, off),
+            (Driver, true, true, None, snap, off),
+            (Driver, true, false, None, None, off),
+            (Driver, false, false, line, None, off),
+            (Driver, false, false, None, snap, off),
+            (Unsupported, true, false, line, None, counts),
+            (Unsupported, true, false, line, snap, counts),
+            (Unsupported, true, true, line, None, counts),
+            (Unsupported, true, true, None, None, off),
+            (Unsupported, false, false, line, None, off),
+            (Producer, true, false, line, None, off),
+            (Producer, true, true, line, snap, off),
+            (Producer, false, false, line, None, off),
         ];
-        for (owner, armed, env, line, seed, pinned, want) in table {
-            let got = select_spec_floor_policy(owner, armed, env, line, seed, pinned);
-            assert_eq!(got, want, "{owner:?} armed={armed} env={env} seed={seed}");
+        for (owner, armed, env, line, snapshot, want) in table {
+            let got = select_spec_floor_policy(owner, armed, env, line, snapshot);
+            assert_eq!(got, want, "{owner:?} armed={armed} env={env} {snapshot:?}");
         }
-        assert!(unpriced.driver() && pin.driver());
+        assert!(pin.driver());
         assert!(!counts.driver() && !off.driver());
-        assert_eq!((pin.name(), unpriced.name()), ("counts-pinned", "unpriced"));
+        assert_eq!(
+            (pin.name(), counts.name(), off.name()),
+            ("counts-pinned", "counts-line", "off")
+        );
     }
 
     thread_local! {
@@ -4856,9 +4854,8 @@ mod spec_floor_driver_tests {
 
     fn logged_driver() -> DriverFloor {
         LOGGED.with(|lines| lines.borrow_mut().clear());
-        let mut df = DriverFloor::new(16, hipfire_runtime::spec::DRIVER_FLOOR_PROBE_TOKENS, false);
-        df.floor = FixedFloor::fixed(hipfire_runtime::spec::DRIVER_FLOOR_PROBE_TOKENS)
-            .with_call_log_to("T", "driver-test", true, capture);
+        let mut df = DriverFloor::new(16, false);
+        df.floor = FixedFloor::fixed().with_call_log_to("T", "driver-test", true, capture);
         df
     }
 
@@ -4897,7 +4894,7 @@ mod spec_floor_driver_tests {
         ms: impl Fn(bool, usize) -> f64,
     ) -> SpecFloorRun {
         let mut run = SpecFloorRun::new(policy, None);
-        run.start(df, 100);
+        run.start(df);
         let mut now = Instant::now();
         let (mut spec, mut ar, mut position) = (0, 0, 100);
         for _ in 0..loops {
@@ -4959,8 +4956,8 @@ mod spec_floor_driver_tests {
             full_rows: 16,
         };
         let mut df = logged_driver();
-        let mut run = SpecFloorRun::new(SpecFloorPolicy::Floor(Some(pinned)), Some(CLOSE));
-        run.start(&mut df, 174);
+        let mut run = SpecFloorRun::new(SpecFloorPolicy::Floor(pinned), Some(CLOSE));
+        run.start(&mut df);
         let mut now = Instant::now();
         let (mut spec, mut ar, mut generated) = (0, 0, 1);
         while generated < 1022 {
@@ -5027,15 +5024,9 @@ mod spec_floor_driver_tests {
     /// drives it: route key and policy at request start, then per loop the
     /// mark, the plan and the window with the verified rows a DFlash step
     /// reports (`drafted = [seed, d1..d15]`: 16; every 9th window a 12-row
-    /// lookup Tail). Windows take 39 ms (33 ms at 12 rows); AR tokens 23.4
-    /// ms, the first two after a window 26 ms. The load's first `tape` AR
-    /// tokens record the PM4 tape (the first-use marker moves across them).
-    fn load_request(
-        df: &mut DriverFloor,
-        seed_explicit: bool,
-        counts: &[usize],
-        tape: &mut usize,
-    ) -> serde_json::Value {
+    /// lookup Tail). Windows take `window_ms` (6 ms less at 12 rows); AR
+    /// tokens 23.4 ms, the first two after a window 26 ms.
+    fn load_request(df: &mut DriverFloor, counts: &[usize], window_ms: f64) -> serde_json::Value {
         use hipfire_runtime::spec_prices::ArRouteKey;
         df.prices.set_route(ArRouteKey::new(2, true));
         let start = 100;
@@ -5044,22 +5035,17 @@ mod spec_floor_driver_tests {
             true,
             false,
             Some(DEFAULT_BREAK_EVEN),
-            seed_explicit,
-            df.prices.pinned(start),
+            df.snapshot().map(|(prices, _)| prices),
         );
         let mut run = SpecFloorRun::new(policy, None);
-        run.start(df, start);
+        run.start(df);
         let mut now = Instant::now();
-        let (mut kernels, mut spec, mut position, mut ar_run) = (0, 0, start, 0);
+        let (mut spec, mut position, mut ar_run) = (0, start, 0);
         while spec < counts.len() {
-            run.mark(df, now, marker(kernels));
+            run.mark(df, now, marker(0));
             let action = run.plan(df, 15);
             let ar_step = !matches!(action, Action::Native(_));
             let (tokens, proposed, ms) = if ar_step {
-                if *tape > 0 {
-                    *tape -= 1;
-                    kernels += 1;
-                }
                 ar_run += 1;
                 (1, 0, if ar_run <= 2 { 26.0 } else { 23.4 })
             } else {
@@ -5069,7 +5055,7 @@ mod spec_floor_driver_tests {
                 (
                     counts[spec - 1],
                     if tail { 12 } else { 16 },
-                    if tail { 33.0 } else { 39.0 },
+                    if tail { window_ms - 6.0 } else { window_ms },
                 )
             };
             now += Duration::from_secs_f64(ms / 1e3);
@@ -5088,52 +5074,72 @@ mod spec_floor_driver_tests {
         run.report(Some(df))
     }
 
+    /// R9700 `qwen3.8:27b`-like load snapshot: 39 ms full block, 23.4 ms AR.
+    fn r9700_snapshot() -> PinnedPrices {
+        let mut window_us = [0.0; LOAD_PRICE_WINDOW_ROWS + 1];
+        window_us[16] = 39_000.0;
+        PinnedPrices {
+            ar_us: 23_400.0,
+            window_us,
+            full_rows: 16,
+        }
+    }
+
     #[test]
-    fn a_load_pins_within_its_first_requests_and_then_runs_no_probe() {
-        // A full DFlash block reports its 16 verified rows: the full-block
-        // price cell the pin waits for is the one these windows fill.
-        let mut df = DriverFloor::new(16, hipfire_runtime::spec::DRIVER_FLOOR_PROBE_TOKENS, false);
+    fn a_load_snapshot_decides_every_request_from_the_first() {
+        use hipfire_runtime::spec::FloorSnapshotSource;
+        // A full DFlash block reports its 16 verified rows, the scale the
+        // snapshot's full-block price is on.
+        let mut df = DriverFloor::new(16, false);
         assert_eq!(spec_floor_rows(false, 16), df.prices.full_rows());
         assert_eq!(spec_floor_rows(true, 0), 0);
-        // G19R order on one load; the first request's probe records the tape.
-        let mut tape = 8;
-        let orders = [
-            (&G19R_RIVER, false),
-            (&G19R_LIGHTHOUSE, false),
-            (&G19R_RIVER, false),
-            (&G19R_LIGHTHOUSE, true),
-        ];
+        assert!(df.freeze_snapshot(r9700_snapshot(), FloorSnapshotSource::LoadCalibrated));
+        // G19R order on one load, the first request included: no AR token,
+        // one schedule per prompt, checkpoints judged on the snapshot. The
+        // requests' own wall times (25% slower windows) never move it.
+        let orders = [&G19R_RIVER, &G19R_LIGHTHOUSE, &G19R_RIVER, &G19R_LIGHTHOUSE];
         let reports: Vec<_> = orders
             .iter()
-            .map(|&(counts, seed)| load_request(&mut df, seed, counts, &mut tape))
+            .map(|counts| load_request(&mut df, *counts, 48.75))
             .collect();
-        let field = |i: usize, key: &str| reports[i][key].clone();
-        // Request 1: unpriced; its calibration probe only records the tape.
-        assert_eq!(field(0, "policy"), "unpriced");
-        assert_eq!(field(0, "probe_tokens"), 6);
-        assert_eq!(field(0, "schedule"), "s3,a6,s37");
-        // Request 2: its probe leaves four priced AR tokens; the bucket pins
-        // at the probe's last token (observation 3 windows + 6 AR = 9).
-        assert_eq!(field(1, "policy"), "counts-pinned");
-        assert_eq!(field(1, "pinned_at"), 9);
-        assert_eq!(field(1, "ar_us"), 23_400.0);
-        assert_eq!(
-            field(1, "break_even"),
-            (39.0f64 / 23.4 * 1000.0).round() / 1000.0
-        );
-        // Requests 3 and 4 (the last seeded) start pinned: no probe, no AR
-        // token, checkpoints judged on the pin.
-        for i in [2, 3] {
-            assert_eq!(field(i, "policy"), "counts-pinned", "request {}", i + 1);
-            assert_eq!(field(i, "probe_tokens"), 0, "request {}", i + 1);
-            assert_eq!(field(i, "pinned_at"), serde_json::Value::Null);
-            assert_eq!(field(i, "schedule"), "s40", "request {}", i + 1);
-            assert!(reports[i]["checkpoints"]
+        for (i, report) in reports.iter().enumerate() {
+            assert_eq!(report["policy"], "counts-pinned", "request {}", i + 1);
+            assert_eq!(report["source"], "load-calibrated");
+            assert_eq!(report["schedule"], "s40", "request {}", i + 1);
+            assert_eq!(report["ar_us"], 23_400.0);
+            assert_eq!(
+                report["break_even"],
+                (39.0f64 / 23.4 * 1000.0).round() / 1000.0
+            );
+            assert!(report["checkpoints"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .all(|c| c["decision"] == "keep"));
         }
+        assert_eq!(
+            df.snapshot(),
+            Some((r9700_snapshot(), FloorSnapshotSource::LoadCalibrated)),
+            "the snapshot is frozen"
+        );
+        assert!(df
+            .prices
+            .window_price(16, 100)
+            .is_some_and(|us| us > 39_000.0));
+        // A second freeze is refused.
+        let mut other = r9700_snapshot();
+        other.ar_us = 11_700.0;
+        assert!(!df.freeze_snapshot(other, FloorSnapshotSource::LoadCalibrated));
+        assert_eq!(df.snapshot().unwrap().0, r9700_snapshot());
+    }
+
+    #[test]
+    fn a_load_without_a_snapshot_runs_the_count_line() {
+        let mut df = DriverFloor::new(16, false);
+        let report = load_request(&mut df, &G19R_RIVER, 39.0);
+        assert_eq!(report["policy"], "counts-line");
+        assert_eq!(report["source"], "count-line");
+        assert_eq!(report.as_object().unwrap().len(), 2, "{report}");
     }
 
     /// 2 tokens per window against b = 3.75: retired at window 8 (16 <
@@ -5143,7 +5149,7 @@ mod spec_floor_driver_tests {
 
     #[test]
     fn one_clock_wall_time_never_changes_a_decision() {
-        let policy = SpecFloorPolicy::Floor(Some(pinned()));
+        let policy = SpecFloorPolicy::Floor(pinned());
         // A fast and a slow, jittered wall clock: identical decisions.
         let fast = scripted(&mut logged_driver(), policy, 763, |_| X1_LIKE, |_, _| 3.0);
         let slow = scripted(
@@ -5187,51 +5193,15 @@ mod spec_floor_driver_tests {
     }
 
     #[test]
-    fn seeded_and_unseeded_requests_decide_identically_after_the_pin() {
-        let line = Some(DEFAULT_BREAK_EVEN);
-        let reports: Vec<_> = [false, true]
-            .into_iter()
-            .map(|seed| {
-                let policy = select_spec_floor_policy(
-                    FloorOwner::Driver,
-                    true,
-                    false,
-                    line,
-                    seed,
-                    Some(pinned()),
-                );
-                assert_eq!(policy, SpecFloorPolicy::Floor(Some(pinned())));
-                // Different wall clocks per arm: only counts decide.
-                let ms = if seed { 41.0 } else { 97.0 };
-                let settled = |i: usize| [1, 2, 4, 2, 1, 3][i % 6];
-                let mut df = logged_driver();
-                let run = scripted(&mut df, policy, 900, settled, |_, _| ms);
-                let report = run.report(Some(&df));
-                (
-                    report["schedule"].clone(),
-                    report["checkpoints"].clone(),
-                    run.retired_at,
-                )
-            })
-            .collect();
-        assert_eq!(reports[0], reports[1]);
-        assert!(reports[0].2.is_some(), "the scripted request retires");
-    }
-
-    #[test]
     fn the_settled_count_after_repair_reaches_the_observation() {
         let mut df = logged_driver();
-        let mut run = SpecFloorRun::new(SpecFloorPolicy::Floor(None), None);
-        run.start(&mut df, 100);
+        let mut run = SpecFloorRun::new(SpecFloorPolicy::Floor(pinned()), None);
+        run.start(&mut df);
         let t0 = Instant::now();
         let (retired, rearm) = run.mark(&mut df, t0, marker(0));
         assert_eq!((retired, rearm), (None, false), "nothing to observe yet");
         let action = run.plan(&mut df, 15);
-        assert_eq!(
-            action,
-            Action::Native(15),
-            "no load price: no AR token runs for a price"
-        );
+        assert_eq!(action, Action::Native(15));
         run.window_done(action, 12, 16, 100, 112, true, &[7; 12]);
         run.mark(&mut df, t0 + Duration::from_millis(40), marker(0));
         // A window that committed 12 tokens of which a strict-prefix repair
@@ -5243,71 +5213,28 @@ mod spec_floor_driver_tests {
         assert_eq!(observed_settled(), ["12", "5"]);
         assert_eq!(run.observed_windows, 2);
         assert!((run.observed_wall_us - 120_000.0).abs() < 1.0);
-        assert!(!df.floor.calibrated());
         assert_eq!(df.prices.ar_price(100), None);
-        assert_eq!(run.probe_tokens, 0);
-        assert_eq!(run.report(Some(&df))["policy"], "unpriced");
+        assert_eq!(run.report(Some(&df))["policy"], "counts-pinned");
     }
 
     #[test]
     fn the_first_two_ar_tokens_after_a_window_are_never_load_prices() {
-        // Unpriced load, low yield (2 of 16 rows): the calibration probe
-        // runs after window 3; its AR tokens take 90, 60, 20, 22, 24, 26 ms.
-        // Only the last four price AR: median 23 ms (24 with the second, 25
-        // with both).
+        // 2 tokens per window against b = 3.75 retires at window 8; the AR
+        // tokens then take 90, 60, 20, 22, 24, 26 ms (the 7th, the request's
+        // last, is never observed). Only the last four price AR (for
+        // reports): median 23 ms (24 with the second, 25 with both).
         let mut df = logged_driver();
-        let ar_ms = [90.0, 60.0, 20.0, 22.0, 24.0, 26.0];
+        let ar_ms = [90.0, 60.0, 20.0, 22.0, 24.0, 26.0, 99.0];
         let run = scripted(
             &mut df,
-            SpecFloorPolicy::Floor(None),
-            10,
+            SpecFloorPolicy::Floor(pinned()),
+            15,
             |_| 2,
             |spec, i| if spec { 75.0 } else { ar_ms[i] },
         );
-        assert_eq!(run.probe_tokens, 6);
-        assert_eq!(run.schedule_string(), "s3,a6,s1");
+        assert_eq!(run.schedule_string(), "s8,a7");
         let ar = df.prices.ar_price(100).expect("AR priced");
         assert!((ar - 23_000.0).abs() < 1.0, "{ar}");
-    }
-
-    #[test]
-    fn a_pin_landing_mid_request_applies_from_the_next_checkpoint() {
-        // Unpriced load, 2 tokens per 75 ms window, 20 ms AR. The probe (6
-        // AR, 4 priced) runs after window 3; the full-block cell keeps its
-        // 8th sample at window 10 (window 1 is the load's first at 16 rows,
-        // window 2 the cell's discarded first), so the bucket pins there.
-        // Checkpoints 3 and 8 are unpriced; 16 retires on b = 3.75.
-        let mut df = logged_driver();
-        let run = scripted(
-            &mut df,
-            SpecFloorPolicy::Floor(None),
-            60,
-            |_| 2,
-            |spec, _| if spec { 75.0 } else { 20.0 },
-        );
-        let report = run.report(Some(&df));
-        assert_eq!(report["policy"], "counts-pinned");
-        assert_eq!(report["pinned_at"], 16, "window 10 is observation 16");
-        assert_eq!(report["break_even"], 3.75);
-        let decisions: Vec<_> = report["checkpoints"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|c| {
-                (
-                    c["windows"].as_u64().unwrap(),
-                    c["decision"].as_str().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            decisions[..3],
-            [(3, "unpriced"), (8, "unpriced"), (16, "retire")]
-        );
-        assert!(report["schedule"]
-            .as_str()
-            .unwrap()
-            .starts_with("s3,a6,s13,a"));
     }
 
     #[test]
@@ -5316,8 +5243,8 @@ mod spec_floor_driver_tests {
         // at its width, then two marker changes) at 1.3 s each, then run warm
         // at 40 ms: the window price is the warm one.
         let mut df = logged_driver();
-        let mut run = SpecFloorRun::new(SpecFloorPolicy::Floor(None), None);
-        run.start(&mut df, 100);
+        let mut run = SpecFloorRun::new(SpecFloorPolicy::Floor(pinned()), None);
+        run.start(&mut df);
         let mut now = Instant::now();
         let mut kernels = 10;
         for i in 0..40 {
@@ -5332,15 +5259,14 @@ mod spec_floor_driver_tests {
             run.window_done(Action::Native(15), 12, 16, 100, 112, true, &[1; 12]);
         }
         assert_eq!(run.cold_windows, 3);
-        assert_eq!(run.probe_tokens, 0);
         assert_eq!(df.prices.window_price(16, 100), Some(40_000.0));
     }
 
     #[test]
     fn a_newly_emitted_think_close_rearms_once_after_its_window() {
         let mut df = logged_driver();
-        let mut run = SpecFloorRun::new(SpecFloorPolicy::Floor(Some(pinned())), Some(3));
-        run.start(&mut df, 0);
+        let mut run = SpecFloorRun::new(SpecFloorPolicy::Floor(pinned()), Some(3));
+        run.start(&mut df);
         let t0 = Instant::now();
         let mut now = t0;
         let mut step = |run: &mut SpecFloorRun, df: &mut DriverFloor, consumed: &[u32]| {
@@ -5398,10 +5324,6 @@ pub fn generate_spec(
     // configured through `configure_request`); greedy drafters ignore it. The
     // daemon's routing gate enforces that invariant.
     temp: f32,
-    // The request carried an explicit wire `seed`: on a bucket with no pinned
-    // prices a driver-owned floor then keeps the count line (C6); with a pin,
-    // seeded or not, it decides on token counts and the pinned prices.
-    seed_explicit: bool,
 ) -> Option<SpecRun> {
     // Zero-budget reject: no first token, no prefill/GPU/state/client mutation.
     // Correlated validation error only — wrapper sees None and skips done/cache.
@@ -6018,28 +5940,27 @@ pub fn generate_spec(
     // first sampled token was already a terminator (see the guard above).
     let mut terminal_cache_invalidated = false;
     // Spec → AR policy at request start (SPEC-AR-FLOOR §7.3 contract 7 as
-    // amended by §7.10). The retire policy arms for greedy requests on a
-    // speculator with an AR step, and sampled ones when that AR step samples
-    // with the request's law.
+    // amended by §7.10 and §7.11). The retire policy arms for greedy requests
+    // on a speculator with an AR step, and sampled ones when that AR step
+    // samples with the request's law.
     // - `HIPFIRE_SPEC_RETIRE` set, or a speculator without a driver-owned
     //   floor: the count-based `spec_retire` line (token and verified-row
     //   counts only), as before.
     // - A driver-owned floor (`FloorControl::Driver`): one clock for every
-    //   request. The fixed-window floor decides on token counts and the
-    //   pinned prices of the request's start bucket, seeded or not; wall
-    //   time only feeds the load's price cells. With no pin: a seeded
-    //   request keeps the count line, an unseeded one runs without a verdict
-    //   until a pin lands.
+    //   request, seeded or not. The fixed-window floor decides on token
+    //   counts and the load's frozen snapshot (calibrated at load, before
+    //   the first request); wall time only feeds the load's price cells,
+    //   for reports. A load without a snapshot keeps the count line.
     // - `FloorControl::Producer`: the speculator decides in its own step.
     let retire_raw = hipfire_config::developer_var("HIPFIRE_SPEC_RETIRE").ok();
     let retire_armed = (temp <= 1e-6 || spec.supports_sampled_ar_step()) && spec.supports_ar_step();
     let retire_line = retire_armed
         .then(|| spec_retire_break_even(retire_raw.as_deref(), spec.retire_break_even()))
         .flatten();
-    let (floor_owner, floor_pinned) = match spec.floor_control() {
+    let (floor_owner, floor_snapshot) = match spec.floor_control() {
         hipfire_runtime::spec::FloorControl::Driver(df) => {
             df.prices.set_route(spec_floor_route_key(gpu));
-            (FloorOwner::Driver, df.prices.pinned(position))
+            (FloorOwner::Driver, df.snapshot().map(|(prices, _)| prices))
         }
         hipfire_runtime::spec::FloorControl::Producer => (FloorOwner::Producer, None),
         hipfire_runtime::spec::FloorControl::Unsupported => (FloorOwner::Unsupported, None),
@@ -6049,8 +5970,7 @@ pub fn generate_spec(
         retire_armed,
         retire_raw.is_some(),
         retire_line,
-        seed_explicit,
-        floor_pinned,
+        floor_snapshot,
     );
     assert!(
         floor_owner != FloorOwner::Producer || floor_policy == SpecFloorPolicy::Off,
@@ -6063,7 +5983,7 @@ pub fn generate_spec(
     let mut floor_run = SpecFloorRun::new(floor_policy, tokenizer.special_token_id("</think>"));
     if floor_policy.driver() {
         if let hipfire_runtime::spec::FloorControl::Driver(df) = spec.floor_control() {
-            floor_run.start(df, position);
+            floor_run.start(df);
         }
     }
     let mut ar_steps = 0usize;

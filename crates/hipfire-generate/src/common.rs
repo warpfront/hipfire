@@ -1862,8 +1862,7 @@ pub struct SpecRun {
     /// Context position of the request's first spec → AR retirement (the
     /// count line or the driver-owned floor); `None` while it never retired.
     pub spec_retired_at: Option<usize>,
-    /// Every AR token the request decoded (the driver floor's calibration and
-    /// probe tokens included; not counted in `spec_cycles`).
+    /// Every AR token the request decoded (not counted in `spec_cycles`).
     pub ar_steps: usize,
     /// The driver-owned floor's `done` object (`FloorControl::Driver`
     /// speculators only).

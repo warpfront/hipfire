@@ -2703,6 +2703,27 @@ fn main() {
                                 continue;
                             }
                         };
+                        // Speculation floor prices are fixed at load
+                        // (SPEC-AR-FLOOR S2a-5): a qwen35 DFlash load with a
+                        // driver-owned floor calibrates here, on its final
+                        // route and executors, before `loaded`; no request
+                        // ever calibrates. Only a failed reset after the
+                        // calibration (state unknown) fails the load.
+                        if let Err(floor_err) =
+                            hipfire_generate::spec_floor_load::prepare_spec_floor(&mut m, &mut gpu)
+                        {
+                            let rollback_err = hipfire_loader::unload_model(m, &mut gpu).err();
+                            let mut msg = format!(
+                                "load failed: {floor_err}{}",
+                                no_model_loaded_suffix(model.is_some())
+                            );
+                            if let Some(rb) = rollback_err {
+                                msg.push_str(&format!("; model rollback also failed: {rb}"));
+                            }
+                            emit_uncorrelated_error(&mut stdout, None, &msg, "gpu", false, false);
+                            let _ = stdout.flush();
+                            continue;
+                        }
                         // FIX #1 (deferred model retirement, after staging):
                         // the new model is fully staged — NOW retire the
                         // prior model before publishing. Single-GPU/pp models
@@ -4179,7 +4200,6 @@ fn main() {
                         enable_thinking_jinja,
                         logprobs_top_k,
                         request_seed,
-                        client_seed.is_some(),
                     );
                     if let Some(drive_res) = hipfire_generate::batch::drive_promoted(
                         batch_scheduler.as_mut(),

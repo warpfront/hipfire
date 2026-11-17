@@ -16,12 +16,14 @@
 //! `LookupPriceBook` uses the same cell.
 //!
 //! Wall time reaches a qwen35 DFlash request's speculate-vs-AR decision only
-//! through these cells: the floor decides on token counts and a bucket's
-//! [`PinnedPrices`]. Precedence, highest first: `HIPFIRE_SPEC_RETIRE` set
-//! (the count path) → the pinned prices of the request's start bucket,
-//! seeded or not → a seeded request without a pin: the drafter's
-//! `retire_break_even()`, else `DEFAULT_BREAK_EVEN` → an unseeded request
-//! without a pin: no verdict until a pin lands.
+//! through the load's frozen snapshot: one [`PinnedPrices`], measured by the
+//! load-time calibration before the load accepts a request (the first pin of
+//! these cells) and never changed by a request. The floor decides on token
+//! counts and that snapshot; requests keep feeding the cells for reports
+//! only. Precedence, highest first: `HIPFIRE_SPEC_RETIRE` set (the count
+//! path) → the load's snapshot, seeded or not, in every context bucket → a
+//! load without a snapshot: the count line (the drafter's
+//! `retire_break_even()`, else `DEFAULT_BREAK_EVEN`).
 
 /// Samples kept per price cell (median of the last `PRICE_WINDOW`).
 pub const PRICE_WINDOW: usize = 8;
@@ -263,6 +265,17 @@ impl LoadPrices {
     pub fn full_rows(&self) -> usize {
         self.full_rows
     }
+
+    /// Kept samples of the AR cell (`rows == 0`) or the `rows`-row window
+    /// cell at `ctx`'s bucket; 0 for a row count outside the table.
+    pub fn kept(&self, rows: usize, ctx: usize) -> usize {
+        let bucket = price_bucket(ctx);
+        match rows {
+            0 => self.ar[bucket].kept(),
+            1..=LOAD_PRICE_WINDOW_ROWS => self.window[rows][bucket].kept(),
+            _ => 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +346,8 @@ mod tests {
             prices.record_window(16, 10, 80_000.0);
         }
         assert!(prices.pinned(10).is_none(), "7 kept window samples");
+        assert_eq!((prices.kept(0, 10), prices.kept(16, 10)), (4, 7));
+        assert_eq!((prices.kept(8, 10), prices.kept(17, 10)), (0, 0));
         prices.record_window(16, 10, 80_000.0);
         assert_eq!(PIN_MIN_WINDOW_SAMPLES, 8);
         assert!(prices.pinned(10).is_some(), "8 kept window samples");

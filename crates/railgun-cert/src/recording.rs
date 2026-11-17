@@ -1976,9 +1976,9 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "dflash-floor-price-route-key",
         predicates: &[ReplayState],
-        condition: "hipfire-generate qwen.rs spec_floor_route_key, once at the start of a speculative request on a driver-owned floor (qwen35 DFlash): `gpu.replay.state()` classed as Hip / Fallback / retained (any recording stage) plus `uses_pm4_transport()` forms the ArRouteKey of the load's in-memory AR price cache; a key change clears the AR prices and pins",
+        condition: "hipfire-generate qwen.rs spec_floor_route_key, once at the start of a speculative request and once at the load-time calibration (spec_floor_load.rs) on a driver-owned floor (qwen35 DFlash): `gpu.replay.state()` classed as Hip / Fallback / retained (any recording stage) plus `uses_pm4_transport()` forms the ArRouteKey of the load's in-memory AR price cells; a key change clears the AR cells and their pins",
         effect: Oracle,
-        switches: "only which per-load AR price the speculate-vs-AR floor starts from (or whether it calibrates); no launch, kernel or replay body depends on it",
+        switches: "only which in-memory price cells the load's wall times land in (the load-time calibration's pin, then reports); the frozen snapshot every request decides on never changes; no launch, kernel or replay body depends on it",
         kernels: &[],
         verdict: Invariant,
         evidence: "host bookkeeping read outside every forward; the AR token and the speculative window run the same executors whatever the key says, so recorded and eager programs are unaffected",
@@ -1987,7 +1987,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "dflash-floor-first-use-marker",
         predicates: &[ReplayState],
-        condition: "rdna-compute dispatch.rs Gpu::first_use_marker, read by hipfire-generate qwen.rs at every loop mark on a driver-owned floor (qwen35 DFlash): `self.replay.state()` with the bound-kernel, replay-tape and graph-blob counts; a change across a window marks it cold, so the floor observes it unpriced",
+        condition: "rdna-compute dispatch.rs Gpu::first_use_marker, read by hipfire-generate qwen.rs at every loop mark on a driver-owned floor and by spec_floor_load.rs at every step of the load-time calibration (qwen35 DFlash): `self.replay.state()` with the bound-kernel, replay-tape and graph-blob counts; a change across a window marks it cold, so it is never a price sample",
         effect: Oracle,
         switches: "only whether the speculate-vs-AR floor prices that window's wall time; no launch, kernel or replay body depends on it",
         kernels: &[],

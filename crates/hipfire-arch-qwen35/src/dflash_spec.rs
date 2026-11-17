@@ -1450,10 +1450,15 @@ mod lookup {
     }
 
     impl LookupState {
+        /// The controller of a fresh load: default policy, no prices.
+        fn fresh_controller() -> LookupController {
+            LookupController::new(LookupPolicy::default(), true)
+        }
+
         fn new(ctx: MtpCopyContext, tail: bool, max_rows: usize) -> Self {
             Self {
                 ctx,
-                ctl: LookupController::new(LookupPolicy::default(), true),
+                ctl: Self::fresh_controller(),
                 tail,
                 max_rows,
                 prompt_len: 0,
@@ -1479,6 +1484,13 @@ mod lookup {
             self.prompt_len = 0;
             self.dirty = false;
             self.proposal.clear();
+        }
+
+        /// Forget the load-scoped window prices and acceptance tables (back
+        /// to the controller a fresh load builds), then end the request.
+        pub fn reset_to_load(&mut self) {
+            self.ctl = Self::fresh_controller();
+            self.end_request();
         }
 
         /// A rewind / terminal repair may have shrunk or rewritten `emitted`:
@@ -2286,11 +2298,7 @@ impl DflashSpeculator {
         floor_call_log: bool,
     ) -> Self {
         let adaptive = DflashAdaptiveBlock::new(df.block_size, adaptive_b);
-        let floor = hipfire_runtime::spec::DriverFloor::new(
-            df.block_size,
-            hipfire_runtime::spec::DRIVER_FLOOR_PROBE_TOKENS,
-            floor_call_log,
-        );
+        let floor = hipfire_runtime::spec::DriverFloor::new(df.block_size, floor_call_log);
         Self {
             df: Some(df),
             vacant: None,
@@ -3054,6 +3062,23 @@ impl Speculator for DflashSpeculator {
         for (_, snap) in self.checkpoints.drain(..) {
             snap.free_gpu(gpu);
         }
+        Ok(())
+    }
+
+    /// [`Self::reset`] plus the load-scoped state a fresh load has not
+    /// built yet: the hidden-ring cursor, the lookup controller's prices and
+    /// acceptance tables, and the turn-boundary pin. (The sampling RNG is
+    /// re-seeded by every request's `set_sampling`.)
+    fn reset_to_load(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.reset(gpu)?;
+        if let Some(df) = self.df.as_mut() {
+            df.hidden_rb.reset();
+        }
+        if let Some(lk) = self.lookup.as_mut() {
+            lk.reset_to_load();
+        }
+        self.turn_boundary = None;
+        self.pinned_boundary = None;
         Ok(())
     }
 

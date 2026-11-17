@@ -1027,6 +1027,17 @@ pub trait Speculator {
     /// drafter fails so production rollback can attest `rolled_back:false`.
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String>;
 
+    /// Return to the drafter state of a fresh load after load-time work ran
+    /// windows through this speculator (the driver floor's calibration):
+    /// everything [`Self::reset`] clears plus the load-scoped state a later
+    /// request would otherwise inherit (learned window-kind prices, ring
+    /// cursors). The driver floor's snapshot stays. The target's KV /
+    /// recurrent state is the caller's, as for [`Self::reset`]. Default:
+    /// [`Self::reset`].
+    fn reset_to_load(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.reset(gpu)
+    }
+
     /// Rewind drafter-local GPU state for an intra-request strict-prefix
     /// realignment. Request-local policy and telemetry must survive. Stateless
     /// and non-MTP speculators use the ordinary full reset by default.
@@ -1188,10 +1199,22 @@ pub trait Speculator {
 /// ([`crate::spec_economics::replay_call_log`]).
 pub const DRIVER_FLOOR_CALL_PREFIX: &str = "QWEN35_DFLASH_FLOOR_CALL";
 
-/// AR tokens of the driver floor's calibration probe on an unpriced load
-/// (the first two follow a speculative window and are never priced, so it
-/// leaves the four AR samples a pin needs).
-pub const DRIVER_FLOOR_PROBE_TOKENS: usize = 6;
+/// Where a load's frozen speculate-vs-AR prices came from (the `done`
+/// envelope's `floor.source`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloorSnapshotSource {
+    /// Measured by the load-time calibration, before the load accepted a
+    /// request.
+    LoadCalibrated,
+}
+
+impl FloorSnapshotSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::LoadCalibrated => "load-calibrated",
+        }
+    }
+}
 
 /// Who decides, per window, whether a request speculates or runs an AR token.
 pub enum FloorControl<'a> {
@@ -1213,18 +1236,23 @@ pub enum FloorControl<'a> {
 #[derive(Clone, Debug)]
 pub struct DriverFloor {
     pub floor: crate::spec_economics::FixedFloor,
+    /// Wall-time price cells: the load-time calibration's samples, then every
+    /// request's, for reports only (no request decides on them).
     pub prices: crate::spec_prices::LoadPrices,
+    /// The load's frozen prices ([`Self::freeze_snapshot`]); `None` runs the
+    /// count line.
+    snapshot: Option<(crate::spec_prices::PinnedPrices, FloorSnapshotSource)>,
     /// Verified-row counts (bit `rows`, 0 = AR token, saturating at 127)
     /// already observed on this load: see [`Self::first_use`].
     warm_rows: u128,
 }
 
 impl DriverFloor {
-    /// A floor for a load whose full block verifies `full_rows` rows, whose
-    /// calibration probe runs `probe_tokens` AR tokens. `call_log` writes the
-    /// floor's exact call log ([`DRIVER_FLOOR_CALL_PREFIX`]) on stderr.
-    pub fn new(full_rows: usize, probe_tokens: usize, call_log: bool) -> Self {
-        let floor = crate::spec_economics::FixedFloor::fixed(probe_tokens);
+    /// A floor for a load whose full block verifies `full_rows` rows.
+    /// `call_log` writes the floor's exact call log
+    /// ([`DRIVER_FLOOR_CALL_PREFIX`]) on stderr.
+    pub fn new(full_rows: usize, call_log: bool) -> Self {
+        let floor = crate::spec_economics::FixedFloor::fixed();
         Self {
             floor: if call_log {
                 floor.with_call_log_enabled(DRIVER_FLOOR_CALL_PREFIX, "qwen35-dflash", true)
@@ -1232,8 +1260,35 @@ impl DriverFloor {
                 floor
             },
             prices: crate::spec_prices::LoadPrices::new(full_rows),
+            snapshot: None,
             warm_rows: 0,
         }
+    }
+
+    /// Freeze the load's prices: every request on the load decides on
+    /// `prices`, in every context bucket. Once per load; a second call is
+    /// refused (returns `false`) and leaves the first snapshot in place.
+    pub fn freeze_snapshot(
+        &mut self,
+        prices: crate::spec_prices::PinnedPrices,
+        source: FloorSnapshotSource,
+    ) -> bool {
+        if self.snapshot.is_some() {
+            return false;
+        }
+        self.snapshot = Some((prices, source));
+        true
+    }
+
+    /// The load's frozen prices and their source.
+    pub fn snapshot(&self) -> Option<(crate::spec_prices::PinnedPrices, FloorSnapshotSource)> {
+        self.snapshot
+    }
+
+    /// Empty the price cells (the load-time calibration's samples), keeping
+    /// the snapshot and the first-use marks.
+    pub fn clear_prices(&mut self) {
+        self.prices = crate::spec_prices::LoadPrices::new(self.prices.full_rows());
     }
 
     /// `true` the first time a window of `rows` verified rows (0: an AR

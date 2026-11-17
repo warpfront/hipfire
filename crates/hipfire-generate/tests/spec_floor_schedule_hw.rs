@@ -38,7 +38,7 @@
 //! forced advance (two tokens), `S` / `A` spec windows / AR tokens until the
 //! decode reaches `SPEC_FLOOR_HW_TOKENS`, default 256):
 //!
-//! - `s3,a6,S`: the floor's calibration probe (spec ×3 → AR ×6 → spec);
+//! - `s3,a6,S`: an AR segment between windows (spec ×3 → AR ×6 → spec);
 //! - `s8,A`: a retirement at the 8-window checkpoint, no re-entry inside the
 //!   request;
 //! - `s8,a200,s3,A`: a retirement, a re-entry epoch after the AR gap
@@ -65,15 +65,31 @@
 //! - `SPEC_FLOOR_HW_ROUTE=pm4|hip` (default `pm4`): the load's AR executor.
 //! - `SPEC_FLOOR_HW_ORACLE`: the trace of the schedule an `f` arm replays.
 //! - `SPEC_FLOOR_HW_SABOTAGE=N`: feed AR token number N a wrong seed.
+//! - `SPEC_FLOOR_HW_CALIBRATE`: before the schedule, `1` runs the load-time
+//!   floor calibration exactly as the daemon does
+//!   (`hipfire_generate::spec_floor_load::prepare_spec_floor`: calibrate →
+//!   reset); `skip-drafter` / `skip-slot` run the calibration and the reset
+//!   sequence minus the drafter's load reset (`Speculator::reset_to_load`
+//!   replaced by `reset`) or minus the target slot reset (gate 22's
+//!   sabotage arms).
 //!
 //! `spec_floor_schedule_arms` lists every arm (`ARM <ops> <oracle ops|->`,
 //! oracle sources first); `spec_floor_schedule_verdict` reads
 //! `SPEC_FLOOR_HW_TRACES/{cand,inc}/<prompt>/<arm>.trace` and applies (a)–(e).
+//!
+//! **Gate 22, calibration neutrality (§7.11).** The calibrated arm of a
+//! schedule (`SPEC_FLOOR_HW_CALIBRATE=1`) must give the identical ids and
+//! identical digests on every surface at every checkpoint as the same
+//! schedule on a fresh load, and a sabotage arm that skips one reset step
+//! must differ. `spec_floor_calibration_arms` lists the arms (`CAL <ops>`,
+//! `CALSABOTAGE <ops> <mode>`); `spec_floor_calibration_verdict` reads
+//! `SPEC_FLOOR_HW_TRACES/{fresh,calibrated}/<prompt>/<arm>.trace` (sabotage
+//! traces `calibrated/<prompt>/<arm>+<mode>.trace`).
 
 use hipfire_arch_qwen35::dflash_spec::DflashSpeculator;
 use hipfire_arch_qwen35::speculative::ModelSlot;
 use hipfire_runtime::loader_api::SpecLoadCfg;
-use hipfire_runtime::spec::{PrefillOutcome, SpecTarget, Speculator};
+use hipfire_runtime::spec::{FloorControl, PrefillOutcome, SpecTarget, Speculator};
 use rdna_compute::GpuTensor;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -87,8 +103,13 @@ const SCHEDULES: [&str; 6] = [
     "F,a2,s2,a20,s1,a6,s3,S",
     "A",
 ];
-/// The sabotage arm: the probe-set schedule, AR token 2 fed a wrong seed.
+/// The sabotage arm: the AR-segment schedule, AR token 2 fed a wrong seed.
 const SABOTAGE: (&str, usize) = ("s3,a6,S", 2);
+/// Gate 22's schedules: an AR segment between windows, a retirement with a
+/// re-entry, the forced-advance interleaving, and pure AR.
+const CALIBRATION_SCHEDULES: [&str; 4] = ["s3,a6,S", "s8,a200,s3,A", "F,a2,s2,a20,s1,a6,s3,S", "A"];
+/// Gate 22's sabotage arms: the first schedule with one reset step skipped.
+const CALIBRATION_SABOTAGE: (&str, [&str; 2]) = ("s3,a6,S", ["skip-drafter", "skip-slot"]);
 const PROMPTS: usize = 4;
 const DEFAULT_TOKENS: usize = 256;
 
@@ -654,11 +675,17 @@ fn qwen35_dflash_floor_schedule_arm() {
         gpu.replay
             .set_pm4_gfx12_dispatch_pacing(rdna_compute::replay::gfx1201_pm4_pacing_from_config());
     }
+    let calibrate = std::env::var("SPEC_FLOOR_HW_CALIBRATE").ok();
+    let calibrated = calibrate
+        .as_deref()
+        .map(|mode| calibrate_load(&mut m, &mut gpu, mode));
     let header = format!(
-        "arm {ops_text} prompt {prompt_path} sabotage {sabotage:?} arch {} route {} retained {enabled} transport {}",
+        "arm {ops_text} prompt {prompt_path} sabotage {sabotage:?} arch {} route {} retained {enabled} transport {} calibrate {} snapshot {}",
         gpu.arch,
         if pm4 { "pm4" } else { "hip" },
-        gpu.replay.transport_name()
+        gpu.replay.transport_name(),
+        calibrate.as_deref().unwrap_or("-"),
+        calibrated.as_deref().unwrap_or("-"),
     );
     eprintln!(
         "spec_floor_schedule_hw: {header} prompt_tokens={}",
@@ -692,6 +719,74 @@ fn qwen35_dflash_floor_schedule_arm() {
     );
     assert!(!replay.failed, "replay failed");
     trace.write(&out, &header);
+}
+
+/// The target half of the reset sequence (KV cache and DeltaNet state
+/// cleared, then synchronized), for gate 22's sabotage arms.
+fn reset_slot(gpu: &mut rdna_compute::Gpu, slot: &mut ModelSlot) {
+    slot.kv_cache.clear_gpu(gpu).expect("KV clear");
+    slot.kv_cache.compact_offset = 0;
+    slot.dn_state.reset(gpu).expect("DeltaNet reset");
+    gpu.hip.device_synchronize().expect("sync");
+}
+
+/// Gate 22: the load-time floor calibration before the schedule. `1` runs
+/// the daemon's own `prepare_spec_floor` (calibrate → reset); `skip-drafter`
+/// and `skip-slot` run the calibration, then the reset sequence with one
+/// step skipped. Returns the calibration's pin for the trace header.
+fn calibrate_load(
+    m: &mut hipfire_loader::LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    mode: &str,
+) -> String {
+    use hipfire_generate::spec_floor_load as load;
+    let line = |prices: Option<hipfire_runtime::spec_prices::PinnedPrices>| {
+        prices.map_or_else(
+            || "none".to_owned(),
+            |p| {
+                let full = p.window(p.full_rows);
+                format!(
+                    "ar_us={},window_us={},b={:.4}",
+                    p.ar_us,
+                    full,
+                    full / p.ar_us
+                )
+            },
+        )
+    };
+    if mode == "1" {
+        load::prepare_spec_floor(m, gpu).expect("calibration reset");
+        let spec = m.speculator.as_mut().expect("speculator");
+        let FloorControl::Driver(df) = spec.floor_control() else {
+            panic!("the DFlash speculator owns no floor");
+        };
+        let (prices, source) = df.snapshot().expect("the calibration pinned");
+        return format!("{},source={}", line(Some(prices)), source.name());
+    }
+    let prompt = m
+        .tokenizer
+        .as_ref()
+        .expect("tokenizer")
+        .encode(load::CALIBRATION_TEXT);
+    let spec = m.speculator.as_mut().expect("speculator");
+    let capacity = spec.ctx_capacity().min(m.physical_cap);
+    let mut guard =
+        hipfire_loader::spec_build::Qwen35SlotGuard::take(&mut m.state).expect("slot guard");
+    let slot = guard.model_slot().expect("model slot");
+    let calibration = load::run_spec_floor_calibration(gpu, spec.as_mut(), slot, &prompt, capacity)
+        .expect("calibration");
+    match mode {
+        "skip-drafter" => {
+            spec.reset(gpu).expect("reset");
+            reset_slot(gpu, slot);
+        }
+        "skip-slot" => spec.reset_to_load(gpu).expect("reset_to_load"),
+        other => panic!("SPEC_FLOOR_HW_CALIBRATE={other}"),
+    }
+    drop(guard);
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    line(calibration.snapshot)
 }
 
 // ─── CPU: arm list and verdict ──────────────────────────────────────────────
@@ -987,4 +1082,93 @@ fn spec_floor_schedule_arm_catalog() {
             assert!(at < me, "oracle source runs first");
         }
     }
+}
+
+// ─── CPU: gate 22 (calibration neutrality) ──────────────────────────────────
+
+fn calibration_sabotage_file(ops: &str, mode: &str) -> String {
+    format!("{}+{mode}.trace", ops.replace(',', "-"))
+}
+
+#[test]
+#[ignore = "lists the gate-22 arms for the driver"]
+fn spec_floor_calibration_arms() {
+    for ops in CALIBRATION_SCHEDULES {
+        println!("CAL {ops}");
+    }
+    for mode in CALIBRATION_SABOTAGE.1 {
+        println!("CALSABOTAGE {} {mode}", CALIBRATION_SABOTAGE.0);
+    }
+}
+
+#[test]
+#[ignore = "reads SPEC_FLOOR_HW_TRACES/{fresh,calibrated} written by qwen35_dflash_floor_schedule_arm"]
+fn spec_floor_calibration_verdict() {
+    let root = PathBuf::from(std::env::var("SPEC_FLOOR_HW_TRACES").expect("SPEC_FLOOR_HW_TRACES"));
+    let mut prompts: Vec<String> = std::fs::read_dir(root.join("fresh"))
+        .expect("fresh traces")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    prompts.sort();
+    let read = |side: &str, prompt: &str, file: &str| {
+        let path = root.join(side).join(prompt).join(file);
+        Trace::read(&path).unwrap_or_else(|| panic!("missing {}", path.display()))
+    };
+    let mut failures = 0usize;
+    let mut required_detected = 0usize;
+    for prompt in &prompts {
+        for ops in CALIBRATION_SCHEDULES {
+            let file = arm_file(ops, None, None);
+            let fresh = read("fresh", prompt, &file);
+            let calibrated = read("calibrated", prompt, &file);
+            let n = fresh.tokens.len().max(calibrated.tokens.len());
+            let ids = id_diffs(&calibrated, &fresh, 0..n);
+            let surf = surface_diffs(&calibrated, &fresh, None);
+            let fail = !ids.is_empty()
+                || !surf.is_empty()
+                || calibrated.tokens.len() != fresh.tokens.len()
+                || calibrated.checkpoints.len() != fresh.checkpoints.len();
+            eprintln!(
+                "(22) {prompt} {ops}: {} ids, {} surfaces over {} checkpoints differ calibrated vs fresh -> {}",
+                ids.len(),
+                surf.len(),
+                fresh.checkpoints.len(),
+                if fail { "FAIL" } else { "pass" }
+            );
+            if fail {
+                summarize(&format!("(22) {prompt} {ops}"), &surf);
+                failures += 1;
+            }
+        }
+        let (ops, modes) = CALIBRATION_SABOTAGE;
+        let fresh = read("fresh", prompt, &arm_file(ops, None, None));
+        for mode in modes {
+            let sab = read("calibrated", prompt, &calibration_sabotage_file(ops, mode));
+            let n = fresh.tokens.len().max(sab.tokens.len());
+            let ids = id_diffs(&sab, &fresh, 0..n);
+            let surf = surface_diffs(&sab, &fresh, None);
+            let detected = !ids.is_empty() || !surf.is_empty();
+            eprintln!(
+                "(22) {prompt} sabotage {mode}: {} ids, {} surfaces differ -> {}",
+                ids.len(),
+                surf.len(),
+                if detected { "detected" } else { "NOT DETECTED" }
+            );
+            summarize(&format!("(22) {prompt} sabotage {mode}"), &surf);
+            required_detected += usize::from(mode == "skip-drafter" && detected);
+        }
+    }
+    eprintln!(
+        "spec_floor_calibration_verdict: {} prompts, {failures} failures, skip-drafter detected on {required_detected}",
+        prompts.len()
+    );
+    assert!(!prompts.is_empty(), "no prompt traces");
+    assert_eq!(
+        required_detected,
+        prompts.len(),
+        "the skip-drafter sabotage arm was not detected on every prompt"
+    );
+    assert_eq!(failures, 0, "gate 22 mismatches");
 }
