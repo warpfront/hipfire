@@ -117,6 +117,9 @@ pub mod offload;
 pub mod spec_economics;
 pub mod spec_lookup;
 pub mod spec_ngram;
+/// Per-load, in-memory speculation prices (AR token and settled window by
+/// context bucket). Pure CPU.
+pub mod spec_prices;
 /// Per-request spec → AR retirement policy. Pure math, no GPU types.
 pub mod spec_retire;
 pub mod spec_sampling;

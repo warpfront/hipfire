@@ -981,6 +981,18 @@ pub trait Speculator {
         None
     }
 
+    /// Who decides speculate-vs-AR for this speculator's requests
+    /// ([`FloorControl`]). Default [`FloorControl::Unsupported`]: a speculator
+    /// with an AR step keeps the count-based [`crate::spec_retire`] policy.
+    fn floor_control(&mut self) -> FloorControl<'_> {
+        FloorControl::Unsupported
+    }
+
+    /// A new speculation epoch of the running request (the driver-owned
+    /// floor re-armed at a think-close): reset request-local width state
+    /// learned before it. Default no-op.
+    fn rearm_spec_epoch(&mut self) {}
+
     /// Repair a terminal that consumed only a strict prefix of the most recent
     /// speculative window. Implementations with a retained pre-window snapshot
     /// restore it and replay only the state-committable prefix, leaving the last
@@ -1169,6 +1181,47 @@ pub trait Speculator {
     /// [`SpecRequestConfig::logprobs`]. Default `None`.
     fn token_logits(&self, _index: usize) -> Option<&[f32]> {
         None
+    }
+}
+
+/// Prefix of the driver-owned floor's exact call-log lines
+/// ([`crate::spec_economics::replay_call_log`]).
+pub const DRIVER_FLOOR_CALL_PREFIX: &str = "QWEN35_DFLASH_FLOOR_CALL";
+
+/// Who decides, per window, whether a request speculates or runs an AR token.
+pub enum FloorControl<'a> {
+    /// No measured floor: a speculator with an AR step keeps the count-based
+    /// [`crate::spec_retire`] policy.
+    Unsupported,
+    /// The speculator decides inside its own step (Qwen4 native MTP's floor);
+    /// the driver arms no retire policy for it.
+    Producer,
+    /// The driver decides with this load-lifetime floor and price cache.
+    Driver(&'a mut DriverFloor),
+}
+
+/// The driver-owned floor of one speculator: allocated once at speculator
+/// build, lives for the load.
+#[derive(Clone, Debug)]
+pub struct DriverFloor {
+    pub floor: crate::spec_economics::FixedFloor,
+    pub prices: crate::spec_prices::LoadPrices,
+}
+
+impl DriverFloor {
+    /// A floor for a load whose full block verifies `full_rows` rows, taking
+    /// `probe_tokens` AR probes at a losing verdict. `call_log` writes the
+    /// floor's exact call log ([`DRIVER_FLOOR_CALL_PREFIX`]) on stderr.
+    pub fn new(full_rows: usize, probe_tokens: usize, call_log: bool) -> Self {
+        let floor = crate::spec_economics::FixedFloor::fixed(probe_tokens);
+        Self {
+            floor: if call_log {
+                floor.with_call_log_enabled(DRIVER_FLOOR_CALL_PREFIX, "qwen35-dflash", true)
+            } else {
+                floor
+            },
+            prices: crate::spec_prices::LoadPrices::new(full_rows),
+        }
     }
 }
 
