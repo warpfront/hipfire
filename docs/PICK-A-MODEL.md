@@ -46,6 +46,20 @@ admit less context than these numbers.
 | 7900 XT (20 GB) | `qwen3.8:27b` with `hipfire config qwen3.8:27b set dflash_mode off`, or `qwen3.8:27b-mq3-xts` | Defaults (mq4-xts + draft): admitted context 15,420, out of memory on a 17.7K-token prompt. mq4-xts AR: context 80,956, the chain completes at 47.2 tok/s. mq3-xts + draft: context 123,361, the chain completes at 26.7 tok/s; gfx1100 has no PM4 decode route for MQ3 + DFlash yet. |
 | 16 GB (7800 XT, 9070 XT) | `qwen3.8:27b-mq3-xts` (defaults: below the 18 GiB floor its draft is not paired), or `qwen3.5:9b` | `qwen3.8:27b` (mq4-xts) is refused at load: AR on both 7800 XT and 9070 XT emulation, and with the draft on the 9070 XT. 9070 XT emulation, mq3-xts AR (fp8 KV): context 77,220, the chain completes at 43.7 tok/s. mq3-xts + draft (forced with `dflash_mode on`): context 8,128, out of memory on a 21.8K-token prompt. |
 
+**On a 16 or 20 GB card, use the compact KV cache:** `hipfire config set kv_cache fwht3`
+(or `HIPFIRE_KV_MODE=fwht3` for one run). It stores K at about 3 bits (V stays
+`q8`), so the KV cache takes roughly a third less memory than the default and the
+same free memory holds a longer context.
+The trade is some quality: `fwht3` has no published KLD pin yet. On these cards
+a longer usable context is usually worth more than that cost; switch back with
+`hipfire config set kv_cache auto` if output quality matters more than length.
+
+Since the table was measured, the VRAM diet and the host-memory token embedding
+(both on beta) raised the 20 GiB emulation's admitted context with the default
+KV: 59,753 for `qwen3.8:27b` with its draft (was 15,420), and 150,347 for
+`qwen3.8:27b-mq3-xts` with its draft. A 16 GB card loads `qwen3.8:27b-mq3-xts`
+without its draft at 107,702.
+
 `hipfire fit qwen3.8:27b --ctx N` evaluates every `qwen3.8:27b-*` tier on your
 GPU, with the paired draft charged against free memory, and names the
 largest tier that fits ([CLI.md](CLI.md#hipfire-fit)).
