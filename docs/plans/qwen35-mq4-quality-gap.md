@@ -791,7 +791,7 @@ Test #1 — Qwen3 plain (no DeltaNet, no Q/K/V bias) discriminator (**STRONG SIG
 After Step B confirmed cross-engine ground truth exists, instrumented both engines for per-layer hidden-state capture on Qwen3.5-0.8B chunk 0:
 
 - `scripts/dump_hf_hidden_states.py` — HF transformers BF16 oracle. Uses a forward-pre-hook on `model.model.norm` to capture the pre-final-norm last-layer output (transformers's `output_hidden_states[n_layers]` is post-norm, which doesn't match hipfire's HiddenStateRingBuffer capture point).
-- `crates/hipfire-runtime/examples/dump_qwen35_hidden_states.rs` — hipfire forward through `forward_scratch_with_hidden`, reusing the existing `HiddenStateRingBuffer` from spec-decode infra with `extract_layers` overridden to `(0..n_layers)` for full coverage.
+- `crates/hipfire-runtime/examples/dump_qwen35_hidden_states.rs` — hipfire forward through `forward_scratch` with `ArHiddenStaging`, reusing the existing `HiddenStateRingBuffer` from spec-decode infra with `extract_layers` overridden to `(0..n_layers)` for full coverage.
 - `scripts/compare_hidden_states.py` — offline per-layer cosine + relative-L2 comparator.
 
 Both dumps are 192 MB (24 layers × 2048 positions × 1024 hidden × 4 B). Identical input tokens (lifted from `qwen3.5-0.8b-bf16.kldref.bin` chunk 0).

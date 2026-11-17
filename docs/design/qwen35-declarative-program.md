@@ -306,7 +306,7 @@ checked token by token against beta (`move-audit.diff`), not on hardware; the
 A3B native FP8 prefill A/B above covers the MoE attention too.
 
 Slice 4 (HIPF-120) adds: `dump_qwen35_hidden_states` (every layer's captured
-hidden row through `forward_scratch_with_hidden`) byte-compared against the
+hidden row through `forward_scratch` with `ArHiddenStaging`) byte-compared against the
 hand arms on 9B, 27B-xt and A3B, plus 16 4B formats in Loki's review; MTP
 battery tau per turn on dense 27B-xt, A3B and Ornith (also the Q8 27B
 sidecar, A3B KV q8/fwht2/fwht4/asym3 and the captured proposal graph); 9B and
