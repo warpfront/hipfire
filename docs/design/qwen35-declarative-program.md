@@ -140,7 +140,6 @@ QKV/alpha/beta tape copies: the DeltaNet-MoE binding forwards `tape_offset`
 to dispatch so DFlash/MTP rollback reads the same rows.
 
 The MoE-only route gates moved with them and exist once:
-`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` (exact IU4 producers),
 `HIPFIRE_GDN_MOE_PRE_FUSED`, `HIPFIRE_GDN_QK_INDEXED`, the MoE GDN route
 order and the chunk-scan output plane. The per-chunk MoE chunk-scan
 admission stays in the chunk loop, beside the dense one, and reaches the

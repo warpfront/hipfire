@@ -283,10 +283,10 @@ pub struct FusedQkvBiasParams<'a> {
     pub bias: [&'a GpuTensor; 3],
 }
 
-/// Operands of the opt-in exact-gfx1201 RMSNorm/FWHT + `block_i4_128` producer
+/// Operands of the exact-gfx1201 RMSNorm/FWHT + `block_i4_128` producer
 /// that feeds a prepared uniform-MQ4V2 QKV (`FusedQkvMq4G256V2`) or QKVZA
 /// (`FusedQkvzaMq4G256V2`) projection
-/// (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`). The F32 `x_rot` store is always
+/// (unconditional on exact gfx1201). The F32 `x_rot` store is always
 /// written so every downstream reader (calibration tap, small tails) sees the
 /// same bytes as the unprepared route.
 pub struct FusedQkvIu4RmsnormParams<'a> {

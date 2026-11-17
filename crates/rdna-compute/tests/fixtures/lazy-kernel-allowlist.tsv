@@ -260,7 +260,7 @@ module	fused_rmsnorm_mq_rotate_awq_i4_fold	developer-opt-in	Non-default develope
 module	fused_rmsnorm_mq_rotate_awq_i4_gfx12	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:4073-4087
 module	fused_rmsnorm_mq_rotate_awq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:6839
 module	fused_rmsnorm_mq_rotate_awq_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:6831
-module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_inreg_short_gfx12_seq	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_RMSNORM_P1A_BATCHED; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
@@ -270,7 +270,7 @@ module	fused_rmsnorm_mq_rotate_i4_fold	developer-opt-in	Non-default developer ov
 module	fused_rmsnorm_mq_rotate_i4_gfx12	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:4073-4087
 module	fused_rmsnorm_mq_rotate_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:6843
 module	fused_rmsnorm_mq_rotate_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:6835
-module	fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_rmsnorm_mq_rotate_mq4v2_fp8_inreg_short_gfx12_seq	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_RMSNORM_P1A_BATCHED; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
@@ -287,11 +287,11 @@ module	fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab	developer-opt-in	Non-defau
 module	fused_silu_mul_mq_rotate_awq_i8_hin_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:6946
 module	fused_silu_mul_mq_rotate_awq_i8_hin_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:6941
 module	fused_silu_mul_mq_rotate_awq_indexed	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; hipfire-dispatch/src/pipeline/mod.rs:4658-4668
-module	fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_silu_mul_mq_rotate_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_silu_mul_mq_rotate_hin_bf16_fp8_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_silu_mul_mq_rotate_hin_fp8_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
-module	fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	fused_silu_mul_mq_rotate_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	gated_add_f32	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/flux_gpu.rs:1736
 module	gated_delta_net	config-opt-in	Non-default configuration: memory.state_quant; qwen35/forward.rs:2447
@@ -319,8 +319,8 @@ module	gated_norm_mq_rotate_awq_i4_gfx12	config-opt-in	Non-default configuration
 module	gated_norm_mq_rotate_awq_i4_gfx12_xbf16	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:5436-5467
 module	gated_norm_mq_rotate_awq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:7051
 module	gated_norm_mq_rotate_awq_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:7043
-module	gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
-module	gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12_xbf16	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12_xbf16	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	gated_norm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	gated_norm_mq_rotate_awq_mq4v2_fp8_inreg_gfx12_xbf16	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	gated_norm_mq_rotate_i4_gfx11	developer-opt-in	Non-default developer override: HIPFIRE_GFX1100_GATED_NORM_V2; rdna-compute/src/gemv.rs:5845-5860
@@ -328,8 +328,8 @@ module	gated_norm_mq_rotate_i4_gfx12	config-opt-in	Non-default configuration: ke
 module	gated_norm_mq_rotate_i4_gfx12_xbf16	config-opt-in	Non-default configuration: kernel.g; rdna-compute/src/gemv.rs:5436-5467
 module	gated_norm_mq_rotate_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:7055
 module	gated_norm_mq_rotate_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:7047
-module	gated_norm_mq_rotate_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
-module	gated_norm_mq_rotate_mq4v2_fp8_gfx12_xbf16	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	gated_norm_mq_rotate_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	gated_norm_mq_rotate_mq4v2_fp8_gfx12_xbf16	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	gated_norm_mq_rotate_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	gated_norm_mq_rotate_mq4v2_fp8_inreg_gfx12_xbf16	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	gated_rmsnorm_sigmoid_rows	non-core-family	Raon RDA output norm (non-w128 shape); hipfire-arch-raon/src/rda.rs:629
@@ -945,7 +945,7 @@ module	hc_sinkhorn_4x4	non-core-family	Non-core family route: DeepSeek4; rdna-co
 module	hc_sinkhorn_4x4_batched	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21011
 module	hc_split_finalize_batched	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21052
 module	hfq4g256_dequantize_to_f16	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/dispatch.rs:5031-5047
-module	indexed_attention_gathered_wmma_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_QWEN4_QSA_PM; rdna-compute/src/tensor_ops.rs:9878
+module	indexed_attention_gathered_wmma_gfx1201	non-core-family	Non-core family route: Qwen4 gathered QSA attention, reached only when qsa_gathered_pm_fits rejects the shape; rdna-compute/src/tensor_ops.rs:12263
 module	indexed_attention_select_exact	developer-opt-in	Non-default developer override: HIPFIRE_QWEN4_QSA_SELECT_EXACT; rdna-compute/src/tensor_ops.rs:91-98
 module	indexer_relu_score_batched	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:21287
 module	indexer_relu_score_batched_f16	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:19597
@@ -1031,7 +1031,7 @@ module	moe_unscatter_silu_clamp_k8	non-core-family	Non-core family route: DeepSe
 module	mq8_rotate_quantize_x_batched	codec-outside-core-rungs	MQ8G256 batched FWHT256 activation producer shared by the prefill GEMM and the n>=3 row-exact verify GEMV; run by the Raon attention-class MQ8G256 projections, an arch outside the admitted core artifact rungs; rdna-compute/src/gemm_mq8g256.rs:475
 module	mq_rotate_x_dual_fp8_gfx12	codec-outside-core-rungs	MFP4/HFP4 route absent from admitted core artifact rungs; gemv.rs:7715-7717
 module	mq_rotate_x_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemv.rs:6058-6063
-module	mq_rotate_x_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	mq_rotate_x_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	mq_rotate_x_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	mq8_rotate_quantize_x	codec-outside-core-rungs	MQ8G256 route absent from admitted core artifact rungs; hipfire-dispatch/src/pipeline/steps.rs:1638
 module	mq_rotate_x_i8_gfx11	developer-opt-in	gfx1151 opt-in only, measured slower: HIPFIRE_MQ6_I8=1 (one-pass rotate + A8 producer of the exact-INT8 MQ6 prefill); rdna-compute/src/gemv.rs:6666
@@ -1057,8 +1057,8 @@ module	qwen4_g942_hc_gates	non-target-arch	Only non-target gfx942 reaches this p
 module	qwen4_g942_rows16_grid	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 row-grid launch of the few-row BF16 MFMA GEMM for the HC read down projection at 17..=256 rows, resolved by arch); rdna-compute/src/cdna/gfx942.rs:2541
 module	qwen4_gdn_lanes_step_f32_gfx942	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 batched F32 GDN lanes core, resolved by arch); rdna-compute/src/cdna/gfx942.rs:1572
 module	qwen4_moe_down_a8_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_QWEN4_MOE_DOWN_A8; rdna-compute/src/qwen4_moe_down_a8.rs:343
-module	qwen4_moe_ep_a8_gfx12	developer-opt-in	Developer overrides HIPFIRE_QWEN4_MOE_EP_A8 (EP prefill) and HIPFIRE_QWEN4_MOE_GU_A8 (default-on kill switch, EP2 9..=64-row verify), like qwen4_moe_down_a8_gfx1201; rdna-compute/src/qwen4_moe_ep_a8.rs:525
-module	qwen4_moe_rotate128_i8_gfx12	developer-opt-in	Developer overrides HIPFIRE_QWEN4_MOE_EP_A8 (EP prefill) and HIPFIRE_QWEN4_MOE_GU_A8 (default-on kill switch, EP2 9..=64-row verify); rdna-compute/src/qwen4_moe_ep_a8.rs:358
+module	qwen4_moe_ep_a8_gfx12	developer-opt-in	Developer overrides HIPFIRE_QWEN4_MOE_EP_A8 (EP prefill), like qwen4_moe_down_a8_gfx1201; rdna-compute/src/qwen4_moe_ep_a8.rs:525
+module	qwen4_moe_rotate128_i8_gfx12	developer-opt-in	Developer overrides HIPFIRE_QWEN4_MOE_EP_A8 (EP prefill); rdna-compute/src/qwen4_moe_ep_a8.rs:358
 module	qwen4_qsa_lanes_f32_gfx942	non-target-arch	Only non-target gfx942 reaches this path (exact gfx942 batched QSA lanes core, resolved by arch); rdna-compute/src/cdna/gfx942_qsa_lanes.rs:289
 module	railgun_copy	developer-opt-in	Registered only in kernel_registry::railgun_entries (kernel_registry.rs:6809-6830), not entries(); loaded by railgun_transport_digests, reached only with HIPFIRE_DFLASH_RAILGUN_WINDOW=1 (default off, hipfire-arch-qwen35/src/dflash_railgun.rs:56-61; builder dflash_railgun_builder.rs:962) or Raon railgun_decode.rs:1877; rdna-compute/src/railgun_window.rs:501
 module	railgun_fill	developer-opt-in	Registered only in kernel_registry::railgun_entries (kernel_registry.rs:6809-6830), not entries(); loaded by railgun_transport_digests, reached only with HIPFIRE_DFLASH_RAILGUN_WINDOW=1 (default off, hipfire-arch-qwen35/src/dflash_railgun.rs:56-61; builder dflash_railgun_builder.rs:962) or Raon railgun_decode.rs:1877; rdna-compute/src/railgun_window.rs:507
@@ -1087,17 +1087,17 @@ module	rope_tail_yarn_interleaved_staged_buf_f32	non-core-family	Non-core family
 module	rope_tail_yarn_interleaved_wide	non-core-family	Non-core family route: DeepSeek4; rdna-compute/src/attention.rs:22422
 module	rotate_with_rms_gfx1100	config-opt-in	Non-default configuration: kernel.rdna; rdna-compute/src/gemv.rs:2767-2769
 module	rotate_with_rms_gfx942	non-target-arch	Only non-target gfx906/gfx942/gfx10 or non-admitted synthetic shapes reach this path; rdna-compute/src/gemv.rs:3304
-module	rotate_x_mq_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	rotate_x_mq_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	rotate_x_mq_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	round_h_bf16_quality_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_EMU_BF16_H; rdna-compute/src/gemv.rs:4453-4460
 module	sigmoid_mul_rotate_x_mq_awq_i8_gfx11	config-opt-in	Non-default configuration: kernel.gfx; rdna-compute/src/gemv.rs:7171
 module	sigmoid_mul_rotate_x_mq_awq_i8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_A8_PREFILL; rdna-compute/src/gemv.rs:7166
-module	sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
-module	sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gil_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gil_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_inreg_gil_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
-module	sigmoid_mul_rotate_x_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
-module	sigmoid_mul_rotate_x_mq4v2_fp8_gil_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL / HIPFIRE_FP8_PROD_INREG; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	sigmoid_mul_rotate_x_mq4v2_fp8_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
+module	sigmoid_mul_rotate_x_mq4v2_fp8_gil_gfx12	developer-opt-in	Non-default developer override: HIPFIRE_IU4_PREFILL; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	sigmoid_mul_rotate_x_mq4v2_fp8_inreg_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	sigmoid_mul_rotate_x_mq4v2_fp8_inreg_gil_gfx12	config-opt-in	Non-default configuration: kernel.iu / kernel.gfx; hipfire-arch-qwen35/src/qwen35/prefill.rs:7596-7640
 module	silu	developer-opt-in	Requires qwen4-dev-profiles feature and hipfire_profile marker; pipeline/layer_ops.rs:4317

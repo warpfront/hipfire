@@ -26,8 +26,8 @@
 //! (`qwen4_moe_sym_gate_up_symbol`, `qwen4_moe_sym_gemm_symbols_wide`,
 //! `qwen4_moe_rotate128_i4_gp_selected`) and refuses unless it agrees with the per-arch default
 //! plan this module documents and returns from `pm_objects` (an env override such as
-//! `HIPFIRE_QWEN4_MOE_SYM_PM=0`, `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR`, `HIPFIRE_MOE_ROTATE_I4_PM=0`,
-//! `HIPFIRE_MOE_IU4_WIDE_TILES=0` would otherwise change what is launched but not what is
+//! `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR`, `HIPFIRE_MOE_ROTATE_I4_PM=0`
+//! would otherwise change what is launched but not what is
 //! certified). Expected plans: gfx1201 resident gate NT4 / down gp-NT4, host-mapped gate NT8 /
 //! down gp-NT8 (gate NT8 also resident once `slots >= 128 E`); gfx1151 NT4/NT4 (rr 1);
 //! gfx1100 NT1/NT1 (flat plane, embedded K3 producer, `k == 640`).
@@ -461,8 +461,7 @@ impl Iu4Arm {
             return Err(format!(
                 "qwen4_moe_verify IU4 arm: the live selector picks {observed:?} but the default \
                  {} plan certified and documented here is {expected:?} (an environment override \
-                 such as HIPFIRE_QWEN4_MOE_SYM_PM / _SYM_DOWN_RR / MOE_ROTATE_I4_PM / \
-                 MOE_IU4_WIDE_TILES is set); unset it",
+                 such as HIPFIRE_QWEN4_MOE_SYM_DOWN_RR / MOE_ROTATE_I4_PM is set); unset it",
                 target.name()
             ));
         }
@@ -757,7 +756,7 @@ impl Iu4Arm {
                     rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151,
                     "kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco",
                     "rdna_compute::kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151 (crates/rdna-compute/src/kernels.rs:4465)",
-                    &format!("{} MoeSymIu4Kernel gfx1151 row (image, entries; native image selected by HIPFIRE_QWEN4_MOE_SYM_PM default)", target.descriptor_lines()),
+                    &format!("{} MoeSymIu4Kernel gfx1151 row (image, entries; native image selected by default)", target.descriptor_lines()),
                     exports,
                     &plan.gate,
                     vec![plan.gate.clone(), plan.down.clone()],

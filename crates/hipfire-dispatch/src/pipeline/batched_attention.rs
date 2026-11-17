@@ -169,27 +169,6 @@ fn gfx12_sigmoid_rotate_quant_admitted(
         && gpu.iu4_producer_quant_fused_active(n, k)
 }
 
-/// A4 (IU4) FA gate in place: `HIPFIRE_A4_FA_GATE_IL=0` keeps the fp8q prep's
-/// gate copy and the compact-gate IU4 sigmoid producer (default on).
-fn a4_fa_gate_in_place_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_A4_FA_GATE_IL", true)
-}
-
-/// A4 (IU4) attention epilogue: `HIPFIRE_A4_ATTN_EPI=0` keeps the fp8q
-/// Q-resident attention's f32 output and the separate `_gil_` slab sigmoid
-/// producer instead of the attention writing that producer's slab (default
-/// on).
-fn a4_attn_epilogue_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_A4_ATTN_EPI", true)
-}
-
-/// gfx1201 ragged fp8q packet: `HIPFIRE_FA_RAGGED_PACKET=0` restores the
-/// incumbent admission (no fp8q prep / Q-resident attention for a widened
-/// chunk whose tail is not a whole 512-row run). Default on.
-fn fa_ragged_packet_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_FA_RAGGED_PACKET", true)
-}
-
 /// Incumbent fp8q n/commit-stride shape predicate (unchanged): single runs
 /// up to 512 rows or whole 512-row runs, with `commit_stride` either absent or
 /// exactly `Some(512)` over whole runs.
@@ -267,7 +246,7 @@ fn try_gfx12_sigmoid_rotate_quant_fused_prepared(
 
 /// gfx1201 FP8-stream FA output producer.  Folds sigmoid, optional AWQ,
 /// FWHT rotation and the scale_mode=1 pack into one row-wide launch;
-/// `HIPFIRE_FP8_PROD_INREG=1` keeps the row in registers and skips `x_rot`.
+/// For K <= 17408 the row stays in registers and `x_rot` is not written.
 /// `gate` is the compact gate copy or, when the fp8q FA prep skipped the
 /// copy, the gate half of `fa_q_full_batch` read in place.
 fn try_gfx12_fp8_stream_sigmoid_prepared(
@@ -1032,7 +1011,6 @@ pub fn dflash_fa_batch_fusion_admitted(
     let n_rot = config.n_rot;
     fusion.is_chain_verify()
         && gpu.arch_caps.supports_dflash_fa_batch_fusions()
-        && !gpu.flags.fa_batch_fuse_off
         && !gpu.flags.rope_interleaved_legacy
         && !tap_active
         && matches!((config.n_heads, config.n_kv_heads), (16, 2) | (24, 4))
@@ -1120,9 +1098,7 @@ pub fn batch_chunk_full_attn_prepare(
     // tap needs pre-RoPE Q, legacy interleaved RoPE needs its own kernel, and
     // every other shape/arch/ctx keeps the old path. Admitted for DFlash
     // chain verify and, since gfx11-1, ordinary prefill (DflashFusionCtx::Off:
-    // −325 µs per N4096 call vs the three-launch chain) unless
-    // HIPFIRE_GFX1100_FA_PREP=0.
-    // HIPFIRE_FA_BATCH_FUSE_OFF=1 restores it byte-for-byte.
+    // −325 µs per N4096 call vs the three-launch chain).
     // Admitted geometries are 16Q/2K and 24Q/4K (Qwen3.8-27B FA is 24/4);
     // HD must be 256 and n_rot 64.
     let fa_prep_n_rot = config.n_rot;
@@ -1131,21 +1107,17 @@ pub fn batch_chunk_full_attn_prepare(
         && config.head_dim == 256
         && fa_prep_n_rot == 64;
     let fa_prep_fused_ok = dflash_fa_batch_fusion_admitted(gpu, config, fusion, n, tap.is_some())
-        || ((fusion == DflashFusionCtx::Off
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA_PREP", true))
+        || (fusion == DflashFusionCtx::Off
             && gpu.arch_caps.is_gfx1100()
-            && !gpu.flags.fa_batch_fuse_off
             && !gpu.flags.rope_interleaved_legacy
             && tap.is_none()
             && fa_prep_shape_ok
             && n >= 1);
     // gfx1151 twin (`qwen35_fa_prep_batched_gfx1151`, same source) in
     // ordinary prefill, bit-exact against the three-launch chain on the
-    // Halo; HIPFIRE_GFX1151_FA_PREP=0 restores the chain.
+    // Halo.
     let fa_prep_fused_gfx1151_ok = fusion == DflashFusionCtx::Off
-        && hipfire_config::developer_bool("HIPFIRE_GFX1151_FA_PREP", true)
         && gpu.arch_caps.is_gfx1151()
-        && !gpu.flags.fa_batch_fuse_off
         && !gpu.flags.rope_interleaved_legacy
         && tap.is_none()
         && fa_prep_shape_ok
@@ -2865,15 +2837,14 @@ pub fn gfx12_fa_prep_fp8q_admitted(
         || !(shape_free || (64..=262_144).contains(&max_ctx_len))
         || !(shape_free
             || fa_fp8q_incumbent_shape(n, commit_stride)
-            || (fa_ragged_packet_enabled()
-                && fa_ragged_packet_split(
-                    n,
-                    commit_stride,
-                    start_pos,
-                    max_ctx_len,
-                    kv_cache.physical_cap,
-                )
-                .is_some()))
+            || fa_ragged_packet_split(
+                n,
+                commit_stride,
+                start_pos,
+                max_ctx_len,
+                kv_cache.physical_cap,
+            )
+            .is_some())
     {
         return false;
     }
@@ -2972,35 +2943,29 @@ pub fn batch_chunk_full_attn_attn(
     // The fp8q prep can leave the sigmoid gate in `fa_q_full_batch` (no
     // 4·n·q_dim-byte copy, and its gate half is never read by the prep) when
     // the output projection will select a sigmoid producer that reads the
-    // gate in place: the gfx1201 IU4 AWQ producer (A4, unless
-    // `HIPFIRE_A4_FA_GATE_IL=0`) or the FP8-stream producer. Mirrors their
+    // gate in place: the gfx1201 IU4 AWQ producer (A4) or the FP8-stream producer. Mirrors their
     // admission: A8 is excluded by `iu4_producer_quant_fused_active` /
     // `gfx12_fp8_stream_admitted` (which also honours the residual family
     // opt-out), the IU4 producer is tried first and the gfx11
     // fusion only after it; gfx1100 S4 needs `gfx12_fa_prep`'s gfx1201 false.
     let fa_gate_in_place = gfx12_fa_prep_fp8q
         && layer.wo.k == q_dim
-        && if gfx12_sigmoid_rotate_quant_admitted(gpu, &layer.wo, layer.wo.k, n, &epilogue) {
-            a4_fa_gate_in_place_enabled()
-        } else {
-            gfx12_fp8_stream_admitted(
+        && (gfx12_sigmoid_rotate_quant_admitted(gpu, &layer.wo, layer.wo.k, n, &epilogue)
+            || (gfx12_fp8_stream_admitted(
                 gpu,
                 Fp8StreamConsumer::Residual,
                 &[layer.wo.dtype],
                 n,
                 layer.wo.k,
-            ) && !gpu.iu4_producer_quant_fused_active(n, layer.wo.k)
-        };
+            ) && !gpu.iu4_producer_quant_fused_active(n, layer.wo.k)));
     // A4 attention epilogue: when the gate stays in place for the gfx1201 IU4
     // AWQ sigmoid producer on the slab route, the fp8q attention itself
-    // writes that producer's A4 slab (`HIPFIRE_A4_ATTN_EPI=0` keeps the
-    // attention + producer pair). Implies the fp8q single-step attend.
+    // writes that producer's A4 slab. Implies the fp8q single-step attend.
     let a4_epi_awq = if fa_gate_in_place
         && (config.n_heads, config.n_kv_heads) == (24, 4)
         && !newly_admitted_ragged
         && gpu.a4_slab_active()
         && gfx12_sigmoid_rotate_quant_admitted(gpu, &layer.wo, layer.wo.k, n, &epilogue)
-        && a4_attn_epilogue_enabled()
     {
         layer.wo.awq_scale
     } else {

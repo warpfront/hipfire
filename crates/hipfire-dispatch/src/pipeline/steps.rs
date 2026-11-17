@@ -1136,7 +1136,7 @@ fn execute_window<'a>(
                     .collect();
                 let group = ops.len();
                 // The OutProj phase that follows the group (the fused lane attention
-                // may rotate its input, `HIPFIRE_QWEN4_QSA_LANES_FUSE`).
+                // may rotate its input).
                 let out_proj = match steps[..end].get(i + group) {
                     Some(Step::IndexedAttention(next)) if next.phase == MixerPhase::OutProj => {
                         Some(next)
@@ -2118,7 +2118,7 @@ fn launch_fused<'a>(
     steps: &[Step<'a>],
 ) -> Result<(), DispatchError> {
     // Step 0 is always RmsnormAutomatic. The exact-gfx1201 MQ4G256V2 mixer
-    // windows fold it into the projection launch (`HIPFIRE_A3B_NORM_FOLD`).
+    // windows fold it into the projection launch.
     if matches!(
         key,
         KernelKey::FusedQkvMq4G256V2 | KernelKey::FusedQkvzaMq4G256V2

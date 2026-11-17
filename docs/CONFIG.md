@@ -433,13 +433,10 @@ The expert-staging levers have no typed schema key. They are `[developer]` keys 
 | `developer.fa_prefill_pm` | `HIPFIRE_FA_PREFILL_PM` | Q8_0 and native FP8: unset = on where qualified; explicit `true` / `1` or `false` / `0` wins | Codec-aware PeaceMaker full-causal prefill on exact gfx1201, H16/KV2/D256, 64..8192 query rows and context 1..262144. Q8_0 K/V and native FP8 E4M3 K/V use their own direct bodies after shared Q16 preconvert. FP8 token rows contain 512 codes and two f16 head scales (516 bytes); `FP8_KV_QUALIFIED` names exact gfx1201 for both PM routes. Unsupported codec/layout, replay recording and graph capture keep the incumbent route. Explicit `0` / `false` kills the route for that codec; this flag does not change auto KV selection. |
 | `developer.fa_prefill_pm_qprep` | `HIPFIRE_FA_PREFILL_PM_QPREP` | Q8_0 and native FP8: unset = on where qualified; explicit `true` / `1` or `false` / `0` wins | Exact F5 Q-prep fold nested under both flags resolved for the actual cache codec. FP8 requires both flags enabled; disabling PM retains the incumbent regardless of this flag. Requires whole PM admission, 64 rotary dimensions, non-legacy half-split RoPE and a plain eager full-causal single-chunk layer. The codec must match both tier-plan entries: the Q8 or FP8 batched cache writer and corresponding masked attention. K then V are written with the matching production writer before `fa_prefill_pm_direct_codec`. FP8 has its own qualified rows; Q8 qualification never enables FP8. |
 | `developer.moe_combine_v2` | `HIPFIRE_MOE_COMBINE_V2` | on where qualified (exact gfx1201) | Admitted grouped BF16-input combine v2; `false` / `0` restores the incumbent. Ordered top-k arithmetic is retained. |
-| `developer.moe_iu4_wide_tiles` | `HIPFIRE_MOE_IU4_WIDE_TILES` | on where qualified (exact gfx1201) | Admitted VRAM-resident symmetric IU4 gate/up runs use the existing NT8 pair when checked slot occupancy permits; `false` / `0` keeps incumbent tiles. |
-| `developer.prefill_iu4_producer_fused` | `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` | on where qualified (exact gfx1201) | Existing prefill RMSNorm/FWHT and SwiGLU/FWHT producers retain the exact eight-candidate IU4 search while avoiding separate preparation; `false` / `0` keeps the incumbent. |
 | `developer.moe_router_fused_prefill` | `HIPFIRE_MOE_ROUTER_FUSED_PREFILL` | on where qualified (exact gfx1201) | Prefill-only exact softmax/top-8/renormalization fusion; all existing shape/execution prerequisites apply. `false` / `0` keeps separate operations. |
 | `developer.moe_router_topk_multirow` | `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW` | on where qualified (exact gfx1201) | Wave-per-row fused router (one wave32 per row, 8 rows per workgroup, any row count), byte-identical to the one-row fused router; requires fused-router admission. `false` / `0` restores the incumbent. |
 | `developer.moe_shared_prepared_iu4` | `HIPFIRE_MOE_SHARED_PREPARED_IU4` | on where qualified (exact gfx1201) | Reuses one prepared shared-expert IU4 activation for selector and gate/up consumers; `false` / `0` keeps per-consumer preparation. |
 | `developer.moe_rotate_i4_pm` | `HIPFIRE_MOE_ROTATE_I4_PM` | on where qualified (exact gfx1201) | Exact-gfx1201 PeaceMaker down-projection rotate/quantize twin of `qwen4_moe_rotate128_i4` (byte-identical); existing runtime-K, layout and execution admission remains required. `false` / `0` restores the HIP incumbent. |
-| `developer.prefill_iu4_c8_pm` | `HIPFIRE_PREFILL_IU4_C8_PM` | on where qualified (exact gfx1201) | PeaceMaker eight-candidate IU4 rotate/RMSNorm-rotate twins (byte-identical), nested beneath the resolved producer-fusion route; preserves rotated f32 side output and complete activation records. `false` / `0` restores the HIP producers. |
 | `developer.gdn_chunk_prep_pm` | `HIPFIRE_GDN_CHUNK_PREP_PM` | on where qualified (exact gfx1201) | PeaceMaker GDN chunk-prep twin (byte-identical) nested beneath the admitted MoE chunk-scan route; unsupported cases retain incumbent preparation. `false` / `0` restores the incumbent. |
 | `developer.moe_shared_down_sigmoid_epi` | `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` | on where qualified (exact gfx1201) | Shared-expert sigmoid-gate epilogue in the existing HIP `full_add_v3` entry, not a PeaceMaker route. Retains the admitted FMA/residual arithmetic. `false` / `0` restores the separate gated residual add. |
 | `developer.gdn_qk_indexed` | `HIPFIRE_GDN_QK_INDEXED` | on where qualified (exact gfx1201) | Sequential Q8-state MoE prefill indexes key-head Q/K by value-head ratio instead of repeating Q/K; `false` / `0` restores repeat/copy. |
@@ -2527,6 +2524,47 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.qwen4_qsa_split_gfx1100` | `qwen4_qsa_split_gfx1100` | 0.4.5 | 0.5.0 | none; exact gfx1100 always takes the split selector where admitted |
 | `developer.stream_ordered_copies` | `stream_ordered_copies` | 0.4.5 | 0.5.0 | none; steady-state copies and fills always run on the active stream |
 | `developer.tp_peer_direct` | `tp_peer_direct` | 0.4.0 | 0.5.0 | none; two-rank peer meshes always take the symmetric direct-peer read |
+| `developer.a3b_norm_fold` | `a3b_norm_fold` | 0.4.5 | 0.5.0 | none; A3B-class gfx1201 single-row decode always folds the norm into its projection GEMV where admitted |
+| `developer.a4_attn_epi` | `a4_attn_epi` | 0.4.0 | 0.5.0 | none; the A4 attention epilogue always runs where its shape and slab gates admit it |
+| `developer.a4_fa_gate_il` | `a4_fa_gate_il` | 0.4.0 | 0.5.0 | none; the fp8q prep route always reads the sigmoid gate in place where admitted |
+| `developer.attn_fa2_generic` | `attn_fa2_generic` | 0.4.5 | 0.5.0 | none; the FA2 latent-attention flash body is always used where admitted |
+| `developer.bf16w_small_rows` | `bf16w_small_rows` | 0.4.5 | 0.5.0 | none; the register-tiled small-rows BF16 GEMM is always used on its admitted arches and shapes |
+| `developer.cpu_expert_pin` | `cpu_expert_pin` | 0.4.3 | 0.5.0 | none; CPU splice workers are always pinned to physical cores |
+| `developer.cpu_pool_spin` | `cpu_pool_spin` | 0.4.5 | 0.5.0 | none; the CPU splice pool always spins before blocking |
+| `developer.dflash_device_accept` | `dflash_device_accept` | 0.4.2 | 0.5.0 | none; singleton sampled DFlash windows always accept on the device where supported |
+| `developer.f1lite` | `f1lite` | 0.4.0 | 0.5.0 | none; F1-lite fused gate/up+SwiGLU always runs where shape and tile admit it |
+| `developer.fa_batch_fuse_off` | `fa_batch_fuse_off` | 0.4.0 | 0.5.0 | none; DFlash FA prep and KV writes are always batched where admitted |
+| `developer.fa_ragged_packet` | `fa_ragged_packet` | 0.4.2 | 0.5.0 | none; ragged chunk tails always take the fp8q prep / Q-resident attention packet where admitted |
+| `developer.fp8_prod_inreg` | `fp8_prod_inreg` | 0.4.0 | 0.5.0 | none; fp8 producers always run in-register for K up to 17408 |
+| `developer.g942_bf16_wide` | `g942_bf16_wide` | 0.4.6 | 0.5.0 | none; 17+ row gfx942 BF16 groups always take the wide64 entry where admitted |
+| `developer.g942_rows16_chain` | `g942_rows16_chain` | 0.4.6 | 0.5.0 | none; gfx942 BF16 projections over 16 rows always chain rows16 launches |
+| `developer.gfx1100_fa_prep` | `gfx1100_fa_prep` | 0.4.0 | 0.5.0 | none; gfx1100 always takes the fused FA prep where admitted |
+| `developer.gfx1151_fa_prep` | `gfx1151_fa_prep` | 0.4.0 | 0.5.0 | none; gfx1151 always takes the fused FA prep twin where admitted |
+| `developer.moe_a8_xlds` | `moe_a8_xlds` | 0.4.5 | 0.5.0 | none; the X-in-LDS grouped routed GEMM is always used where admitted |
+| `developer.moe_iu4_wide_tiles` | `moe_iu4_wide_tiles` | 0.4.3 | 0.5.0 | none; exact gfx1201 always widens resident symmetric IU4 gate/up to NT8 where occupancy admits it |
+| `developer.mq4v2_shared_down_fused` | `mq4v2_shared_down_fused` | 0.4.0 | 0.5.0 | none; the fused shared-down GEMV always runs on gfx1100/gfx1201 where admitted |
+| `developer.pinned_xfer_default` | `pinned_xfer_default` | 0.4.2 | 0.5.0 | none; hipfire always sets GPU_PINNED_MIN_XFER_SIZE unless it is already set |
+| `developer.prefill_iu4_c8_pm` | `prefill_iu4_c8_pm` | 0.4.3 | 0.5.0 | none; exact gfx1201 always runs the C8 PM producers where admitted |
+| `developer.prefill_iu4_producer_fused` | `prefill_iu4_producer_fused` | 0.4.3 | 0.5.0 | none; exact gfx1201 always fuses the exact IU4 producer where admitted |
+| `developer.q8a8_ps` | `q8a8_ps` | 0.4.5 | 0.5.0 | none; T128x128 fast Q8 A8 launches always use the pipelined single-buffer schedule |
+| `developer.q8_mmq_gfx11_tiles` | `q8_mmq_gfx11_tiles` | 0.4.5 | 0.5.0 | none; gfx1100/gfx1151 always take the tiled Q8 MMQ route where admitted |
+| `developer.qwen4_hc_pair_allrows` | `qwen4_hc_pair_allrows` | 0.4.5 | 0.5.0 | none; exact gfx1201 wide-verify HC reads always hand gates to the paired write |
+| `developer.qwen4_hc_pair_decode` | `qwen4_hc_pair_decode` | 0.4.5 | 0.5.0 | none; exact gfx1201 1..=8-row decode always fuses hyper_norm with its GEMV |
+| `developer.qwen4_lwmma_multi_part` | `qwen4_lwmma_multi_part` | 0.4.5 | 0.5.0 | none; lane-WMMA projections always share one multi-part launch where planned |
+| `developer.qwen4_moe_epilogue_fuse` | `qwen4_moe_epilogue_fuse` | 0.4.5 | 0.5.0 | none; the Qwen4 MoE epilogue is always fused where admitted |
+| `developer.qwen4_moe_front_fuse` | `qwen4_moe_front_fuse` | 0.4.3 | 0.5.0 | none; the Qwen4 MoE front producers are always fused where admitted |
+| `developer.qwen4_moe_glue_fold` | `qwen4_moe_glue_fold` | 0.4.5 | 0.5.0 | none; all Qwen4 wide-verify MoE glue folds always run where admitted |
+| `developer.qwen4_moe_gu_a8` | `qwen4_moe_gu_a8` | 0.4.5 | 0.5.0 | none; the owner-masked wide-verify A8 MoE chain always runs where admitted |
+| `developer.qwen4_moe_route_scatter` | `qwen4_moe_route_scatter` | 0.4.5 | 0.5.0 | none; the Qwen4 MoE route always scatters where admitted |
+| `developer.qwen4_moe_sym_pm` | `qwen4_moe_sym_pm` | 0.4.1 | 0.5.0 | none; the PeaceMaker symmetric MoE route is always used |
+| `developer.qwen4_prefill_lwmma_hc` | `qwen4_prefill_lwmma_hc` | 0.4.5 | 0.5.0 | none; HC read down/up projections always take the lane-WMMA kernels where admitted |
+| `developer.qwen4_prefill_lwmma_tile` | `qwen4_prefill_lwmma_tile` | 0.4.5 | 0.5.0 | none; lane-WMMA GEMMs above 64 rows always take the staged-tile kernel where admitted |
+| `developer.qwen4_qsa_lanes_fuse` | `qwen4_qsa_lanes_fuse` | 0.4.5 | 0.5.0 | none; the fused QSA lanes path is always used where admitted |
+| `developer.qwen4_qsa_pm` | `qwen4_qsa_pm` | 0.4.1 | 0.5.0 | none; the PeaceMaker gathered-route producer is always used where admitted |
+| `developer.qwen4_shared_gu_pm` | `qwen4_shared_gu_pm` | 0.4.2 | 0.5.0 | none; the fused shared-expert gate/up + SwiGLU always runs where admitted |
+| `developer.qwen4_trunk_a8_x4` | `qwen4_trunk_a8_x4` | 0.4.5 | 0.5.0 | none; same-K trunk members always share one x4 launch where admitted |
+| `developer.v2b_addepi` | `v2b_addepi` | 0.4.0 | 0.5.0 | none; the V2B residual add epilogue is always used |
+| `developer.verify_tape_copy_batch` | `verify_tape_copy_batch` | 0.4.2 | 0.5.0 | none; singleton chain-verify tape copies are always one batched launch |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 

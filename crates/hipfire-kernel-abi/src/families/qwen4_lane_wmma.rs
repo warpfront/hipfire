@@ -36,7 +36,7 @@
 //!
 //! Admission that is not a function of the launch params stays in the launcher
 //! (`lane_wmma_multi_plan`: 2..=4 non-empty parts, each `S_p` the auto split-K of its part, scratch
-//! fit, `HIPFIRE_QWEN4_LWMMA_MULTI_PART`, `lane_wmma_applies`).
+//! fit, `lane_wmma_applies`).
 
 use crate::{
     Access, Arch, DomainRuleV1, ExportV1, Expr, FieldKind, FieldV1, FormatId, HiddenKind, HiddenV1,

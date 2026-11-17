@@ -12,11 +12,11 @@
 //! the device, over the CPU folds) and the down sidecar produced by the real
 //! `mq_rotate_x_128_v2` plus the shared quantizer. The GEMMs are the certified
 //! builder (PM) expert-run entries the launchers select for the residency and the case's real
-//! slots (gfx1201 host-mapped: NT8 gate/up and down; resident: gate/up NT8 under
-//! `HIPFIRE_MOE_IU4_WIDE_TILES` resolved on (unset on at exact gfx1201) when the slots per expert reach 128, else NT4, and the down
-//! always NT4, so a widened resident pair is the mixed `pm_nt8gu_nt4dn`; reported as
-//! `candidate_total_slots`), or the gfx1151 hipcc NT4 under
-//! `HIPFIRE_QWEN4_MOE_SYM_PM=0`. On gfx1151 PM the down GEMM follows
+//! slots (gfx1201 host-mapped: NT8 gate/up and down; resident: gate/up NT8 when the slots per
+//! expert reach 128 (exact gfx1201 qualification), else NT4, and the down always NT4, so a
+//! widened resident pair is the mixed `pm_nt8gu_nt4dn`; reported as
+//! `candidate_total_slots`).
+//! On gfx1151 PM the down GEMM follows
 //! `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` (1|2|4, row repeat; reported as `down_rr`).
 //! Every other entry of the arch (PM NT1/NT4/NT8, down rr2/rr4 `pm_nt4_dr*`,
 //! gfx1151 hipcc NT1/NT4) is an anchor: it runs on the same grouping and
@@ -819,7 +819,7 @@ const ENTRIES_GFX1201: [Entry; 3] = [
 ];
 
 /// The resident gfx1201 pair the launchers run for a widened expert run
-/// (`HIPFIRE_MOE_IU4_WIDE_TILES` resolved on, slots per expert >= 128): the NT8 gate/up with the incumbent
+/// (slots per expert >= 128 on exact gfx1201): the NT8 gate/up with the incumbent
 /// NT4 down. Not a row of [`ENTRIES_GFX1201`] (that table keeps the uniform NT1/NT4/NT8 anchors),
 /// so [`cand_and_anchors`] matches the route's symbols against it after the table; the symbols
 /// are the table's own `pm_nt8` gate/up and `pm_nt4` down. Every uniform entry stays an anchor.
@@ -866,7 +866,7 @@ fn load_entries(gpu: &mut Gpu) -> Res<()> {
 /// The candidate (the entry the launchers select for this residency and for a grouped call of
 /// `total_slots` real routed slots over the geometry's `geo().e` expert-table entries, down row
 /// repeat included) and its anchors: every other entry of the arch. The width of a resident
-/// gfx1201 gate/up run follows `HIPFIRE_MOE_IU4_WIDE_TILES` and the slots per expert (the down
+/// gfx1201 gate/up run follows the slots per expert (the down
 /// entry stays NT4 resident), so the shape is part of the question and the route's pair can be
 /// the mixed [`MIXED_GFX1201`] entry, matched by its two reported symbols.
 fn cand_and_anchors(gpu: &Gpu, host: bool, total_slots: usize) -> Res<(Entry, Vec<Entry>)> {
@@ -946,10 +946,6 @@ fn report_candidate(
     out.insert("down_rr".into(), cand.down_rr.to_string());
     out.insert("residency".into(), q(residency));
     out.insert("candidate_total_slots".into(), total_slots.to_string());
-    out.insert(
-        "moe_iu4_wide_tiles".into(),
-        gpu.flags.moe_iu4_wide_tiles.to_string(),
-    );
     let names: Vec<String> = anchors.iter().map(|e| q(e.name)).collect();
     out.insert("anchors".into(), format!("[{}]", names.join(",")));
     Ok((cand, anchors))

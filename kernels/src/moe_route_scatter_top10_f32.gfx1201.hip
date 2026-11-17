@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026
 // hipfire — fused Qwen4 E512/top-10 router + grouped scatter, one launch
-// (`HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`, default off; exact gfx1201, 1..=8 rows).
+// (exact gfx1201, 1..=8 rows).
 //
 // This unit is compiled AFTER moe_router_softmax_top10_f32_fast.hip and
 // qwen4_moe_scatter_fused_k8.hip (the module source is the concatenation, see

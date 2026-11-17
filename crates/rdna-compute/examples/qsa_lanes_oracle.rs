@@ -41,7 +41,7 @@
 //!
 //! `cargo run --release -p rdna-compute --features lab --example qsa_lanes_oracle -- [--out DIR] [--steps N] [--replays N] [--quick] [--fuse] [--heads N]`
 //!
-//! `--fuse` (HcQsaFuse, `HIPFIRE_QWEN4_QSA_LANES_FUSE`): the candidate arm takes
+//! `--fuse` (HcQsaFuse): the candidate arm takes
 //! `QsaCoreLanesPlan::launch_fused` (prologue + pool + select, then attention + the
 //! out-projection's `mq_rotate_x`) for the one-row lane sets, and BOTH arms end the step with
 //! the out-projection's rotation of the lanes' outputs (`rotate_x_mq_batched` over the bank

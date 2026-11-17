@@ -397,7 +397,7 @@ pub(crate) fn try_iu4_rmsnorm_prepared(
     Ok(Some(prep))
 }
 
-/// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): whether the FFN
+/// ADD-epilogue fold (gfx1151 V2B): whether the FFN
 /// norm after an out-projection will take the IU4 RMSNorm route, the fold's
 /// only consumer. When it will, the out-projection arms `pbs.gate_ffn_batch`
 /// as the delta for its residual GEMM: that buffer is dead from the
@@ -518,7 +518,7 @@ fn try_iu4_silu_prepared(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FfnGateOutput {
     Separate,
-    /// A4 fusion (`HIPFIRE_V2B_A4_EPI`, default on gfx1151; `=0` opts out): the gate/up epilogue wrote the w_down A4
+    /// A4 fusion (gfx1151 V2B): the gate/up epilogue wrote the w_down A4
     /// sidecar itself; `gate_ffn_batch` (h) was not written.
     Iu4A4(rdna_compute::Int4MmqDownPrepared),
     Iu4H,
@@ -672,8 +672,7 @@ fn try_packed_mq4_ffn_gate_up(
 /// symmetric qt49 gate/up/down feeding the same AWQ h producer). Decided once
 /// per FFN, before gate/up; the gate/up hook then reports whether it actually
 /// emitted h (`Gpu::gemm_gate_up_silu_mq4g256v2_iu4_prepared` /
-/// `gemm_gate_up_silu_mq3v25_iu4_prepared` add the per-arch tile rule and
-/// `HIPFIRE_F1LITE`).
+/// `gemm_gate_up_silu_mq3v25_iu4_prepared` add the per-arch tile rule).
 #[allow(clippy::too_many_arguments)]
 fn f1lite_ffn_eligible(
     gpu: &Gpu,
@@ -868,7 +867,7 @@ pub(crate) fn gfx12_fp8_stream_admitted(
 /// producer + standalone-pack path. Admission is
 /// [`gfx12_fp8_stream_admitted`] (consumer takes FP8; exact gfx1201, eager,
 /// batch >= 64, K % 256 == 0; partial N tiles are masked in-kernel, so odd
-/// tails run unpadded). On `HIPFIRE_FP8_PROD_INREG=1` the producer leaves
+/// tails run unpadded). For K <= 17408 (`fp8_prod_inreg`) the producer leaves
 /// `x_rot` untouched; the admitted consumer reads only the prepared FP8
 /// planes.
 #[allow(clippy::too_many_arguments)]
@@ -901,7 +900,7 @@ pub(crate) fn try_gfx12_fp8_stream_rmsnorm_prepared(
 
 /// gfx1201 FP8-stream down-projection producer. The admitted Lloyd route
 /// writes the exact scale_mode=1 FP8 planes for the residual GEMM.
-/// `HIPFIRE_FP8_PROD_INREG=1` retains the FWHT row in registers.
+/// For K <= 17408 (`fp8_prod_inreg`) the FWHT row stays in registers.
 /// With the paired-row gate/up epilogue, `gate` already contains h and the
 /// h-first in-register producer consumes it without reading `up` or `x_rot`.
 fn try_gfx12_fp8_stream_silu_prepared(
@@ -1656,9 +1655,8 @@ pub(crate) fn lloyd_c16_or_fail(w: &WeightRef<'_>, family: &'static str) -> HipR
     })
 }
 
-/// gfx11 (exact gfx1100|gfx1151) MMQ-LUT route for qt=52, unless kill-switched.
-/// Same arch predicate as the uniform MQ4V2 MMQ path; `HIPFIRE_LLOYD_MMQ_OFF=1`
-/// forces fail-closed via the existing FP8-LUT arm (never uniform).
+/// gfx11 (exact gfx1100|gfx1151) MMQ-LUT route for qt=52. Same arch predicate
+/// as the uniform MQ4V2 MMQ path.
 #[inline]
 pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
     matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151") && !gpu.flags.lloyd_mmq_off
@@ -2263,7 +2261,7 @@ fn swiglu_ffn_gate_up_batched(
         .filter(|_| !mq3v25_a4_weight(gpu, layer.w_gate.dtype))
     {
         // F1-lite: one GEMM v2 launch emits h; else the SET pair below.
-        // A4 fusion (gfx1151 V2B only, default on; `HIPFIRE_V2B_A4_EPI=0` opts out): the epilogue
+        // A4 fusion (gfx1151 V2B only): the epilogue
         // also writes the w_down sidecar, so no h and no hin producer.
         if f1lite {
             if let Some(awq) = layer.w_down.awq_scale {

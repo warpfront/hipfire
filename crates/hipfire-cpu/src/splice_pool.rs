@@ -22,8 +22,6 @@ use std::time::{Duration, Instant};
 pub struct SplicePoolConfig {
     /// Worker count; `0` = one per physical core in the allowed CPU set.
     pub threads: usize,
-    /// Pin each worker to a logical CPU of a distinct physical core.
-    pub pin: bool,
 }
 
 static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
@@ -246,15 +244,6 @@ fn build_pool(cfg: SplicePoolConfig) -> rayon::ThreadPool {
             .build()
             .expect("splice pool: thread pool build failed")
     };
-    if !cfg.pin {
-        let n = if cfg.threads > 0 {
-            cfg.threads
-        } else {
-            physical_core_cpus().map_or_else(fallback_threads, |c| c.primaries.len().max(1))
-        };
-        eprintln!("cpu exec: splice pool {n} threads, unpinned (HIPFIRE_CPU_EXPERT_PIN=0)");
-        return unpinned(n);
-    }
     let Some(cpus) = physical_core_cpus() else {
         let n = fallback_threads();
         eprintln!(
@@ -407,10 +396,7 @@ mod test {
 
     #[test]
     fn splice_pool_runs_work() {
-        let pool = splice_pool(SplicePoolConfig {
-            threads: 0,
-            pin: true,
-        });
+        let pool = splice_pool(SplicePoolConfig { threads: 0 });
         let sum: usize = pool.install(|| {
             use rayon::prelude::*;
             (0..1000usize).into_par_iter().sum()
@@ -420,10 +406,7 @@ mod test {
     }
 
     fn pool() -> &'static rayon::ThreadPool {
-        splice_pool(SplicePoolConfig {
-            threads: 0,
-            pin: true,
-        })
+        splice_pool(SplicePoolConfig { threads: 0 })
     }
 
     /// The spin install returns exactly what the plain install computes, on the pool's workers.
@@ -474,10 +457,7 @@ mod test {
     #[test]
     fn warm_pool_handshake_and_release() {
         use rayon::prelude::*;
-        let cfg = SplicePoolConfig {
-            threads: 0,
-            pin: true,
-        };
+        let cfg = SplicePoolConfig { threads: 0 };
         let work = || (0..50_000u64).into_par_iter().sum::<u64>();
         let want = pool().install(work);
         for _ in 0..20 {

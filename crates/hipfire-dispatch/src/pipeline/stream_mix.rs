@@ -251,8 +251,7 @@ fn gamma<'a>(norm: Option<StreamNorm<'a>>) -> Option<StreamGamma<'a>> {
 /// Router-shaped calls (`m > SMALL_ROWS_SELECTOR_SHAPE_M`, F32 activation, `k` a
 /// multiple of 512) on an arch with the register-tiled kernels (gfx1201, gfx1100:
 /// [`small_rows_thresholds`]) run [`Gpu::gemm_bf16_small_rows`] at every row count, its
-/// profile picked by `n` and the arch's thresholds ([`small_rows_profile`]);
-/// `HIPFIRE_BF16W_SMALL_ROWS=0` restores the routes below.
+/// profile picked by `n` and the arch's thresholds ([`small_rows_profile`]).
 ///
 /// Otherwise `n < BF16_TILED_ROWS_MIN_N` (decode, speculative verify) and every arch
 /// but gfx1201 run `gemm_bf16_xf32_batched`. gfx1201 with `n >= BF16_TILED_ROWS_MIN_N`
@@ -397,8 +396,7 @@ pub(crate) fn small_rows_profile(
 }
 
 /// [`small_rows_profile`] gated by K (the kernels need `k` a multiple of
-/// [`rdna_compute::gemm::BF16_SMALL_ROWS_K_MULTIPLE`]) and by `HIPFIRE_BF16W_SMALL_ROWS`
-/// (developer flag, default ON: bit-identical to the batched/tiled routes; `0` restores them).
+/// [`rdna_compute::gemm::BF16_SMALL_ROWS_K_MULTIPLE`]); bit-identical to the batched/tiled routes.
 fn small_rows_route(
     arch: &str,
     x_bf16: bool,
@@ -406,9 +404,7 @@ fn small_rows_route(
     k: usize,
     n: usize,
 ) -> Option<rdna_compute::gemm::Bf16SmallRowsProfile> {
-    if !k.is_multiple_of(rdna_compute::gemm::BF16_SMALL_ROWS_K_MULTIPLE)
-        || !hipfire_config::developer_bool("HIPFIRE_BF16W_SMALL_ROWS", true)
-    {
+    if !k.is_multiple_of(rdna_compute::gemm::BF16_SMALL_ROWS_K_MULTIPLE) {
         return None;
     }
     small_rows_profile(arch, x_bf16, m, n)

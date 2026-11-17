@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Wave-3 C8 MoE glue folds X8a / X8b: byte ORACLE + timing bench (exact gfx1201; developer
-//! example, `HIPFIRE_QWEN4_MOE_GLUE_FOLD` a / b).
+//! example).
 //!
 //! The reference is the served unfused chain on the ep_a8_wide route: `moe_router_softmax_top10_f32`
 //! (fast router), `moe_scatter_fused_top10`, `ep_tile_mask_pm_gfx1201` (`Gpu::ep_tile_mask`).
@@ -29,8 +29,7 @@
 //! Usage: qwen4_moe_glue_fold oracle | bench
 
 use rdna_compute::moe::TileMaskFold;
-use rdna_compute::{FeatureFlags, Gpu, GpuTensor};
-use std::sync::Arc;
+use rdna_compute::{Gpu, GpuTensor};
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -136,13 +135,6 @@ fn check_arch(gpu: &Gpu) -> Res<()> {
         return Err("requires exact gfx1201".into());
     }
     Ok(())
-}
-
-/// Enable every glue fold on this device (the launchers' admission reads the flags).
-fn enable_folds(gpu: &mut Gpu) {
-    let mut f: FeatureFlags = (*gpu.flags).clone();
-    f.qwen4_moe_glue_fold = 0b111;
-    gpu.flags = Arc::new(f);
 }
 
 struct Table {
@@ -354,7 +346,6 @@ fn run_b(
 fn oracle() -> Res<()> {
     let mut gpu = Gpu::init()?;
     check_arch(&gpu)?;
-    enable_folds(&mut gpu);
     gpu.ensure_router_fault_word()?;
     let seeds: u64 = std::env::var("GLUE_FOLD_SEEDS")
         .ok()
@@ -407,17 +398,6 @@ fn oracle() -> Res<()> {
             )?;
             assert!(!launched, "rows {rows} e {e} k {k} must decline");
         }
-        let mut f: FeatureFlags = (*gpu.flags).clone();
-        f.qwen4_moe_glue_fold = 0b101; // a + c: no router fold
-        gpu.flags = Arc::new(f);
-        assert!(!gpu.moe_glue_fold_route_admitted(16, E, K));
-        assert!(gpu.moe_glue_fold_mask_admitted());
-        let mut f: FeatureFlags = (*gpu.flags).clone();
-        f.qwen4_moe_glue_fold = 0b010; // b only: no mask fold
-        gpu.flags = Arc::new(f);
-        assert!(gpu.moe_glue_fold_route_admitted(16, E, K));
-        assert!(!gpu.moe_glue_fold_mask_admitted());
-        enable_folds(&mut gpu);
         assert!(
             gpu.moe_glue_fold_route_admitted(9, E, K) && gpu.moe_glue_fold_route_admitted(64, E, K)
         );
@@ -738,7 +718,6 @@ fn bench() -> Res<()> {
     const LAYERS: usize = 48;
     let mut gpu = Gpu::init()?;
     check_arch(&gpu)?;
-    enable_folds(&mut gpu);
     gpu.ensure_router_fault_word()?;
     let e0 = gpu.hip.event_create()?;
     let e1 = gpu.hip.event_create()?;

@@ -1730,10 +1730,10 @@ pub struct Gpu {
     /// no locking, bumped after a successful launch submission.
     pub(crate) moe_route_census: crate::gemm::MoeRouteLaunchCensus,
     /// Row-completion counters and quarter scratch of `hyper_norm_gate_k4_outputs_f32`
-    /// (HIPFIRE_QWEN4_HC_PAIR_DECODE), allocated and zeroed on first use; the kernel's last
+    /// (the HC pair decode fusion), allocated and zeroed on first use; the kernel's last
     /// block of a row resets its counter, so it stays zero between launches.
     pub(crate) hc_pair_sync: Option<GpuTensor>,
-    /// Arrival counter of `moe_route_scatter_top10_wide_f32` (HIPFIRE_QWEN4_MOE_GLUE_FOLD b),
+    /// Arrival counter of `moe_route_scatter_top10_wide_f32` (the 9..=64-row router + scatter),
     /// allocated and zeroed on first use; the launch's last workgroup resets it, so it stays zero
     /// between launches. Eager launches only.
     pub(crate) moe_route_sync: Option<GpuTensor>,
@@ -1906,7 +1906,7 @@ pub struct Gpu {
     /// loader from HFQ `mq3v2.symmetric` metadata after group validation;
     /// false for legacy/asymmetric artifacts.
     pub mq3v2_symmetric: bool,
-    /// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): delta buffer
+    /// ADD-epilogue fold (gfx1151 V2B): delta buffer
     /// armed by the caller for the next residual GEMM, and the deferred add
     /// that GEMM left for the following IU4 RMSNorm. See
     /// [`Gpu::arm_residual_fold`].
@@ -2036,7 +2036,7 @@ pub struct Gpu {
     /// the MoE int8 gate/up chain, the int8 down) refuse while it is set.
     pub lane_row_exact_scope: bool,
     /// Set by the HC read around its SIMT down/up projections so the dense prefill lane WMMA knob
-    /// (`HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`) never takes the HC mixers (the HC knob owns them).
+    /// (`HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`) never takes the HC mixers (the HC route owns them).
     pub prefill_lwmma_dense_hold: bool,
     /// Actual singleton AR arithmetic for an eager verify window. The forward
     /// owner restores this host scope binding after success or error; it never

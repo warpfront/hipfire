@@ -68,9 +68,10 @@
 //!
 //! ## Scope limits (see `--plan`)
 //!
-//! * The oracle calls the launchers directly. It does not read
-//!   `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` and does not exercise the
-//!   `PrefillIu4ProducerFused` capability or the prefill.rs wiring.
+//! * The oracle calls the launchers directly. The producer route is
+//!   unconditional on exact gfx1201, so there is no flag to read; the oracle
+//!   does not exercise the `PrefillIu4ProducerFused` capability or the
+//!   prefill.rs wiring.
 //! * The new `gdn_qkvza` consumer is the existing prepared qkvza consumer; on
 //!   exact gfx1201 it runs beta/alpha as plain MMQ SET launches, whereas the
 //!   incumbent wrapper first calls `gemm_mq4g256v2_small_tail_set_iu4` (zeroed
@@ -1228,7 +1229,7 @@ fn prerequisites() -> Vec<&'static str> {
 
 fn limitations() -> Vec<&'static str> {
     vec![
-        "does not read HIPFIRE_PREFILL_IU4_PRODUCER_FUSED and does not exercise the PrefillIu4ProducerFused capability or the prefill.rs/dispatch wiring: it proves launcher-level bytes only",
+        "the producer route is unconditional on exact gfx1201, so there is no flag to read; the oracle does not exercise the PrefillIu4ProducerFused capability or the prefill.rs/dispatch wiring: it proves launcher-level bytes only",
         "sigmoid_mul_f32 ahead of the FA out rotate and rmsnorm_f32 ahead of the router rotate are upstream of the compared sequences and common to both arms (the oracle feeds their outputs directly)",
         "AWQ scales carry no reciprocal planes (AoS, non-slab twins); a slab sidecar from a future producer would be converted and reported as layout:slab",
         "gdn_qkvza: the new prepared consumer runs beta/alpha as plain MMQ SET on gfx1201; the incumbent wrapper goes through small_tail_set_iu4 (zero Y + gfx11 MW4 attempt, MMQ SET fallback); equality is proven only by the output byte compare",

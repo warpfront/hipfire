@@ -18,7 +18,7 @@
 //! | [`EMBEDDING_Q8_BATCHED`] | `embedding_q8_batched` (gfx1201, gfx1100) | `Gpu::embedding_lookup_q8_batched` (`crates/rdna-compute/src/embedding.rs`) |
 //! | [`MOE_GROUPED_QT44_A8_SYM`] | `moe_grouped_qt44_a8_sym_gfx1201_nt{1,2}r{1,2}` (gfx1201) | `Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` (`crates/rdna-compute/src/moe_grouped_qt44_iu4.rs`) |
 //! | [`MOE_GROUPED_QT44_IU4_SYM`] | `moe_grouped_qt44_iu4_sym_gfx1201_nt{1,2,4}r{1,2}` (gfx1201) | `Gpu::gemm_mq4g256v2_moe_grouped_iu4_sym` (same file) |
-//! | [`MOE_GROUPED_QT44_A8_SYM_XLDS`] | `moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8` (gfx1201, `HIPFIRE_MOE_A8_XLDS`, default on) | same launcher, X-in-LDS body (own module) |
+//! | [`MOE_GROUPED_QT44_A8_SYM_XLDS`] | `moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8` (gfx1201) | same launcher, X-in-LDS body (own module) |
 //!
 //! Evidence for every layout: the JIT-cached objects in `~/.hipfire_kernels/<arch>/` (clang offload
 //! bundles; unbundled with `clang-offload-bundler --type=o --targets=hipv4-amdgcn-amd-amdhsa--<arch>`,
@@ -1039,7 +1039,7 @@ small_rows_abi!(
 );
 
 /// Admission of the `gemm_bf16_small_rows` family: the selector `rows_gemm` (and the stream-mix selector
-/// GEMM) send gfx1201 and gfx1100 calls here at every row count unless `HIPFIRE_BF16W_SMALL_ROWS=0`. `small_rows_profile`
+/// GEMM) send gfx1201 and gfx1100 calls here at every row count. `small_rows_profile`
 /// picks the kernel by activation dtype (F32 + M > 32: router `_r*`; BF16 + M <= 32: selector `_s*`) and by
 /// row count, and only for K a multiple of 512 (`small_rows_route`; the kernels have no k tail and the
 /// launcher rejects other K). Every kernel is correct at every row count, so the domain is not row-limited.
@@ -1047,7 +1047,7 @@ const ADMIT_BF16_SMALL_ROWS: RowDomainV1 = RowDomainV1 {
     min_rows: 1,
     max_rows: None,
     predicate: "crates/hipfire-dispatch/src/pipeline/stream_mix.rs::small_rows_profile",
-    kill_env: Some("HIPFIRE_BF16W_SMALL_ROWS"),
+    kill_env: None,
 };
 
 /// Weight binding of the F32 GEMMs: any codec (the runtime holds F32 whatever the file codec), fused
@@ -1077,7 +1077,7 @@ const ADMIT_F32_BATCHED: RowDomainV1 = RowDomainV1 {
 /// `n < BF16_TILED_ROWS_MIN_N` (512) here, and every row count on archs without the tiled kernel
 /// (gfx1100) or with `HIPFIRE_BF16W_TILED_ROWS=0`. On gfx1201 and gfx1100 the router-shaped (F32 activation, M > 32)
 /// and selector-shaped (BF16 activation, M <= 32) calls take the `gemm_bf16_small_rows` kernels instead
-/// ([`ADMIT_BF16_SMALL_ROWS`]) unless `HIPFIRE_BF16W_SMALL_ROWS=0`; other shapes and direct callers
+/// ([`ADMIT_BF16_SMALL_ROWS`]); other shapes and direct callers
 /// still run this kernel.
 const ADMIT_BF16_XF32_BATCHED: RowDomainV1 = RowDomainV1 {
     min_rows: 1,
@@ -1140,7 +1140,7 @@ pub static WORK_GEMM_BF16_XF32_BATCHED: WorkSpecV1 = WorkSpecV1 {
         note: "One wave per output: grid (M, N) gives M and N exactly; K from the BF16 weight. Bytes = A + B + Y \
                extents (A is 2 bytes per element). Every output re-reads its activation row (L2-served), so the \
                true traffic exceeds the operand extents. Selector `rows_gemm`'s route for BF16-resident weights \
-               at n < 512 / non-gfx1201 / kill-switch (`HIPFIRE_BF16W_SMALL_ROWS=0` on gfx1201 / gfx1100: the small-rows \
+               at n < 512 / non-gfx1201 (the small-rows \
                kernels take the router and selector shapes otherwise), and direct callers.",
     },
 };
@@ -1166,7 +1166,7 @@ pub static WORK_GEMM_BF16_XF32_TILED_ROWS: WorkSpecV1 = WorkSpecV1 {
         note: "Grid y = ceil(N/4) leaves N in an interval of 4: ChunkRows narrows it. M in (32, ..] takes this entry, \
                M <= 32 the mp4 entry. Admitted on gfx1201 only, at n >= 512 rows, `HIPFIRE_BF16W_TILED_ROWS=0` \
                restores gemm_bf16_xf32_batched. The router shape (F32 activation) takes the small-rows kernels \
-               instead unless `HIPFIRE_BF16W_SMALL_ROWS=0`. Bytes = A + X + Y extents.",
+               instead. Bytes = A + X + Y extents.",
     },
 };
 
@@ -1192,8 +1192,7 @@ pub static WORK_GEMM_BF16_XF32_TILED_ROWS_MP4: WorkSpecV1 = WorkSpecV1 {
                is 1 for every admitted M, so the grid only bounds M to [1, 32]; the weight match (by M, interval \
                [1, 32]) then binds M exactly (e.g. the 17-row fused mHC phi) and K. Same row domain as \
                gemm_bf16_xf32_tiled_rows. The BF16-activation selector takes the small-rows kernels (or \
-               gemm_bf16_xbf16_tiled_rows) instead; this entry serves an F32 activation, or \
-               `HIPFIRE_BF16W_SMALL_ROWS=0`.",
+               gemm_bf16_xbf16_tiled_rows) instead; this entry serves an F32 activation.",
     },
 };
 
@@ -1238,23 +1237,23 @@ small_rows_work!(
     BINDS_SMALL_ROWS_EXACT,
     "Router shape (F32 activation, M > 32), decode / speculative verify row counts. Grid y = N pins N; grid x = \
      ceil(M/8) leaves M in an interval of 8 that the weight match (by M) binds exactly, with K. Admitted on \
-     gfx1201 and gfx1100, K % 512 == 0 (no k tail), `HIPFIRE_BF16W_SMALL_ROWS=0` restores the batched/tiled routes. Bytes = A + X + Y extents."
+     gfx1201 and gfx1100, K % 512 == 0 (no k tail). Bytes = A + X + Y extents."
 );
 small_rows_work!(
     WORK_GEMM_BF16_XF32_SMALL_ROWS_R4,
     GEMM_BF16_XF32_SMALL_ROWS_R4,
     BINDS_SMALL_ROWS_CHUNKED,
     "Router shape (F32 activation, M > 32), 4 rows per CTA. Grid y = ceil(N/4) leaves N in an interval of 4: \
-     ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail), \
-     `HIPFIRE_BF16W_SMALL_ROWS=0` restores the batched/tiled routes. Bytes = A + X + Y extents."
+     ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail). \
+     Bytes = A + X + Y extents."
 );
 small_rows_work!(
     WORK_GEMM_BF16_XF32_SMALL_ROWS_R8,
     GEMM_BF16_XF32_SMALL_ROWS_R8,
     BINDS_SMALL_ROWS_CHUNKED,
     "Router shape (F32 activation, M > 32), 8 rows per CTA (prefill row counts). Grid y = ceil(N/8) leaves N in \
-     an interval of 8: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail), \
-     `HIPFIRE_BF16W_SMALL_ROWS=0` restores the batched/tiled routes. Bytes = A + X + Y extents."
+     an interval of 8: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail). \
+     Bytes = A + X + Y extents."
 );
 small_rows_work!(
     WORK_GEMM_BF16_XBF16_SMALL_ROWS_S1,
@@ -1262,24 +1261,24 @@ small_rows_work!(
     BINDS_SMALL_ROWS_EXACT,
     "mHC selector shape (BF16 activation, M <= 32), decode / speculative verify row counts. Grid y = N pins N; \
      grid x = ceil(M/17) is 1 for M <= 17 and the weight match (by M) binds M exactly (the 17-row fused mHC \
-     phi) and K. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail), `HIPFIRE_BF16W_SMALL_ROWS=0` restores the xbf16 batched/tiled \
-     routes. Bytes = A + X + Y extents (X is 2 bytes per element)."
+     phi) and K. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail). \
+     Bytes = A + X + Y extents (X is 2 bytes per element)."
 );
 small_rows_work!(
     WORK_GEMM_BF16_XBF16_SMALL_ROWS_S4,
     GEMM_BF16_XBF16_SMALL_ROWS_S4,
     BINDS_SMALL_ROWS_CHUNKED,
     "mHC selector shape (BF16 activation, M <= 32), 4 rows per CTA. Grid y = ceil(N/4) leaves N in an interval \
-     of 4: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail), \
-     `HIPFIRE_BF16W_SMALL_ROWS=0` restores the xbf16 batched/tiled routes. Bytes = A + X + Y extents."
+     of 4: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail). \
+     Bytes = A + X + Y extents."
 );
 small_rows_work!(
     WORK_GEMM_BF16_XBF16_SMALL_ROWS_S8,
     GEMM_BF16_XBF16_SMALL_ROWS_S8,
     BINDS_SMALL_ROWS_CHUNKED,
     "mHC selector shape (BF16 activation, M <= 32), 8 rows per CTA (prefill row counts). Grid y = ceil(N/8) \
-     leaves N in an interval of 8: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail), \
-     `HIPFIRE_BF16W_SMALL_ROWS=0` restores the xbf16 batched/tiled routes. Bytes = A + X + Y extents."
+     leaves N in an interval of 8: ChunkRows narrows it; M and K bind from the weight. Admitted on gfx1201 and gfx1100, K % 512 == 0 (no k tail). \
+     Bytes = A + X + Y extents."
 );
 
 // ================================================================================================
@@ -2125,8 +2124,7 @@ pub static WORK_MOE_GROUPED_QT44_IU4_SYM: WorkSpecV1 = WorkSpecV1 {
 const A8_XLDS_SRC: &str = "kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip";
 const A8_XLDS_MODULE: &str = "moe_grouped_qt44_a8_sym_xlds_gfx12";
 
-/// W4A8 grouped routed experts, X-in-LDS body (`Gpu::gemm_mq4g256v2_moe_grouped_a8_sym` behind
-/// `HIPFIRE_MOE_A8_XLDS`, default ON, gfx1201 only): ONE export in its own module
+/// W4A8 grouped routed experts, X-in-LDS body (`Gpu::gemm_mq4g256v2_moe_grouped_a8_sym`, gfx1201 only): ONE export in its own module
 /// (`kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip`; the `nt{1,2}r{1,2}` module is untouched). Kernarg layout,
 /// operands, fields, numerics and domain are those of [`MOE_GROUPED_QT44_A8_SYM`] (72 B, `n_experts@68`, no hidden
 /// words): the arithmetic is identical (bit-identical output, card-proven at every row class), only the data movement
@@ -2169,17 +2167,17 @@ const ADMIT_QT44_A8_XLDS: RowDomainV1 = RowDomainV1 {
     min_rows: 16,
     max_rows: None,
     predicate: "crates/rdna-compute/src/moe_grouped_qt44_iu4.rs::MOE_A8_XLDS_MIN_ROWS",
-    kill_env: Some("HIPFIRE_MOE_A8_XLDS"),
+    kill_env: None,
 };
 
-/// The A8 work, admitted behind `HIPFIRE_MOE_A8_XLDS` (default on; `0` kills) from `MOE_A8_XLDS_MIN_ROWS` grouped rows.
+/// The A8 work, admitted on gfx1201 from `MOE_A8_XLDS_MIN_ROWS` grouped rows.
 pub static WORK_MOE_GROUPED_QT44_A8_SYM_XLDS: WorkSpecV1 = WorkSpecV1 {
     abi: &MOE_GROUPED_QT44_A8_SYM_XLDS,
     work: WorkV1 {
         admit: ADMIT_QT44_A8_XLDS,
-        note: "X-in-LDS body of the W4A8 route (default ON, gfx1201): same work, bindings (routed `rows`/`tokens` \
+        note: "X-in-LDS body of the W4A8 route (gfx1201): same work, bindings (routed `rows`/`tokens` \
                from `m_total`, expert K match) and lower-bound byte model as the A8 contract; bit-identical output. \
-               Replaces the `select_entry_a8` entry when `HIPFIRE_MOE_A8_XLDS=1`, `M % 128 == 0` and `m_total >= \
+               Replaces the `select_entry_a8` entry when `M % 128 == 0` and `m_total >= \
                MOE_A8_XLDS_MIN_ROWS`; block 256, dynamic LDS 17920, grid (M/128, m_total/16).",
         ..WORK_MOE_GROUPED_QT44_A8_SYM.work
     },
@@ -2632,10 +2630,6 @@ mod tests {
         assert_eq!(abi.fields.len(), MOE_GROUPED_QT44_A8_SYM.fields.len());
         assert_eq!(abi.numeric, MOE_GROUPED_QT44_A8_SYM.numeric);
         assert_eq!(WORK_MOE_GROUPED_QT44_A8_SYM_XLDS.work.admit.min_rows, 16);
-        assert_eq!(
-            WORK_MOE_GROUPED_QT44_A8_SYM_XLDS.work.admit.kill_env,
-            Some("HIPFIRE_MOE_A8_XLDS")
-        );
     }
 
     // ---- layouts equal the inspected metadata --------------------------------------------------
@@ -2898,11 +2892,6 @@ mod tests {
         for (_, w, symbol, ..) in small_rows_cases() {
             assert_eq!(w.work.admit.min_rows, 1, "{symbol}");
             assert_eq!(w.work.admit.max_rows, None, "{symbol}");
-            assert_eq!(
-                w.work.admit.kill_env,
-                Some("HIPFIRE_BF16W_SMALL_ROWS"),
-                "{symbol}"
-            );
             assert!(
                 w.work
                     .admit

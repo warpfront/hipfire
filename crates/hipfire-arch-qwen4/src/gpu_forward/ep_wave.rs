@@ -123,7 +123,7 @@ pub(crate) fn exact_wave_lane_floor_from(value: Option<&str>, batch_exact_off: b
 /// Whether a wave of `lane_rows` runs its row-local dense stages jointly
 /// ([`ep_wave_policy_for`]): only when EVERY lane has at least `floor` rows, where `floor` is
 /// `FeatureFlags::qwen4_prefill_lwmma_floor_knob`: `QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS` while
-/// the dense and HC prefill entries are on, else `WIDE_VERIFY_MAX_ROWS + 1` (65, every lane wider
+/// the dense prefill entry is on, else `WIDE_VERIFY_MAX_ROWS + 1` (65, every lane wider
 /// than the few-row window). The joint HC / GDN / QSA launches select their kernels on the real
 /// rows of the call (lane WMMA at 16..=64 rows, the HC8 decode route, the 9..=48-row MQ6 tile), so
 /// a lane below `floor` reproduces its singleton bytes only with its own per-lane launches; a lane

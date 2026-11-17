@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte oracle and hipEvent microbench of the Qwen4 MoE front producer fusion (exact gfx1201 or
-//! exact gfx1151, `HIPFIRE_QWEN4_MOE_FRONT_FUSE`).
+//! exact gfx1151).
 //!
 //! The sealed grouped prefill's symmetric-IU4 route reads the HC `mixed` rows `[rows, 2560]` F32
 //! in three producers on gfx1201 (two on gfx1151, whose F16 WMMA gate/up rotates itself and so
@@ -578,7 +578,7 @@ fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     if !matches!(gpu.arch.as_str(), "gfx1201" | "gfx1151") || !gpu.qwen4_moe_front_fuse_applies() {
         eprintln!(
-            "qwen4_moe_front_oracle: needs exact gfx1201 or gfx1151 with HIPFIRE_QWEN4_MOE_FRONT_FUSE on \
+            "qwen4_moe_front_oracle: needs exact gfx1201 or gfx1151 with the front producer fusion admitted \
              (arch {}, applies {})",
             gpu.arch,
             gpu.qwen4_moe_front_fuse_applies()

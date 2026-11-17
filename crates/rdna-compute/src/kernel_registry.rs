@@ -326,9 +326,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         ["gated_delta_net_q8_fast_stream"]
     );
     // DFlash verify tape capture (`Gpu::tape_copy_batched`, tape_copy.rs): the
-    // kernel source has no arch guard and the launcher no arch gate
-    // (HIPFIRE_VERIFY_TAPE_COPY_BATCH defaults on), so every inventory carries
-    // it; module key == symbol, source is the launcher's own constant.
+    // kernel source has no arch guard and the launcher no arch gate, so every
+    // inventory carries it; module key == symbol, source is the launcher's own constant.
     add!(
         "tape_copy_batched",
         crate::tape_copy::TAPE_COPY_BATCHED_SRC,
@@ -2846,7 +2845,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "moe_down_combine_grouped_top10_bf16in_ordered_zinit"
             ]
         );
-        // `HIPFIRE_QWEN4_MOE_GLUE_FOLD=c` (opt-in, exact gfx1201): the wide-verify A8 gate/up GEMM with
+        // Glue fold c (exact gfx1201): the wide-verify A8 gate/up GEMM with
         // the down producer folded into its epilogue, a module of its own over the unchanged legacy A8
         // GEMM source. The module therefore also defines the legacy entries (never requested from it:
         // the launchers load those from `qwen4_moe_ep_a8_gfx12`); the registry declares what the
@@ -3064,7 +3063,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::MOE_ROUTER_SOFTMAX_TOP10_F32_FAST_SRC,
             ["moe_router_softmax_top10_f32_fast"]
         );
-        // `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER` (developer, default on): router + scatter, one launch.
+        // Fused router + scatter, one launch.
         if arch == "gfx1201" {
             // Output-tiled Qwen4 decode BF16 rows GEMVs (HIPFIRE_QWEN4_BF16_ROWS_OTILE, default on).
             add!(
@@ -3117,7 +3116,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                     "moe_scatter_fused_k8"
                 ]
             );
-            // `HIPFIRE_QWEN4_MOE_GLUE_FOLD` (opt-in): scatter + owner tile mask, and the 9..=64-row
+            // Glue folds X8a / X8b: scatter + owner tile mask, and the 9..=64-row
             // router + scatter (+ mask), one launch each.
             add!(
                 "moe_route_scatter_wide",
@@ -3777,9 +3776,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             crate::tensor_ops::QSA_LANES_SRC.into(),
             extra_flags,
         ));
-        // Default-off fused QSA lane core (`HIPFIRE_QWEN4_QSA_LANES_FUSE`; qsa_core_lanes.rs
-        // launch_fused): the qsa_lanes translation unit plus the two fused kernels, in its own
-        // module so the unfused module's source is untouched.
+        // Fused QSA lane core (qsa_core_lanes.rs launch_fused): the qsa_lanes translation
+        // unit plus the two fused kernels, in its own module so the unfused module's source
+        // is untouched.
         entries.push(entry(
             arch,
             crate::tensor_ops::QSA_LANES_FUSE_MODULE,
@@ -4301,7 +4300,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::MQ_ROTATE_X_I4_SRC,
             ["mq_rotate_x_i4"]
         );
-        // Qwen4 MoE front producer (HIPFIRE_QWEN4_MOE_FRONT_FUSE): the F16-output twin.
+        // Qwen4 MoE front producer: the F16-output twin.
         add!(
             "mq_rotate_x_i4_f16out",
             kernels::MQ_ROTATE_X_I4_F16OUT_SRC,
@@ -4370,7 +4369,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hc_row_write_norm_gate_gfx1201",
             ]
         );
-        // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE` (developer, default off).
+        // Shared-down combine epilogue: combine, shared-down rows and shared fold in one launch.
         add!(
             "moe_shared_down_combine",
             crate::tensor_ops::MOE_SHARED_DOWN_COMBINE_SRC,
@@ -4572,7 +4571,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     if arch == "gfx1201" {
-        // A3B decode norm fold (`HIPFIRE_A3B_NORM_FOLD`): RMSNorm + FWHT rotate
+        // A3B decode norm fold: RMSNorm + FWHT rotate
         // inside the MQ4G256V2 projection GEMV that consumes it.
         add!(
             "fused_rmsnorm_proj4_mq4g256v2_fold_gfx1201",
@@ -11628,7 +11627,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // The Qwen4 MoE front producer (`HIPFIRE_QWEN4_MOE_FRONT_FUSE`) adds the
+        // The Qwen4 MoE front producer adds the
         // `mq_rotate_x_i4` source's F16-output twin.
         const MOE_FRONT_ADDED_MODULES: [&str; 1] = ["mq_rotate_x_i4_f16out"];
         for module in MOE_FRONT_ADDED_MODULES {
@@ -11982,7 +11981,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: the shared-down rows GEMV with the combine + shared fold epilogue.
+        // The shared-down rows GEMV with the combine + shared fold epilogue.
         const MOE_EPILOGUE_FUSE_ADDED_MODULES: [&str; 1] = ["moe_shared_down_combine"];
         for module in MOE_EPILOGUE_FUSE_ADDED_MODULES {
             assert!(
@@ -12145,7 +12144,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // `HIPFIRE_QWEN4_MOE_GLUE_FOLD` (opt-in, exact gfx1201, wide-verify int8 chain): the
+        // Wide-verify int8 chain (exact gfx1201): the
         // scatter + owner tile mask launch and the 9..=64-row router + scatter (+ mask) launch.
         const GLUE_FOLD_ADDED_MODULES: [&str; 1] = ["moe_route_scatter_wide"];
         for module in GLUE_FOLD_ADDED_MODULES {
@@ -12160,7 +12159,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // `HIPFIRE_QWEN4_MOE_GLUE_FOLD=c` (opt-in, exact gfx1201, wide-verify int8 chain): the A8
+        // Glue fold c (exact gfx1201, wide-verify int8 chain): the A8
         // gate/up GEMM with the rotate128 down producer in its epilogue.
         const GLUE_FOLD_ROTATE_ADDED_MODULES: [&str; 1] = ["qwen4_moe_ep_a8_rot_gfx12"];
         for module in GLUE_FOLD_ROTATE_ADDED_MODULES {

@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Builder-emitted gfx1201 device accept / residual / bonus of a sampled
-//! singleton DFlash window (`HIPFIRE_DFLASH_DEVICE_ACCEPT`), one module
+//! singleton DFlash window, one module
 //! `dflash_sampled_accept_pm_gfx1201` with the symbol
 //! `dflash_sampled_accept_sparse_q_f32_pm_gfx1201`: the kernarg ABI (`probs`,
 //! `tau_rows`, `z_rows`, `payload`, `out`, `n`, `vocab`; 48 bytes), grid `[1]`,

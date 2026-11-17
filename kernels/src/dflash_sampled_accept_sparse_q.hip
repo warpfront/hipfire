@@ -3,8 +3,8 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 //
 // Device accept / residual / bonus of a sampled singleton DFlash window
-// (HIPFIRE_DFLASH_DEVICE_ACCEPT), over the resident FAST_SAMPLE target rows
-// of `softmax_temp_topp_batched_f32` and the host's SPARSE selector q rows.
+// over the resident FAST_SAMPLE target rows of `softmax_temp_topp_batched_f32`
+// and the host's SPARSE selector q rows.
 // No target row, no compaction and no dense q ever leaves or touches the host:
 // the host uploads one payload (tokens, pre-drawn uniforms, q) and downloads
 // four words.

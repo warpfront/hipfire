@@ -5,7 +5,7 @@
 // GEN-MOE packet A winner M3: `moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8` — nt4 x rf1, 8 waves (block 256, dynamic LDS 17920),
 // X epoch tile of a 4-tile (64-slot) expert run staged once per CTA in a 2-stage LDS ring shared by 8 waves.
 // Launch: block 256, dynamic LDS 17920 B, grid [M / 128, m_total / 16, 1] (the nt2r2 grid; non-leader tiles return).
-// Route: Gpu::gemm_mq4g256v2_moe_grouped_a8_sym behind HIPFIRE_MOE_A8_XLDS (developer, default OFF), gfx1201, m_total >= MOE_A8_XLDS_MIN_ROWS.
+// Route: Gpu::gemm_mq4g256v2_moe_grouped_a8_sym on gfx1201, m_total >= MOE_A8_XLDS_MIN_ROWS.
 #define MC_NT 4
 #define MC_RF 1
 #define MC_NW 8

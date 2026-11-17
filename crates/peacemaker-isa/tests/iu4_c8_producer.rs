@@ -13,8 +13,7 @@
 //! bytes of every `block_i4_128` record - with an independent Rust transcription of the incumbent HIP graph
 //! (`mq_rotate_x_i4.hip`, `fused_rmsnorm_mq_rotate.hip`, `block_i4_128_quant.hip`, `cand_mode == 8`), written
 //! lane by lane from the HIP source (butterflies through per-lane arrays, remap lanes, `shfl_down` / `shfl_xor`
-//! semantics). The interpreter is not the hardware: the GPU byte oracle (`iu4_c8_pm_oracle`) remains the final
-//! gate.
+//! semantics). The interpreter is not the hardware: this is an emulator check, not a GPU gate.
 use peacemaker_ir::emu::{trans, Emulator, Launch, Memory};
 use peacemaker_ir::inst::Frontend;
 use peacemaker_isa::kernels::iu4_c8_producer::{self as c8, Export};
@@ -826,7 +825,7 @@ fn run(rig: &Rig, export: Export, i: &Inputs) -> (Vec<u32>, Vec<u8>) {
         Export::Rotate => (i.rows * i.k / 256, 32),
         Export::Norm => (i.rows, 256),
         Export::SigmoidRotate | Export::NormOut => {
-            unreachable!("the folded exports are proven by the GPU byte oracle (iu4_c8_pm_oracle)")
+            unreachable!("the folded exports are not emulated by this test")
         }
     };
     for wg in 0..grid {

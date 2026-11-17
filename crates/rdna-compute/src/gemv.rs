@@ -825,10 +825,10 @@ fn gfx942_rotate_live_validation_enabled() -> bool {
         == Some("1")
 }
 
-/// In-register fp8 producers (no `x_rot` round trip). Default on after
-/// byte-identical H2 KLD and +1.8% pp8192; `HIPFIRE_FP8_PROD_INREG=0` opts out.
+/// In-register fp8 producers (no `x_rot` round trip) for K <= 17408; larger K
+/// keeps the `x_rot` producers.
 pub(crate) fn fp8_prod_inreg(k: usize) -> bool {
-    k <= 17408 && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", true)
+    k <= 17408
 }
 /// Phase-1a-batched fp8 SHORT RMSNorm: up to 8 row loads in flight per wave
 /// instead of one, same arithmetic order (bit-identical rms). Default on;
@@ -4173,9 +4173,9 @@ impl Gpu {
                 "fused_rmsnorm_rotate_mq_i4_gfx12_batched: reservation (k,n) mismatch",
             ));
         }
-        // Exact (reference8) producer only: `HIPFIRE_PREFILL_IU4_C8_PM` (opt-in, nested beneath
-        // the resolved F3 flag) swaps in the byte-identical PeaceMaker C8 twin when admitted;
-        // every other request runs the HIP export below unchanged.
+        // Exact (reference8) producer only: the byte-identical PeaceMaker C8 twin swaps in when
+        // admitted, nested beneath the F3 producer fusion; every other request runs the HIP
+        // export below unchanged.
         if exact
             && self.iu4_c8_pm_admitted(
                 true,
@@ -4560,8 +4560,8 @@ impl Gpu {
         })
     }
     /// gfx1201 FP8-stream producer for residual down projections. Fuses
-    /// SwiGLU/AWQ/FWHT with the scale_mode=1 MQ4v2 pack. Under
-    /// HIPFIRE_FP8_PROD_INREG=1, x_rot is not written; the prepared planes
+    /// SwiGLU/AWQ/FWHT with the scale_mode=1 MQ4v2 pack. For K <= 17408,
+    /// x_rot is not written; the prepared planes
     /// are the only valid downstream output.
     #[allow(clippy::too_many_arguments)]
     pub fn fused_silu_mul_rotate_mq_fp8_gfx12_batched(
@@ -20169,10 +20169,10 @@ impl Gpu {
             && self.route_rows(rows) < crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
     }
 
-    /// Same as [`Gpu::prefill_lwmma_dense_applies`] for the HC read projections
-    /// (`HIPFIRE_QWEN4_PREFILL_LWMMA_HC`, default on), without the HC hold.
+    /// Same as [`Gpu::prefill_lwmma_dense_applies`] for the HC read projections, without the
+    /// HC hold.
     pub fn prefill_lwmma_hc_applies(&self, rows: usize) -> bool {
-        self.flags.qwen4_prefill_lwmma_hc_enabled()
+        self.flags.qwen4_lane_wmma_enabled()
             && !self.lane_row_exact_scope
             && (rows > WIDE_VERIFY_MAX_ROWS || self.prefill_small_lane_rows(rows))
             && self.route_rows(rows) < crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
@@ -22760,7 +22760,7 @@ impl Gpu {
                     .all(|&(_, y, m)| m == 0 || (y.dtype == DType::F32 && k.is_multiple_of(128)))
             {
                 // Terms 2: general f32 activations, no `hc_act`. Parts with m == 0 are padding.
-                // `HIPFIRE_QWEN4_LWMMA_MULTI_PART`: two or more live parts are ONE launch, each
+                // Two or more live parts are ONE launch, each
                 // part's bytes the per-part launch's.
                 let mut live = [LaneWmmaMultiPart {
                     w: parts[0].0,

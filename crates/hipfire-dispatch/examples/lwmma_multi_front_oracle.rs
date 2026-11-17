@@ -3,15 +3,14 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte oracle of the served call site of the multi-part lane-WMMA launch
-//! (`HIPFIRE_QWEN4_LWMMA_MULTI_PART=1`, exact gfx1201): `project_weights` over the BF16 members
+//! (exact gfx1201): `project_weights` over the BF16 members
 //! of the wide MoE block's dense front (router | selector | shared gate | shared up, K = 2560,
 //! rows 16..=64; plus a five-member group, which must chunk four + one) against today's
 //! per-member `lane_wmma_gemm_fixed` (two terms, auto split-K). Outputs start NaN-dirty with
-//! sentinel tails; every word is compared. With the flag on a `_multi` entry must have been
-//! loaded, with it off none (the oracle then proves the default path is the per-member loop).
+//! sentinel tails; every word is compared. The served route must load a `_multi` entry.
 //!
 //! ```text
-//! [HIPFIRE_QWEN4_LWMMA_MULTI_PART=1] cargo run --release -p hipfire-dispatch \
+//! cargo run --release -p hipfire-dispatch \
 //!   --features test-utils --example lwmma_multi_front_oracle
 //! ```
 
@@ -86,8 +85,6 @@ fn main() -> R<()> {
     if !gpu.arch_caps.is_gfx1201() {
         return Err("requires exact gfx1201".into());
     }
-    let flag_on = gpu.flags.qwen4_lwmma_multi_part_enabled();
-    println!("HIPFIRE_QWEN4_LWMMA_MULTI_PART enabled: {flag_on}");
     let (mut cells, mut words, mut mismatches) = (0usize, 0u64, 0u64);
     for &(label, ms) in CASES {
         let mut ws = Vec::new();
@@ -155,9 +152,9 @@ fn main() -> R<()> {
         .filter(|n| n.ends_with("_n1_multi"))
         .collect();
     println!("multi entries loaded: {multi:?}");
-    let route_ok = multi.is_empty() == !flag_on;
+    let route_ok = !multi.is_empty();
     println!(
-        "cells {cells} | words compared {words} | mismatches {mismatches} | multi loaded iff flag: {route_ok}"
+        "cells {cells} | words compared {words} | mismatches {mismatches} | multi loaded: {route_ok}"
     );
     let pass = mismatches == 0 && route_ok;
     println!("ORACLE {}", if pass { "PASS" } else { "FAIL" });

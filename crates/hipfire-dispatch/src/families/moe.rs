@@ -1605,10 +1605,10 @@ pub trait MoeRowGather {
         false
     }
 
-    /// The owner mask of the wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GU_A8`, `ep_a8_wide`) of this
+    /// The owner mask of the wide-verify int8 chain (`ep_a8_wide`) of this
     /// layer's call: `Some` only where [`Self::gather_skipped`] holds and the rank built its owner table
     /// at EP attach, so the chain masks the tiles of every expert another rank owns out of both A8
-    /// GEMMs and folds only owned rows. `None` (default): the chain runs over unmasked tiles, the
+    /// GEMMs and folds only owned rows. `None`: the chain runs over unmasked tiles, the
     /// non-owned experts on the zero dummy tables, byte-identical.
     fn decode_owner_mask(&self, _layer_idx: u16) -> Option<MoeDecodeOwnerMask<'_>> {
         None
