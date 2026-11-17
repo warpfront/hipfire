@@ -700,6 +700,7 @@ pub(crate) fn route_capabilities(
         // spelled out separately.
         "refused_request_fields": if multi_slot {
             serde_json::json!([
+                "n",
                 "best_of",
                 "logit_bias",
                 "echo",
@@ -3015,13 +3016,6 @@ pub(crate) fn supervise_engine(shared: &ServeShared) -> Result<()> {
     Ok(())
 }
 
-/// Startup validation for the serving admission path (spec §5.2, §5.3, §9.1).
-///
-/// Rejects: (1) `serve.max_batch_tokens < serve.prefill_min_tokens` so a
-/// nonzero prefill quantum always fits the global trunk-row budget; (2)
-/// experimental multi-slot combined with `continuous_batch_size > 1`; (3)
-/// `serve.max_queue == 0` when multi-slot is enabled — an uncapped queue is
-/// rejected rather than reinterpreted in robust multi-slot mode.
 /// Verify rows one speculative slot may inject in a step (the VMM
 /// reserve-slack upper bound), as in `serve_engine`.
 const MAX_VERIFY_ROWS_PER_SLOT: u64 = 64;
@@ -3051,6 +3045,13 @@ fn multi_slot_scratch_formula(prefill_chunk: u64, n_slots: u64, paged: bool) -> 
     }
 }
 
+/// Startup validation for the serving admission path (spec §5.2, §5.3, §9.1).
+///
+/// Rejects: (1) `serve.max_batch_tokens < serve.prefill_min_tokens` so a
+/// nonzero prefill quantum always fits the global trunk-row budget; (2)
+/// experimental multi-slot combined with `continuous_batch_size > 1`; (3)
+/// `serve.max_queue == 0` when multi-slot is enabled — an uncapped queue is
+/// rejected rather than reinterpreted in robust multi-slot mode.
 pub(crate) fn validate_multi_slot_startup(
     multi_slot_enabled: bool,
     continuous_batch_size: u64,
@@ -5234,14 +5235,21 @@ mod capabilities_tests {
             "stop sequences are supported"
         );
         assert!(
-            !refused.iter().any(|v| v == "response_format:json_object"),
-            "json_object is enforced as a permissive object schema"
-        );
-        assert!(
             !refused.iter().any(|v| v == "logprobs"),
             "logprobs are supported (AR fallback)"
         );
-        for field in ["best_of", "logit_bias", "echo", "suffix", "tools+image"] {
+        assert!(
+            !refused.iter().any(|v| v == "response_format:json_object"),
+            "json_object is enforced as a permissive object schema"
+        );
+        for field in [
+            "n",
+            "best_of",
+            "logit_bias",
+            "echo",
+            "suffix",
+            "tools+image",
+        ] {
             assert!(
                 refused.iter().any(|v| v == field),
                 "refusal list must contain {field}"

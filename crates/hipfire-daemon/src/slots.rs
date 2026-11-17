@@ -2661,10 +2661,10 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("min_tokens not supported in experimental multi-slot".to_string());
     }
-    // response_format: the ONLY supported type is json_schema (spec §7.1:
-    // "reject missing requested semantics. An optimization bypass is
-    // allowed, a silent semantic downgrade is not"). Any other type — e.g.
-    // json_object — used to fall through validation and run unconstrained.
+    // response_format: json_schema, and json_object as the permissive
+    // `{"type":"object"}` schema (spec §7.1: "reject missing requested
+    // semantics. An optimization bypass is allowed, a silent semantic
+    // downgrade is not"). Any other type is refused, never run unconstrained.
     let rf_type = msg
         .get("response_format")
         .and_then(|v| v.get("type"))
@@ -2712,7 +2712,7 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
         Some(other) => {
             return Some(format!(
                 "response_format type '{other}' is not supported in \
-                 experimental multi-slot (only json_schema)"
+                 experimental multi-slot (only json_schema and json_object)"
             ));
         }
     }

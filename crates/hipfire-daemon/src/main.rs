@@ -739,9 +739,6 @@ impl ResidentKvDiag {
         }
     }
 
-    /// The slot engine's own KV backend. `None` = the load request did not
-    /// name one, and the route's documented default (legacy arenas) applies;
-    /// `Some` is the operator's choice (`legacy` or per-slot `vmm`).
     /// The shared paged pool is backed by VMM. This is a different storage
     /// route from the per-slot KV backend; reporting it as the per-slot
     /// automatic-legacy default emitted a warning that contradicted the
@@ -760,6 +757,10 @@ impl ResidentKvDiag {
         }
     }
 
+    /// The slot engine's own KV backend. `None` = the load request did not
+    /// name one, and the route's documented default (legacy arenas) applies;
+    /// `Some` is the operator's explicit choice (a bare `vmm` is refused at
+    /// slot admission: the slot route's only VMM cache is the shared pool).
     fn for_slot(requested: Option<hipfire_runtime::kv_backend::KvBackend>) -> Self {
         use hipfire_loader::admission::KvBackendRequest;
         use hipfire_runtime::kv_backend::KvBackend;
