@@ -3,10 +3,11 @@
 # This is the manual-test recipe for the VMM slot route
 # (`docs/plans/2026-10-22-vmm-kv-multislot-engine.md`):
 #   * multi-slot engine (4 slots, per-slot ctx bound 262144);
-#   * per-slot VMM KV reservations (`--kv-backend vmm`), q8;
+#   * the shared VMM page pool (`--multi-slot-paged` with
+#     `serve.multi_slot_paged_backend=vmm`), q8;
 #   * MTP speculative decode from the `.mtp` sidecar (`--spec mtp`);
 #   * vision from the `.vl` sidecar (`--vision`, `HIPFIRE_VISION_MODE=on`);
-#     image requests run the sequential VL path on their own slot owner.
+#     image requests run the sequential VL path against their slot's pages.
 #
 # The model directory is bind-mounted read-only; it must contain the trunk and
 # its sidecars (qwen3.5-4b.mq4 / .mtp / .vl), because sidecars are resolved as
@@ -49,6 +50,7 @@ services:
       # VMM maps KV on demand, so this is a bound, not a reservation.
       HIPFIRE_SERVE_MULTI_SLOT_CTX: "262144"
       HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK: "1024"
+      HIPFIRE_SERVE_MULTI_SLOT_PAGED_BACKEND: "vmm"
       HIPFIRE_VISION_MODE: "on"
       # Per-window MTP draft/accept trace in the container log (manual testing:
       # `docker logs -f`). Remove for a quiet log.
@@ -61,8 +63,7 @@ services:
       - /models/qwen3.5-4b.mq4
       - --vision
       - /models/qwen3.5-4b.vl
-      - --kv-backend
-      - vmm
+      - --multi-slot-paged
       - --kv-mode
       - q8
       - --spec

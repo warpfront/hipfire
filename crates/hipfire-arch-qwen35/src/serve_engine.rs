@@ -469,8 +469,9 @@ struct ModelRig {
     /// which uses `k_arenas`/`v_arenas` + `desc_staging` instead.
     vmm: Option<VmmSlotKv>,
     /// VMM-paged shared pool mapper (`serve.multi_slot_paged_backend=vmm`).
-    /// The owners live in `k_arenas`/`v_arenas`; this maps granules on page
-    /// allocation and unmaps them on release.
+    /// The owners live in `k_arenas`/`v_arenas`; this maps granules on first
+    /// page allocation and never unmaps them before teardown (see
+    /// `VmmPageMapper::sync`).
     paged_vmm: Option<VmmPageMapper>,
     /// Per-slot row offset of the LAST forward's contribution: the decode
     /// batch offset for a decoding slot, 0 for a prefilling slot (its hidden
