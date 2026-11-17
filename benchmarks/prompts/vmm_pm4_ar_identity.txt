@@ -1,0 +1,9 @@
+Write a Python module that implements an LRU cache with these requirements:
+
+1. `class LRUCache(capacity)` with `get(key)` and `put(key, value)` in O(1).
+2. Use `collections.OrderedDict`.
+3. Raise `ValueError` when capacity < 1.
+4. Add a `stats()` method returning a dict with `hits`, `misses`, `evictions`.
+5. Include a `__main__` block with three example usages and their printed output.
+
+Return only the code, no explanation.

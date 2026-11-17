@@ -76,6 +76,9 @@ fn main() {
         mtp_mode: hipfire_config::MtpMode::Off,
         kv_mode_raw: String::new(),
         kv_backend: "legacy".to_string(),
+        multi_slot_paged: false,
+        multi_slot_paged_pages: 0,
+        multi_slot_paged_backend: "arena".to_string(),
         prefix_cache: false,
         prefix_cache_max_bytes: 0,
         max_batch_tokens: 4096,
@@ -114,6 +117,7 @@ fn main() {
                 presence_penalty: 0.0,
                 frequency_penalty: 0.0,
                 min_p: 0.0,
+                logprobs_top_k: None,
                 visual_data: None,
                 json_schema: None,
                 started_in_think: false,
@@ -130,7 +134,7 @@ fn main() {
             while let Ok(ev) = rx.recv() {
                 match ev {
                     Event::Accepted { .. } => accepted = true,
-                    Event::Token { id } => tokens.push(id),
+                    Event::Token { id, .. } => tokens.push(id),
                     Event::Rejected { reason, .. } => {
                         rejected = Some(reason);
                         break;
