@@ -13,6 +13,13 @@ use crate::scheduler::{
 };
 use rdna_compute::slot_pool::SlotId;
 
+/// Rows past `prompt + max_tokens` one speculative slot may still write in a
+/// step: the last speculative window (DFlash block, at most 63 rows; MTP
+/// `k + 1`) and the finish drain. The engine's VMM reserve slack
+/// (`VMM_RESERVE_SLACK_ROWS`) and the serve CLI's multi-slot scratch sizing
+/// both read this one value.
+pub const SPEC_SLACK_ROWS_PER_SLOT: usize = 64;
+
 #[derive(Debug, Clone, Default)]
 pub struct SlotBatch {
     /// Per-slot token counts for this step. 0 means the slot is idle.
