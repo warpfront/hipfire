@@ -4599,7 +4599,7 @@ pub(crate) fn resolve_model_path(
             }
         }
     }
-    Ok(find_model_path(paths, registry, model))
+    locate_model_path(paths, registry, model)
 }
 
 fn migrate_flash_next_xts(paths: &Paths, entry: &ModelEntry) -> Result<Option<PathBuf>> {
@@ -4848,23 +4848,39 @@ fn strip_name_separators(name: &str) -> String {
         .collect()
 }
 
-/// Resolve a model name or path to a local file. A path the user named (or a
-/// catalog path) is returned as selected, made absolute but with symlinks
-/// intact: the PLE sidecar lookup probes `<selected>.ple-*` first and the
-/// canonical target second, and a canonical path would lose the former.
+/// Resolve a model name or path to a local file; `None` when absent OR when an
+/// unregistered name matches several files (see [`locate_model_path`], which
+/// reports that ambiguity as an error listing the candidates).
 pub(crate) fn find_model_path(
     paths: &Paths,
     registry: &RegistryV1,
     model: &str,
 ) -> Option<PathBuf> {
+    locate_model_path(paths, registry, model).ok().flatten()
+}
+
+/// Resolve a model name or path to a local file. A path the user named (or a
+/// catalog path) is returned as selected, made absolute but with symlinks
+/// intact: the PLE sidecar lookup probes `<selected>.ple-*` first and the
+/// canonical target second, and a canonical path would lose the former.
+///
+/// A registry tag or alias resolves through the registry to its own file (or a
+/// separator-only respelling of it) and nothing else. Fuzzy stem/substring
+/// matching runs only for names the registry does not know, and refuses with
+/// the candidate list when more than one file matches.
+pub(crate) fn locate_model_path(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model: &str,
+) -> Result<Option<PathBuf>> {
     let direct = PathBuf::from(model);
     if direct.is_file() {
-        return Some(lexical_absolute(&direct));
+        return Ok(Some(lexical_absolute(&direct)));
     }
     if let Ok(catalog) = load_catalog(&paths.config) {
         if let Some((_, record)) = catalog.catalog.model(model) {
             if let Some(path) = record.path.as_ref().filter(|path| path.is_file()) {
-                return Some(lexical_absolute(path));
+                return Ok(Some(lexical_absolute(path)));
             }
         }
     }
@@ -4872,13 +4888,13 @@ pub(crate) fn find_model_path(
         .model(model)
         .filter(|(_, entry)| entry.is_flash_next_xts())
     {
-        return [
+        return Ok([
             entry.file.as_str(),
             hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE,
         ]
         .into_iter()
         .map(|file| paths.models.join(file))
-        .find(|path| path.is_file());
+        .find(|path| path.is_file()));
     }
     if let Some((_, entry)) = registry
         .model(model)
@@ -4886,67 +4902,64 @@ pub(crate) fn find_model_path(
     {
         // A split tag serves its base, else the grandfathered monolithic it was
         // cut from, so nobody is forced to re-download after the registry switch.
-        return hipfire_registry::split_model_files_in(entry, &grandfather_table())
-            .iter()
-            .map(|file| paths.models.join(file))
-            .find(|path| path.is_file());
-    }
-    // An exact on-disk spelling outranks a registry alias that would rewrite it.
-    // The registry maps a model NAME to its canonical FILE, which is what makes
-    // `qwen3.8:27b` resolve to `qwen3.8-27b.mq4`. But when a legacy alias points at
-    // a RENAMED artifact and both spellings are present, that rewrite silently
-    // serves weights the user did not name -- `ornith1.5:35b-a3b` reaching
-    // `ornith-1.5-35b-a3b.mq4` while `ornith1.5-35b-a3b.mq4` sits right there.
-    //
-    // The comparison is on the exact stem, deliberately NOT the looser `contains`
-    // used by scan_local_models: `qwen3.8:27b` would `contains`-match
-    // `qwen3.8-27b.mq4r` and `qwen3.8-27b.mq4-xt` as well, and the quant sort below
-    // ranks `.mq4r` ABOVE `.mq4`, so a looser rule here would silently move users
-    // onto a different tier. An exact stem can only ever match the one file the
-    // user actually spelled.
-    let exact_stem = model.replace(':', "-").to_ascii_lowercase();
-    if let Ok(local) = local_model_paths(paths, registry) {
-        if let Some(hit) = local.iter().find(|path| {
-            let name = path
-                .file_name()
-                .and_then(|file| file.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            MODEL_SUFFIXES
+        return Ok(
+            hipfire_registry::split_model_files_in(entry, &grandfather_table())
                 .iter()
-                .any(|suffix| name == format!("{exact_stem}{suffix}"))
-        }) {
-            return Some(hit.clone());
-        }
+                .map(|file| paths.models.join(file))
+                .find(|path| path.is_file()),
+        );
     }
+    let local = local_model_paths(paths, registry).unwrap_or_default();
+    let file_name = |path: &PathBuf| -> String {
+        path.file_name()
+            .and_then(|file| file.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    };
+    let exact_stem = model.replace(':', "-").to_ascii_lowercase();
+    let exact_stem_hits = |local: &[PathBuf]| -> Vec<PathBuf> {
+        local
+            .iter()
+            .filter(|path| {
+                let name = file_name(path);
+                MODEL_SUFFIXES
+                    .iter()
+                    .any(|suffix| name == format!("{exact_stem}{suffix}"))
+            })
+            .cloned()
+            .collect()
+    };
+    // A registry tag or alias names exactly one FILE. Only that file, or a
+    // spelling of the SAME file (equal once `-`, `.`, `_` are ignored: the
+    // renamed-artifact case), qualifies. A bare stem must not reach a sibling
+    // tier: `qwen3.8:27b` (alias of `qwen3.8:27b-mq4-xts`) used to load whatever
+    // `qwen3.8-27b.*` the directory listed first, e.g. `.mq5`.
     if let Some((_, entry)) = registry.model(model) {
+        let wanted = strip_name_separators(&entry.file);
+        let same_file = |path: &PathBuf| strip_name_separators(&file_name(path)) == wanted;
+        // The user's exact on-disk spelling of the registry file outranks the
+        // canonical spelling: `ornith1.5:35b-a3b` keeps `ornith1.5-35b-a3b.mq4`
+        // rather than being rewritten to a renamed sibling.
+        if let Some(hit) = exact_stem_hits(&local).into_iter().find(same_file) {
+            return Ok(Some(hit));
+        }
         let path = paths.models.join(&entry.file);
         if path.is_file() {
-            return Some(path);
+            return Ok(Some(path));
         }
+        // Missing (or dangling) canonical file: report absent rather than hand
+        // back a different tier, so the caller pulls the canonical file.
+        return Ok(local.into_iter().find(same_file));
     }
     let path = paths.models.join(model);
     if path.is_file() {
-        return Some(path);
+        return Ok(Some(path));
     }
-    let search = model.replace(':', "-").to_ascii_lowercase();
-    let explicit_quant = MODEL_SUFFIXES.iter().any(|suffix| search.ends_with(suffix));
-    let local = local_model_paths(paths, registry).ok()?;
-    // A registry tag names exactly one file. When that file is missing (or a
-    // dangling symlink) the substring scans below would hand back any sibling
-    // whose name merely contains the tag: `qwen3.8:27b-mq3` reached
-    // `qwen3.8-27b.mq3-xt`, a different tier, and loaded it silently. Only a
-    // spelling of the SAME file qualifies (equal once `-`, `.`, `_` are ignored:
-    // the renamed-artifact case); otherwise report it absent so the caller pulls
-    // the canonical file.
-    if let Some((_, entry)) = registry.model(model) {
-        let wanted = strip_name_separators(&entry.file);
-        return local.into_iter().find(|path| {
-            path.file_name()
-                .and_then(|file| file.to_str())
-                .is_some_and(|name| strip_name_separators(name) == wanted)
-        });
+    let exact = exact_stem_hits(&local);
+    if !exact.is_empty() {
+        return single_candidate(model, exact);
     }
+    let search = exact_stem;
     // Two passes. The first matches the literal spelling and is what has always
     // run. The second retries with `-`, `.` and `_` stripped from both sides, so
     // an input and an on-disk file that differ only in separators still meet:
@@ -4962,22 +4975,25 @@ pub(crate) fn find_model_path(
     if candidates.is_empty() {
         candidates = scan_local_models(&local, &search, MatchMode::IgnoreSeparators);
     }
-    candidates.sort_by_key(|path| {
-        let name = path
-            .file_name()
-            .and_then(|file| file.to_str())
-            .unwrap_or_default();
-        if explicit_quant || name.ends_with(".mq4r") {
-            0
-        } else if name.ends_with(".mq4") {
-            1
-        } else if name.ends_with(".hf4") || name.ends_with(".hfq") {
-            2
-        } else {
-            3
-        }
-    });
-    candidates.into_iter().next()
+    single_candidate(model, candidates)
+}
+
+/// The one file an unregistered name matched, `None` for none, and an error
+/// listing every candidate when several matched: never a silent pick.
+fn single_candidate(model: &str, mut candidates: Vec<PathBuf>) -> Result<Option<PathBuf>> {
+    if candidates.len() <= 1 {
+        return Ok(candidates.pop());
+    }
+    candidates.sort();
+    let list = candidates
+        .iter()
+        .map(|path| format!("\n  {}", path.display()))
+        .collect::<String>();
+    bail!(
+        "model name {model} is ambiguous: it matches {} local files; name one exactly \
+         (a registry tag or a path):{list}",
+        candidates.len()
+    )
 }
 
 /// Clap value parser for `--kv-backend`: shared `KvBackend::from_str` so the old
@@ -10553,6 +10569,9 @@ pub(crate) fn model_not_found_error(
             expected.display()
         );
     }
+    if let Err(ambiguous) = locate_model_path(paths, registry, input) {
+        return ambiguous;
+    }
     if looks_like_model_path(input) {
         return anyhow!(
             "model not found: {input} (no such file)\n  check the path, or use a registry tag: \
@@ -11737,6 +11756,65 @@ mod tests {
         let registry = hipfire_registry::bundled().unwrap();
 
         assert_eq!(find_model_path(&paths, &registry, "-.-"), None);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// A registry alias resolves to its registry file, never to whichever
+    /// same-stem sibling the directory lists first; an explicit tier tag gets
+    /// its own file; an unknown name matching several files is refused.
+    #[test]
+    fn registry_alias_beats_bare_stem_and_unknown_ambiguity_refuses() {
+        let registry = hipfire_registry::bundled().unwrap();
+        let (_, alias) = registry.model("qwen3.8:27b").unwrap();
+        assert_eq!(alias.file, "qwen3.8-27b.mq4-xts");
+        let (_, mq5) = registry.model("qwen3.8:27b-mq5").unwrap();
+        assert_eq!(mq5.file, "qwen3.8-27b.mq5");
+        let files = [
+            "qwen3.8-27b.mq5",
+            "qwen3.8-27b.mq4-xts",
+            "qwen3.8-27b.mq3-xt",
+        ];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for (n, order) in orders.iter().enumerate() {
+            let paths = test_paths(&format!("alias-vs-stem-{n}"));
+            fs::create_dir_all(&paths.models).unwrap();
+            for &i in order {
+                fs::write(paths.models.join(files[i]), b"x").unwrap();
+            }
+            assert_eq!(
+                find_model_path(&paths, &registry, "qwen3.8:27b"),
+                Some(paths.models.join("qwen3.8-27b.mq4-xts")),
+                "order {order:?}"
+            );
+            assert_eq!(
+                find_model_path(&paths, &registry, "qwen3.8:27b-mq5"),
+                Some(paths.models.join("qwen3.8-27b.mq5")),
+                "order {order:?}"
+            );
+            fs::remove_dir_all(&paths.root).unwrap();
+        }
+
+        let paths = test_paths("unknown-stem-ambiguous");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["zz-unknown-9b.mq4", "zz-unknown-9b.mq6"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        let error = locate_model_path(&paths, &registry, "zz-unknown:9b")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(error.contains("zz-unknown-9b.mq4"), "{error}");
+        assert!(error.contains("zz-unknown-9b.mq6"), "{error}");
+        assert_eq!(find_model_path(&paths, &registry, "zz-unknown:9b"), None);
+        let shown = model_not_found_error(&paths, &registry, "zz-unknown:9b").to_string();
+        assert!(shown.contains("zz-unknown-9b.mq6"), "{shown}");
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
