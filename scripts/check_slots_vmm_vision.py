@@ -5,10 +5,9 @@
 
 """GPU coherence check: post-image text turns on the multi-slot VMM route.
 
-The VMM slot engine runs image requests on the sequential per-token M-RoPE
-path and text requests on the batched `_vmm` path. A *text continuation* of an
-image conversation needs M-RoPE phases too (`pos + rope_delta`); the `_vmm`
-kernels have no M-RoPE writer. This check drives the feature end to end:
+A *text continuation* of an image conversation needs M-RoPE phases too
+(`pos + rope_delta`). This check drives image and text turns end to end on the
+shared VMM page pool:
 
   1. image turn + question through a multi-slot serve on the shared VMM
      page pool (`serve.multi_slot_paged` + `HIPFIRE_SLOTS_PAGED_BACKEND=vmm`);

@@ -9,6 +9,15 @@ sharing, verified by `scripts/check_vmm_paged_regressions.py`. The paragraphs
 that name the deleted module are the historical record of that work, not a
 current implementation pointer.
 
+**Amendment (2026-11-17):** the per-slot VMM owner route itself
+(`serve_vmm.rs`, `VmmSlotKv`, `ModelRig::forward_step_vmm`, and the VMM arm of
+the multi-slot oracle) was **deleted** for the same reason: `use_vmm` was still
+a literal `false`, and `memory.kv_backend=vmm` alone is refused at spawn. The
+multi-slot VMM cache is the shared paged pool
+([`2026-10-25-vmm-backed-shared-paged-kv.md`](2026-10-25-vmm-backed-shared-paged-kv.md)).
+The oracle keeps its slab half as `test_slots_slab_oracle`. The rest of this
+record is history, not a current implementation pointer.
+
 **Lifecycle:** `planned` (design) / slices 0–3 `branch-implemented`, with the
 smoke evidence in §11. This record is design + execution plan. It makes no
 current-product claim and is **not** an acceptance pass: the

@@ -3087,14 +3087,14 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SKIP_BUILD` | scripts/container-gate.sh, scripts/test_container_gate.py | harness |
 | `HIPFIRE_SKIP_LLAMA_COMMIT_CHECK` | crates/hipfire-runtime/src/eval_common.rs | developer |
 | `HIPFIRE_SLOTS_ATTN_CROSSOVER` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_SLOTS_DECODE_GRAPH` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | developer |
+| `HIPFIRE_SLOTS_DECODE_GRAPH` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-runtime/examples/test_slots_slab_oracle.rs | developer |
 | `HIPFIRE_SLOTS_GFX1100_ROUTES` | crates/hipfire-arch-qwen35/src/forward_slots.rs | developer |
-| `HIPFIRE_SLOTS_ORACLE_DRAFT` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | harness |
-| `HIPFIRE_SLOTS_ORACLE_DUMP` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | harness |
+| `HIPFIRE_SLOTS_ORACLE_DRAFT` | crates/hipfire-runtime/examples/test_slots_slab_oracle.rs | harness |
+| `HIPFIRE_SLOTS_ORACLE_DUMP` | crates/hipfire-runtime/examples/test_slots_slab_oracle.rs | harness |
+| `HIPFIRE_SLOTS_ORACLE_MODEL` | crates/hipfire-runtime/examples/test_slots_slab_oracle.rs | harness |
 | `HIPFIRE_SLOTS_PAGED` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-cli/src/serve/mod.rs | developer |
 | `HIPFIRE_SLOTS_PAGED_BACKEND` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-cli/src/serve/mod.rs | developer |
 | `HIPFIRE_SLOTS_PAGED_PAGES` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-cli/src/serve/mod.rs | developer |
-| `HIPFIRE_SLOTS_VMM_MODEL` | crates/hipfire-runtime/examples/test_slots_vmm_oracle.rs | harness |
 | `HIPFIRE_SLOT_TRACE` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_SLOWLINK_HW_MODEL` | crates/hipfire-arch-qwen4/tests/slowlink_prefill_hw.rs | harness |
 | `HIPFIRE_SLOWLINK_HW_ROWS` | crates/hipfire-arch-qwen4/tests/slowlink_prefill_hw.rs | harness |

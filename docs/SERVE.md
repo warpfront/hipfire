@@ -317,9 +317,8 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
     is [`investigations/2026-10-30-vmm-paged-kv-fixlog-and-revalidation.md`](investigations/2026-10-30-vmm-paged-kv-fixlog-and-revalidation.md).
 
    The VMM-backed multi-slot route is the shared paged pool with
-   `serve.multi_slot_paged_backend=vmm` (q8 only). There is no per-slot VMM
-   reservation: the slot engine has one pool for every slot, with per-slot
-   block tables and refcounted pages. `--kv-backend vmm` does not select this
+   `serve.multi_slot_paged_backend=vmm` (q8 only): one pool for every
+   slot, with per-slot block tables and refcounted pages. `--kv-backend vmm` does not select this
    route; on the multi-slot engine it is refused unless
    `--multi-slot-paged` (or `serve.multi_slot_paged`) is on and
    `serve.multi_slot_paged_backend=vmm`. The
@@ -328,33 +327,25 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    64 verify rows × slots)`. A lone prefilling slot may use the full chunk;
    concurrent prefills share those rows. This is the difference between a
    4096-row (2.7 GiB on 27B) and a 1024-row scratch, and it is what leaves
-   KV headroom for concurrent long generations (4-slot 27B q8 VMM: 5766 MiB
-   mapped-byte budget at `multi_slot_prefill_chunk=1024`). Plain
-   prompt rows, decode and verify rows run batched through the
-   descriptor-addressed `_vmm` kernels; only MTP/DFlash prompt chunks stay on
-   the singleton body, because their private hidden capture is not ported to
-   the batched pass. Sampled (temperature>0) MTP/DFlash requests use the
+   KV headroom for concurrent long generations. Prompt, decode and verify
+   rows run through the descriptor-addressed `_vmm_paged` kernels. Sampled (temperature>0) MTP/DFlash requests use the
    same rejection-sampling acceptors as the singleton route; set
    `speculation.mtp_sampled=0`/`HIPFIRE_MTP_SAMPLED=0` to restore the AR
    fallback. Vision, MTP and DFlash2 run on this
-   route: image requests (the gateway forwards one image per request) use the sequential
-   per-token VL path against the slot's own cache (`--vision` with
-   `vision_mode=on`); a text turn that
-   continues an image conversation uses that same sequential M-RoPE path for
-   the turn (the `_vmm` kernels have no M-RoPE writer), while ordinary text
-   stays batched. MTP verify rows ride the batched decode step, and DFlash's
-   draft context is seeded from the singleton prefill's extract-layer hidden
-   capture (legacy DFlash drafts, which have no candidate selector, are still
-   refused). `serve.prefix_cache` runs on this route as the same
+   route: image requests (the gateway forwards one image per request) use the
+   batched VL path (`--vision` with `vision_mode=on`;
+   `HIPFIRE_VL_SEQUENTIAL=1` needs contiguous slots and is refused here). MTP
+   and DFlash2 verify rows ride the batched decode step (legacy DFlash drafts,
+   which have no candidate selector, are still refused). `serve.prefix_cache` runs on this route as the same
    cross-session reuse of sealed 128-token pages plus Qwen hybrid checkpoints
    as the arena route (this route's pool is the shared paged pool, selected
    by `--multi-slot-paged` with `serve.multi_slot_paged_backend=vmm`).
    Every unservable combination is refused before any GPU allocation. On this route decode always runs the
-   row-batched `_vmm` kernels, so a greedy comparison against the sequential
+   row-batched `_vmm_paged` kernels, so a greedy comparison against the sequential
    route (or against a different batch composition) is expected to differ at
    some token, as on the arena route: output is deterministic for a fixed batch
    composition and fully request-isolated, not byte-equal across routes. Design:
-   [`docs/plans/2026-10-22-vmm-kv-multislot-engine.md`](plans/2026-10-22-vmm-kv-multislot-engine.md).
+   [`docs/plans/2026-10-25-vmm-backed-shared-paged-kv.md`](plans/2026-10-25-vmm-backed-shared-paged-kv.md).
    A container recipe for this exact stack (4 slots, VMM, MTP + vision on a
    qwen3.5-4b fixture, port 9001) is `docker/compose.vmm-9001.yaml`.
 
@@ -959,9 +950,8 @@ This is not a registry admission.
 `memory.kv_backend=vmm` is **not** an opt-in to the shared paged pool on the
 multi-slot engine: the load is refused by name unless `serve.multi_slot_paged`
 requests the pool and `serve.multi_slot_paged_backend=vmm` selects the
-VMM-backed variant. That keeps a
-`kv_backend=vmm` written for a per-slot route from landing on the experimental
-shared cache.
+VMM-backed variant. That keeps a stray `kv_backend=vmm` from landing on the
+experimental shared cache.
 
 ### Capability advertisement
 
