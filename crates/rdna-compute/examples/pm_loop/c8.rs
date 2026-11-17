@@ -42,7 +42,7 @@
 //!
 //! | preset | rows | source |
 //! |---|---|---|
-//! | `a3b:chunk` | 8192 | first pp16000 chunk and the A3B row ceiling: `moe_program.rs:5210` (`A3B_ROWS = 8192`), `shared_down_sigmoid_epi_oracle.rs:53-54`, `iu4_c8_pm_oracle.rs:67` |
+//! | `a3b:chunk` | 8192 | first pp16000 chunk and the A3B row ceiling: `moe_program.rs:5210` (`A3B_ROWS = 8192`), `shared_down_sigmoid_epi_oracle.rs:53-54` |
 //! | `a3b:tail` | 7808 | second pp16000 chunk (16000 - 8192): same oracle docs |
 //! | `a3b:chunk4k` | 4096 | the memory-aware resident-MoE chunk: `docs/env-vars.md:471` (`HIPFIRE_PREFILL_CHUNK_ROWS`) |
 //!
@@ -58,12 +58,12 @@
 //!
 //! # Inputs
 //! Deterministic (`Xs64`): `x` f32 `[rows, K]` uniform in `[-1, 1)` scaled per row by
-//! `0.25 * (1 + row % 5)` (the oracle's `random` class, `iu4_c8_pm_oracle.rs:478-488`); `signs1` /
+//! `0.25 * (1 + row % 5)`; `signs1` /
 //! `signs2` the production `+-1.0` FWHT tables, 256 f32 each, seeds 42 / 1042 (`scratch.rs:1353-1365`,
 //! `:2008-2025`); the norm weight and the AWQ table positive f32 `[K]` in `[0.5, 2.0)`; the sigmoid gate
-//! f32 `[rows, K]` uniform in `[-12, 12)`. `eps = 1e-6` for the norm exports (`iu4_c8_pm_oracle.rs:124`),
+//! f32 `[rows, K]` uniform in `[-12, 12)`. `eps = 1e-6` for the norm exports,
 //! `0` otherwise (what the launcher passes for the rotate exports). Outputs start at a `0xA5` sentinel
-//! (the oracle's `SENTINEL`) so a skipped store cannot match by accident.
+//! (`SENTINEL` below) so a skipped store cannot match by accident.
 //!
 //! # Outputs and pass criterion
 //! Compared: the f32 rotated row `[rows, K]`, the `block_i4_128` sidecar (`K/128 * rows` records of 72 B,
@@ -73,8 +73,8 @@
 //! # CPU reference (exact for the arithmetic; see per-export notes)
 //! Transcribed from `crates/peacemaker-isa/tests/iu4_c8_producer.rs` (`reference_rotate` `:641-663`,
 //! `reference_norm` `:688-753`, `fwht_ref` `:596-626`, `quantize_mode` `:527-593`; the quantizer also
-//! equals `iu4_c8_pm_oracle.rs:575-657`, which that oracle checks against the incumbent's own bytes on
-//! the card) and the incumbent recipe documented in `iu4_c8_producer.rs:36-66`. Pure f32 IEEE
+//! equals the C8 search checked on the card against the incumbent's own bytes) and the incumbent
+//! recipe documented in `iu4_c8_producer.rs:36-66`. Pure f32 IEEE
 //! arithmetic (`fma` as the generator does), so exact for `rotate`. The other exports also use the
 //! emulator's integer models of the transcendentals `v_rsq_f32` (`norm`, `norm_out`) and `v_exp_f32`
 //! (`sigmoid_rotate`, hipcc's range-reduced `expf` after `gdn_chunk_prep.rs:382-429`):
@@ -82,8 +82,7 @@
 //! the card, so a reference mismatch that coexists with baseline identity points at that model, not at
 //! the candidate. `norm` uses the fused-RMSNorm reduction order (wave tree, then the eight wave sums),
 //! `norm_out` the standalone `rmsnorm_f32` order (`kernels/src/rmsnorm.hip:13-21`: LDS tree
-//! `s = 128 .. 1`); the repo has no CPU reference for the two folded exports other than this one
-//! (`iu4_c8_pm_oracle` proves them against the HIP chain on the card).
+//! `s = 128 .. 1`); the repo has no CPU reference for the two folded exports other than this one.
 //!
 //! # `--emu`
 //! The candidate export runs on the emulator at `rows = 8, K = 2048` (this run's `awq`) over every
@@ -105,9 +104,9 @@ use std::ops::Range;
 
 const ARCH: Arch = Arch::Gfx1201;
 const IR_ARCH: peacemaker_ir::Arch = peacemaker_ir::Arch::Gfx1201;
-/// RMSNorm epsilon of the norm exports (`iu4_c8_pm_oracle.rs:124`).
+/// RMSNorm epsilon of the norm exports.
 const EPS: f32 = 1.0e-6;
-/// Pre-launch fill of every output (`iu4_c8_pm_oracle.rs:123`).
+/// Pre-launch fill of every output.
 const SENTINEL: u8 = 0xa5;
 /// Bytes of one `block_i4_128` record.
 const RECORD: usize = 72;
@@ -875,7 +874,7 @@ fn xor_sum32(mut v: [f32; 32]) -> f32 {
 }
 
 /// `quantize_block_i4_128_wave<false>` (the C8 search) of 128 rotated floats into one 72 B record
-/// (`tests/iu4_c8_producer.rs:527-593`; `iu4_c8_pm_oracle.rs:575-657`). `amax == 0` forces zero codes and
+/// (`tests/iu4_c8_producer.rs:527-593`). `amax == 0` forces zero codes and
 /// `d = 1`; otherwise the codes are recomputed from `best_d` (which stays `1.0` if no candidate beats the
 /// `1e30` sentinel).
 fn quantize_c8(x: &[f32; 128]) -> [u8; RECORD] {
@@ -1397,7 +1396,7 @@ mod tests {
     #[test]
     fn emu_runs_the_small_shape_bit_exact_or_refuses() {
         // The legacy exports are covered by the repo's emulator tests (`tests/iu4_c8_producer.rs`): they
-        // must run and match. The folded exports are proven on the card; the emulator may refuse them.
+        // must run and match. The folded exports are not checked here; the emulator may refuse them.
         for (tag, _) in EXPORTS {
             let w = new("rows=8", &mut knobs(&[("export", tag)])).unwrap();
             match w.emu() {

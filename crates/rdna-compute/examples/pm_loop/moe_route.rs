@@ -1062,8 +1062,7 @@ impl Bench {
             if (gate, down) != (GATE_IU4, DOWN_IU4) {
                 return Err(format!(
                     "the live IU4 selector picks ({gate}, {down}), the documented plan is \
-                     ({GATE_IU4}, {DOWN_IU4}) (an environment override such as \
-                     HIPFIRE_QWEN4_MOE_SYM_PM changed what is launched)"
+                     ({GATE_IU4}, {DOWN_IU4}) (an environment override changed what is launched)"
                 ));
             }
         }

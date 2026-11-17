@@ -107,7 +107,7 @@ fn router_shared_fuse_allowed(
         && env_enabled
 }
 
-/// Admission of the A3B decode norm fold (`HIPFIRE_A3B_NORM_FOLD`), static at
+/// Admission of the A3B decode norm fold, static at
 /// seal: the plain norm + FWHT before the exact MQ4G256V2 hidden-2048 router /
 /// selector / shared gate / shared up quartet runs inside that quartet's launch
 /// ([`Gpu::fused_rmsnorm_proj4_mq4g256v2_fold`]). Exact gfx1201, rows == 1;
@@ -152,7 +152,6 @@ fn a3b_norm_fold_admitted(
         && w(&shared.weights.selector, 1)
         && w(&shared.weights.gate, 512)
         && w(&shared.weights.up, 512)
-        && super::norm_fold::env_enabled()
 }
 
 /// Opt-in gfx1100 decode down+last-combine admission. The fused kernel is a
@@ -214,8 +213,7 @@ pub(super) struct MoeDecodeSelection {
     /// (last) releases it. Implies `cpu_split`.
     pub(super) cpwait: bool,
     /// A3B decode norm fold admitted for this layer (exact gfx1201, MQ4G256V2
-    /// hidden-2048 router + shared quartet after a plain norm, rows == 1, kill
-    /// switch `HIPFIRE_A3B_NORM_FOLD` not `0`); see [`a3b_norm_fold_admitted`].
+    /// hidden-2048 router + shared quartet after a plain norm, rows == 1); see [`a3b_norm_fold_admitted`].
     pub(super) norm_fold: bool,
 }
 
@@ -297,7 +295,7 @@ fn router_carries_shared_iu4(
 }
 
 /// Pure part of the exact fused input-basis producer
-/// (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`): the shared gate is MQ4G256V2 over the
+/// (the `PrefillIu4ProducerFused` route): the shared gate is MQ4G256V2 over the
 /// router's K, K a nonzero multiple of 256 (the IU4 consumers' floor), and the
 /// router/shared IU4 carry already holds (so the next two stages are the router
 /// and the shared gate/up, which read the same `x_rot_batch`, and nothing else
@@ -351,7 +349,7 @@ pub(super) struct MoeStepState<'a> {
     /// re-quantized) by the shared gate/up stage of the same invocation.
     shared_iu4: RefCell<Option<rdna_compute::scratch::Int4MmqPrepared>>,
     /// The IU4 sidecar the fused shared activation wrote for the shared down
-    /// (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`): written only by the generic
+    /// (the `PrefillIu4ProducerFused` route): written only by the generic
     /// shared activation stage, taken by the shared down stage that the lowering
     /// places immediately after it (the fused route is not admitted for
     /// `shared_after_combine`, whose routed stages would sit in between).
@@ -372,7 +370,7 @@ pub(super) struct MoeStepState<'a> {
     /// `HIPFIRE_QWEN4_HC_ROW_FOLD`: the shared down ran the whole tail as the
     /// HC row fold, including the next HC read's norm.
     hc_row_folded: Cell<bool>,
-    /// `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: the combine stage deferred its launch to the shared
+    /// The combine stage deferred its launch to the shared
     /// down stage's `moe_shared_down_combine_rows` (taken by that stage).
     combine_deferred: Cell<bool>,
     /// The call runs its whole lowered program through [`execute`] / [`execute_after_clear`]
@@ -393,7 +391,7 @@ pub(super) struct MoeStepState<'a> {
     /// ([`SealedMoeOp::fold_prefill_norm_into_input_basis`]); the input-basis stage has nothing
     /// left to produce.
     norm_basis_folded: Cell<bool>,
-    /// `HIPFIRE_QWEN4_MOE_FRONT_FUSE`: the plain (`execute`) program may run the fused MoE
+    /// The plain (`execute`) program may run the fused MoE
     /// front producer; every other lowering (the S1 layer-major prepare, the slowlink
     /// tiles, ...) leaves this false and runs the unfused producers.
     front_allowed: Cell<bool>,
@@ -404,14 +402,14 @@ pub(super) struct MoeStepState<'a> {
     /// The normalize stage skipped the plain norm because the gate-side launch
     /// recomputes it ([`a3b_norm_fold_admitted`]).
     norm_fold_active: Cell<bool>,
-    /// `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`: the lowering placed `Scatter` immediately after `Route`
+    /// The lowering placed `Scatter` immediately after `Route`
     /// (no `OwnerAssign`, no CPU split / deferral), so the route stage may run the router and the
     /// scatter as one launch.
     route_scatter_allowed: Cell<bool>,
     /// The route stage ran the fused router + scatter launch; the next `Scatter` stage launches
     /// nothing (and clears this).
     route_scatter_done: Cell<bool>,
-    /// `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: the scatter-side launch of this call (the scatter stage's
+    /// The scatter-side launch of this call (the scatter stage's
     /// `moe_scatter_fused_top10_pmask` or the route stage's wide router + scatter launch) wrote the
     /// wide-verify chain's owner-masked tile ids; the gate/up stage takes this (and clears it) and
     /// does not launch `ep_tile_mask`.
@@ -525,7 +523,7 @@ impl<'a> MoeStepState<'a> {
         self.call.dispatch_ctx()
     }
 
-    /// `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: whether this call's combine rides its shared down
+    /// Whether this call's combine rides its shared down
     /// ([`super::qt44_qt53_prefill::epilogue_fuse_applies`]) -- only for the plain lowering
     /// whose `Combine` is followed by the `SharedDown` that consumes the deferral: no CPU split
     /// or deferred experts (their combine / splice order differs), no tile exchange, and no
@@ -1000,7 +998,7 @@ impl<'a> SealedMoeOp<'a> {
     }
 
     /// L4: the grouped prefill's standalone `rmsnorm_f32` folded into the exact C8 PM input-basis
-    /// producer that consumes its output (`HIPFIRE_PREFILL_IU4_C8_PM` nested under the F3 producer
+    /// producer that consumes its output (the `PrefillIu4C8Pm` route nested under the F3 producer
     /// fusion). Taken only where [`Self::input_basis`] would run the producer-fused arm for this call
     /// (same selection, carry and shared-gate admission) and the PM rotate itself is admitted for the
     /// operands: one launch writes the normalized F32 row into `x_norm_batch` (the router, shared
@@ -1508,7 +1506,7 @@ impl<'a> SealedMoeOp<'a> {
                     Ok::<_, DispatchError>(super::sealed_moe::RouteScatterFuse {
                         grouped_rows: selection.path2_m_total,
                         launched: &self.state.route_scatter_done,
-                        // The wide router + scatter launch (`HIPFIRE_QWEN4_MOE_GLUE_FOLD` b) also
+                        // The wide router + scatter launch (glue fold b) also
                         // writes the wide-verify chain's owner-masked tile ids.
                         owner_mask: super::qt44_qt53_prefill::glue_fold_owner_mask(gpu, params)?,
                         mask_written: &self.state.tile_mask_written,
@@ -1777,7 +1775,7 @@ impl<'a> SealedMoeOp<'a> {
             if self.state.g942_combine_deferred.replace(false) {
                 return super::qt44_qt53_prefill::g942_fold_shared_down_combine(gpu, params);
             }
-            // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: this call's combine was deferred by the
+            // This call's combine was deferred by the
             // combine stage; the one launch does combine, shared-down rows and shared fold.
             if self.state.combine_deferred.replace(false) {
                 // An absorbed fill reaching a deferred combine is the fused launch's own
@@ -2125,7 +2123,7 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
-            // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: the shared down stage's one launch combines
+            // The shared down stage's one launch combines
             // the ten expanded rows itself; only the scratch preflight is owed here.
             if self.state.epilogue_fuse_admitted(gpu, params, selection) {
                 self.state.combine_deferred.set(true);
@@ -2994,7 +2992,7 @@ fn lower_prefill<'a>(
         if owner_assign {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::OwnerAssign))?;
         }
-        // `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`: only the lowering whose very next routed stage is
+        // Only the lowering whose very next routed stage is
         // `Scatter` (no owner assignment, no CPU split / deferral) lets the route stage launch
         // the scatter with the router.
         state.route_scatter_allowed.set(
@@ -5409,7 +5407,7 @@ fn expert_iu4_facts(
 
 /// Log classes (one rate-limit counter each): admitted 0, each
 /// [`ExpertIu4Reject`] `1 + index`, each exclusion 19..=32, admitted host-mapped 33, admitted
-/// resident with the NT8 gate/up entry and the NT4 down entry (`HIPFIRE_MOE_IU4_WIDE_TILES`) 34.
+/// resident with the NT8 gate/up entry and the NT4 down entry (the `MoeIu4WideTiles` route) 34.
 const EXPERT_IU4_LOG_CLASSES: usize = 64;
 const EXPERT_IU4_CLASS_ADMITTED_HOST_MAPPED: usize = 33;
 const EXPERT_IU4_CLASS_ADMITTED_RESIDENT_NT8_GATE_UP: usize = 34;

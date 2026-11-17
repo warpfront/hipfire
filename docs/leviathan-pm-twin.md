@@ -213,7 +213,7 @@ remain unproven. No stronger analysis proof is claimed.
 ## `lwmma_gemm_bf16_t2_m{1,2,3,4}_n1_multi` (same Route A, proof only)
 
 The four multi-part lane-WMMA entries of `kernels/src/qwen4_lane_wmma.gfx1201.hip`
-(`HIPFIRE_QWEN4_LWMMA_MULTI_PART`) are sealed by `scripts/pm-leviathan-twin.py --family lwmma-multi
+are sealed by `scripts/pm-leviathan-twin.py --family lwmma-multi
 --arch gfx1201` into one bundle. The seal covers the whole device ELF (all 67 kernels, the plain
 lane-WMMA entries included), which is byte-identical to the hipcc anchor; there is no math
 evidence from this script. Dispatch stays the registry HIP source.
@@ -259,7 +259,7 @@ analysis proof is claimed, and no railgun certificate is claimed for these entri
 
 ## X8 wide MoE glue and rot planar gate/up (Route A, proof only)
 
-Two gfx1201 families of `scripts/pm-leviathan-twin.py` seal the X8 entries of `HIPFIRE_QWEN4_MOE_GLUE_FOLD`
+Two gfx1201 families of `scripts/pm-leviathan-twin.py` seal the X8 entries of the MoE glue folds
 (`--family moe-route-scatter-wide`, `--family qwen4-moe-ep-a8-rot`, both `--arch gfx1201`). Each compiles the exact
 concatenated runtime module source (the manifest's `module_source` records the define, every part's path, bytes
 and sha256, and the combined sha256: `MOE_ROUTE_SCATTER_WIDE_SRC`, `QWEN4_MOE_EP_A8_ROT_SRC`) with the core hipcc

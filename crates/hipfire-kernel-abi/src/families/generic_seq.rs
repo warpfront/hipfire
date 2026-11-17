@@ -1062,10 +1062,10 @@ mod flash_fa2 {
         min_rows: 17,
         max_rows: None,
         predicate: "crates/rdna-compute/src/latent_attention_flash.rs::FA2_MIN_ROWS",
-        kill_env: Some("HIPFIRE_ATTN_FA2_GENERIC"),
+        kill_env: None,
     };
 
-    /// The incumbent's work, admitted from 17 rows behind `HIPFIRE_ATTN_FA2_GENERIC` (default on; `0` kills).
+    /// The incumbent's work, admitted from 17 rows (FA2 route; no env switch).
     pub static WORK: WorkSpecV1 = WorkSpecV1 {
         abi: &ABI,
         work: WorkV1 {
@@ -1334,10 +1334,10 @@ mod flash_fa2_q8 {
         min_rows: 17,
         max_rows: None,
         predicate: "crates/rdna-compute/src/latent_attention_flash.rs::FA2_Q8_MIN_ROWS",
-        kill_env: Some("HIPFIRE_ATTN_FA2_GENERIC"),
+        kill_env: None,
     };
 
-    /// The Q8 incumbent's work, admitted from 17 rows behind `HIPFIRE_ATTN_FA2_GENERIC` (default on; `0` kills).
+    /// The Q8 incumbent's work, admitted from 17 rows (FA2 route; no env switch).
     pub static WORK: WorkSpecV1 = WorkSpecV1 {
         abi: &ABI,
         work: WorkV1 {
@@ -3194,7 +3194,7 @@ mod tests {
             w.admit.predicate,
             "crates/rdna-compute/src/latent_attention_flash.rs::FA2_MIN_ROWS"
         );
-        assert_eq!(w.admit.kill_env, Some("HIPFIRE_ATTN_FA2_GENERIC"));
+        assert_eq!(w.admit.kill_env, None);
         // Raon dispatch: 512 rows / 128 = 4 tiles x 256 threads, 40 heads.
         let (x, y) = work_items(
             &flash_fa2::ABI,
@@ -3245,7 +3245,7 @@ mod tests {
             w.admit.predicate,
             "crates/rdna-compute/src/latent_attention_flash.rs::FA2_Q8_MIN_ROWS"
         );
-        assert_eq!(w.admit.kill_env, Some("HIPFIRE_ATTN_FA2_GENERIC"));
+        assert_eq!(w.admit.kill_env, None);
         let (x, y) = work_items(
             &flash_fa2_q8::ABI,
             &[

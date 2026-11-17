@@ -3,8 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte oracle of the decode / wide-verify HC read/write pair fusion
-//! (`HIPFIRE_QWEN4_HC_PAIR_DECODE`,
-//! `hyper_norm_gate_k4_outputs_f32`), rows `1..=64`.
+//! (`hyper_norm_gate_k4_outputs_f32`), rows `1..=64`.
 //!
 //! ```text
 //! hc_pair_decode_oracle [SEEDS]        (default 32 seeds)

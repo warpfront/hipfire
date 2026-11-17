@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Wave-3 C8 MoE glue-fold entries of qwen4 Flash-Next on exact gfx1201
-//! (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, default on; folds a/b/c). Four hipcc-built entries in two modules, three
+//! (glue folds a/b/c). Four hipcc-built entries in two modules, three
 //! kernarg layouts:
 //!
 //! | contract | entries | launcher |

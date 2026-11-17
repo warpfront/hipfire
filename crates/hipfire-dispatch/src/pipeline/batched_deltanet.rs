@@ -236,7 +236,7 @@ fn gfx12_fp8_stream_gdn_admitted(
 
 /// gfx1201 FP8-stream LA output producer.  Replaces gated_norm + AWQ/FWHT
 /// rotate + standalone pack for Lloyd residual consumers. With
-/// `HIPFIRE_FP8_PROD_INREG=1`, the FP8 prepared consumer does not read `x_rot`.
+/// `fp8_prod_inreg` (K <= 17408), the FP8 prepared consumer does not read `x_rot`.
 /// `x_fmt` is the storage of `x` (the GDN chunk-scan plane).
 #[allow(clippy::too_many_arguments)]
 fn try_gfx12_fp8_stream_gdn_prepared(
@@ -1218,16 +1218,6 @@ pub fn batch_chunk_delta_net_input_projection(
     Ok(false)
 }
 
-/// Default-on switch for the singleton chain-verify batched tape copy
-/// (`HIPFIRE_VERIFY_TAPE_COPY_BATCH=0` restores three `memcpy_dtod_at_auto`).
-fn verify_tape_copy_batch_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_VERIFY_TAPE_COPY_BATCH")
-            .map_or(true, |v| v.trim() != "0")
-    });
-    *ENABLED
-}
-
 /// One DeltaNet layer's DFlash tape-capture copies (pre-conv1d qkv rows,
 /// post-sigmoid alpha and beta rows of `pbs`'s rows `[0, n)`, into the layer's
 /// tape slots at `tape_offset`) as three descriptors for
@@ -1473,9 +1463,7 @@ pub fn batch_chunk_delta_net_pre_gdn(
     if let Some(tape) = gdn_tape.as_ref() {
         if let Some(sink) = tape_sink {
             push_gdn_tape_copies(sink, tape, pbs, n_v_heads, tape_offset, n, delta_layer_idx);
-        } else if fusion.is_chain_verify()
-            && matches!(batch_semantics, BatchSemantics::Sequential)
-            && verify_tape_copy_batch_enabled()
+        } else if fusion.is_chain_verify() && matches!(batch_semantics, BatchSemantics::Sequential)
         {
             // Singleton chain verify: one batched launch for the same three
             // descriptors, issued at the original copy point (before conv).

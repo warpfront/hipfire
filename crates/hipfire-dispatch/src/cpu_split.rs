@@ -677,7 +677,7 @@ struct Transaction {
     /// Generation of this call's join word (CP-wait executors).
     cp_gen: u32,
     /// Splice-pool workers held awake from `prepare` until the CPU arm has run
-    /// (`HIPFIRE_CPU_POOL_SPIN`); `None` when the spin is off or no cold slot needs the arm.
+    /// (budget `HIPFIRE_CPU_POOL_SPIN_US`); `None` when it is `0` or no cold slot needs the arm.
     warm: Option<hipfire_cpu::splice_pool::PoolWarm>,
     /// `HIPFIRE_CPU_SPLIT_TRACE` host timeline of this call's `prepare` (cpwait executors only).
     prep_trace: Option<PrepTrace>,
@@ -2166,7 +2166,7 @@ impl CpuSplitExecutor {
             (start, (prev != 0).then(|| now_ns.saturating_sub(prev)))
         });
         // Wake the splice pool now: the wake then overlaps the readiness wait below instead of
-        // delaying the arm (`HIPFIRE_CPU_POOL_SPIN`; `None` when off).
+        // delaying the arm (`None` when the `HIPFIRE_CPU_POOL_SPIN_US` budget is `0`).
         let warm = cpu_exec::warm_splice_pool();
         self.gate(gpu, rows)?;
         let rows_x = rows

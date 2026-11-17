@@ -10,14 +10,6 @@ use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 
-/// `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER` (developer, default off): the sealed grouped MoE route
-/// stage of a 1..=8 row exact-gfx1201 call runs the E512/top-10 router and the grouped scatter
-/// as one launch ([`Gpu::moe_route_scatter_top10_f32`]); the scatter stage then launches
-/// nothing. Read once.
-static QWEN4_MOE_ROUTE_SCATTER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_ROUTE_SCATTER", true)
-});
-
 /// Rows the wide router + scatter fold ([`Gpu::moe_route_scatter_top10_wide_f32`]) serves: the g32
 /// verify window's top.
 pub const MOE_GLUE_FOLD_MAX_ROWS: usize = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
@@ -2698,18 +2690,16 @@ impl Gpu {
     }
 
     /// The fused route + scatter launch ([`Gpu::moe_route_scatter_top10_f32`]) is admitted for
-    /// this call: `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER` set, exact gfx1201, the block-wide-scan
-    /// scatter (not the `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` serial walk), eager launch (not
-    /// recording a replay, not capturing a graph), 1..=8 rows (one router workgroup) and the
-    /// fixed E512/top-10 grammar. Pure: reads flags and device state only.
+    /// this call: exact gfx1201, the block-wide-scan scatter (not the `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0`
+    /// serial walk), eager launch (not recording a replay, not capturing a graph), 1..=8 rows (one router
+    /// workgroup) and the fixed E512/top-10 grammar. Pure: reads flags and device state only.
     pub fn moe_route_scatter_top10_admitted(
         &self,
         tokens: usize,
         n_experts: usize,
         k_top: usize,
     ) -> bool {
-        *QWEN4_MOE_ROUTE_SCATTER
-            && self.arch_caps.is_gfx1201()
+        self.arch_caps.is_gfx1201()
             && !self.flags.qwen4_moe_scatter_serial_walk()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -2824,30 +2814,26 @@ impl Gpu {
         result.map(|()| true)
     }
 
-    /// X8a of `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: the scatter launch also writes the owner tile mask
-    /// ([`Gpu::moe_scatter_fused_top10_pmask`]). Exact gfx1201, the block-wide-scan scatter (not the
-    /// `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` serial walk), eager launch. Pure: reads flags and
-    /// device state only.
+    /// X8a: the scatter launch also writes the owner tile mask ([`Gpu::moe_scatter_fused_top10_pmask`]).
+    /// Exact gfx1201, the block-wide-scan scatter (not the `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` serial walk),
+    /// eager launch. Pure: reads flags and device state only.
     pub fn moe_glue_fold_mask_admitted(&self) -> bool {
-        self.flags
-            .qwen4_moe_glue_fold_enabled(crate::feature_flags::MOE_GLUE_FOLD_MASK)
+        self.arch_caps.is_gfx1201()
             && !self.flags.qwen4_moe_scatter_serial_walk()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
     }
 
-    /// X8b of `HIPFIRE_QWEN4_MOE_GLUE_FOLD`: the 9..=64-row router + scatter (+ mask) launch
-    /// ([`Gpu::moe_route_scatter_top10_wide_f32`]) is admitted for this call: the flag's `b` fold,
-    /// exact gfx1201, the block-wide-scan scatter, eager launch, 9..=64 rows (1..=8 rows keep the
-    /// one-workgroup [`Gpu::moe_route_scatter_top10_f32`]) and the fixed E512/top-10 grammar.
+    /// X8b: the 9..=64-row router + scatter (+ mask) launch ([`Gpu::moe_route_scatter_top10_wide_f32`]) is
+    /// admitted for this call: exact gfx1201, the block-wide-scan scatter, eager launch, 9..=64 rows (1..=8
+    /// rows keep the one-workgroup [`Gpu::moe_route_scatter_top10_f32`]) and the fixed E512/top-10 grammar.
     pub fn moe_glue_fold_route_admitted(
         &self,
         tokens: usize,
         n_experts: usize,
         k_top: usize,
     ) -> bool {
-        self.flags
-            .qwen4_moe_glue_fold_enabled(crate::feature_flags::MOE_GLUE_FOLD_ROUTER)
+        self.arch_caps.is_gfx1201()
             && !self.flags.qwen4_moe_scatter_serial_walk()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode

@@ -373,7 +373,7 @@ pub struct ScratchState {
     /// Fixed-size split-K scratch of the lane WMMA route (`crate::lane_wmma`): allocated lazily on
     /// first use, zeroed once, never grown or replaced.
     pub lane_wmma_scratch: Option<crate::lane_wmma::LaneWmmaScratch>,
-    /// Multi-part split-K scratch of the lane WMMA route (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`):
+    /// Multi-part split-K scratch of the lane WMMA route:
     /// disjoint partial slices for up to four parts of one launch; lazily allocated, zeroed once,
     /// never grown.
     pub lane_wmma_multi_scratch: Option<crate::lane_wmma::LaneWmmaScratch>,
@@ -427,7 +427,7 @@ pub struct ScratchState {
     pub int4_mmq_x_scratch: Option<DeviceBuffer>,
     pub int4_mmq_x_scratch_bytes: usize,
     /// Dedicated down-proj `block_i4_128` sidecar written by the A4-fused
-    /// gate/up SiLU epilogue (`HIPFIRE_V2B_A4_EPI=1`). Never aliases
+    /// gate/up SiLU epilogue on admitted gfx1151 V2B shapes. Never aliases
     /// `int4_mmq_x_scratch` and never bumps `int4_mmq_generation`.
     pub int4_mmq_down_scratch: Option<DeviceBuffer>,
     pub int4_mmq_down_scratch_bytes: usize,

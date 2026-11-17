@@ -270,7 +270,7 @@ const GRID_MMQ_GEMM: [Expr; 3] = [Expr::DivCeil(&P_M, 128), Expr::DivCeil(&P_N, 
 /// `.group_segment_fixed_size` 22528 (one LDS buffer: `128*80 + 128*80 + 2*128*4 + 2*128*4`),
 /// `.max_flat_workgroup_size` 256. Launch: block 256 (`2 * BM`), grid `(ceil(M/128), ceil(N/128))`.
 /// `Gpu::q8_a8_pick_tile` selects the 128x128 tile when the grid holds at least `Q8A8_FILL_BLOCKS` (128)
-/// CTAs, FAST needs `K % 64 == 0` and a 4-byte aligned weight base, and `HIPFIRE_Q8A8_PS=0` keeps the plain
+/// CTAs, FAST needs `K % 64 == 0` and a 4-byte aligned weight base; `Q8A8Sched::Plain` keeps the plain
 /// (two-LDS-buffer, 45056 B) schedule instead.
 pub static GEMM_Q8_0_MMQ_I8_T128X128_PS: KernelAbiV1 = KernelAbiV1 {
     id: "generic_mmq.q8_0_mmq_i8_t128x128_ps.f32",
@@ -372,7 +372,7 @@ pub static WORK_GEMM_Q8_0_MMQ_I8_T128X128_PS: WorkSpecV1 = WorkSpecV1 {
                gives N in [385, 512] and the binder checks the Derived value against it (a launch outside the interval \
                is reported inconsistent). Selector: \
                `q8_a8_pick_tile` takes 128x128 when ceil(M/128)*ceil(N/128) >= 128 CTAs (a grid predicate, not a row \
-               one); `HIPFIRE_Q8A8_PS=0` routes the plain `gemm_q8_0_mmq_i8_t128x128` instead; K % 64 != 0 takes the \
+               one); `Q8A8Sched::Plain` routes the plain `gemm_q8_0_mmq_i8_t128x128` instead; K % 64 != 0 takes the \
                `_slow` kernels.",
     },
 };
@@ -394,7 +394,7 @@ pub static WORK_GEMM_Q8_0_MMQ_I8_T128X128_PS_BF16: WorkSpecV1 = WorkSpecV1 {
                X (N*K) + F32 scales (K/32*N*4) + F32 Y (N*M*4; the plane is F32, BF16-rounded values). N binds to \
                the chunk rows (Raon: grid y = 32 -> N in [3969, 4096], the whole 4096-row chunk); K from the Q8_0 \
                weight match on M (grid x interval of 128). `gemm_q8_0_a8_gemm_bf16` is called by the \
-               prepared-activation projection path when the caller wants BF16-rounded output; `HIPFIRE_Q8A8_PS=0` \
+               prepared-activation projection path when the caller wants BF16-rounded output; `Q8A8Sched::Plain` \
                routes the plain `gemm_q8_0_mmq_i8_t128x128_bf16`. The 5120-row node (g/q/k/v) shares M with f_b \
                [5120,128]: the weight-set selection by call count may report several fitting sets.",
     },

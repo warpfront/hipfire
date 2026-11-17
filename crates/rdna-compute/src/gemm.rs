@@ -374,9 +374,6 @@ static DISPATCH_IU4_X5: LazyLock<bool> =
 static DISPATCH_V2C_ADDEPI: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0"));
 
-static DISPATCH_V2B_ADDEPI: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_V2B_ADDEPI").as_deref() != Ok("0"));
-
 static DISPATCH_GFX1100_DENSE_GATE_UP_PAIR: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR", false));
 
@@ -478,16 +475,6 @@ mod bt_tile_tests {
 /// wave 0 reduces the partials through LDS. Must match the kernels.
 const MQ3_SPLITK_WAVES: u32 = 8;
 
-/// `HIPFIRE_QWEN4_MOE_FRONT_FUSE` (default on, `0` restores the unfused chain): the
-/// sealed grouped MoE prefill on exact gfx1201's or exact gfx1151's symmetric IU4 route reads the HC `mixed`
-/// rows once in `mq_rotate_x_i4_f16out`, which emits both the router / shared-expert F16 X
-/// (the bytes of `convert_f32_to_f16`) and the routed gate/up IU4 sidecar (the bytes of
-/// `mq_rotate_x_i4`), and skips the F32 `mq_rotate_x` whose output no reader on that route
-/// consumes. Byte-identical to the chain it replaces. Read once.
-pub(crate) static QWEN4_MOE_FRONT_FUSE: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_FRONT_FUSE", true)
-    });
 /// `HIPFIRE_QWEN4_MOE_X_LDS` (`auto` | `1` | `0`, default `auto`): on exact
 /// gfx1151 the F16 WMMA grouped MoE gate/up SiLU and down GEMMs take the
 /// entries whose row-tile waves share each expert run's X through LDS
@@ -620,13 +607,6 @@ static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(
 /// `kernels::QWEN4_MQ6_X4_PM_GFX1151`. `0` keeps the hipcc kernels. Read once.
 static QWEN4_MQ6_X4_PM: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ6_X4_PM", true));
-/// `HIPFIRE_QWEN4_SHARED_GU_PM` (on unless `0`) runs gfx1151's Flash-Next shared-expert
-/// gate/up (the gate and up F16 WMMA GEMMs, `shared_expert_activation_bf16_f32` and the
-/// shared down's F32 -> F16 hidden conversion) as one launch of the certified builder module
-/// `kernels::QWEN4_SHARED_GU_PM_GFX1151`, byte-identical (F16 hidden, post-sigmoid selector,
-/// everything downstream). `0` keeps the chain. Read once.
-static QWEN4_SHARED_GU_PM: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_GU_PM", true));
 /// Waves (16 channels each) per workgroup of the entry the route launches: the
 /// `_w8` entry (128 channels x 128 tokens per workgroup). The `_w4` entry is the oracle's
 /// comparison arm.
@@ -1574,7 +1554,7 @@ const PM_V2B_A4_MODULE: &str = "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx115
 /// Stage-1 retile twin of `PM_V2B_SILU` (same ABI; block 512, grid
 /// `[N/128, 2M/512]`), `HIPFIRE_V2B_A4_EPI=retile`.
 const PM_V2B_SILU_M512: &str = "gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_m512_gfx1151";
-/// Fused gate/up SiLU + down-proj A4 sidecar producer, `HIPFIRE_V2B_A4_EPI=1`.
+/// Fused gate/up SiLU + down-proj A4 sidecar producer (the default arm).
 const PM_V2B_SILU_A4: &str = "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151";
 /// The builder ADD touches the residual over epochs E-16..E-9, so it needs
 /// at least 16 K128 epochs.
@@ -1621,21 +1601,20 @@ enum A4Mode {
 }
 
 /// Current `HIPFIRE_V2B_A4_EPI` arm. Read on every call (not cached) so one
-/// process can switch arms; `0` is the opt-out (unfused V2B SiLU + hin).
+/// process can switch arms; `retile` is the diagnostic bisect arm.
 /// Only exact gfx1151 V2B shapes are admitted (`Gpu::a4_epi_admitted`).
-fn v2b_a4_mode() -> Option<A4Mode> {
+fn v2b_a4_mode() -> A4Mode {
     match hipfire_config::developer_var("HIPFIRE_V2B_A4_EPI").as_deref() {
-        Ok("0") => None,
-        Ok("retile") => Some(A4Mode::Retile),
-        _ => Some(A4Mode::Fused),
+        Ok("retile") => A4Mode::Retile,
+        _ => A4Mode::Fused,
     }
 }
 
 /// Builder twin of a hipcc V2B entry (gfx1151 only: the V2B tile is), with
 /// the builder ADD's log2 raster group; `None` keeps the hipcc entry.
 /// `HIPFIRE_V2B_PM=0` restores every hipcc entry. The Z|beta|alpha
-/// `_set_zba` scatter and the plain `_add` (`HIPFIRE_V2B_ADDEPI=0`) stay on
-/// hipcc; the ADD twin takes power-of-two groups that divide the row tiles.
+/// `_set_zba` scatter stays on hipcc; the ADD twin takes power-of-two groups
+/// that divide the row tiles.
 /// Outputs are byte-identical to the entry replaced.
 fn v2b_pm_entry(hipcc: &str, swz_grp: i32, m: usize, k: usize) -> Option<(&'static str, u32)> {
     if hipfire_config::developer_var("HIPFIRE_V2B_PM").as_deref() == Ok("0") {
@@ -11225,8 +11204,8 @@ impl Gpu {
     }
     /// Only the measured symmetric 128x128 v2 route has a paired-row h
     /// epilogue. The producer must retain h in registers at this K. Default
-    /// on (byte-identical H2 KLD, +3.3% pp8192); `HIPFIRE_FP8_SILU_H=0` or
-    /// `HIPFIRE_FP8_PROD_INREG=0` restores the separate gate/up planes.
+    /// on (byte-identical H2 KLD, +3.3% pp8192); `HIPFIRE_FP8_SILU_H=0`
+    /// restores the separate gate/up planes.
     pub fn fp8_silu_h_active(&self, n: usize, k: usize, gate_m: usize, up_m: usize) -> bool {
         self.arch == "gfx1201"
             && self.flags.gfx12_mq4v2_fp8_v2
@@ -11236,7 +11215,6 @@ impl Gpu {
             && (n >= 256 || self.ordinary_prefill_active())
             && k <= 17408
             && gate_m == up_m
-            && hipfire_config::developer_bool("HIPFIRE_FP8_PROD_INREG", true)
             && hipfire_config::developer_bool("HIPFIRE_FP8_SILU_H", true)
     }
 
@@ -20325,7 +20303,7 @@ impl Gpu {
         self.gemm_mq4g256v2_mmq_prequant_lloyd(a_raw, x_q8_ptr, y, m, k, batch_size, true, c16)
     }
 
-    /// Family gate for MQ4V2-Lloyd MMQ-LUT conveniences: kill switch, exact
+    /// Family gate for MQ4V2-Lloyd MMQ-LUT conveniences: exact
     /// gfx1100|gfx1151, K%256, batch>0. Batch granularity is handled inside
     /// the conveniences (GEMV N<64, pad-to-128 otherwise, direct N%128==0).
     fn lloyd_mmq_family_gate(&self, launcher: &str, k: usize, batch_size: usize) -> HipResult<()> {
@@ -21138,23 +21116,22 @@ impl Gpu {
             return result;
         }
         if v2_tile == Some(Iu4V2Tile::V2b) {
-            // ADD epilogue (`HIPFIRE_V2B_ADDEPI=0` restores the plain ADD):
+            // ADD epilogue:
             // with a caller-armed delta buffer, write SET into it and leave
             // the residual add to the next IU4 RMSNorm (`residual_fold_pending`);
             // otherwise touch the residual ahead of the epilogue
             // (`_add_touch`). Both are byte-identical to `_add`.
-            let addepi = add && *DISPATCH_V2B_ADDEPI;
-            let fold = if addepi {
+            let fold = if add {
                 self.residual_fold_arm
                     .take()
                     .filter(|a| a.len >= m * batch_size && a.delta != y.buf.as_ptr())
             } else {
                 None
             };
-            let kernel_name = match (add, addepi, fold.is_some()) {
-                (true, true, true) | (false, _, _) => "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11",
-                (true, true, false) => "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11",
-                (true, false, _) => "gemm_mq4g256v2_residual_iu4_v2b_add_gfx11",
+            let kernel_name = if add && fold.is_none() {
+                "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11"
+            } else {
+                "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11"
             };
             // FFN down raster (`HIPFIRE_V2B_DOWN_SWZ`, row tiles per group;
             // `0` restores the token-fastest `_add_touch` order): the only
@@ -22292,7 +22269,6 @@ impl Gpu {
             || mg == 0
             || n == 0
             || bf16_h_a4_enabled()
-            || hipfire_config::developer_var("HIPFIRE_F1LITE").as_deref() == Ok("0")
         {
             return Ok(false);
         }
@@ -29712,11 +29688,10 @@ impl Gpu {
 
     /// Whether the fused shared-expert gate/up kernel
     /// ([`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_shared_gu_pm`]) applies to the BF16
-    /// `[m × k]` gate and up weights at `batch_size` rows: exact gfx1151,
-    /// `HIPFIRE_QWEN4_SHARED_GU_PM` on (default), both weights on the Qwen4
-    /// F16 WMMA route (the chain's own GEMM: >= `QWEN4_F16_WMMA_MIN_TOKENS`
+    /// `[m × k]` gate and up weights at `batch_size` rows: exact gfx1151, both weights on
+    /// the Qwen4 F16 WMMA route (the chain's own GEMM: >= `QWEN4_F16_WMMA_MIN_TOKENS`
     /// rows, no recorder or capture) and the kernel's shape limits
-    /// ([`qwen4_shared_gu_pm_shape`]).
+    /// ([`qwen4_shared_gu_pm_shape`]). Otherwise the chain runs.
     pub fn qwen4_shared_gu_pm_applies(
         &self,
         gate: &GpuTensor,
@@ -29725,8 +29700,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> bool {
-        *QWEN4_SHARED_GU_PM
-            && self.arch_caps.is_gfx1151()
+        self.arch_caps.is_gfx1151()
             && qwen4_shared_gu_pm_shape(m, k, batch_size)
             && self.qwen4_f16_wmma_applies(gate, k, batch_size)
             && self.qwen4_f16_wmma_applies(up, k, batch_size)
@@ -31172,8 +31146,8 @@ impl Gpu {
         // `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE` (default on, exact gfx1201, > 64 rows below the F16
         // WMMA route): the same kernel with two BF16 activation terms (hi + lo) and a split-K
         // pinned to a fixed row count, so each row is bitwise its singleton's whatever the call size.
-        // `HIPFIRE_QWEN4_PREFILL_LWMMA_TILE` (default on) runs the tuned shapes on the staged-tile
-        // kernel (`lwmma_tile_bf16_*`), every output word the same as the shipped kernel's.
+        // The tuned shapes run on the staged-tile kernel (`lwmma_tile_bf16_*`), every output word
+        // the same as the shipped kernel's.
         if self.prefill_lwmma_dense_applies(batch_size)
             && k.is_multiple_of(128)
             && x.dtype == DType::F32
@@ -37686,7 +37660,7 @@ impl Gpu {
         Ok(())
     }
 
-    /// F1-lite prepared IU4 gate/up + SwiGLU (`HIPFIRE_F1LITE=0` opts out):
+    /// F1-lite prepared IU4 gate/up + SwiGLU:
     /// one GEMM v2 launch folds the gate and up rows (address-interleaved at
     /// 16-row granularity, weights untouched) and its epilogue stores
     /// h = silu(gate)*up to `h` (FP32 [N][M]) instead of the two streams.
@@ -37709,7 +37683,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
-        if gate_m != up_m || hipfire_config::developer_var("HIPFIRE_F1LITE").as_deref() == Ok("0") {
+        if gate_m != up_m {
             return Ok(false);
         }
         if self.arch == "gfx1201" {
@@ -37745,7 +37719,7 @@ impl Gpu {
         };
         // gfx1151: the certified builder twin unless `HIPFIRE_V2B_PM=0`.
         let a4_retile = tile == Iu4V2Tile::V2b
-            && v2b_a4_mode() == Some(A4Mode::Retile)
+            && v2b_a4_mode() == A4Mode::Retile
             && self.a4_epi_admitted(Some(tile), gate_m, up_m, k, batch_size);
         let v2b_pm = match tile {
             Iu4V2Tile::V2b => v2b_pm_entry(kernel_name, 0, gate_m, k).map(|(name, _)| name),
@@ -37828,8 +37802,8 @@ impl Gpu {
     /// A4-fusion admission shared by the `HIPFIRE_V2B_A4_EPI` arms: exact
     /// gfx1151, `gate_m == up_m`, the V2B tile (which already excludes Redline
     /// recording and graph capture), `gate_m % 256 == 0`,
-    /// `batch_size % 128 == 0`, `k % 256 == 0`, and neither `HIPFIRE_F1LITE=0`
-    /// nor `HIPFIRE_V2B_PM=0`. `tile` is `self.iu4_v2_tile(gate_m, k, batch_size)`.
+    /// `batch_size % 128 == 0`, `k % 256 == 0`, and not `HIPFIRE_V2B_PM=0`.
+    /// `tile` is `self.iu4_v2_tile(gate_m, k, batch_size)`.
     fn a4_epi_admitted(
         &self,
         tile: Option<Iu4V2Tile>,
@@ -37844,19 +37818,18 @@ impl Gpu {
             && gate_m % 256 == 0
             && batch_size % 128 == 0
             && k % 256 == 0
-            && hipfire_config::developer_var("HIPFIRE_F1LITE").as_deref() != Ok("0")
             && hipfire_config::developer_var("HIPFIRE_V2B_PM").as_deref() != Ok("0")
     }
 
-    /// A4-fusion stage 2 (`HIPFIRE_V2B_A4_EPI`, default on; `=0` opts out): the certified
+    /// A4-fusion stage 2 (the default arm on gfx1151 V2B): the certified
     /// V2B gate/up + SiLU GEMM that also writes the w_down A4 sidecar. The
     /// kernel applies the `fused_silu_hin_rotate_mq_i4_batched` producer to its
     /// own SiLU output and stores the byte-identical 72-byte `block_i4_128`
     /// records (`[M/128][N]`, record `(2*group+half)*N + token`) into the
     /// dedicated `int4_mmq_down_scratch`, so `h` is never written and the
     /// separate hin producer is skipped. `awq` is w_down's `awq_scale`
-    /// (`f32[gate_m]`). Returns `Ok(None)` without launching unless the arm is
-    /// on and the shape is admitted (see [`Self::a4_epi_admitted`]); the
+    /// (`f32[gate_m]`). Returns `Ok(None)` without launching under `retile` or
+    /// unless the shape is admitted (see [`Self::a4_epi_admitted`]); the
     /// caller then runs the unfused path. The returned handle feeds
     /// [`Self::gemm_mq4g256v2_residual_wmma_iu4_down_prepared`].
     #[allow(clippy::too_many_arguments)]
@@ -37871,7 +37844,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<Option<crate::scratch::Int4MmqDownPrepared>> {
-        if v2b_a4_mode() != Some(A4Mode::Fused) {
+        if v2b_a4_mode() != A4Mode::Fused {
             return Ok(None);
         }
         let tile = self.iu4_v2_tile(gate_m, k, batch_size);
@@ -50565,8 +50538,8 @@ impl Gpu {
 
     /// The verify window the wide gfx1201 MoE routes serve: more than eight source rows, up to
     /// [`crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS`]. One definition for the `g32` gate/up family
-    /// ([`Gpu::moe32_gu_applies`]) and the int8 gate/up + down chain (`HIPFIRE_QWEN4_MOE_GU_A8`,
-    /// [`Gpu::qwen4_moe_gu_a8_applies`]).
+    /// ([`Gpu::moe32_gu_applies`]) and the int8 gate/up + down chain
+    /// ([`Gpu::qwen4_moe_gu_a8_applies`]).
     pub(crate) fn moe_wide_verify_rows(rows: usize) -> bool {
         rows > 8 && rows <= crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
     }
@@ -51139,22 +51112,11 @@ mod moe_sym_iu4_admits_tests {
     }
 }
 
-/// The route's GEMMs run from the certified builder modules
-/// (`kernels::QWEN4_MOE_IU4_SYM_PM_*`). `HIPFIRE_QWEN4_MOE_SYM_PM=0` restores
-/// the byte-identical gfx1151 hipcc entries (same-binary control); gfx1201 has
-/// only the builder module. Read once.
-static QWEN4_MOE_SYM_PM: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_SYM_PM", true));
-
 /// Prefill rows from which the symmetric IU4 MoE route applies: the F16 WMMA
 /// gate/up threshold it replaces. Smaller prefill, decode and verify stay on
 /// the incumbent.
 pub const QWEN4_MOE_SYM_IU4_MIN_ROWS: usize = QWEN4_F16_WMMA_MIN_TOKENS;
 const QWEN4_MOE_SYM_MODULE: &str = "qwen4_moe_iu4_sym_gfx1151";
-/// Expert-run tile entries (four 16-slot tiles per weight stream, block 128);
-/// bitwise the module's 16-slot entries, which the ORACLE keeps as the anchor.
-const QWEN4_MOE_SYM_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4";
-const QWEN4_MOE_SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151_nt4";
 const QWEN4_MOE_SYM_STREAM8_MODULE: &str = "qwen4_moe_gate_up_stream8_pm_gfx1151";
 const QWEN4_MOE_SYM_STREAM8_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt8_stream2";
 const QWEN4_MOE_SYM_CHECK: &str = "qwen4_moe_sym_check_gfx1151";
@@ -51208,11 +51170,11 @@ const QWEN4_MOE_SYM_PM_MODULE: [&str; 2] = [
 ];
 /// Expert-run entries `[arch][nt8]` (block 128, several 16-slot tiles per weight stream): NT4 on
 /// VRAM-resident experts; on gfx1201 NT8 when the layer's experts are host-mapped (twice the reuse
-/// per PCIe weight stream). Resident, only the gate/up entry widens (to NT8 when the wide-tile
-/// flag resolves on (`HIPFIRE_MOE_IU4_WIDE_TILES`, unset on at exact gfx1201) and the real slots
-/// per expert reach 128, [`qwen4_moe_sym_nt8_selected`]); the resident down entry is always the NT4 incumbent (the NT8
-/// down is slower resident). The reported pair can therefore be mixed (gate/up NT8, down NT4).
-/// Every entry is bitwise the module's 16-slot entries, the ORACLE's anchor.
+/// per PCIe weight stream). Resident, only the gate/up entry widens (to NT8 when the real slots
+/// per expert reach 128, [`qwen4_moe_sym_nt8_selected`]); the resident down entry is always the
+/// NT4 incumbent (the NT8 down is slower resident). The reported pair can therefore be mixed
+/// (gate/up NT8, down NT4). Every entry is bitwise the module's 16-slot entries, the ORACLE's
+/// anchor.
 const QWEN4_MOE_SYM_PM_GATE_UP: [[&str; 2]; 2] = [
     [
         "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4",
@@ -51235,8 +51197,8 @@ const QWEN4_MOE_SYM_PM_DOWN: [[&str; 2]; 2] = [
 ];
 
 /// Real routed slots per expert from which a VRAM-resident gate/up expert run takes the NT8 entry
-/// (wide-tile flag resolved on): 128 slots are eight full 16-slot tiles, the width one NT8
-/// weight stream serves.
+/// (on exact gfx1201): 128 slots are eight full 16-slot tiles, the width one NT8 weight stream
+/// serves.
 pub(crate) const QWEN4_MOE_SYM_WIDE_MIN_SLOTS_PER_EXPERT: usize = 128;
 
 /// Total real routed slots of one grouped IU4 GEMM launch: the launcher's `x_src_rows * x_row_div`
@@ -51265,22 +51227,20 @@ pub(crate) enum Qwen4MoeSymGemm {
 
 /// Whether the grouped IU4 GEMM `gemm` runs its NT8 entry (`..._gfx1201_nt8`) instead of NT4. Only
 /// gfx1201 carries an NT8 table (gfx1151 has the one NT4 width, so this is `false` there for every
-/// input). Host-mapped experts keep the existing NT8 for both GEMMs whatever the flag says.
-/// VRAM-resident experts widen only the gate/up GEMM, and only when the typed flag is on
-/// (`wide_flag`, `FeatureFlags::moe_iu4_wide_tiles`), the raw bundle inventory exists
-/// ([`crate::prefill_route_capabilities::raw_inventory`]) and [`qwen4_moe_sym_wide_shape`] holds;
-/// the resident down GEMM is always NT4 (measured slower as NT8). No card or model predicate.
+/// input). Host-mapped experts keep the existing NT8 for both GEMMs. VRAM-resident experts widen
+/// only the gate/up GEMM, and only when the wide-tile route is qualified on the arch
+/// ([`crate::prefill_route_capabilities::qualified`]: exact gfx1201, raw bundle inventory
+/// included) and [`qwen4_moe_sym_wide_shape`] holds; the resident down GEMM is always NT4
+/// (measured slower as NT8). No card or model predicate.
 pub(crate) fn qwen4_moe_sym_nt8_selected(
     gemm: Qwen4MoeSymGemm,
     arch: &str,
     host_mapped: bool,
-    wide_flag: bool,
     total_slots: usize,
     n_experts: usize,
 ) -> bool {
     let wide = gemm == Qwen4MoeSymGemm::GateUp
-        && wide_flag
-        && crate::prefill_route_capabilities::raw_inventory(
+        && crate::prefill_route_capabilities::qualified(
             arch,
             crate::prefill_route_capabilities::PrefillRoute::MoeIu4WideTiles,
         )
@@ -51295,25 +51255,22 @@ pub(crate) fn qwen4_moe_sym_nt8_selected(
 pub(crate) fn qwen4_moe_sym_nt8_pair(
     arch: &str,
     host_mapped: bool,
-    wide_flag: bool,
     total_slots: usize,
     n_experts: usize,
 ) -> [bool; 2] {
-    [Qwen4MoeSymGemm::GateUp, Qwen4MoeSymGemm::Down].map(|gemm| {
-        qwen4_moe_sym_nt8_selected(gemm, arch, host_mapped, wide_flag, total_slots, n_experts)
-    })
+    [Qwen4MoeSymGemm::GateUp, Qwen4MoeSymGemm::Down]
+        .map(|gemm| qwen4_moe_sym_nt8_selected(gemm, arch, host_mapped, total_slots, n_experts))
 }
 
 #[cfg(test)]
 mod qwen4_moe_sym_wide_tiles_tests {
     use super::Qwen4MoeSymGemm::{Down, GateUp};
     use super::*;
-    use crate::prefill_route_capabilities::{enabled, PrefillRoute};
+    use crate::prefill_route_capabilities::{qualified, PrefillRoute};
 
     const ARCHES: [&str; 6] = [
         "gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx1030", "unknown",
     ];
-    const EXPLICIT: [Option<bool>; 3] = [None, Some(false), Some(true)];
     const KINDS: [Qwen4MoeSymGemm; 2] = [GateUp, Down];
 
     /// The expected selection, written independently of the production predicate: exact
@@ -51322,7 +51279,6 @@ mod qwen4_moe_sym_wide_tiles_tests {
     fn expected(
         gemm: Qwen4MoeSymGemm,
         arch: &str,
-        explicit: Option<bool>,
         host: bool,
         total_slots: usize,
         experts: usize,
@@ -51330,48 +51286,29 @@ mod qwen4_moe_sym_wide_tiles_tests {
         if arch != "gfx1201" {
             return false;
         }
-        let wide = gemm == GateUp
-            && explicit != Some(false)
-            && experts > 0
-            && (total_slots as u128) >= 128 * (experts as u128);
+        let wide =
+            gemm == GateUp && experts > 0 && (total_slots as u128) >= 128 * (experts as u128);
         host || wide
     }
 
-    /// Production selection through the resolved flag the way `FeatureFlags` builds it.
-    fn selected(
-        gemm: Qwen4MoeSymGemm,
-        arch: &str,
-        explicit: Option<bool>,
-        host: bool,
-        total_slots: usize,
-        experts: usize,
-    ) -> bool {
-        let flag = enabled(explicit, arch, PrefillRoute::MoeIu4WideTiles);
-        qwen4_moe_sym_nt8_selected(gemm, arch, host, flag, total_slots, experts)
+    fn gate_up(arch: &str, host: bool, total_slots: usize, experts: usize) -> bool {
+        qwen4_moe_sym_nt8_selected(GateUp, arch, host, total_slots, experts)
     }
 
-    fn gate_up(
-        arch: &str,
-        explicit: Option<bool>,
-        host: bool,
-        total_slots: usize,
-        experts: usize,
-    ) -> bool {
-        selected(GateUp, arch, explicit, host, total_slots, experts)
-    }
-
-    fn down(
-        arch: &str,
-        explicit: Option<bool>,
-        host: bool,
-        total_slots: usize,
-        experts: usize,
-    ) -> bool {
-        selected(Down, arch, explicit, host, total_slots, experts)
+    fn down(arch: &str, host: bool, total_slots: usize, experts: usize) -> bool {
+        qwen4_moe_sym_nt8_selected(Down, arch, host, total_slots, experts)
     }
 
     #[test]
-    fn truth_table_over_kinds_flags_arches_residency_and_shapes() {
+    fn wide_tiles_default_is_qualified_on_exact_gfx1201_only() {
+        assert!(qualified("gfx1201", PrefillRoute::MoeIu4WideTiles));
+        for arch in ARCHES.into_iter().filter(|arch| *arch != "gfx1201") {
+            assert!(!qualified(arch, PrefillRoute::MoeIu4WideTiles), "{arch}");
+        }
+    }
+
+    #[test]
+    fn truth_table_over_kinds_arches_residency_and_shapes() {
         let mut shapes: Vec<(usize, usize)> = Vec::new();
         // A3B-like: top-8, 256 experts; rows 512 / 4096 / 8192 (16 / 128 / 256 slots per expert).
         for rows in [512usize, 4096, 8192] {
@@ -51404,159 +51341,110 @@ mod qwen4_moe_sym_wide_tiles_tests {
         let mut resident_gate_up_wide = 0usize;
         for gemm in KINDS {
             for arch in ARCHES {
-                for explicit in EXPLICIT {
-                    for host in [false, true] {
-                        for &(slots, experts) in &shapes {
-                            let got = selected(gemm, arch, explicit, host, slots, experts);
-                            assert_eq!(
-                                got,
-                                expected(gemm, arch, explicit, host, slots, experts),
-                                "{gemm:?} {arch} flag={explicit:?} host={host} slots={slots} \
-                                 experts={experts}"
-                            );
-                            checked += 1;
-                            if got && !host {
-                                // Resident NT8 is a gate/up-only outcome.
-                                assert_eq!(gemm, GateUp);
-                                resident_gate_up_wide += 1;
-                            }
-                            // The pair helper is the two kinds, in [gate/up, down] order.
-                            let flag = enabled(explicit, arch, PrefillRoute::MoeIu4WideTiles);
-                            let pair = qwen4_moe_sym_nt8_pair(arch, host, flag, slots, experts);
-                            assert_eq!(
-                                pair,
-                                [
-                                    expected(GateUp, arch, explicit, host, slots, experts),
-                                    expected(Down, arch, explicit, host, slots, experts),
-                                ]
-                            );
+                for host in [false, true] {
+                    for &(slots, experts) in &shapes {
+                        let got = qwen4_moe_sym_nt8_selected(gemm, arch, host, slots, experts);
+                        assert_eq!(
+                            got,
+                            expected(gemm, arch, host, slots, experts),
+                            "{gemm:?} {arch} host={host} slots={slots} experts={experts}"
+                        );
+                        checked += 1;
+                        if got && !host {
+                            // Resident NT8 is a gate/up-only outcome.
+                            assert_eq!(gemm, GateUp);
+                            resident_gate_up_wide += 1;
                         }
+                        // The pair helper is the two kinds, in [gate/up, down] order.
+                        assert_eq!(
+                            qwen4_moe_sym_nt8_pair(arch, host, slots, experts),
+                            [
+                                expected(GateUp, arch, host, slots, experts),
+                                expected(Down, arch, host, slots, experts),
+                            ]
+                        );
                     }
                 }
             }
         }
-        assert_eq!(
-            checked,
-            KINDS.len() * ARCHES.len() * EXPLICIT.len() * 2 * shapes.len()
-        );
+        assert_eq!(checked, KINDS.len() * ARCHES.len() * 2 * shapes.len());
         assert!(resident_gate_up_wide > 0);
     }
 
     #[test]
     fn resident_pair_is_mixed_gate_up_nt8_down_nt4_only_when_widened() {
-        // A3B at 4096 rows, flag on, resident: gate/up NT8, down NT4.
+        // A3B at 4096 rows, resident: gate/up NT8, down NT4.
         assert_eq!(
-            qwen4_moe_sym_nt8_pair("gfx1201", false, true, 4096 * 8, 256),
+            qwen4_moe_sym_nt8_pair("gfx1201", false, 4096 * 8, 256),
             [true, false]
         );
-        // Below the floor, or flag off: all NT4.
+        // Below the floor: all NT4.
         assert_eq!(
-            qwen4_moe_sym_nt8_pair("gfx1201", false, true, 512 * 8, 256),
+            qwen4_moe_sym_nt8_pair("gfx1201", false, 512 * 8, 256),
             [false, false]
         );
-        assert_eq!(
-            qwen4_moe_sym_nt8_pair("gfx1201", false, false, 8192 * 8, 256),
-            [false, false]
-        );
-        // Host-mapped: NT8 for both, whatever the flag or shape.
-        for flag in [false, true] {
-            for slots in [0usize, 512 * 8, 8192 * 8] {
-                assert_eq!(
-                    qwen4_moe_sym_nt8_pair("gfx1201", true, flag, slots, 256),
-                    [true, true]
-                );
-            }
+        // Host-mapped: NT8 for both, whatever the shape.
+        for slots in [0usize, 512 * 8, 8192 * 8] {
+            assert_eq!(
+                qwen4_moe_sym_nt8_pair("gfx1201", true, slots, 256),
+                [true, true]
+            );
         }
         // gfx1151: NT4 only.
         assert_eq!(
-            qwen4_moe_sym_nt8_pair("gfx1151", false, true, 8192 * 8, 256),
+            qwen4_moe_sym_nt8_pair("gfx1151", false, 8192 * 8, 256),
             [false, false]
         );
         assert_eq!(
-            qwen4_moe_sym_nt8_pair("gfx1151", true, true, 8192 * 8, 256),
+            qwen4_moe_sym_nt8_pair("gfx1151", true, 8192 * 8, 256),
             [false, false]
         );
     }
 
     #[test]
-    fn resident_down_is_always_nt4_whatever_the_flag_arch_or_shape() {
+    fn resident_down_is_always_nt4_whatever_the_arch_or_shape() {
         for arch in ARCHES {
-            for explicit in EXPLICIT {
-                for (slots, experts) in [
-                    (0usize, 0usize),
-                    (4096 * 8, 256),
-                    (8192 * 8, 256),
-                    (128, 1),
-                    (usize::MAX, 1),
-                    (usize::MAX, usize::MAX),
-                ] {
-                    assert!(
-                        !down(arch, explicit, false, slots, experts),
-                        "{arch} {explicit:?}"
-                    );
-                }
+            for (slots, experts) in [
+                (0usize, 0usize),
+                (4096 * 8, 256),
+                (8192 * 8, 256),
+                (128, 1),
+                (usize::MAX, 1),
+                (usize::MAX, usize::MAX),
+            ] {
+                assert!(!down(arch, false, slots, experts), "{arch}");
             }
         }
-        // Host-mapped down keeps the existing NT8 on gfx1201 only, under every flag value.
-        for explicit in EXPLICIT {
-            assert!(down("gfx1201", explicit, true, 0, 0));
-            assert!(down("gfx1201", explicit, true, 8192 * 8, 256));
-            assert!(!down("gfx1151", explicit, true, 8192 * 8, 256));
-        }
+        // Host-mapped down keeps the existing NT8 on gfx1201 only.
+        assert!(down("gfx1201", true, 0, 0));
+        assert!(down("gfx1201", true, 8192 * 8, 256));
+        assert!(!down("gfx1151", true, 8192 * 8, 256));
     }
 
     #[test]
-    fn a3b_rows_widen_only_gate_up_from_4096_with_the_flag_on_a_raw_arch() {
+    fn a3b_rows_widen_only_gate_up_from_4096_on_a_raw_arch() {
         for (rows, wide) in [(512usize, false), (4096, true), (8192, true)] {
             let slots = rows * 8;
             assert_eq!(slots / 256 >= 128, wide, "rows {rows}");
-            for explicit in EXPLICIT {
-                assert_eq!(
-                    gate_up("gfx1201", explicit, false, slots, 256),
-                    wide && explicit != Some(false),
-                    "rows {rows} flag {explicit:?}"
-                );
-                // The resident pair is gate/up NT8 + down NT4 when widened; never down NT8.
-                assert!(!down("gfx1201", explicit, false, slots, 256), "rows {rows}");
-                // Host-mapped experts keep NT8 for both GEMMs at every shape and flag value.
-                assert!(gate_up("gfx1201", explicit, true, slots, 256));
-                assert!(down("gfx1201", explicit, true, slots, 256));
-            }
+            assert_eq!(gate_up("gfx1201", false, slots, 256), wide, "rows {rows}");
+            // The resident pair is gate/up NT8 + down NT4 when widened; never down NT8.
+            assert!(!down("gfx1201", false, slots, 256), "rows {rows}");
+            // Host-mapped experts keep NT8 for both GEMMs at every shape.
+            assert!(gate_up("gfx1201", true, slots, 256));
+            assert!(down("gfx1201", true, slots, 256));
         }
     }
 
     #[test]
-    fn threshold_is_exactly_128_slots_per_expert_and_zero_never_opts_in() {
+    fn threshold_is_exactly_128_slots_per_expert() {
         for experts in [1usize, 2, 7, 256, 512, 4096] {
             assert!(!qwen4_moe_sym_wide_shape(127 * experts, experts));
             assert!(!qwen4_moe_sym_wide_shape(128 * experts - 1, experts));
             assert!(qwen4_moe_sym_wide_shape(128 * experts, experts));
             assert!(qwen4_moe_sym_wide_shape(129 * experts, experts));
-            // Unset resolves on (qualified at exact gfx1201); only an explicit 0 keeps NT4.
-            assert!(gate_up("gfx1201", None, false, 129 * experts, experts));
-            assert!(!gate_up("gfx1201", None, false, 127 * experts, experts));
-            assert!(!gate_up(
-                "gfx1201",
-                Some(false),
-                false,
-                129 * experts,
-                experts
-            ));
-            assert!(gate_up(
-                "gfx1201",
-                Some(true),
-                false,
-                128 * experts,
-                experts
-            ));
-            assert!(!gate_up(
-                "gfx1201",
-                Some(true),
-                false,
-                127 * experts,
-                experts
-            ));
-            assert!(!down("gfx1201", Some(true), false, 129 * experts, experts));
+            assert!(gate_up("gfx1201", false, 128 * experts, experts));
+            assert!(!gate_up("gfx1201", false, 127 * experts, experts));
+            assert!(!down("gfx1201", false, 129 * experts, experts));
         }
     }
 
@@ -51564,13 +51452,13 @@ mod qwen4_moe_sym_wide_tiles_tests {
     fn zero_experts_and_overflow_fail_closed() {
         for slots in [0usize, 1, 128, usize::MAX] {
             assert!(!qwen4_moe_sym_wide_shape(slots, 0));
-            assert!(!gate_up("gfx1201", Some(true), false, slots, 0));
+            assert!(!gate_up("gfx1201", false, slots, 0));
         }
         // 128 * n overflows: no slot count reaches it.
         for experts in [usize::MAX, usize::MAX / 128 + 1, usize::MAX / 2] {
             assert!(experts.checked_mul(128).is_none());
             assert!(!qwen4_moe_sym_wide_shape(usize::MAX, experts));
-            assert!(!gate_up("gfx1201", Some(true), false, usize::MAX, experts));
+            assert!(!gate_up("gfx1201", false, usize::MAX, experts));
         }
         // The largest non-overflowing floor still compares exactly.
         let edge = usize::MAX / 128;
@@ -51582,14 +51470,13 @@ mod qwen4_moe_sym_wide_tiles_tests {
         assert_eq!(qwen4_moe_sym_total_slots(4096, 8), 32768);
         assert!(!gate_up(
             "gfx1201",
-            Some(true),
             false,
             qwen4_moe_sym_total_slots(usize::MAX, 8),
             1
         ));
         // Host-mapped still takes NT8 (existing behavior) for both GEMMs even then.
-        assert!(gate_up("gfx1201", None, true, 0, 0));
-        assert!(down("gfx1201", None, true, 0, 0));
+        assert!(gate_up("gfx1201", true, 0, 0));
+        assert!(down("gfx1201", true, 0, 0));
     }
 
     #[test]
@@ -51613,7 +51500,7 @@ mod qwen4_moe_sym_wide_tiles_tests {
         let padded = real + experts * 15;
         assert!(!qwen4_moe_sym_wide_shape(real, experts));
         assert!(qwen4_moe_sym_wide_shape(padded, experts));
-        assert!(!gate_up("gfx1201", Some(true), false, real, experts));
+        assert!(!gate_up("gfx1201", false, real, experts));
     }
 
     #[test]
@@ -51628,27 +51515,23 @@ mod qwen4_moe_sym_wide_tiles_tests {
             (8192, true),
         ] {
             assert_eq!(
-                gate_up("gfx1201", Some(true), false, rows * 10, 512),
+                gate_up("gfx1201", false, rows * 10, 512),
                 wide,
                 "rows {rows}"
             );
-            assert_eq!(gate_up("gfx1201", None, false, rows * 10, 512), wide);
-            assert!(!gate_up("gfx1201", Some(false), false, rows * 10, 512));
-            assert!(gate_up("gfx1201", None, true, rows * 10, 512));
-            assert!(!down("gfx1201", Some(true), false, rows * 10, 512));
-            assert!(down("gfx1201", None, true, rows * 10, 512));
+            assert!(gate_up("gfx1201", true, rows * 10, 512));
+            assert!(!down("gfx1201", false, rows * 10, 512));
+            assert!(down("gfx1201", true, rows * 10, 512));
         }
     }
 
     #[test]
     fn gfx1151_and_every_non_raw_arch_never_select_nt8() {
         for arch in ARCHES.into_iter().filter(|arch| *arch != "gfx1201") {
-            for explicit in EXPLICIT {
-                for host in [false, true] {
-                    for (slots, experts) in [(0usize, 0usize), (65536, 256), (usize::MAX, 1)] {
-                        assert!(!gate_up(arch, explicit, host, slots, experts), "{arch}");
-                        assert!(!down(arch, explicit, host, slots, experts), "{arch}");
-                    }
+            for host in [false, true] {
+                for (slots, experts) in [(0usize, 0usize), (65536, 256), (usize::MAX, 1)] {
+                    assert!(!gate_up(arch, host, slots, experts), "{arch}");
+                    assert!(!down(arch, host, slots, experts), "{arch}");
                 }
             }
         }
@@ -51884,15 +51767,6 @@ pub struct MoeSymIu4Checker {
     pub symbol: &'static str,
 }
 
-/// hipcc twin of a descriptor's GEMM entries (gfx1151 `HIPFIRE_QWEN4_MOE_SYM_PM=0`, the
-/// same-binary control): module key, source and `[gate/up, down]` entries.
-#[derive(Clone, Copy, Debug)]
-pub struct MoeSymIu4HipccTwin {
-    pub module: &'static str,
-    pub source: fn() -> &'static str,
-    pub entries: [&'static str; 2],
-}
-
 /// Immutable descriptor of one aggregate symmetric-IU4 MoE kernel family: the codec's GEMM
 /// image and entries, A4 producers, header checker and hardware limits for one target ISA. A
 /// row exists only where the shipped kernels do; the lookup ([`moe_sym_iu4_kernel`]) is derived
@@ -51918,7 +51792,6 @@ pub struct MoeSymIu4Kernel {
     pub max_slots: usize,
     /// Down entries with a row repeat of 2 and 4, `[rr2, rr4]` (gfx1151 only).
     pub down_row_repeat: Option<[&'static str; 2]>,
-    pub hipcc_twin: Option<MoeSymIu4HipccTwin>,
     pub gate_producer: MoeSymIu4GateProducer,
     pub down_producer: MoeSymIu4DownProducer,
     /// Per-arch factory of the header checker (`zp == -8 * sc`, finite). A callable, not an
@@ -52004,7 +51877,6 @@ static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 3] = [
         lds_bytes: [[0, 0], [0, 0]],
         max_slots: QWEN4_MOE_SYM_PM_MAX_SLOTS,
         down_row_repeat: None,
-        hipcc_twin: None,
         gate_producer: MoeSymIu4GateProducer {
             module: "mq_rotate_x_i4",
             require_c2: true,
@@ -52032,11 +51904,6 @@ static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 3] = [
         lds_bytes: [[8192, 0], [8192, 0]],
         max_slots: QWEN4_MOE_SYM_PM_MAX_SLOTS,
         down_row_repeat: Some(QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR),
-        hipcc_twin: Some(MoeSymIu4HipccTwin {
-            module: QWEN4_MOE_SYM_MODULE,
-            source: qwen4_moe_sym_gfx1151_hipcc_src,
-            entries: [QWEN4_MOE_SYM_GATE_UP, QWEN4_MOE_SYM_DOWN],
-        }),
         gate_producer: MoeSymIu4GateProducer {
             module: "mq_rotate_x_i4",
             require_c2: false,
@@ -52061,7 +51928,6 @@ static MOE_SYM_IU4_KERNELS: [MoeSymIu4Kernel; 3] = [
         lds_bytes: [[8192, 0], [16384, 0]],
         max_slots: QWEN4_MOE_SYM_PM_MAX_SLOTS,
         down_row_repeat: None,
-        hipcc_twin: None,
         gate_producer: MoeSymIu4GateProducer {
             module: "mq_rotate_x_i4",
             require_c2: false,
@@ -52107,7 +51973,6 @@ static MOE_SYM_IU4_GFX1201_MQ4_PLANAR: MoeSymIu4Kernel = MoeSymIu4Kernel {
     lds_bytes: [[8192, 0], [16384, 0]],
     max_slots: QWEN4_MOE_SYM_PM_MAX_SLOTS,
     down_row_repeat: None,
-    hipcc_twin: None,
     gate_producer: MoeSymIu4GateProducer {
         module: "mq_rotate_x_i4",
         require_c2: false,
@@ -52143,38 +52008,21 @@ pub fn moe_sym_iu4_kernel(
     }
 }
 
-/// gfx1201's symmetric MoE uses the native image even when the gfx1151 native-image kill switch
-/// (`HIPFIRE_QWEN4_MOE_SYM_PM`, `pm_switch`) is off: a descriptor without a hipcc twin is always
-/// native.
-pub(crate) fn moe_sym_iu4_native_selected(kernel: &MoeSymIu4Kernel, pm_switch: bool) -> bool {
-    kernel.hipcc_twin.is_none() || pm_switch
-}
-
 /// `[gate/up, down]` GEMM entries the launchers run for experts in VRAM or (`host_mapped`) in
-/// host-mapped memory: the builder entries, or the hipcc twin when the native image is not
-/// selected. The down entry carries the row repeat `down_rr` where the descriptor has row-repeat
-/// entries; a descriptor without them (and the hipcc twin) keeps one entry.
+/// host-mapped memory: the builder entries. The down entry carries the row repeat `down_rr`
+/// where the descriptor has row-repeat entries; a descriptor without them keeps one entry.
 pub(crate) fn moe_sym_iu4_symbols(
     kernel: &MoeSymIu4Kernel,
-    pm_switch: bool,
     down_rr: usize,
     host_mapped: bool,
 ) -> [&'static str; 2] {
-    match (
-        moe_sym_iu4_native_selected(kernel, pm_switch),
-        kernel.hipcc_twin.as_ref(),
-    ) {
-        (false, Some(twin)) => twin.entries,
-        _ => {
-            let h = usize::from(host_mapped);
-            let down = match (down_rr, kernel.down_row_repeat) {
-                (2, Some(rr)) => rr[0],
-                (4, Some(rr)) => rr[1],
-                _ => kernel.entries[h][1],
-            };
-            [kernel.entries[h][0], down]
-        }
-    }
+    let h = usize::from(host_mapped);
+    let down = match (down_rr, kernel.down_row_repeat) {
+        (2, Some(rr)) => rr[0],
+        (4, Some(rr)) => rr[1],
+        _ => kernel.entries[h][1],
+    };
+    [kernel.entries[h][0], down]
 }
 
 /// True when `hipcc_extra_flags` carries at least one `-DIU4_A4_CANDIDATES=` and every one is
@@ -52332,7 +52180,7 @@ const QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR: [&str; 2] = [
 /// expert-run module `kernels::QWEN4_MOE_IU4_SYM_W3_NT4_PM_GFX1151` the route launches like the
 /// MQ4 gfx1151 NT4 entries (block 128, four 16-slot tiles per weight stream; down also with
 /// the row repeats of [`Gpu::qwen4_moe_sym_down_rr`], `[rr1, rr2, rr4]`). Every NT4 entry is
-/// bitwise the NT1 entry. There is no hipcc W3 entry: `HIPFIRE_QWEN4_MOE_SYM_PM=0` does not apply.
+/// bitwise the NT1 entry. There is no hipcc W3 entry.
 const QWEN4_MOE_SYM_W3_PM_MODULE_GFX1151: &str = "qwen4_moe_iu4_sym_w3_pm_gfx1151";
 const QWEN4_MOE_SYM_W3_PM_ENTRIES_GFX1151: [&str; 4] = [
     "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1151",
@@ -52881,18 +52729,14 @@ impl Gpu {
     /// the global IU4 prefill switch is explicitly off (`HIPFIRE_IU4_PREFILL=0`),
     /// and only when the device has a symmetric IU4 MoE descriptor
     /// ([`Self::qwen4_moe_sym_kernel`]: `has_iu4_wmma` plus a descriptor row,
-    /// today gfx1100, gfx1151 and gfx1201) whose PeaceMaker native image is
-    /// selected (the gfx1151 hipcc control under `HIPFIRE_QWEN4_MOE_SYM_PM=0` is
-    /// not part of this route), the frozen C2 A4 producer candidate set is in
+    /// today gfx1100, gfx1151 and gfx1201), the frozen C2 A4 producer candidate set is in
     /// force (`-DIU4_A4_CANDIDATES=2`, exactly as
     /// [`Self::qwen4_moe_sym_iu4_requested`]), and the slot-ops builder object
     /// exists ([`Self::moe_slot_ops_available`]). Independent of
     /// `HIPFIRE_QWEN4_MOE_SYM_IU4`. Row count, shape plan and verified headers are
     /// checked separately; this route has no row floor of its own here.
     pub fn moe_sym_iu4_requested(&self) -> bool {
-        let arch_ok = self
-            .qwen4_moe_sym_kernel()
-            .is_some_and(|kernel| moe_sym_iu4_native_selected(kernel, *QWEN4_MOE_SYM_PM));
+        let arch_ok = self.qwen4_moe_sym_kernel().is_some();
         moe_sym_iu4_admits(
             *MOE_SYM_IU4,
             self.flags.iu4_prefill,
@@ -52923,18 +52767,15 @@ impl Gpu {
     /// `[gate/up, down]` entry names the route's GEMM launchers run on this
     /// device for experts in VRAM or (`host_mapped`) in host-mapped memory, and
     /// a grouped call of `total_slots` real routed slots over `n_experts` table
-    /// entries: the descriptor's builder entries, or the gfx1151 hipcc entries under
-    /// `HIPFIRE_QWEN4_MOE_SYM_PM=0` ([`moe_sym_iu4_symbols`]). `total_slots` is `x_src_rows * x_row_div`
-    /// of the launcher (gate/up: tokens x top-k; down: flat slots x 1), NOT the
-    /// padded grouped rows; `n_experts` is the pointer-table length. Descriptor-level
-    /// routing (NT1 early-out, native-vs-hipcc selection, row repeat) matches the launcher;
+    /// entries: the descriptor's builder entries ([`moe_sym_iu4_symbols`]). `total_slots` is
+    /// `x_src_rows * x_row_div` of the launcher (gate/up: tokens x top-k; down: flat slots x 1),
+    /// NOT the padded grouped rows; `n_experts` is the pointer-table length. Descriptor-level
+    /// routing (NT1 early-out, row repeat) matches the launcher;
     /// wide-tile routing matches the launcher's resident gate/up NT8 selection below.
     /// On gfx1201 host-mapped experts take NT8 for both GEMMs. VRAM-resident experts widen
-    /// only gate/up, and only when the wide-tile flag resolves on (`HIPFIRE_MOE_IU4_WIDE_TILES`,
-    /// unset on at exact gfx1201; `=0` kills) with
-    /// `total_slots / n_experts >= 128`; the resident down entry is always NT4,
-    /// so a widened resident call reports the mixed pair (gate/up NT8, down NT4)
-    /// ([`qwen4_moe_sym_nt8_pair`]). gfx1151 has one NT4
+    /// only gate/up, on exact gfx1201 with `total_slots / n_experts >= 128`; the resident down
+    /// entry is always NT4, so a widened resident call reports the mixed pair (gate/up NT8,
+    /// down NT4) ([`qwen4_moe_sym_nt8_pair`]). gfx1151 has one NT4
     /// width and is unaffected by every argument but the arch. The down entry
     /// carries the row repeat of [`Gpu::qwen4_moe_sym_down_rr`]; the launcher's
     /// `m % (64 * rr)` check is what keeps its grid covering every row. gfx1100 has the
@@ -52950,48 +52791,34 @@ impl Gpu {
         if kernel.tiles_per_cta[usize::from(host_mapped)] == 1 {
             return Some(moe_sym_iu4_symbols(
                 kernel,
-                *QWEN4_MOE_SYM_PM,
                 self.qwen4_moe_sym_down_rr().unwrap_or(1),
                 host_mapped,
             ));
         }
         let arch = self.qwen4_moe_sym_arch_index()?;
-        let [gate_up_nt8, _down_nt8] = qwen4_moe_sym_nt8_pair(
-            self.arch.as_str(),
-            host_mapped,
-            self.flags.moe_iu4_wide_tiles,
-            total_slots,
-            n_experts,
-        )
-        .map(usize::from);
-        Some(if moe_sym_iu4_native_selected(kernel, *QWEN4_MOE_SYM_PM) {
-            let down = match self.qwen4_moe_sym_down_rr().unwrap_or(1) {
-                2 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[0],
-                4 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[1],
-                _ => kernel.entries[usize::from(host_mapped)][1],
-            };
-            let gate_up = if gate_up_nt8 == 1 && !host_mapped && arch == 1 {
-                // The descriptor's own NT8 gate/up entry: the drop-zero planar bundle (DESIGN F1)
-                // has its `..._sym_p_pm_..._nt8`, a hard-coded aggregate entry would bind the
-                // planar pointer table to the wrong contract.
-                kernel.entries[1][0]
-            } else {
-                kernel.entries[usize::from(host_mapped)][0]
-            };
-            [gate_up, down]
-        } else if let Some(twin) = kernel.hipcc_twin.as_ref() {
-            twin.entries
+        let [gate_up_nt8, _down_nt8] =
+            qwen4_moe_sym_nt8_pair(self.arch.as_str(), host_mapped, total_slots, n_experts)
+                .map(usize::from);
+        let down = match self.qwen4_moe_sym_down_rr().unwrap_or(1) {
+            2 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[0],
+            4 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[1],
+            _ => kernel.entries[usize::from(host_mapped)][1],
+        };
+        let gate_up = if gate_up_nt8 == 1 && !host_mapped && arch == 1 {
+            // The descriptor's own NT8 gate/up entry: the drop-zero planar bundle (DESIGN F1)
+            // has its `..._sym_p_pm_..._nt8`, a hard-coded aggregate entry would bind the
+            // planar pointer table to the wrong contract.
+            kernel.entries[1][0]
         } else {
-            [QWEN4_MOE_SYM_GATE_UP, QWEN4_MOE_SYM_DOWN]
-        })
+            kernel.entries[usize::from(host_mapped)][0]
+        };
+        Some([gate_up, down])
     }
     /// Widened reporting twin of [`Gpu::qwen4_moe_sym_gemm_symbols`]: the
     /// canonical native pair, except a VRAM-resident gfx1201 call whose real
-    /// slots per expert reach 128 while the F2 opt-in
-    /// (`HIPFIRE_MOE_IU4_WIDE_TILES`, unset on at exact gfx1201) resolves on
-    /// reports the NT8 gate/up entry with the incumbent NT4 down (the mixed
-    /// pair the launcher runs; see the F2 substitution in
-    /// [`Gpu::qwen4_moe_sym_gemm`]).
+    /// slots per expert reach 128 reports the NT8 gate/up entry with the
+    /// incumbent NT4 down (the mixed pair the launcher runs; see the F2
+    /// substitution in [`Gpu::qwen4_moe_sym_gemm`]).
     pub fn qwen4_moe_sym_gemm_symbols_wide(
         &self,
         host_mapped: bool,
@@ -53001,13 +52828,7 @@ impl Gpu {
         let mut pair = self.qwen4_moe_sym_gemm_symbols(host_mapped, total_slots, n_experts)?;
         if !host_mapped
             && self.arch.as_str() == "gfx1201"
-            && qwen4_moe_sym_nt8_pair(
-                self.arch.as_str(),
-                host_mapped,
-                self.flags.moe_iu4_wide_tiles,
-                total_slots,
-                n_experts,
-            )[0]
+            && qwen4_moe_sym_nt8_pair(self.arch.as_str(), host_mapped, total_slots, n_experts)[0]
         {
             pair[0] = self.qwen4_moe_sym_kernel()?.entries[1][0];
         }
@@ -53038,14 +52859,12 @@ impl Gpu {
     /// Down-GEMM row repeat: contiguous 64-row blocks one workgroup covers
     /// (`grid.x = m / (64 * rr)`). `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` (1, 2 or 4)
     /// applies on a descriptor with row-repeat entries (the gfx1151 builder PM
-    /// entries) only; every other path, gfx1201, gfx1100 and
-    /// `HIPFIRE_QWEN4_MOE_SYM_PM=0` included, is 1. A value other than 1/2/4
-    /// is an error where it would apply.
+    /// entries) only; every other path, gfx1201 and gfx1100 included, is 1. A value other
+    /// than 1/2/4 is an error where it would apply.
     pub fn qwen4_moe_sym_down_rr(&self) -> HipResult<usize> {
-        let applies = self.qwen4_moe_sym_kernel().is_some_and(|kernel| {
-            kernel.down_row_repeat.is_some()
-                && moe_sym_iu4_native_selected(kernel, *QWEN4_MOE_SYM_PM)
-        });
+        let applies = self
+            .qwen4_moe_sym_kernel()
+            .is_some_and(|kernel| kernel.down_row_repeat.is_some());
         if !applies {
             return Ok(1);
         }
@@ -53065,7 +52884,6 @@ impl Gpu {
                 kernel.arch == "gfx1201"
                     && kernel.tiles_per_cta[0] != 1
                     && kernel.tiles_per_cta[1] != 1
-                    && moe_sym_iu4_native_selected(kernel, *QWEN4_MOE_SYM_PM)
             })
     }
 
@@ -53600,14 +53418,13 @@ impl Gpu {
         Ok(prepared)
     }
 
-    /// Whether the Qwen4 MoE front producer ([`Gpu::qwen4_moe_front_producer`]) may replace
+    /// Whether the Qwen4 MoE front producer ([`Gpu::qwen4_moe_front_producer`]) replaces
     /// the sealed grouped prefill's `convert_f32_to_f16` + `mq_rotate_x_i4` (and the dead
-    /// F32 `mq_rotate_x`): exact gfx1201 or exact gfx1151, `HIPFIRE_QWEN4_MOE_FRONT_FUSE` not
-    /// `0`, the aggregate symmetric IU4 descriptor present, and no recorder or graph capture
-    /// (the F16 scratch is written by a fresh producer launch, not a recorded conversion).
+    /// F32 `mq_rotate_x`): exact gfx1201 or exact gfx1151, the aggregate symmetric IU4
+    /// descriptor present, and no recorder or graph capture (the F16 scratch is written by
+    /// a fresh producer launch, not a recorded conversion). Otherwise the unfused chain runs.
     pub fn qwen4_moe_front_fuse_applies(&self) -> bool {
-        *QWEN4_MOE_FRONT_FUSE
-            && (self.arch_caps.is_gfx1201() || self.arch == "gfx1151")
+        (self.arch_caps.is_gfx1201() || self.arch == "gfx1151")
             && self.qwen4_moe_sym_kernel().is_some()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -54009,8 +53826,7 @@ impl Gpu {
     /// tiles untouched. `xq` is the [`Gpu::qwen4_moe_rotate256_i4`] handle of
     /// `x_src_rows` tokens; `x_row_div` = top-k. `host_mapped`: the experts
     /// behind `ptrs` live in host-mapped memory (selects the NT8 entries on gfx1201; resident
-    /// experts take the gate/up NT8 entry only when the wide-tile flag resolves on
-    /// (`HIPFIRE_MOE_IU4_WIDE_TILES`, unset on at exact gfx1201) with
+    /// experts take the gate/up NT8 entry on exact gfx1201 with
     /// `x_src_rows * x_row_div` real slots >= 128 per expert-table entry, see
     /// [`Gpu::qwen4_moe_sym_gemm_symbols`]).
     #[allow(clippy::too_many_arguments)]
@@ -54607,8 +54423,7 @@ impl Gpu {
     /// Shared 64-byte kernarg launch (the 60-byte frozen ABI plus trailing `n_experts`) of the two
     /// grouped IU4 GEMMs of this device's [`MoeSymIu4Kernel`]: an NT1 descriptor launches through
     /// [`Gpu::qwen4_moe_sym_nt1_gemm`]; an NT4/NT8 descriptor launches the certified builder
-    /// entry, or with `HIPFIRE_QWEN4_MOE_SYM_PM=0` on a descriptor with a hipcc twin (gfx1151)
-    /// the byte-identical hipcc entry. Only the descriptor's own image is ever loaded.
+    /// entry. Only the descriptor's own image is ever loaded.
     fn qwen4_moe_sym_gemm(
         &mut self,
         [down, host_mapped]: [bool; 2],
@@ -54625,12 +54440,7 @@ impl Gpu {
         };
         let kernel = self.qwen4_moe_sym_require(what)?;
         let h = usize::from(host_mapped);
-        if grouped_plane
-            && (!down
-                || self.arch != "gfx1201"
-                || kernel.tiles_per_cta[h] == 1
-                || !moe_sym_iu4_native_selected(kernel, *QWEN4_MOE_SYM_PM))
-        {
+        if grouped_plane && (!down || self.arch != "gfx1201" || kernel.tiles_per_cta[h] == 1) {
             return Err(hip_bridge::HipError::new(
                 0,
                 "qwen4_moe_sym_gemm: the grouped-position plane needs the exact-gfx1201 PM NT4/NT8 down entry",
@@ -54650,7 +54460,6 @@ impl Gpu {
             self.moe_route_census.count_sym_iu4(down);
             return Ok(());
         }
-        let pm = moe_sym_iu4_native_selected(kernel, *QWEN4_MOE_SYM_PM);
         // Row blocks per workgroup: the down symbol and grid.x both come from
         // this one value, so a launch never covers fewer rows than `m`.
         let rr = if down {
@@ -54667,9 +54476,7 @@ impl Gpu {
         let baseline_func = self
             .qwen4_moe_sym_gemm_symbols(host_mapped, total_slots, n_experts)
             .map(|[gate_up, dn]| if down { dn } else { gate_up })
-            .unwrap_or_else(|| {
-                moe_sym_iu4_symbols(kernel, *QWEN4_MOE_SYM_PM, rr, host_mapped)[usize::from(down)]
-            });
+            .unwrap_or_else(|| moe_sym_iu4_symbols(kernel, rr, host_mapped)[usize::from(down)]);
         let func = if down {
             baseline_func
         } else {
@@ -54682,10 +54489,9 @@ impl Gpu {
         let block = kernel.block_threads[usize::from(down)];
         // The grouped-position twin of the selected NT entry: same grid, ABI and bytes, its own bundle.
         let func = qwen4_moe_down_gp_entry(func, grouped_plane);
-        // The slot and Y-byte bounds belong to the builder entries; the incumbent hipcc entry
-        // (pm == false) is not bound.
+        // The slot and Y-byte bounds belong to the builder entries.
         let [mv, kv, dv, gv, sv] =
-            moe_sym_iu4_extents(func, down, rr, pm.then_some(kernel.max_slots), dims)?;
+            moe_sym_iu4_extents(func, down, rr, Some(kernel.max_slots), dims)?;
         let grid = [(dims[0] / (64 * rr)) as u32, tiles_y, 1];
         self.bind_thread()?;
         let operands = crate::kernel_abi::moe_sym_bindings(
@@ -54710,7 +54516,7 @@ impl Gpu {
             grid,
             block,
         )?;
-        if pm && func == QWEN4_MOE_SYM_STREAM8_GATE_UP {
+        if func == QWEN4_MOE_SYM_STREAM8_GATE_UP {
             self.ensure_embedded_kernel(
                 QWEN4_MOE_SYM_STREAM8_MODULE,
                 kernels::QWEN4_MOE_GATE_UP_STREAM8_PM_GFX1151,
@@ -54718,10 +54524,7 @@ impl Gpu {
             )?;
         } else {
             let (module, image) = qwen4_moe_down_gp_image(kernel, grouped_plane);
-            match (pm, kernel.hipcc_twin.as_ref()) {
-                (false, Some(twin)) => self.ensure_kernel(twin.module, (twin.source)(), func)?,
-                _ => self.ensure_embedded_kernel(module, image, func)?,
-            }
+            self.ensure_embedded_kernel(module, image, func)?;
         }
         let mut kparams = [std::ptr::null_mut::<c_void>(); hipfire_kernel_abi::MAX_FIELDS];
         let nk = crate::kernel_abi::kernel_params(&mut v, &mut kparams)?;
@@ -56662,17 +56465,6 @@ mod tests {
                     assert_eq!(abi_eval(&export.grid[0], abi, export, &params).unwrap(), 3);
                 }
             }
-            // The hipcc control (`HIPFIRE_QWEN4_MOE_SYM_PM=0`).
-            if let Some(twin) = kernel.hipcc_twin.as_ref() {
-                for d in 0..2 {
-                    assert_moe_export(
-                        kernel.arch,
-                        twin.entries[d],
-                        kernel.block_threads[d],
-                        twin.module,
-                    );
-                }
-            }
         }
         assert_eq!(descriptor_entries, 12);
         // The wide-tile / host-mapped NT8 pair tables and the measured-shape stream8 entry.
@@ -56852,7 +56644,7 @@ mod tests {
             512,
             128,
         );
-        // gfx1151 down row repeat 2 and the hipcc control (no slot / Y-byte guard).
+        // gfx1151 down row repeat 2.
         assert_moe_bytes_equal_legacy(
             "gfx1151",
             QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[0],
@@ -56862,18 +56654,6 @@ mod tests {
             2,
             slots,
             down_dims,
-            512,
-            128,
-        );
-        assert_moe_bytes_equal_legacy(
-            "gfx1151",
-            QWEN4_MOE_SYM_GATE_UP,
-            mq4,
-            false,
-            false,
-            1,
-            None,
-            gate_up_dims,
             512,
             128,
         );
@@ -57425,21 +57205,6 @@ mod route_selector_tests {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn symmetric_moe_native_kill_switch_is_gfx1151_only() {
-        for kernel in &MOE_SYM_IU4_KERNELS {
-            for enabled in [false, true] {
-                let expected = enabled || kernel.arch != "gfx1151";
-                assert_eq!(
-                    moe_sym_iu4_native_selected(kernel, enabled),
-                    expected,
-                    "{}",
-                    kernel.arch
-                );
             }
         }
     }
@@ -58296,8 +58061,7 @@ mod route_selector_tests {
         assert!(sym_iu4_rows_admit_from(128, false, 128, 8));
     }
 
-    /// Entry selection pinned to literal symbols per descriptor, switch, row repeat and
-    /// residency.
+    /// Entry selection pinned to literal symbols per descriptor, row repeat and residency.
     #[test]
     fn moe_sym_iu4_capability_symbol_selection_is_pinned() {
         let gfx1151 = moe_sym_row("gfx1151");
@@ -58308,53 +58072,40 @@ mod route_selector_tests {
                 (4, "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4r4"),
             ] {
                 assert_eq!(
-                    moe_sym_iu4_symbols(gfx1151, true, rr, host),
+                    moe_sym_iu4_symbols(gfx1151, rr, host),
                     ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4", down],
-                    "pm on rr {rr} host {host}"
-                );
-                // The hipcc twin (PM=0) keeps one NT4 entry whatever the row repeat.
-                assert_eq!(
-                    moe_sym_iu4_symbols(gfx1151, false, rr, host),
-                    [
-                        "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4",
-                        "qwen4_moe_down_iu4_sym_gfx1151_nt4"
-                    ],
-                    "pm off rr {rr} host {host}"
+                    "rr {rr} host {host}"
                 );
             }
         }
         let gfx1201 = moe_sym_row("gfx1201");
-        for pm in [false, true] {
-            for rr in [1, 2, 4] {
-                assert_eq!(
-                    moe_sym_iu4_symbols(gfx1201, pm, rr, false),
-                    [
-                        "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4",
-                        "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4"
-                    ]
-                );
-                assert_eq!(
-                    moe_sym_iu4_symbols(gfx1201, pm, rr, true),
-                    [
-                        "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8",
-                        "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8"
-                    ]
-                );
-            }
+        for rr in [1, 2, 4] {
+            assert_eq!(
+                moe_sym_iu4_symbols(gfx1201, rr, false),
+                [
+                    "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4",
+                    "qwen4_moe_down_iu4_sym_pm_gfx1201_nt4"
+                ]
+            );
+            assert_eq!(
+                moe_sym_iu4_symbols(gfx1201, rr, true),
+                [
+                    "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8",
+                    "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8"
+                ]
+            );
         }
         let gfx1100 = moe_sym_row("gfx1100");
-        for pm in [false, true] {
-            for rr in [1, 2, 4] {
-                for host in [false, true] {
-                    assert_eq!(
-                        moe_sym_iu4_symbols(gfx1100, pm, rr, host),
-                        [
-                            "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100",
-                            "qwen4_moe_down_iu4_sym_pm_gfx1100"
-                        ],
-                        "pm {pm} rr {rr} host {host}"
-                    );
-                }
+        for rr in [1, 2, 4] {
+            for host in [false, true] {
+                assert_eq!(
+                    moe_sym_iu4_symbols(gfx1100, rr, host),
+                    [
+                        "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1100",
+                        "qwen4_moe_down_iu4_sym_pm_gfx1100"
+                    ],
+                    "rr {rr} host {host}"
+                );
             }
         }
     }
@@ -58572,13 +58323,6 @@ mod route_selector_tests {
                     .contains("!isfinite(sc) || !isfinite(zp) || zp != -8.0f * sc"),
                 "{arch}: checker predicate"
             );
-            if let Some(twin) = &row.hipcc_twin {
-                let module = registry.iter().find(|e| e.module == twin.module).unwrap();
-                for entry in twin.entries {
-                    assert!(module.symbols.contains(&entry), "{arch}: twin {entry}");
-                }
-                assert_eq!(module.source(), (twin.source)(), "{arch}: twin source");
-            }
             match row.down_producer {
                 MoeSymIu4DownProducer::Hipcc { module } => {
                     assert_ne!(arch, "gfx1100");
@@ -58610,7 +58354,7 @@ mod route_selector_tests {
             ([1, 1], [64, 128], [[0, 0], [0, 0]])
         );
         assert_eq!(gfx1100.block_threads, QWEN4_MOE_SYM_NT1_BLOCK);
-        assert!(gfx1100.down_row_repeat.is_none() && gfx1100.hipcc_twin.is_none());
+        assert!(gfx1100.down_row_repeat.is_none());
         for name in slab.entries {
             assert_eq!(
                 kernel_descriptor(gfx1100.image, name).map(|d| (d.0, d.1, d.2)),

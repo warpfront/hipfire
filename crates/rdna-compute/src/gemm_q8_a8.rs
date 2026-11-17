@@ -95,14 +95,6 @@ pub enum Q8A8Sched {
     PipelinedSb,
 }
 
-/// `HIPFIRE_Q8A8_PS=0` keeps the plain schedule everywhere (kill switch of the default
-/// [`Q8A8Sched::PipelinedSb`] choice for `T128x128` FAST launches). Read once.
-fn ps_default_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_Q8A8_PS", true));
-    *ON
-}
-
 /// Quantized activations in the Gpu's W8A8 scratch. The pointers stay valid
 /// until the next [`Gpu::q8_a8_quantize_x`] (which overwrites them) or a
 /// scratch growth; [`Gpu::q8_a8_acts_current`] tells whether that happened, and the GEMM refuses
@@ -355,7 +347,7 @@ impl Gpu {
                 true
             }
             Some(Q8A8Sched::Plain) => false,
-            None => tile.has_ps(fast) && ps_default_enabled(),
+            None => tile.has_ps(fast),
         };
         let symbol = tile.symbol(fast, bf16_out, ps);
         self.ensure_kernel(MODULE, kernels::GEMM_Q8_0_MMQ_I8_GFX12_SRC, symbol)?;

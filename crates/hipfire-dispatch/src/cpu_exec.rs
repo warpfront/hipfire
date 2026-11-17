@@ -99,10 +99,9 @@ pub fn passback_enabled() -> bool {
     host_exec_mode() == HostExecMode::Passback
 }
 
-/// The splice pool configuration. Knobs (both developer vars, read once when
-/// first needed): `HIPFIRE_CPU_EXPERT_THREADS` (worker count; `0`/unset = one
-/// per physical core in the process's allowed CPU set) and
-/// `HIPFIRE_CPU_EXPERT_PIN` (`0` = do not pin workers; default on).
+/// The splice pool configuration. Knob (developer var, read once when first needed):
+/// `HIPFIRE_CPU_EXPERT_THREADS` (worker count; `0`/unset = one per physical core in the
+/// process's allowed CPU set). Workers pin to distinct physical cores.
 fn splice_pool_config() -> hipfire_cpu::splice_pool::SplicePoolConfig {
     use hipfire_cpu::splice_pool::SplicePoolConfig;
     static CFG: LazyLock<SplicePoolConfig> = LazyLock::new(|| SplicePoolConfig {
@@ -110,7 +109,6 @@ fn splice_pool_config() -> hipfire_cpu::splice_pool::SplicePoolConfig {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0),
-        pin: hipfire_config::developer_bool("HIPFIRE_CPU_EXPERT_PIN", true),
     });
     *CFG
 }
@@ -120,20 +118,13 @@ pub(crate) fn in_splice_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     hipfire_cpu::splice_pool::install(splice_pool_config(), f)
 }
 
-/// Whether the pool spin is on when `HIPFIRE_CPU_POOL_SPIN` is unset: on, with the paired decode
-/// A/B receipts the CHANGELOG entry names; `HIPFIRE_CPU_POOL_SPIN=0` is the kill switch.
-const POOL_SPIN_DEFAULT: bool = true;
-
 /// Default spin budget (both the workers' and the caller's), `HIPFIRE_CPU_POOL_SPIN_US`.
 const POOL_SPIN_DEFAULT_US: u64 = 2000;
 
-/// `HIPFIRE_CPU_POOL_SPIN` / `HIPFIRE_CPU_POOL_SPIN_US` (developer, read once): the spin budget of
-/// the CPU arm's pool wake and completion wait, or `None` when the spin is killed (`=0`).
+/// `HIPFIRE_CPU_POOL_SPIN_US` (developer, read once): the spin budget of the CPU arm's pool
+/// wake and completion wait, or `None` when the budget is `0`.
 fn pool_spin() -> Option<std::time::Duration> {
     static SPIN: LazyLock<Option<std::time::Duration>> = LazyLock::new(|| {
-        if !hipfire_config::developer_bool("HIPFIRE_CPU_POOL_SPIN", POOL_SPIN_DEFAULT) {
-            return None;
-        }
         let us = hipfire_config::developer_var("HIPFIRE_CPU_POOL_SPIN_US")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -5545,7 +5536,7 @@ mod moe_splice_tests {
         }
     }
 
-    /// The pool spin (`HIPFIRE_CPU_POOL_SPIN`) changes only when the workers are awake: the arm
+    /// The pool spin changes only when the workers are awake: the arm
     /// run through `install_spin`, with and without a warm pool and its handshake, over every
     /// host-slot subset of a 4-row window, is byte-equal to the plain splice-pool run.
     #[test]

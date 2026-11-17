@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //! Developer-only byte-equality and timing of the gathered QSA route on the
-//! hipcc kernels against the builder module (`HIPFIRE_QWEN4_QSA_PM`).
+//! hipcc kernels against the builder module.
 //!
 //! `qsa_pm_check SNAPSHOT_DIR... --out OUT.jsonl [--time N]`: every
 //! `qsa-source-v1` snapshot (`snapshot.json` under each directory, recursively,

@@ -28,8 +28,8 @@ pub mod gdn_wy_stream;
 #[path = "qsa_core_lanes.rs"]
 mod qsa_core_lanes;
 pub use qsa_core_lanes::{
-    qsa_core_lanes, qsa_core_lanes_min, qsa_lanes_fuse_enabled, QsaCoreLane, QsaCoreLanesPlan,
-    QsaOutRotate, QSA_CORE_LANES_MAX, QSA_CORE_LANE_ROWS, QSA_LANES_ATTENTION_SYMBOL,
+    qsa_core_lanes, qsa_core_lanes_min, QsaCoreLane, QsaCoreLanesPlan, QsaOutRotate,
+    QSA_CORE_LANES_MAX, QSA_CORE_LANE_ROWS, QSA_LANES_ATTENTION_SYMBOL,
     QSA_LANES_FUSED_ATTENTION_SYMBOL, QSA_LANES_FUSED_CORE_SYMBOL, QSA_LANES_FUSE_MODULE,
     QSA_LANES_MODULE, QSA_LANES_POOL_SYMBOL, QSA_LANES_PROLOGUE_SYMBOL, QSA_LANES_SELECT_SYMBOL,
 };
@@ -75,13 +75,6 @@ const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");
 const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_select_exact.hip");
-/// `HIPFIRE_QWEN4_QSA_PM` (on unless `0`) runs the gathered route's producer
-/// and attention from the certified builder module (`kernels::QSA_GATHER_PM_*`,
-/// same ABI, grid, LDS and output bytes as the hipcc kernels) instead of the
-/// JIT source, on every gathered-route arch (gfx1151, gfx1201).  `0` keeps the
-/// hipcc kernels.  Read once.
-static QWEN4_QSA_PM: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PM", true));
 /// Persistent per-QSA-layer F16 K/V for exact gfx1151 F32-state prefill.
 /// Opt-in (`HIPFIRE_QWEN4_QSA_F16_ARENA=1`); off keeps per-launch
 /// conversion. Resolved once at load; decode keeps the F32 state.
@@ -2665,15 +2658,11 @@ pub fn hyper_write_norm(
     )
 }
 
-/// `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE` (developer, default off): on exact gfx1201 the Qwen4 MoE
-/// epilogue chain `moe_down_combine_top10_batched` -> shared-down `gemv_bf16_xf32_x4_rows_r<R>`
+/// The Qwen4 MoE epilogue chain `moe_down_combine_top10_batched` -> shared-down `gemv_bf16_xf32_x4_rows_r<R>`
 /// -> `bf16_scaled_add_batched_f32` (3 launches, 1..=8 rows) runs as the one launch
-/// `moe_shared_down_combine_rows_r<R>` ([`moe_shared_down_combine`]): the combine and the shared
-/// fold ride the shared-down GEMV's epilogue. Read once.
-static QWEN4_MOE_EPILOGUE_FUSE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE", true)
-});
-
+/// `moe_shared_down_combine_rows_r<R>` ([`moe_shared_down_combine`]) on exact gfx1201: the combine and the
+/// shared fold ride the shared-down GEMV's epilogue.
+///
 /// Operands of [`moe_shared_down_combine`].
 pub struct MoeSharedDownCombine<'a> {
     /// The shared down's BF16 weight `[m, k]`.
@@ -2701,7 +2690,7 @@ pub struct MoeSharedDownCombine<'a> {
 }
 
 impl MoeSharedDownCombine<'_> {
-    /// Whether [`moe_shared_down_combine`] can run these operands on `gpu`: the flag, exact
+    /// Whether [`moe_shared_down_combine`] can run these operands on `gpu`: exact
     /// gfx1201, no replay recording / graph capture, 1..=8 rows (the rows-GEMV route; wider
     /// passes take the WMMA GEMMs), `m % 8 == 0`, at most 2^20 experts (the kernel's sort key) and
     /// the operand extents the kernel reads.
@@ -2710,8 +2699,7 @@ impl MoeSharedDownCombine<'_> {
     pub fn applies(&self, gpu: &Gpu) -> bool {
         let f32_at_least = |t: &GpuTensor, n: usize| t.dtype == DType::F32 && t.numel() >= n;
         let (m, k, rows) = (self.m, self.k, self.rows);
-        *QWEN4_MOE_EPILOGUE_FUSE
-            && gpu.arch_caps.is_gfx1201()
+        gpu.arch_caps.is_gfx1201()
             && !gpu.replay.is_recording()
             && !gpu.graphs.capture_mode
             && (1..=crate::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&rows)
@@ -2995,7 +2983,7 @@ pub fn hyper_norm_gate_outputs(gpu: &mut Gpu, p: &HyperNormGateOutputs<'_>) -> H
 }
 
 /// Decode HC read norm + the paired write's k4 gate GEMV in one launch
-/// (`hyper_norm_gate_k4_outputs_f32`, `HIPFIRE_QWEN4_HC_PAIR_DECODE`): `normalized` is
+/// (`hyper_norm_gate_k4_outputs_f32`): `normalized` is
 /// bitwise [`hyper_norm`]'s and `gates` bitwise the write's `gemv_bf16_xf32_k4` /
 /// `gemv_bf16_xf32_k4_rows_r<R>` / `_otile_r<R>` launch over that `normalized` (no
 /// `hc_act`), for 1..=64 rows (`WIDE_VERIFY_MAX_ROWS`). Four branches, hidden 2560.
@@ -10554,7 +10542,7 @@ pub fn indexed_attention_attention_batch_exact(
 }
 
 /// The gathered route's launches for `p` on the hipcc kernels or, with `pm`,
-/// the builder module (`HIPFIRE_QWEN4_QSA_PM`), whatever the route flags say.
+/// the builder module, whatever the route flags say.
 /// Byte-equality and timing harness only (`examples/qsa_pm_check.rs`).
 #[cfg(any(test, feature = "lab"))]
 #[doc(hidden)]
@@ -12220,7 +12208,7 @@ fn qsa_gathered_wmma(
     max_selected: usize,
     arena: Option<&QsaF16ArenaRef<'_>>,
 ) -> HipResult<()> {
-    let pm = *QWEN4_QSA_PM && qsa_gathered_pm_fits(p);
+    let pm = qsa_gathered_pm_fits(p);
     qsa_gathered_wmma_launch_with(gpu, p, end_position, max_selected, pm, arena)
 }
 

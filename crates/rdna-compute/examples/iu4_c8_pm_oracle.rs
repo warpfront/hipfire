@@ -44,10 +44,9 @@
 //!
 //! The PM exports are launched explicitly through the low-level PM launchers,
 //! independent of the production route: the oracle never reads the
-//! `PrefillIu4C8Pm` capability / `developer.prefill_iu4_c8_pm`. The route is
-//! qualified on exact gfx1201, so an unset flag would let the HIP incumbent
-//! arm (`*_exact_batched`) take the PM twin; the oracle therefore requires the
-//! explicit kill `HIPFIRE_PREFILL_IU4_C8_PM=0` and refuses to run otherwise.
+//! `PrefillIu4C8Pm` capability. The HIP arm pins the production exact wrappers
+//! (`*_exact_batched`) to the incumbent via `iu4_c8_pm::lab_pin_incumbent`, so
+//! they never take the PM twin.
 //!
 //! CPU diagnostic (never contributes to `all_byte_identical`): the first 64
 //! rows of the incumbent's rotated f32 are quantized by the CPU C8 model in
@@ -124,9 +123,6 @@ const SENTINEL: u8 = 0xA5;
 const EPS: f32 = 1.0e-6;
 const ROWS: [usize; 4] = [512, 4096, 7808, 8192];
 const KS: [usize; 2] = [2048, 4096];
-/// Raw env key of the production flag; the oracle must not run with it on.
-const FLAG_ENV: &str = "HIPFIRE_PREFILL_IU4_C8_PM";
-const FLAG_TYPED_KEY: &str = "developer.prefill_iu4_c8_pm";
 const PM_MODULE: &str = "iu4_c8_producer_pm_gfx1201";
 /// Candidate count of the C8 search and the first-rows CPU model span.
 const C8_CANDIDATES: usize = 8;
@@ -702,29 +698,6 @@ fn cpu_model_vs_sidecar(
     None
 }
 
-/// Flag expectation for `HIPFIRE_PREFILL_IU4_C8_PM`: explicit 1 opts in,
-/// 0 kills, unset follows the exact-gfx1201 qualification (on there).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FlagState {
-    Default,
-    On,
-    Killed,
-}
-
-fn flag_state(env: Option<&str>) -> FlagState {
-    match env {
-        Some("1") => FlagState::On,
-        Some("0") => FlagState::Killed,
-        _ => FlagState::Default,
-    }
-}
-
-/// The oracle's HIP incumbent must not be re-routed to PM: only the explicit
-/// kill keeps the `*_exact_batched` methods on the HIP export.
-fn env_isolated(env: Option<&str>) -> bool {
-    flag_state(env) == FlagState::Killed
-}
-
 // ---------------------------------------------------------------------------
 // Byte compare / locate helpers (CPU, covered by --self-check)
 // ---------------------------------------------------------------------------
@@ -938,6 +911,8 @@ fn launch(
         assert!(!ptr.is_null(), "no live IU4 sidecar scratch");
         fill_device(gpu, ptr, c.case.sidecar_bytes(), SENTINEL);
     }
+    // The exact wrappers route to PM on gfx1201; only the HIP arm must stay on the incumbent.
+    rdna_compute::iu4_c8_pm::lab_pin_incumbent(matches!(arm, Arm::Hip));
     match (c.case.export, arm) {
         (Export::Rotate, Arm::Hip) => {
             gpu.rotate_x_mq_i4_gfx12_exact_batched(c.x, c.awq, Some(x_rot), res, k, n)
@@ -964,7 +939,7 @@ fn launch(
             n,
         ),
         // The unfused chain of the sigmoid fold: `sigmoid_mul_f32` in place on the attention copy, then the
-        // HIP exact rotate of it (the flag is off, so the exact wrapper is the HIP producer).
+        // HIP exact rotate of it (pinned above, so the exact wrapper is the HIP producer).
         (Export::SigmoidRotate, Arm::Hip) => {
             gpu.sigmoid_mul_f32(&c.g.attn_work, &c.g.gate)?;
             gpu.rotate_x_mq_i4_gfx12_exact_batched(&c.g.attn_work, c.awq, Some(x_rot), res, k, n)
@@ -1291,7 +1266,6 @@ fn run_case(gpu: &mut Gpu, case: &Case, g: &Group, a: &Args, deadline: Instant) 
 fn prerequisites() -> Vec<String> {
     vec![
         "exact gfx1201 (the oracle refuses any other arch with exit 2)".to_string(),
-        format!("{FLAG_ENV}=0 is required: the route is qualified on exact gfx1201, the oracle launches the PM launchers explicitly and the HIP incumbent through the *_exact_batched methods; exit 2 otherwise"),
         format!("module {PM_MODULE} is embedded in the build (kernels/{PM_MODULE}.hxaco, include_bytes! in rdna-compute src/iu4_c8_pm.rs)"),
         "one GPU, single process, watchdog <= 120 s".to_string(),
     ]
@@ -1299,7 +1273,7 @@ fn prerequisites() -> Vec<String> {
 
 fn limitations() -> Vec<&'static str> {
     vec![
-        "launcher-level bytes only: does not read the PrefillIu4C8Pm capability, the production flag or the prefill.rs wiring",
+        "launcher-level bytes only: does not read the PrefillIu4C8Pm capability or the prefill.rs wiring",
         "the norm fold's normalized f32 row is compared bytewise; the plain norm twin emits none, so only the f32 rotated side-output and the sidecar exist for it",
         "inputs are finite f32 (no inf/NaN); weights, signs and AWQ scales are finite, AWQ positive without reciprocal planes",
         "the shared-down SwiGLU producer is not part of this twin (incumbent HIP stays); the sigmoid and RMSNorm folds are compared against the unfused chain on the HIP exact rotate",
@@ -1322,11 +1296,6 @@ fn plan(a: &Args) {
             "reps": a.reps, "min_reps": MIN_REPS, "warmups": a.warmups,
             "deadline_secs": a.deadline_secs,
             "module": PM_MODULE,
-            "flag_env": FLAG_ENV,
-            "flag_typed_key": FLAG_TYPED_KEY,
-            "flag_env_current": std::env::var(FLAG_ENV).ok(),
-            "flag_state_current": format!("{:?}", flag_state(std::env::var(FLAG_ENV).ok().as_deref())),
-            "env_isolated": env_isolated(std::env::var(FLAG_ENV).ok().as_deref()),
             "kernarg_abi_bytes": PM_KERNARG_BYTES,
             "kernarg_abi": PM_KERNARG.iter().map(|(n, o, s)| json!({"name": n, "offset": o, "size": s})).collect::<Vec<_>>(),
             "prerequisites": prerequisites(),
@@ -1500,26 +1469,6 @@ fn self_check() {
             "kernarg order"
         );
     }
-
-    // ---- Flag expectations -------------------------------------------
-    check!(
-        flag_state(None) == FlagState::Default,
-        "unset follows qualification"
-    );
-    check!(flag_state(Some("1")) == FlagState::On, "1 opts in");
-    check!(flag_state(Some("0")) == FlagState::Killed, "0 kills");
-    check!(
-        flag_state(Some("")) == FlagState::Default,
-        "empty is the default"
-    );
-    check!(
-        !env_isolated(None) && env_isolated(Some("0")) && !env_isolated(Some("1")),
-        "oracle runs only with the explicit kill"
-    );
-    check!(
-        FLAG_ENV == "HIPFIRE_PREFILL_IU4_C8_PM" && FLAG_TYPED_KEY == "developer.prefill_iu4_c8_pm",
-        "flag names"
-    );
 
     // ---- Record layout -----------------------------------------------
     check!(
@@ -1969,7 +1918,7 @@ fn self_check() {
             "checks": checks,
             "failures": failed,
             "byte_result": null,
-            "note": "CPU self-check validates the case matrix, ABI table, flag expectations, ownership remap, record index, C8 candidate constants, packing and the compare helpers only; it proves nothing about GPU bytes",
+            "note": "CPU self-check validates the case matrix, ABI table, ownership remap, record index, C8 candidate constants, packing and the compare helpers only; it proves nothing about GPU bytes",
         })
     );
     if failed != 0 {
@@ -1986,15 +1935,6 @@ fn run(a: &Args) {
         eprintln!("iu4_c8_pm_oracle: {secs}s deadline exceeded (watchdog); exiting 3");
         std::process::exit(3);
     });
-
-    let env = std::env::var(FLAG_ENV).ok();
-    if !env_isolated(env.as_deref()) {
-        eprintln!(
-            "iu4_c8_pm_oracle: {FLAG_ENV} must be 0 (the route is qualified on exact gfx1201, \
-             so unset or 1 lets the HIP incumbent route to PM; the oracle launches PM explicitly)"
-        );
-        std::process::exit(2);
-    }
 
     let mut gpu = Gpu::init().expect("gpu init");
     let cases = case_matrix(a);
@@ -2049,7 +1989,6 @@ fn run(a: &Args) {
             "oracle": "iu4_c8_pm",
             "arch": gpu.arch,
             "module": PM_MODULE,
-            "flag_env": env,
             "cases_planned": cases.len(),
             "cases_completed": completed,
             "cases_identical": identical_cases,

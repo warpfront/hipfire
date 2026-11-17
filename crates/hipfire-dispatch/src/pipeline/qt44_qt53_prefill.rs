@@ -269,7 +269,7 @@ pub(crate) struct ScratchRoute {
     /// The qt=55 FP8E4M3B128 grouped route (every other flag is then false).
     pub(crate) fp8: bool,
     pub(crate) sym_iu4: bool,
-    /// The wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GU_A8`, [`ep_a8_wide`]): BF16 grouped rows in
+    /// The wide-verify int8 chain ([`ep_a8_wide`]): BF16 grouped rows in
     /// both grouped buffers, the combine's rank order in `down_expanded`; exclusive of `sym_iu4`.
     pub(crate) ep_a8_wide: bool,
     pub(crate) gateup_bf16: bool,
@@ -579,7 +579,7 @@ pub(crate) struct MoeFront {
 }
 
 /// Whether the symmetric IU4 route (exact gfx1201 or exact gfx1151,
-/// `HIPFIRE_QWEN4_MOE_FRONT_FUSE`) reads
+/// the front producer gate) reads
 /// `x_norm_batch` once in one producer instead of the chain's `mq_rotate_x` (whose F32 output
 /// nothing on this route reads: the symmetric gate/up consumes only the IU4 sidecar, and the
 /// router and shared projections are BF16 on the natural activation),
@@ -762,15 +762,14 @@ fn router_with_selector(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
 
 /// Whether the unscoped wide route (`route_rows` past `Gpu::few_row_limit`, 16..=64 rows) projects
 /// the router together with the all-BF16 shared selector/gate/up in the shared gate/up stage's
-/// `project_weights` call (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`): the four members are lane-WMMA
+/// `project_weights` call: the four members are lane-WMMA
 /// projections of the same `x_norm_batch` (none takes the F16 WMMA route, no EP wave split), which
 /// `project_weights` runs as ONE multi-part launch, each output the router stage's / the
 /// member's own launch's bytes. Like [`router_with_shared`], the stage runs right after the router
 /// stage with no writer of `x_norm_batch` or reader of the logits in between.
 fn router_with_shared_multi(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     let router = &p.prelude.router;
-    gpu.flags.qwen4_lwmma_multi_part_enabled()
-        && !is_fp8(p)
+    !is_fp8(p)
         && gpu.route_rows(p.batch_size) > gpu.few_row_limit()
         && p.x_norm_batch.dtype == DType::F32
         && p.prelude.router_logits.dtype == DType::F32
@@ -819,7 +818,7 @@ fn router_shares_f16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
 }
 
 /// Whether this call's shared expert runs the fused gate/up PeaceMaker launch
-/// (`HIPFIRE_QWEN4_SHARED_GU_PM`, [`Gpu::qwen4_shared_gu_pm_applies`]): the
+/// ([`Gpu::qwen4_shared_gu_pm_applies`]): the
 /// router and selector on the shared F16 conversion ([`router_shares_f16`]),
 /// the BF16 recipe, a BF16 shared down on the F16 WMMA route (which then
 /// reads the F16 hidden the launch leaves in `rotated`'s bytes), and not path
@@ -1667,7 +1666,7 @@ fn epilogue_operands<'a>(
     })
 }
 
-/// Whether this call's combine + shared down + shared fold (`HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`)
+/// Whether this call's combine + shared down + shared fold
 /// run as the one launch `moe_shared_down_combine_rows_r<rows>` ([`shared_down_combined`]):
 /// the expanded-rows combine arm, then the BF16 shared down on the few-row F32 rows GEMV
 /// (`gemv_bf16_xf32_x4_rows`, or the one-row GEMV) and `bf16_scaled_add_batched`, bytewise
@@ -1914,11 +1913,11 @@ fn shared_reads_x_rot(p: &MoePrefillParams<'_>) -> bool {
 }
 
 /// Whether path 2 takes the wide-verify int8 chain of the Flash-Next EP2 decode / verify MoE
-/// (`HIPFIRE_QWEN4_MOE_GU_A8`, default on, exact `0` off): `qwen4_moe_rotate256_i8` + the signed-IU8
+/// (taken wherever the gates below admit it): `qwen4_moe_rotate256_i8` + the signed-IU8
 /// gate/up with the SwiGLU epilogue, `qwen4_moe_rotate128_i8` + the signed-IU8 down, BF16 grouped
 /// rows, and the BF16-row grouped combine, in place of the g32 gate/up, the unscatter + FWHT128,
 /// the PM A8 down, the down unscatter and the expanded top-10 combine. All of:
-/// * [`Gpu::qwen4_moe_gu_a8_applies`]: exact gfx1201, the switch not `0`, eager (no capture or
+/// * [`Gpu::qwen4_moe_gu_a8_applies`]: exact gfx1201, eager (no capture or
 ///   replay record), `batch_size` source rows in the g32 window 9..=64;
 /// * the grouped path 2 at a route above the few-row limit (not the indexed per-slot down, not
 ///   the wide-exact singleton route), not FP8 / slab, not the symmetric IU4 route (prefill keeps
@@ -1930,7 +1929,7 @@ fn shared_reads_x_rot(p: &MoePrefillParams<'_>) -> bool {
 ///   shard's partial FFN, owned-slot partial completed by the HC all-reduce, non-owned experts on
 ///   the zero dummy tables). Owner-masked ([`ep_a8_owner_mask`], default) both A8 GEMMs skip the
 ///   tiles of every non-owned expert and the combine folds only owned rows (a foreign rank adds
-///   +0); unmasked (`HIPFIRE_QWEN4_MOE_GU_A8=2`, or a gather without a mask) every grouped row is
+///   +0); unmasked (a gather without a mask) every grouped row is
 ///   written, +0 for dummy tiles. Both are byte-identical. A call that gathers (the MTP head, a
 ///   non-shard EP, a balanced / partitioned layer) needs F32 slot-ordered rows and keeps the
 ///   incumbent chain;
@@ -1960,8 +1959,8 @@ pub(crate) fn ep_a8_wide(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -
 
 /// The owner mask of this call's wide-verify int8 chain ([`ep_a8_wide`] is the caller's gate): the
 /// layer's gather hook ([`crate::families::moe::MoeRowGather::decode_owner_mask`]: the static `e % ranks`
-/// ownership of the rank's compact decode table, real owned experts and zero dummies for the rest)
-/// unless `HIPFIRE_QWEN4_MOE_GU_A8=2` ([`Gpu::qwen4_moe_gu_a8_masked`]) asks for the unmasked A/B.
+/// ownership of the rank's compact decode table, real owned experts and zero dummies for the rest),
+/// on exact gfx1201 ([`Gpu::qwen4_moe_gu_a8_masked`]).
 /// `None`: the chain runs over unmasked tiles. A table over another expert count is an error.
 fn ep_a8_owner_mask<'p>(
     gpu: &Gpu,
@@ -1987,7 +1986,7 @@ fn ep_a8_owner_mask<'p>(
 
 /// Whether [`scatter`] would launch the plain `moe_scatter_fused_top10` for this call, with
 /// nothing else to do and no error to raise: the fused router + scatter launch
-/// (`HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`) replaces exactly that launch. Mirrors [`scatter`]'s own
+/// (the route-scatter fusion) replaces exactly that launch. Mirrors [`scatter`]'s own
 /// branches (FP8, geometry, wide exact rows, symmetric IU4, owner-routed tile exchange); the
 /// expert IU4 verdict is also left to the scatter stage, so a bound IU4 plan declines.
 pub(crate) fn scatter_fusable(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
@@ -2057,7 +2056,7 @@ pub(crate) fn scatter(
     ))
 }
 
-/// The owner mask a scatter-side glue-fold launch (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, X8a / X8b) writes
+/// The owner mask a scatter-side glue-fold launch (X8a / X8b) writes
 /// together with the scatter tables: the wide-verify int8 chain's owner mask ([`ep_a8_owner_mask`]) of
 /// a call that takes that chain ([`ep_a8_wide`]); `None` for every other call.
 pub(crate) fn glue_fold_owner_mask<'p>(
@@ -2071,7 +2070,7 @@ pub(crate) fn glue_fold_owner_mask<'p>(
 }
 
 /// [`scatter`], with the owner tile mask of the wide-verify int8 chain written by the same launch when
-/// `HIPFIRE_QWEN4_MOE_GLUE_FOLD` selects X8a and the call takes the plain grouped scatter
+/// glue fold X8a is selected and the call takes the plain grouped scatter
 /// ([`scatter_fusable`]) on that chain. Returns whether the masked copy of the tile ids
 /// (`tile_ids_owned`) has been written: the gate/up stage then does not launch `ep_tile_mask`.
 pub(crate) fn scatter_masked(
@@ -2340,7 +2339,7 @@ pub(crate) fn gate_up(
 /// the live scratch (generation, shape or pointer mismatch) is never read: the producer
 /// runs again, as the unfused chain would.
 /// `tile_mask_written`: the scatter-side launch of this call already wrote the owner-masked tile ids
-/// of the wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, [`scatter_masked`]); the chain's own
+/// of the wide-verify int8 chain (glue folds X8a / X8b, [`scatter_masked`]); the chain's own
 /// `ep_tile_mask` launch is skipped.
 pub(crate) fn gate_up_front(
     gpu: &mut Gpu,
@@ -2405,8 +2404,8 @@ pub(crate) fn gate_up_front(
         ));
     }
     if ep_a8_wide(gpu, p, use_path2) {
-        // HIPFIRE_QWEN4_MOE_GU_A8 (EP2 decode / verify, 9..=64 rows): int8 per-128 gate/up with the
-        // SwiGLU epilogue (BF16 grouped rows). Owner-masked (default): `ep_tile_mask` copies the
+        // Wide-verify int8 chain (EP2 decode / verify, 9..=64 rows): int8 per-128 gate/up with the
+        // SwiGLU epilogue (BF16 grouped rows). Owner-masked: `ep_tile_mask` copies the
         // scatter's tile ids with every non-owned expert's tile set to the `-1` sentinel; this GEMM
         // and the down both read the copy (the down runs later in the same call, stream-ordered), so
         // neither touches a tile whose weights are the zero dummy. Unmasked: every grouped row is
@@ -2415,7 +2414,7 @@ pub(crate) fn gate_up_front(
         gpu.qwen4_moe_gu_a8_receipt(p.batch_size, grouped_rows, mask.is_some());
         let tile_ids = match mask {
             Some(mask) => {
-                // `HIPFIRE_QWEN4_MOE_GLUE_FOLD` a / b: the scatter-side launch already wrote the
+                // Glue fold a / b: the scatter-side launch already wrote the
                 // masked copy of the tile ids of this call.
                 if !tile_mask_written {
                     hip(gpu.ep_tile_mask(
@@ -2440,7 +2439,7 @@ pub(crate) fn gate_up_front(
             grouped_rows,
             p.k_top,
         ) {
-            // HIPFIRE_QWEN4_MOE_GLUE_FOLD=c: the down producer (`qwen4_moe_rotate128_i8`) runs in this
+            // Glue fold c: the down producer (`qwen4_moe_rotate128_i8`) runs in this
             // GEMM's epilogue; the sidecar waits in the dedicated down scratch for the down stage's
             // `gemm_qwen4_moe_down_a8_rot_sym` (same predicate, same arguments). No BF16 grouped rows.
             return hip(gpu.gemm_qwen4_moe_gate_up_silu_a8_rot_sym(
@@ -2906,7 +2905,7 @@ fn down_stage(
         return release_stage(gpu, p);
     }
     if ep_a8_wide(gpu, p, use_path2) {
-        // HIPFIRE_QWEN4_MOE_GU_A8: grouped BF16 SwiGLU rows -> FWHT128 -> flat-slot A8 -> signed-IU8
+        // Wide-verify int8 chain: grouped BF16 SwiGLU rows -> FWHT128 -> flat-slot A8 -> signed-IU8
         // down; BF16 rows for the BF16-input combine (no unscatter to slot order: the gather is a no-op).
         // The rotation reads the gate/up rows of every grouped slot, the rows of masked tiles
         // included (stale: gate/up never wrote them): each lands in its own flat-slot record
@@ -2922,7 +2921,7 @@ fn down_stage(
             grouped_rows,
             p.k_top,
         ) {
-            // The gate/up stage already produced the flat-slot A8 sidecar (HIPFIRE_QWEN4_MOE_GLUE_FOLD=c).
+            // The gate/up stage already produced the flat-slot A8 sidecar (glue fold c).
             hip(gpu.gemm_qwen4_moe_down_a8_rot_sym(
                 down_ptrs,
                 tile_ids,
@@ -5117,7 +5116,7 @@ mod scratch_tests {
         assert_eq!((need.gate_batch, need.up_batch, need.rot_batch), (0, 0, 0));
     }
 
-    /// The wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GU_A8`) writes the symmetric arm's BF16 grouped
+    /// The wide-verify int8 chain writes the symmetric arm's BF16 grouped
     /// rows and rank order, over the verify window: its requirement is the symmetric one, and both
     /// BF16 grouped buffers fit inside the F32 buffers the incumbent grouped decode chain already holds.
     #[test]

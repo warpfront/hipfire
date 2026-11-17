@@ -108,7 +108,7 @@ fn main() {
         .nth(1)
         .map(|s| s.split(',').filter_map(|v| v.parse().ok()).collect())
         .unwrap_or_else(|| vec![1, 4]);
-    let cfg = SplicePoolConfig { threads, pin: true };
+    let cfg = SplicePoolConfig { threads };
     let formats: [(&str, CpuQuant, CpuQuant); 2] = [
         ("W3", CpuQuant::Mq3I4G128R256, CpuQuant::Mq3I4G128R128),
         ("MQ4", CpuQuant::Mq4G256V2, CpuQuant::Mq4G128V2),

@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte-exactness gate for `moe_route_scatter_top10_f32`
-//! (`HIPFIRE_QWEN4_MOE_ROUTE_SCATTER=1`, module `moe_route_scatter_top10_f32`): the E512/top-10
+//! (module `moe_route_scatter_top10_f32`): the E512/top-10
 //! router and the grouped scatter in one single-CTA launch, rows 1..=8.
 //!
 //! For every row count 1..=8, both softmax recipes (normalize x BF16 round) and seeded logits
@@ -161,8 +161,6 @@ fn gen_row(rng: &mut Lcg, mode: u32, shared: &[f32]) -> Vec<f32> {
 #[test]
 #[ignore = "needs an exact gfx1201 GPU"]
 fn moe_route_scatter_matches_two_launch_chain_hw() {
-    // Read once per process by the launcher.
-    std::env::set_var("HIPFIRE_QWEN4_MOE_ROUTE_SCATTER", "1");
     let mut gpu = Gpu::init().expect("GPU required");
     if !gpu.arch_caps.is_gfx1201() {
         eprintln!("SKIP: requires exact gfx1201.");
@@ -475,51 +473,4 @@ fn moe_route_scatter_matches_two_launch_chain_hw() {
         bad, 0,
         "fused route+scatter differs from the two-launch chain"
     );
-}
-
-/// Run alone (separate process, flag `=0`, the default-on kill switch): the launcher declines and
-/// touches nothing.
-#[test]
-#[ignore = "needs an exact gfx1201 GPU"]
-fn moe_route_scatter_declines_without_flag_hw() {
-    if std::env::var("HIPFIRE_QWEN4_MOE_ROUTE_SCATTER").as_deref() == Ok("1") {
-        eprintln!("SKIP: flag forced on in this process (run this test alone).");
-        return;
-    }
-    // Read once per process by the launcher; the flag is default on, so kill it explicitly.
-    std::env::set_var("HIPFIRE_QWEN4_MOE_ROUTE_SCATTER", "0");
-    let mut gpu = Gpu::init().expect("GPU required");
-    if !gpu.arch_caps.is_gfx1201() {
-        eprintln!("SKIP: requires exact gfx1201.");
-        return;
-    }
-    let o = Outputs::new(&mut gpu, 8);
-    let logits = upload_u32(&mut gpu, DType::F32, &vec![0u32; 8 * E]);
-    assert!(!gpu.moe_route_scatter_top10_admitted(8, E, K));
-    let launched = gpu
-        .moe_route_scatter_top10_f32(
-            &logits,
-            &o.idx,
-            &o.w,
-            8,
-            true,
-            true,
-            0,
-            0,
-            &o.counts,
-            &o.offsets,
-            &o.sorted,
-            &o.tiles,
-            &o.inverse,
-            E,
-            K,
-            m_total_bound(80),
-            BLOCK_M,
-        )
-        .expect("decline");
-    assert!(!launched);
-    gpu.hip.device_synchronize().expect("sync");
-    for (i, d) in o.dump(&gpu).iter().enumerate() {
-        assert!(d.iter().all(|w| *w == CANARY), "{} touched", NAMES[i]);
-    }
 }

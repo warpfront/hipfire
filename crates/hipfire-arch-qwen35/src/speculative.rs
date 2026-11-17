@@ -3284,9 +3284,9 @@ pub struct VerifyScratch {
     /// constructor — `forward_prefill_batch` then falls back to allocating
     /// its own scratch.
     pub prefill_batch: Option<qwen35::PrefillBatchScratch>,
-    /// Reusable buffers of the singleton device sampled accept
-    /// (`HIPFIRE_DFLASH_DEVICE_ACCEPT`), grown on first sampled window. A
-    /// `Mutex` because the singleton step borrows `VerifyScratch` shared.
+    /// Reusable buffers of the singleton device sampled accept, grown on the
+    /// first sampled window. A `Mutex` because the singleton step borrows
+    /// `VerifyScratch` shared.
     pub device_accept: std::sync::Mutex<Option<DflashAcceptScratch>>,
     /// Reusable verbatim-lookup tail buffer of the singleton DFlash step
     /// (`spec_step_dflash`'s `lookup` seam), reserved at its 15-candidate
@@ -4768,35 +4768,20 @@ fn dflash_target_rows_core(
     Ok(())
 }
 
-/// `HIPFIRE_DFLASH_DEVICE_ACCEPT=0` (developer kill switch): decide the
-/// singleton sampled window on the host again (the FAST_SAMPLE target rows come
-/// back as sparse/dense host rows and the host accept loop runs). Default on.
-static DFLASH_DEVICE_ACCEPT_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_DFLASH_DEVICE_ACCEPT").map_or(true, |v| v.trim() != "0")
-});
-
-/// The kill switch of the device sampled accept ([`dflash_sampled_accept_device`]).
-/// The kernel is the certified builder module (gfx1201 only, no hipcc production
-/// fallback), so callers also require `Gpu::dflash_device_accept_supported()`.
-#[doc(hidden)]
-pub fn dflash_device_accept_enabled() -> bool {
-    *DFLASH_DEVICE_ACCEPT_ON
-}
-
 /// Whether a sampled window is decided by [`dflash_sampled_accept_device`]:
-/// the switch is on, CACTUS is off (it rewrites the whole dense target row and
-/// keeps the host arithmetic), the selector q is the sparse representation and the
-/// receipt covers the `block.len() - 1` proposed rows. Repeat / n-gram
-/// penalties never reach the sampled arm (they are greedy-only host paths).
+/// CACTUS is off (it rewrites the whole dense target row and keeps the host
+/// arithmetic), the selector q is the sparse representation and the receipt
+/// covers the `block.len() - 1` proposed rows. Repeat / n-gram penalties never
+/// reach the sampled arm (they are greedy-only host paths). The kernel is the
+/// certified builder module (gfx1201 only, no hipcc production fallback), so
+/// callers also require `Gpu::dflash_device_accept_supported()`.
 #[doc(hidden)]
 pub fn dflash_device_accept_eligible(
-    enabled: bool,
     cfg: &DflashSampleCfg,
     q: &DflashSampledDraft,
     block_len: usize,
 ) -> bool {
-    enabled
-        && !(cfg.cactus_delta > 0.0)
+    !(cfg.cactus_delta > 0.0)
         && q.sparse
         && block_len >= 2
         && q.selected_q.len() == block_len - 1
@@ -4830,7 +4815,7 @@ pub fn dflash_sampled_accept_device(
     scratch: &mut Option<DflashAcceptScratch>,
 ) -> HipResult<SampledWindowDecision> {
     let b = block.len();
-    if !dflash_device_accept_eligible(true, &cfg, q, b) {
+    if !dflash_device_accept_eligible(&cfg, q, b) {
         return Err(HipError::new(
             0,
             "device sampled accept: ineligible window (cactus / dense q / receipt shape)",
@@ -10134,8 +10119,8 @@ pub fn spec_step_dflash_with_railgun(
         let device_decision: Option<SampledWindowDecision> = match q_receipt.as_ref() {
             Some(r)
                 if !gpu_accept
+                    && gpu.dflash_device_accept_supported()
                     && dflash_device_accept_eligible(
-                        dflash_device_accept_enabled() && gpu.dflash_device_accept_supported(),
                         &DflashSampleCfg {
                             temp,
                             top_p,
@@ -10235,7 +10220,7 @@ pub fn spec_step_dflash_with_railgun(
             let _ = gpu.free_tensor(tau_t_dev);
             let _ = gpu.free_tensor(z_t_dev);
         } else if let Some(decision) = device_decision {
-            // ── Device accept path (HIPFIRE_DFLASH_DEVICE_ACCEPT) ───────────
+            // ── Device accept path ──────────────────────────────────────────
             // Selector / PLD sparse q + resident verify logits: softmax, accept
             // tests, residual and bonus all on the device; the host only reads
             // {accept_len, bonus}. See `dflash_sampled_accept_device`.
@@ -14527,11 +14512,11 @@ mod dn_stream_tests {
 
 #[cfg(test)]
 mod device_accept_tests {
-    //! Host-only checks of the singleton device sampled accept
-    //! (`HIPFIRE_DFLASH_DEVICE_ACCEPT`): admission, the payload built from the
-    //! real `SparseQRows` (last-write duplicate ids), and the kernel's bit-exact
-    //! host twin against the legacy sparse host loop. The kernel itself is
-    //! compared with the twin by `tests/sampled_dflash_device_accept_hw.rs`.
+    //! Host-only checks of the singleton device sampled accept: admission, the
+    //! payload built from the real `SparseQRows` (last-write duplicate ids), and
+    //! the kernel's bit-exact host twin against the legacy sparse host loop. The
+    //! kernel itself is compared with the twin by
+    //! `tests/sampled_dflash_device_accept_hw.rs`.
     use super::*;
     use rdna_compute::dflash_sampled_accept::{
         dflash_accept_pack_payload, dflash_sampled_accept_reference,
@@ -14567,7 +14552,7 @@ mod device_accept_tests {
     }
 
     #[test]
-    fn admission_follows_switch_cactus_and_q_representation() {
+    fn admission_follows_cactus_and_q_representation() {
         let cfg = DflashSampleCfg {
             temp: 0.7,
             top_p: 0.9,
@@ -14575,24 +14560,21 @@ mod device_accept_tests {
             cactus_delta: 0.0,
         };
         let d = sparse_draft(5);
-        assert!(dflash_device_accept_eligible(true, &cfg, &d, 5));
-        // Kill switch.
-        assert!(!dflash_device_accept_eligible(false, &cfg, &d, 5));
+        assert!(dflash_device_accept_eligible(&cfg, &d, 5));
         // CACTUS keeps the dense host arithmetic.
         let cactus = DflashSampleCfg {
             cactus_delta: 0.05,
             ..cfg
         };
-        assert!(!dflash_device_accept_eligible(true, &cactus, &d, 5));
+        assert!(!dflash_device_accept_eligible(&cactus, &d, 5));
         // Dense q (sparse off) keeps the host loop.
         let mut dense = sparse_draft(5);
         dense.sparse = false;
-        assert!(!dflash_device_accept_eligible(true, &cfg, &dense, 5));
+        assert!(!dflash_device_accept_eligible(&cfg, &dense, 5));
         // Receipt not covering the window.
-        assert!(!dflash_device_accept_eligible(true, &cfg, &d, 6));
-        assert!(!dflash_device_accept_eligible(true, &cfg, &d, 1));
+        assert!(!dflash_device_accept_eligible(&cfg, &d, 6));
+        assert!(!dflash_device_accept_eligible(&cfg, &d, 1));
         assert!(!dflash_device_accept_eligible(
-            true,
             &cfg,
             &DflashSampledDraft::default(),
             5

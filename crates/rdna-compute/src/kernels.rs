@@ -1461,8 +1461,7 @@ pub const MQ_ROTATE_X_I4_SRC: &str = concat!(
 /// FWHT rotate + in-register `block_i4_128` emit of [`MQ_ROTATE_X_I4_SRC`] (the F32 rotated
 /// row is not stored: the symmetric gate/up reads only the sidecar) that also stores the RNE
 /// F16 cast of the raw row (`convert_f32_to_f16`'s bytes) from the registers it loaded: the F16
-/// X of the router / shared-expert WMMA GEMMs in the same launch. Gated by
-/// `HIPFIRE_QWEN4_MOE_FRONT_FUSE`.
+/// X of the router / shared-expert WMMA GEMMs in the same launch.
 pub const MQ_ROTATE_X_I4_F16OUT_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -4425,7 +4424,7 @@ pub const MOE_SCATTER_FUSED_TOP10_SRC: &str = concat!(
     include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip")
 );
 /// Fused Qwen4 E512/top-10 router + grouped scatter in one single-CTA launch
-/// (`HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`, exact gfx1201, 1..=8 rows). The module is the
+/// (exact gfx1201, 1..=8 rows). The module is the
 /// concatenation of the wave-per-token router (its `router_fast_token` body), the scatter
 /// body (`qwen4_moe_scatter_body`, scan entry) and the fused entry that runs one after the
 /// other behind a workgroup barrier; no arithmetic is new.
@@ -4434,7 +4433,7 @@ pub const MOE_ROUTE_SCATTER_TOP10_F32_SRC: &str = concat!(
     include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip"),
     include_str!("../../../kernels/src/moe_route_scatter_top10_f32.gfx1201.hip")
 );
-/// Wave-3 C8 MoE glue folds (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`, exact gfx1201): the scatter + owner tile
+/// Wave-3 C8 MoE glue folds (exact gfx1201): the scatter + owner tile
 /// mask launch (`moe_scatter_fused_top10_pmask`, X8a) and the 9..=64-row router + scatter (+ mask)
 /// launch (`moe_route_scatter_top10_wide_f32`, X8b). Same concatenation as
 /// [`MOE_ROUTE_SCATTER_TOP10_F32_SRC`] with the wide entries as the last unit; the scatter body and
@@ -4446,9 +4445,9 @@ pub const MOE_ROUTE_SCATTER_WIDE_SRC: &str = concat!(
 );
 /// Opt-in Qwen4 symmetric IU4 MoE route (fn-moe-sym, gfx1151 and gfx1201),
 /// separately named modules; no incumbent module is extended.
-/// gfx1151 hipcc twin of the builder GEMMs (the `HIPFIRE_QWEN4_MOE_SYM_PM=0`
-/// control) and the gfx1151 per-header symmetric-grid checker. The shared
-/// `block_i4_128` prelude supplies the sidecar layout.
+/// gfx1151 hipcc GEMMs (byte-oracle anchors, not launched by the route) and the gfx1151
+/// per-header symmetric-grid checker. The shared `block_i4_128` prelude supplies the
+/// sidecar layout.
 pub const QWEN4_MOE_IU4_SYM_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -4548,7 +4547,7 @@ pub const QWEN4_MOE_IU4_SYM_E8P_PM_GFX1151: &[u8] =
 /// the F16 K / block-transposed V producer and the gathered F16 WMMA
 /// attention, with the ABI, grid, LDS and output bytes of
 /// `kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip`.
-/// Default on (`HIPFIRE_QWEN4_QSA_PM=0` keeps the hipcc kernels).
+/// The gathered QSA route uses them for shapes `qsa_gathered_pm_fits` admits.
 /// SHA-256 gfx1151 ad83c8da896261901671b8beeaa583c22e7a3e361f41f24ae784269c3e3de4c2
 /// (was 3ede3516…, b7809d03…), gfx1201 e3b1c677b9b71c6d7a4c7693d8442afb53dd9581137644f158134aba2d740e02
 /// (was 9d0b83cc…, deee483f…); the earlier steps differ only by the `.comment` stamp
@@ -4791,8 +4790,8 @@ pub const MQ4_ROWS_X4_PM_GFX1100_SHA256: &str =
 /// and the shared down's F32 -> F16 hidden conversion, leaving the F16 hidden `[N, I]` and the
 /// post-sigmoid selector `[N]` byte for byte what that chain leaves (same ascending K16 WMMA
 /// chains, same BF16-recipe activation ops; grid `[ceil(I / (16 wr)), ceil(N / 128), 1]`,
-/// block `32 wr`). Default on for exact gfx1151 prefill (`HIPFIRE_QWEN4_SHARED_GU_PM=0` keeps
-/// the chain).
+/// block `32 wr`). Served on exact gfx1151 prefill; other calls keep
+/// the unfused chain.
 /// SHA-256 f243bcec8e431289f6decd9e797fdfb5d5ef750faff5fad57a72fccfdd70bdcc
 /// (`sha256sum kernels/qwen4_shared_gu_pm_gfx1151.hxaco`).
 pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] =
@@ -5730,8 +5729,8 @@ pub const GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151: &[u8] =
 /// `fused_silu_hin_rotate_mq_i4_batched` on its own h, and the stage-1 retile
 /// twin `gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_m512_gfx1151` (same ABI and h
 /// bits as the V2B SiLU entry). Selected on exact gfx1151 V2B admission only
-/// via `HIPFIRE_V2B_A4_EPI` (fused by default; `retile` selects the twin,
-/// `0` the unfused path); `HIPFIRE_V2B_A4_PM_BUNDLE=<path>` loads another
+/// via `HIPFIRE_V2B_A4_EPI` (fused by default; `retile` selects the twin);
+/// `HIPFIRE_V2B_A4_PM_BUNDLE=<path>` loads another
 /// bundle instead. Since 0.4.2 the epilogue's panel-retire barrier waits for
 /// the round-0 panel loads (`s_waitcnt lgkmcnt(0)`): without it a WGP's other
 /// CU could overwrite a panel row before this wave read it, which made the
@@ -8745,8 +8744,8 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A3B_GFX1201_SRC: &str = con
 /// (`attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201`): the same
 /// body; its epilogue emits the FA out-projection's A4 slab (the bytes
 /// `sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab` forms from the f32 output)
-/// instead of the f32 output. Default on the exact gfx1201 A4 slab route;
-/// `HIPFIRE_A4_ATTN_EPI=0` restores the q8 body + producer pair.
+/// instead of the f32 output. Used on the exact gfx1201 A4 slab route;
+/// the q8 body + producer pair handles the other shapes.
 pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_A4EPI_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_QRESIDENT_V2_Q8 1\n",
     "#define HIPFIRE_FA2_A4_EPILOGUE 1\n",
@@ -12185,7 +12184,7 @@ pub const QWEN4_MOE_ROTATE128_I8_SRC: &str = concat!(
     include_str!("../../../kernels/src/qwen4_moe_rotate128_i8.hip")
 );
 /// Gate/up A8 GEMM of the same chain with the down producer folded into its epilogue
-/// (`qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}`, `HIPFIRE_QWEN4_MOE_GLUE_FOLD` sub-fold `c`): the legacy
+/// (`qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}`, glue-fold sub-fold `c`): the legacy
 /// A8 GEMM source and the A8 quantizer in front (unchanged), so the two legacy sources above keep their
 /// recorded identity. A module of its own.
 pub const QWEN4_MOE_EP_A8_ROT_SRC: &str = concat!(

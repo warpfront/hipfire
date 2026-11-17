@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Fused multi-lane QSA decode core (HIPFIRE_QWEN4_QSA_LANES_FUSE, default off), exact
+// Fused multi-lane QSA decode core, exact
 // gfx1201, fp8 K/V, BF16 index keys, ONE row per lane (AR decode). Appended after
 // qsa_lanes.gfx1201.hip (struct QsaLanes) onto the tensor_ops.hip translation unit as its
 // own module (`qsa_lanes_fuse`), so no unfused kernel's code object changes.

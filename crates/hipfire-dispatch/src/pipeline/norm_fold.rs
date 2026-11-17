@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! A3B decode norm fold (`HIPFIRE_A3B_NORM_FOLD`, default on).
+//! A3B decode norm fold.
 //!
 //! On exact gfx1201, a one-row decode of an MQ4G256V2 hidden-2048 model runs a
 //! single-workgroup `fused_rmsnorm_mq_rotate` before the MQ4G256V2 projection
@@ -24,15 +24,6 @@ const MIXER_ROWS_PER_WAVE: usize = 12;
 /// Output rows per row wave of the folded router + shared gate/up launch
 /// (1281 rows).
 pub(super) const MOE_GATE_ROWS_PER_WAVE: usize = 3;
-
-/// `HIPFIRE_A3B_NORM_FOLD` kill switch, read once per process: unset or any
-/// value but `0` keeps the fold on, `0` restores the separate norm launch.
-pub(super) fn env_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_A3B_NORM_FOLD").as_deref() != Ok("0")
-    });
-    *ENABLED
-}
 
 /// Per-call runtime admission: exact gfx1201 and no hook that needs to observe
 /// the norm output or the projection input between the two launches.
@@ -58,7 +49,7 @@ pub(super) fn launch_mixer_window(
     steps: &[super::steps::Step<'_>],
 ) -> Result<bool, DispatchError> {
     use super::steps::Step;
-    if !env_enabled() || !launchable(gpu) || !(steps.len() == 4 || steps.len() == 5) {
+    if !launchable(gpu) || !(steps.len() == 4 || steps.len() == 5) {
         return Ok(false);
     }
     let Step::RmsnormAutomatic {

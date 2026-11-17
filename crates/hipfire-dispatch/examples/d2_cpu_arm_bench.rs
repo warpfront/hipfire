@@ -26,8 +26,8 @@
 //! cargo run --release -p hipfire-dispatch --features lab --example d2_cpu_arm_bench -- kernel
 //! ```
 //!
-//! The worker count and pinning follow `HIPFIRE_CPU_EXPERT_THREADS` /
-//! `HIPFIRE_CPU_EXPERT_PIN`, as in the daemon. Pin the process to the cores
+//! The worker count follows `HIPFIRE_CPU_EXPERT_THREADS`; workers pin to distinct
+//! physical cores, as in the daemon. Pin the process to the cores
 //! under test (`taskset`) to model a smaller host.
 
 use std::time::Instant;
@@ -247,10 +247,7 @@ fn kernel(args: &[String]) {
     let reps: usize = arg(args, "--reps", 200);
     // A one-worker splice pool (this process builds no other splice pool), so
     // `gemv`'s rayon region runs on one pinned core.
-    let cfg = hipfire_cpu::splice_pool::SplicePoolConfig {
-        threads: 1,
-        pin: true,
-    };
+    let cfg = hipfire_cpu::splice_pool::SplicePoolConfig { threads: 1 };
     let mut rng = Rng(0xC0DE);
     let (m, k) = (2 * MI, DIM);
     let x: Vec<f32> = (0..k).map(|_| rng.unit() * 2.0 - 1.0).collect();
@@ -334,7 +331,6 @@ fn regions(args: &[String]) {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
-        pin: true,
     };
     let (mut gu_t, mut gu_x, mut dn_t, mut dn_x) = (vec![], vec![], vec![], vec![]);
     let mut call_t = vec![];

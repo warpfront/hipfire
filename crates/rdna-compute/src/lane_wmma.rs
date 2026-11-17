@@ -6,7 +6,7 @@
 //! dense BF16 `[rows, k]` projections at 16..=64 rows (the decode / lane / verify window),
 //! for BF16 weights and planar W8 weights (int8 widened to BF16 exactly, the per-32 scale
 //! applied in the f32 epilogue). The same kernels also serve the sub-512-row prefill forward above
-//! 64 rows ([`Gpu::lane_wmma_gemm_prefill`], `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE` / `_HC`) with a
+//! 64 rows ([`Gpu::lane_wmma_gemm_prefill`], `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`) with a
 //! split-K pinned per `(m, k)`, so each row's bytes do not depend on the call's row count.
 //!
 //! Kernels: `kernels/src/qwen4_lane_wmma.gfx1201.hip`.
@@ -606,12 +606,10 @@ pub fn lane_wmma_gemm_multi(
 
 impl Gpu {
     /// Whether `parts` of `ms` output columns over `k` and `rows` run as ONE
-    /// [`Gpu::lane_wmma_gemm_multi_fixed`] launch: `HIPFIRE_QWEN4_LWMMA_MULTI_PART` on top of
-    /// [`Gpu::lane_wmma_applies`] and a [`lane_wmma_multi_plan`]. Pure.
+    /// [`Gpu::lane_wmma_gemm_multi_fixed`] launch: [`Gpu::lane_wmma_applies`] and a
+    /// [`lane_wmma_multi_plan`]. Pure.
     pub fn lane_wmma_multi_part_applies(&self, ms: &[usize], k: usize, rows: usize) -> bool {
-        self.flags.qwen4_lwmma_multi_part_enabled()
-            && self.lane_wmma_applies(rows)
-            && lane_wmma_multi_plan(ms, k, rows).is_some()
+        self.lane_wmma_applies(rows) && lane_wmma_multi_plan(ms, k, rows).is_some()
     }
 
     /// [`lane_wmma_gemm_multi`] with the `Gpu`-owned multi-part scratch: allocated lazily on first
