@@ -2486,14 +2486,6 @@ fn main() {
                             drafter,
                             batched_spec_lanes,
                         );
-                        if drafter == Some("dflash")
-                            && attached != hipfire_runtime::config::AttachedDraft::Dflash
-                        {
-                            eprintln!(
-                                "[redline] DFlash continuous-batching lanes requested: the retained \
-                                 default is withheld for this load (save-free verify keeps HIP)"
-                            );
-                        }
                         let redline_default = hipfire_runtime::config::retained_redline_default(
                             &gpu.arch,
                             arch,
@@ -2506,12 +2498,21 @@ fn main() {
                             eprintln!("[redline] retained default refused: {refusal}; using the HIP graph");
                             false
                         });
+                        if drafter == Some("dflash")
+                            && attached != hipfire_runtime::config::AttachedDraft::Dflash
+                            && !redline_default
+                        {
+                            eprintln!(
+                                "[redline] DFlash continuous-batching lanes requested: the retained \
+                                 default is withheld for this load (save-free verify keeps HIP)"
+                            );
+                        }
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
                                 "[redline] enabling fail-closed retained default on {} \
                                  (model_arch={arch}, drafter={}, transport={})",
                                 gpu.arch,
-                                drafter.unwrap_or("off"),
+                                attached.label(),
                                 gpu.replay.transport_name()
                             );
                         }

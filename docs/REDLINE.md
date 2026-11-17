@@ -183,14 +183,17 @@ MFP4G32E8SOA tensors that are not the exact MQ2R recipe, is refused at load.
 The drafter a load attached enters admission typed, as
 `AttachedDraft::{None, Dflash, NativeMtp, Other}` (from the loaded
 speculator's name), never as a yes/no: the two Qwen3.5-dense predicates admit
-`None` and `Dflash` (see "AR forwards of a load with a DFlash drafter" below),
-every other predicate admits `None` only, and the MQ4R SKU predicate does not
+`None` and `Dflash` (see "AR forwards of a load with a DFlash drafter" below;
+on gfx1100 a DFlash drafter is admitted for symmetric MQ4G256V2 only, there is
+no DFlash + MQ3G256V2 receipt), every other predicate admits `None` only, and the MQ4R SKU predicate does not
 read the drafter. A DFlash load that stages the continuous-batching
 speculative lanes (`continuous_batch_size > 1` with `serve_vmm_batch.spec`) is
 `Other`: the gfx1201 save-free DeltaNet verify of those lanes refuses under an
 enabled retained controller and exchanges the owners a tape would bake, so that
-load keeps the HIP route and logs `[redline] DFlash continuous-batching lanes
-requested: the retained default is withheld for this load`.
+load keeps the HIP route. The daemon logs `[redline] DFlash continuous-batching
+lanes requested: the retained default is withheld for this load` only when the
+final admission result is false (for example, not on a load an MQ4R SKU rule
+admits regardless of the drafter).
 
 Exclusions applied by `retained_redline_default` before any predicate matches
 (`crates/hipfire-runtime/src/config.rs`): expert-parallel loads (`ep` > 1)
@@ -327,6 +330,8 @@ AND model_arch is qwen3_5 (dense, arch_id 5)
 AND the file's DenseWeights is in gfx1100_dense_weights_qualified:
       MQ3G256V2 (qt49), symmetric or asymmetric
       MQ4G256V2 (qt44), symmetric
+      (with a DFlash drafter: symmetric MQ4G256V2 only,
+      gfx1100_dflash_weights_qualified; no DFlash + MQ3G256V2 receipt)
 AND pipeline parallelism == 1
 AND tensor parallelism == 1
 AND expert parallelism == 1
@@ -1300,7 +1305,7 @@ Prefer paths and symbols over line numbers.
 
 | Concern | Stable source path and symbols |
 |---|---|
-| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default` (the drafter typed as `AttachedDraft`): `mq4r_redline_default` (MQ4R SKU + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic except the Muse Glimmer and Gemma 4 withholds), Qwen3.5 dense (`qwen3_5`) on exact gfx1201 with `pp=tp=1` and no drafter or a DFlash drafter, Qwen4 (`qwen4`) on exact gfx1201 with `pp=tp=1` and no drafter, Qwen3.5 dense on exact gfx1100 with a qualified decode weight format (`gfx1100_dense_weights_qualified`: MQ3G256V2, symmetric MQ4G256V2), `pp=tp=1` and no drafter or a DFlash drafter, the A3B MQ4RS SKU on exact gfx1100 or gfx1201 (`A3B_MQ4RS_RETAINED_ARCHES`; gfx1151 stays on HIP) with `pp=tp=1` and no drafter, and DeepSeek4 MQ2R on gfx1151 AR (SKU and dense-weights identity: `crates/hipfire-runtime/src/route_sku.rs`, `identify_path`). Expert-parallel loads (`ep` > 1) and Qwen3.5 under CPU-executed partial offload are never admitted. Existing LFM `.mq4` sealed evidence has no automatic selector. |
+| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default` (the drafter typed as `AttachedDraft`): `mq4r_redline_default` (MQ4R SKU + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic except the Muse Glimmer and Gemma 4 withholds), Qwen3.5 dense (`qwen3_5`) on exact gfx1201 with `pp=tp=1` and no drafter or a DFlash drafter, Qwen4 (`qwen4`) on exact gfx1201 with `pp=tp=1` and no drafter, Qwen3.5 dense on exact gfx1100 with a qualified decode weight format (`gfx1100_dense_weights_qualified`: MQ3G256V2, symmetric MQ4G256V2), `pp=tp=1` and no drafter, or a DFlash drafter with symmetric MQ4G256V2 only (`gfx1100_dflash_weights_qualified`), the A3B MQ4RS SKU on exact gfx1100 or gfx1201 (`A3B_MQ4RS_RETAINED_ARCHES`; gfx1151 stays on HIP) with `pp=tp=1` and no drafter, and DeepSeek4 MQ2R on gfx1151 AR (SKU and dense-weights identity: `crates/hipfire-runtime/src/route_sku.rs`, `identify_path`). Expert-parallel loads (`ep` > 1) and Qwen3.5 under CPU-executed partial offload are never admitted. Existing LFM `.mq4` sealed evidence has no automatic selector. |
 | Model-load application and diagnostic handlers | `crates/hipfire-daemon/src/main.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
 | Qwen model boundary and route | `crates/hipfire-arch-qwen35/src/qwen35.rs` — `forward_scratch`; `prepare_scratch_inputs`; `set_forward_eligible`; `should_route_aql`; `should_route_pm4`; `finish_capture`; `prepare_*` |
 | LFM decode path and registry evidence | `crates/hipfire-arch-lfm2moe/src/forward.rs` — `decode_step`; `decode_step_with_graph`. Sealed LFM retained-PM4 evidence/admission: [`admissions.yml`](admissions.yml) row `lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar` (no current runtime selector). |

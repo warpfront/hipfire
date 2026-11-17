@@ -97,7 +97,8 @@ impl AttachedDraft {
 /// GPU, no drafter, PM4 transport), with greedy ids identical to the HIP route
 /// on both (gfx1100: x1.22-1.32 decode tok/s, REDLINE.md §11.6); gfx1151 has no
 /// receipts and stays on HIP. A Qwen3.5 dense trunk on exact gfx1100 is
-/// admitted for single-GPU AR decode (no drafter or a DFlash drafter) when its
+/// admitted for single-GPU AR decode (no drafter, or a DFlash drafter with
+/// symmetric MQ4G256V2 only) when its
 /// decode weight
 /// format ([`DenseWeights`], read from the tensor index and HFQ metadata, never
 /// the file name) is in [`gfx1100_dense_weights_qualified`]: the MQ3G256V2
@@ -148,12 +149,17 @@ pub fn retained_redline_default(
     }
     // gfx1100 Qwen3.5 dense plain AR: a qualified decode weight format; the
     // receipts per format are the 27B served identity + tok/s in REDLINE.md §3.
+    // A DFlash drafter narrows this to symmetric MQ4G256V2 (the default 27B
+    // `mq4-xts`): there is no DFlash + MQ3G256V2 receipt on gfx1100.
     if gpu_arch == "gfx1100"
         && model_arch.eq_ignore_ascii_case("qwen3_5")
         && pp == 1
         && tp == 1
         && qwen35_dense_draft_ok
-        && weights.is_some_and(gfx1100_dense_weights_qualified)
+        && weights.is_some_and(|w| match draft {
+            AttachedDraft::Dflash => gfx1100_dflash_weights_qualified(w),
+            _ => gfx1100_dense_weights_qualified(w),
+        })
     {
         return true;
     }
@@ -201,6 +207,12 @@ pub fn gfx1100_dense_weights_qualified(weights: DenseWeights) -> bool {
         weights,
         DenseWeights::Mq3V2 { .. } | DenseWeights::Mq4V2 { symmetric: true }
     )
+}
+
+/// The subset of [`gfx1100_dense_weights_qualified`] with a DFlash-paired
+/// receipt on gfx1100: symmetric MQ4G256V2 only. DFlash + MQ3G256V2 has none.
+pub fn gfx1100_dflash_weights_qualified(weights: DenseWeights) -> bool {
+    matches!(weights, DenseWeights::Mq4V2 { symmetric: true })
 }
 
 fn cpu_offload_configured() -> bool {
@@ -790,9 +802,14 @@ mod tests {
         ];
         for w in qualified {
             assert!(gfx1100_dense_weights_qualified(w));
-            // No drafter or a DFlash drafter: the qualified plain-AR tape.
+            // No drafter: the qualified plain-AR tape. A DFlash drafter is
+            // admitted for symmetric MQ4G256V2 only (no DFlash + MQ3 receipt).
             assert!(gfx1100("qwen3_5", Some(w), 1, 1, 1, D::None), "{w:?}");
-            assert!(gfx1100("qwen3_5", Some(w), 1, 1, 1, D::Dflash), "{w:?}");
+            assert_eq!(
+                gfx1100("qwen3_5", Some(w), 1, 1, 1, D::Dflash),
+                w == DenseWeights::Mq4V2 { symmetric: true },
+                "{w:?}"
+            );
             // Any other drafter, multi-GPU and expert parallelism keep the HIP
             // graph.
             assert!(!gfx1100("qwen3_5", Some(w), 1, 1, 1, D::NativeMtp), "{w:?}");
@@ -1071,16 +1088,19 @@ mod tests {
     }
 
     /// Every [`D`] kind against every admitted cell (single GPU): DFlash joins
-    /// exactly the two Qwen3.5-dense cells, the MQ4R SKU rule ignores the
+    /// exactly the two Qwen3.5-dense cells (on gfx1100 symmetric MQ4 only;
+    /// gfx1100 + Mq3V2 admits no drafter), the MQ4R SKU rule ignores the
     /// drafter as before, and every other cell admits no drafter at all.
     #[test]
     fn attached_draft_admission_truth_table() {
         let mq4 = Some(DenseWeights::Mq4V2 { symmetric: true });
+        let mq3 = Some(DenseWeights::Mq3V2 { symmetric: true });
         let unqualified = Some(DenseWeights::Mq4V2 { symmetric: false });
-        let cells: [(&str, &str, Option<RouteSku>, Option<DenseWeights>, &[D]); 11] = [
+        let cells: [(&str, &str, Option<RouteSku>, Option<DenseWeights>, &[D]); 12] = [
             ("gfx1201", "qwen3_5", None, mq4, &[D::None, D::Dflash]),
             ("gfx1201", "qwen3_5", None, None, &[D::None, D::Dflash]),
             ("gfx1100", "qwen3_5", None, mq4, &[D::None, D::Dflash]),
+            ("gfx1100", "qwen3_5", None, mq3, &[D::None]),
             ("gfx1100", "qwen3_5", None, unqualified, &[]),
             ("gfx1151", "qwen3_5", None, mq4, &[]),
             ("gfx1201", "qwen4", None, None, &[D::None]),
