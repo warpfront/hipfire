@@ -302,7 +302,7 @@ fn run() -> R<i32> {
         let unprep_takes_iu4 = !a8 && iu4_flag && n >= 64;
         let producer_fused = gpu.iu4_producer_quant_fused_active(n, K);
         let reader_fused = gpu.iu4_producer_quant_fused_active(n, k_wo);
-        let scan_out = if gpu.flags.a8_fused_prod && gpu.a8_prefill_active(n, k_wo) {
+        let scan_out = if gpu.a8_prefill_active(n, k_wo) {
             "F32"
         } else if reader_fused {
             match gpu.gdn_scan_out(rdna_compute::norm::GdnScanOut::Bf16)? {

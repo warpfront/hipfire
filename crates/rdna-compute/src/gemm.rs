@@ -271,10 +271,6 @@ static MOE_GU_C8_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
     }
 });
 
-// Dispatch settings are process-wide, like FeatureFlags; resolve off the hot path.
-static DISPATCH_IU4_SYMFOLD: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0"));
-
 static DISPATCH_GFX1151_QKVZA_WAVE64: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64", false));
 
@@ -358,18 +354,6 @@ static DISPATCH_RDNA3_QKVZA_R2: LazyLock<bool> =
 
 static DISPATCH_QKVZA_CPOL: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc"));
-
-static DISPATCH_IU4_V2C: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_IU4_V2C").as_deref() != Ok("0"));
-
-static DISPATCH_IU4_V2B: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_IU4_V2B").as_deref() != Ok("0"));
-
-static DISPATCH_G12_RASTER: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0"));
-
-static DISPATCH_IU4_X5: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_IU4_X5").as_deref() != Ok("0"));
 
 static DISPATCH_V2C_ADDEPI: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0"));
@@ -1163,16 +1147,6 @@ impl Gpu {
 /// domain is covered.
 const LDSSTAGE_MAX_BATCH_GFX11: usize = 96;
 
-/// `HIPFIRE_G12_IU4_V3=1` enables the K1 lean-issue IU4 module on gfx1201
-/// symmetric routes (default on). Parsed once per process.
-static G12_IU4_V3: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_V3", true));
-
-#[inline]
-fn g12_iu4_v3_enabled() -> bool {
-    *G12_IU4_V3
-}
-
 /// Select the original certified bundle in the same binary for parity/timing controls.
 static G12_IU4_B1_CONTROL: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_B1_CONTROL", false));
@@ -1286,43 +1260,23 @@ static VERIFY_V64: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_VERIFY_V64", true));
 /// Largest launch row count (`n`) that takes the `_v64` slab exports.
 const VERIFY_V64_MAX_N: usize = 128;
-/// Token-fastest grid for the slab HIN producer (`HIPFIRE_A4_HIN_TOKFAST`,
-/// default on; `=0` opts out): `fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast`
-/// on grid [N, K/256] instead of the group-fastest `_slab` twin on [K/256, N].
-/// The group-fastest order fills each 128-B slab-plane line from tokens 68
-/// workgroups apart; token-fastest fills it from neighbouring workgroups.
-/// Same per-workgroup math and stores, so byte-identical output.
-static A4_HIN_TOKFAST: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_A4_HIN_TOKFAST", true));
-#[inline]
-pub(crate) fn a4_hin_tokfast_enabled() -> bool {
-    *A4_HIN_TOKFAST
-}
 /// Quality receipts count the fused A4 GDN projection launches (print-only,
 /// one stderr line per launch). Kept off in production and all timing runs.
 static G12_IU4_GDN_COVERAGE: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_IU4_GDN_COVERAGE", false));
-/// Physically packed bf16 SiLU h is independently selectable for each producer route.
-/// A4 stays opt-in after both pp8192 orders regressed; fp8 F2 defaults on after
-/// both orders improved. Each flag restores the f32 handoff when disabled.
+/// Physically packed bf16 SiLU h for the A4 producer route: opt-in after both
+/// pp8192 orders regressed (unset keeps the f32 handoff). The fp8 F2 route always
+/// packs bf16 h.
 pub(crate) fn bf16_h_a4_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_BF16_H_A4", false)
 }
-
-pub(crate) fn bf16_h_fp8_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_BF16_H_FP8", true)
-}
 /// Builder fp8 GEMM (F2 Row, bundle 962fe61d with next-K128 W and Rw
-/// prefetch), byte-identical to 1b25e3aa. Default ON for fp8 prefill on
-/// exact gfx1201 (`fp8_f2_row_active` admits N >= 512 only);
-/// `HIPFIRE_G12_FP8_ISA=0` opts out to the v2 route. H2 five-family
+/// prefetch), byte-identical to 1b25e3aa. Used for fp8 prefill on
+/// exact gfx1201 (`fp8_f2_row_active` admits N >= 512 only). H2 five-family
 /// N8192 weighted GEMM time improves 1.75% / 2.09% in ABBA / BAAB against
 /// the prior bundle at 300 W; model and quality receipts are recorded at
 /// `/home/kaden/qcal/perf/fp8-4k5/f2/prefetch/report.md`. The A4/IU4
-/// default route never admits F2. Parsed once so a queued producer and
-/// its consumer cannot see different route settings.
-static G12_FP8_F2: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G12_FP8_ISA", true));
+/// default route never admits F2.
 // H2's earlier 256-site serial repack+F2 cutoff sweep (529f971d +
 // ef2f7796) beat v2 from N=512 onward; N=256 lost. This bit-exact
 // prefetch changes neither the scale mode nor the admission threshold.
@@ -1343,18 +1297,13 @@ fn g12_iu4_b1_eligible(m: usize, k: usize, output: *mut c_void) -> bool {
     k % 256 == 0 && m % 4 == 0 && (output as usize) % 16 == 0
 }
 
-/// Certified builder V2C tile on exact gfx1100 (`HIPFIRE_GFX1100_PM_GEMM`,
-/// default on; `=0` restores the hipcc V2C JIT entries). Same algorithm,
-/// launch grid and bytes as V2C SET / ADD / F1-lite gate-up, with every fold
-/// op VOPD-paired. Parsed once so every launch of a process agrees.
-static GFX1100_PM_GEMM: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GFX1100_PM_GEMM", true));
-
-/// The builder V2C admits every V2C shape whose 32-bit lane offsets fit its
+/// Certified builder V2C tile on exact gfx1100. Same algorithm, launch grid
+/// and bytes as V2C SET / ADD / F1-lite gate-up, with every fold op
+/// VOPD-paired. It admits every V2C shape whose 32-bit lane offsets fit its
 /// 24-bit multiplies (`(token)*M` with M < 2^22; H2's largest M is 17,408).
 #[inline]
 fn gfx1100_pm_gemm(m: usize) -> bool {
-    *GFX1100_PM_GEMM && m < (1 << 22)
+    m < (1 << 22)
 }
 
 /// gfx1100 MQ6 residual PM twin (`HIPFIRE_MQ6_RESID_PM_GFX1100`, default on; `=0` restores the
@@ -2276,7 +2225,7 @@ impl Gpu {
     /// Every condition of the gfx1201 builder `_b1` selection except the
     /// per-launch shape/pointer check ([`g12_iu4_b1_eligible`]).
     fn g12_iu4_isa_requested(&self) -> bool {
-        self.mq4v2_symmetric && *DISPATCH_IU4_SYMFOLD && self.flags.g12_iu4_isa
+        self.mq4v2_symmetric && self.flags.g12_iu4_isa
     }
 
     /// B-1 slab activation layout (`HIPFIRE_A4_SLAB` / `kernel.a4_slab`,
@@ -10842,8 +10791,7 @@ impl Gpu {
     /// Admit only symmetric uniform qt44 with the existing Row-scale producer.
     /// A failed admission keeps the incumbent v2 dispatch before any repack.
     pub fn fp8_f2_row_active(&self, n: usize, k: usize, dims: &[usize], silu: bool) -> bool {
-        *G12_FP8_F2
-            && self.arch == "gfx1201"
+        self.arch == "gfx1201"
             && self.mq4v2_symmetric
             && self.flags.gfx12_mq4v2_fp8_v2
             && !self.flags.iu4_prefill_enabled()
@@ -11000,8 +10948,7 @@ impl Gpu {
         let symbol = match epi {
             "set" => "gemm_mq4g256v2_fp8_set_row_b1",
             "add" => "gemm_mq4g256v2_fp8_add_row_b1",
-            "silu" if bf16_h_fp8_enabled() => "gemm_mq4g256v2_fp8_silu_row_b1_bf16",
-            "silu" => "gemm_mq4g256v2_fp8_silu_row_b1",
+            "silu" => "gemm_mq4g256v2_fp8_silu_row_b1_bf16",
             "qkv" => "gemm_mq4g256v2_fp8_qkv_row_b1",
             "qkvza" => "gemm_mq4g256v2_fp8_qkvza_row_b1",
             "qkvzagdn" => "gemm_mq4g256v2_fp8_qkvzagdn_row_b1",
@@ -11129,7 +11076,7 @@ impl Gpu {
                 &mut eps as *mut _ as *mut c_void,
             ]);
         }
-        let output_bytes = if silu && bf16_h_fp8_enabled() { 2 } else { 4 };
+        let output_bytes = if silu { 2 } else { 4 };
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", symbol, needed + n * mt * output_bytes);
         let result = self.launch_maybe_blob(
@@ -11203,9 +11150,8 @@ impl Gpu {
             && hipfire_config::developer_var("HIPFIRE_FP8_SYMFOLD").as_deref() != Ok("0")
     }
     /// Only the measured symmetric 128x128 v2 route has a paired-row h
-    /// epilogue. The producer must retain h in registers at this K. Default
-    /// on (byte-identical H2 KLD, +3.3% pp8192); `HIPFIRE_FP8_SILU_H=0`
-    /// restores the separate gate/up planes.
+    /// epilogue. The producer must retain h in registers at this K
+    /// (byte-identical H2 KLD, +3.3% pp8192).
     pub fn fp8_silu_h_active(&self, n: usize, k: usize, gate_m: usize, up_m: usize) -> bool {
         self.arch == "gfx1201"
             && self.flags.gfx12_mq4v2_fp8_v2
@@ -11215,7 +11161,6 @@ impl Gpu {
             && (n >= 256 || self.ordinary_prefill_active())
             && k <= 17408
             && gate_m == up_m
-            && hipfire_config::developer_bool("HIPFIRE_FP8_SILU_H", true)
     }
 
     #[inline]
@@ -20713,12 +20658,11 @@ impl Gpu {
     /// `None` for X5 and its fallbacks. Both tiles take the X5 eligibility
     /// rule: symmetric fold, full M128/N128 tiles, eager column route (no
     /// replay/graph capture), positive dims.
-    /// - V2C: exact gfx1100. `HIPFIRE_IU4_V2C=0` falls back to X5.
+    /// - V2C: exact gfx1100.
     /// - V2B: exact gfx1151, M%256 == N%256 == 0 and at least two dispatch
     ///   rounds of the 1-CTA/WGP grid ((M/256)*(N/256) >= CU count = 2x WGPs).
     ///   On Halo every measured grid of >= 40 CTAs beat X5 (1.08-1.45x); grids
     ///   of 4-12 and 24 CTAs (e.g. M1024 at N512) lost and keep X5.
-    ///   `HIPFIRE_IU4_V2B=0` falls back to X5.
     fn iu4_v2_tile(&self, m: usize, k: usize, n: usize) -> Option<Iu4V2Tile> {
         match self.arch.as_str() {
             "gfx1151"
@@ -20727,7 +20671,7 @@ impl Gpu {
             {
                 Some(Iu4V2Tile::V2b)
             }
-            "gfx1100" if self.iu4_v2_eligible(m, k, n) && *DISPATCH_IU4_V2C => Some(Iu4V2Tile::V2c),
+            "gfx1100" if self.iu4_v2_eligible(m, k, n) => Some(Iu4V2Tile::V2c),
             _ => None,
         }
     }
@@ -20741,14 +20685,12 @@ impl Gpu {
             && m % 128 == 0
             && n % 128 == 0
             && self.mq4v2_symmetric
-            && self.flags.gfx11_iu4_symfold
-            && *DISPATCH_IU4_SYMFOLD
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
     }
 
     /// Whether the gfx1151 V2B tile can run an (m, k, n) IU4 SET at all: the X5 eligibility,
-    /// M%256 == N%256 == 0 and the kill switch, with no grid-size (CTA count) condition. The
+    /// M%256 == N%256 == 0, with no grid-size (CTA count) condition. The
     /// CTA count is a throughput heuristic of [`Self::iu4_v2_tile`]; the ordinary prefill
     /// recipe must not let it pick the arithmetic (the Z|beta|alpha scatter fold and the
     /// separate M-tail SETs round differently), so its Z|beta|alpha fold asks this instead.
@@ -20757,7 +20699,6 @@ impl Gpu {
             && self.iu4_v2_eligible(m, k, n)
             && m % 256 == 0
             && n % 256 == 0
-            && *DISPATCH_IU4_V2B
     }
 
     /// iu4-direct MMQ consumer for the MQ4V2 family (W4A4 prefill): reads the
@@ -20820,16 +20761,12 @@ impl Gpu {
             // A + W slabs and DS/SZ metadata staged in LDS once per WG per
             // 128-K block; partial M/N handled natively (zero-filled slab /
             // guarded writeback). Block [256,1,1].
-            let symfold = self.mq4v2_symmetric && *DISPATCH_IU4_SYMFOLD;
+            let symfold = self.mq4v2_symmetric;
             // The ISA bundle has the K1 ABI/geometry but only the masked
             // b128 store. Unsupported shapes/pointers use hipcc `_v3`.
             let isa_requested = symfold && self.flags.g12_iu4_isa;
             let isa = isa_requested && g12_iu4_b1_eligible(m, k, y.buf.as_ptr());
-            let v3 = symfold && (isa_requested || g12_iu4_v3_enabled());
-            // Banded CTA raster + wide epilogue (bit-identical outputs, see
-            // the kernel header); `HIPFIRE_G12_RASTER=0` restores the
-            // incumbent modules.
-            let g12r = *DISPATCH_G12_RASTER;
+            let v3 = symfold;
             // Slab-layout activations (a slab producer twin wrote the live
             // scratch) have exactly one reader: the `_b1s` bundle.
             let slab = self.scratch.int4_mmq_slab_at(x_i4_ptr);
@@ -20887,35 +20824,16 @@ impl Gpu {
                     },
                 )
             } else {
-                let kernel_name = match (g12r, symfold, add) {
-                    (true, true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold_g12r",
-                    (true, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold_g12r",
-                    (true, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_g12r",
-                    (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_g12r",
-                    (false, true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
-                    (false, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
-                    (false, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
-                    (false, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
-                };
-                let (module, source) = match (g12r, symfold) {
-                    (true, true) => (
-                        "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r",
-                        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC,
-                    ),
-                    (true, false) => (
-                        "gemm_mq4g256v2_residual_mmq_iu4_gfx12_g12r",
-                        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_G12R_SRC,
-                    ),
-                    (false, true) => (
-                        "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
-                        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
-                    ),
-                    (false, false) => (
-                        "gemm_mq4g256v2_residual_mmq_iu4_gfx12",
-                        kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC,
-                    ),
-                };
-                (module, source, kernel_name)
+                // Asymmetric weights: the banded-raster module without the symmetric fold.
+                (
+                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_g12r",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_G12R_SRC,
+                    if add {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_add_g12r"
+                    } else {
+                        "gemm_mq4g256v2_residual_mmq_iu4_full_set_g12r"
+                    },
+                )
             };
             if isa {
                 self.ensure_embedded_kernel(
@@ -20990,10 +20908,8 @@ impl Gpu {
             return result;
         }
         let full = m % 128 == 0 && batch_size % 128 == 0;
-        let symfold_requested = matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && self.mq4v2_symmetric
-            && self.flags.gfx11_iu4_symfold
-            && *DISPATCH_IU4_SYMFOLD;
+        let symfold_requested =
+            matches!(self.arch.as_str(), "gfx1100" | "gfx1151") && self.mq4v2_symmetric;
         // A partial N grid can still use FULL=true for every complete column
         // tile when M itself is full. The guarded wrapper below targets only
         // the one remaining column tile while retaining the original N stride.
@@ -21040,10 +20956,9 @@ impl Gpu {
             && m > 0
             && k > 0
             && batch_size > 0
-            && (self.arch.as_str() == "gfx1151" || shape_lf16)
-            && *DISPATCH_IU4_X5;
+            && (self.arch.as_str() == "gfx1151" || shape_lf16);
         // GEMM v2 V2C (gfx1100) / V2B (gfx1151): see `iu4_v2_tile` for the
-        // eligibility rule and kill switches.
+        // eligibility rule.
         let v2_tile = self.iu4_v2_tile(m, k, batch_size);
         if v2_tile == Some(Iu4V2Tile::V2c) {
             // ADD epilogue (`HIPFIRE_V2C_ADDEPI=0` restores the plain ADD):
@@ -34445,12 +34360,8 @@ impl Gpu {
             // only Z's leading rows); the IU4 sidecar gate itself declines A8 shapes.
             && (self.iu4_producer_sidecar_active(n, k)
                 || (self.flags.iu4_producer_sidecar_enabled()
-                    && self.flags.a8_fused_prod
                     && self.a8_prefill_active(n, k)))
             && self.mq4v2_symmetric
-            && self.flags.gfx11_iu4_symfold
-            && *DISPATCH_IU4_SYMFOLD
-            && hipfire_config::developer_var("HIPFIRE_IU4_BAFOLD").as_deref() != Ok("0")
             && qkv_m > 0
             && qkv_m % 128 == 0
             && z_m > 0
@@ -35068,7 +34979,7 @@ impl Gpu {
     /// gfx1201 A4 fused GDN input projection is admitted for these weights:
     /// the certified `_b1` bundle (not the control), symmetric MQ4V2, the
     /// Qwen3.5 GDN geometry the epilogue hard-codes (q/k/v = 16 + 16 + 48
-    /// heads of 128, beta/alpha 48) and `HIPFIRE_GDN_PREP_FUSED` != `0`. The
+    /// heads of 128, beta/alpha 48). The
     /// loader appends beta/alpha to Z ([`Self::iu4_gdn_fold_rows`]) under the
     /// same predicate, so it must not depend on the batch.
     pub fn iu4_gdn_fold_active(&self, dims: [usize; 4], k: usize) -> bool {
@@ -35077,8 +34988,6 @@ impl Gpu {
             && self.flags.iu4_prefill_enabled()
             && self.flags.g12_iu4_isa
             && !*G12_IU4_B1_CONTROL
-            && *DISPATCH_IU4_SYMFOLD
-            && hipfire_config::developer_var("HIPFIRE_GDN_PREP_FUSED").as_deref() != Ok("0")
             && dims == [10240, 6144, 48, 48]
             && k > 0
             && k % 256 == 0
@@ -36874,7 +36783,6 @@ impl Gpu {
     }
     /// MQ4 v2 (qt 44) — gfx1201 FP8-WMMA gate/up prefill candidate, B=12.
     /// Research route, default-off (`HIPFIRE_GFX12_MQ4V2_FP8_GATEUP`).
-    /// The paired-row SiLU-h epilogue is gated by `HIPFIRE_FP8_SILU_H`.
     /// Same positional ABI as the standard fp8 gate/up kernel; in h mode,
     /// `y_gate` receives h and `y_up` is left untouched.
     pub fn gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared(
@@ -36969,16 +36877,10 @@ impl Gpu {
         // ranking so BT8/BT4 keep their exact ranges). Grid ceil-divides
         // batch_tiles and the kernels guard `oc < N`, so any tile covers N%64.
         let silu_h = silu_h_requested;
-        let (func_name, ksrc, bv): (&str, &str, usize) = if silu_h && bf16_h_fp8_enabled() {
+        let (func_name, ksrc, bv): (&str, &str, usize) = if silu_h {
             (
                 "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_silu_h_bf16",
                 kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SILU_H_BF16_SRC,
-                8,
-            )
-        } else if silu_h {
-            (
-                "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_silu_h",
-                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SILU_H_SRC,
                 8,
             )
         } else if symfold {
@@ -37934,14 +37836,7 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<bool> {
-        if !self.mq4v2_symmetric
-            || hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() == Ok("0")
-            || m == 0
-            || m % 128 != 0
-            || k == 0
-            || k % 256 != 0
-            || n == 0
-        {
+        if !self.mq4v2_symmetric || m == 0 || m % 128 != 0 || k == 0 || k % 256 != 0 || n == 0 {
             return Ok(false);
         }
         self.bind_thread()?;
@@ -37996,23 +37891,11 @@ impl Gpu {
                     "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1"
                 },
             )
-        } else if isa_requested || g12_iu4_v3_enabled() {
+        } else {
             (
                 "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC,
                 "gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3",
-            )
-        } else if *DISPATCH_G12_RASTER {
-            (
-                "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r",
-                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC,
-                "gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold_g12r",
-            )
-        } else {
-            (
-                "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
-                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
-                "gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold",
             )
         };
         if isa {
@@ -41902,10 +41785,8 @@ impl Gpu {
     /// the incumbent consumer route ([`Self::mq4g256v2_shared_iu4_supported`]:
     /// exact gfx1201 WMMA, IU4 prefill, no FP8/A8 precedence, eager, `k % 256 ==
     /// 0`, `rows >= 64`) with the symmetric fold the V3 module implements
-    /// (`mq4v2_symmetric`, `HIPFIRE_IU4_SYMFOLD` not `0`, and the V3 module
-    /// selected: `HIPFIRE_G12_IU4_ISA` or `HIPFIRE_G12_IU4_V3`, the same
-    /// predicate the incumbent launcher uses to pick V3 over the legacy
-    /// symfold modules). The V3 entry handles every `m`, so `m` is only
+    /// (`mq4v2_symmetric`; asymmetric weights take the g12r module, which has
+    /// no gate epilogue). The V3 entry handles every `m`, so `m` is only
     /// required nonzero.
     pub fn mq4g256v2_shared_down_sigmoid_epi_supported(
         &self,
@@ -41913,11 +41794,7 @@ impl Gpu {
         k: usize,
         rows: usize,
     ) -> bool {
-        m > 0
-            && self.mq4g256v2_shared_iu4_supported(k, rows)
-            && self.mq4v2_symmetric
-            && *DISPATCH_IU4_SYMFOLD
-            && (self.flags.g12_iu4_isa || g12_iu4_v3_enabled())
+        m > 0 && self.mq4g256v2_shared_iu4_supported(k, rows) && self.mq4v2_symmetric
     }
 
     /// Shared-expert down GEMM with the gated residual add fused into its
@@ -52365,11 +52242,7 @@ impl Gpu {
     /// claims the symmetric contract (`mq4v2_symmetric`) the dense SET
     /// kernels read.
     pub fn qwen4_trunk_iu4_requested(&self, mask: &crate::trunk_mask::Qwen4TrunkMask) -> bool {
-        !mask.is_empty()
-            && self.arch == "gfx1151"
-            && self.flags.iu4_prefill_enabled()
-            && self.flags.gfx11_iu4_symfold
-            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+        !mask.is_empty() && self.arch == "gfx1151" && self.flags.iu4_prefill_enabled()
     }
 
     /// Whether a `rows`-row trunk projection takes the dense IU4 route: verified
@@ -53574,8 +53447,8 @@ impl Gpu {
     /// nothing.
     ///
     /// Runs the exact PeaceMaker twin ([`Gpu::qwen4_moe_rotate128_i4_pm`]) when
-    /// [`Gpu::moe_rotate_i4_pm_selected`] holds (`HIPFIRE_MOE_ROTATE_I4_PM=1` on exact
-    /// gfx1201, the symmetric IU4 route requested, C2, a supported shape; off by default),
+    /// [`Gpu::moe_rotate_i4_pm_selected`] holds (exact gfx1201, the symmetric IU4 route
+    /// requested, C2, a supported shape),
     /// otherwise the descriptor's embedded row-local producer at its own `k` (gfx1100 K3,
     /// `k == 640`), otherwise the HIP incumbent ([`Gpu::qwen4_moe_rotate128_i4_incumbent`],
     /// any `k % 128 == 0`: the A3B down `k == 512` on gfx1100). All write the same bytes, so

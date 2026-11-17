@@ -438,19 +438,6 @@ fn core_hipcc_flags(arch: &str) -> Vec<String> {
     ]
 }
 
-/// `HIPFIRE_GDN_PERSISTENT_STAGED` (developer, default on; exact `0` is the kill
-/// switch): on gfx12, `gated_delta_step_persistent256_body` (the GDN verify
-/// capture, its rollback and the capture lanes) stages a few-row block's q/k
-/// squares with the whole block and keeps the per-row Q8 boundary in F32
-/// (`kernels/src/tensor_ops.hip`, bit-identical). `0` compiles the `tensor_ops`
-/// and `gdn_lanes` modules with [`GDN_PERSISTENT_SERIAL_DEFINE`], which restores
-/// the previous body exactly (its own cache key).
-const GDN_PERSISTENT_STAGED_ENV: &str = "HIPFIRE_GDN_PERSISTENT_STAGED";
-const GDN_PERSISTENT_SERIAL_DEFINE: &str = "-DHIPFIRE_GDN_PERSISTENT_SERIAL=1";
-
-static GDN_PERSISTENT_SERIAL: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| !hipfire_config::developer_bool(GDN_PERSISTENT_STAGED_ENV, true));
-
 /// Compiles HIP kernel sources to code objects, with caching.
 ///
 /// Two-directory contract:
@@ -725,7 +712,7 @@ impl KernelCompiler {
         name: &str,
         gfx1151_cumode_modules: &HashSet<String>,
     ) -> Vec<String> {
-        let mut flags = if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
+        if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
             && matches!(
                 name,
                 "gdn_chunk_prep"
@@ -740,7 +727,8 @@ impl KernelCompiler {
                     | "gdn_chunk_scan_gfx1151"
                     | "gdn_chunk_prep_gfx11"
                     | "gdn_chunk_kkt_solve_gfx1100"
-            ) {
+            )
+        {
             let mut flags = vec!["-ffp-contract=off".to_owned()];
             if arch == "gfx1201" && name.starts_with("gdn_chunk_scan") {
                 flags.push("-mcumode".to_owned());
@@ -750,16 +738,7 @@ impl KernelCompiler {
             vec!["-mcumode".to_owned()]
         } else {
             Vec::new()
-        };
-        // The modules whose launched GDN kernels instantiate
-        // `gated_delta_step_persistent256_body` (capture, rollback, capture lanes).
-        if arch.starts_with("gfx12")
-            && matches!(name, "tensor_ops" | "gdn_lanes")
-            && *GDN_PERSISTENT_SERIAL
-        {
-            flags.push(GDN_PERSISTENT_SERIAL_DEFINE.to_owned());
         }
-        flags
     }
 
     fn module_flags(&self, name: &str) -> Vec<String> {
@@ -2832,7 +2811,7 @@ mod tests {
     fn gfx1201_k1_scheduler_is_module_exact_and_cache_keyed() {
         let source = "__global__ void kernel() {}";
         let module = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3";
-        let shipping = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r";
+        let shipping = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_g12r";
         let mut compiler = test_compiler("", "hipcc 7.2");
         compiler.arch = "gfx1201".to_owned();
 

@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Certified gfx1201 PeaceMaker twin of `gdn_chunk_prep` for the A3B GDN chunk-scan
-//! preamble (`HIPFIRE_GDN_CHUNK_PREP_PM`): 16 key heads, 32 value heads, head dim 128,
+//! preamble (`PrefillRoute::GdnChunkPrepPm`): 16 key heads, 32 value heads, head dim 128,
 //! `1..=8192` rows. The launch ABI is the incumbent's, byte for byte: ten pointers `x`,
 //! `conv_w`, `conv_state`, `a` (gate, in place), `b` (beta, in place), `dt_bias`, `a_log`,
 //! `q`, `k`, `v` (FP16 planes; the incumbent's "bf16" helper stores `__float2half_rn`),
@@ -46,7 +46,6 @@ fn err(message: impl AsRef<str>) -> HipError {
 /// Why a GDN chunk-scan prep keeps the incumbent `gdn_chunk_prep`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GdnChunkPrepPmRefusal {
-    Disabled,
     InventoryUnavailable,
     Shape,
     Rows,
@@ -55,7 +54,6 @@ pub enum GdnChunkPrepPmRefusal {
 impl std::fmt::Display for GdnChunkPrepPmRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Disabled => "HIPFIRE_GDN_CHUNK_PREP_PM is off",
             Self::InventoryUnavailable => {
                 "no embedded image for this architecture (exact gfx1201 only)"
             }
@@ -68,20 +66,15 @@ impl std::fmt::Display for GdnChunkPrepPmRefusal {
 impl GdnChunkPrepPmRefusal {
     fn log_once(self) {
         let index = match self {
-            // An unset or explicit-0 flag is the incumbent, not a refusal.
-            Self::Disabled => return,
-            Self::InventoryUnavailable => 0,
-            Self::Shape => 1,
-            Self::Rows => 2,
+            // Other architectures run the incumbent; that is not a refusal.
+            Self::InventoryUnavailable => return,
+            Self::Shape => 0,
+            Self::Rows => 1,
         };
-        static REFUSALS: [std::sync::Once; 3] = [
-            std::sync::Once::new(),
-            std::sync::Once::new(),
-            std::sync::Once::new(),
-        ];
+        static REFUSALS: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
         REFUSALS[index].call_once(|| {
             eprintln!(
-                "[gdn-chunk-prep-pm] HIPFIRE_GDN_CHUNK_PREP_PM enabled, refused: {self:?}; \
+                "[gdn-chunk-prep-pm] refused: {self:?}; \
                  keeping incumbent gdn_chunk_prep"
             );
         });
@@ -146,21 +139,17 @@ fn require_span(tensor: &GpuTensor, bytes: usize, name: &str) -> HipResult<()> {
 }
 
 impl Gpu {
-    /// Pure admission of the PM prep: the resolved `HIPFIRE_GDN_CHUNK_PREP_PM` flag (explicit
-    /// `1` wins, explicit `0` kills, unset follows the exact-gfx1201 qualification), the raw
-    /// exact-gfx1201 inventory, 16 key / 32 value heads and `1..=8192` rows. Callers add the
-    /// chunk-scan admission (which refuses capture and recording).
+    /// Pure admission of the PM prep: the raw exact-gfx1201 inventory, 16 key / 32 value
+    /// heads and `1..=8192` rows. Callers add the chunk-scan admission (which refuses
+    /// capture and recording).
     pub fn gdn_chunk_prep_pm_admission(
-        flag: bool,
         arch: &str,
         n_tokens: usize,
         n_key_heads: usize,
         n_value_heads: usize,
     ) -> Result<(), GdnChunkPrepPmRefusal> {
         use crate::prefill_route_capabilities::{raw_inventory, PrefillRoute};
-        if !flag {
-            Err(GdnChunkPrepPmRefusal::Disabled)
-        } else if !raw_inventory(arch, PrefillRoute::GdnChunkPrepPm) {
+        if !raw_inventory(arch, PrefillRoute::GdnChunkPrepPm) {
             Err(GdnChunkPrepPmRefusal::InventoryUnavailable)
         } else {
             shape_refusal(n_tokens, n_key_heads, n_value_heads).map_or(Ok(()), Err)
@@ -174,13 +163,7 @@ impl Gpu {
         n_key_heads: usize,
         n_value_heads: usize,
     ) -> bool {
-        match Self::gdn_chunk_prep_pm_admission(
-            self.flags.gdn_chunk_prep_pm,
-            &self.arch,
-            n_tokens,
-            n_key_heads,
-            n_value_heads,
-        ) {
+        match Self::gdn_chunk_prep_pm_admission(&self.arch, n_tokens, n_key_heads, n_value_heads) {
             Ok(()) => true,
             Err(reason) => {
                 reason.log_once();
@@ -403,46 +386,22 @@ mod tests {
     #[test]
     fn admission_requires_every_gate_in_order() {
         use GdnChunkPrepPmRefusal as R;
-        let ok = |flag: bool, arch: &str, rows: usize, hk: usize, hv: usize| {
-            Gpu::gdn_chunk_prep_pm_admission(flag, arch, rows, hk, hv)
+        let ok = |arch: &str, rows: usize, hk: usize, hv: usize| {
+            Gpu::gdn_chunk_prep_pm_admission(arch, rows, hk, hv)
         };
-        assert_eq!(ok(true, "gfx1201", 1, 16, 32), Ok(()));
-        assert_eq!(ok(true, "gfx1201", 8192, 16, 32), Ok(()));
-        assert_eq!(ok(false, "gfx1201", 4096, 16, 32), Err(R::Disabled));
+        assert_eq!(ok("gfx1201", 1, 16, 32), Ok(()));
+        assert_eq!(ok("gfx1201", 8192, 16, 32), Ok(()));
         for arch in [
             "gfx1200", "gfx1151", "gfx1100", "gfx942", "gfx906", "gfx1030", "unknown", "",
         ] {
             assert_eq!(
-                ok(true, arch, 4096, 16, 32),
+                ok(arch, 4096, 16, 32),
                 Err(R::InventoryUnavailable),
                 "{arch}"
             );
-            assert_eq!(ok(false, arch, 4096, 16, 32), Err(R::Disabled), "{arch}");
         }
-        assert_eq!(ok(true, "gfx1201", 4096, 16, 48), Err(R::Shape));
-        assert_eq!(ok(true, "gfx1201", 0, 16, 32), Err(R::Rows));
-        assert_eq!(ok(true, "gfx1201", 8193, 16, 32), Err(R::Rows));
-    }
-
-    #[test]
-    fn unset_follows_the_exact_gfx1201_qualification_and_zero_kills() {
-        use crate::prefill_route_capabilities::{enabled, PrefillRoute};
-        let route = PrefillRoute::GdnChunkPrepPm;
-        for arch in ["gfx1201", "gfx1151", "gfx1100", "gfx942", "unknown"] {
-            let admit = |explicit: Option<bool>| {
-                Gpu::gdn_chunk_prep_pm_admission(enabled(explicit, arch, route), arch, 4096, 16, 32)
-            };
-            assert_eq!(
-                admit(None).is_ok(),
-                arch == "gfx1201",
-                "{arch}: unset follows the qualification"
-            );
-            assert!(admit(Some(false)).is_err(), "{arch}: 0 kills");
-            assert_eq!(
-                admit(Some(true)).is_ok(),
-                arch == "gfx1201",
-                "{arch}: 1 needs the inventory"
-            );
-        }
+        assert_eq!(ok("gfx1201", 4096, 16, 48), Err(R::Shape));
+        assert_eq!(ok("gfx1201", 0, 16, 32), Err(R::Rows));
+        assert_eq!(ok("gfx1201", 8193, 16, 32), Err(R::Rows));
     }
 }

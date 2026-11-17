@@ -116,8 +116,7 @@ fn a8_gdn_admitted(
     // requirement (the producer is weight-independent; the twin consumer
     // enforces the same A4 predicate).
     let lloyd_wo = wo.dtype == DType::MQ4G256V2Lloyd && lloyd_mmq_a4_route(gpu, n, k);
-    gpu.flags.a8_fused_prod
-        && (gpu.a8_prefill_active(n, k) || lloyd_wo)
+    (gpu.a8_prefill_active(n, k) || lloyd_wo)
         && (wo.dtype == DType::MQ4G256V2 || lloyd_wo)
         && matches!(epilogue, BatchEpilogue::Residual)
         && head_dim == 128
@@ -1358,11 +1357,10 @@ pub fn batch_chunk_delta_net_pre_gdn(
     // S5-gdn-pre-tape-fusion fast path: one launch for sigmoid(alpha/beta) +
     // tape writes + conv + QK norm/interleave. Chain verify is sequential
     // so success returns early. Every failed predicate
-    // (kill switch, non-sequential batch, non-GQA route, tape absence or
+    // (non-sequential batch, non-GQA route, tape absence or
     // overflow, ineligible shapes/arch) runs the pre-change sequence below
     // launch-for-launch.
     if fusion.is_chain_verify()
-        && !gpu.flags.gdn_pre_fuse_off
         && matches!(batch_semantics, BatchSemantics::Sequential)
         && config.linear_key_heads < n_v_heads
         && (1..=16).contains(&n)

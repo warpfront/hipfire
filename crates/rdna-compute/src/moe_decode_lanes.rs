@@ -35,9 +35,7 @@
 //! `tests/moe_dedup.rs`). The routed down is two launches: stage A writes each
 //! pair's pre-combine slot parts into the expanded scratch
 //! ([`MoeDecodeLanesArgs::down_expanded`]), stage B is the singleton's
-//! ascending-slot weighted fold into the residual. `HIPFIRE_A3B_MOE_DEDUP=0`
-//! keeps the twins; `HIPFIRE_A3B_MOE_DEDUP_DOWN=0` keeps the twin for the
-//! routed down alone ([`MoeDedup`]).
+//! ascending-slot weighted fold into the residual. One lane keeps the twins.
 //!
 //! Layout contract: row-major `[lanes][len]` buffers (the
 //! `PrefillBatchScratch` fields), see [`MoeDecodeLanesArgs`].
@@ -89,40 +87,6 @@ pub const MOE_DEDUP_GATE_UP_ROWS: usize = 4;
 pub const MOE_DEDUP_DOWN_ROWS: usize = 16;
 /// Dedup module source.
 pub const MOE_DEDUP_SRC: &str = include_str!("../../../kernels/src/moe_dedup_mq4rs.gfx1201.hip");
-
-/// Which routed stages use the expert-deduplicating kernels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MoeDedup {
-    pub gate_up: bool,
-    pub down: bool,
-}
-
-impl MoeDedup {
-    pub const OFF: Self = Self {
-        gate_up: false,
-        down: false,
-    };
-    pub const ALL: Self = Self {
-        gate_up: true,
-        down: true,
-    };
-
-    /// `HIPFIRE_A3B_MOE_DEDUP` kill switch (developer, read once per
-    /// process): on unless `0`; `0` keeps the non-dedup lane twins for the
-    /// routed gate/up and down + combine. `HIPFIRE_A3B_MOE_DEDUP_DOWN=0`
-    /// (same reading) keeps the lane twin for the down + combine alone.
-    pub fn from_env() -> Self {
-        static CHOICE: std::sync::LazyLock<MoeDedup> = std::sync::LazyLock::new(|| {
-            let on = |name: &str| hipfire_config::developer_var(name).as_deref() != Ok("0");
-            let all = on("HIPFIRE_A3B_MOE_DEDUP");
-            MoeDedup {
-                gate_up: all,
-                down: all && on("HIPFIRE_A3B_MOE_DEDUP_DOWN"),
-            }
-        });
-        *CHOICE
-    }
-}
 
 fn lane_err(msg: impl AsRef<str>) -> HipError {
     HipError::new(0, msg.as_ref())
@@ -294,23 +258,11 @@ impl Gpu {
     /// `shared_rot`, `gate_batch`/`up_batch`, `x_batch` row) are byte-identical
     /// to the five singleton launches run on lane `r`'s rows alone. With 2+
     /// lanes the routed gate/up and down + combine use the expert-deduplicating
-    /// kernels (one weight read per distinct expert, same bytes) unless
-    /// `HIPFIRE_A3B_MOE_DEDUP=0`.
+    /// kernels (one weight read per distinct expert, same bytes).
     pub fn moe_decode_lanes_mq4rs(
         &mut self,
         a: &MoeDecodeLanesArgs<'_>,
         lanes: usize,
-    ) -> HipResult<()> {
-        self.moe_decode_lanes_mq4rs_with(a, lanes, MoeDedup::from_env())
-    }
-
-    /// [`Self::moe_decode_lanes_mq4rs`] with the dedup choice explicit (lab
-    /// entry; ignored for one lane).
-    pub fn moe_decode_lanes_mq4rs_with(
-        &mut self,
-        a: &MoeDecodeLanesArgs<'_>,
-        lanes: usize,
-        dedup: MoeDedup,
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch_caps.is_gfx1201() {
@@ -406,12 +358,11 @@ impl Gpu {
         }
 
         // 4. routed gate/up and 5. routed down + combine (+ residual): the
-        // expert-deduplicating kernels when 2+ lanes and `dedup` (one lane has
-        // nothing to dedup), else the lane twins.
-        let gate_up = dedup.gate_up && lanes >= 2;
-        let down = dedup.down && lanes >= 2;
-        self.moe_routed_gate_up_launch(a, lanes, gate_up)?;
-        self.moe_routed_down_launch(a, lanes, down)
+        // expert-deduplicating kernels when 2+ lanes (one lane has nothing to
+        // dedup), else the lane twins.
+        let dedup = lanes >= 2;
+        self.moe_routed_gate_up_launch(a, lanes, dedup)?;
+        self.moe_routed_down_launch(a, lanes, dedup)
     }
 
     /// Routed gate/up of `lanes` lanes alone (the block's step 4), with the

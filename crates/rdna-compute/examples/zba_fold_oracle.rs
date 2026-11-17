@@ -13,8 +13,8 @@
 //! unit weight and a synthetic AWQ scale), the layout the `_b1s` bundle and the
 //! merged QKV + Z-fold launch require; the oracle fails when the merged launch is
 //! not admitted. Needs `Gpu::a4_slab_active` (default env on gfx1201: no
-//! `HIPFIRE_A4_SLAB=0`, `HIPFIRE_G12_IU4_B1_CONTROL`, `HIPFIRE_G12_A4C2=0`,
-//! `HIPFIRE_G12_IU4_ISA=0`, `HIPFIRE_IU4_SYMFOLD=0` or `HIPFIRE_G12_NORM=0`).
+//! `HIPFIRE_A4_SLAB=0`, `HIPFIRE_G12_IU4_B1_CONTROL`, `HIPFIRE_G12_A4C2=0`
+//! or `HIPFIRE_G12_NORM=0`).
 //!
 //! ```text
 //! cargo run --release -p rdna-compute --features lab --example zba_fold_oracle
@@ -96,7 +96,7 @@ fn main() {
     // synthetic weights are only compared against themselves.
     gpu.mq4v2_symmetric = true;
     if !gpu.iu4_gdn_fold_active([QKV_M, Z_M, 48, 48], K) {
-        eprintln!("zba_fold_oracle: Gpu::iu4_gdn_fold_active is false (check HIPFIRE_IU4_PREFILL / HIPFIRE_GDN_PREP_FUSED / G12 IU4 flags)");
+        eprintln!("zba_fold_oracle: Gpu::iu4_gdn_fold_active is false (check HIPFIRE_IU4_PREFILL / G12 IU4 flags)");
         std::process::exit(2);
     }
 
@@ -130,12 +130,10 @@ fn main() {
         let env = |k: &str| std::env::var(k).unwrap_or_else(|_| "<unset>".into());
         eprintln!(
             "zba_fold_oracle: Gpu::a4_slab_active is false (slab producer twins unavailable): \
-             HIPFIRE_A4_SLAB={} HIPFIRE_G12_IU4_B1_CONTROL={} HIPFIRE_IU4_SYMFOLD={} \
-             HIPFIRE_G12_IU4_ISA={} HIPFIRE_G12_A4C2={} g12_iu4_isa={} hipcc_extra_flags={:?} (needs -DIU4_A4_CANDIDATES=2)",
+             HIPFIRE_A4_SLAB={} HIPFIRE_G12_IU4_B1_CONTROL={} \
+             HIPFIRE_G12_A4C2={} g12_iu4_isa={} hipcc_extra_flags={:?} (needs -DIU4_A4_CANDIDATES=2)",
             env("HIPFIRE_A4_SLAB"),
             env("HIPFIRE_G12_IU4_B1_CONTROL"),
-            env("HIPFIRE_IU4_SYMFOLD"),
-            env("HIPFIRE_G12_IU4_ISA"),
             env("HIPFIRE_G12_A4C2"),
             gpu.flags.g12_iu4_isa,
             gpu.flags.hipcc_extra_flags,

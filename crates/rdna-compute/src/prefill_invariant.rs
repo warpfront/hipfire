@@ -704,7 +704,7 @@ impl Gpu {
             return (gdn_arith::OTHER_BASE | desc.out_dtype as u32, false);
         }
         let shape = desc.out_residual && desc.head_dim == 128 && k > 0;
-        if shape && self.flags.a8_fused_prod && self.a8_prefill_active(rows, k) {
+        if shape && self.a8_prefill_active(rows, k) {
             return (gdn_arith::OUT_A8_FUSED, false);
         }
         if shape && self.iu4_producer_quant_fused_active(rows, k) {

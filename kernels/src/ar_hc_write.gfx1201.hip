@@ -120,13 +120,7 @@ typedef unsigned int arhc_u4 __attribute__((ext_vector_type(4)));
 // when any of its lower 16 bits is set). Written as selects: the hip_bfloat16 if / else-if
 // compiled to divergent branches, ~2000 instructions per granule of the HC apply (measured: the
 // apply was 6.2 of the 9.3 us of a 1-row launch). Proved against hip_bfloat16 over all 2^32
-// inputs on device by `ar_hc_write_oracle` (rounding check). The host prepends
-// `#define ARHC_RND_HIP_BF16` (kill switch `HIPFIRE_EP_AR_FAST_APPLY=0`) to compile the
-// hip_bfloat16 casts instead.
-#ifdef ARHC_RND_HIP_BF16
-__device__ __forceinline__ unsigned arhc_rnd_bits(float v) { return (unsigned)static_cast<hip_bfloat16>(v).data; }
-__device__ __forceinline__ float arhc_rnd(float v) { return static_cast<float>(static_cast<hip_bfloat16>(v)); }
-#else
+// inputs on device by `ar_hc_write_oracle` (rounding check).
 __device__ __forceinline__ unsigned arhc_rnd_bits(float v) {
     const unsigned u = __float_as_uint(v);
     const unsigned rne = u + 0x7FFFu + ((u >> 16) & 1u);
@@ -134,7 +128,6 @@ __device__ __forceinline__ unsigned arhc_rnd_bits(float v) {
     return ((~u & 0x7F800000u) != 0u ? rne : nan) >> 16;
 }
 __device__ __forceinline__ float arhc_rnd(float v) { return __uint_as_float(arhc_rnd_bits(v) << 16); }
-#endif
 __device__ __forceinline__ float arhc_gate(float logit) {
     const float gate_logit = arhc_rnd(logit);
     const float gate_scaled = arhc_rnd(gate_logit / 4.0f);

@@ -5485,18 +5485,15 @@ impl Gpu {
         Ok(())
     }
 
-    /// Row-major GDN preparation is exact on gfx11. Disable for A/B via
-    /// `HIPFIRE_GDN_PREP_GFX11=0`.
+    /// Row-major GDN preparation is exact on gfx11.
     #[cfg(feature = "deltanet")]
     fn gdn_chunk_prep_gfx11(&self) -> bool {
         matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && hipfire_config::developer_var("HIPFIRE_GDN_PREP_GFX11").as_deref() != Ok("0")
     }
 
     #[cfg(feature = "deltanet")]
     fn gdn_chunk_kkt_gfx1100(&self) -> bool {
         self.arch == "gfx1100"
-            && hipfire_config::developer_var("HIPFIRE_GDN_KKT_GFX1100").as_deref() != Ok("0")
     }
 
     /// One KKT launch per layer ([`Self::gdn_chunk_kkt_solve_batched`]) instead
@@ -5509,8 +5506,7 @@ impl Gpu {
     }
 
     /// One chunk-scan launch per layer ([`Self::gdn_chunk_scan_layer_mseg`])
-    /// instead of one per 512-row commit segment (gfx1201 bf16 `out`,
-    /// default on; `HIPFIRE_GDN_SCAN_MSEG=0` keeps the per-segment launches).
+    /// instead of one per 512-row commit segment (gfx1201 bf16 `out` only).
     /// The caller also requires batched KKT A blocks for every row.
     #[cfg(feature = "deltanet")]
     pub fn gdn_scan_mseg_enabled(&self, out: GdnScanOut, segment_rows: usize) -> bool {
@@ -5518,7 +5514,6 @@ impl Gpu {
             && out == GdnScanOut::Bf16
             && segment_rows == 512
             && hipfire_config::developer_var("HIPFIRE_GDN_SCAN_OUT_EMU").is_err()
-            && hipfire_config::developer_bool("HIPFIRE_GDN_SCAN_MSEG", true)
     }
 
     /// Every 512-row commit segment of one layer's GDN chunk scan in one
@@ -5807,13 +5802,11 @@ impl Gpu {
         })
     }
 
-    /// The fused F2 QKVZA+GDN route (gfx1201, default on; `HIPFIRE_GDN_PREP_FUSED=0`
-    /// keeps the f32 projection + `gdn_chunk_prep`). The GEMM itself is admitted
+    /// The fused F2 QKVZA+GDN route (gfx1201). The GEMM itself is admitted
     /// separately by [`Self::gemm_qkvza_mq4g256v2_fp8_gdn_prepared`].
     #[cfg(feature = "deltanet")]
     pub fn gdn_prep_fused_enabled(&self) -> bool {
         self.arch == "gfx1201"
-            && hipfire_config::developer_var("HIPFIRE_GDN_PREP_FUSED").as_deref() != Ok("0")
     }
 
     /// JIT the completion pass before the projection mutates anything.
@@ -9136,21 +9129,13 @@ impl Gpu {
                 ),
             ));
         }
-        // Prefer the tuned kernel: same ABI and same math, but without the
-        // per-pair f64 `pow` that made the seed kernel run ~12x slower than a
-        // plain copy of the same bytes. `HIPFIRE_FLUX_ROPE_FAST=0` forces the
-        // seed kernel, so the two can be A/B-ed in one session on the real
-        // forward rather than compared across commits.
-        let fast =
-            hipfire_config::developer_var("HIPFIRE_FLUX_ROPE_FAST").map_or(true, |v| v != "0");
-        let (kernel, src) = if fast {
-            (
-                "rope_2d_flux_f32_fast",
-                crate::kernels::ROPE_2D_FLUX_F32_FAST_SRC,
-            )
-        } else {
-            ("rope_2d_flux_f32", crate::kernels::ROPE_2D_FLUX_F32_SRC)
-        };
+        // The tuned kernel: same ABI and same math as the seed kernel, but
+        // without the per-pair f64 `pow` that made it run ~12x slower than a
+        // plain copy of the same bytes.
+        let (kernel, src) = (
+            "rope_2d_flux_f32_fast",
+            crate::kernels::ROPE_2D_FLUX_F32_FAST_SRC,
+        );
         let kernel: &str = kernel;
         self.ensure_kernel(kernel, src, kernel)?;
         let x_ptr = x.buf.as_ptr();
@@ -9164,14 +9149,9 @@ impl Gpu {
         let ax1_i = axes_dim[1] as i32;
         let ax2_i = axes_dim[2] as i32;
         let ax3_i = axes_dim[3] as i32;
-        // The seed kernel runs one thread per (row, head) and loops the pairs;
-        // the fast kernel runs one thread per (row, head, pair) so that
-        // adjacent lanes touch adjacent memory.
-        let total = if fast {
-            n_img * heads * (head_dim / 2)
-        } else {
-            n_img * heads
-        };
+        // One thread per (row, head, pair) so that adjacent lanes touch
+        // adjacent memory.
+        let total = n_img * heads * (head_dim / 2);
         let block = 256u32;
         let grid = total.div_ceil(block as usize) as u32;
         let mut params: Vec<*mut c_void> = vec![

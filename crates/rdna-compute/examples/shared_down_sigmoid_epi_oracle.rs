@@ -8,7 +8,7 @@
 //! incumbent two-launch sequence. The fold has two launch targets with the same
 //! kernarg layout and bytes: the builder `_b1` bundle entry
 //! `gemm_mq4g256v2_residual_mmq_iu4_full_add_sigmoid_b1` (selected when
-//! `HIPFIRE_G12_IU4_ISA` holds and the shape/pointer are eligible) and the hipcc
+//! `Gpu::flags.g12_iu4_isa` holds and the shape/pointer are eligible) and the hipcc
 //! V3 `full_add_v3` kernel launched with runtime mode `add == 2` (the anchor).
 //!
 //! ## Arms (A3B geometry: hidden M = 2048, shared intermediate K = 512)
@@ -72,7 +72,7 @@
 //! support check. It never compares a fallback against the incumbent. It does
 //! not read `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI`. The V3 module is only
 //! reached through the host executor's support predicate (exact gfx1201 IU4
-//! prefill route, symmetric MQ4V2, `HIPFIRE_G12_IU4_ISA` or V3 enabled); the
+//! prefill route, symmetric MQ4V2); the
 //! incumbent must also take the standalone-quantizer IU4 route; this is checked
 //! per case through the scratch generation bump, and a miss aborts as
 //! unsupported.
@@ -904,7 +904,7 @@ fn prerequisites() -> Vec<&'static str> {
     vec![
         "exact gfx1201 with WMMA (any other arch: exit 2, nothing compared)",
         "Gpu::mq4g256v2_shared_down_sigmoid_epi_supported(2048, 512, rows) true for every selected rows (IU4 prefill, symmetric MQ4V2, V3 route, no slab sidecars); false is an error, never a pass",
-        "the _b1 sigmoid entry must be the launch target of the candidate and the V3 module that of the anchor (support inherits IU4 prefill + symmetric MQ4V2 + HIPFIRE_G12_IU4_ISA or HIPFIRE_G12_IU4_V3); the oracle only sets Gpu::mq4v2_symmetric = true for its symmetric synthetic weights",
+        "the _b1 sigmoid entry must be the launch target of the candidate and the V3 module that of the anchor (support inherits IU4 prefill + symmetric MQ4V2); the oracle only sets Gpu::mq4v2_symmetric = true for its symmetric synthetic weights",
         "the incumbent gemm_mq4g256v2 must bump the IU4 scratch generation (standalone-quantizer route); checked per case",
         "one GPU, single process, <= 120 s; weights are synthetic valid symmetric MQ4G256V2, not model weights",
     ]
@@ -1337,7 +1337,7 @@ fn run(a: &Args) {
         refuse(
             &format!(
                 "mq4g256v2_shared_down_sigmoid_epi_supported({M}, {K}, rows) is false on {} for {} case(s); \
-                 symmetric MQ4V2, V3 module (HIPFIRE_G12_IU4_ISA / HIPFIRE_G12_IU4_V3), \
+                 symmetric MQ4V2, V3 module, \
                  IU4 prefill, no A8 prefill / FP8 verify scope, eager stream",
                 gpu.arch,
                 unsupported.len()
