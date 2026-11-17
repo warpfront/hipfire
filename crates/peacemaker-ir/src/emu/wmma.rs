@@ -32,9 +32,9 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         return swmmac(arch, name, i, s);
     }
     let shape = match (arch, name) {
-        (Arch::Gfx1151 | Arch::Gfx1201, "v_wmma_f32_16x16x16_f16") => Shape::F16,
-        (Arch::Gfx1151 | Arch::Gfx1201, "v_wmma_f32_16x16x16_bf16") => Shape::Bf16,
-        (Arch::Gfx1151 | Arch::Gfx1201, "v_wmma_i32_16x16x16_iu8") => Shape::Iu8,
+        (Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201, "v_wmma_f32_16x16x16_f16") => Shape::F16,
+        (Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201, "v_wmma_f32_16x16x16_bf16") => Shape::Bf16,
+        (Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201, "v_wmma_i32_16x16x16_iu8") => Shape::Iu8,
         (Arch::Gfx1201, "v_wmma_f32_16x16x16_fp8_fp8") => Shape::F8(mma::Fmt::Fp8, mma::Fmt::Fp8),
         (Arch::Gfx1201, "v_wmma_f32_16x16x16_fp8_bf8") => Shape::F8(mma::Fmt::Fp8, mma::Fmt::Bf8),
         (Arch::Gfx1201, "v_wmma_f32_16x16x16_bf8_fp8") => Shape::F8(mma::Fmt::Bf8, mma::Fmt::Fp8),

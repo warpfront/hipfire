@@ -2853,11 +2853,16 @@ pub fn catalog(arch: Arch) -> Option<&'static Catalog> {
         LazyLock::new(|| load(include_str!("../../isa/gfx1100.xml.jsonl")));
     static GFX1151: LazyLock<Catalog> =
         LazyLock::new(|| load(include_str!("../../isa/gfx1151.xml.jsonl")));
+    // gfx1150 is the gfx1151 instruction family under its own target; the
+    // shipped catalog is the same RDNA3.5 XML.
+    static GFX1150: LazyLock<Catalog> =
+        LazyLock::new(|| load(include_str!("../../isa/gfx1150.xml.jsonl")));
     static GFX12: LazyLock<Catalog> =
         LazyLock::new(|| load(include_str!("../../isa/gfx12.xml.jsonl")));
     match arch {
         Arch::Gfx1100 => Some(&GFX1100),
         Arch::Gfx1151 => Some(&GFX1151),
+        Arch::Gfx1150 => Some(&GFX1150),
         Arch::Gfx1200 | Arch::Gfx1201 => Some(&GFX12),
         Arch::Gfx1010 | Arch::Gfx1030 => None,
     }

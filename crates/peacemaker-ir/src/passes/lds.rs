@@ -604,7 +604,7 @@ fn entries(body: &Body, arch: Arch) -> Vec<Option<Values>> {
 pub fn analyze(body: &Body, arch: Arch) -> Result<LdsAnalysis, LdsError> {
     if !matches!(
         arch,
-        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1200 | Arch::Gfx1201
     ) {
         return Err(LdsError::UnsupportedArch(arch));
     }

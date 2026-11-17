@@ -1501,7 +1501,7 @@ fn analyze_core(
     };
     if !matches!(
         arch,
-        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1200 | Arch::Gfx1201
     ) {
         facts.unresolved.push(Unresolved {
             inst: None,
