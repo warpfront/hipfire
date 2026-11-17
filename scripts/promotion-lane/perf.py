@@ -27,12 +27,14 @@ runtime and measurement spec match
 the baseline archive runs interleaved with the candidate (`pair`).
 
 A relation row (a row with a `reference` proc) judges the candidate alone,
-against itself: its metric on `proc` may exceed the same metric on
-`reference`, measured in the same job, by at most the row's `max_excess`.
-`warm_over_cold_ttft` is a process's median warm TTFT over its cold (first)
-TTFT, so a speculative load whose later requests wait for work the previous
-request left on the device fails against the plain-AR load, whose warm
-requests are faster than its cold one.
+against itself: the median over `proc`'s processes of the metric, over the
+median over `reference`'s processes measured in the same job, may exceed 1
+by at most the row's `max_excess`. `warm_ttft_over_reference` takes each
+process's median warm TTFT, so a speculative load whose later requests wait
+for work the previous request left on the device fails against the plain-AR
+load on the same prompt. Cold requests stay out of it: a load that calibrates
+(runs prefill and speculative windows) before `loaded` has no cold first
+request to compare against.
 """
 import hashlib
 import json
@@ -50,7 +52,7 @@ PERF_SCHEMA = "promotion-perf-v1"
 METRICS = {
     "decode_tok_s": ("decode", "higher", "warm"),
     "ttft_ms": ("ttft_ms", "lower", "warm"),
-    "warm_over_cold_ttft": ("ttft_ms", "lower", "relation"),
+    "warm_ttft_over_reference": ("ttft_ms", "lower", "relation"),
     "cold_wall_tok_s": ("wall", "higher", "cold"),
 }
 PASS = ("pass", "waived")
@@ -277,13 +279,13 @@ def values_of(entry, metric, proc):
     if not isinstance(samples, list) or len(samples) < proc["runs"] or not all(_is_num(v) and v > 0 for v in samples):
         return None
     if window == "relation":
-        return [median(samples[proc["discard"]:]) / samples[0]]
+        return [median(samples[proc["discard"]:])]
     return [samples[0]] if window == "cold" else samples[proc["discard"]:]
 
 
 def judge_relation(perf, rid, row, cal, new_entries, ref_entries):
     """A relation row over the candidate's own processes: the median over `proc`'s processes of the
-    metric may exceed the median over `reference`'s by at most the class's max_excess."""
+    metric over the median over `reference`'s may exceed 1 by at most the class's max_excess."""
     proc, ref = perf["procs"][row["proc"]], perf["procs"][row["reference"]]
     out = {"id": rid, "required": True, "metric": row["metric"], "better": "lower", "window": "relation",
            "proc": row["proc"], "reference": row["reference"], "mode": "candidate",
@@ -300,12 +302,12 @@ def judge_relation(perf, rid, row, cal, new_entries, ref_entries):
         return dict(out, verdict="failed", note="candidate process failed or short: %s"
                     % (", ".join(bad) or "no %s process" % (row["proc"] if not new_entries else row["reference"])))
     value, ref_value = median([v[0] for v in new]), median([v[0] for v in refs])
-    limit = round(ref_value + cal["max_excess"], 5)
-    note = "%s %s %.4f vs %s %.4f + %.4f = %.4f (per process %s vs %s)" % (
-        row["metric"], row["proc"], value, row["reference"], ref_value, cal["max_excess"], limit,
-        ", ".join("%.3f" % v[0] for v in new), ", ".join("%.3f" % v[0] for v in refs))
-    return dict(out, ratio=round(value, 5), reference_value=round(ref_value, 5), threshold=limit,
-                verdict="pass" if value <= limit else "regressed", note=note)
+    ratio, limit = round(value / ref_value, 5), round(1.0 + cal["max_excess"], 5)
+    note = "%s %s %.2f / %s %.2f = %.4f, limit 1 + %.4f = %.4f (per process %s vs %s)" % (
+        row["metric"], row["proc"], value, row["reference"], ref_value, ratio, cal["max_excess"], limit,
+        ", ".join("%.2f" % v[0] for v in new), ", ".join("%.2f" % v[0] for v in refs))
+    return dict(out, ratio=ratio, value=round(value, 3), reference_value=round(ref_value, 3), threshold=limit,
+                verdict="pass" if ratio <= limit else "regressed", note=note)
 
 
 def judge_row(perf, rid, row, cal, old_entries, new_entries, mode):
@@ -357,12 +359,12 @@ def row_problem(perf, row, cal):
     if verdict not in VERDICTS:
         return "verdict %r" % (verdict,)
     if is_relation((perf.get("rows") or {}).get(row.get("id"))):
-        ref, value, thr = row.get("reference_value"), row.get("ratio"), row.get("threshold")
+        ref, ratio, thr = row.get("reference_value"), row.get("ratio"), row.get("threshold")
         if row.get("max_excess") != cal.get("max_excess"):
             return "max_excess %r but policy says %r" % (row.get("max_excess"), cal.get("max_excess"))
-        if verdict == "pass" and not (_is_num(ref) and _is_num(value) and _is_num(thr)
-                                      and thr == round(ref + cal["max_excess"], 5) and value <= thr):
-            return "verdict pass but %r is over %r + max_excess" % (value, ref)
+        if verdict == "pass" and not (_is_num(ref) and _is_num(ratio) and _is_num(thr)
+                                      and thr == round(1.0 + cal["max_excess"], 5) and ratio <= thr):
+            return "verdict pass but ratio %r is over 1 + max_excess" % (ratio,)
         return None
     if row.get("threshold") != threshold(perf, cal):
         return "threshold %r but policy says %r" % (row.get("threshold"), threshold(perf, cal))

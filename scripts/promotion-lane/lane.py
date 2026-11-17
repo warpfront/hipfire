@@ -1415,10 +1415,10 @@ def _self_test_perf_units(t):
     t(perfmod.row_problem(perf, row, {"aa_half_width": 0.001}) is not None, "a softer threshold than policy is refused")
     row = {"id": "r", "verdict": "pass", "threshold": 0.98, "ci": [0.97, 0.99]}
     t(perfmod.row_problem(perf, row, {"aa_half_width": 0.001}) is None, "sound pass row accepted")
-    # relation row: a speculative proc's warm/cold TTFT against the plain-AR proc's, same candidate
+    # relation row: a speculative proc's warm TTFT against the plain-AR proc's, same candidate
     rel = json.loads(json.dumps(perf))
     rel["procs"]["p-spec"] = dict(rel["procs"]["p-ar"], spec="dflash")
-    rel["rows"]["perf-warm"] = {"proc": "p-spec", "reference": "p-ar", "metric": "warm_over_cold_ttft"}
+    rel["rows"]["perf-warm"] = {"proc": "p-spec", "reference": "p-ar", "metric": "warm_ttft_over_reference"}
     rel["classes"]["gfx1100"]["rows"]["perf-warm"] = {"max_excess": 0.1}
     t(perfmod.validate(rel, SELF_POLICY["classes"]) == [], "relation row valid")
     t(perfmod.spec_sha256(rel) == perfmod.spec_sha256(dict(rel, rows=perf["rows"])),
@@ -1447,6 +1447,11 @@ def _self_test_perf_units(t):
       % judged.get("note"))
     judged = perfmod.judge_relation(rel, "perf-warm", row, cal, clean, ar)
     t(judged["verdict"] == "pass", "warm within the plain-AR relation passes (%s)" % judged.get("note"))
+    # a load that calibrates before `loaded` has no cold first request; the cold sample must not decide
+    ar_slow_cold = [entry("ar%d" % i, [70.0, 61.0, 61.0, 61.2]) for i in range(2)]
+    calibrated = [entry("sp%d" % i, [64.0, 64.0, 64.2, 64.0]) for i in range(2)]
+    t(perfmod.judge_relation(rel, "perf-warm", row, cal, calibrated, ar_slow_cold)["verdict"] == "pass",
+      "a speculative load whose first request is already warm passes")
     t(perfmod.row_problem(rel, judged, cal) is None, "sound relation pass accepted")
     t(perfmod.row_problem(rel, dict(judged, ratio=judged["threshold"] + 0.01), cal) is not None,
       "relation pass over its limit is a lie")
