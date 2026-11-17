@@ -645,6 +645,10 @@ def cmd_perf(args):
         perf = json.loads(json.dumps(perf))
         crow = perf["classes"].setdefault(args.cls, {"rows": {}})["rows"]
         for rid in row_filter:
+            if perfmod.is_relation(perf["rows"][rid]):
+                if "max_excess" not in crow.get(rid, {}):
+                    raise Usage("relation row %s has no max_excess for class %s" % (rid, args.cls))
+                continue
             crow.setdefault(rid, {"aa_half_width": 0.0, "uncalibrated": True})
     if args.candidate:
         need_sha(args.candidate, "--candidate")
@@ -963,15 +967,29 @@ def cmd_plan(args, policy):
         missing += bool(host)
     print("transitions_required: %s" % ",".join(class_transitions(policy, cls)))
     print("rows: %s" % ",".join(cls["required"]))
-    prows = perfmod.class_rows(policy.get("perf"), args.cls)
-    for rid, row, cal in prows:
-        proc = policy["perf"]["procs"][row["proc"]]
-        print("  %s [perf] %s of %s (%s, spec %s, prompt %s) threshold %.4f (A/A half-width %.4f)"
-              % (rid, row["metric"], row["proc"], proc.get("model") or proc.get("model_file"), proc["spec"],
-                 proc["prompt"], perfmod.threshold(policy["perf"], cal), cal["aa_half_width"]))
-    if prows:
-        print("perf rows: %s" % ",".join(r[0] for r in prows))
+    lines = plan_perf_lines(policy.get("perf"), args.cls)
+    for line in lines:
+        print(line)
     return 1 if missing else 0
+
+
+def plan_perf_lines(perf, cls):
+    """`plan`'s perf rows for class `cls`: a ratio row's threshold and A/A half-width, a relation row's
+    reference proc and max_excess."""
+    prows = perfmod.class_rows(perf, cls)
+    lines = []
+    for rid, row, cal in prows:
+        proc = perf["procs"][row["proc"]]
+        if perfmod.is_relation(row):
+            limit = "reference %s max_excess %.4f" % (row["reference"], cal["max_excess"])
+        else:
+            limit = "threshold %.4f (A/A half-width %.4f)" % (perfmod.threshold(perf, cal), cal["aa_half_width"])
+        lines.append("  %s [perf] %s of %s (%s, spec %s, prompt %s) %s"
+                     % (rid, row["metric"], row["proc"], proc.get("model") or proc.get("model_file"), proc["spec"],
+                        proc["prompt"], limit))
+    if prows:
+        lines.append("perf rows: %s" % ",".join(r[0] for r in prows))
+    return lines
 
 
 # --------------------------------------------------------------------------- self-test
@@ -1397,6 +1415,46 @@ def _self_test_perf_units(t):
     t(perfmod.row_problem(perf, row, {"aa_half_width": 0.001}) is not None, "a softer threshold than policy is refused")
     row = {"id": "r", "verdict": "pass", "threshold": 0.98, "ci": [0.97, 0.99]}
     t(perfmod.row_problem(perf, row, {"aa_half_width": 0.001}) is None, "sound pass row accepted")
+    # relation row: a speculative proc's warm/cold TTFT against the plain-AR proc's, same candidate
+    rel = json.loads(json.dumps(perf))
+    rel["procs"]["p-spec"] = dict(rel["procs"]["p-ar"], spec="dflash")
+    rel["rows"]["perf-warm"] = {"proc": "p-spec", "reference": "p-ar", "metric": "warm_over_cold_ttft"}
+    rel["classes"]["gfx1100"]["rows"]["perf-warm"] = {"max_excess": 0.1}
+    t(perfmod.validate(rel, SELF_POLICY["classes"]) == [], "relation row valid")
+    t(perfmod.spec_sha256(rel) == perfmod.spec_sha256(dict(rel, rows=perf["rows"])),
+      "adding a relation row keeps baseline numbers reusable")
+    bad = json.loads(json.dumps(rel))
+    del bad["rows"]["perf-warm"]["reference"]
+    t(any("reference" in p for p in perfmod.validate(bad, SELF_POLICY["classes"])), "relation metric needs a reference")
+    bad = json.loads(json.dumps(rel))
+    bad["classes"]["gfx1100"]["rows"]["perf-warm"] = {"aa_half_width": 0.0}
+    t(any("max_excess" in p for p in perfmod.validate(bad, SELF_POLICY["classes"])), "relation row needs max_excess")
+    plan = plan_perf_lines(rel, "gfx1100")
+    t(any("perf-warm" in ln and "reference p-ar max_excess 0.1000" in ln for ln in plan),
+      "plan prints a relation row's reference and max_excess (%s)" % plan)
+    t(any("perf-dec" in ln and "threshold" in ln for ln in plan), "plan still prints a ratio row's threshold")
+
+    def entry(label, ttft):
+        return {"label": label, "rc": 0, "samples": {"ttft_ms": ttft}}
+
+    ar = [entry("ar%d" % i, [66.0, 61.0, 61.0, 61.2]) for i in range(2)]
+    tail = [entry("sp%d" % i, [66.0, 94.0, 94.5, 94.0]) for i in range(2)]
+    clean = [entry("sp%d" % i, [66.0, 64.0, 64.2, 64.0]) for i in range(2)]
+    cal = {"max_excess": 0.1}
+    row = rel["rows"]["perf-warm"]
+    judged = perfmod.judge_relation(rel, "perf-warm", row, cal, tail, ar)
+    t(judged["verdict"] == "regressed", "warm requests waiting ~28 ms on the previous request regress (%s)"
+      % judged.get("note"))
+    judged = perfmod.judge_relation(rel, "perf-warm", row, cal, clean, ar)
+    t(judged["verdict"] == "pass", "warm within the plain-AR relation passes (%s)" % judged.get("note"))
+    t(perfmod.row_problem(rel, judged, cal) is None, "sound relation pass accepted")
+    t(perfmod.row_problem(rel, dict(judged, ratio=judged["threshold"] + 0.01), cal) is not None,
+      "relation pass over its limit is a lie")
+    t(perfmod.row_problem(rel, judged, {"max_excess": 0.2}) is not None, "a relation judged under another limit is refused")
+    t(perfmod.judge_relation(rel, "perf-warm", row, cal, clean, [])["verdict"] == "failed",
+      "a relation without reference processes fails")
+    t(perfmod.judge_relation(rel, "perf-warm", row, cal, clean, [dict(ar[0], rejected="psi")])["verdict"] == "skipped",
+      "a pressured relation process is skipped, not passed")
 
 
 def _self_test_perf_records(t):

@@ -211,6 +211,11 @@
       "perf-flashnext-decode": {
         "proc": "flashnext-code",
         "metric": "decode_tok_s"
+      },
+      "perf-27b-dflash-warm-ttft": {
+        "proc": "27b-dflash-code",
+        "reference": "27b-ar-code",
+        "metric": "warm_over_cold_ttft"
       }
     },
     "classes": {
@@ -236,6 +241,9 @@
           "perf-27b-cold": {
             "aa_half_width": 0.0287,
             "aa_trials": 3
+          },
+          "perf-27b-dflash-warm-ttft": {
+            "max_excess": 0.07
           }
         }
       },
@@ -273,6 +281,9 @@
           "perf-flashnext-decode": {
             "aa_half_width": 0.00786,
             "aa_trials": 3
+          },
+          "perf-27b-dflash-warm-ttft": {
+            "max_excess": 0.1
           }
         }
       }

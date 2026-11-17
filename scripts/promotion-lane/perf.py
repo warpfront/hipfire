@@ -25,6 +25,14 @@ the previous promotion record of the gate's own beta when card, host, HIP
 runtime and measurement spec match
 (`reuse`); otherwise, or to confirm a regression seen against reused numbers,
 the baseline archive runs interleaved with the candidate (`pair`).
+
+A relation row (a row with a `reference` proc) judges the candidate alone,
+against itself: its metric on `proc` may exceed the same metric on
+`reference`, measured in the same job, by at most the row's `max_excess`.
+`warm_over_cold_ttft` is a process's median warm TTFT over its cold (first)
+TTFT, so a speculative load whose later requests wait for work the previous
+request left on the device fails against the plain-AR load, whose warm
+requests are faster than its cold one.
 """
 import hashlib
 import json
@@ -42,6 +50,7 @@ PERF_SCHEMA = "promotion-perf-v1"
 METRICS = {
     "decode_tok_s": ("decode", "higher", "warm"),
     "ttft_ms": ("ttft_ms", "lower", "warm"),
+    "warm_over_cold_ttft": ("ttft_ms", "lower", "relation"),
     "cold_wall_tok_s": ("wall", "higher", "cold"),
 }
 PASS = ("pass", "waived")
@@ -159,6 +168,11 @@ def validate(perf, classes):
         if not isinstance(row, dict) or row.get("proc") not in procs or row.get("metric") not in METRICS:
             problems.append("policy: perf row %s needs proc (a perf.procs id) and metric (%s)"
                             % (rid, "/".join(METRICS)))
+        elif is_relation(row) != (METRICS[row["metric"]][2] == "relation"):
+            problems.append("policy: perf row %s: metric %s %s a reference proc" % (
+                rid, row["metric"], "needs" if METRICS[row["metric"]][2] == "relation" else "takes no"))
+        elif is_relation(row) and (row["reference"] not in procs or row["reference"] == row["proc"]):
+            problems.append("policy: perf relation row %s needs reference (another perf.procs id)" % rid)
     pclasses = perf.get("classes") if isinstance(perf.get("classes"), dict) else None
     if pclasses is None:
         problems.append("policy: perf.classes must be an object")
@@ -173,6 +187,11 @@ def validate(perf, classes):
         for rid, cal in crow.items():
             if rid not in rows:
                 problems.append("policy: perf class %s row %s is not in perf.rows" % (name, rid))
+            elif is_relation(rows[rid]):
+                if not isinstance(cal, dict) or not _is_num(cal.get("max_excess")) or not 0 < cal["max_excess"] < 1:
+                    problems.append("policy: perf class %s relation row %s needs max_excess in (0, 1)"
+                                    % (name, rid))
+                continue
             if not isinstance(cal, dict) or not _is_num(cal.get("aa_half_width")) or not 0 <= cal["aa_half_width"] < 0.5:
                 problems.append("policy: perf class %s row %s needs a calibrated aa_half_width in [0, 0.5)"
                                 % (name, rid))
@@ -206,6 +225,16 @@ def class_rows(perf, cls):
     if not spec:
         return []
     return [(rid, perf["rows"][rid], cal) for rid, cal in spec["rows"].items()]
+
+
+def is_relation(row):
+    """A relation row judges the candidate against its own `reference` proc, not against a baseline."""
+    return isinstance(row, dict) and "reference" in row
+
+
+def row_procs(row):
+    """The perf.procs ids a row needs measured."""
+    return [row["proc"], row["reference"]] if is_relation(row) else [row["proc"]]
 
 
 def threshold(perf, cal):
@@ -247,10 +276,41 @@ def values_of(entry, metric, proc):
     samples = (entry.get("samples") or {}).get(key) if entry.get("rc") == 0 and not entry.get("rejected") else None
     if not isinstance(samples, list) or len(samples) < proc["runs"] or not all(_is_num(v) and v > 0 for v in samples):
         return None
+    if window == "relation":
+        return [median(samples[proc["discard"]:]) / samples[0]]
     return [samples[0]] if window == "cold" else samples[proc["discard"]:]
 
 
+def judge_relation(perf, rid, row, cal, new_entries, ref_entries):
+    """A relation row over the candidate's own processes: the median over `proc`'s processes of the
+    metric may exceed the median over `reference`'s by at most the class's max_excess."""
+    proc, ref = perf["procs"][row["proc"]], perf["procs"][row["reference"]]
+    out = {"id": rid, "required": True, "metric": row["metric"], "better": "lower", "window": "relation",
+           "proc": row["proc"], "reference": row["reference"], "mode": "candidate",
+           "max_excess": cal["max_excess"], "threshold": None, "ratio": None, "ci": None,
+           "reference_value": None, "n_new": len(new_entries), "n_reference": len(ref_entries)}
+    pressured = [e.get("label", "?") for e in new_entries + ref_entries if e.get("rejected")]
+    if pressured:
+        return dict(out, verdict="skipped", note="host pressure: no clean sample after retries (%s)"
+                    % ", ".join(pressured))
+    new = [values_of(e, row["metric"], proc) for e in new_entries]
+    refs = [values_of(e, row["metric"], ref) for e in ref_entries]
+    bad = [e.get("label", "?") for e, v in zip(new_entries + ref_entries, new + refs) if v is None]
+    if not new_entries or not ref_entries or bad:
+        return dict(out, verdict="failed", note="candidate process failed or short: %s"
+                    % (", ".join(bad) or "no %s process" % (row["proc"] if not new_entries else row["reference"])))
+    value, ref_value = median([v[0] for v in new]), median([v[0] for v in refs])
+    limit = round(ref_value + cal["max_excess"], 5)
+    note = "%s %s %.4f vs %s %.4f + %.4f = %.4f (per process %s vs %s)" % (
+        row["metric"], row["proc"], value, row["reference"], ref_value, cal["max_excess"], limit,
+        ", ".join("%.3f" % v[0] for v in new), ", ".join("%.3f" % v[0] for v in refs))
+    return dict(out, ratio=round(value, 5), reference_value=round(ref_value, 5), threshold=limit,
+                verdict="pass" if value <= limit else "regressed", note=note)
+
+
 def judge_row(perf, rid, row, cal, old_entries, new_entries, mode):
+    if is_relation(row):
+        return judge_relation(perf, rid, row, cal, new_entries, [])
     proc = perf["procs"][row["proc"]]
     _, better, window = METRICS[row["metric"]]
     thr = threshold(perf, cal)
@@ -296,6 +356,14 @@ def row_problem(perf, row, cal):
     verdict = row.get("verdict")
     if verdict not in VERDICTS:
         return "verdict %r" % (verdict,)
+    if is_relation((perf.get("rows") or {}).get(row.get("id"))):
+        ref, value, thr = row.get("reference_value"), row.get("ratio"), row.get("threshold")
+        if row.get("max_excess") != cal.get("max_excess"):
+            return "max_excess %r but policy says %r" % (row.get("max_excess"), cal.get("max_excess"))
+        if verdict == "pass" and not (_is_num(ref) and _is_num(value) and _is_num(thr)
+                                      and thr == round(ref + cal["max_excess"], 5) and value <= thr):
+            return "verdict pass but %r is over %r + max_excess" % (value, ref)
+        return None
     if row.get("threshold") != threshold(perf, cal):
         return "threshold %r but policy says %r" % (row.get("threshold"), threshold(perf, cal))
     ci = row.get("ci")
@@ -530,7 +598,7 @@ def run(perf, cls, install, models_dir, prompts_root, out, base_env, baseline_in
     host = host or socket.gethostname()
     card = card_identity(base_env)
     n = int(procs_per_arm or perf["judge"]["procs_per_arm"])
-    needed = sorted({row["proc"] for _, row, _ in rows})
+    needed = sorted({pid for _, row, _ in rows for pid in row_procs(row)})
     workroot = os.path.join(out, "perf")
     shutil.rmtree(workroot, ignore_errors=True)
     os.makedirs(workroot)
@@ -590,6 +658,10 @@ def run(perf, cls, install, models_dir, prompts_root, out, base_env, baseline_in
     results = []
     for rid, row, cal in rows:
         p = procs[row["proc"]]
+        if is_relation(row):
+            # judged on the candidate's own processes: no baseline needed
+            results.append(judge_relation(perf, rid, row, cal, p["new"], procs[row["reference"]]["new"]))
+            continue
         if mode == "none":
             results.append(judge_row(perf, rid, row, cal, [], p["new"], mode))
             results[-1].update(verdict="skipped", note="no reusable baseline (%s) and no baseline archive" % why_not)
@@ -605,7 +677,7 @@ def run(perf, cls, install, models_dir, prompts_root, out, base_env, baseline_in
             procs[pid] = {"new": [], "old": [], "reused": reused[pid]}
         measure(confirm, ["old", "new"], "pair")
         for i, (rid, row, cal) in enumerate(rows):
-            if row["proc"] in confirm:
+            if row["proc"] in confirm and not is_relation(row):
                 p = procs[row["proc"]]
                 results[i] = judge_row(perf, rid, row, cal, p["old"], p["new"], "pair-confirm")
         mode = "reuse+confirm"
@@ -627,7 +699,7 @@ def run(perf, cls, install, models_dir, prompts_root, out, base_env, baseline_in
 
 def print_rows(section, out=print):
     for row in section.get("rows", []):
-        if row.get("ratio") is None:
+        if row.get("ratio") is None or row.get("ci") is None:
             out("  %s: %s (%s) %s" % (row["id"], row["verdict"], row["mode"], row.get("note", "")))
         else:
             out("  %s: %s ratio %.4f CI [%.4f, %.4f] threshold %.4f (%s)%s"
@@ -643,6 +715,8 @@ def calibrate(perf, docs, cls):
     is max(1 - lo, hi - 1) of its CI; the row's aa_half_width is the largest."""
     out = {}
     for rid, row in perf["rows"].items():
+        if is_relation(row):
+            continue  # judged against the candidate itself: nothing to calibrate
         pid = row["proc"]
         arms = [(d.get("label", "doc%d" % i), (d.get("procs") or {}).get(pid)) for i, d in enumerate(docs)]
         arms = [(label, p) for label, p in arms if p and p.get("new")]
