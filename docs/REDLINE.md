@@ -354,8 +354,7 @@ extension, the last name-selected route.
 
 The MQ3G256V2 decode tape contains `gemv_mq3g256v2_residual`, which has a
 16-byte private segment per lane, so the route needs the GFX10/GFX11 PM4
-scratch rings (`HIPFIRE_PMSCRATCH_PM4_SCRATCH`, default on; at `=0` the prepare
-refuses and the load falls back closed to the HIP graph). Each lane's ring is also
+scratch rings, which the prepare always builds (there is no opt-out). Each lane's ring is also
 published in its queue's `amd_queue_t` scratch fields (`QueueSet::bind_scratch`):
 the command processor reloads the scratch registers from there when KFD maps the
 queue again after an eviction, and a queue without them stalls (HIPF-347). The
@@ -589,9 +588,8 @@ A retained route is valid only when all of the following hold.
   constant `COMPUTE_TMPRING_SIZE` plan sized for the largest private segment of
   the tape and one device-memory ring per queue lane
   (`crates/redline-rocr/src/pm4_gfx10_scratch.rs`; primary sources cited there).
-  `HIPFIRE_PMSCRATCH_PM4_SCRATCH=0` removes the rings, and a private-segment
-  kernel then blocks installation again. Dynamic-callstack kernels and gfx12
-  scratch remain unsupported.
+  The rings are always built, so a private-segment kernel no longer blocks
+  installation. Dynamic-callstack kernels and gfx12 scratch remain unsupported.
 - Artifact path, artifact digest, symbol, loader kernarg size/alignment, padded
   blob, grid, block, and shared memory are one identity contract. A stable
   kernel-name hash alone is insufficient.

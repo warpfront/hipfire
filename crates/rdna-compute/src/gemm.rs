@@ -160,12 +160,6 @@ pub struct F2GdnTargets<'a> {
     pub eps: f32,
 }
 
-/// `HIPFIRE_QWEN4_MTP_DRAFT_HEAD_PM` (on unless `0`): the MTP draft head's
-/// x-batched MQ2 ranking GEMV runs the gfx1201 PeaceMaker module where it
-/// covers the shape; `0` keeps the hipcc kernel. Read once.
-static MQ2_XBATCH_PM: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_DRAFT_HEAD_PM", true));
-
 static MQ2_XBATCH_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
     use sha2::{Digest, Sha256};
     let actual = format!("{:x}", Sha256::digest(kernels::GEMV_MQ2_XBATCH_PM_GFX1201));
@@ -223,12 +217,6 @@ static MOE_GU_FEW_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
         ))
     }
 });
-
-/// `HIPFIRE_QWEN4_MOE_GU_C8_PM` (on unless `0`): the gfx1201 `g32` gate/up on the `_nodz` path
-/// (M 1280 x K 2560, planar experts, more than 8 source rows) runs the persistent PeaceMaker
-/// module where [`Gpu::moe_gu_c8_pm_covers`] holds; `0` keeps the hipcc `g32` entry. Read once.
-static MOE_GU_C8_PM: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_GU_C8_PM", true));
 
 /// Persistent workgroup counts of the c8 gate/up module per entry: the resident capacity of each on
 /// gfx1201 (r8: 192 VGPRs, 8 waves/SIMD = 4 workgroups/WGP x 32 WGPs = 128; r4: 136 VGPRs, 11 waves/SIMD =
@@ -355,9 +343,6 @@ static DISPATCH_RDNA3_QKVZA_R2: LazyLock<bool> =
 static DISPATCH_QKVZA_CPOL: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc"));
 
-static DISPATCH_V2C_ADDEPI: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0"));
-
 static DISPATCH_GFX1100_DENSE_GATE_UP_PAIR: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR", false));
 
@@ -459,59 +444,15 @@ mod bt_tile_tests {
 /// wave 0 reduces the partials through LDS. Must match the kernels.
 const MQ3_SPLITK_WAVES: u32 = 8;
 
-/// `HIPFIRE_QWEN4_MOE_X_LDS` (`auto` | `1` | `0`, default `auto`): on exact
-/// gfx1151 the F16 WMMA grouped MoE gate/up SiLU and down GEMMs take the
-/// entries whose row-tile waves share each expert run's X through LDS
-/// (`gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4`,
-/// `gemm_mq4g128v2_moe_grouped_wmma_gfx1151_x8_bf16out`), bitwise the
-/// per-wave entries. See [`qwen4_moe_x_lds_armed`].  Read once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Qwen4MoeXLds {
-    /// Unset, `auto` or any other value: armed where the F16 WMMA MoE route runs.
-    Auto,
-    /// `1`: forced wherever admissible (exact gfx1151, F16 WMMA MoE route).
-    On,
-    /// `0`: the kill switch; the per-wave entries everywhere.
-    Off,
+/// Whether a Qwen4 grouped MoE GEMM takes the X-LDS entry. The entries exist for the
+/// F16 WMMA MoE route on exact gfx1151 only: the gate/up SiLU and down GEMMs there
+/// share each expert run's X through LDS (`gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4`,
+/// `gemm_mq4g128v2_moe_grouped_wmma_gfx1151_x8_bf16out`), bitwise the per-wave entries.
+/// A layer whose symmetric IU4 arm is selected (`HIPFIRE_QWEN4_MOE_SYM_IU4`,
+/// verified-symmetric experts) and every other architecture keep the per-wave entries.
+pub(crate) fn qwen4_moe_x_lds_armed(exact_gfx1151: bool, sym_iu4_selected: bool) -> bool {
+    exact_gfx1151 && !sym_iu4_selected
 }
-
-impl Qwen4MoeXLds {
-    fn parse(raw: Option<&str>) -> Self {
-        match raw {
-            Some("1") => Self::On,
-            Some("0") => Self::Off,
-            _ => Self::Auto,
-        }
-    }
-}
-
-pub(crate) static QWEN4_MOE_X_LDS: std::sync::LazyLock<Qwen4MoeXLds> =
-    std::sync::LazyLock::new(|| {
-        Qwen4MoeXLds::parse(hipfire_config::process_value("HIPFIRE_QWEN4_MOE_X_LDS").as_deref())
-    });
-
-/// Whether a Qwen4 grouped MoE GEMM takes the X-LDS entry. The entries exist
-/// for the F16 WMMA MoE route on exact gfx1151 only, so `auto` and `1` arm
-/// exactly when that route runs: a layer whose symmetric IU4 arm is selected
-/// (`HIPFIRE_QWEN4_MOE_SYM_IU4`, verified-symmetric experts) never reaches
-/// them, and other architectures keep the per-wave entries.
-pub(crate) fn qwen4_moe_x_lds_armed(
-    mode: Qwen4MoeXLds,
-    exact_gfx1151: bool,
-    sym_iu4_selected: bool,
-) -> bool {
-    mode != Qwen4MoeXLds::Off && exact_gfx1151 && !sym_iu4_selected
-}
-
-/// `HIPFIRE_QWEN4_MOE_DOWN_TWIN` (default on; `0` restores the O8×R16 down for
-/// every row count): on exact gfx1151 the Qwen4 grouped MoE down GEMM below
-/// the F16 WMMA window runs the X-in-LDS twin
-/// (`gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs4_gfx1151`) for batches of at
-/// least [`QWEN4_MOE_DOWN_TWIN_MIN_TOKENS`] tokens. Bitwise the O8×R16 output.
-/// Read once.
-pub(crate) static QWEN4_MOE_DOWN_TWIN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_DOWN_TWIN", true)
-});
 
 /// Smallest token batch (inclusive) that takes the down twin.
 pub(crate) const QWEN4_MOE_DOWN_TWIN_MIN_TOKENS: usize = 9;
@@ -526,31 +467,18 @@ pub(crate) const QWEN4_MOE_DOWN_TWIN_MIN_TOKENS: usize = 9;
 /// row count) of at least [`QWEN4_MOE_DOWN_TWIN_MIN_TOKENS`] tokens. The F16
 /// WMMA arm (>= 512 tokens) is checked first by the caller.
 pub(crate) fn qwen4_moe_down_twin_applies(
-    enabled: bool,
     exact_gfx1151: bool,
     m: usize,
     k: usize,
     x_row_div: usize,
     x_src_rows: usize,
 ) -> bool {
-    enabled
-        && exact_gfx1151
+    exact_gfx1151
         && m == 2560
         && k == 640
         && x_row_div == 1
         && x_src_rows >= QWEN4_MOE_DOWN_TWIN_MIN_TOKENS * 10
 }
-
-/// `HIPFIRE_QWEN4_MOE_GATEUP_TWIN` (default on; `0` restores the O4×R8 X4
-/// gate/up for every row count): on exact gfx1151 the Qwen4 grouped MoE
-/// gate/up GEMM (M = 1280, K = 2560, ten slots per token) on batches of more
-/// than eight tokens below the F16 WMMA window runs
-/// `gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe_gfx1151`. Bitwise the O4×R8 X4
-/// output. Read once.
-pub(crate) static QWEN4_MOE_GATEUP_TWIN: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_GATEUP_TWIN", true)
-    });
 
 /// Waves per block of the gate/up twin (block = `32 * WAVES` threads, grid x =
 /// `m.div_ceil(4 * WAVES)`). Must match the instantiation in
@@ -566,14 +494,13 @@ pub(crate) const QWEN4_MOE_GATEUP_TWIN_WAVES: usize = 4;
 /// arm keeps the incumbent). The F16 WMMA arm (>= 512 tokens) is checked
 /// first by the caller.
 pub(crate) fn qwen4_moe_gateup_twin_applies(
-    enabled: bool,
     exact_gfx1151: bool,
     m: usize,
     k: usize,
     x_row_div: usize,
     x_src_rows: usize,
 ) -> bool {
-    enabled && exact_gfx1151 && m == 1280 && k == 2560 && x_row_div == 10 && x_src_rows > 8
+    exact_gfx1151 && m == 1280 && k == 2560 && x_row_div == 10 && x_src_rows > 8
 }
 
 /// Fuse the BF16 shared-down fold into its incumbent WMMA store; opt-in.
@@ -583,14 +510,6 @@ static QWEN4_SHARED_DOWN_EPI: LazyLock<bool> =
 static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_PROJ_REGIONS", false)
 });
-/// `HIPFIRE_QWEN4_MQ6_X4_PM` (on unless `0`) runs gfx1201's MQ6 F32 overwrite
-/// trunk GEMM from the certified builder module (`kernels::QWEN4_MQ6_X4_PM_GFX1201`,
-/// same arguments and output bytes as `gemm_mq6g256v2_wmma_gfx12_bt8_x4`, its own
-/// 256-token grid) instead of the hipcc kernel, and gfx1151's large MQ6 overwrite
-/// launches (see [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`]) from
-/// `kernels::QWEN4_MQ6_X4_PM_GFX1151`. `0` keeps the hipcc kernels. Read once.
-static QWEN4_MQ6_X4_PM: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ6_X4_PM", true));
 /// Waves (16 channels each) per workgroup of the entry the route launches: the
 /// `_w8` entry (128 channels x 128 tokens per workgroup). The `_w4` entry is the oracle's
 /// comparison arm.
@@ -634,7 +553,7 @@ pub const fn mtp_dense_det_pm_shape(m: usize, k: usize, n: usize) -> bool {
         && ((n as u128) + (MTP_DENSE_DET_PM_TILE_N as u128) - 1) / (MTP_DENSE_DET_PM_TILE_N as u128)
             <= 0xffff
 }
-/// gfx1151 selective PM route (`HIPFIRE_QWEN4_MQ6_X4_PM`): the MQ6 X-LDS overwrite
+/// gfx1151 selective PM route: the MQ6 X-LDS overwrite
 /// launches (F32, BF16 output, and the a/b/z regions fold, all 128-row `_w8` entries of
 /// `kernels::QWEN4_MQ6_X4_PM_GFX1151`, 256-token tiles) run from the certified builder
 /// module at `M >= QWEN4_MQ6_X4_PM_MIN_M_GFX1151` rows (regions: summed rows) and
@@ -649,7 +568,7 @@ pub const QWEN4_MQ6_X4_PM_MIN_N_GFX1151: usize = 2048;
 pub const QWEN4_MQ4_X4_MIN_N_GFX1151: usize = 96;
 
 /// Header-planner counterpart of the launcher's selective native MQ6 arm.
-/// The process-frozen switch is supplied explicitly so shape policy is pure.
+/// The PM switch is supplied explicitly so shape policy is pure.
 pub(crate) fn mq6_x4_pm_gfx1151_selected(arch: &str, enabled: bool, m: usize, n: usize) -> bool {
     enabled && arch == "gfx1151" && mq6_x4_pm_gfx1151_shape(m, n)
 }
@@ -671,17 +590,12 @@ pub(crate) fn hc_down_tile_selected(
     }
 }
 
-/// gfx1100 HC `input_mix_down` fill tile (`HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100`, default on):
-/// exact gfx1100, M == 320 (four full 80-row tiles: no ragged M tile) and K % 64 == 0.
-/// Bit-identical to the 64 x 64 / k64 pipelined tile it replaces (same ascending-K WMMA chain
-/// per output element); any other shape keeps the generic M < 512 tile.
-pub(crate) fn hc_mix_fill80_gfx1100_selected(
-    arch: &str,
-    enabled: bool,
-    m: usize,
-    k: usize,
-) -> bool {
-    enabled && arch == "gfx1100" && m == 320 && k % 64 == 0
+/// gfx1100 HC `input_mix_down` fill tile: exact gfx1100, M == 320 (four full 80-row tiles: no
+/// ragged M tile) and K % 64 == 0. Bit-identical to the 64 x 64 / k64 pipelined tile it
+/// replaces (same ascending-K WMMA chain per output element); any other shape keeps the generic
+/// M < 512 tile.
+pub(crate) fn hc_mix_fill80_gfx1100_selected(arch: &str, m: usize, k: usize) -> bool {
+    arch == "gfx1100" && m == 320 && k % 64 == 0
 }
 
 /// Smallest route-row count the gfx1201 fused HC-down + activation kernel takes; below it the
@@ -1252,12 +1166,9 @@ mod iu4_tail_export_tests {
         ));
     }
 }
-/// gfx1201 small-N verify schedules (`HIPFIRE_VERIFY_V64`, default on; `=0` kills): slab
-/// launches of at most [`VERIFY_V64_MAX_N`] rows load the `_v64` exports of the `_b1s`
-/// bundle (full_add/full_set/qkvzaset/gate_up_silu) instead of the shipped ones.
-/// Byte-identical outputs.
-static VERIFY_V64: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_VERIFY_V64", true));
+/// gfx1201 small-N verify schedules: slab launches of at most [`VERIFY_V64_MAX_N`] rows load
+/// the `_v64` exports of the `_b1s` bundle (full_add/full_set/qkvzaset/gate_up_silu) instead of
+/// the shipped ones. Byte-identical outputs.
 /// Largest launch row count (`n`) that takes the `_v64` slab exports.
 const VERIFY_V64_MAX_N: usize = 128;
 /// Quality receipts count the fused A4 GDN projection launches (print-only,
@@ -1306,24 +1217,13 @@ fn gfx1100_pm_gemm(m: usize) -> bool {
     m < (1 << 22)
 }
 
-/// gfx1100 MQ6 residual PM twin (`HIPFIRE_MQ6_RESID_PM_GFX1100`, default on; `=0` restores the
-/// hipcc `gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds` for every shape). Parsed once.
-static MQ6_RESID_PM_GFX1100: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_MQ6_RESID_PM_GFX1100", true));
-
 /// Waves of the gfx1100 MQ6 residual PM twin for an MQ6 residual with `batch_size` tokens and
 /// `m` output rows, or `None` to keep hipcc. Only where hipcc selects MW8 (`batch_size >= 464`)
 /// on exact gfx1100: `m >= 6144` -> w8, `2560 <= m < 6144` -> w4, smaller `m` stays hipcc.
 /// Card ratios PM/hipcc at N=768: M10240 0.521, M6144 0.542, M12288 0.496 (w8); M2560 K6144
 /// 0.692 (w4).
-fn mq6_resid_pm_gfx1100_waves(
-    arch: &str,
-    bits: u8,
-    batch_size: usize,
-    m: usize,
-    enabled: bool,
-) -> Option<usize> {
-    if !enabled || bits != 6 {
+fn mq6_resid_pm_gfx1100_waves(arch: &str, bits: u8, batch_size: usize, m: usize) -> Option<usize> {
+    if bits != 6 {
         return None;
     }
     if mqv2_mw_waves(arch, bits, MqV2PrefillProjection::Residual, batch_size) != Some(8) {
@@ -1394,8 +1294,7 @@ enum Mq6ResidGfx1100Route {
 }
 
 /// Geometry of the gfx1100 MQ6 residual hipcc port for an MQ6 residual with `batch_size` tokens,
-/// `m` output rows and `k` inputs, or `None`. `enabled` is `FeatureFlags::mq6_resid_port_gfx1100`
-/// (`HIPFIRE_MQ6_RESID_PORT_GFX1100`, default on; `=0` kills it). Only where hipcc selects MW8
+/// `m` output rows and `k` inputs, or `None`. Only where hipcc selects MW8
 /// (exact gfx1100, `batch_size >= 464`): `m >= 6144` -> w8n256, `2560 <= m < 6144` -> w4n128,
 /// smaller `m` (the 48-row `ba` projection) stays hipcc MW8. The port addresses weights and
 /// activations through raw buffer descriptors with 31-bit byte offsets, so shapes whose weight
@@ -1409,10 +1308,9 @@ fn mq6_resid_port_gfx1100_geom(
     batch_size: usize,
     m: usize,
     k: usize,
-    enabled: bool,
 ) -> Option<Mq6ResidPortGeom> {
     const EXTENT_LIMIT: u128 = 1 << 31;
-    if !enabled || bits != 6 || k == 0 || k % 256 != 0 {
+    if bits != 6 || k == 0 || k % 256 != 0 {
         return None;
     }
     if mqv2_mw_waves(arch, bits, MqV2PrefillProjection::Residual, batch_size) != Some(8) {
@@ -1433,24 +1331,21 @@ fn mq6_resid_port_gfx1100_geom(
 
 /// Route of an exact-gfx1100 MQ6 residual GEMM where hipcc would run MW8, in precedence order:
 /// hipcc port ([`mq6_resid_port_gfx1100_geom`]) -> PM twin ([`mq6_resid_pm_gfx1100_waves`]) ->
-/// `None` (the generic path, hipcc MW8). `port_enabled` / `pm_enabled` are the two kill switches
-/// (`HIPFIRE_MQ6_RESID_PORT_GFX1100`, `HIPFIRE_MQ6_RESID_PM_GFX1100`).
+/// `None` (the generic path, hipcc MW8).
 fn mq6_resid_gfx1100_route(
     arch: &str,
     bits: u8,
     batch_size: usize,
     m: usize,
     k: usize,
-    port_enabled: bool,
-    pm_enabled: bool,
 ) -> Option<Mq6ResidGfx1100Route> {
     if bits != 6 || k % 256 != 0 {
         return None;
     }
-    if let Some(geom) = mq6_resid_port_gfx1100_geom(arch, bits, batch_size, m, k, port_enabled) {
+    if let Some(geom) = mq6_resid_port_gfx1100_geom(arch, bits, batch_size, m, k) {
         return Some(Mq6ResidGfx1100Route::Port(geom));
     }
-    mq6_resid_pm_gfx1100_waves(arch, bits, batch_size, m, pm_enabled).map(Mq6ResidGfx1100Route::Pm)
+    mq6_resid_pm_gfx1100_waves(arch, bits, batch_size, m).map(Mq6ResidGfx1100Route::Pm)
 }
 
 /// Developer A/B of the gfx1100 builder bundle with one binary (for example
@@ -1510,7 +1405,7 @@ const PM_V2B_SILU_A4: &str = "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151"
 const PM_V2B_ADD_MIN_K: usize = 2048;
 
 /// Developer same-binary A/B of the gfx1151 V2B builder bundle (for example
-/// the previous certified bundle as the opt-out arm):
+/// the previous certified bundle as the A/B arm):
 /// `HIPFIRE_V2B_PM_BUNDLE=<path>` loads it from a file instead of the
 /// embedded image. Read once; an unreadable file fails every V2B builder launch.
 static V2B_PM_BUNDLE: LazyLock<BundleOverride> =
@@ -1561,14 +1456,10 @@ fn v2b_a4_mode() -> A4Mode {
 
 /// Builder twin of a hipcc V2B entry (gfx1151 only: the V2B tile is), with
 /// the builder ADD's log2 raster group; `None` keeps the hipcc entry.
-/// `HIPFIRE_V2B_PM=0` restores every hipcc entry. The Z|beta|alpha
-/// `_set_zba` scatter stays on hipcc; the ADD twin takes power-of-two groups
+/// The Z|beta|alpha `_set_zba` scatter stays on hipcc; the ADD twin takes power-of-two groups
 /// that divide the row tiles.
 /// Outputs are byte-identical to the entry replaced.
 fn v2b_pm_entry(hipcc: &str, swz_grp: i32, m: usize, k: usize) -> Option<(&'static str, u32)> {
-    if hipfire_config::developer_var("HIPFIRE_V2B_PM").as_deref() == Ok("0") {
-        return None;
-    }
     match hipcc {
         "gemm_mq4g256v2_residual_iu4_v2b_set_gfx11" => Some((PM_V2B_SET, 0)),
         "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11"
@@ -1623,10 +1514,9 @@ impl Iu4V2Tile {
 ///
 /// Shared by the F32 entry below and the F16 entry in
 /// `mq_f16_residual_producers.rs` so both precisions route identically: the
-/// `residual_ksplit_off` kill switch dominates BOTH optimized tiers and
-/// restores the base kernel; otherwise the `residual_ldsstage` default-on
-/// exact-gfx1100 tier wins wherever `K % 512 == 0`, else the frozen split-K
-/// table, else base. Pure so CPU tests can pin the precedence without a GPU.
+/// `residual_ldsstage` default-on exact-gfx1100 tier wins wherever `K % 512 == 0`,
+/// else the frozen split-K table, else base. Pure so CPU tests can pin the
+/// precedence without a GPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResidualVerifyTier {
     LdsStage,
@@ -20794,7 +20684,7 @@ impl Gpu {
                 (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s",
                     "",
-                    match (add, *VERIFY_V64 && batch_size <= VERIFY_V64_MAX_N) {
+                    match (add, batch_size <= VERIFY_V64_MAX_N) {
                         (true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s",
                         (false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_b1s",
                         (true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_b1s_v64",
@@ -20961,9 +20851,8 @@ impl Gpu {
         // eligibility rule.
         let v2_tile = self.iu4_v2_tile(m, k, batch_size);
         if v2_tile == Some(Iu4V2Tile::V2c) {
-            // ADD epilogue (`HIPFIRE_V2C_ADDEPI=0` restores the plain ADD):
-            // `_add_touch` touches the residual tile ahead of the epilogue,
-            // byte-identical to `_add`. The builder tile
+            // ADD epilogue: `_add_touch` touches the residual tile ahead of the epilogue,
+            // byte-identical to the plain ADD. The builder tile
             // (`gfx1100_pm_gemm`) runs the same algorithm from the embedded
             // certified bundle as one 256-thread block; its ADD always
             // touches the residual over `_add_touch`'s epoch window.
@@ -20972,10 +20861,7 @@ impl Gpu {
                 (true, false) => "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100",
                 (true, true) => "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100",
                 (false, false) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
-                (false, true) if *DISPATCH_V2C_ADDEPI => {
-                    "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11"
-                }
-                (false, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
+                (false, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11",
             };
             if pm {
                 self.ensure_embedded_kernel(
@@ -21069,8 +20955,7 @@ impl Gpu {
             } else {
                 kernel_name
             };
-            // Certified builder V2B (`HIPFIRE_V2B_PM=0` restores the hipcc
-            // entry): same tiles and output bytes, launched as a flat
+            // Certified builder V2B: same tiles and output bytes, launched as a flat
             // 512-thread block; ADD takes the raster group as a shift.
             let pm = v2b_pm_entry(kernel_name, swz_grp, m, k);
             let launch_name = match pm {
@@ -30228,12 +30113,7 @@ impl Gpu {
         // each output's K order.  M < 1024 (router 512, shared gate/up 640 at
         // K 2560): 128 x 128 over 128 x 256, 175 vs 213 us at 640 x 2560 x 1131;
         // every tile keeps each output's K order.
-        if hc_mix_fill80_gfx1100_selected(
-            self.arch.as_str(),
-            self.flags.qwen4_hc_mix_fill80_gfx1100_enabled(),
-            m,
-            k,
-        ) {
+        if hc_mix_fill80_gfx1100_selected(self.arch.as_str(), m, k) {
             return self.gemm_f16_x_f16_wmma_lds_tiled_ld(
                 &w_view,
                 x_f16,
@@ -31037,7 +30917,7 @@ impl Gpu {
             }
             return Ok(());
         }
-        // `HIPFIRE_QWEN4_LANE_WMMA` (exact gfx1201, 16..=64 rows): the MoE call's BF16 router /
+        // Exact gfx1201, 16..=64 rows: the MoE call's BF16 router /
         // shared-expert projections on the lane WMMA kernel, two BF16 activation terms (hi + lo:
         // the f32 input is not BF16-exact). Not bitwise the arms below (f32 summation order).
         if self.lane_wmma_applies(batch_size)
@@ -31058,7 +30938,7 @@ impl Gpu {
                 )
                 .map(|_| ());
         }
-        // `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE` (default on, exact gfx1201, > 64 rows below the F16
+        // Exact gfx1201, > 64 rows below the F16
         // WMMA route): the same kernel with two BF16 activation terms (hi + lo) and a split-K
         // pinned to a fixed row count, so each row is bitwise its singleton's whatever the call size.
         // The tuned shapes run on the staged-tile kernel (`lwmma_tile_bf16_*`), every output word
@@ -31079,7 +30959,7 @@ impl Gpu {
                 None,
             );
         }
-        // `HIPFIRE_QWEN4_BF16_ALLROWS` (exact gfx1201): 9..=64 rows in one launch that loads
+        // Exact gfx1201: 9..=64 rows in one launch that loads
         // each weight once per output tile; every output word is bitwise the arms below'.
         if self.bf16_allrows_applies(batch_size) {
             return self.gemm_bf16_xf32_multirow_allrows(weight, x, y, m, k, batch_size);
@@ -34833,11 +34713,7 @@ impl Gpu {
             return Ok(false);
         }
         let module = "gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s";
-        let symbol = if *VERIFY_V64 {
-            "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s_v64"
-        } else {
-            "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s"
-        };
+        let symbol = "gemm_mq4g256v2_residual_mmq_iu4_qkvzaset_b1s_v64";
         // An owed residual add must land before any further GEMM.
         self.flush_residual_fold()?;
         self.ensure_embedded_kernel(module, g12_iu4_b1s_image()?, symbol)?;
@@ -35219,8 +35095,7 @@ impl Gpu {
         }
         let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, n)?;
-        // Halo V2B: scatter Z|beta|alpha straight from the SET epilogue
-        // (`HIPFIRE_V2B_ZBA_SCATTER=0` restores SET + split). Byte-identical
+        // Halo V2B: scatter Z|beta|alpha straight from the SET epilogue. Byte-identical
         // outputs; deletes the split's folded read and Z/beta/alpha rewrite.
         if folded_m == z_m + 256
             && z_m % 256 == 0
@@ -35228,7 +35103,6 @@ impl Gpu {
             && y_z.byte_size() >= n * z_m * 4
             && y_beta.byte_size() >= n * 48 * 4
             && y_alpha.byte_size() >= n * 48 * 4
-            && hipfire_config::developer_var("HIPFIRE_V2B_ZBA_SCATTER").as_deref() != Ok("0")
         {
             return self.gemm_zba_v2b_scatter(a_z_fold, xq, y_z, y_beta, y_alpha, z_m, k, n);
         }
@@ -37619,7 +37493,6 @@ impl Gpu {
                 "gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11",
             ),
         };
-        // gfx1151: the certified builder twin unless `HIPFIRE_V2B_PM=0`.
         let a4_retile = tile == Iu4V2Tile::V2b
             && v2b_a4_mode() == A4Mode::Retile
             && self.a4_epi_admitted(Some(tile), gate_m, up_m, k, batch_size);
@@ -37704,7 +37577,7 @@ impl Gpu {
     /// A4-fusion admission shared by the `HIPFIRE_V2B_A4_EPI` arms: exact
     /// gfx1151, `gate_m == up_m`, the V2B tile (which already excludes Redline
     /// recording and graph capture), `gate_m % 256 == 0`,
-    /// `batch_size % 128 == 0`, `k % 256 == 0`, and not `HIPFIRE_V2B_PM=0`.
+    /// `batch_size % 128 == 0`, `k % 256 == 0`.
     /// `tile` is `self.iu4_v2_tile(gate_m, k, batch_size)`.
     fn a4_epi_admitted(
         &self,
@@ -37720,10 +37593,9 @@ impl Gpu {
             && gate_m % 256 == 0
             && batch_size % 128 == 0
             && k % 256 == 0
-            && hipfire_config::developer_var("HIPFIRE_V2B_PM").as_deref() != Ok("0")
     }
 
-    /// A4-fusion stage 2 (the default arm on gfx1151 V2B): the certified
+    /// A4-fusion stage 2 (gfx1151 V2B): the certified
     /// V2B gate/up + SiLU GEMM that also writes the w_down A4 sidecar. The
     /// kernel applies the `fused_silu_hin_rotate_mq_i4_batched` producer to its
     /// own SiLU output and stores the byte-identical 72-byte `block_i4_128`
@@ -37865,8 +37737,7 @@ impl Gpu {
                 "",
                 if bf16_h_a4_enabled() {
                     "gemm_mq4g256v2_gate_up_silu_mmq_iu4_b1s_bf16"
-                } else if *VERIFY_V64
-                    && n <= VERIFY_V64_MAX_N
+                } else if n <= VERIFY_V64_MAX_N
                     && crate::pm_tune::lookup(
                         &self.arch,
                         crate::pm_tune::GATE_UP_B1S_SYMBOL,
@@ -39460,23 +39331,16 @@ impl Gpu {
         // capture), and its symbols carry the replay.rs kernarg contract, so
         // verify-graph capture bakes ks4_lds and every replayed cycle keeps
         // the win. Only Redline tape recording keeps the base contract.
-        // Kill switch: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 disables BOTH the ksplit
-        // and ldsstage kernels (flags.residual_ksplit_off) and restores the
-        // base oracle. The ldsstage kernel (gfx1100 port of the gfx12
+        // The ldsstage kernel (gfx1100 port of the gfx12
         // ldsstage design) is default-on for exact gfx1100
         // (flags.residual_ldsstage) wherever K % 512 == 0; set
         // HIPFIRE_RESIDUAL_LDSSTAGE=0 to restore the split-K table path.
         if !self.replay.is_recording()
-            && !self.flags.residual_ksplit_off
             && self.arch_caps.is_gfx1100()
             && self.arch == "gfx1100"
             && batch_size <= 16
         {
-            match Self::residual_verify_tier(
-                self.flags.residual_ksplit_off,
-                self.flags.residual_ldsstage,
-                k,
-            ) {
+            match Self::residual_verify_tier(self.flags.residual_ldsstage, k) {
                 ResidualVerifyTier::LdsStage => {
                     return self.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
                         a_raw, x, y, m, k, batch_size,
@@ -39523,6 +39387,20 @@ impl Gpu {
             return self
                 .gemm_mq4g256v2_residual_wmma_gfx1151_xlds(a_raw, x, y, m, k, batch_size, false);
         }
+        self.gemm_mq4g256v2_residual_wmma_base(a_raw, x, y, m, k, batch_size)
+    }
+
+    /// The historical base launch of [`Gpu::gemm_mq4g256v2_residual_wmma`] (one wave32 per
+    /// 16x16 tile), with no tier choice: the reference arm of the gfx1100 residual harnesses.
+    pub fn gemm_mq4g256v2_residual_wmma_base(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         let kname = "gemm_mq4g256v2_residual_wmma";
         let ksrc = kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC;
@@ -40170,69 +40048,6 @@ impl Gpu {
         result
     }
 
-    /// T0 experiment: plain uniform MQ4G256V2 residual WMMA base tile
-    /// (no BT reuse) as the N<96 reference arm. Mirrors the dispatcher
-    /// fallthrough path (`GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC`, grid
-    /// ceil(M/16) x ceil(N/16)). Eager-only throwaway for the T0
-    /// differential; not wired into dispatch. Lab-only: the sole caller is
-    /// the lab-gated `tmp_lloyd_gfx11_t0` example.
-    #[cfg(feature = "lab")]
-    pub fn gemm_mq4g256v2_residual_wmma_base(
-        &mut self,
-        a_raw: &GpuTensor,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
-        k: usize,
-        batch_size: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        const MODULE: &str = "gemm_mq4g256v2_residual_wmma_base";
-        const FUNC: &str = "gemm_mq4g256v2_residual_wmma";
-        self.ensure_kernel(MODULE, kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC, FUNC)?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x_f16_ptr;
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
-        ];
-        let row_tiles = (m + 15) / 16;
-        let batch_tiles = (batch_size + 15) / 16;
-        let bytes =
-            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
-        let result = self.launch_maybe_blob(
-            FUNC,
-            [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(x_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(bs_val);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
     /// T0 experiment: MQ4G256V2-Lloyd (qt=52) residual BT twin for gfx1100.
     /// Same grid/block/arithmetic as
     /// [`Self::gemm_mq4g256v2_residual_wmma_gfx1100_bt`], except the dequant
@@ -40359,22 +40174,15 @@ impl Gpu {
     }
 
     /// Shared verify-tier pick for the exact-gfx1100 residual entries (see
-    /// `ResidualVerifyTier`): kill switch dominates both tiers, default-on
-    /// ldsstage next, split-K table next, base fallback. Both the F32 entry
-    /// above and the F16 entry route through here.
+    /// `ResidualVerifyTier`): ldsstage first, split-K table next, base fallback.
+    /// Both the F32 entry above and the F16 entry route through here.
     #[inline]
-    pub(crate) fn residual_verify_tier(
-        ksplit_off: bool,
-        ldsstage: bool,
-        k: usize,
-    ) -> ResidualVerifyTier {
-        if !ksplit_off && ldsstage && k > 0 && k % 512 == 0 {
+    pub(crate) fn residual_verify_tier(ldsstage: bool, k: usize) -> ResidualVerifyTier {
+        if ldsstage && k > 0 && k % 512 == 0 {
             return ResidualVerifyTier::LdsStage;
         }
-        if !ksplit_off {
-            if let Some(kw) = Self::residual_ksplit_kw(k) {
-                return ResidualVerifyTier::Ksplit { kw };
-            }
+        if let Some(kw) = Self::residual_ksplit_kw(k) {
+            return ResidualVerifyTier::Ksplit { kw };
         }
         ResidualVerifyTier::Base
     }
@@ -42010,15 +41818,8 @@ impl Gpu {
             }
             return Ok(());
         }
-        let pm = self.mq2_xbatch_pm_active(m, k);
+        let pm = self.mq2_xbatch_pm_covers(m, k);
         self.gemv_mq2g256v2_xbatch_with(a_raw, x, y, m, k, batch_size, pm)
-    }
-
-    /// Whether [`Self::gemv_mq2g256v2_xbatch`] runs the gfx1201 PeaceMaker
-    /// module for this shape: `HIPFIRE_QWEN4_MTP_DRAFT_HEAD_PM` on and
-    /// [`Self::mq2_xbatch_pm_covers`].
-    pub fn mq2_xbatch_pm_active(&self, m: usize, k: usize) -> bool {
-        *MQ2_XBATCH_PM && self.mq2_xbatch_pm_covers(m, k)
     }
 
     /// Whether the gfx1201 PeaceMaker x-batched MQ2 module covers this shape:
@@ -42411,15 +42212,7 @@ impl Gpu {
         if self.replay.is_recording() || self.graphs.capture_mode {
             return Ok(false);
         }
-        if let Some(route) = mq6_resid_gfx1100_route(
-            self.arch.as_str(),
-            bits,
-            batch_size,
-            m,
-            k,
-            self.flags.mq6_resid_port_gfx1100_enabled(),
-            *MQ6_RESID_PM_GFX1100,
-        ) {
+        if let Some(route) = mq6_resid_gfx1100_route(self.arch.as_str(), bits, batch_size, m, k) {
             match route {
                 Mq6ResidGfx1100Route::Port(geom) => {
                     self.gemm_mq6_residual_port_gfx1100(geom, a_raw, x, y, m, k, batch_size)?;
@@ -42861,24 +42654,14 @@ impl Gpu {
         x_f16: Option<*mut c_void>,
     ) -> HipResult<()> {
         self.mqv2_wmma_gfx11_bt_pm(
-            bits,
-            batch_tile,
-            a_raw,
-            x,
-            y,
-            m,
-            k,
-            batch_size,
-            overwrite,
-            x_f16,
-            *QWEN4_MQ6_X4_PM,
+            bits, batch_tile, a_raw, x, y, m, k, batch_size, overwrite, x_f16, true,
         )
     }
 
     /// `overwrite` (`Y = W·X`, MQ6 BT8 X-LDS) equals zeroing Y and
     /// then accumulating, in one launch.
     /// `pm` runs the gfx1201 MQ6 F32 overwrite GEMM from the builder module
-    /// (`HIPFIRE_QWEN4_MQ6_X4_PM`): same arguments and output bytes, 256-token grid.
+    /// same arguments and output bytes, 256-token grid.
     #[allow(clippy::too_many_arguments)]
     fn mqv2_wmma_gfx11_bt_pm(
         &mut self,
@@ -42943,7 +42726,7 @@ impl Gpu {
         } else {
             Mq6X4Kind::Plain
         };
-        // gfx1151 PM (F32 and BF16 output, M/N from the selective thresholds, flag on):
+        // gfx1151 PM (F32 and BF16 output, M/N from the selective thresholds):
         // the 128-row `_w8` entry of the certified builder module replaces the hipcc entry
         // and the U3 twin; everything smaller keeps U3 / hipcc.
         let pm1151 = xlds && overwrite && self.mq6_x4_pm_gfx1151(pm, m, batch_size);
@@ -45654,7 +45437,7 @@ impl Gpu {
             .unwrap_or(self.qwen4_scope && self.arch.as_str() == "gfx1151")
     }
 
-    /// gfx1151 selective PM route (`HIPFIRE_QWEN4_MQ6_X4_PM`, `pm`): an MQ6 X-LDS overwrite
+    /// gfx1151 selective PM route (`pm`): an MQ6 X-LDS overwrite
     /// launch of `m` rows (regions: summed rows) and `n` tokens runs from the certified
     /// builder module `qwen4_mq6_x4_pm_gfx1151` from [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`] rows
     /// and [`QWEN4_MQ6_X4_PM_MIN_N_GFX1151`] tokens up (256-token tiles, `_w8` entries).
@@ -45711,10 +45494,10 @@ impl Gpu {
         if !self.qwen4_mq6_x4_regions() {
             return Ok(false);
         }
-        self.gemm_mq6g256v2_xf16_regions_pm(regions, x_f16, k, batch_size, *QWEN4_MQ6_X4_PM)
+        self.gemm_mq6g256v2_xf16_regions_pm(regions, x_f16, k, batch_size, true)
     }
 
-    /// [`Gpu::gemm_mq6g256v2_xf16_regions`] past the fold flag, with the PM flag explicit
+    /// [`Gpu::gemm_mq6g256v2_xf16_regions`] past the fold flag, with the PM switch explicit
     /// (gfx1151: the builder module's `_w8_regions` entry from the selective thresholds).
     fn gemm_mq6g256v2_xf16_regions_pm(
         &mut self,
@@ -50068,12 +49851,12 @@ impl Gpu {
             &[grouped_rows, m / 2, 2],
             "gemm_mq4g256v2_moe_grouped_top10_silu_bf16out grouped rows",
         )?;
-        // gfx1151 (`HIPFIRE_QWEN4_MOE_X_LDS`, default `auto`): four row tiles
+        // gfx1151: four row tiles
         // per workgroup share each multi-tile run's X through LDS (bitwise the
         // per-wave entry). This launcher is the F16 WMMA MoE route's gate/up:
         // the Qwen4 prefill dispatch reaches it only when the layer's
         // symmetric IU4 arm is not selected.
-        let x4 = qwen4_moe_x_lds_armed(*QWEN4_MOE_X_LDS, self.arch_caps.is_gfx1151(), false)
+        let x4 = qwen4_moe_x_lds_armed(self.arch_caps.is_gfx1151(), false)
             && m.is_multiple_of(64)
             && k.is_multiple_of(256);
         self.gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
@@ -50165,7 +49948,6 @@ impl Gpu {
                 );
             }
             if qwen4_moe_gateup_twin_applies(
-                *QWEN4_MOE_GATEUP_TWIN,
                 self.arch_caps.is_gfx1151(),
                 m,
                 k,
@@ -50486,7 +50268,7 @@ impl Gpu {
     /// [`Self::gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151`] (same ABI), one 256-thread block per
     /// 16-slot tile x 32 output rows (grid `[M / 32, ceil(grouped_rows / 16)]`); `g32_r8` for more
     /// than 16 source rows, `g32_r4` for 9..=16. Where [`Self::moe_gu_c8_pm_covers`] holds on the
-    /// `_nodz` path and `HIPFIRE_QWEN4_MOE_GU_C8_PM` is on, the PeaceMaker persistent twin runs
+    /// `_nodz` path, the PeaceMaker persistent twin runs
     /// instead ([`Self::gemm_mq4g256v2_moe_grouped_top10_g32_with`]).
     #[allow(clippy::too_many_arguments)]
     fn gemm_mq4g256v2_moe_grouped_top10_g32_gfx1201(
@@ -50506,7 +50288,6 @@ impl Gpu {
         // +0.0 stores); `HIPFIRE_QWEN4_MOE32_GU=2` forces the `_nodz` entries whatever that switch says.
         let nodz = self.moe32_gu == 2 || !self.moe_dead_stores;
         let pm = nodz
-            && *MOE_GU_C8_PM
             && moe_gu_c8_pm_rows(x_src_rows)
             && self.moe_gu_c8_pm_covers(m, k, x_row_div, grouped_rows);
         let n_blocks = MOE_GU_C8_PM_BLOCKS.unwrap_or(if x_src_rows > 16 {
@@ -52120,10 +51901,6 @@ fn qwen4_moe_group_module_src(arch: &str) -> (&'static str, &'static str) {
 }
 const QWEN4_MOE_ROTATE128_I4: &str = "qwen4_moe_rotate128_i4";
 
-static QWEN4_TRUNK_IU4_RAGGED: LazyLock<bool> = LazyLock::new(|| {
-    hipfire_config::developer_var("HIPFIRE_QWEN4_TRUNK_IU4_RAGGED").as_deref() != Ok("0")
-});
-
 /// Dense eligibility uses live rows, never a tensor's allocation capacity.
 pub fn qwen4_trunk_iu4_dense_rows(rows: usize) -> bool {
     rows >= QWEN4_F16_WMMA_MIN_TOKENS && rows % 128 == 0
@@ -52279,7 +52056,6 @@ impl Gpu {
             && !intent.suppresses_trunk_iu4()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && *QWEN4_TRUNK_IU4_RAGGED
         {
             qwen4_trunk_iu4_ragged_rows_for(intent, rows)
         } else {
@@ -52416,7 +52192,6 @@ impl Gpu {
             || y_z.byte_size() < n * z_m * 4
             || y_beta.byte_size() < n * 48 * 4
             || y_alpha.byte_size() < n * 48 * 4
-            || hipfire_config::developer_var("HIPFIRE_V2B_ZBA_SCATTER").as_deref() == Ok("0")
         {
             return Ok(false);
         }
@@ -54756,30 +54531,14 @@ mod tests {
     }
 
     #[test]
-    fn qwen4_moe_x_lds_parses_auto_on_off() {
-        assert_eq!(Qwen4MoeXLds::parse(None), Qwen4MoeXLds::Auto);
-        assert_eq!(Qwen4MoeXLds::parse(Some("auto")), Qwen4MoeXLds::Auto);
-        assert_eq!(Qwen4MoeXLds::parse(Some("1")), Qwen4MoeXLds::On);
-        assert_eq!(Qwen4MoeXLds::parse(Some("0")), Qwen4MoeXLds::Off);
-    }
-
-    #[test]
-    fn qwen4_moe_x_lds_auto_arms_only_on_the_gfx1151_f16_route() {
-        use Qwen4MoeXLds::{Auto, Off, On};
+    fn qwen4_moe_x_lds_arms_only_on_the_gfx1151_f16_route() {
         // IU4 selected (the GPTQ3 default on gfx1151): off.
-        assert!(!qwen4_moe_x_lds_armed(Auto, true, true));
+        assert!(!qwen4_moe_x_lds_armed(true, true));
         // IU4 not selected (`HIPFIRE_QWEN4_MOE_SYM_IU4=0`, asymmetric experts) on gfx1151: on.
-        assert!(qwen4_moe_x_lds_armed(Auto, true, false));
+        assert!(qwen4_moe_x_lds_armed(true, false));
         // Any other arch: off, IU4 or not.
-        assert!(!qwen4_moe_x_lds_armed(Auto, false, false));
-        assert!(!qwen4_moe_x_lds_armed(Auto, false, true));
-        // `0` is the kill switch.
-        assert!(!qwen4_moe_x_lds_armed(Off, true, false));
-        assert!(!qwen4_moe_x_lds_armed(Off, true, true));
-        // `1` forces it where admissible, and only there.
-        assert!(qwen4_moe_x_lds_armed(On, true, false));
-        assert!(!qwen4_moe_x_lds_armed(On, true, true));
-        assert!(!qwen4_moe_x_lds_armed(On, false, false));
+        assert!(!qwen4_moe_x_lds_armed(false, false));
+        assert!(!qwen4_moe_x_lds_armed(false, true));
     }
 
     #[test]
@@ -55229,48 +54988,35 @@ mod tests {
     }
 
     #[test]
-    fn residual_kill_switch_dominates_ldsstage_and_ksplit() {
+    fn residual_verify_tier_prefers_ldsstage_then_ksplit() {
         // K = 2048 admits both optimized tiers (K % 512 == 0, ks table -> kw=4).
-        // Kill switch restores base even with the ldsstage enabled (the F16 bug).
-        assert_eq!(
-            ResidualVerifyTier::Base,
-            Gpu::residual_verify_tier(true, true, 2048)
-        );
-        assert_eq!(
-            ResidualVerifyTier::Base,
-            Gpu::residual_verify_tier(true, false, 2048)
-        );
-        // Preserved enabled/disabled routing with the kill switch off.
         assert_eq!(
             ResidualVerifyTier::LdsStage,
-            Gpu::residual_verify_tier(false, true, 2048)
+            Gpu::residual_verify_tier(true, 2048)
         );
         assert_eq!(
             ResidualVerifyTier::Ksplit { kw: 4 },
-            Gpu::residual_verify_tier(false, false, 2048)
+            Gpu::residual_verify_tier(false, 2048)
         );
         // Large-K split widths still route through the table (kw=8).
         assert_eq!(
             ResidualVerifyTier::Ksplit { kw: 8 },
-            Gpu::residual_verify_tier(false, false, 12288)
+            Gpu::residual_verify_tier(false, 12288)
         );
         assert_eq!(
             ResidualVerifyTier::LdsStage,
-            Gpu::residual_verify_tier(false, true, 12288)
+            Gpu::residual_verify_tier(true, 12288)
         );
         // Unsupported K (K/256 odd, no kw divides it) restores base.
         assert_eq!(
             ResidualVerifyTier::Base,
-            Gpu::residual_verify_tier(false, true, 768)
+            Gpu::residual_verify_tier(true, 768)
         );
         assert_eq!(
             ResidualVerifyTier::Base,
-            Gpu::residual_verify_tier(false, false, 1000)
+            Gpu::residual_verify_tier(false, 1000)
         );
-        assert_eq!(
-            ResidualVerifyTier::Base,
-            Gpu::residual_verify_tier(false, true, 0)
-        );
+        assert_eq!(ResidualVerifyTier::Base, Gpu::residual_verify_tier(true, 0));
     }
 
     /// Every gfx1151 BF16 multirow route (R16 allowlist shapes and the
@@ -55709,7 +55455,7 @@ mod tests {
         }
     }
 
-    /// The builder-module MQ6 overwrite GEMM (`HIPFIRE_QWEN4_MQ6_X4_PM`) must
+    /// The builder-module MQ6 overwrite GEMM (the `pm` route) must
     /// produce the hipcc `gemm_mq6g256v2_wmma_gfx12_bt8_x4` bytes: the 64-row
     /// entry (M <= 64), the 128-row entry with a full and a ragged row tail,
     /// the 256-row `_w16` entry (whole 32-workgroup rounds, incl. a ragged row
@@ -56772,49 +56518,47 @@ mod route_selector_tests {
 
     #[test]
     fn qwen4_moe_down_twin_window_and_shape_table() {
-        // (enabled, exact_gfx1151, m, k, x_row_div, tokens, expected)
-        for (enabled, gfx1151, m, k, row_div, tokens, want) in [
-            (false, true, 2560, 640, 1, 200, false),
-            (true, false, 2560, 640, 1, 200, false),
-            (true, true, 2048, 640, 1, 200, false),
-            (true, true, 2560, 512, 1, 200, false),
-            (true, true, 2560, 640, 10, 200, false),
-            (true, true, 2560, 640, 1, 8, false),
-            (true, true, 2560, 640, 1, 9, true),
-            (true, true, 2560, 640, 1, 145, true),
-            (true, true, 2560, 640, 1, 336, true),
-            (true, true, 2560, 640, 1, 337, true),
-            (true, true, 2560, 640, 1, 401, true),
-            (true, true, 2560, 640, 1, 529, true),
+        // (exact_gfx1151, m, k, x_row_div, tokens, expected)
+        for (gfx1151, m, k, row_div, tokens, want) in [
+            (false, 2560, 640, 1, 200, false),
+            (true, 2048, 640, 1, 200, false),
+            (true, 2560, 512, 1, 200, false),
+            (true, 2560, 640, 10, 200, false),
+            (true, 2560, 640, 1, 8, false),
+            (true, 2560, 640, 1, 9, true),
+            (true, 2560, 640, 1, 145, true),
+            (true, 2560, 640, 1, 336, true),
+            (true, 2560, 640, 1, 337, true),
+            (true, 2560, 640, 1, 401, true),
+            (true, 2560, 640, 1, 529, true),
         ] {
             assert_eq!(
-                qwen4_moe_down_twin_applies(enabled, gfx1151, m, k, row_div, tokens * 10),
+                qwen4_moe_down_twin_applies(gfx1151, m, k, row_div, tokens * 10),
                 want,
-                "enabled={enabled} gfx1151={gfx1151} m={m} k={k} x_row_div={row_div} tokens={tokens}",
+                "gfx1151={gfx1151} m={m} k={k} x_row_div={row_div} tokens={tokens}",
             );
         }
     }
 
     #[test]
     fn qwen4_moe_gateup_twin_token_and_shape_table() {
-        // (enabled, exact_gfx1151, m, k, x_row_div, tokens, expected)
-        for (enabled, gfx1151, m, k, row_div, tokens, want) in [
-            (false, true, 1280, 2560, 10, 200, false),
-            (true, false, 1280, 2560, 10, 200, false),
-            (true, true, 2560, 2560, 10, 200, false),
-            (true, true, 1280, 640, 10, 200, false),
-            (true, true, 1280, 2560, 1, 200, false),
-            (true, true, 1280, 2560, 10, 8, false),
-            (true, true, 1280, 2560, 10, 9, true),
-            (true, true, 1280, 2560, 10, 145, true),
-            (true, true, 1280, 2560, 10, 401, true),
-            (true, true, 1280, 2560, 10, 511, true),
-            (true, true, 1280, 2560, 10, 529, true),
+        // (exact_gfx1151, m, k, x_row_div, tokens, expected)
+        for (gfx1151, m, k, row_div, tokens, want) in [
+            (false, 1280, 2560, 10, 200, false),
+            (true, 2560, 2560, 10, 200, false),
+            (true, 1280, 640, 10, 200, false),
+            (true, 1280, 2560, 1, 200, false),
+            (true, 1280, 2560, 10, 8, false),
+            (true, 1280, 2560, 10, 9, true),
+            (true, 1280, 2560, 10, 145, true),
+            (true, 1280, 2560, 10, 401, true),
+            (true, 1280, 2560, 10, 511, true),
+            (true, 1280, 2560, 10, 529, true),
         ] {
             assert_eq!(
-                qwen4_moe_gateup_twin_applies(enabled, gfx1151, m, k, row_div, tokens),
+                qwen4_moe_gateup_twin_applies(gfx1151, m, k, row_div, tokens),
                 want,
-                "enabled={enabled} gfx1151={gfx1151} m={m} k={k} x_row_div={row_div} tokens={tokens}",
+                "gfx1151={gfx1151} m={m} k={k} x_row_div={row_div} tokens={tokens}",
             );
         }
     }
@@ -57151,21 +56895,19 @@ mod route_selector_tests {
     }
 
     /// The gfx1100 HC `input_mix_down` fill tile: exact gfx1100, M == 320,
-    /// K % 64 == 0, kill switch off the route; its entry is the
+    /// K % 64 == 0; its entry is the
     /// `LdsTile::entry()` of the 80 x 32 / 80 x 16 k64 pipelined tile, two
     /// waves, 4 x 24 workgroups at N = 768 (192 waves, five chains per wave).
     #[test]
     fn hc_mix_fill80_gfx1100_predicate_and_geometry() {
         for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx942"] {
-            for enabled in [false, true] {
-                for m in [1, 80, 319, 320, 321, 400, 640] {
-                    for k in [64, 2560, 10240, 10241, 10304] {
-                        assert_eq!(
-                            hc_mix_fill80_gfx1100_selected(arch, enabled, m, k),
-                            enabled && arch == "gfx1100" && m == 320 && k % 64 == 0,
-                            "{arch} enabled={enabled} m={m} k={k}"
-                        );
-                    }
+            for m in [1, 80, 319, 320, 321, 400, 640] {
+                for k in [64, 2560, 10240, 10241, 10304] {
+                    assert_eq!(
+                        hc_mix_fill80_gfx1100_selected(arch, m, k),
+                        arch == "gfx1100" && m == 320 && k % 64 == 0,
+                        "{arch} m={m} k={k}"
+                    );
                 }
             }
         }
@@ -58597,28 +58339,27 @@ mod mq6_resid_pm_gfx1100_selection {
             (10240, Some(8)),
             (12288, Some(8)),
         ] {
-            assert_eq!(pick("gfx1100", 6, 768, m, true), want, "m={m}");
+            assert_eq!(pick("gfx1100", 6, 768, m), want, "m={m}");
         }
     }
 
     #[test]
     fn only_where_hipcc_selects_mw8() {
-        assert_eq!(pick("gfx1100", 6, 463, 10240, true), None);
-        assert_eq!(pick("gfx1100", 6, 416, 10240, true), None);
-        assert_eq!(pick("gfx1100", 6, 464, 10240, true), Some(8));
-        assert_eq!(pick("gfx1100", 6, 464, 2560, true), Some(4));
+        assert_eq!(pick("gfx1100", 6, 463, 10240), None);
+        assert_eq!(pick("gfx1100", 6, 416, 10240), None);
+        assert_eq!(pick("gfx1100", 6, 464, 10240), Some(8));
+        assert_eq!(pick("gfx1100", 6, 464, 2560), Some(4));
     }
 
     #[test]
-    fn kill_switch_other_bits_and_other_arches_unchanged() {
-        assert_eq!(pick("gfx1100", 6, 768, 10240, false), None);
+    fn other_bits_and_other_arches_unchanged() {
         for bits in [3u8, 4, 5] {
-            assert_eq!(pick("gfx1100", bits, 768, 10240, true), None, "bits={bits}");
+            assert_eq!(pick("gfx1100", bits, 768, 10240), None, "bits={bits}");
         }
         for arch in [
             "gfx1151", "gfx1150", "gfx1152", "gfx1201", "gfx942", "gfx1101",
         ] {
-            assert_eq!(pick(arch, 6, 768, 10240, true), None, "{arch}");
+            assert_eq!(pick(arch, 6, 768, 10240), None, "{arch}");
         }
     }
 }
@@ -58647,7 +58388,7 @@ mod mq6_resid_port_gfx1100_selection {
             (10240, 2560, Some(W8N256)),
             (12288, 2560, Some(W8N256)),
         ] {
-            assert_eq!(geom("gfx1100", 6, N, m, k, true), want, "m={m}");
+            assert_eq!(geom("gfx1100", 6, N, m, k), want, "m={m}");
         }
     }
 
@@ -58656,114 +58397,77 @@ mod mq6_resid_port_gfx1100_selection {
         // hipcc picks MW8 from N >= 464, MW4 for 416..=463 and no MW below 416.
         for n in [1, 64, 415, 416, 417, 463] {
             for m in [2560, 6143, 6144, 12288] {
-                assert_eq!(geom("gfx1100", 6, n, m, 2560, true), None, "n={n} m={m}");
-                assert_eq!(
-                    route("gfx1100", 6, n, m, 2560, true, true),
-                    None,
-                    "n={n} m={m}"
-                );
+                assert_eq!(geom("gfx1100", 6, n, m, 2560), None, "n={n} m={m}");
+                assert_eq!(route("gfx1100", 6, n, m, 2560), None, "n={n} m={m}");
             }
         }
         for n in [464, 465, 768, 1536, 16896] {
-            assert_eq!(
-                geom("gfx1100", 6, n, 10240, 2560, true),
-                Some(W8N256),
-                "n={n}"
-            );
-            assert_eq!(
-                geom("gfx1100", 6, n, 2560, 6144, true),
-                Some(W4N128),
-                "n={n}"
-            );
-            assert_eq!(geom("gfx1100", 6, n, 48, 2560, true), None, "n={n}");
+            assert_eq!(geom("gfx1100", 6, n, 10240, 2560), Some(W8N256), "n={n}");
+            assert_eq!(geom("gfx1100", 6, n, 2560, 6144), Some(W4N128), "n={n}");
+            assert_eq!(geom("gfx1100", 6, n, 48, 2560), None, "n={n}");
         }
     }
 
-    /// Every (port, PM) switch combination at every M class: port -> PM twin -> hipcc MW8.
+    /// Port -> PM twin -> hipcc MW8 at every M class.
     #[test]
-    fn precedence_for_every_flag_combination() {
+    fn precedence_port_then_pm_then_mw8() {
         type R = Option<Mq6ResidGfx1100Route>;
-        for (m, k, port_on, pm_on, want) in [
-            // M >= 6144 (w8n256 / PM w8)
-            (10240usize, 2560usize, true, true, Some(Port(W8N256))),
-            (10240, 2560, true, false, Some(Port(W8N256))),
-            (10240, 2560, false, true, Some(Pm(8))),
-            (10240, 2560, false, false, None),
-            (6144, 2560, true, true, Some(Port(W8N256))),
-            (6144, 2560, false, true, Some(Pm(8))),
-            (6144, 2560, false, false, None),
-            (12288, 2560, true, false, Some(Port(W8N256))),
-            (12288, 2560, false, true, Some(Pm(8))),
-            // 2560 <= M < 6144 (w4n128 / PM w4)
-            (6143, 2560, true, true, Some(Port(W4N128))),
-            (6143, 2560, true, false, Some(Port(W4N128))),
-            (6143, 2560, false, true, Some(Pm(4))),
-            (6143, 2560, false, false, None),
-            (2560, 6144, true, true, Some(Port(W4N128))),
-            (2560, 6144, true, false, Some(Port(W4N128))),
-            (2560, 6144, false, true, Some(Pm(4))),
-            (2560, 6144, false, false, None),
-            // M < 2560 (ba): hipcc MW8 under every combination
-            (2559, 2560, true, true, None),
-            (2559, 2560, false, true, None),
-            (640, 2560, true, true, None),
-            (48, 2560, true, true, None),
-            (48, 2560, true, false, None),
-            (48, 2560, false, true, None),
-            (48, 2560, false, false, None),
+        for (m, k, want) in [
+            // M >= 6144 (w8n256)
+            (10240usize, 2560usize, Some(Port(W8N256))),
+            (6144, 2560, Some(Port(W8N256))),
+            (12288, 2560, Some(Port(W8N256))),
+            // Weight extent over 2^31 bytes: the port refuses, the PM twin takes it.
+            (12288, 262144, Some(Pm(8))),
+            // 2560 <= M < 6144 (w4n128)
+            (6143, 2560, Some(Port(W4N128))),
+            (2560, 6144, Some(Port(W4N128))),
+            // M < 2560 (ba): hipcc MW8
+            (2559, 2560, None),
+            (640, 2560, None),
+            (48, 2560, None),
         ] {
-            let got: R = route("gfx1100", 6, N, m, k, port_on, pm_on);
-            assert_eq!(got, want, "m={m} port={port_on} pm={pm_on}");
+            let got: R = route("gfx1100", 6, N, m, k);
+            assert_eq!(got, want, "m={m} k={k}");
         }
     }
 
     #[test]
     fn other_bits_arches_and_k_are_unchanged() {
         for bits in [2u8, 3, 4, 5, 8] {
-            assert_eq!(
-                geom("gfx1100", bits, N, 10240, 2560, true),
-                None,
-                "bits={bits}"
-            );
-            assert_eq!(
-                route("gfx1100", bits, N, 10240, 2560, true, true),
-                None,
-                "bits={bits}"
-            );
+            assert_eq!(geom("gfx1100", bits, N, 10240, 2560), None, "bits={bits}");
+            assert_eq!(route("gfx1100", bits, N, 10240, 2560), None, "bits={bits}");
         }
         for arch in [
             "gfx1151", "gfx1150", "gfx1152", "gfx1201", "gfx942", "gfx1101", "gfx906", "",
         ] {
-            assert_eq!(geom(arch, 6, N, 10240, 2560, true), None, "{arch}");
-            assert_eq!(route(arch, 6, N, 10240, 2560, true, true), None, "{arch}");
+            assert_eq!(geom(arch, 6, N, 10240, 2560), None, "{arch}");
+            assert_eq!(route(arch, 6, N, 10240, 2560), None, "{arch}");
         }
         for k in [1, 255, 257, 2559, 2561] {
-            assert_eq!(geom("gfx1100", 6, N, 10240, k, true), None, "k={k}");
-            assert_eq!(route("gfx1100", 6, N, 10240, k, true, true), None, "k={k}");
+            assert_eq!(geom("gfx1100", 6, N, 10240, k), None, "k={k}");
+            assert_eq!(route("gfx1100", 6, N, 10240, k), None, "k={k}");
         }
         // k == 0 is never the port (the launchers return before launching, as before).
-        assert_eq!(geom("gfx1100", 6, N, 10240, 0, true), None);
-        assert_eq!(geom("gfx1100", 6, N, 0, 2560, true), None);
-        assert_eq!(geom("gfx1100", 6, 0, 10240, 2560, true), None);
+        assert_eq!(geom("gfx1100", 6, N, 10240, 0), None);
+        assert_eq!(geom("gfx1100", 6, N, 0, 2560), None);
+        assert_eq!(geom("gfx1100", 6, 0, 10240, 2560), None);
     }
 
     /// The raw buffer descriptors carry 31-bit byte offsets; shapes that do not fit keep the
-    /// incumbent (and, with the PM twin on, the PM twin, which has its own admission).
+    /// incumbent (and the PM twin, which has its own admission).
     #[test]
     fn extents_that_exceed_31_bits_keep_the_incumbent() {
         // fp16 X: n * k * 2 < 2^31.
         let n_ok = ((1usize << 31) - 1) / (2 * 2560);
-        assert_eq!(geom("gfx1100", 6, n_ok, 10240, 2560, true), Some(W8N256));
-        assert_eq!(geom("gfx1100", 6, n_ok + 1, 10240, 2560, true), None);
-        assert_eq!(
-            route("gfx1100", 6, n_ok + 1, 10240, 2560, true, true),
-            Some(Pm(8))
-        );
+        assert_eq!(geom("gfx1100", 6, n_ok, 10240, 2560), Some(W8N256));
+        assert_eq!(geom("gfx1100", 6, n_ok + 1, 10240, 2560), None);
+        assert_eq!(route("gfx1100", 6, n_ok + 1, 10240, 2560), Some(Pm(8)));
         // MQ6 weights: m * (k / 256) * 200 < 2^31.
         let m_ok = ((1usize << 31) - 1) / (10 * 200);
-        assert_eq!(geom("gfx1100", 6, N, m_ok, 2560, true), Some(W8N256));
-        assert_eq!(geom("gfx1100", 6, N, m_ok + 1, 2560, true), None);
-        assert_eq!(geom("gfx1100", 6, N, usize::MAX / 4, 2560, true), None);
+        assert_eq!(geom("gfx1100", 6, N, m_ok, 2560), Some(W8N256));
+        assert_eq!(geom("gfx1100", 6, N, m_ok + 1, 2560), None);
+        assert_eq!(geom("gfx1100", 6, N, usize::MAX / 4, 2560), None);
     }
 
     #[test]

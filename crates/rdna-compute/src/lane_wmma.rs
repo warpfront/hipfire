@@ -6,7 +6,7 @@
 //! dense BF16 `[rows, k]` projections at 16..=64 rows (the decode / lane / verify window),
 //! for BF16 weights and planar W8 weights (int8 widened to BF16 exactly, the per-32 scale
 //! applied in the f32 epilogue). The same kernels also serve the sub-512-row prefill forward above
-//! 64 rows ([`Gpu::lane_wmma_gemm_prefill`], `HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE`) with a
+//! 64 rows ([`Gpu::lane_wmma_gemm_prefill`]) with a
 //! split-K pinned per `(m, k)`, so each row's bytes do not depend on the call's row count.
 //!
 //! Kernels: `kernels/src/qwen4_lane_wmma.gfx1201.hip`.
@@ -26,7 +26,7 @@
 //! so outputs are NOT bitwise the SIMT route's; they are deterministic run to run.
 //!
 //! This module reads no environment variable. The product routes are gated by
-//! `HIPFIRE_QWEN4_LANE_WMMA` (see `Gpu::lane_wmma_applies`); the lab-only prefill W8 twins and the Q8_0
+//! `Gpu::lane_wmma_applies` (exact gfx1201); the lab-only prefill W8 twins and the Q8_0
 //! repack live in [`crate::lane_wmma_lab`].
 
 use crate::dispatch::ReplayLaunchBindings;

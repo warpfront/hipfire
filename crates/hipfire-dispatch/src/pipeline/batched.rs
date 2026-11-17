@@ -1889,7 +1889,6 @@ pub fn mq_f16_projection_fast_route(
         // The PM FP8 verify scope never takes an F16-input projection route.
         && !gpu.fp8_verify_scope
         && gpu.arch_caps.supports_dflash_f16_projection_fusions()
-        && !gpu.flags.mq_f16_projection_off
         && n >= 1
         && n <= 16
         && dim % 256 == 0
@@ -1904,7 +1903,7 @@ pub fn mq_f16_projection_fast_route(
 /// post-attention/down hooks.
 ///
 /// True only for the frozen fixture route: chain verify on exact
-/// gfx1100 or exact gfx1201, the slice kill switch clear, an MQ4G256V2 residual consumer, a
+/// gfx1100 or exact gfx1201, an MQ4G256V2 residual consumer, a
 /// `Residual` epilogue, and a verify-block batch `1 <= n <= 16`. Every false
 /// keeps the pre-change path byte-for-byte.
 pub fn s4_residual_fast(
@@ -1918,7 +1917,6 @@ pub fn s4_residual_fast(
         // The PM FP8 verify scope keeps the F32 producer + FP8 residual GEMM
         // (batched == singleton by construction; no F16-input residual GEMM).
         && !gpu.fp8_verify_scope
-        && !gpu.flags.mq_f16_residual_off
         && gpu.arch_caps.supports_dflash_f16_residual_fusions()
         && w_dtype == DType::MQ4G256V2
         && matches!(epilogue, BatchEpilogue::Residual)

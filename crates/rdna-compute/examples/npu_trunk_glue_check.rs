@@ -306,13 +306,13 @@ fn pack_checks(gpu: &mut Gpu, k: usize, n512: bool, xp: &[u16], ap: &[i8], dp: &
                         hipcc += loop_ms(gpu, 64, &mut h);
                     }
                 }
-                // The product entry point (HIPFIRE_NPU_TRUNK_PACK_A_PM decides hipcc or PM): process-level A/B by running the
-                // example with and without the kill switch.
+                // The product entry point: the PM twin for K 2560 / 5120 on gfx1151.
                 let product = loop_ms(gpu, 256, |g| {
                     g.npu_trunk_pack_a_bf16(&x, rows, layout, &a, &d).unwrap()
                 });
-                println!("pack_product k={k} n512={n512} rows={rows} product_ms={product:.5} (256 launches; HIPFIRE_NPU_TRUNK_PACK_A_PM={})",
-                    std::env::var("HIPFIRE_NPU_TRUNK_PACK_A_PM").unwrap_or_else(|_| "unset".into()));
+                println!(
+                    "pack_product k={k} n512={n512} rows={rows} product_ms={product:.5} (256 launches)"
+                );
                 let (hipcc, pm) = (hipcc / 4.0, pm / 4.0);
                 println!("pack_pm_vs_hipcc k={k} n512={n512} rows={rows} hipcc_ms={hipcc:.5} pm_ms={pm:.5} pm/hipcc={:.4} (ABBA 4x64 launches)", pm / hipcc);
                 let traffic = (rows * k * 2 + layout.a_bytes() + rows * 4) as f64;

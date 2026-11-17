@@ -1057,7 +1057,6 @@ fn strict_dispatch(
     rows: usize,
     position_start: usize,
     reference: Qwen4VerifyReference,
-    split_enabled: bool,
     label: &str,
 ) -> QsaDecodeAttentionPolicy {
     let p = IndexedAttentionAttentionBatch {
@@ -1083,14 +1082,13 @@ fn strict_dispatch(
         Some(reference),
         "{label}: reference scope"
     );
-    let expected =
-        if reference == Qwen4VerifyReference::Eager && split_enabled && gpu.arch == "gfx1151" {
-            QsaDecodeAttentionPolicy::SplitKvQ8 {
-                splits: QSA_DECODE_SPLITK_SPLITS,
-            }
-        } else {
-            QsaDecodeAttentionPolicy::PerHead
-        };
+    let expected = if reference == Qwen4VerifyReference::Eager && gpu.arch == "gfx1151" {
+        QsaDecodeAttentionPolicy::SplitKvQ8 {
+            splits: QSA_DECODE_SPLITK_SPLITS,
+        }
+    } else {
+        QsaDecodeAttentionPolicy::PerHead
+    };
     for row in 0..rows {
         assert_eq!(
             qsa_decode_attention_policy_for_row_for_test(gpu, &p, row),
@@ -1137,14 +1135,13 @@ fn strict_production_fixture(
     cfg: &BatchCfg,
     seed: u64,
     reference: Qwen4VerifyReference,
-    split_enabled: bool,
 ) {
     const ROWS: usize = 64;
     const GUARD: usize = 64;
     const Q_ROW: usize = 2 * NH * HD;
     const O_ROW: usize = NH * HD;
     let label = format!(
-        "arch={} seed={seed:#x} mode={reference:?} split={split_enabled} {} ps={} c={} budget={} cap={}",
+        "arch={} seed={seed:#x} mode={reference:?} {} ps={} c={} budget={} cap={}",
         gpu.arch, cfg.name, cfg.position_start, cfg.compress, cfg.budget, cfg.capacity,
     );
     assert!(cfg.position_start > 0);
@@ -1191,7 +1188,6 @@ fn strict_production_fixture(
             1,
             cfg.position_start + r,
             reference,
-            split_enabled,
             &format!("{label} singleton row={r}"),
         );
         let bytes = gpu
@@ -1260,7 +1256,6 @@ fn strict_production_fixture(
             rows,
             cfg.position_start,
             reference,
-            split_enabled,
             &candidate_label,
         );
         let terminal = gpu
@@ -1326,7 +1321,6 @@ fn qsa_splitk_q8_batched_rows_bitwise_individual_wide() {
     );
     let prior_rows = gpu.set_wide_verify_rows(64);
     let prior_reference = gpu.qwen4_verify_reference();
-    let prior_flags = gpu.flags.clone();
     // Restore host scope even if a candidate refusal/mismatch panics.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert_eq!(gpu.few_row_limit(), 64, "strict candidate was not admitted");
@@ -1335,48 +1329,36 @@ fn qsa_splitk_q8_batched_rows_bitwise_individual_wide() {
             let keys = gpu.download_raw_bytes(&dev.keys).expect("cache K S0");
             let values = gpu.download_raw_bytes(&dev.values).expect("cache V S0");
             assert!(keys.iter().any(|&b| b != 0) && values.iter().any(|&b| b != 0));
-            for split_enabled in [true, false] {
-                let mut flags = (*prior_flags).clone();
-                flags.qwen4_qsa_decode_splitk = split_enabled;
-                gpu.flags = std::sync::Arc::new(flags);
-                for reference in [Qwen4VerifyReference::Eager, Qwen4VerifyReference::Recorded] {
-                    gpu.set_qwen4_verify_reference(Some(reference));
-                    for compress in [1, 4, 8] {
-                        for residue in 0..compress {
-                            // Nonzero initial prefix in every fixture; all compress residues.
-                            let start = 16 * compress + residue;
-                            for (name, position_start, budget, capacity) in [
-                                ("empty-short", start, 0, 16),
-                                ("short-budget", start, 1, 16),
-                                ("capacity-max", start, HUGE, 64),
-                                ("lds-boundary", 8184 + residue, HUGE, 8256),
-                            ] {
-                                let cfg = BatchCfg {
-                                    name,
-                                    compress,
-                                    budget,
-                                    position_start,
-                                    capacity,
-                                };
-                                strict_production_fixture(
-                                    &mut gpu,
-                                    &dev,
-                                    &cfg,
-                                    seed,
-                                    reference,
-                                    split_enabled,
-                                );
-                                assert_raw_equal(
-                                    &gpu.download_raw_bytes(&dev.keys).expect("cache K final"),
-                                    &keys,
-                                    "immutable K cache S0",
-                                );
-                                assert_raw_equal(
-                                    &gpu.download_raw_bytes(&dev.values).expect("cache V final"),
-                                    &values,
-                                    "immutable V cache S0",
-                                );
-                            }
+            for reference in [Qwen4VerifyReference::Eager, Qwen4VerifyReference::Recorded] {
+                gpu.set_qwen4_verify_reference(Some(reference));
+                for compress in [1, 4, 8] {
+                    for residue in 0..compress {
+                        // Nonzero initial prefix in every fixture; all compress residues.
+                        let start = 16 * compress + residue;
+                        for (name, position_start, budget, capacity) in [
+                            ("empty-short", start, 0, 16),
+                            ("short-budget", start, 1, 16),
+                            ("capacity-max", start, HUGE, 64),
+                            ("lds-boundary", 8184 + residue, HUGE, 8256),
+                        ] {
+                            let cfg = BatchCfg {
+                                name,
+                                compress,
+                                budget,
+                                position_start,
+                                capacity,
+                            };
+                            strict_production_fixture(&mut gpu, &dev, &cfg, seed, reference);
+                            assert_raw_equal(
+                                &gpu.download_raw_bytes(&dev.keys).expect("cache K final"),
+                                &keys,
+                                "immutable K cache S0",
+                            );
+                            assert_raw_equal(
+                                &gpu.download_raw_bytes(&dev.values).expect("cache V final"),
+                                &values,
+                                "immutable V cache S0",
+                            );
                         }
                     }
                 }
@@ -1385,7 +1367,6 @@ fn qsa_splitk_q8_batched_rows_bitwise_individual_wide() {
             gpu.free_tensor(dev.values).expect("free cache V");
         }
     }));
-    gpu.flags = prior_flags;
     gpu.set_qwen4_verify_reference(prior_reference);
     gpu.set_wide_verify_rows(prior_rows);
     if let Err(panic) = result {

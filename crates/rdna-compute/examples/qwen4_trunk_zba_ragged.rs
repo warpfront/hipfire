@@ -79,21 +79,6 @@ fn main() {
     gpu.mq4v2_symmetric = true;
     gpu.qwen4_trunk_iu4 = true;
     gpu.qwen4_trunk_iu4_prefill_scope = true;
-    // Resolve the production flag exactly once, without changing env or spawning.
-    let disabled =
-        hipfire_config::developer_var("HIPFIRE_QWEN4_TRUNK_IU4_RAGGED").as_deref() == Ok("0");
-    if disabled {
-        assert_eq!(gpu.qwen4_trunk_iu4_ragged(8186), None);
-        let report =
-            json!({"pass": true, "kill_switch": true, "admission_checks": true, "cases": []});
-        let text = report.to_string();
-        if let Some(out) = arg("--json") {
-            std::fs::write(out, &text).expect("write json");
-        }
-        println!("{text}");
-        gpu.free_tensor(fold).expect("free fold");
-        return;
-    }
     let capture = arg("--act").map(|p| {
         let raw = std::fs::read(p).expect("activation file");
         assert_eq!(raw.len() % (K * 4), 0, "activation row size");
@@ -204,7 +189,7 @@ fn main() {
     gpu.free_tensor(fold).expect("free fold");
     let seconds = start.elapsed().as_secs_f64();
     pass &= seconds < 90.0;
-    let report = json!({"pass": pass, "layer": layer, "kill_switch": false,
+    let report = json!({"pass": pass, "layer": layer,
         "admission_checks": true, "seconds": seconds, "cases": reports});
     let text = report.to_string();
     if let Some(out) = arg("--json") {

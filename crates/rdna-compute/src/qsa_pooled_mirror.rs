@@ -34,21 +34,14 @@ const THREADS: usize = 256;
 /// Elements per thread of both kernels.
 const PER_THREAD: usize = 4;
 
-/// The same switch `tensor_ops` reads for the PM score kernels
-/// (`HIPFIRE_QWEN4_QSA_SCORE_PM`, on unless `0`): the mirror is only consumed
-/// by the PM BF16 score kernel, so it is not admitted without it.
-static QWEN4_QSA_SCORE_PM: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SCORE_PM", true));
-
 /// Load-time admission, no GPU launch: the switch is on
 /// (`HIPFIRE_QWEN4_QSA_POOLED_BF16` / `attention.qwen4_qsa_pooled_bf16`,
 /// `FeatureFlags::qwen4_qsa_pooled_bf16`, on unless `0`), exact gfx1151,
 /// F32 QSA state, `index_dim` 128, and the builder BF16 score module
-/// (`kernels::QSA_SELECT_BF16_PM_GFX1151`, the PM scorer's switch on) exists.
+/// (`kernels::QSA_SELECT_BF16_PM_GFX1151`, the mirror's only consumer) exists.
 pub fn qsa_pooled_bf16_mirror_enabled(gpu: &Gpu, format: QsaKvFormat, index_dim: usize) -> bool {
     qsa_pooled_bf16_mirror_admits(
         gpu.flags.qwen4_qsa_pooled_bf16,
-        *QWEN4_QSA_SCORE_PM,
         !crate::kernels::QSA_SELECT_BF16_PM_GFX1151.is_empty(),
         gpu.arch_caps.is_gfx1151(),
         format,
@@ -58,14 +51,12 @@ pub fn qsa_pooled_bf16_mirror_enabled(gpu: &Gpu, format: QsaKvFormat, index_dim:
 
 fn qsa_pooled_bf16_mirror_admits(
     switch: bool,
-    score_pm: bool,
     module: bool,
     gfx1151: bool,
     format: QsaKvFormat,
     index_dim: usize,
 ) -> bool {
     switch
-        && score_pm
         && module
         && gfx1151
         && format == QsaKvFormat::F32
@@ -412,29 +403,13 @@ mod tests {
     #[test]
     fn admission_requires_every_condition() {
         let f32f = QsaKvFormat::F32;
-        assert!(qsa_pooled_bf16_mirror_admits(
-            true, true, true, true, f32f, 128
-        ));
+        assert!(qsa_pooled_bf16_mirror_admits(true, true, true, f32f, 128));
+        assert!(!qsa_pooled_bf16_mirror_admits(false, true, true, f32f, 128));
+        assert!(!qsa_pooled_bf16_mirror_admits(true, false, true, f32f, 128));
+        assert!(!qsa_pooled_bf16_mirror_admits(true, true, false, f32f, 128));
+        assert!(!qsa_pooled_bf16_mirror_admits(true, true, true, f32f, 64));
+        assert!(!qsa_pooled_bf16_mirror_admits(true, true, true, f32f, 256));
         assert!(!qsa_pooled_bf16_mirror_admits(
-            false, true, true, true, f32f, 128
-        ));
-        assert!(!qsa_pooled_bf16_mirror_admits(
-            true, false, true, true, f32f, 128
-        ));
-        assert!(!qsa_pooled_bf16_mirror_admits(
-            true, true, false, true, f32f, 128
-        ));
-        assert!(!qsa_pooled_bf16_mirror_admits(
-            true, true, true, false, f32f, 128
-        ));
-        assert!(!qsa_pooled_bf16_mirror_admits(
-            true, true, true, true, f32f, 64
-        ));
-        assert!(!qsa_pooled_bf16_mirror_admits(
-            true, true, true, true, f32f, 256
-        ));
-        assert!(!qsa_pooled_bf16_mirror_admits(
-            true,
             true,
             true,
             true,
@@ -442,7 +417,6 @@ mod tests {
             128
         ));
         assert!(!qsa_pooled_bf16_mirror_admits(
-            true,
             true,
             true,
             true,

@@ -4,8 +4,7 @@
 //
 // Re-scheduled twins of the Qwen4 decode BF16 rows GEMVs
 // (`gemv_bf16_xf32_k4_rows_r<R>` and `gemv_bf16_xf32_x4_rows_r<R>` of
-// qwen4_gemv_bf16_xf32.hip; module `qwen4_gemv_bf16_xf32_otile`,
-// `HIPFIRE_QWEN4_BF16_ROWS_OTILE`, default off).
+// qwen4_gemv_bf16_xf32.hip; module `qwen4_gemv_bf16_xf32_otile`, routed on exact gfx1201).
 //
 // The per-(row, output) arithmetic is the incumbent's, verbatim: per
 // 256-element group lane l owns bf16 [8l, 8l + 8), chains a0..a3 take
@@ -14,8 +13,7 @@
 // 16, 8, 4, 2, 1 tree (k4: quarter fold (q0 + q1) + (q2 + q3) and the
 // `hc_act` epilogue). The expressions are the incumbent's text, so the
 // compiler contracts them the same way; which wave computes which output and
-// when its loads issue is free. `otile_bf16_rows_oracle` proves every output
-// word equal on real weights.
+// when its loads issue is free.
 //
 // What changes is the load schedule and the tiling:
 //  * NO outputs per wave share every X load (k4 ships NO = 2: X traffic, ~16x

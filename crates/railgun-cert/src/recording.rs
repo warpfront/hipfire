@@ -989,7 +989,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "gfx1100-f16-projection-fast-route",
         predicates: &[IsRecording, CaptureMode],
-        condition: "mq_f16_projection_fast_route: chain verify && gfx1100 && 1 <= n <= 16 && dim % 256 == 0 && !fp8_verify_scope && !mq_f16_projection_off; capture/recording additionally requires ChainVerifySplit and preloaded partial/merge/preconvert kernels with sufficient existing Q16 scratch (prefill.rs:5806-5818; attention.rs:7912-7924)",
+        condition: "mq_f16_projection_fast_route: chain verify && gfx1100 && 1 <= n <= 16 && dim % 256 == 0 && !fp8_verify_scope; capture/recording additionally requires ChainVerifySplit and preloaded partial/merge/preconvert kernels with sufficient existing Q16 scratch (prefill.rs:5806-5818; attention.rs:7912-7924)",
         effect: KernelSelection,
         switches: "eager and admitted split capture/recording: fused_rmsnorm_rotate_mq[_awq]_f16_batched + *_mq4g256v2_wmma_f16; other recorded windows: F32 producer + convert_f32_to_f16 + base *_mq4g256v2_wmma",
         kernels: &["fused_rmsnorm_rotate_mq*_f16_batched", "gemm_*_mq4g256v2_wmma_f16", "convert_f32_to_f16"],
@@ -1394,7 +1394,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "select-regrid-row-selectors",
         predicates: &[IsRecording],
-        condition: "select_regrid_enabled: (exact gfx1201 || exact gfx1151 || exact gfx1100) && !select_regrid_off && !is_recording() (select_regrid.rs:64-70), consulted by the batched top-K and argmax selectors (sampling.rs:129, 838) and the developer online draft tuner (dflash_online.rs)",
+        condition: "select_regrid_enabled: (exact gfx1201 || exact gfx1151 || exact gfx1100) && !is_recording() (select_regrid.rs:64-70), consulted by the batched top-K and argmax selectors (sampling.rs:129, 838) and the developer online draft tuner (dflash_online.rs)",
         effect: KernelSelection,
         switches: "eager or HipGraph: select_regrid 1024-thread row selectors (+ topk_values_tie_exact_f32 on tied rows); recorded: topk_values_batched_f32 / argmax_f32_batched",
         kernels: &["topk_values_batched_f32", "argmax_f32_batched"],

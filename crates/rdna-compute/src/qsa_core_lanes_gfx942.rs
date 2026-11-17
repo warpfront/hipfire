@@ -503,12 +503,12 @@ mod tests {
     #[test]
     fn gfx942_attention_policy_is_per_head() {
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlags::for_test("gfx942"));
-        let caps = crate::arch_caps::ArchCaps::new("gfx942", flags.clone());
+        let caps = crate::arch_caps::ArchCaps::new("gfx942", flags);
         for format in [QsaKvFormat::F32, QsaKvFormat::Fp8Fnuz] {
             for eager in [true, false] {
                 assert_eq!(
                     super::super::qsa_decode_attention_policy_with(
-                        &flags, &caps, format, 256, 24, 2, 2051, eager,
+                        &caps, format, 256, 24, 2, 2051, eager,
                     ),
                     QsaDecodeAttentionPolicy::PerHead,
                     "{format:?} eager={eager}"

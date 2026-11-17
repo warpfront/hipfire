@@ -3,8 +3,8 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte oracle + timing of the packed-epilogue MQ6G256V2 few-row kernels
-//! (`gemm_mq6g256v2_f32_rows[_x4]_pk_r{R}_w{W}_s{S}`, `HIPFIRE_QWEN4_MQ6_R8_PK`,
-//! default off) against the incumbent stream-split kernels.
+//! (`gemm_mq6g256v2_f32_rows[_x4]_pk_r{R}_w{W}_s{S}`) against the incumbent
+//! stream-split kernels. The public launcher takes the packed route on gfx1201.
 //!
 //! ```text
 //! mq6_r8_pk_oracle            # correctness (all shapes) + timing (trunk shapes)
@@ -15,8 +15,7 @@
 //! Correctness, per shape, seed and `R` in `1..=8` (x rows include +-0, subnormal,
 //! all-zero and cancelling rows, so a `-0.0` vs `+0.0` difference shows):
 //! * reference: the decode singleton (`gemv_mq6g256v2[_x4]`) on each row alone;
-//! * `off`: the public launcher, `HIPFIRE_QWEN4_MQ6_R8_PK` off (incumbent);
-//! * `pk`: the public launcher with the flag on;
+//! * `public`: the public launcher (packed route on gfx1201);
 //! * every pk export (`R` 3..=8 x (W, S) in (4,1), (4,4), (8,4)) by symbol, and
 //!   every incumbent split export by symbol.
 //! All must equal the reference word for word; output allocations carry
@@ -209,10 +208,9 @@ fn parts_of<'a>(
     })
 }
 
-fn set_flags(gpu: &mut Gpu, pk: bool) {
+fn set_flags(gpu: &mut Gpu) {
     let f = Arc::make_mut(&mut gpu.flags);
     f.mq6_rows_split = true;
-    f.qwen4_mq6_r8_pk = pk;
 }
 
 fn sym_name(x4: bool, pk: bool, rows: usize, w: usize, s: usize) -> String {
@@ -348,30 +346,27 @@ fn run_case(gpu: &mut Gpu, case: &Case, seed: u64, st: &mut Stats) -> Result<(),
         refs.push(row);
     }
 
-    // Public launcher, flag off (incumbent) and on, rows 1..=8.
+    // Public launcher, rows 1..=8 (the packed route on gfx1201).
+    set_flags(gpu);
     for rows in 1..=MAX_R {
-        for pk in [false, true] {
-            set_flags(gpu, pk);
-            let ys = alloc_ys(gpu, ms)?;
-            let views: Vec<GpuTensor> = ys
-                .iter()
-                .zip(ms)
-                .map(|(y, m)| y.sub_offset(GUARD, rows * m))
-                .collect();
-            let xv = x.sub_offset(0, rows * k);
-            launch_public(
-                gpu,
-                case.x4,
-                parts_of(&ws, &dummy, ms, &views),
-                &xv,
-                k,
-                rows,
-            )?;
-            let tag = format!("{} seed {seed:#x} public R{rows} pk={pk}", case.name);
-            check(gpu, &ys, ms, rows, &refs, &tag, st)?;
-        }
+        let ys = alloc_ys(gpu, ms)?;
+        let views: Vec<GpuTensor> = ys
+            .iter()
+            .zip(ms)
+            .map(|(y, m)| y.sub_offset(GUARD, rows * m))
+            .collect();
+        let xv = x.sub_offset(0, rows * k);
+        launch_public(
+            gpu,
+            case.x4,
+            parts_of(&ws, &dummy, ms, &views),
+            &xv,
+            k,
+            rows,
+        )?;
+        let tag = format!("{} seed {seed:#x} public R{rows}", case.name);
+        check(gpu, &ys, ms, rows, &refs, &tag, st)?;
     }
-    set_flags(gpu, false);
 
     // Every export by symbol: incumbent split and pk.
     for rows in 3..=MAX_R {
@@ -472,6 +467,7 @@ fn time_case(gpu: &mut Gpu, case: &Case) -> Result<(), String> {
         k,
         bytes as f64 / 1e6
     );
+    set_flags(gpu);
     for rows in 1..=MAX_R {
         let xv = x.sub_offset(0, rows * k);
         let ysv: Vec<GpuTensor> = views
@@ -479,7 +475,6 @@ fn time_case(gpu: &mut Gpu, case: &Case) -> Result<(), String> {
             .zip(ms)
             .map(|(y, m)| y.sub_offset(0, rows * m))
             .collect();
-        set_flags(gpu, false);
         let us = time_us(gpu, iters, &mut |g, i| {
             launch_public(
                 g,
@@ -491,7 +486,7 @@ fn time_case(gpu: &mut Gpu, case: &Case) -> Result<(), String> {
             )
         })?;
         println!(
-            "TIME {shape} R={rows} incumbent_public us={us:.2} GBps={:.0}",
+            "TIME {shape} R={rows} public us={us:.2} GBps={:.0}",
             gbps(us)
         );
         if rows < 3 {
@@ -511,22 +506,6 @@ fn time_case(gpu: &mut Gpu, case: &Case) -> Result<(), String> {
                 );
             }
         }
-        set_flags(gpu, true);
-        let us = time_us(gpu, iters, &mut |g, i| {
-            launch_public(
-                g,
-                case.x4,
-                parts_of(&sets[i % copies], &dummy, ms, &ysv),
-                &xv,
-                k,
-                rows,
-            )
-        })?;
-        println!(
-            "TIME {shape} R={rows} pk_public us={us:.2} GBps={:.0}",
-            gbps(us)
-        );
-        set_flags(gpu, false);
     }
     Ok(())
 }

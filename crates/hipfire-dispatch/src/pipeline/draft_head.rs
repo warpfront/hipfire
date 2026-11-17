@@ -794,7 +794,7 @@ impl DraftHead {
         }
         let (ranked, order) = ranking(self.front, self.special, self.vocab, full_steps);
         let ranking_head = self.copy.as_ref().unwrap_or(head);
-        if ranking_head.dtype == DType::MQ2G256V2 && gpu.mq2_xbatch_pm_active(ranked, self.hidden) {
+        if ranking_head.dtype == DType::MQ2G256V2 && gpu.mq2_xbatch_pm_covers(ranked, self.hidden) {
             // The gfx1201 PeaceMaker x-batch module at one row: the bytes of
             // the one-row GEMV (`mq2_xbatch_oracle`), the rotated input left in
             // `self.rotation` exactly as `project_weight` leaves it.
@@ -874,7 +874,7 @@ impl DraftHead {
         let copy = self.copy.as_ref().expect("MQ2 ranking copy");
         let (lo, m) = shard_range(ranked, shard.rank);
         let first = shard.claim(1)?;
-        let pm = gpu.mq2_xbatch_pm_active(ranked, self.hidden);
+        let pm = gpu.mq2_xbatch_pm_covers(ranked, self.hidden);
         if m > 0 && !pm {
             let half = copy_rows(copy, self.hidden, lo, m)?;
             project_weight(
