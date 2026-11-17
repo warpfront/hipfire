@@ -1213,6 +1213,13 @@ pub struct DriverFloor {
     /// Verified-row counts (bit `rows`, 0 = AR token, saturating at 127)
     /// already observed on this load: see [`Self::first_use`].
     warm_rows: u128,
+    /// The load's last wall-clock floor request on this route ended retired
+    /// with speculation measured losing: the next wall-clock request reaches
+    /// its first verdict after [`crate::spec_economics::FLOOR_PROBE_WINDOWS`]
+    /// priced windows ([`crate::spec_economics::Floor::set_fixed_carry`]).
+    /// Seeded (price-clock) requests neither read nor write it; a route-key
+    /// change clears it.
+    pub carry_losing: bool,
 }
 
 impl DriverFloor {
@@ -1229,7 +1236,18 @@ impl DriverFloor {
             },
             prices: crate::spec_prices::LoadPrices::new(full_rows),
             warm_rows: 0,
+            carry_losing: false,
         }
+    }
+
+    /// Install the AR route of the coming request
+    /// ([`crate::spec_prices::LoadPrices::set_route`]); a different key clears
+    /// the carry with the AR prices and pins.
+    pub fn set_route(&mut self, key: crate::spec_prices::ArRouteKey) {
+        if self.prices.route() != Some(key) {
+            self.carry_losing = false;
+        }
+        self.prices.set_route(key);
     }
 
     /// `true` the first time a window of `rows` verified rows (0: an AR

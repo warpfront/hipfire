@@ -4499,6 +4499,12 @@ struct SpecFloorRun {
     observed_wall_us: f64,
     observed_priced_us: f64,
     retired_at: Option<usize>,
+    /// Speculative windows the wall-clock floor priced (warm, AR priced).
+    priced_windows: usize,
+    /// The load's carry this request read at start (wall clock only).
+    carry: bool,
+    /// The load's carry this request wrote at its end (wall clock only).
+    carry_next: Option<bool>,
 }
 
 impl SpecFloorRun {
@@ -4521,13 +4527,17 @@ impl SpecFloorRun {
             observed_wall_us: 0.0,
             observed_priced_us: 0.0,
             retired_at: None,
+            priced_windows: 0,
+            carry: false,
+            carry_next: None,
         }
     }
 
     /// Request start: reset the floor and price AR from the load (wall
-    /// clock: own bucket, else nearest; with none, the floor's own two-token
-    /// calibration runs) or from the pinned snapshot (price clock).
-    fn start(&self, df: &mut hipfire_runtime::spec::DriverFloor, ctx: usize) {
+    /// clock: own bucket, else nearest; with none, no AR price until the
+    /// probe set runs) or from the pinned snapshot (price clock). The wall
+    /// clock reads the load's carry; the price clock never does (C6).
+    fn start(&mut self, df: &mut hipfire_runtime::spec::DriverFloor, ctx: usize) {
         match self.policy {
             SpecFloorPolicy::Floor => {
                 df.floor
@@ -4535,6 +4545,8 @@ impl SpecFloorRun {
                 if let Some(ar_us) = df.prices.ar_price(ctx) {
                     df.floor.calibrate_from(ar_us);
                 }
+                self.carry = df.carry_losing;
+                df.floor.set_fixed_carry(self.carry);
             }
             SpecFloorPolicy::CountsPinned(pinned) => {
                 df.floor.reset_fixed(0);
@@ -4542,6 +4554,28 @@ impl SpecFloorRun {
             }
             SpecFloorPolicy::Off | SpecFloorPolicy::CountsLine(_) => {}
         }
+    }
+
+    /// Request end: a wall-clock request with at least
+    /// [`FLOOR_PROBE_WINDOWS`] priced windows writes the load's carry: set
+    /// when it ended retired with its realized speculative µs per token
+    /// above `ar_us × (1 + FIXED_HYSTERESIS)`, cleared otherwise. The price
+    /// clock leaves it alone (C6).
+    ///
+    /// [`FLOOR_PROBE_WINDOWS`]: hipfire_runtime::spec_economics::FLOOR_PROBE_WINDOWS
+    fn finish(&mut self, df: &mut hipfire_runtime::spec::DriverFloor) {
+        use hipfire_runtime::spec_economics::{FIXED_HYSTERESIS, FLOOR_PROBE_WINDOWS};
+        if self.policy != SpecFloorPolicy::Floor || self.priced_windows < FLOOR_PROBE_WINDOWS {
+            return;
+        }
+        let line = df.floor.ar_us() * (1.0 + FIXED_HYSTERESIS);
+        let losing = df.floor.retired()
+            && df
+                .floor
+                .fixed_spec_us_per_token()
+                .is_some_and(|us| us > line);
+        df.carry_losing = losing;
+        self.carry_next = Some(losing);
     }
 
     /// The loop mark of the next window: observe the previous window with
@@ -4597,6 +4631,9 @@ impl SpecFloorRun {
             _ => us,
         };
         self.observed_windows += 1;
+        self.priced_windows += usize::from(
+            matches!(self.policy, SpecFloorPolicy::Floor) && !ar && !cold && df.floor.calibrated(),
+        );
         self.cold_windows += usize::from(cold);
         self.observed_wall_us += f64::from(us);
         self.observed_priced_us += f64::from(priced);
@@ -4692,6 +4729,11 @@ impl SpecFloorRun {
             report["cold_windows"] = serde_json::json!(self.cold_windows);
             report["observed_wall_us"] = serde_json::json!(round(self.observed_wall_us));
             report["observed_priced_us"] = serde_json::json!(round(self.observed_priced_us));
+            if self.policy == SpecFloorPolicy::Floor {
+                report["carry"] = serde_json::json!(self.carry);
+                report["carry_next"] = serde_json::json!(df.carry_losing);
+                report["carry_written"] = serde_json::json!(self.carry_next.is_some());
+            }
         }
         report
     }
@@ -4988,6 +5030,143 @@ mod spec_floor_driver_tests {
         assert_eq!(report["policy"], "floor");
         assert_eq!(report["rearms"], 1);
         assert_eq!(report["observed_windows"], 4);
+    }
+
+    /// One scripted request on `df`: `loops` loop marks, each speculative
+    /// window settling 2 tokens in `window_ms(i)` (i counts speculative
+    /// windows), each AR token 20 ms, against a load AR price of 20 ms (the
+    /// pinned 20 ms / 75 ms on the price clock). The request ends with
+    /// [`SpecFloorRun::finish`]. Returns the run and, at its first
+    /// retirement, the priced speculative windows and the speculative
+    /// windows observed.
+    fn scripted(
+        df: &mut DriverFloor,
+        policy: SpecFloorPolicy,
+        loops: usize,
+        window_ms: impl Fn(usize) -> u64,
+    ) -> (SpecFloorRun, Option<(usize, usize)>) {
+        let mut run = SpecFloorRun::new(policy, None);
+        run.start(df, 100);
+        if policy == SpecFloorPolicy::Floor {
+            df.floor.calibrate_from(20_000.0);
+        }
+        let mut now = Instant::now();
+        let mut retired_after = None;
+        let mut spec = 0;
+        for _ in 0..loops {
+            let (retired, _) = run.mark(df, now, marker(0));
+            if retired.is_some() && retired_after.is_none() {
+                retired_after = Some((run.priced_windows, spec));
+            }
+            let action = run.plan(df, 15);
+            if matches!(action, Action::Native(_)) {
+                now += Duration::from_millis(window_ms(spec));
+                spec += 1;
+                run.window_done(action, 2, 16, 100, 102, true, &[1, 2]);
+            } else {
+                now += Duration::from_millis(20);
+                run.window_done(action, 1, 0, 100, 101, true, &[1]);
+            }
+        }
+        run.finish(df);
+        (run, retired_after)
+    }
+
+    /// 75 ms per 2 tokens against 20 ms per AR token.
+    const LOSING_MS: u64 = 75;
+    /// 30 ms per 2 tokens against 20 ms per AR token.
+    const WINNING_MS: u64 = 30;
+
+    fn priced_at(retired: Option<(usize, usize)>) -> Option<usize> {
+        retired.map(|(priced, _)| priced)
+    }
+
+    /// A load whose last wall-clock request ended retired and losing.
+    fn carried() -> DriverFloor {
+        let mut df = logged_driver();
+        let (first, retired) = scripted(&mut df, SpecFloorPolicy::Floor, 40, |_| LOSING_MS);
+        assert!(!first.carry);
+        assert_eq!(
+            priced_at(retired),
+            Some(hipfire_runtime::spec_economics::FIXED_MIN_PRICED_WINDOWS)
+        );
+        assert!(df.carry_losing, "a losing retired request sets the carry");
+        assert_eq!(first.report(Some(&df))["carry_next"], true);
+        df
+    }
+
+    #[test]
+    fn carry_retires_the_next_losing_request_after_three_priced_windows() {
+        let mut df = carried();
+        let (run, retired) = scripted(&mut df, SpecFloorPolicy::Floor, 40, |_| LOSING_MS);
+        assert!(run.carry);
+        assert_eq!(
+            priced_at(retired),
+            Some(hipfire_runtime::spec_economics::FLOOR_PROBE_WINDOWS)
+        );
+        let report = run.report(Some(&df));
+        assert_eq!(report["carry"], true);
+        assert_eq!(report["carry_next"], true);
+        assert!(df.carry_losing);
+    }
+
+    #[test]
+    fn carry_never_retires_a_winning_request_and_the_win_clears_it() {
+        let mut df = carried();
+        let (run, retired) = scripted(&mut df, SpecFloorPolicy::Floor, 60, |_| WINNING_MS);
+        assert!(run.carry);
+        assert_eq!(retired, None);
+        assert_eq!(run.retires, 0);
+        assert_eq!(run.probe_tokens, 0);
+        assert!(!df.carry_losing, "a winning request clears the carry");
+        assert_eq!(run.report(Some(&df))["carry_next"], false);
+        // The next losing request is back on the full minimum.
+        let (_, retired) = scripted(&mut df, SpecFloorPolicy::Floor, 40, |_| LOSING_MS);
+        assert_eq!(
+            priced_at(retired),
+            Some(hipfire_runtime::spec_economics::FIXED_MIN_PRICED_WINDOWS)
+        );
+    }
+
+    #[test]
+    fn carry_whose_fresh_windows_win_first_falls_back_to_eight() {
+        let mut df = carried();
+        let ms = |i: usize| if i < 3 { WINNING_MS } else { 3 * LOSING_MS };
+        let (_, retired) = scripted(&mut df, SpecFloorPolicy::Floor, 60, ms);
+        assert!(priced_at(retired)
+            .is_some_and(|at| at >= hipfire_runtime::spec_economics::FIXED_MIN_PRICED_WINDOWS));
+    }
+
+    #[test]
+    fn route_key_change_clears_the_carry() {
+        use hipfire_runtime::spec_prices::ArRouteKey;
+        let mut df = carried();
+        df.set_route(ArRouteKey::new(2, true));
+        df.carry_losing = true;
+        df.set_route(ArRouteKey::new(2, true));
+        assert!(df.carry_losing, "the same key keeps it");
+        df.set_route(ArRouteKey::new(0, false));
+        assert!(!df.carry_losing);
+    }
+
+    #[test]
+    fn seeded_requests_neither_read_nor_write_the_carry() {
+        let pin = SpecFloorPolicy::CountsPinned(pinned());
+        let full = hipfire_runtime::spec_economics::FIXED_MIN_PRICED_WINDOWS;
+        // No carry: the pinned prices lose, retiring after the full minimum.
+        let mut plain = logged_driver();
+        let (run, retired) = scripted(&mut plain, pin, 20, |_| WINNING_MS);
+        assert_eq!(retired.map(|(_, spec)| spec), Some(full));
+        assert!(!plain.carry_losing, "a losing seeded request never sets it");
+        assert!(run.carry_next.is_none());
+        // Carry set: identical decisions, and the carry is left alone.
+        let mut df = carried();
+        let (run, retired) = scripted(&mut df, pin, 20, |_| WINNING_MS);
+        assert!(!run.carry && run.carry_next.is_none());
+        assert_eq!(retired.map(|(_, spec)| spec), Some(full));
+        assert_eq!(run.probe_tokens, 0);
+        assert!(df.carry_losing, "a seeded request never clears it");
+        assert!(run.report(Some(&df)).get("carry").is_none());
     }
 }
 
@@ -5660,7 +5839,7 @@ pub fn generate_spec(
         .flatten();
     let (floor_owner, floor_pinned) = match spec.floor_control() {
         hipfire_runtime::spec::FloorControl::Driver(df) => {
-            df.prices.set_route(spec_floor_route_key(gpu));
+            df.set_route(spec_floor_route_key(gpu));
             (FloorOwner::Driver, df.prices.pinned(position))
         }
         hipfire_runtime::spec::FloorControl::Producer => (FloorOwner::Producer, None),
@@ -6493,7 +6672,10 @@ pub fn generate_spec(
 
     // The last window is never observed (no next mark).
     let floor_report = (floor_owner == FloorOwner::Driver).then(|| match spec.floor_control() {
-        hipfire_runtime::spec::FloorControl::Driver(df) => floor_run.report(Some(df)),
+        hipfire_runtime::spec::FloorControl::Driver(df) => {
+            floor_run.finish(df);
+            floor_run.report(Some(df))
+        }
         _ => floor_run.report(None),
     });
     // Snapshot the emitter's state needed by the post-loop bookkeeping before

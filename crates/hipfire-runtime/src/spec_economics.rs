@@ -2207,6 +2207,13 @@ struct FixedState {
     /// Decayed (settled tokens, verified rows) of the windows observed while
     /// AR has no price.
     yield_rows: (f32, f32),
+    /// The load's last wall-clock request ended retired and losing
+    /// ([`Floor::set_fixed_carry`]): the first verdict of this request comes
+    /// after [`FLOOR_PROBE_WINDOWS`] priced windows instead of
+    /// [`FIXED_MIN_PRICED_WINDOWS`]. Cleared by the first verdict that does
+    /// not probe, so a request whose fresh windows are not losing continues
+    /// under the 8-window rule.
+    carry: bool,
 }
 
 impl FixedFloor {
@@ -2232,7 +2239,9 @@ impl FixedFloor {
 ///   after [`FLOOR_PROBE_WINDOWS`] windows, the decayed settled count is at
 ///   most [`FIXED_SUSPECT_YIELD`] of the decayed verified rows does the probe
 ///   set run; its mean prices AR and the floor decides.
-/// - No verdict before [`FIXED_MIN_PRICED_WINDOWS`] priced windows of the epoch. A
+/// - No verdict before [`FIXED_MIN_PRICED_WINDOWS`] priced windows of the epoch
+///   ([`FLOOR_PROBE_WINDOWS`] for the first verdict while the load's carry is
+///   set, [`Self::set_fixed_carry`]). A
 ///   window with first-use cost ([`FloorObservation::cold`]) is observed but
 ///   never priced or counted; a cold AR token is never priced.
 /// - Losing: both memories above `ar_us × (1 + FIXED_HYSTERESIS)`; a tie
@@ -2325,6 +2334,22 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         self.start_fixed_epoch();
         if let Some(log) = self.call_log {
             log.emit("rearm_fixed", self.id, format_args!("{}", self.after()));
+        }
+    }
+
+    /// The load's carry for this request (call after [`Self::reset_fixed`],
+    /// which clears it): `true` when the load's last wall-clock request
+    /// ended retired with speculation measured losing. While set, the first
+    /// verdict needs [`FLOOR_PROBE_WINDOWS`] priced windows, and still needs
+    /// both fresh memories losing.
+    pub fn set_fixed_carry(&mut self, carry: bool) {
+        self.fixed.carry = carry;
+        if let Some(log) = self.call_log {
+            log.emit(
+                "set_fixed_carry",
+                self.id,
+                format_args!(",\"carry\":{carry}{}", self.after()),
+            );
         }
     }
 
@@ -2513,9 +2538,14 @@ impl<const W: usize, const E: usize> Floor<W, E> {
     }
 
     fn decide_fixed(&mut self) {
+        let min_windows = if self.fixed.carry {
+            FLOOR_PROBE_WINDOWS
+        } else {
+            FIXED_MIN_PRICED_WINDOWS
+        };
         if self.retired
             || !self.calibrated
-            || self.observed < FIXED_MIN_PRICED_WINDOWS
+            || self.observed < min_windows
             || self.probing()
             || self.probe_left > 0
         {
@@ -2523,11 +2553,13 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         }
         if !valid_us(self.ar_us) {
             self.retired = true;
+            self.fixed.carry = false;
             return;
         }
         let line = self.ar_us * (1.0 + FIXED_HYSTERESIS);
         let loses = |(us, tokens): (f32, f32)| us > line * tokens;
         if !(loses(self.combined) && loses(self.slow)) {
+            self.fixed.carry = false;
             return;
         }
         if self.should_probe() {
@@ -2537,6 +2569,7 @@ impl<const W: usize, const E: usize> Floor<W, E> {
             return;
         }
         self.retired = true;
+        self.fixed.carry = false;
         self.fixed.allowance = 0.0;
     }
 }
@@ -2764,6 +2797,10 @@ fn replay_call<const W: usize, const E: usize>(
         }
         "rearm_fixed" => {
             floor.rearm_fixed();
+            None
+        }
+        "set_fixed_carry" => {
+            floor.set_fixed_carry(json_bool(value, "carry")?);
             None
         }
         "reset_request" => {
@@ -10226,6 +10263,7 @@ mod fixed_floor_tests {
         }
         floor.reset_fixed(PROBES);
         floor.calibrate_from(22.5);
+        floor.set_fixed_carry(true);
         for i in 0..200 {
             step(&mut floor, 1 + i % 3, 70.0, 22.5);
         }
@@ -10236,6 +10274,7 @@ mod fixed_floor_tests {
             "\"op\":\"plan_fixed\"",
             "\"op\":\"observe_fixed\"",
             "\"op\":\"rearm_fixed\"",
+            "\"op\":\"set_fixed_carry\"",
             "\"ret\":\"Ar\"",
             "\"ret\":\"ArSample\"",
             "\"ret\":\"Batched:15\"",
@@ -10253,5 +10292,59 @@ mod fixed_floor_tests {
             "{:?}",
             report.floors[0].first_mismatch
         );
+    }
+
+    /// Actions of `steps` planned windows, each settling `settled(i)` tokens
+    /// in `us(i)`, with AR at [`AR`].
+    fn schedule(
+        carry: bool,
+        steps: usize,
+        settled: impl Fn(usize) -> usize,
+        us: impl Fn(usize) -> f32,
+    ) -> Vec<Action> {
+        let mut floor = calibrated(0);
+        floor.set_fixed_carry(carry);
+        (0..steps)
+            .map(|i| step(&mut floor, settled(i), us(i), AR))
+            .collect()
+    }
+
+    #[test]
+    fn carry_retires_a_losing_request_after_the_probe_windows() {
+        let mut floor = calibrated(0);
+        floor.set_fixed_carry(true);
+        for _ in 0..FLOOR_PROBE_WINDOWS - 1 {
+            assert_eq!(step(&mut floor, 4, 200.0, AR), native());
+            assert!(!floor.retired());
+        }
+        assert_eq!(step(&mut floor, 4, 200.0, AR), native());
+        assert!(
+            floor.retired(),
+            "3 fresh losing windows retire under the carry"
+        );
+        // Without the carry the same windows wait for the full minimum.
+        let plain = schedule(false, FIXED_MIN_PRICED_WINDOWS + 1, |_| 4, |_| 200.0);
+        assert_eq!(plain[..FIXED_MIN_PRICED_WINDOWS], [native(); 8]);
+        assert_eq!(plain[FIXED_MIN_PRICED_WINDOWS], Action::ArHeadFree);
+    }
+
+    #[test]
+    fn carry_with_winning_fresh_windows_changes_nothing() {
+        // 4 tokens per 80 µs (20 per token against 25): never retires.
+        let with = schedule(true, 64, |_| 4, |_| 80.0);
+        assert_eq!(with, schedule(false, 64, |_| 4, |_| 80.0));
+        assert!(with.iter().all(|&a| a == native()));
+    }
+
+    #[test]
+    fn carry_whose_first_windows_win_falls_back_to_the_full_minimum() {
+        // Three winning windows, then losing ones: the carry is spent on the
+        // non-losing verdict at window 3, so the schedule equals the plain
+        // 8-window one.
+        let us = |i: usize| if i < FLOOR_PROBE_WINDOWS { 80.0 } else { 400.0 };
+        let with = schedule(true, 40, |_| 4, us);
+        assert_eq!(with, schedule(false, 40, |_| 4, us));
+        let first_ar = with.iter().position(|&a| a != native());
+        assert!(first_ar.is_some_and(|at| at >= FIXED_MIN_PRICED_WINDOWS));
     }
 }
