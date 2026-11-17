@@ -461,7 +461,7 @@ pub fn analyze_with(
     let mut analysis = HazardAnalysis::default();
     match arch {
         Arch::Gfx1200 | Arch::Gfx1201 => run_sgpr_model(body, arch, wave, model, &mut analysis)?,
-        Arch::Gfx1100 | Arch::Gfx1151 => run_gfx11(body, arch, &mut analysis),
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 => run_gfx11(body, arch, &mut analysis),
         _ => return Err(HazardError::Unsupported(arch, wave)),
     }
     run_wmma(body, arch, &mut analysis);

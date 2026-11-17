@@ -190,7 +190,7 @@ pub(super) fn field(form: Form, name: &str) -> Option<Field> {
     layout(form).iter().copied().find(|f| f.name == name)
 }
 pub(super) fn field_for(arch: Arch, form: Form, name: &str) -> Option<Field> {
-    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151) {
+    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150) {
         super::forms_gfx11::field(form, name)
     } else {
         field(form, name)
@@ -217,7 +217,7 @@ pub(super) fn opcode(form: Form) -> Option<Field> {
     })
 }
 pub(super) fn opcode_for(arch: Arch, form: Form) -> Option<Field> {
-    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151) {
+    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150) {
         super::forms_gfx11::opcode(form)
     } else {
         opcode(form)
@@ -246,7 +246,7 @@ pub(super) fn prefix(form: Form) -> Option<(u32, u32)> {
     })
 }
 pub(super) fn prefix_for(arch: Arch, form: Form) -> Option<(u32, u32)> {
-    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151) {
+    if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150) {
         super::forms_gfx11::prefix(form)
     } else {
         prefix(form)

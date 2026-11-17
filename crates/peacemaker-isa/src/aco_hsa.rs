@@ -516,6 +516,7 @@ impl AcoHipContract {
         let arch = match str_of(t, "arch")? {
             "gfx1100" => IrArch::Gfx1100,
             "gfx1151" => IrArch::Gfx1151,
+            "gfx1150" => IrArch::Gfx1150,
             "gfx1201" => IrArch::Gfx1201,
             o => return Err(AcoError::Contract(format!("target.arch {o:?}"))),
         };

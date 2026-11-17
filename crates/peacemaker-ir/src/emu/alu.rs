@@ -172,7 +172,7 @@ const DEFAULT_NAN: u32 = 0xffc0_0000;
 /// `v_subrev_f32`/`v_dual_sub_f32` (measured, see the `lanes` arms); `v_dual_subrev_f32` is in no object and no probe.
 /// gfx1151 takes the default NaN (as its measured `v_sub_f32` sibling), every other arch keeps the hard error.
 fn fin_invalid(arch: Arch, x: f32) -> Result<u32> {
-    if x.is_nan() && arch == Arch::Gfx1151 {
+    if x.is_nan() && matches!(arch, Arch::Gfx1151 | Arch::Gfx1150) {
         Ok(DEFAULT_NAN)
     } else {
         fin(x)
@@ -187,7 +187,7 @@ const NAN_MOD: &str =
 /// Architectures whose raw v2 edge tables prove the NaN/default-NaN/signed-zero/divide rules shared by the helpers
 /// below (see the module comment). Anything else keeps the documented hard errors.
 fn edge_qualified(arch: Arch) -> bool {
-    matches!(arch, Arch::Gfx1151 | Arch::Gfx1201)
+    matches!(arch, Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201)
 }
 
 fn is_snan(bits: u32) -> bool {
@@ -642,7 +642,7 @@ fn out_f32(arch: Arch, bits: u32, i: &Inst) -> Result<u32> {
     if m.omod != Omod::None {
         match arch {
             // RDNA3: OMOD is ignored when output denormals are enabled.
-            Arch::Gfx1100 | Arch::Gfx1151 => {}
+            Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 => {}
             Arch::Gfx1201 => {
                 if x.is_nan() {
                     return Err("OMOD on a NaN result: payload not specified".into());
@@ -703,7 +703,7 @@ fn num_select(a: u32, b: u32, max: bool) -> u32 {
 /// in source order), two quiet NaNs give `a`, one quiet NaN loses to the number. Other arches: NaN is an error
 /// (the behavior depends on MODE.IEEE and is not measured there).
 fn legacy_select(arch: Arch, a: u32, b: u32, max: bool) -> Result<u32> {
-    if arch != Arch::Gfx1151 {
+    if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1150) {
         let (fa, fb) = (num(a)?, num(b)?);
         return Ok(if if max { max_gt(fa, fb) } else { min_lt(fa, fb) } {
             a
@@ -1751,7 +1751,7 @@ fn vector(
         }
         "v_exp_f32" | "v_rcp_f32" | "v_rcp_iflag_f32" | "v_log_f32" | "v_rsq_f32"
         | "v_sqrt_f32" => {
-            if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1201) {
+            if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201) {
                 return Err(format!("unqualified numerical architecture {arch:?}"));
             }
             let model = match stem(name) {

@@ -79,7 +79,7 @@ use tables::{
 #[inline]
 fn qualify(arch: Arch, func: &str) {
     match arch {
-        Arch::Gfx1151 | Arch::Gfx1201 => {}
+        Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201 => {}
         other => {
             panic!("emu::trans::{func}: {other:?} is not qualified (only Gfx1151 and Gfx1201)")
         }

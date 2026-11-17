@@ -535,7 +535,7 @@ fn abi_obligations(
     }
     // gfx11's enabled system inputs occupy ordinary SGPRs even if the code
     // never reads them. gfx12 workgroup IDs occupy TTMPs, not this budget.
-    let entry_sgprs = if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151) {
+    let entry_sgprs = if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150) {
         let rsrc2 = descriptor.compute_pgm_rsrc2.0;
         (rsrc2 >> 1 & 0x1f) + (7..=10).filter(|bit| rsrc2 >> bit & 1 != 0).count() as u32
     } else {
@@ -757,7 +757,7 @@ pub fn lower_labels(body: &Body, arch: Arch) -> Result<Vec<Inst>, EditError> {
 pub fn encode_stream(body: &Body, arch: Arch) -> Result<Vec<u32>, EditError> {
     if !matches!(
         arch,
-        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1200 | Arch::Gfx1201
     ) {
         return Err(EditError::Unsupported(format!("no codec for {arch:?}")));
     }
@@ -1222,7 +1222,7 @@ fn entry_cell_dword(cell: EntryCell) -> usize {
 fn entry_seed(kern: &Kernel, arch: Arch) -> Result<Bits, EditError> {
     if !matches!(
         arch,
-        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1200 | Arch::Gfx1201
     ) {
         return Err(EditError::Unsupported(format!(
             "no ABI entry table for {arch:?}"

@@ -39,7 +39,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         "v_dot4_i32_iu8" | "v_dot8_i32_iu4" => {
             // GFX1201 and GFX1151 probes (NEG_LO[2], NEG_HI[0] varied): they have no effect on the integer dots;
             // unmeasured elsewhere.
-            if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1201)
+            if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201)
                 && (m.neg_lo & 4 != 0 || m.neg_hi != 0)
             {
                 return Err(format!("{name}: NEG[2]/NEG_HI are undefined for integer dots and unmeasured on {arch:?}"));
@@ -76,7 +76,7 @@ pub(super) fn execute(arch: Arch, name: &str, i: &Inst, s: &mut State) -> Result
         }
         "v_dot2_f32_f16" | "v_dot2_f32_bf16" => {
             // gfx1201 and gfx1151 have a probed model (mma::dot2_f32 documents the receipts); gfx1100 refuses.
-            if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1201) {
+            if !matches!(arch, Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201) {
                 return Err(format!("{name} on {arch:?}: no probed floating-point dot model; refusing to approximate"));
             }
             // op_sel[2] / op_sel_hi[2] (the f32 C operand) were never varied: only the defaults are modeled.
