@@ -1188,9 +1188,10 @@ pub trait Speculator {
 /// ([`crate::spec_economics::replay_call_log`]).
 pub const DRIVER_FLOOR_CALL_PREFIX: &str = "QWEN35_DFLASH_FLOOR_CALL";
 
-/// AR tokens a losing driver-floor verdict takes to re-price AR where the
-/// request is (the [`DriverFloor`] probe set).
-pub const DRIVER_FLOOR_PROBE_TOKENS: usize = 4;
+/// AR tokens of the driver floor's calibration probe on an unpriced load
+/// (the first two follow a speculative window and are never priced, so it
+/// leaves the four AR samples a pin needs).
+pub const DRIVER_FLOOR_PROBE_TOKENS: usize = 6;
 
 /// Who decides, per window, whether a request speculates or runs an AR token.
 pub enum FloorControl<'a> {
@@ -1213,18 +1214,11 @@ pub struct DriverFloor {
     /// Verified-row counts (bit `rows`, 0 = AR token, saturating at 127)
     /// already observed on this load: see [`Self::first_use`].
     warm_rows: u128,
-    /// The load's last wall-clock floor request on this route ended retired
-    /// with speculation measured losing: the next wall-clock request reaches
-    /// its first verdict after [`crate::spec_economics::FLOOR_PROBE_WINDOWS`]
-    /// priced windows ([`crate::spec_economics::Floor::set_fixed_carry`]).
-    /// Seeded (price-clock) requests neither read nor write it; a route-key
-    /// change clears it.
-    pub carry_losing: bool,
 }
 
 impl DriverFloor {
-    /// A floor for a load whose full block verifies `full_rows` rows, taking
-    /// `probe_tokens` AR probes at a losing verdict. `call_log` writes the
+    /// A floor for a load whose full block verifies `full_rows` rows, whose
+    /// calibration probe runs `probe_tokens` AR tokens. `call_log` writes the
     /// floor's exact call log ([`DRIVER_FLOOR_CALL_PREFIX`]) on stderr.
     pub fn new(full_rows: usize, probe_tokens: usize, call_log: bool) -> Self {
         let floor = crate::spec_economics::FixedFloor::fixed(probe_tokens);
@@ -1236,24 +1230,12 @@ impl DriverFloor {
             },
             prices: crate::spec_prices::LoadPrices::new(full_rows),
             warm_rows: 0,
-            carry_losing: false,
         }
-    }
-
-    /// Install the AR route of the coming request
-    /// ([`crate::spec_prices::LoadPrices::set_route`]); a different key clears
-    /// the carry with the AR prices and pins.
-    pub fn set_route(&mut self, key: crate::spec_prices::ArRouteKey) {
-        if self.prices.route() != Some(key) {
-            self.carry_losing = false;
-        }
-        self.prices.set_route(key);
     }
 
     /// `true` the first time a window of `rows` verified rows (0: an AR
     /// token) is observed on this load: it carries the width's or route's
-    /// first-use cost and is observed unpriced
-    /// ([`crate::spec_economics::FloorObservation::cold`]).
+    /// first-use cost and is never recorded as a load price.
     pub fn first_use(&mut self, rows: usize) -> bool {
         let bit = 1u128 << rows.min(127);
         let first = self.warm_rows & bit == 0;

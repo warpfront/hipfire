@@ -38,9 +38,13 @@
 //! forced advance (two tokens), `S` / `A` spec windows / AR tokens until the
 //! decode reaches `SPEC_FLOOR_HW_TOKENS`, default 256):
 //!
-//! - `s3,a4,S`: the floor's probe set (spec ×3 → AR ×4 → spec);
-//! - `s1,a50,s1,A`: a retirement with one scout (spec → AR ×50 → spec ×1 → AR);
-//! - `s3,a4,s1,a20,s6,F,s2,A` and its reverse `F,a2,s2,a20,s1,a4,s3,S`;
+//! - `s3,a6,S`: the floor's calibration probe (spec ×3 → AR ×6 → spec);
+//! - `s8,A`: a retirement at the 8-window checkpoint, no re-entry inside the
+//!   request;
+//! - `s8,a200,s3,A`: a retirement, a re-entry epoch after the AR gap
+//!   (shortened to 200 to fit the decode) and a second retirement at its
+//!   3-window checkpoint;
+//! - `s3,a6,s1,a20,s6,F,s2,A` and its reverse `F,a2,s2,a20,s1,a6,s3,S`;
 //! - `A`: pure AR; `R` (one per schedule with an `F`): pure AR with that
 //!   schedule's think-close forced advances at the same decode indices, the
 //!   (e) reference of every arm of that schedule (a forced close changes the
@@ -50,7 +54,7 @@
 //!
 //! ```text
 //! SPEC_FLOOR_HW_PROMPT=benchmarks/prompts/prose_river_short.txt \
-//! SPEC_FLOOR_HW_OPS=s3,a4,S SPEC_FLOOR_HW_OUT=<dir>/<arm>.trace \
+//! SPEC_FLOOR_HW_OPS=s3,a6,S SPEC_FLOOR_HW_OUT=<dir>/<arm>.trace \
 //! cargo test --release -p hipfire-generate --test spec_floor_schedule_hw -- \
 //!   --ignored --exact qwen35_dflash_floor_schedule_arm
 //! ```
@@ -75,15 +79,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The floor's schedules and the forced-advance interleavings, pure AR last.
-const SCHEDULES: [&str; 5] = [
-    "s3,a4,S",
-    "s1,a50,s1,A",
-    "s3,a4,s1,a20,s6,F,s2,A",
-    "F,a2,s2,a20,s1,a4,s3,S",
+const SCHEDULES: [&str; 6] = [
+    "s3,a6,S",
+    "s8,A",
+    "s8,a200,s3,A",
+    "s3,a6,s1,a20,s6,F,s2,A",
+    "F,a2,s2,a20,s1,a6,s3,S",
     "A",
 ];
 /// The sabotage arm: the probe-set schedule, AR token 2 fed a wrong seed.
-const SABOTAGE: (&str, usize) = ("s3,a4,S", 2);
+const SABOTAGE: (&str, usize) = ("s3,a6,S", 2);
 const PROMPTS: usize = 4;
 const DEFAULT_TOKENS: usize = 256;
 
@@ -957,20 +962,23 @@ fn spec_floor_schedule_verdict() {
 fn spec_floor_schedule_arm_catalog() {
     let all = arms();
     let names: Vec<&str> = all.iter().map(|(o, _)| o.as_str()).collect();
-    assert!(names.contains(&"s3,a4,A"));
-    assert!(names.contains(&"s1,a50,A"));
-    assert!(names.contains(&"s3,a4,s1,a20,A"));
+    assert!(names.contains(&"s3,a6,A"));
+    assert!(names.contains(&"s8,a200,A"));
+    assert!(names.contains(&"s3,a6,s1,a20,A"));
     assert!(names.contains(&"F,a2,s2,a20,A"));
-    assert!(names.contains(&"F,a2,s2,a20,s1,a4,A"));
-    assert!(names.contains(&"s3,f4,S"));
-    assert!(names.contains(&"F,f2,s2,f20,s1,f4,s3,S"));
+    assert!(names.contains(&"F,a2,s2,a20,s1,a6,A"));
+    assert!(names.contains(&"s3,f6,S"));
+    assert!(names.contains(&"s8,f200,s3,A"));
+    assert!(names.contains(&"F,f2,s2,f20,s1,f6,s3,S"));
     // `F,a2` follows a forced advance, not spec: no boundary arm.
     assert!(!names.contains(&"F,a2,A"));
+    // `s8,A` scripts no AR count: no boundary or oracle arm.
+    assert_eq!(names.iter().filter(|n| n.starts_with("s8,A")).count(), 1);
     let mirrors: Vec<_> = all.iter().filter(|(o, _)| o == "R").collect();
     assert_eq!(mirrors.len(), 2, "one mirrored pure-AR arm per F schedule");
-    assert_eq!(close_family("F,a2,s2,a20,A"), Some(SCHEDULES[3]));
-    assert_eq!(close_family("s3,f4,s1,f20,s6,F,s2,A"), Some(SCHEDULES[2]));
-    assert_eq!(close_family("s3,a4,s1,a20,A"), None);
+    assert_eq!(close_family("F,a2,s2,a20,A"), Some(SCHEDULES[4]));
+    assert_eq!(close_family("s3,f6,s1,f20,s6,F,s2,A"), Some(SCHEDULES[3]));
+    assert_eq!(close_family("s3,a6,s1,a20,A"), None);
     for (ops, src) in &all {
         parse_ops(ops);
         if let Some(src) = src {
