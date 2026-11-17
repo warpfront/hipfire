@@ -540,7 +540,7 @@ Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarki
 |---|---|
 | `--runs N` | Measured runs; default `5`, must be positive. |
 | `--tp N` | Tensor/expert-parallel degree for the bench daemon, `1..=64`. |
-| `-j`, `--json` | JSON report; not supported with `--exp` or `--concurrency`. |
+| `-j`, `--json` | JSON report; not supported with `--exp` or `--concurrency`. The standard bench's report adds client-side timing next to the daemon's own: `client_wall_ms` (per measured run, request send to `done` received, timed in the CLI), `client_send_ms` (each run's send offset from the first measured send), `client_tokens` (tokens per run) and `client_span_tok_s` (all measured tokens ÷ the time from the first measured send to the last `done`). `wall_tok_s` is the daemon's `tok_s` and does not see work outside the daemon's timers; `client_span_tok_s` does. |
 | `--exp` | RDNA2 kernel-variant sweep in isolated daemon processes; cannot combine with `--matrix`/`--redline`, `--json` or `--reasoning-on`. |
 | `--matrix` / `--redline` | Synthetic token-id rows; neither takes a prompt. Runs on every topology `serve` admits (single card, `--tp` / `topology.pp` PP, TP, EP; which carriers declare each axis: [multi-gpu.md](multi-gpu.md#which-carriers-declare-which-axis)) and reports the loaded `topology` ([below](#bench-matrix-topology)). `--redline` additionally selects the Redline replay backend (PM4 transport, graph AR/forward). |
 | `--pp`, `--ctx` | Comma lists for the matrix; default `128,512,2048,4096,8192,20000`. |
@@ -550,6 +550,7 @@ Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarki
 | `--ttft` | Client-side time to first token: per run, generate one token on the standard prompt and time request-send to first streamed token; reports `prompt_tokens` and TTFT. Standard path only (not with `--matrix`). |
 | `--max-tokens N` | Generated tokens per measured request: default `128` on the standard bench, `256` on the `--concurrency` `steady` shape. |
 | `--min-tokens N` | Hold EOS and stop sequences inactive until N tokens were generated (the daemon's vLLM-compatible `min_tokens`), clamped to each request's `--max-tokens`: fixed-length measured rows on a prompt the model would end early (the mq3 raw code prompt emits EOS after about 2 tokens). Unset sends no `min_tokens`. |
+| `--seed N` | Send the wire `seed` (u64) on every standard-bench generate request, warmups included. Unset sends no `seed`. The `--json` report echoes it as `seed`. |
 | `--reasoning-on` | Let a reasoning model think during the bench (off by default, because a think span usually cannot close inside the benchmark's token budget and the daemon then fails that turn closed); pair with a large enough `--max-tokens`. |
 | `--spec <m>`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq` | Same contracts as on `run`/`serve`. |
 | `--prompt-file PATH` | Read the standard-bench prompt verbatim (raw bytes); mutually exclusive with positional prompt words. |
