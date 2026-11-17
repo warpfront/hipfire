@@ -118,7 +118,6 @@ pub mod mtp_speculator;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
 #[cfg(feature = "deltanet")]
-#[cfg(feature = "deltanet")]
 pub mod serve_engine;
 /// Shared-weight host v1: typed export/import of a dense Qwen3.5 weight set
 /// as read-only POSIX-FD VMM allocations. Linux only.

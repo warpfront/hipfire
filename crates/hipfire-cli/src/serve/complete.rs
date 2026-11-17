@@ -1961,11 +1961,14 @@ pub(crate) fn validate_response_format(
         .ok_or_else(|| invalid_request!("response_format.type is required"))?;
     match ty {
         "json_object" => {
-            bail_invalid!(
-                "response_format type 'json_object' is not supported on this \
-                 serve route (no enforcement exists; only json_schema strict \
-                 output is supported)"
-            );
+            // OpenAI's permissive JSON mode: any JSON object, no schema.
+            // Enforce it with the same pre-sampling subset compiler by
+            // compiling `{"type":"object"}` — an unconstrained object is
+            // still a constraint (no prose, no array) and it is not a
+            // silent downgrade.
+            let schema = serde_json::json!({ "type": "object" });
+            validate_json_schema_subset(&schema, "$")?;
+            Ok(Some(ResponseFormat { schema, name: None }))
         }
         "json_schema" => {
             let js = value
@@ -2929,32 +2932,22 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
             "images and tools together are not supported in experimental multi-slot".to_owned(),
         );
     }
-    // `stop` is unsupported, but an EMPTY stop (`[]` or `""`) is neutral —
-    // refusing it 400s a request that asks for nothing. Only a non-empty
-    // stop is refused (matches the daemon's `stop_nonempty` rule in
-    // slots.rs so the gateway and engine agree).
-    let stop_nonempty = match body.get("stop") {
-        Some(serde_json::Value::Array(a)) => !a.is_empty(),
-        Some(serde_json::Value::String(t)) => !t.is_empty(),
-        Some(v) => !v.is_null(),
-        None => false,
-    };
-    if stop_nonempty {
-        return Err("stop sequences are not supported".to_owned());
-    }
+    // `stop` is supported on the slot engine: the emitter's streaming matcher
+    // withholds the stop bytes and ends the turn. Validate the wire shape
+    // here (string / array, count and character caps) so every route agrees
+    // on what is a 400; an empty stop remains neutral.
+    hipfire_runtime::stop_sequence::parse_stop_field(body.get("stop"))
+        .map_err(|e| e.to_string())?;
+    // logprobs/top_logprobs: the slot engine forces AR and attaches
+    // per-token values, so this is not a refusal. Re-validate here so a
+    // direct caller of this gate gets the same 400 as the HTTP path.
+    validate_logprobs_request(body).map_err(|e| e.to_string())?;
     // `min_tokens` is a daemon decode-loop control; the slot engine has none.
     if body
         .get("min_tokens")
         .is_some_and(|v| !v.is_null() && v.as_u64() != Some(0))
     {
         return Err("min_tokens is not supported".to_owned());
-    }
-    if body.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true)
-        || body
-            .get("top_logprobs")
-            .is_some_and(|value| !value.is_null())
-    {
-        return Err("logprobs are not supported".to_owned());
     }
     // Penalties are supported end-to-end on the slot engine (in-kernel
     // repeat/presence/frequency over a per-slot recent-token window, min_p in
@@ -8468,8 +8461,8 @@ mod tests {
         };
         let cases: Vec<(&str, Result<()>)> = vec![
             (
-                "experimental multi-slot does not support this request",
-                require_multi_slot_support(&serde_json::json!({"stop": ["\n"]})),
+                "invalid stop: every entry must be a string",
+                require_multi_slot_support(&serde_json::json!({"stop": [1]})),
             ),
             (
                 "top_logprobs requires logprobs to be true",
@@ -8522,9 +8515,9 @@ mod tests {
                 contract(serde_json::json!({"max_tokens": 8, "messages": [{"role": "x"}]})),
             ),
             (
-                "response_format type 'json_object' is not supported",
+                "response_format.type 'yaml' is not supported",
                 contract(serde_json::json!({
-                    "max_tokens": 8, "response_format": {"type": "json_object"}
+                    "max_tokens": 8, "response_format": {"type": "yaml"}
                 })),
             ),
             (
@@ -8618,10 +8611,27 @@ mod tests {
             }),
             "images and tools",
         );
-        err_contains(serde_json::json!({ "stop": ["\n\n"] }), "stop");
-        err_contains(serde_json::json!({ "stop": "END" }), "stop");
-        err_contains(serde_json::json!({ "logprobs": true }), "logprobs");
-        err_contains(serde_json::json!({ "top_logprobs": 5 }), "logprobs");
+        // Stop sequences are supported: both wire forms validate and pass.
+        assert!(ok(serde_json::json!({ "stop": ["\n\n"] })));
+        assert!(ok(serde_json::json!({ "stop": "END" })));
+        // Malformed stop shapes/limits are 400s with the shared parser text.
+        err_contains(serde_json::json!({ "stop": [1] }), "invalid stop");
+        err_contains(
+            serde_json::json!({ "stop": "x".repeat(65) }),
+            "invalid stop",
+        );
+        assert!(ok(serde_json::json!({ "logprobs": true })));
+        assert!(ok(
+            serde_json::json!({ "logprobs": true, "top_logprobs": 5 })
+        ));
+        err_contains(
+            serde_json::json!({ "top_logprobs": 5 }),
+            "requires logprobs",
+        );
+        err_contains(
+            serde_json::json!({ "logprobs": "yes" }),
+            "must be a boolean",
+        );
         // Non-neutral penalties are supported end-to-end on the slot engine
         // (in-kernel repeat/presence/frequency over a per-slot recent-token
         // window), so they are forwarded — no error here.
@@ -8652,14 +8662,12 @@ mod tests {
             .unwrap()
             .is_none());
 
-        // json_object → REJECTED (typed error). This serve route has no
-        // json_object enforcement; silently dropping the requested
-        // constraint and returning success would be the "silent semantic
-        // downgrade" the spec forbids (§7.1/X2). It used to pass through as
-        // None — an unconstrained 200.
-        assert!(
-            validate_response_format(Some(&serde_json::json!({"type": "json_object"}))).is_err()
-        );
+        // json_object → enforced as the permissive object schema, not
+        // dropped as None and not rejected.
+        let jf = validate_response_format(Some(&serde_json::json!({"type": "json_object"})))
+            .expect("json_object is enforced")
+            .expect("json_object produces a schema");
+        assert_eq!(jf.schema, serde_json::json!({"type": "object"}));
 
         // Valid json_schema with a simple object schema.
         let rf = validate_response_format(Some(&serde_json::json!({

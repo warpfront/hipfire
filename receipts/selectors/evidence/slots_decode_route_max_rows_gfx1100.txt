@@ -1,0 +1,71 @@
+# SLOTS_DECODE_ROUTE_MAX_ROWS (crates/hipfire-arch-qwen35/src/forward_slots.rs), gfx1100 RX 7900 XTX, 2026-11-14
+# Qwen3.6-35B-A3B-MQ4R-AWQ, hipfire serve multi-slot, 8 slots, --kv-mode q8, ctx 4096, spec off, greedy.
+# c concurrent requests x 256 tokens, 3 reps; aggregate tok/s = total tokens / wall.
+# arm a8092fe351: per-row sealed MoE + x-batch MQ4V2 GEMV admitted at 1..=8 rows (routes on).
+# arm routes=0: HIPFIRE_SLOTS_GFX1100_ROUTES=0 (batched body at every width, beta arithmetic).
+# arm cap4: routes capped at 1..=4 rows (this constant).
+## slab a8092fe351
+BENCH decode c1 rep0 tokens=256 wall=1.69s agg_tok_s=151.4
+BENCH decode c1 rep1 tokens=256 wall=1.69s agg_tok_s=151.3
+BENCH decode c1 rep2 tokens=256 wall=1.68s agg_tok_s=152.5
+BENCH decode c2 rep0 tokens=512 wall=2.34s agg_tok_s=218.7
+BENCH decode c2 rep1 tokens=512 wall=2.40s agg_tok_s=213.6
+BENCH decode c2 rep2 tokens=512 wall=2.40s agg_tok_s=213.5
+BENCH decode c4 rep0 tokens=1024 wall=3.82s agg_tok_s=268.1
+BENCH decode c4 rep1 tokens=1024 wall=3.83s agg_tok_s=267.4
+BENCH decode c4 rep2 tokens=1024 wall=3.85s agg_tok_s=266.3
+BENCH decode c5 rep0 tokens=1280 wall=5.62s agg_tok_s=228.0
+BENCH decode c5 rep1 tokens=1280 wall=5.65s agg_tok_s=226.4
+BENCH decode c5 rep2 tokens=1280 wall=5.63s agg_tok_s=227.5
+BENCH decode c6 rep0 tokens=1536 wall=6.47s agg_tok_s=237.6
+BENCH decode c6 rep1 tokens=1536 wall=6.48s agg_tok_s=236.9
+BENCH decode c6 rep2 tokens=1536 wall=6.48s agg_tok_s=236.9
+BENCH decode c8 rep0 tokens=2048 wall=8.26s agg_tok_s=248.0
+BENCH decode c8 rep1 tokens=2048 wall=8.21s agg_tok_s=249.6
+BENCH decode c8 rep2 tokens=2048 wall=8.24s agg_tok_s=248.6
+## slab routes=0
+BENCH decode c1 rep0 tokens=256 wall=2.65s agg_tok_s=96.5
+BENCH decode c1 rep1 tokens=256 wall=2.68s agg_tok_s=95.6
+BENCH decode c1 rep2 tokens=256 wall=2.66s agg_tok_s=96.2
+BENCH decode c2 rep0 tokens=512 wall=3.03s agg_tok_s=169.2
+BENCH decode c2 rep1 tokens=512 wall=3.11s agg_tok_s=164.6
+BENCH decode c2 rep2 tokens=512 wall=3.08s agg_tok_s=166.4
+BENCH decode c4 rep0 tokens=1024 wall=4.15s agg_tok_s=246.9
+BENCH decode c4 rep1 tokens=1024 wall=4.17s agg_tok_s=245.7
+BENCH decode c4 rep2 tokens=1024 wall=4.17s agg_tok_s=245.7
+BENCH decode c5 rep0 tokens=1280 wall=4.67s agg_tok_s=274.0
+BENCH decode c5 rep1 tokens=1280 wall=4.68s agg_tok_s=273.5
+BENCH decode c5 rep2 tokens=1280 wall=4.66s agg_tok_s=274.7
+BENCH decode c6 rep0 tokens=1536 wall=5.18s agg_tok_s=296.5
+BENCH decode c6 rep1 tokens=1536 wall=5.21s agg_tok_s=294.8
+BENCH decode c6 rep2 tokens=1536 wall=5.22s agg_tok_s=294.2
+BENCH decode c8 rep0 tokens=2048 wall=6.00s agg_tok_s=341.1
+BENCH decode c8 rep1 tokens=2048 wall=5.99s agg_tok_s=341.8
+BENCH decode c8 rep2 tokens=2048 wall=6.00s agg_tok_s=341.1
+## slab cap4
+BENCH decode c1 rep0 tokens=256 wall=1.67s agg_tok_s=153.6
+BENCH decode c1 rep1 tokens=256 wall=1.67s agg_tok_s=153.3
+BENCH decode c1 rep2 tokens=256 wall=1.68s agg_tok_s=152.7
+BENCH decode c2 rep0 tokens=512 wall=2.34s agg_tok_s=218.5
+BENCH decode c2 rep1 tokens=512 wall=2.40s agg_tok_s=213.4
+BENCH decode c2 rep2 tokens=512 wall=2.40s agg_tok_s=213.2
+BENCH decode c4 rep0 tokens=1024 wall=3.81s agg_tok_s=268.8
+BENCH decode c4 rep1 tokens=1024 wall=4.32s agg_tok_s=237.3
+BENCH decode c4 rep2 tokens=1024 wall=3.84s agg_tok_s=266.5
+BENCH decode c5 rep0 tokens=1280 wall=4.45s agg_tok_s=287.6
+BENCH decode c5 rep1 tokens=1280 wall=4.67s agg_tok_s=274.1
+BENCH decode c5 rep2 tokens=1280 wall=4.47s agg_tok_s=286.2
+BENCH decode c6 rep0 tokens=1536 wall=5.04s agg_tok_s=304.6
+BENCH decode c6 rep1 tokens=1536 wall=5.03s agg_tok_s=305.6
+BENCH decode c6 rep2 tokens=1536 wall=5.03s agg_tok_s=305.4
+BENCH decode c8 rep0 tokens=2048 wall=5.83s agg_tok_s=351.2
+BENCH decode c8 rep1 tokens=2048 wall=5.81s agg_tok_s=352.2
+BENCH decode c8 rep2 tokens=2048 wall=5.85s agg_tok_s=350.3
+## paged a8092fe351
+BENCH decode c8 rep0 tokens=2048 wall=7.98s agg_tok_s=256.6
+BENCH decode c8 rep1 tokens=2048 wall=8.02s agg_tok_s=255.4
+BENCH decode c8 rep2 tokens=2048 wall=8.05s agg_tok_s=254.5
+## paged cap4
+BENCH decode c8 rep0 tokens=2048 wall=5.59s agg_tok_s=366.6
+BENCH decode c8 rep1 tokens=2048 wall=5.56s agg_tok_s=368.0
+BENCH decode c8 rep2 tokens=2048 wall=5.57s agg_tok_s=367.5
