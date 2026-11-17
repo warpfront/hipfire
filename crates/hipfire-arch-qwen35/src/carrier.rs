@@ -59,14 +59,15 @@ pub(crate) fn draft_file_reserve_bytes(path: &std::path::Path) -> u64 {
     let Ok(meta) = std::fs::metadata(path) else {
         return 0;
     };
-    reserve_for_bytes(meta.len())
+    draft_reserve_for_bytes(meta.len())
 }
 
 /// The `draft_file_reserve_bytes` formula for a known byte count: file bytes +
 /// 1/8 for the expanded/AWQ tensors + 512 MiB of scratch. Split out so the
 /// bundled-trailer arm (which knows its section size without a file of its
-/// own) charges the same estimate as a sidecar file of the same size.
-fn reserve_for_bytes(file_bytes: u64) -> u64 {
+/// own) charges the same estimate as a sidecar file of the same size, and so
+/// `hipfire fit` charges a draft it has not downloaded the way the load will.
+pub fn draft_reserve_for_bytes(file_bytes: u64) -> u64 {
     file_bytes + file_bytes / 8 + (512 << 20)
 }
 
@@ -106,7 +107,7 @@ pub(crate) fn draft_device_reserve_bytes(
         }
         Some(MtpHeadLocation::Bundled { section_bytes }) => {
             if *section_bytes > 0 {
-                bytes = bytes.saturating_add(reserve_for_bytes(*section_bytes));
+                bytes = bytes.saturating_add(draft_reserve_for_bytes(*section_bytes));
             }
         }
         None => {}

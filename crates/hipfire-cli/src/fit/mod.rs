@@ -381,7 +381,7 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
     supply_visible_device_count(process, &machine);
     let analysis = analyze_model(paths, registry, &args.model, &args, &machine)?;
     let mut tiers = Vec::new();
-    let family = crate::pull_select::family_tiers(registry, &analysis.model.tag);
+    let family = crate::pull_select::fit_family_tiers(registry, &args.model, &analysis.model.tag);
     // Every other tier runs the same admission concurrently: each one walks its
     // own artifact's source identity (seconds per tier on a large MoE), and the
     // analyses share only read-only state (the installed process config, the
@@ -671,7 +671,20 @@ fn analyze_model(
         return Ok(result);
     };
     apply_dflash_vram_floor(&mut params, device, &mut result.notes);
-    let inputs = admission_inputs(&params);
+    let mut inputs = admission_inputs(&params);
+    inputs.draft_charge = paired_draft_bytes(
+        &inputs,
+        &params,
+        draft_missing.as_ref().filter(|_| !result.model.installed),
+        entry.and_then(|entry| entry.dflash_min_vram_gb),
+        device,
+    );
+    if inputs.draft_charge > 0 {
+        result.notes.push(format!(
+            "DFlash draft reserve {} charged against free memory, as the load reserves it before it caps the context (draft file + 1/8 + 512 MiB); the speculation checkpoints the load also holds back are not projected",
+            gib(inputs.draft_charge)
+        ));
+    }
     let admitted = match inputs.admit(&path, device) {
         Ok(admitted) => admitted,
         Err(detail) => match inputs.capacity_refusal(&path, device) {
@@ -1059,6 +1072,42 @@ fn apply_dflash_vram_floor(params: &mut Value, device: &FitDevice, notes: &mut V
             ));
         }
         DflashVramGate::Forced(warning) => notes.push(warning),
+    }
+}
+
+/// Device bytes the load reserves for the DFlash draft it pairs, charged
+/// against each GPU's free memory: the load reserves the draft before it caps
+/// the context (`max_seq budget: draft_reserve`), so the context left is net
+/// of it. The reserve is the load's own formula
+/// ([`hipfire_loader::admission::qwen35_draft_reserve_bytes`]) over the
+/// draft's file size. `missing` is a registry draft that is not pulled, passed
+/// only for a model fit read just the header of: `hipfire pull` fetches it
+/// with the model, so it counts at the registry size unless the mode would not
+/// pair it (`off`, `auto` on tp>1, or below the tier's `dflash_min_vram_gb`
+/// on this device under `auto`). 0 when no draft is paired.
+fn paired_draft_bytes(
+    inputs: &AdmissionInputs<'_>,
+    params: &Value,
+    missing: Option<&MissingDraft>,
+    floor_gb: Option<f64>,
+    device: &FitDevice,
+) -> u64 {
+    use hipfire_config::dflash_floor::{dflash_vram_gate, DflashVramGate};
+    use hipfire_loader::admission::qwen35_draft_reserve_bytes;
+    if let Some(draft) = inputs.draft {
+        return std::fs::metadata(draft).map_or(0, |m| qwen35_draft_reserve_bytes(m.len()));
+    }
+    let Some(size) = missing.and_then(|missing| missing.size_bytes) else {
+        return 0;
+    };
+    let mode = params["dflash_mode"].as_str().unwrap_or("auto");
+    if mode == "off" || (mode == "auto" && inputs.tp > 1) {
+        return 0;
+    }
+    let total = device.vram_total.filter(|_| !device.unified_memory);
+    match dflash_vram_gate(mode, floor_gb, total) {
+        DflashVramGate::Skip(_) => 0,
+        DflashVramGate::Pair | DflashVramGate::Forced(_) => qwen35_draft_reserve_bytes(size),
     }
 }
 
@@ -1723,6 +1772,9 @@ struct AdmissionInputs<'a> {
     kv_adaptive: Option<&'a str>,
     options: SourceAdmissionOptions,
     error: Option<String>,
+    /// Bytes of the paired DFlash draft ([`paired_draft_bytes`]), taken off
+    /// each GPU's free memory before the projection; 0 without a draft.
+    draft_charge: u64,
 }
 
 impl AdmissionInputs<'_> {
@@ -1735,7 +1787,10 @@ impl AdmissionInputs<'_> {
             deepseek4_heterogeneous: self.options.non_single_compute,
             qwen_default_q8: qwen_default_q8_enabled(),
             vmm_runtime_refusal: None,
-            free_vram_bytes: device.free.and_then(|n| usize::try_from(n).ok()),
+            free_vram_bytes: device
+                .free
+                .map(|n| n.saturating_sub(self.draft_charge))
+                .and_then(|n| usize::try_from(n).ok()),
         }
     }
 
@@ -1935,6 +1990,7 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
         kv_adaptive,
         options,
         error,
+        draft_charge: 0,
     }
 }
 
@@ -2036,6 +2092,61 @@ mod tests {
         apply_dflash_vram_floor(&mut paired, &device(), &mut notes);
         assert!(paired.get("draft").is_some());
         assert_eq!(notes.len(), 2);
+    }
+
+    #[test]
+    fn paired_dflash_draft_is_charged_against_free_memory() {
+        // A 20 GB 7900 XT (gfx1100) planning the default 27B with its paired
+        // mq4 draft: the projection sees free memory net of the draft reserve
+        // the load itself takes (file + 1/8 + 512 MiB).
+        let xt = FitDevice {
+            arch: "gfx1100".into(),
+            vram_total: Some(21_458_059_264),
+            free: Some(21_458_059_264),
+            ..device()
+        };
+        let draft = std::env::temp_dir().join(format!(
+            "hipfire-fit-draft-charge-{}.hfq",
+            std::process::id()
+        ));
+        std::fs::write(&draft, vec![0u8; 4096]).unwrap();
+        let installed = json!({"dflash_mode": "auto", "draft": draft.to_str().unwrap()});
+        let mut inputs = admission_inputs(&installed);
+        inputs.draft_charge = paired_draft_bytes(&inputs, &installed, None, None, &xt);
+        assert_eq!(inputs.draft_charge, 4096 + 512 + (512 << 20));
+        assert_eq!(
+            inputs.hints(&xt).free_vram_bytes,
+            Some(21_458_059_264 - 4096 - 512 - (512 << 20))
+        );
+        std::fs::remove_file(&draft).unwrap();
+
+        // Not pulled yet (header-only fit): `hipfire pull` fetches it with the
+        // model, so `auto` counts its registry size unless the floor skips it.
+        // 1,897,674,368 B is the `draft_reserve` the daemon logs for this draft.
+        let missing = MissingDraft {
+            file: "qwen38-27b-dflash-mq4.hfq".into(),
+            size_bytes: Some(1_209_603_072),
+        };
+        for (mode, floor, tp, want) in [
+            ("auto", None, 1, 1_897_674_368),
+            ("on", Some(28.0), 1, 1_897_674_368),
+            ("auto", Some(28.0), 1, 0),
+            ("auto", None, 2, 0),
+            ("off", None, 1, 0),
+        ] {
+            let params = json!({"dflash_mode": mode, "tp": tp});
+            let inputs = admission_inputs(&params);
+            assert_eq!(
+                paired_draft_bytes(&inputs, &params, Some(&missing), floor, &xt),
+                want,
+                "{mode} {floor:?} tp={tp}"
+            );
+        }
+        // No draft at all: nothing is charged.
+        let plain = json!({"dflash_mode": "auto"});
+        let inputs = admission_inputs(&plain);
+        assert_eq!(paired_draft_bytes(&inputs, &plain, None, None, &xt), 0);
+        assert_eq!(inputs.hints(&xt).free_vram_bytes, Some(21_458_059_264));
     }
 
     fn report() -> Report {

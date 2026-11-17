@@ -25,6 +25,29 @@ tags (5 and 8 GB, below). Long context needs more room than the weights
 alone; see the KV notes in
 [GETTING_STARTED.md](GETTING_STARTED.md#long-context-optional).
 
+### Qwen3.8-27B by card
+
+The default `qwen3.8:27b` is `qwen3.8:27b-mq4-xts` (14.99 GB). On the 27B tiers
+that pair a DFlash draft (`mq3*`, `mq4*`), `dflash_mode` resolves to `auto`, so
+a pulled draft (1.21 GB for mq4, 0.98 GB for mq3) loads beside the weights and
+takes context room. Each result below is one load running an 8-turn document
+chain that grows to a 35.5K-token prompt (greedy, thinking off, default KV). The
+card's capacity was emulated with `HIPFIRE_EMU` on a 7900 XTX (gfx1100) or an
+R9700 (gfx1201), headless, on build `bbe7d51a2c`. The emulation caps hipfire's
+managed allocations, not the whole card: under the 20 GiB cap the whole card
+peaked at 20.8–21.8 GiB. A real card with a display attached can therefore
+admit less context than these numbers.
+
+| Card | Pick | Measured |
+|---|---|---|
+| 7900 XTX (24 GB) | `qwen3.8:27b` (defaults, paired DFlash) | Admitted context 104,086 (no emulation). The 35.5K chain completes; DFlash decode averaged 50.1 tok/s. |
+| 7900 XT (20 GB) | `qwen3.8:27b` with `hipfire config qwen3.8:27b set dflash_mode off`, or `qwen3.8:27b-mq3-xts` | Defaults (mq4-xts + draft): admitted context 15,420, out of memory on a 17.7K-token prompt. mq4-xts AR: context 80,956, the chain completes at 47.2 tok/s. mq3-xts + draft: context 123,361, the chain completes at 26.7 tok/s; gfx1100 has no PM4 decode route for MQ3 + DFlash yet. |
+| 16 GB (7800 XT, 9070 XT) | `qwen3.8:27b-mq3-xts` with `hipfire config qwen3.8:27b-mq3-xts set dflash_mode off`, or `qwen3.5:9b` | `qwen3.8:27b` (mq4-xts) is refused at load: AR on both 7800 XT and 9070 XT emulation, and with the draft on the 9070 XT. 9070 XT emulation, mq3-xts AR (fp8 KV): context 77,220, the chain completes at 43.7 tok/s. mq3-xts + draft: context 8,128, out of memory on a 21.8K-token prompt. |
+
+`hipfire fit qwen3.8:27b --ctx N` evaluates every `qwen3.8:27b-*` tier on your
+GPU, with the paired draft charged against free memory, and names the
+largest tier that fits ([CLI.md](CLI.md#hipfire-fit)).
+
 ## Measured on v0.4.4
 
 Copied from the README's
@@ -55,7 +78,7 @@ tier whose `min_vram_gb` fits with headroom for KV, and read
 |---|---|---:|---|
 | 5–8 GB | `bonsai:27b-bq1` (5) / `bonsai:27b-tq2` (8) | 3.8 / 7.16 GB | 27B at 1.14 / 2.125 bpw; heavy quantization, see the registry `desc` for its KLD |
 | 12 GB | `qwen3.5:27b-mq3` (12), `qwen3.6:27b-mq3` (12) | 10.7 GB | MQ3 alpha, gfx11 / gfx12 |
-| 13–15 GB | `qwen3.8:27b-mq3-xt` (13), `qwen3.8:27b-mq3` (14), `qwen3.8:27b-mq3-pro` (15) | 11.78–13.18 GB | MQ3V2 tiers |
+| 13–15 GB | `qwen3.8:27b-mq3-xts` (13, symmetric), `qwen3.8:27b-mq3-xt` (13), `qwen3.8:27b-mq3` (14), `qwen3.8:27b-mq3-pro` (15) | 11.78–13.18 GB | MQ3V2 tiers; `-mq3-xts` runs the W3A4 prefill on gfx1100 and gfx1201. For the 27B on 16 and 20 GB cards see [Qwen3.8-27B by card](#qwen38-27b-by-card) |
 | 16–18 GB | `qwen3.8:27b-mq4-xt` (16, speed), `qwen3.8:27b-mq4` (17, asymmetric, the pre-0.5.0 default), `qwen3.8:27b-mq4-pro` (18) | 14.99–16.46 GB | MQ4V2 tiers; `qwen3.8:27b-mq4-xts` (16) is the registry default (`qwen3.8`, `qwen3.8:27b`) and the canonical dense fixture: paired KLD +0.0008 vs `qwen3.8:27b-mq4` (gfx1201 A4 route), decode 4.8% faster, 0.67 GB smaller |
 | 20–24 GB | `qwen3.8:27b-mq5*` (20–21), `qwen3.8:27b-mq6*` (23–24) | 18.18–22.17 GB | higher-quality V2 tiers |
 | 22 GB | `qwen3.6:35b-a3b` (22), `ornith-1.5:35b-a3b` (22), `nex-n2:mini` (22) | 19–19.8 GB | 35B / 3B-active MoE |

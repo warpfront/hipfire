@@ -1929,6 +1929,13 @@ mod qwen35_measured_fit_tests {
     }
 }
 
+/// Device bytes a Qwen3.5 load reserves for a DFlash draft file of
+/// `file_bytes` before it caps the context (`max_seq budget: draft_reserve`):
+/// the carrier's own formula, for `hipfire fit`.
+pub fn qwen35_draft_reserve_bytes(file_bytes: u64) -> u64 {
+    hipfire_arch_qwen35::carrier::draft_reserve_for_bytes(file_bytes)
+}
+
 /// Only Qwen's single-card cache has the matching VMM KV-row accounting.
 /// The HFQ file is a lower bound on loaded weights; include 12.5% for
 /// expanded raw tensors/runtime state and 512 MiB for allocator/transients.

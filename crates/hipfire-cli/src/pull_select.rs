@@ -92,10 +92,41 @@ pub(crate) struct Tier<'a> {
 /// MQ4 tags are one split base). Aliases resolve to their tag before this
 /// runs, so `qwen3.8:flash` offers the tiers of `qwen3.8:flash-next`.
 pub(crate) fn family_tiers<'a>(registry: &'a RegistryV1, root: &str) -> Vec<Tier<'a>> {
+    family_with_prefix(registry, root, root)
+}
+
+/// The tiers `hipfire fit <input>` evaluates: the resolved tag's own family
+/// ([`family_tiers`]), or, when that has no other tier and `input` is an alias
+/// naming a family that has no model of its own (`qwen3.8:27b` resolves to
+/// `qwen3.8:27b-mq4-xts`), the `<input>-<suffix>` tiers with the alias target
+/// first. Pull keeps [`family_tiers`].
+pub(crate) fn fit_family_tiers<'a>(
+    registry: &'a RegistryV1,
+    input: &str,
+    tag: &str,
+) -> Vec<Tier<'a>> {
+    let own = family_tiers(registry, tag);
+    if own.len() > 1
+        || input == tag
+        || registry.models.contains_key(input)
+        || !registry.aliases.contains_key(input)
+    {
+        return own;
+    }
+    let named = family_with_prefix(registry, tag, input);
+    if named.len() > 1 {
+        named
+    } else {
+        own
+    }
+}
+
+/// [`family_tiers`] of `root` over the tags `<prefix>-<suffix>`.
+fn family_with_prefix<'a>(registry: &'a RegistryV1, root: &str, prefix: &str) -> Vec<Tier<'a>> {
     let Some((root_tag, root_entry)) = registry.models.get_key_value(root) else {
         return Vec::new();
     };
-    let prefix = format!("{root}-");
+    let prefix = format!("{prefix}-");
     let members: Vec<(&'a str, &'a ModelEntry)> = registry
         .models
         .iter()
@@ -1089,6 +1120,63 @@ mod tests {
         );
         assert_eq!(family_tiers(&registry, "solo").len(), 1);
         assert!(family_tiers(&registry, "missing").is_empty());
+    }
+
+    #[test]
+    fn fit_evaluates_the_family_an_alias_names() {
+        // `qwen3.8:27b` is an alias of `qwen3.8:27b-mq4-xts`, whose own family
+        // is empty: fit lists the `qwen3.8:27b-*` tiers, the target first.
+        let tier = |file: &str, sha: &str, size: f64, arch: u32| {
+            serde_json::json!({"repo": "x/27b", "file": file, "sha256": sha.repeat(64),
+                "size_gb": size, "min_vram_gb": size + 1.0, "arch_id": arch, "desc": "tier"})
+        };
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2099-01-01T00:00:00Z",
+            "models": {
+                "qwen3.8:27b-mq4-xts": tier("qwen3.8-27b.mq4-xts", "a", 14.99, 5),
+                "qwen3.8:27b-mq3-xts": tier("qwen3.8-27b.mq3-xts", "b", 11.78, 5),
+                "qwen3.8:27b-mq5": tier("qwen3.8-27b.mq5", "c", 18.71, 5),
+                "qwen3.8:27b-draft-mq4": tier("qwen38-27b-dflash-mq4.hfq", "d", 1.21, 20)
+            },
+            "aliases": {"qwen3.8:27b": "qwen3.8:27b-mq4-xts", "qwen3.8": "qwen3.8:27b-mq4-xts"}
+        });
+        let registry = RegistryV1::parse(&value.to_string(), "fit family test").unwrap();
+        let shape = |tiers: Vec<Tier<'_>>| -> Vec<(String, String)> {
+            tiers
+                .iter()
+                .map(|t| (t.label.clone(), t.tag.to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            shape(fit_family_tiers(
+                &registry,
+                "qwen3.8:27b",
+                "qwen3.8:27b-mq4-xts"
+            )),
+            [
+                ("mq4-xts".to_owned(), "qwen3.8:27b-mq4-xts".to_owned()),
+                ("mq5".to_owned(), "qwen3.8:27b-mq5".to_owned()),
+                ("mq3-xts".to_owned(), "qwen3.8:27b-mq3-xts".to_owned()),
+            ]
+        );
+        // The tag itself, an alias with no `<alias>-*` tiers, and pull's view
+        // stay single.
+        assert_eq!(
+            fit_family_tiers(&registry, "qwen3.8:27b-mq4-xts", "qwen3.8:27b-mq4-xts").len(),
+            1
+        );
+        assert_eq!(
+            fit_family_tiers(&registry, "qwen3.8", "qwen3.8:27b-mq4-xts").len(),
+            1
+        );
+        assert_eq!(family_tiers(&registry, "qwen3.8:27b-mq4-xts").len(), 1);
+        // A family that already has tiers keeps them (`qwen3.8:flash`).
+        let flash = super::tests::registry();
+        assert_eq!(
+            fit_family_tiers(&flash, "qwen3.8:flash", "qwen3.8:flash-next").len(),
+            family_tiers(&flash, "qwen3.8:flash-next").len()
+        );
     }
 
     #[test]
