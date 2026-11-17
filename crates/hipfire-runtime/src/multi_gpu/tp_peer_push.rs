@@ -61,14 +61,9 @@ pub(super) struct TpPeerPush {
 /// on for four ranks, where it replaces the event/copy route that cannot be
 /// captured into a graph (+43% TP4 decode).
 fn tp_peer_push_requested(ranks: usize) -> bool {
-    match hipfire_config::developer_var("HIPFIRE_TP_PEER_PUSH")
-        .ok()
-        .as_deref()
-    {
-        Some("1") => true,
-        Some("0") => false,
-        _ => ranks == 4,
-    }
+    rdna_compute::FeatureFlags::process()
+        .tp_peer_push
+        .unwrap_or(ranks == 4)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

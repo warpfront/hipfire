@@ -262,35 +262,28 @@ fn tp_full_graph_env() -> Option<String> {
     hipfire_config::developer_var("HIPFIRE_TP_FULL_GRAPH").ok()
 }
 
-fn tp_peer_alternating_env() -> Option<String> {
-    hipfire_config::developer_var("HIPFIRE_TP_PEER_ALTERNATING").ok()
-}
-
 /// Alternating-partial producer-only synchronization for the TP2
 /// direct-peer reduction ([`Gpus::all_reduce_sum_f32_peer_direct_add_alternating`]).
-/// `HIPFIRE_TP_PEER_ALTERNATING=1` enables it and `0` disables it (and with
+/// `HIPFIRE_TP_PEER_ALTERNATING=1` (`FeatureFlags::tp_peer_alternating`
+/// `Some(true)`) enables it and `0` disables it (and with
 /// it the whole-token graph, whose captured reduction is this protocol).
 /// Unset follows the mesh's effective whole-token graph request
 /// ([`tp_full_graph_requested`]): off by default, on whenever the graph is
 /// effectively requested for this mesh's arch.
-fn tp_peer_alternating_requested(raw: Option<&str>, full_graph: bool) -> bool {
-    match raw {
-        Some("1") => true,
-        Some("0") => false,
-        _ => full_graph,
-    }
+fn tp_peer_alternating_requested(explicit: Option<bool>, full_graph: bool) -> bool {
+    explicit.unwrap_or(full_graph)
 }
 
 /// Effective alternating decision for a mesh: resolves the tri-state full
 /// graph request for the mesh's topology, then lets an unset alternating
 /// knob follow it.
 fn tp_peer_alternating_for_mesh<'a>(
-    alternating_raw: Option<&str>,
+    alternating: Option<bool>,
     full_graph_raw: Option<&str>,
     arches: impl ExactSizeIterator<Item = &'a str>,
 ) -> bool {
     tp_peer_alternating_requested(
-        alternating_raw,
+        alternating,
         tp_full_graph_requested(full_graph_raw, tp2_graph_topology(arches)),
     )
 }
@@ -1500,7 +1493,7 @@ impl Gpus {
     /// follows [`Self::tp_full_graph_effective`].
     fn tp_peer_alternating_effective(&self) -> bool {
         tp_peer_alternating_for_mesh(
-            tp_peer_alternating_env().as_deref(),
+            rdna_compute::FeatureFlags::process().tp_peer_alternating,
             tp_full_graph_env().as_deref(),
             self.devices.iter().map(|device| device.arch.as_str()),
         )
@@ -3981,16 +3974,14 @@ mod tests {
     #[test]
     fn tp_peer_alternating_inherits_graph_unless_explicitly_set() {
         for full_graph in [false, true] {
-            for raw in [None, Some(""), Some("true"), Some("false"), Some(" 1")] {
-                assert_eq!(tp_peer_alternating_requested(raw, full_graph), full_graph);
-            }
-            assert!(tp_peer_alternating_requested(Some("1"), full_graph));
-            assert!(!tp_peer_alternating_requested(Some("0"), full_graph));
+            assert_eq!(tp_peer_alternating_requested(None, full_graph), full_graph);
+            assert!(tp_peer_alternating_requested(Some(true), full_graph));
+            assert!(!tp_peer_alternating_requested(Some(false), full_graph));
         }
         assert!(!tp_peer_alternating_requested(None, false));
         assert!(!tp2_whole_token_graph_admitted(
             true,
-            || tp_peer_alternating_requested(Some("0"), true),
+            || tp_peer_alternating_requested(Some(false), true),
             ["gfx1100", "gfx1100"].into_iter(),
         ));
     }
@@ -4016,12 +4007,12 @@ mod tests {
                 arches.into_iter()
             ));
             assert!(tp_peer_alternating_for_mesh(
-                Some("1"),
+                Some(true),
                 None,
                 arches.into_iter()
             ));
             assert!(!tp_peer_alternating_for_mesh(
-                Some("0"),
+                Some(false),
                 Some("1"),
                 arches.into_iter()
             ));

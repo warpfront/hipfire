@@ -1865,13 +1865,11 @@ pub fn routed_headers_symmetric_verdict(
     routed_headers_symmetric_cached(hfq, manifest, hfq.path(), home.as_deref())
 }
 
-/// DESIGN F1: repack the symmetric MQ4-XTS routed experts without their zero
-/// plane while each expert-parallel rank compacts them to the device
-/// (`2,611,200 -> 2,534,400` bytes per expert). `=0` keeps the shipped layout.
-pub const EXPERT_DROP_ZERO_ENV: &str = "HIPFIRE_QWEN4_EXPERT_DROP_ZERO";
-
-/// Whether the drop-zero repack is requested for the load of `model`. An explicit
-/// [`EXPERT_DROP_ZERO_ENV`] wins (`0` off, `1` on). Unset follows the shipped EP expert hot set
+/// DESIGN F1: whether the drop-zero repack of the symmetric MQ4-XTS routed experts (without
+/// their zero plane, while each expert-parallel rank compacts them to the device,
+/// `2,611,200 -> 2,534,400` bytes per expert) is requested for the load of `model`. An explicit
+/// `HIPFIRE_QWEN4_EXPERT_DROP_ZERO` (`FeatureFlags::qwen4_expert_drop_zero`) wins (`0` off,
+/// `1` on). Unset follows the shipped EP expert hot set
 /// (D1): on exactly when the shipped default gate is on
 /// (`hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON`), the model has its
 /// `<model>.ep.expert-hotset` sidecar and `HIPFIRE_QWEN4_EP_EXPERT_HOTSET` is not `0`; so the
@@ -1879,31 +1877,25 @@ pub const EXPERT_DROP_ZERO_ENV: &str = "HIPFIRE_QWEN4_EXPERT_DROP_ZERO";
 /// itself still declines every load it does not apply to,
 /// [`apply_expert_drop_zero`]).
 pub fn expert_drop_zero_requested_for(model: &std::path::Path) -> bool {
+    let flags = rdna_compute::FeatureFlags::process();
     expert_drop_zero_default_requested(
-        hipfire_config::developer_var(EXPERT_DROP_ZERO_ENV)
-            .ok()
-            .as_deref(),
-        rdna_compute::FeatureFlags::process()
-            .qwen4_ep_expert_hotset
-            .as_deref(),
+        flags.qwen4_expert_drop_zero,
+        flags.qwen4_ep_expert_hotset.as_deref(),
         hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
         || hipfire_config::memory::ep_expert_hotset_sidecar_path(model).is_file(),
     )
 }
 
-/// The pure decision of [`expert_drop_zero_requested_for`] over the raw values of
-/// [`EXPERT_DROP_ZERO_ENV`] and [`crate::expert_ep_units::EP_EXPERT_HOTSET_ENV`].
+/// The pure decision of [`expert_drop_zero_requested_for`] over the explicit drop-zero
+/// switch and the raw [`crate::expert_ep_units::EP_EXPERT_HOTSET_ENV`] value.
 pub fn expert_drop_zero_default_requested(
-    drop_zero_raw: Option<&str>,
+    explicit: Option<bool>,
     hotset_raw: Option<&str>,
     gate: bool,
     sidecar_exists: impl FnOnce() -> bool,
 ) -> bool {
-    // `hipfire_config::developer_bool` semantics: exact `1` on, exact `0` off, anything else unset.
-    match drop_zero_raw {
-        Some("0") => return false,
-        Some("1") => return true,
-        _ => {}
+    if let Some(explicit) = explicit {
+        return explicit;
     }
     gate && !matches!(
         crate::expert_ep_units::ep_units_policy(hotset_raw),
@@ -4901,18 +4893,15 @@ mod drop_zero_default_tests {
             "hot set blank = off"
         );
         // The explicit switch wins over everything.
-        assert!(requested(Some("1"), Some("0"), false, || false));
-        assert!(!requested(Some("0"), None, true, || true));
-        // Any other spelling is unset.
-        assert!(requested(Some("yes"), None, true, || true));
-        assert!(!requested(Some("yes"), None, false, || true));
+        assert!(requested(Some(true), Some("0"), false, || false));
+        assert!(!requested(Some(false), None, true, || true));
     }
 
     #[test]
     fn the_sidecar_probe_is_not_called_when_the_answer_is_settled() {
         let probe = || -> bool { panic!("probed") };
-        assert!(requested(Some("1"), None, true, probe));
-        assert!(!requested(Some("0"), None, true, probe));
+        assert!(requested(Some(true), None, true, probe));
+        assert!(!requested(Some(false), None, true, probe));
         assert!(!requested(None, None, false, probe));
         assert!(!requested(None, Some("0"), true, probe));
     }

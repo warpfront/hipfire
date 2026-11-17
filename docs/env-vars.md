@@ -2367,7 +2367,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/examples/fn_wide_kl_oracle.rs | developer |
 | `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` | crates/hipfire-arch-qwen4/examples/qwen4_ep_kld.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` | crates/hipfire-arch-qwen4/src/expert_cache.rs, crates/hipfire-arch-qwen4/src/expert_cache_config.rs | developer |
-| `HIPFIRE_QWEN4_EXPERT_DROP_ZERO` | crates/hipfire-arch-qwen4/src/artifact.rs, crates/hipfire-arch-qwen4/src/weights.rs | developer |
+| `HIPFIRE_QWEN4_EXPERT_DROP_ZERO` | crates/hipfire-arch-qwen4/src/artifact.rs, crates/hipfire-arch-qwen4/src/weights.rs | experimental |
 | `HIPFIRE_QWEN4_EXPERT_HOTSET` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-arch-qwen4/src/expert_ep_units.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE` | crates/hipfire-arch-qwen4/src/expert_hotset.rs, crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100` | crates/hipfire-arch-qwen4/src/expert_hotset.rs, crates/hipfire-config/src/lib.rs | developer |
@@ -2805,14 +2805,14 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_TP_BENCH_ITERS` | crates/hip-bridge/examples/rccl_smoke.rs, crates/hipfire-runtime/examples/tp_allreduce_smoke.rs | harness |
 | `HIPFIRE_TP_BENCH_N` | crates/hip-bridge/examples/rccl_smoke.rs, crates/hipfire-runtime/examples/tp_allreduce_smoke.rs | harness |
 | `HIPFIRE_TP_BENCH_WARMUP` | crates/hipfire-runtime/examples/tp_allreduce_smoke.rs | harness |
-| `HIPFIRE_TP_EXCHANGE` | crates/hipfire-loader/src/lib.rs, crates/hipfire-runtime/examples/tp2_cross_device_graph_reduce.rs | developer |
+| `HIPFIRE_TP_EXCHANGE` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/lib.rs | experimental |
 | `HIPFIRE_TP_FULL_GRAPH` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-arch-qwen35/src/qwen35/mesh_tp.rs | developer |
 | `HIPFIRE_TP_GRAPH_RANKS` | crates/hipfire-runtime/examples/tp4_cross_device_graph_barrier.rs | harness |
 | `HIPFIRE_TP_PARITY_PROMPT_FILE` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |
 | `HIPFIRE_TP_PARITY_STEPS` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |
 | `HIPFIRE_TP_PARITY_TP` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |
-| `HIPFIRE_TP_PEER_ALTERNATING` | crates/hipfire-runtime/src/multi_gpu.rs | developer |
-| `HIPFIRE_TP_PEER_PUSH` | crates/hipfire-runtime/src/multi_gpu.rs, crates/hipfire-runtime/src/multi_gpu/tp_peer_push.rs | developer |
+| `HIPFIRE_TP_PEER_ALTERNATING` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/multi_gpu.rs | experimental |
+| `HIPFIRE_TP_PEER_PUSH` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/multi_gpu.rs | experimental |
 | `HIPFIRE_TP_PEER_PUSH_FAULT` | crates/hipfire-runtime/src/multi_gpu/tp_peer_push.rs, crates/rdna-compute/src/tp_peer_push.rs | developer |
 | `HIPFIRE_TP_USE_RCCL` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |
 | `HIPFIRE_TQ2G128_XBATCH` | crates/rdna-compute/src/kernels.rs | developer |

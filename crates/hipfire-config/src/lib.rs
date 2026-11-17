@@ -3232,6 +3232,40 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD",
         "Qwen4 EP vocabulary-sharded MQ2 draft head: unset attaches when the target shard exchange is attached, 0 off, 1 requires it."
     ),
+    process_auto_bool_field!(
+        "memory.qwen4_expert_drop_zero",
+        "qwen4_expert_drop_zero",
+        Memory,
+        true,
+        "HIPFIRE_QWEN4_EXPERT_DROP_ZERO",
+        "Qwen4 drop-zero planar repack of the symmetric MQ4-XTS routed experts on exact-gfx1201 EP loads: auto (default) on only with the shipped EP expert hot set and its sidecar; true requests it on every EP load it applies to; false keeps the shipped layout."
+    ),
+    process_field!(
+        "topology.tp_exchange",
+        "tp_exchange",
+        Hardware,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_TP_EXCHANGE",
+        "Dense Qwen TP partial exchange format (trimmed): unset, empty or auto the measured policy (bf16 except TP2 single-row decode, which keeps f32); f32, bf16 or f16 forces one format; anything else prints an error and uses f32."
+    ),
+    process_auto_bool_field!(
+        "topology.tp_peer_alternating",
+        "tp_peer_alternating",
+        Hardware,
+        true,
+        "HIPFIRE_TP_PEER_ALTERNATING",
+        "TP2 alternating-partial direct-peer reduction: auto (default) follows the mesh's effective whole-token graph request; true on; false off (and with it the whole-token graph)."
+    ),
+    process_auto_bool_field!(
+        "topology.tp_peer_push",
+        "tp_peer_push",
+        Hardware,
+        true,
+        "HIPFIRE_TP_PEER_PUSH",
+        "gfx1201 tagged peer-VRAM TP residual reduction: auto (default) on for four ranks, off for a pair; true forces it on; false off."
+    ),
     process_bool_field!(
         "speculation.mtp_ar_floor",
         "mtp_ar_floor",
@@ -4800,6 +4834,38 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "promoted to a typed key (HIPF-430); HIPFIRE_QWEN4_EP_DRAFT_VOCAB_SHARD is unchanged",
         replacement: "topology.qwen4_ep_draft_vocab_shard",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_expert_drop_zero",
+        legacy_key: "developer.qwen4_expert_drop_zero",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-437); HIPFIRE_QWEN4_EXPERT_DROP_ZERO is unchanged",
+        replacement: "memory.qwen4_expert_drop_zero",
+    },
+    RetiredConfigKey {
+        key: "developer.tp_exchange",
+        legacy_key: "developer.tp_exchange",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-437); HIPFIRE_TP_EXCHANGE is unchanged",
+        replacement: "topology.tp_exchange",
+    },
+    RetiredConfigKey {
+        key: "developer.tp_peer_alternating",
+        legacy_key: "developer.tp_peer_alternating",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-437); HIPFIRE_TP_PEER_ALTERNATING is unchanged",
+        replacement: "topology.tp_peer_alternating",
+    },
+    RetiredConfigKey {
+        key: "developer.tp_peer_push",
+        legacy_key: "developer.tp_peer_push",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-437); HIPFIRE_TP_PEER_PUSH is unchanged",
+        replacement: "topology.tp_peer_push",
     },
     RetiredConfigKey {
         key: "developer.mtp_ar_floor",
@@ -8966,7 +9032,12 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
         | "route_plan"
         | "t5_gpu" => ConfigValue::Bool(raw != "0"),
         // Untrimmed exact `1` / `0`; anything else is the conditional default.
-        "ep_peer_allreduce" | "ep_peer_allreduce_decode" | "qwen4_mtp_draft_rounds" => match raw {
+        "ep_peer_allreduce"
+        | "ep_peer_allreduce_decode"
+        | "qwen4_mtp_draft_rounds"
+        | "qwen4_expert_drop_zero"
+        | "tp_peer_alternating"
+        | "tp_peer_push" => match raw {
             "1" => ConfigValue::Bool(true),
             "0" => ConfigValue::Bool(false),
             _ => ConfigValue::String("auto".to_owned()),
@@ -9002,7 +9073,8 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
         | "raon_railgun"
         | "raon_verify_rowexact"
         | "raon_shared_ffn"
-        | "v2b_a4_epi" => ConfigValue::String(raw.to_owned()),
+        | "v2b_a4_epi"
+        | "tp_exchange" => ConfigValue::String(raw.to_owned()),
         _ => return None,
     })
 }
@@ -10020,6 +10092,9 @@ mod tests {
                 "ep_peer_allreduce",
                 "ep_peer_allreduce_decode",
                 "qwen4_mtp_draft_rounds",
+                "qwen4_expert_drop_zero",
+                "tp_peer_alternating",
+                "tp_peer_push",
             ] {
                 let want = match raw {
                     "1" => "1",
@@ -10046,6 +10121,7 @@ mod tests {
                 "raon_verify_rowexact",
                 "raon_shared_ffn",
                 "v2b_a4_epi",
+                "tp_exchange",
             ] {
                 assert_eq!(on(key, raw).as_deref(), Some(raw), "{key}={raw:?}");
             }
@@ -10064,8 +10140,9 @@ mod tests {
             .iter()
             .filter(|f| promoted_flag_env_value(f.legacy_key, "").is_some())
             .collect();
-        // 9 kernel-side (stage 1) + 28 arch-crate / runtime (stage 2) + 2 tier-B kernel-side (HIPF-438).
-        assert_eq!(promoted.len(), 39);
+        // 9 kernel-side (stage 1) + 28 arch-crate / runtime (stage 2) + 2 tier-B kernel-side
+        // (HIPF-438) + 4 tier-B arch-crate / runtime (HIPF-437).
+        assert_eq!(promoted.len(), 43);
         for f in promoted {
             let dev = developer_key_for_env(f.env_compat.unwrap()).unwrap();
             let err = ConfigLayer::default().set_cli(&dev, "1").unwrap_err();
