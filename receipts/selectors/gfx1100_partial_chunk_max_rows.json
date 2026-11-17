@@ -1,0 +1,29 @@
+{
+  "schema": "pm.selector_receipt.v1",
+  "arch": "gfx1100",
+  "candidate": "widened ordinary prefill: a chunk below the admitted ceiling and above 4096 rows is re-planned with a 4096-row ceiling (5909 -> 4096 + 1813)",
+  "incumbent": "one ragged chunk up to the admitted 8192-row ceiling (5909 -> 5909)",
+  "constant": "GFX1100_PARTIAL_CHUNK_MAX_ROWS",
+  "value": 4096,
+  "kind": "max",
+  "row_key": "rows",
+  "covers": true,
+  "note": "7900 XTX, 27B qwen3.8 mq4-xts --spec off, 4 fresh loads per arm, bootstrap 95% CI over per-load medians; lane archives 58917ec2d6d6 (base) and b16ca4147bd6 (cand). The 4096-ceiling arm (HIPFIRE_PREFILL_CHUNK_ROWS=4096) executes the same schedule this rule produces for a 5,909-token prompt. Full-ceiling chunks are not capped: 8192-row chunks beat 2 x 4096 (pp8192, pp16384), and prompts at or below 4096 rows are unchanged (pp2048, t134 within noise).",
+  "classes": [
+    {"rows": 5909, "prompt": "ttft_5900", "metric": "ttft_ms", "ratio": 1.1894, "ci95_speed_ratio": [1.1884, 1.1900], "verdict": "faster", "admitted": true},
+    {"rows": 8192, "prompt": "pp8192", "metric": "tok_s", "ratio": 0.9923, "ci95_speed_ratio": [0.9921, 0.9928], "verdict": "slower", "admitted": false},
+    {"rows": 16384, "prompt": "pp16384", "metric": "tok_s", "ratio": 0.9899, "ci95_speed_ratio": [0.9887, 0.9928], "verdict": "slower", "admitted": false},
+    {"rows": 2048, "prompt": "pp2048", "metric": "tok_s", "ratio": 0.9987, "ci95_speed_ratio": [0.9950, 1.0033], "verdict": "unchanged", "admitted": false},
+    {"rows": 134, "prompt": "code-134", "metric": "ttft_ms", "ratio": 0.9997, "ci95_speed_ratio": [0.9977, 1.0040], "verdict": "unchanged", "admitted": false}
+  ],
+  "records": [
+    {
+      "path": "receipts/selectors/evidence/gfx1100_partial_chunk_max_rows/ttft5900-j5419.txt",
+      "sha256": "518f2e2cb17fa7dfab30ad8990fa1e061e4d68fe7dc2185f0bf915aab6eeea36"
+    },
+    {
+      "path": "receipts/selectors/evidence/gfx1100_partial_chunk_max_rows/shape-ab-j5421-j5422.txt",
+      "sha256": "e8f01d27ff8e5927d0ae2560a0c745c767e3c3eae9598e812ea27547ca5eec3c"
+    }
+  ]
+}

@@ -2817,6 +2817,37 @@ pub fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<
     Some(chunk)
 }
 
+/// Largest ragged widened chunk on gfx1100: a chunk short of the admitted
+/// ceiling but above 4096 rows splits at the 4096 rung. On the 7900 XTX the
+/// 27B 5909-token TTFT is 2920 ms as one 5909-row chunk and 2456 ms as
+/// 4096 + 1813, while full 8192-row chunks stay faster than 2 x 4096
+/// (pp8192 +0.8%, pp16384 +1.0%), so full ceilings are left whole.
+// selector-receipt: receipts/selectors/gfx1100_partial_chunk_max_rows.json
+const GFX1100_PARTIAL_CHUNK_MAX_ROWS: usize = 4096;
+
+/// Ragged-chunk cap of the widened ordinary loop, `None` where no measured
+/// shape rule applies.
+fn widened_partial_chunk_cap(arch: &str, wide: bool) -> Option<usize> {
+    (wide && arch == "gfx1100").then_some(GFX1100_PARTIAL_CHUNK_MAX_ROWS)
+}
+
+/// Re-plan a chunk under the ragged cap: a chunk below the admitted `ceiling`
+/// and above `cap` is re-planned with `cap` as its ceiling (the planners keep
+/// the legacy 512-row commit cadence for any ceiling). `ceiling` is the
+/// admitted rung, not the owned PBS rows: a call shorter than the rung sizes
+/// its PBS to the call, so that bound always equals the whole call.
+fn capped_partial_chunk(
+    chunk: usize,
+    ceiling: usize,
+    cap: Option<usize>,
+    plan: impl Fn(usize) -> Option<usize>,
+) -> Option<usize> {
+    match cap {
+        Some(cap) if chunk < ceiling && chunk > cap => plan(cap),
+        _ => Some(chunk),
+    }
+}
+
 /// Coalesce only complete legacy 512-row chunks for packed FFN. Preserve
 /// the legacy irregular tail (including 511+2 for a singleton remainder),
 /// so changing the ceiling does not change which rows use packed quantization.
@@ -4130,25 +4161,30 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             && gpu.arch == "gfx1100"
             && gpu.flags.packed_mq4_prefill
             && dense_layers_have_projection_dtype(weights, DType::MQ4G256);
+        let partial_cap = widened_partial_chunk_cap(gpu.arch.as_str(), wide);
         let mut chunk_start = 0usize;
         while chunk_start < n {
             let remaining = n - chunk_start;
             // Widened grouping keeps an odd tail attached to the largest
             // admitted chunk so its GEMMs use the padded multi-row route.
-            let chunk_n = if ordinary_intent && !packed_mq4 {
-                // Outer chunk boundaries carry no numerical meaning on the canonical
-                // route (the stream owns the absolute schedule), so a one-row tail is
-                // a legal chunk.
-                Some(remaining.min(chunk_batch))
-            } else {
-                next_ordinary_chunk_len(wide, packed_mq4, remaining, chunk_batch)
-            }
-            .ok_or_else(|| {
-                hip_bridge::HipError::new(
-                    0,
-                    "forward_prefill_batch: chunk plan cannot satisfy the two-token minimum",
-                )
-            })?;
+            let plan = |ceiling: usize| {
+                if ordinary_intent && !packed_mq4 {
+                    // Outer chunk boundaries carry no numerical meaning on the canonical
+                    // route (the stream owns the absolute schedule), so a one-row tail is
+                    // a legal chunk.
+                    Some(remaining.min(ceiling))
+                } else {
+                    next_ordinary_chunk_len(wide, packed_mq4, remaining, ceiling)
+                }
+            };
+            let chunk_n = plan(chunk_batch)
+                .and_then(|chunk| capped_partial_chunk(chunk, limit, partial_cap, plan))
+                .ok_or_else(|| {
+                    hip_bridge::HipError::new(
+                        0,
+                        "forward_prefill_batch: chunk plan cannot satisfy the two-token minimum",
+                    )
+                })?;
             if pbs.lean {
                 if !matches!(fusion, DflashFusionCtx::Off) {
                     return Err(hip_bridge::HipError::new(
@@ -9697,6 +9733,32 @@ mod tests {
     fn prefill_chunk_plan_refuses_unpartitionable_minimum_batch() {
         assert_eq!(next_prefill_chunk_len(3, 2), None);
     }
+    #[test]
+    fn gfx1100_ragged_widened_chunk_splits_at_4096() {
+        let cap = widened_partial_chunk_cap("gfx1100", true);
+        assert_eq!(cap, Some(4096));
+        assert_eq!(widened_partial_chunk_cap("gfx1201", true), None);
+        assert_eq!(widened_partial_chunk_cap("gfx1100", false), None);
+        fn schedule(mut remaining: usize, ceiling: usize, cap: Option<usize>) -> Vec<usize> {
+            let mut out = Vec::new();
+            while remaining > 0 {
+                let plan = |c: usize| next_exact_prefill_chunk_len(remaining, c);
+                let chunk = plan(ceiling)
+                    .and_then(|chunk| capped_partial_chunk(chunk, ceiling, cap, plan))
+                    .unwrap();
+                out.push(chunk);
+                remaining -= chunk;
+            }
+            out
+        }
+        assert_eq!(schedule(5909, 8192, cap), vec![4096, 1813]);
+        assert_eq!(schedule(8192, 8192, cap), vec![8192]);
+        assert_eq!(schedule(16384, 8192, cap), vec![8192, 8192]);
+        assert_eq!(schedule(14101, 8192, cap), vec![8192, 4096, 1813]);
+        assert_eq!(schedule(2048, 8192, cap), vec![2048]);
+        assert_eq!(schedule(5909, 8192, None), vec![5909]);
+    }
+
     #[test]
     fn widened_direct_grouping_keeps_non_rung_tail_attached() {
         assert_eq!(next_exact_prefill_chunk_len(277, 4096), Some(277));

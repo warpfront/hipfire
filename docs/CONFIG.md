@@ -1826,6 +1826,11 @@ ranges are the schema's; every key also appears in the generated
 | `memory.unsafe_wsl_vmm_kv` | `false` | bool. UNSAFE until certified: allow the VMM KV backend under WSL/ROCDXG, where WDDM VA growth may alias earlier KV pages. Off: automatic KV selects legacy and an explicit `kv_backend = "vmm"` is refused. |
 | `replay.unsafe_wsl_redline` | `false` | bool. UNSAFE until certified: allow Redline PM4/retained replay under WSL/ROCDXG. Off: the retained default falls back to the HIP graph and an explicit `replay.backend = "redline"`/`"shadow"` is refused. |
 
+On exact gfx1100 the widened ordinary prefill splits a chunk that is shorter
+than the admitted `prefill.chunk_rows` ceiling but longer than 4096 rows at
+the 4096 rung (a 5,909-token prompt runs 4096 + 1813 instead of one
+5909-row chunk); full-ceiling chunks are unchanged.
+
 The Qwen dense uniform `MQ4G256V2` Exact route also admits exact gfx1100
 with Q8 VMM KV. On gfx1100 each target lane executes the complete singleton
 layer program; target projections are not merged across requests. This first
