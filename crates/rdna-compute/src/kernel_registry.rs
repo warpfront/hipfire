@@ -7095,8 +7095,8 @@ pub struct NativeObject {
 
 /// Embedded native objects the Raon decode body loads: on exact gfx1201 the
 /// sealed `gated_delta_vector_pm` twin (RDA recurrence and depthwise causal
-/// conv), through `ensure_embedded_kernel` under `HIPFIRE_GATED_DELTA_VECTOR_PM`
-/// (default on). Registry presence is not permission: the launcher admits it
+/// conv), through `ensure_embedded_kernel`. Registry presence is not permission: the
+/// launcher admits it
 /// per launch shape (head dim, kernel size).
 pub fn native_object_entries(arch: &str) -> Result<Vec<NativeObject>, RegistryError> {
     let arch: &'static str = SUPPORTED_ARCHES

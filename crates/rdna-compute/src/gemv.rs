@@ -4626,9 +4626,6 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
-        if !crate::gemm::bf16_h_fp8_enabled() {
-            self.round_h_bf16_quality_only(h, batch_size * k)?;
-        }
         self.fused_silu_rotate_mq_fp8_gfx12_batched_impl(h, None, awq, None, k, batch_size)
     }
 
@@ -4675,44 +4672,34 @@ impl Gpu {
         }
         let mut row_scale_shift = fp8_row_scale_shift()?;
         self.ensure_mq_signs()?;
-        let bf16_h = h_input && crate::gemm::bf16_h_fp8_enabled();
-        let (module, source, kernel) = match (awq, inreg, h_input, bf16_h) {
-            (Some(_), true, true, true) => (
+        // h input is always packed bf16.
+        let (module, source, kernel) = match (awq, inreg, h_input) {
+            (Some(_), true, true) => (
                 "fused_silu_mul_mq_rotate_awq_hin_bf16_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_HIN_BF16_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_hin_bf16_fp8_gfx12",
             ),
-            (None, true, true, true) => (
+            (None, true, true) => (
                 "fused_silu_mul_mq_rotate_hin_bf16_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_HIN_BF16_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_hin_bf16_fp8_gfx12",
             ),
-            (Some(_), true, true, false) => (
-                "fused_silu_mul_mq_rotate_awq_hin_fp8_gfx12",
-                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_HIN_FP8_GFX12_SRC,
-                "fused_silu_mul_mq_rotate_awq_hin_fp8_gfx12",
-            ),
-            (None, true, true, false) => (
-                "fused_silu_mul_mq_rotate_hin_fp8_gfx12",
-                kernels::FUSED_SILU_MUL_MQ_ROTATE_HIN_FP8_GFX12_SRC,
-                "fused_silu_mul_mq_rotate_hin_fp8_gfx12",
-            ),
-            (Some(_), true, false, _) => (
+            (Some(_), true, false) => (
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_INREG_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_inreg_gfx12",
             ),
-            (None, true, false, _) => (
+            (None, true, false) => (
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_inreg_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_FP8_INREG_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_inreg_gfx12",
             ),
-            (Some(_), false, _, _) => (
+            (Some(_), false, _) => (
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12",
             ),
-            (None, false, _, _) => (
+            (None, false, _) => (
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12",
@@ -4785,20 +4772,8 @@ impl Gpu {
                 &mut row_scale_shift as *mut _ as *mut c_void,
             ]
         };
-        let bytes = ((if h_input {
-            if bf16_h {
-                2
-            } else {
-                4
-            }
-        } else {
-            8
-        }) * k
-            + k * 4
-            + k
-            + (k / 256) * 2 * 4
-            + 4)
-            * batch_size;
+        let bytes =
+            ((if h_input { 2 } else { 8 }) * k + k * 4 + k + (k / 256) * 2 * 4 + 4) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fused",
@@ -5002,21 +4977,17 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let slab = !bf16_h && self.arch == "gfx1201" && self.a4_slab_active();
-        let tokfast = slab && crate::gemm::a4_hin_tokfast_enabled();
         let (source, kernel) = if bf16_h {
             (
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_BF16_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_i4_hin_bf16_gfx12",
             )
-        } else if tokfast {
+        } else if slab {
+            // Token-fastest grid [N, K/256]: neighbouring workgroups fill each
+            // 128-B slab-plane line.
             (
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SLAB_TOKFAST_SRC,
                 "fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast",
-            )
-        } else if slab {
-            (
-                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SLAB_SRC,
-                "fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab",
             )
         } else if self.arch == "gfx1201" {
             (
@@ -5056,7 +5027,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            if tokfast {
+            if slab {
                 [batch_size as u32, n_groups, 1]
             } else {
                 folded_rows_grid(
@@ -6037,12 +6008,10 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        // gfx1100 `_gfx1100_v2` (opt-out `HIPFIRE_GFX1100_GATED_NORM_V2=0`);
-        // gfx1151 `_gfx1151_v2` (same body + one-pass emit, same launch).
+        // gfx1100 `_gfx1100_v2`; gfx1151 `_gfx1151_v2` (same body + one-pass
+        // emit, same launch); other gfx11 keep the v1 producers.
         let gfx1151 = self.arch_caps.is_gfx1151();
-        let v2 = gfx1151
-            || (self.arch_caps.is_gfx1100()
-                && hipfire_config::developer_bool("HIPFIRE_GFX1100_GATED_NORM_V2", true));
+        let v2 = gfx1151 || self.arch_caps.is_gfx1100();
         let (module, source) = match (awq.is_some(), v2, gfx1151) {
             (true, false, _) => (
                 "gated_norm_mq_rotate_awq_i4_gfx11",

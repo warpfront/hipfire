@@ -436,8 +436,6 @@ The expert-staging levers have no typed schema key. They are `[developer]` keys 
 | `developer.moe_router_fused_prefill` | `HIPFIRE_MOE_ROUTER_FUSED_PREFILL` | on where qualified (exact gfx1201) | Prefill-only exact softmax/top-8/renormalization fusion; all existing shape/execution prerequisites apply. `false` / `0` keeps separate operations. |
 | `developer.moe_router_topk_multirow` | `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW` | on where qualified (exact gfx1201) | Wave-per-row fused router (one wave32 per row, 8 rows per workgroup, any row count), byte-identical to the one-row fused router; requires fused-router admission. `false` / `0` restores the incumbent. |
 | `developer.moe_shared_prepared_iu4` | `HIPFIRE_MOE_SHARED_PREPARED_IU4` | on where qualified (exact gfx1201) | Reuses one prepared shared-expert IU4 activation for selector and gate/up consumers; `false` / `0` keeps per-consumer preparation. |
-| `developer.moe_rotate_i4_pm` | `HIPFIRE_MOE_ROTATE_I4_PM` | on where qualified (exact gfx1201) | Exact-gfx1201 PeaceMaker down-projection rotate/quantize twin of `qwen4_moe_rotate128_i4` (byte-identical); existing runtime-K, layout and execution admission remains required. `false` / `0` restores the HIP incumbent. |
-| `developer.gdn_chunk_prep_pm` | `HIPFIRE_GDN_CHUNK_PREP_PM` | on where qualified (exact gfx1201) | PeaceMaker GDN chunk-prep twin (byte-identical) nested beneath the admitted MoE chunk-scan route; unsupported cases retain incumbent preparation. `false` / `0` restores the incumbent. |
 | `developer.moe_shared_down_sigmoid_epi` | `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` | on where qualified (exact gfx1201) | Shared-expert sigmoid-gate epilogue in the existing HIP `full_add_v3` entry, not a PeaceMaker route. Retains the admitted FMA/residual arithmetic. `false` / `0` restores the separate gated residual add. |
 | `developer.gdn_qk_indexed` | `HIPFIRE_GDN_QK_INDEXED` | on where qualified (exact gfx1201) | Sequential Q8-state MoE prefill indexes key-head Q/K by value-head ratio instead of repeating Q/K; `false` / `0` restores repeat/copy. |
 | `developer.gdn_moe_pre_fused` | `HIPFIRE_GDN_MOE_PRE_FUSED` | on where qualified (exact gfx1201) | Admitted MoE prefill uses the existing fused sigmoid/conv/norm/repeat preamble; `false` / `0` keeps separate launches. |
@@ -1889,7 +1887,7 @@ daemon after changing them.
 |---|---|
 | Exact gfx1201 | `kernel.gfx12_mq4v2_fp8_gateup`, `kernel.gfx12_mq4v2_fp8_resid`, `kernel.gfx12_mq4v2_fp8_qkvza`, `kernel.gfx12_mq4v2_fp8_qkv` (the four family flags), `kernel.gfx12_mq4v2_fp8_v2` (staged-tile v2; the four family flags remain prerequisites), `kernel.gfx12_gdn_pre_fused`, `kernel.gfx12_silu_quant_fused`, `kernel.gfx12_producer_quant_fused`, `kernel.g12_norm`, `kernel.g12_a4c2`, `kernel.gfx12_fa2_prefill`, `kernel.gfx12_fa_packet`, `kernel.attn_qresident` (exact H24/KV4/D256 native-fp8-KV shapes), `kernel.attn_qresident_v2` (only where the Q-resident route is selected), `kernel.gfx12_fa_prep_fused`, `kernel.gfx12_fa_prep_fp8q` |
 | Exact gfx1100 / gfx1151 / gfx1201 | `kernel.gfx12_gdn_chunk_scan`, `kernel.iu4_prefill`, `kernel.verify_attn` |
-| Exact gfx1100 / gfx1151 | `kernel.gfx11_fa2_prefill`, `kernel.gfx11_producer_quant_fused`, `kernel.gfx11_iu4_symfold` (symmetric artifacts only) |
+| Exact gfx1100 / gfx1151 | `kernel.gfx11_fa2_prefill`, `kernel.gfx11_producer_quant_fused` |
 | Exact gfx1201 / gfx1151 | `kernel.g12_dec_norm` |
 | Exact gfx1100 | `kernel.gfx1100_dec_norm`, `kernel.gfx11_iu4_shape` |
 
@@ -2565,10 +2563,50 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.qwen4_trunk_a8_x4` | `qwen4_trunk_a8_x4` | 0.4.5 | 0.5.0 | none; same-K trunk members always share one x4 launch where admitted |
 | `developer.v2b_addepi` | `v2b_addepi` | 0.4.0 | 0.5.0 | none; the V2B residual add epilogue is always used |
 | `developer.verify_tape_copy_batch` | `verify_tape_copy_batch` | 0.4.2 | 0.5.0 | none; singleton chain-verify tape copies are always one batched launch |
+| `developer.a3b_moe_dedup` | `a3b_moe_dedup` | 0.4.5 | 0.5.0 | none; A3B lane decode of 2+ lanes always runs the expert-deduplicating routed kernels |
+| `developer.a3b_moe_dedup_down` | `a3b_moe_dedup_down` | 0.4.5 | 0.5.0 | none; A3B lane decode of 2+ lanes always runs the expert-deduplicating routed down |
+| `developer.a4_hin_tokfast` | `a4_hin_tokfast` | 0.4.0 | 0.5.0 | none; the slab HIN producer always runs the token-fastest grid |
+| `developer.a8_fused_prod` | `a8_fused_prod` | 0.4.0 | 0.5.0 | none; admitted A8 prefill sites always emit the A8 sidecar from the fused producers |
+| `developer.argmax_regrid_pm` | `argmax_regrid_pm` | 0.4.5 | 0.5.0 | none; exact gfx1201 always runs the builder argmax twin where the row length admits it |
+| `developer.bf16_h_fp8` | `bf16_h_fp8` | 0.4.0 | 0.5.0 | none; the fp8 F2 and v2 SiLU-h routes always hand off packed bf16 h |
+| `developer.ddtree_topk_direct_off` | `ddtree_topk_direct_off` | 0.4.0 | 0.5.0 | none; the switch had no consumer left |
+| `developer.ep_ar_fast_apply` | `ep_ar_fast_apply` | 0.4.5 | 0.5.0 | none; the gfx1201 EP2 AR / SP HC apply always rounds by selects and splits short tagged launches |
+| `developer.ep_ar_wide_grid` | `ep_ar_wide_grid` | 0.4.5 | 0.5.0 | none; the gfx1201 EP2 AR non-split entries always take the wide launch grid where it fits |
+| `developer.fa2_fill` | `fa2_fill` | 0.4.0 | 0.5.0 | none; gfx1100 and gfx1151 always run their warp-specialized FA2 fill builds |
+| `developer.flux_rope_fast` | `flux_rope_fast` | 0.4.0 | 0.5.0 | none; FLUX RoPE always runs the tuned kernel |
+| `developer.fp8_decode_attn_gqa` | `fp8_decode_attn_gqa` | 0.4.0 | 0.5.0 | none; gfx1201 fp8 decode attention always takes the GQA-shared tile where its shape admits it |
+| `developer.fp8_silu_h` | `fp8_silu_h` | 0.4.0 | 0.5.0 | none; the gfx1201 fp8 v2 gate/up always uses the SiLU-h epilogue where admitted |
+| `developer.g12_fp8_isa` | `g12_fp8_isa` | 0.4.0 | 0.5.0 | none; gfx1201 fp8 prefill always takes the builder F2 GEMM where admitted |
+| `developer.g12_iu4_isa` | `g12_iu4_isa` | 0.4.0 | 0.5.0 | none; gfx1201 symmetric A4 prefill always takes the builder _b1 GEMM where the shape admits it |
+| `developer.g12_iu4_v3` | `g12_iu4_v3` | 0.4.0 | 0.5.0 | none; gfx1201 symmetric IU4 always uses the K1 V3 module where the builder GEMM does not run |
+| `developer.g12_raster` | `g12_raster` | 0.4.0 | 0.5.0 | none; the gfx1201 asymmetric IU4 GEMM always uses the banded raster module |
+| `developer.gated_delta_vector_pm` | `gated_delta_vector_pm` | 0.4.5 | 0.5.0 | none; exact gfx1100 and gfx1201 always run the twins where admitted |
+| `developer.gdn_chunk_pm` | `gdn_chunk_pm` | 0.4.5 | 0.5.0 | none; exact gfx1151 and gfx1100 always run the sealed twins of their variants |
+| `developer.gdn_chunk_prep_pm` | `gdn_chunk_prep_pm` | 0.4.3 | 0.5.0 | none; exact gfx1201 always runs the twin where the chunk scan admits it |
+| `developer.gdn_kkt_gfx1100` | `gdn_kkt_gfx1100` | 0.4.0 | 0.5.0 | none; gfx1100 always takes its GDN KKT path |
+| `developer.gdn_persistent_staged` | `gdn_persistent_staged` | 0.4.5 | 0.5.0 | none; gfx12 always compiles the staged persistent GDN body |
+| `developer.gdn_pre_fuse_off` | `gdn_pre_fuse_off` | 0.4.0 | 0.5.0 | none; the fused GDN pre-kernels always run where admitted |
+| `developer.gdn_prep_fused` | `gdn_prep_fused` | 0.4.0 | 0.5.0 | none; gfx1201 always takes the fused GDN prep route where admitted |
+| `developer.gdn_prep_gfx11` | `gdn_prep_gfx11` | 0.4.0 | 0.5.0 | none; gfx1100 and gfx1151 always take the row-major GDN prep |
+| `developer.gdn_scan_mseg` | `gdn_scan_mseg` | 0.4.0 | 0.5.0 | none; gfx1201 always runs one chunk-scan launch per layer where admitted |
+| `developer.gfx1100_decode_attn_gqa` | `gfx1100_decode_attn_gqa` | 0.4.0 | 0.5.0 | none; gfx1100 Q8 decode attention always takes the GQA-shared tile where its shape admits it |
+| `developer.gfx1100_fa2_r3` | `gfx1100_fa2_r3` | 0.4.0 | 0.5.0 | none; gfx1100 always runs its CU-mode FA2 fill variant |
+| `developer.gfx1100_gated_norm_v2` | `gfx1100_gated_norm_v2` | 0.4.0 | 0.5.0 | none; gfx1100 always runs the v2 gated-norm IU4 producers |
+| `developer.gfx1100_pm_gemm` | `gfx1100_pm_gemm` | 0.4.0 | 0.5.0 | none; gfx1100 always runs the builder V2C tile where admitted |
+| `developer.gfx1151_fa2_twin` | `gfx1151_fa2_twin` | 0.4.0 | 0.5.0 | none; gfx1151 always runs its FA2 fill twin |
+| `developer.gfx1151_q8_decode_attn_gqa` | `gfx1151_q8_decode_attn_gqa` | 0.4.0 | 0.5.0 | none; gfx1151 Q8 decode attention always takes the GQA-shared tile where its shape admits it |
+| `developer.gfx1151_q8_decode_attn_gqa_gemma` | `gfx1151_q8_decode_attn_gqa_gemma` | 0.4.2 | 0.5.0 | none; gfx1151 Gemma 4 Q8 decode always takes the GQA tile where its shape admits it |
+| `developer.iu4_bafold` | `iu4_bafold` | 0.4.0 | 0.5.0 | none; the beta/alpha fold always applies where admitted |
+| `developer.iu4_v2b` | `iu4_v2b` | 0.4.0 | 0.5.0 | none; gfx1151 always takes the V2B tile where admitted |
+| `developer.iu4_v2c` | `iu4_v2c` | 0.4.0 | 0.5.0 | none; gfx1100 always takes the V2C tile where admitted |
+| `developer.iu4_x5` | `iu4_x5` | 0.4.0 | 0.5.0 | none; gfx11 IU4 always uses X5 packets where admitted |
+| `developer.moe_grouped_k2_pm` | `moe_grouped_k2_pm` | 0.4.5 | 0.5.0 | none; exact gfx1100 always runs the twin where admitted |
+| `developer.moe_rotate_i4_pm` | `moe_rotate_i4_pm` | 0.4.3 | 0.5.0 | none; exact gfx1201 always runs the twin where the symmetric IU4 route admits it |
+| `kernel.gfx11_iu4_symfold` | `gfx11_iu4_symfold` | 0.4.0 | 0.5.0 | none; symmetric MQ4V2 artifacts always take the signed-weight IU4 fold |
 
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 309 schema keys, plus the `developer.<name>` namespace.
+**Count:** 308 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -2684,7 +2722,6 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.gfx11_fa2_prefill` | `gfx11_fa2_prefill` | `HIPFIRE_GFX11_FA2_PREFILL` | stable |
 | `kernel.gfx11_iu4_gridspec` | `gfx11_iu4_gridspec` | `HIPFIRE_GFX11_IU4_GRIDSPEC` | stable |
 | `kernel.gfx11_iu4_shape` | `gfx11_iu4_shape` | `HIPFIRE_GFX11_IU4_SHAPE` | experimental |
-| `kernel.gfx11_iu4_symfold` | `gfx11_iu4_symfold` | `HIPFIRE_IU4_SYMFOLD` | experimental |
 | `kernel.gfx11_producer_quant_fused` | `gfx11_producer_quant_fused` | `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED` | stable |
 | `kernel.gfx11_q8_fa2_wide` | `gfx11_q8_fa2_wide` | `HIPFIRE_GFX11_Q8_FA2_WIDE` | experimental |
 | `kernel.gfx12_fa2_prefill` | `gfx12_fa2_prefill` | `HIPFIRE_GFX12_FA2_PREFILL` | stable |

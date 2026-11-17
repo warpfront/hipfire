@@ -5,8 +5,7 @@
 // The Gemma 4 26B-A4B gfx1151 kernels against an f64 CPU reference, at the
 // model's shapes (head_dim 256 / 16q:8kv / window 1024 sliding, head_dim 512 /
 // 16q:2kv full; routed experts M 2816, K 704, top-8):
-//   * decode Q8_0 flash attention (`attention_flash_q8_0_windowed_gemma`); run with
-//     HIPFIRE_GFX1151_Q8_DECODE_ATTN_GQA_GEMMA=0 to compare the reference tile;
+//   * decode Q8_0 flash attention (`attention_flash_q8_0_windowed_gemma`);
 //   * batched prefill attention (`attention_q8_0_prefill_gqa_wmma`);
 //   * the HFQ4-G128 routed down projection, per-row and grouped;
 // plus eager timings of the decode attention at 290 and 32768 keys. Exit 1

@@ -139,8 +139,7 @@ fn try_a8_sigmoid_prepared(
     // Lloyd rides the A4 predicate in place of the symmetric-file requirement.
     let lloyd_wo = wo.dtype == DType::MQ4G256V2Lloyd && lloyd_mmq_a4_route(gpu, n, k);
     let wo_is_a8 = wo.dtype == DType::MQ4G256V2 || lloyd_wo;
-    if !gpu.flags.a8_fused_prod
-        || (!gpu.a8_prefill_active(n, k) && !lloyd_wo)
+    if (!gpu.a8_prefill_active(n, k) && !lloyd_wo)
         || !wo_is_a8
         || !matches!(epilogue, BatchEpilogue::Residual)
     {

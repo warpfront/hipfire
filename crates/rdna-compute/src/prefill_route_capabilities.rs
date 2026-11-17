@@ -24,8 +24,8 @@
 //! `HIPFIRE_GDN_MOE_CHUNK_SCAN`, `HIPFIRE_MOE_ROUTER_FUSED_PREFILL`,
 //! `HIPFIRE_MOE_SHARED_PREPARED_IU4`, `HIPFIRE_FA_PREFILL_PM`,
 //! `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW`, `HIPFIRE_MOE_COMBINE_V2`, `HIPFIRE_FA_PREFILL_PM_QPREP`,
-//! `HIPFIRE_MOE_ROTATE_I4_PM`, `HIPFIRE_GDN_CHUNK_PREP_PM`,
-//! `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI`) is a typed boolean.
+//! `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI`) is a typed boolean; the routes without one run
+//! wherever they are qualified.
 //! An explicit `1` / `0` always wins; unset follows [`qualified`] of the running device's
 //! architecture. The admission predicates (shape, state format, recording, capture, GPU
 //! capability) are unchanged and still apply after the default is resolved. The default callers
@@ -38,11 +38,11 @@
 //! Nested routes retain the parent's resolved flag and admission: `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW`
 //! runs only inside the admitted `HIPFIRE_MOE_ROUTER_FUSED_PREFILL` branch,
 //! `HIPFIRE_FA_PREFILL_PM_QPREP` needs the *resolved* `HIPFIRE_FA_PREFILL_PM` flag (an explicit
-//! PM `0` refuses the fold), and `HIPFIRE_GDN_CHUNK_PREP_PM` runs only inside an admitted
+//! PM `0` refuses the fold), and [`PrefillRoute::GdnChunkPrepPm`] runs only inside an admitted
 //! `HIPFIRE_GDN_MOE_CHUNK_SCAN` layer (an explicit chunk-scan `0` refuses it). For
 //! the [`PrefillRoute::MoeIu4WideTiles`] route only VRAM-resident gate/up is widened (the resident
 //! down stays NT4); host-mapped experts keep their existing NT8 selection for both GEMMs
-//! regardless of qualification. `HIPFIRE_MOE_ROTATE_I4_PM` stays nested beneath the requested
+//! regardless of qualification. [`PrefillRoute::MoeRotateI4Pm`] stays nested beneath the requested
 //! symmetric IU4 route and its frozen C2 producer candidate set (`Gpu::qwen4_moe_rotate128_i4`),
 //! and [`PrefillRoute::PrefillIu4C8Pm`] nests beneath the
 //! [`PrefillRoute::PrefillIu4ProducerFused`] route. `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` still applies
@@ -92,19 +92,19 @@ pub enum PrefillRoute {
     /// ahead of the PM direct attention. Nested beneath [`PrefillRoute::FaPrefillPm`]. Unset
     /// follows its exact-gfx1201 qualification.
     FaPrefillPmQprep,
-    /// `HIPFIRE_MOE_ROTATE_I4_PM`: the down A4 producer `qwen4_moe_rotate128_i4` runs the exact
+    /// The down A4 producer `qwen4_moe_rotate128_i4` runs the exact
     /// PeaceMaker twin `moe_rotate_i4_pm_gfx1201` (grid `[P, K/128, 1]`, wave32) instead of the
-    /// HIP incumbent. Unset follows its exact-gfx1201 qualification.
+    /// HIP incumbent. Qualified on exact gfx1201 only.
     MoeRotateI4Pm,
     /// The PeaceMaker C8 rotate / RMSNorm-rotate producer twins
     /// (`iu4_c8_rotate_pm_gfx1201`, `iu4_c8_rmsnorm_rotate_pm_gfx1201`) run in place of the HIP
     /// exact (`cand_mode = 8`) F3 producers. Nested beneath the
     /// [`PrefillRoute::PrefillIu4ProducerFused`] route. Qualified on exact gfx1201 only.
     PrefillIu4C8Pm,
-    /// `HIPFIRE_GDN_CHUNK_PREP_PM`: the MoE GDN chunk-scan layer runs the PM twin of
+    /// The MoE GDN chunk-scan layer runs the PM twin of
     /// `gdn_chunk_prep` (`gdn_chunk_prep_pm_gfx1201`, 16 key / 32 value heads, rows 1..=8192)
     /// in place of the incumbent preamble. Nested beneath [`PrefillRoute::GdnMoeChunkScan`].
-    /// Unset follows its exact-gfx1201 qualification.
+    /// Qualified on exact gfx1201 only.
     GdnChunkPrepPm,
     /// `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI`: the A3B shared-expert MQ4G256V2 down GEMM folds
     /// `residual += sigmoid(gate) * down` into a gfx12 IU4 ADD epilogue (the builder `_b1` entry

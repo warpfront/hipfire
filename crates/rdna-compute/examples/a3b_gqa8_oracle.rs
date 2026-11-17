@@ -26,11 +26,10 @@
 //   decode [--shape a3b|h2|all]
 //       prints one DECODE line (FNV-1a of the whole out and partials
 //       allocations) per case for whatever route `Gpu::attention_flash_fp8_e4m3_tile`
-//       takes. The decode flag is a process snapshot, so the reference is a second
-//       process:
+//       takes. The non-GQA reference process arm left with its kill switch
+//       (HIPF-396); dumps from two builds still compare byte for byte:
 //         a3b_gqa8_oracle decode --dump-dir cand
-//         HIPFIRE_FP8_DECODE_ATTN_GQA=0 a3b_gqa8_oracle decode --dump-dir ref
-//         diff -rq cand ref             # compares every byte, including guards
+//         diff -rq cand ref             # ref: a dump from the reference build
 //       Directories must be new; hashes alone are not an identity gate.
 //       Which pair ran is visible with HIPFIRE_MODULE_LOAD_AUDIT=1 (the candidate
 //       run loads attention_flash_fp8_e4m3_tile_gqa8_gfx1201 + the dsplit reduce,
@@ -751,7 +750,10 @@ fn bench(gpu: &mut Gpu, shapes: &[Shape]) {
                 )
                 .expect("decode")
             });
-            println!("BENCH_DECODE shape={} ctx={ctx} ms_per_call={ms:.4} (route = env HIPFIRE_FP8_DECODE_ATTN_GQA)", s.name);
+            println!(
+                "BENCH_DECODE shape={} ctx={ctx} ms_per_call={ms:.4}",
+                s.name
+            );
             for t in [q, k, v, pos, out, part] {
                 let _ = gpu.free_tensor(t);
             }

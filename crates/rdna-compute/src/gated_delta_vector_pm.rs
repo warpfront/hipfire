@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! gfx1100 / gfx1201 PeaceMaker twins of the generic gated-delta ops in [`crate::gated_delta_vector`]
-//! (`HIPFIRE_GATED_DELTA_VECTOR_PM`, developer, default on; `=0` restores the hipcc kernels).
+//! gfx1100 / gfx1201 PeaceMaker twins of the generic gated-delta ops in [`crate::gated_delta_vector`];
+//! other arches and refused shapes run the hipcc kernels.
 //!
 //! One embedded module per arch (`kernels/gated_delta_vector_pm_gfx1100.hxaco`,
 //! `kernels/gated_delta_vector_pm_gfx1201.hxaco`, sealed by `scripts/pm-hip-twin.sh`, route A: lift
@@ -31,7 +31,6 @@
 //! Profile timers keep the incumbent kernel names, so attribution buckets are unchanged.
 
 use crate::dispatch::Gpu;
-use std::sync::LazyLock;
 
 /// One arch's sealed twin module.
 #[derive(Debug, PartialEq, Eq)]
@@ -72,9 +71,6 @@ pub const CONV_BLOCK: u32 = 128;
 /// Conv rows per workgroup (`CCD_RPW`); only row slice 0 reads the history.
 pub const CONV_ROWS_PER_WG: usize = 32;
 
-static FLAG: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GATED_DELTA_VECTOR_PM", true));
-
 /// The twin module of an exact arch, if one is sealed.
 pub fn twin_for_arch(arch: &str) -> Option<&'static Twin> {
     match arch {
@@ -95,8 +91,7 @@ pub struct ConvShape {
 /// Why a launch keeps the hipcc kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatedDeltaVectorPmRefusal {
-    Disabled,
-    /// No twin is sealed for this arch (the default-on flag is not a refusal worth logging there).
+    /// No twin is sealed for this arch (the incumbent, not a refusal worth logging).
     Arch,
     HeadDim,
     ConvKernel,
@@ -107,7 +102,6 @@ pub enum GatedDeltaVectorPmRefusal {
 impl std::fmt::Display for GatedDeltaVectorPmRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Disabled => "HIPFIRE_GATED_DELTA_VECTOR_PM is off",
             Self::Arch => "exact gfx1100 / gfx1201 only",
             Self::HeadDim => "RDA twin needs head_dim 128",
             Self::ConvKernel => "conv twin needs 2 <= ksize and ksize - 1 <= 32 history rows",
@@ -119,7 +113,7 @@ impl std::fmt::Display for GatedDeltaVectorPmRefusal {
 impl GatedDeltaVectorPmRefusal {
     fn log_once(self) {
         let index = match self {
-            Self::Disabled | Self::Arch => return,
+            Self::Arch => return,
             Self::HeadDim => 0,
             Self::ConvKernel => 1,
             Self::ConvNotInPlace => 2,
@@ -135,34 +129,29 @@ impl GatedDeltaVectorPmRefusal {
     }
 }
 
-fn common(flag: bool, arch: &str) -> Result<&'static Twin, GatedDeltaVectorPmRefusal> {
-    if !flag {
-        return Err(GatedDeltaVectorPmRefusal::Disabled);
-    }
+fn common(arch: &str) -> Result<&'static Twin, GatedDeltaVectorPmRefusal> {
     twin_for_arch(arch).ok_or(GatedDeltaVectorPmRefusal::Arch)
 }
 
-/// Pure admission of the RDA twin: flag on, an exact-arch twin, `head_dim == 128`.
+/// Pure admission of the RDA twin: an exact-arch twin, `head_dim == 128`.
 pub fn rda_admission(
-    flag: bool,
     arch: &str,
     head_dim: usize,
 ) -> Result<&'static Twin, GatedDeltaVectorPmRefusal> {
-    let twin = common(flag, arch)?;
+    let twin = common(arch)?;
     if head_dim != HEAD_DIM {
         return Err(GatedDeltaVectorPmRefusal::HeadDim);
     }
     Ok(twin)
 }
 
-/// Pure admission of the conv twin: flag on, an exact-arch twin, and the `ksize - 1` history rows
+/// Pure admission of the conv twin: an exact-arch twin, and the `ksize - 1` history rows
 /// fit in row slice 0 (always true for the launcher's `2..=8`); on gfx1201 also the in-place history.
 pub fn conv_admission(
-    flag: bool,
     arch: &str,
     shape: ConvShape,
 ) -> Result<&'static Twin, GatedDeltaVectorPmRefusal> {
-    let twin = common(flag, arch)?;
+    let twin = common(arch)?;
     if shape.ksize < 2 || shape.ksize - 1 > CONV_ROWS_PER_WG {
         return Err(GatedDeltaVectorPmRefusal::ConvKernel);
     }
@@ -191,7 +180,7 @@ impl Gpu {
         &self,
         head_dim: usize,
     ) -> Option<&'static Twin> {
-        match rda_admission(*FLAG, &self.arch, head_dim) {
+        match rda_admission(&self.arch, head_dim) {
             Ok(twin) => Some(twin),
             Err(reason) => {
                 reason.log_once();
@@ -204,7 +193,7 @@ impl Gpu {
         &self,
         shape: ConvShape,
     ) -> Option<&'static Twin> {
-        match conv_admission(*FLAG, &self.arch, shape) {
+        match conv_admission(&self.arch, shape) {
             Ok(twin) => Some(twin),
             Err(reason) => {
                 reason.log_once();
@@ -285,17 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn rda_admission_arch_flag_and_head_dim() {
-        assert_eq!(rda_admission(true, "gfx1100", 128), Ok(&GFX1100));
-        assert_eq!(rda_admission(true, "gfx1201", 128), Ok(&GFX1201));
+    fn rda_admission_arch_and_head_dim() {
+        assert_eq!(rda_admission("gfx1100", 128), Ok(&GFX1100));
+        assert_eq!(rda_admission("gfx1201", 128), Ok(&GFX1201));
         for arch in ["gfx1100", "gfx1201"] {
-            assert_eq!(
-                rda_admission(false, arch, 128),
-                Err(GatedDeltaVectorPmRefusal::Disabled)
-            );
             for hd in [0, 64, 127, 129, 256] {
                 assert_eq!(
-                    rda_admission(true, arch, hd),
+                    rda_admission(arch, hd),
                     Err(GatedDeltaVectorPmRefusal::HeadDim),
                     "{arch} {hd}"
                 );
@@ -303,7 +288,7 @@ mod tests {
         }
         for arch in ["gfx1101", "gfx1151", "gfx942", "gfx1100x", ""] {
             assert_eq!(
-                rda_admission(true, arch, 128),
+                rda_admission(arch, 128),
                 Err(GatedDeltaVectorPmRefusal::Arch),
                 "{arch}"
             );
@@ -311,38 +296,31 @@ mod tests {
     }
 
     #[test]
-    fn conv_admission_arch_flag_and_ksize() {
+    fn conv_admission_arch_and_ksize() {
         for k in 2..=8 {
             assert_eq!(
-                conv_admission(true, "gfx1100", conv(k, true)),
+                conv_admission("gfx1100", conv(k, true)),
                 Ok(&GFX1100),
                 "{k}"
             );
             assert_eq!(
-                conv_admission(true, "gfx1100", conv(k, false)),
+                conv_admission("gfx1100", conv(k, false)),
                 Ok(&GFX1100),
                 "{k}"
             );
         }
-        assert_eq!(
-            conv_admission(true, "gfx1100", conv(33, true)),
-            Ok(&GFX1100)
-        );
+        assert_eq!(conv_admission("gfx1100", conv(33, true)), Ok(&GFX1100));
         for arch in ["gfx1100", "gfx1201"] {
             for k in [0, 1, 34, 1000] {
                 assert_eq!(
-                    conv_admission(true, arch, conv(k, true)),
+                    conv_admission(arch, conv(k, true)),
                     Err(GatedDeltaVectorPmRefusal::ConvKernel),
                     "{arch} {k}"
                 );
             }
-            assert_eq!(
-                conv_admission(false, arch, conv(4, true)),
-                Err(GatedDeltaVectorPmRefusal::Disabled)
-            );
         }
         assert_eq!(
-            conv_admission(true, "gfx1151", conv(4, true)),
+            conv_admission("gfx1151", conv(4, true)),
             Err(GatedDeltaVectorPmRefusal::Arch)
         );
     }
@@ -351,12 +329,12 @@ mod tests {
     fn conv_gfx1201_admits_in_place_only() {
         for k in 2..=8 {
             assert_eq!(
-                conv_admission(true, "gfx1201", conv(k, true)),
+                conv_admission("gfx1201", conv(k, true)),
                 Ok(&GFX1201),
                 "{k}"
             );
             assert_eq!(
-                conv_admission(true, "gfx1201", conv(k, false)),
+                conv_admission("gfx1201", conv(k, false)),
                 Err(GatedDeltaVectorPmRefusal::ConvNotInPlace),
                 "{k}"
             );

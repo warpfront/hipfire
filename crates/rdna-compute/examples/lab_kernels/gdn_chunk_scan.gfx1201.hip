@@ -49,7 +49,7 @@
 #define GS_KP 132
 #define GS_AP 68
 #ifdef GDN_SCAN_MULTISEG
-// Multi-segment launch (`gdn_chunk_scan_bf16_mseg`, HIPFIRE_GDN_SCAN_MSEG):
+// Multi-segment launch (`gdn_chunk_scan_bf16_mseg`):
 // T is the layer's whole row count, walked in commit segments of GS_SEG rows.
 #define GS_SEG 512
 #endif

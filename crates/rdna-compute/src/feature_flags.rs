@@ -51,9 +51,9 @@ pub struct FeatureFlags {
     /// Quality cost ~+0.016 WT2-24 KLD on the MQ4-XT speed rung
     /// (gfx1201: 0.048028 -> 0.063890).
     pub iu4_prefill: Option<bool>,
-    /// Exact gfx1201 symmetric A4 prefill: builder-emitted `_b1` GEMM
-    /// (`HIPFIRE_G12_IU4_ISA`). Default on after byte-exact G3 and +7.04%
-    /// pp8192 G4; `=0` restores hipcc K1 when that route is selected.
+    /// Exact gfx1201 symmetric A4 prefill: builder-emitted `_b1` GEMM. Always
+    /// true in production (no env read); oracles clear it to pin the hipcc K1
+    /// V3 anchor.
     pub g12_iu4_isa: bool,
     /// Oracle-accepted decode twins (`kernel.pm_decode`, `HIPFIRE_PM_DECODE`):
     /// exact gfx1201 loads the embedded builder images of
@@ -67,8 +67,6 @@ pub struct FeatureFlags {
     /// `HIPFIRE_GFX11_A8_PREFILL`); opt-in, default off. Takes precedence over
     /// the IU4 W4A4 projections wherever it is admitted.
     pub gfx11_a8_prefill: bool,
-    /// Fuse A8 sidecar emission into the four activation producers (default on).
-    pub a8_fused_prod: bool,
     /// Qwen4 chunked GDN prefill (`HIPFIRE_QWEN4_GDN_CONV_QKNORM`): the
     /// convolution also writes the normalized Q/K, dropping the separate
     /// Q/K-norm launch. Bytes identical to the two-launch pair. Exact gfx1151
@@ -272,18 +270,6 @@ pub struct FeatureFlags {
     /// `LANE_WMMA_PREFILL_SPLIT_ROWS` (row-count invariant per row). Default on for exact
     /// gfx1201 (`=0` kills it); also gated by the lane WMMA flag.
     pub qwen4_prefill_lwmma_dense: bool,
-    /// EP2 all-reduce / sequence-parallel HC apply fast path (`HIPFIRE_EP_AR_FAST_APPLY`): bf16
-    /// rounding by selects instead of the branchy `hip_bfloat16` casts (bit-identical for all
-    /// 2^32 inputs) and, for tagged launches of at most `AR_HC_SPLIT_MAX_ROWS` rows, one lane
-    /// per (granule, branch). Byte-identical. Default on for exact gfx1201 (`=0` kills it).
-    pub ep_ar_fast_apply: bool,
-    /// EP2 fused all-reduce + HC write launch grid (`HIPFIRE_EP_AR_WIDE_GRID`): launches the
-    /// non-split entries (`ar_hc_write_d8_*` / `ar_hc_write_*`, 13+ rows: wide verify and lane
-    /// steps, short prefill tiles) on up to 64 blocks of up to 512 lanes (one granule per lane up
-    /// to 51 rows, at most 3 up to 153 rows; larger launches keep it) instead of the 16-block
-    /// default shape. Byte-identical (the per-granule arithmetic
-    /// does not depend on which lane runs it). Default on for exact gfx1201 (`=0` kills it).
-    pub ep_ar_wide_grid: bool,
     /// The QSA select score scratch is reserved at the call's shape bound
     /// (`HIPFIRE_QWEN4_QSA_SCORES_RESERVE`), so a growing block count never regrows the shared
     /// F16 scratch (device sync + free + malloc). Default on for exact gfx1201.
@@ -299,10 +285,6 @@ pub struct FeatureFlags {
     /// (`kernel.gfx11_iu4_shape`, default on). gfx1151 keeps its shipped
     /// SET-only selection regardless of this setting.
     pub gfx11_iu4_shape: bool,
-    /// Exploit MQ4V2's symmetric `zp = -8 * scale` contract by rebiasing
-    /// packed weight codes once and using signed-weight IU4 WMMA
-    /// (`kernel.gfx11_iu4_symfold`). Default on for symmetric gfx1100/gfx1151 only.
-    pub gfx11_iu4_symfold: bool,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -693,18 +675,6 @@ pub struct FeatureFlags {
     /// The same `HIPFIRE_FA_PREFILL_PM_QPREP` key resolved for the native fp8-E4M3 KV codec;
     /// qualification as [`Self::fa_prefill_pm_fp8_kv`] (on only on exact gfx1201 when unset).
     pub fa_prefill_pm_qprep_fp8_kv: bool,
-    /// `HIPFIRE_MOE_ROTATE_I4_PM` (`developer.moe_rotate_i4_pm`): typed flag for the exact
-    /// PeaceMaker twin of the down A4 producer `qwen4_moe_rotate128_i4`, resolved through its
-    /// qualification (on only on exact gfx1201 when unset; explicit 1 opts in, 0 kills). Raw
-    /// inventory, the requested symmetric IU4 route, the C2 candidate set and the launch shape
-    /// are applied at selection.
-    pub moe_rotate_i4_pm: bool,
-    /// `HIPFIRE_GDN_CHUNK_PREP_PM` (`developer.gdn_chunk_prep_pm`): typed flag for the PM
-    /// twin of `gdn_chunk_prep` (A3B 16/32-head GDN chunk-scan preamble), resolved through its
-    /// qualification (on only on exact gfx1201 when unset; explicit 1 opts in, 0 kills).
-    /// Independent of the chunk-scan flag as a flag; the MoE chunk-scan layer admission still
-    /// applies in `hipfire-arch-qwen35`.
-    pub gdn_chunk_prep_pm: bool,
     /// gfx1201 packet-minimal Q128 FA2 body (`HIPFIRE_GFX12_FA_PACKET`,
     /// `kernel.gfx12_fa_packet`). Default ON on exact gfx1201; `=0` opts out
     /// to the route-N body. Exact stage-b arithmetic; any raw-O bit difference
@@ -848,8 +818,6 @@ pub struct FeatureFlags {
     pub mq_f16_projection_off: bool,
     /// S4: `HIPFIRE_MQ_F16_RESIDUAL_OFF=1` restores F32 residual producers.
     pub mq_f16_residual_off: bool,
-    /// S5: `HIPFIRE_GDN_PRE_FUSE_OFF=1` restores unfused GDN pre-kernels.
-    pub gdn_pre_fuse_off: bool,
     /// S7: `HIPFIRE_DRAFT_COLLAPSE_OFF=1` restores scalar draft embeddings. Also
     /// vetoes the gfx1201 DFlash draft overwrite-GEMM route
     /// (`gemm_mq4g256v2_overwrite_gfx12_dflash`), restoring memset + residual.
@@ -873,10 +841,6 @@ pub struct FeatureFlags {
     /// per-row `topk_values_batched_f32` / `argmax_f32_batched` launches (the
     /// gfx1201 multi-block re-grid is default-on there).
     pub select_regrid_off: bool,
-    /// PeaceMaker B4: on exact gfx1201 the re-grid batched argmax runs the builder
-    /// twin `argmax_f32_batched_regrid_pm_gfx1201` (byte-identical, certified);
-    /// `HIPFIRE_ARGMAX_REGRID_PM=0` restores the hipcc re-grid kernel.
-    pub argmax_regrid_pm: bool,
     /// Flash-Next lane-step PeaceMaker row kernels (`HIPFIRE_FN_LANE_PM_ROWS`):
     /// multi-column GEMVs that keep every column byte-identical to the 1-row
     /// incumbent while sharing activation loads across weight rows. Default on
@@ -1232,11 +1196,10 @@ impl FeatureFlags {
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
-            g12_iu4_isa: parse_bool("HIPFIRE_G12_IU4_ISA").unwrap_or(true),
+            g12_iu4_isa: true,
             pm_decode: parse_bool("HIPFIRE_PM_DECODE").unwrap_or(arch == "gfx1201"),
             a8_prefill: parse_bool("HIPFIRE_A8_PREFILL").unwrap_or(false),
             gfx11_a8_prefill: parse_bool("HIPFIRE_GFX11_A8_PREFILL").unwrap_or(false),
-            a8_fused_prod: parse_bool("HIPFIRE_A8_FUSED_PROD").unwrap_or(true),
             qwen4_gdn_conv_qknorm: parse_bool("HIPFIRE_QWEN4_GDN_CONV_QKNORM")
                 .unwrap_or(halo_hyper_default),
             qwen4_gdn_q8_inline: parse_bool("HIPFIRE_QWEN4_GDN_Q8_INLINE").unwrap_or(false),
@@ -1314,14 +1277,11 @@ impl FeatureFlags {
             qwen4_lane_wmma: parse_bool("HIPFIRE_QWEN4_LANE_WMMA").unwrap_or(true),
             qwen4_prefill_lwmma_dense: parse_bool("HIPFIRE_QWEN4_PREFILL_LWMMA_DENSE")
                 .unwrap_or(true),
-            ep_ar_fast_apply: parse_bool("HIPFIRE_EP_AR_FAST_APPLY").unwrap_or(true),
-            ep_ar_wide_grid: parse_bool("HIPFIRE_EP_AR_WIDE_GRID").unwrap_or(true),
             qwen4_qsa_scores_reserve: parse_bool("HIPFIRE_QWEN4_QSA_SCORES_RESERVE")
                 .unwrap_or(true),
             qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(exact_unit_default),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
-            gfx11_iu4_symfold: parse_bool("HIPFIRE_IU4_SYMFOLD").unwrap_or(true),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -1550,24 +1510,6 @@ impl FeatureFlags {
                 arch,
                 crate::prefill_route_capabilities::PrefillRoute::FaPrefillPmQprep,
             ),
-            moe_rotate_i4_pm: crate::prefill_route_capabilities::enabled(
-                value("HIPFIRE_MOE_ROTATE_I4_PM").ok().map(|raw| {
-                    hipfire_config::parse_typed_bool(&raw).expect(
-                        "HIPFIRE_MOE_ROTATE_I4_PM is not a boolean: expected true, false, 1 or 0",
-                    )
-                }),
-                arch,
-                crate::prefill_route_capabilities::PrefillRoute::MoeRotateI4Pm,
-            ),
-            gdn_chunk_prep_pm: crate::prefill_route_capabilities::enabled(
-                value("HIPFIRE_GDN_CHUNK_PREP_PM").ok().map(|raw| {
-                    hipfire_config::parse_typed_bool(&raw).expect(
-                        "HIPFIRE_GDN_CHUNK_PREP_PM is not a boolean: expected true, false, 1 or 0",
-                    )
-                }),
-                arch,
-                crate::prefill_route_capabilities::PrefillRoute::GdnChunkPrepPm,
-            ),
             gfx12_fa_packet: parse_bool("HIPFIRE_GFX12_FA_PACKET").unwrap_or(arch == "gfx1201"),
             attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT").unwrap_or(arch == "gfx1201"),
             attn_qresident_v2: parse_bool("HIPFIRE_ATTN_QRESIDENT_V2").unwrap_or(arch == "gfx1201"),
@@ -1650,7 +1592,6 @@ impl FeatureFlags {
             mq_f16_projection_off: value("HIPFIRE_MQ_F16_PROJECTION_OFF").ok().as_deref()
                 == Some("1"),
             mq_f16_residual_off: value("HIPFIRE_MQ_F16_RESIDUAL_OFF").ok().as_deref() == Some("1"),
-            gdn_pre_fuse_off: value("HIPFIRE_GDN_PRE_FUSE_OFF").ok().as_deref() == Some("1"),
             draft_collapse_off: value("HIPFIRE_DRAFT_COLLAPSE_OFF").ok().as_deref() == Some("1"),
             draft_shared_qkv_rotation: parse_bool("HIPFIRE_DRAFT_SHARED_QKV_ROTATION")
                 .unwrap_or(arch == "gfx1100"),
@@ -1661,7 +1602,6 @@ impl FeatureFlags {
             mq_prologue_fuse_off: value("HIPFIRE_MQ_PROLOGUE_FUSE_OFF").ok().as_deref()
                 == Some("1"),
             select_regrid_off: value("HIPFIRE_SELECT_REGRID_OFF").ok().as_deref() == Some("1"),
-            argmax_regrid_pm: value("HIPFIRE_ARGMAX_REGRID_PM").ok().as_deref() != Some("0"),
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
             mq6_rows_split: parse_bool("HIPFIRE_MQ6_ROWS_SPLIT")
                 .unwrap_or(matches!(arch, "gfx1201" | "gfx1100")),
@@ -2213,18 +2153,6 @@ impl FeatureFlags {
         self.arch == "gfx1201"
     }
 
-    /// EP2 AR / SP HC apply fast path (`HIPFIRE_EP_AR_FAST_APPLY`, default on, `=0` kills it).
-    /// Exact gfx1201 only (the only arch with those kernels).
-    pub fn ep_ar_fast_apply_enabled(&self) -> bool {
-        self.ep_ar_fast_apply && self.arch == "gfx1201"
-    }
-
-    /// EP2 AR wide launch grid (`HIPFIRE_EP_AR_WIDE_GRID`, default on, `=0` kills it). Exact
-    /// gfx1201 only (the only arch with the kernel).
-    pub fn ep_ar_wide_grid_enabled(&self) -> bool {
-        self.ep_ar_wide_grid && self.arch == "gfx1201"
-    }
-
     /// Decode HC read norm + paired write k4 gate GEMV in one launch. Exact gfx1201 only.
     pub fn qwen4_hc_pair_decode_enabled(&self) -> bool {
         self.arch == "gfx1201"
@@ -2375,7 +2303,6 @@ impl FeatureFlags {
             pm_decode: false,
             a8_prefill: false,
             gfx11_a8_prefill: false,
-            a8_fused_prod: false,
             qwen4_gdn_conv_qknorm: false,
             qwen4_gdn_q8_inline: false,
             qwen4_gdn_i8_fuse: false,
@@ -2415,13 +2342,10 @@ impl FeatureFlags {
             qwen4_bf16_allrows: false,
             qwen4_lane_wmma: false,
             qwen4_prefill_lwmma_dense: false,
-            ep_ar_fast_apply: false,
-            ep_ar_wide_grid: false,
             qwen4_qsa_scores_reserve: false,
             qwen4_ple_fuse: false,
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,
-            gfx11_iu4_symfold: false,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,
@@ -2534,8 +2458,6 @@ impl FeatureFlags {
             fa_prefill_pm_fp8_kv: false,
             fa_prefill_pm_qprep: false,
             fa_prefill_pm_qprep_fp8_kv: false,
-            moe_rotate_i4_pm: false,
-            gdn_chunk_prep_pm: false,
             gfx12_fa_packet: false,
             attn_qresident: false,
             attn_qresident_v2: false,
@@ -2575,14 +2497,12 @@ impl FeatureFlags {
             hidden_scatter_fuse_off: false,
             mq_f16_projection_off: false,
             mq_f16_residual_off: false,
-            gdn_pre_fuse_off: false,
             draft_collapse_off: false,
             draft_shared_qkv_rotation: false,
             draft_shared_ffn_rotation: false,
             draft_shared_ctx_kv_rotation: false,
             mq_prologue_fuse_off: false,
             select_regrid_off: false,
-            argmax_regrid_pm: false,
             fn_lane_pm_rows: false,
             mq6_rows_split: false,
             qwen4_mq6_r8_pk: false,
@@ -4168,66 +4088,6 @@ mod tests {
         }
     }
 
-    /// The EP2 AR fast apply is default on (`=0` kills) and reaches exact gfx1201 only.
-    #[test]
-    fn ep_ar_fast_apply_defaults_on_exact_gfx1201() {
-        let with = |value: &'static str| {
-            move |n: &str| -> std::result::Result<String, ()> {
-                if n == "HIPFIRE_EP_AR_FAST_APPLY" {
-                    Ok(value.into())
-                } else {
-                    Err(())
-                }
-            }
-        };
-        for arch in [
-            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
-        ] {
-            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(
-                unset.ep_ar_fast_apply_enabled(),
-                arch == "gfx1201",
-                "{arch}: unset"
-            );
-            let off = FeatureFlags::from_lookup(arch, with("0"));
-            assert!(!off.ep_ar_fast_apply_enabled(), "{arch}: 0");
-            let on = FeatureFlags::from_lookup(arch, with("1"));
-            assert_eq!(
-                on.ep_ar_fast_apply_enabled(),
-                arch == "gfx1201",
-                "{arch}: 1"
-            );
-        }
-        assert!(!FeatureFlags::for_test("gfx1201").ep_ar_fast_apply_enabled());
-    }
-
-    /// The EP2 AR wide grid is default on (`=0` kills) and reaches exact gfx1201 only.
-    #[test]
-    fn ep_ar_wide_grid_defaults_on_exact_gfx1201() {
-        let with = |value: &'static str| {
-            move |n: &str| -> std::result::Result<String, ()> {
-                if n == "HIPFIRE_EP_AR_WIDE_GRID" {
-                    Ok(value.into())
-                } else {
-                    Err(())
-                }
-            }
-        };
-        for arch in [
-            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
-        ] {
-            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(
-                unset.ep_ar_wide_grid_enabled(),
-                arch == "gfx1201",
-                "{arch}: unset"
-            );
-            let off = FeatureFlags::from_lookup(arch, with("0"));
-            assert!(!off.ep_ar_wide_grid_enabled(), "{arch}: 0");
-        }
-        assert!(!FeatureFlags::for_test("gfx1201").ep_ar_wide_grid_enabled());
-    }
-
     /// The decode HC read/write pair fusion reaches exact gfx1201 only.
     #[test]
     fn qwen4_hc_pair_decode_exact_gfx1201() {
@@ -4976,83 +4836,6 @@ mod tests {
                 assert!(!flags.fa_prefill_pm_qprep, "{arch}: pm {pm:?}");
                 assert!(!flags.fa_prefill_pm_qprep_fp8_kv, "{arch}: fp8 pm {pm:?}");
             }
-        }
-    }
-
-    #[test]
-    fn moe_rotate_i4_pm_follows_its_qualification_and_explicit_overrides() {
-        use crate::prefill_route_capabilities::{qualified, PrefillRoute};
-        for arch in [
-            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
-        ] {
-            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(
-                qualified(arch, PrefillRoute::MoeRotateI4Pm),
-                arch == "gfx1201",
-                "{arch}"
-            );
-            assert_eq!(unset.moe_rotate_i4_pm, arch == "gfx1201", "{arch}");
-            assert!(!FeatureFlags::for_test(arch).moe_rotate_i4_pm, "{arch}");
-            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
-                let flags = FeatureFlags::from_lookup(arch, |name| {
-                    if name == "HIPFIRE_MOE_ROTATE_I4_PM" {
-                        Ok(raw.into())
-                    } else {
-                        Err(())
-                    }
-                });
-                // The flag is the typed request only; raw inventory is applied at selection.
-                assert_eq!(flags.moe_rotate_i4_pm, want, "{arch}: {raw}");
-                // No other route flag moves with it.
-                assert_eq!(flags.fa_prefill_pm, unset.fa_prefill_pm, "{arch}: {raw}");
-            }
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "HIPFIRE_MOE_ROTATE_I4_PM is not a boolean")]
-    fn moe_rotate_i4_pm_rejects_a_non_boolean_spelling() {
-        let _ = FeatureFlags::from_lookup("gfx1201", |name| {
-            if name == "HIPFIRE_MOE_ROTATE_I4_PM" {
-                Ok("on".into())
-            } else {
-                Err(())
-            }
-        });
-    }
-
-    #[test]
-    fn gdn_chunk_prep_pm_follows_its_qualification_with_explicit_override() {
-        use crate::prefill_route_capabilities::{qualified, raw_inventory, PrefillRoute};
-        for arch in [
-            "gfx1201", "gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown",
-        ] {
-            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
-            assert_eq!(
-                unset.gdn_chunk_prep_pm,
-                qualified(arch, PrefillRoute::GdnChunkPrepPm)
-            );
-            assert_eq!(unset.gdn_chunk_prep_pm, arch == "gfx1201", "{arch}");
-            assert!(!FeatureFlags::for_test(arch).gdn_chunk_prep_pm);
-            for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
-                let flags = FeatureFlags::from_lookup(arch, |name| {
-                    if name == "HIPFIRE_GDN_CHUNK_PREP_PM" {
-                        Ok(raw.into())
-                    } else {
-                        Err(())
-                    }
-                });
-                assert_eq!(flags.gdn_chunk_prep_pm, want, "{arch}: {raw}");
-                // Independent of every other route flag: they keep their own resolution.
-                assert_eq!(flags.fa_prefill_pm, arch == "gfx1201", "{arch}");
-                assert_eq!(flags.fa_prefill_pm_qprep, arch == "gfx1201", "{arch}");
-            }
-            // An explicit 1 resolves on whatever the architecture; the launcher admission
-            // adds the raw inventory (exact gfx1201).
-            assert_eq!(
-                raw_inventory(arch, PrefillRoute::GdnChunkPrepPm),
-                arch == "gfx1201"
-            );
         }
     }
 

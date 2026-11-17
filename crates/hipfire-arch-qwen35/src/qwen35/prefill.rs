@@ -2063,9 +2063,9 @@ fn next_ordinary_chunk_len(
 /// sequential prefill runs eager, with no chain verify or MoE/TP/EP.
 /// Check the exact same producer predicates used by the fallback decisions.
 fn lean_pbs_route(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwen35Config, n: usize) -> bool {
-    // An A8-owned site has a fused A8 producer only with A8_FUSED_PROD on;
+    // An A8-owned site always has a fused A8 producer;
     // FFN down additionally needs F1-lite (the w_down AWQ scale, 128-row hidden).
-    let a8 = |k: usize| gpu.flags.a8_fused_prod && gpu.a8_prefill_active(n, k);
+    let a8 = |k: usize| gpu.a8_prefill_active(n, k);
     let a8_down = a8(config.hidden_dim) && config.hidden_dim % 128 == 0;
     matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
         && config.num_experts == 0
