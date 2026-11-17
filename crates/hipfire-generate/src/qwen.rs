@@ -4471,6 +4471,19 @@ fn spec_floor_route_key(gpu: &rdna_compute::Gpu) -> hipfire_runtime::spec_prices
 /// on the R9700 HIP-graph route, SPEC-AR-FLOOR §7.10 rule 6).
 const SPEC_FLOOR_UNPRICED_AR: usize = 2;
 
+/// Verified rows of a finished window for the driver floor and the load's
+/// price cells (0 for an AR token). A `FloorControl::Driver` speculator
+/// reports its verified rows as `SpecStep::proposed`: the qwen35 DFlash
+/// step's `drafted` is `[seed, d1..d(B-1)]`, so a full block is `B` rows,
+/// the `full_rows` its `DriverFloor` prices by.
+fn spec_floor_rows(ar_step: bool, proposed: usize) -> usize {
+    if ar_step {
+        0
+    } else {
+        proposed
+    }
+}
+
 /// A finished window waiting for its wall time (the next loop mark).
 #[derive(Clone, Copy, Debug)]
 struct SpecFloorPending {
@@ -4997,6 +5010,130 @@ mod spec_floor_driver_tests {
         assert_eq!(steady, jitter);
         assert_eq!(steady.3, 1, "the think-close re-arms once");
         assert!(!steady.1.is_empty(), "checkpoints were judged");
+    }
+
+    /// The incumbent's first 40 windows of the G19R requests on the R9700
+    /// `qwen3.8:27b` (`prose_river_short` and `fiction_lighthouse`, gate 20).
+    const G19R_RIVER: [usize; 40] = [
+        1, 2, 2, 2, 2, 5, 2, 2, 3, 1, 2, 3, 2, 1, 2, 2, 2, 3, 2, 2, 3, 3, 3, 4, 2, 1, 1, 1, 2, 3,
+        1, 5, 2, 1, 1, 1, 3, 2, 2, 1,
+    ];
+    const G19R_LIGHTHOUSE: [usize; 40] = [
+        1, 2, 1, 4, 1, 2, 2, 3, 5, 1, 2, 2, 5, 1, 3, 3, 4, 1, 2, 1, 1, 1, 3, 2, 1, 2, 1, 3, 8, 8,
+        5, 1, 1, 8, 8, 3, 4, 3, 1, 3,
+    ];
+
+    /// One request on a 16-row DFlash load, driven the way `generate_spec`
+    /// drives it: route key and policy at request start, then per loop the
+    /// mark, the plan and the window with the verified rows a DFlash step
+    /// reports (`drafted = [seed, d1..d15]`: 16; every 9th window a 12-row
+    /// lookup Tail). Windows take 39 ms (33 ms at 12 rows); AR tokens 23.4
+    /// ms, the first two after a window 26 ms. The load's first `tape` AR
+    /// tokens record the PM4 tape (the first-use marker moves across them).
+    fn load_request(
+        df: &mut DriverFloor,
+        seed_explicit: bool,
+        counts: &[usize],
+        tape: &mut usize,
+    ) -> serde_json::Value {
+        use hipfire_runtime::spec_prices::ArRouteKey;
+        df.prices.set_route(ArRouteKey::new(2, true));
+        let start = 100;
+        let policy = select_spec_floor_policy(
+            FloorOwner::Driver,
+            true,
+            false,
+            Some(DEFAULT_BREAK_EVEN),
+            seed_explicit,
+            df.prices.pinned(start),
+        );
+        let mut run = SpecFloorRun::new(policy, None);
+        run.start(df, start);
+        let mut now = Instant::now();
+        let (mut kernels, mut spec, mut position, mut ar_run) = (0, 0, start, 0);
+        while spec < counts.len() {
+            run.mark(df, now, marker(kernels));
+            let action = run.plan(df, 15);
+            let ar_step = !matches!(action, Action::Native(_));
+            let (tokens, proposed, ms) = if ar_step {
+                if *tape > 0 {
+                    *tape -= 1;
+                    kernels += 1;
+                }
+                ar_run += 1;
+                (1, 0, if ar_run <= 2 { 26.0 } else { 23.4 })
+            } else {
+                ar_run = 0;
+                spec += 1;
+                let tail = spec % 9 == 0;
+                (
+                    counts[spec - 1],
+                    if tail { 12 } else { 16 },
+                    if tail { 33.0 } else { 39.0 },
+                )
+            };
+            now += Duration::from_secs_f64(ms / 1e3);
+            let rows = spec_floor_rows(ar_step, proposed);
+            run.window_done(
+                action,
+                tokens,
+                rows,
+                position,
+                position + tokens,
+                true,
+                &[1],
+            );
+            position += tokens;
+        }
+        run.report(Some(df))
+    }
+
+    #[test]
+    fn a_load_pins_within_its_first_requests_and_then_runs_no_probe() {
+        // A full DFlash block reports its 16 verified rows: the full-block
+        // price cell the pin waits for is the one these windows fill.
+        let mut df = DriverFloor::new(16, hipfire_runtime::spec::DRIVER_FLOOR_PROBE_TOKENS, false);
+        assert_eq!(spec_floor_rows(false, 16), df.prices.full_rows());
+        assert_eq!(spec_floor_rows(true, 0), 0);
+        // G19R order on one load; the first request's probe records the tape.
+        let mut tape = 8;
+        let orders = [
+            (&G19R_RIVER, false),
+            (&G19R_LIGHTHOUSE, false),
+            (&G19R_RIVER, false),
+            (&G19R_LIGHTHOUSE, true),
+        ];
+        let reports: Vec<_> = orders
+            .iter()
+            .map(|&(counts, seed)| load_request(&mut df, seed, counts, &mut tape))
+            .collect();
+        let field = |i: usize, key: &str| reports[i][key].clone();
+        // Request 1: unpriced; its calibration probe only records the tape.
+        assert_eq!(field(0, "policy"), "unpriced");
+        assert_eq!(field(0, "probe_tokens"), 6);
+        assert_eq!(field(0, "schedule"), "s3,a6,s37");
+        // Request 2: its probe leaves four priced AR tokens; the bucket pins
+        // at the probe's last token (observation 3 windows + 6 AR = 9).
+        assert_eq!(field(1, "policy"), "counts-pinned");
+        assert_eq!(field(1, "pinned_at"), 9);
+        assert_eq!(field(1, "ar_us"), 23_400.0);
+        assert_eq!(
+            field(1, "break_even"),
+            (39.0f64 / 23.4 * 1000.0).round() / 1000.0
+        );
+        // Requests 3 and 4 (the last seeded) start pinned: no probe, no AR
+        // token, checkpoints judged on the pin.
+        for i in [2, 3] {
+            assert_eq!(field(i, "policy"), "counts-pinned", "request {}", i + 1);
+            assert_eq!(field(i, "probe_tokens"), 0, "request {}", i + 1);
+            assert_eq!(field(i, "pinned_at"), serde_json::Value::Null);
+            assert_eq!(field(i, "schedule"), "s40", "request {}", i + 1);
+            assert!(reports[i]["checkpoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["decision"] == "keep"));
+        }
     }
 
     /// 2 tokens per window against b = 3.75: retired at window 8 (16 <
@@ -6714,7 +6851,7 @@ pub fn generate_spec(
             floor_run.window_done(
                 floor_action,
                 keep,
-                if ar_step { 0 } else { step.proposed + 1 },
+                spec_floor_rows(ar_step, step.proposed),
                 position_before,
                 position,
                 window_steady,
