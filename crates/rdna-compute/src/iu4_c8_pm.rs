@@ -3,9 +3,9 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! PeaceMaker twins of the exact (`cand_mode = 8`) gfx1201 IU4 C8 producers that feed the A3B
-//! F3 prefill route (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`), behind
-//! `HIPFIRE_PREFILL_IU4_C8_PM` ([`PrefillRoute::PrefillIu4C8Pm`], qualified on exact gfx1201:
-//! unset follows the qualification, `1` opts in, `0` kills).
+//! F3 prefill route ([`PrefillRoute::PrefillIu4ProducerFused`]), behind
+//! [`PrefillRoute::PrefillIu4C8Pm`] (qualified on exact gfx1201 only; other arches keep the HIP
+//! exact producer).
 //!
 //! * [`Gpu::mq_rotate_x_i4_c8_pm`]: twin of `Gpu::rotate_x_mq_i4_gfx12_exact_batched`
 //!   (`iu4_c8_rotate_pm_gfx1201`, block 32, grid `rows * K / 256`, K 2048 or 4096).
@@ -14,10 +14,10 @@
 //!   block 256, grid `rows`, K 2048).
 //!
 //! Both are standalone low-level launchers with the exact signature of their HIP twin: callable
-//! regardless of any flag (the byte oracle `iu4_c8_pm_oracle` calls them directly), eager only,
+//! regardless of qualification, eager only,
 //! no HIP fallback, and they always store the f32 rotated side output (`x_out` / `x_rot` must be
 //! `Some`). The production exact wrappers in `gemv.rs` intercept into them only where
-//! [`Gpu::iu4_c8_pm_admitted`] holds (both flags, raw inventory, eager, supported shape and
+//! [`Gpu::iu4_c8_pm_admitted`] holds (both routes qualified, raw inventory, eager, supported shape and
 //! operands) and otherwise run the unchanged HIP exact path. The shared-down SwiGLU producer and
 //! the sigmoid transform keep the incumbent.
 //!
@@ -34,7 +34,7 @@
 //!   [`Gpu::mq_rotate_x_i4_c8_pm`] (rotated f32 row, sidecar and normalized row).
 //!
 //! [`Gpu::iu4_c8_pm_sigmoid_rotate_admitted`] / [`Gpu::iu4_c8_pm_norm_out_admitted`] are the
-//! production admissions (same flags, eager and shape rules as the plain producers, plus the
+//! production admissions (same qualification, eager and shape rules as the plain producers, plus the
 //! extra operand); a refusal keeps the unfused chain.
 //!
 //! The kernarg ABI is the frozen 72-byte block of the PeaceMaker family
@@ -42,7 +42,7 @@
 //! `@16`, signs1 f32 `@24`, signs2 f32 `@32`, norm weight f32 `@40` (null for rotate), AWQ f32
 //! `@48` (null when absent), rows i32 `@56`, K i32 `@60`, eps f32 `@64`, padding `@68`.
 
-use crate::prefill_route_capabilities::{raw_inventory, PrefillRoute};
+use crate::prefill_route_capabilities::{qualified, raw_inventory, PrefillRoute};
 use crate::scratch::{Int4MmqPrepared, Int4MmqReservation};
 use crate::{DType, Gpu, GpuTensor};
 use hip_bridge::{HipError, HipResult};
@@ -85,9 +85,9 @@ pub fn c8_pm_supported_shape(is_norm: bool, k: usize, rows: usize) -> bool {
 /// Why a production exact C8 producer keeps the HIP incumbent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum C8PmRefusal {
-    /// `HIPFIRE_PREFILL_IU4_C8_PM` unset or `0`.
+    /// The C8 route `PrefillIu4C8Pm` is not qualified on this arch (exact gfx1201 only).
     Disabled,
-    /// The resolved `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` flag is off (the route nests beneath it).
+    /// The F3 route `PrefillIu4ProducerFused` is not qualified on this arch (C8 nests beneath it).
     F3Disabled,
     /// Raw exact-gfx1201 inventory of the route or of F3 is absent.
     InventoryUnavailable,
@@ -102,7 +102,7 @@ pub enum C8PmRefusal {
 impl C8PmRefusal {
     fn log_once(self) {
         let index = match self {
-            // An unset/0 route flag and an F3 kill are the caller's choices: silent.
+            // A route not qualified on this arch is the expected case off exact gfx1201: silent.
             Self::Disabled | Self::F3Disabled => return,
             Self::InventoryUnavailable => 0,
             Self::NotEager => 1,
@@ -117,21 +117,18 @@ impl C8PmRefusal {
         ];
         REFUSALS[index].call_once(|| {
             eprintln!(
-                "[iu4-c8-pm] HIPFIRE_PREFILL_IU4_C8_PM producer refused: {self:?}; \
+                "[iu4-c8-pm] C8 PM producer refused: {self:?}; \
                  keeping the HIP exact C8 producer"
             );
         });
     }
 }
 
-/// Pure admission of the PM C8 producers inside the production exact wrappers: the resolved
-/// route flag (`c8_flag`: explicit `1`, unset and `0` are off), the resolved F3 flag it nests
-/// beneath, the raw exact-gfx1201 inventory of both routes, eager execution, the supported shape
-/// and valid operands.
-#[allow(clippy::too_many_arguments)]
+/// Pure admission of the PM C8 producers inside the production exact wrappers: the C8 route
+/// (`PrefillIu4C8Pm`) must be qualified on `arch`, and so must the F3 route it nests beneath
+/// (`PrefillIu4ProducerFused`). Then the raw exact-gfx1201 inventory of both routes, eager
+/// execution, the supported shape and valid operands.
 pub fn c8_pm_admission(
-    c8_flag: bool,
-    f3_flag: bool,
     arch: &str,
     eager: bool,
     is_norm: bool,
@@ -140,9 +137,9 @@ pub fn c8_pm_admission(
     operands_ok: bool,
 ) -> Result<(), C8PmRefusal> {
     use C8PmRefusal::*;
-    if !c8_flag {
+    if !qualified(arch, PrefillRoute::PrefillIu4C8Pm) {
         Err(Disabled)
-    } else if !f3_flag {
+    } else if !qualified(arch, PrefillRoute::PrefillIu4ProducerFused) {
         Err(F3Disabled)
     } else if !raw_inventory(arch, PrefillRoute::PrefillIu4C8Pm)
         || !raw_inventory(arch, PrefillRoute::PrefillIu4ProducerFused)
@@ -288,16 +285,29 @@ fn extra_valid(
     }
 }
 
+#[cfg(feature = "lab")]
+thread_local! {
+    static LAB_INCUMBENT_PIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Lab byte oracle only: while pinned on this thread, every C8 PM admission refuses, so the
+/// `*_exact_batched` wrappers run the HIP incumbent instead of the PM twin.
+#[cfg(feature = "lab")]
+pub fn lab_pin_incumbent(on: bool) {
+    LAB_INCUMBENT_PIN.with(|pin| pin.set(on));
+}
+
 impl Gpu {
     /// Whether no replay recording and no HIP stream capture is active.
     fn iu4_c8_pm_eager(&self) -> bool {
         !self.replay.is_recording() && !self.graphs.capture_mode
     }
 
-    /// Current-device admission used by the production exact wrappers: the resolved flags of
-    /// this device (`flags.prefill_iu4_c8_pm`, `flags.prefill_iu4_producer_fused`), the pure
-    /// [`c8_pm_admission`] and the operands the standalone launchers would validate. Enabled
-    /// refusals log once per reason; a refusal means the caller runs the HIP exact producer.
+    /// Current-device admission used by the production exact wrappers: the route qualification
+    /// of this device (`PrefillIu4C8Pm` beneath `PrefillIu4ProducerFused`), the pure
+    /// [`c8_pm_admission`] and the operands the standalone launchers would validate. Refusals
+    /// other than a missing qualification log once per reason; a refusal means the caller runs
+    /// the HIP exact producer.
     #[allow(clippy::too_many_arguments)]
     pub fn iu4_c8_pm_admitted(
         &self,
@@ -395,10 +405,12 @@ impl Gpu {
         k: usize,
         rows: usize,
     ) -> bool {
+        #[cfg(feature = "lab")]
+        if LAB_INCUMBENT_PIN.with(|pin| pin.get()) {
+            return false;
+        }
         let is_norm = variant.is_norm();
         match c8_pm_admission(
-            self.flags.prefill_iu4_c8_pm,
-            self.flags.prefill_iu4_producer_fused,
             &self.arch,
             self.iu4_c8_pm_eager(),
             is_norm,
@@ -786,113 +798,48 @@ mod tests {
     #[test]
     fn admission_requires_every_gate_in_order() {
         use C8PmRefusal as R;
-        let ok = |c8: bool,
-                  f3: bool,
-                  arch: &str,
-                  eager: bool,
-                  norm: bool,
-                  k: usize,
-                  rows: usize,
-                  operands: bool| {
-            c8_pm_admission(c8, f3, arch, eager, norm, k, rows, operands)
-        };
-        assert_eq!(
-            ok(true, true, "gfx1201", true, false, 4096, 512, true),
-            Ok(())
-        );
-        assert_eq!(
-            ok(true, true, "gfx1201", true, true, 2048, 8192, true),
-            Ok(())
-        );
-        assert_eq!(
-            ok(false, true, "gfx1201", true, true, 2048, 512, true),
-            Err(R::Disabled)
-        );
-        assert_eq!(
-            ok(true, false, "gfx1201", true, true, 2048, 512, true),
-            Err(R::F3Disabled)
-        );
-        for arch in [
-            "gfx1200", "gfx1151", "gfx1100", "gfx942", "gfx906", "unknown",
-        ] {
-            assert_eq!(
-                ok(true, true, arch, true, true, 2048, 512, true),
-                Err(R::InventoryUnavailable),
-                "{arch}"
-            );
+        for arch in ARCHES {
+            // Only exact gfx1201 qualifies; F3, which the C8 route nests beneath, does too.
+            if qualified(arch, PrefillRoute::PrefillIu4C8Pm) {
+                assert!(
+                    qualified(arch, PrefillRoute::PrefillIu4ProducerFused),
+                    "{arch}"
+                );
+            } else {
+                assert_eq!(
+                    c8_pm_admission(arch, true, true, 2048, 512, true),
+                    Err(R::Disabled),
+                    "{arch}"
+                );
+            }
         }
         assert_eq!(
-            ok(true, true, "gfx1201", false, true, 2048, 512, true),
+            c8_pm_admission("gfx1201", true, false, 4096, 512, true),
+            Ok(())
+        );
+        assert_eq!(
+            c8_pm_admission("gfx1201", true, true, 2048, 8192, true),
+            Ok(())
+        );
+        assert_eq!(
+            c8_pm_admission("gfx1201", false, true, 2048, 512, true),
             Err(R::NotEager)
         );
         assert_eq!(
-            ok(true, true, "gfx1201", true, true, 4096, 512, true),
+            c8_pm_admission("gfx1201", true, true, 4096, 512, true),
             Err(R::Shape)
         );
         assert_eq!(
-            ok(true, true, "gfx1201", true, false, 2048, 0, true),
+            c8_pm_admission("gfx1201", true, false, 2048, 0, true),
             Err(R::Shape)
         );
         assert_eq!(
-            ok(true, true, "gfx1201", true, false, 2048, 8193, true),
+            c8_pm_admission("gfx1201", true, false, 2048, 8193, true),
             Err(R::Shape)
         );
         assert_eq!(
-            ok(true, true, "gfx1201", true, false, 2048, 512, false),
+            c8_pm_admission("gfx1201", true, false, 2048, 512, false),
             Err(R::Operands)
         );
-    }
-
-    #[test]
-    fn route_follows_its_qualification_and_nests_beneath_f3() {
-        use crate::prefill_route_capabilities::enabled;
-        // Resolve both flags exactly as `FeatureFlags` does, then admit.
-        let admit = |arch: &str, f3: Option<bool>, c8: Option<bool>| {
-            c8_pm_admission(
-                enabled(c8, arch, PrefillRoute::PrefillIu4C8Pm),
-                enabled(f3, arch, PrefillRoute::PrefillIu4ProducerFused),
-                arch,
-                true,
-                true,
-                2048,
-                512,
-                true,
-            )
-        };
-        use C8PmRefusal as R;
-        for arch in ARCHES {
-            let gfx1201 = arch == "gfx1201";
-            // Unset: the route follows its exact-gfx1201 qualification beneath the resolved F3.
-            let unset = if gfx1201 { Ok(()) } else { Err(R::Disabled) };
-            assert_eq!(admit(arch, None, None), unset, "{arch}");
-            assert_eq!(admit(arch, Some(true), None), unset, "{arch}");
-            // Explicit 0 kills.
-            assert_eq!(admit(arch, None, Some(false)), Err(R::Disabled), "{arch}");
-            assert_eq!(
-                admit(arch, Some(true), Some(false)),
-                Err(R::Disabled),
-                "{arch}"
-            );
-            // Explicit 1 follows F3 and the exact-gfx1201 inventory.
-            assert_eq!(
-                admit(arch, None, Some(true)),
-                if gfx1201 { Ok(()) } else { Err(R::F3Disabled) },
-                "{arch}"
-            );
-            assert_eq!(
-                admit(arch, Some(false), Some(true)),
-                Err(R::F3Disabled),
-                "{arch}"
-            );
-            assert_eq!(
-                admit(arch, Some(true), Some(true)),
-                if gfx1201 {
-                    Ok(())
-                } else {
-                    Err(R::InventoryUnavailable)
-                },
-                "{arch}"
-            );
-        }
     }
 }

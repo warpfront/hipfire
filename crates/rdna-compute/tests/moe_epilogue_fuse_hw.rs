@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Byte-exactness gate for `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: the one launch
+//! Byte-exactness gate for the Qwen4 MoE epilogue fusion: the one launch
 //! `moe_shared_down_combine_rows_r<R>` ([`rdna_compute::tensor_ops::moe_shared_down_combine`])
 //! against the production chain it replaces on the same operands,
 //!
@@ -225,8 +225,6 @@ fn special(rng: &mut Lcg, v: f32) -> f32 {
 #[test]
 #[ignore = "needs an exact gfx1201 GPU"]
 fn moe_epilogue_fuse_matches_unfused_chain_hw() {
-    // The flag is read once per process: set it before the first launcher call.
-    std::env::set_var("HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE", "1");
     let mut gpu = Gpu::init().expect("GPU required");
     if !gpu.arch_caps.is_gfx1201() {
         eprintln!("SKIP: requires exact gfx1201.");
@@ -571,7 +569,6 @@ fn real_or_seeded_weights() -> Vec<(String, Vec<u16>)> {
 #[test]
 #[ignore = "needs an exact gfx1201 GPU"]
 fn moe_epilogue_fuse_zinit_matches_zero_fill_hw() {
-    std::env::set_var("HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE", "1");
     let mut gpu = Gpu::init().expect("GPU required");
     if !gpu.arch_caps.is_gfx1201() {
         eprintln!("SKIP: requires exact gfx1201.");
@@ -713,7 +710,6 @@ fn pct(v: &mut [f64], q: f64) -> f64 {
 #[test]
 #[ignore = "needs an exact gfx1201 GPU; timing"]
 fn moe_epilogue_fuse_zinit_bench_hw() {
-    std::env::set_var("HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE", "1");
     let mut gpu = Gpu::init().expect("GPU required");
     if !gpu.arch_caps.is_gfx1201() {
         eprintln!("SKIP: requires exact gfx1201.");
@@ -832,7 +828,6 @@ fn moe_epilogue_fuse_zinit_bench_hw() {
 #[test]
 #[ignore = "needs an exact gfx1201 GPU"]
 fn moe_epilogue_fuse_zinit_pm_twin_hw() {
-    std::env::set_var("HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE", "1");
     let mut gpu = Gpu::init().expect("GPU required");
     assert!(
         gpu.arch_caps.is_gfx1201(),

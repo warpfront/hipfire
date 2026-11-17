@@ -545,7 +545,7 @@ pub(crate) struct Qwen4EpRowGatherHook {
     /// The rank's D2 expert tail (`HIPFIRE_EP_UNIT_TAIL`), installed once after the forward
     /// attached; never set when the tail is off.
     tail: OnceLock<Arc<crate::expert_unit_tail_rank::UnitTailRank>>,
-    /// The wide-verify int8 chain's owner mask (`HIPFIRE_QWEN4_MOE_GU_A8` default, trunk shard):
+    /// The wide-verify int8 chain's owner mask (trunk shard):
     /// non-owning views of the forward's owner table and masked tile ids, installed once after
     /// `attach_ep`; never set when the chain is off / unmasked or off the trunk shard.
     decode_mask: OnceLock<DecodeOwnerMaskViews>,

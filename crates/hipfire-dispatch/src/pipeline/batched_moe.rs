@@ -74,39 +74,21 @@ fn refuse_mq3_projections(site: &str, dtypes: &[DType]) -> HipResult<()> {
     Ok(())
 }
 
-/// `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` (developer typed boolean): the
-/// explicit value, read once. Unset is `None`; the capability table has raw
-/// exact-gfx1201 inventory and a qualified row there, so unset resolves on
-/// at exact gfx1201 and off elsewhere.
-fn prefill_iu4_producer_fused_explicit() -> Option<bool> {
-    static EXPLICIT: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_typed_bool("HIPFIRE_PREFILL_IU4_PRODUCER_FUSED")
-    });
-    *EXPLICIT
-}
-
-/// Pure admission of the qualified exact IU4 producer fusion: the typed flag
-/// resolved through the capability table (`explicit` `1` needs the raw
-/// inventory of `arch`, `0` is off, unset follows the exact-gfx1201 qualification), a uniform
-/// MQ4G256V2 consumer weight, and the existing producer shape/eager prerequisites
-/// (`Gpu::iu4_producer_quant_fused_active`).
+/// Pure admission of the qualified exact IU4 producer fusion: the route's
+/// exact-gfx1201 qualification (`qualified`, which already carries the raw
+/// inventory), a uniform MQ4G256V2 consumer weight, and the existing producer
+/// shape/eager prerequisites (`Gpu::iu4_producer_quant_fused_active`).
 fn prefill_iu4_producer_fused_admitted(
-    explicit: Option<bool>,
     arch: &str,
     weight_is_mq4v2: bool,
     producer_shape_active: bool,
 ) -> bool {
     weight_is_mq4v2
         && producer_shape_active
-        && prefill_route_capabilities::raw_inventory(arch, PrefillRoute::PrefillIu4ProducerFused)
-        && prefill_route_capabilities::enabled(
-            explicit,
-            arch,
-            PrefillRoute::PrefillIu4ProducerFused,
-        )
+        && prefill_route_capabilities::qualified(arch, PrefillRoute::PrefillIu4ProducerFused)
 }
 
-/// Qualified (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`, unset on at exact gfx1201) FWHT-rotate +
+/// Qualified (exact gfx1201 `PrefillIu4ProducerFused`) FWHT-rotate +
 /// `block_i4_128` producer for the MoE FullAttn wo input, which has no
 /// epilogue param and always accumulates residual into `x_batch`. Uses the
 /// exact wrapper (`rotate_x_mq_i4_gfx12_exact_batched`); the legacy
@@ -121,7 +103,6 @@ fn try_gfx12_rotate_exact_prepared_no_epilogue(
     n: usize,
 ) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
     if !prefill_iu4_producer_fused_admitted(
-        prefill_iu4_producer_fused_explicit(),
         &gpu.arch,
         wo.dtype == DType::MQ4G256V2,
         gpu.mq4g256v2_shared_iu4_supported(k, n) && gpu.iu4_producer_quant_fused_active(n, k),
@@ -141,7 +122,7 @@ fn try_gfx12_rotate_exact_prepared_no_epilogue(
 }
 
 /// L4: the FA output gate of the MoE finish (`sigmoid_mul_f32(attn, gate)`) folded into the exact C8 PM
-/// rotate that consumes it (`HIPFIRE_PREFILL_IU4_C8_PM` nested under the F3 producer fusion). The
+/// rotate that consumes it (nested under the F3 producer fusion). The
 /// gated activation is formed per element in registers (the exact `sigmoid_mul_f32` expression), then
 /// the identical AWQ / rotate / C8 path runs: the f32 rotated side output, the sidecar and the
 /// capture / receipt notes are those of [`try_gfx12_rotate_exact_prepared_no_epilogue`] after the
@@ -165,7 +146,6 @@ fn try_gfx12_sigmoid_rotate_exact_prepared_no_epilogue(
         return Ok(None);
     }
     if !prefill_iu4_producer_fused_admitted(
-        prefill_iu4_producer_fused_explicit(),
         &gpu.arch,
         wo.dtype == DType::MQ4G256V2,
         gpu.mq4g256v2_shared_iu4_supported(k, n) && gpu.iu4_producer_quant_fused_active(n, k),
@@ -183,7 +163,7 @@ fn try_gfx12_sigmoid_rotate_exact_prepared_no_epilogue(
     Ok(Some(prep))
 }
 
-/// Qualified (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`, unset on at exact gfx1201) RMSNorm/FWHT +
+/// Qualified (exact gfx1201 `PrefillIu4ProducerFused`) RMSNorm/FWHT +
 /// `block_i4_128` producer for the MoE LA qkvza / FA qkv input. The caller
 /// passes whether every consumer weight is MQ4G256V2 and the fused key
 /// (`FusedQkvzaMq4G256V2` / `FusedQkvMq4G256V2`) the prepared consumer
@@ -204,7 +184,6 @@ fn try_gfx12_rmsnorm_exact_prepared(
     kind: crate::types::KernelKey,
 ) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
     if !prefill_iu4_producer_fused_admitted(
-        prefill_iu4_producer_fused_explicit(),
         &gpu.arch,
         weights_uniform_mq4v2 && next_linear.dtype == DType::MQ4G256V2,
         gpu.mq4g256v2_shared_iu4_supported(k, n) && gpu.iu4_producer_quant_fused_active(n, k),
@@ -1975,25 +1954,17 @@ mod tests {
         assert_eq!(admit(true, q8, false, 16, 32, 256, 256), None);
     }
 
-    /// `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` admission truth table: unset follows the
-    /// exact-gfx1201 qualification and `0` is always off; `1` needs the capability
-    /// inventory of the arch; both need an MQ4G256V2 weight and the producer shape/eager
-    /// prerequisites.
+    /// The exact-gfx1201 IU4 producer-fusion admission: the route's qualification,
+    /// an MQ4G256V2 weight, and the producer shape/eager prerequisites.
     #[test]
     fn prefill_iu4_producer_fused_admission_truth_table() {
         for arch in ["gfx1201", "gfx1200", "gfx1100", "gfx1151", "gfx942", ""] {
-            for explicit in [None, Some(false), Some(true)] {
-                for mask in 0u8..4 {
-                    let mq4v2 = mask & 1 != 0;
-                    let shape = mask & 2 != 0;
-                    let got = prefill_iu4_producer_fused_admitted(explicit, arch, mq4v2, shape);
-                    let on = match explicit {
-                        None => arch == "gfx1201",
-                        Some(explicit) => explicit,
-                    };
-                    let want = on && arch == "gfx1201" && mq4v2 && shape;
-                    assert_eq!(got, want, "arch={arch} explicit={explicit:?} mask={mask}");
-                }
+            for mask in 0u8..4 {
+                let mq4v2 = mask & 1 != 0;
+                let shape = mask & 2 != 0;
+                let got = prefill_iu4_producer_fused_admitted(arch, mq4v2, shape);
+                let want = arch == "gfx1201" && mq4v2 && shape;
+                assert_eq!(got, want, "arch={arch} mask={mask}");
             }
         }
     }

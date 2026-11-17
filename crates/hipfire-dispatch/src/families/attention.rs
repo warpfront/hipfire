@@ -899,7 +899,7 @@ fn dispatch_kv_write(
             // established two-launch path.
             let pos = io.positions();
             #[cfg(feature = "deltanet")]
-            if gpu.arch_caps.is_gfx1100() && !gpu.flags.fa_batch_fuse_off {
+            if gpu.arch_caps.is_gfx1100() {
                 return hip!(gpu.kv_cache_write_q8_0_pair_batched(
                     io.k_cache,
                     io.v_cache,

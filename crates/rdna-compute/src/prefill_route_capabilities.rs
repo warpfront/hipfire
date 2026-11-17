@@ -20,13 +20,12 @@
 //!
 //! # What a default means
 //!
-//! The developer flag of each route (`HIPFIRE_GDN_QK_INDEXED`, `HIPFIRE_GDN_MOE_PRE_FUSED`,
+//! The developer flag of each route with one (`HIPFIRE_GDN_QK_INDEXED`, `HIPFIRE_GDN_MOE_PRE_FUSED`,
 //! `HIPFIRE_GDN_MOE_CHUNK_SCAN`, `HIPFIRE_MOE_ROUTER_FUSED_PREFILL`,
 //! `HIPFIRE_MOE_SHARED_PREPARED_IU4`, `HIPFIRE_FA_PREFILL_PM`,
-//! `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW`, `HIPFIRE_MOE_COMBINE_V2`, `HIPFIRE_MOE_IU4_WIDE_TILES`,
-//! `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`, `HIPFIRE_FA_PREFILL_PM_QPREP`,
-//! `HIPFIRE_MOE_ROTATE_I4_PM`, `HIPFIRE_PREFILL_IU4_C8_PM`,
-//! `HIPFIRE_GDN_CHUNK_PREP_PM`, `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI`) is a typed boolean.
+//! `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW`, `HIPFIRE_MOE_COMBINE_V2`, `HIPFIRE_FA_PREFILL_PM_QPREP`,
+//! `HIPFIRE_MOE_ROTATE_I4_PM`, `HIPFIRE_GDN_CHUNK_PREP_PM`,
+//! `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI`) is a typed boolean.
 //! An explicit `1` / `0` always wins; unset follows [`qualified`] of the running device's
 //! architecture. The admission predicates (shape, state format, recording, capture, GPU
 //! capability) are unchanged and still apply after the default is resolved. The default callers
@@ -41,12 +40,12 @@
 //! `HIPFIRE_FA_PREFILL_PM_QPREP` needs the *resolved* `HIPFIRE_FA_PREFILL_PM` flag (an explicit
 //! PM `0` refuses the fold), and `HIPFIRE_GDN_CHUNK_PREP_PM` runs only inside an admitted
 //! `HIPFIRE_GDN_MOE_CHUNK_SCAN` layer (an explicit chunk-scan `0` refuses it). For
-//! `HIPFIRE_MOE_IU4_WIDE_TILES` the flag only governs VRAM-resident gate/up (the resident
+//! the [`PrefillRoute::MoeIu4WideTiles`] route only VRAM-resident gate/up is widened (the resident
 //! down stays NT4); host-mapped experts keep their existing NT8 selection for both GEMMs
-//! whatever the flag says. `HIPFIRE_MOE_ROTATE_I4_PM` stays nested beneath the requested
+//! regardless of qualification. `HIPFIRE_MOE_ROTATE_I4_PM` stays nested beneath the requested
 //! symmetric IU4 route and its frozen C2 producer candidate set (`Gpu::qwen4_moe_rotate128_i4`),
-//! and `HIPFIRE_PREFILL_IU4_C8_PM` nests beneath the *resolved*
-//! `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` flag. `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` still applies
+//! and [`PrefillRoute::PrefillIu4C8Pm`] nests beneath the
+//! [`PrefillRoute::PrefillIu4ProducerFused`] route. `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` still applies
 //! only where the raw inventory and the GPU-side shape admission hold.
 
 /// A prefill route whose unset default is decided by qualification.
@@ -79,14 +78,14 @@ pub enum PrefillRoute {
     /// (`moe_down_combine_grouped_bf16in_v2_pm_gfx1201`, eight contiguous columns per lane) in
     /// place of v1. Unset follows its exact-gfx1201 qualification.
     MoeCombineV2,
-    /// `HIPFIRE_MOE_IU4_WIDE_TILES`: VRAM-resident symmetric IU4 routed experts take the
+    /// VRAM-resident symmetric IU4 routed experts take the
     /// NT8 gate/up entry (`qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8`) instead of NT4 when
     /// the per-expert real-slot count is high enough; the resident down entry stays NT4.
-    /// Unset follows its exact-gfx1201 qualification.
+    /// Qualified on exact gfx1201 only.
     MoeIu4WideTiles,
-    /// `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`: exact IU4 producer fusion (RMSNorm / rotate /
-    /// SiLU gfx12 producers write the IU4 prequantized activation directly). Unset follows
-    /// its exact-gfx1201 qualification.
+    /// Exact IU4 producer fusion (RMSNorm / rotate /
+    /// SiLU gfx12 producers write the IU4 prequantized activation directly). Qualified on
+    /// exact gfx1201 only.
     PrefillIu4ProducerFused,
     /// `HIPFIRE_FA_PREFILL_PM_QPREP`: the A3B exact Q-prep fold (interleaved projection ->
     /// gate + final f16 Q in one PM pass, consuming angles captured by the K rope launch)
@@ -97,11 +96,10 @@ pub enum PrefillRoute {
     /// PeaceMaker twin `moe_rotate_i4_pm_gfx1201` (grid `[P, K/128, 1]`, wave32) instead of the
     /// HIP incumbent. Unset follows its exact-gfx1201 qualification.
     MoeRotateI4Pm,
-    /// `HIPFIRE_PREFILL_IU4_C8_PM`: the PeaceMaker C8 rotate / RMSNorm-rotate producer twins
+    /// The PeaceMaker C8 rotate / RMSNorm-rotate producer twins
     /// (`iu4_c8_rotate_pm_gfx1201`, `iu4_c8_rmsnorm_rotate_pm_gfx1201`) run in place of the HIP
-    /// exact (`cand_mode = 8`) F3 producers. Nested beneath the resolved
-    /// [`PrefillRoute::PrefillIu4ProducerFused`] flag. Unset follows its exact-gfx1201
-    /// qualification.
+    /// exact (`cand_mode = 8`) F3 producers. Nested beneath the
+    /// [`PrefillRoute::PrefillIu4ProducerFused`] route. Qualified on exact gfx1201 only.
     PrefillIu4C8Pm,
     /// `HIPFIRE_GDN_CHUNK_PREP_PM`: the MoE GDN chunk-scan layer runs the PM twin of
     /// `gdn_chunk_prep` (`gdn_chunk_prep_pm_gfx1201`, 16 key / 32 value heads, rows 1..=8192)
@@ -686,8 +684,6 @@ mod tests {
             assert_eq!(raw_inventory(arch, route), arch == "gfx1201", "{arch}");
             assert_eq!(qualified(arch, route), arch == "gfx1201", "{arch}");
             assert_eq!(enabled(None, arch, route), arch == "gfx1201", "{arch}");
-            assert!(enabled(Some(true), arch, route), "{arch}: 1 opts in");
-            assert!(!enabled(Some(false), arch, route), "{arch}: 0 kills");
         }
     }
 
@@ -790,14 +786,6 @@ mod tests {
                     enabled(None, arch, route),
                     arch == "gfx1201",
                     "{route:?} on {arch}"
-                );
-                assert!(
-                    enabled(Some(true), arch, route),
-                    "{route:?} {arch}: 1 opts in"
-                );
-                assert!(
-                    !enabled(Some(false), arch, route),
-                    "{route:?} {arch}: 0 kills"
                 );
             }
         }
@@ -973,8 +961,6 @@ mod moe_iu4_wide_tiles_bundle_tests {
         for arch in ARCHES {
             assert_eq!(qualified(arch, ROUTE), raw_inventory(arch, ROUTE), "{arch}");
             assert_eq!(enabled(None, arch, ROUTE), arch == "gfx1201", "{arch}");
-            assert!(enabled(Some(true), arch, ROUTE), "{arch}");
-            assert!(!enabled(Some(false), arch, ROUTE), "{arch}");
         }
         assert!(PrefillRoute::ALL.contains(&ROUTE));
         assert_eq!(PrefillRoute::ALL[8], ROUTE);

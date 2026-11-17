@@ -28,14 +28,13 @@
 //!   stage (gate/up, down), median microseconds from HIP events.
 //!
 //! Production selection (`--plan` and `--self-check` state and check it, no GPU): a
-//! VRAM-resident run widens GATE/UP ONLY, to NT8, when `HIPFIRE_MOE_IU4_WIDE_TILES` resolves
-//! on (unset follows its exact-gfx1201 qualification, explicit `1` opts in, `0` kills),
-//! the arch is capable (NT8 admitted below) and real total slots >= 128 per table
-//! expert; resident DOWN is always NT4. An explicit `0` disables resident widening;
-//! host-mapped experts keep NT8 for both stages. Every plan cell and GPU cell carries
-//! the stage-specific selection record. The GPU run is a diagnostic: it still compares
-//! and times NT4 vs NT8 for BOTH stages, whatever production selects (owner measured
-//! 12/12 cells byte-identical; NT8 wins resident gate/up and loses resident down).
+//! VRAM-resident run widens GATE/UP ONLY, to NT8, when the arch is capable (NT8 admitted
+//! below, exact gfx1201 qualification) and real total slots >= 128 per table expert;
+//! resident DOWN is always NT4. Host-mapped experts keep NT8 for both stages. Every plan
+//! cell and GPU cell carries the stage-specific selection record. The GPU run is a
+//! diagnostic: it still compares and times NT4 vs NT8 for BOTH stages, whatever production
+//! selects (owner measured 12/12 cells byte-identical; NT8 wins resident gate/up and loses
+//! resident down).
 //!
 //! Admission is by raw bundle capability, not by model or card name: the
 //! typed ISA target (`gpu.arch` parsed to `peacemaker_isa::Arch`) must plan the
@@ -614,9 +613,6 @@ fn admit(arch_name: &str) -> Result<Admission, Vec<String>> {
 
 // ---------------------------------------------------- production selection
 
-/// The flag the production selector reads (resolved: unset follows qualification, on at
-/// exact gfx1201; an explicit `0` disables resident widening).
-const WIDE_FLAG_ENV: &str = "HIPFIRE_MOE_IU4_WIDE_TILES";
 /// Real routed slots per expert from which a resident run widens (gate/up only).
 const WIDE_MIN_SLOTS_PER_EXPERT: u128 = 128;
 
@@ -629,14 +625,13 @@ struct StageNt {
 
 /// Expected production selection, written from the contract, not from the selector:
 /// an incapable arch is NT4/NT4; host-mapped experts take NT8 for both stages; a
-/// VRAM-resident run takes NT8 for gate/up only (`wide_flag` on and real total slots
-/// >= 128 per table expert, exact 128-bit arithmetic) and NT4 for down always.
+/// VRAM-resident run takes NT8 for gate/up only (real total slots >= 128 per table
+/// expert, exact 128-bit arithmetic) and NT4 for down always.
 /// `total_slots` is the same for both stages: gate/up `x_src_rows * x_row_div` and
 /// down flat slots are both `rows * top_k`.
 fn expected_stage_nt(
     capable: bool,
     host_mapped: bool,
-    wide_flag: bool,
     total_slots: usize,
     n_experts: usize,
 ) -> StageNt {
@@ -652,9 +647,8 @@ fn expected_stage_nt(
             down: 8,
         };
     }
-    let wide = wide_flag
-        && n_experts > 0
-        && (total_slots as u128) >= WIDE_MIN_SLOTS_PER_EXPERT * (n_experts as u128);
+    let wide =
+        n_experts > 0 && (total_slots as u128) >= WIDE_MIN_SLOTS_PER_EXPERT * (n_experts as u128);
     StageNt {
         gate_up: if wide { 8 } else { 4 },
         down: 4,
@@ -677,24 +671,21 @@ fn stage_json(arch: &str, s: StageNt) -> Value {
     })
 }
 
-/// Machine-readable production selection of one shape on `arch`: host-mapped, and
-/// VRAM-resident with the flag resolved off (explicit `0`) and resolved on (unset on a
-/// qualified arch, or explicit `1`).
+/// Machine-readable production selection of one shape on `arch`, host-mapped and VRAM-resident.
 fn selection_record(arch: &str, capable: bool, total_slots: usize, n_experts: usize) -> Value {
-    let pick = |host, flag| {
+    let pick = |host| {
         stage_json(
             arch,
-            expected_stage_nt(capable, host, flag, total_slots, n_experts),
+            expected_stage_nt(capable, host, total_slots, n_experts),
         )
     };
     json!({
-        "arch":arch,"capable":capable,"flag":WIDE_FLAG_ENV,
+        "arch":arch,"capable":capable,
         "total_slots":total_slots,"n_experts":n_experts,
         "slots_per_expert":total_slots as f64 / n_experts as f64,
         "wide_shape":n_experts > 0 && (total_slots as u128) >= WIDE_MIN_SLOTS_PER_EXPERT * (n_experts as u128),
-        "host_mapped":pick(true, false),
-        "resident_flag_off":pick(false, false),
-        "resident_flag_on":pick(false, true),
+        "host_mapped":pick(true),
+        "resident":pick(false),
     })
 }
 
@@ -731,10 +722,8 @@ fn print_plan(o: &Opts) -> Res<()> {
             "producers":["moe_scatter_stable_top10","qwen4_moe_rotate256_i4","qwen4_moe_rotate128_i4"],
             "variants":["pm_nt4","pm_nt8"],"nt16":"not built: Spec::validate caps gfx12 at NT8, gfx11 at NT4",
             "stages":["gate_up","down","down_isolated (NT8 down on NT4's down sidecar)"],
-            "production_selection":{"flag":WIDE_FLAG_ENV,"flag_0":"resident NT4 for both stages",
-                "flag_unset":"follows qualification: exact gfx1201 resolves on, other arches off",
-                "resident_flag_on":"flag resolved on (unset on gfx1201 or explicit 1): gate_up NT8 only when capable and total_slots >= 128 * n_experts; down always NT4",
-                "host_mapped":"NT8 for both stages on a capable arch, unchanged by the flag",
+            "production_selection":{"resident":"VRAM-resident, capable arch: gate_up NT8 only when total_slots >= 128 * n_experts; down always NT4",
+                "host_mapped":"NT8 for both stages on a capable arch",
                 "min_slots_per_expert":128,"incapable_arch":"NT4 for both stages",
                 "owner_measured":"R9700 VRAM random median us: GU wins at 4096/8192 rows, down loses (+4.5%/+5.2%); 12/12 cells byte-identical"},
             "diagnostic":"every cell still byte-compares and times NT4 vs NT8 for BOTH stages whatever production selects",
@@ -749,7 +738,7 @@ fn print_plan(o: &Opts) -> Res<()> {
             match admit(arch) {
                 Ok(a) => json!({"kind":"plan_admission","arch":arch,"admitted":true,
                     "symbols":a.symbols,"bundle_bytes":a.bundle_bytes,"bundle_sha256":a.bundle_sha256,
-                    "resident_wide_selection":stage_json(arch, expected_stage_nt(true, false, true, MAX_ROWS * g.topk, g.e))}),
+                    "resident_wide_selection":stage_json(arch, expected_stage_nt(true, false, MAX_ROWS * g.topk, g.e))}),
                 Err(r) => json!({"kind":"plan_admission","arch":arch,"admitted":false,"reasons":r}),
             }
         );
@@ -894,27 +883,19 @@ fn self_check() -> Res<usize> {
     for (rows, wide) in [(512usize, false), (4096, true), (8192, true)] {
         let slots = rows * g.topk;
         ck!(
-            expected_stage_nt(true, false, true, slots, g.e) == if wide { mixed } else { n4 },
-            "resident flag on, {rows} rows"
+            expected_stage_nt(true, false, slots, g.e) == if wide { mixed } else { n4 },
+            "resident, {rows} rows"
         );
         ck!(
-            expected_stage_nt(true, false, false, slots, g.e) == n4,
-            "resident flag off, {rows} rows"
+            expected_stage_nt(true, true, slots, g.e) == n8,
+            "host, {rows} rows"
         );
         ck!(
-            expected_stage_nt(true, true, false, slots, g.e) == n8,
-            "host flag off, {rows} rows"
-        );
-        ck!(
-            expected_stage_nt(true, true, true, slots, g.e) == n8,
-            "host flag on, {rows} rows"
-        );
-        ck!(
-            expected_stage_nt(false, true, true, slots, g.e) == n4,
+            expected_stage_nt(false, true, slots, g.e) == n4,
             "incapable host, {rows} rows"
         );
         ck!(
-            expected_stage_nt(false, false, true, slots, g.e) == n4,
+            expected_stage_nt(false, false, slots, g.e) == n4,
             "incapable resident, {rows} rows"
         );
     }
@@ -939,26 +920,27 @@ fn self_check() -> Res<usize> {
     ]);
     for (arch, &cap) in arches.iter().zip(&caps) {
         for host in [false, true] {
-            for flag in [false, true] {
-                for &(slots, ne) in &shapes {
-                    let got = expected_stage_nt(cap, host, flag, slots, ne);
-                    let wide = flag && ne > 0 && (slots as u128) >= 128 * (ne as u128);
-                    let want = match (*arch == "gfx1201", host, wide) {
-                        (false, _, _) => n4,
-                        (true, true, _) => n8,
-                        (true, false, true) => mixed,
-                        (true, false, false) => n4,
-                    };
-                    ck!(got == want, "{arch:?} host={host} flag={flag} slots={slots} experts={ne}: {got:?} != {want:?}");
-                    ck!(
-                        (host && cap) || got.down == 4,
-                        "{arch:?} resident down must be NT4: {got:?}"
-                    );
-                    ck!(
-                        !wide || host || !cap || got.gate_up == 8,
-                        "{arch:?} wide shape must widen gate/up"
-                    );
-                }
+            for &(slots, ne) in &shapes {
+                let got = expected_stage_nt(cap, host, slots, ne);
+                let wide = ne > 0 && (slots as u128) >= 128 * (ne as u128);
+                let want = match (*arch == "gfx1201", host, wide) {
+                    (false, _, _) => n4,
+                    (true, true, _) => n8,
+                    (true, false, true) => mixed,
+                    (true, false, false) => n4,
+                };
+                ck!(
+                    got == want,
+                    "{arch:?} host={host} slots={slots} experts={ne}: {got:?} != {want:?}"
+                );
+                ck!(
+                    (host && cap) || got.down == 4,
+                    "{arch:?} resident down must be NT4: {got:?}"
+                );
+                ck!(
+                    !wide || host || !cap || got.gate_up == 8,
+                    "{arch:?} wide shape must widen gate/up"
+                );
             }
         }
     }
@@ -986,23 +968,21 @@ fn self_check() -> Res<usize> {
     // Machine-readable records.
     for (rows, wide) in [(512usize, false), (4096, true), (8192, true)] {
         let rec = selection_record("gfx1201", true, rows * g.topk, g.e);
-        let on = &rec["resident_flag_on"];
+        let res = &rec["resident"];
         ck!(
-            on["gate_up"]["nt"] == if wide { 8 } else { 4 }
-                && on["down"]["nt"] == 4
-                && on["mixed"] == wide
-                && on["down"]["entry"] == "pm_nt4"
+            res["gate_up"]["nt"] == if wide { 8 } else { 4 }
+                && res["down"]["nt"] == 4
+                && res["mixed"] == wide
+                && res["down"]["entry"] == "pm_nt4"
                 && rec["wide_shape"] == wide,
-            "resident flag-on record {rows}: {rec}"
+            "resident record {rows}: {rec}"
         );
         ck!(
-            rec["resident_flag_off"]["mixed"] == false
-                && rec["resident_flag_off"]["gate_up"]["nt"] == 4
-                && rec["host_mapped"]["gate_up"]["nt"] == 8
+            rec["host_mapped"]["gate_up"]["nt"] == 8
                 && rec["host_mapped"]["down"]["nt"] == 8
-                && on["gate_up"]["symbol"].is_string()
-                && on["down"]["symbol"].is_string(),
-            "flag-off / host record {rows}: {rec}"
+                && res["gate_up"]["symbol"].is_string()
+                && res["down"]["symbol"].is_string(),
+            "host record {rows}: {rec}"
         );
         let cell = plan_cell(&model(rows, "skew_empty", 1)?);
         ck!(
@@ -1011,7 +991,7 @@ fn self_check() -> Res<usize> {
         );
     }
     ck!(
-        selection_record("gfx1151", false, 65536, g.e)["resident_flag_on"]["mixed"] == false,
+        selection_record("gfx1151", false, 65536, g.e)["resident"]["mixed"] == false,
         "gfx1151 never mixes"
     );
     // Production threshold: every shape reaches the route.
@@ -1377,10 +1357,10 @@ fn time_cell(
         }
     }
     let tot = |v: usize| median(&gu[v]) + median(&dn[v]);
-    // The production pair's stage medians (flag on, resident / this residency): the
-    // gate/up and down medians of whichever width each stage selects.
-    let resident = expected_stage_nt(true, false, true, total_slots, geo().e);
-    let current = expected_stage_nt(true, host, true, total_slots, geo().e);
+    // The production pair's stage medians (resident / this residency): the gate/up and
+    // down medians of whichever width each stage selects.
+    let resident = expected_stage_nt(true, false, total_slots, geo().e);
+    let current = expected_stage_nt(true, host, total_slots, geo().e);
     let prod_timing = |s: StageNt| {
         let (g, d) = (usize::from(s.gate_up == 8), usize::from(s.down == 8));
         let sum = median(&gu[g]) + median(&dn[d]);
@@ -1392,7 +1372,7 @@ fn time_cell(
         "nt4":{"gate_up":stat_json(&gu[0]),"down":stat_json(&dn[0]),"sum_of_medians_us":tot(0)},
         "nt8":{"gate_up":stat_json(&gu[1]),"down":stat_json(&dn[1]),"sum_of_medians_us":tot(1)},
         "nt8_over_nt4_median":{"gate_up":median(&gu[1]) / median(&gu[0]),"down":median(&dn[1]) / median(&dn[0]),"sum":tot(1) / tot(0)},
-        "production_resident_flag_on":prod_timing(resident),
+        "production_resident":prod_timing(resident),
         "production_current_residency":prod_timing(current),
     }))
 }

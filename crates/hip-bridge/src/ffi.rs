@@ -12,7 +12,7 @@ use crate::{DeviceBuffer, MemcpyKind};
 #[cfg(unix)]
 use core::ffi::CStr;
 use libloading::{Library, Symbol};
-use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
+use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -953,83 +953,23 @@ pub fn keep_host_memory_out_of_reclaim(reason: &str) {
     }
 }
 
-/// Exact opt-out from the process-wide [`GPU_PINNED_MIN_XFER_SIZE`] default:
-/// when it is `0`, [`keep_pageable_copies_out_of_reclaim`] leaves the switch
-/// unset, so clr keeps its own built-in threshold. That is an exact
-/// restoration of the pre-default behavior, which setting
-/// `GPU_PINNED_MIN_XFER_SIZE=0` is not (it pins every pageable copy source in
-/// place, including copies below clr's built-in threshold).
-const PINNED_XFER_DEFAULT_ENV: &str = "HIPFIRE_PINNED_XFER_DEFAULT";
-
-/// What [`keep_pageable_copies_out_of_reclaim`] does with
-/// `GPU_PINNED_MIN_XFER_SIZE`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PageableCopyStaging {
-    /// The operator already set the switch: respected untouched, whatever the
-    /// opt-out says.
-    Preset,
-    /// [`PINNED_XFER_DEFAULT_ENV`] is `0`: leave the switch unset.
-    OptedOut,
-    /// Set the switch to [`STAGE_ALL_PAGEABLE_COPIES_MB`].
-    Arm,
-}
-
-/// The decision behind [`keep_pageable_copies_out_of_reclaim`], pure so the
-/// tests never touch the process environment. `opt_out` is the value of
-/// [`PINNED_XFER_DEFAULT_ENV`] and `preset` that of `GPU_PINNED_MIN_XFER_SIZE`;
-/// only an `opt_out` of exactly `0` opts out.
-fn pageable_copy_staging(opt_out: Option<&OsStr>, preset: Option<&OsStr>) -> PageableCopyStaging {
-    if preset.is_some() {
-        PageableCopyStaging::Preset
-    } else if opt_out == Some(OsStr::new("0")) {
-        PageableCopyStaging::OptedOut
-    } else {
-        PageableCopyStaging::Arm
-    }
-}
-
-/// [`PINNED_XFER_DEFAULT_ENV`] as this process sees it: the installed process
-/// config when there is one, otherwise the ambient environment. Like
-/// [`host_maps_qwen4_experts`], it never installs the local fallback config, so
-/// it is safe before the HIP runtime loads.
-fn pinned_xfer_default_opt_out() -> Option<OsString> {
-    match hipfire_config::active_process_config() {
-        Some(config) => config
-            .legacy_value(PINNED_XFER_DEFAULT_ENV)
-            .map(OsString::from),
-        None => std::env::var_os(PINNED_XFER_DEFAULT_ENV),
-    }
-}
-
 /// Arm clr's pageable-copy staging threshold (`GPU_PINNED_MIN_XFER_SIZE`) in
 /// every Linux process, before the HIP runtime is dlopen'd, unless the operator
-/// already set it or opted out with `HIPFIRE_PINNED_XFER_DEFAULT=0` (see
-/// [`pageable_copy_staging`]). Separate from [`keep_host_memory_out_of_reclaim`]
-/// because this switch is priced free while the `HSA_USERPTR_FOR_PAGED_MEM`
-/// half is not, so the two are scoped differently. This is the tier that
-/// covers the mapped-file copy source on *every* HFQ load:
-/// [`HipRuntime::load`] is the one site every load path in every process
-/// reaches before its first weight copy, where
-/// `hipfire_loader::prepare_host_memory_for` runs earlier but only in a daemon
-/// started for a model.
+/// already set it. Separate from [`keep_host_memory_out_of_reclaim`] because
+/// this switch is priced free while the `HSA_USERPTR_FOR_PAGED_MEM` half is
+/// not, so the two are scoped differently. This is the tier that covers the
+/// mapped-file copy source on *every* HFQ load: [`HipRuntime::load`] is the one
+/// site every load path in every process reaches before its first weight copy,
+/// where `hipfire_loader::prepare_host_memory_for` runs earlier but only in a
+/// daemon started for a model.
 fn keep_pageable_copies_out_of_reclaim() {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(target_os = "linux") || std::env::var_os(GPU_PINNED_MIN_XFER_SIZE).is_some() {
         return;
     }
-    let opt_out = pinned_xfer_default_opt_out();
-    let preset = std::env::var_os(GPU_PINNED_MIN_XFER_SIZE);
-    match pageable_copy_staging(opt_out.as_deref(), preset.as_deref()) {
-        PageableCopyStaging::Preset => {}
-        PageableCopyStaging::OptedOut => eprintln!(
-            "[hip-bridge] {PINNED_XFER_DEFAULT_ENV}=0: {GPU_PINNED_MIN_XFER_SIZE} left unset (clr default)"
-        ),
-        PageableCopyStaging::Arm => {
-            std::env::set_var(GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB);
-            eprintln!(
-                "[hip-bridge] {GPU_PINNED_MIN_XFER_SIZE}={STAGE_ALL_PAGEABLE_COPIES_MB}: pageable weight copies staged out of reclaim"
-            );
-        }
-    }
+    std::env::set_var(GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB);
+    eprintln!(
+        "[hip-bridge] {GPU_PINNED_MIN_XFER_SIZE}={STAGE_ALL_PAGEABLE_COPIES_MB}: pageable weight copies staged out of reclaim"
+    );
 }
 
 /// What [`HipRuntime::load`] found when the HIP runtime was first loaded in this process:
@@ -6210,58 +6150,6 @@ mod mapped_library_tests {
     #[test]
     fn diagnostic_lookup_handles_an_unknown_address() {
         assert_eq!(dladdr_fname(ptr::null()), None);
-    }
-}
-
-#[cfg(test)]
-mod pageable_copy_staging_tests {
-    use super::{pageable_copy_staging, PageableCopyStaging};
-    use std::ffi::OsStr;
-
-    fn decide(opt_out: Option<&str>, preset: Option<&str>) -> PageableCopyStaging {
-        pageable_copy_staging(opt_out.map(OsStr::new), preset.map(OsStr::new))
-    }
-
-    #[test]
-    fn both_unset_arms_the_default() {
-        assert_eq!(decide(None, None), PageableCopyStaging::Arm);
-    }
-
-    #[test]
-    fn opt_out_zero_leaves_the_switch_unset() {
-        assert_eq!(decide(Some("0"), None), PageableCopyStaging::OptedOut);
-    }
-
-    #[test]
-    fn any_other_opt_out_value_still_arms() {
-        for value in ["1", "", "00", "false", " 0", "0 "] {
-            assert_eq!(
-                decide(Some(value), None),
-                PageableCopyStaging::Arm,
-                "opt-out {value:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_preset_switch_is_always_respected() {
-        for preset in ["0", "100000", "64", ""] {
-            assert_eq!(
-                decide(None, Some(preset)),
-                PageableCopyStaging::Preset,
-                "preset {preset:?}"
-            );
-            assert_eq!(
-                decide(Some("0"), Some(preset)),
-                PageableCopyStaging::Preset,
-                "preset {preset:?} with opt-out"
-            );
-            assert_eq!(
-                decide(Some("1"), Some(preset)),
-                PageableCopyStaging::Preset,
-                "preset {preset:?} with =1"
-            );
-        }
     }
 }
 

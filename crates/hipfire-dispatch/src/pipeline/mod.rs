@@ -4396,23 +4396,11 @@ mod shared_prepared_iu4_tests {
     }
 }
 
-/// `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` (`developer.prefill_iu4_producer_fused`,
-/// a typed boolean): the explicit value, read once. The capability table has
-/// raw exact-gfx1201 inventory and a qualified row there, so unset is on at
-/// exact gfx1201 and off elsewhere, `1` arms where the admission below holds,
-/// `0` is the kill switch.
-static PREFILL_IU4_PRODUCER_FUSED: LazyLock<Option<bool>> =
-    LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_PREFILL_IU4_PRODUCER_FUSED"));
-
-/// `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` resolved through the capability table
-/// for `gpu`'s architecture: an explicit `1` needs the raw gfx1201 inventory,
-/// `0` is off, unset follows the exact-gfx1201 qualification.
+/// The IU4 producer fusion's capability for `gpu`'s architecture: the route's
+/// `QUALIFIED` row, which is exact gfx1201 only (it also carries the raw inventory).
 pub(super) fn prefill_iu4_producer_fused_enabled(gpu: &Gpu) -> bool {
-    use rdna_compute::prefill_route_capabilities::{enabled, raw_inventory, PrefillRoute};
-    let route = PrefillRoute::PrefillIu4ProducerFused;
-    // An explicit `1` wins over the qualified default on any architecture, so
-    // the raw inventory (exact gfx1201 launchers) is a separate conjunct.
-    enabled(*PREFILL_IU4_PRODUCER_FUSED, &gpu.arch, route) && raw_inventory(&gpu.arch, route)
+    use rdna_compute::prefill_route_capabilities::{qualified, PrefillRoute};
+    qualified(&gpu.arch, PrefillRoute::PrefillIu4ProducerFused)
 }
 
 /// The only shared-down K the fused producer serves (the A3B shared expert's
@@ -4420,7 +4408,7 @@ pub(super) fn prefill_iu4_producer_fused_enabled(gpu: &Gpu) -> bool {
 const SHARED_DOWN_PRODUCER_FUSED_K: usize = 512;
 
 /// Pure admission of the fused shared-down SwiGLU/FWHT/`block_i4_128` producer:
-/// the flag resolved through the capability table, the GPU capability of the
+/// the route's qualification through the capability table, the GPU capability of the
 /// generic MQ4G256V2 GEMM's IU4 ADD consumer (`mq4g256v2_shared_iu4_supported`:
 /// exact gfx1201 WMMA, IU4 prefill, no A8/FP8 precedence, eager, K % 256, rows >= 64),
 /// an MQ4G256V2 down whose K is the shared intermediate width and equals
@@ -5530,18 +5518,12 @@ fn decode_shared_down_stage(
             } else if !router_shared_fuse {
                 hip!(gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, smi))?;
             }
-            // Default-on one-launch fuse for the exact Ornith qt44 shared-down
-            // shape. The scalar has no later read in this executor. `ffn_out`
-            // is dead here on the indexed path; on the generic fallback its
-            // next access is an overwrite by routed-expert down. `0` or an
-            // invalid override keeps sigmoid + plain V2 GEMV + scaled_add.
-            static MQ4V2_SHARED_DOWN_FUSED: LazyLock<bool> = LazyLock::new(|| {
-                hipfire_config::developer_var("HIPFIRE_MQ4V2_SHARED_DOWN_FUSED")
-                    .map(|value| value == "1")
-                    .unwrap_or(true)
-            });
-            let use_mq4v2_shared_down_fused = *MQ4V2_SHARED_DOWN_FUSED
-                && shared_down_w.dtype == DType::MQ4G256V2
+            // One-launch fuse for the exact Ornith qt44 shared-down shape. The
+            // scalar has no later read in this executor. `ffn_out` is dead here
+            // on the indexed path; on the generic fallback its next access is an
+            // overwrite by routed-expert down. Other shapes and arches keep
+            // sigmoid + plain V2 GEMV + scaled_add.
+            let use_mq4v2_shared_down_fused = shared_down_w.dtype == DType::MQ4G256V2
                 && shared_down_w.awq_scale.is_none()
                 && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
                 && shared_down_w.m == 2_048

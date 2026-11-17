@@ -34,8 +34,6 @@ pub const A8_XLDS_SRC: &str =
     include_str!("../../../kernels/src/moe_grouped_qt44_a8_sym_xlds.gfx12.hip");
 pub const A8_XLDS_MODULE: &str = "moe_grouped_qt44_a8_sym_xlds_gfx12";
 pub const A8_XLDS_SYMBOL: &str = "moe_grouped_qt44_a8_sym_gfx1201_xlds_nt4r1w8";
-/// Developer switch of the xlds route (default ON; `0` kills and restores the incumbent entry).
-pub const A8_XLDS_FLAG: &str = "HIPFIRE_MOE_A8_XLDS";
 /// Threads per xlds CTA (8 waves, each one 16-row weight fragment: 128 weight rows per CTA).
 pub const A8_XLDS_BLOCK: u32 = 256;
 /// Dynamic LDS of the xlds body (2 stages x 64 rows x (136 B qs pitch + 4 B d)).
@@ -47,10 +45,10 @@ pub const A8_XLDS_LDS: u32 = 17920;
 // selector-receipt: receipts/selectors/moe_a8_xlds_min_rows.json
 pub(crate) const MOE_A8_XLDS_MIN_ROWS: usize = 2304;
 
-/// Whether the xlds entry takes a W4A8 launch: exact gfx1201, the flag on, `m_total >= MOE_A8_XLDS_MIN_ROWS` and
+/// Whether the xlds entry takes a W4A8 launch: exact gfx1201, `m_total >= MOE_A8_XLDS_MIN_ROWS` and
 /// `m % 128 == 0` (8 waves x 16 weight rows per CTA; grid x = `m / 128`). Every other launch runs `select_entry_a8`'s entry.
-pub(crate) fn a8_xlds_admits(arch: &str, flag: bool, m_total: usize, m: usize) -> bool {
-    arch == "gfx1201" && flag && m_total >= MOE_A8_XLDS_MIN_ROWS && m > 0 && m % 128 == 0
+pub(crate) fn a8_xlds_admits(arch: &str, m_total: usize, m: usize) -> bool {
+    arch == "gfx1201" && m_total >= MOE_A8_XLDS_MIN_ROWS && m > 0 && m % 128 == 0
 }
 
 /// gfx11 (gfx1100 / gfx1151) twin of the W4A8 module: RDNA3 K16 iu8 operand form, same fold, so its
@@ -349,13 +347,7 @@ impl Gpu {
                 "grouped qt44 symmetric GEMM: W4A8 on gfx1201/gfx1100/gfx1151, W4A4/FP8 on gfx1201 only",
             ));
         }
-        let xlds = matches!(act, SymAct::A8)
-            && a8_xlds_admits(
-                &self.arch,
-                hipfire_config::developer_bool(A8_XLDS_FLAG, true),
-                m_total,
-                m,
-            );
+        let xlds = matches!(act, SymAct::A8) && a8_xlds_admits(&self.arch, m_total, m);
         let (func, module, src) = if xlds {
             (Some(A8_XLDS_SYMBOL), A8_XLDS_MODULE, A8_XLDS_SRC)
         } else {
@@ -529,30 +521,28 @@ mod tests {
 
     #[test]
     fn a8_xlds_route_predicate() {
-        let ok = |arch, flag, m_total, m| a8_xlds_admits(arch, flag, m_total, m);
+        let ok = |arch, m_total, m| a8_xlds_admits(arch, m_total, m);
         // gate/up (M 2176) and down (M 2560) of the Raon layer, routed launch bounds.
         for (m_total, m) in [(2304, 2176), (4992, 2560), (26496, 2560), (26496, 2176)] {
-            assert!(ok("gfx1201", true, m_total, m), "{m_total} {m}");
-            assert!(!ok("gfx1201", false, m_total, m), "flag off {m_total} {m}");
+            assert!(ok("gfx1201", m_total, m), "{m_total} {m}");
         }
         // decode / verify launch bounds (1-16 tokens on the Raon route histogram) stay on the incumbent
         for m_total in [96, 768, 1536, 2112] {
-            assert!(!ok("gfx1201", true, m_total, 2176), "{m_total}");
+            assert!(!ok("gfx1201", m_total, 2176), "{m_total}");
         }
         // the floor is inclusive and is in grouped rows (m_total)
-        assert!(ok("gfx1201", true, MOE_A8_XLDS_MIN_ROWS, 2176));
-        assert!(!ok("gfx1201", true, MOE_A8_XLDS_MIN_ROWS - 1, 2176));
-        assert!(!ok("gfx1201", true, 0, 2176));
+        assert!(ok("gfx1201", MOE_A8_XLDS_MIN_ROWS, 2176));
+        assert!(!ok("gfx1201", MOE_A8_XLDS_MIN_ROWS - 1, 2176));
+        assert!(!ok("gfx1201", 0, 2176));
         // 128 weight rows per CTA: an M that is only a multiple of 64 stays on the incumbent
-        assert!(!ok("gfx1201", true, 26496, 2112));
-        assert!(!ok("gfx1201", true, 26496, 64));
-        assert!(!ok("gfx1201", true, 26496, 0));
+        assert!(!ok("gfx1201", 26496, 2112));
+        assert!(!ok("gfx1201", 26496, 64));
+        assert!(!ok("gfx1201", 26496, 0));
         // exact gfx1201 only
         for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", "gfx1030", ""] {
-            assert!(!ok(arch, true, 26496, 2176), "{arch}");
+            assert!(!ok(arch, 26496, 2176), "{arch}");
         }
         assert_eq!(MOE_A8_XLDS_MIN_ROWS, 2304);
-        assert_eq!(A8_XLDS_FLAG, "HIPFIRE_MOE_A8_XLDS");
     }
 
     #[test]

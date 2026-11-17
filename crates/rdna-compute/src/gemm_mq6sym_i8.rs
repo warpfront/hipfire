@@ -26,8 +26,8 @@
 //! requests the route on exact gfx1201, `0`/`false` is the kill switch. The route additionally
 //! needs the loader's symmetric verdict ([`Gpu::set_qwen4_trunk_a8_verified`]).
 //!
-//! Multi-part form ([`Gpu::gemm_mq6sym_i8_prequant_x4`], `HIPFIRE_QWEN4_TRUNK_A8_X4`, developer,
-//! default on): up to four F32 members of one K and one `xq` (GDN qkv|z|a|b, QSA q|k|v|idx) in ONE
+//! Multi-part form ([`Gpu::gemm_mq6sym_i8_prequant_x4`], exact gfx1201 outside the lane
+//! row-exact scope): up to four F32 members of one K and one `xq` (GDN qkv|z|a|b, QSA q|k|v|idx) in ONE
 //! `gemm_mq6sym_i8_set_{m64n16,m32n32,m64n48,m64n16y}_x4_gfx1201` launch, one tile picked from the
 //! largest member; every output word is the single-matrix entry's, bit for bit.
 
@@ -128,8 +128,8 @@ fn trunk_a8_admits(g: TrunkA8Gate) -> bool {
 /// Pure form of [`Gpu::qwen4_trunk_a8_x4_enabled`]: the multi-part A8 route is a trunk A8 route, so
 /// it is refused inside the lane row-exact scope ([`Gpu::lane_row_exact_scope`]) like
 /// [`trunk_a8_admits`].
-fn trunk_a8_x4_admits(flag: bool, arch: &str, row_exact_scope: bool) -> bool {
-    flag && arch == "gfx1201" && !row_exact_scope
+fn trunk_a8_x4_admits(arch: &str, row_exact_scope: bool) -> bool {
+    arch == "gfx1201" && !row_exact_scope
 }
 
 /// One launchable tile of the symmetric A8 route.
@@ -545,14 +545,10 @@ impl Gpu {
         .and_then(x4_entry)
     }
 
-    /// `HIPFIRE_QWEN4_TRUNK_A8_X4` (developer, default on): the F32 members of one K of the wide
-    /// A8 trunk route launch as one multi-part [`Gpu::gemm_mq6sym_i8_prequant_x4`].
+    /// The F32 members of one K of the wide A8 trunk route launch as one multi-part
+    /// [`Gpu::gemm_mq6sym_i8_prequant_x4`] on exact gfx1201 outside the lane row-exact scope.
     pub fn qwen4_trunk_a8_x4_enabled(&self) -> bool {
-        trunk_a8_x4_admits(
-            self.flags.qwen4_trunk_a8_x4,
-            &self.arch,
-            self.lane_row_exact_scope,
-        )
+        trunk_a8_x4_admits(&self.arch, self.lane_row_exact_scope)
     }
 
     /// Overwrite each part's `y` (`[n x m]`, F32) with `W . X` for up to four verified-symmetric
@@ -1242,9 +1238,8 @@ mod tests {
 
     #[test]
     fn trunk_a8_x4_refused_in_lane_row_exact_scope() {
-        assert!(trunk_a8_x4_admits(true, "gfx1201", false));
-        assert!(!trunk_a8_x4_admits(true, "gfx1201", true));
-        assert!(!trunk_a8_x4_admits(false, "gfx1201", false));
-        assert!(!trunk_a8_x4_admits(true, "gfx1100", false));
+        assert!(trunk_a8_x4_admits("gfx1201", false));
+        assert!(!trunk_a8_x4_admits("gfx1201", true));
+        assert!(!trunk_a8_x4_admits("gfx1100", false));
     }
 }

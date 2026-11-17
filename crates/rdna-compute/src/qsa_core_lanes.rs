@@ -66,18 +66,6 @@ pub const QSA_LANES_FUSED_CORE_SYMBOL: &str = "indexed_attention_core_fused_fp8_
 /// Attention + the out-projection's `mq_rotate_x` as one launch.
 pub const QSA_LANES_FUSED_ATTENTION_SYMBOL: &str = "indexed_attention_attention_rot_fp8_lanes";
 
-/// `HIPFIRE_QWEN4_QSA_LANES_FUSE` (developer, default off): the admitted lane set takes the
-/// two fused launches ([`QsaCoreLanesPlan::launch_fused`]) instead of the four
-/// [`QsaCoreLanesPlan::launch`] launches plus the out-projection's `mq_rotate_x`. Read once.
-static QWEN4_QSA_LANES_FUSE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_LANES_FUSE", true)
-});
-
-/// Whether `HIPFIRE_QWEN4_QSA_LANES_FUSE` is on.
-pub fn qsa_lanes_fuse_enabled() -> bool {
-    *QWEN4_QSA_LANES_FUSE
-}
-
 /// Most dynamic + static LDS of a fused launch the admission allows (the fused core
 /// kernel carries the prologue's and the pool's static LDS next to the select's).
 const QSA_FUSE_LDS_MARGIN_BYTES: usize = 16 * 1024;

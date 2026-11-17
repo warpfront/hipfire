@@ -62,8 +62,6 @@ const FLASH_FA2_FUNC: &str = "latent_attention_flash_prefill_fa2_q128w8";
 const FLASH_FA2_Q8_MODULE: &str = "latent_attention_flash_fa2_q8";
 const FLASH_FA2_Q8_GFX1100_MODULE: &str = "latent_attention_flash_fa2_q8_gfx1100";
 const FLASH_FA2_Q8_FUNC: &str = "latent_attention_flash_prefill_fa2_q8_q128w8";
-/// Developer switch of the FA2 route (default ON; `0` kills and restores the incumbent).
-pub const FA2_FLAG: &str = "HIPFIRE_ATTN_FA2_GENERIC";
 /// Smallest row count the FA2 body is routed at (below it the incumbent wins: j6115, 1 row prefix 0 is 1.105x).
 // selector-receipt: receipts/selectors/fa2_min_rows.json
 pub(crate) const FA2_MIN_ROWS: usize = 17;
@@ -133,20 +131,19 @@ pub(crate) fn fa2_body(arch: &str, q8: bool) -> Option<Fa2Body> {
     }
 }
 
-/// The FA2 body a non-wide launch takes, if any: the arch has a body for the mirror ([`fa2_body`]), flag on,
+/// The FA2 body a non-wide launch takes, if any: the arch has a body for the mirror ([`fa2_body`]),
 /// `rows >= body.min_rows`, and the judged geometry (`wa` 128, `wb` 64 so `wa + wb <= 192`, `dv` 128; the body
 /// returns without writing otherwise).
 pub(crate) fn fa2_route(
     arch: &str,
     q8: bool,
-    flag: bool,
     n_rows: usize,
     wa: usize,
     wb: usize,
     dv: usize,
 ) -> Option<Fa2Body> {
     let body = fa2_body(arch, q8)?;
-    (flag && n_rows >= body.min_rows && wa + wb <= 192 && wa == 128 && wb == 64 && dv == 128)
+    (n_rows >= body.min_rows && wa + wb <= 192 && wa == 128 && wb == 64 && dv == 128)
         .then_some(body)
 }
 
@@ -347,15 +344,7 @@ impl Gpu {
             && dv <= WIDE_MAX_DV
             && wide_lds_bytes(dq, dv) <= LATENT_ATTENTION_FLASH_LDS_LIMIT;
         let fa2 = if fa2_route && !wide {
-            self::fa2_route(
-                &self.arch,
-                q8,
-                hipfire_config::developer_bool(FA2_FLAG, true),
-                a.n_rows,
-                wa,
-                wb,
-                dv,
-            )
+            self::fa2_route(&self.arch, q8, a.n_rows, wa, wb, dv)
         } else {
             None
         };
@@ -477,24 +466,22 @@ mod tests {
 
     #[test]
     fn fa2_route_predicate() {
-        let ok =
-            |arch, flag, rows, wa, wb, dv| fa2_route(arch, false, flag, rows, wa, wb, dv).is_some();
-        assert!(ok("gfx1201", true, 512, 128, 64, 128));
-        assert!(ok("gfx1201", true, FA2_MIN_ROWS, 128, 64, 128));
-        assert!(!ok("gfx1201", true, FA2_MIN_ROWS - 1, 128, 64, 128));
-        assert!(!ok("gfx1201", true, 1, 128, 64, 128));
-        assert!(!ok("gfx1201", false, 512, 128, 64, 128));
-        assert!(ok("gfx1100", true, FA2_GFX1100_MIN_ROWS, 128, 64, 128));
-        assert!(!ok("gfx1100", true, FA2_GFX1100_MIN_ROWS - 1, 128, 64, 128));
+        let ok = |arch, rows, wa, wb, dv| fa2_route(arch, false, rows, wa, wb, dv).is_some();
+        assert!(ok("gfx1201", 512, 128, 64, 128));
+        assert!(ok("gfx1201", FA2_MIN_ROWS, 128, 64, 128));
+        assert!(!ok("gfx1201", FA2_MIN_ROWS - 1, 128, 64, 128));
+        assert!(!ok("gfx1201", 1, 128, 64, 128));
+        assert!(ok("gfx1100", FA2_GFX1100_MIN_ROWS, 128, 64, 128));
+        assert!(!ok("gfx1100", FA2_GFX1100_MIN_ROWS - 1, 128, 64, 128));
         for arch in ["gfx1151", "gfx1101", "gfx1010", ""] {
-            assert!(!ok(arch, true, 512, 128, 64, 128), "{arch}");
+            assert!(!ok(arch, 512, 128, 64, 128), "{arch}");
         }
         // geometry: anything but the judged 128 + 64 -> 128 falls back.
-        assert!(!ok("gfx1201", true, 512, 128, 64, 256));
-        assert!(!ok("gfx1201", true, 512, 128, 64, 64));
-        assert!(!ok("gfx1201", true, 512, 64, 64, 128));
-        assert!(!ok("gfx1201", true, 512, 128, 128, 128));
-        assert!(!ok("gfx1201", true, 512, 512, 64, 128));
+        assert!(!ok("gfx1201", 512, 128, 64, 256));
+        assert!(!ok("gfx1201", 512, 128, 64, 64));
+        assert!(!ok("gfx1201", 512, 64, 64, 128));
+        assert!(!ok("gfx1201", 512, 128, 128, 128));
+        assert!(!ok("gfx1201", 512, 512, 64, 128));
         assert_eq!(FA2_MIN_ROWS, 17);
     }
 
@@ -545,18 +532,16 @@ mod tests {
     #[test]
     fn fa2_q8_route_and_launch_constants_match_the_contract() {
         use hipfire_kernel_abi::families::generic_seq;
-        // The Q8 path shares the predicate: same flag / rows / geometry gate.
-        let ok = |arch, flag, rows| fa2_route(arch, true, flag, rows, 128, 64, 128).is_some();
-        assert!(ok("gfx1201", true, FA2_Q8_MIN_ROWS));
-        assert!(!ok("gfx1201", true, FA2_Q8_MIN_ROWS - 1));
-        assert!(!ok("gfx1201", false, 512));
-        assert!(ok("gfx1100", true, FA2_Q8_GFX1100_MIN_ROWS));
-        assert!(!ok("gfx1100", true, FA2_Q8_GFX1100_MIN_ROWS - 1));
-        assert!(!ok("gfx1100", false, 512));
+        // The Q8 path shares the predicate: same rows / geometry gate.
+        let ok = |arch, rows| fa2_route(arch, true, rows, 128, 64, 128).is_some();
+        assert!(ok("gfx1201", FA2_Q8_MIN_ROWS));
+        assert!(!ok("gfx1201", FA2_Q8_MIN_ROWS - 1));
+        assert!(ok("gfx1100", FA2_Q8_GFX1100_MIN_ROWS));
+        assert!(!ok("gfx1100", FA2_Q8_GFX1100_MIN_ROWS - 1));
         for arch in ["gfx1151", "gfx1101", "gfx1010", ""] {
-            assert!(!ok(arch, true, 512), "{arch}");
+            assert!(!ok(arch, 512), "{arch}");
         }
-        assert!(fa2_route("gfx1100", true, true, 512, 128, 64, 256).is_none());
+        assert!(fa2_route("gfx1100", true, 512, 128, 64, 256).is_none());
         let abi = generic_seq::ABIS
             .iter()
             .find(|a| a.id == "generic_seq.latent_attention_flash_prefill_fa2_q8_q128w8")

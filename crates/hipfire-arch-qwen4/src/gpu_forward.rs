@@ -4435,7 +4435,7 @@ pub(crate) struct Qwen4BalancedPlan {
     pub(crate) slot_owner: GpuTensor,
 }
 
-/// One EP rank's owner-mask state of the wide-verify int8 chain (`HIPFIRE_QWEN4_MOE_GU_A8`, default; the
+/// One EP rank's owner-mask state of the wide-verify int8 chain (the
 /// trunk shard's 9..=64-row decode / verify MoE): both buffers are built once at
 /// [`Qwen4GpuForward::attach_ep`], never per step, and owned by [`Qwen4ForwardEp`] (the row-gather
 /// hook holds non-owning views, [`Qwen4GpuForward::ep_decode_owner_mask_views`]).
@@ -4530,9 +4530,9 @@ pub(crate) struct Qwen4ForwardEp {
     /// chunk route takes every wide call, and its partial mask drops the non-owned experts'
     /// tiles through the owner table, with no exchange.
     tile: Option<Qwen4TileRoute>,
-    /// The wide-verify int8 chain's owner mask (`HIPFIRE_QWEN4_MOE_GU_A8` default, trunk shard):
+    /// The wide-verify int8 chain's owner mask (trunk shard):
     /// built at [`Qwen4GpuForward::attach_ep`], `None` when the chain is off or unmasked
-    /// (`HIPFIRE_QWEN4_MOE_GU_A8=0` / `2`), off the trunk shard, or before attach.
+    /// (not admitted on this arch), off the trunk shard, or before attach.
     decode_mask: Option<Qwen4DecodeOwnerMask>,
 }
 
@@ -14418,7 +14418,7 @@ impl Qwen4GpuForward {
                 }
             }
             // Wide-verify int8 chain owner mask: only the trunk shard's partial FFN route has a no-op
-            // gather (`MoeRowGather::gather_skipped`), and `HIPFIRE_QWEN4_MOE_GU_A8=2` / `0` run
+            // gather (`MoeRowGather::gather_skipped`), and a non-admitted arch runs
             // unmasked / off, so nothing is allocated there. The table is the SEALED ownership
             // (`placement.owns(e)` is `e % ranks`, what the compact decode table's real entries
             // follow); built once here, no per-step allocation or upload.

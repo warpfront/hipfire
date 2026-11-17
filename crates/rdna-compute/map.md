@@ -14,7 +14,7 @@ Kernel compilation, caching, and dispatch for RDNA GPUs. Owns `Gpu`/`GpuTensor`,
 - `Gpu` methods pick WMMA → specialized → baseline via `arch_caps` predicates — adding a new arch clause that a newer predicate already subsumes is redundant.
 - `a3b_gqa8_oracle` requires `lab` and carries the original full-allocation decode dump comparison and VerifyAttn byte-identity gates. Native FP8 H16/KV2 uses the gfx1201 group-8 decode/verify exports under the existing admission flags; H24/group-6, explicit Q8 optimized routes, and the Q8 qualification table remain unchanged. Native FP8 PM-prefill and PM-Qprep default on only for their qualified exact-gfx1201 H16/KV2/D256 route; explicit flag `0` opts out and all existing shape, codec, recording/capture and other admission guards still apply. The already-blocked VMM mode is excluded from this target; existing production VMM refusal/fallback semantics are unchanged.
 - `FP8_KV_QUALIFIED` has two exact-gfx1201 H16/KV2/D256 rows for F16-Q attention with native FP8 K/V and its PM Qprep route; it is not empty and is not qualification of FP8-quantized Q. Native FP8 KV selection and FA2 eligibility are independent and stackable. Existing codec/shape/eager-state guards and explicit flag overrides remain authoritative.
-- A3B H16/KV2/D256 has its own Q-resident v2 Q8 pair (`attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201` direct, `..._range_a3b_gfx1201` range) sharing the dense KT48 body and 49,936 B dynamic LDS: one Raw Q allocation as E4M3 code plane + F32 scale plane with checked total-row offsets, exact-gfx1201 admission, and no Q8-image, historical 64-KiB/F16-record or `FP8_KV_QUALIFIED` F16-Q changes. PP16000 scope only: four original opt-ins (`HIPFIRE_MOE_ROTATE_I4_PM=1`, `HIPFIRE_PREFILL_IU4_C8_PM=1`, `HIPFIRE_GDN_CHUNK_PREP_PM=1`, `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI=1`), not the stock default; qwen3.6-35b-a3b-d53.mq4rs 17478.9 / ornith-1.5-35b-a3b-d53.mq4rs 17383.8 strict medians, 6 fresh processes total, 18 measured samples (3 per process after 2 warmups), source dc307/tree fb056, CLI efa37fc4 / daemon 8a43d456, kit 860802. Tiny 522 (512 + tail 10) takes whole-batch native Direct before the F32 fallback; Range supports 1+ rows but GEN Range unobserved. The 522/128 GEN smoke was a coherent bounded prefix with mid-Python/length-runaway true, not a complete answer. Quality plus all three final CPU gates REQUIRED; no stock/default/release/tag/SITE claim.
+- A3B H16/KV2/D256 has its own Q-resident v2 Q8 pair (`attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201` direct, `..._range_a3b_gfx1201` range) sharing the dense KT48 body and 49,936 B dynamic LDS: one Raw Q allocation as E4M3 code plane + F32 scale plane with checked total-row offsets, exact-gfx1201 admission, and no Q8-image, historical 64-KiB/F16-record or `FP8_KV_QUALIFIED` F16-Q changes. PP16000 scope only: three original opt-ins (`HIPFIRE_MOE_ROTATE_I4_PM=1`, `HIPFIRE_GDN_CHUNK_PREP_PM=1`, `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI=1`) plus the C8 PM twin (now unconditional on exact gfx1201), not the stock default; qwen3.6-35b-a3b-d53.mq4rs 17478.9 / ornith-1.5-35b-a3b-d53.mq4rs 17383.8 strict medians, 6 fresh processes total, 18 measured samples (3 per process after 2 warmups), source dc307/tree fb056, CLI efa37fc4 / daemon 8a43d456, kit 860802. Tiny 522 (512 + tail 10) takes whole-batch native Direct before the F32 fallback; Range supports 1+ rows but GEN Range unobserved. The 522/128 GEN smoke was a coherent bounded prefix with mid-Python/length-runaway true, not a complete answer. Quality plus all three final CPU gates REQUIRED; no stock/default/release/tag/SITE claim.
 - The gfx1201 native FP8 GQA8 tile scores heads in four two-head batches to reduce live Q registers; P.V retains two four-head halves. Group-6 scoring, per-head arithmetic order, ABI, launch geometry, LDS layout and admission guards are unchanged.
 - Walked HIP plans bind live current registry recipes, not historical whole-source text; historical captures and pins remain provenance. Existing kind/compiler-flag/profile/symbol/shape/admission/pack contracts and strict embedded-image SHA checks remain enforced, with no kernel arithmetic, public API or feature-default changes.
 - `examples/pm_loop.rs` (`--features lab`, dev-deps only) is the one-command emit → M7 → correctness → ABBA loop for PM production generators (`iu4_gemm`, `mq6_i8_gemm`, `qwen4_moe_sym` and the producers `iu4_c8_producer_pm`, `moe_rotate_i4_pm`, `gdn_chunk_prep_pm`; `--rip` is iu4_gemm/mq6_i8_gemm only, the 2:4-sparse `--mma` iu4_gemm only). Shared builders live in `examples/pm_loop/common.rs` (PRNG, `fn:`/`a3b:` shape presets, shipped-object selection, emulator launcher) and the producers share one generic `Workload` (`examples/pm_loop/prod.rs`: bitwise identity vs the shipped object plus an exact CPU reference where the repo has one). It times with `examples/support/abba.rs`, shared with `pm_decode_twins`: `pm_loop` calls a result `separable` by an exact sign test (p <= 1e-3) over the per-round paired ratios of each ABBA round, which cancels the between-round clock drift that defeats block-disjoint comparisons, and auto-extends by doubling ABBA rounds up to `--max-rounds`/`--time-budget-s`; the block-disjoint and twins' full-range rules stay in the record as `separable_block_disjoint` and `separable_full_range`, and `material` additionally needs `|block_ratio - 1| >= --min-effect` (default 0.5%). Run it only through `fabric-run.sh --class timing`.
@@ -1412,9 +1412,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `iu4_prefill_enabled`
   - `iu4_producer_sidecar_enabled`
   - `Mb4Mode`
-  - `MOE_GLUE_FOLD_MASK`
-  - `MOE_GLUE_FOLD_ROTATE`
-  - `MOE_GLUE_FOLD_ROUTER`
   - `mq3v25_a4_enabled`
   - `mq3v25_a8_enabled`
   - `mq4v2_gateup_k5120_enabled`
@@ -1422,7 +1419,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `mq6_rows_split_enabled`
   - `no_device_compiler_from_active_config`
   - `parse_legacy_flag_bool`
-  - `parse_moe_glue_fold`
   - `process`
   - `qwen4_bf16_allrows_enabled`
   - `qwen4_bf16_rows_otile_enabled`
@@ -1450,7 +1446,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `qwen4_hc_mix_fill80_gfx1100_enabled`
   - `qwen4_hc_pair_allrows_enabled`
   - `qwen4_hc_pair_decode_enabled`
-  - `qwen4_hc_pair_wide_enabled`
   - `qwen4_hc_row_fold_enabled`
   - `qwen4_hc_row_fold_mixer_gfx1201_enabled`
   - `qwen4_hc_row_fold_moe_gfx1201_enabled`
@@ -1466,19 +1461,15 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `qwen4_lane_ple_project_enabled`
   - `qwen4_lane_prepare_async_enabled`
   - `qwen4_lane_wmma_enabled`
-  - `qwen4_lwmma_multi_part_enabled`
   - `qwen4_moe_combine_inline_order_enabled`
   - `qwen4_moe_combine_zinit_enabled`
   - `qwen4_moe_down_r4_enabled`
-  - `qwen4_moe_glue_fold_enabled`
   - `qwen4_moe_scatter_serial_walk`
   - `qwen4_mq6_r8_pk_enabled`
   - `qwen4_mtp_fc_one_launch_enabled`
   - `qwen4_ple_fuse_enabled`
   - `qwen4_prefill_lwmma_dense_enabled`
   - `qwen4_prefill_lwmma_floor_knob`
-  - `qwen4_prefill_lwmma_hc_enabled`
-  - `qwen4_prefill_lwmma_tile_enabled`
   - `QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS`
   - `qwen4_qsa_decode_splitk_enabled`
   - `qwen4_qsa_decode_splitkv_q8_enabled`
@@ -2379,7 +2370,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `MoeSymIu4Checker`
   - `MoeSymIu4DownProducer`
   - `MoeSymIu4GateProducer`
-  - `MoeSymIu4HipccTwin`
   - `MoeSymIu4Kernel`
   - `mq2_xbatch_pm_active`
   - `mq2_xbatch_pm_covers`
@@ -3174,6 +3164,7 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `iu4_c8_pm_sigmoid_rotate_admitted`
   - `KERNARG_BYTES`
   - `KERNARG_BYTES_EXT`
+  - `lab_pin_incumbent`
   - `MAX_ROWS`
   - `MODULE`
   - `mq_rotate_x_i4_c8_pm`
@@ -5195,7 +5186,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `LATENT_DECODE_ROWS_CAP`
   - `LATENT_DECODE_SPLITS`
 - [`src/latent_attention_flash.rs`](src/latent_attention_flash.rs)
-  - `FA2_FLAG`
   - `LATENT_ATTENTION_FLASH_FA2_GFX1100_SRC`
   - `LATENT_ATTENTION_FLASH_FA2_Q8_GFX1100_SRC`
   - `LATENT_ATTENTION_FLASH_FA2_Q8_SRC`
@@ -5532,7 +5522,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `A8_SRC`
   - `a8_supported`
   - `A8_XLDS_BLOCK`
-  - `A8_XLDS_FLAG`
   - `A8_XLDS_LDS`
   - `A8_XLDS_MODULE`
   - `A8_XLDS_SRC`
@@ -6057,7 +6046,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `QSA_CORE_LANES_MAX`
   - `qsa_core_lanes_min`
   - `QSA_LANES_ATTENTION_SYMBOL`
-  - `qsa_lanes_fuse_enabled`
   - `QSA_LANES_FUSE_MODULE`
   - `QSA_LANES_FUSED_ATTENTION_SYMBOL`
   - `QSA_LANES_FUSED_CORE_SYMBOL`
@@ -6140,8 +6128,6 @@ _Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside
   - `QWEN4_MOE_EP_A8_NT_ENV`
   - `qwen4_moe_ep_a8_requested`
   - `qwen4_moe_gu_a8_applies`
-  - `qwen4_moe_gu_a8_enabled`
-  - `QWEN4_MOE_GU_A8_FLAG`
   - `qwen4_moe_gu_a8_masked`
   - `qwen4_moe_gu_a8_receipt`
   - `qwen4_moe_gu_rot_fold_applies`

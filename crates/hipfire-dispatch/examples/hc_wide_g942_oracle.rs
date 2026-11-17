@@ -1419,7 +1419,7 @@ fn run() -> R<bool> {
         }
         println!(
             "BENCH n={n} iters={} weights={} hc_lane_scope_ms={hc_lane:.3} hc_chunk_route_ms={hc_chunk:.3} \
-             dense_census_ms={dense:.3} (dense route per HIPFIRE_G942_BF16_WIDE / chain flags of this process)",
+             dense_census_ms={dense:.3} (dense route as this build selects it)",
             cli.iters, set.label
         );
     }

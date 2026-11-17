@@ -518,31 +518,6 @@ mod tests {
     }
 
     #[test]
-    fn prefill_iu4_producer_fused_is_an_uncurated_advanced_developer_key() {
-        // Qualified capability route (exact-gfx1201 default resolved by rdna-compute, not a
-        // schema default).
-        let key = "developer.prefill_iu4_producer_fused";
-        assert_eq!(intent_of(key), Intent::Advanced);
-        for intent in Intent::ALL {
-            assert!(!intent.curated().contains(&key), "{intent:?}");
-        }
-        assert!(key_matches(key, "HIPFIRE_PREFILL_IU4_PRODUCER_FUSED"));
-        assert!(key_matches(key, "prefill_iu4_producer_fused"));
-    }
-
-    #[test]
-    fn prefill_iu4_c8_pm_is_an_uncurated_advanced_developer_key() {
-        // Raw-inventory-only capability route: opt-in, no schema default.
-        let key = "developer.prefill_iu4_c8_pm";
-        assert_eq!(intent_of(key), Intent::Advanced);
-        for intent in Intent::ALL {
-            assert!(!intent.curated().contains(&key), "{intent:?}");
-        }
-        assert!(key_matches(key, "HIPFIRE_PREFILL_IU4_C8_PM"));
-        assert!(key_matches(key, "prefill_iu4_c8_pm"));
-    }
-
-    #[test]
     fn moe_shared_down_sigmoid_epi_is_an_uncurated_advanced_developer_key() {
         // Default-off opt-in capability route (no qualified row, no schema default).
         let key = "developer.moe_shared_down_sigmoid_epi";

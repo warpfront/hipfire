@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Hardware oracle of the singleton device sampled accept
-//! (`HIPFIRE_DFLASH_DEVICE_ACCEPT`, `dflash_sampled_accept_sparse_q_f32`).
+//! (`dflash_sampled_accept_sparse_q_f32`).
 //!
 //! `#[ignore]`d: it needs a real HIP GPU (no model). Run explicitly:
 //!

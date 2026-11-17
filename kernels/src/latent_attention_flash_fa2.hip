@@ -8,7 +8,7 @@
 // `latent_attention_flash_prefill` (kernels/src/latent_attention_flash.hip) in every contract-derived row class.
 // Product launch: block 256, dynamic LDS 44032, grid [ceil(n_rows / 128), n_heads, 1] (the "grid.x is ceil(n_rows/64)"
 // remarks below describe the generator's original harness; the early return keeps any larger grid safe).
-// Routed from `Gpu::latent_attention_flash_prefill` behind HIPFIRE_ATTN_FA2_GENERIC (default OFF).
+// Routed from `Gpu::latent_attention_flash_prefill` for the admitted row counts (no env switch).
 #define F2A_NW 8
 #define F2A_RING 0
 #define F2A_LATE 0

@@ -369,7 +369,7 @@ impl Gpu {
 
     /// The product entry of the sub-512-row prefill lane-WMMA GEMMs above 64 rows: the tile kernel
     /// ([`Gpu::lane_wmma_tile_gemm_prefill`]) for a BF16 weight of a tuned `(m, k, terms)` shape
-    /// while `HIPFIRE_QWEN4_PREFILL_LWMMA_TILE` is on (default), else the shipped
+    /// on the lane-WMMA route, else the shipped
     /// [`Gpu::lane_wmma_gemm_prefill`]. Every output word is the same either way.
     #[allow(clippy::too_many_arguments)]
     pub fn lane_wmma_prefill_gemm(
@@ -383,7 +383,7 @@ impl Gpu {
         terms: usize,
         hc_act: Option<f32>,
     ) -> HipResult<()> {
-        if self.flags.qwen4_prefill_lwmma_tile_enabled()
+        if self.flags.qwen4_lane_wmma_enabled()
             && matches!(w, LaneWmmaWeight::Bf16(_))
             && lane_wmma_tile_pick(m, k, rows, terms).is_some()
         {

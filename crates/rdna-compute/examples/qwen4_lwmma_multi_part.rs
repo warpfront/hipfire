@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Multi-part lane-WMMA launch (`HIPFIRE_QWEN4_LWMMA_MULTI_PART`): byte ORACLE + timing bench
+//! Multi-part lane-WMMA launch: byte ORACLE + timing bench
 //! (exact gfx1201; developer example).
 //!
 //! `oracle`: up to four BF16 projections of one activation (the wide MoE block's dense front:
@@ -15,14 +15,12 @@
 //! (a different pattern per arm, so an unwritten word cannot match), the multi scratch counters
 //! must be left zero, the multi launch is repeated over the dirty partial scratch, and `x`
 //! carries inf / NaN rows in some cells. Negative controls (flipped output bit, perturbed
-//! weight) must be DETECTED. The `Gpu::gemv_bf16_xf32_x4_rows` route cells (flag
-//! `HIPFIRE_QWEN4_LWMMA_MULTI_PART=1` in the environment) check that the product route loads a
-//! `_multi` entry exactly when the flag is on and that it is byte-identical to the per-part
-//! reference either way.
+//! weight) must be DETECTED. The `Gpu::gemv_bf16_xf32_x4_rows` route cells check that the
+//! product route loads a `_multi` entry and is byte-identical to the per-part reference.
 //! `bench`: per-layer launch-sequence times, one launch per part vs one multi launch, over 8
 //! rotating weight sets.
 //!
-//! Usage: [HIPFIRE_QWEN4_LWMMA_MULTI_PART=1] qwen4_lwmma_multi_part oracle | bench
+//! Usage: qwen4_lwmma_multi_part oracle | bench
 
 use rdna_compute::lane_wmma::{
     lane_wmma_gemm, lane_wmma_gemm_multi, lane_wmma_multi_plan, LaneWmmaCfg, LaneWmmaMultiPart,
@@ -330,15 +328,6 @@ fn first_words(c: &Cell, x_words: &[u32]) -> u64 {
 fn oracle() -> Res<()> {
     let mut gpu = Gpu::init()?;
     check_arch(&gpu)?;
-    let flag_on = gpu.flags.qwen4_lwmma_multi_part_enabled();
-    println!(
-        "flag HIPFIRE_QWEN4_LWMMA_MULTI_PART enabled: {flag_on} (route cells {})",
-        if flag_on {
-            "must load a _multi entry"
-        } else {
-            "must NOT load a _multi entry"
-        }
-    );
     let single = LaneWmmaScratch::new(
         &mut gpu,
         LANE_WMMA_SCRATCH_PARTIAL_FLOATS,
@@ -403,9 +392,9 @@ fn oracle() -> Res<()> {
         .cloned()
         .collect::<Vec<_>>();
     println!("route cells loaded multi entries: {multi_loaded:?}");
-    if multi_loaded.is_empty() == flag_on {
+    if multi_loaded.is_empty() {
         failures += 1;
-        println!("ROUTE FAIL: multi entry loaded != flag");
+        println!("ROUTE FAIL: no multi entry loaded");
     }
 
     // ---- direct kernel cells ----

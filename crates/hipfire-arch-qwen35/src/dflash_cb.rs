@@ -56,8 +56,8 @@ use crate::qwen35::prefill::multi::{
 use crate::qwen35::{self, DeltaNetState, DflashFusionCtx};
 use crate::qwen35::{Qwen35Config, Qwen35Weights};
 use crate::speculative::{
-    dflash_device_accept_eligible, dflash_device_accept_enabled, dflash_download_verify_argmax,
-    dflash_draft_batch_eligible, dflash_draft_batch_max_rows, dflash_enqueue_verify_lm_head_argmax,
+    dflash_device_accept_eligible, dflash_download_verify_argmax, dflash_draft_batch_eligible,
+    dflash_draft_batch_max_rows, dflash_enqueue_verify_lm_head_argmax,
     dflash_sampled_accept_device, dflash_sampled_selector_draft_into, dflash_sparse_target_enabled,
     dflash_target_rows_into, draft_dflash_block_rank, draft_dflash_blocks_batched,
     draft_dflash_sampled_blocks_batched, DeltaNetSnapshot, DflashCbDraft, DflashDraftLane,
@@ -385,12 +385,12 @@ fn cb_sampled_packed_head_admitted(
 fn cb_sampled_device_accept_eligible(lane: &DflashCbVerifyLane<'_>, device_ok: bool) -> bool {
     lane.state.sample_temp > 1e-6
         && lane.state.sampled_draft.as_ref().is_some_and(|receipt| {
-            dflash_device_accept_eligible(
-                dflash_device_accept_enabled() && device_ok,
-                &lane.state.sample_cfg(),
-                receipt,
-                lane.draft.verify_tokens.len(),
-            )
+            device_ok
+                && dflash_device_accept_eligible(
+                    &lane.state.sample_cfg(),
+                    receipt,
+                    lane.draft.verify_tokens.len(),
+                )
         })
 }
 

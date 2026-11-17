@@ -2522,13 +2522,13 @@ fn validate_route_receipt_pair(
 }
 
 /// The route stage's offer to run the grouped scatter inside the router launch
-/// (`HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`): the caller has already checked that the scatter stage
+/// (route-scatter fusion): the caller has already checked that the scatter stage
 /// would launch the plain grouped scatter right after this route. `launched` is set when the
 /// fused launch ran; the scatter stage then launches nothing.
 pub(super) struct RouteScatterFuse<'a> {
     pub(super) grouped_rows: usize,
     pub(super) launched: &'a std::cell::Cell<bool>,
-    /// The owner mask of the wide-verify int8 chain of this call (`HIPFIRE_QWEN4_MOE_GLUE_FOLD`):
+    /// The owner mask of the wide-verify int8 chain of this call (glue folds X8a / X8b):
     /// the 9..=64-row wide launch writes its masked tile-id copy too and sets `mask_written`.
     pub(super) owner_mask: Option<crate::families::moe::MoeDecodeOwnerMask<'a>>,
     pub(super) mask_written: &'a std::cell::Cell<bool>,
@@ -2638,7 +2638,7 @@ pub(super) fn produce_prefill_route<'a>(
                     super::router_observer::RouterScoresAfterRoute::Logits,
                     params.recipe.bf16_round_trip(),
                 );
-                // `HIPFIRE_QWEN4_MOE_GLUE_FOLD` b: 9..=64 rows run the wide router + scatter (+ owner
+                // Glue fold b: 9..=64 rows run the wide router + scatter (+ owner
                 // mask) launch, 1..=8 rows the one-workgroup `moe_route_scatter_top10_f32`.
                 let wide = fuse_scatter.is_some()
                     && gpu.moe_glue_fold_route_admitted(

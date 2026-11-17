@@ -54,8 +54,8 @@ use rdna_compute::tensor_ops::{
     gated_delta_gate_batched_rotate_arena, gated_delta_step_gate_wmma_arena,
     gated_delta_step_gate_wmma_qknormed_arena, indexed_attention_cache_append_batch_arena,
     indexed_attention_index_key_append_batch_arena, indexed_attention_norm_rope_batch_arena,
-    indexed_attention_rope_table, qsa_core_lanes, qsa_lanes_fuse_enabled, Bf16Arena, GdnCoreLane,
-    GdnCoreRowsLane, QsaCoreLane, QsaOutRotate, QSA_CORE_LANE_ROWS,
+    indexed_attention_rope_table, qsa_core_lanes, Bf16Arena, GdnCoreLane, GdnCoreRowsLane,
+    QsaCoreLane, QsaOutRotate, QSA_CORE_LANE_ROWS,
 };
 use rdna_compute::{
     DType, Gpu, GpuTensor, TrunkFamily, QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM,
@@ -410,7 +410,7 @@ fn project_weights_inner(
                 continue;
             }
             let xq = hip(gpu.mq6_i8_prepare_x(input, weight.k, rows))?;
-            // `HIPFIRE_QWEN4_TRUNK_A8_X4`: the F32 members of this K gather into chunks of up to
+            // The F32 members of this K gather into chunks of up to
             // four and launch as one multi-part GEMM (`gemm_mq6sym_i8_prequant_x4`); BF16 members
             // (the chunked GDN qkv) and shapes without an x4 entry launch per member as before.
             let x4 = gpu.qwen4_trunk_a8_x4_enabled();
@@ -644,16 +644,12 @@ fn project_weights_inner(
             }
         }
     }
-    // `HIPFIRE_QWEN4_LWMMA_MULTI_PART` (exact gfx1201, 16..=64 rows past the few-row window): BF16
+    // Exact gfx1201, 16..=64 rows past the few-row window: BF16
     // members of one K that each decline the F16 WMMA route take, one by one, the lane-WMMA arm of
     // `gemm_bf16_xf32_multirow` (`project_rotated`); two to four of them run as ONE multi-part
     // launch instead, each member's bytes that launch's. Not inside an EP prefill wave split
     // (`Gpu::wave_lane_groups`: the one-call-per-lane arm owns those).
-    if !wide_exact
-        && input.dtype == DType::F32
-        && gpu.flags.qwen4_lwmma_multi_part_enabled()
-        && gpu.wave_lane_groups(rows).is_none()
-    {
+    if !wide_exact && input.dtype == DType::F32 && gpu.wave_lane_groups(rows).is_none() {
         for i in 0..projections.len() {
             let (weight, _) = projections[i];
             if done[i] || weight.dtype != DType::BF16 {
@@ -1316,30 +1312,6 @@ pub fn g942_bf16_few_rows_invariant(gpu: &Gpu) -> bool {
     gpu.arch_caps.is_gfx942() && !g942_trunk_gemv()
 }
 
-/// `HIPFIRE_G942_ROWS16_CHAIN` (read once, default on; `=0` kills): on gfx942,
-/// a BF16 projection of more than 16 rows takes ⌈rows/16⌉ chained few-row
-/// launches instead of the 32-row-tile entry while the shape's
-/// `rdna_compute::cdna::gfx942::rows16_chain_max_rows` admits it. Same bytes
-/// either way (row-invariant MFMA chain).
-fn g942_rows16_chain() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_G942_ROWS16_CHAIN", true)
-    });
-    *ON
-}
-
-/// `HIPFIRE_G942_BF16_WIDE` (read once, default on; `=0` kills): on gfx942, a BF16
-/// projection group of 17.. rows takes the wide entry (`Gpu::gemm_bf16_mfma_gfx942_wide`, one
-/// weight pass per 64 rows) while `rdna_compute::cdna::gfx942::wide_max_rows` admits any of its
-/// members, ahead of the rows16 chain. Same bytes either way (row-invariant MFMA chain; Tier C
-/// `qwen4_gemm_bf16_mfma_gfx942_wide`, rows 1..=64 / 65 / 257 / 1025 on every trunk shape; model
-/// prefill logits and states byte-equal with the switch on and off).
-fn g942_bf16_wide() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_G942_BF16_WIDE", true));
-    *ON
-}
-
 /// Whether a BF16-weight projection takes the gfx942 MFMA GEMM
 /// (`KernelKey::GemmBf16Mfma`) at `rows` batch rows.
 ///
@@ -1416,10 +1388,8 @@ fn project_g942_mfma(
     // in-kernel staging produces): otherwise every 16-row chain launch
     // re-reads its F32 rows per workgroup and the wide entry converts them
     // in each workgroup.
-    let chain = g942_rows16_chain();
-    let wide = g942_bf16_wide();
     let mut staged: Option<GpuTensor> = None;
-    if (chain || wide) && rows > 16 && input.dtype == DType::F32 {
+    if rows > 16 && input.dtype == DType::F32 {
         let mut scratch = hip(gpu.qwen4_f16_x_scratch(n))?;
         scratch.dtype = DType::BF16;
         hip(gpu.convert_f32_to_bf16(input, &scratch, n))?;
@@ -1445,7 +1415,9 @@ fn project_g942_mfma(
                 )
             })
             .collect();
-        if hip(gpu.gemm_bf16_mfma_gfx942_rows16_chain(&x, &launch, k, rows, chain, wide))? {
+        // `chain` and `wide` both on: the signature keeps `chain` because the gfx942 rows16
+        // grid oracle source is hash-pinned by its hardware receipt.
+        if hip(gpu.gemm_bf16_mfma_gfx942_rows16_chain(&x, &launch, k, rows, true, true))? {
             fused[base..base + members.len()].fill(true);
         }
     }
@@ -2248,10 +2220,10 @@ fn execute_hyper_read_core(
         && op.input_mix_down.awq_scale.is_none()
         && op.input_mix_down.k % 128 == 0
     {
-        // HIPFIRE_QWEN4_PREFILL_LWMMA_HC (default on): lane WMMA down + hc_act epilogue above 64 rows
+        // Lane WMMA down + hc_act epilogue above 64 rows
         // below the F16 WMMA route. One BF16 term is exact: `normalized` is `hyper_norm`'s
-        // BF16-rounded output and the weight is BF16. HIPFIRE_QWEN4_PREFILL_LWMMA_TILE (default on)
-        // runs the tuned shape on the staged-tile kernel, every output word the same.
+        // BF16-rounded output and the weight is BF16. The tuned shape runs on the staged-tile kernel
+        // (`lane_wmma_prefill_gemm`), every output word the same.
         if !normalized_ready {
             hip(hyper_norm(gpu, &norm))?;
         }
@@ -2457,7 +2429,7 @@ fn execute_hyper_read_core(
             )
             .map(|_| ()));
         }
-        // HIPFIRE_QWEN4_PREFILL_LWMMA_HC (default on): the same lane WMMA up read above 64 rows below
+        // The same lane WMMA up read above 64 rows below
         // the F16 WMMA route, split-K-free (the read-up kernel is row-count invariant there).
         if gpu.arch_caps.has_gfx11_plus_simt()
             && gpu.prefill_lwmma_hc_applies(op.rows)
@@ -3124,20 +3096,17 @@ fn g942_hc_quarters_gates(gpu: &Gpu, op: &HyperWriteOp<'_>) -> bool {
 }
 
 /// Whether the read's row count takes the fused `hyper_norm_gate_k4_outputs_f32` launch: 1..=8
-/// rows with `HIPFIRE_QWEN4_HC_PAIR_DECODE`, 9..=64 rows (wide verify) additionally with
-/// the wide pair and only eagerly (the kernel's persistent counter buffer is
-/// refused under replay recording / graph capture, where the allrows pair runs instead).
+/// rows on exact gfx1201, 9..=64 rows (wide verify) additionally only eagerly (the kernel's
+/// persistent counter buffer is refused under replay recording / graph capture, where the
+/// allrows pair runs instead).
 fn hyper_pair_fused_rows(gpu: &Gpu, read: &HyperReadOp<'_>) -> bool {
     HyperNormGateK4Outputs::supports(read.branches, read.hidden, read.rows)
         && gpu.flags.qwen4_hc_pair_decode_enabled()
-        && (read.rows <= 8
-            || (gpu.flags.qwen4_hc_pair_wide_enabled()
-                && !gpu.replay.is_recording()
-                && !gpu.graphs.capture_mode))
+        && (read.rows <= 8 || (!gpu.replay.is_recording() && !gpu.graphs.capture_mode))
 }
 
 /// Whether the decode read `read` also produces its paired write's gates in the same launch
-/// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, exact gfx1201): the write's gate route is the k4 route and
+/// (exact gfx1201): the write's gate route is the k4 route and
 /// the geometry is the kernel's (four branches, hidden 2560, 1..=8 rows, BF16 `block_inject`
 /// `[4, 4 * hidden]` without AWQ scale, F32 gates). `hyper_norm_gate_k4_outputs_f32` is bitwise
 /// `hyper_norm` followed by that k4 gate GEMV, so the write then runs pregated.
@@ -3157,7 +3126,7 @@ fn hyper_pair_decode_applies(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWri
 }
 
 /// Whether the k4-route read `read` (every wide row count [`hyper_pair_fused_rows`] does not take) hands its
-/// paired write the gates (`HIPFIRE_QWEN4_HC_PAIR_ALLROWS`, exact gfx1201): the write's gate
+/// paired write the gates (exact gfx1201): the write's gate
 /// route is the k4 GEMV over its own `hyper_norm` of the same streams with the same norm weight
 /// ([`hyper_read_pairs_write`]), so running that GEMV on the read's `normalized` is the write's
 /// launch on the same bytes, and the write skips its norm (`hyper_write` never reads it).
@@ -5741,8 +5710,7 @@ pub fn execute_indexed_attention_uncovered(
 /// launches.
 ///
 /// `out_proj` is the op that runs right after the group (the layer's QSA
-/// OutProj phase), when the caller knows it: under
-/// `HIPFIRE_QWEN4_QSA_LANES_FUSE` (default off) the admitted one-row lanes run
+/// OutProj phase), when the caller knows it: the admitted one-row lanes run
 /// as two launches (prologue + pool + select, then attention + the output
 /// projection's FWHT rotation) instead of five, and the rotation lands in
 /// `out_proj`'s rotation scratch under the `scratch.prerotated` memo that its
@@ -5924,7 +5892,7 @@ pub fn execute_indexed_attention_core_lanes(
         return Ok(false);
     };
     before_launch(gpu)?;
-    if qsa_lanes_fuse_enabled() && plan.fusable() {
+    if plan.fusable() {
         let q_width = ops[0].heads * ops[0].head_dim;
         // The out-projection whose input rotation the fused attention writes: the
         // same layer's OutProj over an Aligned256-basis F32 input (the
@@ -6222,7 +6190,7 @@ fn execute_indexed_attention_hc_impl(
     }
     if phase == MixerPhase::OutProj {
         let projected = qsa_project_output(gpu, op, &qsa_output_batch, hc, fused);
-        // A rotation the fused lane attention (`HIPFIRE_QWEN4_QSA_LANES_FUSE`) left for this
+        // A rotation the fused lane attention left for this
         // projection's input lives only until this step ends.
         if matches!(
             gpu.scratch.prerotated,

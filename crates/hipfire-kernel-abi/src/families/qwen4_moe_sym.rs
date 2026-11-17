@@ -56,9 +56,9 @@
 //! aggregate route; `qwen4_moe_sym_slab_gemm` itself is only called with codec 3 (E8P).
 //!
 //! Admission stays in the launcher where it is not a function of the launch params:
-//! which entry is selected (NT width, residency, `HIPFIRE_QWEN4_MOE_SYM_PM`, the
-//! measured-shape stream8 allowlist `qwen4_moe_stream8_selected`, the wide-tile flag,
-//! the exact-arch checks), and the host-side stale-handle check of `Int4MmqPrepared`.
+//! which entry is selected (NT width, residency, the measured-shape stream8 allowlist
+//! `qwen4_moe_stream8_selected`, the exact-arch checks), and the host-side stale-handle
+//! check of `Int4MmqPrepared`.
 
 use crate::{
     Access, Arch, Axis, DomainRuleV1, ExportV1, Expr, FieldKind, FieldV1, FormatId, HiddenKind,
@@ -595,9 +595,8 @@ const DOMAIN_DOWN_RR4: [DomainRuleV1; 7] = [
     RULE_SLOTS,
     RULE_DOWN_Y_U32,
 ];
-/// The incumbent hipcc entry (`HIPFIRE_QWEN4_MOE_SYM_PM=0`) is not bound by the slot or
-/// the Y-byte guard: `moe_sym_iu4_extents(..., slot_bound = pm.then_some(..))` passes
-/// `None` for it, so those rules are absent here (never stricter than the launcher).
+/// The hipcc byte-oracle anchor is not bound by the slot or Y-byte guard, which apply only
+/// to the builder entries (`moe_sym_iu4_extents` `slot_bound`); those rules are absent here.
 const DOMAIN_GATE_UP_HIPCC: [DomainRuleV1; 5] = [
     RULE_M_POSITIVE,
     RULE_M_64,
@@ -673,9 +672,8 @@ const OBJ_DOWN_GP_GFX1201: ObjectRefV1 = ObjectRefV1::Embedded {
     artifact: "kernels/qwen4_moe_down_gp_pm_gfx1201.hxaco",
     sha256: "e136e40e9df122b938a7942f28d1c55be7af9359ce7a800b317aadb2e733b972",
 };
-/// `HIPFIRE_QWEN4_MOE_SYM_PM=0` control: hipcc-compiled at load from
-/// `kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC` (this file preceded by the
-/// `block_i4_128_quant.hip` prelude).
+/// hipcc byte-oracle anchor (no env selection): `HipccSource` of
+/// `kernels/src/qwen4_moe_iu4_sym.gfx1151.hip`.
 const OBJ_HIPCC_GFX1151: ObjectRefV1 = ObjectRefV1::HipccSource {
     module: "qwen4_moe_iu4_sym_gfx1151",
     source: "kernels/src/qwen4_moe_iu4_sym.gfx1151.hip",
@@ -1329,7 +1327,7 @@ pub static QWEN4_MOE_SYM_DOWN_GP: KernelAbiV1 = KernelAbiV1 {
     exports: &[GFX1201_DOWN_GP_NT4, GFX1201_DOWN_GP_NT8],
 };
 
-/// gfx1151 hipcc twin gate/up (`HIPFIRE_QWEN4_MOE_SYM_PM=0`): the same operands and
+/// gfx1151 hipcc byte-oracle anchor, gate/up: the same operands and
 /// numerics as the builder entries, no slot/Y-byte guard, hipcc's hidden block.
 pub static QWEN4_MOE_SYM_GATE_UP_HIPCC: KernelAbiV1 = KernelAbiV1 {
     id: "qwen4_moe_sym.gate_up.hipcc",

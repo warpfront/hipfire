@@ -152,9 +152,8 @@
 //! NT4, NT8 x gate/up, down; `MoeSymIu4Kernel` row `gemm.rs:50101-50125`) and picks the
 //! symbol per call: **down is always NT4**; **gate/up is NT4 unless the real slots
 //! `x_src_rows * x_row_div` reach 128 per table expert (`total_slots >= 128 * E`),
-//! then NT8** (`qwen4_moe_sym_nt8_selected`, `gemm.rs:49334`; `qwen4_moe_sym_wide_shape`,
-//! `gemm.rs:49313`; flag `HIPFIRE_MOE_IU4_WIDE_TILES` unset = on at gfx1201,
-//! `prefill_route_capabilities.rs:303,327`; the tables `gemm.rs:49277-49296`). Host-mapped
+//! then NT8** (`qwen4_moe_sym_nt8_selected`, `qwen4_moe_sym_wide_shape`, the tables in
+//! `gemm.rs`; exact gfx1201 selects it with no env override). Host-mapped
 //! experts (NT8 for both GEMMs) are not modelled: weights here are VRAM-resident; use
 //! `--base-epi gate_up_nt8` / `down_nt8` for that arm. All NT entries share the 64-byte
 //! ABI, grid and output bytes (each output byte equals the NT1 entry's;
@@ -2126,8 +2125,7 @@ impl Moe {
                         "selection": {
                             "residency": "vram (host-mapped experts would take NT8 for both GEMMs)",
                             "rule": "down: NT4 always; gate_up: NT8 iff total_slots >= 128 * n_experts \
-                                     (HIPFIRE_MOE_IU4_WIDE_TILES unset = on at gfx1201, \
-                                     prefill_route_capabilities.rs:303,327), else NT4",
+                                     (selected unconditionally on exact gfx1201), else NT4",
                             "total_slots": p.total_slots(),
                             "n_experts": p.geo.experts,
                         },
@@ -2176,7 +2174,7 @@ impl Moe {
                 "crates/rdna-compute/src/gemm.rs:50779 qwen4_moe_sym_gate_up_symbol (stream8 \
                  allowlist), :56516 qwen4_moe_stream8_selected, :52458 launcher module \
                  QWEN4_MOE_SYM_STREAM8_MODULE (:49228-49229)",
-                "gate_up: streamed NT8 iff gfx1151 && native PM (HIPFIRE_QWEN4_MOE_SYM_PM unset = on) \
+                "gate_up: streamed NT8 iff gfx1151 && native PM \
                  && resident && [M,K,top,rows,experts] = [1280,2560,10,7168..=8192,512] \
                  (gemm.rs:56516)",
             ),
@@ -2213,7 +2211,10 @@ impl Moe {
                 "gate_up and down: NT1 for both residencies (the only gfx1100 entries)",
             ),
             (other, _) => {
-                return Err(format!("no shipped qwen4_moe_sym object on {}", other.name()))
+                return Err(format!(
+                    "no shipped qwen4_moe_sym object on {}",
+                    other.name()
+                ))
             }
         };
         let mut needle = symbol.clone().into_bytes();

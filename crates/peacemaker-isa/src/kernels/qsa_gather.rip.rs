@@ -3,8 +3,8 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Builder-emitted QSA gathered F16 WMMA prefill attention (the gfx1151 /
-//! gfx1201 default `HIPFIRE_QWEN4_QSA_WMMA_GATHER` route), default on
-//! (`HIPFIRE_QWEN4_QSA_PM=0` opts out). Two symbols per arch, with the ABI, grid,
+//! gfx1201 default `HIPFIRE_QWEN4_QSA_WMMA_GATHER` route).
+//! Two symbols per arch, with the ABI, grid,
 //! block, LDS layout and output bytes of the hipcc twins in
 //! `kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip`:
 //!

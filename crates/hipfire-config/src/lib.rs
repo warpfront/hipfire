@@ -4011,11 +4011,8 @@ const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.fa_prefill_pm",
     "developer.moe_router_topk_multirow",
     "developer.moe_combine_v2",
-    "developer.moe_iu4_wide_tiles",
-    "developer.prefill_iu4_producer_fused",
     "developer.fa_prefill_pm_qprep",
     "developer.moe_rotate_i4_pm",
-    "developer.prefill_iu4_c8_pm",
     "developer.gdn_chunk_prep_pm",
     "developer.moe_shared_down_sigmoid_epi",
 ];
@@ -5676,6 +5673,334 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "the TP direct-peer-read allreduce kill switch was removed (HIPF-396)",
         replacement: "none; two-rank peer meshes always take the symmetric direct-peer read",
+    },
+    RetiredConfigKey {
+        key: "developer.a3b_norm_fold",
+        legacy_key: "a3b_norm_fold",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the A3B decode norm fold kill switch was removed (HIPF-396)",
+        replacement: "none; A3B-class gfx1201 single-row decode always folds the norm into its projection GEMV where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.a4_attn_epi",
+        legacy_key: "a4_attn_epi",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the A4 attention epilogue kill switch was removed (HIPF-396)",
+        replacement: "none; the A4 attention epilogue always runs where its shape and slab gates admit it",
+    },
+    RetiredConfigKey {
+        key: "developer.a4_fa_gate_il",
+        legacy_key: "a4_fa_gate_il",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the A4 FA gate-in-place kill switch was removed (HIPF-396)",
+        replacement: "none; the fp8q prep route always reads the sigmoid gate in place where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.attn_fa2_generic",
+        legacy_key: "attn_fa2_generic",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the FA2 latent-attention flash kill switch was removed (HIPF-396)",
+        replacement: "none; the FA2 latent-attention flash body is always used where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.bf16w_small_rows",
+        legacy_key: "bf16w_small_rows",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the BF16 small-rows GEMM kill switch was removed (HIPF-396)",
+        replacement: "none; the register-tiled small-rows BF16 GEMM is always used on its admitted arches and shapes",
+    },
+    RetiredConfigKey {
+        key: "developer.cpu_expert_pin",
+        legacy_key: "cpu_expert_pin",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the CPU splice worker pinning kill switch was removed (HIPF-396)",
+        replacement: "none; CPU splice workers are always pinned to physical cores",
+    },
+    RetiredConfigKey {
+        key: "developer.cpu_pool_spin",
+        legacy_key: "cpu_pool_spin",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the CPU splice pool spin kill switch was removed (HIPF-396)",
+        replacement: "none; the CPU splice pool always spins before blocking",
+    },
+    RetiredConfigKey {
+        key: "developer.dflash_device_accept",
+        legacy_key: "dflash_device_accept",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the DFlash device-accept kill switch was removed (HIPF-396)",
+        replacement: "none; singleton sampled DFlash windows always accept on the device where supported",
+    },
+    RetiredConfigKey {
+        key: "developer.f1lite",
+        legacy_key: "f1lite",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the F1-lite gate/up SwiGLU fold kill switch was removed (HIPF-396)",
+        replacement: "none; F1-lite fused gate/up+SwiGLU always runs where shape and tile admit it",
+    },
+    RetiredConfigKey {
+        key: "developer.fa_batch_fuse_off",
+        legacy_key: "fa_batch_fuse_off",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the FA batch fusion opt-out was removed (HIPF-396)",
+        replacement: "none; DFlash FA prep and KV writes are always batched where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.fa_ragged_packet",
+        legacy_key: "fa_ragged_packet",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the FA ragged-packet kill switch was removed (HIPF-396)",
+        replacement: "none; ragged chunk tails always take the fp8q prep / Q-resident attention packet where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.fp8_prod_inreg",
+        legacy_key: "fp8_prod_inreg",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the in-register fp8 producer kill switch was removed (HIPF-396)",
+        replacement: "none; fp8 producers always run in-register for K up to 17408",
+    },
+    RetiredConfigKey {
+        key: "developer.g942_bf16_wide",
+        legacy_key: "g942_bf16_wide",
+        shipped_in: "0.4.6",
+        removed_in: "0.5.0",
+        reason: "the gfx942 BF16 wide64 kill switch was removed (HIPF-396)",
+        replacement: "none; 17+ row gfx942 BF16 groups always take the wide64 entry where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.g942_rows16_chain",
+        legacy_key: "g942_rows16_chain",
+        shipped_in: "0.4.6",
+        removed_in: "0.5.0",
+        reason: "the gfx942 BF16 rows16 chain kill switch was removed (HIPF-396)",
+        replacement: "none; gfx942 BF16 projections over 16 rows always chain rows16 launches",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1100_fa_prep",
+        legacy_key: "gfx1100_fa_prep",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1100 fused FA prep kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1100 always takes the fused FA prep where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1151_fa_prep",
+        legacy_key: "gfx1151_fa_prep",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the gfx1151 fused FA prep kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1151 always takes the fused FA prep twin where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.moe_a8_xlds",
+        legacy_key: "moe_a8_xlds",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the MoE A8 X-in-LDS kill switch was removed (HIPF-396)",
+        replacement: "none; the X-in-LDS grouped routed GEMM is always used where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.moe_iu4_wide_tiles",
+        legacy_key: "moe_iu4_wide_tiles",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the IU4 MoE wide-tile kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always widens resident symmetric IU4 gate/up to NT8 where occupancy admits it",
+    },
+    RetiredConfigKey {
+        key: "developer.mq4v2_shared_down_fused",
+        legacy_key: "mq4v2_shared_down_fused",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the fused MQ4V2 shared-down kill switch was removed (HIPF-396)",
+        replacement: "none; the fused shared-down GEMV always runs on gfx1100/gfx1201 where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.pinned_xfer_default",
+        legacy_key: "pinned_xfer_default",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the pinned-transfer default opt-out was removed (HIPF-396)",
+        replacement: "none; hipfire always sets GPU_PINNED_MIN_XFER_SIZE unless it is already set",
+    },
+    RetiredConfigKey {
+        key: "developer.prefill_iu4_c8_pm",
+        legacy_key: "prefill_iu4_c8_pm",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the IU4 C8 PeaceMaker producer kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always runs the C8 PM producers where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.prefill_iu4_producer_fused",
+        legacy_key: "prefill_iu4_producer_fused",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the exact IU4 producer fusion kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 always fuses the exact IU4 producer where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.q8a8_ps",
+        legacy_key: "q8a8_ps",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Q8 A8 pipelined-schedule kill switch was removed (HIPF-396)",
+        replacement: "none; T128x128 fast Q8 A8 launches always use the pipelined single-buffer schedule",
+    },
+    RetiredConfigKey {
+        key: "developer.q8_mmq_gfx11_tiles",
+        legacy_key: "q8_mmq_gfx11_tiles",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the gfx11 Q8 MMQ tiles kill switch was removed (HIPF-396)",
+        replacement: "none; gfx1100/gfx1151 always take the tiled Q8 MMQ route where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_hc_pair_allrows",
+        legacy_key: "qwen4_hc_pair_allrows",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 wide-verify HC pair kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 wide-verify HC reads always hand gates to the paired write",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_hc_pair_decode",
+        legacy_key: "qwen4_hc_pair_decode",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 decode HC pair kill switch was removed (HIPF-396)",
+        replacement: "none; exact gfx1201 1..=8-row decode always fuses hyper_norm with its GEMV",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lwmma_multi_part",
+        legacy_key: "qwen4_lwmma_multi_part",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 lane-WMMA multi-part kill switch was removed (HIPF-396)",
+        replacement: "none; lane-WMMA projections always share one multi-part launch where planned",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_moe_epilogue_fuse",
+        legacy_key: "qwen4_moe_epilogue_fuse",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 MoE epilogue fusion kill switch was removed (HIPF-396)",
+        replacement: "none; the Qwen4 MoE epilogue is always fused where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_moe_front_fuse",
+        legacy_key: "qwen4_moe_front_fuse",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 MoE front fusion kill switch was removed (HIPF-396)",
+        replacement: "none; the Qwen4 MoE front producers are always fused where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_moe_glue_fold",
+        legacy_key: "qwen4_moe_glue_fold",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 MoE glue fold switch was removed (HIPF-396)",
+        replacement: "none; all Qwen4 wide-verify MoE glue folds always run where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_moe_gu_a8",
+        legacy_key: "qwen4_moe_gu_a8",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 MoE gate/up A8 switch was removed (HIPF-396)",
+        replacement: "none; the owner-masked wide-verify A8 MoE chain always runs where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_moe_route_scatter",
+        legacy_key: "qwen4_moe_route_scatter",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 MoE route-scatter kill switch was removed (HIPF-396)",
+        replacement: "none; the Qwen4 MoE route always scatters where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_moe_sym_pm",
+        legacy_key: "qwen4_moe_sym_pm",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "the symmetric MoE PeaceMaker kill switch was removed (HIPF-396)",
+        replacement: "none; the PeaceMaker symmetric MoE route is always used",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_prefill_lwmma_hc",
+        legacy_key: "qwen4_prefill_lwmma_hc",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 prefill lane-WMMA HC kill switch was removed (HIPF-396)",
+        replacement: "none; HC read down/up projections always take the lane-WMMA kernels where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_prefill_lwmma_tile",
+        legacy_key: "qwen4_prefill_lwmma_tile",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 prefill lane-WMMA tile kill switch was removed (HIPF-396)",
+        replacement: "none; lane-WMMA GEMMs above 64 rows always take the staged-tile kernel where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_qsa_lanes_fuse",
+        legacy_key: "qwen4_qsa_lanes_fuse",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 QSA lanes fusion kill switch was removed (HIPF-396)",
+        replacement: "none; the fused QSA lanes path is always used where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_qsa_pm",
+        legacy_key: "qwen4_qsa_pm",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 QSA PeaceMaker kill switch was removed (HIPF-396)",
+        replacement: "none; the PeaceMaker gathered-route producer is always used where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_shared_gu_pm",
+        legacy_key: "qwen4_shared_gu_pm",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 shared-expert gate/up PM kill switch was removed (HIPF-396)",
+        replacement: "none; the fused shared-expert gate/up + SwiGLU always runs where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_trunk_a8_x4",
+        legacy_key: "qwen4_trunk_a8_x4",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the Qwen4 trunk A8 x4 kill switch was removed (HIPF-396)",
+        replacement: "none; same-K trunk members always share one x4 launch where admitted",
+    },
+    RetiredConfigKey {
+        key: "developer.v2b_addepi",
+        legacy_key: "v2b_addepi",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the V2B residual add epilogue kill switch was removed (HIPF-396)",
+        replacement: "none; the V2B residual add epilogue is always used",
+    },
+    RetiredConfigKey {
+        key: "developer.verify_tape_copy_batch",
+        legacy_key: "verify_tape_copy_batch",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the verify tape copy batching kill switch was removed (HIPF-396)",
+        replacement: "none; singleton chain-verify tape copies are always one batched launch",
     },
 ];
 
@@ -9693,66 +10018,6 @@ mod tests {
     }
 
     #[test]
-    fn moe_iu4_wide_tiles_is_a_typed_bool_developer_key() {
-        const KEY: &str = "developer.moe_iu4_wide_tiles";
-        const ENV: &str = "HIPFIRE_MOE_IU4_WIDE_TILES";
-        assert!(is_developer_key(KEY));
-        assert!(is_typed_bool_developer_key(KEY));
-        // Independent of the symmetric IU4 route keys and of the FA PM key.
-        for other in [MOE_SYM_IU4_KEY, SYM_IU4_KEY, MOE_SHARED_PREPARED_IU4_KEY] {
-            assert_ne!(KEY, other);
-        }
-        assert_ne!(ENV, MOE_SYM_IU4_ENV);
-        assert_eq!(typed_developer_bool_value(ENV, None), None);
-        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
-            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
-            let mut layer = ConfigLayer::default();
-            layer.set_cli(KEY, raw).unwrap();
-            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
-            layer.validate().unwrap();
-        }
-        for bad in ["", "2", "on", "off", "yes", "maybe"] {
-            let mut layer = ConfigLayer::default();
-            assert!(matches!(
-                layer.set_cli(KEY, bad),
-                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
-            ));
-            assert!(layer.values.is_empty());
-        }
-        // Setting it never writes the route's own keys.
-        let mut layer = ConfigLayer::default();
-        layer.set_cli(KEY, "1").unwrap();
-        assert_eq!(layer.get(MOE_SYM_IU4_KEY), None);
-        assert_eq!(layer.get(SYM_IU4_KEY), None);
-    }
-
-    #[test]
-    fn prefill_iu4_producer_fused_is_a_typed_bool_developer_key() {
-        const KEY: &str = "developer.prefill_iu4_producer_fused";
-        const ENV: &str = "HIPFIRE_PREFILL_IU4_PRODUCER_FUSED";
-        assert!(is_developer_key(KEY));
-        assert!(is_typed_bool_developer_key(KEY));
-        // The raw typed lookup of an unset variable is None: qualification resolves the
-        // architecture default later, never a schema default.
-        assert_eq!(typed_developer_bool_value(ENV, None), None);
-        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
-            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
-            let mut layer = ConfigLayer::default();
-            layer.set_cli(KEY, raw).unwrap();
-            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
-            layer.validate().unwrap();
-        }
-        for bad in ["", "2", "on", "off", "yes", "maybe"] {
-            let mut layer = ConfigLayer::default();
-            assert!(matches!(
-                layer.set_cli(KEY, bad),
-                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
-            ));
-            assert!(layer.values.is_empty());
-        }
-    }
-
-    #[test]
     fn fa_prefill_pm_qprep_is_a_typed_bool_developer_key() {
         const KEY: &str = "developer.fa_prefill_pm_qprep";
         const ENV: &str = "HIPFIRE_FA_PREFILL_PM_QPREP";
@@ -9798,36 +10063,6 @@ mod tests {
             ));
             assert!(layer.values.is_empty());
         }
-    }
-
-    #[test]
-    fn prefill_iu4_c8_pm_is_a_typed_bool_developer_key() {
-        const KEY: &str = "developer.prefill_iu4_c8_pm";
-        const ENV: &str = "HIPFIRE_PREFILL_IU4_C8_PM";
-        assert!(is_developer_key(KEY));
-        assert!(is_typed_bool_developer_key(KEY));
-        // Unset is None: the capability table (raw inventory, no qualified row) resolves it
-        // off; the schema never supplies a default.
-        assert_eq!(typed_developer_bool_value(ENV, None), None);
-        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
-            assert_eq!(typed_developer_bool_value(ENV, Some(raw)), Some(want));
-            let mut layer = ConfigLayer::default();
-            layer.set_cli(KEY, raw).unwrap();
-            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)));
-            layer.validate().unwrap();
-        }
-        for bad in ["", "2", "on", "off", "yes", "maybe"] {
-            let mut layer = ConfigLayer::default();
-            assert!(matches!(
-                layer.set_cli(KEY, bad),
-                Err(ConfigError::InvalidValue { key, .. }) if key == KEY
-            ));
-            assert!(layer.values.is_empty());
-        }
-        // Independent of the F3 flag it nests under at the consumer.
-        let mut layer = ConfigLayer::default();
-        layer.set_cli(KEY, "1").unwrap();
-        assert_eq!(layer.get("developer.prefill_iu4_producer_fused"), None);
     }
 
     #[test]

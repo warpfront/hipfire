@@ -19,8 +19,7 @@
 //!
 //! Admission: gfx1100 and gfx1151 (gfx1151 builds it for the guard and the kernel test; its
 //! dispatch route stays on the 64x64 kernel), `k % 128 == 0`, F32 `x`/`y`, 4-byte aligned weight
-//! base. `HIPFIRE_Q8_MMQ_GFX11_TILES=0` keeps the 64x64 kernel everywhere (kill switch of the
-//! default).
+//! base.
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
@@ -68,15 +67,6 @@ impl Q8MmqTile {
             (Q8MmqTile::T128x128, true) => "gemm_q8_0_mmq_i8_gfx11_t128x128_bf16",
         }
     }
-}
-
-/// `HIPFIRE_Q8_MMQ_GFX11_TILES=0` keeps the 64x64 kernel on every gfx11 Q8_0 call (the tiles are
-/// bit-identical to it, so the default is on). Read once.
-fn tiles_default_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_Q8_MMQ_GFX11_TILES", true)
-    });
-    *ON
 }
 
 /// Q8_1 activations in the Gpu's `q8_1_mmq_x_scratch`. The plane stays valid until the next writer
@@ -128,10 +118,10 @@ pub fn q8_mmq_pick_tile(m: usize, n: usize) -> Q8MmqTile {
     }
 }
 
-/// Arch/shape half of the tiled route's admission (pure apart from the kill switch): gfx11, the
-/// switch on, `k % 128 == 0`. The weight base alignment is [`Gpu::q8_mmq_gfx11_supported`]'s.
+/// Arch/shape half of the tiled route's admission (pure): gfx1100 or gfx1151, `k % 128 == 0`. The
+/// weight base alignment is [`Gpu::q8_mmq_gfx11_supported`]'s.
 pub fn q8_mmq_gfx11_admits(arch: &str, k: usize) -> bool {
-    tiles_default_enabled() && matches!(arch, "gfx1100" | "gfx1151") && k > 0 && k % 128 == 0
+    matches!(arch, "gfx1100" | "gfx1151") && k > 0 && k % 128 == 0
 }
 
 impl Gpu {

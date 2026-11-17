@@ -5,7 +5,7 @@
 //! Wide-verify gate/up A8 GEMM with the down producer folded into its epilogue: word ORACLE +
 //! timing bench (exact gfx1201; developer example).
 //!
-//! `qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}` (one launch, `HIPFIRE_QWEN4_MOE_GLUE_FOLD=c`,
+//! `qwen4_moe_ep_a8_gate_up_rot_planar_nt{1,2}` (one launch, glue fold c,
 //! `Gpu::gemm_qwen4_moe_gate_up_silu_a8_rot_sym` + `Gpu::gemm_qwen4_moe_down_a8_rot_sym`) against the
 //! chain it replaces (`gemm_qwen4_moe_gate_up_silu_a8_sym` -> `qwen4_moe_rotate128_i8` ->
 //! `gemm_qwen4_moe_down_a8_sym`), at the served C8 shapes: gate/up M 1280, K 2560, down M 2560, K 640,
