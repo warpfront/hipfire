@@ -2168,13 +2168,6 @@ pub const FIXED_RETIRE_Z: f64 = 1.28;
 /// `d` the token deficit of the retiring epoch's last ≤ 16 windows. Global.
 pub const FIXED_SCOUT_SHARE: f64 = 0.02;
 
-/// Yield (settled tokens ÷ verified rows) at or below which a fixed-window
-/// request on an unpriced load runs its calibration probe once. Above it no
-/// AR token ever runs just to obtain a price, so a cell that loses above this
-/// yield stays unpriced until some other request on the load prices AR.
-/// Global, relative to the window's own width.
-pub const FIXED_SUSPECT_YIELD: f64 = 0.5;
-
 /// Windows of one judged block, and the epoch checkpoint after which the
 /// checkpoints double (3, 8, 16, 32, …). Structure of the retire rule, not a
 /// tuning knob.
@@ -2313,24 +2306,22 @@ struct FixedState {
     recent_head: usize,
     /// AR tokens still to run before the next epoch while retired.
     reentry_left: usize,
-    /// The request ran its calibration probe (once per request).
-    probe_ran: bool,
     /// Checkpoints judged by the last observation (an epoch checkpoint and a
     /// block can fall on one window).
     checkpoints: [Option<FixedCheckpoint>; 2],
 }
 
 impl FixedFloor {
-    /// A fresh fixed-window floor whose calibration probe runs `probe_tokens`
-    /// AR tokens (0: never).
-    pub fn fixed(probe_tokens: usize) -> Self {
-        Self::with_retire_after([1.0], FLOOR_PROBE_WINDOWS).with_retire_evidence(probe_tokens)
+    /// A fresh fixed-window floor (no AR token ever runs to obtain a price:
+    /// the load's prices come from [`Self::pin_fixed`]).
+    pub fn fixed() -> Self {
+        Self::with_retire_after([1.0], FLOOR_PROBE_WINDOWS)
     }
 }
 
 /// The fixed-window entry points. Every decision is a function of token
 /// counts and the load's pinned prices ([`Self::pin_fixed`]): the floor
-/// never sees a wall time. They reuse the AR price, probe and retire fields
+/// never sees a wall time. They reuse the AR price and retire fields
 /// and never read the per-depth tables, the cost fit, `ROW_COST_PRIOR`, an
 /// agreement or `window_cost`.
 ///
@@ -2344,26 +2335,20 @@ impl FixedFloor {
 ///   No re-price probe, no hysteresis, no minimum-window constant.
 /// - Re-entry: a retired request runs [`fixed_reentry_gap`] AR tokens, then a
 ///   new epoch judged by the same rule.
-/// - Unpriced: no verdict. Once the epoch has [`FLOOR_PROBE_WINDOWS`] windows
-///   and its settled tokens are at most [`FIXED_SUSPECT_YIELD`] of its
-///   verified rows, the calibration probe (`probe_tokens` AR tokens) runs once
-///   per request; counts keep accumulating and the rule applies from the
-///   first checkpoint after a pin.
+/// - Unpinned: no verdict; counts keep accumulating and the rule applies
+///   from the first checkpoint after a pin. (The driver pins every request
+///   at its start from the load's frozen snapshot, or runs the count line.)
 impl<const W: usize, const E: usize> Floor<W, E> {
     /// Start a request: clear every observation, the pin and the
-    /// fixed-window state, keeping the floor id, the call log and the probe
-    /// size. No allocation.
-    pub fn reset_fixed(&mut self, probe_tokens: usize) {
+    /// fixed-window state, keeping the floor id and the call log. No
+    /// allocation.
+    pub fn reset_fixed(&mut self) {
         let log = self.call_log.take();
-        self.reset_request(FLOOR_PROBE_WINDOWS, DEFAULT_DECAY, probe_tokens);
+        self.reset_request(FLOOR_PROBE_WINDOWS, DEFAULT_DECAY, 0);
         self.call_log = log;
         self.fixed = FixedState::default();
         if let Some(log) = self.call_log {
-            log.emit(
-                "reset_fixed",
-                self.id,
-                format_args!(",\"probe_tokens\":{probe_tokens}{}", self.after()),
-            );
+            log.emit("reset_fixed", self.id, format_args!("{}", self.after()));
         }
     }
 
@@ -2387,13 +2372,10 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         }
     }
 
-    /// The next window: [`Action::ArSynced`] while the calibration probe
-    /// runs, [`Action::ArHeadFree`] while retired, else [`Action::Native`]
-    /// with exactly `width`.
+    /// The next window: [`Action::ArHeadFree`] while retired, else
+    /// [`Action::Native`] with exactly `width`.
     pub fn plan_fixed(&mut self, width: usize) -> Action {
-        let ret = if self.probe_left > 0 {
-            Action::ArSynced
-        } else if self.retired {
+        let ret = if self.retired {
             Action::ArHeadFree
         } else {
             Action::Native(width)
@@ -2430,8 +2412,8 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         }
     }
 
-    /// Start a new epoch (a think-close): un-retire, forget the epoch's
-    /// counts and any running probe, keep the pin.
+    /// Start a new epoch (a think-close): un-retire and forget the epoch's
+    /// counts, keep the pin.
     pub fn rearm_fixed(&mut self) {
         self.start_fixed_epoch();
         if let Some(log) = self.call_log {
@@ -2485,9 +2467,7 @@ impl<const W: usize, const E: usize> Floor<W, E> {
     }
 
     fn observe_fixed_ar(&mut self) {
-        if self.probe_left > 0 {
-            self.probe_left -= 1;
-        } else if self.retired {
+        if self.retired {
             self.fixed.reentry_left = self.fixed.reentry_left.saturating_sub(1);
             if self.fixed.reentry_left == 0 {
                 self.start_fixed_epoch();
@@ -2506,15 +2486,6 @@ impl<const W: usize, const E: usize> Floor<W, E> {
         fixed.recent_head = (fixed.recent_head + 1) % FIXED_BLOCK;
         fixed.recent_len = (fixed.recent_len + 1).min(FIXED_BLOCK);
         let windows = fixed.epoch.windows;
-        if fixed.break_even.is_none()
-            && !fixed.probe_ran
-            && self.probe_tokens > 0
-            && windows >= FLOOR_PROBE_WINDOWS
-            && fixed.epoch.settled as f64 <= FIXED_SUSPECT_YIELD * fixed.epoch.rows as f64
-        {
-            fixed.probe_ran = true;
-            self.probe_left = self.probe_tokens;
-        }
         let b = fixed.break_even.as_ref();
         let mut retire = None;
         if fixed_checkpoint(windows) {
@@ -2545,14 +2516,12 @@ impl<const W: usize, const E: usize> Floor<W, E> {
                 checkpoint.retired = true;
             }
             self.retired = true;
-            self.probe_left = 0;
         }
     }
 
     /// A new epoch: fresh counts, checkpoints from 3 windows again.
     fn start_fixed_epoch(&mut self) {
         self.retired = false;
-        self.probe_left = 0;
         let fixed = &mut self.fixed;
         fixed.epoch = FixedTally::default();
         fixed.block = FixedTally::default();
@@ -2786,7 +2755,7 @@ fn replay_call<const W: usize, const E: usize>(
             None
         }
         "reset_fixed" => {
-            floor.reset_fixed(json_usize(value, "probe_tokens")?);
+            floor.reset_fixed();
             None
         }
         "pin_fixed" => {
@@ -9814,7 +9783,6 @@ mod fixed_floor_tests {
 
     const WIDTH: usize = 15;
     const FULL: usize = WIDTH + 1;
-    const PROBES: usize = 6;
 
     fn native() -> Action {
         Action::Native(WIDTH)
@@ -9848,7 +9816,7 @@ mod fixed_floor_tests {
     }
 
     fn pinned(prices: &PinnedPrices) -> FixedFloor {
-        let mut floor = FixedFloor::fixed(PROBES);
+        let mut floor = FixedFloor::fixed();
         floor.pin_fixed(prices);
         floor
     }
@@ -10091,44 +10059,23 @@ mod fixed_floor_tests {
     }
 
     #[test]
-    fn unpriced_floor_never_decides_and_probes_once_at_the_suspect_yield() {
-        // Above the suspect yield (12 of 16 rows): no AR token, no verdict.
-        let mut floor = FixedFloor::fixed(PROBES);
-        for _ in 0..300 {
-            assert_eq!(step(&mut floor, 12), native());
+    fn unpinned_floor_never_decides_and_never_runs_an_ar_token() {
+        // No pin: windows run at any yield, no AR token, no verdict.
+        let mut floor = FixedFloor::fixed();
+        for settled in [12, 8, 1] {
+            for _ in 0..100 {
+                assert_eq!(step(&mut floor, settled), native());
+            }
         }
         assert!(!floor.calibrated() && !floor.retired());
-        // At exactly half the rows the calibration probe runs once, after
-        // the third window, for exactly PROBES AR tokens.
-        let mut floor = FixedFloor::fixed(PROBES);
-        for _ in 0..FLOOR_PROBE_WINDOWS {
-            assert_eq!(step(&mut floor, 8), native());
-        }
-        for _ in 0..PROBES {
-            assert_eq!(step(&mut floor, 1), Action::ArSynced);
-        }
-        // Still unpriced: windows run, no second probe, no verdict.
-        for _ in 0..100 {
-            assert_eq!(step(&mut floor, 1), native());
-        }
-        assert!(!floor.retired());
-        // A probe of 0 tokens never runs one.
-        let mut floor = FixedFloor::fixed(0);
-        for _ in 0..50 {
-            assert_eq!(step(&mut floor, 1), native());
-        }
     }
 
     #[test]
     fn counts_before_the_pin_are_judged_from_the_next_checkpoint() {
-        // XTX `mq3-xt` loser, unpriced: no verdict at 3 (4 tokens would
-        // retire there when priced); the low yield starts the probe.
-        let mut floor = FixedFloor::fixed(PROBES);
+        // XTX `mq3-xt` loser, unpinned: no verdict at 3 (4 tokens would
+        // retire there when priced).
+        let mut floor = FixedFloor::fixed();
         assert_eq!(retired_at(&mut floor, &[1, 1, 2]), None);
-        assert!(floor.needs_ar_sample(), "the probe is running");
-        for _ in 0..PROBES {
-            assert_eq!(step(&mut floor, 1), Action::ArSynced);
-        }
         // The pin lands; the 8-window checkpoint judges all 8 windows.
         floor.pin_fixed(&xtx_mq3());
         assert!(floor.calibrated());
@@ -10136,7 +10083,7 @@ mod fixed_floor_tests {
         let checkpoint = floor.fixed_checkpoints().next().unwrap();
         assert_eq!((checkpoint.windows, checkpoint.settled), (8, 16));
         // An invalid AR price leaves the floor unpriced.
-        let mut floor = FixedFloor::fixed(0);
+        let mut floor = FixedFloor::fixed();
         floor.pin_fixed(&prices(f32::NAN, 76_000.0));
         assert!(!floor.calibrated());
         assert_eq!(floor.fixed_break_even(FULL), None);
@@ -10186,7 +10133,7 @@ mod fixed_floor_tests {
 
     #[test]
     fn plan_returns_only_ar_or_the_given_width() {
-        let mut floor = FixedFloor::fixed(PROBES);
+        let mut floor = FixedFloor::fixed();
         let mut seen = Vec::new();
         for i in 0..2_000 {
             if i == 40 {
@@ -10203,12 +10150,13 @@ mod fixed_floor_tests {
                         rows: width + 1,
                     });
                 }
-                Action::ArSynced | Action::ArHeadFree => ar(&mut floor, action),
+                Action::ArHeadFree => ar(&mut floor, action),
+                Action::ArSynced => panic!("plan_fixed returned ArSynced"),
                 Action::Interleaved => panic!("Interleaved"),
             }
             seen.push(action);
         }
-        assert!(seen.contains(&Action::ArHeadFree) && seen.contains(&Action::ArSynced));
+        assert!(seen.contains(&Action::ArHeadFree));
     }
 
     #[test]
@@ -10254,10 +10202,10 @@ mod fixed_floor_tests {
     fn call_log_of_the_fixed_ops_replays_bit_exactly() {
         const PREFIX: &str = "QWEN35_DFLASH_FLOOR_CALL";
         FIXED_LOGGED.with(|lines| lines.borrow_mut().clear());
-        let mut floor = FixedFloor::fixed(PROBES).with_call_log_to(PREFIX, "unit", true, capture);
-        // Unpriced with a probe, pinned mid-request, retirement, re-entry, a
+        let mut floor = FixedFloor::fixed().with_call_log_to(PREFIX, "unit", true, capture);
+        // Unpinned windows, pinned mid-request, retirement, re-entry, a
         // re-arm; a second request pinned from the start with odd prices.
-        floor.reset_fixed(PROBES);
+        floor.reset_fixed();
         for i in 0..900 {
             if i == 20 {
                 floor.pin_fixed(&b2());
@@ -10267,7 +10215,7 @@ mod fixed_floor_tests {
                 floor.rearm_fixed();
             }
         }
-        floor.reset_fixed(PROBES);
+        floor.reset_fixed();
         let mut odd = prices(17_450.5, 76_000.25);
         odd.window_us[3] = 21_333.3;
         floor.pin_fixed(&odd);
@@ -10290,7 +10238,6 @@ mod fixed_floor_tests {
             "\"op\":\"observe_fixed\"",
             "\"op\":\"rearm_fixed\"",
             "\"ret\":\"Ar\"",
-            "\"ret\":\"ArSample\"",
             "\"ret\":\"Batched:15\"",
         ] {
             assert!(lines.iter().any(|l| l.contains(op)), "no {op} line");

@@ -2471,7 +2471,9 @@ fn redline_percentile(mut values: Vec<f64>, pct: f64) -> f64 {
     values[idx.min(values.len() - 1)]
 }
 
-fn redline_reset_qwen_slot(
+/// The target half of the redline / load-calibration reset sequence: clear
+/// the KV cache and the DeltaNet state, then synchronize.
+pub(crate) fn redline_reset_qwen_slot(
     gpu: &mut rdna_compute::Gpu,
     slot: &mut ModelSlot,
 ) -> Result<(), String> {

@@ -2642,10 +2642,6 @@ pub fn generate(
     // attempt-key + counter entropy) so two requests with the same prompt
     // no longer replay the identical draw sequence at temp>0.
     request_seed: u32,
-    // The request carried an explicit wire `seed` (`client_seed.is_some()`);
-    // seeds are derived exactly as before, this only selects the count-only
-    // speculation floor (`qwen::generate_spec`).
-    seed_explicit: bool,
 ) {
     // Whole-request PLE serving guard (Qwen4 with PLE rows; `None` otherwise):
     // every route below (Qwen4 AR, native MTP, the spec-capacity fallthrough)
@@ -2949,7 +2945,6 @@ pub fn generate(
                 frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
-                seed_explicit,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -3110,7 +3105,6 @@ pub fn generate(
                 frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
-                seed_explicit,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -3326,7 +3320,6 @@ pub fn generate(
                 },
                 cactus_delta,
                 request_seed as u64,
-                seed_explicit,
                 max_tokens,
                 max_think_tokens,
                 stop,
@@ -3360,7 +3353,6 @@ pub fn generate(
                 frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
-                seed_explicit,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -3440,7 +3432,6 @@ pub fn generate(
                 frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
-                seed_explicit,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -3520,7 +3511,6 @@ pub fn generate(
                 frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
-                seed_explicit,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -3670,7 +3660,6 @@ pub fn generate(
                 frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
-                seed_explicit,
                 reasoning_effort,
                 enable_thinking,
             ) {
