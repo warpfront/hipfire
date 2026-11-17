@@ -63,7 +63,7 @@ pub fn lift_raw(
     let arch = spec.target.arch;
     if !matches!(
         arch,
-        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1200 | Arch::Gfx1201
     ) {
         return Err(rejected(
             name,
@@ -299,7 +299,7 @@ pub fn scan_stream(code: &[u8], arch: Arch) -> StreamScan {
     while at < words.len() {
         let offset = 4 * at as u64;
         let decoded = match arch {
-            Arch::Gfx1100 | Arch::Gfx1151 => gfx11::decode(arch, &words[at..]),
+            Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 => gfx11::decode(arch, &words[at..]),
             _ => gfx12::decode_for(arch, &words[at..]),
         };
         match decoded {

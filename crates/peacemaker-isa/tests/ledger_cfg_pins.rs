@@ -96,6 +96,7 @@ fn scan() -> Vec<Image> {
 fn isa_arch(arch: IrArch) -> Result<Arch, String> {
     match arch {
         IrArch::Gfx1100 => Ok(Arch::Gfx1100),
+        IrArch::Gfx1150 => Ok(Arch::Gfx1150),
         IrArch::Gfx1151 => Ok(Arch::Gfx1151),
         IrArch::Gfx1200 => Ok(Arch::Gfx1200),
         IrArch::Gfx1201 => Ok(Arch::Gfx1201),

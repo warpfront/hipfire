@@ -647,6 +647,7 @@ fn program_evidence(
     };
     let arch = match object.arch {
         IrArch::Gfx1100 => Arch::Gfx1100,
+        IrArch::Gfx1150 => Arch::Gfx1150,
         IrArch::Gfx1151 => Arch::Gfx1151,
         IrArch::Gfx1201 => Arch::Gfx1201,
         other => return Err(format!("{artifact}: unexpected target {other:?}")),
@@ -726,6 +727,7 @@ impl GenEntry {
 fn abi_arch(arch: IsaArch) -> Arch {
     match arch {
         IsaArch::Gfx1100 => Arch::Gfx1100,
+        IsaArch::Gfx1150 => Arch::Gfx1150,
         IsaArch::Gfx1151 => Arch::Gfx1151,
         IsaArch::Gfx1201 => Arch::Gfx1201,
         other => panic!("generator arch {} has no KernelAbiV1 arch", other.name()),
@@ -1350,6 +1352,7 @@ fn hipcc_exports_match_compiled_metadata() {
                     // kernel using an instruction the lifter has no table for is still checked.
                     let ir_arch = match arch {
                         "gfx1100" => IrArch::Gfx1100,
+                        "gfx1150" => IrArch::Gfx1150,
                         "gfx1151" => IrArch::Gfx1151,
                         "gfx1201" => IrArch::Gfx1201,
                         other => return Err(format!("{other}: no peacemaker arch")),

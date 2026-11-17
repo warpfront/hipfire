@@ -56,9 +56,10 @@ fn set(g: &Gen, i: u32) -> Set {
     }
 }
 
-/// The unrolled path replaces the K loop of the exact-gfx1100 BF16 MQ4 Down entry only.
+/// The unrolled path replaces the K loop of the exact-gfx1100 BF16 MQ4 Down entry only;
+/// gfx1150 is admitted to the same design (RDNA3.5, same instruction family).
 pub(super) fn applies(g: &Gen) -> bool {
-    g.spec.arch == Arch::Gfx1100
+    matches!(g.spec.arch, Arch::Gfx1100 | Arch::Gfx1150)
         && g.spec.kind == Kind::Down
         && g.spec.codec == Codec::Mq4
         && !g.spec.acc

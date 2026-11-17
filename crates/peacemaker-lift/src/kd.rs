@@ -133,7 +133,7 @@ pub enum DescriptorReject {
 pub fn validate(kd: &KernelDescriptor, arch: Arch) -> Result<(), DescriptorReject> {
     if !matches!(
         arch,
-        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1200 | Arch::Gfx1201
     ) {
         return Err(DescriptorReject::UnsupportedArch(arch));
     }

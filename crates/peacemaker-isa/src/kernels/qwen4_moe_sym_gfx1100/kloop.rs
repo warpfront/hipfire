@@ -231,8 +231,9 @@ fn load_epoch(b: &mut Builder, g: &Gen, phase: Phase) -> Result<(), String> {
 
 /// The exact-gfx1100 BF16 MQ4 GateUp entry carries the lockstep barrier and the prefetched
 /// second-epoch scale; the `_acc` entries and gfx1151 keep their previous code.
+/// gfx1150 is admitted to the same design (RDNA3.5, same instruction family).
 fn lockstep_entry(g: &Gen) -> bool {
-    g.spec.arch == Arch::Gfx1100
+    matches!(g.spec.arch, Arch::Gfx1100 | Arch::Gfx1150)
         && g.spec.codec == Codec::Mq4
         && g.spec.kind == Kind::GateUp
         && !g.spec.acc
