@@ -18,7 +18,12 @@ name: release-kernel-packs
 #   hipfire-<tag>-linux-rocm-<arch>-x64.tar.gz   bin/hipfire, bin/daemon,
 #                                                bin/kernels/compiled/<arch>/, LICENSE, NOTICE
 #   hipfire-<tag>-linux-rocm-<arch>-x64.tar.gz.sha256
+#   hipfire-<tag>-linux-rocm-<arch>-x64.manifest.json  tag, commit, arch, rustc
 # The HIP runtime is not bundled; the host needs ROCm.
+#
+# Rust is pinned for both builds: rustup installs exactly the version in
+# scripts/release-toolchain.txt (not `stable`), the toolchain
+# build-binary-archive.sh requires and the promotion lane's archives use.
 #
 # The image's ROCm fixes the manifest's toolchain and, by default, the admitted
 # ROCm range (its major.minor up to the next major). The default image,
@@ -88,7 +93,7 @@ jobs:
               apt-get update
               apt-get install -y --no-install-recommends build-essential ca-certificates curl git
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --default-toolchain stable --profile minimal
+                | sh -s -- -y --default-toolchain "$(tr -d "[:space:]" < scripts/release-toolchain.txt)" --profile minimal
               export PATH="$HOME/.cargo/bin:$PATH"
               git config --global --add safe.directory /src
               range=()
@@ -110,7 +115,7 @@ jobs:
               apt-get update
               apt-get install -y --no-install-recommends build-essential ca-certificates curl git
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --default-toolchain stable --profile minimal
+                | sh -s -- -y --default-toolchain "$(tr -d "[:space:]" < scripts/release-toolchain.txt)" --profile minimal
               export PATH="$HOME/.cargo/bin:$PATH"
               git config --global --add safe.directory /src
               status=0
