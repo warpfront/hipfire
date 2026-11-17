@@ -685,7 +685,6 @@ impl SpecTarget for RaonBundle {
         }
         let mut hidden_out = hidden_out.filter(|_| !self.spec.layers.is_empty());
         let row_width = self.feature_row_width();
-        let chunk = self.prefill_step_rows();
         let first_kept = if hidden_out.is_some() {
             let first = keep_from(tokens.len(), self.spec.window);
             if first > 0 {
