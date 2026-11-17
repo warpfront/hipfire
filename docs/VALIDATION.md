@@ -170,6 +170,7 @@ exclusive card, build slots paused), on the same installed archive.
 | `perf-27b-cold` | first request of a fresh process with an empty kernel cache (wall tok/s) | gfx1100, gfx1201 |
 | `perf-a3b-mq4rs-decode`, `perf-a3b-mq4rs-cold` | Qwen3.6-35B-A3B `.mq4rs` AR decode (the Redline default) and its cold first request | gfx1201 |
 | `perf-flashnext-decode` | Flash-Next GPTQ3 monolith, single-card default route (native MTP + n-gram), decode tok/s | gfx1201 |
+| `perf-27b-dflash-warm-ttft` | relation row: the DFlash process's median warm TTFT over its cold TTFT may exceed the AR process's by at most `max_excess` (0.1 on gfx1201, 0.07 on gfx1100); catches a speculative request that leaves work queued on the device for the next request's prefill (the pre-0.5.0 terminal seed forward: +25 to 28 ms warm, ratio 1.21 vs AR 0.90 on gfx1201) | gfx1100, gfx1201 |
 
 - **Measurement.** Every number comes from a fresh `hipfire bench` process
   (own `HOME`/`HIPFIRE_HOME`, empty kernel cache, no device compiler,
@@ -197,6 +198,11 @@ exclusive card, build slots paused), on the same installed archive.
   slower). A row **regresses** when the CI upper bound is below
   `1 - max(2%, 3 x A/A half-width)`; the half-width per class and row comes
   from an A/A calibration (`lane.py calibrate`) recorded in the policy.
+- **Relation rows.** A row with a `reference` proc judges the candidate
+  against itself rather than against beta: the median over its processes of
+  the row's metric may exceed the reference proc's median, measured in the
+  same job, by at most the class's `max_excess`. It needs no baseline and no
+  A/A calibration, and adds no processes when both procs already have rows.
 - **Baseline.** The previous promotion record of the gate's beta for the
   same class supplies the baseline numbers when host, card (fabric GPU
   UUID), HIP runtime, PCI slot and measurement spec match and the numbers are
