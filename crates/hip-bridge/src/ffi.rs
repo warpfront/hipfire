@@ -4623,6 +4623,20 @@ impl HipRuntime {
         }
     }
 
+    /// The device's marketing name (`hipDeviceProp_t::name`, the struct's
+    /// first field, e.g. "AMD Radeon AI PRO R9700").
+    pub fn get_device_name(&self, device_id: i32) -> HipResult<String> {
+        // Oversized for every hipDeviceProp_t revision (R0600 is ~1.5 KiB).
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: HIP runtime symbol is live from HipRuntime::load; the
+        // out-param is a local buffer larger than hipDeviceProp_t.
+        let code = unsafe { (self.fn_get_device_properties)(buf.as_mut_ptr(), device_id as c_int) };
+        self.check(code, "hipGetDeviceProperties")?;
+        let name = &buf[..256];
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        Ok(String::from_utf8_lossy(&name[..end]).trim().to_owned())
+    }
+
     /// Query a HIP device attribute by enum ID. See `hipDeviceAttribute_t` in
     /// `hip_runtime_api.h` for valid IDs. Used by the profiler to read CU count
     /// when sysfs/KFD is unavailable (Windows, restricted containers).

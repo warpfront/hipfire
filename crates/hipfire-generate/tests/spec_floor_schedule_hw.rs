@@ -755,7 +755,7 @@ fn calibrate_load(
         )
     };
     if mode == "1" {
-        load::prepare_spec_floor(m, gpu).expect("calibration reset");
+        load::prepare_spec_floor(m, gpu, None).expect("calibration reset");
         let spec = m.speculator.as_mut().expect("speculator");
         let FloorControl::Driver(df) = spec.floor_control() else {
             panic!("the DFlash speculator owns no floor");
