@@ -2322,6 +2322,32 @@ branch) or a misspelled key is unknown and fails the load with
 | Removed key | Legacy key | Shipped | Removed in | Replacement |
 | --- | --- | --- | --- | --- |
 | `kernel.gfx11_lean_pbs` | `gfx11_lean_pbs` | 0.4.0 | 0.5.0 | none; the admitted fused gfx1100 and gfx1151 route takes the 64-row lean scratch |
+| `developer.a3b_lane_head` | `a3b_lane_head` | 0.4.5 | 0.5.0 | none; A3B lanes batch the LM head wherever the lane route admits it |
+| `developer.a3b_lane_proj` | `a3b_lane_proj` | 0.4.5 | 0.5.0 | none; A3B lanes batch their projections wherever the lane route admits it |
+| `developer.a3b_lane_wo` | `a3b_lane_wo` | 0.4.5 | 0.5.0 | none; A3B lanes batch wo wherever the lane route admits it |
+| `developer.a3b_vmm_batch` | `a3b_vmm_batch` | 0.4.5 | 0.5.0 | none; the A3B VMM batch route runs wherever it is admitted |
+| `developer.a4_rms_fdiv` | `a4_rms_fdiv` | 0.4.0 | 0.5.0 | none; gfx1201 A4 RMSNorm producers always use the reciprocal-plane divide |
+| `developer.cb_dflash_draft_batch` | `cb_dflash_draft_batch` | 0.4.2 | 0.5.0 | none; CB lanes always batch the DFlash draft where admitted |
+| `developer.cb_dn_save_free` | `cb_dn_save_free` | 0.4.2 | 0.5.0 | none; the DeltaNet SAVE copy is skipped wherever save-free admission holds |
+| `developer.cb_draft_rows64` | `cb_draft_rows64` | 0.4.2 | 0.5.0 | none; CB drafts use the 64-row route where admitted |
+| `developer.cb_lane_fa_batch` | `cb_lane_fa_batch` | 0.4.2 | 0.5.0 | none; CB lanes batch full attention where admitted |
+| `developer.cb_lane_gdn_batch` | `cb_lane_gdn_batch` | 0.4.2 | 0.5.0 | none; CB lanes batch the GDN recurrence where admitted |
+| `developer.cb_lane_gdn_varrows` | `cb_lane_gdn_varrows` | 0.4.2 | 0.5.0 | none; batched CB GDN lanes accept variable row counts |
+| `developer.cb_sampled_draft_batch` | `cb_sampled_draft_batch` | 0.4.2 | 0.5.0 | none; sampled CB drafts are batched where admitted |
+| `developer.cb_sampled_target_batch` | `cb_sampled_target_batch` | 0.4.2 | 0.5.0 | none; sampled CB targets are batched where admitted |
+| `developer.cb_seg_twins` | `cb_seg_twins` | 0.4.2 | 0.5.0 | none; CB prefill uses the segment twins where admitted |
+| `developer.cb_tape_copy_batch` | `cb_tape_copy_batch` | 0.4.2 | 0.5.0 | none; CB tape copies are one batched launch |
+| `developer.cb_upload_coalesce` | `cb_upload_coalesce` | 0.4.2 | 0.5.0 | none; CB lane positions are uploaded in one copy |
+| `developer.dflash_ordered_draft` | `dflash_ordered_draft` | 0.4.2 | 0.5.0 | none; DFlash drafts are always ordered |
+| `developer.dflash_selector_lanes` | `dflash_selector_lanes` | 0.4.2 | 0.5.0 | none; the DFlash selector runs on lanes where admitted |
+| `developer.dflash_sparse_target` | `dflash_sparse_target` | 0.4.2 | 0.5.0 | none; DFlash keeps sparse target probabilities (dense only for CACTUS) |
+| `developer.dn_snapshot_bulk_off` | `dn_snapshot_bulk_off` | 0.3.1 | 0.5.0 | none; the bulk snapshot runs on gfx1100, gfx1151 and gfx1201 |
+| `developer.dn_snapshot_flip` | `dn_snapshot_flip` | 0.4.0 | 0.5.0 | none; DFlash replay tapes always carry the snapshot-source tables |
+| `developer.draft_noise_embed_batch` | `draft_noise_embed_batch` | 0.4.2 | 0.5.0 | none; draft noise embeds are batched |
+| `developer.gdn_zba_fold` | `gdn_zba_fold` | 0.4.5 | 0.5.0 | none; gfx1201 always folds the GDN input projections |
+| `developer.gfx11_lean_pbs` |  | 0.4.0 | 0.5.0 | none; the admitted fused gfx1100 and gfx1151 route takes the 64-row lean scratch |
+| `developer.qwen_kv_default_q8` | `qwen_kv_default_q8` | 0.4.0 | 0.5.0 | none; Qwen loads default to q8 KV |
+| `developer.spec_lookup_tail` | `spec_lookup_tail` | 0.4.3 | 0.5.0 | none; an armed lookup always offers Tail windows |
 | `kernel.mw16` | `mw16` | 0.3.1 | 0.4.1 | none; the default GEMM path applies |
 | `kernel.moe_paro_i8` | `moe_paro_i8` | 0.3.1 | 0.5.0 | none; ParoQuant models are no longer supported, use an MQ4 or HFQ4 model |
 | `kernel.moe_paro_i8_k8` | `moe_paro_i8_k8` | 0.3.1 | 0.5.0 | none; ParoQuant models are no longer supported, use an MQ4 or HFQ4 model |
@@ -2599,6 +2625,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.moe_grouped_k2_pm` | `moe_grouped_k2_pm` | 0.4.5 | 0.5.0 | none; exact gfx1100 always runs the twin where admitted |
 | `developer.moe_rotate_i4_pm` | `moe_rotate_i4_pm` | 0.4.3 | 0.5.0 | none; exact gfx1201 always runs the twin where the symmetric IU4 route admits it |
 | `kernel.gfx11_iu4_symfold` | `gfx11_iu4_symfold` | 0.4.0 | 0.5.0 | none; symmetric MQ4V2 artifacts always take the signed-weight IU4 fold |
+| `developer.iu4_symfold` | `iu4_symfold` | 0.4.0 | 0.5.0 | none; symmetric MQ4V2 artifacts always take the signed-weight IU4 fold |
 | `developer.mq4v2_k512_r2` | `mq4v2_k512_r2` | 0.4.4 | 0.5.0 | none; the k512 shared-expert GEMV always runs its two-row kernel where admitted |
 | `developer.mq6_resid_pm_gfx1100` | `mq6_resid_pm_gfx1100` | 0.4.5 | 0.5.0 | none; exact gfx1100 always runs the MQ6 residual PM twin where admitted |
 | `developer.mq6_resid_port_gfx1100` | `mq6_resid_port_gfx1100` | 0.4.5 | 0.5.0 | none; exact gfx1100 always runs the card-proven MQ6 residual ports where admitted |
