@@ -74,8 +74,6 @@ use rdna_compute::gdn_stream::{
 };
 use rdna_compute::norm::GdnScanOut;
 use rdna_compute::prefill_invariant::{GdnLayerDesc, GdnProjDesc};
-use rdna_compute::prefill_route_capabilities;
-use rdna_compute::prefill_route_capabilities::PrefillRoute;
 use std::cell::{Cell, RefCell};
 
 /// Multi-request batched prefill chunk (cross-request speculative verify).
