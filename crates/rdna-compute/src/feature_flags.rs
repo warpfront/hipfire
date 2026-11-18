@@ -1103,7 +1103,7 @@ impl FeatureFlags {
                 }
             }
         }
-        if matches!(arch, "gfx1100" | "gfx1151") {
+        if matches!(arch, "gfx1100" | "gfx1151" | "gfx1150") {
             let candidates = match value("HIPFIRE_GFX11_A4_CANDIDATES").ok().as_deref() {
                 Some(candidate @ ("1" | "2" | "4" | "8")) => candidate.to_string(),
                 None | Some("") => "2".to_string(),

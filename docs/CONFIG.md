@@ -1889,7 +1889,7 @@ daemon after changing them.
 
 `kernel.gfx11_a4_candidates` (default `"2"`; `"1"`, `"2"`, `"4"` or `"8"`) sets
 the number of activation-quantization candidates searched inside the fused
-gfx1100/gfx1151 IU4 producers; `"8"` restores the full-grid search.
+gfx1100/gfx1151/gfx1150 IU4 producers; `"8"` restores the full-grid search.
 
 `kernel.gfx11_iu4_gridspec` (default `true`; opt out with `false` or
 `HIPFIRE_GFX11_IU4_GRIDSPEC=0`) splits partial-N gfx11 IU4 GEMMs so full
