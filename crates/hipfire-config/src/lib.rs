@@ -672,6 +672,10 @@ pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high"
 // a value the schema accepts becomes unselectable (and an unselectable value
 // cycles from the wrong place).
 pub const OFFLOAD_EXECS: &[&str] = &["pcie", "cpu", "passback"];
+/// Values of `memory.moe_expert_cache`; exported so the TUI offers exactly this list.
+pub const MOE_EXPERT_CACHE_MODES: &[&str] = &["off", "auto", "on"];
+/// Largest accepted `memory.moe_expert_cache_tail_bytes` (64 TiB), in bytes.
+pub const MOE_EXPERT_CACHE_TAIL_BYTES_MAX: i64 = 70_368_744_177_664;
 /// Values of `memory.ple_format`; exported so the TUI offers exactly this list.
 pub const PLE_FORMATS: &[&str] = &["auto", "q4", "q8"];
 /// Values of `speculation.mode`; exported so the TUI offers exactly this list.
@@ -850,6 +854,33 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_MOE_EXPERT_BUDGET"),
         "Resident routed-expert budget for a Mixture-of-Experts model whose experts exceed VRAM: N keeps the last N layers' routed experts on the GPU and spills the rest to system RAM; unset/null keeps every routed expert on the GPU. The number counts layers whose expert weights stay ON the GPU — llama.cpp's `--n-cpu-moe K` is this value written as `n_layers - K`. Only routed experts move: attention, router, shared expert and KV stay on the card. Explicit 'auto' (-1) opts into placement by fit, spilling routed experts before whole layers. No effect on a dense model, and none on an architecture that cannot spill experts (a configured spill fails that arch's load rather than being ignored)."
+    ),
+    field!(
+        "memory.moe_expert_cache",
+        "moe_expert_cache",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("off"),
+        ValueRule::Enum(MOE_EXPERT_CACHE_MODES),
+        true,
+        true,
+        Some("HIPFIRE_MOE_EXPERT_CACHE"),
+        "Experimental, and not yet read by any load route (the loader slice wires it). Dynamic routed-expert cache for a Mixture-of-Experts model whose routed experts do not all fit in VRAM: off (default) keeps static placement; on requests a bounded reusable tail of device slots filled from the canonical host bytes, never changing which experts are selected or their arithmetic, and is a no-op when every routed expert is already resident; auto does the same only on a route that has passed its measured qualification. The cache is carved from the expert allocation the placement admitted (memory.moe_expert_budget keeps its layer-count/auto/full meaning and its explicit layer pins), never added to it. Size cap: memory.moe_expert_cache_tail_bytes, which requires this key to be auto or on."
+    ),
+    field!(
+        "memory.moe_expert_cache_tail_bytes",
+        "moe_expert_cache_tail_bytes",
+        Memory,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableInteger {
+            min: 0,
+            max: MOE_EXPERT_CACHE_TAIL_BYTES_MAX
+        },
+        true,
+        true,
+        Some("HIPFIRE_MOE_EXPERT_CACHE_TAIL_BYTES"),
+        "Upper bound, in BYTES (plain integer, no unit suffix), on the reusable device tail of the dynamic routed-expert cache (memory.moe_expert_cache). Unset/null lets the planner size the tail from the expert allocation placement admitted; 0 is a valid static-only plan (cache on, no reusable slots). Never reinterprets memory.moe_expert_budget, which counts layers. Setting it while memory.moe_expert_cache is off is a configuration error."
     ),
     // Sparse in the process config (like `replay.backend`): when the user,
     // registry or a compatibility env never set it, the key is absent, so the
@@ -12092,6 +12123,191 @@ pub mod memory {
         parse_gpu_layer_budget(process_value("HIPFIRE_MOE_EXPERT_BUDGET").as_deref())
     }
 
+    /// Typed mode of the dynamic routed-expert cache (`memory.moe_expert_cache`,
+    /// compat env `HIPFIRE_MOE_EXPERT_CACHE`).
+    ///
+    /// * [`MoeExpertCacheMode::Off`] (default): every routed expert follows its
+    ///   static placement; no cache is built.
+    /// * [`MoeExpertCacheMode::Auto`]: the cache is built only for a route that
+    ///   has passed its measured qualification and only when placement leaves
+    ///   experts outside VRAM. Not "spend every remaining byte".
+    /// * [`MoeExpertCacheMode::On`]: the cache is requested explicitly. When the
+    ///   placement already keeps every routed expert resident it is a no-op,
+    ///   not an error; an unqualified route refuses rather than ignoring it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+    pub enum MoeExpertCacheMode {
+        #[default]
+        Off,
+        Auto,
+        On,
+    }
+
+    impl MoeExpertCacheMode {
+        /// The schema spelling of this mode.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                MoeExpertCacheMode::Off => "off",
+                MoeExpertCacheMode::Auto => "auto",
+                MoeExpertCacheMode::On => "on",
+            }
+        }
+    }
+
+    impl std::fmt::Display for MoeExpertCacheMode {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    /// A named configuration error of the dynamic routed-expert cache keys.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum MoeExpertCacheConfigError {
+        /// `memory.moe_expert_cache` is not `off`, `auto` or `on`.
+        InvalidMode { value: String },
+        /// `memory.moe_expert_cache_tail_bytes` is not a plain byte count in
+        /// `0..=`[`MOE_EXPERT_CACHE_TAIL_BYTES_MAX`].
+        InvalidTailBytes { value: String },
+        /// A tail cap was configured while the cache is off. A cap with nothing
+        /// to cap is a contradictory request, refused rather than ignored.
+        TailBytesWithCacheOff { tail_bytes: u64 },
+    }
+
+    impl std::fmt::Display for MoeExpertCacheConfigError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::InvalidMode { value } => write!(
+                    f,
+                    "memory.moe_expert_cache = {value:?} is not one of off|auto|on"
+                ),
+                Self::InvalidTailBytes { value } => write!(
+                    f,
+                    "memory.moe_expert_cache_tail_bytes = {value:?} is not a plain byte count \
+                     (an integer in 0..={}; no unit suffix)",
+                    super::MOE_EXPERT_CACHE_TAIL_BYTES_MAX
+                ),
+                Self::TailBytesWithCacheOff { tail_bytes } => write!(
+                    f,
+                    "memory.moe_expert_cache_tail_bytes = {tail_bytes} conflicts with \
+                     memory.moe_expert_cache = off: set memory.moe_expert_cache to auto or on, \
+                     or unset the tail cap"
+                ),
+            }
+        }
+    }
+
+    impl std::error::Error for MoeExpertCacheConfigError {}
+
+    /// The resolved dynamic-expert-cache request, beside (never replacing) the
+    /// layer-count/`auto`/`full` [`OffloadBudget`] of `memory.moe_expert_budget`.
+    ///
+    /// Precedence: the budget keeps its spelling and units. An explicit
+    /// [`OffloadBudget::Layers`] is a hard pin and stays one; the cache may use
+    /// only what the admitted expert allocation leaves after those pins.
+    /// `tail_bytes_cap`, when present, is an upper bound in **bytes** on the
+    /// reusable tail carved from that allocation (`Some(0)` = static-only);
+    /// absent leaves the size to the planner. It is never derived from, or
+    /// converted into, the budget.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MoeExpertCachePolicy {
+        pub mode: MoeExpertCacheMode,
+        pub tail_bytes_cap: Option<u64>,
+        pub budget: OffloadBudget,
+    }
+
+    impl MoeExpertCachePolicy {
+        /// Whether the cache was requested at all (`auto` or `on`).
+        pub fn enabled(&self) -> bool {
+            self.mode != MoeExpertCacheMode::Off
+        }
+
+        /// The cache was requested but the generic expert budget is
+        /// [`OffloadBudget::Full`] (every routed expert on the device), so the
+        /// generic placement route has nothing to cache. A no-op, not an error.
+        /// Routes that place experts through their own resolver (Qwen4's hot-set
+        /// residency) report their own all-resident fact to admission.
+        pub fn is_noop_on_generic_budget(&self) -> bool {
+            self.enabled() && self.budget == OffloadBudget::Full
+        }
+    }
+
+    /// Pure parser behind `memory.moe_expert_cache`: unset/empty is
+    /// [`MoeExpertCacheMode::Off`]; anything but `off|auto|on` is named.
+    pub fn parse_moe_expert_cache_mode(
+        raw: Option<&str>,
+    ) -> Result<MoeExpertCacheMode, MoeExpertCacheConfigError> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("off") => Ok(MoeExpertCacheMode::Off),
+            Some("auto") => Ok(MoeExpertCacheMode::Auto),
+            Some("on") => Ok(MoeExpertCacheMode::On),
+            Some(other) => Err(MoeExpertCacheConfigError::InvalidMode {
+                value: other.to_owned(),
+            }),
+        }
+    }
+
+    /// Pure parser behind `memory.moe_expert_cache_tail_bytes`: unset, empty or
+    /// `null` is `None`; otherwise a plain unsigned decimal byte count no
+    /// larger than [`MOE_EXPERT_CACHE_TAIL_BYTES_MAX`] (no unit suffixes, the
+    /// same convention as `memory.session_cache_disk_bytes`).
+    pub fn parse_moe_expert_cache_tail_bytes(
+        raw: Option<&str>,
+    ) -> Result<Option<u64>, MoeExpertCacheConfigError> {
+        let Some(text) = raw.map(str::trim) else {
+            return Ok(None);
+        };
+        if text.is_empty() || text.eq_ignore_ascii_case("null") {
+            return Ok(None);
+        }
+        let invalid = || MoeExpertCacheConfigError::InvalidTailBytes {
+            value: text.to_owned(),
+        };
+        if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        let bytes: u64 = text.parse().map_err(|_| invalid())?;
+        if bytes > super::MOE_EXPERT_CACHE_TAIL_BYTES_MAX as u64 {
+            return Err(invalid());
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Resolve the raw cache keys against the expert budget. Pure; the process
+    /// reader is [`moe_expert_cache_policy`].
+    ///
+    /// Conflicts: a tail cap with the cache off is
+    /// [`MoeExpertCacheConfigError::TailBytesWithCacheOff`]. Cache `on`/`auto`
+    /// with [`OffloadBudget::Full`] is valid (a no-op, see
+    /// [`MoeExpertCachePolicy::is_noop_on_generic_budget`]).
+    pub fn resolve_moe_expert_cache(
+        mode: Option<&str>,
+        tail_bytes: Option<&str>,
+        budget: OffloadBudget,
+    ) -> Result<MoeExpertCachePolicy, MoeExpertCacheConfigError> {
+        let mode = parse_moe_expert_cache_mode(mode)?;
+        let tail_bytes_cap = parse_moe_expert_cache_tail_bytes(tail_bytes)?;
+        if mode == MoeExpertCacheMode::Off {
+            if let Some(tail_bytes) = tail_bytes_cap {
+                return Err(MoeExpertCacheConfigError::TailBytesWithCacheOff { tail_bytes });
+            }
+        }
+        Ok(MoeExpertCachePolicy {
+            mode,
+            tail_bytes_cap,
+            budget,
+        })
+    }
+
+    /// The configured dynamic-expert-cache request from the process snapshot
+    /// (`memory.moe_expert_cache`, `memory.moe_expert_cache_tail_bytes`)
+    /// resolved against [`moe_expert_budget`].
+    pub fn moe_expert_cache_policy() -> Result<MoeExpertCachePolicy, MoeExpertCacheConfigError> {
+        resolve_moe_expert_cache(
+            process_value("HIPFIRE_MOE_EXPERT_CACHE").as_deref(),
+            process_value("HIPFIRE_MOE_EXPERT_CACHE_TAIL_BYTES").as_deref(),
+            moe_expert_budget(),
+        )
+    }
+
     /// The configured placement budgets. Unset is [`OffloadBudget::Full`] on
     /// both tiers for every model; auto-fit and manual spills require opt-in.
     pub fn effective_offload_budgets() -> (OffloadBudget, OffloadBudget) {
@@ -13856,6 +14072,194 @@ pub mod memory {
             assert_eq!(OffloadBudget::Full.to_string(), "full");
             assert_eq!(OffloadBudget::Auto.to_string(), "auto");
             assert_eq!(OffloadBudget::Layers(5).to_string(), "5");
+        }
+
+        #[test]
+        fn moe_expert_cache_keys_are_typed_and_default_off() {
+            let mode = crate::field("memory.moe_expert_cache").expect("mode key");
+            assert_eq!(
+                mode.default.to_value(),
+                crate::ConfigValue::String("off".into())
+            );
+            assert_eq!(mode.env_compat, Some("HIPFIRE_MOE_EXPERT_CACHE"));
+            let tail = crate::field("memory.moe_expert_cache_tail_bytes").expect("tail key");
+            assert_eq!(tail.default.to_value(), crate::ConfigValue::Null);
+            assert_eq!(tail.env_compat, Some("HIPFIRE_MOE_EXPERT_CACHE_TAIL_BYTES"));
+            for spelling in ["off", "auto", "on"] {
+                let parsed = mode.parse_cli(spelling).unwrap();
+                mode.validate(&parsed).unwrap();
+            }
+            for spelling in ["true", "ON", "yes", "", "dynamic"] {
+                assert!(mode.parse_cli(spelling).is_err(), "{spelling:?}");
+            }
+            for spelling in ["null", "0", "1", "4294967296", "70368744177664"] {
+                let parsed = tail.parse_cli(spelling).unwrap();
+                tail.validate(&parsed).unwrap();
+            }
+            // Bytes only: no unit suffix, no negative, nothing above the schema cap.
+            for spelling in ["-1", "1GiB", "1.5", "auto", "70368744177665"] {
+                assert!(tail.parse_cli(spelling).is_err(), "{spelling:?}");
+            }
+            // The existing layer-count key keeps its spelling and units.
+            let budget = crate::field("memory.moe_expert_budget").unwrap();
+            assert!(matches!(
+                budget.rule,
+                crate::ValueRule::NullableIntegerOrAuto {
+                    min: -1,
+                    max: 65536
+                }
+            ));
+        }
+
+        #[test]
+        fn moe_expert_cache_mode_parses_strictly() {
+            assert_eq!(
+                parse_moe_expert_cache_mode(None),
+                Ok(MoeExpertCacheMode::Off)
+            );
+            assert_eq!(
+                parse_moe_expert_cache_mode(Some("")),
+                Ok(MoeExpertCacheMode::Off)
+            );
+            assert_eq!(
+                parse_moe_expert_cache_mode(Some(" auto ")),
+                Ok(MoeExpertCacheMode::Auto)
+            );
+            assert_eq!(
+                parse_moe_expert_cache_mode(Some("on")),
+                Ok(MoeExpertCacheMode::On)
+            );
+            assert_eq!(
+                parse_moe_expert_cache_mode(Some("true")),
+                Err(MoeExpertCacheConfigError::InvalidMode {
+                    value: "true".into()
+                })
+            );
+            assert_eq!(MoeExpertCacheMode::default(), MoeExpertCacheMode::Off);
+            assert_eq!(MoeExpertCacheMode::Auto.to_string(), "auto");
+        }
+
+        #[test]
+        fn moe_expert_cache_tail_bytes_are_plain_bytes() {
+            assert_eq!(parse_moe_expert_cache_tail_bytes(None), Ok(None));
+            assert_eq!(parse_moe_expert_cache_tail_bytes(Some("")), Ok(None));
+            assert_eq!(parse_moe_expert_cache_tail_bytes(Some("null")), Ok(None));
+            assert_eq!(parse_moe_expert_cache_tail_bytes(Some("0")), Ok(Some(0)));
+            assert_eq!(
+                parse_moe_expert_cache_tail_bytes(Some(" 4294967296 ")),
+                Ok(Some(4 << 30))
+            );
+            assert_eq!(
+                parse_moe_expert_cache_tail_bytes(Some("70368744177664")),
+                Ok(Some(70_368_744_177_664))
+            );
+            for bad in ["-1", "1GiB", "1.5", "auto", "0x10", "70368744177665"] {
+                assert_eq!(
+                    parse_moe_expert_cache_tail_bytes(Some(bad)),
+                    Err(MoeExpertCacheConfigError::InvalidTailBytes { value: bad.into() }),
+                    "{bad:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn moe_expert_cache_resolution_precedence_and_conflicts() {
+            use OffloadBudget::{Auto, Full, Layers};
+            // Default is off, whatever the budget, and never touches the budget.
+            for budget in [Full, Auto, Layers(7)] {
+                let policy = resolve_moe_expert_cache(None, None, budget).unwrap();
+                assert_eq!(policy.mode, MoeExpertCacheMode::Off);
+                assert_eq!(policy.tail_bytes_cap, None);
+                assert_eq!(policy.budget, budget);
+                assert!(!policy.enabled());
+                assert!(!policy.is_noop_on_generic_budget());
+            }
+            // A tail cap with the cache off is the named conflict, even a zero cap.
+            for tail in ["0", "1048576"] {
+                for mode in [None, Some("off")] {
+                    assert!(matches!(
+                        resolve_moe_expert_cache(mode, Some(tail), Auto),
+                        Err(MoeExpertCacheConfigError::TailBytesWithCacheOff { .. })
+                    ));
+                }
+            }
+            // Cache on with every expert resident (Full) is not an error: it is a no-op.
+            let noop = resolve_moe_expert_cache(Some("on"), None, Full).unwrap();
+            assert!(noop.enabled() && noop.is_noop_on_generic_budget());
+            let capped = resolve_moe_expert_cache(Some("on"), Some("0"), Full).unwrap();
+            assert_eq!(capped.tail_bytes_cap, Some(0));
+            assert!(capped.is_noop_on_generic_budget());
+            // Explicit layer pins stay pins; the cap is carried alongside, unconverted.
+            let pinned =
+                resolve_moe_expert_cache(Some("auto"), Some("2147483648"), Layers(12)).unwrap();
+            assert_eq!(pinned.budget, Layers(12));
+            assert_eq!(pinned.tail_bytes_cap, Some(2 << 30));
+            assert!(pinned.enabled() && !pinned.is_noop_on_generic_budget());
+            // Parse failures are named, mode first.
+            assert!(matches!(
+                resolve_moe_expert_cache(Some("maybe"), Some("x"), Full),
+                Err(MoeExpertCacheConfigError::InvalidMode { .. })
+            ));
+            assert!(matches!(
+                resolve_moe_expert_cache(Some("on"), Some("x"), Full),
+                Err(MoeExpertCacheConfigError::InvalidTailBytes { .. })
+            ));
+            // The messages name the keys.
+            let message = resolve_moe_expert_cache(Some("off"), Some("5"), Auto)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("memory.moe_expert_cache_tail_bytes"),
+                "{message}"
+            );
+            assert!(
+                message.contains("memory.moe_expert_cache = off"),
+                "{message}"
+            );
+        }
+
+        #[test]
+        fn moe_expert_cache_process_snapshot_defaults_to_off() {
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).unwrap()).unwrap();
+            assert_eq!(
+                parse_moe_expert_cache_mode(
+                    defaults.legacy_value("HIPFIRE_MOE_EXPERT_CACHE").as_deref()
+                ),
+                Ok(MoeExpertCacheMode::Off)
+            );
+            for (spelling, expected) in [
+                ("auto", MoeExpertCacheMode::Auto),
+                ("on", MoeExpertCacheMode::On),
+            ] {
+                let mut layer = crate::ConfigLayer::default();
+                layer.set_cli("memory.moe_expert_cache", spelling).unwrap();
+                layer
+                    .set_cli("memory.moe_expert_cache_tail_bytes", "1048576")
+                    .unwrap();
+                let resolved = crate::resolve([crate::NamedLayer {
+                    source: crate::ConfigSource::OneShot {
+                        argument: format!("memory.moe_expert_cache={spelling}"),
+                    },
+                    layer,
+                }])
+                .unwrap();
+                let process = crate::ProcessConfig::from_resolved(&resolved).unwrap();
+                assert_eq!(
+                    parse_moe_expert_cache_mode(
+                        process.legacy_value("HIPFIRE_MOE_EXPERT_CACHE").as_deref()
+                    ),
+                    Ok(expected)
+                );
+                assert_eq!(
+                    parse_moe_expert_cache_tail_bytes(
+                        process
+                            .legacy_value("HIPFIRE_MOE_EXPERT_CACHE_TAIL_BYTES")
+                            .as_deref()
+                    ),
+                    Ok(Some(1_048_576))
+                );
+            }
         }
 
         #[test]
