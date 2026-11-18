@@ -779,6 +779,7 @@ developer_callsite	*	HIPFIRE_SLOTS_PAGED#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_SLOTS_PAGED_PAGES#developer_var=ok.and_then.map.unwrap_or(legacy_equivalent)
 developer_callsite	*	HIPFIRE_SLOTS_PAGED_PAGES#developer_var=ok.and_then.map.unwrap_or_else
 developer_callsite	*	HIPFIRE_SPEC_PHASES#developer_var=ok.as_deref.==Some("1")
+developer_callsite	*	HIPFIRE_SPEC_RETIRE#developer_var=is_ok
 developer_callsite	*	HIPFIRE_SPEC_RETIRE#developer_var=ok
 developer_callsite	*	HIPFIRE_SPEC_WINDOW_ROLLBACK#developer_bool=true
 developer_callsite	*	HIPFIRE_STATE_QUANT#developer_var=unwrap_or_default
@@ -829,4 +830,4 @@ developer_callsite	*	HIPFIRE_VMM_PROMOTE_AT#developer_var=ok.and_then
 developer_callsite	*	HIPFIRE_VMM_TLB_POKE#developer_bool=in_tree
 developer_callsite	*	HIPFIRE_VMM_TLB_POKE#developer_var=ok
 developer_callsite	*	HIPFIRE_WEIGHT_SLAB#developer_var=-
-developer_callsite	*	HIPFIRE_WIDENED_PBS_GROW_ONLY#developer_var=ok.as_deref.!=Some("0")
+developer_callsite	*	HIPFIRE_WIDENED_PBS_GROW_ONLY#developer_var=ok.as_deref.==Some("0")
