@@ -65,6 +65,7 @@ pub mod catalog;
 pub mod device_io;
 mod index;
 mod policy;
+pub mod pread;
 pub mod window;
 
 pub use device_io::{
