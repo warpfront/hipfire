@@ -1591,10 +1591,14 @@ fn dispatch_attend(
                 // capture-safe). Falls through to the incumbent otherwise.
                 // v_mode 4 (lloyd4 V) takes the (4,4) combo module: same K
                 // fill, V dequantized from lloyd4 records, post-inverse
-                // restores O in place. Requires the 256-element V sign
-                // tables (reallocated at lloyd-V load); anything smaller
-                // falls through to the scalar path. Mixed pairs (e.g. K=4
-                // with V=3) are not registered — scalar fallback.
+                // restores O in place. K and V share one sign-table pair
+                // (`givens_cos`/`givens_sin` = `ct`/`st`): a lloyd-V load
+                // reallocates it to 256 elements, an LCG-prefix extension of
+                // the 128-element fwht4 K tables. The arm needs the 256-wide
+                // tables; anything smaller falls through to the scalar path.
+                // Mixed pairs (e.g. K=4 with V=3) are not registered — scalar
+                // fallback.
+                let v_route = gfx11_fwht_fa2_v_route(4, plan.v_mode_bits, ct.numel(), st.numel());
                 if gpu.flags.gfx11_fa2_prefill
                     && matches!(
                         gpu.arch.as_str(),
@@ -1606,10 +1610,9 @@ fn dispatch_attend(
                     && gpu.fa2_gfx11_batch_admitted(io.batch_size)
                     && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
                     && io.tree_bias.is_none()
-                    && (plan.v_mode_bits == 8
-                        || (plan.v_mode_bits == 4 && ct.numel() >= 256 && st.numel() >= 256))
+                    && v_route.is_some()
                 {
-                    if plan.v_mode_bits == 8 {
+                    if v_route == Some(Gfx11FwhtFa2V::Q8) {
                         hip!(gpu.attention_q8_0_fa2_gqa_fwht4k_gfx11(
                             io.q,
                             io.k_cache,
@@ -1758,9 +1761,11 @@ fn dispatch_attend(
                 // gfx1151 only (shared predicate with the Q8 ingress); every
                 // other batch keeps the 64..=512 gate. Falls through to the
                 // incumbent below otherwise.
-                // v_mode 3 (lloyd3 V) takes the (3,3) combo module; same
-                // 256-element sign-table requirement as the (4,4) combo
-                // (fwht3 tables are already 256, the check is belt-and-braces).
+                // v_mode 3 (lloyd3 V) takes the (3,3) combo module; K and V
+                // share `ct`/`st`, with the same 256-element requirement as
+                // the (4,4) combo (fwht3 tables are already 256, the check is
+                // belt-and-braces).
+                let v_route = gfx11_fwht_fa2_v_route(3, plan.v_mode_bits, ct.numel(), st.numel());
                 if gpu.flags.gfx11_fa2_prefill
                     && matches!(
                         gpu.arch.as_str(),
@@ -1772,10 +1777,9 @@ fn dispatch_attend(
                     && gpu.fa2_gfx11_batch_admitted(io.batch_size)
                     && gpu.fa2_gfx11_ctx_admitted(io.max_ctx_len)
                     && io.tree_bias.is_none()
-                    && (plan.v_mode_bits == 8
-                        || (plan.v_mode_bits == 3 && ct.numel() >= 256 && st.numel() >= 256))
+                    && v_route.is_some()
                 {
-                    if plan.v_mode_bits == 8 {
+                    if v_route == Some(Gfx11FwhtFa2V::Q8) {
                         hip!(gpu.attention_q8_0_fa2_gqa_fwht3k_gfx11(
                             io.q,
                             io.k_cache,
@@ -2658,9 +2662,54 @@ const DISPATCHED_FULL_ATTENTION_KEYS: &[KernelKey] = &[
     KernelKey::AttnFullF32Causal,
 ];
 
+/// V-cache route of the gfx11 fwht-K FA2 prefill arms (`k_bits` 4 or 3).
+/// Q8_0 V takes the incumbent `attention_q8_0_fa2_gqa_fwht{4,3}k_gfx11`
+/// module. lloyd V takes the matching combo module only when its bit width
+/// equals the K width (the (4,4) and (3,3) modules are the only registered
+/// pairs) and the shared K/V sign tables are the 256-wide lloyd-V tables.
+/// `None` falls through to the scalar path.
+fn gfx11_fwht_fa2_v_route(
+    k_bits: i32,
+    v_mode_bits: i32,
+    signs1_numel: usize,
+    signs2_numel: usize,
+) -> Option<Gfx11FwhtFa2V> {
+    if v_mode_bits == 8 {
+        return Some(Gfx11FwhtFa2V::Q8);
+    }
+    (matches!(k_bits, 3 | 4) && v_mode_bits == k_bits && signs1_numel >= 256 && signs2_numel >= 256)
+        .then_some(Gfx11FwhtFa2V::Lloyd)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gfx11FwhtFa2V {
+    Q8,
+    Lloyd,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gfx11_fwht_fa2_v_route_admits_only_matched_lloyd_with_256_signs() {
+        use Gfx11FwhtFa2V::{Lloyd, Q8};
+        for k in [3, 4] {
+            // Q8_0 V keeps the incumbent module whatever the table width.
+            assert_eq!(gfx11_fwht_fa2_v_route(k, 8, 128, 128), Some(Q8));
+            assert_eq!(gfx11_fwht_fa2_v_route(k, 8, 256, 256), Some(Q8));
+            // Matched lloyd V needs both tables at 256 elements.
+            assert_eq!(gfx11_fwht_fa2_v_route(k, k, 256, 256), Some(Lloyd));
+            assert_eq!(gfx11_fwht_fa2_v_route(k, k, 255, 256), None);
+            assert_eq!(gfx11_fwht_fa2_v_route(k, k, 256, 255), None);
+            assert_eq!(gfx11_fwht_fa2_v_route(k, k, 128, 128), None);
+            // lloyd2 V has no FA2 module.
+            assert_eq!(gfx11_fwht_fa2_v_route(k, 2, 256, 256), None);
+        }
+        // Mixed K/V widths are not registered.
+        assert_eq!(gfx11_fwht_fa2_v_route(4, 3, 256, 256), None);
+        assert_eq!(gfx11_fwht_fa2_v_route(3, 4, 256, 256), None);
+    }
 
     /// HIPF-151: a one-row prefill chunk must take its KV slot from the
     /// chunk's `positions`, not the decode scratch `pos_buf`.

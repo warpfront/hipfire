@@ -9480,10 +9480,11 @@ impl Gpu {
     /// lloyd-V post-inverse epilogue launcher (shared by the (4,4) and (3,3)
     /// combos): `attention_fa2_o_postinvert_lloyd_gfx11` in place over `out`
     /// on the same stream. Pure function of out[] + the V sign tables, so
-    /// capture-safe via launch_maybe_blob. The sign tables are the same
-    /// `givens_cos`/`givens_sin` buffers the KV writer used (256-element after
-    /// the lloyd realloc; LCG-prefix consistent with the K tables) — NOT the
-    /// Q-preconvert tables. Grid covers batch*24 rows / 4 per block.
+    /// capture-safe via launch_maybe_blob. The sign tables are the
+    /// `givens_cos`/`givens_sin` buffers the KV writer used for both K and V
+    /// (256-element after the lloyd realloc, an LCG-prefix extension of the
+    /// 128-element fwht4 K tables); the Q pre-convert reads the same pair.
+    /// Grid covers batch*24 rows / 4 per block.
     fn launch_fa2_o_postinvert_lloyd_gfx11(
         &mut self,
         out: &GpuTensor,

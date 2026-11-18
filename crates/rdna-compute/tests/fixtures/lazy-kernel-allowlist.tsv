@@ -77,8 +77,10 @@ module	attention_int8c_f16_kv	non-core-family	Non-core family route: Qwen2/Llama
 module	attention_q4kv	non-core-family	Non-core family route: Qwen2/Llama; rdna-compute/src/attention.rs:16613
 module	attention_q8_0_fa2_gqa_fwht3k_gfx11	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:8533
 module	attention_q8_0_fa2_gqa_fwht3k_gfx1201	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:7655
+module	attention_q8_0_fa2_gqa_fwht3k_lloydv3_gfx11	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:9818
 module	attention_q8_0_fa2_gqa_fwht4k_gfx11	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:9362
 module	attention_q8_0_fa2_gqa_fwht4k_gfx1201	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:8306
+module	attention_q8_0_fa2_gqa_fwht4k_lloydv4_gfx11	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:9638
 module	attention_q8_0_fa2_gqa_gfx11	developer-opt-in	Non-default developer override: HIPFIRE_FA2_FILL / HIPFIRE_GFX1100_FA2_R3; rdna-compute/src/attention.rs:7977
 module	attention_q8_0_fa2_gqa_gfx1201	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:6094
 module	attention_q8_0_fa2_gqa_partial_gfx1201	developer-opt-in	Non-default developer override: HIPFIRE_GFX12_FA2_SPLIT_VERIFY; rdna-compute/src/attention.rs:8723
