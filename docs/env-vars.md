@@ -1561,6 +1561,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEEPSEEK4_MODEL` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs | harness |
 | `HIPFIRE_DEEPSEEK4_MOE_8W` | crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs, crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_CND` | crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs, crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
+| `HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC` | crates/hipfire-arch-maple/src/program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_GATE_UP_BATCHED_K4096_LDS` | crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE` | crates/hipfire-dispatch/src/families/moe.rs, crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W` | crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
@@ -1715,7 +1716,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EMBED_BATCH_WINDOW_US` | crates/hipfire-arch-embeddinggemma2/src/slot_engine.rs, crates/hipfire-arch-qwen35-embed/src/slot_engine.rs | developer |
 | `HIPFIRE_EMBED_DEBUG` | crates/hipfire-arch-embeddinggemma2/src/carrier.rs, crates/hipfire-arch-embeddinggemma2/src/forward.rs | developer |
 | `HIPFIRE_EMBED_ENGINE_TRACE` | crates/hipfire-arch-embeddinggemma2/src/slot_engine.rs, crates/hipfire-arch-qwen35-embed/src/slot_engine.rs | developer |
-| `HIPFIRE_EMBED_GEMM` | crates/hipfire-arch-embeddinggemma2/src/forward.rs, crates/hipfire-arch-qwen35-embed/src/forward.rs | developer |
+| `HIPFIRE_EMBED_GEMM` | crates/hipfire-arch-embeddinggemma2/src/forward.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_EMBED_HOST` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_EMBED_PHASE` | crates/hipfire-arch-qwen35-embed/examples/batch_parity.rs, crates/hipfire-generate/src/embed.rs | developer |
 | `HIPFIRE_EMBED_VISION_OFFLOAD` | crates/hipfire-arch-qwen35-embed/src/lib.rs, crates/hipfire-arch-qwen35-embed/src/vision.rs | developer |
@@ -1898,7 +1899,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_G942_BF16_WIDE_IMAGE` | crates/rdna-compute/src/cdna/gfx942.rs | developer |
 | `HIPFIRE_G942_ROWS16_CHAIN` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_G942_TRUNK_GEMV` | crates/hipfire-arch-qwen4/examples/qwen4_mtp_g942_cost.rs, crates/hipfire-arch-qwen4/src/mtp_gpu/rows.rs | developer |
-| `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-arch-raon/src/rda.rs | developer |
+| `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-dispatch/src/ops/delta_net.rs | developer |
 | `HIPFIRE_GATED_DELTA_VECTOR_PM` | crates/rdna-compute/src/gated_delta_vector_pm.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
 | `HIPFIRE_GATED_NORM_FP8_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GATED_NORM_FP8_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
@@ -2904,7 +2905,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RAON_GFX1100_DOWN_PRODUCER` | crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
 | `HIPFIRE_RAON_LM_HEAD` | crates/hipfire-quantize/src/raon.rs | developer |
 | `HIPFIRE_RAON_MHC_BF16_STREAMS` | crates/hipfire-arch-raon/src/forward.rs, crates/hipfire-arch-raon/src/mhc.rs | developer |
-| `HIPFIRE_RAON_MHC_FUSED` | crates/hipfire-arch-raon/src/forward.rs, crates/hipfire-arch-raon/src/mhc.rs | developer |
+| `HIPFIRE_RAON_MHC_FUSED` | crates/hipfire-arch-raon/src/mhc.rs, crates/hipfire-arch-raon/src/state.rs | developer |
 | `HIPFIRE_RAON_MIRROR_Q8` | crates/hipfire-arch-raon/src/bundle.rs, crates/hipfire-arch-raon/src/mla.rs | experimental |
 | `HIPFIRE_RAON_MLA_ABSORB` | crates/hipfire-arch-raon/examples/raon_oracle/generate.rs, crates/hipfire-arch-raon/examples/raon_oracle/logits.rs | developer |
 | `HIPFIRE_RAON_PREFILL` | crates/hipfire-arch-raon/src/bundle.rs, crates/hipfire-config/src/lib.rs | experimental |
@@ -2915,11 +2916,11 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RAON_RAILGUN_CORPUS_GFX1100` | crates/hipfire-arch-raon/src/railgun_decode.rs | developer |
 | `HIPFIRE_RAON_RAILGUN_CORPUS_GFX1201` | crates/hipfire-arch-raon/src/railgun_decode.rs | developer |
 | `HIPFIRE_RAON_RAILGUN_LOCAL_CORPUS` | crates/hipfire-arch-raon/src/railgun_decode.rs, crates/hipfire-arch-raon/src/railgun_provision.rs | developer |
-| `HIPFIRE_RAON_RDA_FUSED_PREP` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-arch-raon/src/rda.rs | developer |
-| `HIPFIRE_RAON_RDA_SEGMENT` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-arch-raon/src/rda.rs | developer |
+| `HIPFIRE_RAON_RDA_FUSED_PREP` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-dispatch/src/pipeline/rda.rs | developer |
+| `HIPFIRE_RAON_RDA_SEGMENT` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-dispatch/src/pipeline/rda.rs | developer |
 | `HIPFIRE_RAON_SHARED_FFN` | crates/hipfire-config/src/lib.rs, crates/hipfire-quantize/src/raon.rs | experimental |
 | `HIPFIRE_RAON_TOKENIZER` | crates/hipfire-runtime/src/tokenizer.rs, scripts/check-env-docs.py | developer |
-| `HIPFIRE_RAON_VERIFY_ROWEXACT` | crates/hipfire-arch-raon/examples/raon_dflash_oracle.rs, crates/hipfire-arch-raon/src/projection.rs | experimental |
+| `HIPFIRE_RAON_VERIFY_ROWEXACT` | crates/hipfire-arch-raon/examples/raon_dflash_oracle.rs, crates/hipfire-arch-raon/src/program.rs | experimental |
 | `HIPFIRE_RCCL_LIB` | crates/hip-bridge/src/rccl.rs | developer |
 | `HIPFIRE_RDNA2_VARIANT` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_RDNA3` | crates/hipfire-runtime/examples/tmp_halo_iu4_calibrate.rs | harness |
