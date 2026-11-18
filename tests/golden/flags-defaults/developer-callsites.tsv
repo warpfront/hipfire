@@ -8,6 +8,7 @@ developer_callsite	*	?name#developer_var=ok
 developer_callsite	*	?name#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	?name#developer_var=ok.filter
 developer_callsite	*	?name#developer_var=ok.filter.map
+developer_callsite	*	?name#developer_var=ok.is_some_and
 developer_callsite	*	?v#developer_var=ok.filter.map
 developer_callsite	*	?var#developer_var=-
 developer_callsite	*	?var#developer_var=ok
@@ -199,6 +200,7 @@ developer_callsite	*	HIPFIRE_EMBED_BATCH_WINDOW_US#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_EMBED_DEBUG#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_EMBED_ENGINE_TRACE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_EMBED_GEMM#developer_var=ok.as_deref
+developer_callsite	*	HIPFIRE_EMBED_GEMM#developer_var=ok.is_some_and
 developer_callsite	*	HIPFIRE_EMBED_PHASE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_EMBED_VISION_OFFLOAD#developer_var=-
 developer_callsite	*	HIPFIRE_EMIT_TOKEN_IDS#developer_bool=false
@@ -453,9 +455,7 @@ developer_callsite	*	HIPFIRE_LM_HEAD_HFQ4#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_LOAD_TRACE#developer_var=is_err
 developer_callsite	*	HIPFIRE_LOAD_TRACE#developer_var_os=is_some
 developer_callsite	*	HIPFIRE_LOAD_WEIGHT_DIGEST#developer_var=ok.filter.map
-developer_callsite	*	HIPFIRE_MAPLE_DOWN#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_MAPLE_DUMP_HIDDEN#developer_var=ok
-developer_callsite	*	HIPFIRE_MAPLE_DUMP_ROUTER#developer_var=ok
 developer_callsite	*	HIPFIRE_MAPLE_FORCE_FULL_CAUSAL#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_MEMSET_DUMP#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_MESH_TRANSPORT#developer_var=ok.as_deref
