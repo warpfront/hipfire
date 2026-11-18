@@ -227,18 +227,6 @@ impl Drop for Qwen35DenseTpGuard<'_> {
 // `hipfire_runtime::spec::InPlaceGuard<B>`). The daemon resolves the carrier via
 // `hipfire_loader::carrier_for(arch_id)` and never arch-matches itself.
 
-/// MTP chain depth requested by the load policy (before the drafter's own
-/// 1..=8 clamp): `spec.mtp_k`, else the process default, clamped to 1..=10.
-pub fn mtp_requested_k(spec: &hipfire_runtime::loader_api::SpecLoadCfg) -> usize {
-    spec.mtp_k
-        .unwrap_or(
-            hipfire_runtime::config::get()
-                .mtp_k
-                .unwrap_or(hipfire_config::MTP_K_DEFAULT),
-        )
-        .clamp(1, 10)
-}
-
 /// Pick the speculative-decode drafter for a freshly-loaded model. This is the
 /// single load-time registry the daemon's `generate_dflash` routes through —
 /// it never learns which arm was chosen.
@@ -282,7 +270,7 @@ pub fn build_speculator(
     // to free it).
     if let Some(head) = mtp {
         if matches!(arch_id, 5 | 6) {
-            let max_n = mtp_requested_k(&spec);
+            let max_n = hipfire_arch_qwen35::mtp_speculator::mtp_requested_k(&spec);
             eprintln!("  qwen35 MTP speculator enabled (compressed-serial, K={max_n})");
             hipfire_config::load_summary::note(
                 hipfire_config::load_summary::Facet::SpecOn,

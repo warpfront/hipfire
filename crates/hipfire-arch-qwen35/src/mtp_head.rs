@@ -1023,6 +1023,32 @@ pub fn find_mtp_sidecar(trunk: &Path) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
+/// The MTP head's sizing facts from its metadata alone, without a GPU: the
+/// config with a KV cache of `max_seq` positions and the compressed draft
+/// vocabulary, exactly as [`load_mtp_head_at_offset`] derives them.
+/// `base_offset` is as there (0 for a standalone `.mtp` file).
+pub fn read_mtp_head_sizing(
+    path: &Path,
+    base_offset: u64,
+    max_seq: usize,
+) -> Result<(Qwen35MtpHeadConfig, Option<usize>), String> {
+    let hfq = HfqFile::open_at_offset(path, base_offset)
+        .map_err(|e| format!("open MTP head {} @ {base_offset}: {e}", path.display()))?;
+    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+        .map_err(|e| format!("MTP head {} metadata: {e}", path.display()))?;
+    let compressed = meta
+        .get("has_compressed_lm_head_draft")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        .then(|| meta.get("compressed_vocab_size").and_then(|v| v.as_u64()))
+        .flatten()
+        .map(|v| v as usize);
+    Ok((
+        Qwen35MtpHeadConfig::from_metadata(&meta, max_seq),
+        compressed,
+    ))
+}
+
 // ─── Loader ──────────────────────────────────────────────────────────────
 
 /// Load a `.mtp` file (arch_id = 21) created by `mtp_extract` (Task 8).

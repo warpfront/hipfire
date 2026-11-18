@@ -1339,10 +1339,6 @@ pub struct SourceAdmission {
     pub sequence: Option<SequenceResolution>,
     /// Why an automatic sequence bound retained legacy behavior.
     pub sequence_reason: Option<&'static str>,
-    /// True when the automatic legacy fallback defers measurement to the
-    /// carrier instead of taking the fixed 4096. Backend-gated, not OS-gated;
-    /// the daemon reports bound `legacy-fit` for these loads.
-    pub legacy_measured: bool,
     pub kv_backend_request: KvBackendRequest,
     pub qwen_default_q8: bool,
     /// Effective V axis ([`resolve_kv_v`]); the loader hands exactly this to
@@ -2195,8 +2191,9 @@ mod qwen35_projection_tests {
         // its own ring.
         assert_eq!(one, 404_750_336);
         assert_eq!(rings, 2 * 404_750_336);
-        assert_eq!(qwen35_checkpoint_ring_bytes(100, false), 100);
-        assert_eq!(qwen35_checkpoint_ring_bytes(100, true), 200);
+        use hipfire_arch_qwen35::footprint::checkpoint_ring_bytes;
+        assert_eq!(checkpoint_ring_bytes(100, false), 100);
+        assert_eq!(checkpoint_ring_bytes(100, true), 200);
     }
 
     #[test]
@@ -2278,23 +2275,7 @@ pub fn qwen35_dflash_side(
     hipfire_arch_qwen35::footprint::dflash_side_for_file(&config, draft, dflash_block, context_rows)
 }
 
-/// Bytes of the checkpoint rings one load can populate at once, from the
-/// charge of one snapshot (`DeltaNetSnapshot::device_charge_for`).
-///
-/// Each snapshot mirrors the DeltaNet state; only the first of a ring is
-/// charged. `take_dn_checkpoint` adds further ones (up to the cap,
-/// `HIPFIRE_CACHE_CKPT_MAX`) only from memory the admitted context does not
-/// need (`Gpu::kv_fit_floor`). Two rings can be live together: the AR prefill
-/// ring (`LoadedModel.prefill_checkpoints`, cap `ckpt_max()`) and, when a
-/// DFlash or native-MTP speculator is attached, that speculator's own ring
-/// (cap = the same `HIPFIRE_CACHE_CKPT_MAX` knob). `ckpt_max()`,
-/// `mtp_cache_policy().checkpoint_cap` and the DFlash builder all read that
-/// one knob with default 8 and floor 1, so a single `cap` serves every ring.
-pub fn qwen35_checkpoint_ring_bytes(snapshot_charge: usize, speculator_ring: bool) -> usize {
-    snapshot_charge.saturating_mul(1 + usize::from(speculator_ring))
-}
-
-/// [`qwen35_checkpoint_ring_bytes`] for the Qwen3.5 trunk `source`, from its
+/// [`hipfire_arch_qwen35::footprint::checkpoint_ring_bytes`] for the Qwen3.5 trunk `source`, from its
 /// config alone (the default Q8 + error-feedback state):
 /// `hipfire_arch_qwen35::footprint::dn_snapshot_device_charge`, which prices a
 /// snapshot as the one packed allocation the load makes (386 MiB on the 27B;
@@ -2308,7 +2289,7 @@ pub fn qwen35_checkpoint_rings_charge(
         &config,
     ))
     .map_err(|_| "DeltaNet snapshot sizing overflow".to_string())?;
-    Ok(qwen35_checkpoint_ring_bytes(snapshot, speculator_ring) as u64)
+    Ok(hipfire_arch_qwen35::footprint::checkpoint_ring_bytes(snapshot, speculator_ring) as u64)
 }
 
 /// Only Qwen's single-card cache has the matching VMM KV-row accounting.
@@ -2427,9 +2408,9 @@ pub fn qwen35_card_projection(
 /// against pre-teardown free VRAM misfires on serve model swaps (the
 /// resident model is still counted), so admission never refuses here — the
 /// Qwen35 carrier clamps to its post-weight card cap at the same site as
-/// the VMM bound, minus the legacy contiguity margin, and refuses below
-/// the 512 floor there. Returns `None` outside the admitted set (fixed
-/// 4096 survives there).
+/// the VMM bound, charging the per-request owners a legacy cache cannot give
+/// back, and refuses below the 512 floor there. Returns `None` outside the
+/// admitted set (fixed 4096 survives there).
 ///
 /// Backend-gated, not OS-gated: any load that resolves `KvBackend::Legacy`
 /// measures — explicit `--kv-backend legacy` on any OS, or automatic with a
@@ -3636,15 +3617,20 @@ pub fn admit_source_with_options(
     } else {
         None
     };
-    let (effective_seq, legacy_measured): (usize, bool) = match &sequence {
-        Some(resolved) => (
-            resolved.max_seq,
-            resolved.bound == "pending" && kv_backend == KvBackend::Legacy,
-        ),
-        None if max_seq != 0 => (max_seq, false),
-        None if pinned_moe => (32768, false),
-        None => (4096, false),
-    };
+    let effective_seq = sequence.as_ref().map_or_else(
+        || {
+            if max_seq == 0 {
+                if pinned_moe {
+                    32768
+                } else {
+                    4096
+                }
+            } else {
+                max_seq
+            }
+        },
+        |resolved| resolved.max_seq,
+    );
     let sequence_reason = match (max_seq, pinned_moe) {
         (0, true) => {
             Some("max_seq auto-capacity unsupported for MoE on a discrete GPU; using prior default")
@@ -3903,7 +3889,6 @@ pub fn admit_source_with_options(
         max_seq: effective_seq,
         sequence,
         sequence_reason,
-        legacy_measured,
         kv_backend_request: request,
         qwen_default_q8: hints.qwen_default_q8,
         kv_v,
@@ -5898,7 +5883,6 @@ mod tests {
                 let admitted =
                     admit_legacy(&trunk, 0, Some(24 << 30)).expect("legacy automatic must admit");
                 assert_eq!(admitted.kv_backend, KvBackend::Legacy);
-                assert!(admitted.legacy_measured, "deferred, not fixed");
                 // 24 GiB free dwarfs the tiny trunk, but admission resolves
                 // the trained window regardless of the free figure; the
                 // carrier clamps it post-weight.
@@ -5915,10 +5899,10 @@ mod tests {
                 // A free budget the old pre-teardown projection refused (room
                 // for far fewer than 512 tokens past every projected owner):
                 // admission still resolves the trained window; the carrier
-                // refuses post-weight if the margin really does not fit.
+                // refuses post-weight if the card really does not hold it.
                 let admitted =
                     admit_legacy(&trunk, 0, Some(256 << 20)).expect("no pre-teardown refusal");
-                assert!(admitted.legacy_measured);
+                assert_eq!(admitted.sequence.map(|s| s.bound), Some("pending"));
                 assert_eq!(admitted.max_seq, 131072);
                 cleanup(&trunk);
             }
@@ -5929,7 +5913,6 @@ mod tests {
                 let admitted =
                     admit_legacy(&trunk, 0, None).expect("no measurement must still load");
                 assert_eq!(admitted.max_seq, 131072);
-                assert!(admitted.legacy_measured);
                 assert!(admitted.sequence.is_some());
                 cleanup(&trunk);
             }
@@ -5940,7 +5923,7 @@ mod tests {
                 let admitted =
                     admit_legacy(&trunk, 8192, Some(24 << 30)).expect("explicit must admit");
                 assert_eq!(admitted.max_seq, 8192);
-                assert!(!admitted.legacy_measured);
+                assert!(admitted.sequence.is_none());
                 cleanup(&trunk);
             }
 
@@ -5959,7 +5942,7 @@ mod tests {
                 let admitted =
                     admit_legacy(&path, 0, Some(24 << 30)).expect("MoE legacy automatic must load");
                 assert_eq!(admitted.max_seq, 4096);
-                assert!(!admitted.legacy_measured);
+                assert!(admitted.sequence.is_none());
                 cleanup(&path);
             }
         }

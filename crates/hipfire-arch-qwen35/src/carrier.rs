@@ -64,29 +64,108 @@ pub(crate) fn mtp_head_file_reserve_bytes(path: &std::path::Path) -> u64 {
     mtp_head_reserve_for_bytes(meta.len())
 }
 
-/// Legacy KV contiguity margin: the legacy backend allocates the full admitted
-/// context contiguously at load while VMM grows on demand, so the post-weight
-/// free figure overstates what one allocation can take. Start 512 MiB; tune
-/// from the live test.
-const QWEN35_LEGACY_CONTIGUITY_MARGIN_BYTES: usize = 512 << 20;
-
-/// Post-weight legacy card cap: the VMM bound's parts (free after weights,
-/// minimum prefill, vision reserve, page rounding, draft reserve) minus the
-/// single-allocation contiguity margin. Pure for testing; the carrier charges
-/// the same draft/vision reserves the admission projection omits.
-fn legacy_card_cap(
+/// The parts of the post-weight card cap, measured after the weights load.
+#[derive(Clone, Copy, Debug)]
+struct CardCapParts {
+    /// Planned free VRAM after the weights.
     free: usize,
+    /// Minimum prefill reservation.
     minimum: usize,
+    /// Vision reserve.
     reserve: usize,
-    draft_reserve: u64,
+    /// Draft (DFlash / MTP head) device reserve.
+    draft_reserve: usize,
+    /// DeltaNet state and stream carry.
+    state: usize,
+    /// KV bytes per token.
     stride: usize,
-) -> usize {
-    free.saturating_sub(minimum)
-        .saturating_sub(reserve)
-        .saturating_sub(128 << 20)
-        .saturating_sub(usize::try_from(draft_reserve).unwrap_or(usize::MAX))
-        .saturating_sub(QWEN35_LEGACY_CONTIGUITY_MARGIN_BYTES)
-        / stride
+    /// Flash-attention partials per token of capacity.
+    partials: usize,
+}
+
+/// What a legacy-KV load must also leave free. A VMM load re-measures after
+/// the full load and lowers its context to leave room for the owners a
+/// request creates lazily (the loader's `Qwen35LazyCharges`); a legacy cache
+/// is allocated whole at load and cannot shrink, so the carrier charges them
+/// up front: the DeltaNet checkpoint rings and, when the native-MTP
+/// speculator attaches, its request state and prompt-fill transient, part of
+/// which (the head's KV cache) grows per token. Zero for VMM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LegacyKvCharge {
+    fixed: usize,
+    per_token: usize,
+}
+
+impl CardCapParts {
+    /// The one card-cap expression both KV backends size against: free after
+    /// weights less every owner still to come, over the per-token cost.
+    fn card_cap(&self, legacy: LegacyKvCharge) -> usize {
+        self.free
+            .saturating_sub(self.minimum)
+            .saturating_sub(self.reserve)
+            .saturating_sub(128 << 20)
+            .saturating_sub(self.draft_reserve)
+            .saturating_sub(self.state)
+            .saturating_sub(legacy.fixed)
+            / (self.stride + self.partials + legacy.per_token)
+    }
+}
+
+/// [`LegacyKvCharge`] for this load, from the trunk config and the MTP head's
+/// metadata. The MTP charge mirrors the loader's (`mtp_request_bytes`), taking
+/// the batched prompt fill (the larger) since the head's dtypes are not known
+/// before it loads; its per-token part is the growth up to `model_ctx`.
+fn legacy_kv_charge(
+    trunk: &std::path::Path,
+    ctx: &LoadCtx,
+    config: &Qwen35Config,
+    model_ctx: usize,
+) -> Result<LegacyKvCharge, String> {
+    let snapshot = usize::try_from(crate::footprint::dn_snapshot_device_charge(config))
+        .map_err(|_| "DeltaNet snapshot sizing overflow".to_string())?;
+    // The MTP head attaches only when no DFlash draft takes the speculator
+    // slot (the loader's `build_speculator` order).
+    let mtp_head = if ctx.draft_path.is_none() && mtp_head_reserved(ctx.spec.mtp) {
+        match ctx.mtp_path.clone() {
+            Some(path) => Some((path, 0)),
+            None => match crate::mtp_head::detect_bundled_mtp_offset(trunk) {
+                Ok(Some(offset)) => Some((trunk.to_path_buf(), offset)),
+                _ => crate::mtp_head::find_mtp_sidecar(trunk).map(|path| (path, 0)),
+            },
+        }
+    } else {
+        None
+    };
+    let rings = crate::footprint::checkpoint_ring_bytes(
+        snapshot,
+        ctx.draft_path.is_some() || mtp_head.is_some(),
+    );
+    let Some((path, offset)) = mtp_head else {
+        return Ok(LegacyKvCharge {
+            fixed: rings,
+            per_token: 0,
+        });
+    };
+    let requested_k = crate::mtp_speculator::mtp_requested_k(&ctx.spec);
+    let model_ctx = model_ctx.max(1);
+    let mtp_at = |positions: usize| -> Result<usize, String> {
+        let (head, compressed) = crate::mtp_head::read_mtp_head_sizing(&path, offset, positions)?;
+        crate::mtp_spec::mtp_request_bytes(
+            &*ctx.gpu,
+            config,
+            snapshot,
+            &head,
+            compressed,
+            true,
+            requested_k,
+        )
+    };
+    let fixed = mtp_at(0)?;
+    let grown = mtp_at(model_ctx)?;
+    Ok(LegacyKvCharge {
+        fixed: rings.saturating_add(fixed),
+        per_token: grown.saturating_sub(fixed).div_ceil(model_ctx),
+    })
 }
 
 /// The `mtp_head_file_reserve_bytes` formula for a known byte count. Split out
@@ -596,13 +675,12 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     // expanded tensors) already own VRAM, while KV and lazy PBS do not.
     if let Some(mut sequence) = ctx.sequence {
         let reserve = sequence.reserve_bytes;
-        let capacity = (|| -> Result<(usize, usize, usize, usize, u64, usize, usize), String> {
+        let capacity = (|| -> Result<CardCapParts, String> {
             let planned = ctx
                 .gpu
                 .planned_capacity()
                 .map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
             eprintln!("qwen35: admission decision: max_seq/KV budget capacity from {planned}");
-            let free = planned.bytes;
             let minimum =
                 crate::qwen35::prefill::minimum_prefill_reservation_bytes(&config, &ctx.gpu.arch)
                     .ok_or("Qwen minimum PBS sizing overflow")?;
@@ -612,60 +690,58 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
                 plan.adaptive.is_some(),
             )
             .ok_or("Qwen KV stride overflow")?;
-            let draft_reserve = load_draft_reserve_bytes(hfq.path(), ctx, &config);
             // Owners still to be allocated after the weights: the DeltaNet
             // state and stream carry, and the flash-attention partials, whose
             // size follows this very capacity (they are sized from the
             // provisional context), so they ride on every token's cost.
-            let state = usize::try_from(crate::footprint::dn_state_device_charge(&config))
-                .unwrap_or(usize::MAX);
-            let partials = crate::footprint::flash_partials_bytes_per_token(&config);
-            let card_cap = free
-                .saturating_sub(minimum)
-                .saturating_sub(reserve)
-                .saturating_sub(128 << 20)
-                .saturating_sub(usize::try_from(draft_reserve).unwrap_or(usize::MAX))
-                .saturating_sub(state)
-                / (stride + partials);
-            Ok((
-                free,
+            Ok(CardCapParts {
+                free: planned.bytes,
                 minimum,
+                reserve,
+                draft_reserve: usize::try_from(load_draft_reserve_bytes(hfq.path(), ctx, &config))
+                    .unwrap_or(usize::MAX),
+                state: usize::try_from(crate::footprint::dn_state_device_charge(&config))
+                    .unwrap_or(usize::MAX),
                 stride,
-                card_cap,
-                draft_reserve,
-                state,
-                partials,
-            ))
+                partials: crate::footprint::flash_partials_bytes_per_token(&config),
+            })
         })();
-        let (free, minimum, stride, mut card_cap, draft_reserve, state, partials) = match capacity {
+        let legacy = ctx.kv_backend == KvBackend::Legacy;
+        let capacity = capacity.and_then(|parts| {
+            let charge = if legacy {
+                legacy_kv_charge(hfq.path(), ctx, &config, sequence.model_ctx)?
+            } else {
+                LegacyKvCharge::default()
+            };
+            Ok((parts, charge))
+        });
+        let (parts, legacy_charge) = match capacity {
             Ok(v) => v,
             Err(e) => {
                 weights.free_gpu(ctx.gpu);
                 return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
             }
         };
+        let card_cap = parts.card_cap(legacy_charge);
         eprintln!(
-            "max_seq budget: free_after_weights={free} min_prefill={minimum} vision_reserve={reserve} draft_reserve={draft_reserve} dn_state={state} page_rounding={} kv_bytes_per_token={stride} flash_partials_bytes_per_token={partials}",
+            "max_seq budget: free_after_weights={} min_prefill={} vision_reserve={} draft_reserve={} dn_state={} page_rounding={} legacy_lazy={} kv_bytes_per_token={} flash_partials_bytes_per_token={} legacy_lazy_per_token={}",
+            parts.free,
+            parts.minimum,
+            parts.reserve,
+            parts.draft_reserve,
+            parts.state,
             128 << 20,
+            legacy_charge.fixed,
+            parts.stride,
+            parts.partials,
+            legacy_charge.per_token,
         );
         if sequence.automatic {
-            // Deferred legacy fit charges the contiguity margin on top of
-            // the VMM parts (vision and draft reserves included); admission
-            // deliberately did not refuse on the pre-teardown figure, so
-            // this post-weight cap is the effective bound.
-            let legacy = ctx.kv_backend == KvBackend::Legacy;
-            if legacy {
-                card_cap = legacy_card_cap(free, minimum, reserve, draft_reserve, stride);
-            }
             if card_cap < 512 {
+                let backend = if legacy { "legacy" } else { "VMM" };
                 weights.free_gpu(ctx.gpu);
                 return Err(release_after_failed_load(
-                    if legacy {
-                        "Qwen legacy load refused: measured post-weight VRAM cannot hold minimum PBS and KV"
-                    } else {
-                        "Qwen VMM load refused: measured post-weight VRAM cannot hold minimum PBS and KV"
-                    }
-                    .into(),
+                    format!("Qwen {backend} load refused: measured post-weight VRAM cannot hold minimum PBS and KV"),
                     weight_lease.take(),
                     ctx.gpu,
                 ));
@@ -1753,46 +1829,57 @@ mod tests {
         );
     }
 
+    /// The one post-weight card-cap expression: every part charged exactly,
+    /// the legacy-only term on top of the VMM cap, the 512 floor boundary,
+    /// and saturation. Pure (no GPU): the carrier calls it with the measured
+    /// post-weight parts for both backends.
     #[test]
-    /// Post-weight legacy card cap: exact fit, margin, floor, and the
-    /// draft/vision charges. Pure (no GPU): the carrier calls it with the
-    /// measured post-weight parts.
-    fn legacy_card_cap_charges_every_part_and_floors() {
-        // Exact fit: free minus every part, over the stride.
+    fn card_cap_charges_every_part_and_the_legacy_term() {
         // parts: minimum 1 GiB, reserve 2 GiB, page 128 MiB, draft 3 GiB,
-        // margin 512 MiB; stride 1 MiB/token; room for exactly 9000 tokens.
-        let free =
-            (1 << 30) + (2 << 30) + (128 << 20) + (3 << 30) + (512 << 20) + 9_000 * (1 << 20);
-        assert_eq!(
-            legacy_card_cap(free, 1 << 30, 2 << 30, 3 << 30, 1 << 20),
-            9_000
-        );
-        // Removing the draft reserve costs exactly its tokens.
-        assert_eq!(
-            legacy_card_cap(free, 1 << 30, 2 << 30, 0, 1 << 20),
-            9_000 + 3 * 1024
-        );
-        // Removing the vision reserve costs exactly its tokens.
-        assert_eq!(
-            legacy_card_cap(free, 1 << 30, 0, 3 << 30, 1 << 20),
-            9_000 + 2 * 1024
-        );
-        // The margin is charged: without it the cap would be 512 higher.
-        let room_no_margin = free - (1 << 30) - (2 << 30) - (128 << 20) - (3 << 30);
-        assert_eq!(room_no_margin / (1 << 20) - 9_000, 512);
+        // state 256 MiB; stride 1 MiB/token with 0.5 MiB of partials;
+        // room for exactly 9000 tokens.
+        let fixed = (1 << 30) + (2 << 30) + (128 << 20) + (3 << 30) + (256 << 20);
+        let per_token = (1 << 20) + (512 << 10);
+        let parts = |free| CardCapParts {
+            free,
+            minimum: 1 << 30,
+            reserve: 2 << 30,
+            draft_reserve: 3 << 30,
+            state: 256 << 20,
+            stride: 1 << 20,
+            partials: 512 << 10,
+        };
+        let vmm = LegacyKvCharge::default();
+        let free = fixed + 9_000 * per_token;
+        assert_eq!(parts(free).card_cap(vmm), 9_000);
+        // Each part costs exactly its tokens.
+        let without_draft = CardCapParts {
+            draft_reserve: 0,
+            ..parts(free)
+        };
+        assert_eq!(without_draft.card_cap(vmm), 9_000 + (3 << 30) / per_token);
+        let without_state = CardCapParts {
+            state: 0,
+            ..parts(free)
+        };
+        assert_eq!(without_state.card_cap(vmm), 9_000 + (256 << 20) / per_token);
+        // Legacy: checkpoint rings (fixed) and an MTP head KV (per token)
+        // charged on top of the very same parts.
+        let legacy = LegacyKvCharge {
+            fixed: 1_500 * per_token,
+            per_token: 0,
+        };
+        assert_eq!(parts(free).card_cap(legacy), 7_500);
+        let legacy = LegacyKvCharge {
+            fixed: 0,
+            per_token: per_token / 2,
+        };
+        assert_eq!(parts(free).card_cap(legacy), 6_000);
         // Floor boundary, pinned exactly: 511 refuses, 512 admits.
-        let tight = (1 << 30) + (2 << 30) + (128 << 20) + (3 << 30) + (512 << 20) + 511 * (1 << 20);
-        assert_eq!(
-            legacy_card_cap(tight, 1 << 30, 2 << 30, 3 << 30, 1 << 20),
-            511
-        );
-        let fits = tight + (1 << 20);
-        assert_eq!(
-            legacy_card_cap(fits, 1 << 30, 2 << 30, 3 << 30, 1 << 20),
-            512
-        );
+        assert_eq!(parts(fixed + 511 * per_token).card_cap(vmm), 511);
+        assert_eq!(parts(fixed + 512 * per_token).card_cap(vmm), 512);
         // Zero free saturates, never underflows.
-        assert_eq!(legacy_card_cap(0, 1 << 30, 2 << 30, 3 << 30, 1 << 20), 0);
+        assert_eq!(parts(0).card_cap(legacy), 0);
     }
 
     #[test]

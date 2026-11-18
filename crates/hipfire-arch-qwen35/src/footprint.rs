@@ -203,6 +203,23 @@ pub fn dn_snapshot_device_charge(config: &Qwen35Config) -> u64 {
     ))
 }
 
+/// Bytes of the checkpoint rings one load can populate at once, from the
+/// charge of one snapshot ([`dn_snapshot_device_charge`] before the load,
+/// `DeltaNetSnapshot::device_charge_for` after it).
+///
+/// Each snapshot mirrors the DeltaNet state; only the first of a ring is
+/// charged. `take_dn_checkpoint` adds further ones (up to the cap,
+/// `HIPFIRE_CACHE_CKPT_MAX`) only from memory the admitted context does not
+/// need (`Gpu::kv_fit_floor`). Two rings can be live together: the AR prefill
+/// ring (`LoadedModel.prefill_checkpoints`, cap `ckpt_max()`) and, when a
+/// DFlash or native-MTP speculator is attached, that speculator's own ring
+/// (cap = the same `HIPFIRE_CACHE_CKPT_MAX` knob). `ckpt_max()`,
+/// `mtp_cache_policy().checkpoint_cap` and the DFlash builder all read that
+/// one knob with default 8 and floor 1, so a single `cap` serves every ring.
+pub fn checkpoint_ring_bytes(snapshot_charge: usize, speculator_ring: bool) -> usize {
+    snapshot_charge.saturating_mul(1 + usize::from(speculator_ring))
+}
+
 /// Device bytes of the resident DeltaNet state of the default load: the
 /// recurrent state and canonical stream carry (the same tensors a snapshot
 /// mirrors) plus the stream binding's edge workspace

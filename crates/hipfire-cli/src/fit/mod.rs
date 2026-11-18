@@ -810,10 +810,33 @@ fn analyze_model(
             }
         }
         EffectiveTopology::Single if matches!(admitted.arch_id, 5 | 6) => {
-            match admitted.sequence.as_ref().and_then(|s| s.projection) {
-                // The projection admission itself refused on: the load's own
-                // context check, so its verdict is the fit verdict.
-                Some(projection) => {
+            // Automatic legacy KV: admission defers the context to the
+            // carrier, which clamps it after the weights load with the same
+            // terms this projection charges (the checkpoint rings and any
+            // paired draft come off free above), so the projection is the
+            // load's verdict, as for VMM.
+            let deferred_legacy = admitted.kv_backend
+                == hipfire_runtime::kv_backend::KvBackend::Legacy
+                && admitted
+                    .sequence
+                    .as_ref()
+                    .is_some_and(|s| s.projection.is_none() && s.bound == "pending");
+            let stored = admitted.sequence.as_ref().and_then(|s| s.projection);
+            let projection = match stored {
+                Some(projection) => Ok(Some(projection)),
+                None if deferred_legacy => hipfire_loader::admission::qwen35_card_projection(
+                    &admitted.source,
+                    &device.arch,
+                    inputs.hints(device),
+                )
+                .map(Some),
+                None => Ok(None),
+            };
+            match projection {
+                // The projection admission itself refused on (or, for
+                // deferred legacy, the one the carrier clamps with): the
+                // load's own context check, so its verdict is the fit verdict.
+                Ok(Some(projection)) => {
                     let automatic = inputs.max_seq == 0;
                     let gpus = visible_gpu_capacities(&admitted.source, &inputs, machine);
                     let best = capacity::best_gpu(&gpus);
@@ -828,6 +851,15 @@ fn analyze_model(
                         device,
                         better,
                     ));
+                    if deferred_legacy {
+                        plan.max_seq = projection.card_cap.min(projection.model_ctx);
+                        plan.bound = if projection.card_cap < projection.model_ctx {
+                            "card"
+                        } else {
+                            "model"
+                        }
+                        .into();
+                    }
                     plan.model_ctx = Some(projection.model_ctx);
                     plan.projection = Some(projection_json(projection));
                     if machine.devices.len() > 1 {
@@ -835,11 +867,17 @@ fn analyze_model(
                     }
                     plan.gpus = gpus;
                 }
-                // No stored projection (MoE on a discrete GPU, or legacy KV):
-                // the daemon does not check this context before load, so fit
-                // cannot decide it. The VMM projection is advisory only and
-                // never replaces the plan's resolved KV mode.
-                None => {
+                Err(error) => result.findings.push(unchecked_context_finding(
+                    Err(error),
+                    admitted.max_seq,
+                    "legacy KV backend",
+                )),
+                // No stored projection (MoE on a discrete GPU, or legacy KV
+                // with a fixed context): the daemon does not check this
+                // context before load, so fit cannot decide it. The VMM
+                // projection is advisory only and never replaces the plan's
+                // resolved KV mode.
+                Ok(None) => {
                     let projection = hipfire_loader::admission::qwen35_card_projection(
                         &admitted.source,
                         &device.arch,

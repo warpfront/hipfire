@@ -2312,7 +2312,8 @@ struct Qwen35LazyCharges {
 /// ([`DeltaNetSnapshot::device_charge_for`]: every allocation ROCr-rounded),
 /// not at the raw bytes of the state it mirrors: a 27B snapshot of 386 MiB
 /// takes 530 MiB. The ring multiplier is
-/// [`admission::qwen35_checkpoint_ring_bytes`], shared with `hipfire fit`.
+/// [`hipfire_arch_qwen35::footprint::checkpoint_ring_bytes`], shared with
+/// `hipfire fit` and the carrier's legacy charge.
 fn qwen35_lazy_charges(
     config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     dn_state: &hipfire_arch_qwen35::qwen35::DeltaNetState,
@@ -2322,32 +2323,19 @@ fn qwen35_lazy_charges(
 ) -> Result<Qwen35LazyCharges, String> {
     let snapshot_bytes = usize::try_from(DeltaNetSnapshot::device_charge_for(dn_state))
         .map_err(|_| "DeltaNet snapshot sizing overflow".to_string())?;
-    let checkpoints = admission::qwen35_checkpoint_ring_bytes(snapshot_bytes, speculator_ring);
+    let checkpoints =
+        hipfire_arch_qwen35::footprint::checkpoint_ring_bytes(snapshot_bytes, speculator_ring);
     let mtp = match mtp {
         None => 0,
-        Some((head, requested_k)) => {
-            use hipfire_arch_qwen35::mtp_spec::{
-                mtp_head_fills_batched, mtp_prompt_fill_requested_bytes, MtpSpecState,
-            };
-            let max_n = hipfire_arch_qwen35::mtp_speculator::mtp_drafter_max_n(requested_k);
-            let verify_capacity = hipfire_arch_qwen35::mtp_speculator::mtp_verify_capacity(max_n);
-            let state = MtpSpecState::requested_bytes(
-                &gpu.arch,
-                config,
-                snapshot_bytes,
-                &head.config,
-                head.weights.compressed_vocab_size,
-                max_n,
-                verify_capacity,
-            )?;
-            let fill = mtp_prompt_fill_requested_bytes(
-                config,
-                &head.config,
-                mtp_head_fills_batched(head),
-                hipfire_arch_qwen35::qwen35::prefill_max_batch(gpu),
-            );
-            state.saturating_add(fill)
-        }
+        Some((head, requested_k)) => hipfire_arch_qwen35::mtp_spec::mtp_request_bytes(
+            gpu,
+            config,
+            snapshot_bytes,
+            &head.config,
+            head.weights.compressed_vocab_size,
+            hipfire_arch_qwen35::mtp_spec::mtp_head_fills_batched(head),
+            requested_k,
+        )?,
     };
     Ok(Qwen35LazyCharges { checkpoints, mtp })
 }
@@ -3018,8 +3006,12 @@ fn finish_qwen35_load(
         let speculator_ring =
             spec_slot_free && (dflash.is_some() || (mtp_attaches && mtp.is_some()));
         let mtp_sizing = if mtp_attaches && matches!(arch_id, 5 | 6) {
-            mtp.as_ref()
-                .map(|head| (head, crate::spec_build::mtp_requested_k(&ctx.spec)))
+            mtp.as_ref().map(|head| {
+                (
+                    head,
+                    hipfire_arch_qwen35::mtp_speculator::mtp_requested_k(&ctx.spec),
+                )
+            })
         } else {
             None
         };

@@ -68,6 +68,18 @@ pub fn mtp_drafter_max_n(requested: usize) -> usize {
     requested.clamp(1, 8)
 }
 
+/// MTP chain depth requested by the load policy (before the drafter's own
+/// 1..=8 clamp): `spec.mtp_k`, else the process default, clamped to 1..=10.
+pub fn mtp_requested_k(spec: &hipfire_runtime::loader_api::SpecLoadCfg) -> usize {
+    spec.mtp_k
+        .unwrap_or(
+            hipfire_runtime::config::get()
+                .mtp_k
+                .unwrap_or(hipfire_config::MTP_K_DEFAULT),
+        )
+        .clamp(1, 10)
+}
+
 /// qwen35 MTP drafter. `state` is allocated on the first `mtp_prefill` (it needs
 /// `&mut Gpu` + the concrete `ModelSlot`, neither available at load-time
 /// construction). Sampling is installed once per request via

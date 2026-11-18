@@ -3400,6 +3400,42 @@ pub fn mtp_prompt_fill_requested_bytes(
         )
 }
 
+/// Device bytes the native-MTP speculator allocates per request after the
+/// load, which a filled context must still find room for: the
+/// [`MtpSpecState`] of the first request plus its prompt-fill transient
+/// ([`mtp_prompt_fill_requested_bytes`]). `requested_k` is the load policy's
+/// chain depth ([`crate::mtp_speculator::mtp_requested_k`]). The loader's
+/// post-load fit charges it for the attached head; the carrier charges it
+/// before a legacy KV allocation from the head file's metadata.
+pub fn mtp_request_bytes(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    trunk_snapshot_bytes: usize,
+    head_config: &mtp_head::Qwen35MtpHeadConfig,
+    compressed_vocab: Option<usize>,
+    fills_batched: bool,
+    requested_k: usize,
+) -> Result<usize, String> {
+    let max_n = crate::mtp_speculator::mtp_drafter_max_n(requested_k);
+    let verify_capacity = crate::mtp_speculator::mtp_verify_capacity(max_n);
+    let state = MtpSpecState::requested_bytes(
+        &gpu.arch,
+        config,
+        trunk_snapshot_bytes,
+        head_config,
+        compressed_vocab,
+        max_n,
+        verify_capacity,
+    )?;
+    let fill = mtp_prompt_fill_requested_bytes(
+        config,
+        head_config,
+        fills_batched,
+        crate::qwen35::prefill_max_batch(gpu),
+    );
+    Ok(state.saturating_add(fill))
+}
+
 #[cfg(test)]
 mod lazy_state_bytes_tests {
     use super::*;
