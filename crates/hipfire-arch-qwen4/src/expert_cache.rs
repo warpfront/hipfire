@@ -74,8 +74,8 @@ use hipfire_dispatch::families::moe::{
 };
 use hipfire_runtime::expert_cache::{
     BundleSource, CacheStats, CancelOutcome, ConsumerId, CopyDevice, DeviceIo, ExpertCachePolicy,
-    ExpertCatalog, ExpertKey, FillOp, HipCopyBackend, HostRange, IoError, PolicyConfig, PoolConfig,
-    PoolDest, PoolId, PoolInit, Rejected, Segment, WindowConsumerPhase, WindowUse,
+    ExpertCatalog, ExpertKey, HipCopyBackend, HostRange, PolicyConfig, PoolConfig, PoolDest,
+    PoolId, PoolInit, Segment, WindowConsumerPhase, WindowUse,
 };
 use railgun::sealed_table::generation::{
     BlockRegistry, Expert, FenceBackend, FenceFailure, FenceState, SlotSpan,
@@ -83,7 +83,6 @@ use railgun::sealed_table::generation::{
 use railgun::window::Quiescence;
 use railgun::Binding;
 use rdna_compute::Gpu;
-use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -546,63 +545,44 @@ fn unknown(message: impl std::fmt::Display) -> FenceFailure {
     }
 }
 
-/// A copy backend whose fills can record their events without copying: the initial warm seed
-/// names donor bytes the artifact already placed, so it must not move them again.
-struct SeedCopy<B: CopyDevice> {
-    inner: B,
-    /// While set, a fill records its event but copies nothing. Seeds always set it: a restore's
-    /// bytes move in one bulk copy per pool hull issued before the seed (`restore_hulls`).
-    skip_copies: Cell<bool>,
+/// The shared core's HIP copy backend.
+type QwenCopy = HipCopyBackend<Arc<HipRuntime>>;
+
+/// The copy fence of a warm seed: the seed moves no byte of its own (the donors hold their
+/// experts already, or a restore's bulk copies were enqueued first), so every pool's batch
+/// records copy event 0 behind everything on the copy stream and one synchronize covers them
+/// all. Only valid while the io has no fill in flight, so event 0 is free.
+struct SeedFence<'a, B: CopyDevice> {
+    copy: &'a B,
+    recorded: u64,
+    synced: bool,
 }
-
-/// The shared core's HIP copy backend with the seed switch.
-type QwenCopy = SeedCopy<HipCopyBackend<Arc<HipRuntime>>>;
-
-impl<B: CopyDevice> SeedCopy<B> {
-    fn new(inner: B) -> Self {
-        Self {
-            inner,
-            skip_copies: Cell::new(false),
-        }
-    }
-    fn set_skip_copies(&self, skip: bool) {
-        self.skip_copies.set(skip);
-    }
-    /// One copy past the seed switch: a restore rewrites a whole pool hull at once.
-    fn enqueue_bulk(&self, pool: PoolId, dst: u64, src: HostRange) -> Result<()> {
-        self.inner.enqueue_copy(pool, dst, src).map_err(Into::into)
-    }
-}
-
-impl<B: CopyDevice> CopyDevice for SeedCopy<B> {
+// SAFETY: record marks event 0 after every copy enqueued so far on the copy stream; a
+// successful synchronize of it covers all of them. Seed batches enqueue nothing themselves.
+unsafe impl<B: CopyDevice> FenceBackend for SeedFence<'_, B> {
     fn incarnation(&self) -> u64 {
-        self.inner.incarnation()
+        self.copy.incarnation()
     }
-    fn events(&self) -> usize {
-        self.inner.events()
+    fn record(&mut self) -> std::result::Result<u64, FenceFailure> {
+        self.copy.record(0).map_err(unknown)?;
+        self.recorded += 1;
+        self.synced = false;
+        Ok(self.recorded)
     }
-    fn enqueue_copy(
-        &self,
-        pool: PoolId,
-        dst: u64,
-        src: HostRange,
-    ) -> std::result::Result<(), String> {
-        if self.skip_copies.get() {
-            return Ok(());
+    fn poll(&mut self, _: u64) -> FenceState {
+        FenceState::Pending
+    }
+    fn wait(&mut self, fence: u64) -> FenceState {
+        if fence == 0 || fence > self.recorded {
+            return FenceState::Failed(unknown("seed copy fence missing"));
         }
-        self.inner.enqueue_copy(pool, dst, src)
-    }
-    fn record(&self, event: usize) -> std::result::Result<(), String> {
-        self.inner.record(event)
-    }
-    fn query(&self, event: usize) -> std::result::Result<bool, String> {
-        self.inner.query(event)
-    }
-    fn synchronize(&self, event: usize) -> std::result::Result<(), String> {
-        self.inner.synchronize(event)
-    }
-    fn quarantine(&self) {
-        self.inner.quarantine()
+        if !self.synced {
+            if let Err(e) = self.copy.synchronize(0) {
+                return FenceState::Failed(unknown(e));
+            }
+            self.synced = true;
+        }
+        FenceState::Complete
     }
 }
 
@@ -696,8 +676,6 @@ pub(crate) struct ExpertCache {
     donor_device: (usize, usize),
     mirror_cpu: (usize, usize),
     restore_epoch: u64,
-    /// Bytes the warm seeds (not fills) moved through the io.
-    seed_bytes: u64,
     dirty: bool,
     poisoned: Option<String>,
     outstanding: Arc<AtomicBool>,
@@ -745,7 +723,7 @@ fn restore_hulls<B: CopyDevice>(
     layout: &Layout,
     donor_device: (usize, usize),
     mirror_cpu: (usize, usize),
-    engine: &Engine<SeedCopy<B>>,
+    copy: &B,
 ) -> Result<()> {
     for (index, pool) in layout.pools.iter().enumerate() {
         let (base, bytes) = pool.block;
@@ -759,40 +737,53 @@ fn restore_hulls<B: CopyDevice>(
             .ok_or("expert cache pool hull leaves the donor tail")?;
         // SAFETY: the lease retains the pinned mirror, which nothing writes, past every copy.
         let src = unsafe { HostRange::new(mirror_cpu.0 + offset, bytes) };
-        engine
-            .io
-            .backend()
-            .enqueue_bulk(PoolId(index as u16), base as u64, src)?;
+        copy.enqueue_copy(PoolId(index as u16), base as u64, src)?;
     }
     Ok(())
 }
 
-/// Issue every seed fill (one event each, waiting for events when the pool runs out), then wait
-/// for all of them: the completion tokens are in the policy, staged by the next plan.
-fn issue_seed<B: CopyDevice>(layout: &Layout, engine: &mut Engine<B>) -> Result<()> {
-    let ops: Vec<FillOp> = engine.policy.take_fills().collect();
-    for mut op in ops {
-        loop {
-            match engine.io.issue(&mut engine.policy, op, layout) {
-                Ok(()) => break,
-                Err(Rejected {
-                    error: IoError::EventPoolExhausted { .. },
-                    op: Some(back),
-                }) => {
-                    engine
-                        .io
-                        .poll(&mut engine.policy, true)
-                        .map_err(|e| fail("seed wait", e))?;
-                    op = back;
-                }
-                Err(Rejected { error: cause, .. }) => return Err(fail("seed fill", cause)),
-            }
+/// Issue every seed fill as one batch per pool behind a single copy fence (`SeedFence`), then
+/// wait for all of them: the completion tokens are in the policy, staged by the next plan.
+fn issue_seed<B: CopyDevice>(engine: &mut Engine<B>) -> Result<()> {
+    if engine.io.in_flight() != 0 {
+        return Err("expert cache seed needs an idle copy engine".into());
+    }
+    let mut tickets: Vec<Vec<_>> = (0..engine.policy.pools()).map(|_| Vec::new()).collect();
+    for op in engine.policy.take_fills() {
+        tickets[usize::from(op.pool.0)].push(op.ticket);
+    }
+    let mut fence = SeedFence {
+        copy: engine.io.backend(),
+        recorded: 0,
+        synced: false,
+    };
+    let mut batches = Vec::with_capacity(tickets.len());
+    for (index, tickets) in tickets.into_iter().enumerate() {
+        if tickets.is_empty() {
+            continue;
+        }
+        let pool = PoolId(index as u16);
+        let batch = engine
+            .policy
+            .issue_fills(pool, tickets, &mut fence, &mut |_| Ok(()))
+            .map_err(|(back, failure)| {
+                engine.policy.abandon_fills(pool, back);
+                fail("seed fill", failure.message)
+            })?;
+        batches.push((pool, batch));
+    }
+    for (pool, batch) in batches {
+        let done = engine
+            .policy
+            .complete_fills(pool, batch, &mut fence, true)
+            .map_err(|_| "expert cache seed fence did not complete")?;
+        for token in done {
+            engine
+                .policy
+                .deliver_completion(pool, token)
+                .map_err(|e| fail("seed completion", e))?;
         }
     }
-    engine
-        .io
-        .poll(&mut engine.policy, true)
-        .map_err(|e| fail("seed wait", e))?;
     Ok(())
 }
 
@@ -951,7 +942,7 @@ impl ExpertCache {
             .collect();
         let backend =
             HipCopyBackend::new(hip.clone(), dests, events).map_err(|e| fail("copy backend", e))?;
-        let io = DeviceIo::new(SeedCopy::new(backend)).map_err(|e| fail("device io", e))?;
+        let io = DeviceIo::new(backend).map_err(|e| fail("device io", e))?;
         let mut cache = Self {
             hip,
             device_id: gpu.device_id,
@@ -964,7 +955,6 @@ impl ExpertCache {
             donor_device: ranges.donor_device,
             mirror_cpu: ranges.mirror_cpu,
             restore_epoch: 0,
-            seed_bytes: 0,
             dirty: false,
             poisoned: None,
             outstanding: Arc::new(AtomicBool::new(false)),
@@ -986,11 +976,7 @@ impl ExpertCache {
             stats.fills_completed += live.fills_published;
             stats.evictions += live.evictions;
             stats.skipped_full += live.skipped_full;
-            stats.fill_bytes = engine
-                .io
-                .stats()
-                .bytes_enqueued
-                .saturating_sub(self.seed_bytes);
+            stats.fill_bytes = engine.io.stats().bytes_enqueued;
         }
         stats
     }
@@ -1471,9 +1457,9 @@ impl ExpertCache {
 
     /// Replace the pools by a fresh build whose slots hold their donors' original experts,
     /// published into the tables. `restore`: first copy each pool hull back from the mirror in
-    /// one bulk copy per pool (the restore itself); the seed fills then copy nothing and only
-    /// record their events on the same copy stream, behind the bulk copies. The engine is always
-    /// installed, so teardown sees it.
+    /// one bulk copy per pool (the restore itself). The seed copies nothing: one fence behind
+    /// those copies completes all of its fills. The engine is always installed, so teardown
+    /// sees it.
     fn install_seeded(&mut self, gpu: &Gpu, io: DeviceIo<QwenCopy>, restore: bool) -> Result<()> {
         let policy = build_policy(
             &self.layout,
@@ -1483,15 +1469,16 @@ impl ExpertCache {
         )?;
         let mut engine = Engine { policy, io };
         let issued = if restore {
-            restore_hulls(&self.layout, self.donor_device, self.mirror_cpu, &engine)
+            restore_hulls(
+                &self.layout,
+                self.donor_device,
+                self.mirror_cpu,
+                engine.io.backend(),
+            )
         } else {
             Ok(())
         };
-        let before = engine.io.stats().bytes_enqueued;
-        engine.io.backend().set_skip_copies(true);
-        let issued = issued.and_then(|()| issue_seed(&self.layout, &mut engine));
-        engine.io.backend().set_skip_copies(false);
-        self.seed_bytes += engine.io.stats().bytes_enqueued - before;
+        let issued = issued.and_then(|()| issue_seed(&mut engine));
         let result = issued.and_then(|()| {
             // Stage every seed completion, publish them over the canonical mapping.
             engine
@@ -1848,15 +1835,15 @@ mod tests {
         }
     }
 
-    type Rig = Engine<SeedCopy<Fake>>;
+    type Rig = Engine<Fake>;
 
     fn rig(layout: &Layout, events: usize) -> (Rig, Rc<Trace>) {
         let trace = Rc::new(Trace::default());
         let policy = build_policy(layout, config(), 4, 9).unwrap();
-        let io = DeviceIo::new(SeedCopy::new(Fake {
+        let io = DeviceIo::new(Fake {
             events,
             trace: trace.clone(),
-        }))
+        })
         .unwrap();
         (Engine { policy, io }, trace)
     }
@@ -2042,7 +2029,7 @@ mod tests {
     // -- the adapter over the shared core ---------------------------------------------------
 
     #[test]
-    fn a_seed_is_one_event_per_donor_and_a_restore_is_one_bulk_copy_per_pool() {
+    fn a_seed_is_one_fence_per_pool_and_a_restore_is_one_bulk_copy_per_pool() {
         let layout = layout_of(&cached_plan(5));
         let start = layout.pools.iter().map(|p| p.block.0).min().unwrap();
         let end = layout
@@ -2056,29 +2043,29 @@ mod tests {
         // A hull that leaves the donor tail is refused.
         let (probe, _) = rig(&layout, 2);
         assert!(
-            restore_hulls(&layout, (donor.0, donor.1 - 1), mirror, &probe)
+            restore_hulls(&layout, (donor.0, donor.1 - 1), mirror, probe.io.backend())
                 .unwrap_err()
                 .contains("leaves the donor tail")
         );
         for restore in [false, true] {
             let (mut engine, trace) = rig(&layout, 2);
             if restore {
-                restore_hulls(&layout, donor, mirror, &engine).unwrap();
+                restore_hulls(&layout, donor, mirror, engine.io.backend()).unwrap();
             }
-            engine.io.backend().set_skip_copies(true);
-            issue_seed(&layout, &mut engine).unwrap();
+            issue_seed(&mut engine).unwrap();
             let summary = engine.policy.plan_group(0, (0, 0)).unwrap();
             assert_eq!(summary.published, 5, "restore {restore}");
             assert!(summary.needs_retirement);
             assert_eq!(engine.io.in_flight(), 0);
             {
-                // Five fills through a two-event pool record their events and move no byte; a
-                // restore copies each pool hull once, before every seed event.
+                // Five seed fills in each pool are one batch behind one fence and move no byte;
+                // a restore copies each pool hull once, before every seed fence.
                 let log = trace.log.borrow();
-                let pools = if restore { layout.pools.len() } else { 0 };
-                assert!(log[..pools].iter().all(|e| e == "copy"));
-                assert_eq!(log[pools..], ["record"; 5]);
-                let hulls: Vec<(u64, usize)> = layout.pools[..pools]
+                let pools = layout.pools.len();
+                let copies = if restore { pools } else { 0 };
+                assert!(log[..copies].iter().all(|e| e == "copy"));
+                assert_eq!(log[copies..], vec!["record"; pools][..]);
+                let hulls: Vec<(u64, usize)> = layout.pools[..copies]
                     .iter()
                     .map(|p| (p.block.0 as u64, p.block.1))
                     .collect();
@@ -2102,7 +2089,7 @@ mod tests {
     /// Pools seeded and published (generation sealed), the trace cleared.
     fn seeded(layout: &Layout, events: usize) -> (Rig, Rc<Trace>) {
         let (mut engine, trace) = rig(layout, events);
-        issue_seed(layout, &mut engine).unwrap();
+        issue_seed(&mut engine).unwrap();
         engine.policy.plan_group(0, (0, 0)).unwrap();
         retire_all(&mut engine);
         trace.log.borrow_mut().clear();
