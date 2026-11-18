@@ -14906,10 +14906,24 @@ impl Qwen4GpuForward {
                 let mut prefill = Qwen4MoeLayerRuntime::from_moe_borrow(
                     gpu, weights, moe, layer, config, false, 0,
                 )?;
-                // The immutable host mirror contains the same verified headers.
-                // Losing this verdict would change the >=512-row IU4 route and
-                // can exceed the compact plan's F32 fallback scratch.
-                prefill.symmetric = resident.symmetric;
+                // The immutable host mirror contains the same verified headers. Losing the
+                // symmetric verdict would change the >=512-row IU4 route and can exceed the
+                // compact plan's F32 fallback scratch; a different host-mapped bit would select
+                // another stage/host-wait route than the Resident one. Both are fixed here.
+                match crate::expert_cache::inherit_prefill_verdict(
+                    layer,
+                    crate::expert_cache::PrefillVerdict {
+                        host_mapped: resident.host_mapped,
+                        symmetric: resident.symmetric,
+                    },
+                    prefill.host_mapped,
+                ) {
+                    Ok(verdict) => prefill.symmetric = verdict.symmetric,
+                    Err(reason) => {
+                        let _ = prefill.free_gpu(gpu);
+                        return Err(invalid(reason));
+                    }
+                }
                 let decode = runtimes
                     .get(layer)
                     .and_then(Option::as_ref)
@@ -16799,6 +16813,13 @@ impl Qwen4GpuForward {
                     .map_err(invalid)?;
             } else {
                 cache.prepare_prefill(gpu).map_err(invalid)?;
+                // The Resident tables name every donor slot as holding its original expert:
+                // never run them over donors that may hold cached replacements.
+                if cache.is_dirty() {
+                    return Err(invalid(
+                        "exact expert cache: resident prefill refused over dirty donor slots",
+                    ));
+                }
             }
             let prior = std::mem::replace(&mut self.cache_host_prefill_active, host_prefill);
             let result = self.forward_chunk_tile(
