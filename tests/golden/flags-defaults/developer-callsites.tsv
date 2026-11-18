@@ -596,6 +596,9 @@ developer_callsite	*	HIPFIRE_QWEN4_EP_VOCAB_SHARD#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QWEN4_EP_WIDE_VERIFY#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_EP_WIDE_VERIFY#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES#developer_bool=false
+developer_callsite	*	HIPFIRE_QWEN4_EXPERT_CACHE#developer_var=ok.as_deref
+developer_callsite	*	HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT#developer_var=ok.as_deref
+developer_callsite	*	HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QWEN4_EXPERT_DROP_ZERO#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QWEN4_EXPERT_HOTSET#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE#developer_bool=hipfire_config::memory::qwen4_gfx1100_tier_package(arch)
@@ -743,6 +746,7 @@ developer_callsite	*	HIPFIRE_QWEN_CACHE_TRACE#developer_var=ok.as_deref.!=Some("
 developer_callsite	*	HIPFIRE_QWEN_CACHE_TRACE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_QWEN_KV_DEFAULT_Q8#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_RAILGUN_CACHE_TABLE#developer_var=ok.filter
+developer_callsite	*	HIPFIRE_RAILGUN_CHECK#developer_var=ok
 developer_callsite	*	HIPFIRE_RAILGUN_NEGATIVE_CONTROL#developer_var=as_deref.==Ok("drop_boundaries")
 developer_callsite	*	HIPFIRE_RAON_A8_FUSE_ROUND#developer_bool=true
 developer_callsite	*	HIPFIRE_RAON_A8_REUSE#developer_bool=true
