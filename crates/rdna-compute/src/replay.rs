@@ -5685,6 +5685,12 @@ pub struct ReplayController {
     /// key set is then final, and a key first seen afterwards is a table the
     /// tape never validated, not a valid new map.
     route_identities_sealed: bool,
+    /// Owners of a mutable placement image the tape was recorded against
+    /// (the sealed call registers them with the route identities). A retained
+    /// replay bypasses that call, so every submission re-verifies each one
+    /// (a live generation lease at the current image epoch). Empty for every
+    /// static binding. Cleared and sealed together with `route_identities`.
+    launch_authorities: crate::launch_authority::LaunchAuthorities,
     prepared_max_position: Option<usize>,
     synthesized_position_bindings: Vec<(usize, ReplayKernargBinding)>,
     position_bindings_calibrated: bool,
@@ -5798,6 +5804,7 @@ impl ReplayController {
             route_proof_log: route_proof_log_requested(),
             route_identities: BTreeMap::new(),
             route_identities_sealed: false,
+            launch_authorities: crate::launch_authority::LaunchAuthorities::default(),
             prepared_max_position: None,
             synthesized_position_bindings: Vec::new(),
             position_bindings_calibrated: false,
@@ -5923,6 +5930,7 @@ impl ReplayController {
         self.unknown_effect_launches = 0;
         self.prepared_max_position = None;
         self.route_identities.clear();
+        self.launch_authorities.clear();
         self.route_identities_sealed = false;
         self.synthesized_position_bindings.clear();
         self.position_bindings_calibrated = false;
@@ -7442,6 +7450,7 @@ impl ReplayController {
     /// The captured model allocations and all pointed-to buffers must still be
     /// live and in the same binding layout.
     pub unsafe fn replay_linear_aql(&mut self, position: usize) -> Result<GpuBatchTiming, String> {
+        self.authorize_retained_launch()?;
         let result = {
             let prepared = self
                 .prepared
@@ -7471,6 +7480,12 @@ impl ReplayController {
         &mut self,
         position: usize,
     ) -> Result<GpuMultiQueueTiming, RetainedReplayFailure> {
+        if let Err(error) = self.authorize_retained_launch() {
+            return Err(RetainedReplayFailure {
+                error,
+                quiescence: ReplayQuiescence::Proven,
+            });
+        }
         if let Err(error) = self.fail_if_bindings_stale() {
             return Err(RetainedReplayFailure {
                 error,
@@ -7501,6 +7516,7 @@ impl ReplayController {
         &mut self,
         position: usize,
     ) -> Result<Pm4DispatchProfile, String> {
+        self.authorize_retained_launch()?;
         self.fail_if_bindings_stale()?;
         let result = {
             let prepared = self
@@ -7615,6 +7631,7 @@ impl ReplayController {
         self.prepared = None;
         self.prepared_max_position = None;
         self.route_identities.clear();
+        self.launch_authorities.clear();
         self.route_identities_sealed = false;
         self.synthesized_position_bindings.clear();
         self.position_bindings_calibrated = false;
@@ -7649,6 +7666,7 @@ impl ReplayController {
         self.fallback_effect_launches = 0;
         self.unknown_effect_launches = 0;
         self.route_identities.clear();
+        self.launch_authorities.clear();
         self.route_identities_sealed = false;
         self.synthesized_position_bindings.clear();
         self.position_bindings_calibrated = false;
@@ -8649,6 +8667,35 @@ impl ReplayController {
                  {latched}, observed {identity}"
             )),
         }
+    }
+
+    /// Register the owner of a mutable placement image the tape being recorded
+    /// reads, at the generation the recording ran under. Same latch/seal rules
+    /// as [`Self::note_route_identity`]: an owner the capture never saw cannot
+    /// join a sealed tape, and one owner cannot name two generations.
+    pub fn note_launch_authority<A>(
+        &mut self,
+        authority: &A,
+        owner_generation: u64,
+    ) -> Result<(), String>
+    where
+        A: crate::launch_authority::LaunchAuthority + Clone + 'static,
+    {
+        self.launch_authorities
+            .note(authority, owner_generation, self.route_identities_sealed)
+    }
+
+    /// Launch authority for every retained submission that bypasses the sealed
+    /// call: verify each registered owner (a live generation lease at the
+    /// current image epoch) before any work is submitted. `Ok` when none is
+    /// registered, so static bindings keep their behaviour.
+    pub fn authorize_retained_launch(&self) -> Result<(), String> {
+        self.launch_authorities.authorize_all()
+    }
+
+    /// Number of mutable-image owners the tape registered.
+    pub fn launch_authority_count(&self) -> usize {
+        self.launch_authorities.len()
     }
 
     /// Validate the complete captured binding at the top level, before a

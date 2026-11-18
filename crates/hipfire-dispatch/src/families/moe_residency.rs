@@ -90,10 +90,20 @@ pub struct ResidencySnapshot {
     pub mapping: Arc<[ResidencyLocation]>,
 }
 
+/// The reader lease of the single token currently executing against the
+/// published image: the owner generation it reads and the image epoch it was
+/// admitted at. Publication is refused while a lease is live, so a lease whose
+/// epoch differs from the published epoch is never a valid launch authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidencyLease {
+    pub owner_generation: u64,
+    pub epoch: u64,
+}
+
 struct State {
     published: ResidencySnapshot,
     completed: Vec<Option<ResidencySlotTicket>>,
-    active: bool,
+    lease: Option<ResidencyLease>,
     poisoned: bool,
 }
 
@@ -230,7 +240,7 @@ impl MutableExpertResidency {
             state: Mutex::new(State {
                 published,
                 completed,
-                active: false,
+                lease: None,
                 poisoned: false,
             }),
         })))
@@ -306,14 +316,17 @@ impl MutableExpertResidency {
             .state
             .lock()
             .map_err(|_| "mutable residency: mutex poisoned")?;
-        if state.poisoned || state.active {
+        if state.poisoned || state.lease.is_some() {
             return Err("mutable residency: poisoned or token already active".into());
         }
         if state.published.epoch != expected_epoch {
             return Err("mutable residency: stale token epoch".into());
         }
         let snapshot = state.published.clone();
-        state.active = true;
+        state.lease = Some(ResidencyLease {
+            owner_generation: snapshot.owner_generation,
+            epoch: snapshot.epoch,
+        });
         Ok(ResidencyTokenGuard {
             residency: self.clone(),
             snapshot,
@@ -347,11 +360,64 @@ impl MutableExpertResidency {
             .state
             .lock()
             .map_err(|_| "mutable residency: mutex poisoned")?;
-        if state.poisoned || !state.active {
+        if state.poisoned || state.lease.is_none() {
             return Err("mutable residency: launch requires a live, unpoisoned token guard".into());
         }
         if gate_up != state.published.gate_up.as_ref() || down != state.published.down.as_ref() {
             return Err("mutable residency: host entries differ from published mapping".into());
+        }
+        Ok(())
+    }
+
+    /// Launch authority for a replay that bypasses the sealed call (retained
+    /// PM4/AQL tape, recorded-HIP replay): the residency must be unpoisoned,
+    /// hold a live reader lease, and that lease must name `owner_generation`
+    /// (the generation the program recorded) at the current image epoch. A
+    /// stable identity string never substitutes for this check. Returns the
+    /// lease the submission runs under.
+    pub fn authorize_launch(&self, owner_generation: u64) -> Result<ResidencyLease> {
+        let state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| "mutable residency: mutex poisoned")?;
+        if state.poisoned {
+            return Err("mutable residency launch refused: authority poisoned".into());
+        }
+        let Some(lease) = state.lease else {
+            return Err(
+                "mutable residency launch refused: no live generation lease (no token guard held)"
+                    .into(),
+            );
+        };
+        if owner_generation != state.published.owner_generation
+            || lease.owner_generation != owner_generation
+        {
+            return Err(format!(
+                "mutable residency launch refused: program recorded owner generation \
+                 {owner_generation}, lease holds {} of published generation {}",
+                lease.owner_generation, state.published.owner_generation
+            ));
+        }
+        if lease.epoch != state.published.epoch {
+            return Err(format!(
+                "mutable residency launch refused: lease epoch {} is not the current image epoch {}",
+                lease.epoch, state.published.epoch
+            ));
+        }
+        Ok(lease)
+    }
+
+    /// [`Self::authorize_launch`] for a caller that holds its own lease (a token
+    /// guard): that exact lease must be the live one at the current epoch.
+    pub fn authorize_lease(&self, lease: ResidencyLease) -> Result<()> {
+        let live = self.authorize_launch(lease.owner_generation)?;
+        if live != lease {
+            return Err(format!(
+                "mutable residency launch refused: held lease epoch {} is not the current \
+                 image epoch {}",
+                lease.epoch, live.epoch
+            ));
         }
         Ok(())
     }
@@ -385,7 +451,7 @@ impl MutableExpertResidency {
             .state
             .lock()
             .map_err(|_| "mutable residency: mutex poisoned")?;
-        if state.poisoned || state.active {
+        if state.poisoned || state.lease.is_some() {
             return Err(
                 "mutable residency: publication refused during active/poisoned token".into(),
             );
@@ -482,6 +548,15 @@ impl ResidencyTokenGuard {
         &self.snapshot
     }
 
+    /// The lease this guard holds: its generation and the image epoch it was
+    /// admitted at.
+    pub fn lease(&self) -> ResidencyLease {
+        ResidencyLease {
+            owner_generation: self.snapshot.owner_generation,
+            epoch: self.snapshot.epoch,
+        }
+    }
+
     /// # Safety
     /// Every GPU read submitted under this token has completed, or no GPU work
     /// was submitted. A timeout with unknown quiescence cannot retire the guard.
@@ -492,10 +567,10 @@ impl ResidencyTokenGuard {
             .state
             .lock()
             .map_err(|_| "mutable residency: mutex poisoned")?;
-        if state.poisoned || !state.active || state.published.epoch != self.snapshot.epoch {
+        if state.poisoned || state.lease.is_none() || state.published.epoch != self.snapshot.epoch {
             return Err("mutable residency: invalid token retirement".into());
         }
-        state.active = false;
+        state.lease = None;
         self.retired = true;
         Ok(())
     }
@@ -507,6 +582,16 @@ impl Drop for ResidencyTokenGuard {
                 state.poisoned = true;
             }
         }
+    }
+}
+
+impl rdna_compute::launch_authority::LaunchAuthority for MutableExpertResidency {
+    fn authority_id(&self) -> u64 {
+        self.0.id
+    }
+
+    fn authorize_launch(&self, owner_generation: u64) -> std::result::Result<(), String> {
+        MutableExpertResidency::authorize_launch(self, owner_generation).map(|_| ())
     }
 }
 
@@ -735,5 +820,188 @@ mod tests {
         let other = fixture();
         assert_ne!(r, other);
         assert_ne!(r.stable_fingerprint(), other.stable_fingerprint());
+    }
+}
+
+#[cfg(test)]
+mod launch_authority_tests {
+    use super::*;
+    use rdna_compute::replay::{ReplayBackendRequest, ReplayController};
+
+    fn span(address: usize, bytes: usize) -> ResidencySpan {
+        ResidencySpan { address, bytes }
+    }
+    fn fixture() -> MutableExpertResidency {
+        // SAFETY: metadata-only fake spans, never dereferenced.
+        unsafe {
+            MutableExpertResidency::new(MutableExpertResidencySpec {
+                owner_generation: 7,
+                canonical_gate_up: vec![span(0x1000, 32), span(0x2000, 32)],
+                canonical_down: vec![span(0x3000, 16), span(0x4000, 16)],
+                gate_up_table: span(0x5000, 16),
+                down_table: span(0x6000, 16),
+                slots: vec![ResidencySlot {
+                    gate_up: span(0x8000, 32),
+                    down: span(0x9000, 16),
+                }],
+                keepalive: Arc::new(()),
+            })
+            .unwrap()
+        }
+    }
+    fn republish(r: &MutableExpertResidency, epoch: u64, generation: u64) {
+        let ticket = ResidencySlotTicket {
+            slot: 0,
+            expert: 0,
+            generation,
+        };
+        let mut mapping = vec![ResidencyLocation::Canonical; 2];
+        mapping[0] = ResidencyLocation::Slot(ticket);
+        // SAFETY: metadata-only publication; no GPU readers or tables exist.
+        unsafe {
+            r.publish_after_gpu_wait(
+                ResidencyPublication {
+                    expected_epoch: epoch,
+                    mapping,
+                    completed_slots: vec![ticket],
+                },
+                |_| Ok(()),
+            )
+        }
+        .unwrap();
+    }
+
+    #[test]
+    fn launch_needs_a_live_lease_of_the_recorded_generation_at_the_current_epoch() {
+        let r = fixture();
+        let refusal = r.authorize_launch(7).unwrap_err();
+        assert!(refusal.contains("no live generation lease"), "{refusal}");
+        let guard = r.begin_token(0).unwrap();
+        assert_eq!(
+            r.authorize_launch(7).unwrap(),
+            ResidencyLease {
+                owner_generation: 7,
+                epoch: 0
+            }
+        );
+        r.authorize_lease(guard.lease()).unwrap();
+        let wrong = r.authorize_launch(8).unwrap_err();
+        assert!(wrong.contains("owner generation"), "{wrong}");
+        // SAFETY: no GPU work was submitted.
+        unsafe { guard.retire_after_gpu_wait() }.unwrap();
+        assert!(r.authorize_launch(7).is_err());
+    }
+
+    #[test]
+    fn a_lease_from_an_earlier_epoch_is_not_authority() {
+        let r = fixture();
+        let guard = r.begin_token(0).unwrap();
+        let old = guard.lease();
+        // SAFETY: no GPU work was submitted.
+        unsafe { guard.retire_after_gpu_wait() }.unwrap();
+        republish(&r, 0, 1);
+        let guard = r.begin_token(1).unwrap();
+        r.authorize_launch(7).unwrap();
+        let stale = r.authorize_lease(old).unwrap_err();
+        assert!(stale.contains("current image epoch"), "{stale}");
+        r.authorize_lease(guard.lease()).unwrap();
+        // SAFETY: no GPU work was submitted.
+        unsafe { guard.retire_after_gpu_wait() }.unwrap();
+    }
+
+    #[test]
+    fn a_poisoned_authority_refuses_every_launch() {
+        let r = fixture();
+        drop(r.begin_token(0).unwrap());
+        let refusal = r.authorize_launch(7).unwrap_err();
+        assert!(refusal.contains("poisoned"), "{refusal}");
+    }
+
+    /// Every retained replay entry of the controller refuses a wrong-epoch /
+    /// wrong-generation / missing lease BEFORE it looks at (or submits) the
+    /// prepared plan: an unprepared controller reports the authority refusal,
+    /// not "no prepared replay", and reports the plan error once authorized.
+    #[test]
+    fn every_controller_replay_entry_refuses_before_submission() {
+        let r = fixture();
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.note_launch_authority(&r, 7).unwrap();
+        assert_eq!(controller.launch_authority_count(), 1);
+
+        // No lease: AQL, PM4 (+ checked) and the PM4 profile all refuse.
+        // SAFETY: nothing is prepared, so none of these can submit work.
+        let aql = unsafe { controller.replay_linear_aql(0) }.unwrap_err();
+        assert!(aql.contains("no live generation lease"), "{aql}");
+        let pm4 = unsafe { controller.replay_pm4(0) }.unwrap_err();
+        assert!(pm4.contains("no live generation lease"), "{pm4}");
+        let checked = unsafe { controller.replay_pm4_checked(0) }.unwrap_err();
+        assert!(checked.error.contains("no live generation lease"));
+        assert_eq!(
+            checked.quiescence,
+            rdna_compute::replay::ReplayQuiescence::Proven
+        );
+        let profile = unsafe { controller.replay_pm4_dispatch_profile(0) }.unwrap_err();
+        assert!(profile.contains("no live generation lease"), "{profile}");
+        assert!(controller
+            .authorize_retained_launch()
+            .unwrap_err()
+            .contains("no live generation lease"));
+
+        // A tape recorded under another generation is never authorized by this
+        // owner's lease.
+        let guard = r.begin_token(0).unwrap();
+        let mut other = ReplayController::new(ReplayBackendRequest::Auto);
+        other.note_launch_authority(&r, 6).unwrap();
+        let wrong = unsafe { other.replay_linear_aql(0) }.unwrap_err();
+        assert!(wrong.contains("owner generation"), "{wrong}");
+        let wrong = unsafe { other.replay_pm4(0) }.unwrap_err();
+        assert!(wrong.contains("owner generation"), "{wrong}");
+        let wrong = unsafe { other.replay_pm4_dispatch_profile(0) }.unwrap_err();
+        assert!(wrong.contains("owner generation"), "{wrong}");
+
+        // Authorized: the entries proceed to the plan check.
+        controller.authorize_retained_launch().unwrap();
+        let aql = unsafe { controller.replay_linear_aql(0) }.unwrap_err();
+        assert_eq!(aql, "no prepared AQL replay");
+        let pm4 = unsafe { controller.replay_pm4(0) }.unwrap_err();
+        assert_eq!(pm4, "no prepared PM4 replay");
+        let profile = unsafe { controller.replay_pm4_dispatch_profile(0) }.unwrap_err();
+        assert_eq!(profile, "no prepared PM4 replay");
+        // SAFETY: no GPU work was submitted.
+        unsafe { guard.retire_after_gpu_wait() }.unwrap();
+
+        // After the token retires the same tape is refused again.
+        assert!(unsafe { controller.replay_linear_aql(0) }
+            .unwrap_err()
+            .contains("no live generation lease"));
+    }
+
+    #[test]
+    fn an_unregistered_controller_keeps_its_behaviour() {
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        assert_eq!(controller.launch_authority_count(), 0);
+        controller.authorize_retained_launch().unwrap();
+        // SAFETY: nothing is prepared, so these cannot submit work.
+        assert_eq!(
+            unsafe { controller.replay_linear_aql(0) }.unwrap_err(),
+            "no prepared AQL replay"
+        );
+        assert_eq!(
+            unsafe { controller.replay_pm4(0) }.unwrap_err(),
+            "no prepared PM4 replay"
+        );
+    }
+
+    #[test]
+    fn the_authority_set_is_latched_per_tape_and_sealed_with_it() {
+        let r = fixture();
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.note_launch_authority(&r, 7).unwrap();
+        controller.note_launch_authority(&r, 7).unwrap();
+        assert_eq!(controller.launch_authority_count(), 1);
+        assert!(controller.note_launch_authority(&r, 8).is_err());
+        let other = fixture();
+        controller.note_launch_authority(&other, 7).unwrap();
+        assert_eq!(controller.launch_authority_count(), 2);
     }
 }

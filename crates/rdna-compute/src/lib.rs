@@ -97,6 +97,7 @@ pub mod latent_attention_absorb;
 pub mod latent_attention_decode;
 pub mod latent_attention_flash;
 pub mod latent_attention_tiled;
+pub mod launch_authority;
 pub mod load_phases;
 mod loaded_code_check;
 pub mod moe;

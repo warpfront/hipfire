@@ -39,8 +39,9 @@
 #[path = "moe_residency.rs"]
 mod mutable_residency;
 pub use mutable_residency::{
-    MutableExpertResidency, MutableExpertResidencySpec, ResidencyLocation, ResidencyPublication,
-    ResidencySlot, ResidencySlotTicket, ResidencySnapshot, ResidencySpan, ResidencyTokenGuard,
+    MutableExpertResidency, MutableExpertResidencySpec, ResidencyLease, ResidencyLocation,
+    ResidencyPublication, ResidencySlot, ResidencySlotTicket, ResidencySnapshot, ResidencySpan,
+    ResidencyTokenGuard,
 };
 
 use rdna_compute::DType;

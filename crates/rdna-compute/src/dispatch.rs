@@ -4622,6 +4622,9 @@ impl Gpu {
     pub fn replay_recorded_hip_prefix(&self, count: usize) -> HipResult<()> {
         self.bind_thread()?;
         self.refuse_unprepared_route("replay_recorded_hip_prefix")?;
+        self.replay
+            .authorize_retained_launch()
+            .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
         if count > self.replay.recorded_launches().len() {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -4665,6 +4668,9 @@ impl Gpu {
     pub fn replay_recorded_hip_prefix_at(&self, count: usize, position: usize) -> HipResult<()> {
         self.bind_thread()?;
         self.refuse_unprepared_route("replay_recorded_hip_prefix_at")?;
+        self.replay
+            .authorize_retained_launch()
+            .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
         let launches = self.replay.recorded_launches();
         if count > launches.len() {
             return Err(hip_bridge::HipError::new(

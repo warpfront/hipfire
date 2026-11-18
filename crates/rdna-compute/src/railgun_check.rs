@@ -538,6 +538,9 @@ fn fast_hash(bytes: &[u8]) -> u64 {
 /// kernarg bytes the PM4 lowering submitted (explicit prefix only; HIP
 /// supplies its own hidden arguments). Returns the launch count.
 unsafe fn run_twin(gpu: &mut Gpu) -> Result<usize, String> {
+    gpu.replay
+        .authorize_retained_launch()
+        .map_err(|e| format!("HIP twin refused: {e}"))?;
     let images = gpu
         .replay
         .prepared_pm4_submitted_kernargs()

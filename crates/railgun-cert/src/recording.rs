@@ -708,6 +708,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "mutable-residency-graph-capture-refusal",
+        predicates: &[CaptureMode],
+        condition: "hipfire-dispatch sealed_moe.rs SealedMoeCall::note_retained_route_identity (the chokepoint of execute_sealed, execute_sealed_prepare and execute_sealed_after_clear) refuses a sealed MoE call that carries the mutable placement capability (RoutedExpertWeights::mutable_residency or its live binding) while HIP graph capture is active, before any launch of the call",
+        effect: Refusal,
+        switches: "active capture returns an error for a mutable-residency call; a graph launch has no image-epoch/generation-lease check, so no graph can hold such a binding. Eager and recorded (Redline) execution of the same call latches its route identity and registers its launch authority instead",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "admission only: the refusal precedes every dispatch of the call and selects no alternate kernel; a static binding (no mutable capability) takes no branch on this predicate",
+        reaches: &[],
+    },
+    Decision {
         id: "mq6-explicit-railgun-refusal",
         predicates: &[IsRecording, CaptureMode, G0Observing],
         condition: "rdna-compute mq6_railgun::check_gpu rejects Redline recording, G0 observation and HIP graph capture before preparing or replaying an explicit fixed-binding MQ6 program; an active stream capture is also refused",
@@ -2025,6 +2036,12 @@ pub const SITES: &[Site] = &[
         function: "forward_cache_chunk",
         occurrences: 1,
         decisions: &["qwen4-exact-cache-capture-refusal"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/sealed_moe.rs",
+        function: "note_retained_route_identity",
+        occurrences: 1,
+        decisions: &["mutable-residency-graph-capture-refusal"],
     },
     Site {
         file: "hipfire-arch-raon/src/bundle.rs",

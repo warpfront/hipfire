@@ -1308,6 +1308,16 @@ pub struct RetainedRouteInputs<'a> {
     /// frozen pointer-table mirrors all move the identity. `None` keeps the
     /// legacy/slab identity byte-identical.
     pub tier: Option<&'a ExpertTierIdentity>,
+    /// `Some` when the bound expert set carries the mutable placement
+    /// capability: its construction-stable identity (canonical views, owner
+    /// generation, table addresses/extents and pool topology; never the
+    /// published entries, slot tickets or epoch). It replaces
+    /// `mapping_fingerprint` and the tier's frozen placement, host-bit and
+    /// pointer-mirror digests, so an authorized remap keeps the identity while a
+    /// canonical, generation, table or pool change breaks it. A stable identity
+    /// is never launch authority (see `validate_retained_moe_binding`). `None`
+    /// keeps every static identity byte-identical.
+    pub mutable_stable_identity: Option<&'a str>,
 }
 
 /// The exact `(key, identity)` pairs a layer passes to
@@ -1318,27 +1328,42 @@ pub struct RetainedRouteInputs<'a> {
 /// digest and the arena generation, and a second pair keyed by the layer binds
 /// the tables, codec digest and generation separately.
 pub fn retained_route_identities(input: &RetainedRouteInputs<'_>) -> Vec<(u64, String)> {
-    let suffix = input.tier.map_or_else(String::new, tier_identity_suffix);
+    let stable = input.mutable_stable_identity.map(|identity| {
+        format!(
+            "mutable-route/v1|canon={:016x}",
+            fnv1a_u64(identity.as_bytes())
+        )
+    });
+    let base = stable.as_deref().unwrap_or(input.mapping_fingerprint);
+    let suffix = input.tier.map_or_else(String::new, |tier| {
+        if stable.is_some() {
+            tier_stable_identity_suffix(tier)
+        } else {
+            tier_identity_suffix(tier)
+        }
+    });
     let tags = input.tag_table.map_or_else(
         || "none".to_owned(),
         |(ptr, bytes)| format!("{ptr:x}:{bytes}"),
     );
     let Some(codecs) = input.codecs else {
-        if input.tier.is_none() {
+        if input.tier.is_none() && stable.is_none() {
             return vec![(input.table_identity, input.mapping_fingerprint.to_owned())];
         }
+        let kind = if stable.is_some() {
+            "mutable-layer/v1"
+        } else {
+            "tier-layer/v1"
+        };
         let layer_key =
-            fnv1a_u64(format!("tier-layer/v1|{}|{}", input.layer, input.table_identity).as_bytes())
+            fnv1a_u64(format!("{kind}|{}|{}", input.layer, input.table_identity).as_bytes())
                 | (1 << 63);
         return vec![
-            (
-                input.table_identity,
-                format!("{}{suffix}", input.mapping_fingerprint),
-            ),
+            (input.table_identity, format!("{base}{suffix}")),
             (
                 layer_key,
                 format!(
-                    "tier-layer/v1|layer={}|gu={:x}:{}|dn={:x}:{}|tags={tags}|gen={}{suffix}",
+                    "{kind}|layer={}|gu={:x}:{}|dn={:x}:{}|tags={tags}|gen={}{suffix}",
                     input.layer,
                     input.gate_up_table.0,
                     input.gate_up_table.1,
@@ -1358,7 +1383,7 @@ pub fn retained_route_identities(input: &RetainedRouteInputs<'_>) -> Vec<(u64, S
             input.table_identity,
             format!(
                 "{}|slab-v1|codec={codec:016x}|gen={}{suffix}",
-                input.mapping_fingerprint, input.owner_generation
+                base, input.owner_generation
             ),
         ),
         (
@@ -1380,10 +1405,7 @@ pub fn retained_route_identities(input: &RetainedRouteInputs<'_>) -> Vec<(u64, S
 /// logical digest, the layer-wide host bit, and digests of the per-expert
 /// placement, codec and frozen pointer-table mirrors.
 fn tier_identity_suffix(tier: &ExpertTierIdentity) -> String {
-    let mut digest = String::with_capacity(64);
-    for byte in tier.logical_digest() {
-        digest.push_str(&format!("{byte:02x}"));
-    }
+    let digest = logical_digest_hex(tier);
     let entry_hash = |entries: &[usize]| {
         let bytes: Vec<u8> = entries
             .iter()
@@ -1400,6 +1422,27 @@ fn tier_identity_suffix(tier: &ExpertTierIdentity) -> String {
         entry_hash(tier.gate_up_entries()),
         entry_hash(tier.down_entries()),
     )
+}
+
+/// The identity suffix of a tier under the mutable capability: owner
+/// generation, logical digest and codecs only. Placement, the layer host bit
+/// and the frozen pointer-table mirrors describe the current mapping, not the
+/// canonical experts, so a remap must not move the identity.
+fn tier_stable_identity_suffix(tier: &ExpertTierIdentity) -> String {
+    format!(
+        "|tier-stable-v1|gen={}|digest={}|codec={:016x}",
+        tier.generation(),
+        logical_digest_hex(tier),
+        fnv1a_u64(tier.codecs()),
+    )
+}
+
+fn logical_digest_hex(tier: &ExpertTierIdentity) -> String {
+    let mut digest = String::with_capacity(64);
+    for byte in tier.logical_digest() {
+        digest.push_str(&format!("{byte:02x}"));
+    }
+    digest
 }
 
 /// Codec byte of an expert's down dtype: `0` = MQ4, `1` = W3, `3` = E8P-I4,
@@ -1575,7 +1618,18 @@ impl ExpertBindingCache {
                 live.source_identity.unwrap_or(0),
                 ExpertTierIdentity::generation,
             ),
+            mutable_stable_identity: live
+                .mutable_residency
+                .as_ref()
+                .map(MutableExpertResidency::stable_fingerprint),
         }))
+    }
+
+    /// The mutable placement capability this cache was bound with, if any.
+    pub fn mutable_residency(&self) -> Option<&MutableExpertResidency> {
+        self.live
+            .as_ref()
+            .and_then(|live| live.mutable_residency.as_ref())
     }
 
     /// The explicit tier identity this cache was bound with, if any.
@@ -2870,7 +2924,21 @@ impl SealedMoeCall<'_> {
     /// views without re-uploading or re-validating them, so a mapping change
     /// between capture and replay has to be an error instead of a silent
     /// dereference of tensors the prepared plan never validated.
+    ///
+    /// A call that carries the mutable placement capability always latches (the
+    /// route policy / tier gate below is for static bindings) and also registers
+    /// that capability as a launch authority on the tape: the replay bypasses
+    /// verify its generation lease and image epoch before every submission. A
+    /// graph capture of such a call is refused, since a graph launch has no
+    /// such check.
     fn note_retained_route_identity(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let mutable = self.carried_mutable_residency();
+        if mutable.is_some() && gpu.graphs.capture_mode {
+            return Err(invalid(
+                "mutable residency: a sealed MoE call cannot be captured into a HIP graph; \
+                 a graph launch carries no image epoch or generation lease authority",
+            ));
+        }
         if !gpu.replay.retained_body_active() {
             return Ok(());
         }
@@ -2884,7 +2952,7 @@ impl SealedMoeCall<'_> {
             .live
             .as_ref()
             .is_some_and(|live| live.tier.is_some());
-        if !specialized && !tier_bound {
+        if !specialized && !tier_bound && mutable.is_none() {
             return Ok(());
         }
         if self.experts.cache.live.is_none() {
@@ -2905,7 +2973,23 @@ impl SealedMoeCall<'_> {
                 .note_route_identity(key, &identity)
                 .map_err(|reason| invalid(reason))?;
         }
+        if let Some(residency) = mutable {
+            gpu.replay
+                .note_launch_authority(residency, residency.owner_generation())
+                .map_err(|reason| invalid(reason))?;
+        }
         Ok(())
+    }
+
+    /// The mutable placement capability this call carries: its routed-expert
+    /// set's, else the one its live binding was made with (the two are checked
+    /// equal by `validate_live_binding` before any launch).
+    fn carried_mutable_residency(&self) -> Option<&MutableExpertResidency> {
+        let from_call = match &self.params {
+            SealedParams::Decode(params) => params.routed_experts.mutable_residency(),
+            SealedParams::Prefill(params) => params.routed_experts.mutable_residency(),
+        };
+        from_call.or_else(|| self.experts.cache.mutable_residency())
     }
 }
 
@@ -5075,6 +5159,13 @@ fn table_has_mixed_dtypes(table: &ExpertTable) -> Result<bool, DispatchError> {
 ///
 /// The caller must also validate the retained route identities and executing
 /// device, and retain the token guard through proven GPU retirement.
+///
+/// Per-binding content validation only. The submission authority itself (live
+/// generation lease at the current image epoch) is also verified by
+/// `ReplayController::authorize_retained_launch` inside every retained replay
+/// entry (AQL, PM4, PM4 profile, recorded-HIP, railgun twin), for every arch,
+/// from the authority the recording sealed call registered; an arch does not
+/// need to call this function for that guarantee.
 pub fn validate_retained_moe_binding(
     experts: &BoundMoeExperts<'_>,
     routed_experts: &dyn RoutedExpertWeights,
@@ -5177,6 +5268,11 @@ fn validate_live_binding(
     // entries without re-uploading them, so each entry must point at the live
     // expert tensor it claims to name. Mirrors the compact path's check.
     if let Some(residency) = &live.mutable_residency {
+        // Submission authority, not identity: the live generation lease at the
+        // current image epoch (the same check every retained replay entry runs).
+        residency
+            .authorize_launch(residency.owner_generation())
+            .map_err(invalid)?;
         let entries = host_entries.ok_or_else(|| {
             invalid("mutable residency requires the published host pointer entries")
         })?;
@@ -5973,6 +6069,216 @@ mod tests {
         );
         // SAFETY: no GPU work was submitted.
         unsafe { guard.retire_after_gpu_wait() }.unwrap();
+    }
+
+    fn bound_mutable_cache(
+        table: &ExpertTable,
+        fixture: &LiveFixture,
+        residency: &MutableExpertResidency,
+        identity: u64,
+    ) -> ExpertBindingCache {
+        let routed = MutableRouted {
+            inner: &fixture.routed,
+            residency: residency.clone(),
+            identity,
+        };
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        cache
+            .bind_live(
+                table,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+            )
+            .unwrap();
+        cache
+    }
+
+    /// A2.3: under the mutable capability the latch identity is canonical
+    /// digest + table address/extent + owner generation. A remap keeps it, a
+    /// canonical / generation / source / table change breaks it, and a static
+    /// binding keeps its one pointer-level fingerprint pair.
+    #[test]
+    fn mutable_retained_identity_survives_remap_and_follows_canonical_change() {
+        use crate::families::moe::{ResidencyLocation, ResidencyPublication, ResidencySlotTicket};
+        let table = mutable_table();
+        let fixture = live_fixture(&table, 0x5600_0000);
+        let residency = mutable_capability(&fixture, 7);
+        let cache = bound_mutable_cache(&table, &fixture, &residency, 77);
+        let initial = cache.retained_route_identities(&table, 3).unwrap();
+        assert_eq!(initial.len(), 2);
+        assert!(initial[0].1.starts_with("mutable-route/v1|canon="));
+        assert!(initial[1].1.starts_with("mutable-layer/v1|layer=3|"));
+        let fingerprint = cache.live.as_ref().unwrap().mapping_fingerprint.clone();
+        assert!(initial
+            .iter()
+            .all(|(_, identity)| !identity.contains(&fingerprint)));
+        let gate_up_table = format!(
+            "gu={:x}:{}",
+            fixture.gate_up_ptrs.buf.as_ptr() as usize,
+            fixture.gate_up_ptrs.buf.size()
+        );
+        assert!(initial[1].1.contains(&gate_up_table), "{}", initial[1].1);
+        assert!(initial[1].1.contains("|gen=77"), "{}", initial[1].1);
+
+        // Two authorized remaps (different slot occupants and generations).
+        let mut controller = rdna_compute::replay::ReplayController::new(
+            rdna_compute::replay::ReplayBackendRequest::Auto,
+        );
+        for (key, identity) in &initial {
+            controller.note_route_identity(*key, identity).unwrap();
+        }
+        for (epoch, expert, generation) in [(0u64, 0usize, 1u64), (1, 1, 2)] {
+            let ticket = ResidencySlotTicket {
+                slot: 0,
+                expert,
+                generation,
+            };
+            let mut mapping = vec![ResidencyLocation::Canonical; 2];
+            mapping[expert] = ResidencyLocation::Slot(ticket);
+            // SAFETY: metadata-only transaction, no GPU reads or uploads exist.
+            unsafe {
+                residency.publish_after_gpu_wait(
+                    ResidencyPublication {
+                        expected_epoch: epoch,
+                        mapping,
+                        completed_slots: vec![ticket],
+                    },
+                    |_| Ok(()),
+                )
+            }
+            .unwrap();
+            let remapped = cache.retained_route_identities(&table, 3).unwrap();
+            assert_eq!(
+                remapped, initial,
+                "remap at epoch {epoch} moved the identity"
+            );
+            controller
+                .validate_route_identities(|key| {
+                    remapped
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| v.as_str())
+                })
+                .unwrap();
+        }
+
+        // Canonical change: owner generation, source identity, or moved canonical
+        // views / tables each break it.
+        let other_generation = mutable_capability(&fixture, 8);
+        let changed = bound_mutable_cache(&table, &fixture, &other_generation, 77);
+        assert_ne!(
+            changed.retained_route_identities(&table, 3).unwrap(),
+            initial,
+            "owner generation"
+        );
+        let changed = bound_mutable_cache(&table, &fixture, &residency, 78);
+        assert_ne!(
+            changed.retained_route_identities(&table, 3).unwrap(),
+            initial,
+            "source identity"
+        );
+        let moved = live_fixture(&table, 0x5700_0000);
+        let moved_residency = mutable_capability(&moved, 7);
+        let changed = bound_mutable_cache(&table, &moved, &moved_residency, 77);
+        let changed = changed.retained_route_identities(&table, 3).unwrap();
+        assert_ne!(changed, initial, "canonical views and tables");
+        assert!(controller
+            .validate_route_identities(|key| {
+                changed
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.as_str())
+            })
+            .is_err());
+
+        // A static binding of the same experts is untouched: one pair, the
+        // pointer-level mapping fingerprint.
+        let mut frozen = table.prepare_binding(0, 1, 0).unwrap();
+        bind_fixture(&table, &mut frozen, &fixture);
+        let live = frozen.live.as_ref().unwrap();
+        assert_eq!(
+            frozen.retained_route_identities(&table, 3).unwrap(),
+            vec![(live.table_identity, live.mapping_fingerprint.clone())]
+        );
+        assert!(frozen.mutable_residency().is_none());
+        assert!(cache.mutable_residency().is_some());
+    }
+
+    /// Submission authority is independent of the identity strings: with the
+    /// identity latched and equal, a launch still needs a live generation lease
+    /// at the current epoch, and the controller bypass entries refuse without it.
+    #[test]
+    fn mutable_launch_authority_is_checked_beyond_identity_and_registered_on_the_tape() {
+        let table = mutable_table();
+        let fixture = live_fixture(&table, 0x5800_0000);
+        let residency = mutable_capability(&fixture, 7);
+        let routed = MutableRouted {
+            inner: &fixture.routed,
+            residency: residency.clone(),
+            identity: 77,
+        };
+        let cache = bound_mutable_cache(&table, &fixture, &residency, 77);
+        let bound = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let snapshot = residency.snapshot().unwrap();
+        let validate = || {
+            validate_retained_moe_binding(
+                &bound,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+                None,
+                Some(MoePointerEntries {
+                    gate_up: &snapshot.gate_up,
+                    down: &snapshot.down,
+                }),
+            )
+        };
+        let error = format!("{:?}", validate().unwrap_err());
+        assert!(error.contains("no live generation lease"), "{error}");
+
+        // The tape registers the capability while it records; the bypass
+        // entries then follow the lease, whatever the identity says.
+        let mut controller = rdna_compute::replay::ReplayController::new(
+            rdna_compute::replay::ReplayBackendRequest::Auto,
+        );
+        let live = cache.mutable_residency().unwrap();
+        controller
+            .note_launch_authority(live, live.owner_generation())
+            .unwrap();
+        assert!(controller.authorize_retained_launch().is_err());
+        // SAFETY: nothing is prepared, so these cannot submit work.
+        assert!(unsafe { controller.replay_linear_aql(0) }
+            .unwrap_err()
+            .contains("no live generation lease"));
+        assert!(unsafe { controller.replay_pm4(0) }
+            .unwrap_err()
+            .contains("no live generation lease"));
+
+        let guard = residency.begin_token(snapshot.epoch).unwrap();
+        validate().unwrap();
+        controller.authorize_retained_launch().unwrap();
+        // A lease of a different owner generation never authorizes this tape.
+        assert!(residency
+            .authorize_launch(residency.owner_generation() + 1)
+            .is_err());
+        // SAFETY: no GPU work was submitted.
+        unsafe { guard.retire_after_gpu_wait() }.unwrap();
+        assert!(validate().is_err());
+        assert!(controller.authorize_retained_launch().is_err());
+
+        // A static binding registers nothing and is never refused.
+        let mut frozen = table.prepare_binding(0, 1, 0).unwrap();
+        bind_fixture(&table, &mut frozen, &fixture);
+        assert!(frozen.mutable_residency().is_none());
+        let static_controller = rdna_compute::replay::ReplayController::new(
+            rdna_compute::replay::ReplayBackendRequest::Auto,
+        );
+        assert_eq!(static_controller.launch_authority_count(), 0);
+        static_controller.authorize_retained_launch().unwrap();
     }
 
     #[test]
@@ -10383,6 +10689,7 @@ mod retained_route_identity_tests {
             tag_table: codecs.map(|_| (0x3000, 512)),
             owner_generation: generation,
             tier: None,
+            mutable_stable_identity: None,
         }
     }
 
@@ -10497,6 +10804,116 @@ mod retained_route_identity_tests {
         let mut equal = input(None, 5);
         equal.tier = Some(&same);
         assert_eq!(reference, retained_route_identities(&equal));
+    }
+
+    #[test]
+    fn mutable_tier_identity_drops_placement_host_bit_and_pointer_mirrors() {
+        let keep: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(());
+        let base_tier = tier(5, &[0, 0, 0], &keep);
+        let stable = "mutable-residency/v1|id=1|owner=5|gu=[..]|slots=[..]";
+        let mutable = |tier: &ExpertTierIdentity, stable: &'static str| {
+            let mut i = input(None, 5);
+            i.tier = Some(tier);
+            i.mutable_stable_identity = Some(stable);
+            retained_route_identities(&i)
+        };
+        let statik = |tier: &ExpertTierIdentity| {
+            let mut i = input(None, 5);
+            i.tier = Some(tier);
+            retained_route_identities(&i)
+        };
+        let reference = mutable(&base_tier, stable);
+        assert_eq!(reference.len(), 2);
+        assert_ne!(reference[1].0, 7);
+        assert_ne!(reference, statik(&base_tier), "mutable vs static identity");
+
+        // The mapping fingerprint is not an input under the capability.
+        let mut other = input(None, 5);
+        other.tier = Some(&base_tier);
+        other.mutable_stable_identity = Some(stable);
+        other.mapping_fingerprint = "a-remapped-fingerprint";
+        assert_eq!(reference, retained_route_identities(&other));
+
+        // Placement, the layer host bit and the frozen pointer mirrors describe
+        // the current mapping: a remap-shaped change keeps the identity, while
+        // the static identity moves with every one of them.
+        let host = tier(5, &[0, 0, 1], &keep);
+        let mirrors = ExpertTierIdentity::new(
+            5,
+            [9; 32],
+            &[0, 0, 0],
+            &[0, 0, 0],
+            &[0x10_0000, 0x10_1000, 0x10_2000],
+            &[0x20_0000, 0x20_1000, 0x30_2000],
+            keep.clone(),
+        )
+        .unwrap();
+        for (name, changed) in [("host bit/placement", &host), ("pointer mirrors", &mirrors)] {
+            assert_eq!(reference, mutable(changed, stable), "{name}");
+            assert_ne!(statik(&base_tier), statik(changed), "{name} (static)");
+        }
+
+        // Canonical inputs still break it: tier generation, logical digest,
+        // codecs, the stable (canonical/table/pool/owner) identity, the table
+        // address/extent and the owner generation.
+        let digest = ExpertTierIdentity::new(
+            5,
+            [8; 32],
+            &[0, 0, 0],
+            &[0, 0, 0],
+            base_tier.gate_up_entries(),
+            base_tier.down_entries(),
+            keep.clone(),
+        )
+        .unwrap();
+        let codec = ExpertTierIdentity::new(
+            5,
+            [9; 32],
+            &[0, 0, 0],
+            &[1, 0, 0],
+            base_tier.gate_up_entries(),
+            base_tier.down_entries(),
+            keep.clone(),
+        )
+        .unwrap();
+        for (name, changed) in [
+            ("generation", tier(6, &[0, 0, 0], &keep)),
+            ("logical digest", digest),
+            ("codecs", codec),
+        ] {
+            assert_ne!(reference, mutable(&changed, stable), "{name}");
+        }
+        assert_ne!(
+            reference,
+            mutable(
+                &base_tier,
+                "mutable-residency/v1|id=1|owner=5|gu=[moved]|slots=[..]"
+            ),
+            "canonical/stable identity"
+        );
+        let mut table_moved = input(None, 5);
+        table_moved.tier = Some(&base_tier);
+        table_moved.mutable_stable_identity = Some(stable);
+        table_moved.gate_up_table.0 += 16;
+        assert_ne!(
+            reference,
+            retained_route_identities(&table_moved),
+            "table address"
+        );
+        table_moved.gate_up_table.0 -= 16;
+        table_moved.down_table.1 += 8;
+        assert_ne!(
+            reference,
+            retained_route_identities(&table_moved),
+            "table extent"
+        );
+        table_moved.down_table.1 -= 8;
+        table_moved.owner_generation += 1;
+        assert_ne!(
+            reference,
+            retained_route_identities(&table_moved),
+            "owner generation"
+        );
     }
 
     #[test]
