@@ -207,6 +207,7 @@ developer_callsite	*	HIPFIRE_EMIT_TOKEN_IDS#developer_var=ok.as_deref.==Some("1"
 developer_callsite	*	HIPFIRE_EMU_BF16_H#developer_bool=false
 developer_callsite	*	HIPFIRE_EP_AR_HOST_GATE#developer_bool=true
 developer_callsite	*	HIPFIRE_EP_AR_WIRE_DENSE#developer_bool=true
+developer_callsite	*	HIPFIRE_EP_BOUNDARY#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_EP_CHUNK_AUTOFIT#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_EP_COMPACT_SCRATCH#developer_var=as_deref.==Ok("0")
 developer_callsite	*	HIPFIRE_EP_DECODE_TIMING#developer_var=is_ok
