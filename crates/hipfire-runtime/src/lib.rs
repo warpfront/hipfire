@@ -52,6 +52,9 @@ mod ep_barrier_faults;
 pub mod ep_row_gather;
 pub mod ep_tile_exchange;
 pub mod eval_common;
+/// Generic dynamic routed-expert cache: the arch-independent slot POLICY core (slice S1a, CPU
+/// only). Every slot transition goes through railgun's `SlotBank` typestate tokens.
+pub mod expert_cache;
 pub mod external_rows;
 pub mod gguf;
 pub mod hfq;

@@ -935,6 +935,7 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-arch-qwen35`
 - `hipfire-arch-qwen4`
 - `hipfire-arch-raon`
+- `hipfire-runtime`
 - `npu-tools`
 - `rdna-compute`
 
