@@ -199,7 +199,7 @@ __global__ void attention_flash_fwht4_tile(
             p[2 + d_base + 3] = out_vec[half * 4 + 3];
         }
     } else if (v_mode == 4) {
-        // ── lloyd4 V (4-bit): aligned dword loads, w*cnorm factored ──
+        // ── lloyd4 V (4-bit): aligned dword loads; same `w*(cnorm*c)` association as the generic path ──
         const int d0 = tid * 8;
         float ov[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
         const int v_bytes_per_head = 4 + (head_dim * 4) / 8;
