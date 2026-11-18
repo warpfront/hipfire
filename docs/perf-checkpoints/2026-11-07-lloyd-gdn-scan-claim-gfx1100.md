@@ -35,12 +35,12 @@ below. Not a current default, baseline, or admission decision.
   pp2048 prefill (4×512 chunks × 48 DeltaNet layers), 6912 takes across
   the full counting session incl. sustained phases; odd tails (721, 91)
   admitted per the gate's tail rule.
-- at-ctx: standard bench `--prompt-file
-  benchmarks/prompts/scan_107k_synth.txt --max-tokens 1 --warmups 1
-  --runs 3 --max-seq 110592` (same flags otherwise), 3 fresh interleaved
-  processes per side. Prompt: 469200 B harbor-paragraph repetition, md5
-  `3d050f53`, 92012 tokens — synthetic and uniform by design (prefill
-  tok/s is content-agnostic, decode is 1 token).
+- at-ctx: standard bench `--prompt-file <92K prompt> --max-tokens 1
+  --warmups 1 --runs 3 --max-seq 110592` (same flags otherwise), 3 fresh
+  interleaved processes per side. Prompt: 469200 B repetition of one
+  paragraph, md5 `3d050f53`, 92012 tokens — synthetic and uniform by
+  design (prefill tok/s is content-agnostic, decode is 1 token). The file
+  is not committed; any ~92K-token prompt reproduces the shape.
 - Correctness gate on claim binaries: seeded greedy battery (8 short +
   2 long prompts) scan-leg vs saved sequential control, plus eyeball.
 

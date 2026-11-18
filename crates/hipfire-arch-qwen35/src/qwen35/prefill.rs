@@ -6130,22 +6130,57 @@ fn gdn_q8_state_complete(dn_state: &DeltaNetState) -> bool {
         && dn_state.s_matrices.len() == dn_state.s_ef_residual.len()
 }
 
+/// Projection facts of the dense chunk-scan admission: the arch, each all-dense-layers dtype
+/// predicate and the projection-route flags. Pure so the dtype/arch truth table is testable.
+#[derive(Clone, Copy)]
+struct GdnDenseScanDtypeInputs<'a> {
+    arch: &'a str,
+    /// [`mq3_wide_route`].
+    mq3_wide: bool,
+    /// Every dense layer's projections are MQ4G256V2.
+    all_mq4v2: bool,
+    /// Every dense layer's projections are MQ4G256V2Lloyd.
+    all_lloyd: bool,
+    /// `gpu.flags.iu4_prefill_enabled()`.
+    iu4_prefill: bool,
+    /// `gpu.flags.gfx12_mq4v2_fp8_qkvza`.
+    mq4v2_fp8_qkvza: bool,
+}
+
+impl GdnDenseScanDtypeInputs<'_> {
+    /// The qkvza dtype the dense scan reads, or `None` when no admitted qkvza producer
+    /// exists. Each dtype must have its own admitted producer; the A4/A8 flags cannot enable
+    /// a qt44 scan when the MQ4 projection route is off. gfx1201 admits both MQ4V2 projection
+    /// routes (iu4-direct, or the FP8-WMMA qkvza `IU4=0` arm). Lloyd (qt52) is admitted on
+    /// exact gfx1100/gfx1151, where its qkvza producer is the MMQ-LUT route; mixed files
+    /// (not every dense layer Lloyd) stay sequential.
+    fn qkvza_dtype(self) -> Option<DType> {
+        if self.mq3_wide {
+            Some(DType::MQ3G256V2)
+        } else if self.all_mq4v2
+            && (self.iu4_prefill || (self.arch == "gfx1201" && self.mq4v2_fp8_qkvza))
+        {
+            Some(DType::MQ4G256V2)
+        } else if self.all_lloyd && matches!(self.arch, "gfx1100" | "gfx1151") {
+            Some(DType::MQ4G256V2Lloyd)
+        } else {
+            None
+        }
+    }
+}
+
 /// Row-independent chunk-scan admission of the dense route: device, geometry, projection
 /// dtypes/route and Q8 state. Evaluated once per prefix when the plan is resolved. The KV
 /// tier is not an input: the scan never reads KV, and an adaptive-KV tier change must never
-/// change the numerical recipe of a running prefix.
+/// change the numerical recipe of a running prefix. Returns the admitted qkvza dtype
+/// ([`GdnDenseScanDtypeInputs::qkvza_dtype`]), `None` when the dense scan is refused.
 fn gdn_dense_scan_static_admitted(
     gpu: &Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     dn_state: &DeltaNetState,
-) -> bool {
-    let mq3_scan = mq3_wide_route(gpu, weights);
-    let mq4_scan = dense_layers_are_all_mq4v2(weights);
-    // v2 §2.3: Lloyd (qt52) is admitted on exact gfx1100/gfx1151, where its qkvza
-    // producer is the MMQ-LUT route. The scan is weight-free (same f32 scratch).
-    let lloyd_scan = dense_layers_have_projection_dtype(weights, DType::MQ4G256V2Lloyd);
-    gpu.flags.gfx12_gdn_chunk_scan
+) -> Option<DType> {
+    let admitted = gpu.flags.gfx12_gdn_chunk_scan
         && !gpu.fp8_verify_scope
         && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
         && config.num_experts == 0
@@ -6154,17 +6189,21 @@ fn gdn_dense_scan_static_admitted(
         && config.linear_key_head_dim == 128
         && config.linear_value_head_dim == 128
         && config.conv_kernel_dim == 4
-        // Each dtype must have its own admitted qkvza producer; the A4/A8 flags cannot
-        // enable a qt44 scan when the MQ4 projection route is off. gfx1201 admits both
-        // MQ4V2 projection routes (iu4-direct, or the FP8-WMMA qkvza `IU4=0` arm).
-        && (mq3_scan
-            || (mq4_scan
-                && (gpu.flags.iu4_prefill_enabled()
-                    || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza)))
-            || (lloyd_scan && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")))
         && gdn_q8_state_complete(dn_state)
         && !gpu.graphs.capture_mode
-        && !gpu.replay.is_recording()
+        && !gpu.replay.is_recording();
+    if !admitted {
+        return None;
+    }
+    GdnDenseScanDtypeInputs {
+        arch: gpu.arch.as_str(),
+        mq3_wide: mq3_wide_route(gpu, weights),
+        all_mq4v2: dense_layers_are_all_mq4v2(weights),
+        all_lloyd: dense_layers_have_projection_dtype(weights, DType::MQ4G256V2Lloyd),
+        iu4_prefill: gpu.flags.iu4_prefill_enabled(),
+        mq4v2_fp8_qkvza: gpu.flags.gfx12_mq4v2_fp8_qkvza,
+    }
+    .qkvza_dtype()
 }
 
 /// Resolve the canonical prefill plan of every LA layer from static facts: device, weight
@@ -6189,7 +6228,6 @@ pub(crate) fn resolve_gdn_stream_plans(
     } else {
         GdnStateQuant::Q8Ef
     };
-    let dense_static = gdn_dense_scan_static_admitted(gpu, weights, config, dn_state);
     let moe_common = GdnMoeChunkScanInputs {
         enabled: gdn_moe_chunk_scan_on(&gpu.arch),
         capable: gpu.flags.gfx12_gdn_chunk_scan
@@ -6207,13 +6245,7 @@ pub(crate) fn resolve_gdn_stream_plans(
         q8_state: gdn_q8_state_complete(dn_state),
     }
     .admitted();
-    let qkvza_dense = if mq3_wide_route(gpu, weights) {
-        DType::MQ3G256V2
-    } else if dense_layers_have_projection_dtype(weights, DType::MQ4G256V2Lloyd) {
-        DType::MQ4G256V2Lloyd
-    } else {
-        DType::MQ4G256V2
-    };
+    let dense_qkvza = gdn_dense_scan_static_admitted(gpu, weights, config, dn_state);
     let proj = |w: &llama::WeightTensor| GdnProjDesc {
         dtype: w.gpu_dtype,
         m: w.m,
@@ -6251,7 +6283,9 @@ pub(crate) fn resolve_gdn_stream_plans(
                     z_folded,
                     moe: false,
                     state,
-                    scan64_admitted: dense_static && dtypes == [qkvza_dense; 4] && ef_slot,
+                    scan64_admitted: dense_qkvza == Some(dtypes[0])
+                        && dtypes.iter().all(|&d| d == dtypes[0])
+                        && ef_slot,
                 }
             }
             LayerWeights::DeltaNetMoe(l) => {
@@ -8380,6 +8414,54 @@ mod tests {
             };
             let want = bit(0) && bit(1) && bit(2) && bit(3);
             assert_eq!(inputs.admitted(), want, "mask={mask:04b}");
+        }
+    }
+
+    /// Dense scan qkvza dtype: an all-Lloyd file is admitted on gfx1100/gfx1151 only, a
+    /// mixed file is refused, and the MQ3/MQ4V2 arms (gfx1201 included) keep beta's table.
+    #[test]
+    fn gdn_dense_scan_dtype_truth_table() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1200", "gfx942"] {
+            for mask in 0u8..32 {
+                let bit = |i: u8| mask & (1 << i) != 0;
+                let inputs = GdnDenseScanDtypeInputs {
+                    arch,
+                    mq3_wide: bit(0),
+                    all_mq4v2: bit(1),
+                    all_lloyd: bit(2),
+                    iu4_prefill: bit(3),
+                    mq4v2_fp8_qkvza: bit(4),
+                };
+                let want = if inputs.mq3_wide {
+                    Some(DType::MQ3G256V2)
+                } else if inputs.all_mq4v2
+                    && (inputs.iu4_prefill || (arch == "gfx1201" && inputs.mq4v2_fp8_qkvza))
+                {
+                    Some(DType::MQ4G256V2)
+                } else if inputs.all_lloyd && (arch == "gfx1100" || arch == "gfx1151") {
+                    Some(DType::MQ4G256V2Lloyd)
+                } else {
+                    None
+                };
+                assert_eq!(inputs.qkvza_dtype(), want, "arch={arch} mask={mask:05b}");
+            }
+            // A mixed file (neither predicate holds) never admits, whatever the flags.
+            let mixed = GdnDenseScanDtypeInputs {
+                arch,
+                mq3_wide: false,
+                all_mq4v2: false,
+                all_lloyd: false,
+                iu4_prefill: true,
+                mq4v2_fp8_qkvza: true,
+            };
+            assert_eq!(mixed.qkvza_dtype(), None, "arch={arch}");
+            // All-Lloyd: admitted exactly on gfx1100/gfx1151; gfx1201 stays sequential.
+            let lloyd = GdnDenseScanDtypeInputs {
+                all_lloyd: true,
+                ..mixed
+            };
+            let lloyd_want = matches!(arch, "gfx1100" | "gfx1151").then_some(DType::MQ4G256V2Lloyd);
+            assert_eq!(lloyd.qkvza_dtype(), lloyd_want, "arch={arch}");
         }
     }
 
