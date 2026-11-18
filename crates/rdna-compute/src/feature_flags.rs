@@ -5205,6 +5205,27 @@ mod tests {
         }
     }
 
+    /// `HIPFIRE_V2B_A4_EPI` selects the retile bisect arm only on the exact,
+    /// untrimmed spelling `retile`; `1` and every other value keep the fused kernel.
+    #[test]
+    fn v2b_a4_retile_needs_the_exact_spelling() {
+        let retile = |raw: &str| {
+            FeatureFlags::from_lookup("gfx1151", |name| {
+                if name == "HIPFIRE_V2B_A4_EPI" {
+                    Ok(raw.to_owned())
+                } else {
+                    Err(())
+                }
+            })
+            .v2b_a4_retile
+        };
+        assert!(retile("retile"));
+        for raw in ["", "1", "0", "RETILE", " retile", "retile ", "fused"] {
+            assert!(!retile(raw), "{raw:?}");
+        }
+        assert!(!FeatureFlags::from_lookup("gfx1151", |_| Err(())).v2b_a4_retile);
+    }
+
     /// Each typed key of a kept kernel-side flag (HIPF-430) reaches its own
     /// `FeatureFlags` field and no other.
     #[test]
