@@ -246,6 +246,9 @@ pub struct ExpertTierPlan {
     host_windows: Vec<HostWindow>,
     decode_share: Option<DecodeShareTail>,
     expert_cache: Option<DecodeShareTail>,
+    /// Canonical catalog identity recorded at cache admission
+    /// ([`Self::with_expert_cache_identity`]); never part of [`Self::logical_digest`].
+    expert_cache_identity: Option<[u8; 32]>,
     artifact_sha256: Option<[u8; 32]>,
     digest: [u8; 32],
 }
@@ -480,7 +483,8 @@ impl ExpertTierPlan {
         rank: &[u32],
         need_bytes: u64,
     ) -> Result<(Self, DecodeShareTail), DecodeShareError> {
-        let (mut plan, tail) = self.with_donor_tail(rank, need_bytes, DECODE_SHARE_MIRROR_LABEL)?;
+        let (mut plan, tail) =
+            self.with_donor_tail(rank, need_bytes, DECODE_SHARE_MIRROR_LABEL, false)?;
         if !tail.donors.is_empty() {
             plan.decode_share = Some(tail.clone());
         }
@@ -491,15 +495,20 @@ impl ExpertTierPlan {
     /// lending any payload bytes to scratch. Core experts remain device-only;
     /// only donor payloads gain a host mirror. The frozen Resident placement
     /// still names the original donor experts and must be restored before use.
-    /// Requested bytes round up to whole experts; fully resident layers are
-    /// excluded, matching the donor-tail staging contract.
+    ///
+    /// `cap_bytes` is an upper bound on the evictable donor bytes, rounded
+    /// DOWN to whole expert spans (the coldest eligible experts are taken while
+    /// their padded payloads fit): a cap below one span, or `0`, returns the
+    /// plan unchanged with an empty tail (a valid static-only plan), and a cap
+    /// above every eligible byte takes every eligible expert. Fully resident
+    /// layers are excluded, matching the donor-tail staging contract.
     pub fn with_expert_cache_tail(
         self,
         rank: &[u32],
-        requested_bytes: u64,
+        cap_bytes: u64,
     ) -> Result<(Self, DecodeShareTail), DecodeShareError> {
         let (mut plan, tail) =
-            self.with_donor_tail(rank, requested_bytes, EXPERT_CACHE_MIRROR_LABEL)?;
+            self.with_donor_tail(rank, cap_bytes, EXPERT_CACHE_MIRROR_LABEL, true)?;
         if !tail.donors.is_empty() {
             plan.expert_cache = Some(tail.clone());
         }
@@ -512,28 +521,48 @@ impl ExpertTierPlan {
         self.expert_cache.as_ref()
     }
 
+    /// Record the canonical expert-catalog identity digest the cache admission
+    /// derived from this plan (table addresses are not known yet; the latch
+    /// recomputes the identity with them). Not part of [`Self::logical_digest`].
+    pub fn with_expert_cache_identity(mut self, identity: [u8; 32]) -> Self {
+        self.expert_cache_identity = Some(identity);
+        self
+    }
+
+    /// The identity recorded by [`Self::with_expert_cache_identity`].
+    pub fn expert_cache_identity(&self) -> Option<&[u8; 32]> {
+        self.expert_cache_identity.as_ref()
+    }
+
+    /// The artifact SHA-256 pinned by [`Self::with_artifact_sha256`], if any.
+    pub fn artifact_sha256(&self) -> Option<&[u8; 32]> {
+        self.artifact_sha256.as_ref()
+    }
+
     fn with_donor_tail(
         mut self,
         rank: &[u32],
         need_bytes: u64,
         mirror_label: &str,
+        round_down: bool,
     ) -> Result<(Self, DecodeShareTail), DecodeShareError> {
         use DecodeShareError::{AlreadyShared, Insufficient, Overflow};
         if self.decode_share.is_some() || self.expert_cache.is_some() {
             return Err(AlreadyShared);
         }
+        let empty_tail = |entries: &[ExpertTierEntry]| DecodeShareTail {
+            donors: Vec::new(),
+            guard_offset: 0,
+            donor_offset: 0,
+            donor_bytes: 0,
+            mirror_offset: 0,
+            borrow_entries: entries.to_vec(),
+            class_spans: Vec::new(),
+            class_donors: Vec::new(),
+            shadow_bytes: 0,
+        };
         if need_bytes == 0 {
-            let tail = DecodeShareTail {
-                donors: Vec::new(),
-                guard_offset: 0,
-                donor_offset: 0,
-                donor_bytes: 0,
-                mirror_offset: 0,
-                borrow_entries: self.entries.clone(),
-                class_spans: Vec::new(),
-                class_donors: Vec::new(),
-                shadow_bytes: 0,
-            };
+            let tail = empty_tail(&self.entries);
             return Ok((self, tail));
         }
         let padded = |e: &ExpertTierEntry| -> Result<u64, DecodeShareError> {
@@ -562,13 +591,22 @@ impl ExpertTierPlan {
             if e.tier != Placement::Device || !layer_has_host[idx / EXPERTS] || is_donor[idx] {
                 continue;
             }
-            got = got.checked_add(padded(e)?).ok_or(Overflow)?;
+            let next = got.checked_add(padded(e)?).ok_or(Overflow)?;
+            if round_down && next > need_bytes {
+                break;
+            }
+            got = next;
             is_donor[idx] = true;
             if got >= need_bytes {
                 break;
             }
         }
-        if got < need_bytes {
+        if round_down {
+            if got == 0 {
+                let tail = empty_tail(&self.entries);
+                return Ok((self, tail));
+            }
+        } else if got < need_bytes {
             return Err(Insufficient {
                 need: need_bytes,
                 available: got,
@@ -885,6 +923,7 @@ pub fn plan_expert_tiers_from_slabs(
         host_windows: Vec::new(),
         decode_share: None,
         expert_cache: None,
+        expert_cache_identity: None,
         artifact_sha256: None,
         digest,
     })
@@ -1795,7 +1834,7 @@ mod tests {
         let before = device_plan(&rank);
         let (cache, t) = before
             .clone()
-            .with_expert_cache_tail(&rank, 3 * PADDED - 1)
+            .with_expert_cache_tail(&rank, 4 * PADDED - 1)
             .unwrap();
         assert_eq!(t.donors, vec![5, 6, 7]);
         assert_eq!(t.donor_bytes, 3 * PADDED);
@@ -1862,11 +1901,64 @@ mod tests {
             before.clone().with_expert_cache_tail(&rank, 0).unwrap().0,
             before
         );
-        let (cache, tail) = before.with_expert_cache_tail(&rank, PADDED + 1).unwrap();
+        let (cache, tail) = before
+            .with_expert_cache_tail(&rank, 3 * PADDED - 1)
+            .unwrap();
         assert_eq!(tail.donors, model_ids(1, 1..3));
         for expert in 0..512 {
             assert_eq!(cache.entry(0, expert).unwrap().tier, Placement::Device);
             assert_eq!(tail.borrow_entries[expert].tier, Placement::Device);
         }
+    }
+
+    #[test]
+    fn expert_cache_tail_cap_rounds_down_to_whole_experts_and_clamps() {
+        let rank = model_ids(0, 0..8);
+        let before = device_plan(&rank);
+        // A cap below one span takes nothing: the plan is unchanged and has no
+        // cache tail (a valid static-only plan, not an error).
+        for cap in [0, 1, PADDED - 1] {
+            let (plan, tail) = before
+                .clone()
+                .with_expert_cache_tail(&rank, cap)
+                .expect("a small cap is static-only, not an error");
+            assert_eq!(plan, before, "cap {cap}");
+            assert!(tail.donors.is_empty() && plan.expert_cache_tail().is_none());
+        }
+        // An exact multiple takes exactly that many experts; one byte less takes one fewer.
+        for (cap, want) in [
+            (PADDED, 1usize),
+            (2 * PADDED - 1, 1),
+            (2 * PADDED, 2),
+            (3 * PADDED + PADDED / 2, 3),
+        ] {
+            let (_, tail) = before.clone().with_expert_cache_tail(&rank, cap).unwrap();
+            assert_eq!(tail.donors.len(), want, "cap {cap}");
+            assert_eq!(tail.donor_bytes, want as u64 * PADDED, "cap {cap}");
+        }
+        // A cap above every eligible donor byte clamps to all eligible experts
+        // (all 8 device experts of the mixed layer), never an error.
+        let (_, all) = before
+            .clone()
+            .with_expert_cache_tail(&rank, u64::MAX)
+            .unwrap();
+        assert_eq!(all.donors, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(all.donor_bytes, 8 * PADDED);
+    }
+
+    #[test]
+    fn expert_cache_identity_is_recorded_but_is_not_plan_identity() {
+        let rank = model_ids(0, 0..8);
+        let plan = device_plan(&rank);
+        assert_eq!(plan.expert_cache_identity(), None);
+        let digest = plan.logical_digest();
+        let marked = plan.clone().with_expert_cache_identity([9u8; 32]);
+        assert_eq!(marked.expert_cache_identity(), Some(&[9u8; 32]));
+        assert_eq!(marked.logical_digest(), digest);
+        assert_eq!(plan.artifact_sha256(), None);
+        assert_eq!(
+            plan.with_artifact_sha256([7u8; 32]).artifact_sha256(),
+            Some(&[7u8; 32])
+        );
     }
 }

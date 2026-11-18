@@ -14944,7 +14944,7 @@ impl Qwen4GpuForward {
         self.moe_cache_prefill = prefill_runtimes;
         self.cache_routes = Some(routes);
         self.expert_cache = Some(cache);
-        eprintln!("  qwen4 exact expert cache: decode-only, tail={}%, max-inflight={}, routed ids unchanged", policy.tail_percent, policy.max_inflight);
+        eprintln!("  qwen4 exact expert cache: decode-only, tail cap={:?} bytes (None = default {}% of the ranked device owner), max-inflight={}, routed ids unchanged", policy.tail_bytes_cap, crate::expert_cache_config::DEFAULT_DONOR_PERCENT, policy.max_inflight);
         eprintln!("  qwen4 exact expert cache: dirty prompt tiles below {} rows read immutable core/host tables", self.cache_prefill_stage_min_rows(gpu));
         Ok(())
     }

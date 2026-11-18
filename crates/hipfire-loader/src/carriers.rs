@@ -2353,7 +2353,7 @@ fn qwen4_plan_hotset_placement_with_cache(
         hotsets::require_experts(plain.device_experts()).map_err(|skip| skip.to_string())?;
         let mut overhead = 0u64;
         let plan = if let Some(cache) = cache {
-            let requested = cache.tail_bytes(plain.owner_bytes(Placement::Device))?;
+            let requested = cache.tail_cap_bytes(plain.owner_bytes(Placement::Device))?;
             let (cached, _) = plain
                 .clone()
                 .with_expert_cache_tail(rank, requested)
@@ -5653,6 +5653,14 @@ pub fn qwen4_preload_resource_plan(
                         expert_cache,
                     )
                     .map_err(|error| format!("qwen4 preload plan: hotset plan: {error}"))?;
+                    // Cache admission: the runtime expert catalog of the admitted plan,
+                    // refused by its CatalogError before any materialization.
+                    let plan = if expert_cache.is_some() {
+                        hipfire_arch_qwen4::expert_cache_config::record_catalog_identity(plan)
+                            .map_err(|error| format!("qwen4 preload plan: {error}"))?
+                    } else {
+                        plan
+                    };
                     plan.check_executable(&gpu.arch)
                         .map_err(|error| format!("qwen4 preload plan: hotset plan: {error}"))?;
                     let host_bytes = plan
@@ -6176,7 +6184,8 @@ pub fn qwen4_preload_resource_plan(
     plan["whole_load_host_union_bytes"] = serde_json::json!(whole_host_union_bytes);
     if let Some(cache) = expert_cache {
         plan["expert_cache"] = serde_json::json!({
-            "requested": true, "tail_percent": cache.tail_percent,
+            "requested": true, "tail_bytes_cap": cache.tail_bytes_cap,
+            "static_only": cache.is_static_only(),
             "max_inflight": cache.max_inflight,
             "device_tables_routes_queue_reserve_bytes": cache.device_reserve_bytes(
                 config.num_hidden_layers, config.num_experts, config.num_experts_per_tok,
@@ -8110,6 +8119,14 @@ fn load_qwen4_rank_unscoped(
             // region at the start of the donor tail; record it so the lease
             // (and the forward) know the scratch backing starts after it.
             let plan = qwen4_record_shadow_region(plan, need.is_some(), decode_share_shadow_bytes)?;
+            // Cache admission: the runtime expert catalog of the admitted plan, refused by
+            // its CatalogError before any materialization; its identity rides on the plan.
+            let plan = if expert_cache.is_some() {
+                hipfire_arch_qwen4::expert_cache_config::record_catalog_identity(plan)
+                    .map_err(|error| format!("qwen4: {error}"))?
+            } else {
+                plan
+            };
             let growth = if grow && plan.decode_share_tail().is_some() {
                 // What the plain reserve would have placed, for the load log.
                 let plain_total = hotsets::require_budget(residency::expert_hotset_budget(
@@ -9357,6 +9374,10 @@ fn load_qwen4_rank_unscoped(
                     lease.owner_bytes(Placement::HostMapped) as f64 / (1u64 << 30) as f64,
                 ),
             );
+        } else if expert_cache.is_some() {
+            eprintln!(
+                "  qwen4 exact expert cache: static-only plan, no evictable slots (the tail cap rounds to zero experts or no layer has host experts); nothing attached"
+            );
         }
         if let Some(tail) = share_tail.as_ref().filter(|tail| !tail.donors.is_empty()) {
             let share_digest = |view| {
@@ -9602,7 +9623,11 @@ fn load_qwen4_rank_unscoped(
                 ctx.max_seq
             ),
         })?;
-    if let Some(cache) = expert_cache {
+    let cache_backed = bundle
+        .weights
+        .expert_tiers()
+        .is_some_and(|lease| lease.expert_cache_ranges().is_some());
+    if let Some(cache) = expert_cache.filter(|_| cache_backed) {
         let Some(sidecar) = hotset.as_ref() else {
             let _ = bundle.free_gpu(ctx.gpu);
             return Err("qwen4: expert-cache sidecar disappeared after placement".into());
@@ -14923,7 +14948,7 @@ mod qwen4_admission_tests {
         };
         let (slabs, rank) = decode_share_fixture();
         let cache = ExpertCacheConfig {
-            tail_percent: 50,
+            tail_bytes_cap: None,
             max_inflight: 64,
         };
         let run = |total, cache, share| {
@@ -15006,6 +15031,69 @@ mod qwen4_admission_tests {
             .flat_map(|expert| (0..48u32).map(move |layer| layer * 512 + expert))
             .collect();
         (slabs, rank)
+    }
+
+    #[test]
+    fn expert_cache_tail_cap_bytes_size_the_planned_donor_tail() {
+        use hipfire_arch_qwen4::{
+            expert_cache_config::ExpertCacheConfig, expert_hotset::HotsetBudget,
+            expert_tier_plan::Placement,
+        };
+        // The fixture's padded expert (1000 B gate/up + 500 B down, each 256-aligned).
+        const SPAN: u64 = 1024 + 512;
+        let (slabs, rank) = decode_share_fixture();
+        let run = |cache: Option<Option<u64>>| {
+            super::qwen4_plan_hotset_placement_with_cache(
+                &slabs,
+                &rank,
+                HotsetBudget::parse(Some("8")).unwrap(),
+                128 << 20,
+                true,
+                (48, 512, false),
+                None,
+                &[],
+                cache.map(|tail_bytes_cap| ExpertCacheConfig {
+                    tail_bytes_cap,
+                    max_inflight: 64,
+                }),
+            )
+            .unwrap()
+        };
+        let (plain, plain_pin, plain_stage) = run(None);
+        // Unset: half the ranked device owner, rounded down to whole experts.
+        let (default, pin, stage) = run(Some(None));
+        let tail = default.expert_cache_tail().unwrap();
+        let half = plain.owner_bytes(Placement::Device) / 2;
+        assert_eq!((pin, stage), (plain_pin, plain_stage));
+        assert_eq!(tail.donor_bytes % SPAN, 0);
+        assert!(tail.donor_bytes <= half && tail.donor_bytes + SPAN > half);
+        // An explicit cap rounds down to whole experts.
+        let (three, _, _) = run(Some(Some(4 * SPAN - 1)));
+        assert_eq!(three.expert_cache_tail().unwrap().donors.len(), 3);
+        // Zero is a valid static-only plan: no tail and exactly the plain placement.
+        let (zero, zero_pin, zero_stage) = run(Some(Some(0)));
+        assert!(zero.expert_cache_tail().is_none());
+        assert_eq!((zero_pin, zero_stage), (plain_pin, plain_stage));
+        assert_eq!(zero.device_experts(), plain.device_experts());
+        assert_eq!(
+            zero.owner_bytes(Placement::Device),
+            plain.owner_bytes(Placement::Device)
+        );
+        assert_eq!(
+            zero.owner_bytes(Placement::HostMapped),
+            plain.owner_bytes(Placement::HostMapped)
+        );
+        // A cap above every donor byte clamps to every eligible device expert.
+        let (all, _, _) = run(Some(Some(u64::MAX)));
+        assert_eq!(
+            all.expert_cache_tail().unwrap().donors.len(),
+            plain.device_experts()
+        );
+        // The fixture's spans are not real Mq4Xts payload sizes: the catalog refuses the plan
+        // with its named error instead of attaching it.
+        let error =
+            hipfire_arch_qwen4::expert_cache_config::record_catalog_identity(default).unwrap_err();
+        assert!(error.starts_with("exact expert cache catalog: "), "{error}");
     }
 
     fn device_ids(plan: &hipfire_arch_qwen4::expert_tier_plan::ExpertTierPlan) -> Vec<usize> {

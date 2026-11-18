@@ -27,12 +27,16 @@ somewhere in this file).
 
 ## Experimental Flash-Next exact expert cache
 
-`HIPFIRE_QWEN4_EXPERT_CACHE=1` (typed boolean; default off) enables the
-exact expert LRU described in [CONFIG.md](CONFIG.md). It requires one gfx1201
+`memory.moe_expert_cache=on` (env `HIPFIRE_MOE_EXPERT_CACHE=on`; `off|auto|on`,
+default `off`) enables the exact expert LRU described in [CONFIG.md](CONFIG.md).
+It is read only by the Qwen4 / Flash-Next load route and requires one gfx1201
 GPU, uniform QT44/QT53 Flash-Next weights and an applicable ranked hotset.
 Set speculation off, `HIPFIRE_QWEN4_DECODE_SHARE=off` and
 `HIPFIRE_OFFLOAD_EXEC=pcie`. CPU/D2, EP/PP/TP, continuous batching, NPU, S1,
-expert-keep and whole-first placement are refused. Routing is unchanged; a
+expert-keep and whole-first placement are refused as named load errors.
+`auto` is currently static placement: no route has passed its measured
+qualification, so it logs one line naming why and loads without the cache.
+Routing is unchanged; a
 miss runs from canonical mapped host bytes and schedules a bounded paired
 fill for later tokens. Dirty prefill tiles below the effective expert-staging
 threshold (2048 rows by default on gfx1201) use independent immutable tables:
@@ -50,10 +54,12 @@ checked, including TOML `developer.railgun_check`; disabling the cache preserves
 ordinary railgun checking. `sample(N)` has no such weight-digest conflict,
 which is not a claim that the combination has been qualified.
 
-`HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT` defaults to `50` and accepts
-`1..=100`; it requests the evictable fraction of the resident expert owner,
-rounded to whole experts from mixed-residency layers. Only that tail needs an
-extra immutable host mirror. `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` defaults to
+`memory.moe_expert_cache_tail_bytes` (env `HIPFIRE_MOE_EXPERT_CACHE_TAIL_BYTES`)
+caps the evictable donor bytes in plain bytes, rounded down to whole experts
+from mixed-residency layers; unset means 50% of the resident expert owner
+(also rounded down) and `0` is a static-only plan with nothing attached. Only
+the evictable tail needs an extra immutable host mirror.
+`HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` defaults to
 `64` and accepts `1..=4096` paired fills. Table/route owners and a conservative
 32 MiB device queue margin plus 128 MiB host metadata margin join admission;
 the host margin covers both additional expert runtimes (decode and immutable
@@ -1238,6 +1244,8 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `max_total_think_tokens` | `HIPFIRE_MAX_TOTAL_THINK_TOKENS` |
 | `memory.gpu_layer_budget` | `HIPFIRE_GPU_LAYER_BUDGET` |
 | `memory.moe_expert_budget` | `HIPFIRE_MOE_EXPERT_BUDGET` |
+| `memory.moe_expert_cache` | `HIPFIRE_MOE_EXPERT_CACHE` |
+| `memory.moe_expert_cache_tail_bytes` | `HIPFIRE_MOE_EXPERT_CACHE_TAIL_BYTES` |
 | `memory.state_quant` | `HIPFIRE_STATE_QUANT` |
 | `memory.offload_exec` | `HIPFIRE_OFFLOAD_EXEC` |
 | `memory.embed_host` | `HIPFIRE_EMBED_HOST` |
@@ -1333,7 +1341,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1946
+**Count:** 1944
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2319,8 +2327,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MOE_EXPERTS_MQ5` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_MOE_EXPERTS_MQ6` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_MOE_EXPERT_BUDGET` | crates/hipfire-arch-lfm2moe/tests/offload_parity.rs, crates/hipfire-config/src/lib.rs | stable |
-| `HIPFIRE_MOE_EXPERT_CACHE` | crates/hipfire-config/src/lib.rs | experimental |
-| `HIPFIRE_MOE_EXPERT_CACHE_TAIL_BYTES` | crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_MOE_EXPERT_CACHE` | crates/hipfire-arch-qwen4/src/expert_cache_config.rs, crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_MOE_EXPERT_CACHE_TAIL_BYTES` | crates/hipfire-arch-qwen4/src/expert_cache_config.rs, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_MOE_EXPERT_STATS` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
 | `HIPFIRE_MOE_EXPERT_STATS_OUT` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-runtime/examples/eval_hipfire.rs | developer |
 | `HIPFIRE_MOE_GATE_UP_CPOL` | crates/rdna-compute/src/gemv.rs | developer |
@@ -2652,9 +2660,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_EP_WIDE_VERIFY` | crates/hipfire-arch-qwen4/examples/qwen4_ep_kld.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/examples/fn_wide_kl_oracle.rs | developer |
 | `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` | crates/hipfire-arch-qwen4/examples/qwen4_ep_kld.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
-| `HIPFIRE_QWEN4_EXPERT_CACHE` | crates/hipfire-arch-qwen4/src/expert_cache_config.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` | crates/hipfire-arch-qwen4/src/expert_cache_config.rs | developer |
-| `HIPFIRE_QWEN4_EXPERT_CACHE_TAIL_PERCENT` | crates/hipfire-arch-qwen4/src/expert_cache_config.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_DROP_ZERO` | crates/hipfire-arch-qwen4/src/artifact.rs, crates/hipfire-arch-qwen4/src/weights.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_HOTSET` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-arch-qwen4/src/expert_ep_units.rs | developer |
 | `HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE` | crates/hipfire-arch-qwen4/src/expert_hotset.rs, crates/hipfire-config/src/lib.rs | developer |

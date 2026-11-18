@@ -865,7 +865,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         Some("HIPFIRE_MOE_EXPERT_CACHE"),
-        "Experimental, and not yet read by any load route (the loader slice wires it). Dynamic routed-expert cache for a Mixture-of-Experts model whose routed experts do not all fit in VRAM: off (default) keeps static placement; on requests a bounded reusable tail of device slots filled from the canonical host bytes, never changing which experts are selected or their arithmetic, and is a no-op when every routed expert is already resident; auto does the same only on a route that has passed its measured qualification. The cache is carved from the expert allocation the placement admitted (memory.moe_expert_budget keeps its layer-count/auto/full meaning and its explicit layer pins), never added to it. Size cap: memory.moe_expert_cache_tail_bytes, which requires this key to be auto or on."
+        "Experimental. Dynamic routed-expert cache for a Mixture-of-Experts model whose routed experts do not all fit in VRAM: off (default) keeps static placement; on requests a bounded reusable tail of device slots filled from the canonical host bytes, never changing which experts are selected or their arithmetic. Only the Qwen4 / Flash-Next load route reads it, on a single exact-gfx1201 GPU with a ranked expert hotset and uniform QT44/QT53 experts; every unqualified route (speculation, EP/PP/TP, CPU/D2 splice, continuous batching, NPU, decode-share, expert-keep, HIPFIRE_RAILGUN_CHECK=always, ...) refuses the load with a named error when this is on. A placement that leaves no evictable slot (every routed expert resident, or a zero tail cap) runs static. auto is currently the same as off: no route has passed its measured qualification, so auto resolves to static placement and logs one line naming why (it is not an error). The cache is carved from the expert allocation the placement admitted (memory.moe_expert_budget keeps its layer-count/auto/full meaning), never added to it. Size cap: memory.moe_expert_cache_tail_bytes, which requires this key to be auto or on."
     ),
     field!(
         "memory.moe_expert_cache_tail_bytes",
@@ -880,7 +880,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         true,
         Some("HIPFIRE_MOE_EXPERT_CACHE_TAIL_BYTES"),
-        "Upper bound, in BYTES (plain integer, no unit suffix), on the reusable device tail of the dynamic routed-expert cache (memory.moe_expert_cache). Unset/null lets the planner size the tail from the expert allocation placement admitted; 0 is a valid static-only plan (cache on, no reusable slots). Never reinterprets memory.moe_expert_budget, which counts layers. Setting it while memory.moe_expert_cache is off is a configuration error."
+        "Experimental. Upper bound, in BYTES (plain integer, no unit suffix), on the evictable donor bytes of the dynamic routed-expert cache (memory.moe_expert_cache=on), rounded DOWN to whole expert spans. Unset/null sizes the tail at 50% of the ranked device expert owner (also rounded down); 0 is a valid static-only plan (cache requested, no evictable slots, nothing attached); a cap above the eligible donor bytes takes every eligible expert. Read only by the Qwen4 / Flash-Next route on a single exact-gfx1201 GPU. Never reinterprets memory.moe_expert_budget, which counts layers. Setting it while memory.moe_expert_cache is off is a configuration error."
     ),
     // Sparse in the process config (like `replay.backend`): when the user,
     // registry or a compatibility env never set it, the key is absent, so the
@@ -4007,7 +4007,6 @@ const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_moe_down_a8",
     "developer.qwen4_moe_down_a8_indexed",
     "developer.qwen4_d2_default",
-    "developer.qwen4_expert_cache",
     "developer.qwen4_mtp_head_d2",
     "developer.qwen4_mtp_head_resident",
     "developer.qwen4_sp",
@@ -14109,6 +14108,41 @@ pub mod memory {
                     max: 65536
                 }
             ));
+        }
+
+        #[test]
+        fn removed_qwen4_expert_cache_developer_keys_are_gone() {
+            // The typed keys replace the two removed Qwen4 developer cache keys (spelled in
+            // pieces so the removed names never appear in the tree): neither is a schema key,
+            // the on/off one is no longer a typed-boolean developer key, and the non-developer
+            // spellings are unknown keys.
+            let stem = format!("qwen4_expert_{}", "cache");
+            let removed = [
+                format!("developer.{stem}"),
+                format!("developer.{stem}_tail_{}", "percent"),
+            ];
+            for key in &removed {
+                assert!(crate::field(key).is_none(), "{key}");
+                assert!(!crate::is_typed_bool_developer_key(key), "{key}");
+            }
+            for key in [
+                format!("memory.{stem}"),
+                format!("memory.{stem}_tail_{}", "percent"),
+                stem.clone(),
+                format!("moe_expert_cache_tail_{}", "percent"),
+            ] {
+                let mut layer = crate::ConfigLayer::default();
+                assert!(
+                    matches!(
+                        layer.set(&key, crate::ConfigValue::String("on".into())),
+                        Err(crate::ConfigError::UnknownKey(_))
+                    ),
+                    "{key}"
+                );
+            }
+            // The typed replacements are real schema keys.
+            assert!(crate::field("memory.moe_expert_cache").is_some());
+            assert!(crate::field("memory.moe_expert_cache_tail_bytes").is_some());
         }
 
         #[test]
