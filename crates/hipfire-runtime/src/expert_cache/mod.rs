@@ -58,6 +58,7 @@
 //! Adapters that judge request by request (DS4-style) use [`ExpertCachePolicy::reserve`],
 //! [`ExpertCachePolicy::lookup`] and [`ExpertCachePolicy::rollback`] over the same pools.
 
+pub mod catalog;
 pub mod device_io;
 mod index;
 mod policy;
@@ -71,6 +72,10 @@ pub use device_io::{
 #[cfg(test)]
 mod tests;
 
+pub use catalog::{
+    CatalogError, CatalogFacts, CatalogIdentity, ExpertCatalog, KernelAbi, LayoutClass, PoolDemand,
+    TableExtent, UnitPlanDescriptor,
+};
 pub use policy::{
     ExpertCachePolicy, FillOp, Lookup, PlanSummary, PolicyConfig, PoolConfig, PoolInit, Published,
     Reservation, Withdrawn,
