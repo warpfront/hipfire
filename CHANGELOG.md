@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+- **Fixed: automatic `max_seq` is no longer stuck at 4096 on legacy-KV loads.** The no-sequence fallback (`KvBackend::Legacy`, explicit or automatic-with-VMM-refusal) now resolves the trained window with a `pending` bound and no pre-teardown refusal — measuring against pre-teardown free VRAM misfires on serve model swaps, where the resident model is still counted. The Qwen35 carrier clamps to its post-weight card cap at the same site as the VMM bound (vision and draft reserves included), minus a 512 MiB contiguity margin for the single upfront allocation, and refuses below the 512 floor there. The load summary reports the measured bound (`card`/`model`) with the legacy KV label instead of `legacy`. On unified-memory APUs the resolved context is committed at load (host RAM pinned at idle), unlike VMM's on-demand growth; the margin does not cap UMA loads. Backend-gated, not OS-gated: explicit `--kv-backend legacy` on any OS measures, and Qwen4/MoE/directory loads keep their existing behavior. `hipfire fit` is unchanged (still advisory for these loads).
+
+## v0.4.5 — 2026-10-30
 
 - **One host-RAM admission measure for every loader that pins host memory (no behaviour change for Qwen4 or the host-offload path):** `hipfire_runtime::offload::pinnable_host_ram` reads `MemAvailable - CMA` plus TTM's page-pool estimate (freed GTT pages a GTT-backed pin takes first, outside `MemAvailable`), and `PinnableHostRam::admit` applies the 4 GiB headroom. Qwen4's experts, stage mirrors, slow-link prefill budget, carriers and `hipfire fit`, and the generic host-offload admission now call it; Qwen4's private copies of the pool estimate, headroom and GTT budget are gone.
 
