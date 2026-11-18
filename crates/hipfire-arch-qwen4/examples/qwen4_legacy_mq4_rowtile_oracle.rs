@@ -616,8 +616,8 @@ impl Model {
             },
             "budget": {
                 "host_union_upper_bound_bytes": host,
-                "host_headroom_bytes": residency::HOST_RAM_HEADROOM_BYTES,
-                "host_reservation_budget_bytes": quote_add(host, residency::HOST_RAM_HEADROOM_BYTES, "host budget with headroom")?,
+                "host_headroom_bytes": hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES,
+                "host_reservation_budget_bytes": quote_add(host, hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES, "host budget with headroom")?,
                 "pinned_gtt_demand_bytes": pinned,
                 "device_allocation_upper_bound_bytes": device,
                 "model_only_remaining_device_bytes": quote_number(&base, "/component_union/device_union_upper_bound_bytes")?,
@@ -1473,12 +1473,11 @@ fn enforce_preload_capacity(quote: &serde_json::Value) -> Result<(), String> {
     // oracle arrays never become an invented pinned/GTT charge.
     residency::check_host_ram(
         quote_number(quote, "/budget/host_union_upper_bound_bytes")?,
-        rdna_compute::kv_slots::mem_available_bytes(),
-        residency::ttm_pool_estimate(),
+        hipfire_runtime::offload::pinnable_host_ram(None),
     )?;
     residency::check_gtt_cap(
         quote_number(quote, "/budget/pinned_gtt_demand_bytes")?,
-        residency::gtt_budget(),
+        hipfire_runtime::offload::gtt_budget(),
     )
 }
 

@@ -15,10 +15,9 @@
 use crate::gpu_forward::Qwen4ForwardScratchMode;
 use crate::weights::{Qwen4BandScope, Qwen4EpPlacement};
 use crate::Qwen4Config;
+use hipfire_runtime::offload::{gtt_budget, pinnable_host_ram, GttBudget, PinnableHostRam};
 use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
-use rdna_compute::uma_memory::{
-    amdgpu_gtt_used_bytes, read_sysfs_u64, TTM_PAGES_LIMIT, TTM_PAGE_BYTES,
-};
+use rdna_compute::uma_memory::{TTM_PAGES_LIMIT, TTM_PAGE_BYTES};
 
 /// `N` keeps the routed experts of trunk layers `0..N` in VRAM; `auto` picks
 /// the largest `N` that fits the card's free VRAM. Unset keeps every expert
@@ -122,9 +121,6 @@ pub const AUTO_VRAM_RESERVE_MAX_SEQ: usize = 32768;
 /// Prefill chunk [`AUTO_VRAM_RESERVE_BYTES`] was measured at; its forward
 /// scratch then carried speculative logits and argmax for every chunk row.
 pub const AUTO_VRAM_RESERVE_CHUNK: usize = 1536;
-
-/// Host RAM that must remain available after the pinned experts are placed.
-pub const HOST_RAM_HEADROOM_BYTES: u64 = 4 << 30;
 
 /// Slack `Gpu::upload_raw_host_mapped` adds to every host-mapped tensor.
 pub const HOST_MAPPED_PAD_BYTES: u64 = 1 << 20;
@@ -3751,8 +3747,7 @@ pub(crate) fn admit_stage_mirrors(mirror_bytes: u64, later_host_bytes: u64) -> R
     admit_stage_mirrors_on(
         mirror_bytes,
         later_host_bytes,
-        rdna_compute::kv_slots::mem_available_bytes(),
-        ttm_pool_estimate(),
+        pinnable_host_ram(None),
         gtt_budget(),
     )
 }
@@ -3760,12 +3755,11 @@ pub(crate) fn admit_stage_mirrors(mirror_bytes: u64, later_host_bytes: u64) -> R
 fn admit_stage_mirrors_on(
     mirror_bytes: u64,
     later_host_bytes: u64,
-    mem_available: Option<u64>,
-    ttm_pool_bytes: u64,
+    ram: PinnableHostRam,
     gtt: Option<GttBudget>,
 ) -> Result<(), String> {
     let charge = mirror_bytes.saturating_add(later_host_bytes);
-    check_host_ram(charge, mem_available, ttm_pool_bytes).and_then(|()| check_gtt_cap(charge, gtt))
+    check_host_ram(charge, ram).and_then(|()| check_gtt_cap(charge, gtt))
 }
 
 /// Pinned host RAM/GTT the borrowed slab stage's two donor restore copies take
@@ -4357,96 +4351,17 @@ pub fn ep_fit_report(
 }
 
 /// Refuse before any allocation when the pinned experts would not leave
-/// [`HOST_RAM_HEADROOM_BYTES`] of the host RAM they can take: `mem_available`
-/// (`MemAvailable - CMA`; CMA pageblocks serve only movable allocations)
-/// plus `ttm_pool_bytes`, the estimate of freed GTT pages parked in TTM's
-/// page pool ([`ttm_pool_estimate`]). Pinned pages cannot be reclaimed, so
+/// [`hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES`] of the host RAM they can take
+/// ([`PinnableHostRam::admit`]). Pinned pages cannot be reclaimed, so
 /// over-committing them starves the rest of the host.
-pub fn check_host_ram(
-    host_bytes: u64,
-    mem_available: Option<u64>,
-    ttm_pool_bytes: u64,
-) -> Result<(), String> {
-    if host_bytes == 0 {
-        return Ok(());
-    }
-    let Some(available) = mem_available else {
-        return Err(format!(
-            "routed experts need {:.1} GiB of pinned host RAM, but MemAvailable is unreadable",
-            host_bytes as f64 / GIB
-        ));
-    };
-    let needed = host_bytes + HOST_RAM_HEADROOM_BYTES;
-    if available.saturating_add(ttm_pool_bytes) < needed {
-        return Err(format!(
-            "routed experts need {:.1} GiB of pinned host RAM plus {:.0} GiB headroom, but \
-             MemAvailable - CMA is {:.1} GiB (plus {:.1} GiB estimated in TTM's page pool); free host \
-             memory or keep more expert layers in VRAM ({EXPERT_VRAM_LAYERS_ENV})",
-            host_bytes as f64 / GIB,
-            HOST_RAM_HEADROOM_BYTES as f64 / GIB,
-            available as f64 / GIB,
-            ttm_pool_bytes as f64 / GIB
-        ));
-    }
-    Ok(())
-}
-
-fn host_mapped_is_gtt() -> bool {
-    std::env::var("HSA_USERPTR_FOR_PAGED_MEM").is_ok_and(|value| value.trim() == "0")
-}
-
-/// Host RAM held in TTM's page pool that the host-mapped experts can take
-/// ([`rdna_compute::uma_memory::ttm_pool_bytes`]). amdgpu parks the
-/// write-combined and uncached pages of freed GTT buffers there, up to
-/// `page_pool_size` (half of RAM by default), so a Flash-Next process that
-/// exits leaves its host-mapped experts' pages in it. A new GTT allocation
-/// takes pages from the pool first, and TTM's shrinker frees it under memory
-/// pressure (`echo 2 | sudo tee /proc/sys/vm/drop_caches` empties it at
-/// once). 0 unless host-mapped memory is GTT-backed
-/// (`HSA_USERPTR_FOR_PAGED_MEM=0`), or when sysfs or `/proc/meminfo` is
-/// unreadable. Loads that hold a [`rdna_compute::Gpu`] use
-/// [`ttm_pool_estimate_on`], which also counts the pool on a GTT-backed APU.
-pub fn ttm_pool_estimate() -> u64 {
-    if !host_mapped_is_gtt() {
-        return 0;
-    }
-    rdna_compute::uma_memory::ttm_pool_bytes()
-}
-
-/// [`ttm_pool_estimate`] for a load on `gpu`. A GTT-backed unified-memory APU
-/// (Strix Halo: a 1 GiB carve-out, the rest of the device pool is GTT) takes
-/// every allocation, weights and scratch included, from GTT, so a previous
-/// process's freed pages parked in TTM's page pool are available to it whether
-/// or not `HSA_USERPTR_FOR_PAGED_MEM=0` is set (hip-bridge leaves it unset on
-/// an APU, which ignores it). Without this count a reload after any exit
-/// reads the ~80 GiB the last process parked as `MemAvailable` it does not
-/// have.
-pub fn ttm_pool_estimate_on(gpu: &rdna_compute::Gpu) -> u64 {
-    if gpu.is_gtt_backed_apu() {
-        return rdna_compute::uma_memory::ttm_pool_bytes();
-    }
-    ttm_pool_estimate()
-}
-
-/// GTT room on the host: TTM's cap and what amdgpu devices already hold.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GttBudget {
-    pub limit_bytes: u64,
-    pub used_bytes: u64,
-}
-
-/// The GTT budget when host-mapped memory is GTT-backed, i.e. when
-/// `HSA_USERPTR_FOR_PAGED_MEM` is `0` (hip-bridge's default). It is `None`
-/// under userptr, or when sysfs does not expose TTM's limit. `used_bytes`
-/// sums `mem_info_gtt_used` over every amdgpu device.
-pub fn gtt_budget() -> Option<GttBudget> {
-    if !host_mapped_is_gtt() {
-        return None;
-    }
-    let limit_bytes = read_sysfs_u64(TTM_PAGES_LIMIT.as_ref())?.checked_mul(TTM_PAGE_BYTES)?;
-    Some(GttBudget {
-        limit_bytes,
-        used_bytes: amdgpu_gtt_used_bytes()?,
+pub fn check_host_ram(host_bytes: u64, ram: PinnableHostRam) -> Result<(), String> {
+    ram.admit(host_bytes).map_err(|shortfall| {
+        shortfall.describe(
+            "routed experts",
+            &format!(
+                "free host memory or keep more expert layers in VRAM ({EXPERT_VRAM_LAYERS_ENV})"
+            ),
+        )
     })
 }
 
@@ -5001,9 +4916,9 @@ pub(crate) fn j1778_bf16_manifest() -> Vec<WeightEntry> {
 mod tests {
     use super::*;
     use crate::gpu_forward::Qwen4ForwardScratchMode::{FnSymGfx1201, Full};
+    use hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES;
     use hipfire_runtime::weight_manifest::ShardPolicy;
     use rdna_compute::tensor_ops::QsaKvFormat::{self, F32};
-    use rdna_compute::uma_memory::ttm_pool_estimate_from;
     use rdna_compute::DType;
 
     fn entry(name: &str, layer: usize) -> WeightEntry {
@@ -8127,18 +8042,19 @@ mod tests {
         }
     }
 
+    fn ram(available: u64) -> PinnableHostRam {
+        PinnableHostRam {
+            mem_available: Some(available),
+            ttm_pool: 0,
+        }
+    }
+
     #[test]
-    fn host_ram_check_refuses_below_headroom() {
+    fn host_ram_refusal_names_the_expert_vram_layers_knob() {
         let host = 60u64 << 30;
-        assert!(check_host_ram(host, Some(host + HOST_RAM_HEADROOM_BYTES), 0).is_ok());
-        let error = check_host_ram(host, Some(host + HOST_RAM_HEADROOM_BYTES - 1), 0).unwrap_err();
-        assert!(error.contains("MemAvailable"), "{error}");
-        assert!(check_host_ram(host, None, 0).is_err());
-        assert!(check_host_ram(host, None, u64::MAX).is_err());
-        assert!(check_host_ram(0, None, 0).is_ok());
-        // The pool counts toward the room, byte for byte.
-        assert!(check_host_ram(host, Some(host), HOST_RAM_HEADROOM_BYTES).is_ok());
-        assert!(check_host_ram(host, Some(host), HOST_RAM_HEADROOM_BYTES - 1).is_err());
+        let error = check_host_ram(host, ram(host + HOST_RAM_HEADROOM_BYTES - 1)).unwrap_err();
+        assert!(error.contains("routed experts"), "{error}");
+        assert!(error.contains(EXPERT_VRAM_LAYERS_ENV), "{error}");
     }
 
     #[test]
@@ -8170,13 +8086,11 @@ mod tests {
             let mut staged = [false; 2];
             for rank in 0..2 {
                 // The loader's placement check: this rank and every later rank's pins.
-                check_host_ram(experts[rank..].iter().sum(), Some(available), 0)
-                    .map_err(|_| rank)?;
+                check_host_ram(experts[rank..].iter().sum(), ram(available)).map_err(|_| rank)?;
                 available -= experts[rank];
                 let pending = pending_stage_mirror_bytes(layer, rank, 2).unwrap();
                 let later = experts[rank + 1..].iter().sum();
-                staged[rank] =
-                    admit_stage_mirrors_on(pending, later, Some(available), 0, None).is_ok();
+                staged[rank] = admit_stage_mirrors_on(pending, later, ram(available), None).is_ok();
                 if staged[rank] {
                     available -= mirror;
                 }
@@ -8273,8 +8187,8 @@ mod tests {
         let ep2 = expert_stage_mirror_bytes(full / 2, 2).unwrap();
         assert_eq!(charge - ep2, 8 * HOST_MAPPED_PAD_BYTES);
         // Host RAM admission takes the total over all four ranks, byte for byte.
-        assert!(check_host_ram(charge, Some(charge + HOST_RAM_HEADROOM_BYTES), 0).is_ok());
-        assert!(check_host_ram(charge, Some(charge + HOST_RAM_HEADROOM_BYTES - 1), 0).is_err());
+        assert!(check_host_ram(charge, ram(charge + HOST_RAM_HEADROOM_BYTES)).is_ok());
+        assert!(check_host_ram(charge, ram(charge + HOST_RAM_HEADROOM_BYTES - 1)).is_err());
         // So does the GTT cap: one rank's quarter fits where the four-rank total does not.
         let budget = |limit_bytes| {
             Some(GttBudget {
@@ -8285,56 +8199,6 @@ mod tests {
         assert!(check_gtt_cap(charge, budget(charge)).is_ok());
         assert!(check_gtt_cap(charge, budget(charge - 1)).is_err());
         assert!(check_gtt_cap(charge / 4, budget(charge - 1)).is_ok());
-    }
-
-    /// `/proc/meminfo` text from `(field, MiB)` pairs.
-    fn meminfo(fields: &[(&str, u64)]) -> String {
-        fields
-            .iter()
-            .map(|(key, mib)| format!("{key}:{:>16} kB\n", mib << 10))
-            .collect()
-    }
-
-    /// The measured 5-card gfx1201 host (MemTotal 128865156 kB, pool cap
-    /// 16108144 pages), 5 x 16 MiB of idle GTT, and `pool_mib` of pages outside
-    /// every counter on top of `baseline_mib`.
-    fn gfx1201_host(pool_mib: u64, baseline_mib: u64) -> String {
-        let total = 128_865_156 >> 10;
-        let (anon, slab, sreclaim) = (14 << 10, 3 << 10, 2 << 10);
-        let cached = total - pool_mib - baseline_mib - 80 - anon - slab - 1024;
-        meminfo(&[
-            ("MemTotal", total),
-            ("MemFree", 1024),
-            ("MemAvailable", 45_800),
-            ("Cached", cached),
-            ("SwapCached", 0),
-            ("AnonPages", anon),
-            ("Shmem", 2048),
-            ("KReclaimable", sreclaim),
-            ("Slab", slab),
-            ("SReclaimable", sreclaim),
-        ])
-    }
-
-    #[test]
-    fn leftover_pool_admits_the_reload_and_a_real_shortage_still_refuses() {
-        // N=12 host-maps 46.1 GiB; the reported refusal read MemAvailable 45.8 GiB.
-        let host = 47_206u64 << 20;
-        let available = Some(46_899u64 << 20);
-        let gtt = 5 * (16 << 20);
-        assert!(check_host_ram(host, available, 0).is_err());
-        let leftover = ttm_pool_estimate_from(&gfx1201_host(59_737, 2826), gtt, 16_108_144);
-        assert!(check_host_ram(host, available, leftover.unwrap()).is_ok());
-        // The same MemAvailable with nothing parked in the pool.
-        let empty = ttm_pool_estimate_from(&gfx1201_host(0, 2826), gtt, 16_108_144);
-        let error = check_host_ram(host, available, empty.unwrap()).unwrap_err();
-        assert!(
-            error.contains("MemAvailable - CMA is 45.8 GiB (plus 0.0 GiB"),
-            "{error}"
-        );
-        // A pool smaller than the 4.3 GiB gap still refuses.
-        let small = ttm_pool_estimate_from(&gfx1201_host(3 << 10, 2826), gtt, 16_108_144);
-        assert!(check_host_ram(host, available, small.unwrap()).is_err());
     }
 
     #[test]

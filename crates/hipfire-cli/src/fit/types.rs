@@ -189,6 +189,17 @@ pub(crate) struct FitHost {
     pub devices: Vec<FitDevice>,
 }
 
+impl FitHost {
+    /// The pinnable-host-RAM measure `check_host_ram` admits against. The two
+    /// fields stay separate so the serialized report keeps its keys.
+    pub(crate) fn host_ram(&self) -> hipfire_runtime::offload::PinnableHostRam {
+        hipfire_runtime::offload::PinnableHostRam {
+            mem_available: self.mem_available,
+            ttm_pool: self.ttm_pool,
+        }
+    }
+}
+
 /// Where the weights go.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct PlacementPlan {

@@ -980,7 +980,7 @@ mod tests {
         Qwen4HostCheckInputs {
             host_check_bytes: 20 << 30,
             stage_mirror_bytes: 1 << 30,
-            host_headroom_bytes: crate::expert_residency::HOST_RAM_HEADROOM_BYTES,
+            host_headroom_bytes: hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES,
             ttm_pool_bytes: 0,
             mem_available_bytes: Some(64 << 30),
             gtt_budget_bytes: None,

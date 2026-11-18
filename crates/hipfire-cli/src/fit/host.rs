@@ -19,7 +19,7 @@
 //!   fed `hipMemGetInfo`'s two numbers as amdgpu's sysfs counters give them
 //!   ([`device_free`]).
 //! - Host RAM, TTM pool, GTT cap: the `uma_memory` meminfo helpers and a
-//!   root-injectable mirror of `expert_residency::{ttm_pool_estimate,
+//!   root-injectable mirror of `hipfire_runtime::offload::{pinnable_host_ram,
 //!   gtt_budget}` ([`read_memory`]); those two read the live system, so they
 //!   cannot be pointed at a test tree.
 //! - Link: `calibration::lookup_in` + `host_link::link_from_calibration`
@@ -65,8 +65,8 @@ pub(crate) struct HostInputs {
 /// then empty and the note carries the fix. Other notes are unreadable counters.
 ///
 /// Production overrides the sysfs/proc-derived memory facts with the engine's own
-/// live readers: `uma_memory::{host_total_bytes, mem_available_bytes}` always,
-/// and `expert_residency::{ttm_pool_estimate, gtt_budget}` when
+/// live readers: `uma_memory::host_total_bytes` always, and
+/// `hipfire_runtime::offload::{pinnable_host_ram, gtt_budget}` when
 /// `HSA_USERPTR_FOR_PAGED_MEM=0` is already in the environment. Those two read
 /// that variable, which the daemon sets to `0` only inside the Qwen4 load
 /// process, so while it is unset the GTT-backed answer is the root-injectable
@@ -76,14 +76,15 @@ pub(crate) fn detect_with_notes(paths: &crate::Paths) -> (FitHost, Vec<String>) 
     let inputs = live_inputs(paths);
     let (mut host, notes) = detect_at(Path::new("/"), &inputs);
     host.ram_total = uma_memory::host_total_bytes();
-    host.mem_available = uma_memory::mem_available_bytes();
+    let live_ram = hipfire_runtime::offload::pinnable_host_ram(None);
+    host.mem_available = live_ram.mem_available;
     if inputs
         .userptr_for_paged_mem
         .as_deref()
         .is_some_and(|value| value.trim() == "0")
     {
-        host.ttm_pool = hipfire_arch_qwen4::expert_residency::ttm_pool_estimate();
-        let budget = hipfire_arch_qwen4::expert_residency::gtt_budget();
+        host.ttm_pool = live_ram.ttm_pool;
+        let budget = hipfire_runtime::offload::gtt_budget();
         host.gtt_limit = budget.map(|budget| budget.limit_bytes);
         host.gtt_used = budget.map(|budget| budget.used_bytes);
     }
@@ -516,8 +517,8 @@ fn amdgpu_gtt_used_at(root: &Path) -> Option<u64> {
 /// Host RAM, TTM pool and GTT cap.
 ///
 /// `ttm_pool` and `gtt_limit`/`gtt_used` mirror
-/// `expert_residency::ttm_pool_estimate` (expert_residency.rs:2425) and
-/// `gtt_budget` (:2443): both apply only while host-mapped memory is
+/// `hipfire_runtime::offload::pinnable_host_ram` and
+/// `gtt_budget`: both apply only while host-mapped memory is
 /// GTT-backed, i.e. `HSA_USERPTR_FOR_PAGED_MEM=0`. hip-bridge sets that to `0`
 /// for a process that loads a Qwen4 model unless the operator already set it
 /// (hip-bridge ffi.rs:703-714), and the load fit describes is that process, so
@@ -535,12 +536,16 @@ fn read_memory(root: &Path, inputs: &HostInputs) -> Memory {
         .userptr_for_paged_mem
         .as_deref()
         .is_none_or(|value| value.trim() == "0");
-    let ttm_pool = if gtt_backed {
-        (|| uma_memory::ttm_pool_estimate_from(meminfo.as_deref()?, gtt_used?, pool_pages?))()
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    // The root-injectable form of `hipfire_runtime::offload::pinnable_host_ram`:
+    // the pool counts only while host-mapped memory is GTT-backed and the
+    // counters it is derived from are all readable.
+    let host_ram = hipfire_runtime::offload::PinnableHostRam::from_parts(
+        meminfo.as_deref().unwrap_or(""),
+        zoneinfo.as_deref(),
+        gtt_used.unwrap_or(0),
+        pool_pages.unwrap_or(0),
+        gtt_backed && meminfo.is_some() && gtt_used.is_some() && pool_pages.is_some(),
+    );
     let (gtt_limit, gtt_used_reported) = if gtt_backed {
         let budget = (|| {
             let limit =
@@ -555,10 +560,8 @@ fn read_memory(root: &Path, inputs: &HostInputs) -> Memory {
         ram_total: meminfo
             .as_deref()
             .and_then(|text| uma_memory::meminfo_field(text, "MemTotal")),
-        mem_available: meminfo
-            .as_deref()
-            .and_then(|text| uma_memory::meminfo_available_bytes(text, zoneinfo.as_deref())),
-        ttm_pool,
+        mem_available: host_ram.mem_available,
+        ttm_pool: host_ram.ttm_pool,
         gtt_limit,
         gtt_used: gtt_used_reported,
         apu_available: meminfo.as_deref().and_then(|text| {

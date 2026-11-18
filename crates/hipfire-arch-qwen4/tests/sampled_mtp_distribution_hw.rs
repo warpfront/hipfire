@@ -1275,12 +1275,8 @@ fn load_with_max_seq(model: &Path, max_seq: usize) -> Result<Loaded, String> {
             };
             let moved = residency::place_routed_experts(&mut weights, vram_layers);
             let host = residency::host_mapped_bytes(&weights, bytes_of)?;
-            residency::check_host_ram(
-                host,
-                rdna_compute::kv_slots::mem_available_bytes(),
-                residency::ttm_pool_estimate(),
-            )?;
-            residency::check_gtt_cap(host, residency::gtt_budget())?;
+            residency::check_host_ram(host, hipfire_runtime::offload::pinnable_host_ram(None))?;
+            residency::check_gtt_cap(host, hipfire_runtime::offload::gtt_budget())?;
             eprintln!(
                 "qwen4 routed experts: layers 0..{} in VRAM, {moved} tensors ({host} bytes) in pinned host RAM",
                 vram_layers.min(receipt.config.num_hidden_layers)

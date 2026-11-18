@@ -1738,8 +1738,7 @@ struct Qwen4SettledResourceEvidence {
     margin_bytes: u64,
     host_check_bytes: u64,
     stage_mirror_bytes: u64,
-    mem_available: Option<u64>,
-    ttm_pool: u64,
+    host_ram: hipfire_runtime::offload::PinnableHostRam,
     gtt_free_bytes: Option<u64>,
 }
 
@@ -1894,9 +1893,9 @@ fn qwen4_measured_resource_snapshot(
     let host = Qwen4HostCheckInputs {
         host_check_bytes: evidence.host_check_bytes,
         stage_mirror_bytes: evidence.stage_mirror_bytes,
-        host_headroom_bytes: hipfire_arch_qwen4::expert_residency::HOST_RAM_HEADROOM_BYTES,
-        ttm_pool_bytes: evidence.ttm_pool,
-        mem_available_bytes: evidence.mem_available,
+        host_headroom_bytes: hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES,
+        ttm_pool_bytes: evidence.host_ram.ttm_pool,
+        mem_available_bytes: evidence.host_ram.mem_available,
         gtt_budget_bytes: evidence.gtt_free_bytes,
     };
     let backing = Qwen4LoadBacking {
@@ -1936,13 +1935,13 @@ fn qwen4_measured_resource_snapshot(
                     snapshot.device_plan_bytes());
                 return None;
             }
-            let Some(available) = evidence.mem_available else {
+            let Some(available) = evidence.host_ram.mem_available else {
                 eprintln!(
                     "  qwen4 measured resources: unavailable (original host capacity unreadable)"
                 );
                 return None;
             };
-            if snapshot.host_plan_bytes() > available.saturating_add(evidence.ttm_pool) {
+            if snapshot.host_plan_bytes() > available.saturating_add(evidence.host_ram.ttm_pool) {
                 eprintln!("  qwen4 measured resources: unavailable (host union upper bound exceeds original MemAvailable plus TTM pool)");
                 return None;
             }
@@ -3492,9 +3491,8 @@ pub fn qwen4_ep_vram_layers(
         decoupled_reserve_no_shadows: &decoupled_reserve_no_shadows,
         planar: planar_experts,
         host: Qwen4EpReserveHost {
-            mem_available: rdna_compute::kv_slots::mem_available_bytes(),
-            ttm_pool: hipfire_arch_qwen4::expert_residency::ttm_pool_estimate_on(gpu),
-            gtt: hipfire_arch_qwen4::expert_residency::gtt_budget(),
+            host_ram: hipfire_runtime::offload::pinnable_host_ram(Some(gpu)),
+            gtt: hipfire_runtime::offload::gtt_budget(),
             host_expert_bytes: &host_expert_bytes,
             emu_check: &emu_check,
         },
@@ -4513,8 +4511,7 @@ fn qwen4_ep_units_donor_plan(
             mirrors >> 20
         )
     };
-    residency::check_host_ram(total, input.host.mem_available, input.host.ttm_pool)
-        .map_err(&aggregate)?;
+    residency::check_host_ram(total, input.host.host_ram).map_err(&aggregate)?;
     residency::check_gtt_cap(total, input.host.gtt).map_err(&aggregate)?;
     (input.host.emu_check)(total)?;
     Ok((staged, plan))
@@ -4571,13 +4568,10 @@ fn qwen4_ep_rank_placement_forward(
 /// The aggregate host-memory allowance (all ranks together): RAM plus the TTM pool less the
 /// headroom, capped by the GTT room.
 fn qwen4_ep_reserve_host_allowance(host: &Qwen4EpReserveHost<'_>) -> Result<u64, String> {
-    use hipfire_arch_qwen4::expert_residency as residency;
-    let available = host.mem_available.ok_or(
+    let available = host.host_ram.bytes().ok_or(
         "qwen4: EP reserve decoupling: MemAvailable is unreadable, so the aggregate pinned-host charge cannot be admitted",
     )?;
-    let ram_allowance = available
-        .saturating_add(host.ttm_pool)
-        .saturating_sub(residency::HOST_RAM_HEADROOM_BYTES);
+    let ram_allowance = available.saturating_sub(hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES);
     Ok(host.gtt.map_or(ram_allowance, |gtt| {
         ram_allowance.min(gtt.limit_bytes.saturating_sub(gtt.used_bytes))
     }))
@@ -4939,9 +4933,8 @@ fn qwen4_ep_reserve_env(arch: &str, prompt_rows: usize) -> (bool, usize) {
 
 /// The host-memory observations the aggregate charge is admitted against.
 struct Qwen4EpReserveHost<'a> {
-    mem_available: Option<u64>,
-    ttm_pool: u64,
-    gtt: Option<hipfire_arch_qwen4::expert_residency::GttBudget>,
+    host_ram: hipfire_runtime::offload::PinnableHostRam,
+    gtt: Option<hipfire_runtime::offload::GttBudget>,
     /// Pinned host bytes of every rank's host-mapped experts TOGETHER at a
     /// resident layer count.
     host_expert_bytes: &'a dyn Fn(usize) -> Result<u64, String>,
@@ -5089,12 +5082,10 @@ fn qwen4_ep_reserve_try(
     }
     let host = &attempt.host;
     let host_experts = (host.host_expert_bytes)(resident)?;
-    let available = host.mem_available.ok_or(
+    let available = host.host_ram.bytes().ok_or(
         "qwen4: EP reserve decoupling: MemAvailable is unreadable, so the aggregate pinned-host charge cannot be admitted",
     )?;
-    let ram_allowance = available
-        .saturating_add(host.ttm_pool)
-        .saturating_sub(residency::HOST_RAM_HEADROOM_BYTES);
+    let ram_allowance = available.saturating_sub(hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES);
     let allowance = host.gtt.map_or(ram_allowance, |gtt| {
         ram_allowance.min(gtt.limit_bytes.saturating_sub(gtt.used_bytes))
     });
@@ -5130,7 +5121,7 @@ fn qwen4_ep_reserve_try(
             mirrors >> 20
         )
     };
-    residency::check_host_ram(total, host.mem_available, host.ttm_pool).map_err(&aggregate)?;
+    residency::check_host_ram(total, host.host_ram).map_err(&aggregate)?;
     residency::check_gtt_cap(total, host.gtt).map_err(&aggregate)?;
     (host.emu_check)(total)?;
     Ok(Qwen4EpReserveResolution::Plan(plan, resident_without_lanes))
@@ -5524,9 +5515,8 @@ pub fn qwen4_preload_resource_plan(
         .device_mem_info()
         .map(|(free, _)| u64::try_from(free).unwrap_or(u64::MAX))
         .ok();
-    let mem_available = rdna_compute::kv_slots::mem_available_bytes();
-    let ttm_pool = residency::ttm_pool_estimate_on(gpu);
-    let preallocation_gtt = residency::gtt_budget();
+    let host_ram = hipfire_runtime::offload::pinnable_host_ram(Some(gpu));
+    let preallocation_gtt = hipfire_runtime::offload::gtt_budget();
     let hotset_policy_for_plan = hipfire_arch_qwen4::expert_hotset::HotsetPolicy::from_env()
         .map_err(|error| format!("qwen4 preload plan: hotset policy unreadable: {error}"))?;
     let placement_policy_for_plan = hipfire_arch_qwen4::expert_hotset::PlacementPolicy::from_env()
@@ -5676,7 +5666,7 @@ pub fn qwen4_preload_resource_plan(
                             )
                         })
                         .ok_or("qwen4 preload plan: host byte accounting overflow")?;
-                    residency::check_host_ram(host_bytes, mem_available, ttm_pool)?;
+                    residency::check_host_ram(host_bytes, host_ram)?;
                     residency::check_gtt_cap(host_bytes, preallocation_gtt)?;
                     let (latest_free, _) = gpu
                         .device_mem_info()
@@ -6129,8 +6119,8 @@ pub fn qwen4_preload_resource_plan(
         stage_mirror_bytes,
         fresh_pool_bytes,
         fresh_free_device,
-        mem_available,
-        ttm_pool,
+        host_ram.mem_available,
+        host_ram.ttm_pool,
         gtt_free,
         granule_bytes,
         scratch_label,
@@ -6149,8 +6139,7 @@ pub fn qwen4_preload_resource_plan(
         page_cache_bytes,
         staging_upload_bytes,
         session_cache_configured,
-        mem_available,
-        ttm_pool,
+        host_ram,
     )?;
     let mut plan = serde_json::json!({
         "kind": "qwen4_preload_resource_plan",
@@ -6174,8 +6163,8 @@ pub fn qwen4_preload_resource_plan(
         "load_upload_transient_bytes": staging_upload_bytes,
         "session_cache_configured_bytes": session_cache_configured,
         "fresh": { "pool_parked_bytes": fresh_pool_bytes,
-            "free_device_bytes": fresh_free_device, "mem_available_bytes": mem_available,
-            "ttm_pool_bytes": ttm_pool, "gtt_free_bytes": gtt_free },
+            "free_device_bytes": fresh_free_device, "mem_available_bytes": host_ram.mem_available,
+            "ttm_pool_bytes": host_ram.ttm_pool, "gtt_free_bytes": gtt_free },
         "component_union": component_union,
         "whole_load_join": whole_load_join,
     });
@@ -6223,8 +6212,7 @@ fn preload_whole_host_join(
     page_cache_bytes: u64,
     load_upload_transient_bytes: u64,
     session_cache_configured_bytes: u64,
-    mem_available_bytes: Option<u64>,
-    ttm_pool_bytes: u64,
+    host_ram: hipfire_runtime::offload::PinnableHostRam,
 ) -> Result<(u64, serde_json::Value), String> {
     let num = |field: &str| {
         component_union
@@ -6282,16 +6270,16 @@ fn preload_whole_host_join(
     // Admission figures faithful to `check_host_ram`: the pinned/GTT demand,
     // the 4GiB headroom as an explicit separate allowance, and the observed
     // capacity quote (MemAvailable may be absent: JSON null + named reason).
-    let headroom_bytes = hipfire_arch_qwen4::expert_residency::HOST_RAM_HEADROOM_BYTES;
+    let headroom_bytes = hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES;
     let admission_needed_bytes = ck(
         pinned_gtt_demand_bytes,
         headroom_bytes,
         "host admission charge with headroom",
     )?;
-    let (admission_capacity_bytes, capacity_note) = match mem_available_bytes {
+    let (admission_capacity_bytes, capacity_note) = match host_ram.mem_available {
         Some(available) => (
             serde_json::json!(available
-                .checked_add(ttm_pool_bytes)
+                .checked_add(host_ram.ttm_pool)
                 .ok_or("qwen4 preload plan: host admission capacity overflows")?),
             "MemAvailable plus TTM pool (observed reclaimable pages, never a planned allocation); headroom stays an explicit separate allowance, never usage; reporting only, not a fit verdict",
         ),
@@ -7371,9 +7359,8 @@ fn load_qwen4_rank_unscoped(
         .device_mem_info()
         .map(|(free, _)| u64::try_from(free).unwrap_or(u64::MAX))
         .ok();
-    let preallocation_mem_available = rdna_compute::kv_slots::mem_available_bytes();
-    let preallocation_ttm_pool = residency::ttm_pool_estimate_on(&*ctx.gpu);
-    let preallocation_gtt = residency::gtt_budget();
+    let preallocation_host_ram = hipfire_runtime::offload::pinnable_host_ram(Some(&*ctx.gpu));
+    let preallocation_gtt = hipfire_runtime::offload::gtt_budget();
     // The `.hc8` sidecar's per-tensor sizes, resolved once above (`hc8_sidecar`): the expert-
     // parallel census charges the HC mixers at their E4M3 size (`qwen4_ep_hc8_saving`). A
     // pipeline band (and an EP-less load, whose saving is 0) charges nothing.
@@ -8187,11 +8174,7 @@ fn load_qwen4_rank_unscoped(
                     bytes.checked_add(expert_cache.map_or(0, |cache| cache.host_reserve_bytes()))
                 })
                 .ok_or("host byte accounting overflow")?;
-            residency::check_host_ram(
-                host_bytes,
-                preallocation_mem_available,
-                preallocation_ttm_pool,
-            )?;
+            residency::check_host_ram(host_bytes, preallocation_host_ram)?;
             residency::check_gtt_cap(host_bytes, preallocation_gtt)?;
             // Re-query before either placement branch changes WeightEntries
             // or tier conversion removes aggregate tensors. A shortfall
@@ -8768,9 +8751,8 @@ fn load_qwen4_rank_unscoped(
         let host_check_bytes;
         (host_check_bytes, ep_later_host_bytes) =
             qwen4_ep_host_ledger(&rank_host_bytes, own_rank, ep_reserve_mirror_bytes);
-        let mem_available = preallocation_mem_available;
-        let ttm_pool = preallocation_ttm_pool;
-        residency::check_host_ram(host_check_bytes, mem_available, ttm_pool)
+        let host_ram = preallocation_host_ram;
+        residency::check_host_ram(host_check_bytes, host_ram)
             .map_err(|error| format!("qwen4: {error}"))?;
         residency::check_gtt_cap(host_check_bytes, preallocation_gtt)
             .map_err(|error| format!("qwen4: {error}"))?;
@@ -8788,16 +8770,16 @@ fn load_qwen4_rank_unscoped(
                 gib(expert_host_bytes),
                 units.resident_units(own_rank),
                 gib(units.vram_bytes(own_rank)),
-                gib(mem_available.unwrap_or(0)),
-                gib(ttm_pool)
+                gib(host_ram.mem_available.unwrap_or(0)),
+                gib(host_ram.ttm_pool)
             );
         } else if let Some(resident) = &resident_set {
             eprintln!(
                 "  qwen4 routed experts: layers {resident:?} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM \
                  (MemAvailable - CMA {:.1} GiB + {:.1} GiB estimated in TTM's page pool)",
                 gib(expert_host_bytes),
-                gib(mem_available.unwrap_or(0)),
-                gib(ttm_pool)
+                gib(host_ram.mem_available.unwrap_or(0)),
+                gib(host_ram.ttm_pool)
             );
         } else {
             eprintln!(
@@ -8805,8 +8787,8 @@ fn load_qwen4_rank_unscoped(
                  (MemAvailable - CMA {:.1} GiB + {:.1} GiB estimated in TTM's page pool)",
                 vram_layers.min(config.num_hidden_layers),
                 gib(expert_host_bytes),
-                gib(mem_available.unwrap_or(0)),
-                gib(ttm_pool)
+                gib(host_ram.mem_available.unwrap_or(0)),
+                gib(host_ram.ttm_pool)
             );
         }
         hipfire_config::load_summary::note(
@@ -8867,12 +8849,8 @@ fn load_qwen4_rank_unscoped(
         let host_check_bytes;
         (host_check_bytes, ep_later_host_bytes) =
             qwen4_ep_host_ledger(&rank_host_bytes, own_rank, ep_reserve_mirror_bytes);
-        residency::check_host_ram(
-            host_check_bytes,
-            preallocation_mem_available,
-            preallocation_ttm_pool,
-        )
-        .map_err(|error| format!("qwen4: {error}"))?;
+        residency::check_host_ram(host_check_bytes, preallocation_host_ram)
+            .map_err(|error| format!("qwen4: {error}"))?;
         residency::check_gtt_cap(host_check_bytes, preallocation_gtt)
             .map_err(|error| format!("qwen4: {error}"))?;
         ctx.gpu
@@ -9164,8 +9142,7 @@ fn load_qwen4_rank_unscoped(
             margin_bytes: margin,
             host_check_bytes: host_mapped_bytes,
             stage_mirror_bytes,
-            mem_available: preallocation_mem_available,
-            ttm_pool: preallocation_ttm_pool,
+            host_ram: preallocation_host_ram,
             gtt_free_bytes: preallocation_gtt
                 .map(|budget| budget.limit_bytes.saturating_sub(budget.used_bytes)),
         };
@@ -9203,12 +9180,8 @@ fn load_qwen4_rank_unscoped(
             }
         }
         if use_ranges || admitted_capture_64 {
-            let host_admission = residency::check_host_ram(
-                host_union,
-                preallocation_mem_available,
-                preallocation_ttm_pool,
-            )
-            .and_then(|()| residency::check_gtt_cap(host_union, preallocation_gtt));
+            let host_admission = residency::check_host_ram(host_union, preallocation_host_ram)
+                .and_then(|()| residency::check_gtt_cap(host_union, preallocation_gtt));
             if let Err(reason) = host_admission {
                 if admitted_capture_64
                     || state_format.qsa_f16_arena
@@ -10024,19 +9997,15 @@ fn load_qwen4_rank_unscoped(
                     "qwen4: admitted CPU window of {req} rows overflows the host charge"
                 ));
             };
-            let current_mem_available = rdna_compute::kv_slots::mem_available_bytes();
-            if let Err(reason) = residency::check_host_ram(
-                host_inc_bytes,
-                current_mem_available,
-                residency::ttm_pool_estimate_on(&*ctx.gpu),
-            ) {
+            let current_host_ram = hipfire_runtime::offload::pinnable_host_ram(Some(&*ctx.gpu));
+            if let Err(reason) = residency::check_host_ram(host_inc_bytes, current_host_ram) {
                 let _ = bundle.free_gpu(ctx.gpu);
                 return Err(format!(
                     "qwen4: admitted CPU window of {req} rows does not fit host RAM: {reason}"
                 ));
             }
             if let Err(reason) =
-                residency::check_gtt_cap(host_pinned_bytes, residency::gtt_budget())
+                residency::check_gtt_cap(host_pinned_bytes, hipfire_runtime::offload::gtt_budget())
             {
                 let _ = bundle.free_gpu(ctx.gpu);
                 return Err(format!(
@@ -16857,20 +16826,29 @@ mod qwen4_preload_plan_tests {
         })
     }
 
+    fn pinnable(
+        mem_available: Option<u64>,
+        ttm_pool: u64,
+    ) -> hipfire_runtime::offload::PinnableHostRam {
+        hipfire_runtime::offload::PinnableHostRam {
+            mem_available,
+            ttm_pool,
+        }
+    }
+
     #[test]
     fn preload_whole_host_join_splits_pinned_and_ram_only() {
-        let headroom = hipfire_arch_qwen4::expert_residency::HOST_RAM_HEADROOM_BYTES;
+        let headroom = hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES;
         assert_eq!(headroom, 4 << 30);
         let (whole_host, report) = preload_whole_host_join(
             &join_union(100, 1000, 0, false),
             false,
-            10, // PLE resident envelope: RAM-only, never pinned demand
-            2,  // PLE staging: pinned
-            4,  // page cache: RAM-only
-            8,  // upload transient: pinned
-            16, // session cap: RAM-only
-            Some(1 << 40),
-            32, // TTM pool: observed reclaimable, never planned
+            10,                          // PLE resident envelope: RAM-only, never pinned demand
+            2,                           // PLE staging: pinned
+            4,                           // page cache: RAM-only
+            8,                           // upload transient: pinned
+            16,                          // session cap: RAM-only
+            pinnable(Some(1 << 40), 32), // TTM pool: observed reclaimable, never planned
         )
         .expect("join");
         // Pinned/GTT demand: A host union + pinned staging/upload only.
@@ -16914,8 +16892,7 @@ mod qwen4_preload_plan_tests {
             0,
             0,
             0,
-            None,
-            32,
+            pinnable(None, 32),
         )
         .expect("join with unknown capacity");
         // No zero assumed: JSON null plus a named unavailable reason.
@@ -16931,10 +16908,18 @@ mod qwen4_preload_plan_tests {
     #[test]
     fn preload_whole_host_join_rejects_missing_keys_and_backing_mismatch() {
         let good = join_union(1, 2, 0, false);
-        assert!(
-            preload_whole_host_join(&serde_json::json!({}), false, 0, 0, 0, 0, 0, None, 0).is_err()
-        );
-        assert!(preload_whole_host_join(&good, true, 0, 0, 0, 0, 0, None, 0).is_err());
+        assert!(preload_whole_host_join(
+            &serde_json::json!({}),
+            false,
+            0,
+            0,
+            0,
+            0,
+            0,
+            pinnable(None, 0)
+        )
+        .is_err());
+        assert!(preload_whole_host_join(&good, true, 0, 0, 0, 0, 0, pinnable(None, 0)).is_err());
     }
 
     #[test]
@@ -16948,8 +16933,7 @@ mod qwen4_preload_plan_tests {
             0,
             0,
             0,
-            None,
-            0
+            pinnable(None, 0)
         )
         .is_err());
         // Headroom on top of u64::MAX pinned demand overflows the admission add.
@@ -16961,8 +16945,7 @@ mod qwen4_preload_plan_tests {
             0,
             0,
             0,
-            None,
-            0
+            pinnable(None, 0)
         )
         .is_err());
         // Some(MemAvailable) near u64::MAX plus TTM pool overflows the checked
@@ -16975,8 +16958,7 @@ mod qwen4_preload_plan_tests {
             0,
             0,
             0,
-            Some(u64::MAX),
-            1
+            pinnable(Some(u64::MAX), 1)
         )
         .is_err());
     }
@@ -17656,7 +17638,7 @@ mod qwen4_ep_reserve_loader_tests {
 
     struct Mock {
         mem_available: Option<u64>,
-        gtt: Option<residency::GttBudget>,
+        gtt: Option<hipfire_runtime::offload::GttBudget>,
         emu_fails: bool,
     }
 
@@ -17761,8 +17743,10 @@ mod qwen4_ep_reserve_loader_tests {
             decoupled_reserve_no_shadows: &decoupled_no_shadows,
             planar: false,
             host: Qwen4EpReserveHost {
-                mem_available: mock.mem_available,
-                ttm_pool: 0,
+                host_ram: hipfire_runtime::offload::PinnableHostRam {
+                    mem_available: mock.mem_available,
+                    ttm_pool: 0,
+                },
                 gtt: mock.gtt,
                 host_expert_bytes: &hosts,
                 emu_check: &emu,
@@ -18086,8 +18070,10 @@ mod qwen4_ep_reserve_loader_tests {
             decoupled_reserve_no_shadows: &unreachable,
             planar: false,
             host: Qwen4EpReserveHost {
-                mem_available: Some(512 * GIB),
-                ttm_pool: 0,
+                host_ram: hipfire_runtime::offload::PinnableHostRam {
+                    mem_available: Some(512 * GIB),
+                    ttm_pool: 0,
+                },
                 gtt: None,
                 host_expert_bytes: &hosts,
                 emu_check: &emu,
@@ -18232,7 +18218,9 @@ mod qwen4_ep_reserve_loader_tests {
         // Aggregate over ranks: the allowance leaves room for ONE rank's
         // mirrors (7 layers) but not both ranks' (14 layers).
         let one_rank_only = Mock {
-            mem_available: Some(residency::HOST_RAM_HEADROOM_BYTES + host_experts + 10 * layer),
+            mem_available: Some(
+                hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES + host_experts + 10 * layer,
+            ),
             gtt: None,
             emu_fails: false,
         };
@@ -18244,7 +18232,9 @@ mod qwen4_ep_reserve_loader_tests {
         // The planner's allowance passes by the raw mirror bytes but the pads
         // of the real allocations refuse in the exact aggregate check.
         let pads_only = Mock {
-            mem_available: Some(residency::HOST_RAM_HEADROOM_BYTES + host_experts + 14 * layer),
+            mem_available: Some(
+                hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES + host_experts + 14 * layer,
+            ),
             gtt: None,
             emu_fails: false,
         };
@@ -18267,7 +18257,7 @@ mod qwen4_ep_reserve_loader_tests {
         // GTT cap: little room beside what amdgpu already holds.
         let gtt = Mock {
             mem_available: Some(512 * GIB),
-            gtt: Some(residency::GttBudget {
+            gtt: Some(hipfire_runtime::offload::GttBudget {
                 limit_bytes: 100 * GIB,
                 used_bytes: 95 * GIB,
             }),

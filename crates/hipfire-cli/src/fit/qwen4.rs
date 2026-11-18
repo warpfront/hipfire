@@ -442,7 +442,7 @@ fn decide(
 }
 
 fn host_findings(report: &mut ArchFit, lower: u64, upper: u64, host: &FitHost) {
-    let need = lower.saturating_add(residency::HOST_RAM_HEADROOM_BYTES);
+    let need = lower.saturating_add(hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES);
     let ram_fix = format!("need {} host RAM including the gate's headroom, versus {} MemAvailable - CMA plus {} TTM pool; free host memory, keep more expert layers in VRAM (a GPU with more memory) or a smaller tier", gib(need), host.mem_available.map(gib).unwrap_or_else(|| "unreadable".into()), gib(host.ttm_pool));
     let range = || {
         format!(
@@ -451,10 +451,11 @@ fn host_findings(report: &mut ArchFit, lower: u64, upper: u64, host: &FitHost) {
             gib(upper)
         )
     };
-    report.findings.push(
-        match residency::check_host_ram(lower, host.mem_available, host.ttm_pool) {
+    report
+        .findings
+        .push(match residency::check_host_ram(lower, host.host_ram()) {
             Err(error) => Finding::fails("host_ram", error, ram_fix.as_str()),
-            Ok(()) => match residency::check_host_ram(upper, host.mem_available, host.ttm_pool) {
+            Ok(()) => match residency::check_host_ram(upper, host.host_ram()) {
                 Ok(()) => Finding::fits(
                     "host_ram",
                     format!(
@@ -464,12 +465,13 @@ fn host_findings(report: &mut ArchFit, lower: u64, upper: u64, host: &FitHost) {
                 ),
                 Err(_) => Finding::undetermined("host_ram", range(), None),
             },
-        },
-    );
-    let gtt = host.gtt_limit.map(|limit_bytes| residency::GttBudget {
-        limit_bytes,
-        used_bytes: host.gtt_used.unwrap_or(0),
-    });
+        });
+    let gtt = host
+        .gtt_limit
+        .map(|limit_bytes| hipfire_runtime::offload::GttBudget {
+            limit_bytes,
+            used_bytes: host.gtt_used.unwrap_or(0),
+        });
     // If a cap is known but usage is not, zero usage is a safe *lower-bound*
     // refusal check, never proof that the upper host bound passes the gate.
     report.findings.push(match residency::check_gtt_cap(lower, gtt) {
@@ -555,7 +557,7 @@ mod tests {
         let lower = report.placement.host_mapped_bytes.unwrap();
         let error = residency::check_gtt_cap(
             lower,
-            Some(residency::GttBudget {
+            Some(hipfire_runtime::offload::GttBudget {
                 limit_bytes: 31 * GIB,
                 used_bytes: 0,
             }),
@@ -655,7 +657,14 @@ mod tests {
         let lower = report.placement.host_mapped_bytes.unwrap();
         assert_eq!(
             finding(&report, "host_ram").detail,
-            residency::check_host_ram(lower, Some(32 * GIB), 0).unwrap_err()
+            residency::check_host_ram(
+                lower,
+                hipfire_runtime::offload::PinnableHostRam {
+                    mem_available: Some(32 * GIB),
+                    ttm_pool: 0,
+                }
+            )
+            .unwrap_err()
         );
         assert_eq!(finding(&report, "host_ram").verdict, Verdict::DoesNotFit);
         assert!(finding(&report, "host_ram")

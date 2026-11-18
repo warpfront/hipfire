@@ -124,20 +124,19 @@ pub(crate) fn sp_layer_cost(
 // ── load decision ─────────────────────────────────────────────────────
 
 /// SP's pinned host budget: the host RAM the unmovable pinned allocations can
-/// still take (`MemAvailable - CMA` plus the TTM page pool, less the
-/// [`crate::expert_residency::HOST_RAM_HEADROOM_BYTES`] the experts' own check
-/// keeps) less the pinned bytes S1's own page pool is about to stage. `0` when
-/// `MemAvailable` is unreadable (SP is then declined by name).
+/// still take ([`PinnableHostRam::bytes`]: `MemAvailable - CMA` plus the TTM
+/// page pool, less the [`hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES`]
+/// the experts' own check keeps) less the pinned bytes S1's own page pool is
+/// about to stage. `0` when `MemAvailable` is unreadable (SP is then declined
+/// by name).
 pub(crate) fn sp_pinned_budget(
-    mem_available: Option<u64>,
-    ttm_pool_bytes: u64,
+    host_ram: hipfire_runtime::offload::PinnableHostRam,
     s1_pinned_bytes: u64,
 ) -> u64 {
-    mem_available
-        .map(|available| {
-            available
-                .saturating_add(ttm_pool_bytes)
-                .saturating_sub(crate::expert_residency::HOST_RAM_HEADROOM_BYTES)
+    host_ram
+        .bytes()
+        .map(|room| {
+            room.saturating_sub(hipfire_runtime::offload::HOST_RAM_HEADROOM_BYTES)
                 .saturating_sub(s1_pinned_bytes)
         })
         .unwrap_or(0)
@@ -378,8 +377,7 @@ pub(crate) fn sp_load_decision(
             .then(hipfire_dispatch::cpu_exec::splice_pool_threads);
         facts.region_fit_rows = sp_region_fit_rows(profile);
         facts.pinned_budget_bytes = sp_pinned_budget(
-            rdna_compute::kv_slots::mem_available_bytes(),
-            crate::expert_residency::ttm_pool_estimate_on(gpu),
+            hipfire_runtime::offload::pinnable_host_ram(Some(gpu)),
             profile.host_pinned_bytes(),
         );
         facts.prefix_cache = serve_prefix_cache();
@@ -2233,19 +2231,24 @@ mod tests {
 
     #[test]
     fn sp_pinned_budget_is_available_host_ram_less_headroom_and_s1_staging() {
-        let headroom = crate::expert_residency::HOST_RAM_HEADROOM_BYTES;
-        assert_eq!(sp_pinned_budget(None, 1 << 40, 0), 0);
+        use hipfire_runtime::offload::{PinnableHostRam, HOST_RAM_HEADROOM_BYTES};
+        let headroom = HOST_RAM_HEADROOM_BYTES;
+        let ram = |mem_available, ttm_pool| PinnableHostRam {
+            mem_available,
+            ttm_pool,
+        };
+        assert_eq!(sp_pinned_budget(ram(None, 1 << 40), 0), 0);
         assert_eq!(
-            sp_pinned_budget(Some(headroom + (200 << 20)), 0, 50 << 20),
+            sp_pinned_budget(ram(Some(headroom + (200 << 20)), 0), 50 << 20),
             150 << 20
         );
         assert_eq!(
-            sp_pinned_budget(Some(headroom), 100, 0),
+            sp_pinned_budget(ram(Some(headroom), 100), 0),
             100,
             "the TTM page pool counts"
         );
-        assert_eq!(sp_pinned_budget(Some(headroom - 1), 0, 0), 0);
-        assert_eq!(sp_pinned_budget(Some(u64::MAX), u64::MAX, u64::MAX), 0);
+        assert_eq!(sp_pinned_budget(ram(Some(headroom - 1), 0), 0), 0);
+        assert_eq!(sp_pinned_budget(ram(Some(u64::MAX), u64::MAX), u64::MAX), 0);
     }
 
     #[test]

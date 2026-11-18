@@ -1450,10 +1450,9 @@ fn load(model: &Path, max_seq: usize, cache_budget: Option<u64>) -> Result<Loade
         residency::host_mapped_bytes(&weights, |entry| slab_payload_bytes(&hfq, entry))?;
     residency::check_host_ram(
         host_bytes,
-        rdna_compute::kv_slots::mem_available_bytes(),
-        residency::ttm_pool_estimate(),
+        hipfire_runtime::offload::pinnable_host_ram(None),
     )?;
-    residency::check_gtt_cap(host_bytes, residency::gtt_budget())?;
+    residency::check_gtt_cap(host_bytes, hipfire_runtime::offload::gtt_budget())?;
     eprintln!(
         "qwen4 expert placement: {vram_layers} resident layers, {host_bytes} host-mapped bytes"
     );

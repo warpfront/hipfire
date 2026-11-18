@@ -671,6 +671,8 @@ pub fn largest_fitting_tail(
 
 // ── Host admission ──────────────────────────────────────────────────────────
 
+use rdna_compute::uma_memory::{self, TTM_PAGES_LIMIT, TTM_PAGE_BYTES};
+
 /// Host RAM that must remain available after the pinned weights are placed.
 /// Pinned pages cannot be reclaimed, so over-committing them starves the host.
 pub const HOST_RAM_HEADROOM_BYTES: u64 = 4 << 30;
@@ -679,126 +681,145 @@ pub const HOST_RAM_HEADROOM_BYTES: u64 = 4 << 30;
 /// tensor.
 pub const HOST_MAPPED_PAD_BYTES: u64 = 1 << 20;
 
-/// TTM's page limit, in pages, which caps every GTT allocation on the host.
-const TTM_PAGES_LIMIT: &str = "/sys/module/ttm/parameters/pages_limit";
-
-/// TTM's page pool cap, in pages. Freed GTT pages past it go back to the kernel
-/// at once.
-const TTM_PAGE_POOL_SIZE: &str = "/sys/module/ttm/parameters/page_pool_size";
-
-/// TTM's page size on x86_64, the only host ROCm supports for discrete GPUs.
-const TTM_PAGE_BYTES: u64 = 4096;
-
-/// Host memory outside every `/proc/meminfo` counter that is not TTM's pool:
-/// other drivers' pages, DMA buffers, firmware. [`ttm_pool_estimate`] never
-/// counts this much as pool. Measured on the 5-card gfx1201 host with the pool
-/// empty and 46.2 GiB of live GTT: 2.76 GiB.
-pub const UNTRACKED_KERNEL_BYTES: u64 = 4 << 30;
-
-/// `/proc/meminfo` fields, in bytes, that together account for every allocated
-/// page except driver pages (TTM's pool and live GTT among them). Subset fields
-/// (`Shmem`, `Mlocked`, `AnonHugePages`, ...) are left out.
-const MEMINFO_TRACKED: &[&str] = &[
-    "MemFree",
-    "Buffers",
-    "Cached",
-    "SwapCached",
-    "AnonPages",
-    "Slab",
-    "KernelStack",
-    "ShadowCallStack",
-    "PageTables",
-    "SecPageTables",
-    "VmallocUsed",
-    "Percpu",
-    "Hugetlb",
-    "Zswap",
-    "Unaccepted",
-    "Balloon",
-];
-
-fn host_mapped_is_gtt() -> bool {
+/// Whether `hipHostMalloc` memory is GTT-backed: `HSA_USERPTR_FOR_PAGED_MEM=0`,
+/// hip-bridge's default. Under userptr it is pageable memory the kernel pins.
+pub fn host_mapped_is_gtt() -> bool {
     std::env::var("HSA_USERPTR_FOR_PAGED_MEM").is_ok_and(|value| value.trim() == "0")
 }
 
-fn read_u64(path: &std::path::Path) -> Option<u64> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Host RAM a pinning load can still take, sampled once ([`pinnable_host_ram`]):
+/// `MemAvailable - CMA` plus the freed GTT pages TTM's page pool holds when the
+/// load's pinned allocations are GTT, which take pool pages first.
+///
+/// The pool is outside `MemAvailable`: amdgpu parks the write-combined and
+/// uncached pages of freed GTT buffers there, up to `page_pool_size` (half of
+/// RAM by default), so a process that exits leaves its host-mapped pages in it,
+/// and a reload that read `MemAvailable` alone would refuse room it has. TTM's
+/// shrinker returns the pool under memory pressure
+/// (`echo 2 | sudo tee /proc/sys/vm/drop_caches` empties it at once).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnableHostRam {
+    /// `MemAvailable - CMA` ([`uma_memory::meminfo_available_bytes`]; CMA
+    /// pageblocks serve only movable allocations). `None` when unreadable, and
+    /// then every nonzero charge refuses.
+    pub mem_available: Option<u64>,
+    /// The TTM page-pool estimate ([`uma_memory::ttm_pool_estimate_from`]) the
+    /// load can draw on; 0 when its pinned memory is not GTT or the pool is
+    /// unreadable.
+    pub ttm_pool: u64,
 }
 
-/// `MemAvailable - CMA` in bytes, read now
-/// ([`rdna_compute::uma_memory::mem_available_bytes`]). `None` when unreadable
-/// (admission then refuses rather than assuming room).
-pub fn mem_available_bytes() -> Option<u64> {
-    rdna_compute::uma_memory::mem_available_bytes()
-}
-
-/// `mem_info_gtt_used` summed over every amdgpu device. Host allocations may
-/// count against another device than the one the process runs on (on a 5-card
-/// gfx1201 host, a card-2 process's host-mapped experts show in card 0's
-/// `mem_info_gtt_used`).
-fn amdgpu_gtt_used_bytes() -> Option<u64> {
-    let mut used_bytes = 0u64;
-    for card in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
-        let name = card.file_name();
-        let is_card = name
-            .to_str()
-            .and_then(|name| name.strip_prefix("card"))
-            .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()));
-        if is_card {
-            used_bytes += read_u64(&card.path().join("device/mem_info_gtt_used")).unwrap_or(0);
+impl PinnableHostRam {
+    /// The measure from `/proc/meminfo` and `/proc/zoneinfo` text, the GTT amdgpu
+    /// devices hold, TTM's `page_pool_size` in pages, and whether the load's
+    /// pinned allocations are GTT (`pool_counts`). A missing pool field counts
+    /// the pool as empty.
+    pub fn from_parts(
+        meminfo: &str,
+        zoneinfo: Option<&str>,
+        gtt_used: u64,
+        pool_size_pages: u64,
+        pool_counts: bool,
+    ) -> Self {
+        let ttm_pool = if pool_counts {
+            uma_memory::ttm_pool_estimate_from(meminfo, gtt_used, pool_size_pages).unwrap_or(0)
+        } else {
+            0
+        };
+        Self {
+            mem_available: uma_memory::meminfo_available_bytes(meminfo, zoneinfo),
+            ttm_pool,
         }
     }
-    Some(used_bytes)
-}
 
-/// Estimate of the freed GTT pages TTM keeps in its page pool, from
-/// `/proc/meminfo` text, the GTT amdgpu devices hold, and TTM's `page_pool_size`
-/// in pages.
-///
-/// The pool is invisible to an unprivileged process: its pages are in no
-/// `/proc/meminfo` counter, so `MemAvailable` excludes them, and
-/// `mem_info_gtt_used` drops them when their buffer is freed (only root's
-/// `/sys/kernel/debug/ttm/page_pool` reads it). It is `MemTotal` minus every
-/// tracked counter, minus the live GTT and [`UNTRACKED_KERNEL_BYTES`], capped at
-/// `page_pool_size`. `None` when a field is missing.
-pub fn ttm_pool_estimate_from(meminfo: &str, gtt_used: u64, pool_size_pages: u64) -> Option<u64> {
-    let field = |key: &str| -> Option<u64> {
-        meminfo.lines().find_map(|line| {
-            let rest = line.strip_prefix(key)?.strip_prefix(':')?;
-            Some(rest.split_whitespace().next()?.parse::<u64>().ok()? * 1024)
-        })
-    };
-    let total = field("MemTotal")?;
-    field("MemFree")?;
-    let tracked: u64 = MEMINFO_TRACKED
-        .iter()
-        .filter_map(|key| field(key))
-        .sum::<u64>()
-        + field("KReclaimable")?.saturating_sub(field("SReclaimable")?);
-    let untracked = total
-        .saturating_sub(tracked)
-        .saturating_sub(gtt_used)
-        .saturating_sub(UNTRACKED_KERNEL_BYTES);
-    Some(untracked.min(pool_size_pages.saturating_mul(TTM_PAGE_BYTES)))
-}
-
-/// Host RAM held in TTM's page pool that host-mapped weights can take. amdgpu
-/// parks the write-combined and uncached pages of freed GTT buffers there, up to
-/// `page_pool_size` (half of RAM by default), so a process that exits leaves its
-/// host-mapped weights' pages in it. A new GTT allocation takes pages from the
-/// pool first, and TTM's shrinker frees it under memory pressure. 0 unless
-/// host-mapped memory is GTT-backed (`HSA_USERPTR_FOR_PAGED_MEM=0`), or when
-/// sysfs or `/proc/meminfo` is unreadable.
-pub fn ttm_pool_estimate() -> u64 {
-    if !host_mapped_is_gtt() {
-        return 0;
+    /// Pinnable bytes: `MemAvailable - CMA` plus the pool; `None` when
+    /// `MemAvailable` is unreadable.
+    pub fn bytes(self) -> Option<u64> {
+        self.mem_available
+            .map(|available| available.saturating_add(self.ttm_pool))
     }
-    let estimate = || -> Option<u64> {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let pool_size_pages = read_u64(TTM_PAGE_POOL_SIZE.as_ref())?;
-        ttm_pool_estimate_from(&meminfo, amdgpu_gtt_used_bytes()?, pool_size_pages)
+
+    /// Admit `host_bytes` of pinned host RAM: it must leave
+    /// [`HOST_RAM_HEADROOM_BYTES`] of [`Self::bytes`]. Zero bytes always admit;
+    /// an unreadable `MemAvailable` refuses rather than assume room.
+    pub fn admit(self, host_bytes: u64) -> Result<(), HostRamShortfall> {
+        if host_bytes == 0 {
+            return Ok(());
+        }
+        let fits = self.bytes().is_some_and(|room| {
+            host_bytes
+                .checked_add(HOST_RAM_HEADROOM_BYTES)
+                .is_some_and(|needed| needed <= room)
+        });
+        if fits {
+            return Ok(());
+        }
+        Err(HostRamShortfall {
+            host_bytes,
+            headroom: HOST_RAM_HEADROOM_BYTES,
+            ram: self,
+        })
+    }
+}
+
+/// Live [`PinnableHostRam`] for a load: the one host-RAM measure every loader
+/// that pins host memory admits against. The pool counts when `hipHostMalloc`
+/// is GTT-backed ([`host_mapped_is_gtt`]) or when `gpu` is a GTT-backed
+/// unified-memory APU (Strix Halo: a 1 GiB carve-out, the rest of the device
+/// pool is GTT), which takes every allocation from GTT whether or not
+/// `HSA_USERPTR_FOR_PAGED_MEM=0` is set (hip-bridge leaves it unset on an APU).
+/// Loads without a [`rdna_compute::Gpu`] yet pass `None`.
+pub fn pinnable_host_ram(gpu: Option<&rdna_compute::Gpu>) -> PinnableHostRam {
+    let pool_counts = gpu.is_some_and(rdna_compute::Gpu::is_gtt_backed_apu) || host_mapped_is_gtt();
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return PinnableHostRam {
+            mem_available: None,
+            ttm_pool: 0,
+        };
     };
-    estimate().unwrap_or(0)
+    // An unreadable pool cap or live-GTT figure counts the pool as empty.
+    let pool_size_pages = uma_memory::read_sysfs_u64(uma_memory::TTM_PAGE_POOL_SIZE.as_ref());
+    let gtt_used = uma_memory::amdgpu_gtt_used_bytes();
+    PinnableHostRam::from_parts(
+        &meminfo,
+        uma_memory::read_zoneinfo().as_deref(),
+        gtt_used.unwrap_or(0),
+        pool_size_pages.unwrap_or(0),
+        pool_counts && gtt_used.is_some(),
+    )
+}
+
+/// A refused pinned-host charge ([`PinnableHostRam::admit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostRamShortfall {
+    /// Bytes the load would pin.
+    pub host_bytes: u64,
+    /// Bytes that must stay free beyond them ([`HOST_RAM_HEADROOM_BYTES`]).
+    pub headroom: u64,
+    /// The measure the charge was refused against.
+    pub ram: PinnableHostRam,
+}
+
+impl HostRamShortfall {
+    /// The operator line: `subject` names what pins (plural: "routed experts"),
+    /// `fix` what to do about it.
+    pub fn describe(&self, subject: &str, fix: &str) -> String {
+        let gib = |bytes: u64| bytes as f64 / GIB_F;
+        match self.ram.mem_available {
+            Some(available) => format!(
+                "{subject} need {:.1} GiB of pinned host RAM plus {:.0} GiB headroom, but \
+                 MemAvailable - CMA is {:.1} GiB (plus {:.1} GiB estimated in TTM's page pool); {fix}",
+                gib(self.host_bytes),
+                gib(self.headroom),
+                gib(available),
+                gib(self.ram.ttm_pool),
+            ),
+            None => format!(
+                "{subject} need {:.1} GiB of pinned host RAM, but MemAvailable is unreadable",
+                gib(self.host_bytes)
+            ),
+        }
+    }
 }
 
 /// GTT room on the host: TTM's cap and what amdgpu devices already hold.
@@ -816,47 +837,24 @@ pub fn gtt_budget() -> Option<GttBudget> {
     if !host_mapped_is_gtt() {
         return None;
     }
-    let limit_bytes = read_u64(TTM_PAGES_LIMIT.as_ref())?.checked_mul(TTM_PAGE_BYTES)?;
+    let limit_bytes =
+        uma_memory::read_sysfs_u64(TTM_PAGES_LIMIT.as_ref())?.checked_mul(TTM_PAGE_BYTES)?;
     Some(GttBudget {
         limit_bytes,
-        used_bytes: amdgpu_gtt_used_bytes()?,
+        used_bytes: uma_memory::amdgpu_gtt_used_bytes()?,
     })
 }
 
-/// Refuse before any allocation when the pinned weights would not leave
-/// [`HOST_RAM_HEADROOM_BYTES`] of the host RAM they can take: `mem_available`
-/// (`MemAvailable - CMA`, [`mem_available_bytes`]; CMA pageblocks serve
-/// only movable allocations) plus `ttm_pool_bytes`, the estimate of freed GTT
-/// pages parked in TTM's page pool ([`ttm_pool_estimate`]). Pinned pages
-/// cannot be reclaimed, so over-committing them starves the rest of the host.
-pub fn check_host_ram(
-    host_bytes: u64,
-    mem_available: Option<u64>,
-    ttm_pool_bytes: u64,
-) -> Result<(), String> {
-    if host_bytes == 0 {
-        return Ok(());
-    }
-    let Some(available) = mem_available else {
-        return Err(format!(
-            "host-placed weights need {:.1} GiB of pinned host RAM, but MemAvailable is unreadable",
-            host_bytes as f64 / GIB_F
-        ));
-    };
-    let needed = host_bytes + HOST_RAM_HEADROOM_BYTES;
-    if available.saturating_add(ttm_pool_bytes) < needed {
-        return Err(format!(
-            "host-placed weights need {:.1} GiB of pinned host RAM plus {:.0} GiB headroom, but \
-             MemAvailable - CMA is {:.1} GiB (plus {:.1} GiB estimated in TTM's page pool); free host \
-             memory or keep more weights in VRAM (memory.moe_expert_budget / \
+/// Refuse before any allocation when the pinned host-placed weights would not
+/// leave [`HOST_RAM_HEADROOM_BYTES`] of `ram` ([`PinnableHostRam::admit`]).
+pub fn check_host_ram(host_bytes: u64, ram: PinnableHostRam) -> Result<(), String> {
+    ram.admit(host_bytes).map_err(|shortfall| {
+        shortfall.describe(
+            "host-placed weights",
+            "free host memory or keep more weights in VRAM (memory.moe_expert_budget / \
              memory.gpu_layer_budget)",
-            host_bytes as f64 / GIB_F,
-            HOST_RAM_HEADROOM_BYTES as f64 / GIB_F,
-            available as f64 / GIB_F,
-            ttm_pool_bytes as f64 / GIB_F
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 /// Refuse before any allocation when GTT-backed host-mapped weights would not fit
@@ -889,11 +887,11 @@ pub fn check_gtt_cap(host_bytes: u64, budget: Option<GttBudget>) -> Result<(), S
     Ok(())
 }
 
-/// Both host-tier admissions, read now: `MemAvailable - CMA` + TTM's page pool, then
-/// GTT's cap. This is the one call a loader makes before allocating anything
-/// host-mapped.
+/// Both host-tier admissions, read now: [`pinnable_host_ram`], then GTT's cap.
+/// This is the one call a loader without a [`rdna_compute::Gpu`] makes before
+/// allocating anything host-mapped.
 pub fn admit_host_placement(host_bytes: u64) -> Result<(), String> {
-    check_host_ram(host_bytes, mem_available_bytes(), ttm_pool_estimate())?;
+    check_host_ram(host_bytes, pinnable_host_ram(None))?;
     check_gtt_cap(host_bytes, gtt_budget())
 }
 
@@ -1098,18 +1096,61 @@ mod tests {
         assert_eq!(kv_reserve(u64::MAX, 4), None);
     }
 
+    /// A measure of `available` bytes `MemAvailable - CMA` and `pool` bytes of
+    /// TTM page pool.
+    fn ram(available: Option<u64>, pool: u64) -> PinnableHostRam {
+        PinnableHostRam {
+            mem_available: available,
+            ttm_pool: pool,
+        }
+    }
+
     #[test]
-    fn host_ram_check_refuses_below_headroom() {
+    fn admit_refuses_below_headroom_and_counts_the_pool_byte_for_byte() {
         let host = 60u64 << 30;
-        assert!(check_host_ram(host, Some(host + HOST_RAM_HEADROOM_BYTES), 0).is_ok());
-        let error = check_host_ram(host, Some(host + HOST_RAM_HEADROOM_BYTES - 1), 0).unwrap_err();
-        assert!(error.contains("MemAvailable"), "{error}");
-        assert!(check_host_ram(host, None, 0).is_err());
-        assert!(check_host_ram(host, None, u64::MAX).is_err());
-        assert!(check_host_ram(0, None, 0).is_ok());
+        assert!(ram(Some(host + HOST_RAM_HEADROOM_BYTES), 0)
+            .admit(host)
+            .is_ok());
+        let short = ram(Some(host + HOST_RAM_HEADROOM_BYTES - 1), 0);
+        assert_eq!(
+            short.admit(host),
+            Err(HostRamShortfall {
+                host_bytes: host,
+                headroom: HOST_RAM_HEADROOM_BYTES,
+                ram: short,
+            })
+        );
+        // An unreadable MemAvailable refuses, whatever the pool holds.
+        assert!(ram(None, 0).admit(host).is_err());
+        assert!(ram(None, u64::MAX).admit(host).is_err());
+        // Nothing pinned always admits.
+        assert!(ram(None, 0).admit(0).is_ok());
         // The pool counts toward the room, byte for byte.
-        assert!(check_host_ram(host, Some(host), HOST_RAM_HEADROOM_BYTES).is_ok());
-        assert!(check_host_ram(host, Some(host), HOST_RAM_HEADROOM_BYTES - 1).is_err());
+        assert!(ram(Some(host), HOST_RAM_HEADROOM_BYTES).admit(host).is_ok());
+        assert!(ram(Some(host), HOST_RAM_HEADROOM_BYTES - 1)
+            .admit(host)
+            .is_err());
+        // Saturating, never wrapping.
+        assert_eq!(ram(Some(u64::MAX), u64::MAX).bytes(), Some(u64::MAX));
+        assert!(ram(Some(u64::MAX), 0).admit(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn shortfall_names_both_terms_and_the_fix() {
+        let host = 60u64 << 30;
+        let error = check_host_ram(host, ram(Some(40 << 30), 10 << 30)).unwrap_err();
+        assert_eq!(
+            error,
+            "host-placed weights need 60.0 GiB of pinned host RAM plus 4 GiB headroom, but \
+             MemAvailable - CMA is 40.0 GiB (plus 10.0 GiB estimated in TTM's page pool); free \
+             host memory or keep more weights in VRAM (memory.moe_expert_budget / \
+             memory.gpu_layer_budget)"
+        );
+        let unreadable = ram(None, 0).admit(host).unwrap_err();
+        assert_eq!(
+            unreadable.describe("routed experts", "unused"),
+            "routed experts need 60.0 GiB of pinned host RAM, but MemAvailable is unreadable"
+        );
     }
 
     /// `/proc/meminfo` text from `(field, MiB)` pairs.
@@ -1141,47 +1182,117 @@ mod tests {
         ])
     }
 
+    const GFX1201_POOL_PAGES: u64 = 16_108_144;
+    const IDLE_GTT: u64 = 5 * (16 << 20);
+
     #[test]
-    fn ttm_pool_estimate_credits_only_untracked_pages_past_the_baseline() {
-        const POOL_PAGES: u64 = 16_108_144;
-        let gtt = 5 * (16 << 20);
-        let mib = |bytes: u64| bytes >> 20;
-        // The measured baseline (2.76 GiB, pool empty) is never credited.
+    fn from_parts_credits_the_pool_only_when_the_pins_are_gtt() {
+        let text = gfx1201_host(59_737, 2826);
+        let gtt = PinnableHostRam::from_parts(&text, None, IDLE_GTT, GFX1201_POOL_PAGES, true);
+        assert_eq!(gtt.mem_available, Some(45_800 << 20));
+        // The reported leftover (59,737 MiB); the measured baseline (2.76 GiB with
+        // the pool empty) is never credited.
         assert_eq!(
-            ttm_pool_estimate_from(&gfx1201_host(0, 2826), gtt, POOL_PAGES),
-            Some(0)
+            gtt.ttm_pool >> 20,
+            59_737 + 2826 - (uma_memory::UNTRACKED_KERNEL_BYTES >> 20)
         );
-        // The reported leftover: 15,292,712 pool pages (59,737 MiB).
-        let pool = ttm_pool_estimate_from(&gfx1201_host(59_737, 2826), gtt, POOL_PAGES).unwrap();
-        assert_eq!(mib(pool), 59_737 + 2826 - (UNTRACKED_KERNEL_BYTES >> 20));
-        // Capped at page_pool_size.
-        let capped = ttm_pool_estimate_from(&gfx1201_host(59_737, 2826), gtt, 1 << 20).unwrap();
-        assert_eq!(capped, (1 << 20) * TTM_PAGE_BYTES);
+        // Userptr pins come from the buddy allocator, not the pool.
+        let userptr = PinnableHostRam::from_parts(&text, None, IDLE_GTT, GFX1201_POOL_PAGES, false);
+        assert_eq!(userptr, ram(Some(45_800 << 20), 0));
+        // Capped at page_pool_size: hiptrx since 2026-11-18 (1048576 pages, 4 GiB).
+        let capped = PinnableHostRam::from_parts(&text, None, IDLE_GTT, 1 << 20, true);
+        assert_eq!(capped.ttm_pool, 4 << 30);
         // Live GTT (another host-mapped load) is not pool.
-        let live = ttm_pool_estimate_from(&gfx1201_host(0, 2826), 46 << 30, POOL_PAGES);
-        let held = ttm_pool_estimate_from(&gfx1201_host(46 << 10, 2826), 46 << 30, POOL_PAGES);
-        assert_eq!((live, held), (Some(0), Some(0)));
+        let held = PinnableHostRam::from_parts(
+            &gfx1201_host(46 << 10, 2826),
+            None,
+            46 << 30,
+            GFX1201_POOL_PAGES,
+            true,
+        );
+        assert_eq!(held.ttm_pool, 0);
+        // A meminfo without the pool's fields counts the pool as empty but keeps
+        // MemAvailable; one without MemAvailable is unreadable.
+        let bare = PinnableHostRam::from_parts("MemAvailable: 1024 kB\n", None, 0, 1 << 20, true);
+        assert_eq!(bare, ram(Some(1 << 20), 0));
+        let none = PinnableHostRam::from_parts("MemTotal: 1024 kB\n", None, 0, 1 << 20, true);
+        assert_eq!(none.bytes(), None);
+    }
+
+    #[test]
+    fn from_parts_subtracts_the_cma_region() {
+        // 40 GiB available, 2 GiB of CMA pageblocks (more than CmaFree).
+        let text = "MemAvailable: 41943040 kB\nCmaTotal: 2097152 kB\nCmaFree: 1048576 kB\n";
+        let measured = PinnableHostRam::from_parts(text, None, 0, 0, true);
+        assert_eq!(measured, ram(Some(38 << 30), 0));
+        // KHO scratch: zoneinfo's cma pageblocks (4 GiB) exceed CmaTotal.
+        let zoneinfo = "Node 0, zone   Normal\n  pages free 1\n        cma      1048576\n";
+        let kho = PinnableHostRam::from_parts(text, Some(zoneinfo), 0, 0, true);
+        assert_eq!(kho, ram(Some(36 << 30), 0));
     }
 
     #[test]
     fn leftover_pool_admits_the_reload_and_a_real_shortage_still_refuses() {
-        // N=12 host-maps 46.1 GiB; the reported refusal read MemAvailable 45.8 GiB.
+        // N=12 host-maps 46.1 GiB, more than MemAvailable alone holds.
         let host = 47_206u64 << 20;
-        let available = Some(46_899u64 << 20);
-        let gtt = 5 * (16 << 20);
-        assert!(check_host_ram(host, available, 0).is_err());
-        let leftover = ttm_pool_estimate_from(&gfx1201_host(59_737, 2826), gtt, 16_108_144);
-        assert!(check_host_ram(host, available, leftover.unwrap()).is_ok());
+        let measure = |pool_mib| {
+            PinnableHostRam::from_parts(
+                &gfx1201_host(pool_mib, 2826),
+                None,
+                IDLE_GTT,
+                GFX1201_POOL_PAGES,
+                true,
+            )
+        };
+        assert!(measure(59_737).admit(host).is_ok());
         // The same MemAvailable with nothing parked in the pool.
-        let empty = ttm_pool_estimate_from(&gfx1201_host(0, 2826), gtt, 16_108_144);
-        let error = check_host_ram(host, available, empty.unwrap()).unwrap_err();
+        let error = check_host_ram(host, measure(0)).unwrap_err();
         assert!(
-            error.contains("MemAvailable - CMA is 45.8 GiB (plus 0.0 GiB"),
+            error.contains("MemAvailable - CMA is 44.7 GiB (plus 0.0 GiB"),
             "{error}"
         );
-        // A pool smaller than the 4.3 GiB gap still refuses.
-        let small = ttm_pool_estimate_from(&gfx1201_host(3 << 10, 2826), gtt, 16_108_144);
-        assert!(check_host_ram(host, available, small.unwrap()).is_err());
+        // A pool smaller than the gap still refuses.
+        assert!(measure(3 << 10).admit(host).is_err());
+    }
+
+    /// hiptrx at the S6b DeepSeek V4 refusal (j10757, 2026-11-18): MemTotal
+    /// 122.9 GiB, MemAvailable 38.0 GiB, about 50 GiB in TTM's page pool under
+    /// the default 61.4 GiB cap.
+    fn hiptrx_j10757() -> String {
+        let kib = |bytes: u64| bytes >> 10;
+        format!(
+            "MemTotal: {} kB\nMemFree: {} kB\nMemAvailable: {} kB\nBuffers: 0 kB\nCached: {} kB\n\
+             SwapCached: 0 kB\nAnonPages: {} kB\nSlab: {} kB\nKReclaimable: {} kB\n\
+             SReclaimable: {} kB\nKernelStack: {} kB\nPageTables: {} kB\nCmaTotal: 0 kB\n\
+             CmaFree: 0 kB\n",
+            kib(131_957_878_784),
+            kib(11_657_281_536),
+            kib(40_779_407_360),
+            kib(44_647_026_688),
+            kib(10_985_365_504),
+            3 << 20,
+            2 << 20,
+            2 << 20,
+            64 << 10,
+            256 << 10,
+        )
+    }
+
+    #[test]
+    fn the_ds4_owner_refused_on_mem_available_alone_admits_with_the_pool() {
+        // 72.6 GiB pinned (S6b c-mapped.json: 78,003,568,640 B).
+        let pinned = 78_003_568_640u64;
+        let text = hiptrx_j10757();
+        let without = PinnableHostRam::from_parts(&text, None, IDLE_GTT, GFX1201_POOL_PAGES, false);
+        assert!(without.admit(pinned).is_err());
+        let with = PinnableHostRam::from_parts(&text, None, IDLE_GTT, GFX1201_POOL_PAGES, true);
+        assert!(with.ttm_pool > 45 << 30, "{with:?}");
+        assert!(with.admit(pinned).is_ok());
+        // Under a 4 GiB cap only 4 GiB counts as pool (the kernel frees the rest
+        // at once, so a live MemAvailable shows it instead).
+        let capped = PinnableHostRam::from_parts(&text, None, IDLE_GTT, 1 << 20, true);
+        assert_eq!(capped.ttm_pool, 4 << 30);
+        assert!(capped.admit(pinned).is_err());
     }
 
     #[test]
