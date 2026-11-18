@@ -3183,9 +3183,12 @@ impl Qwen4State {
     /// stream (finish its incomplete tile, quantize once at the absolute end,
     /// close the cursor) so decode/verify may read the live slot. Call once
     /// at the real prompt end, never at an outer chunk, checkpoint, restore or
-    /// lane exchange. The dispatch layer also seals lazily before any
-    /// non-stream consumer reaches a layer, so a missed owner call is never a
-    /// stale read.
+    /// lane exchange. Every decode/verify forward also seals eagerly before its
+    /// body begins (`Qwen4GpuForward::forward_chunk_inner`), and the dispatch
+    /// layer seals lazily before any other non-stream consumer reaches a layer,
+    /// so a missed owner call is never a stale read. Never inside a recorded or
+    /// captured body: the seal launchers refuse there (a recorded seal would
+    /// replay over the live state every step).
     pub fn seal_gdn_streams<'w>(
         &mut self,
         gpu: &mut Gpu,

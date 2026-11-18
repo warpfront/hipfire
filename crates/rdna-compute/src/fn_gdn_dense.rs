@@ -1007,7 +1007,8 @@ pub fn stream_append(
 
 /// Seal an Open Scan64 stream once at the actual prompt end (finish the incomplete tile,
 /// quantize once) and hand the live Qwen4 convolution ring back at `meta.position`. A
-/// Sealed cursor is returned as is.
+/// Sealed cursor is returned as is. Refused before any launch inside a recorded or captured
+/// body ([`crate::gdn_stream::GdnStreamMeta::refuse_recorded_seal`]), as the WY seal is.
 #[cfg(feature = "deltanet")]
 #[allow(clippy::too_many_arguments)]
 pub fn stream_seal(
@@ -1029,6 +1030,7 @@ pub fn stream_seal(
     if meta.phase == GdnStreamPhase::Sealed {
         return Ok(*meta);
     }
+    meta.refuse_recorded_seal(gpu.replay.is_recording() || gpu.graphs.capture_mode)?;
     let geometry = Geometry::of(key_heads, value_heads).ok_or_else(|| {
         hip_bridge::HipError::new(0, "fn_gdn_dense stream: head geometry not admitted")
     })?;

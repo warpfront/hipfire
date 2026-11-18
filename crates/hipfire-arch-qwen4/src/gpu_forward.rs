@@ -16948,6 +16948,18 @@ impl Qwen4GpuForward {
     ) -> Result<(), Qwen4GpuForwardError> {
         self.share_check()?;
         self.ep_tail_borrow_check()?;
+        // A decode / verify forward is the first consumer of the live slot after an ordinary
+        // prefill: seal every open GDN stream here, before any body the replay recorder (armed
+        // inside `forward_chunk_scoped`) can capture, on every route below (EP reserve / tail,
+        // expert cache, share, mesh). Left to the dispatch layer's lazy per-layer seal, an
+        // unsealed prime (`forward_chunk_final`, a mid-prefill snapshot restore) records the
+        // one-time seal into the first retained body, and every replay re-finishes the stale
+        // tile over the live state. The seal launchers refuse inside a recorded body.
+        if !self.prefill_scope {
+            bundle
+                .seal_gdn_streams(gpu)
+                .map_err(|error| invalid(format!("seal the GDN stream before decode: {error}")))?;
+        }
         self.ep_ordinary_note_call(tokens.len());
         // The previous singleton forward (a token or a verify window) is a retired window of
         // the D2 expert tail, if one is installed (lane steps retire theirs after their own
@@ -20669,6 +20681,27 @@ mod d2_split_enabled_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A decode/verify forward seals open GDN streams at the top of `forward_chunk_inner`,
+    /// before every route it hands off to (EP reserve / tail, expert cache, the tile whose scoped
+    /// body arms the replay recorder), so no recorded body contains the one-time seal (pinned on
+    /// the source: a device is needed to run it).
+    #[test]
+    fn decode_seals_gdn_streams_before_any_recordable_body() {
+        let src = include_str!("gpu_forward.rs");
+        let inner = &src[src.find("    fn forward_chunk_inner(").expect("inner")..];
+        let inner = &inner[..inner.find("\n    }\n").expect("inner end")];
+        let seal = inner.find(".seal_gdn_streams(gpu)").expect("eager seal");
+        assert!(inner[..seal].contains("if !self.prefill_scope {"));
+        for route in [
+            "self.ep_reserve_forward_chunk(",
+            "self.ep_tail_forward_chunk(",
+            "self.forward_cache_chunk(",
+            "self.forward_chunk_tile(",
+        ] {
+            assert!(seal < inner.find(route).expect(route), "{route}");
+        }
+    }
+
     #[test]
     fn sym_iu4_kill_verdict_cases() {
         use super::{sym_iu4_kill_verdict as v, Iu4KillVerdict::*};

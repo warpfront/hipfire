@@ -5289,8 +5289,9 @@ impl Qwen4Bundle {
     }
 
     /// Seal every open GDN stream of the resident state ([`Qwen4State::seal_gdn_streams`] with
-    /// this bundle's resident GDN weights). A no-op on a sealed or carry-less state.
-    fn seal_gdn_streams(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+    /// this bundle's resident GDN weights). A no-op on a sealed or carry-less state. Also the
+    /// eager seal every decode/verify forward runs before its (recordable) body begins.
+    pub(crate) fn seal_gdn_streams(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
         let weights = &self.weights;
         self.state
             .seal_gdn_streams(gpu, &|abs| {

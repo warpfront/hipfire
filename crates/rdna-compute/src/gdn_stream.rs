@@ -164,6 +164,24 @@ impl GdnStreamMeta {
             },
         }
     }
+
+    /// Refuse sealing this cursor inside a recorded or captured body (`recording`: the replay
+    /// recorder or a HIP graph capture is live). The seal is the one-time terminal fence of an
+    /// ordinary-prefill phase, but a recorded body replays every launch it recorded at every
+    /// later step, so a seal recorded there would re-finish the stale tile over the live decode
+    /// state on each replay. The owner seals before such a body begins. A Sealed cursor is a
+    /// no-op seal and always passes.
+    pub fn refuse_recorded_seal(&self, recording: bool) -> hip_bridge::HipResult<()> {
+        if recording && self.phase == GdnStreamPhase::Open {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "GDN stream seal inside a recorded or captured body: the open stream must be \
+                 sealed before the decode/verify body begins (a recorded seal replays over the \
+                 live state every step)",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Geometry of a per-layer persistent carry (§5): FP32 tile-entry state,
@@ -805,5 +823,24 @@ mod tests {
             .meta;
         assert_eq!(open.begin_append_at(499), open);
         assert!(GdnAppendSchedule::new(&open.begin_append_at(499), 499, 1, 64, 512).is_err());
+    }
+
+    /// A recording body never seals: an Open cursor refuses under the recorder or a HIP graph
+    /// capture (the seal would be recorded and replayed over the live state every step), seals
+    /// eagerly, and a Sealed cursor (a no-op seal) passes either way.
+    #[test]
+    fn a_recording_body_refuses_to_seal_an_open_stream() {
+        let sealed = GdnStreamMeta::sealed_at(512, 3);
+        let open = GdnStreamMeta {
+            phase: GdnStreamPhase::Open,
+            tile_base: 512 - 13,
+            pending_rows: 13,
+            ..sealed
+        };
+        let refused = open.refuse_recorded_seal(true).expect_err("recorded seal");
+        assert!(refused.to_string().contains("recorded or captured body"));
+        assert!(open.refuse_recorded_seal(false).is_ok());
+        assert!(sealed.refuse_recorded_seal(true).is_ok());
+        assert!(sealed.refuse_recorded_seal(false).is_ok());
     }
 }

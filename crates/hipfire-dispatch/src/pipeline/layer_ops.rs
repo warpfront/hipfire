@@ -4516,7 +4516,9 @@ fn execute_gated_delta_net_hc_impl(
     let arenas = core_arena(phase, arenas);
     // Ordinary prefill appends to the layer's stream (C16 WY on gfx11, dense C64 on gfx1201)
     // at absolute tile and seam positions; any other consumer of the live slot first seals an
-    // open stream (finishes the incomplete tile, quantizes once at the absolute end).
+    // open stream (finishes the incomplete tile, quantizes once at the absolute end). Inside a
+    // recorded or captured body the seal launchers refuse instead (a recorded seal would replay
+    // over the live state every step): owners seal before such a body begins.
     let wy_stream = gdn_wy_stream_route(gpu, op) && arenas.is_none();
     let dense_stream = gdn_dense_stream_route(gpu, op) && arenas.is_none();
     if !wy_stream && !dense_stream && matches!(phase, MixerPhase::Whole | MixerPhase::Core) {

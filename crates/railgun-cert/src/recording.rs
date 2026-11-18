@@ -1099,9 +1099,9 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "canonical-gdn-stream-eager-only",
         predicates: &[IsRecording, CaptureMode],
-        condition: "the canonical ordinary-prefill GDN stream and its plain-forward gate are eager-only: `ordinary_prefill_forward` (qwen35 prefill.rs; sequential, no tree/tape/fusion, band, max_layer, routed_out or mask override and !capture_mode && !is_recording() && !fp8_verify_scope && !iu4_verify_scope) feeds `with_gdn_forward` in forward_batch_chunk_impl and forward_prefill_chunk_pair_body; `gdn_dense_stream_route` and `gdn_wy_stream_route` (hipfire-dispatch pipeline/layer_ops.rs) each end in `&& !gpu.replay.is_recording() && !gpu.graphs.capture_mode` after the carry/stream, geometry and static-admission clauses; rdna-compute `fn_gdn_dense::applies_edge` ends in the same two clauses; `gdn_wy_stream_append` returns `wrong_shape()` when `replay.is_recording() || graphs.capture_mode`, as does `gdn_wy_stream_seal` for a not-yet-sealed stream; `Gpu::gdn_input_arith` (prefill_invariant.rs) computes `eager = !is_recording() && !capture_mode && k % 256 == 0` and reports the F16_WMMA arithmetic code instead of IU4/FP8/MMQ when not eager",
+        condition: "the canonical ordinary-prefill GDN stream and its plain-forward gate are eager-only: `ordinary_prefill_forward` (qwen35 prefill.rs; sequential, no tree/tape/fusion, band, max_layer, routed_out or mask override and !capture_mode && !is_recording() && !fp8_verify_scope && !iu4_verify_scope) feeds `with_gdn_forward` in forward_batch_chunk_impl and forward_prefill_chunk_pair_body; `gdn_dense_stream_route` and `gdn_wy_stream_route` (hipfire-dispatch pipeline/layer_ops.rs) each end in `&& !gpu.replay.is_recording() && !gpu.graphs.capture_mode` after the carry/stream, geometry and static-admission clauses; rdna-compute `fn_gdn_dense::applies_edge` ends in the same two clauses; `gdn_wy_stream_append` returns `wrong_shape()` when `replay.is_recording() || graphs.capture_mode`, as does `gdn_wy_stream_seal` for a not-yet-sealed stream, and `fn_gdn_dense::stream_seal` refuses an Open cursor under the same two clauses before any launch (`GdnStreamMeta::refuse_recorded_seal`: a recorded seal would replay over the live decode state every step; Qwen4 decode/verify forwards seal eagerly in `forward_chunk_inner` before the retained body arms); `Gpu::gdn_input_arith` (prefill_invariant.rs) computes `eager = !is_recording() && !capture_mode && k % 256 == 0` and reports the F16_WMMA arithmetic code instead of IU4/FP8/MMQ when not eager",
         effect: KernelSelection,
-        switches: "eager: the canonical stream routes (dense Scan64 append, WY append/seal, edge executor) and ordinary-prefill-only recipes; recorded or captured: the route predicates are false and the call keeps the incumbent route (the layer_ops.rs doc: recorder/capture runs keep the incumbent route), the direct append/seal entry points return an error before any launch, and `gdn_input_arith` reports F16_WMMA",
+        switches: "eager: the canonical stream routes (dense Scan64 append/seal, WY append/seal, edge executor) and ordinary-prefill-only recipes; recorded or captured: the route predicates are false and the call keeps the incumbent route (the layer_ops.rs doc: recorder/capture runs keep the incumbent route), the direct append/seal entry points return an error before any launch, and `gdn_input_arith` reports F16_WMMA",
         kernels: &[],
         verdict: NotEquivalent,
         evidence: "different route (stream vs incumbent recurrence); no byte-exact oracle is cited. Reaches no default program: ordinary prefill is a plain sequential forward and the recorder/capture branches are the same clauses inventoried under gdn-chunk-scan",
@@ -2393,6 +2393,12 @@ pub const SITES: &[Site] = &[
     Site {
         file: "rdna-compute/src/fn_gdn_dense.rs",
         function: "applies_edge",
+        occurrences: 2,
+        decisions: &["canonical-gdn-stream-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/fn_gdn_dense.rs",
+        function: "stream_seal",
         occurrences: 2,
         decisions: &["canonical-gdn-stream-eager-only"],
     },
