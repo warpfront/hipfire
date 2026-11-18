@@ -3073,6 +3073,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fwht4_tile_gqa_gfx11",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
         function: "attention_flash_q8_0_rows_masked_logical",
         occurrences: 2,
         decisions: &[
