@@ -790,6 +790,12 @@ impl ExpertTierLease {
         self.binding.generation
     }
 
+    /// The admitted tier plan this lease materialized: placement, the canonical artifact
+    /// sources and, for a cache plan, the catalog identity recorded at admission.
+    pub fn tier_plan(&self) -> &ExpertTierPlan {
+        &self.binding.plan
+    }
+
     pub fn logical_digest(&self) -> [u8; 32] {
         self.binding.logical_digest
     }

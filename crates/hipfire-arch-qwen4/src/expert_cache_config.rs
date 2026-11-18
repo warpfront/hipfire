@@ -17,7 +17,8 @@
 //! whole expert spans: unset means [`DEFAULT_DONOR_PERCENT`] percent of the ranked device
 //! owner's bytes, `0` is a valid static-only plan (no evictable slots, nothing attached).
 //!
-//! `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` stays a developer knob (maximum paired fills in flight).
+//! `HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT` stays a developer knob (target for paired fills in flight;
+//! the shared core's per-layer pools each take `ceil(cap / pools)`, see `expert_cache`).
 //!
 //! [`record_catalog_identity`] builds the runtime [`ExpertCatalog`] from the admitted tier plan
 //! and records its canonical identity digest on the plan before any weight is materialized.

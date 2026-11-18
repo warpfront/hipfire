@@ -1,31 +1,89 @@
-//! Decode-only exact LRU of immutable Flash-Next expert payloads.
+//! Decode-only exact LRU of immutable Flash-Next expert payloads, on the shared runtime core.
 //!
-//! A token uses the tables acquired at its start. Misses execute from immutable
-//! mapped host backing; asynchronous copies serve later tokens. Dirty short
-//! prefill reads independent immutable core/host tables. Long prefill restores
-//! the original donor bytes before using the frozen resident view.
+//! A token uses the tables acquired at its start. Misses execute from immutable mapped host
+//! backing; asynchronous copies serve later tokens. Dirty short prefill reads independent
+//! immutable core/host tables. Long prefill restores the original donor bytes before using the
+//! frozen resident view.
+//!
+//! # What runs where
+//!
+//! The decisions and every slot / fill / generation transition belong to
+//! [`hipfire_runtime::expert_cache`]: [`ExpertCachePolicy`] (LRU, candidates, fill budget,
+//! pending-is-invisible, withdrawal, the retirement cadence over railgun's `SlotBank`) and
+//! [`DeviceIo`] (copy stream, event pool, one event per paired GU+DN fill). This module is the
+//! thin Qwen adapter:
+//!
+//! * the layout: [`ExpertKey`]s come from the admitted [`ExpertCatalog`]
+//!   ([`crate::expert_cache_config::build_expert_catalog`], checked against the identity recorded
+//!   at admission) and each layer's donor slots become one policy pool whose layout class the
+//!   catalog proves ([`build_layout`]);
+//! * the canonical sources: both projections of a cacheable expert are the segments of one
+//!   [`BundleSource`] bundle, so a fill copies GU and DN under one event and never publishes half;
+//! * the decode window: one window per AR token (`begin_token` .. `finish_token`), the routed ids
+//!   the step read back become the window's uses, and `published()` / `withdrawn()` are written
+//!   into the per-layer device tables through the dispatch [`MutableExpertResidency`]
+//!   capability (the table writes and the launch authority stay dispatch's);
+//! * the donor protocol (S4c generalizes it): a dirty short prefill reads the immutable
+//!   core/host tables, a dirty long prefill drains every fill and re-seeds the pools from the
+//!   original donor bytes (see [`ExpertCache::prepare_prefill`]);
+//! * teardown ([`ExpertCache::shutdown`], `Drop`): wait every fill, drop the pools once the
+//!   device is idle; an unretired token or an unprovable retirement retains every owner.
+//!
+//! # Retirement cadence (A2.1)
+//!
+//! A window with nothing to publish and no victim to withdraw seals, retires and syncs nothing:
+//! each pool's one lease of its live generation simply continues. Only a completed fill or a
+//! withdrawn victim ([`ExpertCachePolicy::needs_retirement`]) fences the compute stream, retires
+//! the dirty pools' generations, rewrites the tables of the changed layers and seals again.
+//! Completed fills are published when `begin_token` polls them and when `finish_token` stages
+//! them with the group decision, so one retirement serves both.
+//!
+//! # Decision differences from the #1022 private manager (placement only, never math)
+//!
+//! * Victims: least recently used by the core's stamp (a key the window used is stamped), the
+//!   colder hot-set ranking first on a tie, then the slot index. #1022 broke ties by slot index
+//!   and stamped slots whose fill was still pending.
+//! * Candidates: missed keys ordered by reads, then hot-set ranking, then key. #1022 served the
+//!   layers round-robin in selected order.
+//! * Fill budget: the pool's `F` minus its fills in flight, one window per group. `F` is
+//!   `ceil(HIPFIRE_QWEN4_EXPERT_CACHE_INFLIGHT / pools)` per layer pool (at least one) and the
+//!   event pool holds `F x pools` events, so the global cap is that knob rounded up to a whole
+//!   fill per layer pool; #1022 counted one global cap with no per-layer share.
+//! * Pools: one pool per layer (a single layout class each, refused otherwise) instead of one pool
+//!   per layout class. The dispatch capability publishes through a per-layer slot universe, so a
+//!   layer's key can only occupy that layer's donor slots; sharing a class pool across layers
+//!   would make every layer's capability carry every slot (its constructor checks every slot
+//!   against every other slot and each publication clones all of them). S4c / S3b can lift this.
+//! * Warm start: the donors' original experts fill the slots, all with the same stamp, so the
+//!   colder hot-set ranking is evicted first (#1022 staggered the stamps by the ranking, the same
+//!   order); the seed is published at load and after each restore instead of at the next token.
+//! * The old per-token reader lease and compute-stream sync are gone: the window consumer joins
+//!   on the caller's proof (the route readback wait, or `device_synchronize` on cancellation),
+//!   and the stream is only synced when a generation retires.
+//! * Slot fill generations restart when a restore rebuilds the pools, so a dispatch ticket's
+//!   generation is `restore epoch << 32 | fill generation`: still strictly increasing per slot.
 
-use crate::expert_cache_config::ExpertCacheConfig;
+use crate::expert_cache_config::{build_expert_catalog, ExpertCacheConfig};
 use crate::expert_slabs::{EXPERTS_PER_LAYER, TRUNK_LAYERS};
-use crate::expert_tier_owners::{ExpertCacheSlot, ExpertCacheTableLease, ExpertTierLease};
+use crate::expert_tier_owners::{ExpertCacheTableLease, ExpertTierLease};
 use crate::expert_tier_plan::Placement;
-use hip_bridge::{DeviceBuffer, Event, HipRuntime, Stream, HIP_EVENT_DISABLE_TIMING};
+use hip_bridge::{HipRuntime, Stream};
 use hipfire_dispatch::families::moe::{
     MutableExpertResidency, MutableExpertResidencySpec, ResidencyLocation, ResidencyPublication,
     ResidencySlot, ResidencySlotTicket, ResidencySnapshot, ResidencySpan, ResidencyTokenGuard,
 };
+use hipfire_runtime::expert_cache::{
+    BundleSource, CacheStats, CancelOutcome, ConsumerId, CopyDevice, DeviceIo, ExpertCachePolicy,
+    ExpertCatalog, ExpertKey, FillOp, HipCopyBackend, HostRange, IoError, PolicyConfig, PoolConfig,
+    PoolDest, PoolId, PoolInit, Rejected, Segment, WindowConsumerPhase, WindowUse,
+};
 use railgun::sealed_table::generation::{
-    acquire_window_owned, finish_window, BlockRegistry, Expert, FenceBackend, FenceFailure,
-    FenceState, FillTicket, FillsNotDone, GenerationId, GenerationRetired, OwnedTableGeneration,
-    PendingFills, SlotBank, SlotCell, SlotPhaseView, SlotSpan, Staging, TableBacking,
-    WindowReadLease,
+    BlockRegistry, Expert, FenceBackend, FenceFailure, FenceState, SlotSpan,
 };
 use railgun::window::Quiescence;
 use railgun::Binding;
 use rdna_compute::Gpu;
-use std::collections::BTreeMap;
-use std::collections::VecDeque;
-use std::ffi::c_void;
+use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -36,7 +94,7 @@ use std::time::Instant;
 const EXPERTS: usize = EXPERTS_PER_LAYER as usize;
 const LAYERS: usize = TRUNK_LAYERS as usize;
 const TOPK: usize = 10;
-type Result<T> = std::result::Result<T, String>;
+type Result<T, E = String> = std::result::Result<T, E>;
 
 /// Descriptors returned by tables are borrowed and must never be freed.
 #[derive(Clone)]
@@ -48,8 +106,8 @@ pub(crate) struct ExpertCacheLayerBinding {
 /// An unretired token poisons every capability and prevents freeing its owners.
 pub(crate) struct ExpertCacheToken {
     guards: Vec<ResidencyTokenGuard>,
+    consumer: ConsumerId,
     outstanding: Arc<AtomicBool>,
-    reader: Option<WindowReadLease<'static>>,
 }
 /// Cumulative logical byte counters and host-observed wall durations. Timings
 /// cover these manager methods, not the caller's route readback or GPU step.
@@ -85,54 +143,118 @@ pub(crate) struct ExpertCacheStats {
     /// Attempted GU/DN publication transactions, including failed attempts.
     pub publish_calls: u64,
     /// Whole prepare_prefill wall time when entering with dirty donor bytes:
-    /// drain, mapping withdrawal, restoration and waits, including failed attempts.
+    /// drain, restoration and waits, including failed attempts.
     pub prefill_restore_wall_ns: u64,
 }
 
+fn elapsed_wall_ns(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn fail(context: &str, value: impl std::fmt::Display) -> String {
+    format!("exact expert cache {context}: {value}")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Layout: keys, pools, canonical sources
+// ---------------------------------------------------------------------------------------------
+
+/// CPU range `(address, bytes)` of both canonical projections of one host-backed expert.
 #[derive(Clone, Copy)]
 struct HostPair {
     gate_up: (usize, usize),
     down: (usize, usize),
 }
-struct LayerCache {
-    binding: ExpertCacheLayerBinding,
-    slots: Vec<ExpertCacheSlot>,
-    host: Vec<Option<HostPair>>,
-    slot_ids: Vec<usize>,
-    index: Vec<Option<usize>>,
-    // Retain upload mirrors even when the second upload fails after the first.
-    gate_up_upload: Vec<u8>,
-    down_upload: Vec<u8>,
-}
-struct PendingFill {
-    batch: PendingFills,
+
+/// One expert of a layer as the cache view names it.
+struct ExpertInput {
+    gate_up: ResidencySpan,
+    down: ResidencySpan,
+    /// `Some` for every cacheable expert (host-mapped or a donor); `None` for the pinned core.
+    host: Option<HostPair>,
 }
 
-pub(crate) struct ExpertCache {
-    hip: Arc<HipRuntime>,
-    device_id: i32,
-    lease: Option<ExpertTierLease>,
-    layers: Vec<LayerCache>,
-    copy_stream: Option<Stream>,
-    bank: Option<CacheBank>,
-    pending: VecDeque<PendingFill>,
-    events: CopyEvents,
-    max_inflight: usize,
-    warm_order: Vec<Vec<usize>>,
-    needs_seed: bool,
-    dirty: bool,
-    poisoned: Option<String>,
-    outstanding: Arc<AtomicBool>,
-    stats: ExpertCacheStats,
-    next_layer: usize,
-}
-fn elapsed_wall_ns(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+/// One donor slot: the original expert whose bytes it holds and its device extents.
+struct SlotInput {
+    original_expert: usize,
+    gate_up: (usize, usize),
+    down: (usize, usize),
 }
 
-fn error(context: &str, value: impl std::fmt::Display) -> String {
-    format!("exact expert cache {context}: {value}")
+struct LayerInput {
+    experts: Vec<ExpertInput>,
+    /// In physical tail order.
+    slots: Vec<SlotInput>,
+    /// The layer's mutable GU and DN pointer tables.
+    tables: [Binding; 2],
 }
+
+/// What one routed selection of a (layer, expert) is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Read {
+    /// Pinned in VRAM by the admitted plan.
+    Core,
+    /// Cacheable and served by a pool of donor slots.
+    Cache { pool: PoolId, rank: u32, bytes: u64 },
+    /// Cacheable but the layer has no donor slot: always a host read.
+    Host { bytes: u64 },
+}
+
+/// The physical shape of one pool: a layer's donor slots.
+struct PoolGeometry {
+    layer: usize,
+    /// `(device address, bytes)` of the hull of the pool's slots inside the donor tail.
+    block: (usize, usize),
+    /// Block-relative `[gate/up, down]` write extents per slot, in physical order.
+    spans: Vec<Vec<SlotSpan>>,
+    tables: Vec<Binding>,
+    /// Slot `i` starts out holding its donor's original expert.
+    seed: Vec<(ExpertKey, u32)>,
+}
+
+struct Layout {
+    owner_id: u64,
+    owner_generation: u64,
+    /// `layer * EXPERTS + expert`.
+    reads: Vec<Read>,
+    /// The two canonical host segments (GU, DN) of each cacheable expert of a pooled layer.
+    bundles: Vec<Option<[Segment; 2]>>,
+    /// The policy pool of each layer.
+    layer_pool: Vec<Option<PoolId>>,
+    pools: Vec<PoolGeometry>,
+}
+
+impl Layout {
+    fn key(&self, layer: usize, expert: usize) -> ExpertKey {
+        ExpertKey {
+            owner_id: self.owner_id,
+            owner_generation: self.owner_generation,
+            group_id: layer as u32,
+            expert_id: expert as u32,
+        }
+    }
+
+    fn slots(&self) -> usize {
+        self.pools.iter().map(|pool| pool.spans.len()).sum()
+    }
+}
+
+impl BundleSource for Layout {
+    fn bundle(&self, key: &ExpertKey, pool: PoolId) -> Option<&[Segment]> {
+        if key.owner_id != self.owner_id || key.owner_generation != self.owner_generation {
+            return None;
+        }
+        let layer = key.group_id as usize;
+        let expert = key.expert_id as usize;
+        if layer >= LAYERS || expert >= EXPERTS || self.layer_pool[layer] != Some(pool) {
+            return None;
+        }
+        self.bundles[layer * EXPERTS + expert]
+            .as_ref()
+            .map(|bundle| &bundle[..])
+    }
+}
+
 fn host_projection(
     alias: usize,
     bytes: usize,
@@ -159,329 +281,25 @@ fn host_projection(
         .ok_or("expert cache host CPU end overflow")?;
     Ok((cpu, bytes))
 }
-/// Preserve selected order within each layer while giving every nonempty
-/// layer its first fill before any layer receives a second one.
-fn fair_misses(misses: &[Vec<usize>], start: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
-    let layers = misses.len();
-    let longest = misses.iter().map(Vec::len).max().unwrap_or(0);
-    (0..longest).flat_map(move |ordinal| {
-        (0..layers).filter_map(move |offset| {
-            let layer = (start + offset) % layers;
-            misses[layer]
-                .get(ordinal)
-                .copied()
-                .map(|expert| (layer, expert))
-        })
-    })
-}
 
-fn warm_order(rank: &[u32]) -> Result<Vec<Vec<usize>>> {
+/// Ranking position (smaller = hotter) of every `layer * EXPERTS + expert`; the rank must be a
+/// complete permutation.
+fn rank_positions(rank: &[u32]) -> Result<Vec<u32>> {
     if rank.len() != LAYERS * EXPERTS {
         return Err("expert cache rank cardinality".into());
     }
-    let mut seen = vec![false; rank.len()];
-    let mut layers = (0..LAYERS)
-        .map(|_| Vec::with_capacity(EXPERTS))
-        .collect::<Vec<_>>();
-    // Touch cold to hot, leaving the hottest resident donor most recent.
-    for &id in rank.iter().rev() {
-        let id = id as usize;
-        if id >= seen.len() || std::mem::replace(&mut seen[id], true) {
+    let mut position = vec![u32::MAX; rank.len()];
+    for (at, &id) in rank.iter().enumerate() {
+        let slot = position
+            .get_mut(id as usize)
+            .ok_or("expert cache rank is not a permutation")?;
+        if std::mem::replace(slot, at as u32) != u32::MAX {
             return Err("expert cache rank is not a permutation".into());
         }
-        layers[id / EXPERTS].push(id % EXPERTS);
     }
-    Ok(layers)
-}
-/// Count what the completed token actually read, independent of later LRU
-/// reservations or copy completion. Reject malformed selection before counting.
-fn account_routes(
-    stats: &mut ExpertCacheStats,
-    ids: &[i32],
-    host: &[Option<HostPair>],
-    mapping: &[ResidencyLocation],
-) -> Result<()> {
-    if host.len() != EXPERTS || mapping.len() != EXPERTS {
-        return Err("expert cache route-accounting cardinality".into());
-    }
-    let mut seen = [false; EXPERTS];
-    for &id in ids {
-        let expert = usize::try_from(id).map_err(|_| "expert cache negative selected expert")?;
-        if expert >= EXPERTS || std::mem::replace(&mut seen[expert], true) {
-            return Err("expert cache invalid/duplicate selected expert".into());
-        }
-    }
-    for &id in ids {
-        let expert = id as usize;
-        stats.selected = stats.selected.saturating_add(1);
-        match host[expert] {
-            None => stats.core_hits = stats.core_hits.saturating_add(1),
-            Some(_) if matches!(mapping[expert], ResidencyLocation::Slot(_)) => {
-                stats.cache_hits = stats.cache_hits.saturating_add(1);
-            }
-            Some(pair) => {
-                stats.host_misses = stats.host_misses.saturating_add(1);
-                stats.miss_bytes = stats
-                    .miss_bytes
-                    .saturating_add((pair.gate_up.1 + pair.down.1) as u64);
-            }
-        }
-    }
-    Ok(())
+    Ok(position)
 }
 
-/// The sole slot/fill-generation authority. Policy metadata selects a slot,
-/// while every ownership transition is performed by the shared railgun bank.
-struct CacheBank {
-    bank: Option<SlotBank>,
-    cells: Vec<Option<SlotCell>>,
-    staging: Staging,
-    backing: Option<TableBacking>,
-    generation: Option<OwnedTableGeneration>,
-    retired: Option<GenerationRetired>,
-    meta: Vec<(usize, usize)>,
-    last_used: Vec<u64>,
-    clock: u64,
-    epoch: u64,
-}
-impl CacheBank {
-    fn new(
-        block: (usize, usize),
-        allocation_generation: u64,
-        spans: Vec<Vec<SlotSpan>>,
-        meta: Vec<(usize, usize)>,
-        tables: Vec<Binding>,
-    ) -> Result<Self> {
-        let registry = BlockRegistry::new(0);
-        // This is the owner's actual contiguous, exclusively lent donor tail,
-        // not the min/max hull of unrelated allocations. The tier lease owns it.
-        let block = registry
-            .adopt::<Expert>(block.0 as u64, block.1 as u64, allocation_generation)
-            .map_err(|e| e.to_string())?;
-        let (mut bank, cells) =
-            SlotBank::new(block, spans, false).map_err(|(_, e)| e.to_string())?;
-        let staging = bank.staging();
-        let backing = bank
-            .register_table_backing(tables)
-            .map_err(|e| e.to_string())?;
-        let generation = bank
-            .seal(&staging, backing, GenerationId { epoch: 0, sub: 0 })
-            .map_err(|(_, e)| e.to_string())?;
-        let n = cells.len();
-        if meta.len() != n {
-            return Err("expert cache slot metadata extent mismatch".into());
-        }
-        Ok(Self {
-            bank: Some(bank),
-            cells: cells.into_iter().map(|c| Some(SlotCell::Free(c))).collect(),
-            staging,
-            backing: None,
-            generation: Some(generation),
-            retired: None,
-            meta,
-            last_used: vec![0; n],
-            clock: 0,
-            epoch: 0,
-        })
-    }
-    fn require_backing(&self) -> Result<()> {
-        if self.backing.is_none() || self.generation.is_some() {
-            return Err("expert cache pointer tables are leased to a reader generation".into());
-        }
-        Ok(())
-    }
-    fn retire_idle(&mut self) -> Result<()> {
-        if let Some(generation) = self.generation.take() {
-            match self
-                .bank
-                .as_mut()
-                .expect("open bank")
-                .retire(generation, None)
-            {
-                Ok((backing, retired)) => {
-                    self.backing = Some(backing);
-                    self.retired = Some(retired);
-                }
-                Err((generation, error)) => {
-                    self.generation = Some(generation);
-                    return Err(error.to_string());
-                }
-            }
-        }
-        self.require_backing()
-    }
-    fn seal_idle(&mut self) -> Result<()> {
-        self.require_backing()?;
-        let epoch = self
-            .epoch
-            .checked_add(1)
-            .ok_or("expert cache generation exhausted")?;
-        let backing = self.backing.take().expect("write backing");
-        match self.bank.as_mut().expect("open bank").seal(
-            &self.staging,
-            backing,
-            GenerationId { epoch, sub: 0 },
-        ) {
-            Ok(generation) => {
-                self.generation = Some(generation);
-                self.epoch = epoch;
-                Ok(())
-            }
-            Err((backing, error)) => {
-                self.backing = Some(backing);
-                Err(error.to_string())
-            }
-        }
-    }
-    fn acquire_reader(&mut self) -> Result<WindowReadLease<'static>> {
-        let generation = self
-            .generation
-            .take()
-            .ok_or("expert cache generation already has a reader")?;
-        match acquire_window_owned(generation) {
-            Ok(reader) => Ok(reader),
-            Err((generation, error)) => {
-                self.generation = Some(generation);
-                Err(error.to_string())
-            }
-        }
-    }
-    fn finish_reader(
-        &mut self,
-        reader: WindowReadLease<'static>,
-        fence: &mut dyn FenceBackend,
-    ) -> Result<()> {
-        if self.generation.is_some() || self.backing.is_some() {
-            return Err("expert cache reader owner state mismatch".into());
-        }
-        let pending = reader
-            .enqueued(fence)
-            .map_err(|(_reader, f)| error("reader fence record", f.message))?;
-        let fenced =
-            finish_window(pending, fence).map_err(|e| error("reader wait", format!("{e:?}")))?;
-        self.generation = Some(
-            fenced
-                .into_generation()
-                .ok_or("expert cache window lost owned generation")?,
-        );
-        Ok(())
-    }
-    fn phase(&self, slot: usize) -> SlotPhaseView {
-        self.cells[slot].as_ref().expect("cell present").phase()
-    }
-    fn occupant(&self, slot: usize) -> Option<u64> {
-        match self.cells[slot].as_ref().expect("cell present") {
-            SlotCell::Resident(s) => Some(s.occupant()),
-            SlotCell::Filling(s) => Some(s.occupant()),
-            _ => None,
-        }
-    }
-    fn touch(&mut self, slot: usize) {
-        self.clock = self.clock.saturating_add(1);
-        self.last_used[slot] = self.clock;
-    }
-    fn choose(&self, slots: &[usize]) -> Option<usize> {
-        slots
-            .iter()
-            .copied()
-            .find(|&s| self.phase(s) == SlotPhaseView::Free)
-            .or_else(|| {
-                slots
-                    .iter()
-                    .copied()
-                    .filter(|&s| self.phase(s) == SlotPhaseView::Resident)
-                    .min_by_key(|&s| (self.last_used[s], s))
-            })
-    }
-    fn start_fill(&mut self, slot: usize, occupant: u64) -> Result<FillTicket> {
-        match self.cells[slot].take().expect("cell present") {
-            SlotCell::Free(free) => match self
-                .bank
-                .as_mut()
-                .expect("open bank")
-                .start_fill(free, occupant)
-            {
-                Ok((filling, ticket)) => {
-                    self.cells[slot] = Some(SlotCell::Filling(filling));
-                    self.touch(slot);
-                    Ok(ticket)
-                }
-                Err((free, error)) => {
-                    self.cells[slot] = Some(SlotCell::Free(free));
-                    Err(error.to_string())
-                }
-            },
-            other => {
-                self.cells[slot] = Some(other);
-                Err("expert cache fill needs a free slot".into())
-            }
-        }
-    }
-    fn complete(
-        &mut self,
-        slot: usize,
-        done: railgun::sealed_table::generation::FillComplete,
-    ) -> Result<(u64, u64)> {
-        match self.cells[slot].take().expect("cell present") {
-            SlotCell::Filling(filling) => match self
-                .bank
-                .as_mut()
-                .expect("open bank")
-                .finish_fill(filling, done)
-            {
-                Ok(resident) => {
-                    let identity = (resident.occupant(), resident.fill_generation());
-                    let result = self
-                        .bank
-                        .as_mut()
-                        .expect("open bank")
-                        .publish(&mut self.staging, &resident);
-                    self.cells[slot] = Some(SlotCell::Resident(resident));
-                    result.map_err(|e| e.to_string())?;
-                    Ok(identity)
-                }
-                Err((filling, _done, error)) => {
-                    self.cells[slot] = Some(SlotCell::Filling(filling));
-                    Err(error.to_string())
-                }
-            },
-            other => {
-                self.cells[slot] = Some(other);
-                Err("expert cache completion needs a filling slot".into())
-            }
-        }
-    }
-    fn evict(&mut self, slot: usize) -> Result<()> {
-        self.require_backing()?;
-        let retired = self
-            .retired
-            .as_ref()
-            .ok_or("cache missing generation retirement")?;
-        let bank = self.bank.as_mut().expect("open bank");
-        match self.cells[slot].take().expect("cell present") {
-            SlotCell::Resident(resident) => match bank.unpublish(&mut self.staging, resident) {
-                Ok(evicting) => match bank.reclaim(evicting, retired) {
-                    Ok(free) => {
-                        self.cells[slot] = Some(SlotCell::Free(free));
-                        Ok(())
-                    }
-                    Err((evicting, error)) => {
-                        self.cells[slot] = Some(SlotCell::Evicting(evicting));
-                        Err(error.to_string())
-                    }
-                },
-                Err((resident, error)) => {
-                    self.cells[slot] = Some(SlotCell::Resident(resident));
-                    Err(error.to_string())
-                }
-            },
-            other => {
-                self.cells[slot] = Some(other);
-                Err("expert cache eviction needs a resident slot".into())
-            }
-        }
-    }
-}
 fn checked_slot_span(block: (usize, usize), span: (usize, usize)) -> Result<SlotSpan> {
     let offset = span
         .0
@@ -495,40 +313,228 @@ fn checked_slot_span(block: (usize, usize), span: (usize, usize)) -> Result<Slot
         bytes: span.1 as u64,
     })
 }
-fn copy_projection(
-    hip: &HipRuntime,
-    source: (usize, usize),
-    destination: (usize, usize),
-    stream: &Stream,
-) -> Result<()> {
-    if source.1 == 0 || source.1 != destination.1 {
-        return Err("expert cache unequal copy extents".into());
+
+/// Check the cache view against the admitted catalog and derive every pool, seed and canonical
+/// bundle. Pure: no device, no lease.
+fn build_layout(
+    catalog: &ExpertCatalog,
+    layers: &[LayerInput],
+    rank_pos: &[u32],
+) -> Result<Layout> {
+    if layers.len() != LAYERS || rank_pos.len() != LAYERS * EXPERTS {
+        return Err("expert cache layout cardinality".into());
     }
-    // SAFETY: caller binds immutable pinned source and destination ranges to
-    // the live tier lease and either a FillTicket or the exact ScratchLoan.
-    let bytes = unsafe { std::slice::from_raw_parts(source.0 as *const u8, source.1) };
-    let destination =
-        unsafe { DeviceBuffer::from_raw(destination.0 as *mut c_void, destination.1) };
-    hip.memcpy_htod_async(&destination, bytes, stream)
-        .map_err(|e| error("payload copy", e))
-}
-fn copy_pair(hip: &HipRuntime, stream: &Stream, source: HostPair, spans: &[Binding]) -> Result<()> {
-    if spans.len() != 2 {
-        return Err("cache fill requires paired GU/DN ticket spans".into());
+    let mut layout = Layout {
+        owner_id: catalog.owner_id(),
+        owner_generation: catalog.owner_generation(),
+        reads: vec![Read::Core; LAYERS * EXPERTS],
+        bundles: vec![None; LAYERS * EXPERTS],
+        layer_pool: vec![None; LAYERS],
+        pools: Vec::new(),
+    };
+    let mut prior_end = 0usize;
+    for (layer, input) in layers.iter().enumerate() {
+        if input.experts.len() != EXPERTS {
+            return Err("expert cache layer expert cardinality".into());
+        }
+        let (gate_up_bytes, down_bytes) =
+            (input.experts[0].gate_up.bytes, input.experts[0].down.bytes);
+        let mut class = None;
+        for (expert, e) in input.experts.iter().enumerate() {
+            if e.gate_up.bytes != gate_up_bytes || e.down.bytes != down_bytes {
+                return Err("expert cache requires equal projection extents within a layer".into());
+            }
+            let key = layout.key(layer, expert);
+            let bundle = catalog.bundle(&key).ok_or_else(|| {
+                format!("expert cache catalog lacks layer {layer} expert {expert}")
+            })?;
+            let segments = bundle.segments();
+            if segments.len() != 2
+                || segments[0].extent.len != e.gate_up.bytes as u64
+                || segments[1].extent.len != e.down.bytes as u64
+            {
+                return Err(format!(
+                    "expert cache catalog segments of layer {layer} expert {expert} differ from the cache view"
+                ));
+            }
+            if bundle.pinned() != e.host.is_none() {
+                return Err(format!(
+                    "expert cache catalog and cache view disagree on whether layer {layer} expert {expert} is pinned"
+                ));
+            }
+            if !bundle.pinned() {
+                match class {
+                    None => class = Some(bundle.pool()),
+                    Some(bound) if bound != bundle.pool() => {
+                        return Err(format!(
+                            "expert cache layer {layer} mixes layout classes; one pool per layer needs one"
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        let pooled = !input.slots.is_empty();
+        let pool = PoolId(layout.pools.len() as u16);
+        if pooled {
+            let class = class
+                .and_then(|pool| catalog.class_of(pool))
+                .ok_or_else(|| {
+                    format!("expert cache layer {layer} has donors but no cacheable expert")
+                })?;
+            let [class_gate_up, class_down] = class.segments() else {
+                return Err("expert cache layout class is not a GU + DN pair".into());
+            };
+            let mut start = usize::MAX;
+            let mut end = 0usize;
+            for slot in &input.slots {
+                if slot.gate_up.1 as u64 != class_gate_up.len
+                    || slot.down.1 as u64 != class_down.len
+                {
+                    return Err(format!(
+                        "expert cache layer {layer} slot extents differ from its layout class"
+                    ));
+                }
+                for (address, bytes) in [slot.gate_up, slot.down] {
+                    start = start.min(address);
+                    end = end.max(
+                        address
+                            .checked_add(bytes)
+                            .ok_or("expert cache slot extent overflows")?,
+                    );
+                }
+            }
+            if start < prior_end {
+                return Err(
+                    "expert cache layer donor slots interleave with the previous layer's".into(),
+                );
+            }
+            prior_end = end;
+            let block = (start, end - start);
+            let mut spans = Vec::with_capacity(input.slots.len());
+            let mut seed: Vec<(ExpertKey, u32)> = Vec::with_capacity(input.slots.len());
+            for slot in &input.slots {
+                spans.push(vec![
+                    checked_slot_span(block, slot.gate_up)?,
+                    checked_slot_span(block, slot.down)?,
+                ]);
+                let expert = slot.original_expert;
+                if expert >= EXPERTS
+                    || input.experts[expert].host.is_none()
+                    || seed.iter().any(|(key, _)| key.expert_id == expert as u32)
+                {
+                    return Err(format!(
+                        "expert cache layer {layer} donor {expert} is not a distinct cacheable expert"
+                    ));
+                }
+                seed.push((
+                    layout.key(layer, expert),
+                    rank_pos[layer * EXPERTS + expert],
+                ));
+            }
+            layout.layer_pool[layer] = Some(pool);
+            layout.pools.push(PoolGeometry {
+                layer,
+                block,
+                spans,
+                tables: input.tables.to_vec(),
+                seed,
+            });
+        }
+        for (expert, e) in input.experts.iter().enumerate() {
+            let id = layer * EXPERTS + expert;
+            let Some(host) = e.host else { continue };
+            let bytes = (host.gate_up.1 + host.down.1) as u64;
+            layout.reads[id] = if pooled {
+                Read::Cache {
+                    pool,
+                    rank: rank_pos[id],
+                    bytes,
+                }
+            } else {
+                Read::Host { bytes }
+            };
+            if pooled {
+                // SAFETY: canonical pinned host mirror of the lease the cache retains; nothing
+                // writes it and it outlives every fill.
+                let range =
+                    |(address, len): (usize, usize)| unsafe { HostRange::new(address, len) };
+                layout.bundles[id] = Some([
+                    Segment::new(range(host.gate_up), 0, 0),
+                    Segment::new(range(host.down), 1, 0),
+                ]);
+            }
+        }
     }
-    copy_projection(
-        hip,
-        source.gate_up,
-        (spans[0].base as usize, spans[0].bytes as usize),
-        stream,
-    )?;
-    copy_projection(
-        hip,
-        source.down,
-        (spans[1].base as usize, spans[1].bytes as usize),
-        stream,
-    )
+    Ok(layout)
 }
+
+// ---------------------------------------------------------------------------------------------
+// Route accounting
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RouteAccount {
+    selected: u64,
+    core_hits: u64,
+    cache_hits: u64,
+    host_misses: u64,
+    miss_bytes: u64,
+}
+
+/// Count what the completed token actually read, independent of later LRU
+/// reservations or copy completion. Reject malformed selection before counting.
+fn account_route(
+    layout: &Layout,
+    layer: usize,
+    ids: &[i32],
+    mapping: &[ResidencyLocation],
+) -> Result<RouteAccount> {
+    if mapping.len() != EXPERTS {
+        return Err("expert cache route-accounting cardinality".into());
+    }
+    let mut seen = [false; EXPERTS];
+    for &id in ids {
+        let expert = usize::try_from(id).map_err(|_| "expert cache negative selected expert")?;
+        if expert >= EXPERTS || std::mem::replace(&mut seen[expert], true) {
+            return Err("expert cache invalid/duplicate selected expert".into());
+        }
+    }
+    let mut account = RouteAccount::default();
+    for &id in ids {
+        let expert = id as usize;
+        account.selected += 1;
+        match layout.reads[layer * EXPERTS + expert] {
+            Read::Core => account.core_hits += 1,
+            Read::Cache { bytes, .. } | Read::Host { bytes } => {
+                if matches!(mapping[expert], ResidencyLocation::Slot(_)) {
+                    account.cache_hits += 1;
+                } else {
+                    account.host_misses += 1;
+                    account.miss_bytes += bytes;
+                }
+            }
+        }
+    }
+    Ok(account)
+}
+
+/// The dispatch ticket generation of a fill generation: slot fill generations restart when a
+/// restore rebuilds the pools, the capability requires them never to go backwards.
+fn ticket_generation(restore_epoch: u64, fill_generation: u64) -> Result<u64> {
+    if fill_generation >= 1 << 32 {
+        return Err("expert cache slot fill generation exhausted".into());
+    }
+    restore_epoch
+        .checked_mul(1 << 32)
+        .and_then(|base| base.checked_add(fill_generation))
+        .ok_or_else(|| "expert cache restore epoch exhausted".into())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Device adapters
+// ---------------------------------------------------------------------------------------------
+
 static NEXT_FENCE_INCAR: AtomicU64 = AtomicU64::new(1);
 fn incarnation() -> u64 {
     NEXT_FENCE_INCAR.fetch_add(1, Ordering::Relaxed)
@@ -539,82 +545,73 @@ fn unknown(message: impl std::fmt::Display) -> FenceFailure {
         quiescence: Quiescence::Unknown,
     }
 }
-struct CopyEvents {
-    incarnation: u64,
-    next: u64,
-    idle: Vec<Event>,
-    live: BTreeMap<u64, Event>,
+
+/// A copy backend whose fills can record their events without copying: the initial warm seed
+/// names donor bytes the artifact already placed, so it must not move them again.
+struct SeedCopy<B: CopyDevice> {
+    inner: B,
+    /// While set, a fill records its event but copies nothing. Cleared for a restore, whose
+    /// fills ARE the copy.
+    skip_copies: Cell<bool>,
 }
-impl CopyEvents {
-    fn new() -> Self {
+
+/// The shared core's HIP copy backend with the seed switch.
+type QwenCopy = SeedCopy<HipCopyBackend<Arc<HipRuntime>>>;
+
+impl<B: CopyDevice> SeedCopy<B> {
+    fn new(inner: B) -> Self {
         Self {
-            incarnation: incarnation(),
-            next: 1,
-            idle: Vec::new(),
-            live: BTreeMap::new(),
+            inner,
+            skip_copies: Cell::new(false),
         }
     }
+    fn set_skip_copies(&self, skip: bool) {
+        self.skip_copies.set(skip);
+    }
 }
-struct CopyFence<'a> {
-    hip: &'a HipRuntime,
-    stream: &'a Stream,
-    events: &'a mut CopyEvents,
-}
-// SAFETY: one real HIP event follows every pair's writes on the immutable
-// copy-stream incarnation. Errors never claim quiescence; the bank quarantines.
-unsafe impl FenceBackend for CopyFence<'_> {
+
+impl<B: CopyDevice> CopyDevice for SeedCopy<B> {
     fn incarnation(&self) -> u64 {
-        self.events.incarnation
+        self.inner.incarnation()
     }
-    fn record(&mut self) -> std::result::Result<u64, FenceFailure> {
-        let event = match self.events.idle.pop() {
-            Some(e) => e,
-            None => self
-                .hip
-                .event_create_with_flags(HIP_EVENT_DISABLE_TIMING)
-                .map_err(unknown)?,
-        };
-        if let Err(e) = self.hip.event_record(&event, Some(self.stream)) {
-            self.events.idle.push(event);
-            return Err(unknown(e));
-        }
-        let id = self.events.next;
-        self.events.next = id
-            .checked_add(1)
-            .ok_or_else(|| unknown("cache copy fence counter exhausted"))?;
-        self.events.live.insert(id, event);
-        Ok(id)
+    fn events(&self) -> usize {
+        self.inner.events()
     }
-    fn poll(&mut self, fence: u64) -> FenceState {
-        match self.events.live.get(&fence) {
-            None => FenceState::Failed(unknown("cache copy fence missing")),
-            Some(event) => match self.hip.event_query(event) {
-                Ok(true) => FenceState::Complete,
-                Ok(false) => FenceState::Pending,
-                Err(e) => FenceState::Failed(unknown(e)),
-            },
+    fn enqueue_copy(
+        &self,
+        pool: PoolId,
+        dst: u64,
+        src: HostRange,
+    ) -> std::result::Result<(), String> {
+        if self.skip_copies.get() {
+            return Ok(());
         }
+        self.inner.enqueue_copy(pool, dst, src)
     }
-    fn wait(&mut self, fence: u64) -> FenceState {
-        match self.events.live.get(&fence) {
-            None => FenceState::Failed(unknown("cache copy fence missing")),
-            Some(event) => match self.hip.event_synchronize(event) {
-                Ok(()) => FenceState::Complete,
-                Err(e) => FenceState::Failed(unknown(e)),
-            },
-        }
+    fn record(&self, event: usize) -> std::result::Result<(), String> {
+        self.inner.record(event)
     }
-    fn recycle(&mut self, fence: u64) {
-        if let Some(event) = self.events.live.remove(&fence) {
-            self.events.idle.push(event);
-        }
+    fn query(&self, event: usize) -> std::result::Result<bool, String> {
+        self.inner.query(event)
+    }
+    fn synchronize(&self, event: usize) -> std::result::Result<(), String> {
+        self.inner.synchronize(event)
+    }
+    fn quarantine(&self) {
+        self.inner.quarantine()
     }
 }
+
+/// The last-read fence of a retiring generation: every consumer of the closed window already
+/// retired, so one synchronize of the compute stream covers all of them. One instance serves one
+/// retirement step: nothing is enqueued between its waits, so after the first successful wait
+/// every later fence of the step is already covered.
 struct ComputeFence<'a> {
     hip: &'a HipRuntime,
     stream: Option<&'a Stream>,
     incarnation: u64,
     recorded: u64,
+    synced: bool,
     _thread: PhantomData<*const ()>,
 }
 impl<'a> ComputeFence<'a> {
@@ -624,6 +621,7 @@ impl<'a> ComputeFence<'a> {
             stream,
             incarnation: incarnation(),
             recorded: 0,
+            synced: false,
             _thread: PhantomData,
         }
     }
@@ -646,15 +644,122 @@ unsafe impl FenceBackend for ComputeFence<'_> {
         if fence == 0 || fence > self.recorded {
             return FenceState::Failed(unknown("cache compute fence missing"));
         }
+        if self.synced {
+            return FenceState::Complete;
+        }
         let result = match self.stream {
             Some(s) => self.hip.stream_synchronize(s),
             None => self.hip.device_synchronize(),
         };
         match result {
-            Ok(()) => FenceState::Complete,
+            Ok(()) => {
+                self.synced = true;
+                FenceState::Complete
+            }
             Err(e) => FenceState::Failed(unknown(e)),
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The cache
+// ---------------------------------------------------------------------------------------------
+
+struct LayerCache {
+    binding: ExpertCacheLayerBinding,
+    // Retain upload mirrors even when the second upload fails after the first.
+    gate_up_upload: Vec<u8>,
+    down_upload: Vec<u8>,
+}
+
+/// The shared core's policy over its device I/O.
+struct Engine<B: CopyDevice> {
+    policy: ExpertCachePolicy,
+    io: DeviceIo<B>,
+}
+
+pub(crate) struct ExpertCache {
+    hip: Arc<HipRuntime>,
+    device_id: i32,
+    lease: Option<ExpertTierLease>,
+    layers: Vec<LayerCache>,
+    layout: Layout,
+    engine: Option<Engine<QwenCopy>>,
+    policy_config: PolicyConfig,
+    /// `F` of every pool: fills one window may start.
+    fills_per_pool: usize,
+    /// Bytes of the donor tail a restore rewrites.
+    donor_bytes: usize,
+    restore_epoch: u64,
+    /// Bytes the warm seeds (not fills) moved through the io.
+    seed_bytes: u64,
+    dirty: bool,
+    poisoned: Option<String>,
+    outstanding: Arc<AtomicBool>,
+    stats: ExpertCacheStats,
+}
+
+/// Build the pools of a layout. Each build adopts its blocks from a fresh registry: the previous
+/// build's ledger blocks are dropped with its policy, which is a registry capacity leak only.
+fn build_policy(
+    layout: &Layout,
+    config: PolicyConfig,
+    fills_per_pool: usize,
+    allocation_generation: u64,
+) -> Result<ExpertCachePolicy> {
+    let registry = BlockRegistry::new(0);
+    let mut pools = Vec::with_capacity(layout.pools.len());
+    for geometry in &layout.pools {
+        let block = registry
+            .adopt::<Expert>(
+                geometry.block.0 as u64,
+                geometry.block.1 as u64,
+                allocation_generation,
+            )
+            .map_err(|e| fail(&format!("layer {} pool block", geometry.layer), e))?;
+        pools.push((
+            PoolConfig {
+                slots: geometry.spans.len(),
+                fills_per_window: fills_per_pool,
+            },
+            PoolInit {
+                block,
+                spans: geometry.spans.clone(),
+                tables: geometry.tables.clone(),
+                seed: geometry.seed.clone(),
+            },
+        ));
+    }
+    ExpertCachePolicy::new(config, pools).map_err(|e| fail("policy", e))
+}
+
+/// Issue every seed fill (one event each, waiting for events when the pool runs out), then wait
+/// for all of them: the completion tokens are in the policy, staged by the next plan.
+fn issue_seed<B: CopyDevice>(layout: &Layout, engine: &mut Engine<B>) -> Result<()> {
+    let ops: Vec<FillOp> = engine.policy.take_fills().collect();
+    for mut op in ops {
+        loop {
+            match engine.io.issue(&mut engine.policy, op, layout) {
+                Ok(()) => break,
+                Err(Rejected {
+                    error: IoError::EventPoolExhausted { .. },
+                    op: Some(back),
+                }) => {
+                    engine
+                        .io
+                        .poll(&mut engine.policy, true)
+                        .map_err(|e| fail("seed wait", e))?;
+                    op = back;
+                }
+                Err(Rejected { error: cause, .. }) => return Err(fail("seed fill", cause)),
+            }
+        }
+    }
+    engine
+        .io
+        .poll(&mut engine.policy, true)
+        .map_err(|e| fail("seed wait", e))?;
+    Ok(())
 }
 
 impl ExpertCache {
@@ -667,8 +772,9 @@ impl ExpertCache {
         if gpu.arch != "gfx1201" || config.max_inflight == 0 {
             return Err("expert cache requires gfx1201 and a bounded nonzero queue".into());
         }
-        gpu.bind_thread().map_err(|e| error("bind", e))?;
-        let warm_order = warm_order(rank)?;
+        gpu.bind_thread().map_err(|e| fail("bind", e))?;
+        let rank_pos = rank_positions(rank)?;
+        let catalog = admitted_catalog(&lease)?;
         let ranges = lease
             .expert_cache_ranges()
             .ok_or("expert cache missing donor mirror")?;
@@ -681,27 +787,11 @@ impl ExpertCache {
         let host_cpu = lease
             .host_cpu_range()
             .ok_or("expert cache missing host owner")?;
-        let hip = Arc::new(HipRuntime::load().map_err(|e| error("HIP", e))?);
+        let hip = Arc::new(HipRuntime::load().map_err(|e| fail("HIP", e))?);
         hip.set_device(gpu.device_id)
-            .map_err(|e| error("device", e))?;
-        let mut result = Self {
-            hip,
-            device_id: gpu.device_id,
-            lease: Some(lease.clone()),
-            layers: Vec::with_capacity(LAYERS),
-            copy_stream: None,
-            bank: None,
-            pending: VecDeque::new(),
-            events: CopyEvents::new(),
-            max_inflight: config.max_inflight,
-            warm_order,
-            needs_seed: true,
-            dirty: false,
-            poisoned: None,
-            outstanding: Arc::new(AtomicBool::new(false)),
-            stats: ExpertCacheStats::default(),
-            next_layer: 0,
-        };
+            .map_err(|e| fail("device", e))?;
+        let mut layers = Vec::with_capacity(LAYERS);
+        let mut inputs = Vec::with_capacity(LAYERS);
         for layer in 0..LAYERS {
             let view = lease
                 .expert_cache_layer(layer)
@@ -711,7 +801,7 @@ impl ExpertCache {
                 .ok_or("expert cache missing slot metadata")?;
             let mut canonical_gate_up: Vec<ResidencySpan> = Vec::with_capacity(EXPERTS);
             let mut canonical_down: Vec<ResidencySpan> = Vec::with_capacity(EXPERTS);
-            let mut host = Vec::with_capacity(EXPERTS);
+            let mut experts = Vec::with_capacity(EXPERTS);
             for expert in 0..EXPERTS {
                 let entry = view.entry(expert).ok_or("expert cache missing expert")?;
                 let gu = ResidencySpan {
@@ -724,28 +814,25 @@ impl ExpertCache {
                     bytes: usize::try_from(entry.down_len)
                         .map_err(|_| "expert cache DN length overflow")?,
                 };
-                if expert > 0
-                    && (gu.bytes != canonical_gate_up[0].bytes
-                        || dn.bytes != canonical_down[0].bytes)
-                {
-                    return Err(
-                        "expert cache requires equal projection extents within a layer".into(),
-                    );
-                }
-                canonical_gate_up.push(gu);
-                canonical_down.push(dn);
-                host.push(if entry.tier == Placement::HostMapped {
+                let host = if entry.tier == Placement::HostMapped {
                     Some(HostPair {
                         gate_up: host_projection(gu.address, gu.bytes, host_alias, host_cpu)?,
                         down: host_projection(dn.address, dn.bytes, host_alias, host_cpu)?,
                     })
                 } else {
                     None
+                };
+                canonical_gate_up.push(gu);
+                canonical_down.push(dn);
+                experts.push(ExpertInput {
+                    gate_up: gu,
+                    down: dn,
+                    host,
                 });
             }
             let tables = lease
                 .allocate_expert_cache_tables(gpu, layer)
-                .map_err(|e| error("tables", e))?;
+                .map_err(|e| fail("tables", e))?;
             let gu = tables.gate_up_table();
             let dn = tables.down_table();
             let slot_spans = slots
@@ -761,6 +848,10 @@ impl ExpertCache {
                     },
                 })
                 .collect();
+            let table_bindings = [&gu, &dn].map(|table| Binding {
+                base: table.buf.as_ptr() as u64,
+                bytes: table.buf.size() as u64,
+            });
             // SAFETY: leases retain every checked allocation. Table allocation
             // uploaded and synchronized canonical addresses; no token exists.
             let residency = unsafe {
@@ -780,66 +871,93 @@ impl ExpertCache {
                     keepalive: tables.keepalive(),
                 })
             }?;
-            result.layers.push(LayerCache {
+            inputs.push(LayerInput {
+                experts,
+                slots: slots
+                    .iter()
+                    .map(|slot| SlotInput {
+                        original_expert: slot.ranges.original_expert,
+                        gate_up: slot.ranges.gate_up_device,
+                        down: slot.ranges.down_device,
+                    })
+                    .collect(),
+                tables: table_bindings,
+            });
+            layers.push(LayerCache {
                 binding: ExpertCacheLayerBinding { tables, residency },
-                slots,
-                host,
-                slot_ids: Vec::new(),
-                index: vec![None; EXPERTS],
                 gate_up_upload: vec![0; EXPERTS * 8],
                 down_upload: vec![0; EXPERTS * 8],
             });
         }
-        result.copy_stream = Some(
-            result
-                .hip
-                .stream_create_non_blocking()
-                .map_err(|e| error("copy stream", e))?,
-        );
-        let mut slot_meta = Vec::new();
-        let mut slot_spans = Vec::new();
-        let mut tables = Vec::new();
-        for (layer, state) in result.layers.iter_mut().enumerate() {
-            for (local, slot) in state.slots.iter().enumerate() {
-                state.slot_ids.push(slot_meta.len());
-                slot_meta.push((layer, local));
-                slot_spans.push(vec![
-                    checked_slot_span(ranges.donor_device, slot.ranges.gate_up_device)?,
-                    checked_slot_span(ranges.donor_device, slot.ranges.down_device)?,
-                ]);
-            }
-            for table in [
-                state.binding.tables.gate_up_table(),
-                state.binding.tables.down_table(),
-            ] {
-                tables.push(Binding {
-                    base: table.buf.as_ptr() as u64,
-                    bytes: table.buf.size() as u64,
-                });
-            }
+        let layout = build_layout(&catalog, &inputs, &rank_pos)?;
+        let pools = layout.pools.len();
+        if pools == 0 {
+            return Err("expert cache has no evictable slot".into());
         }
-        result.bank = Some(CacheBank::new(
-            ranges.donor_device,
-            lease.generation(),
-            slot_spans,
-            slot_meta,
-            tables,
-        )?);
-        for _ in 0..config.max_inflight {
-            result.events.idle.push(
-                result
-                    .hip
-                    .event_create_with_flags(HIP_EVENT_DISABLE_TIMING)
-                    .map_err(|e| error("fill event pool", e))?,
-            );
-        }
-        Ok(result)
+        let fills_per_pool = config.max_inflight.div_ceil(pools).max(1);
+        let events = fills_per_pool * pools;
+        let slots = layout.slots();
+        let policy_config = PolicyConfig {
+            // One window per AR token: every window closes its own group.
+            retire_ids: 1,
+            max_windows: 1,
+            fill_group_cap: 1,
+            use_log: LAYERS * TOPK,
+            // A warm seed's completions are all buffered before the one plan that stages them.
+            completions: slots + events,
+            parked: slots,
+            consumers: 1,
+            queues: 1,
+        };
+        let dests = layout
+            .pools
+            .iter()
+            // SAFETY: the pool's hull lies inside the donor tail the lease retains.
+            .map(|pool| unsafe { PoolDest::new(pool.block.0 as u64, pool.block.1 as u64) })
+            .collect();
+        let backend =
+            HipCopyBackend::new(hip.clone(), dests, events).map_err(|e| fail("copy backend", e))?;
+        let io = DeviceIo::new(SeedCopy::new(backend)).map_err(|e| fail("device io", e))?;
+        let mut cache = Self {
+            hip,
+            device_id: gpu.device_id,
+            lease: Some(lease),
+            layers,
+            layout,
+            engine: None,
+            policy_config,
+            fills_per_pool,
+            donor_bytes: ranges.donor_device.1,
+            restore_epoch: 0,
+            seed_bytes: 0,
+            dirty: false,
+            poisoned: None,
+            outstanding: Arc::new(AtomicBool::new(false)),
+            stats: ExpertCacheStats::default(),
+        };
+        // The donor slots hold their original experts' bytes right now: warm seed, no copy.
+        cache.install_seeded(gpu, io, false)?;
+        Ok(cache)
     }
     pub(crate) fn layer_binding(&self, layer: usize) -> Option<ExpertCacheLayerBinding> {
         self.layers.get(layer).map(|layer| layer.binding.clone())
     }
+    /// Cumulative counters: the adapter's own plus the live policy's and io's.
     pub(crate) fn stats(&self) -> ExpertCacheStats {
-        self.stats
+        let mut stats = self.stats;
+        if let Some(engine) = &self.engine {
+            let live = engine.policy.stats();
+            stats.fills_started += live.fills_issued;
+            stats.fills_completed += live.fills_published;
+            stats.evictions += live.evictions;
+            stats.skipped_full += live.skipped_full;
+            stats.fill_bytes = engine
+                .io
+                .stats()
+                .bytes_enqueued
+                .saturating_sub(self.seed_bytes);
+        }
+        stats
     }
     pub(crate) fn is_dirty(&self) -> bool {
         self.dirty
@@ -868,18 +986,18 @@ impl ExpertCache {
 
     fn emit_stats(&self) {
         if tracing::enabled!(tracing::Level::DEBUG) {
-            tracing::debug!(stats = ?self.stats, "qwen4 exact expert cache");
+            tracing::debug!(stats = ?self.stats(), "qwen4 exact expert cache");
         }
     }
 
     pub(crate) fn check_readers_idle(&self) -> Result<()> {
         if let Some(reason) = &self.poisoned {
-            return Err(error("poisoned", reason));
+            return Err(fail("poisoned", reason));
         }
         if self.outstanding.load(Ordering::Acquire) {
             return Err("expert cache token is unretired".into());
         }
-        if self.copy_stream.is_none() {
+        if self.engine.is_none() {
             return Err("expert cache is stopped".into());
         }
         Ok(())
@@ -893,8 +1011,27 @@ impl ExpertCache {
     }
     fn check(&self, gpu: &Gpu) -> Result<()> {
         self.check_idle_for_state_op(gpu)?;
-        gpu.bind_thread().map_err(|e| error("bind", e))
+        gpu.bind_thread().map_err(|e| fail("bind", e))
     }
+
+    /// Run `f` with the engine taken out of `self`, and put it back whatever `f` returns.
+    fn with_engine<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &mut Engine<QwenCopy>) -> Result<R>,
+    ) -> Result<R> {
+        let mut engine = self.engine.take().ok_or("expert cache is stopped")?;
+        let result = f(self, &mut engine);
+        self.engine = Some(engine);
+        result
+    }
+
+    fn fold_policy_stats(&mut self, retired: CacheStats) {
+        self.stats.fills_started += retired.fills_issued;
+        self.stats.fills_completed += retired.fills_published;
+        self.stats.evictions += retired.evictions;
+        self.stats.skipped_full += retired.skipped_full;
+    }
+
     pub(crate) fn begin_token(&mut self, gpu: &mut Gpu) -> Result<ExpertCacheToken> {
         let started = Instant::now();
         let result = self.begin_token_inner(gpu);
@@ -907,13 +1044,11 @@ impl ExpertCache {
 
     fn begin_token_inner(&mut self, gpu: &mut Gpu) -> Result<ExpertCacheToken> {
         self.check(gpu)?;
-        let result = (|| {
-            if self.needs_seed {
-                self.seed(gpu)?;
-            }
-            self.publish_completed(gpu, false)?;
+        let gpu: &Gpu = gpu;
+        let result = self.with_engine(|this, engine| {
+            this.publish_completed(gpu, engine, false)?;
             let mut guards = Vec::with_capacity(LAYERS);
-            for layer in &self.layers {
+            for layer in &this.layers {
                 let cap = &layer.binding.residency;
                 let acquired = cap
                     .snapshot()
@@ -929,67 +1064,88 @@ impl ExpertCache {
                     }
                 }
             }
-            let reader = match self.bank.as_mut().expect("live bank").acquire_reader() {
-                Ok(reader) => reader,
-                Err(error) => {
-                    // SAFETY: reader acquisition precedes every token submission.
+            let opened = engine.policy.begin_window().and_then(|_| {
+                engine
+                    .policy
+                    .register_consumer(0, WindowConsumerPhase::Decode, 0)
+            });
+            let consumer = match opened {
+                Ok(consumer) => consumer,
+                Err(cause) => {
+                    // The window never reached a queue: proven retired.
+                    let _ = engine.policy.cancel_window(CancelOutcome::Retired);
+                    // SAFETY: window and guards precede every token submission.
                     for guard in guards {
                         unsafe { guard.retire_after_gpu_wait() }?;
                     }
-                    return Err(error);
+                    return Err(fail("window", cause));
                 }
             };
-            self.outstanding.store(true, Ordering::Release);
+            this.outstanding.store(true, Ordering::Release);
             Ok(ExpertCacheToken {
                 guards,
-                reader: Some(reader),
-                outstanding: self.outstanding.clone(),
+                consumer,
+                outstanding: this.outstanding.clone(),
             })
-        })();
+        });
         if let Err(reason) = &result {
             self.poisoned = Some(reason.clone());
         }
         result
     }
 
-    /// Cancel without observing routes, changing recency or issuing payload copies.
+    /// Retire the token's guards and join (`finished`) or cancel its window.
+    ///
     /// # Safety
-    /// Every independent PM4 reader is proven retired (or never submitted).
-    /// The HIP fence below covers the remaining HIP work; it cannot prove PM4 retirement.
-    /// Unknown callers must retain/drop the token and quarantine its complete owner set.
-    pub(crate) unsafe fn cancel_after_gpu_wait(
+    /// Every GPU reader of the token is proven retired: the caller's route readback wait for a
+    /// finished token, a device wait for a cancelled one, and for every independent PM4 reader its
+    /// own checked retirement (or it never submitted).
+    unsafe fn retire_token(
         &mut self,
         gpu: &mut Gpu,
-        mut token: ExpertCacheToken,
+        token: ExpertCacheToken,
+        finished: bool,
     ) -> Result<()> {
         if !Arc::ptr_eq(&token.outstanding, &self.outstanding) || gpu.device_id != self.device_id {
             return Err("expert cache reader belongs to another cache or GPU".into());
         }
-        gpu.bind_thread().map_err(|e| error("retire bind", e))?;
-        let mut fence = ComputeFence::new(&self.hip, gpu.active_stream.as_ref());
-        let reader = token
-            .reader
-            .take()
-            .ok_or("expert cache reader lease missing")?;
-        let result = self
-            .bank
-            .as_mut()
-            .expect("live bank")
-            .finish_reader(reader, &mut fence);
-        if let Err(reason) = result {
+        gpu.bind_thread().map_err(|e| fail("retire bind", e))?;
+        let engine = self.engine.as_mut().ok_or("expert cache is stopped")?;
+        let window = if finished {
+            engine.policy.join_consumer(token.consumer)
+        } else {
+            engine.policy.cancel_window(CancelOutcome::Retired)
+        };
+        if let Err(cause) = window {
+            let reason = fail("window", cause);
             self.poisoned = Some(reason.clone());
             return Err(reason);
         }
         for guard in token.guards {
-            // SAFETY: caller's independent-queue proof plus the HIP fence above.
+            // SAFETY: caller's proof above.
             unsafe { guard.retire_after_gpu_wait() }?;
         }
         self.outstanding.store(false, Ordering::Release);
         Ok(())
     }
 
+    /// Cancel without observing routes, changing recency or issuing payload copies.
     /// # Safety
-    /// Every independent PM4 reader is proven retired; IDs are this token's complete readback.
+    /// Every independent PM4 reader is proven retired (or never submitted) and the caller waited
+    /// for the HIP work of the token.
+    /// Unknown callers must retain/drop the token and quarantine its complete owner set.
+    pub(crate) unsafe fn cancel_after_gpu_wait(
+        &mut self,
+        gpu: &mut Gpu,
+        token: ExpertCacheToken,
+    ) -> Result<()> {
+        // SAFETY: forwarded from this function's caller.
+        unsafe { self.retire_token(gpu, token, false) }
+    }
+
+    /// # Safety
+    /// Every independent PM4 reader is proven retired; IDs are this token's complete readback,
+    /// which the caller waited for.
     pub(crate) unsafe fn finish_token(
         &mut self,
         gpu: &mut Gpu,
@@ -998,13 +1154,19 @@ impl ExpertCache {
     ) -> Result<()> {
         let started = Instant::now();
         let snapshots: Vec<_> = token.guards.iter().map(|g| g.snapshot().clone()).collect();
-        // SAFETY: forwarded from this function's caller; HIP work is fenced in cancellation.
-        let result = unsafe { self.cancel_after_gpu_wait(gpu, token) }.and_then(|()| {
+        // SAFETY: forwarded from this function's caller.
+        let retired = unsafe { self.retire_token(gpu, token, true) };
+        let result = retired.and_then(|()| {
             if ids.len() != LAYERS * TOPK || ids.iter().any(|id| !(0..EXPERTS as i32).contains(id))
             {
+                // The consumer joined: the window is idle again once cancelled as retired.
+                if let Some(engine) = self.engine.as_mut() {
+                    let _ = engine.policy.cancel_window(CancelOutcome::Retired);
+                }
                 return Err("expert cache invalid route readback".into());
             }
-            self.observe_and_fill(gpu, ids, &snapshots)
+            let gpu: &Gpu = gpu;
+            self.with_engine(|this, engine| this.observe(gpu, engine, ids, &snapshots))
         });
         self.stats.finish_token_wall_ns = self
             .stats
@@ -1019,183 +1181,193 @@ impl ExpertCache {
         result
     }
 
-    fn observe_and_fill(
+    /// The window's routes become the group's uses; the group is judged, retired when it must be,
+    /// and the fills it decided are issued.
+    fn observe(
         &mut self,
         gpu: &Gpu,
+        engine: &mut Engine<QwenCopy>,
+        ids: &[i32],
+        snapshots: &[ResidencySnapshot],
+    ) -> Result<()> {
+        let result = self.observe_inner(gpu, engine, ids, snapshots);
+        if result.is_err() {
+            // The consumer joined; a still-open window is idle again once cancelled as retired.
+            let _ = engine.policy.cancel_window(CancelOutcome::Retired);
+        }
+        result
+    }
+
+    fn observe_inner(
+        &mut self,
+        gpu: &Gpu,
+        engine: &mut Engine<QwenCopy>,
         ids: &[i32],
         snapshots: &[ResidencySnapshot],
     ) -> Result<()> {
         self.stats.tokens = self.stats.tokens.saturating_add(1);
-        let bank = self.bank.as_mut().expect("live bank");
-        let mut misses = vec![Vec::new(); LAYERS];
+        let mut core = 0u64;
         for layer in 0..LAYERS {
             let selected = &ids[layer * TOPK..(layer + 1) * TOPK];
-            account_routes(
-                &mut self.stats,
-                selected,
-                &self.layers[layer].host,
-                &snapshots[layer].mapping,
-            )?;
-            for &expert in selected {
-                let expert = expert as usize;
-                if self.layers[layer].host[expert].is_none() {
-                    continue;
+            let account = account_route(&self.layout, layer, selected, &snapshots[layer].mapping)?;
+            self.stats.selected = self.stats.selected.saturating_add(account.selected);
+            self.stats.core_hits = self.stats.core_hits.saturating_add(account.core_hits);
+            self.stats.cache_hits = self.stats.cache_hits.saturating_add(account.cache_hits);
+            self.stats.host_misses = self.stats.host_misses.saturating_add(account.host_misses);
+            self.stats.miss_bytes = self.stats.miss_bytes.saturating_add(account.miss_bytes);
+            core += account.core_hits;
+            for &id in selected {
+                let expert = id as usize;
+                if let Read::Cache { pool, rank, .. } = self.layout.reads[layer * EXPERTS + expert]
+                {
+                    engine
+                        .policy
+                        .record_use(WindowUse {
+                            key: self.layout.key(layer, expert),
+                            pool,
+                            reads: 1,
+                            rank,
+                        })
+                        .map_err(|e| fail("route use", e))?;
                 }
-                if let Some(slot) = self.layers[layer].index[expert] {
-                    bank.touch(slot);
-                } else if !self.layers[layer].slot_ids.is_empty() {
-                    misses[layer].push(expert);
-                }
             }
         }
-        bank.retire_idle()?;
-        let mut mappings: Vec<_> = self
-            .layers
-            .iter()
-            .map(|s| s.binding.residency.snapshot().map(|s| s.mapping.to_vec()))
-            .collect::<Result<_>>()?;
-        let mut changed = [false; LAYERS];
-        let mut tickets = Vec::new();
-        let pending = self
-            .pending
-            .iter()
-            .map(|p| p.batch.fills().len())
-            .sum::<usize>();
-        let mut last_served = None;
-        for (layer, expert) in fair_misses(&misses, self.next_layer) {
-            if pending + tickets.len() >= self.max_inflight {
-                self.stats.skipped_full += 1;
-                continue;
-            }
-            let Some(slot) = bank.choose(&self.layers[layer].slot_ids) else {
-                self.stats.skipped_full += 1;
-                continue;
-            };
-            if let Some(victim) = bank.occupant(slot) {
-                let victim = victim as usize % EXPERTS;
-                self.layers[layer].index[victim] = None;
-                mappings[layer][victim] = ResidencyLocation::Canonical;
-                changed[layer] = true;
-                bank.evict(slot)?;
-                self.stats.evictions += 1;
-            }
-            let ticket = bank.start_fill(slot, (layer * EXPERTS + expert) as u64)?;
-            self.layers[layer].index[expert] = Some(slot);
-            tickets.push(ticket);
-            last_served = Some(layer);
-        }
-        self.next_layer = (last_served.unwrap_or(self.next_layer) + 1) % LAYERS;
-        for layer in 0..LAYERS {
-            if changed[layer] {
-                self.publish(gpu, layer, std::mem::take(&mut mappings[layer]), Vec::new())?;
-            }
-        }
+        let windows = engine
+            .policy
+            .end_window(ids.len() as u64)
+            .map_err(|e| fail("window end", e))?
+            .ok_or("expert cache cadence did not close its one-window group")?;
+        // Deliver what the copy stream finished meanwhile; the plan stages those completions.
+        engine
+            .io
+            .poll(&mut engine.policy, false)
+            .map_err(|e| fail("fill completion", e))?;
+        engine
+            .policy
+            .plan_group(windows, (core, core))
+            .map_err(|e| fail("plan", e))?;
+        // Only a staged completion or a withdrawn victim retires anything (A2.1).
+        self.retire_and_publish(gpu, engine, false)?;
         // The newly sealed membership excludes every victim before copy enqueue.
-        self.bank.as_mut().expect("live bank").seal_idle()?;
-        if tickets.is_empty() {
-            return Ok(());
+        let issued = engine
+            .io
+            .issue_pending(&mut engine.policy, &self.layout)
+            .map_err(|e| fail("fill enqueue", e))?;
+        if issued > 0 {
+            self.dirty = true;
+            self.stats.peak_inflight = self.stats.peak_inflight.max(engine.io.in_flight());
         }
-        let pairs = tickets.len();
-        let bytes = tickets
-            .iter()
-            .map(|t| t.write_spans().iter().map(|s| s.bytes).sum::<u64>())
-            .sum::<u64>();
-        let hip = &self.hip;
-        let stream = self.copy_stream.as_ref().expect("live copy stream");
-        let layers = &self.layers;
-        let mut backend = CopyFence {
-            hip,
-            stream,
-            events: &mut self.events,
-        };
-        let bank = self.bank.as_mut().expect("live bank");
-        let result = bank.bank.as_mut().expect("open bank").issue_fills(
-            tickets,
-            &mut backend,
-            &mut |ticket| {
-                let layer = ticket.occupant() as usize / EXPERTS;
-                let expert = ticket.occupant() as usize % EXPERTS;
-                let source = layers[layer].host[expert].ok_or("fill attempted immutable core")?;
-                copy_pair(hip, stream, source, ticket.write_spans())
-            },
-        );
-        match result {
-            Ok(batch) => self.pending.push_back(PendingFill { batch }),
-            Err((tickets, failure)) => {
-                bank.bank
-                    .as_mut()
-                    .expect("open bank")
-                    .abandon_fills(tickets);
-                return Err(error("fill enqueue", failure.message));
-            }
-        }
-        self.dirty = true;
-        self.stats.fills_started += pairs as u64;
-        self.stats.fill_bytes += bytes;
-        self.stats.peak_inflight = self.stats.peak_inflight.max(pending + pairs);
         Ok(())
     }
-    fn publish_completed(&mut self, gpu: &Gpu, wait: bool) -> Result<()> {
-        let mut completed = Vec::new();
-        while let Some(fill) = self.pending.pop_front() {
-            let mut copy = CopyFence {
-                hip: &self.hip,
-                stream: self.copy_stream.as_ref().expect("live copy stream"),
-                events: &mut self.events,
-            };
-            match self
-                .bank
-                .as_mut()
-                .expect("live bank")
-                .bank
-                .as_mut()
-                .expect("open bank")
-                .complete_fills(fill.batch, &mut copy, wait)
-            {
-                Ok(mut done) => completed.append(&mut done),
-                Err(FillsNotDone::Pending(batch)) => {
-                    self.pending.push_front(PendingFill { batch });
-                    break;
-                }
-                Err(FillsNotDone::Failed { failure, .. }) => {
-                    return Err(error("fill completion", failure.message))
-                }
-            }
+
+    /// Deliver the fills the copy stream completed and publish them (a publication-only plan).
+    fn publish_completed(
+        &mut self,
+        gpu: &Gpu,
+        engine: &mut Engine<QwenCopy>,
+        wait: bool,
+    ) -> Result<()> {
+        engine
+            .io
+            .poll(&mut engine.policy, wait)
+            .map_err(|e| fail("fill completion", e))?;
+        if engine.policy.completion_room() < engine.policy.config().completions {
+            engine
+                .policy
+                .plan_group(0, (0, 0))
+                .map_err(|e| fail("publication plan", e))?;
+            self.retire_and_publish(gpu, engine, false)?;
         }
-        if completed.is_empty() {
+        Ok(())
+    }
+
+    /// The retirement protocol of every pool with something pending: fence the compute stream,
+    /// retire the generations, rewrite the tables, reclaim the withdrawn victims (which starts the
+    /// fills deferred into them) and seal the next generation. A no-op when nothing is pending.
+    fn retire_and_publish(
+        &mut self,
+        gpu: &Gpu,
+        engine: &mut Engine<QwenCopy>,
+        reseed: bool,
+    ) -> Result<()> {
+        if !engine.policy.needs_retirement() {
             return Ok(());
         }
-        self.bank.as_mut().expect("live bank").retire_idle()?;
-        let mut by_layer = vec![Vec::new(); LAYERS];
-        for done in completed {
-            let slot = done.slot() as usize;
-            let bank = self.bank.as_mut().expect("live bank");
-            let (layer, local) = bank.meta[slot];
-            let (expert, generation) = bank.complete(slot, done)?;
-            by_layer[layer].push(ResidencySlotTicket {
-                slot: local,
-                expert: expert as usize % EXPERTS,
-                generation,
-            });
-            self.stats.fills_completed += 1;
+        let mut dirty = Vec::new();
+        {
+            let mut fence = ComputeFence::new(&self.hip, gpu.active_stream.as_ref());
+            for index in 0..engine.policy.pools() {
+                let pool = PoolId(index as u16);
+                if engine.policy.pool_needs_retirement(pool) {
+                    engine
+                        .policy
+                        .retire_generation(pool, &mut fence)
+                        .map_err(|e| fail("generation retirement", e))?;
+                    dirty.push(pool);
+                }
+            }
         }
-        for (layer, tickets) in by_layer.into_iter().enumerate() {
-            if tickets.is_empty() {
+        self.write_tables(gpu, &engine.policy, reseed)?;
+        for pool in dirty {
+            engine
+                .policy
+                .finish_plan(pool)
+                .map_err(|e| fail("reclaim", e))?;
+            engine.policy.seal(pool).map_err(|e| fail("seal", e))?;
+        }
+        Ok(())
+    }
+
+    /// Write `withdrawn()` / `published()` into the layers' device tables. `reseed` rebuilds the
+    /// whole mapping from the canonical one (the seed of a restore); otherwise the published
+    /// mapping is edited.
+    fn write_tables(&mut self, gpu: &Gpu, policy: &ExpertCachePolicy, reseed: bool) -> Result<()> {
+        let mut withdrawn: Vec<Vec<usize>> = vec![Vec::new(); LAYERS];
+        let mut published: Vec<Vec<ResidencySlotTicket>> = vec![Vec::new(); LAYERS];
+        for entry in policy.withdrawn() {
+            let layer = entry.key.group_id as usize;
+            withdrawn
+                .get_mut(layer)
+                .ok_or("expert cache withdrawal names an unknown layer")?
+                .push(entry.key.expert_id as usize);
+        }
+        for entry in policy.published() {
+            let layer = entry.key.group_id as usize;
+            let ticket = ResidencySlotTicket {
+                slot: entry.slot as usize,
+                expert: entry.key.expert_id as usize,
+                generation: ticket_generation(self.restore_epoch, entry.fill_generation)?,
+            };
+            published
+                .get_mut(layer)
+                .ok_or("expert cache publication names an unknown layer")?
+                .push(ticket);
+        }
+        for layer in 0..LAYERS {
+            if withdrawn[layer].is_empty() && published[layer].is_empty() {
                 continue;
             }
-            let mut mapping = self.layers[layer]
-                .binding
-                .residency
-                .snapshot()?
-                .mapping
-                .to_vec();
-            for &ticket in &tickets {
+            let mut mapping = if reseed {
+                vec![ResidencyLocation::Canonical; EXPERTS]
+            } else {
+                self.layers[layer]
+                    .binding
+                    .residency
+                    .snapshot()?
+                    .mapping
+                    .to_vec()
+            };
+            for &expert in &withdrawn[layer] {
+                mapping[expert] = ResidencyLocation::Canonical;
+            }
+            for &ticket in &published[layer] {
                 mapping[ticket.expert] = ResidencyLocation::Slot(ticket);
             }
-            self.publish(gpu, layer, mapping, tickets)?;
+            self.publish(gpu, layer, mapping, std::mem::take(&mut published[layer]))?;
         }
-        self.bank.as_mut().expect("live bank").seal_idle()
+        Ok(())
     }
+
     fn publish(
         &mut self,
         gpu: &Gpu,
@@ -1220,15 +1392,14 @@ impl ExpertCache {
         mapping: Vec<ResidencyLocation>,
         completed_slots: Vec<ResidencySlotTicket>,
     ) -> Result<()> {
-        self.bank.as_ref().expect("live bank").require_backing()?;
         let state = &mut self.layers[layer];
         let cap = state.binding.residency.clone();
         let epoch = cap.snapshot()?.epoch;
         let gu = state.binding.tables.gate_up_table();
         let dn = state.binding.tables.down_table();
-        // SAFETY: no token guards are active, and prior reads retired. Completed
-        // tickets passed event_query or name restored original donor payloads.
-        // Both tables are uploaded and synchronized before host publication.
+        // SAFETY: no token guards are active, and prior reads retired (the generation fence
+        // above). Completed tickets passed event_query or name the restored original donor
+        // payloads. Both tables are uploaded and synchronized before host publication.
         unsafe {
             cap.publish_after_gpu_wait(
                 ResidencyPublication {
@@ -1246,7 +1417,7 @@ impl ExpertCache {
                         }
                         self.hip
                             .memcpy_htod_async_on(&table.buf, upload, gpu.active_stream.as_ref())
-                            .map_err(|e| error("table upload", e))?;
+                            .map_err(|e| fail("table upload", e))?;
                         self.stats.table_upload_bytes = self
                             .stats
                             .table_upload_bytes
@@ -1256,81 +1427,54 @@ impl ExpertCache {
                         Some(stream) => self.hip.stream_synchronize(stream),
                         None => self.hip.stream_synchronize_default(),
                     }
-                    .map_err(|e| error("table visibility", e))
+                    .map_err(|e| fail("table visibility", e))
                 },
             )
         }?;
         Ok(())
     }
-    fn seed(&mut self, gpu: &Gpu) -> Result<()> {
-        let bank = self.bank.as_mut().expect("live bank");
-        bank.retire_idle()?;
-        let mut tickets = Vec::new();
-        for (layer, state) in self.layers.iter_mut().enumerate() {
-            for (local, slot) in state.slots.iter().enumerate() {
-                let global = state.slot_ids[local];
-                let expert = slot.ranges.original_expert;
-                tickets.push(bank.start_fill(global, (layer * EXPERTS + expert) as u64)?);
-                state.index[expert] = Some(global);
+
+    /// Replace the pools by a fresh build whose slots hold their donors' original experts,
+    /// published into the tables. `restore`: the seed fills copy the donors' original bytes back
+    /// from the mirror (the restore itself); otherwise the bytes are already in place and the
+    /// fills only record their events. The engine is always installed, so teardown sees it.
+    fn install_seeded(&mut self, gpu: &Gpu, io: DeviceIo<QwenCopy>, restore: bool) -> Result<()> {
+        let policy = build_policy(
+            &self.layout,
+            self.policy_config,
+            self.fills_per_pool,
+            self.lease.as_ref().map_or(0, ExpertTierLease::generation),
+        )?;
+        let mut engine = Engine { policy, io };
+        let before = engine.io.stats().bytes_enqueued;
+        engine.io.backend().set_skip_copies(!restore);
+        let issued = issue_seed(&self.layout, &mut engine);
+        engine.io.backend().set_skip_copies(false);
+        self.seed_bytes += engine.io.stats().bytes_enqueued - before;
+        let result = issued.and_then(|()| {
+            // Stage every seed completion, publish them over the canonical mapping.
+            engine
+                .policy
+                .plan_group(0, (0, 0))
+                .map_err(|e| fail("seed staging", e))?;
+            self.retire_and_publish(gpu, &mut engine, true)?;
+            for index in 0..engine.policy.pools() {
+                engine
+                    .policy
+                    .check_seeded(PoolId(index as u16))
+                    .map_err(|e| fail("seed", e))?;
             }
-        }
-        // Initial load or completed long-prefill restore already installed the
-        // exact original donor bytes. Still issue real bank completion fences.
-        let mut copy = CopyFence {
-            hip: &self.hip,
-            stream: self.copy_stream.as_ref().expect("live copy stream"),
-            events: &mut self.events,
-        };
-        let pending = match bank.bank.as_mut().expect("open bank").issue_fills(
-            tickets,
-            &mut copy,
-            &mut |_| Ok(()),
-        ) {
-            Ok(pending) => pending,
-            Err((tickets, failure)) => {
-                bank.bank
-                    .as_mut()
-                    .expect("open bank")
-                    .abandon_fills(tickets);
-                return Err(error("seed issue", failure.message));
-            }
-        };
-        let completed = bank
-            .bank
-            .as_mut()
-            .expect("open bank")
-            .complete_fills(pending, &mut copy, true)
-            .map_err(|_| "expert cache seed fence did not complete")?;
-        let mut layers = vec![Vec::new(); LAYERS];
-        for done in completed {
-            let global = done.slot() as usize;
-            let (layer, local) = bank.meta[global];
-            let (expert, generation) = bank.complete(global, done)?;
-            layers[layer].push(ResidencySlotTicket {
-                slot: local,
-                expert: expert as usize % EXPERTS,
-                generation,
-            });
-        }
-        for (layer, tickets) in layers.into_iter().enumerate() {
-            let mut mapping = vec![ResidencyLocation::Canonical; EXPERTS];
-            for &ticket in &tickets {
-                mapping[ticket.expert] = ResidencyLocation::Slot(ticket);
-            }
-            self.publish(gpu, layer, mapping, tickets)?;
-            let bank = self.bank.as_mut().expect("live bank");
-            for &expert in &self.warm_order[layer] {
-                if let Some(slot) = self.layers[layer].index[expert] {
-                    bank.touch(slot);
-                }
-            }
-        }
-        self.bank.as_mut().expect("live bank").seal_idle()?;
-        self.needs_seed = false;
-        Ok(())
+            Ok(())
+        });
+        self.engine = Some(engine);
+        result
     }
-    /// Drain cache DMA, retire slot mappings, and restore the original contiguous
-    /// donor tail before frozen prefill. Never reset the slot generation counter.
+
+    /// Restore the original donor bytes before frozen resident prefill. A cache that never filled
+    /// a slot still holds them. Otherwise every fill is drained, and the pools are rebuilt with a
+    /// copy-mode seed: its fills write each donor's original bytes back from the pinned mirror
+    /// and publish the seed over the canonical mapping. No token is outstanding and no
+    /// retained queue reads the tables, so nothing reads a donor slot while it is rewritten.
     pub(crate) fn prepare_prefill(&mut self, gpu: &mut Gpu) -> Result<()> {
         let started = Instant::now();
         let was_dirty = self.dirty;
@@ -1349,85 +1493,32 @@ impl ExpertCache {
 
     fn prepare_prefill_inner(&mut self, gpu: &mut Gpu) -> Result<()> {
         self.check(gpu)?;
+        if !self.dirty {
+            return Ok(());
+        }
+        let gpu: &Gpu = gpu;
         let result: Result<()> = (|| {
-            self.publish_completed(gpu, true)?;
-            self.bank.as_mut().expect("live bank").retire_idle()?;
-            for layer in 0..LAYERS {
-                let snapshot = self.layers[layer].binding.residency.snapshot()?;
-                if snapshot
-                    .mapping
-                    .iter()
-                    .any(|m| *m != ResidencyLocation::Canonical)
-                {
-                    self.publish(
-                        gpu,
-                        layer,
-                        vec![ResidencyLocation::Canonical; EXPERTS],
-                        Vec::new(),
-                    )?;
-                }
-                self.layers[layer].index.fill(None);
+            let mut engine = self.engine.take().ok_or("expert cache is stopped")?;
+            if !engine.policy.window().is_idle() {
+                self.engine = Some(engine);
+                return Err("expert cache restore needs an idle window".into());
             }
-            let bank = self.bank.as_mut().expect("live bank");
-            for slot in 0..bank.cells.len() {
-                if bank.phase(slot) == SlotPhaseView::Resident {
-                    bank.evict(slot)?;
-                }
+            // Every fill completes; their tokens die with the old pools.
+            if let Err(cause) = engine.io.poll(&mut engine.policy, true) {
+                self.engine = Some(engine);
+                return Err(fail("restore drain", cause));
             }
-            if self.dirty {
-                let ranges = self
-                    .lease
-                    .as_ref()
-                    .expect("live lease")
-                    .expert_cache_ranges()
-                    .ok_or("cache lost restore ranges")?;
-                let mut device = ComputeFence::new(&self.hip, None);
-                let q = bank
-                    .bank
-                    .as_mut()
-                    .expect("open bank")
-                    .quiesce(&mut device)
-                    .map_err(|f| f.message)?;
-                let loan = bank
-                    .bank
-                    .as_mut()
-                    .expect("open bank")
-                    .lend_scratch(q)
-                    .map_err(|e| e.to_string())?;
-                if loan.span()
-                    != (Binding {
-                        base: ranges.donor_device.0 as u64,
-                        bytes: ranges.donor_device.1 as u64,
-                    })
-                {
-                    return Err("cache scratch loan extent changed".into());
-                }
-                let stream = self.copy_stream.as_ref().expect("live copy stream");
-                copy_projection(&self.hip, ranges.mirror_cpu, ranges.donor_device, stream)?;
-                let mut copy = CopyFence {
-                    hip: &self.hip,
-                    stream,
-                    events: &mut self.events,
-                };
-                let restore = bank
-                    .bank
-                    .as_mut()
-                    .expect("open bank")
-                    .issue_restore(&loan, &mut copy, &mut |_, _, _| {
-                        Err("free cache slot unexpectedly occupied during restore".into())
-                    })
-                    .map_err(|f| f.message)?;
-                bank.bank
-                    .as_mut()
-                    .expect("open bank")
-                    .end_scratch(loan, restore, &mut copy)
-                    .map_err(|(_, _, e)| e.to_string())?;
-                self.stats.prefill_restores += 1;
-                self.stats.restore_bytes += ranges.donor_device.1 as u64;
-                self.dirty = false;
-            }
-            self.bank.as_mut().expect("live bank").seal_idle()?;
-            self.needs_seed = true;
+            let Engine { policy, io } = engine;
+            self.fold_policy_stats(policy.stats());
+            drop(policy);
+            self.restore_epoch = self
+                .restore_epoch
+                .checked_add(1)
+                .ok_or("expert cache restore epoch exhausted")?;
+            self.install_seeded(gpu, io, true)?;
+            self.stats.prefill_restores += 1;
+            self.stats.restore_bytes += self.donor_bytes as u64;
+            self.dirty = false;
             Ok(())
         })();
         if let Err(reason) = &result {
@@ -1435,6 +1526,7 @@ impl ExpertCache {
         }
         result
     }
+
     /// Refuse unknown token quiescence: a HIP wait alone cannot retire PM4.
     pub(crate) fn shutdown(&mut self, gpu: &mut Gpu) -> Result<()> {
         if self.outstanding.load(Ordering::Acquire) {
@@ -1443,65 +1535,35 @@ impl ExpertCache {
         if gpu.device_id != self.device_id {
             return Err("expert cache shutdown on another GPU".into());
         }
-        gpu.bind_thread().map_err(|e| error("shutdown bind", e))?;
+        gpu.bind_thread().map_err(|e| fail("shutdown bind", e))?;
         self.hip
             .device_synchronize()
-            .map_err(|e| error("shutdown wait", e))?;
-        self.destroy_queue()
+            .map_err(|e| fail("shutdown wait", e))?;
+        self.destroy_engine()
     }
-    fn destroy_queue(&mut self) -> Result<()> {
-        if let Some(bank) = self.bank.as_mut() {
-            if bank.bank.is_none() || bank.cells.iter().any(Option::is_none) {
-                return Err("expert cache teardown authority is incomplete; retain owners".into());
-            }
-            bank.retire_idle()?;
-            let mut device = ComputeFence::new(&self.hip, None);
-            let q = bank
-                .bank
-                .as_mut()
-                .expect("open bank")
-                .quiesce(&mut device)
-                .map_err(|f| f.message)?;
-            let raw = bank.bank.take().expect("open bank");
-            let cells = bank
-                .cells
-                .iter_mut()
-                .map(|c| c.take().expect("cell present"))
-                .collect();
-            match raw.close(cells, q) {
-                Ok((block, done)) => {
-                    block.free(done).map_err(|(_, _, e)| e.to_string())?;
-                }
-                Err((raw, cells, error)) => {
-                    bank.bank = Some(raw);
-                    bank.cells = cells.into_iter().map(Some).collect();
-                    return Err(error.to_string());
-                }
+    /// Wait every fill (the io synchronizes each event), then drop the pools: the device is idle,
+    /// so their generations and leases are CPU ledgers only. An open or poisoned window, or an
+    /// event that cannot be waited, is a refusal and the caller retains every owner.
+    fn destroy_engine(&mut self) -> Result<()> {
+        if let Some(engine) = &self.engine {
+            if !engine.policy.window().is_idle() {
+                return Err("expert cache teardown has an unjoined window; retain owners".into());
             }
         }
-        self.bank = None;
-        self.pending.clear();
-        for event in std::mem::take(&mut self.events.live)
-            .into_values()
-            .chain(self.events.idle.drain(..))
-        {
-            self.hip
-                .event_destroy(event)
-                .map_err(|e| error("shutdown event", e))?;
-        }
-        if let Some(stream) = self.copy_stream.take() {
-            self.hip
-                .stream_destroy(stream)
-                .map_err(|e| error("shutdown stream", e))?;
-        }
+        let Some(Engine { policy, io }) = self.engine.take() else {
+            return Ok(());
+        };
+        self.fold_policy_stats(policy.stats());
+        io.shutdown().map_err(|e| fail("shutdown", e))?;
+        drop(policy);
         Ok(())
     }
     fn retain_on_unknown_quiescence(&mut self) {
         // Retain canonical bytes, slots, tables and upload mirrors. A poisoned
         // token can still have independent PM4 reads that HIP cannot fence.
         std::mem::forget(std::mem::take(&mut self.layers));
-        if let Some(bank) = self.bank.take() {
-            std::mem::forget(bank);
+        if let Some(engine) = self.engine.take() {
+            std::mem::forget(engine);
         }
         if let Some(lease) = self.lease.take() {
             std::mem::forget(lease);
@@ -1524,7 +1586,7 @@ impl Drop for ExpertCache {
             .and_then(|()| self.hip.device_synchronize())
             .is_ok()
         {
-            if self.destroy_queue().is_err() {
+            if self.destroy_engine().is_err() {
                 self.retain_on_unknown_quiescence();
             }
         } else {
@@ -1537,164 +1599,257 @@ impl Drop for ExpertCache {
         }
     }
 }
+
+/// The catalog of the lease's admitted plan, proven to be the one admission recorded: the keys
+/// the cache uses name the admitted canonical experts, never a rebuilt or different layout.
+fn admitted_catalog(lease: &ExpertTierLease) -> Result<ExpertCatalog> {
+    let plan = lease.tier_plan();
+    let catalog = build_expert_catalog(plan).map_err(|e| fail("catalog", e))?;
+    let recorded = plan
+        .expert_cache_identity()
+        .ok_or("exact expert cache plan carries no admitted catalog identity")?;
+    let identity = catalog
+        .identity(&[])
+        .map_err(|e| fail("catalog identity", e))?;
+    if identity.as_bytes() != recorded {
+        return Err(
+            "exact expert cache catalog differs from the identity admitted with the plan".into(),
+        );
+    }
+    Ok(catalog)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct CpuFence {
-        incarnation: u64,
-        next: u64,
-        unknown: bool,
-    }
-    // SAFETY: metadata-only tests enqueue no device operations. The explicit
-    // unknown arm simulates a backend that cannot establish retirement.
-    unsafe impl FenceBackend for CpuFence {
-        fn incarnation(&self) -> u64 {
-            self.incarnation
-        }
-        fn record(&mut self) -> std::result::Result<u64, FenceFailure> {
-            self.next += 1;
-            Ok(self.next)
-        }
-        fn poll(&mut self, _: u64) -> FenceState {
-            if self.unknown {
-                FenceState::Failed(unknown("injected unknown queue"))
-            } else {
-                FenceState::Complete
-            }
-        }
-        fn wait(&mut self, f: u64) -> FenceState {
-            self.poll(f)
-        }
-    }
-    fn cpu_fence(unknown: bool) -> CpuFence {
-        CpuFence {
-            incarnation: incarnation(),
-            next: 0,
-            unknown,
-        }
-    }
-    fn bank_fixture(base: usize) -> CacheBank {
-        CacheBank::new(
-            (base, 64),
-            7,
-            vec![vec![
-                SlotSpan {
-                    offset: 0,
-                    bytes: 16,
-                },
-                SlotSpan {
-                    offset: 16,
-                    bytes: 16,
-                },
-            ]],
-            vec![(0, 0)],
-            vec![Binding {
-                base: base as u64 + 0x1000,
-                bytes: 16,
-            }],
-        )
-        .unwrap()
-    }
-    fn cpu_completed(
-        bank: &mut CacheBank,
-        expert: u64,
-    ) -> railgun::sealed_table::generation::FillComplete {
-        let ticket = bank.start_fill(0, expert).unwrap();
-        let mut fence = cpu_fence(false);
-        let raw = bank.bank.as_mut().unwrap();
-        let pending = raw
-            .issue_fills(vec![ticket], &mut fence, &mut |_| Ok(()))
-            .unwrap();
-        raw.complete_fills(pending, &mut fence, true)
-            .unwrap()
-            .pop()
-            .unwrap()
-    }
-    #[test]
-    fn expert_cache_bank_reader_blocks_publication_and_known_cancellation_returns_authority() {
-        let mut bank = bank_fixture(0x10000);
-        bank.retire_idle().unwrap();
-        let done = cpu_completed(&mut bank, 42);
-        assert_eq!(bank.complete(0, done).unwrap(), (42, 1));
-        bank.seal_idle().unwrap();
-        let epoch = bank.epoch;
-        let reader = bank.acquire_reader().unwrap();
-        assert!(bank.retire_idle().is_err());
-        assert!(bank.require_backing().is_err());
-        assert!(bank.evict(0).is_err());
-        assert_eq!(bank.phase(0), SlotPhaseView::Resident);
-        bank.finish_reader(reader, &mut cpu_fence(false)).unwrap();
-        assert_eq!(
-            bank.epoch, epoch,
-            "cancel must not publish or invent a generation"
-        );
-        bank.retire_idle().unwrap();
-        bank.evict(0).unwrap();
-        let done = cpu_completed(&mut bank, 17);
-        assert_eq!(bank.complete(0, done).unwrap(), (17, 2));
-    }
-    #[test]
-    fn expert_cache_bank_unknown_reader_and_dropped_token_never_reopen_backing() {
-        for drop_token in [false, true] {
-            let mut bank = bank_fixture(0x20000);
-            let reader = bank.acquire_reader().unwrap();
-            if drop_token {
-                let outstanding = Arc::new(AtomicBool::new(true));
-                drop(ExpertCacheToken {
-                    guards: Vec::new(),
-                    reader: Some(reader),
-                    outstanding: outstanding.clone(),
-                });
-                assert!(outstanding.load(Ordering::Acquire));
-            } else {
-                assert!(bank.finish_reader(reader, &mut cpu_fence(true)).is_err());
-            }
-            assert!(bank.retire_idle().is_err());
-            assert!(bank.require_backing().is_err());
-            assert_eq!(bank.bank.as_ref().unwrap().live_generations(), 1);
-        }
-    }
-    #[test]
-    fn expert_cache_bank_rejects_foreign_completion_and_partial_pair_enqueue() {
-        let mut a = bank_fixture(0x30000);
-        let mut b = bank_fixture(0x40000);
-        a.retire_idle().unwrap();
-        b.retire_idle().unwrap();
-        let foreign = cpu_completed(&mut a, 8);
-        let ticket = b.start_fill(0, 9).unwrap();
-        assert!(b.complete(0, foreign).is_err());
-        assert_eq!(b.phase(0), SlotPhaseView::Filling);
-        let mut wrote_gu = false;
-        let failure = b
-            .bank
-            .as_mut()
-            .unwrap()
-            .issue_fills(vec![ticket], &mut cpu_fence(false), &mut |t| {
-                assert_eq!(t.write_spans().len(), 2);
-                wrote_gu = true;
-                Err("injected DN enqueue failure after GU".into())
+    use crate::expert_slab_table::{ExpertSlab, ExpertSlabSpan};
+    use crate::expert_slabs::ExpertFormat;
+    use crate::expert_tier_plan::{plan_expert_tiers_from_slabs, ExpertTierPlan};
+    use hipfire_runtime::expert_cache::{validate_bundle, Lookup, PlanSummary, SlotPhase};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const DEVICE: usize = 0x1_0000_0000;
+    const HOST: usize = 0x9000_0000;
+    /// Padded device bytes of one expert (both projections 256-aligned).
+    const SPAN: u64 = 2_611_200;
+
+    // -- fixtures -------------------------------------------------------------------------
+
+    fn real_slabs() -> Vec<ExpertSlab> {
+        let format = ExpertFormat::Mq4Xts;
+        let mut cursor = 0;
+        (0..(TRUNK_LAYERS * EXPERTS_PER_LAYER) as usize)
+            .map(|_| {
+                let gate_up = ExpertSlabSpan {
+                    offset: cursor,
+                    len: format.gate_up_bytes(),
+                };
+                cursor += format.gate_up_bytes();
+                let down = ExpertSlabSpan {
+                    offset: cursor,
+                    len: format.down_bytes(),
+                };
+                cursor += format.down_bytes();
+                ExpertSlab {
+                    format,
+                    gate_up,
+                    down,
+                }
             })
-            .unwrap_err();
-        assert!(wrote_gu);
-        assert_eq!(failure.1.quiescence, Quiescence::Unknown);
-        b.bank.as_mut().unwrap().abandon_fills(failure.0);
-        assert!(b.bank.as_ref().unwrap().is_quarantined(0));
-        assert!(!b.staging.contains(0));
-        assert!(
-            b.choose(&[0]).is_none(),
-            "partial pair cannot be reused or published"
-        );
+            .collect()
     }
 
+    /// A plan of 16 device experts (layer 0) with the `donors` coldest of them donated.
+    fn cached_plan(donors: u64) -> ExpertTierPlan {
+        let rank: Vec<u32> = (0..16).collect();
+        let plain = plan_expert_tiers_from_slabs(&real_slabs(), &rank, u64::MAX).unwrap();
+        let (plan, tail) = plain.with_expert_cache_tail(&rank, donors * SPAN).unwrap();
+        assert_eq!(tail.donors.len(), donors as usize);
+        crate::expert_cache_config::record_catalog_identity(plan).unwrap()
+    }
+
+    fn inputs(plan: &ExpertTierPlan) -> Vec<LayerInput> {
+        let tail = plan.expert_cache_tail().unwrap();
+        (0..LAYERS)
+            .map(|layer| {
+                let experts = (0..EXPERTS)
+                    .map(|expert| {
+                        let entry = plan.entry(layer, expert).unwrap();
+                        let id = layer * EXPERTS + expert;
+                        let cacheable = entry.tier == Placement::HostMapped
+                            || tail.donors.binary_search(&(id as u32)).is_ok();
+                        let gate_up = entry.gate_up_len as usize;
+                        let down = entry.down_len as usize;
+                        ExpertInput {
+                            gate_up: ResidencySpan {
+                                address: 0x4000_0000 + id * 0x40_0000,
+                                bytes: gate_up,
+                            },
+                            down: ResidencySpan {
+                                address: 0x4020_0000 + id * 0x40_0000,
+                                bytes: down,
+                            },
+                            host: cacheable.then(|| HostPair {
+                                gate_up: (HOST + id * 0x40_0000, gate_up),
+                                down: (HOST + id * 0x40_0000 + 0x20_0000, down),
+                            }),
+                        }
+                    })
+                    .collect();
+                let slots = tail
+                    .donors
+                    .iter()
+                    .filter(|&&id| id as usize / EXPERTS == layer)
+                    .map(|&id| {
+                        let entry = plan.entry(layer, id as usize % EXPERTS).unwrap();
+                        SlotInput {
+                            original_expert: id as usize % EXPERTS,
+                            gate_up: (
+                                DEVICE + entry.gate_up_offset as usize,
+                                entry.gate_up_len as usize,
+                            ),
+                            down: (DEVICE + entry.down_offset as usize, entry.down_len as usize),
+                        }
+                    })
+                    .collect();
+                LayerInput {
+                    experts,
+                    slots,
+                    tables: [0, 1].map(|table| Binding {
+                        base: 0x7000_0000 + (layer * 2 + table) as u64 * 0x1000,
+                        bytes: 4096,
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    fn rank_pos() -> Vec<u32> {
+        (0..(LAYERS * EXPERTS) as u32).collect()
+    }
+
+    fn layout_of(plan: &ExpertTierPlan) -> Layout {
+        let catalog = build_expert_catalog(plan).unwrap();
+        build_layout(&catalog, &inputs(plan), &rank_pos()).unwrap()
+    }
+
+    fn config() -> PolicyConfig {
+        PolicyConfig {
+            retire_ids: 1,
+            max_windows: 1,
+            fill_group_cap: 1,
+            use_log: LAYERS * TOPK,
+            completions: 64,
+            parked: 64,
+            consumers: 1,
+            queues: 1,
+        }
+    }
+
+    // -- a fake copy device ---------------------------------------------------------------
+
+    #[derive(Default)]
+    struct Trace {
+        /// `copy (dst, len)` and `record` in submission order.
+        log: RefCell<Vec<String>>,
+        copies: RefCell<Vec<(u64, usize)>>,
+    }
+    struct Fake {
+        events: usize,
+        trace: Rc<Trace>,
+    }
+    impl CopyDevice for Fake {
+        fn incarnation(&self) -> u64 {
+            1
+        }
+        fn events(&self) -> usize {
+            self.events
+        }
+        fn enqueue_copy(
+            &self,
+            _: PoolId,
+            dst: u64,
+            src: HostRange,
+        ) -> std::result::Result<(), String> {
+            self.trace.copies.borrow_mut().push((dst, src.len()));
+            self.trace.log.borrow_mut().push("copy".into());
+            Ok(())
+        }
+        fn record(&self, _: usize) -> std::result::Result<(), String> {
+            self.trace.log.borrow_mut().push("record".into());
+            Ok(())
+        }
+        fn query(&self, _: usize) -> std::result::Result<bool, String> {
+            Ok(true)
+        }
+        fn synchronize(&self, _: usize) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        fn quarantine(&self) {}
+    }
+
+    struct CpuFence(u64);
+    // SAFETY: metadata-only tests enqueue no device operation; every fence is complete.
+    unsafe impl FenceBackend for CpuFence {
+        fn incarnation(&self) -> u64 {
+            7
+        }
+        fn record(&mut self) -> std::result::Result<u64, FenceFailure> {
+            self.0 += 1;
+            Ok(self.0)
+        }
+        fn poll(&mut self, _: u64) -> FenceState {
+            FenceState::Complete
+        }
+        fn wait(&mut self, _: u64) -> FenceState {
+            FenceState::Complete
+        }
+    }
+
+    type Rig = Engine<SeedCopy<Fake>>;
+
+    fn rig(layout: &Layout, events: usize) -> (Rig, Rc<Trace>) {
+        let trace = Rc::new(Trace::default());
+        let policy = build_policy(layout, config(), 4, 9).unwrap();
+        let io = DeviceIo::new(SeedCopy::new(Fake {
+            events,
+            trace: trace.clone(),
+        }))
+        .unwrap();
+        (Engine { policy, io }, trace)
+    }
+
+    /// Stage and publish what the policy completed (the table rewrite is the dispatch capability's
+    /// job and is not under test): retire, reclaim, seal.
+    fn retire_all(engine: &mut Rig) {
+        let mut fence = CpuFence(0);
+        let pools = engine.policy.pools();
+        let dirty: Vec<_> = (0..pools)
+            .map(|i| PoolId(i as u16))
+            .filter(|&p| engine.policy.pool_needs_retirement(p))
+            .collect();
+        for &pool in &dirty {
+            engine.policy.retire_generation(pool, &mut fence).unwrap();
+        }
+        for &pool in &dirty {
+            engine.policy.finish_plan(pool).unwrap();
+            engine.policy.seal(pool).unwrap();
+        }
+    }
+
+    // -- ported protocol and helper tests -----------------------------------------------------
+
     #[test]
-    fn expert_cache_accounting_uses_token_start_mapping() {
-        let pair = HostPair {
-            gate_up: (0, 2),
-            down: (0, 3),
-        };
-        let mut host = vec![Some(pair); EXPERTS];
-        host[0] = None;
-        host[1] = None;
+    fn route_accounting_uses_token_start_mapping() {
+        let mut layout = layout_of(&cached_plan(5));
+        // Layer 0: experts 0 and 1 are the pinned core, 2 and 3 are in slots, the rest miss.
+        for expert in [0, 1] {
+            layout.reads[expert] = Read::Core;
+        }
+        for expert in 2..10 {
+            layout.reads[expert] = Read::Host { bytes: 5 };
+        }
         let mut mapping = vec![ResidencyLocation::Canonical; EXPERTS];
         for expert in [2, 3] {
             mapping[expert] = ResidencyLocation::Slot(ResidencySlotTicket {
@@ -1704,15 +1859,14 @@ mod tests {
             });
         }
         let ids: Vec<_> = (0..10).collect();
-        let mut stats = ExpertCacheStats::default();
-        account_routes(&mut stats, &ids, &host, &mapping).unwrap();
+        let account = account_route(&layout, 0, &ids, &mapping).unwrap();
         assert_eq!(
             (
-                stats.selected,
-                stats.core_hits,
-                stats.cache_hits,
-                stats.host_misses,
-                stats.miss_bytes
+                account.selected,
+                account.core_hits,
+                account.cache_hits,
+                account.host_misses,
+                account.miss_bytes
             ),
             (10, 2, 2, 6, 30)
         );
@@ -1722,16 +1876,14 @@ mod tests {
             expert: 4,
             generation: 2,
         });
-        assert_eq!(stats.host_misses, 6);
-        let mut rejected = ExpertCacheStats::default();
-        assert!(account_routes(&mut rejected, &[7, 7], &host, &mapping).is_err());
-        assert_eq!(rejected.selected, 0);
-        assert!(account_routes(&mut rejected, &[-1], &host, &mapping).is_err());
-        assert!(account_routes(&mut rejected, &[EXPERTS as i32], &host, &mapping).is_err());
+        assert_eq!(account.host_misses, 6);
+        assert!(account_route(&layout, 0, &[7, 7], &mapping).is_err());
+        assert!(account_route(&layout, 0, &[-1], &mapping).is_err());
+        assert!(account_route(&layout, 0, &[EXPERTS as i32], &mapping).is_err());
     }
 
     #[test]
-    fn expert_cache_cpu_alias_translation_checks_both_ends() {
+    fn cpu_alias_translation_checks_both_ends() {
         assert_eq!(
             host_projection(0x1100, 128, (0x1000, 1024), (0x8000, 1024)).unwrap(),
             (0x8100, 128)
@@ -1741,51 +1893,315 @@ mod tests {
         assert!(host_projection(0x1000, 1, (0x1000, 1024), (usize::MAX, 1024)).is_err());
         assert!(host_projection(0x1000, 1, (0x1000, 1024), (0x8000, 1023)).is_err());
     }
+
     #[test]
-    fn expert_cache_warm_order_requires_complete_permutation() {
+    fn rank_positions_require_a_complete_permutation() {
         let mut rank: Vec<_> = (0..(LAYERS * EXPERTS) as u32).collect();
-        let order = warm_order(&rank).unwrap();
-        assert_eq!(order[0][0], EXPERTS - 1);
-        assert_eq!(order[0][EXPERTS - 1], 0);
-        assert!(warm_order(&rank[..rank.len() - 1]).is_err());
+        rank.reverse();
+        let position = rank_positions(&rank).unwrap();
+        // The hottest id (rank[0]) has position 0.
+        assert_eq!(position[rank[0] as usize], 0);
+        assert_eq!(position[0], (LAYERS * EXPERTS - 1) as u32);
+        assert!(rank_positions(&rank[..rank.len() - 1]).is_err());
         rank[1] = rank[0];
-        assert!(warm_order(&rank).is_err());
+        assert!(rank_positions(&rank).is_err());
         rank[1] = (LAYERS * EXPERTS) as u32;
-        assert!(warm_order(&rank).is_err());
-    }
-    #[test]
-    fn expert_cache_bounded_queue_serves_every_layer_before_second_fills() {
-        let misses = (0..LAYERS)
-            .map(|_| (0..TOPK).collect())
-            .collect::<Vec<Vec<usize>>>();
-        let mut cursor = 0;
-        let mut total = [0; LAYERS];
-        for _ in 0..3 {
-            let selected = fair_misses(&misses, cursor).take(64).collect::<Vec<_>>();
-            let mut served = [0; LAYERS];
-            for &(layer, expert) in &selected {
-                assert_eq!(expert, served[layer], "within-layer priority changed");
-                served[layer] += 1;
-                total[layer] += 1;
-            }
-            assert_eq!(selected.len(), 64);
-            assert!(
-                served.iter().all(|&n| n == 1 || n == 2),
-                "a layer monopolized the queue"
-            );
-            cursor = (selected.last().unwrap().0 + 1) % LAYERS;
-        }
-        assert!(total.iter().all(|&n| n == 4), "extra quota did not rotate");
+        assert!(rank_positions(&rank).is_err());
     }
 
     #[test]
-    fn expert_cache_fair_fill_order_skips_empty_layers() {
-        let misses = vec![vec![], vec![7, 9], vec![], vec![3]];
+    fn ticket_generations_never_go_backwards_across_restores() {
+        // A restore rebuilds the bank, so fill generations restart at 1; the ticket must not.
+        let before = ticket_generation(0, 41).unwrap();
+        let after = ticket_generation(1, 1).unwrap();
+        assert!(after > before && ticket_generation(0, 1).unwrap() >= 1);
+        assert!(ticket_generation(0, 1 << 32).is_err());
+        assert!(ticket_generation(u64::MAX, 1).is_err());
+    }
+
+    // -- layout ---------------------------------------------------------------------------
+
+    #[test]
+    fn layout_pools_the_donor_layer_and_names_every_cacheable_bundle() {
+        let plan = cached_plan(5);
+        let layout = layout_of(&plan);
+        // Only layer 0 donates: one pool of its five slots, seeded with the donors' experts.
+        assert_eq!(layout.pools.len(), 1);
+        assert_eq!(layout.layer_pool[0], Some(PoolId(0)));
+        assert!(layout.layer_pool[1..].iter().all(Option::is_none));
+        let pool = &layout.pools[0];
+        assert_eq!((pool.layer, pool.spans.len(), pool.seed.len()), (0, 5, 5));
+        let tail = plan.expert_cache_tail().unwrap();
+        for ((key, rank), &donor) in pool.seed.iter().zip(&tail.donors) {
+            assert_eq!((key.group_id, key.expert_id), (0, donor % EXPERTS as u32));
+            assert_eq!(*rank, donor);
+        }
+        // Every cacheable expert of the pooled layer has a GU + DN bundle covering a slot exactly;
+        // the pinned core has none, and another pool's id is not its pool.
+        let slot_spans: Vec<Binding> = pool.spans[0]
+            .iter()
+            .map(|span| Binding {
+                base: pool.block.0 as u64 + span.offset,
+                bytes: span.bytes,
+            })
+            .collect();
+        for expert in 0..EXPERTS {
+            let key = layout.key(0, expert);
+            match layout.reads[expert] {
+                Read::Core => assert!(layout.bundle(&key, PoolId(0)).is_none()),
+                Read::Cache { pool, .. } => {
+                    assert_eq!(pool, PoolId(0));
+                    let bundle = layout.bundle(&key, pool).expect("cacheable bundle");
+                    assert_eq!(bundle.len(), 2, "GU and DN travel as one bundle");
+                    validate_bundle(bundle, &slot_spans).unwrap();
+                    assert!(layout.bundle(&key, PoolId(1)).is_none());
+                }
+                Read::Host { .. } => panic!("a pooled layer has no unpooled cacheable expert"),
+            }
+        }
+        // Layers without donors read the host and never fill.
+        assert!(matches!(layout.reads[EXPERTS + 100], Read::Host { .. }));
+        assert!(layout.bundle(&layout.key(1, 100), PoolId(0)).is_none());
+    }
+
+    #[test]
+    fn layout_refuses_a_view_the_admitted_catalog_does_not_describe() {
+        let plan = cached_plan(5);
+        let catalog = build_expert_catalog(&plan).unwrap();
+        // The cache view pins an expert the catalog marks cacheable.
+        let mut bad = inputs(&plan);
+        bad[0].experts[100].host = None;
+        assert!(build_layout(&catalog, &bad, &rank_pos())
+            .err()
+            .expect("refused")
+            .contains("pinned"));
+        // A slot whose extents are not its layout class's.
+        let mut bad = inputs(&plan);
+        bad[0].slots[1].gate_up.1 -= 256;
+        assert!(build_layout(&catalog, &bad, &rank_pos())
+            .err()
+            .expect("refused")
+            .contains("layout class"));
+        // Two donors of one expert would misalign the seed.
+        let mut bad = inputs(&plan);
+        bad[0].slots[1].original_expert = bad[0].slots[0].original_expert;
+        assert!(build_layout(&catalog, &bad, &rank_pos())
+            .err()
+            .expect("refused")
+            .contains("distinct"));
+        // A layer whose experts differ in extent.
+        let mut bad = inputs(&plan);
+        bad[3].experts[7].down.bytes -= 256;
+        assert!(build_layout(&catalog, &bad, &rank_pos())
+            .err()
+            .expect("refused")
+            .contains("equal projection extents"));
+    }
+
+    // -- the adapter over the shared core ---------------------------------------------------
+
+    #[test]
+    fn a_seed_is_one_paired_event_per_donor_and_only_a_restore_copies() {
+        let layout = layout_of(&cached_plan(5));
+        for restore in [false, true] {
+            let (mut engine, trace) = rig(&layout, 2);
+            engine.io.backend().set_skip_copies(!restore);
+            issue_seed(&layout, &mut engine).unwrap();
+            let summary = engine.policy.plan_group(0, (0, 0)).unwrap();
+            assert_eq!(summary.published, 5, "restore {restore}");
+            assert!(summary.needs_retirement);
+            assert_eq!(engine.io.in_flight(), 0);
+            {
+                // Five fills through a two-event pool. A restore copies GU then DN before each
+                // fill's event; the initial seed records the same events and moves no byte.
+                let log = trace.log.borrow();
+                if restore {
+                    assert_eq!(log.len(), 15);
+                    assert!(log.chunks(3).all(|c| c == ["copy", "copy", "record"]));
+                } else {
+                    assert_eq!(*log, ["record"; 5]);
+                    assert!(trace.copies.borrow().is_empty());
+                }
+            }
+            retire_all(&mut engine);
+            engine.policy.check_seeded(PoolId(0)).unwrap();
+            for (slot, (key, _)) in layout.pools[0].seed.iter().enumerate() {
+                assert_eq!(
+                    engine.policy.lookup(*key),
+                    Lookup::Published {
+                        pool: PoolId(0),
+                        slot: slot as u32,
+                        fill_generation: 1
+                    }
+                );
+            }
+        }
+    }
+
+    /// Pools seeded and published (generation sealed), the trace cleared.
+    fn seeded(layout: &Layout, events: usize) -> (Rig, Rc<Trace>) {
+        let (mut engine, trace) = rig(layout, events);
+        issue_seed(layout, &mut engine).unwrap();
+        engine.policy.plan_group(0, (0, 0)).unwrap();
+        retire_all(&mut engine);
+        trace.log.borrow_mut().clear();
+        trace.copies.borrow_mut().clear();
+        (engine, trace)
+    }
+
+    /// One decode window reading `keys`, judged as its own group the way `finish_token` does.
+    fn window(engine: &mut Rig, layout: &Layout, keys: &[ExpertKey]) -> PlanSummary {
+        engine.policy.begin_window().unwrap();
+        let consumer = engine
+            .policy
+            .register_consumer(0, WindowConsumerPhase::Decode, 0)
+            .unwrap();
+        for &key in keys {
+            let id = key.group_id as usize * EXPERTS + key.expert_id as usize;
+            let Read::Cache { pool, rank, .. } = layout.reads[id] else {
+                panic!("a cacheable expert");
+            };
+            engine
+                .policy
+                .record_use(WindowUse {
+                    key,
+                    pool,
+                    reads: 1,
+                    rank,
+                })
+                .unwrap();
+        }
+        engine.policy.join_consumer(consumer).unwrap();
         assert_eq!(
-            fair_misses(&misses, 3).collect::<Vec<_>>(),
-            [(3, 3), (1, 7), (1, 9)]
+            engine.policy.end_window(keys.len() as u64).unwrap(),
+            Some(1)
         );
-        assert_eq!(fair_misses(&[], 0).count(), 0);
-        assert_eq!(fair_misses(&[vec![], vec![]], 1).count(), 0);
+        engine.policy.plan_group(1, (0, 0)).unwrap()
+    }
+
+    #[test]
+    fn a_miss_fills_a_victim_with_one_paired_bundle_and_stays_invisible_until_staged() {
+        let layout = layout_of(&cached_plan(5));
+        let (mut engine, trace) = seeded(&layout, 4);
+        // Two host experts (16 and 17 are not donors, so not seeded) are read.
+        let missed = [layout.key(0, 16), layout.key(0, 17)];
+        let summary = window(&mut engine, &layout, &missed);
+        // Every slot is a resident seed: both candidates need a victim, and withdrawing one
+        // retires the generation before its slot may be refilled.
+        assert_eq!(
+            (summary.misses, summary.withdrawn, summary.fills),
+            (2, 2, 0)
+        );
+        assert!(summary.needs_retirement);
+        assert_eq!(engine.policy.withdrawn().len(), 2);
+        retire_all(&mut engine);
+        // Reclaimed: both fills started, both slots Filling, neither key visible.
+        assert_eq!(engine.policy.count(PoolId(0), SlotPhase::Filling), 2);
+        for key in missed {
+            assert!(matches!(engine.policy.lookup(key), Lookup::Pending { .. }));
+        }
+        assert_eq!(
+            engine
+                .io
+                .issue_pending(&mut engine.policy, &layout)
+                .unwrap(),
+            2
+        );
+        // Two fills: GU and DN copies then one event each, and the copies land in the slot spans.
+        let log = trace.log.borrow().clone();
+        assert_eq!(log, ["copy", "copy", "record", "copy", "copy", "record"]);
+        let block = layout.pools[0].block.0 as u64;
+        let spans: Vec<(u64, u64)> = layout.pools[0]
+            .spans
+            .iter()
+            .flat_map(|slot| slot.iter().map(move |s| (block + s.offset, s.bytes)))
+            .collect();
+        for &(dst, len) in trace.copies.borrow().iter() {
+            assert!(
+                spans.contains(&(dst, len as u64)),
+                "copy outside a slot extent"
+            );
+        }
+        // Still invisible until the completions are delivered AND staged.
+        assert!(matches!(
+            engine.policy.lookup(missed[0]),
+            Lookup::Pending { .. }
+        ));
+        let polled = engine.io.poll(&mut engine.policy, false).unwrap();
+        assert_eq!(polled.delivered, 2);
+        assert!(matches!(
+            engine.policy.lookup(missed[1]),
+            Lookup::Pending { .. }
+        ));
+        let staged = engine.policy.plan_group(0, (0, 0)).unwrap();
+        assert_eq!((staged.published, staged.stale), (2, 0));
+        for key in missed {
+            assert!(matches!(
+                engine.policy.lookup(key),
+                Lookup::Published { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn a_pending_fill_is_never_evicted_by_a_later_window() {
+        let layout = layout_of(&cached_plan(5));
+        let (mut engine, _trace) = seeded(&layout, 4);
+        let first = [layout.key(0, 16), layout.key(0, 17)];
+        window(&mut engine, &layout, &first);
+        retire_all(&mut engine);
+        assert_eq!(engine.policy.count(PoolId(0), SlotPhase::Filling), 2);
+        // Their fills are decided but nothing completed: the next window's misses may only take
+        // the three seeds still resident, never the two slots that are filling.
+        let second = [layout.key(0, 18), layout.key(0, 19)];
+        let summary = window(&mut engine, &layout, &second);
+        assert_eq!((summary.withdrawn, summary.skipped_full), (2, 0));
+        assert!(engine
+            .policy
+            .withdrawn()
+            .iter()
+            .all(|w| !first.contains(&w.key)));
+        retire_all(&mut engine);
+        assert_eq!(engine.policy.count(PoolId(0), SlotPhase::Filling), 4);
+        for key in first {
+            assert!(matches!(engine.policy.lookup(key), Lookup::Pending { .. }));
+        }
+        // The fill budget (F = 4) is spent by the four fills in flight: a third window admits
+        // nothing and touches no pending slot although a seed is still resident.
+        let third = [layout.key(0, 20), layout.key(0, 21)];
+        let summary = window(&mut engine, &layout, &third);
+        assert_eq!(
+            (summary.misses, summary.withdrawn, summary.fills),
+            (2, 0, 0)
+        );
+        assert!(!summary.needs_retirement);
+        assert_eq!(engine.policy.count(PoolId(0), SlotPhase::Filling), 4);
+        assert_eq!(engine.policy.count(PoolId(0), SlotPhase::Live), 1);
+    }
+
+    #[test]
+    fn a_completion_of_dropped_pools_never_publishes_into_rebuilt_ones() {
+        let layout = layout_of(&cached_plan(5));
+        // A restore rebuilds the pools: a completion the old bank issued cannot name a slot of
+        // the new one, whatever its slot index and fill generation.
+        let (mut old, _) = rig(&layout, 4);
+        let (mut fresh, _) = rig(&layout, 4);
+        let op = old.policy.take_fills().next().expect("a seed fill");
+        let pool = op.pool;
+        let mut fence = CpuFence(0);
+        let pending = old
+            .policy
+            .issue_fills(pool, vec![op.ticket], &mut fence, &mut |_| Ok(()))
+            .unwrap();
+        let done = old
+            .policy
+            .complete_fills(pool, pending, &mut fence, true)
+            .unwrap()
+            .pop()
+            .expect("one completion");
+        fresh.policy.deliver_completion(pool, done).unwrap();
+        let summary = fresh.policy.plan_group(0, (0, 0)).unwrap();
+        assert_eq!((summary.published, summary.stale), (0, 1));
+        assert!(!fresh.policy.needs_retirement());
     }
 }
