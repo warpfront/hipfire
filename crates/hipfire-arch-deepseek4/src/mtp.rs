@@ -9,6 +9,7 @@ use crate::forward::{
     precompute_attn_state_batched, precompute_positions_batched, q_lora, weight_needs_fwht,
     Deepseek4Bindings, OloraSchedule,
 };
+use crate::routed_seal::{verify_binding, ExpertConsumer};
 use crate::rows_program::{self, RowSlots, RowsWindow};
 use hipfire_dispatch::pipeline::superop::SuperOpKind;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -61,6 +62,8 @@ pub fn mtp_forward(
     position: u32,
 ) -> Result<Vec<f32>, String> {
     let mtp_layer_idx = cfg.num_hidden_layers;
+    // The MTP head reads its own expert tables: verify its binding before touching state.
+    verify_binding(weights, mtp_layer_idx, ExpertConsumer::MtpDecode, None)?;
     // Steps 0–6: validate MTP weights + embed/norm/HC plumbing + attention.
     mtp_pre_ffn(cfg, weights, state, gpu, h_n, next_token, position)?;
     // FFN block (== ds4_moe_block_core at the MTP layer: mhc_pre(ffn) + shared
@@ -544,6 +547,9 @@ pub fn mtp_forward_ep(
     assert_eq!(h_n_per_rank.len(), n, "mtp_forward_ep: h_n_per_rank len");
     let hidden = cfg.hidden_size;
     let mtp_layer_idx = cfg.num_hidden_layers;
+    for weights in weights_per_rank {
+        verify_binding(weights, mtp_layer_idx, ExpertConsumer::MtpDecode, None)?;
+    }
 
     // 1. Per-rank pre-FFN (embed/norm/HC + attention), replicated. attn_stub
     //    reads state.n_tokens for the MTP-layer SWA ring slot → set it to
@@ -719,6 +725,8 @@ pub fn mtp_forward_batched(
     let hc_mult = cfg.hc_mult;
     let stream_len = hc_mult * hidden;
     let mtp_layer_idx = cfg.num_hidden_layers;
+    // The MTP head's rows program is its own reader of the head's expert tables.
+    verify_binding(weights, mtp_layer_idx, ExpertConsumer::MtpRows, None)?;
 
     // Lazy alloc state.mtp_last_hidden.
     if state.mtp_last_hidden.is_none() {

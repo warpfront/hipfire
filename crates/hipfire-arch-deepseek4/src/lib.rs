@@ -73,6 +73,8 @@ pub mod forward;
 pub mod mtp;
 pub use saddle_core::grammar::dsml as grammar;
 pub mod heterogeneous;
+#[cfg(feature = "lab")]
+pub mod lab_mapped;
 
 pub mod mtp_speculator;
 mod program;

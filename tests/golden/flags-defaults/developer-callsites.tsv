@@ -173,6 +173,7 @@ developer_callsite	*	HIPFIRE_DPM_WARMUP_SECS#developer_var=-
 developer_callsite	*	HIPFIRE_DRAFT_NOISE_EMBED_BATCH#developer_var=map_or(true, |v| v.trim() != "0")
 developer_callsite	*	HIPFIRE_DS4_DENSE_ACT_DIR#developer_var_os=-
 developer_callsite	*	HIPFIRE_DS4_EXPERT_OVERLAP#developer_var=as_deref.!=Ok("1")
+developer_callsite	*	HIPFIRE_DS4_EXPERT_SOURCE#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_DS4_REPLAY_INVENTORY#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DS4_REPLAY_SEQUENCE#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_DS4_ROUTE_DUMP#developer_var=is_ok

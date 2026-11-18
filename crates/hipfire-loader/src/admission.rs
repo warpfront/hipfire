@@ -672,6 +672,32 @@ pub(crate) fn partial_offload_refusal(
     }
 }
 
+/// Early refusal of `HIPFIRE_DS4_EXPERT_SOURCE=mapped` on a topology the pinned-host owner does
+/// not support (tp, pp, the mixed-GPU base load): the GPU-free half of the arch loader's
+/// admission, raised where the arch is dispatched. A DS4 source with the opt-in unset, and
+/// every other arch, passes untouched. `spill_support` is not consulted: dense spill stays
+/// refused for DS4 by `partial_offload_refusal`.
+pub(crate) fn deepseek4_expert_source_refusal(
+    arch_id: u32,
+    tp: usize,
+    pp: usize,
+    heterogeneous: bool,
+) -> Result<(), String> {
+    use hipfire_arch_deepseek4::expert_source::{
+        mapped_source_refusal, ExpertSourceMode, DS4_ARCH_ID,
+    };
+    if arch_id != DS4_ARCH_ID {
+        return Ok(());
+    }
+    mapped_source_refusal(
+        ExpertSourceMode::from_process()?,
+        arch_id,
+        tp,
+        pp,
+        heterogeneous,
+    )
+}
+
 /// The loader gate's sentences for each `SpillRefusal` dimension — verbatim
 /// from the hand-written checks this replaced (`{keys}` is the two budget
 /// keys; non-arch arms interpolate their own count).
@@ -3453,6 +3479,10 @@ pub fn admit_source_with_options(
     // `ep_experts` is `None`: every tp>1 load (the only expert-parallel
     // route) is refused by `spill_support`'s tp dimension first.
     partial_offload_refusal(arch_id, &source, tp, pp, None)?;
+    // DeepSeek V4's pinned-host expert source is a separate, explicit opt-in: its topology
+    // refusals surface here, before any teardown, and the arch loader re-admits it with the
+    // facts only it knows (file map, host RAM) before its first allocation.
+    deepseek4_expert_source_refusal(arch_id, tp, pp, hints.deepseek4_heterogeneous)?;
     let heterogeneous_reason = hints.deepseek4_heterogeneous && arch_id == 9;
     // Qwen4 owns its own VMM QSA layout and certification (gfx1151/gfx1201), so
     // its capability replaces the Qwen/KvCache predicates below; its

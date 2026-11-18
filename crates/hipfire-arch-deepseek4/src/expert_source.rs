@@ -49,8 +49,17 @@
 //! untouched: it gates dense-layer spill and still refuses arch 9, so enabling expert caching
 //! cannot admit arbitrary dense offload.
 //!
-//! No forward-path wiring lives here: binding the catalog to `RoutedSeal`, the tables and the
-//! window protocol is S6b.
+//! # The mapped owner (S6b)
+//!
+//! [`ExpertSourceMode`] is the explicit opt-in (`HIPFIRE_DS4_EXPERT_SOURCE=mapped`; the resident
+//! loader stays the default). Under it `arch.rs` admits the source before its first allocation,
+//! fills each group's two blobs into pinned host-mapped allocations with the resident loader's
+//! packed pread jobs, and pairs the source with those blobs in a [`Ds4MappedOwner`] (the host
+//! range of every blob, [`Ds4MappedOwner::bundle_spans`] per bundle, the observed pinned bytes to
+//! reconcile with [`Ds4ExpertSource::host_charge`]). `routed_seal.rs` binds one
+//! mutable-residency capability per group to the owner generation and the tables' catalog
+//! extents; the decode, hash, rows and MTP readers each verify it. The cache fill/evict engine
+//! and the window protocol are later slices: nothing here moves an expert after load.
 
 use std::fmt;
 
@@ -309,6 +318,12 @@ pub enum Ds4SourceError {
     Overflow {
         what: &'static str,
     },
+    /// The pinned blobs a loader reports do not match the source's catalog (wrong count, size,
+    /// null or overlapping host range).
+    Mapped {
+        group_id: u32,
+        what: &'static str,
+    },
 }
 
 impl fmt::Display for Ds4SourceError {
@@ -395,6 +410,10 @@ impl fmt::Display for Ds4SourceError {
                 key.group_id, key.expert_id, key.owner_id, key.owner_generation
             ),
             Self::Overflow { what } => write!(f, "deepseek4 expert source: {what} overflows"),
+            Self::Mapped { group_id, what } => write!(
+                f,
+                "deepseek4 expert source: group {group_id} mapped owner: {what}"
+            ),
         }
     }
 }
@@ -1073,6 +1092,304 @@ pub fn expert_cache_support(topology: &Topology) -> Result<(), Ds4Refusal> {
 /// unreadable `MemAvailable` refuses.
 pub fn check_host_ram(charge: &HostCharge, ram: PinnableHostRam) -> Result<(), Ds4Refusal> {
     ram.admit(charge.total()).map_err(Ds4Refusal::HostRam)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Opt-in and loader-side admission
+// ---------------------------------------------------------------------------------------------
+
+/// Developer opt-in of the pinned-host canonical owner: `mapped` loads each layer's routed
+/// experts into the host-mapped blobs [`Ds4MappedOwner`] describes; unset or `resident` keeps
+/// the device-resident loader byte for byte.
+pub const EXPERT_SOURCE_ENV: &str = "HIPFIRE_DS4_EXPERT_SOURCE";
+
+/// Where a DS4 load places its routed experts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExpertSourceMode {
+    /// One device blob per layer and projection group (the incumbent loader).
+    #[default]
+    Resident,
+    /// Pinned host-mapped blobs the kernels read over PCIe: the canonical owner of the shared
+    /// expert cache ([`Ds4MappedOwner`]).
+    Mapped,
+}
+
+impl ExpertSourceMode {
+    /// `None` / empty / `resident` select [`Self::Resident`], `mapped` selects
+    /// [`Self::Mapped`]; any other spelling is an error naming the accepted values.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("") | Some("resident") => Ok(Self::Resident),
+            Some("mapped") => Ok(Self::Mapped),
+            Some(other) => Err(format!(
+                "{EXPERT_SOURCE_ENV}={other:?} is not recognized; accepted values are \
+                 \"resident\" (default) and \"mapped\""
+            )),
+        }
+    }
+
+    /// The mode the process asks for ([`EXPERT_SOURCE_ENV`] through the process snapshot).
+    pub fn from_process() -> Result<Self, String> {
+        Self::parse(
+            hipfire_config::developer_var(EXPERT_SOURCE_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    pub fn is_mapped(self) -> bool {
+        self == Self::Mapped
+    }
+}
+
+/// [`Ds4Refusal`] as one load sentence that names the exact byte counts of a host-RAM refusal
+/// next to the opt-in that asked for the owner.
+pub fn describe_refusal(refusal: &Ds4Refusal) -> String {
+    let mut text = format!("{EXPERT_SOURCE_ENV}=mapped: {refusal}");
+    if let Ds4Refusal::HostRam(HostRamShortfall {
+        host_bytes,
+        headroom,
+        ram,
+    }) = refusal
+    {
+        let required = host_bytes.saturating_add(*headroom);
+        match ram.mem_available {
+            Some(available) => text.push_str(&format!(
+                " (required {required} bytes = {host_bytes} pinned + {headroom} headroom, \
+                 available {available} bytes MemAvailable - CMA + {} bytes TTM page pool)",
+                ram.ttm_pool
+            )),
+            None => text.push_str(&format!(
+                " (required {required} bytes = {host_bytes} pinned + {headroom} headroom, \
+                 available: unreadable)"
+            )),
+        }
+    }
+    text
+}
+
+/// The loader's early, GPU-free refusal (`hipfire-loader` admission, before any teardown or GPU
+/// init): under [`ExpertSourceMode::Mapped`] a DS4 load must be single-GPU. It is the same
+/// [`expert_cache_support`] truth table the arch loader applies again with the facts only it
+/// knows (EP shards, keep-map, unified memory, host RAM). Another arch ignores the opt-in.
+pub fn mapped_source_refusal(
+    mode: ExpertSourceMode,
+    arch_id: u32,
+    tp: usize,
+    pp: usize,
+    heterogeneous: bool,
+) -> Result<(), String> {
+    if !mode.is_mapped() || arch_id != DS4_ARCH_ID {
+        return Ok(());
+    }
+    expert_cache_support(&Topology {
+        arch_id,
+        tp,
+        pp,
+        ep_experts: None,
+        reap_keep: false,
+        heterogeneous,
+        unified_memory: false,
+    })
+    .map_err(|refusal| describe_refusal(&refusal))
+}
+
+static NEXT_OWNER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A fresh owner generation: process-unique and never zero, so a reload can never be mistaken
+/// for the load it replaced.
+pub fn fresh_owner_generation() -> u64 {
+    NEXT_OWNER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The stable owner id of a model file: FNV-1a over its content fingerprint, so two loads of
+/// the same file share an id while their generations differ.
+pub fn owner_id_for(fingerprint: &str) -> u64 {
+    fingerprint
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
+// ---------------------------------------------------------------------------------------------
+// The mapped owner
+// ---------------------------------------------------------------------------------------------
+
+/// A byte range of pinned host memory (the allocation's logical length, not its tail pad).
+/// Plain data: nothing here dereferences it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostSpan {
+    pub addr: usize,
+    pub len: usize,
+}
+
+/// One pinned host-mapped blob of the canonical owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MappedBlob {
+    /// The device-visible alias of the pinned allocation: the base the layer's pointer table
+    /// entries hold.
+    pub device_address: u64,
+    /// The `hipHostMalloc` range the loader filled and the cache fills from.
+    pub host: HostSpan,
+}
+
+/// The two blobs of one group (the `gate_up` and `w2` blobs of the resident loader).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MappedGroup {
+    pub group_id: u32,
+    pub gate_up: MappedBlob,
+    pub down: MappedBlob,
+}
+
+/// Where one bundle's two segments live in the owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BundleSpans {
+    /// `w1 || w3` of the expert inside the gate/up blob.
+    pub gate_up: HostSpan,
+    /// `w2` of the expert inside the down blob.
+    pub down: HostSpan,
+    /// The addresses the layer's pointer tables hold for this expert.
+    pub gate_up_device: u64,
+    pub down_device: u64,
+}
+
+/// The source and the pinned blobs a loader filled from it: the canonical owner of one owner
+/// generation. Plain addresses (`Send + Sync`); the allocations themselves belong to the layer
+/// weights and live until unload.
+#[derive(Clone, Debug)]
+pub struct Ds4MappedOwner {
+    source: Ds4ExpertSource,
+    groups: Vec<MappedGroup>,
+}
+
+impl Ds4MappedOwner {
+    /// Pair `source` with the blobs of every one of its groups, in group order. Every blob must
+    /// have exactly the catalog region's length and a non-null host and device address, and no
+    /// two blobs (tail pads included) may share a byte.
+    pub fn new(source: Ds4ExpertSource, groups: Vec<MappedGroup>) -> Result<Self, Ds4SourceError> {
+        let n = source.geometry().n_experts as u64;
+        let bytes = *source.expert_bytes();
+        if groups.len() != source.groups().len() {
+            return Err(Ds4SourceError::Mapped {
+                group_id: 0,
+                what: "the loader reported a different number of groups than the source has",
+            });
+        }
+        let mut host: Vec<(usize, usize, u32)> = Vec::with_capacity(2 * groups.len());
+        let mut device: Vec<(u64, u64, u32)> = Vec::with_capacity(2 * groups.len());
+        for (group, expected) in groups.iter().zip(source.groups()) {
+            let bad = |what| Ds4SourceError::Mapped {
+                group_id: expected.group_id(),
+                what,
+            };
+            if group.group_id != expected.group_id() {
+                return Err(bad("groups are not in the source's group order"));
+            }
+            for (blob, len) in [
+                (&group.gate_up, n.checked_mul(bytes.gate_up())),
+                (&group.down, n.checked_mul(bytes.down)),
+            ] {
+                let len = len.ok_or(Ds4SourceError::Overflow {
+                    what: "mapped blob bytes",
+                })?;
+                if blob.host.len as u64 != len {
+                    return Err(bad("a blob is not the catalog region's length"));
+                }
+                if blob.host.addr == 0 || blob.device_address == 0 {
+                    return Err(bad("a blob has a null host or device address"));
+                }
+                host.push((blob.host.addr, blob.host.len, group.group_id));
+                device.push((blob.device_address, len, group.group_id));
+            }
+        }
+        host.sort_unstable();
+        for pair in host.windows(2) {
+            let end = pair[0]
+                .0
+                .saturating_add(pair[0].1 + HOST_TAIL_PAD_BYTES as usize);
+            if end > pair[1].0 {
+                return Err(Ds4SourceError::Mapped {
+                    group_id: pair[1].2,
+                    what: "two host blobs (tail pads included) share bytes",
+                });
+            }
+        }
+        device.sort_unstable();
+        for pair in device.windows(2) {
+            if pair[0].0.saturating_add(pair[0].1) > pair[1].0 {
+                return Err(Ds4SourceError::Mapped {
+                    group_id: pair[1].2,
+                    what: "two device aliases share bytes",
+                });
+            }
+        }
+        Ok(Self { source, groups })
+    }
+
+    pub fn source(&self) -> &Ds4ExpertSource {
+        &self.source
+    }
+
+    pub fn owner_id(&self) -> u64 {
+        self.source.owner_id()
+    }
+
+    pub fn owner_generation(&self) -> u64 {
+        self.source.owner_generation()
+    }
+
+    pub fn groups(&self) -> &[MappedGroup] {
+        &self.groups
+    }
+
+    pub fn group(&self, group_id: u32) -> Option<&MappedGroup> {
+        self.groups.iter().find(|group| group.group_id == group_id)
+    }
+
+    /// The pinned bytes the blobs actually hold (logical bytes plus one tail pad per blob), the
+    /// figure to reconcile against [`Ds4ExpertSource::host_charge`].
+    pub fn observed_charge(&self) -> HostCharge {
+        let allocations = 2 * self.groups.len();
+        let blob_bytes = self
+            .groups
+            .iter()
+            .map(|group| (group.gate_up.host.len + group.down.host.len) as u64)
+            .sum();
+        HostCharge {
+            blob_bytes,
+            tail_pad_bytes: HOST_TAIL_PAD_BYTES * allocations as u64,
+            allocations,
+        }
+    }
+
+    /// Where `key`'s bundle sits in the owner. Refuses a key of another owner id or generation
+    /// ([`Ds4SourceError::StaleOwner`]) and an unknown key.
+    pub fn bundle_spans(&self, key: &ExpertKey) -> Result<BundleSpans, Ds4SourceError> {
+        self.source.bundle_files(key)?;
+        let unknown = || Ds4SourceError::UnknownKey { key: *key };
+        let group = self.group(key.group_id).ok_or_else(unknown)?;
+        let bytes = self.source.expert_bytes();
+        let expert = u64::from(key.expert_id);
+        let slice = |blob: &MappedBlob, stride: u64| {
+            let offset = expert * stride;
+            (
+                HostSpan {
+                    addr: blob.host.addr + offset as usize,
+                    len: stride as usize,
+                },
+                blob.device_address + offset,
+            )
+        };
+        let (gate_up, gate_up_device) = slice(&group.gate_up, bytes.gate_up());
+        let (down, down_device) = slice(&group.down, bytes.down);
+        Ok(BundleSpans {
+            gate_up,
+            down,
+            gate_up_device,
+            down_device,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1826,5 +2143,218 @@ mod tests {
         assert!(Ds4Refusal::UnifiedMemory
             .to_string()
             .contains("unified memory"));
+    }
+
+    // ---- opt-in and loader admission -------------------------------------------------------
+
+    #[test]
+    fn the_opt_in_parses_strictly_and_defaults_to_resident() {
+        assert_eq!(ExpertSourceMode::default(), ExpertSourceMode::Resident);
+        for resident in [None, Some(""), Some("resident"), Some(" resident ")] {
+            assert_eq!(
+                ExpertSourceMode::parse(resident),
+                Ok(ExpertSourceMode::Resident)
+            );
+        }
+        for mapped in [Some("mapped"), Some(" mapped\n")] {
+            let mode = ExpertSourceMode::parse(mapped).unwrap();
+            assert_eq!(mode, ExpertSourceMode::Mapped);
+            assert!(mode.is_mapped());
+        }
+        let error = ExpertSourceMode::parse(Some("pinned")).unwrap_err();
+        assert!(error.contains(EXPERT_SOURCE_ENV), "{error}");
+        assert!(error.contains("\"mapped\""), "{error}");
+        assert!(ExpertSourceMode::parse(Some("Mapped")).is_err());
+    }
+
+    #[test]
+    fn loader_refusal_covers_the_topologies_the_owner_cannot_serve() {
+        use ExpertSourceMode::{Mapped, Resident};
+        // The default and every other arch pass untouched, whatever the topology.
+        assert_eq!(mapped_source_refusal(Resident, 9, 4, 2, true), Ok(()));
+        assert_eq!(mapped_source_refusal(Mapped, 6, 4, 2, true), Ok(()));
+        assert_eq!(mapped_source_refusal(Mapped, 9, 1, 1, false), Ok(()));
+        for (tp, pp, heterogeneous, needle) in [
+            (2, 1, false, "tp=2"),
+            (1, 2, false, "pp=2"),
+            (1, 1, true, "mixed-GPU"),
+        ] {
+            let error = mapped_source_refusal(Mapped, 9, tp, pp, heterogeneous).unwrap_err();
+            assert!(error.starts_with(EXPERT_SOURCE_ENV), "{error}");
+            assert!(error.contains(needle), "{error}");
+        }
+    }
+
+    #[test]
+    fn host_ram_refusal_names_the_available_and_required_bytes() {
+        let needed = 100u64;
+        let refusal = |mem_available, ttm_pool| {
+            Ds4Refusal::HostRam(HostRamShortfall {
+                host_bytes: needed,
+                headroom: HOST_RAM_HEADROOM_BYTES,
+                ram: ram(mem_available, ttm_pool),
+            })
+        };
+        let text = describe_refusal(&refusal(Some(50), 7));
+        let required = needed + HOST_RAM_HEADROOM_BYTES;
+        assert!(
+            text.contains(&format!("required {required} bytes")),
+            "{text}"
+        );
+        assert!(
+            text.contains("available 50 bytes MemAvailable - CMA + 7 bytes TTM page pool"),
+            "{text}"
+        );
+        let unreadable = describe_refusal(&refusal(None, 0));
+        assert!(unreadable.contains("available: unreadable"), "{unreadable}");
+        // Another refusal keeps its own sentence under the opt-in's name.
+        let other = describe_refusal(&Ds4Refusal::UnifiedMemory);
+        assert!(other.starts_with(EXPERT_SOURCE_ENV), "{other}");
+    }
+
+    #[test]
+    fn owner_generations_are_fresh_and_ids_follow_the_file() {
+        let (a, b) = (fresh_owner_generation(), fresh_owner_generation());
+        assert!(a != 0 && b != 0 && a != b);
+        assert_eq!(owner_id_for("fp-a"), owner_id_for("fp-a"));
+        assert_ne!(owner_id_for("fp-a"), owner_id_for("fp-b"));
+    }
+
+    // ---- the mapped owner ------------------------------------------------------------------
+
+    /// Disjoint fake blobs (never dereferenced) of the right lengths for every group.
+    fn fake_blobs(source: &Ds4ExpertSource) -> Vec<MappedGroup> {
+        let n = source.geometry().n_experts;
+        let bytes = *source.expert_bytes();
+        let blob = |slot: usize, len: usize| MappedBlob {
+            device_address: 0x7000_0000_0000 + ((slot as u64) << 32),
+            host: HostSpan {
+                addr: 0x1000_0000_0000 + (slot << 32),
+                len,
+            },
+        };
+        source
+            .groups()
+            .iter()
+            .enumerate()
+            .map(|(i, group)| MappedGroup {
+                group_id: group.group_id(),
+                gate_up: blob(2 * i, n * bytes.gate_up() as usize),
+                down: blob(2 * i + 1, n * bytes.down as usize),
+            })
+            .collect()
+    }
+
+    fn owned() -> Ds4MappedOwner {
+        let source = built(MtpSource::InBand);
+        let groups = fake_blobs(&source);
+        Ds4MappedOwner::new(source, groups).unwrap()
+    }
+
+    #[test]
+    fn the_observed_pinned_bytes_equal_the_admitted_charge() {
+        let owner = owned();
+        assert_eq!(owner.observed_charge(), owner.source().host_charge());
+        assert_eq!(owner.groups().len(), SMALL.trunk_layers + 1);
+        assert_eq!(owner.owner_generation(), GEN);
+    }
+
+    #[test]
+    fn no_bundle_is_pinned_so_every_expert_is_cacheable() {
+        let owner = owned();
+        let catalog = owner.source().catalog();
+        assert!(catalog.facts().is_fully_cacheable());
+        assert!(catalog.entries().all(|(_, bundle)| !bundle.pinned()));
+    }
+
+    #[test]
+    fn bundle_spans_address_one_expert_inside_each_blob() {
+        let owner = owned();
+        let bytes = *owner.source().expert_bytes();
+        let key = owner.source().key(1, 4);
+        let spans = owner.bundle_spans(&key).unwrap();
+        let group = owner.group(1).unwrap();
+        assert_eq!(spans.gate_up.len as u64, bytes.gate_up());
+        assert_eq!(spans.down.len as u64, bytes.down);
+        assert_eq!(
+            spans.gate_up.addr,
+            group.gate_up.host.addr + 4 * bytes.gate_up() as usize
+        );
+        assert_eq!(
+            spans.down.addr,
+            group.down.host.addr + 4 * bytes.down as usize
+        );
+        // The device addresses are the ones the layer's pointer-table entries hold.
+        assert_eq!(
+            spans.gate_up_device,
+            group.gate_up.device_address + 4 * bytes.gate_up()
+        );
+        assert_eq!(
+            spans.down_device,
+            group.down.device_address + 4 * bytes.down
+        );
+        // The last expert ends exactly at the blob's logical end.
+        let last = owner
+            .bundle_spans(&owner.source().key(1, SMALL.n_experts as u32 - 1))
+            .unwrap();
+        assert_eq!(
+            last.gate_up.addr + last.gate_up.len,
+            group.gate_up.host.addr + group.gate_up.host.len
+        );
+    }
+
+    #[test]
+    fn bundle_spans_refuse_a_stale_generation_and_unknown_keys() {
+        let owner = owned();
+        let mut stale = owner.source().key(0, 0);
+        stale.owner_generation += 1;
+        assert!(matches!(
+            owner.bundle_spans(&stale),
+            Err(Ds4SourceError::StaleOwner { .. })
+        ));
+        assert!(matches!(
+            owner.bundle_spans(&owner.source().key(99, 0)),
+            Err(Ds4SourceError::UnknownKey { .. })
+        ));
+        assert!(matches!(
+            owner.bundle_spans(&owner.source().key(0, SMALL.n_experts as u32)),
+            Err(Ds4SourceError::UnknownKey { .. })
+        ));
+    }
+
+    #[test]
+    fn the_owner_refuses_blobs_that_do_not_match_the_catalog() {
+        let source = built(MtpSource::InBand);
+        let good = fake_blobs(&source);
+        let new = |groups: Vec<MappedGroup>| Ds4MappedOwner::new(source.clone(), groups);
+        assert!(new(good.clone()).is_ok());
+
+        let mut missing = good.clone();
+        missing.pop();
+        assert!(matches!(new(missing), Err(Ds4SourceError::Mapped { .. })));
+
+        let mut short = good.clone();
+        short[2].down.host.len -= 1;
+        assert!(matches!(
+            new(short),
+            Err(Ds4SourceError::Mapped { group_id: 2, .. })
+        ));
+
+        let mut shuffled = good.clone();
+        shuffled.swap(0, 1);
+        assert!(matches!(new(shuffled), Err(Ds4SourceError::Mapped { .. })));
+
+        let mut null = good.clone();
+        null[0].gate_up.host.addr = 0;
+        assert!(matches!(new(null), Err(Ds4SourceError::Mapped { .. })));
+
+        // The tail pad counts: a blob starting inside its neighbour's pad overlaps it.
+        let mut padded = good.clone();
+        padded[0].down.host.addr = padded[0].gate_up.host.addr + padded[0].gate_up.host.len + 1;
+        assert!(matches!(new(padded), Err(Ds4SourceError::Mapped { .. })));
+
+        let mut aliased = good.clone();
+        aliased[1].gate_up.device_address = good[0].gate_up.device_address;
+        assert!(matches!(new(aliased), Err(Ds4SourceError::Mapped { .. })));
     }
 }

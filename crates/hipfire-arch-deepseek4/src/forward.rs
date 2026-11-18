@@ -30,7 +30,7 @@ use crate::deepseek4::{
 };
 use crate::heterogeneous::DeepseekV4HeterogeneousExecution;
 use crate::program::{self, LayerProgram, Mix};
-use crate::routed_seal::RoutedSeal;
+use crate::routed_seal::{score_consumer, verify_binding, ExpertConsumer, RoutedSeal};
 use crate::rows_program::{self, Observed, RowSlots, RowsWindow};
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use hipfire_dispatch::context::DispatchCtx;
@@ -3594,7 +3594,7 @@ fn ensure_routed_experts(
         RoutedSeal::ensure(
             &mut state.routed_seals,
             gpu,
-            weights.resolve_layer(layer_idx),
+            weights,
             layer_idx,
             cfg.hidden_size,
             im,
@@ -3628,8 +3628,13 @@ fn routed_experts_op<'a>(
             .gate_weight
             .as_ref()
             .ok_or_else(|| missing("gate.weight"))?;
-        let seal = RoutedSeal::find(&state.routed_seals, layer)
-            .ok_or_else(|| missing("sealed expert binding (ensure_routed_experts)"))?;
+        let seal = RoutedSeal::find(&state.routed_seals, weights, layer_idx)?;
+        let image = verify_binding(
+            weights,
+            layer_idx,
+            score_consumer(weights, layer_idx),
+            Some(seal.generation()),
+        )?;
         let ctx = state
             .routed_ctx
             .as_ref()
@@ -3694,7 +3699,9 @@ fn routed_experts_op<'a>(
             shared: None,
             expert_gate_up_ptrs: layer.expert_gate_up_ptrs.as_ref().unwrap(),
             expert_down_ptrs: layer.expert_w2_ptrs.as_ref().unwrap(),
-            expert_ptrs_host: None,
+            // Under a mapped owner the authorized image of the tables the kernels read; the
+            // resident loader keeps none.
+            expert_ptrs_host: image.map(|image| image.entries),
             expert_down_awq_ptrs: None,
             expert_dtype_tags: None,
             routed_gate_up_k: hidden,
@@ -3725,6 +3732,9 @@ fn routed_experts_op<'a>(
             layer: layer_idx,
         });
     }
+    // The hash decode reads the same pointer tables through its own kernel chain, so it
+    // verifies the mapped binding itself rather than relying on the score route's seal.
+    verify_binding(weights, layer_idx, ExpertConsumer::HashDecode, None)?;
     // Host-side bounds check (tid2eid_dev mirrors tid2eid_host).
     let row = (token_id as usize) * k;
     if row + k > layer.tid2eid_host.len() {
@@ -8078,6 +8088,7 @@ pub fn forward_ep_prefill_batch_chunked(
                             layer_idx < cfg.num_hash_layers,
                             rows_program::rows_projection(gpu, weights.mq2r_backend),
                             weights.mq2r_backend,
+                            Some(weights),
                         )?;
                     }
                     let observed = Observed::Layer(layer_idx, layer);

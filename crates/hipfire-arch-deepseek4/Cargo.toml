@@ -111,3 +111,7 @@ required-features = ["lab"]
 name = "ep_deepseek4"
 required-features = ["lab"]
 
+[[example]]
+name = "fn_ds4_mapped_parity"
+required-features = ["lab"]
+

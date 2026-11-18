@@ -50,6 +50,7 @@ use crate::forward::{
     ensure_compressor, ensure_final_norm_compute, final_norm_compute_op, layer_rope_params,
     PrefillBatchScratch, POS_SLOTS_PER_LAYER,
 };
+use crate::routed_seal::{rows_consumer, verify_binding};
 use crate::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 
 /// One window of rows.
@@ -329,6 +330,7 @@ pub(crate) fn rows_layer_program<'a>(
         layer_idx < cfg.num_hash_layers,
         projection,
         weights.mq2r_backend,
+        Some(weights),
     )?;
     push_mix(&mut program, cfg, pbs, gpu, true, rows);
     if let Some(slot) = capture_slot {
@@ -391,6 +393,7 @@ pub(crate) fn push_ffn<'a>(
     hash_routing: bool,
     projection: RowsProjection,
     backend: Mq2rBackend,
+    owner: Option<&DeepseekV4Weights>,
 ) -> Result<(), String> {
     program.push(
         Stage::HcPreFfn,
@@ -407,6 +410,7 @@ pub(crate) fn push_ffn<'a>(
             hash_routing,
             projection,
             backend,
+            owner,
         )?,
     );
     Ok(())
@@ -1278,6 +1282,7 @@ fn expert_ffn_rows<'a>(
     hash_routing: bool,
     projection: RowsProjection,
     backend: Mq2rBackend,
+    owner: Option<&DeepseekV4Weights>,
 ) -> Result<Step<'a>, String> {
     let rows = window.rows;
     let shared_w1 = layer.shared_w1.as_ref().unwrap();
@@ -1300,6 +1305,13 @@ fn expert_ffn_rows<'a>(
         // Hash layers without the static tid2eid table fall back to the
         // shared expert alone.
         && !(hash_routing && layer.tid2eid_host.is_empty());
+    // The batched rows kernels read the pointer tables themselves, so this reader verifies a
+    // mapped binding on its own (hash and score layers, trunk and MTP rows alike).
+    if do_routed {
+        if let Some(weights) = owner {
+            verify_binding(weights, layer_idx, rows_consumer(weights, layer_idx), None)?;
+        }
+    }
     let (router, routed) = if do_routed {
         let routing = if hash_routing {
             if window.tokens.len() < rows {
@@ -1744,6 +1756,8 @@ pub(crate) fn drafter_stage_program<'a>(
         false,
         projection,
         backend,
+        // A DSpark stage's experts are resident (the mapped owner refuses the sidecar).
+        None,
     )?;
     push_mix(&mut program, cfg, pbs, gpu, true, block);
     Ok(program)

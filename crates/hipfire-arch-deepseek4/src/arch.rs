@@ -229,6 +229,12 @@ impl DsparkLoadStaging {
         }
     }
 }
+use crate::expert_source::{
+    describe_refusal, expert_cache_support, fresh_owner_generation, owner_id_for, Ds4ExpertSource,
+    Ds4Geometry, Ds4MappedOwner, Ds4SourceError, ExpertSourceMode, HfqIndex, HostSpan, MappedBlob,
+    MappedGroup, MtpSource, TensorIndex, Topology, EXPERT_SOURCE_ENV,
+};
+use crate::routed_seal::MappedExperts;
 use hipfire_reap::hook::ReapArchHook;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
@@ -236,6 +242,13 @@ use hipfire_runtime::hfq_parallel::{read_hfq_jobs_ordered, HfqReadJob};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, bf16_to_f32};
 use rdna_compute::{DType, Gpu};
+
+/// Load-scoped state of the mapped canonical owner: the admitted source and the pinned blobs
+/// filled from it so far (in source group order).
+pub(crate) struct MappedLoad {
+    pub(crate) source: Ds4ExpertSource,
+    pub(crate) groups: Vec<MappedGroup>,
+}
 
 /// Preserve the HFQ wire dtype when uploading dense DeepSeek projections.
 ///
@@ -681,7 +694,284 @@ impl DeepseekV4 {
         Ok(())
     }
 
-    fn upload_layer_routed_experts(
+    /// `<stem>-dspark.<ext>` next to the base HFQ: the DSpark drafter sidecar's path.
+    fn dspark_sidecar_path(base: &std::path::Path) -> Option<std::path::PathBuf> {
+        match (base.parent(), base.file_stem(), base.extension()) {
+            (Some(parent), Some(file_stem), Some(ext)) => Some(parent.join(format!(
+                "{}-dspark.{}",
+                file_stem.to_string_lossy(),
+                ext.to_string_lossy()
+            ))),
+            _ => None,
+        }
+    }
+
+    /// Admission of [`ExpertSourceMode::Mapped`], before any GPU allocation: the topology truth
+    /// table ([`expert_cache_support`]), the source's file map over the HFQ tensor index (every
+    /// expert present, quant type 19, exact length, inside the file, no overlap) and the
+    /// pinned-host charge against `MemAvailable`. Returns `None` for the resident loader. Every
+    /// refusal is a contextual error naming what failed (a host-RAM refusal names the available
+    /// and required bytes); none falls back to the resident loader.
+    fn plan_mapped_experts(
+        mode: ExpertSourceMode,
+        hfq: &HfqFile,
+        mtp_addon: Option<&HfqFile>,
+        cfg: &DeepseekV4Config,
+        gpu: &Gpu,
+        shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+        heterogeneous: bool,
+        expert_layer_end: Option<usize>,
+    ) -> Result<Option<MappedLoad>, String> {
+        if !mode.is_mapped() {
+            return Ok(None);
+        }
+        let refuse = |why: String| format!("deepseek4: {EXPERT_SOURCE_ENV}=mapped: {why}");
+        let topology = Topology {
+            arch_id: <Self as Architecture>::arch_id(),
+            tp: 1,
+            pp: 1,
+            ep_experts: shard.map(|(shard, rank)| {
+                (0..cfg.n_routed_experts)
+                    .filter(|&e| shard.owns_expert(rank, e))
+                    .count()
+            }),
+            reap_keep: cfg.reap_keep.is_some(),
+            heterogeneous,
+            unified_memory: gpu.is_uma(),
+        };
+        expert_cache_support(&topology).map_err(|refusal| describe_refusal(&refusal))?;
+        if let Some(end) = expert_layer_end {
+            return Err(refuse(format!(
+                "cannot be combined with HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END={end}: the pinned \
+                 owner holds every layer's experts"
+            )));
+        }
+        if cfg.load_dspark {
+            if let Some(sidecar) = Self::dspark_sidecar_path(hfq.path()).filter(|p| p.exists()) {
+                return Err(refuse(format!(
+                    "the DSpark sidecar {sidecar:?} carries routed experts the owner does not \
+                     cover; turn speculation.dspark off (or remove the sidecar) for a mapped load"
+                )));
+            }
+        }
+        let geometry = Ds4Geometry {
+            hidden: cfg.hidden_size,
+            moe_intermediate: cfg.moe_intermediate_size,
+            n_experts: cfg.n_routed_experts,
+            trunk_layers: cfg.num_hidden_layers,
+        };
+        // The MTP head the load will attach: the same predicate `load_weights_inner` applies
+        // when it reads `mtp.0.norm.weight` (addon if present, else the base).
+        let mtp_file: &HfqFile = mtp_addon.unwrap_or(hfq);
+        let want_mtp = cfg.load_mtp
+            && cfg.reap_keep.is_none()
+            && mtp_file.find_tensor_info("mtp.0.norm.weight").is_some();
+        let addon_index = mtp_addon.map(HfqIndex);
+        let mtp = match (want_mtp, addon_index.as_ref()) {
+            (false, _) => MtpSource::None,
+            (true, Some(addon)) => MtpSource::Addon(addon as &dyn TensorIndex),
+            (true, None) => MtpSource::InBand,
+        };
+        let trunk = HfqIndex(hfq);
+        let source = Ds4ExpertSource::build(
+            owner_id_for(&trunk.fingerprint()),
+            fresh_owner_generation(),
+            geometry,
+            &trunk,
+            mtp,
+        )
+        .map_err(|error| refuse(error.to_string()))?;
+        let ram = hipfire_runtime::offload::pinnable_host_ram(Some(gpu));
+        let charge = source
+            .admit(&topology, ram)
+            .map_err(|refusal| describe_refusal(&refusal))?;
+        let bytes =
+            |value: Option<u64>| value.map_or_else(|| "unreadable".to_string(), |b| b.to_string());
+        eprintln!(
+            "deepseek4: {EXPERT_SOURCE_ENV}=mapped admitted: owner {:#x} generation {}, {} groups, \
+             pinned charge {} bytes ({} blob + {} tail pad, {} allocations), MemAvailable - CMA {} \
+             bytes + TTM page pool {} bytes",
+            source.owner_id(),
+            source.owner_generation(),
+            source.groups().len(),
+            charge.total(),
+            charge.blob_bytes,
+            charge.tail_pad_bytes,
+            charge.allocations,
+            bytes(ram.mem_available),
+            ram.ttm_pool,
+        );
+        Ok(Some(MappedLoad {
+            source,
+            groups: Vec::new(),
+        }))
+    }
+
+    /// Mapped-owner twin of [`Self::upload_layer_routed_experts_parallel`] for the single-GPU,
+    /// no-keep-map, whole-file load (`HIPFIRE_DS4_EXPERT_SOURCE=mapped`). The same packed pread
+    /// jobs fill the same two blobs, but each blob is a pinned host-mapped allocation the
+    /// kernels read over PCIe and a cache fills from: the blob bytes and the pointer-table
+    /// entries (`blob base + expert * stride`) equal the resident loader's, only the allocation
+    /// differs. Every tensor is first checked against the extent the source mapped (a wrong
+    /// file for this owner refuses before any allocation). Returns the pinned ranges of the two
+    /// blobs.
+    fn upload_layer_routed_experts_mapped(
+        hfq: &HfqFile,
+        gpu: &mut Gpu,
+        source: &Ds4ExpertSource,
+        group_id: u32,
+        layer: &mut DeepseekV4LayerWeights,
+    ) -> Result<MappedGroup, String> {
+        let group = source
+            .group(group_id)
+            .ok_or_else(|| format!("deepseek4: mapped expert source has no group {group_id}"))?;
+        let prefix = group.prefix().to_string();
+        let n = group.experts();
+        let bytes = *source.expert_bytes();
+        let (gate_up_stride, down_stride) = (bytes.gate_up() as usize, bytes.down as usize);
+        let mut w2_names = Vec::with_capacity(n);
+        let mut gate_up_names = Vec::with_capacity(2 * n);
+        for e in 0..n {
+            let files = group
+                .bundle(e as u32)
+                .ok_or_else(|| format!("deepseek4: {prefix} expert {e} missing from the source"))?;
+            for (part, extent) in [("w1", files.gate), ("w3", files.up), ("w2", files.down)] {
+                let name = format!("{prefix}.ffn.experts.{e}.{part}.weight");
+                let info = hfq
+                    .find_tensor_info(&name)
+                    .ok_or_else(|| format!("deepseek4: missing {name}"))?;
+                if info.data_offset as u64 != extent.offset || info.data_size as u64 != extent.len {
+                    return Err(format!(
+                        "deepseek4: {name} in {} is {} bytes at offset {}, the expert source \
+                         mapped {} bytes at offset {}: this file is not the owner's source file",
+                        hfq.path().display(),
+                        info.data_size,
+                        info.data_offset,
+                        extent.len,
+                        extent.offset
+                    ));
+                }
+                match part {
+                    "w2" => w2_names.push(name),
+                    _ => gate_up_names.push(name),
+                }
+            }
+        }
+        let jobs = [
+            HfqReadJob::packed(hfq, format!("{prefix}.w2"), &w2_names)
+                .map_err(|e| format!("deepseek4: plan {prefix}.w2: {e}"))?,
+            HfqReadJob::packed(hfq, format!("{prefix}.gate_up"), &gate_up_names)
+                .map_err(|e| format!("deepseek4: plan {prefix}.gate_up: {e}"))?,
+        ];
+        let mut buffers = read_hfq_jobs_ordered(hfq, &jobs)
+            .map_err(|e| format!("deepseek4: parallel expert read {prefix}: {e}"))?
+            .into_iter();
+        let w2_blob = buffers.next().expect("two planned expert jobs").data;
+        let gate_up_blob = buffers.next().expect("two planned expert jobs").data;
+        if w2_blob.len() != n * down_stride || gate_up_blob.len() != n * gate_up_stride {
+            return Err(format!(
+                "deepseek4: {prefix} packed blobs are {} / {} bytes, the catalog requires {} / {}",
+                w2_blob.len(),
+                gate_up_blob.len(),
+                n * down_stride,
+                n * gate_up_stride
+            ));
+        }
+
+        // Attach each allocation before the next fallible operation, exactly as the resident
+        // loader does, so the caller's layer transaction reclaims a partial group.
+        layer.expert_w2_blob = Some(
+            gpu.upload_raw_host_mapped(&w2_blob, &[n, down_stride])
+                .map_err(|e| format!("deepseek4: upload host-mapped blob {prefix}.w2: {e:?}"))?,
+        );
+        drop(w2_blob);
+        let down = Self::mapped_blob(
+            gpu,
+            layer.expert_w2_blob.as_ref().expect("w2 blob attached"),
+            &prefix,
+            "w2",
+        )?;
+        let w2_ptrs: Vec<u64> = (0..n)
+            .map(|e| down.device_address + (e * down_stride) as u64)
+            .collect();
+        layer.expert_w2_ptrs = Some(Self::upload_expert_ptr_table(
+            gpu,
+            &w2_ptrs,
+            &format!("{prefix}.w2"),
+        )?);
+        layer.expert_w2_stride = down_stride;
+        layer.expert_w2_ptr_entries = w2_ptrs;
+
+        layer.expert_gate_up_blob = Some(
+            gpu.upload_raw_host_mapped(&gate_up_blob, &[n, gate_up_stride])
+                .map_err(|e| {
+                    format!("deepseek4: upload host-mapped blob {prefix}.gate_up: {e:?}")
+                })?,
+        );
+        drop(gate_up_blob);
+        let gate_up = Self::mapped_blob(
+            gpu,
+            layer
+                .expert_gate_up_blob
+                .as_ref()
+                .expect("gate_up blob attached"),
+            &prefix,
+            "gate_up",
+        )?;
+        let gate_up_ptrs: Vec<u64> = (0..n)
+            .map(|e| gate_up.device_address + (e * gate_up_stride) as u64)
+            .collect();
+        layer.expert_gate_up_ptrs = Some(Self::upload_expert_ptr_table(
+            gpu,
+            &gate_up_ptrs,
+            &format!("{prefix}.gate_up"),
+        )?);
+        layer.expert_gate_up_stride = gate_up_stride;
+        layer.expert_gate_up_ptr_entries = gate_up_ptrs;
+        Ok(MappedGroup {
+            group_id,
+            gate_up,
+            down,
+        })
+    }
+
+    /// The pinned range and device alias of a host-mapped blob this `Gpu` owns.
+    fn mapped_blob(
+        gpu: &Gpu,
+        tensor: &rdna_compute::GpuTensor,
+        prefix: &str,
+        what: &str,
+    ) -> Result<MappedBlob, String> {
+        let host = gpu.host_bytes(tensor).ok_or_else(|| {
+            format!("deepseek4: {prefix}.{what} blob is not a registered host-mapped allocation")
+        })?;
+        Ok(MappedBlob {
+            device_address: tensor.buf.as_ptr() as u64,
+            host: HostSpan {
+                addr: host.as_ptr() as usize,
+                len: host.len(),
+            },
+        })
+    }
+
+    /// One device pointer table (`2 * n` F32 slots = `n` u64 addresses) holding `ptrs`.
+    fn upload_expert_ptr_table(
+        gpu: &mut Gpu,
+        ptrs: &[u64],
+        what: &str,
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        let table = gpu
+            .alloc_tensor(&[2 * ptrs.len()], DType::F32)
+            .map_err(|e| format!("deepseek4: alloc ptr table {what}: {e:?}"))?;
+        let table_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+        if let Err(e) = gpu.hip.memcpy_htod(&table.buf, &table_bytes) {
+            let _ = gpu.free_tensor(table);
+            return Err(format!("deepseek4: copy ptr table {what}: {e:?}"));
+        }
+        Ok(table)
+    }
+
+    pub(crate) fn upload_layer_routed_experts(
         hfq: &HfqFile,
         gpu: &mut Gpu,
         prefix: &str,
@@ -689,7 +979,48 @@ impl DeepseekV4 {
         layer: &mut DeepseekV4LayerWeights,
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
         keep: Option<&[u32]>,
+        mapped: Option<&mut MappedLoad>,
     ) -> Result<(), String> {
+        if let Some(mapped) = mapped {
+            // The mapped owner covers a whole, unshadowed, unsharded HFQ.
+            if hfq.has_overlay() {
+                return Err(Ds4SourceError::Overlay {
+                    file: hfq.path().display().to_string(),
+                }
+                .to_string());
+            }
+            if shard.is_some() || keep.is_some() {
+                return Err(format!(
+                    "deepseek4: {EXPERT_SOURCE_ENV}=mapped cannot be combined with EP sharding \
+                     or a REAP keep-map ({prefix})"
+                ));
+            }
+            if n_exp != mapped.source.geometry().n_experts {
+                return Err(format!(
+                    "deepseek4: {prefix} has {n_exp} routed experts, the mapped source was built \
+                     for {}",
+                    mapped.source.geometry().n_experts
+                ));
+            }
+            let group_id = mapped
+                .source
+                .groups()
+                .iter()
+                .find(|group| group.prefix() == prefix)
+                .map(|group| group.group_id())
+                .ok_or_else(|| {
+                    format!("deepseek4: the mapped expert source has no group for {prefix}")
+                })?;
+            let group = Self::upload_layer_routed_experts_mapped(
+                hfq,
+                gpu,
+                &mapped.source,
+                group_id,
+                layer,
+            )?;
+            mapped.groups.push(group);
+            return Ok(());
+        }
         if !hfq.has_overlay() {
             return Self::upload_layer_routed_experts_parallel(
                 hfq, gpu, prefix, n_exp, layer, shard, keep,
@@ -1164,6 +1495,7 @@ impl DeepseekV4 {
             layers,
             mtp_layer: None, // skipped by quantize per `mtp.` prefix; Phase 5 work.
             dspark: None,    // DSpark sidecar discovered+loaded in load_weights_inner.
+            expert_owner: None, // set by load_weights_inner when the load is mapped.
             _scaffold: (),
         })
     }
@@ -1193,7 +1525,8 @@ impl Architecture for DeepseekV4 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        Ok(Self::load_weights_inner(hfq, cfg, gpu, None, None, None)?.into_single())
+        let mode = ExpertSourceMode::from_process()?;
+        Ok(Self::load_weights_inner(hfq, cfg, gpu, None, None, None, mode)?.into_single())
     }
 
     fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
@@ -1585,7 +1918,25 @@ impl DeepseekV4 {
         shard: &hipfire_runtime::tp_shard::ShardConfig,
         rank: usize,
     ) -> Result<DeepseekV4Weights, String> {
-        Ok(Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)), None, None)?.into_single())
+        let mode = ExpertSourceMode::from_process()?;
+        Ok(
+            Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)), None, None, mode)?
+                .into_single(),
+        )
+    }
+
+    /// [`Architecture::load_weights`] with the routed-expert placement named by the caller
+    /// instead of read from `HIPFIRE_DS4_EXPERT_SOURCE`: [`ExpertSourceMode::Mapped`] loads
+    /// every routed expert into the pinned-host canonical owner
+    /// ([`DeepseekV4Weights::mapped_expert_owner`]) after the admission described in
+    /// [`crate::expert_source`]; [`ExpertSourceMode::Resident`] is the incumbent loader.
+    pub fn load_weights_expert_source(
+        hfq: &mut HfqFile,
+        cfg: &DeepseekV4Config,
+        gpu: &mut Gpu,
+        mode: ExpertSourceMode,
+    ) -> Result<DeepseekV4Weights, String> {
+        Ok(Self::load_weights_inner(hfq, cfg, gpu, None, None, None, mode)?.into_single())
     }
 
     /// Load the fixed MQ2R artifact directly onto its two exact device owners:
@@ -1618,8 +1969,17 @@ impl DeepseekV4 {
                     .into(),
             );
         }
-        Self::load_weights_inner(hfq, cfg, dense_gpu, None, Some(routed_gpu), None)?
-            .into_heterogeneous()
+        let expert_source = ExpertSourceMode::from_process()?;
+        Self::load_weights_inner(
+            hfq,
+            cfg,
+            dense_gpu,
+            None,
+            Some(routed_gpu),
+            None,
+            expert_source,
+        )?
+        .into_heterogeneous()
     }
 
     #[doc(hidden)]
@@ -1641,8 +2001,17 @@ impl DeepseekV4 {
                 "deepseek4 heterogeneous fault harness requires the exact admitted G2 route".into(),
             );
         }
-        Self::load_weights_inner(hfq, cfg, dense_gpu, None, Some(routed_gpu), Some(fault))?
-            .into_heterogeneous()
+        let expert_source = ExpertSourceMode::from_process()?;
+        Self::load_weights_inner(
+            hfq,
+            cfg,
+            dense_gpu,
+            None,
+            Some(routed_gpu),
+            Some(fault),
+            expert_source,
+        )?
+        .into_heterogeneous()
     }
 
     fn load_weights_inner(
@@ -1652,6 +2021,7 @@ impl DeepseekV4 {
         shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
         mut routed_gpu: Option<&mut Gpu>,
         heterogeneous_fault: Option<DeepseekV4HeterogeneousFault>,
+        expert_source: ExpertSourceMode,
     ) -> Result<DeepseekV4WeightStaging, String> {
         // Model identity and route identity are intentionally separate.
         // `.mq2r` fixes the exact P3 tensor recipe on every architecture.
@@ -1742,6 +2112,20 @@ impl DeepseekV4 {
                 None => None,
             }
         };
+
+        // Mapped canonical owner: topology, file map and host-RAM admission run here, before
+        // the first GPU allocation of this load. A refusal is a contextual error, never a
+        // silent fallback to the resident loader.
+        let mut mapped = Self::plan_mapped_experts(
+            expert_source,
+            hfq,
+            mtp_addon.as_ref(),
+            cfg,
+            gpu,
+            shard,
+            routed_gpu.is_some(),
+            expert_layer_end,
+        )?;
 
         let initial_weights = Self::load_weights_host_only_walk(hfq, cfg)?;
         let routed_weights = routed_gpu
@@ -2528,6 +2912,7 @@ impl DeepseekV4 {
                     layer,
                     shard,
                     keep,
+                    None,
                 )?;
             } else {
                 let layer = &mut weights.layers[l];
@@ -2539,6 +2924,7 @@ impl DeepseekV4 {
                     layer,
                     shard,
                     keep,
+                    mapped.as_mut(),
                 )?;
             }
             if heterogeneous_fault == Some(DeepseekV4HeterogeneousFault::AfterRoutedLayer(l)) {
@@ -2569,6 +2955,7 @@ impl DeepseekV4 {
                     mtp,
                     shard,
                     None, // MTP not loaded under REAP keep-map (see load_mtp guard)
+                    None,
                 )?;
             } else {
                 Self::upload_layer_routed_experts(
@@ -2579,8 +2966,38 @@ impl DeepseekV4 {
                     mtp,
                     shard,
                     None, // MTP not loaded under REAP keep-map (see load_mtp guard)
+                    mapped.as_mut(),
                 )?;
             }
+        }
+
+        // Seal the mapped owner: pair the admitted source with the pinned blobs just filled,
+        // reconcile the observed pinned bytes with the admitted charge, and bind one
+        // mutable-residency capability per group to the layers' tables.
+        if let Some(loaded) = mapped.take() {
+            let owner = Ds4MappedOwner::new(loaded.source, loaded.groups)
+                .map_err(|e| format!("deepseek4: {EXPERT_SOURCE_ENV}=mapped: {e}"))?;
+            let (charge, observed) = (owner.source().host_charge(), owner.observed_charge());
+            if charge != observed {
+                return Err(format!(
+                    "deepseek4: {EXPERT_SOURCE_ENV}=mapped: the pinned blobs hold {} bytes in {} \
+                     allocations, the admitted charge was {} bytes in {}",
+                    observed.total(),
+                    observed.allocations,
+                    charge.total(),
+                    charge.allocations
+                ));
+            }
+            let sealed = MappedExperts::seal(owner, &weights)?;
+            eprintln!(
+                "deepseek4: mapped expert owner sealed: generation {}, {} groups, {} bytes \
+                 pinned ({} allocations)",
+                sealed.owner_generation(),
+                sealed.owner().groups().len(),
+                observed.total(),
+                observed.allocations
+            );
+            weights.expert_owner = Some(std::sync::Arc::new(sealed));
         }
 
         // ── DSpark 3-stage drafter sidecar discovery ─────────────────────
@@ -2598,16 +3015,7 @@ impl DeepseekV4 {
                         .into(),
                 );
             }
-            let base = hfq.path();
-            let dspark_path: Option<std::path::PathBuf> =
-                match (base.parent(), base.file_stem(), base.extension()) {
-                    (Some(parent), Some(file_stem), Some(ext)) => Some(parent.join(format!(
-                        "{}-dspark.{}",
-                        file_stem.to_string_lossy(),
-                        ext.to_string_lossy()
-                    ))),
-                    _ => None,
-                };
+            let dspark_path = Self::dspark_sidecar_path(hfq.path());
             if let Some(p) = dspark_path.filter(|c| c.exists()) {
                 eprintln!("deepseek4: opening DSpark sidecar HFQ {p:?}");
                 let mut dspark_hfq = HfqFile::open(&p).map_err(|e| {
@@ -2865,6 +3273,7 @@ impl DeepseekV4 {
                         layer,
                         None,
                         None,
+                        None,
                     )?;
                     if s == last {
                         // Last stage carries the head-HC mix + final norm.
@@ -3118,7 +3527,8 @@ impl DeepseekV4 {
 
     /// Upload routed-expert blobs for one layer from a ModelSource.
     /// Mirrors `upload_layer_routed_experts` but sources from
-    /// `&dyn ModelSource`.
+    /// `&dyn ModelSource`. Resident only: `load_weights_from_safetensors` refuses
+    /// `HIPFIRE_DS4_EXPERT_SOURCE=mapped` before reaching it.
     fn upload_layer_routed_experts_from_source(
         source: &dyn ModelSource,
         gpu: &mut Gpu,
@@ -3313,6 +3723,14 @@ impl DeepseekV4 {
         cfg: &DeepseekV4Config,
         gpu: &mut Gpu,
     ) -> Result<DeepseekV4Weights, String> {
+        // The mapped owner's file map is built from an HFQ tensor index (byte extents of one
+        // file); a safetensors directory has none, so the opt-in refuses before any allocation.
+        if ExpertSourceMode::from_process()?.is_mapped() {
+            return Err(format!(
+                "deepseek4: {EXPERT_SOURCE_ENV}=mapped needs an HFQ model file: a safetensors \
+                 directory has no tensor index of file extents for the pinned owner's source map"
+            ));
+        }
         let expert_layer_end: Option<usize> =
             hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
                 .ok()
@@ -3338,6 +3756,7 @@ impl DeepseekV4 {
             layers,
             mtp_layer: None,
             dspark: None,
+            expert_owner: None,
             _scaffold: (),
         };
 

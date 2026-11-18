@@ -1262,10 +1262,19 @@ pub struct DeepseekV4Weights {
     /// `<stem>-dspark.<ext>` sidecar. Additive to `mtp_layer` — both can be
     /// present. `None` when no DSpark sidecar exists (silent no-op).
     pub dspark: Option<DsparkWeights>,
+    /// The pinned-host canonical owner of the routed experts and its per-layer
+    /// mutable-residency capabilities. `Some` only when the load opted into
+    /// `HIPFIRE_DS4_EXPERT_SOURCE=mapped`; `None` for the resident loader.
+    pub(crate) expert_owner: Option<std::sync::Arc<crate::routed_seal::MappedExperts>>,
     pub _scaffold: (),
 }
 
 impl DeepseekV4Weights {
+    /// The mapped canonical owner of this model's routed experts, `None` when they are resident.
+    pub fn mapped_expert_owner(&self) -> Option<&crate::expert_source::Ds4MappedOwner> {
+        self.expert_owner.as_deref().map(|mapped| mapped.owner())
+    }
+
     /// Look up the layer-shaped weight bundle by index. Resolves to
     /// `layers[idx]` for the main `0..num_hidden_layers` range and to
     /// `mtp_layer` for `idx == layers.len()`. Used by the per-layer
