@@ -543,11 +543,21 @@ fn run(a: &Args) -> R<Report> {
         _ => return Err("requires reviewed HFQ artifact".into()),
     };
     // Resolve the same fixed hot budget as the product loader; never clamp it.
+    // Both arms must name it explicitly (the reference check compares it); the
+    // value is whatever fits the card after the current loader's reserves.
+    let hot_budget =
+        hipfire_arch_qwen4::expert_hotset::HotsetBudget::from_env()?.select(u64::MAX)?;
     require(
-        hipfire_arch_qwen4::expert_hotset::HotsetBudget::from_env()?.select(u64::MAX)?
-            == 20000 * (1u64 << 20),
-        "requires exact matched 20000MiB hot budget",
+        hot_budget < u64::MAX && hot_budget % (1u64 << 20) == 0,
+        "requires an explicit fixed HIPFIRE_QWEN4_EXPERT_HOT_BUDGET_MIB",
     )?;
+    let hot_budget_mib = hot_budget >> 20;
+    if let Some(reference) = reference.as_ref() {
+        require(
+            reference.identity["hot_budget_mib"] == json!(hot_budget_mib),
+            "reference hot budget differs",
+        )?;
+    }
     require(
         hipfire_config::memory::ple_format() == hipfire_config::memory::PleFormatRequest::Q4,
         "requires reviewed q4 PLE",
@@ -828,7 +838,7 @@ fn run(a: &Args) -> R<Report> {
             coverage: json!({"cases":cells,"census_end":end,"donor_bytes":donor_bytes,"known_cancel":fault}),
             identity: json!({"model":a.model,"model_bytes":std::fs::metadata(&a.model).map_err(err)?.len(),
                 "loader":"production load_qwen4_rank","native_mtp":false,"max_k":0,
-                "hot_budget_mib":20000,"original_resident_experts":original_resident_experts,
+                "hot_budget_mib":hot_budget_mib,"original_resident_experts":original_resident_experts,
                 "partition_comparison":"original Resident entry tier+qtype pair+projection lengths bound to actual HFQ size/index; physical plan recorded separately",
                 "artifact_payload_sha256":"NOT_REHASHED_BY_THIS_TOOL; supervisor frozen artifact seal required",
                 "logits":"full-vocabulary F32 LE bits",
