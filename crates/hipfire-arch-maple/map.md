@@ -15,7 +15,7 @@ Maple-Preview 20B-A1B (`deepgrove/maple-preview`, `model_type: maple`, `arch_id`
 - **`intermediate_size` (4096) is a dead key** in this config; experts are 512 wide.
 - **`partial_rotary_factor` 0.5** — only the first 64 of 128 head dims rotate.
 - Layers are the typed `Step` program of [`src/program.rs`](src/program.rs) (#666 G17); `forward.rs` only stages scratch, positions and embeddings. The MoE is sealed (`MoeRecipe::SoftmaxRoutedNoShared` + an `MoeMq2Lloyd` declaration carrying the 7.0 clamp); the batched dense GEMM is `ProjectLadder::GroupedLloydF16`, the grouped MoE WMMA kernel driven as a single-expert case (`E=1`, zero tile ids, identity slot index, `x_row_div=1`). No new GPU kernels.
-- The expanded vs self-combining decode down is the shared MQ2-Lloyd policy (`HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=0` takes the residual down); `HIPFIRE_MAPLE_DOWN` and the `HIPFIRE_MAPLE_DUMP_ROUTER` probe are gone.
+- Decode always takes the expanded down + k8 combine; the self-combining residual down is no longer selectable. `HIPFIRE_MAPLE_DOWN` and the `HIPFIRE_MAPLE_DUMP_ROUTER` probe are gone.
 - Numerics regression gate is **mean KL 0.084**, not perplexity. Maple's absolute PPL (~54) is dominated by the model — the bf16 reference scores the same — so PPL would hide a real kernel regression inside its own noise.
 - Research probes under `examples/` are gated behind `--features lab`; build them with `cargo build -p hipfire-arch-maple --examples --features lab`.
 

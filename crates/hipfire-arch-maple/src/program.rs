@@ -361,8 +361,7 @@ impl<'a> LayerRefs<'a> {
             per_expert_down: None,
         };
         // Clamped SwiGLU `silu(min(gate, L)) * clamp(up, -L, L)`; the expanded
-        // down + k8 combine (HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=0: the
-        // self-combining residual down).
+        // down + k8 combine.
         let lloyd = MoeMq2Lloyd {
             swiglu_limit: cfg.swiglu_clamp,
             uses_atomic_down: false,
