@@ -37,34 +37,37 @@
 //! timeline: `record` enqueues a marker at the stream tail, `poll` is `Complete` iff the marker
 //! executed, `wait` runs the stream up to the marker unless the test set the stream's [`Wait`]
 //! mode to `Pending` (a wait that cannot finish) or `Stuck` (`Failed`, `Quiescence::Unknown`). The
-//! test can also bump a stream's incarnation (a recreated stream), make its event query fail, or
-//! make a backend LIE (`lie_complete`: an unsound backend, used only by positive controls).
+//! test can also bump a stream's incarnation (a recreated stream, or one recreated right after
+//! the next fence was recorded), make its event query fail, or make a backend LIE
+//! (`lie_complete`: an unsound backend, used only by positive controls).
 //!
 //! # The protocol driver ([`SimRank`])
 //!
 //! One rank of a 2-rank mesh sharing one [`PeerBoard`]. [`SimRank::retire`] runs the retirement
-//! `j` of `expert_unit_tail_rank.rs::retire_group` in its order, over the real objects:
+//! `j` of `expert_unit_tail_rank.rs::retire_group` over the real objects (the shared core owns
+//! the published generation and its lease):
 //!
-//! 1. fence the window of the published generation: `lease.enqueued(compute)` then
-//!    `finish_window(pending, compute)` -> `FencedWindow::into_generation()`. A fence that cannot
-//!    finish keeps the `PendingWindow` and the step reports [`Step::Blocked`]; an unknown fence
-//!    quarantines the generation and freezes the rank.
-//! 2. the D2H log is not modeled; the pending fill batches are polled with
+//! 1. the D2H log is not modeled; the pending fill batches are polled with
 //!    `complete_fills(batch, copy, false)` (the fill-overlap `wait_newest` only adds a wait: a
 //!    pending batch simply stays pending here, the stricter case) -> `FillComplete` tokens.
-//! 3. `policy.retire_generation(G, peers)`; in PEER mode `peers = Some((board, rank, j))`, the one
-//!    `released_through` call. A refusal returns the generation (kept, retried by the next step).
-//! 4. `retire_windows` / `retire_peer_windows` with the tokens and the `GenerationRetired`.
-//! 5. the table images (the backing's host side) are written from the decisions, the peer deltas
+//! 2. `policy.retire_windows(compute, peers, ..)`: the window fence of the published generation
+//!    (`lease.enqueued(compute)` then `finish_window`) and its retirement, in PEER mode with
+//!    `peers = Some((board, rank))` (the one `released_through` call at index `j`), then the
+//!    judging and the plan. A fence that cannot finish keeps the pending window in the core and
+//!    the step reports [`Step::Blocked`]; an unknown fence quarantines the generation and
+//!    freezes the rank; a refusal (a reader still registered in the window) is
+//!    [`Step::Refused`] and the next step retries.
+//! 3. the table images (the backing's host side) are written from the decisions, the peer deltas
 //!    are posted, taken (out of step -> freeze, no ack) and applied, and the changed images are
 //!    uploaded on the compute stream.
-//! 6. `policy.seal(backing, {epoch j, sub 0})` + `acquire_window_owned` -> the lease until the next
-//!    retirement; then the PEER ack (`board.ack`), which only records that the uploads were
-//!    ENQUEUED ([`Ack`] lets a test withhold or defer it).
-//! 7. the fills: with [`Cfg::with_gate`] a tables-ready marker is recorded on compute and the copy
+//! 4. `policy.finish_retirement(tables, ..)`: the victims' slots reclaim, the generation
+//!    `{epoch j, sub 0}` is sealed and leased until the next retirement; then the PEER ack
+//!    (`board.ack`), which only records that the uploads were ENQUEUED ([`Ack`] lets a test
+//!    withhold or defer it).
+//! 5. the fills: with [`Cfg::with_gate`] a tables-ready marker is recorded on compute and the copy
 //!    stream waits for it, then `policy.issue_fills(tickets, copy, enqueue)`.
 //!
-//! Not modeled: the fill-overlap deferral of step 7 (a later enqueue only makes the fills safer),
+//! Not modeled: the fill-overlap deferral of step 5 (a later enqueue only makes the fills safer),
 //! the log, the borrow restore copies (the borrow is exercised through `quiesce` / `lend_scratch`).
 //! The tables-ready gate is OFF by default: it only orders a fill after the SAME rank's earlier
 //! compute work, so leaving it out checks the stronger property (the fences and acks alone keep
@@ -77,8 +80,9 @@
 //!
 //! Each [`Variant`] breaks one rule of the protocol above and nothing else:
 //!
-//! * `EarlyFence`: the window fence is recorded BEFORE the window's final reader is enqueued
-//!   (`enqueued()` called early), so the fence completes without the reader.
+//! * `EarlyFence`: the window fence is recorded BEFORE the window's final reader is enqueued (the
+//!   backend hands the retirement a fence recorded earlier), so the fence completes without the
+//!   reader.
 //! * `LyingPeerFence`: the owner asks a [`PeerReaderFence`] that claims every peer acknowledged
 //!   (refill without the peers' acks).
 //! * `AckBeforeFence`: the peer acknowledges the owner's posts before fencing its own window.
@@ -88,7 +92,7 @@
 //!   its copy ran.
 //! * `TrustTokenNumbers`: a completion is accepted by its `(slot, fill_generation)` numbers (the
 //!   old pair API) instead of the policy's typed token, so a foreign token publishes the fill.
-//! * `UnleasedStage`: the stage reader reads the slots without holding a lease on the generation.
+//! * `UnleasedStage`: the stage reader reads the slots without registering in the window.
 //! * `ReleaseEarly`: the teardown frees the pool although the bank refused to close.
 
 use std::cell::{RefCell, RefMut};
@@ -96,19 +100,20 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use hipfire_runtime::expert_cache::{CacheError, ConsumerId, WindowConsumerPhase};
 use railgun::sealed_table::generation::{
     acquire_window, acquire_window_owned, finish_window, BlockReclaimed, Expert, FenceBackend,
-    FenceFailure, FenceState, FillComplete, FillTicket, FillsNotDone, GenerationId, LentBlock,
-    OwnedTableGeneration, PeerReaderFence, PendingFills, PendingOrQuarantined, PendingWindow,
-    QuarantinedWindow, ResidencyError, ScratchLoan, SlotBank, TableBacking, WindowReadLease,
+    FenceFailure, FenceState, FillComplete, FillTicket, FillsNotDone, GenerationId,
+    GenerationRetired, LentBlock, OwnedSlot, OwnedTableGeneration, PeerReaderFence, PendingFills,
+    ResidencyError, Resident, ScratchLoan, SlotBank, Staging, TableBacking,
 };
 use railgun::window::Quiescence;
 use railgun::Binding;
 
-use super::rig::{rig_pool, Rig, RIG_BLOCK, RIG_DOWN, RIG_GATE_UP, RIG_TABLE};
+use super::rig::{rig_policy, rig_pool, Rig, RIG_BLOCK, RIG_DOWN, RIG_GATE_UP, RIG_TABLE};
 use super::{
-    occupant_unit, EpUnitTailConfig, PeerBoard, PeerDelta, PeerTake, Retire, SlotPhase, TailPolicy,
-    UnitKey, WindowUse, RESERVE_RETIREMENTS,
+    occupant_unit, unit_occupant, EpUnitTailConfig, PeerBoard, PeerDelta, PeerTake, Retire,
+    SlotPhase, TailPolicy, UnitKey, WindowUse, RESERVE_RETIREMENTS,
 };
 
 const RANKS: usize = 2;
@@ -219,6 +224,13 @@ struct Stream {
     incarnation: u64,
     query_error: Option<Quiescence>,
     lie_complete: bool,
+    /// The next fence recorded on the stream is recorded on the incarnation the stream has now,
+    /// and the stream is recreated right after ([`Dev::recreate_after_next_record`]).
+    recreate_armed: bool,
+    /// Incarnation reads left before the armed recreation takes effect: the two reads around
+    /// the recording see the old incarnation, the first read after them the new one.
+    recreate_delay: u8,
+    recreate_now: bool,
 }
 
 type Shared = Rc<RefCell<Dev>>;
@@ -265,6 +277,9 @@ impl Dev {
                     incarnation: 1,
                     query_error: None,
                     lie_complete: false,
+                    recreate_armed: false,
+                    recreate_delay: 0,
+                    recreate_now: false,
                 })
                 .collect(),
             next_marker: 1,
@@ -315,6 +330,12 @@ impl Dev {
     /// The stream handle was recreated: its incarnation changes (queued ops stay).
     fn recreate(&mut self, stream: usize) {
         self.streams[stream].incarnation += 1;
+    }
+
+    /// The stream handle is recreated right after the next fence is recorded on it (the window
+    /// fence a retirement records and waits in one core call): the fence is stale when waited.
+    fn recreate_after_next_record(&mut self, stream: usize) {
+        self.streams[stream].recreate_armed = true;
     }
 
     /// The queued ops of `stream` are lost (without any incarnation change).
@@ -492,6 +513,10 @@ impl Dev {
 struct Backend {
     dev: Shared,
     stream: usize,
+    /// A fence recorded earlier ([`Backend::mark_early`]): the next `record` returns it instead
+    /// of recording a new one (the `EarlyFence` bug, expressed through the core's one-call
+    /// retirement).
+    preset: Option<u64>,
 }
 
 impl Backend {
@@ -499,24 +524,55 @@ impl Backend {
         Self {
             dev: Rc::clone(dev),
             stream,
+            preset: None,
         }
     }
-}
 
-// SAFETY: `record` queues a marker at the stream tail and `poll` / `wait` report `Complete` only
-// once that marker executed, i.e. after every op queued before it (the stream is FIFO). The one
-// exception is the test-only `lie_complete` knob, which breaks this contract ON PURPOSE: the
-// positive controls use it to prove the checker catches an unsound backend.
-unsafe impl FenceBackend for Backend {
-    fn incarnation(&self) -> u64 {
-        self.dev.borrow().streams[self.stream].incarnation
-    }
-
-    fn record(&mut self) -> Result<u64, FenceFailure> {
+    /// Record a fence NOW and hand it out as the next one `record` returns: the fence goes in
+    /// before the window's final consumer is enqueued.
+    fn mark_early(&mut self) {
         let mut dev = self.dev.borrow_mut();
         let id = dev.next_marker;
         dev.next_marker += 1;
         dev.push(self.stream, Op::Marker(id));
+        self.preset = Some(id);
+    }
+}
+
+// SAFETY: `record` queues a marker at the stream tail and `poll` / `wait` report `Complete` only
+// once that marker executed, i.e. after every op queued before it (the stream is FIFO). The
+// exceptions are the test-only `lie_complete` knob and the `preset` fence, which break this
+// contract ON PURPOSE: the positive controls use them to prove the checker catches an unsound
+// backend and a fence recorded before the final consumer.
+unsafe impl FenceBackend for Backend {
+    fn incarnation(&self) -> u64 {
+        let mut dev = self.dev.borrow_mut();
+        let stream = &mut dev.streams[self.stream];
+        if stream.recreate_delay > 0 {
+            stream.recreate_delay -= 1;
+            if stream.recreate_delay == 0 {
+                stream.recreate_now = true;
+            }
+        } else if stream.recreate_now {
+            stream.recreate_now = false;
+            stream.incarnation += 1;
+        }
+        stream.incarnation
+    }
+
+    fn record(&mut self) -> Result<u64, FenceFailure> {
+        if let Some(id) = self.preset.take() {
+            return Ok(id);
+        }
+        let mut dev = self.dev.borrow_mut();
+        let id = dev.next_marker;
+        dev.next_marker += 1;
+        dev.push(self.stream, Op::Marker(id));
+        let stream = &mut dev.streams[self.stream];
+        if stream.recreate_armed {
+            stream.recreate_armed = false;
+            stream.recreate_delay = 1;
+        }
         Ok(id)
     }
 
@@ -623,8 +679,8 @@ enum Step {
     Retired(Outcome),
     /// The window's fence cannot finish yet: nothing was retired, nothing changed.
     Blocked,
-    /// `retire_generation` refused (the generation came back and is retried by the next step).
-    Refused(ResidencyError),
+    /// The core refused the retirement (the published generation stays, the next step retries).
+    Refused(CacheError),
     /// A device error or an out-of-step peer post: the tail froze (sticky).
     Frozen(String),
 }
@@ -673,26 +729,18 @@ impl Cfg {
         self
     }
 
-    /// Generations are leased through shared leases ([`shared_lease`]) so that a stage reader can
-    /// hold a second lease on the published generation.
+    /// Stage readers register as consumers in the core's window book (a consumer that has not
+    /// joined keeps the generation from retiring): the core owns the published generation, so a
+    /// second lease on it is not available to the tests.
     fn with_shared(mut self) -> Self {
         self.shared = true;
         self
     }
 }
 
-/// A shared lease with a `'static` lifetime.
-fn shared_lease(generation: &OwnedTableGeneration) -> WindowReadLease<'static> {
-    let lease = acquire_window(generation).expect("an unquarantined generation");
-    // SAFETY: the lifetime parameter is a `PhantomData` borrow; the lease keeps its own `Arc` of
-    // the generation core, so it stays valid when the generation value moves (to `retire`).
-    // That is exactly the situation under test: a lease that outlives the owner's borrow.
-    unsafe { std::mem::transmute(lease) }
-}
-
 /// The bank of a policy.
 fn bank(policy: &TailPolicy) -> &SlotBank {
-    policy.bank.as_ref().expect("the tail's bank is open")
+    policy.bank().expect("the tail's bank is open")
 }
 
 /// The deltas a retirement posts for the peers.
@@ -712,15 +760,12 @@ fn peer_deltas(retire: &Retire) -> Vec<PeerDelta> {
 
 /// Queue the copies of `tickets` on the copy stream of `rank` and record the batch fence
 /// (`issue_fills`, the callback writes only the ticket's spans).
-fn enqueue_fills(
-    policy: &mut TailPolicy,
+fn fill_enqueue(
     dev: &Shared,
     rank: usize,
-    tickets: Vec<FillTicket>,
-    copy: &mut Backend,
-) -> Result<PendingFills, (Vec<FillTicket>, FenceFailure)> {
+) -> impl FnMut(&FillTicket) -> Result<(), String> + 'static {
     let dev = Rc::clone(dev);
-    let mut enqueue = move |ticket: &FillTicket| -> Result<(), String> {
+    move |ticket: &FillTicket| -> Result<(), String> {
         dev.borrow_mut().push(
             copy_stream(rank),
             Op::Fill {
@@ -731,21 +776,27 @@ fn enqueue_fills(
             },
         );
         Ok(())
-    };
+    }
+}
+
+fn enqueue_fills(
+    policy: &mut TailPolicy,
+    dev: &Shared,
+    rank: usize,
+    tickets: Vec<FillTicket>,
+    copy: &mut Backend,
+) -> Result<PendingFills, (Vec<FillTicket>, FenceFailure)> {
+    let mut enqueue = fill_enqueue(dev, rank);
     policy.issue_fills(tickets, copy, &mut enqueue)
 }
 
-/// Production's `abandon_retire_fills`: a retirement that fails before its fills are issued
-/// tells the bank its tickets will never be issued.
-fn abandon_retire_fills(policy: &mut TailPolicy, retire: Retire) {
-    policy.abandon_fills(retire.fills.into_iter().map(|op| op.ticket).collect());
-}
-
-/// One rank of the mesh: the real [`TailPolicy`] and the capabilities `retire_group` holds,
-/// driven step by step over the timeline.
+/// One rank of the mesh: the real [`TailPolicy`] (the shared core underneath owns the published
+/// generation and its lease) and the capabilities `retire_group` holds, driven step by step over
+/// the timeline.
 struct SimRank {
     r: usize,
     t: usize,
+    config: EpUnitTailConfig,
     policy: TailPolicy,
     dev: Shared,
     board: Arc<PeerBoard>,
@@ -758,20 +809,8 @@ struct SimRank {
     copy: Backend,
     stage: Backend,
     device: DeviceIdle,
-    backing: Option<TableBacking>,
-    /// The lease of the published generation (between retirements).
-    lease: Option<WindowReadLease<'static>>,
-    /// The published generation itself (shared-lease mode only).
-    generation: Option<OwnedTableGeneration>,
-    /// The window fence is recorded, the last reader not yet fenced.
-    pending: Option<PendingWindow<'static>>,
-    /// A fenced generation waiting for its retirement (also: refused, to be retried).
-    held: Option<OwnedTableGeneration>,
-    /// A generation whose window fence failed with unknown quiescence (kept alive, never retires).
-    #[allow(dead_code)]
-    parked: Option<QuarantinedWindow>,
-    /// The stage reader's lease on the published generation.
-    stage_pending: Option<PendingWindow<'static>>,
+    /// The stage reader's registration in the core's window book and the marker of its fence.
+    stage_reader: Option<(ConsumerId, u64)>,
     batches: VecDeque<PendingFills>,
     /// Completion tokens polled and not yet handed to the policy.
     completed: Vec<FillComplete>,
@@ -781,8 +820,6 @@ struct SimRank {
     /// `(slot, fill generation, unit)` of every fill the driver saw decided.
     issued: Vec<(usize, u64, UnitKey)>,
     frozen: Option<String>,
-    /// The last generation's window fenced and retired for a teardown.
-    retired_last: bool,
     /// The backing's host side: what the next upload writes.
     host_decode: Image,
     host_full: Image,
@@ -797,20 +834,11 @@ impl SimRank {
             fill_per_step: cfg.f,
             boundary_every: 1,
         };
-        let (block, spans) = rig_pool(cfg.t);
-        let mut policy = TailPolicy::new(config, false, HashMap::new(), cfg.peer, block, spans)
-            .map_err(|(_, error)| error)
-            .expect("the sim policy");
-        let backing = policy
-            .register_table_backing(vec![Binding {
-                base: RIG_TABLE,
-                bytes: 0x1000,
-            }])
-            .expect("the sim table backing");
         Self {
             r,
             t: cfg.t,
-            policy,
+            config,
+            policy: rig_policy(config, false, &HashMap::new(), cfg.peer, &[]),
             dev: Rc::clone(dev),
             board: Arc::clone(board),
             peer: cfg.peer,
@@ -824,20 +852,13 @@ impl SimRank {
             device: DeviceIdle {
                 dev: Rc::clone(dev),
             },
-            backing: Some(backing),
-            lease: None,
-            generation: None,
-            pending: None,
-            held: None,
-            parked: None,
-            stage_pending: None,
+            stage_reader: None,
             batches: VecDeque::new(),
             completed: Vec::new(),
             deferred_acks: Vec::new(),
             early: None,
             issued: Vec::new(),
             frozen: None,
-            retired_last: false,
             host_decode: Image::new(),
             host_full: Image::new(),
             sent_decode: Image::new(),
@@ -845,10 +866,12 @@ impl SimRank {
         }
     }
 
-    /// Warm start: fill, copy (synchronously), publish generation `{0, 0}`, upload the warm
-    /// table, post the seeds as retirement 0 (PEER).
+    /// Warm start: fill, copy (synchronously), publish the warm generation, upload the warm
+    /// table, post the seeds as retirement 0 (PEER). The seeds are a construction input of the
+    /// shared core, so the policy is rebuilt with them (nothing ran yet).
     fn seed(&mut self, units: &[UnitKey]) {
-        let fills = self.policy.seed(units).expect("seed");
+        self.policy = rig_policy(self.config, false, &HashMap::new(), self.peer, units);
+        let fills = self.policy.take_fills();
         let seeded: Vec<(UnitKey, usize)> = fills.iter().map(|op| (op.unit, op.slot)).collect();
         let tickets: Vec<FillTicket> = fills.into_iter().map(|op| op.ticket).collect();
         let done = if tickets.is_empty() {
@@ -863,12 +886,10 @@ impl SimRank {
                 .map_err(|_| "seed copy")
                 .expect("seed fills complete")
         };
-        let backing = self.backing.take().expect("the table backing");
-        let generation = self
+        let tables = self
             .policy
-            .finish_seed(done, backing)
-            .map_err(|(_, error)| error)
-            .expect("finish_seed");
+            .publish_warm(&mut self.compute, done)
+            .expect("publish_warm");
         let deltas: Vec<PeerDelta> = seeded
             .iter()
             .map(|&(unit, slot)| PeerDelta {
@@ -882,34 +903,20 @@ impl SimRank {
         }
         self.upload();
         self.dev.borrow_mut().run_all(compute_stream(self.r));
-        self.install(generation);
+        self.policy.seal_warm(tables).expect("seal_warm");
         if self.peer {
             self.board.post(self.r, 0, deltas);
         }
         self.sync_protected();
     }
 
-    /// Lease the generation the next window reads.
-    fn install(&mut self, generation: OwnedTableGeneration) {
-        if self.shared {
-            let lease = shared_lease(&generation);
-            self.generation = Some(generation);
-            self.lease = Some(lease);
-        } else {
-            self.lease = Some(
-                acquire_window_owned(generation)
-                    .map_err(|(_, error)| error)
-                    .expect("lease"),
-            );
-        }
-    }
-
-    /// The slots the published generation names (from its closure).
+    /// The slots the published generation names: the slots a live generation references (the
+    /// core keeps exactly one live generation per pool).
     fn published_slots(&self) -> Vec<u32> {
-        self.lease
-            .as_ref()
-            .map(|lease| lease.closure().slot_reads().map(|read| read.slot).collect())
-            .unwrap_or_default()
+        let bank = bank(&self.policy);
+        (0..self.t as u32)
+            .filter(|&slot| bank.refs(slot) > 0)
+            .collect()
     }
 
     /// Upload every host image that changed since its last upload (compute stream).
@@ -953,7 +960,7 @@ impl SimRank {
 
     /// Refresh the white-box set: slots a live generation or lease still references.
     fn sync_protected(&self) {
-        let Some(bank) = self.policy.bank.as_ref() else {
+        let Some(bank) = self.policy.bank() else {
             return;
         };
         let mut dev = self.dev.borrow_mut();
@@ -965,25 +972,12 @@ impl SimRank {
         }
     }
 
-    /// The window's fence is recorded NOW (`lease.enqueued`): normally by [`Self::retire`], after
-    /// the window's readers were enqueued.
-    fn record_window_fence(&mut self) {
-        if self.pending.is_some() {
-            return;
-        }
-        if let Some(lease) = self.lease.take() {
-            match lease.enqueued(&mut self.compute) {
-                Ok(pending) => self.pending = Some(pending),
-                Err((lease, _)) => self.lease = Some(lease),
-            }
-        }
-    }
-
     /// One window's forward: the readers of this rank's tables, queued on the compute stream.
     fn forward(&mut self) {
         if self.variant == Variant::EarlyFence {
-            // The bug: the last-read fence goes in before the final consumer is enqueued.
-            self.record_window_fence();
+            // The bug: the last-read fence goes in before the final consumer is enqueued (the
+            // retirement's one core call then hands out this fence instead of recording one).
+            self.compute.mark_early();
         }
         let mut dev = self.dev.borrow_mut();
         dev.push(
@@ -1004,19 +998,19 @@ impl SimRank {
         }
     }
 
-    /// A stage reader: reads the published generation's slots (its closure) on the stage stream
-    /// while holding a shared lease on the generation (`Cfg::with_shared`).
+    /// A stage reader: reads the published generation's slots on the stage stream while it is
+    /// registered as a consumer of the core's window (`Cfg::with_shared`): the window stays open,
+    /// so the generation cannot retire, until the reader's fence completed and it joined.
     fn stage_hold(&mut self) {
-        let lease = self.lease.as_ref().expect("a published generation");
-        let reads: Vec<(UnitKey, usize, u32)> = lease
-            .closure()
-            .slot_reads()
-            .map(|read| {
+        let reads: Vec<(UnitKey, usize, u32)> = self
+            .published_slots()
+            .into_iter()
+            .map(|slot| {
                 let unit = self
                     .policy
-                    .slot_unit(read.slot as usize)
+                    .slot_unit(slot as usize)
                     .expect("a published slot holds a unit");
-                (unit, self.r, read.slot)
+                (unit, self.r, slot)
             })
             .collect();
         self.dev.borrow_mut().push(
@@ -1029,30 +1023,35 @@ impl SimRank {
         if self.variant == Variant::UnleasedStage {
             return;
         }
-        let generation = self
-            .generation
-            .as_ref()
-            .expect("a stage lease needs Cfg::with_shared");
-        match shared_lease(generation).enqueued(&mut self.stage) {
-            Ok(pending) => self.stage_pending = Some(pending),
-            Err((_, failure)) => panic!("stage fence: {}", failure.message),
-        }
+        assert!(self.shared, "a stage consumer needs Cfg::with_shared");
+        let core = self.policy.core_mut();
+        core.begin_window().expect("the stage window opens");
+        let id = core
+            .register_consumer(0, WindowConsumerPhase::Decode, 0)
+            .expect("the stage consumer registers");
+        // The fence is recorded after the reader was enqueued.
+        let marker = self.stage.record().expect("stage fence");
+        self.stage_reader = Some((id, marker));
     }
 
-    /// The stage reader finished: wait its fence and release its lease. `false` while pending.
+    /// The stage reader finished: wait its fence and join it to the window. `false` while
+    /// pending.
     fn stage_finish(&mut self) -> bool {
-        let Some(pending) = self.stage_pending.take() else {
+        let Some((id, marker)) = self.stage_reader.take() else {
             return true;
         };
-        match finish_window(pending, &mut self.stage) {
-            Ok(_fenced) => true,
-            Err(PendingOrQuarantined::Pending(pending)) => {
-                self.stage_pending = Some(pending);
+        match self.stage.wait(marker) {
+            FenceState::Complete => {
+                let core = self.policy.core_mut();
+                core.join_consumer(id).expect("the stage consumer joins");
+                core.end_window(0).expect("the stage window ends");
+                true
+            }
+            FenceState::Pending => {
+                self.stage_reader = Some((id, marker));
                 false
             }
-            Err(PendingOrQuarantined::Quarantined(q)) => {
-                panic!("the stage fence quarantined: {:?}", q.failure())
-            }
+            FenceState::Failed(failure) => panic!("the stage fence failed: {failure:?}"),
         }
     }
 
@@ -1083,42 +1082,7 @@ impl SimRank {
         }
     }
 
-    /// Step 1: fence the window of the published generation.
-    fn fence_window(&mut self) -> Result<OwnedTableGeneration, Step> {
-        let pending = match self.pending.take() {
-            Some(pending) => pending,
-            None => {
-                let lease = self
-                    .lease
-                    .take()
-                    .ok_or_else(|| Step::Frozen("no published table generation".into()))?;
-                match lease.enqueued(&mut self.compute) {
-                    Ok(pending) => pending,
-                    Err((lease, failure)) => {
-                        self.lease = Some(lease);
-                        return Err(self.freeze(failure.message));
-                    }
-                }
-            }
-        };
-        match finish_window(pending, &mut self.compute) {
-            Ok(fenced) => Ok(match fenced.into_generation() {
-                Some(generation) => generation,
-                None => self.generation.take().expect("the shared-lease generation"),
-            }),
-            Err(PendingOrQuarantined::Pending(pending)) => {
-                self.pending = Some(pending);
-                Err(Step::Blocked)
-            }
-            Err(PendingOrQuarantined::Quarantined(q)) => {
-                let why = q.failure().message.clone();
-                self.parked = Some(q);
-                Err(self.freeze(why))
-            }
-        }
-    }
-
-    /// Step 2: poll the pending fill batches in issue order (stop at the first pending).
+    /// Step 1: poll the pending fill batches in issue order (stop at the first pending).
     fn poll_batches(&mut self) -> Result<Vec<FillComplete>, String> {
         let mut done = Vec::new();
         while let Some(batch) = self.batches.pop_front() {
@@ -1148,7 +1112,7 @@ impl SimRank {
         }
     }
 
-    /// One retirement (steps 1-7 of the module docs).
+    /// One retirement (steps 1-6 of the module docs).
     fn retire(&mut self, uses: &[WindowUse]) -> Step {
         let step = self.retire_steps(uses);
         self.sync_protected();
@@ -1162,41 +1126,14 @@ impl SimRank {
         if self.variant == Variant::AckBeforeFence && self.peer && self.early.is_none() {
             self.early_ack();
         }
-        // (1) the window fence of the published generation.
-        if self.held.is_none() {
-            match self.fence_window() {
-                Ok(generation) => self.held = Some(generation),
-                Err(step) => return step,
-            }
-        }
-        // (2) the batches that completed.
+        // (1) the batches that completed.
         match self.poll_batches() {
             Ok(done) => self.completed.extend(done),
             Err(why) => return self.freeze(why),
         }
-        // (3) retire the generation; in PEER mode the one `released_through` call.
-        let generation = self.held.take().expect("the fenced generation");
-        let at = self.policy.next_retirement();
-        let board = Arc::clone(&self.board);
-        let lying = LyingFence;
-        let fence: &dyn PeerReaderFence = if self.variant == Variant::LyingPeerFence {
-            &lying
-        } else {
-            &*board
-        };
-        let peers = self.peer.then_some((fence, self.r, at));
-        let (backing, retired) = match self.policy.retire_generation(generation, peers) {
-            Ok(done) => done,
-            Err((generation, error)) => {
-                self.held = Some(generation);
-                return Step::Refused(error);
-            }
-        };
-        // (4) the policy step.
-        let tokens = std::mem::take(&mut self.completed);
         if self.variant == Variant::TrustTokenNumbers {
             // The bug: a completion is believed by its (slot, generation) numbers.
-            for token in &tokens {
+            for token in &self.completed {
                 let numbers = (token.slot() as usize, token.fill_generation());
                 if let Some(&(_, _, unit)) = self
                     .issued
@@ -1207,29 +1144,41 @@ impl SimRank {
                 }
             }
         }
-        let retire = if self.peer {
-            self.policy
-                .retire_peer_windows((0, 0), uses, tokens, 1, &retired)
+        // (2) the window fence of the published generation and its retirement, then the policy
+        // step: one core call. In PEER mode the one `released_through` call.
+        let board = Arc::clone(&self.board);
+        let lying = LyingFence;
+        let fence: &dyn PeerReaderFence = if self.variant == Variant::LyingPeerFence {
+            &lying
         } else {
-            self.policy
-                .retire_windows((0, 0), uses, tokens, 1, &retired)
+            &*board
+        };
+        let peers = self.peer.then_some((fence, self.r));
+        let mut retire = match self.policy.retire_windows(
+            &mut self.compute,
+            peers,
+            (0, 0),
+            uses,
+            &mut self.completed,
+            1,
+        ) {
+            Ok(retire) => retire,
+            // The window's fence cannot finish yet: nothing was retired, nothing changed.
+            Err(CacheError::WindowFencePending { .. }) => return Step::Blocked,
+            // A device error or an unknown-quiescence fence: the generation is quarantined.
+            Err(CacheError::Fence { failure, .. }) => return self.freeze(failure.message),
+            Err(CacheError::Quarantined { pool }) => {
+                return self.freeze(format!("pool {} generation quarantined", pool.0))
+            }
+            Err(error) => return Step::Refused(error),
         };
         let j = self.policy.stats().retirements;
-        // (5) table images, peer post / take / apply, uploads.
+        // (3) table images, peer post / take / apply, uploads.
         for &(unit, slot) in &retire.publish {
             self.host_decode.insert(unit, (self.r, slot as u32));
         }
         for unit in &retire.unpublish {
             self.host_decode.remove(unit);
-        }
-        if self.variant == Variant::PublishBeforeFill {
-            // The bug: the entry names the slot as soon as the fill is decided.
-            for op in &retire.fills {
-                self.host_decode.insert(op.unit, (self.r, op.slot as u32));
-            }
-        }
-        for op in &retire.fills {
-            self.issued.push((op.slot, op.generation, op.unit));
         }
         let mut take = None;
         if self.peer {
@@ -1239,8 +1188,7 @@ impl SimRank {
             deltas.extend(fresh.deltas.iter().copied());
             let ahead = fresh.newest().is_some_and(|k| k > j);
             if ahead && self.variant != Variant::AckWithoutApply {
-                self.backing = Some(backing);
-                abandon_retire_fills(&mut self.policy, retire);
+                self.policy.abandon_decided();
                 return self.freeze(format!(
                     "peer posts through {:?} reached rank {} at its retirement {j}: the ranks' \
                      windows are out of step",
@@ -1254,16 +1202,23 @@ impl SimRank {
             take = Some(fresh);
         }
         self.upload();
-        // (6) seal, lease, ack.
-        let generation = match self.policy.seal(backing, GenerationId { epoch: j, sub: 0 }) {
-            Ok(generation) => generation,
-            Err((backing, error)) => {
-                self.backing = Some(backing);
-                abandon_retire_fills(&mut self.policy, retire);
-                return self.freeze(format!("sealing generation {j}: {error}"));
+        // (4) reclaim, seal, lease, ack.
+        let tables = self.policy.open_tables().expect("the tables are open");
+        if let Err(error) = self.policy.finish_retirement(tables, &mut retire) {
+            self.policy.abandon_decided();
+            return self.freeze(format!("sealing generation {j}: {error}"));
+        }
+        if self.variant == Variant::PublishBeforeFill {
+            // The bug: the entry names the slot as soon as the fill is decided (the fills of a
+            // retirement are only in hand once it is sealed: the entry goes up right after).
+            for op in &retire.fills {
+                self.host_decode.insert(op.unit, (self.r, op.slot as u32));
             }
-        };
-        self.install(generation);
+            self.upload();
+        }
+        for op in &retire.fills {
+            self.issued.push((op.slot, op.generation, op.unit));
+        }
         if let Some(take) = take {
             match self.ack {
                 Ack::Now => self.board.ack(self.r, j, &take),
@@ -1271,7 +1226,7 @@ impl SimRank {
                 Ack::Defer => self.deferred_acks.push((j, take)),
             }
         }
-        // (7) the fills.
+        // (5) the fills.
         let Retire {
             publish,
             unpublish,
@@ -1301,26 +1256,10 @@ impl SimRank {
 
     /// Fence and retire the last generation (production's `fence_and_retire`).
     fn retire_last(&mut self) -> Result<(), String> {
-        if self.retired_last {
-            return Ok(());
-        }
-        if self.held.is_none() {
-            match self.fence_window() {
-                Ok(generation) => self.held = Some(generation),
-                Err(step) => return Err(format!("the last window did not fence: {step:?}")),
-            }
-        }
-        let generation = self.held.take().expect("the fenced generation");
-        match self.policy.retire_generation(generation, None) {
-            Ok(_) => {
-                self.retired_last = true;
-                Ok(())
-            }
-            Err((generation, error)) => {
-                self.held = Some(generation);
-                Err(error.to_string())
-            }
-        }
+        self.policy
+            .retire_now(&mut self.compute)
+            .map(|_| ())
+            .map_err(|error| format!("the last window did not fence: {error}"))
     }
 
     /// Device idle, then close the bank (no window-fence check first).
@@ -1359,7 +1298,10 @@ impl SimRank {
             .policy
             .quiesce(&mut self.device)
             .map_err(|failure| ResidencyError::Refused(failure.message))?;
-        self.policy.lend_scratch(q)
+        self.policy.lend_scratch(q).map_err(|error| match error {
+            CacheError::Bank { error, .. } => error,
+            other => ResidencyError::Refused(other.to_string()),
+        })
     }
 }
 
@@ -1698,7 +1640,7 @@ fn race_delayed_stage_reader_refuses_retirement() {
     for _ in 0..2 {
         assert!(matches!(
             m.ranks[0].retire(&uses),
-            Step::Refused(ResidencyError::Refused(_))
+            Step::Refused(CacheError::WindowsOpen)
         ));
     }
     assert!(
@@ -2095,8 +2037,7 @@ fn race_stale_completion_and_stale_bind_never_publish() {
     let mut m = Mesh::new(Cfg::new(2, 2));
     m.seed(0, &[A, B]);
     m.ranks[0].forward();
-    m.ranks[0].record_window_fence();
-    m.dev().recreate(compute_stream(0));
+    m.dev().recreate_after_next_record(compute_stream(0));
     assert!(matches!(
         m.ranks[0].retire(&[hit(A), hit(C)]),
         Step::Frozen(_)
@@ -2154,11 +2095,16 @@ fn race_stale_fence_positive_control() {
 
 // 9. an old lease held while a refill is attempted -----------------------------------------------
 
-/// A non-peer rank driven by hand with two table backings, so that two generations can be live
-/// at once. Slots 0 and 1 hold `A` and `B` (fill generation 1), generation 0 names both.
+// The core owns one table backing and one live generation per pool, so two live generations
+// cannot exist through the policy: these two tests exercise the slot bank itself.
+
+/// A non-peer slot bank driven by hand with two table backings, so that two generations can be
+/// live at once. Slots 0 and 1 hold `A` and `B` (fill generation 1), generation 0 names both.
 struct Pipelined {
     dev: Shared,
-    policy: TailPolicy,
+    bank: SlotBank,
+    staging: Staging,
+    resident: Vec<OwnedSlot<Resident>>,
     g0: OwnedTableGeneration,
     spare: TableBacking,
     compute: Backend,
@@ -2166,49 +2112,71 @@ struct Pipelined {
     stage: Backend,
 }
 
+/// Queue the copies of `tickets` through the bank (the policy-less `enqueue_fills`).
+fn bank_enqueue_fills(
+    bank: &mut SlotBank,
+    dev: &Shared,
+    rank: usize,
+    tickets: Vec<FillTicket>,
+    copy: &mut Backend,
+) -> Result<PendingFills, (Vec<FillTicket>, FenceFailure)> {
+    let mut enqueue = fill_enqueue(dev, rank);
+    bank.issue_fills(tickets, copy, &mut enqueue)
+}
+
 impl Pipelined {
     fn new() -> Self {
         let dev = Dev::new(2);
-        let config = EpUnitTailConfig {
-            tail_units: 2,
-            fill_per_step: 2,
-            boundary_every: 1,
-        };
         let (block, spans) = rig_pool(2);
-        let mut policy = TailPolicy::new(config, false, HashMap::new(), false, block, spans)
+        let (mut bank, cells) = SlotBank::new(block, spans, false)
             .map_err(|(_, error)| error)
-            .expect("the policy");
+            .expect("the bank");
+        let mut staging = bank.staging();
         let table = |base| {
             vec![Binding {
                 base,
                 bytes: 0x1000,
             }]
         };
-        let t0 = policy
+        let t0 = bank
             .register_table_backing(table(RIG_TABLE))
             .expect("backing 0");
-        let spare = policy
+        let spare = bank
             .register_table_backing(table(RIG_TABLE + 0x1000))
             .expect("backing 1");
         let mut copy = Backend::new(&dev, copy_stream(0));
-        let tickets = policy
-            .seed(&[A, B])
-            .expect("seed")
-            .into_iter()
-            .map(|op| op.ticket)
-            .collect();
-        let batch = enqueue_fills(&mut policy, &dev, 0, tickets, &mut copy)
+        let mut filling = Vec::new();
+        let mut tickets = Vec::new();
+        for (free, unit) in cells.into_iter().zip([A, B]) {
+            let (slot, ticket) = bank
+                .start_fill(free, unit_occupant(unit))
+                .map_err(|(_, error)| error)
+                .expect("start fill");
+            filling.push(slot);
+            tickets.push(ticket);
+        }
+        let batch = bank_enqueue_fills(&mut bank, &dev, 0, tickets, &mut copy)
             .map_err(|(_, failure)| failure.message)
             .expect("seed issue");
         dev.borrow_mut().settle();
-        let done = policy
+        let mut done = bank
             .complete_fills(batch, &mut copy, true)
             .map_err(|_| "seed copy")
             .expect("seed complete");
-        let g0 = policy
-            .finish_seed(done, t0)
+        done.sort_by_key(|token| token.slot());
+        let mut resident = Vec::new();
+        for (filling, token) in filling.into_iter().zip(done) {
+            let slot = bank
+                .finish_fill(filling, token)
+                .map_err(|(_, _, error)| error)
+                .expect("finish fill");
+            bank.publish(&mut staging, &slot).expect("publish");
+            resident.push(slot);
+        }
+        let g0 = bank
+            .seal(&staging, t0, GenerationId { epoch: 0, sub: 0 })
             .map_err(|(_, error)| error)
-            .expect("finish_seed");
+            .expect("seal generation 0");
         dev.borrow_mut()
             .images
             .insert(Table::Decode(0), Image::from([(A, (0, 0)), (B, (0, 1))]));
@@ -2217,7 +2185,9 @@ impl Pipelined {
             stage: Backend::new(&dev, stage_stream(0)),
             copy,
             dev,
-            policy,
+            bank,
+            staging,
+            resident,
             g0,
             spare,
         }
@@ -2227,12 +2197,13 @@ impl Pipelined {
 /// Seal generation 1 (naming A and B again) through the spare backing, fence its window and
 /// retire it: the token of a retirement while generation 0 is still live.
 fn retire_pipelined_generation(
-    policy: &mut TailPolicy,
+    bank: &mut SlotBank,
+    staging: &Staging,
     spare: TableBacking,
     compute: &mut Backend,
-) -> railgun::sealed_table::generation::GenerationRetired {
-    let g1 = policy
-        .seal(spare, GenerationId { epoch: 1, sub: 0 })
+) -> GenerationRetired {
+    let g1 = bank
+        .seal(staging, spare, GenerationId { epoch: 1, sub: 0 })
         .map_err(|(_, error)| error)
         .expect("seal generation 1");
     let pending = acquire_window_owned(g1)
@@ -2246,8 +2217,7 @@ fn retire_pipelined_generation(
         .expect("generation 1 fenced")
         .into_generation()
         .expect("owned generation");
-    policy
-        .retire_generation(g1, None)
+    bank.retire(g1, None)
         .map_err(|(_, error)| error)
         .expect("retire generation 1")
         .1
@@ -2257,7 +2227,9 @@ fn retire_pipelined_generation(
 fn race_old_lease_blocks_reclaim_of_a_multiply_named_slot() {
     let Pipelined {
         dev,
-        mut policy,
+        mut bank,
+        mut staging,
+        mut resident,
         g0,
         spare,
         mut compute,
@@ -2278,38 +2250,43 @@ fn race_old_lease_blocks_reclaim_of_a_multiply_named_slot() {
         .map_err(|(_, failure)| failure.message)
         .expect("stage fence");
     // Generation 1 also names both slots, and retires while generation 0 is still live.
-    let retired1 = retire_pipelined_generation(&mut policy, spare, &mut compute);
-    let out = policy.retire_windows((0, 0), &[hit(A), hit(C)], vec![], 1, &retired1);
+    let retired1 = retire_pipelined_generation(&mut bank, &staging, spare, &mut compute);
     // B is evicted but its slot is still named by generation 0: the reclaim is refused, no fill.
-    assert_eq!(out.unpublish, vec![B]);
-    assert!(out.fills.is_empty());
-    assert_eq!(policy.refusals().0, 1, "{:?}", policy.refusals());
-    assert_eq!(policy.slot_phase(1), SlotPhase::Quarantined);
-    assert_eq!(bank(&policy).refs(1), 1);
+    let b = resident.pop().expect("B's slot");
+    let evicting = bank
+        .unpublish(&mut staging, b)
+        .map_err(|(_, error)| error)
+        .expect("unpublish B");
+    let evicting = match bank.reclaim(evicting, &retired1) {
+        Err((evicting, _refused)) => evicting,
+        Ok(_) => panic!("generation 0 still names B's slot: the reclaim must be refused"),
+    };
+    assert_eq!(bank.refs(1), 1);
     assert_eq!(dev.borrow().queued(copy_stream(0)), 0);
     assert_eq!(dev.borrow().slot_bytes[0], vec![Some(A), Some(B)]);
-    // The stage reader runs (intact bytes) and generation 0 retires: the slot reclaims at the
-    // next retirement and is refilled.
+    // The stage reader runs (intact bytes) and generation 0 retires: the slot reclaims and is
+    // refilled.
     finish_window(held, &mut stage)
         .map_err(|_| "stage fence")
         .expect("stage fenced");
-    let (_t0, retired0) = policy
-        .retire_generation(g0, None)
+    let (_t0, retired0) = bank
+        .retire(g0, None)
         .map_err(|(_, error)| error)
         .expect("retire generation 0");
-    let out = policy.retire_windows((0, 0), &[hit(A), hit(C)], vec![], 1, &retired0);
-    assert_eq!(
-        out.fills.iter().map(|op| op.key()).collect::<Vec<_>>(),
-        vec![(1, C, 2)]
-    );
-    assert!(out.unpublish.is_empty());
-    assert_eq!(policy.refusals().0, 1);
+    let free = bank
+        .reclaim(evicting, &retired0)
+        .map_err(|(_, error)| error)
+        .expect("the slot reclaims once generation 0 retired");
+    let (_filling, ticket) = bank
+        .start_fill(free, unit_occupant(C))
+        .map_err(|(_, error)| error)
+        .expect("start C's fill");
+    assert_eq!((ticket.slot(), ticket.fill_generation()), (1, 2));
     // The new table (A only) reaches the device before the fill runs.
-    let tickets = out.fills.into_iter().map(|op| op.ticket).collect();
     dev.borrow_mut()
         .images
         .insert(Table::Decode(0), Image::from([(A, (0, 0))]));
-    enqueue_fills(&mut policy, &dev, 0, tickets, &mut copy)
+    bank_enqueue_fills(&mut bank, &dev, 0, vec![ticket], &mut copy)
         .map_err(|(_, failure)| failure.message)
         .expect("fill issue");
     dev.borrow_mut().settle();
@@ -2321,7 +2298,9 @@ fn race_old_lease_blocks_reclaim_of_a_multiply_named_slot() {
 fn race_old_lease_positive_control() {
     let Pipelined {
         dev,
-        mut policy,
+        mut bank,
+        mut staging,
+        mut resident,
         g0,
         spare,
         mut compute,
@@ -2345,18 +2324,25 @@ fn race_old_lease_positive_control() {
         .map_err(|_| "stage fence")
         .expect("premature stage fence");
     // Generation 0 retires prematurely, so the reclaim of B's slot goes through.
-    policy
-        .retire_generation(g0, None)
+    bank.retire(g0, None)
         .map_err(|(_, error)| error)
         .expect("retire generation 0");
-    let retired1 = retire_pipelined_generation(&mut policy, spare, &mut compute);
-    let out = policy.retire_windows((0, 0), &[hit(A), hit(C)], vec![], 1, &retired1);
-    assert_eq!(
-        out.fills.iter().map(|op| op.key()).collect::<Vec<_>>(),
-        vec![(1, C, 2)]
-    );
-    let tickets = out.fills.into_iter().map(|op| op.ticket).collect();
-    enqueue_fills(&mut policy, &dev, 0, tickets, &mut copy)
+    let retired1 = retire_pipelined_generation(&mut bank, &staging, spare, &mut compute);
+    let b = resident.pop().expect("B's slot");
+    let evicting = bank
+        .unpublish(&mut staging, b)
+        .map_err(|(_, error)| error)
+        .expect("unpublish B");
+    let free = bank
+        .reclaim(evicting, &retired1)
+        .map_err(|(_, error)| error)
+        .expect("the premature retirement lets the reclaim through");
+    let (_filling, ticket) = bank
+        .start_fill(free, unit_occupant(C))
+        .map_err(|(_, error)| error)
+        .expect("start C's fill");
+    assert_eq!((ticket.slot(), ticket.fill_generation()), (1, 2));
+    bank_enqueue_fills(&mut bank, &dev, 0, vec![ticket], &mut copy)
         .map_err(|(_, failure)| failure.message)
         .expect("fill issue");
     dev.borrow_mut().run_all(copy_stream(0));
@@ -2474,14 +2460,14 @@ fn race_teardown_with_a_pending_window() {
         .close_idle()
         .expect_err("a live generation refuses close");
     assert!(refused.contains("generation"), "{refused}");
-    assert!(m.ranks[0].policy.bank.is_some());
+    assert!(m.ranks[0].policy.bank().is_some());
     assert_eq!(bank(&m.ranks[0].policy).live_generations(), 1);
     assert!(!m.dev.borrow().freed[0]);
     // The device idle ran the window's marker: the fence completes, the generation retires, the
     // bank closes and only then is the pool freed.
     assert!(m.ranks[0].release());
     assert!(m.dev.borrow().freed[0]);
-    assert!(m.ranks[0].policy.bank.is_none());
+    assert!(m.ranks[0].policy.bank().is_none());
     m.assert_clean();
 }
 

@@ -2,31 +2,33 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Test rig: drives a [`TailPolicy`] through the retirement protocol (window fence of the
-//! published generation, retirement, policy step, sealing, window lease, fill issue and
+//! Test rig: drives a [`TailPolicy`] through the retirement protocol (retirement of the
+//! published generation with its window fence, policy step, sealing, window lease, fill issue and
 //! completion) over an in-order fake device whose fences complete at once.
 //!
 //! The pre-migration policy tests (and the pin / peer simulations) fed the policy
 //! `(slot, generation)` completion pairs and a `released_through` closure. The rig keeps those
 //! call shapes: [`Rig::retire`] & co. take the same arguments and return the retirement's
-//! decisions, while the rig itself holds every capability the new API needs (the table backing,
-//! the generation under its lease, the fill tickets / pending fences) and produces the completion
-//! tokens from real `issue_fills` / `complete_fills` calls. A completion pair that names no issued
-//! fill (the old "stale completion" tests) is turned into a token of ANOTHER bank, which the
-//! policy must ignore and count as stale.
+//! decisions, while the rig itself holds every capability the policy needs (the fill tickets /
+//! pending fences) and produces the completion tokens from real `issue_fills` / `complete_fills`
+//! calls. A completion pair that names no issued fill (the old "stale completion" tests) is turned
+//! into a token of ANOTHER bank, which the policy must ignore and count as stale.
+//!
+//! The warm start is a construction input of the shared core (the seeds fill slots `0..` when the
+//! policy is built), so [`Rig::seed`] rebuilds the policy with the seeds: it runs before the first
+//! retirement, where the two are indistinguishable.
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
 use railgun::sealed_table::generation::{
-    acquire_window_owned, finish_window, BlockRegistry, Expert, FenceBackend, FenceFailure,
-    FenceState, FillComplete, GenerationId, PeerReaderFence, PendingFills, SlotBank, SlotSpan,
-    TableBacking, WindowReadLease,
+    BlockRegistry, Expert, FenceBackend, FenceFailure, FenceState, FillComplete, PeerReaderFence,
+    PendingFills, SlotBank, SlotSpan,
 };
 use railgun::Binding;
 
-use super::{EpUnitTailConfig, TailPolicy, UnitKey, WindowUse};
+use super::{EpUnitTailConfig, TailPolicy, TailPool, UnitKey, WindowUse};
 
 /// Bytes of one slot's gate/up extent and of its down extent in the rig's block.
 pub(crate) const RIG_GATE_UP: u64 = 0x1000;
@@ -35,6 +37,8 @@ pub(crate) const RIG_DOWN: u64 = 0x800;
 pub(crate) const RIG_BLOCK: u64 = 0x1000_0000;
 /// The pointer-table allocation every rig generation is published through.
 pub(crate) const RIG_TABLE: u64 = 0x7000_0000;
+/// Distinct units a rig policy can see (the core's use-log capacity).
+const RIG_UNITS: usize = 4096;
 
 /// An in-order fake stream: every fence completes at once. The simplest honest
 /// [`FenceBackend`] (the device timeline simulator of the race tests lives in `race`).
@@ -97,8 +101,9 @@ pub(crate) struct RigRetire {
 /// A policy plus the capabilities and fake device that drive it (see the module docs).
 pub(crate) struct Rig {
     pub(crate) policy: TailPolicy,
-    backing: Option<TableBacking>,
-    lease: Option<WindowReadLease<'static>>,
+    config: EpUnitTailConfig,
+    frozen: bool,
+    priority: HashMap<UnitKey, u32>,
     /// Issued fills not yet completed, one fence each: `(slot, generation)`.
     pending: Vec<((usize, u64), PendingFills)>,
     copy: Instant,
@@ -151,6 +156,35 @@ pub(crate) fn rig_pool(
     (block, spans)
 }
 
+/// A policy over `config.tail_units` rig slots with its pointer-table allocation, warm-started
+/// with `seed` (their fills are in `take_fills`).
+pub(crate) fn rig_policy(
+    config: EpUnitTailConfig,
+    frozen: bool,
+    priority: &HashMap<UnitKey, u32>,
+    peer: bool,
+    seed: &[UnitKey],
+) -> TailPolicy {
+    let (block, spans) = rig_pool(config.tail_units);
+    TailPolicy::new(
+        config,
+        frozen,
+        priority.clone(),
+        peer,
+        TailPool {
+            block,
+            spans,
+            tables: vec![Binding {
+                base: RIG_TABLE,
+                bytes: 0x1000,
+            }],
+            units: RIG_UNITS,
+        },
+        seed,
+    )
+    .expect("the rig policy")
+}
+
 impl Rig {
     /// A policy over `t = config.tail_units` rig slots; `peer` enables PEER quarantine.
     pub(crate) fn with_peer(
@@ -159,20 +193,11 @@ impl Rig {
         priority: HashMap<UnitKey, u32>,
         peer: bool,
     ) -> Rig {
-        let (block, spans) = rig_pool(config.tail_units);
-        let mut policy = TailPolicy::new(config, frozen, priority, peer, block, spans)
-            .map_err(|(_, error)| error)
-            .expect("the rig policy");
-        let backing = policy
-            .register_table_backing(vec![Binding {
-                base: RIG_TABLE,
-                bytes: 0x1000,
-            }])
-            .expect("the rig table backing");
         Rig {
-            policy,
-            backing: Some(backing),
-            lease: None,
+            policy: rig_policy(config, frozen, &priority, peer, &[]),
+            config,
+            frozen,
+            priority,
             pending: Vec::new(),
             copy: Instant::new(1),
             compute: Instant::new(2),
@@ -193,11 +218,18 @@ impl Rig {
         Self::with_peer(config, frozen, priority, false)
     }
 
-    /// Warm start: the first `T` of `units` fill slots `0..`, copy, complete and publish as
-    /// generation `{0, 0}`. Returns `(slot, unit, generation)` per seed.
+    /// Stop admitting (the old `frozen` field): kept across the warm-start rebuild of the policy.
+    pub(crate) fn freeze(&mut self) {
+        self.frozen = true;
+        self.policy.freeze();
+    }
+
+    /// Warm start: the first `T` of `units` fill slots `0..`, copy, complete and publish as the
+    /// warm generation. Returns `(slot, unit, generation)` per seed.
     pub(crate) fn seed(&mut self, units: &[UnitKey]) -> Vec<(usize, UnitKey, u64)> {
         assert!(!self.published, "seed before the first retirement");
-        let fills = self.policy.seed(units).expect("seed");
+        self.policy = rig_policy(self.config, self.frozen, &self.priority, self.peer, units);
+        let fills = self.policy.take_fills();
         let keys: Vec<_> = fills.iter().map(|op| op.key()).collect();
         let tickets = fills.into_iter().map(|op| op.ticket).collect();
         let pending = self
@@ -210,22 +242,16 @@ impl Rig {
             .complete_fills(pending, &mut self.copy, true)
             .map_err(|_| "seed fills complete")
             .expect("seed fills complete");
-        let backing = self.backing.take().expect("backing");
-        let generation = self
+        let tables = self
             .policy
-            .finish_seed(done, backing)
-            .map_err(|(_, error)| error)
-            .expect("finish_seed");
-        self.lease = Some(
-            acquire_window_owned(generation)
-                .map_err(|(_, e)| e)
-                .expect("lease"),
-        );
+            .publish_warm(&mut self.compute, done)
+            .expect("publish_warm");
+        self.policy.seal_warm(tables).expect("seal_warm");
         self.published = true;
         keys
     }
 
-    /// The first retirement of a rig that was never seeded publishes an empty generation `{0, 0}`.
+    /// The first retirement of a rig that was never seeded publishes an empty warm generation.
     fn ensure_published(&mut self) {
         if !self.published {
             self.seed(&[]);
@@ -294,7 +320,7 @@ impl Rig {
     }
 
     /// One retirement of `windows` windows. `peer`: the `released_through(m)` of the old peer
-    /// tests (asked once, by the bank's `retire`).
+    /// tests (asked once, by the core's retirement).
     fn step(
         &mut self,
         core: (u64, u64),
@@ -304,47 +330,25 @@ impl Rig {
         peer: Option<Box<dyn FnOnce(u64) -> u64 + '_>>,
     ) -> RigRetire {
         self.ensure_published();
-        // (1) the window fence of the published generation, (2) its retirement.
-        let lease = self.lease.take().expect("a published generation");
-        let pending = lease
-            .enqueued(&mut self.compute)
-            .map_err(|(_, f)| f.message)
-            .expect("record the last-read fence");
-        let fenced = finish_window(pending, &mut self.compute)
-            .map_err(|_| "the rig window fences at once")
-            .expect("finish_window");
-        let generation = fenced.into_generation().expect("owned generation");
-        let at = self.policy.next_retirement();
+        let mut tokens = self.tokens(completed);
         let once = peer.map(|f| OnceFence(Cell::new(Some(f))));
         let peers = once
             .as_ref()
-            .map(|fence| (fence as &dyn PeerReaderFence, 0usize, at));
-        let (backing, retired) = self
+            .map(|fence| (fence as &dyn PeerReaderFence, 0usize));
+        // (1) the window fence of the published generation and its retirement, (2) the policy
+        // step, (3) the seal over the (here: unwritten) tables, the lease.
+        let mut retire = self
             .policy
-            .retire_generation(generation, peers)
-            .map_err(|(_, e)| e)
-            .expect("retire_generation");
-        let tokens = self.tokens(completed);
-        let mut retire = if self.peer {
-            self.policy
-                .retire_peer_windows(core, window, tokens, windows, &retired)
-        } else {
-            self.policy
-                .retire_windows(core, window, tokens, windows, &retired)
-        };
+            .retire_windows(&mut self.compute, peers, core, window, &mut tokens, windows)
+            .map_err(|error| error.to_string())
+            .expect("retire_windows");
+        let tables = self.policy.open_tables().expect("the tables open");
+        self.policy
+            .finish_retirement(tables, &mut retire)
+            .map_err(|error| error.to_string())
+            .expect("finish_retirement");
         assert_eq!(self.policy.refusals().0, 0, "{:?}", self.policy.refusals());
-        // (6) seal over the written tables, lease; (7) issue the fills (one fence each).
-        let j = self.policy.stats().retirements;
-        let generation = self
-            .policy
-            .seal(backing, GenerationId { epoch: j, sub: 0 })
-            .map_err(|(_, e)| e)
-            .expect("seal");
-        self.lease = Some(
-            acquire_window_owned(generation)
-                .map_err(|(_, e)| e)
-                .expect("lease"),
-        );
+        // (4) issue the fills (one fence each).
         let fills: Vec<_> = std::mem::take(&mut retire.fills);
         let keys = fills.iter().map(|op| op.key()).collect();
         self.unissued.extend(fills);

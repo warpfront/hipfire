@@ -174,7 +174,7 @@ fn compare(
         .map(|op| (op.slot, op.unit, op.generation))
         .collect();
     same(at, "fills", &beta_fills, &rig_out.fills)?;
-    same(at, "stats", beta.stats(), rig.stats())?;
+    same(at, "stats", beta.stats(), &rig.stats())?;
     for slot in 0..beta.slots() {
         same(
             at,

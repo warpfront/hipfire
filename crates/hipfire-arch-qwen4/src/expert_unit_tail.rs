@@ -13,10 +13,11 @@
 //! are repointed at it, so a table entry is either canonical or a completed
 //! slot holding identical bytes: outputs stay exact by construction.
 //!
-//! This file is the pure part: the flag, the budget charge, the slot
-//! policy ([`TailPolicy`]) with its tickets and counters, and the cross-rank
-//! [`PeerBoard`] of the peer-visibility lever. It touches no device,
-//! environment (beyond the parse helpers) or plan; the rank's device part is
+//! This file is the pure part: the flag, the budget charge, the slot policy ([`TailPolicy`]: an
+//! adapter over the shared expert-cache core, `hipfire_runtime::expert_cache`, with the D2
+//! admission rules as an [`AdmissionStrategy`]) with its tickets and counters, and the
+//! cross-rank [`PeerBoard`] of the peer-visibility lever. It touches no device, environment
+//! (beyond the parse helpers) or plan; the rank's device part is
 //! [`crate::expert_unit_tail_rank`].
 //!
 //! # Guard
@@ -37,27 +38,29 @@
 //!
 //! # Generations, leases and the slot bank
 //!
-//! The policy owns the rank's [`SlotBank`] (railgun's generation-owned resource API): every slot
-//! is a typestate cell (`Free` -> `Filling` -> `Resident` -> `Evicting` -> `Free`, [`SlotCell`];
+//! The core owns the rank's [`SlotBank`] (railgun's generation-owned resource API): every slot is
+//! a typestate cell (`Free` -> `Filling` -> `Resident` -> `Evicting` -> `Free`;
 //! [`SlotPhase`] is the derived view), and a transition that could overwrite bytes a reader may
 //! still name needs a token that cannot be forged: [`FillComplete`] (a fill's copy fence
-//! completed) to publish, [`GenerationRetired`] (every generation naming the slot retired, and
-//! in PEER mode every peer fenced) to reclaim.
+//! completed) to publish, a retirement token (every generation naming the slot retired, and in
+//! PEER mode every peer fenced) to reclaim.
 //!
-//! * One immutable table GENERATION per retirement: the policy's staged membership (the
-//!   `Resident` slots) is sealed through the tail's table backing as generation `{ epoch j, sub
-//!   0 }` at retirement `j` (the warm start is epoch 0; a borrow resume re-seals `sub + 1`).
-//! * One WINDOW LEASE per generation, from its sealing until the next retirement's fence
-//!   (`acquire_window_owned`, `enqueued`, `finish_window`): every window and every forward the
-//!   rank enqueues on its compute stream in between reads that generation. Retirement `j`
-//!   fences the lease (the compute backend's wait is the stream synchronize the protocol always
-//!   did), retires generation `j - 1` ([`TailPolicy::retire_generation`]; PEER mode: the one
-//!   `released_through` call of the retirement, [`PeerReaderFence`]) and only then steps the
-//!   policy with the retirement token, so a victim's slot is reclaimable exactly when no
-//!   generation names it any more.
+//! * One immutable table GENERATION per retirement: the staged membership (the `Resident` slots)
+//!   is sealed through the tail's table backing as generation `{ epoch j, sub 0 }` at retirement
+//!   `j` (the warm start is epoch 0, sub 1; a borrow resume re-seals `sub + 1`). The core
+//!   retires only when something is pending, the tail retires EVERY group, so the peer clock `j`
+//!   is [`TailPolicy`]'s own group counter.
+//! * One WINDOW LEASE per generation, from its sealing until the next retirement's fence (the
+//!   core's `retire_generation_now`): every window and every forward the rank enqueues on its
+//!   compute stream in between reads that generation. Retirement `j` fences the lease (the
+//!   compute backend's wait is the stream synchronize the protocol always did), retires
+//!   generation `j - 1` (PEER mode: the one `released_through` call of the retirement,
+//!   [`PeerReaderFence`]) and only then plans the group ([`TailPolicy::retire_windows`]), so a
+//!   victim's slot is reclaimable exactly when no generation names it any more.
 //! * The table backing (the tables' write capability) exists only between the retirement of
 //!   generation `j - 1` and the sealing of generation `j`: table images are written and uploaded
-//!   only then.
+//!   only then, under the [`TablesOpen`] witness ([`TailPolicy::open_tables`]), which the sealing
+//!   ([`TailPolicy::finish_retirement`]) consumes.
 //! * An unfinished or dropped lease quarantines its generation (it can never retire, its slots
 //!   never reclaim); an unknown-quiescence fence failure quarantines the slots it guarded.
 //!
@@ -170,11 +173,15 @@ pub(crate) mod rig;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 
+use hipfire_runtime::expert_cache::{
+    AdmissionStrategy, CacheError, Candidate, CandidateSink, EvictMode, ExpertCachePolicy,
+    ExpertKey, Lookup, PassContext, PassPlan, PlanContext, PolicyConfig, PoolConfig, PoolId,
+    PoolInit, PoolMode, SlotPhase as CorePhase, Victim, WindowUse as CoreUse,
+};
 use railgun::sealed_table::generation::{
     BlockReclaimed, Expert, FenceBackend, FenceFailure, FillComplete, FillTicket, FillsNotDone,
-    GenerationId, GenerationRetired, LentBlock, OwnedTableGeneration, PeerReaderFence,
-    PendingFills, PendingRestore, Quiesced, ResidencyError, ScratchLoan, SlotBank, SlotCell,
-    SlotPhaseView, SlotSpan, Staging, TableBacking,
+    GenerationId, LentBlock, PeerReaderFence, PendingFills, PendingRestore, Quiesced,
+    ResidencyError, ScratchLoan, SlotBank, SlotSpan,
 };
 use railgun::Binding;
 
@@ -432,14 +439,30 @@ pub fn ep_unit_tail_budget_delta_mib(config: &EpUnitTailConfig, unit_bytes: u64)
 /// A unit: `(trunk layer, expert)`.
 pub type UnitKey = (u16, u16);
 
-/// The slot-bank occupant id of a unit: `layer * 65536 + expert`.
+/// The slot-bank occupant id of a unit: `layer << 32 | expert`, the id the shared cache core
+/// gives the key [`unit_key`] builds (`group_id << 32 | expert_id`).
 pub const fn unit_occupant(unit: UnitKey) -> u64 {
-    unit.0 as u64 * 65536 + unit.1 as u64
+    (unit.0 as u64) << 32 | unit.1 as u64
 }
 
 /// The unit a [`unit_occupant`] id names.
 pub const fn occupant_unit(occupant: u64) -> UnitKey {
-    ((occupant >> 16) as u16, (occupant & 0xffff) as u16)
+    ((occupant >> 32) as u16, (occupant & 0xffff_ffff) as u16)
+}
+
+/// The key of `unit` in the shared cache core: owner 0, generation 0, the layer as the group.
+fn unit_key(unit: UnitKey) -> ExpertKey {
+    ExpertKey {
+        owner_id: 0,
+        owner_generation: 0,
+        group_id: unit.0 as u32,
+        expert_id: unit.1 as u32,
+    }
+}
+
+/// The unit a [`unit_key`] names.
+fn key_unit(key: &ExpertKey) -> UnitKey {
+    (key.group_id as u16, key.expert_id as u16)
 }
 
 /// Lifecycle of one tail slot: the derived public view of the slot's typestate cell
@@ -457,20 +480,6 @@ pub enum SlotPhase {
     /// still name the slot, so its bytes must stay until every peer acknowledged the
     /// unpublication: neither free nor a victim (`OwnedSlot<Evicting>`).
     Quarantined,
-}
-
-/// One tail slot: its owned typestate cell and the policy's per-slot bookkeeping. The unit a
-/// slot holds and its fill generation are not stored here: they are the cell's `occupant` and
-/// `fill_generation`.
-struct Slot {
-    /// `None` only while a transition holds the cell by value.
-    cell: Option<SlotCell>,
-    /// The window (counted from 1) that last used the unit the slot holds.
-    last_used: u64,
-    /// Ranking position of the held unit (smaller = hotter), cached for victim ordering.
-    rank: u32,
-    /// The retirement the slot was evicted at (meaningful while `Quarantined`).
-    evicted_at: u64,
 }
 
 /// A copy the device part must start: `unit`'s canonical bytes into `slot`. The `ticket` is the
@@ -601,48 +610,6 @@ impl TailStats {
     }
 }
 
-/// The slot policy of one rank's tail: LRU eviction, admit-on-miss bounded by
-/// `F` fills per window, tickets, counters. It owns the rank's [`SlotBank`] (the slots as
-/// typestate cells, the staged generation membership): every slot transition goes through the
-/// bank's tokens, so a decision here can never overwrite a slot a live generation still names.
-pub struct TailPolicy {
-    config: EpUnitTailConfig,
-    frozen: bool,
-    /// PEER mode: evictions quarantine the slot instead of refilling it in the same retirement.
-    peer: bool,
-    /// `None` only after [`Self::close`] succeeded.
-    bank: Option<SlotBank>,
-    /// The membership of the NEXT generation: the `Resident` slots.
-    staging: Staging,
-    slots: Vec<Slot>,
-    /// Unit -> slot for slots that are `Filling` or `Live`.
-    index: HashMap<UnitKey, usize>,
-    /// Ranking position of a unit (smaller = hotter): the tie-break and, in
-    /// boundary mode, the prior of the heat.
-    priority: HashMap<UnitKey, u32>,
-    /// Boundary mode: decayed read heat of non-core units.
-    heat: HashMap<UnitKey, f32>,
-    window: u64,
-    stats: TailStats,
-    /// Transitions the bank refused (a protocol bug: never expected, fail closed). The device
-    /// part freezes the tail when this grows.
-    refusals: u64,
-    first_refusal: Option<String>,
-}
-
-impl std::fmt::Debug for TailPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TailPolicy")
-            .field("config", &self.config)
-            .field("frozen", &self.frozen)
-            .field("peer", &self.peer)
-            .field("slots", &self.slots.len())
-            .field("window", &self.window)
-            .field("stats", &self.stats)
-            .finish_non_exhaustive()
-    }
-}
-
 /// Heat decay per boundary (matches the LINKBYTES-D2 boundary design).
 const HEAT_DECAY: f32 = 0.8;
 /// A challenger must beat the victim's heat by this factor.
@@ -658,61 +625,220 @@ pub const QUARANTINE_WINDOWS: usize = 3;
 /// 3x was about 10 MiB/step of host reads worse at code C8 than 2x).
 pub const RESERVE_RETIREMENTS: usize = 2;
 
-/// Why a completion token did not publish its fill.
-enum CompletionError {
-    /// The slot is not `Filling` at that fill generation (or the token is another bank's): the
-    /// completion is ignored and counted.
-    Stale,
-    /// The bank refused a transition it should accept.
-    Refused(String),
+/// The tail's one pool inside its core.
+const POOL: PoolId = PoolId(0);
+
+/// The physical resources of the tail's pool, handed to the core at construction.
+pub struct TailPool {
+    /// The pool allocation (an `Expert` loan).
+    pub block: LentBlock<Expert>,
+    /// `spans[i]`: the write extents of slot `i`, block relative.
+    pub spans: Vec<Vec<SlotSpan>>,
+    /// The pointer-table allocations every generation is published through.
+    pub tables: Vec<Binding>,
+    /// An upper bound of the distinct units the tail can ever see (the core's use-log capacity).
+    pub units: usize,
+}
+
+/// The tables' write witness: it exists only while the pool's table backing is writable, from
+/// the retirement of the published generation until the next generation is sealed over the
+/// tables ([`TailPolicy::open_tables`]). Every table image write and upload takes `&TablesOpen`;
+/// sealing ([`TailPolicy::finish_retirement`], [`TailPolicy::reseal`], [`TailPolicy::seal_warm`])
+/// consumes it. The backing itself stays in the core ([`ExpertCachePolicy::backing`]).
+#[derive(Debug)]
+pub struct TablesOpen(());
+
+/// The D2 admission rules over the shared core's seam ([`AdmissionStrategy`]): per-window reads,
+/// the boundary heat mode (decayed `f32` heat, the boundary gate, the 10% hysteresis veto), the
+/// PEER quarantine (an eviction withdraws the victim without a target, capped at
+/// [`QUARANTINE_WINDOWS`] windows of fills) and the reserve of the saturated peer per-window mode.
+/// The core keeps every slot invariant; this only decides what is worth admitting.
+struct TailAdmission {
+    peer: bool,
+    boundary_every: u32,
+    /// Ranking position of a unit (smaller = hotter): the tie-break and, in boundary mode, the
+    /// prior of the heat.
+    priority: HashMap<UnitKey, u32>,
+    /// Boundary mode: decayed read heat of non-core units.
+    heat: HashMap<UnitKey, f32>,
+}
+
+impl TailAdmission {
+    fn boundary(&self) -> bool {
+        self.boundary_every > 1
+    }
+
+    fn rank_of(&self, unit: UnitKey) -> u32 {
+        self.priority.get(&unit).copied().unwrap_or(u32::MAX)
+    }
+
+    fn heat_of(&self, unit: UnitKey) -> f32 {
+        self.heat.get(&unit).copied().unwrap_or(0.0)
+    }
+}
+
+impl AdmissionStrategy for TailAdmission {
+    fn observe(&mut self, _ctx: &PlanContext, log: &[CoreUse]) {
+        if self.boundary() {
+            for used in log {
+                *self.heat.entry(key_unit(&used.key)).or_insert(0.0) += used.reads as f32;
+            }
+        }
+    }
+
+    fn open_gate(&mut self, ctx: &PlanContext) -> bool {
+        // Boundary mode admits when the group crossed a multiple of N WINDOWS (with one window
+        // per retirement: every Nth window).
+        !self.boundary() || ctx.crossed(self.boundary_every as u64)
+    }
+
+    fn score(&mut self, used: &CoreUse) -> f32 {
+        if self.boundary() {
+            self.heat_of(key_unit(&used.key))
+        } else {
+            used.reads as f32
+        }
+    }
+
+    fn extra_candidates(
+        &mut self,
+        _ctx: &PlanContext,
+        sink: &mut CandidateSink<'_>,
+    ) -> Result<(), CacheError> {
+        // Units hot over the interval but not missed in the last window. The sink drops the
+        // bound and the read ones; the core's candidate order makes the HashMap order moot.
+        if self.boundary() {
+            for (&unit, &heat) in &self.heat {
+                sink.push(unit_key(unit), POOL, self.rank_of(unit), heat)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn pass(&mut self, ctx: &PassContext) -> PassPlan {
+        if !self.peer {
+            return PassPlan::default();
+        }
+        // PEER per-window mode under SATURATED demand (at least `budget` candidates) keeps the
+        // reserve (module docs, RESERVE). Below saturation the candidate that has to evict waits
+        // (it is admitted if it misses again).
+        PassPlan {
+            evict: EvictMode::Quarantine,
+            quarantine_cap: QUARANTINE_WINDOWS * ctx.total_budget,
+            reserve_target: (!self.boundary() && ctx.candidates >= ctx.budget)
+                .then_some(RESERVE_RETIREMENTS * ctx.budget),
+        }
+    }
+
+    fn veto_victim(&mut self, candidate: &Candidate, victim: &Victim) -> bool {
+        self.boundary() && candidate.score < self.heat_of(key_unit(&victim.key)) * HEAT_HYSTERESIS
+    }
+
+    fn settled(&mut self, _ctx: &PlanContext, reached: bool) {
+        if self.boundary() && reached {
+            self.heat.retain(|_, h| {
+                *h *= HEAT_DECAY;
+                *h > 0.01
+            });
+        }
+    }
+}
+
+/// The slot policy of one rank's tail, an adapter over the shared cache core
+/// ([`ExpertCachePolicy`], one pool): the core owns the rank's [`SlotBank`] and every decision
+/// (LRU eviction, admit-on-miss bounded by `F` fills per window, tickets, counters); this type
+/// keeps what is the tail's own: the group counter of the peer clock, the unit <-> key mapping
+/// and the D2 admission rules ([`TailAdmission`]). Every slot transition goes through the
+/// bank's tokens, so a decision here can never overwrite a slot a live generation still names.
+pub struct TailPolicy {
+    config: EpUnitTailConfig,
+    /// PEER mode: evictions quarantine the slot instead of refilling it in the same retirement.
+    peer: bool,
+    core: ExpertCachePolicy,
+    admission: TailAdmission,
+    /// Retirements made so far: the peer clock `j` every rank counts alike (the core retires only
+    /// when something is pending, the tail retires every group).
+    retirements: u64,
+    /// Calls the core refused (a protocol bug: never expected, fail closed). The device part
+    /// freezes the tail on the first error it sees.
+    refusals: u64,
+    first_refusal: Option<String>,
+}
+
+impl std::fmt::Debug for TailPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TailPolicy")
+            .field("config", &self.config)
+            .field("peer", &self.peer)
+            .field("slots", &self.slots())
+            .field("retirements", &self.retirements)
+            .field("stats", &self.stats())
+            .finish_non_exhaustive()
+    }
 }
 
 impl TailPolicy {
-    /// `priority[unit]`: ranking position of every unit the rank may see
-    /// (smaller = hotter); an unknown unit sorts last. `block` is the rank's pool allocation
-    /// (adopted as an `Expert` loan) and `spans[i]` the write extents of slot `i`, block
-    /// relative; `peer` enables PEER quarantine (an evicted slot reclaims only once every peer
-    /// acknowledged: [`SlotBank::new`]'s `peer`). Every slot starts `Free` at fill generation 0.
+    /// `priority[unit]`: ranking position of every unit the rank may see (smaller = hotter); an
+    /// unknown unit sorts last. `pool` is the rank's pool allocation (adopted as an `Expert`
+    /// loan) with the write extents of every slot and the table allocations; `peer` enables PEER
+    /// quarantine. Warm start: the first `T` distinct of `seed` fill slots `0..` (fill generation
+    /// 1; their fills are in [`Self::take_fills`], the device part copies them and publishes
+    /// them all with [`Self::publish_warm`] before the first window), so window 1 sees exactly
+    /// what D1's static plan would hold. A `frozen` tail publishes but never admits.
     pub fn new(
         config: EpUnitTailConfig,
         frozen: bool,
         priority: HashMap<UnitKey, u32>,
         peer: bool,
-        block: LentBlock<Expert>,
-        spans: Vec<Vec<SlotSpan>>,
-    ) -> Result<Self, (LentBlock<Expert>, ResidencyError)> {
-        if spans.len() != config.tail_units {
-            return Err((
-                block,
-                ResidencyError::Refused(format!(
-                    "{} slot extents for {} tail slots",
-                    spans.len(),
-                    config.tail_units
-                )),
-            ));
-        }
-        let (bank, cells) = SlotBank::new(block, spans, peer)?;
-        let staging = bank.staging();
-        Ok(Self {
-            config,
-            frozen,
+        pool: TailPool,
+        seed: &[UnitKey],
+    ) -> Result<Self, CacheError> {
+        let slots = config.tail_units;
+        let admission = TailAdmission {
             peer,
-            bank: Some(bank),
-            staging,
-            slots: cells
-                .into_iter()
-                .map(|free| Slot {
-                    cell: Some(SlotCell::Free(free)),
-                    last_used: 0,
-                    rank: 0,
-                    evicted_at: 0,
-                })
-                .collect(),
-            index: HashMap::new(),
+            boundary_every: config.boundary_every,
             priority,
             heat: HashMap::new(),
-            window: 0,
-            stats: TailStats::default(),
+        };
+        let policy = PolicyConfig {
+            max_windows: RETIRE_MAX_WINDOWS,
+            fill_group_cap: FILL_GROUP_CAP,
+            use_log: pool.units.max(1),
+            completions: 2 * slots + 16,
+            parked: slots.max(1),
+            consumers: 1,
+            queues: 1,
+            ..PolicyConfig::default()
+        };
+        let init = PoolInit {
+            block: pool.block,
+            spans: pool.spans,
+            tables: pool.tables,
+            seed: seed
+                .iter()
+                .map(|&unit| (unit_key(unit), admission.rank_of(unit)))
+                .collect(),
+        };
+        let mut core = ExpertCachePolicy::new_with_modes(
+            policy,
+            vec![(
+                PoolConfig {
+                    slots,
+                    fills_per_window: config.fill_per_step,
+                },
+                init,
+            )],
+            &[PoolMode { peer }],
+        )?;
+        if frozen {
+            core.freeze();
+        }
+        Ok(Self {
+            config,
+            peer,
+            core,
+            admission,
+            retirements: 0,
             refusals: 0,
             first_refusal: None,
         })
@@ -722,307 +848,315 @@ impl TailPolicy {
         &self.config
     }
 
-    pub fn stats(&self) -> &TailStats {
-        &self.stats
+    /// The counters: the core's, with the tail's own retirement count.
+    pub fn stats(&self) -> TailStats {
+        let s = self.core.stats();
+        TailStats {
+            windows: s.windows,
+            retirements: self.retirements,
+            core_reads: s.core_reads,
+            core_distinct: s.core_distinct,
+            tail_reads: s.tail_reads,
+            tail_distinct: s.tail_distinct,
+            host_reads: s.host_reads,
+            host_distinct: s.host_distinct,
+            fills_issued: s.fills_issued,
+            fills_published: s.fills_published,
+            evictions: s.evictions,
+            skipped_full: s.skipped_full,
+            stale_completions: s.stale_completions,
+            quarantined: s.quarantined,
+        }
     }
 
     pub fn slots(&self) -> usize {
-        self.slots.len()
+        self.core.slots(POOL).unwrap_or(0)
     }
 
-    /// How many bank transitions were refused (never expected; the device part freezes the tail
-    /// when it grows) and the first refusal's message.
+    /// How many core calls were refused (never expected; the device part freezes the tail on the
+    /// first error) and the first refusal's message.
     pub fn refusals(&self) -> (u64, Option<&str>) {
         (self.refusals, self.first_refusal.as_deref())
     }
 
     /// The retirement index the next retirement will have (`stats().retirements + 1`): the
-    /// `at` of `bank.retire`'s peer fence and the epoch its generation is sealed under.
+    /// `at` of the bank's peer fence and the epoch its generation is sealed under.
     pub fn next_retirement(&self) -> u64 {
-        self.window + 1
+        self.retirements + 1
+    }
+
+    /// Stop admitting: retirements still publish the completed fills ([`Self::new`]'s `frozen`).
+    pub fn freeze(&mut self) {
+        self.core.freeze();
     }
 
     /// The slot that serves `unit` now (`Live` only).
     pub fn live_slot(&self, unit: UnitKey) -> Option<usize> {
-        let slot = *self.index.get(&unit)?;
-        (self.phase_of(slot) == SlotPhase::Live).then_some(slot)
+        match self.core.lookup(unit_key(unit)) {
+            Lookup::Published { slot, .. } => Some(slot as usize),
+            Lookup::Absent | Lookup::Pending { .. } => None,
+        }
     }
 
     /// Slots in a phase (diagnostics, tests).
     pub fn count(&self, phase: SlotPhase) -> usize {
-        (0..self.slots.len())
-            .filter(|&slot| self.phase_of(slot) == phase)
-            .count()
+        let phase = match phase {
+            SlotPhase::Free => CorePhase::Free,
+            SlotPhase::Filling => CorePhase::Filling,
+            SlotPhase::Live => CorePhase::Live,
+            SlotPhase::Quarantined => CorePhase::Withdrawn,
+        };
+        self.core.count(POOL, phase)
     }
 
-    /// The unit a slot holds while it is `Filling` or `Live`: the cell's occupant. `None` for a
-    /// `Free` or `Quarantined` slot (the policy forgets the unit of an evicted slot; the bank
-    /// still records it as the occupant, [`Self::occupied`]).
+    /// The unit a slot holds while it is `Filling` or `Live`. `None` for a `Free` or
+    /// `Quarantined` slot (the policy forgets the unit of an evicted slot; the bank still records
+    /// it as the occupant, [`Self::occupied`]).
     pub fn slot_unit(&self, slot: usize) -> Option<UnitKey> {
-        self.unit_of(slot)
+        self.core
+            .slot_key(POOL, slot as u32)
+            .map(|key| key_unit(&key))
     }
 
     /// Generation of a slot (bumped by every fill that reuses it): the cell's fill generation.
     pub fn slot_generation(&self, slot: usize) -> u64 {
-        match self.slots[slot].cell.as_ref().expect("slot cell present") {
-            SlotCell::Free(s) => s.fill_generation(),
-            SlotCell::Filling(s) => s.fill_generation(),
-            SlotCell::Resident(s) => s.fill_generation(),
-            SlotCell::Evicting(s) => s.fill_generation(),
-        }
+        self.core
+            .slot_generation(POOL, slot as u32)
+            .expect("a slot of the tail pool")
     }
 
     pub fn slot_phase(&self, slot: usize) -> SlotPhase {
-        self.phase_of(slot)
+        match self
+            .core
+            .slot_phase(POOL, slot as u32)
+            .expect("a slot of the tail pool")
+        {
+            CorePhase::Free => SlotPhase::Free,
+            CorePhase::Filling => SlotPhase::Filling,
+            CorePhase::Live => SlotPhase::Live,
+            CorePhase::Withdrawn => SlotPhase::Quarantined,
+        }
     }
 
-    /// The retirement a `Quarantined` slot was evicted at.
+    /// The retirement a `Quarantined` slot was evicted at: the first generation epoch that no
+    /// longer names it (the bank's `excluded_from_epoch`, retirement `j` seals epoch `j`).
     pub fn slot_evicted_at(&self, slot: usize) -> Option<u64> {
-        let s = &self.slots[slot];
-        (self.phase_of(slot) == SlotPhase::Quarantined).then_some(s.evicted_at)
+        self.core.bank(POOL)?.excluded_from_epoch(slot as u32)
     }
 
     /// The occupied slots as `(slot, occupant, fill_generation)`, ascending by slot: the bank's
     /// view (`Resident`, `Evicting` and issued `Filling` slots).
     pub fn occupied(&self) -> Vec<(u32, u64, u64)> {
-        self.bank.as_ref().map_or_else(Vec::new, SlotBank::occupied)
+        self.core
+            .bank(POOL)
+            .map_or_else(Vec::new, SlotBank::occupied)
     }
 
-    fn phase_of(&self, slot: usize) -> SlotPhase {
-        match self.slots[slot]
-            .cell
-            .as_ref()
-            .expect("slot cell present")
-            .phase()
-        {
-            SlotPhaseView::Free => SlotPhase::Free,
-            SlotPhaseView::Filling => SlotPhase::Filling,
-            SlotPhaseView::Resident => SlotPhase::Live,
-            SlotPhaseView::Evicting => SlotPhase::Quarantined,
-        }
+    /// The pool's bank (introspection: reference counts, live generations, quarantine).
+    #[cfg(test)]
+    pub(crate) fn bank(&self) -> Option<&SlotBank> {
+        self.core.bank(POOL)
     }
 
-    fn unit_of(&self, slot: usize) -> Option<UnitKey> {
-        match self.slots.get(slot)?.cell.as_ref()? {
-            SlotCell::Filling(s) => Some(occupant_unit(s.occupant())),
-            SlotCell::Resident(s) => Some(occupant_unit(s.occupant())),
-            SlotCell::Free(_) | SlotCell::Evicting(_) => None,
-        }
+    /// The core itself (the race tests register a stage reader in its window book).
+    #[cfg(test)]
+    pub(crate) fn core_mut(&mut self) -> &mut ExpertCachePolicy {
+        &mut self.core
     }
 
-    fn bank(&mut self) -> &mut SlotBank {
-        self.bank.as_mut().expect("the tail's slot bank is open")
-    }
-
-    fn take_cell(&mut self, slot: usize) -> SlotCell {
-        self.slots[slot].cell.take().expect("slot cell present")
-    }
-
-    fn put_cell(&mut self, slot: usize, cell: SlotCell) {
-        self.slots[slot].cell = Some(cell);
-    }
-
-    fn refuse(&mut self, why: String) {
+    fn refuse(&mut self, error: CacheError) -> CacheError {
         self.refusals += 1;
         if self.first_refusal.is_none() {
-            self.first_refusal = Some(why);
+            self.first_refusal = Some(error.to_string());
+        }
+        error
+    }
+
+    /// The fills decided and not yet taken, in the core's emission order (fills into free slots
+    /// in candidate order, then the fills into victim slots in victim order).
+    pub fn take_fills(&mut self) -> Vec<FillOp> {
+        self.core
+            .take_fills()
+            .map(|op| FillOp {
+                slot: op.slot as usize,
+                unit: key_unit(&op.key),
+                generation: op.fill_generation,
+                ticket: op.ticket,
+            })
+            .collect()
+    }
+
+    /// A retirement that fails before its fills are issued or deferred: the decided fills that
+    /// were not taken yet will never be issued, so the bank is told ([`Self::abandon_fills`]).
+    pub fn abandon_decided(&mut self) {
+        let tickets: Vec<FillTicket> = self.core.take_fills().map(|op| op.ticket).collect();
+        self.abandon_fills(tickets);
+    }
+
+    /// The tables' write witness, while the pool's table backing is writable (the published
+    /// generation retired, the next not yet sealed).
+    pub fn open_tables(&self) -> Result<TablesOpen, CacheError> {
+        if self.core.backing(POOL).is_some() {
+            Ok(TablesOpen(()))
+        } else {
+            Err(CacheError::GenerationState {
+                pool: POOL,
+                state: "without a writable table backing",
+            })
         }
     }
 
-    /// `Free` -> `Filling` (bumps the fill generation). On refusal the cell stays as it was.
-    fn begin_fill(&mut self, slot: usize, unit: UnitKey) -> Result<FillTicket, String> {
-        match self.take_cell(slot) {
-            SlotCell::Free(free) => match self.bank().start_fill(free, unit_occupant(unit)) {
-                Ok((filling, ticket)) => {
-                    self.put_cell(slot, SlotCell::Filling(filling));
-                    Ok(ticket)
-                }
-                Err((free, error)) => {
-                    self.put_cell(slot, SlotCell::Free(free));
-                    Err(format!("start_fill of slot {slot}: {error}"))
-                }
-            },
-            other => {
-                self.put_cell(slot, other);
-                Err(format!("slot {slot} is not free"))
-            }
-        }
+    /// Retire the published generation unconditionally, whether or not anything is pending (a
+    /// borrow's suspend, a rewrite between windows, the release): the last-read fence is
+    /// recorded on `fence` and waited, the table backing is writable again
+    /// ([`Self::open_tables`]). `Ok(false)`: it already was retired.
+    pub fn retire_now(&mut self, fence: &mut dyn FenceBackend) -> Result<bool, CacheError> {
+        self.core
+            .retire_generation_now(POOL, fence, None)
+            .map_err(|error| self.refuse(error))
     }
 
-    /// `Filling` -> `Resident` by the completion token, then staged for the next generation.
-    fn publish_completed(
+    /// Warm start, step 1: retire the empty epoch-0 generation, stage the seeds' completions
+    /// (`done`, every seed copy finished) and open the tables for the warm images.
+    pub fn publish_warm(
         &mut self,
-        done: FillComplete,
-    ) -> Result<(UnitKey, usize), CompletionError> {
-        let slot = done.slot() as usize;
-        if slot >= self.slots.len() {
-            return Err(CompletionError::Stale);
-        }
-        match self.take_cell(slot) {
-            SlotCell::Filling(filling) => match self.bank().finish_fill(filling, done) {
-                Ok(resident) => {
-                    let unit = occupant_unit(resident.occupant());
-                    let bank = self.bank.as_mut().expect("the tail's slot bank is open");
-                    let staged = bank.publish(&mut self.staging, &resident);
-                    self.put_cell(slot, SlotCell::Resident(resident));
-                    match staged {
-                        Ok(()) => Ok((unit, slot)),
-                        Err(error) => Err(CompletionError::Refused(format!(
-                            "publish of slot {slot}: {error}"
-                        ))),
-                    }
-                }
-                Err((filling, _done, _error)) => {
-                    self.put_cell(slot, SlotCell::Filling(filling));
-                    Err(CompletionError::Stale)
-                }
-            },
-            other => {
-                self.put_cell(slot, other);
-                Err(CompletionError::Stale)
-            }
-        }
-    }
-
-    /// `Resident` -> `Evicting`, out of the staged membership.
-    fn evict(&mut self, slot: usize) -> Result<(), String> {
-        match self.take_cell(slot) {
-            SlotCell::Resident(resident) => {
-                let bank = self.bank.as_mut().expect("the tail's slot bank is open");
-                match bank.unpublish(&mut self.staging, resident) {
-                    Ok(evicting) => {
-                        self.put_cell(slot, SlotCell::Evicting(evicting));
-                        Ok(())
-                    }
-                    Err((resident, error)) => {
-                        self.put_cell(slot, SlotCell::Resident(resident));
-                        Err(format!("unpublish of slot {slot}: {error}"))
-                    }
-                }
-            }
-            other => {
-                self.put_cell(slot, other);
-                Err(format!("slot {slot} is not resident"))
-            }
-        }
-    }
-
-    /// `Evicting` -> `Free` against the retirement's token (every generation naming the slot
-    /// retired; in PEER mode every peer acknowledged). On refusal the slot stays `Evicting`.
-    fn reclaim_slot(&mut self, slot: usize, retired: &GenerationRetired) -> bool {
-        match self.take_cell(slot) {
-            SlotCell::Evicting(evicting) => match self.bank().reclaim(evicting, retired) {
-                Ok(free) => {
-                    self.put_cell(slot, SlotCell::Free(free));
-                    true
-                }
-                Err((evicting, error)) => {
-                    self.put_cell(slot, SlotCell::Evicting(evicting));
-                    self.refuse(format!("reclaim of slot {slot}: {error}"));
-                    false
-                }
-            },
-            other => {
-                self.put_cell(slot, other);
-                self.refuse(format!("reclaim of slot {slot}: not evicting"));
-                false
-            }
-        }
-    }
-
-    /// Warm start: the first `T` of `units` fill slots `0..` (fill generation 1; the device part
-    /// copies them through [`Self::issue_fills`] / [`Self::complete_fills`] and publishes them
-    /// all with [`Self::finish_seed`] before the first window), so window 1 sees exactly what
-    /// D1's static plan would hold. Returns the fills to copy; units beyond `T` and repeats are
-    /// ignored.
-    pub fn seed(&mut self, units: &[UnitKey]) -> Result<Vec<FillOp>, ResidencyError> {
-        let mut out = Vec::new();
-        for &unit in units {
-            if out.len() >= self.slots.len() {
-                break;
-            }
-            if self.index.contains_key(&unit) {
-                continue;
-            }
-            let slot = out.len();
-            let rank = self.rank_of(unit);
-            let ticket = self
-                .begin_fill(slot, unit)
-                .map_err(ResidencyError::Refused)?;
-            let s = &mut self.slots[slot];
-            s.last_used = 0;
-            s.rank = rank;
-            self.index.insert(unit, slot);
-            out.push(FillOp {
-                slot,
-                unit,
-                generation: ticket.fill_generation(),
-                ticket,
-            });
-        }
-        Ok(out)
-    }
-
-    /// The warm start's publication: every seed completion finishes its fill and is staged
-    /// (`Resident`), then the staged membership is sealed through `backing` as generation
-    /// `{ epoch 0, sub 0 }`. `backing` is the table backing the device part wrote and uploaded
-    /// the warm tables through; on refusal it is returned.
-    pub fn finish_seed(
-        &mut self,
+        fence: &mut dyn FenceBackend,
         done: Vec<FillComplete>,
-        backing: TableBacking,
-    ) -> Result<OwnedTableGeneration, (TableBacking, ResidencyError)> {
-        for token in done {
-            match self.publish_completed(token) {
-                Ok(_) => {}
-                Err(CompletionError::Stale) => {
-                    return Err((
-                        backing,
-                        ResidencyError::Stale("a seed completion names no filling slot".into()),
-                    ))
-                }
-                Err(CompletionError::Refused(why)) => {
-                    return Err((backing, ResidencyError::Refused(why)))
-                }
+    ) -> Result<TablesOpen, CacheError> {
+        let staged = (|| {
+            self.core.retire_generation_now(POOL, fence, None)?;
+            for token in done {
+                self.core.deliver_completion(POOL, token)?;
             }
-        }
-        if self.count(SlotPhase::Filling) > 0 {
-            return Err((
-                backing,
-                ResidencyError::Refused("a seeded slot has no completion".into()),
-            ));
-        }
-        self.seal(backing, GenerationId { epoch: 0, sub: 0 })
+            self.core.plan_group(0, (0, 0))?;
+            self.core.check_seeded(POOL)
+        })();
+        staged.map_err(|error| self.refuse(error))?;
+        self.open_tables()
     }
 
-    /// Seal the staged membership into an immutable generation through `backing`.
-    pub fn seal(
-        &mut self,
-        backing: TableBacking,
-        id: GenerationId,
-    ) -> Result<OwnedTableGeneration, (TableBacking, ResidencyError)> {
-        let bank = self.bank.as_mut().expect("the tail's slot bank is open");
-        bank.seal(&self.staging, backing, id)
+    /// Warm start, step 2: seal the staged seeds over the warm tables as generation
+    /// `{ epoch 0, sub 1 }` (the core sealed the empty `{ 0, 0 }`), so retirement `j` seals
+    /// epoch `j`.
+    pub fn seal_warm(&mut self, tables: TablesOpen) -> Result<GenerationId, CacheError> {
+        drop(tables);
+        self.core
+            .seal_as(POOL, GenerationId { epoch: 0, sub: 1 })
+            .map_err(|error| self.refuse(error))
     }
 
-    /// Register the table allocations every generation of this tail is published through.
-    pub fn register_table_backing(
-        &mut self,
-        tables: Vec<Binding>,
-    ) -> Result<TableBacking, ResidencyError> {
-        self.bank().register_table_backing(tables)
+    /// Seal the staged membership again as `{ epoch, sub + 1 }` of the last sealed generation
+    /// (a borrow resume, a rewrite between windows): the tables were rewritten through
+    /// [`TablesOpen`] and the retirement clock does not move.
+    pub fn reseal(&mut self, tables: TablesOpen) -> Result<GenerationId, CacheError> {
+        drop(tables);
+        let Some(last) = self.core.last_sealed(POOL) else {
+            let error = CacheError::GenerationState {
+                pool: POOL,
+                state: "never sealed",
+            };
+            return Err(self.refuse(error));
+        };
+        self.core
+            .seal_as(
+                POOL,
+                GenerationId {
+                    epoch: last.epoch,
+                    sub: last.sub + 1,
+                },
+            )
+            .map_err(|error| self.refuse(error))
     }
 
-    /// Retire the generation published before this retirement: its window's last reader fenced
-    /// (the caller holds the proof by owning the generation back out of a `FencedWindow`). In
-    /// PEER mode `peers = Some((board, owner, m))` asks the board's `released_through` exactly
-    /// once. Returns the backing (writable again) and the token the retirement's reclaims use.
-    pub fn retire_generation(
+    /// Retire one GROUP of `windows` consecutive decode windows (the retirement cadence,
+    /// [`RetireCadence`]): the first half of a retirement. The published generation is fenced on
+    /// `fence` and retired (PEER mode: `peers = Some((board, owner rank))` asks the board's
+    /// `released_through` exactly once, at this retirement's index), then the group is judged:
+    /// `window` holds the distinct non-core units any window of the group read (reads summed),
+    /// judged against the slots live when the group started; `core` = (distinct, slot reads) the
+    /// static core served; `completed` = the completion tokens of the fills whose copy finished
+    /// since the last retirement (drained once the retirement succeeded; a token that does not
+    /// name a `Filling` slot at its fill generation is ignored and counted stale). A unit read
+    /// anywhere in the group is never a victim. The fill budget is `F x windows` capped at
+    /// `F x `[`FILL_GROUP_CAP`]. In PEER mode a slot evicted at a retirement `k` every peer
+    /// acknowledged by a retirement before this one is free again from this retirement on.
+    ///
+    /// Returns the table changes (`publish`, `unpublish`); the tables are open
+    /// ([`Self::open_tables`]) until [`Self::finish_retirement`] seals the next generation over
+    /// them and hands out the fills. An error before the plan leaves `completed` untouched.
+    pub fn retire_windows(
         &mut self,
-        g: OwnedTableGeneration,
-        peers: Option<(&dyn PeerReaderFence, usize, u64)>,
-    ) -> Result<(TableBacking, GenerationRetired), (OwnedTableGeneration, ResidencyError)> {
-        self.bank().retire(g, peers)
+        fence: &mut dyn FenceBackend,
+        peers: Option<(&dyn PeerReaderFence, usize)>,
+        core: (u64, u64),
+        window: &[WindowUse],
+        completed: &mut Vec<FillComplete>,
+        windows: u32,
+    ) -> Result<Retire, CacheError> {
+        let at = self.retirements + 1;
+        let peers = peers.map(|(fence, owner)| (fence, owner, at));
+        self.core
+            .retire_generation_now(POOL, fence, peers)
+            .map_err(|error| self.refuse(error))?;
+        self.retirements = at;
+        let planned = (|| {
+            for done in completed.drain(..) {
+                self.core.deliver_completion(POOL, done)?;
+            }
+            self.core.begin_window()?;
+            for used in window {
+                self.core.record_use(CoreUse {
+                    key: unit_key(used.unit),
+                    pool: POOL,
+                    reads: used.reads,
+                    rank: self.admission.rank_of(used.unit),
+                })?;
+            }
+            self.core.end_window(0)?;
+            self.core
+                .plan_group_with(windows.max(1), core, &mut self.admission)
+        })();
+        planned.map_err(|error| self.refuse(error))?;
+        Ok(Retire {
+            publish: self
+                .core
+                .published()
+                .iter()
+                .map(|p| (key_unit(&p.key), p.slot as usize))
+                .collect(),
+            unpublish: self
+                .core
+                .withdrawn()
+                .iter()
+                .map(|w| key_unit(&w.key))
+                .collect(),
+            fills: Vec::new(),
+        })
+    }
+
+    /// The second half of a retirement, after the tables were rewritten and uploaded: reclaim
+    /// the slots the retirement frees and start the fills into them, seal the next generation
+    /// (epoch = this retirement's index) over the written tables, and hand the decided fills to
+    /// `retire.fills`.
+    pub fn finish_retirement(
+        &mut self,
+        tables: TablesOpen,
+        retire: &mut Retire,
+    ) -> Result<GenerationId, CacheError> {
+        drop(tables);
+        let sealed = (|| {
+            self.core.finish_plan_with(POOL, &mut self.admission)?;
+            self.core.seal_as(
+                POOL,
+                GenerationId {
+                    epoch: self.retirements,
+                    sub: 0,
+                },
+            )
+        })();
+        let id = sealed.map_err(|error| self.refuse(error))?;
+        retire.fills = self.take_fills();
+        Ok(id)
     }
 
     /// Enqueue the copies of `tickets` (the callback writes only `ticket.write_spans()`) and
@@ -1034,16 +1168,14 @@ impl TailPolicy {
         copy: &mut dyn FenceBackend,
         enqueue: &mut dyn FnMut(&FillTicket) -> Result<(), String>,
     ) -> Result<PendingFills, (Vec<FillTicket>, FenceFailure)> {
-        self.bank().issue_fills(tickets, copy, enqueue)
+        self.core.issue_fills(POOL, tickets, copy, enqueue)
     }
 
     /// Tickets that will never be issued (a frozen or released tail drops its deferred fills):
     /// their slots stay `Filling` and are never restored, but the bank no longer counts them as
     /// pending, so a scratch loan and the close accept them.
     pub fn abandon_fills(&mut self, tickets: Vec<FillTicket>) {
-        if !tickets.is_empty() {
-            self.bank().abandon_fills(tickets);
-        }
+        self.core.abandon_fills(POOL, tickets);
     }
 
     /// Poll (`wait == false`) or wait for one batch of issued fills.
@@ -1053,17 +1185,18 @@ impl TailPolicy {
         copy: &mut dyn FenceBackend,
         wait: bool,
     ) -> Result<Vec<FillComplete>, FillsNotDone> {
-        self.bank().complete_fills(batch, copy, wait)
+        self.core.complete_fills(POOL, batch, copy, wait)
     }
 
     /// Device-wide quiescence of the bank's issued fills ([`SlotBank::quiesce`]).
     pub fn quiesce(&mut self, device: &mut dyn FenceBackend) -> Result<Quiesced, FenceFailure> {
-        self.bank().quiesce(device)
+        self.core.quiesce(POOL, device)
     }
 
-    /// Lend the whole pool as scratch ([`SlotBank::lend_scratch`]).
-    pub fn lend_scratch(&mut self, q: Quiesced) -> Result<ScratchLoan, ResidencyError> {
-        self.bank().lend_scratch(q)
+    /// Lend the whole pool as scratch ([`SlotBank::lend_scratch`]): refused while any generation
+    /// is live ([`Self::retire_now`] first).
+    pub fn lend_scratch(&mut self, q: Quiesced) -> Result<ScratchLoan, CacheError> {
+        self.core.lend_scratch(POOL, q)
     }
 
     /// Re-copy every occupied slot after a scratch epoch ([`SlotBank::issue_restore`]): the
@@ -1074,7 +1207,7 @@ impl TailPolicy {
         copy: &mut dyn FenceBackend,
         enqueue: &mut dyn FnMut(u32, u64, &[Binding]) -> Result<(), String>,
     ) -> Result<PendingRestore, FenceFailure> {
-        self.bank().issue_restore(loan, copy, enqueue)
+        self.core.issue_restore(POOL, loan, copy, enqueue)
     }
 
     /// Wait the restore fence and end the scratch loan ([`SlotBank::end_scratch`]); on error the
@@ -1086,368 +1219,17 @@ impl TailPolicy {
         restore: PendingRestore,
         copy: &mut dyn FenceBackend,
     ) -> Result<(), (ScratchLoan, PendingRestore, ResidencyError)> {
-        self.bank().end_scratch(loan, restore, copy)
+        self.core.end_scratch(POOL, loan, restore, copy)
     }
 
     /// Hand every cell and the bank back: the pool block and its reclaim token, or the refusal
-    /// (the bank and the cells stay in the policy). Needs no live generation and a current `q`.
+    /// (the pool stays as it was). Needs no live generation ([`Self::retire_now`]), every
+    /// decided fill issued or abandoned and a current `q`.
     pub fn close(
         &mut self,
         q: Quiesced,
-    ) -> Result<(LentBlock<Expert>, BlockReclaimed), ResidencyError> {
-        if self.slots.iter().any(|s| s.cell.is_none()) {
-            return Err(ResidencyError::Refused("a slot cell is in transit".into()));
-        }
-        let bank = self.bank.take().ok_or_else(|| {
-            ResidencyError::Refused("the tail's slot bank is already closed".into())
-        })?;
-        let cells: Vec<SlotCell> = self
-            .slots
-            .iter_mut()
-            .map(|s| s.cell.take().expect("checked"))
-            .collect();
-        match bank.close(cells, q) {
-            Ok(done) => Ok(done),
-            Err((bank, cells, error)) => {
-                self.bank = Some(bank);
-                for (s, cell) in self.slots.iter_mut().zip(cells) {
-                    s.cell = Some(cell);
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn rank_of(&self, unit: UnitKey) -> u32 {
-        self.priority.get(&unit).copied().unwrap_or(u32::MAX)
-    }
-
-    fn fills_in_flight(&self) -> usize {
-        self.count(SlotPhase::Filling)
-    }
-
-    /// Retire one GROUP of `windows` consecutive decode windows (the retirement cadence,
-    /// [`RetireCadence`]) of a policy WITHOUT peer quarantine: `window` holds the distinct
-    /// non-core units any window of the group read (reads summed), judged against the slots
-    /// live when the group started; `core` = (distinct, slot reads) the static core served;
-    /// `completed` = the completion tokens of the fills whose copy finished since the last
-    /// retirement (a token that does not name a `Filling` slot at its fill generation is
-    /// ignored and counted stale); `retired` = the token of the generation this retirement
-    /// retired (every window that read it has fenced), which the reclaims below spend. A unit
-    /// read anywhere in the group is never a victim. The fill budget is `F x windows` capped at
-    /// `F x `[`FILL_GROUP_CAP`].
-    pub fn retire_windows(
-        &mut self,
-        core: (u64, u64),
-        window: &[WindowUse],
-        completed: Vec<FillComplete>,
-        windows: u32,
-        retired: &GenerationRetired,
-    ) -> Retire {
-        assert!(
-            !self.peer,
-            "a policy with peer quarantine retires through `retire_peer_windows`"
-        );
-        self.retire_inner(core, window, completed, retired, windows)
-    }
-
-    /// [`Self::retire_windows`] of a policy with peer quarantine. `retired.peer_through()` is
-    /// the newest eviction retirement `k` that EVERY peer acknowledged by a retirement before
-    /// this one ([`PeerBoard::released_through`], asked once by the bank's `retire`): slots
-    /// evicted at `k' <= k` are free from this retirement on (this retirement may refill them).
-    pub fn retire_peer_windows(
-        &mut self,
-        core: (u64, u64),
-        window: &[WindowUse],
-        completed: Vec<FillComplete>,
-        windows: u32,
-        retired: &GenerationRetired,
-    ) -> Retire {
-        assert!(
-            self.peer,
-            "`retire_peer_windows` needs a policy with peer quarantine"
-        );
-        self.retire_inner(core, window, completed, retired, windows)
-    }
-
-    /// Fills one retirement of `windows` windows may have in flight in total.
-    fn fill_budget(&self, windows: u32) -> usize {
-        self.config.fill_per_step * (windows as usize).clamp(1, FILL_GROUP_CAP)
-    }
-
-    fn retire_inner(
-        &mut self,
-        core: (u64, u64),
-        window: &[WindowUse],
-        completed: Vec<FillComplete>,
-        retired: &GenerationRetired,
-        windows: u32,
-    ) -> Retire {
-        let windows = windows.max(1);
-        self.window += 1;
-        let now = self.window;
-        let windows_before = self.stats.windows;
-        self.stats.windows += windows as u64;
-        self.stats.retirements += 1;
-        self.stats.core_distinct += core.0;
-        self.stats.core_reads += core.1;
-        let mut out = Retire::default();
-
-        // 1. Judge the window against the slots LIVE at its start.
-        let mut misses: Vec<WindowUse> = Vec::new();
-        for &used in window {
-            match self.index.get(&used.unit).copied() {
-                Some(slot) if self.phase_of(slot) == SlotPhase::Live => {
-                    self.slots[slot].last_used = now;
-                    self.stats.tail_distinct += 1;
-                    self.stats.tail_reads += used.reads as u64;
-                }
-                _ => {
-                    self.stats.host_distinct += 1;
-                    self.stats.host_reads += used.reads as u64;
-                    misses.push(used);
-                }
-            }
-        }
-        if self.config.boundary_every > 1 {
-            for used in window {
-                *self.heat.entry(used.unit).or_insert(0.0) += used.reads as f32;
-            }
-        }
-
-        // 2. Publish the fills that completed (they serve the NEXT window).
-        for done in completed {
-            match self.publish_completed(done) {
-                Ok((unit, slot)) => {
-                    self.slots[slot].last_used = now;
-                    self.stats.fills_published += 1;
-                    out.publish.push((unit, slot));
-                }
-                Err(CompletionError::Stale) => self.stats.stale_completions += 1,
-                Err(CompletionError::Refused(why)) => self.refuse(why),
-            }
-        }
-
-        // 2b. A slot evicted at a retirement every peer has acknowledged is free again (this
-        // retirement may refill it). Without peer quarantine an evicted slot is reclaimed in
-        // the same retirement (below), so nothing waits here.
-        let through = retired.peer_through();
-        for slot in 0..self.slots.len() {
-            if self.phase_of(slot) != SlotPhase::Quarantined {
-                continue;
-            }
-            let covered =
-                !self.peer || through.is_some_and(|through| self.slots[slot].evicted_at <= through);
-            if covered {
-                self.reclaim_slot(slot, retired);
-            }
-        }
-
-        // 3. Admission.
-        if self.frozen {
-            return out;
-        }
-        let boundary = self.config.boundary_every > 1;
-        // Boundary mode admits when the group crossed a multiple of N WINDOWS (with one window
-        // per retirement: every Nth window, as before).
-        let every = self.config.boundary_every as u64;
-        if boundary && (self.stats.windows / every) == (windows_before / every) {
-            return out;
-        }
-        let total_budget = self.fill_budget(windows);
-        let budget = total_budget.saturating_sub(self.fills_in_flight());
-        if budget == 0 {
-            return out;
-        }
-        let candidates = self.candidates(misses, boundary);
-        if candidates.is_empty() {
-            if boundary {
-                self.decay_heat();
-            }
-            return out;
-        }
-        // Victims: free slots first, then Live slots NOT used by the retiring
-        // window, least recently used first (colder ranking position on ties).
-        let mut free: Vec<usize> = (0..self.slots.len())
-            .filter(|&s| self.phase_of(s) == SlotPhase::Free)
-            .collect();
-        free.reverse(); // pop() takes the lowest slot first
-                        // Only `budget` victims can be used: select them in O(T) instead of sorting all T.
-        let mut live: Vec<(u64, std::cmp::Reverse<u32>, usize)> = (0..self.slots.len())
-            .filter(|&slot| {
-                self.phase_of(slot) == SlotPhase::Live && self.slots[slot].last_used < now
-            })
-            .map(|slot| {
-                let s = &self.slots[slot];
-                (s.last_used, std::cmp::Reverse(s.rank), slot)
-            })
-            .collect();
-        if live.len() > budget {
-            live.select_nth_unstable(budget - 1);
-            live.truncate(budget);
-        }
-        live.sort_unstable();
-        let mut live = live.into_iter().map(|(_, _, slot)| slot);
-        let mut quarantined = if self.peer {
-            self.count(SlotPhase::Quarantined)
-        } else {
-            0
-        };
-        let quarantine_cap = QUARANTINE_WINDOWS * total_budget;
-        // PEER per-window mode under SATURATED demand (at least `budget` candidates) keeps the
-        // reserve (module docs, RESERVE): every candidate fills a free slot if one exists and,
-        // while free + quarantined slots are below `RESERVE_RETIREMENTS x budget`, evicts one
-        // victim into quarantine for a later retirement's fills. Below saturation the candidate
-        // that has to evict waits (it is admitted if it misses again), as without the reserve.
-        let reserve = self.peer && !boundary && candidates.len() >= budget;
-        let reserve_target = RESERVE_RETIREMENTS * budget;
-        for cand in candidates.into_iter().take(budget) {
-            if reserve {
-                let slot = free.pop();
-                let mut evicted = false;
-                if free.len() + quarantined < reserve_target {
-                    if let Some(victim) = live.next() {
-                        evicted = self.quarantine(victim, now, &mut out);
-                        quarantined += usize::from(evicted);
-                    }
-                }
-                match slot {
-                    Some(slot) => self.admit(slot, cand, now, &mut out),
-                    // The candidate waits for a later retirement's free slot.
-                    None if evicted => {}
-                    None => self.stats.skipped_full += 1,
-                }
-                continue;
-            }
-            let (slot, evicted) = if let Some(slot) = free.pop() {
-                (slot, None)
-            } else {
-                if self.peer && quarantined >= quarantine_cap {
-                    self.stats.skipped_full += 1;
-                    continue;
-                }
-                let Some(slot) = live.next() else {
-                    self.stats.skipped_full += 1;
-                    continue;
-                };
-                let victim = self.unit_of(slot).expect("live slot has a unit");
-                if boundary {
-                    let challenger = self.heat.get(&cand).copied().unwrap_or(0.0);
-                    let incumbent = self.heat.get(&victim).copied().unwrap_or(0.0);
-                    if challenger < incumbent * HEAT_HYSTERESIS {
-                        self.stats.skipped_full += 1;
-                        continue;
-                    }
-                }
-                (slot, Some(victim))
-            };
-            if evicted.is_some() {
-                if self.peer {
-                    // Quarantine: the peers' full tables may still name the slot, so it takes no
-                    // fill until they acknowledged the unpublication; the candidate waits.
-                    quarantined += usize::from(self.quarantine(slot, now, &mut out));
-                    continue;
-                }
-                if !self.unpublish_victim(slot, &mut out) {
-                    continue;
-                }
-                // No peer reads the slot: the retired generation was its last name.
-                if !self.reclaim_slot(slot, retired) {
-                    continue;
-                }
-            }
-            self.admit(slot, cand, now, &mut out);
-        }
-        if boundary {
-            self.decay_heat();
-        }
-        out
-    }
-
-    /// Unpublish the Live `slot`'s unit (`out.unpublish`); `false` = refused (the policy froze).
-    fn unpublish_victim(&mut self, slot: usize, out: &mut Retire) -> bool {
-        let victim = self.unit_of(slot).expect("live slot has a unit");
-        if let Err(why) = self.evict(slot) {
-            self.refuse(why);
-            return false;
-        }
-        self.index.remove(&victim);
-        out.unpublish.push(victim);
-        self.stats.evictions += 1;
-        true
-    }
-
-    /// PEER mode: unpublish the Live `slot`'s unit and quarantine the slot until every peer
-    /// acknowledged the unpublication; `false` = refused (the policy froze).
-    fn quarantine(&mut self, slot: usize, now: u64, out: &mut Retire) -> bool {
-        if !self.unpublish_victim(slot, out) {
-            return false;
-        }
-        self.slots[slot].evicted_at = now;
-        self.stats.quarantined += 1;
-        true
-    }
-
-    /// Start `cand`'s fill into the Free `slot` (`out.fills`).
-    fn admit(&mut self, slot: usize, cand: UnitKey, now: u64, out: &mut Retire) {
-        let rank = self.rank_of(cand);
-        let ticket = match self.begin_fill(slot, cand) {
-            Ok(ticket) => ticket,
-            Err(why) => {
-                self.refuse(why);
-                return;
-            }
-        };
-        let s = &mut self.slots[slot];
-        s.last_used = now;
-        s.rank = rank;
-        self.index.insert(cand, slot);
-        self.stats.fills_issued += 1;
-        out.fills.push(FillOp {
-            slot,
-            unit: cand,
-            generation: ticket.fill_generation(),
-            ticket,
-        });
-    }
-
-    /// Candidate misses, best first: per-window mode by reads then ranking;
-    /// boundary mode by decayed heat then ranking.
-    fn candidates(&self, misses: Vec<WindowUse>, boundary: bool) -> Vec<UnitKey> {
-        let mut fresh: Vec<(UnitKey, f32)> = misses
-            .into_iter()
-            .filter(|m| !self.index.contains_key(&m.unit))
-            .map(|m| {
-                let score = if boundary {
-                    self.heat.get(&m.unit).copied().unwrap_or(0.0)
-                } else {
-                    m.reads as f32
-                };
-                (m.unit, score)
-            })
-            .collect();
-        if boundary {
-            // Units hot over the interval but not missed in the last window.
-            for (&unit, &heat) in &self.heat {
-                if !self.index.contains_key(&unit) && !fresh.iter().any(|(u, _)| *u == unit) {
-                    fresh.push((unit, heat));
-                }
-            }
-        }
-        fresh.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| self.rank_of(a.0).cmp(&self.rank_of(b.0)))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        fresh.into_iter().map(|(unit, _)| unit).collect()
-    }
-
-    fn decay_heat(&mut self) {
-        self.heat.retain(|_, h| {
-            *h *= HEAT_DECAY;
-            *h > 0.01
-        });
+    ) -> Result<(LentBlock<Expert>, BlockReclaimed), CacheError> {
+        self.core.close_pool(POOL, q)
     }
 }
 
@@ -2056,7 +1838,7 @@ mod tests {
     #[test]
     fn a_frozen_policy_publishes_but_never_admits() {
         let mut p = policy(2, 4, 1);
-        p.frozen = true;
+        p.freeze();
         let r = p.retire((1, 4), &[use1(0, 3, 6)], &[]);
         assert!(r.fills.is_empty() && r.unpublish.is_empty());
         assert_eq!(p.stats().host_reads, 6);
@@ -2183,7 +1965,7 @@ mod tests {
         let mut p = policy(2, 4, 1);
         p.seed(&[(0, 1)]);
         p.retire((2, 6), &[use1(0, 1, 2), use1(0, 5, 2)], &[]);
-        let s = *p.stats();
+        let s = p.stats();
         assert_eq!((s.core_reads, s.tail_reads, s.host_reads), (6, 2, 2));
         assert!((s.slot_hit() - 0.8).abs() < 1e-12);
         assert!((s.distinct_hit() - 0.75).abs() < 1e-12);
@@ -2290,7 +2072,7 @@ mod tests {
             }
             fold(&mut h, 4);
         }
-        let s = *p.stats();
+        let s = p.stats();
         for v in [
             s.windows,
             s.core_reads,
@@ -2379,9 +2161,9 @@ mod tests {
                 let uses: Vec<WindowUse> = (0..2 * f as u16)
                     .map(|i| use1(1, w * 2 * f as u16 + i, 1))
                     .collect();
-                let before = *p.stats();
+                let before = p.stats();
                 let r = p.retire_peer((0, 0), &uses, &completed, |m| m.saturating_sub(lag));
-                let s = *p.stats();
+                let s = p.stats();
                 assert!(
                     s.evictions - before.evictions <= f as u64,
                     "one eviction per candidate"
@@ -2435,7 +2217,7 @@ mod tests {
         assert_eq!(p.slot_evicted_at(first), Some(1));
         assert_eq!(p.slot_unit(first), None);
         assert_eq!(p.live_slot(r.unpublish[0]), None);
-        let s = *p.stats();
+        let s = p.stats();
         assert_eq!(
             (s.evictions, s.quarantined, s.fills_issued, s.skipped_full),
             (1, 1, 0, 0)
