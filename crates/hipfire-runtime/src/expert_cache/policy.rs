@@ -1562,6 +1562,12 @@ impl ExpertCachePolicy {
         }
     }
 
+    /// Completion tokens [`Self::deliver_completion`] can still accept before the next plan
+    /// stages them.
+    pub fn completion_room(&self) -> usize {
+        self.config.completions - self.completions.len()
+    }
+
     /// Deliver a completion token (from `complete_fills`) to the pool it names. It is staged by
     /// the next plan; a token that names no `Filling` slot at its fill generation is ignored
     /// there and counted stale.

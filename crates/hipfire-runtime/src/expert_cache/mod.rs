@@ -58,9 +58,15 @@
 //! Adapters that judge request by request (DS4-style) use [`ExpertCachePolicy::reserve`],
 //! [`ExpertCachePolicy::lookup`] and [`ExpertCachePolicy::rollback`] over the same pools.
 
+pub mod device_io;
 mod index;
 mod policy;
 pub mod window;
+
+pub use device_io::{
+    validate_bundle, BundleError, BundleSource, CopyDevice, DeviceIo, HipCopyBackend, HostRange,
+    IoError, IoStats, PollSummary, PoolDest, Rejected, Segment,
+};
 
 #[cfg(test)]
 mod tests;
