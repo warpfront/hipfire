@@ -5,11 +5,12 @@ name: diff-sentry
 # exfiltration, pipe-to-shell, workflow pwn-requests. The scan is
 # deterministic and offline: no API key, no model, no secrets.
 #
-# Runs the PyPI CLI directly instead of `uses: qazbnm456/diff-sentry`: the
-# org action allowlist rejects that action and its nested astral-sh/setup-uv
-# (startup_failure, no check run). The step below is the action's own
-# gated/report-only split. Resolution is frozen to the 0.7.0 release date so
-# an unpinned transitive dependency cannot change what runs.
+# Installs the pinned PyPI CLI in a `run:` step instead of
+# `uses: qazbnm456/diff-sentry`: the org action allowlist rejects that action
+# and its nested astral-sh/setup-uv. The step reproduces the action's
+# gated/report-only split. `--uploaded-prior-to` freezes the transitive
+# dependencies at the 0.7.0 release date, so a later upload cannot change
+# what runs.
 #
 # Advisory, not a required check. Calibrated on the last 150 beta commits:
 # 8 would trip `high`, all false positives typical for an LLM engine
@@ -22,8 +23,8 @@ name: diff-sentry
 # `pull_request` runs the PR's own copy of this file, so the scan does not
 # cover a PR that weakens or deletes this workflow. Never move it to
 # `pull_request_target`: that would run PR code with a write token. To post
-# the report as a PR comment, upload it as an artifact here and post it from a
-# separate `workflow_run` job that never checks out PR code.
+# the report as a PR comment, read the uploaded artifact from a separate
+# `workflow_run` job that never checks out PR code.
 
 on:
   pull_request:
@@ -43,22 +44,36 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Scan the PR diff
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           FAIL_ON: high
           REPORT_ONLY: docs/*.md
-          EXCLUDE_NEWER: '2026-10-22T00:00:00Z'
+          UPLOADED_PRIOR_TO: '2026-10-22T00:00:00Z'
         run: |
           set -euo pipefail
-          pipx install uv==0.13.4
-          sentry=(uvx --exclude-newer "$EXCLUDE_NEWER" diff-sentry==0.7.0)
+          python -m venv "$RUNNER_TEMP/ds"
+          "$RUNNER_TEMP/ds/bin/pip" install -q pip==26.3
+          "$RUNNER_TEMP/ds/bin/pip" install -q --uploaded-prior-to "$UPLOADED_PRIOR_TO" diff-sentry==0.7.0
+          sentry="$RUNNER_TEMP/ds/bin/diff-sentry"
 
           git diff "$BASE_SHA...HEAD" -- . ":(exclude)$REPORT_ONLY" > "$RUNNER_TEMP/gated.diff"
           git diff "$BASE_SHA...HEAD" -- "$REPORT_ONLY" > "$RUNNER_TEMP/report-only.diff"
 
           echo "::group::$REPORT_ONLY (reported, never gated)"
-          "${sentry[@]}" scan "$RUNNER_TEMP/report-only.diff" --fail-on "$FAIL_ON" || true
+          "$sentry" scan "$RUNNER_TEMP/report-only.diff" --fail-on "$FAIL_ON" || true
           echo "::endgroup::"
 
-          "${sentry[@]}" scan "$RUNNER_TEMP/gated.diff" --fail-on "$FAIL_ON"
+          mkdir -p "$RUNNER_TEMP/report"
+          "$sentry" scan "$RUNNER_TEMP/gated.diff" --fail-on "$FAIL_ON" --json \
+            > "$RUNNER_TEMP/report/diff-sentry-report.json" || true
+          "$sentry" scan "$RUNNER_TEMP/gated.diff" --fail-on "$FAIL_ON"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diff-sentry-report
+          path: ${{ runner.temp }}/report/
+          if-no-files-found: ignore
