@@ -4063,6 +4063,7 @@ pub fn execute_indexed_attention_core_rows(
         head_dim: op.head_dim,
         rotary_dim: op.rotary_dim,
         rope: op.rope,
+        mrope: op.mrope,
         input_width: op.input_width,
         rotation: op.rotation,
         mode: op.mode,
@@ -5164,6 +5165,8 @@ pub struct IndexedAttentionOp<'a> {
     /// its scaling is lowered at [`Self::rotary_dim`] for every QSA rotation
     /// (queries, keys, indexer queries and pooled keys).
     pub rope: rdna_compute::rope::Rope,
+    /// Image prompt coordinates; absent for every text-only route.
+    pub mrope: Option<rdna_compute::qsa_mrope::QsaMrope<'a>>,
     pub input_width: usize,
     /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
     /// BF16 path never reads it.
@@ -5210,6 +5213,16 @@ impl IndexedAttentionOp<'_> {
     /// The RoPE width ([`Self::rotary_dim`]) against the op's geometry and the
     /// fixed width the pooled-key RoPE kernel rotates.
     fn validate_rotary(&self) -> Result<(), DispatchError> {
+        if let Some(mrope) = self.mrope {
+            let end = self
+                .state
+                .position
+                .checked_add(self.rows)
+                .ok_or_else(|| DispatchError::Hip("image mRoPE position overflow".into()))?;
+            mrope
+                .validate(self.rotary_dim, end)
+                .map_err(|error| DispatchError::Hip(error.to_string()))?;
+        }
         if self.rotary_dim < 2
             || self.rotary_dim % 2 != 0
             || self.rotary_dim > self.head_dim
@@ -6094,6 +6107,19 @@ fn execute_indexed_attention_hc_impl(
     projection_only: Option<[bool; 4]>,
 ) -> Result<(), DispatchError> {
     op.check_phase()?;
+    if op.mrope.is_some() && arenas.is_some() {
+        return Err(DispatchError::Hip(
+            "image mRoPE cannot consume NPU projection arenas".into(),
+        ));
+    }
+    let norm_rope = |gpu: &mut Gpu, p: &IndexedAttentionNormRopeBatch<'_>| match op.mrope {
+        Some(mrope) => rdna_compute::qsa_mrope::norm_mrope(gpu, p, mrope),
+        None => indexed_attention_norm_rope_batch(gpu, p),
+    };
+    let pool_rope = |gpu: &mut Gpu, p: &IndexedAttentionPoolRope<'_>| match op.mrope {
+        Some(mrope) => rdna_compute::qsa_mrope::pool_mrope(gpu, p, mrope),
+        None => indexed_attention_pool_rope_incremental(gpu, p),
+    };
     let phase = if projection_only.is_some() {
         MixerPhase::InProj
     } else {
@@ -6142,7 +6168,8 @@ fn execute_indexed_attention_hc_impl(
     // projection records which of q / k actually ran fused.
     let yarn = op.rope.yarn(op.rotary_dim);
     let table_floats = rows * QSA_NORM_EPI_ROTARY_DIM;
-    let fuse_candidate = phase == MixerPhase::Whole
+    let fuse_candidate = op.mrope.is_none()
+        && phase == MixerPhase::Whole
         && arenas.is_none()
         && projection_only.is_none()
         && !qsa_projection_hook_installed()
@@ -6350,7 +6377,8 @@ fn execute_indexed_attention_hc_impl(
         } else {
             hip(indexed_attention_cache_append_batch(gpu, &append))?;
         }
-    } else if gpu.route_rows(rows) <= gpu.few_row_limit()
+    } else if op.mrope.is_none()
+        && gpu.route_rows(rows) <= gpu.few_row_limit()
         && op.index_dim <= 256
         && op.head_dim <= 256
         && prologue_rotary
@@ -6383,7 +6411,7 @@ fn execute_indexed_attention_hc_impl(
             },
         ))?;
     } else {
-        hip(indexed_attention_norm_rope_batch(
+        hip(norm_rope(
             gpu,
             &IndexedAttentionNormRopeBatch {
                 values: &index_batch,
@@ -6442,7 +6470,7 @@ fn execute_indexed_attention_hc_impl(
             ))?;
         }
         if !q_fused {
-            hip(indexed_attention_norm_rope_batch(
+            hip(norm_rope(
                 gpu,
                 &IndexedAttentionNormRopeBatch {
                     values: &qgate_batch,
@@ -6459,7 +6487,7 @@ fn execute_indexed_attention_hc_impl(
             ))?;
         }
         if !k_fused {
-            hip(indexed_attention_norm_rope_batch(
+            hip(norm_rope(
                 gpu,
                 &IndexedAttentionNormRopeBatch {
                     values: &k_batch,
@@ -6502,7 +6530,7 @@ fn execute_indexed_attention_hc_impl(
         // later row rewrites (a rollback rewinds to a position, and the block
         // containing it is re-pooled). Re-pooling the whole prefix every
         // prefill chunk was quadratic in the context.
-        hip(indexed_attention_pool_rope_incremental(
+        hip(pool_rope(
             gpu,
             &IndexedAttentionPoolRope {
                 raw_keys: op.state.raw_index_keys,
@@ -8349,6 +8377,7 @@ mod tests {
             lloyd_lut_c16: None,
         };
         IndexedAttentionOp {
+            mrope: None,
             rotary_dim: 2,
             rope: rdna_compute::rope::Rope {
                 theta: 10_000_000.0,
