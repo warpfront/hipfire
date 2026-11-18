@@ -1010,6 +1010,11 @@ required-features = ["lab"]
 name = "bench_attention_flux_vt"
 required-features = ["lab"]
 
+# TEMPORARY diagnostic (delete before commit): fwht4 GQA vs scalar tile
+# differential. Lab-gated like the other tmp probes.
+[[example]]
+name = "tmp_fwht_gqa_oracle"
+required-features = ["lab"]
 
 [[example]]
 name = "test_kv_slot_desc_ports"
