@@ -1661,11 +1661,7 @@ pub(crate) fn lloyd_c16_or_fail(w: &WeightRef<'_>, family: &'static str) -> HipR
 /// forces fail-closed via the existing FP8-LUT arm (never uniform).
 #[inline]
 pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
-    matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
-        && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_OFF")
-            .ok()
-            .as_deref()
-            != Some("1")
+    matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151") && !gpu.flags.lloyd_mmq_off
 }
 
 /// Twin route (T3, default OFF): exact gfx1100 only (the twin TU is V2C-free
@@ -1684,15 +1680,7 @@ pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
 /// per-launch gates still fail closed at dispatch.
 #[inline]
 pub fn lloyd_mmq_a4_static_admitted(gpu: &Gpu) -> bool {
-    gpu.arch.as_str() == "gfx1100"
-        && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_A4")
-            .ok()
-            .as_deref()
-            == Some("1")
-        && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_OFF")
-            .ok()
-            .as_deref()
-            != Some("1")
+    gpu.arch.as_str() == "gfx1100" && gpu.flags.lloyd_mmq_a4 && !gpu.flags.lloyd_mmq_off
 }
 
 #[inline]
@@ -1735,14 +1723,8 @@ pub(crate) fn lloyd_f16_bt_route(gpu: &Gpu, n: usize) -> bool {
         && n < 64
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
-        && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_OFF")
-            .ok()
-            .as_deref()
-            != Some("1")
-        && hipfire_config::developer_var("HIPFIRE_LLOYD_F16_GFX11")
-            .ok()
-            .as_deref()
-            != Some("0")
+        && !gpu.flags.lloyd_mmq_off
+        && gpu.flags.lloyd_f16_gfx11
 }
 
 /// True when all listed projection dtypes are the Lloyd-V2 dtype.

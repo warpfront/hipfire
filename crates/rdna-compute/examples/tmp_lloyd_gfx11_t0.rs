@@ -18,6 +18,13 @@ use std::time::Instant;
 
 const K: usize = 2048;
 const ITERS: usize = 11;
+/// A twin with an identity codebook decodes the same values as its uniform
+/// kernel; anything above f32 reassociation noise is a mismatch.
+const TWIN_REL_L2_MAX: f64 = 1e-6;
+/// BT vs MMQ-LUT legitimately differ by Q8-activation noise (~1e-3).
+const BT_VS_MMQ_REL_L2_MAX: f64 = 5e-3;
+/// Comparisons over their bound; any makes the run exit non-zero.
+static FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn f16_bits(v: f32) -> u16 {
     half::f16::from_f32(v).to_bits()
@@ -125,8 +132,14 @@ fn report(gpu: &Gpu, tag: (&str, usize, usize), tu: f64, tl: f64, ab: (&[f32], &
         den += a[i] as f64 * a[i] as f64;
     }
     let rel = (num / den).sqrt();
+    let verdict = if rel <= TWIN_REL_L2_MAX {
+        "PASS"
+    } else {
+        FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        "FAIL"
+    };
     eprintln!(
-        "{label} N={n} bt={bt}: uniform {tu:.6}s lloyd {tl:.6}s delta {:+.1}% max_abs={max_abs:.3e} rel_l2={rel:.3e}",
+        "{label} N={n} bt={bt}: uniform {tu:.6}s lloyd {tl:.6}s delta {:+.1}% max_abs={max_abs:.3e} rel_l2={rel:.3e} {verdict}",
         (tl / tu - 1.0) * 100.0
     );
 }
@@ -152,10 +165,11 @@ fn report_btvmmq(gpu: &Gpu, label: &str, n: usize, tbt: f64, tmmq: f64, ab: (&[f
         den += a[i] as f64 * a[i] as f64;
     }
     let rel = (num / den).sqrt();
-    let verdict = if rel < 5e-3 {
+    let verdict = if rel < BT_VS_MMQ_REL_L2_MAX {
         "SCREEN-PASS"
     } else {
-        "SCREEN-CHECK"
+        FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        "SCREEN-FAIL"
     };
     eprintln!(
         "{label} N={n}: BT {tbt:.6}s MMQ {tmmq:.6}s delta {:+.1}% max_abs={max_abs:.3e} rel_l2={rel:.3e} {verdict}",
@@ -660,5 +674,10 @@ fn main() {
                 report_btvmmq(&gpu, "qkvza", n, tbt, tmmq, (&a, &b));
             }
         }
+    }
+    let failures = FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    if failures > 0 {
+        eprintln!("t0: {failures} comparison(s) failed");
+        std::process::exit(1);
     }
 }

@@ -1043,6 +1043,16 @@ pub struct FeatureFlags {
     /// (kill switch); acted on for exact gfx1100 only
     /// (`fwht4_gqa_decode_gfx1100_enabled`).
     pub fwht4_gqa_decode_gfx1100: bool,
+    /// `HIPFIRE_LLOYD_MMQ_OFF`: kill switch of every MQ4G256V2-Lloyd (qt=52) gfx11
+    /// prefill route (MMQ-LUT, the opt-in A4 twin and the small-N F16-BT twin);
+    /// fail-closed, never uniform. Legacy bool grammar, default off.
+    pub lloyd_mmq_off: bool,
+    /// `HIPFIRE_LLOYD_MMQ_A4`: opt-in exact-gfx1100 Lloyd staged-i8 (A4) MMQ twin
+    /// prefill; exactly `1`, default off.
+    pub lloyd_mmq_a4: bool,
+    /// `HIPFIRE_LLOYD_F16_GFX11`: exact-gfx1100 small-N (N<64) Lloyd F16-BT-LUT
+    /// prefill twins; on unless the value is exactly `0`.
+    pub lloyd_f16_gfx11: bool,
     /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE`: the q8 grouped prefill attention
     /// (`indexed_attention_attention_q8_batched_hg4`) runs its bit-identical
     /// low-LDS twin `..._hg4_lite`. Parsed on unless the value is exactly `0`
@@ -1889,6 +1899,9 @@ impl FeatureFlags {
                 .ok()
                 .as_deref()
                 != Some("0"),
+            lloyd_mmq_off: parse_bool("HIPFIRE_LLOYD_MMQ_OFF").unwrap_or(false),
+            lloyd_mmq_a4: value("HIPFIRE_LLOYD_MMQ_A4").ok().as_deref() == Some("1"),
+            lloyd_f16_gfx11: on_unless_zero("HIPFIRE_LLOYD_F16_GFX11"),
             qwen4_qsa_hg4_q8_lite: value("HIPFIRE_QWEN4_QSA_HG4_Q8_LITE").ok().as_deref()
                 != Some("0"),
             qwen4_hc_mix_fill80_gfx1100: value("HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100")
@@ -2870,6 +2883,9 @@ impl FeatureFlags {
             qwen4_qsa_code_check: false,
             mq6_resid_port_gfx1100: false,
             fwht4_gqa_decode_gfx1100: false,
+            lloyd_mmq_off: false,
+            lloyd_mmq_a4: false,
+            lloyd_f16_gfx11: false,
             qwen4_qsa_hg4_q8_lite: false,
             qwen4_hc_mix_fill80_gfx1100: false,
             gate_up_bt: false,

@@ -166,8 +166,10 @@ fn is_mq4(dtype: DType) -> bool {
 
 /// MQ rotation contract for decode fusions: Lloyd (qt=52) shares qt=44's
 /// FWHT input rotation; only the weight codebook differs (handled downstream).
-fn is_mq4_rot(dtype: DType) -> bool {
-    is_mq4(dtype) || dtype == DType::MQ4G256V2Lloyd
+/// Lloyd is admitted on exact gfx1100 only, the arch its decode fusions were
+/// measured on; every other arch keeps the unfused Lloyd route.
+fn is_mq4_rot(gpu: &Gpu, dtype: DType) -> bool {
+    is_mq4(dtype) || (dtype == DType::MQ4G256V2Lloyd && gpu.arch == "gfx1100")
 }
 
 /// Decode path that keeps DeltaNet Q/K at their native head count and lets
@@ -228,7 +230,7 @@ pub fn gated_norm_mq_rotate(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>) ->
     admitted_arch_shape
         && dims.linear_value_dim == 128
         && wo.k == n_v_heads * dims.linear_value_dim
-        && is_mq4_rot(wo.dtype)
+        && is_mq4_rot(gpu, wo.dtype)
 }
 
 /// Fold the single-token Q8_0 KV-cache write into the FA-prep epilogue on the
@@ -293,7 +295,7 @@ pub fn fused_attention_epilogue(gpu: &Gpu, dims: &HybridDims, wo: &WeightRef<'_>
             && dims.is_dense_27b_shape()
             && dims.n_heads == 24
             && dims.n_kv_heads == 4);
-    admitted_arch_shape && dims.head_dim == 256 && is_mq4_rot(wo.dtype)
+    admitted_arch_shape && dims.head_dim == 256 && is_mq4_rot(gpu, wo.dtype)
 }
 
 /// fp8: admitted only for the flash-tile attend key whose [2+head_dim] f32

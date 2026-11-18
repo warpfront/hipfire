@@ -448,8 +448,6 @@ developer_callsite	*	HIPFIRE_LFM2_CAPTURE_POSTMIXER#developer_var_os=is_some
 developer_callsite	*	HIPFIRE_LFM2_GRAPH#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_LFM2_LOAD_TRACE#developer_var=map.unwrap_or(false)
 developer_callsite	*	HIPFIRE_LLOYD_K3#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_LLOYD_MMQ_OFF#developer_bool=false
-developer_callsite	*	HIPFIRE_LLOYD_MMQ_OFF#developer_var=ok.as_deref.!=Some("1")
 developer_callsite	*	HIPFIRE_LM_HEAD_HFQ2#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_LM_HEAD_HFQ3#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_LM_HEAD_HFQ4#developer_var=ok.as_deref.==Some("1")

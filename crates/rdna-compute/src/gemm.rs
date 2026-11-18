@@ -20391,7 +20391,7 @@ impl Gpu {
     /// gfx1100|gfx1151, K%256, batch>0. Batch granularity is handled inside
     /// the conveniences (GEMV N<64, pad-to-128 otherwise, direct N%128==0).
     fn lloyd_mmq_family_gate(&self, launcher: &str, k: usize, batch_size: usize) -> HipResult<()> {
-        if hipfire_config::developer_bool("HIPFIRE_LLOYD_MMQ_OFF", false) {
+        if self.flags.lloyd_mmq_off {
             return Err(hip_bridge::HipError::new(
                 1,
                 &format!("{launcher}: HIPFIRE_LLOYD_MMQ_OFF=1 (fail-closed)"),
@@ -34810,11 +34810,7 @@ impl Gpu {
                 ),
             ));
         }
-        if hipfire_config::developer_var("HIPFIRE_LLOYD_F16_GFX11")
-            .ok()
-            .as_deref()
-            == Some("0")
-        {
+        if !self.flags.lloyd_f16_gfx11 {
             return Err(hip_bridge::HipError::new(
                 0,
                 "gemm_qkvza_mq4g256v2_wmma_gfx11_lloyd opted out via HIPFIRE_LLOYD_F16_GFX11=0",
@@ -36267,11 +36263,7 @@ impl Gpu {
                 ),
             ));
         }
-        if hipfire_config::developer_var("HIPFIRE_LLOYD_F16_GFX11")
-            .ok()
-            .as_deref()
-            == Some("0")
-        {
+        if !self.flags.lloyd_f16_gfx11 {
             return Err(hip_bridge::HipError::new(
                 0,
                 "gemm_qkv_mq4g256v2_wmma_gfx11_lloyd opted out via HIPFIRE_LLOYD_F16_GFX11=0",
@@ -37718,11 +37710,7 @@ impl Gpu {
                 ),
             ));
         }
-        if hipfire_config::developer_var("HIPFIRE_LLOYD_F16_GFX11")
-            .ok()
-            .as_deref()
-            == Some("0")
-        {
+        if !self.flags.lloyd_f16_gfx11 {
             return Err(hip_bridge::HipError::new(
                 0,
                 "gemm_gate_up_mq4g256v2_wmma_gfx11_lloyd opted out via HIPFIRE_LLOYD_F16_GFX11=0",
@@ -39907,11 +39895,7 @@ impl Gpu {
                 ),
             ));
         }
-        if hipfire_config::developer_var("HIPFIRE_LLOYD_F16_GFX11")
-            .ok()
-            .as_deref()
-            == Some("0")
-        {
+        if !self.flags.lloyd_f16_gfx11 {
             return Err(hip_bridge::HipError::new(
                 0,
                 "gemm_mq4g256v2_residual_wmma_gfx11_lloyd opted out via HIPFIRE_LLOYD_F16_GFX11=0",

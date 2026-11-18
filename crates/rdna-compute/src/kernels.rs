@@ -2513,20 +2513,20 @@ pub const GEMV_MQ4G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4
 /// dwords (16 centered f16 codebook levels, staged to LDS) and decodes nibbles
 /// through them (`w = sc*C[q] + zp'`, zp' pre-folded in the headers). Distinct
 /// symbol (`gemv_mq4g256v2_lloyd`) so the module cannot alias the uniform one.
+/// Weight buffer loads (`gfx12_weight_cache_policy.inc`) are eligible on exact
+/// gfx1100 only; every other arch keeps plain pointer loads.
 pub const GEMV_MQ4G256V2_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_lloyd\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#if defined(__gfx1100__)\n#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n#endif\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_mq4g256v2_lloyd.hip")
 );
 /// Residual-epilogue twin of `GEMV_MQ4G256V2_LUT_SRC` (`y +=`, symbol
 /// `gemv_mq4g256v2_residual_lloyd`): the single-row Lloyd body, kept for
 /// non-gfx1100 arches (the dual-row body below regressed gfx1151 decode by
-/// ~3%). Lloyd-only source, so the uniform residual pin is untouched.
+/// ~3%). Same bytes as before the dual-row twin: plain pointer loads.
 pub const GEMV_MQ4G256V2_RESIDUAL_LUT_SRC: &str = concat!(
     "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_lloyd\n",
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
 );
 /// Dual-row residual twin (2 rows/wave, hoisted float4 x reused across both
