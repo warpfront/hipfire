@@ -1950,12 +1950,19 @@ impl DeltaNetSnapshot {
 
     /// Queue only the validated bulk save; false retains the synchronous fallback.
     /// The caller must drain the active stream even when the launch returns an error.
+    ///
+    /// Same contract as [`Self::save_from`] minus the stream sync: refuses a
+    /// structural mismatch before launching, moves the carry only while the
+    /// stream is Open, and records the stream image at enqueue time. The
+    /// caller must not touch `state`'s stream between the enqueue and the drain.
     fn enqueue_bulk_save(&mut self, state: &DeltaNetState, gpu: &mut Gpu) -> HipResult<bool> {
+        self.check_structure(state)?;
         let carry = Self::carries(&state.stream.meta);
         let Some((table, n)) = self.bulk_table(state, gpu, true, carry) else {
             return Ok(false);
         };
         gpu.dflash_state_bulk_copy_gfx1100(table.as_ptr() as *const _, n)?;
+        self.capture_stream(state);
         Ok(true)
     }
 
@@ -12790,48 +12797,157 @@ mod tests {
     #[test]
     #[ignore = "requires an idle gfx1100/gfx1151/gfx1201 GPU; bulk snapshot byte oracle"]
     fn dflash_snapshot_overlap_bulk_copy_is_exact() {
+        use crate::qwen35::weights::{DeltaNetCarry, GdnStreamOwner};
+        use rdna_compute::gdn_stream::{GdnCarryGeometry, GdnStreamPhase};
+
+        /// Tiny state with an EF residual and a one-lane GDN carry, so the
+        /// Open (carry moved) and Sealed (carry left) routes both run.
+        fn carried_state(gpu: &mut Gpu) -> DeltaNetState {
+            let geometry = GdnCarryGeometry {
+                hk: 1,
+                hv: 1,
+                head_dim: 2,
+                conv_hist_rows: 3,
+                micro_rows: 2,
+            };
+            let mut f32s = |bytes: usize| vec![gpu.zeros(&[bytes / 4], DType::F32).unwrap()];
+            let carry = DeltaNetCarry {
+                geometry,
+                lanes: 1,
+                tile_state: f32s(geometry.state_bytes()),
+                tile_conv: f32s(geometry.conv_bytes()),
+                raw_qkv: f32s(geometry.raw_qkv_bytes()),
+                raw_ab: f32s(geometry.raw_ab_bytes()),
+            };
+            let mut state = tiny_dn_with_ef(gpu);
+            state.stream = GdnStreamOwner::new(1, 1, Some(carry));
+            state
+        }
+        /// Distinct bytes per family and `salt` across all eight live families.
+        fn fill(gpu: &Gpu, state: &DeltaNetState, salt: usize) {
+            for (family, tensors) in live_families(state).iter().enumerate() {
+                for tensor in tensors.iter() {
+                    let bytes: Vec<_> = (0..tensor.buf.size())
+                        .map(|i| ((i * 13 + family * 71 + salt * 29) % 251) as u8)
+                        .collect();
+                    gpu.hip.memcpy_htod(&tensor.buf, &bytes).unwrap();
+                }
+            }
+        }
+        fn bytes_of(gpu: &Gpu, buffer: &DeviceBuffer) -> Vec<u8> {
+            let mut bytes = vec![0; buffer.size()];
+            gpu.hip.memcpy_dtoh(&mut bytes, buffer).unwrap();
+            bytes
+        }
+        /// `[family][layer]` bytes of the backup.
+        fn read(gpu: &Gpu, snapshot: &DeltaNetSnapshot) -> Vec<Vec<Vec<u8>>> {
+            snapshot
+                .back_families()
+                .iter()
+                .map(|fam| fam.iter().map(|b| bytes_of(gpu, b)).collect())
+                .collect()
+        }
+        /// `[family][layer]` bytes of the live state.
+        fn read_live(gpu: &Gpu, state: &DeltaNetState) -> Vec<Vec<Vec<u8>>> {
+            live_families(state)
+                .iter()
+                .map(|fam| fam.iter().map(|t| bytes_of(gpu, &t.buf)).collect())
+                .collect()
+        }
+        fn open_at(owner: &mut GdnStreamOwner, position: u64, pending: u32) {
+            for m in &mut owner.meta {
+                m.phase = GdnStreamPhase::Open;
+                m.position = position;
+                m.phase_start = 0;
+                m.frame_base = position / 512 * 512;
+                m.tile_base = position - u64::from(pending);
+                m.pending_rows = pending;
+            }
+        }
+        fn sealed_at(owner: &mut GdnStreamOwner, position: u64) {
+            for m in &mut owner.meta {
+                m.phase = GdnStreamPhase::Sealed;
+            }
+            owner.seal_sealed_at(position).unwrap();
+        }
+
         let mut gpu = Gpu::init().unwrap();
         gpu.active_stream = Some(gpu.hip.stream_create().unwrap());
         std::sync::Arc::make_mut(&mut gpu.flags).dn_snapshot_bulk_off = false;
         assert!(DeltaNetSnapshot::bulk_arch(&gpu));
-        let mut state = tiny_dn_with_ef(&mut gpu);
-        for (family, tensor) in state
-            .s_matrices
-            .iter()
-            .chain(&state.s_scales)
-            .chain(&state.conv_states)
-            .chain(&state.s_ef_residual)
-            .enumerate()
-        {
-            let bytes: Vec<_> = (0..tensor.buf.size())
-                .map(|i| ((i * 13 + family * 71) % 251) as u8)
-                .collect();
-            gpu.hip.memcpy_htod(&tensor.buf, &bytes).unwrap();
-        }
+        let mut state = carried_state(&mut gpu);
+        fill(&gpu, &state, 0);
         let mut reference = DeltaNetSnapshot::new_for(&mut gpu, &state).unwrap();
         let mut candidate = DeltaNetSnapshot::new_for(&mut gpu, &state).unwrap();
+        assert!(candidate.bulk_n_items > candidate.bulk_n_state);
+
+        // Open: the cursors move after `new_for`, so an enqueue that skipped
+        // `capture_stream` would keep the stale Sealed@0 image.
+        open_at(&mut state.stream, 70, 1);
+        let open_meta = state.stream.meta.clone();
+        assert!(DeltaNetSnapshot::carries(&open_meta));
         reference.save_from(&state, &mut gpu).unwrap();
         assert!(candidate.enqueue_bulk_save(&state, &mut gpu).unwrap());
         DeltaNetSnapshot::bulk_sync(&gpu).unwrap();
-        fn read(gpu: &Gpu, snapshot: &DeltaNetSnapshot) -> Vec<Vec<u8>> {
-            snapshot
-                .s_matrix_bufs
-                .iter()
-                .chain(&snapshot.s_scale_bufs)
-                .chain(&snapshot.conv_state_bufs)
-                .chain(&snapshot.s_ef_residual_bufs)
-                .map(|buffer| {
-                    let mut bytes = vec![0; buffer.size()];
-                    gpu.hip.memcpy_dtoh(&mut bytes, buffer).unwrap();
-                    bytes
-                })
-                .collect()
-        }
+        let open_live = read_live(&gpu, &state);
         let expected = read(&gpu, &reference);
+        assert_eq!(expected, open_live, "Open save moves all eight families");
         assert_eq!(read(&gpu, &candidate), expected);
-        let mut other = tiny_dn_with_ef(&mut gpu);
+        assert_eq!(candidate.stream.identity, reference.stream.identity);
+        assert_eq!(candidate.stream.meta, reference.stream.meta);
+        assert_eq!(candidate.stream.meta, open_meta);
+
+        // Rejected draft: verify advances bytes and cursors; the rollback
+        // restores both from the enqueued save.
+        fill(&gpu, &state, 1);
+        sealed_at(&mut state.stream, 86);
+        candidate.restore_to(&mut state, &mut gpu).unwrap();
+        assert_eq!(read_live(&gpu, &state), open_live);
+        assert_eq!(state.stream.meta, open_meta);
+
+        // Sealed: the carry is not moved, the cursors are still captured.
+        fill(&gpu, &state, 2);
+        sealed_at(&mut state.stream, 90);
+        let sealed_meta = state.stream.meta.clone();
+        assert!(!DeltaNetSnapshot::carries(&sealed_meta));
+        reference.save_from(&state, &mut gpu).unwrap();
+        assert!(candidate.enqueue_bulk_save(&state, &mut gpu).unwrap());
+        DeltaNetSnapshot::bulk_sync(&gpu).unwrap();
+        let sealed_live = read_live(&gpu, &state);
+        let sealed_back = read(&gpu, &candidate);
+        assert_eq!(sealed_back, read(&gpu, &reference));
+        assert_eq!(sealed_back[..4], sealed_live[..4]);
+        assert_eq!(
+            sealed_back[4..],
+            open_live[4..],
+            "Sealed save keeps the carry"
+        );
+        assert_eq!(candidate.stream.meta, reference.stream.meta);
+        assert_eq!(candidate.stream.meta, sealed_meta);
+        fill(&gpu, &state, 3);
+        open_at(&mut state.stream, 94, 0);
+        let scribbled = read_live(&gpu, &state);
+        candidate.restore_to(&mut state, &mut gpu).unwrap();
+        let restored = read_live(&gpu, &state);
+        assert_eq!(restored[..4], sealed_live[..4]);
+        assert_eq!(
+            restored[4..],
+            scribbled[4..],
+            "Sealed restore leaves the carry"
+        );
+        assert_eq!(state.stream.meta, sealed_meta);
+
+        // Structure mismatch refuses before launching or capturing.
+        let mut plain = tiny_dn_with_ef(&mut gpu);
+        assert!(candidate.enqueue_bulk_save(&plain, &mut gpu).is_err());
+        assert_eq!(read(&gpu, &candidate), sealed_back);
+        assert_eq!(candidate.stream.meta, sealed_meta);
+
+        // Stale fingerprint keeps the synchronous fallback.
+        let mut other = carried_state(&mut gpu);
+        fill(&gpu, &other, 4);
         assert!(!candidate.enqueue_bulk_save(&other, &mut gpu).unwrap());
-        assert_eq!(read(&gpu, &candidate), expected);
+        assert_eq!(read(&gpu, &candidate), sealed_back);
         candidate.save_from(&other, &mut gpu).unwrap();
         reference.save_from(&other, &mut gpu).unwrap();
         assert_eq!(read(&gpu, &candidate), read(&gpu, &reference));
@@ -12841,6 +12957,7 @@ mod tests {
         candidate.free_gpu(&mut gpu);
         state.free_gpu(&mut gpu);
         other.free_gpu(&mut gpu);
+        plain.free_gpu(&mut gpu);
     }
 
     #[test]
