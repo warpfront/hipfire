@@ -15213,8 +15213,8 @@ impl Gpu {
     /// One 256-thread workgroup per (kv head, tile) serves all six query
     /// heads: each K/V tile is read once instead of once per head. Same
     /// partials ABI and reduce as [`Self::attention_flash_fwht4`]; the
-    /// tile kernel covers v_mode 8 (Q8_0 V) and 4 (lloyd4 V). Other modes
-    /// keep the scalar tile (host-gated at the dispatch site).
+    /// tile kernel covers v_mode 8 (Q8_0 V) only and refuses every other
+    /// mode (the scalar tile serves them, host-gated at the dispatch site).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_fwht4_tile_gqa_gfx11(
         &mut self,
@@ -15246,10 +15246,10 @@ impl Gpu {
                 "attention_flash_fwht4_tile_gqa_gfx11 requires H24/KV4/D256",
             ));
         }
-        if v_mode_bits != 8 && v_mode_bits != 4 {
+        if v_mode_bits != 8 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "attention_flash_fwht4_tile_gqa_gfx11 requires v_mode 8 or 4",
+                "attention_flash_fwht4_tile_gqa_gfx11 requires v_mode 8 (Q8_0 V)",
             ));
         }
         const TILE_SIZE: usize = 128;
@@ -15302,10 +15302,9 @@ impl Gpu {
                 &mut vm as *mut _ as *mut c_void,
             ];
             // One workgroup per (kv head, tile); block 256. Static LDS only
-            // (~17.5 KB: V slab + Q + scores, worst-case Q8 V; lloyd4 V
-            // is smaller); no dynamic shared use. No K LDS — keys are
-            // partitioned across the 8 waves (16 each) and read straight
-            // from global with scalar-identical addressing.
+            // (~17.5 KB: V slab + Q + scores, Q8 V); no dynamic shared use.
+            // No K LDS — keys are partitioned across the 8 waves (16 each)
+            // and read straight from global with scalar-identical addressing.
             // Cap Y like the Q8 GQA tile so a graph-captured grid does not
             // dispatch thousands of idle workgroups.
             let grid_y = launch_tiles.min(512);

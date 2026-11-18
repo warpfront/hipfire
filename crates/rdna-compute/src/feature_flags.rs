@@ -1034,6 +1034,12 @@ pub struct FeatureFlags {
     /// picks MW8. Parsed on unless the value is exactly `0` (kill switch);
     /// acted on for exact gfx1100 only (`mq6_resid_port_gfx1100_enabled`).
     pub mq6_resid_port_gfx1100: bool,
+    /// `HIPFIRE_FWHT4_GQA_GFX1100`: the exact-gfx1100 fwht4 decode attention
+    /// runs the GQA-shared tile (`attention_flash_fwht4_tile_gqa_gfx11`) for
+    /// Q8_0 V at H24/KV4/D256. Parsed on unless the value is exactly `0`
+    /// (kill switch); acted on for exact gfx1100 only
+    /// (`fwht4_gqa_decode_gfx1100_enabled`).
+    pub fwht4_gqa_decode_gfx1100: bool,
     /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE`: the q8 grouped prefill attention
     /// (`indexed_attention_attention_q8_batched_hg4`) runs its bit-identical
     /// low-LDS twin `..._hg4_lite`. Parsed on unless the value is exactly `0`
@@ -1874,6 +1880,10 @@ impl FeatureFlags {
                 .ok()
                 .as_deref()
                 != Some("0"),
+            fwht4_gqa_decode_gfx1100: value("HIPFIRE_FWHT4_GQA_GFX1100")
+                .ok()
+                .as_deref()
+                != Some("0"),
             qwen4_qsa_hg4_q8_lite: value("HIPFIRE_QWEN4_QSA_HG4_Q8_LITE").ok().as_deref()
                 != Some("0"),
             qwen4_hc_mix_fill80_gfx1100: value("HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100")
@@ -2077,6 +2087,14 @@ impl FeatureFlags {
     /// (`HIPFIRE_MQ6_RESID_PM_GFX1100`) or hipcc MW8. Bit-identical output.
     pub fn mq6_resid_port_gfx1100_enabled(&self) -> bool {
         self.mq6_resid_port_gfx1100 && self.arch == "gfx1100"
+    }
+
+    /// GQA-shared fwht4-K decode tile (`attention_flash_fwht4_tile_gqa_gfx11`,
+    /// Q8_0 V, H24/KV4/D256): default on, exact gfx1100 only (the only
+    /// architecture it was carded on); `HIPFIRE_FWHT4_GQA_GFX1100=0` restores
+    /// the scalar `attention_flash_fwht4_tile`. Bit-identical partials.
+    pub fn fwht4_gqa_decode_gfx1100_enabled(&self) -> bool {
+        self.fwht4_gqa_decode_gfx1100 && self.arch == "gfx1100"
     }
 
     /// q8 grouped prefill attention low-LDS twin
@@ -2845,6 +2863,7 @@ impl FeatureFlags {
             qwen4_qsa_extent_sync: false,
             qwen4_qsa_code_check: false,
             mq6_resid_port_gfx1100: false,
+            fwht4_gqa_decode_gfx1100: false,
             qwen4_qsa_hg4_q8_lite: false,
             qwen4_hc_mix_fill80_gfx1100: false,
             gate_up_bt: false,
@@ -3373,6 +3392,44 @@ mod tests {
         }
         // for_test zeroes every default-on flag.
         assert!(!FeatureFlags::for_test("gfx1100").mq6_resid_port_gfx1100_enabled());
+    }
+
+    /// The fwht4 GQA decode tile is default on for exact gfx1100 only; exactly
+    /// `0` is the kill switch and every other value keeps it on.
+    #[test]
+    fn fwht4_gqa_decode_gfx1100_defaults_on_exact_gfx1100_and_zero_opts_out() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1201",
+        ] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_FWHT4_GQA_GFX1100" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let exact = arch == "gfx1100";
+            assert!(flags(None).fwht4_gqa_decode_gfx1100, "{arch}: unset");
+            assert_eq!(
+                flags(None).fwht4_gqa_decode_gfx1100_enabled(),
+                exact,
+                "{arch}"
+            );
+            assert!(!flags(Some("0")).fwht4_gqa_decode_gfx1100, "{arch}: 0");
+            assert!(
+                !flags(Some("0")).fwht4_gqa_decode_gfx1100_enabled(),
+                "{arch}: 0"
+            );
+            for raw in ["1", "", "true", "on", "2", " 0", "0 ", "00"] {
+                assert!(flags(Some(raw)).fwht4_gqa_decode_gfx1100, "{arch}: {raw:?}");
+                assert_eq!(
+                    flags(Some(raw)).fwht4_gqa_decode_gfx1100_enabled(),
+                    exact,
+                    "{arch}: {raw:?}"
+                );
+            }
+        }
+        // for_test zeroes every default-on flag.
+        assert!(!FeatureFlags::for_test("gfx1100").fwht4_gqa_decode_gfx1100_enabled());
     }
 
     /// The q8 hg4 lite twin is default on for exact gfx1100 only; exactly `0`

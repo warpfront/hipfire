@@ -17,15 +17,13 @@
 // tile instead of ~20.
 //
 // Output partials use the SAME [n_heads, max_tiles, 2 + 256] layout as
-// attention_flash_fwht4_tile (rotated space for lloyd V, Q8_0 normal space
-// for v_mode 8) and are consumed unchanged by the existing reduce kernels.
-// Per-lane arithmetic mirrors the scalar tile exactly (same DOT4 shape per
-// (head, key), same fma accumulation order in V); the bar is KLD parity +
-// greedy identity (P1 precedent), not claimed bit-identity — though the
-// oracle currently holds bit-identical.
+// attention_flash_fwht4_tile (Q8_0 normal space) and are consumed unchanged
+// by the existing reduce kernels. Per-lane arithmetic mirrors the scalar
+// tile exactly (same DOT4 shape per (head, key), same fma accumulation
+// order in V); the oracle (fwht_gqa_oracle) holds the partials bit-identical.
 //
-// v_mode: 8 = Q8_0 V, 4 = lloyd4 V (256-wide FWHT-rotated). Other modes
-// keep the scalar path (host-gated).
+// Q8_0 V only: the host dispatch admits v_mode 8 and the launcher refuses
+// every other mode (v_mode is kept in the kernarg ABI but unused here).
 #include <hip/hip_runtime.h>
 // turbo_common.h (TURBO_C4_256, fwht_shfl_forward) is prepended by the
 // launcher, NOT #included here: the runtime compile has no -I to
@@ -42,7 +40,7 @@
 #define FGQA_THREADS 256
 // K record: [f32 cnorm][128 B nibbles] per (pos, kv head).
 #define FGQA_K_SEG 132
-// V slab: 32 keys; lloyd4 132 B/head, Q8_0 272 B/head (worst case sizes it).
+// V slab: 32 keys of Q8_0 V, 272 B/head.
 #define FGQA_V_TILE 32
 // LDS carve: V slab (worst case) + Q 6*256 floats + scores 6*128 floats.
 #define FGQA_V_DWORDS (FGQA_V_TILE * 272 / 4)
@@ -53,7 +51,7 @@ extern "C" __launch_bounds__(FGQA_THREADS, 1)
 __global__ void attention_flash_fwht4_tile_gqa_gfx11(
     const float* __restrict__ q,                // [n_heads, 256], f32
     const unsigned char* __restrict__ k_cache,  // fwht4 K rows
-    const unsigned char* __restrict__ v_cache,  // Q8_0 or lloyd4 V rows
+    const unsigned char* __restrict__ v_cache,  // Q8_0 V rows
     float* __restrict__ partials,               // [n_heads, max_tiles, 2 + 256]
     const int* __restrict__ pos_buf,            // pos_buf[0] = last position
     const float* __restrict__ signs1,
@@ -70,6 +68,12 @@ __global__ void attention_flash_fwht4_tile_gqa_gfx11(
     const int seq_len = pos_buf[0] + 1;
     const int kv_h = blockIdx.x;
     if (kv_h >= n_kv_heads) return;
+
+    // Uniform per block: a block's first tile id is blockIdx.y, so when
+    // blockIdx.y >= n_tiles the grid-stride loop below assigns it no tile
+    // on any iteration. Exit before Q staging, FWHT and the first barrier.
+    const int n_tiles = min((seq_len + FGQA_TILE - 1) / FGQA_TILE, max_tiles);
+    if ((int)blockIdx.y >= n_tiles) return;
 
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
@@ -102,7 +106,6 @@ __global__ void attention_flash_fwht4_tile_gqa_gfx11(
     }
     __syncthreads();
 
-    const int n_tiles = min((seq_len + FGQA_TILE - 1) / FGQA_TILE, max_tiles);
     const size_t k_bytes_per_pos = (size_t)n_kv_heads * FGQA_K_SEG;
     const size_t k_head_off = (size_t)kv_h * FGQA_K_SEG;
 
@@ -200,13 +203,12 @@ __global__ void attention_flash_fwht4_tile_gqa_gfx11(
         // ---- V accumulation: waves 0-5 own heads 0-5. V streams in
         // 32-key slabs through LDS (one global read per K/V tile per
         // kv head); accumulators live across slabs, partials are written
-        // once per tile (scalar-identical rotated space for lloyd V).
-        const int v_rec_b = (v_mode == 8) ? 272 : 4 + FGQA_HD * v_mode / 8;
-        const int v_rec_d = v_rec_b / 4;
+        // once per tile (Q8_0 normal space).
+        constexpr int v_rec_b = 272;  // Q8_0 V record: 8 x (f16 scale + 32 i8)
+        constexpr int v_rec_d = v_rec_b / 4;
         const size_t v_bytes_per_pos = (size_t)n_kv_heads * (size_t)v_rec_b;
         const size_t v_head_off = (size_t)kv_h * (size_t)v_rec_b;
         float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-        float ov[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
         for (int slab = 0; slab < tile_len; slab += FGQA_V_TILE) {
             const int slab_len = min(FGQA_V_TILE, tile_len - slab);
             // Stage the slab cooperatively (tails clamp to the last row).
@@ -225,44 +227,20 @@ __global__ void attention_flash_fwht4_tile_gqa_gfx11(
             __syncthreads();
             if (wave < FGQA_GROUP) {
                 const float* ws = sc + wave * FGQA_TILE + slab;
-                if (v_mode == 8) {
-                    for (int tl = 0; tl < slab_len; ++tl) {
-                        const float w = ws[tl];
-                        const unsigned char* vb =
-                            (const unsigned char*)(v_lds + (size_t)tl * (size_t)v_rec_d);
-                        for (int half = 0; half < 2; ++half) {
-                            const int d_base = half * 128 + lane * 4;
-                            const int v_bi = d_base / 32;
-                            const int v_bj = d_base % 32;
-                            const unsigned char* vbh = vb + (size_t)v_bi * 34u;
-                            const float qq = (float)(*((const _Float16*)vbh));
-                            out_vec[half * 4 + 0] += w * (qq * (float)((signed char)vbh[2 + v_bj + 0]));
-                            out_vec[half * 4 + 1] += w * (qq * (float)((signed char)vbh[2 + v_bj + 1]));
-                            out_vec[half * 4 + 2] += w * (qq * (float)((signed char)vbh[2 + v_bj + 2]));
-                            out_vec[half * 4 + 3] += w * (qq * (float)((signed char)vbh[2 + v_bj + 3]));
-                        }
-                    }
-                } else {
-                    const int d0 = lane * 8;
-                    for (int tl = 0; tl < slab_len; ++tl) {
-                        const float w = ws[tl];
-                        const unsigned char* vb =
-                            (const unsigned char*)(v_lds + (size_t)tl * (size_t)v_rec_d);
-                        float cnorm;
-                        __builtin_memcpy(&cnorm, vb, 4);
-                        const unsigned char* base = vb + 4 + lane * (unsigned)v_mode;
-                        unsigned int packed = (unsigned int)base[0];
-                        if (v_mode >= 2) packed |= ((unsigned int)base[1] << 8);
-                        if (v_mode >= 3) packed |= ((unsigned int)base[2] << 16);
-                        if (v_mode >= 4) packed |= ((unsigned int)base[3] << 24);
-#pragma unroll
-                        for (int i = 0; i < 8; i++) {
-                            float c;
-                            if (v_mode == 2)      c = TURBO_C2_256[(packed >> (i * 2)) & 3];
-                            else if (v_mode == 3) c = TURBO_C3_256[(packed >> (i * 3)) & 7];
-                            else                  c = TURBO_C4_256[(packed >> (i * 4)) & 15];
-                            ov[i] += w * (cnorm * c);
-                        }
+                for (int tl = 0; tl < slab_len; ++tl) {
+                    const float w = ws[tl];
+                    const unsigned char* vb =
+                        (const unsigned char*)(v_lds + (size_t)tl * (size_t)v_rec_d);
+                    for (int half = 0; half < 2; ++half) {
+                        const int d_base = half * 128 + lane * 4;
+                        const int v_bi = d_base / 32;
+                        const int v_bj = d_base % 32;
+                        const unsigned char* vbh = vb + (size_t)v_bi * 34u;
+                        const float qq = (float)(*((const _Float16*)vbh));
+                        out_vec[half * 4 + 0] += w * (qq * (float)((signed char)vbh[2 + v_bj + 0]));
+                        out_vec[half * 4 + 1] += w * (qq * (float)((signed char)vbh[2 + v_bj + 1]));
+                        out_vec[half * 4 + 2] += w * (qq * (float)((signed char)vbh[2 + v_bj + 2]));
+                        out_vec[half * 4 + 3] += w * (qq * (float)((signed char)vbh[2 + v_bj + 3]));
                     }
                 }
             }
@@ -270,19 +248,12 @@ __global__ void attention_flash_fwht4_tile_gqa_gfx11(
         }
         if (wave < FGQA_GROUP) {
             float* p = partials + ((size_t)(h0 + wave) * max_tiles + tile_id) * (2 + FGQA_HD);
-            if (v_mode == 8) {
-                for (int half = 0; half < 2; ++half) {
-                    const int d_base = half * 128 + lane * 4;
-                    p[2 + d_base + 0] = out_vec[half * 4 + 0];
-                    p[2 + d_base + 1] = out_vec[half * 4 + 1];
-                    p[2 + d_base + 2] = out_vec[half * 4 + 2];
-                    p[2 + d_base + 3] = out_vec[half * 4 + 3];
-                }
-            } else {
-                const int d0 = lane * 8;
-#pragma unroll
-                for (int i = 0; i < 8; i++)
-                    p[2 + d0 + i] = ov[i];
+            for (int half = 0; half < 2; ++half) {
+                const int d_base = half * 128 + lane * 4;
+                p[2 + d_base + 0] = out_vec[half * 4 + 0];
+                p[2 + d_base + 1] = out_vec[half * 4 + 1];
+                p[2 + d_base + 2] = out_vec[half * 4 + 2];
+                p[2 + d_base + 3] = out_vec[half * 4 + 3];
             }
         }
     }

@@ -44,6 +44,7 @@ module	attention_flash_fwht3_tile_hd512	no-caller	No production caller; only def
 module	attention_flash_fwht4_tile	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:15287
 module	attention_flash_fwht4_tile_batched	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:13429
 module	attention_flash_fwht4_tile_batched_paged	config-opt-in	Non-default configuration: attention.rs / serve.multi_slot; rdna-compute/src/attention.rs:11406
+module	attention_flash_fwht4_tile_gqa_gfx11	config-opt-in	Non-default configuration: attention.rs / memory.kv_cache; rdna-compute/src/attention.rs:14834
 module	attention_flash_gqa_fused	non-core-family	Non-core family route: Qwen2/Llama; rdna-compute/src/attention.rs:1339
 module	attention_flash_gqa_partial	non-core-family	Non-core family route: Qwen2/Llama; rdna-compute/src/attention.rs:1233
 module	attention_flash_lloyd_reduce	config-opt-in	Non-default configuration: attention.rs / memory.kv_k; rdna-compute/src/attention.rs:11497
