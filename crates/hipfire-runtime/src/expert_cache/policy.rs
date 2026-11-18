@@ -35,20 +35,33 @@
 //!   withdrawn victim. A group with nothing pending keeps the live generation and its lease.
 //! * `windows == 0` is a publication-only plan (no judging, no admission, no counters but the
 //!   staged completions): the warm start's seeds and the `reserve` path publish through it.
-//! * Peer quarantine, boundary heat mode and pins are not part of the core.
+//! * Peer quarantine, the boundary heat mode and the quarantine reserve are not hard-wired: they
+//!   are an [`AdmissionStrategy`] over the core's `Evicting` slots (module [`super::admission`]).
+//!   A peer pool ([`PoolMode::peer`]) retires against a [`PeerReaderFence`]
+//!   ([`ExpertCachePolicy::retire_generation_with`]) and reclaims a withdrawn slot only once the
+//!   token's `released_through` covers it; a held slot stays `Evicting` (and parked) across
+//!   retirements. When the pool's generation is retired BEFORE the plan
+//!   ([`ExpertCachePolicy::retire_generation_now`]: D2 retires every group) the plan itself
+//!   reclaims the covered slots before it admits, so a freed slot can take a fill in the same
+//!   plan.
 
 use std::cmp::Reverse;
 use std::collections::VecDeque;
 
 use railgun::sealed_table::generation::{
-    acquire_window_owned, finish_window, Expert, FenceBackend, FenceFailure, FillComplete,
-    FillTicket, FillsNotDone, GenerationId, GenerationRetired, LentBlock, OwnedTableGeneration,
-    PendingFills, PendingOrQuarantined, PendingWindow, QuarantinedWindow, ResidencyError, SlotBank,
-    SlotCell, SlotPhaseView, SlotSpan, Staging, TableBacking, WindowReadLease,
+    acquire_window_owned, finish_window, BlockReclaimed, Expert, FenceBackend, FenceFailure,
+    FillComplete, FillTicket, FillsNotDone, GenerationId, GenerationRetired, LentBlock,
+    OwnedTableGeneration, PeerReaderFence, PendingFills, PendingOrQuarantined, PendingRestore,
+    PendingWindow, QuarantinedWindow, Quiesced, ResidencyError, ScratchLoan, SlotBank, SlotCell,
+    SlotPhaseView, SlotSpan, Staging, TableBacking, WindowReadLease,
 };
 use railgun::window::Quiescence;
 use railgun::Binding;
 
+use super::admission::{
+    clean_score, AdmissionStrategy, Cand, Candidate, CandidateSink, DefaultAdmission, EvictMode,
+    PassContext, PlanContext, SlotHold, Victim,
+};
 use super::index::{KeyIndex, Loc};
 use super::window::{
     CancelOutcome, ConsumerId, RetireCadence, WindowBook, DEFAULT_GROUP_MAX_WINDOWS,
@@ -117,6 +130,17 @@ pub struct PoolInit {
     /// The fills are in [`ExpertCachePolicy::take_fills`]; once their completions are delivered a
     /// publication-only plan (`plan_group(0, ..)`) publishes them.
     pub seed: Vec<(ExpertKey, u32)>,
+}
+
+/// How one pool's bank behaves. Kept apart from [`PoolInit`] so existing constructions of it
+/// stay valid; see [`ExpertCachePolicy::new_with_modes`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolMode {
+    /// PEER mode (`SlotBank::new`'s `peer`): a withdrawn slot reclaims only once every peer
+    /// reader acknowledged its unpublication. The pool must retire through
+    /// [`ExpertCachePolicy::retire_generation_with`] / `retire_generation_now` with a
+    /// [`PeerReaderFence`]; a retirement without one holds every withdrawn slot.
+    pub peer: bool,
 }
 
 /// A copy the device part must start: `key`'s canonical bytes into `slot`. The `ticket` is the
@@ -199,6 +223,8 @@ pub struct PlanSummary {
     pub deferred: u32,
     /// Candidates dropped for lack of a victim.
     pub skipped_full: u32,
+    /// Victims withdrawn without a fill target (quarantined; included in `withdrawn`).
+    pub quarantined: u32,
     /// Some pool must retire its generation before the next window.
     pub needs_retirement: bool,
 }
@@ -279,6 +305,11 @@ struct SlotRec {
     cancelled: bool,
     /// A warm-start fill (published without counting as a fill).
     seeded: bool,
+    /// The core stamp of the plan that withdrew the slot (meaningful while `Evicting`).
+    evicted_at: u64,
+    /// A reclaim left the slot `Evicting` (a peer acknowledgement or a strategy hold is
+    /// missing): `seal` does not wait for it.
+    held: bool,
 }
 
 /// The generation of one pool: sealed under its lease until a retirement needs it.
@@ -319,10 +350,29 @@ enum Staged {
     Stale,
 }
 
+/// The pool's slot bank. `None` only after `close_pool` handed the bank back: every entry point
+/// refuses a closed pool before it reaches the bank, so dereferencing is an invariant, not a
+/// state a caller can reach.
+struct BankCell(Option<SlotBank>);
+
+impl std::ops::Deref for BankCell {
+    type Target = SlotBank;
+
+    fn deref(&self) -> &SlotBank {
+        self.0.as_ref().expect("an open pool owns its slot bank")
+    }
+}
+
+impl std::ops::DerefMut for BankCell {
+    fn deref_mut(&mut self) -> &mut SlotBank {
+        self.0.as_mut().expect("an open pool owns its slot bank")
+    }
+}
+
 /// One pool: a bank, its staged membership, its slots and its generation.
 struct Pool {
     id: PoolId,
-    bank: SlotBank,
+    bank: BankCell,
     /// The membership of the NEXT generation: the `Resident` slots.
     staging: Staging,
     slots: Vec<SlotRec>,
@@ -342,6 +392,11 @@ impl Pool {
             pool: self.id,
             error,
         }
+    }
+
+    /// The pool still owns its bank (`close_pool` has not run).
+    fn is_open(&self) -> bool {
+        self.bank.0.is_some()
     }
 
     fn refused(&self, why: String) -> CacheError {
@@ -500,7 +555,12 @@ impl Pool {
     }
 
     /// Fence the live generation's last reader and retire it. `Ok(true)` = newly retired.
-    fn retire(&mut self, fence: &mut dyn FenceBackend) -> Result<bool, CacheError> {
+    /// `peers`: the peer readers' release, asked once by the bank when the retirement succeeds.
+    fn retire(
+        &mut self,
+        fence: &mut dyn FenceBackend,
+        peers: Option<(&dyn PeerReaderFence, usize, u64)>,
+    ) -> Result<bool, CacheError> {
         let pool = self.id;
         let pending = match std::mem::replace(&mut self.gen, GenState::Transit) {
             GenState::Live(lease) => match lease.enqueued(fence) {
@@ -511,7 +571,7 @@ impl Pool {
                 }
             },
             GenState::Fencing(pending) => pending,
-            GenState::Idle(generation) => return self.retire_sealed(generation),
+            GenState::Idle(generation) => return self.retire_sealed(generation, peers),
             GenState::Retired => {
                 self.gen = GenState::Retired;
                 return Ok(false);
@@ -529,7 +589,7 @@ impl Pool {
         };
         match finish_window(pending, fence) {
             Ok(fenced) => match fenced.into_generation() {
-                Some(generation) => self.retire_sealed(generation),
+                Some(generation) => self.retire_sealed(generation, peers),
                 None => Err(CacheError::GenerationState {
                     pool,
                     state: "fenced through a borrowed lease",
@@ -547,8 +607,12 @@ impl Pool {
         }
     }
 
-    fn retire_sealed(&mut self, generation: OwnedTableGeneration) -> Result<bool, CacheError> {
-        match self.bank.retire(generation, None) {
+    fn retire_sealed(
+        &mut self,
+        generation: OwnedTableGeneration,
+        peers: Option<(&dyn PeerReaderFence, usize, u64)>,
+    ) -> Result<bool, CacheError> {
+        match self.bank.retire(generation, peers) {
             Ok((backing, token)) => {
                 self.backing = Some(backing);
                 self.retired = Some(token);
@@ -562,8 +626,9 @@ impl Pool {
         }
     }
 
-    /// Seal the staged membership into the next generation under a fresh lease.
-    fn seal(&mut self) -> Result<GenerationId, CacheError> {
+    /// Seal the staged membership into the next generation under a fresh lease: `id`, or
+    /// `{ next epoch, sub 0 }`. The next default epoch stays above every sealed one.
+    fn seal(&mut self, id: Option<GenerationId>) -> Result<GenerationId, CacheError> {
         let pool = self.id;
         if !matches!(self.gen, GenState::Retired) {
             return Err(CacheError::GenerationState {
@@ -577,13 +642,13 @@ impl Pool {
                 state: "without a table backing",
             });
         };
-        let id = GenerationId {
+        let id = id.unwrap_or(GenerationId {
             epoch: self.next_epoch,
             sub: 0,
-        };
+        });
         match self.bank.seal(&self.staging, backing, id) {
             Ok(generation) => {
-                self.next_epoch += 1;
+                self.next_epoch = self.next_epoch.max(id.epoch + 1);
                 self.retired = None;
                 match acquire_window_owned(generation) {
                     Ok(lease) => {
@@ -616,7 +681,7 @@ pub struct ExpertCachePolicy {
     log: Vec<WindowUse>,
     log_index: KeyIndex,
     /// Scratch: the group's missed keys, then its candidates.
-    cands: Vec<WindowUse>,
+    cands: Vec<Cand>,
     /// Scratch: victim choices of one pool.
     victims: Vec<(u64, Reverse<u32>, u32)>,
     completions: VecDeque<(u16, FillComplete)>,
@@ -650,9 +715,37 @@ impl ExpertCachePolicy {
     /// lease, so every later retirement has a generation to retire and a token to reclaim
     /// against. A construction error drops the blocks of the pools already built (a registry
     /// capacity leak, never an early release).
+    ///
+    /// `PoolInit::tables` are the pointer tables every generation of the pool is published
+    /// through: they must exist at construction (the owner of the policy builds its table
+    /// allocations first), because the bank needs a registered backing to seal its first
+    /// generation.
     pub fn new(
         config: PolicyConfig,
         pools: Vec<(PoolConfig, PoolInit)>,
+    ) -> Result<Self, CacheError> {
+        Self::build(config, pools, &[])
+    }
+
+    /// [`Self::new`] with a [`PoolMode`] per pool (`modes.len()` must equal `pools.len()`).
+    pub fn new_with_modes(
+        config: PolicyConfig,
+        pools: Vec<(PoolConfig, PoolInit)>,
+        modes: &[PoolMode],
+    ) -> Result<Self, CacheError> {
+        if modes.len() != pools.len() {
+            return Err(CacheError::PoolShape {
+                pool: PoolId(0),
+                why: "a pool mode for another pool count",
+            });
+        }
+        Self::build(config, pools, modes)
+    }
+
+    fn build(
+        config: PolicyConfig,
+        pools: Vec<(PoolConfig, PoolInit)>,
+        modes: &[PoolMode],
     ) -> Result<Self, CacheError> {
         if pools.is_empty() {
             return Err(CacheError::NoPools);
@@ -688,7 +781,8 @@ impl ExpertCachePolicy {
         for (i, (cfg, init)) in pools.into_iter().enumerate() {
             let id = PoolId(i as u16);
             let bank_err = move |error: ResidencyError| CacheError::Bank { pool: id, error };
-            let (mut bank, cells) = SlotBank::new(init.block, init.spans, false)
+            let peer = modes.get(i).is_some_and(|mode| mode.peer);
+            let (mut bank, cells) = SlotBank::new(init.block, init.spans, peer)
                 .map_err(|(_block, error)| bank_err(error))?;
             let backing = bank.register_table_backing(init.tables).map_err(bank_err)?;
             let staging = bank.staging();
@@ -708,11 +802,13 @@ impl ExpertCachePolicy {
                     target: None,
                     cancelled: false,
                     seeded: false,
+                    evicted_at: 0,
+                    held: false,
                 })
                 .collect();
             let mut pool = Pool {
                 id,
-                bank,
+                bank: BankCell(Some(bank)),
                 staging,
                 slots,
                 fills_per_window: cfg.fills_per_window,
@@ -810,7 +906,40 @@ impl ExpertCachePolicy {
 
     /// The pool's bank (introspection: reference counts, phases, live generations).
     pub fn bank(&self, pool: PoolId) -> Option<&SlotBank> {
-        self.pools.get(pool.0 as usize).map(|p| &p.bank)
+        self.pools
+            .get(pool.0 as usize)
+            .and_then(|p| p.bank.0.as_ref())
+    }
+
+    /// The pool's table backing, writable while the live generation is retired (between
+    /// `retire_generation*` and `seal*`): the capability a table rewrite needs. `None` while a
+    /// generation holds it, and for a closed pool.
+    pub fn backing(&self, pool: PoolId) -> Option<&TableBacking> {
+        self.pools.get(pool.0 as usize)?.backing.as_ref()
+    }
+
+    /// The id of the last sealed generation of the pool (`None` before any, or once closed).
+    pub fn last_sealed(&self, pool: PoolId) -> Option<GenerationId> {
+        self.bank(pool)?.last_sealed()
+    }
+
+    /// The core stamp of the plan that withdrew a `Withdrawn` slot (`None` for any other
+    /// phase): D2's `slot_evicted_at`.
+    pub fn slot_evicted_at(&self, pool: PoolId, slot: u32) -> Option<u64> {
+        let p = self.pools.get(pool.0 as usize)?;
+        let rec = p.slots.get(slot as usize)?;
+        (p.phase(slot as usize) == SlotPhaseView::Evicting).then_some(rec.evicted_at)
+    }
+
+    /// Withdrawn slots of the pool that wait for no fill: the quarantined / held ones.
+    pub fn quarantined(&self, pool: PoolId) -> usize {
+        let Some(p) = self.pools.get(pool.0 as usize) else {
+            return 0;
+        };
+        self.parked
+            .iter()
+            .filter(|&&(pp, slot)| pp == pool.0 && p.slots[slot as usize].target.is_none())
+            .count()
     }
 
     /// The window book of the cache.
@@ -967,10 +1096,10 @@ impl ExpertCachePolicy {
     // -------------------------------------------------------------------- windows
 
     fn pool_idx(&self, pool: PoolId) -> Result<usize, CacheError> {
-        if (pool.0 as usize) < self.pools.len() {
-            Ok(pool.0 as usize)
-        } else {
-            Err(CacheError::UnknownPool(pool))
+        match self.pools.get(pool.0 as usize) {
+            None => Err(CacheError::UnknownPool(pool)),
+            Some(p) if !p.is_open() => Err(CacheError::PoolClosed(pool)),
+            Some(_) => Ok(pool.0 as usize),
         }
     }
 
@@ -1099,11 +1228,25 @@ impl ExpertCachePolicy {
     /// Judge one retirement group of `windows` windows and decide: stage the completed fills,
     /// withdraw the victims, start the fills into free slots (module docs). `core`:
     /// `(distinct, reads)` the static core served. Needs the book idle and no pool waiting for
-    /// its retirement. `windows == 0`: publication only.
+    /// its retirement. `windows == 0`: publication only. The core's own admission
+    /// ([`DefaultAdmission`]); see [`Self::plan_group_with`].
     pub fn plan_group(
         &mut self,
         windows: u32,
         core: (u64, u64),
+    ) -> Result<PlanSummary, CacheError> {
+        self.plan_group_with(windows, core, &mut DefaultAdmission)
+    }
+
+    /// [`Self::plan_group`] with `strategy` deciding what is admitted and how a victim is staged
+    /// (module [`super::admission`]). Order: judge the group and let the strategy `observe` it;
+    /// stage the completed fills; reclaim the withdrawn slots of every pool whose generation is
+    /// already retired (peer acknowledgement and `hold_withdrawn` permitting); admit.
+    pub fn plan_group_with(
+        &mut self,
+        windows: u32,
+        core: (u64, u64),
+        strategy: &mut dyn AdmissionStrategy,
     ) -> Result<PlanSummary, CacheError> {
         if self.book.is_poisoned() {
             return Err(CacheError::WindowPoisoned);
@@ -1114,9 +1257,19 @@ impl ExpertCachePolicy {
         if self.needs_retirement() {
             return Err(CacheError::PlanPending);
         }
+        if let Some(lent) = self.pools.iter().find(|p| p.is_open() && p.bank.is_lent()) {
+            return Err(CacheError::PoolLent { pool: lent.id });
+        }
         let judged = windows > 0;
         self.clock += 1;
         let now = self.clock;
+        let windows_before = self.stats.windows;
+        let ctx = PlanContext {
+            windows,
+            windows_before,
+            windows_after: windows_before + windows as u64,
+            now,
+        };
         let mut summary = PlanSummary {
             windows,
             ..PlanSummary::default()
@@ -1157,17 +1310,22 @@ impl ExpertCachePolicy {
                     self.stats.host_distinct += 1;
                     self.stats.host_reads += used.reads as u64;
                     summary.misses += 1;
-                    self.cands.push(used);
+                    self.cands.push(Cand { used, score: 0.0 });
                 }
             }
+            strategy.observe(&ctx, &self.log);
         }
 
         // 2. Stage the fills that completed (they serve the NEXT image).
         self.stage_completions(now, &mut summary)?;
 
+        // 2b. A pool retired before this plan reclaims its withdrawn slots now (a slot a peer
+        // acknowledged is free for this plan's fills).
+        self.reclaim_retired(&mut summary, strategy)?;
+
         // 3. Admission.
         if judged && !self.frozen {
-            self.admit(now, windows, &mut summary)?;
+            self.admit(&ctx, &mut summary, strategy)?;
         }
         if judged {
             self.log.clear();
@@ -1219,6 +1377,7 @@ impl ExpertCachePolicy {
                 }
                 Staged::Cancelled => {
                     self.parked.push((p as u16, slot as u32));
+                    self.pools[p].slots[slot].evicted_at = now;
                     self.pools[p].dirty = true;
                     self.stats.cancelled_fills += 1;
                     summary.cancelled += 1;
@@ -1232,85 +1391,249 @@ impl ExpertCachePolicy {
         Ok(())
     }
 
-    #[allow(clippy::needless_range_loop)]
-    fn admit(
+    /// Reclaim the withdrawn slots of every pool whose generation is already retired.
+    fn reclaim_retired(
         &mut self,
-        now: u64,
-        windows: u32,
         summary: &mut PlanSummary,
+        strategy: &mut dyn AdmissionStrategy,
     ) -> Result<(), CacheError> {
-        // Candidates: the missed keys not bound to a slot, best first.
-        let index = &self.index;
-        self.cands.retain(|used| index.get(&used.key).is_none());
-        self.cands.sort_unstable_by(|a, b| {
-            (b.reads as f32)
-                .partial_cmp(&(a.reads as f32))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.rank.cmp(&b.rank))
-                .then_with(|| a.key.cmp(&b.key))
-        });
-        if self.cands.is_empty() {
-            return Ok(());
-        }
-        let cap = self.config.fill_group_cap.max(1);
         for p in 0..self.pools.len() {
-            let total = self.pools[p].fills_per_window * (windows as usize).clamp(1, cap);
-            let in_flight = self.pools[p].count(SlotPhaseView::Filling);
-            let budget = total.saturating_sub(in_flight);
-            if budget == 0 || !self.cands.iter().any(|c| c.pool.0 as usize == p) {
+            if !self.pools[p].is_open()
+                || !matches!(self.pools[p].gen, GenState::Retired)
+                || !self.parked.iter().any(|&(pp, _)| pp as usize == p)
+            {
                 continue;
             }
-            // Victims: Resident slots not used by this group, least recently used first (the
-            // colder ranking on a tie). Only `budget` of them can be used.
-            self.victims.clear();
-            for slot in 0..self.pools[p].slots.len() {
-                let rec = &self.pools[p].slots[slot];
-                if self.pools[p].phase(slot) == SlotPhaseView::Resident && rec.last_used < now {
-                    self.victims
-                        .push((rec.last_used, Reverse(rec.rank), slot as u32));
-                }
+            summary.fills += self.reclaim_pool(p, strategy)?;
+        }
+        Ok(())
+    }
+
+    /// `F x clamp(windows, 1, cap)`: the fills a group may have in flight in pool `p`.
+    fn fill_total(&self, p: usize, windows: u32) -> usize {
+        let cap = self.config.fill_group_cap.max(1);
+        self.pools[p].fills_per_window * (windows as usize).clamp(1, cap)
+    }
+
+    /// The fills pool `p` may start now: its total minus the fills in flight.
+    fn pool_budget(&self, p: usize, windows: u32) -> usize {
+        if !self.pools[p].is_open() {
+            return 0;
+        }
+        self.fill_total(p, windows)
+            .saturating_sub(self.pools[p].count(SlotPhaseView::Filling))
+    }
+
+    fn admit(
+        &mut self,
+        ctx: &PlanContext,
+        summary: &mut PlanSummary,
+        strategy: &mut dyn AdmissionStrategy,
+    ) -> Result<(), CacheError> {
+        if !strategy.open_gate(ctx)
+            || !(0..self.pools.len()).any(|p| self.pool_budget(p, ctx.windows) > 0)
+        {
+            strategy.settled(ctx, false);
+            return Ok(());
+        }
+        // Candidates: the missed keys not bound to a slot, scored; then the strategy's extras
+        // (keys the group did not read), already scored. Best first.
+        let index = &self.index;
+        self.cands.retain(|c| index.get(&c.used.key).is_none());
+        for cand in &mut self.cands {
+            cand.score = clean_score(strategy.score(&cand.used));
+        }
+        {
+            let mut sink = CandidateSink {
+                index: &self.index,
+                log: &self.log_index,
+                cands: &mut self.cands,
+                capacity: self.config.use_log,
+                pools: self.pools.len(),
+            };
+            strategy.extra_candidates(ctx, &mut sink)?;
+        }
+        self.cands.sort_unstable_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.used.rank.cmp(&b.used.rank))
+                .then_with(|| a.used.key.cmp(&b.used.key))
+        });
+        for p in 0..self.pools.len() {
+            let budget = self.pool_budget(p, ctx.windows);
+            let candidates = self
+                .cands
+                .iter()
+                .filter(|c| c.used.pool.0 as usize == p)
+                .count();
+            if budget == 0 || candidates == 0 {
+                continue;
             }
-            if self.victims.len() > budget {
-                self.victims.select_nth_unstable(budget - 1);
-                self.victims.truncate(budget);
-            }
-            self.victims.sort_unstable();
-            let slots = self.pools[p].slots.len();
-            let (mut free_at, mut next_victim, mut taken) = (0usize, 0usize, 0usize);
-            for ci in 0..self.cands.len() {
-                let cand = self.cands[ci];
-                if cand.pool.0 as usize != p {
-                    continue;
-                }
-                if taken == budget {
-                    break;
-                }
-                taken += 1;
-                let mut free = None;
-                while free_at < slots {
-                    let slot = free_at;
-                    free_at += 1;
-                    if self.pools[p].phase(slot) == SlotPhaseView::Free {
-                        free = Some(slot);
-                        break;
-                    }
-                }
-                if let Some(slot) = free {
-                    self.start_fill(p, slot, cand.key, cand.rank, now)?;
-                    summary.fills += 1;
-                    continue;
-                }
-                let Some(&(_, _, victim)) = self.victims.get(next_victim) else {
-                    self.stats.skipped_full += 1;
-                    summary.skipped_full += 1;
-                    continue;
-                };
-                next_victim += 1;
-                self.withdraw(p, victim as usize, Some((cand.key, cand.rank)), now)?;
-                summary.withdrawn += 1;
-                summary.deferred += 1;
+            self.admit_pool(p, ctx, budget, candidates, summary, strategy)?;
+        }
+        strategy.settled(ctx, true);
+        Ok(())
+    }
+
+    /// One pool's admission pass over the sorted candidates: at most `budget` of them, each
+    /// taking the lowest free slot, else (as the strategy's `PassPlan` says) a victim.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    fn admit_pool(
+        &mut self,
+        p: usize,
+        ctx: &PlanContext,
+        budget: usize,
+        candidates: usize,
+        summary: &mut PlanSummary,
+        strategy: &mut dyn AdmissionStrategy,
+    ) -> Result<(), CacheError> {
+        let now = ctx.now;
+        let pool = PoolId(p as u16);
+        let slots = self.pools[p].slots.len();
+        // Victims: Resident slots not used by this group, least recently used first (the
+        // colder ranking on a tie). Only `budget` of them can be used.
+        self.victims.clear();
+        for slot in 0..slots {
+            let rec = &self.pools[p].slots[slot];
+            if self.pools[p].phase(slot) == SlotPhaseView::Resident && rec.last_used < now {
+                self.victims
+                    .push((rec.last_used, Reverse(rec.rank), slot as u32));
             }
         }
+        if self.victims.len() > budget {
+            self.victims.select_nth_unstable(budget - 1);
+            self.victims.truncate(budget);
+        }
+        self.victims.sort_unstable();
+        let mut free_left = self.pools[p].count(SlotPhaseView::Free);
+        let mut quarantined = self.quarantined(pool);
+        let plan = strategy.pass(&PassContext {
+            pool,
+            windows: ctx.windows,
+            total_budget: self.fill_total(p, ctx.windows),
+            budget,
+            candidates,
+            free: free_left,
+            filling: self.pools[p].count(SlotPhaseView::Filling),
+            resident: self.pools[p].count(SlotPhaseView::Resident),
+            quarantined,
+        });
+        let (mut free_at, mut next_victim, mut taken) = (0usize, 0usize, 0usize);
+        for ci in 0..self.cands.len() {
+            let cand = self.cands[ci];
+            if cand.used.pool.0 as usize != p {
+                continue;
+            }
+            if taken == budget {
+                break;
+            }
+            taken += 1;
+            let mut free = None;
+            while free_at < slots {
+                let slot = free_at;
+                free_at += 1;
+                if self.pools[p].phase(slot) == SlotPhaseView::Free {
+                    free = Some(slot);
+                    break;
+                }
+            }
+            if free.is_some() {
+                free_left = free_left.saturating_sub(1);
+            }
+            if let Some(reserve_target) = plan.reserve_target {
+                // The reserve: every candidate takes a free slot if there is one and, while the
+                // reserve is short, also evicts one victim into quarantine for a later plan.
+                let mut evicted = false;
+                if free_left + quarantined < reserve_target {
+                    if let Some(&(_, _, victim)) = self.victims.get(next_victim) {
+                        next_victim += 1;
+                        self.quarantine(p, victim as usize, now, summary)?;
+                        quarantined += 1;
+                        evicted = true;
+                    }
+                }
+                match free {
+                    Some(slot) => {
+                        self.start_fill(p, slot, cand.used.key, cand.used.rank, now)?;
+                        summary.fills += 1;
+                    }
+                    // The candidate waits for a later plan's free slot.
+                    None if evicted => {}
+                    None => {
+                        self.stats.skipped_full += 1;
+                        summary.skipped_full += 1;
+                    }
+                }
+                continue;
+            }
+            if let Some(slot) = free {
+                self.start_fill(p, slot, cand.used.key, cand.used.rank, now)?;
+                summary.fills += 1;
+                continue;
+            }
+            if plan.evict == EvictMode::Quarantine && quarantined >= plan.quarantine_cap {
+                self.stats.skipped_full += 1;
+                summary.skipped_full += 1;
+                continue;
+            }
+            let Some(&(_, _, victim)) = self.victims.get(next_victim) else {
+                self.stats.skipped_full += 1;
+                summary.skipped_full += 1;
+                continue;
+            };
+            next_victim += 1;
+            let victim = victim as usize;
+            let displaced = {
+                let rec = &self.pools[p].slots[victim];
+                let Some(key) = rec.key else {
+                    return Err(self.pools[p].refused(format!("resident slot {victim} has no key")));
+                };
+                Victim {
+                    key,
+                    pool,
+                    slot: victim as u32,
+                    rank: rec.rank,
+                    last_used: rec.last_used,
+                }
+            };
+            let challenger = Candidate {
+                used: cand.used,
+                score: cand.score,
+            };
+            if strategy.veto_victim(&challenger, &displaced) {
+                self.stats.skipped_full += 1;
+                summary.skipped_full += 1;
+                continue;
+            }
+            match plan.evict {
+                EvictMode::Quarantine => {
+                    self.quarantine(p, victim, now, summary)?;
+                    quarantined += 1;
+                }
+                EvictMode::Deferred => {
+                    self.withdraw(p, victim, Some((cand.used.key, cand.used.rank)), now)?;
+                    summary.withdrawn += 1;
+                    summary.deferred += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Withdraw the `Resident` slot's key with no fill target: the slot waits (quarantined) for
+    /// a later reclaim.
+    fn quarantine(
+        &mut self,
+        p: usize,
+        slot: usize,
+        stamp: u64,
+        summary: &mut PlanSummary,
+    ) -> Result<(), CacheError> {
+        self.withdraw(p, slot, None, stamp)?;
+        self.stats.quarantined += 1;
+        summary.withdrawn += 1;
+        summary.quarantined += 1;
         Ok(())
     }
 
@@ -1371,7 +1694,12 @@ impl ExpertCachePolicy {
         };
         self.pools[p].evict(slot)?;
         self.index.remove(&key);
-        self.pools[p].slots[slot].key = None;
+        {
+            let rec = &mut self.pools[p].slots[slot];
+            rec.key = None;
+            rec.held = false;
+            rec.evicted_at = stamp;
+        }
         self.parked.push((p as u16, slot as u32));
         self.pools[p].dirty = true;
         self.published
@@ -1416,11 +1744,25 @@ impl ExpertCachePolicy {
     /// final consumer was enqueued, then waited) and retire it: its table backing is writable
     /// again. Refused unless something is pending (A2.1: a group with nothing pending never
     /// retires), while a window is open and once the book is poisoned. A pending fence keeps the
-    /// state (`WindowFencePending`): call again.
+    /// state (`WindowFencePending`): call again. A peer pool retires through
+    /// [`Self::retire_generation_with`].
     pub fn retire_generation(
         &mut self,
         pool: PoolId,
         fence: &mut dyn FenceBackend,
+    ) -> Result<(), CacheError> {
+        self.retire_generation_with(pool, fence, None)
+    }
+
+    /// [`Self::retire_generation`] that also asks the peer readers: `peers = Some((fence, owner,
+    /// at))` calls `fence.released_through(owner, at)` exactly once when the retirement
+    /// succeeds and stores the answer in the retirement token (the bank of a peer pool reclaims
+    /// a withdrawn slot only when it covers the slot's exclusion epoch).
+    pub fn retire_generation_with(
+        &mut self,
+        pool: PoolId,
+        fence: &mut dyn FenceBackend,
+        peers: Option<(&dyn PeerReaderFence, usize, u64)>,
     ) -> Result<(), CacheError> {
         let p = self.retirement_gate(pool)?;
         if !self.pools[p].dirty {
@@ -1429,10 +1771,34 @@ impl ExpertCachePolicy {
                 state: "has nothing pending",
             });
         }
-        if self.pools[p].retire(fence)? {
+        self.retire_pool(p, fence, peers).map(|_| ())
+    }
+
+    /// Retire the pool's live generation whether or not anything is pending (the borrow
+    /// protocol's suspend, a peer pool that retires every group, a close): `Ok(true)` = newly
+    /// retired, `Ok(false)` = it already was. The backing comes back ([`Self::backing`]); seal
+    /// again with [`Self::seal`] / [`Self::seal_as`], or close / lend the pool.
+    pub fn retire_generation_now(
+        &mut self,
+        pool: PoolId,
+        fence: &mut dyn FenceBackend,
+        peers: Option<(&dyn PeerReaderFence, usize, u64)>,
+    ) -> Result<bool, CacheError> {
+        let p = self.retirement_gate(pool)?;
+        self.retire_pool(p, fence, peers)
+    }
+
+    fn retire_pool(
+        &mut self,
+        p: usize,
+        fence: &mut dyn FenceBackend,
+        peers: Option<(&dyn PeerReaderFence, usize, u64)>,
+    ) -> Result<bool, CacheError> {
+        let newly = self.pools[p].retire(fence, peers)?;
+        if newly {
             self.stats.generations_retired += 1;
         }
-        Ok(())
+        Ok(newly)
     }
 
     fn retirement_gate(&self, pool: PoolId) -> Result<usize, CacheError> {
@@ -1445,16 +1811,41 @@ impl ExpertCachePolicy {
         self.pool_idx(pool)
     }
 
-    /// After `retire_generation` and the table rewrite: reclaim every withdrawn slot of the pool
-    /// (`Evicting -> Free`) and start the fills deferred into them. Returns the fills started.
-    pub fn finish_plan(&mut self, pool: PoolId) -> Result<u32, CacheError> {
-        let p = self.retirement_gate(pool)?;
-        if !self.pools[p].dirty {
-            return Ok(0);
+    /// Whether the reclaim of withdrawn slot `slot` of pool `p` must wait: a peer pool until the
+    /// retirement token's `released_through` covers the slot's exclusion epoch, then the
+    /// strategy's `hold_withdrawn`.
+    fn slot_held(&self, p: usize, slot: usize, strategy: &mut dyn AdmissionStrategy) -> bool {
+        let pool = &self.pools[p];
+        let peer_through = pool.retired.as_ref().and_then(|token| token.peer_through());
+        let excluded_from = pool.bank.excluded_from_epoch(slot as u32);
+        if pool.bank.is_peer() {
+            let covered = match (peer_through, excluded_from) {
+                (Some(through), Some(from)) => through >= from,
+                _ => false,
+            };
+            if !covered {
+                return true;
+            }
         }
-        if !matches!(self.pools[p].gen, GenState::Retired) {
-            return Err(CacheError::RetirementRequired { pool });
-        }
+        let rec = &pool.slots[slot];
+        strategy.hold_withdrawn(&SlotHold {
+            pool: pool.id,
+            slot: slot as u32,
+            evicted_at: rec.evicted_at,
+            excluded_from,
+            peer_through,
+            has_target: rec.target.is_some(),
+        })
+    }
+
+    /// Reclaim every withdrawn slot of pool `p` that is not held (`Evicting -> Free`) and start
+    /// the fills deferred into them; a held slot stays parked with its target. The pool's
+    /// generation must be retired. Returns the fills started.
+    fn reclaim_pool(
+        &mut self,
+        p: usize,
+        strategy: &mut dyn AdmissionStrategy,
+    ) -> Result<u32, CacheError> {
         let mut started = 0u32;
         let mut at = 0usize;
         while at < self.parked.len() {
@@ -1464,9 +1855,15 @@ impl ExpertCachePolicy {
                 continue;
             }
             let slot = slot as usize;
+            if self.slot_held(p, slot, strategy) {
+                self.pools[p].slots[slot].held = true;
+                at += 1;
+                continue;
+            }
             self.pools[p].reclaim(slot)?;
             self.parked.remove(at);
             let rec = &mut self.pools[p].slots[slot];
+            rec.held = false;
             let Some((key, rank)) = rec.target.take() else {
                 continue;
             };
@@ -1480,21 +1877,198 @@ impl ExpertCachePolicy {
         Ok(started)
     }
 
+    /// After `retire_generation` and the table rewrite: reclaim every withdrawn slot of the pool
+    /// (`Evicting -> Free`) and start the fills deferred into them. Returns the fills started.
+    /// The core's own admission; a peer pool or a hold-back strategy uses
+    /// [`Self::finish_plan_with`].
+    pub fn finish_plan(&mut self, pool: PoolId) -> Result<u32, CacheError> {
+        self.finish_plan_with(pool, &mut DefaultAdmission)
+    }
+
+    /// [`Self::finish_plan`] where a slot that is held stays `Evicting`: a peer pool's slot
+    /// until the retirement token's `released_through` covers it (a retirement without peers
+    /// holds all of them), then whatever `strategy.hold_withdrawn` keeps (quarantine
+    /// hold-back). A held slot keeps its deferred fill, stays parked (`seal` does not wait for
+    /// it) and is asked again at the next reclaim; with the pool's generation retired before a
+    /// plan, that plan reclaims it ([`Self::plan_group_with`]).
+    pub fn finish_plan_with(
+        &mut self,
+        pool: PoolId,
+        strategy: &mut dyn AdmissionStrategy,
+    ) -> Result<u32, CacheError> {
+        let p = self.retirement_gate(pool)?;
+        let waiting = self.parked.iter().any(|&(pp, _)| pp as usize == p);
+        if !self.pools[p].dirty && !waiting {
+            return Ok(0);
+        }
+        if !matches!(self.pools[p].gen, GenState::Retired) {
+            return Err(CacheError::RetirementRequired { pool });
+        }
+        self.reclaim_pool(p, strategy)
+    }
+
     /// Seal the pool's staged membership into its next generation (epoch + 1) under a fresh
     /// lease. The tables must have been rewritten from `published()` / `withdrawn()` and
-    /// `finish_plan` must have reclaimed every withdrawn slot. Clears the pool's published and
-    /// withdrawn records.
+    /// `finish_plan` must have reclaimed every withdrawn slot that is not held. Clears the
+    /// pool's published and withdrawn records.
     pub fn seal(&mut self, pool: PoolId) -> Result<GenerationId, CacheError> {
+        self.seal_inner(pool, None)
+    }
+
+    /// [`Self::seal`] under an explicit generation id (it must exceed every earlier id of the
+    /// pool): a resume re-seals `{ epoch, sub + 1 }` of the last sealed generation
+    /// ([`Self::last_sealed`]), a peer pool seals epoch = its retirement index. The next
+    /// [`Self::seal`] continues above `id.epoch`.
+    pub fn seal_as(&mut self, pool: PoolId, id: GenerationId) -> Result<GenerationId, CacheError> {
+        self.seal_inner(pool, Some(id))
+    }
+
+    fn seal_inner(
+        &mut self,
+        pool: PoolId,
+        id: Option<GenerationId>,
+    ) -> Result<GenerationId, CacheError> {
         let p = self.retirement_gate(pool)?;
-        if self.parked.iter().any(|&(pp, _)| pp as usize == p) {
+        if self
+            .parked
+            .iter()
+            .any(|&(pp, slot)| pp as usize == p && !self.pools[p].slots[slot as usize].held)
+        {
             return Err(CacheError::PlanPending);
         }
-        let id = self.pools[p].seal()?;
+        let id = self.pools[p].seal(id)?;
         self.pools[p].dirty = false;
         self.published.retain(|entry| entry.pool != pool);
         self.withdrawn.retain(|entry| entry.pool != pool);
         self.stats.generations_sealed += 1;
         Ok(id)
+    }
+
+    // ------------------------------------------------------------ pool lifecycle
+
+    /// Device-wide quiescence of the pool's issued fills ([`SlotBank::quiesce`]): the proof
+    /// `close_pool` and `lend_scratch` need. Binds the bank's issue sequence at record time, so
+    /// no fill may be issued between this and the call that spends it.
+    pub fn quiesce(
+        &mut self,
+        pool: PoolId,
+        device: &mut dyn FenceBackend,
+    ) -> Result<Quiesced, FenceFailure> {
+        match self.pools.get_mut(pool.0 as usize).filter(|p| p.is_open()) {
+            Some(p) => p.bank.quiesce(device),
+            None => Err(FenceFailure {
+                message: format!("no open pool {}", pool.0),
+                quiescence: Quiescence::Proven,
+            }),
+        }
+    }
+
+    /// Hand the pool's block back (teardown): every cell goes back to the bank, which needs no
+    /// live generation ([`Self::retire_generation_now`] first), no quarantined slot, no lent
+    /// block, no outstanding fill ticket (take the decided fills and issue or abandon them) and
+    /// a current `q` ([`Self::quiesce`]). The pool is closed afterwards: its keys, parked slots,
+    /// completions and table records are dropped and every later call on it is
+    /// [`CacheError::PoolClosed`]. A refusal leaves the pool exactly as it was.
+    pub fn close_pool(
+        &mut self,
+        pool: PoolId,
+        q: Quiesced,
+    ) -> Result<(LentBlock<Expert>, BlockReclaimed), CacheError> {
+        let p = self.pool_idx(pool)?;
+        if self.fills.iter().any(|op| op.pool == pool) {
+            return Err(CacheError::FillsPending { pool });
+        }
+        let target = &mut self.pools[p];
+        if target.slots.iter().any(|rec| rec.cell.is_none()) {
+            return Err(target.refused("a slot cell is in transit".into()));
+        }
+        let Some(bank) = target.bank.0.take() else {
+            return Err(CacheError::PoolClosed(pool));
+        };
+        let cells: Vec<SlotCell> = target
+            .slots
+            .iter_mut()
+            .map(|rec| rec.cell.take().expect("every cell was checked present"))
+            .collect();
+        match bank.close(cells, q) {
+            Ok(done) => {
+                for rec in &target.slots {
+                    if let Some(key) = rec.key {
+                        self.index.remove(&key);
+                    }
+                    if let Some((key, _)) = rec.target {
+                        self.index.remove(&key);
+                    }
+                }
+                target.slots.clear();
+                target.dirty = false;
+                target.backing = None;
+                target.retired = None;
+                self.parked.retain(|&(pp, _)| pp as usize != p);
+                self.completions.retain(|(pp, _)| *pp as usize != p);
+                self.published.retain(|entry| entry.pool != pool);
+                self.withdrawn.retain(|entry| entry.pool != pool);
+                Ok(done)
+            }
+            Err((bank, cells, error)) => {
+                target.bank.0 = Some(bank);
+                for (rec, cell) in target.slots.iter_mut().zip(cells) {
+                    rec.cell = Some(cell);
+                }
+                Err(target.bank_err(error))
+            }
+        }
+    }
+
+    /// Lend the pool's whole block as scratch ([`SlotBank::lend_scratch`]): refused while any
+    /// generation is live (retire it first: [`Self::retire_generation_now`]), a slot is
+    /// quarantined by the bank or has an unissued ticket, or `q` is stale. While lent the pool
+    /// plans and reserves nothing ([`CacheError::PoolLent`]).
+    pub fn lend_scratch(&mut self, pool: PoolId, q: Quiesced) -> Result<ScratchLoan, CacheError> {
+        let p = self.pool_idx(pool)?;
+        let target = &mut self.pools[p];
+        target
+            .bank
+            .lend_scratch(q)
+            .map_err(|error| target.bank_err(error))
+    }
+
+    /// Re-copy every occupied slot after a scratch epoch ([`SlotBank::issue_restore`]): the
+    /// callback runs once per occupied slot, ascending, then one fence is recorded on `copy`.
+    pub fn issue_restore(
+        &mut self,
+        pool: PoolId,
+        loan: &ScratchLoan,
+        copy: &mut dyn FenceBackend,
+        enqueue: &mut dyn FnMut(u32, u64, &[Binding]) -> Result<(), String>,
+    ) -> Result<PendingRestore, FenceFailure> {
+        match self.pools.get_mut(pool.0 as usize).filter(|p| p.is_open()) {
+            Some(p) => p.bank.issue_restore(loan, copy, enqueue),
+            None => Err(FenceFailure {
+                message: format!("no open pool {}", pool.0),
+                quiescence: Quiescence::Proven,
+            }),
+        }
+    }
+
+    /// Wait the restore fence and end the scratch loan ([`SlotBank::end_scratch`]); on error the
+    /// loan and the restore come back.
+    #[allow(clippy::type_complexity)]
+    pub fn end_scratch(
+        &mut self,
+        pool: PoolId,
+        loan: ScratchLoan,
+        restore: PendingRestore,
+        copy: &mut dyn FenceBackend,
+    ) -> Result<(), (ScratchLoan, PendingRestore, ResidencyError)> {
+        match self.pools.get_mut(pool.0 as usize).filter(|p| p.is_open()) {
+            Some(p) => p.bank.end_scratch(loan, restore, copy),
+            None => Err((
+                loan,
+                restore,
+                ResidencyError::Refused(format!("no open pool {}", pool.0)),
+            )),
+        }
     }
 
     // ---------------------------------------------------------------- copy engine
@@ -1521,7 +2095,7 @@ impl ExpertCachePolicy {
         copy: &mut dyn FenceBackend,
         enqueue: &mut dyn FnMut(&FillTicket) -> Result<(), String>,
     ) -> Result<PendingFills, (Vec<FillTicket>, FenceFailure)> {
-        match self.pools.get_mut(pool.0 as usize) {
+        match self.pools.get_mut(pool.0 as usize).filter(|p| p.is_open()) {
             Some(p) => p.bank.issue_fills(tickets, copy, enqueue),
             None => Err((
                 tickets,
@@ -1541,7 +2115,7 @@ impl ExpertCachePolicy {
         copy: &mut dyn FenceBackend,
         wait: bool,
     ) -> Result<Vec<FillComplete>, FillsNotDone> {
-        match self.pools.get_mut(pool.0 as usize) {
+        match self.pools.get_mut(pool.0 as usize).filter(|p| p.is_open()) {
             Some(p) => p.bank.complete_fills(batch, copy, wait),
             None => Err(FillsNotDone::Failed {
                 fills: batch.fills().to_vec(),
@@ -1555,7 +2129,7 @@ impl ExpertCachePolicy {
 
     /// Tickets that will never be issued: their slots stay `Filling` and are never restored.
     pub fn abandon_fills(&mut self, pool: PoolId, tickets: Vec<FillTicket>) {
-        if let Some(p) = self.pools.get_mut(pool.0 as usize) {
+        if let Some(p) = self.pools.get_mut(pool.0 as usize).filter(|p| p.is_open()) {
             if !tickets.is_empty() {
                 p.bank.abandon_fills(tickets);
             }
@@ -1598,6 +2172,9 @@ impl ExpertCachePolicy {
             return Err(CacheError::Frozen);
         }
         let p = self.pool_idx(pool)?;
+        if self.pools[p].bank.is_lent() {
+            return Err(CacheError::PoolLent { pool });
+        }
         if let Some(loc) = self.index.get(&key) {
             if loc.pool != pool.0 {
                 return Err(CacheError::PoolMismatch {

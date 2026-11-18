@@ -17,8 +17,10 @@
 //! (LRU victims by retirement stamp then colder ranking, candidates by reads then ranking, fill
 //! budget `F x min(windows, cap)` minus fills in flight, units used by the retiring group never
 //! victims); the differential test pins them against the frozen beta copy. Peer quarantine, the
-//! boundary heat mode and the EP `PeerBoard` / pins are NOT part of the core (they stay in the D2
-//! adapter); nothing here refuses them, they simply have no state.
+//! boundary heat mode, the quarantine reserve and the borrow / teardown protocol are the core's
+//! too, through the [`AdmissionStrategy`] seam and the pool-lifecycle calls (`quiesce`,
+//! `close_pool`, `lend_scratch`, `seal_as`, ...); only the EP `PeerBoard` itself and the pins
+//! stay in the D2 adapter (the board is the `PeerReaderFence` the core retires against).
 //!
 //! # Layout
 //!
@@ -58,6 +60,7 @@
 //! Adapters that judge request by request (DS4-style) use [`ExpertCachePolicy::reserve`],
 //! [`ExpertCachePolicy::lookup`] and [`ExpertCachePolicy::rollback`] over the same pools.
 
+pub mod admission;
 pub mod catalog;
 pub mod device_io;
 mod index;
@@ -72,13 +75,17 @@ pub use device_io::{
 #[cfg(test)]
 mod tests;
 
+pub use admission::{
+    AdmissionStrategy, Candidate, CandidateSink, DefaultAdmission, EvictMode, PassContext,
+    PassPlan, PlanContext, SlotHold, Victim,
+};
 pub use catalog::{
     CatalogError, CatalogFacts, CatalogIdentity, ExpertCatalog, KernelAbi, LayoutClass, PoolDemand,
     TableExtent, UnitPlanDescriptor,
 };
 pub use policy::{
-    ExpertCachePolicy, FillOp, Lookup, PlanSummary, PolicyConfig, PoolConfig, PoolInit, Published,
-    Reservation, Withdrawn,
+    ExpertCachePolicy, FillOp, Lookup, PlanSummary, PolicyConfig, PoolConfig, PoolInit, PoolMode,
+    Published, Reservation, Withdrawn,
 };
 pub use window::{
     CancelOutcome, ConsumerId, RetireCadence, WindowBook, WindowReceipt, DEFAULT_GROUP_MAX_WINDOWS,
@@ -182,6 +189,9 @@ pub struct CacheStats {
     pub generations_sealed: u64,
     /// Generations retired (a fence wait each).
     pub generations_retired: u64,
+    /// Victims withdrawn without a fill target (quarantined: their slot waits for the peers'
+    /// acknowledgement or a hold).
+    pub quarantined: u64,
 }
 
 impl CacheStats {
@@ -299,6 +309,17 @@ pub enum CacheError {
     ConsumersOutstanding {
         outstanding: usize,
     },
+    /// The pool was closed (`close_pool` handed its block back): nothing is left to ask it.
+    PoolClosed(PoolId),
+    /// `close_pool` found fills decided and not taken (take them, then issue or abandon them).
+    FillsPending {
+        pool: PoolId,
+    },
+    /// The pool's whole block is lent as scratch: it is neither planned nor reserved until the
+    /// loan ended.
+    PoolLent {
+        pool: PoolId,
+    },
 }
 
 impl std::fmt::Display for CacheError {
@@ -372,6 +393,15 @@ impl std::fmt::Display for CacheError {
             Self::ConsumersOutstanding { outstanding } => {
                 write!(f, "{outstanding} consumer(s) have not joined")
             }
+            Self::PoolClosed(pool) => write!(f, "pool {} is closed", pool.0),
+            Self::FillsPending { pool } => {
+                write!(
+                    f,
+                    "pool {}: fills decided and not taken or abandoned",
+                    pool.0
+                )
+            }
+            Self::PoolLent { pool } => write!(f, "pool {} is lent as scratch", pool.0),
         }
     }
 }
