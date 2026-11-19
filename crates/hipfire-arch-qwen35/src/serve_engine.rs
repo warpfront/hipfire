@@ -25,7 +25,7 @@ use hipfire_runtime::admission::{AdmissionController, AdmitError, ModelFootprint
 use hipfire_runtime::serve::{
     send_event, Continuation, DoneReason, EngineStats, Event, RejectClass, SubmitRequest,
 };
-use hipfire_runtime::session_table::{SessionId, SessionTable};
+use hipfire_runtime::session_table::{Residency, SessionId, SessionTable};
 use hipfire_runtime::swap::snapshot::{
     capture_slot, capture_slot_mapped, restore_slot, restore_slot_mapped, SnapshotStamp,
 };
@@ -269,7 +269,8 @@ impl SlotEngine {
         *self.stats.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Drain the ids of sessions the engine closed on its own (idle sweep).
+    /// Drain the ids of sessions the engine closed on its own (the TTL/cap
+    /// sweep; the idle paged reclaim parks Cold and does not close).
     pub fn take_closed_sessions(&self) -> Vec<u64> {
         let mut guard = self.closed.lock().unwrap_or_else(|p| p.into_inner());
         std::mem::take(&mut *guard)
@@ -975,7 +976,8 @@ struct Rig {
     session_ttl: Option<std::time::Duration>,
     /// Hard cap on session-table entries; 0 = auto max(64, 16 x n_slots).
     session_max: usize,
-    /// Ids the engine closed internally, for the daemon's broker.
+    /// Ids the engine closed internally (TTL/cap sweep only), for the
+    /// daemon's pending-tool broker.
     closed_sessions: Arc<Mutex<Vec<u64>>>,
     /// Global trunk-row budget (spec §5.2 S2). Enforced in `next_batch` and
     /// the MTP verify injection path; the forward assert is a backstop.
@@ -4364,16 +4366,25 @@ fn inject_publish_fault() -> bool {
     ARMED.swap(false, Ordering::Relaxed)
 }
 
-/// Drop every parked session's KV pages.
+/// Drop every parked session's KV pages without destroying the session.
 ///
 /// A finished request leaves its session resident so a continuation can
 /// reuse the slot. Nothing is in flight here, so those pages are only
-/// holding VMM granules. Closing them returns the pages to the pool, and
-/// the prefix-cache reclaim that follows drops any cache refs, so the next
-/// request reuses the committed granules in place instead of mapping new
-/// ones. A used VA keeps its physical binding until teardown
-/// ([`VmmPageMapper::sync`]), so nothing is unmapped. A continuation that
-/// arrives later misses and prefills again.
+/// holding VMM granules. Parking the session `Cold` returns its slot and
+/// admission grant to the pool while keeping its tokens, conversation
+/// identity and session id: a tool-result turn names that id, so closing the
+/// entry would make the daemon reap its pending-tool record and answer the
+/// next turn with `unknown or stale tool_call_id`. A `Cold` reentry
+/// re-prefills from the same prompt (never wrong, and the KV is coming back
+/// anyway). The prefix-cache reclaim that follows drops any cache refs, so
+/// the next request reuses the committed granules in place instead of
+/// mapping new ones. A used VA keeps its physical binding until teardown
+/// ([`VmmPageMapper::sync`]), so nothing is unmapped.
+///
+/// These ids are deliberately NOT reported through `closed_sessions`: the
+/// session still exists and stays addressable. Only the TTL/cap sweep
+/// ([`sweep_sessions`]) closes parked entries, and that is the point where a
+/// pending tool turn becomes stale.
 fn release_idle_sessions(rig: &mut Rig) -> usize {
     let ids: Vec<u64> = rig.sessions.iter().map(|(id, _)| id).collect();
     if ids.is_empty() {
@@ -4381,7 +4392,7 @@ fn release_idle_sessions(rig: &mut Rig) -> usize {
     }
     for &id in &ids {
         rig.sessions
-            .close(&mut rig.pool, &mut rig.adm, SessionId(id));
+            .mark_cold(&mut rig.pool, &mut rig.adm, SessionId(id));
         rig.swap.forget(id);
         let _ = rig.fair_queue.remove(id);
     }
@@ -4394,9 +4405,6 @@ fn release_idle_sessions(rig: &mut Rig) -> usize {
     }
     if let Some(pp) = rig.pool.page_pool_mut() {
         pp.drain_completed();
-    }
-    if let Ok(mut closed) = rig.closed_sessions.lock() {
-        closed.extend(ids.iter().copied());
     }
     ids.len()
 }
@@ -7641,8 +7649,25 @@ fn admit(
             Continuation::Cold => None,
             Continuation::UserTurn(_) => rig.sessions.find_continuation(&req.convo, &busy),
             Continuation::ToolResults { session, .. } => {
-                rig.sessions
-                    .confirm_reentry(SessionId(*session), &req.convo, &busy)
+                let confirmed =
+                    rig.sessions
+                        .confirm_reentry(SessionId(*session), &req.convo, &busy);
+                // The idle paged reclaim parks a resident session Cold. The
+                // id still owns this conversation and still holds its tokens,
+                // so re-enter it through the cold admit path: `admit_cold`
+                // re-opens the SAME id and re-prefills, and the daemon's
+                // tool-result turn is accepted on the session it named.
+                // Returning None here would mint a new id, which the daemon
+                // rejects as an admission on the wrong session.
+                let is_cold = confirmed.is_some_and(|id| {
+                    rig.sessions
+                        .get(id)
+                        .is_some_and(|s| s.residency == Residency::Cold)
+                });
+                if is_cold {
+                    cold_reuse = confirmed;
+                }
+                confirmed.filter(|_| !is_cold)
             }
         };
         if let Some(existing) = matched {
@@ -8148,7 +8173,16 @@ fn admit(
             }
         }
         if rig.gpu.slot_trace() {
-            eprintln!("[slot-trace] continuation MISS -- falling back to cold prefill");
+            match cold_reuse {
+                Some(id) => eprintln!(
+                    "[slot-trace] continuation names session {} (Cold) -- re-entering \
+                     the same id with a cold prefill",
+                    id.0
+                ),
+                None => {
+                    eprintln!("[slot-trace] continuation MISS -- falling back to cold prefill")
+                }
+            }
         }
     }
 
