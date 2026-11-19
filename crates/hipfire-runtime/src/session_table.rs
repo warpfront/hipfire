@@ -89,6 +89,15 @@ pub struct Session {
     /// session's physical pages are lost (swap/cold), because the radix's
     /// handles no longer describe the restored pages.
     pub published_boundary: usize,
+    /// Highest full-page boundary this session has ever published into the
+    /// cross-session prefix cache. Separate from `published_boundary` on
+    /// purpose: this one is NOT reset when the session leaves its slot
+    /// (`mark_cold`/`mark_swapped`). The session-aware cache reclaim walks
+    /// `tokens[..prefix_boundary]` and soft-protects the radix path it still
+    /// finds, so a parked session keeps its KV reusable until TTL/close or
+    /// real pressure. Publication still uses `published_boundary`, clamped to
+    /// the turn's actual reuse point, so a lost cache never creates a gap.
+    pub prefix_boundary: usize,
     /// Monotonic stamp for LRU. Bumped by `touch`.
     pub last_used: u64,
     /// Wall-clock time of the last use/refresh. The idle sweep ages parked
@@ -150,6 +159,7 @@ impl SessionTable {
                 rope_delta: 0,
                 has_image: false,
                 published_boundary: 0,
+                prefix_boundary: 0,
                 admitted: true,
                 last_used: {
                     self.clock += 1;

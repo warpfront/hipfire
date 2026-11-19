@@ -2452,7 +2452,7 @@ impl Rig {
                 },
                 arch_policy: ArchPolicy {
                     arch_tag: "qwen35-deltanet".to_string(),
-                    state_abi_tag: g.dn_states[0].stream.identity().state_abi_tag("dn-q8"),
+                    state_abi_tag: dn_states[0].stream.identity().state_abi_tag("dn-q8"),
                     position_attention_tag: "causal-mrope".to_string(),
                 },
                 kv_layout: KvLayout {
@@ -4366,6 +4366,41 @@ fn inject_publish_fault() -> bool {
     ARMED.swap(false, Ordering::Relaxed)
 }
 
+/// Rebuild the prefix index's live-session protection set.
+///
+/// A session's `prefix_boundary` is the last page-aligned boundary it
+/// published into the cross-session radix. Walking those prefixes gives the
+/// exact pages and checkpoints still present, so an edited, partially
+/// evicted or already-swept session contributes only what exists. Called
+/// before every reclaim and before a publish (the index's own ceiling
+/// eviction consults the same set).
+fn refresh_prefix_soft_protection(rig: &mut Rig) {
+    if rig.prefix_index.is_none() {
+        return;
+    }
+    let Some(domain) = rig.cache_domain.as_ref() else {
+        return;
+    };
+    let Some(pool) = rig.pool.page_pool() else {
+        return;
+    };
+    let prefixes: Vec<&[u32]> = rig
+        .sessions
+        .iter()
+        .filter(|(_, s)| !s.has_image && s.prefix_boundary > 0)
+        .map(|(_, s)| &s.tokens[..s.prefix_boundary.min(s.tokens.len())])
+        .collect();
+    let (pages, checkpoints) = rig
+        .prefix_index
+        .as_ref()
+        .expect("checked above")
+        .protection_for(domain, &prefixes, pool);
+    rig.prefix_index
+        .as_mut()
+        .expect("checked above")
+        .set_soft_protection(pages, checkpoints);
+}
+
 /// Drop every parked session's KV pages without destroying the session.
 ///
 /// A finished request leaves its session resident so a continuation can
@@ -4442,36 +4477,47 @@ fn release_idle_sessions(rig: &mut Rig) -> usize {
     )
 }
 
-/// Drop unpinned prefix-cache pages and DeltaNet snapshots.
+/// Drop unpinned, unreferenced prefix-cache pages and DeltaNet snapshots.
 ///
 /// Finished requests publish KV pages and a recurrent-state snapshot so a
 /// later turn can resume. Those snapshots are `hipMalloc`s beside the VMM
 /// page pool, and the configured ceiling is larger than the free memory on
 /// a 24 GB card, so leaving them resident fills the device and the next
 /// granule map fails. Cache refs are what keep the pages non-Free; evicting
-/// unpinned leaves makes them Free, so the pool reuses those granules'
+/// unreferenced leaves makes them Free, so the pool reuses those granules'
 /// committed pages in place instead of mapping more
 /// ([`VmmPageMapper::sync`] never unmaps a used VA). Live slots hold table
 /// refs, so their pages stay.
 ///
+/// Live sessions' published prefixes are soft-protected: this idle pass
+/// skips them (and their checkpoints) so a parked tool turn or continuation
+/// can still hit. They become ordinary eviction candidates when the session
+/// closes or ages out, and real pressure may still reclaim them.
+///
 /// Returns `(kv pages returned to the free list, checkpoint bytes freed)`.
 fn release_unpinned_device_cache(rig: &mut Rig) -> (usize, u64) {
+    refresh_prefix_soft_protection(rig);
     let pages = if let (Some(idx), Some(pp)) = (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
     {
         let before = pp.free_pages();
-        idx.evict_unpinned_leaves(pp, usize::MAX);
+        idx.evict_unprotected_leaves(pp, usize::MAX);
         pp.drain_completed();
         pp.free_pages().saturating_sub(before)
     } else {
         0
     };
+    let protected = rig
+        .prefix_index
+        .as_ref()
+        .map(|idx| idx.soft_checkpoints().clone())
+        .unwrap_or_default();
     let blobs = rig
         .model
         .checkpoint_pool
         .as_mut()
         .map(|pool| {
             let mut out = Vec::new();
-            while let Some((_, blob)) = pool.pop_lru() {
+            while let Some((_, blob)) = pool.pop_lru_excluding(&protected) {
                 out.push(blob);
             }
             out
@@ -4504,6 +4550,7 @@ fn publish_generated_prefix(
     if !rig.prefix_cache {
         return;
     }
+    refresh_prefix_soft_protection(rig);
     let Some(f) = slots[s].as_ref() else { return };
     let session = f.session;
     let last_pub = f.last_published_boundary;
@@ -4618,6 +4665,7 @@ fn publish_generated_prefix(
         }
         if let Some(sess) = rig.sessions.get_mut(session) {
             sess.published_boundary = new_boundary;
+            sess.prefix_boundary = sess.prefix_boundary.max(new_boundary);
         }
         if rig.gpu.slot_trace() {
             eprintln!(
@@ -5941,6 +5989,7 @@ fn run_loop(
                 row += m;
                 let mut reserved = rig.pool.set_seq_len(SlotId(s), frontier).is_ok();
                 if !reserved {
+                    refresh_prefix_soft_protection(&mut rig);
                     if let (Some(idx), Some(pp)) =
                         (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
                     {
@@ -6474,6 +6523,21 @@ fn run_loop(
                         .map(|sess| sess.tokens[..new_boundary].to_vec())
                         .unwrap_or_default();
                     if tokens.len() == new_boundary {
+                        // Only a publish that can hit the index's own ceiling
+                        // needs a fresh protection set; walking every session
+                        // prefix on every chunk would be O(tokens) per chunk.
+                        let page_bytes = rig
+                            .pool
+                            .page_pool()
+                            .map(|p| p.k_page_bytes() + p.v_page_bytes())
+                            .unwrap_or(0);
+                        if rig
+                            .prefix_index
+                            .as_ref()
+                            .is_some_and(|idx| idx.needs_reclaim_before(n_new_pages, page_bytes))
+                        {
+                            refresh_prefix_soft_protection(&mut rig);
+                        }
                         let domain = rig.cache_domain.as_ref().unwrap();
                         let idx = rig.prefix_index.as_mut().unwrap();
                         let pp = rig.pool.page_pool_mut().unwrap();
@@ -6532,6 +6596,7 @@ fn run_loop(
                             if let Some(session) = slots[s].as_ref().map(|f| f.session) {
                                 if let Some(sess) = rig.sessions.get_mut(session) {
                                     sess.published_boundary = new_boundary;
+                                    sess.prefix_boundary = sess.prefix_boundary.max(new_boundary);
                                 }
                             }
                             if rig.gpu.slot_trace() {
@@ -7828,6 +7893,10 @@ fn admit(
                         .saturating_add(req.max_tokens.max(1))
                         .div_ceil(PAGE_TOKENS)
                         .saturating_add(1);
+                    let free_now = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+                    if free_now < needed_pages {
+                        refresh_prefix_soft_protection(rig);
+                    }
                     if let (Some(idx), Some(domain)) =
                         (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
                     {
@@ -8141,6 +8210,7 @@ fn admit(
                             .unwrap_or(0);
                         if let Some(sess) = rig.sessions.get_mut(existing) {
                             sess.published_boundary = session_pub;
+                            sess.prefix_boundary = sess.prefix_boundary.max(session_pub);
                         }
                         let repeat_window_req = effective_repeat_window(
                             req.repeat_window,
@@ -8569,6 +8639,7 @@ fn admit(
             .unwrap_or(0);
         let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
         if page_bytes > 0 && free < needed_pages {
+            refresh_prefix_soft_protection(rig);
             let evict_bytes = needed_pages.saturating_sub(free) * page_bytes;
             let evicted = if let (Some(idx), Some(_domain)) =
                 (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
@@ -8869,6 +8940,7 @@ fn admit(
     if prefix_hit {
         if let Some(sess) = rig.sessions.get_mut(id) {
             sess.published_boundary = reused;
+            sess.prefix_boundary = sess.prefix_boundary.max(reused);
         }
     }
     let repeat_window_req = effective_repeat_window(

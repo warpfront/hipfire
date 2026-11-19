@@ -364,6 +364,16 @@ pub struct PrefixIndex {
     retired: Vec<CheckpointId>,
     /// Visible checkpoint ids published through the exact API.
     exact_ids: HashSet<CheckpointId>,
+    /// Physical pages referenced by live sessions' published prefixes.
+    ///
+    /// Soft protection, not a pin: eviction drains unprotected leaves first
+    /// and only touches a protected leaf when that is not enough. The engine
+    /// refreshes this set from the session table before a reclaim or publish;
+    /// a closed/TTL-swept session simply stops contributing.
+    soft_pages: HashSet<u32>,
+    /// Checkpoints on the same live-session paths. The checkpoint pool is
+    /// also allowed to keep these while unprotected blobs are reclaimable.
+    soft_checkpoints: HashSet<CheckpointId>,
 }
 
 /// The deepest usable exact checkpoint found by a walk.
@@ -410,6 +420,8 @@ impl PrefixIndex {
             retained_bytes: 0,
             retired: Vec::new(),
             exact_ids: HashSet::new(),
+            soft_pages: HashSet::new(),
+            soft_checkpoints: HashSet::new(),
         }
     }
 
@@ -433,6 +445,86 @@ impl PrefixIndex {
     /// Number of distinct cache domains with entries.
     pub fn domain_count(&self) -> usize {
         self.trees.len()
+    }
+
+    /// Physical pages and checkpoints on the radix paths still present for
+    /// `prefixes` (live sessions' published token spans).
+    ///
+    /// A session that was edited, partially evicted or never published simply
+    /// contributes the resident part of its path. The caller installs the
+    /// union with [`Self::set_soft_protection`]; eviction treats it as a
+    /// priority, never as a pin.
+    pub fn protection_for(
+        &self,
+        domain: &CacheDomain,
+        prefixes: &[&[u32]],
+        pool: &PagePool,
+    ) -> (HashSet<u32>, HashSet<CheckpointId>) {
+        let mut pages = HashSet::new();
+        let mut checkpoints = HashSet::new();
+        for tokens in prefixes {
+            let walk = self.walk(domain, tokens, pool, None);
+            for h in &walk.pages {
+                pages.insert(h.handle.phys);
+            }
+            let Some(tree) = self.trees.get(domain) else {
+                continue;
+            };
+            for nid in &walk.path {
+                if let Some(node) = tree.nodes.get(nid) {
+                    for cb in &node.checkpoints {
+                        checkpoints.insert(cb.checkpoint);
+                    }
+                }
+            }
+        }
+        (pages, checkpoints)
+    }
+
+    /// Install the live-session protection set. Called before a reclaim or a
+    /// publish so the index's own ceiling/CPU-bound eviction prefers
+    /// unreferenced leaves.
+    pub fn set_soft_protection(&mut self, pages: HashSet<u32>, checkpoints: HashSet<CheckpointId>) {
+        self.soft_pages = pages;
+        self.soft_checkpoints = checkpoints;
+    }
+
+    /// The checkpoint ids on live-session paths, for the checkpoint pool's
+    /// two-pass reclaim.
+    pub fn soft_checkpoints(&self) -> &HashSet<CheckpointId> {
+        &self.soft_checkpoints
+    }
+
+    /// Whether an insert of `pages` page slots could trigger this index's own
+    /// retained-byte or CPU-node eviction. The engine uses it to refresh the
+    /// live-session protection set only when a publish can actually evict;
+    /// walking every session's prefix on every 128-token chunk would cost
+    /// O(tokens) per chunk. A false negative only loses soft priority for
+    /// that one insert (never correctness).
+    pub fn needs_reclaim_before(&self, pages: usize, page_bytes: usize) -> bool {
+        let byte_bound = self.max_retained_bytes.is_some_and(|max| {
+            self.retained_bytes
+                .saturating_add(pages.saturating_mul(page_bytes))
+                > max
+        });
+        // Splits add marker nodes on top of one page slot; two per page plus
+        // the new tail is a conservative estimate.
+        let node_bound = self
+            .total_nodes
+            .saturating_add(pages.saturating_mul(2))
+            .saturating_add(2)
+            > self.max_cpu_nodes;
+        byte_bound || node_bound
+    }
+
+    /// A leaf is protected when any page or checkpoint on it belongs to a
+    /// live session's cached prefix.
+    fn leaf_is_protected(&self, node: &Node) -> bool {
+        node.pages.iter().any(|p| self.soft_pages.contains(&p.phys))
+            || node
+                .checkpoints
+                .iter()
+                .any(|cb| self.soft_checkpoints.contains(&cb.checkpoint))
     }
 
     // ── Lookup ────────────────────────────────────────────────────────
@@ -988,6 +1080,8 @@ impl PrefixIndex {
         }
         self.total_nodes = 0;
         self.retained_bytes = 0;
+        self.soft_pages.clear();
+        self.soft_checkpoints.clear();
         released
     }
 
@@ -1005,14 +1099,24 @@ impl PrefixIndex {
         nid: NodeId,
         pool: &mut PagePool,
         evicted_phys: &mut Vec<u32>,
+        allow_protected: bool,
     ) -> Option<(usize, Option<(NodeId, u64)>)> {
-        let tree = self.trees.get_mut(domain)?;
-        let node = tree.nodes.get(&nid)?;
-        if nid == tree.root || !node.is_leaf_node() || node.pin_count != 0 {
+        let (parent_id, first_token, protected) = {
+            let tree = self.trees.get(domain)?;
+            let node = tree.nodes.get(&nid)?;
+            if nid == tree.root || !node.is_leaf_node() || node.pin_count != 0 {
+                return None;
+            }
+            (
+                node.parent,
+                node.edge_tokens.first().copied(),
+                self.leaf_is_protected(node),
+            )
+        };
+        if protected && !allow_protected {
             return None;
         }
-        let parent_id = node.parent;
-        let first_token = node.edge_tokens.first().copied();
+        let tree = self.trees.get_mut(domain)?;
 
         // Unlink from the parent via the stored back-pointer.
         if let (Some(pid), Some(ft)) = (parent_id, first_token) {
@@ -1059,6 +1163,11 @@ impl PrefixIndex {
     /// Evict oldest unpinned leaves, releasing up to `max_bytes` of device
     /// memory (spec §4.4 C4).
     ///
+    /// Unreferenced leaves go first; leaves on a live session's cached
+    /// prefix are evicted only when that pass cannot meet the target. A
+    /// protected leaf is soft protection, not a pin: real pressure still
+    /// reclaims it.
+    ///
     /// Leaf-first, oldest first (by insert sequence). Removes lookup
     /// visibility **before** releasing cache refs via
     /// `PagePool::release_cache_ref`, and queues evicted checkpoint ids for
@@ -1069,6 +1178,28 @@ impl PrefixIndex {
     ///
     /// Returns the physical page indices that were evicted.
     pub fn evict_unpinned_leaves(&mut self, pool: &mut PagePool, max_bytes: usize) -> Vec<u32> {
+        let (mut evicted, freed) = self.evict_leaves_inner(pool, max_bytes, false);
+        if freed < max_bytes {
+            let (more, _) = self.evict_leaves_inner(pool, max_bytes - freed, true);
+            evicted.extend(more);
+        }
+        evicted
+    }
+
+    /// Evict only unreferenced leaves. The idle reclaim uses this: a live
+    /// session's cached pages survive until TTL/close or real pressure.
+    pub fn evict_unprotected_leaves(&mut self, pool: &mut PagePool, max_bytes: usize) -> Vec<u32> {
+        self.evict_leaves_inner(pool, max_bytes, false).0
+    }
+
+    /// Shared leaf-first pass. `allow_protected` decides whether leaves on a
+    /// live session's prefix are eligible for this pass.
+    fn evict_leaves_inner(
+        &mut self,
+        pool: &mut PagePool,
+        max_bytes: usize,
+        allow_protected: bool,
+    ) -> (Vec<u32>, usize) {
         let mut evicted_phys: Vec<u32> = Vec::new();
         let mut bytes_freed: usize = 0;
 
@@ -1091,9 +1222,11 @@ impl PrefixIndex {
             let (domain, nid, _) = candidates[cursor].clone();
             cursor += 1;
 
-            // Re-checks leaf/pin conditions (may have changed).
-            if let Some((freed, parent)) = self.evict_leaf(&domain, nid, pool, &mut evicted_phys) {
-                bytes_freed += freed;
+            // Re-checks leaf/pin/protection conditions (may have changed).
+            if let Some((freed, parent)) =
+                self.evict_leaf(&domain, nid, pool, &mut evicted_phys, allow_protected)
+            {
+                bytes_freed = bytes_freed.saturating_add(freed);
                 // Re-evaluate the parent in the same pass so eviction can
                 // collapse chains instead of stopping one level short.
                 if let Some((pid, seq)) = parent {
@@ -1102,19 +1235,35 @@ impl PrefixIndex {
             }
         }
 
-        evicted_phys
+        (evicted_phys, bytes_freed)
     }
 
-    /// Evict exactly one leaf: the unpinned leaf (any domain, including a
-    /// metadata-only leaf) with the smallest insert sequence. Same
+    /// Evict exactly one leaf: the unprotected unpinned leaf with the
+    /// smallest insert sequence, else the oldest protected one. Same
     /// visibility/retirement/release ordering as
     /// [`evict_unpinned_leaves`](Self::evict_unpinned_leaves). Returns
     /// `false` when no unpinned leaf exists.
     pub fn evict_oldest_unpinned_leaf(&mut self, pool: &mut PagePool) -> bool {
+        let best = self
+            .oldest_leaf_candidate(false)
+            .or_else(|| self.oldest_leaf_candidate(true));
+        let Some((domain, nid, _)) = best else {
+            return false;
+        };
+        let mut evicted_phys = Vec::new();
+        self.evict_leaf(&domain, nid, pool, &mut evicted_phys, true)
+            .is_some()
+    }
+
+    /// The oldest evictable leaf, optionally restricted to unprotected ones.
+    fn oldest_leaf_candidate(&self, allow_protected: bool) -> Option<(CacheDomain, NodeId, u64)> {
         let mut best: Option<(CacheDomain, NodeId, u64)> = None;
         for (domain, tree) in &self.trees {
             for (nid, node) in &tree.nodes {
                 if *nid == tree.root || !node.is_leaf_node() || node.pin_count != 0 {
+                    continue;
+                }
+                if !allow_protected && self.leaf_is_protected(node) {
                     continue;
                 }
                 let older = match &best {
@@ -1126,12 +1275,7 @@ impl PrefixIndex {
                 }
             }
         }
-        let Some((domain, nid, _)) = best else {
-            return false;
-        };
-        let mut evicted_phys = Vec::new();
-        self.evict_leaf(&domain, nid, pool, &mut evicted_phys)
-            .is_some()
+        best
     }
 
     /// Try to evict enough nodes to fit `needed` new nodes.
@@ -4101,6 +4245,38 @@ mod tests {
         index.release_pin(&domain, pin.pin);
         assert!(index.evict_oldest_unpinned_leaf(&mut pool));
         assert_eq!(index.take_retired_checkpoints(), vec![CheckpointId(2)]);
+    }
+
+    #[test]
+    fn session_protection_keeps_a_live_prefix_and_evicts_it_later() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let live = make_tokens(256);
+        let other = make_tokens_from(5000, 256);
+        publish_exact(&mut index, &mut pool, &domain, &live, 1).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &other, 2).unwrap();
+
+        let (pages, checkpoints) = index.protection_for(&domain, &[&live], &pool);
+        assert_eq!(pages.len(), 2, "two published pages on the live path");
+        assert!(checkpoints.contains(&CheckpointId(1)));
+        index.set_soft_protection(pages, checkpoints);
+
+        // Idle reclaim: only the unreferenced prefix goes.
+        let evicted = index.evict_unprotected_leaves(&mut pool, usize::MAX);
+        assert_eq!(evicted.len(), 2);
+        let hit = index
+            .lookup_checkpoint(&domain, &live, 300, &pool)
+            .expect("live prefix survives the idle pass");
+        index.release_pin(&domain, hit.pin);
+        assert!(index
+            .lookup_checkpoint(&domain, &other, 300, &pool)
+            .is_err());
+        assert_eq!(index.checkpoint_count(), 1);
+
+        // Real pressure: the protected prefix is reclaimed last, not pinned.
+        assert_eq!(index.evict_unpinned_leaves(&mut pool, usize::MAX).len(), 2);
+        assert!(index.lookup_checkpoint(&domain, &live, 300, &pool).is_err());
     }
 
     #[test]

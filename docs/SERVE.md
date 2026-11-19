@@ -356,7 +356,10 @@ addressable. It does **not** close those sessions. A tool-result turn names
 the session that returned the tool calls one turn earlier; closing that entry
 would make the daemon's pending-tool record stale and fail the turn with
 `HTTP 400 unknown or stale tool_call_id`. A tool-result turn on a parked
-session re-enters the same id and re-prefills it cold. Only the TTL/cap sweep
+session re-enters the same id and re-prefills it cold. With
+`serve.prefix_cache` enabled, the session's published pages are also
+soft-protected across the idle reclaim, so the turn can reuse its cached
+prefix instead of re-prefilling it. Only the TTL/cap sweep
 below closes parked entries, so an abandoned tool turn becomes stale after
 `serve.multi_slot_session_ttl_secs`, never between consecutive turns.
 
@@ -959,6 +962,19 @@ entry covers one released text chunk, which is a decoder step — not
 necessarily one sampled token, and a per-sampled-token stream is not claimed.
 The images+tools combination stays refused, and tools alone are supported.
 This is not a registry admission.
+
+Live sessions' published prefixes are **soft-protected** across the paged
+idle reclaim. When the engine parks a session `Cold`, the radix pages and
+checkpoints up to that session's last published page boundary stay resident;
+the reclaim drains only unreferenced cache. A later turn on that session
+therefore reuses the cached prefix instead of re-prefilling it, including a
+tool-result turn after an idle gap. Protection is a priority, not a pin:
+request admission and the retained-byte ceiling evict unreferenced leaves
+first and live-session leaves only when that is not enough. A session stops
+protecting its cache when it is closed, swept by
+`serve.multi_slot_session_ttl_secs`, or reset; those pages then return to
+the normal LRU order. `serve.prefix_cache_max_bytes` bounds retained page
+bytes and the checkpoint pool.
 
 `memory.kv_backend=vmm` is **not** an opt-in to the shared paged pool on the
 multi-slot engine: the load is refused by name unless
