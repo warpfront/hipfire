@@ -11,6 +11,7 @@
 //! `w = sc · L[q] + zp`. The codebook itself is NOT in the weight blob — the
 //! pipeline emits it as an F32 sidecar `<stem>.lloyd_levels.weight` shape `[16]`.
 
+use crate::lloyd_gpu::{gpu_lloyd_enabled, gpu_lloyd_free_fit};
 use crate::quant_fwht::{cpu_fwht_256, MQ4V2_GROUP_BYTES};
 use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 use parking_lot::Mutex;
@@ -683,7 +684,14 @@ pub(crate) fn quantize_mq4g256v2_lloyd(
     };
 
     // Unconstrained fit (report) + E4M3-constrained fit (stored / encode).
-    let (levels_free, free_hist) = lloyd_max_fit(&fit_vals, &fit_wts, LLOYD_V2_MAX_ITERS);
+    let (levels_free, free_hist) = if gpu_lloyd_enabled() {
+        gpu_lloyd_free_fit(&fit_vals, &fit_wts).unwrap_or_else(|e| {
+            eprintln!("error: HIPFIRE_QUANT_GPU=1 failed: {e}");
+            std::process::exit(2);
+        })
+    } else {
+        lloyd_max_fit(&fit_vals, &fit_wts, LLOYD_V2_MAX_ITERS)
+    };
     let (levels_f64, _) = lloyd_max_fit_e4m3_from_free(
         &fit_vals,
         &fit_wts,
@@ -827,6 +835,53 @@ mod tests {
             out.push(g as f32);
         }
         out
+    }
+
+    /// Local stream-(2) research only. Dumps a full-fit fixture:
+    /// `u64 n`, `f64[16] expected levels`, `f64[n] vals`, `f64[n] wts`.
+    #[test]
+    #[ignore = "local GPU research: LLOYD_FIT_FIXTURE=<path> cargo test --release -p hipfire-quantize --bin hipfire-quantize -- --ignored lloyd_fit_fixture --nocapture"]
+    fn lloyd_fit_fixture() {
+        let Ok(path) = std::env::var("LLOYD_FIT_FIXTURE") else {
+            eprintln!("set LLOYD_FIT_FIXTURE to write the fixture");
+            return;
+        };
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w = synthetic_weights(64, 32768, 12345);
+        let mut vals = Vec::new();
+        let mut wts = Vec::new();
+        for group in w.chunks_exact(256) {
+            let mut g = [0.0f32; 256];
+            g.copy_from_slice(group);
+            cpu_fwht_256(&mut g, &s1, &s2);
+            let (_, _, sts, zs, degenerate) = mq4v2_block_header(&g);
+            for h in 0..2 {
+                if degenerate[h] {
+                    continue;
+                }
+                let inv = 1.0 / sts[h];
+                let wh = (sts[h] as f64) * (sts[h] as f64);
+                for i in 0..128 {
+                    vals.push(((g[h * 128 + i] - zs[h]) * inv) as f64);
+                    wts.push(wh);
+                }
+            }
+        }
+        let (levels, _) = lloyd_max_fit(&vals, &wts, LLOYD_V2_MAX_ITERS);
+        let mut bytes = Vec::with_capacity(8 + 16 * 8 + vals.len() * 16);
+        bytes.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+        for &v in &levels {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &vals {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for &v in &wts {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        eprintln!("wrote {path}: n={} levels={levels:?}", vals.len());
     }
 
     #[test]
