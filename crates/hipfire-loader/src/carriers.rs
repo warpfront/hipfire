@@ -16752,10 +16752,19 @@ mod ep_lane_reservation_tests {
 #[cfg(test)]
 mod qwen4_backing_tests {
     use super::{preload_whole_host_join, qwen4_host_union};
-    use hipfire_arch_qwen4::expert_residency::{check_gtt_cap, check_host_ram, GttBudget};
+    use hipfire_arch_qwen4::expert_residency::{check_gtt_cap, check_host_ram};
+    use hipfire_runtime::offload::{GttBudget, PinnableHostRam};
     use rdna_compute::uma_memory::{device_free_from, gtt_backed, DeviceMemory};
 
     const GIB: u64 = 1 << 30;
+
+    /// `MemAvailable` only: no TTM pool to draw on.
+    fn ram(available: u64) -> PinnableHostRam {
+        PinnableHostRam {
+            mem_available: Some(available),
+            ttm_pool: 0,
+        }
+    }
 
     #[test]
     fn carveout_96gib_and_31gib_host_keep_disjoint_budgets() {
@@ -16765,7 +16774,7 @@ mod qwen4_backing_tests {
         let host_only = GIB / 4;
         let union = qwen4_host_union(host_only, device, shared).unwrap();
         assert_eq!(union, host_only);
-        check_host_ram(union, Some(21 * GIB), 0).unwrap();
+        check_host_ram(union, ram(21 * GIB)).unwrap();
         check_gtt_cap(
             union,
             Some(GttBudget {
@@ -16798,8 +16807,7 @@ mod qwen4_backing_tests {
             0,
             GIB / 16,
             0,
-            Some(21 * GIB),
-            0,
+            ram(21 * GIB),
         )
         .unwrap();
         assert_eq!(whole, host_only + GIB + GIB / 8);
@@ -16807,8 +16815,7 @@ mod qwen4_backing_tests {
         // Real host-only overcommit remains refused even on a carve-out APU.
         assert!(check_host_ram(
             qwen4_host_union(28 * GIB, device, shared).unwrap(),
-            Some(31 * GIB),
-            0
+            ram(31 * GIB)
         )
         .is_err());
     }
@@ -16820,7 +16827,7 @@ mod qwen4_backing_tests {
             assert!(shared);
             let union = qwen4_host_union(GIB / 4, 70 * GIB, shared).unwrap();
             assert_eq!(union, 70 * GIB + GIB / 4);
-            assert!(check_host_ram(union, Some(31 * GIB), 0).is_err());
+            assert!(check_host_ram(union, ram(31 * GIB)).is_err());
             assert!(check_gtt_cap(
                 union,
                 Some(GttBudget {

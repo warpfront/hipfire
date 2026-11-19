@@ -96,8 +96,17 @@ pub fn generate_qwen4_vl(
         refuse(stdout, id, "max_tokens must be > 0");
         return;
     }
-    // Read file and base64 inputs through the same dimension-checked decoder.
-    let bytes = match &params.image_source {
+    // Flash Next renders one image per request; more are refused like the
+    // other single-image routes. Read file and base64 inputs through the
+    // same dimension-checked decoder.
+    let image_source = match params.single_image() {
+        Ok(source) => source,
+        Err(error) => {
+            refuse(stdout, id, &error);
+            return;
+        }
+    };
+    let bytes = match image_source {
         ImageSource::Path(path) => std::fs::read(path).map_err(|e| e.to_string()),
         ImageSource::Base64(encoded) => base64::engine::general_purpose::STANDARD
             .decode(encoded)

@@ -234,7 +234,7 @@ pub struct GenerateVLParams<'a> {
 
 impl<'a> GenerateVLParams<'a> {
     /// The one image of a single-image route, or the refusal text.
-    fn single_image(&self) -> Result<&ImageSource<'a>, String> {
+    pub(crate) fn single_image(&self) -> Result<&ImageSource<'a>, String> {
         match self.image_sources.as_slice() {
             [only] => Ok(only),
             [] => Err("vision request carries no image".to_owned()),

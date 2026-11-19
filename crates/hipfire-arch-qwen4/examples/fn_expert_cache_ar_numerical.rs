@@ -582,6 +582,7 @@ fn run(a: &Args) -> R<Report> {
         path: raw.into(),
         max_seq: a.max_seq,
         sequence: None,
+        vision_reserve_bytes: 0,
         backend,
         vmm_granularity: gpu.vmm_recommended_granularity().map_err(err)?,
         kv_mode: "fp8".into(),

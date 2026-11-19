@@ -367,6 +367,7 @@ fn core_op<'a>(
         head_dim: HD,
         rotary_dim: 64,
         rope: rope(),
+        mrope: None,
         input_width: HIDDEN,
         rotation: &s.rotation,
         mode: IndexedAttentionMode::Full,
