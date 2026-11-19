@@ -385,13 +385,14 @@ impl LocalLaneRank<'_> {
             }
             forwarded?;
         }
-        gpu.hip
-            .memcpy_dtoh(
-                &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
-                &top1.buf,
-            )
-            .map_err(|e| e.to_string())?;
-        gpu.take_device_wait_error().map_err(|e| e.to_string())?;
+        // Stream-ordered on the compute stream, not a blocking null-stream copy: that copy parks a
+        // packet on the null stream's own hardware queue for the whole forward, and when the queue
+        // mapper puts that queue on the compute queue's CP pipe every dispatch pays a time slice.
+        gpu.dtoh_stream_ordered(
+            &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
+            &top1.buf,
+        )
+        .map_err(|e| e.to_string())?;
         // The window's forward is retired on this rank: the D2 expert tail (when installed)
         // judges it and rewrites its decode tables before the next window launches.
         if let Some(gather) = bundle
@@ -666,16 +667,13 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
             }))
             .map_err(|e| rank_error(format!("draft_step: draft step {j}: {e}")))?;
         }
-        // One D2H for every active lane.
+        // One D2H for every active lane, stream-ordered (see the readback in `verify_device`).
         let bytes = round.ops.len() * slot_bytes;
-        gpu.hip
-            .memcpy_dtoh(
-                &mut spec_store.draft_top1_host[..bytes],
-                &spec_store.draft_top1.buf,
-            )
-            .map_err(|e| rank_error(format!("draft_step: draft download: {e}")))?;
-        gpu.take_device_wait_error()
-            .map_err(|e| rank_error(format!("draft_step: draft download: {e}")))?;
+        gpu.dtoh_stream_ordered(
+            &mut spec_store.draft_top1_host[..bytes],
+            &spec_store.draft_top1.buf,
+        )
+        .map_err(|e| rank_error(format!("draft_step: draft download: {e}")))?;
         let mut proposals = Vec::with_capacity(round.ops.len());
         for (slot, (op, lane)) in round.ops.iter().zip(lanes.iter_mut()).enumerate() {
             let top = &spec_store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
