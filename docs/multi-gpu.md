@@ -749,9 +749,9 @@ borrows its last two resident compact expert layers as alternating DMA stages,
 then restores their original bytes before the forward returns. Residency is
 unchanged; each host layer copies the rank's owned compact experts (637.5
 MiB/rank on EP2 and 318.75 MiB/rank on EP4). Two donor mirrors/rank, each
-sized to that rank's own sealed share, are charged as the sum of every rank's
-share against one host's RAM/GTT budgets; an all-resident load needs no
-host-layer stage.
+sized to that rank's own sealed share, are admitted against one host's
+RAM/GTT budgets as this rank's share plus each later rank's (earlier ranks
+have already pinned theirs); an all-resident load needs no host-layer stage.
 Decode and verify continue to use mapped experts and host-wait row exchange,
 independent of the staging launch stream. Staging stays outside capture/tapes.
 EP staging requires every trunk MoE in the forward to bind the compact
