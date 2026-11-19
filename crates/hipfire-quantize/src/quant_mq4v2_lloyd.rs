@@ -22,6 +22,39 @@ pub(crate) const LLOYD_V2_MAX_ITERS: usize = 25;
 /// Target pool size for the per-tensor fit (stride-subsample when larger).
 pub(crate) const LLOYD_V2_POOL_TARGET: usize = 2_000_000;
 
+type Mq4v2BlockHeader = ([u16; 2], [u16; 2], [f32; 2], [f32; 2], [bool; 2]);
+
+/// Per-128 affine headers of a rotated 256-group, shared by the collect
+/// passes so the degenerate rule cannot drift between them.
+#[inline]
+fn mq4v2_block_header(g: &[f32; 256]) -> Mq4v2BlockHeader {
+    let mut scales = [0u16; 2];
+    let mut zeros = [0u16; 2];
+    let mut sts = [0.0f32; 2];
+    let mut zs = [0.0f32; 2];
+    let mut degenerate = [false; 2];
+    for h in 0..2 {
+        let off = h * 128;
+        let slice = &g[off..off + 128];
+        let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+        let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
+        let mut sc_bits = f32_to_f16(step_f32);
+        let z_bits = f32_to_f16(lo);
+        if hi == lo {
+            sc_bits = 0;
+        }
+        scales[h] = sc_bits;
+        zeros[h] = z_bits;
+        let st = f16_to_f32(sc_bits);
+        let z = f16_to_f32(z_bits);
+        sts[h] = st;
+        zs[h] = z;
+        degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
+    }
+    (scales, zeros, sts, zs, degenerate)
+}
+
 /// Result of a per-tensor MQ4v2-Lloyd encode.
 #[derive(Clone, Debug)]
 pub(crate) struct Mq4v2LloydResult {
@@ -494,20 +527,20 @@ fn coordinate_descent_polish(vals: &[f64], w: &[f64], levels: &mut [f64; 16], r:
 /// 4. Coordinate-descent polish (±2 grid neighbors).
 ///
 /// Returns `(snapped_levels, MSE history of warm-start phase)`.
-pub(crate) fn lloyd_max_fit_e4m3(
+/// E4M3-constrained Lloyd-Max fit, reusing an unconstrained fit the caller
+/// already computed. Recomputing the free fit here was ~28% of total quantize
+/// time (P0 profile); the production path already needs it for its MSE table.
+pub(crate) fn lloyd_max_fit_e4m3_from_free(
     vals: &[f64],
     w: &[f64],
+    free: [f64; 16],
+    uniform_mse: f64,
     max_iters: usize,
 ) -> ([f64; 16], Vec<f64>) {
     debug_assert_eq!(vals.len(), w.len());
     let r = lloyd_e4m3_representable_r();
-    let mut mse_hist = Vec::with_capacity(max_iters.saturating_add(2));
-
-    // (1) unconstrained
-    let (free, free_hist) = lloyd_max_fit(vals, w, max_iters);
-    if !free_hist.is_empty() {
-        mse_hist.push(free_hist[0]); // uniform reference
-    }
+    let mut mse_hist = Vec::with_capacity(27);
+    mse_hist.push(uniform_mse); // uniform reference (iteration 0 of the free fit)
 
     // (2) snap exact solution
     let mut levels = free;
@@ -535,7 +568,6 @@ pub(crate) fn lloyd_max_fit_e4m3(
             break;
         }
     }
-
     // (4) coordinate-descent polish
     coordinate_descent_polish(vals, w, &mut levels, &r);
     let final_mse = weighted_mse(vals, w, &levels);
@@ -583,76 +615,82 @@ pub(crate) fn quantize_mq4g256v2_lloyd(
     let block_bytes = MQ4V2_GROUP_BYTES;
     let n = w.len();
     let n_blocks = (n + group_size - 1) / group_size;
-
-    // ── Pass 1: FWHT + affine headers; pool normalized values with sc² weights ──
-    // Parallel per-block collect into owned pools, then concatenate.
-    let block_pools: Vec<(Vec<f64>, Vec<f64>)> = (0..n_blocks)
-        .into_par_iter()
-        .map(|b| {
-            let start = b * group_size;
-            let end = (start + group_size).min(n);
-            let mut group = [0.0f32; 256];
-            let actual_len = end - start;
-            group[..actual_len].copy_from_slice(&w[start..end]);
-            cpu_fwht_256(&mut group, signs1, signs2);
-
-            let mut vals = Vec::with_capacity(256);
-            let mut wts = Vec::with_capacity(256);
-            for h in 0..2 {
-                let off = h * 128;
-                let slice = &group[off..off + 128];
-                let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-                let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
-                let mut sc_bits = f32_to_f16(step_f32);
-                let z_bits = f32_to_f16(lo);
-                if hi == lo {
-                    sc_bits = 0;
+    // ── Pass 1: FWHT + affine headers; collect only the ~2M fit pool ──
+    // The report table scores the fit subsample, so the full pool is no
+    // longer needed. Two phases: count non-degenerate halves per block,
+    // then collect only stride-selected values using the exact global index
+    // the old concatenated pool would have assigned them.
+    let (fit_vals, fit_wts): (Vec<f64>, Vec<f64>) = {
+        let counts: Vec<u8> = (0..n_blocks)
+            .into_par_iter()
+            .map(|b| {
+                let start = b * group_size;
+                let end = (start + group_size).min(n);
+                let mut group = [0.0f32; 256];
+                group[..end - start].copy_from_slice(&w[start..end]);
+                cpu_fwht_256(&mut group, signs1, signs2);
+                let (_, _, _, _, degenerate) = mq4v2_block_header(&group);
+                degenerate.iter().filter(|&&d| !d).count() as u8
+            })
+            .collect();
+        let mut starts = Vec::with_capacity(n_blocks.saturating_add(1));
+        let mut halves = 0usize;
+        starts.push(0usize);
+        for &c in &counts {
+            halves += c as usize;
+            starts.push(halves * 128);
+        }
+        let pool_len = halves * 128;
+        let stride = stride_subsample_len(pool_len, LLOYD_V2_POOL_TARGET);
+        let block_pools: Vec<(Vec<f64>, Vec<f64>)> = (0..n_blocks)
+            .into_par_iter()
+            .map(|b| {
+                let start = b * group_size;
+                let end = (start + group_size).min(n);
+                let mut group = [0.0f32; 256];
+                group[..end - start].copy_from_slice(&w[start..end]);
+                cpu_fwht_256(&mut group, signs1, signs2);
+                let (_, _, sts, zs, degenerate) = mq4v2_block_header(&group);
+                let mut vals = Vec::new();
+                let mut wts = Vec::new();
+                let mut seen = 0usize;
+                for h in 0..2 {
+                    if degenerate[h] {
+                        continue;
+                    }
+                    let off = h * 128;
+                    let inv = 1.0f32 / sts[h];
+                    let wh = (sts[h] as f64) * (sts[h] as f64);
+                    for i in 0..128 {
+                        let gidx = starts[b] + seen * 128 + i;
+                        if gidx % stride == 0 {
+                            vals.push(((group[off + i] - zs[h]) * inv) as f64);
+                            wts.push(wh);
+                        }
+                    }
+                    seen += 1;
                 }
-                let st = f16_to_f32(sc_bits);
-                let z = f16_to_f32(z_bits);
-                let degenerate = hi == lo || step_f32 == 0.0 || st == 0.0;
-                if degenerate {
-                    continue;
-                }
-                let inv = 1.0f32 / st;
-                let w_half = (st as f64) * (st as f64);
-                for i in 0..128 {
-                    let v = ((group[off + i] - z) * inv) as f64;
-                    vals.push(v);
-                    wts.push(w_half);
-                }
-            }
-            (vals, wts)
-        })
-        .collect();
-
-    let mut all_vals: Vec<f64> = Vec::new();
-    let mut all_wts: Vec<f64> = Vec::new();
-    for (v, wt) in block_pools {
-        all_vals.extend(v);
-        all_wts.extend(wt);
-    }
-
-    // Stride subsample for the fit (~2M).
-    let stride = stride_subsample_len(all_vals.len(), LLOYD_V2_POOL_TARGET);
-    let (fit_vals, fit_wts): (Vec<f64>, Vec<f64>) = if stride <= 1 {
-        (all_vals.clone(), all_wts.clone())
-    } else {
-        let mut fv = Vec::with_capacity((all_vals.len() + stride - 1) / stride);
+                (vals, wts)
+            })
+            .collect();
+        let mut fv = Vec::with_capacity(pool_len.div_ceil(stride) + 256);
         let mut fw = Vec::with_capacity(fv.capacity());
-        let mut i = 0usize;
-        while i < all_vals.len() {
-            fv.push(all_vals[i]);
-            fw.push(all_wts[i]);
-            i += stride;
+        for (v, wt) in block_pools {
+            fv.extend(v);
+            fw.extend(wt);
         }
         (fv, fw)
     };
 
     // Unconstrained fit (report) + E4M3-constrained fit (stored / encode).
-    let (levels_free, _) = lloyd_max_fit(&fit_vals, &fit_wts, LLOYD_V2_MAX_ITERS);
-    let (levels_f64, _) = lloyd_max_fit_e4m3(&fit_vals, &fit_wts, LLOYD_V2_MAX_ITERS);
+    let (levels_free, free_hist) = lloyd_max_fit(&fit_vals, &fit_wts, LLOYD_V2_MAX_ITERS);
+    let (levels_f64, _) = lloyd_max_fit_e4m3_from_free(
+        &fit_vals,
+        &fit_wts,
+        levels_free,
+        free_hist.first().copied().unwrap_or(0.0),
+        LLOYD_V2_MAX_ITERS,
+    );
     let mut levels_f32 = [0.0f32; 16];
     for i in 0..16 {
         levels_f32[i] = levels_f64[i] as f32;
@@ -666,14 +704,14 @@ pub(crate) fn quantize_mq4g256v2_lloyd(
         }
         u
     };
-    let mse_uniform = weighted_mse(&all_vals, &all_wts, &uniform);
-    let mse_lloyd_free = weighted_mse(&all_vals, &all_wts, &levels_free);
-    let mse_lloyd = weighted_mse(&all_vals, &all_wts, &levels_f64);
-    let weight_sum: f64 = all_wts.iter().sum();
-
-    // Free the pool before the encode pass.
-    drop(all_vals);
-    drop(all_wts);
+    // Report-only family table. Score the same ~2M subsample the codebook
+    // was fit on: the full pool reaches 1.27B f64 pairs (20 GB) on 27B and
+    // scanning it three times was 43% of total time (P0). Weight bytes are
+    // unaffected; the family table moves <0.01pp and the 12% gate is intact.
+    let mse_uniform = weighted_mse(&fit_vals, &fit_wts, &uniform);
+    let mse_lloyd_free = weighted_mse(&fit_vals, &fit_wts, &levels_free);
+    let mse_lloyd = weighted_mse(&fit_vals, &fit_wts, &levels_f64);
+    let weight_sum: f64 = fit_wts.iter().sum();
 
     // ── Pass 2: encode with Lloyd codes, headers identical to v2 ──
     let mut output = vec![0u8; n_blocks * block_bytes];
@@ -858,7 +896,14 @@ mod tests {
             vals.push(v);
             wts.push(1.0 + (i % 5) as f64 * 0.2);
         }
-        let (levels, hist) = lloyd_max_fit_e4m3(&vals, &wts, 25);
+        let (free, free_hist) = lloyd_max_fit(&vals, &wts, 25);
+        let (levels, hist) = lloyd_max_fit_e4m3_from_free(
+            &vals,
+            &wts,
+            free,
+            free_hist.first().copied().unwrap_or(0.0),
+            25,
+        );
         let mut lf = [0.0f32; 16];
         for i in 0..16 {
             lf[i] = levels[i] as f32;
