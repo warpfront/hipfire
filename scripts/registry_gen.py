@@ -315,6 +315,10 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
     # qwen3_5 (5); it has no A3B variant, so there is no "a3b" split here.
     if family == "decider":
         return 5
+    # DaisyRose-27B = RadixArk's RL post-train of Qwen3.8-27B
+    # (RadixArk/DaisyRose-27B, Apache-2.0); unchanged dense qwen3_5 (5).
+    if family == "daisyrose":
+        return 5
 
     # EmbeddingGemma 2 (`google/embeddinggemma-2`) — the arch-18 single-vector
     # embedding encoder: a Gemma-4-family bidirectional trunk with no LM head,
