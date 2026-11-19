@@ -57,10 +57,17 @@ impl Gpu {
 
         if !self.hip.plan_active() {
             let func = &self.functions["embedding_q8"];
-            // SAFETY: params match the kernel signature; null stream as before.
+            // SAFETY: params match the kernel signature. On the active stream: this lookup runs
+            // every decode step, and a null-stream launch would park the step on the legacy queue.
             return unsafe {
-                self.hip
-                    .launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, None, &mut params)
+                self.hip.launch_kernel(
+                    func,
+                    [1, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    self.active_stream.as_ref(),
+                    &mut params,
+                )
             };
         }
         self.launch_maybe_blob(
@@ -143,8 +150,14 @@ impl Gpu {
         ];
 
         unsafe {
-            self.hip
-                .launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, None, &mut params)
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.active_stream.as_ref(),
+                &mut params,
+            )
         }
     }
 

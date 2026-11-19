@@ -2365,6 +2365,13 @@ pub fn decode_step_with_graph(
             .map_err(|e| format!("decode_step_with_graph: stream_create: {e:?}"))?;
         gpu.active_stream = Some(s);
     }
+    // A replay step is steady state: no null-stream submission from here to the logits
+    // (`HIPFIRE_NULL_STREAM_LEDGER=deny` fails one).
+    let _step = gpu
+        .graphs
+        .graph_exec
+        .is_some()
+        .then(hip_bridge::null_stream::steady_step);
 
     // Embedding lookup and pos-array host write run OUTSIDE the captured
     // region. token_id is baked into the embedding kernel arg, so capture
@@ -2417,11 +2424,10 @@ pub fn decode_step_with_graph(
         state.n_tokens += 1;
     }
 
-    // Logits download is outside the captured region (sync memcpy_dtoh
-    // on the null stream — completes after the captured kernels finish
-    // because the captured stream is observed by the device).
+    // Logits download is outside the captured region, ordered on the active stream behind the
+    // replayed kernels (no legacy null-stream hop per token).
     let logits = state.logits.as_ref().unwrap();
-    gpu.download_f32(logits)
+    gpu.download_f32_stream_ordered(logits)
         .map_err(|e| format!("download logits (graph path): {e:?}"))
 }
 

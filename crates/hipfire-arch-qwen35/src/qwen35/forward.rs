@@ -2160,8 +2160,7 @@ fn forward_scratch_staged(
         // + verify invalidation guarantee — and this call passes the buffers
         // the graph was captured with (`ar_graph_binding`). ──
         let copy_started = rdna_compute::gap_timing::now();
-        gpu.hip
-            .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        gpu.upload_stream_ordered(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         rdna_compute::gap_timing::add_since(rdna_compute::gap_timing::Slot::PosCopy, copy_started);
         let launch_started = rdna_compute::gap_timing::now();
         gpu.graphs

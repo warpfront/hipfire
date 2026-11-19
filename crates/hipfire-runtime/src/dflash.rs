@@ -3369,13 +3369,15 @@ fn upload_slice_f32(gpu: &Gpu, dst: &GpuTensor, data: &[f32]) -> HipResult<()> {
 
 /// Upload i32 slice into a GPU tensor (interpreted as i32 by kernels).
 /// Synchronous outside hipGraph capture; while capturing it is enqueued on
-/// the capturing stream (`Gpu::memcpy_htod_auto`), which bakes `data`'s host
+/// the capturing stream (`Gpu::upload_stream_ordered`), which bakes `data`'s host
 /// address into the graph: a replaying owner keeps that storage alive and
-/// rewrites it in place before each launch.
+/// rewrites it in place before each launch. Outside capture the copy is
+/// ordered on the decode stream, not the legacy null stream (it runs every
+/// draft step).
 fn upload_slice_i32(gpu: &Gpu, dst: &GpuTensor, data: &[i32]) -> HipResult<()> {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-    gpu.memcpy_htod_auto(&dst.buf, bytes)
+    gpu.upload_stream_ordered(&dst.buf, bytes)
 }
 
 /// `HIPFIRE_DFLASH_ORDERED_DRAFT=0` (developer kill switch): the draft

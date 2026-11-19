@@ -511,7 +511,8 @@ impl DraftHead {
         self.draft_enqueue(gpu, head, hidden, &top1)?;
         let mut top = [0u8; Gpu::TOPK8_OUT_BYTES];
         let read = if self.partial.is_some() { top.len() } else { 8 };
-        hip(gpu.hip.memcpy_dtoh(&mut top[..read], &top1.buf))?;
+        // Stream-ordered behind the ranking launches: the draft runs every MTP window.
+        hip(gpu.dtoh_stream_ordered(&mut top[..read], &top1.buf))?;
         self.draft_finish(&top[..read])
     }
 

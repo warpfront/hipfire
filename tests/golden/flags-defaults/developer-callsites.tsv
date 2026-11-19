@@ -531,7 +531,7 @@ developer_callsite	*	HIPFIRE_MTP_VERIFY_DECOUPLE#developer_var=ok
 developer_callsite	*	HIPFIRE_NO_Q8_ROUTER#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_NO_SPILL#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_NPU_TRUNK_PACK_A_PM#developer_bool=true
-developer_callsite	*	HIPFIRE_NULL_STREAM_LEDGER#developer_var=as_deref.==Ok("1")
+developer_callsite	*	HIPFIRE_NULL_STREAM_LEDGER#developer_var=as_deref
 developer_callsite	*	HIPFIRE_OFFLOAD_DEBUG#developer_var=is_ok
 developer_callsite	*	HIPFIRE_PACK_JOBS#developer_var=ok
 developer_callsite	*	HIPFIRE_PAGE_EVICTION#developer_var=ok.map.unwrap_or_else

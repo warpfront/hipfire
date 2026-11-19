@@ -191,6 +191,13 @@ pub fn decode_step_with_graph(
             .map_err(|e| format!("gemma4 graph: stream_create: {e:?}"))?;
         gpu.active_stream = Some(s);
     }
+    // A replay step is steady state: no null-stream submission from here to the logits
+    // (`HIPFIRE_NULL_STREAM_LEDGER=deny` fails one).
+    let _step = gpu
+        .graphs
+        .graph_exec
+        .is_some()
+        .then(hip_bridge::null_stream::steady_step);
 
     // Embedding lookup + √dim scale OUTSIDE the captured region — token_id is
     // baked into the embedding kernarg. Runs on the active stream, ordered
@@ -236,9 +243,9 @@ pub fn decode_step_with_graph(
     }
     state.n_tokens = position as usize + 1;
 
-    // Logits download is outside the captured region (sync dtoh completes after
-    // the captured kernels, which the device observes on the active stream).
-    gpu.download_f32(&state.logits)
+    // Logits download is outside the captured region, ordered on the active stream behind the
+    // replayed kernels (no legacy null-stream hop per token).
+    gpu.download_f32_stream_ordered(&state.logits)
         .map_err(|e| format!("gemma4 graph: download logits: {e:?}"))
 }
 

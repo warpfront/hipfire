@@ -5974,6 +5974,9 @@ pub fn generate_spec(
         }
     }
     let mut ar_steps = 0usize;
+    // Speculative cycles run so far; past the warm-up each is a steady-state window that must not
+    // submit to the legacy null stream (`HIPFIRE_NULL_STREAM_LEDGER`).
+    let mut spec_cycles = 0usize;
     while !first_token_is_eos && generated < max_tokens {
         // Decode-side abort (dflash path). See the matching block in
         // `generate()` for rationale. Without this, a Pi cancel
@@ -6303,6 +6306,11 @@ pub fn generate_spec(
             spec.ar_step(gpu, slot, position, seed_token, &emitted)
                 .map(|t| hipfire_runtime::spec::SpecStep::new([t], t, 0, 0))
         } else {
+            let _step = hip_bridge::null_stream::steady_step_after_warmup(
+                spec_cycles,
+                gpu.active_stream.is_some(),
+            );
+            spec_cycles += 1;
             spec_step(
                 pp.as_deref_mut(),
                 gpu,

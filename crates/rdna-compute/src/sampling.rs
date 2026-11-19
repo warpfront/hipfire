@@ -792,10 +792,11 @@ impl Gpu {
         Ok(())
     }
 
-    /// Synchronous 8-byte `{token_id, rng}` readback of a sampler result.
+    /// Synchronous 8-byte `{token_id, rng}` readback of a sampler result, ordered on the stream
+    /// the sampler kernels ran on ([`Self::dtoh_stream_ordered`]): it runs every decode step.
     fn read_sample_result(&self, result_buf: &GpuTensor) -> HipResult<(u32, u32)> {
         let mut out = [0u8; 8];
-        self.hip.memcpy_dtoh(&mut out, &result_buf.buf)?;
+        self.dtoh_stream_ordered(&mut out, &result_buf.buf)?;
         let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
         let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
         Ok((token_id, new_rng))

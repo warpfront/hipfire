@@ -2370,8 +2370,7 @@ pub fn mtp_head_forward_block_only(
 
     // Upload position scalar for the RoPE / attention kernels.
     let pos_i32 = pos as i32;
-    gpu.hip
-        .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+    gpu.upload_stream_ordered(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
 
     mtp_head_forward_block_only_with_pos_buf(
         gpu,
