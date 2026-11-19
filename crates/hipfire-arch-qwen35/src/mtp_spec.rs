@@ -1181,7 +1181,7 @@ impl MtpSpecState {
         row: usize,
         dim: usize,
     ) -> HipResult<()> {
-        gpu.hip.memcpy_dtod_at(
+        gpu.memcpy_dtod_at_auto(
             &self.prev_hidden.buf,
             0,
             &self.verify_hidden.buf,
@@ -2414,7 +2414,7 @@ fn mtp_verify_accept_impl(
                 let bytes: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(accept_host.as_mut_ptr() as *mut u8, 8)
                 };
-                gpu.hip.memcpy_dtoh(bytes, &accept_result.buf)?;
+                gpu.dtoh_stream_ordered(bytes, &accept_result.buf)?;
             }
             assemble_greedy_accept_from_gpu_result(
                 &candidates[..drafts_generated],
@@ -5170,8 +5170,7 @@ pub fn mtp_draft_phase_inner(
             let seed_token = last_committed as i32;
             let seed_bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(&seed_token as *const i32 as *const u8, 4) };
-            gpu.hip
-                .memcpy_htod(&state.mtp_token_chain.buf, seed_bytes)?;
+            gpu.upload_stream_ordered(&state.mtp_token_chain.buf, seed_bytes)?;
         }
     }
 
@@ -5613,7 +5612,7 @@ pub fn mtp_draft_phase_inner(
             let bytes: &mut [u8] = unsafe {
                 std::slice::from_raw_parts_mut(candidate_host.as_mut_ptr() as *mut u8, max_n * 4)
             };
-            gpu.hip.memcpy_dtoh(bytes, &candidate_view.buf)?;
+            gpu.dtoh_stream_ordered(bytes, &candidate_view.buf)?;
         }
         candidates.extend(candidate_host.into_iter().map(|t| t as u32));
         max_n

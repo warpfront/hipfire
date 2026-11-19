@@ -3453,8 +3453,7 @@ impl Qwen4Bundle {
         result?;
         #[cfg(feature = "lab")]
         self.lab_note_forward(gpu, std::slice::from_ref(&token), &logits, 1, false)?;
-        gpu.hip
-            .memcpy_dtoh(&mut self.spec_host_top1[..top1_bytes], &top1.buf)
+        gpu.dtoh_stream_ordered(&mut self.spec_host_top1[..top1_bytes], &top1.buf)
             .map_err(BundleError::Hip)?;
         gpu.take_device_wait_error().map_err(BundleError::Hip)?;
         let bytes = &self.spec_host_top1[..top1_bytes];

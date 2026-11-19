@@ -12591,19 +12591,11 @@ impl Gpu {
 }
 
 /// [`argmax_f32`] of one logits row, read back: `llama::argmax(logits)`
-/// without downloading the row. Uses a lazily allocated 4-byte scratch.
-pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
-    argmax_f32_host_impl(gpu, logits, false)
-}
-
-/// [`argmax_f32_host`] for a decode loop that replays a graph on
-/// `Gpu::active_stream`: the 4-byte result is read back ordered on that stream
-/// ([`Gpu::download_f32_stream_ordered`]) instead of a blocking null-stream copy.
+/// without downloading the row. Uses a lazily allocated 4-byte scratch. The
+/// result is read back ordered on `Gpu::active_stream`
+/// ([`Gpu::download_f32_stream_ordered`]), not with a blocking null-stream copy:
+/// decode loops call it every token.
 pub fn argmax_f32_host_stream_ordered(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
-    argmax_f32_host_impl(gpu, logits, true)
-}
-
-fn argmax_f32_host_impl(gpu: &mut Gpu, logits: &GpuTensor, ordered: bool) -> HipResult<u32> {
     if gpu.scratch.argmax_host.is_none() {
         gpu.scratch.argmax_host = Some(gpu.alloc_tensor(&[1], DType::F32)?);
     }
@@ -12620,11 +12612,7 @@ fn argmax_f32_host_impl(gpu: &mut Gpu, logits: &GpuTensor, ordered: bool) -> Hip
             vocab: logits.numel(),
         },
     )?;
-    let row = if ordered {
-        gpu.download_f32_stream_ordered(&result)?
-    } else {
-        gpu.download_f32(&result)?
-    };
+    let row = gpu.download_f32_stream_ordered(&result)?;
     Ok(row[0].to_bits())
 }
 
@@ -16706,7 +16694,10 @@ mod tests {
         ];
         for (values, expected) in cases {
             let logits = gpu.upload_f32(&values, &[values.len()]).unwrap();
-            assert_eq!(argmax_f32_host(&mut gpu, &logits).unwrap(), expected);
+            assert_eq!(
+                argmax_f32_host_stream_ordered(&mut gpu, &logits).unwrap(),
+                expected
+            );
             gpu.free_tensor(logits).unwrap();
         }
     }

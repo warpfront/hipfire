@@ -3020,11 +3020,11 @@ pub fn upload_prefill_batch_inputs(
     let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
     let tokens_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
-    gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+    gpu.upload_stream_ordered(&pbs.tokens.buf, tokens_bytes)?;
     let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
     let positions_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
-    gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    gpu.upload_stream_ordered(&pbs.positions.buf, positions_bytes)?;
     Ok(())
 }
 
@@ -5761,14 +5761,13 @@ pub(crate) fn batch_chunk_embed_tokens(
                     let tokens_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, len * 4)
                     };
-                    gpu.hip
-                        .memcpy_htod_offset(&pbs.tokens.buf, start * 4, tokens_bytes)
+                    gpu.htod_stream_ordered(&pbs.tokens.buf, start * 4, tokens_bytes)
                 })?;
             } else {
                 let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
                 let tokens_bytes: &[u8] =
                     unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
-                gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+                gpu.upload_stream_ordered(&pbs.tokens.buf, tokens_bytes)?;
             }
         }
         if let Some(embed_mask) = embed_mask {
@@ -5889,8 +5888,7 @@ pub(crate) fn batch_chunk_embed_tokens(
                 let bytes: &[u8] =
                     unsafe { std::slice::from_raw_parts(ovr.embed.as_ptr() as *const u8, dim * 4) };
                 let offset = ovr.slot * dim_row_bytes;
-                gpu.hip
-                    .memcpy_htod_offset(&pbs.x_batch.buf, offset, bytes)?;
+                gpu.htod_stream_ordered(&pbs.x_batch.buf, offset, bytes)?;
             }
         }
     }
@@ -5962,8 +5960,7 @@ pub(crate) fn batch_chunk_upload_positions(
                         len * 4,
                     )
                 };
-                gpu.hip
-                    .memcpy_htod_offset(&pbs.positions.buf, start * 4, positions_bytes)?;
+                gpu.htod_stream_ordered(&pbs.positions.buf, start * 4, positions_bytes)?;
                 if let Some(tv) = tree_verify.as_ref() {
                     debug_assert_eq!(tv.positions.len(), n, "tree RoPE positions length");
                     let rope_bytes: &[u8] = unsafe {
@@ -5980,7 +5977,7 @@ pub(crate) fn batch_chunk_upload_positions(
         } else {
             let positions_bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
-            gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+            gpu.upload_stream_ordered(&pbs.positions.buf, positions_bytes)?;
             if let Some(tv) = tree_verify.as_ref() {
                 debug_assert_eq!(tv.positions.len(), n, "tree RoPE positions length");
                 let rope_bytes: &[u8] = unsafe {

@@ -17335,7 +17335,8 @@ impl Qwen4GpuForward {
         let host_argmax: [u32; 1];
         let tokens = match argmax_of {
             Some(previous) if !hip_body => {
-                let token = rdna_compute::tensor_ops::argmax_f32_host(gpu, previous)?;
+                let token =
+                    rdna_compute::tensor_ops::argmax_f32_host_stream_ordered(gpu, previous)?;
                 if token as usize >= config.vocab_size {
                     return Err(invalid(
                         "Qwen4 token id is outside the embedding vocabulary",

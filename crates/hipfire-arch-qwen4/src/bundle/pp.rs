@@ -2538,7 +2538,8 @@ impl Qwen4Bundle {
                     .get_mut(owner)
                     .ok_or_else(|| pp_error("the output device is unavailable"))?;
                 gpu.bind_thread().map_err(BundleError::Hip)?;
-                rdna_compute::tensor_ops::argmax_f32_host(gpu, logits).map_err(BundleError::Hip)?
+                rdna_compute::tensor_ops::argmax_f32_host_stream_ordered(gpu, logits)
+                    .map_err(BundleError::Hip)?
             }
         };
         self.pp_forward_detached(
