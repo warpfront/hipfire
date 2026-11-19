@@ -287,7 +287,11 @@ impl SessionTable {
     /// session was touched last, not to the one that emitted the calls being
     /// answered. The caller identifies the session from the tool-call ids it
     /// handed the client; this only re-checks the session is still that
-    /// conversation, so a stale or evicted id falls back to a cold prefill.
+    /// conversation. A `Cold` session still owns its id, tokens and
+    /// conversation: the idle KV reclaim parks resident sessions cold
+    /// instead of closing them, and the caller re-enters this id through the
+    /// cold admit path (a re-prefill under the same id), never a new id.
+    /// `None` means the id is unknown or its conversation moved on.
     pub fn confirm_reentry(
         &self,
         id: SessionId,
@@ -298,8 +302,7 @@ impl SessionTable {
             return None;
         }
         let s = self.sessions.get(&id.0)?;
-        (s.residency != Residency::Cold && s.convo.as_slice() == want && !s.tokens.is_empty())
-            .then_some(id)
+        (s.convo.as_slice() == want && !s.tokens.is_empty()).then_some(id)
     }
 
     /// Mark a session as most-recently used, for LRU.
@@ -756,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_reentry_refuses_cold_busy_and_empty_sessions() {
+    fn confirm_reentry_refuses_busy_and_empty_sessions() {
         let (mut pool, mut adm, mut t) = rig(2);
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
         {
@@ -767,9 +770,40 @@ mod tests {
         assert_eq!(t.confirm_reentry(a, &[11], &[a]), None, "busy");
         t.get_mut(a).unwrap().tokens.clear();
         assert_eq!(t.confirm_reentry(a, &[11], &[]), None, "nothing in its KV");
-        t.get_mut(a).unwrap().tokens = vec![1];
+    }
+
+    #[test]
+    fn confirm_reentry_accepts_a_parked_cold_session_and_reopens_the_same_id() {
+        // The idle paged reclaim parks a resident session cold instead of
+        // closing it. A tool-result turn names that id, so the id must stay
+        // addressable and re-prefill in place — not mint a new session (the
+        // daemon rejects a tool result admitted on a different session).
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![11];
+            s.tokens = vec![1, 2, 3];
+        }
         t.mark_cold(&mut pool, &mut adm, a);
-        assert_eq!(t.confirm_reentry(a, &[11], &[]), None, "cold");
+        assert_eq!(t.get(a).unwrap().residency, Residency::Cold);
+        assert_eq!(t.get(a).unwrap().tokens, [1, 2, 3]);
+        assert_eq!(t.confirm_reentry(a, &[11], &[]), Some(a));
+        assert_eq!(t.reopen_cold(&mut pool, &mut adm, a, 1024).unwrap(), a);
+        assert_eq!(t.get(a).unwrap().residency, Residency::Resident);
+    }
+
+    #[test]
+    fn confirm_reentry_refuses_a_cold_session_whose_conversation_moved_on() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![11, 22];
+            s.tokens = vec![1, 2, 3];
+        }
+        t.mark_cold(&mut pool, &mut adm, a);
+        assert_eq!(t.confirm_reentry(a, &[11], &[]), None);
     }
 
     #[test]

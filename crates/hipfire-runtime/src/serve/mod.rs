@@ -531,9 +531,11 @@ pub trait SlotEngineHandle: Send + Sync {
     fn reset(&self) -> Result<(), String>;
     /// Snapshot of engine-level counters (submitted/rejected/completed/…).
     fn stats(&self) -> EngineStats;
-    /// Drain ids of sessions the engine closed on its own (the idle sweep).
-    /// The daemon prunes its pending-tool broker from this list; engines
-    /// without an internal sweep return an empty vec.
+    /// Drain ids of sessions the engine closed on its own (the TTL/cap
+    /// sweep). The daemon prunes its pending-tool broker from this list; the
+    /// idle paged reclaim parks sessions `Cold` instead of closing them, so
+    /// it does not appear here. Engines without an internal sweep return an
+    /// empty vec.
     fn take_closed_sessions(&self) -> Vec<u64> {
         Vec::new()
     }

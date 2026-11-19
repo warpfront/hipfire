@@ -370,6 +370,17 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    A container recipe for this exact stack (4 slots, VMM, MTP + vision on a
    qwen3.5-4b fixture, port 9001) is `docker/compose.vmm-9001.yaml`.
 
+When the paged engine is idle (nothing in flight, nothing queued) it parks
+every resident session `Cold`: the slot, admission grant and KV pages go back
+to the pool, while the session id, tokens and conversation identity stay
+addressable. It does **not** close those sessions. A tool-result turn names
+the session that returned the tool calls one turn earlier; closing that entry
+would make the daemon's pending-tool record stale and fail the turn with
+`HTTP 400 unknown or stale tool_call_id`. A tool-result turn on a parked
+session re-enters the same id and re-prefills it cold. Only the TTL/cap sweep
+below closes parked entries, so an abandoned tool turn becomes stale after
+`serve.multi_slot_session_ttl_secs`, never between consecutive turns.
+
 Parked (swapped or cold) sessions are bounded even when clients abandon them:
 a session idle for `serve.multi_slot_session_ttl_secs` (default one hour; `0`
 disables the idle sweep) is closed by the next request or by the engine's idle
