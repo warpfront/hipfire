@@ -8283,6 +8283,11 @@ mod tests {
             pending_stage_mirror_bytes(&[layer; 2], 0).unwrap(),
             2 * mirror
         );
+        // An uneven seal: each pending rank at its own share, not this rank's or rank 0's.
+        assert_eq!(
+            pending_stage_mirror_bytes(&[300, 212, 100], 1).unwrap(),
+            expert_stage_mirror_bytes(&[212, 100]).unwrap()
+        );
     }
 
     #[test]
