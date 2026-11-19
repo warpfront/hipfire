@@ -1342,15 +1342,17 @@ mod tests {
                 );
             }
         }
+        let ep2 = crate::expert_residency::EpExpertSpans::new(512, vec![256, 256]).unwrap();
         assert_eq!(
-            resident_split_ranks_trunk(&head, bytes, 2, Some((&dims, mode))),
-            resident_split_ranks(&head, bytes, 2)
+            resident_split_ranks_trunk(&head, bytes, &ep2, Some((&dims, mode))),
+            resident_split_ranks(&head, bytes, &ep2)
         );
         // the trunk part of the same manifest IS cut: strictly fewer resident bytes per rank
-        let (plain, _) = resident_split_ranks(&manifest.weights, bytes, 2).unwrap();
+        let (plain, _) = resident_split_ranks(&manifest.weights, bytes, &ep2).unwrap();
         let (sharded, _) =
-            resident_split_ranks_trunk(&manifest.weights, bytes, 2, Some((&dims, mode))).unwrap();
-        let (head_plain, _) = resident_split_ranks(&head, bytes, 2).unwrap();
+            resident_split_ranks_trunk(&manifest.weights, bytes, &ep2, Some((&dims, mode)))
+                .unwrap();
+        let (head_plain, _) = resident_split_ranks(&head, bytes, &ep2).unwrap();
         assert!(head_plain > 0 && sharded < plain);
         // ... and by exactly the trunk's cut: dropping the head from both leaves the same delta
         let trunk_only: Vec<WeightEntry> = manifest
@@ -1359,9 +1361,9 @@ mod tests {
             .filter(|entry| !entry.name.starts_with("mtp."))
             .cloned()
             .collect();
-        let (trunk_plain, _) = resident_split_ranks(&trunk_only, bytes, 2).unwrap();
+        let (trunk_plain, _) = resident_split_ranks(&trunk_only, bytes, &ep2).unwrap();
         let (trunk_sharded, _) =
-            resident_split_ranks_trunk(&trunk_only, bytes, 2, Some((&dims, mode))).unwrap();
+            resident_split_ranks_trunk(&trunk_only, bytes, &ep2, Some((&dims, mode))).unwrap();
         assert_eq!(plain - sharded, trunk_plain - trunk_sharded);
         assert_eq!(sharded - trunk_sharded, head_plain);
     }
