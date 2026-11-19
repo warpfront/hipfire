@@ -133,6 +133,9 @@ impl MoeBiasAwareMq2Backend for Gfx1201Backend {
         }
     }
 
+    /// Rank-ordered: the k_top products land in `residual` rank 0 first, as the atomic GEMV's
+    /// adds do when they complete in rank order, so a pinned host-mapped owner (whose PCIe
+    /// reads reorder the workgroups) decodes bit-identically run to run.
     fn down_residual_scaled(
         &self,
         gpu: &mut Gpu,
@@ -140,22 +143,23 @@ impl MoeBiasAwareMq2Backend for Gfx1201Backend {
         topk_indices: &GpuTensor,
         topk_weights: &GpuTensor,
         rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
         residual: &GpuTensor,
         m: usize,
         k: usize,
         k_top: usize,
     ) -> Result<(), String> {
         Self::verify(gpu, "MQ2 hash down")?;
-        gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+        gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_rank_ordered(
             expert_ptrs,
             topk_indices,
             topk_weights,
             rot_batch,
+            expert_outputs,
             residual,
             m,
             k,
             k_top,
-            false,
         )
         .map_err(|e| format!("gfx1201 MQ2 hash down: {e:?}"))
     }

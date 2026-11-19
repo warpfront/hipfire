@@ -275,6 +275,12 @@ pub struct HashRoutedExpertsOp<'a> {
     pub native: Option<&'a dyn MoeBiasAwareMq2Backend>,
     /// Accumulation target (`out += route_scale · Σ w_k · down_k`).
     pub out: &'a GpuTensor,
+    /// `[k × hidden]` staging of the rank-ordered down, which adds the k products into `out`
+    /// rank 0 first whatever order its workgroups complete in.
+    pub expert_outputs: &'a GpuTensor,
+    /// Without a native backend: add the k products atomically, in workgroup completion order
+    /// (gfx1151's certified route), instead of in rank order. A native backend owns this choice.
+    pub uses_atomic_down: bool,
     pub hidden: usize,
     pub im: usize,
     pub k: usize,
@@ -448,13 +454,14 @@ pub fn execute_hash_routed_experts(
                 op.topk_indices,
                 op.topk_weights,
                 op.rot_batch,
+                op.expert_outputs,
                 op.out,
                 hidden,
                 im,
                 k,
             )
             .map_err(|e| DispatchError::Hip(format!("native down hash l{layer}: {e}")))
-    } else {
+    } else if op.uses_atomic_down {
         gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
             op.down_ptrs,
             op.topk_indices,
@@ -467,6 +474,19 @@ pub fn execute_hash_routed_experts(
             op.down_nox,
         )
         .map_err(|e| hip_err(format!("fused down hash l{layer}"), e))
+    } else {
+        gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_rank_ordered(
+            op.down_ptrs,
+            op.topk_indices,
+            op.topk_weights,
+            op.rot_batch,
+            op.expert_outputs,
+            op.out,
+            hidden,
+            im,
+            k,
+        )
+        .map_err(|e| hip_err(format!("rank-ordered down hash l{layer}"), e))
     }
 }
 

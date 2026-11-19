@@ -1931,6 +1931,12 @@ pub trait MoeBiasAwareMq2Backend {
         batch_size: usize,
     ) -> Result<(), String>;
 
+    /// The hash-routed decode down: `residual += Σ_k topk_weights[k] · (W_k · rot_batch[k])`.
+    ///
+    /// `expert_outputs` (`[k_top × m]` f32) is staging for a backend that adds the k_top
+    /// products in rank order, so `residual` does not depend on the order its workgroups
+    /// complete in (expert weights read over PCIe from a pinned host-mapped owner make that
+    /// order vary run to run). A backend that accumulates atomically leaves it untouched.
     #[allow(clippy::too_many_arguments)]
     fn down_residual_scaled(
         &self,
@@ -1939,6 +1945,7 @@ pub trait MoeBiasAwareMq2Backend {
         topk_indices: &GpuTensor,
         topk_weights: &GpuTensor,
         rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
         residual: &GpuTensor,
         m: usize,
         k: usize,

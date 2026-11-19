@@ -3579,8 +3579,8 @@ fn ensure_routed_experts(
         state.moe_rot_batch = Some(alloc(gpu, &[k_top, im], "moe_rot_batch")?);
     }
     // [k_top × hidden] per-expert down outputs for the deterministic
-    // (atomic-free) bias-aware combine.
-    if !hash && state.moe_down_expert_outputs.is_none() {
+    // (atomic-free) bias-aware combine and the hash route's rank-ordered down.
+    if state.moe_down_expert_outputs.is_none() {
         state.moe_down_expert_outputs = Some(alloc(
             gpu,
             &[k_top, cfg.hidden_size],
@@ -3774,6 +3774,8 @@ fn routed_experts_op<'a>(
         gate_up_dummy: layer.expert_gate_up_dummy.as_ref(),
         native: weights.mq2r_backend.bias_aware_native_backend(),
         out,
+        expert_outputs: state.moe_down_expert_outputs.as_ref().unwrap(),
+        uses_atomic_down: weights.mq2r_backend.uses_atomic_moe_down(),
         hidden: cfg.hidden_size,
         im: cfg.moe_intermediate_size,
         k,

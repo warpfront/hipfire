@@ -166,6 +166,64 @@ impl Gpu {
         result
     }
 
+    /// Rank-ordered fold of one token's atomic-free MoE down outputs into its residual:
+    /// `x_residual[c] = ((x_residual[c] + w[0]·e[0][c]) + w[1]·e[1][c]) + …`, each product
+    /// rounded before its add. This is the arithmetic of the atomic residual GEMVs when their
+    /// `k_top` adds land in rank order, fixed regardless of workgroup completion order;
+    /// [`Self::moe_down_combine_k8_batched`] sums the products first and rounds differently.
+    pub fn moe_down_add_scaled_rank_ordered(
+        &mut self,
+        expert_outputs: &GpuTensor, // [k_top × m] f32
+        topk_weights: &GpuTensor,   // [k_top] f32
+        x_residual: &GpuTensor,     // [m] f32 in-place +=
+        m: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FUNC: &str = "moe_down_add_scaled_rank_ordered";
+        self.ensure_kernel(
+            "moe_down_add_rank_ordered",
+            kernels::MOE_DOWN_ADD_RANK_ORDERED_SRC,
+            FUNC,
+        )?;
+        let eop = expert_outputs.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &eop as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        // BW: expert_outputs read K_TOP*M, topk_weights K_TOP, x_residual r+w 2*M.
+        let bytes = (k_top * m + k_top + 2 * m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", FUNC, bytes);
+        let block_m: u32 = 256;
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [(m as u32).div_ceil(block_m), 1, 1],
+            [block_m, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(eop);
+                b.push_ptr(wp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// gfx1100 decode experiment: finish one atomic-free routed-MoE row and
     /// immediately produce the following layer's RMS-normalized MQ rotation.
     /// This replaces `moe_down_combine_k8_batched` plus

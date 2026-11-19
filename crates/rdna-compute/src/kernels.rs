@@ -3906,6 +3906,12 @@ pub const GEMV_HFQ5G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 pub const MOE_DOWN_COMBINE_K8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/moe_down_combine_k8_batched.hip");
 
+/// Rank-ordered fold of the atomic-free MoE down's per-rank outputs into the residual: the
+/// residual first, then rank 0, 1, … each separately rounded product added in turn (the value
+/// the atomic residual GEMV leaves when its adds land in rank order). One token.
+pub const MOE_DOWN_ADD_RANK_ORDERED_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_add_rank_ordered.hip");
+
 /// Cross-layer gfx1100 experiment: combine one K=8 routed output row and
 /// consume it immediately for the following K=2048 RMSNorm + MQ rotation.
 pub const MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC: &str =

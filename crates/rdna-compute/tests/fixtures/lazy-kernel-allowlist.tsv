@@ -1006,6 +1006,7 @@ module	layernorm_modulate	non-core-family	Non-core family route: Flux/VAE; hipfi
 module	logit_softcap_f32	non-core-family	Non-core family route: Muse Glimmer, Gemma, LFM2; forward.rs:507-3897
 module	max_prob	developer-opt-in	Only forward_early_exit (llama.rs) calls max_prob, and its only callers are the bench_early_exit/sweep_exit examples; hipfire-runtime/src/llama.rs:4914
 module	modulate_f32	non-core-family	Non-core family route: Flux/VAE; hipfire-arch-diffusion/src/flux_gpu.rs:3114
+module	moe_down_add_rank_ordered	non-core-family	Non-core family route: DeepSeek4 hash-layer decode (rank-ordered down); rdna-compute/src/moe.rs:184-188
 module	moe_down_combine_k8_batched_vec4	developer-opt-in	Non-default developer override: HIPFIRE_MOE_DOWN_COMBINE_VEC4; rdna-compute/src/moe.rs:76-80
 module	moe_down_unscatter_k8	config-opt-in	Requires tp>1 / --tp; default single-device load uses tp=1; hipfire-dispatch/src/pipeline/mod.rs:5961-5969
 module	moe_gate_up_unscatter_top10	no-caller	No production caller; only definitions, tests/examples or an unreachable launcher branch remain; rdna-compute/src/moe.rs:2382-2404

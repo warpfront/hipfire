@@ -1597,9 +1597,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
-        "moe_down_combine_k8_batched" | "moe_down_combine_k8_batched_vec4" => {
-            Some(vec![read(0), read(8), write(16)])
-        }
+        "moe_down_combine_k8_batched"
+        | "moe_down_combine_k8_batched_vec4"
+        | "moe_down_add_scaled_rank_ordered" => Some(vec![read(0), read(8), write(16)]),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(vec![
             read(0),
@@ -2065,6 +2065,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_q8_0"
         | "moe_down_combine_k8_batched"
         | "moe_down_combine_k8_batched_vec4"
+        | "moe_down_add_scaled_rank_ordered"
         | "moe_topk_renorm_k8"
         | "rmsnorm_f32"
         | "rmsnorm_f32_rowsplit"

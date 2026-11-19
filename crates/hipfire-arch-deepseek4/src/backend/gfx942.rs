@@ -142,6 +142,9 @@ impl MoeBiasAwareMq2Backend for Gfx942Backend {
             .map_err(|e| format!("gfx942 MQ2 deterministic down: {e:?}"))
     }
 
+    /// Atomic, in workgroup completion order: the wave64 residual has no rank-ordered twin yet,
+    /// so `expert_outputs` stays unused and a pinned host-mapped owner on gfx942 is not
+    /// bit-reproducible run to run in its hash layers.
     fn down_residual_scaled(
         &self,
         gpu: &mut Gpu,
@@ -149,6 +152,7 @@ impl MoeBiasAwareMq2Backend for Gfx942Backend {
         topk_indices: &GpuTensor,
         topk_weights: &GpuTensor,
         rot_batch: &GpuTensor,
+        _expert_outputs: &GpuTensor,
         residual: &GpuTensor,
         m: usize,
         k: usize,

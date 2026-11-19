@@ -23167,6 +23167,40 @@ impl Gpu {
         }
         result
     }
+    /// Rank-ordered twin of [`Self::deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed`]
+    /// (its default one-row tile, one token): `x_residual += Σ_k topk_weights[k] · (W_k · rot_k)`
+    /// with the k_top products added rank 0 first. The atomic GEMV adds them in workgroup
+    /// completion order, which expert weights read over PCIe (a pinned host-mapped owner) make
+    /// vary from run to run. Here the per-rank GEMV
+    /// ([`Self::deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4`], the same per-row dot
+    /// product) writes `expert_outputs` (`[k_top × m]`) and
+    /// [`Self::moe_down_add_scaled_rank_ordered`] adds the scaled outputs in rank order: the
+    /// value the atomic GEMV leaves when its adds happen to land in rank order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_rank_ordered(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,      // [k_top × K]
+        expert_outputs: &GpuTensor, // [k_top × M] staging
+        x_residual: &GpuTensor,     // [M]
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+            expert_ptrs,
+            topk_indices,
+            rot_batch,
+            expert_outputs,
+            m,
+            k,
+            k_top,
+            1,
+        )?;
+        self.moe_down_add_scaled_rank_ordered(expert_outputs, topk_weights, x_residual, m, k_top)
+    }
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
         &mut self,
         expert_ptrs: &GpuTensor,
