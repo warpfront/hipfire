@@ -286,6 +286,19 @@ impl<B: CheckpointBlob> CheckpointPool<B> {
             .map(|(k, _)| k.clone())
     }
 
+    /// Find the oldest unpinned entry whose checkpoint id is not in
+    /// `excluded` (live-session protection).
+    fn find_oldest_unpinned_key_excluding(
+        &self,
+        excluded: &HashSet<CheckpointId>,
+    ) -> Option<CheckpointKey> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.pins == 0 && !excluded.contains(&e.id))
+            .min_by_key(|(_, e)| e.lru_stamp)
+            .map(|(k, _)| k.clone())
+    }
+
     /// Remove an entry by key, accounting bytes and recording eviction.
     /// Returns the removed blob for the caller to free on the GPU — never
     /// dropped here (see [`Self::insert`] for the no-`Drop` rationale).
@@ -301,6 +314,18 @@ impl<B: CheckpointBlob> CheckpointPool<B> {
     /// caller to free. `None` when the pool is empty or every entry is pinned.
     pub fn pop_lru(&mut self) -> Option<(CheckpointKey, B)> {
         let key = self.find_oldest_unpinned_key()?;
+        let blob = self.evict_internal(key.clone())?;
+        Some((key, blob))
+    }
+
+    /// Evict the oldest unpinned entry whose checkpoint id is not protected
+    /// by a live session, returning its key and blob for the caller to free.
+    /// The idle reclaim uses this before it considers any protected blob.
+    pub fn pop_lru_excluding(
+        &mut self,
+        excluded: &HashSet<CheckpointId>,
+    ) -> Option<(CheckpointKey, B)> {
+        let key = self.find_oldest_unpinned_key_excluding(excluded)?;
         let blob = self.evict_internal(key.clone())?;
         Some((key, blob))
     }
@@ -1421,5 +1446,33 @@ mod tests {
         assert!(pool.contains(&d, 128, 128));
         assert!(pool.pop_lru().is_none(), "only a pinned entry remains");
         assert_eq!(pool.total_bytes(), 100);
+    }
+
+    #[test]
+    fn pop_lru_excluding_skips_live_session_checkpoints() {
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
+        let d = test_domain("pop-exclude");
+        let (id128, _) = pool.insert(d.clone(), 128, fp(128), HostBlob { bytes: 1 });
+        let (id256, _) = pool.insert(d.clone(), 256, fp(256), HostBlob { bytes: 1 });
+
+        let mut excluded = HashSet::new();
+        excluded.insert(id128);
+        let (key, blob) = pool
+            .pop_lru_excluding(&excluded)
+            .expect("the unprotected entry is reclaimable");
+        assert_eq!(key.1, 256);
+        assert_eq!(blob.bytes, 1);
+        assert!(
+            pool.peek(&d, 128, fp(128)).is_some(),
+            "live checkpoint kept"
+        );
+
+        // With every remaining id protected the idle pass refuses; real
+        // pressure still has `pop_lru`.
+        let mut all = HashSet::new();
+        all.insert(id128);
+        all.insert(id256);
+        assert!(pool.pop_lru_excluding(&all).is_none());
+        assert!(pool.pop_lru().is_some());
     }
 }

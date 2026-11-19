@@ -1213,8 +1213,8 @@ Collapse `\n{3,}` → `\n\n` at engine entry. Legacy alias:
 | `serve.max_queue_bytes` | `268435456` | int 1–1TiB. Multi-slot route: total request bytes allowed to wait in the admission queue |
 | `serve.max_batch_tokens` | `4096` | int 1–1048576 (global trunk-row budget) |
 | `serve.prefill_min_tokens` | `1` | int 1–1048576 (prefill quantum) |
-| `serve.prefix_cache` | `false` | bool — experimental; off until route admission |
-| `serve.prefix_cache_max_bytes` | `0` | int 0–1TiB (0 = no retained cache) |
+| `serve.prefix_cache` | `false` | bool — experimental; off by default. When on, live sessions' published prefixes are soft-protected across the paged idle reclaim (unreferenced cache is evicted first; close/TTL releases). |
+| `serve.prefix_cache_max_bytes` | `0` | int 0–1TiB (0 = no retained cache). Bounds retained page bytes and the checkpoint pool. |
 | `serve.structured_jump_forward` | `false` | bool — experimental |
 | `serve.stream_stall_timeout_ms` | `30000` | int 0–3600000. Multi-slot route: a streaming client that leaves its response channel full (or a final frame unflushed) this long is aborted and its queue permit released |
 | `experimental_budget_alert` | `false` | bool |
