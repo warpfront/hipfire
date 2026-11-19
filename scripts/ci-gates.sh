@@ -39,6 +39,9 @@ run python3 scripts/flags-golden-extract.py
 # compiles: `cargo xwin check` never links, so they break only at an MSVC link.
 run python3 scripts/check-unix-externs.py --self-test
 run python3 scripts/check-unix-externs.py
+# Qwen4 QSA pooled mRoPE position rule (host C++ build of the kernel header,
+# two planted mutants must be rejected).
+run python3 scripts/test_qsa_mrope_position.py
 # Fixture and quality pins (fixtures/pins.toml): schema, provenance, prompt
 # md5s, mirrored digests, and every `pin:<kind>/<id>` citation resolves.
 run python3 scripts/check-pins.py --self-test
