@@ -1798,6 +1798,7 @@ dependencies = [
  "clap",
  "faer",
  "half",
+ "hip-bridge",
  "hipfire-arch-qwen4",
  "hipfire-config",
  "hipfire-reap",

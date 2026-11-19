@@ -25,6 +25,7 @@ serde_json.workspace = true
 byteorder = "1"
 rayon = "1"
 parking_lot = "0.12"
+hip-bridge = { path = "../hip-bridge" }
 libc = "0.2"
 hipfire-reap = { path = "../hipfire-reap" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false }

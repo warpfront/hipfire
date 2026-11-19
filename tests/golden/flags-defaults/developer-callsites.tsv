@@ -465,6 +465,7 @@ developer_callsite	*	HIPFIRE_Q8_FLASH_TILE#developer_var=ok.and_then.filter.unwr
 developer_callsite	*	HIPFIRE_QKVZA_CPOL#developer_var=as_deref.==Ok("slc")
 developer_callsite	*	HIPFIRE_QKVZA_SCALAR_PREP#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_QKVZA_SCALAR_PREP#developer_var=as_deref.==Some("1")
+developer_callsite	*	HIPFIRE_QUANT_GPU#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_QWEN2_VERIFY_SEQ#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD#developer_var=ok.and_then.or.unwrap_or(0.1f32)
 developer_callsite	*	HIPFIRE_QWEN35_FINITE_TRACE#developer_var_os=is_none
