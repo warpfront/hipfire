@@ -1614,6 +1614,37 @@
       "min_vram_gb": 16,
       "desc": "Qwopus3.5 v3, 27B MQ4"
     },
+    "daisyrose:27b": {
+      "repo": "hipfire-models/daisyrose-27b",
+      "file": "daisyrose-27b.mq4",
+      "size_gb": 15.66,
+      "min_vram_gb": 17,
+      "default_kv_mode": "q8",
+      "desc": "RadixArk DaisyRose 27B (Qwen3.8-27B RL post-train for long-horizon agent tasks), MQ4V2 base tier, not AWQ-calibrated. Native 262K context, xhigh default thinking effort. MTP sidecar: ~60 vs 34 tok/s on R9700.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "mtp": {
+        "file": "daisyrose-27b.mtp"
+      }
+    },
     "qwopus:9b-mq6": {
       "repo": "hipfire-models/qwopus-9b",
       "file": "qwopus-9b.mq6",
@@ -2124,6 +2155,8 @@
     "qwopus:9b-mq4": "qwopus:9b",
     "qwopus:4b-mq4": "qwopus:4b",
     "qwopus:27b-mq4": "qwopus:27b",
+    "daisyrose": "daisyrose:27b",
+    "daisyrose:27b-mq4": "daisyrose:27b",
     "qwen3.5-9b:draft": "qwen3.5:9b-draft",
     "qwen3.5-27b:draft": "qwen3.5:27b-draft",
     "qwen3.5:9b:draft": "qwen3.5:9b-draft",
