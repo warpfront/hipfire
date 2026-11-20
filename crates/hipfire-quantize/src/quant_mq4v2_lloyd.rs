@@ -11,7 +11,9 @@
 //! `w = sc · L[q] + zp`. The codebook itself is NOT in the weight blob — the
 //! pipeline emits it as an F32 sidecar `<stem>.lloyd_levels.weight` shape `[16]`.
 
-use crate::lloyd_gpu::{gpu_lloyd_enabled, gpu_lloyd_free_fit};
+use crate::lloyd_gpu::{
+    gpu_lloyd_enabled, gpu_lloyd_free_fit, gpu_lloyd_polish_init, gpu_lloyd_polish_scores,
+};
 use crate::quant_fwht::{cpu_fwht_256, MQ4V2_GROUP_BYTES};
 use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 use parking_lot::Mutex;
@@ -247,6 +249,28 @@ pub(crate) fn weighted_mse(vals: &[f64], w: &[f64], levels: &[f64; 16]) -> f64 {
     }
 }
 
+/// Score four candidate codebooks in one element pass. Each accumulator is
+/// updated in the same element order as `weighted_mse`.
+fn weighted_mse_4(vals: &[f64], w: &[f64], levels: &[[f64; 16]; 4]) -> [f64; 4] {
+    debug_assert_eq!(vals.len(), w.len());
+    let mut sse = [0.0f64; 4];
+    let mut wsum = [0.0f64; 4];
+    for (&v, &wt) in vals.iter().zip(w.iter()) {
+        for c in 0..4 {
+            let lvl = &levels[c];
+            let idx = assign_level_midpoints(v, lvl);
+            let e = v - lvl[idx];
+            sse[c] += wt * e * e;
+            wsum[c] += wt;
+        }
+    }
+    let mut out = [0.0f64; 4];
+    for c in 0..4 {
+        out[c] = if wsum[c] > 0.0 { sse[c] / wsum[c] } else { 0.0 };
+    }
+    out
+}
+
 /// Finite E4M3 (bias=7) values with -8 ≤ e < 8, sorted unique.
 /// Includes ±0 once. Domain S = { 7.5 + e }.
 /// E4M3: normals sign·2^(exp−7)·(1+m/8) exp=1..14 m=0..7;
@@ -455,6 +479,12 @@ fn coordinate_descent_polish(vals: &[f64], w: &[f64], levels: &mut [f64; 16], r:
         (pv, pw)
     };
 
+    if gpu_lloyd_enabled() {
+        gpu_lloyd_polish_init(&pvals, &pwts).unwrap_or_else(|e| {
+            eprintln!("error: HIPFIRE_QUANT_GPU=1 polish init failed: {e}");
+            std::process::exit(2);
+        });
+    }
     let mut mse = weighted_mse(&pvals, &pwts, levels);
     for _pass in 0..16 {
         let mut improved = false;
@@ -462,16 +492,17 @@ fn coordinate_descent_polish(vals: &[f64], w: &[f64], levels: &mut [f64; 16], r:
             let Some(idx0) = r_index_of(levels[i], r) else {
                 continue;
             };
-            for d in [-2i32, -1, 1, 2] {
+            // Build all four candidates first; this is pure level math and
+            // cannot change which one wins.
+            let mut cands = [None, None, None, None];
+            for (ci, &d) in [-2i32, -1, 1, 2].iter().enumerate() {
                 let j = idx0 as i32 + d;
                 if j < 0 || j as usize >= r.len() {
                     continue;
                 }
-                let cand_val = r[j as usize];
                 let mut cand = *levels;
-                cand[i] = cand_val;
+                cand[i] = r[j as usize];
                 cand.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                // de-collide walk-right
                 let mut ok = true;
                 for k in 1..16 {
                     if cand[k] <= cand[k - 1] + 1e-15 {
@@ -501,12 +532,32 @@ fn coordinate_descent_polish(vals: &[f64], w: &[f64], levels: &mut [f64; 16], r:
                         break;
                     }
                 }
-                if !ok {
+                if ok {
+                    cands[ci] = Some(cand);
+                }
+            }
+            let mut set = [*levels, *levels, *levels, *levels];
+            for (ci, c) in cands.iter().enumerate() {
+                if let Some(cand) = c {
+                    set[ci] = *cand;
+                }
+            }
+            let scores = if gpu_lloyd_enabled() {
+                // Four distinct candidates in one launch.
+                gpu_lloyd_polish_scores(&set).unwrap_or_else(|e| {
+                    eprintln!("error: HIPFIRE_QUANT_GPU=1 polish scoring failed: {e}");
+                    std::process::exit(2);
+                })
+            } else {
+                weighted_mse_4(&pvals, &pwts, &set)
+            };
+            for ci in 0..4 {
+                if cands[ci].is_none() {
                     continue;
                 }
-                let m = weighted_mse(&pvals, &pwts, &cand);
+                let m = scores[ci];
                 if m + 1e-15 < mse {
-                    *levels = cand;
+                    *levels = set[ci];
                     mse = m;
                     improved = true;
                     break; // next level
