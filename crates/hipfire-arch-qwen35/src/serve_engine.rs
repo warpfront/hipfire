@@ -9175,7 +9175,7 @@ fn session_policy_from_config() -> (Option<std::time::Duration>, usize, std::tim
     };
     let ttl = value("serve.multi_slot_session_ttl_secs").unwrap_or(3600);
     let max = value("serve.multi_slot_max_sessions").unwrap_or(0);
-    let reclaim_ms = value("serve.paged_idle_reclaim_ms").unwrap_or(30_000);
+    let reclaim_ms = value("serve.paged_idle_reclaim_ms").unwrap_or(0);
     (
         if ttl == 0 {
             None

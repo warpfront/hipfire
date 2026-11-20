@@ -371,7 +371,9 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    qwen3.5-4b fixture, port 9001) is `docker/compose.vmm-9001.yaml`.
 
 When the paged engine is idle (nothing in flight, nothing queued) it waits
-`serve.paged_idle_reclaim_ms` (default 30 s; `0` keeps the immediate reclaim)
+`serve.paged_idle_reclaim_ms` (default `0`, the immediate reclaim; opt-in
+because an in-place turn is session-exact, not cold-exact; see
+[`CONFIG.md`](CONFIG.md) `serve.paged_idle_reclaim_ms`)
 before parking every resident session `Cold`: the slot, admission grant and
 KV pages go back to the pool, while the session id, tokens and conversation
 identity stay addressable. It does **not** close those sessions. A
