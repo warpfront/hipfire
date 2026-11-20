@@ -29,8 +29,8 @@
 // launcher, NOT #included here: the runtime compile has no -I to
 // kernels/src (same pattern as the FA2 combo modules).
 
-#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__)
-#error "attention_flash_fwht4_tile_gqa_gfx1100 requires --offload-arch=gfx1100"
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__) && !defined(__gfx1151__)
+#error "attention_flash_fwht4_tile_gqa_gfx11 requires --offload-arch=gfx1100 or gfx1151"
 #endif
 
 #define FGQA_TILE 128

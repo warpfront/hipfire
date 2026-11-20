@@ -15186,7 +15186,7 @@ impl Gpu {
         Ok(())
     }
 
-    /// GQA-shared fwht4-K decode (gfx1100, H24/KV4/D256, GQA group 6).
+    /// GQA-shared fwht4-K decode (gfx1100/gfx1151, H24/KV4/D256, GQA group 6).
     /// One 256-thread workgroup per (kv head, tile) serves all six query
     /// heads: each K/V tile is read once instead of once per head. Same
     /// partials ABI and reduce as [`Self::attention_flash_fwht4`]; the
@@ -15211,10 +15211,10 @@ impl Gpu {
         v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch.as_str() != "gfx1100" {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
             return Err(hip_bridge::HipError::new(
                 0,
-                "attention_flash_fwht4_tile_gqa_gfx11 requires gfx1100",
+                "attention_flash_fwht4_tile_gqa_gfx11 requires gfx1100/gfx1151",
             ));
         }
         if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {

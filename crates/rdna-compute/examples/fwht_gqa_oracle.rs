@@ -8,7 +8,7 @@
 //! the oracle panics naming the first differing (head, tile, dim) and the
 //! max abs diff. Inputs are randomized from a fixed-seed LCG: per-record K
 //! `cnorm` in [0.5, 4), Q8_0 f16 scales in [2^-3, 2) and +-1 sign tables.
-//! Needs a gfx1100 device. Run with `--features lab`.
+//! Needs a gfx1100 or gfx1151 device. Run with `--features lab`.
 //!
 //! Run: `cargo run -p rdna-compute --features lab --example fwht_gqa_oracle`
 
@@ -23,7 +23,7 @@ fn main() {
     for ordinal in 0..8 {
         match Gpu::init_with_device(ordinal) {
             Ok(g) => {
-                if g.arch == "gfx1100" {
+                if matches!(g.arch.as_str(), "gfx1100" | "gfx1151") {
                     found = Some(g);
                     break;
                 }
@@ -31,7 +31,7 @@ fn main() {
             Err(_) => break,
         }
     }
-    let mut gpu = found.expect("no gfx1100 among HIP ordinals");
+    let mut gpu = found.expect("no gfx1100/gfx1151 among HIP ordinals");
     eprintln!("oracle arch: {}", gpu.arch);
 
     for t in [1usize, 2, 16, 17, 32, 128, 256, 66048] {
