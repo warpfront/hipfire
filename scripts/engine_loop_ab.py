@@ -414,6 +414,8 @@ def self_test():
     assert not ok(arm(sweep=("abc",) * 4))  # seed ignored
     assert not ok(arm(sweep=("abc",) * 4), leg=arm(sweep=("abc", "abd", "abe", "abf")))  # seed ignored, tvd 0.25
     assert not ok(arm(tau=0.5), route={"spec_noise": True})
+    assert not ok(arm(tau=0.985), route={"spec_noise": True})  # G-spec bound is 1 %
+    assert ok(arm(tau=0.995), route={"spec_noise": True})
     assert not ok(arm(tau=None), route={"spec_noise": True})
     assert not ok(arm(loop="legacy"), route={"expect_engine": True})  # silent fallback
     assert not ok(arm(loop="bogus"))
@@ -423,6 +425,10 @@ def self_test():
     assert not ok(mixed)
     assert not ok(arm(), perf={"median": {"g_perf": False}})
     assert ok(arm(), perf={"median": {"g_perf": True}})
+    assert perf_ok({"prefill_tok_s_delta_pct": -1.9, "decode_tok_s_delta_pct": 1.9})
+    assert not perf_ok({"prefill_tok_s_delta_pct": -2.1, "decode_tok_s_delta_pct": 0.0})
+    assert not perf_ok({"prefill_tok_s_delta_pct": 0.0, "decode_tok_s_delta_pct": 2.1})
+    assert not perf_ok({"prefill_tok_s_delta_pct": None, "decode_tok_s_delta_pct": 0.0})
     print("self-test ok")
 
 
@@ -439,6 +445,12 @@ def host_state(own_pid=None):
     for f in Path("/sys/class/drm").glob("card*/device/pp_dpm_sclk"):
         sclk += [ln.split(":")[1].strip(" *") for ln in f.read_text().splitlines() if ln.endswith("*")]
     return {"loadavg": os.getloadavg(), "kfd": kfd, "gfxclk": sclk}
+
+
+def perf_ok(m):
+    """G-perf: both median tok/s deltas within +-2 %."""
+    return all(m.get(k) is not None and abs(m[k]) <= 2.0
+               for k in ("prefill_tok_s_delta_pct", "decode_tok_s_delta_pct"))
 
 
 def run_perf(args, route, out):
@@ -472,7 +484,7 @@ def run_perf(args, route, out):
     for k in ("prefill_tok_s", "decode_tok_s"):
         lg, en = summary["legacy"][k], summary["engine"][k]
         summary[f"{k}_delta_pct"] = round(100 * (en - lg) / lg, 2) if lg and en else None
-    summary["g_perf"] = all(v is not None and abs(v) <= 2.0 for k, v in summary.items() if k.endswith("_pct"))
+    summary["g_perf"] = perf_ok(summary)
     return {"reps": rows, "median": summary}
 
 
@@ -522,11 +534,14 @@ def main():
     perf = run_perf(args, route, out) if args.perf else None
     j = judge(res, route, args.tvd_max, perf)
     ok = j["ok"]
+    # a pass with unexercised scenarios must not be citable as covering them
+    unex = [k for k, v in j["scenarios"].items() if v["status"] == UNEXERCISED]
+    verdict = ("pass-partial" if unex else "pass") if ok else "fail"
 
     me = Path(__file__).resolve()
     git = lambda *a: subprocess.run(["git", "-C", str(me.parent), *a], capture_output=True, text=True).stdout.strip()
     receipt = {
-        "route": route, "verdict": "pass" if ok else "fail", **{k: v for k, v in j.items() if k != "ok"},
+        "route": route, "verdict": verdict, "unexercised": unex, **{k: v for k, v in j.items() if k != "ok"},
         "daemon": {"path": os.path.realpath(args.daemon),
                    "md5": hashlib.md5(Path(args.daemon).read_bytes()).hexdigest()},
         "fixture_sha256": sha256_cached(model, out),
@@ -557,7 +572,7 @@ def main():
     with ev.open("a") as f:
         f.write(f"| {route['name']} | {receipt['harness']['sha256'][:12]} | {receipt['daemon']['md5'][:8]} | "
                 f"{receipt['fixture_sha256'][:16]} | `{' '.join(sys.argv)}` | {rpath} | {summary} | "
-                f"{'current' if ok else 'failed'} |\n")
+                f"{('current' + (' (unexercised: ' + ', '.join(unex) + ')' if unex else '')) if ok else 'failed'} |\n")
     print(json.dumps({"route": route["name"], "verdict": receipt["verdict"], "summary": summary}))
     sys.exit(0 if ok else 1)
 
