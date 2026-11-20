@@ -659,8 +659,8 @@ fn ordinary_prefill_static_ceiling(
     }
     let native_mq4 = native_mq4_widened_route(gpu, weights);
     let mq3 = mq3_wide_route(gpu, weights);
-    // Lloyd staged-i8 twin route (opt-in HIPFIRE_LLOYD_MMQ_A4=1, exact
-    // gfx1100): the twin SET consumes any N natively (descriptor bounds +
+    // Lloyd staged-i8 twin route (opt-in HIPFIRE_LLOYD_MMQ_A4=1,
+    // gfx1100/gfx1151): the twin SET consumes any N natively (descriptor bounds +
     // tok<N masking, no padding) and the X128/BT arms cover every fallback
     // shape, so the ceiling needs no N/K shape beyond the dense-27B gate
     // above (all 27B K are K%256==0; per-launch gates fail closed). Shares
