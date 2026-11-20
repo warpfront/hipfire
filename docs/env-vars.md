@@ -1198,7 +1198,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1688
+**Count:** 1689
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1278,7 +1278,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_B_REF` | scripts/ab-dispatch-validation.sh | harness |
 | `HIPFIRE_C2M_DUMP_PROMPT` | crates/hipfire-generate/src/dense.rs | developer |
 | `HIPFIRE_C2M_NORMDUMP` | crates/hipfire-arch-cohere2moe/src/forward.rs | developer |
-| `HIPFIRE_CACHE_CKPT_INTERVAL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/tests/mtp_cache_byte_identity.rs | developer |
+| `HIPFIRE_CACHE_CKPT_INTERVAL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/tests/mtp_auto_generic_hw.rs | developer |
 | `HIPFIRE_CACHE_CKPT_MAX` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-arch-qwen35/src/footprint.rs | developer |
 | `HIPFIRE_CALIB_BF16` | crates/hipfire-arch-lfm2moe/src/lfm2moe.rs, crates/hipfire-arch-muse-glimmer/src/glimmer.rs | experimental |
 | `HIPFIRE_CALIB_F64_AUDIT` | crates/hipfire-runtime/src/calibration.rs | developer |
@@ -1591,6 +1591,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FA2_GFX1100` | crates/rdna-compute/src/attention.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
 | `HIPFIRE_FA2_KMODE` | crates/hipfire-runtime/examples/tmp_fa2_attrib.rs, crates/rdna-compute/examples/fa_pm_fp8_oracle.rs | developer |
 | `HIPFIRE_FA2_KT` | crates/hipfire-runtime/examples/tmp_fa2_attrib.rs, crates/rdna-compute/src/attention.rs | developer |
+| `HIPFIRE_FA2_LLOYDV_Q16` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_FA2_PACKET` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_FA2_Q0_A3B` | crates/rdna-compute/examples/fa_pm_fp8_oracle.rs | harness |
 | `HIPFIRE_FA2_Q16` | crates/rdna-compute/src/attention.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
@@ -2164,8 +2165,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MQV2_BT_SCREEN_BITS3` | crates/rdna-compute/examples/test_mqv2_bt_gfx11.rs | harness |
 | `HIPFIRE_MQV2_GFX11_SCREEN` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_MTP_AR_FLOOR` | crates/hipfire-arch-qwen4/src/mesh_lane_protocol.rs, crates/hipfire-arch-qwen4/src/mtp_lanes.rs | experimental |
-| `HIPFIRE_MTP_BYTE_IDENTITY_HEAD` | crates/hipfire-arch-qwen35/tests/mtp_cache_byte_identity.rs, crates/hipfire-arch-qwen35/tests/mtp_step_oracle.rs | harness |
-| `HIPFIRE_MTP_BYTE_IDENTITY_MODEL` | crates/hipfire-arch-qwen35/tests/mtp_cache_byte_identity.rs, crates/hipfire-arch-qwen35/tests/mtp_step_oracle.rs | harness |
+| `HIPFIRE_MTP_BYTE_IDENTITY_HEAD` | crates/hipfire-arch-qwen35/tests/mtp_auto_generic_hw.rs, crates/hipfire-arch-qwen35/tests/mtp_cache_byte_identity.rs | harness |
+| `HIPFIRE_MTP_BYTE_IDENTITY_MODEL` | crates/hipfire-arch-qwen35/tests/mtp_auto_generic_hw.rs, crates/hipfire-arch-qwen35/tests/mtp_cache_byte_identity.rs | harness |
 | `HIPFIRE_MTP_CPU_ORACLE_ARM` | crates/hipfire-arch-qwen35/tests/mtp_verify_graph_oracle.rs | harness |
 | `HIPFIRE_MTP_CPU_ORACLE_OUT` | crates/hipfire-arch-qwen35/tests/mtp_verify_graph_oracle.rs | harness |
 | `HIPFIRE_MTP_CPU_ORACLE_REF_TOKS` | crates/hipfire-arch-qwen35/tests/mtp_verify_graph_oracle.rs | harness |
