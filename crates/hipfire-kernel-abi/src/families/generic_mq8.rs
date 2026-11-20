@@ -1278,7 +1278,9 @@ mod tests {
                             }
                         );
                     }
-                    Arch::Gfx1151 => panic!("{}: gfx1151 is not an export", e.symbol),
+                    Arch::Gfx1151 | Arch::Gfx1150 => {
+                        panic!("{}: {} is not an export", e.symbol, e.arch.name())
+                    }
                 }
             }
         }

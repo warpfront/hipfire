@@ -350,7 +350,7 @@ fn hipcc_spellings_match_codec() {
 /// spelling for that arch, so the parser/codec pair must refuse it too.
 type Pinned = (&'static str, &'static [u32], &'static [u32], &'static [u32]);
 
-const GFX11_ARCHES: [Arch; 2] = [Arch::Gfx1100, Arch::Gfx1151];
+const GFX11_ARCHES: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1150];
 
 /// Encode through the architecture's own codec.
 fn encode_for_arch(arch: Arch, inst: &Inst) -> Result<Vec<u32>, String> {
@@ -370,7 +370,7 @@ fn parse_encode(text: &str, arch: Arch) -> Result<Vec<u32>, String> {
 fn pinned_words(case: &Pinned, arch: Arch) -> &'static [u32] {
     match arch {
         Arch::Gfx1100 => case.1,
-        Arch::Gfx1151 => case.2,
+        Arch::Gfx1151 | Arch::Gfx1150 => case.2,
         Arch::Gfx1201 => case.3,
         other => panic!("no pinned words for {other:?}"),
     }

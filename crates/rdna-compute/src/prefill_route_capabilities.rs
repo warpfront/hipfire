@@ -726,7 +726,7 @@ mod tests {
         );
         assert_eq!(
             format!("{:x}", Sha256::digest(source.as_bytes())),
-            "5a845a9eea866a6617ae4d59efe04f992c9685cce12382643e32469f6af332e9",
+            "6ccc5a27a4f2e1917bdfe5f586acc9ce608a4fa4e91d187cd274690bc65a0fb6",
             "V3 module source changed: re-run the owner GPU byte oracle, then update this pin"
         );
     }

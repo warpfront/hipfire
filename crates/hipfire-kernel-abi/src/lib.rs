@@ -51,22 +51,24 @@ pub use validate::{
 
 use serde::Serialize;
 
-/// Exact target architecture. Near neighbours (gfx1200, gfx1150, ...) are
+/// Exact target architecture. Near neighbours (gfx1200, gfx1152, ...) are
 /// never aliases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Arch {
     Gfx1100,
+    Gfx1150,
     Gfx1151,
     Gfx1201,
 }
 
 impl Arch {
-    pub const ALL: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
+    pub const ALL: [Arch; 4] = [Arch::Gfx1100, Arch::Gfx1150, Arch::Gfx1151, Arch::Gfx1201];
 
     pub fn name(self) -> &'static str {
         match self {
             Arch::Gfx1100 => "gfx1100",
+            Arch::Gfx1150 => "gfx1150",
             Arch::Gfx1151 => "gfx1151",
             Arch::Gfx1201 => "gfx1201",
         }

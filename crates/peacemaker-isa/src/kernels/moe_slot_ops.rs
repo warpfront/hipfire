@@ -2,11 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Builder-emitted (PeaceMaker) gfx1201 / gfx1100 / gfx1151 BF16-input top-k combine of the symmetric
+//! Builder-emitted (PeaceMaker) gfx1201 / gfx1100 / gfx1151 / gfx1150 BF16-input top-k combine of the symmetric
 //! IU4 grouped MoE (`HIPFIRE_MOE_SYM_IU4`, prefill Path2): the twin of
 //! `moe_down_combine_grouped_k8` for the BF16 grouped down rows the symmetric
-//! down GEMM writes, `moe_down_combine_grouped_bf16in_pm_gfx1201` in the module
-//! `moe_slot_ops_pm_<arch>`. gfx1201, gfx1100 and gfx1151 (every other arch is refused).
+//! down GEMM writes, `moe_down_combine_grouped_bf16in_pm_<arch>` in the module
+//! `moe_slot_ops_pm_<arch>`. gfx1201, gfx1100, gfx1151 and gfx1150 (every other arch is refused).
 //!
 //! ABI (eight arguments, 48 bytes): `y_grouped_bf16` `*u16` @0 (BF16 bits,
 //! `[grouped_rows, dim]`), `inverse_perm` `*i32` @8 (`[n_tokens * k_top]`, flat
@@ -57,7 +57,7 @@ use crate::{
     reg::{Kind, Live, RegRef},
     Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan,
 };
-use peacemaker_author::{Gfx1100, Gfx1151, Gfx1201, Scc, Target, WgUniform, Workgroup};
+use peacemaker_author::{Gfx1100, Gfx1150, Gfx1151, Gfx1201, Scc, Target, WgUniform, Workgroup};
 
 type R = Result<(), String>;
 
@@ -188,11 +188,14 @@ fn plan(arch: Arch) -> Result<RegPlan, String> {
     Ok(p)
 }
 
-/// The builder-emitted kernel (gfx1100, gfx1151 and gfx1201; every other target is refused before any builder exists).
+/// The builder-emitted kernel (gfx1100, gfx1151, gfx1150 and gfx1201; every other target is refused before any builder exists).
 pub fn emit(arch: Arch) -> Result<Emitted, String> {
-    if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
+    if !matches!(
+        arch,
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1201
+    ) {
         return Err(format!(
-            "{KERNEL_ID}: built for gfx1100, gfx1151 and gfx1201 only, not {}",
+            "{KERNEL_ID}: built for gfx1100, gfx1151, gfx1150 and gfx1201 only, not {}",
             arch.name()
         ));
     }
@@ -214,6 +217,7 @@ pub fn emit(arch: Arch) -> Result<Emitted, String> {
     match arch {
         Arch::Gfx1100 => kernel(&mut Workgroup::<Gfx1100, Builder>::new(&mut b)?, arch)?,
         Arch::Gfx1151 => kernel(&mut Workgroup::<Gfx1151, Builder>::new(&mut b)?, arch)?,
+        Arch::Gfx1150 => kernel(&mut Workgroup::<Gfx1150, Builder>::new(&mut b)?, arch)?,
         _ => kernel(&mut Workgroup::<Gfx1201, Builder>::new(&mut b)?, arch)?,
     }
     b.finish()

@@ -691,7 +691,7 @@ fn walk_block(
         }
         if let Some(mem) = &inst.effects.mem {
             if is_tracked(mem.class)
-                || (matches!(arch, Arch::Gfx1100 | Arch::Gfx1151)
+                || (matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150)
                     && matches!(mem.class, MemClass::DsAtomic { .. }))
             {
                 push_event(arch, &mut state, events, id, inst, mem, recorder.is_some());
@@ -708,7 +708,7 @@ fn walk_block(
 pub fn replay(body: &Body, arch: Arch, wave: Wave) -> Result<WaitReplay, WaitError> {
     if !matches!(
         arch,
-        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1200 | Arch::Gfx1201
     ) {
         return Err(WaitError::UnsupportedArch(arch));
     }
@@ -906,7 +906,7 @@ fn fixpoint(
 pub fn census(body: &Body, arch: Arch) -> Result<WaitCensus, WaitError> {
     if !matches!(
         arch,
-        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1200 | Arch::Gfx1201
     ) {
         return Err(WaitError::UnsupportedArch(arch));
     }

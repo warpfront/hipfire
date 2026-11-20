@@ -428,6 +428,7 @@ pub fn drive<'a>(
         Arch::Gfx1201 => drive_t::<Gfx1201>(bld, body),
         Arch::Gfx1100 => drive_t::<Gfx1100>(bld, body),
         Arch::Gfx1200 => Err("the .rip front end has no gfx1200 builder target (only sealed hip_twin objects target gfx1200)".into()),
+        Arch::Gfx1150 => Err("the .rip front end has no gfx1150 builder target (only sealed hip_twin objects target gfx1150)".into()),
         Arch::Gfx942 => drive_t::<Gfx942>(bld, body),
     }
 }

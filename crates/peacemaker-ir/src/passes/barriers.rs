@@ -225,7 +225,7 @@ fn ds_stores_pending(replay: &WaitReplay, id: InstId, arch: Arch) -> bool {
             event.counters.contains(counter)
                 && !event.satisfied.contains(counter)
                 && match arch {
-                    Arch::Gfx1100 | Arch::Gfx1151 => matches!(
+                    Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 => matches!(
                         event.class,
                         crate::effects::MemClass::DsStore
                             | crate::effects::MemClass::DsAtomic { .. }
@@ -250,7 +250,7 @@ fn drain_obligation(id: InstId, what: &str, arch: Arch) -> Obligation {
 pub fn analyze(body: &Body, arch: Arch) -> Result<BarrierAnalysis, BarrierError> {
     if !matches!(
         arch,
-        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1200 | Arch::Gfx1201
     ) {
         return Err(BarrierError::UnsupportedArch(arch));
     }

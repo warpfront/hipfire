@@ -112,6 +112,7 @@ fn e_flags(arch: Arch) -> u32 {
     match arch {
         Arch::Gfx1100 => 0x41,
         Arch::Gfx1151 => 0x4a,
+        Arch::Gfx1150 => 0x43,
         Arch::Gfx1200 => 0x48,
         Arch::Gfx1201 => 0x4e,
         Arch::Gfx942 => MACH_GFX942 | XNACK_ANY | SRAMECC_ANY,
@@ -753,6 +754,8 @@ mod tests {
         let rdna = link(Arch::Gfx1100, 6, &one_kernel(), &[0x80], false).unwrap();
         assert_eq!(rdna[8], 4);
         assert_eq!(u32::from_le_bytes(rdna[48..52].try_into().unwrap()), 0x41);
+        let strix = link(Arch::Gfx1150, 6, &one_kernel(), &[0x80], false).unwrap();
+        assert_eq!(u32::from_le_bytes(strix[48..52].try_into().unwrap()), 0x43);
         assert!(link(Arch::Gfx1100, 5, &one_kernel(), &[0x80], false).is_err());
         assert!(link(Arch::Gfx942, 4, &one_kernel(), &[0x80], false).is_err());
     }
@@ -827,7 +830,7 @@ mod tests {
     }
     #[test]
     fn code_end_guard_aligns_to_128_then_adds_96_dwords_and_keeps_the_kernel_size() {
-        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1150, Arch::Gfx1201] {
             // One dword of code: the 4 bytes pad to 128 with s_code_end, then 384 more guard bytes.
             let kernel = kernel_of(1);
             let (bare, bare_sizes) =

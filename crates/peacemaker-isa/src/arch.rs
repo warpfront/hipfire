@@ -12,6 +12,8 @@ pub enum Arch {
     Gfx1200,
     Gfx1100,
     Gfx1151,
+    /// RDNA3.5 gfx1150: the gfx1151 instruction family under its own ELF machine / bundle triple.
+    Gfx1150,
     Gfx942,
 }
 
@@ -35,6 +37,7 @@ impl Arch {
             Self::Gfx1200 => "gfx1200",
             Self::Gfx1100 => "gfx1100",
             Self::Gfx1151 => "gfx1151",
+            Self::Gfx1150 => "gfx1150",
             Self::Gfx942 => "gfx942",
         }
     }
@@ -159,6 +162,7 @@ impl Arch {
                     || mnemonic == "s_barrier_signal"
                     || mnemonic == "s_barrier_wait"
                     || (self != Self::Gfx1151
+                        && self != Self::Gfx1150
                         && (mnemonic == "s_add_f32" || mnemonic == "s_mul_f32"))
                     || mnemonic == "v_s_rcp_f32"))
             || (self.gfx12()
@@ -179,6 +183,7 @@ impl std::str::FromStr for Arch {
             "gfx1200" => Ok(Self::Gfx1200),
             "gfx1100" => Ok(Self::Gfx1100),
             "gfx1151" => Ok(Self::Gfx1151),
+            "gfx1150" => Ok(Self::Gfx1150),
             "gfx942" => Ok(Self::Gfx942),
             _ => Err(format!("unsupported architecture {s}")),
         }
@@ -220,7 +225,7 @@ mod arch_tests {
 
     #[test]
     fn rdna_remains_wave32() {
-        for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151] {
+        for arch in [Arch::Gfx1201, Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1150] {
             assert!(!arch.wave64());
             assert!(arch.check_mnemonic("s_nop").is_ok());
         }
@@ -245,9 +250,28 @@ mod arch_tests {
         // RDNA3.5's scalar FP fold/scale instructions are pinned in gfx1151.tbl.
         for mnemonic in ["s_add_f32", "s_mul_f32"] {
             assert!(Arch::Gfx1151.check_mnemonic(mnemonic).is_ok());
+            assert!(Arch::Gfx1150.check_mnemonic(mnemonic).is_ok());
             assert!(Arch::Gfx1201.check_mnemonic(mnemonic).is_ok());
             assert!(Arch::Gfx1100.check_mnemonic(mnemonic).is_err());
             assert!(Arch::Gfx942.check_mnemonic(mnemonic).is_err());
         }
+    }
+
+    #[test]
+    fn gfx1150_is_the_gfx1151_family_under_its_own_name() {
+        let arch: Arch = "gfx1150".parse().unwrap();
+        assert_eq!(arch, Arch::Gfx1150);
+        assert_eq!(arch.name(), "gfx1150");
+        assert!(!arch.gfx12() && !arch.wave64());
+        assert_eq!(serde_json::to_string(&arch).unwrap(), "\"gfx1150\"");
+        assert_eq!(arch.barrier(), Arch::Gfx1151.barrier());
+        assert_eq!(arch.wmma_iu4(), Arch::Gfx1151.wmma_iu4());
+        assert_eq!(arch.buffer_offset_max(), Arch::Gfx1151.buffer_offset_max());
+        assert_eq!(arch.dependency_wait(), Arch::Gfx1151.dependency_wait());
+        assert_eq!(
+            arch.min_user_system_sgprs(),
+            Arch::Gfx1151.min_user_system_sgprs()
+        );
+        assert_eq!(arch.cdna(), Arch::Gfx1151.cdna());
     }
 }

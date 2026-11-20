@@ -242,7 +242,7 @@ pub fn load_helpers(program: &Program) -> Result<Vec<Helper>, String> {
         while at < words.len() {
             let va = extent.start + 4 * at as u64;
             let (mut inst, n) = match arch {
-                Arch::Gfx1100 | Arch::Gfx1151 => gfx11::decode(arch, &words[at..]),
+                Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 => gfx11::decode(arch, &words[at..]),
                 _ => gfx12::decode_for(arch, &words[at..]),
             }
             .map_err(|e| fail(va, format!("decode: {e}")))?;

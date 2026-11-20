@@ -269,6 +269,25 @@ pub fn gfx1100() -> &'static [OpRow] {
     });
     &TABLE
 }
+pub fn gfx1150() -> &'static [OpRow] {
+    static TABLE: LazyLock<Vec<OpRow>> = LazyLock::new(|| {
+        let mut rows = gfx1100().to_vec();
+        for delta in
+            parse(include_str!("../isa/gfx1150.tbl")).expect("shipped gfx1150 deltas must parse")
+        {
+            if let Some(old) = rows
+                .iter_mut()
+                .find(|row| row.op == delta.op && row.form == delta.form)
+            {
+                *old = delta;
+            } else {
+                rows.push(delta);
+            }
+        }
+        rows
+    });
+    &TABLE
+}
 pub fn gfx1151() -> &'static [OpRow] {
     static TABLE: LazyLock<Vec<OpRow>> = LazyLock::new(|| {
         let mut rows = gfx1100().to_vec();
@@ -292,6 +311,7 @@ pub fn table(arch: Arch) -> &'static [OpRow] {
     match arch {
         Arch::Gfx1100 => gfx1100(),
         Arch::Gfx1151 => gfx1151(),
+        Arch::Gfx1150 => gfx1150(),
         Arch::Gfx1200 | Arch::Gfx1201 => gfx12(),
         Arch::Gfx1010 | Arch::Gfx1030 => &[],
     }
@@ -308,11 +328,14 @@ pub fn runtime_table(arch: Arch) -> &'static [OpRow] {
         LazyLock::new(|| parse(generated!("gfx1100")).expect("gfx1100 runtime table"));
     static GFX1151: LazyLock<Vec<OpRow>> =
         LazyLock::new(|| parse(generated!("gfx1151")).expect("gfx1151 runtime table"));
+    static GFX1150: LazyLock<Vec<OpRow>> =
+        LazyLock::new(|| parse(generated!("gfx1150")).expect("gfx1150 runtime table"));
     static GFX12: LazyLock<Vec<OpRow>> =
         LazyLock::new(|| parse(generated!("gfx12")).expect("gfx12 runtime table"));
     match arch {
         Arch::Gfx1100 => &GFX1100,
         Arch::Gfx1151 => &GFX1151,
+        Arch::Gfx1150 => &GFX1150,
         Arch::Gfx1200 | Arch::Gfx1201 => &GFX12,
         _ => &[],
     }
@@ -332,11 +355,14 @@ fn variant_index(arch: Arch) -> Option<&'static std::collections::HashMap<Encodi
         LazyLock::new(|| build(Arch::Gfx1100));
     static GFX1151: LazyLock<std::collections::HashMap<EncodingVariant, usize>> =
         LazyLock::new(|| build(Arch::Gfx1151));
+    static GFX1150: LazyLock<std::collections::HashMap<EncodingVariant, usize>> =
+        LazyLock::new(|| build(Arch::Gfx1150));
     static GFX12: LazyLock<std::collections::HashMap<EncodingVariant, usize>> =
         LazyLock::new(|| build(Arch::Gfx1201));
     match arch {
         Arch::Gfx1100 => Some(&GFX1100),
         Arch::Gfx1151 => Some(&GFX1151),
+        Arch::Gfx1150 => Some(&GFX1150),
         Arch::Gfx1200 | Arch::Gfx1201 => Some(&GFX12),
         _ => None,
     }

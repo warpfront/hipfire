@@ -98,6 +98,7 @@ fn ir_arch(arch: Arch) -> Result<IrArch, String> {
     match arch {
         Arch::Gfx1100 => Ok(IrArch::Gfx1100),
         Arch::Gfx1151 => Ok(IrArch::Gfx1151),
+        Arch::Gfx1150 => Ok(IrArch::Gfx1150),
         Arch::Gfx1200 => Ok(IrArch::Gfx1200),
         Arch::Gfx1201 => Ok(IrArch::Gfx1201),
         Arch::Gfx942 => Err("gfx942 uses the typed CDNA lift, not the RDNA IR".into()),
@@ -357,7 +358,7 @@ pub fn seal(
     let mut hz_err = Vec::new();
     if matches!(
         arch,
-        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1200 | Arch::Gfx1201
+        Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150 | Arch::Gfx1200 | Arch::Gfx1201
     ) {
         let findings = check_kernel(kernel, ir, true);
         let blocking: Vec<_> = findings

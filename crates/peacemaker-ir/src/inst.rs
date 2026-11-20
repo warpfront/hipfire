@@ -23,6 +23,8 @@ pub enum Arch {
     Gfx1030,
     Gfx1100,
     Gfx1151,
+    /// RDNA3.5 `gfx1150`: the gfx1151 instruction family under a distinct ELF machine / bundle triple.
+    Gfx1150,
     /// RDNA4 `gfx1200`: the gfx1201 ISA (encodings, semantics, hazards, descriptors) under a
     /// distinct ELF machine / bundle triple. ISA-family tests use [`Arch::is_gfx12`].
     Gfx1200,

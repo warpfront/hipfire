@@ -555,8 +555,8 @@ impl<'a> Emulator<'a> {
                 ..
             }
         );
-        let reads_at_issue =
-            !strict_store_sources && (hipcc || matches!(arch, Arch::Gfx1100 | Arch::Gfx1151));
+        let reads_at_issue = !strict_store_sources
+            && (hipcc || matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1150));
         self.hw = Some(
             self.steps
                 .iter()

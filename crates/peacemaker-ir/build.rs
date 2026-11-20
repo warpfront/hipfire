@@ -15,7 +15,7 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
-const TARGETS: [&str; 3] = ["gfx1100", "gfx1151", "gfx12"];
+const TARGETS: [&str; 4] = ["gfx1100", "gfx1151", "gfx12", "gfx1150"];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");

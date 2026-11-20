@@ -716,7 +716,10 @@ pub fn oracle_assemble_link_bundle(
     output: &Path,
     arch: &str,
 ) -> Result<BuildOutput> {
-    if !matches!(arch, "gfx1201" | "gfx1200" | "gfx1100" | "gfx1151") {
+    if !matches!(
+        arch,
+        "gfx1201" | "gfx1200" | "gfx1100" | "gfx1151" | "gfx1150"
+    ) {
         return Err(format!("unsupported AMDGPU architecture: {arch}"));
     }
     let stem = output.with_extension("");
@@ -869,7 +872,7 @@ pub fn certify(
                     | "iu4_c8_sigmoid_rotate_pm_gfx1201"
                     | "iu4_c8_rmsnorm_out_rotate_pm_gfx1201"
             );
-        let m7_cert = matches!(arch, "gfx1100" | "gfx1151")
+        let m7_cert = matches!(arch, "gfx1100" | "gfx1151" | "gfx1150")
             || arch == "gfx1201"
                 && (contract.symbol.starts_with("qwen4_moe_")
                     || qsa_pm
