@@ -524,7 +524,7 @@ enum FfnGateOutput {
     Iu4H,
     Fp8H,
     A8H,
-    /// Lloyd A8 twin (opt-in `HIPFIRE_LLOYD_MMQ_A4=1`, exact gfx1100): the
+    /// Lloyd A8 twin (opt-in `HIPFIRE_LLOYD_MMQ_A4=1`, gfx1100/gfx1151): the
     /// gate/up epilogue wrote fused h into `gate_ffn_batch`, same contract
     /// as A8H but carrying Lloyd codebook weights. The down arm consumes h
     /// through the twin residual worker (never the uniform i8 path).
@@ -1662,15 +1662,15 @@ pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
     matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151") && !gpu.flags.lloyd_mmq_off
 }
 
-/// Twin route (T3, default OFF): exact gfx1100 only (the twin TU is V2C-free
-/// and tile-pinned for gfx1100; gfx1151 keeps X128 until the V2B follow-up),
+/// Twin route (T3, default OFF): gfx1100 and gfx1151 (the twin TU compiles
+/// for both; without the opt-in gfx1151 keeps X128),
 /// K%256, N>=64, eager-only (no replay/capture — same bar as the twin
 /// worker's siblings). Explicit opt-in `HIPFIRE_LLOYD_MMQ_A4=1`; distinct
 /// from the fail-closed `HIPFIRE_LLOYD_MMQ_OFF` and the uniform
 /// `HIPFIRE_IU4_PREFILL`. qkv/qkvza/partial/single-weight ride the existing
 /// single-matrix SET/ADD entries (no new TU); only gate/up has a fused SILU
 /// twin entry.
-/// Static half of [`lloyd_mmq_a4_route`]: exact gfx1100 plus the explicit
+/// Static half of [`lloyd_mmq_a4_route`]: gfx1100/gfx1151 plus the explicit
 /// opt-in `HIPFIRE_LLOYD_MMQ_A4=1`, without the per-launch shape/capture
 /// terms. `HIPFIRE_LLOYD_MMQ_OFF=1` dominates the opt-in (fail-closed),
 /// so A8-prepared twin paths cannot bypass the kill switch. Shared with
@@ -1678,7 +1678,9 @@ pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
 /// per-launch gates still fail closed at dispatch.
 #[inline]
 pub fn lloyd_mmq_a4_static_admitted(gpu: &Gpu) -> bool {
-    gpu.arch.as_str() == "gfx1100" && gpu.flags.lloyd_mmq_a4 && !gpu.flags.lloyd_mmq_off
+    matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
+        && gpu.flags.lloyd_mmq_a4
+        && !gpu.flags.lloyd_mmq_off
 }
 
 #[inline]
