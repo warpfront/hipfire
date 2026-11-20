@@ -79,10 +79,14 @@ Verified against the merged source (corrects §0 where noted):
   per-layer SWA pattern. Full-attention visits = 8, sliding = 40 (matches the
   third-party otis catalog note "8 global and 40 sliding-window layers" —
   independent cross-check of the 48-visit schedule).
-- **block_count trap confirmed real**: unsloth GGUFs written with 48 blocks
-  fail to load on the merged build (llmctl pins ggml-org's GGUF for exactly
-  this reason). GGUF must carry 24 physical + loop metadata; hipfire must
-  stamp physical count + loop config and never unroll.
+- **block_count trap**: the published ggml-org BF16 GGUF carries
+  `inkling2_loop.block_count = 24` **plus** `loop.start=6`, `loop.end=18`,
+  `loop.count=3`, `loop.gate_rank=64`, `loop.varying=false` (verified from the
+  GGUF header, §8). llama.cpp derives `n_phys` from `block_count` and expands
+  to `n_slot=48` cache slots separately, so a GGUF stamped 48 would allocate
+  48 physical layers against 24 tensor sets. The specific report that
+  unsloth's 48-block GGUFs fail to load remains a lead, not reproduced here;
+  hipfire must stamp physical count + loop config and never unroll.
 - `is_varloop` exists upstream (varying flag, min 1 pass, research GGUF
   only). Mini is `is_varloop=false`; Phase 1 refuses varying (same
   fail-closed posture as upstream's invalid-config throws).
@@ -370,9 +374,10 @@ fuse only in Phase 4 behind the KLD pin.
    `imatrix.gguf` are evidence/calibration inputs, not a BF16 training source.
 3. **Scope caps**: text-only AR at `max_seq` 32768 as the Phase-1 ceiling;
    vision, MTP and 1M context stay deferred. Accepted.
-4. **Destination**: this plan is developed on `feat/inkling2-mini-support` off
-   `origin/beta`. Keep it as local commits — **do not open a PR** until asked;
-   an upstream PR to `beta` is a possible later step, not the current one.
+4. **Destination**: an upstream PR is the goal **once the actual
+   implementation is done and verified** — not for this planning work. Until
+   then everything stays as local commits on `feat/inkling2-mini-support` off
+   `origin/beta`; do not open a PR now.
 
 ## 7. Effort (honest, calendar time for one engineer with hardware access)
 
@@ -397,6 +402,7 @@ carried forward from the original plan and remain Phase-0 tasks.
 | llama.cpp support merged | GitHub API PR #32694 | merged 2026-11-20T22:01:08Z by CISC; full merge SHA `29b52d398b294509746ec0a3f28948a3107c0213`; 9 commits, 13 files, +631/−123. Short `29b52d3` did not resolve via GitHub web/API here — use the full SHA. |
 | GGUF fixtures published | `hf models list` | both repos exist: `ggml-org/Inkling-2-Mini-GGUF` (BF16 52,226,509,504 B sha256 `7074c976…`, IQ4_NL, Q8_0, `imatrix.gguf` 90,752,032 B, mmproj) and `ggml-org/TML-d24-varloop-research-GGUF` (BF16/IQ4_NL/Q8_0/imatrix/mmproj). |
 | Arch ids 24 / 25 free | `docs/architecture-ids.md` on `origin/beta` `9e410448e` | 18 (EmbeddingGemma2) and 19 (Raon) are now claimed; 24 is first free primary, 25 first free sidecar after 23. |
+| GGUF carries 24 physical blocks + loop metadata | 1 MB range read of `ggml-org/Inkling-2-Mini-GGUF/Inkling-2-Mini-BF16.gguf` header | `general.architecture=inkling2_loop`, `block_count=24`, `loop.start/end/count/gate_rank/varying=6/18/3/64/false`, context_length 1048576, vocab 201024/200058. Confirms the file is not unrolled. |
 
 ### Merged-source re-verification (2026-11-20)
 
@@ -415,9 +421,9 @@ and `conversion/inkling2.py` at the full merge SHA:
 | Ingest transforms | static conv weights are `flip(0).T` at conversion; `attn_res.attn_queries.{i}` maps to block `i+1`; `mlp.gate.bias` is the router `e_score_correction_bias`; F32 keep list covers conv/clip/res_query/attn_rel_bias and every loop tensor. The text converter skips vision and MTP tensors (matches the Phase-1 refusal). |
 
 Still oracle-owned by Phase 0: elementwise dequant parity against the
-published BF16 GGUF, the 48-vs-24 `block_count` trap on unsloth GGUFs,
+published BF16 GGUF, direct reproduction of the 48-block unsloth load failure,
 HF-transformers numerical parity of the controllers, and the template surface.
-Source confirmation is not numerical proof.
+Source/header confirmation is not numerical proof.
 
 ### Phase-1 file map (checked on `origin/beta` `9e410448e`)
 
