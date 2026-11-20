@@ -4245,7 +4245,9 @@ pub(crate) fn run() {
             && name.starts_with("mtp.")
             && !name.contains(".ffn.experts.")
             && should_quantize(name);
-        if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name) || keep_f16_mtp)
+        if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name)
+            || is_inkling2_keep_f16(name)
+            || keep_f16_mtp)
             && n_elements >= 32
         {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
