@@ -372,7 +372,8 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
 
 When the paged engine is idle (nothing in flight, nothing queued) it waits
 `serve.paged_idle_reclaim_ms` (default `0`, the immediate reclaim; opt-in
-because an in-place turn is session-exact, not cold-exact; see
+because an in-place turn is session-exact, not cold-exact, and paged decode
+attention uses the flash kernel where the slab route uses the scalar one; see
 [`CONFIG.md`](CONFIG.md) `serve.paged_idle_reclaim_ms`)
 before parking every resident session `Cold`: the slot, admission grant and
 KV pages go back to the pool, while the session id, tokens and conversation
