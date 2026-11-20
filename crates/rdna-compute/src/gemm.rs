@@ -34441,7 +34441,7 @@ impl Gpu {
 
     /// C2 prepared IU4 consumer for qkvza: never launches `quantize_int4_mmq_ds128`.
     /// `x` is still required for beta/alpha small-tail f32 paths (emit_f32=true).
-    /// T0 follow-up: MQ4G256V2-Lloyd (qt=52) QKVZA prefill on exact gfx1100.
+    /// T0 follow-up: MQ4G256V2-Lloyd (qt=52) QKVZA prefill on gfx1100/gfx1151.
     /// F16-WMMA-LUT twin of [`Self::gemm_qkvza_mq4g256v2_wmma`]: BT-tile
     /// selected by the frozen uniform policy, MMQ/iu4 fast paths bypassed.
     /// Eager-only; other arches fail closed. Kill switch
@@ -34475,11 +34475,11 @@ impl Gpu {
                 ),
             ));
         }
-        if self.arch != "gfx1100" {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "gemm_qkvza_mq4g256v2_wmma_gfx11_lloyd requires exact gfx1100 (got {})",
+                    "gemm_qkvza_mq4g256v2_wmma_gfx11_lloyd requires gfx1100/gfx1151 (got {})",
                     self.arch
                 ),
             ));
@@ -35888,7 +35888,7 @@ impl Gpu {
     }
 
     /// C2 prepared IU4 consumer for qkv: never launches `quantize_int4_mmq_ds128`.
-    /// T0 follow-up: MQ4G256V2-Lloyd (qt=52) QKV prefill on exact gfx1100.
+    /// T0 follow-up: MQ4G256V2-Lloyd (qt=52) QKV prefill on gfx1100/gfx1151.
     /// F16-WMMA-LUT twin of [`Self::gemm_qkv_mq4g256v2_wmma`]: BT-tile
     /// selected by the frozen uniform policy, MMQ/iu4 fast paths bypassed.
     /// Eager-only; other arches fail closed. Kill switch
@@ -35919,11 +35919,11 @@ impl Gpu {
                 ),
             ));
         }
-        if self.arch != "gfx1100" {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "gemm_qkv_mq4g256v2_wmma_gfx11_lloyd requires exact gfx1100 (got {})",
+                    "gemm_qkv_mq4g256v2_wmma_gfx11_lloyd requires gfx1100/gfx1151 (got {})",
                     self.arch
                 ),
             ));
@@ -37332,7 +37332,7 @@ impl Gpu {
     }
 
     /// C2 prepared IU4 consumer for gate_up: never launches `quantize_int4_mmq_ds128`.
-    /// T0 follow-up: MQ4G256V2-Lloyd (qt=52) gate/up prefill on exact gfx1100.
+    /// T0 follow-up: MQ4G256V2-Lloyd (qt=52) gate/up prefill on gfx1100/gfx1151.
     /// F16-WMMA-LUT twin of [`Self::gemm_gate_up_mq4g256v2_wmma`]: BT-tile
     /// selected by the frozen uniform policy, MMQ/iu4 fast paths bypassed.
     /// Eager-only; other arches fail closed. Kill switch
@@ -37359,11 +37359,11 @@ impl Gpu {
                 &format!("gemm_gate_up_mq4g256v2_wmma_gfx11_lloyd: K divisible by 256 required (got {k})"),
             ));
         }
-        if self.arch != "gfx1100" {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "gemm_gate_up_mq4g256v2_wmma_gfx11_lloyd requires exact gfx1100 (got {})",
+                    "gemm_gate_up_mq4g256v2_wmma_gfx11_lloyd requires gfx1100/gfx1151 (got {})",
                     self.arch
                 ),
             ));
@@ -39504,7 +39504,7 @@ impl Gpu {
     /// to `gemm_gate_up_mq4g256v2_wmma`); same per-output WMMA chain and epilogue;
     /// grid `[ceil((gate_m+up_m)/64), ceil(N/16), 1]`, block `[128, 1, 1]`,
     /// 4 waves x 16 rows per block with the X slab staged in LDS.
-    /// T0 follow-up: MQ4G256V2-Lloyd (qt=52) residual prefill on exact gfx1100.
+    /// T0 follow-up: MQ4G256V2-Lloyd (qt=52) residual prefill on gfx1100/gfx1151.
     /// F16-WMMA-LUT twin of [`Self::gemm_mq4g256v2_residual_wmma`]: BT-tile
     /// selected by the frozen uniform policy, MMQ/iu4/verify/MW fast paths
     /// bypassed (integer MMQ cannot consume a float codebook). Eager-only;
@@ -39528,11 +39528,11 @@ impl Gpu {
                 &format!("gemm_mq4g256v2_residual_wmma_gfx11_lloyd: K divisible by 256 required (got {k})"),
             ));
         }
-        if self.arch != "gfx1100" {
+        if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "gemm_mq4g256v2_residual_wmma_gfx11_lloyd requires exact gfx1100 (got {})",
+                    "gemm_mq4g256v2_residual_wmma_gfx11_lloyd requires gfx1100/gfx1151 (got {})",
                     self.arch
                 ),
             ));
