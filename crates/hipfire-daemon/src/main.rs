@@ -3958,10 +3958,28 @@ fn main() {
                         // Qwen4 lanes: the driver renders exactly at assignment (its own
                         // template path, not the Qwen3.5 batch render); admission defers
                         // prompt tokens and skips Qwen3.5 length/think validation.
+                        let mut lane_singleton_now = false;
                         let render = if qwen4_lanes {
                             Ok((Vec::new(), false))
                         } else if lane_family {
-                            hipfire_generate::lanes::render_lane_prompt(m, &msg)
+                            // A request no lane can hold runs on the singleton,
+                            // which serves it to its cache cap.
+                            use hipfire_generate::lanes::{lane_admission, LaneAdmission};
+                            match lane_admission(
+                                m,
+                                &msg,
+                                batch_scheduler.as_ref().map_or(0, |s| s.lane_capacity),
+                            ) {
+                                Ok(LaneAdmission::Lane {
+                                    tokens,
+                                    started_in_think,
+                                }) => Ok((tokens, started_in_think)),
+                                Ok(LaneAdmission::Singleton) => {
+                                    lane_singleton_now = true;
+                                    Ok((Vec::new(), false))
+                                }
+                                Err(e) => Err(e),
+                            }
                         } else {
                             batch_render_prompt_tokens(
                                 &prompt_owned,
@@ -4003,14 +4021,6 @@ fn main() {
                                 &gpu.arch,
                                 prompt_tokens.len(),
                                 max_tokens,
-                            );
-                        // Lane families: a request no lane can hold runs on the
-                        // singleton, which serves it to its cache cap.
-                        let lane_singleton_now = lane_family
-                            && hipfire_engine::terminal::batch_lfm_exceeds_capacity(
-                                prompt_tokens.len(),
-                                max_tokens,
-                                batch_scheduler.as_ref().map_or(0, |s| s.lane_capacity),
                             );
                         let singleton_now = vmm_singleton_now || lane_singleton_now;
                         if (started_in_think && !vmm_route) || singleton_now {
