@@ -1699,6 +1699,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Multi-slot route: close a parked (swapped or cold) session after this many seconds idle; 0 disables the idle sweep (the hard session cap still applies)."
     ),
     field!(
+        "serve.paged_idle_reclaim_ms",
+        "paged_idle_reclaim_ms",
+        Serve,
+        Process,
+        DefaultValue::Integer(30000),
+        ValueRule::Integer { min: 0, max: 3600000 },
+        true,
+        true,
+        Some("HIPFIRE_SERVE_PAGED_IDLE_RECLAIM_MS"),
+        "Multi-slot paged route: keep resident sessions and the prefix cache intact for this many milliseconds after the engine goes idle before reclaiming them; 0 keeps the immediate reclaim. A command arriving in the window resets the timer, so a tool-result turn reaches the still-resident KV. Pressure evicts idle sessions before this deadline."
+    ),
+    field!(
         "serve.multi_slot_max_sessions",
         "multi_slot_max_sessions",
         Serve,
@@ -10669,6 +10681,51 @@ mod tests {
                 "{spelling:?}"
             );
         }
+    }
+
+    #[test]
+    fn paged_idle_reclaim_ms_default_and_override() {
+        let f = field("serve.paged_idle_reclaim_ms").expect("paged idle reclaim schema field");
+        assert_eq!(f.env_compat, Some("HIPFIRE_SERVE_PAGED_IDLE_RECLAIM_MS"));
+        assert!(matches!(f.default, DefaultValue::Integer(30000)));
+        for valid in [0, 1, 30_000, 3_600_000] {
+            assert!(
+                f.validate(&ConfigValue::Integer(valid)).is_ok(),
+                "{valid} should validate"
+            );
+        }
+        for invalid in [-1, 3_600_001] {
+            assert!(
+                f.validate(&ConfigValue::Integer(invalid)).is_err(),
+                "{invalid} should be refused"
+            );
+        }
+        // The resolved process snapshot carries the default without an env layer.
+        let process =
+            ProcessConfig::from_resolved(&resolve([]).expect("empty resolve")).expect("process");
+        assert_eq!(
+            process.values.get("serve.paged_idle_reclaim_ms"),
+            Some(&ConfigValue::Integer(30000))
+        );
+        // One legacy env spelling resolves to the same canonical key.
+        let mut env_layer = ConfigLayer::default();
+        env_layer
+            .set("serve.paged_idle_reclaim_ms", ConfigValue::Integer(0))
+            .expect("zero validates");
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::LegacyEnv {
+                    name: "HIPFIRE_SERVE_PAGED_IDLE_RECLAIM_MS".into(),
+                },
+                layer: env_layer,
+            }])
+            .expect("env resolve"),
+        )
+        .expect("process");
+        assert_eq!(
+            process.values.get("serve.paged_idle_reclaim_ms"),
+            Some(&ConfigValue::Integer(0))
+        );
     }
 
     fn temp_root(name: &str) -> PathBuf {
