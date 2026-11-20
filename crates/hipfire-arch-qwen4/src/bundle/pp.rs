@@ -355,7 +355,7 @@ const MODE_COUNT: usize = 3;
 static NEXT_LOAD_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Next process-unique load id; fails instead of wrapping.
-fn next_load_id() -> Result<u64, String> {
+pub(super) fn next_load_id() -> Result<u64, String> {
     NEXT_LOAD_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map_err(|_| "load ids are exhausted".to_string())

@@ -298,6 +298,9 @@ pub struct RuntimeConfig {
     /// load on a discrete GPU places its untied passthrough token embedding in
     /// pinned host RAM. Read by the loader and the capacity projection.
     pub embed_host: bool,
+    /// `generation.engine_loop` / `HIPFIRE_ENGINE_LOOP` = `engine`: allowlisted
+    /// routes run on the shared engine loop (G12 PoC). Default `legacy`.
+    pub engine_loop: bool,
 }
 
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
@@ -412,6 +415,7 @@ impl RuntimeConfig {
             yarn_factor: value("HIPFIRE_YARN_FACTOR").and_then(|value| value.parse().ok()),
             npu_spillover: value("HIPFIRE_NPU_SPILLOVER").as_deref() == Some("1"),
             embed_host: value("HIPFIRE_EMBED_HOST").as_deref() != Some("0"),
+            engine_loop: value("HIPFIRE_ENGINE_LOOP").as_deref() == Some("engine"),
         }
     }
 }

@@ -2714,7 +2714,7 @@ fn plan_spec_session(
 ///
 /// [`ArchModel::spec_session_reuse`]: hipfire_runtime::arch_model::ArchModel::spec_session_reuse
 /// [`ArchModel::session_commit_live_mesh`]: hipfire_runtime::arch_model::ArchModel::session_commit_live_mesh
-fn commit_session(model: &mut LoadedModel) {
+pub(crate) fn commit_session(model: &mut LoadedModel) {
     let LoadedModel {
         state,
         pp_gpus,
@@ -11453,7 +11453,7 @@ pub fn generate_qwen4_ar(
     min_tokens: usize,
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
-    _request_seed: u32,
+    request_seed: u32,
 ) {
     let route = crate::ar::GenerationRoute::Qwen4Ar;
     let Some((vocab_size, eos_token)) = m
@@ -11514,6 +11514,40 @@ pub fn generate_qwen4_ar(
             false,
         );
         return;
+    }
+    // The engine allowlist covers the Single load; PP and EP keep their loops.
+    if crate::engine::runs_on_engine(route)
+        && m.qwen4()
+            .is_some_and(|bundle| bundle.single_mesh_eligible())
+    {
+        let sampler = hipfire_runtime::sampler::SamplerConfig {
+            temperature: temp,
+            top_p,
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+            blocked_tokens: Vec::new(),
+            top_k,
+            min_p,
+        };
+        return crate::engine::qwen4::generate_ar(
+            m,
+            gpu,
+            stdout,
+            id,
+            &prompt_tokens,
+            started_in_think,
+            crate::engine::qwen4::ArRequest {
+                sampler,
+                max_tokens,
+                max_think_tokens,
+                stop,
+                min_tokens,
+                tools: tools.is_some(),
+                seed: request_seed,
+            },
+        );
     }
     let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len() + 1, m.max_seq);
     let required = prompt_tokens

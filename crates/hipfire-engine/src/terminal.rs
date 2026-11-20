@@ -1471,6 +1471,18 @@ pub fn emit_staged_terminal_done_outcome(
             claimed = true;
         }
     }
+    // G12: every done names the loop that produced it; the engine loop stages
+    // its own `"loop": "engine"`, so a missing field is a legacy loop.
+    let stamped;
+    let pending_done = match pending_done.as_object() {
+        Some(obj) if !obj.contains_key("loop") => {
+            let mut obj = obj.clone();
+            obj.insert("loop".into(), "legacy".into());
+            stamped = serde_json::Value::Object(obj);
+            &stamped
+        }
+        _ => pending_done,
+    };
     let delivered = writeln!(stdout, "{}", pending_done).is_ok() && stdout.flush().is_ok();
     TerminalEmitOutcome::new(claimed, delivered)
 }
