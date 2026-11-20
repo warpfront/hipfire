@@ -51,3 +51,44 @@ extern "C" __global__ void lloyd_partial(
   p[32] = sse;
   p[33] = wsum;
 }
+
+// Score four candidate level-sets in one element pass. `levels4` is four
+// contiguous 16-double sets. Each chunk writes 4 sse + 4 wsum doubles in
+// candidate order; the host combines chunks in launch order.
+extern "C" __global__ void lloyd_polish_partial(
+    const double* __restrict__ vals,
+    const double* __restrict__ wts,
+    const double* __restrict__ levels4,
+    double* __restrict__ partials,
+    unsigned long long n)
+{
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned long long start = (unsigned long long)tid * LLOYD_CHUNK;
+  if (start >= n) return;
+  double L[4][16];
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+#pragma unroll
+    for (int k = 0; k < 16; ++k) L[c][k] = levels4[c * 16 + k];
+  }
+  double sse[4] = {0.0, 0.0, 0.0, 0.0};
+  double wsum[4] = {0.0, 0.0, 0.0, 0.0};
+  for (unsigned long long i = start; i < start + LLOYD_CHUNK && i < n; ++i) {
+    const double v = vals[i], wt = wts[i];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      int idx = 15;
+#pragma unroll
+      for (int k = 0; k < 15; ++k) {
+        const double mid = 0.5 * (L[c][k] + L[c][k + 1]);
+        if (v < mid) { idx = k; break; }
+      }
+      const double e = v - L[c][idx];
+      sse[c] += wt * e * e;
+      wsum[c] += wt;
+    }
+  }
+  double* p = partials + (size_t)tid * 8;
+#pragma unroll
+  for (int c = 0; c < 4; ++c) { p[c] = sse[c]; p[4 + c] = wsum[c]; }
+}
