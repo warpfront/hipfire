@@ -3460,7 +3460,7 @@ pub(crate) fn run() {
                 let data = quantize_mq4g256(&f32_e, &signs1, &signs2);
                 let leaf = if is_w13 { "gate_up_proj" } else { "down_proj" };
                 hfq_tensors.push(HfqTensor {
-                    name: format!("{base}.experts.{e}.{leaf}"),
+                    name: format!("{base}.experts.{e}.{leaf}.weight"),
                     quant_type: QuantType::MQ4G256,
                     shape: vec![rows as u32, cols as u32],
                     group_size: 256,
