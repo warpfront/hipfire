@@ -175,6 +175,7 @@ impl ExpertCacheConfig {
         layers: usize,
         experts: usize,
         topk: usize,
+        max_rows: usize,
     ) -> Result<u64, String> {
         if self.is_static_only() {
             return Ok(0);
@@ -185,6 +186,7 @@ impl ExpertCacheConfig {
             .ok_or("expert-cache table budget overflows")?;
         let routes = layers
             .checked_mul(topk)
+            .and_then(|x| x.checked_mul(max_rows))
             .and_then(|x| x.checked_mul(4))
             .ok_or("expert-cache route budget overflows")?;
         u64::try_from(tables)
@@ -527,13 +529,19 @@ mod tests {
         assert_eq!(on.tail_cap_bytes(0).unwrap(), 0);
         assert!(on.tail_cap_bytes(u64::MAX).is_err());
         assert_eq!(on.host_reserve_bytes(), 128 << 20);
-        assert!(on.device_reserve_bytes(usize::MAX, 512, 10).is_err());
+        assert!(on.device_reserve_bytes(usize::MAX, 512, 10, 64).is_err());
         assert_eq!(
-            on.device_reserve_bytes(48, 512, 10).unwrap(),
+            on.device_reserve_bytes(48, 512, 10, 64).unwrap(),
+            (48 * 512 * 16) + (48 * 10 * 64 * 4) + (32 << 20),
+        );
+        // One row is the AR-only footprint.
+        assert_eq!(
+            on.device_reserve_bytes(48, 512, 10, 1).unwrap(),
             (48 * 512 * 16) + (48 * 10 * 4) + (32 << 20),
         );
-        assert!(on.device_reserve_bytes(1, usize::MAX, 10).is_err());
-        assert!(on.device_reserve_bytes(1, 512, usize::MAX).is_err());
+        assert!(on.device_reserve_bytes(1, usize::MAX, 10, 64).is_err());
+        assert!(on.device_reserve_bytes(1, 512, usize::MAX, 64).is_err());
+        assert!(on.device_reserve_bytes(1, 512, 10, usize::MAX).is_err());
         // An explicit cap is used verbatim, even above the owner's bytes.
         let capped = ExpertCacheConfig {
             tail_bytes_cap: Some(7 << 40),
@@ -546,7 +554,7 @@ mod tests {
             ..on
         };
         assert_eq!(zero.tail_cap_bytes(1 << 30).unwrap(), 0);
-        assert_eq!(zero.device_reserve_bytes(48, 512, 10).unwrap(), 0);
+        assert_eq!(zero.device_reserve_bytes(48, 512, 10, 64).unwrap(), 0);
         assert_eq!(zero.host_reserve_bytes(), 0);
     }
 

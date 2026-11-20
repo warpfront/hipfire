@@ -19,10 +19,13 @@
 //!   catalog proves ([`build_layout`]);
 //! * the canonical sources: both projections of a cacheable expert are the segments of one
 //!   [`BundleSource`] bundle, so a fill copies GU and DN under one event and never publishes half;
-//! * the decode window: one window per AR token (`begin_token` .. `finish_token`), the routed ids
-//!   the step read back become the window's uses, and `published()` / `withdrawn()` are written
-//!   into the per-layer device tables through the dispatch [`MutableExpertResidency`]
-//!   capability (the table writes and the launch authority stay dispatch's);
+//! * the decode window: one window per AR token or per verify/repair window of `rows` rows
+//!   (`begin_token` .. `finish_token`). The routed ids the forward read back, laid out
+//!   `[layer][row][k]`, become the window's uses; a rejected draft row is a real read and counts
+//!   as a use (PLAN §5.3), and a model-state rollback never touches residency. `published()` /
+//!   `withdrawn()` are written into the per-layer device tables through the dispatch
+//!   [`MutableExpertResidency`] capability (the table writes and the launch authority stay
+//!   dispatch's);
 //! * the donor protocol (§5.2, see [`ExpertCache::prepare_prefill`]): a dirty prompt shorter than
 //!   the staged threshold reads the immutable core/host tables and leaves fills, mappings,
 //!   tickets and recency alone; a prompt that needs the Resident donors back refuses while a
@@ -115,7 +118,12 @@ pub(crate) struct ExpertCacheToken {
 /// cover these manager methods, not the caller's route readback or GPU step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct ExpertCacheStats {
+    /// Windows observed (one per AR token or per verify/repair window).
     pub tokens: u64,
+    /// Rows observed across those windows (one per AR token).
+    pub rows: u64,
+    /// Windows that carried more than one row.
+    pub verify_windows: u64,
     pub selected: u64,
     pub core_hits: u64,
     pub cache_hits: u64,
@@ -550,6 +558,63 @@ fn account_route(
     Ok(account)
 }
 
+/// Reject a route readback that is not exactly `rows` windows-rows of `LAYERS * TOPK` valid
+/// expert ids, or that exceeds the rows the cache's use log was sized for.
+fn validate_window_ids(ids: &[i32], rows: usize, max_rows: usize) -> Result<()> {
+    let expected = LAYERS
+        .checked_mul(TOPK)
+        .and_then(|ids| ids.checked_mul(rows));
+    if rows == 0
+        || rows > max_rows
+        || expected != Some(ids.len())
+        || ids.iter().any(|id| !(0..EXPERTS as i32).contains(id))
+    {
+        return Err("expert cache invalid route readback".into());
+    }
+    Ok(())
+}
+
+/// Walk one window's routed ids layer -> row -> rank (ids are `[layer][row][k]`; for one row
+/// this is today's layer-major order). Every row is accounted on its own `TOPK` slice, so one
+/// expert in two rows is legal while a duplicate inside one row is refused. `record` receives
+/// each cacheable read in that order. Returns the summed account of the window.
+fn observe_window_routes<'a>(
+    layout: &Layout,
+    ids: &[i32],
+    rows: usize,
+    mapping_of: impl Fn(usize) -> &'a [ResidencyLocation],
+    mut record: impl FnMut(WindowUse) -> Result<()>,
+) -> Result<RouteAccount> {
+    let mut total = RouteAccount::default();
+    for layer in 0..LAYERS {
+        let mapping = mapping_of(layer);
+        for row in 0..rows {
+            let start = (layer * rows + row) * TOPK;
+            let selected = ids
+                .get(start..start + TOPK)
+                .ok_or("expert cache route readback extent")?;
+            let account = account_route(layout, layer, selected, mapping)?;
+            total.selected = total.selected.saturating_add(account.selected);
+            total.core_hits = total.core_hits.saturating_add(account.core_hits);
+            total.cache_hits = total.cache_hits.saturating_add(account.cache_hits);
+            total.host_misses = total.host_misses.saturating_add(account.host_misses);
+            total.miss_bytes = total.miss_bytes.saturating_add(account.miss_bytes);
+            for &id in selected {
+                let expert = id as usize;
+                if let Read::Cache { pool, rank, .. } = layout.reads[layer * EXPERTS + expert] {
+                    record(WindowUse {
+                        key: layout.key(layer, expert),
+                        pool,
+                        reads: 1,
+                        rank,
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
 /// The dispatch ticket generation of a fill generation: slot fill generations restart when a
 /// restore rebuilds the pools, the capability requires them never to go backwards.
 fn ticket_generation(restore_epoch: u64, fill_generation: u64) -> Result<u64> {
@@ -795,6 +860,8 @@ pub(crate) struct ExpertCache {
     /// The donor tail a restore rewrites, and its pinned host mirror (equal lengths).
     donor_device: (usize, usize),
     mirror_cpu: (usize, usize),
+    /// Most rows one window may carry; the use log is sized for it at construction.
+    max_rows: usize,
     restore_epoch: u64,
     dirty: bool,
     poisoned: Option<String>,
@@ -1005,9 +1072,10 @@ impl ExpertCache {
         lease: ExpertTierLease,
         config: ExpertCacheConfig,
         rank: &[u32],
+        max_rows: usize,
     ) -> Result<Self> {
-        if gpu.arch != "gfx1201" || config.max_inflight == 0 {
-            return Err("expert cache requires gfx1201 and a bounded nonzero queue".into());
+        if gpu.arch != "gfx1201" || config.max_inflight == 0 || max_rows == 0 {
+            return Err("expert cache requires gfx1201, a bounded nonzero queue and at least one window row".into());
         }
         gpu.bind_thread().map_err(|e| fail("bind", e))?;
         let rank_pos = rank_positions(rank)?;
@@ -1134,12 +1202,17 @@ impl ExpertCache {
         let fills_per_pool = config.max_inflight.div_ceil(pools).max(1);
         let events = fills_per_pool * pools;
         let slots = layout.slots();
+        let use_log = LAYERS
+            .checked_mul(TOPK)
+            .and_then(|uses| uses.checked_mul(max_rows))
+            .ok_or("expert cache route-use extent overflows")?;
         let policy_config = PolicyConfig {
-            // One window per AR token: every window closes its own group.
+            // One window per AR token or verify/repair window: every window closes its own
+            // group. The log holds every distinct use of the widest window.
             retire_ids: 1,
             max_windows: 1,
             fill_group_cap: 1,
-            use_log: LAYERS * TOPK,
+            use_log,
             // A warm seed's completions are all buffered before the one plan that stages them.
             completions: slots + events,
             parked: slots,
@@ -1158,6 +1231,7 @@ impl ExpertCache {
         let mut cache = Self {
             hip,
             device_id: gpu.device_id,
+            max_rows,
             lease: Some(lease),
             layers,
             layout,
@@ -1252,9 +1326,13 @@ impl ExpertCache {
         self.stats.skipped_full += retired.skipped_full;
     }
 
-    pub(crate) fn begin_token(&mut self, gpu: &mut Gpu) -> Result<ExpertCacheToken> {
+    pub(crate) fn begin_token(
+        &mut self,
+        gpu: &mut Gpu,
+        phase: WindowConsumerPhase,
+    ) -> Result<ExpertCacheToken> {
         let started = Instant::now();
-        let result = self.begin_token_inner(gpu);
+        let result = self.begin_token_inner(gpu, phase);
         self.stats.begin_token_wall_ns = self
             .stats
             .begin_token_wall_ns
@@ -1262,7 +1340,11 @@ impl ExpertCache {
         result
     }
 
-    fn begin_token_inner(&mut self, gpu: &mut Gpu) -> Result<ExpertCacheToken> {
+    fn begin_token_inner(
+        &mut self,
+        gpu: &mut Gpu,
+        phase: WindowConsumerPhase,
+    ) -> Result<ExpertCacheToken> {
         self.check(gpu)?;
         let gpu: &Gpu = gpu;
         let result = self.with_engine(|this, engine| {
@@ -1284,11 +1366,10 @@ impl ExpertCache {
                     }
                 }
             }
-            let opened = engine.policy.begin_window().and_then(|_| {
-                engine
-                    .policy
-                    .register_consumer(0, WindowConsumerPhase::Decode, 0)
-            });
+            let opened = engine
+                .policy
+                .begin_window()
+                .and_then(|_| engine.policy.register_consumer(0, phase, 0));
             let consumer = match opened {
                 Ok(consumer) => consumer,
                 Err(cause) => {
@@ -1364,21 +1445,21 @@ impl ExpertCache {
     }
 
     /// # Safety
-    /// Every independent PM4 reader is proven retired; IDs are this token's complete readback,
-    /// which the caller waited for.
+    /// Every independent PM4 reader is proven retired; IDs are this window's complete readback
+    /// (`rows` rows, `[layer][row][k]`), which the caller waited for.
     pub(crate) unsafe fn finish_token(
         &mut self,
         gpu: &mut Gpu,
         token: ExpertCacheToken,
         ids: &[i32],
+        rows: usize,
     ) -> Result<()> {
         let started = Instant::now();
         let snapshots: Vec<_> = token.guards.iter().map(|g| g.snapshot().clone()).collect();
         // SAFETY: forwarded from this function's caller.
         let retired = unsafe { self.retire_token(gpu, token, true) };
         let result = retired.and_then(|()| {
-            if ids.len() != LAYERS * TOPK || ids.iter().any(|id| !(0..EXPERTS as i32).contains(id))
-            {
+            if validate_window_ids(ids, rows, self.max_rows).is_err() {
                 // The consumer joined: the window is idle again once cancelled as retired.
                 if let Some(engine) = self.engine.as_mut() {
                     let _ = engine.policy.cancel_window(CancelOutcome::Retired);
@@ -1386,7 +1467,7 @@ impl ExpertCache {
                 return Err("expert cache invalid route readback".into());
             }
             let gpu: &Gpu = gpu;
-            self.with_engine(|this, engine| this.observe(gpu, engine, ids, &snapshots))
+            self.with_engine(|this, engine| this.observe(gpu, engine, ids, rows, &snapshots))
         });
         self.stats.finish_token_wall_ns = self
             .stats
@@ -1408,9 +1489,10 @@ impl ExpertCache {
         gpu: &Gpu,
         engine: &mut Engine<QwenCopy>,
         ids: &[i32],
+        rows: usize,
         snapshots: &[ResidencySnapshot],
     ) -> Result<()> {
-        let result = self.observe_inner(gpu, engine, ids, snapshots);
+        let result = self.observe_inner(gpu, engine, ids, rows, snapshots);
         if result.is_err() {
             // The consumer joined; a still-open window is idle again once cancelled as retired.
             let _ = engine.policy.cancel_window(CancelOutcome::Retired);
@@ -1423,35 +1505,32 @@ impl ExpertCache {
         gpu: &Gpu,
         engine: &mut Engine<QwenCopy>,
         ids: &[i32],
+        rows: usize,
         snapshots: &[ResidencySnapshot],
     ) -> Result<()> {
         self.stats.tokens = self.stats.tokens.saturating_add(1);
-        let mut core = 0u64;
-        for layer in 0..LAYERS {
-            let selected = &ids[layer * TOPK..(layer + 1) * TOPK];
-            let account = account_route(&self.layout, layer, selected, &snapshots[layer].mapping)?;
-            self.stats.selected = self.stats.selected.saturating_add(account.selected);
-            self.stats.core_hits = self.stats.core_hits.saturating_add(account.core_hits);
-            self.stats.cache_hits = self.stats.cache_hits.saturating_add(account.cache_hits);
-            self.stats.host_misses = self.stats.host_misses.saturating_add(account.host_misses);
-            self.stats.miss_bytes = self.stats.miss_bytes.saturating_add(account.miss_bytes);
-            core += account.core_hits;
-            for &id in selected {
-                let expert = id as usize;
-                if let Read::Cache { pool, rank, .. } = self.layout.reads[layer * EXPERTS + expert]
-                {
-                    engine
-                        .policy
-                        .record_use(WindowUse {
-                            key: self.layout.key(layer, expert),
-                            pool,
-                            reads: 1,
-                            rank,
-                        })
-                        .map_err(|e| fail("route use", e))?;
-                }
-            }
+        self.stats.rows = self.stats.rows.saturating_add(rows as u64);
+        if rows > 1 {
+            self.stats.verify_windows = self.stats.verify_windows.saturating_add(1);
         }
+        let account = observe_window_routes(
+            &self.layout,
+            ids,
+            rows,
+            |layer| &snapshots[layer].mapping[..],
+            |used| {
+                engine
+                    .policy
+                    .record_use(used)
+                    .map_err(|e| fail("route use", e))
+            },
+        )?;
+        self.stats.selected = self.stats.selected.saturating_add(account.selected);
+        self.stats.core_hits = self.stats.core_hits.saturating_add(account.core_hits);
+        self.stats.cache_hits = self.stats.cache_hits.saturating_add(account.cache_hits);
+        self.stats.host_misses = self.stats.host_misses.saturating_add(account.host_misses);
+        self.stats.miss_bytes = self.stats.miss_bytes.saturating_add(account.miss_bytes);
+        let core = account.core_hits;
         let windows = engine
             .policy
             .end_window(ids.len() as u64)
@@ -2115,6 +2194,123 @@ mod tests {
         assert!(account_route(&layout, 0, &[7, 7], &mapping).is_err());
         assert!(account_route(&layout, 0, &[-1], &mapping).is_err());
         assert!(account_route(&layout, 0, &[EXPERTS as i32], &mapping).is_err());
+    }
+
+    #[test]
+    fn window_ids_must_be_exactly_rows_by_layers_by_topk_in_range() {
+        let ok = vec![0i32; LAYERS * TOPK * 3];
+        assert!(validate_window_ids(&ok, 3, 64).is_ok());
+        assert!(validate_window_ids(&ok[..LAYERS * TOPK], 1, 64).is_ok());
+        // A wrong length for the claimed rows, zero rows and too many rows refuse.
+        assert!(validate_window_ids(&ok, 2, 64).is_err());
+        assert!(validate_window_ids(&ok, 4, 64).is_err());
+        assert!(validate_window_ids(&ok[..LAYERS * TOPK], 0, 64).is_err());
+        assert!(validate_window_ids(&ok, 3, 2).is_err());
+        assert!(validate_window_ids(&ok, usize::MAX, usize::MAX).is_err());
+        // Every id must be a valid expert.
+        let mut bad = ok.clone();
+        bad[7] = -1;
+        assert!(validate_window_ids(&bad, 3, 64).is_err());
+        bad[7] = EXPERTS as i32;
+        assert!(validate_window_ids(&bad, 3, 64).is_err());
+    }
+
+    /// Every expert below 64 of every layer is a cacheable read ranked by its id.
+    fn cacheable_layout() -> Layout {
+        let mut layout = layout_of(&cached_plan(5));
+        for layer in 0..LAYERS {
+            for expert in 0..64 {
+                layout.reads[layer * EXPERTS + expert] = Read::Cache {
+                    pool: PoolId(0),
+                    rank: expert as u32,
+                    bytes: 5,
+                };
+            }
+        }
+        layout
+    }
+
+    /// `[layer][row][k]` ids: row `r` of every layer selects experts `r * 10 .. r * 10 + 10`.
+    fn window_ids(rows: usize) -> Vec<i32> {
+        let mut ids = Vec::with_capacity(LAYERS * rows * TOPK);
+        for _layer in 0..LAYERS {
+            for row in 0..rows {
+                ids.extend((0..TOPK).map(|j| (row * TOPK + j) as i32));
+            }
+        }
+        ids
+    }
+
+    fn observed(
+        layout: &Layout,
+        ids: &[i32],
+        rows: usize,
+    ) -> Result<(Vec<(u32, u32)>, RouteAccount)> {
+        let mapping = vec![ResidencyLocation::Canonical; EXPERTS];
+        let mut order = Vec::new();
+        let account = observe_window_routes(
+            layout,
+            ids,
+            rows,
+            |_| &mapping[..],
+            |used| {
+                order.push((used.key.group_id, used.key.expert_id));
+                Ok(())
+            },
+        )?;
+        Ok((order, account))
+    }
+
+    #[test]
+    fn a_one_row_window_observes_layer_major_as_before() {
+        let layout = cacheable_layout();
+        let (order, account) = observed(&layout, &window_ids(1), 1).unwrap();
+        let expected: Vec<_> = (0..LAYERS as u32)
+            .flat_map(|layer| (0..TOPK as u32).map(move |j| (layer, j)))
+            .collect();
+        assert_eq!(order, expected);
+        assert_eq!(account.selected, (LAYERS * TOPK) as u64);
+    }
+
+    #[test]
+    fn a_multi_row_window_observes_layer_then_row_then_rank() {
+        let layout = cacheable_layout();
+        let rows = 3;
+        let (order, account) = observed(&layout, &window_ids(rows), rows).unwrap();
+        let expected: Vec<_> = (0..LAYERS as u32)
+            .flat_map(|layer| {
+                (0..rows as u32).flat_map(move |row| {
+                    (0..TOPK as u32).map(move |j| (layer, row * TOPK as u32 + j))
+                })
+            })
+            .collect();
+        assert_eq!(order, expected);
+        assert_eq!(account.selected, (LAYERS * rows * TOPK) as u64);
+    }
+
+    #[test]
+    fn one_expert_in_two_rows_is_accepted_but_a_duplicate_inside_a_row_is_refused() {
+        let layout = cacheable_layout();
+        let rows = 3;
+        // Rows 0 and 1 select the same experts in every layer.
+        let mut ids = window_ids(rows);
+        for layer in 0..LAYERS {
+            let row0 = (layer * rows) * TOPK;
+            let row1 = (layer * rows + 1) * TOPK;
+            for j in 0..TOPK {
+                ids[row1 + j] = ids[row0 + j];
+            }
+        }
+        let (order, account) = observed(&layout, &ids, rows).unwrap();
+        assert_eq!(account.selected, (LAYERS * rows * TOPK) as u64);
+        assert_eq!(order.len(), LAYERS * rows * TOPK);
+        // A duplicate inside row 1 of layer 5 refuses.
+        let mut dup = window_ids(rows);
+        let row1 = (5 * rows + 1) * TOPK;
+        dup[row1 + 3] = dup[row1];
+        assert!(observed(&layout, &dup, rows).is_err());
+        // A readback shorter than rows x layers x topk refuses.
+        assert!(observed(&layout, &window_ids(2), rows).is_err());
     }
 
     #[test]

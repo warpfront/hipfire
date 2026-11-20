@@ -2472,7 +2472,14 @@ fn qwen4_plan_hotset_placement_with_cache(
     // Cache admission pins Flash-Next's top-10 router. This includes all extra
     // device pointer tables, the retained 48x10 ids and queue headroom.
     let cache_reserve = cache
-        .map(|cache| cache.device_reserve_bytes(table_geometry.0, table_geometry.1, 10))
+        .map(|cache| {
+            cache.device_reserve_bytes(
+                table_geometry.0,
+                table_geometry.1,
+                10,
+                hipfire_config::QWEN4_VERIFY_MAX_ROWS,
+            )
+        })
         .transpose()?
         .unwrap_or(0);
     let mut stage = 0u64;
@@ -5847,6 +5854,7 @@ pub fn qwen4_preload_resource_plan(
                                 + expert_cache.map(|cache| cache.device_reserve_bytes(
                                     config.num_hidden_layers, config.num_experts,
                                     config.num_experts_per_tok,
+                                    hipfire_config::QWEN4_VERIFY_MAX_ROWS,
                                 )).transpose()?.unwrap_or(0);
                                 bytes
                                     .checked_sub(stage)
@@ -6111,6 +6119,7 @@ pub fn qwen4_preload_resource_plan(
                         config.num_hidden_layers,
                         config.num_experts,
                         config.num_experts_per_tok,
+                        hipfire_config::QWEN4_VERIFY_MAX_ROWS,
                     )
                 })
                 .transpose()?
@@ -6330,6 +6339,7 @@ pub fn qwen4_preload_resource_plan(
             "max_inflight": cache.max_inflight,
             "device_tables_routes_queue_reserve_bytes": cache.device_reserve_bytes(
                 config.num_hidden_layers, config.num_experts, config.num_experts_per_tok,
+                hipfire_config::QWEN4_VERIFY_MAX_ROWS,
             )?,
             "host_metadata_reserve_bytes": cache.host_reserve_bytes(),
             "note": "donor mirror and guard are already included in tier owners; queue margins are source reserves, not measured peaks",
@@ -8328,6 +8338,7 @@ fn load_qwen4_rank_unscoped(
                             config.num_hidden_layers,
                             config.num_experts,
                             config.num_experts_per_tok,
+                            hipfire_config::QWEN4_VERIFY_MAX_ROWS,
                         )
                     })
                     .transpose()?
@@ -8392,7 +8403,12 @@ fn load_qwen4_rank_unscoped(
             if let Some(cache) = expert_cache {
                 eprintln!(
                     "  qwen4 exact expert cache reserve: {} bytes device tables/routes/queue margin, {} MiB host metadata margin; donor mirror is included in the tier host owner",
-                    cache.device_reserve_bytes(config.num_hidden_layers, config.num_experts, config.num_experts_per_tok)?,
+                    cache.device_reserve_bytes(
+                        config.num_hidden_layers,
+                        config.num_experts,
+                        config.num_experts_per_tok,
+                        hipfire_config::QWEN4_VERIFY_MAX_ROWS,
+                    )?,
                     cache.host_reserve_bytes() / MIB,
                 );
             }
@@ -15124,7 +15140,7 @@ mod qwen4_admission_tests {
         assert!(cached.owner_bytes(Placement::Device) > plain.owner_bytes(Placement::Device));
         // The frozen resident prefill uses the same original donor experts.
         assert_eq!(cache_stage, plain_stage);
-        assert!(cache.device_reserve_bytes(48, 512, 10).unwrap() > 32 << 20);
+        assert!(cache.device_reserve_bytes(48, 512, 10, 64).unwrap() > 32 << 20);
         // The plain fixed pin fits exactly; the same quote must refuse the
         // extra cache owners instead of shrinking the requested ranked prefix.
         let tight =
