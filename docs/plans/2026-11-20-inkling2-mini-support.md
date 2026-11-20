@@ -6,9 +6,10 @@ building. Prior research notes were treated as leads and spot-checked against
 this checkout; where I could not verify, I say so.
 
 Promoted 2026-11-20 from the gitignored `docs/plans/local/` scratch copy to the
-tracked `docs/plans/` path for upstream review on `feat/inkling2-mini-support`
-(base `origin/beta` `9e410448e`). Live verification results and resolved
-decisions are recorded in §8; the rest is the original plan unless marked.
+tracked `docs/plans/` path on `feat/inkling2-mini-support` (base `origin/beta`
+`9e410448e`). No PR is opened; that is a later step. Live verification results
+and resolved decisions are recorded in §8; the rest is the original plan unless
+marked.
 
 ## 0a. Reference implementation (merged — verified 2026-11-20)
 
@@ -370,7 +371,8 @@ fuse only in Phase 4 behind the KLD pin.
 3. **Scope caps**: text-only AR at `max_seq` 32768 as the Phase-1 ceiling;
    vision, MTP and 1M context stay deferred. Accepted.
 4. **Destination**: this plan is developed on `feat/inkling2-mini-support` off
-   `origin/beta` and is intended to land in an upstream PR to `beta`.
+   `origin/beta`. Keep it as local commits — **do not open a PR** until asked;
+   an upstream PR to `beta` is a possible later step, not the current one.
 
 ## 7. Effort (honest, calendar time for one engineer with hardware access)
 
@@ -446,3 +448,13 @@ exist); do not use `/tmp`.
 
 Environment notes: downloads go to `D:\hipfire-models`; `hf` is authenticated;
 `codegraph` is absent in this worktree, so exploration uses grep/read.
+
+CI note (2026-11-20): `scripts/pre-commit-ci.sh origin/beta` passes the checks
+relevant to a Rust-free change (`check-attribution --require`, `ratchet-diff`,
+`ci-rustfmt-changed.sh`, `check-pins`). The three failing checks (`ci-gates.sh`,
+`cargo-fmt --all -- --check`, workspace clippy) fail **identically on a clean
+`origin/beta` worktree** on this Windows host: Python's cp1252 default breaks
+`check-changelog.py`, `os.killpg` and MSVC `cl` are missing, 29 POSIX externs
+and the `hipfire-xdna`/`redline` Unix crates do not build, and the deep
+worktree path trips rustfmt's Win32 path limit. None is caused by this doc;
+re-run the gate on the Linux CI host before the PR lands.
