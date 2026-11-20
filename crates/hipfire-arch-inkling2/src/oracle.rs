@@ -140,6 +140,34 @@ pub fn convolve_static(
     (conv, new_past)
 }
 
+/// Relative-position logits for one query token, mirroring `inkling2.cpp`:
+/// R is projected to `n_rel` per head, multiplied by the `[n_rel, n_extent]`
+/// bias table, the per-head sink logit is subtracted, and the result is
+/// gathered by distance. Returns `[n_heads, n_kv]`.
+pub fn relative_bias(
+    rel: &[f32],
+    table: &[f32],
+    sink: &[f32],
+    distances: &[usize],
+    n_rel: usize,
+    n_heads: usize,
+    n_extent: usize,
+) -> Vec<f32> {
+    let n_kv = distances.len();
+    let mut out = vec![0.0f32; n_heads * n_kv];
+    for h in 0..n_heads {
+        for (k, &d) in distances.iter().enumerate() {
+            assert!(d < n_extent, "relative distance {d} out of range");
+            let mut v = 0.0f32;
+            for r in 0..n_rel {
+                v += table[r * n_extent + d] * rel[r * n_heads + h];
+            }
+            out[h * n_kv + k] = v - sink[h];
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +276,14 @@ mod tests {
             out[0]
         );
         assert!(past.is_empty());
+    }
+
+    #[test]
+    fn relative_bias_subtracts_sink_before_gather() {
+        // table rows [1,2,3,4] and [5,6,7,8]; R = [2,3]; sink = 1.
+        let table = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let out = relative_bias(&[2.0, 3.0], &table, &[1.0], &[0, 2], 2, 1, 4);
+        // d=0: 1*2 + 5*3 - 1 = 16; d=2: 3*2 + 7*3 - 1 = 26.
+        assert_eq!(out, vec![16.0, 26.0]);
     }
 }
