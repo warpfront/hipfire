@@ -1160,20 +1160,31 @@ Collapse `\n{3,}` → `\n\n` at engine entry. Legacy alias:
 | `serve.swap_dir` | `""` | Path or empty. Multi-slot route: swap spill directory; empty uses `$XDG_RUNTIME_DIR/hipfire/swap/<pid>`, falling back to `$TMPDIR/hipfire-swap-<pid>`. Created `0700`, must be owned by this user, is locked to one daemon, and may not be a symlink; an existing owned directory has group/other access removed. Stale `*.snap`/`*.snap.tmp` files are removed at start; other files are left untouched. |
 | `serve.multi_slot_session_ttl_secs` | `3600` | int 0–86400. Multi-slot route: close a parked (swapped or cold) session after this many seconds idle; `0` disables the idle sweep (the hard cap still applies). The engine wakes at most every 30 s while idle when this is non-zero. |
 | `serve.multi_slot_max_sessions` | `0` | int 0–4096. Multi-slot route: hard cap on session-table entries; `0` = auto `max(64, 16 × serve.multi_slot_slots)`. Only parked sessions are closed to enforce it. |
-| `serve.paged_idle_reclaim_ms` | `30000` | int 0–3600000 (ms). Multi-slot paged route: stay idle this long before the idle reclaim parks resident sessions `Cold` and drains unpinned prefix-cache state; `0` keeps the immediate reclaim. A command in the window resets the timer; real page/slot pressure evicts idle sessions first. No effect on the fixed-slab route. |
+| `serve.paged_idle_reclaim_ms` | `0` | int 0–3600000 (ms). Multi-slot paged route: stay idle this long before the idle reclaim parks resident sessions `Cold` and drains unpinned prefix-cache state; `0` (default) keeps the immediate reclaim. A command in the window resets the timer; real page/slot pressure evicts idle sessions first. No effect on the fixed-slab route. Opt-in: in-place extension is session-exact, not cold-exact (see below). |
 
 Multi-slot parked sessions are swept after `serve.multi_slot_session_ttl_secs`
 idle and capped at `serve.multi_slot_max_sessions` non-resident entries
 (oldest first). Closing one only forces a cold re-prefill on its next turn;
 resident sessions are never swept.
 
-Paged idle reclaim is delayed by `serve.paged_idle_reclaim_ms` (default 30 s;
-`0` = immediate), so consecutive agent turns keep their KV resident instead
-of re-prefilling after every tool call. The engine wakes at the earlier of
+Paged idle reclaim can be delayed by `serve.paged_idle_reclaim_ms` (default `0`
+= immediate), so consecutive agent turns keep their KV resident instead
+of re-prefilling after every tool call. It is opt-in: a turn inside the
+window extends the resident session in place, so it continues from
+decode-written (session-exact) KV and DeltaNet state rather than a cold
+re-prefill of the same tokens. That is the slab route's behaviour too, but it
+changes agent output: on `benchmarks/sessions/tool_chain_agent.json`
+(ornith-1.5-35b-a3b.mq4, gfx1100) the cold re-prefill starts the first
+tool-result turn with `Let` (p 0.98) while the in-place turn starts with
+`<invoke` (p 0.97) and stops calling tools. No kernel fault was found: the
+paged WMMA prefill matches a CPU f64 oracle at unaligned starts, and the
+decode MoE route matches the batched MoE to ~4e-4 per call; the difference is
+decode-versus-prefill numerics accumulated in the Q8 DeltaNet state. The
+default therefore keeps the immediate reclaim and its cold re-prefill. The engine wakes at the earlier of
 that deadline and the TTL sweep, and a command arriving in the window
 restarts it. Pressure does not wait for the deadline: slot and page admission
-evict LRU idle sessions, and a step-time page or granule-map shortfall parks
-them before the request is refused.
+evict LRU idle sessions, and a step-time page shortfall parks them before
+the request is refused.
 
 Serve HTTP surface: [`SERVE.md`](SERVE.md). The corresponding `HIPFIRE_MODEL`,
 `HIPFIRE_IDLE_TIMEOUT`, `HIPFIRE_MAX_REQUEST_BYTES`,
