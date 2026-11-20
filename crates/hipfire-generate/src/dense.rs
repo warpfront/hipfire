@@ -2489,6 +2489,14 @@ pub fn generate_gemma4(
         if generated_count >= max_tokens {
             break;
         }
+        // Poll before each sample: otherwise an abort is only seen at the
+        // commit handshake after the whole budget has decoded (HIPF-475).
+        // Same teardown as an abort at the handshake: no session commit.
+        if check_abort(id) {
+            m.seq_pos = bundle.state.n_tokens;
+            emit_aborted_terminal_after_abort(stdout, id, generated_count);
+            return;
+        }
         sample_logits.clear();
         sample_logits.extend_from_slice(&last_logits);
         let next_tok = hipfire_runtime::sampler::sample_cpu(
