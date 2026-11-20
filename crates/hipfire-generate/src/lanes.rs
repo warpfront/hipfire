@@ -1011,8 +1011,8 @@ pub fn drive_lane_continuous_batch(
                     sched.lane_capacity,
                     lane_ref.max_active_lanes.max(1),
                 );
-                let mut envelope = pending_done.clone();
-                envelope["type"] = serde_json::json!("commit_ready");
+                let envelope =
+                    commit_ready_envelope(&pending_done).unwrap_or_else(|| pending_done.clone());
                 // Install AwaitingClient/Ready BEFORE publishing commit_ready.
                 let marked = sched.mark_awaiting_commit(lane_idx, pending_done.clone());
                 if !marked {
@@ -1332,8 +1332,8 @@ pub fn drive_lane_continuous_batch(
         }
         // Install AwaitingClient/Ready BEFORE publishing commit_ready; rollback if publish fails.
         for (idx, key, admission, pending_done) in to_await {
-            let mut envelope = pending_done.clone();
-            envelope["type"] = serde_json::json!("commit_ready");
+            let envelope =
+                commit_ready_envelope(&pending_done).unwrap_or_else(|| pending_done.clone());
             let marked = sched.mark_awaiting_commit(idx, pending_done.clone());
             if !marked {
                 eprintln!(

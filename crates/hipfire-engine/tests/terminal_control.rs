@@ -198,10 +198,13 @@ fn matching_ready_commit_succeeds() {
     assert_eq!(v["attempt_id"], 8);
     assert_eq!(v["finish_reason"], "stop");
     assert_eq!(v["tokens"], 3);
-    // commit_ready is pending_done with only type changed.
+    // commit_ready is the payload the done carries, with only type changed:
+    // a loop-less staged done is a legacy loop on both.
     let mut as_done = v.clone();
     as_done["type"] = serde_json::json!("done");
-    assert_eq!(as_done, pending);
+    let mut expected = pending.clone();
+    expected["loop"] = serde_json::json!("legacy");
+    assert_eq!(as_done, expected);
     reset();
 }
 
