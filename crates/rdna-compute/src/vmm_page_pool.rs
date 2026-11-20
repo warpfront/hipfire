@@ -342,6 +342,20 @@ impl VmmPageMapper {
         self.layout
     }
 
+    /// Physical bytes a [`Self::sync`] against `states` would commit now.
+    /// Counts only used granules that are not mapped yet, in every K and V
+    /// arena. Callers free checkpoint bytes before a map that might fail:
+    /// a failed map poisons the engine. Zero on the common no-new-granule
+    /// path, so the caller can skip its device-memory query entirely.
+    pub fn pending_map_bytes(&self, states: &[PageState]) -> usize {
+        pending_map_bytes_for(
+            states,
+            &self.layout,
+            &self.mapped_granules,
+            self.k_bases.len() + self.v_bases.len(),
+        )
+    }
+
     pub fn mapped_bytes(&self) -> usize {
         self.mapped_bytes
     }
@@ -643,6 +657,35 @@ impl Drop for VmmPageMapper {
 /// cannot drift.
 pub const VMM_PAGE_TOKENS: usize = PAGE_TOKENS;
 
+/// Byte cost of the granules `sync` would map for `states` but has not
+/// mapped yet. A granule holding several live pages is counted once; a
+/// granule whose pages are all `Free` is never counted, even when it has
+/// never been mapped (the caller's page pool only offers live pages).
+fn pending_map_bytes_for(
+    states: &[PageState],
+    layout: &VmmPageLayout,
+    mapped: &[bool],
+    arena_count: usize,
+) -> usize {
+    let per_granule = layout.granule_bytes.saturating_mul(arena_count);
+    let pages_per_granule = layout.pages_per_granule as usize;
+    let mut pending = 0usize;
+    for (granule, &is_mapped) in mapped.iter().enumerate() {
+        if is_mapped {
+            continue;
+        }
+        let start = granule.saturating_mul(pages_per_granule);
+        let end = start.saturating_add(pages_per_granule).min(states.len());
+        if states
+            .get(start..end)
+            .is_some_and(|pages| pages.iter().any(|&s| s != PageState::Free))
+        {
+            pending = pending.saturating_add(1);
+        }
+    }
+    pending.saturating_mul(per_granule)
+}
+
 /// Granules holding at least one non-`Free` page.
 fn used_granules(states: &[PageState], pages_per_granule: usize, n_granules: usize) -> Vec<bool> {
     let mut used = vec![false; n_granules];
@@ -708,6 +751,50 @@ mod tests {
                 )
             }),
         )
+    }
+
+    /// The pre-map estimate must match `sync`'s cost: one granule per used,
+    /// unmapped granule in every K/V arena, and zero when nothing new needs
+    /// mapping (the caller's no-device-query fast path).
+    #[test]
+    fn pending_map_bytes_counts_unmapped_used_granules_only() {
+        let layout = super::VmmPageLayout {
+            page_tokens: PAGE_TOKENS,
+            page_bytes: 1 << 20,
+            granule_bytes: 4 << 20,
+            pages_per_granule: 4,
+            n_pages: 8,
+            n_granules: 2,
+        };
+        let cost = 3 * (4 << 20); // one K and two V arenas
+        let mut states = vec![PageState::Free; 8];
+        assert_eq!(
+            super::pending_map_bytes_for(&states, &layout, &[false, false], 3),
+            0,
+            "no live pages: nothing to map"
+        );
+        states[0] = PageState::CacheOnly;
+        states[3] = PageState::Sealed;
+        assert_eq!(
+            super::pending_map_bytes_for(&states, &layout, &[false, false], 3),
+            cost,
+            "two live pages in one granule count once"
+        );
+        assert_eq!(
+            super::pending_map_bytes_for(&states, &layout, &[true, false], 3),
+            0,
+            "already-mapped granules cost nothing"
+        );
+        states[7] = PageState::Private;
+        assert_eq!(
+            super::pending_map_bytes_for(&states, &layout, &[true, false], 3),
+            cost,
+            "a newly used granule counts even when others are mapped"
+        );
+        assert_eq!(
+            super::pending_map_bytes_for(&states, &layout, &[true, true], 3),
+            0
+        );
     }
 
     /// Two slots growing in lockstep through every page edge (127/128/129
