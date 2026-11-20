@@ -1695,7 +1695,7 @@ pub(crate) fn lloyd_mmq_a4_route(gpu: &Gpu, n: usize, k: usize) -> bool {
 
 /// qt=52 (MQ4G256V2Lloyd) prefill: extract the per-tensor centered f16
 /// codebook LUT or fail closed naming the prefill family. Sibling of
-/// [`lloyd_e4m3_or_fail`]; consumed by the gfx1100 F16-BT-LUT launchers.
+/// [`lloyd_e4m3_or_fail`]; consumed by the gfx1100/gfx1151 F16-BT-LUT launchers.
 #[inline]
 pub(crate) fn lloyd_f16_or_fail(w: &WeightRef<'_>, family: &'static str) -> HipResult<[u32; 8]> {
     w.lloyd_lut_f16.ok_or_else(|| {
