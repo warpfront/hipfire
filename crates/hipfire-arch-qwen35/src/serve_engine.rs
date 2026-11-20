@@ -4383,32 +4383,63 @@ fn inject_publish_fault() -> bool {
 /// mapping new ones. A used VA keeps its physical binding until teardown
 /// ([`VmmPageMapper::sync`]), so nothing is unmapped.
 ///
+/// Only currently `Resident` sessions (`slot.is_some()`) are transitioned:
+/// `Cold` sessions already hold no GPU state and must not be recounted on
+/// subsequent idle passes, and `Swapped` sessions hold only host/disk
+/// snapshots (zero GPU pages) whose swap entries and `parked_streams` must
+/// remain intact.
+///
 /// These ids are deliberately NOT reported through `closed_sessions`: the
 /// session still exists and stays addressable. Only the TTL/cap sweep
 /// ([`sweep_sessions`]) closes parked entries, and that is the point where a
 /// pending tool turn becomes stale.
-fn release_idle_sessions(rig: &mut Rig) -> usize {
-    let ids: Vec<u64> = rig.sessions.iter().map(|(id, _)| id).collect();
-    if ids.is_empty() {
-        return 0;
-    }
+fn release_idle_sessions_in(
+    sessions: &mut SessionTable,
+    pool: &mut SlotPool,
+    adm: &mut AdmissionController,
+    swap: &mut SwapManager,
+    fair_queue: &mut FairQueue,
+    parked_streams: &mut std::collections::HashMap<u64, crate::qwen35::weights::GdnStreamImage>,
+    n_slots: usize,
+) -> usize {
+    let ids: Vec<u64> = sessions
+        .iter()
+        .filter(|(_, s)| s.slot.is_some())
+        .map(|(id, _)| id)
+        .collect();
     for &id in &ids {
-        rig.sessions
-            .mark_cold(&mut rig.pool, &mut rig.adm, SessionId(id));
-        rig.swap.forget(id);
-        let _ = rig.fair_queue.remove(id);
+        sessions.mark_cold(pool, adm, SessionId(id));
+        swap.forget(id);
+        let _ = fair_queue.remove(id);
+        parked_streams.remove(&id);
     }
     // A session that lost its slot without `pool.release` would leave the
     // block table, and one live page pins the whole VMM granule.
-    for s in 0..rig.n_slots {
-        if rig.pool.block_table(SlotId(s)).is_some() {
-            rig.pool.release(SlotId(s));
+    let mut released_orphan = false;
+    for s in 0..n_slots {
+        if pool.block_table(SlotId(s)).is_some() {
+            pool.release(SlotId(s));
+            released_orphan = true;
         }
     }
-    if let Some(pp) = rig.pool.page_pool_mut() {
-        pp.drain_completed();
+    if !ids.is_empty() || released_orphan {
+        if let Some(pp) = pool.page_pool_mut() {
+            pp.drain_completed();
+        }
     }
     ids.len()
+}
+
+fn release_idle_sessions(rig: &mut Rig) -> usize {
+    release_idle_sessions_in(
+        &mut rig.sessions,
+        &mut rig.pool,
+        &mut rig.adm,
+        &mut rig.swap,
+        &mut rig.fair_queue,
+        &mut rig.parked_streams,
+        rig.n_slots,
+    )
 }
 
 /// Drop unpinned prefix-cache pages and DeltaNet snapshots.
@@ -10125,6 +10156,178 @@ mod tests {
             "cold re-entry reuses the same row"
         );
         assert_eq!(sessions.active(), 1, "no new session was minted");
+    }
+
+    fn test_swap_snapshot() -> hipfire_runtime::swap::snapshot::SlotSnapshot {
+        let payload = vec![0x5Au8; 64];
+        let checksum = hipfire_runtime::swap::snapshot::checksum_of(&payload);
+        hipfire_runtime::swap::snapshot::SlotSnapshot {
+            stamp: SnapshotStamp {
+                model_hash: 1,
+                instance_id: 1,
+                kv_dtype_tag: 1,
+                per_pos_bytes: 4,
+                per_pos_v_bytes: 4,
+                n_fa_layers: 1,
+                dn_layout_version: 1,
+                cap: 64,
+                dn_bytes: 56,
+            },
+            seq_len: 1,
+            tokens: vec![1],
+            payload,
+            checksum,
+        }
+    }
+
+    fn test_stream_image() -> crate::qwen35::weights::GdnStreamImage {
+        crate::qwen35::weights::GdnStreamImage {
+            identity: crate::qwen35::weights::GdnStreamIdentity {
+                schema_version: 1,
+                recipe_id: 42,
+                geometry: None,
+                lanes: 1,
+                layers: 0,
+            },
+            meta: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn release_idle_sessions_skips_cold_sessions_and_only_counts_resident() {
+        let n_slots = 4;
+        let mut pool = SlotPool::new(n_slots, 4096, 1088).unwrap();
+        let mut adm = AdmissionController::new(
+            ModelFootprint {
+                weights_bytes: 0,
+                kv_bytes_per_token: 1024,
+                pinned_host_bytes: 0,
+            },
+            32 * 1024 * 1024 * 1024,
+        );
+        let mut sessions = SessionTable::default();
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-release-idle-cold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut swap = SwapManager::new(dir.clone(), 64 * 1024, 0).unwrap();
+        let mut fair_queue = FairQueue::new(1024, n_slots as u64, 64).unwrap();
+        let mut parked_streams = std::collections::HashMap::new();
+
+        let cold1 = sessions.open(&mut pool, &mut adm, 1024).unwrap();
+        let cold2 = sessions.open(&mut pool, &mut adm, 1024).unwrap();
+        let res = sessions.open(&mut pool, &mut adm, 1024).unwrap();
+        sessions.mark_cold(&mut pool, &mut adm, cold1);
+        sessions.mark_cold(&mut pool, &mut adm, cold2);
+
+        // 1 Resident + 2 Cold -> only the 1 Resident session is reclaimed.
+        let released = release_idle_sessions_in(
+            &mut sessions,
+            &mut pool,
+            &mut adm,
+            &mut swap,
+            &mut fair_queue,
+            &mut parked_streams,
+            n_slots,
+        );
+        assert_eq!(released, 1, "only resident sessions must be counted");
+        assert_eq!(sessions.get(res).unwrap().residency, Residency::Cold);
+        assert!(sessions.get(res).unwrap().slot.is_none());
+        assert_eq!(sessions.get(cold1).unwrap().residency, Residency::Cold);
+        assert_eq!(sessions.get(cold2).unwrap().residency, Residency::Cold);
+        assert_eq!(sessions.active(), 3);
+
+        // Second idle pass with only Cold sessions -> returns 0, no recounting.
+        let released_again = release_idle_sessions_in(
+            &mut sessions,
+            &mut pool,
+            &mut adm,
+            &mut swap,
+            &mut fair_queue,
+            &mut parked_streams,
+            n_slots,
+        );
+        assert_eq!(released_again, 0, "cold sessions must not be recounted");
+
+        drop(swap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn release_idle_sessions_preserves_swapped_sessions_and_parked_streams() {
+        let n_slots = 4;
+        let mut pool = SlotPool::new(n_slots, 4096, 1088).unwrap();
+        let mut adm = AdmissionController::new(
+            ModelFootprint {
+                weights_bytes: 0,
+                kv_bytes_per_token: 1024,
+                pinned_host_bytes: 0,
+            },
+            32 * 1024 * 1024 * 1024,
+        );
+        let mut sessions = SessionTable::default();
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-release-idle-swapped-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut swap = SwapManager::new(dir.clone(), 64 * 1024, 0).unwrap();
+        let mut fair_queue = FairQueue::new(1024, n_slots as u64, 64).unwrap();
+        let mut parked_streams = std::collections::HashMap::new();
+
+        let swapped = sessions.open(&mut pool, &mut adm, 1024).unwrap();
+        let res = sessions.open(&mut pool, &mut adm, 1024).unwrap();
+
+        swap.park(swapped.0, test_swap_snapshot()).unwrap();
+        parked_streams.insert(swapped.0, test_stream_image());
+        sessions.mark_swapped(&mut pool, &mut adm, swapped);
+        // Also plant a stale stream image on the resident session to confirm
+        // resident cleanup removes it without touching the swapped session.
+        parked_streams.insert(res.0, test_stream_image());
+
+        let released = release_idle_sessions_in(
+            &mut sessions,
+            &mut pool,
+            &mut adm,
+            &mut swap,
+            &mut fair_queue,
+            &mut parked_streams,
+            n_slots,
+        );
+        assert_eq!(released, 1, "only the resident session should be reclaimed");
+        assert_eq!(sessions.get(res).unwrap().residency, Residency::Cold);
+        assert!(!parked_streams.contains_key(&res.0));
+
+        // Swapped session survives completely intact.
+        let s = sessions.get(swapped).unwrap();
+        assert_eq!(s.residency, Residency::Swapped);
+        assert!(s.slot.is_none());
+        assert_eq!(
+            swap.store().tier_of(swapped.0),
+            Some("host"),
+            "swapped snapshot must remain in the swap store"
+        );
+        assert!(
+            parked_streams.contains_key(&swapped.0),
+            "swapped session's parked GDN stream image must remain untouched"
+        );
+
+        // Subsequent idle pass with only Swapped + Cold returns 0 and preserves swap.
+        let released_again = release_idle_sessions_in(
+            &mut sessions,
+            &mut pool,
+            &mut adm,
+            &mut swap,
+            &mut fair_queue,
+            &mut parked_streams,
+            n_slots,
+        );
+        assert_eq!(released_again, 0);
+        assert_eq!(sessions.get(swapped).unwrap().residency, Residency::Swapped);
+        assert_eq!(swap.store().tier_of(swapped.0), Some("host"));
+        assert!(parked_streams.contains_key(&swapped.0));
+
+        drop(swap);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
