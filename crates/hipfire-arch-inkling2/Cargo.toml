@@ -6,3 +6,4 @@ license.workspace = true
 description = "Inkling-2-Mini looped MoE architecture: Phase-0 visit schedule and CPU oracle"
 
 [dependencies]
+serde_json.workspace = true
