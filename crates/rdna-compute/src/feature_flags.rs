@@ -822,20 +822,20 @@ pub struct FeatureFlags {
     pub qwen4_qsa_extent_sync: bool,
     /// Developer CPU-visible loaded-code snapshot; exactly `1`, default off.
     pub qwen4_qsa_code_check: bool,
-    /// `HIPFIRE_FWHT4_GQA_GFX1100`: the exact-gfx1100 fwht4 decode attention
+    /// `HIPFIRE_FWHT4_GQA_GFX1100`: the gfx1100/gfx1151 fwht4 decode attention
     /// runs the GQA-shared tile (`attention_flash_fwht4_tile_gqa_gfx11`) for
     /// Q8_0 V at H24/KV4/D256. Parsed on unless the value is exactly `0`
-    /// (kill switch); acted on for exact gfx1100 only
+    /// (kill switch); acted on for gfx1100 and gfx1151 only
     /// (`fwht4_gqa_decode_gfx1100_enabled`).
     pub fwht4_gqa_decode_gfx1100: bool,
     /// `HIPFIRE_LLOYD_MMQ_OFF`: kill switch of every MQ4G256V2-Lloyd (qt=52) gfx11
     /// prefill route (MMQ-LUT, the opt-in A4 twin and the small-N F16-BT twin);
     /// fail-closed, never uniform. Legacy bool grammar, default off.
     pub lloyd_mmq_off: bool,
-    /// `HIPFIRE_LLOYD_MMQ_A4`: opt-in exact-gfx1100 Lloyd staged-i8 (A4) MMQ twin
+    /// `HIPFIRE_LLOYD_MMQ_A4`: opt-in gfx1100/gfx1151 Lloyd staged-i8 (A4) MMQ twin
     /// prefill; exactly `1`, default off.
     pub lloyd_mmq_a4: bool,
-    /// `HIPFIRE_LLOYD_F16_GFX11`: exact-gfx1100 small-N (N<64) Lloyd F16-BT-LUT
+    /// `HIPFIRE_LLOYD_F16_GFX11`: gfx1100/gfx1151 small-N (N<64) Lloyd F16-BT-LUT
     /// prefill twins; on unless the value is exactly `0`.
     pub lloyd_f16_gfx11: bool,
 
@@ -1756,11 +1756,11 @@ impl FeatureFlags {
     }
 
     /// GQA-shared fwht4-K decode tile (`attention_flash_fwht4_tile_gqa_gfx11`,
-    /// Q8_0 V, H24/KV4/D256): default on, exact gfx1100 only (the only
-    /// architecture it was carded on); `HIPFIRE_FWHT4_GQA_GFX1100=0` restores
+    /// Q8_0 V, H24/KV4/D256): default on for gfx1100 and gfx1151 (the
+    /// architectures it was carded on); `HIPFIRE_FWHT4_GQA_GFX1100=0` restores
     /// the scalar `attention_flash_fwht4_tile`. Bit-identical partials.
     pub fn fwht4_gqa_decode_gfx1100_enabled(&self) -> bool {
-        self.fwht4_gqa_decode_gfx1100 && self.arch == "gfx1100"
+        self.fwht4_gqa_decode_gfx1100 && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
     }
 
     /// H4: Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`, 0 = off):
@@ -2821,10 +2821,10 @@ mod tests {
         assert!(!FeatureFlags::for_test("gfx1201").mq6_rows_split_enabled());
     }
 
-    /// The fwht4 GQA decode tile is default on for exact gfx1100 only; exactly
-    /// `0` is the kill switch and every other value keeps it on.
+    /// The fwht4 GQA decode tile is default on for gfx1100 and gfx1151 only;
+    /// exactly `0` is the kill switch and every other value keeps it on.
     #[test]
-    fn fwht4_gqa_decode_gfx1100_defaults_on_exact_gfx1100_and_zero_opts_out() {
+    fn fwht4_gqa_decode_gfx1100_defaults_on_gfx1100_gfx1151_and_zero_opts_out() {
         for arch in [
             "gfx906", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1201",
         ] {
@@ -2834,7 +2834,7 @@ mod tests {
                     _ => Err(()),
                 })
             };
-            let exact = arch == "gfx1100";
+            let exact = matches!(arch, "gfx1100" | "gfx1151");
             assert!(flags(None).fwht4_gqa_decode_gfx1100, "{arch}: unset");
             assert_eq!(
                 flags(None).fwht4_gqa_decode_gfx1100_enabled(),
