@@ -516,7 +516,11 @@ impl ModelRig {
         // room first. Zero pending bytes is the common path: no device query
         // and no checkpoint bookkeeping at all.
         let need = mapper.pending_map_bytes(&states) as u64;
-        if need > 0 {
+        if crate::checkpoint::should_drain_checkpoints_for_vmm_map(
+            need,
+            mapper.mapped_bytes() as u64,
+            mapper.budget_bytes() as u64,
+        ) {
             if let Some(ckpts) = self.checkpoint_pool.as_mut() {
                 free_checkpoints_for_vmm_map(gpu, ckpts, need, soft_checkpoints);
             }
@@ -4429,6 +4433,31 @@ fn refresh_prefix_soft_protection(rig: &mut Rig) {
         .set_soft_protection(pages, checkpoints);
 }
 
+/// Refresh soft checkpoint protection only when a VMM granule map is pending
+/// and both the checkpoint pool and prefix index are active. Zero cost on the
+/// common path (`pending_map_bytes == 0`).
+fn refresh_soft_if_vmm_pending(rig: &mut Rig) {
+    let need = match (rig.model.paged_vmm.as_ref(), rig.pool.page_pool()) {
+        (Some(mapper), Some(pp)) => mapper.pending_map_bytes(&pp.page_states()),
+        _ => 0,
+    };
+    if need > 0 && rig.model.checkpoint_pool.is_some() && rig.prefix_index.is_some() {
+        refresh_prefix_soft_protection(rig);
+    }
+}
+
+/// Sync the paged VMM mapper with fresh soft-checkpoint protection when a map
+/// is pending.
+fn sync_paged_vmm(rig: &mut Rig) -> rdna_compute::HipResult<()> {
+    refresh_soft_if_vmm_pending(rig);
+    let soft = rig
+        .prefix_index
+        .as_ref()
+        .map(|idx| idx.soft_checkpoints())
+        .unwrap_or(&NO_SOFT_CHECKPOINTS);
+    rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft)
+}
+
 /// Drop every parked session's KV pages without destroying the session.
 ///
 /// A finished request leaves its session resident so a continuation can
@@ -4582,6 +4611,43 @@ fn release_unpinned_device_cache(rig: &mut Rig) -> (usize, u64) {
     (pages, ckpt_bytes)
 }
 
+/// Emergency device-cache reclaim when a VMM granule map has been refused.
+///
+/// Unlike [`release_unpinned_device_cache`], this pass reclaims both
+/// unprotected AND soft-protected unpinned radix leaves and checkpoints
+/// (unprotected first, then soft-protected; hard pins survive) and drains the
+/// GPU tensor pool so freed bytes are immediately visible to HIP.
+fn release_device_cache_under_pressure(rig: &mut Rig) -> (usize, u64) {
+    refresh_prefix_soft_protection(rig);
+    let pages = if let (Some(idx), Some(pp)) = (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
+    {
+        let before = pp.free_pages();
+        idx.evict_unpinned_leaves(pp, usize::MAX);
+        pp.drain_completed();
+        pp.free_pages().saturating_sub(before)
+    } else {
+        0
+    };
+    let protected = rig
+        .prefix_index
+        .as_ref()
+        .map(|idx| idx.soft_checkpoints().clone())
+        .unwrap_or_default();
+    let blobs = rig
+        .model
+        .checkpoint_pool
+        .as_mut()
+        .map(|pool| crate::checkpoint::drain_checkpoints_under_pressure(pool, &protected))
+        .unwrap_or_default();
+    let mut ckpt_bytes = 0u64;
+    for blob in blobs {
+        ckpt_bytes += blob.bytes_len();
+        blob.free_gpu(&mut rig.gpu);
+    }
+    rig.gpu.drain_pool();
+    (pages, ckpt_bytes)
+}
+
 /// Publish generated-prefix pages at the client-commit boundary (Done event
 /// for non-cancellation reasons). Seals and publishes any full pages beyond
 /// the last prefill-boundary publish, capturing a checkpoint at the new
@@ -4601,7 +4667,6 @@ fn publish_generated_prefix(
     if !rig.prefix_cache {
         return;
     }
-    refresh_prefix_soft_protection(rig);
     let Some(f) = slots[s].as_ref() else { return };
     let session = f.session;
     let last_pub = f.last_published_boundary;
@@ -4676,6 +4741,18 @@ fn publish_generated_prefix(
     if tokens.len() != new_boundary {
         return;
     }
+    let page_bytes = rig
+        .pool
+        .page_pool()
+        .map(|p| p.k_page_bytes() + p.v_page_bytes())
+        .unwrap_or(0);
+    if rig
+        .prefix_index
+        .as_ref()
+        .is_some_and(|idx| idx.needs_reclaim_before(n_new_pages, page_bytes))
+    {
+        refresh_prefix_soft_protection(rig);
+    }
     let domain = rig.cache_domain.as_ref().unwrap();
     let idx = rig.prefix_index.as_mut().unwrap();
     let pp = rig.pool.page_pool_mut().unwrap();
@@ -4718,6 +4795,7 @@ fn publish_generated_prefix(
             sess.published_boundary = new_boundary;
             sess.prefix_boundary = sess.prefix_boundary.max(new_boundary);
         }
+        refresh_prefix_soft_protection(rig);
         if rig.gpu.slot_trace() {
             eprintln!(
                 "[slot-trace] generated-prefix published {n_new_pages} pages at boundary {new_boundary}"
@@ -5277,6 +5355,73 @@ fn idle_wait(
     (wait, due)
 }
 
+/// Clear `idle_reclaimed` after a TTL/cap sweep closed at least one parked
+/// session on a paged pool so the next idle iteration immediately reclaims
+/// the newly unprotected KV pages and checkpoints (since `idle_since` is
+/// untouched, `reclaim_due` stays true).
+fn reset_idle_reclaim_on_sweep(swept: usize, is_paged: bool, idle_reclaimed: &mut bool) {
+    if swept > 0 && is_paged && *idle_reclaimed {
+        *idle_reclaimed = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleCommandKind {
+    Submit,
+    CancelWaiting,
+    Close { session_exists: bool },
+    Reset,
+}
+
+fn note_idle_command_kind(
+    kind: IdleCommandKind,
+    is_paged: bool,
+    prefix_cache: bool,
+    idle_since: &mut Option<std::time::Instant>,
+    idle_reclaimed: &mut bool,
+) {
+    match kind {
+        IdleCommandKind::Submit => {
+            *idle_since = None;
+            *idle_reclaimed = false;
+        }
+        IdleCommandKind::CancelWaiting | IdleCommandKind::Reset => {}
+        IdleCommandKind::Close { session_exists } => {
+            if session_exists && is_paged && prefix_cache && *idle_reclaimed {
+                *idle_reclaimed = false;
+            }
+        }
+    }
+}
+
+/// Update idle grace/reclaim state before handling a command that arrived
+/// while the engine was idle. Only `Submit` resets the grace timer; closing an
+/// existing session on a paged prefix-cached rig re-arms idle reclaim so its
+/// newly unprotected pages/checkpoints can be freed without resetting
+/// `idle_since`.
+fn note_idle_command(
+    rig: &Rig,
+    cmd: &EngineCommand,
+    idle_since: &mut Option<std::time::Instant>,
+    idle_reclaimed: &mut bool,
+) {
+    let kind = match cmd {
+        EngineCommand::Submit(_) => IdleCommandKind::Submit,
+        EngineCommand::CancelWaiting { .. } => IdleCommandKind::CancelWaiting,
+        EngineCommand::Close { session, .. } => IdleCommandKind::Close {
+            session_exists: rig.sessions.get(SessionId(*session)).is_some(),
+        },
+        EngineCommand::Reset { .. } => IdleCommandKind::Reset,
+    };
+    note_idle_command_kind(
+        kind,
+        rig.pool.is_paged(),
+        rig.prefix_cache,
+        idle_since,
+        idle_reclaimed,
+    );
+}
+
 fn run_loop(
     mut rig: Rig,
     rx: Receiver<EngineCommand>,
@@ -5361,8 +5506,7 @@ fn run_loop(
                 // must run before parked KV is dropped.
                 match rx.try_recv() {
                     Ok(cmd) => {
-                        idle_since = None;
-                        idle_reclaimed = false;
+                        note_idle_command(&rig, &cmd, &mut idle_since, &mut idle_reclaimed);
                         handle_command(&mut rig, &mut slots, &mut work, &stats, cmd);
                         continue 'serve;
                     }
@@ -5420,12 +5564,7 @@ fn run_loop(
                             "[hipfire] idle cache reclaim: {sessions} sessions, {pages} kv pages, {ckpt_bytes} checkpoint bytes, held_pages={held:?}"
                         );
                     }
-                    let soft = rig
-                        .prefix_index
-                        .as_ref()
-                        .map(|idx| idx.soft_checkpoints())
-                        .unwrap_or(&NO_SOFT_CHECKPOINTS);
-                    if let Err(e) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft) {
+                    if let Err(e) = sync_paged_vmm(&mut rig) {
                         let reason = format!("VMM-paged reclaim failed: {e}");
                         poison = Some(reason);
                         break 'serve;
@@ -5450,12 +5589,16 @@ fn run_loop(
                 match wait {
                     Some(wait) => match rx.recv_timeout(wait) {
                         Ok(cmd) => {
-                            idle_since = None;
-                            idle_reclaimed = false;
+                            note_idle_command(&rig, &cmd, &mut idle_since, &mut idle_reclaimed);
                             handle_command(&mut rig, &mut slots, &mut work, &stats, cmd)
                         }
                         Err(RecvTimeoutError::Timeout) => {
-                            sweep_sessions(&mut rig);
+                            let swept = sweep_sessions(&mut rig);
+                            reset_idle_reclaim_on_sweep(
+                                swept,
+                                rig.pool.is_paged(),
+                                &mut idle_reclaimed,
+                            );
                             let mut st = stats.lock().expect("stats");
                             st.note_swap(&rig.swap);
                             drop(st);
@@ -5465,8 +5608,7 @@ fn run_loop(
                     },
                     None => match rx.recv() {
                         Ok(cmd) => {
-                            idle_since = None;
-                            idle_reclaimed = false;
+                            note_idle_command(&rig, &cmd, &mut idle_since, &mut idle_reclaimed);
                             handle_command(&mut rig, &mut slots, &mut work, &stats, cmd)
                         }
                         Err(_) => break 'serve, // all senders gone: shut down after drain
@@ -6108,22 +6250,54 @@ fn run_loop(
                 row += m;
                 let mut reserved = rig.pool.set_seq_len(SlotId(s), frontier).is_ok();
                 if !reserved {
+                    let cur_pages = rig
+                        .pool
+                        .block_table(SlotId(s))
+                        .map(|bt| bt.num_pages())
+                        .unwrap_or(0);
+                    let target_pages = frontier.div_ceil(PAGE_TOKENS);
+                    let shortfall_pages = target_pages.saturating_sub(cur_pages).max(1);
+                    let page_bytes = rig
+                        .pool
+                        .page_pool()
+                        .map(|p| p.k_page_bytes() + p.v_page_bytes())
+                        .unwrap_or(0);
+                    let needed_bytes = shortfall_pages.saturating_mul(page_bytes).max(1);
+                    let mut provision_error = None;
+
+                    // 1) Evict only the shortfall from unprotected leaves.
                     refresh_prefix_soft_protection(&mut rig);
                     if let (Some(idx), Some(pp)) =
                         (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
                     {
-                        idx.evict_unpinned_leaves(pp, usize::MAX);
+                        idx.evict_unprotected_leaves(pp, needed_bytes);
                         pp.drain_completed();
                     }
-                    let mut provision_error = None;
                     match rig.pool.set_seq_len(SlotId(s), frontier) {
                         Ok(()) => reserved = true,
                         Err(error) => provision_error = Some(error),
                     }
+
+                    // 2) Evict all unprotected leaves.
+                    if !reserved {
+                        if let (Some(idx), Some(pp)) =
+                            (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
+                        {
+                            idx.evict_unprotected_leaves(pp, usize::MAX);
+                            pp.drain_completed();
+                        }
+                        match rig.pool.set_seq_len(SlotId(s), frontier) {
+                            Ok(()) => reserved = true,
+                            Err(error) => provision_error = Some(error),
+                        }
+                    }
+
+                    // 3) Park idle resident sessions LRU-first.
                     if !reserved {
                         // Cache leaves are gone, but the grace window can
                         // still be holding finished sessions in their slots.
-                        // Park them LRU-first before refusing this request.
+                        // Park them LRU-first before evicting soft-protected
+                        // cache leaves or refusing this request.
                         let exclude: Vec<SessionId> =
                             slots.iter().flatten().map(|f| f.session).collect();
                         while park_idle_session_cold(&mut rig, &exclude) {
@@ -6133,6 +6307,36 @@ fn run_loop(
                             }
                         }
                     }
+
+                    // 4) Evict the shortfall from any unpinned leaves
+                    //    (unprotected first, then soft-protected).
+                    if !reserved {
+                        if let (Some(idx), Some(pp)) =
+                            (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
+                        {
+                            idx.evict_unpinned_leaves(pp, needed_bytes);
+                            pp.drain_completed();
+                        }
+                        match rig.pool.set_seq_len(SlotId(s), frontier) {
+                            Ok(()) => reserved = true,
+                            Err(error) => provision_error = Some(error),
+                        }
+                    }
+
+                    // 5) Evict all unpinned leaves and make one final attempt.
+                    if !reserved {
+                        if let (Some(idx), Some(pp)) =
+                            (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
+                        {
+                            idx.evict_unpinned_leaves(pp, usize::MAX);
+                            pp.drain_completed();
+                        }
+                        match rig.pool.set_seq_len(SlotId(s), frontier) {
+                            Ok(()) => reserved = true,
+                            Err(error) => provision_error = Some(error),
+                        }
+                    }
+
                     if !reserved {
                         eprintln!(
                             "[serve] page provisioning refused slot {s}: {}",
@@ -6149,12 +6353,7 @@ fn run_loop(
                 // request when the budget or `hipMemCreate` refuses. A
                 // poisoned mapper has a VA range that no longer matches the
                 // bitmap; keep serving and the next map faults or overlaps.
-                let soft = rig
-                    .prefix_index
-                    .as_ref()
-                    .map(|idx| idx.soft_checkpoints())
-                    .unwrap_or(&NO_SOFT_CHECKPOINTS);
-                if let Err(error) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft) {
+                if let Err(error) = sync_paged_vmm(&mut rig) {
                     let poisoned = rig
                         .model
                         .paged_vmm
@@ -6166,7 +6365,7 @@ fn run_loop(
                         ));
                         break;
                     }
-                    let (pages, ckpt_bytes) = release_unpinned_device_cache(&mut rig);
+                    let (pages, ckpt_bytes) = release_device_cache_under_pressure(&mut rig);
                     eprintln!(
                         "[serve] VMM page map refused slot {s}: {error}; \
                          reclaimed {pages} kv pages and {ckpt_bytes} checkpoint bytes"
@@ -6175,12 +6374,7 @@ fn run_loop(
                     // keeps its physical binding until teardown, so freeing
                     // their pages returns no device memory to this map. The
                     // checkpoint drain inside `sync_paged_vmm` is the lever.
-                    let soft = rig
-                        .prefix_index
-                        .as_ref()
-                        .map(|idx| idx.soft_checkpoints())
-                        .unwrap_or(&NO_SOFT_CHECKPOINTS);
-                    match rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft) {
+                    match sync_paged_vmm(&mut rig) {
                         Ok(()) => continue,
                         Err(retry_error) => {
                             let poisoned = rig
@@ -6287,11 +6481,6 @@ fn run_loop(
                 // copy-on-write the wrong pages and mutate a shared one.
                 let write_start = rows.iter().map(|pos| *pos as usize).min().unwrap_or(0);
                 let write_end = rows.iter().map(|pos| *pos as usize + 1).max().unwrap_or(0);
-                let soft = rig
-                    .prefix_index
-                    .as_ref()
-                    .map(|idx| idx.soft_checkpoints())
-                    .unwrap_or(&NO_SOFT_CHECKPOINTS);
                 match rig
                     .pool
                     .plan_cow_for_slot(SlotId(s), write_start, write_end)
@@ -6309,9 +6498,7 @@ fn run_loop(
                         // source in place.
                         if plan.is_empty() {
                             cow_plans.push(Some((s, plan)));
-                        } else if let Err(e) =
-                            rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft)
-                        {
+                        } else if let Err(e) = sync_paged_vmm(&mut rig) {
                             let poisoned = rig
                                 .model
                                 .paged_vmm
@@ -6572,6 +6759,7 @@ fn run_loop(
             let dflash_prefill_slots: Vec<bool> = (0..n)
                 .map(|s| work[s].spec == SpecKind::Dflash && prefill_slots[s])
                 .collect();
+            refresh_soft_if_vmm_pending(&mut rig);
             let soft = rig
                 .prefix_index
                 .as_ref()
@@ -7865,7 +8053,7 @@ fn admit(
     // Bound parked-session growth before matching: close swapped/cold
     // sessions idle past the TTL, then enforce the non-resident cap. A
     // resident session is never a sweep victim.
-    sweep_sessions(rig);
+    let _ = sweep_sessions(rig);
 
     // Multi-turn continuation. The client resends the whole conversation, so a
     // follow-up turn is matched by its USER turns and then built by APPENDING
@@ -9174,7 +9362,7 @@ fn session_policy_from_config() -> (Option<std::time::Duration>, usize, std::tim
 /// The TTL is wall-clock and the cap is generous (16 parked conversations per
 /// slot, at least 64): a parked session is only a cache entry, so closing one
 /// costs a cold re-prefill, never correctness.
-fn sweep_sessions(rig: &mut Rig) {
+fn sweep_sessions(rig: &mut Rig) -> usize {
     const CAP_MIN: usize = 64;
     const PER_SLOT: usize = 16;
     let ttl = rig.session_ttl.unwrap_or(std::time::Duration::MAX);
@@ -9191,15 +9379,16 @@ fn sweep_sessions(rig: &mut Rig) {
         cap,
     );
     if closed.is_empty() {
-        return;
+        return 0;
     }
+    let count = closed.len();
     if let Ok(mut ids) = rig.closed_sessions.lock() {
         ids.extend(closed.iter().map(|id| id.0));
     }
     if rig.gpu.slot_trace() {
         eprintln!(
             "[slot-trace] swept {} parked session(s) (ttl {ttl:?}, cap {cap})",
-            closed.len()
+            count
         );
     }
     for id in closed {
@@ -9208,6 +9397,7 @@ fn sweep_sessions(rig: &mut Rig) {
         // normal Close command does the same.)
         let _ = rig.fair_queue.remove(id.0);
     }
+    count
 }
 
 /// Return a continuation match that must re-enter through [`admit_cold`].
@@ -9372,14 +9562,9 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
                 r
             } else if rig.model.paged_vmm.is_some() {
                 let layout = rig.model.paged_vmm.as_ref().map(|m| m.page_layout());
-                let soft = rig
-                    .prefix_index
-                    .as_ref()
-                    .map(|idx| idx.soft_checkpoints())
-                    .unwrap_or(&NO_SOFT_CHECKPOINTS);
                 match rig.pool.provision_pages_for(slot, snap.seq_len) {
                     Err(e) => Err(SwapError::Gpu(e)),
-                    Ok(()) => match rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft) {
+                    Ok(()) => match sync_paged_vmm(rig) {
                         Err(e) => Err(SwapError::Gpu(e.to_string())),
                         Ok(()) => {
                             let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
@@ -10632,6 +10817,121 @@ mod tests {
 
         drop(swap);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_idle_reclaim_on_sweep_rearms_only_when_paged_and_swept() {
+        let mut reclaimed = true;
+        reset_idle_reclaim_on_sweep(0, true, &mut reclaimed);
+        assert!(
+            reclaimed,
+            "zero swept sessions must leave idle_reclaimed alone"
+        );
+
+        reset_idle_reclaim_on_sweep(2, false, &mut reclaimed);
+        assert!(reclaimed, "non-paged pool must not rearm idle_reclaimed");
+
+        reset_idle_reclaim_on_sweep(1, true, &mut reclaimed);
+        assert!(
+            !reclaimed,
+            "sweeping >=1 session on paged pool must rearm reclaim"
+        );
+
+        // Already false stays false.
+        reset_idle_reclaim_on_sweep(3, true, &mut reclaimed);
+        assert!(!reclaimed);
+    }
+
+    #[test]
+    fn note_idle_command_transitions() {
+        let t0 = std::time::Instant::now();
+
+        // Submit resets both idle_since and idle_reclaimed.
+        let mut idle_since = Some(t0);
+        let mut idle_reclaimed = true;
+        note_idle_command_kind(
+            IdleCommandKind::Submit,
+            true,
+            true,
+            &mut idle_since,
+            &mut idle_reclaimed,
+        );
+        assert!(idle_since.is_none());
+        assert!(!idle_reclaimed);
+
+        // CancelWaiting touches neither.
+        let mut idle_since = Some(t0);
+        let mut idle_reclaimed = true;
+        note_idle_command_kind(
+            IdleCommandKind::CancelWaiting,
+            true,
+            true,
+            &mut idle_since,
+            &mut idle_reclaimed,
+        );
+        assert_eq!(idle_since, Some(t0));
+        assert!(idle_reclaimed);
+
+        // Reset touches neither.
+        let mut idle_since = Some(t0);
+        let mut idle_reclaimed = true;
+        note_idle_command_kind(
+            IdleCommandKind::Reset,
+            true,
+            true,
+            &mut idle_since,
+            &mut idle_reclaimed,
+        );
+        assert_eq!(idle_since, Some(t0));
+        assert!(idle_reclaimed);
+
+        // Close on an existing session on a paged prefix-cached rig clears
+        // idle_reclaimed while preserving idle_since.
+        let mut idle_since = Some(t0);
+        let mut idle_reclaimed = true;
+        note_idle_command_kind(
+            IdleCommandKind::Close {
+                session_exists: true,
+            },
+            true,
+            true,
+            &mut idle_since,
+            &mut idle_reclaimed,
+        );
+        assert_eq!(idle_since, Some(t0));
+        assert!(!idle_reclaimed);
+
+        // Close on a missing session touches neither.
+        let mut idle_since = Some(t0);
+        let mut idle_reclaimed = true;
+        note_idle_command_kind(
+            IdleCommandKind::Close {
+                session_exists: false,
+            },
+            true,
+            true,
+            &mut idle_since,
+            &mut idle_reclaimed,
+        );
+        assert_eq!(idle_since, Some(t0));
+        assert!(idle_reclaimed);
+
+        // Close on non-paged or without prefix_cache touches neither.
+        for (is_paged, prefix_cache) in [(false, true), (true, false)] {
+            let mut idle_since = Some(t0);
+            let mut idle_reclaimed = true;
+            note_idle_command_kind(
+                IdleCommandKind::Close {
+                    session_exists: true,
+                },
+                is_paged,
+                prefix_cache,
+                &mut idle_since,
+                &mut idle_reclaimed,
+            );
+            assert_eq!(idle_since, Some(t0));
+            assert!(idle_reclaimed);
+        }
     }
 }
 

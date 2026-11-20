@@ -56,6 +56,37 @@ fn checkpoint_device_room(
     }
 }
 
+/// True when a pending VMM granule map fits within the mapper's configured
+/// byte budget and therefore warrants freeing checkpoints to make device room.
+///
+/// A map that would exceed `budget` (when `budget > 0`) is refused by the
+/// mapper before any HIP allocation happens, so draining live checkpoints for
+/// it would destroy reusable state for a map that is guaranteed to fail.
+pub(crate) fn should_drain_checkpoints_for_vmm_map(need: u64, mapped: u64, budget: u64) -> bool {
+    need > 0
+        && (budget == 0
+            || mapped
+                .checked_add(need)
+                .is_some_and(|total| total <= budget))
+}
+
+/// Drain every unpinned checkpoint under emergency VMM memory pressure,
+/// popping unprotected entries first (LRU) and then soft-protected entries
+/// (LRU). Hard-pinned entries remain in `pool`.
+pub(crate) fn drain_checkpoints_under_pressure<B: CheckpointBlob>(
+    pool: &mut CheckpointPool<B>,
+    protected: &HashSet<CheckpointId>,
+) -> Vec<B> {
+    let mut out = Vec::new();
+    while let Some((_, blob)) = pool.pop_lru_excluding(protected) {
+        out.push(blob);
+    }
+    while let Some((_, blob)) = pool.pop_lru() {
+        out.push(blob);
+    }
+    out
+}
+
 /// Free unpinned checkpoints until the next VMM granule map has its reserve.
 ///
 /// Snapshots are raw `hipMalloc`s beside the VMM pool. A granule map that
@@ -75,6 +106,12 @@ pub(crate) fn free_checkpoints_for_vmm_map(
     need: u64,
     protected: &HashSet<CheckpointId>,
 ) -> u64 {
+    if need == 0 || pool.is_empty() {
+        return 0;
+    }
+    // Drain the tensor pool before reading `hipMemGetInfo` so cached freed
+    // buffers are not miscounted as occupied device memory.
+    gpu.drain_pool();
     let (unprotected, soft) = pool.drain_candidates(protected);
     let free = gpu
         .device_mem_info()
@@ -101,8 +138,8 @@ pub(crate) fn free_checkpoints_for_vmm_map(
     }
     // The tensor pool can still account the freed buffers as used until it
     // is drained (same reason as the idle reclaim).
-    gpu.drain_pool();
     if freed > 0 {
+        gpu.drain_pool();
         eprintln!("[prefix-cache] freed {freed} checkpoint bytes before a VMM map of {need} bytes");
     }
     freed
@@ -206,3 +243,145 @@ pub fn restore_private(
 // ───────────────────────────────────────────────────────────────────────────
 // Tests (host-only — no GPU/HIP required)
 // ───────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hipfire_runtime::serve_contract::{
+        ArchPolicy, DeviceTopology, KvLayout, SharingNamespace, TemplateIdentity, TokenizerIdentity,
+    };
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TaggedBlob {
+        tag: &'static str,
+        bytes: u64,
+    }
+
+    impl CheckpointBlob for TaggedBlob {
+        fn bytes_len(&self) -> u64 {
+            self.bytes
+        }
+    }
+
+    fn test_domain() -> CacheDomain {
+        CacheDomain {
+            model_content_digest: vec![0u8; 32],
+            model_load_epoch: 1,
+            sidecar_digests: vec![],
+            tokenizer: TokenizerIdentity {
+                vocab_digest: vec![1u8; 16],
+                config_digest: vec![2u8; 16],
+            },
+            template: TemplateIdentity {
+                template_digest: vec![3u8; 16],
+                normalization_tag: "default".to_string(),
+            },
+            arch_policy: ArchPolicy {
+                arch_tag: "qwen35".to_string(),
+                state_abi_tag: "q8".to_string(),
+                position_attention_tag: "causal".to_string(),
+            },
+            kv_layout: KvLayout {
+                k_stride_bytes: vec![128],
+                v_stride_bytes: vec![128],
+                layout_tag: "q8".to_string(),
+            },
+            device: DeviceTopology {
+                device_id: "gpu0".to_string(),
+                topology_id: "single".to_string(),
+                allocation_epoch: 1,
+            },
+            namespace: SharingNamespace {
+                domain_id: "test".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn should_drain_checkpoints_for_vmm_map_respects_budget_and_need() {
+        // Zero need never drains.
+        assert!(!should_drain_checkpoints_for_vmm_map(0, 0, 1024));
+        assert!(!should_drain_checkpoints_for_vmm_map(0, 512, 0));
+
+        // Unlimited budget (budget == 0) drains whenever need > 0.
+        assert!(should_drain_checkpoints_for_vmm_map(256, 10_000, 0));
+
+        // Under budget and exact fit both drain.
+        assert!(should_drain_checkpoints_for_vmm_map(256, 512, 1024));
+        assert!(should_drain_checkpoints_for_vmm_map(512, 512, 1024));
+
+        // Exceeding budget refuses to drain (map will be refused by budget anyway).
+        assert!(!should_drain_checkpoints_for_vmm_map(513, 512, 1024));
+        assert!(!should_drain_checkpoints_for_vmm_map(1, u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn drain_checkpoints_under_pressure_orders_unprotected_then_soft_and_keeps_hard_pins() {
+        let domain = test_domain();
+        let mut pool = CheckpointPool::new(1024 * 1024);
+
+        let (id_soft_old, _) = pool.insert(
+            domain.clone(),
+            128,
+            1,
+            TaggedBlob {
+                tag: "soft_old",
+                bytes: 100,
+            },
+        );
+        let (id_unprot_old, _) = pool.insert(
+            domain.clone(),
+            256,
+            2,
+            TaggedBlob {
+                tag: "unprot_old",
+                bytes: 100,
+            },
+        );
+        let (id_hard_pin, _) = pool.insert(
+            domain.clone(),
+            384,
+            3,
+            TaggedBlob {
+                tag: "hard_pin",
+                bytes: 100,
+            },
+        );
+        let (id_soft_new, _) = pool.insert(
+            domain.clone(),
+            512,
+            4,
+            TaggedBlob {
+                tag: "soft_new",
+                bytes: 100,
+            },
+        );
+        let (_id_unprot_new, _) = pool.insert(
+            domain.clone(),
+            640,
+            5,
+            TaggedBlob {
+                tag: "unprot_new",
+                bytes: 100,
+            },
+        );
+
+        assert!(pool.pin(&domain, 384, 3));
+        assert!(id_unprot_old.is_some());
+        assert!(id_hard_pin.is_some());
+
+        let protected: HashSet<CheckpointId> = [id_soft_old, id_soft_new].into_iter().collect();
+        let drained = drain_checkpoints_under_pressure(&mut pool, &protected);
+        let tags: Vec<&str> = drained.iter().map(|b| b.tag).collect();
+
+        // Unprotected entries are drained first (LRU order), then soft-protected
+        // entries (LRU order). Hard-pinned entry survives in the pool.
+        assert_eq!(
+            tags,
+            vec!["unprot_old", "unprot_new", "soft_old", "soft_new"]
+        );
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&domain, 384, 3));
+        assert!(pool.is_pinned(&domain, 384, 3));
+    }
+}
