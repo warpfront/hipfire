@@ -2767,6 +2767,13 @@ pub(crate) fn run() {
     // so fold that shard in for arch 17 — without it the .hfq would carry no
     // `linear.weight` and the loader's Dense-head read would fail.
     let mut shard_paths = find_safetensors(input_dir);
+    if arch_id == 24 {
+        // Inkling-2's `mtp.safetensors` is a separate DSpark sidecar with a
+        // generic tensor namespace (`fuse_weight`, `layers.0.*`). Phase 1 is
+        // text-only AR; folding it into the trunk would emit colliding,
+        // unconsumed tensors. It gets its own packer later.
+        shard_paths.retain(|p| p.file_name().and_then(|n| n.to_str()) != Some("mtp.safetensors"));
+    }
     if arch_id == 17 {
         let dense = input_dir.join("1_Dense/model.safetensors");
         if dense.is_file() {
