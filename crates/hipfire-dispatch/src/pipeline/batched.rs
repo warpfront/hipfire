@@ -1264,7 +1264,7 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                     n,
                 );
             } else if matches!(w.dtype, DType::MQ4G256V2Lloyd) {
-                // qt=52: small-N gfx1100 → F16-BT-LUT (native masking);
+                // qt=52: small-N gfx1100/gfx1151 → F16-BT-LUT (native masking);
                 // N>=64 or other gfx11 → MMQ-LUT; gfx12 keeps FP8-LUT; else
                 // fail-closed inside the FP8 launcher (never uniform).
                 if lloyd_f16_bt_route(gpu, n) {
@@ -1410,7 +1410,7 @@ pub(crate) fn dispatch_batched_gemm_epilogue(
                 );
             } else if matches!(w.dtype, DType::MQ4G256V2Lloyd) {
                 // qt=52 Partial: zero then residual (== plain GEMM).
-                // Small-N gfx1100 → F16-BT-LUT; N>=64 or other gfx11 →
+                // Small-N gfx1100/gfx1151 → F16-BT-LUT; N>=64 or other gfx11 →
                 // MMQ-LUT ADD into zeroed Y; gfx12 keeps FP8-LUT.
                 zero_partial_for_residual(gpu, out, n, m)?;
                 if lloyd_f16_bt_route(gpu, n) {
@@ -1708,7 +1708,7 @@ pub(crate) fn lloyd_f16_or_fail(w: &WeightRef<'_>, family: &'static str) -> HipR
     })
 }
 
-/// Small-N F16-BT-LUT route for qt=52 on exact gfx1100: BT-tiled WMMA with
+/// Small-N F16-BT-LUT route for qt=52 on gfx1100/gfx1151: BT-tiled WMMA with
 /// per-tensor centered codebooks, valid at any N via masking. Covers N<64,
 /// where the MMQ path falls back to per-row GEMV; N>=64 stays on the
 /// (possibly padded) MMQ-LUT route. Eager-only: the BT launchers refuse
@@ -1717,7 +1717,7 @@ pub(crate) fn lloyd_f16_or_fail(w: &WeightRef<'_>, family: &'static str) -> HipR
 /// restores the MMQ/GEMV path (default is on).
 #[inline]
 pub(crate) fn lloyd_f16_bt_route(gpu: &Gpu, n: usize) -> bool {
-    gpu.arch.as_str() == "gfx1100"
+    matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
         && n < 64
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
