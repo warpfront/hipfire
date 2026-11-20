@@ -321,9 +321,10 @@ fuse only in Phase 4 behind the KLD pin.
   NVFP4); E4M3 values × UE8M0 `2^(byte-127)` per 32 columns. The earlier
   "2-D 32×32 block" reading was wrong: the existing `[1,block_k]`-only
   `dequantize_mxfp8_e8m0_strict` needs **no 2-D generalization**, just
-  `block_k = 32`. If `hf_quant_config.json` advertises
-  `weight_block_shape [32,32]`, that is a metadata conflict the converter only
-  warns about — trust the stored tensor/scale shapes.
+  `block_k = 32`. The published `hf_quant_config.json` **does** advertise
+  `weight_block_shape [32,32]` for MXFP8 while the stored block is `(1,32)` —
+  a metadata conflict the converter only warns about (§8). Trust the stored
+  tensor/scale shapes.
 - BF16/F32 (controllers, queries, norms, biases, `q/k_l2_clip.scale`,
   `rel_l2_clip.scale`, vision, embed, unembed, MTP): existing `to_f32`
   paths; add keep lists (`model_filter.rs`, MiniMax/DS4 precedent) so
@@ -399,6 +400,7 @@ carried forward from the original plan and remain Phase-0 tasks.
 | Geometry: 24 physical layers, loop core 6–18 ×3 passes, gate_rank 64, `is_varloop=false`, 24Q/8KV hd 128, `d_rel` 16, rel_extent 1024, QK/rel clips 22.627/8.0, `final_logit_softcapping` 30, MoE 128/top-8/1152/`route_scale` 8 + gate bias, sconv kernel 4, SWA 1024, 6-layer attn-res blocks, unpadded vocab 200058, MTP 3 layers/markov 256/block 8/target visits 5/23/41/48, `model_max_length` 1048576 | live `thinkingmachines/Inkling-2-Mini/config.json` | confirmed |
 | `reasoning_effort` default 0.9, strict canonical tool JSON, custom roles/thinking/tool tokens | live `chat_template.jinja` | confirmed |
 | `quantization_config` = modelopt / NVFP4 | live `config.json` | confirmed |
+| Quant scheme metadata | live `hf_quant_config.json` | NVFP4 group: `weight_block_shape [1,16]`, `weight_scale_format amax_denominator`, `weight_transform nvfp4_nearest`. MXFP8 group: `weight_block_shape [32,32]`, `weight_transform mxfp8_nearest`, activation `block_size 32` / `scale_dtype ue8m0` — the `[32,32]` is the advertised conflict the merged converter warns about, not the stored block. |
 | llama.cpp support merged | GitHub API PR #32694 | merged 2026-11-20T22:01:08Z by CISC; full merge SHA `29b52d398b294509746ec0a3f28948a3107c0213`; 9 commits, 13 files, +631/−123. Short `29b52d3` did not resolve via GitHub web/API here — use the full SHA. |
 | GGUF fixtures published | `hf models list` | both repos exist: `ggml-org/Inkling-2-Mini-GGUF` (BF16 52,226,509,504 B sha256 `7074c976…`, IQ4_NL, Q8_0, `imatrix.gguf` 90,752,032 B, mmproj) and `ggml-org/TML-d24-varloop-research-GGUF` (BF16/IQ4_NL/Q8_0/imatrix/mmproj). |
 | Arch ids 24 / 25 free | `docs/architecture-ids.md` on `origin/beta` `9e410448e` | 18 (EmbeddingGemma2) and 19 (Raon) are now claimed; 24 is first free primary, 25 first free sidecar after 23. |
