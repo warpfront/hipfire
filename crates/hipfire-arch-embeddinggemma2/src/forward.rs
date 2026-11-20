@@ -608,12 +608,18 @@ fn encode_trunk(
     let hidden = gpu
         .upload_f32(&host_hidden, &[n * h])
         .map_err(|e| format!("embeddinggemma2: upload: {e:?}"))?;
-    let positions = gpu
-        .alloc_tensor(&[n], DType::F32)
-        .map_err(|e| format!("embeddinggemma2: alloc: {e:?}"))?;
-    gpu.hip
-        .memcpy_htod(&positions.buf, &pos_bytes)
-        .map_err(|e| format!("embeddinggemma2: positions upload: {e:?}"))?;
+    let positions = match gpu.alloc_tensor(&[n], DType::F32) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = gpu.free_tensor(hidden);
+            return Err(format!("embeddinggemma2: alloc: {e:?}"));
+        }
+    };
+    if let Err(e) = gpu.hip.memcpy_htod(&positions.buf, &pos_bytes) {
+        let _ = gpu.free_tensor(hidden);
+        let _ = gpu.free_tensor(positions);
+        return Err(format!("embeddinggemma2: positions upload: {e:?}"));
+    }
 
     let s = EncodeScratch::new(gpu, cfg, n, hidden, positions)?;
     match run_layers(gpu, w, cfg, segs, &s) {
