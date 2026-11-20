@@ -3552,7 +3552,10 @@ pub fn qwen4_ep_vram_layers(
             prompt_rows: chunk_rows,
             explicit_chunk,
             stage_min_rows,
-            npu: match hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env() {
+            npu: match hipfire_runtime::coproc::Mode::from_config(
+                hipfire_arch_qwen4::npu_trunk::SWITCH,
+                hipfire_runtime::coproc::Mode::Auto,
+            ) {
                 Ok(npu) => {
                     hipfire_arch_qwen4::slowlink_admission::npu_trunk_selected(&gpu.arch, npu)
                 }
@@ -5582,7 +5585,10 @@ pub fn qwen4_preload_resource_plan(
                 != hipfire_arch_qwen4::decode_share::DecodeShareMode::Off,
             npu: hipfire_arch_qwen4::slowlink_admission::npu_trunk_selected(
                 &gpu.arch,
-                hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env()?,
+                hipfire_runtime::coproc::Mode::from_config(
+                    hipfire_arch_qwen4::npu_trunk::SWITCH,
+                    hipfire_runtime::coproc::Mode::Auto,
+                )?,
             ),
             slowlink: false,
             expert_keep: config.expert_keep.is_some(),
@@ -6556,11 +6562,12 @@ fn preload_s1_union(
     )
     .is_ok();
     let chunk_rows_env = hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS").ok();
-    let npu_trunk = hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env()
-        .map(|mode| s1::npu_trunk_selected(&gpu.arch, mode))
-        .map_err(|error| {
-            format!("qwen4 preload plan: S1 union: NPU trunk mode unreadable: {error}")
-        })?;
+    let npu_trunk = hipfire_runtime::coproc::Mode::from_config(
+        hipfire_arch_qwen4::npu_trunk::SWITCH,
+        hipfire_runtime::coproc::Mode::Auto,
+    )
+    .map(|mode| s1::npu_trunk_selected(&gpu.arch, mode))
+    .map_err(|error| format!("qwen4 preload plan: S1 union: NPU trunk mode unreadable: {error}"))?;
     let shape = s1::LoadShape {
         arch: &gpu.arch,
         unified_memory: use_ranges,
@@ -7285,7 +7292,10 @@ fn load_qwen4_rank_unscoped(
                 != hipfire_arch_qwen4::decode_share::DecodeShareMode::Off,
             npu: hipfire_arch_qwen4::slowlink_admission::npu_trunk_selected(
                 &ctx.gpu.arch,
-                hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env()?,
+                hipfire_runtime::coproc::Mode::from_config(
+                    hipfire_arch_qwen4::npu_trunk::SWITCH,
+                    hipfire_runtime::coproc::Mode::Auto,
+                )?,
             ),
             slowlink: false,
             expert_keep: config.expert_keep.is_some(),
@@ -7951,7 +7961,10 @@ fn load_qwen4_rank_unscoped(
             stage_opt_out: stage_env.as_deref() == Some("0"),
             npu_trunk: s1::npu_trunk_selected(
                 &ctx.gpu.arch,
-                hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env()?,
+                hipfire_runtime::coproc::Mode::from_config(
+                    hipfire_arch_qwen4::npu_trunk::SWITCH,
+                    hipfire_runtime::coproc::Mode::Auto,
+                )?,
             ),
             chunk_rows_env: chunk_rows_env.as_deref(),
             max_seq: ctx.max_seq,
@@ -8073,7 +8086,10 @@ fn load_qwen4_rank_unscoped(
             expert_parallel: ep.is_some() || expert_vram_layers.is_some(),
             // An unparseable NPU knob is the attach's error to report; here it
             // only means "not selected" for this decision.
-            npu_trunk: match hipfire_arch_qwen4::npu_trunk::NpuTrunkMode::from_env() {
+            npu_trunk: match hipfire_runtime::coproc::Mode::from_config(
+                hipfire_arch_qwen4::npu_trunk::SWITCH,
+                hipfire_runtime::coproc::Mode::Auto,
+            ) {
                 Ok(npu) => {
                     hipfire_arch_qwen4::slowlink_admission::npu_trunk_selected(&ctx.gpu.arch, npu)
                 }
