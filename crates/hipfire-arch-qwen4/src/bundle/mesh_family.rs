@@ -135,6 +135,16 @@ impl MeshFamily for Qwen4Bundle {
         }
     }
 
+    /// The Single decode path's device argmax (`forward_token_or_argmax`).
+    fn device_token_decode(&self) -> bool {
+        true
+    }
+
+    /// The token the forward committed as the newest PLE history slot.
+    fn decoded_token(&self) -> Result<u32> {
+        Ok(self.state.ple_history.previous()[1])
+    }
+
     fn prepare_epoch(&mut self, gpus: &mut Gpus, route: MeshRoute, rows: usize) -> Result<usize> {
         let gpu = device(gpus)?;
         let layout = self.with_forward(|bundle, forward| {
@@ -164,6 +174,7 @@ impl MeshFamily for Qwen4Bundle {
             if let Some(layout) = layout {
                 bindings.set_rank_layout(0, layout)?;
             }
+            bindings.set_device_token(input.device_token);
             bindings.set_head(input.head.map(|head| Qwen4MeshHead {
                 logits: head.logits,
                 top1: head.top1,

@@ -16,7 +16,7 @@
 use crate::device_mesh::DeviceMesh;
 use crate::mesh_placement::{AdmittedMesh, AdmittedRank, BandPlacement};
 use crate::mesh_split::{split_program, SplitPlan};
-use crate::multi_gpu::executor::{ForwardEpoch, MeshRoute, MeshStepBindings, Result};
+use crate::multi_gpu::executor::{ForwardEpoch, MeshRoute, MeshStepBindings, MeshTicket, Result};
 use crate::multi_gpu::transport::EdgeId;
 use crate::multi_gpu::Gpus;
 use crate::weight_manifest::{plan_manifest, StateEntry, WeightEntry};
@@ -39,6 +39,9 @@ pub struct EpochInput<'a> {
     pub route_rows: usize,
     /// `None` commits state only.
     pub head: Option<EpochHead<'a>>,
+    /// `Some(row)`: the one Decode token is the device argmax of `row` as
+    /// the previous epoch left it (`tokens` holds a placeholder).
+    pub device_token: Option<&'a GpuTensor>,
     /// Transport epochs of the band boundaries, in logical band order.
     pub edge_epochs: Vec<u64>,
 }
@@ -80,6 +83,18 @@ pub trait MeshFamily {
     /// Best effort: map state ahead for `new_tokens` decode rows.
     fn reserve_decode(&mut self, _gpus: &mut Gpus, _new_tokens: usize) {}
 
+    /// Whether a decode epoch can take its token from the device argmax of
+    /// the previous row ([`EpochInput::device_token`]), so greedy decode
+    /// never waits for the host between tokens.
+    fn device_token_decode(&self) -> bool {
+        false
+    }
+    /// The token the last submitted device-token decode epoch ran, known on
+    /// the host once the epoch was submitted.
+    fn decoded_token(&self) -> Result<u32> {
+        Err("this family has no device-token decode".into())
+    }
+
     /// Prepare capacity for an epoch of `rows` on `route` at the family's
     /// position; returns its routing rows.
     fn prepare_epoch(&mut self, gpus: &mut Gpus, route: MeshRoute, rows: usize) -> Result<usize>;
@@ -97,6 +112,8 @@ pub enum DecodeOut {
     Top1(u32),
     /// The row, for a host sampler.
     Logits(Vec<f32>),
+    /// The row stays on the device: the next decode epoch takes its argmax.
+    Device,
 }
 
 static NEXT_LOAD_ID: AtomicU64 = AtomicU64::new(1);
@@ -113,6 +130,8 @@ pub struct MeshRunner {
     load_id: u64,
     request_id: u64,
     next_op: u64,
+    /// Submitted, not yet drained epochs of the request in flight, oldest first.
+    outstanding: Vec<MeshTicket>,
 }
 
 /// One request's output buffers on the mesh's output owner.
@@ -134,6 +153,7 @@ impl MeshRunner {
             load_id,
             request_id: 0,
             next_op: 1,
+            outstanding: Vec::new(),
         })
     }
 
@@ -188,11 +208,26 @@ impl MeshRunner {
         })
     }
 
-    /// Release a request's outputs.
-    pub fn end(&mut self, request: MeshRequest, gpus: &mut Gpus) {
+    /// Release a request's outputs once every epoch that writes them drained;
+    /// returns the drain verdict. A failed drain leaks them: work in flight
+    /// may still write them.
+    pub fn end(&mut self, request: MeshRequest, gpus: &mut Gpus) -> Result<()> {
+        if let Err(error) = self.settle(gpus) {
+            std::mem::forget(request);
+            return Err(error);
+        }
         let gpu = &mut gpus.devices[request.owner];
         let _ = gpu.free_tensor(request.logits);
         let _ = gpu.free_tensor(request.top1);
+        Ok(())
+    }
+
+    /// Drain every outstanding epoch with one synchronization of each device.
+    pub fn settle(&mut self, gpus: &mut Gpus) -> Result<()> {
+        if self.outstanding.is_empty() {
+            return Ok(());
+        }
+        gpus.drain_mesh_epochs(std::mem::take(&mut self.outstanding))
     }
 
     /// Run the next prompt epoch; returns its end and, at the prompt end,
@@ -215,7 +250,15 @@ impl MeshRunner {
             logits: &request.logits,
             top1: None,
         });
-        self.epoch(family, gpus, &prompt[start..end], MeshRoute::Prefill, head)?;
+        self.epoch(
+            family,
+            gpus,
+            &prompt[start..end],
+            MeshRoute::Prefill,
+            head,
+            None,
+        )?;
+        self.settle(gpus)?;
         family.prompt_rows_done(gpus, prompt, end)?;
         let logits = if last {
             Some(self.read_logits(request, gpus)?)
@@ -225,22 +268,51 @@ impl MeshRunner {
         Ok((end, logits))
     }
 
-    /// Run `token` as one decode epoch; `top1` takes the device argmax.
+    /// One decode epoch of `token`, or with `None` of the device argmax of
+    /// the previous row; returns the token it ran. With `top1` on a family
+    /// with device-token decode nothing drains: the next epoch reads this
+    /// row's argmax on the device ([`DecodeOut::Device`]). Otherwise the
+    /// epoch drains and the row's argmax (`top1`) or the row comes back.
     pub fn decode_epoch(
         &mut self,
         request: &MeshRequest,
         family: &mut dyn MeshFamily,
         gpus: &mut Gpus,
-        token: u32,
+        token: Option<u32>,
         top1: bool,
-    ) -> Result<DecodeOut> {
+    ) -> Result<(u32, DecodeOut)> {
+        if top1 && family.device_token_decode() {
+            let head = EpochHead {
+                logits: &request.logits,
+                top1: None,
+            };
+            let device = token.is_none().then_some(&request.logits);
+            let placeholder = [token.unwrap_or(0)];
+            self.epoch(
+                family,
+                gpus,
+                &placeholder,
+                MeshRoute::Decode,
+                Some(head),
+                device,
+            )?;
+            let ran = match token {
+                Some(token) => token,
+                None => family.decoded_token()?,
+            };
+            return Ok((ran, DecodeOut::Device));
+        }
+        let token = token.ok_or("a host-token decode epoch needs its token")?;
         let head = EpochHead {
             logits: &request.logits,
             top1: top1.then_some(&request.top1),
         };
-        self.epoch(family, gpus, &[token], MeshRoute::Decode, Some(head))?;
+        self.epoch(family, gpus, &[token], MeshRoute::Decode, Some(head), None)?;
+        self.settle(gpus)?;
         if !top1 {
-            return self.read_logits(request, gpus).map(DecodeOut::Logits);
+            return self
+                .read_logits(request, gpus)
+                .map(|row| (token, DecodeOut::Logits(row)));
         }
         let bytes = gpus.devices[request.owner]
             .download_raw_bytes(&request.top1)
@@ -249,12 +321,13 @@ impl MeshRunner {
             .get(..4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .ok_or("top-1 readback is short")?;
-        Ok(DecodeOut::Top1(id))
+        Ok((token, DecodeOut::Top1(id)))
     }
 
     /// Bring a poisoned mesh back after a contained fault: drain every device
     /// and, for a one-owner mesh, provision it again.
     pub fn recover(&mut self, family: &dyn MeshFamily, gpus: &mut Gpus) -> Result<()> {
+        self.outstanding.clear();
         gpus.drain_mesh_edges()?;
         if gpus.devices.len() != 1 {
             return Err("a multi-owner mesh is recovered by its loader".into());
@@ -269,12 +342,15 @@ impl MeshRunner {
         if !gpus.mesh_healthy() {
             self.recover(&*family, gpus)?;
         }
+        // The reset drains every device and retires every outstanding epoch.
+        self.outstanding.clear();
         let epoch = self.lifecycle_epoch(&*family, gpus);
         let input = EpochInput {
             tokens: &[],
             route: MeshRoute::Prefill,
             route_rows: 0,
             head: None,
+            device_token: None,
             edge_epochs: edge_epochs(gpus)?,
         };
         let result = family.with_bindings(input, &mut |bindings| gpus.reset_mesh(bindings, &epoch));
@@ -299,6 +375,7 @@ impl MeshRunner {
         }
     }
 
+    /// Submit one epoch; it stays outstanding until [`Self::settle`].
     fn epoch(
         &mut self,
         family: &mut dyn MeshFamily,
@@ -306,6 +383,7 @@ impl MeshRunner {
         tokens: &[u32],
         route: MeshRoute,
         head: Option<EpochHead<'_>>,
+        device_token: Option<&GpuTensor>,
     ) -> Result<()> {
         let route_rows = family.prepare_epoch(gpus, route, tokens.len())?;
         let mode = match head {
@@ -334,15 +412,18 @@ impl MeshRunner {
             route,
             route_rows,
             head,
+            device_token,
             edge_epochs: edge_epochs(gpus)?,
         };
+        let outstanding = &mut self.outstanding;
         family.with_bindings(input, &mut |bindings| {
-            let ticket = gpus.submit_mesh_epoch(plan, &epoch, bindings)?;
-            gpus.drain_mesh_epoch(ticket)
+            outstanding.push(gpus.submit_mesh_epoch(plan, &epoch, bindings)?);
+            Ok(())
         })
     }
 
-    fn read_logits(&self, request: &MeshRequest, gpus: &mut Gpus) -> Result<Vec<f32>> {
+    fn read_logits(&mut self, request: &MeshRequest, gpus: &mut Gpus) -> Result<Vec<f32>> {
+        self.settle(gpus)?;
         gpus.devices[request.owner]
             .download_f32(&request.logits)
             .map_err(|e| e.to_string())
