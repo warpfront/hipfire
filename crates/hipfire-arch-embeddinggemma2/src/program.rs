@@ -34,6 +34,30 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use crate::config::{EmbedConfig, LayerType};
 use crate::weights::{EmbedWeights, LayerWeights};
 
+/// Carve offsets round up to 64 floats (256 B), so odd row counts keep every
+/// role's base vector-aligned.
+const CARVE_ALIGN: usize = 64;
+/// Gap after every carve: 4 KiB + 256 B, so role bases do not share their low
+/// address bits (G19 / HIPF-283 B1 measured 1-2% at 1-2K tokens on gfx1151).
+const CARVE_STAGGER: usize = 1088;
+
+/// Views of `widths` (floats per row) laid back to back in `arena`.
+fn carve<const N: usize>(arena: &GpuTensor, rows: usize, widths: [usize; N]) -> [GpuTensor; N] {
+    let mut off = 0;
+    widths.map(|w| {
+        let t = arena.sub_offset(off, w * rows);
+        off += (w * rows).next_multiple_of(CARVE_ALIGN) + CARVE_STAGGER;
+        t
+    })
+}
+
+fn carved_len(rows: usize, widths: &[usize]) -> usize {
+    widths
+        .iter()
+        .map(|w| (w * rows).next_multiple_of(CARVE_ALIGN) + CARVE_STAGGER)
+        .sum()
+}
+
 /// One encode's activations, sized for its `rows`; reused by every layer.
 ///
 /// The attention (`q`/`k`/`v`/`ctx`), MLP (`mlp_gate`/`mlp_up`), PLE
@@ -79,17 +103,19 @@ impl EncodeScratch {
         let qd = layers.clone().map(|l| cfg.q_dim(l)).max().unwrap_or(0);
         let kvd = layers.map(|l| cfg.kv_dim(l)).max().unwrap_or(0);
         let (h, inter, ple) = (cfg.hidden_size, cfg.intermediate_size, cfg.ple_dim);
-        let width = (2 * qd + 2 * kvd)
-            .max(2 * inter)
-            .max(h)
-            .max(cfg.embedding_dim);
+        let attn = [qd, kvd, kvd, qd];
+        let mlp = [inter, inter];
+        let arena_len = carved_len(rows, &attn)
+            .max(carved_len(rows, &mlp))
+            .max(carved_len(rows, &[h]))
+            .max(carved_len(rows, &[cfg.embedding_dim]));
         let k_max = h.max(qd).max(inter).max(ple);
         let sizes = [
             (rows * cfg.num_layers * ple, DType::F32),
             (rows * h, DType::F32),
             (rows * h, DType::F32),
             (rows * k_max, DType::F16),
-            (rows * width, DType::F32),
+            (arena_len, DType::F32),
         ];
         let mut owned = vec![hidden, positions];
         for (n, dtype) in sizes {
@@ -108,18 +134,20 @@ impl EncodeScratch {
         else {
             unreachable!("two owned tensors plus five allocations");
         };
-        // Views: (offset, width) in units of `rows` elements.
-        let view = |off: usize, w: usize| arena.sub_offset(rows * off, rows * w);
+        let [q, k, v, ctx] = carve(&arena, rows, attn);
+        let [mlp_gate, mlp_up] = carve(&arena, rows, mlp);
+        let [ple_act] = carve(&arena, rows, [h]);
+        let [embedding] = carve(&arena, rows, [cfg.embedding_dim]);
         Ok(Self {
             rows,
-            q: view(0, qd),
-            k: view(qd, kvd),
-            v: view(qd + kvd, kvd),
-            ctx: view(qd + 2 * kvd, qd),
-            mlp_gate: view(0, inter),
-            mlp_up: view(inter, inter),
-            ple_act: view(0, h),
-            embedding: view(0, cfg.embedding_dim),
+            q,
+            k,
+            v,
+            ctx,
+            mlp_gate,
+            mlp_up,
+            ple_act,
+            embedding,
             hidden,
             positions,
             ple_all,
@@ -133,7 +161,7 @@ impl EncodeScratch {
     /// Free everything but the residual stream and return it.
     pub fn into_hidden(self, gpu: &mut Gpu) -> Result<GpuTensor, String> {
         let hidden = self.hidden;
-        free_all(
+        let freed = free_all(
             gpu,
             [
                 self.positions,
@@ -143,8 +171,14 @@ impl EncodeScratch {
                 self.x16,
                 self.arena,
             ],
-        )?;
-        Ok(hidden)
+        );
+        match freed {
+            Ok(()) => Ok(hidden),
+            Err(e) => {
+                let _ = gpu.free_tensor(hidden);
+                Err(e)
+            }
+        }
     }
 
     /// Frees the owned buffers; the views die with `arena`.
@@ -164,12 +198,15 @@ impl EncodeScratch {
     }
 }
 
+/// Frees every tensor even after a failure; returns the first error.
 fn free_all<const N: usize>(gpu: &mut Gpu, tensors: [GpuTensor; N]) -> Result<(), String> {
+    let mut first = Ok(());
     for t in tensors {
-        gpu.free_tensor(t)
-            .map_err(|e| format!("embeddinggemma2: free: {e:?}"))?;
+        if let (Err(e), Ok(())) = (gpu.free_tensor(t), &first) {
+            first = Err(format!("embeddinggemma2: free: {e:?}"));
+        }
     }
-    Ok(())
+    first
 }
 
 /// `out = x · wᵀ` on the F16 encoder ladder.
