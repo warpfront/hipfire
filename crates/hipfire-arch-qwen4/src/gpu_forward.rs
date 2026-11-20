@@ -16397,7 +16397,7 @@ impl Qwen4GpuForward {
             return Ok(Qwen4MeshLayout {
                 route_rows: rows,
                 bf16_streams: chunk.bf16_streams,
-                stream_bytes: chunk.stream_bytes / self.scratch.max_chunk * rows,
+                stream_bytes: chunk.stream_bytes * rows / self.scratch.max_chunk,
             });
         }
         let ordinary_scope =
