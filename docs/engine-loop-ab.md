@@ -58,7 +58,7 @@ own route files: Qwen4 native MTP via `"mtp_mode": "on"`, a DFlash drafter via
 | `multi_turn` | 4 turns, each resending the history | token events, done fields incl. `cached_tokens` |
 | `abort_prefill` | long prompt with the abort queued right behind it, then a fresh request | abort result and the follow-up. The abort lands at the loop's first stdin poll, which on some families comes after decode tokens (Gemma 4: ~60) |
 | `abort_decode` | abort after the 8th token or reasoning event, then the same prompt again | `finish_reason` must be `aborted`; the common prefix of the aborted stream; the follow-up exactly |
-| `eos_budget` | probe the natural length `n`, then rerun with `max_tokens` `n` and `n+1` | token events, done fields |
+| `eos_budget` | probe the natural length `n` on the legacy arm, then rerun both arms with `max_tokens` `n` and `n+1` (the engine arm reuses the legacy `n`, because its own probe does not count EOS) | token events, done fields |
 | `seeded_repro` | the same seed twice at T=0.8 | each arm must reproduce itself |
 | `seeded_sweep` | `--seeds` seeds at T=0.8 | distribution only: TVD of the first-8-token mix `<= --tvd-max` (0.35) |
 
