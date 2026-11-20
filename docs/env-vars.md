@@ -1232,7 +1232,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 2095
+**Count:** 2096
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1819,6 +1819,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FLUX_ROPE_FAST` | crates/rdna-compute/src/norm.rs | developer |
 | `HIPFIRE_FLUX_WPAD` | crates/hipfire-arch-diffusion/examples/gpu_flux_forward.rs, crates/hipfire-arch-diffusion/src/flux_gpu.rs | developer |
 | `HIPFIRE_FN_GDN_DENSE_SCAN` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_FN_LANES_IDENTITY_MODEL` | crates/hipfire-arch-qwen4/tests/fn_lanes_singleton_identity_hw.rs | harness |
 | `HIPFIRE_FN_LANE_PM_ROWS` | crates/hipfire-arch-qwen4/examples/qwen4_gdn_in_probe.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_FN_LANE_POLICY` | crates/hipfire-arch-qwen4/src/lane/groups.rs | developer |
 | `HIPFIRE_FN_MODEL` | crates/rdna-compute/tests/moe_epilogue_fuse_hw.rs | harness |
