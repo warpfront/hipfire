@@ -2832,7 +2832,8 @@ pub(crate) fn run() {
     let mut inkling2_experts: HashMap<String, Inkling2Companion> = HashMap::new();
     for (fi, st) in st_files.iter().enumerate() {
         for name in st.tensor_names() {
-            let Some(stem) = name.strip_suffix("_weight_scale") else {
+            // `...w13_weight_scale` -> stem `...w13_weight` (strip `_scale`).
+            let Some(stem) = name.strip_suffix("_scale") else {
                 continue;
             };
             if !(stem.contains(".mlp.experts.")
@@ -3467,6 +3468,10 @@ pub(crate) fn run() {
                     spilled_len: 0,
                 });
             }
+            // total_params counted the packed element count; emitted tensors
+            // are logical (NVFP4 doubles the columns). Correct the denominator
+            // so the end-of-run accounting gate closes.
+            total_params += (experts * per_expert) as u64 - n_elements as u64;
             quantized_params += (experts * per_expert) as u64;
             eprintln!(
                 "  {:>8}: {} -> {} per-expert MQ4G256",
@@ -7150,6 +7155,14 @@ fn handle_main_quant(
                     } else {
                         n_elements
                     };
+                    // For non-2-D tensors the encoder only needs the flat group
+                    // count: m*k must equal the element count. shape[0] can be a
+                    // middle dimension (e.g. [1024,1,4]) and would overstate m.
+                    let m_dim = if meta.shape.len() == 2 {
+                        meta.shape[0]
+                    } else {
+                        1
+                    };
                     if k_dim % 256 == 0 {
                         let signs1 = gen_fwht_signs(42, 256);
                         let signs2 = gen_fwht_signs(1042, 256);
@@ -7157,7 +7170,6 @@ fn handle_main_quant(
                             (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                         {
                             if awq_eligible(name) {
-                                let m_dim = meta.shape[0];
                                 let selected = compute_awq_scales_for_weight(
                                     name, im_weights, alpha, &f32_data, m_dim, k_dim, &signs1,
                                     &signs2,
@@ -7174,12 +7186,10 @@ fn handle_main_quant(
                                 awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
                                 quantize_mq4g256v2_selected(&scaled, m_dim, k_dim, &signs1, &signs2)
                             } else {
-                                let m_dim = meta.shape[0];
                                 let k = k_dim;
                                 quantize_mq4g256v2_selected(&f32_data, m_dim, k, &signs1, &signs2)
                             }
                         } else {
-                            let m_dim = meta.shape[0];
                             let k = k_dim;
                             quantize_mq4g256v2_selected(&f32_data, m_dim, k, &signs1, &signs2)
                         };
