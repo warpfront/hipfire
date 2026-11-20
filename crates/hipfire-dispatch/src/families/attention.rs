@@ -1351,7 +1351,7 @@ fn dispatch_attend(
                 // read instead of six. Measured positive on q8 at every ctx
                 // (short +1.7%, medium +5.6%, long +10-12%, no overlap);
                 // lloyd4 V keeps the scalar tile (GQA loses there at every
-                // ctx). Exact gfx1100, H24/KV4/D256 geometry, v_mode 8 only;
+                // ctx). gfx1100/gfx1151, H24/KV4/D256 geometry, v_mode 8 only;
                 // `HIPFIRE_FWHT4_GQA_GFX1100=0` restores the scalar tile.
                 if gpu.flags.fwht4_gqa_decode_gfx1100_enabled()
                     && io.n_heads == 24
