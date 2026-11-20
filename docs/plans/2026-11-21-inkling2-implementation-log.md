@@ -97,9 +97,19 @@ HIPFIRE_HOME="D:\hipfire-models\inkling2-home" \
   --format mq4v2 --arch-id 24 --include-prefix "model.llm.layers.0."
 ```
 (`HIPFIRE_HOME` isolates an unrelated stale config key in the default user
-home.) A full-model quantization to `D:\hipfire-models\inkling2-mini-mq4.hfq`
-was started in the background; check its log at
-`D:\hipfire-models\inkling2-quant-full.log` for the final result.
+home.) **Full-model quantization completed** with the release binary:
+`D:\hipfire-models\inkling2-mini-mq4.hfq` — 13.9 GB, arch id 24, **6742
+tensors** (428 F16, 6144 per-expert MQ4G256, 170 MQ4G256V2). Log:
+`D:\hipfire-models\inkling2-quant-full-release3.log`. The MTP sidecar is
+excluded from the trunk. An independent Python header/index reader
+(`C:\Users\Jan\AppData\Local\Temp\opencode\hfq_inspect.py`) confirms the arch
+id, tensor count and per-expert names
+(`...experts.{E}.gate_up_proj.weight` / `down_proj.weight`).
+
+Fixes needed along the way (all committed): companion suffix is `_scale`
+(not `_weight_scale`); MQ4V2 `m` must be 1 for non-2-D tensors; packed-vs-logical
+param accounting; MXFP8 experts must be dequantized per 2-D slice; expert names
+need `.weight`; `mtp.safetensors` must be excluded.
 
 ## Next steps, in order
 
