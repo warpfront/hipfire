@@ -881,6 +881,10 @@ fn abort_helper_emits_exactly_one_correlated_aborted_terminal() {
         "never a success done on abort, got: {text}"
     );
     assert_eq!(
+        events[1]["loop"], "legacy",
+        "G12: every done names its loop"
+    );
+    assert_eq!(
         events[1].get("id").and_then(|v| v.as_str()),
         Some("req-abort")
     );
