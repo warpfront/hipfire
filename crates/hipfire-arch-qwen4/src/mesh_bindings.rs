@@ -421,7 +421,7 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
             }
             if rank.bundle.state.position != epoch.start_position
                 || end > rank.bundle.state.max_seq_len
-                || epoch.actual_rows > rank.forward.scratch.max_chunk
+                || epoch.actual_rows > rank.forward.mesh_rows_limit(epoch.route)
             {
                 return Err("Qwen4 mesh rank position or capacity disagrees with epoch".into());
             }
