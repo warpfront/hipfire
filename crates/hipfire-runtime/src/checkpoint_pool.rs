@@ -33,6 +33,36 @@ pub trait CheckpointBlob {
     fn bytes_len(&self) -> u64;
 }
 
+/// Bytes of checkpoint blobs to release before a device map of `need` bytes.
+///
+/// `free` is one `device_mem_info` reading. The driver frees buffers
+/// asynchronously, so a reading taken just after a free still reports the
+/// old value; callers therefore account each freed blob arithmetically
+/// instead of re-querying. `sizes` must follow eviction order (unprotected
+/// first, then soft-protected — see [`CheckpointPool::drain_candidates`]).
+/// Returns 0 when no drain is needed, otherwise the smallest prefix of
+/// `sizes` covering `need + reserve`, or every size when none can cover it.
+pub fn checkpoint_drain_bytes(
+    free: u64,
+    need: u64,
+    reserve: u64,
+    sizes: impl IntoIterator<Item = u64>,
+) -> u64 {
+    let mut missing = need.saturating_add(reserve).saturating_sub(free);
+    if missing == 0 {
+        return 0;
+    }
+    let mut target = 0u64;
+    for size in sizes {
+        target = target.saturating_add(size);
+        missing = missing.saturating_sub(size);
+        if missing == 0 {
+            break;
+        }
+    }
+    target
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Pool entry
 // ───────────────────────────────────────────────────────────────────────────
@@ -328,6 +358,31 @@ impl<B: CheckpointBlob> CheckpointPool<B> {
         let key = self.find_oldest_unpinned_key_excluding(excluded)?;
         let blob = self.evict_internal(key.clone())?;
         Some((key, blob))
+    }
+
+    /// Sizes of unpinned blobs in drain order: `(unprotected, protected)`,
+    /// each oldest first. Mirrors the two-pass `pop_lru_excluding` then
+    /// `pop_lru` sequence used when a VMM map needs device room, so the
+    /// caller can size the drain from one memory reading and one snapshot.
+    /// Hard pins are never candidates: `plan_resume` pins a checkpoint
+    /// between planning and restore.
+    pub fn drain_candidates(&self, protected: &HashSet<CheckpointId>) -> (Vec<u64>, Vec<u64>) {
+        let mut entries: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.pins == 0)
+            .map(|(_, e)| (e.lru_stamp, protected.contains(&e.id), e.blob.bytes_len()))
+            .collect();
+        entries.sort_unstable_by_key(|&(stamp, _, _)| stamp);
+        let (mut unprotected, mut soft) = (Vec::new(), Vec::new());
+        for (_, is_protected, bytes) in entries {
+            if is_protected {
+                soft.push(bytes);
+            } else {
+                unprotected.push(bytes);
+            }
+        }
+        (unprotected, soft)
     }
 
     /// Explicitly evict the checkpoint at `(domain, p, fp)`.
@@ -1474,5 +1529,52 @@ mod tests {
         all.insert(id256);
         assert!(pool.pop_lru_excluding(&all).is_none());
         assert!(pool.pop_lru().is_some());
+    }
+
+    #[test]
+    fn checkpoint_drain_bytes_uses_one_reading_and_the_smallest_sufficient_prefix() {
+        // Enough device memory for map + reserve: no drain, no query loop.
+        assert_eq!(checkpoint_drain_bytes(1200, 100, 100, [4096]), 0);
+        // One reading (300 free) sets a 300-byte shortfall; two small blobs
+        // cover it and the large one is left resident.
+        assert_eq!(checkpoint_drain_bytes(300, 100, 500, [64, 256, 4096]), 320);
+        // Nothing covers the shortfall: drain everything available.
+        assert_eq!(checkpoint_drain_bytes(0, 100, 500, [64, 256]), 320);
+        // No candidates at all: report zero rather than looping forever.
+        assert_eq!(checkpoint_drain_bytes(0, 100, 500, []), 0);
+        // Saturating arithmetic at the extremes.
+        assert_eq!(
+            checkpoint_drain_bytes(0, u64::MAX, 512, [u64::MAX]),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn drain_candidates_orders_unprotected_before_soft_protected() {
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
+        let d = test_domain("drain-order");
+        pool.insert(d.clone(), 128, fp(128), HostBlob { bytes: 11 });
+        let (middle, _) = pool.insert(d.clone(), 256, fp(256), HostBlob { bytes: 22 });
+        pool.insert(d.clone(), 384, fp(384), HostBlob { bytes: 33 });
+        let mut protected = HashSet::new();
+        protected.insert(middle);
+        assert_eq!(
+            pool.drain_candidates(&protected),
+            (vec![11, 33], vec![22]),
+            "an older protected blob does not jump ahead of unprotected ones"
+        );
+        assert!(pool.pin(&d, 128, fp(128)));
+        assert_eq!(
+            pool.drain_candidates(&protected),
+            (vec![33], vec![22]),
+            "a hard pin is never a candidate"
+        );
+        // The two-pass pops consume exactly that order.
+        assert_eq!(pool.pop_lru_excluding(&protected).unwrap().1.bytes, 33);
+        assert_eq!(pool.pop_lru().unwrap().1.bytes, 22);
+        assert!(
+            pool.contains(&d, 128, fp(128)),
+            "the pinned entry survives both passes"
+        );
     }
 }

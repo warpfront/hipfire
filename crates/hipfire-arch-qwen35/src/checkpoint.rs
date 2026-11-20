@@ -6,6 +6,10 @@
 //! GPU capture/restore over a live `DeltaNetState`, and re-exports so
 //! existing `crate::checkpoint::…` paths keep working.
 
+use std::collections::HashSet;
+
+use hipfire_runtime::checkpoint_pool::checkpoint_drain_bytes;
+
 use crate::qwen35::DeltaNetState;
 use crate::speculative::DeltaNetSnapshot;
 use hip_bridge::{HipError, HipResult};
@@ -50,6 +54,58 @@ fn checkpoint_device_room(
             "[prefix-cache] freed {freed} checkpoint bytes to leave room for a {bytes} B capture (device free {free})"
         );
     }
+}
+
+/// Free unpinned checkpoints until the next VMM granule map has its reserve.
+///
+/// Snapshots are raw `hipMalloc`s beside the VMM pool. A granule map that
+/// runs out of device memory poisons the mapper, so this runs before the
+/// map, not only when a new checkpoint is captured. Soft-protected blobs go
+/// last (protection is a priority, not a pin), but hard pins survive: a
+/// request pins its checkpoint between `plan_resume` and restore.
+///
+/// `hipMemGetInfo` lags after a `hipFree`, so free memory is read once and
+/// each freed blob is counted arithmetically; re-querying would over-free.
+/// The caller only invokes this when a map is actually pending.
+///
+/// Returns freed bytes.
+pub(crate) fn free_checkpoints_for_vmm_map(
+    gpu: &mut Gpu,
+    pool: &mut CheckpointPool<DeltaNetSnapshot>,
+    need: u64,
+    protected: &HashSet<CheckpointId>,
+) -> u64 {
+    let (unprotected, soft) = pool.drain_candidates(protected);
+    let free = gpu
+        .device_mem_info()
+        .map(|(free, _)| free as u64)
+        .unwrap_or(0);
+    let target = checkpoint_drain_bytes(
+        free,
+        need,
+        CHECKPOINT_MAP_RESERVE_BYTES,
+        unprotected.into_iter().chain(soft),
+    );
+    if target == 0 {
+        return 0;
+    }
+    let mut freed = 0u64;
+    while freed < target {
+        let blob = match pool.pop_lru_excluding(protected) {
+            Some((_, blob)) => Some(blob),
+            None => pool.pop_lru().map(|(_, blob)| blob),
+        };
+        let Some(blob) = blob else { break };
+        freed = freed.saturating_add(blob.bytes_len());
+        blob.free_gpu(gpu);
+    }
+    // The tensor pool can still account the freed buffers as used until it
+    // is drained (same reason as the idle reclaim).
+    gpu.drain_pool();
+    if freed > 0 {
+        eprintln!("[prefix-cache] freed {freed} checkpoint bytes before a VMM map of {need} bytes");
+    }
+    freed
 }
 
 /// Capture a checkpoint from the live `DeltaNetState` at boundary `p`

@@ -38,7 +38,9 @@ use rdna_compute::vmm_page_pool::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-use crate::checkpoint::{capture_checkpoint, plan_resume, CheckpointId, CheckpointPool};
+use crate::checkpoint::{
+    capture_checkpoint, free_checkpoints_for_vmm_map, plan_resume, CheckpointId, CheckpointPool,
+};
 use crate::forward_slots::{forward_batch_slots_graphed_opts, SlotDecodeGraph, SlotDescStaging};
 use crate::grammar;
 use crate::qwen35::{
@@ -482,6 +484,10 @@ struct ModelRig {
     vmm_row_offsets: Vec<usize>,
 }
 
+/// Empty soft-protection set for engines without a prefix index.
+static NO_SOFT_CHECKPOINTS: std::sync::LazyLock<HashSet<CheckpointId>> =
+    std::sync::LazyLock::new(HashSet::new);
+
 impl ModelRig {
     /// One batched forward step across the N slots (spec §5.2). Wraps
     /// `forward_slots::forward_batch_slots_graphed_opts` with every model
@@ -493,7 +499,12 @@ impl ModelRig {
     /// forward, and check that no two slots share a writable page. Mapping is
     /// an admission/provisioning boundary, never inside a kernel step. The
     /// mapper never unmaps while serving (see `VmmPageMapper::sync`).
-    fn sync_paged_vmm(&mut self, gpu: &mut Gpu, pool: &SlotPool) -> rdna_compute::HipResult<()> {
+    fn sync_paged_vmm(
+        &mut self,
+        gpu: &mut Gpu,
+        pool: &SlotPool,
+        soft_checkpoints: &HashSet<CheckpointId>,
+    ) -> rdna_compute::HipResult<()> {
         let Some(mapper) = self.paged_vmm.as_mut() else {
             return Ok(());
         };
@@ -501,6 +512,15 @@ impl ModelRig {
             .page_pool()
             .ok_or_else(|| rdna_compute::HipError::new(0, "VMM-paged mapper without a page pool"))?
             .page_states();
+        // A map that cannot get device memory poisons the mapper, so make
+        // room first. Zero pending bytes is the common path: no device query
+        // and no checkpoint bookkeeping at all.
+        let need = mapper.pending_map_bytes(&states) as u64;
+        if need > 0 {
+            if let Some(ckpts) = self.checkpoint_pool.as_mut() {
+                free_checkpoints_for_vmm_map(gpu, ckpts, need, soft_checkpoints);
+            }
+        }
         mapper
             .sync(gpu, &states)
             .map_err(|e| rdna_compute::HipError::new(0, &e))?;
@@ -540,6 +560,7 @@ impl ModelRig {
         prefill_slots: &[bool],
         mtp_prefill_slots: &[bool],
         dflash_prefill_slots: &[bool],
+        soft_checkpoints: &HashSet<CheckpointId>,
     ) -> rdna_compute::HipResult<()> {
         if self.paged_vmm.is_some() {
             // `forward_batch_slots` provisions each slot's write frontier
@@ -559,7 +580,7 @@ impl ModelRig {
                 }
             }
         }
-        self.sync_paged_vmm(gpu, pool)?;
+        self.sync_paged_vmm(gpu, pool, soft_checkpoints)?;
         if self.vmm.is_some() {
             return self.forward_step_vmm(
                 gpu,
@@ -5315,7 +5336,12 @@ fn run_loop(
                         "[hipfire] idle cache reclaim: {sessions} sessions, {pages} kv pages, {ckpt_bytes} checkpoint bytes, held_pages={held:?}"
                     );
                 }
-                if let Err(e) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
+                let soft = rig
+                    .prefix_index
+                    .as_ref()
+                    .map(|idx| idx.soft_checkpoints())
+                    .unwrap_or(&NO_SOFT_CHECKPOINTS);
+                if let Err(e) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft) {
                     let reason = format!("VMM-paged reclaim failed: {e}");
                     poison = Some(reason);
                     break 'serve;
@@ -6012,7 +6038,12 @@ fn run_loop(
                 // request when the budget or `hipMemCreate` refuses. A
                 // poisoned mapper has a VA range that no longer matches the
                 // bitmap; keep serving and the next map faults or overlaps.
-                if let Err(error) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
+                let soft = rig
+                    .prefix_index
+                    .as_ref()
+                    .map(|idx| idx.soft_checkpoints())
+                    .unwrap_or(&NO_SOFT_CHECKPOINTS);
+                if let Err(error) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft) {
                     let poisoned = rig
                         .model
                         .paged_vmm
@@ -6029,7 +6060,12 @@ fn run_loop(
                         "[serve] VMM page map refused slot {s}: {error}; \
                          reclaimed {pages} kv pages and {ckpt_bytes} checkpoint bytes"
                     );
-                    match rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
+                    let soft = rig
+                        .prefix_index
+                        .as_ref()
+                        .map(|idx| idx.soft_checkpoints())
+                        .unwrap_or(&NO_SOFT_CHECKPOINTS);
+                    match rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft) {
                         Ok(()) => continue,
                         Err(retry_error) => {
                             let poisoned = rig
@@ -6136,6 +6172,11 @@ fn run_loop(
                 // copy-on-write the wrong pages and mutate a shared one.
                 let write_start = rows.iter().map(|pos| *pos as usize).min().unwrap_or(0);
                 let write_end = rows.iter().map(|pos| *pos as usize + 1).max().unwrap_or(0);
+                let soft = rig
+                    .prefix_index
+                    .as_ref()
+                    .map(|idx| idx.soft_checkpoints())
+                    .unwrap_or(&NO_SOFT_CHECKPOINTS);
                 match rig
                     .pool
                     .plan_cow_for_slot(SlotId(s), write_start, write_end)
@@ -6153,7 +6194,9 @@ fn run_loop(
                         // source in place.
                         if plan.is_empty() {
                             cow_plans.push(Some((s, plan)));
-                        } else if let Err(e) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
+                        } else if let Err(e) =
+                            rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft)
+                        {
                             let poisoned = rig
                                 .model
                                 .paged_vmm
@@ -6414,6 +6457,11 @@ fn run_loop(
             let dflash_prefill_slots: Vec<bool> = (0..n)
                 .map(|s| work[s].spec == SpecKind::Dflash && prefill_slots[s])
                 .collect();
+            let soft = rig
+                .prefix_index
+                .as_ref()
+                .map(|idx| idx.soft_checkpoints())
+                .unwrap_or(&NO_SOFT_CHECKPOINTS);
             let fwd = rig.model.forward_step(
                 &mut rig.gpu,
                 &batch,
@@ -6425,6 +6473,7 @@ fn run_loop(
                 &prefill_slots,
                 &mtp_prefill_slots,
                 &dflash_prefill_slots,
+                soft,
             );
             let forward_ns = t_forward.elapsed().as_nanos() as u64;
             // ── Publication (spec §4.6 C6) ──────────────────────────────────
@@ -9206,9 +9255,14 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
                 r
             } else if rig.model.paged_vmm.is_some() {
                 let layout = rig.model.paged_vmm.as_ref().map(|m| m.page_layout());
+                let soft = rig
+                    .prefix_index
+                    .as_ref()
+                    .map(|idx| idx.soft_checkpoints())
+                    .unwrap_or(&NO_SOFT_CHECKPOINTS);
                 match rig.pool.provision_pages_for(slot, snap.seq_len) {
                     Err(e) => Err(SwapError::Gpu(e)),
-                    Ok(()) => match rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool) {
+                    Ok(()) => match rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft) {
                         Err(e) => Err(SwapError::Gpu(e.to_string())),
                         Ok(()) => {
                             let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
