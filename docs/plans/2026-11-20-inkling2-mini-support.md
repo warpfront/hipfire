@@ -417,5 +417,32 @@ published BF16 GGUF, the 48-vs-24 `block_count` trap on unsloth GGUFs,
 HF-transformers numerical parity of the controllers, and the template surface.
 Source confirmation is not numerical proof.
 
+### Phase-1 file map (checked on `origin/beta` `9e410448e`)
+
+All paths named in §1–§4 exist on this base: the toy skeleton is
+`crates/hipfire-arch-toy/{lib,arch,arch_model,carrier,toy_model}.rs` + `Cargo.toml`
++ `map.md` (note: it has **no** `config.rs` / `forward.rs` — those two are new
+files, not copies); the quantize, runtime, loader and generate files are all
+present; and `scripts/{serve_harness.py,redline_daemon_harness.py,pre-commit-ci.sh,check_fixture.sh,check-crate-maps.py,check-attribution.py}`
+exist.
+
+Two ingest consequences of the source reading:
+
+- `dequant.rs` already has `dequantize_mxfp8_e8m0_strict(weight, scale, block_k)`
+  with 2-D weight/scale, shape `[rows, cols/block_k]`, block `[1, block_k]` and
+  strict E4M3-NaN / E8M0-255 / non-finite checks. The merged converter's MXFP8
+  is exactly `block_k = 32` — **no new 2-D decoder** (the §4 correction).
+- NVFP4 has no existing decoder: `dequantize_e2m1_ue8m0_to_f32` pairs E2M1 with
+  **UE8M0**, not E4M3 scales, and `dequantize_e4m3_f32scale_to_f32` is the
+  MiniMax block-128 path. The 1×16 E2M1 + E4M3 + `amax/d` combination needs one
+  new strict function plus a `dequant.rs` dispatch arm for a 3-D scale and the
+  two F32 companions.
+
+`derive_arch_id` does longest-substring matching over `model_type` and
+`architectures` in `arch_mapping.rs`, so the §1 routing rows are sufficient —
+no other routing edit is needed. Phase-1 `serve_harness` prompts should be
+committed files under `benchmarks/prompts/` (several suitable fixtures already
+exist); do not use `/tmp`.
+
 Environment notes: downloads go to `D:\hipfire-models`; `hf` is authenticated;
 `codegraph` is absent in this worktree, so exploration uses grep/read.
