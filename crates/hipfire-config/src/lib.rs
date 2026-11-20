@@ -2823,6 +2823,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Opt in to the W4A8 MQ4V2 prefill route on exact gfx1100/gfx1151 (symmetric MQ4V2, eager, batch >= 64, K % 256 == 0): int8 per-128 activations from the fused producers and an iu8-WMMA GEMM: about 43% lower KLD than IU4 W4A4 on Strix Halo, prompts about 1.5-1.6x slower. Default off on every architecture (IU4 W4A4 stays the default); other architectures ignore it."
     ),
     process_bool_field!(
+        "kernel.fa2_lloydv_q16",
+        "fa2_lloydv_q16",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_FA2_LLOYDV_Q16",
+        "Opt in to the pre-split gfx11 FA2 lloyd-V path with Q16 (16 query rows per workgroup) and warp-specialized lloyd-V FILL for KMODE4/VMODE4. Default off; the default split path and its VMODE 4/3 guard are unchanged. Output byte-identical."
+    ),
+    process_bool_field!(
         "kernel.npu_spillover",
         "npu_spillover",
         Kernel,

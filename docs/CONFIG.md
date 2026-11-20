@@ -2785,6 +2785,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `kernel.gfx1100_fa2_split_verify` | `gfx1100_fa2_split_verify` | `HIPFIRE_GFX1100_FA2_SPLIT_VERIFY` | stable |
 | `kernel.gfx11_a4_candidates` | `gfx11_a4_candidates` | `HIPFIRE_GFX11_A4_CANDIDATES` | experimental |
 | `kernel.gfx11_a8_prefill` | `gfx11_a8_prefill` | `HIPFIRE_GFX11_A8_PREFILL` | experimental |
+| `kernel.fa2_lloydv_q16` | `fa2_lloydv_q16` | `HIPFIRE_FA2_LLOYDV_Q16` | experimental |
 | `kernel.gfx11_fa2_prefill` | `gfx11_fa2_prefill` | `HIPFIRE_GFX11_FA2_PREFILL` | stable |
 | `kernel.gfx11_iu4_gridspec` | `gfx11_iu4_gridspec` | `HIPFIRE_GFX11_IU4_GRIDSPEC` | stable |
 | `kernel.gfx11_iu4_shape` | `gfx11_iu4_shape` | `HIPFIRE_GFX11_IU4_SHAPE` | experimental |

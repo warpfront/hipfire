@@ -8742,6 +8742,17 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT4K_LLOYDV4_GFX11_SRC: &str = concat!(
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa_lloydv.gfx11.hip")
 );
 
+/// Gated Q16 + lloyd-V FILL twin of
+/// [`ATTENTION_Q8_0_FA2_GQA_FWHT4K_LLOYDV4_GFX11_SRC`]. The pre-split monolithic
+/// body admits Q16 and the warp-specialized lloyd-V FILL for KMODE4/VMODE4.
+/// Selected only by the typed `fa2_lloydv_q16` flag; the module name is
+/// unchanged and the kernel is byte-identical to the default path's output.
+pub const ATTENTION_Q8_0_FA2_GQA_FWHT4K_LLOYDV4_Q16_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 4\n#define HIPFIRE_FA2_VMODE 4\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa_lloydv_q16.gfx11.hip")
+);
+
 /// gfx11 fwht3-K + lloyd3-V FA2 source (`HIPFIRE_FA2_KMODE=3`,
 /// `HIPFIRE_FA2_VMODE=3`): K fill identical to the FWHT3K module; V
 /// dequantizes lloyd3 records (`TURBO_C3_256`, 100 B/head). Same

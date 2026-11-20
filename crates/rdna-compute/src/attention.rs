@@ -9621,10 +9621,20 @@ impl Gpu {
             || !self.functions.contains_key(PRECONVERT)
             || !self.functions.contains_key(POSTINVERT)
         {
-            let src = format!(
-                "#define HIPFIRE_FA2_KT 32\n{}",
-                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_LLOYDV4_GFX11_SRC
-            );
+            // Gated opt-in: the pre-split body restores Q16 (16 query rows per
+            // workgroup) and the warp-specialized lloyd-V FILL. The default
+            // split source and its VMODE 4/3 guard are untouched.
+            let src = if self.flags.fa2_lloydv_q16 {
+                format!(
+                    "#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_FILL 1\n{}",
+                    kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_LLOYDV4_Q16_GFX11_SRC
+                )
+            } else {
+                format!(
+                    "#define HIPFIRE_FA2_KT 32\n{}",
+                    kernels::ATTENTION_Q8_0_FA2_GQA_FWHT4K_LLOYDV4_GFX11_SRC
+                )
+            };
             self.ensure_kernel(module, &src, module)?;
             self.ensure_kernel(module, &src, PRECONVERT)?;
             self.ensure_kernel(module, &src, POSTINVERT)?;
@@ -9640,7 +9650,11 @@ impl Gpu {
         let q16_ptr = self
             .scratch
             .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
-        let grid_x = batch_size.div_ceil(8) as u32;
+        let grid_x = if self.flags.fa2_lloydv_q16 {
+            batch_size.div_ceil(16) as u32
+        } else {
+            batch_size.div_ceil(8) as u32
+        };
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -9689,7 +9703,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             module,
             [grid_x, 4, 1],
-            [128, 1, 1],
+            [if self.flags.fa2_lloydv_q16 { 256 } else { 128 }, 1, 1],
             32768,
             &mut params,
             || {
