@@ -83,7 +83,7 @@ scenario did not test what its name says, judged on the legacy arm: the
 `eos_budget` probe hit its budget before EOS, a `multi_turn` turn after the
 first reused no prefix (`cached_tokens` 0), the `abort_prefill` abort landed
 after decode tokens, or the `abort_decode` abort landed past half the budget.
-It is listed in the EVIDENCE summary; a gate that relies on that scenario
+The receipt verdict is then `pass-partial` (exit 0) and the EVIDENCE disposition names the unexercised scenarios; a gate that relies on that scenario
 needs another route or fixture. Baseline: on Gemma 4 26B-A4B, `multi_turn`,
 `abort_prefill` and `abort_decode` are all `unexercised` (HIPF-475).
 
