@@ -217,7 +217,9 @@ pub struct ExpertCacheAdmission<'a> {
     pub single_device: bool,
     pub ranked_hotset: bool,
     pub uniform_mq4: bool,
-    pub speculation: bool,
+    /// DFlash, n-gram or DSpark drafting. Native MTP is not here: its verify and repair
+    /// windows are n-row cache windows over the same sealed QT44/QT53 route.
+    pub other_speculation: bool,
     pub continuous_batch: bool,
     pub cpu_experts: bool,
     pub decode_share: bool,
@@ -238,8 +240,8 @@ pub fn admit(facts: &ExpertCacheAdmission<'_>) -> Result<(), String> {
         Some("requires an applied ranked expert hotset")
     } else if !facts.uniform_mq4 {
         Some("requires uniform QT44/QT53 experts")
-    } else if facts.speculation {
-        Some("requires speculation off")
+    } else if facts.other_speculation {
+        Some("requires DFlash, n-gram and DSpark speculation off (native MTP is admitted)")
     } else if facts.continuous_batch {
         Some("does not support continuous batching/lanes")
     } else if facts.cpu_experts {
@@ -710,7 +712,7 @@ mod tests {
             single_device: true,
             ranked_hotset: true,
             uniform_mq4: true,
-            speculation: false,
+            other_speculation: false,
             continuous_batch: false,
             cpu_experts: false,
             decode_share: false,
@@ -740,7 +742,7 @@ mod tests {
         f.uniform_mq4 = false;
         assert!(admit(&f).is_err());
         let mut f = facts();
-        f.speculation = true;
+        f.other_speculation = true;
         assert!(admit(&f).is_err());
         let mut f = facts();
         f.continuous_batch = true;

@@ -14996,7 +14996,7 @@ impl Qwen4GpuForward {
         self.moe_cache_prefill = prefill_runtimes;
         self.cache_routes = Some(routes);
         self.expert_cache = Some(cache);
-        eprintln!("  qwen4 exact expert cache: decode-only, tail cap={:?} bytes (None = default {}% of the ranked device owner), max-inflight={}, routed ids unchanged", policy.tail_bytes_cap, crate::expert_cache_config::DEFAULT_DONOR_PERCENT, policy.max_inflight);
+        eprintln!("  qwen4 exact expert cache: decode and native-MTP verify windows, tail cap={:?} bytes (None = default {}% of the ranked device owner), max-inflight={}, routed ids unchanged", policy.tail_bytes_cap, crate::expert_cache_config::DEFAULT_DONOR_PERCENT, policy.max_inflight);
         eprintln!("  qwen4 exact expert cache: dirty prompt tiles below {} rows read immutable core/host tables", self.cache_prefill_stage_min_rows(gpu));
         Ok(())
     }
@@ -16989,8 +16989,14 @@ impl Qwen4GpuForward {
             self.cache_host_prefill_active = prior;
             return result;
         }
-        if tokens.len() != 1 || wide_hidden_capture.is_some() {
-            return Err(invalid("exact expert cache serves single-row decode only: multi-row verify windows (and their wide-hidden capture) need sealed-MoE mutable-residency support for the prefill-class route (dispatch, pending); prompt entries use the canonical prefill scope"));
+        // A decode token or a native-MTP verify / repair window: one cache window of `rows`
+        // rows, sized at construction for the widest verify. Dispatch seals n > 1 on the
+        // grouped-prefill protocol and admits it only as an eager 2..=64-row window.
+        let rows = tokens.len();
+        if rows == 0 || rows > qwen4_spec_logit_rows(self.scratch.max_chunk) {
+            return Err(invalid(format!(
+                "exact expert cache window of {rows} rows exceeds the sized verify rows; prompt entries use the canonical prefill scope"
+            )));
         }
         if self.qsa_tap.is_some()
             || self.layer_capture.is_some()
@@ -16998,11 +17004,8 @@ impl Qwen4GpuForward {
             || self.mesh_segment.is_some()
             || gpu.graphs.capture_mode
         {
-            return Err(invalid("exact expert cache serves singleton AR decode; prompt entries use the canonical prefill scope"));
+            return Err(invalid("exact expert cache serves singleton AR decode and native-MTP verify windows; prompt entries use the canonical prefill scope"));
         }
-        // Row count of the window: the route buffer, readback and adapter are n-row; only the
-        // single-row window is admitted above.
-        let rows = tokens.len();
         let phase = if rows == 1 {
             hipfire_runtime::expert_cache::WindowConsumerPhase::Decode
         } else {

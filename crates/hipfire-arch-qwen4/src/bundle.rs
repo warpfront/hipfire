@@ -2130,11 +2130,6 @@ impl Qwen4Bundle {
     }
     /// Attach the reusable native MTP head and its bounded GPU state.
     pub fn attach_mtp(&mut self, gpu: &mut Gpu, max_seq: usize) -> Result<(), BundleError> {
-        if self.expert_cache.is_some() {
-            return Err(BundleError::Forward(
-                "exact expert cache requires native MTP off".into(),
-            ));
-        }
         self.ep_refuse("native MTP")?;
         Self::require_mtp_head(self.config.profile.id(), self.weights.mtp.is_some())?;
         if self.mtp.is_some() {

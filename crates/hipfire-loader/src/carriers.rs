@@ -5576,9 +5576,8 @@ pub fn qwen4_preload_resource_plan(
             single_device: !use_ranges,
             ranked_hotset: true,
             uniform_mq4: true,
-            speculation: effective_native_mtp
-                || shared.spec.mtp == Some(true)
-                || shared.spec.dflash == Some(true)
+            // Native MTP is admitted: its verify/repair windows run as n-row cache windows.
+            other_speculation: shared.spec.dflash == Some(true)
                 || shared.spec.ngram_draft == Some(true)
                 || shared.spec.dspark == Some(true),
             continuous_batch: shared.batch.lanes().is_some(),
@@ -7282,9 +7281,8 @@ fn load_qwen4_rank_unscoped(
             // any expert materialization or full model fulfillment.
             ranked_hotset: true,
             uniform_mq4: true,
-            speculation: native_mtp
-                || ctx.spec.mtp == Some(true)
-                || ctx.spec.dflash == Some(true)
+            // Native MTP is admitted: its verify/repair windows run as n-row cache windows.
+            other_speculation: ctx.spec.dflash == Some(true)
                 || ctx.spec.ngram_draft == Some(true)
                 || ctx.spec.dspark == Some(true),
             continuous_batch: shared.batch.lanes().is_some(),
