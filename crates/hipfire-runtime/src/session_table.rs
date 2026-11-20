@@ -242,7 +242,7 @@ impl SessionTable {
         Ok(plan)
     }
 
-    /// Find a resident, non-busy session whose conversation `convo` is one user
+    /// Find a non-busy session whose conversation `convo` is one user
     /// turn shorter than `want` and a prefix of it — i.e. `want` continues it.
     ///
     /// Exactly one turn shorter, not merely a prefix: a session two turns
@@ -250,6 +250,13 @@ impl SessionTable {
     /// appending the newest user turn to it would skip a turn.
     /// Returns None when more than one non-busy matching candidate exists —
     /// an LRU pick among duplicates would append to the wrong session.
+    ///
+    /// Residency is NOT a filter. The idle paged reclaim parks sessions Cold
+    /// instead of closing them, and a Cold session still owns its conversation
+    /// and tokens; a user turn after that idle gap must find the same id or
+    /// `admit` mints a new one and strands a row per turn. A Cold match has no
+    /// KV to extend, so the caller must route it through `reopen_cold` and a
+    /// re-prefill of the FULL prompt, never the resident-extension path.
     pub fn find_continuation(&self, want: &[u64], busy: &[SessionId]) -> Option<SessionId> {
         if want.len() < 2 {
             return None;
@@ -257,9 +264,6 @@ impl SessionTable {
         let expect = &want[..want.len() - 1];
         let mut candidates: Vec<(u64, u64)> = Vec::new();
         for (id, s) in self.sessions.iter() {
-            if s.residency == Residency::Cold {
-                continue;
-            }
             if s.convo.as_slice() != expect {
                 continue;
             }
@@ -661,8 +665,10 @@ mod tests {
     }
 
     #[test]
-    fn find_continuation_refuses_a_cold_session() {
-        // Cold means no snapshot exists, so there is nothing to restore.
+    fn find_continuation_matches_a_parked_cold_session() {
+        // Cold has no snapshot to restore, but the idle paged reclaim parks
+        // sessions instead of closing them: tokens and convo survive, so the
+        // next user turn must still find the same id (and take the cold path).
         let (mut pool, mut adm, mut t) = rig(2);
         let a = t.open(&mut pool, &mut adm, 1024).unwrap();
         {
@@ -671,7 +677,78 @@ mod tests {
             s.tokens = vec![1, 2, 3];
         }
         t.mark_cold(&mut pool, &mut adm, a);
+        assert_eq!(t.get(a).unwrap().residency, Residency::Cold);
+        assert_eq!(t.find_continuation(&[11, 22], &[]), Some(a));
+    }
+
+    #[test]
+    fn find_continuation_cold_match_reopens_the_same_id_without_a_row_leak() {
+        // The leak this guards: a missed Cold match lets `admit` open a new
+        // session per user turn, leaving the parked row until TTL/cap sweep.
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![11];
+            s.tokens = vec![1, 2, 3];
+        }
+        t.mark_cold(&mut pool, &mut adm, a);
+        let before = t.active();
+        let matched = t.find_continuation(&[11, 22], &[]).expect("cold match");
+        assert_eq!(matched, a);
+        assert_eq!(
+            t.reopen_cold(&mut pool, &mut adm, matched, 2048).unwrap(),
+            a
+        );
+        assert_eq!(t.active(), before, "no second session was minted");
+        assert_eq!(t.get(a).unwrap().residency, Residency::Resident);
+        assert!(t.get(a).unwrap().tokens.is_empty());
+        assert_eq!(t.get(a).unwrap().next_pos, 0);
+        // The re-prefill starts from scratch over the request's FULL prompt,
+        // not over the continuation delta.
+        let plan = t.begin_turn(&mut pool, a, &[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(plan.reused, 0);
+        assert_eq!(plan.to_prefill, 5);
+    }
+
+    #[test]
+    fn find_continuation_returns_none_for_ambiguous_matches_including_cold() {
+        // A Cold candidate is a real candidate, but duplicates still must not
+        // be resolved by recency: either row could own the continuation.
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        for id in [a, b] {
+            let s = t.get_mut(id).unwrap();
+            s.convo = vec![11];
+            s.tokens = vec![1, 2, 3];
+        }
+        t.mark_cold(&mut pool, &mut adm, a);
         assert_eq!(t.find_continuation(&[11, 22], &[]), None);
+        t.touch(b);
+        assert_eq!(t.find_continuation(&[11, 22], &[]), None);
+        t.close(&mut pool, &mut adm, b);
+        assert_eq!(t.find_continuation(&[11, 22], &[]), Some(a));
+    }
+
+    #[test]
+    fn find_continuation_refuses_busy_and_empty_sessions() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![11];
+            s.tokens = vec![1];
+        }
+        assert_eq!(t.find_continuation(&[11, 22], &[a]), None, "busy resident");
+        t.mark_cold(&mut pool, &mut adm, a);
+        assert_eq!(t.find_continuation(&[11, 22], &[a]), None, "busy cold");
+        t.get_mut(a).unwrap().tokens.clear();
+        assert_eq!(
+            t.find_continuation(&[11, 22], &[]),
+            None,
+            "nothing to re-prefill from"
+        );
     }
 
     #[test]
