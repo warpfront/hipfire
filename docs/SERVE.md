@@ -920,6 +920,14 @@ QSA K/V, GDN recurrent state, PLE history) over the one resident weight set,
 and every committed token and state byte per request is identical to that
 request run alone on the singleton route. **Default off, experimental.**
 
+On a single GPU (`serve.vmm_batch`, no `topology.ep` / `topology.pp`) that
+holds for the request that prefilled alone on the singleton and was promoted
+into a lane. A request whose prompt is prefilled as a lane tile
+(`Qwen4Bundle::lane_prefill_tile`) decodes correctly but is **not**
+byte-identical to the same request run alone: the tile leaves a GDN recurrent
+state that differs from the singleton prefill's, so its text can diverge from
+the singleton's after some tokens (greedy included). EP2 lanes are unchanged.
+
 - **Enable:** `serve.vmm_batch = true` (`HIPFIRE_SERVE_VMM_BATCH=1`) **and**
   `serve.continuous_batch_size >= 2` (`HIPFIRE_CONTINUOUS_BATCH_SIZE`); the
   row budget per step is `serve.max_batch_tokens`. The QSA context backend must
