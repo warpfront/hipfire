@@ -246,6 +246,29 @@ pub(crate) fn weighted_mse(vals: &[f64], w: &[f64], levels: &[f64; 16]) -> f64 {
     }
 }
 
+/// Score four candidate codebooks in one element pass. Each of the four
+/// accumulators is updated in the same element order as `weighted_mse`, so
+/// every returned value is bit-identical to a serial call on that candidate.
+fn weighted_mse_4(vals: &[f64], w: &[f64], levels: &[[f64; 16]; 4]) -> [f64; 4] {
+    debug_assert_eq!(vals.len(), w.len());
+    let mut sse = [0.0f64; 4];
+    let mut wsum = [0.0f64; 4];
+    for (&v, &wt) in vals.iter().zip(w.iter()) {
+        for c in 0..4 {
+            let lvl = &levels[c];
+            let idx = assign_level_midpoints(v, lvl);
+            let e = v - lvl[idx];
+            sse[c] += wt * e * e;
+            wsum[c] += wt;
+        }
+    }
+    let mut out = [0.0f64; 4];
+    for c in 0..4 {
+        out[c] = if wsum[c] > 0.0 { sse[c] / wsum[c] } else { 0.0 };
+    }
+    out
+}
+
 /// Finite E4M3 (bias=7) values with -8 ≤ e < 8, sorted unique.
 /// Includes ±0 once. Domain S = { 7.5 + e }.
 /// E4M3: normals sign·2^(exp−7)·(1+m/8) exp=1..14 m=0..7;
@@ -461,7 +484,10 @@ fn coordinate_descent_polish(vals: &[f64], w: &[f64], levels: &mut [f64; 16], r:
             let Some(idx0) = r_index_of(levels[i], r) else {
                 continue;
             };
-            for d in [-2i32, -1, 1, 2] {
+            // Build all four de-collided candidates first. This is pure
+            // level math, so it cannot change which candidate wins.
+            let mut cands = [None, None, None, None];
+            for (ci, &d) in [-2i32, -1, 1, 2].iter().enumerate() {
                 let j = idx0 as i32 + d;
                 if j < 0 || j as usize >= r.len() {
                     continue;
@@ -500,12 +526,27 @@ fn coordinate_descent_polish(vals: &[f64], w: &[f64], levels: &mut [f64; 16], r:
                         break;
                     }
                 }
-                if !ok {
+                if ok {
+                    cands[ci] = Some(cand);
+                }
+            }
+            // One element pass scores all four. Invalid slots carry the
+            // current levels so their MSE equals `mse` and cannot win.
+            let mut set = [*levels, *levels, *levels, *levels];
+            for (ci, c) in cands.iter().enumerate() {
+                if let Some(cand) = c {
+                    set[ci] = *cand;
+                }
+            }
+            let scores = weighted_mse_4(&pvals, &pwts, &set);
+            // `ci` follows [-2, -1, +1, +2], preserving first-winner order.
+            for ci in 0..4 {
+                if cands[ci].is_none() {
                     continue;
                 }
-                let m = weighted_mse(&pvals, &pwts, &cand);
+                let m = scores[ci];
                 if m + 1e-15 < mse {
-                    *levels = cand;
+                    *levels = set[ci];
                     mse = m;
                     improved = true;
                     break; // next level
