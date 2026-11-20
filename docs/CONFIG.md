@@ -1172,18 +1172,42 @@ Paged idle reclaim can be delayed by `serve.paged_idle_reclaim_ms` (default `0`
 of re-prefilling after every tool call. It is opt-in: a turn inside the
 window extends the resident session in place, so it continues from
 decode-written (session-exact) KV and DeltaNet state rather than a cold
-re-prefill of the same tokens. That is the slab route's behaviour too, but it
-changes agent output: on `benchmarks/sessions/tool_chain_agent.json`
-(ornith-1.5-35b-a3b.mq4, gfx1100) the cold re-prefill starts the first
-tool-result turn with `Let` (p 0.98) while the in-place turn starts with
-`<invoke` (p 0.97) and stops calling tools. No kernel fault was found: the
-paged WMMA prefill matches a CPU f64 oracle at unaligned starts, and the
-decode MoE route matches the batched MoE to ~4e-4 per call; the difference is
-decode-versus-prefill numerics accumulated in the Q8 DeltaNet state. The
-default therefore keeps the immediate reclaim and its cold re-prefill. The engine wakes at the earlier of
+re-prefill of the same tokens, and that changes agent output. On
+`benchmarks/sessions/tool_chain_agent.json` (ornith-1.5-35b-a3b.mq4, gfx1100)
+the cold re-prefill starts the first tool-result turn with `Let` (p 0.98)
+while the in-place turn starts with `<invoke` (p 0.97) and stops calling
+tools.
+
+The cause is not the paged KV layout and not a kernel fault. It is a decode
+attention kernel selection that differs between the routes. Paged decode sets
+`ctx_override = Some(decode_ctx_bucket(batch, 8192))`; 8192 is above the
+2048-token flash crossover, so it runs `attention_flash_q8_0_tile_batched_paged`.
+The slab route leaves `ctx_override = None` (the context, 526, is at or below
+2048) and runs `attention_q8_0_kv_batched_paged`. A 2x2 crossover experiment
+isolates this (all four arms are byte-identical on turn 1, `md5=9fb501aa98`,
+`ctx=525`, `gen=79`):
+
+- slab with `HIPFIRE_SLOTS_ATTN_CROSSOVER=0` (flash decode) is byte-identical to
+  paged with a 30 s grace on turns 1, 2 and 3.
+- paged with a 30 s grace and `HIPFIRE_SLOTS_ATTN_CROSSOVER=8192` (scalar
+  decode) is byte-identical to slab on turns 1 and 2; its turn-2 first-token
+  logprobs match slab to four decimals (`Let` -0.6707, `<tool_call>` -1.12,
+  `I` -2.18).
+
+An isolated kernel oracle (n_heads 16, n_kv_heads 2, head_dim 256, seq_len
+526/550/604, max_ctx_len 604 and 8192, `0x7f` NaN poison past `seq_len` and in
+unused block-table pages) shows both kernels agree with an independent CPU f64
+reference: flash `max_abs` 2.1e-6..3.1e-6 (`rel_l2` ~4e-7), scalar `max_abs`
+~2.0e-5 (`rel_l2` ~2e-6), flash against scalar `max_abs` ~2.0e-5, `paged`
+against `vmm_paged` bit-exact, `max_ctx_len` 604 against 8192 bit-exact, no
+NaN. The turn-2 flip is therefore f32 reduction-order drift between the two
+decode kernels, accumulated across 79 decode steps on top of the in-place
+(`ctx=1273`) versus cold (`ctx=1270`) prompt boundary. The default keeps the
+immediate reclaim and its cold re-prefill. The engine wakes at the earlier of
 that deadline and the TTL sweep, and a command arriving in the window
 restarts it. Pressure does not wait for the deadline: slot and page admission
-evict LRU idle sessions, and a step-time page shortfall parks them before
+evict LRU idle sessions, and a step-time page shortfall evicts unprotected
+cache leaves, then parks idle sessions, then evicts protected leaves before
 the request is refused.
 
 Serve HTTP surface: [`SERVE.md`](SERVE.md). The corresponding `HIPFIRE_MODEL`,
