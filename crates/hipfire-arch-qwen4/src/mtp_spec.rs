@@ -3868,7 +3868,9 @@ pub struct Qwen4MtpDrafter {
     /// otherwise preserve sticky retirement.
     floor: Qwen4Floor,
     /// `HIPFIRE_MTP_AR_FLOOR` (`0` opts out), read once per request by
-    /// `configure_request`; false restores the pre-floor chooser.
+    /// `configure_request` and always false for a sampled request (its
+    /// seeded text must not depend on wall time); false restores the
+    /// pre-floor chooser.
     floor_enabled: bool,
     /// The head rows the retired request owes (see [`HeadLag`]); empty
     /// while the head sits at the target.
@@ -10708,7 +10710,11 @@ impl MtpDrafter for Qwen4MtpDrafter {
         self.g942_refused = false;
         self.retained = None;
         self.floor_pending = None;
-        self.floor_enabled = rdna_compute::FeatureFlags::process().mtp_ar_floor;
+        let sampled = self.sampled_enabled && cfg.temp.is_finite() && cfg.temp > 1.0e-6;
+        // The floor routes on wall time, and a Leviathan window's draws depend
+        // on its depth, so a sampled request runs the deterministic floor-off
+        // chooser: the same seed must give the same text (HIPF-474).
+        self.floor_enabled = rdna_compute::FeatureFlags::process().mtp_ar_floor && !sampled;
         self.floor.clear_call_log();
         self.floor.reset_request(
             singleton_floor_min_windows(),
@@ -10722,7 +10728,6 @@ impl MtpDrafter for Qwen4MtpDrafter {
         if let Some(device) = self.sampled.as_mut().and_then(|state| state.device.take()) {
             self.device_spare.push(device);
         }
-        let sampled = self.sampled_enabled && cfg.temp.is_finite() && cfg.temp > 1.0e-6;
         self.sampled = match (sampled, &self.sampled_mode) {
             (true, Ok(mode)) => Some(SampledVerify::new(cfg, self.max_k, *mode)),
             _ => None,
@@ -12161,6 +12166,28 @@ mod tests {
         drafter
             .plan_window_with(&[0, 1], k, incremental, false)
             .expect("plan")
+    }
+
+    #[test]
+    fn sampled_request_skips_the_wall_time_floor() {
+        // HIPF-474: the floor's timed calibration and routes change a sampled
+        // request's window depths, and with them its seeded draws.
+        for (temp, floor) in [(0.0, true), (0.8, false)] {
+            let mut drafter = Qwen4MtpDrafter::new(7, 4096, None);
+            drafter.sampled_enabled = true;
+            drafter.sampled_mode = Ok(SampledMode::Leviathan);
+            drafter.configure_request(SpecRequestConfig {
+                temp,
+                rng_seed: 123,
+                ..Default::default()
+            });
+            assert_eq!(drafter.floor_enabled, floor, "temp={temp}");
+            assert_eq!(
+                plan_of(&mut drafter, 7, None).route == WindowRoute::ArCalibrate,
+                floor,
+                "temp={temp}"
+            );
+        }
     }
 
     #[test]
