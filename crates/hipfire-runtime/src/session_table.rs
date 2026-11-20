@@ -443,6 +443,7 @@ impl SessionTable {
         session.tokens.clear();
         session.next_pos = 0;
         session.published_boundary = 0;
+        session.prefix_boundary = 0;
         session.last_used = now;
         Ok(id)
     }
@@ -1147,6 +1148,40 @@ mod tests {
             t.reopen_cold(&mut pool, &mut adm, SessionId(77), 1024),
             Err(AdmitError::UnknownSession(77))
         ));
+    }
+
+    #[test]
+    fn mark_cold_preserves_prefix_boundary_and_reopen_cold_resets_it() {
+        let (mut pool, mut adm, mut t) = rig(1);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.tokens = vec![1; 512];
+            s.next_pos = 512;
+            s.published_boundary = 512;
+            s.prefix_boundary = 512;
+        }
+        t.mark_cold(&mut pool, &mut adm, a);
+        {
+            let s = t.get(a).unwrap();
+            assert_eq!(s.residency, Residency::Cold);
+            assert_eq!(s.published_boundary, 0);
+            assert_eq!(
+                s.prefix_boundary, 512,
+                "mark_cold must preserve prefix_boundary for parked soft protection"
+            );
+        }
+        assert_eq!(t.reopen_cold(&mut pool, &mut adm, a, 1024).unwrap(), a);
+        {
+            let s = t.get(a).unwrap();
+            assert_eq!(s.residency, Residency::Resident);
+            assert_eq!(s.next_pos, 0);
+            assert_eq!(s.published_boundary, 0);
+            assert_eq!(
+                s.prefix_boundary, 0,
+                "reopen_cold must reset prefix_boundary alongside tokens/next_pos/published_boundary"
+            );
+        }
     }
 
     #[test]

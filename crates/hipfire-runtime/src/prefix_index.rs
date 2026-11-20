@@ -402,6 +402,9 @@ struct WalkResult {
     pages: Vec<Handle>,
     /// Deepest usable exact checkpoint (only computed when requested).
     exact: Option<ExactCandidate>,
+    /// Deepest resumable checkpoint along the matched prefix (boundary, id),
+    /// where all full pages below the boundary are contiguously resident.
+    deepest_resumable_checkpoint: Option<(u64, CheckpointId)>,
 }
 
 impl PrefixIndex {
@@ -467,15 +470,8 @@ impl PrefixIndex {
             for h in &walk.pages {
                 pages.insert(h.handle.phys);
             }
-            let Some(tree) = self.trees.get(domain) else {
-                continue;
-            };
-            for nid in &walk.path {
-                if let Some(node) = tree.nodes.get(nid) {
-                    for cb in &node.checkpoints {
-                        checkpoints.insert(cb.checkpoint);
-                    }
-                }
+            if let Some((_, ckpt)) = walk.deepest_resumable_checkpoint {
+                checkpoints.insert(ckpt);
             }
         }
         (pages, checkpoints)
@@ -670,6 +666,7 @@ impl PrefixIndex {
                     exhausted_query: false,
                     pages: Vec::new(),
                     exact: None,
+                    deepest_resumable_checkpoint: None,
                 };
             }
         };
@@ -688,6 +685,19 @@ impl PrefixIndex {
         let mut resumable_tokens: u64 = 0;
         let mut pages: Vec<Handle> = Vec::new();
         let mut exact: Option<ExactCandidate> = None;
+        let mut deepest_resumable_checkpoint: Option<(u64, CheckpointId)> = None;
+
+        if let Some(root_node) = tree.nodes.get(&tree.root) {
+            for cb in &root_node.checkpoints {
+                let boundary = cb.token_offset;
+                let required = boundary - boundary % PAGE_TOKENS as u64;
+                if required <= contiguous_resident_tokens
+                    && deepest_resumable_checkpoint.map_or(true, |(b, _)| boundary > b)
+                {
+                    deepest_resumable_checkpoint = Some((boundary, cb.checkpoint));
+                }
+            }
+        }
 
         loop {
             if query_pos >= tokens.len() {
@@ -761,11 +771,16 @@ impl PrefixIndex {
                     if boundary <= contiguous_resident_tokens {
                         resumable_tokens = resumable_tokens.max(boundary);
                     }
+                    let required = boundary - boundary % PAGE_TOKENS as u64;
+                    if required <= contiguous_resident_tokens
+                        && deepest_resumable_checkpoint.map_or(true, |(b, _)| boundary > b)
+                    {
+                        deepest_resumable_checkpoint = Some((boundary, cb.checkpoint));
+                    }
                     if let Some(before) = exact_before {
                         // Exact boundary: only the full pages below it are
                         // required (the residual tail has no page), so the
                         // gap-free resident prefix must reach the page floor.
-                        let required = boundary - boundary % PAGE_TOKENS as u64;
                         if boundary < before
                             && required <= contiguous_resident_tokens
                             && exact.map_or(true, |e| boundary > e.boundary)
@@ -800,6 +815,7 @@ impl PrefixIndex {
             exhausted_query: query_pos >= tokens.len(),
             pages,
             exact,
+            deepest_resumable_checkpoint,
         }
     }
 
@@ -4277,6 +4293,77 @@ mod tests {
         // Real pressure: the protected prefix is reclaimed last, not pinned.
         assert_eq!(index.evict_unpinned_leaves(&mut pool, usize::MAX).len(), 2);
         assert!(index.lookup_checkpoint(&domain, &live, 300, &pool).is_err());
+    }
+
+    #[test]
+    fn protection_for_protects_only_deepest_resumable_checkpoint() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let tokens = make_tokens(512);
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..128], 1).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..256], 2).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..384], 3).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..512], 4).unwrap();
+
+        let (pages, checkpoints) = index.protection_for(&domain, &[&tokens[..512]], &pool);
+        assert_eq!(pages.len(), 4, "all four resident pages remain protected");
+        assert_eq!(
+            checkpoints.len(),
+            1,
+            "superseded ancestor checkpoints must not be protected"
+        );
+        assert!(checkpoints.contains(&CheckpointId(4)));
+        assert!(!checkpoints.contains(&CheckpointId(1)));
+        assert!(!checkpoints.contains(&CheckpointId(2)));
+        assert!(!checkpoints.contains(&CheckpointId(3)));
+    }
+
+    #[test]
+    fn protection_for_shared_prefix_protects_each_sessions_tip_only() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let tokens = make_tokens(512);
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..128], 1).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..256], 2).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..384], 3).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..512], 4).unwrap();
+
+        let (pages, checkpoints) =
+            index.protection_for(&domain, &[&tokens[..256], &tokens[..512]], &pool);
+        assert_eq!(pages.len(), 4);
+        assert_eq!(checkpoints.len(), 2);
+        assert!(checkpoints.contains(&CheckpointId(2)));
+        assert!(checkpoints.contains(&CheckpointId(4)));
+        assert!(!checkpoints.contains(&CheckpointId(1)));
+        assert!(!checkpoints.contains(&CheckpointId(3)));
+    }
+
+    #[test]
+    fn protection_for_falls_back_to_deepest_resumable_checkpoint_on_page_gap() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let tokens = make_tokens(512);
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..128], 1).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..256], 2).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..384], 3).unwrap();
+        let (res, handles) = publish_exact_with(&mut index, &mut pool, &domain, &tokens[..512], 4);
+        res.unwrap();
+        assert_eq!(handles.len(), 4);
+
+        // Drop page 3 (384..512) so 512 is no longer resumable, while 384 still is.
+        index.test_drop_page_ref(&mut pool, &domain, handles[3].handle.phys);
+        pool.drain_completed();
+
+        let (pages, checkpoints) = index.protection_for(&domain, &[&tokens[..512]], &pool);
+        assert_eq!(pages.len(), 3);
+        assert_eq!(checkpoints.len(), 1);
+        assert!(checkpoints.contains(&CheckpointId(3)));
+        assert!(!checkpoints.contains(&CheckpointId(4)));
+        assert!(!checkpoints.contains(&CheckpointId(1)));
+        assert!(!checkpoints.contains(&CheckpointId(2)));
     }
 
     #[test]
