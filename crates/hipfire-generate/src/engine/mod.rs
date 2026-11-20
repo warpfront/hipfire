@@ -2,20 +2,25 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! G12 PoC engine loop (`generation.engine_loop = engine`).
+//! G12 engine loop (`generation.engine_loop = engine`), model- and
+//! hardware-agnostic.
 //!
 //! [`RequestRun`] is one request's state machine. It never touches a GPU:
 //! [`RequestRun::next_work`] names the next forward and the `apply_*` calls
 //! fold each forward's result back in (sample with the request's own RNG,
-//! count, stop, finish). A family driver ([`qwen4`]) executes the work through
-//! the mesh executor, emits, and sends every error and abort exit through its
-//! one attested rollback.
+//! count, stop, finish). [`drive`] runs it as a batch of one over two seams:
+//! [`Forwards`] (the model on its mesh, [`mesh::MeshForwards`] over any
+//! `MeshFamily`) and [`Emit`] (the wire protocol, [`chatml::ChatMlEmit`]).
+//! [`run::run`] owns admission, the budget, metrics, the terminal and the one
+//! attested rollback for every error and abort exit.
 //!
 //! Intended differences from the legacy loops: the RNG is per request (not
 //! the process-global sampler state), an EOS token is not counted in
 //! `tokens`, and a stop on the last budget token finishes `stop`.
 
-pub mod qwen4;
+pub mod chatml;
+pub mod mesh;
+pub mod run;
 
 use hipfire_runtime::sampler::{apply_logit_policy_cpu, SamplerConfig};
 use std::collections::VecDeque;
@@ -226,6 +231,18 @@ impl RequestRun {
         self.generated
     }
 
+    /// The prompt reruns from `start` (a contained prompt fault): only while
+    /// still prefilling.
+    pub fn restart_prefill(&mut self, start: usize) -> Result<(), String> {
+        if self.pending.is_some() || start >= self.prompt_len {
+            return Err(format!(
+                "prompt rerun from {start} after prefill finished or past the prompt"
+            ));
+        }
+        self.position = start;
+        Ok(())
+    }
+
     fn sample(&mut self, row: &mut [f32], history: &[u32]) -> u32 {
         apply_logit_policy_cpu(row, history, &self.sampler);
         hipfire_runtime::llama::sample_top_k_p_with_state(
@@ -278,14 +295,26 @@ impl DoneMetrics {
     }
 }
 
-/// A family's forwards and emit for [`drive`]. Every method may enqueue GPU
-/// work only through the mesh executor; none rolls back on its own.
-pub trait EngineFamily {
-    /// Run one prefill tile from `rows.start` (ending at a session boundary
-    /// or the chunk); returns its end and, on the final tile, the logits row.
+/// A model's forwards for [`drive`]: one prompt epoch at a time, one decode
+/// epoch per token. Model- and hardware-agnostic (the mesh implementation is
+/// [`mesh::MeshForwards`]); none rolls back on its own.
+pub trait Forwards {
+    /// Run the next prompt epoch from `rows.start`; returns its end and, on
+    /// the final one, the logits row.
     fn prefill(&mut self, rows: Range<usize>) -> Result<(usize, Option<Vec<f32>>), String>;
     /// Run `token`; `top1` asks for the device argmax instead of the row.
     fn decode(&mut self, token: u32, top1: bool) -> Result<Next, String>;
+    /// After a failed prompt epoch: `Some(start)` when the model contained
+    /// the fault and the prompt reruns from `start` (already begun there).
+    fn prefill_rerun(&mut self) -> Result<Option<usize>, String> {
+        Ok(None)
+    }
+}
+
+/// A request's wire side for [`drive`]: commits and classifies tokens.
+pub trait Emit {
+    /// The whole prompt is resident: it joins the committed history.
+    fn commit_prompt(&mut self);
     /// Commit and emit `token` (it has run); returns how it classified and
     /// any template tokens to force next.
     fn emit(&mut self, token: u32) -> Result<(Verdict, Vec<u32>), String>;
@@ -303,34 +332,56 @@ pub enum Exit {
     Failed(String),
 }
 
-/// The batch-of-one loop: `next_work -> family -> apply` until done, polling
-/// abort before every forward (each prefill tile included) and reporting
-/// `prefill_progress` after every tile.
-pub fn drive(run: &mut RequestRun, family: &mut impl EngineFamily) -> Exit {
-    let reused = run.position;
+/// The batch-of-one loop: `next_work -> forwards -> apply` until done,
+/// polling abort before every forward (each prompt epoch included) and
+/// reporting `prefill_progress` after every prompt epoch. A contained prompt
+/// fault reruns the prompt once from the model's re-planned start.
+pub fn drive(
+    run: &mut RequestRun,
+    forwards: &mut impl Forwards,
+    emit: &mut (impl Emit + ?Sized),
+) -> Exit {
+    let mut reused = run.position;
+    let mut rerun = false;
     loop {
         let work = run.next_work();
         if let Work::Done(finish) = work {
             return Exit::Finished(finish);
         }
-        if family.aborted() {
+        if emit.aborted() {
             return Exit::Aborted;
         }
         let step = match work {
             Work::Prefill { rows } => {
                 let _phase = hipfire_runtime::prefill_progress::prompt_phase();
-                family.prefill(rows).and_then(|(end, logits)| {
-                    run.apply_prefill(end, logits, family.history())?;
-                    hipfire_runtime::prefill_progress::report(
-                        end - reused,
-                        run.prompt_len - reused,
-                    );
-                    Ok(())
-                })
+                match forwards.prefill(rows) {
+                    Ok((end, logits)) => {
+                        if logits.is_some() {
+                            emit.commit_prompt();
+                        }
+                        let applied = run.apply_prefill(end, logits, emit.history());
+                        hipfire_runtime::prefill_progress::report(
+                            end - reused,
+                            run.prompt_len - reused,
+                        );
+                        applied
+                    }
+                    Err(error) if !rerun => match forwards.prefill_rerun() {
+                        Ok(Some(start)) => {
+                            eprintln!("[engine] prompt reruns from {start}: {error}");
+                            rerun = true;
+                            reused = start;
+                            run.restart_prefill(start)
+                        }
+                        Ok(None) => Err(error),
+                        Err(recover) => Err(format!("{error}; rerun failed: {recover}")),
+                    },
+                    Err(error) => Err(error),
+                }
             }
-            Work::Decode { token } => family.decode(token, run.wants_top1()).and_then(|next| {
-                let (verdict, close) = family.emit(token)?;
-                run.apply_decode(next, verdict, &close, family.history());
+            Work::Decode { token } => forwards.decode(token, run.wants_top1()).and_then(|next| {
+                let (verdict, close) = emit.emit(token)?;
+                run.apply_decode(next, verdict, &close, emit.history());
                 Ok(())
             }),
             Work::Done(_) => unreachable!(),
@@ -505,46 +556,64 @@ mod tests {
         assert_eq!(admit_budget(10, 100, 16, fit), Ok(5));
     }
 
-    /// A family whose forwards follow a script: `top1` is the token after
-    /// each decoded one, `eos` classifies as EOS. Counts calls to place an
-    /// abort or a failure at an exact forward.
-    struct Fake {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// Forwards that follow a script: the decode of `t` leaves `t + 1` as the
+    /// device argmax. A shared counter places an abort or failure at an exact
+    /// forward; `rerun_from` contains every prompt failure at that start.
+    struct FakeForwards {
         len: usize,
         tile: usize,
         position: usize,
-        forwards: usize,
+        count: Rc<Cell<usize>>,
+        fail_at: Vec<usize>,
+        rerun_from: Option<usize>,
+    }
+
+    struct FakeEmit {
+        count: Rc<Cell<usize>>,
         abort_at: Option<usize>,
-        fail_at: Option<usize>,
         eos: u32,
         emitted: Vec<u32>,
         history: Vec<u32>,
+        prompt_commits: usize,
     }
 
-    impl Fake {
-        fn new(len: usize, tile: usize) -> Self {
-            Self {
+    fn fakes(len: usize, tile: usize) -> (FakeForwards, FakeEmit) {
+        let count = Rc::new(Cell::new(0));
+        (
+            FakeForwards {
                 len,
                 tile,
                 position: 0,
-                forwards: 0,
+                count: count.clone(),
+                fail_at: Vec::new(),
+                rerun_from: None,
+            },
+            FakeEmit {
+                count,
                 abort_at: None,
-                fail_at: None,
                 eos: 0,
                 emitted: Vec::new(),
                 history: Vec::new(),
-            }
-        }
+                prompt_commits: 0,
+            },
+        )
+    }
 
+    impl FakeForwards {
         fn forward(&mut self) -> Result<(), String> {
-            self.forwards += 1;
-            if self.fail_at == Some(self.forwards) {
-                return Err(format!("forward {} failed", self.forwards));
+            let n = self.count.get() + 1;
+            self.count.set(n);
+            if self.fail_at.contains(&n) {
+                return Err(format!("forward {n} failed"));
             }
             Ok(())
         }
     }
 
-    impl EngineFamily for Fake {
+    impl Forwards for FakeForwards {
         fn prefill(&mut self, rows: Range<usize>) -> Result<(usize, Option<Vec<f32>>), String> {
             assert_eq!(rows.start, self.position);
             self.forward()?;
@@ -555,21 +624,31 @@ mod tests {
         fn decode(&mut self, token: u32, top1: bool) -> Result<Next, String> {
             assert!(top1);
             self.forward()?;
-            // 1 -> 2 -> 3 -> ... with `eos` once reached.
             Ok(Next::Top1(token + 1))
+        }
+
+        fn prefill_rerun(&mut self) -> Result<Option<usize>, String> {
+            if let Some(start) = self.rerun_from {
+                self.position = start;
+            }
+            Ok(self.rerun_from)
+        }
+    }
+
+    impl Emit for FakeEmit {
+        fn commit_prompt(&mut self) {
+            self.prompt_commits += 1;
         }
 
         fn emit(&mut self, token: u32) -> Result<(Verdict, Vec<u32>), String> {
             self.emitted.push(token);
             self.history.push(token);
-            Ok((
-                if token == self.eos {
-                    Verdict::Eos
-                } else {
-                    Verdict::Continue
-                },
-                Vec::new(),
-            ))
+            let verdict = if token == self.eos {
+                Verdict::Eos
+            } else {
+                Verdict::Continue
+            };
+            Ok((verdict, Vec::new()))
         }
 
         fn history(&self) -> &[u32] {
@@ -577,59 +656,98 @@ mod tests {
         }
 
         fn aborted(&self) -> bool {
-            self.abort_at.is_some_and(|at| self.forwards >= at)
+            self.abort_at.is_some_and(|at| self.count.get() >= at)
         }
     }
 
     #[test]
     fn drive_runs_every_tile_then_decodes_to_the_budget() {
-        let mut fake = Fake::new(10, 4);
+        let (mut fwd, mut emit) = fakes(10, 4);
         let mut run = RequestRun::new(10, 0, 3, greedy(), 1);
-        assert_eq!(drive(&mut run, &mut fake), Exit::Finished(Finish::Length));
-        assert_eq!(fake.forwards, 3 + 3, "three tiles, three decodes");
-        assert_eq!(fake.emitted, [1, 2, 3]);
+        assert_eq!(
+            drive(&mut run, &mut fwd, &mut emit),
+            Exit::Finished(Finish::Length)
+        );
+        assert_eq!(fwd.count.get(), 3 + 3, "three tiles, three decodes");
+        assert_eq!(emit.emitted, [1, 2, 3]);
+        assert_eq!(emit.prompt_commits, 1, "the prompt joins the history once");
     }
 
     #[test]
     fn drive_stops_on_eos_without_counting_it() {
-        let mut fake = Fake::new(2, 8);
-        fake.eos = 3;
+        let (mut fwd, mut emit) = fakes(2, 8);
+        emit.eos = 3;
         let mut run = RequestRun::new(2, 0, 10, greedy(), 1);
-        assert_eq!(drive(&mut run, &mut fake), Exit::Finished(Finish::Stop));
-        assert_eq!(fake.emitted, [1, 2, 3]);
+        assert_eq!(
+            drive(&mut run, &mut fwd, &mut emit),
+            Exit::Finished(Finish::Stop)
+        );
+        assert_eq!(emit.emitted, [1, 2, 3]);
         assert_eq!(run.generated(), 2);
     }
 
     #[test]
     fn drive_polls_abort_between_prefill_tiles() {
-        let mut fake = Fake::new(10, 4);
-        fake.abort_at = Some(1);
+        let (mut fwd, mut emit) = fakes(10, 4);
+        emit.abort_at = Some(1);
         let mut run = RequestRun::new(10, 0, 3, greedy(), 1);
-        assert_eq!(drive(&mut run, &mut fake), Exit::Aborted);
-        assert_eq!(fake.forwards, 1, "no tile runs after the abort");
-        assert!(fake.emitted.is_empty());
+        assert_eq!(drive(&mut run, &mut fwd, &mut emit), Exit::Aborted);
+        assert_eq!(fwd.count.get(), 1, "no tile runs after the abort");
+        assert!(emit.emitted.is_empty());
     }
 
     #[test]
     fn drive_polls_abort_between_decode_steps() {
-        let mut fake = Fake::new(2, 8);
-        fake.abort_at = Some(3);
+        let (mut fwd, mut emit) = fakes(2, 8);
+        emit.abort_at = Some(3);
         let mut run = RequestRun::new(2, 0, 10, greedy(), 1);
-        assert_eq!(drive(&mut run, &mut fake), Exit::Aborted);
-        assert_eq!(fake.emitted, [1, 2]);
+        assert_eq!(drive(&mut run, &mut fwd, &mut emit), Exit::Aborted);
+        assert_eq!(emit.emitted, [1, 2]);
     }
 
     #[test]
-    fn drive_turns_a_failed_forward_into_a_failed_exit_at_once() {
+    fn drive_turns_an_uncontained_failure_into_a_failed_exit_at_once() {
         for fail_at in [2, 4] {
-            let mut fake = Fake::new(8, 4);
-            fake.fail_at = Some(fail_at);
+            let (mut fwd, mut emit) = fakes(8, 4);
+            fwd.fail_at = vec![fail_at];
             let mut run = RequestRun::new(8, 0, 10, greedy(), 1);
             assert_eq!(
-                drive(&mut run, &mut fake),
+                drive(&mut run, &mut fwd, &mut emit),
                 Exit::Failed(format!("forward {fail_at} failed"))
             );
-            assert_eq!(fake.forwards, fail_at, "nothing runs after the failure");
+            assert_eq!(fwd.count.get(), fail_at, "nothing runs after the failure");
         }
+    }
+
+    #[test]
+    fn a_contained_prompt_fault_reruns_the_prompt_once_from_the_replanned_start() {
+        let (mut fwd, mut emit) = fakes(12, 4);
+        fwd.fail_at = vec![2];
+        fwd.rerun_from = Some(0);
+        let mut run = RequestRun::new(12, 0, 2, greedy(), 1);
+        assert_eq!(
+            drive(&mut run, &mut fwd, &mut emit),
+            Exit::Finished(Finish::Length)
+        );
+        // tile 1, failed tile 2, then three tiles from 0, then two decodes.
+        assert_eq!(fwd.count.get(), 2 + 3 + 2);
+        assert_eq!(emit.emitted, [1, 2]);
+
+        let (mut fwd, mut emit) = fakes(12, 4);
+        fwd.fail_at = vec![2, 4];
+        fwd.rerun_from = Some(0);
+        let mut run = RequestRun::new(12, 0, 2, greedy(), 1);
+        assert_eq!(
+            drive(&mut run, &mut fwd, &mut emit),
+            Exit::Failed("forward 4 failed".into()),
+            "a second fault is not rerun"
+        );
+    }
+
+    #[test]
+    fn a_prompt_rerun_after_prefill_is_refused() {
+        let mut run = RequestRun::new(4, 0, 2, greedy(), 1);
+        run.apply_prefill(4, Some(row(1)), &[]).unwrap();
+        assert!(run.restart_prefill(0).is_err());
     }
 }

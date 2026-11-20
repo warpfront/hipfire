@@ -16375,11 +16375,22 @@ impl Qwen4GpuForward {
                 "a mesh forward cannot run on a decode-share forward (bank-selected scratch)",
             ));
         }
-        if rows == 0 || rows > self.scratch.max_chunk {
+        let limit = self.mesh_rows_limit(route);
+        if rows == 0 || rows > limit {
             return Err(invalid(format!(
-                "mesh forward of {rows} rows exceeds the configured capacity {}",
-                self.scratch.max_chunk
+                "mesh forward of {rows} rows exceeds the configured capacity {limit}"
             )));
+        }
+        if rows > self.scratch.max_chunk {
+            // A whole-model prompt extent beyond one chunk (an NPU pair group)
+            // tiles inside the band and routes per tile; it publishes no
+            // streams, so its layout is the chunk's, scaled to its rows.
+            let chunk = self.mesh_layout(bundle, gpu, route, self.scratch.max_chunk)?;
+            return Ok(Qwen4MeshLayout {
+                route_rows: rows,
+                bf16_streams: chunk.bf16_streams,
+                stream_bytes: chunk.stream_bytes / self.scratch.max_chunk * rows,
+            });
         }
         let ordinary_scope =
             ordinary_prefill_applies(route == MeshRoute::Prefill, false, false, &gpu.arch);
@@ -16424,7 +16435,9 @@ impl Qwen4GpuForward {
     }
 
     /// Refuse every route a mesh forward must not take: retained replay,
-    /// the NPU trunk, expert staging/EP, lanes and developer taps.
+    /// expert staging/EP, lanes, developer taps, and the NPU trunk on a band
+    /// that does not own the whole model (its pairs run layer-major across
+    /// every layer).
     fn check_mesh_admission(
         &self,
         bundle: &Qwen4Bundle,
@@ -16441,8 +16454,8 @@ impl Qwen4GpuForward {
             Some("expert parallelism")
         } else if self.expert_stage.is_some() {
             Some("expert staging")
-        } else if self.npu_trunk_loaded() {
-            Some("the NPU trunk")
+        } else if self.npu_trunk_loaded() && !(self.scope.input && self.scope.output) {
+            Some("the NPU trunk on a partial band")
         } else if self.qsa_tap.is_some() {
             Some("the QSA parity tap")
         } else if self.route_trace.is_some() {
@@ -16460,6 +16473,67 @@ impl Qwen4GpuForward {
             Some(route) => Err(invalid(format!("a mesh forward refuses {route}"))),
             None => Ok(()),
         }
+    }
+
+    /// Whether a mesh forward can run on this forward at all: no decode-share
+    /// banks, and every [`Self::check_mesh_admission`] condition.
+    pub fn mesh_admission(
+        &self,
+        bundle: &Qwen4Bundle,
+        gpu: &Gpu,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        if self.share.is_some() {
+            return Err(invalid(
+                "a mesh forward cannot run on a decode-share forward (bank-selected scratch)",
+            ));
+        }
+        self.check_mesh_admission(bundle, gpu)
+    }
+
+    /// A prompt epoch on a band that owns the whole model (input and
+    /// output): it runs the band's tiled prompt program, NPU pairs included.
+    fn whole_model_prompt(&self, route: MeshRoute) -> bool {
+        route == MeshRoute::Prefill && self.scope.input && self.scope.output
+    }
+
+    /// Rows one mesh epoch on `route` may carry: one chunk, or on a
+    /// whole-model prompt with the NPU trunk loaded one pair group
+    /// (`qwen4_prefill_segment_rows`: at most two chunks).
+    pub fn mesh_rows_limit(&self, route: MeshRoute) -> usize {
+        if self.whole_model_prompt(route) && self.npu_trunk_loaded() {
+            2 * self.scratch.max_chunk
+        } else {
+            self.scratch.max_chunk
+        }
+    }
+
+    /// The whole-model prompt epoch: the band's own prompt program over the
+    /// extent (the Single chunk-major tiles, NPU pairs where the trunk plans
+    /// them), the head on the final row when `head` is set.
+    fn forward_mesh_prompt_extent(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        head: Option<Qwen4MeshHead<'_>>,
+        wide_hidden_capture: Option<&GpuTensor>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let prior = std::mem::replace(&mut self.prefill_scope, true);
+        let result = match head {
+            None => self.forward_chunk_silent(bundle, gpu, tokens, wide_hidden_capture),
+            Some(head) => self.forward_chunk(
+                bundle,
+                gpu,
+                tokens,
+                head.logits,
+                head.top1,
+                wide_hidden_capture,
+                head.rows,
+            ),
+        };
+        self.prefill_scope = prior;
+        self.mesh_next_op = None;
+        result
     }
 
     /// Map the QSA context (and the gathered-prefill workspace) a mesh
@@ -16573,6 +16647,9 @@ impl Qwen4GpuForward {
             return Err(invalid(format!(
                 "mesh op range {ops:?} does not continue the band program at op {expected}"
             )));
+        }
+        if self.whole_model_prompt(route) && ops == full {
+            return self.forward_mesh_prompt_extent(bundle, gpu, tokens, head, wide_hidden_capture);
         }
         // Op ids map onto the trunk steps after the input band's `Embed`.
         let first_step = trunk.start + u32::from(self.scope.input);

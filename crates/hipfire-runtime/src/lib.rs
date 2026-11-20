@@ -69,6 +69,9 @@ pub mod llama_spec;
 pub mod lloyd_lut;
 pub mod loader_api;
 pub mod loop_guard;
+/// G12 engine loop: the model-family contract and the runner that executes it
+/// on any device mesh.
+pub mod mesh_family;
 pub mod mesh_placement;
 pub mod mesh_split;
 pub mod model_load;

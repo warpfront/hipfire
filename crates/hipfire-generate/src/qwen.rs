@@ -2714,7 +2714,7 @@ fn plan_spec_session(
 ///
 /// [`ArchModel::spec_session_reuse`]: hipfire_runtime::arch_model::ArchModel::spec_session_reuse
 /// [`ArchModel::session_commit_live_mesh`]: hipfire_runtime::arch_model::ArchModel::session_commit_live_mesh
-pub(crate) fn commit_session(model: &mut LoadedModel) {
+fn commit_session(model: &mut LoadedModel) {
     let LoadedModel {
         state,
         pp_gpus,
@@ -11515,39 +11515,47 @@ pub fn generate_qwen4_ar(
         );
         return;
     }
-    // The engine allowlist covers the Single load; PP and EP keep their loops.
-    if crate::engine::runs_on_engine(route)
-        && m.qwen4()
-            .is_some_and(|bundle| bundle.single_mesh_eligible())
-    {
-        let sampler = hipfire_runtime::sampler::SamplerConfig {
-            temperature: temp,
-            top_p,
-            repeat_penalty,
-            repeat_window,
-            presence_penalty,
-            frequency_penalty,
-            blocked_tokens: Vec::new(),
-            top_k,
-            min_p,
+    // G12: an allowlisted route runs on the engine loop when the model and
+    // its devices admit it; a decline (nothing emitted) keeps the loop below.
+    if crate::engine::runs_on_engine(route) {
+        let protocol = crate::engine::chatml::ChatMl {
+            started_in_think,
+            tools: tools.is_some(),
+            stop,
+            min_tokens,
+            max_think_tokens,
+            eos: vec![eos_token],
         };
-        return crate::engine::qwen4::generate_ar(
+        let request = crate::engine::run::Request {
+            sampler: hipfire_runtime::sampler::SamplerConfig {
+                temperature: temp,
+                top_p,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
+                blocked_tokens: Vec::new(),
+                top_k,
+                min_p,
+            },
+            max_tokens,
+            seed: request_seed,
+        };
+        match crate::engine::run::run(
             m,
             gpu,
             stdout,
             id,
+            route,
             &prompt_tokens,
-            started_in_think,
-            crate::engine::qwen4::ArRequest {
-                sampler,
-                max_tokens,
-                max_think_tokens,
-                stop,
-                min_tokens,
-                tools: tools.is_some(),
-                seed: request_seed,
-            },
-        );
+            &protocol,
+            request,
+        ) {
+            crate::engine::run::Outcome::Served => return,
+            crate::engine::run::Outcome::Declined(reason) => {
+                eprintln!("[engine] {} declined, legacy loop: {reason}", route.name());
+            }
+        }
     }
     let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len() + 1, m.max_seq);
     let required = prompt_tokens

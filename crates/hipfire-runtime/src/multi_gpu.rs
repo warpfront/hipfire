@@ -490,12 +490,19 @@ impl Gpus {
         }
     }
 
-    /// Lend a borrowed `gpu` to a fresh one-owner mesh for `body`, then give
-    /// it back. For a caller that owns its `Gpu` by reference (the daemon) and
-    /// must still run on the mesh executor. `body` must leave exactly the
-    /// lent device in `devices`. A panic inside aborts the process: unwinding
-    /// would leave `gpu` moved out.
-    pub fn lend_single<R>(gpu: &mut Gpu, n_layers: usize, body: impl FnOnce(&mut Gpus) -> R) -> R {
+    /// Lend a borrowed `gpu` to a one-owner `mesh` for `body`, then give it
+    /// back. For a caller that owns its `Gpu` by reference (the daemon) and
+    /// must still run on the mesh executor; `mesh` is the caller's persistent
+    /// one-device topology, so plans made against it stay valid across lends.
+    /// `body` must leave exactly the lent device in `devices`. A panic inside
+    /// aborts the process: unwinding would leave `gpu` moved out.
+    pub fn lend_single<R>(
+        gpu: &mut Gpu,
+        mesh: &DeviceMesh,
+        n_layers: usize,
+        body: impl FnOnce(&mut Gpus) -> R,
+    ) -> R {
+        assert_eq!(mesh.n_devices(), 1, "lend_single: a one-device mesh");
         struct AbortOnUnwind;
         impl Drop for AbortOnUnwind {
             fn drop(&mut self) {
@@ -507,6 +514,7 @@ impl Gpus {
         // SAFETY: the value is written back below before `gpu` is observable
         // again; any unwind in between aborts instead of dropping it twice.
         let mut gpus = Self::single(unsafe { std::ptr::read(gpu) }, n_layers);
+        gpus.mesh = mesh.clone();
         let result = body(&mut gpus);
         let lent = gpus.devices.pop();
         assert!(
