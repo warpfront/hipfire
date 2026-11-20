@@ -30,11 +30,16 @@ import time
 from pathlib import Path
 
 ARMS = ("legacy", "engine")
-# Done-envelope keys that are wall-clock measurements, never compared.
-TIMING = re.compile(r"(_ms|_s|tok_s|_us|_ns|wall|time|elapsed)$")
-# Speculation bookkeeping: judged by G-spec (mean tau), never exactly. Qwen4 MTP
-# acceptance differs between two legacy processes with identical tokens (HIPF-468).
-SPEC = re.compile(r"^(tau|cycles|accepted|mtp_windows|floor_ar_windows|ar_windows|mtp_retired|ngram_mod_.*)$")
+# Done-envelope keys that are wall-clock measurements, never compared (at any depth).
+TIMING = re.compile(r"(_ms|_s|tok_s|_us|_ns|wall|time|timings?|elapsed)$")
+# Speculation bookkeeping. Compared exactly unless the route sets "spec_noise": true
+# (Qwen4 MTP: these counters differ between two legacy processes with identical
+# tokens, HIPF-474); then judged by G-spec only. A field present on one arm only
+# is always a diff.
+SPEC = re.compile(r"^(tau|cycles|rounds|accepted|mtp_windows|floor_ar_windows|ar_windows|mtp_retired"
+                  r"|ngram_mod_.*|dflash_profit_ratio|dflash_retired|dflash_retire_cycle)$")
+# Greedy scenarios whose done envelopes feed G-spec (aborted requests excluded).
+GREEDY = ("cold", "multi_turn", "abort_prefill", "abort_decode", "eos_budget")
 LONG = (
     "Summarize the following notes in two sentences.\n"
     + "".join(f"Note {i}: the {w} sensor on rack {i % 7} reported {i * 13 % 97} units. "
@@ -105,7 +110,7 @@ class Daemon:
             elif t in ("done", "error"):
                 done = {k: v for k, v in e.items() if k not in ("type", "id", "attempt_id")}
                 text = "".join(x[1] for x in events)
-                return {"type": t, "events": events, "text": text,
+                return {"type": t, "events": events, "text": text, "max_tokens": req.get("max_tokens"),
                         "sha": hashlib.sha256(text.encode()).hexdigest()[:16], "done": done}
 
     def close(self):
@@ -149,10 +154,10 @@ def run_arm(args, route, arm, out, eos_n=None):
             hist.append({"role": "assistant", "content": r["text"]})
             turns.append(r)
         res["multi_turn"] = turns
-        # abort mid-prefill (long prompt, abort queued behind the request), then a
-        # follow-up that must not see corrupt state
+        # abort mid-prefill (long prompt, abort queued behind the request), then the
+        # same prompt again: a partially prefilled prefix must not be reused wrongly
         res["abort_prefill"] = [d.generate("ap", greedy(LONG, mt), abort_now=True),
-                                d.generate("ap-next", greedy("Write one sentence about the sea.", mt))]
+                                d.generate("ap-next", greedy(LONG, mt))]
         # abort mid-decode after 8 tokens, then the same prompt again (prefix reuse)
         cnt = "List the numbers from 1 to 100, one per line, as digits."
         res["abort_decode"] = [d.generate("ad", greedy(cnt, 4 * mt), abort_at_token=8),
@@ -178,85 +183,87 @@ def run_arm(args, route, arm, out, eos_n=None):
     return res
 
 
+def strip_timing(v):
+    if isinstance(v, dict):
+        return {k: strip_timing(x) for k, x in sorted(v.items()) if not TIMING.search(k)}
+    if isinstance(v, list):
+        return [strip_timing(x) for x in v]
+    return v
+
+
 def done_view(done):
-    return {k: v for k, v in sorted(done.items()) if not TIMING.search(k) and k != "loop"}
+    return {k: v for k, v in strip_timing(done).items() if k != "loop"}
 
 
-def compare(sc, a, b, a_name="legacy", b_name="engine"):
-    """Diff two result lists. Returns (status, notes); status equal|intended|diff."""
-    notes, intended = [], False
+# Note kinds. Only DIFF fails a scenario; UNEXERCISED marks a scenario that did not
+# test what its name says (shown in the summary, does not fail it).
+DIFF, INTENDED, SPEC_STAT, UNEXERCISED = "diff", "intended", "spec-stat", "unexercised"
+# Prompt-side done fields, compared on sampled requests too.
+PROMPT_SIDE = ("cached_tokens", "prefill_tokens")
+
+
+def compare(sc, a, b, spec_noise=False):
+    """Diff two result lists (a = legacy, b = engine). Returns (status, notes);
+    notes are [kind, text]; status is diff|unexercised|intended|equal."""
+    notes = []
+
+    def note(kind, text):
+        notes.append([kind, text])
     if len(a) != len(b):
-        return "diff", [f"{len(a)} vs {len(b)} requests"]
+        note(DIFF, f"{len(a)} vs {len(b)} requests")
     for i, (x, y) in enumerate(zip(a, b)):
         # an error outside an abort is a broken scenario, even when both arms agree
-        for name, r in ((a_name, x), (b_name, y)):
+        for name, r in (("legacy", x), ("engine", y)):
             if sc != "load" and r["type"] == "error" and not (sc.startswith("abort") and i == 0):
-                notes.append(f"[{i}] {name} error: {r['done'].get('message')}")
-        if sc.startswith("seeded"):
-            continue
-        if sc == "load":
-            if done_view(x["done"]) != done_view(y["done"]):
-                notes.append("loaded envelope differs")
-            continue
+                note(DIFF, f"[{i}] {name} error: {r['done'].get('message')}")
         dx, dy = done_view(x["done"]), done_view(y["done"])
+        if sc == "load":
+            if dx != dy:
+                note(DIFF, "loaded envelope differs")
+            continue
+        if sc.startswith("seeded"):
+            for key in PROMPT_SIDE:
+                if dx.get(key) != dy.get(key):
+                    note(DIFF, f"[{i}] {key}: {dx.get(key)!r} vs {dy.get(key)!r}")
+            continue
+        # coverage, judged on the legacy arm
         if sc == "eos_budget" and i == 0 and dx.get("finish_reason") != "stop":
-            notes.append("eos_budget: not exercised (the probe hit its budget before EOS)")
+            note(UNEXERCISED, "the probe hit its budget before EOS")
+        if sc == "multi_turn" and i > 0 and not dx.get("cached_tokens"):
+            note(UNEXERCISED, f"[{i}] turn reused no prefix (cached_tokens {dx.get('cached_tokens')!r})")
+        if sc == "abort_prefill" and i == 0 and x["events"]:
+            note(UNEXERCISED, f"abort landed after {len(x['events'])} decode events, not in prefill")
         if sc == "abort_decode" and i == 0:
+            if x.get("max_tokens") and len(x["events"]) > x["max_tokens"] // 2:
+                note(UNEXERCISED, f"abort landed at {len(x['events'])}/{x['max_tokens']} events")
             if dx.get("finish_reason") != "aborted":
-                notes.append(f"abort_decode: abort did not land (finish_reason {dx.get('finish_reason')})")
-            # abort lands asynchronously: the shorter stream must be a prefix
-            # of the longer one, and both must end aborted.
+                note(DIFF, f"abort did not land (finish_reason {dx.get('finish_reason')})")
+            if dx.get("finish_reason") != dy.get("finish_reason"):
+                note(DIFF, f"finish_reason {dx.get('finish_reason')} vs {dy.get('finish_reason')}")
+            # the abort lands asynchronously: only the common prefix is compared
             k = min(len(x["events"]), len(y["events"]))
             if x["events"][:k] != y["events"][:k]:
-                notes.append("abort_decode: streams diverge before the abort")
-            if dx.get("finish_reason") != dy.get("finish_reason"):
-                notes.append(f"abort_decode finish_reason {dx.get('finish_reason')} vs {dy.get('finish_reason')}")
+                note(DIFF, "streams diverge before the abort")
             continue
         if x["events"] != y["events"]:
-            notes.append(f"[{i}] tokens differ ({x['sha']} vs {y['sha']})")
+            note(DIFF, f"[{i}] tokens differ ({x['sha']} vs {y['sha']})")
         for key in sorted(set(dx) | set(dy)):
             vx, vy = dx.get(key), dy.get(key)
             if vx == vy:
                 continue
             # Intended diff 2: EOS is not counted in `tokens` on the engine.
             if key == "tokens" and isinstance(vx, int) and vy == vx - 1 and dx.get("finish_reason") == "stop":
-                intended = True
-                notes.append(f"[{i}] intended: tokens {vx}->{vy} (EOS not counted)")
+                note(INTENDED, f"[{i}] tokens {vx}->{vy} (EOS not counted)")
             # Intended diff 3: a stop on the last budget token is `stop`.
             elif key == "finish_reason" and sc == "eos_budget" and (vx, vy) == ("length", "stop"):
-                intended = True
-                notes.append(f"[{i}] intended: finish_reason length->stop on last budget token")
-            elif SPEC.match(key):
-                notes.append(f"[{i}] spec-stat: {key}: {vx!r} vs {vy!r}")
+                note(INTENDED, f"[{i}] finish_reason length->stop on last budget token")
+            elif SPEC.match(key) and spec_noise and key in dx and key in dy:
+                note(SPEC_STAT, f"[{i}] {key}: {vx!r} vs {vy!r}")
             else:
-                notes.append(f"[{i}] {key}: {vx!r} vs {vy!r}")
-    real = [n for n in notes if "intended:" not in n and "spec-stat:" not in n]
-    return ("diff" if real else "intended" if intended else "equal"), notes
-
-
-def self_test():
-    """GPU-free check of the diff rules (`--self-test`)."""
-    def r(text, typ="done", **done):
-        return {"type": typ, "events": [["t", c] for c in text], "sha": text, "done": done}
-    same = [r("ab", tokens=3, finish_reason="stop", prefill_ms=1.0)]
-    assert compare("cold", same, [r("ab", tokens=3, finish_reason="stop", prefill_ms=9.0, loop="engine")])[0] == "equal"
-    assert compare("cold", same, [r("ac", tokens=3, finish_reason="stop")])[0] == "diff"
-    assert compare("cold", same, [r("ab", tokens=2, finish_reason="stop")])[0] == "intended"
-    assert compare("cold", same, [r("ab", tokens=3, finish_reason="stop", cached_tokens=4)])[0] == "diff"
-    probe = r("ab", tokens=2, finish_reason="stop")
-    budget = [probe, r("ab", tokens=2, finish_reason="length")]
-    assert compare("eos_budget", budget, [probe, r("ab", tokens=2, finish_reason="stop")])[0] == "intended"
-    assert compare("cold", budget, [probe, r("ab", tokens=2, finish_reason="stop")])[0] == "diff"
-    assert compare("eos_budget", budget[1:], budget[1:])[0] == "diff"  # probe never reached EOS
-    err = [r("", "error", message="ctx")]
-    assert compare("cold", err, err)[0] == "diff"
-    assert compare("cold", [r("ab", tau=1.2, cycles=4)], [r("ab", tau=0.9, cycles=5)])[0] == "equal"
-    ab = [r("abcd", finish_reason="aborted"), r("x")]
-    assert compare("abort_decode", ab, [r("abc", finish_reason="aborted"), r("x")])[0] == "equal"
-    assert compare("abort_decode", ab, [r("abX", finish_reason="aborted"), r("x")])[0] == "diff"
-    assert compare("abort_decode", [r("ab", finish_reason="stop"), r("x")],
-                   [r("ab", finish_reason="stop"), r("x")])[0] == "diff"
-    print("self-test ok")
+                note(DIFF, f"[{i}] {key}: {vx!r} vs {vy!r}")
+    kinds = {k for k, _ in notes}
+    status = next((k for k in (DIFF, UNEXERCISED, INTENDED) if k in kinds), "equal")
+    return status, notes
 
 
 def first_tokens(rows, k=8):
@@ -270,17 +277,153 @@ def first_tokens(rows, k=8):
 
 def sampled_checks(res):
     """Intended diff 1 (per-request RNG): sampled output is not compared bitwise
-    across arms. Each arm must reproduce itself; the arms' early-token
-    distributions must stay close (total variation distance)."""
+    across arms. Each arm must reproduce itself, must honour the seed (as many
+    distinct sweep outputs as legacy), and the arms' early-token distributions
+    must stay close (total variation distance)."""
     out = {}
     for arm in ARMS:
         a, b = res[arm]["seeded_repro"]
         out[f"{arm}_reproducible"] = a["events"] == b["events"]
+        out[f"{arm}_distinct"] = len({r["sha"] for r in res[arm]["seeded_sweep"]})
     p, q = first_tokens(res["legacy"]["seeded_sweep"]), first_tokens(res["engine"]["seeded_sweep"])
     out["tvd_first8"] = round(0.5 * sum(abs(p.get(t, 0) - q.get(t, 0)) for t in set(p) | set(q)), 4)
     out["bitwise_equal_across_arms"] = all(
         x["events"] == y["events"] for x, y in zip(res["legacy"]["seeded_sweep"], res["engine"]["seeded_sweep"]))
     return out
+
+
+def loop_checks(res, expect_engine):
+    """Every done envelope carries `loop` once an arm emits it at all; the value is
+    `legacy` or the arm's own; with expect_engine, every engine-arm done is `engine`
+    (catches an engine arm that silently fell back to legacy)."""
+    out, ok = {}, True
+    for arm in ARMS:
+        vals = [r["done"].get("loop") for sc, rows in res[arm].items() if sc not in ("load", "daemon_rc")
+                for r in rows if r["type"] == "done"]
+        out[arm] = {str(v): vals.count(v) for v in set(vals)}
+        bad = [v for v in vals if v not in (None, "legacy", arm)]
+        missing = None in vals and any(v is not None for v in vals)
+        fell_back = arm == "engine" and expect_engine and any(v != "engine" for v in vals)
+        ok = ok and not bad and not missing and not fell_back
+    return ok, out
+
+
+def judge(res, route, tvd_max, perf=None):
+    """All gates over both arms' results. Pure: --self-test drives it with fakes."""
+    scenarios = {}
+    for sc in res["legacy"]:
+        if sc == "daemon_rc":
+            continue
+        status, notes = compare(sc, res["legacy"][sc], res["engine"][sc], route.get("spec_noise", False))
+        scenarios[sc] = {"status": status, "notes": notes}
+    sampled = sampled_checks(res)
+    sampled["ok"] = (sampled["legacy_reproducible"] and sampled["engine_reproducible"]
+                     and sampled["engine_distinct"] >= sampled["legacy_distinct"]
+                     and sampled["tvd_first8"] <= tvd_max)
+    # G-spec: engine mean tau >= legacy - 1 %; an engine that drops tau fails.
+    taus = {arm: [r["done"]["tau"] for sc in GREEDY if sc in res[arm]
+                  for r in res[arm][sc][int(sc.startswith("abort")):] if "tau" in r["done"]] for arm in ARMS}
+    g_spec = None
+    if taus["legacy"]:
+        g_spec = (len(taus["engine"]) == len(taus["legacy"])
+                  and statistics.mean(taus["engine"]) >= 0.99 * statistics.mean(taus["legacy"]))
+    loop_ok, loops = loop_checks(res, route.get("expect_engine", False))
+    g_perf = perf["median"]["g_perf"] if perf else None
+    ok = (all(s["status"] != DIFF for s in scenarios.values()) and sampled["ok"] and g_spec is not False
+          and loop_ok and g_perf is not False and res["legacy"]["daemon_rc"] == res["engine"]["daemon_rc"] == 0)
+    return {"ok": ok, "scenarios": scenarios, "sampled": sampled, "tau": taus, "g_spec": g_spec,
+            "loop_ok": loop_ok, "loop": loops, "g_perf": g_perf}
+
+
+def self_test():
+    """GPU-free check of the diff rules and gates (`--self-test`)."""
+    def r(text, typ="done", **done):
+        return {"type": typ, "events": [["t", c] for c in text], "sha": text, "done": done, "max_tokens": 64}
+
+    def st(sc, a, b, **kw):
+        return compare(sc, a, b, **kw)[0]
+    same = [r("ab", tokens=3, finish_reason="stop", prefill_ms=1.0)]
+    assert st("cold", same, [r("ab", tokens=3, finish_reason="stop", prefill_ms=9.0, loop="engine")]) == "equal"
+    assert st("cold", [r("ab", floor={"x_ms": 1, "k": 2})], [r("ab", floor={"x_ms": 5, "k": 2})]) == "equal"
+    assert st("cold", [r("ab", floor={"x_ms": 1, "k": 2})], [r("ab", floor={"x_ms": 1, "k": 3})]) == "diff"
+    assert st("cold", [r("ab", w=[{"t_ms": 1}])], [r("ab", w=[{"t_ms": 2}])]) == "equal"
+    assert st("cold", same, [r("ac", tokens=3, finish_reason="stop")]) == "diff"
+    assert st("cold", same, [r("ab", tokens=2, finish_reason="stop")]) == "intended"
+    assert st("cold", same, [r("ab", tokens=1, finish_reason="stop")]) == "diff"
+    assert st("cold", [r("ab", tokens=3, finish_reason="length")],
+              [r("ab", tokens=2, finish_reason="length")]) == "diff"
+    assert st("cold", same, [r("ab", tokens=3, finish_reason="stop", cached_tokens=4)]) == "diff"
+    assert st("cold", same, same + same) == "diff"
+    probe = r("ab", tokens=2, finish_reason="stop")
+    budget = [probe, r("ab", tokens=2, finish_reason="length")]
+    assert st("eos_budget", budget, [probe, r("ab", tokens=2, finish_reason="stop")]) == "intended"
+    assert st("cold", budget, [probe, r("ab", tokens=2, finish_reason="stop")]) == "diff"
+    assert st("eos_budget", [probe, probe], [probe, r("ab", tokens=2, finish_reason="length")]) == "diff"
+    assert st("eos_budget", budget[1:], budget[1:]) == "unexercised"
+    err = [r("", "error", message="ctx")]
+    assert st("cold", err, err) == "diff"
+    assert st("load", [{"done": {"arch": "a", "load_ms": 1}}], [{"done": {"arch": "a", "load_ms": 2}}]) == "equal"
+    assert st("load", [{"done": {"arch": "a"}}], [{"done": {"arch": "b"}}]) == "diff"
+    # spec counters: exact by default, loose with spec_noise, a dropped field always a diff
+    sx, sy = [r("ab", tau=1.2, cycles=4)], [r("ab", tau=0.9, cycles=5)]
+    assert st("cold", sx, sy) == "diff"
+    assert st("cold", sx, sy, spec_noise=True) == "equal"
+    assert st("cold", sx, [r("ab", cycles=5)], spec_noise=True) == "diff"
+    # aborts
+    ab = [r("abcd", finish_reason="aborted"), r("x")]
+    assert st("abort_decode", ab, [r("abc", finish_reason="aborted"), r("x")]) == "equal"
+    assert st("abort_decode", ab, [r("abX", finish_reason="aborted"), r("x")]) == "diff"
+    assert st("abort_decode", ab, [r("abcd", finish_reason="stop"), r("x")]) == "diff"
+    assert st("abort_decode", ab, [r("abcd", finish_reason="aborted"), r("y")]) == "diff"
+    assert st("abort_decode", [r("ab", finish_reason="stop"), r("x")],
+              [r("ab", finish_reason="stop"), r("x")]) == "diff"
+    assert st("abort_decode", [r("a" * 40, finish_reason="aborted"), r("x")],
+              [r("a" * 40, finish_reason="aborted"), r("x")]) == "unexercised"
+    assert st("abort_prefill", [r("", "error", message="m"), r("x")], [r("", "error", message="m"), r("x")]) != "diff"
+    assert st("abort_decode", ab, [ab[0], r("", "error", message="m")]) == "diff"
+    assert st("abort_decode", [ab[0], r("", "error", message="m")], [ab[0], r("", "error", message="m")]) == "diff"
+    assert st("abort_prefill", [r("", finish_reason="aborted"), r("x")],
+              [r("", finish_reason="aborted"), r("x")]) == "equal"
+    assert st("abort_prefill", [r("ab", finish_reason="aborted"), r("x")],
+              [r("ab", finish_reason="aborted"), r("x")]) == "unexercised"
+    mt = [r("a", cached_tokens=0), r("b", cached_tokens=0)]
+    assert st("multi_turn", mt, mt) == "unexercised"
+    assert st("multi_turn", mt, [mt[0], r("b", cached_tokens=0, tokens=-1)]) == "diff"
+    mt2 = [r("a", cached_tokens=0), r("b", cached_tokens=0, tokens=3, finish_reason="stop")]
+    assert st("multi_turn", mt2, [mt2[0], r("b", cached_tokens=0, tokens=2, finish_reason="stop")]) == "unexercised"
+    # sampled requests: tokens free, prompt-side fields exact
+    assert st("seeded_sweep", [r("ab", cached_tokens=0)], [r("xy", cached_tokens=0)]) == "equal"
+    assert st("seeded_sweep", [r("ab", cached_tokens=0)], [r("xy", cached_tokens=5)]) == "diff"
+
+    # gates
+    def arm(loop=None, tau=1.0, sweep=("abc", "bcd", "cde", "def"), repro=("p", "p"), rc=0):
+        def d(text):
+            g = r(text, finish_reason="stop", tokens=len(text), cached_tokens=0, tau=tau, loop=loop)
+            g["done"] = {k: v for k, v in g["done"].items() if v is not None}
+            return g
+        return {"load": [{"done": {"arch": "x"}}], "cold": [d("ab")],
+                "seeded_repro": [d(repro[0]), d(repro[1])], "seeded_sweep": [d(s) for s in sweep], "daemon_rc": rc}
+
+    def ok(eng, leg=None, route=None, perf=None):
+        return judge({"legacy": leg or arm(), "engine": eng}, route or {}, 0.35, perf)["ok"]
+    assert ok(arm())
+    assert ok(arm(loop="engine"), route={"expect_engine": True})
+    assert not ok(arm(rc=1))
+    assert not ok(arm(repro=("p", "q")))
+    assert not ok(arm(sweep=("xyz", "yzx", "zxy", "xzy")))  # distribution moved
+    assert not ok(arm(sweep=("abc",) * 4))  # seed ignored
+    assert not ok(arm(sweep=("abc",) * 4), leg=arm(sweep=("abc", "abd", "abe", "abf")))  # seed ignored, tvd 0.25
+    assert not ok(arm(tau=0.5), route={"spec_noise": True})
+    assert not ok(arm(tau=None), route={"spec_noise": True})
+    assert not ok(arm(loop="legacy"), route={"expect_engine": True})  # silent fallback
+    assert not ok(arm(loop="bogus"))
+    assert not ok(arm(), leg=arm(loop="engine"))
+    mixed = arm(loop="engine")
+    mixed["cold"][0]["done"].pop("loop")
+    assert not ok(mixed)
+    assert not ok(arm(), perf={"median": {"g_perf": False}})
+    assert ok(arm(), perf={"median": {"g_perf": True}})
+    print("self-test ok")
 
 
 def host_state(own_pid=None):
@@ -376,58 +519,43 @@ def main():
     for arm in ARMS:
         res[arm] = run_arm(args, route, arm, out,
                            None if arm == "legacy" else res["legacy"]["eos_budget"][0]["done"].get("tokens", 0))
-    scenarios = {}
-    for sc in res["legacy"]:
-        if sc == "daemon_rc":
-            continue
-        status, notes = compare(sc, res["legacy"][sc], res["engine"][sc])
-        scenarios[sc] = {"status": status, "notes": notes,
-                         "loop": {arm: [r["done"].get("loop") for r in res[arm][sc]] for arm in ARMS}}
-    sampled = sampled_checks(res)
-    sampled_ok = (sampled["legacy_reproducible"] and sampled["engine_reproducible"]
-                  and sampled["tvd_first8"] <= args.tvd_max)
-    # A spec route reports tau; G-spec: engine tau >= legacy tau - 1 %.
-    taus = {arm: [r["done"]["tau"] for sc in ("cold", "multi_turn", "abort_prefill", "abort_decode", "eos_budget")
-                  for r in res[arm][sc][int(sc.startswith("abort")):] if "tau" in r["done"]]
-            for arm in ARMS}
-    g_spec = None
-    if taus["legacy"] and taus["engine"]:
-        g_spec = statistics.mean(taus["engine"]) >= 0.99 * statistics.mean(taus["legacy"])
-    # Loop marker: absent (flag unknown, pre-engine binary) or the value the arm ran.
-    loop_ok = all(v in (None, "legacy", arm) for sc in scenarios.values()
-                  for arm, vs in sc["loop"].items() for v in vs)
-    ok = (all(s["status"] != "diff" for s in scenarios.values()) and sampled_ok
-          and g_spec is not False and loop_ok and res["legacy"]["daemon_rc"] == res["engine"]["daemon_rc"] == 0)
+    perf = run_perf(args, route, out) if args.perf else None
+    j = judge(res, route, args.tvd_max, perf)
+    ok = j["ok"]
 
+    me = Path(__file__).resolve()
+    git = lambda *a: subprocess.run(["git", "-C", str(me.parent), *a], capture_output=True, text=True).stdout.strip()
     receipt = {
-        "route": route, "verdict": "pass" if ok else "fail", "scenarios": scenarios,
-        "sampled": dict(sampled, ok=sampled_ok), "tau": taus, "g_spec": g_spec, "loop_ok": loop_ok,
+        "route": route, "verdict": "pass" if ok else "fail", **{k: v for k, v in j.items() if k != "ok"},
         "daemon": {"path": os.path.realpath(args.daemon),
                    "md5": hashlib.md5(Path(args.daemon).read_bytes()).hexdigest()},
         "fixture_sha256": sha256_cached(model, out),
-        "head": subprocess.run(["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
-                               capture_output=True, text=True).stdout.strip(),
-        "host": host_state(), "wall_s": None, "arms": res,
+        # identifies the harness bytes even when run from a copy outside the repo
+        "harness": {"sha256": hashlib.sha256(me.read_bytes()).hexdigest(), "git_head": git("rev-parse", "HEAD"),
+                    "dirty": bool(git("status", "--porcelain", "--", str(me)))},
+        "host": host_state(), "wall_s": round(time.time() - t0, 1), "arms": res,
     }
-    if args.perf:
-        receipt["perf"] = run_perf(args, route, out)
-    receipt["wall_s"] = round(time.time() - t0, 1)
+    if perf:
+        receipt["perf"] = perf
     rpath = out / f"{route['name']}.json"
     rpath.write_text(json.dumps(receipt, indent=1))
 
     ev = out / "EVIDENCE.md"
     if not ev.exists():
-        ev.write_text("| route | head | daemon md5 | fixture sha256 | command | receipt | result | disposition |\n"
+        ev.write_text("| route | harness sha256 | daemon md5 | fixture sha256 | command | receipt | result | disposition |\n"
                       "|---|---|---|---|---|---|---|---|\n")
-    summary = ", ".join(f"{k}={v['status']}" for k, v in scenarios.items())
-    summary += f", sampled tvd={sampled['tvd_first8']} repro={sampled['legacy_reproducible']}/{sampled['engine_reproducible']}"
-    if g_spec is not None:
-        summary += f", G-spec={g_spec}"
-    if args.perf:
-        m = receipt["perf"]["median"]
-        summary += f", perf prefill {m['prefill_tok_s_delta_pct']}% decode {m['decode_tok_s_delta_pct']}%"
+    sampled = j["sampled"]
+    summary = ", ".join(f"{k}={v['status']}" for k, v in j["scenarios"].items())
+    summary += (f", sampled tvd={sampled['tvd_first8']} repro={sampled['legacy_reproducible']}/"
+                f"{sampled['engine_reproducible']} distinct={sampled['legacy_distinct']}/{sampled['engine_distinct']}")
+    summary += f", loop={j['loop']['engine']}" + ("" if j["loop_ok"] else " (FAIL)")
+    if j["g_spec"] is not None:
+        summary += f", G-spec={j['g_spec']}"
+    if perf:
+        m = perf["median"]
+        summary += f", G-perf={m['g_perf']} prefill {m['prefill_tok_s_delta_pct']}% decode {m['decode_tok_s_delta_pct']}%"
     with ev.open("a") as f:
-        f.write(f"| {route['name']} | {receipt['head'][:9]} | {receipt['daemon']['md5'][:8]} | "
+        f.write(f"| {route['name']} | {receipt['harness']['sha256'][:12]} | {receipt['daemon']['md5'][:8]} | "
                 f"{receipt['fixture_sha256'][:16]} | `{' '.join(sys.argv)}` | {rpath} | {summary} | "
                 f"{'current' if ok else 'failed'} |\n")
     print(json.dumps({"route": route["name"], "verdict": receipt["verdict"], "summary": summary}))
