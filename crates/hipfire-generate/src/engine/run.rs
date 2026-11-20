@@ -234,7 +234,12 @@ impl Job<'_> {
                 (exit, forwards.prompt_done)
             }
         };
-        runner.end(mesh_request, gpus);
+        // A finished request is acknowledged only once its last decode
+        // epochs drained (greedy decode leaves them in flight).
+        let exit = match (exit, runner.end(mesh_request, gpus)) {
+            (Exit::Finished(_), Err(error)) => Exit::Failed(format!("drain failed: {error}")),
+            (exit, _) => exit,
+        };
         let finish = match exit {
             Exit::Finished(finish) => finish,
             Exit::Aborted => {

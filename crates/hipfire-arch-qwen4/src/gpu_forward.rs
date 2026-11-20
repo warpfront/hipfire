@@ -16630,6 +16630,44 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         ops: std::ops::Range<u32>,
     ) -> Result<(), Qwen4GpuForwardError> {
+        self.forward_mesh_chunk_from(
+            bundle,
+            gpu,
+            tokens,
+            None,
+            route_rows,
+            route,
+            head,
+            wide_hidden_capture,
+            ops,
+        )
+    }
+
+    /// [`Self::forward_mesh_chunk`] whose one Decode token is, with
+    /// `argmax_of`, the device argmax of that logits row as the previous
+    /// forward left it (`tokens` then holds a placeholder), exactly as
+    /// [`Self::forward_token_or_argmax`]: only a whole-model band can, since
+    /// it embeds the token and owns the row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_mesh_chunk_from(
+        &mut self,
+        bundle: &mut Qwen4Bundle,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        argmax_of: Option<&GpuTensor>,
+        route_rows: usize,
+        route: MeshRoute,
+        head: Option<Qwen4MeshHead<'_>>,
+        wide_hidden_capture: Option<&GpuTensor>,
+        ops: std::ops::Range<u32>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        if argmax_of.is_some()
+            && !(route == MeshRoute::Decode && self.scope.input && self.scope.output)
+        {
+            return Err(invalid(
+                "a device-argmax token feeds only a whole-model band's Decode forward",
+            ));
+        }
         if self.share.is_some() {
             return Err(invalid(
                 "a mesh forward cannot run on a decode-share forward (bank-selected scratch)",
@@ -16722,7 +16760,7 @@ impl Qwen4GpuForward {
             bundle,
             gpu,
             tokens,
-            None,
+            argmax_of,
             head.map(|head| head.logits),
             head.and_then(|head| head.top1),
             wide_hidden_capture,

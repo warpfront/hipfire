@@ -42,19 +42,16 @@ impl Forwards for MeshForwards<'_> {
         Ok((end, logits))
     }
 
-    fn decode(&mut self, token: u32, top1: bool) -> Result<Next, String> {
-        Ok(
-            match self.runner.decode_epoch(
-                self.request,
-                &mut *self.family,
-                self.gpus,
-                token,
-                top1,
-            )? {
-                DecodeOut::Top1(id) => Next::Top1(id),
-                DecodeOut::Logits(row) => Next::Logits(row),
-            },
-        )
+    fn decode(&mut self, token: Option<u32>, top1: bool) -> Result<(u32, Next), String> {
+        let (ran, out) =
+            self.runner
+                .decode_epoch(self.request, &mut *self.family, self.gpus, token, top1)?;
+        let next = match out {
+            DecodeOut::Top1(id) => Next::Top1(id),
+            DecodeOut::Logits(row) => Next::Logits(row),
+            DecodeOut::Device => Next::Device,
+        };
+        Ok((ran, next))
     }
 
     fn prefill_rerun(&mut self) -> Result<Option<usize>, String> {

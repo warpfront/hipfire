@@ -64,9 +64,10 @@ pub enum Work {
     Prefill {
         rows: Range<usize>,
     },
-    /// Run `token` (KV write), then it is emitted.
+    /// Run `token` (KV write), then it is emitted. `None`: the device argmax
+    /// of the last row, known on the host once the forward ran.
     Decode {
-        token: u32,
+        token: Option<u32>,
     },
     Done(Finish),
 }
@@ -99,10 +100,12 @@ impl Finish {
 
 /// What a decode forward left for choosing the next token.
 pub enum Next {
-    /// Device argmax of the row (plain greedy).
+    /// Device argmax of the row, read back (plain greedy).
     Top1(u32),
     /// The row, for the host sampler.
     Logits(Vec<f32>),
+    /// The row stays on the device; the next decode runs its argmax.
+    Device,
 }
 
 /// How the driver classified the token it just emitted.
@@ -120,8 +123,9 @@ pub struct RequestRun {
     position: usize,
     budget: usize,
     generated: usize,
-    /// Token the next decode runs.
-    pending: Option<u32>,
+    /// The next decode's input: `Some(Some(t))` a host token, `Some(None)`
+    /// the device argmax of the last row.
+    pending: Option<Option<u32>>,
     /// Template tokens forced ahead of sampling (think-budget close).
     forced: VecDeque<u32>,
     finish: Option<Finish>,
@@ -194,7 +198,7 @@ impl RequestRun {
         self.position = end;
         match (end == self.prompt_len, logits) {
             (true, Some(mut row)) => {
-                self.pending = Some(self.sample(&mut row, history));
+                self.pending = Some(Some(self.sample(&mut row, history)));
                 Ok(())
             }
             (false, None) => Ok(()),
@@ -220,9 +224,10 @@ impl RequestRun {
         }
         self.forced.extend(close);
         self.pending = Some(match (self.forced.pop_front(), next) {
-            (Some(token), _) => token,
-            (None, Next::Top1(token)) => token,
-            (None, Next::Logits(mut row)) => self.sample(&mut row, history),
+            (Some(token), _) => Some(token),
+            (None, Next::Top1(token)) => Some(token),
+            (None, Next::Logits(mut row)) => Some(self.sample(&mut row, history)),
+            (None, Next::Device) => None,
         });
     }
 
@@ -302,8 +307,10 @@ pub trait Forwards {
     /// Run the next prompt epoch from `rows.start`; returns its end and, on
     /// the final one, the logits row.
     fn prefill(&mut self, rows: Range<usize>) -> Result<(usize, Option<Vec<f32>>), String>;
-    /// Run `token`; `top1` asks for the device argmax instead of the row.
-    fn decode(&mut self, token: u32, top1: bool) -> Result<Next, String>;
+    /// Run `token` (`None`: the device argmax of the last row) and return
+    /// the token it ran; `top1` asks for the next token's argmax instead of
+    /// the row ([`Next::Top1`] or, kept on the device, [`Next::Device`]).
+    fn decode(&mut self, token: Option<u32>, top1: bool) -> Result<(u32, Next), String>;
     /// After a failed prompt epoch: `Some(start)` when the model contained
     /// the fault and the prompt reruns from `start` (already begun there).
     fn prefill_rerun(&mut self) -> Result<Option<usize>, String> {
@@ -379,11 +386,15 @@ pub fn drive(
                     Err(error) => Err(error),
                 }
             }
-            Work::Decode { token } => forwards.decode(token, run.wants_top1()).and_then(|next| {
-                let (verdict, close) = emit.emit(token)?;
-                run.apply_decode(next, verdict, &close, emit.history());
-                Ok(())
-            }),
+            Work::Decode { token } => {
+                forwards
+                    .decode(token, run.wants_top1())
+                    .and_then(|(ran, next)| {
+                        let (verdict, close) = emit.emit(ran)?;
+                        run.apply_decode(next, verdict, &close, emit.history());
+                        Ok(())
+                    })
+            }
             Work::Done(_) => unreachable!(),
         };
         if let Err(error) = step {
@@ -440,7 +451,7 @@ mod tests {
         run.apply_prefill(8, None, &[]).unwrap();
         assert_eq!(run.next_work(), Work::Prefill { rows: 8..10 });
         run.apply_prefill(10, Some(row(5)), &[]).unwrap();
-        assert_eq!(run.next_work(), Work::Decode { token: 5 });
+        assert_eq!(run.next_work(), Work::Decode { token: Some(5) });
     }
 
     #[test]
@@ -465,7 +476,7 @@ mod tests {
     fn budget_exhaustion_finishes_length_after_exactly_budget_tokens() {
         let mut run = prefilled(3, 0, 8, 2, 1);
         run.apply_decode(Next::Top1(2), Verdict::Continue, &[], &[]);
-        assert_eq!(run.next_work(), Work::Decode { token: 2 });
+        assert_eq!(run.next_work(), Work::Decode { token: Some(2) });
         run.apply_decode(Next::Top1(3), Verdict::Continue, &[], &[]);
         assert_eq!(run.next_work(), Work::Done(Finish::Length));
         assert_eq!(run.generated(), 2);
@@ -494,11 +505,24 @@ mod tests {
         assert!(run.wants_top1());
         run.apply_decode(Next::Top1(4), Verdict::Continue, &[6, 7], &[]);
         assert!(!run.wants_top1(), "a queued forced token needs no argmax");
-        assert_eq!(run.next_work(), Work::Decode { token: 6 });
+        assert_eq!(run.next_work(), Work::Decode { token: Some(6) });
         run.apply_decode(Next::Top1(4), Verdict::Continue, &[], &[]);
-        assert_eq!(run.next_work(), Work::Decode { token: 7 });
+        assert_eq!(run.next_work(), Work::Decode { token: Some(7) });
         run.apply_decode(Next::Top1(4), Verdict::Continue, &[], &[]);
-        assert_eq!(run.next_work(), Work::Decode { token: 4 });
+        assert_eq!(run.next_work(), Work::Decode { token: Some(4) });
+    }
+
+    #[test]
+    fn a_device_argmax_feeds_the_next_decode_unless_a_forced_token_waits() {
+        let mut run = prefilled(3, 0, 8, 10, 1);
+        run.apply_decode(Next::Device, Verdict::Continue, &[], &[]);
+        assert_eq!(run.next_work(), Work::Decode { token: None });
+        run.apply_decode(Next::Device, Verdict::Continue, &[9], &[]);
+        assert_eq!(
+            run.next_work(),
+            Work::Decode { token: Some(9) },
+            "a forced close token replaces the device argmax"
+        );
     }
 
     #[test]
@@ -513,7 +537,7 @@ mod tests {
             run.apply_prefill(1, Some(flat.clone()), &[]).unwrap();
             let mut ids = Vec::new();
             for _ in 0..32 {
-                let Work::Decode { token } = run.next_work() else {
+                let Work::Decode { token: Some(token) } = run.next_work() else {
                     unreachable!()
                 };
                 ids.push(token);
@@ -543,7 +567,7 @@ mod tests {
         let mut first = row(3);
         first[2] = 0.9;
         run.apply_prefill(1, Some(first), &[3]).unwrap();
-        assert_eq!(run.next_work(), Work::Decode { token: 2 });
+        assert_eq!(run.next_work(), Work::Decode { token: Some(2) });
     }
 
     #[test]
@@ -569,6 +593,8 @@ mod tests {
         count: Rc<Cell<usize>>,
         fail_at: Vec<usize>,
         rerun_from: Option<usize>,
+        /// The last token a decode ran (the device argmax source).
+        last: u32,
     }
 
     struct FakeEmit {
@@ -590,6 +616,7 @@ mod tests {
                 count: count.clone(),
                 fail_at: Vec::new(),
                 rerun_from: None,
+                last: 0,
             },
             FakeEmit {
                 count,
@@ -621,10 +648,14 @@ mod tests {
             Ok((self.position, (self.position == self.len).then(|| row(1))))
         }
 
-        fn decode(&mut self, token: u32, top1: bool) -> Result<Next, String> {
+        /// Greedy on the device: the decode of `t` leaves `t + 1` as the next
+        /// row's argmax, which the following `None` decode runs.
+        fn decode(&mut self, token: Option<u32>, top1: bool) -> Result<(u32, Next), String> {
             assert!(top1);
             self.forward()?;
-            Ok(Next::Top1(token + 1))
+            let ran = token.unwrap_or(self.last + 1);
+            self.last = ran;
+            Ok((ran, Next::Device))
         }
 
         fn prefill_rerun(&mut self) -> Result<Option<usize>, String> {

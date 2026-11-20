@@ -189,6 +189,8 @@ pub struct Qwen4MeshBindings<'a> {
     edge_epochs: Vec<u64>,
     head: Option<Qwen4MeshHead<'a>>,
     wide: Option<&'a GpuTensor>,
+    /// The Decode token is the device argmax of this row (one-owner mesh).
+    argmax_of: Option<&'a GpuTensor>,
     prepared: Option<ForwardEpoch>,
     ran: [bool; 8],
     layouts: [Option<Qwen4MeshLayout>; 8],
@@ -272,6 +274,7 @@ impl<'a> Qwen4MeshBindings<'a> {
             edge_epochs: Vec::new(),
             head: None,
             wide: None,
+            argmax_of: None,
             prepared: None,
             ran: [false; 8],
             layouts: [None; 8],
@@ -313,6 +316,13 @@ impl<'a> Qwen4MeshBindings<'a> {
     /// output band writes it. `None` captures nothing.
     pub fn set_wide_capture(&mut self, wide: Option<&'a GpuTensor>) {
         self.wide = wide;
+        self.prepared = None;
+    }
+
+    /// `Some(row)`: the epoch's one Decode token is the device argmax of
+    /// `row` as the previous epoch left it (the tokens hold a placeholder).
+    pub fn set_device_token(&mut self, argmax_of: Option<&'a GpuTensor>) {
+        self.argmax_of = argmax_of;
         self.prepared = None;
     }
 
@@ -531,10 +541,11 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
         // Only the output band owns the final pre-collapse streams.
         let wide = if output { self.wide } else { None };
         rank.forward
-            .forward_mesh_chunk(
+            .forward_mesh_chunk_from(
                 rank.bundle,
                 gpu,
                 self.tokens,
+                self.argmax_of,
                 epoch.route_rows,
                 epoch.route,
                 head,
