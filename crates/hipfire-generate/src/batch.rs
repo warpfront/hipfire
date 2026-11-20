@@ -1374,8 +1374,8 @@ pub fn drive_qwen_continuous_batch(
         }
         // Install AwaitingClient/Ready BEFORE publishing commit_ready; rollback if publish fails.
         for (idx, key, admission, pending_done) in to_await {
-            let mut envelope = pending_done.clone();
-            envelope["type"] = serde_json::json!("commit_ready");
+            let envelope =
+                commit_ready_envelope(&pending_done).unwrap_or_else(|| pending_done.clone());
             let marked = sched.mark_awaiting_commit(idx, pending_done.clone());
             if !marked {
                 eprintln!(
@@ -2759,8 +2759,7 @@ fn vmm_publish_commit_ready(
     admission: BatchGeneration,
     pending_done: serde_json::Value,
 ) -> bool {
-    let mut envelope = pending_done.clone();
-    envelope["type"] = serde_json::json!("commit_ready");
+    let envelope = commit_ready_envelope(&pending_done).unwrap_or_else(|| pending_done.clone());
     if !sched.mark_awaiting_commit(idx, pending_done) {
         eprintln!(
             "[batch][vmm] mark_awaiting_commit failed lane {idx} id={} — aborting lane",
@@ -6428,8 +6427,8 @@ pub fn drive_qwen35_ep_continuous_batch(
             producers[idx] = None;
         }
         for (idx, key, admission, pending_done) in to_await {
-            let mut envelope = pending_done.clone();
-            envelope["type"] = serde_json::json!("commit_ready");
+            let envelope =
+                commit_ready_envelope(&pending_done).unwrap_or_else(|| pending_done.clone());
             let marked = sched.mark_awaiting_commit(idx, pending_done.clone());
             if !marked {
                 eprintln!(
