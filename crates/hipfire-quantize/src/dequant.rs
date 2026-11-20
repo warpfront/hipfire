@@ -424,6 +424,90 @@ pub(crate) fn dequantize_e4m3_f32scale_to_f32(
     out
 }
 
+/// Dequantize an Inkling-2 NVFP4 expert tensor: 1x16 blocks of E2M1 weights
+/// with per-block E4M3 scales, then per-expert `amax / denominator`. Mirrors
+/// `_dequant_expert_chunk` in the merged llama.cpp `conversion/inkling2.py`.
+///
+/// `weight_shape` is the packed storage shape `[experts, rows, cols/2]`;
+/// the returned logical shape is `[experts, rows, cols]`. `scale_shape` is
+/// `[experts, rows, cols/16]` of raw E4M3 codes. `amax` is one F32 per expert,
+/// `denominator` one F32; both must be finite with amax >= 0 and denominator > 0.
+pub(crate) fn dequantize_nvfp4_amax_denominator(
+    weight_bytes: &[u8],
+    weight_shape: &[usize],
+    scale_bytes: &[u8],
+    scale_shape: &[usize],
+    amax_bytes: &[u8],
+    denominator_bytes: &[u8],
+) -> Result<Vec<f32>, String> {
+    if weight_shape.len() != 3 || scale_shape.len() != 3 {
+        return Err(format!(
+            "NVFP4 needs 3-D weight/scale, got {weight_shape:?} / {scale_shape:?}"
+        ));
+    }
+    let (experts, rows, cols_packed) = (weight_shape[0], weight_shape[1], weight_shape[2]);
+    let cols = cols_packed
+        .checked_mul(2)
+        .ok_or("NVFP4 column count overflow")?;
+    if cols % 16 != 0 {
+        return Err(format!("NVFP4 logical cols {cols} not divisible by 16"));
+    }
+    let blocks = cols / 16;
+    if scale_shape != [experts, rows, blocks] {
+        return Err(format!(
+            "NVFP4 scale shape {scale_shape:?} != [{experts}, {rows}, {blocks}]"
+        ));
+    }
+    if weight_bytes.len() != experts * rows * cols_packed
+        || scale_bytes.len() != experts * rows * blocks
+    {
+        return Err("NVFP4 weight/scale byte count mismatch".to_string());
+    }
+    if amax_bytes.len() != experts * 4 || denominator_bytes.len() != 4 {
+        return Err(format!(
+            "NVFP4 expected {} amax bytes and 4 denominator bytes, got {} / {}",
+            experts * 4,
+            amax_bytes.len(),
+            denominator_bytes.len()
+        ));
+    }
+    let denominator = f32::from_le_bytes(denominator_bytes[..4].try_into().unwrap());
+    if !denominator.is_finite() || denominator <= 0.0 {
+        return Err(format!(
+            "NVFP4 denominator {denominator} must be finite and > 0"
+        ));
+    }
+
+    let mut out = Vec::with_capacity(experts * rows * cols);
+    for e in 0..experts {
+        let amax = f32::from_le_bytes(amax_bytes[e * 4..e * 4 + 4].try_into().unwrap());
+        if !amax.is_finite() || amax < 0.0 {
+            return Err(format!("NVFP4 amax[{e}] {amax} must be finite and >= 0"));
+        }
+        let outer = amax / denominator;
+        for r in 0..rows {
+            let row_base = (e * rows + r) * blocks;
+            for b in 0..blocks {
+                let scale = e4m3_to_f32_strict(scale_bytes[row_base + b])?;
+                let packed = (e * rows + r) * cols_packed + b * 8;
+                for j in 0..16 {
+                    let byte = weight_bytes[packed + j / 2];
+                    let nibble = if j % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+                    let v = e2m1_to_f32(nibble) * scale * outer;
+                    if !v.is_finite() {
+                        return Err(format!(
+                            "NVFP4 non-finite dequant at expert {e} row {r} col {}",
+                            b * 16 + j
+                        ));
+                    }
+                    out.push(v);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn dequantize_hfq_q8f16(data: &[u8], n_elements: usize) -> Result<Vec<f32>, String> {
     let n_blocks = n_elements.div_ceil(32);
     let expected = n_blocks * 34;
@@ -444,4 +528,116 @@ pub(crate) fn dequantize_hfq_q8f16(data: &[u8], n_elements: usize) -> Result<Vec
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f32le(v: f32) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    #[test]
+    fn nvfp4_all_e2m1_codes_low_nibble_first() {
+        // One expert, one row, 16 logical columns; logical column j is nibble j.
+        let mut packed = vec![0u8; 8];
+        for j in 0..16 {
+            if j % 2 == 0 {
+                packed[j / 2] |= j as u8;
+            } else {
+                packed[j / 2] |= (j as u8) << 4;
+            }
+        }
+        let out = dequantize_nvfp4_amax_denominator(
+            &packed,
+            &[1, 1, 8],
+            &[56], // E4M3 1.0
+            &[1, 1, 1],
+            &f32le(1.0),
+            &f32le(1.0),
+        )
+        .unwrap();
+        let expected = [
+            0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0,
+            -6.0,
+        ];
+        assert_eq!(out.len(), 16);
+        for (got, want) in out.iter().zip(expected.iter()) {
+            assert_eq!(got.to_bits(), want.to_bits(), "E2M1 nibble order/table");
+        }
+    }
+
+    #[test]
+    fn nvfp4_block_and_outer_scale() {
+        // 16 logical columns = 8 packed bytes, one 1x16 scale block.
+        // Column 0: 0.5 (E2M1 code 1) * 2.0 (E4M3 0x40) * (6 / 3) = 2.0.
+        let mut packed = [0u8; 8];
+        packed[0] = 0x01; // low nibble 1, high nibble 0
+        let out = dequantize_nvfp4_amax_denominator(
+            &packed,
+            &[1, 1, 8],
+            &[64],
+            &[1, 1, 1],
+            &f32le(6.0),
+            &f32le(3.0),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 16);
+        assert_eq!(out[0], 2.0);
+        assert!(out[1..].iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn nvfp4_refuses_nan_scale_and_bad_companions() {
+        let packed = [0u8; 8];
+        assert!(dequantize_nvfp4_amax_denominator(
+            &packed,
+            &[1, 1, 8],
+            &[0x7f], // E4M3 NaN code
+            &[1, 1, 1],
+            &f32le(1.0),
+            &f32le(1.0),
+        )
+        .is_err());
+        assert!(dequantize_nvfp4_amax_denominator(
+            &packed,
+            &[1, 1, 8],
+            &[56],
+            &[1, 1, 1],
+            &f32le(-1.0),
+            &f32le(1.0),
+        )
+        .is_err());
+        assert!(dequantize_nvfp4_amax_denominator(
+            &packed,
+            &[1, 1, 8],
+            &[56],
+            &[1, 1, 1],
+            &f32le(1.0),
+            &f32le(0.0),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn nvfp4_refuses_nonfinite_product() {
+        // 16 logical columns; column 0: 6.0 (E2M1 7) * 448.0 (E4M3 max 0x7e)
+        // * 3e38 -> +inf. Must fail the finite-product check, not the shape check.
+        let mut packed = [0u8; 8];
+        packed[0] = 0x07;
+        let err = dequantize_nvfp4_amax_denominator(
+            &packed,
+            &[1, 1, 8],
+            &[0x7e],
+            &[1, 1, 1],
+            &f32le(3e38),
+            &f32le(1.0),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("non-finite"),
+            "expected non-finite refusal, got {err}"
+        );
+    }
 }
