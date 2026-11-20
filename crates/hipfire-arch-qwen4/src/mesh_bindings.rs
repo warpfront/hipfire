@@ -220,8 +220,8 @@ fn validate_scopes<'s>(
         }
         end = scope.band.end;
     }
-    if !(2..=8).contains(&count) {
-        return Err("Qwen4 topology.pp requires 2..=8 bands".into());
+    if !(1..=8).contains(&count) {
+        return Err("a Qwen4 mesh has 1..=8 bands".into());
     }
     if end != config.num_hidden_layers {
         return Err("Qwen4 rank bands do not cover the trunk".into());
@@ -937,7 +937,8 @@ mod tests {
     #[test]
     fn mesh_scope_tiles_and_pins() {
         let config = crate::config::compact_test_config();
-        for counts in [&[24, 24][..], &[9, 8, 8, 8, 8, 7][..]] {
+        // One band is the one-owner mesh of a Single load.
+        for counts in [&[48][..], &[24, 24][..], &[9, 8, 8, 8, 8, 7][..]] {
             assert!(validate_scopes(&config, &scopes(counts)).is_ok());
         }
         let mut bands = scopes(&[24, 24]);
@@ -952,7 +953,7 @@ mod tests {
         let bands = scopes(&[1, 47]);
         assert!(validate_scopes(&config, &bands).is_err());
         assert!(validate_scopes(&config, &scopes(&[24, 23])).is_err());
-        assert!(validate_scopes(&config, &scopes(&[48])).is_err());
+        assert!(validate_scopes(&config, &scopes(&[6, 6, 6, 6, 6, 6, 4, 4, 4])).is_err());
     }
 }
 

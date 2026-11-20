@@ -58,6 +58,9 @@ mod pp;
 use hipfire_runtime::multi_gpu::executor::MeshRoute;
 use pp::{Qwen4PpBandMeta, Qwen4PpMesh};
 pub use pp::{Qwen4PpLaneExecutor, Qwen4PpWindow};
+#[path = "bundle/single_mesh.rs"]
+mod single_mesh;
+pub use single_mesh::Qwen4SingleMesh;
 
 mod image_context;
 use image_context::ImageContext;

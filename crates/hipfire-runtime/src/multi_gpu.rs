@@ -490,6 +490,35 @@ impl Gpus {
         }
     }
 
+    /// Lend a borrowed `gpu` to a fresh one-owner mesh for `body`, then give
+    /// it back. For a caller that owns its `Gpu` by reference (the daemon) and
+    /// must still run on the mesh executor. `body` must leave exactly the
+    /// lent device in `devices`. A panic inside aborts the process: unwinding
+    /// would leave `gpu` moved out.
+    pub fn lend_single<R>(gpu: &mut Gpu, n_layers: usize, body: impl FnOnce(&mut Gpus) -> R) -> R {
+        struct AbortOnUnwind;
+        impl Drop for AbortOnUnwind {
+            fn drop(&mut self) {
+                eprintln!("Gpus::lend_single: panic while the device was lent; aborting");
+                std::process::abort();
+            }
+        }
+        let guard = AbortOnUnwind;
+        // SAFETY: the value is written back below before `gpu` is observable
+        // again; any unwind in between aborts instead of dropping it twice.
+        let mut gpus = Self::single(unsafe { std::ptr::read(gpu) }, n_layers);
+        let result = body(&mut gpus);
+        let lent = gpus.devices.pop();
+        assert!(
+            gpus.devices.is_empty(),
+            "lend_single: body changed the device set"
+        );
+        // SAFETY: `gpu` still holds the moved-out bits; overwrite without dropping.
+        unsafe { std::ptr::write(gpu, lent.expect("lend_single: body removed the device")) };
+        std::mem::forget(guard);
+        result
+    }
+
     /// Tensor-parallel constructor: bring up `tp_size` devices that each run
     /// **every** layer (PP=1), sharded within-layer per a `ShardConfig`.
     ///

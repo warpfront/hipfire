@@ -2155,6 +2155,16 @@ pub static FIELDS: &[ConfigField] = &[
         "Token window inspected by the repeated 4-gram loop guard."
     ),
     process_field!(
+        "generation.engine_loop",
+        "engine_loop",
+        Generation,
+        DefaultValue::String("legacy"),
+        ValueRule::Enum(&["legacy", "engine"]),
+        true,
+        "HIPFIRE_ENGINE_LOOP",
+        "Which generation loop runs an allowlisted route (G12 PoC): `legacy` (default) = the route's own loop, `engine` = the shared engine loop over the mesh executor. Today only the Qwen4 single-card AR route is allowlisted; every other route keeps its own loop whatever this says. Read once per process; every done envelope reports the loop that produced it as `loop`."
+    ),
+    process_field!(
         "kernel.flash_partials_batch",
         "flash_partials_batch",
         Kernel,

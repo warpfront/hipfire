@@ -11,6 +11,7 @@ runtime_config	*	draft_gemm_dump=false
 runtime_config	*	draft_subphase=false
 runtime_config	*	embed_host=true
 runtime_config	*	emulate_gpus=None
+runtime_config	*	engine_loop=false
 runtime_config	*	experimental_budget_alert=false
 runtime_config	*	flash_partials_batch=None
 runtime_config	*	kv_adaptive="off"
