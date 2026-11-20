@@ -290,7 +290,6 @@ impl Job<'_> {
             rollback(&mut *emitter, family, runner, gpus, None, run.generated());
             return Outcome::Served;
         }
-        drop(rollback);
         if state.spec_session_reuse() {
             state.session_commit_live_mesh(gpus, emitter.history());
         }
