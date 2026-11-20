@@ -111,20 +111,19 @@ Fixes needed along the way (all committed): companion suffix is `_scale`
 param accounting; MXFP8 experts must be dequantized per 2-D slice; expert names
 need `.weight`; `mtp.safetensors` must be excluded.
 
+## Current end state (2026-11-21, 26 local commits)
+
+Done: a working quantizer path and a 13.9 GB arch-24 HFQ artifact;
+typed config parsing; a 21-test CPU-oracle crate. Not done: the loader bundle,
+GPU forward, and generation route — the artifact cannot be served yet.
+
 ## Next steps, in order
 
-1. **Wire NVFP4/MXFP8 ingest into the quantizer pipeline.** `pipeline.rs` builds
-   `fp8_scale_for: HashMap<String, (usize, String)>` around line 2793 and strips
-   `.scale` / `.weight_scale_inv` suffixes. Inkling2 companions use
-   `_weight_scale`, `_weight_amax`, `_weight_outer_scale_denominator` and a U8
-   packed weight, so a separate companion map (or an extended value type) is
-   needed. `tensor_to_f32_with_optional_fp8_scale` in `dequant.rs` is called from
-   ~20 sites; prefer a narrowly scoped Inkling2 branch over a broad signature
-   change. Add a refusal for unrecognized companion layouts.
-2. **Finish the CPU oracle**: attention with relative-bias gather (sink
-   subtracted before gather), K/V clips, output gate, MoE sigmoid+bias top-8 +
-   SiTU activation, final softcap. Reference:
-   `C:\Users\Jan\AppData\Local\Temp\opencode\llama-inkling2\src\models\inkling2.cpp`.
+1. **DONE** — NVFP4/MXFP8 quantizer ingest (see above).
+2. **DONE** — CPU oracle scalar/operator set: `rmsnorm`, `clip`, `tau`,
+   `matvec`, `control`, `mix`, `convolve_static`, `relative_bias`, `situ`,
+   `sigmoid_topk`, `softcap` (21 tests). Not yet covered: full attention with
+   softmax/sink, the dynamic-conv tap path, and the MoE expert combine.
 3. **Arch crate wiring**: `arch.rs`, `arch_model.rs`, `carrier.rs`, `forward.rs`
    mirroring `hipfire-arch-toy`; register `arch_mapping.rs` rows for
    `inkling2_loop` / `inkling2_loop_text` → 24 and the class-substring row;
