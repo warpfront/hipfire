@@ -345,9 +345,12 @@ fuse only in Phase 4 behind the KLD pin.
 
 ## 5. Risks, unknowns
 
-1. **Quant→quant**: no BF16 source exists; both NVFP4→MQ4 and MXFP8→MQ4 lose
-   information the original never had to lose. Mitigation: strict dequant
-   parity first, uniform-MQ4 quality measured before any graded claim.
+1. **Quant→quant**: no original pre-quant BF16 checkpoint is published; both
+   NVFP4→MQ4(/MQ4L) and MXFP8→MQ4(/MQ4L) lose information the original never
+   had to lose. The published dequantized BF16 GGUF and `imatrix.gguf` (§0) are
+   a dequant oracle and a Lloyd-calibration input, not a pre-quant training
+   source. Mitigation: strict dequant parity first, uniform MQ4/MQ4L quality
+   measured before any graded claim.
 2. **48-visit cost model**: core layers run 3×/token; prefill is ~2.5× a
    24-layer model and KV is 48 visits deep — the 1M `model_max_length` is
    not servable on day one (cap + refuse loudly).
