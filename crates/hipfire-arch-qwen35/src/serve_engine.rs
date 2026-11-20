@@ -995,6 +995,11 @@ struct Rig {
     prefill_chunk: usize,
     /// Close parked sessions after this idle period (None = never).
     session_ttl: Option<std::time::Duration>,
+    /// Paged route only: how long the engine must stay continuously idle
+    /// before the reclaim parks sessions `Cold` and drains the prefix cache.
+    /// 0 keeps the immediate reclaim; a turn inside the window reaches the
+    /// still-resident KV instead of re-prefilling the whole context.
+    paged_idle_reclaim: std::time::Duration,
     /// Hard cap on session-table entries; 0 = auto max(64, 16 x n_slots).
     session_max: usize,
     /// Ids the engine closed internally (TTL/cap sweep only), for the
@@ -1298,7 +1303,7 @@ impl Rig {
         use hipfire_runtime::tokenizer::Tokenizer;
         use rdna_compute::kv_slots::preflight_alloc;
 
-        let (session_ttl, session_max) = session_policy_from_config();
+        let (session_ttl, session_max, paged_idle_reclaim) = session_policy_from_config();
         let mut hfq = HfqFile::open(&cfg.model_path).map_err(|e| format!("open model: {e}"))?;
         let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("config: {e}"))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -2274,12 +2279,13 @@ impl Rig {
         )
         .map_err(|e| format!("SwapManager: {e}"))?;
         eprintln!(
-            "serve: swap host-budget={} B disk-budget={} B dir={} session-ttl={:?} session-max={} model-fingerprint={:016x} instance-id={:016x}",
+            "serve: swap host-budget={} B disk-budget={} B dir={} session-ttl={:?} session-max={} paged-idle-reclaim={:?} model-fingerprint={:016x} instance-id={:016x}",
             cfg.host_budget_bytes,
             swap.store().disk_budget(),
             cfg.swap_dir.display(),
             session_ttl,
             session_max,
+            paged_idle_reclaim,
             model_fingerprint,
             instance_id
         );
@@ -2587,6 +2593,7 @@ impl Rig {
             cap_tokens: cfg.cap_tokens,
             prefill_chunk,
             session_ttl,
+            paged_idle_reclaim,
             session_max,
             closed_sessions,
             max_batch_tokens,
@@ -4498,6 +4505,29 @@ fn release_idle_sessions(rig: &mut Rig) -> usize {
     )
 }
 
+/// Park one LRU idle resident session `Cold` to return its KV pages now.
+///
+/// Step-time page pressure (a failed `set_seq_len` or granule map) arrives
+/// after admission, when the grace window may still be holding finished
+/// sessions resident. This is the single-session form of
+/// [`release_idle_sessions`]: the same release operations, no
+/// `closed_sessions` report, so the session id stays addressable for a
+/// pending tool turn. Returns false when no victim is left.
+fn park_idle_session_cold(rig: &mut Rig, exclude: &[SessionId]) -> bool {
+    let Some(victim) = rig.sessions.lru_idle_victim(exclude) else {
+        return false;
+    };
+    rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, victim);
+    rig.swap.forget(victim.0);
+    let _ = rig.fair_queue.remove(victim.0);
+    // A page held only by the retired block table stays non-Free until its
+    // in-flight refs drain; without this the retry can see no new pages.
+    if let Some(pp) = rig.pool.page_pool_mut() {
+        pp.drain_completed();
+    }
+    true
+}
+
 /// Drop unpinned, unreferenced prefix-cache pages and DeltaNet snapshots.
 ///
 /// Finished requests publish KV pages and a recurrent-state snapshot so a
@@ -5221,6 +5251,32 @@ impl GrammarConstraint {
     }
 }
 
+/// How long the idle engine may block, and whether the paged reclaim is due.
+///
+/// The grace deadline and the TTL sweep share one `recv_timeout` so a command
+/// arriving mid-grace is handled at once: that is the tool-result turn whose
+/// KV is still resident. `None` means block without a deadline — used once
+/// the reclaim is done and no TTL sweep is configured, so an idle engine
+/// never wakes just to re-run work it already did. The 1 ms floor keeps a
+/// just-expired deadline from spinning when a wake finds no command.
+fn idle_wait(
+    now: std::time::Instant,
+    idle_since: std::time::Instant,
+    grace: std::time::Duration,
+    ttl_wake: Option<std::time::Duration>,
+) -> (Option<std::time::Duration>, bool) {
+    const MIN_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
+    let remaining = grace.saturating_sub(now.saturating_duration_since(idle_since));
+    let due = remaining.is_zero();
+    let wait = match (ttl_wake, due) {
+        (Some(ttl), true) => Some(ttl.max(MIN_WAIT)),
+        (Some(ttl), false) => Some(ttl.min(remaining).max(MIN_WAIT)),
+        (None, true) => None,
+        (None, false) => Some(remaining.max(MIN_WAIT)),
+    };
+    (wait, due)
+}
+
 fn run_loop(
     mut rig: Rig,
     rx: Receiver<EngineCommand>,
@@ -5249,6 +5305,11 @@ fn run_loop(
     };
     let mut graph = SlotDecodeGraph::new();
     let mut poison: Option<String> = None;
+    // A grace window starts when the engine first has nothing in flight and
+    // no queued work. Any command restarts it, so a tool turn inside the
+    // window sees its still-resident KV instead of a re-prefill.
+    let mut idle_since: Option<std::time::Instant> = None;
+    let mut idle_reclaimed = false;
 
     // Helper to fail every active request, close sessions, clear work, forget swap.
     // Used for HIP poison and shutdown drain. Returns the reason used.
@@ -5288,83 +5349,111 @@ fn run_loop(
         let check_pool_invariants =
             hipfire_config::developer_var("HIPFIRE_DEBUG_POOL_INVARIANTS").as_deref() == Ok("1");
         'serve: loop {
-            let idle = slots.iter().all(|s| s.is_none());
-            if idle && rig.wait_queue.queued_count() == 0 {
+            let idle = slots.iter().all(|s| s.is_none()) && rig.wait_queue.queued_count() == 0;
+            if !idle {
+                // Work or a queued request restarts the continuous quiet
+                // period; the next idle window gets a fresh grace deadline.
+                idle_since = None;
+                idle_reclaimed = false;
+            }
+            if idle {
                 // A command already queued (a continuation, a new request)
                 // must run before parked KV is dropped.
                 match rx.try_recv() {
                     Ok(cmd) => {
+                        idle_since = None;
+                        idle_reclaimed = false;
                         handle_command(&mut rig, &mut slots, &mut work, &stats, cmd);
                         continue 'serve;
                     }
                     Err(TryRecvError::Disconnected) => break 'serve,
                     Err(TryRecvError::Empty) => {}
                 }
-                // Nothing in flight and nothing queued. Parked sessions
-                // still own KV pages, and the prefix cache owns snapshots
-                // allocated beside the VMM pool. Drop both so the pool's
-                // committed granules are reused in place by the next
-                // request, and the snapshot bytes go back to the device. A
-                // used VA keeps its physical binding until teardown (see
-                // `VmmPageMapper::sync`), so no granule is unmapped here.
-                // A later request with the same prefix misses and prefills
-                // again. A failed map poisons the mapper.
-                // Paged pool only. The fixed slabs hold no VMM granules, and
-                // with this reclaim on the slab route concurrent greedy output
-                // varied from run to run; without it the slab route keeps the
-                // parked-session and prefix-cache behaviour it had before.
-                let (sessions, (pages, ckpt_bytes)) = if rig.pool.is_paged() {
-                    (
-                        release_idle_sessions(&mut rig),
-                        release_unpinned_device_cache(&mut rig),
-                    )
+                let now = std::time::Instant::now();
+                let since = *idle_since.get_or_insert(now);
+                // The slab route has no VMM granules to reclaim: keep its
+                // original blocking recv when no TTL sweep is configured.
+                let grace = if rig.pool.is_paged() {
+                    rig.paged_idle_reclaim
                 } else {
-                    (0, (0, 0))
+                    std::time::Duration::ZERO
                 };
-                if sessions > 0 || pages > 0 || ckpt_bytes > 0 {
-                    // Checkpoint snapshots are raw hipMallocs. The tensor pool
-                    // can still be holding other freed buffers, which
-                    // hipMemGetInfo counts as used.
-                    rig.gpu.drain_pool();
-                    let held = rig.pool.page_pool().map(|pp| {
-                        pp.page_states()
-                            .iter()
-                            .filter(|s| **s != rdna_compute::page_pool::PageState::Free)
-                            .count()
-                    });
-                    eprintln!(
-                        "[hipfire] idle cache reclaim: {sessions} sessions, {pages} kv pages, {ckpt_bytes} checkpoint bytes, held_pages={held:?}"
-                    );
-                }
-                let soft = rig
-                    .prefix_index
-                    .as_ref()
-                    .map(|idx| idx.soft_checkpoints())
-                    .unwrap_or(&NO_SOFT_CHECKPOINTS);
-                if let Err(e) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft) {
-                    let reason = format!("VMM-paged reclaim failed: {e}");
-                    poison = Some(reason);
-                    break 'serve;
-                }
-                if sessions > 0 || pages > 0 || ckpt_bytes > 0 {
-                    let mapped = rig
-                        .model
-                        .paged_vmm
-                        .as_ref()
-                        .map(|mapper| mapper.mapped_bytes())
-                        .unwrap_or(0);
-                    eprintln!("[hipfire] idle cache reclaim mapped_bytes={mapped}");
-                }
-                // Nothing in flight and nothing queued: block rather than spin.
-                // With an idle TTL configured, wake periodically to close
-                // abandoned parked sessions instead of waiting for the next
-                // request.
-                match rig.session_ttl.map(|ttl| {
+                let ttl_wake = rig.session_ttl.map(|ttl| {
                     ttl.min(std::time::Duration::from_secs(30))
                         .max(std::time::Duration::from_secs(1))
-                }) {
+                });
+                let (wait, reclaim_due) = idle_wait(now, since, grace, ttl_wake);
+                if reclaim_due && !idle_reclaimed {
+                    // Nothing in flight and nothing queued. Parked sessions
+                    // still own KV pages, and the prefix cache owns snapshots
+                    // allocated beside the VMM pool. Drop both so the pool's
+                    // committed granules are reused in place by the next
+                    // request, and the snapshot bytes go back to the device. A
+                    // used VA keeps its physical binding until teardown (see
+                    // `VmmPageMapper::sync`), so no granule is unmapped here.
+                    // A later request with the same prefix misses and prefills
+                    // again. A failed map poisons the mapper.
+                    // Paged pool only. The fixed slabs hold no VMM granules, and
+                    // with this reclaim on the slab route concurrent greedy output
+                    // varied from run to run; without it the slab route keeps the
+                    // parked-session and prefix-cache behaviour it had before.
+                    let (sessions, (pages, ckpt_bytes)) = if rig.pool.is_paged() {
+                        (
+                            release_idle_sessions(&mut rig),
+                            release_unpinned_device_cache(&mut rig),
+                        )
+                    } else {
+                        (0, (0, 0))
+                    };
+                    if sessions > 0 || pages > 0 || ckpt_bytes > 0 {
+                        // Checkpoint snapshots are raw hipMallocs. The tensor pool
+                        // can still be holding other freed buffers, which
+                        // hipMemGetInfo counts as used.
+                        rig.gpu.drain_pool();
+                        let held = rig.pool.page_pool().map(|pp| {
+                            pp.page_states()
+                                .iter()
+                                .filter(|s| **s != rdna_compute::page_pool::PageState::Free)
+                                .count()
+                        });
+                        eprintln!(
+                            "[hipfire] idle cache reclaim: {sessions} sessions, {pages} kv pages, {ckpt_bytes} checkpoint bytes, held_pages={held:?}"
+                        );
+                    }
+                    let soft = rig
+                        .prefix_index
+                        .as_ref()
+                        .map(|idx| idx.soft_checkpoints())
+                        .unwrap_or(&NO_SOFT_CHECKPOINTS);
+                    if let Err(e) = rig.model.sync_paged_vmm(&mut rig.gpu, &rig.pool, soft) {
+                        let reason = format!("VMM-paged reclaim failed: {e}");
+                        poison = Some(reason);
+                        break 'serve;
+                    }
+                    if sessions > 0 || pages > 0 || ckpt_bytes > 0 {
+                        let mapped = rig
+                            .model
+                            .paged_vmm
+                            .as_ref()
+                            .map(|mapper| mapper.mapped_bytes())
+                            .unwrap_or(0);
+                        eprintln!("[hipfire] idle cache reclaim mapped_bytes={mapped}");
+                    }
+                    // One reclaim per quiet window. Later TTL wakes only
+                    // sweep sessions; re-parking nothing would spin the log.
+                    idle_reclaimed = true;
+                }
+                // Nothing in flight and nothing queued: block rather than spin.
+                // Wake at the earlier of the TTL sweep and the reclaim grace;
+                // a command arriving inside the grace window is handled at
+                // once, with its KV still resident.
+                match wait {
                     Some(wait) => match rx.recv_timeout(wait) {
-                        Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                        Ok(cmd) => {
+                            idle_since = None;
+                            idle_reclaimed = false;
+                            handle_command(&mut rig, &mut slots, &mut work, &stats, cmd)
+                        }
                         Err(RecvTimeoutError::Timeout) => {
                             sweep_sessions(&mut rig);
                             let mut st = stats.lock().expect("stats");
@@ -5375,7 +5464,11 @@ fn run_loop(
                         Err(RecvTimeoutError::Disconnected) => break 'serve,
                     },
                     None => match rx.recv() {
-                        Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                        Ok(cmd) => {
+                            idle_since = None;
+                            idle_reclaimed = false;
+                            handle_command(&mut rig, &mut slots, &mut work, &stats, cmd)
+                        }
                         Err(_) => break 'serve, // all senders gone: shut down after drain
                     },
                 }
@@ -6022,12 +6115,30 @@ fn run_loop(
                         idx.evict_unpinned_leaves(pp, usize::MAX);
                         pp.drain_completed();
                     }
+                    let mut provision_error = None;
                     match rig.pool.set_seq_len(SlotId(s), frontier) {
                         Ok(()) => reserved = true,
-                        Err(error) => {
-                            eprintln!("[serve] page provisioning refused slot {s}: {error}");
-                            provision_failed.push(s);
+                        Err(error) => provision_error = Some(error),
+                    }
+                    if !reserved {
+                        // Cache leaves are gone, but the grace window can
+                        // still be holding finished sessions in their slots.
+                        // Park them LRU-first before refusing this request.
+                        let exclude: Vec<SessionId> =
+                            slots.iter().flatten().map(|f| f.session).collect();
+                        while park_idle_session_cold(&mut rig, &exclude) {
+                            if rig.pool.set_seq_len(SlotId(s), frontier).is_ok() {
+                                reserved = true;
+                                break;
+                            }
                         }
+                    }
+                    if !reserved {
+                        eprintln!(
+                            "[serve] page provisioning refused slot {s}: {}",
+                            provision_error.expect("set_seq_len failed at least once")
+                        );
+                        provision_failed.push(s);
                     }
                 }
                 if !reserved || rig.model.paged_vmm.is_none() {
@@ -6060,6 +6171,10 @@ fn run_loop(
                         "[serve] VMM page map refused slot {s}: {error}; \
                          reclaimed {pages} kv pages and {ckpt_bytes} checkpoint bytes"
                     );
+                    // Parking idle sessions here would not help: a used VA
+                    // keeps its physical binding until teardown, so freeing
+                    // their pages returns no device memory to this map. The
+                    // checkpoint drain inside `sync_paged_vmm` is the lever.
                     let soft = rig
                         .prefix_index
                         .as_ref()
@@ -9028,10 +9143,10 @@ fn admit(
     lock_stats(stats).note_admitted();
 }
 
-/// Read the session sweep policy from the process config. The engine already
-/// reads developer config directly; these two keys are process-scoped policy,
-/// like the swap budgets.
-fn session_policy_from_config() -> (Option<std::time::Duration>, usize) {
+/// Read the session sweep and paged idle-reclaim policy from the process
+/// config. The engine already reads developer config directly; these keys are
+/// process-scoped policy, like the swap budgets.
+fn session_policy_from_config() -> (Option<std::time::Duration>, usize, std::time::Duration) {
     let process = hipfire_config::active_or_local_process_config();
     let value = |key: &str| {
         process.values.get(key).and_then(|value| match value {
@@ -9041,6 +9156,7 @@ fn session_policy_from_config() -> (Option<std::time::Duration>, usize) {
     };
     let ttl = value("serve.multi_slot_session_ttl_secs").unwrap_or(3600);
     let max = value("serve.multi_slot_max_sessions").unwrap_or(0);
+    let reclaim_ms = value("serve.paged_idle_reclaim_ms").unwrap_or(30_000);
     (
         if ttl == 0 {
             None
@@ -9048,6 +9164,7 @@ fn session_policy_from_config() -> (Option<std::time::Duration>, usize) {
             Some(std::time::Duration::from_secs(ttl))
         },
         usize::try_from(max).unwrap_or(usize::MAX),
+        std::time::Duration::from_millis(reclaim_ms),
     )
 }
 
@@ -9381,6 +9498,67 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
 mod tests {
     use super::*;
 
+    #[test]
+    fn idle_wait_zero_grace_keeps_the_immediate_reclaim() {
+        let since = std::time::Instant::now();
+        // No TTL: block without a deadline, exactly as the old recv() path.
+        assert_eq!(
+            idle_wait(since, since, std::time::Duration::ZERO, None),
+            (None, true)
+        );
+        // With a TTL: reuse the periodic sweep as the wake, as before.
+        let ttl = std::time::Duration::from_secs(5);
+        assert_eq!(
+            idle_wait(since, since, std::time::Duration::ZERO, Some(ttl)),
+            (Some(ttl), true)
+        );
+    }
+
+    #[test]
+    fn idle_wait_wakes_at_the_earlier_of_grace_and_ttl() {
+        let since = std::time::Instant::now();
+        let grace = std::time::Duration::from_secs(30);
+        let ttl = std::time::Duration::from_secs(5);
+        // At the start of the window the TTL sweep is the earlier wake.
+        assert_eq!(
+            idle_wait(since, since, grace, Some(ttl)),
+            (Some(ttl), false)
+        );
+        // 28 s in, the 2 s left of grace wins over the 5 s TTL interval.
+        assert_eq!(
+            idle_wait(
+                since + std::time::Duration::from_secs(28),
+                since,
+                grace,
+                Some(ttl)
+            ),
+            (Some(std::time::Duration::from_secs(2)), false)
+        );
+        // Without a TTL the sole wake is the grace deadline.
+        assert_eq!(idle_wait(since, since, grace, None), (Some(grace), false));
+        assert_eq!(
+            idle_wait(
+                since + std::time::Duration::from_secs(29),
+                since,
+                grace,
+                None
+            ),
+            (Some(std::time::Duration::from_secs(1)), false)
+        );
+    }
+
+    #[test]
+    fn idle_wait_reports_due_and_does_not_spin_after_the_deadline() {
+        let since = std::time::Instant::now();
+        let grace = std::time::Duration::from_secs(30);
+        let late = since + std::time::Duration::from_secs(31);
+        // No TTL: due once, then the caller blocks on recv() with no deadline.
+        assert_eq!(idle_wait(late, since, grace, None), (None, true));
+        // With a TTL: still due, but the sweep interval bounds the wake so a
+        // wake that finds no command does not spin.
+        let ttl = std::time::Duration::from_secs(1);
+        assert_eq!(idle_wait(late, since, grace, Some(ttl)), (Some(ttl), true));
+    }
     #[test]
     fn multi_slot_scratch_rows_keep_a_whole_chunk_per_slab_slot() {
         // Paged: the shared total budget.
