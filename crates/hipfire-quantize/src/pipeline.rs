@@ -3413,7 +3413,24 @@ pub(crate) fn run() {
                     )
                 }
                 (None, None) => {
-                    dequantize_mxfp8_e8m0_strict(raw_data, &meta.shape, sbytes, &smeta.shape, 32)
+                    // The strict MXFP8 decoder is 2-D; feed it one expert slice
+                    // at a time and concatenate into one logical F32 buffer.
+                    let experts = meta.shape[0];
+                    let rows = meta.shape[1];
+                    let cols = meta.shape[2];
+                    let sc = smeta.shape[2];
+                    let mut acc = Vec::with_capacity(experts * rows * cols);
+                    for e in 0..experts {
+                        let wb = &raw_data[e * rows * cols..(e + 1) * rows * cols];
+                        let sb = &sbytes[e * rows * sc..(e + 1) * rows * sc];
+                        acc.extend(
+                            dequantize_mxfp8_e8m0_strict(wb, &[rows, cols], sb, &[rows, sc], 32)
+                                .unwrap_or_else(|e| {
+                                    panic!("inkling2 MXFP8 dequant expert {e}: {e}")
+                                }),
+                        );
+                    }
+                    Ok(acc)
                 }
                 _ => unreachable!(),
             }
