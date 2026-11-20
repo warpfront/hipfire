@@ -640,4 +640,100 @@ mod tests {
             "expected non-finite refusal, got {err}"
         );
     }
+
+    #[test]
+    #[ignore = "requires the downloaded Inkling-2 checkpoint under D:/hipfire-models"]
+    fn nvfp4_real_checkpoint_expert_inspect() {
+        use hipfire_quantize::safetensors_file::SafetensorsFile;
+        let path = std::path::Path::new(
+            r"D:\hipfire-models\Inkling-2-Mini\model-00001-of-00001.safetensors",
+        );
+        let st = SafetensorsFile::open(path).expect("open checkpoint");
+        let base = "model.llm.layers.0.mlp.experts.w13_weight";
+        let names = [
+            base.to_string(),
+            format!("{base}_scale"),
+            format!("{base}_amax"),
+            format!("{base}_outer_scale_denominator"),
+        ];
+        for n in &names {
+            let (m, b) = st.tensor_data(n).unwrap_or_else(|| panic!("missing {n}"));
+            eprintln!(
+                "{n}: dtype={} shape={:?} bytes={}",
+                m.dtype,
+                m.shape,
+                b.len()
+            );
+        }
+        let (wm, wb_all) = st.tensor_data(&names[0]).unwrap();
+        let (sm, sb_all) = st.tensor_data(&names[1]).unwrap();
+        let (_, ab_all) = st.tensor_data(&names[2]).unwrap();
+        let (_, db) = st.tensor_data(&names[3]).unwrap();
+        let rows = wm.shape[1];
+        let packed = wm.shape[2];
+        let per_expert_w = rows * packed;
+        let per_expert_s = sm.shape[1] * sm.shape[2];
+        let wb = &wb_all[..per_expert_w];
+        let sb = &sb_all[..per_expert_s];
+        let ab = &ab_all[..4];
+        let out = dequantize_nvfp4_amax_denominator(
+            wb,
+            &[1, rows, packed],
+            sb,
+            &[1, sm.shape[1], sm.shape[2]],
+            ab,
+            db,
+        )
+        .expect("dequant expert 0");
+        let finite = out.iter().all(|v| v.is_finite());
+        let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let min = out.iter().copied().fold(f32::INFINITY, f32::min);
+        eprintln!(
+            "expert 0: {} values, finite={finite}, min={min}, max={max}",
+            out.len()
+        );
+        eprintln!("first 16: {:?}", &out[..16]);
+        assert!(finite);
+        assert_eq!(out.len(), rows * packed * 2);
+    }
+
+    #[test]
+    #[ignore = "requires the downloaded Inkling-2 checkpoint under D:/hipfire-models"]
+    fn mxfp8_real_checkpoint_expert_inspect() {
+        use hipfire_quantize::safetensors_file::SafetensorsFile;
+        let path = std::path::Path::new(
+            r"D:\hipfire-models\Inkling-2-Mini\model-00001-of-00001.safetensors",
+        );
+        let st = SafetensorsFile::open(path).expect("open checkpoint");
+        let base = "model.llm.layers.20.mlp.experts.w13_weight";
+        let scale_name = format!("{base}_scale");
+        for n in [base, scale_name.as_str()] {
+            let (m, b) = st.tensor_data(n).unwrap_or_else(|| panic!("missing {n}"));
+            eprintln!(
+                "{n}: dtype={} shape={:?} bytes={}",
+                m.dtype,
+                m.shape,
+                b.len()
+            );
+        }
+        let (wm, wb_all) = st.tensor_data(base).unwrap();
+        let (sm, sb_all) = st.tensor_data(&scale_name).unwrap();
+        let rows = wm.shape[1];
+        let cols = wm.shape[2];
+        let sc = sm.shape[2];
+        assert_eq!(sc * 32, cols, "MXFP8 stored block must be [1,32]");
+        let wb = &wb_all[..rows * cols];
+        let sb = &sb_all[..rows * sc];
+        let out = dequantize_mxfp8_e8m0_strict(wb, &[rows, cols], sb, &[rows, sc], 32)
+            .expect("dequant MXFP8 expert 0");
+        let finite = out.iter().all(|v| v.is_finite());
+        let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let min = out.iter().copied().fold(f32::INFINITY, f32::min);
+        eprintln!(
+            "MXFP8 expert 0: {} values, finite={finite}, min={min}, max={max}",
+            out.len()
+        );
+        assert!(finite);
+        assert_eq!(out.len(), rows * cols);
+    }
 }
