@@ -70,6 +70,37 @@ python3 scripts/check-attribution.py --range origin/beta..HEAD --require
 python3 scripts/check-crate-maps.py --check
 ```
 
+## Added after the initial log (same session)
+
+- `82c28c81a`, `585ff6485` — **quantizer pipeline ingest** in
+  `crates/hipfire-quantize/src/pipeline.rs`: index the 48 packed expert
+  companion sets (`_scale`, `_amax`, `_outer_scale_denominator`), dequantize
+  NVFP4/MXFP8 to F32, split each 3-D stacked tensor per expert, apply the w13
+  gate/up regrouping, and emit per-expert `...experts.{E}.gate_up_proj` /
+  `down_proj` MQ4G256 tensors. Also fixed a pre-existing MQ4V2 assertion for
+  non-2-D tensors and the packed-vs-logical param accounting.
+- `803d54324` — routing rows in `crates/hipfire-runtime/src/arch_mapping.rs`
+  for `inkling2_loop`, `inkling2_loop_text` and the class name → id 24; reserved
+  ids 24/25 in `docs/architecture-ids.md`.
+- `7d469f132`, `6fade9c02` — CPU oracle additions: `relative_bias`, `situ`,
+  `sigmoid_topk` (no renorm), `softcap`. Crate now has 20 passing tests.
+
+**Smoke validation:** an end-to-end `--include-prefix model.llm.layers.0.`
+quantization run completed and wrote a 556 MB HFQ to
+`D:\hipfire-models\inkling2-mini-smoke.hfq` with per-expert MQ4G256 weights.
+Run it with:
+```bash
+HIPFIRE_HOME="D:\hipfire-models\inkling2-home" \
+  cargo run -q -p hipfire-quantize --bin hipfire-quantize -- \
+  --input "D:\hipfire-models\Inkling-2-Mini" \
+  --output "D:\hipfire-models\inkling2-mini-smoke.hfq" \
+  --format mq4v2 --arch-id 24 --include-prefix "model.llm.layers.0."
+```
+(`HIPFIRE_HOME` isolates an unrelated stale config key in the default user
+home.) A full-model quantization to `D:\hipfire-models\inkling2-mini-mq4.hfq`
+was started in the background; check its log at
+`D:\hipfire-models\inkling2-quant-full.log` for the final result.
+
 ## Next steps, in order
 
 1. **Wire NVFP4/MXFP8 ingest into the quantizer pipeline.** `pipeline.rs` builds
