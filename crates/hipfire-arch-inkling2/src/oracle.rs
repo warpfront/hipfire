@@ -168,6 +168,49 @@ pub fn relative_bias(
     out
 }
 
+/// `situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)`
+/// from `llama-graph.cpp::LLM_FFN_SITU`. `linear_beta <= 0` leaves `up` raw.
+pub fn situ(gate: f32, up: f32, beta: f32, linear_beta: f32) -> f32 {
+    let act = beta * (gate / beta).tanh() * sigmoid(gate);
+    let up_term = if linear_beta > 0.0 {
+        linear_beta * (up / linear_beta).tanh()
+    } else {
+        up
+    };
+    act * up_term
+}
+
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Sigmoid router with optional per-expert score-correction bias, top-k by
+/// score, **no renormalization** (upstream Inkling-2 MoE). Returns
+/// `(expert_index, weight)` sorted by descending weight.
+pub fn sigmoid_topk(
+    scores: &[f32],
+    bias: Option<&[f32]>,
+    k: usize,
+    scale: f32,
+) -> Vec<(usize, f32)> {
+    let mut ranked: Vec<(usize, f32)> = scores
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let b = bias.map_or(0.0, |v| v[i]);
+            (i, sigmoid(s * scale + b))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(k);
+    ranked
+}
+
+/// Final logit softcap `cap * tanh(x / cap)`.
+pub fn softcap(x: f32, cap: f32) -> f32 {
+    cap * (x / cap).tanh()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +319,32 @@ mod tests {
             out[0]
         );
         assert!(past.is_empty());
+    }
+
+    #[test]
+    fn situ_matches_source_formula() {
+        let got = situ(1.0, 2.0, 4.0, 25.0);
+        let want = 4.0 * 0.25f32.tanh() * sigmoid(1.0) * 25.0 * (2.0f32 / 25.0f32).tanh();
+        assert!(close(got, want), "{} vs {}", got, want);
+        assert_eq!(
+            situ(1.0, 2.0, 4.0, 0.0),
+            4.0 * 0.25f32.tanh() * sigmoid(1.0) * 2.0
+        );
+    }
+
+    #[test]
+    fn sigmoid_topk_has_no_renormalization() {
+        let out = sigmoid_topk(&[1.0, 2.0, 3.0], None, 2, 8.0);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, 2);
+        assert_eq!(out[1].0, 1);
+        let sum: f32 = out.iter().map(|x| x.1).sum();
+        assert!(sum > 1.0, "sigmoid top-k must not renorm: {sum}");
+    }
+
+    #[test]
+    fn softcap_is_cap_times_tanh() {
+        assert!(close(softcap(30.0, 30.0), 30.0 * 1.0f32.tanh()));
     }
 
     #[test]
