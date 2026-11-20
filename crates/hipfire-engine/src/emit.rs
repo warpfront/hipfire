@@ -380,15 +380,17 @@ pub fn emit_qwen_ar_cancelled(
     id: &str,
     completion_tokens: usize,
 ) -> bool {
-    emit_qwen_ar_cancelled_outcome(stdout, id, completion_tokens).delivered()
+    emit_qwen_ar_cancelled_outcome(stdout, id, completion_tokens, "legacy").delivered()
 }
 
 /// Emit a cancellation while retaining whether its terminal claim was
-/// consumed when the writer fails.
+/// consumed when the writer fails. `loop_name` is the G12 loop that produced
+/// it (`engine` | `legacy`), stamped on the `done`.
 pub fn emit_qwen_ar_cancelled_outcome(
     stdout: &mut impl std::io::Write,
     id: &str,
     completion_tokens: usize,
+    loop_name: &str,
 ) -> TerminalEmitOutcome {
     let attempt_id = active_attempt_id();
     if !claim_wire_terminal(id, attempt_id) {
@@ -398,7 +400,8 @@ pub fn emit_qwen_ar_cancelled_outcome(
     if writeln!(stdout, "{}", aborted).is_err() {
         return TerminalEmitOutcome::new(true, false);
     }
-    let done = hipfire_runtime::semantic::wire_aborted_done(id, completion_tokens, attempt_id);
+    let mut done = hipfire_runtime::semantic::wire_aborted_done(id, completion_tokens, attempt_id);
+    done["loop"] = loop_name.into();
     if writeln!(stdout, "{}", done).is_err() {
         return TerminalEmitOutcome::new(true, false);
     }
