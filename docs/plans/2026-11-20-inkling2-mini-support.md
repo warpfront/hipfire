@@ -25,9 +25,10 @@ still open, do not rely on it. Reference files on master, read verbatim:
   arch/tensor plumbing in `src/llama-arch.*`, `gguf-py/gguf/*`.
 - Published GGUFs: `ggml-org/Inkling-2-Mini-GGUF` (+ experimental
   `TML-d24-varloop-research-GGUF` for `is_varloop=true`).
-- Quants: merged PR discusses F32-default conversion; **no NVFP4-specific
-  dequant math was found in the merged diff hunks** — the nibble-order and
-  `amax/denominator` semantics remain unverified (Phase-0 probe owns this).
+- Quants: the converter's `_dequant_expert_chunk` **is** the NVFP4/MXFP8
+  dequant reference (§8) — the earlier "no NVFP4-specific dequant math in the
+  merged diff hunks" note was a sampling error, not a fact about the merged
+  tree. Non-expert tensors and all loop/controller tensors convert F32.
 
 Verified against the merged source (corrects §0 where noted):
 
@@ -84,6 +85,11 @@ Verified against the merged source (corrects §0 where noted):
 - `is_varloop` exists upstream (varying flag, min 1 pass, research GGUF
   only). Mini is `is_varloop=false`; Phase 1 refuses varying (same
   fail-closed posture as upstream's invalid-config throws).
+- Re-verified verbatim from `inkling2.cpp`, `inkling2-loop.cpp` and
+  `conversion/inkling2.py` at the full merge SHA (§8): the controller, `mix()`,
+  `clip()`, `convolve()`, relative-bias gather, `tau`, MoE and output bullets
+  above; the prelude save / skip-first-core-block bank; and the cross-pass
+  query packing. Extra ingest details and two corrections are in §8.
 - Two HF controller namings accepted upstream: Mini's
   `controllers.{attn,k,v,mlp}.{down,gain,forget}_weight` and the varloop
   checkpoint's `{q,k,v,mlp}_controller.{down,gain,forget}_proj`. Ingest
@@ -296,15 +302,23 @@ fuse only in Phase 4 behind the KLD pin.
 
 ## 4. Weight-ingest path (exact)
 
-- NVFP4 1×16 (`w13/w2_weight` layers 0–19): each nibble E2M1 × per-16 E4M3
-  scale, then per-expert `weight_scale × amax / outer_scale_denominator`
-  (confirm multiplicand/divisor roles against the llama.cpp converter —
-  the handover's "per-expert scale" phrasing is unverified). Strict: refuse
-  E4M3-NaN codes and non-finite products (same posture as
+- NVFP4 1×16 (`w13/w2_weight` layers 0–19): **verified against the merged
+  converter (§8)** — low nibble first (`packed & 15`) then high (`packed >> 4`)
+  through the E2M1 table `[0, .5, 1, 1.5, 2, 3, 4, 6, -0.0, …]`, × per-16 E4M3
+  scale, then × `amax / outer_scale_denominator` (F32 scalars, per-expert and
+  global respectively). No extra `weight_scale` factor: `amax/d` **is** the
+  outer scale. Strict: refuse E4M3-NaN codes, non-finite amax (must be ≥ 0) or
+  denominator (must be > 0), and non-finite products (same posture as
   `dequantize_mxfp8_e8m0_strict`).
-- MXFP8 32×32 (layers 20–23): E4M3 × UE8M0 with **2-D** 32×32 blocks —
-  generalize the existing `[1,block_k]`-only `dequantize_mxfp8_e8m0_strict`
-  (which assumes scale shape `[R,C/block]`), do not fork a second decoder.
+- MXFP8 **1×32, not 32×32** (layers 20–23): **correction from the merged
+  converter (§8)** — it requires the stored block
+  `(rows/scale_rows, cols/scale_cols) == (1, 32)` for MXFP8 (`(1, 16)` for
+  NVFP4); E4M3 values × UE8M0 `2^(byte-127)` per 32 columns. The earlier
+  "2-D 32×32 block" reading was wrong: the existing `[1,block_k]`-only
+  `dequantize_mxfp8_e8m0_strict` needs **no 2-D generalization**, just
+  `block_k = 32`. If `hf_quant_config.json` advertises
+  `weight_block_shape [32,32]`, that is a metadata conflict the converter only
+  warns about — trust the stored tensor/scale shapes.
 - BF16/F32 (controllers, queries, norms, biases, `q/k_l2_clip.scale`,
   `rel_l2_clip.scale`, vision, embed, unembed, MTP): existing `to_f32`
   paths; add keep lists (`model_filter.rs`, MiniMax/DS4 precedent) so
@@ -334,8 +348,8 @@ fuse only in Phase 4 behind the KLD pin.
 3. **Upstream residual drift**: base support is merged and stable
    (`29b52d398b294509746ec0a3f28948a3107c0213`); only the quant/shard follow-up
    (#32695, Draft) still moves.
-   The NVFP4 converter semantics were not in the merged diff — the Phase-0
-   probe owns them.
+   The NVFP4/MXFP8 dequant semantics are now pinned from the merged converter
+   (§8); what remains is the ingest-parity probe, not the semantics.
 4. **MTP head is alien**: markov-rank-256 DSpark matches no hipfire drafter;
    budget it as a mini-arch, not a config flag.
 5. **Template surface**: `reasoning_effort` + strict tool-JSON + custom
@@ -382,12 +396,26 @@ carried forward from the original plan and remain Phase-0 tasks.
 | GGUF fixtures published | `hf models list` | both repos exist: `ggml-org/Inkling-2-Mini-GGUF` (BF16 52,226,509,504 B sha256 `7074c976…`, IQ4_NL, Q8_0, `imatrix.gguf` 90,752,032 B, mmproj) and `ggml-org/TML-d24-varloop-research-GGUF` (BF16/IQ4_NL/Q8_0/imatrix/mmproj). |
 | Arch ids 24 / 25 free | `docs/architecture-ids.md` on `origin/beta` `9e410448e` | 18 (EmbeddingGemma2) and 19 (Raon) are now claimed; 24 is first free primary, 25 first free sidecar after 23. |
 
-Still unverified, owned by Phase 0: NVFP4 nibble order and the
-`amax`/`outer_scale_denominator` roles (no NVFP4 dequant math in the merged
-diff), the controller `out = (1−tanh(F·h))·cur + tanh(G·h)·msg`, `mix()` bank
-details, the relative-bias gather, dynamic-conv offsets/post-scale, and the
-48-vs-24 `block_count` trap. These are reference-source leads, not
-oracle-checked facts.
+### Merged-source re-verification (2026-11-20)
+
+Read verbatim from `src/models/inkling2.cpp`, `src/models/inkling2-loop.cpp`
+and `conversion/inkling2.py` at the full merge SHA:
+
+| Mechanism | Result |
+|---|---|
+| `control()` | confirmed: `gate = RMSNorm(cur,1e-6) ‖ RMSNorm(msg,1e-6)`, down `[2·n_embd, rank]`, gain/forget `[rank, n_embd]`, `out = cur − tanh(F·gate)·cur + tanh(G·gate)·msg`. |
+| `mix()` | confirmed: concat `[blocks…, cur]` → RMSNorm 1e-6 → scores at `1/√n_embd` → weighted sum; bank = previous pass's `blocks[prelude_len+1..]` plus its output, prelude restored each pass (skip-first-core-block detail confirmed). |
+| `clip()`, `convolve()`, `tau`, output | confirmed: row L2 + 1e-6 with factor `threshold/norm` clamped [0,1]; unified conv state offsets 0 / `n_embd_k_gqa` / `2·n_embd_k_gqa` / `2·n_embd_k_gqa+n_embd`, `out = cur + conv`, post-scale `1/√((dynamic?2:1)·n_conv+1)`; `tau = 1+α·log(max(1,(pos+1)/floor))` on Q and R of full layers; F32 head → softcap → unpadded slice. |
+| Relative bias | confirmed: R projected to `n_rel`/head × the `[n_rel, n_extent]` table, sink logit subtracted **before** the distance gather. |
+| **NVFP4 dequant** | **resolved**: E2M1 low nibble first, then high, table `[0,.5,1,1.5,2,3,4,6,-0.0,…]`, × E4M3 scale per 16 columns, then × `amax/d` (F32 scalars; amax ≥ 0, denominator > 0; E4M3-NaN and non-finite results refused). There is **no separate `weight_scale` factor**. |
+| **MXFP8 block shape** | **corrected to 1×32** (stored block `(1,32)`, NVFP4 `(1,16)`), E4M3 × UE8M0 `2^(byte−127)`. No 2-D-block decoder is needed; a `weight_block_shape [32,32]` in `hf_quant_config.json` is only a warning. |
+| Loop validation | confirmed, plus one extra rule: `n_layer_nextn == 0` is required; `n_slot = 48 ≤ LLAMA_MAX_LAYERS`. |
+| Ingest transforms | static conv weights are `flip(0).T` at conversion; `attn_res.attn_queries.{i}` maps to block `i+1`; `mlp.gate.bias` is the router `e_score_correction_bias`; F32 keep list covers conv/clip/res_query/attn_rel_bias and every loop tensor. The text converter skips vision and MTP tensors (matches the Phase-1 refusal). |
+
+Still oracle-owned by Phase 0: elementwise dequant parity against the
+published BF16 GGUF, the 48-vs-24 `block_count` trap on unsloth GGUFs,
+HF-transformers numerical parity of the controllers, and the template surface.
+Source confirmation is not numerical proof.
 
 Environment notes: downloads go to `D:\hipfire-models`; `hf` is authenticated;
 `codegraph` is absent in this worktree, so exploration uses grep/read.
