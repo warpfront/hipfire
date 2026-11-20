@@ -143,38 +143,11 @@ pub fn render_lane_prompt(
         None => None,
     };
     if let Some(b) = m.muse_glimmer() {
-        // The singleton dispatch normalizes `prompt` and every message
-        // (`maybe_normalize_prompt`, `parse_generate_messages`); render the
-        // same tokens here.
-        let glimmer_prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(
-            msg.get("prompt")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Hello"),
-        );
-        let glimmer_messages = hipfire_engine::prompt::parse_generate_messages(msg)
-            .map_err(|e| format!("invalid messages field: {e}"))?;
-        // Same effort derivation the daemon hands the singleton route.
-        let raw_effort = msg
-            .get("reasoning_effort")
-            .or_else(|| msg.get("thinking_mode"))
-            .and_then(|v| v.as_str());
-        let thinking = msg.get("thinking_enabled").and_then(|v| v.as_bool());
-        let (_, effort) = qwen_jinja_reasoning(thinking, raw_effort, max_think);
-        let unused = std::cell::Cell::new(0);
-        let ids = crate::dense::glimmer_prompt_ids(
+        let ids = render_glimmer_lane_prompt(
             tokenizer,
             m.chat_template.as_ref(),
-            // Batch requests are a single user turn: no assistant turn to replay.
-            &mut hipfire_loader::AsstTurnCache::new_from_env(),
             b.config.bos_token,
-            &glimmer_prompt,
-            system,
-            effort.as_deref(),
-            max_think,
-            None,
-            glimmer_messages.as_deref(),
-            &unused,
-            &unused,
+            msg,
         )?;
         return Ok((ids, false));
     }
@@ -199,6 +172,100 @@ pub fn render_lane_prompt(
         None,
     )
     .map_err(|e| e.to_string())
+}
+
+/// Glimmer lane prompt ids. The singleton dispatch normalizes `prompt` and
+/// every message (`maybe_normalize_prompt`, `parse_generate_messages`);
+/// render the same tokens here.
+pub fn render_glimmer_lane_prompt(
+    tokenizer: &Tokenizer,
+    chat_template: Option<&String>,
+    bos_token: u32,
+    msg: &serde_json::Value,
+) -> Result<Vec<u32>, String> {
+    let glimmer_prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(
+        msg.get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Hello"),
+    );
+    let glimmer_messages = hipfire_engine::prompt::parse_generate_messages(msg)
+        .map_err(|e| format!("invalid messages field: {e}"))?;
+    let max_think = msg
+        .get("max_think_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    // Same effort derivation the daemon hands the singleton route.
+    let raw_effort = msg
+        .get("reasoning_effort")
+        .or_else(|| msg.get("thinking_mode"))
+        .and_then(|v| v.as_str());
+    let thinking = msg.get("thinking_enabled").and_then(|v| v.as_bool());
+    let (_, effort) = qwen_jinja_reasoning(thinking, raw_effort, max_think);
+    let unused = std::cell::Cell::new(0);
+    crate::dense::glimmer_prompt_ids(
+        tokenizer,
+        chat_template,
+        // Batch requests are a single user turn: no assistant turn to replay.
+        &mut hipfire_loader::AsstTurnCache::new_from_env(),
+        bos_token,
+        &glimmer_prompt,
+        msg.get("system").and_then(|v| v.as_str()),
+        effort.as_deref(),
+        max_think,
+        None,
+        glimmer_messages.as_deref(),
+        &unused,
+        &unused,
+    )
+}
+
+/// Where a lane-family request runs. The daemon's admission and the lane
+/// driver both decide through [`lane_admission`], so they cannot drift.
+#[derive(Debug, PartialEq)]
+pub enum LaneAdmission {
+    Lane {
+        tokens: Vec<u32>,
+        started_in_think: bool,
+    },
+    /// No lane can hold it; the singleton serves it to its cache cap.
+    Singleton,
+}
+
+/// Render `msg` and decide lane vs singleton against `lane_capacity`.
+pub fn lane_admission(
+    m: &LoadedModel,
+    msg: &serde_json::Value,
+    lane_capacity: usize,
+) -> Result<LaneAdmission, String> {
+    let (tokens, started_in_think) = render_lane_prompt(m, msg)?;
+    Ok(admit_rendered(
+        tokens,
+        started_in_think,
+        request_max_tokens(msg),
+        lane_capacity,
+    ))
+}
+
+fn request_max_tokens(msg: &serde_json::Value) -> usize {
+    msg.get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .map_or(DEFAULT_GENERATE_MAX_TOKENS, |v| v as usize)
+}
+
+fn admit_rendered(
+    tokens: Vec<u32>,
+    started_in_think: bool,
+    max_tokens: usize,
+    lane_capacity: usize,
+) -> LaneAdmission {
+    if batch_lfm_exceeds_capacity(tokens.len(), max_tokens, lane_capacity) {
+        LaneAdmission::Singleton
+    } else {
+        LaneAdmission::Lane {
+            tokens,
+            started_in_think,
+        }
+    }
 }
 
 /// Emit the assignment-time capacity failure. The caller must hold the exact
@@ -593,37 +660,45 @@ pub fn drive_lane_continuous_batch(
                             .get("max_think_tokens")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0) as usize;
-                        let max_tokens_req = json
-                            .get("max_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(4096) as usize;
-                        let (prompt_tokens, started_in_think) =
-                            match render_lane_prompt(unsafe { &*model_ptr }, &json) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    emit_batch_admission_error(
-                                        stdout,
-                                        &id,
-                                        attempt_id,
-                                        admission,
-                                        &format!("render failed: {e}"),
-                                        "validation",
-                                        false,
-                                        false,
-                                    );
-                                    continue;
-                                }
-                            };
-                        if started_in_think {
-                            let handoff = match handoff_admitted_started_in_think(
-                                &id, attempt_id, admission, json, route,
-                            ) {
-                                Ok(msg) => msg,
-                                Err(reason) => return fail_all(sched, gpu, family, stdout, reason),
-                            };
-                            barrier = Some(handoff);
-                            break;
-                        }
+                        let max_tokens_req = request_max_tokens(&json);
+                        let (prompt_tokens, started_in_think) = match lane_admission(
+                            unsafe { &*model_ptr },
+                            &json,
+                            sched.lane_capacity,
+                        ) {
+                            Ok(LaneAdmission::Lane {
+                                tokens,
+                                started_in_think: false,
+                            }) => (tokens, false),
+                            // Think-open prompts are sequential barriers, and a
+                            // request no lane can hold is the singleton's: hand
+                            // both over, never refuse.
+                            Ok(LaneAdmission::Lane { .. } | LaneAdmission::Singleton) => {
+                                let handoff = match handoff_admitted_started_in_think(
+                                    &id, attempt_id, admission, json, route,
+                                ) {
+                                    Ok(msg) => msg,
+                                    Err(reason) => {
+                                        return fail_all(sched, gpu, family, stdout, reason)
+                                    }
+                                };
+                                barrier = Some(handoff);
+                                break;
+                            }
+                            Err(e) => {
+                                emit_batch_admission_error(
+                                    stdout,
+                                    &id,
+                                    attempt_id,
+                                    admission,
+                                    &format!("render failed: {e}"),
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
+                        };
                         if prompt_tokens.is_empty() {
                             emit_batch_admission_error(
                                 stdout,
@@ -636,22 +711,6 @@ pub fn drive_lane_continuous_batch(
                                 false,
                             );
                             continue;
-                        }
-                        // A request a lane cannot hold is the singleton's
-                        // (it serves to its cache cap): hand it over, never refuse.
-                        if batch_lfm_exceeds_capacity(
-                            prompt_tokens.len(),
-                            max_tokens_req,
-                            sched.lane_capacity,
-                        ) {
-                            let handoff = match handoff_admitted_started_in_think(
-                                &id, attempt_id, admission, json, route,
-                            ) {
-                                Ok(msg) => msg,
-                                Err(reason) => return fail_all(sched, gpu, family, stdout, reason),
-                            };
-                            barrier = Some(handoff);
-                            break;
                         }
                         // Explicit wire `seed` must reach the lane RNG on the
                         // batched route too; out-of-domain values are rejected
@@ -1825,5 +1884,40 @@ impl LaneFamily for GlimmerLaneFamily<'_> {
         events.extend(l.router.flush());
         l.route(events, stdout, id);
         crate::dense::parse_glimmer_atem(&l.tool_acc).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_boundary_stays_on_a_lane_and_one_past_goes_to_the_singleton() {
+        let lane = |n: usize, started_in_think| LaneAdmission::Lane {
+            tokens: vec![7; n],
+            started_in_think,
+        };
+        assert_eq!(
+            admit_rendered(vec![7; 100], false, 10, 110),
+            lane(100, false)
+        );
+        assert_eq!(admit_rendered(vec![7; 100], true, 10, 110), lane(100, true));
+        assert_eq!(
+            admit_rendered(vec![7; 100], false, 11, 110),
+            LaneAdmission::Singleton
+        );
+        assert_eq!(
+            admit_rendered(vec![7; 100], true, 11, 110),
+            LaneAdmission::Singleton
+        );
+    }
+
+    #[test]
+    fn max_tokens_defaults_like_the_daemon() {
+        assert_eq!(
+            request_max_tokens(&serde_json::json!({})),
+            DEFAULT_GENERATE_MAX_TOKENS
+        );
+        assert_eq!(request_max_tokens(&serde_json::json!({"max_tokens": 9})), 9);
     }
 }
