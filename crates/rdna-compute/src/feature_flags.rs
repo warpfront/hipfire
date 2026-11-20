@@ -832,10 +832,10 @@ pub struct FeatureFlags {
     /// prefill route (MMQ-LUT, the opt-in A4 twin and the small-N F16-BT twin);
     /// fail-closed, never uniform. Legacy bool grammar, default off.
     pub lloyd_mmq_off: bool,
-    /// `HIPFIRE_LLOYD_MMQ_A4`: opt-in exact-gfx1100 Lloyd staged-i8 (A4) MMQ twin
+    /// `HIPFIRE_LLOYD_MMQ_A4`: opt-in gfx1100/gfx1151 Lloyd staged-i8 (A4) MMQ twin
     /// prefill; exactly `1`, default off.
     pub lloyd_mmq_a4: bool,
-    /// `HIPFIRE_LLOYD_F16_GFX11`: exact-gfx1100 small-N (N<64) Lloyd F16-BT-LUT
+    /// `HIPFIRE_LLOYD_F16_GFX11`: gfx1100/gfx1151 small-N (N<64) Lloyd F16-BT-LUT
     /// prefill twins; on unless the value is exactly `0`.
     pub lloyd_f16_gfx11: bool,
 
