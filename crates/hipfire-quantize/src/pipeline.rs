@@ -2816,6 +2816,69 @@ pub(crate) fn run() {
             all_tensors.push((name, fi));
         }
     }
+
+    // ── Inkling-2-Mini expert companions (NVFP4 / MXFP8) ─────────────────────
+    // The checkpoint ships 3-D stacked expert weights plus separate scale and
+    // (for NVFP4) amax / outer-scale-denominator tensors. Index the companions
+    // by the weight name and drop them from the main tensor list. The weight
+    // itself is dequantized and split per-expert in the main loop.
+    #[derive(Clone)]
+    struct Inkling2Companion {
+        file_idx: usize,
+        scale: String,
+        amax: Option<String>,
+        denominator: Option<String>,
+    }
+    let mut inkling2_experts: HashMap<String, Inkling2Companion> = HashMap::new();
+    for (fi, st) in st_files.iter().enumerate() {
+        for name in st.tensor_names() {
+            let Some(stem) = name.strip_suffix("_weight_scale") else {
+                continue;
+            };
+            if !(stem.contains(".mlp.experts.")
+                && (stem.ends_with(".w13_weight") || stem.ends_with(".w2_weight")))
+            {
+                continue;
+            }
+            let amax_name = format!("{stem}_amax");
+            let denom_name = format!("{stem}_outer_scale_denominator");
+            let has_amax = st_files.iter().any(|s| s.tensors.contains_key(&amax_name));
+            let has_denom = st_files.iter().any(|s| s.tensors.contains_key(&denom_name));
+            if has_amax != has_denom {
+                eprintln!(
+                    "inkling2: incomplete companion set for {stem} (amax={has_amax}, denominator={has_denom})"
+                );
+                std::process::exit(2);
+            }
+            inkling2_experts.insert(
+                stem.to_string(),
+                Inkling2Companion {
+                    file_idx: fi,
+                    scale: name.to_string(),
+                    amax: has_amax.then_some(amax_name),
+                    denominator: has_denom.then_some(denom_name),
+                },
+            );
+        }
+    }
+    if !inkling2_experts.is_empty() {
+        let mut companion_names: Vec<String> = Vec::new();
+        for c in inkling2_experts.values() {
+            companion_names.push(c.scale.clone());
+            if let Some(a) = &c.amax {
+                companion_names.push(a.clone());
+            }
+            if let Some(d) = &c.denominator {
+                companion_names.push(d.clone());
+            }
+        }
+        all_tensors.retain(|(n, _)| !companion_names.iter().any(|s| s == n));
+        eprintln!(
+            "Inkling-2: indexed {} expert weight tensors (NVFP4 + MXFP8)",
+            inkling2_experts.len()
+        );
+    }
+
     if args.awq_a4_aware || args.awq_a4_route_c2 {
         // Runtime fusion applies one inverse AWQ scale to each shared input.
         // Visit the largest fused projection first so it chooses the alpha
@@ -3326,6 +3389,94 @@ pub(crate) fn run() {
         let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
         let mut n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
+
+        // ── Inkling-2-Mini expert ingest ────────────────────────────────────────
+        // Dequantize the 3-D packed tensor to F32, split it per expert, apply
+        // the gate/up interleave for w13, and emit MQ4G256 per-expert weights.
+        // Companion tensors were removed from `all_tensors` above.
+        if let Some(inc) = inkling2_experts.get(*name) {
+            let (smeta, sbytes) = st_files[inc.file_idx]
+                .tensor_data(&inc.scale)
+                .unwrap_or_else(|| panic!("inkling2 scale tensor missing: {}", inc.scale));
+            let f32_all = match (&inc.amax, &inc.denominator) {
+                (Some(a), Some(d)) => {
+                    let (_, ab) = st_files[inc.file_idx].tensor_data(a).unwrap();
+                    let (_, db) = st_files[inc.file_idx].tensor_data(d).unwrap();
+                    dequantize_nvfp4_amax_denominator(
+                        raw_data,
+                        &meta.shape,
+                        sbytes,
+                        &smeta.shape,
+                        ab,
+                        db,
+                    )
+                }
+                (None, None) => {
+                    dequantize_mxfp8_e8m0_strict(raw_data, &meta.shape, sbytes, &smeta.shape, 32)
+                }
+                _ => unreachable!(),
+            }
+            .unwrap_or_else(|e| {
+                eprintln!("inkling2: dequant failed for {name}: {e}");
+                std::process::exit(2);
+            });
+
+            let experts = meta.shape[0];
+            let rows = meta.shape[1];
+            let is_nvfp4 = inc.amax.is_some();
+            let cols = if is_nvfp4 {
+                meta.shape[2] * 2
+            } else {
+                meta.shape[2]
+            };
+            let per_expert = rows * cols;
+            if f32_all.len() != experts * per_expert {
+                eprintln!("inkling2: dequant length mismatch for {name}");
+                std::process::exit(2);
+            }
+            let is_w13 = name.ends_with(".w13_weight");
+            let base = name
+                .strip_suffix(".experts.w13_weight")
+                .or_else(|| name.strip_suffix(".experts.w2_weight"))
+                .unwrap_or_else(|| panic!("unexpected inkling2 expert name {name}"));
+            let signs1 = gen_fwht_signs(42, 256);
+            let signs2 = gen_fwht_signs(1042, 256);
+            for e in 0..experts {
+                let mut f32_e = f32_all[e * per_expert..(e + 1) * per_expert].to_vec();
+                if is_w13 {
+                    // Converter stores w13 rows as [gate0, up0, gate1, up1, …];
+                    // the loader expects [gate…, up…] of shape [2*inter, hidden].
+                    let inter = rows / 2;
+                    let mut grouped = vec![0.0f32; per_expert];
+                    for j in 0..inter {
+                        for c in 0..cols {
+                            grouped[j * cols + c] = f32_e[(2 * j) * cols + c];
+                            grouped[(inter + j) * cols + c] = f32_e[(2 * j + 1) * cols + c];
+                        }
+                    }
+                    f32_e = grouped;
+                }
+                let data = quantize_mq4g256(&f32_e, &signs1, &signs2);
+                let leaf = if is_w13 { "gate_up_proj" } else { "down_proj" };
+                hfq_tensors.push(HfqTensor {
+                    name: format!("{base}.experts.{e}.{leaf}"),
+                    quant_type: QuantType::MQ4G256,
+                    shape: vec![rows as u32, cols as u32],
+                    group_size: 256,
+                    data,
+                    spilled_len: 0,
+                });
+            }
+            quantized_params += (experts * per_expert) as u64;
+            eprintln!(
+                "  {:>8}: {} -> {} per-expert MQ4G256",
+                if is_nvfp4 { "NVFP4" } else { "MXFP8" },
+                name,
+                experts
+            );
+            st_files[*file_idx].drop_tensor_pages(name);
+            continue;
+        }
 
         if use_deepseek4_mq2rxt_overlay {
             let sidecar = include_prefix.is_some_and(|prefix| prefix == "mtp.");
