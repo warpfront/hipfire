@@ -344,7 +344,10 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    row-batched `_vmm` kernels, so a greedy comparison against the sequential
    route (or against a different batch composition) is expected to differ at
    some token, as on the arena route: output is deterministic for a fixed batch
-   composition and fully request-isolated, not byte-equal across routes. Design:
+   composition and fully request-isolated, not byte-equal across routes. Two
+   runs of the same concurrent traffic can also differ from each other:
+   arrival timing changes the composition, so byte-equal round-to-round output
+   is not an invariant this route owes. Design:
    [`docs/plans/2026-10-22-vmm-kv-multislot-engine.md`](plans/2026-10-22-vmm-kv-multislot-engine.md).
    A container recipe for this exact stack (4 slots, VMM, MTP + vision on a
    qwen3.5-4b fixture, port 9001) is `docker/compose.vmm-9001.yaml`.
