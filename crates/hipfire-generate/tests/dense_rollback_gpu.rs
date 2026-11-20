@@ -201,6 +201,7 @@ fn normalize_envelope(mut v: serde_json::Value) -> serde_json::Value {
             "tok_s",
             "prefill_ms",
             "prefill_tok_s",
+            "decode_ms",
             "decode_tok_s",
             "ttft_ms",
             "total_ms",
