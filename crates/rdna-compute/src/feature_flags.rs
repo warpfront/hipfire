@@ -67,6 +67,11 @@ pub struct FeatureFlags {
     /// `HIPFIRE_GFX11_A8_PREFILL`); opt-in, default off. Takes precedence over
     /// the IU4 W4A4 projections wherever it is admitted.
     pub gfx11_a8_prefill: bool,
+    /// lloyd-V FA2 Q16 + warp-specialized FILL for gfx11 KMODE4/VMODE4
+    /// (`kernel.fa2_lloydv_q16`, `HIPFIRE_FA2_LLOYDV_Q16`); opt-in, default
+    /// off. Restores the pre-split perf arms without touching the default
+    /// split path or its VMODE 4/3 guard. Output byte-identical.
+    pub fa2_lloydv_q16: bool,
     /// Qwen4 chunked GDN prefill (`HIPFIRE_QWEN4_GDN_CONV_QKNORM`): the
     /// convolution also writes the normalized Q/K, dropping the separate
     /// Q/K-norm launch. Bytes identical to the two-launch pair. Exact gfx1151
@@ -1160,6 +1165,7 @@ impl FeatureFlags {
             pm_decode: parse_bool("HIPFIRE_PM_DECODE").unwrap_or(arch == "gfx1201"),
             a8_prefill: parse_bool("HIPFIRE_A8_PREFILL").unwrap_or(false),
             gfx11_a8_prefill: parse_bool("HIPFIRE_GFX11_A8_PREFILL").unwrap_or(false),
+            fa2_lloydv_q16: parse_bool("HIPFIRE_FA2_LLOYDV_Q16").unwrap_or(false),
             qwen4_gdn_conv_qknorm: parse_bool("HIPFIRE_QWEN4_GDN_CONV_QKNORM")
                 .unwrap_or(halo_hyper_default),
             qwen4_gdn_q8_inline: parse_bool("HIPFIRE_QWEN4_GDN_Q8_INLINE").unwrap_or(false),
@@ -2185,6 +2191,7 @@ impl FeatureFlags {
             pm_decode: false,
             a8_prefill: false,
             gfx11_a8_prefill: false,
+            fa2_lloydv_q16: false,
             qwen4_gdn_conv_qknorm: false,
             qwen4_gdn_q8_inline: false,
             qwen4_gdn_i8_fuse: false,
