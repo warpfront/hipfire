@@ -1198,6 +1198,25 @@ def self_test():
     check("exit-failed", exits["failed"] == 1)
     check("exit-current", exits["current"] == 0)
     check("exit-unknown-row", main(["--rows", "no-such-row"]) == 2)
+    # `cargo test` takes one TESTNAME before `--`; further test names go after it.
+    bad_cargo = []
+    for crow in load_catalogue(repo_root())["rows"]:
+        for ckey in ("positive", "negative"):
+            for ccmd in crow.get("commands", {}).get(ckey, []):
+                if "cargo test" not in ccmd:
+                    continue
+                head = ccmd.split("cargo test", 1)[1].split(" -- ", 1)[0]
+                pos, skip = [], False
+                for tok in head.split():
+                    if skip:
+                        skip = False
+                    elif tok in ("-p", "--package", "--test", "--features", "--bin", "--example", "--manifest-path", "--target-dir"):
+                        skip = True
+                    elif not tok.startswith("-"):
+                        pos.append(tok)
+                if len(pos) > 1:
+                    bad_cargo.append(crow["id"])
+    check("cargo-one-positional-before-dashdash", not bad_cargo)
     for name, ok in checks:
         print("   [%s] %s" % ("PASS" if ok else "FAIL", name))
     print("device_mesh_matrix: self-test %s (%d checks)" % ("OK" if all(ok for _, ok in checks) else "FAILED", len(checks)))
