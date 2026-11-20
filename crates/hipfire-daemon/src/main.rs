@@ -3199,11 +3199,7 @@ fn main() {
                     admission: (!singleton_handoff).then_some(admission),
                 };
                 gpu.replay.begin_replay_observation_window();
-                let prompt = msg
-                    .get("prompt")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Hello");
-                let prompt_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt);
+                let prompt_norm = hipfire_engine::prompt::generate_prompt(&msg);
                 let prompt: &str = &prompt_norm;
                 if hipfire_runtime::config::get().prompt_token_heat {
                     if let Some(tok) = m.tokenizer.as_ref() {

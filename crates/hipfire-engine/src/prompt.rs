@@ -42,6 +42,17 @@ pub fn qwen_jinja_reasoning(
     }
 }
 
+/// A generate request's `prompt` (default `"Hello"`), normalized with
+/// `maybe_normalize_prompt`. The singleton dispatch and the Glimmer lane
+/// render share it so both tokenize identical bytes.
+pub fn generate_prompt(msg: &serde_json::Value) -> std::borrow::Cow<'_, str> {
+    hipfire_runtime::tokenizer::maybe_normalize_prompt(
+        msg.get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Hello"),
+    )
+}
+
 /// A generate request's `messages`, each non-empty content normalized the
 /// way the daemon normalizes `prompt` (`maybe_normalize_prompt`: strip
 /// trailing whitespace before `\n`, collapse 3+ newlines to 2, ...).
