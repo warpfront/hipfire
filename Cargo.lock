@@ -1367,6 +1367,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-inkling2"
+version = "0.4.6"
+
+[[package]]
 name = "hipfire-arch-lfm2-vl"
 version = "0.4.6"
 dependencies = [
