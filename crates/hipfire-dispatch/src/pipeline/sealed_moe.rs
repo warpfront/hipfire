@@ -2947,7 +2947,9 @@ impl SealedMoeCall<'_> {
     /// that capability as a launch authority on the tape: the replay bypasses
     /// verify its generation lease and image epoch before every submission. A
     /// graph capture of such a call is refused, since a graph launch has no
-    /// such check.
+    /// such check. A multi-row (grouped-prefill protocol) call with the capability
+    /// is qualified for eager HIP only, so a retained body (recording or a
+    /// prepared PM4/AQL route) of it is refused too.
     fn note_retained_route_identity(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let mutable = self.carried_mutable_residency();
         if mutable.is_some() && gpu.graphs.capture_mode {
@@ -2958,6 +2960,12 @@ impl SealedMoeCall<'_> {
         }
         if !gpu.replay.retained_body_active() {
             return Ok(());
+        }
+        if mutable.is_some() && matches!(self.params, SealedParams::Prefill(_)) {
+            return Err(invalid(
+                "mutable residency: a multi-row (grouped-prefill protocol) call runs eager HIP \
+                 only; a retained or recorded verify body is not qualified",
+            ));
         }
         let specialized = match &self.params {
             SealedParams::Decode(params) => params.route_policy.is_some(),
@@ -4091,15 +4099,99 @@ fn validate_decode(
     Ok(())
 }
 
+/// Admission of a grouped-prefill-protocol call over a mutable-residency expert set: an
+/// exact-cache verify or repair window (PLAN A2; `docs/expert-cache/ROUTE-INVENTORY.md` §7).
+///
+/// Every kernel the admitted route can launch reads the routed pointer tables through the
+/// table address in its kernarg at execute time. Everything that reads table contents at
+/// plan or bind time, or leaves the device, is refused here, before sealing:
+/// * exact gfx1201 and a 2..=[`WIDE_VERIFY_MAX_ROWS`] row window (one row is the indexed
+///   decode seal; a prompt reads the canonical prefill scope, never this binding);
+/// * the sealed QT44/QT53 grouped route only: no generic, FP8 or expert-slab lowering and
+///   no expert-IU4 or MQ2-Lloyd arm (GU-14/DOWN-13, GU-16/DOWN-15 are not reachable);
+/// * no stage tables (TAB-3/TAB-5 are filled from host entries at plan time);
+/// * no CPU splice or split (HOST-1..4) and no EP partial, gather or exchange;
+/// * no AWQ or dtype-tag tables.
+///
+/// Kernel selection then reads only the binding's plan-derived host bit (the tier
+/// identity's `any_host`), never the current placement, and the call's launch authority
+/// is its live reader lease at the current image epoch ([`validate_live_binding`]).
+///
+/// [`WIDE_VERIFY_MAX_ROWS`]: rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+fn validate_mutable_prefill(
+    ctx: &DispatchCtx,
+    params: &MoePrefillParams<'_>,
+) -> Result<(), DispatchError> {
+    use crate::families::moe::MoeRouteCapability::{Qt44Qt53Grouped, Qt44Qt53GroupedSymmetric};
+    const MAX_ROWS: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+    if ctx.arch.arch() != "gfx1201" {
+        return Err(invalid("mutable residency prefill requires exact gfx1201"));
+    }
+    if !(2..=MAX_ROWS).contains(&params.batch_size) {
+        return Err(invalid(format!(
+            "mutable residency prefill serves 2..={MAX_ROWS}-row verify windows, got {} rows",
+            params.batch_size
+        )));
+    }
+    if !params.route_policy.is_some_and(|policy| {
+        matches!(
+            policy.capability,
+            Qt44Qt53Grouped | Qt44Qt53GroupedSymmetric
+        )
+    }) || params.expert_iu4.is_some()
+        || params.mq2_lloyd.is_some()
+    {
+        return Err(invalid(
+            "mutable residency prefill requires the sealed QT44/QT53 grouped route",
+        ));
+    }
+    if params.expert_stage_ptrs.is_some() {
+        return Err(invalid(
+            "mutable residency prefill refuses stage tables (filled from host entries at plan time)",
+        ));
+    }
+    if params.cpu_deferred_experts
+        || params.routed_experts.cpu_split().is_some()
+        || params.routed_out.is_some()
+        || params.ep_row_gather.is_some()
+        || params.ep_tile_exchange.is_some()
+        || params.shared_down_out.is_some()
+        || !matches!(params.prelude.route, PrefillRouteMode::Replicated)
+    {
+        return Err(invalid(
+            "mutable residency prefill refuses CPU splice/split and EP",
+        ));
+    }
+    if params.expert_down_awq_ptrs.is_some()
+        || params.down_awq_scale.is_some()
+        || params.expert_dtype_tags.is_some()
+    {
+        return Err(invalid(
+            "mutable residency prefill refuses AWQ and dtype-tag tables",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_prefill(
-    _ctx: &DispatchCtx,
+    ctx: &DispatchCtx,
     experts: &BoundMoeExperts<'_>,
     params: &MoePrefillParams<'_>,
 ) -> Result<(), DispatchError> {
-    if params.routed_experts.mutable_residency().is_some() {
-        return Err(invalid(
-            "mutable residency is decode-only; prefill requires frozen resources",
-        ));
+    let mutable = params.routed_experts.mutable_residency().is_some();
+    if mutable {
+        validate_mutable_prefill(ctx, params)?;
+        // Launch authority before any other work: the window's reader lease at the current
+        // image epoch, and the published entries it leased.
+        validate_live_binding(
+            experts,
+            Some(params.routed_experts),
+            params.expert_gate_up_ptrs,
+            params.expert_down_ptrs,
+            params.expert_down_awq_ptrs,
+            params.expert_dtype_tags,
+            params.expert_ptrs_host,
+        )?;
     }
     if params.batch_size == 0 {
         return Err(invalid("grouped prefill batch_size is zero"));
@@ -4206,15 +4298,19 @@ fn validate_prefill(
         params.dtypes.per_expert_gate_up.as_deref(),
         params.dtypes.per_expert_down.as_deref(),
     )?;
-    validate_live_binding(
-        experts,
-        Some(params.routed_experts),
-        params.expert_gate_up_ptrs,
-        params.expert_down_ptrs,
-        params.expert_down_awq_ptrs,
-        params.expert_dtype_tags,
-        None,
-    )?;
+    if !mutable {
+        // A frozen binding's host entries are not read here (the historical prefill
+        // contract); a mutable one was checked under its lease above.
+        validate_live_binding(
+            experts,
+            Some(params.routed_experts),
+            params.expert_gate_up_ptrs,
+            params.expert_down_ptrs,
+            params.expert_down_awq_ptrs,
+            params.expert_dtype_tags,
+            None,
+        )?;
+    }
     validate_dtype_tag_table(
         params.expert_dtype_tags,
         params.n_exp,
@@ -6328,7 +6424,7 @@ mod tests {
     }
 
     #[test]
-    fn mutable_decode_refuses_unqualified_arch_cpu_and_ep_before_sealing() {
+    fn mutable_residency_admits_only_qualified_decode_and_verify_windows() {
         let table = mutable_table();
         let fixture = live_fixture(&table, 0x5100_0000);
         let routed = MutableRouted {
@@ -6377,17 +6473,180 @@ mod tests {
             let error = validate_decode(&ctx, &bound, &params).unwrap_err();
             assert!(format!("{error:?}").contains(expected), "{error:?}");
         }
-        let ctx = DispatchCtx::for_test("gfx1201");
+        // The grouped-prefill protocol (an n-row verify/repair window) is admitted only for a
+        // 2..=64-row sealed QT44/QT53 replicated window on gfx1201, and then only under a live
+        // reader lease naming the published image.
+        use crate::families::moe::{
+            MoeRouteCapability, MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy,
+        };
+        let policy = |capability| MoeRoutePolicy {
+            capability,
+            geometry: MoeRouteGeometry {
+                experts: 512,
+                top_k: 10,
+                hidden: 2560,
+                routed_intermediate: 640,
+                shared_intermediate: 640,
+            },
+            formats: MoeRouteFormats {
+                router: DType::BF16,
+                shared_selector: DType::BF16,
+                shared_gate: DType::BF16,
+                shared_up: DType::BF16,
+                shared_down: DType::BF16,
+                routed_gate_up: DType::MQ4G256V2,
+                routed_down: DType::MQ4G128V2,
+            },
+            slab_cold_codec: None,
+            expert_keep_mask: 0,
+        };
         let scratch = prefill_scratch(0x5300_0000);
-        let params = ep_prefill_params(
+        let partial = &scratch.x_batch;
+        let window = |rows: usize| {
+            let mut params = ep_prefill_params(
+                &scratch,
+                &routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                None,
+            );
+            params.batch_size = rows;
+            params.prelude.route = PrefillRouteMode::Replicated;
+            params.route_policy = Some(policy(MoeRouteCapability::Qt44Qt53GroupedSymmetric));
+            params
+        };
+        let gfx1201 = DispatchCtx::for_test("gfx1201");
+        for rows in [2, 5, 9, 64] {
+            validate_mutable_prefill(&gfx1201, &window(rows)).unwrap();
+        }
+        let mut plain = window(4);
+        plain.route_policy = Some(policy(MoeRouteCapability::Qt44Qt53Grouped));
+        validate_mutable_prefill(&gfx1201, &plain).unwrap();
+        type Mutate = fn(&mut MoePrefillParams<'_>);
+        let refusals: [(&str, usize, Mutate, &str); 8] = [
+            ("gfx1100", 4, |_| {}, "exact gfx1201"),
+            ("gfx1201", 1, |_| {}, "2..=64-row verify windows"),
+            ("gfx1201", 65, |_| {}, "2..=64-row verify windows"),
+            (
+                "gfx1201",
+                4,
+                |p| p.route_policy = None,
+                "sealed QT44/QT53 grouped route",
+            ),
+            (
+                "gfx1201",
+                4,
+                |p| {
+                    p.route_policy = p.route_policy.map(|mut policy| {
+                        policy.capability = MoeRouteCapability::SlabCodecGrouped;
+                        policy
+                    })
+                },
+                "sealed QT44/QT53 grouped route",
+            ),
+            (
+                "gfx1201",
+                4,
+                |p| {
+                    p.route_policy = p.route_policy.map(|mut policy| {
+                        policy.capability = MoeRouteCapability::Fp8B128Grouped;
+                        policy
+                    })
+                },
+                "sealed QT44/QT53 grouped route",
+            ),
+            (
+                "gfx1201",
+                4,
+                |p| p.cpu_deferred_experts = true,
+                "CPU splice/split and EP",
+            ),
+            (
+                "gfx1201",
+                4,
+                |p| p.expert_dtype_tags = Some(p.topk_indices),
+                "AWQ and dtype-tag",
+            ),
+        ];
+        for (arch, rows, mutate, expected) in refusals {
+            let mut params = window(rows);
+            mutate(&mut params);
+            let ctx = DispatchCtx::for_test(arch);
+            let error = validate_prefill(&ctx, &bound, &params).unwrap_err();
+            assert!(
+                format!("{error:?}").contains(expected),
+                "{arch} {rows}: {error:?}"
+            );
+        }
+        let mut ep_partial = window(4);
+        ep_partial.routed_out = Some(partial);
+        let error = validate_prefill(&gfx1201, &bound, &ep_partial).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("CPU splice/split and EP"),
+            "{error:?}"
+        );
+        // The fixture's own root-produced (compact EP) route.
+        let mut produce_root = ep_prefill_params(
             &scratch,
             &routed,
             &fixture.gate_up_ptrs,
             &fixture.down_ptrs,
             None,
         );
-        let error = validate_prefill(&ctx, &bound, &params).unwrap_err();
-        assert!(format!("{error:?}").contains("decode-only"), "{error:?}");
+        produce_root.batch_size = 4;
+        produce_root.route_policy = Some(policy(MoeRouteCapability::Qt44Qt53Grouped));
+        assert!(matches!(
+            produce_root.prelude.route,
+            PrefillRouteMode::ProduceRoot { .. }
+        ));
+        let error = validate_prefill(&gfx1201, &bound, &produce_root).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("CPU splice/split and EP"),
+            "{error:?}"
+        );
+
+        // Admitted shape: the lease must be live (checked first), and under it the host
+        // mirror of the published image is mandatory.
+        let snapshot = routed.residency.snapshot().unwrap();
+        let mut leased = window(4);
+        leased.expert_ptrs_host = Some(MoePointerEntries {
+            gate_up: &snapshot.gate_up,
+            down: &snapshot.down,
+        });
+        for params in [&window(4), &leased] {
+            let error = validate_prefill(&gfx1201, &bound, params).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("no live generation lease"),
+                "{error:?}"
+            );
+        }
+        let guard = routed.residency.begin_token(snapshot.epoch).unwrap();
+        let error = validate_prefill(&gfx1201, &bound, &window(4)).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("published host pointer entries"),
+            "{error:?}"
+        );
+        // Under the lease the binding and authority pass: whatever the synthetic shapes
+        // still refuse is not a residency check.
+        if let Err(error) = validate_prefill(&gfx1201, &bound, &leased) {
+            assert!(
+                !format!("{error:?}").contains("mutable residency"),
+                "{error:?}"
+            );
+        }
+        // A host mirror that is not the published image refuses even under the lease.
+        let stale = [0x1234usize, 0x5678];
+        leased.expert_ptrs_host = Some(MoePointerEntries {
+            gate_up: &stale,
+            down: &snapshot.down,
+        });
+        let error = validate_prefill(&gfx1201, &bound, &leased).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("published mapping"),
+            "{error:?}"
+        );
+        // SAFETY: no GPU work was submitted.
+        unsafe { guard.retire_after_gpu_wait() }.unwrap();
     }
 
     #[test]
@@ -9230,6 +9489,7 @@ mod tests {
             x_rot_batch: &s.x_rot_batch,
             expert_gate_up_ptrs: gate_up_ptrs,
             expert_down_ptrs: down_ptrs,
+            expert_ptrs_host: None,
             expert_stage_ptrs: None,
             routed_experts: routed,
             expert_down_awq_ptrs: None,

@@ -249,3 +249,34 @@ A2.4 says: if the tier identity's per-layer host bit selects kernels, derive it 
 3. **No retained-route latch exists for DS4, qwen35, cohere2moe, lfm2moe, minimax, raon, gemma4, maple** (VAL-4, REP-3..6). A retained tape on those archs is unguarded today; "launch authority on every replay bypass" (A5, S3b) needs REP-2..REP-7 each, not only the qwen4 site.
 4. **A tier/placement digest in the latch** (IDENT-2) and **host-bit kernel selection** (H1) are the two items that make a remap observable to a tape; both must move to plan-derived values before any `record/bind-time` row is lifted.
 5. Rows I could not close and left [UNVERIFIED]: GRP-2/3/5 (forwarded table extraction, K2 body), PM-6 ISA read, REP-7 per-loop arch, CACHE-11, GU-3/GU-6 duplicate definitions, GU-5/DOWN-4 arch use, TAB-9 minimax builder.
+
+## 7. Multi-row windows under mutable residency (S5b)
+
+Source: worktree `wt-s5b` (branch `ec/s5b`, base 68691a36c4), read 2026-11-20. Rows §1–§6 and their counts are unchanged; this section records which of them a multi-row exact-cache window may reach, and the admission that keeps everything else out.
+
+**Admission.** A Qwen4 verify / repair window of `n` rows seals the grouped-prefill protocol (`hipfire-arch-qwen4/src/program.rs` `seal_moe_for_layer`: decode at `route_rows == 1`, prefill otherwise). `hipfire-dispatch/src/pipeline/sealed_moe.rs::validate_mutable_prefill` admits such a call over a mutable-residency set only when:
+
+- the arch is exactly gfx1201 and `2 <= n <= WIDE_VERIFY_MAX_ROWS` (64);
+- the route policy is `Qt44Qt53Grouped` / `Qt44Qt53GroupedSymmetric` (the sealed grouped route), with no `expert_iu4` or `mq2_lloyd` arm. So the generic prefill stages (GU-14/DOWN-13), the expert-IU4 stages (GU-16/DOWN-15), FP8 and the slab route (GRP-5, PM-4..6, GU-9/DOWN-9) are **not reachable**;
+- there are no stage tables (TAB-3, TAB-5), no CPU splice or split (HOST-1..4), no EP partial / row gather / tile exchange / shared-down redirect, and the route is `Replicated`;
+- there are no AWQ or dtype-tag tables.
+
+Then `validate_live_binding` runs with the call's `expert_ptrs_host` (new `MoePrefillParams` field; Qwen4 passes its refreshed mirror). Launch authority is `MutableExpertResidency::authorize_launch`: a live reader lease at the current image epoch. The entries must equal the published image (`validate_current_entries`). A retained or recorded body of such a call is refused in `note_retained_route_identity`, and Qwen4's replay eligibility is `n == 1` (`gpu_forward.rs` `eligible = … && n == 1`). Multi-row windows therefore run eager HIP only.
+
+**Kernel selection is plan-derived (A2.4).** The only placement-dependent selector the route reads is the H1 host bit. `select_prefill` takes it through `routed_host_mapped_projections` (tier identity first). The grouped IU4 GEMMs take it through `experts_host_mapped` (`qt44_qt53_prefill.rs:2323`) → `RoutedExpertWeights::host_mapped`. For an exact-cache layer both read the tier identity's `any_host`. That identity is built once at load from the canonical cache view's placement (`gpu_forward.rs` `Qwen4MoeLayerRuntime::build`, `tier_identity` / `local_host_mapped`), never from the current mapping. The GPU gate is a launch census identical across remaps.
+
+**Qualified rows: reads the table at execute time.** These are the kernels the admitted route launches. `moe_program.rs:1869`–`1885` and `:2056`–`2069` dispatch the sealed grouped route to `qt44_qt53_prefill::{gate_up_front, down}`. Their table pick (`:2359`–`2361`, `:2838`–`2840`) is always `expert_gate_up_ptrs` / `expert_down_ptrs`, because stage tables are refused.
+
+| Row | Arm (qt44_qt53_prefill.rs) | Launcher | Table read | Evidence |
+|---|---|---|---|---|
+| GU-15 / DOWN-14 | sealed grouped front / down | dispatch only | `p.expert_*_ptrs` forwarded | `:2359`–`2361`, `:2838`–`2840` |
+| GU-11 / DOWN-10 | symmetric IU4 (`sym_iu4`, `:2393`, `:2893`) | `gemm.rs:54135`, `:54183` → `qwen4_moe_sym_gemm` `:54730` | table address in the operand set; extent `nev = moe_expert_table_len(ptrs)` | `[ptrs, tiles, sorted, y]` (`gemm.rs:54817`), `:54782`; the H1 bit picks `kernel.entries[h]` (`:54759`) |
+| GU-12 / DOWN-11 | developer `HIPFIRE_QWEN4_MOE_EP_A8` arm of `sym_iu4` (`:2370`, `:2862`); the EP `ep_a8_wide` arm is refused (needs `ep_row_gather`) | `qwen4_moe_ep_a8.rs:499`, `:540`, `:606`, `:728` → `qwen4_moe_ep_a8_gemm` `:769` | table address | `let ep = ptrs.buf.as_ptr();` (`:647`, `:800`) |
+| GRP-2 | path-2 gate/up (`:2486`, `:2520`) | `gemm_mq4g256v2_moe_grouped_top10{,_bf16out,_silu_bf16out}` (`gemm.rs:50371`, `:50273`, `:50312`). On gfx1201 these forward to `…_wmma_k2_impl` (`:15049`), `…_top10_g32_run` (from `:50760`) or `…_top10_simt` (`:51066`). The gfx1151 arms (`…_inverse` `moe_few.rs:26`, `o4_r8*`) are not reachable | table address | `let ep = expert_weight_ptrs.buf.as_ptr();` (`gemm.rs:15138`, `:50916`, `:51086`). This closes the §6.5 [UNVERIFIED] mark for the gfx1201 arms |
+| GRP-4 | path-2 down (`:2987`, `:2999`) | `gemm_mq4g128v2_moe_grouped_top10{,_xf16}` (`moe.rs:3874`, `:3999`) → `…_grouped_top10_with` (`:4128`), `…_grouped_wmma_gfx1151` (`:4029`) or the A8 grouped down (`qwen4_moe_down_a8.rs:550`/`:612` → run `:652`) | table address | `let ep = expert_ptrs.buf.as_ptr();` (`moe.rs:4072`, `:4215`; `qwen4_moe_down_a8.rs:701`) |
+| GU-1 + PM-1 | path-1 / wide-exact indexed gate/up (`:2541`; `wide_exact_moe_rows`, 9..=limit rows, skips scatter/unscatter) | `gemv_mq4g256v2_moe_gate_up_top10_indexed_batched` (`gemv.rs:16901`), including the gfx1201 row-tile PM twin (`:16927`–`:16937`) | table address | `let pp = expert_ptrs.buf.as_ptr();` (`:16977`, `:17053`); `b.push_ptr(pp)` (`:17006`, `:17102`, `:17146`) |
+| DOWN-6 + PM-2 | indexed down (`indexed_down` → `:3035`) | `gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded` (`moe.rs:3568`), including the row-tile PM twin (`:3676`–`:3690`) | table address | `let pp = expert_ptrs.buf.as_ptr();` (`:3731`, `:3799`); `b.push_ptr(pp)` (`:3765`) |
+
+The router, scatter, unscatter, activation, combine, shared-expert and HC stages of the same program read no routed expert table (SH-1..SH-6, PM-7/PM-8). The shared weights stay outside the cache domain. The lab-only G1 observer (`bind_g1_window`, `lab_observe_g1`) is inactive unless a lab observer is installed. It names the canonical identity and reads within the call's window, so it does not select a kernel.
+
+**Refused under mutable residency (record/bind-time or not qualified):** TAB-3 / TAB-5 stage tables, HOST-1..4, the EP / tile-exchange / row-gather arms, FP8, slab, expert-IU4, AWQ / dtype tags, HIP graph capture, and any retained or recorded multi-row body. Nothing in §1–§3 changed class.

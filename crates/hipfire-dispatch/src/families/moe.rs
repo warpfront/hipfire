@@ -2126,6 +2126,12 @@ pub struct MoePrefillParams<'a> {
     // routed gate_up/down pointer tables
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
+    /// Host entries behind `expert_gate_up_ptrs` / `expert_down_ptrs` (see
+    /// [`MoeParams::expert_ptrs_host`]). Read only for a routed set that carries
+    /// [`RoutedExpertWeights::mutable_residency`]: the multi-row verify window
+    /// must name the published image it holds the reader lease for. A frozen
+    /// binding ignores it, so `None` keeps the historical prefill contract.
+    pub expert_ptrs_host: Option<MoePointerEntries<'a>>,
     /// Prefill-only table override; decode and live-binding validation ignore it.
     pub expert_stage_ptrs: Option<MoeStageTables<'a>>,
     /// Exact live expert owners bound to the sealed load-time identity.

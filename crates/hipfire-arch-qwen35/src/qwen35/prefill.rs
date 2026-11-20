@@ -5338,6 +5338,7 @@ fn build_moe_prefill_params<'a>(
         x_rot_batch: &pbs.x_rot_batch,
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
+        expert_ptrs_host: None,
         expert_stage_ptrs: None,
         routed_experts: ffn,
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),

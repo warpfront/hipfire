@@ -435,6 +435,7 @@ impl<'a> LayerRefs<'a> {
                     x_rot_batch: moe.x_rot,
                     expert_gate_up_ptrs: &m.expert_gate_up_ptrs,
                     expert_down_ptrs: &m.expert_down_ptrs,
+                    expert_ptrs_host: None,
                     expert_stage_ptrs: None,
                     routed_experts: m,
                     expert_down_awq_ptrs: None,

@@ -998,6 +998,10 @@ pub fn seal_moe_for_layer<'a>(
             moe.layer_idx
         )));
     }
+    // An exact-cache (mutable residency) layer seals the same way: one row is the indexed
+    // decode, an n-row verify/repair window the grouped prefill protocol, which dispatch
+    // admits under mutable residency only for a 2..=64-row sealed QT44/QT53 window (no
+    // stage tables, CPU or EP) whose published image is leased at the current epoch.
     if route_rows == 1 && !moe.route_policy.capability.is_fp8_grouped() {
         let params = build_moe_decode(dims, moe, scratch.hc_mixed, scratch, cpu_deferred)?;
         seal_decode(bound, ctx, params)
@@ -1293,6 +1297,12 @@ fn build_moe_prefill<'a>(
         x_rot_batch: scratch.moe_x_rot,
         expert_gate_up_ptrs: moe.expert_gate_up_ptrs,
         expert_down_ptrs: moe.expert_down_ptrs,
+        // The published mirror of the tables above: dispatch reads it only for a
+        // mutable-residency layer (an exact-cache verify window), never a frozen one.
+        expert_ptrs_host: Some(hipfire_dispatch::families::moe::MoePointerEntries {
+            gate_up: moe.expert_gate_up_entries,
+            down: moe.expert_down_entries,
+        }),
         expert_stage_ptrs: moe.expert_stage_ptrs,
         routed_experts: moe.routed_experts,
         expert_down_awq_ptrs: None,
