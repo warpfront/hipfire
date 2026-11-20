@@ -8063,6 +8063,15 @@ pub fn route_entries_sealed(
                     radiowave_json: None,
                     symbols,
                 });
+                // The native-MTP verify argmaxes its rows through `argmax_f32_batched_regrid`, which on exact
+                // gfx1201 (this route) runs the sealed builder twin. Plan that image so it is bound before ready
+                // instead of being a post-ready embedded load the closed route refuses.
+                embedded.push(PlannedKernel::Embedded {
+                    module: crate::select_regrid::ARGMAX_REGRID_PM_GFX1201_SYMBOL,
+                    image: crate::kernels::ARGMAX_REGRID_PM_GFX1201,
+                    radiowave_json: None,
+                    symbols: &[crate::select_regrid::ARGMAX_REGRID_PM_GFX1201_SYMBOL],
+                });
             }
             // VMM exact route projections/lm_head: the accepted PM
             // multi-column objects under pm_decode, else the hipcc x-batch
@@ -8457,6 +8466,7 @@ pub fn predicted_kernels(
                 .flat_map(|twin| twin.symbols.iter().copied()),
         );
         foreign.extend(crate::pm_mtp_gemm::route_object().2.iter().copied());
+        foreign.insert(crate::select_regrid::ARGMAX_REGRID_PM_GFX1201_SYMBOL);
         for (_, _, symbols) in crate::pm_xbatch::route_objects() {
             foreign.extend(symbols.iter().copied());
         }
