@@ -127,8 +127,9 @@ def greedy(prompt, max_tokens, **kw):
     return {"prompt": prompt, "temperature": 0.0, "max_tokens": max_tokens, **kw}
 
 
-def run_arm(args, route, arm, out):
-    """All scenarios on one fresh daemon. Returns {scenario: [result, ...]}."""
+def run_arm(args, route, arm, out, eos_n=None):
+    """All scenarios on one fresh daemon. Returns {scenario: [result, ...]}.
+    eos_n: the eos_budget length to rerun with (default: this arm's own probe)."""
     env = dict(os.environ, **route.get("env", {}), HIPFIRE_ENGINE_LOOP=arm)
     d = Daemon(args.daemon, env, f"{out}/{route['name']}.{arm}", args.timeout)
     res = {}
@@ -157,11 +158,13 @@ def run_arm(args, route, arm, out):
         res["abort_decode"] = [d.generate("ad", greedy(cnt, 4 * mt), abort_at_token=8),
                                d.generate("ad-next", greedy(cnt, mt))]
         # stop on the last budget token: probe the natural length, then rerun with
-        # the budget ending exactly at the EOS (both tokens-counting conventions)
+        # the budget ending exactly at the EOS (both tokens-counting conventions).
+        # Both arms rerun at the legacy n: the engine does not count EOS, so its own
+        # probe is one shorter and would pair different budgets.
         p = "Reply with exactly the word: yes"
         nothink = {"thinking_enabled": False}  # a thinking model would not stop inside the budget
         probe = d.generate("eos-probe", greedy(p, mt, **nothink))
-        n = probe["done"].get("tokens", 0)
+        n = probe["done"].get("tokens", 0) if eos_n is None else eos_n
         res["eos_budget"] = [probe] + [d.generate(f"eos-{b}", greedy(p, b, **nothink)) for b in (n, n + 1) if b > 0]
         # seeded sampled: same seed twice (reproducibility), then a seed sweep for
         # the cross-arm distribution check
@@ -371,7 +374,8 @@ def main():
 
     res, t0 = {}, time.time()
     for arm in ARMS:
-        res[arm] = run_arm(args, route, arm, out)
+        res[arm] = run_arm(args, route, arm, out,
+                           None if arm == "legacy" else res["legacy"]["eos_budget"][0]["done"].get("tokens", 0))
     scenarios = {}
     for sc in res["legacy"]:
         if sc == "daemon_rc":
