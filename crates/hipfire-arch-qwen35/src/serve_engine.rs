@@ -4391,11 +4391,13 @@ fn inject_publish_fault() -> bool {
 /// reuse the slot. Nothing is in flight here, so those pages are only
 /// holding VMM granules. Parking the session `Cold` returns its slot and
 /// admission grant to the pool while keeping its tokens, conversation
-/// identity and session id: a tool-result turn names that id, so closing the
-/// entry would make the daemon reap its pending-tool record and answer the
-/// next turn with `unknown or stale tool_call_id`. A `Cold` reentry
-/// re-prefills from the same prompt (never wrong, and the KV is coming back
-/// anyway). The prefix-cache reclaim that follows drops any cache refs, so
+/// identity and session id: the next turn names that id, whether it is a
+/// user turn or a tool result. Closing the entry would strand a row per
+/// user turn and, for tool results, make the daemon reap its pending-tool
+/// record and answer with `unknown or stale tool_call_id`. A `Cold` reentry
+/// re-prefills the full prompt into that same id (never wrong, and the KV is
+/// coming back anyway). The prefix-cache reclaim that follows drops any
+/// cache refs, so
 /// the next request reuses the committed granules in place instead of
 /// mapping new ones. A used VA keeps its physical binding until teardown
 /// ([`VmmPageMapper::sync`]), so nothing is unmapped.
@@ -7631,9 +7633,11 @@ fn admit(
     // turn began after an OpenThink opener that history rendering does not
     // replay, and re-encoding the decoded reply is not guaranteed to round
     // trip. Reuse also keeps the DeltaNet state, which is the point.
-    // Set when a matched session's snapshot was lost and restore marked it
-    // Cold: the cold path below re-prefills into that same session instead of
-    // minting a new id (which would strand the old entry).
+    // Set when a continuation match names a Cold session: the idle paged
+    // reclaim parks sessions instead of closing them, so a user turn (like a
+    // tool-result turn) after that gap must re-enter the SAME id. The cold
+    // path re-prefills the request's full prompt into that id instead of
+    // minting a new one and stranding the parked row until the TTL/cap sweep.
     let mut cold_reuse: Option<SessionId> = None;
     if req.visual_data.is_none() && !req.continuation.tokens().is_empty() {
         if rig.gpu.slot_trace() {
@@ -7661,34 +7665,28 @@ fn admit(
         }
         // The suffix shape decides which match is legal — never both. A user
         // turn searches for the session one turn behind; tool results confirm
-        // the session that emitted the calls being answered. Either way the
-        // suffix is appended to the session's exact stored tokens, so the KV
-        // and DeltaNet state extend strictly.
+        // the session that emitted the calls being answered. Either way a
+        // resident/swapped match is extended from its exact stored tokens so
+        // the KV and DeltaNet state extend strictly.
         let matched = match &req.continuation {
             Continuation::Cold => None,
             Continuation::UserTurn(_) => rig.sessions.find_continuation(&req.convo, &busy),
             Continuation::ToolResults { session, .. } => {
-                let confirmed =
-                    rig.sessions
-                        .confirm_reentry(SessionId(*session), &req.convo, &busy);
-                // The idle paged reclaim parks a resident session Cold. The
-                // id still owns this conversation and still holds its tokens,
-                // so re-enter it through the cold admit path: `admit_cold`
-                // re-opens the SAME id and re-prefills, and the daemon's
-                // tool-result turn is accepted on the session it named.
-                // Returning None here would mint a new id, which the daemon
-                // rejects as an admission on the wrong session.
-                let is_cold = confirmed.is_some_and(|id| {
-                    rig.sessions
-                        .get(id)
-                        .is_some_and(|s| s.residency == Residency::Cold)
-                });
-                if is_cold {
-                    cold_reuse = confirmed;
-                }
-                confirmed.filter(|_| !is_cold)
+                rig.sessions
+                    .confirm_reentry(SessionId(*session), &req.convo, &busy)
             }
         };
+        // A parked Cold session owns the conversation and tokens but has no
+        // KV or snapshot to extend. Both continuation shapes can name one:
+        // the idle reclaim parks idle sessions after ANY finished turn, not
+        // just tool calls. Re-enter through admit_cold (reopen_cold + full
+        // re-prefill under the same id) rather than falling through to a new
+        // session, which would leak a table row per user turn.
+        let cold_match = matched_cold_session(&rig.sessions, matched);
+        if cold_match.is_some() {
+            cold_reuse = cold_match;
+        }
+        let matched = matched.filter(|id| Some(*id) != cold_match);
         if let Some(existing) = matched {
             let base = rig
                 .sessions
@@ -8962,10 +8960,25 @@ fn sweep_sessions(rig: &mut Rig) {
     }
 }
 
-/// Admit the cold path's session. When a matched session's snapshot was lost,
-/// restore marked that session Cold; reopen the same id (it still owns the
-/// conversation identity) instead of minting a new one, which would strand the
-/// old entry in the table forever.
+/// Return a continuation match that must re-enter through [`admit_cold`].
+///
+/// A `Cold` session has no slot and no snapshot: extending it in place is
+/// impossible, and opening a new session would strand the parked row until
+/// the TTL/cap sweep (one leak per user turn after an idle gap). Both the
+/// user-turn and tool-result matchers can produce one, so the routing decision
+/// lives here rather than in either matcher's arm.
+fn matched_cold_session(sessions: &SessionTable, matched: Option<SessionId>) -> Option<SessionId> {
+    matched.filter(|id| {
+        sessions
+            .get(*id)
+            .is_some_and(|s| s.residency == Residency::Cold)
+    })
+}
+
+/// Admit the cold path's session. A matched session may be Cold because its
+/// snapshot was lost or because the idle paged reclaim parked it; reopen the
+/// same id (it still owns conversation identity and tokens) instead of
+/// minting a new one, which would strand the old entry in the table forever.
 fn admit_cold(
     rig: &mut Rig,
     reuse: &mut Option<SessionId>,
@@ -10092,6 +10105,52 @@ mod tests {
             "const true must produce forced tokens"
         );
         assert_eq!(run.token_ids, vec![0, 1, 2, 3], "forced tokens are t,r,u,e");
+    }
+
+    #[test]
+    fn continuation_cold_match_routes_to_cold_reentry_not_resident_extend() {
+        // CPU-level model of admit's match routing: after the idle paged
+        // reclaim parks a session Cold, the next USER turn still matches its
+        // convo and must take the cold path under the same id, not mint a new
+        // session and leave a row behind.
+        let mut pool = SlotPool::new(2, 4096, 1088).unwrap();
+        let mut adm = AdmissionController::new(
+            ModelFootprint {
+                weights_bytes: 0,
+                kv_bytes_per_token: 1024,
+                pinned_host_bytes: 0,
+            },
+            32 * 1024 * 1024 * 1024,
+        );
+        let mut sessions = SessionTable::default();
+        let id = sessions.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = sessions.get_mut(id).unwrap();
+            s.convo = vec![11];
+            s.tokens = vec![1, 2, 3];
+        }
+        let want = [11, 22];
+        let resident = sessions.find_continuation(&want, &[]);
+        assert_eq!(resident, Some(id));
+        assert_eq!(matched_cold_session(&sessions, resident), None);
+
+        sessions.mark_swapped(&mut pool, &mut adm, id);
+        assert_eq!(
+            matched_cold_session(&sessions, sessions.find_continuation(&want, &[])),
+            None,
+            "a swapped session is restored and extended in place"
+        );
+
+        sessions.mark_cold(&mut pool, &mut adm, id);
+        let cold = sessions.find_continuation(&want, &[]);
+        assert_eq!(cold, Some(id), "the parked id must still match");
+        assert_eq!(matched_cold_session(&sessions, cold), Some(id));
+        assert_eq!(
+            sessions.reopen_cold(&mut pool, &mut adm, id, 1024).unwrap(),
+            id,
+            "cold re-entry reuses the same row"
+        );
+        assert_eq!(sessions.active(), 1, "no new session was minted");
     }
 }
 
