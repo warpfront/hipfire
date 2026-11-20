@@ -53,7 +53,7 @@ fn crlf_nbsp_prompt_renders_identically_on_singleton_and_lane() {
     });
     for msg in [bare, with_messages] {
         // Singleton: what the daemon hands `generate_muse_glimmer`.
-        let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(raw_prompt);
+        let prompt = hipfire_engine::prompt::generate_prompt(&msg);
         let messages = hipfire_engine::prompt::parse_generate_messages(&msg).unwrap();
         let singleton_ids = singleton(&prompt, messages.as_deref());
 

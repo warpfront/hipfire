@@ -117,9 +117,9 @@ pub(crate) trait LaneFamily {
     fn finish(&mut self, lane: usize, stdout: &mut std::io::Stdout, id: &str) -> Vec<ToolCall>;
 }
 
-/// Prompt tokens and started-in-think of a lane-family request. The daemon
-/// renders the first request of a wave and the driver the rest, both here.
-pub fn render_lane_prompt(
+/// Prompt tokens and started-in-think of a lane-family request; callers go
+/// through [`lane_admission`] so render and capacity are decided together.
+fn render_lane_prompt(
     m: &LoadedModel,
     msg: &serde_json::Value,
 ) -> Result<(Vec<u32>, bool), String> {
@@ -175,19 +175,15 @@ pub fn render_lane_prompt(
 }
 
 /// Glimmer lane prompt ids. The singleton dispatch normalizes `prompt` and
-/// every message (`maybe_normalize_prompt`, `parse_generate_messages`);
-/// render the same tokens here.
+/// every message (`generate_prompt`, `parse_generate_messages`); render the
+/// same tokens here.
 pub fn render_glimmer_lane_prompt(
     tokenizer: &Tokenizer,
     chat_template: Option<&String>,
     bos_token: u32,
     msg: &serde_json::Value,
 ) -> Result<Vec<u32>, String> {
-    let glimmer_prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(
-        msg.get("prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Hello"),
-    );
+    let glimmer_prompt = hipfire_engine::prompt::generate_prompt(msg);
     let glimmer_messages = hipfire_engine::prompt::parse_generate_messages(msg)
         .map_err(|e| format!("invalid messages field: {e}"))?;
     let max_think = msg
