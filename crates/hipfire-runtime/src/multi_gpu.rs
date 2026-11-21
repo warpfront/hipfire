@@ -204,9 +204,8 @@ pub struct Gpus {
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
 
-/// Architecture defaults for the homogeneous TP2 whole-token decode graph
-/// when `HIPFIRE_TP_FULL_GRAPH` is unset. Both admitted exact architectures
-/// have an independent hardware receipt and retain `=0` as the kill switch.
+/// Architecture defaults for the homogeneous TP2 whole-token decode graph.
+/// Both admitted exact architectures have an independent hardware receipt.
 ///
 /// gfx1100: 2x W7900, Qwen3.8-27B mq4-xts, 3 fresh processes per arm,
 /// 47.8 -> 53.2 tok/s median (+11.30%); 100 exact graph replays and six
@@ -216,8 +215,7 @@ const GFX1100_TP2_WHOLE_TOKEN_GRAPH_DEFAULT: bool = true;
 /// 19.99 -> 18.55 ms/token at ctx 128 and 20.59 -> 18.97 ms/token at ctx 8192;
 /// rank-0 logits byte-identical on every token.
 const GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT: bool = true;
-/// gfx1201 TP4 (bf16 peer-push exchange): whole-token graph default when
-/// `HIPFIRE_TP_FULL_GRAPH` is unset.
+/// gfx1201 TP4 (bf16 peer-push exchange): whole-token graph default.
 const GFX1201_TPN_WHOLE_TOKEN_GRAPH_DEFAULT: bool = true;
 
 /// The exact homogeneous TP2 meshes the whole-token graph route admits.
@@ -242,24 +240,14 @@ fn tp2_graph_topology<'a>(
     }
 }
 
-/// Tri-state whole-token graph request (`HIPFIRE_TP_FULL_GRAPH`): `"1"` opts
-/// in, `"0"` opts out, anything else (unset, empty, other spellings) takes
-/// the architecture default on an admitted homogeneous TP2 mesh, off
-/// otherwise.
-fn tp_full_graph_requested(raw: Option<&str>, topology: Option<Tp2GraphTopology>) -> bool {
-    match raw {
-        Some("1") => true,
-        Some("0") => false,
-        _ => match topology {
-            Some(Tp2GraphTopology::Gfx1100) => GFX1100_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
-            Some(Tp2GraphTopology::Gfx1201) => GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
-            None => false,
-        },
+/// Whole-token graph request for a TP2 mesh: the architecture default on an
+/// admitted homogeneous pair, off otherwise.
+fn tp_full_graph_requested(topology: Option<Tp2GraphTopology>) -> bool {
+    match topology {
+        Some(Tp2GraphTopology::Gfx1100) => GFX1100_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
+        Some(Tp2GraphTopology::Gfx1201) => GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
+        None => false,
     }
-}
-
-fn tp_full_graph_env() -> Option<String> {
-    hipfire_config::developer_var("HIPFIRE_TP_FULL_GRAPH").ok()
 }
 
 /// Alternating-partial producer-only synchronization for the TP2
@@ -274,17 +262,16 @@ fn tp_peer_alternating_requested(explicit: Option<bool>, full_graph: bool) -> bo
     explicit.unwrap_or(full_graph)
 }
 
-/// Effective alternating decision for a mesh: resolves the tri-state full
-/// graph request for the mesh's topology, then lets an unset alternating
-/// knob follow it.
+/// Effective alternating decision for a mesh: resolves the whole-token graph
+/// request for the mesh's topology, then lets an unset alternating knob
+/// follow it.
 fn tp_peer_alternating_for_mesh<'a>(
     alternating: Option<bool>,
-    full_graph_raw: Option<&str>,
     arches: impl ExactSizeIterator<Item = &'a str>,
 ) -> bool {
     tp_peer_alternating_requested(
         alternating,
-        tp_full_graph_requested(full_graph_raw, tp2_graph_topology(arches)),
+        tp_full_graph_requested(tp2_graph_topology(arches)),
     )
 }
 
@@ -1517,13 +1504,10 @@ impl Gpus {
             && self.tp_graph_barrier_count == barriers
     }
 
-    /// Effective `HIPFIRE_TP_FULL_GRAPH` for this mesh: tri-state, with the
-    /// architecture default when unset.
+    /// Whole-token graph request for this mesh: the per-arch default.
     fn tp_full_graph_effective(&self) -> bool {
-        tp_full_graph_requested(
-            tp_full_graph_env().as_deref(),
-            tp2_graph_topology(self.devices.iter().map(|device| device.arch.as_str())),
-        )
+        let topology = tp2_graph_topology(self.devices.iter().map(|device| device.arch.as_str()));
+        tp_full_graph_requested(topology)
     }
 
     /// Effective `HIPFIRE_TP_PEER_ALTERNATING` for this mesh: an unset knob
@@ -1531,7 +1515,6 @@ impl Gpus {
     fn tp_peer_alternating_effective(&self) -> bool {
         tp_peer_alternating_for_mesh(
             rdna_compute::FeatureFlags::process().tp_peer_alternating,
-            tp_full_graph_env().as_deref(),
             self.devices.iter().map(|device| device.arch.as_str()),
         )
     }
@@ -1545,9 +1528,7 @@ impl Gpus {
     }
 
     /// Load-time half of the homogeneous gfx1100/gfx1201 TP2 whole-token
-    /// decode graph (`HIPFIRE_TP_FULL_GRAPH`: `1` opts in, `0` opts out,
-    /// unset takes the architecture default — on for exact gfx1100 and
-    /// gfx1201 TP2 pairs).
+    /// decode graph (on for exact gfx1100 and gfx1201 TP2 pairs).
     /// Call before [`Self::enable_peer_all`], as
     /// for the gfx1201 signal tape. Returns `Ok(false)` and touches nothing
     /// unless the graph is requested, the alternating
@@ -1569,26 +1550,21 @@ impl Gpus {
         Ok(true)
     }
 
-    /// Whether `HIPFIRE_TP_FULL_GRAPH` (tri-state, default
-    /// [`GFX1201_TPN_WHOLE_TOKEN_GRAPH_DEFAULT`]) requests the whole-token
-    /// graph for this mesh of four gfx1201 ranks.
+    /// Whether this mesh of four gfx1201 ranks takes the whole-token graph
+    /// ([`GFX1201_TPN_WHOLE_TOKEN_GRAPH_DEFAULT`]).
     fn tp_push_whole_token_graph_requested(&self) -> bool {
         let n = self.devices.len();
         if n != 4 || self.devices.iter().any(|gpu| !gpu.arch_caps.is_gfx1201()) {
             return false;
         }
-        match tp_full_graph_env().as_deref() {
-            Some("1") => true,
-            Some("0") => false,
-            _ => GFX1201_TPN_WHOLE_TOKEN_GRAPH_DEFAULT,
-        }
+        GFX1201_TPN_WHOLE_TOKEN_GRAPH_DEFAULT
     }
 
     /// Load-time half of the gfx1201 TP4 whole-token decode graph: when
-    /// requested (`HIPFIRE_TP_FULL_GRAPH`, and `HIPFIRE_TP_PEER_PUSH` not `0`)
-    /// allocate the peer-VRAM mailboxes and resolve the kernel. Call before peer
-    /// access is enabled. Returns whether the route is prepared; qualification
-    /// runs in [`Self::enable_peer_all`].
+    /// requested (unless `HIPFIRE_TP_PEER_PUSH` is `0`) allocate the peer-VRAM
+    /// mailboxes and resolve the kernel. Call before peer access is enabled.
+    /// Returns whether the route is prepared; qualification runs in
+    /// [`Self::enable_peer_all`].
     pub fn prepare_tp_push_whole_token_graph(&mut self, payload_bytes: usize) -> bool {
         if !self.tp_push_whole_token_graph_requested() {
             return false;
@@ -3001,8 +2977,7 @@ impl Gpus {
     /// gather/fold/broadcast. `partial_slot` is `Some(0 | 1)` only when the
     /// caller alternates two distinct partial buffers on consecutive calls;
     /// with the alternating protocol effectively enabled for this mesh
-    /// (`HIPFIRE_TP_PEER_ALTERNATING`, following the effective
-    /// `HIPFIRE_TP_FULL_GRAPH` when unset)
+    /// (`HIPFIRE_TP_PEER_ALTERNATING`, unset: follows the per-arch graph default)
     /// such calls take [`Self::all_reduce_sum_f32_peer_direct_add_alternating`],
     /// which is also the only reduction the TP2 whole-token graph can
     /// capture. `None`, or the protocol disabled, keeps the ordinary
@@ -3947,30 +3922,20 @@ mod tests {
     }
 
     #[test]
-    fn tp_full_graph_is_tri_state_with_arch_default() {
-        let gfx1100 = Some(Tp2GraphTopology::Gfx1100);
-        let gfx1201 = Some(Tp2GraphTopology::Gfx1201);
-        // Each admitted exact topology follows its independently promoted
-        // default; unsupported topologies stay off.
-        for raw in [None, Some(""), Some("true"), Some("false"), Some(" 1")] {
-            assert_eq!(
-                tp_full_graph_requested(raw, gfx1100),
-                GFX1100_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
-            );
-            assert_eq!(
-                tp_full_graph_requested(raw, gfx1201),
-                GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
-            );
-            assert!(!tp_full_graph_requested(raw, None));
-        }
-        for topology in [gfx1100, gfx1201, None] {
-            assert!(tp_full_graph_requested(Some("1"), topology));
-            assert!(!tp_full_graph_requested(Some("0"), topology));
-        }
+    fn tp_full_graph_defaults_per_topology() {
+        assert_eq!(
+            tp_full_graph_requested(Some(Tp2GraphTopology::Gfx1100)),
+            GFX1100_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
+        );
+        assert_eq!(
+            tp_full_graph_requested(Some(Tp2GraphTopology::Gfx1201)),
+            GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
+        );
+        assert!(!tp_full_graph_requested(None));
     }
 
     #[test]
-    fn tp2_whole_token_graph_defaults_on_for_admitted_pairs_and_honors_zero() {
+    fn tp2_whole_token_graph_defaults_on_for_admitted_pairs() {
         for (arches, arch_default) in [
             (
                 ["gfx1100", "gfx1100"],
@@ -3981,28 +3946,27 @@ mod tests {
                 GFX1201_TP2_WHOLE_TOKEN_GRAPH_DEFAULT,
             ),
         ] {
-            let full_graph =
-                |raw| tp_full_graph_requested(raw, tp2_graph_topology(arches.into_iter()));
-            assert_eq!(full_graph(None), arch_default);
+            let full_graph = tp_full_graph_requested(tp2_graph_topology(arches.into_iter()));
+            assert_eq!(full_graph, arch_default);
             assert!(tp2_whole_token_graph_admitted(
-                full_graph(Some("1")),
-                || tp_peer_alternating_for_mesh(None, Some("1"), arches.into_iter()),
+                full_graph,
+                || tp_peer_alternating_for_mesh(None, arches.into_iter()),
                 arches.into_iter(),
             ));
             assert!(!tp2_whole_token_graph_admitted(
-                full_graph(Some("0")),
-                || panic!("alternating flag must not be read when full graph is off"),
+                full_graph,
+                || tp_peer_alternating_for_mesh(Some(false), arches.into_iter()),
                 arches.into_iter(),
             ));
         }
-        // Mixed and 3-rank meshes refuse even an explicit `1`.
+        // Mixed and 3-rank meshes refuse the graph.
         for arches in [
             &["gfx1100", "gfx1201"][..],
             &["gfx1201", "gfx1201", "gfx1201"][..],
         ] {
             assert!(!tp2_whole_token_graph_admitted(
-                tp_full_graph_requested(Some("1"), tp2_graph_topology(arches.iter().copied())),
-                || tp_peer_alternating_for_mesh(None, Some("1"), arches.iter().copied()),
+                tp_full_graph_requested(tp2_graph_topology(arches.iter().copied())),
+                || tp_peer_alternating_for_mesh(None, arches.iter().copied()),
                 arches.iter().copied(),
             ));
         }
@@ -4028,29 +3992,13 @@ mod tests {
         for arches in [["gfx1100", "gfx1100"], ["gfx1201", "gfx1201"]] {
             // Unset follows the effective (arch-default) graph request.
             assert_eq!(
-                tp_peer_alternating_for_mesh(None, None, arches.into_iter()),
-                tp_full_graph_requested(None, tp2_graph_topology(arches.into_iter())),
+                tp_peer_alternating_for_mesh(None, arches.into_iter()),
+                tp_full_graph_requested(tp2_graph_topology(arches.into_iter())),
             );
-            // Explicit graph `1` turns an unset alternating knob on; graph
-            // `0` keeps it off; an explicit alternating knob always wins.
-            assert!(tp_peer_alternating_for_mesh(
-                None,
-                Some("1"),
-                arches.into_iter()
-            ));
-            assert!(!tp_peer_alternating_for_mesh(
-                None,
-                Some("0"),
-                arches.into_iter()
-            ));
-            assert!(tp_peer_alternating_for_mesh(
-                Some(true),
-                None,
-                arches.into_iter()
-            ));
+            // An explicit alternating knob always wins over the graph request.
+            assert!(tp_peer_alternating_for_mesh(Some(true), arches.into_iter()));
             assert!(!tp_peer_alternating_for_mesh(
                 Some(false),
-                Some("1"),
                 arches.into_iter()
             ));
         }
