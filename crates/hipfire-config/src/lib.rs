@@ -2590,15 +2590,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx1201 batched prefill GDN preamble fusion (default on exact gfx1201; set to false or HIPFIRE_GFX12_GDN_PRE_FUSED=0 to opt out; fuses sigmoid+conv+qknorm into gdn_pre_batched_gfx1201, byte-exact)."
     ),
     process_bool_field!(
-        "kernel.gfx12_gdn_chunk_scan",
-        "gfx12_gdn_chunk_scan",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_GFX12_GDN_CHUNK_SCAN",
-        "Enable the fused chunked gated-delta-net prefill scan on gfx1100/gfx1151/gfx1201 (default on; set to false or HIPFIRE_GFX12_GDN_CHUNK_SCAN=0 to opt out; exact-shape ordinary prefill only)."
-    ),
-    process_bool_field!(
         "kernel.gfx12_silu_quant_fused",
         "gfx12_silu_quant_fused",
         Kernel,
@@ -6971,6 +6962,14 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "the wave64 verify GEMM kill switch was removed (HIPF-396)",
         replacement: "none; the verify GEMM always takes the wave64 variant where admitted",
+    },
+    RetiredConfigKey {
+        key: "kernel.gfx12_gdn_chunk_scan",
+        legacy_key: "gfx12_gdn_chunk_scan",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the fused GDN chunk-scan kill switch was removed (HIPF-489)",
+        replacement: "none; the arch default applies (on for gfx1100, gfx1151 and gfx1201)",
     },
 ];
 
