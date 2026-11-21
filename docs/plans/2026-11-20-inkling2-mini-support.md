@@ -7,7 +7,9 @@ this checkout; where I could not verify, I say so.
 
 Promoted 2026-11-20 from the gitignored `docs/plans/local/` scratch copy to the
 tracked `docs/plans/` path on `feat/inkling2-mini-support` (base `origin/beta`
-`9e410448e`). No PR is opened; that is a later step. Live verification results
+`9e410448e`). A draft PR for visibility only is open at
+https://github.com/warpfront/hipfire/pull/1192; it is WIP and must not be
+merged until the implementation is done and verified. Live verification results
 and resolved decisions are recorded in §8; the rest is the original plan unless
 marked.
 
@@ -378,10 +380,9 @@ fuse only in Phase 4 behind the KLD pin.
    `imatrix.gguf` are evidence/calibration inputs, not a BF16 training source.
 3. **Scope caps**: text-only AR at `max_seq` 32768 as the Phase-1 ceiling;
    vision, MTP and 1M context stay deferred. Accepted.
-4. **Destination**: an upstream PR is the goal **once the actual
-   implementation is done and verified** — not for this planning work. Until
-   then everything stays as local commits on `feat/inkling2-mini-support` off
-   `origin/beta`; do not open a PR now.
+4. **Destination**: a draft PR (warpfront#1192) is open for visibility while
+   the implementation is in progress. It must stay draft and unmerged until
+   the actual implementation is done and verified.
 
 ## 7. Effort (honest, calendar time for one engineer with hardware access)
 
