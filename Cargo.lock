@@ -1371,8 +1371,10 @@ name = "hipfire-arch-inkling2"
 version = "0.4.6"
 dependencies = [
  "half",
+ "hip-bridge",
  "hipfire-runtime",
  "memmap2",
+ "rayon",
  "rdna-compute",
  "safetensors",
  "serde_json",
