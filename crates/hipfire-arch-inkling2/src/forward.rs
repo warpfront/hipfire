@@ -79,6 +79,19 @@ fn rmsnorm_l2(x: &[f32], eps: f32) -> Vec<f32> {
     x.iter().map(|v| v * s).collect()
 }
 
+/// HFQ stores conv tensors as `[n_channels, 1, kernel]`; transpose to the
+/// oracle's `[kernel, n_channels]` layout.
+fn flatten_conv(v: &[f32], kernel: usize) -> Vec<f32> {
+    let n_ch = v.len() / kernel;
+    let mut out = vec![0.0f32; v.len()];
+    for c in 0..n_ch {
+        for k in 0..kernel {
+            out[k * n_ch + c] = v[c * kernel + k];
+        }
+    }
+    out
+}
+
 /// Run one single-token decoder layer. `x` is `[n_embd]`, `pos` the position,
 /// `state` the per-visit conv state (mutated). Returns the layer output.
 pub fn decode_layer(
@@ -215,6 +228,188 @@ pub fn decode_moe(
     out
 }
 
+/// Run one full decoder visit (attention + MoE + residual/block bookkeeping),
+/// loading weights lazily from the validated HFQ index. `x` is `[n_embd]`,
+/// `visit` the global visit index (0..48), `blocks` the AttnRes block stream,
+/// `state` the per-visit conv state. Messages/controllers are handled by the
+/// higher-level loop driver (Phase 2 of this scaffold).
+pub fn decode_visit(
+    w: &crate::weights::Inkling2Weights,
+    cfg: &crate::config::Inkling2Config,
+    state: &mut ConvState,
+    blocks: &mut Vec<Vec<f32>>,
+    x: &[f32],
+    visit: usize,
+    pos: usize,
+) -> Result<Vec<f32>, String> {
+    let phys = cfg.loop_cfg.layer_phys(visit);
+    let p = format!("model.llm.layers.{phys}.");
+    let swa = cfg.swa_layers[phys];
+    let g = |s: &str| w.f32(&format!("{p}{s}")).map(|x| x.1);
+
+    // --- attention input: AttnRes mix (if this visit has a query) + norm ---
+    let mut inp = x.to_vec();
+    let attn_q = format!("model.llm.attn_res.attn_queries.{phys}");
+    if let Ok((shape, q)) = w.f32(&attn_q) {
+        let query_rows = if shape.len() == 1 {
+            1
+        } else {
+            shape[0] as usize
+        };
+        let mixed = oracle::mix(blocks, x, &q, cfg.n_embd, query_rows);
+        inp = mixed[..cfg.n_embd].to_vec();
+    }
+    if swa {
+        inp = rmsnorm_gain(&inp, &g("attn_norm.weight")?, cfg.rms_norm_eps);
+    } else {
+        inp = rmsnorm_gain(&inp, &g("q_input_norm.weight")?, cfg.rms_norm_eps);
+    }
+
+    // --- attention projections + convs (SWA static; full dynamic deferred) ---
+    let d = cfg.head_dim;
+    let nh = cfg.n_head;
+    let nkv = cfg.n_head_kv;
+    let ekv = nkv * d;
+    let eattn = nh * d;
+    let q = oracle::matvec(&g("attn.wq_du.weight")?, &inp, eattn, cfg.n_embd);
+    let k_raw = oracle::matvec(&g("attn.wk_dv.weight")?, &inp, ekv, cfg.n_embd);
+    let v_raw = oracle::matvec(&g("attn.wv_dv.weight")?, &inp, ekv, cfg.n_embd);
+    let r = oracle::matvec(&g("attn.wr_du.weight")?, &inp, nh * cfg.n_rel, cfg.n_embd);
+    let (k_conv, kp) = oracle::convolve_static(
+        &k_raw,
+        &flatten_conv(&g("attn.k_sconv.weight")?, cfg.conv_kernel),
+        &state.k_past,
+        1,
+        ekv,
+        cfg.conv_kernel,
+    );
+    let (v_conv, vp) = oracle::convolve_static(
+        &v_raw,
+        &flatten_conv(&g("attn.v_sconv.weight")?, cfg.conv_kernel),
+        &state.v_past,
+        1,
+        ekv,
+        cfg.conv_kernel,
+    );
+    state.k_past = kp;
+    state.v_past = vp;
+
+    let qc = oracle::clip(
+        &q,
+        w.f32(&format!("{p}attn.q_l2_clip.scale"))
+            .ok()
+            .map(|x| x.1)
+            .as_deref(),
+        cfg.qk_clip,
+    );
+    let kc = oracle::clip(&k_conv, None, cfg.qk_clip);
+    let vc: Vec<f32> = (0..nkv)
+        .flat_map(|h| oracle::rmsnorm(&v_conv[h * d..(h + 1) * d], cfg.rms_norm_eps))
+        .collect();
+    let mut rc = oracle::clip(
+        &r,
+        w.f32(&format!("{p}attn.rel_l2_clip.scale"))
+            .ok()
+            .map(|x| x.1)
+            .as_deref(),
+        cfg.rel_clip,
+    );
+    if !swa {
+        // full-layer tau multiplies Q (per-head below) and R.
+        let t = oracle::tau(pos, cfg.log_floor, cfg.log_alpha);
+        for v in rc.iter_mut() {
+            *v *= t;
+        }
+    }
+
+    let sinks = oracle::matvec(&g("attn.attn_sink_proj.weight")?, &inp, nh, cfg.n_embd);
+    let rel_table = g("attn.rel_logits_proj.proj")?;
+    let mut attn_out = vec![0.0f32; eattn];
+    for h in 0..nh {
+        let rh = &rc[h * cfg.n_rel..(h + 1) * cfg.n_rel];
+        let bias0: f32 = (0..cfg.n_rel)
+            .map(|rr| rel_table[rr * cfg.n_extent] * rh[rr])
+            .sum::<f32>()
+            - sinks[h];
+        let mut qh = qc[h * d..(h + 1) * d].to_vec();
+        if !swa {
+            let t = oracle::tau(pos, cfg.log_floor, cfg.log_alpha);
+            for v in &mut qh {
+                *v *= t;
+            }
+        }
+        let kh = &kc[(h % nkv) * d..(h % nkv + 1) * d];
+        let vh = &vc[(h % nkv) * d..(h % nkv + 1) * d];
+        let score: f32 =
+            qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() / (d as f32).sqrt() + bias0;
+        let wv = oracle::attention_softmax_with_sink(&[score], 0.0, vh, 1, d);
+        attn_out[h * d..(h + 1) * d].copy_from_slice(&wv);
+    }
+    let gate = oracle::matvec(&g("attn.gate_attn.weight")?, &inp, eattn, cfg.n_embd);
+    for i in 0..eattn {
+        attn_out[i] *= oracle::sigmoid(gate[i]);
+    }
+    let proj = oracle::matvec(&g("attn.wo_ud.weight")?, &attn_out, cfg.n_embd, eattn);
+    let (attn_res, ap) = oracle::convolve_static(
+        &proj,
+        &flatten_conv(&g("attn_sconv.weight")?, cfg.conv_kernel),
+        &state.attn_out_past,
+        1,
+        cfg.n_embd,
+        cfg.conv_kernel,
+    );
+    state.attn_out_past = ap;
+
+    // AttnRes block bookkeeping: first visit of a block pushes inpSA, others add residual.
+    let inp_sa = x.to_vec();
+    let cur = if visit % cfg.attn_res_block == 0 {
+        blocks.push(inp_sa);
+        attn_res
+    } else {
+        inp_sa.iter().zip(&attn_res).map(|(a, b)| a + b).collect()
+    };
+
+    // --- MoE with AttnRes mix on FFN input ---
+    let ffn_mix_q = format!("model.llm.attn_res.mlp_queries.{phys}");
+    let mut ffn_in = cur.clone();
+    if let Ok((_shape, q)) = w.f32(&ffn_mix_q) {
+        let mixed = oracle::mix(blocks, &cur, &q, cfg.n_embd, 1);
+        ffn_in = mixed;
+    }
+    let ffn_normed = rmsnorm_gain(&ffn_in, &g("mlp_norm.weight")?, cfg.rms_norm_eps);
+    let router = g("mlp.gate.weight")?;
+    let bias = g("mlp.gate.bias").ok();
+    let mut gu = Vec::with_capacity(cfg.n_experts);
+    let mut dn = Vec::with_capacity(cfg.n_experts);
+    for e in 0..cfg.n_experts {
+        gu.push(g(&format!("mlp.experts.{e}.gate_up_proj.weight"))?);
+        dn.push(g(&format!("mlp.experts.{e}.down_proj.weight"))?);
+    }
+    let moe = decode_moe(
+        &ffn_normed,
+        &router,
+        bias.as_deref(),
+        &gu,
+        &dn,
+        cfg.n_embd,
+        cfg.inter,
+        cfg.n_expert_used,
+        cfg.route_scale,
+        cfg.situ_beta,
+        cfg.situ_linear_beta,
+    );
+    let (moe_conv, fp) = oracle::convolve_static(
+        &moe,
+        &flatten_conv(&g("mlp_sconv.weight")?, cfg.conv_kernel),
+        &state.ffn_out_past,
+        1,
+        cfg.n_embd,
+        cfg.conv_kernel,
+    );
+    state.ffn_out_past = fp;
+    Ok(ffn_in.iter().zip(&moe_conv).map(|(a, b)| a + b).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,10 +508,10 @@ mod tests {
                 .ok()
                 .map(|x| x.1),
             attn_norm: g("attn_norm.weight"),
-            k_conv: flatten_conv(&g("attn.k_sconv.weight")),
-            v_conv: flatten_conv(&g("attn.v_sconv.weight")),
-            attn_post_conv: flatten_conv(&g("attn_sconv.weight")),
-            ffn_post_conv: flatten_conv(&g("mlp_sconv.weight")),
+            k_conv: flatten_conv(&g("attn.k_sconv.weight"), 4),
+            v_conv: flatten_conv(&g("attn.v_sconv.weight"), 4),
+            attn_post_conv: flatten_conv(&g("attn_sconv.weight"), 4),
+            ffn_post_conv: flatten_conv(&g("mlp_sconv.weight"), 4),
         };
         let mut st = ConvState::default();
         let out = decode_layer(&f, &mut st, &x, 0);
@@ -325,20 +520,6 @@ mod tests {
         let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let min = out.iter().copied().fold(f32::INFINITY, f32::min);
         eprintln!("layer0 decode: {} values, min={min}, max={max}", out.len());
-    }
-
-    fn flatten_conv(v: &[f32]) -> Vec<f32> {
-        // HFQ stores conv as [n_channels, 1, kernel]; dequant returns that
-        // flat order. The oracle wants [kernel, n_channels], so transpose.
-        let kernel = 4usize;
-        let n_ch = v.len() / kernel;
-        let mut out = vec![0.0f32; v.len()];
-        for c in 0..n_ch {
-            for k in 0..kernel {
-                out[k * n_ch + c] = v[c * kernel + k];
-            }
-        }
-        out
     }
 
     #[test]
@@ -428,6 +609,28 @@ mod tests {
         assert!(out.iter().all(|v| v.is_finite()), "non-finite MoE output");
         let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         eprintln!("real MoE: {} values, max={max}", out.len());
+    }
+
+    #[test]
+    #[ignore = "requires the 14 GB inkling2-mini-mq4.hfq artifact"]
+    fn full_visit_real_layer0_produces_finite_output() {
+        use crate::weights::Inkling2Weights;
+        use hipfire_runtime::hfq::HfqFile;
+        let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        let hfq = HfqFile::open(std::path::Path::new(
+            r"D:\hipfire-models\inkling2-mini-mq4.hfq",
+        ))
+        .expect("open");
+        let w = Inkling2Weights::load(&hfq, &cfg).expect("load");
+        let embed = w.f32("model.llm.embed.weight").unwrap().1;
+        let x = embed[..cfg.n_embd].to_vec();
+        let mut st = ConvState::default();
+        let mut blocks = Vec::new();
+        let out = decode_visit(&w, &cfg, &mut st, &mut blocks, &x, 0, 0).expect("decode visit");
+        assert_eq!(out.len(), cfg.n_embd);
+        assert!(out.iter().all(|v| v.is_finite()), "non-finite visit output");
+        let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!("full visit 0: {} values, max={max}", out.len());
     }
 
     fn oracle_close(a: f32, b: f32) -> bool {
