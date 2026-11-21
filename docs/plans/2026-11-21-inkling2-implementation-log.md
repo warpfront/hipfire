@@ -111,11 +111,35 @@ Fixes needed along the way (all committed): companion suffix is `_scale`
 param accounting; MXFP8 experts must be dequantized per 2-D slice; expert names
 need `.weight`; `mtp.safetensors` must be excluded.
 
-## Current end state (2026-11-21, 26 local commits)
+## Numeric oracle (2026-11-21)
+
+A working reference oracle is built and producing golden outputs:
+
+- **llama.cpp build**: `D:\hipfire-models\llama-inkling2-build\bin\llama-cli.exe`
+  (build `b12600-29b52d398`, CPU backend), built from the merged PR #32694
+  source at `C:\Users\Jan\AppData\Local\Temp\opencode\llama-inkling2`. CMake /
+  Ninja came from VS BuildTools; RC / `mt.exe` from the Windows SDK
+  (`...\Windows Kits\10\bin\10.0.26100.0\x64`) must be on PATH for linking.
+- **Oracle model**: `D:\hipfire-models\Inkling-2-Mini\inkling2-f32.gguf`
+  (104 GB F32), converted with `convert_hf_to_gguf.py` from the downloaded
+  checkpoint using the merged converter.
+- **Golden outputs**: `D:\hipfire-models\inkling2-golden\MANIFEST.txt` — four
+  committed prompts with md5, decoded thinking text, and the exact flags
+  (`-n 48 --temp 0 -ngl 0 --no-warmup -st`). Regenerate with
+  `C:\Users\Jan\AppData\Local\Temp\opencode\make_golden_v2.sh`.
+  The model is a reasoning model: output begins `[Start thinking]`. Note the
+  48-token budget is mostly consumed by the thinking phase, so these are
+  **thinking-phase** parity targets, not final answers.
+
+This oracle is the numeric target for the CPU-forward port: future work should
+compare per-visit hidden states / logits against it, not just final tokens.
+
+## Current end state (2026-11-21)
 
 Done: a working quantizer path and a 13.9 GB arch-24 HFQ artifact;
-typed config parsing; a 21-test CPU-oracle crate. Not done: the loader bundle,
-GPU forward, and generation route — the artifact cannot be served yet.
+typed config parsing; a 21-test CPU-oracle crate; a built reference oracle with
+reproducible golden outputs. Not done: the loader bundle, GPU forward, and
+generation route — the artifact cannot be served yet.
 
 ## Next steps, in order
 
