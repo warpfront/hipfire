@@ -112,7 +112,9 @@ fn rdna1p1_is_gfx1011_or_gfx1012() {
 
 #[test]
 fn rdna2_coverage() {
-    for &arch in &["gfx1030", "gfx1031", "gfx1032"] {
+    for &arch in &[
+        "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036",
+    ] {
         assert!(make_caps(arch).is_rdna2(), "{arch} should be RDNA2");
     }
     assert!(!make_caps("gfx1010").is_rdna2());
@@ -216,8 +218,9 @@ fn wmma_w32_gfx12_is_rdna4_only() {
 #[test]
 fn dot2_f32_f16_coverage() {
     for &arch in &[
-        "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1101", "gfx1102",
-        "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
+        "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035",
+        "gfx1036", "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152",
+        "gfx1200", "gfx1201",
     ] {
         assert!(
             make_caps(arch).has_dot2_f32_f16(),
@@ -244,7 +247,10 @@ fn mmq_is_gcn5_or_rdna3() {
 
 #[test]
 fn hfq3_sdot4_is_rdna1p1_or_rdna2() {
-    for &arch in &["gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032"] {
+    for &arch in &[
+        "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035",
+        "gfx1036",
+    ] {
         assert!(make_caps(arch).has_hfq3_sdot4(), "{arch} should have sdot4");
     }
     assert!(!make_caps("gfx1010").has_hfq3_sdot4());
@@ -254,7 +260,9 @@ fn hfq3_sdot4_is_rdna1p1_or_rdna2() {
 
 #[test]
 fn wave32_on_rdna() {
-    for &arch in &["gfx1010", "gfx1030", "gfx1100", "gfx1200"] {
+    for &arch in &[
+        "gfx1010", "gfx1030", "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx1100", "gfx1200",
+    ] {
         assert!(make_caps(arch).is_wave32(), "{arch} should be wave32");
     }
     assert!(!make_caps("gfx906").is_wave32());
@@ -284,9 +292,10 @@ fn gemv_rows_default_is_1_on_wave64_rdna2_rdna3dgpu() {
             "{arch}: expected gemv_rows_default = 1"
         );
     }
-    // RDNA1, RDNA1p1, RDNA3p5, RDNA4 default to 2
+    // RDNA1, RDNA1p1, gfx1033-1036 (HIPF-370), RDNA3p5, RDNA4 default to 2
     for &arch in &[
-        "gfx1010", "gfx1011", "gfx1012", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
+        "gfx1010", "gfx1011", "gfx1012", "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx1150",
+        "gfx1151", "gfx1152", "gfx1200", "gfx1201",
     ] {
         assert_eq!(
             make_caps(arch).gemv_rows_default(),
