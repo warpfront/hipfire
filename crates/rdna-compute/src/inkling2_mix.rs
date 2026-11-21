@@ -14,94 +14,79 @@
 //!
 //! [`inkling2_mix_f32`] is the CPU reference the GPU path must match.
 //! The HIP envelope ([`INKLING2_MIX_HIP_SRC`]) splits the op the way a
-//! single-token decode kernel does: pass 1 normalizes the bank into scratch,
-//! pass 2 runs one query row per block (F32 stable softmax + weighted sum).
+//! single-token decode kernel does: pass 1 RMSNorms the bank in-shader via
+//! the shared gamma-less norm (one block per state row), pass 2 runs one
+//! query row per block with a cooperative dot/reduce, a `tid == 0`
+//! softmax over the <= 6 weights, and a cooperative weighted sum.
 
 /// mix() RMSNorm epsilon.
 pub const INKLING2_MIX_EPS: f32 = 1e-6;
 
 /// gfx1100 decode envelope for `mix()`.
 ///
-/// Pass 1 (`inkling2_mix_norm_states_f32`): one thread per `(state, i)`
-/// element, grid-stride over the flat `[n_states, n_embd]` bank.
-/// Pass 2 (`inkling2_mix_query_row_f32`): one block per query row;
-/// `blockDim.x` (256) threads cooperatively reduce the `n_states` scores
-/// (shared-memory max + sum, F32 stable softmax), then accumulate the
-/// weighted sum grid-stride over `n_embd`.
+/// Pass 1 normalizes the `[n_states, n_embd]` bank with the shared
+/// gamma-less RMSNorm from `inkling2_control.rs` (one block per state row)
+/// — there is no `row_inv_scale` input and no `scratch[n_states]` global.
+/// Pass 2 (`inkling2_mix_query_row_f32`): one block per query row; all 256
+/// threads cooperatively dot/reduce (`i = tid, tid+256, ... < n_embd`) per
+/// state with a shared-memory reduction, `tid == 0` soft-maxes the <= 6
+/// weights and broadcasts them, then all threads cooperatively accumulate
+/// the weighted sum.
 pub const INKLING2_MIX_HIP_SRC: &str = r#"
 #include <hip/hip_runtime.h>
-// normed[s * n_embd + i] = bank[s * n_embd + i] / sqrt(mean_sq + 1e-6)
-extern "C" __global__ void inkling2_mix_norm_states_f32(
-    const float* __restrict__ bank,
-    float* __restrict__ normed,
-    const float* __restrict__ row_inv_scale, // per-state 1/sqrt(mean_sq+eps)
-    int n_states,
-    int n_embd) {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const int stride = blockDim.x * gridDim.x;
-    const int total = n_states * n_embd;
-    for (int t = tid; t < total; t += stride) {
-        normed[t] = bank[t] * row_inv_scale[t / n_embd];
-    }
-}
 // out[q * n_embd + i] = sum_s softmax_s(dot(normed_s, query_q)/sqrt(n_embd)) * normed_s[i]
+// normed is [n_states, n_embd] (already RMSNormed), query is [query_rows, n_embd].
+// One block per query row, blockDim.x == 256 fixed. n_states <= 6.
 extern "C" __global__ void inkling2_mix_query_row_f32(
     const float* __restrict__ normed, // [n_states, n_embd], F32
     const float* __restrict__ query,  // [query_rows, n_embd]
     float* __restrict__ out,          // [query_rows, n_embd]
-    float* __restrict__ scratch,      // [n_states] scores for this row
     int n_states,
     int n_embd,
     float inv_sqrt_embd) {
     const int q = blockIdx.x; // one block per query row
-    const int tid = threadIdx.x;
-    // scores[s] = dot(normed_s, query_q) * inv_sqrt_embd (grid-stride over s)
-    for (int s = tid; s < n_states; s += blockDim.x) {
-        float acc = 0.0f;
-        for (int i = 0; i < n_embd; ++i) {
-            acc += normed[s * n_embd + i] * query[q * n_embd + i];
-        }
-        scratch[s] = acc * inv_sqrt_embd;
-    }
-    __syncthreads();
-    // stable softmax over scratch[0..n_states] in shared pattern (block 256)
+    const int t = threadIdx.x;
     __shared__ float sh[256];
-    float mx = -3.4028235e38f;
-    for (int s = tid; s < n_states; s += blockDim.x) {
-        if (scratch[s] > mx) mx = scratch[s];
-    }
-    sh[tid] = mx;
-    __syncthreads();
-    if (tid == 0) {
-        float m = sh[0];
-        for (int t = 1; t < blockDim.x; ++t) {
-            if (sh[t] > m) m = sh[t];
+    __shared__ float w[6]; // n_states <= 6: one softmax weight per state
+    // 1. scores[s] = dot(normed_s, query_q) * inv_sqrt_embd, cooperatively.
+    for (int s = 0; s < n_states; ++s) {
+        float acc = 0.0f;
+        const float* ns = normed + (size_t)s * n_embd;
+        const float* qq = query + (size_t)q * n_embd;
+        for (int i = t; i < n_embd; i += blockDim.x) {
+            acc += ns[i] * qq[i];
         }
-        sh[0] = m;
+        sh[t] = acc;
+        __syncthreads();
+        for (int st = blockDim.x >> 1; st > 0; st >>= 1) {
+            if (t < st) sh[t] += sh[t + st];
+            __syncthreads();
+        }
+        if (t == 0) w[s] = sh[0] * inv_sqrt_embd;
+        __syncthreads();
+    }
+    // 2. stable softmax over the <= 6 weights on thread 0, then broadcast.
+    if (t == 0) {
+        float mx = w[0];
+        for (int s = 1; s < n_states; ++s) {
+            if (w[s] > mx) mx = w[s];
+        }
+        float sum = 0.0f;
+        for (int s = 0; s < n_states; ++s) {
+            w[s] = expf(w[s] - mx);
+            sum += w[s];
+        }
+        for (int s = 0; s < n_states; ++s) w[s] /= sum;
     }
     __syncthreads();
-    mx = sh[0];
-    float sum = 0.0f;
-    for (int s = tid; s < n_states; s += blockDim.x) {
-        scratch[s] = expf(scratch[s] - mx);
-        sum += scratch[s];
-    }
-    sh[tid] = sum;
-    __syncthreads();
-    if (tid == 0) {
-        float t = 0.0f;
-        for (int k = 0; k < blockDim.x; ++k) t += sh[k];
-        sh[0] = t;
-    }
-    __syncthreads();
-    sum = sh[0];
-    // out[q, i] = sum_s scratch[s]/sum * normed[s, i] (grid-stride over i)
-    for (int i = tid; i < n_embd; i += blockDim.x) {
+    // 3. out[q, i] = sum_s w[s] * normed[s, i], cooperatively.
+    float* oq = out + (size_t)q * n_embd;
+    for (int i = t; i < n_embd; i += blockDim.x) {
         float acc = 0.0f;
         for (int s = 0; s < n_states; ++s) {
-            acc += (scratch[s] / sum) * normed[s * n_embd + i];
+            acc += w[s] * normed[(size_t)s * n_embd + i];
         }
-        out[q * n_embd + i] = acc;
+        oq[i] = acc;
     }
 }
 "#;
@@ -128,10 +113,13 @@ pub fn inkling2_mix_f32(
     query_rows: usize,
 ) -> Vec<f32> {
     assert_eq!(query.len(), query_rows * n_embd);
-    let mut states: Vec<Vec<f32>> = blocks.iter().map(|b| {
-        assert_eq!(b.len(), n_embd);
-        rmsnorm_row(b)
-    }).collect();
+    let mut states: Vec<Vec<f32>> = blocks
+        .iter()
+        .map(|b| {
+            assert_eq!(b.len(), n_embd);
+            rmsnorm_row(b)
+        })
+        .collect();
     assert_eq!(cur.len(), n_embd);
     states.push(rmsnorm_row(cur));
     let ns = states.len();
@@ -252,7 +240,10 @@ mod tests {
     fn equal_states_split_evenly() {
         // Oracle golden: identical states average to themselves.
         let out = inkling2_mix_f32(&[vec![1.0, 1.0]], &[1.0, 1.0], &[1.0, 1.0], 2, 1);
-        assert!((out[0] - 1.0).abs() < 1e-6 && (out[1] - 1.0).abs() < 1e-6, "{out:?}");
+        assert!(
+            (out[0] - 1.0).abs() < 1e-6 && (out[1] - 1.0).abs() < 1e-6,
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -292,7 +283,10 @@ mod tests {
         states.push(norm(&cur));
         for i in 0..n_embd {
             let lo = states.iter().map(|st| st[i]).fold(f32::INFINITY, f32::min);
-            let hi = states.iter().map(|st| st[i]).fold(f32::NEG_INFINITY, f32::max);
+            let hi = states
+                .iter()
+                .map(|st| st[i])
+                .fold(f32::NEG_INFINITY, f32::max);
             assert!(out[i] >= lo - 1e-5 && out[i] <= hi + 1e-5, "i={i}");
         }
     }
@@ -309,5 +303,209 @@ mod tests {
         let both = inkling2_mix_f32(&blocks, &cur, &query, n_embd, query_rows);
         let first = inkling2_mix_f32(&blocks, &cur, &query[..n_embd], n_embd, 1);
         assert_eq!(&both[..n_embd], &first[..]);
+    }
+}
+
+// --- GPU dispatch (gfx1100) -------------------------------------------------
+
+use std::ffi::c_void;
+
+use crate::dispatch::{Gpu, GpuTensor};
+use hip_bridge::HipResult;
+
+impl Gpu {
+    /// One `mix()` query block: cooperative dot/reduce + softmax + weighted
+    /// sum over the already-normalized `normed` bank. `normed` is
+    /// `[n_states, n_embd]` F32 (normalize the bank first with
+    /// [`Self::inkling2_rmsnorm_nogamma_f32`]), `query` is
+    /// `[query_rows, n_embd]`, `out` is `[query_rows, n_embd]`.
+    /// `n_states <= 6` (the model bank plus `cur`); the softmax weights live
+    /// in shared memory, so no `scratch` global crosses the launch.
+    pub fn inkling2_mix_query_row_f32(
+        &mut self,
+        normed: &GpuTensor,
+        query: &GpuTensor,
+        out: &GpuTensor,
+        n_states: usize,
+        n_embd: usize,
+        query_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            (1..=6).contains(&n_states),
+            "n_states {n_states} exceeds the 6-weight shared design"
+        );
+        assert_eq!(normed.shape, vec![n_states, n_embd]);
+        assert_eq!(query.shape, vec![query_rows, n_embd]);
+        assert_eq!(out.shape, vec![query_rows, n_embd]);
+        self.ensure_kernel(
+            "inkling2_mix_query",
+            INKLING2_MIX_HIP_SRC,
+            "inkling2_mix_query_row_f32",
+        )?;
+        let normed_ptr = normed.buf.as_ptr();
+        let query_ptr = query.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_states_val = n_states as i32;
+        let n_embd_val = n_embd as i32;
+        let inv_sqrt_embd = 1.0 / (n_embd as f32).sqrt();
+        let mut params: Vec<*mut c_void> = vec![
+            &normed_ptr as *const _ as *mut c_void,
+            &query_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &n_states_val as *const _ as *mut c_void,
+            &n_embd_val as *const _ as *mut c_void,
+            &inv_sqrt_embd as *const _ as *mut c_void,
+        ];
+        // 256-wide shared reduction + 6 softmax weights: (256 + 6) * 4 B.
+        self.launch_maybe_blob(
+            "inkling2_mix_query_row_f32",
+            [query_rows as u32, 1, 1],
+            [256, 1, 1],
+            (256 + 6) * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(normed_ptr);
+                b.push_ptr(query_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_states_val);
+                b.push_i32(n_embd_val);
+                b.push_f32(inv_sqrt_embd);
+                b
+            },
+        )
+    }
+
+    /// Full `mix()`: RMSNorm the `[n_states, n_embd]` `bank` in-shader into
+    /// caller-owned `normed`, then run all `query_rows` against it. The
+    /// per-call path joins nothing and allocates nothing: both buffers are
+    /// caller-owned (brief 03 stages them in its state).
+    pub fn inkling2_mix_f32_gpu(
+        &mut self,
+        bank: &GpuTensor,
+        query: &GpuTensor,
+        normed: &GpuTensor,
+        out: &GpuTensor,
+        n_states: usize,
+        n_embd: usize,
+        query_rows: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        assert_eq!(bank.shape, vec![n_states, n_embd]);
+        self.inkling2_rmsnorm_nogamma_f32(bank, normed, n_states, n_embd, eps)?;
+        self.inkling2_mix_query_row_f32(normed, query, out, n_states, n_embd, query_rows)
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+    use crate::dispatch::DType;
+    use crate::inkling2_control::INKLING2_CONTROL_EPS;
+
+    fn rng_next(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    fn rng_f32(state: &mut u64, lo: f32, hi: f32) -> f32 {
+        let u = (rng_next(state) >> 11) as f32 / (1u64 << 53) as f32;
+        lo + u * (hi - lo)
+    }
+
+    fn run_case(
+        gpu: &mut Gpu,
+        blocks_h: &[Vec<f32>],
+        cur_h: &[f32],
+        query_h: &[f32],
+        n_embd: usize,
+        query_rows: usize,
+    ) -> f32 {
+        let n_states = blocks_h.len() + 1;
+        let mut bank_h: Vec<f32> = Vec::with_capacity(n_states * n_embd);
+        for b in blocks_h {
+            bank_h.extend_from_slice(b);
+        }
+        bank_h.extend_from_slice(cur_h);
+        let bank = gpu
+            .upload_f32(&bank_h, &[n_states, n_embd])
+            .expect("bank upload");
+        let query = gpu
+            .upload_f32(query_h, &[query_rows, n_embd])
+            .expect("query upload");
+        let normed = gpu
+            .alloc_tensor(&[n_states, n_embd], DType::F32)
+            .expect("normed alloc");
+        let out = gpu
+            .alloc_tensor(&[query_rows, n_embd], DType::F32)
+            .expect("out alloc");
+        gpu.inkling2_mix_f32_gpu(
+            &bank,
+            &query,
+            &normed,
+            &out,
+            n_states,
+            n_embd,
+            query_rows,
+            INKLING2_MIX_EPS,
+        )
+        .expect("mix launch");
+        let got = gpu.download_f32(&out).expect("download");
+        let want = inkling2_mix_f32(blocks_h, cur_h, query_h, n_embd, query_rows);
+        assert_eq!(got.len(), want.len());
+        got.iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Gate: device output matches the crate F32 reference at model dims
+    /// (n_embd 2304, 5 bank blocks + cur, 2 query rows) and on a randomized
+    /// case. Bar: <= 1e-5 abs.
+    #[test]
+    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    fn gpu_matches_cpu_reference() {
+        let mut gpu = match crate::gpu_test::init() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: no usable GPU ({e:?})");
+                return;
+            }
+        };
+        assert_eq!(gpu.arch, "gfx1100");
+        assert_eq!(INKLING2_MIX_EPS, INKLING2_CONTROL_EPS);
+        // (a) model dims.
+        let (n_embd, n_blocks, query_rows) = (2304usize, 5usize, 2usize);
+        let mut s = 0x51ab_3c9d_2ef0_1123u64;
+        let blocks: Vec<Vec<f32>> = (0..n_blocks)
+            .map(|_| (0..n_embd).map(|_| rng_f32(&mut s, -2.0, 2.0)).collect())
+            .collect();
+        let cur: Vec<f32> = (0..n_embd).map(|_| rng_f32(&mut s, -2.0, 2.0)).collect();
+        let query: Vec<f32> = (0..query_rows * n_embd)
+            .map(|_| rng_f32(&mut s, -1.0, 1.0))
+            .collect();
+        let d = run_case(&mut gpu, &blocks, &cur, &query, n_embd, query_rows);
+        eprintln!("mix model-dims max abs diff: {d}");
+        assert!(d <= 1e-5, "model dims diff {d}");
+        // (b) randomized small case (single state + two-state bank).
+        let (n_embd, query_rows) = (64usize, 3usize);
+        let mut s = 0x77aa_bbcc_ddee_ff03u64;
+        for n_blocks in [0usize, 2usize] {
+            let blocks: Vec<Vec<f32>> = (0..n_blocks)
+                .map(|_| (0..n_embd).map(|_| rng_f32(&mut s, -3.0, 3.0)).collect())
+                .collect();
+            let cur: Vec<f32> = (0..n_embd).map(|_| rng_f32(&mut s, -3.0, 3.0)).collect();
+            let query: Vec<f32> = (0..query_rows * n_embd)
+                .map(|_| rng_f32(&mut s, -1.0, 1.0))
+                .collect();
+            let d = run_case(&mut gpu, &blocks, &cur, &query, n_embd, query_rows);
+            eprintln!("mix randomized ({} blocks) max abs diff: {d}", n_blocks);
+            assert!(d <= 1e-5, "randomized diff {d}");
+        }
     }
 }

@@ -51,6 +51,45 @@ extern "C" __global__ void inkling2_control_blend_f32(
 }
 "#;
 
+/// Gamma-less batched RMSNorm shared by the controller input norms, the
+/// `mix()` state-bank norm and the attention V-head norm (all Inkling-2
+/// norms are gamma-less, so no dummy ones-tensor through `rmsnorm_batched`).
+/// One block per row, 256 threads, grid-stride over `n`; `x` and `out` may
+/// be distinct buffers (the controller norms into `gate`, `mix` into its
+/// normed bank).
+pub const INKLING2_RMSNORM_NOGAMMA_HIP_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+// out[r * n + i] = x[r * n + i] / sqrt(mean_sq + eps)
+extern "C" __global__ void inkling2_rmsnorm_nogamma_f32(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int batch,
+    int n,
+    float eps) {
+    const int r = blockIdx.x;
+    if (r >= batch) return;
+    const float* xr = x + (size_t)r * n;
+    float* orow = out + (size_t)r * n;
+    const int t = threadIdx.x; // blockDim.x == 256, fixed
+    __shared__ float sh[256];
+    float acc = 0.0f;
+    for (int i = t; i < n; i += blockDim.x) {
+        const float v = xr[i];
+        acc += v * v;
+    }
+    sh[t] = acc;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (t < s) sh[t] += sh[t + s];
+        __syncthreads();
+    }
+    const float inv = 1.0f / sqrtf(sh[0] / (float)n + eps);
+    for (int i = t; i < n; i += blockDim.x) {
+        orow[i] = xr[i] * inv;
+    }
+}
+"#;
+
 /// Row-major `w [rows, cols]` times `x [cols]`, accumulated in K-tiles of 512
 /// (the order a tiled GEMV kernel accumulates in).
 fn matvec_tiled(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
@@ -194,7 +233,8 @@ mod tests {
     fn zero_gates_are_identity() {
         // Oracle golden: zero down/gain/forget rows => tanh(0)=0 => out=cur.
         let cur = [3.0f32, 4.0];
-        let out = inkling2_control_f32(&cur, &[9.0, 9.0], &[0.0; 4], &[0.0, 0.0], &[0.0, 0.0], 2, 1);
+        let out =
+            inkling2_control_f32(&cur, &[9.0, 9.0], &[0.0; 4], &[0.0, 0.0], &[0.0, 0.0], 2, 1);
         assert_eq!(out, cur.to_vec());
     }
 
@@ -282,5 +322,281 @@ mod tests {
         // Fail closed: NaN propagates through tanh and the blend.
         let out = inkling2_control_blend_f32(&[f32::NAN], &[1.0], &[0.5], &[0.5]);
         assert!(out[0].is_nan());
+    }
+}
+
+// --- GPU dispatch (gfx1100) -------------------------------------------------
+
+use std::ffi::c_void;
+
+use crate::dispatch::{DType, Gpu, GpuTensor};
+use hip_bridge::{DeviceBuffer, HipResult};
+
+/// Byte-offset view into `buf` (mirrors `rows_buffer` in `norm.rs`):
+/// the controller carves `gate`, `g`, `gain_out`, `forget_out` out of one
+/// caller-owned scratch allocation, so the per-call path joins nothing and
+/// allocates nothing.
+fn scratch_view(buf: &DeviceBuffer, float_off: usize, floats: usize, dtype: DType) -> GpuTensor {
+    let byte_off = float_off * 4;
+    let len = floats * 4;
+    assert!(
+        byte_off + len <= buf.size(),
+        "scratch view [{byte_off}, {}) exceeds buffer {}",
+        byte_off + len,
+        buf.size()
+    );
+    // SAFETY: `[byte_off, byte_off + len)` lies inside `buf`; the view is
+    // non-owning (`Borrowed`), so dropping it never frees the parent.
+    unsafe {
+        GpuTensor {
+            buf: DeviceBuffer::from_raw(
+                (buf.as_ptr() as *mut u8).add(byte_off) as *mut c_void,
+                len,
+            ),
+            shape: vec![floats],
+            dtype,
+        }
+    }
+}
+
+impl Gpu {
+    /// Gamma-less batched RMSNorm: `out[r] = rmsnorm(x[r], eps)` for
+    /// `batch` rows of `n` (shared by the controller input norms, the
+    /// `mix()` state-bank norm and the attention V-head norm).
+    pub fn inkling2_rmsnorm_nogamma_f32(
+        &mut self,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        batch: usize,
+        n: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "inkling2_rmsnorm_nogamma",
+            INKLING2_RMSNORM_NOGAMMA_HIP_SRC,
+            "inkling2_rmsnorm_nogamma_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let batch_val = batch as i32;
+        let n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &batch_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "inkling2_rmsnorm_nogamma_f32",
+            [batch as u32, 1, 1],
+            [256, 1, 1],
+            256 * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(batch_val);
+                b.push_i32(n_val);
+                b.push_f32(eps);
+                b
+            },
+        )
+    }
+
+    /// Elementwise controller tail:
+    /// `out[i] = cur[i] - tanh(forget[i]) * cur[i] + tanh(gain[i]) * msg[i]`.
+    pub fn inkling2_control_blend_gpu_f32(
+        &mut self,
+        cur: &GpuTensor,
+        msg: &GpuTensor,
+        gain: &GpuTensor,
+        forget: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "inkling2_control_blend",
+            INKLING2_CONTROL_HIP_SRC,
+            "inkling2_control_blend_f32",
+        )?;
+        let cur_ptr = cur.buf.as_ptr();
+        let msg_ptr = msg.buf.as_ptr();
+        let gain_ptr = gain.buf.as_ptr();
+        let forget_ptr = forget.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &cur_ptr as *const _ as *mut c_void,
+            &msg_ptr as *const _ as *mut c_void,
+            &gain_ptr as *const _ as *mut c_void,
+            &forget_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "inkling2_control_blend_f32",
+            [n.div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cur_ptr);
+                b.push_ptr(msg_ptr);
+                b.push_ptr(gain_ptr);
+                b.push_ptr(forget_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
+    /// One fused controller step: `out = cur - tanh(F·g)·cur + tanh(G·g)·msg`.
+    ///
+    /// `down_w` is F32 `[rank, 2*n_embd]`, `gain_w`/`forget_w` are F32
+    /// `[n_embd, rank]` (brief-01 F32 keep-list weights arrive as device
+    /// buffers). `scratch` is caller-owned F32 space for `gate[2*n_embd]`,
+    /// `g[rank]`, `gain_out[n_embd]`, `forget_out[n_embd]` —
+    /// `4*n_embd + rank` floats. The three projections reuse `gemv_f32`;
+    /// the two input norms use [`Self::inkling2_rmsnorm_nogamma_f32`].
+    pub fn inkling2_control_f32_gpu(
+        &mut self,
+        cur: &GpuTensor,
+        msg: &GpuTensor,
+        down_w: &GpuTensor,
+        gain_w: &GpuTensor,
+        forget_w: &GpuTensor,
+        out: &GpuTensor,
+        scratch: &GpuTensor,
+        n_embd: usize,
+        rank: usize,
+    ) -> HipResult<()> {
+        assert_eq!(down_w.shape, vec![rank, 2 * n_embd]);
+        assert_eq!(gain_w.shape, vec![n_embd, rank]);
+        assert_eq!(forget_w.shape, vec![n_embd, rank]);
+        assert_eq!(scratch.shape, vec![4 * n_embd + rank]);
+        let gate = scratch_view(&scratch.buf, 0, 2 * n_embd, DType::F32);
+        let gate_cur = scratch_view(&scratch.buf, 0, n_embd, DType::F32);
+        let gate_msg = scratch_view(&scratch.buf, n_embd, n_embd, DType::F32);
+        let g = scratch_view(&scratch.buf, 2 * n_embd, rank, DType::F32);
+        let gain_out = scratch_view(&scratch.buf, 2 * n_embd + rank, n_embd, DType::F32);
+        let forget_out = scratch_view(&scratch.buf, 3 * n_embd + rank, n_embd, DType::F32);
+        self.inkling2_rmsnorm_nogamma_f32(cur, &gate_cur, 1, n_embd, INKLING2_CONTROL_EPS)?;
+        self.inkling2_rmsnorm_nogamma_f32(msg, &gate_msg, 1, n_embd, INKLING2_CONTROL_EPS)?;
+        self.gemv_f32(down_w, &gate, &g)?;
+        self.gemv_f32(gain_w, &g, &gain_out)?;
+        self.gemv_f32(forget_w, &g, &forget_out)?;
+        self.inkling2_control_blend_gpu_f32(cur, msg, &gain_out, &forget_out, out, n_embd)
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+
+    fn rng_next(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    fn rng_f32(state: &mut u64, lo: f32, hi: f32) -> f32 {
+        let u = (rng_next(state) >> 11) as f32 / (1u64 << 53) as f32;
+        lo + u * (hi - lo)
+    }
+
+    fn run_case(
+        gpu: &mut Gpu,
+        cur_h: &[f32],
+        msg_h: &[f32],
+        down_h: &[f32],
+        gain_h: &[f32],
+        forget_h: &[f32],
+        n_embd: usize,
+        rank: usize,
+    ) -> f32 {
+        let cur = gpu.upload_f32(cur_h, &[n_embd]).expect("cur upload");
+        let msg = gpu.upload_f32(msg_h, &[n_embd]).expect("msg upload");
+        let down = gpu
+            .upload_f32(down_h, &[rank, 2 * n_embd])
+            .expect("down upload");
+        let gain = gpu
+            .upload_f32(gain_h, &[n_embd, rank])
+            .expect("gain upload");
+        let forget = gpu
+            .upload_f32(forget_h, &[n_embd, rank])
+            .expect("forget upload");
+        let out = gpu.alloc_tensor(&[n_embd], DType::F32).expect("out alloc");
+        let scratch = gpu
+            .alloc_tensor(&[4 * n_embd + rank], DType::F32)
+            .expect("scratch alloc");
+        gpu.inkling2_control_f32_gpu(
+            &cur, &msg, &down, &gain, &forget, &out, &scratch, n_embd, rank,
+        )
+        .expect("control launch");
+        let got = gpu.download_f32(&out).expect("download");
+        let want = inkling2_control_f32(cur_h, msg_h, down_h, gain_h, forget_h, n_embd, rank);
+        assert_eq!(got.len(), want.len());
+        got.iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Gate: device output matches the crate F32 reference at model dims
+    /// (n_embd 2304, rank 64) and on a randomized case. Bar: <= 1e-4 abs.
+    #[test]
+    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    fn gpu_matches_cpu_reference() {
+        let mut gpu = match crate::gpu_test::init() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: no usable GPU ({e:?})");
+                return;
+            }
+        };
+        assert_eq!(gpu.arch, "gfx1100");
+        // (a) model dims, synthetic data.
+        let (n_embd, rank) = (2304usize, 64usize);
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let cur: Vec<f32> = (0..n_embd).map(|_| rng_f32(&mut s, -2.0, 2.0)).collect();
+        let msg: Vec<f32> = (0..n_embd).map(|_| rng_f32(&mut s, -2.0, 2.0)).collect();
+        let down: Vec<f32> = (0..rank * 2 * n_embd)
+            .map(|_| rng_f32(&mut s, -0.1, 0.1))
+            .collect();
+        let gain: Vec<f32> = (0..n_embd * rank)
+            .map(|_| rng_f32(&mut s, -0.1, 0.1))
+            .collect();
+        let forget: Vec<f32> = (0..n_embd * rank)
+            .map(|_| rng_f32(&mut s, -0.1, 0.1))
+            .collect();
+        let d = run_case(&mut gpu, &cur, &msg, &down, &gain, &forget, n_embd, rank);
+        eprintln!("control model-dims max abs diff: {d}");
+        assert!(d <= 1e-4, "model dims diff {d}");
+        // (b) randomized small case.
+        let (n_embd, rank) = (256usize, 8usize);
+        let mut s = 0xdead_beef_cafe_f01du64;
+        let cur: Vec<f32> = (0..n_embd).map(|_| rng_f32(&mut s, -2.0, 2.0)).collect();
+        let msg: Vec<f32> = (0..n_embd).map(|_| rng_f32(&mut s, -2.0, 2.0)).collect();
+        let down: Vec<f32> = (0..rank * 2 * n_embd)
+            .map(|_| rng_f32(&mut s, -0.2, 0.2))
+            .collect();
+        let gain: Vec<f32> = (0..n_embd * rank)
+            .map(|_| rng_f32(&mut s, -0.2, 0.2))
+            .collect();
+        let forget: Vec<f32> = (0..n_embd * rank)
+            .map(|_| rng_f32(&mut s, -0.2, 0.2))
+            .collect();
+        let d = run_case(&mut gpu, &cur, &msg, &down, &gain, &forget, n_embd, rank);
+        eprintln!("control randomized max abs diff: {d}");
+        assert!(d <= 1e-4, "randomized diff {d}");
     }
 }
