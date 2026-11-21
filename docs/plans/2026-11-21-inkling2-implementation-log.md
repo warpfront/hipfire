@@ -238,46 +238,71 @@ debug CLI + release daemon:
 The GPU VRAM plan and kernel inventory research docs are vendored under
 `docs/plans/inkling2-research/`.
 
-## Parity bisect status (2026-11-21 — updated at intermediate stop)
+## Parity bisect status (2026-11-21 — resolved)
 
 The validated Python reference (vendored `ref-visits.md`) hits the llama.cpp
 oracle at r=1.0000 and dumps per-visit hiddens + sub-components. Using it, the
 Rust `decode_visit` was debugged **operator by operator** on the exact F32
 weights via `GgufF32` (the `.bin` carries file-order dim labels but torch-order
-bytes; the shim reverses dims at read). Latest measured result:
+bytes; the shim reverses dims at read).
 
-- **visit 0** (SWA): every intermediate (`x_in`, `q_inp`, `k/v_inp`, `q/k/v/r_raw`,
-  `k/v_conv`, `q/k/v/r_clip`, `vc`, `sinks`, `rel_bias`, `attn_heads`, `wo_out`,
-  `cur_attn`, `ffn_mix`, `ffn_normed`, `router_logits`, selected experts,
-  `moe_raw`, `moe_conv`, `visit_out`) matches the reference to **~1e-5**.
-- **visit 5** (first full-attention layer, dynamic conv): every intermediate
-  matches to **~1e-5** after the last fix (`D:\hipfire-models\ref-visits\tok0\`
-  has `ref_visit5_*.txt` and `rust_visit5_*.txt`; `cmp_visit5.py` diffs them).
-- Bugs found and fixed this session: per-head clip, GQA block grouping `h//3`,
-  MoE residual base, final output mix, conv tap order (tap `k-1` = current),
-  AttnRes query off-by-one (HFQ `attn_queries.0` feeds block 1, not 0),
-  `decode_visit` loading conv weights raw instead of via `load_conv`, full-layer
-  dynamic K/V convs, and the `static_w` double-flip between HFQ (verbatim,
-  needs flip) and GgufF32 (already converted). **28 unit tests pass.**
+**Result (F32 weights, token 0, against the llama.cpp oracle):**
 
-**Not yet re-measured after the visit-5 fix**: the full 48-visit trace. The last
-`dump_visits_f32` run was interrupted while capturing; its late-visit numbers
-are stale and must not be quoted. Re-run `dump_visits_f32` +
-`compare_visits.py` to get the true full-model parity curve. Full-logit parity
-on the MQ4 artifact is still expected to show the quantization gap.
+- All **48 visits** match: `max|d| <= 1.8e-4`, `mean|d| <= 2e-5`, `corr 1.0000`
+  (`compare_visits.py` over `D:\hipfire-models\rust-visits-tok0`).
+- Token-0 logits: **r = 0.9944**, **argmax 31274 == oracle**, mean|d| 0.267,
+  max|d| 1.68. The residual is fp32 accumulation-order divergence over 48
+  visits plus a 200k-way head GEMV, not a stage error — the per-visit states
+  agree to 1e-4 absolute on vectors with std ~13.
+- `dump_visits_f32` + `dump_raw_logits_token0` are the two commands; capture a
+  fresh baseline before touching `forward.rs` again.
 
-## Current end state (2026-11-21 — intermediate stop)
+This is the first point at which the forward is trustworthy enough to gate
+anything on. The earlier r≈0.19 was **not** quantization — it was three
+independent bugs in the pass>0 path, all invisible until visit 18 applies the
+first cross-pass message:
+
+1. **Visit→physical-layer schedule** (the dominant one). `layer_phys` took
+   llama.cpp's extended-layer index while its only caller passes the visit
+   slot; on `usize` the shared-core visit 18 underflowed and ran layer 16, and
+   the post layers 42–47 ran 12–17. `layer_phys` is now visit-indexed and
+   `visit_schedule()` derives from it.
+2. **Duplicated softmax state.** `states_for_mix` already held `prev_out`, and
+   `mix()` appends its `cur` — so `prev_out` entered the message softmax twice.
+   Signature: messages corr 0.987 (close, not wrong-looking).
+3. **K/V message queries.** `GgufF32` classified the two cross-pass globals
+   with `ends_with("_queries")`, true for both, so the kv global returned Q/FFN
+   rows. Predicate is now `!ends_with("kv_queries")` (covers both checkpoint
+   spellings).
+
+Earlier bugs found and fixed while getting visit 0/5 to the oracle (all still
+required): per-head clip, GQA block grouping `h//3`, MoE residual base, final
+output mix, conv tap order (tap `k-1` = current), AttnRes query off-by-one
+(HFQ `attn_queries.0` feeds block 1, not 0), `decode_visit` loading conv
+weights raw instead of via `load_conv`, full-layer dynamic K/V convs, and the
+`static_w` double-flip between HFQ (verbatim, needs flip) and GgufF32 (already
+converted). **29 unit tests pass.**
+
+Debug tooling added along the way (all ignored tests, `--ignored`):
+`dump_visits_f32` (per-visit trace), `dump_raw_logits_token0`,
+`visit18_debug_dump` (any-visit component capture via `forward_token`'s
+`debug` hook), `visit18_message_dump` / `visit18_control_dump` (rebuild one
+message/control from the trace without a full forward), and
+`cmp_visit.py` / `compare_visits.py` in the temp dir.
+
+## Current end state (2026-11-21 — parity closed, GPU forward next)
 
 **Branch** `feat/inkling2-mini-support` (fork `raufaser`), draft PR
-https://github.com/warpfront/hipfire/pull/1192. ~50 local commits, clean tree,
+https://github.com/warpfront/hipfire/pull/1192. Clean tree,
 attribution + crate-map checks pass.
 
 Done:
 - Working quantizer + 13.9 GB arch-24 HFQ artifact (6790 tensors).
 - Typed config, 24/48 loop schedule, validation traps, HFQ weight index.
 - CPU reference forward: all 48 visits, controllers, cross-pass messages,
-  dynamic convs, MoE, LM head. Visit 0 and visit 5 verified to ~1e-5 against
-  the validated oracle; full-model re-measurement pending (above).
+  dynamic convs, MoE, LM head.
+- **Full forward parity on F32 weights**: all 48 visits ≤1.8e-4, token-0
+  logits r=0.9944 with the oracle's argmax. See the parity section above.
 - **Loader/carrier skeleton**: arch 24 loads on the RX 7900 XTX (gfx1100,
   25.8 GB VRAM) via `hipfire run`; `generate` returns a clean fail-closed
   "inkling2: generation is not implemented yet" (no panic).
@@ -286,7 +311,7 @@ Done:
   VRAM plan, kernel inventory).
 
 Not done: GPU forward/kernels, generation route (`GenerationRoute::InklingAr`),
-multi-token KV cache, full-model parity re-measurement, served validation.
+multi-token KV cache, served validation, MQ4 forward parity.
 **The model loads but cannot generate yet.**
 
 **Artifact fix (2026-11-21):** the quantizer's generic `.scale`-sibling rule
@@ -312,18 +337,17 @@ SWA uses static `k_sconv.weight`. Per-expert tensors are
 
 ## Next steps, in order (for the next session — split-friendly)
 
-1. **Re-measure full-model parity** (quick, unblocks everything): run
-   `cargo test -p hipfire-arch-inkling2 dump_visits_f32 -- --ignored` then
-   `python3 <temp>/compare_visits.py`. Visit 0 and 5 already match to ~1e-5;
-   expect the whole curve near 1.0 on the F32 path. Then run `dump_raw_logits_token0`
-   and compare to `oracle-logits-tok0.txt` — this finally separates forward
-   correctness from MQ4 quantization loss.
+1. ~~**Re-measure full-model parity**~~ — **done**, see the parity section.
+   F32 forward is clean through all 48 visits and the LM head.
+   Remaining measurement: MQ4 (quantized artifact) forward parity, which is
+   the quant-gap number, not a forward check.
 2. **GPU forward** (largest slice, can be a separate worker): implement device
    weight upload + per-visit state (VRAM plan: 48 visit slots, conv width 6656,
    SWA-aware KV) and the 13 operators mapped in `inkling2-research/kernel-inventory.md`.
    Most reuse existing `rdna-compute` HIP kernels (rmsnorm, dynamic conv,
    attention sliding+sink, SiTU MoE, softcap); NEW are controller fuse, mix,
-   rel-bias gather, L2 clip. Gate each operator against the CPU oracle.
+   rel-bias gather, L2 clip. Gate each operator against the CPU oracle
+   (`forward_token` with the `debug` hook captures any visit's components).
 3. **Generation route** (depends on 2): add `GenerationRoute::InklingAr` and a
    `generate_inkling` producer; remove the arch-24 guard in `ar.rs::generate`.
    No batch/slot/PP/EP/Redline in Phase 1.
@@ -338,6 +362,34 @@ SWA uses static `k_sconv.weight`. Per-expert tensors are
 Step 1 is self-contained and fast — do it first in any session. Steps 2 and 4
 are independent research/implementation tracks that can run in parallel
 workers, feeding results back via `docs/plans/local/`. Step 3 requires step 2.
+
+## Parallel tracks in flight (branch base: `feat/inkling2-mini-support`)
+
+None of these are merged into this worktree; they were built in isolation so
+they could not disturb the parity bisect.
+
+- **`hipfire-kernels` worktree** (`feat/inkling2-kernels` @ `6f08889`): the four
+  genuinely NEW operators as new `rdna-compute` files — `inkling2_control`,
+  `inkling2_mix`, `inkling2_rel_bias`, `inkling2_clip` — each with an F32
+  reference, goldens, randomized differentials and property tests (22 pass,
+  clippy clean). HIP bodies are inert source strings: no GPU execution was
+  possible on that host. Integrate before the GPU forward, then gate each
+  against `forward_token`'s `debug` capture.
+- **MQ4L expert path** (`D:/mq4l`, `feat/mq4l-expert-path`): quantizer expert
+  branch uses the Lloyd encoder + `lloyd_levels` sidecar + per-expert AWQ
+  Route A; `quant_mq.rs` maps Inkling names to imatrix keys (zero misses on
+  bartowski); family table now judges experts. Gate PASS: layer-0 smoke →
+  `MQ4G256V2L:263 + F32:263`, `mlp_down` 14.16% / `mlp_gate` 14.13% (bar 12%).
+  Its own caveat: **runtime decode for `MQ4G256V2L` is not wired** — an MQ4L
+  artifact can be produced and gated but not served. 48 `bin`-test failures
+  are pre-existing (diffed identical).
+- **qt52 runtime decode** (handed to another agent, not started here): its
+  blockers are concrete — `lloyd_lut::apply_lloyd_centering` refuses
+  `K % 256 != 0` and the Inkling `down_proj` is K=1152; `expert_capabilities`
+  has no qt52 expert kernel (`QT_MQ4_LLOYD` is a reserved tag); and
+  `hipfire-quantize/src/dequant.rs` has no qt52 arm, so the CPU forward cannot
+  yet read an MQ4L artifact. Not on the critical path until the GPU forward
+  exists.
 
 ## Known issues / risks
 
