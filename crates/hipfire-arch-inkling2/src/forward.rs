@@ -79,17 +79,41 @@ fn rmsnorm_l2(x: &[f32], eps: f32) -> Vec<f32> {
     x.iter().map(|v| v * s).collect()
 }
 
-/// HFQ stores conv tensors as `[n_channels, 1, kernel]`; transpose to the
-/// oracle's `[kernel, n_channels]` layout.
-fn flatten_conv(v: &[f32], kernel: usize) -> Vec<f32> {
+/// Load a conv tensor into `[kernel, n_channels]` oracle layout, honoring the
+/// checkpoint layouts:
+///  * SWA layers: `[n_channels, 1, kernel]` (plain `.weight`) — transpose only.
+///  * full layers: `.static_w` is `[kernel, n_channels]`; the merged converter
+///    applies `flip(0).T` to produce the runtime conv, so flip the kernel axis.
+fn load_conv(
+    w: &crate::weights::Inkling2Weights,
+    name: &str,
+    kernel: usize,
+) -> Result<Vec<f32>, String> {
+    let (shape, v) = w.f32(name)?;
     let n_ch = v.len() / kernel;
     let mut out = vec![0.0f32; v.len()];
-    for c in 0..n_ch {
+    if shape.len() == 3 {
+        // [channels, 1, kernel] -> [kernel, channels]
+        for c in 0..n_ch {
+            for k in 0..kernel {
+                out[k * n_ch + c] = v[c * kernel + k];
+            }
+        }
+    } else if name.ends_with(".static_w") {
+        // [kernel, channels], flipped by the converter along the kernel axis.
         for k in 0..kernel {
-            out[k * n_ch + c] = v[c * kernel + k];
+            for c in 0..n_ch {
+                out[k * n_ch + c] = v[(kernel - 1 - k) * n_ch + c];
+            }
+        }
+    } else {
+        for c in 0..n_ch {
+            for k in 0..kernel {
+                out[k * n_ch + c] = v[c * kernel + k];
+            }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Run one single-token decoder layer. `x` is `[n_embd]`, `pos` the position,
@@ -320,20 +344,29 @@ pub fn decode_visit(
     let swa = cfg.swa_layers[phys];
     let g = |s: &str| w.f32(&format!("{p}{s}")).map(|x| x.1);
 
-    // --- attention input: AttnRes mix (if this visit has a query) + norm ---
-    let mut inp = x.to_vec();
+    // --- attention inputs: AttnRes mix (if this visit has a query) ---
+    // SWA layers have 1 query (all three inputs equal); full layers have 3
+    // queries (one each for Q, K, V). Then loop messages are applied per input.
     let attn_q = format!("model.llm.attn_res.attn_queries.{phys}");
-    if let Ok((shape, q)) = w.f32(&attn_q) {
+    let (base_q, base_k, base_v) = if let Ok((shape, q)) = w.f32(&attn_q) {
         let query_rows = if shape.len() == 1 {
             1
         } else {
             shape[0] as usize
         };
         let mixed = oracle::mix(blocks, x, &q, cfg.n_embd, query_rows);
-        inp = mixed[..cfg.n_embd].to_vec();
-    }
-    // Three attention inputs. Pass 0 (no messages): all equal `inp`. Later
-    // passes: each is `control(inp, msg[j], ctrl[j])` then normed separately.
+        let row = |j: usize| mixed[j * cfg.n_embd..(j + 1) * cfg.n_embd].to_vec();
+        if query_rows >= 3 {
+            (row(0), row(1), row(2))
+        } else {
+            let r = row(0);
+            (r.clone(), r.clone(), r)
+        }
+    } else {
+        (x.to_vec(), x.to_vec(), x.to_vec())
+    };
+    // Pass 0 (no messages): inputs are the AttnRes-mixed bases. Later passes:
+    // each is `control(base, msg[j], ctrl[j])`.
     let (q_inp, k_inp, v_inp) = match messages {
         Some((msgs, ctrls)) => {
             let apply = |base: &[f32], j: usize, c: &ControllerWeights| {
@@ -348,12 +381,12 @@ pub fn decode_visit(
                 )
             };
             (
-                apply(&inp, 0, &ctrls[0]),
-                apply(&inp, 1, &ctrls[1]),
-                apply(&inp, 2, &ctrls[2]),
+                apply(&base_q, 0, &ctrls[0]),
+                apply(&base_k, 1, &ctrls[1]),
+                apply(&base_v, 2, &ctrls[2]),
             )
         }
-        None => (inp.clone(), inp.clone(), inp.clone()),
+        None => (base_q, base_k, base_v),
     };
     let (q_inp, k_inp, v_inp) = if swa {
         let norm = g("attn_norm.weight")?;
@@ -385,22 +418,10 @@ pub fn decode_visit(
     // taps. The dynamic taps are deferred; here use the static weights.
     let k_conv_w = g("attn.k_sconv.weight").or_else(|_| g("attn.k_sconv.static_w"))?;
     let v_conv_w = g("attn.v_sconv.weight").or_else(|_| g("attn.v_sconv.static_w"))?;
-    let (k_conv, kp) = oracle::convolve_static(
-        &k_raw,
-        &flatten_conv(&k_conv_w, cfg.conv_kernel),
-        &state.k_past,
-        1,
-        ekv,
-        cfg.conv_kernel,
-    );
-    let (v_conv, vp) = oracle::convolve_static(
-        &v_raw,
-        &flatten_conv(&v_conv_w, cfg.conv_kernel),
-        &state.v_past,
-        1,
-        ekv,
-        cfg.conv_kernel,
-    );
+    let (k_conv, kp) =
+        oracle::convolve_static(&k_raw, &k_conv_w, &state.k_past, 1, ekv, cfg.conv_kernel);
+    let (v_conv, vp) =
+        oracle::convolve_static(&v_raw, &v_conv_w, &state.v_past, 1, ekv, cfg.conv_kernel);
     state.k_past = kp;
     state.v_past = vp;
 
@@ -432,7 +453,7 @@ pub fn decode_visit(
         }
     }
 
-    let sinks = oracle::matvec(&g("attn.attn_sink_proj.weight")?, &inp, nh, cfg.n_embd);
+    let sinks = oracle::matvec(&g("attn.attn_sink_proj.weight")?, &q_inp, nh, cfg.n_embd);
     let rel_table = g("attn.rel_logits_proj.proj")?;
     let mut attn_out = vec![0.0f32; eattn];
     for h in 0..nh {
@@ -462,7 +483,7 @@ pub fn decode_visit(
     let proj = oracle::matvec(&g("attn.wo_ud.weight")?, &attn_out, cfg.n_embd, eattn);
     let (attn_res, ap) = oracle::convolve_static(
         &proj,
-        &flatten_conv(&g("attn_sconv.weight")?, cfg.conv_kernel),
+        &load_conv(w, &format!("{p}attn_sconv.weight"), cfg.conv_kernel)?,
         &state.attn_out_past,
         1,
         cfg.n_embd,
@@ -528,7 +549,7 @@ pub fn decode_visit(
     );
     let (moe_conv, fp) = oracle::convolve_static(
         &moe,
-        &flatten_conv(&g("mlp_sconv.weight")?, cfg.conv_kernel),
+        &load_conv(w, &format!("{p}mlp_sconv.weight"), cfg.conv_kernel)?,
         &state.ffn_out_past,
         1,
         cfg.n_embd,
@@ -798,10 +819,10 @@ mod tests {
                 .ok()
                 .map(|x| x.1),
             attn_norm: g("attn_norm.weight"),
-            k_conv: flatten_conv(&g("attn.k_sconv.weight"), 4),
-            v_conv: flatten_conv(&g("attn.v_sconv.weight"), 4),
-            attn_post_conv: flatten_conv(&g("attn_sconv.weight"), 4),
-            ffn_post_conv: flatten_conv(&g("mlp_sconv.weight"), 4),
+            k_conv: load_conv(&w, &format!("{p}attn.k_sconv.weight"), 4).unwrap(),
+            v_conv: load_conv(&w, &format!("{p}attn.v_sconv.weight"), 4).unwrap(),
+            attn_post_conv: load_conv(&w, &format!("{p}attn_sconv.weight"), 4).unwrap(),
+            ffn_post_conv: load_conv(&w, &format!("{p}mlp_sconv.weight"), 4).unwrap(),
         };
         let mut st = ConvState::default();
         let out = decode_layer(&f, &mut st, &x, 0);
@@ -971,6 +992,29 @@ mod tests {
             "end-to-end: {} logits, argmax={argmax}, max={max}",
             logits.len()
         );
+    }
+
+    #[test]
+    #[ignore = "parity: dump CPU logits for token 0 to compare with llama.cpp oracle"]
+    fn dump_cpu_logits_token0() {
+        use crate::weights::Inkling2Weights;
+        use hipfire_runtime::hfq::HfqFile;
+        let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        let hfq = HfqFile::open(std::path::Path::new(
+            r"D:\hipfire-models\inkling2-mini-mq4.hfq",
+        ))
+        .expect("open");
+        let w = Inkling2Weights::load(&hfq, &cfg).expect("load");
+        let embed = w.f32("model.llm.embed.weight").unwrap().1;
+        let x = embed[..cfg.n_embd].to_vec();
+        let hidden = forward_token(&w, &cfg, &x, 0).expect("forward");
+        let logits = lm_head_logits(&w, &cfg, &hidden).expect("lm head");
+        let mut s = String::new();
+        for (i, v) in logits.iter().enumerate() {
+            s.push_str(&format!("{} {:08x}\n", i, v.to_bits()));
+        }
+        std::fs::write(r"D:\hipfire-models\cpu-logits-tok0.txt", s).unwrap();
+        eprintln!("dumped {} CPU logits", logits.len());
     }
 
     fn oracle_close(a: f32, b: f32) -> bool {
