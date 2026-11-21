@@ -1879,7 +1879,7 @@ daemon after changing them.
 | Scope | Keys |
 |---|---|
 | Exact gfx1201 | `kernel.gfx12_mq4v2_fp8_gateup`, `kernel.gfx12_mq4v2_fp8_resid`, `kernel.gfx12_mq4v2_fp8_qkvza`, `kernel.gfx12_mq4v2_fp8_qkv` (the four family flags), `kernel.gfx12_mq4v2_fp8_v2` (staged-tile v2; the four family flags remain prerequisites), `kernel.g12_a4c2`, `kernel.gfx12_fa2_prefill`, `kernel.attn_qresident` (exact H24/KV4/D256 native-fp8-KV shapes), `kernel.gfx12_fa_prep_fused`, `kernel.gfx12_fa_prep_fp8q` |
-| Exact gfx1100 / gfx1151 / gfx1201 | `kernel.gfx12_gdn_chunk_scan`, `kernel.iu4_prefill`, `kernel.verify_attn` |
+| Exact gfx1100 / gfx1151 / gfx1201 | `kernel.iu4_prefill`, `kernel.verify_attn` |
 | Exact gfx1100 / gfx1151 | `kernel.gfx11_fa2_prefill` |
 | Exact gfx1100 | `kernel.gfx11_iu4_shape` |
 
