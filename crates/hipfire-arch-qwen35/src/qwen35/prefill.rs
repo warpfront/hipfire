@@ -4955,7 +4955,6 @@ pub fn prefill_batch_pbs_eligible(
     arch: &str,
     moe_router_logits_present: bool,
 ) -> bool {
-    let decouple_env = hipfire_config::developer_var("HIPFIRE_MTP_VERIFY_DECOUPLE").ok();
     let has_dn = weights
         .layers
         .iter()
@@ -4963,7 +4962,6 @@ pub fn prefill_batch_pbs_eligible(
     let scalar_ok = prefill_batch_scalar_eligible(
         n,
         arch,
-        decouple_env.as_deref(),
         hipfire_runtime::config::get().prefill_batched,
         has_dn,
     );
@@ -4997,19 +4995,15 @@ pub fn prefill_batch_pbs_eligible(
 }
 
 /// Pure scalar half of [`prefill_batch_pbs_eligible`] (no weights): the
-/// verify-decouple window, the `prefill_batched` config switch, the
-/// two-token minimum and a DeltaNet layer. `decouple_env` is
-/// `HIPFIRE_MTP_VERIFY_DECOUPLE`.
+/// verify-decouple window (gfx11, `n <= 32`), the `prefill_batched` config
+/// switch, the two-token minimum and a DeltaNet layer.
 fn prefill_batch_scalar_eligible(
     n: usize,
     arch: &str,
-    decouple_env: Option<&str>,
     prefill_batched: bool,
     has_dn: bool,
 ) -> bool {
-    let is_rdna3_decouple = arch.starts_with("gfx11");
-    let verify_decouple =
-        n <= 32 && decouple_env != Some("0") && (is_rdna3_decouple || decouple_env == Some("1"));
+    let verify_decouple = n <= 32 && arch.starts_with("gfx11");
     let force_fallback = !verify_decouple && !prefill_batched;
     !force_fallback && n >= MIN_BATCH && has_dn
 }
@@ -11418,9 +11412,6 @@ mod tests {
             && prefill_batch_scalar_eligible(
                 rows,
                 sc.arch,
-                hipfire_config::developer_var("HIPFIRE_MTP_VERIFY_DECOUPLE")
-                    .ok()
-                    .as_deref(),
                 sc.prefill_batched,
                 moe.config
                     .layer_types
@@ -12337,28 +12328,11 @@ mod tests {
             (WrapperOwner::Physical, None, false, false)
         );
         // The shared scalar gate: prefill_batched off denies (outside the verify-decouple window).
-        assert!(prefill_batch_scalar_eligible(
-            512, "gfx1201", None, true, true
-        ));
-        assert!(!prefill_batch_scalar_eligible(
-            512, "gfx1201", None, false, true
-        ));
-        assert!(!prefill_batch_scalar_eligible(
-            512,
-            "gfx1100",
-            Some("0"),
-            false,
-            true
-        ));
-        assert!(prefill_batch_scalar_eligible(
-            16, "gfx1100", None, false, true
-        ));
-        assert!(!prefill_batch_scalar_eligible(
-            1, "gfx1201", None, true, true
-        ));
-        assert!(!prefill_batch_scalar_eligible(
-            512, "gfx1201", None, true, false
-        ));
+        assert!(prefill_batch_scalar_eligible(512, "gfx1201", true, true));
+        assert!(!prefill_batch_scalar_eligible(512, "gfx1201", false, true));
+        assert!(prefill_batch_scalar_eligible(16, "gfx1100", false, true));
+        assert!(!prefill_batch_scalar_eligible(1, "gfx1201", true, true));
+        assert!(!prefill_batch_scalar_eligible(512, "gfx1201", true, false));
         // The shared ceiling resolver: the cap applies to the override too.
         assert_eq!(resolve_ordinary_max_batch(512, None, Some(256)), 256);
         assert_eq!(resolve_ordinary_max_batch(512, Some(4096), Some(256)), 256);
@@ -12583,13 +12557,12 @@ mod tests {
         let open = OrdinaryCallFacts::default();
         let phys = Some(512usize);
         let gate = |arch: &str,
-                    decouple: Option<&str>,
                     batched: bool,
                     n: usize,
                     call: &OrdinaryCallFacts,
                     physical: Option<usize>| {
             OrdinaryWrapperGate::new(n, call, physical, |rows| {
-                prefill_batch_scalar_eligible(rows, arch, decouple, batched, true)
+                prefill_batch_scalar_eligible(rows, arch, batched, true)
             })
         };
         let target = implicit_reuse_pbs_plan("gfx1100", Some(RESIDENT_MOE_CHUNK_ROWS), false);
@@ -12612,53 +12585,28 @@ mod tests {
         };
         // n = 1 falls to the per-token AR loop: closed, reuse on and off.
         for physical in [phys, None] {
-            assert_closed(&gate("gfx1100", None, true, 1, &open, physical), "n=1");
-            assert_closed(
-                &gate("gfx1201", None, true, 1, &open, physical),
-                "n=1 gfx1201",
-            );
+            assert_closed(&gate("gfx1100", true, 1, &open, physical), "n=1");
+            assert_closed(&gate("gfx1201", true, 1, &open, physical), "n=1 gfx1201");
         }
         // prefill_batched off: the verify-decouple window admits small n on
         // gfx11 (actual n allowed) but the 512-row seam is not: closed. Above
-        // the window both are closed. gfx1201 needs the env opt-in for the
-        // window and is still closed at the seam.
-        assert!(prefill_batch_scalar_eligible(
-            16, "gfx1100", None, false, true
-        ));
-        assert!(!prefill_batch_scalar_eligible(
-            512, "gfx1100", None, false, true
-        ));
+        // the window both are closed. gfx1201 is outside the window and is
+        // closed at the seam.
+        assert!(prefill_batch_scalar_eligible(16, "gfx1100", false, true));
+        assert!(!prefill_batch_scalar_eligible(512, "gfx1100", false, true));
         for physical in [phys, None] {
             for n in [2usize, 16, 32, 33, 40, 600] {
                 assert_closed(
-                    &gate("gfx1100", None, false, n, &open, physical),
+                    &gate("gfx1100", false, n, &open, physical),
                     "gfx1100 prefill_batched off",
                 );
             }
-            assert_closed(
-                &gate("gfx1201", None, false, 16, &open, physical),
-                "gfx1201 off",
-            );
-            assert!(prefill_batch_scalar_eligible(
-                16,
-                "gfx1201",
-                Some("1"),
-                false,
-                true
-            ));
-            assert_closed(
-                &gate("gfx1201", Some("1"), false, 16, &open, physical),
-                "gfx1201 decouple=1, off",
-            );
-            assert_closed(
-                &gate("gfx1100", Some("0"), false, 16, &open, physical),
-                "decouple=0, off",
-            );
+            assert_closed(&gate("gfx1201", false, 16, &open, physical), "gfx1201 off");
         }
         // Valid positive n opens the gate: the implicit cache is mapped and the
         // memory fit is queried; reuse off maps nothing.
         for n in [2usize, 3, 16, 33, 100, 4096, 8192] {
-            let g = gate("gfx1100", None, true, n, &open, phys);
+            let g = gate("gfx1100", true, n, &open, phys);
             assert!(
                 g.call_eligible && g.maps_kv() && g.needs_default_fit(false),
                 "n={n}"
@@ -12678,7 +12626,7 @@ mod tests {
                 "n={n}"
             );
             // A fit that was not asked for (needs_default_fit false) never promotes.
-            let off = gate("gfx1100", None, true, n, &open, None);
+            let off = gate("gfx1100", true, n, &open, None);
             assert!(off.call_eligible && !off.maps_kv() && !off.needs_default_fit(false));
             let p = off.plan("gfx1100", false, false, Some(target), true);
             assert_eq!(
@@ -12701,10 +12649,10 @@ mod tests {
         for flip in flips {
             let mut c = open;
             flip(&mut c);
-            assert_closed(&gate("gfx1100", None, true, 100, &c, phys), "call fact");
+            assert_closed(&gate("gfx1100", true, 100, &c, phys), "call fact");
         }
         // An empty call touches nothing at all.
-        let g = gate("gfx1100", None, true, 0, &open, phys);
+        let g = gate("gfx1100", true, 0, &open, phys);
         assert!(!g.call_eligible && !g.maps_kv());
         let p = g.plan("gfx1100", false, false, Some(target), true);
         assert_eq!(
@@ -12873,8 +12821,6 @@ mod tests {
         }
         // prefill_batched off at the verify-decouple boundary and above: the
         // actual n may be admitted (gfx11 window) while the 512 seam is not.
-        let decouple_env_unset =
-            hipfire_config::developer_var_os("HIPFIRE_MTP_VERIFY_DECOUPLE").is_none();
         for reuse in [false, true] {
             for existing in [None, Some(target)] {
                 for n in [2usize, 16, 32, 33, 40, 600] {
@@ -12882,13 +12828,11 @@ mod tests {
                     sc.prefill_batched = false;
                     sc.existing_virtual = existing;
                     assert!(!sc_batched_eligible(moe, &sc, WIDENED_COMMIT_ROWS));
-                    if decouple_env_unset {
-                        assert_eq!(
-                            sc_batched_eligible(moe, &sc, n),
-                            arch == "gfx1100" && n <= 32,
-                            "{name} {arch} n={n}: actual-n admission differs from the 512 probe"
-                        );
-                    }
+                    assert_eq!(
+                        sc_batched_eligible(moe, &sc, n),
+                        arch == "gfx1100" && n <= 32,
+                        "{name} {arch} n={n}: actual-n admission differs from the 512 probe"
+                    );
                     assert_denied(&sc, "prefill_batched off");
                     // The whole planner flow keeps the original incumbent plan.
                     let r = run(moe, &sc);
