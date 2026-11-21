@@ -39,8 +39,7 @@
 //!
 //! Last result line (the card script greps it):
 //! `lane_hc8_rows_oracle: <C> cells, <W> bytes compared, <M> mismatching bytes`.
-//! Exit 0 pass, 1 mismatch, 2 environment. Needs exact gfx1201 and
-//! `HIPFIRE_QWEN4_LANE_HC_ALLROWS` on (its default).
+//! Exit 0 pass, 1 mismatch, 2 environment. Needs exact gfx1201, where the all-rows HC arm is on.
 
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;

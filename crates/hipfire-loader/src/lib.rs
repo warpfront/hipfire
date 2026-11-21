@@ -5783,9 +5783,8 @@ fn load_model_tp_qwen35_dense(
         .can_access_peer_all()
         .map_err(|e| format!("dense TP can_access_peer_all: {e:?}"))?;
     if peer {
-        // TP2 whole-token decode graph (exact gfx1201 pair by default, gfx1100
-        // pair with `HIPFIRE_TP_FULL_GRAPH=1`): the runtime admits it and
-        // prepares its signal tape before peer access is enabled.
+        // TP2 whole-token decode graph (per-arch topology default): the runtime
+        // admits it and prepares its signal tape before peer access is enabled.
         let barriers = config.n_layers * 2;
         let whole_token_graph = staging
             .gpus_mut()
@@ -6187,8 +6186,8 @@ fn load_model_tp_qwen35_mesh(
     let placement =
         BandPlacement::uniform(&mesh, 1).map_err(|e| format!("dense TP mesh placement: {e}"))?;
     let max_bytes = (chunk * config.dim * std::mem::size_of::<f32>()).next_multiple_of(16);
-    // TP2 whole-token decode graph (`HIPFIRE_TP_FULL_GRAPH`, on by default for
-    // an exact gfx1100 or gfx1201 pair), as the hand loader: the runtime
+    // TP2 whole-token decode graph (per-arch topology default; exact gfx1100 or
+    // gfx1201 pairs), as the hand loader: the runtime
     // admits it and prepares its signal tape (one barrier per collective, two
     // per layer) and payload exchange before peer access is enabled, which
     // the provisioning's `qualify_peer` does.

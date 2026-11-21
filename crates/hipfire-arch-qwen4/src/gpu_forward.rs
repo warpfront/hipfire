@@ -2823,7 +2823,7 @@ pub fn qwen4_ep_wide_group_cap() -> usize {
 }
 
 /// Default gather capacity (rows) of an exact gfx1201 EP rank with `HIPFIRE_QWEN4_EP_WIDE_VERIFY`
-/// unset: the all-rows lane MoE's one-call window (`HIPFIRE_QWEN4_LANE_ALLROWS_MOE`, 9..=48
+/// unset: the all-rows lane MoE's one-call window (9..=48
 /// rows). Capacity only (buffers, transport slots, slot-owner words): no route, segmentation or
 /// kernel choice of a <= 8-row call changes with it. `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` sizes it
 /// instead when set; `HIPFIRE_QWEN4_EP_WIDE_VERIFY=0` restores the 8-row capacity.
