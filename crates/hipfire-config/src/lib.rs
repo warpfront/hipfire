@@ -4495,6 +4495,14 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         replacement: "none; balanced EP owners are always used on gfx1201 at 2 to 4 ranks, other arches and larger N keep the static split",
     },
     RetiredConfigKey {
+        key: "developer.mtp_verify_decouple",
+        legacy_key: "mtp_verify_decouple",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "the MTP verify-decouple kill switch was removed (HIPF-489)",
+        replacement: "none; the decoupled verify applies on gfx11 (RDNA3) for n <= 32 (unchanged default); no override",
+    },
+    RetiredConfigKey {
         key: "developer.ep_unit_pinned_owners",
         legacy_key: "ep_unit_pinned_owners",
         shipped_in: "0.4.5",

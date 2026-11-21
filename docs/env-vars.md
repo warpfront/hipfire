@@ -2197,7 +2197,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MTP_SNAPSHOT_OVERLAP` | crates/hipfire-arch-qwen35/src/mtp_spec.rs | developer |
 | `HIPFIRE_MTP_TAKEOVER_FILL_ARM` | crates/hipfire-arch-qwen4/tests/mtp_takeover_fill_hw.rs | harness |
 | `HIPFIRE_MTP_TRACE` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
-| `HIPFIRE_MTP_VERIFY_DECOUPLE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_MTP_VERIFY_GRAPH_ORACLE_ARM` | crates/hipfire-arch-qwen35/tests/mtp_verify_graph_oracle.rs | harness |
 | `HIPFIRE_MTP_VERIFY_GRAPH_ORACLE_OUT` | crates/hipfire-arch-qwen35/tests/mtp_verify_graph_oracle.rs | harness |
 | `HIPFIRE_MTP_VERIFY_GRAPH_ORACLE_OUT_ROOT` | crates/hipfire-arch-qwen35/tests/mtp_verify_graph_oracle.rs | harness |

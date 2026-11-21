@@ -2398,6 +2398,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.ep_unit_tail_pins` | `ep_unit_tail_pins` | 0.4.5 | 0.5.0 | none; the tail always keeps pinned owners where they are admitted |
 | `developer.ep_unit_tail_prefill` | `ep_unit_tail_prefill` | 0.4.5 | 0.5.0 | none; the tail's full-table prefill always follows its publications |
 | `developer.ep_tail_log_direct` | `ep_tail_log_direct` | 0.4.5 | 0.5.0 | none; the few-row MoE call always logs its slot under the tail |
+| `developer.mtp_verify_decouple` | `mtp_verify_decouple` | 0.3.1 | 0.5.0 | none; the decoupled verify applies on gfx11 (RDNA3) for n <= 32 (unchanged default); no override |
 | `developer.ep_unit_pinned_owners` | `ep_unit_pinned_owners` | 0.4.5 | 0.5.0 | none; pinned owners are always on where balanced ownership is admitted |
 | `developer.ep_mtp_experts_resident` | `ep_mtp_experts_resident` | 0.4.5 | 0.5.0 | none; an EP load of two or more ranks keeps the native MTP head's owned routed-expert slice VRAM-resident whenever the head is attached |
 | `developer.ep_mtp_lane_copy` | `ep_mtp_lane_copy` | 0.4.5 | 0.5.0 | none; the copy lane follows the singleton policy, and speculation.mtp_ngram_copy = off still disables it |
