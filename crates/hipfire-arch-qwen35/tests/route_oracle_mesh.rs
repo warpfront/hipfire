@@ -782,7 +782,7 @@ fn qwen35_tp2_vs_single_oracle() {
     let peer = gpus.can_access_peer_all().expect("tp can_access_peer_all");
     if peer {
         // As `load_model_tp_qwen35_dense`: the TP2 whole-token graph (gfx1100 /
-        // gfx1201, `HIPFIRE_TP_FULL_GRAPH`) prepares its signal tape before peer
+        // gfx1201, per-arch topology default) prepares its signal tape before peer
         // enable. `Ok(false)` touches nothing when it is not admitted.
         let whole_token_graph = gpus
             .prepare_tp2_whole_token_graph(

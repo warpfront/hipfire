@@ -26,7 +26,7 @@
 //!
 //! Decode and prefill epochs run plain launches through the executor. TP2
 //! decode on an exact gfx1201 or gfx1100 pair, where the runtime admits the
-//! hand route's whole-token graph (`HIPFIRE_TP_FULL_GRAPH`, peer access and
+//! hand route's whole-token graph (per-arch topology default, peer access and
 //! the load-time signal tape of `Gpus::prepare_tp2_whole_token_graph`), runs
 //! one graph per rank ([`Qwen35TpProgram::run_epoch`]): the embeds run
 //! eagerly first, the executor submission of the rest is captured on both

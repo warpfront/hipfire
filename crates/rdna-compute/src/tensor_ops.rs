@@ -3150,7 +3150,7 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
         gpu.arch_caps.is_gfx1201(),
         p.rows,
     );
-    // `HIPFIRE_QWEN4_LANE_HC_ALLROWS`: the lane step's all-rows HC read tail (9..=64 rows) is the
+    // The lane step's all-rows HC read tail (exact gfx1201 and gfx942, 9..=64 rows) is the
     // t1 entry, whose grid `[hidden / 8, ceil(rows / 8)]` runs each eight-token tile with the
     // very device body the <= 8-row group launches run (one token per wave, no state shared
     // across `blockIdx.y`), in one launch, instead of the incumbent's 128-token row grid.

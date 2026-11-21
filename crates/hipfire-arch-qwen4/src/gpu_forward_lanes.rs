@@ -24,13 +24,12 @@
 //! - **Row-local stages** run either per lane ([`StageShare::PerLane`], the
 //!   singleton's arm by construction) or once over every lane's rows
 //!   ([`StageShare::OnceAllRows`], in groups of at most [`LANE_MAX_ROWS`];
-//!   under `HIPFIRE_QWEN4_LANE_HC_ALLROWS` the HC stages of a >8-row AR /
-//!   verify step take one all-rows segment instead, and under
-//!   `HIPFIRE_QWEN4_LANE_ALLROWS` so does every other non-MoE once-over-all-rows
-//!   stage: only the routed MoE keeps its groups, unless
-//!   `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` (default on) makes it one EP call over every row on a
-//!   second all-rows segment; a wide-class step (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY`)
-//!   is one group already, so its MoE is that one call through its group).
+//!   on exact gfx1201 and gfx942 the HC stages of a >8-row AR / verify step take one
+//!   all-rows segment instead, and so does every other non-MoE once-over-all-rows stage:
+//!   only the routed MoE keeps its groups, unless it is one EP call over every row on a
+//!   second all-rows segment (also on exact gfx1201 and gfx942); a wide-class step
+//!   (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY`) is one group already, so its MoE is that one
+//!   call through its group).
 //!   A stage moves to `OnceAllRows` only on byte evidence from the G0 oracle
 //!   (`examples/fn_lane_oracle.rs --g0`): the S0 kill experiment found the
 //!   few-row forward NOT bitwise equal to single rows at every N ≥ 2, so
@@ -252,9 +251,8 @@ impl StageName {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StageShare {
     /// One launch over every lane's rows, in groups of at most
-    /// [`LANE_MAX_ROWS`] rows (HC stages: one all-rows segment under
-    /// `HIPFIRE_QWEN4_LANE_HC_ALLROWS`; every non-MoE stage under
-    /// `HIPFIRE_QWEN4_LANE_ALLROWS`). Admitted only with G0 byte evidence.
+    /// [`LANE_MAX_ROWS`] rows (HC stages: one all-rows segment; every non-MoE stage too,
+    /// on exact gfx1201 and gfx942). Admitted only with G0 byte evidence.
     OnceAllRows,
     /// One launch per lane class; executes as [`StageShare::PerLane`] with
     /// the existing kernels.
@@ -1586,8 +1584,8 @@ const HC_ALL_ROWS_MAX: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_
 
 /// Whether an AR / verify lane step of `group_rows` (the once-over-all-rows
 /// groups of at most [`LANE_MAX_ROWS`] rows each) runs its HC stages once over
-/// every row (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`) instead of once per group.
-/// `flag` is the exact-gfx1201 flag, `ar_step` an AR / verify step (never a
+/// every row (on exact gfx1201 and gfx942) instead of once per group.
+/// `flag` is the all-rows HC flag, `ar_step` an AR / verify step (never a
 /// prefill wave or a band edge), `eager` no replay recording and no graph
 /// capture (the wide few-row limit the HC kernels' all-rows arms run under
 /// exists only eagerly), `cpu_splice` a layer with CPU routed experts (its
@@ -1618,7 +1616,7 @@ fn hc_all_rows_applies(
 }
 
 /// Whether an AR / verify lane step also runs every non-MoE row-local stage once over all
-/// rows (`HIPFIRE_QWEN4_LANE_ALLROWS`), on top of the all-rows HC segment
+/// rows (on exact gfx1201 and gfx942), on top of the all-rows HC segment
 /// ([`hc_all_rows_applies`], which it refines: it is only asked for a step that segment
 /// admitted). Refused (`false`) for anything the wide 9..=64-row routes (9..=128 on single-device
 /// gfx942, [`g942_lanes::G942_ALLROWS_MAX_ROWS`]) of the projections
@@ -1652,7 +1650,7 @@ fn lane_step_trace_enabled() -> bool {
     *ON
 }
 
-/// Why a lane step that asked for `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` keeps its routed MoE on
+/// Why a lane step keeps its routed MoE on
 /// the <= 8-row groups (`Some(reason)`), or `None` when the one all-rows MoE call applies. The
 /// step the flag refines is a 9..=64-row (9..=128 on single-device gfx942) AR / verify step the all-rows stage segment
 /// admitted (`stages_apply`: flag, eager, no CPU splice, no wide scope, ...); the call is the
@@ -1753,13 +1751,13 @@ fn all_rows_moe_refusal(
 ///   `qwen4_bf16_streams(n) == qwen4_bf16_streams(1)` is a function of `n` and this constant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaneAllRowsRule {
-    /// `HIPFIRE_QWEN4_LANE_HC_ALLROWS` (`Flags::qwen4_lane_hc_allrows_enabled`).
+    /// `Flags::qwen4_lane_hc_allrows_enabled`, on exact gfx1201 and gfx942.
     pub hc_flag: bool,
-    /// `HIPFIRE_QWEN4_LANE_ALLROWS` (`Flags::qwen4_lane_allrows_enabled`).
+    /// `Flags::qwen4_lane_allrows_enabled`, on exact gfx1201 and gfx942.
     pub stages_flag: bool,
     /// `HIPFIRE_QWEN4_LANE_ALLROWS_EXACT` (`Flags::qwen4_lane_allrows_exact_enabled`).
     pub exact_flag: bool,
-    /// `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` (`Flags::qwen4_lane_allrows_moe_enabled`).
+    /// `Flags::qwen4_lane_allrows_moe_enabled`, on exact gfx1201 and gfx942.
     pub moe_flag: bool,
     /// `HIPFIRE_QWEN4_GDN_QKV_BF16` (`Flags::qwen4_gdn_qkv_bf16_enabled`).
     pub gdn_qkv_bf16: bool,
@@ -1958,11 +1956,10 @@ impl LaneAllRowsRule {
     }
 }
 
-/// What the all-rows segment of an AR / verify lane step takes: the HC stages
-/// (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`) and, with `stages`, every other non-MoE
-/// once-over-all-rows stage (`HIPFIRE_QWEN4_LANE_ALLROWS`). The routed MoE keeps its
-/// <= 8-row groups unless `moe` (`HIPFIRE_QWEN4_LANE_ALLROWS_MOE`): then it is ONE call per
-/// layer over every row on the MoE all-rows segment (the one after the HC one).
+/// What the all-rows segment of an AR / verify lane step takes (on exact gfx1201 and gfx942):
+/// the HC stages and, with `stages`, every other non-MoE once-over-all-rows stage. The routed
+/// MoE keeps its <= 8-row groups unless `moe`: then it is ONE call per layer over every row on
+/// the MoE all-rows segment (the one after the HC one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllRowsPlan {
     /// Whether the attention (`[0]`) / MLP (`[1]`) HC write runs all-rows; a write a TP2
@@ -3214,10 +3211,10 @@ fn forward_lanes_scoped(
         }
     };
     let mut all_segs: Vec<Segment> = lane_segs.iter().chain(&group_segs).copied().collect();
-    // The all-rows segment (exact gfx1201). `HIPFIRE_QWEN4_LANE_HC_ALLROWS`: an AR / verify
+    // The all-rows segment (on exact gfx1201 and gfx942). An AR / verify
     // step of more than LANE_MAX_ROWS rows (several groups) runs every HC stage -- each
     // layer's reads, the writes the all-reduce does not carry, the final read -- as ONE
-    // segment over all `n` rows. `HIPFIRE_QWEN4_LANE_ALLROWS` (`all_stages`, a refinement of
+    // segment over all `n` rows. The stages flag (`all_stages`, a refinement of
     // the same step) puts every other non-MoE once-over-all-rows stage on that segment too:
     // Embed, PleRows, the GDN / QSA input and output projections, Head and Argmax; only the
     // routed MoE keeps its groups. The segment is appended after the groups (`hc_seg`); a
@@ -3252,7 +3249,7 @@ fn forward_lanes_scoped(
         (decision.hc_all, decision.all_stages, decision.exact_scope);
     // The few-row limit an all-rows (`n`-row) segment's descriptions are bound under.
     let exact_limit = n.max(gpu.few_row_limit());
-    // `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` (default on): on top of the all-rows stages the routed MoE is ONE
+    // The MoE (on exact gfx1201 and gfx942): on top of the all-rows stages the routed MoE is ONE
     // `ep_lane_moe_rows` call per layer over every row (the wide-group MoE of `n` rows) on its
     // own all-rows segment, and the HC writes a TP2 all-reduce carries go all-rows too: no
     // family runs per <= 8-row group. A wide-class lane step already packs into one group of
@@ -3947,9 +3944,9 @@ fn forward_lanes_scoped(
             } else {
                 StageShare::OnceAllRows
             };
-            // The run's pieces: with the all-rows segment the HC ops (and, under
-            // `HIPFIRE_QWEN4_LANE_ALLROWS`, every other non-MoE op) of a once-over-all-rows
-            // run form their own all-rows pieces (the routed MoE keeps its groups); each
+            // The run's pieces: with the all-rows segment the HC ops (and, on exact gfx1201
+            // and gfx942, every other non-MoE op) of a once-over-all-rows run form their own
+            // all-rows pieces (the routed MoE keeps its groups); each
             // piece is emitted segment-major over its own segments, pieces in order.
             let items = run_items(
                 start,
@@ -7807,7 +7804,7 @@ mod tests {
         })
     }
 
-    /// The `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` plan: every stage all-rows, every HC write too.
+    /// The all-rows MoE plan: every stage all-rows, every HC write too.
     fn plan_moe() -> Option<AllRowsPlan> {
         Some(AllRowsPlan {
             hc_writes: [true, true],
@@ -7850,7 +7847,7 @@ mod tests {
         }
     }
 
-    /// `HIPFIRE_QWEN4_LANE_ALLROWS`: every non-MoE once-over-all-rows op appears ONCE on the
+    /// All-rows stages: every non-MoE once-over-all-rows op appears ONCE on the
     /// all-rows segment (one launch per op per layer), the routed MoE stays on its groups
     /// between the all-rows HC read and write of its block, and per-lane stages are emitted
     /// exactly as today.
@@ -8003,7 +8000,7 @@ mod tests {
         }
     }
 
-    /// `HIPFIRE_QWEN4_LANE_ALLROWS_MOE`: no op runs per group. Every non-MoE once op is on the
+    /// All-rows MoE: no op runs per group. Every non-MoE once op is on the
     /// all-rows segment, every HC write too (an all-reduce write included), and the routed MoE
     /// appears exactly once per layer on the segment after it, between the all-rows HC read and
     /// write of its block; per-lane stages are emitted exactly as today.
@@ -8130,7 +8127,7 @@ mod tests {
 
     /// A wide-class lane step packs into ONE group of up to the wide cap, so its MoE is already
     /// one call over every row and the all-rows segment (which needs several groups) stays out
-    /// of it: `HIPFIRE_QWEN4_LANE_ALLROWS` composes with the wide path by not applying to it.
+    /// of it: the all-rows non-MoE stages compose with the wide path by not applying to it.
     #[test]
     fn wide_class_lane_step_is_one_group_and_takes_no_all_rows_segment() {
         use crate::mesh_lane_protocol::pack_classed_row_groups_with_cap;

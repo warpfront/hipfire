@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Byte oracle, launch census and bench of the Flash-Next lane step's all-rows HC arm
-//! (`HIPFIRE_QWEN4_LANE_HC_ALLROWS=1`, exact gfx1201).
+//! (on for exact gfx1201 and gfx942; this oracle needs gfx1201).
 //!
 //! A lane step of more than eight rows runs its HC stages (HcRead / HcWrite / FinalHyper)
 //! once per group of at most eight rows (`group_segments`); with the flag they run ONE
@@ -32,13 +32,13 @@
 //! bit flips of a live word, a tail word and a quarter word.
 //!
 //! ```text
-//! HIPFIRE_QWEN4_LANE_HC_ALLROWS=1 cargo run --release -p hipfire-dispatch \
+//! cargo run --release -p hipfire-dispatch \
 //!   --features test-utils --example hc_allrows_oracle -- \
 //!   [--out DIR] [--model PATH] [--layers 0,1,..] [--seeds N] [--rows-max 64] \
 //!   [--bench | --bench-only] [--iters N]
 //! ```
 //!
-//! Exit nonzero on a non-gfx1201 device, a missing flag, a launch error, any mismatch,
+//! Exit nonzero on a non-gfx1201 device, an all-rows arm that is off, a launch error, any mismatch,
 //! census failure or undetected control. Receipts: `oracle.json`, `bench.json` in `--out`.
 
 use std::collections::BTreeMap;

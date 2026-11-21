@@ -19957,8 +19957,8 @@ impl Gpu {
         )
     }
 
-    /// Whether the lane step's all-rows HC stages (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`, exact
-    /// gfx1201) take their one-launch arms for a `rows`-row HC op: the flag, more than
+    /// Whether the lane step's all-rows HC stages (on for exact gfx1201 and gfx942) take
+    /// their one-launch arms for a `rows`-row HC op: the flag, more than
     /// [`FEW_ROW_ROUTE_ROWS`] and at most [`WIDE_VERIFY_MAX_ROWS`] rows, and
     /// [`Gpu::few_row_limit`] already admitting them (the lane forward opens that scope for
     /// its all-rows HC steps only: eager, never recording or capturing, never the
@@ -20021,7 +20021,7 @@ impl Gpu {
         {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gemv_bf16_xf32_k4_rows_lane_allrows needs K % 32 == 0, 9..=64 rows and HIPFIRE_QWEN4_LANE_HC_ALLROWS on gfx1201",
+                "gemv_bf16_xf32_k4_rows_lane_allrows needs K % 32 == 0, 9..=64 rows and the lane all-rows HC arm (exact gfx1201 or gfx942)",
             ));
         }
         self.bind_thread()?;

@@ -386,7 +386,7 @@ const GFX942_LANE_STATIC_DEPTH: usize = 3;
 /// `HIPFIRE_QWEN4_LANE_ROW_CAP` (developer; default off, `1` on): the gfx1201
 /// profile's even split of one 8-row group over the step's lanes
 /// ([`LaneCostProfile::step_row_cap`]). Off (the default since the all-rows
-/// lane step, `HIPFIRE_QWEN4_LANE_ALLROWS`, runs a >8-row step as one pass), the
+/// lane step runs a >8-row step as one pass), the
 /// lanes of a step draft up to their own budgets and the floors learn the
 /// spill (`G`) from the priced steps; `1` restores the one-group cap.
 pub(crate) fn lane_row_cap_enabled() -> bool {

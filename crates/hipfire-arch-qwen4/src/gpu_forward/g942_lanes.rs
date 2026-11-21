@@ -10,13 +10,13 @@
 //! its shared stages ONCE over every row instead of once per <= 8-row group:
 //!
 //! * the HC reads / writes, embedding, PLE rows, GDN / QSA in / out projections, final hyper
-//!   read, LM head and top-1 on the all-rows segment (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`,
-//!   `HIPFIRE_QWEN4_LANE_ALLROWS`). The trunk projections are BF16 on the MFMA entry
+//!   read, LM head and top-1 on the all-rows segment (on for gfx942). The trunk projections
+//!   are BF16 on the MFMA entry
 //!   `gemm_bf16_mfma_gfx942` (the rows16 few-row entry up to 16 rows, the tile entry above, bitwise
 //!   equal: CHANGELOG `gemm_bf16_mfma_gfx942_rows16`), whose per-element chain does not depend on
 //!   the row count;
 //! * the routed MoE as ONE call per layer over every row on its own all-rows segment
-//!   (`HIPFIRE_QWEN4_LANE_ALLROWS_MOE`): the FP8 grouped MFMA route
+//!   (on for gfx942): the FP8 grouped MFMA route
 //!   (`gemm_fp8b128_moe_grouped_bf16mfma`: fixed ascending K, 1..16-row tiles, the same kernels
 //!   at every row count) with the router / scatter / combine glue per row. Unlike the gfx1201
 //!   EP all-rows MoE there is no row gather and no gather-capacity or MoE-call-parity limit:
@@ -54,7 +54,7 @@ pub(crate) fn single_device_rule(gpu: &Gpu, gather_cap: Option<usize>) -> bool {
     gpu.arch_caps.is_gfx942() && gather_cap.is_none()
 }
 
-/// Why a single-device gfx942 step that asked for `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` keeps its MoE
+/// Why a single-device gfx942 step keeps its MoE
 /// on the <= 8-row groups (`Some(reason)`), or `None` when the one all-rows MoE call applies:
 /// the stage segment must apply (`stages_apply`), the policy must place the MoE once
 /// (`moe_once`), no lane is wide-class (`any_wide_lane`: wide lanes keep their classed group) and

@@ -1167,7 +1167,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1692
+**Count:** 1688
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2381,13 +2381,10 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_HC_UP_TILE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/tensor_ops.rs | developer |
 | `HIPFIRE_QWEN4_HC_UP_V2` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_LANES_ON_D2` | crates/hipfire-loader/src/batch_staging.rs | developer |
-| `HIPFIRE_QWEN4_LANE_ALLROWS` | crates/hipfire-arch-qwen4/src/gpu_forward/g942_lanes.rs, crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs | developer |
 | `HIPFIRE_QWEN4_LANE_ALLROWS_EXACT` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/gpu_forward/g942_lanes.rs | developer |
 | `HIPFIRE_QWEN4_LANE_COMMIT_FILL` | crates/hipfire-arch-qwen4/src/mtp_lanes.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |
 | `HIPFIRE_QWEN4_LANE_COPY_LANES` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/tests/common/lane_ep.rs | developer |
 | `HIPFIRE_QWEN4_LANE_COST_TRACE` | crates/hipfire-arch-qwen4/src/mtp_lanes.rs | developer |
-| `HIPFIRE_QWEN4_LANE_HC_ALLROWS` | crates/hipfire-arch-qwen4/examples/lane_hc8_rows_oracle.rs, crates/hipfire-arch-qwen4/src/gpu_forward/g942_lanes.rs | developer |
 | `HIPFIRE_QWEN4_LANE_LAB_ROUTES` | crates/hipfire-arch-qwen4/src/lane.rs | developer |
 | `HIPFIRE_QWEN4_LANE_PAGE_BUDGET_COLD_MIB` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB` | crates/hipfire-arch-qwen4/src/lane/pages.rs, crates/hipfire-config/src/lib.rs | developer |
@@ -2781,7 +2778,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_TP_BENCH_N` | crates/hip-bridge/examples/rccl_smoke.rs, crates/hipfire-runtime/examples/tp_allreduce_smoke.rs | harness |
 | `HIPFIRE_TP_BENCH_WARMUP` | crates/hipfire-runtime/examples/tp_allreduce_smoke.rs | harness |
 | `HIPFIRE_TP_EXCHANGE` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/lib.rs | experimental |
-| `HIPFIRE_TP_FULL_GRAPH` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-arch-qwen35/src/qwen35/mesh_tp.rs | developer |
 | `HIPFIRE_TP_GRAPH_RANKS` | crates/hipfire-runtime/examples/tp4_cross_device_graph_barrier.rs | harness |
 | `HIPFIRE_TP_PARITY_PROMPT_FILE` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |
 | `HIPFIRE_TP_PARITY_STEPS` | crates/hipfire-arch-qwen35/examples/qwen_dense_tp2_parity.rs | harness |

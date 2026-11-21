@@ -1313,7 +1313,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "tp2-graph-fused-reduce",
         predicates: &[CaptureMode],
-        condition: "all_reduce_sum_f32_peer_direct_add_impl: alternating-slot reduction with both ranks of an exact gfx1100 or exact gfx1201 TP2 pair capturing (the whole-token graph: default on a gfx1201 pair, `HIPFIRE_TP_FULL_GRAPH=1` on gfx1100, `=0` off) → `tp2_peer_push_reduce_gfx1201` on a gfx1201 pair once the load-time peer-push qualification passed (`HIPFIRE_TP_PEER_PUSH=0` and any gfx1100 pair use `tp_graph_signal_reduce_gfx1100`) (hipfire-runtime multi_gpu.rs)",
+        condition: "all_reduce_sum_f32_peer_direct_add_impl: alternating-slot reduction with both ranks of an exact gfx1100 or exact gfx1201 TP2 pair capturing (the whole-token graph: per-arch topology default) → `tp2_peer_push_reduce_gfx1201` on a gfx1201 pair once the load-time peer-push qualification passed (`HIPFIRE_TP_PEER_PUSH=0` and any gfx1100 pair use `tp_graph_signal_reduce_gfx1100`) (hipfire-runtime multi_gpu.rs)",
         effect: KernelSelection,
         switches: "captured: one fused peer exchange + residual add kernel per rank (gfx1201: tagged peer-VRAM granules; otherwise signal barrier + coherent payload exchange); eager: event record/wait + `add_peer_residual_f32` reading the peer partial",
         kernels: &[
@@ -1328,7 +1328,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "tp4-graph-peer-push-reduce16",
         predicates: &[CaptureMode],
-        condition: "peer_reduce (hipfire-runtime multi_gpu/executor.rs): decode `AllReduceAdd` on 3 or 4 gfx1201 ranks, bf16 exchange, every rank capturing (the TP3/TP4 whole-token graph: `HIPFIRE_TP_FULL_GRAPH` default on, `HIPFIRE_TP_PEER_PUSH=0` and `HIPFIRE_TP_FULL_GRAPH=0` off) with the load-time peer-push qualification passed → `tp_peer_pushn_reduce_bf16_gfx1201`",
+        condition: "peer_reduce (hipfire-runtime multi_gpu/executor.rs): decode `AllReduceAdd` on 3 or 4 gfx1201 ranks, bf16 exchange, every rank capturing (the TP4 whole-token graph: per-arch topology default, `HIPFIRE_TP_PEER_PUSH=0` off) with the load-time peer-push qualification passed → `tp_peer_pushn_reduce_bf16_gfx1201`",
         effect: KernelSelection,
         switches: "captured: one bf16 peer-push kernel per rank (tagged 16-byte granules in the peers' fine-grained VRAM, device-resident generations); eager: `tp_pack16_bf16` + peer copies + event record/wait + `tp_fold16_bf16`",
         kernels: &[
@@ -1724,7 +1724,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-lane-hc-allrows-eager-only",
         predicates: &[IsRecording, CaptureMode],
-        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs) via LaneAllRowsRule::from_parts (its `eager` fact, also the mesh root's plan-time rule) and hc_all_rows_applies: an AR / verify lane step of more than LANE_MAX_ROWS rows runs its HC stages (layer reads, the writes no TP2 all-reduce carries, the final read) as ONE all-rows segment under HIPFIRE_QWEN4_LANE_HC_ALLROWS (exact gfx1201, default on, `=0` kills it) only while `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)` and outside the prefill-invariant scope; a recorded or captured step keeps the per <= 8-row group emission",
+        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs) via LaneAllRowsRule::from_parts (its `eager` fact, also the mesh root's plan-time rule) and hc_all_rows_applies: an AR / verify lane step of more than LANE_MAX_ROWS rows runs its HC stages (layer reads, the writes no TP2 all-reduce carries, the final read) as ONE all-rows segment (on for exact gfx1201 and gfx942 only) only while `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)` and outside the prefill-invariant scope; a recorded or captured step keeps the per <= 8-row group emission",
         effect: KernelSelection,
         switches: "eager: gemv_bf16_xf32_k4_rows_lane_t8 (one launch over every row tile) and the t1 HC up read at 9..=64 rows; recorded/captured: the incumbent per-group HC launches",
         kernels: &["gemv_bf16_xf32_k4_rows_lane_t8"],
