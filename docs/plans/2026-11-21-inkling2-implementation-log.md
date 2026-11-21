@@ -220,6 +220,35 @@ layers (static weights only), multi-token KV cache (single-token primitive).
 The practical fix for the quality gap is imatrix-based MQ4L calibration, which
 this CPU forward can now drive.
 
+## GPU milestone (2026-11-21, continued session)
+
+**arch 24 now loads on the real gfx1100 GPU.** Verified end-to-end with the
+debug CLI + release daemon:
+- `hipfire list` shows `inkling2-mini.mq4.hfq 13.93 GB`.
+- `hipfire run inkling2-mini.mq4.hfq "hi" --max-tokens 1` loads the artifact on
+  gfx1100 (25.8 GB VRAM), prints
+  `hipfire load summary: inkling2-mini.mq4.hfq (inkling2)` and
+  `[inkling2] 2304d 48L 200058 vocab`, then returns a clean fail-closed
+  `[internal retryable=false] inkling2: generation is not implemented yet`.
+- This followed the vendored carrier spec: `arch.rs` / `arch_model.rs` /
+  `carrier.rs`, `Inkling2Carrier` in REGISTRY, `arch_label`, `bench_decode_route`,
+  `reset_core` inventory, and a clean arch-24 guard at `ar.rs::generate`
+  (replaces an LLaMA-downcast panic).
+
+The GPU VRAM plan and kernel inventory research docs are vendored under
+`docs/plans/inkling2-research/`.
+
+## Parity bisect status (2026-11-21)
+
+The validated Python reference (vendored `ref-visits.md`) hits the oracle with
+r=1.0000 and dumps per-visit hiddens + sub-components. My Rust forward on the
+same F32 weights still diverges from **visit 0** (corr 0.56). Fixed from the
+reference's findings: per-head clip, GQA `h//3`, MoE residual base, final
+output mix, conv tap order, GGUF dim reversal (the `.bin` carries file-order
+labels with torch-order bytes). 27 unit tests pass. Full-logit parity remains
+open; per-visit traces are dumped at `D:\hipfire-models\rust-visits-tok0\` and
+compared with `compare_visits.py`.
+
 ## Current end state (2026-11-21)
 
 Done: a working quantizer path and a 13.9 GB arch-24 HFQ artifact;
