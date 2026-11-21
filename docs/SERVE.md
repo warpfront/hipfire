@@ -365,10 +365,19 @@ With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    row-batched `_vmm` kernels, so a greedy comparison against the sequential
    route (or against a different batch composition) is expected to differ at
    some token, as on the arena route: output is deterministic for a fixed batch
-   composition and fully request-isolated, not byte-equal across routes. Two
-   runs of the same concurrent traffic can also differ from each other:
-   arrival timing changes the composition, so byte-equal round-to-round output
-   is not an invariant this route owes. Design:
+   composition, and requests are isolated at the KV/state level, but a
+   request's tokens are not a function of its own bytes alone — the rows it
+   shares a step with change the reduction order. Two runs of the same
+   concurrent traffic can therefore differ from each other, and the same
+   request can differ between two rows of one concurrent run, because arrival
+   timing changes the composition. Byte-equal round-to-round output is not an
+   invariant this route owes, and the same holds on the slab route (both
+   multi-slot KV routes fail `serve_harness.py --concurrent-clients`'s greedy
+   per-client isolation equality for the same composition reason, so it is not
+   a validity gate for either): judge the run by its coherence and
+   `empty`/`attractor`/`runaway` accounting plus the storage oracles
+   (`vmm_paged_swap_smoke`, `test_slots_vmm_oracle`), not by byte equality.
+   Design:
    [`docs/plans/2026-10-22-vmm-kv-multislot-engine.md`](plans/2026-10-22-vmm-kv-multislot-engine.md).
    A container recipe for this exact stack (4 slots, VMM, MTP + vision on a
    qwen3.5-4b fixture, port 9001) is `docker/compose.vmm-9001.yaml`.

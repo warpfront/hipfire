@@ -2,25 +2,35 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Multi-slot KV-storage oracle: `kv_backend=legacy` (arena) vs
-//! `kv_backend=vmm` (per-slot VMM reservations), on one GPU, in one process.
+//! Multi-slot KV-storage oracle: the fixed-slab route
+//! (`multi_slot_paged=false`) vs the shared paged pool with the VMM physical
+//! backend (`multi_slot_paged=true, multi_slot_paged_backend=vmm`), on one
+//! GPU, in one process.
 //!
-//! Asserts the properties the VMM route is allowed to claim
+//! `kv_backend=vmm` is no longer a separate per-slot-owner mode on this
+//! engine: it means the shared paged pool and is refused unless
+//! `multi_slot_paged` is set, so the storage choice is expressed by
+//! `multi_slot_paged` + `multi_slot_paged_backend` (see `docs/SERVE.md`).
+//!
+//! Asserts the properties the paged route is allowed to claim
 //! (`docs/plans/2026-10-22-vmm-kv-multislot-engine.md` §5, §11):
 //!
-//! * **Isolation (I9)** — on the VMM route a request's FIRST generated token
+//! * **Isolation (I9)** — on the paged route a request's FIRST generated token
 //!   comes from its own prefill, whose arithmetic is composition-independent
 //!   (per-slot singleton prefill). A concurrent lane must therefore emit the
 //!   same first token as that prompt run alone. Cross-slot KV contamination
 //!   (a row addressing the wrong owner) changes it immediately.
 //! * **Composition determinism (I9)** — repeating a run with the same batch
 //!   composition reproduces every id, on both storage routes.
-//! * **Graph coverage** — with `HIPFIRE_SLOTS_DECODE_GRAPH=1`, the VMM route
-//!   must have replayed a captured decode graph (`graph_replays > 0`).
+//! * **Graph coverage** — with `HIPFIRE_SLOTS_DECODE_GRAPH=1`, the slab route
+//!   must have replayed a captured decode graph (`graph_replays > 0`). The
+//!   shared paged pool's decode step is eager on purpose
+//!   (`forward_slots.rs` skips capture when `pool.is_paged()`), so its
+//!   counters are printed for information and not asserted.
 //!
 //! It deliberately does **not** assert lane-for-lane or cross-route equality:
 //! projection/attention arithmetic is row-count dependent on both routes, and
-//! a lane's row count changes as other lanes join or leave. The arena route
+//! a lane's row count changes as other lanes join or leave. The slab route
 //! demonstrates this even between two identical concurrent prompts (one may
 //! prefill in a mixed step, the other alone through the single-slot path), so
 //! the cross-route match is printed for information, not asserted.
@@ -65,11 +75,20 @@ fn main() {
         stats: EngineStats,
     }
 
+    /// KV-storage route under test: fixed slabs, or the shared paged pool
+    /// with a chosen physical backend.
+    #[derive(Clone, Copy)]
+    struct Route {
+        label: &'static str,
+        paged: bool,
+        backend: &'static str,
+    }
+
     /// One engine: serial runs, then two identical bursts (one submission per
     /// slot, all at once), then a consuming shutdown so the next route can load.
     fn run_engine(
         model_path: &str,
-        backend: &str,
+        route: Route,
         prompts: &[Vec<u32>],
         draft: Option<&Path>,
     ) -> Run {
@@ -80,19 +99,17 @@ fn main() {
             prefill_chunk: 512,
             host_budget_bytes: 4 * 1024 * 1024 * 1024,
             swap_dir: std::env::temp_dir().join("hipfire-vmm-oracle-swap"),
-            swap_disk_bytes: 1 << 30,
+            swap_disk_bytes: 0,
             is_vl: false,
             vl_path: None,
             vision_residency: hipfire_arch_qwen35_vl::qwen35_vl::TowerResidency::Streamed,
             mtp_k: 0,
             mtp_mode: hipfire_config::MtpMode::Off,
             kv_mode_raw: "q8".to_string(),
-            kv_backend: backend.to_string(),
-            // Per-slot storage on both arms: this oracle compares the legacy
-            // arena with per-slot VMM reservations, not the shared paged pool.
-            multi_slot_paged: false,
+            kv_backend: "legacy".to_string(),
+            multi_slot_paged: route.paged,
             multi_slot_paged_pages: 0,
-            multi_slot_paged_backend: "arena".to_string(),
+            multi_slot_paged_backend: route.backend.to_string(),
             prefix_cache: false,
             prefix_cache_max_bytes: 0,
             max_batch_tokens: 4096,
@@ -104,7 +121,7 @@ fn main() {
             dflash_draft: draft.map(Path::to_path_buf),
             dflash_required: draft.is_some(),
         })
-        .unwrap_or_else(|e| panic!("SlotEngine::spawn({backend}): {e}"));
+        .unwrap_or_else(|e| panic!("SlotEngine::spawn({}): {e}", route.label));
 
         let serial: Vec<Vec<u32>> = prompts.iter().map(|p| ask(&engine, p)).collect();
         let serial_repeat: Vec<Vec<u32>> = prompts.iter().map(|p| ask(&engine, p)).collect();
@@ -113,7 +130,7 @@ fn main() {
         let stats = engine.stats();
         engine
             .shutdown_engine()
-            .unwrap_or_else(|e| panic!("shutdown({backend}): {e}"));
+            .unwrap_or_else(|e| panic!("shutdown({}): {e}", route.label));
         Run {
             serial,
             serial_repeat,
@@ -229,12 +246,30 @@ fn main() {
     // One engine at a time: each spawn loads its own weights, and the
     // consuming shutdown releases VRAM (and invalidates caches) before the
     // next route loads.
-    let arena = run_engine(&model_path, "legacy", &prompts, draft.as_deref());
-    let vmm = run_engine(&model_path, "vmm", &prompts, draft.as_deref());
+    let slab = run_engine(
+        &model_path,
+        Route {
+            label: "slab",
+            paged: false,
+            backend: "arena",
+        },
+        &prompts,
+        draft.as_deref(),
+    );
+    let paged = run_engine(
+        &model_path,
+        Route {
+            label: "paged-vmm",
+            paged: true,
+            backend: "vmm",
+        },
+        &prompts,
+        draft.as_deref(),
+    );
 
     // Composition determinism: the same serial run and the same burst
     // reproduce every id on both storage routes.
-    for (name, run) in [("arena", &arena), ("vmm", &vmm)] {
+    for (name, run) in [("slab", &slab), ("paged", &paged)] {
         assert_eq!(
             run.serial, run.serial_repeat,
             "{name}: repeating a serial run changed its ids"
@@ -244,46 +279,45 @@ fn main() {
             "{name}: repeating the same batch composition changed its ids"
         );
     }
-    // Isolation: a VMM lane's first token comes from its own singleton
+    // Isolation: a paged lane's first token comes from its own singleton
     // prefill, so concurrency must not change it.
     for (i, _prompt) in prompts.iter().enumerate() {
         assert_eq!(
-            vmm.burst[i][0], vmm.serial[i][0],
-            "vmm: prompt {i} first token changed under concurrency — a lane's \
+            paged.burst[i][0], paged.serial[i][0],
+            "paged: prompt {i} first token changed under concurrency — a lane's \
              prefill saw another lane's KV"
         );
     }
     // Informational: how often the two storage routes agree lane-for-lane at
     // the same burst. Differing is allowed (row-count-dependent arithmetic).
     let cross: Vec<bool> = (0..prompts.len())
-        .map(|i| vmm.burst[i] == arena.burst[i])
+        .map(|i| paged.burst[i] == slab.burst[i])
         .collect();
 
     // Graph coverage: the flag is read once per process when the Gpu starts.
+    // The shared paged pool decodes eagerly by design (`forward_slots.rs`
+    // skips capture when `pool.is_paged()`), so only the slab route owes a
+    // capture/replay; the paged counters are printed below for information.
     if std::env::var("HIPFIRE_SLOTS_DECODE_GRAPH").as_deref() == Ok("1") {
         assert!(
-            vmm.stats.graph_replays > 0,
-            "HIPFIRE_SLOTS_DECODE_GRAPH=1 but the VMM route replayed no graph \
+            slab.stats.graph_replays > 0,
+            "HIPFIRE_SLOTS_DECODE_GRAPH=1 but the slab route replayed no graph \
              (captures {}, replays {})",
-            vmm.stats.graph_captures,
-            vmm.stats.graph_replays
-        );
-        assert!(
-            arena.stats.graph_replays > 0,
-            "HIPFIRE_SLOTS_DECODE_GRAPH=1 but the arena route replayed no graph"
+            slab.stats.graph_captures,
+            slab.stats.graph_replays
         );
     }
 
     // Optional JSON dump so two runs (graph off/on) can be diffed externally.
     if let Ok(path) = std::env::var("HIPFIRE_SLOTS_ORACLE_DUMP") {
         let dump = serde_json::json!({
-            "arena": { "serial": arena.serial, "burst": arena.burst },
-            "vmm": { "serial": vmm.serial, "burst": vmm.burst },
+            "slab": { "serial": slab.serial, "burst": slab.burst },
+            "paged": { "serial": paged.serial, "burst": paged.burst },
             "graph": {
-                "arena_captures": arena.stats.graph_captures,
-                "arena_replays": arena.stats.graph_replays,
-                "vmm_captures": vmm.stats.graph_captures,
-                "vmm_replays": vmm.stats.graph_replays,
+                "slab_captures": slab.stats.graph_captures,
+                "slab_replays": slab.stats.graph_replays,
+                "paged_captures": paged.stats.graph_captures,
+                "paged_replays": paged.stats.graph_replays,
             },
         });
         std::fs::write(&path, serde_json::to_vec(&dump).expect("serialize dump"))
@@ -291,12 +325,12 @@ fn main() {
         println!("dumped ids to {path}");
     }
     println!(
-        "arena: captures={} replays={} | vmm: captures={} replays={}",
-        arena.stats.graph_captures,
-        arena.stats.graph_replays,
-        vmm.stats.graph_captures,
-        vmm.stats.graph_replays
+        "slab: captures={} replays={} | paged: captures={} replays={}",
+        slab.stats.graph_captures,
+        slab.stats.graph_replays,
+        paged.stats.graph_captures,
+        paged.stats.graph_replays
     );
-    println!("vmm/arena burst lane match (informational): {cross:?}");
-    println!("PASS: vmm first-token isolation + composition determinism on both routes");
+    println!("paged/slab burst lane match (informational): {cross:?}");
+    println!("PASS: paged first-token isolation + composition determinism on both routes");
 }
