@@ -8065,9 +8065,19 @@ pub fn route_entries_sealed(
         return refuse("host-mapped experts have no closed route".into());
     }
     // `pm_decode` is a closed route axis (accepted twins replace their HIP
-    // entries below); every other flag must be the builtin default.
+    // entries below). Memory/host policy and MoE-router fields select no kernel
+    // of a closed route (HIPF-489), so they are exempt; every other flag must be
+    // the builtin default.
     let mut default_flags = default_feature_flags(input.arch)?;
     default_flags.pm_decode = input.flags.pm_decode;
+    default_flags.page_eviction = input.flags.page_eviction;
+    default_flags.widened_pbs_grow_only = input.flags.widened_pbs_grow_only;
+    default_flags.qwen4_expert_hotset_gfx1100 = input.flags.qwen4_expert_hotset_gfx1100;
+    default_flags.qwen4_d2_mixed_cpwait = input.flags.qwen4_d2_mixed_cpwait;
+    default_flags.qwen4_expert_hotset_census_reserve =
+        input.flags.qwen4_expert_hotset_census_reserve;
+    default_flags.qwen4_s1_tier = input.flags.qwen4_s1_tier;
+    default_flags.gfx1100_router_w64 = input.flags.gfx1100_router_w64;
     if format!("{:?}", input.flags) != format!("{default_flags:?}") {
         return refuse(format!("non-default feature flags on {}", input.arch));
     }
@@ -14874,6 +14884,16 @@ extern "C" __global__ void NAMED(int* p) {}
         for pm_decode in [false, true] {
             let mut flags = default_feature_flags("gfx1201").unwrap();
             flags.pm_decode = pm_decode;
+            // HIPF-489: memory/host policy and router knobs never unseal the route.
+            if pm_decode {
+                flags.page_eviction = Some(false);
+                flags.widened_pbs_grow_only = !flags.widened_pbs_grow_only;
+                flags.qwen4_expert_hotset_gfx1100 = Some(false);
+                flags.qwen4_d2_mixed_cpwait = Some(false);
+                flags.qwen4_expert_hotset_census_reserve = Some(false);
+                flags.qwen4_s1_tier = Some(false);
+                flags.gfx1100_router_w64 = crate::feature_flags::RouterW64Mode::Approx;
+            }
             let mut input = RouteKernelInput {
                 arch: "gfx1201",
                 model_arch: 5,
