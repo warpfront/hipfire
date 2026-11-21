@@ -268,40 +268,64 @@ impl GgufF32 {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
         let mut buf = [0u8; 4];
-        f.read_exact(&mut buf).map_err(|e| format!("read count: {e}"))?;
+        f.read_exact(&mut buf)
+            .map_err(|e| format!("read count: {e}"))?;
         let n = u32::from_le_bytes(buf);
         let mut index = HashMap::new();
         for _ in 0..n {
-            f.read_exact(&mut buf).map_err(|e| format!("read name len: {e}"))?;
+            f.read_exact(&mut buf)
+                .map_err(|e| format!("read name len: {e}"))?;
             let nl = u32::from_le_bytes(buf) as usize;
             let mut nb = vec![0u8; nl];
-            f.read_exact(&mut nb).map_err(|e| format!("read name: {e}"))?;
+            f.read_exact(&mut nb)
+                .map_err(|e| format!("read name: {e}"))?;
             let name = String::from_utf8(nb).map_err(|e| format!("name: {e}"))?;
-            f.read_exact(&mut buf).map_err(|e| format!("read ndim: {e}"))?;
+            f.read_exact(&mut buf)
+                .map_err(|e| format!("read ndim: {e}"))?;
             let nd = u32::from_le_bytes(buf) as usize;
             let mut db = vec![0u8; nd * 4];
-            f.read_exact(&mut db).map_err(|e| format!("read dims: {e}"))?;
-            let shape: Vec<usize> = db.chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]]) as usize).collect();
+            f.read_exact(&mut db)
+                .map_err(|e| format!("read dims: {e}"))?;
+            let shape: Vec<usize> = db
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+                .collect();
             let len: usize = shape.iter().product();
             let off = f.stream_position().map_err(|e| format!("pos: {e}"))?;
-            f.seek(SeekFrom::Current((len * 4) as i64)).map_err(|e| format!("seek: {e}"))?;
+            f.seek(SeekFrom::Current((len * 4) as i64))
+                .map_err(|e| format!("seek: {e}"))?;
             index.insert(name, (shape, off));
         }
-        Ok(Self { path: path.to_path_buf(), index, cache: std::cell::RefCell::new(HashMap::new()) })
+        Ok(Self {
+            path: path.to_path_buf(),
+            index,
+            cache: std::cell::RefCell::new(HashMap::new()),
+        })
     }
 
     fn read(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
         use std::io::{Read, Seek, SeekFrom};
-        let (shape, off) = self.index.get(name).cloned()
+        let (shape, off) = self
+            .index
+            .get(name)
+            .cloned()
             .ok_or_else(|| format!("gguf: missing {name}"))?;
         let len: usize = shape.iter().product();
         let mut f = std::fs::File::open(&self.path).map_err(|e| format!("open: {e}"))?;
-        f.seek(SeekFrom::Start(off)).map_err(|e| format!("seek: {e}"))?;
-        let mut fb = vec![0u8; len * 4];
-        f.read_exact(&mut fb).map_err(|e| format!("read {name}: {e}"))?;
-        let vals: Vec<f32> = fb.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+        f.seek(SeekFrom::Start(off))
+            .map_err(|e| format!("seek: {e}"))?;
+        // The .bin carries file-order dim labels but torch-order bytes; the
+        // torch view is flat.reshape(reversed(shape)). Store the reversed
+        // (torch-logical) shape so all downstream name handling is uniform.
+        let shape: Vec<usize> = shape.iter().rev().copied().collect();
+        // Read directly into f32 storage (avoids a second multi-GB byte buffer).
+        let mut vals = vec![0.0f32; len];
+        {
+            let bytes =
+                unsafe { std::slice::from_raw_parts_mut(vals.as_mut_ptr() as *mut u8, len * 4) };
+            f.read_exact(bytes)
+                .map_err(|e| format!("read {name}: {e}"))?;
+        }
         Ok((shape, vals))
     }
 }
@@ -310,16 +334,24 @@ impl WeightSource for GgufF32 {
     fn f32(&self, hfq: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
         // map HFQ (checkpoint) name -> GGUF name, with per-GGUF-name cache.
         let get = |n: &str| -> Result<(Vec<usize>, Vec<f32>), String> {
-            if let Some(v) = self.cache.borrow().get(n) { return Ok(v.clone()); }
+            if let Some(v) = self.cache.borrow().get(n) {
+                return Ok(v.clone());
+            }
             let v = self.read(n)?;
-            self.cache.borrow_mut().insert(n.to_string(), v.clone());
+            // Only cache small tensors (norms, convs, clips, controllers,
+            // small projections). Embed/head (~1.8 GB) and expert weights
+            // (~21 MB × hundreds) would exhaust RAM if cached.
+            if v.1.len() <= 4 * 1024 * 1024 {
+                self.cache.borrow_mut().insert(n.to_string(), v.clone());
+            }
             Ok(v)
         };
         if hfq == "model.llm.embed.weight" {
             return get("token_embd.weight");
         }
         if hfq == "model.llm.embed_norm.weight" {
-            return self.read("token_embd_norm.weight")
+            return self
+                .read("token_embd_norm.weight")
                 .or_else(|_| self.read("token_norm.weight"));
         }
         if hfq == "model.llm.norm.weight" {
@@ -341,45 +373,40 @@ impl WeightSource for GgufF32 {
                 let dot2 = e.find('.').ok_or("bad expert")?;
                 let ex: usize = e[..dot2].parse().map_err(|_| "bad expert idx")?;
                 if e.ends_with("gate_up_proj.weight") {
-                    // GGUF [2*inter, hidden, n_exp], expert on last axis.
+                    // dims reversed at read -> torch [E, 2*inter, hidden].
                     let (shape, v) = get(&format!("{b}ffn_gate_up_exps.weight"))?;
-                    let rows = shape[0];
-                    let cols = shape[1];
-                    let nexp = shape[2];
-                    let mut out = vec![0.0f32; rows * cols];
-                    for i in 0..rows { for j in 0..cols {
-                        out[i * cols + j] = v[(i * cols + j) * nexp + ex];
-                    }}
-                    return Ok((vec![rows, cols], out));
+                    let per = shape[1] * shape[2];
+                    let out = v[ex * per..(ex + 1) * per].to_vec();
+                    return Ok((vec![shape[1], shape[2]], out));
                 }
                 if e.ends_with("down_proj.weight") {
-                    // GGUF [inter, hidden, n_exp] expert-last -> transpose to
-                    // [hidden, inter] for the matvec.
+                    // torch [E, hidden, inter].
                     let (shape, v) = get(&format!("{b}ffn_down_exps.weight"))?;
-                    let inter = shape[0];
-                    let hidden = shape[1];
-                    let nexp = shape[2];
-                    let mut out = vec![0.0f32; hidden * inter];
-                    for i in 0..inter { for j in 0..hidden {
-                        out[j * inter + i] = v[(i * hidden + j) * nexp + ex];
-                    }}
-                    return Ok((vec![hidden, inter], out));
+                    let per = shape[1] * shape[2];
+                    let out = v[ex * per..(ex + 1) * per].to_vec();
+                    return Ok((vec![shape[1], shape[2]], out));
                 }
+            }
+            // rel bias table: GGUF torch view [n_extent, n_rel]; forward wants
+            // [n_rel, n_extent] (HFQ order) indexed [r * n_extent + d].
+            if suffix == "attn.rel_logits_proj.proj" {
+                let (shape, v) = get(&format!("{b}attn_rel_bias.weight"))?;
+                let (extent, nrel) = (shape[0], shape[1]);
+                let mut t = vec![0.0f32; nrel * extent];
+                for r in 0..nrel {
+                    for d2 in 0..extent {
+                        t[r * extent + d2] = v[d2 * nrel + r];
+                    }
+                }
+                return Ok((vec![nrel, extent], t));
             }
             // controllers.{attn,k,v,mlp}.{down,gain,forget}_weight
             // GGUF stores them transposed vs hipfire's control() convention.
             for (short, tag) in [("attn", "q"), ("k", "k"), ("v", "v"), ("mlp", "ffn")] {
                 for (kind, ktag) in [("down", "down"), ("gain", "gain"), ("forget", "forget")] {
                     if suffix == format!("controllers.{short}.{kind}_weight") {
-                        let gname = format!("{b}loop_{tag}_ctrl_{ktag}.weight");
-                        let (shape, v) = get(&gname)?;
-                        let rows = shape[0];
-                        let cols = shape[1];
-                        let mut t = vec![0.0f32; rows * cols];
-                        for i in 0..rows { for j in 0..cols {
-                            t[j * rows + i] = v[i * cols + j];
-                        }}
-                        return Ok((vec![cols, rows], t));
+                        // dims reversed at read -> torch order, no transpose.
+                        return get(&format!("{b}loop_{tag}_ctrl_{ktag}.weight"));
                     }
                 }
             }
@@ -436,31 +463,15 @@ impl WeightSource for GgufF32 {
             }
             return Ok((vec![24, e], if is_q { q_rows } else { kv_rows }));
         }
-        // global attn_res queries: GGUF stores [n_embd, rows] (ggml order),
-        // hipfire expects [rows, n_embd] — transpose.
+        // AttnRes queries: dims reversed at read -> torch [rows, n_embd] (or
+        // [n_embd] for single-row). GGUF query i lives on block i+1.
         if let Some(rest) = hfq.strip_prefix("model.llm.attn_res.attn_queries.") {
             let i: usize = rest.parse().map_err(|_| "bad query idx")?;
-            let (shape, v) = get(&format!("blk.{}.attn_res_query.weight", i + 1))?;
-            if shape.len() == 1 {
-                return Ok((vec![1, shape[0]], v));
-            }
-            let e = shape[0];
-            let rows = shape[1];
-            let mut t = vec![0.0f32; rows * e];
-            for r in 0..rows { for c in 0..e { t[r * e + c] = v[c * rows + r]; }}
-            return Ok((vec![rows, e], t));
+            return get(&format!("blk.{}.attn_res_query.weight", i + 1));
         }
         if let Some(rest) = hfq.strip_prefix("model.llm.attn_res.mlp_queries.") {
             let i: usize = rest.parse().map_err(|_| "bad query idx")?;
-            let (shape, v) = get(&format!("blk.{i}.ffn_res_query.weight"))?;
-            if shape.len() == 1 {
-                return Ok((vec![1, shape[0]], v));
-            }
-            let e = shape[0];
-            let rows = shape[1];
-            let mut t = vec![0.0f32; rows * e];
-            for r in 0..rows { for c in 0..e { t[r * e + c] = v[c * rows + r]; }}
-            return Ok((vec![rows, e], t));
+            return get(&format!("blk.{i}.ffn_res_query.weight"));
         }
         get(hfq)
     }
@@ -502,6 +513,29 @@ mod tests {
         "local_layer_ids":[0,1,2,3,4,6,7,8,9,10,12,13,14,15,16,18,19,20,21,22],
         "loop_config":{"core_start":6,"core_end":18,"num_passes":3,"gate_rank":64,"is_varloop":false}
     }}}"#;
+
+    #[test]
+    #[ignore = "requires the 14 GB artifact; verify embedded tokenizer"]
+    fn tokenizer_from_artifact() {
+        use hipfire_runtime::hfq::HfqFile;
+        let hfq = HfqFile::open(std::path::Path::new(
+            r"D:\hipfire-models\inkling2-mini-mq4.hfq",
+        ))
+        .expect("open");
+        let tok = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+            .expect("tokenizer from HFQ metadata");
+        let ids = tok.encode("The capital of France is");
+        eprintln!(
+            "tokenized {} -> {} ids: {:?}",
+            "The capital of France is",
+            ids.len(),
+            &ids[..ids.len().min(16)]
+        );
+        assert!(!ids.is_empty());
+        let roundtrip = tok.decode(&ids);
+        assert!(!roundtrip.is_empty());
+        eprintln!("roundtrip: {:?}", &roundtrip[..roundtrip.len().min(80)]);
+    }
 
     #[test]
     #[ignore = "print decoded qt44 stats to compare with GGUF"]

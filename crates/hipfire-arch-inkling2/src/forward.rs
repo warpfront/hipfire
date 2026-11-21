@@ -154,13 +154,13 @@ pub fn decode_layer(
     state.v_past = v_past;
 
     // Reshape to [n_head, d] and apply clips.
-    let qc = oracle::clip(&q, w.q_clip_scale.as_deref(), w.qk_clip);
-    let kc = oracle::clip(&k_conv, None, w.qk_clip);
+    let qc = oracle::clip(&q, w.q_clip_scale.as_deref(), w.qk_clip, w.head_dim);
+    let kc = oracle::clip(&k_conv, None, w.qk_clip, w.head_dim);
     // V uses unweighted RMSNorm per head.
     let vc: Vec<f32> = (0..nkv)
         .flat_map(|h| oracle::rmsnorm(&v_conv[h * d..(h + 1) * d], w.rms_eps))
         .collect();
-    let rc = oracle::clip(&r, w.rel_clip_scale.as_deref(), w.rel_clip);
+    let rc = oracle::clip(&r, w.rel_clip_scale.as_deref(), w.rel_clip, w.n_rel);
 
     // Relative bias: table [n_rel, n_extent] × per-head R, sink subtracted
     // before gather (llama.cpp order). Single-token: distance to every cached
@@ -176,12 +176,12 @@ pub fn decode_layer(
             - sinks[h];
         let qh = &qc[h * d..(h + 1) * d];
         let kh = if h < nkv {
-            &kc[(h % nkv) * d..(h % nkv + 1) * d]
+            &kc[(h / (nh / nkv)) * d..(h / (nh / nkv) + 1) * d]
         } else {
             &kc[0..d]
         };
         let vh = if h < nkv {
-            &vc[(h % nkv) * d..(h % nkv + 1) * d]
+            &vc[(h / (nh / nkv)) * d..(h / (nh / nkv) + 1) * d]
         } else {
             &vc[0..d]
         };
@@ -432,8 +432,9 @@ pub fn decode_visit<W: crate::weights::WeightSource>(
             .map(|x| x.1)
             .as_deref(),
         cfg.qk_clip,
+        d,
     );
-    let kc = oracle::clip(&k_conv, None, cfg.qk_clip);
+    let kc = oracle::clip(&k_conv, None, cfg.qk_clip, d);
     let vc: Vec<f32> = (0..nkv)
         .flat_map(|h| oracle::rmsnorm(&v_conv[h * d..(h + 1) * d], cfg.rms_norm_eps))
         .collect();
@@ -444,6 +445,7 @@ pub fn decode_visit<W: crate::weights::WeightSource>(
             .map(|x| x.1)
             .as_deref(),
         cfg.rel_clip,
+        cfg.n_rel,
     );
     if !swa {
         // full-layer tau multiplies Q (per-head below) and R.
@@ -469,8 +471,8 @@ pub fn decode_visit<W: crate::weights::WeightSource>(
                 *v *= t;
             }
         }
-        let kh = &kc[(h % nkv) * d..(h % nkv + 1) * d];
-        let vh = &vc[(h % nkv) * d..(h % nkv + 1) * d];
+        let kh = &kc[(h / (nh / nkv)) * d..(h / (nh / nkv) + 1) * d];
+        let vh = &vc[(h / (nh / nkv)) * d..(h / (nh / nkv) + 1) * d];
         let score: f32 =
             qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() / (d as f32).sqrt() + bias0;
         let wv = oracle::attention_softmax_with_sink(&[score], 0.0, vh, 1, d);
@@ -556,7 +558,10 @@ pub fn decode_visit<W: crate::weights::WeightSource>(
         cfg.conv_kernel,
     );
     state.ffn_out_past = fp;
-    Ok(ffn_in.iter().zip(&moe_conv).map(|(a, b)| a + b).collect())
+    // llama.cpp build_layer: `ffn_inp = cur` (post-attention stream), then
+    // `cur = MoE(mix(ffn_inp))`, `return cur + ffn_inp`. The residual base is
+    // the post-attention `cur`, NOT the mixed/controlled `ffn_in`.
+    Ok(cur.iter().zip(&moe_conv).map(|(a, b)| a + b).collect())
 }
 
 /// Compute logits from the final hidden state: LM head GEMV, fp32, final
@@ -586,6 +591,7 @@ pub fn forward_token<W: crate::weights::WeightSource>(
     cfg: &crate::config::Inkling2Config,
     token_embed: &[f32],
     pos: usize,
+    mut trace: Option<&mut Vec<Vec<f32>>>,
 ) -> Result<Vec<f32>, String> {
     // build_inputs: token embedding, RMSNormed (token path only).
     let tok_norm = w.f32("model.llm.embed_norm.weight")?.1;
@@ -612,6 +618,9 @@ pub fn forward_token<W: crate::weights::WeightSource>(
             None,
         )?;
         x = out;
+        if let Some(t) = trace.as_deref_mut() {
+            t.push(x.clone());
+        }
         visit += 1;
     }
     let prelude_x = x.clone();
@@ -668,6 +677,9 @@ pub fn forward_token<W: crate::weights::WeightSource>(
                 message.as_ref(),
             )?;
             x = out;
+            if let Some(t) = trace.as_deref_mut() {
+                t.push(x.clone());
+            }
             visit += 1;
         }
         prev_blocks = blocks.clone();
@@ -687,11 +699,21 @@ pub fn forward_token<W: crate::weights::WeightSource>(
             None,
         )?;
         x = out;
+        if let Some(t) = trace.as_deref_mut() {
+            t.push(x.clone());
+        }
         visit += 1;
     }
     debug_assert_eq!(visit, cfg.loop_cfg.n_slot());
+    let _ = &visit;
 
     // Final norm.
+    // build_output: mix the collected AttnRes blocks with the output query,
+    // then final RMSNorm. `blocks` still holds all visit block states.
+    if let Ok(out_q) = w.f32("model.llm.attn_res.output_query") {
+        let mixed = oracle::mix(&blocks, &x, &out_q.1, cfg.n_embd, 1);
+        x = mixed;
+    }
     let final_norm = w.f32("model.llm.norm.weight")?.1;
     Ok(rmsnorm_gain(&x, &final_norm, cfg.rms_norm_eps))
 }
@@ -958,7 +980,7 @@ mod tests {
         let w = Inkling2Weights::load(&hfq, &cfg).expect("load");
         let embed = w.f32("model.llm.embed.weight").unwrap().1;
         let x = embed[..cfg.n_embd].to_vec();
-        let out = forward_token(&w, &cfg, &x, 0).expect("forward token");
+        let out = forward_token(&w, &cfg, &x, 0, None).expect("forward token");
         assert_eq!(out.len(), cfg.n_embd);
         assert!(out.iter().all(|v| v.is_finite()), "non-finite model output");
         let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -978,7 +1000,7 @@ mod tests {
         let w = Inkling2Weights::load(&hfq, &cfg).expect("load");
         let embed = w.f32("model.llm.embed.weight").unwrap().1;
         let x = embed[..cfg.n_embd].to_vec();
-        let hidden = forward_token(&w, &cfg, &x, 0).expect("forward");
+        let hidden = forward_token(&w, &cfg, &x, 0, None).expect("forward");
         let logits = lm_head_logits(&w, &cfg, &hidden).expect("lm head");
         assert_eq!(logits.len(), cfg.unpadded_vocab_size);
         assert!(logits.iter().all(|v| v.is_finite()), "non-finite logits");
@@ -1007,7 +1029,7 @@ mod tests {
         let w = Inkling2Weights::load(&hfq, &cfg).expect("load");
         let embed = w.f32("model.llm.embed.weight").unwrap().1;
         let x = embed[..cfg.n_embd].to_vec();
-        let hidden = forward_token(&w, &cfg, &x, 0).expect("forward");
+        let hidden = forward_token(&w, &cfg, &x, 0, None).expect("forward");
         let logits = lm_head_logits(&w, &cfg, &hidden).expect("lm head");
         let mut s = String::new();
         for (i, v) in logits.iter().enumerate() {
@@ -1026,7 +1048,7 @@ mod tests {
             .expect("open gguf f32");
         let embed = w.f32("model.llm.embed.weight").unwrap().1;
         let x = embed[..cfg.n_embd].to_vec();
-        let hidden = forward_token(&w, &cfg, &x, 0).expect("forward");
+        let hidden = forward_token(&w, &cfg, &x, 0, None).expect("forward");
         let logits = lm_head_logits(&w, &cfg, &hidden).expect("lm head");
         let mut s = String::new();
         for (i, v) in logits.iter().enumerate() {
@@ -1039,6 +1061,26 @@ mod tests {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .unwrap();
         eprintln!("raw: dumped {} logits, argmax={argmax}", logits.len());
+    }
+
+    #[test]
+    #[ignore = "parity: dump per-visit hidden states on F32 weights"]
+    fn dump_visits_f32() {
+        use crate::weights::{GgufF32, WeightSource};
+        let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        let w = GgufF32::open(std::path::Path::new(r"D:\hipfire-models\gguf-f32.bin")).unwrap();
+        let embed = w.f32("model.llm.embed.weight").unwrap().1;
+        let x = embed[..cfg.n_embd].to_vec();
+        let mut trace = Vec::new();
+        let _ = forward_token(&w, &cfg, &x, 0, Some(&mut trace)).expect("forward");
+        let dir = std::path::Path::new(r"D:\hipfire-models\rust-visits-tok0");
+        std::fs::create_dir_all(dir).unwrap();
+        for (i, v) in trace.iter().enumerate() {
+            let mut s = String::new();
+            for x in v { s.push_str(&format!("{}\n", x.to_bits())); }
+            std::fs::write(dir.join(format!("visit{i:02}.txt")), s).unwrap();
+        }
+        eprintln!("dumped {} visits", trace.len());
     }
 
     fn oracle_close(a: f32, b: f32) -> bool {
