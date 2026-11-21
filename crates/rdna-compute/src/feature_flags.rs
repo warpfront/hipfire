@@ -589,7 +589,7 @@ pub struct FeatureFlags {
     /// sequential dense prefill route. Byte-exact vs the 3-launch sequence.
     pub gfx12_gdn_pre_fused: bool,
     /// fused chunked gated-delta-net prefill scan, WMMA-resident state (hipfire design; structure informed by public FLA/AITER chunk decomposition).
-    /// Enabled by default on gfx1100/gfx1151/gfx1201; `HIPFIRE_GFX12_GDN_CHUNK_SCAN=0` opts out.
+    /// Enabled on gfx1100/gfx1151/gfx1201.
     pub gfx12_gdn_chunk_scan: bool,
     /// gfx1201 down-proj SwiGLU/FWHT + int4 quant fusion (slice 1). On for
     /// exact gfx1201. Bit-identical vs the silu+quantizer chain.
@@ -1425,8 +1425,7 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_v2: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_V2")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_gdn_pre_fused: arch == "gfx1201",
-            gfx12_gdn_chunk_scan: parse_bool("HIPFIRE_GFX12_GDN_CHUNK_SCAN")
-                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")),
+            gfx12_gdn_chunk_scan: matches!(arch, "gfx1100" | "gfx1151" | "gfx1201"),
             gfx12_silu_quant_fused: arch == "gfx1201",
             gfx12_producer_quant_fused: arch == "gfx1201",
             g12_norm: arch == "gfx1201",

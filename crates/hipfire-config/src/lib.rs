@@ -2641,15 +2641,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx1201 MQ4v2 FP8 WMMA staged-tile v2 prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_V2=0 to opt out; selects the _v2_gfx1201 symbols at N>=256 with 128x128 geometry and 2 slabs unless HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM/_SLABS override, the four family flags remain prerequisites)."
     ),
     process_bool_field!(
-        "kernel.gfx12_gdn_chunk_scan",
-        "gfx12_gdn_chunk_scan",
-        Kernel,
-        true,
-        false,
-        "HIPFIRE_GFX12_GDN_CHUNK_SCAN",
-        "Enable the fused chunked gated-delta-net prefill scan on gfx1100/gfx1151/gfx1201 (default on; set to false or HIPFIRE_GFX12_GDN_CHUNK_SCAN=0 to opt out; exact-shape ordinary prefill only)."
-    ),
-    process_bool_field!(
         "kernel.g12_a4c2",
         "g12_a4c2",
         Kernel,
@@ -7262,6 +7253,14 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "the Qwen4 EP2 vocabulary-shard kill switch was removed (HIPF-396)",
         replacement: "none; EP2 over two gfx1201 cards always shards the LM head where admitted (bitwise the whole head)",
+    },
+    RetiredConfigKey {
+        key: "kernel.gfx12_gdn_chunk_scan",
+        legacy_key: "gfx12_gdn_chunk_scan",
+        shipped_in: "0.4.0",
+        removed_in: "0.5.0",
+        reason: "the fused GDN chunk-scan kill switch was removed (HIPF-489)",
+        replacement: "none; the arch default applies (on for gfx1100, gfx1151 and gfx1201)",
     },
 ];
 
