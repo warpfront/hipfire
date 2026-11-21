@@ -2859,6 +2859,15 @@ impl CodeObjectBytes {
         &whole[self.start..self.end]
     }
 
+    /// The bytes when they are a `'static` embedded image (never freed or
+    /// written, so its address names its contents); `None` for an owned image.
+    pub fn static_bytes(&self) -> Option<&'static [u8]> {
+        match self.backing {
+            CodeObjectBacking::Static(bytes) => Some(&bytes[self.start..self.end]),
+            CodeObjectBacking::Owned(_) => None,
+        }
+    }
+
     /// A view of `range` relative to this view's bytes, sharing the backing.
     pub fn subimage(&self, range: std::ops::Range<usize>) -> Result<Self, RuntimeError> {
         let len = self.end - self.start;
