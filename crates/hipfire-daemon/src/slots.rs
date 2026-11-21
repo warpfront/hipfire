@@ -1945,9 +1945,9 @@ impl SlotBackend {
         let _ =
             batch_mark_ready_with_pending(id, attempt_id, admission, ticket, pending_done.clone());
         // commit_ready is the staged done with only `type` changed.
-        pending_done["type"] = serde_json::Value::String("commit_ready".to_string());
-        let _ = writeln!(stdout, "{}", pending_done);
-        pending_done["type"] = serde_json::Value::String("done".to_string());
+        if let Some(ready) = hipfire_engine::terminal::commit_ready_envelope(&pending_done) {
+            let _ = writeln!(stdout, "{}", ready);
+        }
         let _ = stdout.flush();
 
         let decision =

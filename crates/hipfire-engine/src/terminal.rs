@@ -1403,15 +1403,9 @@ pub fn await_client_terminal_commit(
     }
     // Abort may already be latched before ready — still emit commit_ready so
     // the engine observes the handshake edge, then wait returns Abort.
-    let mut envelope = pending_done.clone();
-    if let Some(obj) = envelope.as_object_mut() {
-        obj.insert(
-            "type".to_string(),
-            serde_json::Value::String("commit_ready".to_string()),
-        );
-    } else {
+    let Some(envelope) = commit_ready_envelope(pending_done) else {
         return ClientTerminalDecision::Abort;
-    }
+    };
     if writeln!(stdout, "{}", envelope).is_err() {
         return ClientTerminalDecision::Abort;
     }
@@ -1471,8 +1465,36 @@ pub fn emit_staged_terminal_done_outcome(
             claimed = true;
         }
     }
+    let stamped;
+    let pending_done = match pending_done.as_object() {
+        Some(obj) if !obj.contains_key("loop") => {
+            let mut obj = obj.clone();
+            stamp_legacy_loop(&mut obj);
+            stamped = serde_json::Value::Object(obj);
+            &stamped
+        }
+        _ => pending_done,
+    };
     let delivered = writeln!(stdout, "{}", pending_done).is_ok() && stdout.flush().is_ok();
     TerminalEmitOutcome::new(claimed, delivered)
+}
+
+/// G12: every staged terminal names the loop that produced it. The engine
+/// loop stages its own `"loop": "engine"`, so a missing field is a legacy
+/// loop. Applied to `commit_ready` and `done` alike, so the client sees the
+/// same payload in both.
+fn stamp_legacy_loop(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    obj.entry("loop").or_insert_with(|| "legacy".into());
+}
+
+/// The `commit_ready` of a staged `done`: the same payload (the `loop` stamp
+/// included, as its `done` will carry it) with only `type` changed. `None`
+/// for a payload that is not an object.
+pub fn commit_ready_envelope(pending_done: &serde_json::Value) -> Option<serde_json::Value> {
+    let mut obj = pending_done.as_object()?.clone();
+    stamp_legacy_loop(&mut obj);
+    obj.insert("type".into(), "commit_ready".into());
+    Some(serde_json::Value::Object(obj))
 }
 
 /// Force-answer target request ID, set by the stdin-reader thread on

@@ -1337,7 +1337,7 @@ fn emit_route_terminal(
     id: &str,
     _attempt: u64,
     event: RouteTerminalEvent<'_>,
-    route_name: &'static str,
+    route: GenerationRoute,
 ) -> TerminalEmitOutcome {
     let mut buffer = Vec::new();
     let staged = match event {
@@ -1364,7 +1364,7 @@ fn emit_route_terminal(
             let message = match message {
                 Some(message) => message,
                 None => {
-                    fallback = format!("{route_name} terminal error");
+                    fallback = format!("{} terminal error", route.name());
                     &fallback
                 }
             };
@@ -1378,7 +1378,12 @@ fn emit_route_terminal(
             )
         }
         RouteTerminalEvent::Cancel { completion_tokens } => {
-            emit_qwen_ar_cancelled_outcome(&mut buffer, id, completion_tokens)
+            let loop_name = if crate::engine::runs_on_engine(route) {
+                "engine"
+            } else {
+                "legacy"
+            };
+            emit_qwen_ar_cancelled_outcome(&mut buffer, id, completion_tokens, loop_name)
         }
     };
     if !staged.delivered() {
@@ -1414,7 +1419,7 @@ macro_rules! define_route_terminal {
             attempt: u64,
             event: RouteTerminalEvent<'_>,
         ) -> TerminalEmitOutcome {
-            emit_route_terminal(output, id, attempt, event, $route.name())
+            emit_route_terminal(output, id, attempt, event, $route)
         }
     };
 }

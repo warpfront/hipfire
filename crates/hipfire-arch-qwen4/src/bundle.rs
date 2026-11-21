@@ -58,6 +58,8 @@ mod pp;
 use hipfire_runtime::multi_gpu::executor::MeshRoute;
 use pp::{Qwen4PpBandMeta, Qwen4PpMesh};
 pub use pp::{Qwen4PpLaneExecutor, Qwen4PpWindow};
+#[path = "bundle/mesh_family.rs"]
+mod mesh_family;
 
 mod image_context;
 use image_context::ImageContext;
@@ -182,6 +184,9 @@ pub struct Qwen4Bundle {
     /// the published bundle so unload owns the scratch, expert pointer tables,
     /// and all per-layer dispatch state exactly once.
     pub(crate) execution: Option<Qwen4GpuForward>,
+    /// The layout `MeshFamily::prepare_epoch` settled for the epoch the next
+    /// `with_bindings` binds (engine loop, one-owner mesh).
+    pub(crate) mesh_epoch_layout: Option<crate::gpu_forward::Qwen4MeshLayout>,
     /// Admitted decode-cache policy. The forward owns mutable residency and DMA.
     pub(crate) expert_cache: Option<crate::expert_cache_config::ExpertCacheLoad>,
     /// Reusable native MTP execution resources, attached only when the
@@ -993,6 +998,7 @@ impl Qwen4Bundle {
             ple,
             weight_store: AttachedWeightStore::new(transaction),
             execution: None,
+            mesh_epoch_layout: None,
             expert_cache: None,
             mtp: None,
             spec_logits: None,
@@ -6630,6 +6636,14 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
             remaining_new_tokens,
             max_draft_rows,
         );
+    }
+
+    /// The Single load (no PP holder, no EP rank) is a one-owner mesh family.
+    fn mesh_family(&mut self) -> Option<&mut dyn hipfire_runtime::mesh_family::MeshFamily> {
+        if self.pp.is_some() || self.ep.is_some() {
+            return None;
+        }
+        Some(self)
     }
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {

@@ -1194,6 +1194,9 @@ pub struct LoadedModel {
     pub arch_id: u32,
     pub pp: usize,
     pub pp_gpus: Option<Gpus>,
+    /// The engine loop's execution state for this load (G12): split plans and
+    /// epoch identity on the load's mesh. Created by the first engine request.
+    pub engine: Option<hipfire_runtime::mesh_family::MeshRunner>,
     pub pp_dn_la_to_device: Option<Vec<u8>>,
     pub ep: Option<EpState>,
     // Shared arch state — every arch lives here as `Box<dyn ArchModel>`.
@@ -1304,6 +1307,7 @@ impl LoadedModel {
             pp: 1,
             ep: None,
             pp_gpus: None,
+            engine: None,
             pp_dn_la_to_device: None,
             state: None,
             deepseek4_eos_tok: 0,

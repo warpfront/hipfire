@@ -2448,6 +2448,12 @@ impl Gpus {
         self.mesh_execution.output_owner
     }
 
+    /// Whether the mesh is provisioned and neither poisoned nor quarantined.
+    pub fn mesh_healthy(&self) -> bool {
+        let state = &self.mesh_execution;
+        state.mesh_epoch.is_some() && !state.poisoned && !state.quarantined
+    }
+
     pub fn mesh_edge_epoch(&self, edge: EdgeId) -> Option<u64> {
         self.mesh_execution
             .edges

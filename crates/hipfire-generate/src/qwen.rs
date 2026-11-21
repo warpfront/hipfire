@@ -11453,7 +11453,7 @@ pub fn generate_qwen4_ar(
     min_tokens: usize,
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
-    _request_seed: u32,
+    request_seed: u32,
 ) {
     let route = crate::ar::GenerationRoute::Qwen4Ar;
     let Some((vocab_size, eos_token)) = m
@@ -11514,6 +11514,48 @@ pub fn generate_qwen4_ar(
             false,
         );
         return;
+    }
+    // G12: an allowlisted route runs on the engine loop when the model and
+    // its devices admit it; a decline (nothing emitted) keeps the loop below.
+    if crate::engine::runs_on_engine(route) {
+        let protocol = crate::engine::chatml::ChatMl {
+            started_in_think,
+            tools: tools.is_some(),
+            stop,
+            min_tokens,
+            max_think_tokens,
+            eos: vec![eos_token],
+        };
+        let request = crate::engine::run::Request {
+            sampler: hipfire_runtime::sampler::SamplerConfig {
+                temperature: temp,
+                top_p,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
+                blocked_tokens: Vec::new(),
+                top_k,
+                min_p,
+            },
+            max_tokens,
+            seed: request_seed,
+        };
+        match crate::engine::run::run(
+            m,
+            gpu,
+            stdout,
+            id,
+            route,
+            &prompt_tokens,
+            &protocol,
+            request,
+        ) {
+            crate::engine::run::Outcome::Served => return,
+            crate::engine::run::Outcome::Declined(reason) => {
+                eprintln!("[engine] {} declined, legacy loop: {reason}", route.name());
+            }
+        }
     }
     let max_tokens = crate::common::fit_max_tokens(max_tokens, prompt_tokens.len() + 1, m.max_seq);
     let required = prompt_tokens

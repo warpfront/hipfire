@@ -59,6 +59,10 @@ pub mod dense;
 /// `generate_ar_with_forward` wiring for `GenerationRoute::RaonAr`.
 pub mod raon;
 
+/// G12 PoC engine loop behind `generation.engine_loop`: one request state
+/// machine and batch-of-one driver over the mesh executor.
+pub mod engine;
+
 /// Image generation: the `img_generate` wire body (FLUX.1/FLUX.2),
 /// including reference-image decode and the GPU/CPU denoise split.
 pub mod img;

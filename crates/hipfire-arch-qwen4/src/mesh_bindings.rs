@@ -189,6 +189,8 @@ pub struct Qwen4MeshBindings<'a> {
     edge_epochs: Vec<u64>,
     head: Option<Qwen4MeshHead<'a>>,
     wide: Option<&'a GpuTensor>,
+    /// The Decode token is the device argmax of this row (one-owner mesh).
+    argmax_of: Option<&'a GpuTensor>,
     prepared: Option<ForwardEpoch>,
     ran: [bool; 8],
     layouts: [Option<Qwen4MeshLayout>; 8],
@@ -220,8 +222,8 @@ fn validate_scopes<'s>(
         }
         end = scope.band.end;
     }
-    if !(2..=8).contains(&count) {
-        return Err("Qwen4 topology.pp requires 2..=8 bands".into());
+    if !(1..=8).contains(&count) {
+        return Err("a Qwen4 mesh has 1..=8 bands".into());
     }
     if end != config.num_hidden_layers {
         return Err("Qwen4 rank bands do not cover the trunk".into());
@@ -272,6 +274,7 @@ impl<'a> Qwen4MeshBindings<'a> {
             edge_epochs: Vec::new(),
             head: None,
             wide: None,
+            argmax_of: None,
             prepared: None,
             ran: [false; 8],
             layouts: [None; 8],
@@ -313,6 +316,13 @@ impl<'a> Qwen4MeshBindings<'a> {
     /// output band writes it. `None` captures nothing.
     pub fn set_wide_capture(&mut self, wide: Option<&'a GpuTensor>) {
         self.wide = wide;
+        self.prepared = None;
+    }
+
+    /// `Some(row)`: the epoch's one Decode token is the device argmax of
+    /// `row` as the previous epoch left it (the tokens hold a placeholder).
+    pub fn set_device_token(&mut self, argmax_of: Option<&'a GpuTensor>) {
+        self.argmax_of = argmax_of;
         self.prepared = None;
     }
 
@@ -421,7 +431,7 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
             }
             if rank.bundle.state.position != epoch.start_position
                 || end > rank.bundle.state.max_seq_len
-                || epoch.actual_rows > rank.forward.scratch.max_chunk
+                || epoch.actual_rows > rank.forward.mesh_rows_limit(epoch.route)
             {
                 return Err("Qwen4 mesh rank position or capacity disagrees with epoch".into());
             }
@@ -531,10 +541,11 @@ impl MeshStepBindings for Qwen4MeshBindings<'_> {
         // Only the output band owns the final pre-collapse streams.
         let wide = if output { self.wide } else { None };
         rank.forward
-            .forward_mesh_chunk(
+            .forward_mesh_chunk_from(
                 rank.bundle,
                 gpu,
                 self.tokens,
+                self.argmax_of,
                 epoch.route_rows,
                 epoch.route,
                 head,
@@ -937,7 +948,8 @@ mod tests {
     #[test]
     fn mesh_scope_tiles_and_pins() {
         let config = crate::config::compact_test_config();
-        for counts in [&[24, 24][..], &[9, 8, 8, 8, 8, 7][..]] {
+        // One band is the one-owner mesh of a Single load.
+        for counts in [&[48][..], &[24, 24][..], &[9, 8, 8, 8, 8, 7][..]] {
             assert!(validate_scopes(&config, &scopes(counts)).is_ok());
         }
         let mut bands = scopes(&[24, 24]);
@@ -952,7 +964,7 @@ mod tests {
         let bands = scopes(&[1, 47]);
         assert!(validate_scopes(&config, &bands).is_err());
         assert!(validate_scopes(&config, &scopes(&[24, 23])).is_err());
-        assert!(validate_scopes(&config, &scopes(&[48])).is_err());
+        assert!(validate_scopes(&config, &scopes(&[6, 6, 6, 6, 6, 6, 4, 4, 4])).is_err());
     }
 }
 

@@ -237,6 +237,13 @@ pub trait ArchModel: Send + std::any::Any {
         self.free_gpu(gpu);
         Ok(())
     }
+
+    /// The model's engine-loop family contract ([`crate::mesh_family`]):
+    /// its step program, bindings, prompt schedule and session adapter.
+    /// `None` (the default) keeps the model on its own generation loop.
+    fn mesh_family(&mut self) -> Option<&mut dyn crate::mesh_family::MeshFamily> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -1526,8 +1526,7 @@ fn finish_lane(
         ));
     }
     release(model, ctl)?;
-    let mut ready = done.clone();
-    ready["type"] = serde_json::json!("commit_ready");
+    let ready = commit_ready_envelope(&done).ok_or("qwen4 staged done is not an object")?;
     if !sched.mark_awaiting_commit(idx, done) {
         return Err("qwen4 mark_awaiting_commit failed".into());
     }

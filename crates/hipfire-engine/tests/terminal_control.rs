@@ -198,10 +198,13 @@ fn matching_ready_commit_succeeds() {
     assert_eq!(v["attempt_id"], 8);
     assert_eq!(v["finish_reason"], "stop");
     assert_eq!(v["tokens"], 3);
-    // commit_ready is pending_done with only type changed.
+    // commit_ready is the payload the done carries, with only type changed:
+    // a loop-less staged done is a legacy loop on both.
     let mut as_done = v.clone();
     as_done["type"] = serde_json::json!("done");
-    assert_eq!(as_done, pending);
+    let mut expected = pending.clone();
+    expected["loop"] = serde_json::json!("legacy");
+    assert_eq!(as_done, expected);
     reset();
 }
 
@@ -876,6 +879,10 @@ fn abort_helper_emits_exactly_one_correlated_aborted_terminal() {
         events[1].get("finish_reason").and_then(|v| v.as_str()),
         Some("aborted"),
         "never a success done on abort, got: {text}"
+    );
+    assert_eq!(
+        events[1]["loop"], "legacy",
+        "G12: every done names its loop"
     );
     assert_eq!(
         events[1].get("id").and_then(|v| v.as_str()),

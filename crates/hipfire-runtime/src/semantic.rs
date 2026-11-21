@@ -440,7 +440,8 @@ pub fn wire_aborted(id: &str, reason: &str, attempt_id: u64) -> serde_json::Valu
 /// Build a correlated `done` envelope with `finish_reason: "aborted"`.
 ///
 /// Field set matches the Qwen AR cancellation writer (prompt/decode timings
-/// zeroed; completion_tokens carries tokens generated before cancel).
+/// zeroed; completion_tokens carries tokens generated before cancel). G12:
+/// `loop` is `legacy`; the engine loop's cancel writer overrides it.
 pub fn wire_aborted_done(id: &str, completion_tokens: usize, attempt_id: u64) -> serde_json::Value {
     serde_json::json!({
         "type": "done",
@@ -451,6 +452,7 @@ pub fn wire_aborted_done(id: &str, completion_tokens: usize, attempt_id: u64) ->
         "prefill_ms": 0,
         "decode_ms": 0,
         "attempt_id": attempt_id,
+        "loop": "legacy",
     })
 }
 
