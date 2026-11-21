@@ -1,0 +1,14 @@
+[package]
+name = "hipfire-arch-inkling2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Inkling-2-Mini looped MoE architecture: Phase-0 visit schedule and CPU oracle"
+
+[dependencies]
+serde_json.workspace = true
+safetensors.workspace = true
+memmap2.workspace = true
+half = "2"
+hipfire-runtime = { path = "../hipfire-runtime" }
+rdna-compute = { path = "../rdna-compute" }

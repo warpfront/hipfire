@@ -125,6 +125,14 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     // contain `raon1_mini`, so the class alias is its own key.
     ("raon1_mini", 19),
     ("raon1miniforcausallm", 19),
+    // arch 24 — Inkling-2-Mini looped MoE (provisional id; nothing ships yet).
+    // The class-name key is needed for `derive_arch_id`'s architectures loop
+    // (longest substring wins), the `model_type` keys for safetensors probing.
+    ("inkling2loopforconditionalgeneration", 24),
+    ("inkling2_loop", 24),
+    ("inkling2_loop_text", 24),
+    ("inkling2", 24),
+    ("inkling2_text", 24),
 ];
 /// Reserved source classifications with no executable carrier or reset owner.
 /// These strings remain accepted by [`lookup_model_type`] so packers and

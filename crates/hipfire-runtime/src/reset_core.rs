@@ -246,6 +246,19 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
             reason: "raon1_mini GPU fault parity pending",
         },
     };
+    const INKLING2: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "inkling2",
+        recurrent_or_conv: true,
+        s_ef_residual: true,
+        kv_or_aux_caches: true,
+        graphs: false,
+        drafter: false,
+        adaptive: false,
+        host_position_and_conversation: true,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason: "inkling2 skeleton has no generate route yet",
+        },
+    };
     // Qwen3.5 multi-vector embedding encoder (arch 17): one-shot requests,
     // no KV cache / graphs / drafter state; the GDN scratch resets before
     // every encode, so there is no cross-request state to recover.
@@ -318,6 +331,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         MUSE_GLIMMER,
         MAPLE,
         RAON1_MINI,
+        INKLING2,
         QWEN35_EMBED,
         EMBEDDING_GEMMA2,
         FLUX,
@@ -618,6 +632,7 @@ mod tests {
                 14 => Some("muse_glimmer"),
                 15 => Some("maple"),
                 19 => Some("raon1_mini"),
+                24 => Some("inkling2"),
                 17 => Some("qwen35-embed"),
                 18 => Some("embeddinggemma2"),
                 40 => Some("flux"),

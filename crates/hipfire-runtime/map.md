@@ -3276,6 +3276,7 @@ Workspace crates with a path dependency on this crate:
 - `hipfire-arch-dots-ocr`
 - `hipfire-arch-embeddinggemma2`
 - `hipfire-arch-gemma4`
+- `hipfire-arch-inkling2`
 - `hipfire-arch-lfm2-vl`
 - `hipfire-arch-lfm2moe`
 - `hipfire-arch-llama`

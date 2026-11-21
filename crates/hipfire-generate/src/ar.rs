@@ -2650,6 +2650,17 @@ pub fn generate(
     // prefills and decodes under it, and it drops on every return, error and
     // unwind, so a caller outside the daemon is covered too.
     let _ple_serving = m.ple_serving_guard();
+    // Inkling-2-Mini (arch 24) has a loader/bundle but no generate route yet.
+    // Fail closed with a clean correlated error instead of falling through to
+    // the LLaMA downcast (which would panic).
+    if m.arch_id == 24 {
+        write_error(
+            stdout,
+            id,
+            "inkling2: generation is not implemented yet (loader-only skeleton)",
+        );
+        return;
+    }
     // ── Producer-route authority (Task 6) ──────────────────────────────
     // Resolve the selected generation route BEFORE sampler RNG reset and
     // every stateful branch. Non-empty tools are denied for unsafe routes

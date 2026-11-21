@@ -40,6 +40,23 @@ pub(crate) fn should_quantize(name: &str) -> bool {
     name.contains("weight")
 }
 
+/// Inkling-2 small tensors the merged llama.cpp converter forces to F32:
+/// controllers, attention-residual queries, relative bias, clips, conv weights
+/// and every scale. Re-quantizing these to HFQ4G128 loses more than it saves.
+pub(crate) fn is_inkling2_keep_f16(name: &str) -> bool {
+    if !name.starts_with("model.llm.") {
+        return false;
+    }
+    name.contains(".controllers.")
+        || name.contains("res_query")
+        || name.contains("attn_rel_bias")
+        || name.contains(".q_l2_clip.")
+        || name.contains(".rel_l2_clip.")
+        || name.contains(".attn_sink_proj.")
+        || name.contains("conv")
+        || name.contains("scale")
+}
+
 pub(crate) fn is_deepseek4_keep_f16(name: &str) -> bool {
     name.ends_with(".compressor.wkv.weight")
         || name.ends_with(".compressor.wgate.weight")

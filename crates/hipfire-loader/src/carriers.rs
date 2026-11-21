@@ -10,6 +10,7 @@ use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
     SRC_DIR_JINJA, SRC_DIR_TOKENIZER_CONFIG,
 };
+use hipfire_arch_inkling2;
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::HfqModelSource;
@@ -13126,6 +13127,53 @@ impl Carrier for MinimaxCarrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_minimax::load_minimax_bundle(src, ctx)?;
+        let speculator =
+            crate::spec_build::build_speculator(meta.arch_id, None, None, ctx.max_seq, ctx.spec);
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+                meta.chat_template_source,
+            )
+        })
+    }
+}
+
+// ─── Inkling2Carrier ─────────────────────────────────────────────────
+
+pub struct Inkling2Carrier;
+impl Carrier for Inkling2Carrier {
+    fn name(&self) -> &'static str {
+        "inkling2"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == hipfire_arch_inkling2::ARCH_ID
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        // Text-only skeleton: default IS the declaration.
+        saddle_core::caps::ArchCaps::default()
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(1.0, 1.0, 1.0)
+    }
+    // No topology_caps / spec overrides: multi-card and spec decode refuse.
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err(crate::pp_unsupported_message(
+                "inkling2",
+                matches!(src, ModelSource::Dir(_)),
+                ctx.pp,
+            ));
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_inkling2::load_inkling2_bundle(src, ctx)?;
         let speculator =
             crate::spec_build::build_speculator(meta.arch_id, None, None, ctx.max_seq, ctx.spec);
         Ok(LoadedModel {
