@@ -10,6 +10,7 @@ use gemma4::emit::{GemmaEmit, GemmaThoughtRouter};
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_gemma4 as gemma4;
+use hipfire_arch_inkling2 as inkling2;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
@@ -19,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use hipfire_loader::{AsstTurnCache, LoadedModel};
+use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::prompt_frame::{AssistantPrefix, ThinkMode};
 use std::io::Write;
 use std::time::Instant;
@@ -6598,6 +6600,350 @@ pub fn generate_lfm2moe(
     hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, &tool_calls);
     // Legacy contract surfaces calls ONLY from a `{"type":"tool_calls"}`
     // event read BEFORE the commit_ready terminal — precede the handshake.
+    hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
+    let _ = stdout.flush();
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
+    }
+}
+
+/// Inkling-2-Mini (arch_id=24) generate path — plain GPU AR.
+///
+/// Stateless like `generate_maple`: every turn cold-resets the GPU session
+/// state and re-prefills the full rendered prompt from position 0 through
+/// `forward_token_gpu` (one token in, logits out), then decodes token by
+/// token with the request's full sampler contract
+/// (`sampler::sample_cpu`: temp 0 reduces to argmax, matching 04's
+/// `generate_cpu`). No spec, no batch, no tools/stop router on this route
+/// (refused upstream by the capability gates); the model's thinking markers
+/// stream as ordinary text. Prefill loops one token at a time — the GPU
+/// forward only does single-token steps, no prefill kernel exists here.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_inkling(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    request_seed: u32,
+) {
+    if m.tokenizer.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tokenizer not loaded",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    if m.inkling2().is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "inkling2 state missing on arch_id=24 generate",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Prompt build (same two-path branch as the lfm2moe AR path): the model
+    // carries an embedded chat template (brief 07 serves with it), so render
+    // through `JinjaChatFrame`; fall back to raw encode when absent.
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let try_jinja = m.chat_template.is_some();
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+                reasoning_strength: None,
+                reasoning_effort: None,
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                    match messages_history {
+                        Some(h) => h,
+                        None => {
+                            let mut v = Vec::new();
+                            if let Some(sys) = system_prompt {
+                                v.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: sys.to_string(),
+                                    reasoning_content: None,
+                                    name: None,
+                                    rendered_name: None,
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                    tool_plan: String::new(),
+                                });
+                            }
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                            synthesized = v;
+                            &synthesized
+                        }
+                    };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!("[daemon] jinja render failed in inkling2 path ({e}) — falling back to raw encode");
+                    tokenizer.encode(prompt)
+                }
+            }
+        } else {
+            tokenizer.encode(prompt)
+        }
+    };
+
+    if prompt_ids.is_empty() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "empty prompt after tokenize",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let eos_tok = m.inkling2().unwrap().eos_tok;
+    // KV row budget lives in the GPU session state (sized from `max_seq` at
+    // load); overflow fails closed inside `forward_token_gpu` (no SWA
+    // eviction), so guard the whole run up front like the lfm2moe path.
+    let cap = m
+        .inkling2()
+        .unwrap()
+        .gpu_state
+        .as_ref()
+        .map(|s| s.max_seq)
+        .unwrap_or(m.max_seq);
+    let max_tokens = fit_max_tokens(max_tokens, prompt_ids.len(), cap);
+    if prompt_ids.len().saturating_add(max_tokens) > cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, cap),
+            "context_length",
+            false,
+            false
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::InklingAr),
+        stdout,
+        id,
+        false,
+    );
+
+    // Stateless turn: cold-reset the GPU session (conv states, KV cursors,
+    // `seq_pos`) and re-prefill the full prompt from position 0, so
+    // sequential bench requests on one loaded model stay independent.
+    // Post-gen_start failure: fail closed (rollback + one correlated error).
+    if let Err(e) = m.inkling2_mut().unwrap().reset_session_state(gpu) {
+        dense_fail_closed_error(
+            m,
+            gpu,
+            stdout,
+            id,
+            &format!("inkling2 turn reset failed: {e}"),
+        );
+        return;
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
+    let t0 = Instant::now();
+
+    // Prefill: one `forward_token_gpu` step per prompt token (the GPU forward
+    // only does single-token steps). Abort is checked before each token so a
+    // client cancel during a long prompt does not run the full prefill.
+    let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
+    let mut prefill_fail: Option<String> = None;
+    for (i, &tok) in prompt_ids.iter().enumerate() {
+        if check_abort(id) {
+            prefill_aborted = true;
+            break;
+        }
+        let step = {
+            let b = m.inkling2_mut().unwrap();
+            inkling2::forward_token_gpu(b, gpu, tok, i)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                prefill_fail = Some(format!("inkling2 prefill failed: {e}"));
+                break;
+            }
+        }
+    }
+    if let Some(msg) = prefill_fail {
+        dense_fail_closed_error(m, gpu, stdout, id, &msg);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // Decode loop. Sample host-side from the running logits vector with the
+    // request's full sampler contract (temp 0 = greedy argmax, matching the
+    // CPU reference; penalties over the conversation). Abort is checked at
+    // the top of every iteration like the lfm2moe path.
+    hipfire_runtime::llama::reset_cpu_sampler_rng(request_seed);
+    let sampler_cfg = hipfire_runtime::sampler::SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        blocked_tokens: Vec::new(),
+        top_k,
+        min_p,
+    };
+    let mut sample_logits: Vec<f32> = Vec::with_capacity(last_logits.len());
+    let mut hit_eos = false;
+    let mut generated_count: usize = 0;
+    let prompt_len = prompt_ids.len();
+    let decode_t0 = Instant::now();
+    let mut text_stream = TokenTextStream::new();
+    loop {
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+        if generated_count >= max_tokens {
+            break;
+        }
+        sample_logits.clear();
+        sample_logits.extend_from_slice(&last_logits);
+        let next_tok = hipfire_runtime::sampler::sample_cpu(
+            &mut sample_logits,
+            &m.conversation_tokens,
+            &sampler_cfg,
+        );
+        if next_tok == eos_tok {
+            hit_eos = true;
+            break;
+        }
+
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+
+        let step = {
+            let b = m.inkling2_mut().unwrap();
+            inkling2::forward_token_gpu(b, gpu, next_tok, prompt_len + generated_count - 1)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                dense_fail_closed_error(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("inkling2 decode failed: {e}"),
+                );
+                return;
+            }
+        }
+    }
+    emit_dense_token_text(stdout, id, &text_stream.flush());
+
+    if check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        return;
+    }
+
+    m.seq_pos = prompt_len + generated_count;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let finish_reason = if hit_eos { "stop" } else { "length" };
+    let mut pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 100.0).round() / 100.0,
+        "prefill_ms": prefill_ms,
+        "decode_ms": decode_ms as f64,
+        "total_ms": total_ms,
+        "finish_reason": finish_reason,
+        "attempt_id": active_attempt_id(),
+    });
+    // No tool calls on this route; the empty stage keeps the terminal shape
+    // identical to every other legacy-contract producer.
+    let tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+    hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, &tool_calls);
     hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
     let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {

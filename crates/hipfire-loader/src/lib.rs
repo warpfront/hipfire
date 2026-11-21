@@ -461,6 +461,7 @@ pub enum BenchDecodeRoute {
     MuseGlimmer,
     Qwen4,
     Raon,
+    Inkling,
     Unsupported,
 }
 pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
@@ -472,7 +473,7 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
         14 => BenchDecodeRoute::MuseGlimmer,
         16 => BenchDecodeRoute::Qwen4,
         19 => BenchDecodeRoute::Raon,
-        24 => BenchDecodeRoute::Unsupported,
+        24 => BenchDecodeRoute::Inkling,
         _ => BenchDecodeRoute::Unsupported,
     }
 }

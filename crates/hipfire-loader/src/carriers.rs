@@ -13165,6 +13165,41 @@ impl Carrier for Inkling2Carrier {
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
         saddle_core::sampling::SamplingDefaults::new(1.0, 1.0, 1.0)
     }
+    fn admit_options(
+        &self,
+        draft_path: Option<&str>,
+        options: crate::admission::SourceAdmissionOptions,
+    ) -> Result<(), String> {
+        // Single-GPU AR only: any spec ask, adaptive KV, or foreign drafter
+        // must refuse here — without this, `--spec mtp` would silently run
+        // AR (the default `admit_options` returns `Ok`).
+        let spec = options.spec;
+        let unsupported = [
+            (
+                draft_path.is_some(),
+                "draft model (draft_path; inkling2 has no speculator)",
+            ),
+            (spec.dflash == Some(true), "DFlash (speculation.dflash)"),
+            (spec.mtp == Some(true), "native MTP (speculation.mtp)"),
+            (spec.dspark == Some(true), "DSpark (speculation.dspark)"),
+            (
+                spec.ngram_draft == Some(true),
+                "n-gram draft (speculation.ngram_draft)",
+            ),
+            (options.kv_adaptive, "adaptive KV"),
+            (options.eagle_drafter, "EAGLE drafter"),
+        ]
+        .into_iter()
+        .filter_map(|(set, name)| set.then_some(name))
+        .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            return Err(format!(
+                "inkling2: unsupported option(s): {}; turn them off to load Inkling-2-Mini",
+                unsupported.join(", ")
+            ));
+        }
+        Ok(())
+    }
     // No topology_caps / spec overrides: multi-card and spec decode refuse.
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -13176,12 +13211,24 @@ impl Carrier for Inkling2Carrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
+        let options = crate::admission::SourceAdmissionOptions {
+            spec: ctx.spec,
+            kv_adaptive: crate::admission::qwen4_kv_adaptive_requested(ctx.kv_adaptive_override),
+            eagle_drafter: ctx.gemma4_drafter_path.is_some(),
+            state_quant: ctx.state_quant_override.is_some(),
+            non_single_compute: !matches!(
+                &ctx.deepseek4_compute_placement,
+                hipfire_config::Deepseek4ComputePlacement::Single
+            ),
+            expert_count_override: ctx.deepseek4_experts_per_token.is_some(),
+        };
+        self.admit_options(ctx.draft_path, options)?;
         let bundle = hipfire_arch_inkling2::load_inkling2_bundle(src, ctx)?;
-        let speculator =
-            crate::spec_build::build_speculator(meta.arch_id, None, None, ctx.max_seq, ctx.spec);
+        // No speculator on arch 24: every spec ask refused above, so the
+        // load stays plain AR (no `build_speculator` call).
         Ok(LoadedModel {
             state: Some(Box::new(bundle)),
-            speculator,
+            speculator: None,
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
@@ -13192,6 +13239,66 @@ impl Carrier for Inkling2Carrier {
                 meta.chat_template_source,
             )
         })
+    }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        // Same shape as `Qwen2Carrier::bench_prefill`: loop the production
+        // single-token forward over the synthetic ids from the zeroed state
+        // the daemon reset before timing.
+        let b = m.inkling2_mut()?;
+        let mut ok = true;
+        for (i, &tok) in synthetic.iter().enumerate() {
+            if hipfire_arch_inkling2::forward_token_gpu(b, gpu, tok, i).is_err() {
+                ok = false;
+                break;
+            }
+        }
+        Some(ok)
+    }
+    fn bench_decode_prime(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        let mut error = None;
+        match self.bench_prefill(m, gpu, synthetic, synthetic.len(), &mut error) {
+            Some(true) => Some(None),
+            Some(false) => {
+                Some(Some(error.unwrap_or_else(|| {
+                    "inkling2 bench decode prime failed".into()
+                })))
+            }
+            None => None,
+        }
+    }
+    fn bench_decode_run(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        context: usize,
+        iterations: usize,
+        decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        // The production decode step IS `forward_token_gpu` (logits
+        // discarded here); positions continue past the primed context.
+        let Some(b) = m.inkling2_mut() else {
+            *decode_err = Some("inkling2 bench decode missing state".into());
+            return Some(false);
+        };
+        for i in 0..iterations {
+            if hipfire_arch_inkling2::forward_token_gpu(b, gpu, 10, context + i).is_err() {
+                *decode_err = Some(format!("inkling2 bench decode step {i} failed"));
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 }
 
