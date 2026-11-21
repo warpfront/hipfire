@@ -11,5 +11,6 @@
 
 pub mod config;
 pub mod oracle;
+pub mod weights;
 
 pub use config::{LoopConfig, ARCH_ID, MTP_SIDECAR_ARCH_ID};

@@ -7,3 +7,4 @@ description = "Inkling-2-Mini looped MoE architecture: Phase-0 visit schedule an
 
 [dependencies]
 serde_json.workspace = true
+hipfire-runtime = { path = "../hipfire-runtime" }
