@@ -84,8 +84,8 @@ fn rmsnorm_l2(x: &[f32], eps: f32) -> Vec<f32> {
 ///  * SWA layers: `[n_channels, 1, kernel]` (plain `.weight`) — transpose only.
 ///  * full layers: `.static_w` is `[kernel, n_channels]`; the merged converter
 ///    applies `flip(0).T` to produce the runtime conv, so flip the kernel axis.
-fn load_conv(
-    w: &crate::weights::Inkling2Weights,
+fn load_conv<W: crate::weights::WeightSource>(
+    w: &W,
     name: &str,
     kernel: usize,
 ) -> Result<Vec<f32>, String> {
@@ -295,8 +295,8 @@ pub struct ControllerWeights {
 /// queries. The stored `middle_cycle_cross_pass_queries` and `_kv_queries`
 /// are each `[2*core_len, n_embd]`; per core layer i the four queries are
 /// `[q[2i], kv[2i], kv[2i+1], q[2i+1]]` = [Q, K, V, FFN] messages.
-pub fn pack_message_queries(
-    w: &crate::weights::Inkling2Weights,
+pub fn pack_message_queries<W: crate::weights::WeightSource>(
+    w: &W,
     cfg: &crate::config::Inkling2Config,
 ) -> Result<Vec<[Vec<f32>; 4]>, String> {
     let (_, q) = w.f32("model.llm.middle_cycle_cross_pass_queries")?;
@@ -329,8 +329,8 @@ pub fn pack_message_queries(
 /// `visit` the global visit index (0..48), `blocks` the AttnRes block stream,
 /// `state` the per-visit conv state. `messages`/`ctrl` are present for loop
 /// visits after pass 0 (four messages Q/K/V/FFN and their controllers).
-pub fn decode_visit(
-    w: &crate::weights::Inkling2Weights,
+pub fn decode_visit<W: crate::weights::WeightSource>(
+    w: &W,
     cfg: &crate::config::Inkling2Config,
     state: &mut ConvState,
     blocks: &mut Vec<Vec<f32>>,
@@ -561,8 +561,8 @@ pub fn decode_visit(
 
 /// Compute logits from the final hidden state: LM head GEMV, fp32, final
 /// softcap 30, then slice to the unpadded vocabulary (200058 of 201024).
-pub fn lm_head_logits(
-    w: &crate::weights::Inkling2Weights,
+pub fn lm_head_logits<W: crate::weights::WeightSource>(
+    w: &W,
     cfg: &crate::config::Inkling2Config,
     hidden: &[f32],
 ) -> Result<Vec<f32>, String> {
@@ -581,8 +581,8 @@ pub fn lm_head_logits(
 /// `llama_model_inkling2_loop::graph::graph`: prelude layers 0..6 once, core
 /// layers 6..18 for `num_passes` passes (later passes get cross-pass messages
 /// from the previous pass's bank), post-loop layers 18..24 once.
-pub fn forward_token(
-    w: &crate::weights::Inkling2Weights,
+pub fn forward_token<W: crate::weights::WeightSource>(
+    w: &W,
     cfg: &crate::config::Inkling2Config,
     token_embed: &[f32],
     pos: usize,
@@ -696,8 +696,8 @@ pub fn forward_token(
     Ok(rmsnorm_gain(&x, &final_norm, cfg.rms_norm_eps))
 }
 
-fn load_controllers(
-    w: &crate::weights::Inkling2Weights,
+fn load_controllers<W: crate::weights::WeightSource>(
+    w: &W,
     phys: usize,
     cfg: &crate::config::Inkling2Config,
 ) -> Result<[ControllerWeights; 4], String> {
@@ -1015,6 +1015,30 @@ mod tests {
         }
         std::fs::write(r"D:\hipfire-models\cpu-logits-tok0.txt", s).unwrap();
         eprintln!("dumped {} CPU logits", logits.len());
+    }
+
+    #[test]
+    #[ignore = "parity: dump CPU logits on RAW checkpoint weights"]
+    fn dump_raw_logits_token0() {
+        use crate::weights::{GgufF32, WeightSource};
+        let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        let w = GgufF32::open(std::path::Path::new(r"D:\hipfire-models\gguf-f32.bin"))
+            .expect("open gguf f32");
+        let embed = w.f32("model.llm.embed.weight").unwrap().1;
+        let x = embed[..cfg.n_embd].to_vec();
+        let hidden = forward_token(&w, &cfg, &x, 0).expect("forward");
+        let logits = lm_head_logits(&w, &cfg, &hidden).expect("lm head");
+        let mut s = String::new();
+        for (i, v) in logits.iter().enumerate() {
+            s.push_str(&format!("{} {:08x}\n", i, v.to_bits()));
+        }
+        std::fs::write(r"D:\hipfire-models\cpu-raw-logits-tok0.txt", s).unwrap();
+        let (argmax, _) = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        eprintln!("raw: dumped {} logits, argmax={argmax}", logits.len());
     }
 
     fn oracle_close(a: f32, b: f32) -> bool {
