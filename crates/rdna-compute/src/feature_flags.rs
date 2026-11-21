@@ -17,6 +17,14 @@ pub enum Mb4Mode {
     Pack4,
 }
 
+/// MoE router selection for `kernel.gfx1100_router_w64` (`HIPFIRE_GFX1100_ROUTER_W64`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterW64Mode {
+    Exact,
+    Off,
+    Approx,
+}
+
 /// Fewest rows of an EP prefill wave lane that take the prefill lane WMMA entries and the joint
 /// dense stages.
 pub const QWEN4_PREFILL_LWMMA_WAVE_FLOOR_ROWS: usize = 49;
@@ -463,6 +471,10 @@ pub struct FeatureFlags {
     /// gfx1100, false elsewhere; `HIPFIRE_GFX1100_Q8X_VERIFY=0` restores the
     /// WMMA tiers.
     pub gfx1100_q8x_verify: bool,
+    /// `kernel.gfx1100_router_w64` (`HIPFIRE_GFX1100_ROUTER_W64`): `Exact` (default) selects the
+    /// exact wave64 MoE router on exact gfx1100 256-expert models, `Approx` the approximate wave64
+    /// router, `Off` the baseline router. gfx1151 and gfx1201 ignore it.
+    pub gfx1100_router_w64: RouterW64Mode,
     /// `HIPFIRE_GFX1151_XLDS` selects the exact-gfx1151 1..=16-row MQ4V2 and
     /// HFQ4G256/MQ4G256 v1 WMMA GEMMs (`*_gfx1151_xlds`: 4 waves x 16 rows per
     /// block, X slab staged in LDS) for gate_up/qkvza/qkv/residual (residual also
@@ -1060,6 +1072,14 @@ impl FeatureFlags {
             }
         };
 
+        let parse_router_w64 = |name: &str| -> RouterW64Mode {
+            match value(name).ok().as_deref() {
+                Some("off") => RouterW64Mode::Off,
+                Some("approx") => RouterW64Mode::Approx,
+                _ => RouterW64Mode::Exact,
+            }
+        };
+
         let qsa_extent_mode = value("HIPFIRE_QWEN4_QSA_EXTENT_CHECK").ok();
 
         let is_gfx906 = arch == "gfx906";
@@ -1386,6 +1406,7 @@ impl FeatureFlags {
             residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
             gfx1100_q8x_verify: parse_bool("HIPFIRE_GFX1100_Q8X_VERIFY").unwrap_or(arch == "gfx1100"),
+            gfx1100_router_w64: parse_router_w64("HIPFIRE_GFX1100_ROUTER_W64"),
             gfx1151_xlds: parse_bool("HIPFIRE_GFX1151_XLDS").unwrap_or(arch == "gfx1151"),
             mq4v2_gfx1150_bt: parse_bool("HIPFIRE_MQ4V2_GFX1150_BT")
                 .unwrap_or(arch == "gfx1150"),
@@ -2314,6 +2335,7 @@ impl FeatureFlags {
             residual_ldsstage: false,
             gate_up_ldsstage: false,
             gfx1100_q8x_verify: false,
+            gfx1100_router_w64: RouterW64Mode::Exact,
             gfx1151_xlds: false,
             mq4v2_gfx1150_bt: false,
             mq4v2_gfx1150_iu4: false,
@@ -2985,6 +3007,22 @@ mod tests {
     fn force_unfused_defaults_false_in_test_ctor() {
         let f = FeatureFlags::for_test("gfx1151");
         assert!(!f.force_unfused);
+    }
+
+    #[test]
+    fn gfx1100_router_w64_parses_each_typed_mode() {
+        let mode = |raw: &str| {
+            FeatureFlags::from_lookup("gfx1100", |name| match name {
+                "HIPFIRE_GFX1100_ROUTER_W64" => Ok(raw.to_owned()),
+                _ => Err(()),
+            })
+            .gfx1100_router_w64
+        };
+        assert_eq!(mode("exact"), RouterW64Mode::Exact);
+        assert_eq!(mode("off"), RouterW64Mode::Off);
+        assert_eq!(mode("approx"), RouterW64Mode::Approx);
+        let unset = FeatureFlags::from_lookup("gfx1100", |_| Err(()));
+        assert_eq!(unset.gfx1100_router_w64, RouterW64Mode::Exact);
     }
 
     /// H4/H3/H8a flags are exact gfx1151 / gfx1201: unset, H4 is level 3 on

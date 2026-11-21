@@ -256,7 +256,6 @@ developer_callsite	*	HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1100_DRAFT_VOCAB#developer_bool=gpu.arch_caps.is_gfx1100()
 developer_callsite	*	HIPFIRE_GFX1100_MQ4_WIDE_PREFILL#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GFX1100_PACKED_MQ4_PREFILL#developer_var=ok.as_deref.==Some("1")
-developer_callsite	*	HIPFIRE_GFX1100_ROUTER_W64#developer_var=ok
 developer_callsite	*	HIPFIRE_GFX1101_GFX1100_CAMPAIGN#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_GFX1101_GFX1100_CAMPAIGN#developer_var=as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_GFX1151_ATTENTION_TILE_DPP#developer_var=as_deref.==Ok("1")

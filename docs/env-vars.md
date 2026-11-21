@@ -974,6 +974,8 @@ Two env grammars apply:
 | `HIPFIRE_FA_PREFILL_PM_QPREP` | `developer.fa_prefill_pm_qprep` (typed boolean) | on where qualified (nested under `HIPFIRE_FA_PREFILL_PM`) | `true`/`false`/`1`/`0` (`true`/`false` case-insensitive); any other spelling fails the config load | `fa_prefill_pm_qprep`, `fa_prefill_pm_qprep_fp8_kv` | PeaceMaker prefill A/B runs | Per-arch / per-codec qualification of the F5 Q-prep fold, as `HIPFIRE_FA_PREFILL_PM` (HIPF-396 B5). |
 | `HIPFIRE_MQ6_I8` | `kernel.mq6_i8` (`auto`/`true`/`false`) | `auto`: on in the Qwen4 forward at 512+ rows on the default archs (`MQ6_I8_DEFAULT_ARCHS`) | Legacy grammar: `1`, `true`, `TRUE`, `on`, `ON` force on (any scope); `0`, `false`, `FALSE`, `off`, `OFF` kill; anything else (`auto`, empty, garbage) is `auto` | `mq6_i8` (`Option<bool>`) | `qsa_norm_epi_oracle` sets `1` | Tri-state opt-in outside the default scope, not a default-ON switch (HIPF-396 B8). |
 | `HIPFIRE_V2B_A4_EPI` | `kernel.v2b_a4_epi` (nullable string) | fused A4 epilogue (exact gfx1151 V2B shapes) | Legacy grammar: exactly `retile` runs the stage-1 M512xN128 twin instead of the fused A4 kernel; anything else (unset, `1`, empty) keeps the fused kernel | `v2b_a4_retile` | `test_mq4v2_gate_up_a4_gfx1151` runs one arm per process | Diagnostic bisect arm of the A4 fusion; only its `0` arm was removed (HIPF-396 B6). |
+| `HIPFIRE_GFX1100_ROUTER_W64` | `kernel.gfx1100_router_w64` (`exact`/`off`/`approx`) | `exact`: gfx1100 at 256 experts uses the exact wave64 MoE router (gfx1151 and gfx1201 ignore the setting) | Legacy grammar: exactly `0` is `off`, exactly `approx` is `approx`; anything else (unset, `off`, empty, garbage) is `exact` | `gfx1100_router_w64` (`RouterW64Mode`) | no in-repo script or test sets it (operator A/B switch) | A/B switch between the exact and the approximate gfx1100 wave64 MoE routers. Tests: `gfx1100_router_w64_parses_each_typed_mode` (rdna-compute), `router_w64_and_hc_fuse_promoted_arms_keep_their_legacy_meaning` (hipfire-config). |
+| `HIPFIRE_QWEN4_HC_FUSE` | `kernel.qwen4_hc_fuse` (nullable integer, `0`–`3`) | gfx1151 `3`, gfx1201 `1`, elsewhere `0` | Legacy grammar: the trimmed value parses as `u8`; levels above `3` clamp to `3`; values that do not parse (empty, garbage, above 255) are unset | `qwen4_hc_fuse` (`u8`; consumers read `qwen4_hc_fuse_level()`, which clamps to `3`) | operator; `trunk_shard_layer_oracle` and `lab_trunk_oracle` name `=1` | Fusion level of the Qwen4 HC write (`=1` keeps the mixer's HC write unfused, per the trunk-shard oracle). Test: `router_w64_and_hc_fuse_promoted_arms_keep_their_legacy_meaning` (hipfire-config). |
 
 ## Manual — kept developer flags, arch-crate and runtime side (HIPF-430)
 
@@ -1174,7 +1176,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1712
+**Count:** 1713
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1738,7 +1740,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX1100_PM4_EXPERIMENTS` | crates/rdna-compute/src/replay.rs, crates/rdna-compute/src/replay/railgun_lower.rs | developer |
 | `HIPFIRE_GFX1100_PM_BUNDLE` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GFX1100_Q8X_VERIFY` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv_q8x.rs | developer |
-| `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
+| `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_GFX1100_WMMA_VERIFY_ATTN` | crates/hipfire-dispatch/src/pipeline/batched_attention.rs, crates/rdna-compute/src/attention_wmma_verify.rs | developer |
 | `HIPFIRE_GFX1101_GFX1100_CAMPAIGN` | crates/hipfire-dispatch/src/pipeline/hybrid.rs, crates/rdna-compute/src/norm.rs | developer |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP` | crates/rdna-compute/src/attention.rs | developer |
@@ -2403,7 +2405,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_GDN_PREFILL` | crates/hipfire-arch-qwen4/examples/fn_prefill_g0.rs, crates/rdna-compute/examples/gdn_wy_repeat_check.rs | developer |
 | `HIPFIRE_QWEN4_GDN_Q8_INLINE` | crates/hipfire-arch-qwen4/src/state.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_GDN_QKV_BF16` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
-| `HIPFIRE_QWEN4_HC_FUSE` | crates/hipfire-arch-qwen4/examples/trunk_shard_layer_oracle.rs, crates/hipfire-arch-qwen4/src/lab_trunk_oracle.rs | developer |
+| `HIPFIRE_QWEN4_HC_FUSE` | crates/hipfire-arch-qwen4/examples/trunk_shard_layer_oracle.rs, crates/hipfire-arch-qwen4/src/lab_trunk_oracle.rs | experimental |
 | `HIPFIRE_QWEN4_HC_ROW_FOLD` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs, crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
 | `HIPFIRE_QWEN4_HC_UP_TILE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/tensor_ops.rs | developer |
 | `HIPFIRE_QWEN4_HC_UP_V2` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/feature_flags.rs | developer |
