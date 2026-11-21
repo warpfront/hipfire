@@ -938,10 +938,8 @@ impl CpuDecodeState {
             let mut k = Vec::with_capacity(nkv);
             let mut v = Vec::with_capacity(nkv);
             for _ in 0..nkv {
-                let mut kk = Vec::new();
-                kk.reserve(reserve);
-                let mut vv = Vec::new();
-                vv.reserve(reserve);
+                let kk = Vec::with_capacity(reserve);
+                let vv = Vec::with_capacity(reserve);
                 k.push(kk);
                 v.push(vv);
             }
@@ -1390,7 +1388,7 @@ pub fn forward_token_cached<W: crate::weights::WeightSource>(
                 // mix() appends `cur` itself: states = [bank..., prev_out].
                 let msgs: Vec<Vec<f32>> = msg_queries[i]
                     .iter()
-                    .map(|q| oracle::mix(&bank, &prev_out, &q, cfg.n_embd, 1))
+                    .map(|q| oracle::mix(&bank, &prev_out, q, cfg.n_embd, 1))
                     .collect();
                 let msgs_arr: [Vec<f32>; 4] = [
                     msgs[0].clone(),
