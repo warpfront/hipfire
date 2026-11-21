@@ -7,7 +7,8 @@
 //! Proves on hardware:
 //! - two pages can be mapped at non-adjacent offsets (a hole is unmapped)
 //! - a buffer view rejects an unmapped hole
-//! - a page can be unmapped, remapped, and written/read again
+//! - an unmapped page's VA is retired: remapping it is refused (a stale TLB
+//!   translation can outlive the unmap) and a fresh offset still writes/reads
 //! - overlapping maps are refused without changing the mapped set
 //! - release tears down every mapped page
 //!
@@ -67,42 +68,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     arena.unmap_at(&hip, g, g)?;
     assert_eq!(arena.mapped_bytes(), 2 * g);
 
-    // Unmap the first page, remap it, and verify fresh contents.
+    // Unmap the first page. Its VA is retired: rebinding it would revive a
+    // stale translation, so the map is refused and fresh contents go to a
+    // fresh offset instead.
     arena.unmap_at(&hip, 0, g)?;
     assert_eq!(arena.mapped_bytes(), g);
     assert!(arena.buffer_at(0, 3 * g).is_err());
-    arena.map_at(&hip, 0, g, &[])?;
+    let refused = arena
+        .map_at(&hip, 0, g, &[])
+        .expect_err("remapping an unmapped VA must be refused");
+    assert!(
+        refused.message.contains("remapping a used VA"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(arena.mapped_bytes(), g, "a refused remap maps nothing");
+    arena.map_at(&hip, 6 * g, g, &[])?;
     let replacement = vec![0x55u8; g];
-    hip.memcpy_htod(&arena.buffer_at(0, g)?, &replacement)?;
+    hip.memcpy_htod(&arena.buffer_at(6 * g, g)?, &replacement)?;
     let mut readback = vec![0u8; g];
-    hip.memcpy_dtoh(&mut readback, &arena.buffer_at(0, g)?)?;
+    hip.memcpy_dtoh(&mut readback, &arena.buffer_at(6 * g, g)?)?;
     assert_eq!(readback, replacement);
     assert_eq!(arena.mapped_bytes(), 2 * g);
 
     // Every allocation/map/access failure rolls back without changing the
-    // mapped set, and a later map at the same offset succeeds.
-    for kind in [
-        VmmFaultKind::Create,
-        VmmFaultKind::Map,
-        VmmFaultKind::AccessReset,
+    // mapped set. Create and Map fail before a binding, so the same offset is
+    // reusable; an access-reset failure unmaps a mapped handle, which retires
+    // the VA, so that retry needs a fresh offset.
+    let mut mapped = 2usize; // 2g and 6g
+    for (kind, off, retires) in [
+        (VmmFaultKind::Create, 4 * g, false),
+        (VmmFaultKind::Map, 5 * g, false),
+        (VmmFaultKind::AccessReset, 7 * g, true),
     ] {
         inject_vmm_fault(kind, 1);
-        assert!(arena.map_at(&hip, 4 * g, g, &[]).is_err());
+        assert!(arena.map_at(&hip, off, g, &[]).is_err());
         clear_vmm_faults();
         assert_eq!(
             arena.mapped_bytes(),
-            2 * g,
+            mapped * g,
             "failed {kind:?} changed mapped set"
         );
+        if retires {
+            assert!(
+                arena.map_at(&hip, off, g, &[]).is_err(),
+                "an access-reset rollback retires its VA"
+            );
+            arena.map_at(&hip, 9 * g, g, &[])?;
+        } else {
+            arena.map_at(&hip, off, g, &[])?;
+        }
+        mapped += 1;
+        assert_eq!(arena.mapped_bytes(), mapped * g);
     }
-    arena.map_at(&hip, 4 * g, g, &[])?;
-    assert_eq!(arena.mapped_bytes(), 3 * g);
 
     // Unmapping an already-unmapped range is refused.
     arena.unmap_at(&hip, 2 * g, g)?;
     assert!(arena.unmap_at(&hip, 2 * g, g).is_err());
-    arena.unmap_at(&hip, 0, g)?;
+    assert!(
+        arena.unmap_at(&hip, 0, g).is_err(),
+        "a retired and unmapped VA has nothing to unmap"
+    );
     arena.unmap_at(&hip, 4 * g, g)?;
+    arena.unmap_at(&hip, 5 * g, g)?;
+    arena.unmap_at(&hip, 6 * g, g)?;
+    arena.unmap_at(&hip, 9 * g, g)?;
     assert_eq!(arena.mapped_bytes(), 0);
     arena.release(&hip)?;
     assert!(arena.is_released());
