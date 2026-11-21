@@ -172,6 +172,30 @@ transformers *runtime* tensor. The llama.cpp **converter**
 per core layer to produce each `loop_msg_query [n_embd,4]`. My plan §0a is
 correct; leave it.
 
+## CPU forward complete (2026-11-21, continued session)
+
+The CPU reference forward is now **complete end-to-end** in `forward.rs`:
+- `decode_layer` (SWA attention primitive), `decode_moe` / `decode_moe_lazy`
+  (sigmoid top-8 + SiTU + fp32 combine), `decode_visit` (full layer: AttnRes
+  mix, controllers, attention, MoE, convs, residuals), `pack_message_queries`,
+  `forward_token` (all 48 visits with per-visit state, prelude/core×3/post,
+  cross-pass messages from the previous pass's bank), `lm_head_logits`
+  (GEMV + softcap 30 + slice to 200058).
+- **Real-artifact verification**: full 48-visit forward + LM head on the 14 GB
+  artifact produces **200058 finite logits** (argmax 196997, max 14.66) in a
+  ~4-minute debug run. Lazy top-8 expert decode cuts expert decodes from 6144
+  to ~384 per token (OOM before; now fine). F32 decode is cached in
+  `weights.rs`.
+- 26 unit tests + 6 ignored real-artifact tests (all verified manually).
+
+**Not yet proven**: numeric parity with the llama.cpp oracle. The argmax above
+is from a raw `embed[0]` vector with no chat-template framing, so it is not a
+generation-quality check. The next gate is a teacher-forced logit comparison:
+feed the same token sequence to `forward_token` and to the llama.cpp oracle and
+compare logits per position. Known simplifications still to close: dynamic
+K/V conv taps on full layers (currently static weights only), multi-token KV
+cache (single-token primitive), and controller/message parity.
+
 ## Current end state (2026-11-21)
 
 Done: a working quantizer path and a 13.9 GB arch-24 HFQ artifact;
