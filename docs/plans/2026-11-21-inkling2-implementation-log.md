@@ -171,9 +171,19 @@ correct; leave it.
 ## Current end state (2026-11-21)
 
 Done: a working quantizer path and a 13.9 GB arch-24 HFQ artifact;
-typed config parsing; a 21-test CPU-oracle crate; a built reference oracle with
-reproducible golden outputs. Not done: the loader bundle, GPU forward, and
-generation route — the artifact cannot be served yet.
+typed config parsing; a **24-test** CPU-oracle crate (MoE renorm + sink
+attention corrected against the research reports); a validated HFQ weight
+index (`weights.rs`, tested against the real 14 GB artifact); a built reference
+oracle with reproducible golden outputs; three research reports vendored under
+`docs/plans/inkling2-research/`. Not done: the loader bundle, CPU/GPU forward,
+and generation route — the artifact cannot be served yet.
+
+Layer-type norm names in the loaded artifact (for the forward port): SWA
+layers use `attn_norm.weight`; full layers (5, 11, 17, 23) use
+`q_input_norm.weight` / `k_input_norm.weight` / `v_input_norm.weight`. Full
+attention uses dynamic K/V convs (`k_sconv.static_w` + `k_sconv.weight_proj`);
+SWA uses static `k_sconv.weight`. Per-expert tensors are
+`...mlp.experts.{E}.{gate_up_proj,down_proj}.weight`.
 
 ## Next steps, in order
 
