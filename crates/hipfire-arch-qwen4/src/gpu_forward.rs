@@ -6670,7 +6670,10 @@ impl Qwen4MoeLayerRuntime {
             .cpu_cold_owners
             .as_ref()
             .is_some_and(|owners| owners.kind() == cpu_splice::SplitOwnerKind::Tier);
-        hipfire_config::memory::qwen4_d2_ready_for(arch, tier_split)
+        hipfire_config::memory::qwen4_d2_ready_for(
+            rdna_compute::FeatureFlags::process().qwen4_expert_hotset_gfx1100_enabled(arch),
+            tier_split,
+        )
     }
 
     /// Shared executor construction behind [`Self::attach_cpu_split`] (initial
@@ -6725,11 +6728,11 @@ impl Qwen4MoeLayerRuntime {
                 return Err(release(executor, format!("{error:?}")));
             }
         }
-        // `HIPFIRE_QWEN4_D2_MIXED_CPWAIT=1` (developer, default off): a MIXED
+        // `memory.qwen4_d2_mixed_cpwait` (default ON on gfx1100, off elsewhere): a MIXED
         // hot/cold layer of a load that requests `mapped` + `cpwait` takes the
         // mapped staging + CP-wait join as one atomic selection; a refusal of
         // either half restores the copy transport and the host join, logged.
-        let mixed_cpwait = hipfire_config::memory::qwen4_d2_mixed_cpwait(&gpu.arch)
+        let mixed_cpwait = gpu.flags.qwen4_d2_mixed_cpwait_enabled(&gpu.arch)
             && request == D2Return::Mapped
             && join == D2Join::CpWait
             && placement.contains(&0)
