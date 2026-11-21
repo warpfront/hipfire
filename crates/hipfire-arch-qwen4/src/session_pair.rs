@@ -218,6 +218,15 @@ impl Qwen4Bundle {
             .as_ref()
             .expect("hyper_feedback is input-band state");
         stage.copy(gpu, stage.fixed.len() - 1, hyper_feedback)?;
+        // The pair's GDN never touches the stream carry (its cut cursor is
+        // sealed), so each layer's carry parts are the live ones, staged once.
+        let layout = StageLayout::of(&self.state);
+        for (slot, layer) in self.state.gdn.iter().enumerate() {
+            if let Some(carry) = &layer.carry {
+                let index = layout.gdn_index(slot).expect("owned GDN slot");
+                stage.copy_parts(gpu, index + layout.gdn_parts - 3, carry.tensors())?;
+            }
+        }
         Ok(Some(stage))
     }
 
