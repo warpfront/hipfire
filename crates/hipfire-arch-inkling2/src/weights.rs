@@ -493,6 +493,88 @@ impl WeightSource for GgufF32 {
 mod tests {
     use super::*;
 
+    /// Writes a synthetic gguf-f32.bin carrying the AttnRes/cross-pass tensors
+    /// so the HFQ-name -> GGUF-name mapping is testable without the 98 GB
+    /// export. This is the regression net for the class of bug where a name
+    /// went unmapped and the forward silently skipped a required tensor.
+    fn synthetic_bin(entries: &[(&str, &[usize])]) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "inkling2-synthetic-{}-{}.bin",
+            std::process::id(),
+            entries.len()
+        ));
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        f.write_all(&(entries.len() as u32).to_le_bytes()).unwrap();
+        for (name, dims) in entries {
+            let len: usize = dims.iter().product();
+            f.write_all(&(name.len() as u32).to_le_bytes()).unwrap();
+            f.write_all(name.as_bytes()).unwrap();
+            f.write_all(&(dims.len() as u32).to_le_bytes()).unwrap();
+            for d in *dims {
+                f.write_all(&(*d as u32).to_le_bytes()).unwrap();
+            }
+            for i in 0..len {
+                f.write_all(&((i as f32) * 0.5).to_le_bytes()).unwrap();
+            }
+        }
+        f.flush().unwrap();
+        path
+    }
+
+    #[test]
+    fn gguf_mapping_covers_attnres_and_cross_pass_tensors() {
+        let e = 2304usize;
+        // GGUF file order is ne0 first, so a [4, e] torch view is stored [e, 4].
+        let one = [e];
+        let four = [e, 4];
+        let mut names: Vec<(String, usize)> = vec![
+            ("output_res_query.weight".to_string(), 0),
+            ("output_norm.weight".to_string(), 0),
+            ("blk.6.attn_res_query.weight".to_string(), 0),
+            ("blk.6.ffn_res_query.weight".to_string(), 0),
+        ];
+        for l in 6..18 {
+            names.push((format!("blk.{l}.loop_msg_query.weight"), 1));
+        }
+        let entries: Vec<(&str, &[usize])> = names
+            .iter()
+            .map(|(n, four_col)| {
+                (
+                    n.as_str(),
+                    if *four_col == 1 { &four[..] } else { &one[..] },
+                )
+            })
+            .collect();
+        let path = synthetic_bin(&entries);
+        let w = GgufF32::open(&path).expect("open synthetic");
+        let len = |name: &str| -> usize {
+            w.f32(name)
+                .unwrap_or_else(|e| panic!("{name} must map: {e}"))
+                .1
+                .len()
+        };
+        // bug #4: this one was unmapped, so the final AttnRes mix was skipped
+        assert_eq!(len("model.llm.attn_res.output_query"), e);
+        assert_eq!(len("model.llm.attn_res.attn_queries.5"), e);
+        assert_eq!(len("model.llm.attn_res.mlp_queries.6"), e);
+        let q = w
+            .f32("model.llm.middle_cycle_cross_pass_queries")
+            .unwrap()
+            .1;
+        let kv = w
+            .f32("model.llm.middle_cycle_cross_pass_kv_queries")
+            .unwrap()
+            .1;
+        assert_eq!(q.len(), 24 * e);
+        assert_eq!(kv.len(), 24 * e);
+        // the two globals must not be the same rows (bug #3)
+        assert_ne!(q, kv);
+        // unknown names still fail closed
+        assert!(w.f32("model.llm.attn_res.nonexistent").is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn cross_pass_query_names_classify_q_and_kv() {
         assert!(is_cross_pass_q_query(
