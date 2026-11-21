@@ -47,22 +47,25 @@ impl LoopConfig {
 
     /// Upstream's structural sharing: visits at or past `n_phys` reuse the
     /// physical layer's weights but keep their own KV/conv state.
-    pub fn layer_phys(&self, il: usize) -> usize {
-        if il < self.n_phys {
-            il
+    /// Physical layer executed at a visit slot. Visit order is prelude
+    /// `0..core_start`, `num_passes` passes over `core_start..core_end`, then
+    /// the post layers `core_end..n_phys` — NOT the physical layer order.
+    pub fn layer_phys(&self, visit: usize) -> usize {
+        let core_len = self.core_end - self.core_start;
+        let looped = self.num_passes * core_len;
+        if visit < self.core_start {
+            visit
+        } else if visit < self.core_start + looped {
+            self.core_start + (visit - self.core_start) % core_len
         } else {
-            self.core_start + (il - self.n_phys) % (self.core_end - self.core_start)
+            self.core_end + (visit - self.core_start - looped)
         }
     }
 
     /// The visit order of a decode step: all physical layers once, then the
     /// core repeated `num_passes - 1` more times.
     pub fn visit_schedule(&self) -> Vec<usize> {
-        let mut v: Vec<usize> = (0..self.n_phys).collect();
-        for _ in 1..self.num_passes {
-            v.extend(self.core_start..self.core_end);
-        }
-        v
+        (0..self.n_slot()).map(|v| self.layer_phys(v)).collect()
     }
 
     /// Mirror upstream's validation exactly — no stricter and no looser.
@@ -229,20 +232,23 @@ mod tests {
             let want = if (6..18).contains(&il) { 3 } else { 1 };
             assert_eq!(visits, want, "physical layer {il}");
         }
+        // Visit order: prelude, then 3 core passes, then the post layers.
         assert_eq!(&sched[..6], &[0, 1, 2, 3, 4, 5]);
-        assert_eq!(&sched[24..26], &[6, 7]);
-        assert_eq!(&sched[46..48], &[16, 17]);
+        assert_eq!(&sched[6..12], &[6, 7, 8, 9, 10, 11]);
+        assert_eq!(&sched[17..19], &[17, 6]);
+        assert_eq!(&sched[41..48], &[17, 18, 19, 20, 21, 22, 23]);
     }
 
     #[test]
     fn layer_phys_shares_core_weights() {
         let cfg = LoopConfig::mini();
-        assert_eq!(cfg.layer_phys(0), 0);
-        assert_eq!(cfg.layer_phys(23), 23);
-        assert_eq!(cfg.layer_phys(24), 6);
-        assert_eq!(cfg.layer_phys(35), 17);
-        assert_eq!(cfg.layer_phys(36), 6);
-        assert_eq!(cfg.layer_phys(47), 17);
+        // every visit slot of all three passes maps to its own pass's layer
+        for (v, want) in [
+            (0, 0), (5, 5), (6, 6), (17, 17), (18, 6), (23, 11), (29, 17),
+            (30, 6), (41, 17), (42, 18), (47, 23),
+        ] {
+            assert_eq!(cfg.layer_phys(v), want, "visit {v}");
+        }
     }
 
     #[test]
