@@ -134,6 +134,40 @@ A working reference oracle is built and producing golden outputs:
 This oracle is the numeric target for the CPU-forward port: future work should
 compare per-visit hidden states / logits against it, not just final tokens.
 
+## Research cross-check (2026-11-21, three parallel reports)
+
+Read `inkling2-research-transformers.md`,
+`inkling2-research-transformers-ninfer-all.md` and
+`inkling2-research-transformers-vllm.md` in `docs/plans/local/`. All three
+independently agree with the llama.cpp source I verified. Actions taken:
+
+- **Bug fixed**: MoE top-8 sigmoid weights ARE renormed by their sum (eps
+  `expert_weights_norm_eps = 1e-20`) then multiplied by `route_scale = 8`.
+  Confirmed in authoritative `llama-graph.cpp::build_moe_ffn` lines
+  2518-2543. `sigmoid_topk` and its tests corrected; added
+  `attention_softmax_with_sink`. 23 oracle tests pass.
+- **Sink-vs-bias equivalence confirmed**: llama.cpp subtracts `sinks` from
+  the bias table before gather and passes a zero sink to `build_attn`;
+  transformers concatenates `[scores, sink]` and softmaxes jointly. These are
+  algebraically identical. My `relative_bias` (subtract before gather) +
+  `attention_softmax_with_sink` (zero sink) implementation is correct.
+- **Geometry confirmed**: 20 sliding + 4 full layers (full = 5, 11, 17, 23 —
+  one per 6-layer AttnRes block); `log_scaling_n_floor = 8192` (checkpoint
+  value wins over vLLM's 128000 default); 48 visits; 24 physical layers.
+- **SiTU confirmed**: `mlp_gate_softcap=4` / `mlp_up_softcap=25` ARE the SiTU
+  `beta` / `linear_beta`; my `situ` op matches.
+- **Flag for the forward port**: transformers PR #51050 threads a
+  `cache_offset` so each pass uses deep-copied per-pass KV + conv caches —
+  hipfire must allocate **48** cache slots, not 24 (my `LoopConfig::n_slot()`
+  already computes 48).
+
+**Discrepancy to NOT "fix"**: one report claims llama.cpp has no
+`[q[2i], kv[2i], kv[2i+1], q[2i+1]]` packing. That is only true of the
+transformers *runtime* tensor. The llama.cpp **converter**
+(`conversion/inkling2.py:modify_tensors`) does exactly that `torch.stack`
+per core layer to produce each `loop_msg_query [n_embd,4]`. My plan §0a is
+correct; leave it.
+
 ## Current end state (2026-11-21)
 
 Done: a working quantizer path and a 13.9 GB arch-24 HFQ artifact;
