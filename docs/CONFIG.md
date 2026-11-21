@@ -2668,6 +2668,9 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.v2b_pm` | `v2b_pm` | 0.4.0 | 0.5.0 | none; gfx1151 V2B entries always run their builder twins where admitted |
 | `developer.v2b_zba_scatter` | `v2b_zba_scatter` | 0.4.0 | 0.5.0 | none; the V2B Z|beta|alpha SET always scatters where admitted |
 | `developer.v2c_addepi` | `v2c_addepi` | 0.4.0 | 0.5.0 | none; the V2C ADD always takes the residual-touch entry |
+| `developer.qwen4_lane_allrows` | `qwen4_lane_allrows` | 0.4.5 | 0.5.0 | none; on by arch (exact gfx1201 or gfx942); no kill switch |
+| `developer.qwen4_lane_allrows_moe` | `qwen4_lane_allrows_moe` | 0.4.5 | 0.5.0 | none; on by arch (exact gfx1201 or gfx942); no kill switch |
+| `developer.qwen4_lane_hc_allrows` | `qwen4_lane_hc_allrows` | 0.4.5 | 0.5.0 | none; on by arch (exact gfx1201 or gfx942); no kill switch |
 | `developer.verify_v64` | `verify_v64` | 0.4.5 | 0.5.0 | none; the verify GEMM always takes the wave64 variant where admitted |
 | `kernel.gfx12_gdn_pre_fused` | `gfx12_gdn_pre_fused` | 0.4.0 | 0.5.0 | none; exact gfx1201 always runs the fused GDN preamble (byte-identical) |
 | `developer.gfx12_gdn_pre_fused` | `gfx12_gdn_pre_fused` | 0.4.0 | 0.5.0 | none; exact gfx1201 always runs the fused GDN preamble (byte-identical) |
