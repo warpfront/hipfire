@@ -513,28 +513,16 @@ pub fn decode_visit<W: crate::weights::WeightSource>(
         v_conv = vc2;
     }
 
-    let qc = oracle::clip(
-        &q,
-        w.f32(&format!("{p}attn.q_l2_clip.scale"))
-            .ok()
-            .map(|x| x.1)
-            .as_deref(),
-        cfg.qk_clip,
-        d,
-    );
+    // Per-channel clip scale is a real checkpoint tensor; a miss is a load
+    // error, not "clip without the learned scale".
+    let q_clip = w.f32(&format!("{p}attn.q_l2_clip.scale"))?.1;
+    let qc = oracle::clip(&q, Some(&q_clip), cfg.qk_clip, d);
     let kc = oracle::clip(&k_conv, None, cfg.qk_clip, d);
     let vc: Vec<f32> = (0..nkv)
         .flat_map(|h| oracle::rmsnorm(&v_conv[h * d..(h + 1) * d], cfg.rms_norm_eps))
         .collect();
-    let mut rc = oracle::clip(
-        &r,
-        w.f32(&format!("{p}attn.rel_l2_clip.scale"))
-            .ok()
-            .map(|x| x.1)
-            .as_deref(),
-        cfg.rel_clip,
-        cfg.n_rel,
-    );
+    let rel_clip = w.f32(&format!("{p}attn.rel_l2_clip.scale"))?.1;
+    let mut rc = oracle::clip(&r, Some(&rel_clip), cfg.rel_clip, cfg.n_rel);
     if !swa {
         // full-layer tau multiplies Q (per-head below) and R.
         let t = oracle::tau(pos, cfg.log_floor, cfg.log_alpha);
@@ -608,12 +596,10 @@ pub fn decode_visit<W: crate::weights::WeightSource>(
     };
 
     // --- MoE with AttnRes mix on FFN input ---
+    // Every layer carries an FFN query upstream, so a miss is a load error.
     let ffn_mix_q = format!("model.llm.attn_res.mlp_queries.{phys}");
-    let mut ffn_in = cur.clone();
-    if let Ok((_shape, q)) = w.f32(&ffn_mix_q) {
-        let mixed = oracle::mix(blocks, &cur, &q, cfg.n_embd, 1);
-        ffn_in = mixed;
-    }
+    let (_, fq) = w.f32(&ffn_mix_q)?;
+    let mut ffn_in = oracle::mix(blocks, &cur, &fq, cfg.n_embd, 1);
     // FFN message controller (index 3 = LOOP_CTRL_FFN), applied before norm.
     if let Some((msgs, ctrls)) = messages {
         ffn_in = oracle::control(
@@ -834,10 +820,10 @@ pub fn forward_token<W: crate::weights::WeightSource>(
     // Final norm.
     // build_output: mix the collected AttnRes blocks with the output query,
     // then final RMSNorm. `blocks` still holds all visit block states.
-    if let Ok(out_q) = w.f32("model.llm.attn_res.output_query") {
-        let mixed = oracle::mix(&blocks, &x, &out_q.1, cfg.n_embd, 1);
-        x = mixed;
-    }
+    // Required: upstream always mixes here, and a silent skip leaves the LM
+    // head reading an unmixed state (that bug cost the token-0 parity run).
+    let out_q = w.f32("model.llm.attn_res.output_query")?;
+    x = oracle::mix(&blocks, &x, &out_q.1, cfg.n_embd, 1);
     let final_norm = w.f32("model.llm.norm.weight")?.1;
     Ok(rmsnorm_gain(&x, &final_norm, cfg.rms_norm_eps))
 }
@@ -1178,7 +1164,12 @@ mod tests {
         for (i, v) in logits.iter().enumerate() {
             s.push_str(&format!("{} {:08x}\n", i, v.to_bits()));
         }
-        std::fs::write(r"D:\hipfire-models\cpu-raw-logits-tok0.txt", s).unwrap();
+        std::fs::write(r"D:/hipfire-models/cpu-raw-logits-tok0.txt", s).unwrap();
+        let mut f = String::new();
+        for v in &hidden {
+            f.push_str(&format!("{}\n", v.to_bits()));
+        }
+        std::fs::write(r"D:/hipfire-models/rust-fin-f32.txt", f).unwrap();
         let (argmax, _) = logits
             .iter()
             .enumerate()

@@ -474,6 +474,9 @@ impl WeightSource for GgufF32 {
         }
         // AttnRes queries: dims reversed at read -> torch [rows, n_embd] (or
         // [n_embd] for single-row). GGUF query i lives on block i+1.
+        if hfq == "model.llm.attn_res.output_query" {
+            return get("output_res_query.weight");
+        }
         if let Some(rest) = hfq.strip_prefix("model.llm.attn_res.attn_queries.") {
             let i: usize = rest.parse().map_err(|_| "bad query idx")?;
             return get(&format!("blk.{}.attn_res_query.weight", i + 1));
