@@ -88,6 +88,29 @@ impl Inkling2Weights {
         self.tensors.get(name)
     }
 
+    /// Decode a named weight to true (un-rotated) f32 values. Uses hipfire's
+    /// public HFQ decoder, which inverse-FWHTs the MQ4G256/G256V2 formats so
+    /// the result is the original weight matrix (row-major, `shape`).
+    pub fn f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
+        let t = self
+            .get(name)
+            .ok_or_else(|| format!("inkling2: tensor not found: {name}"))?;
+        let shape: Vec<usize> = t.info.shape.iter().map(|&d| d as usize).collect();
+        let n: usize = shape.iter().product();
+        let vals = hipfire_runtime::weight_backend::dequantize_weight_to_f32(
+            t.info.quant_type,
+            &t.data,
+            n,
+        );
+        if vals.len() != n {
+            return Err(format!(
+                "inkling2: decoded {name} to {} values, expected {n}",
+                vals.len()
+            ));
+        }
+        Ok((shape, vals))
+    }
+
     /// Expected expert tensor count: n_phys × n_experts × 2 (gate_up + down).
     pub fn expected_expert_tensors(cfg: &crate::config::Inkling2Config) -> usize {
         cfg.n_phys * cfg.n_experts * 2
@@ -119,6 +142,10 @@ mod tests {
     fn tiny_cfg() -> crate::config::Inkling2Config {
         // Reuse the metadata parser test's config by parsing the same JSON.
         crate::config::Inkling2Config::from_metadata_json(TEST_META).unwrap()
+    }
+
+    pub(crate) fn test_meta() -> &'static str {
+        TEST_META
     }
 
     const TEST_META: &str = r#"{"config":{"eos_token_id":200006,"text_config":{
