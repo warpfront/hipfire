@@ -39470,7 +39470,7 @@ impl Gpu {
     /// Exact-gfx1151 small-batch 4-bit G256 WMMA route (`*_gfx1151_xlds`, MQ4V2 and
     /// HFQ4G256/MQ4G256 v1): 1..=16 rows,
     /// K % 256 == 0, eager or HipGraph capture; Redline replay recording keeps the
-    /// base contract. `HIPFIRE_GFX1151_XLDS=0` restores the base kernels.
+    /// base contract. Exact gfx1151 only.
     pub(crate) fn gfx1151_xlds_active(&self, batch_size: usize, k: usize) -> bool {
         self.flags.gfx1151_xlds
             && self.arch_caps.is_gfx1151()

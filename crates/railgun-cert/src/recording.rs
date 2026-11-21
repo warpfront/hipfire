@@ -944,7 +944,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "gfx1151-mq4v2-verify-xlds",
         predicates: &[IsRecording],
-        condition: "Gpu::gfx1151_xlds_active: `flags.gfx1151_xlds && exact gfx1151 && !is_recording() && 1 <= N <= 16 && k % 256 == 0` (gemm.rs), consulted by gemm_{gate_up,qkvza,qkv}_mq4g256v2_wmma and gemm_mq4g256v2_residual_wmma (also the verify lm_head) just before the base launch, by the HFQ4G256/MQ4G256 v1 gemm_{qkvza,qkv}_hfq4g256_wmma, gemm_gate_up_hfq4g256_wmma and gemm_hfq4g256_residual_wmma (also gemm_hfq4g256_batched_lmhead; the last two only without a HIPFIRE_GATE_UP_VARIANT / HIPFIRE_WO_WMMA_VARIANT pin), by gemm_q8_0_wmma (Q8_0 DFlash draft/verify lm_head; also needs a 16 B aligned weight base), by gemm_gate_up_q8_0_wmma (two gemm_q8_0_wmma launches; both weight bases 16 B aligned) and by gemm_mw16_residual_wmma_f16x (DSpark F16 drafter lm_head; W and X 16 B aligned); eager and HipGraph capture both take the route (it ignores capture_mode), only Redline recording keeps the base contract. Kill switch HIPFIRE_GFX1151_XLDS=0",
+        condition: "Gpu::gfx1151_xlds_active: `flags.gfx1151_xlds && exact gfx1151 && !is_recording() && 1 <= N <= 16 && k % 256 == 0` (gemm.rs), consulted by gemm_{gate_up,qkvza,qkv}_mq4g256v2_wmma and gemm_mq4g256v2_residual_wmma (also the verify lm_head) just before the base launch, by the HFQ4G256/MQ4G256 v1 gemm_{qkvza,qkv}_hfq4g256_wmma, gemm_gate_up_hfq4g256_wmma and gemm_hfq4g256_residual_wmma (also gemm_hfq4g256_batched_lmhead; the last two only without a HIPFIRE_GATE_UP_VARIANT / HIPFIRE_WO_WMMA_VARIANT pin), by gemm_q8_0_wmma (Q8_0 DFlash draft/verify lm_head; also needs a 16 B aligned weight base), by gemm_gate_up_q8_0_wmma (two gemm_q8_0_wmma launches; both weight bases 16 B aligned) and by gemm_mw16_residual_wmma_f16x (DSpark F16 drafter lm_head; W and X 16 B aligned); eager and HipGraph capture both take the route (it ignores capture_mode), only Redline recording keeps the base contract.",
         effect: KernelSelection,
         switches: "eager/captured: `gemm_*_{mq4g256v2,hfq4g256}_wmma_gfx1151_xlds` / `gemm_q8_0_wmma_gfx1151_xlds` / `gemm_f16_wmma_gfx1151_xlds` (128-thread blocks, 4 waves x 16 rows, X slab staged in LDS); recorded: base one-wave `gemm_*_mq4g256v2_wmma` / `gemm_*_hfq4g256_wmma{,_ldscoop_nosync,_k2}` / `gemm_q8_0_wmma` / `gemm_gate_up_q8_0_wmma` / `gemm_mw16_residual_wmma`",
         kernels: &[
@@ -1181,7 +1181,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "dflash-gfx1100-shared-rotation",
         predicates: &[IsRecording, CaptureMode],
-        condition: "gemm_dispatch_shared (hipfire-runtime dflash.rs, #838), the DFlash draft's shared-input projection groups (noise Q/K/V, FFN gate/up, incremental context K/V): the group's kernel.draft_shared_{qkv,ffn,ctx_kv}_rotation switch (default on exact gfx1100), exact gfx1100, `!is_recording() && !capture_mode`, 2 <= rows <= 16, no HIPFIRE_DRAFT_GEMM_DUMP, every weight MQ4G256V2 with one k (k % 256 == 0) and no AWQ sidecar, rotation scratch for all rows. Host-only; decided before any launch",
+        condition: "gemm_dispatch_shared (hipfire-runtime dflash.rs, #838), the DFlash draft's shared-input projection groups (noise Q/K/V, FFN gate/up, incremental context K/V): exact gfx1100, `!is_recording() && !capture_mode`, 2 <= rows <= 16, no HIPFIRE_DRAFT_GEMM_DUMP, every weight MQ4G256V2 with one k (k % 256 == 0) and no AWQ sidecar, rotation scratch for all rows. Host-only; decided before any launch",
         effect: KernelSelection,
         switches: "eager: one rotation of the shared input (mq_rotate_x_f16_dflash_gfx1100 on the S7 split-K route, else mq_rotate_x) feeding every projection's GEMM; recorded/captured/refused: gemm_dispatch once per projection in order, one rotation each. Only the gfx1100-only F16 rotation symbol is listed: the generic mq_rotate_x is shared by every arch's routes, and attributing it here would let an unrelated mq_rotate_x difference pass G0 on another arch",
         kernels: &["mq_rotate_x_f16_dflash_gfx1100"],
@@ -1702,7 +1702,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-ep-vocab-shard-eager-only",
         predicates: &[IsRecording, CaptureMode],
-        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs): a step carrying a Flash-Next EP2 vocabulary shard (`LaneOutputs::vocab_shard`, HIPFIRE_QWEN4_EP_VOCAB_SHARD) errors before any launch when `gpu.replay.is_recording() || gpu.graphs.capture_mode`; the shard's peer exchange is host-ordered and runs only eager",
+        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs): a step carrying a Flash-Next EP2 vocabulary shard (`LaneOutputs::vocab_shard`) errors before any launch when `gpu.replay.is_recording() || gpu.graphs.capture_mode`; the shard's peer exchange is host-ordered and runs only eager",
         effect: Refusal,
         switches: "error before any launch vs the eager sharded head stage (half-width MQ6 projection, shard-local argmax, peer merge)",
         kernels: &[],

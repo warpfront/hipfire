@@ -15,8 +15,7 @@
 //! round-to-nearest-even, not the pipe128 recurrence's stochastic rounding.
 //! On for every admitted step.
 //!
-//! `HIPFIRE_QWEN4_GDN_CHAIN_FUSE` (exact gfx1201, default on, `0` restores the v1 producer and
-//! the F32 projection): the qkv projection arrives as BF16 bits (the producer only reads it
+//! On exact gfx1201 the qkv projection arrives as BF16 bits (the producer only reads it
 //! through its BF16 rounding) and the load-batched `fn_gdn_dense_producer_v2_{f32,bf16}` entries
 //! run; every stored byte is the v1 producer's.
 //!
@@ -25,7 +24,7 @@
 //! pure admission shared with the prefill-workspace census). The 16 / 48 entries are byte for byte
 //! the pre-shard ones; the 8 / 24 geometry has its own load-batched producer entries
 //! (`..._k8v24`) and gate entry (`fn_gdn_dense_gate_i8_p12`), so it needs
-//! `HIPFIRE_QWEN4_GDN_CHAIN_FUSE` (the v1 producer is 16 / 48 only). The KKT solve and the chunk
+//! the exact gfx1201 chain fusion (the v1 producer is 16 / 48 only). The KKT solve and the chunk
 //! scan take their head counts as kernel arguments. The thread-local A / EF scratch is sized at
 //! the 48-head upper bound, which is also what the census charges.
 
@@ -289,7 +288,7 @@ pub fn stream_geometry_admitted(
         )
 }
 
-/// [`stream_geometry_admitted`] under this device's flags (`HIPFIRE_QWEN4_GDN_CHAIN_FUSE`).
+/// [`stream_geometry_admitted`] under this device's flags (exact gfx1201 chain fusion).
 pub fn stream_admitted(
     gpu: &Gpu,
     format: GdnStateFormat,
@@ -531,8 +530,8 @@ pub fn run(
         args.push_i32(i32::from(conv.input.dtype == DType::BF16));
         args.push_f32((p.key_dim as f32).sqrt().recip());
         args.push_i32(ef_words as i32);
-        // `HIPFIRE_QWEN4_GDN_CHAIN_FUSE`: the load-batched producer (same bytes), entry by
-        // the projection's dtype; `=0` keeps the v1 entry (which reads either dtype). The
+        // Exact gfx1201 chain fusion: the load-batched producer (same bytes), entry by
+        // the projection's dtype; elsewhere the v1 entry (which reads either dtype). The
         // 8 / 24 shard geometry has only the load-batched entries (`applies` requires them).
         let chain_fuse = gpu.flags.qwen4_gdn_chain_fuse_enabled();
         if geometry.producer_entry(chain_fuse, false).is_none() {

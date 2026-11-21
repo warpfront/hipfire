@@ -4,7 +4,7 @@
 //! Exact-gfx1151 XLDS routes of `gemm_gate_up_q8_0_wmma` (two
 //! `gemm_q8_0_wmma_gfx1151_xlds` launches) and `gemm_mw16_residual_wmma_f16x`
 //! (`gemm_f16_wmma_gfx1151_xlds`) must be bitwise the base kernels
-//! (`HIPFIRE_GFX1151_XLDS=0`). Random weights, odd shapes (M not a multiple of
+//! (`FeatureFlags::gfx1151_xlds` cleared). Random weights, odd shapes (M not a multiple of
 //! 64, gate_m != up_m, partial batch tiles) plus the DSpark drafter shapes,
 //! N = 1, 5, 16. Panics on any differing f32 bit pattern (HIPF-111).
 //!

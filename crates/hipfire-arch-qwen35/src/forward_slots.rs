@@ -3251,16 +3251,6 @@ fn final_logits_per_slot(
     )
 }
 
-/// `HIPFIRE_BATCHED_HEAD` kill switch (developer, read once per process):
-/// unset or any value but `0` keeps the batched MQ4G256V2 lm_head on for exact
-/// gfx1201; `0` restores one single-vector lm_head GEMV per slot.
-fn batched_head_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_BATCHED_HEAD").as_deref() != Ok("0")
-    });
-    *ENABLED
-}
-
 /// `HIPFIRE_BATCHED_HEAD_VERIFY=1` (developer lab check, read once per
 /// process): after every batched head, also run the per-slot head into a side
 /// buffer and byte-compare every head row; any mismatch is an error. Needs the
@@ -3284,8 +3274,7 @@ fn batched_head_v2_admitted(
     lm_head_skip: &[bool],
     dim: usize,
 ) -> bool {
-    if !batched_head_enabled()
-        || weights.output.gpu_dtype != DType::MQ4G256V2
+    if weights.output.gpu_dtype != DType::MQ4G256V2
         || !gpu.arch_caps.is_gfx1201()
         || gpu.owns_host_cpu_weights()
         || pbs.x_rot_batch.numel() < batch.m_per_slot.len() * dim
