@@ -260,6 +260,7 @@ pub struct GgufF32 {
     path: std::path::PathBuf,
     /// name -> (shape, byte offset of data in file)
     index: HashMap<String, (Vec<usize>, u64)>,
+    cache: std::cell::RefCell<HashMap<String, (Vec<usize>, Vec<f32>)>>,
 }
 
 impl GgufF32 {
@@ -287,7 +288,7 @@ impl GgufF32 {
             f.seek(SeekFrom::Current((len * 4) as i64)).map_err(|e| format!("seek: {e}"))?;
             index.insert(name, (shape, off));
         }
-        Ok(Self { path: path.to_path_buf(), index })
+        Ok(Self { path: path.to_path_buf(), index, cache: std::cell::RefCell::new(HashMap::new()) })
     }
 
     fn read(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
@@ -307,8 +308,13 @@ impl GgufF32 {
 
 impl WeightSource for GgufF32 {
     fn f32(&self, hfq: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
-        // map HFQ (checkpoint) name -> GGUF name
-        let get = |n: &str| -> Result<(Vec<usize>, Vec<f32>), String> { self.read(n) };
+        // map HFQ (checkpoint) name -> GGUF name, with per-GGUF-name cache.
+        let get = |n: &str| -> Result<(Vec<usize>, Vec<f32>), String> {
+            if let Some(v) = self.cache.borrow().get(n) { return Ok(v.clone()); }
+            let v = self.read(n)?;
+            self.cache.borrow_mut().insert(n.to_string(), v.clone());
+            Ok(v)
+        };
         if hfq == "model.llm.embed.weight" {
             return get("token_embd.weight");
         }
@@ -360,16 +366,24 @@ impl WeightSource for GgufF32 {
                     return Ok((vec![hidden, inter], out));
                 }
             }
-            let map = |s: &str| -> String {
-                // controllers.{attn,k,v,mlp}.{down,gain,forget}_weight
-                for (short, tag) in [("attn", "q"), ("k", "k"), ("v", "v"), ("mlp", "ffn")] {
-                    for (kind, ktag) in [("down", "down"), ("gain", "gain"), ("forget", "forget")] {
-                        let key = format!("controllers.{short}.{kind}_weight");
-                        if s == key {
-                            return format!("{b}loop_{tag}_ctrl_{ktag}.weight");
-                        }
+            // controllers.{attn,k,v,mlp}.{down,gain,forget}_weight
+            // GGUF stores them transposed vs hipfire's control() convention.
+            for (short, tag) in [("attn", "q"), ("k", "k"), ("v", "v"), ("mlp", "ffn")] {
+                for (kind, ktag) in [("down", "down"), ("gain", "gain"), ("forget", "forget")] {
+                    if suffix == format!("controllers.{short}.{kind}_weight") {
+                        let gname = format!("{b}loop_{tag}_ctrl_{ktag}.weight");
+                        let (shape, v) = get(&gname)?;
+                        let rows = shape[0];
+                        let cols = shape[1];
+                        let mut t = vec![0.0f32; rows * cols];
+                        for i in 0..rows { for j in 0..cols {
+                            t[j * rows + i] = v[i * cols + j];
+                        }}
+                        return Ok((vec![cols, rows], t));
                     }
                 }
+            }
+            let map = |s: &str| -> String {
                 match s {
                     "attn.wq_du.weight" => format!("{b}attn_q.weight"),
                     "attn.wk_dv.weight" => format!("{b}attn_k.weight"),
@@ -382,6 +396,9 @@ impl WeightSource for GgufF32 {
                     "attn.q_l2_clip.scale" => format!("{b}attn_q_clip.weight"),
                     "attn.rel_l2_clip.scale" => format!("{b}attn_rel_clip.weight"),
                     "attn_norm.weight" => format!("{b}attn_norm.weight"),
+                    "q_input_norm.weight" => format!("{b}attn_q_inp_norm.weight"),
+                    "k_input_norm.weight" => format!("{b}attn_k_inp_norm.weight"),
+                    "v_input_norm.weight" => format!("{b}attn_v_inp_norm.weight"),
                     "attn.k_sconv.weight" | "attn.k_sconv.static_w" => {
                         format!("{b}attn_k_conv.weight")
                     }
@@ -419,14 +436,31 @@ impl WeightSource for GgufF32 {
             }
             return Ok((vec![24, e], if is_q { q_rows } else { kv_rows }));
         }
-        // global attn_res queries: attn_queries.{i} -> blk.{i+1}.attn_res_query
+        // global attn_res queries: GGUF stores [n_embd, rows] (ggml order),
+        // hipfire expects [rows, n_embd] — transpose.
         if let Some(rest) = hfq.strip_prefix("model.llm.attn_res.attn_queries.") {
             let i: usize = rest.parse().map_err(|_| "bad query idx")?;
-            return get(&format!("blk.{}.attn_res_query.weight", i + 1));
+            let (shape, v) = get(&format!("blk.{}.attn_res_query.weight", i + 1))?;
+            if shape.len() == 1 {
+                return Ok((vec![1, shape[0]], v));
+            }
+            let e = shape[0];
+            let rows = shape[1];
+            let mut t = vec![0.0f32; rows * e];
+            for r in 0..rows { for c in 0..e { t[r * e + c] = v[c * rows + r]; }}
+            return Ok((vec![rows, e], t));
         }
         if let Some(rest) = hfq.strip_prefix("model.llm.attn_res.mlp_queries.") {
             let i: usize = rest.parse().map_err(|_| "bad query idx")?;
-            return get(&format!("blk.{i}.ffn_res_query.weight"));
+            let (shape, v) = get(&format!("blk.{i}.ffn_res_query.weight"))?;
+            if shape.len() == 1 {
+                return Ok((vec![1, shape[0]], v));
+            }
+            let e = shape[0];
+            let rows = shape[1];
+            let mut t = vec![0.0f32; rows * e];
+            for r in 0..rows { for c in 0..e { t[r * e + c] = v[c * rows + r]; }}
+            return Ok((vec![rows, e], t));
         }
         get(hfq)
     }
