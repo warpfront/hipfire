@@ -39,7 +39,9 @@ use rdna_compute::vmm_page_pool::{
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::checkpoint::{
-    capture_checkpoint, free_checkpoints_for_vmm_map, plan_resume, CheckpointId, CheckpointPool,
+    capture_checkpoint_excluding, free_checkpoints_for_vmm_map, plan_resume,
+    should_drain_checkpoints_for_vmm_map, CheckpointId, CheckpointPool,
+    CHECKPOINT_MAP_RESERVE_BYTES,
 };
 use crate::forward_slots::{forward_batch_slots_graphed_opts, SlotDecodeGraph, SlotDescStaging};
 use crate::grammar;
@@ -517,7 +519,7 @@ impl ModelRig {
         // room first. Zero pending bytes is the common path: no device query
         // and no checkpoint bookkeeping at all.
         let need = mapper.pending_map_bytes(&states) as u64;
-        if crate::checkpoint::should_drain_checkpoints_for_vmm_map(
+        if should_drain_checkpoints_for_vmm_map(
             need,
             mapper.mapped_bytes() as u64,
             mapper.budget_bytes() as u64,
@@ -4441,15 +4443,74 @@ fn refresh_prefix_soft_protection(rig: &mut Rig) {
         .filter(|(_, s)| !s.has_image && s.prefix_boundary > 0)
         .map(|(_, s)| &s.tokens[..s.prefix_boundary.min(s.tokens.len())])
         .collect();
+    let ckpt_pool = rig.model.checkpoint_pool.as_ref();
     let (pages, checkpoints) = rig
         .prefix_index
         .as_ref()
         .expect("checked above")
-        .protection_for(domain, &prefixes, pool);
+        .protection_for_live(domain, &prefixes, pool, |id| {
+            ckpt_pool.is_none_or(|cp| cp.contains_id(id))
+        });
     rig.prefix_index
         .as_mut()
         .expect("checked above")
         .set_soft_protection(pages, checkpoints);
+}
+
+/// Capture a checkpoint for `slot` at `boundary`, refreshing soft protection
+/// lazily when `checkpoint_pool` may need to evict and honoring soft-protected
+/// live-session checkpoint ids.
+fn capture_slot_checkpoint(
+    rig: &mut Rig,
+    slot: usize,
+    boundary: u64,
+    tokens: &[u32],
+    log_prefix: &str,
+) -> Option<CheckpointId> {
+    if rig.model.checkpoint_pool.is_none() || rig.cache_domain.is_none() {
+        return None;
+    }
+    let bytes = crate::speculative::DeltaNetSnapshot::bytes_for(&rig.model.dn_states[slot]);
+    let needs_ckpt_refresh = rig.model.checkpoint_pool.as_ref().is_some_and(|cp| {
+        if cp.is_empty() {
+            return false;
+        }
+        if cp.total_bytes().saturating_add(bytes) > cp.max_bytes() {
+            return true;
+        }
+        let free = rig
+            .gpu
+            .device_mem_info()
+            .map(|(free, _)| free as u64)
+            .unwrap_or(0);
+        free < bytes.saturating_add(CHECKPOINT_MAP_RESERVE_BYTES)
+    });
+    if needs_ckpt_refresh {
+        refresh_prefix_soft_protection(rig);
+    }
+    let domain = rig.cache_domain.as_ref().unwrap();
+    let ckpt_pool = rig.model.checkpoint_pool.as_mut().unwrap();
+    let soft = rig
+        .prefix_index
+        .as_ref()
+        .map(|idx| idx.soft_checkpoints())
+        .unwrap_or(&NO_SOFT_CHECKPOINTS);
+    match capture_checkpoint_excluding(
+        &mut rig.gpu,
+        ckpt_pool,
+        domain,
+        boundary,
+        tokens,
+        &rig.model.dn_states[slot],
+        soft,
+    ) {
+        Ok(id) if id.is_some() => Some(id),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("[prefix-cache] {log_prefix}capture_checkpoint failed: {e}");
+            None
+        }
+    }
 }
 
 /// Refresh soft checkpoint protection only when a VMM granule map is pending
@@ -4630,40 +4691,62 @@ fn release_unpinned_device_cache(rig: &mut Rig) -> (usize, u64) {
     (pages, ckpt_bytes)
 }
 
+/// True when the pending VMM granule map fits within the mapper's configured
+/// byte budget and could benefit from draining checkpoints on retry.
+fn vmm_pending_map_within_budget(rig: &Rig) -> bool {
+    let (Some(mapper), Some(pp)) = (rig.model.paged_vmm.as_ref(), rig.pool.page_pool()) else {
+        return false;
+    };
+    let need = mapper.pending_map_bytes(&pp.page_states()) as u64;
+    should_drain_checkpoints_for_vmm_map(
+        need,
+        mapper.mapped_bytes() as u64,
+        mapper.budget_bytes() as u64,
+    )
+}
+
 /// Emergency device-cache reclaim when a VMM granule map has been refused.
 ///
-/// Unlike [`release_unpinned_device_cache`], this pass reclaims both
-/// unprotected AND soft-protected unpinned radix leaves and checkpoints
+/// Reclaims unreferenced (`evict_unprotected_leaves`) radix leaves only:
+/// soft-protected KV pages sit in already-mapped granules whose VA stays
+/// bound until teardown, so freeing them returns no device memory to
+/// `hipMemCreate`. When `drain_checkpoints` is `true` (the pending map fits
+/// within `mapper.budget_bytes()`), drains all unpinned checkpoints
 /// (unprotected first, then soft-protected; hard pins survive) and drains the
 /// GPU tensor pool so freed bytes are immediately visible to HIP.
-fn release_device_cache_under_pressure(rig: &mut Rig) -> (usize, u64) {
+fn release_device_cache_under_pressure(rig: &mut Rig, drain_checkpoints: bool) -> (usize, u64) {
     refresh_prefix_soft_protection(rig);
     let pages = if let (Some(idx), Some(pp)) = (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
     {
         let before = pp.free_pages();
-        idx.evict_unpinned_leaves(pp, usize::MAX);
+        idx.evict_unprotected_leaves(pp, usize::MAX);
         pp.drain_completed();
         pp.free_pages().saturating_sub(before)
     } else {
         0
     };
-    let protected = rig
-        .prefix_index
-        .as_ref()
-        .map(|idx| idx.soft_checkpoints().clone())
-        .unwrap_or_default();
-    let blobs = rig
-        .model
-        .checkpoint_pool
-        .as_mut()
-        .map(|pool| crate::checkpoint::drain_checkpoints_under_pressure(pool, &protected))
-        .unwrap_or_default();
-    let mut ckpt_bytes = 0u64;
-    for blob in blobs {
-        ckpt_bytes += blob.bytes_len();
-        blob.free_gpu(&mut rig.gpu);
-    }
-    rig.gpu.drain_pool();
+    let ckpt_bytes = if drain_checkpoints {
+        let protected = rig
+            .prefix_index
+            .as_ref()
+            .map(|idx| idx.soft_checkpoints().clone())
+            .unwrap_or_default();
+        let blobs = rig
+            .model
+            .checkpoint_pool
+            .as_mut()
+            .map(|pool| crate::checkpoint::drain_checkpoints_under_pressure(pool, &protected))
+            .unwrap_or_default();
+        let mut freed = 0u64;
+        for blob in blobs {
+            freed += blob.bytes_len();
+            blob.free_gpu(&mut rig.gpu);
+        }
+        rig.gpu.drain_pool();
+        freed
+    } else {
+        0
+    };
     (pages, ckpt_bytes)
 }
 
@@ -4772,36 +4855,18 @@ fn publish_generated_prefix(
     {
         refresh_prefix_soft_protection(rig);
     }
-    let domain = rig.cache_domain.as_ref().unwrap();
-    let idx = rig.prefix_index.as_mut().unwrap();
-    let pp = rig.pool.page_pool_mut().unwrap();
     // Capture a checkpoint only when the published boundary is exactly the
     // recurrent-state boundary (spec §4.5). A ceiling-refused capture
     // (CheckpointId::NONE) publishes pages without a checkpoint — the
     // boundary stays honestly unresumable.
     let checkpoint = if new_boundary == state_boundary {
-        if let Some(ckpt_pool) = rig.model.checkpoint_pool.as_mut() {
-            match capture_checkpoint(
-                &mut rig.gpu,
-                ckpt_pool,
-                domain,
-                new_boundary as u64,
-                &tokens,
-                &rig.model.dn_states[s],
-            ) {
-                Ok(id) if id.is_some() => Some(id),
-                Ok(_) => None,
-                Err(e) => {
-                    eprintln!("[prefix-cache] generated-prefix capture_checkpoint failed: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        }
+        capture_slot_checkpoint(rig, s, new_boundary as u64, &tokens, "generated-prefix ")
     } else {
         None
     };
+    let domain = rig.cache_domain.as_ref().unwrap();
+    let idx = rig.prefix_index.as_mut().unwrap();
+    let pp = rig.pool.page_pool_mut().unwrap();
     if let Err(e) = idx.publish_sealed_pages(domain, &tokens, &handles, checkpoint, pp) {
         eprintln!("[prefix-cache] generated-prefix publish_sealed_pages failed: {e:?}");
         // No cache refs to roll back — the index owns them and releases on
@@ -6384,34 +6449,43 @@ fn run_loop(
                         ));
                         break;
                     }
-                    let (pages, ckpt_bytes) = release_device_cache_under_pressure(&mut rig);
+                    let within_budget = vmm_pending_map_within_budget(&rig);
+                    let (pages, ckpt_bytes) =
+                        release_device_cache_under_pressure(&mut rig, within_budget);
                     eprintln!(
                         "[serve] VMM page map refused slot {s}: {error}; \
                          reclaimed {pages} kv pages and {ckpt_bytes} checkpoint bytes"
                     );
-                    // Parking idle sessions here would not help: a used VA
-                    // keeps its physical binding until teardown, so freeing
-                    // their pages returns no device memory to this map. The
-                    // checkpoint drain inside `sync_paged_vmm` is the lever.
-                    match sync_paged_vmm(&mut rig) {
-                        Ok(()) => continue,
-                        Err(retry_error) => {
-                            let poisoned = rig
-                                .model
-                                .paged_vmm
-                                .as_ref()
-                                .is_some_and(|mapper| mapper.is_poisoned());
-                            if poisoned {
-                                vmm_map_poison = Some(format!(
-                                    "VMM-paged map failed and the mapper is poisoned: {retry_error}"
-                                ));
-                                break;
+                    if within_budget {
+                        // Parking idle sessions here would not help: a used VA
+                        // keeps its physical binding until teardown, so freeing
+                        // their pages returns no device memory to this map. The
+                        // checkpoint drain inside `sync_paged_vmm` is the lever.
+                        match sync_paged_vmm(&mut rig) {
+                            Ok(()) => continue,
+                            Err(retry_error) => {
+                                let poisoned = rig
+                                    .model
+                                    .paged_vmm
+                                    .as_ref()
+                                    .is_some_and(|mapper| mapper.is_poisoned());
+                                if poisoned {
+                                    vmm_map_poison = Some(format!(
+                                        "VMM-paged map failed and the mapper is poisoned: {retry_error}"
+                                    ));
+                                    break;
+                                }
+                                eprintln!(
+                                    "[serve] VMM page map refused slot {s} after reclaim: {retry_error}; \
+                                     rejecting that request"
+                                );
                             }
-                            eprintln!(
-                                "[serve] VMM page map refused slot {s} after reclaim: {retry_error}; \
-                                 rejecting that request"
-                            );
                         }
+                    } else {
+                        eprintln!(
+                            "[serve] VMM page map refused slot {s} (budget exceeded); \
+                             rejecting that request"
+                        );
                     }
                     provision_failed.push(s);
                     if let Some(mut flight) = slots[s].take() {
@@ -6909,9 +6983,6 @@ fn run_loop(
                         {
                             refresh_prefix_soft_protection(&mut rig);
                         }
-                        let domain = rig.cache_domain.as_ref().unwrap();
-                        let idx = rig.prefix_index.as_mut().unwrap();
-                        let pp = rig.pool.page_pool_mut().unwrap();
                         // Capture a checkpoint at the boundary — ONLY when the
                         // published boundary is exactly the recurrent-state
                         // boundary (`next_pos`). The live DeltaNetState sits at
@@ -6922,28 +6993,13 @@ fn run_loop(
                         // checkpoint, so lookups fall back to an earlier aligned
                         // checkpoint or an honest cold recompute.
                         let checkpoint = if new_boundary == work[s].next_pos {
-                            if let Some(ckpt_pool) = rig.model.checkpoint_pool.as_mut() {
-                                match capture_checkpoint(
-                                    &mut rig.gpu,
-                                    ckpt_pool,
-                                    domain,
-                                    new_boundary as u64,
-                                    &tokens,
-                                    &rig.model.dn_states[s],
-                                ) {
-                                    Ok(id) if id.is_some() => Some(id),
-                                    Ok(_) => None, // pool at ceiling: publish pages only
-                                    Err(e) => {
-                                        eprintln!("[prefix-cache] capture_checkpoint failed: {e}");
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            }
+                            capture_slot_checkpoint(&mut rig, s, new_boundary as u64, &tokens, "")
                         } else {
                             None
                         };
+                        let domain = rig.cache_domain.as_ref().unwrap();
+                        let idx = rig.prefix_index.as_mut().unwrap();
+                        let pp = rig.pool.page_pool_mut().unwrap();
                         // A19 fault injection (host test seam): with
                         // HIPFIRE_FAULT_PREFIX_PUBLISH=1 the first publish
                         // attempt fails so the honest-miss behavior (and the
@@ -8020,6 +8076,139 @@ fn sync_fair_needs(
     let _ = q.set_uncached_prefill(id, uncached);
 }
 
+/// Reclaim pages for a request entering `admit()` in priority order:
+/// 1) drain completed in-flight page refs;
+/// 2) evict unprotected prefix-cache leaves (shortfall first, then all);
+/// 3) evict/swap LRU idle resident sessions (excluding `exclude`);
+/// 4) under remaining pressure, evict soft-protected prefix-cache leaves.
+/// Returns the resulting `free_pages()` count.
+fn reclaim_pages_for_admit(
+    rig: &mut Rig,
+    needed_pages: usize,
+    exclude: &[SessionId],
+    stats: &Arc<Mutex<EngineStats>>,
+    trace_cold: bool,
+) -> usize {
+    if let Some(pp) = rig.pool.page_pool_mut() {
+        pp.drain_completed();
+    }
+    let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+    if free >= needed_pages {
+        return free;
+    }
+
+    refresh_prefix_soft_protection(rig);
+    let page_bytes = rig
+        .pool
+        .page_pool()
+        .map(|pp| pp.k_page_bytes() + pp.v_page_bytes())
+        .unwrap_or(0);
+
+    // 1) Unprotected prefix-cache leaves (shortfall first, then remaining).
+    if page_bytes > 0 {
+        if let (Some(idx), Some(pp)) = (rig.prefix_index.as_mut(), rig.pool.page_pool_mut()) {
+            let shortfall_bytes = needed_pages.saturating_sub(free).saturating_mul(page_bytes);
+            let mut evicted = idx.evict_unprotected_leaves(pp, shortfall_bytes);
+            pp.drain_completed();
+            if pp.free_pages() < needed_pages {
+                evicted.extend(idx.evict_unprotected_leaves(pp, usize::MAX));
+                pp.drain_completed();
+            }
+            if trace_cold && !evicted.is_empty() && rig.gpu.slot_trace() {
+                eprintln!(
+                    "[slot-trace] reclaimed {} cache-only pages under admission pressure",
+                    evicted.len()
+                );
+            }
+        }
+    }
+
+    // 2) Evict/swap LRU idle resident sessions.
+    loop {
+        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+        if free >= needed_pages {
+            return free;
+        }
+        let Some(victim) = rig.sessions.lru_idle_victim(exclude) else {
+            break;
+        };
+        if !evict(rig, victim, stats) {
+            break;
+        }
+        if let Some(pp) = rig.pool.page_pool_mut() {
+            pp.drain_completed();
+        }
+        lock_stats(stats).note_eviction();
+        if trace_cold && rig.gpu.slot_trace() {
+            eprintln!(
+                "[slot-trace] evicted idle session {victim:?} for page demand \
+                 ({free} free < {needed_pages} needed)"
+            );
+        }
+    }
+
+    // 3) Soft-protected prefix-cache leaves under real pressure.
+    let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+    if free < needed_pages && page_bytes > 0 {
+        if let (Some(idx), Some(pp)) = (rig.prefix_index.as_mut(), rig.pool.page_pool_mut()) {
+            let shortfall_bytes = needed_pages.saturating_sub(free).saturating_mul(page_bytes);
+            let mut evicted = idx.evict_unpinned_leaves(pp, shortfall_bytes);
+            pp.drain_completed();
+            if pp.free_pages() < needed_pages {
+                evicted.extend(idx.evict_unpinned_leaves(pp, usize::MAX));
+                pp.drain_completed();
+            }
+            if trace_cold && !evicted.is_empty() && rig.gpu.slot_trace() {
+                eprintln!(
+                    "[slot-trace] reclaimed {} soft-protected cache pages under admission pressure",
+                    evicted.len()
+                );
+            }
+        }
+    }
+
+    rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0)
+}
+
+/// Roll back a post-`admit_cold` admission failure. If `id` was reopened from
+/// a `Cold` session (`cold_backup`), park it `Cold` again and restore its
+/// saved tokens and `prefix_boundary` so a transient error (e.g. `Overload`)
+/// leaves the `SessionId` retryable. Fresh sessions are closed.
+fn abort_cold_admit_in(
+    sessions: &mut SessionTable,
+    pool: &mut SlotPool,
+    adm: &mut AdmissionController,
+    id: SessionId,
+    cold_backup: Option<(SessionId, Vec<u32>, usize)>,
+) {
+    match cold_backup {
+        Some((cid, tokens, prefix_boundary)) if cid == id => {
+            sessions.mark_cold(pool, adm, id);
+            if let Some(sess) = sessions.get_mut(id) {
+                sess.tokens = tokens;
+                sess.prefix_boundary = prefix_boundary;
+            }
+        }
+        _ => {
+            sessions.close(pool, adm, id);
+        }
+    }
+}
+
+fn abort_cold_admit(
+    rig: &mut Rig,
+    id: SessionId,
+    cold_backup: Option<(SessionId, Vec<u32>, usize)>,
+) {
+    abort_cold_admit_in(
+        &mut rig.sessions,
+        &mut rig.pool,
+        &mut rig.adm,
+        id,
+        cold_backup,
+    );
+}
+
 /// Admit one request, evicting an idle session if that is what it takes.
 fn admit(
     rig: &mut Rig,
@@ -8264,44 +8453,9 @@ fn admit(
                         .saturating_add(req.max_tokens.max(1))
                         .div_ceil(PAGE_TOKENS)
                         .saturating_add(1);
-                    let free_now = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                    if free_now < needed_pages {
-                        refresh_prefix_soft_protection(rig);
-                    }
-                    if let (Some(idx), Some(domain)) =
-                        (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
-                    {
-                        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                        if free < needed_pages {
-                            let page_bytes = rig
-                                .pool
-                                .page_pool()
-                                .map(|pp| pp.k_page_bytes() + pp.v_page_bytes())
-                                .unwrap_or(0);
-                            let pp = rig.pool.page_pool_mut().expect("paged pool");
-                            idx.evict_unpinned_leaves(
-                                pp,
-                                needed_pages.saturating_sub(free) * page_bytes,
-                            );
-                        }
-                        let _ = domain;
-                    }
                     let mut exclude: Vec<SessionId> = busy.clone();
                     exclude.push(existing);
-                    loop {
-                        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                        if free >= needed_pages {
-                            break;
-                        }
-                        let Some(victim) = rig.sessions.lru_idle_victim(&exclude) else {
-                            break;
-                        };
-                        if !evict(rig, victim, stats) {
-                            break;
-                        }
-                        lock_stats(stats).note_eviction();
-                    }
-                    let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+                    let free = reclaim_pages_for_admit(rig, needed_pages, &exclude, stats, false);
                     if free < needed_pages {
                         // Keep the session resident — a smaller retry can
                         // still continue it; only this request is refused.
@@ -8693,6 +8847,12 @@ fn admit(
     // request's grant did not fit and it parked behind the first until its
     // session closed — slots serialized for long generations even though
     // both had free pages and free rows.
+    let cold_backup = cold_reuse.and_then(|cid| {
+        rig.sessions
+            .get(cid)
+            .filter(|s| s.residency == Residency::Cold)
+            .map(|s| (cid, s.tokens.clone(), s.prefix_boundary))
+    });
     let grant_tokens = req
         .prompt_tokens
         .len()
@@ -8822,7 +8982,7 @@ fn admit(
                     reason: format!("KV capacity: {reason}"),
                 },
             );
-            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+            abort_cold_admit(rig, id, cold_backup);
             lock_stats(stats).note_rejected();
             return;
         }
@@ -8841,7 +9001,7 @@ fn admit(
                 reason: format!("state reset failed: {e}"),
             },
         );
-        rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+        abort_cold_admit(rig, id, cold_backup);
         lock_stats(stats).note_rejected();
         return;
     }
@@ -8943,6 +9103,10 @@ fn admit(
                             if shared_ok {
                                 prefix_reused = boundary;
                                 prefix_hit = true;
+                                if let Some(sess) = rig.sessions.get_mut(id) {
+                                    sess.published_boundary = prefix_reused;
+                                    sess.prefix_boundary = sess.prefix_boundary.max(prefix_reused);
+                                }
                                 if rig.gpu.slot_trace() {
                                     eprintln!(
                                         "[slot-trace] prefix cache HIT: \
@@ -8991,51 +9155,10 @@ fn admit(
         }
     }
 
-    // ── Cache reclaim under page pressure (spec §4.4 C4) ────────────────
-    // Running work has priority over cache-only residency: before this
-    // request's prefill starts allocating, make sure the pool can back the
-    // suffix plus the generation budget. If free pages are short, evict
-    // oldest unpinned radix leaves (their cache-only pages return to the
-    // free list) rather than letting a mid-prefill provision fail.
-    if rig.prefix_cache {
-        let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
-        let needed_pages = suffix_tokens
-            .saturating_add(req.max_tokens.max(1))
-            .div_ceil(PAGE_TOKENS)
-            .saturating_add(1);
-        let page_bytes = rig
-            .pool
-            .page_pool()
-            .map(|pp| pp.k_page_bytes() + pp.v_page_bytes())
-            .unwrap_or(0);
-        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-        if page_bytes > 0 && free < needed_pages {
-            refresh_prefix_soft_protection(rig);
-            let evict_bytes = needed_pages.saturating_sub(free) * page_bytes;
-            let evicted = if let (Some(idx), Some(_domain)) =
-                (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
-            {
-                let pp = rig.pool.page_pool_mut().expect("paged pool");
-                idx.evict_unpinned_leaves(pp, evict_bytes)
-            } else {
-                Vec::new()
-            };
-            if !evicted.is_empty() && rig.gpu.slot_trace() {
-                eprintln!(
-                    "[slot-trace] reclaimed {} cache-only pages under admission pressure",
-                    evicted.len()
-                );
-            }
-        }
-    }
-
-    // ── Idle-session reclaim under page pressure (spec §5.4 S4 row 3) ──
-    // Radix-leaf eviction only frees cache-only pages. Pages held by idle
-    // resident sessions' table refs are neither free nor radix-evictable,
-    // so a shortfall here means the forward WILL fail mid-prefill with
-    // "need N more pages". Evict LRU idle sessions (snapshot to swap, or
-    // cold on snapshot failure) until the demand is backed; if no victim
-    // remains, reject at admit instead of letting the forward die.
+    // ── Cache & idle-session reclaim under page pressure (spec §4.4/5.4) ──
+    // Before prefill starts allocating, make sure the pool can back the
+    // suffix plus the generation budget: unprotected radix leaves first, then
+    // LRU idle resident sessions, then soft-protected radix leaves.
     if rig.pool.is_paged() {
         let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
         let needed_pages = suffix_tokens
@@ -9046,26 +9169,7 @@ fn admit(
         // exclude it explicitly so it is never its own eviction victim.
         let mut exclude: Vec<SessionId> = busy.clone();
         exclude.push(id);
-        loop {
-            let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-            if free >= needed_pages {
-                break;
-            }
-            let Some(victim) = rig.sessions.lru_idle_victim(&exclude) else {
-                break;
-            };
-            if !evict(rig, victim, stats) {
-                break;
-            }
-            lock_stats(stats).note_eviction();
-            if rig.gpu.slot_trace() {
-                eprintln!(
-                    "[slot-trace] evicted idle session {victim:?} for page demand \
-                     ({free} free < {needed_pages} needed)"
-                );
-            }
-        }
-        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+        let free = reclaim_pages_for_admit(rig, needed_pages, &exclude, stats, true);
         if free < needed_pages {
             let _ = send_event(
                 &req.reply,
@@ -9078,7 +9182,7 @@ fn admit(
                 },
             );
             release_pin_ticket(rig, &mut pin_ticket);
-            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+            abort_cold_admit(rig, id, cold_backup);
             lock_stats(stats).note_rejected();
             return;
         }
@@ -9109,31 +9213,13 @@ fn admit(
                         reason: e,
                     },
                 );
-                rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+                abort_cold_admit(rig, id, cold_backup);
                 lock_stats(stats).note_rejected();
                 return;
             }
         };
         plan.reused
     };
-    if let Some(sess) = rig.sessions.get_mut(id) {
-        sess.tokens = req.prompt_tokens.clone();
-        sess.convo = req.convo.clone();
-        // An image turn defines the conversation's M-RoPE phase offset for
-        // every later text continuation; a text-only conversation stays 0
-        // (fresh sessions are, but this path also serves continuation-miss
-        // re-prefills, which must not inherit anything stale).
-        sess.rope_delta = req
-            .visual_data
-            .as_ref()
-            .map(|vd| vd.rope_delta)
-            .unwrap_or(0);
-        // Sticky image marker: `rope_delta` is 0 for a thin (single-row/col)
-        // image, so it cannot stand in for "this conversation carries an
-        // image turn". `has_image` is the publish/lookup gate for the prefix
-        // cache (spec §6 X2).
-        sess.has_image = sess.has_image || req.visual_data.is_some();
-    }
 
     if send_event(
         &req.reply,
@@ -9146,9 +9232,9 @@ fn admit(
     .is_err()
     {
         // A prefix hit still holds its PinTicket — release it before
-        // closing so the path does not pin the radix forever.
+        // aborting so the path does not pin the radix forever.
         release_pin_ticket(rig, &mut pin_ticket);
-        rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+        abort_cold_admit(rig, id, cold_backup);
         return;
     }
 
@@ -9178,7 +9264,7 @@ fn admit(
     // validate_generate_caps; recompile here to build the per-request
     // mutable cursor. CompiledSchema is immutable and Send+Sync; the
     // SchemaMatcher is request-local mutable state (spec §7.2 G2).
-    let grammar_constraint = req.json_schema.as_ref().and_then(|schema| {
+    let grammar_constraint = if let Some(schema) = req.json_schema.as_ref() {
         match cached_compile_schema(rig, schema) {
             Ok(compiled) => Some(GrammarConstraint {
                 matcher: grammar::json_schema::SchemaMatcher::from_compiled(&compiled),
@@ -9202,15 +9288,31 @@ fn admit(
                     },
                 );
                 release_pin_ticket(rig, &mut pin_ticket);
-                rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+                abort_cold_admit(rig, id, cold_backup);
                 lock_stats(stats).note_rejected();
-                return None;
+                return;
             }
         }
-    });
-    // If compilation failed and we already sent Rejected, bail out.
-    if req.json_schema.is_some() && grammar_constraint.is_none() {
-        return;
+    } else {
+        None
+    };
+    if let Some(sess) = rig.sessions.get_mut(id) {
+        sess.tokens = req.prompt_tokens.clone();
+        sess.convo = req.convo.clone();
+        // An image turn defines the conversation's M-RoPE phase offset for
+        // every later text continuation; a text-only conversation stays 0
+        // (fresh sessions are, but this path also serves continuation-miss
+        // re-prefills, which must not inherit anything stale).
+        sess.rope_delta = req
+            .visual_data
+            .as_ref()
+            .map(|vd| vd.rope_delta)
+            .unwrap_or(0);
+        // Sticky image marker: `rope_delta` is 0 for a thin (single-row/col)
+        // image, so it cannot stand in for "this conversation carries an
+        // image turn". `has_image` is the publish/lookup gate for the prefix
+        // cache (spec §6 X2).
+        sess.has_image = sess.has_image || req.visual_data.is_some();
     }
     let grammar_constrained = grammar_constraint.is_some();
     if let Some(vd) = req.visual_data {
@@ -10958,6 +11060,63 @@ mod tests {
             assert_eq!(idle_since, Some(t0));
             assert!(idle_reclaimed);
         }
+    }
+
+    #[test]
+    fn abort_cold_admit_restores_reopened_cold_session_and_closes_fresh_session() {
+        let n_slots = 2;
+        let mut pool = SlotPool::new(n_slots, 4096, 1088).unwrap();
+        let mut adm = AdmissionController::new(
+            ModelFootprint {
+                weights_bytes: 0,
+                kv_bytes_per_token: 1024,
+                pinned_host_bytes: 0,
+            },
+            32 * 1024 * 1024 * 1024,
+        );
+        let mut sessions = SessionTable::default();
+
+        // Seed a session, park it Cold with saved tokens and prefix_boundary,
+        // then reopen it (which clears tokens and prefix_boundary).
+        let cold_id = sessions.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = sessions.get_mut(cold_id).unwrap();
+            s.tokens = vec![10, 20, 30, 40];
+            s.prefix_boundary = 256;
+            s.published_boundary = 256;
+            s.convo = vec![111];
+        }
+        sessions.mark_cold(&mut pool, &mut adm, cold_id);
+        let cold_backup = sessions
+            .get(cold_id)
+            .map(|s| (cold_id, s.tokens.clone(), s.prefix_boundary));
+        sessions
+            .reopen_cold(&mut pool, &mut adm, cold_id, 1024)
+            .unwrap();
+        assert_eq!(
+            sessions.get(cold_id).unwrap().residency,
+            Residency::Resident
+        );
+        assert!(sessions.get(cold_id).unwrap().tokens.is_empty());
+        assert_eq!(sessions.get(cold_id).unwrap().prefix_boundary, 0);
+
+        // Aborting the reopened Cold admit restores Cold residency, tokens, and
+        // prefix_boundary while returning its slot and grant.
+        abort_cold_admit_in(&mut sessions, &mut pool, &mut adm, cold_id, cold_backup);
+        let restored = sessions
+            .get(cold_id)
+            .expect("reopened Cold session must survive abort");
+        assert_eq!(restored.residency, Residency::Cold);
+        assert!(restored.slot.is_none());
+        assert_eq!(restored.tokens, vec![10, 20, 30, 40]);
+        assert_eq!(restored.prefix_boundary, 256);
+        assert_eq!(restored.published_boundary, 0);
+        assert_eq!(restored.convo, vec![111]);
+
+        // Aborting a fresh session (cold_backup == None) closes it completely.
+        let fresh_id = sessions.open(&mut pool, &mut adm, 1024).unwrap();
+        abort_cold_admit_in(&mut sessions, &mut pool, &mut adm, fresh_id, None);
+        assert!(sessions.get(fresh_id).is_none());
     }
 }
 

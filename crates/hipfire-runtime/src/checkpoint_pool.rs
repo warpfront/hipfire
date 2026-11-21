@@ -168,6 +168,16 @@ impl<B: CheckpointBlob> CheckpointPool<B> {
         self.total_bytes
     }
 
+    /// Whether any currently resident entry in the pool carries `id`.
+    ///
+    /// Used by [`crate::prefix_index::PrefixIndex::protection_for_live`] so a
+    /// checkpoint evicted from the pool under device or ceiling pressure does
+    /// not remain the sole soft-protected candidate on a radix path and shadow
+    /// an earlier live fallback checkpoint.
+    pub fn contains_id(&self, id: CheckpointId) -> bool {
+        !id.is_none() && self.entries.values().any(|e| e.id == id)
+    }
+
     /// Number of entries currently in the pool.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -235,10 +245,24 @@ impl<B: CheckpointBlob> CheckpointPool<B> {
         fp: u64,
         blob: B,
     ) -> (CheckpointId, Vec<B>) {
+        self.insert_excluding(domain, p, fp, blob, &HashSet::new())
+    }
+
+    /// [`Self::insert`] preferring to evict unpinned entries whose
+    /// [`CheckpointId`] is not in `excluded` before touching soft-protected
+    /// entries when reclaiming to stay under `max_bytes`.
+    pub fn insert_excluding(
+        &mut self,
+        domain: CacheDomain,
+        p: u64,
+        fp: u64,
+        blob: B,
+        excluded: &HashSet<CheckpointId>,
+    ) -> (CheckpointId, Vec<B>) {
         if !Self::is_aligned(p) {
             return (CheckpointId::NONE, vec![blob]);
         }
-        self.insert_unaligned(domain, p, fp, blob)
+        self.insert_unaligned_excluding(domain, p, fp, blob, excluded)
     }
 
     /// [`Self::insert`] without the page-alignment requirement, for owners
@@ -250,6 +274,19 @@ impl<B: CheckpointBlob> CheckpointPool<B> {
         p: u64,
         fp: u64,
         blob: B,
+    ) -> (CheckpointId, Vec<B>) {
+        self.insert_unaligned_excluding(domain, p, fp, blob, &HashSet::new())
+    }
+
+    /// [`Self::insert_unaligned`] preferring to evict unpinned entries whose
+    /// [`CheckpointId`] is not in `excluded` before soft-protected entries.
+    pub fn insert_unaligned_excluding(
+        &mut self,
+        domain: CacheDomain,
+        p: u64,
+        fp: u64,
+        blob: B,
+        excluded: &HashSet<CheckpointId>,
     ) -> (CheckpointId, Vec<B>) {
         let mut displaced: Vec<B> = Vec::new();
 
@@ -269,9 +306,13 @@ impl<B: CheckpointBlob> CheckpointPool<B> {
         // Clear any prior eviction record for this key.
         self.evicted.remove(&key);
 
-        // Evict oldest unpinned until we can afford the new blob.
-        while self.total_bytes + bytes > self.max_bytes {
-            match self.find_oldest_unpinned_key() {
+        // Evict oldest unpinned until we can afford the new blob, taking
+        // unprotected entries before soft-protected ones.
+        while self.total_bytes.saturating_add(bytes) > self.max_bytes {
+            let next_victim = self
+                .find_oldest_unpinned_key_excluding(excluded)
+                .or_else(|| self.find_oldest_unpinned_key());
+            match next_victim {
                 Some(evict_key) => {
                     if let Some(blob) = self.evict_internal(evict_key) {
                         displaced.push(blob);
@@ -1576,5 +1617,54 @@ mod tests {
             pool.contains(&d, 128, fp(128)),
             "the pinned entry survives both passes"
         );
+    }
+
+    #[test]
+    fn contains_id_tracks_live_entries_and_clears_on_eviction() {
+        let mut pool = CheckpointPool::<HostBlob>::new(1 << 20);
+        let d = test_domain("contains-id");
+        assert!(!pool.contains_id(CheckpointId::NONE));
+        assert!(!pool.contains_id(CheckpointId(999)));
+
+        let (id128, _) = pool.insert(d.clone(), 128, fp(128), HostBlob { bytes: 10 });
+        let (id256, _) = pool.insert(d.clone(), 256, fp(256), HostBlob { bytes: 10 });
+        assert!(pool.contains_id(id128));
+        assert!(pool.contains_id(id256));
+
+        let mut keep = HashSet::new();
+        keep.insert(id256);
+        let (evicted_key, _) = pool.pop_lru_excluding(&keep).unwrap();
+        assert_eq!(evicted_key.1, 128);
+        assert!(!pool.contains_id(id128));
+        assert!(pool.contains_id(id256));
+    }
+
+    #[test]
+    fn insert_excluding_evicts_unprotected_before_soft_protected_at_ceiling() {
+        let mut pool = CheckpointPool::<HostBlob>::new(200);
+        let d = test_domain("insert-exclude");
+        let (id128, _) = pool.insert(d.clone(), 128, fp(128), HostBlob { bytes: 100 });
+        let (id256, _) = pool.insert(d.clone(), 256, fp(256), HostBlob { bytes: 100 });
+
+        // `id128` is older than `id256` but soft-protected: ceiling eviction
+        // for `384` must displace `id256` and preserve `id128`.
+        let mut excluded = HashSet::new();
+        excluded.insert(id128);
+        let (id384, displaced) =
+            pool.insert_excluding(d.clone(), 384, fp(384), HostBlob { bytes: 100 }, &excluded);
+        assert_eq!(displaced.len(), 1);
+        assert!(pool.contains_id(id128));
+        assert!(!pool.contains_id(id256));
+        assert!(pool.contains_id(id384));
+
+        // When every remaining entry is soft-protected, real ceiling pressure
+        // still evicts the oldest soft-protected entry (`id128`).
+        excluded.insert(id384);
+        let (id512, displaced2) =
+            pool.insert_excluding(d.clone(), 512, fp(512), HostBlob { bytes: 100 }, &excluded);
+        assert_eq!(displaced2.len(), 1);
+        assert!(!pool.contains_id(id128));
+        assert!(pool.contains_id(id384));
+        assert!(pool.contains_id(id512));
     }
 }
