@@ -51,7 +51,9 @@ pub(crate) use session_pair::with_sp_identity;
 pub(crate) use session_pair::SlowlinkFailPoint;
 #[cfg(any(test, feature = "lab", feature = "reference-parity"))]
 pub use session_pair::SLOWLINK_PRIMITIVES;
-pub(crate) use session_pair::{PairSessionStage, PromptTxn, SlowlinkOwner, SlowlinkScope};
+pub(crate) use session_pair::{
+    PairSessionStage, PromptTxn, SlowlinkOwner, SlowlinkScope, StageLayout,
+};
 
 #[path = "bundle/pp.rs"]
 mod pp;
