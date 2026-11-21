@@ -742,9 +742,7 @@ fn run() -> R<bool> {
         return Err(format!("needs exact gfx1201, got {}", gpu.arch));
     }
     if !gpu.flags.qwen4_lane_hc_allrows_enabled() {
-        return Err(
-            "HIPFIRE_QWEN4_LANE_HC_ALLROWS is off: the all-rows arm would not engage".into(),
-        );
+        return Err("the all-rows HC arm would not engage".into());
     }
 
     // Group the payloads by connection prefix.
