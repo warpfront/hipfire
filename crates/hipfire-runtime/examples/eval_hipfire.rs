@@ -79,7 +79,9 @@
 //! scored-region call goes through `forward_prefill_batch_capped` with cap N,
 //! so the scored rows run as consecutive N-row verify-capture forwards (the
 //! shape of an MTP K = N-1 verify) instead of one 1023-row call. The prefix
-//! call is unchanged. Use it to measure routes that gate on a small row count
+//! call is unchanged; the GDN stream is sealed at the prompt end before the
+//! verify forwards. A cap that would leave a 1-row tail (below the planner's
+//! two-token minimum) runs its last forward as N+1 rows. Use it to measure routes that gate on a small row count
 //! (e.g. the exact-gfx1100 2..=5-row verify GEMV); compare like with like,
 //! since the KV/state commit cadence differs from the default split mode.
 //! Absent (the default), the scored call is byte-for-byte the historical one.
@@ -1042,22 +1044,48 @@ fn main() {
                         None,
                     )
                     .expect("forward_prefill_batch prefix (scored-max-batch)");
-                    let scored_rows = scoring_start..(n_ctx - 1 + usize::from(pad_scoring_tail));
-                    qwen35::forward_prefill_batch_capped(
-                        &mut gpu,
-                        &weights,
-                        &config,
-                        &chunk_tokens[scored_rows],
-                        scoring_start,
-                        &mut kv_cache,
-                        &mut dn_state,
-                        &scratch,
-                        None,
-                        Some(h_buf),
-                        None,
-                        cap,
-                    )
-                    .expect("forward_prefill_batch_capped scored");
+                    // A verify-capture forward may not consume an Open GDN
+                    // stream: seal it at the prompt end, as the production
+                    // verify paths do.
+                    dn_state
+                        .seal_streams(&mut gpu, scoring_start)
+                        .expect("seal_streams (scored-max-batch)");
+                    let scored_end = n_ctx - 1 + usize::from(pad_scoring_tail);
+                    let n_scored = scored_end - scoring_start;
+                    // The chunk planner refuses a 1-row forward, so a cap that
+                    // leaves a 1-row tail folds it into a final cap+1 forward.
+                    let head = if n_scored % cap == 1 && n_scored > cap {
+                        n_scored - cap - 1
+                    } else {
+                        n_scored
+                    };
+                    let mut run = |rows: std::ops::Range<usize>, cap: usize| {
+                        let out = h_buf.sub_offset(
+                            (rows.start - scoring_start) * config.dim,
+                            rows.len() * config.dim,
+                        );
+                        qwen35::forward_prefill_batch_capped(
+                            &mut gpu,
+                            &weights,
+                            &config,
+                            &chunk_tokens[rows.clone()],
+                            rows.start,
+                            &mut kv_cache,
+                            &mut dn_state,
+                            &scratch,
+                            None,
+                            Some(&out),
+                            None,
+                            cap,
+                        )
+                        .expect("forward_prefill_batch_capped scored");
+                    };
+                    if head > 0 {
+                        run(scoring_start..scoring_start + head, cap);
+                    }
+                    if head < n_scored {
+                        run(scoring_start + head..scored_end, cap + 1);
+                    }
                     h_buf
                 } else {
                     qwen35::forward_prefill_batch(
