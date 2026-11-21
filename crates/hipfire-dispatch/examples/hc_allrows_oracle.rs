@@ -2118,11 +2118,9 @@ fn run() -> R<bool> {
         return Err(format!("needs exact gfx1201, got {}", gpu.arch));
     }
     if !gpu.flags.qwen4_lane_hc_allrows_enabled() {
-        return Err(
-            "HIPFIRE_QWEN4_LANE_HC_ALLROWS=1 is required: the all-rows arm is off, the oracle \
+        return Err("the all-rows arm is off, the oracle \
              would compare the incumbent with itself"
-                .into(),
-        );
+            .into());
     }
     let log = Arc::new(Log::default());
     let sink = log.clone();
