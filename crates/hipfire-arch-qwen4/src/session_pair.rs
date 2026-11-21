@@ -223,8 +223,9 @@ impl Qwen4Bundle {
         let layout = StageLayout::of(&self.state);
         for (slot, layer) in self.state.gdn.iter().enumerate() {
             if let Some(carry) = &layer.carry {
+                let parts = carry.tensors();
                 let index = layout.gdn_index(slot).expect("owned GDN slot");
-                stage.copy_parts(gpu, index + layout.gdn_parts - 3, carry.tensors())?;
+                stage.copy_parts(gpu, index + layout.gdn_parts - parts.len(), parts)?;
             }
         }
         Ok(Some(stage))
