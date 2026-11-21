@@ -464,6 +464,7 @@ impl Gpu {
     /// `g[rank]`, `gain_out[n_embd]`, `forget_out[n_embd]` —
     /// `4*n_embd + rank` floats. The three projections reuse `gemv_f32`;
     /// the two input norms use [`Self::inkling2_rmsnorm_nogamma_f32`].
+    #[allow(clippy::too_many_arguments)]
     pub fn inkling2_control_f32_gpu(
         &mut self,
         cur: &GpuTensor,
