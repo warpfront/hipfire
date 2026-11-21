@@ -26,7 +26,7 @@ pub(crate) const TEST_METADATA: &str = r#"{"config":{"eos_token_id":200006,"text
     "log_scaling_n_floor":8192,"log_scaling_alpha":0.1,"sconv_kernel_size":4,
     "n_layers_per_attn_res_block":6,"final_logit_softcapping":30.0,
     "n_routed_experts":128,"num_experts_per_tok":8,"intermediate_size":1152,
-    "route_scale":8.0,"mlp_gate_softcap":4.0,"mlp_up_softcap":25.0,
+    "route_scale":8.0,"mlp_gate_softcap":4.0,"mlp_up_softcap":25.0,"rms_norm_eps":1e-6,
     "local_layer_ids":[0,1,2,3,4,6,7,8,9,10,12,13,14,15,16,18,19,20,21,22],
     "loop_config":{"core_start":6,"core_end":18,"num_passes":3,"gate_rank":64,"is_varloop":false}
 }}}"#;
