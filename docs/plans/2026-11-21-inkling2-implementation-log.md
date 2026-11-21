@@ -2,8 +2,12 @@
 
 Working branch: `feat/inkling2-mini-support` off `origin/beta` (`9e410448e`),
 in worktree `C:\Users\Jan\AppData\Local\Temp\opencode\hipfire-inkling2`.
-**No PR is open** — PR is the goal only after the implementation is done and
-verified. All commits carry an `Agent: hy4-flash-free/<seat>` trailer;
+A **draft PR** is open for visibility only:
+https://github.com/warpfront/hipfire/pull/1192 (fork branch
+`raufaser:feat/inkling2-mini-support` → `warpfront:beta`). It is explicitly
+**not ready for review or merge** — the model cannot be served yet. Pushing to
+`warpfront` directly is not permitted (no write access), so the PR comes from
+the `raufaser` fork. All commits carry an `Agent: hy4-flash-free/<seat>` trailer;
 `python3 scripts/check-attribution.py --range origin/beta..HEAD --require` passes.
 
 The planning document is
