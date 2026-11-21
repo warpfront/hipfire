@@ -4479,6 +4479,14 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         replacement: "none; supported retained PM4 routes always trim redundant GCR operations",
     },
     RetiredConfigKey {
+        key: "developer.bf16w_tiled_rows",
+        legacy_key: "bf16w_tiled_rows",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "the BF16W tiled-rows kill switch was removed (HIPF-489)",
+        replacement: "none; the tiled BF16 rows route is gated by arch and row count alone (no kill switch)",
+    },
+    RetiredConfigKey {
         key: "developer.lane_reset_batch",
         legacy_key: "lane_reset_batch",
         shipped_in: "0.4.5",
