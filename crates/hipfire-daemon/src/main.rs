@@ -4021,10 +4021,8 @@ fn main() {
                                 gen_attempt_id,
                                 admission,
                             );
-                            if singleton_now {
-                                // As on the not-eligible path: the sequential producer takes the singleton claim.
-                                batch_scope.rebind_for(gen_attempt_id);
-                            }
+                            // As on the not-eligible path: the sequential producer takes the singleton claim.
+                            batch_scope.rebind_for(gen_attempt_id);
                             // Fall through to sequential generate below (do not enqueue).
                         } else {
                             if !qwen4_lanes
