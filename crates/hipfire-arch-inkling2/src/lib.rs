@@ -9,11 +9,17 @@
 //! The schedule and validation mirror llama.cpp's `inkling2-loop.cpp` at
 //! merge commit `29b52d398b294509746ec0a3f28948a3107c0213`.
 
+pub mod arch;
+pub mod arch_model;
+pub mod carrier;
 pub mod config;
 pub mod forward;
 pub mod oracle;
 pub mod weights;
 
+pub use arch::Inkling2;
+pub use arch_model::{Inkling2Bundle, Inkling2State};
+pub use carrier::{load_inkling2_bundle, INKLING2_MAX_CONTEXT};
 pub use config::{LoopConfig, ARCH_ID, MTP_SIDECAR_ARCH_ID};
 
 /// The verified Mini config.json metadata shape, shared by tests across modules.

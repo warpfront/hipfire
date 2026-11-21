@@ -41,6 +41,7 @@ hipfire-arch-raon = { path = "../hipfire-arch-raon" }
 # Public accessor types (Lfm2MoeBundle.vision_* fields are lfm2-vl types).
 hipfire-arch-lfm2-vl = { path = "../hipfire-arch-lfm2-vl" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
+hipfire-arch-inkling2 = { path = "../hipfire-arch-inkling2" }
 hipfire-arch-qwen35-embed = { path = "../hipfire-arch-qwen35-embed" }
 hipfire-arch-embeddinggemma2 = { path = "../hipfire-arch-embeddinggemma2" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }

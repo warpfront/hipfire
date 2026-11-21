@@ -1370,7 +1370,11 @@ dependencies = [
 name = "hipfire-arch-inkling2"
 version = "0.4.6"
 dependencies = [
+ "half",
  "hipfire-runtime",
+ "memmap2",
+ "rdna-compute",
+ "safetensors",
  "serde_json",
 ]
 
@@ -1776,6 +1780,7 @@ dependencies = [
  "hipfire-arch-dots-ocr",
  "hipfire-arch-embeddinggemma2",
  "hipfire-arch-gemma4",
+ "hipfire-arch-inkling2",
  "hipfire-arch-lfm2-vl",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
