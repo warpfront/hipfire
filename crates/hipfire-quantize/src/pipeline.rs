@@ -2798,6 +2798,14 @@ pub(crate) fn run() {
     // before the existing MQ-family pipeline runs.
     let mut all_tensors: Vec<(&str, usize)> = Vec::new();
     let mut fp8_scale_for: HashMap<String, (usize, String)> = HashMap::new();
+    // A `.scale` name is an FP8 sibling ONLY when a matching `<stem>.weight`
+    // actually exists. Inkling-2's `q_l2_clip.scale` / `rel_l2_clip.scale` are
+    // bare learned parameters with no `.weight` companion — treating them as
+    // siblings silently drops them (they are small F32 keep tensors).
+    let all_names: std::collections::HashSet<String> = st_files
+        .iter()
+        .flat_map(|st| st.tensor_names().into_iter().map(str::to_string))
+        .collect();
     for (fi, st) in st_files.iter().enumerate() {
         for name in st.tensor_names() {
             // MiniMax-M2 FP8: `<w>.weight` (e4m3) + `<w>.weight_scale_inv` (F32
@@ -2810,12 +2818,13 @@ pub(crate) fn run() {
             if let Some(stem) = name.strip_suffix(".scale") {
                 // FP8 scale siblings: `foo.scale` is the per-tensor scale for
                 // `foo.weight`. Skip from quantization; attach at quant time.
-                // Exception: Gemma4's `router.scale` is a real model weight
-                // (multiplicative scale on router input), NOT an FP8 scale.
-                if name.contains("router.scale") {
+                // A real FP8 sibling needs an existing `<stem>.weight`.
+                // `router.scale` and Inkling-2's `*_l2_clip.scale` are bare
+                // learned parameters (no `.weight`) — keep them as tensors.
+                let w_name = format!("{stem}.weight");
+                if name.contains("router.scale") || !all_names.contains(&w_name) {
                     all_tensors.push((name, fi));
                 } else {
-                    let w_name = format!("{stem}.weight");
                     fp8_scale_for.insert(w_name, (fi, name.to_string()));
                 }
                 continue;
