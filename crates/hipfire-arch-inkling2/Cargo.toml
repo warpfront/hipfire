@@ -9,6 +9,8 @@ description = "Inkling-2-Mini looped MoE architecture: Phase-0 visit schedule an
 serde_json.workspace = true
 safetensors.workspace = true
 memmap2.workspace = true
+rayon.workspace = true
 half = "2"
+hip-bridge = { path = "../hip-bridge" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 rdna-compute = { path = "../rdna-compute" }

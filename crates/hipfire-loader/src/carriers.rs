@@ -13139,6 +13139,13 @@ impl Carrier for Inkling2Carrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == hipfire_arch_inkling2::ARCH_ID
     }
+    // Brief 01 deviation (supervisor ack needed): 64m slab packing so the
+    // 3072 expert tensors (gate_up 2.8 MiB > the 2m default threshold) pack
+    // instead of rounding to 4 MiB each (~+3.6 GiB measured). Mirrors the
+    // qwen35 carrier override; touches no other carrier.
+    fn weight_slab_default(&self, _gpu_arch: &str) -> Option<hip_bridge::SlabMode> {
+        Some(hip_bridge::SlabMode::Up64M)
+    }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         // Text-only skeleton: default IS the declaration.
         saddle_core::caps::ArchCaps::default()
