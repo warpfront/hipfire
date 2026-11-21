@@ -373,7 +373,7 @@ pub fn decode_visit<W: crate::weights::WeightSource>(
     };
     // Pass 0 (no messages): inputs are the AttnRes-mixed bases. Later passes:
     // each is `control(base, msg[j], ctrl[j])`.
-    let (q_inp, k_inp, v_inp) = match messages {
+    let (q_ctrl, k_ctrl, v_ctrl) = match messages {
         Some((msgs, ctrls)) => {
             let apply = |base: &[f32], j: usize, c: &ControllerWeights| {
                 oracle::control(
@@ -392,25 +392,27 @@ pub fn decode_visit<W: crate::weights::WeightSource>(
                 apply(&base_v, 2, &ctrls[2]),
             )
         }
-        None => (base_q, base_k, base_v),
+        None => (base_q.clone(), base_k.clone(), base_v.clone()),
     };
     let (q_inp, k_inp, v_inp) = if swa {
         let norm = g("attn_norm.weight")?;
         (
-            rmsnorm_gain(&q_inp, &norm, cfg.rms_norm_eps),
-            rmsnorm_gain(&k_inp, &norm, cfg.rms_norm_eps),
-            rmsnorm_gain(&v_inp, &norm, cfg.rms_norm_eps),
+            rmsnorm_gain(&q_ctrl, &norm, cfg.rms_norm_eps),
+            rmsnorm_gain(&k_ctrl, &norm, cfg.rms_norm_eps),
+            rmsnorm_gain(&v_ctrl, &norm, cfg.rms_norm_eps),
         )
     } else {
         (
-            rmsnorm_gain(&q_inp, &g("q_input_norm.weight")?, cfg.rms_norm_eps),
-            rmsnorm_gain(&k_inp, &g("k_input_norm.weight")?, cfg.rms_norm_eps),
-            rmsnorm_gain(&v_inp, &g("v_input_norm.weight")?, cfg.rms_norm_eps),
+            rmsnorm_gain(&q_ctrl, &g("q_input_norm.weight")?, cfg.rms_norm_eps),
+            rmsnorm_gain(&k_ctrl, &g("k_input_norm.weight")?, cfg.rms_norm_eps),
+            rmsnorm_gain(&v_ctrl, &g("v_input_norm.weight")?, cfg.rms_norm_eps),
         )
     };
 
     if let Some(d) = debug.as_deref_mut() {
         d.insert("x_in".into(), x.to_vec());
+        d.insert("base_q".into(), base_q.clone());
+        d.insert("q_ctrl".into(), q_ctrl.clone());
         d.insert("q_inp".into(), q_inp.clone());
         d.insert("k_inp".into(), k_inp.clone());
         d.insert("v_inp".into(), v_inp.clone());
@@ -457,13 +459,15 @@ pub fn decode_visit<W: crate::weights::WeightSource>(
             // already returns the converted torch view [channels, kernel].
             let already_torch = shape.len() >= 2 && shape[0] == ch;
             let mut t = vec![0.0f32; v.len()];
-            for c in 0..ch { for l in 0..kk {
-                t[c * kk + l] = if already_torch {
-                    v[c * kk + l]
-                } else {
-                    v[(kk - 1 - l) * ch + c]
-                };
-            }}
+            for c in 0..ch {
+                for l in 0..kk {
+                    t[c * kk + l] = if already_torch {
+                        v[c * kk + l]
+                    } else {
+                        v[(kk - 1 - l) * ch + c]
+                    };
+                }
+            }
             t
         };
         let wkt = torch_conv(&sw_k_shape, &sw_k);
@@ -471,10 +475,26 @@ pub fn decode_visit<W: crate::weights::WeightSource>(
         let kproj = g("attn.k_sconv.weight_proj")?;
         let vproj = g("attn.v_sconv.weight_proj")?;
         let (kc2, kp2) = oracle::convolve_dynamic(
-            &k_raw, &wkt, &kproj, &k_inp, &state.k_past, nkv, d, cfg.conv_kernel, cfg.n_embd,
+            &k_raw,
+            &wkt,
+            &kproj,
+            &k_inp,
+            &state.k_past,
+            nkv,
+            d,
+            cfg.conv_kernel,
+            cfg.n_embd,
         );
         let (vc2, vp2) = oracle::convolve_dynamic(
-            &v_raw, &wvt, &vproj, &v_inp, &state.v_past, nkv, d, cfg.conv_kernel, cfg.n_embd,
+            &v_raw,
+            &wvt,
+            &vproj,
+            &v_inp,
+            &state.v_past,
+            nkv,
+            d,
+            cfg.conv_kernel,
+            cfg.n_embd,
         );
         state.k_past = kp2;
         state.v_past = vp2;
@@ -686,6 +706,7 @@ pub fn forward_token<W: crate::weights::WeightSource>(
     token_embed: &[f32],
     pos: usize,
     mut trace: Option<&mut Vec<Vec<f32>>>,
+    mut debug: Option<&mut (usize, std::collections::HashMap<String, Vec<f32>>)>,
 ) -> Result<Vec<f32>, String> {
     // build_inputs: token embedding, RMSNormed (token path only).
     let tok_norm = w.f32("model.llm.embed_norm.weight")?.1;
@@ -710,7 +731,9 @@ pub fn forward_token<W: crate::weights::WeightSource>(
             visit,
             pos,
             None,
-            None,
+            debug
+                .as_mut()
+                .and_then(|d| if d.0 == visit { Some(&mut d.1) } else { None }),
         )?;
         x = out;
         if let Some(t) = trace.as_deref_mut() {
@@ -744,11 +767,10 @@ pub fn forward_token<W: crate::weights::WeightSource>(
         for i in 0..core_len {
             let phys = cfg.loop_cfg.core_start + i;
             let message = if pass > 0 {
-                let mut states_for_mix = bank.clone();
-                states_for_mix.push(prev_out.clone());
+                // mix() appends `cur` itself: states = [bank..., prev_out].
                 let msgs: Vec<Vec<f32>> = msg_queries[i]
                     .iter()
-                    .map(|q| oracle::mix(&states_for_mix, &prev_out, q, cfg.n_embd, 1))
+                    .map(|q| oracle::mix(&bank, &prev_out, q, cfg.n_embd, 1))
                     .collect();
                 let msgs_arr: [Vec<f32>; 4] = [
                     msgs[0].clone(),
@@ -770,7 +792,9 @@ pub fn forward_token<W: crate::weights::WeightSource>(
                 visit,
                 pos,
                 message.as_ref(),
-                None,
+                debug
+                    .as_mut()
+                    .and_then(|d| if d.0 == visit { Some(&mut d.1) } else { None }),
             )?;
             x = out;
             if let Some(t) = trace.as_deref_mut() {
@@ -793,7 +817,9 @@ pub fn forward_token<W: crate::weights::WeightSource>(
             visit,
             pos,
             None,
-            None,
+            debug
+                .as_mut()
+                .and_then(|d| if d.0 == visit { Some(&mut d.1) } else { None }),
         )?;
         x = out;
         if let Some(t) = trace.as_deref_mut() {
@@ -1056,8 +1082,8 @@ mod tests {
         let x = embed[..cfg.n_embd].to_vec();
         let mut st = ConvState::default();
         let mut blocks = Vec::new();
-        let out =
-            decode_visit(&w, &cfg, &mut st, &mut blocks, &x, 0, 0, None, None).expect("decode visit");
+        let out = decode_visit(&w, &cfg, &mut st, &mut blocks, &x, 0, 0, None, None)
+            .expect("decode visit");
         assert_eq!(out.len(), cfg.n_embd);
         assert!(out.iter().all(|v| v.is_finite()), "non-finite visit output");
         let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -1077,7 +1103,7 @@ mod tests {
         let w = Inkling2Weights::load(&hfq, &cfg).expect("load");
         let embed = w.f32("model.llm.embed.weight").unwrap().1;
         let x = embed[..cfg.n_embd].to_vec();
-        let out = forward_token(&w, &cfg, &x, 0, None).expect("forward token");
+        let out = forward_token(&w, &cfg, &x, 0, None, None).expect("forward token");
         assert_eq!(out.len(), cfg.n_embd);
         assert!(out.iter().all(|v| v.is_finite()), "non-finite model output");
         let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -1097,7 +1123,7 @@ mod tests {
         let w = Inkling2Weights::load(&hfq, &cfg).expect("load");
         let embed = w.f32("model.llm.embed.weight").unwrap().1;
         let x = embed[..cfg.n_embd].to_vec();
-        let hidden = forward_token(&w, &cfg, &x, 0, None).expect("forward");
+        let hidden = forward_token(&w, &cfg, &x, 0, None, None).expect("forward");
         let logits = lm_head_logits(&w, &cfg, &hidden).expect("lm head");
         assert_eq!(logits.len(), cfg.unpadded_vocab_size);
         assert!(logits.iter().all(|v| v.is_finite()), "non-finite logits");
@@ -1126,7 +1152,7 @@ mod tests {
         let w = Inkling2Weights::load(&hfq, &cfg).expect("load");
         let embed = w.f32("model.llm.embed.weight").unwrap().1;
         let x = embed[..cfg.n_embd].to_vec();
-        let hidden = forward_token(&w, &cfg, &x, 0, None).expect("forward");
+        let hidden = forward_token(&w, &cfg, &x, 0, None, None).expect("forward");
         let logits = lm_head_logits(&w, &cfg, &hidden).expect("lm head");
         let mut s = String::new();
         for (i, v) in logits.iter().enumerate() {
@@ -1145,7 +1171,7 @@ mod tests {
             .expect("open gguf f32");
         let embed = w.f32("model.llm.embed.weight").unwrap().1;
         let x = embed[..cfg.n_embd].to_vec();
-        let hidden = forward_token(&w, &cfg, &x, 0, None).expect("forward");
+        let hidden = forward_token(&w, &cfg, &x, 0, None, None).expect("forward");
         let logits = lm_head_logits(&w, &cfg, &hidden).expect("lm head");
         let mut s = String::new();
         for (i, v) in logits.iter().enumerate() {
@@ -1169,12 +1195,14 @@ mod tests {
         let embed = w.f32("model.llm.embed.weight").unwrap().1;
         let x = embed[..cfg.n_embd].to_vec();
         let mut trace = Vec::new();
-        let _ = forward_token(&w, &cfg, &x, 0, Some(&mut trace)).expect("forward");
+        let _ = forward_token(&w, &cfg, &x, 0, Some(&mut trace), None).expect("forward");
         let dir = std::path::Path::new(r"D:\hipfire-models\rust-visits-tok0");
         std::fs::create_dir_all(dir).unwrap();
         for (i, v) in trace.iter().enumerate() {
             let mut s = String::new();
-            for x in v { s.push_str(&format!("{}\n", x.to_bits())); }
+            for x in v {
+                s.push_str(&format!("{}\n", x.to_bits()));
+            }
             std::fs::write(dir.join(format!("visit{i:02}.txt")), s).unwrap();
         }
         eprintln!("dumped {} visits", trace.len());
@@ -1187,7 +1215,11 @@ mod tests {
         let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
         let w = GgufF32::open(std::path::Path::new(r"D:\hipfire-models\gguf-f32.bin")).unwrap();
         let emb = w.f32("model.llm.embed.weight").unwrap().1;
-        let x = rmsnorm_gain(&emb[..cfg.n_embd], &w.f32("model.llm.embed_norm.weight").unwrap().1, cfg.rms_norm_eps);
+        let x = rmsnorm_gain(
+            &emb[..cfg.n_embd],
+            &w.f32("model.llm.embed_norm.weight").unwrap().1,
+            cfg.rms_norm_eps,
+        );
 
         // visit 0 = physical layer 0, SWA, no messages, no AttnRes query on layer 0.
         let p = "model.llm.layers.0.";
@@ -1199,14 +1231,23 @@ mod tests {
         let check = |name: &str, got: &[f32]| {
             let path = format!(r"D:\hipfire-models\ref-visits\tok0\{name}.txt");
             if let Ok(s) = std::fs::read_to_string(&path) {
-                let want: Vec<f32> = s.lines().map(|l| f32::from_bits(l.trim().parse().unwrap())).collect();
+                let want: Vec<f32> = s
+                    .lines()
+                    .map(|l| f32::from_bits(l.trim().parse().unwrap()))
+                    .collect();
                 assert_eq!(want.len(), got.len(), "{name} len");
-                let maxd = want.iter().zip(got).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+                let maxd = want
+                    .iter()
+                    .zip(got)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
                 eprintln!("{name}: max|d|={maxd:.6}");
             } else {
                 // dump for the reference agent to consume
                 let mut s = String::new();
-                for v in got { s.push_str(&format!("{}\n", v.to_bits())); }
+                for v in got {
+                    s.push_str(&format!("{}\n", v.to_bits()));
+                }
                 std::fs::write(&path, s).unwrap();
                 eprintln!("{name}: dumped {} values", got.len());
             }
@@ -1240,7 +1281,10 @@ mod tests {
         check("v_conv", &v_conv);
 
         let qscale = w.f32(&format!("{p}attn.q_l2_clip.scale")).ok().map(|x| x.1);
-        let rscale = w.f32(&format!("{p}attn.rel_l2_clip.scale")).ok().map(|x| x.1);
+        let rscale = w
+            .f32(&format!("{p}attn.rel_l2_clip.scale"))
+            .ok()
+            .map(|x| x.1);
         let qc = oracle::clip(&q_raw, qscale.as_deref(), cfg.qk_clip, cfg.head_dim);
         let kc = oracle::clip(&k_conv, None, cfg.qk_clip, cfg.head_dim);
         let rc = oracle::clip(&r_raw, rscale.as_deref(), cfg.rel_clip, cfg.n_rel);
@@ -1250,10 +1294,20 @@ mod tests {
 
         // V RMSNorm per KV head, sinks, rel bias, attention (single key, sink=0).
         let vc: Vec<f32> = (0..cfg.n_head_kv)
-            .flat_map(|h| oracle::rmsnorm(&v_conv[h * cfg.head_dim..(h + 1) * cfg.head_dim], cfg.rms_norm_eps))
+            .flat_map(|h| {
+                oracle::rmsnorm(
+                    &v_conv[h * cfg.head_dim..(h + 1) * cfg.head_dim],
+                    cfg.rms_norm_eps,
+                )
+            })
             .collect();
         check("vc", &vc);
-        let sinks = oracle::matvec(&w.f32(&format!("{p}attn.attn_sink_proj.weight")).unwrap().1, &q_inp, cfg.n_head, cfg.n_embd);
+        let sinks = oracle::matvec(
+            &w.f32(&format!("{p}attn.attn_sink_proj.weight")).unwrap().1,
+            &q_inp,
+            cfg.n_head,
+            cfg.n_embd,
+        );
         check("sinks", &sinks);
         let rel_table_raw = w.f32(&format!("{p}attn.rel_logits_proj.proj")).unwrap().1;
         // rel_table is [n_rel, n_extent] from HFQ; distance 0 gather column 0.
@@ -1262,14 +1316,25 @@ mod tests {
         let mut attn_heads = vec![0.0f32; cfg.n_head * cfg.head_dim];
         for h in 0..cfg.n_head {
             let rh = &rc[h * cfg.n_rel..(h + 1) * cfg.n_rel];
-            let bias0: f32 = (0..cfg.n_rel).map(|rr| rel_table_raw[rr * cfg.n_extent] * rh[rr]).sum::<f32>() - sinks[h];
+            let bias0: f32 = (0..cfg.n_rel)
+                .map(|rr| rel_table_raw[rr * cfg.n_extent] * rh[rr])
+                .sum::<f32>()
+                - sinks[h];
             rel_bias.push(bias0);
             let g = h / (cfg.n_head / cfg.n_head_kv);
             let qh = &qc[h * cfg.head_dim..(h + 1) * cfg.head_dim];
             let kh = &kc[g * cfg.head_dim..(g + 1) * cfg.head_dim];
-            let score = qh.iter().zip(kh).map(|(a,b)| a*b).sum::<f32>() / (cfg.head_dim as f32).sqrt() + bias0;
+            let score = qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>()
+                / (cfg.head_dim as f32).sqrt()
+                + bias0;
             scores.push(score);
-            let wv = oracle::attention_softmax_with_sink(&[score], 0.0, &vc[g * cfg.head_dim..(g + 1) * cfg.head_dim], 1, cfg.head_dim);
+            let wv = oracle::attention_softmax_with_sink(
+                &[score],
+                0.0,
+                &vc[g * cfg.head_dim..(g + 1) * cfg.head_dim],
+                1,
+                cfg.head_dim,
+            );
             attn_heads[h * cfg.head_dim..(h + 1) * cfg.head_dim].copy_from_slice(&wv);
         }
         check("rel_bias", &rel_bias);
@@ -1277,13 +1342,25 @@ mod tests {
         check("attn_heads", &attn_heads);
 
         // output gate + wo + post-conv + AttnRes block bookkeeping.
-        let gate_raw = oracle::matvec(&w.f32(&format!("{p}attn.gate_attn.weight")).unwrap().1, &q_inp, cfg.n_head * cfg.head_dim, cfg.n_embd);
+        let gate_raw = oracle::matvec(
+            &w.f32(&format!("{p}attn.gate_attn.weight")).unwrap().1,
+            &q_inp,
+            cfg.n_head * cfg.head_dim,
+            cfg.n_embd,
+        );
         check("attn_gate_raw", &gate_raw);
         let eattn = cfg.n_head * cfg.head_dim;
         let mut gated = attn_heads.clone();
-        for i in 0..eattn { gated[i] *= oracle::sigmoid(gate_raw[i]); }
+        for i in 0..eattn {
+            gated[i] *= oracle::sigmoid(gate_raw[i]);
+        }
         check("attn_gated", &gated);
-        let wo = oracle::matvec(&w.f32(&format!("{p}attn.wo_ud.weight")).unwrap().1, &gated, cfg.n_embd, eattn);
+        let wo = oracle::matvec(
+            &w.f32(&format!("{p}attn.wo_ud.weight")).unwrap().1,
+            &gated,
+            cfg.n_embd,
+            eattn,
+        );
         check("wo_out", &wo);
         let wp = load_conv(&w, &format!("{p}attn_sconv.weight"), cfg.conv_kernel).unwrap();
         let (attn_res, _) = oracle::convolve_static(&wo, &wp, &[], 1, cfg.n_embd, cfg.conv_kernel);
@@ -1296,7 +1373,11 @@ mod tests {
         let ffn_q = w.f32("model.llm.attn_res.mlp_queries.0").unwrap().1;
         let ffn_mix = oracle::mix(&[x.clone()], &cur, &ffn_q, cfg.n_embd, 1);
         check("ffn_mix", &ffn_mix);
-        let fnorm = rmsnorm_gain(&ffn_mix, &w.f32(&format!("{p}mlp_norm.weight")).unwrap().1, cfg.rms_norm_eps);
+        let fnorm = rmsnorm_gain(
+            &ffn_mix,
+            &w.f32(&format!("{p}mlp_norm.weight")).unwrap().1,
+            cfg.rms_norm_eps,
+        );
         check("ffn_normed", &fnorm);
         let router = w.f32(&format!("{p}mlp.gate.weight")).unwrap().1;
         let rbias = w.f32(&format!("{p}mlp.gate.bias")).unwrap().1;
@@ -1305,17 +1386,42 @@ mod tests {
         let sel = oracle::sigmoid_topk(&rlogits, Some(&rbias), cfg.n_expert_used, cfg.route_scale);
         let sel_ids: Vec<u32> = sel.iter().map(|x| x.0 as u32).collect();
         let sel_weights: Vec<f32> = sel.iter().map(|x| x.1).collect();
-        check("sel_ids", &sel_ids.iter().map(|&v| v as f32).collect::<Vec<_>>());
+        check(
+            "sel_ids",
+            &sel_ids.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        );
         check("sel_weights", &sel_weights);
-        let moe = decode_moe(&fnorm, &router, Some(&rbias),
-            &(0..cfg.n_experts).map(|e| w.f32(&format!("{p}mlp.experts.{e}.gate_up_proj.weight")).unwrap().1).collect::<Vec<_>>(),
-            &(0..cfg.n_experts).map(|e| w.f32(&format!("{p}mlp.experts.{e}.down_proj.weight")).unwrap().1).collect::<Vec<_>>(),
-            cfg.n_embd, cfg.inter, cfg.n_expert_used, cfg.route_scale, cfg.situ_beta, cfg.situ_linear_beta);
+        let moe = decode_moe(
+            &fnorm,
+            &router,
+            Some(&rbias),
+            &(0..cfg.n_experts)
+                .map(|e| {
+                    w.f32(&format!("{p}mlp.experts.{e}.gate_up_proj.weight"))
+                        .unwrap()
+                        .1
+                })
+                .collect::<Vec<_>>(),
+            &(0..cfg.n_experts)
+                .map(|e| {
+                    w.f32(&format!("{p}mlp.experts.{e}.down_proj.weight"))
+                        .unwrap()
+                        .1
+                })
+                .collect::<Vec<_>>(),
+            cfg.n_embd,
+            cfg.inter,
+            cfg.n_expert_used,
+            cfg.route_scale,
+            cfg.situ_beta,
+            cfg.situ_linear_beta,
+        );
         check("moe_raw", &moe);
         let wpost = load_conv(&w, &format!("{p}mlp_sconv.weight"), cfg.conv_kernel).unwrap();
-        let (moe_conv, _) = oracle::convolve_static(&moe, &wpost, &[], 1, cfg.n_embd, cfg.conv_kernel);
+        let (moe_conv, _) =
+            oracle::convolve_static(&moe, &wpost, &[], 1, cfg.n_embd, cfg.conv_kernel);
         check("moe_conv", &moe_conv);
-        let visit_out: Vec<f32> = cur.iter().zip(&moe_conv).map(|(a,b)| a+b).collect();
+        let visit_out: Vec<f32> = cur.iter().zip(&moe_conv).map(|(a, b)| a + b).collect();
         check("visit_out", &visit_out);
     }
 
@@ -1326,24 +1432,62 @@ mod tests {
         let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
         let w = GgufF32::open(std::path::Path::new(r"D:\hipfire-models\gguf-f32.bin")).unwrap();
         let emb = w.f32("model.llm.embed.weight").unwrap().1;
-        let x = rmsnorm_gain(&emb[..cfg.n_embd], &w.f32("model.llm.embed_norm.weight").unwrap().1, cfg.rms_norm_eps);
+        let x = rmsnorm_gain(
+            &emb[..cfg.n_embd],
+            &w.f32("model.llm.embed_norm.weight").unwrap().1,
+            cfg.rms_norm_eps,
+        );
         let mut st = ConvState::default();
         let mut blocks = Vec::new();
         let mut dbg = std::collections::HashMap::new();
-        let out = decode_visit(&w, &cfg, &mut st, &mut blocks, &x, 0, 0, None, Some(&mut dbg)).unwrap();
+        let out = decode_visit(
+            &w,
+            &cfg,
+            &mut st,
+            &mut blocks,
+            &x,
+            0,
+            0,
+            None,
+            Some(&mut dbg),
+        )
+        .unwrap();
         let cmp = |name: &str, got: &[f32]| {
             let p = format!(r"D:\hipfire-models\ref-visits\tok0\{name}.txt");
             if let Ok(s) = std::fs::read_to_string(&p) {
-                let want: Vec<f32> = s.lines().map(|l| f32::from_bits(l.trim().parse().unwrap())).collect();
+                let want: Vec<f32> = s
+                    .lines()
+                    .map(|l| f32::from_bits(l.trim().parse().unwrap()))
+                    .collect();
                 if want.len() == got.len() {
-                    let m = want.iter().zip(got).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+                    let m = want
+                        .iter()
+                        .zip(got)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
                     eprintln!("{name}: max|d|={m:.6}");
                 }
             }
         };
         cmp("visit_out", &out);
-        for k in ["x_in","q_inp","qc","kc","vc","rc","sinks","attn_heads","ffn_mix","ffn_normed","moe_raw","moe_conv","cur_attn"] {
-            if let Some(v) = dbg.get(k) { cmp(k, v); }
+        for k in [
+            "x_in",
+            "q_inp",
+            "qc",
+            "kc",
+            "vc",
+            "rc",
+            "sinks",
+            "attn_heads",
+            "ffn_mix",
+            "ffn_normed",
+            "moe_raw",
+            "moe_conv",
+            "cur_attn",
+        ] {
+            if let Some(v) = dbg.get(k) {
+                cmp(k, v);
+            }
         }
     }
 
@@ -1354,24 +1498,234 @@ mod tests {
         let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
         let w = GgufF32::open(std::path::Path::new(r"D:\hipfire-models\gguf-f32.bin")).unwrap();
         let emb = w.f32("model.llm.embed.weight").unwrap().1;
-        let x = rmsnorm_gain(&emb[..cfg.n_embd], &w.f32("model.llm.embed_norm.weight").unwrap().1, cfg.rms_norm_eps);
+        let x = rmsnorm_gain(
+            &emb[..cfg.n_embd],
+            &w.f32("model.llm.embed_norm.weight").unwrap().1,
+            cfg.rms_norm_eps,
+        );
         // Run visits 0..4 to build state, then capture debug on visit 5.
         let mut states: Vec<ConvState> = (0..48).map(|_| ConvState::default()).collect();
         let mut blocks = Vec::new();
         let mut cur = x;
         for v in 0..5 {
-            cur = decode_visit(&w, &cfg, &mut states[v], &mut blocks, &cur, v, 0, None, None).unwrap();
+            cur = decode_visit(
+                &w,
+                &cfg,
+                &mut states[v],
+                &mut blocks,
+                &cur,
+                v,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
         }
         let mut dbg = std::collections::HashMap::new();
-        let _ = decode_visit(&w, &cfg, &mut states[5], &mut blocks, &cur, 5, 0, None, Some(&mut dbg)).unwrap();
-        for k in ["x_in","q_inp","k_inp","v_inp","k_raw","v_raw","k_conv","v_conv","qc","kc","vc","rc","sinks","rel_bias","attn_heads","wo_out","cur_attn","moe_raw","visit_out"] {
+        let _ = decode_visit(
+            &w,
+            &cfg,
+            &mut states[5],
+            &mut blocks,
+            &cur,
+            5,
+            0,
+            None,
+            Some(&mut dbg),
+        )
+        .unwrap();
+        for k in [
+            "x_in",
+            "q_inp",
+            "k_inp",
+            "v_inp",
+            "k_raw",
+            "v_raw",
+            "k_conv",
+            "v_conv",
+            "qc",
+            "kc",
+            "vc",
+            "rc",
+            "sinks",
+            "rel_bias",
+            "attn_heads",
+            "wo_out",
+            "cur_attn",
+            "moe_raw",
+            "visit_out",
+        ] {
             if let Some(vals) = dbg.get(k) {
                 let mut s = String::new();
-                for v in vals { s.push_str(&format!("{}\n", v.to_bits())); }
-                std::fs::write(format!(r"D:\hipfire-models\ref-visits\tok0\rust_visit5_{k}.txt"), s).unwrap();
+                for v in vals {
+                    s.push_str(&format!("{}\n", v.to_bits()));
+                }
+                std::fs::write(
+                    format!(r"D:\hipfire-models\ref-visits\tok0\rust_visit5_{k}.txt"),
+                    s,
+                )
+                .unwrap();
                 eprintln!("dumped rust_visit5_{k}: {} vals", vals.len());
             }
         }
+    }
+
+    #[test]
+    #[ignore = "dump visit-18 (first pass-1 visit: cross-pass messages applied)"]
+    fn visit18_debug_dump() {
+        use crate::weights::{GgufF32, WeightSource};
+        let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        let w = GgufF32::open(std::path::Path::new(r"D:\hipfire-models\gguf-f32.bin")).unwrap();
+        let emb = w.f32("model.llm.embed.weight").unwrap().1;
+        let x = emb[..cfg.n_embd].to_vec();
+        let mut cap = (18usize, std::collections::HashMap::new());
+        let mut trace = Vec::new();
+        let _ = forward_token(&w, &cfg, &x, 0, Some(&mut trace), Some(&mut cap)).unwrap();
+        for k in [
+            "x_in",
+            "base_q",
+            "q_ctrl",
+            "q_inp",
+            "k_inp",
+            "v_inp",
+            "fwd_msg0",
+            "fwd_msg1",
+            "fwd_msg2",
+            "fwd_msg3",
+            "fwd_prev_out",
+            "fwd_bank_len",
+            "k_raw",
+            "v_raw",
+            "k_conv",
+            "v_conv",
+            "qc",
+            "kc",
+            "vc",
+            "rc",
+            "sinks",
+            "rel_bias",
+            "attn_heads",
+            "wo_out",
+            "cur_attn",
+            "ffn_mix",
+            "ffn_normed",
+            "moe_raw",
+            "moe_conv",
+            "visit_out",
+        ] {
+            if let Some(vals) = cap.1.get(k) {
+                let mut s = String::new();
+                for v in vals {
+                    s.push_str(&format!("{}\n", v.to_bits()));
+                }
+                std::fs::write(
+                    format!(r"D:\hipfire-models\ref-visits\tok0\rust_visit18_{k}.txt"),
+                    s,
+                )
+                .unwrap();
+                eprintln!("dumped rust_visit18_{k}: {} vals", vals.len());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "dump the layer-6/pass-1 cross-pass messages from the existing rust trace"]
+    fn visit18_message_dump() {
+        use crate::weights::{GgufF32, WeightSource};
+        let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        let w = GgufF32::open(std::path::Path::new(r"D:\hipfire-models\gguf-f32.bin")).unwrap();
+        let read = |v: usize| -> Vec<f32> {
+            let s = std::fs::read_to_string(format!(
+                r"D:\hipfire-models\rust-visits-tok0\visit{v:02}.txt"
+            ))
+            .unwrap();
+            s.lines()
+                .map(|l| f32::from_bits(l.trim().parse::<u32>().unwrap()))
+                .collect()
+        };
+        // pass 0 output and the bank row pushed at visit 12 (output of visit 11)
+        let prev_out = read(17);
+        let bank = vec![read(11)];
+        let mq = pack_message_queries(&w, &cfg).unwrap();
+        for j in 0..4 {
+            let msg = oracle::mix(&bank, &prev_out, &mq[0][j], cfg.n_embd, 1);
+            let mut s = String::new();
+            for v in &msg {
+                s.push_str(&format!("{}\n", v.to_bits()));
+            }
+            std::fs::write(
+                format!(r"D:\hipfire-models\ref-visits\tok0\rust_visit18_msg{j}.txt"),
+                s,
+            )
+            .unwrap();
+            eprintln!("dumped rust msg{j} head {:?}", &msg[..4]);
+        }
+    }
+
+    #[test]
+    #[ignore = "dump layer-6/pass-1 control intermediates from the existing rust trace"]
+    fn visit18_control_dump() {
+        use crate::weights::{GgufF32, WeightSource};
+        let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        let w = GgufF32::open(std::path::Path::new(r"D:\hipfire-models\gguf-f32.bin")).unwrap();
+        let read = |v: usize| -> Vec<f32> {
+            let s = std::fs::read_to_string(format!(
+                r"D:\hipfire-models\rust-visits-tok0\visit{v:02}.txt"
+            ))
+            .unwrap();
+            s.lines()
+                .map(|l| f32::from_bits(l.trim().parse::<u32>().unwrap()))
+                .collect()
+        };
+        let prev_out = read(17);
+        let bank = vec![read(11)];
+        let mq = pack_message_queries(&w, &cfg).unwrap();
+        let msg = oracle::mix(&bank, &prev_out, &mq[0][0], cfg.n_embd, 1);
+        // base_q for visit 18 == base_q for visit 6: both start from the
+        // prelude output with the prelude block list reset.
+        let (_, aq) = w.f32("model.llm.attn_res.attn_queries.5").unwrap();
+        let emb = w.f32("model.llm.embed.weight").unwrap().1;
+        let tok_norm = w.f32("model.llm.embed_norm.weight").unwrap().1;
+        let prelude_blocks = vec![rmsnorm_gain(
+            &emb[..cfg.n_embd],
+            &tok_norm,
+            cfg.rms_norm_eps,
+        )];
+        let base = oracle::mix(&prelude_blocks, &read(5), &aq, cfg.n_embd, 1);
+        let ctrls = load_controllers(&w, 6, &cfg).unwrap();
+        let out = oracle::control(
+            &base,
+            &msg,
+            &ctrls[0].down,
+            &ctrls[0].gain,
+            &ctrls[0].forget,
+            cfg.n_embd,
+            cfg.loop_cfg.gate_rank,
+        );
+        let write = |name: &str, v: &[f32]| {
+            let mut s = String::new();
+            for x in v {
+                s.push_str(&format!("{}\n", x.to_bits()));
+            }
+            std::fs::write(
+                format!(r"D:\hipfire-models\ref-visits\tok0\rust_visit18_{name}.txt"),
+                s,
+            )
+            .unwrap();
+        };
+        write("base_q", &base);
+        write("ctrl_out", &out);
+        write("ctrl_down", &ctrls[0].down);
+        write("ctrl_gain", &ctrls[0].gain);
+        write("ctrl_forget", &ctrls[0].forget);
+        eprintln!(
+            "down {} gain {} forget {} base_head {:?} out_head {:?}",
+            ctrls[0].down.len(),
+            ctrls[0].gain.len(),
+            ctrls[0].forget.len(),
+            &base[..4],
+            &out[..4]
+        );
     }
 
     #[test]
@@ -1381,11 +1735,37 @@ mod tests {
         let router = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
         let bias = vec![0.0; 4];
         let x = vec![0.5; n];
-        let gu: Vec<Vec<f32>> = (0..4).map(|e| vec![0.1 * (e + 1) as f32; 2 * inter * n]).collect();
-        let dn: Vec<Vec<f32>> = (0..4).map(|e| vec![0.05 * (e + 1) as f32; n * inter]).collect();
-        let eager = decode_moe(&x, &router, Some(&bias), &gu, &dn, n, inter, 2, 8.0, 4.0, 25.0);
-        let lazy = decode_moe_lazy(&x, &router, Some(&bias), n, inter, 2, 8.0, 4.0, 25.0,
-            &mut |e| (gu[e].clone(), dn[e].clone()));
+        let gu: Vec<Vec<f32>> = (0..4)
+            .map(|e| vec![0.1 * (e + 1) as f32; 2 * inter * n])
+            .collect();
+        let dn: Vec<Vec<f32>> = (0..4)
+            .map(|e| vec![0.05 * (e + 1) as f32; n * inter])
+            .collect();
+        let eager = decode_moe(
+            &x,
+            &router,
+            Some(&bias),
+            &gu,
+            &dn,
+            n,
+            inter,
+            2,
+            8.0,
+            4.0,
+            25.0,
+        );
+        let lazy = decode_moe_lazy(
+            &x,
+            &router,
+            Some(&bias),
+            n,
+            inter,
+            2,
+            8.0,
+            4.0,
+            25.0,
+            &mut |e| (gu[e].clone(), dn[e].clone()),
+        );
         assert_eq!(eager, lazy, "eager vs lazy MoE must be bit-identical");
     }
 
