@@ -3119,6 +3119,219 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_V2B_A4_EPI",
         "Exact-gfx1151 V2B gate/up SiLU A4 epilogue arm: retile runs the M512xN128 twin in place of the fused A4 kernel (diagnostic bisect arm); anything else (unset) keeps the fused kernel."
     ),
+    // Qwen4 FeatureFlags-only kernel levers (HIPF-487, HIPF-396 tier C S5b).
+    // `auto` (default) keeps the per-arch default; the env keeps the
+    // `parse_legacy_flag_bool` grammar (any other spelling is auto).
+    process_auto_bool_field!(
+        "kernel.qwen4_gdn_conv_qknorm",
+        "qwen4_gdn_conv_qknorm",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_GDN_CONV_QKNORM",
+        "Qwen4 GDN conv + QK-norm fusion: auto (default) is on exact gfx1151 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_gdn_i8_fuse",
+        "qwen4_gdn_i8_fuse",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_GDN_I8_FUSE",
+        "Qwen4 GDN int8 producer fusion: auto (default) is on exact gfx1201 only; true / false force it."
+    ),
+    process_field!(
+        "kernel.qwen4_hc_fuse",
+        "qwen4_hc_fuse",
+        Kernel,
+        DefaultValue::String("auto"),
+        ValueRule::AutoInteger { min: 0, max: 255 },
+        true,
+        "HIPFIRE_QWEN4_HC_FUSE",
+        "Qwen4 hyper-connection fusion level: auto (default) is 3 on exact gfx1151, 1 on exact gfx1201, 0 elsewhere; an integer sets the level (clamped to 3; other archs stay 0)."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_hc_up_tile",
+        "qwen4_hc_up_tile",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_HC_UP_TILE",
+        "Qwen4 retiled operand-swapped HC up+mix read tail: auto (default) is on exact gfx1151 / gfx1201; true / false force it (needs HC fusion level 1+)."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_hc_up_v2",
+        "qwen4_hc_up_v2",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_HC_UP_V2",
+        "Qwen4 HC up v2 kernel: auto (default) is on exact gfx1151 / gfx1201; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_hc_row_fold",
+        "qwen4_hc_row_fold",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_HC_ROW_FOLD",
+        "Qwen4 HC row fold: auto (default) is on exact gfx1151 / gfx1201; true / false force it (the accessors keep their HC level and zinit gates)."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_moe_combine_zinit",
+        "qwen4_moe_combine_zinit",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_MOE_COMBINE_ZINIT",
+        "Qwen4 MoE combine zero-init fold: auto (default) is on exact gfx1151 / gfx1201; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_moe_combine_inline_order",
+        "qwen4_moe_combine_inline_order",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER",
+        "Qwen4 MoE combine inline ordering: auto (default) is on exact gfx1201 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_moe_down_r4",
+        "qwen4_moe_down_r4",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_MOE_DOWN_R4",
+        "Qwen4 routed-MoE down projection, 4-row variant: auto (default) is on exact gfx1151 / gfx1201; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_moe_scatter_scan",
+        "qwen4_moe_scatter_scan",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_MOE_SCATTER_SCAN",
+        "Qwen4 MoE scatter block-wide scan: auto (default) is on exact gfx1201 only; true / false force it (the scan kernel is built for gfx1151 / gfx1201)."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_router_fast",
+        "qwen4_router_fast",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_ROUTER_FAST",
+        "Qwen4 wave-per-token E512 / top-10 router: auto (default) is on exact gfx1151 / gfx1201; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_shared_down_fuse",
+        "qwen4_shared_down_fuse",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_SHARED_DOWN_FUSE",
+        "Qwen4 shared-expert down fusion: auto (default) is on exact gfx1151 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_ffn_clear_absorb",
+        "qwen4_ffn_clear_absorb",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_FFN_CLEAR_ABSORB",
+        "Qwen4 FFN output clear absorbed into the producer: auto (default) is on exact gfx1201 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_ffn_clear_absorb_rows",
+        "qwen4_ffn_clear_absorb_rows",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS",
+        "Qwen4 FFN clear absorb, multi-row steps: auto (default) is on exact gfx1201 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_decode_zba_x3",
+        "qwen4_decode_zba_x3",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_DECODE_ZBA_X3",
+        "Qwen4 decode ZBA x3 lever: auto (default) is on exact gfx1151 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_decode_head_fuse",
+        "qwen4_decode_head_fuse",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_DECODE_HEAD_FUSE",
+        "Qwen4 decode head fusion: auto (default) is on exact gfx1151 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_ple_fuse",
+        "qwen4_ple_fuse",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_PLE_FUSE",
+        "Qwen4 per-layer-embedding fusion: auto (default) is on exact gfx1151 / gfx1201; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_gdn_lanes",
+        "qwen4_gdn_lanes",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_GDN_LANES",
+        "Qwen4 batched-lane GDN route: auto (default) is on exact gfx1151 / gfx1201; true / false force it; exact gfx942 is always on."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_qsa_lanes",
+        "qwen4_qsa_lanes",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_QSA_LANES",
+        "Qwen4 batched-lane QSA route: auto (default) is on exact gfx1201 only; true / false force it; exact gfx942 is always on."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_lane_hc_allrows",
+        "qwen4_lane_hc_allrows",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_LANE_HC_ALLROWS",
+        "Qwen4 lane HC steps over all rows: auto (default) is on (the accessor admits it where the lane route runs); false keeps the per-row path; exact gfx942 is always on."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_lane_allrows",
+        "qwen4_lane_allrows",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_LANE_ALLROWS",
+        "Qwen4 lane steps over all rows: auto (default) is on (the accessor admits it where the lane route runs); false keeps the per-row path; exact gfx942 is always on."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_lane_allrows_moe",
+        "qwen4_lane_allrows_moe",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_LANE_ALLROWS_MOE",
+        "Qwen4 lane MoE steps over all rows: auto (default) is on (the accessor admits it where the lane route runs); false keeps the per-row path; exact gfx942 is always on."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_lane_prepare_async",
+        "qwen4_lane_prepare_async",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_LANE_PREPARE_ASYNC",
+        "Qwen4 asynchronous lane prepare: auto (default) is on exact gfx1201 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_ep_pmask_implicit_zero",
+        "qwen4_ep_pmask_implicit_zero",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO",
+        "Qwen4 expert-parallel presence mask with implicit zero rows: auto (default) is on exact gfx1201 only; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_draft_glue_fold",
+        "qwen4_draft_glue_fold",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_DRAFT_GLUE_FOLD",
+        "Qwen4 MTP draft glue fold: auto (default) is on exact gfx1201 / gfx942; true / false force it."
+    ),
+    process_auto_bool_field!(
+        "kernel.qwen4_draft_topk8_rows",
+        "qwen4_draft_topk8_rows",
+        Kernel,
+        true,
+        "HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS",
+        "Qwen4 MTP draft top-8 over rows: auto (default) is on exact gfx1201 only; true / false force it."
+    ),
     process_bool_field!(
         "attention.qwen4_qsa_wmma_gather",
         "qwen4_qsa_wmma_gather",
@@ -4737,6 +4950,214 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "promoted to a typed key (HIPF-438); HIPFIRE_V2B_A4_EPI is unchanged",
         replacement: "kernel.v2b_a4_epi",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_gdn_conv_qknorm",
+        legacy_key: "developer.qwen4_gdn_conv_qknorm",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_GDN_CONV_QKNORM is unchanged",
+        replacement: "kernel.qwen4_gdn_conv_qknorm",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_gdn_i8_fuse",
+        legacy_key: "developer.qwen4_gdn_i8_fuse",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_GDN_I8_FUSE is unchanged",
+        replacement: "kernel.qwen4_gdn_i8_fuse",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_hc_fuse",
+        legacy_key: "developer.qwen4_hc_fuse",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_HC_FUSE is unchanged",
+        replacement: "kernel.qwen4_hc_fuse",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_hc_up_tile",
+        legacy_key: "developer.qwen4_hc_up_tile",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_HC_UP_TILE is unchanged",
+        replacement: "kernel.qwen4_hc_up_tile",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_hc_up_v2",
+        legacy_key: "developer.qwen4_hc_up_v2",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_HC_UP_V2 is unchanged",
+        replacement: "kernel.qwen4_hc_up_v2",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_hc_row_fold",
+        legacy_key: "developer.qwen4_hc_row_fold",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_HC_ROW_FOLD is unchanged",
+        replacement: "kernel.qwen4_hc_row_fold",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_moe_combine_zinit",
+        legacy_key: "developer.qwen4_moe_combine_zinit",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_MOE_COMBINE_ZINIT is unchanged",
+        replacement: "kernel.qwen4_moe_combine_zinit",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_moe_combine_inline_order",
+        legacy_key: "developer.qwen4_moe_combine_inline_order",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_MOE_COMBINE_INLINE_ORDER is unchanged",
+        replacement: "kernel.qwen4_moe_combine_inline_order",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_moe_down_r4",
+        legacy_key: "developer.qwen4_moe_down_r4",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_MOE_DOWN_R4 is unchanged",
+        replacement: "kernel.qwen4_moe_down_r4",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_moe_scatter_scan",
+        legacy_key: "developer.qwen4_moe_scatter_scan",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_MOE_SCATTER_SCAN is unchanged",
+        replacement: "kernel.qwen4_moe_scatter_scan",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_router_fast",
+        legacy_key: "developer.qwen4_router_fast",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_ROUTER_FAST is unchanged",
+        replacement: "kernel.qwen4_router_fast",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_shared_down_fuse",
+        legacy_key: "developer.qwen4_shared_down_fuse",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_SHARED_DOWN_FUSE is unchanged",
+        replacement: "kernel.qwen4_shared_down_fuse",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ffn_clear_absorb",
+        legacy_key: "developer.qwen4_ffn_clear_absorb",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_FFN_CLEAR_ABSORB is unchanged",
+        replacement: "kernel.qwen4_ffn_clear_absorb",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ffn_clear_absorb_rows",
+        legacy_key: "developer.qwen4_ffn_clear_absorb_rows",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_FFN_CLEAR_ABSORB_ROWS is unchanged",
+        replacement: "kernel.qwen4_ffn_clear_absorb_rows",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_decode_zba_x3",
+        legacy_key: "developer.qwen4_decode_zba_x3",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_DECODE_ZBA_X3 is unchanged",
+        replacement: "kernel.qwen4_decode_zba_x3",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_decode_head_fuse",
+        legacy_key: "developer.qwen4_decode_head_fuse",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_DECODE_HEAD_FUSE is unchanged",
+        replacement: "kernel.qwen4_decode_head_fuse",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ple_fuse",
+        legacy_key: "developer.qwen4_ple_fuse",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_PLE_FUSE is unchanged",
+        replacement: "kernel.qwen4_ple_fuse",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_gdn_lanes",
+        legacy_key: "developer.qwen4_gdn_lanes",
+        shipped_in: "0.4.3",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_GDN_LANES is unchanged",
+        replacement: "kernel.qwen4_gdn_lanes",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_qsa_lanes",
+        legacy_key: "developer.qwen4_qsa_lanes",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_QSA_LANES is unchanged",
+        replacement: "kernel.qwen4_qsa_lanes",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_hc_allrows",
+        legacy_key: "developer.qwen4_lane_hc_allrows",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_LANE_HC_ALLROWS is unchanged",
+        replacement: "kernel.qwen4_lane_hc_allrows",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_allrows",
+        legacy_key: "developer.qwen4_lane_allrows",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_LANE_ALLROWS is unchanged",
+        replacement: "kernel.qwen4_lane_allrows",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_allrows_moe",
+        legacy_key: "developer.qwen4_lane_allrows_moe",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_LANE_ALLROWS_MOE is unchanged",
+        replacement: "kernel.qwen4_lane_allrows_moe",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_lane_prepare_async",
+        legacy_key: "developer.qwen4_lane_prepare_async",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_LANE_PREPARE_ASYNC is unchanged",
+        replacement: "kernel.qwen4_lane_prepare_async",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_ep_pmask_implicit_zero",
+        legacy_key: "developer.qwen4_ep_pmask_implicit_zero",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO is unchanged",
+        replacement: "kernel.qwen4_ep_pmask_implicit_zero",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_draft_glue_fold",
+        legacy_key: "developer.qwen4_draft_glue_fold",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_DRAFT_GLUE_FOLD is unchanged",
+        replacement: "kernel.qwen4_draft_glue_fold",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_draft_topk8_rows",
+        legacy_key: "developer.qwen4_draft_topk8_rows",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-487); HIPFIRE_QWEN4_DRAFT_TOPK8_ROWS is unchanged",
+        replacement: "kernel.qwen4_draft_topk8_rows",
     },
     RetiredConfigKey {
         key: "developer.qwen4_qsa_wmma_gather",
@@ -9043,10 +9464,40 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
             _ => ConfigValue::String("auto".to_owned()),
         },
         // `parse_legacy_flag_bool`: its true / false spellings; anything else is auto.
-        "mq6_i8" => match raw {
+        "mq6_i8"
+        | "qwen4_gdn_conv_qknorm"
+        | "qwen4_gdn_i8_fuse"
+        | "qwen4_hc_up_tile"
+        | "qwen4_hc_up_v2"
+        | "qwen4_hc_row_fold"
+        | "qwen4_moe_combine_zinit"
+        | "qwen4_moe_combine_inline_order"
+        | "qwen4_moe_down_r4"
+        | "qwen4_moe_scatter_scan"
+        | "qwen4_router_fast"
+        | "qwen4_shared_down_fuse"
+        | "qwen4_ffn_clear_absorb"
+        | "qwen4_ffn_clear_absorb_rows"
+        | "qwen4_decode_zba_x3"
+        | "qwen4_decode_head_fuse"
+        | "qwen4_ple_fuse"
+        | "qwen4_gdn_lanes"
+        | "qwen4_qsa_lanes"
+        | "qwen4_lane_hc_allrows"
+        | "qwen4_lane_allrows"
+        | "qwen4_lane_allrows_moe"
+        | "qwen4_lane_prepare_async"
+        | "qwen4_ep_pmask_implicit_zero"
+        | "qwen4_draft_glue_fold"
+        | "qwen4_draft_topk8_rows" => match raw {
             "1" | "true" | "TRUE" | "on" | "ON" => ConfigValue::Bool(true),
             "0" | "false" | "FALSE" | "off" | "OFF" => ConfigValue::Bool(false),
             _ => ConfigValue::String("auto".to_owned()),
+        },
+        // `trim().parse::<u8>()`; anything else is the per-arch level.
+        "qwen4_hc_fuse" => match raw.trim().parse::<u8>() {
+            Ok(level) => ConfigValue::Integer(level.into()),
+            Err(_) => ConfigValue::String("auto".to_owned()),
         },
         // Trimmed exact `1` / `0`; anything else is the load-conditional default.
         "qwen4_moe_ep_a8" => match raw.trim() {
@@ -10026,7 +10477,8 @@ mod tests {
     fn promoted_flag_env_values_keep_the_legacy_reader_grammar() {
         let inputs = [
             "", "0", "1", " 1", "0 ", "true", "false", "TRUE", "FALSE", "True", "False", "on",
-            "off", "ON", "OFF", "yes", "no", "2", "garbage", "null", "auto",
+            "off", "ON", "OFF", "yes", "no", "2", "garbage", "null", "auto", "3", " 3", "255",
+            "256",
         ];
         let on = |key: &str, raw: &str| {
             let schema = FIELDS.iter().find(|f| f.legacy_key == key).unwrap();
@@ -10089,6 +10541,40 @@ mod tests {
             };
             assert_eq!(on("mq6_i8", raw).as_deref(), Some(mq6_i8), "{raw:?}");
             for key in [
+                "qwen4_gdn_conv_qknorm",
+                "qwen4_gdn_i8_fuse",
+                "qwen4_hc_up_tile",
+                "qwen4_hc_up_v2",
+                "qwen4_hc_row_fold",
+                "qwen4_moe_combine_zinit",
+                "qwen4_moe_combine_inline_order",
+                "qwen4_moe_down_r4",
+                "qwen4_moe_scatter_scan",
+                "qwen4_router_fast",
+                "qwen4_shared_down_fuse",
+                "qwen4_ffn_clear_absorb",
+                "qwen4_ffn_clear_absorb_rows",
+                "qwen4_decode_zba_x3",
+                "qwen4_decode_head_fuse",
+                "qwen4_ple_fuse",
+                "qwen4_gdn_lanes",
+                "qwen4_qsa_lanes",
+                "qwen4_lane_hc_allrows",
+                "qwen4_lane_allrows",
+                "qwen4_lane_allrows_moe",
+                "qwen4_lane_prepare_async",
+                "qwen4_ep_pmask_implicit_zero",
+                "qwen4_draft_glue_fold",
+                "qwen4_draft_topk8_rows",
+            ] {
+                assert_eq!(on(key, raw).as_deref(), Some(mq6_i8), "{key}={raw:?}");
+            }
+            let hc_fuse = raw
+                .trim()
+                .parse::<u8>()
+                .map_or("auto".to_owned(), |l| l.to_string());
+            assert_eq!(on("qwen4_hc_fuse", raw), Some(hc_fuse), "{raw:?}");
+            for key in [
                 "ep_peer_allreduce",
                 "ep_peer_allreduce_decode",
                 "qwen4_mtp_draft_rounds",
@@ -10141,8 +10627,8 @@ mod tests {
             .filter(|f| promoted_flag_env_value(f.legacy_key, "").is_some())
             .collect();
         // 9 kernel-side (stage 1) + 28 arch-crate / runtime (stage 2) + 2 tier-B kernel-side
-        // (HIPF-438) + 4 tier-B arch-crate / runtime (HIPF-437).
-        assert_eq!(promoted.len(), 43);
+        // (HIPF-438) + 4 tier-B arch-crate / runtime (HIPF-437) + 26 Qwen4 tier-C S5b (HIPF-487).
+        assert_eq!(promoted.len(), 69);
         for f in promoted {
             let dev = developer_key_for_env(f.env_compat.unwrap()).unwrap();
             let err = ConfigLayer::default().set_cli(&dev, "1").unwrap_err();
@@ -10350,13 +10836,13 @@ mod tests {
     fn other_developer_keys_keep_their_free_form_spelling() {
         let mut layer = ConfigLayer::default();
         layer.set_cli("developer.experimental_mode", "on").unwrap();
-        layer.set_cli("developer.qwen4_hc_fuse", "3").unwrap();
+        layer.set_cli("developer.qwen4_gdn_q8_inline", "3").unwrap();
         assert_eq!(
             layer.get("developer.experimental_mode"),
             Some(&ConfigValue::String("on".into()))
         );
         assert_eq!(
-            layer.get("developer.qwen4_hc_fuse"),
+            layer.get("developer.qwen4_gdn_q8_inline"),
             Some(&ConfigValue::String("3".into()))
         );
     }
