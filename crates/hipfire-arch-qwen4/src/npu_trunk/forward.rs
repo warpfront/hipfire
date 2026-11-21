@@ -1489,26 +1489,39 @@ struct Snapshot<'a> {
 struct CoreCut<'a> {
     stage: &'a crate::bundle::PairSessionStage,
     row: usize,
-    gdn_total: usize,
+    layout: crate::bundle::StageLayout,
     gdn_slot: usize,
     qsa_slot: usize,
 }
 
-/// Stage a layer's mixer state at the snapshot row.
+/// Stage a layer's mixer state at the snapshot row (the GDN carry parts were
+/// staged at prepare: the pair's GDN never advances them).
 fn copy_mixer_state(
     gpu: &mut Gpu,
     stage: &crate::bundle::PairSessionStage,
     mixer: &Step<'_>,
-    gdn_total: usize,
+    layout: crate::bundle::StageLayout,
     gdn_slot: usize,
     qsa_slot: usize,
 ) -> Result<(), Qwen4GpuForwardError> {
+    let slot = || fail("paired snapshot slot outside the state");
     match mixer {
-        Step::GatedDeltaNet(op) => stage
-            .copy_parts(gpu, 2 * gdn_slot, [op.recurrent, op.conv_state])
-            .map_err(fail),
+        Step::GatedDeltaNet(op) => {
+            let index = layout.gdn_index(gdn_slot).ok_or_else(slot)?;
+            match op.residual {
+                Some(residual) => {
+                    stage.copy_parts(gpu, index, [op.recurrent, residual, op.conv_state])
+                }
+                None => stage.copy_parts(gpu, index, [op.recurrent, op.conv_state]),
+            }
+            .map_err(fail)
+        }
         Step::IndexedAttention(op) => stage
-            .copy(gpu, 2 * gdn_total + qsa_slot, op.state.selected_indices)
+            .copy(
+                gpu,
+                layout.qsa_index(qsa_slot).ok_or_else(slot)?,
+                op.state.selected_indices,
+            )
             .map_err(fail),
         _ => unreachable!("typed mixer"),
     }
@@ -1973,7 +1986,7 @@ impl NpuForward {
                                 gpu,
                                 cut.stage,
                                 &program.steps[index],
-                                cut.gdn_total,
+                                cut.layout,
                                 cut.gdn_slot,
                                 cut.qsa_slot,
                             )?;
@@ -2002,7 +2015,7 @@ impl NpuForward {
                     gpu,
                     cut.stage,
                     &program.steps[index],
-                    cut.gdn_total,
+                    cut.layout,
                     cut.gdn_slot,
                     cut.qsa_slot,
                 )?;
@@ -2311,7 +2324,7 @@ impl NpuForward {
             let mut last_seq = seq;
             // (GDN, QSA) layers already run per bank: the snapshot slots.
             let mut slots = [(0usize, 0usize); 2];
-            let gdn_total = bundle.state.gdn.len();
+            let layout = crate::bundle::StageLayout::of(&bundle.state);
             for op in coproc::pair_schedule(bundle.config.num_hidden_layers) {
                 match op {
                     PairOp::Prepare { layer, bank } => {
@@ -2354,7 +2367,7 @@ impl NpuForward {
                             (Some(row), Some(stage)) => Some(CoreCut {
                                 stage,
                                 row,
-                                gdn_total,
+                                layout,
                                 gdn_slot: slots[bank].0,
                                 qsa_slot: slots[bank].1,
                             }),
@@ -2375,7 +2388,7 @@ impl NpuForward {
                         if geometry[bank].stage_after {
                             if let Some(stage) = &stage {
                                 copy_mixer_state(
-                                    gpu, stage, mixer, gdn_total, slots[0].0, slots[0].1,
+                                    gpu, stage, mixer, layout, slots[0].0, slots[0].1,
                                 )?;
                             }
                         }
@@ -3780,6 +3793,10 @@ pub(super) fn run_pair_request(
             tokens.len() * program_dims(&bundle.config).wide(),
         )
     });
+    // The pair's GDN runs without the stream carry and reads the live slot: an
+    // Open stream (a restored GPU-chunk snapshot) must be sealed first. The pair
+    // is never recorded, so the eager seal is allowed here.
+    bundle.seal_gdn_streams(gpu).map_err(fail)?;
     let mut npu = owner.npu_trunk.take().expect("on owner");
     let result = npu.pair(
         owner,

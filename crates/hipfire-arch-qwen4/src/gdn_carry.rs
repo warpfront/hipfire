@@ -22,11 +22,11 @@
 
 use super::*;
 use rdna_compute::gdn_stream::{
-    GdnAppendSchedule, GdnPrefillPlan, GdnProjectionRecipe, GdnScanAlgorithm, GdnStateQuant,
-    GdnStreamMeta, GdnStreamPhase, GdnStreamWorkspace, GdnTensorFormat, GDN_COMMIT_ROWS,
+    GdnPrefillPlan, GdnProjectionRecipe, GdnScanAlgorithm, GdnStateQuant, GdnStreamMeta,
+    GdnStreamPhase, GdnStreamWorkspace, GdnTensorFormat, GDN_COMMIT_ROWS,
     GDN_STREAM_SCHEMA_VERSION,
 };
-use rdna_compute::tensor_ops::gdn_wy_stream::{wy_advance_meta, wy_stream_admitted, WY_TILE_ROWS};
+use rdna_compute::tensor_ops::gdn_wy_stream::{wy_stream_admitted, WY_TILE_ROWS};
 
 /// Session metadata words one carrying GDN layer adds
 /// (`[schema|phase, recipe, position, phase_start, frame_base, tile_base,
@@ -342,51 +342,4 @@ pub(crate) fn decode_meta(
         // A restore is a new owner generation of the restored prefix.
         owner_generation: generation,
     })
-}
-
-/// Cursor of a layer that `rows` rows past `entry` at `position - rows`
-/// (used to describe a session cut inside a window without running the scan).
-pub(crate) fn meta_after(
-    entry: GdnStreamMeta,
-    plan: &GdnPrefillPlan,
-    entry_position: u64,
-    position: u64,
-) -> GdnStreamMeta {
-    if position == entry_position {
-        return match entry.phase {
-            GdnStreamPhase::Open => entry,
-            GdnStreamPhase::Sealed => sealed_cursor(plan, position, entry.owner_generation),
-        };
-    }
-    match plan.algorithm {
-        GdnScanAlgorithm::Scan64 => {
-            // The Scan64 executor's schedule is the shared pure arithmetic over the cursor;
-            // a Sealed entry opens at `entry_position`.
-            let from = match entry.phase {
-                GdnStreamPhase::Open => entry,
-                GdnStreamPhase::Sealed => GdnStreamMeta {
-                    recipe_id: plan.recipe_id,
-                    ..GdnStreamMeta::sealed_at(entry_position, entry.owner_generation)
-                },
-            };
-            GdnAppendSchedule::new(
-                &from,
-                entry_position,
-                (position - entry_position) as usize,
-                plan.micro_rows,
-                plan.commit_rows.max(1),
-            )
-            .map_or(from, |schedule| GdnStreamMeta {
-                recipe_id: plan.recipe_id,
-                ..schedule.meta
-            })
-        }
-        _ => wy_advance_meta(
-            entry,
-            plan.recipe_id,
-            entry_position,
-            position - entry_position,
-            plan.state_quant != GdnStateQuant::F32,
-        ),
-    }
 }

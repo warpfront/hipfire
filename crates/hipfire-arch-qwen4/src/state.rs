@@ -4116,33 +4116,19 @@ impl Qwen4State {
         if let Some(plan) = &self.gdn_stream {
             // One cursor per carrying GDN layer, validated on restore before
             // any live byte is written.
-            for (slot, layer) in self.gdn.iter().enumerate() {
+            for layer in &self.gdn {
                 let carry = layer.carry.as_ref().ok_or(StateError::SnapshotShape)?;
-                let meta = if commits.is_some() {
-                    // A cut inside a window: the layer's stream as the tile
-                    // that ended at the cut left it, derived from the
-                    // transaction's entry cursor.
-                    let arena = &self.snapshot_arena;
-                    if !arena.active {
-                        return Err(StateError::SnapshotInactive);
-                    }
-                    let entry = arena
-                        .carry_meta
-                        .get(slot)
-                        .copied()
-                        .flatten()
-                        .ok_or(StateError::SnapshotTicket)?;
-                    gdn_carry::meta_after(entry, plan, arena.position as u64, position as u64)
-                } else {
-                    let live = carry.meta();
-                    match live.phase {
-                        GdnStreamPhase::Open => live,
-                        // A sealed cursor's position is whatever decode left
-                        // it; its meaning is "the live slot at the session
-                        // position".
-                        GdnStreamPhase::Sealed => {
-                            gdn_carry::sealed_cursor(plan, position as u64, self.reset_epoch)
-                        }
+                // A cut inside an NPU pair (`commits`) takes this arm too: the
+                // pair's GDN runs without the stream carry, so the cursor stays
+                // as the pair entry left it and a sealed one describes the cut.
+                let live = carry.meta();
+                let meta = match live.phase {
+                    GdnStreamPhase::Open => live,
+                    // A sealed cursor's position is whatever decode left
+                    // it; its meaning is "the live slot at the session
+                    // position".
+                    GdnStreamPhase::Sealed => {
+                        gdn_carry::sealed_cursor(plan, position as u64, self.reset_epoch)
                     }
                 };
                 if meta.position != position as u64 {
