@@ -188,13 +188,29 @@ The CPU reference forward is now **complete end-to-end** in `forward.rs`:
   `weights.rs`.
 - 26 unit tests + 6 ignored real-artifact tests (all verified manually).
 
-**Not yet proven**: numeric parity with the llama.cpp oracle. The argmax above
-is from a raw `embed[0]` vector with no chat-template framing, so it is not a
-generation-quality check. The next gate is a teacher-forced logit comparison:
-feed the same token sequence to `forward_token` and to the llama.cpp oracle and
-compare logits per position. Known simplifications still to close: dynamic
-K/V conv taps on full layers (currently static weights only), multi-token KV
-cache (single-token primitive), and controller/message parity.
+**Parity investigation (2026-11-21, continued):** built a C API logit dumper
+(`D:\hipfire-models\dump_logits.cpp/.exe`) against the merged llama.cpp and
+compared oracle F32-GGUF logits for token 0 against the CPU forward on the MQ4
+artifact (`compare_logits.py`). Result: r≈0.19, argmax disagrees — **parity not
+achieved**. Root-cause analysis narrowed it down:
+- NVFP4 dequant is exact vs the converter (diff 4e-10).
+- qt44 (MQ4G256V2) f32 decode correlates **0.995** with the F32 GGUF but SQNR
+  is only **20 dB** per weight (mse 4.3e-6, signal 4.3e-4) — meaningful loss.
+- With discrete top-8 MoE routing, small router-logit changes flip expert
+  selection, and errors compound across 48 visits. This plausibly explains a
+  large logit divergence for **uniform, uncalibrated MQ4** — exactly the
+  "quant→quant quality gap" risk in the plan. This is a hypothesis, not proven.
+- Three genuine forward bugs were found and fixed during this: full-layer
+  `static_w` conv flip/transpose, 3-row AttnRes mix for full layers, sink
+  projection using inputs[0]; and RMSNorm raw-weight convention. None closed
+  the gap alone.
+
+To separate quantization from forward correctness, the decisive experiment is
+to run the same forward on the **F32 GGUF weights** and compare to the oracle;
+remaining simplifications that could still bite: dynamic K/V conv taps on full
+layers (static weights only), multi-token KV cache (single-token primitive).
+The practical fix for the quality gap is imatrix-based MQ4L calibration, which
+this CPU forward can now drive.
 
 ## Current end state (2026-11-21)
 
