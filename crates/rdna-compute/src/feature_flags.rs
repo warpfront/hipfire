@@ -192,26 +192,26 @@ pub struct FeatureFlags {
     /// `HIPFIRE_QWEN4_GDN_LANES` on. No env var; the field stays assignable so an oracle can
     /// run the per-row reference.
     pub qwen4_gdn_lanes_rows: bool,
-    /// All-rows HC stages of an AR lane step with more than 8 rows
-    /// (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`): HcRead / HcWrite / FinalHyper run one
-    /// launch per kernel over every row instead of once per <= 8-row group
-    /// (the single-launch `gemv_bf16_xf32_k4_rows_lane_t8` and the t1 HC up read
-    /// at 9..=64 rows). Default on for exact gfx1201 only (`=0` kills it).
+    /// All-rows HC stages of an AR lane step with more than 8 rows: HcRead / HcWrite /
+    /// FinalHyper run one launch per kernel over every row instead of once per <= 8-row group
+    /// (the single-launch `gemv_bf16_xf32_k4_rows_lane_t8` and the t1 HC up read at 9..=64
+    /// rows). On by default; `qwen4_lane_hc_allrows_enabled` gates it to exact gfx1201 and
+    /// gfx942. The A/B oracles flip this field.
     pub qwen4_lane_hc_allrows: bool,
-    /// Every non-MoE row-local stage of an AR / verify lane step with more than 8 rows
-    /// (`HIPFIRE_QWEN4_LANE_ALLROWS`): Embed, PleRows, the GDN / QSA input and output
-    /// projections, the HC stages, FinalHyper, Head and Argmax run one launch over every
-    /// row on the all-rows segment (the wide 9..=64-row routes) instead of once per <= 8-row
-    /// group; the routed MoE keeps its groups. Refines `qwen4_lane_hc_allrows` (needs it).
-    /// Default on for exact gfx1201 only (`=0` kills it).
+    /// Every non-MoE row-local stage of an AR / verify lane step with more than 8 rows:
+    /// Embed, PleRows, the GDN / QSA input and output projections, the HC stages, FinalHyper,
+    /// Head and Argmax run one launch over every row on the all-rows segment (the wide
+    /// 9..=64-row routes) instead of once per <= 8-row group; the routed MoE keeps its groups.
+    /// Refines `qwen4_lane_hc_allrows` (needs it). On by default; the accessor gates it to
+    /// exact gfx1201 and gfx942.
     pub qwen4_lane_allrows: bool,
-    /// `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` (default on for exact gfx1201 only, `=0` kills it):
-    /// an EP AR / verify lane step the all-rows non-MoE stages admitted
-    /// (`qwen4_lane_allrows`) also runs the routed MoE once per layer over every row
-    /// (one `ep_lane_moe_rows` call of all `n` rows, the wide-group MoE) instead of once per
-    /// <= 8-row group; the HC writes a TP2 all-reduce carries go all-rows too. Refused at plan
-    /// time (the step keeps its groups) where the wide call cannot take the rows (no EP row
-    /// gather, `n` above the gather capacity -- 48 rows by default on exact gfx1201 EP).
+    /// An EP AR / verify lane step the all-rows non-MoE stages admitted (`qwen4_lane_allrows`)
+    /// also runs the routed MoE once per layer over every row (one `ep_lane_moe_rows` call of
+    /// all `n` rows, the wide-group MoE) instead of once per <= 8-row group; the HC writes a
+    /// TP2 all-reduce carries go all-rows too. Refused at plan time (the step keeps its groups)
+    /// where the wide call cannot take the rows (no EP row gather, `n` above the gather
+    /// capacity -- 48 rows by default on exact gfx1201 EP). On by default; the accessor gates
+    /// it to exact gfx1201 and gfx942.
     pub qwen4_lane_allrows_moe: bool,
     /// Lab (`HIPFIRE_QWEN4_LANE_ALLROWS_EXACT`, default OFF on every arch, exact gfx1201 only):
     /// every all-rows step of an AR / verify lane step (all families, the MoE when it is the
@@ -1211,9 +1211,9 @@ impl FeatureFlags {
                 || parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
             qwen4_qsa_lanes: arch == "gfx942" || parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
             qwen4_gdn_lanes_rows: true,
-            qwen4_lane_hc_allrows: arch == "gfx942" || parse_bool("HIPFIRE_QWEN4_LANE_HC_ALLROWS").unwrap_or(true),
-            qwen4_lane_allrows: arch == "gfx942" || parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS").unwrap_or(true),
-            qwen4_lane_allrows_moe: arch == "gfx942" || parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS_MOE").unwrap_or(true),
+            qwen4_lane_hc_allrows: true,
+            qwen4_lane_allrows: true,
+            qwen4_lane_allrows_moe: true,
             qwen4_lane_allrows_exact: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS_EXACT").unwrap_or(false),
             // `serve.batch_exact = seeded` (env `HIPFIRE_QWEN4_LANE_ROW_EXACT`) keeps the host
             // row-read sampler: the lane-wide device draw was measured composition dependent
@@ -1895,22 +1895,19 @@ impl FeatureFlags {
         self.arch == "gfx1201"
     }
 
-    /// All-rows HC stages of an AR lane step (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`). Exact
-    /// gfx1201 (default on, `=0` kills it); exact gfx942 on by arch (no env var read).
+    /// All-rows HC stages of an AR lane step. Exact gfx1201 and gfx942 only.
     pub fn qwen4_lane_hc_allrows_enabled(&self) -> bool {
         self.qwen4_lane_hc_allrows && matches!(self.arch.as_str(), "gfx1201" | "gfx942")
     }
 
-    /// All-rows non-MoE stages of an AR / verify lane step (`HIPFIRE_QWEN4_LANE_ALLROWS`).
-    /// Exact gfx1201 (default on, `=0` kills it); exact gfx942 on by arch (no env var read); it only refines the all-rows HC
-    /// segment, so it is inert while `HIPFIRE_QWEN4_LANE_HC_ALLROWS` is off.
+    /// All-rows non-MoE stages of an AR / verify lane step. Exact gfx1201 and gfx942 only; it
+    /// only refines the all-rows HC segment, so it is inert while the HC stages are off.
     pub fn qwen4_lane_allrows_enabled(&self) -> bool {
         self.qwen4_lane_allrows && matches!(self.arch.as_str(), "gfx1201" | "gfx942")
     }
 
-    /// Lab: the routed MoE of an all-rows lane step is one call over every row
-    /// (`HIPFIRE_QWEN4_LANE_ALLROWS_MOE`). Exact gfx1201 (default on, `=0` kills it); exact gfx942 on by arch (no env var read); it only refines the all-rows non-MoE
-    /// stages (`HIPFIRE_QWEN4_LANE_ALLROWS`), so it is inert without them.
+    /// Lab: the routed MoE of an all-rows lane step is one call over every row. Exact gfx1201
+    /// and gfx942 only; it only refines the all-rows non-MoE stages, so it is inert without them.
     pub fn qwen4_lane_allrows_moe_enabled(&self) -> bool {
         self.qwen4_lane_allrows_moe && matches!(self.arch.as_str(), "gfx1201" | "gfx942")
     }
@@ -3336,106 +3333,23 @@ mod tests {
         }
     }
 
-    /// The all-rows lane HC stages are default on (`=0` kills them) and reach exact gfx1201 only.
+    /// The all-rows lane HC stages, non-MoE stages and MoE are on by default and reach exact
+    /// gfx1201 and gfx942 only.
     #[test]
-    fn qwen4_lane_hc_allrows_flag_is_default_on_and_exact_gfx1201() {
-        let with = |value: &'static str| {
-            move |name: &str| -> std::result::Result<String, ()> {
-                if name == "HIPFIRE_QWEN4_LANE_HC_ALLROWS" {
-                    Ok(value.into())
-                } else {
-                    Err(())
-                }
-            }
-        };
+    fn qwen4_lane_allrows_flags_are_default_on_and_exact_gfx1201_or_gfx942() {
         for arch in [
             "gfx906", "gfx942", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
         ] {
-            assert_eq!(
-                FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_lane_hc_allrows_enabled(),
-                matches!(arch, "gfx1201" | "gfx942"),
-                "{arch}"
-            );
-            assert_eq!(
-                FeatureFlags::from_lookup(arch, with("0")).qwen4_lane_hc_allrows_enabled(),
-                arch == "gfx942",
-                "{arch}: =0 kills it except on gfx942 (env not read there)"
-            );
-            assert_eq!(
-                FeatureFlags::from_lookup(arch, with("1")).qwen4_lane_hc_allrows_enabled(),
-                matches!(arch, "gfx1201" | "gfx942"),
-                "{arch}"
-            );
+            let flags = FeatureFlags::from_lookup(arch, |_| Err(()));
+            let on = matches!(arch, "gfx1201" | "gfx942");
+            assert_eq!(flags.qwen4_lane_hc_allrows_enabled(), on, "{arch}");
+            assert_eq!(flags.qwen4_lane_allrows_enabled(), on, "{arch}");
+            assert_eq!(flags.qwen4_lane_allrows_moe_enabled(), on, "{arch}");
         }
-        assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_hc_allrows_enabled());
-    }
-
-    /// The all-rows non-MoE lane stages are default on (`=0` kills them) and reach exact gfx1201 only.
-    #[test]
-    fn qwen4_lane_allrows_flag_is_default_on_and_exact_gfx1201() {
-        let with = |value: &'static str| {
-            move |name: &str| -> std::result::Result<String, ()> {
-                if name == "HIPFIRE_QWEN4_LANE_ALLROWS" {
-                    Ok(value.into())
-                } else {
-                    Err(())
-                }
-            }
-        };
-        for arch in [
-            "gfx906", "gfx942", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
-        ] {
-            assert_eq!(
-                FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_lane_allrows_enabled(),
-                matches!(arch, "gfx1201" | "gfx942"),
-                "{arch}"
-            );
-            assert_eq!(
-                FeatureFlags::from_lookup(arch, with("0")).qwen4_lane_allrows_enabled(),
-                arch == "gfx942",
-                "{arch}: =0 kills it except on gfx942 (env not read there)"
-            );
-            assert_eq!(
-                FeatureFlags::from_lookup(arch, with("1")).qwen4_lane_allrows_enabled(),
-                matches!(arch, "gfx1201" | "gfx942"),
-                "{arch}"
-            );
-        }
-        assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_allrows_enabled());
-    }
-
-    /// The all-rows lane MoE is default on for exact gfx1201 only (`=0` kills it).
-    #[test]
-    fn qwen4_lane_allrows_moe_flag_is_default_on_and_exact_gfx1201() {
-        let with = |value: &'static str| {
-            move |name: &str| -> std::result::Result<String, ()> {
-                if name == "HIPFIRE_QWEN4_LANE_ALLROWS_MOE" {
-                    Ok(value.into())
-                } else {
-                    Err(())
-                }
-            }
-        };
-        for arch in [
-            "gfx906", "gfx942", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
-        ] {
-            assert_eq!(
-                FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_lane_allrows_moe_enabled(),
-                matches!(arch, "gfx1201" | "gfx942"),
-                "{arch}"
-            );
-            assert_eq!(
-                FeatureFlags::from_lookup(arch, with("0")).qwen4_lane_allrows_moe_enabled(),
-                arch == "gfx942",
-                "{arch}: =0 kills it except on gfx942 (env not read there)"
-            );
-            assert_eq!(
-                FeatureFlags::from_lookup(arch, with("1")).qwen4_lane_allrows_moe_enabled(),
-                matches!(arch, "gfx1201" | "gfx942"),
-                "{arch}"
-            );
-        }
-        assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_allrows_moe_enabled());
+        let off = FeatureFlags::for_test("gfx1201");
+        assert!(!off.qwen4_lane_hc_allrows_enabled());
+        assert!(!off.qwen4_lane_allrows_enabled());
+        assert!(!off.qwen4_lane_allrows_moe_enabled());
     }
 
     /// The scoped all-rows lane steps are a lab flag: default off everywhere, `1` reaches exact gfx1201 only.
