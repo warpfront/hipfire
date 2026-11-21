@@ -533,6 +533,7 @@ EmbeddingGemma 2 (arch 18) reads the same two knobs through the shared encoder s
 | Variable | Notes |
 |---|---|
 | `HIPFIRE_GRAPH` | hipGraph capture opt-in (quality caveats; AR-oriented). Raon-1-mini (arch 19) decode defaults to a captured graph (one per admitted context bucket, replayed per token; re-recorded when the latent mapping or K/V mirror grows); `HIPFIRE_GRAPH=0` is the per-launch eager control. A failed capture is an error, never a silent eager fallback. |
+| `HIPFIRE_AR_GRAPH` | Typed `experimental.graph.ar` (default `true`): autoregressive-forward hipGraph capture when otherwise eligible. **Windows exact gfx1100 defaults off** (AR graph replay silently produced wrong output there, #655); Linux gfx1100 and every other arch keep it on. An explicit `1`/`0` from config or env always wins. |
 | `HIPFIRE_MQ3V25_A4` | Symmetric MQ3 (qt49, `mq3v2.symmetric`) W3A4 integer-WMMA prefill. Default on for exact gfx1100 and gfx1201 with a symmetric qt49 artifact; `=0` is the kill switch and restores the F16 route (as does `kernel.iu4_prefill=false`). gfx1151 and other arches stay F16. |
 | `HIPFIRE_VERIFY_GRAPH` / `_TIMING` / `_TREE` | verify-side graph diag |
 | `HIPFIRE_MMQ` / `HIPFIRE_WO_MMQ` | MMQ activation |

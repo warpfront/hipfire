@@ -988,9 +988,10 @@ pub fn graph_ar_default(arch: &str, windows: bool) -> bool {
 
 /// Resolve `experimental.graph.ar` from the process-config compatibility value
 /// of `HIPFIRE_AR_GRAPH`. Absence (the built-in default is never carried in
-/// the process config) selects [`graph_ar_default`]; an explicit value from the
-/// user, the environment or a one-shot argument always wins, and only the exact
-/// value `0` (a rendered `false`) turns capture off.
+/// the process config) selects [`graph_ar_default`] (off on Windows exact
+/// gfx1100, #655); an explicit value from the user, the environment or a
+/// one-shot argument always wins, and only the exact value `0` (a rendered
+/// `false`) turns capture off.
 pub fn resolve_graph_ar(raw: Option<&str>, arch: &str, windows: bool) -> bool {
     match raw {
         None => graph_ar_default(arch, windows),
