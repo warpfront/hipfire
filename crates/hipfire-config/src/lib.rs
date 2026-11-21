@@ -942,6 +942,38 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_WIDENED_PBS_GROW_ONLY",
         "Owns large PBS buffers across requests instead of bouncing them through the pool. Default auto: on for discrete gfx1100 and gfx1201, off for UMA and other architectures. Set off to keep the conservative lifecycle (HIPFIRE_WIDENED_PBS_GROW_ONLY)."
     ),
+    process_auto_bool_field!(
+        "memory.qwen4_expert_hotset_gfx1100",
+        "qwen4_expert_hotset_gfx1100",
+        Memory,
+        true,
+        "HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100",
+        "Qwen4 gfx1100 (7900 XTX) single-card tier package: the default expert hot-set sidecar, S1 slow-link prefill over its tier plan, the census hot-set reserve, event readiness for tier D2 splits and the mixed-layer CP-wait join. Default auto: on for exact gfx1100, inert elsewhere. Set false to turn the package off (each member returns to its previous default); true is the same as auto (HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100)."
+    ),
+    process_auto_bool_field!(
+        "memory.qwen4_d2_mixed_cpwait",
+        "qwen4_d2_mixed_cpwait",
+        Memory,
+        true,
+        "HIPFIRE_QWEN4_D2_MIXED_CPWAIT",
+        "Mixed-layer CP-wait join for tier D2 splits (copy transport when off). Default auto: on for exact gfx1100 while the gfx1100 tier package is on, off elsewhere. Set true or false to force it on any arch (HIPFIRE_QWEN4_D2_MIXED_CPWAIT)."
+    ),
+    process_auto_bool_field!(
+        "memory.qwen4_expert_hotset_census_reserve",
+        "qwen4_expert_hotset_census_reserve",
+        Memory,
+        true,
+        "HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE",
+        "Census hot-set reserve for the Qwen4 expert hot set, applied on exact gfx1100 only. Default auto: on while the gfx1100 tier package is on. Set true or false to force it either way on gfx1100 (HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE)."
+    ),
+    process_auto_bool_field!(
+        "memory.qwen4_s1_tier",
+        "qwen4_s1_tier",
+        Memory,
+        true,
+        "HIPFIRE_QWEN4_S1_TIER",
+        "S1 slow-link prefill over a ranked expert hot-set tier plan. Default auto: on for exact gfx1100 while the gfx1100 tier package is on, off elsewhere. Set true or false to force it on any arch (HIPFIRE_QWEN4_S1_TIER)."
+    ),
     field!(
         "model.deepseek4_experts_per_token",
         "deepseek4_experts_per_token",
@@ -5090,6 +5122,38 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         replacement: "memory.widened_pbs_grow_only",
     },
     RetiredConfigKey {
+        key: "developer.qwen4_expert_hotset_gfx1100",
+        legacy_key: "developer.qwen4_expert_hotset_gfx1100",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-489); HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100 is unchanged",
+        replacement: "memory.qwen4_expert_hotset_gfx1100",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_d2_mixed_cpwait",
+        legacy_key: "developer.qwen4_d2_mixed_cpwait",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-489); HIPFIRE_QWEN4_D2_MIXED_CPWAIT is unchanged",
+        replacement: "memory.qwen4_d2_mixed_cpwait",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_expert_hotset_census_reserve",
+        legacy_key: "developer.qwen4_expert_hotset_census_reserve",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-489); HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE is unchanged",
+        replacement: "memory.qwen4_expert_hotset_census_reserve",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_s1_tier",
+        legacy_key: "developer.qwen4_s1_tier",
+        shipped_in: "0.4.5",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-489); HIPFIRE_QWEN4_S1_TIER is unchanged",
+        replacement: "memory.qwen4_s1_tier",
+    },
+    RetiredConfigKey {
         key: "developer.qwen4_lane_append_share",
         legacy_key: "qwen4_lane_append_share",
         shipped_in: "0.4.5",
@@ -9166,6 +9230,14 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
             };
             ConfigValue::String(mode.to_owned())
         }
+        "qwen4_expert_hotset_gfx1100"
+        | "qwen4_d2_mixed_cpwait"
+        | "qwen4_expert_hotset_census_reserve"
+        | "qwen4_s1_tier" => match raw {
+            "1" => ConfigValue::Bool(true),
+            "0" => ConfigValue::Bool(false),
+            _ => ConfigValue::String("auto".to_owned()),
+        },
         _ => return None,
     })
 }
@@ -10233,8 +10305,9 @@ mod tests {
             .collect();
         // 9 kernel-side (stage 1) + 28 arch-crate / runtime (stage 2) + 2 tier-B kernel-side
         // (HIPF-438) + 4 tier-B arch-crate / runtime (HIPF-437) + 2 kernel-side (HIPF-489)
-        // + 2 memory-side (HIPF-489 case 6).
-        assert_eq!(promoted.len(), 47);
+        // + 2 memory-side (HIPF-489 case 6) + 4 Qwen4 gfx1100 package keys
+        // (HIPF-489 case 6 part B).
+        assert_eq!(promoted.len(), 51);
         for f in promoted {
             let dev = developer_key_for_env(f.env_compat.unwrap()).unwrap();
             let err = ConfigLayer::default().set_cli(&dev, "1").unwrap_err();
@@ -10261,6 +10334,29 @@ mod tests {
                 Some(ConfigValue::String(want.to_owned())),
                 "{raw:?}"
             );
+        }
+    }
+
+    #[test]
+    fn qwen4_gfx1100_package_arms_keep_their_legacy_meaning() {
+        for key in [
+            "qwen4_expert_hotset_gfx1100",
+            "qwen4_d2_mixed_cpwait",
+            "qwen4_expert_hotset_census_reserve",
+            "qwen4_s1_tier",
+        ] {
+            for (raw, want) in [
+                ("1", ConfigValue::Bool(true)),
+                ("0", ConfigValue::Bool(false)),
+                ("", ConfigValue::String("auto".to_owned())),
+                ("true", ConfigValue::String("auto".to_owned())),
+            ] {
+                assert_eq!(
+                    promoted_flag_env_value(key, raw),
+                    Some(want),
+                    "{key} {raw:?}"
+                );
+            }
         }
     }
 
@@ -14929,39 +15025,6 @@ pub mod memory {
         }
     }
 
-    /// The Qwen4 gfx1100 (7900 XTX) single-card tier package, default ON on exact `gfx1100`
-    /// and inert everywhere else: the default sibling expert hot set sidecar
-    /// (`HIPFIRE_QWEN4_EXPERT_HOTSET`), S1 slow-link prefill over its tier plan
-    /// (`HIPFIRE_QWEN4_S1_TIER`), the census hot-set reserve
-    /// (`HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE`), event input readiness for tier D2 splits
-    /// (`HIPFIRE_QWEN4_D2_READY`) and the mixed-layer CP-wait join
-    /// (`HIPFIRE_QWEN4_D2_MIXED_CPWAIT`). The one switch is
-    /// `HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100` (`developer.qwen4_expert_hotset_gfx1100`): `0`
-    /// turns the whole package off (every member returns to its previous default: no default
-    /// sidecar on gfx1100, S1 declines a hot set, the incumbent reserve, sync readiness, the copy
-    /// transport on mixed layers); any other value, including unset, leaves it on. Each member
-    /// keeps its own variable, which always wins over the package for that member (`=1` / `=0`).
-    pub const QWEN4_GFX1100_TIER_PACKAGE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100";
-
-    /// Pure body of [`qwen4_gfx1100_tier_package`]: `arch` is exact `gfx1100` and the switch
-    /// (`package_switch`, the process value; `None` unset) is not `0`.
-    pub fn gfx1100_tier_package_for(arch: &str, package_switch: Option<bool>) -> bool {
-        arch == "gfx1100" && package_switch.unwrap_or(true)
-    }
-
-    /// Whether the gfx1100 tier package defaults apply to a load on `arch` (see
-    /// [`QWEN4_GFX1100_TIER_PACKAGE_ENV`]). Read from the process snapshot.
-    pub fn qwen4_gfx1100_tier_package(arch: &str) -> bool {
-        gfx1100_tier_package_for(
-            arch,
-            match process_value(QWEN4_GFX1100_TIER_PACKAGE_ENV).as_deref() {
-                Some("1") => Some(true),
-                Some("0") => Some(false),
-                _ => None,
-            },
-        )
-    }
-
     /// Pure body of [`qwen4_d2_ready_for`]: an explicit value (`sync` / `event`) always wins; unset
     /// is `Event` for a tier split on a load where the gfx1100 tier package applies
     /// (`package`), `Sync` for every other split and arch. An invalid spelling is an error.
@@ -14977,14 +15040,15 @@ pub mod memory {
     }
 
     /// [`qwen4_d2_ready`] with the per-arch default: event readiness for the D2 tier split
-    /// (`tier_split`: the layer's cold experts live in a hot-set tier owner) of a gfx1100
-    /// tier-package load. `HIPFIRE_QWEN4_D2_READY=sync` is the kill value for it.
+    /// (`tier_split`: the layer's cold experts live in a hot-set tier owner) of a load on the
+    /// Qwen4 gfx1100 tier package (`package`: `memory.qwen4_expert_hotset_gfx1100` resolved for
+    /// this arch). `HIPFIRE_QWEN4_D2_READY=sync` is the kill value for it.
     pub fn qwen4_d2_ready_for(
-        arch: &str,
+        package: bool,
         tier_split: bool,
     ) -> std::result::Result<D2Ready, String> {
         resolve_d2_ready(
-            qwen4_gfx1100_tier_package(arch),
+            package,
             tier_split,
             process_value("HIPFIRE_QWEN4_D2_READY").as_deref(),
         )
@@ -15125,24 +15189,6 @@ pub mod memory {
         parse_d2_pcie_share(process_value("HIPFIRE_QWEN4_D2_PCIE_SHARE").as_deref())
     }
 
-    /// `developer.qwen4_d2_mixed_cpwait` (env `HIPFIRE_QWEN4_D2_MIXED_CPWAIT`), a
-    /// boolean read once per load (default ON on exact gfx1100 as part of the tier package,
-    /// [`QWEN4_GFX1100_TIER_PACKAGE_ENV`]; off on every other arch; `=0` is the kill, `=1` forces
-    /// it anywhere the load requests `mapped` + `cpwait`): a MIXED hot/cold D2 tier layer
-    /// takes the mapped staging + CP-wait join instead of the copy transport +
-    /// host join, whenever the load requests `mapped` and `cpwait` (the gfx1100
-    /// default, or an explicit `HIPFIRE_QWEN4_D2_RETURN=mapped
-    /// HIPFIRE_QWEN4_D2_JOIN=cpwait`). The CPU arm computes the same bytes and the
-    /// canonical combine reads the same device rows; only the cold-row install
-    /// and the combine's enqueue move behind a command-processor wait. Off keeps
-    /// every layer's transport exactly as before.
-    pub fn qwen4_d2_mixed_cpwait(arch: &str) -> bool {
-        super::developer_bool(
-            "HIPFIRE_QWEN4_D2_MIXED_CPWAIT",
-            qwen4_gfx1100_tier_package(arch),
-        )
-    }
-
     /// Pure body of [`qwen4_d2_pcie_contention`]: unset is `1.0` (no
     /// contention); otherwise a plain decimal in `[1, 8]` (digits and one dot,
     /// no sign or exponent). Anything else, including the empty string, is an
@@ -15275,51 +15321,6 @@ pub mod memory {
             }
             for mode in [D2Ready::Sync, D2Ready::Event] {
                 assert_eq!(parse_d2_ready(Some(mode.as_str())), Ok(mode));
-            }
-        }
-
-        #[test]
-        fn gfx1100_tier_package_is_on_for_exact_gfx1100_only_and_one_switch_turns_it_off() {
-            // (arch, switch, package)
-            for (arch, switch, want) in [
-                ("gfx1100", None, true),
-                ("gfx1100", Some(true), true),
-                ("gfx1100", Some(false), false),
-                ("gfx1101", None, false),
-                ("gfx1102", None, false),
-                ("gfx1151", None, false),
-                ("gfx1201", None, false),
-                ("gfx1201", Some(true), false),
-                ("gfx942", None, false),
-                ("", None, false),
-            ] {
-                assert_eq!(
-                    gfx1100_tier_package_for(arch, switch),
-                    want,
-                    "{arch} {switch:?}"
-                );
-            }
-        }
-
-        #[test]
-        fn gfx1100_tier_package_members_default_on_for_gfx1100_and_off_elsewhere() {
-            // The process snapshot of a unit test carries none of the package variables, so
-            // these are the shipped defaults.
-            for arch in ["gfx1100"] {
-                assert!(qwen4_gfx1100_tier_package(arch));
-                assert!(qwen4_d2_mixed_cpwait(arch), "{arch}");
-                assert_eq!(qwen4_d2_ready_for(arch, true), Ok(D2Ready::Event));
-                assert_eq!(qwen4_d2_ready_for(arch, false), Ok(D2Ready::Sync));
-            }
-            // gfx1201, gfx1151 and everything else: byte-unchanged defaults.
-            for arch in [
-                "gfx1201", "gfx1200", "gfx1151", "gfx1101", "gfx942", "gfx90a", "",
-            ] {
-                assert!(!qwen4_gfx1100_tier_package(arch), "{arch}");
-                assert!(!qwen4_d2_mixed_cpwait(arch), "{arch}");
-                for tier in [true, false] {
-                    assert_eq!(qwen4_d2_ready_for(arch, tier), Ok(D2Ready::Sync), "{arch}");
-                }
             }
         }
 

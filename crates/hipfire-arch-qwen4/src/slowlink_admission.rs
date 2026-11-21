@@ -132,19 +132,16 @@ pub const S1_RESIDENT_LAYERS_ENV: &str = "HIPFIRE_QWEN4_SLOWLINK_RESIDENT_LAYERS
 /// resident (a profile admitted this way has `resident_layers == 0` and [`SlowlinkProfile::tier`]
 /// set); the discretionary capacity at zero resident layers is the hot-expert budget
 /// ([`SlowlinkProfile::tier_hot_reserve_bytes`]). Default ON on exact gfx1100 as part of the
-/// gfx1100 tier package ([`hipfire_config::memory::QWEN4_GFX1100_TIER_PACKAGE_ENV`]); `=0` is the
+/// gfx1100 tier package (`memory.qwen4_expert_hotset_gfx1100`); `=0` is the
 /// kill (a hot set then refuses S1 exactly as before) and `=1` forces it on any arch. Every other
 /// arch's default is unchanged: a hot set refuses S1.
-/// (`HIPFIRE_QWEN4_S1_TIER`, `developer.qwen4_s1_tier`.)
+/// (`HIPFIRE_QWEN4_S1_TIER`, `memory.qwen4_s1_tier`.)
 pub const S1_TIER_ENV: &str = "HIPFIRE_QWEN4_S1_TIER";
 
 /// Whether S1 over a ranked hot set is enabled for a load on `arch`: [`S1_TIER_ENV`] when set
 /// (`1` / `0`), else the gfx1100 tier package default.
 pub fn s1_tier_enabled_on(arch: &str) -> bool {
-    hipfire_config::developer_bool(
-        S1_TIER_ENV,
-        hipfire_config::memory::qwen4_gfx1100_tier_package(arch),
-    )
+    rdna_compute::FeatureFlags::process().qwen4_s1_tier_enabled(arch)
 }
 
 /// A tier-admitted window may grow past the floor only while it keeps at least this share

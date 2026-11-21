@@ -80,18 +80,18 @@ pub fn hotset_arch_admits(arch: &str, explicit_path: bool) -> bool {
     hotset_arch_admits_with(
         arch,
         explicit_path,
-        hipfire_config::memory::qwen4_gfx1100_tier_package(arch),
+        rdna_compute::FeatureFlags::process().qwen4_expert_hotset_gfx1100_enabled(arch),
     )
 }
 
 /// The one switch of the gfx1100 (7900 XTX) tier package, default ON on exact `gfx1100` (see
-/// [`hipfire_config::memory::QWEN4_GFX1100_TIER_PACKAGE_ENV`]): the default sibling sidecar also
+/// `memory.qwen4_expert_hotset_gfx1100` ([`HOTSET_GFX1100_ENV`]): the default sibling sidecar also
 /// applies on [`HOTSET_GFX1100_ARCH`], and the package's other members (S1 over the tier plan,
 /// the census reserve, event readiness and the mixed CP-wait join of tier D2 splits) take their
 /// gfx1100 defaults. `=0` turns the whole package off and returns gfx1100 to the
 /// explicit-path-only rule. It changes nothing on any other arch and nothing for an explicit
 /// [`HOTSET_ENV`] path.
-pub const HOTSET_GFX1100_ENV: &str = hipfire_config::memory::QWEN4_GFX1100_TIER_PACKAGE_ENV;
+pub const HOTSET_GFX1100_ENV: &str = "HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100";
 /// The architecture [`HOTSET_GFX1100_ENV`] admits.
 pub const HOTSET_GFX1100_ARCH: &str = "gfx1100";
 
@@ -121,10 +121,7 @@ pub const HOTSET_CENSUS_RESERVE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_
 pub fn hotset_reserve_bytes(arch: &str, reserve: &crate::expert_residency::AutoReserve) -> u64 {
     hotset_reserve_bytes_with(
         arch,
-        hipfire_config::developer_bool(
-            HOTSET_CENSUS_RESERVE_ENV,
-            hipfire_config::memory::qwen4_gfx1100_tier_package(arch),
-        ),
+        rdna_compute::FeatureFlags::process().qwen4_expert_hotset_census_reserve_enabled(arch),
         reserve,
     )
 }

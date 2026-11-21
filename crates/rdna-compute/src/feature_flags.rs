@@ -481,6 +481,18 @@ pub struct FeatureFlags {
     /// `memory.widened_pbs_grow_only` (`HIPFIRE_WIDENED_PBS_GROW_ONLY`) with `off` applied;
     /// [`Self::widened_pbs_grow_only_enabled`] adds the discrete-only gate.
     pub widened_pbs_grow_only: bool,
+    /// `memory.qwen4_expert_hotset_gfx1100` (`HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100`), tri-state:
+    /// the gfx1100 tier package switch, applied by [`Self::qwen4_expert_hotset_gfx1100_enabled`].
+    pub qwen4_expert_hotset_gfx1100: Option<bool>,
+    /// `memory.qwen4_d2_mixed_cpwait` (`HIPFIRE_QWEN4_D2_MIXED_CPWAIT`), tri-state; see
+    /// [`Self::qwen4_d2_mixed_cpwait_enabled`].
+    pub qwen4_d2_mixed_cpwait: Option<bool>,
+    /// `memory.qwen4_expert_hotset_census_reserve` (`HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE`),
+    /// tri-state; see [`Self::qwen4_expert_hotset_census_reserve_enabled`].
+    pub qwen4_expert_hotset_census_reserve: Option<bool>,
+    /// `memory.qwen4_s1_tier` (`HIPFIRE_QWEN4_S1_TIER`), tri-state; see
+    /// [`Self::qwen4_s1_tier_enabled`].
+    pub qwen4_s1_tier: Option<bool>,
     /// `HIPFIRE_GFX1151_XLDS` selects the exact-gfx1151 1..=16-row MQ4V2 and
     /// HFQ4G256/MQ4G256 v1 WMMA GEMMs (`*_gfx1151_xlds`: 4 waves x 16 rows per
     /// block, X slab staged in LDS) for gate_up/qkvza/qkv/residual (residual also
@@ -1416,6 +1428,12 @@ impl FeatureFlags {
             page_eviction: exact_tri("HIPFIRE_PAGE_EVICTION"),
             widened_pbs_grow_only: matches!(arch, "gfx1100" | "gfx1201")
                 && value("HIPFIRE_WIDENED_PBS_GROW_ONLY").ok().as_deref() != Some("off"),
+            qwen4_expert_hotset_gfx1100: exact_tri("HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100"),
+            qwen4_d2_mixed_cpwait: exact_tri("HIPFIRE_QWEN4_D2_MIXED_CPWAIT"),
+            qwen4_expert_hotset_census_reserve: exact_tri(
+                "HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE",
+            ),
+            qwen4_s1_tier: exact_tri("HIPFIRE_QWEN4_S1_TIER"),
             gfx1151_xlds: parse_bool("HIPFIRE_GFX1151_XLDS").unwrap_or(arch == "gfx1151"),
             mq4v2_gfx1150_bt: parse_bool("HIPFIRE_MQ4V2_GFX1150_BT")
                 .unwrap_or(arch == "gfx1150"),
@@ -1815,6 +1833,32 @@ impl FeatureFlags {
     /// Discrete-only: UMA devices keep the conservative lifecycle.
     pub fn widened_pbs_grow_only_enabled(&self, uma: bool) -> bool {
         self.widened_pbs_grow_only && !uma
+    }
+
+    /// `memory.qwen4_expert_hotset_gfx1100`: the gfx1100 tier package switch. Exact gfx1100
+    /// only; `0` turns the package off.
+    pub fn qwen4_expert_hotset_gfx1100_enabled(&self, arch: &str) -> bool {
+        arch == "gfx1100" && self.qwen4_expert_hotset_gfx1100.unwrap_or(true)
+    }
+
+    /// Mixed hot/cold D2 tier: CP-wait join on the mapped staging path. Defaults to the gfx1100
+    /// package; `1` forces it on any arch, `0` off.
+    pub fn qwen4_d2_mixed_cpwait_enabled(&self, arch: &str) -> bool {
+        self.qwen4_d2_mixed_cpwait
+            .unwrap_or_else(|| self.qwen4_expert_hotset_gfx1100_enabled(arch))
+    }
+
+    /// Census-driven hot-set reserve. Defaults to the gfx1100 package; the reserve applies
+    /// only on gfx1100 (`hotset_reserve_bytes_with`).
+    pub fn qwen4_expert_hotset_census_reserve_enabled(&self, arch: &str) -> bool {
+        self.qwen4_expert_hotset_census_reserve
+            .unwrap_or_else(|| self.qwen4_expert_hotset_gfx1100_enabled(arch))
+    }
+
+    /// S1 tier. Defaults to the gfx1100 package; `1` forces it on any arch, `0` off.
+    pub fn qwen4_s1_tier_enabled(&self, arch: &str) -> bool {
+        self.qwen4_s1_tier
+            .unwrap_or_else(|| self.qwen4_expert_hotset_gfx1100_enabled(arch))
     }
 
     /// H3: the retiled operand-swapped HC up+mix read tail
@@ -2357,6 +2401,10 @@ impl FeatureFlags {
             gfx1100_router_w64: RouterW64Mode::Exact,
             page_eviction: None,
             widened_pbs_grow_only: false,
+            qwen4_expert_hotset_gfx1100: None,
+            qwen4_d2_mixed_cpwait: None,
+            qwen4_expert_hotset_census_reserve: None,
+            qwen4_s1_tier: None,
             gfx1151_xlds: false,
             mq4v2_gfx1150_bt: false,
             mq4v2_gfx1150_iu4: false,
@@ -3076,6 +3124,59 @@ mod tests {
             let flags = FeatureFlags::from_lookup(arch, |_| Err(()));
             assert!(!flags.widened_pbs_grow_only_enabled(false), "{arch}");
         }
+    }
+
+    #[test]
+    fn qwen4_expert_hotset_gfx1100_is_exact_gfx1100_unless_switched_off() {
+        for (arch, switch, want) in [
+            ("gfx1100", None, true),
+            ("gfx1100", Some("1"), true),
+            ("gfx1100", Some("0"), false),
+            ("gfx1101", None, false),
+            ("gfx1151", None, false),
+            ("gfx1201", Some("1"), false),
+        ] {
+            let flags = FeatureFlags::from_lookup(arch, |name| match (name, switch) {
+                ("HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100", Some(raw)) => Ok(raw.to_owned()),
+                _ => Err(()),
+            });
+            assert_eq!(
+                flags.qwen4_expert_hotset_gfx1100_enabled(arch),
+                want,
+                "{arch} {switch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen4_tier_members_default_to_the_package_and_explicit_values_win() {
+        for arch in ["gfx1100", "gfx1151"] {
+            let flags = FeatureFlags::from_lookup(arch, |_| Err(()));
+            let on = arch == "gfx1100";
+            assert_eq!(
+                flags.qwen4_d2_mixed_cpwait_enabled(arch),
+                on,
+                "{arch} cpwait"
+            );
+            assert_eq!(flags.qwen4_s1_tier_enabled(arch), on, "{arch} s1");
+            assert_eq!(
+                flags.qwen4_expert_hotset_census_reserve_enabled(arch),
+                on,
+                "{arch} census"
+            );
+        }
+        let forced = FeatureFlags::from_lookup("gfx1151", |name| match name {
+            "HIPFIRE_QWEN4_D2_MIXED_CPWAIT" | "HIPFIRE_QWEN4_S1_TIER" => Ok("1".to_owned()),
+            _ => Err(()),
+        });
+        assert!(forced.qwen4_d2_mixed_cpwait_enabled("gfx1151"));
+        assert!(forced.qwen4_s1_tier_enabled("gfx1151"));
+        let off = FeatureFlags::from_lookup("gfx1100", |name| match name {
+            "HIPFIRE_QWEN4_D2_MIXED_CPWAIT" | "HIPFIRE_QWEN4_S1_TIER" => Ok("0".to_owned()),
+            _ => Err(()),
+        });
+        assert!(!off.qwen4_d2_mixed_cpwait_enabled("gfx1100"));
+        assert!(!off.qwen4_s1_tier_enabled("gfx1100"));
     }
 
     /// H4/H3/H8a flags are exact gfx1151 / gfx1201: unset, H4 is level 3 on
@@ -5343,6 +5444,10 @@ mod tests {
                 format!("{:?}", f.tp_exchange),
                 format!("{:?}", f.tp_peer_alternating),
                 format!("{:?}", f.tp_peer_push),
+                format!("{:?}", f.qwen4_expert_hotset_gfx1100),
+                format!("{:?}", f.qwen4_d2_mixed_cpwait),
+                format!("{:?}", f.qwen4_expert_hotset_census_reserve),
+                format!("{:?}", f.qwen4_s1_tier),
             ]
         };
         let flags_for = |layer: ConfigLayer| {
@@ -5382,6 +5487,18 @@ mod tests {
             ),
             ("topology.tp_peer_alternating", Bool(false), "Some(false)"),
             ("topology.tp_peer_push", Bool(true), "Some(true)"),
+            (
+                "memory.qwen4_expert_hotset_gfx1100",
+                Bool(false),
+                "Some(false)",
+            ),
+            ("memory.qwen4_d2_mixed_cpwait", Bool(true), "Some(true)"),
+            (
+                "memory.qwen4_expert_hotset_census_reserve",
+                Bool(false),
+                "Some(false)",
+            ),
+            ("memory.qwen4_s1_tier", Bool(true), "Some(true)"),
         ]
         .into_iter()
         .enumerate()
