@@ -207,12 +207,43 @@ pub fn decode_moe(
     situ_beta: f32,
     situ_linear_beta: f32,
 ) -> Vec<f32> {
-    let n_experts = gate_up.len();
+    decode_moe_lazy(
+        x,
+        router,
+        router_bias,
+        n_embd,
+        inter,
+        top_k,
+        route_scale,
+        situ_beta,
+        situ_linear_beta,
+        &mut |e| (gate_up[e].clone(), down[e].clone()),
+    )
+}
+
+/// Like [`decode_moe`] but decodes expert weights lazily via `get(e)`, so a
+/// 128-expert layer only decodes its top-8 (critical for the 48-visit CPU run).
+pub fn decode_moe_lazy<F>(
+    x: &[f32],
+    router: &[f32],
+    router_bias: Option<&[f32]>,
+    n_embd: usize,
+    inter: usize,
+    top_k: usize,
+    route_scale: f32,
+    situ_beta: f32,
+    situ_linear_beta: f32,
+    get: &mut F,
+) -> Vec<f32>
+where
+    F: FnMut(usize) -> (Vec<f32>, Vec<f32>),
+{
+    let n_experts = router.len() / n_embd;
     let logits = oracle::matvec(router, x, n_experts, n_embd);
     let selected = oracle::sigmoid_topk(&logits, router_bias, top_k, route_scale);
     let mut out = vec![0.0f32; n_embd];
     for (e, weight) in selected {
-        let gu = &gate_up[e];
+        let (gu, dn) = get(e);
         let gate = &gu[..inter * n_embd];
         let up = &gu[inter * n_embd..];
         let g = oracle::matvec(gate, x, inter, n_embd);
@@ -220,7 +251,7 @@ pub fn decode_moe(
         let act: Vec<f32> = (0..inter)
             .map(|i| oracle::situ(g[i], u[i], situ_beta, situ_linear_beta))
             .collect();
-        let d = oracle::matvec(&down[e], &act, n_embd, inter);
+        let d = oracle::matvec(&dn, &act, n_embd, inter);
         for i in 0..n_embd {
             out[i] += weight * d[i];
         }
@@ -470,24 +501,30 @@ pub fn decode_visit(
     let ffn_normed = rmsnorm_gain(&ffn_in, &g("mlp_norm.weight")?, cfg.rms_norm_eps);
     let router = g("mlp.gate.weight")?;
     let bias = g("mlp.gate.bias").ok();
-    let mut gu = Vec::with_capacity(cfg.n_experts);
-    let mut dn = Vec::with_capacity(cfg.n_experts);
-    for e in 0..cfg.n_experts {
-        gu.push(g(&format!("mlp.experts.{e}.gate_up_proj.weight"))?);
-        dn.push(g(&format!("mlp.experts.{e}.down_proj.weight"))?);
-    }
-    let moe = decode_moe(
+    // Route first, decode only the selected experts (lazy) — a 48-visit run
+    // touches ~384 experts instead of all 6144.
+    let expert_prefix = format!("{p}mlp.experts.");
+    let moe = decode_moe_lazy(
         &ffn_normed,
         &router,
         bias.as_deref(),
-        &gu,
-        &dn,
         cfg.n_embd,
         cfg.inter,
         cfg.n_expert_used,
         cfg.route_scale,
         cfg.situ_beta,
         cfg.situ_linear_beta,
+        &mut |e| {
+            let gu = w
+                .f32(&format!("{expert_prefix}{e}.gate_up_proj.weight"))
+                .expect("expert gate_up")
+                .1;
+            let dn = w
+                .f32(&format!("{expert_prefix}{e}.down_proj.weight"))
+                .expect("expert down")
+                .1;
+            (gu, dn)
+        },
     );
     let (moe_conv, fp) = oracle::convolve_static(
         &moe,
@@ -499,6 +536,23 @@ pub fn decode_visit(
     );
     state.ffn_out_past = fp;
     Ok(ffn_in.iter().zip(&moe_conv).map(|(a, b)| a + b).collect())
+}
+
+/// Compute logits from the final hidden state: LM head GEMV, fp32, final
+/// softcap 30, then slice to the unpadded vocabulary (200058 of 201024).
+pub fn lm_head_logits(
+    w: &crate::weights::Inkling2Weights,
+    cfg: &crate::config::Inkling2Config,
+    hidden: &[f32],
+) -> Result<Vec<f32>, String> {
+    let head = w.f32("model.llm.unembed.weight")?.1;
+    let vocab_pad = cfg.vocab_size;
+    let logits = oracle::matvec(&head, hidden, vocab_pad, cfg.n_embd);
+    let capped: Vec<f32> = logits
+        .iter()
+        .map(|&v| oracle::softcap(v, cfg.softcap))
+        .collect();
+    Ok(capped[..cfg.unpadded_vocab_size].to_vec())
 }
 
 /// Run all 48 visits for one token, from token embedding to final normalized
@@ -888,6 +942,35 @@ mod tests {
         assert!(out.iter().all(|v| v.is_finite()), "non-finite model output");
         let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         eprintln!("48-visit forward: {} values, max={max}", out.len());
+    }
+
+    #[test]
+    #[ignore = "requires the 14 GB artifact; full 48-visit forward + LM head"]
+    fn end_to_end_logits_are_finite_and_sized() {
+        use crate::weights::Inkling2Weights;
+        use hipfire_runtime::hfq::HfqFile;
+        let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        let hfq = HfqFile::open(std::path::Path::new(
+            r"D:\hipfire-models\inkling2-mini-mq4.hfq",
+        ))
+        .expect("open");
+        let w = Inkling2Weights::load(&hfq, &cfg).expect("load");
+        let embed = w.f32("model.llm.embed.weight").unwrap().1;
+        let x = embed[..cfg.n_embd].to_vec();
+        let hidden = forward_token(&w, &cfg, &x, 0).expect("forward");
+        let logits = lm_head_logits(&w, &cfg, &hidden).expect("lm head");
+        assert_eq!(logits.len(), cfg.unpadded_vocab_size);
+        assert!(logits.iter().all(|v| v.is_finite()), "non-finite logits");
+        let (argmax, _) = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!(
+            "end-to-end: {} logits, argmax={argmax}, max={max}",
+            logits.len()
+        );
     }
 
     fn oracle_close(a: f32, b: f32) -> bool {
