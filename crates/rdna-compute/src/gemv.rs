@@ -933,7 +933,7 @@ fn awq_norm_kernel() -> (&'static str, &'static str, u32) {
     )
 }
 
-/// `HIPFIRE_G12_DEC_NORM` / `HIPFIRE_GFX1100_DEC_NORM` twin of [`awq_norm_kernel`]: launched with one
+/// Decode twin of [`awq_norm_kernel`] on exact gfx1201, gfx1151 and gfx1100: launched with one
 /// workgroup per 256-group (grid K/256) instead of one workgroup per row.
 fn awq_norm_dec_kernel() -> (&'static str, &'static str, u32) {
     (
@@ -4073,8 +4073,7 @@ impl Gpu {
     /// sidecar under the `_gfx12` entry symbols. `x_rot = None` skips the f32
     /// store (emit_f32=false). `awq = Some` selects the AWQ twin symbol.
     /// Seals `reservation` into a prepared handle — never calls
-    /// `ensure_int4_mmq_x`. Gated by `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`;
-    /// `HIPFIRE_G12_NORM` (default on) selects the bit-identical `_v2` twins
+    /// `ensure_int4_mmq_x`. Gated by exact gfx1201; the bit-identical `_v2` twins are selected
     /// (same geometry and arguments). The A4 slab AWQ twin divides with the
     /// loader's reciprocal planes (`_v2_slab_fdiv`, one extra `awq_rcp`
     /// argument) when `awq` carries them ([`awq_has_rcp_planes`]).
@@ -4110,7 +4109,7 @@ impl Gpu {
     /// emitted by the standalone-quantizer reference (runtime `cand_mode = 8`
     /// on the existing non-`_v2` `fused_rmsnorm_mq_rotate_{,awq_}i4_gfx12`
     /// exports: `quantize_block_i4_128_wave<false>`, 8-candidate search).
-    /// Always the non-`_v2` kernel regardless of `HIPFIRE_G12_NORM`, never
+    /// Always the non-`_v2` kernel, even on exact gfx1201, never
     /// the slab/fdiv twins: the layout is the AoS `block_i4_128` and the
     /// returned handle is not slab-marked. Same arguments.
     pub fn fused_rmsnorm_rotate_mq_i4_gfx12_exact_batched(
@@ -4139,7 +4138,7 @@ impl Gpu {
 
     /// `exact`: forces the non-`_v2` export with trailing `cand_mode = 8`;
     /// otherwise the existing v2/slab/fdiv selection, and the non-`_v2`
-    /// sources (`HIPFIRE_G12_NORM=0`) receive `cand_mode = 0`.
+    /// sources (off exact gfx1201) receive `cand_mode = 0`.
     #[allow(clippy::too_many_arguments)]
     fn fused_rmsnorm_rotate_mq_i4_gfx12_impl(
         &mut self,
@@ -4348,7 +4347,7 @@ impl Gpu {
     /// invalidation, mirroring `prepare_mq4v2_fp8_x`), launches the fused
     /// producer, and seals the pointers into [`crate::scratch::Mq4v2Fp8Prepared`]
     /// — never calls `prepare_mq4v2_fp8_x`. Gated by
-    /// `HIPFIRE_GFX12_FP8_STREAM`.
+    /// exact gfx1201.
     pub fn fused_rmsnorm_rotate_mq_fp8_gfx12_batched(
         &mut self,
         x: &GpuTensor,
@@ -5047,8 +5046,7 @@ impl Gpu {
     /// producer arithmetic and shared wave quant recipe are the same. The
     /// `_exact_batched` twin selects the 8-candidate reference at runtime.
     /// Seals `reservation` into a prepared handle — never
-    /// calls `ensure_int4_mmq_x`. Selected by `HIPFIRE_GFX12_SILU_QUANT_FUSED`
-    /// (default on for exact-gfx1201 IU4; `=0` opts out).
+    /// calls `ensure_int4_mmq_x`. Exact gfx1201 IU4 only.
     pub fn fused_silu_mul_rotate_mq_i4_gfx12_batched(
         &mut self,
         gate: &GpuTensor,
@@ -5526,8 +5524,7 @@ impl Gpu {
     /// downstream reader). Requires `head_dim == 128`, `K % 256 == 0`, exact
     /// gfx1201. `awq = Some` selects the AWQ twin. Seals `reservation` into
     /// a prepared handle — never calls `ensure_int4_mmq_x`. Gated by
-    /// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`; `HIPFIRE_G12_NORM` (default on)
-    /// selects the bit-identical `_v2` twins (one wave per 256-group, two
+    /// exact gfx1201; the bit-identical `_v2` twins (one wave per 256-group, two
     /// groups per 64-thread workgroup). `x_fmt` is the storage of `x`, the
     /// GDN chunk-scan plane (`Bf16` selects the exactly-widening `_xbf16` twins).
     #[allow(clippy::too_many_arguments)]
@@ -5940,7 +5937,7 @@ impl Gpu {
     /// standalone gated_norm → rotate_x_mq_awq chain). `x_rot = None`
     /// skips the f32 store. Grid [(K/256) * N], block 64, only the
     /// incumbent 1024-B LDS handoff (static `normalized[256]`). Gated by
-    /// `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`.
+    /// exact gfx1100/gfx1151.
     #[allow(clippy::too_many_arguments)]
     pub fn gated_norm_rotate_mq_i4_gfx11_batched(
         &mut self,
@@ -6766,7 +6763,7 @@ impl Gpu {
     /// `x_out` store is always written (byte-identical for every downstream
     /// reader); the sidecar additionally seals `reservation` into a prepared
     /// handle — never calls `ensure_int4_mmq_x`. Gated by
-    /// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`.
+    /// exact gfx1201.
     /// The sidecar uses the compiled candidate policy (gfx1201 C2 {5,7}); it is
     /// NOT in general byte-identical to the standalone `quantize_int4_mmq_ds128`
     /// (8-candidate) chain. The `_exact_batched` twin selects that reference
@@ -7693,7 +7690,7 @@ impl Gpu {
     /// path stored the sigmoided attention row to f32 and immediately
     /// reloaded it in `rotate_x_mq_awq_i4`; this entry keeps that f32 value
     /// in-register and leaves `attn` unmodified. Gated by
-    /// `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`.
+    /// exact gfx1100/gfx1151.
     #[allow(clippy::too_many_arguments)]
     pub fn sigmoid_mul_rotate_x_mq_awq_i4_gfx11_batched(
         &mut self,

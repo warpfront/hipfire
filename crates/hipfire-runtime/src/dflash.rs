@@ -2439,11 +2439,9 @@ enum SharedProjection {
 /// scratch for all rows, `x` is FWHT-rotated once and every projection's GEMM
 /// reads that one rotation: the route `gemm_dispatch` would pick per
 /// projection (the S7 overwrite split-K GEMM on F16, else the batched lm_head
-/// GEMM), minus the repeated rotations of identical bytes. Anything else, or
-/// the group's switch off (`kernel.draft_shared_{qkv,ffn,ctx_kv}_rotation`,
-/// default on exact gfx1100), runs [`gemm_dispatch`] once per projection in
-/// order. Inventoried as railgun-cert decision
-/// `dflash-gfx1100-shared-rotation`.
+/// GEMM), minus the repeated rotations of identical bytes. Anything else runs
+/// [`gemm_dispatch`] once per projection in order. Inventoried as railgun-cert
+/// decision `dflash-gfx1100-shared-rotation`.
 fn gemm_dispatch_shared<const N: usize>(
     gpu: &mut Gpu,
     x: &GpuTensor,

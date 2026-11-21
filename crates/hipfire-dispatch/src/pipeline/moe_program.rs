@@ -8205,24 +8205,18 @@ pub fn grouped_moe_iu4_shape_admits(g: &GroupedMoeGeometry, rows: usize) -> bool
         && g.hidden % 64 == 0
 }
 
-/// `HIPFIRE_RAON_GFX1100_DOWN_PRODUCER` (developer, default on, exact gfx1100): the routed grouped down site
-/// runs the G5 fused producer (`ffn_situ_grouped_rotate_i8`: activation + rotation + A8 quantizer in one
-/// launch, bytewise the three-launch chain) on the 7900 XTX as it does on gfx1201 (where
-/// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` governs it). `=0` restores the three-launch chain. The shared/dense
-/// rows entry is not part of this flag (it stays gfx1201-only).
+/// Exact gfx1100: the routed grouped down site runs the G5 fused producer (`ffn_situ_grouped_rotate_i8`:
+/// activation + rotation + A8 quantizer in one launch, bytewise the three-launch chain) on the 7900 XTX as
+/// it does on gfx1201. The shared/dense rows entry stays gfx1201-only.
 pub fn gfx1100_grouped_down_producer_enabled(arch: &str) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     arch == "gfx1100"
-        && *ON.get_or_init(|| {
-            hipfire_config::developer_bool("HIPFIRE_RAON_GFX1100_DOWN_PRODUCER", true)
-        })
 }
 
 /// Whether a down site runs the fused A8 producer (`Gpu::ffn_activation_grouped_rotate_i8_f32` /
 /// `Gpu::ffn_activation_rows_rotate_i8_f32`: activation + rotation + A8 quantizer in one launch,
 /// bytewise the three-launch chain). Pure: `fused_flag` is
-/// `Flags::gfx12_producer_quant_fused_enabled()` (exact gfx1201 and
-/// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` not `0`), `tier` the down site's admitted tier. The route
+/// `Flags::gfx12_producer_quant_fused_enabled()` (exact gfx1201), `tier` the down site's
+/// admitted tier. The route
 /// runs only for the A8 tier, and for the kernel's column geometry: whole 8-column lanes
 /// (`logical_n % 8`), whole 256-wide rotation groups (`down_k % 256`), `logical_n <= down_k`.
 /// The caller's own admission (rows floor, capture/recording refusal, symmetric format) already ran.
@@ -8658,7 +8652,7 @@ mod grouped_moe_tests {
             PrefillActTier::A8,
             &g
         ));
-        // `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0` (or another arch) restores the chain.
+        // Flag false (off exact gfx1201) restores the chain.
         assert!(!grouped_down_producer_fused_admits(
             false,
             PrefillActTier::A8,

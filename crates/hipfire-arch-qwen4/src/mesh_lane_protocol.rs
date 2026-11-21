@@ -984,7 +984,7 @@ pub struct VerifyPlan {
     /// lane's rows (`None`: the lane is greedy or drawn on the host).
     pub samples: Vec<Option<DeviceSampleSpec>>,
     /// The target LM head and the sampled lanes' device draws are vocabulary-sharded across the
-    /// two EP ranks (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): each rank projects and scans its half of the
+    /// two EP ranks (exact gfx1201 pair): each rank projects and scans its half of the
     /// head, and the sampler owner merges the halves into exactly the unsharded picks and draws
     /// (`argmax_f32_pair_merge`, `lane_leviathan_verify` select / merged modes). Decided by the
     /// root ([`vocab_shard_decision`]), part of the digest, refused by a rank that cannot run it
@@ -2024,9 +2024,9 @@ impl MeshRoot {
         }
     }
 
-    /// Arm the root's vocabulary-sharded verify (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`): an EP step whose
+    /// Arm the root's vocabulary-sharded verify (exact gfx1201 pair): an EP step whose
     /// total rows fit the exchange's `rows` capacity and whose sampled lanes all carry a device
-    /// sample seals [`VerifyPlan::vocab_shard`]. `0` rows (the default) never shards. The root
+    /// sample seals [`VerifyPlan::vocab_shard`]. `0` rows never shards. The root
     /// decides, the plan carries it; a rank that cannot run it refuses the plan.
     pub fn with_vocab_shard_rows(mut self, rows: usize) -> Self {
         self.vocab_shard_rows = rows;

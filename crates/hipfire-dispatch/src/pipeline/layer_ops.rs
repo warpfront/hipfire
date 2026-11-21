@@ -3735,8 +3735,8 @@ pub fn gdn_qkv_projection_bf16(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
         || gdn_dense_qkv_bf16(gpu, op, &dims)
 }
 
-/// gfx1201 FN dense-scan prefill (`HIPFIRE_QWEN4_GDN_QKV_BF16`, opt-in, needs
-/// `HIPFIRE_QWEN4_GDN_CHAIN_FUSE`): the qkv projection is stored as BF16 bits by the exact-INT8 MQ6 GEMM's BF16
+/// gfx1201 FN dense-scan prefill (`HIPFIRE_QWEN4_GDN_QKV_BF16`, opt-in, exact gfx1201 only):
+/// the qkv projection is stored as BF16 bits by the exact-INT8 MQ6 GEMM's BF16
 /// entry (RNE of the F32 accumulator). The dense producer's convolution reads each qkv value only
 /// through that same BF16 rounding, so the chain's bytes are unchanged while the GEMM writes and
 /// the producer reads half the bytes (20 KB instead of 40 KB per row). A pure function of the

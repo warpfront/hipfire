@@ -640,13 +640,12 @@ const SIGNS_BYTES: u64 = 2 * 256 * 4;
 const BLOCK_I8_128_BYTES: u64 = 136;
 
 /// Row floor of the A8 prefill tier the fused producer rides: admitted at `PREFILL_QUANT_MIN_ROWS` (64) rows or
-/// more by the caller (`down_producer_fused_admits` documents that the caller's rows floor already ran), and
-/// turned off by `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0` (`Flags::gfx12_producer_quant_fused_enabled`).
+/// more by the caller (`down_producer_fused_admits` documents that the caller's rows floor already ran).
 const ADMIT_A8_PRODUCER: RowDomainV1 = RowDomainV1 {
     min_rows: 64,
     max_rows: None,
     predicate: "crates/hipfire-dispatch/src/pipeline/q8_prefill.rs::PREFILL_QUANT_MIN_ROWS",
-    kill_env: Some("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED"),
+    kill_env: None,
 };
 
 const MODULE_FFN_ROTATE_I8: ObjectRefV1 = ObjectRefV1::HipccSource {
@@ -1471,7 +1470,7 @@ mod tests {
             w.admit.predicate,
             "crates/hipfire-dispatch/src/pipeline/q8_prefill.rs::PREFILL_QUANT_MIN_ROWS"
         );
-        assert_eq!(w.admit.kill_env, Some("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED"));
+        assert_eq!(w.admit.kill_env, None);
     }
 
     #[test]

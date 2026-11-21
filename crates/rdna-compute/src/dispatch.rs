@@ -6102,7 +6102,7 @@ impl Gpu {
     /// per workgroup), and the gfx1201 iu4 MMQ consumer handles partial
     /// 128-row tiles natively (zero-filled slab / guarded writeback), so the
     /// old %128 multiple was grid convenience only.
-    /// Default on for the IU4 route (`HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts out).
+    /// Exact gfx1201 IU4 route only.
     pub fn iu4_silu_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_silu_quant_fused_enabled()
             && !self.a8_prefill_active(batch, k)
@@ -6114,7 +6114,7 @@ impl Gpu {
             && k % 256 == 0
     }
     /// True when a gfx1201 slices-2-4 producer+quant fusion is live for this
-    /// call: IU4 + `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` on exact gfx1201 +
+    /// call: IU4 on exact gfx1201 +
     /// eager (no replay/capture) + K constraint of the iu4 MMQ consumer. Any
     /// batch >= 64 (any batch >= 1 inside the IU4 verify scope), same
     /// row-parallel justification as `iu4_silu_quant_fused_active`; the GDN
@@ -6213,8 +6213,8 @@ impl Gpu {
         }
     }
     /// True when a gfx11 sigmoid/gated-norm producer+quant fusion is live
-    /// for this call: IU4 + `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED` on
-    /// gfx1100/gfx1151 + eager (no replay/capture) + K constraint of the
+    /// for this call: IU4 on exact gfx1100/gfx1151 +
+    /// eager (no replay/capture) + K constraint of the
     /// iu4 MMQ consumer. Any batch >= 64, same row-parallel justification
     /// as `iu4_producer_quant_fused_active`; the GDN fused producer
     /// additionally requires head_dim == 128 at its callsite helper.
@@ -6229,7 +6229,7 @@ impl Gpu {
             && k % 256 == 0
     }
     /// True when the gfx1201 FP8-stream producer fusion is live for this
-    /// call: `HIPFIRE_GFX12_FP8_STREAM=1` on exact gfx1201 + eager (no
+    /// call: exact gfx1201 + eager (no
     /// replay/capture) + K constraint of the MQ4v2 FP8 consumer (`k % 256
     /// == 0`). Any batch >= 64: the producer grid is row-parallel in batch
     /// (one workgroup per row), and the fp8 kernels mask partial N tiles

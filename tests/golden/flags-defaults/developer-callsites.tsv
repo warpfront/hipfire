@@ -23,7 +23,6 @@ developer_callsite	*	HIPFIRE_AWQ_EXPERTS#developer_var=ok.as_deref.==Some("down"
 developer_callsite	*	HIPFIRE_AWQ_EXPERTS#developer_var=ok.as_deref.==Some("none")
 developer_callsite	*	HIPFIRE_AWQ_F1_ONLY#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_AWQ_NORM_WAVEGRID#developer_var=as_deref.==Ok("1")
-developer_callsite	*	HIPFIRE_BATCHED_HEAD#developer_var=as_deref.!=Ok("0")
 developer_callsite	*	HIPFIRE_BATCHED_HEAD_VERIFY#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_BF16W_TILED_ROWS#developer_bool=true
 developer_callsite	*	HIPFIRE_BF16_H_A4#developer_bool=false
@@ -233,7 +232,6 @@ developer_callsite	*	HIPFIRE_GDN_CHUNKED#developer_var=map.unwrap_or(false)
 developer_callsite	*	HIPFIRE_GDN_CHUNK_SIZE#developer_var=ok.and_then.unwrap_or(16)
 developer_callsite	*	HIPFIRE_GDN_COMPACT2#developer_var=-
 developer_callsite	*	HIPFIRE_GDN_COMPACT2_SHAPE#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_GDN_KKT_BATCHED#developer_bool=true
 developer_callsite	*	HIPFIRE_GDN_MOE_PRE_FUSED#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_GDN_QK_INDEXED#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_GDN_SCAN_OUT#developer_var=ok.as_deref
@@ -282,7 +280,6 @@ developer_callsite	*	HIPFIRE_GFX1151_GATE_UP_WAVE64#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1151_GDN_DPP#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_GFX1151_GDN_R4X2#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_GFX1151_GDN_R8#developer_var=as_deref.==Ok("1")
-developer_callsite	*	HIPFIRE_GFX1151_GDN_SCAN#developer_bool=true
 developer_callsite	*	HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1151_LM_HEAD_BUFFER#developer_bool=false
 developer_callsite	*	HIPFIRE_GFX1151_LM_HEAD_CPOL#developer_var=ok
@@ -484,7 +481,6 @@ developer_callsite	*	HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_EP_TAIL_BORROW_LOG#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_EP_TAIL_BORROW_VERIFY#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_EP_TRUNK_SHARD#developer_var=ok.as_deref
-developer_callsite	*	HIPFIRE_QWEN4_EP_VOCAB_SHARD#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_QWEN4_EP_WIDE_VERIFY#developer_bool=false
 developer_callsite	*	HIPFIRE_QWEN4_EP_WIDE_VERIFY#developer_typed_bool=-
 developer_callsite	*	HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES#developer_bool=false
@@ -578,7 +574,6 @@ developer_callsite	*	HIPFIRE_QWEN_CACHE_TRACE#developer_var=ok.as_deref.==Some("
 developer_callsite	*	HIPFIRE_RAILGUN_CACHE_TABLE#developer_var=ok.filter
 developer_callsite	*	HIPFIRE_RAILGUN_CHECK#developer_var=ok
 developer_callsite	*	HIPFIRE_RAILGUN_NEGATIVE_CONTROL#developer_var=as_deref.==Ok("drop_boundaries")
-developer_callsite	*	HIPFIRE_RAON_GFX1100_DOWN_PRODUCER#developer_bool=true
 developer_callsite	*	HIPFIRE_RAON_LM_HEAD#developer_var=as_deref
 developer_callsite	*	HIPFIRE_RAON_PREFILL_CHUNK_ROWS#developer_var=-
 developer_callsite	*	HIPFIRE_RAON_PREFILL_PRECISION#developer_var=-

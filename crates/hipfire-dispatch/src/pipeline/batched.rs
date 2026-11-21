@@ -726,8 +726,7 @@ fn iu4_hin_prepared(
 /// w_down. `None` → caller keeps the incumbent silu + standalone-quantizer
 /// path. Same contract as [`try_iu4_silu_prepared`] (uniform MQ4G256V2 only,
 /// Residual-only at the call sites) but routed by `iu4_silu_quant_fused_active`
-/// (default on for exact-gfx1201 IU4; `HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts
-/// out) instead of the portable gfx11 sidecar gate. Every other caller keeps
+/// (exact gfx1201 IU4 only) instead of the portable gfx11 sidecar gate. Every other caller keeps
 /// `quantize_int4_mmq_ds128` path untouched.
 fn try_gfx12_silu_quant_fused_prepared(
     gpu: &mut Gpu,
@@ -766,7 +765,7 @@ fn try_gfx12_silu_quant_fused_prepared(
 /// the qkvza/gate_up/qkv inputs. `None` → caller keeps the incumbent
 /// rmsnorm+rotate + standalone-quantizer path. Same contract as
 /// [`try_iu4_rmsnorm_prepared`] (uniform MQ4G256V2 only) but gated by
-/// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` on exact gfx1201 instead of the
+/// exact gfx1201 instead of the
 /// portable gfx11 sidecar gate.
 pub(crate) fn try_gfx12_rmsnorm_quant_fused_prepared(
     gpu: &mut Gpu,
@@ -928,7 +927,7 @@ fn try_gfx12_fp8_stream_silu_prepared(
 /// attention out-proj input. `None` → caller keeps the incumbent rotate +
 /// standalone-quantizer path. Same contract as [`try_iu4_rotate_prepared`]
 /// (uniform MQ4G256V2 only, Residual-only) but gated by
-/// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` on exact gfx1201. The f32 `x_rot`
+/// exact gfx1201. The f32 `x_rot`
 /// store is always written, so every downstream reader is preserved
 /// byte-for-byte.
 pub(crate) fn try_gfx12_rotate_quant_fused_prepared(
@@ -2895,7 +2894,7 @@ mod tests {
     /// ECSQ-5 §6 regression: `HIPFIRE_IU4_PREFILL=0` plus
     /// `HIPFIRE_GFX12_MQ4V2_FP8_{GATEUP,RESID,QKVZA,QKV}=0` gave WT2 KLD 11.74
     /// because the FP8-stream producers (gated only on
-    /// `HIPFIRE_GFX12_FP8_STREAM`) still emitted FP8-only planes for consumers
+    /// exact gfx1201) still emitted FP8-only planes for consumers
     /// that had moved to F16 and read the unwritten `x_rot`. Every subset of
     /// family opt-outs must disable exactly its own producers.
     #[test]

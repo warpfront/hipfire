@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! The vocabulary-sharded target LM head of the EP2 mesh (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`, X1):
-//! switch, admission and the cross-rank exchange.
+//! The vocabulary-sharded target LM head of the EP2 mesh (two exact gfx1201 cards, X1):
+//! admission and the cross-rank exchange.
 //!
 //! # What is sharded
 //!
@@ -67,9 +67,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-/// Developer switch of the vocabulary shard.
-pub const VOCAB_SHARD_ENV: &str = "HIPFIRE_QWEN4_EP_VOCAB_SHARD";
-
 /// The shard is a two-rank split.
 pub const VOCAB_SHARD_RANKS: usize = 2;
 
@@ -117,28 +114,11 @@ pub fn draft_attach_decision(
         (ShardSwitch::Off, _) => Ok(AttachDecision::Off),
         (_, true) => Ok(AttachDecision::Attach),
         (ShardSwitch::On, false) => Err(format!(
-            "{DRAFT_VOCAB_SHARD_ENV}=1 refused: it needs the vocabulary-shard exchange \
-             ({VOCAB_SHARD_ENV}), which is not attached on this load"
+            "{DRAFT_VOCAB_SHARD_ENV}=1 refused: it needs the vocabulary-shard exchange, which is \
+             not attached on this load"
         )),
         (ShardSwitch::Default, false) => Ok(AttachDecision::Off),
     }
-}
-
-/// What the raw `HIPFIRE_QWEN4_EP_VOCAB_SHARD` value asks for (the trunk shard's switch grammar:
-/// unset = the default, `0` / `off` / `false` or any unrecognised value = off, `1` / `true` /
-/// `on` = forced).
-pub fn vocab_shard_switch() -> ShardSwitch {
-    parse_switch(
-        hipfire_config::developer_var(VOCAB_SHARD_ENV)
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// Whether the switch asks for the shard in this process: forced, or the default (EP2 over two
-/// exact gfx1201 cards).
-pub fn vocab_shard_requested() -> bool {
-    requested_for(vocab_shard_switch(), default_applies())
 }
 
 /// The shard geometry a load can run: two ranks and a vocabulary whose half is a whole number of
@@ -183,25 +163,20 @@ pub enum AttachDecision {
     Declined(String),
 }
 
-/// [`AttachDecision`] of a load: `switch` / `default_applies` (see
-/// [`requested_for`]), the mesh's `ranks`, the model's `vocab` and any `blocker`. A FORCED switch
-/// (`=1`) on a load that cannot run the shard is an error (the attach refuses, loudly); the
-/// default only declines.
+/// [`AttachDecision`] of a load: `default_applies` (EP2 over two exact gfx1201 cards), the mesh's
+/// `ranks`, the model's `vocab` and any `blocker`. A load that cannot run the shard declines.
 pub fn attach_decision(
-    switch: ShardSwitch,
     default_applies: bool,
     ranks: usize,
     vocab: usize,
     blocker: Option<&str>,
-) -> Result<AttachDecision, String> {
-    if !requested_for(switch, default_applies) {
-        return Ok(AttachDecision::Off);
+) -> AttachDecision {
+    if !default_applies {
+        return AttachDecision::Off;
     }
-    let reason = geometry_refusal(ranks, vocab).or_else(|| blocker.map(str::to_string));
-    match (reason, switch) {
-        (None, _) => Ok(AttachDecision::Attach),
-        (Some(reason), ShardSwitch::On) => Err(format!("{VOCAB_SHARD_ENV}=1 refused: {reason}")),
-        (Some(reason), _) => Ok(AttachDecision::Declined(reason)),
+    match geometry_refusal(ranks, vocab).or_else(|| blocker.map(str::to_string)) {
+        None => AttachDecision::Attach,
+        Some(reason) => AttachDecision::Declined(reason),
     }
 }
 
@@ -661,34 +636,25 @@ mod tests {
     }
 
     #[test]
-    fn attach_decision_default_declines_and_forced_refuses() {
+    fn attach_decision_applies_by_default_and_declines() {
         use AttachDecision::*;
-        let go = |switch, default, ranks, vocab, blocker| {
-            attach_decision(switch, default, ranks, vocab, blocker)
-        };
-        // The kill switch: nothing, whatever else holds.
-        assert_eq!(go(ShardSwitch::Off, true, 2, 248_320, None), Ok(Off));
-        // Default on a load the default does not cover: off, quietly.
-        assert_eq!(go(ShardSwitch::Default, false, 2, 248_320, None), Ok(Off));
+        // A load the default does not cover: off, quietly.
+        assert_eq!(attach_decision(false, 2, 248_320, None), Off);
         // The shipped shape.
-        assert_eq!(go(ShardSwitch::Default, true, 2, 248_320, None), Ok(Attach));
-        assert_eq!(go(ShardSwitch::On, false, 2, 248_320, None), Ok(Attach));
+        assert_eq!(attach_decision(true, 2, 248_320, None), Attach);
         // The default applies but the load cannot run it: declined with a reason, never an error.
-        match go(ShardSwitch::Default, true, 2, 248_320, Some("split")) {
-            Ok(Declined(reason)) => assert!(reason.contains("split")),
+        match attach_decision(true, 2, 248_320, Some("split")) {
+            Declined(reason) => assert!(reason.contains("split")),
             other => panic!("{other:?}"),
         }
-        match go(ShardSwitch::Default, true, 2, 248_321, None) {
-            Ok(Declined(reason)) => assert!(reason.contains("tiles")),
+        match attach_decision(true, 2, 248_321, None) {
+            Declined(reason) => assert!(reason.contains("tiles")),
             other => panic!("{other:?}"),
         }
-        // Forced on an ineligible load: refused loudly.
-        let error = go(ShardSwitch::On, false, 4, 248_320, None).unwrap_err();
-        assert!(
-            error.contains(VOCAB_SHARD_ENV) && error.contains("refused"),
-            "{error}"
-        );
-        assert!(go(ShardSwitch::On, true, 2, 248_320, Some("split")).is_err());
+        match attach_decision(true, 4, 248_320, None) {
+            Declined(reason) => assert!(reason.contains("ranks")),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

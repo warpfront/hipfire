@@ -910,7 +910,7 @@ pub(crate) fn prepare_rank_lane(
                 LaneKind::Forced(t) => Some(forced_acceptance(t)),
                 // A sampled window's tokens are the root's draws: the rank
                 // replays the decision (its own argmax picks are evidence only).
-                // A rank whose head ran a vocabulary shard (`HIPFIRE_QWEN4_EP_VOCAB_SHARD`,
+                // A rank whose head ran a vocabulary shard (EP2 over two exact gfx1201 cards,
                 // a non-sampler rank of a `VerifyPlan::vocab_shard` step) holds shard-local
                 // picks that are no acceptance input at all: a greedy window replays the
                 // root's decision the same way.

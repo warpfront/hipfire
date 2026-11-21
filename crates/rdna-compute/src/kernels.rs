@@ -1117,7 +1117,7 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
 /// gfx1201 decode twin of `FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC`
-/// (`HIPFIRE_G12_DEC_NORM`, default on): launched with grid K/256 instead of
+/// (exact gfx1201 and gfx1151): launched with grid K/256 instead of
 /// one workgroup. Every workgroup redoes the row's sum of squares (loads
 /// batched, same fma chain) and the unchanged reduction tree, so rms is
 /// bit-identical, then wave 0 rotates only its own 256-group.
@@ -1248,7 +1248,7 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_B8_SRC: &str = concat!(
 /// emit under distinct entry symbols so gfx1151 HSACO caches and profiler
 /// rows cannot alias the gfx1201 fusion. Same shared quant recipe as the C2
 /// sidecars; old symbols stay untouched. Gated by
-/// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`.
+/// exact gfx1201.
 pub const FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -1270,7 +1270,7 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
 /// gfx1201 `_v2` twins of the slices-2 RMSNorm IU4 producers
-/// (`HIPFIRE_G12_NORM`, default on): the sum-of-squares pass keeps up to 20
+/// (exact gfx1201): the sum-of-squares pass keeps up to 20
 /// row loads in flight per wave instead of one, and the RTN codes use one
 /// reciprocal per lane with an exact near-tie divide fallback. Same launch
 /// geometry and arguments; bit-identical `block_i4_128` and `x_rot`.
@@ -1325,7 +1325,7 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_FDIV_SRC: &str = concat!(
 /// E4M3 pack under distinct entry symbols so HSACO caches and profiler rows
 /// cannot alias any other fusion. Emits byte-identical
 /// `prepare_mq4v2_fp8_x_f32` (scale_mode=1) outputs on finite rows; the F32
-/// `x_rot` store is always written. Gated by `HIPFIRE_GFX12_FP8_STREAM`.
+/// `x_rot` store is always written. Gated by exact gfx1201.
 pub const FUSED_RMSNORM_MQ_ROTATE_FP8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
     "#define HIPFIRE_FP8_STREAM 1\n",
@@ -1457,7 +1457,7 @@ pub const MQ_ROTATE_X_AWQ_I4_SRC: &str = concat!(
 /// `block_i4_128` emit for the attention out-proj input (K=6144 in flight)
 /// under distinct entry symbols so T-B HSACO caches and profiler rows
 /// cannot alias the gfx1201 fusion. Same shared quant recipe; old symbols
-/// stay untouched. Gated by `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`.
+/// stay untouched. Gated by exact gfx1201.
 pub const MQ_ROTATE_X_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -1560,7 +1560,7 @@ pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_INREG_GIL_GFX12_SRC: &str = concat!(
 /// register-only, no WMMA); the attention input is intentionally left
 /// unmodified and the prepared residual GEMM is its only downstream
 /// consumer on the admitted route. Gated by
-/// `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`.
+/// exact gfx1100/gfx1151.
 pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -1727,7 +1727,7 @@ pub fn gated_norm_mq_rotate_awq_k6144_gfx1201_src() -> &'static str {
 /// `gated_norm_f32_batched` + `rotate_x_mq[_awq]_batched` +
 /// `quantize_int4_mmq_ds128` with one launch. Grid [(K/256), N], block 64,
 /// only the incumbent 1024-B LDS handoff. Gated by
-/// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`.
+/// exact gfx1201.
 pub const GATED_NORM_MQ_ROTATE_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -1745,7 +1745,7 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
 /// gfx1201 `_v2` twins of the slices-4 gated-norm IU4 producers
-/// (`HIPFIRE_G12_NORM`, default on): one wave per 256-group with every
+/// (exact gfx1201): one wave per 256-group with every
 /// element load issued up front. Grid [ceil((K/256)/2), N], block 64, 2 KiB
 /// LDS; bit-identical `block_i4_128` and `x_rot`.
 pub const GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC: &str = concat!(
@@ -1873,7 +1873,7 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_FP8_INREG_GFX12_XBF16_SRC: &str = concat!(
 /// WMMA — arch-portable); replaces `gated_norm_f32_batched` +
 /// `rotate_x_mq[_awq]_batched` + `quantize_int4_mmq_ds128` with one launch.
 /// Grid [(K/256), N], block 64, only the incumbent 1024-B LDS handoff.
-/// Gated by `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`.
+/// Gated by exact gfx1100/gfx1151.
 pub const GATED_NORM_MQ_ROTATE_I4_GFX11_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -2004,7 +2004,7 @@ pub const ROUND_H_BF16_QUALITY_GFX12_SRC: &str =
 /// gfx1201 slice-1 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128` emit.
 /// Same shared quant recipe as the C2 sidecars, but distinct entry symbols so
 /// gfx1151 HSACO caches and profiler rows cannot alias the gfx1201 fusion.
-/// Selected by `HIPFIRE_GFX12_SILU_QUANT_FUSED` (default on for exact-gfx1201 IU4; `=0` opts out); old symbols stay untouched.
+/// Selected on exact gfx1201 IU4; old symbols stay untouched.
 pub const FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
@@ -7937,7 +7937,7 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
 
-/// gfx1201 decode twin of `rmsnorm_f32` (`HIPFIRE_G12_DEC_NORM`): grid n/256
+/// Decode twin of `rmsnorm_f32` (exact gfx1201 and gfx1151): grid n/256
 /// per row, every workgroup recomputes the row's rms bit-identically and
 /// writes its own 256 outputs. Not in-place.
 pub const RMSNORM_ROWSPLIT_SRC: &str = include_str!("../../../kernels/src/rmsnorm_rowsplit.hip");
@@ -8614,8 +8614,7 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
 /// Q pre-convert and per-run body dispatches. Entry symbols include the direct
 /// packet plus benchmark-only partial/merge twins; the partial retains the
 /// shared pre-convert so the split oracle stays independent.
-/// JIT-only via the packet launcher behind `kernel.gfx12_fa_packet` (default
-/// on exact gfx1201; `false` opts out). The route-N/Q0/fwht3 objects are
+/// JIT-only via the packet launcher on exact gfx1201. The route-N/Q0/fwht3 objects are
 /// unaffected: the packet region preprocesses away without `HIPFIRE_FA2_PACKET`.
 pub const ATTENTION_FP8_E4M3_FA2_GQA_PACKET_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_PACKET 1\n",
@@ -8637,7 +8636,7 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_GFX1201_SRC: &str = concat!(
 /// per-row arithmetic, bit-identical output, with prefetched K/V tiles,
 /// transposed V loads, branch-free masking, bracketed fp8 code conversion
 /// in place of per-element IEEE division, and heaviest-first workgroups.
-/// Default on exact gfx1201 behind `kernel.attn_qresident_v2`.
+/// Exact gfx1201 only.
 pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_QRESIDENT_V2 1\n",
     "#define HIPFIRE_FA2_FP8 1\n",
@@ -9138,7 +9137,7 @@ pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str =
 pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
 
-/// gfx1201 decode twin of `rope_partial_halfsplit_f32` (`HIPFIRE_G12_DEC_NORM`):
+/// Decode twin of `rope_partial_halfsplit_f32` (exact gfx1201 and gfx1151):
 /// one workgroup per head instead of one wave looping over all heads.
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC: &str =
@@ -9438,7 +9437,7 @@ pub const GDN_CHUNK_SCAN_SRC: &str =
     include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip");
 
 /// Exact-gfx1151 twin of [`GDN_CHUNK_SCAN_SRC`] (`gdn_chunk_scan_gfx1151`,
-/// `HIPFIRE_GFX1151_GDN_SCAN=0` opts out): the gfx1201 pipelined chunk loop
+/// exact gfx1151 only): the gfx1201 pipelined chunk loop
 /// with the gfx11 layouts, K staged transposed, one BV=64 value half per
 /// 256-thread workgroup (grid [2, 48]). Same LDS values, WMMA operands, order
 /// and roundings: byte-identical `out` and state.
@@ -9617,8 +9616,8 @@ pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
 /// alpha gate + 4-tap causal conv + SiLU + split + Q/K L2-norm + scale +
 /// repeat-interleave in ONE launch. Row-group tiled (R=32) so the token axis
 /// is parallel across groups; byte-exact vs the 3-launch sequence by the
-/// fmaf/shfl/order recipe in the source header. Default ON on exact gfx1201
-/// behind `HIPFIRE_GFX12_GDN_PRE_FUSED` (`=0` restores the 3-launch sequence).
+/// fmaf/shfl/order recipe in the source header. Exact gfx1201 only; other arches keep
+/// the 3-launch sequence.
 #[cfg(feature = "deltanet")]
 pub const GDN_PRE_BATCHED_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/gdn_pre_batched.gfx1201.hip");

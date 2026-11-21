@@ -2280,7 +2280,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "quantize_int4_mmq_ds128"
             ]
         );
-        // Exact-gfx1151 1..=16-row MQ4V2 + HFQ4G256/MQ4G256 v1 WMMA (HIPFIRE_GFX1151_XLDS; =0 restores the base kernels).
+        // Exact-gfx1151 1..=16-row MQ4V2 + HFQ4G256/MQ4G256 v1 WMMA.
         add!(
             "gemm_mq4g256v2_wmma_gfx1151_xlds",
             kernels::GEMM_MQ4G256V2_WMMA_GFX1151_XLDS_SRC,
@@ -2295,7 +2295,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds"
             ]
         );
-        // Exact-gfx1151 1..=16-row Q8_0 WMMA (HIPFIRE_GFX1151_XLDS; =0 restores the base kernel).
+        // Exact-gfx1151 1..=16-row Q8_0 WMMA.
         add!(
             "gemm_q8_0_wmma_gfx1151_xlds",
             kernels::GEMM_Q8_0_WMMA_GFX1151_XLDS_SRC,
@@ -5240,7 +5240,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     if arch == "gfx1201" {
         // Discovery batch R11 (cell R11, hold frj-disc-r11-v2-01, 27B mq4
         // DFlash) and R13 (frj-disc-r13-v2-01, 27B mq4 AR): the non-slab AWQ
-        // IU4 prefill producers (`HIPFIRE_G12_NORM` default on, slab off), the
+        // IU4 prefill producers (exact gfx1201, slab off), the
         // k6144 gated norm and the fp8q FA prep (module name == symbol).
         add!(
             "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2",
@@ -11543,7 +11543,7 @@ mod tests {
         }
         assert_eq!(count, 86);
         // Modules added since the P0 capture: the scalar-prefill runtime's BR/BC
-        // specialization, the `HIPFIRE_G12_DEC_NORM` decode twins, the five
+        // specialization, the exact gfx1201/gfx1151 decode twins, the five
         // multi-slot `*_paged` modules of the q8/asym3 routes, the H2 decode /
         // prefill / MTP / DFlash modules for compiler-free packs, the Qwen3.8
         // Flash-Next and Qwen3.5-MoE trace modules, the Qwen4 penalty prepass
@@ -12106,7 +12106,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // `HIPFIRE_QWEN4_EP_VOCAB_SHARD` (X1): the vocab-shard argmax merge.
+        // EP2 vocab-shard argmax merge over two exact gfx1201 cards (X1).
         const ARGMAX_PAIR_MERGE_ADDED_MODULES: [&str; 1] = ["argmax_pair_merge"];
         for module in ARGMAX_PAIR_MERGE_ADDED_MODULES {
             assert!(

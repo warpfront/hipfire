@@ -178,7 +178,7 @@ pub fn gfx12_gdn_quant_fused_admitted(
 /// gated_norm_f32 + rotate + standalone-quantizer path. Admission is
 /// uniform MQ4G256V2 only, Residual-only, `head_dim == 128`,
 /// `n_heads * head_dim == k`, `K % 256 == 0`, plus the shared
-/// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` gate on exact gfx1201. When live,
+/// exact gfx1201 gate. When live,
 /// the caller must skip the standalone `gated_norm_f32_batched` store
 /// (`dn_normed_batch` has no other reader on the admitted path); the f32
 /// `x_rot` store is always written, so every downstream reader is preserved
@@ -292,7 +292,7 @@ fn gfx11_gdn_quant_fused_admitted(
 /// caller keeps the incumbent gated_norm_f32 + rotate +
 /// standalone-quantizer path. Admission is uniform MQ4G256V2 only,
 /// `head_dim == 128`, `n_heads * head_dim == k`, `K % 256 == 0`, plus the
-/// shared `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED` gate on gfx1100/gfx1151.
+/// shared exact gfx1100/gfx1151 gate.
 /// When live, the caller must skip the standalone `gated_norm_f32_batched`
 /// store (`dn_normed_batch` has no other reader on the admitted path);
 /// the f32 `x_rot` store is always skipped (prepared GEMM is the only
