@@ -250,17 +250,25 @@ bytes; the shim reverses dims at read).
 
 - All **48 visits** match: `max|d| <= 1.8e-4`, `mean|d| <= 2e-5`, `corr 1.0000`
   (`compare_visits.py` over `D:\hipfire-models\rust-visits-tok0`).
-- Token-0 logits: **r = 0.9944**, **argmax 31274 == oracle**, mean|d| 0.267,
-  max|d| 1.68. The residual is fp32 accumulation-order divergence over 48
-  visits plus a 200k-way head GEMV, not a stage error — the per-visit states
-  agree to 1e-4 absolute on vectors with std ~13.
-- `dump_visits_f32` + `dump_raw_logits_token0` are the two commands; capture a
-  fresh baseline before touching `forward.rs` again.
+- **Final hidden** (output AttnRes mix + final norm): `max|d| 1.4e-5`,
+  `corr 1.0000000000` vs `ref-visits/tok0/final_hidden.npy`.
+- **Token-0 logits: r = 0.9999999968**, mean|d| 4.2e-4, max|d| 1.6e-3,
+  **argmax 31274 == oracle**. That is fp32 accumulation-order noise, nothing
+  structural.
+- **MQ4 artifact (the real quant gap):** r = 0.9907, mean|d| 0.330,
+  **argmax 31274 == oracle**. Uniform MQ4 costs ~0.33 logit units at token 0
+  and does not move the argmax — far better than the 20 dB-SQNR/routing-flip
+  hypothesis predicted. MQ4L is therefore a *quality* track, not a
+  correctness blocker.
+- `dump_visits_f32`, `dump_raw_logits_token0` and `dump_cpu_logits_token0` are
+  the commands; capture a fresh baseline before touching `forward.rs` again.
+  `dump_cpu_logits_token0` needs `HIPFIRE_HOME=D:\hipfire-models\inkling2-home`
+  (the default user home carries an unrelated unknown config key that
+  `hipfire-config` refuses).
 
-This is the first point at which the forward is trustworthy enough to gate
-anything on. The earlier r≈0.19 was **not** quantization — it was three
-independent bugs in the pass>0 path, all invisible until visit 18 applies the
-first cross-pass message:
+The earlier r≈0.19 was **not** quantization — it was four independent bugs in
+the pass>0 / output path, and none of them was visible until a cross-pass
+message is first applied at visit 18:
 
 1. **Visit→physical-layer schedule** (the dominant one). `layer_phys` took
    llama.cpp's extended-layer index while its only caller passes the visit
@@ -274,6 +282,14 @@ first cross-pass message:
    with `ends_with("_queries")`, true for both, so the kv global returned Q/FFN
    rows. Predicate is now `!ends_with("kv_queries")` (covers both checkpoint
    spellings).
+4. **Silently skipped output mix.** `GgufF32` had no mapping for
+   `model.llm.attn_res.output_query`, and `forward_token` wrote the final
+   AttnRes mix as `if let Ok(...)`, so the LM head read an *unmixed* hidden and
+   nothing failed. Cost 3.5 absolute on the final hidden (9% of its std) while
+   every per-visit state looked perfect — the one bug the per-visit trace
+   could not see. Fixed the mapping, and the final mix, the per-layer FFN mix
+   and both L2-clip scales are now `?` (fail closed) instead of silently
+   optional: upstream always applies them.
 
 Earlier bugs found and fixed while getting visit 0/5 to the oracle (all still
 required): per-head clip, GQA block grouping `h//3`, MoE residual base, final
@@ -301,8 +317,10 @@ Done:
 - Typed config, 24/48 loop schedule, validation traps, HFQ weight index.
 - CPU reference forward: all 48 visits, controllers, cross-pass messages,
   dynamic convs, MoE, LM head.
-- **Full forward parity on F32 weights**: all 48 visits ≤1.8e-4, token-0
-  logits r=0.9944 with the oracle's argmax. See the parity section above.
+- **Full forward parity on F32 weights**: all 48 visits ≤1.8e-4, final hidden
+  1.4e-5, token-0 logits r=0.9999999968 with the oracle's argmax. The MQ4
+  artifact is r=0.9907 with the same argmax, i.e. the quant gap at token 0 is
+  small. See the parity section above.
 - **Loader/carrier skeleton**: arch 24 loads on the RX 7900 XTX (gfx1100,
   25.8 GB VRAM) via `hipfire run`; `generate` returns a clean fail-closed
   "inkling2: generation is not implemented yet" (no panic).
