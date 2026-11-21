@@ -28,7 +28,7 @@ Reused kernels are gfx1100-validated paths; gfx1151 usually identical
 | 8 | Tau scale (×Q,R on full layers) | REUSE (fold into prologue, no kernel) | scalar multiply inside attention prologue; no cite needed |
 | 9 | Sliding-1024 + sink-softmax attention, NoPE | REUSE + small adapt | `attention_dflash_sliding_f32` (`attention.rs:16769`); sink pattern `deepseek4_attn_swa.hip:87,124`; NoPE precedent cohere2moe full layers (`crates/hipfire-arch-cohere2moe/src/forward.rs:174,188,589`) |
 | 10 | Output-gate sigmoid multiply | REUSE (elementwise) | `hc_pre_post_sigmoid_scale_f32` (`attention.rs:20349`) or host-composed; trivial |
-| 11 | MoE sigmoid top-8, no renorm, ×route_scale 8, eps 1e-20 | REUSE routing; NEW combine-scale detail | cohere2moe routing (sigmoid, no renorm: `forward.rs:18`, `config.rs:89`); sealed/prefill topk `moe_topk_renorm_k8` (`crates/rdna-compute/src/gemv.rs:15243`), batched (`:16572`); dispatch `MoeFamily` route_scale/norm_topk_prob (`crates/hipfire-dispatch/src/families/moe.rs:264,841`) |
+| 11 | MoE sigmoid top-8, **renorm by sum** (eps 1e-20), ×route_scale 8 | REUSE routing; NEW combine-scale detail | cohere2moe routing (sigmoid: `forward.rs:18`, `config.rs:89`); sealed/prefill topk `moe_topk_renorm_k8` (`crates/rdna-compute/src/gemv.rs:15243`), batched (`:16572`); dispatch `MoeFamily` route_scale/norm_topk_prob (`crates/hipfire-dispatch/src/families/moe.rs:264,841`) |
 | 12 | SiTU(4,25) experts, 128×1152, gate-bias | REUSE (already in tree) | `FfnActivation::Situ` (`crates/rdna-compute/src/ffn_activation.rs:77,350`), rows/grouped entries (`:369-381`), dispatch (`:412,544`), scalar oracle (`:1389-1416`); maple clamped-SiLU is the nearest *pattern*, not the impl |
 | 13 | Final softcap 30 | REUSE | `logit_softcap_f32` (`norm.rs:8898`; gemma4 precedent = same fn) |
 
@@ -150,23 +150,25 @@ the F32 sliding path until a served A/B says otherwise.
 - Reuse: `hc_pre_post_sigmoid_scale_f32` (`attention.rs:20349`) or
   host-composed elementwise. Trivial either way.
 
-### 11. MoE sigmoid top-8 routing, no renorm, ×8 — REUSE + scale detail
-- Spec: `sigmoid(router + bias?)` → top-8 → use raw sigmoid scores (no
-  renorm) → expert outputs combined × `route_scale` 8. Gate bias optional
-  (`TENSOR_NOT_REQUIRED`); 128 experts; norm eps 1e-20 applies to expert
-  layernorm, not the router.
+### 11. MoE sigmoid top-8 routing, renorm by sum, ×8 — REUSE + scale detail
+- Spec: `sigmoid(router + bias?)` → top-8 → **renormalize the 8 scores by their
+  sum** (eps `expert_weights_norm_eps = 1e-20`) → expert outputs combined
+  × `route_scale` 8. Gate bias optional (`TENSOR_NOT_REQUIRED`); 128 experts;
+  the 1e-20 eps is the router renorm's, and the expert norm eps is separate.
 - Shapes: router logits `[128]` → indices/weights `[8]`; F32.
-- Numerics: sigmoid F32; top-8 exact; ×8.0 post-combine; eps 1e-20 in
-  expert norm (do not "round" to 1e-6).
-- Reuse: cohere2moe is the identical routing precedent (sigmoid, no
-  renorm — `cohere2moe/src/forward.rs:18`, `config.rs:89`);
+- Numerics: sigmoid F32; top-8 exact; renorm then ×8.0 post-combine; eps
+  1e-20 in the renorm (do not "round" to 1e-6).
+- Reuse: cohere2moe is the nearest routing precedent (sigmoid —
+  `cohere2moe/src/forward.rs:18`, `config.rs:89`), but it does **not** renorm;
   `moe_topk_renorm_k8` (`gemv.rs:15243`) / batched (`:16572`) and
   `sigmoid_routed_prefill_supported` (`cohere2moe/src/forward.rs:400`)
   cover the GPU path; `route_scale`/`norm_topk_prob` are already
   dispatch concepts (`hipfire-dispatch/src/families/moe.rs:264,841`).
-  NEW detail is only "no-renorm + ×8" as a config, not a kernel.
+  NEW detail is only "renorm + ×8" as a config, not a kernel. Authoritative:
+  `llama-graph.cpp::build_moe_ffn` (2500-2543) and the CPU oracle's
+  `sigmoid_topk` (corrected 2026-11-21).
 - Phase-1 fallback: existing sealed/prefill router path with
-  `norm_topk_prob=false, route_scale=8`.
+  `norm_topk_prob=true, route_scale=8`.
 
 ### 12. SiTU(4,25) experts — REUSE
 - Spec: gate_up interleaved `[n_embd, 2·1152, 128]` (+optional bias),
