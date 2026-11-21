@@ -1370,6 +1370,7 @@ dependencies = [
 name = "hipfire-arch-inkling2"
 version = "0.4.6"
 dependencies = [
+ "hipfire-runtime",
  "serde_json",
 ]
 
