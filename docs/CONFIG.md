@@ -2414,6 +2414,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.qwen4_capture_ring_compact` | `qwen4_capture_ring_compact` | 0.4.5 | 0.5.0 | none; the capture ring always uses the compact rows + 1 slot layout |
 | `developer.bf16w_tiled_rows` | `bf16w_tiled_rows` | 0.4.5 | 0.5.0 | none; the tiled BF16 rows route is gated by arch and row count alone (no kill switch) |
 | `developer.lane_reset_batch` | `lane_reset_batch` | 0.4.5 | 0.5.0 | none; supported lane resets always batch their zero-fills (on the steady copy stream when one exists) |
+| `developer.tp_full_graph` | `tp_full_graph` | 0.4.2 | 0.5.0 | none; the per-arch topology default applies (TP2 whole-token graph on exact gfx1100 or gfx1201 pairs, TP4 on four gfx1201 ranks unless `HIPFIRE_TP_PEER_PUSH=0`); `HIPFIRE_TP_PEER_ALTERNATING=0` also disables the TP2 whole-token graph |
 | `developer.ep_balanced_owners` | `ep_balanced_owners` | 0.4.2 | 0.5.0 | none; balanced owners are always used where balanced ownership is admitted |
 | `developer.ep_owner_routed_prefill` | `ep_owner_routed_prefill` | 0.4.2 | 0.5.0 | none; owner-routed prefill runs wherever its admission conditions hold |
 | `developer.qwen4_append_wmma` | `qwen4_append_wmma` | 0.4.3 | 0.5.0 | none; the WMMA append route runs on gfx1151 prefill chunks of 48 to 511 rows when the prefill PM invariant is off (`HIPFIRE_QWEN4_APPEND_WMMA_MIN_ROWS` moves the lower bound) |

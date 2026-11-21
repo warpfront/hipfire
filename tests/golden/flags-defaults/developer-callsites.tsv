@@ -608,7 +608,6 @@ developer_callsite	*	HIPFIRE_STATE_QUANT#developer_var=unwrap_or_default
 developer_callsite	*	HIPFIRE_STEADY_READBACK_PINNED#developer_bool=true
 developer_callsite	*	HIPFIRE_TARGET_ARCH#developer_var=ok.filter.unwrap_or(detected_arch)
 developer_callsite	*	HIPFIRE_THINK_CONTINUATION#developer_var=unwrap_or_else
-developer_callsite	*	HIPFIRE_TP_FULL_GRAPH#developer_var=ok
 developer_callsite	*	HIPFIRE_TP_PEER_PUSH_FAULT#developer_var=is_ok
 developer_callsite	*	HIPFIRE_TP_PEER_PUSH_FAULT#developer_var=ok.as_deref
 developer_callsite	*	HIPFIRE_V2B_DOWN_SWZ#developer_var=ok.and_then.unwrap_or(V2B_DOWN_SWZ_GRP)

@@ -4495,6 +4495,14 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         replacement: "none; supported lane resets always batch their zero-fills on the steady copy stream",
     },
     RetiredConfigKey {
+        key: "developer.tp_full_graph",
+        legacy_key: "tp_full_graph",
+        shipped_in: "0.4.2",
+        removed_in: "0.5.0",
+        reason: "the TP full-graph kill switch was removed (HIPF-489)",
+        replacement: "none; the per-arch topology default applies (TP2 whole-token graph on exact gfx1100 or gfx1201 pairs, TP4 on four gfx1201 ranks unless `HIPFIRE_TP_PEER_PUSH=0`); `HIPFIRE_TP_PEER_ALTERNATING=0` also disables the TP2 whole-token graph",
+    },
+    RetiredConfigKey {
         key: "developer.ep_balanced_owners",
         legacy_key: "ep_balanced_owners",
         shipped_in: "0.4.2",
