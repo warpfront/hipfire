@@ -168,6 +168,36 @@ pub fn relative_bias(
     out
 }
 
+/// Softmax attention with a zero-value sink logit, mirroring both
+/// `eager_attention_forward` (concat `[scores, sink]`, softmax, drop the sink
+/// column) and llama.cpp (subtract sink from the bias, pass a zero sink to
+/// `build_attn`). `logits` is `[n_kv]` (= qk + relative bias, already scaled),
+/// `values` is `[n_kv, n_embd_v]`. Returns `[n_embd_v]`.
+pub fn attention_softmax_with_sink(
+    logits: &[f32],
+    sink: f32,
+    values: &[f32],
+    n_kv: usize,
+    n_embd_v: usize,
+) -> Vec<f32> {
+    let max = logits.iter().copied().fold(sink, f32::max);
+    let mut denom = (sink - max).exp();
+    let mut probs = Vec::with_capacity(n_kv);
+    for &l in logits.iter().take(n_kv) {
+        let e = (l - max).exp();
+        probs.push(e);
+        denom += e;
+    }
+    let mut out = vec![0.0f32; n_embd_v];
+    for (j, &p) in probs.iter().enumerate() {
+        let w = p / denom;
+        for i in 0..n_embd_v {
+            out[i] += w * values[j * n_embd_v + i];
+        }
+    }
+    out
+}
+
 /// `situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)`
 /// from `llama-graph.cpp::LLM_FFN_SITU`. `linear_beta <= 0` leaves `up` raw.
 pub fn situ(gate: f32, up: f32, beta: f32, linear_beta: f32) -> f32 {
@@ -185,25 +215,31 @@ pub fn sigmoid(x: f32) -> f32 {
 }
 
 /// Sigmoid router with optional per-expert score-correction bias, top-k by
-/// score, **no renormalization** (upstream Inkling-2 MoE). Returns
-/// `(expert_index, weight)` sorted by descending weight.
+/// `sigmoid(logit) + bias`. The returned weights are the UNBIASED sigmoid
+/// scores of the selected experts, **renormalized by their sum (eps 1e-20) and
+/// scaled by `scale` (= route_scale, 8.0)** — matching llama.cpp
+/// `llama-graph.cpp::build_moe_ffn` (`expert_weights_norm_eps = 1e-20`) and
+/// HF `Inkling2TopKRouter`. Returns `(expert_index, weight)` sorted by
+/// descending selection score.
 pub fn sigmoid_topk(
-    scores: &[f32],
+    logits: &[f32],
     bias: Option<&[f32]>,
     k: usize,
     scale: f32,
 ) -> Vec<(usize, f32)> {
-    let mut ranked: Vec<(usize, f32)> = scores
+    let probs: Vec<f32> = logits.iter().map(|&s| sigmoid(s)).collect();
+    let mut selection: Vec<(usize, f32)> = probs
         .iter()
         .enumerate()
-        .map(|(i, &s)| {
-            let b = bias.map_or(0.0, |v| v[i]);
-            (i, sigmoid(s * scale + b))
-        })
+        .map(|(i, &p)| (i, p + bias.map_or(0.0, |v| v[i])))
         .collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.truncate(k);
-    ranked
+    selection.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    selection.truncate(k);
+    let sum: f32 = selection.iter().map(|&(i, _)| probs[i]).sum::<f32>() + 1e-20;
+    selection
+        .into_iter()
+        .map(|(i, _)| (i, probs[i] / sum * scale))
+        .collect()
 }
 
 /// Final logit softcap `cap * tanh(x / cap)`.
@@ -322,6 +358,18 @@ mod tests {
     }
 
     #[test]
+    fn attention_sink_absorbs_probability_mass() {
+        // One KV row with value 10, sink logit = 0, score logit = 0.
+        // p_kv = 1/(1+1) = 0.5, so output = 5. A huge sink drives it to 0.
+        let out = attention_softmax_with_sink(&[0.0], 0.0, &[10.0], 1, 1);
+        assert!(close(out[0], 5.0), "{}", out[0]);
+        let out = attention_softmax_with_sink(&[0.0], 1e6, &[10.0], 1, 1);
+        assert!(close(out[0], 0.0), "huge sink: {}", out[0]);
+        let out = attention_softmax_with_sink(&[0.0], -1e6, &[10.0], 1, 1);
+        assert!(close(out[0], 10.0), "tiny sink: {}", out[0]);
+    }
+
+    #[test]
     fn situ_matches_source_formula() {
         let got = situ(1.0, 2.0, 4.0, 25.0);
         let want = 4.0 * 0.25f32.tanh() * sigmoid(1.0) * 25.0 * (2.0f32 / 25.0f32).tanh();
@@ -333,13 +381,33 @@ mod tests {
     }
 
     #[test]
-    fn sigmoid_topk_has_no_renormalization() {
+    fn sigmoid_topk_renorms_then_scales() {
         let out = sigmoid_topk(&[1.0, 2.0, 3.0], None, 2, 8.0);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, 2);
         assert_eq!(out[1].0, 1);
+        // weights = sigmoid(logit) / sum(top-8 sigmoids) * 8; they sum to 8.
         let sum: f32 = out.iter().map(|x| x.1).sum();
-        assert!(sum > 1.0, "sigmoid top-k must not renorm: {sum}");
+        assert!(
+            close(sum, 8.0),
+            "renorm-then-scale must sum to route_scale: {sum}"
+        );
+        let p3 = sigmoid(3.0);
+        let p2 = sigmoid(2.0);
+        assert!(close(out[0].1, p3 / (p3 + p2) * 8.0));
+        assert!(close(out[1].1, p2 / (p3 + p2) * 8.0));
+    }
+
+    #[test]
+    fn sigmoid_topk_uses_bias_only_for_selection() {
+        // A large bias on expert 0 makes it selected, but its weight is the
+        // unbiased sigmoid, not sigmoid+bias.
+        let out = sigmoid_topk(&[1.0, 2.0], Some(&[2.0, 0.0]), 1, 8.0);
+        assert_eq!(out[0].0, 0);
+        assert!(
+            close(out[0].1, 8.0),
+            "single selected expert weight = full scale"
+        );
     }
 
     #[test]
