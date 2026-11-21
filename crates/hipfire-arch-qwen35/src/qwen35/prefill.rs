@@ -2354,18 +2354,7 @@ fn can_retain_widened_pbs(
 /// Use the same growth-priority lifecycle on discrete gfx1100 as gfx1201.
 /// UMA and the existing explicit opt-out keep the conservative lifecycle.
 fn widened_pbs_grow_only(gpu: &Gpu) -> bool {
-    widened_pbs_grow_only_for(
-        &gpu.arch,
-        gpu.is_uma(),
-        hipfire_config::developer_var("HIPFIRE_WIDENED_PBS_GROW_ONLY")
-            .ok()
-            .as_deref()
-            == Some("0"),
-    )
-}
-
-fn widened_pbs_grow_only_for(arch: &str, uma: bool, disabled: bool) -> bool {
-    matches!(arch, "gfx1100" | "gfx1201") && !uma && !disabled
+    gpu.flags.widened_pbs_grow_only_enabled(gpu.is_uma())
 }
 
 /// A short prompt/tail may use an existing larger owner, but on gfx1100 an
@@ -8490,21 +8479,6 @@ mod tests {
                     rows / 2,
                 ));
             }
-        }
-    }
-
-    #[test]
-    fn widened_pbs_growth_priority_is_discrete_gfx1100_and_gfx1201_only() {
-        for arch in ["gfx1100", "gfx1201"] {
-            assert!(widened_pbs_grow_only_for(arch, false, false));
-            assert!(!widened_pbs_grow_only_for(arch, true, false), "UMA");
-            assert!(
-                !widened_pbs_grow_only_for(arch, false, true),
-                "explicit opt-out"
-            );
-        }
-        for arch in ["gfx1151", "gfx1200", "gfx942", "unknown"] {
-            assert!(!widened_pbs_grow_only_for(arch, false, false));
         }
     }
 

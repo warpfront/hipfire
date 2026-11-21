@@ -976,6 +976,8 @@ Two env grammars apply:
 | `HIPFIRE_V2B_A4_EPI` | `kernel.v2b_a4_epi` (nullable string) | fused A4 epilogue (exact gfx1151 V2B shapes) | Legacy grammar: exactly `retile` runs the stage-1 M512xN128 twin instead of the fused A4 kernel; anything else (unset, `1`, empty) keeps the fused kernel | `v2b_a4_retile` | `test_mq4v2_gate_up_a4_gfx1151` runs one arm per process | Diagnostic bisect arm of the A4 fusion; only its `0` arm was removed (HIPF-396 B6). |
 | `HIPFIRE_GFX1100_ROUTER_W64` | `kernel.gfx1100_router_w64` (`exact`/`off`/`approx`) | `exact`: gfx1100 at 256 experts uses the exact wave64 MoE router (gfx1151 and gfx1201 ignore the setting) | Legacy grammar: exactly `0` is `off`, exactly `approx` is `approx`; anything else (unset, `off`, empty, garbage) is `exact` | `gfx1100_router_w64` (`RouterW64Mode`) | no in-repo script or test sets it (operator A/B switch) | A/B switch between the exact and the approximate gfx1100 wave64 MoE routers. Tests: `gfx1100_router_w64_parses_each_typed_mode` (rdna-compute), `router_w64_and_hc_fuse_promoted_arms_keep_their_legacy_meaning` (hipfire-config). |
 | `HIPFIRE_QWEN4_HC_FUSE` | `kernel.qwen4_hc_fuse` (nullable integer, `0`–`3`) | gfx1151 `3`, gfx1201 `1`, elsewhere `0` | Legacy grammar: the trimmed value parses as `u8`; levels above `3` clamp to `3`; values that do not parse (empty, garbage, above 255) are unset | `qwen4_hc_fuse` (`u8`; consumers read `qwen4_hc_fuse_level()`, which clamps to `3`) | operator; `trunk_shard_layer_oracle` and `lab_trunk_oracle` name `=1` | Fusion level of the Qwen4 HC write (`=1` keeps the mixer's HC write unfused, per the trunk-shard oracle). Test: `router_w64_and_hc_fuse_promoted_arms_keep_their_legacy_meaning` (hipfire-config). |
+| `HIPFIRE_PAGE_EVICTION` | `memory.page_eviction` (`auto`/`true`/`false`) | `auto`: on for UMA GPUs, off for discrete GPUs | Legacy grammar: exactly `0` is `false`; anything else (`auto`, empty, garbage) is `true` | `page_eviction` (`Option<bool>`; `page_eviction_enabled(uma)` resolves auto) | no in-repo script sets it (operator switch) | Drops the model file's page cache after each tensor read; shared by the sequential loader and the multi-slot engine. Tri-state: unset follows UMA. |
+| `HIPFIRE_WIDENED_PBS_GROW_ONLY` | `memory.widened_pbs_grow_only` (`auto`/`off`) | `auto`: on for discrete gfx1100 and gfx1201, off for UMA and other architectures | Legacy grammar: exactly `0` is `off`; anything else (unset, `auto`, garbage) is `auto` | `widened_pbs_grow_only` (`bool`; the arch gate and `off` are applied at parse; `widened_pbs_grow_only_enabled(uma)` adds the UMA gate) | no in-repo script sets it (operator switch) | Owns large PBS buffers across requests instead of bouncing them through the pool; `off` keeps the conservative lifecycle. Test: `page_eviction_and_widened_arms_keep_their_legacy_meaning` (hipfire-config). |
 
 ## Manual — kept developer flags, arch-crate and runtime side (HIPF-430)
 
@@ -2234,7 +2236,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ORACLE_STATE_FP32` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |
 | `HIPFIRE_ORNITH_FIXTURE` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | developer |
 | `HIPFIRE_PACK_JOBS` | crates/rdna-compute/src/bin/hipfire-kernel-pack.rs, scripts/build-binary-archive.sh | developer |
-| `HIPFIRE_PAGE_EVICTION` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-loader/src/carriers.rs | developer |
+| `HIPFIRE_PAGE_EVICTION` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_PARENT_ROUTE_SCALE` | crates/hipfire-arch-deepseek4/scripts/ds4_parent_route_scale_probe.sh, crates/hipfire-ds4-parent/src/moe.rs | developer |
 | `HIPFIRE_PARITY_EXTRA_MODEL` | crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs | harness |
 | `HIPFIRE_PARITY_EXTRA_QT` | crates/hipfire-arch-qwen35/tests/gpu_gemv_parity.rs | harness |
@@ -2882,7 +2884,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_WEIGHT_LOAD_SPLIT_U32` | crates/rdna-compute/src/residual_lanes.rs | developer |
 | `HIPFIRE_WEIGHT_SLAB` | crates/hip-bridge/src/ffi.rs, crates/hip-bridge/src/ffi/weight_slab.rs | developer |
 | `HIPFIRE_WH_FD_ISOLATED_CHILD` | crates/hipfire-runtime/src/weight_host.rs | developer |
-| `HIPFIRE_WIDENED_PBS_GROW_ONLY` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
+| `HIPFIRE_WIDENED_PBS_GROW_ONLY` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_WMMA_BATCH_TILES` | crates/hipfire-arch-qwen35/examples/cb_vmm_state_oracle.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill_multi.rs | developer |
 | `HIPFIRE_WO_MMQ` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_WO_WMMA_VARIANT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/test_wmma_correctness.rs | experimental |

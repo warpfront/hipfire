@@ -11633,10 +11633,8 @@ fn load_qwen35_pp(
     // fadvise(DONTNEED)-per-tensor forces a full disk re-read on every load.
     // UMA keeps eviction (default) to avoid OOM vs hipMalloc staging.
     hfq_file.set_evict_page_cache(
-        hipfire_config::developer_var("HIPFIRE_PAGE_EVICTION")
-            .ok()
-            .map(|v| v != "0")
-            .unwrap_or_else(|| gpus.devices.iter().any(|g| g.is_uma())),
+        rdna_compute::FeatureFlags::process()
+            .page_eviction_enabled(gpus.devices.iter().any(|g| g.is_uma())),
     );
     let _hfq_cache_warmer = hfq_file.start_cache_warmup();
     let layout = hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
@@ -11965,10 +11963,7 @@ impl Carrier for Qwen35Carrier {
                 // re-read on every load. UMA keeps eviction (default) to
                 // avoid OOM vs hipMalloc staging.
                 hfq_file.set_evict_page_cache(
-                    hipfire_config::developer_var("HIPFIRE_PAGE_EVICTION")
-                        .ok()
-                        .map(|v| v != "0")
-                        .unwrap_or_else(|| ctx.gpu.is_uma()),
+                    rdna_compute::FeatureFlags::process().page_eviction_enabled(ctx.gpu.is_uma()),
                 );
                 let _hfq_cache_warmer = hfq_file.start_cache_warmup();
 
