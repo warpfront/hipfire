@@ -1818,8 +1818,8 @@ protocol) is on by default; on every other topology both default off:
 - `HIPFIRE_TP_PEER_ALTERNATING`: the attention partial and the FFN partial
   live in different buffers. Once a peer has produced the next partial, it
   has finished reading the previous one, so the reverse wait is dropped.
-  Unset follows `HIPFIRE_TP_FULL_GRAPH`.
-- `HIPFIRE_TP_FULL_GRAPH`: exact homogeneous gfx1100 pair or exact
+  Unset follows the whole-token graph default.
+- The whole-token graph (no env override of its own): exact homogeneous gfx1100 pair or exact
   homogeneous gfx1201 pair, TP=2, peer access, plain AR decode (a mixed
   gfx1100/gfx1201 pair, any other arch, and any other rank count are not
   admitted). Each rank's whole decode token is captured as one hipGraph.
@@ -1827,8 +1827,8 @@ protocol) is on by default; on every other topology both default off:
   barrier plus the residual add, which reads the peer's partial through a
   host-mapped, system-coherent exchange. Captured peer-VRAM reads can be stale
   on gfx1100, and the same exchange is used on gfx1201. The loader prepares
-  the signal tape and the exchange (about 80 KiB for Qwen3.8-27B). Enabling
-  this control implies the alternating protocol unless
+  the signal tape and the exchange (about 80 KiB for Qwen3.8-27B). The
+  whole-token graph implies the alternating protocol unless
   `HIPFIRE_TP_PEER_ALTERNATING=0`.
 - `HIPFIRE_TP_PEER_PUSH` (tri-state): inside the whole-token graph each rank
   pushes its partial into the other ranks' fine-grained VRAM mailboxes as
@@ -1841,7 +1841,7 @@ protocol) is on by default; on every other topology both default off:
   token (next paragraph).
 
 On four exact gfx1201 ranks on the generic mesh route the whole-token graph is
-also the default (`HIPFIRE_TP_FULL_GRAPH=0` or `HIPFIRE_TP_PEER_PUSH=0` restore
+also the default (`HIPFIRE_TP_PEER_PUSH=0` restores
 the eager event route). The bf16 exchange is unchanged (`x + (r(p0) + r(p1) +
 r(p2) + r(p3))`, rank order, fp32 adds), computed by one `tp_peer_pushn`
 kernel per rank per collective: the rank packs its partial to bf16, writes it
@@ -1856,8 +1856,9 @@ about 1.5 GB/s per sender). Decode of Qwen3.8-27B mq4-xts on 4x R9700:
 54.0 -> 77.5 tok/s (+43%).
 
 On exact homogeneous gfx1100 and gfx1201 pairs the whole-token graph is the
-default; `HIPFIRE_TP_FULL_GRAPH=0` restores the segmented-graph route with
-event-synchronized reductions.
+default; it has no override of its own, and `HIPFIRE_TP_PEER_ALTERNATING=0`
+disables it, restoring the segmented-graph route with event-synchronized
+reductions.
 
 The gfx1100 promotion receipt was measured 2026-10-16 on 2x W7900, current
 Qwen3.8-27B mq4-xts (SHA-256 `3e38ccba…`), Q8 VMM KV, pure AR, greedy, 512
@@ -1865,7 +1866,7 @@ generated tokens, three fresh processes per arm in `A,B,B,A,A,B` order:
 
 | gfx1100 route | decode samples (tok/s) | median | delta |
 |---|---|---:|---:|
-| segmented (`HIPFIRE_TP_FULL_GRAPH=0`) | 48.0, 47.8, 47.8 | 47.8 | — |
+| segmented (`HIPFIRE_TP_PEER_ALTERNATING=0`) | 48.0, 47.8, 47.8 | 47.8 | — |
 | whole-token graph | 53.4, 53.2, 53.1 | 53.2 | +11.30% |
 
 The path oracle passed 100/100 exact replays. Six product-path prompts produced
@@ -1879,7 +1880,7 @@ mq4-xts (sha256 `3e38ccba…`), greedy decode of 64 tokens after a 127- or
 8191-token prefill, 3 fresh processes per arm, median ms/token after the
 first token (fixture-bound, not a floor):
 
-| ctx | 1 card (default FP8 KV) | TP2, `HIPFIRE_TP_FULL_GRAPH=0` (Q8 KV) | TP2 default, whole-token graph (Q8 KV) |
+| ctx | 1 card (default FP8 KV) | TP2, segmented graph (`HIPFIRE_TP_PEER_ALTERNATING=0`, Q8 KV) | TP2 default, whole-token graph (Q8 KV) |
 |---|---|---|---|
 | 128 | 29.86 | 19.99 | 18.55 |
 | 8192 | 26.82 | 20.59 | 18.97 |
@@ -1889,7 +1890,7 @@ token. The first decode token after load runs direct and the second captures
 (about 25 ms). Validate either pair with the lab oracle
 `tp2_cross_device_graph_reduce` (`--features lab`,
 `HIPFIRE_TP2_GRAPH_REPLAYS`) and with greedy transcript identity against
-`HIPFIRE_TP_FULL_GRAPH=0`.
+the segmented-graph route (`HIPFIRE_TP_PEER_ALTERNATING=0`).
 
 ### Dense TP partial exchange: 16-bit (developer)
 
@@ -2199,7 +2200,7 @@ median tok/s:
 
 Decode graphs on the mesh route: TP2 decode on an exact gfx1201 or gfx1100
 pair uses the same whole-token graph as the hand route
-(`HIPFIRE_TP_FULL_GRAPH`, on by default for those pairs). `run_epoch` runs each
+(on by default for those pairs; no env override). `run_epoch` runs each
 rank's embed eagerly, captures the executor submission of the rest on both
 ranks (the reductions record the signal-barrier kernels) and replays the
 graphs on every later token, so a replayed token costs the host only the
@@ -2207,7 +2208,7 @@ epoch bookkeeping. The decode partials alternate two slots
 (`BoundaryIo::partial_slot`: mixer 0, FFN 1), which selects the alternating
 direct-peer reduction the graph can capture; prefill reuses one partial
 buffer and takes the ordinary protocol. Any other decode (TP4, another pair,
-`HIPFIRE_TP_FULL_GRAPH=0`, `HIPFIRE_GRAPH=0`) decodes
+`HIPFIRE_GRAPH=0`) decodes
 eager through the executor. Per-segment hipGraphs (one per rank program
 segment between the collectives) measured slower than eager at TP4 on
 gfx1201 (45.99 vs 51.13 tok/s, Qwen3.8-27B) and were removed: TP2 uses the
