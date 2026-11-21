@@ -119,7 +119,11 @@ pub fn convolve_static(
 ) -> (Vec<f32>, Vec<f32>) {
     let mut x = vec![0.0f32; (n_seq + n_conv - 1) * n_channels];
     let history = (n_conv - 1) * n_channels;
-    x[..history].copy_from_slice(&past[..history]);
+    // A fresh state has no history; treat it as zeros (the standard conv
+    // left-padding), so callers can start from `ConvState::default()`.
+    if past.len() >= history {
+        x[..history].copy_from_slice(&past[..history]);
+    }
     x[history..].copy_from_slice(&cur[..n_seq * n_channels]);
     let mut conv = vec![0.0f32; n_seq * n_channels];
     for t in 0..n_seq {
