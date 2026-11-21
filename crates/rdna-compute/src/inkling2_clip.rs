@@ -220,7 +220,9 @@ mod tests {
         let got = inkling2_clip_f32(&cur, Some(&scale), 1.0, dim);
         for r in 0..heads {
             let scaled_norm = row_norm(
-                &(0..dim).map(|i| cur[r * dim + i] * scale[r * dim + i]).collect::<Vec<_>>(),
+                &(0..dim)
+                    .map(|i| cur[r * dim + i] * scale[r * dim + i])
+                    .collect::<Vec<_>>(),
             );
             let n = row_norm(&got[r * dim..(r + 1) * dim]);
             assert!(n <= scaled_norm + 1e-4, "row {r}: {n} > {scaled_norm}");
@@ -231,5 +233,157 @@ mod tests {
     fn nan_in_is_nan_out() {
         let out = inkling2_clip_f32(&[f32::NAN, 1.0], None, 2.0, 2);
         assert!(out[0].is_nan() && out[1].is_nan());
+    }
+}
+
+// --- GPU dispatch (gfx1100) -------------------------------------------------
+
+use std::ffi::c_void;
+
+use crate::dispatch::{Gpu, GpuTensor};
+use hip_bridge::HipResult;
+
+impl Gpu {
+    /// In-place per-head-row L2 clip: `rows[r] *= min(threshold /
+    /// (|scale[r] .* rows[r]| + eps), 1)` over `n_rows` rows of `dim`.
+    ///
+    /// `scale = None` (the scaleless K path) passes a null scale pointer
+    /// with `has_scale = 0`. One block per row with `blockDim.x = dim`
+    /// (128 for Q/K, 16 for R) and `dim * 4` bytes of shared memory — the
+    /// tree reduction needs a power-of-two `dim <= 1024`, refused otherwise.
+    /// Launch shape mirrors the elementwise kernels in `norm.rs`:
+    /// `launch_maybe_blob` (graph-safe kernargs).
+    pub fn inkling2_l2_clip_rows_f32(
+        &mut self,
+        rows: &GpuTensor,
+        scale: Option<&GpuTensor>,
+        n_rows: usize,
+        dim: usize,
+        threshold: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            dim.is_power_of_two() && dim <= 1024,
+            "dim {dim} must be a power of two <= 1024"
+        );
+        assert_eq!(rows.shape, vec![n_rows, dim]);
+        let has_scale = scale.is_some() as i32;
+        if let Some(s) = scale {
+            assert_eq!(s.shape, vec![n_rows, dim]);
+        }
+        self.ensure_kernel(
+            "inkling2_clip",
+            INKLING2_CLIP_HIP_SRC,
+            "inkling2_l2_clip_rows_f32",
+        )?;
+        let rows_ptr = rows.buf.as_ptr();
+        let scale_ptr = scale
+            .map(|s| s.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let n_rows_val = n_rows as i32;
+        let dim_val = dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &rows_ptr as *const _ as *mut c_void,
+            &scale_ptr as *const _ as *mut c_void,
+            &n_rows_val as *const _ as *mut c_void,
+            &dim_val as *const _ as *mut c_void,
+            &threshold as *const _ as *mut c_void,
+            &has_scale as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "inkling2_l2_clip_rows_f32",
+            [n_rows as u32, 1, 1],
+            [dim as u32, 1, 1],
+            (dim * 4) as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(rows_ptr);
+                b.push_ptr(scale_ptr);
+                b.push_i32(n_rows_val);
+                b.push_i32(dim_val);
+                b.push_f32(threshold);
+                b.push_i32(has_scale);
+                b
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+
+    fn rng_next(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    fn rng_f32(state: &mut u64, lo: f32, hi: f32) -> f32 {
+        let u = (rng_next(state) >> 11) as f32 / (1u64 << 53) as f32;
+        lo + u * (hi - lo)
+    }
+
+    fn run_case(
+        gpu: &mut Gpu,
+        cur_h: &[f32],
+        scale_h: Option<&[f32]>,
+        threshold: f32,
+        dim: usize,
+    ) -> f32 {
+        let n_rows = cur_h.len() / dim;
+        let rows = gpu.upload_f32(cur_h, &[n_rows, dim]).expect("rows upload");
+        let scale = scale_h.map(|s| gpu.upload_f32(s, &[n_rows, dim]).expect("scale upload"));
+        gpu.inkling2_l2_clip_rows_f32(&rows, scale.as_ref(), n_rows, dim, threshold)
+            .expect("clip launch");
+        let got = gpu.download_f32(&rows).expect("download");
+        let want = inkling2_clip_f32(cur_h, scale_h, threshold, dim);
+        assert_eq!(got.len(), want.len());
+        got.iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Gate: device output matches the crate F32 reference at model dims
+    /// (Q 24x128 scaled, K 8x128 scaleless, R 8x16 scaled) and on a
+    /// randomized case. Bar: <= 1e-4 abs.
+    #[test]
+    #[ignore = "requires gfx1100 and the HIP toolchain"]
+    fn gpu_matches_cpu_reference() {
+        let mut gpu = match crate::gpu_test::init() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skip: no usable GPU ({e:?})");
+                return;
+            }
+        };
+        assert_eq!(gpu.arch, "gfx1100");
+        let mut s = 0x2468_ace0_1357_9bdfu64;
+        // (a) model dims: Q heads with scale, K heads scaleless, R scaled.
+        let cur: Vec<f32> = (0..24 * 128).map(|_| rng_f32(&mut s, -3.0, 3.0)).collect();
+        let scale: Vec<f32> = (0..24 * 128).map(|_| rng_f32(&mut s, 0.5, 1.5)).collect();
+        let d = run_case(&mut gpu, &cur, Some(&scale), 22.627, 128);
+        eprintln!("clip Q model-dims max abs diff: {d}");
+        assert!(d <= 1e-4, "Q diff {d}");
+        let cur: Vec<f32> = (0..8 * 128).map(|_| rng_f32(&mut s, -3.0, 3.0)).collect();
+        let d = run_case(&mut gpu, &cur, None, 8.0, 128);
+        eprintln!("clip K model-dims (scaleless) max abs diff: {d}");
+        assert!(d <= 1e-4, "K diff {d}");
+        let cur: Vec<f32> = (0..8 * 16).map(|_| rng_f32(&mut s, -2.0, 2.0)).collect();
+        let scale: Vec<f32> = (0..8 * 16).map(|_| rng_f32(&mut s, 0.5, 2.0)).collect();
+        let d = run_case(&mut gpu, &cur, Some(&scale), 8.0, 16);
+        eprintln!("clip R model-dims max abs diff: {d}");
+        assert!(d <= 1e-4, "R diff {d}");
+        // (b) randomized case (dim 32, mixed above/below threshold).
+        let cur: Vec<f32> = (0..6 * 32).map(|_| rng_f32(&mut s, -5.0, 5.0)).collect();
+        let scale: Vec<f32> = (0..6 * 32).map(|_| rng_f32(&mut s, 0.1, 3.0)).collect();
+        let d = run_case(&mut gpu, &cur, Some(&scale), 1.0, 32);
+        eprintln!("clip randomized max abs diff: {d}");
+        assert!(d <= 1e-4, "randomized diff {d}");
     }
 }
