@@ -409,6 +409,65 @@ they could not disturb the parity bisect.
   yet read an MQ4L artifact. Not on the critical path until the GPU forward
   exists.
 
+## GPU forward — concrete implementation brief (next slice)
+
+Everything below is verified against the tree; it is the structure the next
+session should build, in this order. Do NOT land a partial version of this:
+1 and 2 are only useful together, and a half-built bundle was already thrown
+away once.
+
+**New file `crates/hipfire-arch-inkling2/src/gpu.rs`**, wired from
+`arch.rs::load_weights` (upload) and `arch_model.rs::free_gpu` (free every
+allocation; cf. PR #566).
+
+Per physical layer (×24), following `hipfire-arch-cohere2moe/src/cohere2moe.rs`
+(`Cohere2MoeLayerWeights` + `wt_from_raw` at `:224`):
+
+- attention projections: `wq_du` [3072,2304], `wk_dv`/`wv_dv` [1024,2304],
+  `wr_du` [384,2304], `gate_attn` [3072,2304], `wo_ud` [2304,3072]
+- `attn_sink_proj` [24,2304]; `rel_logits_proj.proj` (F16 table, forward wants
+  `[n_rel=16, n_extent=1024]`); `q_l2_clip.scale` [3072]; `rel_l2_clip.scale` [384]
+- norms: SWA layers `attn_norm` [2304]; full layers `q/k/v_input_norm`; all
+  layers `mlp_norm`
+- convs: `k_sconv`/`v_sconv` static `[C,4]` (+ `weight_proj` on the 4 full
+  layers), `attn_sconv`, `mlp_sconv`
+- controllers ×4 (`attn`,`k`,`v`,`mlp`) × (`down` [64,4608], `gain`/`forget`
+  [2304,64]) — F16 keep
+- `attn_res_query` ([2304] SWA / [3,2304] full), `ffn_res_query` [2304]
+- MoE: router `mlp.gate.weight` [128,2304], 128 × (`gate_up` [2304,2304] +
+  `down` [1152,2304]) MQ4/MQ4V2, plus the `[128]` device pointer arrays the
+  grouped path wants (`MoeFfn` precedent)
+
+Globals: `embed`, `embed_norm`, `norm`, `unembed`, `attn_res.output_query`,
+`middle_cycle_cross_pass_queries`/`_kv_queries` (or the 12 per-layer
+`loop_msg_query` tensors), 200058-slice on the head.
+
+**Per-visit state, 48 slots** (VRAM plan: q8 KV 0.61 GiB at 32768, conv 3.8 MB,
+weights 13.1 GiB, total ≈14.5 GiB on 24 GiB):
+- KV: SWA visits keep 1024 rows, full visits 32768 (slot count from
+  `vram-plan.md` §2); allocate by mask, never 48×32768
+- unified conv state per visit: width `2·1024 + 2·2304 = 6656`, 3 taps
+- keyed by **visit**, not layer — an ×24 allocation silently aliases passes
+
+**Operator → existing kernel** (from `inkling2-research/kernel-inventory.md`,
+with the routing row corrected): rmsnorm `norm.rs:420`; linear `weight_gemv`;
+conv `norm.rs:5461/9211/9470` (drop the SiLU); attention
+`attention.rs:16769` + the DS4 sink idiom; SiTU `ffn_activation.rs` `Situ`;
+softcap `norm.rs:8898`. The four NEW ones are the kernels worktree files
+(`hipfire-kernels`: `inkling2_control.rs`, `inkling2_mix.rs`,
+`inkling2_rel_bias.rs`, `inkling2_clip.rs` — uncommitted there, F32 reference +
+inert HIP source + 22 tests): integrate them as the device implementations land.
+
+**Gating order** (each step is a checkpoint, not a guess):
+1. upload + free smoke: load arch 24 and return VRAM to baseline on unload;
+2. one visit (phys 6, pass 0) vs the CPU oracle — `forward_token`'s `debug`
+   hook gives every component of that visit for the diff;
+3. all 48 visits vs the CPU trace (`visit_out` per visit);
+4. token-0 logits vs `D:\hipfire-models\oracle-logits-tok0.txt`
+   (bar: r > 0.999, argmax match, as the F32 CPU path now achieves);
+5. only then `GenerationRoute::InklingAr` + `generate_inkling`, and remove the
+   arch-24 guard in `ar.rs::generate`.
+
 ## Known issues / risks
 
 - Quant→quant: no original pre-quant BF16 checkpoint exists; the published BF16
