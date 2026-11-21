@@ -178,6 +178,20 @@ oracle with reproducible golden outputs; three research reports vendored under
 `docs/plans/inkling2-research/`. Not done: the loader bundle, CPU/GPU forward,
 and generation route — the artifact cannot be served yet.
 
+**Artifact fix (2026-11-21):** the quantizer's generic `.scale`-sibling rule
+had silently dropped the 48 L2-clip tensors (`q_l2_clip.scale` /
+`rel_l2_clip.scale`) because they are bare learned parameters with no
+`.weight` companion. Fixed: `.scale` is only treated as an FP8 sibling when a
+real `<stem>.weight` exists. Re-quantized artifact now has 6790 tensors
+(+48): 144 controllers, 2 cross-pass, 48 clips, 3072 gate_up + 3072 down.
+The forward primitive needs these clip scales, so this was a real blocker.
+
+A CPU forward **primitive** now exists (`forward.rs`): single-token SWA
+attention using decoded f32 weights + oracle ops, with a unit test and a
+real-layer-0 finite-output test. It is explicitly a scaffold — MoE, loop
+schedule (messages/controllers/mix), full-layer dynamic convs, multi-token KV
+cache and LM head are NOT yet implemented (tracked in the module doc).
+
 Layer-type norm names in the loaded artifact (for the forward port): SWA
 layers use `attn_norm.weight`; full layers (5, 11, 17, 23) use
 `q_input_norm.weight` / `k_input_norm.weight` / `v_input_norm.weight`. Full
