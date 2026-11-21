@@ -22,6 +22,8 @@ pub struct RawTensor {
 /// Index of every Inkling-2 tensor in the trunk HFQ, keyed by verbatim HFQ name.
 pub struct Inkling2Weights {
     pub tensors: HashMap<String, RawTensor>,
+    /// Lazily decoded f32 weights (a 48-visit forward reuses each tensor many times).
+    f32_cache: std::cell::RefCell<HashMap<String, (Vec<usize>, Vec<f32>)>>,
 }
 
 impl Inkling2Weights {
@@ -81,7 +83,10 @@ impl Inkling2Weights {
             }
         }
 
-        Ok(Self { tensors })
+        Ok(Self {
+            tensors,
+            f32_cache: std::cell::RefCell::new(HashMap::new()),
+        })
     }
 
     pub fn get(&self, name: &str) -> Option<&RawTensor> {
@@ -92,6 +97,9 @@ impl Inkling2Weights {
     /// public HFQ decoder, which inverse-FWHTs the MQ4G256/G256V2 formats so
     /// the result is the original weight matrix (row-major, `shape`).
     pub fn f32(&self, name: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
+        if let Some(cached) = self.f32_cache.borrow().get(name) {
+            return Ok(cached.clone());
+        }
         let t = self
             .get(name)
             .ok_or_else(|| format!("inkling2: tensor not found: {name}"))?;
@@ -108,7 +116,9 @@ impl Inkling2Weights {
                 vals.len()
             ));
         }
-        Ok((shape, vals))
+        let result = (shape, vals);
+        self.f32_cache.borrow_mut().insert(name.to_string(), result.clone());
+        Ok(result)
     }
 
     /// Expected expert tensor count: n_phys × n_experts × 2 (gate_up + down).
