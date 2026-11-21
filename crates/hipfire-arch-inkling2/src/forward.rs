@@ -64,11 +64,13 @@ pub struct ConvState {
     pub ffn_out_past: Vec<f32>,
 }
 
-/// Apply a learned-gain RMSNorm: `x_norm * (1 + gain)` per hipfire/HF
-/// convention (gain stored as a delta from 1 for Inkling-2).
-fn rmsnorm_gain(x: &[f32], gain: &[f32], eps: f32) -> Vec<f32> {
+/// Apply a learned-gain RMSNorm: `x_norm * weight`, the raw HF / llama.cpp
+/// convention (`build_norm` does `ggml_mul(rms_norm(x), mw)`). Verified the
+/// decoded Inkling-2 norm weights are raw (embed_norm has negative values),
+/// NOT the Qwen4-style `(1 + delta)` zero-centered convention.
+fn rmsnorm_gain(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = rmsnorm_l2(x, eps);
-    n.iter().zip(gain).map(|(v, g)| v * (1.0 + g)).collect()
+    n.iter().zip(weight).map(|(v, g)| v * g).collect()
 }
 
 fn rmsnorm_l2(x: &[f32], eps: f32) -> Vec<f32> {
@@ -173,6 +175,44 @@ pub fn decode_layer(
     // Residual: next layer input is x + attention result (MoE omitted in this
     // single-layer primitive; it is covered by the oracle MoE operators).
     x.iter().zip(&attn_res).map(|(a, b)| a + b).collect()
+}
+
+/// Decode and run the routed MoE for one layer: sigmoid top-8 router,
+/// per-expert SiTU gate/up, down projection, fp32 combine. `x` is `[n_embd]`.
+/// `gate_up[e]` is `[2*inter, n_embd]` (gate rows first), `down[e]` is
+/// `[n_embd, inter]`, `router` is `[n_experts, n_embd]`.
+pub fn decode_moe(
+    x: &[f32],
+    router: &[f32],
+    router_bias: Option<&[f32]>,
+    gate_up: &[Vec<f32>],
+    down: &[Vec<f32>],
+    n_embd: usize,
+    inter: usize,
+    top_k: usize,
+    route_scale: f32,
+    situ_beta: f32,
+    situ_linear_beta: f32,
+) -> Vec<f32> {
+    let n_experts = gate_up.len();
+    let logits = oracle::matvec(router, x, n_experts, n_embd);
+    let selected = oracle::sigmoid_topk(&logits, router_bias, top_k, route_scale);
+    let mut out = vec![0.0f32; n_embd];
+    for (e, weight) in selected {
+        let gu = &gate_up[e];
+        let gate = &gu[..inter * n_embd];
+        let up = &gu[inter * n_embd..];
+        let g = oracle::matvec(gate, x, inter, n_embd);
+        let u = oracle::matvec(up, x, inter, n_embd);
+        let act: Vec<f32> = (0..inter)
+            .map(|i| oracle::situ(g[i], u[i], situ_beta, situ_linear_beta))
+            .collect();
+        let d = oracle::matvec(&down[e], &act, n_embd, inter);
+        for i in 0..n_embd {
+            out[i] += weight * d[i];
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -299,6 +339,95 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn moe_single_expert_is_its_output_times_scale() {
+        // 2 experts, top-1, expert 0 selected: identity gate/up/down,
+        // SiTU(1,1,beta=4,lb=25) * down = act. Router forces expert 0.
+        let n = 2;
+        let inter = 2;
+        let router = vec![100.0, 0.0, 0.0, 100.0]; // [2,2], x=[1,0] -> e0 wins
+        let x = [1.0, 0.0];
+        // gate_up[e] = [gate(2x2); up(2x2)], identity so g=x, u=x.
+        let gu0 = vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let gu1 = vec![0.0; 8];
+        let d0 = vec![1.0, 0.0, 0.0, 1.0]; // down 2x2 identity
+        let d1 = vec![0.0; 4];
+        let out = decode_moe(
+            &x,
+            &router,
+            None,
+            &[gu0, gu1],
+            &[d0, d1],
+            n,
+            inter,
+            1,
+            8.0,
+            4.0,
+            25.0,
+        );
+        let act0 = oracle::situ(1.0, 1.0, 4.0, 25.0);
+        let act1 = oracle::situ(0.0, 0.0, 4.0, 25.0);
+        assert!(
+            oracle_close(out[0], 8.0 * act0),
+            "{} vs {}",
+            out[0],
+            8.0 * act0
+        );
+        assert!(
+            oracle_close(out[1], 8.0 * act1),
+            "{} vs {}",
+            out[1],
+            8.0 * act1
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the 14 GB inkling2-mini-mq4.hfq artifact"]
+    fn moe_real_layer0_produces_finite_output() {
+        use crate::weights::Inkling2Weights;
+        use hipfire_runtime::hfq::HfqFile;
+        let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        let hfq = HfqFile::open(std::path::Path::new(
+            r"D:\hipfire-models\inkling2-mini-mq4.hfq",
+        ))
+        .expect("open");
+        let w = Inkling2Weights::load(&hfq, &cfg).expect("load");
+        let p = "model.llm.layers.0.";
+        let router = w.f32(&format!("{p}mlp.gate.weight")).unwrap().1;
+        let bias = w.f32(&format!("{p}mlp.gate.bias")).unwrap().1;
+        let mut gu = Vec::with_capacity(cfg.n_experts);
+        let mut dn = Vec::with_capacity(cfg.n_experts);
+        for e in 0..cfg.n_experts {
+            gu.push(
+                w.f32(&format!("{p}mlp.experts.{e}.gate_up_proj.weight"))
+                    .unwrap()
+                    .1,
+            );
+            dn.push(
+                w.f32(&format!("{p}mlp.experts.{e}.down_proj.weight"))
+                    .unwrap()
+                    .1,
+            );
+        }
+        let x = vec![0.01f32; cfg.n_embd];
+        let out = decode_moe(
+            &x,
+            &router,
+            Some(&bias),
+            &gu,
+            &dn,
+            cfg.n_embd,
+            cfg.inter,
+            cfg.n_expert_used,
+            cfg.route_scale,
+            cfg.situ_beta,
+            cfg.situ_linear_beta,
+        );
+        assert!(out.iter().all(|v| v.is_finite()), "non-finite MoE output");
+        let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!("real MoE: {} values, max={max}", out.len());
     }
 
     fn oracle_close(a: f32, b: f32) -> bool {
