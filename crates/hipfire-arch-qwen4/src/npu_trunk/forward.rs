@@ -3793,6 +3793,10 @@ pub(super) fn run_pair_request(
             tokens.len() * program_dims(&bundle.config).wide(),
         )
     });
+    // The pair's GDN runs without the stream carry and reads the live slot: an
+    // Open stream (a restored GPU-chunk snapshot) must be sealed first. The pair
+    // is never recorded, so the eager seal is allowed here.
+    bundle.seal_gdn_streams(gpu).map_err(fail)?;
     let mut npu = owner.npu_trunk.take().expect("on owner");
     let result = npu.pair(
         owner,
