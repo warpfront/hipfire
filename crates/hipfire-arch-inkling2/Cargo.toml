@@ -11,3 +11,4 @@ safetensors.workspace = true
 memmap2.workspace = true
 half = "2"
 hipfire-runtime = { path = "../hipfire-runtime" }
+rdna-compute = { path = "../rdna-compute" }

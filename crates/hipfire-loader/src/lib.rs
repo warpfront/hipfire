@@ -33,6 +33,7 @@ use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_gemma4 as gemma4;
+use hipfire_arch_inkling2 as inkling2;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
@@ -471,6 +472,7 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
         14 => BenchDecodeRoute::MuseGlimmer,
         16 => BenchDecodeRoute::Qwen4,
         19 => BenchDecodeRoute::Raon,
+        24 => BenchDecodeRoute::Unsupported,
         _ => BenchDecodeRoute::Unsupported,
     }
 }
@@ -493,6 +495,7 @@ pub fn arch_label(arch_id: u32) -> &'static str {
         17 => "qwen3_5_embed",
         18 => "embedding_gemma2",
         19 => "raon1_mini",
+        24 => "inkling2",
         40 => "flux_mmdit",
         45 => "flux2_mmdit",
         _ => "qwen3",
@@ -694,6 +697,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Qwen35EmbedCarrier,
     &EmbeddingGemma2Carrier,
     &RaonCarrier,
+    &Inkling2Carrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -969,6 +973,7 @@ pub struct Deepseek4HeterogeneousBundle {
 pub use lfm2moe::Lfm2MoeBundle;
 pub use raon::RaonBundle;
 
+pub use inkling2::Inkling2Bundle;
 /// MiniMax-M2 (arch_id=10) GPU bundle. Re-exported from the arch crate, which
 /// owns it so `impl SpecTarget for MiniMaxBundle` (the n-gram verify seam) can
 /// live next to the forward it drives (orphan rule). Field-identical to the
@@ -1587,6 +1592,19 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<MiniMaxBundle>())
+    }
+
+    /// Inkling-2-Mini bundle if this model is arch_id=24, else None.
+    pub fn inkling2(&self) -> Option<&Inkling2Bundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<Inkling2Bundle>())
+    }
+
+    pub fn inkling2_mut(&mut self) -> Option<&mut Inkling2Bundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Inkling2Bundle>())
     }
 
     /// Qwen2 bundle if this model is arch_id=7 (plain qwen2 via `Qwen2Carrier`),
