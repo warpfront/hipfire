@@ -463,10 +463,31 @@ impl PrefixIndex {
         prefixes: &[&[u32]],
         pool: &PagePool,
     ) -> (HashSet<u32>, HashSet<CheckpointId>) {
+        self.protection_for_live(domain, prefixes, pool, |_| true)
+    }
+
+    /// Like [`Self::protection_for`], but considers only checkpoints for which
+    /// `is_checkpoint_live` returns `true` (i.e. still resident in the
+    /// [`crate::checkpoint_pool::CheckpointPool`]).
+    ///
+    /// If a session's tip checkpoint was evicted from the checkpoint pool under
+    /// device or ceiling pressure while its KV pages remained resident, the
+    /// walk falls back to the deepest ancestor checkpoint along the contiguous
+    /// resident prefix that is still live in the pool.
+    pub fn protection_for_live<F>(
+        &self,
+        domain: &CacheDomain,
+        prefixes: &[&[u32]],
+        pool: &PagePool,
+        is_checkpoint_live: F,
+    ) -> (HashSet<u32>, HashSet<CheckpointId>)
+    where
+        F: Fn(CheckpointId) -> bool,
+    {
         let mut pages = HashSet::new();
         let mut checkpoints = HashSet::new();
         for tokens in prefixes {
-            let walk = self.walk(domain, tokens, pool, None);
+            let walk = self.walk_with_filter(domain, tokens, pool, None, &is_checkpoint_live);
             for h in &walk.pages {
                 pages.insert(h.handle.phys);
             }
@@ -655,6 +676,20 @@ impl PrefixIndex {
         pool: &PagePool,
         exact_before: Option<u64>,
     ) -> WalkResult {
+        self.walk_with_filter(domain, tokens, pool, exact_before, |_| true)
+    }
+
+    fn walk_with_filter<F>(
+        &self,
+        domain: &CacheDomain,
+        tokens: &[u32],
+        pool: &PagePool,
+        exact_before: Option<u64>,
+        is_checkpoint_live: F,
+    ) -> WalkResult
+    where
+        F: Fn(CheckpointId) -> bool,
+    {
         let tree = match self.trees.get(domain) {
             Some(t) => t,
             None => {
@@ -692,6 +727,7 @@ impl PrefixIndex {
                 let boundary = cb.token_offset;
                 let required = boundary - boundary % PAGE_TOKENS as u64;
                 if required <= contiguous_resident_tokens
+                    && is_checkpoint_live(cb.checkpoint)
                     && deepest_resumable_checkpoint.map_or(true, |(b, _)| boundary > b)
                 {
                     deepest_resumable_checkpoint = Some((boundary, cb.checkpoint));
@@ -773,6 +809,7 @@ impl PrefixIndex {
                     }
                     let required = boundary - boundary % PAGE_TOKENS as u64;
                     if required <= contiguous_resident_tokens
+                        && is_checkpoint_live(cb.checkpoint)
                         && deepest_resumable_checkpoint.map_or(true, |(b, _)| boundary > b)
                     {
                         deepest_resumable_checkpoint = Some((boundary, cb.checkpoint));
@@ -4359,6 +4396,29 @@ mod tests {
 
         let (pages, checkpoints) = index.protection_for(&domain, &[&tokens[..512]], &pool);
         assert_eq!(pages.len(), 3);
+        assert_eq!(checkpoints.len(), 1);
+        assert!(checkpoints.contains(&CheckpointId(3)));
+        assert!(!checkpoints.contains(&CheckpointId(4)));
+        assert!(!checkpoints.contains(&CheckpointId(1)));
+        assert!(!checkpoints.contains(&CheckpointId(2)));
+    }
+
+    #[test]
+    fn protection_for_live_falls_back_when_tip_checkpoint_was_evicted_from_pool() {
+        let mut pool = exact_pool();
+        let mut index = PrefixIndex::new(1 << 10);
+        let domain = sample_domain(1);
+        let tokens = make_tokens(512);
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..128], 1).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..256], 2).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..384], 3).unwrap();
+        publish_exact(&mut index, &mut pool, &domain, &tokens[..512], 4).unwrap();
+
+        let (pages, checkpoints) =
+            index.protection_for_live(&domain, &[&tokens[..512]], &pool, |id| {
+                id != CheckpointId(4)
+            });
+        assert_eq!(pages.len(), 4);
         assert_eq!(checkpoints.len(), 1);
         assert!(checkpoints.contains(&CheckpointId(3)));
         assert!(!checkpoints.contains(&CheckpointId(4)));

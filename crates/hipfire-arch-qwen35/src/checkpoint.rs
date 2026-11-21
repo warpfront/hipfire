@@ -27,33 +27,105 @@ impl CheckpointBlob for DeltaNetSnapshot {
 
 /// Bytes left free for the next VMM granule map. A snapshot that would
 /// consume this reserve is refused instead of being allocated.
-const CHECKPOINT_MAP_RESERVE_BYTES: u64 = 512 << 20;
+pub(crate) const CHECKPOINT_MAP_RESERVE_BYTES: u64 = 512 << 20;
+
+/// Bytes of unpinned checkpoints to free before allocating a new checkpoint
+/// of `capture_bytes` while preserving `reserve` bytes for VMM granule maps.
+///
+/// Returns:
+/// - `Some(0)` when `free >= capture_bytes + reserve` (no drain needed);
+/// - `Some(target)` (`target > 0`) for the smallest prefix of `sizes`
+///   (ordered unprotected-first, then soft-protected) whose sum covers the
+///   shortfall;
+/// - `None` when even draining every candidate in `sizes` cannot cover the
+///   shortfall — callers must refuse the capture without destroying existing
+///   reusable checkpoints for a capture that will be refused anyway.
+pub(crate) fn checkpoint_capture_drain_bytes(
+    free: u64,
+    capture_bytes: u64,
+    reserve: u64,
+    sizes: impl IntoIterator<Item = u64>,
+) -> Option<u64> {
+    let need = capture_bytes.saturating_add(reserve);
+    let mut missing = need.saturating_sub(free);
+    if missing == 0 {
+        return Some(0);
+    }
+    let mut target = 0u64;
+    for size in sizes {
+        target = target.saturating_add(size);
+        missing = missing.saturating_sub(size);
+        if missing == 0 {
+            return Some(target);
+        }
+    }
+    None
+}
+
+fn pop_unpinned_preferring_unprotected<B: CheckpointBlob>(
+    pool: &mut CheckpointPool<B>,
+    protected: &HashSet<CheckpointId>,
+) -> Option<B> {
+    pool.pop_lru_excluding(protected)
+        .or_else(|| pool.pop_lru())
+        .map(|(_, blob)| blob)
+}
+
+fn free_checkpoints_up_to(
+    gpu: &mut Gpu,
+    pool: &mut CheckpointPool<DeltaNetSnapshot>,
+    protected: &HashSet<CheckpointId>,
+    target: u64,
+) -> u64 {
+    let mut freed = 0u64;
+    while freed < target {
+        let Some(blob) = pop_unpinned_preferring_unprotected(pool, protected) else {
+            break;
+        };
+        freed = freed.saturating_add(blob.bytes_len());
+        blob.free_gpu(gpu);
+    }
+    freed
+}
 
 /// True when `bytes` can be hipMalloc'd without eating the KV map reserve.
-/// Unpinned snapshots are freed until that holds, or until none remain.
+///
+/// Reads `device_mem_info` once after draining the tensor pool, evicts
+/// unprotected checkpoints before soft-protected ones, and tracks freed bytes
+/// arithmetically (avoiding `hipMemGetInfo` async-free lag). Returns `false`
+/// without evicting anything if draining every unpinned entry still cannot
+/// cover `bytes + CHECKPOINT_MAP_RESERVE_BYTES`.
 fn checkpoint_device_room(
     gpu: &mut Gpu,
     pool: &mut CheckpointPool<DeltaNetSnapshot>,
     bytes: u64,
+    protected: &HashSet<CheckpointId>,
 ) -> bool {
-    let need = bytes.saturating_add(CHECKPOINT_MAP_RESERVE_BYTES);
-    loop {
-        let free = gpu
-            .device_mem_info()
-            .map(|(free, _)| free as u64)
-            .unwrap_or(0);
-        if free >= need {
-            return true;
-        }
-        let Some((_, blob)) = pool.pop_lru() else {
-            return false;
-        };
-        let freed = blob.bytes_len();
-        blob.free_gpu(gpu);
+    gpu.drain_pool();
+    let free = gpu
+        .device_mem_info()
+        .map(|(free, _)| free as u64)
+        .unwrap_or(0);
+    let (unprotected, soft) = pool.drain_candidates(protected);
+    let Some(target) = checkpoint_capture_drain_bytes(
+        free,
+        bytes,
+        CHECKPOINT_MAP_RESERVE_BYTES,
+        unprotected.into_iter().chain(soft),
+    ) else {
+        return false;
+    };
+    if target == 0 {
+        return true;
+    }
+    let freed = free_checkpoints_up_to(gpu, pool, protected, target);
+    if freed > 0 {
+        gpu.drain_pool();
         eprintln!(
             "[prefix-cache] freed {freed} checkpoint bytes to leave room for a {bytes} B capture (device free {free})"
         );
     }
+    free.saturating_add(freed) >= bytes.saturating_add(CHECKPOINT_MAP_RESERVE_BYTES)
 }
 
 /// True when a pending VMM granule map fits within the mapper's configured
@@ -126,16 +198,7 @@ pub(crate) fn free_checkpoints_for_vmm_map(
     if target == 0 {
         return 0;
     }
-    let mut freed = 0u64;
-    while freed < target {
-        let blob = match pool.pop_lru_excluding(protected) {
-            Some((_, blob)) => Some(blob),
-            None => pool.pop_lru().map(|(_, blob)| blob),
-        };
-        let Some(blob) = blob else { break };
-        freed = freed.saturating_add(blob.bytes_len());
-        blob.free_gpu(gpu);
-    }
+    let freed = free_checkpoints_up_to(gpu, pool, protected, target);
     // The tensor pool can still account the freed buffers as used until it
     // is drained (same reason as the idle reclaim).
     if freed > 0 {
@@ -168,6 +231,28 @@ pub fn capture_checkpoint(
     boundary_tokens: &[u32],
     state: &DeltaNetState,
 ) -> HipResult<CheckpointId> {
+    capture_checkpoint_excluding(
+        gpu,
+        pool,
+        domain,
+        p,
+        boundary_tokens,
+        state,
+        &HashSet::new(),
+    )
+}
+
+/// [`capture_checkpoint`] honoring soft-protected live-session checkpoint ids
+/// in `protected` whenever ceiling or device-room eviction runs.
+pub fn capture_checkpoint_excluding(
+    gpu: &mut Gpu,
+    pool: &mut CheckpointPool<DeltaNetSnapshot>,
+    domain: &CacheDomain,
+    p: u64,
+    boundary_tokens: &[u32],
+    state: &DeltaNetState,
+    protected: &HashSet<CheckpointId>,
+) -> HipResult<CheckpointId> {
     if !CheckpointPool::<DeltaNetSnapshot>::is_aligned(p) {
         return Err(HipError::new(
             0,
@@ -190,22 +275,32 @@ pub fn capture_checkpoint(
     // hipMalloc'd beside the VMM page pool; allocating one the card cannot
     // hold fails the next KV granule map. Free unpinned snapshots until the
     // capture fits with a map reserve, or skip it.
-    if !checkpoint_device_room(gpu, pool, bytes) {
+    if !checkpoint_device_room(gpu, pool, bytes, protected) {
         return Ok(CheckpointId::NONE);
     }
 
     let mut snap = match DeltaNetSnapshot::new_for(gpu, state) {
         Ok(snap) => snap,
         Err(err) => {
-            if !checkpoint_device_room(gpu, pool, bytes) {
+            // Do not re-run `checkpoint_device_room` here: `hipMemGetInfo` lags
+            // after `hipFree`. Evict one unpinned candidate and retry once.
+            let Some(blob) = pop_unpinned_preferring_unprotected(pool, protected) else {
                 return Err(err);
-            }
+            };
+            blob.free_gpu(gpu);
+            gpu.drain_pool();
             DeltaNetSnapshot::new_for(gpu, state)?
         }
     };
     snap.save_from(state, gpu)?;
 
-    let (id, displaced) = pool.insert(domain.clone(), p, prefix_fingerprint(boundary_tokens), snap);
+    let (id, displaced) = pool.insert_excluding(
+        domain.clone(),
+        p,
+        prefix_fingerprint(boundary_tokens),
+        snap,
+        protected,
+    );
     // Displaced blobs (LRU evictions / same-key replacement / a ceiling
     // refusal of this very capture) own device memory with no freeing
     // `Drop` — free them here or they leak for the process lifetime.
@@ -383,5 +478,26 @@ mod tests {
         assert_eq!(pool.len(), 1);
         assert!(pool.contains(&domain, 384, 3));
         assert!(pool.is_pinned(&domain, 384, 3));
+    }
+
+    #[test]
+    fn checkpoint_capture_drain_bytes_refuses_futile_drain_and_sizes_minimal_prefix() {
+        // Enough free device memory for capture + reserve: no drain needed.
+        assert_eq!(
+            checkpoint_capture_drain_bytes(1000, 100, 500, [200, 300]),
+            Some(0)
+        );
+        // Shortfall of 200: drains only the minimal prefix covering 200.
+        assert_eq!(
+            checkpoint_capture_drain_bytes(400, 100, 500, [64, 150, 512]),
+            Some(214)
+        );
+        // Even draining every candidate cannot reach capture + reserve: refuse
+        // without destroying existing reusable checkpoints.
+        assert_eq!(
+            checkpoint_capture_drain_bytes(100, 100, 500, [64, 150]),
+            None
+        );
+        assert_eq!(checkpoint_capture_drain_bytes(100, 100, 500, []), None);
     }
 }
