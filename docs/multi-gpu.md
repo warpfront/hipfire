@@ -1866,7 +1866,7 @@ generated tokens, three fresh processes per arm in `A,B,B,A,A,B` order:
 
 | gfx1100 route | decode samples (tok/s) | median | delta |
 |---|---|---:|---:|
-| segmented (`HIPFIRE_TP_PEER_ALTERNATING=0`) | 48.0, 47.8, 47.8 | 47.8 | — |
+| segmented (measured as `HIPFIRE_TP_FULL_GRAPH=0`; equivalent to `HIPFIRE_TP_PEER_ALTERNATING=0` since HIPF-489) | 48.0, 47.8, 47.8 | 47.8 | — |
 | whole-token graph | 53.4, 53.2, 53.1 | 53.2 | +11.30% |
 
 The path oracle passed 100/100 exact replays. Six product-path prompts produced
@@ -1880,7 +1880,7 @@ mq4-xts (sha256 `3e38ccba…`), greedy decode of 64 tokens after a 127- or
 8191-token prefill, 3 fresh processes per arm, median ms/token after the
 first token (fixture-bound, not a floor):
 
-| ctx | 1 card (default FP8 KV) | TP2, segmented graph (`HIPFIRE_TP_PEER_ALTERNATING=0`, Q8 KV) | TP2 default, whole-token graph (Q8 KV) |
+| ctx | 1 card (default FP8 KV) | TP2, segmented graph (measured as `HIPFIRE_TP_FULL_GRAPH=0`, now `HIPFIRE_TP_PEER_ALTERNATING=0`; Q8 KV) | TP2 default, whole-token graph (Q8 KV) |
 |---|---|---|---|
 | 128 | 29.86 | 19.99 | 18.55 |
 | 8192 | 26.82 | 20.59 | 18.97 |
