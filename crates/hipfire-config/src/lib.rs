@@ -2618,6 +2618,26 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_GFX11_A4_CANDIDATES",
         "Number of activation-quantization candidates searched inside fused gfx1100/gfx1151 IU4 producers (default 2, selecting {5,7}); 8 restores the full-grid search. Other architectures and the standalone quantizer are unchanged."
     ),
+    process_field!(
+        "kernel.gfx1100_router_w64",
+        "gfx1100_router_w64",
+        Kernel,
+        DefaultValue::String("exact"),
+        ValueRule::Enum(&["exact", "off", "approx"]),
+        true,
+        "HIPFIRE_GFX1100_ROUTER_W64",
+        "MoE router for 256-expert models on exact gfx1100: exact (default) = exact wave64 router, approx = approximate wave64 router, off = baseline router. gfx1151 and gfx1201 keep their fixed router."
+    ),
+    process_field!(
+        "kernel.qwen4_hc_fuse",
+        "qwen4_hc_fuse",
+        Kernel,
+        DefaultValue::Null,
+        ValueRule::NullableInteger { min: 0, max: 3 },
+        true,
+        "HIPFIRE_QWEN4_HC_FUSE",
+        "Qwen4 HC read/write fusion level 0-3 on exact gfx1151 and gfx1201 (other architectures stay 0): 1 = read side, 2 = + attention output projection writes the HC streams, 3 = + shared-down fold writes them. Unset: 3 on gfx1151, 1 on gfx1201."
+    ),
     process_bool_field!(
         "kernel.gfx12_fa2_prefill",
         "gfx12_fa2_prefill",
@@ -4911,6 +4931,22 @@ pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[
         removed_in: "0.5.0",
         reason: "promoted to a typed key (HIPF-430); HIPFIRE_RAON_SHARED_FFN is unchanged",
         replacement: "kernel.raon_shared_ffn",
+    },
+    RetiredConfigKey {
+        key: "developer.gfx1100_router_w64",
+        legacy_key: "developer.gfx1100_router_w64",
+        shipped_in: "0.3.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-489); HIPFIRE_GFX1100_ROUTER_W64 is unchanged",
+        replacement: "kernel.gfx1100_router_w64",
+    },
+    RetiredConfigKey {
+        key: "developer.qwen4_hc_fuse",
+        legacy_key: "developer.qwen4_hc_fuse",
+        shipped_in: "0.4.1",
+        removed_in: "0.5.0",
+        reason: "promoted to a typed key (HIPF-489); HIPFIRE_QWEN4_HC_FUSE is unchanged",
+        replacement: "kernel.qwen4_hc_fuse",
     },
     RetiredConfigKey {
         key: "developer.qwen4_lane_append_share",
@@ -9232,6 +9268,19 @@ fn promoted_flag_env_value(legacy_key: &str, raw: &str) -> Option<ConfigValue> {
         | "raon_shared_ffn"
         | "v2b_a4_epi"
         | "tp_exchange" => ConfigValue::String(raw.to_owned()),
+        // HIPF-489: each arm keeps its legacy grammar as a typed value.
+        "gfx1100_router_w64" => {
+            let mode = match raw {
+                "0" => "off",
+                "approx" => "approx",
+                _ => "exact",
+            };
+            ConfigValue::String(mode.to_owned())
+        }
+        "qwen4_hc_fuse" => match raw.trim().parse::<u8>() {
+            Ok(level) => ConfigValue::Integer(i64::from(level.min(3))),
+            Err(_) => ConfigValue::Null,
+        },
         _ => return None,
     })
 }
@@ -10298,8 +10347,8 @@ mod tests {
             .filter(|f| promoted_flag_env_value(f.legacy_key, "").is_some())
             .collect();
         // 9 kernel-side (stage 1) + 28 arch-crate / runtime (stage 2) + 2 tier-B kernel-side
-        // (HIPF-438) + 4 tier-B arch-crate / runtime (HIPF-437).
-        assert_eq!(promoted.len(), 43);
+        // (HIPF-438) + 4 tier-B arch-crate / runtime (HIPF-437) + 2 kernel-side (HIPF-489).
+        assert_eq!(promoted.len(), 45);
         for f in promoted {
             let dev = developer_key_for_env(f.env_compat.unwrap()).unwrap();
             let err = ConfigLayer::default().set_cli(&dev, "1").unwrap_err();
@@ -10308,6 +10357,35 @@ mod tests {
                 "{dev}: {err:?}"
             );
             assert!(err.to_string().contains(f.key), "{dev}: {err}");
+        }
+    }
+
+    #[test]
+    fn router_w64_and_hc_fuse_promoted_arms_keep_their_legacy_meaning() {
+        for (raw, want) in [
+            ("0", "off"),
+            ("approx", "approx"),
+            ("1", "exact"),
+            ("", "exact"),
+        ] {
+            assert_eq!(
+                promoted_flag_env_value("gfx1100_router_w64", raw),
+                Some(ConfigValue::String(want.into())),
+                "{raw:?}"
+            );
+        }
+        for (raw, want) in [
+            ("0", ConfigValue::Integer(0)),
+            (" 3 ", ConfigValue::Integer(3)),
+            ("9", ConfigValue::Integer(3)),
+            ("300", ConfigValue::Null),
+            ("x", ConfigValue::Null),
+        ] {
+            assert_eq!(
+                promoted_flag_env_value("qwen4_hc_fuse", raw),
+                Some(want),
+                "{raw:?}"
+            );
         }
     }
 
@@ -10507,13 +10585,13 @@ mod tests {
     fn other_developer_keys_keep_their_free_form_spelling() {
         let mut layer = ConfigLayer::default();
         layer.set_cli("developer.experimental_mode", "on").unwrap();
-        layer.set_cli("developer.qwen4_hc_fuse", "3").unwrap();
+        layer.set_cli("developer.free_form_probe", "3").unwrap();
         assert_eq!(
             layer.get("developer.experimental_mode"),
             Some(&ConfigValue::String("on".into()))
         );
         assert_eq!(
-            layer.get("developer.qwen4_hc_fuse"),
+            layer.get("developer.free_form_probe"),
             Some(&ConfigValue::String("3".into()))
         );
     }

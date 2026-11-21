@@ -25,7 +25,7 @@ use crate::families::moe::{
 };
 use crate::pipeline::sealed_moe::{MoeProtocol, MoeRouterInput, SealedMoeCall};
 use crate::types::DispatchError;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{feature_flags::RouterW64Mode, Gpu, GpuTensor};
 use smallvec::SmallVec;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::OnceLock;
@@ -3841,15 +3841,11 @@ pub(super) fn select_decode(
         }
     }
 
-    let gfx1100_router_mode = hipfire_config::developer_var("HIPFIRE_GFX1100_ROUTER_W64").ok();
+    let w64_mode = ctx.flags.gfx1100_router_w64;
     let exact_wave64_router = params.n_exp == 256
-        && ((ctx.arch.is_gfx1100()
-            && !matches!(gfx1100_router_mode.as_deref(), Some("0" | "approx")))
-            || ctx.arch.is_gfx1151());
+        && ((ctx.arch.is_gfx1100() && w64_mode == RouterW64Mode::Exact) || ctx.arch.is_gfx1151());
     let wave64_router = ctx.arch.is_gfx1201()
-        || (ctx.arch.is_gfx1100()
-            && params.n_exp == 256
-            && gfx1100_router_mode.as_deref() == Some("approx"));
+        || (ctx.arch.is_gfx1100() && params.n_exp == 256 && w64_mode == RouterW64Mode::Approx);
     let (shared_smi, shared_down_dtype, shared_down_has_awq) = params
         .shared
         .as_ref()
