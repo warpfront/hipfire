@@ -15,14 +15,30 @@ pub fn rmsnorm(x: &[f32], eps: f32) -> Vec<f32> {
 /// Row L2 clip to `threshold`, after an optional per-channel scale.
 /// Mirrors `llama_model_inkling2::graph::clip`: eps is added to the norm and
 /// the factor `threshold / norm` is clamped to [0, 1].
-pub fn clip(cur: &[f32], scale: Option<&[f32]>, threshold: f32) -> Vec<f32> {
-    let scaled: Vec<f32> = match scale {
-        Some(s) => cur.iter().zip(s.iter()).map(|(v, k)| v * k).collect(),
-        None => cur.to_vec(),
-    };
-    let norm = scaled.iter().map(|v| v * v).sum::<f32>().sqrt() + 1e-6;
-    let factor = (threshold / norm).clamp(0.0, 1.0);
-    scaled.iter().map(|v| v * factor).collect()
+/// L2-clip each head-vector of `[n_head, dim]` independently (llama.cpp
+/// `clip()` uses ggml_sum_rows; transformers uses vector_norm(dim=-1)).
+/// `scale`, if present, is also `[n_head, dim]`.
+pub fn clip(cur: &[f32], scale: Option<&[f32]>, threshold: f32, dim: usize) -> Vec<f32> {
+    let rows = cur.len() / dim;
+    let mut out = cur.to_vec();
+    for r in 0..rows {
+        let base = r * dim;
+        for i in 0..dim {
+            if let Some(s) = scale {
+                out[base + i] = cur[base + i] * s[base + i];
+            }
+        }
+        let norm = (0..dim)
+            .map(|i| out[base + i] * out[base + i])
+            .sum::<f32>()
+            .sqrt()
+            + 1e-6;
+        let factor = (threshold / norm).clamp(0.0, 1.0);
+        for i in 0..dim {
+            out[base + i] *= factor;
+        }
+    }
+    out
 }
 
 /// Log-scaled position multiplier applied to Q and R on full-attention layers.
@@ -129,8 +145,10 @@ pub fn convolve_static(
     for t in 0..n_seq {
         for ch in 0..n_channels {
             let mut acc = 0.0f32;
+            // Tap convention (converted domain, tap n_conv-1 = current):
+            // W[j] multiplies history[j] where x = [past_0..past_{k-2}, current].
             for l in 0..n_conv {
-                let xi = (t + n_conv - 1 - l) * n_channels + ch;
+                let xi = (t + l) * n_channels + ch;
                 acc += x[xi] * weight[l * n_channels + ch];
             }
             conv[t * n_channels + ch] = acc;
@@ -270,18 +288,28 @@ mod tests {
 
     #[test]
     fn clip_scales_down_only_when_above_threshold() {
-        let out = clip(&[3.0, 4.0], None, 2.0);
+        let out = clip(&[3.0, 4.0], None, 2.0, 2);
         assert!(close(out[0], 1.2), "{}", out[0]);
         assert!(close(out[1], 1.6), "{}", out[1]);
-        let out = clip(&[3.0, 4.0], None, 10.0);
+        let out = clip(&[3.0, 4.0], None, 10.0, 2);
         assert!(close(out[0], 3.0) && close(out[1], 4.0));
     }
 
     #[test]
     fn clip_applies_optional_channel_scale_first() {
-        let out = clip(&[3.0, 4.0], Some(&[2.0, 0.5]), 10.0);
+        let out = clip(&[3.0, 4.0], Some(&[2.0, 0.5]), 10.0, 2);
         assert!(close(out[0], 6.0), "{}", out[0]);
         assert!(close(out[1], 2.0), "{}", out[1]);
+    }
+
+    #[test]
+    fn clip_is_per_head_row_not_whole_vector() {
+        // Two heads of dim 2. Head 0 [3,4] norms 5 -> clipped to 2;
+        // head 1 [0.3,0.4] norms 0.5 -> unchanged. A whole-vector norm
+        // would couple them; per-row keeps head 1 intact.
+        let out = clip(&[3.0, 4.0, 0.3, 0.4], None, 2.0, 2);
+        assert!(close(out[0], 1.2) && close(out[1], 1.6), "{:?}", &out[..2]);
+        assert!(close(out[2], 0.3) && close(out[3], 0.4), "{:?}", &out[2..]);
     }
 
     #[test]
@@ -343,7 +371,7 @@ mod tests {
     fn convolve_static_uses_past_and_returns_new_window() {
         let (out, past) = convolve_static(&[1.0], &[0.5, 0.25], &[2.0], 1, 1, 2);
         assert!(
-            close(out[0], (1.0 + (1.0 * 0.5 + 2.0 * 0.25)) / 3.0f32.sqrt()),
+            close(out[0], (1.0 + (2.0 * 0.5 + 1.0 * 0.25)) / 3.0f32.sqrt()),
             "{}",
             out[0]
         );

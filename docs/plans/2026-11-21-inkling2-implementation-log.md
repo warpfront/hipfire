@@ -205,9 +205,17 @@ achieved**. Root-cause analysis narrowed it down:
   projection using inputs[0]; and RMSNorm raw-weight convention. None closed
   the gap alone.
 
-To separate quantization from forward correctness, the decisive experiment is
-to run the same forward on the **F32 GGUF weights** and compare to the oracle;
-remaining simplifications that could still bite: dynamic K/V conv taps on full
+To separate quantization from forward correctness: the forward is now generic
+over `WeightSource` (`Inkling2Weights` for the MQ4 artifact, `GgufF32` for the
+oracle's exact F32 weights). `GgufF32` reads from `D:\hipfire-models\gguf-f32.bin`
+(a 98 GB flat export of the F32 GGUF made by `gguf_to_f32_bin.py`) on demand via
+seek, mapping HFQ names/expert layout to GGUF names (expert-last axis, down
+transposed). The `dump_raw_logits_token0` test runs the same 48-visit forward on
+those F32 weights; compare its output to `oracle-logits-tok0.txt` with
+`compare_logits.py` (point it at `cpu-raw-logits-tok0.txt`). If parity holds on
+F32, the MQ4 gap is quantization/imatrix; if not, there are still forward bugs.
+
+Remaining simplifications that could still bite: dynamic K/V conv taps on full
 layers (static weights only), multi-token KV cache (single-token primitive).
 The practical fix for the quality gap is imatrix-based MQ4L calibration, which
 this CPU forward can now drive.
