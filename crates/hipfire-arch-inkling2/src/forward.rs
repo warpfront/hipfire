@@ -228,11 +228,52 @@ pub fn decode_moe(
     out
 }
 
+/// A controller's three weight matrices for one of Q/K/V/FFN:
+/// `down [2*n_embd, rank]`, `gain [n_embd, rank]`, `forget [n_embd, rank]`.
+pub struct ControllerWeights {
+    pub down: Vec<f32>,
+    pub gain: Vec<f32>,
+    pub forget: Vec<f32>,
+}
+
+/// Pack the global cross-pass query tensors into per-core-layer message
+/// queries. The stored `middle_cycle_cross_pass_queries` and `_kv_queries`
+/// are each `[2*core_len, n_embd]`; per core layer i the four queries are
+/// `[q[2i], kv[2i], kv[2i+1], q[2i+1]]` = [Q, K, V, FFN] messages.
+pub fn pack_message_queries(
+    w: &crate::weights::Inkling2Weights,
+    cfg: &crate::config::Inkling2Config,
+) -> Result<Vec<[Vec<f32>; 4]>, String> {
+    let (_, q) = w.f32("model.llm.middle_cycle_cross_pass_queries")?;
+    let (_, kv) = w.f32("model.llm.middle_cycle_cross_pass_kv_queries")?;
+    let e = cfg.n_embd;
+    let core = cfg.loop_cfg.core_end - cfg.loop_cfg.core_start;
+    if q.len() != 2 * core * e || kv.len() != q.len() {
+        return Err(format!(
+            "inkling2: cross-pass queries shape mismatch: q={} kv={} expected {}",
+            q.len(),
+            kv.len(),
+            2 * core * e
+        ));
+    }
+    let row = |v: &[f32], i: usize| v[i * e..(i + 1) * e].to_vec();
+    let mut out = Vec::with_capacity(core);
+    for i in 0..core {
+        out.push([
+            row(&q, 2 * i),
+            row(&kv, 2 * i),
+            row(&kv, 2 * i + 1),
+            row(&q, 2 * i + 1),
+        ]);
+    }
+    Ok(out)
+}
+
 /// Run one full decoder visit (attention + MoE + residual/block bookkeeping),
 /// loading weights lazily from the validated HFQ index. `x` is `[n_embd]`,
 /// `visit` the global visit index (0..48), `blocks` the AttnRes block stream,
-/// `state` the per-visit conv state. Messages/controllers are handled by the
-/// higher-level loop driver (Phase 2 of this scaffold).
+/// `state` the per-visit conv state. `messages`/`ctrl` are present for loop
+/// visits after pass 0 (four messages Q/K/V/FFN and their controllers).
 pub fn decode_visit(
     w: &crate::weights::Inkling2Weights,
     cfg: &crate::config::Inkling2Config,
@@ -241,6 +282,7 @@ pub fn decode_visit(
     x: &[f32],
     visit: usize,
     pos: usize,
+    messages: Option<&([Vec<f32>; 4], [ControllerWeights; 4])>,
 ) -> Result<Vec<f32>, String> {
     let phys = cfg.loop_cfg.layer_phys(visit);
     let p = format!("model.llm.layers.{phys}.");
@@ -259,11 +301,43 @@ pub fn decode_visit(
         let mixed = oracle::mix(blocks, x, &q, cfg.n_embd, query_rows);
         inp = mixed[..cfg.n_embd].to_vec();
     }
-    if swa {
-        inp = rmsnorm_gain(&inp, &g("attn_norm.weight")?, cfg.rms_norm_eps);
+    // Three attention inputs. Pass 0 (no messages): all equal `inp`. Later
+    // passes: each is `control(inp, msg[j], ctrl[j])` then normed separately.
+    let (q_inp, k_inp, v_inp) = match messages {
+        Some((msgs, ctrls)) => {
+            let apply = |base: &[f32], j: usize, c: &ControllerWeights| {
+                oracle::control(
+                    base,
+                    &msgs[j],
+                    &c.down,
+                    &c.gain,
+                    &c.forget,
+                    cfg.n_embd,
+                    cfg.loop_cfg.gate_rank,
+                )
+            };
+            (
+                apply(&inp, 0, &ctrls[0]),
+                apply(&inp, 1, &ctrls[1]),
+                apply(&inp, 2, &ctrls[2]),
+            )
+        }
+        None => (inp.clone(), inp.clone(), inp.clone()),
+    };
+    let (q_inp, k_inp, v_inp) = if swa {
+        let norm = g("attn_norm.weight")?;
+        (
+            rmsnorm_gain(&q_inp, &norm, cfg.rms_norm_eps),
+            rmsnorm_gain(&k_inp, &norm, cfg.rms_norm_eps),
+            rmsnorm_gain(&v_inp, &norm, cfg.rms_norm_eps),
+        )
     } else {
-        inp = rmsnorm_gain(&inp, &g("q_input_norm.weight")?, cfg.rms_norm_eps);
-    }
+        (
+            rmsnorm_gain(&q_inp, &g("q_input_norm.weight")?, cfg.rms_norm_eps),
+            rmsnorm_gain(&k_inp, &g("k_input_norm.weight")?, cfg.rms_norm_eps),
+            rmsnorm_gain(&v_inp, &g("v_input_norm.weight")?, cfg.rms_norm_eps),
+        )
+    };
 
     // --- attention projections + convs (SWA static; full dynamic deferred) ---
     let d = cfg.head_dim;
@@ -271,13 +345,18 @@ pub fn decode_visit(
     let nkv = cfg.n_head_kv;
     let ekv = nkv * d;
     let eattn = nh * d;
-    let q = oracle::matvec(&g("attn.wq_du.weight")?, &inp, eattn, cfg.n_embd);
-    let k_raw = oracle::matvec(&g("attn.wk_dv.weight")?, &inp, ekv, cfg.n_embd);
-    let v_raw = oracle::matvec(&g("attn.wv_dv.weight")?, &inp, ekv, cfg.n_embd);
-    let r = oracle::matvec(&g("attn.wr_du.weight")?, &inp, nh * cfg.n_rel, cfg.n_embd);
+    let q = oracle::matvec(&g("attn.wq_du.weight")?, &q_inp, eattn, cfg.n_embd);
+    let k_raw = oracle::matvec(&g("attn.wk_dv.weight")?, &k_inp, ekv, cfg.n_embd);
+    let v_raw = oracle::matvec(&g("attn.wv_dv.weight")?, &v_inp, ekv, cfg.n_embd);
+    let r = oracle::matvec(&g("attn.wr_du.weight")?, &q_inp, nh * cfg.n_rel, cfg.n_embd);
+    // SWA layers store a static `k_sconv.weight [ch,1,kernel]`; full layers
+    // store `k_sconv.static_w` (same shape) plus a `weight_proj` for dynamic
+    // taps. The dynamic taps are deferred; here use the static weights.
+    let k_conv_w = g("attn.k_sconv.weight").or_else(|_| g("attn.k_sconv.static_w"))?;
+    let v_conv_w = g("attn.v_sconv.weight").or_else(|_| g("attn.v_sconv.static_w"))?;
     let (k_conv, kp) = oracle::convolve_static(
         &k_raw,
-        &flatten_conv(&g("attn.k_sconv.weight")?, cfg.conv_kernel),
+        &flatten_conv(&k_conv_w, cfg.conv_kernel),
         &state.k_past,
         1,
         ekv,
@@ -285,7 +364,7 @@ pub fn decode_visit(
     );
     let (v_conv, vp) = oracle::convolve_static(
         &v_raw,
-        &flatten_conv(&g("attn.v_sconv.weight")?, cfg.conv_kernel),
+        &flatten_conv(&v_conv_w, cfg.conv_kernel),
         &state.v_past,
         1,
         ekv,
@@ -345,7 +424,7 @@ pub fn decode_visit(
         let wv = oracle::attention_softmax_with_sink(&[score], 0.0, vh, 1, d);
         attn_out[h * d..(h + 1) * d].copy_from_slice(&wv);
     }
-    let gate = oracle::matvec(&g("attn.gate_attn.weight")?, &inp, eattn, cfg.n_embd);
+    let gate = oracle::matvec(&g("attn.gate_attn.weight")?, &q_inp, eattn, cfg.n_embd);
     for i in 0..eattn {
         attn_out[i] *= oracle::sigmoid(gate[i]);
     }
@@ -375,6 +454,18 @@ pub fn decode_visit(
     if let Ok((_shape, q)) = w.f32(&ffn_mix_q) {
         let mixed = oracle::mix(blocks, &cur, &q, cfg.n_embd, 1);
         ffn_in = mixed;
+    }
+    // FFN message controller (index 3 = LOOP_CTRL_FFN), applied before norm.
+    if let Some((msgs, ctrls)) = messages {
+        ffn_in = oracle::control(
+            &ffn_in,
+            &msgs[3],
+            &ctrls[3].down,
+            &ctrls[3].gain,
+            &ctrls[3].forget,
+            cfg.n_embd,
+            cfg.loop_cfg.gate_rank,
+        );
     }
     let ffn_normed = rmsnorm_gain(&ffn_in, &g("mlp_norm.weight")?, cfg.rms_norm_eps);
     let router = g("mlp.gate.weight")?;
@@ -408,6 +499,151 @@ pub fn decode_visit(
     );
     state.ffn_out_past = fp;
     Ok(ffn_in.iter().zip(&moe_conv).map(|(a, b)| a + b).collect())
+}
+
+/// Run all 48 visits for one token, from token embedding to final normalized
+/// hidden state (before the LM head). Mirrors
+/// `llama_model_inkling2_loop::graph::graph`: prelude layers 0..6 once, core
+/// layers 6..18 for `num_passes` passes (later passes get cross-pass messages
+/// from the previous pass's bank), post-loop layers 18..24 once.
+pub fn forward_token(
+    w: &crate::weights::Inkling2Weights,
+    cfg: &crate::config::Inkling2Config,
+    token_embed: &[f32],
+    pos: usize,
+) -> Result<Vec<f32>, String> {
+    // build_inputs: token embedding, RMSNormed (token path only).
+    let tok_norm = w.f32("model.llm.embed_norm.weight")?.1;
+    let mut x = rmsnorm_gain(token_embed, &tok_norm, cfg.rms_norm_eps);
+
+    // One state per visit slot (48); physical weights are shared but KV/conv
+    // state is per-visit.
+    let mut states: Vec<ConvState> = (0..cfg.loop_cfg.n_slot())
+        .map(|_| ConvState::default())
+        .collect();
+    let mut blocks: Vec<Vec<f32>> = Vec::new();
+    let mut visit = 0usize;
+
+    // Prelude layers 0..core_start (6).
+    for _ in 0..cfg.loop_cfg.core_start {
+        let out = decode_visit(
+            w,
+            cfg,
+            &mut states[visit],
+            &mut blocks,
+            &x,
+            visit,
+            pos,
+            None,
+        )?;
+        x = out;
+        visit += 1;
+    }
+    let prelude_x = x.clone();
+    let prelude_blocks = blocks.clone();
+
+    let msg_queries = pack_message_queries(w, cfg)?;
+    let core_len = cfg.loop_cfg.core_end - cfg.loop_cfg.core_start;
+
+    // Loop passes. pass 0 has no messages; later passes use the previous
+    // pass's bank (blocks after the first core block + its output).
+    let mut prev_blocks = prelude_blocks.clone();
+    let mut prev_out = prelude_x.clone();
+    for pass in 0..cfg.loop_cfg.num_passes {
+        x = prelude_x.clone();
+        blocks = prelude_blocks.clone();
+        // Messages/bank come from the previous pass (pass 0: none).
+        let bank: Vec<Vec<f32>> = if pass > 0 {
+            prev_blocks
+                .iter()
+                .skip(prelude_blocks.len() + 1)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for i in 0..core_len {
+            let phys = cfg.loop_cfg.core_start + i;
+            let message = if pass > 0 {
+                let mut states_for_mix = bank.clone();
+                states_for_mix.push(prev_out.clone());
+                let msgs: Vec<Vec<f32>> = msg_queries[i]
+                    .iter()
+                    .map(|q| oracle::mix(&states_for_mix, &prev_out, q, cfg.n_embd, 1))
+                    .collect();
+                let msgs_arr: [Vec<f32>; 4] = [
+                    msgs[0].clone(),
+                    msgs[1].clone(),
+                    msgs[2].clone(),
+                    msgs[3].clone(),
+                ];
+                let ctrls = load_controllers(w, phys, cfg)?;
+                Some((msgs_arr, ctrls))
+            } else {
+                None
+            };
+            let out = decode_visit(
+                w,
+                cfg,
+                &mut states[visit],
+                &mut blocks,
+                &x,
+                visit,
+                pos,
+                message.as_ref(),
+            )?;
+            x = out;
+            visit += 1;
+        }
+        prev_blocks = blocks.clone();
+        prev_out = x.clone();
+    }
+
+    // Post-loop layers core_end..n_phys once.
+    for _ in cfg.loop_cfg.core_end..cfg.n_phys {
+        let out = decode_visit(
+            w,
+            cfg,
+            &mut states[visit],
+            &mut blocks,
+            &x,
+            visit,
+            pos,
+            None,
+        )?;
+        x = out;
+        visit += 1;
+    }
+    debug_assert_eq!(visit, cfg.loop_cfg.n_slot());
+
+    // Final norm.
+    let final_norm = w.f32("model.llm.norm.weight")?.1;
+    Ok(rmsnorm_gain(&x, &final_norm, cfg.rms_norm_eps))
+}
+
+fn load_controllers(
+    w: &crate::weights::Inkling2Weights,
+    phys: usize,
+    cfg: &crate::config::Inkling2Config,
+) -> Result<[ControllerWeights; 4], String> {
+    let p = format!("model.llm.layers.{phys}.controllers.");
+    let load = |name: &str| -> Result<ControllerWeights, String> {
+        Ok(ControllerWeights {
+            down: w.f32(&format!("{p}{name}.down_weight"))?.1,
+            gain: w.f32(&format!("{p}{name}.gain_weight"))?.1,
+            forget: w.f32(&format!("{p}{name}.forget_weight"))?.1,
+        })
+    };
+    let rank = cfg.loop_cfg.gate_rank;
+    for name in ["attn", "k", "v", "mlp"] {
+        let c = load(name)?;
+        if c.down.len() != 2 * cfg.n_embd * rank {
+            return Err(format!(
+                "inkling2: controller {phys}.{name} down shape mismatch"
+            ));
+        }
+    }
+    Ok([load("attn")?, load("k")?, load("v")?, load("mlp")?])
 }
 
 #[cfg(test)]
@@ -626,11 +862,32 @@ mod tests {
         let x = embed[..cfg.n_embd].to_vec();
         let mut st = ConvState::default();
         let mut blocks = Vec::new();
-        let out = decode_visit(&w, &cfg, &mut st, &mut blocks, &x, 0, 0).expect("decode visit");
+        let out =
+            decode_visit(&w, &cfg, &mut st, &mut blocks, &x, 0, 0, None).expect("decode visit");
         assert_eq!(out.len(), cfg.n_embd);
         assert!(out.iter().all(|v| v.is_finite()), "non-finite visit output");
         let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         eprintln!("full visit 0: {} values, max={max}", out.len());
+    }
+
+    #[test]
+    #[ignore = "requires the 14 GB artifact; runs all 48 visits (slow)"]
+    fn full_48_visit_forward_produces_finite_output() {
+        use crate::weights::Inkling2Weights;
+        use hipfire_runtime::hfq::HfqFile;
+        let cfg = crate::config::Inkling2Config::from_metadata_json(crate::TEST_METADATA).unwrap();
+        let hfq = HfqFile::open(std::path::Path::new(
+            r"D:\hipfire-models\inkling2-mini-mq4.hfq",
+        ))
+        .expect("open");
+        let w = Inkling2Weights::load(&hfq, &cfg).expect("load");
+        let embed = w.f32("model.llm.embed.weight").unwrap().1;
+        let x = embed[..cfg.n_embd].to_vec();
+        let out = forward_token(&w, &cfg, &x, 0).expect("forward token");
+        assert_eq!(out.len(), cfg.n_embd);
+        assert!(out.iter().all(|v| v.is_finite()), "non-finite model output");
+        let max = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!("48-visit forward: {} values, max={max}", out.len());
     }
 
     fn oracle_close(a: f32, b: f32) -> bool {
