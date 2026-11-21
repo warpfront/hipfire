@@ -1075,7 +1075,7 @@ const ADMIT_F32_BATCHED: RowDomainV1 = RowDomainV1 {
 
 /// Admission of `gemm_bf16_xf32_batched`: the selector `rows_gemm` sends BF16-resident weights with
 /// `n < BF16_TILED_ROWS_MIN_N` (512) here, and every row count on archs without the tiled kernel
-/// (gfx1100) or with `HIPFIRE_BF16W_TILED_ROWS=0`. On gfx1201 and gfx1100 the router-shaped (F32 activation, M > 32)
+/// (gfx1100). On gfx1201 and gfx1100 the router-shaped (F32 activation, M > 32)
 /// and selector-shaped (BF16 activation, M <= 32) calls take the `gemm_bf16_small_rows` kernels instead
 /// ([`ADMIT_BF16_SMALL_ROWS`]); other shapes and direct callers
 /// still run this kernel.
@@ -1090,7 +1090,7 @@ const ADMIT_BF16_TILED: RowDomainV1 = RowDomainV1 {
     min_rows: 512,
     max_rows: None,
     predicate: "crates/hipfire-dispatch/src/pipeline/stream_mix.rs::BF16_TILED_ROWS_MIN_N",
-    kill_env: Some("HIPFIRE_BF16W_TILED_ROWS"),
+    kill_env: None,
 };
 
 /// Weight binding of the BF16 GEMMs: the weight is BF16-resident, fused sibling rows allowed.
@@ -1120,7 +1120,7 @@ pub static WORK_GEMM_F32_BATCHED: WorkSpecV1 = WorkSpecV1 {
         note: "One wave per output: grid (M, N) gives M and N exactly; K from the weight. Bytes = A + B + Y extents. \
                Every output re-reads its activation row (reads are L2-served), so the true traffic exceeds the \
                operand extents: the memory floor is a lower bound. See the admit note: this is the \
-               selector's n < 512 (or non-gfx1201 / kill-switch) route AND the direct-call route at any rows. On gfx1201 \
+               selector's n < 512 (or non-gfx1201) route AND the direct-call route at any rows. On gfx1201 \
                and gfx1100 the router and selector shapes take the small-rows kernels instead.",
     },
 };
@@ -1164,9 +1164,8 @@ pub static WORK_GEMM_BF16_XF32_TILED_ROWS: WorkSpecV1 = WorkSpecV1 {
             BIND_BF16_K,
         ],
         note: "Grid y = ceil(N/4) leaves N in an interval of 4: ChunkRows narrows it. M in (32, ..] takes this entry, \
-               M <= 32 the mp4 entry. Admitted on gfx1201 only, at n >= 512 rows, `HIPFIRE_BF16W_TILED_ROWS=0` \
-               restores gemm_bf16_xf32_batched. The router shape (F32 activation) takes the small-rows kernels \
-               instead. Bytes = A + X + Y extents.",
+               M <= 32 the mp4 entry. Admitted on gfx1201 only, at n >= 512 rows. The router shape (F32 activation) \
+               takes the small-rows kernels instead. Bytes = A + X + Y extents.",
     },
 };
 
@@ -2697,7 +2696,7 @@ mod tests {
         ] {
             assert_eq!(w.work.admit.min_rows, 512);
             assert_eq!(w.work.admit.max_rows, None);
-            assert_eq!(w.work.admit.kill_env, Some("HIPFIRE_BF16W_TILED_ROWS"));
+            assert_eq!(w.work.admit.kill_env, None);
             assert!(w
                 .work
                 .admit

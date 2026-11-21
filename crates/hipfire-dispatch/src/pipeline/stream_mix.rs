@@ -258,7 +258,7 @@ fn gamma<'a>(norm: Option<StreamNorm<'a>>) -> Option<StreamGamma<'a>> {
 /// (prefill, Raon pp512..16384) runs the x-stationary `gemm_bf16_xf32_tiled_rows`,
 /// which reads each activation row once per 8*MPW outputs instead of once per
 /// output; its few-block grid is far slower at n = 1..16 and it measured slower on
-/// gfx1100. `HIPFIRE_BF16W_TILED_ROWS=0` runs the batched kernel everywhere.
+/// gfx1100.
 ///
 /// A tensor the loader kept F32 (its source values were not all exactly
 /// BF16-representable) runs `gemm_f32_batched`.
@@ -275,10 +275,7 @@ pub(crate) fn rows_gemm(
         DType::BF16 => {
             if let Some(profile) = small_rows_route(&gpu.arch, x.dtype == DType::BF16, m, k, n) {
                 gpu.gemm_bf16_small_rows(a, x, y, m, k, n, profile)
-            } else if n >= BF16_TILED_ROWS_MIN_N
-                && gpu.arch == "gfx1201"
-                && hipfire_config::developer_bool("HIPFIRE_BF16W_TILED_ROWS", true)
-            {
+            } else if bf16_tiled_rows_applies(&gpu.arch, n) {
                 gpu.gemm_bf16_xf32_tiled_rows(a, x, y, m, k, n)
             } else {
                 gpu.gemm_bf16_xf32_batched(a, x, y, m, k, n)
@@ -416,6 +413,11 @@ fn small_rows_route(
 // selector-receipt: receipts/selectors/bf16_tiled_rows_min_n.json
 pub(crate) const BF16_TILED_ROWS_MIN_N: usize = 512;
 
+/// `gemm_bf16_xf32_tiled_rows` route: gfx1201 only, from `BF16_TILED_ROWS_MIN_N` rows up.
+fn bf16_tiled_rows_applies(arch: &str, n: usize) -> bool {
+    arch == "gfx1201" && n >= BF16_TILED_ROWS_MIN_N
+}
+
 /// True for a device tensor the selector / router GEMMs accept as the weight:
 /// BF16, or F32 when the loader kept the F32 values.
 pub(crate) fn rows_gemm_weight_ok(a: &GpuTensor) -> bool {
@@ -501,7 +503,7 @@ fn helmert_selector_gemm(
     }
     if streams.dtype == DType::BF16 {
         // BF16 streams: the selector is read by the BF16-activation small-rows
-        // kernels (or their batched/tiled twins under the kill switches), all with the
+        // kernels (or their batched/tiled twins), all with the
         // lane-strided/shuffle-tree arithmetic of gemm_f32_batched (bit-identical outputs).
         if selector.dtype != DType::BF16 {
             return Err(geometry("BF16 streams need a BF16 selector weight"));
@@ -511,9 +513,7 @@ fn helmert_selector_gemm(
                 .gemm_bf16_small_rows(selector, streams, selector_out, zdim, x_dim, rows, profile)
                 .map_err(|e| hip_err("stream_mix selector gemm (BF16 streams)", e));
         }
-        let tiled = rows >= BF16_TILED_ROWS_MIN_N
-            && gpu.arch == "gfx1201"
-            && hipfire_config::developer_bool("HIPFIRE_BF16W_TILED_ROWS", true);
+        let tiled = bf16_tiled_rows_applies(&gpu.arch, rows);
         return gpu
             .gemm_bf16_xbf16_rows(selector, streams, selector_out, zdim, x_dim, rows, tiled)
             .map_err(|e| hip_err("stream_mix selector gemm (BF16 streams)", e));
