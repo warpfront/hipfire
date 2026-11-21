@@ -2409,6 +2409,7 @@ branch) or a misspelled key is unknown and fails the load with
 | `developer.moe_cpu_experts` | `moe_cpu_experts` | 0.4.2 | 0.5.0 | set `memory.offload_exec` to `pcie` to turn host expert execution off |
 | `developer.qwen4_decode_share_shadows` | `qwen4_decode_share_shadows` | 0.4.4 | 0.5.0 | none; shadows always borrow the donor tail on admitted gfx1201 decode-share loads |
 | `developer.qwen4_capture_ring_compact` | `qwen4_capture_ring_compact` | 0.4.5 | 0.5.0 | none; the capture ring always uses the compact rows + 1 slot layout |
+| `developer.bf16w_tiled_rows` | `bf16w_tiled_rows` | 0.4.5 | 0.5.0 | none; the tiled BF16 rows route is gated by arch and row count alone (no kill switch) |
 | `developer.lane_reset_batch` | `lane_reset_batch` | 0.4.5 | 0.5.0 | none; supported lane resets always batch their zero-fills (on the steady copy stream when one exists) |
 | `developer.ep_balanced_owners` | `ep_balanced_owners` | 0.4.2 | 0.5.0 | none; balanced owners are always used where balanced ownership is admitted |
 | `developer.ep_owner_routed_prefill` | `ep_owner_routed_prefill` | 0.4.2 | 0.5.0 | none; owner-routed prefill runs wherever its admission conditions hold |

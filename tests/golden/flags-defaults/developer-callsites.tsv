@@ -24,7 +24,6 @@ developer_callsite	*	HIPFIRE_AWQ_EXPERTS#developer_var=ok.as_deref.==Some("none"
 developer_callsite	*	HIPFIRE_AWQ_F1_ONLY#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_AWQ_NORM_WAVEGRID#developer_var=as_deref.==Ok("1")
 developer_callsite	*	HIPFIRE_BATCHED_HEAD_VERIFY#developer_var=as_deref.==Ok("1")
-developer_callsite	*	HIPFIRE_BF16W_TILED_ROWS#developer_bool=true
 developer_callsite	*	HIPFIRE_BF16_H_A4#developer_bool=false
 developer_callsite	*	HIPFIRE_C2M_DUMP_PROMPT#developer_var=ok.as_deref.==Some("1")
 developer_callsite	*	HIPFIRE_C2M_NORMDUMP#developer_var=ok.map

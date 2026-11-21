@@ -212,7 +212,6 @@ HIPFIRE_BENCH_N	raw_string
 HIPFIRE_BENCH_RUNS	raw_string
 HIPFIRE_BENCH_WARMUPS	raw_string
 HIPFIRE_BENCH_WORKLOAD	raw_string
-HIPFIRE_BF16W_TILED_ROWS	developer_bool
 HIPFIRE_BF16_H_A4	developer_bool
 HIPFIRE_BIN	raw_string
 HIPFIRE_BLOB_FORCE	unclassified
