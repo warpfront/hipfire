@@ -425,8 +425,11 @@ Linux with ROCm 6 or newer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.6/scripts/install.sh | bash
+```
 
-# Or install the integration branch for testing:
+Or install the integration branch for testing:
+
+```bash
 curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/v0.4.6/scripts/install.sh \
   | bash -s -- --branch beta
 ```
