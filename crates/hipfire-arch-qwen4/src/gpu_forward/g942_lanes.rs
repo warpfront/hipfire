@@ -67,7 +67,7 @@ pub(crate) fn moe_refusal(
 ) -> Option<String> {
     if !stages_apply {
         return Some(
-            "the step takes no all-rows stage segment (LANE_ALLROWS / LANE_HC_ALLROWS off, not an eager 9..=128-row multi-group AR / verify step, or a CPU splice / wide scope / GDN qkv BF16 is in force)".into(),
+            "the step takes no all-rows stage segment (all-rows HC / non-MoE stages off, not an eager 9..=128-row multi-group AR / verify step, or a CPU splice / wide scope / GDN qkv BF16 is in force)".into(),
         );
     }
     if !moe_once {
